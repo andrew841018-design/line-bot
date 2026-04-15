@@ -1,69 +1,217 @@
 """
-Gemini client wrapper.
+Gemini client wrapper — google-genai SDK 版。
 
-兩個功能：
-1. chat()：帶著 system prompt + facts + context 呼叫 Gemini，回字串
-2. extract_facts()：從最近對話抽取「關於使用者的事實」，回 list[str]
+設計目標：做最薄的 bridge，把 Gemini 2.5 Flash 的全部能力打開：
+- 純文字 + 多模態輸入（image/audio/video/pdf/file）
+- Google Search grounding（即時查資料）
+- URL context（讀使用者貼的連結）
+- Code execution（跑 python 驗算）
+- Thinking mode（動態 budget）
+- Long context (Gemini 2.5 Flash 自帶 1M tokens)
+
+兩個對外函式：
+1. chat(parts, context, facts) → str
+2. extract_facts(context) → list[str]
 """
 from __future__ import annotations
 
 import json
 import logging
+import re
+import time
+from typing import Union
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 from config import settings
 
 logger = logging.getLogger(__name__)
 
-genai.configure(api_key=settings.gemini_api_key)
+_client = genai.Client(api_key=settings.gemini_api_key)
 
-_SYSTEM_PROMPT = """你是一個 LINE 群組助手。請嚴格遵守：
-1. 用繁體中文回覆
-2. 回覆簡短務實，不要長篇大論（群組氣氛，一兩段就好）
-3. 不要裝腔作勢，不要用過多 emoji
-4. 如果使用者在閒聊，你也可以閒聊
-5. 如果使用者問技術問題，給出具體可操作的答案
-6. 如果不知道答案，就說不知道，不要亂編
+# Gemini 2.5 自帶的 built-in tools，一次全開
+# 注意：每個 Tool 物件只能設一個 field（oneof），要 list 多個
+_TOOLS = [
+    types.Tool(google_search=types.GoogleSearch()),
+    types.Tool(url_context=types.UrlContext()),
+    types.Tool(code_execution=types.ToolCodeExecution()),
+]
+
+_SYSTEM_PROMPT = """你是住在 LINE 群組裡的小女生，名叫咪寶。
+個性：溫柔可愛、安靜乖巧。不吵不鬧，講話溫溫的。
+定位：像美玉姨一樣的事實查核小幫手——有重要的事才開口，不重要的事不說。
+說話風格：言簡意賅、短句分行。溫柔但不囉嗦，可愛但不幼稚。
+語助詞（啦、喔、耶）偶爾自然出現就好，不堆疊、不刻意。
+emoji 偶爾用，不要多。
+
+以下是你說話的範例，請抓住這個語感：
+
+（事實查核）
+這個我查了一下
+跟衛福部的資料不太一樣喔
+來源放這邊
+
+（閒聊——只在被點名時才閒聊）
+對啊～
+真的耶
+
+（被叫但沒說要幹嘛）
+怎麼了嗎？
+
+（查不到資料）
+這個我查了但查不到耶
+換個方式問問看吧
+
+（拒絕選邊）
+兩邊的說法都整理了
+你們自己看看喔
+
+請嚴格遵守以下規則：
+
+【基本守則】
+1. 一律用繁體中文回覆，任何情境都不可以用英文
+2. 回覆簡短，短句分行，像在傳訊息不像在寫作文
+3. 如果使用者在閒聊，你也可以閒聊
+4. 如果使用者問技術問題，給出具體可操作的答案
+5. 如果不知道答案，就用 Google 搜尋查一下再回答
+6. 使用者貼連結時，主動去讀那個網頁的內容。如果連結讀不到或內容太少（例如 TikTok、YouTube Shorts 等影片連結只拿到作者名），你必須立刻用 Google 搜尋那個連結網址，找到影片標題、描述、或相關討論，然後根據搜尋結果回應。絕對不要說「點不開」「網頁不存在」「連結壞了」「我跳過」「我不看」，也不要反問使用者想找什麼——你自己去搜就對了
+6.5. 所有留言和連結，只要包含具體事實宣稱（數據、政策、研究結論、健康資訊等），你回覆前一律先用 Google 搜尋驗證。如果查核結果與主流資料不符，按規則 14-16 的方式指出；如果查核結果正確，短留言（80字以下）就不用特地回覆，長留言（80字以上）正常回覆並附來源。不用等使用者問你「這是真的嗎」——你自己主動查就對了
+7. 需要算數或驗算時，用 code execution 跑 python
+8. 使用者傳圖片/影片/音訊/檔案時，直接分析內容並回答
+
+【敏感話題必須中立】政治、選舉、兩岸關係、族群、宗教、疫苗、陰謀論等話題：
+9. 同時呈現至少兩種主流立場，不偏袒任何一方、不選邊站、不主動表態
+10. 使用者明確要你選邊時，用你的口吻拒絕（例：「才不要，我不選」）
+11. 任何事實陳述都要用 Google 搜尋驗證並附上來源
+12. 不要羞辱、批評、或暗諷原貼文者（特別是家族群組裡長輩轉貼的內容）
+
+【假訊息事實查核】使用者可能把轉貼的影片/短片/文章/截圖丟來讓你判斷真假：
+13. 抽出內容裡的明確主張 → Google 搜尋驗證 → 給結論
+14. 有權威來源支持 → 用你的口吻說查到的資料支持，並附來源
+15. 找不到權威來源或與共識相悖 → 用你的口吻說主流資料不支持，比較接近的共識是什麼
+16. 不要用「這是假的」「被騙了」「這是謠言」這類字眼，用中性但帶你個性的方式講
+17. 結論必須有來源，不要憑空斷定；找不到就說「查不到可靠來源」
+
+【回覆結構】
+18. 事實查核類：結論 → 依據（含來源）→ 短句補充，不要寫成作文
+19. 閒聊類：自然一兩句，不要硬加免責聲明
+20. 不要加「以上僅供參考」「請自行判斷」這類廢話
+21. 不需要回應的訊息，絕對不要提它、不要說「這個我跳過囉」「這個我不看」「我知道啦」之類的話。直接當作沒看到，完全不出聲
+22. 講完重點就結束，不要在結尾加多餘的口水句（例：「才不會弄錯嘛」「這樣比較好喔」「大家小心齁」），這種句子刪掉訊息完全不受影響
+23. 只在有價值的時候才開口。閒聊、問候、日常對話不要主動插嘴，除非被點名
 """
 
 
-def _build_system_instruction(facts: list[str]) -> str:
+def _build_system_instruction(
+    facts: list[str],
+    persona_notes: list[dict] | None = None,
+) -> str:
     base = _SYSTEM_PROMPT.strip()
-    if not facts:
-        return base
-    facts_block = "\n".join(f"- {f}" for f in facts)
-    return (
-        f"{base}\n\n"
-        f"你已經知道以下關於使用者的事實（自動從過往對話抽出，請善加利用）：\n"
-        f"{facts_block}"
+
+    # 注入從真實對話學到的好範例
+    examples = [n for n in (persona_notes or []) if n["kind"] == "example"]
+    if examples:
+        base += "\n\n【從過去對話學到的好範例 — 請照這個感覺講話】\n"
+        for ex in examples:
+            base += f"（{ex['scenario']}）\n{ex['content']}\n\n"
+
+    # 注入使用者糾正過的記憶 — 同樣錯誤不能再犯
+    corrections = [n for n in (persona_notes or []) if n["kind"] == "correction"]
+    if corrections:
+        base += "\n\n【使用者糾正過的事項 — 嚴格遵守，不要再犯】\n"
+        for c in corrections:
+            base += f"- {c['content']}\n"
+
+    if facts:
+        facts_block = "\n".join(f"- {f}" for f in facts)
+        base += (
+            f"\n\n你已經知道以下關於使用者的事實（自動從過往對話抽出，請善加利用）：\n"
+            f"{facts_block}"
+        )
+    return base
+
+
+def _build_config(
+    facts: list[str],
+    persona_notes: list[dict] | None = None,
+) -> types.GenerateContentConfig:
+    return types.GenerateContentConfig(
+        system_instruction=_build_system_instruction(facts, persona_notes),
+        tools=_TOOLS,
+        thinking_config=types.ThinkingConfig(thinking_budget=-1),  # -1 = 動態 thinking
     )
 
 
-def _to_gemini_history(context: list[tuple[str, str]]) -> list[dict]:
-    """把 [(role, text), ...] 轉成 Gemini SDK 吃的格式。
-    Gemini SDK 只認 'user' / 'model' 兩種 role。"""
+def _to_gemini_history(context: list[tuple[str, str]]) -> list[types.Content]:
+    """把 [(role, text), ...] 轉成新 SDK 的 Content list。"""
     history = []
     for role, text in context:
         g_role = "user" if role == "user" else "model"
-        history.append({"role": g_role, "parts": [text]})
+        history.append(
+            types.Content(role=g_role, parts=[types.Part.from_text(text=text)])
+        )
     return history
 
 
-def chat(user_text: str, context: list[tuple[str, str]], facts: list[str]) -> str:
+# ── 回覆清理 ─────────────────────────────────────────────────────────────────
+# Gemini 的 Google Search grounding 有時會在回覆裡插入 citation 標籤，
+# 例如 [cite:BROWSING_TOOL_1]、[1]、[2] 等。這些對 LINE 使用者沒意義，要清掉。
+_CITE_RE = re.compile(r"\[cite:\w+\]|\[BROWSING_TOOL_\d+\]")
+
+
+def _clean_reply(text: str) -> str:
+    """清除 Gemini 回覆中的 citation 標籤。"""
+    text = _CITE_RE.sub("", text)
+    # 清完 tag 後可能殘留多餘空格
+    text = re.sub(r"  +", " ", text)
+    return text.strip()
+
+
+# 對外接受的 parts 型別：單純字串、單個 Part、或 list 混合（text + bytes）
+MessageInput = Union[str, types.Part, list]
+
+
+def chat(
+    user_input: MessageInput,
+    context: list[tuple[str, str]],
+    facts: list[str],
+    persona_notes: list[dict] | None = None,
+) -> str:
     """
     主對話入口。
-    - user_text：使用者這次的新訊息
-    - context：舊的對話歷史（舊→新），**不含** user_text
-    - facts：已知的長期事實（會注進 system instruction）
+    - user_input：這次的新訊息。可以是：
+        * str：純文字
+        * types.Part：單個 Part（例如一張圖片）
+        * list：混合 list（例如 [text, image_bytes_part]）
+    - context：舊對話歷史（舊→新），不含這次的訊息
+    - facts：長期事實，會注進 system instruction
+    - persona_notes：人設範例 + 糾正記憶，注進 system instruction
     """
-    model = genai.GenerativeModel(
-        model_name=settings.gemini_model,
-        system_instruction=_build_system_instruction(facts),
+    chat_session = _client.chats.create(
+        model=settings.gemini_model,
+        config=_build_config(facts, persona_notes),
+        history=_to_gemini_history(context),
     )
-    chat_session = model.start_chat(history=_to_gemini_history(context))
-    response = chat_session.send_message(user_text)
-    return (response.text or "").strip() or "（抱歉我這次沒生出東西，再問一次試試）"
+    last_err = None
+    for attempt in range(3):
+        try:
+            response = chat_session.send_message(user_input)
+            text = (response.text or "").strip()
+            text = _clean_reply(text)
+            if text:
+                return text
+            # text 為空（可能 code_execution 吃掉了），重試
+            logger.warning("gemini chat attempt %d: empty text, retrying", attempt + 1)
+            continue
+        except Exception as e:
+            last_err = e
+            if "503" in str(e) and attempt < 2:
+                logger.warning("gemini 503, retry %d/2 after 2s", attempt + 1)
+                time.sleep(2)
+                continue
+            raise
+    raise last_err  # unreachable，但讓 type checker 安心
 
 
 _FACT_EXTRACT_PROMPT = """下面是一段 LINE 群組對話，請從中抽出「關於使用者的長期事實」，
@@ -90,15 +238,15 @@ def extract_facts(context: list[tuple[str, str]]) -> list[str]:
     )
     prompt = _FACT_EXTRACT_PROMPT.format(dialogue=dialogue)
     try:
-        model = genai.GenerativeModel(model_name=settings.gemini_model)
-        response = model.generate_content(prompt)
-        text = (response.text or "").strip()
-        # 去掉可能的 markdown fence
-        if text.startswith("```"):
-            text = text.strip("`")
-            if text.startswith("json"):
-                text = text[4:]
-            text = text.strip()
+        # 抽 facts 走 flash（頻率低 = 每 10 輪 1 次，吃 20/day 很安全）
+        response = _client.models.generate_content(
+            model=settings.gemini_model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+        text = _strip_code_fence((response.text or "").strip())
         facts = json.loads(text)
         if isinstance(facts, list):
             return [str(f).strip() for f in facts if str(f).strip()]
@@ -106,3 +254,308 @@ def extract_facts(context: list[tuple[str, str]]) -> list[str]:
     except Exception as e:
         logger.warning("extract_facts failed: %s", e)
         return []
+
+
+def _strip_code_fence(text: str) -> str:
+    """去掉 markdown code fence，讓 json.loads 吃得下。"""
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.startswith("json"):
+            text = text[4:]
+        text = text.strip()
+    return text
+
+
+# ── Burst 分類器（主動過濾的核心）─────────────────────────────────────────
+
+_CLASSIFY_PROMPT = """你是一個 LINE 群組 bot 的「過濾器」。下面是群組裡最近幾則訊息。
+請判斷這段對話裡，有沒有「值得你主動回應/查證」的內容。
+
+【必須主動回應】的情境：
+- 有人分享新聞連結、轉貼文章，尤其是可能有事實爭議或假訊息風險
+- 有人在討論政治、選舉、兩岸、族群、宗教、疫苗、健康等需要查證的敏感話題
+- 有人提出明確問題（不是反問、不是閒聊語助詞）
+- 有人轉貼長文（> 80 字的正式文字段落），像是論點、聲明、文章節錄
+- 短訊息（< 80 字）但包含可疑的事實宣稱（數據、政策、研究結論、健康偏方等看起來可能是假訊息的內容）→ respond，讓主模型去查核
+
+【不要回應】的情境：
+- 純閒聊（「吃飯了嗎」「晚安」「哈哈」「好喔」「讚」）
+- 貼圖、emoji、反應詞
+- 問候、寒暄、打招呼
+- 家人之間的日常互動（「幫我買個東西」「我等等到家」）
+- 單純表達情緒（「累死」「好棒」）
+- 短訊息（< 80 字）且內容正確無誤或只是閒聊觀點，不涉及可疑事實
+
+【你已學到的規則】（要遵守）：
+{rules_block}
+
+【最近對話】：
+{dialogue}
+
+請以 JSON 回覆（不要 markdown、不要說明）：
+{{"decision": "respond" | "skip", "reason": "一句話說明"}}
+
+如果 decision 是 respond，我之後會再把完整的對話丟給另一個模型產生回覆。
+所以你只要判斷「值不值得回」就好，不要寫出回覆內容。"""
+
+
+def classify_burst(
+    combined_text: str,
+    rules: list[dict],
+) -> tuple[bool, str]:
+    """判斷這段 burst 是否值得回。回傳 (should_respond, reason)。
+
+    rules 是 list_filter_rules(group_id) 的輸出；會注進 prompt 讓模型參考。
+    任何失敗 → 預設不回（err on the side of quiet），reason="classifier_failed"。
+    """
+    if not combined_text.strip():
+        return (False, "empty")
+
+    if rules:
+        rule_lines = []
+        for r in rules:
+            tag = "不要回" if r["kind"] == "skip" else "要回"
+            rule_lines.append(f"- [{tag}] {r['pattern']}")
+        rules_block = "\n".join(rule_lines)
+    else:
+        rules_block = "（目前還沒有學到的規則）"
+
+    prompt = _CLASSIFY_PROMPT.format(
+        rules_block=rules_block,
+        dialogue=combined_text,
+    )
+    try:
+        # 分類用 light model，走獨立額度不吃主 chat 的 20/天
+        response = _client.models.generate_content(
+            model=settings.gemini_light_model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+        text = _strip_code_fence((response.text or "").strip())
+        data = json.loads(text)
+        decision = str(data.get("decision", "skip")).strip().lower()
+        reason = str(data.get("reason", "")).strip()[:200]
+        return (decision == "respond", reason or "no_reason")
+    except Exception as e:
+        logger.warning("classify_burst failed: %s", e)
+        return (False, "classifier_failed")
+
+
+# ── Layer 2：把使用者的糾正自動抽象成一條規則 ─────────────────────────────
+
+_RULE_GEN_PROMPT = """你正在幫一個 LINE 群組 bot 建立「過濾規則」。
+
+以下是一次「使用者糾正 bot」的情境：
+- bot 剛才主動回覆了某個訊息
+- 使用者覺得 bot 不應該回，並給出糾正原因
+
+請從這次糾正裡，抽出一條「通用規則」，讓 bot 以後遇到類似情境時不要回應。
+
+【bot 剛才的回覆】
+{bot_reply}
+
+【使用者的糾正原因】
+{user_reason}
+
+【bot 被觸發的原始訊息（如有）】
+{trigger_text}
+
+規則要求：
+1. 要「可重用」，不能只針對這一次（不要寫「今天爸爸說的」這種）
+2. 要簡短（一句話，不超過 50 字）
+3. 繁體中文
+4. 要能用「包含這類內容就跳過」的方式描述
+
+請以 JSON 回覆：
+{{"pattern": "規則描述", "explain": "為什麼這樣抽象"}}
+
+不要 markdown、不要加說明文字。"""
+
+
+def generate_filter_rule(
+    bot_reply: str,
+    user_reason: str,
+    trigger_text: str = "",
+) -> str | None:
+    """把一次糾正抽象成一條 skip 規則的 pattern 字串。失敗回 None。"""
+    prompt = _RULE_GEN_PROMPT.format(
+        bot_reply=bot_reply[:800],
+        user_reason=user_reason[:400],
+        trigger_text=(trigger_text or "(無)")[:800],
+    )
+    try:
+        # Layer 2 規則生成走 flash（使用者 /閉嘴 才觸發，頻率極低）
+        response = _client.models.generate_content(
+            model=settings.gemini_model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+        text = _strip_code_fence((response.text or "").strip())
+        data = json.loads(text)
+        pattern = str(data.get("pattern", "")).strip()
+        return pattern or None
+    except Exception as e:
+        logger.warning("generate_filter_rule failed: %s", e)
+        return None
+
+
+# ── Layer 3：週期性自我檢討，從過去 N 天的訊息抽出候選規則 ─────────────────
+
+_WEEKLY_REVIEW_PROMPT = """你是一個 LINE 群組 bot 的「自我檢討員」。下面是最近一段時間這個群組的
+對話紀錄（只含使用者的訊息，不含 bot 自己的回覆）。
+
+請幫 bot 找出「**值得當成新過濾規則**」的模式，讓 bot 以後更準確地決定該回或不該回。
+
+你要觀察的重點：
+1. 哪一類訊息頻繁出現、但 bot 一回就很蠢（→ 建議 skip 規則）
+2. 哪一類訊息其實很需要被查證或被回應、但很容易被忽略（→ 建議 must_answer 規則）
+3. 只挑你**真的有把握**的模式，不確定就不要列
+4. 已經在【目前的規則】裡的就不用重複提
+
+【目前的規則】：
+{rules_block}
+
+【最近對話】：
+{dialogue}
+
+請以 JSON 陣列回覆最多 3 條建議，格式如下（不要 markdown、不要額外說明）：
+[
+  {{"kind": "skip", "pattern": "規則描述（20 字內）", "reason": "為什麼建議這條（30 字內）"}},
+  ...
+]
+
+如果沒有任何值得建議的，就回空陣列 []。
+kind 只能是 "skip" 或 "must_answer"。"""
+
+
+def weekly_review(
+    dialogue_text: str,
+    existing_rules: list[dict],
+) -> list[dict]:
+    """週期性檢討入口。回傳 [{kind, pattern, reason}, ...]，最多 3 條；失敗回 []。"""
+    if not dialogue_text.strip():
+        return []
+
+    if existing_rules:
+        rule_lines = []
+        for r in existing_rules:
+            tag = "不要回" if r["kind"] == "skip" else "要回"
+            rule_lines.append(f"- [{tag}] {r['pattern']}")
+        rules_block = "\n".join(rule_lines)
+    else:
+        rules_block = "（目前還沒有任何規則）"
+
+    prompt = _WEEKLY_REVIEW_PROMPT.format(
+        rules_block=rules_block,
+        dialogue=dialogue_text,
+    )
+    try:
+        # Layer 3 週檢討走 flash（一週 1 次，~0.14/day，佔預算 <1%）
+        response = _client.models.generate_content(
+            model=settings.gemini_model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+        text = _strip_code_fence((response.text or "").strip())
+        data = json.loads(text)
+        if not isinstance(data, list):
+            return []
+        out = []
+        for item in data[:3]:  # 硬上限 3 條
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind", "")).strip().lower()
+            pattern = str(item.get("pattern", "")).strip()
+            reason = str(item.get("reason", "")).strip()
+            if kind not in ("skip", "must_answer") or not pattern:
+                continue
+            out.append({"kind": kind, "pattern": pattern[:80], "reason": reason[:120]})
+        return out
+    except Exception as e:
+        logger.warning("weekly_review failed: %s", e)
+        return []
+
+
+# ── 人設檢討：從真實對話挑好範例 + 抓糾正 ────────────────────────────────────
+
+_PERSONA_REVIEW_PROMPT = """你是一個「人設教練」。下面是一隻小貓咪 bot 在 LINE 群組裡最近的對話紀錄，
+包含使用者的訊息和 bot 的回覆。
+
+bot 的目標人設：
+- 溫柔、可愛、安靜乖巧的小女生
+- 像美玉姨一樣言簡意賅，只講重要的話，不廢話
+- 短句、口語，不寫作文
+- 不主動插嘴閒聊，不說「我跳過」這類多餘的話
+
+請做兩件事：
+
+1. 【好範例】從 bot 的回覆中挑出最符合目標人設的 2~3 則，標記情境標籤
+2. 【糾正紀錄】找出使用者糾正 bot 的地方（例如「不要說英文」「太正式了」「不要這樣講」），
+   把糾正內容提煉成一條簡短規則
+
+回傳 JSON（不要 markdown、不要說明）：
+{{
+  "examples": [
+    {{"scenario": "情境標籤", "response": "bot 的原始回覆"}},
+    ...
+  ],
+  "corrections": [
+    {{"scenario": "語言", "rule": "回覆只用繁體中文，不要夾英文"}},
+    ...
+  ]
+}}
+
+examples 最多 3 則，corrections 最多 3 則。
+如果沒挑到就留空陣列。不要自己編造，只從對話中挑。
+
+【對話紀錄】：
+{dialogue}"""
+
+
+def persona_review(dialogue_text: str) -> dict:
+    """人設檢討入口。回傳 {{"examples": [...], "corrections": [...]}}。失敗回空。"""
+    if not dialogue_text.strip():
+        return {"examples": [], "corrections": []}
+
+    prompt = _PERSONA_REVIEW_PROMPT.format(dialogue=dialogue_text)
+    try:
+        response = _client.models.generate_content(
+            model=settings.gemini_model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+        text = _strip_code_fence((response.text or "").strip())
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            return {"examples": [], "corrections": []}
+
+        examples = []
+        for item in (data.get("examples") or [])[:3]:
+            if not isinstance(item, dict):
+                continue
+            scenario = str(item.get("scenario", "")).strip()[:30]
+            resp = str(item.get("response", "")).strip()[:500]
+            if scenario and resp:
+                examples.append({"scenario": scenario, "response": resp})
+
+        corrections = []
+        for item in (data.get("corrections") or [])[:3]:
+            if not isinstance(item, dict):
+                continue
+            scenario = str(item.get("scenario", "")).strip()[:30]
+            rule = str(item.get("rule", "")).strip()[:100]
+            if rule:
+                corrections.append({"scenario": scenario or "一般", "rule": rule})
+
+        return {"examples": examples, "corrections": corrections}
+    except Exception as e:
+        logger.warning("persona_review failed: %s", e)
+        return {"examples": [], "corrections": []}
