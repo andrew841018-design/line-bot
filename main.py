@@ -1110,9 +1110,20 @@ def _reply(reply_token: str, text: str, group_id: str | None = None) -> None:
 
     若 reply_token 已過期（例如 redelivery）且有 group_id,
     自動 fallback 到 push_message 補送。
+
+    settings.bot_muted=True 時整個函式 short-circuit:
+    不 reply、不 push、只把原本要送的 text 寫進 log 方便除錯。
     """
     # LINE 單則訊息上限 5000 字
     text = text[:4900]
+
+    # ── Mute 守門 ─────────────────────────────────────────────────────────────
+    # 修 bug 期間預設靜音。webhook 照收、classifier/chat 照跑、log 照寫，只是不送 LINE。
+    if settings.bot_muted:
+        logger.info("[MUTED] would_reply group=%s len=%d preview=%r",
+                    group_id, len(text), text[:120])
+        return
+
     resp = None
     try:
         with ApiClient(_line_config) as api_client:

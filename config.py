@@ -42,5 +42,10 @@ class Settings(BaseSettings):
     # 最多注入 prompt 的事實數量
     max_facts_in_prompt: int = 20
 
+    # ── Mute 開關 ─────────────────────────────────────────────────────────────
+    # True = 不對 LINE 送出任何回覆（webhook 照收、Gemini 照跑、log 照寫，只是不 push）
+    # 預設靜音；修 bug 完成後在 .env 加 BOT_MUTED=false 並 restart uvicorn 解除
+    bot_muted: bool = True
+
 
 settings = Settings()  # type: ignore[call-arg]
