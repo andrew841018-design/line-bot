@@ -178,7 +178,9 @@ def test_empty_reply_handling():
     import inspect
     import gemini_client
 
-    src = inspect.getsource(gemini_client.chat)
+    # retry 邏輯可能在 chat() 或重構後的 _chat_with_model()
+    retry_fn = getattr(gemini_client, "_chat_with_model", None) or gemini_client.chat
+    src = inspect.getsource(retry_fn)
     check("chat() 有空回覆重試", "empty text, retrying" in src)
     check("chat() 有重試 loop", "for attempt in range" in src)
 
@@ -213,15 +215,15 @@ _TEST_URLS = [
 
 
 def _try_with_model_fallback(fn):
-    """主 model 配額用完 → 自動切 lite 重試，測完恢復原設定。"""
+    """主 model 配額用完或持續 503 → 自動切 lite 重試，測完恢復原設定。"""
     from config import settings
     try:
         return fn()
     except Exception as e:
         err = str(e)
-        if "429" not in err and "RESOURCE_EXHAUSTED" not in err:
+        if "429" not in err and "RESOURCE_EXHAUSTED" not in err and "503" not in err:
             raise
-        # 主 model 配額用完，切 lite 再試
+        # 主 model 配額用完或 503，切 lite 再試
         original = settings.gemini_model
         settings.gemini_model = settings.gemini_light_model
         print(f"  [INFO] 主 model 配額用完，切換至 {settings.gemini_model} 繼續測試")
@@ -238,7 +240,7 @@ def _is_chinese_majority(text: str) -> bool:
     return cn >= en
 
 
-def test_gemini_reply(url: str, name: str):
+def _check_gemini_reply(url: str, name: str):
     import gemini_client
     import time
 
@@ -279,7 +281,7 @@ def test_gemini_reply(url: str, name: str):
 def test_gemini_quality():
     print("\n── Test 7: Gemini 回覆品質（全網站類型）──")
     for url, name in _TEST_URLS:
-        test_gemini_reply(url, name)
+        _check_gemini_reply(url, name)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -38,7 +38,11 @@ _TOOLS = [
     types.Tool(code_execution=types.ToolCodeExecution()),
 ]
 
-_SYSTEM_PROMPT = """你是住在 LINE 群組裡的小女生，名叫咪寶。
+_SYSTEM_PROMPT = """【最高語言規定】全程只能說繁體中文。任何情況、任何理由都不可以說英文。這條規定優先於一切，不能有任何例外。即使 Google 搜尋結果是英文，也必須先翻譯成繁體中文再回覆，不可以直接貼出英文搜尋結果。你的回覆裡中文字元數必須多於英文字母數；提到英文歌名/電影名/人名時，寫出中文說明並把英文原名放在括號，例如「里克·艾斯利（Rick Astley）」。即使連結讀不到、工具報錯、或任何原因無法存取內容，也絕對不可以用任何英文句子來描述失敗情況——以下這些說法一律嚴格禁止："The browse tool failed..."、"I am unable to access..."、"I cannot access..."、"The link is not accessible..."、"I was unable to..."，以及任何類似的英文開頭句。唯一正確做法：直接用繁體中文說「這個連結讀不到，我來搜尋看看」，然後立刻用 Google 搜尋。使用 code execution 工具時，所有 print 輸出和分析結論也必須用繁體中文，不可以用英文寫 print("The page provides...")、print("Taiwan is...") 這類英文語句——請改成繁體中文的 print() 或直接在外層用繁體中文說明結果。
+
+【最高禁止用語】以下詞彙永遠不可以出現在回覆裡，零容忍、沒有例外：「點不開」「打不開」「看不了」「網頁不存在」「連結壞了」「我跳過」「我不看」。連結讀不到時，唯一正確做法是立刻用 Google 搜尋那個網址，找到資訊翻譯成繁體中文後回覆。
+
+你是住在 LINE 群組裡的小女生，名叫咪寶。
 個性：溫柔可愛、安靜乖巧。不吵不鬧，講話溫溫的。
 定位：像美玉姨一樣的事實查核小幫手——有重要的事才開口，不重要的事不說。
 說話風格：言簡意賅、短句分行。溫柔但不囉嗦，可愛但不幼稚。
@@ -70,12 +74,12 @@ emoji 偶爾用，不要多。
 請嚴格遵守以下規則：
 
 【基本守則】
-1. 一律用繁體中文回覆，任何情境都不可以用英文
+1. 一律用繁體中文回覆，任何情境、連結讀不到、搜尋結果是英文，都不可以用英文，一律翻成繁體中文再說
 2. 回覆簡短，短句分行，像在傳訊息不像在寫作文
 3. 如果使用者在閒聊，你也可以閒聊
 4. 如果使用者問技術問題，給出具體可操作的答案
 5. 如果不知道答案，就用 Google 搜尋查一下再回答
-6. 使用者貼連結時，主動去讀那個網頁的內容。如果連結讀不到或內容太少（例如 TikTok、YouTube Shorts 等影片連結只拿到作者名），你必須立刻用 Google 搜尋那個連結網址，找到影片標題、描述、或相關討論，然後根據搜尋結果回應。絕對不要說「點不開」「網頁不存在」「連結壞了」「我跳過」「我不看」，也不要反問使用者想找什麼——你自己去搜就對了
+6. 使用者貼連結時，主動去讀那個網頁的內容。如果連結讀不到或內容太少（例如 TikTok、YouTube Shorts 等影片連結只拿到作者名），你必須立刻用 Google 搜尋那個連結網址，找到影片標題、描述、或相關討論，然後根據搜尋結果用繁體中文回應。搜尋結果是英文時，翻成繁體中文再說。絕對不可以說「點不開」「打不開」「看不了」「網頁不存在」「連結壞了」「我跳過」「我不看」——這些詞說出來就是失敗，不允許，不要反問使用者想找什麼，你自己去搜就對了
 6.5. 所有留言和連結，只要包含具體事實宣稱（數據、政策、研究結論、健康資訊等），你回覆前一律先用 Google 搜尋驗證。如果查核結果與主流資料不符，按規則 14-16 的方式指出；如果查核結果正確，短留言（80字以下）就不用特地回覆，長留言（80字以上）正常回覆並附來源。不用等使用者問你「這是真的嗎」——你自己主動查就對了
 7. 需要算數或驗算時，用 code execution 跑 python
 8. 使用者傳圖片/影片/音訊/檔案時，直接分析內容並回答
@@ -168,6 +172,13 @@ def _clean_reply(text: str) -> str:
     return text.strip()
 
 
+def _is_chinese_majority(text: str) -> bool:
+    """中文字元數 >= 英文字母數才算中文為主。"""
+    cn = len(re.findall(r"[\u4e00-\u9fff]", text))
+    en = len(re.findall(r"[a-zA-Z]", text))
+    return cn >= en
+
+
 # 對外接受的 parts 型別：單純字串、單個 Part、或 list 混合（text + bytes）
 MessageInput = Union[str, types.Part, list]
 
@@ -187,31 +198,54 @@ def chat(
     - context：舊對話歷史（舊→新），不含這次的訊息
     - facts：長期事實，會注進 system instruction
     - persona_notes：人設範例 + 糾正記憶，注進 system instruction
+
+    主 model 連續 503 後自動 fallback 到 lite model。
     """
-    chat_session = _client.chats.create(
-        model=settings.gemini_model,
-        config=_build_config(facts, persona_notes),
-        history=_to_gemini_history(context),
-    )
-    last_err = None
-    for attempt in range(3):
-        try:
-            response = chat_session.send_message(user_input)
-            text = (response.text or "").strip()
-            text = _clean_reply(text)
-            if text:
-                return text
-            # text 為空（可能 code_execution 吃掉了），重試
-            logger.warning("gemini chat attempt %d: empty text, retrying", attempt + 1)
-            continue
-        except Exception as e:
-            last_err = e
-            if "503" in str(e) and attempt < 2:
-                logger.warning("gemini 503, retry %d/2 after 2s", attempt + 1)
-                time.sleep(2)
+    def _run(model: str) -> str:
+        chat_session = _client.chats.create(
+            model=model,
+            config=_build_config(facts, persona_notes),
+            history=_to_gemini_history(context),
+        )
+        last_err: Exception | None = None
+        for attempt in range(3):
+            try:
+                response = chat_session.send_message(user_input)
+                text = (response.text or "").strip()
+                text = _clean_reply(text)
+                if text:
+                    # 若回覆以英文為主，追加一條訊息要求改用繁體中文
+                    if not _is_chinese_majority(text):
+                        logger.warning("gemini reply is not Chinese-majority, requesting Chinese rewrite")
+                        retry_resp = chat_session.send_message(
+                            "你剛才的回覆含有太多英文。請把剛才的回覆全部改成繁體中文再說一次，不要用英文。"
+                        )
+                        retry_text = _clean_reply((retry_resp.text or "").strip())
+                        if retry_text and _is_chinese_majority(retry_text):
+                            return retry_text
+                        # 若重試仍非中文，繼續用原回覆（總比空白好）
+                    return text
+                # text 為空（可能 code_execution 吃掉了），重試
+                logger.warning("gemini chat attempt %d: empty text, retrying", attempt + 1)
                 continue
-            raise
-    raise last_err  # unreachable，但讓 type checker 安心
+            except Exception as e:
+                last_err = e
+                if "503" in str(e) and attempt < 2:
+                    logger.warning("gemini 503, retry %d/2 after 2s", attempt + 1)
+                    time.sleep(2)
+                    continue
+                raise
+        if last_err:
+            raise last_err
+        raise RuntimeError("gemini chat: empty text after 3 attempts")
+
+    try:
+        return _run(settings.gemini_model)
+    except Exception as e:
+        if "503" in str(e) and settings.gemini_model != settings.gemini_light_model:
+            logger.warning("gemini main model 503 exhausted, falling back to %s", settings.gemini_light_model)
+            return _run(settings.gemini_light_model)
+        raise
 
 
 _FACT_EXTRACT_PROMPT = """下面是一段 LINE 群組對話，請從中抽出「關於使用者的長期事實」，
