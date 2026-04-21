@@ -26,6 +26,13 @@ from zoneinfo import ZoneInfo
 import requests as _requests
 from bs4 import BeautifulSoup
 
+try:
+    import yt_dlp as _yt_dlp
+    _YTDLP_AVAILABLE = True
+except ImportError:
+    _yt_dlp = None
+    _YTDLP_AVAILABLE = False
+
 from fastapi import FastAPI, Header, HTTPException, Request
 from google.genai import types
 from linebot.v3 import WebhookParser
@@ -98,6 +105,10 @@ _PREFETCH_MAX_CHARS = 5000   # 截斷上限，避免塞爆 prompt
 _PREFETCH_MAX_URLS = 2       # 一次最多抓幾個連結
 _PREFETCH_MIN_CHARS = 80     # 低於此長度視為垃圾（JS 渲染空殼），不塞進 prompt
 
+_YTDLP_TIMEOUT = 12          # yt-dlp 單次提取上限（秒）
+_YTDLP_SUBTITLE_MAX_CHARS = 3000
+_YTDLP_SUBTITLE_LANGS = ["zh-TW", "zh-Hant", "zh", "zh-Hans", "en"]
+
 # JS 渲染 / Cloudflare 保護的網站，requests.get() 抓不到有效內容
 # 這些網站一律不 prefetch，直接讓 Gemini 用 Google Search 處理
 _JS_RENDERED_DOMAINS = re.compile(
@@ -108,14 +119,426 @@ _JS_RENDERED_DOMAINS = re.compile(
     r")/", re.IGNORECASE
 )
 
+# TikTok 短網址 pattern（vt.tiktok.com / vm.tiktok.com），需先 redirect 才能丟 oEmbed
+_TIKTOK_SHORT_DOMAIN = re.compile(r"https?://(?:vt|vm)\.tiktok\.com/", re.IGNORECASE)
+# 從 oEmbed html 欄位抽背景音樂
+# html 結構：<a title="♬ xxx" href="..."> ♬ xxx</a>，title 裡也有 ♬ 會誤匹配，
+# 所以要求 ♬ 前面必須是 `>`（真正的 anchor content，不是屬性值）
+_TIKTOK_MUSIC_RE = re.compile(r">\s*♬\s*([^<]+?)\s*</a>", re.UNICODE)
+
+
+def _parse_vtt(vtt_text: str) -> str:
+    """WebVTT → 純文字，去掉時間碼、HTML tag、相鄰重複行。"""
+    lines = []
+    for line in vtt_text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("WEBVTT") or "-->" in line or line.isdigit():
+            continue
+        line = re.sub(r"<[^>]+>", "", line)
+        if line:
+            lines.append(line)
+    deduped = []
+    for ln in lines:
+        if not deduped or ln != deduped[-1]:
+            deduped.append(ln)
+    return "\n".join(deduped)
+
+
+def _extract_subtitles_from_info(info: dict) -> str | None:
+    """從 yt-dlp info dict 拿字幕文字（優先人工字幕 → 自動生成，語言優先順序見常數）。"""
+    for subs_dict in (info.get("subtitles") or {}, info.get("automatic_captions") or {}):
+        for lang in _YTDLP_SUBTITLE_LANGS:
+            entries = subs_dict.get(lang)
+            if not entries:
+                continue
+            entry = next((e for e in entries if e.get("ext") == "vtt"), entries[0])
+            sub_url = entry.get("url") if entry else None
+            if not sub_url:
+                continue
+            try:
+                resp = _requests.get(sub_url, timeout=8)
+                resp.raise_for_status()
+                text = _parse_vtt(resp.text)
+                if text and len(text) > 50:
+                    if len(text) > _YTDLP_SUBTITLE_MAX_CHARS:
+                        text = text[:_YTDLP_SUBTITLE_MAX_CHARS] + "…（字幕截斷）"
+                    return text
+            except Exception as e:
+                logger.debug("subtitle download failed lang=%s: %s", lang, e)
+    return None
+
+
+def _fetch_video_ytdlp(url: str) -> str | None:
+    """
+    用 yt-dlp 抓影片 metadata + 字幕，支援 YouTube、TikTok、IG、FB、X 等 1000+ 網站。
+
+    優先抓字幕（中文 > 英文）；沒字幕就用 title + description。
+    任何錯誤都回 None（讓 caller fallback）。
+    """
+    if not _YTDLP_AVAILABLE:
+        return None
+    try:
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "socket_timeout": _YTDLP_TIMEOUT,
+        }
+        with _yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        if not info:
+            return None
+
+        title = (info.get("title") or "").strip()
+        uploader = (info.get("uploader") or info.get("channel") or "").strip()
+        description = (info.get("description") or "").strip()
+        duration = info.get("duration")
+
+        if not title and not uploader:
+            return None
+
+        lines = [f"（以下是影片連結 {url} 的內容，透過 yt-dlp 擷取）"]
+        lines.append("--- 影片資訊開始 ---")
+        if title:
+            lines.append(f"標題：{title}")
+        if uploader:
+            lines.append(f"上傳者：{uploader}")
+        if duration:
+            m, s = divmod(int(duration), 60)
+            lines.append(f"長度：{m}:{s:02d}")
+        if description:
+            desc = description[:500] + "…" if len(description) > 500 else description
+            lines.append(f"描述：{desc}")
+
+        subtitle_text = _extract_subtitles_from_info(info)
+        if subtitle_text:
+            lines.append(f"\n字幕內容：\n{subtitle_text}")
+
+        lines.append("--- 影片資訊結束 ---")
+        block = "\n".join(lines)
+        logger.info("ytdlp OK url=%s chars=%d has_subs=%s", url, len(block), bool(subtitle_text))
+        return block
+    except Exception as e:
+        logger.info("ytdlp failed url=%s: %s", url, e)
+        return None
+
+
+def _fetch_tiktok_meta(url: str) -> str | None:
+    """
+    TikTok 專用 prefetch：走官方 oEmbed API（公開 endpoint，免 token）取 caption / 作者 / 音樂。
+
+    為什麼要這層：TikTok 是 JS 渲染，requests.get() 只抓到空殼；而 Gemini url_context
+    對 TikTok 實測 100% 回空字串（連三次 empty reply 後 raise RuntimeError）。
+    oEmbed endpoint 直接吐 JSON，能拿到 title（caption + hashtags）/ author_name /
+    author_unique_id / html（內含音樂資訊）。
+
+    失敗時回 None，由 caller fallback 回原本 skip 行為，不會退步。
+    """
+    try:
+        # 短網址（vt.tiktok.com / vm.tiktok.com）先 HEAD follow redirect 拿完整 URL
+        target_url = url
+        if _TIKTOK_SHORT_DOMAIN.search(url):
+            try:
+                r = _requests.head(
+                    url, timeout=_PREFETCH_TIMEOUT,
+                    allow_redirects=True,
+                    headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"},
+                )
+                target_url = r.url
+                logger.info("tiktok short url resolved: %s → %s", url, target_url)
+            except Exception as e:
+                logger.info("tiktok short url resolve failed url=%s: %s", url, e)
+                return None
+
+        # 呼叫 oEmbed API
+        resp = _requests.get(
+            "https://www.tiktok.com/oembed",
+            params={"url": target_url},
+            timeout=_PREFETCH_TIMEOUT,
+            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"},
+        )
+        if resp.status_code != 200:
+            logger.info("tiktok oembed HTTP %d url=%s", resp.status_code, target_url)
+            return None
+
+        data = resp.json()
+        # oEmbed error response 會是 {"message": "...", "code": 4xx}
+        if data.get("code") and int(data.get("code", 0)) >= 400:
+            logger.info("tiktok oembed error code=%s url=%s", data.get("code"), target_url)
+            return None
+
+        title = (data.get("title") or "").strip()
+        author_name = (data.get("author_name") or "").strip()
+        author_id = (data.get("author_unique_id") or "").strip()
+
+        # 從 html 欄位抽出背景音樂資訊
+        html_field = data.get("html") or ""
+        music_match = _TIKTOK_MUSIC_RE.search(html_field)
+        music = music_match.group(1).strip() if music_match else ""
+
+        if not title and not author_name:
+            logger.info("tiktok oembed empty content url=%s", target_url)
+            return None
+
+        lines = [f"（以下是 TikTok 連結 {url} 的影片資訊，透過 oEmbed API 擷取）"]
+        lines.append("--- TikTok 影片資訊開始 ---")
+        if author_name:
+            author_line = f"作者：{author_name}"
+            if author_id:
+                author_line += f" (@{author_id})"
+            lines.append(author_line)
+        if title:
+            lines.append(f"影片描述：{title}")
+        if music:
+            lines.append(f"背景音樂：{music}")
+        lines.append("--- TikTok 影片資訊結束 ---")
+
+        block = "\n".join(lines)
+        logger.info(
+            "tiktok oembed OK url=%s author=%s chars=%d",
+            url, author_id or author_name, len(block),
+        )
+        return block
+    except Exception as e:
+        logger.info("tiktok oembed failed url=%s: %s", url, e)
+        return None
+
+
+def _fetch_youtube_meta(url: str) -> str | None:
+    """
+    YouTube（含 shorts、youtu.be）走官方 oEmbed API 拿 title + 頻道。免 token、免 auth。
+
+    為什麼要這層：
+      - youtube.com/shorts / youtu.be 在 JS 白名單裡（目前 skip，讓 Gemini 處理，但 url_context 對 shorts 吐 metadata 不穩定）
+      - youtube.com/watch 走 generic HTML prefetch 只抓到 ~280 chars boilerplate
+      - oEmbed endpoint 穩定吐 title + author_name，比前兩條路都好
+
+    限制：oEmbed 不提供 description，想拿內容描述還是只能靠 Gemini；但至少 title 有了。
+    """
+    try:
+        resp = _requests.get(
+            "https://www.youtube.com/oembed",
+            params={"url": url, "format": "json"},
+            timeout=_PREFETCH_TIMEOUT,
+            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"},
+        )
+        if resp.status_code != 200:
+            logger.info("youtube oembed HTTP %d url=%s", resp.status_code, url)
+            return None
+
+        data = resp.json()
+        title = (data.get("title") or "").strip()
+        author = (data.get("author_name") or "").strip()
+        if not title and not author:
+            return None
+
+        lines = [f"（以下是 YouTube 連結 {url} 的影片資訊，透過 oEmbed API 擷取）"]
+        lines.append("--- YouTube 影片資訊開始 ---")
+        if title:
+            lines.append(f"標題：{title}")
+        if author:
+            lines.append(f"頻道：{author}")
+        lines.append("（備註：oEmbed 只給標題與頻道，影片實際內容請自行參考連結）")
+        lines.append("--- YouTube 影片資訊結束 ---")
+        block = "\n".join(lines)
+        logger.info("youtube oembed OK url=%s chars=%d", url, len(block))
+        return block
+    except Exception as e:
+        logger.info("youtube oembed failed url=%s: %s", url, e)
+        return None
+
+
+# Reddit 短網址 pattern：
+#   舊 redd.it/xxx（短 domain）
+#   新 reddit.com/r/sub/s/xxx（share link）
+_REDDIT_SHORT_DOMAIN = re.compile(r"https?://redd\.it/", re.IGNORECASE)
+_REDDIT_SHARE_PATH = re.compile(r"reddit\.com/r/[^/]+/s/", re.IGNORECASE)
+
+
+def _fetch_reddit_meta(url: str) -> str | None:
+    """
+    Reddit 走公開 .json endpoint 拿 post + 前三條 top comments。免 token，但需 User-Agent。
+
+    為什麼要這層：
+      - reddit.com 在 JS 白名單，目前 skip；而 Gemini url_context 對 reddit 常常只拿到 meta tag
+      - .json endpoint 是 reddit 官方認可的 public API，吐結構化 JSON（title / selftext / comments）
+      - 拿到 selftext + 熱門留言，資訊量遠大於 Gemini 原本拿到的 meta
+    """
+    try:
+        # 短網址 resolve：redd.it/xxx 和 reddit.com/r/.../s/xxx 都要先 follow redirect
+        target = url
+        if _REDDIT_SHORT_DOMAIN.search(url) or _REDDIT_SHARE_PATH.search(url):
+            try:
+                r = _requests.head(
+                    url, timeout=_PREFETCH_TIMEOUT, allow_redirects=True,
+                    headers={"User-Agent": "ptt-line-bot/1.0"},
+                )
+                target = r.url
+                logger.info("reddit short url resolved: %s → %s", url, target)
+            except Exception as e:
+                logger.info("reddit short url resolve failed url=%s: %s", url, e)
+                return None
+
+        # 非貼文 URL（例如 subreddit 首頁、使用者頁面）沒 .json 可抓
+        if "/comments/" not in target:
+            logger.info("reddit url 非貼文格式 (no /comments/) url=%s", target)
+            return None
+
+        # 砍 query/fragment，path 結尾加 .json
+        from urllib.parse import urlsplit, urlunsplit
+        parts = urlsplit(target)
+        json_path = parts.path.rstrip("/") + ".json"
+        json_url = urlunsplit((parts.scheme, parts.netloc, json_path, "", ""))
+
+        resp = _requests.get(
+            json_url, timeout=_PREFETCH_TIMEOUT,
+            headers={"User-Agent": "ptt-line-bot/1.0 (LINE chatbot prefetcher)"},
+        )
+        if resp.status_code != 200:
+            logger.info("reddit .json HTTP %d url=%s", resp.status_code, json_url)
+            return None
+
+        data = resp.json()
+        # 正常 response：[post_listing, comments_listing]
+        if not isinstance(data, list) or len(data) < 1:
+            return None
+
+        post_children = data[0].get("data", {}).get("children", [])
+        if not post_children:
+            return None
+        post = post_children[0].get("data", {}) or {}
+
+        title = (post.get("title") or "").strip()
+        if not title:
+            return None
+
+        selftext = (post.get("selftext") or "").strip()
+        subreddit = (post.get("subreddit") or "").strip()
+        author = (post.get("author") or "").strip()
+        score = post.get("score", 0)
+        num_comments = post.get("num_comments", 0)
+
+        # 前三條 top-level 留言（跳過 deleted / removed）
+        top_comments = []
+        if len(data) > 1:
+            for child in data[1].get("data", {}).get("children", []):
+                if len(top_comments) >= 3:
+                    break
+                c = child.get("data", {}) or {}
+                body = (c.get("body") or "").strip()
+                if not body or body in ("[deleted]", "[removed]"):
+                    continue
+                if len(body) > 300:
+                    body = body[:300] + "…"
+                top_comments.append(
+                    f"  - u/{c.get('author', '?')} ({c.get('score', 0)} 分): {body}"
+                )
+
+        # 內文截斷（避免塞爆 prompt；留空間給 comments）
+        if len(selftext) > _PREFETCH_MAX_CHARS - 500:
+            selftext = selftext[: _PREFETCH_MAX_CHARS - 500] + "…（內文截斷）"
+
+        lines = [f"（以下是 Reddit 貼文 {url} 的內容，透過 .json endpoint 擷取）"]
+        lines.append("--- Reddit 貼文開始 ---")
+        lines.append(f"版：r/{subreddit}")
+        lines.append(f"作者：u/{author}")
+        lines.append(f"標題：{title}")
+        lines.append(f"分數：{score} / 留言數：{num_comments}")
+        if selftext:
+            lines.append(f"內文：\n{selftext}")
+        if top_comments:
+            lines.append("熱門留言：")
+            lines.extend(top_comments)
+        lines.append("--- Reddit 貼文結束 ---")
+
+        block = "\n".join(lines)
+        logger.info(
+            "reddit .json OK url=%s subreddit=%s comments=%d chars=%d",
+            url, subreddit, len(top_comments), len(block),
+        )
+        return block
+    except Exception as e:
+        logger.info("reddit .json failed url=%s: %s", url, e)
+        return None
+
+
+_IG_REEL_RE = re.compile(r"instagram\.com/(reel|p)/([A-Za-z0-9_-]+)", re.IGNORECASE)
+
+
+def _fetch_instagram_embed(url: str) -> str | None:
+    """
+    Instagram Reels / Posts 的 embed 頁面 fallback。
+
+    yt-dlp 對 IG 失敗率高，這層直接抓 /embed/ 公開頁面，
+    用 BeautifulSoup 解出 caption（不需要 token / 登入）。
+    """
+    m = _IG_REEL_RE.search(url)
+    if not m:
+        return None
+    shortcode = m.group(2)
+    kind = m.group(1).lower()   # reel 或 p
+    embed_url = f"https://www.instagram.com/{kind}/{shortcode}/embed/"
+    try:
+        resp = _requests.get(
+            embed_url,
+            timeout=_PREFETCH_TIMEOUT,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/124.0.0.0 Safari/537.36",
+                "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+            },
+        )
+        if resp.status_code != 200:
+            logger.info("ig embed HTTP %d url=%s", resp.status_code, embed_url)
+            return None
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # caption 通常在 <div class="Caption"> 或 meta description
+        caption = ""
+        caption_div = soup.find("div", class_=re.compile(r"Caption", re.I))
+        if caption_div:
+            caption = caption_div.get_text(separator=" ", strip=True)
+
+        if not caption:
+            meta = soup.find("meta", attrs={"name": "description"}) or \
+                   soup.find("meta", attrs={"property": "og:description"})
+            if meta:
+                caption = (meta.get("content") or "").strip()
+
+        if not caption or len(caption) < 10:
+            logger.info("ig embed: no caption found url=%s", url)
+            return None
+
+        if len(caption) > 800:
+            caption = caption[:800] + "…"
+
+        block = (
+            f"（以下是 Instagram 連結 {url} 的內容，透過 embed 頁面擷取）\n"
+            f"--- Instagram 內容開始 ---\n"
+            f"Caption：{caption}\n"
+            f"--- Instagram 內容結束 ---"
+        )
+        logger.info("ig embed OK url=%s chars=%d", url, len(block))
+        return block
+    except Exception as e:
+        logger.info("ig embed failed url=%s: %s", url, e)
+        return None
+
 
 def _prefetch_urls(text: str) -> str:
     """
     從文字中抽出 URL，用 Python requests 預先抓取網頁內容，
     轉成純文字後塞進 prompt。
 
-    JS 渲染網站（TikTok/Dcard/IG/X 等）不 prefetch，
-    直接讓 Gemini 用 Google Search 找內容。
+    特殊平台優先走公開 API（oEmbed / .json），比 HTML prefetch 或 Gemini url_context 穩定：
+      - TikTok  → www.tiktok.com/oembed（caption + author + music）
+      - YouTube → www.youtube.com/oembed（title + channel）
+      - Reddit  → <permalink>.json（title + selftext + top 3 comments）
+
+    其他 JS 渲染網站（IG/threads/FB/X/dcard）仍 skip，交給 Gemini Google Search。
+    一般靜態網頁走 HTML prefetch + BeautifulSoup 文字萃取。
     """
     urls = _URL_RE.findall(text)
     if not urls:
@@ -124,9 +547,47 @@ def _prefetch_urls(text: str) -> str:
     blocks = []
     for url in urls[:_PREFETCH_MAX_URLS]:
         try:
-            # JS 渲染 / Cloudflare 網站：不 prefetch，交給 Gemini Google Search
+            u_lower = url.lower()
+
+            # 1) 影片平台：yt-dlp 優先（支援字幕），失敗才 fallback oEmbed
+            if "tiktok.com" in u_lower:
+                block = _fetch_video_ytdlp(url) or _fetch_tiktok_meta(url)
+                if block:
+                    blocks.append(block)
+                else:
+                    logger.info("tiktok: ytdlp + oembed both failed, skip url=%s", url)
+                continue
+            if "youtube.com" in u_lower or "youtu.be" in u_lower:
+                block = _fetch_video_ytdlp(url) or _fetch_youtube_meta(url)
+                if block:
+                    blocks.append(block)
+                else:
+                    logger.info("youtube: ytdlp + oembed both failed, skip url=%s", url)
+                continue
+            if "reddit.com" in u_lower or "redd.it" in u_lower:
+                block = _fetch_reddit_meta(url)
+                if block:
+                    blocks.append(block)
+                else:
+                    logger.info("reddit .json failed, skip url=%s", url)
+                continue
+
+            # 2) Instagram Reels / Posts：yt-dlp → embed 頁面 → Google Search
+            if "instagram.com" in u_lower:
+                block = _fetch_video_ytdlp(url) or _fetch_instagram_embed(url)
+                if block:
+                    blocks.append(block)
+                else:
+                    logger.info("instagram: all methods failed url=%s → Gemini Google Search", url)
+                continue
+
+            # 3) 其他 JS 渲染網站（FB / X / Threads / dcard）：試 yt-dlp，失敗才 Google Search
             if _JS_RENDERED_DOMAINS.search(url):
-                logger.info("prefetch skip (JS/CF site) url=%s → Gemini Google Search", url)
+                block = _fetch_video_ytdlp(url)
+                if block:
+                    blocks.append(block)
+                else:
+                    logger.info("prefetch skip (JS/CF site, ytdlp failed) url=%s → Gemini Google Search", url)
                 continue
 
             # 一般網頁：直接抓取 HTML
@@ -264,8 +725,7 @@ def _handle_event(event) -> None:
         _handle_text_message(event, group_id)
         return
 
-    # 圖片 / 影片 / 音訊：只記 placeholder 不主動分析。
-    # 使用者之後若 @mention + 引用這則媒體訊息，會走 quote 路徑重新下載並分析。
+    # 圖片：只記 placeholder，不 OCR 也不回應。
     if isinstance(msg, ImageMessageContent):
         memory.log_raw_message(group_id, msg.id, sender_user_id, "[圖片]")
         return
@@ -280,6 +740,7 @@ def _handle_event(event) -> None:
     if isinstance(msg, FileMessageContent):
         _handle_file_message(event, group_id)
         return
+
 
 
 def _handle_text_message(event: MessageEvent, group_id: str) -> None:
@@ -300,15 +761,8 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
         _handle_explicit_text(event, group_id, clean_text)
         return
 
-    # 3. Implicit 訊息 → 丟進 burst 佇列，由主動過濾器決定要不要回
-    sender_user_id = getattr(event.source, "user_id", None)
-    burst_filter.add_to_burst(
-        group_id=group_id,
-        message_id=event.message.id,
-        text=text,
-        user_id=sender_user_id,
-        reply_token=event.reply_token,
-    )
+    # 3. 任何文字訊息都直接回應
+    _handle_explicit_text(event, group_id, text)
 
 
 def _handle_explicit_text(
@@ -1059,14 +1513,18 @@ _TEXT_MENTION_PREFIXES = (
     "@AI ", "@AI", "＠AI ", "＠AI",
 )
 
+# 直接叫名字也算觸發（長輩不用 @，直接說「咪寶...」）
+_BOT_NAME_KEYWORDS = ("咪寶",)
+
 
 def _extract_gemini_trigger(text: str, message: TextMessageContent) -> str | None:
     """判斷這則訊息是否要丟給 Gemini；若是，回傳乾淨的問題文字。
 
-    三種觸發方式（回 None 代表無視）：
+    四種觸發方式（回 None 代表無視）：
     1. 手機 LINE：@ 本 bot，會有 mention 結構 → 去掉 mention 後剩下的字
     2. /ai、/問、/ask 前綴 → 去掉前綴後剩下的字
     3. 桌機 LINE fallback：純文字 @AI 開頭（沒有 mention 結構）→ 去掉前綴
+    4. 訊息裡出現 bot 名字（咪寶）→ 去掉名字後剩下的字
     """
     t = text.strip()
     for prefix in _ASK_PREFIXES:
@@ -1082,6 +1540,11 @@ def _extract_gemini_trigger(text: str, message: TextMessageContent) -> str | Non
             return ""
         if t.lower().startswith(prefix.lower()):
             return t[len(prefix):].strip()
+    # 名字偵測：訊息裡出現 bot 名字就觸發，把名字挖掉後剩下的當問題
+    for name in _BOT_NAME_KEYWORDS:
+        if name in t:
+            clean = t.replace(name, "", 1).strip("，,、。！!？? \t")
+            return clean
     return None
 
 

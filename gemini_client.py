@@ -79,8 +79,9 @@ emoji 偶爾用，不要多。
 3. 如果使用者在閒聊，你也可以閒聊
 4. 如果使用者問技術問題，給出具體可操作的答案
 5. 如果不知道答案，就用 Google 搜尋查一下再回答
+5.5. 使用者貼的是「回覆別人的留言」而不是原始貼文時（例如：截圖裡有「回覆 @xxx」、引用框、或明顯是針對別人說話的語氣）：先把原始留言和這則回覆一起讀完、理解兩者的關係和脈絡，再做回應。不要只看回覆那一層，那樣會失去最重要的背景。
 6. 使用者貼連結時，主動去讀那個網頁的內容。如果連結讀不到或內容太少（例如 TikTok、YouTube Shorts 等影片連結只拿到作者名），你必須立刻用 Google 搜尋那個連結網址，找到影片標題、描述、或相關討論，然後根據搜尋結果用繁體中文回應。搜尋結果是英文時，翻成繁體中文再說。絕對不可以說「點不開」「打不開」「看不了」「網頁不存在」「連結壞了」「我跳過」「我不看」——這些詞說出來就是失敗，不允許，不要反問使用者想找什麼，你自己去搜就對了
-6.5. 所有留言和連結，只要包含具體事實宣稱（數據、政策、研究結論、健康資訊等），你回覆前一律先用 Google 搜尋驗證。如果查核結果與主流資料不符，按規則 14-16 的方式指出；如果查核結果正確，短留言（80字以下）就不用特地回覆，長留言（80字以上）正常回覆並附來源。不用等使用者問你「這是真的嗎」——你自己主動查就對了
+6.5. 所有留言和連結，只要包含具體事實宣稱（數據、政策、研究結論、健康資訊等），你回覆前一律先用 Google 搜尋驗證，且必須查至少 2~3 個不同來源（不同網域），找出各方觀點後再整合回覆。如果查核結果與主流資料不符，按規則 14-16 的方式指出；如果查核結果正確，也要附上來源。不用等使用者問你「這是真的嗎」——你自己主動查就對了
 7. 需要算數或驗算時，用 code execution 跑 python
 8. 使用者傳圖片/影片/音訊/檔案時，直接分析內容並回答
 
@@ -92,18 +93,30 @@ emoji 偶爾用，不要多。
 
 【假訊息事實查核】使用者可能把轉貼的影片/短片/文章/截圖丟來讓你判斷真假：
 13. 抽出內容裡的明確主張 → Google 搜尋驗證 → 給結論
-14. 有權威來源支持 → 用你的口吻說查到的資料支持，並附來源
+14. 有權威來源支持 → 用你的口吻說查到的資料支持，並附上來源網址
 15. 找不到權威來源或與共識相悖 → 用你的口吻說主流資料不支持，比較接近的共識是什麼
 16. 不要用「這是假的」「被騙了」「這是謠言」這類字眼，用中性但帶你個性的方式講
-17. 結論必須有來源，不要憑空斷定；找不到就說「查不到可靠來源」
+17. 結論必須有來源，同時提供至少 2 條不同網域的來源網址（格式範例：\n來源：\n• https://www.mohw.gov.tw/...\n• https://...）；找不到就說「查不到可靠來源」
 
 【回覆結構】
-18. 事實查核類：結論 → 依據（含來源）→ 短句補充，不要寫成作文
+18. 事實查核類：結論 → 依據（含來源網址）→ 短句補充，不要寫成作文
+18.5. 影片/文章摘要類（這類回覆要寫得比平常長，有實質內容）：
+  - 先用 1~2 句說核心主張是什麼
+  - 然後做深入但中立的分析（至少 3~5 點），內容可以包含：
+      * 這個觀點的前提是否成立
+      * 有沒有被刻意省略的重要背景或反例
+      * 另一派的主流看法是什麼、為什麼有人不同意——這條必寫，要具體說出反對論點，不能只說「有人不同意」
+      * 數據或說法有沒有需要查證或補充的地方
+      * 這件事放在更大的脈絡下代表什麼
+  - 用 Google 搜尋至少 2~3 個不同網站的報導或研究，找到不同角度後才整合回覆
+  - 分析要有具體內容，不可以只寫「值得思考」「有不同面向」「需要更多資訊」這種空話
+  - 附上至少 2 條不同網域的來源網址
+  - 短句分行，不要寫成長段作文，但整體篇幅要夠、不要草草結束
 19. 閒聊類：自然一兩句，不要硬加免責聲明
 20. 不要加「以上僅供參考」「請自行判斷」這類廢話
 21. 不需要回應的訊息，絕對不要提它、不要說「這個我跳過囉」「這個我不看」「我知道啦」之類的話。直接當作沒看到，完全不出聲
 22. 講完重點就結束，不要在結尾加多餘的口水句（例：「才不會弄錯嘛」「這樣比較好喔」「大家小心齁」），這種句子刪掉訊息完全不受影響
-23. 只在有價值的時候才開口。閒聊、問候、日常對話不要主動插嘴，除非被點名
+23. 任何文字訊息都要回應。閒聊類（早安晚安、吃飯了嗎、家常話）用自然的一兩句回應，不要硬加分析；有事實宣稱或連結的一律查證後回應
 """
 
 
@@ -172,6 +185,48 @@ def _clean_reply(text: str) -> str:
     return text.strip()
 
 
+def _extract_grounding_urls(response) -> list[tuple[str, str]]:
+    """從 response.candidates[0].grounding_metadata 抽出 (uri, title) 清單。"""
+    try:
+        candidates = getattr(response, "candidates", None) or []
+        if not candidates:
+            return []
+        meta = getattr(candidates[0], "grounding_metadata", None)
+        if meta is None:
+            return []
+        chunks = getattr(meta, "grounding_chunks", None) or []
+        seen: set[str] = set()
+        result = []
+        for chunk in chunks:
+            web = getattr(chunk, "web", None)
+            if web is None:
+                continue
+            uri = (getattr(web, "uri", None) or "").strip()
+            title = (getattr(web, "title", None) or "").strip()
+            if uri and uri not in seen:
+                seen.add(uri)
+                result.append((uri, title))
+        return result
+    except Exception:
+        return []
+
+
+_URL_IN_TEXT_RE = re.compile(r"https?://\S+")
+
+
+def _append_sources(text: str, urls: list[tuple[str, str]]) -> str:
+    """若回覆裡還沒有來源網址，就把 grounding URLs 補在結尾。最多附 3 條。"""
+    if not urls:
+        return text
+    # 如果 Gemini 自己已經寫了網址就不重複附
+    if _URL_IN_TEXT_RE.search(text):
+        return text
+    lines = ["來源："]
+    for uri, title in urls[:3]:
+        lines.append(f"• {title}\n  {uri}" if title else f"• {uri}")
+    return text + "\n\n" + "\n".join(lines)
+
+
 def _is_chinese_majority(text: str) -> bool:
     """中文字元數 >= 英文字母數才算中文為主。"""
     cn = len(re.findall(r"[\u4e00-\u9fff]", text))
@@ -213,6 +268,7 @@ def chat(
                 response = chat_session.send_message(user_input)
                 text = (response.text or "").strip()
                 text = _clean_reply(text)
+                grounding_urls = _extract_grounding_urls(response)
                 if text:
                     # 若回覆以英文為主，追加一條訊息要求改用繁體中文
                     if not _is_chinese_majority(text):
@@ -222,9 +278,10 @@ def chat(
                         )
                         retry_text = _clean_reply((retry_resp.text or "").strip())
                         if retry_text and _is_chinese_majority(retry_text):
-                            return retry_text
+                            retry_urls = _extract_grounding_urls(retry_resp)
+                            return _append_sources(retry_text, retry_urls or grounding_urls)
                         # 若重試仍非中文，繼續用原回覆（總比空白好）
-                    return text
+                    return _append_sources(text, grounding_urls)
                 # text 為空（可能 code_execution 吃掉了），重試
                 logger.warning("gemini chat attempt %d: empty text, retrying", attempt + 1)
                 continue
@@ -246,6 +303,26 @@ def chat(
             logger.warning("gemini main model 503 exhausted, falling back to %s", settings.gemini_light_model)
             return _run(settings.gemini_light_model)
         raise
+
+
+def ocr_image(data: bytes, mime_type: str = "image/jpeg") -> str | None:
+    """圖片 OCR + 描述，不帶 tools / thinking / history，快速單次呼叫。"""
+    try:
+        prompt = [
+            types.Part.from_bytes(data=data, mime_type=mime_type),
+            "請描述這張圖片的內容。如果有文字（截圖、新聞、聊天記錄、貼文等），請完整抄出來。如果是一般圖片，用一兩句說明內容。全程繁體中文。",
+        ]
+        response = _client.models.generate_content(
+            model=settings.gemini_model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+        return (response.text or "").strip() or None
+    except Exception as e:
+        logger.warning("ocr_image failed: %s", e)
+        return None
 
 
 _FACT_EXTRACT_PROMPT = """下面是一段 LINE 群組對話，請從中抽出「關於使用者的長期事實」，
