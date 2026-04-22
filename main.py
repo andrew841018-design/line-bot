@@ -101,14 +101,14 @@ _line_config = Configuration(access_token=settings.line_channel_access_token)
 # ── LINE 訊息配額 ─────────────────────────────────────────────────────────────
 
 def _get_quota_footer() -> str:
-    """每次回應時附上 Gemini 今日剩餘 token 量，失敗回空字串。"""
+    """每次回應時附上 Gemini 今日用量百分比，失敗回空字串。"""
     info = gemini_client.get_gemini_quota_info()
     if info is None:
         return ""
-    remaining = info["remaining_tokens"]
     used = info["used_tokens"]
     limit = info["limit_tokens"]
-    return f"\n\n📊 Gemini 今日剩 {remaining:,} tokens（已用 {used:,} / {limit:,}）"
+    pct = round(used / limit * 100, 1) if limit else 0
+    return f"\n\n📊 Gemini 今日已用 {pct}%"
 
 
 # ── URL 預抓取（繞過 Gemini url_context 的限制）─────────────────────────────
