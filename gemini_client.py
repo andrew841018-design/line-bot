@@ -17,9 +17,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
+from datetime import datetime
 from typing import Union
+from zoneinfo import ZoneInfo
 
 from google import genai
 from google.genai import types
@@ -29,6 +32,65 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 _client = genai.Client(api_key=settings.gemini_api_key)
+
+# ── 今日 Gemini token 用量追蹤 ──────────────────────────────────────────────
+_USAGE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gemini_usage.json")
+_PT = ZoneInfo("America/Los_Angeles")
+_DAILY_TOKEN_LIMIT = 1_000_000
+
+
+def _today_pt() -> str:
+    return datetime.now(tz=_PT).strftime("%Y-%m-%d")
+
+
+def _load_usage() -> dict:
+    try:
+        with open(_USAGE_FILE) as f:
+            data = json.load(f)
+        if data.get("date") == _today_pt():
+            return data
+    except Exception:
+        pass
+    return {"date": _today_pt(), "tokens": 0, "requests": 0}
+
+
+def _save_usage(data: dict) -> None:
+    try:
+        with open(_USAGE_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
+def _track_usage(response) -> None:
+    try:
+        meta = getattr(response, "usage_metadata", None)
+        if meta is None:
+            return
+        tokens = getattr(meta, "total_token_count", 0) or 0
+        data = _load_usage()
+        data["tokens"] = data.get("tokens", 0) + tokens
+        data["requests"] = data.get("requests", 0) + 1
+        _save_usage(data)
+    except Exception:
+        pass
+
+
+def get_gemini_quota_info() -> dict | None:
+    """回傳今日 Gemini 使用量；失敗回 None。"""
+    try:
+        data = _load_usage()
+        used_tokens = data.get("tokens", 0)
+        used_requests = data.get("requests", 0)
+        remaining = max(0, _DAILY_TOKEN_LIMIT - used_tokens)
+        return {
+            "used_tokens": used_tokens,
+            "used_requests": used_requests,
+            "remaining_tokens": remaining,
+            "limit_tokens": _DAILY_TOKEN_LIMIT,
+        }
+    except Exception:
+        return None
 
 # Gemini 2.5 自帶的 built-in tools，一次全開
 # 注意：每個 Tool 物件只能設一個 field（oneof），要 list 多個
@@ -113,6 +175,11 @@ emoji 偶爾用，不要多。
   - 分析要有具體內容，不可以只寫「值得思考」「有不同面向」「需要更多資訊」這種空話
   - **結尾必須附上 3~4 條實際可點的來源網址**（格式：`來源：\n• https://...`），不可以只說「可以搜尋」或「建議查閱」——這樣等於沒有來源
   - 整體篇幅要夠、不要草草結束
+18.6. 財經/投資建議類（股票、ETF、基金、理財策略、操作技巧等）：就算影片來源是正規媒體或知名老師，觀點仍主觀，必須：
+  - 先用 1~2 句摘要核心建議
+  - 用 Google 搜尋補充多角度資訊（例如：這個策略的適用條件、有什麼需要注意的地方、不同專家或研究的看法）
+  - 補充：這個建議的前提假設是什麼、適合哪種投資人、哪些情況要特別注意
+  - **結尾必須附上 3~4 條實際可點的來源網址**（金管會、學術文章、財經媒體等，格式同 18.5），不可以只說「建議諮詢專業人士」
 19. 閒聊類：自然一兩句，不要硬加免責聲明
 20. 不要加「以上僅供參考」「請自行判斷」這類廢話
 21. 不需要回應的訊息，絕對不要提它、不要說「這個我跳過囉」「這個我不看」「我知道啦」之類的話。直接當作沒看到，完全不出聲
@@ -267,6 +334,7 @@ def chat(
         for attempt in range(3):
             try:
                 response = chat_session.send_message(user_input)
+                _track_usage(response)
                 text = (response.text or "").strip()
                 text = _clean_reply(text)
                 grounding_urls = _extract_grounding_urls(response)
@@ -277,6 +345,7 @@ def chat(
                         retry_resp = chat_session.send_message(
                             "你剛才的回覆含有太多英文。請把剛才的回覆全部改成繁體中文再說一次，不要用英文。"
                         )
+                        _track_usage(retry_resp)
                         retry_text = _clean_reply((retry_resp.text or "").strip())
                         if retry_text and _is_chinese_majority(retry_text):
                             retry_urls = _extract_grounding_urls(retry_resp)

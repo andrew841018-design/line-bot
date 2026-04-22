@@ -101,24 +101,14 @@ _line_config = Configuration(access_token=settings.line_channel_access_token)
 # ── LINE 訊息配額 ─────────────────────────────────────────────────────────────
 
 def _get_quota_footer() -> str:
-    """每次回應時即時查詢配額，失敗回空字串（不讓 reply 爆錯）。"""
-    try:
-        headers = {"Authorization": f"Bearer {settings.line_channel_access_token}"}
-        q = _requests.get(
-            "https://api.line.me/v2/bot/message/quota", headers=headers, timeout=3
-        ).json()
-        u = _requests.get(
-            "https://api.line.me/v2/bot/message/quota/consumption",
-            headers=headers, timeout=3,
-        ).json()
-        if q.get("type") == "none":
-            return ""
-        limit = q.get("value", 0)
-        used = u.get("totalUsage", 0)
-        remaining = limit - used
-        return f"\n\n📊 本月配額：剩 {remaining} 則（已用 {used} / {limit}）"
-    except Exception:
+    """每次回應時附上 Gemini 今日剩餘 token 量，失敗回空字串。"""
+    info = gemini_client.get_gemini_quota_info()
+    if info is None:
         return ""
+    remaining = info["remaining_tokens"]
+    used = info["used_tokens"]
+    limit = info["limit_tokens"]
+    return f"\n\n📊 Gemini 今日剩 {remaining:,} tokens（已用 {used:,} / {limit:,}）"
 
 
 # ── URL 預抓取（繞過 Gemini url_context 的限制）─────────────────────────────
