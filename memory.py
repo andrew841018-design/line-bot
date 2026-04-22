@@ -11,8 +11,11 @@ SQLite-backed 對話 context + 長期記憶 + 過濾器規則。
 """
 from __future__ import annotations
 
+import hashlib
+import re
 import sqlite3
 import threading
+import time as _time
 from pathlib import Path
 
 from config import settings
@@ -92,8 +95,31 @@ def _init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_persona_notes_group
                 ON persona_notes(group_id, kind);
+            CREATE TABLE IF NOT EXISTS fact_check_cache (
+                group_id   TEXT NOT NULL,
+                text_hash  TEXT NOT NULL,
+                result     TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                PRIMARY KEY (group_id, text_hash)
+            );
             """
         )
+        # facts schema migration: add user_id column if missing
+        cols = [r[1] for r in c.execute("PRAGMA table_info(facts)").fetchall()]
+        if "user_id" not in cols:
+            c.executescript("""
+                CREATE TABLE IF NOT EXISTS facts_new (
+                    group_id TEXT NOT NULL,
+                    user_id  TEXT NOT NULL DEFAULT '',
+                    fact     TEXT NOT NULL,
+                    PRIMARY KEY (group_id, user_id, fact)
+                );
+                INSERT OR IGNORE INTO facts_new (group_id, user_id, fact)
+                    SELECT group_id, '', fact FROM facts;
+                DROP TABLE facts;
+                ALTER TABLE facts_new RENAME TO facts;
+            """)
 
 
 _init_db()
@@ -132,15 +158,15 @@ def get_context(group_id: str) -> list[tuple[str, str]]:
 
 # ── Facts（長期記憶）──────────────────────────────────────────────────────────
 
-def add_fact(group_id: str, fact: str) -> bool:
-    """回傳是否真的新增（False 代表重複或空字串）。"""
+def add_fact(group_id: str, fact: str, user_id: str = "") -> bool:
+    """回傳是否真的新增（False 代表重複或空字串）。user_id='' 代表群組層級。"""
     fact = fact.strip()
     if not fact:
         return False
     with _lock, _conn() as c:
         cur = c.execute(
-            "INSERT OR IGNORE INTO facts(group_id, fact) VALUES (?, ?)",
-            (group_id, fact),
+            "INSERT OR IGNORE INTO facts(group_id, user_id, fact) VALUES (?, ?, ?)",
+            (group_id, user_id or "", fact),
         )
         return cur.rowcount > 0
 
@@ -155,12 +181,19 @@ def remove_fact(group_id: str, fact_substring: str) -> int:
         return cur.rowcount
 
 
-def list_facts(group_id: str) -> list[str]:
+def list_facts(group_id: str, user_id: str | None = None) -> list[str]:
+    """user_id=None 取全部；否則取該 user 的專屬事實 + 群組層級（user_id=''）事實。"""
     with _conn() as c:
-        rows = c.execute(
-            "SELECT fact FROM facts WHERE group_id = ? ORDER BY fact",
-            (group_id,),
-        ).fetchall()
+        if user_id is None:
+            rows = c.execute(
+                "SELECT fact FROM facts WHERE group_id = ? ORDER BY fact",
+                (group_id,),
+            ).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT fact FROM facts WHERE group_id = ? AND (user_id = ? OR user_id = '') ORDER BY fact",
+                (group_id, user_id),
+            ).fetchall()
         return [r[0] for r in rows]
 
 
@@ -170,9 +203,49 @@ def clear_facts(group_id: str) -> int:
         return cur.rowcount
 
 
-def top_facts(group_id: str) -> list[str]:
+def top_facts(group_id: str, user_id: str | None = None) -> list[str]:
     """給 prompt 注入用，取前 max_facts_in_prompt 條。"""
-    return list_facts(group_id)[: settings.max_facts_in_prompt]
+    return list_facts(group_id, user_id)[: settings.max_facts_in_prompt]
+
+
+# ── 謠言快取 ───────────────────────────────────────────────────────────────────
+
+_CACHE_TTL_DAYS = 7
+_NON_ALNUM = re.compile(r"[^\w]", re.UNICODE)
+
+
+def _cache_key(text: str) -> str:
+    normalized = _NON_ALNUM.sub("", text.lower().strip())
+    return hashlib.sha256(normalized.encode()).hexdigest()
+
+
+def check_fact_cache(group_id: str, text: str) -> str | None:
+    """查快取，若命中且未過期回傳 cached result，否則回 None。"""
+    if len(text.strip()) < 80:
+        return None
+    key = _cache_key(text)
+    now = int(_time.time())
+    with _conn() as c:
+        row = c.execute(
+            "SELECT result FROM fact_check_cache WHERE group_id = ? AND text_hash = ? AND expires_at > ?",
+            (group_id, key, now),
+        ).fetchone()
+    return row[0] if row else None
+
+
+def store_fact_cache(group_id: str, text: str, result: str) -> None:
+    """存入快取，TTL = _CACHE_TTL_DAYS 天。"""
+    if len(text.strip()) < 80:
+        return
+    key = _cache_key(text)
+    now = int(_time.time())
+    expires = now + _CACHE_TTL_DAYS * 86400
+    with _lock, _conn() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO fact_check_cache(group_id, text_hash, result, created_at, expires_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (group_id, key, result, now, expires),
+        )
 
 
 # ── 計數器（決定何時觸發事實抽取）──────────────────────────────────────────

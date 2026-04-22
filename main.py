@@ -748,6 +748,7 @@ def _handle_event(event) -> None:
         return
     if isinstance(msg, AudioMessageContent):
         memory.log_raw_message(group_id, msg.id, sender_user_id, "[音訊]")
+        _handle_audio_message(event, group_id)
         return
 
     # 檔案：只處理文字檔，其他婉拒（file 很罕見，不是 burst 的一部分）
@@ -755,6 +756,40 @@ def _handle_event(event) -> None:
         _handle_file_message(event, group_id)
         return
 
+
+
+def _handle_audio_message(event: MessageEvent, group_id: str) -> None:
+    """語音留言自動分析 — 不需要 @mention，下載後直接丟 Gemini 轉寫 + 回應。"""
+    if _quota_exhausted():
+        return
+    try:
+        data = _download_content(event.message.id)
+    except Exception as e:
+        logger.warning("download audio failed: %s", e)
+        return
+    if len(data) > _MEDIA_BYTE_LIMIT:
+        return
+    parts = [
+        types.Part.from_bytes(data=bytes(data), mime_type="audio/m4a"),
+        "(群組成員傳了一段語音留言，請先完整轉寫內容，再根據系統指令判斷是否有查核或回應價值。若只是閒聊請用一兩句自然回應即可。)",
+    ]
+    context = memory.get_context(group_id)
+    facts = memory.top_facts(group_id)
+    pnotes = _get_persona_notes(group_id)
+    try:
+        reply_text = gemini_client.chat(parts, context, facts, pnotes)
+    except Exception as e:
+        if _is_quota_error(e):
+            _mark_quota_exhausted()
+        else:
+            logger.exception("gemini chat (audio) failed: %s", e)
+        return
+    if not reply_text or not reply_text.strip():
+        return
+    memory.append_turn(group_id, "user", "[語音留言]")
+    memory.append_turn(group_id, "bot", reply_text)
+    _maybe_extract_facts(group_id)
+    _reply(event.reply_token, reply_text, group_id=group_id)
 
 
 def _handle_text_message(event: MessageEvent, group_id: str) -> None:
@@ -801,6 +836,8 @@ def _handle_explicit_text(
         _reply(event.reply_token, "嗯？\n怎麼了嗎\n要找我什麼啦", group_id=group_id)
         return
 
+    sender_user_id = getattr(event.source, "user_id", None) or ""
+
     # 若引用了媒體訊息（圖片 / 影片 / 音訊），走 multimodal 路徑
     quoted_id = getattr(event.message, "quoted_message_id", None)
     if quoted_id:
@@ -822,7 +859,7 @@ def _handle_explicit_text(
     user_input = _prefetch_urls(user_input)
 
     context = memory.get_context(group_id)
-    facts = memory.top_facts(group_id)
+    facts = memory.top_facts(group_id, user_id=sender_user_id)
     pnotes = _get_persona_notes(group_id)
     try:
         reply_text = gemini_client.chat(user_input, context, facts, pnotes)
@@ -840,7 +877,7 @@ def _handle_explicit_text(
 
     memory.append_turn(group_id, "user", user_input)
     memory.append_turn(group_id, "bot", reply_text)
-    _maybe_extract_facts(group_id)
+    _maybe_extract_facts(group_id, user_id=sender_user_id)
     _reply(event.reply_token, reply_text, group_id=group_id)
 
 
@@ -859,6 +896,13 @@ def _handle_burst_flush(
     # 短路 1：cache 已知 quota 爆 → 靜默跳過
     if _quota_exhausted():
         logger.info("burst flush skipped Gemini (cached quota exhausted)")
+        return
+
+    # 短路 2：謠言快取命中 → 直接回，省 quota
+    cached = memory.check_fact_cache(group_id, combined_text)
+    if cached:
+        logger.info("burst flush cache hit group=%s", group_id)
+        _reply(reply_token, cached, group_id=group_id)
         return
 
     context = memory.get_context(group_id)
@@ -890,6 +934,7 @@ def _handle_burst_flush(
         logger.warning("burst gemini returned empty reply, skipping LINE send")
         return
 
+    memory.store_fact_cache(group_id, combined_text, reply_text)
     memory.append_turn(group_id, "user", f"[burst]\n{combined_text}")
     memory.append_turn(group_id, "bot", reply_text)
     _maybe_extract_facts(group_id)
@@ -1249,14 +1294,14 @@ def _friendly_gemini_error(e: Exception, file_name: str | None = None) -> str:
     return f"分析失敗:{type(e).__name__}"
 
 
-def _maybe_extract_facts(group_id: str) -> None:
-    """每 N 輪抽一次長期事實。"""
+def _maybe_extract_facts(group_id: str, user_id: str = "") -> None:
+    """每 N 輪抽一次長期事實，user_id 有值時存為 per-user 事實。"""
     if not memory.bump_and_should_extract(group_id):
         return
     new_facts = gemini_client.extract_facts(memory.get_context(group_id))
     added = 0
     for f in new_facts:
-        if memory.add_fact(group_id, f):
+        if memory.add_fact(group_id, f, user_id=user_id):
             added += 1
     logger.info("auto-extracted facts: %d new (total=%d)", added, len(memory.list_facts(group_id)))
 
