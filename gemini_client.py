@@ -102,7 +102,8 @@ emoji 偶爾用，不要多。
 18. 事實查核類：結論 → 依據（含來源網址）→ 短句補充，不要寫成作文
 18.5. 影片/文章摘要類（這類回覆要寫得比平常長，有實質內容）：
   - 先用 1~2 句說核心主張是什麼
-  - 然後做深入但中立的分析（至少 3~5 點），內容可以包含：
+  - **內容一律用條列（* 或數字）整理，不要寫成散文**。每一個重點各自一條，清楚標出重點名稱（粗體），例如「**發炎風險**：...」
+  - 條列內容至少涵蓋 3~5 點，包含：
       * 這個觀點的前提是否成立
       * 有沒有被刻意省略的重要背景或反例
       * 另一派的主流看法是什麼、為什麼有人不同意——這條必寫，要具體說出反對論點，不能只說「有人不同意」
@@ -111,7 +112,7 @@ emoji 偶爾用，不要多。
   - 用 Google 搜尋至少 2~3 個不同網站的報導或研究，找到不同角度後才整合回覆
   - 分析要有具體內容，不可以只寫「值得思考」「有不同面向」「需要更多資訊」這種空話
   - 附上至少 2 條不同網域的來源網址
-  - 短句分行，不要寫成長段作文，但整體篇幅要夠、不要草草結束
+  - 整體篇幅要夠、不要草草結束
 19. 閒聊類：自然一兩句，不要硬加免責聲明
 20. 不要加「以上僅供參考」「請自行判斷」這類廢話
 21. 不需要回應的訊息，絕對不要提它、不要說「這個我跳過囉」「這個我不看」「我知道啦」之類的話。直接當作沒看到，完全不出聲
@@ -627,6 +628,88 @@ examples 最多 3 則，corrections 最多 3 則。
 
 【對話紀錄】：
 {dialogue}"""
+
+
+_FEEDBACK_SCAN_PROMPT = """以下是 LINE 群組在 20:00 ~ 02:00 之間收集的訊息。
+bot（咪寶）在 20:00 問了「今天有哪裡可以改進的地方嗎？」
+
+請從以下訊息中篩選出「針對 bot 表現的評語或改進建議」。
+weight=2 代表推播後 1 小時內發出（回應可能性較高），weight=1 代表 1 小時後。
+
+訊息列表：
+{messages}
+
+規則：
+- 忽略與 bot 無關的訊息（閒聊、轉貼、日常對話）
+- 只保留真正在評論 bot 回覆風格、語氣、內容或行為的訊息
+- 若訊息模糊，用 weight 輔助判斷（weight=2 優先考慮為回覆）
+
+請以 JSON 陣列回覆（不要 markdown）：
+[
+  {{"text": "原始訊息", "is_feedback": true, "summary": "這條建議的一句話摘要"}},
+  ...
+]
+若無任何評語，回 []。"""
+
+_IMPROVEMENT_PUSH_PROMPT = """以下是家人對 LINE bot 咪寶的評語摘要：
+{feedback_list}
+
+請根據這些評語產生：
+1. 咪寶要推播給家人的回應訊息（繁體中文、溫柔可愛口吻、短句分行、不超過 200 字）
+2. 咪寶要記住的改進規則（每條 30 字以內，清楚可操作）
+
+回傳 JSON（不要 markdown）：
+{{"push_message": "推播訊息", "corrections": ["規則1", "規則2", ...]}}"""
+
+
+def scan_feedback_messages(messages: list[dict]) -> list[dict]:
+    """用 Gemini 掃描 pending 訊息，回傳 is_feedback=True 的條目。失敗回 []。"""
+    if not messages:
+        return []
+
+    msg_lines = "\n".join(
+        f"[weight={m['weight']}] {m['text']}" for m in messages
+    )
+    prompt = _FEEDBACK_SCAN_PROMPT.format(messages=msg_lines)
+    try:
+        response = _client.models.generate_content(
+            model=settings.gemini_light_model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+        text = _strip_code_fence((response.text or "").strip())
+        data = json.loads(text)
+        if not isinstance(data, list):
+            return []
+        return [item for item in data if isinstance(item, dict) and item.get("is_feedback")]
+    except Exception as e:
+        logger.warning("scan_feedback_messages failed: %s", e)
+        raise  # 讓 caller 判斷是否為 429，決定要不要清空 pending
+
+
+def generate_improvement_push(feedback_list: list[dict]) -> dict:
+    """根據評語生成推播訊息 + persona corrections。失敗回空 dict。"""
+    if not feedback_list:
+        return {}
+
+    summaries = "\n".join(f"- {item.get('summary') or item.get('text', '')}" for item in feedback_list)
+    prompt = _IMPROVEMENT_PUSH_PROMPT.format(feedback_list=summaries)
+    try:
+        response = _client.models.generate_content(
+            model=settings.gemini_model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+        text = _strip_code_fence((response.text or "").strip())
+        data = json.loads(text)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        logger.warning("generate_improvement_push failed: %s", e)
+        raise
 
 
 def persona_review(dialogue_text: str) -> dict:

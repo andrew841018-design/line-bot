@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # line_bot daily health check — run by launchd at 15:00 TW
-# Only restarts uvicorn (never cloudflared, to preserve tunnel URL).
+# Restarts uvicorn and/or cloudflared if down; auto-updates LINE webhook URL on cloudflared restart.
 
 set -u
 
 BOT_DIR="/Users/andrew/Desktop/andrew/Data_engineer/line_bot"
 HC_LOG="$BOT_DIR/health_check.log"
 UVICORN_LOG="$BOT_DIR/uvicorn.log"
+CF_LOG="$BOT_DIR/cloudflared.log"
+CF_BIN="/Users/andrew/.local/bin/cloudflared"
 PORT=8080
 MAX_429_PER_DAY=10
 
@@ -69,7 +71,66 @@ if [ $UVICORN_UP -eq 0 ]; then
 fi
 
 if [ $CF_UP -eq 0 ]; then
-  say "WARN cloudflared is DOWN — manual intervention required (tunnel URL will change on restart)"
+  say "cloudflared DOWN; attempting restart..."
+  cd "$BOT_DIR" || { say "ERR cd failed"; exit 1; }
+
+  LINE_TOKEN=$(grep '^LINE_CHANNEL_ACCESS_TOKEN=' .env | cut -d= -f2-)
+  if [ -z "$LINE_TOKEN" ]; then
+    say "ERR LINE_CHANNEL_ACCESS_TOKEN not found in .env"
+    CF_ACTION="cf_restart_failed_no_token"
+  elif [ ! -x "$CF_BIN" ]; then
+    say "ERR cloudflared binary not found at $CF_BIN"
+    CF_ACTION="cf_restart_failed_no_binary"
+  else
+    : > "$CF_LOG"
+    nohup "$CF_BIN" tunnel --url http://127.0.0.1:$PORT >> "$CF_LOG" 2>&1 &
+    CF_NEW_PID=$!
+    disown $CF_NEW_PID 2>/dev/null || true
+    say "spawned cloudflared PID=$CF_NEW_PID, waiting for URL..."
+
+    NEW_URL=""
+    for i in $(seq 1 30); do
+      sleep 1
+      NEW_URL=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' "$CF_LOG" | head -n1 || true)
+      [ -n "$NEW_URL" ] && break
+    done
+
+    if [ -z "$NEW_URL" ]; then
+      say "ERR cloudflared URL not found after 30s"
+      CF_ACTION="cf_restart_failed_no_url"
+    else
+      say "cloudflared new URL=$NEW_URL, verifying tunnel is ready..."
+      TUNNEL_READY=0
+      for i in $(seq 1 15); do
+        sleep 2
+        TUNNEL_HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "${NEW_URL}/health" 2>/dev/null || echo "000")
+        say "tunnel verify attempt=$i HTTP=$TUNNEL_HTTP"
+        [ "$TUNNEL_HTTP" = "200" ] && TUNNEL_READY=1 && break
+      done
+
+      if [ $TUNNEL_READY -eq 0 ]; then
+        say "WARN tunnel URL obtained but /health unreachable after 30s, updating LINE webhook anyway"
+      fi
+
+      WEBHOOK_URL="${NEW_URL}/callback"
+      HTTP_RESP=$(curl -s -o /tmp/line_webhook_resp.txt -w "%{http_code}" \
+        -X PUT https://api.line.me/v2/bot/channel/webhook/endpoint \
+        -H "Authorization: Bearer $LINE_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "{\"endpoint\": \"$WEBHOOK_URL\"}" 2>/dev/null)
+      [ -z "$HTTP_RESP" ] && HTTP_RESP="000"
+      RESP_BODY=$(cat /tmp/line_webhook_resp.txt 2>/dev/null || echo "")
+      say "LINE webhook update HTTP=$HTTP_RESP body=$RESP_BODY"
+
+      if [ "$HTTP_RESP" = "200" ]; then
+        CF_ACTION="cf_restart_success_webhook_updated url=$WEBHOOK_URL"
+      else
+        CF_ACTION="cf_restart_success_tunnel_up_webhook_failed HTTP=$HTTP_RESP"
+        say "WARN tunnel is up but LINE webhook update failed"
+      fi
+    fi
+  fi
+  say "cf_action=$CF_ACTION"
 fi
 
 say "action=$ACTION"

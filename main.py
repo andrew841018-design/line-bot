@@ -61,6 +61,7 @@ from linebot.v3.webhooks import (
 )
 
 import burst_filter
+import feedback_collector
 import gemini_client
 import memory
 import review
@@ -95,6 +96,29 @@ app = FastAPI()
 
 _parser = WebhookParser(settings.line_channel_secret)
 _line_config = Configuration(access_token=settings.line_channel_access_token)
+
+
+# ── LINE 訊息配額 ─────────────────────────────────────────────────────────────
+
+def _get_quota_footer() -> str:
+    """每次回應時即時查詢配額，失敗回空字串（不讓 reply 爆錯）。"""
+    try:
+        headers = {"Authorization": f"Bearer {settings.line_channel_access_token}"}
+        q = _requests.get(
+            "https://api.line.me/v2/bot/message/quota", headers=headers, timeout=3
+        ).json()
+        u = _requests.get(
+            "https://api.line.me/v2/bot/message/quota/consumption",
+            headers=headers, timeout=3,
+        ).json()
+        if q.get("type") == "none":
+            return ""
+        limit = q.get("value", 0)
+        used = u.get("totalUsage", 0)
+        remaining = limit - used
+        return f"\n\n📊 本月配額：剩 {remaining} 則（已用 {used} / {limit}）"
+    except Exception:
+        return ""
 
 
 # ── URL 預抓取（繞過 Gemini url_context 的限制）─────────────────────────────
@@ -746,6 +770,14 @@ def _handle_event(event) -> None:
 def _handle_text_message(event: MessageEvent, group_id: str) -> None:
     text = event.message.text or ""
 
+    # 回饋收集：20:00 ~ 02:00 TW 窗口內，將文字訊息存入 pending_feedback.json
+    if feedback_collector.in_feedback_window():
+        sender = getattr(event.source, "user_id", None) or "unknown"
+        try:
+            feedback_collector.collect_message(sender, text)
+        except Exception as e:
+            logger.warning("[Feedback] collect_message failed: %s", e)
+
     # 1. 指令處理（指令不需要 @mention 也能用，方便管理）
     cmd_reply = _handle_command(group_id, text)
     if cmd_reply is not None:
@@ -754,7 +786,13 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
         _reply(event.reply_token, cmd_reply, group_id=group_id)
         return
 
-    # 2. Explicit 觸發（@mention / /ai / /問 ...）→ 立刻處理，並取消 pending burst
+    # 2. 晚餐推薦觸發
+    if _is_dinner_question(text):
+        burst_filter.cancel_burst(group_id)
+        _handle_dinner_recommendation(event, group_id)
+        return
+
+    # 3. Explicit 觸發（@mention / /ai / /問 ...）→ 立刻處理，並取消 pending burst
     clean_text = _extract_gemini_trigger(text, event.message)
     if clean_text is not None:
         burst_filter.cancel_burst(group_id)
@@ -781,10 +819,9 @@ def _handle_explicit_text(
             _handle_media_via_quote(event, group_id, clean_text, quoted_id, raw[1])
             return
 
-    # 短路：cache 已知 quota 爆 → 直接回 quota 訊息，不浪費 Gemini round-trip
+    # 短路：cache 已知 quota 爆 → 靜默跳過
     if _quota_exhausted():
         logger.info("explicit reply skipped Gemini (cached quota exhausted)")
-        _reply(event.reply_token, _quota_exhausted_message(), group_id=group_id)
         return
 
     # 純文字 + 可能的文字引用
@@ -805,7 +842,7 @@ def _handle_explicit_text(
             logger.warning("gemini chat (explicit) quota exhausted")
         else:
             logger.exception("gemini chat (explicit) failed: %s", e)
-        _reply(event.reply_token, _friendly_gemini_error(e), group_id=group_id)
+            _reply(event.reply_token, _friendly_gemini_error(e), group_id=group_id)
         return
 
     # 即時糾正偵測：使用者如果在糾正 bot，自動記住
@@ -829,10 +866,9 @@ def _handle_burst_flush(
         group_id, len(combined_text),
     )
 
-    # 短路 1：cache 已知 quota 爆 → 直接回 quota 訊息，不浪費網路 round-trip
+    # 短路 1：cache 已知 quota 爆 → 靜默跳過
     if _quota_exhausted():
         logger.info("burst flush skipped Gemini (cached quota exhausted)")
-        _reply(reply_token, _quota_exhausted_message(), group_id=group_id)
         return
 
     context = memory.get_context(group_id)
@@ -854,7 +890,6 @@ def _handle_burst_flush(
         if _is_quota_error(e):
             _mark_quota_exhausted()
             logger.warning("gemini chat (burst) quota exhausted")
-            _reply(reply_token, _quota_exhausted_message(), group_id=group_id)
         else:
             logger.exception("gemini chat (burst) failed: %s", e)
             _reply(reply_token, "Gemini 那邊好像塞車了，等一下再回你～", group_id=group_id)
@@ -902,10 +937,9 @@ def _handle_media_via_quote(
     """
     mime_type, media_name = _MEDIA_PLACEHOLDERS[placeholder]
 
-    # 短路：cache 已知 quota 爆 → 直接回 quota 訊息，連媒體都不用下載了
+    # 短路：cache 已知 quota 爆 → 靜默跳過
     if _quota_exhausted():
         logger.info("media quote skipped Gemini (cached quota exhausted)")
-        _reply(event.reply_token, _quota_exhausted_message(), group_id=group_id)
         return
 
     try:
@@ -946,7 +980,7 @@ def _handle_media_via_quote(
             logger.warning("gemini chat (quoted-%s) quota exhausted", media_name)
         else:
             logger.exception("gemini chat (quoted-%s) failed: %s", media_name, e)
-        _reply(event.reply_token, _friendly_gemini_error(e), group_id=group_id)
+            _reply(event.reply_token, _friendly_gemini_error(e), group_id=group_id)
         return
 
     memory.append_turn(group_id, "user", f"[{media_name} + 問題]\n{prompt_text}")
@@ -1036,10 +1070,9 @@ def _handle_file_message(event: MessageEvent, group_id: str) -> None:
         )
         return
 
-    # 短路：cache 已知 quota 爆 → 直接回 quota 訊息，連檔案都不用下載了
+    # 短路：cache 已知 quota 爆 → 靜默跳過
     if _quota_exhausted():
         logger.info("file handler skipped Gemini (cached quota exhausted)")
-        _reply(event.reply_token, _quota_exhausted_message(), group_id=group_id)
         return
 
     # 下載 + decode + 截斷
@@ -1291,6 +1324,43 @@ def _handle_leave(event: LeaveEvent) -> None:
 
 
 # ── Command 處理 ──────────────────────────────────────────────────────────────
+
+_DINNER_KEYWORDS = ["晚餐吃什麼", "晚餐吃哪", "吃什麼晚餐", "晚餐去哪", "晚餐要吃什麼", "今晚吃什麼", "今天吃什麼"]
+
+def _is_dinner_question(text: str) -> bool:
+    return any(kw in text for kw in _DINNER_KEYWORDS)
+
+
+_DINNER_PROMPT = """你是台北美食達人，以善導寺捷運站（台北市中正區）為中心，推薦附近步行可達的晚餐餐廳。
+
+請推薦 4～5 間，格式如下（用換行分隔每間）：
+🍽 餐廳名稱
+📍 地址（簡短）
+🍴 料理類型 ＋ 招牌菜或特色一句話
+💰 價位（每人約 NT$XXX）
+
+回覆風格：親切自然，像朋友推薦，繁體中文，不要加多餘的前言或結語。"""
+
+
+def _handle_dinner_recommendation(event: MessageEvent, group_id: str) -> None:
+    if _quota_exhausted():
+        logger.info("dinner recommendation skipped (cached quota exhausted)")
+        return
+    context = memory.get_context(group_id)
+    facts = memory.top_facts(group_id)
+    pnotes = _get_persona_notes(group_id)
+    try:
+        reply_text = gemini_client.chat(_DINNER_PROMPT, context, facts, pnotes)
+    except Exception as e:
+        if _is_quota_error(e):
+            _mark_quota_exhausted()
+            logger.warning("dinner recommendation quota exhausted")
+        else:
+            logger.exception("dinner recommendation failed: %s", e)
+            _reply(event.reply_token, _friendly_gemini_error(e), group_id=group_id)
+        return
+    _reply(event.reply_token, reply_text, group_id=group_id)
+
 
 def _handle_command(group_id: str, text: str) -> str | None:
     """有對應到指令回 str；沒有回 None。"""
@@ -1577,8 +1647,9 @@ def _reply(reply_token: str, text: str, group_id: str | None = None) -> None:
     settings.bot_muted=True 時整個函式 short-circuit:
     不 reply、不 push、只把原本要送的 text 寫進 log 方便除錯。
     """
-    # LINE 單則訊息上限 5000 字
-    text = text[:4900]
+    # LINE 單則訊息上限 5000 字；在截斷前先預留 footer 空間
+    footer = _get_quota_footer()
+    text = text[:4900 - len(footer)] + footer
 
     # ── Mute 守門 ─────────────────────────────────────────────────────────────
     # 修 bug 期間預設靜音。webhook 照收、classifier/chat 照跑、log 照寫，只是不送 LINE。
