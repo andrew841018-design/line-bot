@@ -20,7 +20,6 @@ import logging
 import mimetypes
 import os
 import re
-import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -1356,23 +1355,6 @@ def _quota_exhausted_message() -> str:
     )
 
 
-# ── 思考中提示 ────────────────────────────────────────────────────────────────
-# Gemini 呼叫超過 3 秒還沒回 → 推一則「思考中」到群組，讓使用者知道 bot 在忙
-# 不是沒 quota。quota 爆時 handler 已短路；timer 觸發時再 double check 一次。
-
-def _push_thinking(group_id: str) -> None:
-    if _quota_exhausted() or settings.bot_muted:
-        return
-    try:
-        with ApiClient(_line_config) as api_client:
-            MessagingApi(api_client).push_message(
-                PushMessageRequest(
-                    to=group_id,
-                    messages=[TextMessage(text="🐾 正在思考中，稍等一下…")],
-                )
-            )
-    except Exception as e:
-        logger.warning("thinking push failed: %s", str(e)[:200])
 
 
 # ── Pending（quota 爆時的所有訊息，恢復後由 Gemini 分組 + 引用回覆） ──────────
@@ -1661,17 +1643,7 @@ def _process_pending_on_startup() -> None:
 
 @contextmanager
 def _thinking_indicator(group_id: str | None, delay: float = 3.0):
-    """Gemini 呼叫 > delay 秒才回 → 推一則思考中訊息。quota 爆時不推。"""
-    if not group_id:
-        yield
-        return
-    timer = threading.Timer(delay, lambda: _push_thinking(group_id))
-    timer.daemon = True
-    timer.start()
-    try:
-        yield
-    finally:
-        timer.cancel()
+    yield
 
 
 def _get_persona_notes(group_id: str) -> list[dict]:
