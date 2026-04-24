@@ -736,6 +736,14 @@ def _handle_event(event) -> None:
     msg = event.message
     sender_user_id = getattr(event.source, "user_id", None)
 
+    # ── quota 爆時：所有訊息都存 pending，等恢復後由 Gemini 分組 + 逐組引用回覆 ──
+    if _quota_exhausted() and isinstance(msg, (TextMessageContent, FileMessageContent, AudioMessageContent)):
+        _save_pending_any(event, group_id, sender_user_id, msg)
+        # 文字仍記 raw_messages 供引用回查
+        if isinstance(msg, TextMessageContent):
+            memory.log_raw_message(group_id, msg.id, sender_user_id, msg.text or "")
+        return
+
     # 文字：先記進 raw_messages（供 quote 回查 / burst look-back / Layer 2 抓 trigger）
     if isinstance(msg, TextMessageContent):
         memory.log_raw_message(group_id, msg.id, sender_user_id, msg.text or "")
@@ -851,11 +859,6 @@ def _handle_explicit_text(
         _reply(event.reply_token, "嗯？\n怎麼了嗎\n要找我什麼啦", group_id=group_id)
         return
 
-    # 短路：cache 已知 quota 爆 → 靜默跳過
-    if _quota_exhausted():
-        logger.info("explicit reply skipped Gemini (cached quota exhausted)")
-        return
-
     # 純文字 + 可能的文字引用
     quoted_block = _build_quoted_block(event.message, group_id)
     # 空 clean_text + 有引用 → 讓 Gemini 針對原文回應
@@ -866,6 +869,11 @@ def _handle_explicit_text(
 
     # URL 預抓取：先用 Python 抓網頁內容塞進 prompt，繞過 Gemini url_context 的限制
     user_input = _prefetch_urls(user_input)
+
+    # quota 爆時早在 _handle_event 層級已存 pending，這裡不會到（但以防萬一短路）
+    if _quota_exhausted():
+        logger.info("explicit reply skipped Gemini (cached quota exhausted)")
+        return
 
     context = memory.get_context(group_id)
     facts = memory.top_facts(group_id, user_id=sender_user_id)
@@ -1365,6 +1373,290 @@ def _push_thinking(group_id: str) -> None:
             )
     except Exception as e:
         logger.warning("thinking push failed: %s", str(e)[:200])
+
+
+# ── Pending（quota 爆時的所有訊息，恢復後由 Gemini 分組 + 引用回覆） ──────────
+
+import json as _json
+import uuid as _uuid
+_PENDING_EXPLICIT_PATH = os.path.join(os.path.dirname(__file__), "pending_explicit_reply.json")
+_PENDING_MEDIA_DIR = os.path.join(os.path.dirname(__file__), "pending_media")
+
+
+def _load_pending_explicit() -> dict:
+    try:
+        with open(_PENDING_EXPLICIT_PATH) as f:
+            return _json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_pending_explicit_raw(data: dict) -> None:
+    try:
+        with open(_PENDING_EXPLICIT_PATH, "w") as f:
+            _json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        logger.warning("save pending raw failed: %s", str(e)[:200])
+
+
+def _save_pending_any(event, group_id: str, user_id: str | None, msg) -> None:
+    """quota 爆時把任何訊息（文字/檔案/音訊）存進佇列，每則獨立不合併。恢復時由 Gemini 判語意分組。"""
+    try:
+        data = _load_pending_explicit()
+        if group_id not in data or not isinstance(data[group_id], list):
+            data[group_id] = []
+
+        entry = {
+            "user_id": user_id,
+            "message_id": msg.id,
+            "quote_token": getattr(msg, "quote_token", None),
+            "timestamp": time.time(),
+        }
+
+        if isinstance(msg, TextMessageContent):
+            entry["type"] = "text"
+            entry["text"] = msg.text or ""
+            # 若引用他人訊息，帶上被引用的原文，讓 Gemini 恢復時有脈絡
+            qid = getattr(msg, "quoted_message_id", None)
+            if qid:
+                raw = memory.get_raw_message(group_id, qid)
+                if raw:
+                    entry["quoted_original"] = raw[1]
+
+        elif isinstance(msg, FileMessageContent):
+            entry["type"] = "file"
+            entry["file_name"] = getattr(msg, "file_name", "unknown")
+            try:
+                content = _download_content(msg.id)
+                os.makedirs(_PENDING_MEDIA_DIR, exist_ok=True)
+                path = os.path.join(_PENDING_MEDIA_DIR, f"{_uuid.uuid4().hex}.bin")
+                with open(path, "wb") as f:
+                    f.write(bytes(content))
+                entry["media_path"] = path
+            except Exception as e:
+                logger.warning("download file for pending failed: %s", e)
+                entry["download_failed"] = True
+
+        elif isinstance(msg, AudioMessageContent):
+            entry["type"] = "audio"
+            try:
+                content = _download_content(msg.id)
+                os.makedirs(_PENDING_MEDIA_DIR, exist_ok=True)
+                path = os.path.join(_PENDING_MEDIA_DIR, f"{_uuid.uuid4().hex}.m4a")
+                with open(path, "wb") as f:
+                    f.write(bytes(content))
+                entry["media_path"] = path
+                entry["mime_type"] = "audio/m4a"
+            except Exception as e:
+                logger.warning("download audio for pending failed: %s", e)
+                entry["download_failed"] = True
+        else:
+            return
+
+        data[group_id].append(entry)
+        _save_pending_explicit_raw(data)
+    except Exception as e:
+        logger.warning("save pending any failed: %s", str(e)[:200])
+
+
+def _clear_pending_explicit(group_id: str) -> None:
+    data = _load_pending_explicit()
+    # 清掉該 group 所有 media 檔
+    for entry in data.get(group_id, []):
+        path = entry.get("media_path")
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+    data.pop(group_id, None)
+    _save_pending_explicit_raw(data)
+
+
+def _gemini_group_messages(items: list[dict]) -> list[dict]:
+    """call Gemini 判斷 pending 訊息怎麼分組（可跨非連續、可跨被打斷），並挑每組的指標性訊息作為引用目標。
+    回傳：[{"idxs": [int,...], "reply_to": int}, ...]。失敗退回每則各自一組。"""
+    try:
+        from google import genai
+        from google.genai import types
+        client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+        lines = []
+        for i, it in enumerate(items):
+            who = (it.get("user_id") or "unknown")[:8]
+            t = it.get("type", "text")
+            content = it.get("text", "")
+            if t == "file":
+                content = f"[檔案: {it.get('file_name','')}]"
+            elif t == "audio":
+                content = "[語音留言]"
+            lines.append(f"[{i}] ({who}) {t}: {content[:200]}")
+        prompt = (
+            "以下是 LINE 群組在一段時間內收到的訊息（依時間順序）。\n"
+            "請判斷哪些訊息屬於『同一則發言』（同一人表達同一件事，即使中間被別人插嘴打斷），\n"
+            "並從每組中挑一則最具指標性（最能代表該發言核心、最適合被引用回覆）的訊息。\n\n"
+            + "\n".join(lines)
+            + "\n\n回傳 JSON："
+            + '{"groups":[{"idxs":[int,...], "reply_to": int}, ...]}'
+            + "，每組的 idxs 依原順序；reply_to 必須屬於該組；每個訊息 idx 必須恰好出現一次。"
+        )
+        resp = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.1,
+            ),
+        )
+        data = _json.loads(resp.text)
+        groups_raw = data.get("groups", [])
+        seen = set()
+        clean = []
+        for g in groups_raw:
+            idxs = g.get("idxs") if isinstance(g, dict) else None
+            if not isinstance(idxs, list):
+                continue
+            ok = [i for i in idxs if isinstance(i, int) and 0 <= i < len(items) and i not in seen]
+            if not ok:
+                continue
+            seen.update(ok)
+            reply_to = g.get("reply_to") if isinstance(g, dict) else None
+            if not isinstance(reply_to, int) or reply_to not in ok:
+                reply_to = ok[-1]  # fallback：最後一則
+            clean.append({"idxs": ok, "reply_to": reply_to})
+        for i in range(len(items)):
+            if i not in seen:
+                clean.append({"idxs": [i], "reply_to": i})
+        return clean
+    except Exception as e:
+        logger.warning("group messages via gemini failed, falling back to each-alone: %s", str(e)[:200])
+        return [{"idxs": [i], "reply_to": i} for i in range(len(items))]
+
+
+def _build_group_parts(items: list[dict], group_id: str) -> list:
+    """把一組 pending 訊息合成 Gemini parts（文字 + 檔案/音訊 bytes）。"""
+    from google.genai import types
+    parts = []
+    texts = []
+    for it in items:
+        t = it.get("type", "text")
+        if t == "text":
+            txt = it.get("text", "")
+            quoted_original = it.get("quoted_original")
+            if quoted_original:
+                texts.append(f"(引用了：『{quoted_original[:80]}』)\n{txt}")
+            else:
+                texts.append(txt)
+        elif t == "file":
+            path = it.get("media_path")
+            fname = it.get("file_name", "unknown")
+            if path and os.path.exists(path):
+                try:
+                    with open(path, "rb") as f:
+                        data = f.read()
+                    mime, _ = mimetypes.guess_type(fname)
+                    parts.append(types.Part.from_bytes(data=data, mime_type=mime or "application/octet-stream"))
+                    texts.append(f"(使用者傳了檔案：{fname}，請分析其內容)")
+                except Exception as e:
+                    logger.warning("read pending file failed: %s", e)
+                    texts.append(f"(使用者傳了檔案 {fname}，但讀取失敗)")
+            else:
+                texts.append(f"(使用者傳了檔案 {fname}，但原始內容已遺失)")
+        elif t == "audio":
+            path = it.get("media_path")
+            mime = it.get("mime_type", "audio/m4a")
+            if path and os.path.exists(path):
+                try:
+                    with open(path, "rb") as f:
+                        data = f.read()
+                    parts.append(types.Part.from_bytes(data=data, mime_type=mime))
+                    texts.append("(使用者傳了語音，請先完整轉寫再回應)")
+                except Exception as e:
+                    logger.warning("read pending audio failed: %s", e)
+                    texts.append("(使用者傳了語音但讀取失敗)")
+            else:
+                texts.append("(使用者傳了語音但原始內容已遺失)")
+
+    combined_text = "\n".join(texts).strip()
+    if combined_text:
+        # URL 預抓
+        combined_text = _prefetch_urls(combined_text)
+        parts.append(combined_text)
+    return parts
+
+
+@app.on_event("startup")
+def _process_pending_on_startup() -> None:
+    """uvicorn 啟動時處理所有 pending：Gemini 分組 → 逐組用完整 chat 產生回覆 → 引用推送。"""
+    if settings.bot_muted:
+        return
+    pending = _load_pending_explicit()
+    if not pending:
+        return
+    if _quota_exhausted():
+        logger.info("startup: quota still exhausted, keep pending for next time")
+        return
+
+    for group_id, items in list(pending.items()):
+        if isinstance(items, dict):  # 舊格式相容
+            items = [items]
+        if not items:
+            _clear_pending_explicit(group_id)
+            continue
+
+        # Step 1：分組
+        groups = _gemini_group_messages(items)
+        logger.info("startup: group=%s items=%d groups=%d", group_id, len(items), len(groups))
+
+        # Step 2：逐組跑完整 gemini_client.chat()
+        processed_idx = set()
+        try:
+            for g in groups:
+                idxs = g["idxs"]
+                reply_to_idx = g["reply_to"]
+                group_items = [items[i] for i in idxs]
+                parts = _build_group_parts(group_items, group_id)
+                if not parts:
+                    processed_idx.update(idxs)
+                    continue
+
+                context = memory.get_context(group_id)
+                facts = memory.top_facts(group_id)
+                pnotes = _get_persona_notes(group_id)
+                reply_text = gemini_client.chat(parts, context, facts, pnotes)
+
+                text = _md_to_line(reply_text)
+                footer = _get_quota_footer()
+                text = text[:4900 - len(footer)] + footer
+
+                msg_kwargs = {"text": text}
+                qt = items[reply_to_idx].get("quote_token")
+                if qt:
+                    msg_kwargs["quote_token"] = qt
+
+                with ApiClient(_line_config) as api_client:
+                    MessagingApi(api_client).push_message(
+                        PushMessageRequest(
+                            to=group_id,
+                            messages=[TextMessage(**msg_kwargs)],
+                        )
+                    )
+                memory.append_turn(group_id, "user", "\n".join(it.get("text","") for it in group_items if it.get("type")=="text")[:500] or "[非文字訊息]")
+                memory.append_turn(group_id, "bot", reply_text)
+                processed_idx.update(idxs)
+        except Exception as e:
+            if _is_quota_error(e):
+                _mark_quota_exhausted()
+                # 留下還沒處理的 items
+                remaining = [it for i, it in enumerate(items) if i not in processed_idx]
+                data = _load_pending_explicit()
+                data[group_id] = remaining
+                _save_pending_explicit_raw(data)
+                logger.warning("startup pending: quota re-exhausted, saved %d remaining for group=%s", len(remaining), group_id)
+                return
+            logger.exception("startup pending reply failed for group=%s: %s", group_id, e)
+
+        _clear_pending_explicit(group_id)
+        logger.info("startup: group=%s all pending cleared", group_id)
 
 
 @contextmanager
