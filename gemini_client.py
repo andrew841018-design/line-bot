@@ -77,6 +77,16 @@ def _track_usage(response) -> None:
         pass
 
 
+def _track_failed_request() -> None:
+    """Google 那邊會把失敗的請求也計入 quota（429 / 5xx），bot counter 也該記，避免顯示的用量低估。"""
+    try:
+        data = _load_usage()
+        data["requests"] = data.get("requests", 0) + 1
+        _save_usage(data)
+    except Exception:
+        pass
+
+
 def get_gemini_quota_info() -> dict | None:
     """回傳今日 Gemini 使用量；失敗回 None。"""
     try:
@@ -368,6 +378,8 @@ def chat(
                 continue
             except Exception as e:
                 last_err = e
+                # 失敗也要計數（Google 的 daily quota 是含失敗的）
+                _track_failed_request()
                 if _is_transient(e) and attempt < 2:
                     logger.warning("gemini transient error (%s), retry %d/2 after 3s", type(e).__name__, attempt + 1)
                     time.sleep(3)

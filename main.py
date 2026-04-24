@@ -832,10 +832,6 @@ def _handle_explicit_text(
     event: MessageEvent, group_id: str, clean_text: str
 ) -> None:
     """使用者明確叫 bot（@mention / /ai 等），立刻丟 Gemini 回覆。"""
-    if not clean_text:
-        _reply(event.reply_token, "嗯？\n怎麼了嗎\n要找我什麼啦", group_id=group_id)
-        return
-
     sender_user_id = getattr(event.source, "user_id", None) or ""
 
     # 若引用了媒體訊息（圖片 / 影片 / 音訊），走 multimodal 路徑
@@ -846,6 +842,11 @@ def _handle_explicit_text(
             _handle_media_via_quote(event, group_id, clean_text, quoted_id, raw[1])
             return
 
+    # clean_text 空且沒引用 → 用戶只打「咪寶」等觸發詞 → 問候回應
+    if not clean_text and not quoted_id:
+        _reply(event.reply_token, "嗯？\n怎麼了嗎\n要找我什麼啦", group_id=group_id)
+        return
+
     # 短路：cache 已知 quota 爆 → 靜默跳過
     if _quota_exhausted():
         logger.info("explicit reply skipped Gemini (cached quota exhausted)")
@@ -853,7 +854,11 @@ def _handle_explicit_text(
 
     # 純文字 + 可能的文字引用
     quoted_block = _build_quoted_block(event.message, group_id)
-    user_input = clean_text if not quoted_block else f"{quoted_block}\n\n{clean_text}"
+    # 空 clean_text + 有引用 → 讓 Gemini 針對原文回應
+    if not clean_text and quoted_block:
+        user_input = f"{quoted_block}\n\n(使用者只輸入觸發詞呼叫你，請針對上面引用的原文做回應)"
+    else:
+        user_input = clean_text if not quoted_block else f"{quoted_block}\n\n{clean_text}"
 
     # URL 預抓取：先用 Python 抓網頁內容塞進 prompt，繞過 Gemini url_context 的限制
     user_input = _prefetch_urls(user_input)
