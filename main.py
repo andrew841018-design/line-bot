@@ -18,8 +18,11 @@ from __future__ import annotations
 
 import logging
 import mimetypes
+import os
 import re
+import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -777,7 +780,8 @@ def _handle_audio_message(event: MessageEvent, group_id: str) -> None:
     facts = memory.top_facts(group_id)
     pnotes = _get_persona_notes(group_id)
     try:
-        reply_text = gemini_client.chat(parts, context, facts, pnotes)
+        with _thinking_indicator(group_id):
+            reply_text = gemini_client.chat(parts, context, facts, pnotes)
     except Exception as e:
         if _is_quota_error(e):
             _mark_quota_exhausted()
@@ -867,7 +871,8 @@ def _handle_explicit_text(
     facts = memory.top_facts(group_id, user_id=sender_user_id)
     pnotes = _get_persona_notes(group_id)
     try:
-        reply_text = gemini_client.chat(user_input, context, facts, pnotes)
+        with _thinking_indicator(group_id):
+            reply_text = gemini_client.chat(user_input, context, facts, pnotes)
     except Exception as e:
         if _is_quota_error(e):
             _mark_quota_exhausted()
@@ -924,7 +929,8 @@ def _handle_burst_flush(
         f"{prefetched}"
     )
     try:
-        reply_text = gemini_client.chat(user_input, context, facts, pnotes)
+        with _thinking_indicator(group_id):
+            reply_text = gemini_client.chat(user_input, context, facts, pnotes)
     except Exception as e:
         if _is_quota_error(e):
             _mark_quota_exhausted()
@@ -1013,7 +1019,8 @@ def _handle_media_via_quote(
     facts = memory.top_facts(group_id)
     pnotes = _get_persona_notes(group_id)
     try:
-        reply_text = gemini_client.chat(parts, context, facts, pnotes)
+        with _thinking_indicator(group_id):
+            reply_text = gemini_client.chat(parts, context, facts, pnotes)
     except Exception as e:
         if _is_quota_error(e):
             _mark_quota_exhausted()
@@ -1177,7 +1184,8 @@ def _handle_file_message(event: MessageEvent, group_id: str) -> None:
             f"使用者傳了一個檔案：{file_name}。請分析其內容並回應。",
         ]
         try:
-            reply_text = gemini_client.chat(parts, context, facts, pnotes)
+            with _thinking_indicator(group_id):
+                reply_text = gemini_client.chat(parts, context, facts, pnotes)
         except Exception as e:
             if _is_quota_error(e):
                 _mark_quota_exhausted()
@@ -1215,7 +1223,8 @@ def _handle_file_message(event: MessageEvent, group_id: str) -> None:
     )
 
     try:
-        reply_text = gemini_client.chat(prompt_text, context, facts, pnotes)
+        with _thinking_indicator(group_id):
+            reply_text = gemini_client.chat(prompt_text, context, facts, pnotes)
     except Exception as e:
         if _is_quota_error(e):
             _mark_quota_exhausted()
@@ -1273,11 +1282,12 @@ def _next_gemini_reset_tw() -> tuple[str, str]:
 # 先看這個 cache，直接短路回 quota 訊息，不浪費網路 round-trip。
 # 下一個 00:00 PT（= 台灣 15:00 夏令 / 16:00 非夏令）自動失效。
 _quota_exhausted_until_ts: float = 0.0
+_quota_notified_for_ts: float = 0.0  # 已推播過的那個 exhausted_until_ts，避免重複推
 
 
 def _mark_quota_exhausted() -> None:
-    """記錄 Gemini quota 已爆,到下一個 00:00 PT 前都不要再打了。"""
-    global _quota_exhausted_until_ts
+    """記錄 Gemini quota 已爆,到下一個 00:00 PT 前都不要再打了；同時推播一次性提醒到群組。"""
+    global _quota_exhausted_until_ts, _quota_notified_for_ts
     now_pt = datetime.now(tz=_PT_TZ)
     next_midnight_pt = (now_pt + timedelta(days=1)).replace(
         hour=0, minute=0, second=0, microsecond=0
@@ -1288,10 +1298,44 @@ def _mark_quota_exhausted() -> None:
         next_midnight_pt.astimezone(_TW_TZ).strftime("%Y-%m-%d %H:%M TW"),
     )
 
+    # 每天第一次爆 → 推播一次告知群組
+    if _quota_notified_for_ts != _quota_exhausted_until_ts:
+        _quota_notified_for_ts = _quota_exhausted_until_ts
+        try:
+            reset_tw = next_midnight_pt.astimezone(_TW_TZ).strftime("%m-%d %H:%M")
+            notice = (
+                "⚠️ Gemini 今日免費額度已用完\n"
+                f"到 {reset_tw} TW 之前咪寶不會回覆訊息\n"
+                "（明天會自動恢復）"
+            )
+            group_id = getattr(settings, "allowed_group_id", None) or os.environ.get("ALLOWED_GROUP_ID")
+            if group_id and not settings.bot_muted:
+                with ApiClient(_line_config) as api_client:
+                    MessagingApi(api_client).push_message(
+                        PushMessageRequest(
+                            to=group_id,
+                            messages=[TextMessage(text=notice)],
+                        )
+                    )
+                logger.info("quota exhausted notice pushed to group=%s", group_id)
+        except Exception as e:
+            logger.warning("quota exhausted notice push failed: %s", str(e)[:200])
+
 
 def _quota_exhausted() -> bool:
-    """cache 還沒到期就回 True,handler 要直接短路。"""
-    return time.time() < _quota_exhausted_until_ts
+    """cache 還沒到期就回 True,handler 要直接短路。
+    同時做預警：bot counter 達 daily limit 時主動 mark（觸發一次性推播），處理「成功用光」情境。"""
+    if time.time() < _quota_exhausted_until_ts:
+        return True
+    # 預警：當日請求數已達 limit（含失敗），主動觸發 exhausted
+    try:
+        info = gemini_client.get_gemini_quota_info()
+        if info and info.get("used_requests", 0) >= info.get("limit_requests", 20):
+            _mark_quota_exhausted()
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _quota_exhausted_message() -> str:
@@ -1302,6 +1346,40 @@ def _quota_exhausted_message() -> str:
         f"可以再使用的時間:{abs_str}(台灣時間,{rel_str})\n"
         f"想馬上恢復 → https://aistudio.google.com 綁卡開 pay-as-you-go"
     )
+
+
+# ── 思考中提示 ────────────────────────────────────────────────────────────────
+# Gemini 呼叫超過 3 秒還沒回 → 推一則「思考中」到群組，讓使用者知道 bot 在忙
+# 不是沒 quota。quota 爆時 handler 已短路；timer 觸發時再 double check 一次。
+
+def _push_thinking(group_id: str) -> None:
+    if _quota_exhausted() or settings.bot_muted:
+        return
+    try:
+        with ApiClient(_line_config) as api_client:
+            MessagingApi(api_client).push_message(
+                PushMessageRequest(
+                    to=group_id,
+                    messages=[TextMessage(text="🐾 正在思考中，稍等一下…")],
+                )
+            )
+    except Exception as e:
+        logger.warning("thinking push failed: %s", str(e)[:200])
+
+
+@contextmanager
+def _thinking_indicator(group_id: str | None, delay: float = 3.0):
+    """Gemini 呼叫 > delay 秒才回 → 推一則思考中訊息。quota 爆時不推。"""
+    if not group_id:
+        yield
+        return
+    timer = threading.Timer(delay, lambda: _push_thinking(group_id))
+    timer.daemon = True
+    timer.start()
+    try:
+        yield
+    finally:
+        timer.cancel()
 
 
 def _get_persona_notes(group_id: str) -> list[dict]:
@@ -1458,7 +1536,8 @@ def _handle_dinner_recommendation(event: MessageEvent, group_id: str) -> None:
     facts = memory.top_facts(group_id)
     pnotes = _get_persona_notes(group_id)
     try:
-        reply_text = gemini_client.chat(_DINNER_PROMPT, context, facts, pnotes)
+        with _thinking_indicator(group_id):
+            reply_text = gemini_client.chat(_DINNER_PROMPT, context, facts, pnotes)
     except Exception as e:
         if _is_quota_error(e):
             _mark_quota_exhausted()
