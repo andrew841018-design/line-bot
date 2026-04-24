@@ -327,6 +327,14 @@ def chat(
 
     主 model 連續 503 後自動 fallback 到 lite model。
     """
+    _TRANSIENT_SIGS = ("503", "Server disconnected", "Connection reset",
+                       "RemoteProtocolError", "ReadTimeout", "ConnectError",
+                       "TimeoutError", "UNAVAILABLE")
+
+    def _is_transient(e: Exception) -> bool:
+        s = str(e) + type(e).__name__
+        return any(sig in s for sig in _TRANSIENT_SIGS)
+
     def _run(model: str) -> str:
         chat_session = _client.chats.create(
             model=model,
@@ -360,9 +368,9 @@ def chat(
                 continue
             except Exception as e:
                 last_err = e
-                if "503" in str(e) and attempt < 2:
-                    logger.warning("gemini 503, retry %d/2 after 2s", attempt + 1)
-                    time.sleep(2)
+                if _is_transient(e) and attempt < 2:
+                    logger.warning("gemini transient error (%s), retry %d/2 after 3s", type(e).__name__, attempt + 1)
+                    time.sleep(3)
                     continue
                 raise
         if last_err:

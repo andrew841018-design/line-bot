@@ -1085,32 +1085,74 @@ _TEXT_LIKE_MIMES = {
     "application/x-python",
     "application/x-python-code",
 }
+# Gemini 原生支援直接送 bytes 的 MIME
+_GEMINI_NATIVE_MIMES = {
+    "application/pdf",
+    "image/jpeg", "image/png", "image/gif", "image/webp", "image/heic", "image/heif",
+}
 # 80k 字中文 ≈ 100〜120k tokens，留 buffer 給 system prompt + context
 _TEXT_CHAR_LIMIT = 80_000
 
 
+def _extract_office_text(data: bytes, file_name: str) -> str | None:
+    """從 Word/Excel/PPT bytes 抽出純文字，失敗回 None。"""
+    ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
+    try:
+        if ext in ("docx",):
+            from docx import Document
+            import io
+            doc = Document(io.BytesIO(data))
+            return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        if ext in ("xlsx", "xls"):
+            import openpyxl, io
+            wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+            lines = []
+            for sheet in wb.worksheets:
+                lines.append(f"[工作表：{sheet.title}]")
+                for row in sheet.iter_rows(values_only=True):
+                    row_str = "\t".join("" if v is None else str(v) for v in row)
+                    if row_str.strip():
+                        lines.append(row_str)
+            return "\n".join(lines)
+        if ext in ("pptx",):
+            from pptx import Presentation
+            import io
+            prs = Presentation(io.BytesIO(data))
+            lines = []
+            for i, slide in enumerate(prs.slides, 1):
+                lines.append(f"[第 {i} 頁]")
+                for shape in slide.shapes:
+                    if hasattr(shape, "text") and shape.text.strip():
+                        lines.append(shape.text.strip())
+            return "\n".join(lines)
+    except Exception as e:
+        logger.warning("office extract failed (%s): %s", file_name, e)
+    return None
+
+
 def _handle_file_message(event: MessageEvent, group_id: str) -> None:
-    """檔案訊息 — 只處理文字類 (txt/md/json/csv/code)，binary 檔案婉拒。"""
+    """檔案訊息 — 支援 PDF/圖片/Word/Excel/PPT/文字檔，其餘婉拒。"""
     msg = event.message
     file_name = getattr(msg, "file_name", "") or "unknown"
     mime_type = _guess_mime_type(file_name)
     is_text_like = mime_type.startswith("text/") or mime_type in _TEXT_LIKE_MIMES
+    is_native = mime_type in _GEMINI_NATIVE_MIMES
+    ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
+    is_office = ext in ("docx", "xlsx", "xls", "pptx")
 
-    if not is_text_like:
+    if not (is_text_like or is_native or is_office):
         _reply(
             event.reply_token,
-            f"這個檔案 ({file_name}) 不是文字檔,目前不處理 binary/PDF/壓縮檔。\n"
-            f"如果是文章,請直接貼「網址」或「內容文字」給我。",
+            f"這個檔案格式 ({ext or mime_type}) 目前還不支援。\n"
+            f"可以處理的格式：PDF、Word、Excel、PPT、圖片、txt/csv/json。",
             group_id=group_id,
         )
         return
 
-    # 短路：cache 已知 quota 爆 → 靜默跳過
     if _quota_exhausted():
         logger.info("file handler skipped Gemini (cached quota exhausted)")
         return
 
-    # 下載 + decode + 截斷
     try:
         data = _download_content(msg.id)
     except Exception as e:
@@ -1118,31 +1160,55 @@ def _handle_file_message(event: MessageEvent, group_id: str) -> None:
         _reply(event.reply_token, f"下載檔案失敗:{type(e).__name__}", group_id=group_id)
         return
 
-    try:
-        content = data.decode("utf-8", errors="replace")
-    except Exception as e:
-        logger.exception("decode file failed: %s", e)
-        _reply(event.reply_token, f"這個檔案沒辦法用 UTF-8 讀,可能是 binary。", group_id=group_id)
+    context = memory.get_context(group_id)
+    facts = memory.top_facts(group_id)
+    pnotes = _get_persona_notes(group_id)
+
+    # ── PDF / 圖片 → 直接送 bytes Part 給 Gemini ──────────────────────────────
+    if is_native:
+        from google.genai import types as _gtypes
+        parts = [
+            _gtypes.Part.from_bytes(data=data, mime_type=mime_type),
+            f"使用者傳了一個檔案：{file_name}。請分析其內容並回應。",
+        ]
+        try:
+            reply_text = gemini_client.chat(parts, context, facts, pnotes)
+        except Exception as e:
+            if _is_quota_error(e):
+                _mark_quota_exhausted()
+            else:
+                logger.exception("gemini chat (file-native) failed: %s", e)
+            _reply(event.reply_token, _friendly_gemini_error(e, file_name), group_id=group_id)
+            return
+        memory.append_turn(group_id, "user", f"[file: {file_name}]")
+        memory.append_turn(group_id, "bot", reply_text)
+        _maybe_extract_facts(group_id)
+        _reply(event.reply_token, reply_text, group_id=group_id)
         return
+
+    # ── Office 文件 → 抽文字再送 ──────────────────────────────────────────────
+    if is_office:
+        content = _extract_office_text(data, file_name)
+        if content is None:
+            _reply(event.reply_token, f"讀取 {file_name} 失敗，檔案可能損毀或格式不符。", group_id=group_id)
+            return
+    else:
+        # 文字檔
+        content = data.decode("utf-8", errors="replace")
 
     original_len = len(content)
     note = ""
     if original_len > _TEXT_CHAR_LIMIT:
         content = content[:_TEXT_CHAR_LIMIT]
         note = (
-            f"\n\n(注意:原始檔案共 {original_len:,} 字,"
-            f"我只看了前 {_TEXT_CHAR_LIMIT:,} 字,要看完整內容請把檔案切小一點。)"
+            f"\n\n(原始檔案共 {original_len:,} 字，只看前 {_TEXT_CHAR_LIMIT:,} 字)"
         )
 
     prompt_text = (
-        f"(使用者丟了一個文字檔:{file_name}){note}\n\n"
-        f"--- 檔案內容開始 ---\n{content}\n--- 檔案內容結束 ---\n\n"
-        f"請分析這個檔案的內容並回應。"
+        f"(使用者丟了一個檔案：{file_name}){note}\n\n"
+        f"--- 內容開始 ---\n{content}\n--- 內容結束 ---\n\n請分析這個檔案的內容並回應。"
     )
 
-    context = memory.get_context(group_id)
-    facts = memory.top_facts(group_id)
-    pnotes = _get_persona_notes(group_id)
     try:
         reply_text = gemini_client.chat(prompt_text, context, facts, pnotes)
     except Exception as e:
@@ -1156,9 +1222,7 @@ def _handle_file_message(event: MessageEvent, group_id: str) -> None:
 
     memory.append_turn(group_id, "user", f"[file: {file_name}]")
     memory.append_turn(group_id, "bot", reply_text)
-
     _maybe_extract_facts(group_id)
-
     _reply(event.reply_token, reply_text, group_id=group_id)
 
 
@@ -1289,8 +1353,10 @@ def _friendly_gemini_error(e: Exception, file_name: str | None = None) -> str:
         return "Gemini API key 有問題,請檢查設定。"
     if "400" in err_str:
         return f"Gemini 說這個輸入有問題:{err_str[:200]}"
-    if "500" in err_str or "503" in err_str or "UNAVAILABLE" in err_str:
-        return "Gemini 那邊暫時出問題,等一下再試。"
+    if ("500" in err_str or "503" in err_str or "UNAVAILABLE" in err_str
+            or "Server disconnected" in err_str or "RemoteProtocolError" in type(e).__name__
+            or "Connection reset" in err_str or "ReadTimeout" in err_str):
+        return "Gemini 那邊暫時斷線,等一下再試。"
     return f"分析失敗:{type(e).__name__}"
 
 
@@ -1673,6 +1739,46 @@ def _strip_mentions(message: TextMessageContent) -> str:
     return text
 
 
+def _md_to_line(text: str) -> str:
+    """把 Gemini 回傳的 Markdown 語法轉成 LINE 能直接閱讀的純文字。"""
+    lines = text.splitlines()
+    out = []
+    in_code_block = False
+    for line in lines:
+        # code block fence
+        if line.strip().startswith("```"):
+            in_code_block = not in_code_block
+            continue
+        if in_code_block:
+            out.append(line)
+            continue
+        # 水平分隔線
+        if re.match(r"^\s*[-*_]{3,}\s*$", line):
+            out.append("")
+            continue
+        # headers → 加底線感
+        m = re.match(r"^#{1,3}\s+(.+)", line)
+        if m:
+            out.append(f"▌ {m.group(1)}")
+            continue
+        # blockquote
+        line = re.sub(r"^>\s*", "", line)
+        # bullet * / - → •（只處理行首）
+        line = re.sub(r"^(\s*)[*-]\s+", r"\1• ", line)
+        # bold **text** / __text__
+        line = re.sub(r"\*\*(.+?)\*\*", r"\1", line)
+        line = re.sub(r"__(.+?)__", r"\1", line)
+        # italic *text* / _text_（小心不要吃掉 URL 或數學符號）
+        line = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"\1", line)
+        line = re.sub(r"(?<!_)_(?!_)(.+?)(?<!_)_(?!_)", r"\1", line)
+        # inline code
+        line = re.sub(r"`(.+?)`", r"\1", line)
+        # [text](url) → text（url）
+        line = re.sub(r"\[([^\]]+)\]\((https?://[^\)]+)\)", r"\1（\2）", line)
+        out.append(line)
+    return "\n".join(out)
+
+
 def _reply(reply_token: str, text: str, group_id: str | None = None) -> None:
     """
     回覆 LINE 訊息。若帶 group_id,成功後會把 bot 的回覆也存進 raw_messages,
@@ -1684,6 +1790,8 @@ def _reply(reply_token: str, text: str, group_id: str | None = None) -> None:
     settings.bot_muted=True 時整個函式 short-circuit:
     不 reply、不 push、只把原本要送的 text 寫進 log 方便除錯。
     """
+    # Markdown → LINE 純文字
+    text = _md_to_line(text)
     # LINE 單則訊息上限 5000 字；在截斷前先預留 footer 空間
     footer = _get_quota_footer()
     text = text[:4900 - len(footer)] + footer
