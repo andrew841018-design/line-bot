@@ -4,6 +4,7 @@
 - 地震：USGS GeoJSON API，篩選台灣周邊 M3.0+
 - 颱風：爬 CWA 颱風資訊頁面
 """
+
 from __future__ import annotations
 
 import json
@@ -21,7 +22,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 import requests
 from bs4 import BeautifulSoup
 
-GROUP_ID = os.environ.get("LINE_ALLOWED_GROUP_ID") or os.environ.get("ALLOWED_GROUP_ID", "")
+GROUP_ID = os.environ.get("LINE_ALLOWED_GROUP_ID") or os.environ.get(
+    "ALLOWED_GROUP_ID", ""
+)
 TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 
 _PUSH_URL = "https://api.line.me/v2/bot/message/push"
@@ -49,7 +52,10 @@ def _save_state(state: dict) -> None:
 def _push(text: str) -> None:
     requests.post(
         _PUSH_URL,
-        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+        headers={
+            "Authorization": f"Bearer {TOKEN}",
+            "Content-Type": "application/json",
+        },
         json={"to": GROUP_ID, "messages": [{"type": "text", "text": text[:5000]}]},
         timeout=10,
     )
@@ -73,14 +79,18 @@ def _fetch_earthquakes() -> list[dict]:
         if len(coords) < 3:
             continue
         lon, lat, depth = coords[0], coords[1], coords[2]
-        if not (_TW_LAT_MIN <= lat <= _TW_LAT_MAX and _TW_LON_MIN <= lon <= _TW_LON_MAX):
+        if not (
+            _TW_LAT_MIN <= lat <= _TW_LAT_MAX and _TW_LON_MIN <= lon <= _TW_LON_MAX
+        ):
             continue
         mag = props.get("mag", 0) or 0
         if mag < _EQ_MIN_MAG:
             continue
         place = props.get("place", "台灣附近")
         eq_id = f.get("id", "")
-        t = time.strftime("%Y-%m-%d %H:%M", time.gmtime((props.get("time") or 0) / 1000))
+        t = time.strftime(
+            "%Y-%m-%d %H:%M", time.gmtime((props.get("time") or 0) / 1000)
+        )
         text = (
             f"🌍 台灣有感地震\n"
             f"規模 M{mag:.1f}，深度 {abs(depth):.0f} 公里\n"
@@ -105,7 +115,12 @@ def _fetch_typhoon() -> list[dict]:
             return []
         # 取前 500 字當摘要
         summary = text_content[:500].strip()
-        return [{"id": f"typhoon_{time.strftime('%Y%m%d%H')}", "text": f"🌀 颱風動態\n{summary}"}]
+        return [
+            {
+                "id": f"typhoon_{time.strftime('%Y%m%d%H')}",
+                "text": f"🌀 颱風動態\n{summary}",
+            }
+        ]
     except Exception as e:
         print(f"颱風頁面抓取失敗: {e}")
         return []

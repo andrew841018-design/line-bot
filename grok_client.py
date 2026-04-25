@@ -6,6 +6,7 @@ Grok (xAI) fallback client — OpenAI-compatible API。
 
 免費額度：25 req/天（Grok-3-mini）
 """
+
 from __future__ import annotations
 
 import json
@@ -21,7 +22,9 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 _PT = ZoneInfo("America/Los_Angeles")
-_USAGE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grok_usage.json")
+_USAGE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "grok_usage.json"
+)
 _DAILY_REQUEST_LIMIT = 25
 
 _client: OpenAI | None = None
@@ -37,6 +40,7 @@ def _get_client() -> OpenAI:
 
 
 # ── 用量追蹤 ────────────────────────────────────────────────────────────────
+
 
 def _today_pt() -> str:
     return datetime.now(tz=_PT).strftime("%Y-%m-%d")
@@ -78,6 +82,7 @@ def get_quota_info() -> dict:
 
 # ── 對話 ─────────────────────────────────────────────────────────────────────
 
+
 def chat(
     user_input: str,
     context: list[tuple[str, str]],
@@ -94,15 +99,18 @@ def chat(
 
     # 重用 gemini_client 的 system prompt
     from gemini_client import _build_system_instruction
+
     system_text = _build_system_instruction(facts, persona_notes)
 
     messages: list[dict] = [{"role": "system", "content": system_text}]
 
     for role, text in context:
-        messages.append({
-            "role": "user" if role == "user" else "assistant",
-            "content": text,
-        })
+        messages.append(
+            {
+                "role": "user" if role == "user" else "assistant",
+                "content": text,
+            }
+        )
 
     if isinstance(user_input, str):
         messages.append({"role": "user", "content": user_input})
@@ -111,7 +119,7 @@ def chat(
         client = _get_client()
         resp = client.chat.completions.create(
             model=settings.grok_model,
-            messages=messages,
+            messages=messages,  # type: ignore[arg-type]
             temperature=0.7,
         )
         data = _load_usage()
@@ -119,7 +127,9 @@ def chat(
         _save_usage(data)
 
         text = (resp.choices[0].message.content or "").strip()
-        logger.info("grok reply ok, used %d/%d today", data["requests"], _DAILY_REQUEST_LIMIT)
+        logger.info(
+            "grok reply ok, used %d/%d today", data["requests"], _DAILY_REQUEST_LIMIT
+        )
         return text
 
     except Exception as e:
@@ -136,6 +146,7 @@ def group_messages(items: list[dict]) -> list[dict] | None:
         return None
     try:
         from datetime import datetime as _dt
+
         lines = []
         for i, it in enumerate(items):
             ts = it.get("timestamp", 0)
@@ -167,6 +178,7 @@ def group_messages(items: list[dict]) -> list[dict] | None:
             response_format={"type": "json_object"},
         )
         import json as _json
+
         data = _json.loads(resp.choices[0].message.content or "{}")
         groups_raw = data.get("groups", [])
 
@@ -176,7 +188,11 @@ def group_messages(items: list[dict]) -> list[dict] | None:
             idxs = g.get("idxs") if isinstance(g, dict) else None
             if not isinstance(idxs, list):
                 continue
-            ok = [i for i in idxs if isinstance(i, int) and 0 <= i < len(items) and i not in seen]
+            ok = [
+                i
+                for i in idxs
+                if isinstance(i, int) and 0 <= i < len(items) and i not in seen
+            ]
             if not ok:
                 continue
             seen.update(ok)

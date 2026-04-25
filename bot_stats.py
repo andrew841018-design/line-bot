@@ -4,6 +4,7 @@ bot_stats.py — LINE bot 每日使用量統計
 設計：只存 SQLite，不對外推播。Andrew 問的時候查詢給他看。
 用途：判斷要不要付錢、付哪個方案、每月預算大概多少。
 """
+
 from __future__ import annotations
 
 import re
@@ -14,7 +15,9 @@ from zoneinfo import ZoneInfo
 
 _TW = ZoneInfo("Asia/Taipei")
 _lock = threading.Lock()
-_DB_PATH = __import__("os").path.join(__import__("os").path.dirname(__file__), "line_bot.db")
+_DB_PATH = __import__("os").path.join(
+    __import__("os").path.dirname(__file__), "line_bot.db"
+)
 
 
 def _today() -> str:
@@ -40,10 +43,13 @@ def increment(key: str, amount: int = 1, date: str | None = None) -> None:
     d = date or _today()
     with _lock:
         conn = _conn()
-        conn.execute("""
+        conn.execute(
+            """
             INSERT INTO daily_stats(date, stat_key, value) VALUES(?, ?, ?)
             ON CONFLICT(date, stat_key) DO UPDATE SET value = value + excluded.value
-        """, (d, key, amount))
+        """,
+            (d, key, amount),
+        )
         conn.commit()
         conn.close()
 
@@ -52,9 +58,13 @@ def increment(key: str, amount: int = 1, date: str | None = None) -> None:
 
 _URL_RE = re.compile(r"https?://")
 _QUESTION_RE = re.compile(r"[？?]|嗎|幾|什麼|哪|怎麼|為什麼|如何|是否|有沒有")
-_FINANCE_RE = re.compile(r"股票|ETF|投資|基金|台積電|漲|跌|理財|報酬|殖利率|配息|0\d{3}|NVDA|半導體")
+_FINANCE_RE = re.compile(
+    r"股票|ETF|投資|基金|台積電|漲|跌|理財|報酬|殖利率|配息|0\d{3}|NVDA|半導體"
+)
 _HEALTH_RE = re.compile(r"醫|病|症狀|藥|治療|健康|手術|診斷|癌|發燒|血壓|血糖")
-_POLITICAL_RE = re.compile(r"政治|選舉|民進黨|國民黨|兩岸|台灣獨|統一|美國|關稅|川普|習近平")
+_POLITICAL_RE = re.compile(
+    r"政治|選舉|民進黨|國民黨|兩岸|台灣獨|統一|美國|關稅|川普|習近平"
+)
 _FACT_CHECK_RE = re.compile(r"真的假的|是真的|是假的|謠言|查一下|核實|假訊息|真假|可信")
 _NEWS_RE = re.compile(r"新聞|報導|表示|宣布|公告|日前|據了解|指出")
 
@@ -107,18 +117,23 @@ def track_line_push() -> None:
 
 # ── 查詢 ─────────────────────────────────────────────────────────────────────
 
+
 def query_range(days: int = 30) -> list[dict]:
     """回傳最近 N 天的每日統計，newest first。"""
     conn = _conn()
-    rows = conn.execute("""
+    rows = conn.execute(
+        """
         SELECT date, stat_key, value
         FROM daily_stats
         ORDER BY date DESC
         LIMIT ?
-    """, (days * 20,)).fetchall()
+    """,
+        (days * 20,),
+    ).fetchall()
     conn.close()
 
     from collections import defaultdict
+
     by_date: dict[str, dict] = defaultdict(dict)
     for date, key, val in rows:
         by_date[date][key] = val
@@ -143,8 +158,12 @@ def summary_report(days: int = 30) -> str:
     total_gemini = sum(d.get("reply_gemini", 0) for d in data)
     total_grok = sum(d.get("reply_grok", 0) for d in data)
 
-    lines.append(f"收到訊息：{total_received} 則（平均 {total_received//max(len(data),1)}/天）")
-    lines.append(f"成功回覆：{total_replies} 則（Gemini {total_gemini} / Grok {total_grok}）")
+    lines.append(
+        f"收到訊息：{total_received} 則（平均 {total_received // max(len(data), 1)}/天）"
+    )
+    lines.append(
+        f"成功回覆：{total_replies} 則（Gemini {total_gemini} / Grok {total_grok}）"
+    )
     lines.append(f"存入 pending：{total_pending} 則（quota 爆時）")
     lines.append(f"LINE push 用量：{total_push} 則（免費上限 200/月）")
 
@@ -153,7 +172,7 @@ def summary_report(days: int = 30) -> str:
     for d in data:
         for k, v in d.items():
             if k.startswith("msg_type_"):
-                cat = k[len("msg_type_"):]
+                cat = k[len("msg_type_") :]
                 type_totals[cat] = type_totals.get(cat, 0) + v
 
     if type_totals:

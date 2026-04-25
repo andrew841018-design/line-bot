@@ -9,6 +9,7 @@ SQLite-backed 對話 context + 長期記憶 + 過濾器規則。
     raw_messages  (group_id, message_id, user_id, text)    所有看過的原始訊息，供 quote 回查
     filter_rules  (group_id, rule_id, kind, pattern, ...)  過濾器規則（skip / must_answer）
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -127,6 +128,7 @@ _init_db()
 
 # ── Context（短期對話歷史）────────────────────────────────────────────────────
 
+
 def append_turn(group_id: str, role: str, text: str) -> None:
     """role: 'user' | 'bot'。超過 context_rounds*2 筆會自動截掉最舊的。"""
     with _lock, _conn() as c:
@@ -157,6 +159,7 @@ def get_context(group_id: str) -> list[tuple[str, str]]:
 
 
 # ── Facts（長期記憶）──────────────────────────────────────────────────────────
+
 
 def add_fact(group_id: str, fact: str, user_id: str = "") -> bool:
     """回傳是否真的新增（False 代表重複或空字串）。user_id='' 代表群組層級。"""
@@ -275,9 +278,7 @@ def log_raw_message(
         )
 
 
-def get_raw_message(
-    group_id: str, message_id: str
-) -> tuple[str | None, str] | None:
+def get_raw_message(group_id: str, message_id: str) -> tuple[str | None, str] | None:
     """查原始訊息。回傳 (user_id, text) 或 None。"""
     with _conn() as c:
         row = c.execute(
@@ -337,6 +338,7 @@ def get_last_bot_reply(group_id: str) -> tuple[str, str] | None:
 
 # ── Filter rules（過濾器的學習結果）────────────────────────────────────────
 
+
 def add_filter_rule(
     group_id: str, kind: str, pattern: str, source: str = "user"
 ) -> int:
@@ -370,8 +372,7 @@ def list_filter_rules(group_id: str) -> list[dict]:
             (group_id,),
         ).fetchall()
     return [
-        {"rule_id": r[0], "kind": r[1], "pattern": r[2], "source": r[3]}
-        for r in rows
+        {"rule_id": r[0], "kind": r[1], "pattern": r[2], "source": r[3]} for r in rows
     ]
 
 
@@ -386,17 +387,14 @@ def delete_filter_rule(group_id: str, rule_id: int) -> bool:
 
 def clear_filter_rules(group_id: str) -> int:
     with _lock, _conn() as c:
-        cur = c.execute(
-            "DELETE FROM filter_rules WHERE group_id = ?", (group_id,)
-        )
+        cur = c.execute("DELETE FROM filter_rules WHERE group_id = ?", (group_id,))
         return cur.rowcount
 
 
 # ── Rule drafts（Layer 3 週期性自我檢討的候選規則）──────────────────────────
 
-def add_rule_draft(
-    group_id: str, kind: str, pattern: str, reason: str = ""
-) -> int:
+
+def add_rule_draft(group_id: str, kind: str, pattern: str, reason: str = "") -> int:
     """新增一筆 draft，回傳 draft_id。kind: 'skip' | 'must_answer'。"""
     assert kind in ("skip", "must_answer")
     pattern = pattern.strip()
@@ -426,8 +424,7 @@ def list_rule_drafts(group_id: str) -> list[dict]:
             (group_id,),
         ).fetchall()
     return [
-        {"draft_id": r[0], "kind": r[1], "pattern": r[2], "reason": r[3]}
-        for r in rows
+        {"draft_id": r[0], "kind": r[1], "pattern": r[2], "reason": r[3]} for r in rows
     ]
 
 
@@ -445,9 +442,7 @@ def get_rule_draft(group_id: str, draft_id: int) -> dict | None:
 
 def clear_rule_drafts(group_id: str) -> int:
     with _lock, _conn() as c:
-        cur = c.execute(
-            "DELETE FROM rule_drafts WHERE group_id = ?", (group_id,)
-        )
+        cur = c.execute("DELETE FROM rule_drafts WHERE group_id = ?", (group_id,))
         return cur.rowcount
 
 
@@ -497,6 +492,7 @@ def add_persona_note(
 ) -> int | None:
     """新增一筆 persona note。kind='example'|'correction'。超過上限自動淘汰最舊的。"""
     import time
+
     now = int(time.time())
     with _lock, _conn() as c:
         c.execute(
@@ -517,9 +513,7 @@ def add_persona_note(
         return note_id
 
 
-def list_persona_notes(
-    group_id: str, kind: str | None = None
-) -> list[dict]:
+def list_persona_notes(group_id: str, kind: str | None = None) -> list[dict]:
     """取出 persona notes。kind=None 取全部，否則只取指定種類。"""
     with _conn() as c:
         if kind:
@@ -537,7 +531,12 @@ def list_persona_notes(
                 (group_id,),
             ).fetchall()
     return [
-        {"note_id": r[0], "kind": r[1], "scenario": r[2],
-         "content": r[3], "created_at": r[4]}
+        {
+            "note_id": r[0],
+            "kind": r[1],
+            "scenario": r[2],
+            "content": r[3],
+            "created_at": r[4],
+        }
         for r in rows
     ]

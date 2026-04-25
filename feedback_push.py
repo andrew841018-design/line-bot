@@ -5,6 +5,7 @@ usage:
     python feedback_push.py
     python feedback_push.py --dry-run
 """
+
 from __future__ import annotations
 
 import argparse
@@ -28,7 +29,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("feedback_push")
 
-_QUESTION = "今天有哪裡可以改進的地方嗎？\n（對我說話方式、回應內容、任何感覺都可以說喔）"
+_QUESTION = (
+    "今天有哪裡可以改進的地方嗎？\n（對我說話方式、回應內容、任何感覺都可以說喔）"
+)
 
 
 def _push(group_id: str, text: str) -> None:

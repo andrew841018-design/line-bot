@@ -4,6 +4,7 @@
 
 Gemini 429 時不清空 json，讓下一個排程重試。
 """
+
 from __future__ import annotations
 
 import argparse

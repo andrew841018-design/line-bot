@@ -18,6 +18,7 @@ adopt_drafts 的 spec 語意：
 
 採用完會把被採用的 drafts 從 rule_drafts 刪掉（未採用的保留，等下次 /採用 或被下次 /檢討 蓋掉）。
 """
+
 from __future__ import annotations
 
 import logging
@@ -75,9 +76,7 @@ def _format_dialogue_with_bot(
     return "\n".join(lines)
 
 
-def run_weekly_review(
-    group_id: str, days: int = 7
-) -> tuple[str, list[dict]]:
+def run_weekly_review(group_id: str, days: int = 7) -> tuple[str, list[dict]]:
     """跑一次檢討，回傳 (報告文字, 新寫入的 drafts list)。"""
     since_ts = int(time.time()) - days * 86400
     messages = memory.get_messages_since(group_id, since_ts, exclude_bot=True)
@@ -92,8 +91,7 @@ def run_weekly_review(
 
     if msg_count < _MIN_MESSAGES_FOR_REVIEW:
         return (
-            f"{header}\n\n"
-            f"訊息量太少（< {_MIN_MESSAGES_FOR_REVIEW}），這次不產生建議。",
+            f"{header}\n\n訊息量太少（< {_MIN_MESSAGES_FOR_REVIEW}），這次不產生建議。",
             [],
         )
 
@@ -102,11 +100,11 @@ def run_weekly_review(
 
     if not suggestions:
         rule_report = "沒有抓到值得新增的規則。"
-        saved = []
+        saved: list[dict] = []
     else:
         # 先清掉舊 drafts，避免編號亂跳（每次檢討只保留最新建議）
         memory.clear_rule_drafts(group_id)
-        saved: list[dict] = []
+        saved = []
         for s in suggestions:
             draft_id = memory.add_rule_draft(
                 group_id=group_id,
@@ -115,12 +113,14 @@ def run_weekly_review(
                 reason=s.get("reason", ""),
             )
             if draft_id:
-                saved.append({
-                    "draft_id": draft_id,
-                    "kind": s["kind"],
-                    "pattern": s["pattern"],
-                    "reason": s.get("reason", ""),
-                })
+                saved.append(
+                    {
+                        "draft_id": draft_id,
+                        "kind": s["kind"],
+                        "pattern": s["pattern"],
+                        "reason": s.get("reason", ""),
+                    }
+                )
         rule_report = _format_rule_section(saved)
 
     # ── 人設檢討 ──────────────────────────────────────────────────────
@@ -131,9 +131,7 @@ def run_weekly_review(
         persona_result = gemini_client.persona_review(bot_dialogue)
         ex_count = 0
         for ex in persona_result.get("examples", []):
-            memory.add_persona_note(
-                group_id, "example", ex["scenario"], ex["response"]
-            )
+            memory.add_persona_note(group_id, "example", ex["scenario"], ex["response"])
             ex_count += 1
         cor_count = 0
         for cor in persona_result.get("corrections", []):
@@ -169,9 +167,7 @@ def _format_rule_section(drafts: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def adopt_drafts(
-    group_id: str, spec: str
-) -> tuple[list[int], str]:
+def adopt_drafts(group_id: str, spec: str) -> tuple[list[int], str]:
     """採用（或拋棄）drafts。回傳 (被升級為 rule 的 draft_id list, 人類訊息)。"""
     spec = spec.strip()
     drafts = memory.list_rule_drafts(group_id)

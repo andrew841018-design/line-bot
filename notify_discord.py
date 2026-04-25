@@ -7,6 +7,7 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 USER_ID = os.getenv("DISCORD_USER_ID")
 
+
 def send_dm(message: str) -> bool:
     headers = {"Authorization": f"Bot {TOKEN}", "Content-Type": "application/json"}
 
@@ -38,5 +39,6 @@ def send_dm(message: str) -> bool:
 
 if __name__ == "__main__":
     import sys
+
     msg = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "測試提醒"
     send_dm(msg)

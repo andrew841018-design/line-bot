@@ -7,13 +7,16 @@ Env loader.
 ALLOWED_GROUP_ID 為空字串時 = 尚未鎖定群組，bot 會把收到的 source.groupId
 寫到 stdout，使用者從 log 抓出來填進 .env 再重啟鎖定。
 """
+
 from __future__ import annotations
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
 
     # ── LINE Messaging API ────────────────────────────────────────────────────
     line_channel_secret: str

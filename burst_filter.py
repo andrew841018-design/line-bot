@@ -20,6 +20,7 @@ Flow：
 - reply_token 有效期 ~60 秒。初始 8 秒 + 分類 ~5 秒 << 60 秒；
   wait 模式下到期後用最後一則的 token 回，若失效 _reply() 會 log warning 不會炸。
 """
+
 from __future__ import annotations
 
 import logging
@@ -34,17 +35,17 @@ import memory
 logger = logging.getLogger(__name__)
 
 # ── 可調參數 ──────────────────────────────────────────────────────────────────
-SHORT_WINDOW_SECONDS = 8.0     # 初始等待窗口：快速收集 burst，然後問 Gemini
-BURST_WINDOW_SECONDS = 60.0    # Gemini 判斷對方還沒說完時，等 1 分鐘再強制回
-HEURISTIC_SHORT_LEN = 10       # 低於這個長度直接 skip（除非含 URL）
-HEURISTIC_LONG_LEN = 80        # 高於這個長度觸發「可能是轉貼長文」
+SHORT_WINDOW_SECONDS = 8.0  # 初始等待窗口：快速收集 burst，然後問 Gemini
+BURST_WINDOW_SECONDS = 60.0  # Gemini 判斷對方還沒說完時，等 1 分鐘再強制回
+HEURISTIC_SHORT_LEN = 10  # 低於這個長度直接 skip（除非含 URL）
+HEURISTIC_LONG_LEN = 80  # 高於這個長度觸發「可能是轉貼長文」
 
 # ── 共享狀態（全程由 _lock 保護）──────────────────────────────────────────────
 _lock = threading.Lock()
 _pending: dict[str, list[tuple[str, str, str | None, float]]] = {}
 _timers: dict[str, threading.Timer] = {}
 _last_reply_tokens: dict[str, str] = {}
-_waiting_groups: set[str] = set()   # Gemini 說「還沒說完」的 group，等 1 分鐘
+_waiting_groups: set[str] = set()  # Gemini 說「還沒說完」的 group，等 1 分鐘
 
 # main.py 在 import 後注入的 callback；簽名 = (group_id, combined_text, reply_token)
 _on_flush: Callable[[str, str, str], None] | None = None
@@ -75,10 +76,14 @@ def add_to_burst(
             old.cancel()
         if group_id in _waiting_groups:
             # Gemini 已說還沒說完 — 新訊息重置 1 分鐘等待
-            t = threading.Timer(BURST_WINDOW_SECONDS, _flush_burst, args=[group_id, True])
+            t = threading.Timer(
+                BURST_WINDOW_SECONDS, _flush_burst, args=[group_id, True]
+            )
         else:
             # 初始 8 秒快速收集
-            t = threading.Timer(SHORT_WINDOW_SECONDS, _flush_burst, args=[group_id, False])
+            t = threading.Timer(
+                SHORT_WINDOW_SECONDS, _flush_burst, args=[group_id, False]
+            )
         t.daemon = True
         _timers[group_id] = t
         t.start()
@@ -128,7 +133,8 @@ def _classify_and_maybe_respond(
     if force_respond:
         logger.info(
             "burst force respond after 1-min wait (group=%s, text=%s)",
-            group_id, _truncate(combined_text, 80),
+            group_id,
+            _truncate(combined_text, 80),
         )
         _invoke_flush(group_id, combined_text, reply_token)
         return
@@ -140,13 +146,15 @@ def _classify_and_maybe_respond(
     if rule_decision == "skip":
         logger.info(
             "burst skipped by rule (group=%s, text=%s)",
-            group_id, _truncate(combined_text, 80),
+            group_id,
+            _truncate(combined_text, 80),
         )
         return
     if rule_decision == "must_answer":
         logger.info(
             "burst must_answer by rule (group=%s, text=%s)",
-            group_id, _truncate(combined_text, 80),
+            group_id,
+            _truncate(combined_text, 80),
         )
         _invoke_flush(group_id, combined_text, reply_token)
         return
@@ -156,13 +164,15 @@ def _classify_and_maybe_respond(
     if heur == "skip":
         logger.info(
             "burst skipped by heuristic (group=%s, text=%s)",
-            group_id, _truncate(combined_text, 80),
+            group_id,
+            _truncate(combined_text, 80),
         )
         return
     if heur == "respond":
         logger.info(
             "burst respond by heuristic (group=%s, text=%s)",
-            group_id, _truncate(combined_text, 80),
+            group_id,
+            _truncate(combined_text, 80),
         )
         _invoke_flush(group_id, combined_text, reply_token)
         return
@@ -171,7 +181,9 @@ def _classify_and_maybe_respond(
     decision, reason = gemini_client.classify_burst(combined_text, rules)
     logger.info(
         "burst classifier decision=%s reason=%s text=%s",
-        decision, reason, _truncate(combined_text, 80),
+        decision,
+        reason,
+        _truncate(combined_text, 80),
     )
 
     if decision == "respond":
@@ -181,19 +193,23 @@ def _classify_and_maybe_respond(
         with _lock:
             _waiting_groups.add(group_id)
             existing = _pending.get(group_id, [])
-            _pending[group_id] = pending + existing   # 舊訊息在前，保留順序
+            _pending[group_id] = pending + existing  # 舊訊息在前，保留順序
             if group_id not in _last_reply_tokens:
                 _last_reply_tokens[group_id] = reply_token
             old = _timers.pop(group_id, None)
             if old is not None:
                 old.cancel()
-            t = threading.Timer(BURST_WINDOW_SECONDS, _flush_burst, args=[group_id, True])
+            t = threading.Timer(
+                BURST_WINDOW_SECONDS, _flush_burst, args=[group_id, True]
+            )
             t.daemon = True
             _timers[group_id] = t
             t.start()
         logger.info(
             "burst waiting 1 min (group=%s, reason=%s, text=%s)",
-            group_id, reason, _truncate(combined_text, 80),
+            group_id,
+            reason,
+            _truncate(combined_text, 80),
         )
     # else "skip": 不回
 
@@ -206,6 +222,7 @@ def _invoke_flush(group_id: str, combined_text: str, reply_token: str) -> None:
 
 
 # ── 規則匹配 ──────────────────────────────────────────────────────────────────
+
 
 def _match_rules(text: str, rules: list[dict]) -> str | None:
     """回傳 'skip' / 'must_answer' / None。must_answer 優先。"""
@@ -234,9 +251,29 @@ _TOPIC_END_RE = re.compile(r"[？?！!。～~…]+\s*$")  # 末句結束信號
 
 # 常見純閒聊語助詞，整句等於這些就直接 skip
 _CHITCHAT_EXACT = {
-    "哈哈", "哈哈哈", "XD", "LOL", "好", "好喔", "好的", "ok", "OK", "Ok",
-    "讚", "嗯", "嗯嗯", "晚安", "早安", "午安", "謝謝", "感謝", "Thanks",
-    "收到", "了解", "知道了", "辛苦了",
+    "哈哈",
+    "哈哈哈",
+    "XD",
+    "LOL",
+    "好",
+    "好喔",
+    "好的",
+    "ok",
+    "OK",
+    "Ok",
+    "讚",
+    "嗯",
+    "嗯嗯",
+    "晚安",
+    "早安",
+    "午安",
+    "謝謝",
+    "感謝",
+    "Thanks",
+    "收到",
+    "了解",
+    "知道了",
+    "辛苦了",
 }
 
 

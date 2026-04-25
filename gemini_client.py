@@ -13,6 +13,7 @@ Gemini client wrapper — google-genai SDK 版。
 1. chat(parts, context, facts) → str
 2. extract_facts(context) → list[str]
 """
+
 from __future__ import annotations
 
 import json
@@ -34,7 +35,9 @@ logger = logging.getLogger(__name__)
 _client = genai.Client(api_key=settings.gemini_api_key)
 
 # ── 今日 Gemini token 用量追蹤 ──────────────────────────────────────────────
-_USAGE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gemini_usage.json")
+_USAGE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "gemini_usage.json"
+)
 _PT = ZoneInfo("America/Los_Angeles")
 _DAILY_TOKEN_LIMIT = 1_000_000
 _DAILY_REQUEST_LIMIT = 20  # gemini-2.5-flash 免費層每日請求上限
@@ -116,6 +119,7 @@ def get_gemini_quota_info() -> dict | None:
         }
     except Exception:
         return None
+
 
 # Gemini 2.5 自帶的 built-in tools，一次全開
 # 注意：每個 Tool 物件只能設一個 field（oneof），要 list 多個
@@ -255,7 +259,7 @@ def _build_config(
 ) -> types.GenerateContentConfig:
     return types.GenerateContentConfig(
         system_instruction=_build_system_instruction(facts, persona_notes),
-        tools=_TOOLS,
+        tools=_TOOLS,  # type: ignore[arg-type]
         thinking_config=types.ThinkingConfig(thinking_budget=-1),  # -1 = 動態 thinking
     )
 
@@ -356,9 +360,16 @@ def chat(
 
     主 model 連續 503 後自動 fallback 到 lite model。
     """
-    _TRANSIENT_SIGS = ("503", "Server disconnected", "Connection reset",
-                       "RemoteProtocolError", "ReadTimeout", "ConnectError",
-                       "TimeoutError", "UNAVAILABLE")
+    _TRANSIENT_SIGS = (
+        "503",
+        "Server disconnected",
+        "Connection reset",
+        "RemoteProtocolError",
+        "ReadTimeout",
+        "ConnectError",
+        "TimeoutError",
+        "UNAVAILABLE",
+    )
 
     def _is_transient(e: Exception) -> bool:
         s = str(e) + type(e).__name__
@@ -368,7 +379,7 @@ def chat(
         chat_session = _client.chats.create(
             model=model,
             config=_build_config(facts, persona_notes),
-            history=_to_gemini_history(context),
+            history=_to_gemini_history(context),  # type: ignore[arg-type]
         )
         last_err: Exception | None = None
         for attempt in range(3):
@@ -381,7 +392,9 @@ def chat(
                 if text:
                     # 若回覆以英文為主，追加一條訊息要求改用繁體中文
                     if not _is_chinese_majority(text):
-                        logger.warning("gemini reply is not Chinese-majority, requesting Chinese rewrite")
+                        logger.warning(
+                            "gemini reply is not Chinese-majority, requesting Chinese rewrite"
+                        )
                         retry_resp = chat_session.send_message(
                             "你剛才的回覆含有太多英文。請把剛才的回覆全部改成繁體中文再說一次，不要用英文。"
                         )
@@ -389,18 +402,26 @@ def chat(
                         retry_text = _clean_reply((retry_resp.text or "").strip())
                         if retry_text and _is_chinese_majority(retry_text):
                             retry_urls = _extract_grounding_urls(retry_resp)
-                            return _append_sources(retry_text, retry_urls or grounding_urls)
+                            return _append_sources(
+                                retry_text, retry_urls or grounding_urls
+                            )
                         # 若重試仍非中文，繼續用原回覆（總比空白好）
                     return _append_sources(text, grounding_urls)
                 # text 為空（可能 code_execution 吃掉了），重試
-                logger.warning("gemini chat attempt %d: empty text, retrying", attempt + 1)
+                logger.warning(
+                    "gemini chat attempt %d: empty text, retrying", attempt + 1
+                )
                 continue
             except Exception as e:
                 last_err = e
                 # 失敗也要計數（Google 的 daily quota 是含失敗的）
                 _track_failed_request()
                 if _is_transient(e) and attempt < 2:
-                    logger.warning("gemini transient error (%s), retry %d/2 after 3s", type(e).__name__, attempt + 1)
+                    logger.warning(
+                        "gemini transient error (%s), retry %d/2 after 3s",
+                        type(e).__name__,
+                        attempt + 1,
+                    )
                     time.sleep(3)
                     continue
                 raise
@@ -412,7 +433,10 @@ def chat(
         return _run(settings.gemini_model)
     except Exception as e:
         if "503" in str(e) and settings.gemini_model != settings.gemini_light_model:
-            logger.warning("gemini main model 503 exhausted, falling back to %s", settings.gemini_light_model)
+            logger.warning(
+                "gemini main model 503 exhausted, falling back to %s",
+                settings.gemini_light_model,
+            )
             return _run(settings.gemini_light_model)
         raise
 
@@ -426,7 +450,7 @@ def ocr_image(data: bytes, mime_type: str = "image/jpeg") -> str | None:
         ]
         response = _client.models.generate_content(
             model=settings.gemini_model,
-            contents=prompt,
+            contents=prompt,  # type: ignore[arg-type]
             config=types.GenerateContentConfig(
                 thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
@@ -540,7 +564,7 @@ def classify_burst(
     任何失敗 → 預設不回（err on the side of quiet），reason="classifier_failed"。
     """
     if not combined_text.strip():
-        return (False, "empty")
+        return ("skip", "empty")
 
     if rules:
         rule_lines = []
@@ -788,9 +812,7 @@ def scan_feedback_messages(messages: list[dict]) -> list[dict]:
     if not messages:
         return []
 
-    msg_lines = "\n".join(
-        f"[weight={m['weight']}] {m['text']}" for m in messages
-    )
+    msg_lines = "\n".join(f"[weight={m['weight']}] {m['text']}" for m in messages)
     prompt = _FEEDBACK_SCAN_PROMPT.format(messages=msg_lines)
     try:
         response = _client.models.generate_content(
@@ -804,7 +826,9 @@ def scan_feedback_messages(messages: list[dict]) -> list[dict]:
         data = json.loads(text)
         if not isinstance(data, list):
             return []
-        return [item for item in data if isinstance(item, dict) and item.get("is_feedback")]
+        return [
+            item for item in data if isinstance(item, dict) and item.get("is_feedback")
+        ]
     except Exception as e:
         logger.warning("scan_feedback_messages failed: %s", e)
         raise  # 讓 caller 判斷是否為 429，決定要不要清空 pending
@@ -815,7 +839,9 @@ def generate_improvement_push(feedback_list: list[dict]) -> dict:
     if not feedback_list:
         return {}
 
-    summaries = "\n".join(f"- {item.get('summary') or item.get('text', '')}" for item in feedback_list)
+    summaries = "\n".join(
+        f"- {item.get('summary') or item.get('text', '')}" for item in feedback_list
+    )
     prompt = _IMPROVEMENT_PUSH_PROMPT.format(feedback_list=summaries)
     try:
         response = _client.models.generate_content(

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """每日 10:00 自動匯報 → Discord DM"""
+
 import os
 import sys
 import subprocess
@@ -14,12 +15,15 @@ PROJECT_DIR = BASE / "project"
 DEP_CODE_DIR = PROJECT_DIR / "dependent_code"
 
 sys.path.insert(0, str(LINE_BOT_DIR))
-sys.path.insert(0, str(DEP_CODE_DIR))  # DEP_CODE_DIR 優先，避免 line_bot/config.py 蓋掉 dependent_code/config.py
+sys.path.insert(
+    0, str(DEP_CODE_DIR)
+)  # DEP_CODE_DIR 優先，避免 line_bot/config.py 蓋掉 dependent_code/config.py
 
 from notify_discord import send_dm
 
 
 # ── 1. 每日待辦 ──────────────────────────────────────────────────────────────
+
 
 def daily_todos() -> str:
     today = datetime.now().strftime("%m/%d")
@@ -39,9 +43,11 @@ def daily_todos() -> str:
 
 # ── 2. 爬蟲狀態 ──────────────────────────────────────────────────────────────
 
+
 def crawler_status() -> str:
     try:
         from pg_helper import get_pg
+
         with get_pg() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
@@ -70,12 +76,15 @@ def crawler_status() -> str:
 
 # ── 3. LINE Bot 狀態 ──────────────────────────────────────────────────────────
 
+
 def line_bot_status() -> str:
     lines = []
     # uvicorn.log 尾部
     log_path = LINE_BOT_DIR / "uvicorn.log"
     try:
-        result = subprocess.run(["tail", "-20", str(log_path)], capture_output=True, text=True)
+        result = subprocess.run(
+            ["tail", "-20", str(log_path)], capture_output=True, text=True
+        )
         tail = result.stdout
         errors = [l for l in tail.splitlines() if "ERROR" in l or "error" in l.lower()]
         if errors:
@@ -99,6 +108,7 @@ def line_bot_status() -> str:
 
 # ── 4. Git 狀態 ───────────────────────────────────────────────────────────────
 
+
 def git_status() -> str:
     repos = {
         "主專案": str(PROJECT_DIR),
@@ -108,10 +118,16 @@ def git_status() -> str:
     for name, path in repos.items():
         try:
             uncommitted = subprocess.run(
-                ["git", "status", "--porcelain"], cwd=path, capture_output=True, text=True
+                ["git", "status", "--porcelain"],
+                cwd=path,
+                capture_output=True,
+                text=True,
             ).stdout.strip()
             unpushed = subprocess.run(
-                ["git", "log", "@{u}..", "--oneline"], cwd=path, capture_output=True, text=True
+                ["git", "log", "@{u}..", "--oneline"],
+                cwd=path,
+                capture_output=True,
+                text=True,
             ).stdout.strip()
             u_count = len(uncommitted.splitlines()) if uncommitted else 0
             p_count = len(unpushed.splitlines()) if unpushed else 0
@@ -126,17 +142,22 @@ def git_status() -> str:
 
 # ── 5. 系統 & Pipeline ────────────────────────────────────────────────────────
 
+
 def system_status() -> str:
     lines = ["🖥️ **系統 & Pipeline**"]
 
     # logs 清理一律執行，但不顯示（常態維護）
-    log_files = sorted((PROJECT_DIR / "logs").glob("*"), key=lambda f: f.stat().st_mtime)
+    log_files = sorted(
+        (PROJECT_DIR / "logs").glob("*"), key=lambda f: f.stat().st_mtime
+    )
     if len(log_files) > 30:
-        for f in log_files[:len(log_files) - 30]:
+        for f in log_files[: len(log_files) - 30]:
             f.unlink()
 
     # 磁碟：只有 > 90% 才顯示
-    df = subprocess.run(["df", "-h", "/Users/andrew"], capture_output=True, text=True).stdout
+    df = subprocess.run(
+        ["df", "-h", "/Users/andrew"], capture_output=True, text=True
+    ).stdout
     for line in df.splitlines()[1:]:
         parts = line.split()
         if len(parts) >= 5:
@@ -145,7 +166,9 @@ def system_status() -> str:
                 lines.append(f"🔴 磁碟：{parts[4]} 使用（可用 {parts[3]}）")
 
     # ETL log：只有 ERROR 才顯示（WARNING 不顯示）
-    today_log = PROJECT_DIR / "logs" / f"wayback_{datetime.now().strftime('%Y%m%d')}.log"
+    today_log = (
+        PROJECT_DIR / "logs" / f"wayback_{datetime.now().strftime('%Y%m%d')}.log"
+    )
     if today_log.exists():
         content = today_log.read_text(errors="ignore")
         err_count = content.count("ERROR")
@@ -159,6 +182,7 @@ def system_status() -> str:
 
 # ── 6. 待辦 (CLAUDE.md) ───────────────────────────────────────────────────────
 
+
 def next_todos() -> str:
     claude_md = PROJECT_DIR / "CLAUDE.md"
     try:
@@ -167,7 +191,7 @@ def next_todos() -> str:
         idx = content.rfind("下次繼續")
         if idx == -1:
             return ""
-        section = content[idx:idx+500].splitlines()
+        section = content[idx : idx + 500].splitlines()
         lines = ["📋 **下次繼續**"]
         for line in section[1:8]:
             if line.strip():
@@ -181,12 +205,16 @@ def next_todos() -> str:
 
 _SUGGESTION_HISTORY = LINE_BOT_DIR / "suggestion_history.json"
 
+
 def line_bot_suggestions() -> str:
     import json
     from dotenv import load_dotenv
+
     load_dotenv(dotenv_path=LINE_BOT_DIR / ".env")
 
-    memory_path = Path("/Users/andrew/.claude/projects/-Users-andrew-Desktop-andrew-Data-engineer/memory/project_line_bot_feature_suggestions.md")
+    memory_path = Path(
+        "/Users/andrew/.claude/projects/-Users-andrew-Desktop-andrew-Data-engineer/memory/project_line_bot_feature_suggestions.md"
+    )
 
     try:
         memory_text = memory_path.read_text(errors="ignore")
@@ -223,7 +251,7 @@ def line_bot_suggestions() -> str:
         idx = text.find(header)
         if idx == -1:
             return []
-        rest = text[idx + len(header):]
+        rest = text[idx + len(header) :]
         # 下一個 ## 標題之前為止
         end = rest.find("\n## ")
         chunk = rest[:end] if end != -1 else rest
@@ -250,7 +278,7 @@ def line_bot_suggestions() -> str:
     prompt = f"""你是 LINE bot 的產品顧問。任務：根據近 3 天群組對話，判斷今天有沒有一個「真的值得 Andrew 注意」的新功能建議。
 
 【近 3 天群組對話樣本】
-{chr(10).join(recent_msgs) if recent_msgs else '(無)'}
+{chr(10).join(recent_msgs) if recent_msgs else "(無)"}
 
 【待建議池（可直接挑選，或基於對話生成新的）】
 {json.dumps(pending_list, ensure_ascii=False)}
@@ -274,6 +302,7 @@ def line_bot_suggestions() -> str:
     try:
         from google import genai
         from google.genai import types
+
         client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
         for model_name in ("gemini-2.5-flash-lite", "gemini-2.5-flash"):
@@ -302,6 +331,7 @@ def line_bot_suggestions() -> str:
         candidates = [p for p in pending_list if p not in blacklist]
         if candidates:
             import random
+
             title = random.choice(candidates)
             suggestion = {"title": title, "reason": "（本地挑選，Gemini quota 用盡）"}
         else:
@@ -313,7 +343,9 @@ def line_bot_suggestions() -> str:
     # 寫入歷史
     history.append({"date": datetime.now().isoformat(), "title": suggestion["title"]})
     try:
-        _SUGGESTION_HISTORY.write_text(json.dumps(history, ensure_ascii=False, indent=2))
+        _SUGGESTION_HISTORY.write_text(
+            json.dumps(history, ensure_ascii=False, indent=2)
+        )
     except Exception:
         pass
 
@@ -321,6 +353,7 @@ def line_bot_suggestions() -> str:
 
 
 # ── 8. AI+DE 職缺建議 ─────────────────────────────────────────────────────────
+
 
 def job_search_summary() -> str:
     today = datetime.now().strftime("%Y-%m-%d")
@@ -367,7 +400,8 @@ def job_search_summary() -> str:
                         link_col = cols[6]
                         url = ""
                         import re
-                        m = re.search(r'\(https?://[^\)]+\)', link_col)
+
+                        m = re.search(r"\(https?://[^\)]+\)", link_col)
                         if m:
                             url = m.group(0)[1:-1]
                         must_apply.append(f"• {company} — {title} (S{score}) {url}")
@@ -386,6 +420,7 @@ def job_search_summary() -> str:
 
 
 # ── 主流程 ────────────────────────────────────────────────────────────────────
+
 
 def main():
     sections = [daily_todos()]

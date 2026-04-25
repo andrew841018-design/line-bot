@@ -2,6 +2,7 @@
 
 從 raw_messages 取過去 7 天 bot 的回應，請 Gemini 整理成一則摘要推播給群組。
 """
+
 from __future__ import annotations
 
 import os
@@ -19,7 +20,9 @@ import requests
 import gemini_client
 import memory
 
-GROUP_ID = os.environ.get("LINE_ALLOWED_GROUP_ID") or os.environ.get("ALLOWED_GROUP_ID", "")
+GROUP_ID = os.environ.get("LINE_ALLOWED_GROUP_ID") or os.environ.get(
+    "ALLOWED_GROUP_ID", ""
+)
 TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 _PUSH_URL = "https://api.line.me/v2/bot/message/push"
 
@@ -27,7 +30,10 @@ _PUSH_URL = "https://api.line.me/v2/bot/message/push"
 def _push(text: str) -> None:
     requests.post(
         _PUSH_URL,
-        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+        headers={
+            "Authorization": f"Bearer {TOKEN}",
+            "Content-Type": "application/json",
+        },
         json={"to": GROUP_ID, "messages": [{"type": "text", "text": text[:5000]}]},
         timeout=10,
     )

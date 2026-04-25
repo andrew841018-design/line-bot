@@ -14,6 +14,7 @@ LINE → FastAPI webhook → Gemini → LINE
 
 指令列表請用 /help 查看。
 """
+
 from __future__ import annotations
 
 import json as _json
@@ -31,7 +32,8 @@ import requests as _requests
 from bs4 import BeautifulSoup
 
 try:
-    import yt_dlp as _yt_dlp
+    import yt_dlp as _yt_dlp  # type: ignore[import-untyped]
+
     _YTDLP_AVAILABLE = True
 except ImportError:
     _yt_dlp = None
@@ -39,9 +41,9 @@ except ImportError:
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from google.genai import types
-from linebot.v3 import WebhookParser
-from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.messaging import (
+from linebot.v3 import WebhookParser  # type: ignore[import-untyped]
+from linebot.v3.exceptions import InvalidSignatureError  # type: ignore[import-untyped]
+from linebot.v3.messaging import (  # type: ignore[import-untyped]
     ApiClient,
     Configuration,
     MessagingApi,
@@ -50,7 +52,7 @@ from linebot.v3.messaging import (
     ReplyMessageRequest,
     TextMessage,
 )
-from linebot.v3.webhooks import (
+from linebot.v3.webhooks import (  # type: ignore[import-untyped]
     AudioMessageContent,
     FileMessageContent,
     GroupSource,
@@ -92,9 +94,9 @@ class _DualTZFormatter(logging.Formatter):
 
 
 for _h in logging.getLogger().handlers:
-    _h.setFormatter(_DualTZFormatter(
-        "%(asctime)s %(levelname)s %(name)s | %(message)s"
-    ))
+    _h.setFormatter(
+        _DualTZFormatter("%(asctime)s %(levelname)s %(name)s | %(message)s")
+    )
 
 logger = logging.getLogger("line_bot")
 
@@ -106,6 +108,7 @@ _line_config = Configuration(access_token=settings.line_channel_access_token)
 
 # ── LINE 訊息配額 ─────────────────────────────────────────────────────────────
 
+
 def _get_quota_footer() -> str:
     """每次回應時附上今日用量百分比，失敗回空字串。"""
     if _quota_exhausted():
@@ -116,8 +119,16 @@ def _get_quota_footer() -> str:
     info = gemini_client.get_gemini_quota_info()
     if info is None:
         return ""
-    token_pct = round(info["used_tokens"] / info["limit_tokens"] * 100, 1) if info["limit_tokens"] else 0
-    req_pct = round(info["used_requests"] / info["limit_requests"] * 100, 1) if info["limit_requests"] else 0
+    token_pct = (
+        round(info["used_tokens"] / info["limit_tokens"] * 100, 1)
+        if info["limit_tokens"]
+        else 0
+    )
+    req_pct = (
+        round(info["used_requests"] / info["limit_requests"] * 100, 1)
+        if info["limit_requests"]
+        else 0
+    )
     pct = min(99.0, max(token_pct, req_pct))
     thinking = info.get("used_thinking_tokens", 0)
     thinking_part = f"（思考 {thinking // 1000}k）" if thinking >= 1000 else ""
@@ -149,12 +160,12 @@ def _llm_chat(
 # ── URL 預抓取（繞過 Gemini url_context 的限制）─────────────────────────────
 
 _URL_RE = re.compile(r"https?://\S+")
-_PREFETCH_TIMEOUT = 5        # 秒，避免拖太久讓 reply_token 過期
-_PREFETCH_MAX_CHARS = 5000   # 截斷上限，避免塞爆 prompt
-_PREFETCH_MAX_URLS = 2       # 一次最多抓幾個連結
-_PREFETCH_MIN_CHARS = 80     # 低於此長度視為垃圾（JS 渲染空殼），不塞進 prompt
+_PREFETCH_TIMEOUT = 5  # 秒，避免拖太久讓 reply_token 過期
+_PREFETCH_MAX_CHARS = 5000  # 截斷上限，避免塞爆 prompt
+_PREFETCH_MAX_URLS = 2  # 一次最多抓幾個連結
+_PREFETCH_MIN_CHARS = 80  # 低於此長度視為垃圾（JS 渲染空殼），不塞進 prompt
 
-_YTDLP_TIMEOUT = 12          # yt-dlp 單次提取上限（秒）
+_YTDLP_TIMEOUT = 12  # yt-dlp 單次提取上限（秒）
 _YTDLP_SUBTITLE_MAX_CHARS = 3000
 _YTDLP_SUBTITLE_LANGS = ["zh-TW", "zh-Hant", "zh", "zh-Hans", "en"]
 
@@ -165,7 +176,8 @@ _JS_RENDERED_DOMAINS = re.compile(
     r"tiktok\.com|instagram\.com|threads\.net|facebook\.com|fb\.watch|"
     r"dcard\.tw|x\.com|twitter\.com|reddit\.com|"
     r"youtube\.com/shorts|youtu\.be"
-    r")/", re.IGNORECASE
+    r")/",
+    re.IGNORECASE,
 )
 
 # TikTok 短網址 pattern（vt.tiktok.com / vm.tiktok.com），需先 redirect 才能丟 oEmbed
@@ -186,7 +198,7 @@ def _parse_vtt(vtt_text: str) -> str:
         line = re.sub(r"<[^>]+>", "", line)
         if line:
             lines.append(line)
-    deduped = []
+    deduped: list[str] = []
     for ln in lines:
         if not deduped or ln != deduped[-1]:
             deduped.append(ln)
@@ -195,7 +207,10 @@ def _parse_vtt(vtt_text: str) -> str:
 
 def _extract_subtitles_from_info(info: dict) -> str | None:
     """從 yt-dlp info dict 拿字幕文字（優先人工字幕 → 自動生成，語言優先順序見常數）。"""
-    for subs_dict in (info.get("subtitles") or {}, info.get("automatic_captions") or {}):
+    for subs_dict in (
+        info.get("subtitles") or {},
+        info.get("automatic_captions") or {},
+    ):
         for lang in _YTDLP_SUBTITLE_LANGS:
             entries = subs_dict.get(lang)
             if not entries:
@@ -265,7 +280,9 @@ def _fetch_video_ytdlp(url: str) -> str | None:
 
         lines.append("--- 影片資訊結束 ---")
         block = "\n".join(lines)
-        logger.info("ytdlp OK url=%s chars=%d has_subs=%s", url, len(block), bool(subtitle_text))
+        logger.info(
+            "ytdlp OK url=%s chars=%d has_subs=%s", url, len(block), bool(subtitle_text)
+        )
         return block
     except Exception as e:
         logger.info("ytdlp failed url=%s: %s", url, e)
@@ -289,9 +306,12 @@ def _fetch_tiktok_meta(url: str) -> str | None:
         if _TIKTOK_SHORT_DOMAIN.search(url):
             try:
                 r = _requests.head(
-                    url, timeout=_PREFETCH_TIMEOUT,
+                    url,
+                    timeout=_PREFETCH_TIMEOUT,
                     allow_redirects=True,
-                    headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"},
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
+                    },
                 )
                 target_url = r.url
                 logger.info("tiktok short url resolved: %s → %s", url, target_url)
@@ -313,7 +333,9 @@ def _fetch_tiktok_meta(url: str) -> str | None:
         data = resp.json()
         # oEmbed error response 會是 {"message": "...", "code": 4xx}
         if data.get("code") and int(data.get("code", 0)) >= 400:
-            logger.info("tiktok oembed error code=%s url=%s", data.get("code"), target_url)
+            logger.info(
+                "tiktok oembed error code=%s url=%s", data.get("code"), target_url
+            )
             return None
 
         title = (data.get("title") or "").strip()
@@ -345,7 +367,9 @@ def _fetch_tiktok_meta(url: str) -> str | None:
         block = "\n".join(lines)
         logger.info(
             "tiktok oembed OK url=%s author=%s chars=%d",
-            url, author_id or author_name, len(block),
+            url,
+            author_id or author_name,
+            len(block),
         )
         return block
     except Exception as e:
@@ -419,7 +443,9 @@ def _fetch_reddit_meta(url: str) -> str | None:
         if _REDDIT_SHORT_DOMAIN.search(url) or _REDDIT_SHARE_PATH.search(url):
             try:
                 r = _requests.head(
-                    url, timeout=_PREFETCH_TIMEOUT, allow_redirects=True,
+                    url,
+                    timeout=_PREFETCH_TIMEOUT,
+                    allow_redirects=True,
                     headers={"User-Agent": "ptt-line-bot/1.0"},
                 )
                 target = r.url
@@ -435,12 +461,14 @@ def _fetch_reddit_meta(url: str) -> str | None:
 
         # 砍 query/fragment，path 結尾加 .json
         from urllib.parse import urlsplit, urlunsplit
+
         parts = urlsplit(target)
         json_path = parts.path.rstrip("/") + ".json"
         json_url = urlunsplit((parts.scheme, parts.netloc, json_path, "", ""))
 
         resp = _requests.get(
-            json_url, timeout=_PREFETCH_TIMEOUT,
+            json_url,
+            timeout=_PREFETCH_TIMEOUT,
             headers={"User-Agent": "ptt-line-bot/1.0 (LINE chatbot prefetcher)"},
         )
         if resp.status_code != 200:
@@ -468,7 +496,7 @@ def _fetch_reddit_meta(url: str) -> str | None:
         num_comments = post.get("num_comments", 0)
 
         # 前三條 top-level 留言（跳過 deleted / removed）
-        top_comments = []
+        top_comments: list[str] = []
         if len(data) > 1:
             for child in data[1].get("data", {}).get("children", []):
                 if len(top_comments) >= 3:
@@ -503,7 +531,10 @@ def _fetch_reddit_meta(url: str) -> str | None:
         block = "\n".join(lines)
         logger.info(
             "reddit .json OK url=%s subreddit=%s comments=%d chars=%d",
-            url, subreddit, len(top_comments), len(block),
+            url,
+            subreddit,
+            len(top_comments),
+            len(block),
         )
         return block
     except Exception as e:
@@ -525,7 +556,7 @@ def _fetch_instagram_embed(url: str) -> str | None:
     if not m:
         return None
     shortcode = m.group(2)
-    kind = m.group(1).lower()   # reel 或 p
+    kind = m.group(1).lower()  # reel 或 p
     embed_url = f"https://www.instagram.com/{kind}/{shortcode}/embed/"
     try:
         resp = _requests.get(
@@ -533,8 +564,8 @@ def _fetch_instagram_embed(url: str) -> str | None:
             timeout=_PREFETCH_TIMEOUT,
             headers={
                 "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                              "AppleWebKit/537.36 (KHTML, like Gecko) "
-                              "Chrome/124.0.0.0 Safari/537.36",
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36",
                 "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
             },
         )
@@ -551,10 +582,11 @@ def _fetch_instagram_embed(url: str) -> str | None:
             caption = caption_div.get_text(separator=" ", strip=True)
 
         if not caption:
-            meta = soup.find("meta", attrs={"name": "description"}) or \
-                   soup.find("meta", attrs={"property": "og:description"})
+            meta = soup.find("meta", attrs={"name": "description"}) or soup.find(
+                "meta", attrs={"property": "og:description"}
+            )
             if meta:
-                caption = (meta.get("content") or "").strip()
+                caption = str(meta.get("content") or "").strip()
 
         if not caption or len(caption) < 10:
             logger.info("ig embed: no caption found url=%s", url)
@@ -627,7 +659,10 @@ def _prefetch_urls(text: str) -> str:
                 if block:
                     blocks.append(block)
                 else:
-                    logger.info("instagram: all methods failed url=%s → Gemini Google Search", url)
+                    logger.info(
+                        "instagram: all methods failed url=%s → Gemini Google Search",
+                        url,
+                    )
                 continue
 
             # 3) 其他 JS 渲染網站（FB / X / Threads / dcard）：試 yt-dlp，失敗才 Google Search
@@ -636,13 +671,19 @@ def _prefetch_urls(text: str) -> str:
                 if block:
                     blocks.append(block)
                 else:
-                    logger.info("prefetch skip (JS/CF site, ytdlp failed) url=%s → Gemini Google Search", url)
+                    logger.info(
+                        "prefetch skip (JS/CF site, ytdlp failed) url=%s → Gemini Google Search",
+                        url,
+                    )
                 continue
 
             # 一般網頁：直接抓取 HTML
             resp = _requests.get(
-                url, timeout=_PREFETCH_TIMEOUT,
-                headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"},
+                url,
+                timeout=_PREFETCH_TIMEOUT,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
+                },
             )
             resp.raise_for_status()
             soup = BeautifulSoup(resp.text, "html.parser")
@@ -652,7 +693,9 @@ def _prefetch_urls(text: str) -> str:
 
             # 內容太短 = JS 渲染空殼或 Cloudflare 頁面，不塞垃圾進 prompt
             if len(content) < _PREFETCH_MIN_CHARS:
-                logger.info("prefetch skip (too short %d chars) url=%s", len(content), url)
+                logger.info(
+                    "prefetch skip (too short %d chars) url=%s", len(content), url
+                )
                 continue
 
             if len(content) > _PREFETCH_MAX_CHARS:
@@ -672,6 +715,7 @@ def _prefetch_urls(text: str) -> str:
 
 # ── Health ────────────────────────────────────────────────────────────────────
 
+
 @app.get("/health")
 def health():
     return {
@@ -683,6 +727,7 @@ def health():
 
 
 # ── Webhook ───────────────────────────────────────────────────────────────────
+
 
 @app.post("/callback")
 async def callback(request: Request, x_line_signature: str = Header(None)):
@@ -698,7 +743,10 @@ async def callback(request: Request, x_line_signature: str = Header(None)):
     for event in events:
         src = getattr(event, "source", None)
         gid = getattr(src, "group_id", None) if src else None
-        print(f"[EVENT] type={type(event).__name__} source={type(src).__name__ if src else None} group_id={gid}", flush=True)
+        print(
+            f"[EVENT] type={type(event).__name__} source={type(src).__name__ if src else None} group_id={gid}",
+            flush=True,
+        )
         # 把整個 event 物件 dump 出來看有沒有什麼隱藏欄位
         try:
             print(f"[EVENT_DUMP] {event.model_dump_json()}", flush=True)
@@ -725,7 +773,10 @@ def _handle_event(event) -> None:
     # MemberJoinedEvent / MemberLeftEvent: 其他成員進出群組
     if isinstance(event, (MemberJoinedEvent, MemberLeftEvent)):
         try:
-            print(f"[MEMBER_EVT] {type(event).__name__} {event.model_dump_json()}", flush=True)
+            print(
+                f"[MEMBER_EVT] {type(event).__name__} {event.model_dump_json()}",
+                flush=True,
+            )
         except Exception:
             pass
         return
@@ -751,9 +802,7 @@ def _handle_event(event) -> None:
             if existing is not None:
                 logger.info("skip truly-duplicate redelivery msg_id=%s", msg_id)
                 return
-            logger.info(
-                "processing missed redelivery msg_id=%s group=%s", msg_id, gid
-            )
+            logger.info("processing missed redelivery msg_id=%s group=%s", msg_id, gid)
         else:
             logger.info("skip redelivered event (no msg_id)")
             return
@@ -769,7 +818,9 @@ def _handle_event(event) -> None:
     sender_user_id = getattr(event.source, "user_id", None)
 
     # ── quota 爆時：所有訊息都存 pending，等恢復後由 Gemini 分組 + 逐組引用回覆 ──
-    if _quota_exhausted() and isinstance(msg, (TextMessageContent, FileMessageContent, AudioMessageContent)):
+    if _quota_exhausted() and isinstance(
+        msg, (TextMessageContent, FileMessageContent, AudioMessageContent)
+    ):
         _save_pending_any(event, group_id, sender_user_id, msg)
         if isinstance(msg, TextMessageContent):
             memory.log_raw_message(group_id, msg.id, sender_user_id, msg.text or "")
@@ -800,7 +851,6 @@ def _handle_event(event) -> None:
     if isinstance(msg, FileMessageContent):
         _handle_file_message(event, group_id)
         return
-
 
 
 def _handle_audio_message(event: MessageEvent, group_id: str) -> None:
@@ -872,12 +922,12 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
 
     # 4. 其他文字訊息 → burst_filter debounce（等對方說完再回）
     sender_user_id = getattr(event.source, "user_id", None) or ""
-    burst_filter.add_to_burst(group_id, event.message.id, text, sender_user_id, event.reply_token)
+    burst_filter.add_to_burst(
+        group_id, event.message.id, text, sender_user_id, event.reply_token
+    )
 
 
-def _handle_explicit_text(
-    event: MessageEvent, group_id: str, clean_text: str
-) -> None:
+def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -> None:
     """使用者明確叫 bot（@mention / /ai 等），立刻丟 Gemini 回覆。"""
     sender_user_id = getattr(event.source, "user_id", None) or ""
 
@@ -898,9 +948,13 @@ def _handle_explicit_text(
     quoted_block = _build_quoted_block(event.message, group_id)
     # 空 clean_text + 有引用 → 讓 Gemini 針對原文回應
     if not clean_text and quoted_block:
-        user_input = f"{quoted_block}\n\n(使用者只輸入觸發詞呼叫你，請針對上面引用的原文做回應)"
+        user_input = (
+            f"{quoted_block}\n\n(使用者只輸入觸發詞呼叫你，請針對上面引用的原文做回應)"
+        )
     else:
-        user_input = clean_text if not quoted_block else f"{quoted_block}\n\n{clean_text}"
+        user_input = (
+            clean_text if not quoted_block else f"{quoted_block}\n\n{clean_text}"
+        )
 
     # URL 預抓取：先用 Python 抓網頁內容塞進 prompt，繞過 Gemini url_context 的限制
     user_input = _prefetch_urls(user_input)
@@ -934,16 +988,15 @@ def _handle_explicit_text(
     _reply(event.reply_token, reply_text, group_id=group_id)
 
 
-def _handle_burst_flush(
-    group_id: str, combined_text: str, reply_token: str
-) -> None:
+def _handle_burst_flush(group_id: str, combined_text: str, reply_token: str) -> None:
     """burst_filter 判定「值得主動回應」時觸發。跑在 Timer 的 thread 裡。
 
     規則:「會回應的情境」不能靜默 — 要不是真回應，要不就回 quota 訊息。
     """
     logger.info(
         "burst flush triggered group=%s text_len=%d",
-        group_id, len(combined_text),
+        group_id,
+        len(combined_text),
     )
 
     # 短路 1：cache 已知 quota 爆 → 靜默跳過
@@ -980,10 +1033,16 @@ def _handle_burst_flush(
             logger.warning("gemini chat (burst) quota exhausted")
         else:
             logger.exception("gemini chat (burst) failed: %s", e)
-            _reply(reply_token, "Gemini 那邊好像塞車了，等一下再回你～", group_id=group_id)
+            _reply(
+                reply_token, "Gemini 那邊好像塞車了，等一下再回你～", group_id=group_id
+            )
         return
 
-    logger.info("burst gemini reply len=%d text=%s", len(reply_text) if reply_text else 0, repr(reply_text[:200]) if reply_text else "(empty)")
+    logger.info(
+        "burst gemini reply len=%d text=%s",
+        len(reply_text) if reply_text else 0,
+        repr(reply_text[:200]) if reply_text else "(empty)",
+    )
     if not reply_text or not reply_text.strip():
         logger.warning("burst gemini returned empty reply, skipping LINE send")
         return
@@ -1123,7 +1182,9 @@ def _get_member_display_name(group_id: str, user_id: str | None) -> str:
         return "我 (bot)"
     try:
         with ApiClient(_line_config) as api_client:
-            profile = MessagingApi(api_client).get_group_member_profile(group_id, user_id)
+            profile = MessagingApi(api_client).get_group_member_profile(
+                group_id, user_id
+            )
             return getattr(profile, "display_name", None) or "群組成員"
     except Exception as e:
         logger.debug("get_group_member_profile failed: %s", e)
@@ -1143,7 +1204,12 @@ _TEXT_LIKE_MIMES = {
 # Gemini 原生支援直接送 bytes 的 MIME
 _GEMINI_NATIVE_MIMES = {
     "application/pdf",
-    "image/jpeg", "image/png", "image/gif", "image/webp", "image/heic", "image/heif",
+    "image/jpeg",
+    "image/png",
+    "image/gif",
+    "image/webp",
+    "image/heic",
+    "image/heif",
 }
 # 80k 字中文 ≈ 100〜120k tokens，留 buffer 給 system prompt + context
 _TEXT_CHAR_LIMIT = 80_000
@@ -1156,12 +1222,16 @@ def _extract_office_text(data: bytes, file_name: str) -> str | None:
         if ext in ("docx",):
             from docx import Document
             import io
+
             doc = Document(io.BytesIO(data))
             return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
         if ext in ("xlsx", "xls"):
-            import openpyxl
+            import openpyxl  # type: ignore[import-untyped]
             import io
-            wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+
+            wb = openpyxl.load_workbook(
+                io.BytesIO(data), read_only=True, data_only=True
+            )
             lines = []
             for sheet in wb.worksheets:
                 lines.append(f"[工作表：{sheet.title}]")
@@ -1173,6 +1243,7 @@ def _extract_office_text(data: bytes, file_name: str) -> str | None:
         if ext in ("pptx",):
             from pptx import Presentation
             import io
+
             prs = Presentation(io.BytesIO(data))
             lines = []
             for i, slide in enumerate(prs.slides, 1):
@@ -1223,6 +1294,7 @@ def _handle_file_message(event: MessageEvent, group_id: str) -> None:
     # ── PDF / 圖片 → 直接送 bytes Part 給 Gemini ──────────────────────────────
     if is_native:
         from google.genai import types as _gtypes
+
         parts = [
             _gtypes.Part.from_bytes(data=data, mime_type=mime_type),
             f"使用者傳了一個檔案：{file_name}。請分析其內容並回應。",
@@ -1235,7 +1307,11 @@ def _handle_file_message(event: MessageEvent, group_id: str) -> None:
                 _mark_quota_exhausted()
             else:
                 logger.exception("gemini chat (file-native) failed: %s", e)
-            _reply(event.reply_token, _friendly_gemini_error(e, file_name), group_id=group_id)
+            _reply(
+                event.reply_token,
+                _friendly_gemini_error(e, file_name),
+                group_id=group_id,
+            )
             return
         memory.append_turn(group_id, "user", f"[file: {file_name}]")
         memory.append_turn(group_id, "bot", reply_text)
@@ -1247,7 +1323,11 @@ def _handle_file_message(event: MessageEvent, group_id: str) -> None:
     if is_office:
         content = _extract_office_text(data, file_name)
         if content is None:
-            _reply(event.reply_token, f"讀取 {file_name} 失敗，檔案可能損毀或格式不符。", group_id=group_id)
+            _reply(
+                event.reply_token,
+                f"讀取 {file_name} 失敗，檔案可能損毀或格式不符。",
+                group_id=group_id,
+            )
             return
     else:
         # 文字檔
@@ -1257,9 +1337,7 @@ def _handle_file_message(event: MessageEvent, group_id: str) -> None:
     note = ""
     if original_len > _TEXT_CHAR_LIMIT:
         content = content[:_TEXT_CHAR_LIMIT]
-        note = (
-            f"\n\n(原始檔案共 {original_len:,} 字，只看前 {_TEXT_CHAR_LIMIT:,} 字)"
-        )
+        note = f"\n\n(原始檔案共 {original_len:,} 字，只看前 {_TEXT_CHAR_LIMIT:,} 字)"
 
     prompt_text = (
         f"(使用者丟了一個檔案：{file_name}){note}\n\n"
@@ -1275,14 +1353,15 @@ def _handle_file_message(event: MessageEvent, group_id: str) -> None:
             logger.warning("gemini chat (file) quota exhausted")
         else:
             logger.exception("gemini chat (file) failed: %s", e)
-        _reply(event.reply_token, _friendly_gemini_error(e, file_name), group_id=group_id)
+        _reply(
+            event.reply_token, _friendly_gemini_error(e, file_name), group_id=group_id
+        )
         return
 
     memory.append_turn(group_id, "user", f"[file: {file_name}]")
     memory.append_turn(group_id, "bot", reply_text)
     _maybe_extract_facts(group_id)
     _reply(event.reply_token, reply_text, group_id=group_id)
-
 
 
 _PT_TZ = ZoneInfo("America/Los_Angeles")
@@ -1348,10 +1427,13 @@ def _load_quota_state() -> None:
 def _save_quota_state() -> None:
     try:
         with open(_QUOTA_STATE_FILE, "w") as f:
-            _json.dump({
-                "exhausted_until_ts": _quota_exhausted_until_ts,
-                "notified_for_ts": _quota_notified_for_ts,
-            }, f)
+            _json.dump(
+                {
+                    "exhausted_until_ts": _quota_exhausted_until_ts,
+                    "notified_for_ts": _quota_notified_for_ts,
+                },
+                f,
+            )
     except Exception as e:
         logger.warning("save quota state failed: %s", e)
 
@@ -1381,7 +1463,9 @@ def _mark_quota_exhausted() -> None:
                 f"到 {reset_tw} TW 之前咪寶不會回覆訊息\n"
                 "（明天會自動恢復）"
             )
-            group_id = getattr(settings, "allowed_group_id", None) or os.environ.get("ALLOWED_GROUP_ID")
+            group_id = getattr(settings, "allowed_group_id", None) or os.environ.get(
+                "ALLOWED_GROUP_ID"
+            )
             if group_id and not settings.bot_muted:
                 with ApiClient(_line_config) as api_client:
                     MessagingApi(api_client).push_message(
@@ -1393,7 +1477,7 @@ def _mark_quota_exhausted() -> None:
                 logger.info("quota exhausted notice pushed to group=%s", group_id)
         except Exception as e:
             logger.warning("quota exhausted notice push failed: %s", str(e)[:200])
-        _save_quota_state()   # notified_for_ts 更新後才存
+        _save_quota_state()  # notified_for_ts 更新後才存
 
 
 def _quota_exhausted() -> bool:
@@ -1412,11 +1496,11 @@ def _quota_exhausted_message() -> str:
     )
 
 
-
-
 # ── Pending（quota 爆時的所有訊息，恢復後由 Gemini 分組 + 引用回覆） ──────────
 
-_PENDING_EXPLICIT_PATH = os.path.join(os.path.dirname(__file__), "pending_explicit_reply.json")
+_PENDING_EXPLICIT_PATH = os.path.join(
+    os.path.dirname(__file__), "pending_explicit_reply.json"
+)
 _PENDING_MEDIA_DIR = os.path.join(os.path.dirname(__file__), "pending_media")
 
 
@@ -1512,10 +1596,7 @@ def _clear_pending_explicit(group_id: str) -> None:
 
 def _heuristic_group_messages(items: list[dict]) -> list[dict]:
     """Fallback：每則各自一組。"""
-    return [
-        {"idxs": [i], "reply_to": i}
-        for i in range(len(items))
-    ]
+    return [{"idxs": [i], "reply_to": i} for i in range(len(items))]
 
 
 def _gemini_group_messages(items: list[dict]) -> list[dict]:
@@ -1525,10 +1606,12 @@ def _gemini_group_messages(items: list[dict]) -> list[dict]:
         return []
     try:
         from google.genai import types
+
         client = gemini_client._client
         lines = []
         for i, it in enumerate(items):
             from datetime import datetime as _dt
+
             ts = it.get("timestamp", 0)
             ts_str = _dt.fromtimestamp(ts).strftime("%H:%M") if ts else "??"
             who = (it.get("user_id") or "?")[:8]
@@ -1556,7 +1639,11 @@ def _gemini_group_messages(items: list[dict]) -> list[dict]:
             '{"groups":[{"idxs":[int,...], "reply_to": int}, ...]}'
         )
         # 優先用 flash（分組更準確），quota 爆時降回 flash-lite
-        group_model = settings.gemini_model if not _quota_exhausted() else settings.gemini_light_model
+        group_model = (
+            settings.gemini_model
+            if not _quota_exhausted()
+            else settings.gemini_light_model
+        )
         resp = client.models.generate_content(
             model=group_model,
             contents=prompt,
@@ -1566,7 +1653,7 @@ def _gemini_group_messages(items: list[dict]) -> list[dict]:
                 thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
         )
-        data = _json.loads(resp.text)
+        data = _json.loads(resp.text or "")
         groups_raw = data.get("groups", [])
         seen: set[int] = set()
         clean: list[dict] = []
@@ -1574,7 +1661,11 @@ def _gemini_group_messages(items: list[dict]) -> list[dict]:
             idxs = g.get("idxs") if isinstance(g, dict) else None
             if not isinstance(idxs, list):
                 continue
-            ok = [i for i in idxs if isinstance(i, int) and 0 <= i < len(items) and i not in seen]
+            ok = [
+                i
+                for i in idxs
+                if isinstance(i, int) and 0 <= i < len(items) and i not in seen
+            ]
             if not ok:
                 continue
             seen.update(ok)
@@ -1599,7 +1690,8 @@ def _gemini_group_messages(items: list[dict]) -> list[dict]:
 def _build_group_parts(items: list[dict], group_id: str) -> list:
     """把一組 pending 訊息合成 Gemini parts（文字 + 檔案/音訊 bytes）。"""
     from google.genai import types
-    parts = []
+
+    parts: list[object] = []
     texts = []
     for it in items:
         t = it.get("type", "text")
@@ -1618,7 +1710,11 @@ def _build_group_parts(items: list[dict], group_id: str) -> list:
                     with open(path, "rb") as f:
                         data = f.read()
                     mime, _ = mimetypes.guess_type(fname)
-                    parts.append(types.Part.from_bytes(data=data, mime_type=mime or "application/octet-stream"))
+                    parts.append(
+                        types.Part.from_bytes(
+                            data=data, mime_type=mime or "application/octet-stream"
+                        )
+                    )
                     texts.append(f"(使用者傳了檔案：{fname}，請分析其內容)")
                 except Exception as e:
                     logger.warning("read pending file failed: %s", e)
@@ -1653,7 +1749,7 @@ def _process_pending_on_startup() -> None:
     """uvicorn 啟動時處理所有 pending：分組 → 逐組 LLM 回覆 → 引用推送。
     Gemini 耗盡時自動用 Grok fallback；兩者都耗盡才放棄。
     """
-    _load_quota_state()   # 先還原 quota 狀態，再決定要不要跑
+    _load_quota_state()  # 先還原 quota 狀態，再決定要不要跑
     if settings.bot_muted:
         return
     pending = _load_pending_explicit()
@@ -1662,10 +1758,14 @@ def _process_pending_on_startup() -> None:
     gemini_gone = _quota_exhausted()
     grok_gone = grok_client.quota_exhausted()
     if gemini_gone and grok_gone:
-        logger.info("startup: both Gemini and Grok exhausted, keep pending for next time")
+        logger.info(
+            "startup: both Gemini and Grok exhausted, keep pending for next time"
+        )
         return
     if gemini_gone:
-        logger.info("startup: Gemini exhausted, will use Grok fallback for pending messages")
+        logger.info(
+            "startup: Gemini exhausted, will use Grok fallback for pending messages"
+        )
         # 每個 group 只推一次 intro（重複觸發時不再發）
         for group_id in pending:
             if group_id not in _grok_intro_sent_groups:
@@ -1674,7 +1774,11 @@ def _process_pending_on_startup() -> None:
                         MessagingApi(api_client).push_message(
                             PushMessageRequest(
                                 to=group_id,
-                                messages=[TextMessage(text="Gemini 今日用量已用完，接下來由 Grok agent 代為回覆之前積累的訊息，回覆品質可能略有不同～")],
+                                messages=[
+                                    TextMessage(
+                                        text="Gemini 今日用量已用完，接下來由 Grok agent 代為回覆之前積累的訊息，回覆品質可能略有不同～"
+                                    )
+                                ],
                             )
                         )
                     _grok_intro_sent_groups.add(group_id)
@@ -1696,7 +1800,9 @@ def _process_pending_on_startup() -> None:
 
         # Step 1：分組
         groups = _gemini_group_messages(items)
-        logger.info("startup: group=%s items=%d groups=%d", group_id, len(items), len(groups))
+        logger.info(
+            "startup: group=%s items=%d groups=%d", group_id, len(items), len(groups)
+        )
 
         # Step 2：逐組跑完整 gemini_client.chat()
         processed_idx = set()
@@ -1717,7 +1823,7 @@ def _process_pending_on_startup() -> None:
 
                 text = _md_to_line(reply_text)
                 footer = _get_quota_footer()
-                text = text[:4900 - len(footer)] + footer
+                text = text[: 4900 - len(footer)] + footer
 
                 msg_kwargs = {"text": text}
                 qt = items[reply_to_idx].get("quote_token")
@@ -1732,7 +1838,16 @@ def _process_pending_on_startup() -> None:
                         )
                     )
                 bot_stats.track_line_push()
-                memory.append_turn(group_id, "user", "\n".join(it.get("text","") for it in group_items if it.get("type")=="text")[:500] or "[非文字訊息]")
+                memory.append_turn(
+                    group_id,
+                    "user",
+                    "\n".join(
+                        it.get("text", "")
+                        for it in group_items
+                        if it.get("type") == "text"
+                    )[:500]
+                    or "[非文字訊息]",
+                )
                 memory.append_turn(group_id, "bot", reply_text)
                 processed_idx.update(idxs)
         except Exception as e:
@@ -1742,7 +1857,11 @@ def _process_pending_on_startup() -> None:
                 data = _load_pending_explicit()
                 data[group_id] = remaining
                 _save_pending_explicit_raw(data)
-                logger.warning("startup pending: quota re-exhausted, saved %d remaining for group=%s", len(remaining), group_id)
+                logger.warning(
+                    "startup pending: quota re-exhausted, saved %d remaining for group=%s",
+                    len(remaining),
+                    group_id,
+                )
                 return
             # LINE API 429（月額度滿）或其他錯誤：保留未送出的 items，等下次重試
             err_str = str(e)
@@ -1750,13 +1869,22 @@ def _process_pending_on_startup() -> None:
                 data = _load_pending_explicit()
                 data[group_id] = remaining
                 _save_pending_explicit_raw(data)
-                logger.warning("startup pending: push failed (%s), saved %d remaining for group=%s", err_str[:80], len(remaining), group_id)
+                logger.warning(
+                    "startup pending: push failed (%s), saved %d remaining for group=%s",
+                    err_str[:80],
+                    len(remaining),
+                    group_id,
+                )
             else:
-                logger.exception("startup pending reply failed for group=%s: %s", group_id, e)
+                logger.exception(
+                    "startup pending reply failed for group=%s: %s", group_id, e
+                )
             continue
 
         _clear_pending_explicit(group_id)
-        _grok_intro_sent_groups.discard(group_id)  # 下次 Gemini 再度 exhaust 時可重新發 intro
+        _grok_intro_sent_groups.discard(
+            group_id
+        )  # 下次 Gemini 再度 exhaust 時可重新發 intro
         logger.info("startup: group=%s all pending cleared", group_id)
 
 
@@ -1796,8 +1924,17 @@ def _get_persona_notes(group_id: str) -> list[dict]:
 
 # 糾正偵測：使用者 @mention bot 時如果內容像糾正，自動存下來
 _CORRECTION_KEYWORDS = (
-    "不要", "不准", "別再", "下次", "記住", "以後",
-    "不可以", "禁止", "不能", "改掉", "不用",
+    "不要",
+    "不准",
+    "別再",
+    "下次",
+    "記住",
+    "以後",
+    "不可以",
+    "禁止",
+    "不能",
+    "改掉",
+    "不用",
 )
 
 
@@ -1832,9 +1969,15 @@ def _friendly_gemini_error(e: Exception, file_name: str | None = None) -> str:
         return "Gemini API key 有問題,請檢查設定。"
     if "400" in err_str:
         return f"Gemini 說這個輸入有問題:{err_str[:200]}"
-    if ("500" in err_str or "503" in err_str or "UNAVAILABLE" in err_str
-            or "Server disconnected" in err_str or "RemoteProtocolError" in type(e).__name__
-            or "Connection reset" in err_str or "ReadTimeout" in err_str):
+    if (
+        "500" in err_str
+        or "503" in err_str
+        or "UNAVAILABLE" in err_str
+        or "Server disconnected" in err_str
+        or "RemoteProtocolError" in type(e).__name__
+        or "Connection reset" in err_str
+        or "ReadTimeout" in err_str
+    ):
         return "Gemini 那邊暫時斷線,等一下再試。"
     return f"分析失敗:{type(e).__name__}"
 
@@ -1848,10 +1991,15 @@ def _maybe_extract_facts(group_id: str, user_id: str = "") -> None:
     for f in new_facts:
         if memory.add_fact(group_id, f, user_id=user_id):
             added += 1
-    logger.info("auto-extracted facts: %d new (total=%d)", added, len(memory.list_facts(group_id)))
+    logger.info(
+        "auto-extracted facts: %d new (total=%d)",
+        added,
+        len(memory.list_facts(group_id)),
+    )
 
 
 # ── Join / Leave 處理 ────────────────────────────────────────────────────────
+
 
 def _handle_join(event: JoinEvent) -> None:
     """Bot 被加入群組時觸發。立即 reply + 查群組資訊。
@@ -1861,7 +2009,10 @@ def _handle_join(event: JoinEvent) -> None:
     room_id = getattr(src, "room_id", None)
     target_id = group_id or room_id
     source_type = "group" if group_id else ("room" if room_id else "unknown")
-    print(f"[JOIN] source_type={source_type} id={target_id} reply_token={event.reply_token}", flush=True)
+    print(
+        f"[JOIN] source_type={source_type} id={target_id} reply_token={event.reply_token}",
+        flush=True,
+    )
 
     # 1. 立即 reply 一則 welcome 訊息（搶在被踢之前）
     try:
@@ -1879,17 +2030,26 @@ def _handle_join(event: JoinEvent) -> None:
                     summary = api.get_group_summary(group_id)
                     print(f"[JOIN] group_summary={summary}", flush=True)
                 except Exception as e:
-                    print(f"[JOIN] group_summary FAILED: {type(e).__name__}: {str(e)[:200]}", flush=True)
+                    print(
+                        f"[JOIN] group_summary FAILED: {type(e).__name__}: {str(e)[:200]}",
+                        flush=True,
+                    )
                 try:
                     count = api.get_group_member_count(group_id)
                     print(f"[JOIN] group_member_count={count}", flush=True)
                 except Exception as e:
-                    print(f"[JOIN] group_member_count FAILED: {type(e).__name__}: {str(e)[:200]}", flush=True)
+                    print(
+                        f"[JOIN] group_member_count FAILED: {type(e).__name__}: {str(e)[:200]}",
+                        flush=True,
+                    )
                 try:
                     ids = api.get_group_members_ids(group_id)
                     print(f"[JOIN] group_members_ids={ids}", flush=True)
                 except Exception as e:
-                    print(f"[JOIN] group_members_ids FAILED: {type(e).__name__}: {str(e)[:200]}", flush=True)
+                    print(
+                        f"[JOIN] group_members_ids FAILED: {type(e).__name__}: {str(e)[:200]}",
+                        flush=True,
+                    )
         except Exception as e:
             print(f"[JOIN] api_client FAILED: {e}", flush=True)
 
@@ -1905,7 +2065,16 @@ def _handle_leave(event: LeaveEvent) -> None:
 
 # ── Command 處理 ──────────────────────────────────────────────────────────────
 
-_DINNER_KEYWORDS = ["晚餐吃什麼", "晚餐吃哪", "吃什麼晚餐", "晚餐去哪", "晚餐要吃什麼", "今晚吃什麼", "今天吃什麼"]
+_DINNER_KEYWORDS = [
+    "晚餐吃什麼",
+    "晚餐吃哪",
+    "吃什麼晚餐",
+    "晚餐去哪",
+    "晚餐要吃什麼",
+    "今晚吃什麼",
+    "今天吃什麼",
+]
+
 
 def _is_dinner_question(text: str) -> bool:
     return any(kw in text for kw in _DINNER_KEYWORDS)
@@ -1962,7 +2131,7 @@ def _handle_command(group_id: str, text: str) -> str | None:
         return "目前的記憶：\n" + "\n".join(f"• {f}" for f in facts)
 
     if t.startswith("/記住 "):
-        fact = t[len("/記住 "):].strip()
+        fact = t[len("/記住 ") :].strip()
         if not fact:
             return "用法：/記住 <要記住的內容>"
         if memory.add_fact(group_id, fact):
@@ -1970,11 +2139,15 @@ def _handle_command(group_id: str, text: str) -> str | None:
         return f"這條已經在記憶裡了：{fact}"
 
     if t.startswith("/忘記 "):
-        keyword = t[len("/忘記 "):].strip()
+        keyword = t[len("/忘記 ") :].strip()
         if not keyword:
             return "用法：/忘記 <關鍵字>"
         n = memory.remove_fact(group_id, keyword)
-        return f"刪除了 {n} 條含「{keyword}」的記憶。" if n else f"沒有找到含「{keyword}」的記憶。"
+        return (
+            f"刪除了 {n} 條含「{keyword}」的記憶。"
+            if n
+            else f"沒有找到含「{keyword}」的記憶。"
+        )
 
     if t == "/清除記憶":
         n = memory.clear_facts(group_id)
@@ -1982,14 +2155,14 @@ def _handle_command(group_id: str, text: str) -> str | None:
 
     # ── Layer 1：使用者手動管理過濾規則 ──────────────────────────────
     if t.startswith("/不要回 "):
-        pattern = t[len("/不要回 "):].strip()
+        pattern = t[len("/不要回 ") :].strip()
         if not pattern:
             return "用法：/不要回 <這類訊息的特徵，例如「早安」「中午吃什麼」>"
         rid = memory.add_filter_rule(group_id, "skip", pattern, source="user")
         return f"好，以後訊息裡有「{pattern}」就不主動回。(規則 #{rid})"
 
     if t.startswith("/以後要查 "):
-        pattern = t[len("/以後要查 "):].strip()
+        pattern = t[len("/以後要查 ") :].strip()
         if not pattern:
             return "用法：/以後要查 <這類訊息的特徵，例如「某醫師說」「疫苗」>"
         rid = memory.add_filter_rule(group_id, "must_answer", pattern, source="user")
@@ -1998,10 +2171,7 @@ def _handle_command(group_id: str, text: str) -> str | None:
     if t == "/規則":
         rules = memory.list_filter_rules(group_id)
         if not rules:
-            return (
-                "目前沒有過濾規則。\n"
-                "新增：/不要回 <特徵>  或  /以後要查 <特徵>"
-            )
+            return "目前沒有過濾規則。\n新增：/不要回 <特徵>  或  /以後要查 <特徵>"
         lines = ["目前的過濾規則："]
         for r in rules:
             tag = "不要回" if r["kind"] == "skip" else "要查"
@@ -2010,7 +2180,7 @@ def _handle_command(group_id: str, text: str) -> str | None:
         return "\n".join(lines)
 
     if t.startswith("/刪除規則 "):
-        raw = t[len("/刪除規則 "):].strip()
+        raw = t[len("/刪除規則 ") :].strip()
         try:
             rid = int(raw)
         except ValueError:
@@ -2029,7 +2199,7 @@ def _handle_command(group_id: str, text: str) -> str | None:
         return report
 
     if t.startswith("/檢討 "):
-        raw = t[len("/檢討 "):].strip()
+        raw = t[len("/檢討 ") :].strip()
         try:
             days = int(raw)
         except ValueError:
@@ -2054,18 +2224,15 @@ def _handle_command(group_id: str, text: str) -> str | None:
         return "\n".join(lines)
 
     if t.startswith("/採用 "):
-        spec = t[len("/採用 "):].strip()
+        spec = t[len("/採用 ") :].strip()
         _, msg = review.adopt_drafts(group_id, spec)
         return msg
 
     # ── Layer 2：糾正剛剛的 bot 回覆 → 自動抽象成規則 ────────────────
     if t.startswith("/閉嘴"):
-        reason = t[len("/閉嘴"):].lstrip()
+        reason = t[len("/閉嘴") :].lstrip()
         if not reason:
-            return (
-                "用法：/閉嘴 <為什麼不應該回>\n"
-                "例：/閉嘴 這種只是早安問候，不用回"
-            )
+            return "用法：/閉嘴 <為什麼不應該回>\n例：/閉嘴 這種只是早安問候，不用回"
         return _handle_layer2_correction(group_id, reason)
 
     return None
@@ -2131,15 +2298,12 @@ def _guess_last_trigger_text(group_id: str) -> str:
             break
     if last_bot_idx is None:
         return ""
-    before = [
-        recent[i][2]
-        for i in range(last_bot_idx)
-        if recent[i][1] != "__bot__"
-    ]
+    before = [recent[i][2] for i in range(last_bot_idx) if recent[i][1] != "__bot__"]
     return "\n".join(before[-5:])
 
 
 # ── LINE SDK helpers ──────────────────────────────────────────────────────────
+
 
 def _is_mentioned(message: TextMessageContent) -> bool:
     """檢查這則訊息是否 @mention 了本 bot。
@@ -2161,9 +2325,18 @@ _ASK_PREFIXES = ("/ai ", "/ai", "/問 ", "/問", "/ask ", "/ask", "/AI ", "/AI")
 # 列出 bot 名稱 + 通用 @AI 當 fallback。
 # 桌機 LINE 會打出全形 ＠（U+FF20），所以半形全形都要接。
 _TEXT_MENTION_PREFIXES = (
-    "@咪寶 ", "@咪寶", "＠咪寶 ", "＠咪寶",
-    "@ai ", "@ai", "＠ai ", "＠ai",
-    "@AI ", "@AI", "＠AI ", "＠AI",
+    "@咪寶 ",
+    "@咪寶",
+    "＠咪寶 ",
+    "＠咪寶",
+    "@ai ",
+    "@ai",
+    "＠ai ",
+    "＠ai",
+    "@AI ",
+    "@AI",
+    "＠AI ",
+    "＠AI",
 )
 
 # 直接叫名字也算觸發（長輩不用 @，直接說「咪寶...」）
@@ -2184,7 +2357,7 @@ def _extract_gemini_trigger(text: str, message: TextMessageContent) -> str | Non
         if t == prefix.strip():
             return ""
         if t.startswith(prefix):
-            return t[len(prefix):].strip()
+            return t[len(prefix) :].strip()
     if _is_mentioned(message):
         return _strip_mentions(message).strip()
     # fallback：桌機 LINE @mention 不帶結構，只有純文字 @AI
@@ -2192,7 +2365,7 @@ def _extract_gemini_trigger(text: str, message: TextMessageContent) -> str | Non
         if t == prefix.strip():
             return ""
         if t.lower().startswith(prefix.lower()):
-            return t[len(prefix):].strip()
+            return t[len(prefix) :].strip()
     # 名字偵測：訊息裡出現 bot 名字就觸發，把名字挖掉後剩下的當問題
     for name in _BOT_NAME_KEYWORDS:
         if name in t:
@@ -2268,7 +2441,11 @@ def _pop_pending_for_piggyback(group_id: str) -> str | None:
     if not items:
         return None
 
-    batch = [it for it in items[:5] if it.get("type") == "text" and (it.get("text") or "").strip()]
+    batch = [
+        it
+        for it in items[:5]
+        if it.get("type") == "text" and (it.get("text") or "").strip()
+    ]
     if not batch:
         # 非文字批次直接跳過（不處理）
         return None
@@ -2287,7 +2464,9 @@ def _pop_pending_for_piggyback(group_id: str) -> str | None:
 
     # 移出 pending（只移成功處理的 5 則）
     processed_ids = {it.get("message_id") for it in batch}
-    pending[group_id] = [it for it in items if it.get("message_id") not in processed_ids]
+    pending[group_id] = [
+        it for it in items if it.get("message_id") not in processed_ids
+    ]
     if not pending[group_id]:
         del pending[group_id]
     _save_pending_explicit_raw(pending)
@@ -2314,13 +2493,17 @@ def _reply(reply_token: str, text: str, group_id: str | None = None) -> None:
     text = _md_to_line(text)
     # LINE 單則訊息上限 5000 字；在截斷前先預留 footer 空間
     footer = _get_quota_footer()
-    text = text[:4900 - len(footer)] + footer
+    text = text[: 4900 - len(footer)] + footer
 
     # ── Mute 守門 ─────────────────────────────────────────────────────────────
     # 修 bug 期間預設靜音。webhook 照收、classifier/chat 照跑、log 照寫，只是不送 LINE。
     if settings.bot_muted:
-        logger.info("[MUTED] would_reply group=%s len=%d preview=%r",
-                    group_id, len(text), text[:120])
+        logger.info(
+            "[MUTED] would_reply group=%s len=%d preview=%r",
+            group_id,
+            len(text),
+            text[:120],
+        )
         return
 
     # push 額度耗盡時，偷塞 pending 進同一則 reply_message（免費）
@@ -2354,12 +2537,10 @@ def _reply(reply_token: str, text: str, group_id: str | None = None) -> None:
                 logger.info("fallback push_message sent to group=%s", group_id)
                 bot_stats.track_line_push()
                 memory.log_raw_message(
-                    group_id, f"push_{int(time.time()*1000)}", "__bot__", text
+                    group_id, f"push_{int(time.time() * 1000)}", "__bot__", text
                 )
             except Exception as push_err:
-                logger.warning(
-                    "fallback push also failed: %s", str(push_err)[:300]
-                )
+                logger.warning("fallback push also failed: %s", str(push_err)[:300])
         return
 
     # 把 bot 自己的回覆也記進 raw_messages,供之後 quote-lookup

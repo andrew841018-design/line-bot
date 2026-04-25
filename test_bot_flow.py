@@ -13,11 +13,13 @@ test_bot_flow.py — LINE bot 核心流程離線測試
 用法：
   python test_bot_flow.py        # 全部（離線，不呼叫 LLM API）
 """
+
 import sys, os, json, tempfile, types, unittest.mock as mock
 
 sys.path.insert(0, os.path.dirname(__file__))
 
 PASS = FAIL = 0
+
 
 def check(name: str, condition: bool, detail: str = ""):
     global PASS, FAIL
@@ -33,20 +35,21 @@ def check(name: str, condition: bool, detail: str = ""):
 # Test 1: bot_stats — classify_message + increment
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def test_bot_stats():
     print("\n── Test 1: bot_stats 訊息分類 + 計數器 ──")
     import bot_stats
 
     cases = [
-        ("https://youtube.com/shorts/abc",     "url"),
-        ("真的假的？這是謠言嗎",                "fact_check"),
-        ("台積電今天漲停",                       "finance"),
-        ("我頭痛要看醫生",                       "health"),
-        ("民進黨選舉最新消息",                   "political"),
-        ("記者報導指出",                          "news"),
-        ("你覺得這樣對嗎？",                     "question"),
-        ("哈哈",                                  "casual"),
-        ("[圖片]",                               "media"),
+        ("https://youtube.com/shorts/abc", "url"),
+        ("真的假的？這是謠言嗎", "fact_check"),
+        ("台積電今天漲停", "finance"),
+        ("我頭痛要看醫生", "health"),
+        ("民進黨選舉最新消息", "political"),
+        ("記者報導指出", "news"),
+        ("你覺得這樣對嗎？", "question"),
+        ("哈哈", "casual"),
+        ("[圖片]", "media"),
     ]
     for text, expected in cases:
         got = bot_stats.classify_message(text)
@@ -62,8 +65,11 @@ def test_bot_stats():
         bot_stats.increment("msg_received", 2, date="2099-01-01")
         rows = bot_stats.query_range(30)
         day = next((r for r in rows if r["date"] == "2099-01-01"), None)
-        check("increment 累加正確", day is not None and day.get("msg_received") == 5,
-              f"got={day}")
+        check(
+            "increment 累加正確",
+            day is not None and day.get("msg_received") == 5,
+            f"got={day}",
+        )
     finally:
         bot_stats._DB_PATH = orig
         os.unlink(tmp_db)
@@ -72,6 +78,7 @@ def test_bot_stats():
 # ══════════════════════════════════════════════════════════════════════════════
 # Test 2: pending JSON — 存入 / 讀取 / __bot__ 過濾
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 def test_pending_flow():
     print("\n── Test 2: Pending JSON 基本流程 ──")
@@ -87,12 +94,38 @@ def test_pending_flow():
         gid = "G_TEST"
 
         # 寫入 3 則 user + 1 則 bot
-        data = {gid: [
-            {"user_id": "U1", "message_id": "m1", "type": "text", "text": "hello", "timestamp": 1.0},
-            {"user_id": "U2", "message_id": "m2", "type": "text", "text": "world", "timestamp": 2.0},
-            {"user_id": "__bot__", "message_id": "m3", "type": "text", "text": "hi", "timestamp": 3.0},
-            {"user_id": "U3", "message_id": "m4", "type": "text", "text": "bye",  "timestamp": 4.0},
-        ]}
+        data = {
+            gid: [
+                {
+                    "user_id": "U1",
+                    "message_id": "m1",
+                    "type": "text",
+                    "text": "hello",
+                    "timestamp": 1.0,
+                },
+                {
+                    "user_id": "U2",
+                    "message_id": "m2",
+                    "type": "text",
+                    "text": "world",
+                    "timestamp": 2.0,
+                },
+                {
+                    "user_id": "__bot__",
+                    "message_id": "m3",
+                    "type": "text",
+                    "text": "hi",
+                    "timestamp": 3.0,
+                },
+                {
+                    "user_id": "U3",
+                    "message_id": "m4",
+                    "type": "text",
+                    "text": "bye",
+                    "timestamp": 4.0,
+                },
+            ]
+        }
         main._save_pending_explicit_raw(data)
 
         loaded = main._load_pending_explicit()
@@ -102,7 +135,10 @@ def test_pending_flow():
         # 過濾 __bot__（模擬啟動時的 filter）
         filtered = [it for it in items if it.get("user_id") != "__bot__"]
         check("__bot__ 過濾後剩 3 則", len(filtered) == 3)
-        check("__bot__ 條目不在 filtered", all(it["user_id"] != "__bot__" for it in filtered))
+        check(
+            "__bot__ 條目不在 filtered",
+            all(it["user_id"] != "__bot__" for it in filtered),
+        )
     finally:
         main._PENDING_EXPLICIT_PATH = orig
         os.unlink(tmp_path)
@@ -112,18 +148,40 @@ def test_pending_flow():
 # Test 3: Piggyback — 格式 + pending 正確移除
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def test_piggyback():
     print("\n── Test 3: Piggyback 格式與 pending 移除 ──")
     import main
 
     gid = "G_PIG"
-    pending_data = {gid: [
-        {"user_id": "U1", "message_id": "p1", "type": "text", "text": "第一則測試訊息", "timestamp": 1.0},
-        {"user_id": "U2", "message_id": "p2", "type": "text", "text": "第二則測試訊息", "timestamp": 2.0},
-        {"user_id": "U3", "message_id": "p3", "type": "text", "text": "第三則測試訊息", "timestamp": 3.0},
-    ]}
+    pending_data = {
+        gid: [
+            {
+                "user_id": "U1",
+                "message_id": "p1",
+                "type": "text",
+                "text": "第一則測試訊息",
+                "timestamp": 1.0,
+            },
+            {
+                "user_id": "U2",
+                "message_id": "p2",
+                "type": "text",
+                "text": "第二則測試訊息",
+                "timestamp": 2.0,
+            },
+            {
+                "user_id": "U3",
+                "message_id": "p3",
+                "type": "text",
+                "text": "第三則測試訊息",
+                "timestamp": 3.0,
+            },
+        ]
+    }
 
     saved = {}
+
     def fake_save(data):
         saved.update(data)
 
@@ -134,9 +192,11 @@ def test_piggyback():
     orig_path = main._PENDING_EXPLICIT_PATH
     main._PENDING_EXPLICIT_PATH = tmp_path
     try:
-        with mock.patch("main._llm_chat", return_value="這是測試回覆內容"), \
-             mock.patch("main._get_persona_notes", return_value=[]), \
-             mock.patch("main.memory") as mock_mem:
+        with (
+            mock.patch("main._llm_chat", return_value="這是測試回覆內容"),
+            mock.patch("main._get_persona_notes", return_value=[]),
+            mock.patch("main.memory") as mock_mem,
+        ):
             mock_mem.top_facts.return_value = []
             mock_mem.get_context.return_value = []
             result = main._pop_pending_for_piggyback(gid)
@@ -162,9 +222,11 @@ def test_piggyback():
         tmp_path2 = f.name
     main._PENDING_EXPLICIT_PATH = tmp_path2
     try:
-        with mock.patch("main._llm_chat", return_value=""), \
-             mock.patch("main._get_persona_notes", return_value=[]), \
-             mock.patch("main.memory") as mock_mem:
+        with (
+            mock.patch("main._llm_chat", return_value=""),
+            mock.patch("main._get_persona_notes", return_value=[]),
+            mock.patch("main.memory") as mock_mem,
+        ):
             mock_mem.top_facts.return_value = []
             mock_mem.get_context.return_value = []
             result2 = main._pop_pending_for_piggyback(gid)
@@ -181,14 +243,17 @@ def test_piggyback():
 # Test 4: _llm_chat waterfall — Gemini → Grok
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def test_llm_chat_waterfall():
     print("\n── Test 4: _llm_chat Gemini→Grok waterfall ──")
     import main
 
     # Gemini 有量 → 用 Gemini
-    with mock.patch("main._quota_exhausted", return_value=False), \
-         mock.patch("main.gemini_client") as mg, \
-         mock.patch("main.grok_client") as mk:
+    with (
+        mock.patch("main._quota_exhausted", return_value=False),
+        mock.patch("main.gemini_client") as mg,
+        mock.patch("main.grok_client") as mk,
+    ):
         mg.chat.return_value = "gemini reply"
         mk.chat.return_value = "grok reply"
         mk.quota_exhausted.return_value = False
@@ -197,14 +262,17 @@ def test_llm_chat_waterfall():
     check("Gemini 有量 → Grok 未被呼叫", mk.chat.call_count == 0)
 
     # Gemini 沒量 → fallback Grok
-    with mock.patch("main._quota_exhausted", return_value=True), \
-         mock.patch("main.gemini_client") as mg2, \
-         mock.patch("main.grok_client") as mk2, \
-         mock.patch("main.bot_stats"):
+    with (
+        mock.patch("main._quota_exhausted", return_value=True),
+        mock.patch("main.gemini_client") as mg2,
+        mock.patch("main.grok_client") as mk2,
+        mock.patch("main.bot_stats"),
+    ):
         mg2.chat.return_value = ""
         mk2.chat.return_value = "grok reply"
         mk2.quota_exhausted.return_value = False
         from config import settings
+
         orig_key = settings.grok_api_key
         settings.grok_api_key = "fake-key"
         try:
@@ -214,12 +282,15 @@ def test_llm_chat_waterfall():
     check("Gemini 沒量 → fallback Grok", result2 == "grok reply")
 
     # 兩個都沒量 → 回空字串
-    with mock.patch("main._quota_exhausted", return_value=True), \
-         mock.patch("main.grok_client") as mk3, \
-         mock.patch("main.bot_stats"):
+    with (
+        mock.patch("main._quota_exhausted", return_value=True),
+        mock.patch("main.grok_client") as mk3,
+        mock.patch("main.bot_stats"),
+    ):
         mk3.quota_exhausted.return_value = True
         mk3.chat.return_value = ""
         from config import settings
+
         orig_key = settings.grok_api_key
         settings.grok_api_key = "fake-key"
         try:
@@ -233,26 +304,49 @@ def test_llm_chat_waterfall():
 # Test 5: Grok group_messages fallback 格式
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def test_grok_group_format():
     print("\n── Test 5: Grok group_messages fallback 格式 ──")
     import grok_client
 
     items = [
-        {"user_id": "U1", "message_id": "g1", "type": "text", "text": "投資問題", "timestamp": 1.0},
-        {"user_id": "U2", "message_id": "g2", "type": "text", "text": "台積電漲了", "timestamp": 2.0},
-        {"user_id": "U1", "message_id": "g3", "type": "text", "text": "今天天氣", "timestamp": 100.0},
+        {
+            "user_id": "U1",
+            "message_id": "g1",
+            "type": "text",
+            "text": "投資問題",
+            "timestamp": 1.0,
+        },
+        {
+            "user_id": "U2",
+            "message_id": "g2",
+            "type": "text",
+            "text": "台積電漲了",
+            "timestamp": 2.0,
+        },
+        {
+            "user_id": "U1",
+            "message_id": "g3",
+            "type": "text",
+            "text": "今天天氣",
+            "timestamp": 100.0,
+        },
     ]
 
     fake_resp = mock.MagicMock()
-    fake_resp.choices[0].message.content = json.dumps({
-        "groups": [
-            {"idxs": [0, 1], "reply_to": 1},
-            {"idxs": [2],    "reply_to": 2},
-        ]
-    })
+    fake_resp.choices[0].message.content = json.dumps(
+        {
+            "groups": [
+                {"idxs": [0, 1], "reply_to": 1},
+                {"idxs": [2], "reply_to": 2},
+            ]
+        }
+    )
 
-    with mock.patch.object(grok_client, "_get_client") as mc, \
-         mock.patch.object(grok_client, "settings") as ms:
+    with (
+        mock.patch.object(grok_client, "_get_client") as mc,
+        mock.patch.object(grok_client, "settings") as ms,
+    ):
         ms.grok_api_key = "fake"
         ms.grok_model = "grok-3-mini"
         mc.return_value.chat.completions.create.return_value = fake_resp
@@ -261,15 +355,21 @@ def test_grok_group_format():
 
     check("回傳非 None", result is not None)
     check("分成 2 組", result is not None and len(result) == 2)
-    check("每個索引恰好出現一次", result is not None and
-          sorted(sum([g["idxs"] for g in result], [])) == [0, 1, 2])
-    check("reply_to 在各組 idxs 內",
-          result is not None and all(g["reply_to"] in g["idxs"] for g in result))
+    check(
+        "每個索引恰好出現一次",
+        result is not None
+        and sorted(sum([g["idxs"] for g in result], [])) == [0, 1, 2],
+    )
+    check(
+        "reply_to 在各組 idxs 內",
+        result is not None and all(g["reply_to"] in g["idxs"] for g in result),
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Test 6: quota state load/save 往返
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 def test_quota_state():
     print("\n── Test 6: Quota state load/save 往返 ──")
@@ -290,7 +390,10 @@ def test_quota_state():
         main._quota_notified_for_ts = 0.0
         main._load_quota_state()
 
-        check("exhausted_until_ts 往返正確", main._quota_exhausted_until_ts == 9999999999.0)
+        check(
+            "exhausted_until_ts 往返正確",
+            main._quota_exhausted_until_ts == 9999999999.0,
+        )
         check("notified_for_ts 往返正確", main._quota_notified_for_ts == 1234567890.0)
     finally:
         main._QUOTA_STATE_FILE = orig
@@ -303,6 +406,7 @@ def test_quota_state():
 
 if __name__ == "__main__":
     import logging
+
     logging.basicConfig(level=logging.WARNING)
 
     test_bot_stats()
@@ -312,7 +416,7 @@ if __name__ == "__main__":
     test_grok_group_format()
     test_quota_state()
 
-    print(f"\n{'='*50}")
+    print(f"\n{'=' * 50}")
     print(f"TOTAL: {PASS} passed, {FAIL} failed")
     print("=" * 50)
     if FAIL == 0:
