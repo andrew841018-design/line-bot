@@ -112,7 +112,9 @@ def _get_quota_footer() -> str:
     token_pct = round(info["used_tokens"] / info["limit_tokens"] * 100, 1) if info["limit_tokens"] else 0
     req_pct = round(info["used_requests"] / info["limit_requests"] * 100, 1) if info["limit_requests"] else 0
     pct = min(99.0, max(token_pct, req_pct))
-    return f"\n\n📊 Gemini 今日用量 {pct}%"
+    thinking = info.get("used_thinking_tokens", 0)
+    thinking_part = f"（思考 {thinking // 1000}k）" if thinking >= 1000 else ""
+    return f"\n\n📊 Gemini 今日用量 {pct}%{thinking_part}"
 
 
 # ── URL 預抓取（繞過 Gemini url_context 的限制）─────────────────────────────

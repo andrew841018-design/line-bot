@@ -69,8 +69,10 @@ def _track_usage(response) -> None:
         if meta is None:
             return
         tokens = getattr(meta, "total_token_count", 0) or 0
+        thinking = getattr(meta, "thinking_token_count", 0) or 0
         data = _load_usage()
         data["tokens"] = data.get("tokens", 0) + tokens
+        data["thinking_tokens"] = data.get("thinking_tokens", 0) + thinking
         data["requests"] = data.get("requests", 0) + 1
         _save_usage(data)
     except Exception:
@@ -103,8 +105,10 @@ def get_gemini_quota_info() -> dict | None:
         data = _load_usage()
         used_tokens = data.get("tokens", 0)
         used_requests = data.get("requests", 0)
+        used_thinking = data.get("thinking_tokens", 0)
         return {
             "used_tokens": used_tokens,
+            "used_thinking_tokens": used_thinking,
             "used_requests": used_requests,
             "remaining_tokens": max(0, _DAILY_TOKEN_LIMIT - used_tokens),
             "limit_tokens": _DAILY_TOKEN_LIMIT,
@@ -117,7 +121,6 @@ def get_gemini_quota_info() -> dict | None:
 # 注意：每個 Tool 物件只能設一個 field（oneof），要 list 多個
 _TOOLS = [
     types.Tool(google_search=types.GoogleSearch()),
-    types.Tool(url_context=types.UrlContext()),
     types.Tool(code_execution=types.ToolCodeExecution()),
 ]
 
@@ -213,6 +216,7 @@ emoji 偶爾用，不要多。
 21. 不需要回應的訊息，絕對不要提它、不要說「這個我跳過囉」「這個我不看」「我知道啦」之類的話。直接當作沒看到，完全不出聲
 22. 講完重點就結束，不要在結尾加多餘的口水句（例：「才不會弄錯嘛」「這樣比較好喔」「大家小心齁」），這種句子刪掉訊息完全不受影響
 23. 任何文字訊息都要回應。閒聊類（早安晚安、吃飯了嗎、家常話）用自然的一兩句回應，不要硬加分析；有事實宣稱或連結的一律查證後回應
+24. 地震相關訊息：M（規模）是震源能量，一般人看不懂；震度（幾級）才是各地感受強弱，台灣用 0～7 級。回覆時不要只說「M X.X」，要用 Google 搜尋查出這次地震各縣市的實際震度（幾級），再用「XX縣 X 級、XX縣 X 級」格式說明。如果是假設性問題（不是真實地震），解釋規模與震度的差異即可。
 """
 
 

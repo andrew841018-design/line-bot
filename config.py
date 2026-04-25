@@ -36,7 +36,7 @@ class Settings(BaseSettings):
 
     # ── Bot 行為 ──────────────────────────────────────────────────────────────
     # 對話 context 保留幾輪（user + bot 各算一輪）
-    context_rounds: int = 15
+    context_rounds: int = 6
     # 每聊幾輪自動抽取一次長期記憶
     fact_extract_every: int = 10
     # 最多注入 prompt 的事實數量
