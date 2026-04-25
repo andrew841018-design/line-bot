@@ -87,6 +87,16 @@ def _track_failed_request() -> None:
         pass
 
 
+def mark_quota_exhausted_in_usage() -> None:
+    """抓到 429 PerDay 時，把 requests 強制設成上限，讓顯示 100% 而非低估。"""
+    try:
+        data = _load_usage()
+        data["requests"] = max(data.get("requests", 0), _DAILY_REQUEST_LIMIT)
+        _save_usage(data)
+    except Exception:
+        pass
+
+
 def get_gemini_quota_info() -> dict | None:
     """回傳今日 Gemini 使用量；失敗回 None。"""
     try:

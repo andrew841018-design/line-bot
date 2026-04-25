@@ -107,10 +107,12 @@ def _get_quota_footer() -> str:
     info = gemini_client.get_gemini_quota_info()
     if info is None:
         return ""
+    if _quota_exhausted():
+        return "\n\n📊 Gemini 今日用量 已用完"
     token_pct = round(info["used_tokens"] / info["limit_tokens"] * 100, 1) if info["limit_tokens"] else 0
     req_pct = round(info["used_requests"] / info["limit_requests"] * 100, 1) if info["limit_requests"] else 0
-    pct = max(token_pct, req_pct)
-    return f"\n\n📊 Gemini 今日已用 {pct}%"
+    pct = min(99.0, max(token_pct, req_pct))
+    return f"\n\n📊 Gemini 今日用量 {pct}%"
 
 
 # ── URL 預抓取（繞過 Gemini url_context 的限制）─────────────────────────────
@@ -1300,6 +1302,7 @@ def _mark_quota_exhausted() -> None:
         hour=0, minute=0, second=0, microsecond=0
     )
     _quota_exhausted_until_ts = next_midnight_pt.timestamp()
+    gemini_client.mark_quota_exhausted_in_usage()   # 讓 % 顯示反映實際狀態
     logger.warning(
         "gemini quota marked exhausted until %s",
         next_midnight_pt.astimezone(_TW_TZ).strftime("%Y-%m-%d %H:%M TW"),
@@ -1330,19 +1333,9 @@ def _mark_quota_exhausted() -> None:
 
 
 def _quota_exhausted() -> bool:
-    """cache 還沒到期就回 True,handler 要直接短路。
-    同時做預警：bot counter 達 daily limit 時主動 mark（觸發一次性推播），處理「成功用光」情境。"""
-    if time.time() < _quota_exhausted_until_ts:
-        return True
-    # 預警：當日請求數已達 limit（含失敗），主動觸發 exhausted
-    try:
-        info = gemini_client.get_gemini_quota_info()
-        if info and info.get("used_requests", 0) >= info.get("limit_requests", 20):
-            _mark_quota_exhausted()
-            return True
-    except Exception:
-        pass
-    return False
+    """True = 本機記錄到 429 PerDay，且重置時間還沒到。
+    只靠 Google 實際回 429 判斷，不靠計數器預測。"""
+    return time.time() < _quota_exhausted_until_ts
 
 
 def _quota_exhausted_message() -> str:
@@ -1455,44 +1448,64 @@ def _clear_pending_explicit(group_id: str) -> None:
     _save_pending_explicit_raw(data)
 
 
+def _heuristic_group_messages(items: list[dict]) -> list[dict]:
+    """Fallback：每則各自一組。"""
+    return [
+        {"idxs": [i], "reply_to": i}
+        for i in range(len(items))
+    ]
+
+
 def _gemini_group_messages(items: list[dict]) -> list[dict]:
-    """call Gemini 判斷 pending 訊息怎麼分組（可跨非連續、可跨被打斷），並挑每組的指標性訊息作為引用目標。
+    """讓 Gemini 依內容判斷哪些訊息屬於同一話題/討論串，決定分組與回覆目標。
     回傳：[{"idxs": [int,...], "reply_to": int}, ...]。失敗退回每則各自一組。"""
+    if not items:
+        return []
     try:
-        from google import genai
         from google.genai import types
-        client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+        client = gemini_client._client
         lines = []
         for i, it in enumerate(items):
-            who = (it.get("user_id") or "unknown")[:8]
+            from datetime import datetime as _dt
+            ts = it.get("timestamp", 0)
+            ts_str = _dt.fromtimestamp(ts).strftime("%H:%M") if ts else "??"
+            who = (it.get("user_id") or "?")[:8]
             t = it.get("type", "text")
             content = it.get("text", "")
             if t == "file":
-                content = f"[檔案: {it.get('file_name','')}]"
+                content = f"[檔案: {it.get('file_name', '')}]"
             elif t == "audio":
                 content = "[語音留言]"
-            lines.append(f"[{i}] ({who}) {t}: {content[:200]}")
+            lines.append(f"[{i}] {ts_str} ({who}) {content[:200]}")
+
         prompt = (
-            "以下是 LINE 群組在一段時間內收到的訊息（依時間順序）。\n"
-            "請判斷哪些訊息屬於『同一則發言』（同一人表達同一件事，即使中間被別人插嘴打斷），\n"
-            "並從每組中挑一則最具指標性（最能代表該發言核心、最適合被引用回覆）的訊息。\n\n"
+            "以下是 LINE 群組在額度耗盡期間積累的訊息（依時間順序，格式：[索引] 時間 (用戶) 內容）。\n"
+            "你的任務：把這些訊息分組，每組對應「值得單獨回覆一次」的內容。\n\n"
+            "分組規則：\n"
+            "1. 同一人連續發的多則訊息，若講的是同一件事（只是分段打），合為一組\n"
+            "2. 不同人在討論同一個話題（你問我答、辯論、補充），合為一組\n"
+            "3. 話題明顯轉換（新主題、新問題、無關內容）→ 新的一組\n"
+            "4. 純閒聊回應（『哈哈』『好喔』『讚』等）可以單獨一組，也可以和觸發它的那則合併\n"
+            "5. 一組不宜超過 8 則，若同人連說了很多且話題明顯轉移，請適時切開\n\n"
+            "reply_to：從每組中選一則最具代表性的（最能讓回覆有所依附），必須是該組的索引之一。\n\n"
+            "訊息列表：\n"
             + "\n".join(lines)
-            + "\n\n回傳 JSON："
-            + '{"groups":[{"idxs":[int,...], "reply_to": int}, ...]}'
-            + "，每組的 idxs 依原順序；reply_to 必須屬於該組；每個訊息 idx 必須恰好出現一次。"
+            + "\n\n只回傳 JSON，不要說明（每個索引恰好出現一次）：\n"
+            '{"groups":[{"idxs":[int,...], "reply_to": int}, ...]}'
         )
         resp = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model=settings.gemini_light_model,
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                temperature=0.1,
+                temperature=0.0,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
         )
         data = _json.loads(resp.text)
         groups_raw = data.get("groups", [])
-        seen = set()
-        clean = []
+        seen: set[int] = set()
+        clean: list[dict] = []
         for g in groups_raw:
             idxs = g.get("idxs") if isinstance(g, dict) else None
             if not isinstance(idxs, list):
@@ -1501,17 +1514,18 @@ def _gemini_group_messages(items: list[dict]) -> list[dict]:
             if not ok:
                 continue
             seen.update(ok)
-            reply_to = g.get("reply_to") if isinstance(g, dict) else None
+            reply_to = g.get("reply_to")
             if not isinstance(reply_to, int) or reply_to not in ok:
-                reply_to = ok[-1]  # fallback：最後一則
+                reply_to = max(ok, key=lambda i: len(items[i].get("text") or ""))
             clean.append({"idxs": ok, "reply_to": reply_to})
         for i in range(len(items)):
             if i not in seen:
                 clean.append({"idxs": [i], "reply_to": i})
+        logger.info("group gemini: %d items → %d groups", len(items), len(clean))
         return clean
     except Exception as e:
-        logger.warning("group messages via gemini failed, falling back to each-alone: %s", str(e)[:200])
-        return [{"idxs": [i], "reply_to": i} for i in range(len(items))]
+        logger.warning("gemini group failed, fallback to each-alone: %s", str(e)[:200])
+        return _heuristic_group_messages(items)
 
 
 def _build_group_parts(items: list[dict], group_id: str) -> list:
@@ -1641,6 +1655,29 @@ def _process_pending_on_startup() -> None:
         logger.info("startup: group=%s all pending cleared", group_id)
 
 
+def _start_pending_retry_worker() -> None:
+    """背景執行緒每 30 分鐘自動重試 pending，不依賴重啟或 TCC 權限。"""
+    import threading as _threading
+
+    def _worker():
+        while True:
+            _threading.Event().wait(30 * 60)
+            if _load_pending_explicit() and not _quota_exhausted():
+                logger.info("pending retry worker: quota available, processing pending")
+                try:
+                    _process_pending_on_startup()
+                except Exception as e:
+                    logger.exception("pending retry worker failed: %s", e)
+
+    t = _threading.Thread(target=_worker, daemon=True, name="pending-retry")
+    t.start()
+
+
+@app.on_event("startup")
+def _start_background_workers() -> None:
+    _start_pending_retry_worker()
+
+
 @contextmanager
 def _thinking_indicator(group_id: str | None, delay: float = 3.0):
     yield
@@ -1683,19 +1720,8 @@ def _friendly_gemini_error(e: Exception, file_name: str | None = None) -> str:
         # 日額度爆 (RequestsPerDay)
         if "PerDay" in err_str or "free_tier_requests" in err_str:
             return _quota_exhausted_message()
-        # 分鐘 token 爆 (PerMinute, 通常是單次輸入太大)
-        if "input_token" in err_str or "free_tier_input_token_count" in err_str:
-            if file_name:
-                return (
-                    f"這個檔案 ({file_name}) 太大,一次塞爆了 Gemini 免費層的"
-                    f"每分鐘 token 限制 (250k tokens/min)。\n"
-                    f"建議:把檔案切小一點,或直接貼一段文字給我。"
-                )
-            return (
-                "剛才請求太密或輸入太長,超過 Gemini 免費層的 token 限制 (250k/min)。"
-                "等個一分鐘再試。"
-            )
-        return "Gemini quota 爆了,等一下再試。"
+        # 分鐘級限制（transient）→ 靜默，不告知使用者
+        return ""
     if "401" in err_str or "403" in err_str:
         return "Gemini API key 有問題,請檢查設定。"
     if "400" in err_str:
@@ -2138,6 +2164,8 @@ def _reply(reply_token: str, text: str, group_id: str | None = None) -> None:
     settings.bot_muted=True 時整個函式 short-circuit:
     不 reply、不 push、只把原本要送的 text 寫進 log 方便除錯。
     """
+    if not text or not text.strip():
+        return
     # Markdown → LINE 純文字
     text = _md_to_line(text)
     # LINE 單則訊息上限 5000 字；在截斷前先預留 footer 空間
