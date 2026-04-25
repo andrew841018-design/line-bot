@@ -1290,8 +1290,34 @@ def _next_gemini_reset_tw() -> tuple[str, str]:
 # 第一次遇到 429 PerDay 就記住「今天都是爆的」，之後所有 handler 在打 Gemini 之前
 # 先看這個 cache，直接短路回 quota 訊息，不浪費網路 round-trip。
 # 下一個 00:00 PT（= 台灣 15:00 夏令 / 16:00 非夏令）自動失效。
+_QUOTA_STATE_FILE = os.path.join(os.path.dirname(__file__), "quota_state.json")
 _quota_exhausted_until_ts: float = 0.0
-_quota_notified_for_ts: float = 0.0  # 已推播過的那個 exhausted_until_ts，避免重複推
+_quota_notified_for_ts: float = 0.0
+
+
+def _load_quota_state() -> None:
+    """從磁碟還原 quota exhausted 狀態，避免重啟後重複嘗試已耗盡的 quota。"""
+    global _quota_exhausted_until_ts, _quota_notified_for_ts
+    try:
+        with open(_QUOTA_STATE_FILE) as f:
+            d = _json.load(f)
+        _quota_exhausted_until_ts = float(d.get("exhausted_until_ts", 0))
+        _quota_notified_for_ts = float(d.get("notified_for_ts", 0))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.warning("load quota state failed: %s", e)
+
+
+def _save_quota_state() -> None:
+    try:
+        with open(_QUOTA_STATE_FILE, "w") as f:
+            _json.dump({
+                "exhausted_until_ts": _quota_exhausted_until_ts,
+                "notified_for_ts": _quota_notified_for_ts,
+            }, f)
+    except Exception as e:
+        logger.warning("save quota state failed: %s", e)
 
 
 def _mark_quota_exhausted() -> None:
@@ -1302,7 +1328,8 @@ def _mark_quota_exhausted() -> None:
         hour=0, minute=0, second=0, microsecond=0
     )
     _quota_exhausted_until_ts = next_midnight_pt.timestamp()
-    gemini_client.mark_quota_exhausted_in_usage()   # 讓 % 顯示反映實際狀態
+    gemini_client.mark_quota_exhausted_in_usage()
+    _save_quota_state()
     logger.warning(
         "gemini quota marked exhausted until %s",
         next_midnight_pt.astimezone(_TW_TZ).strftime("%Y-%m-%d %H:%M TW"),
@@ -1330,6 +1357,7 @@ def _mark_quota_exhausted() -> None:
                 logger.info("quota exhausted notice pushed to group=%s", group_id)
         except Exception as e:
             logger.warning("quota exhausted notice push failed: %s", str(e)[:200])
+        _save_quota_state()   # notified_for_ts 更新後才存
 
 
 def _quota_exhausted() -> bool:
@@ -1583,6 +1611,7 @@ def _build_group_parts(items: list[dict], group_id: str) -> list:
 @app.on_event("startup")
 def _process_pending_on_startup() -> None:
     """uvicorn 啟動時處理所有 pending：Gemini 分組 → 逐組用完整 chat 產生回覆 → 引用推送。"""
+    _load_quota_state()   # 先還原 quota 狀態，再決定要不要跑
     if settings.bot_muted:
         return
     pending = _load_pending_explicit()
@@ -1674,7 +1703,8 @@ def _start_pending_retry_worker() -> None:
 
 
 @app.on_event("startup")
-def _start_background_workers() -> None:
+def _init_on_startup() -> None:
+    _load_quota_state()
     _start_pending_retry_worker()
 
 
