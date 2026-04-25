@@ -868,8 +868,9 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
         _handle_explicit_text(event, group_id, clean_text)
         return
 
-    # 3. 任何文字訊息都直接回應
-    _handle_explicit_text(event, group_id, text)
+    # 4. 其他文字訊息 → burst_filter debounce（等對方說完再回）
+    sender_user_id = getattr(event.source, "user_id", None) or ""
+    burst_filter.add_to_burst(group_id, event.message.id, text, sender_user_id, event.reply_token)
 
 
 def _handle_explicit_text(
