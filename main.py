@@ -62,9 +62,11 @@ from linebot.v3.webhooks import (
     VideoMessageContent,
 )
 
+import bot_stats
 import burst_filter
 import feedback_collector
 import gemini_client
+import grok_client
 import memory
 import review
 from config import settings
@@ -103,18 +105,43 @@ _line_config = Configuration(access_token=settings.line_channel_access_token)
 # ── LINE 訊息配額 ─────────────────────────────────────────────────────────────
 
 def _get_quota_footer() -> str:
-    """每次回應時附上 Gemini 今日用量百分比，失敗回空字串。"""
+    """每次回應時附上今日用量百分比，失敗回空字串。"""
+    if _quota_exhausted():
+        grok_info = grok_client.get_quota_info()
+        if grok_info["remaining"] > 0:
+            return f"\n\n📊 Gemini 已用完，切換 Grok（剩 {grok_info['remaining']} 次）"
+        return "\n\n📊 Gemini + Grok 今日用量已用完"
     info = gemini_client.get_gemini_quota_info()
     if info is None:
         return ""
-    if _quota_exhausted():
-        return "\n\n📊 Gemini 今日用量 已用完"
     token_pct = round(info["used_tokens"] / info["limit_tokens"] * 100, 1) if info["limit_tokens"] else 0
     req_pct = round(info["used_requests"] / info["limit_requests"] * 100, 1) if info["limit_requests"] else 0
     pct = min(99.0, max(token_pct, req_pct))
     thinking = info.get("used_thinking_tokens", 0)
     thinking_part = f"（思考 {thinking // 1000}k）" if thinking >= 1000 else ""
     return f"\n\n📊 Gemini 今日用量 {pct}%{thinking_part}"
+
+
+def _llm_chat(
+    user_input,
+    context: list[tuple[str, str]],
+    facts: list[str],
+    pnotes: list[dict] | None = None,
+) -> str:
+    """Gemini → Grok fallback。呼叫端不需要感知用哪個 provider。"""
+    if not _quota_exhausted():
+        result = gemini_client.chat(user_input, context, facts, pnotes)
+        if result:
+            bot_stats.track_reply("gemini")
+        return result
+    # Gemini 已用完，嘗試 Grok（純文字 fallback，不支援圖片）
+    text_input = user_input if isinstance(user_input, str) else ""
+    if text_input and settings.grok_api_key:
+        result = grok_client.chat(text_input, context, facts, pnotes)
+        if result:
+            bot_stats.track_reply("grok")
+            return result
+    return ""
 
 
 # ── URL 預抓取（繞過 Gemini url_context 的限制）─────────────────────────────
@@ -742,14 +769,16 @@ def _handle_event(event) -> None:
     # ── quota 爆時：所有訊息都存 pending，等恢復後由 Gemini 分組 + 逐組引用回覆 ──
     if _quota_exhausted() and isinstance(msg, (TextMessageContent, FileMessageContent, AudioMessageContent)):
         _save_pending_any(event, group_id, sender_user_id, msg)
-        # 文字仍記 raw_messages 供引用回查
         if isinstance(msg, TextMessageContent):
             memory.log_raw_message(group_id, msg.id, sender_user_id, msg.text or "")
+            bot_stats.track_message(msg.text or "")
+            bot_stats.track_pending_saved()
         return
 
     # 文字：先記進 raw_messages（供 quote 回查 / burst look-back / Layer 2 抓 trigger）
     if isinstance(msg, TextMessageContent):
         memory.log_raw_message(group_id, msg.id, sender_user_id, msg.text or "")
+        bot_stats.track_message(msg.text or "")
         _handle_text_message(event, group_id)
         return
 
@@ -792,7 +821,7 @@ def _handle_audio_message(event: MessageEvent, group_id: str) -> None:
     pnotes = _get_persona_notes(group_id)
     try:
         with _thinking_indicator(group_id):
-            reply_text = gemini_client.chat(parts, context, facts, pnotes)
+            reply_text = _llm_chat(parts, context, facts, pnotes)
     except Exception as e:
         if _is_quota_error(e):
             _mark_quota_exhausted()
@@ -883,7 +912,7 @@ def _handle_explicit_text(
     pnotes = _get_persona_notes(group_id)
     try:
         with _thinking_indicator(group_id):
-            reply_text = gemini_client.chat(user_input, context, facts, pnotes)
+            reply_text = _llm_chat(user_input, context, facts, pnotes)
     except Exception as e:
         if _is_quota_error(e):
             _mark_quota_exhausted()
@@ -941,7 +970,7 @@ def _handle_burst_flush(
     )
     try:
         with _thinking_indicator(group_id):
-            reply_text = gemini_client.chat(user_input, context, facts, pnotes)
+            reply_text = _llm_chat(user_input, context, facts, pnotes)
     except Exception as e:
         if _is_quota_error(e):
             _mark_quota_exhausted()
@@ -1031,7 +1060,7 @@ def _handle_media_via_quote(
     pnotes = _get_persona_notes(group_id)
     try:
         with _thinking_indicator(group_id):
-            reply_text = gemini_client.chat(parts, context, facts, pnotes)
+            reply_text = _llm_chat(parts, context, facts, pnotes)
     except Exception as e:
         if _is_quota_error(e):
             _mark_quota_exhausted()
@@ -1196,7 +1225,7 @@ def _handle_file_message(event: MessageEvent, group_id: str) -> None:
         ]
         try:
             with _thinking_indicator(group_id):
-                reply_text = gemini_client.chat(parts, context, facts, pnotes)
+                reply_text = _llm_chat(parts, context, facts, pnotes)
         except Exception as e:
             if _is_quota_error(e):
                 _mark_quota_exhausted()
@@ -1235,7 +1264,7 @@ def _handle_file_message(event: MessageEvent, group_id: str) -> None:
 
     try:
         with _thinking_indicator(group_id):
-            reply_text = gemini_client.chat(prompt_text, context, facts, pnotes)
+            reply_text = _llm_chat(prompt_text, context, facts, pnotes)
     except Exception as e:
         if _is_quota_error(e):
             _mark_quota_exhausted()
@@ -1295,6 +1324,7 @@ def _next_gemini_reset_tw() -> tuple[str, str]:
 _QUOTA_STATE_FILE = os.path.join(os.path.dirname(__file__), "quota_state.json")
 _quota_exhausted_until_ts: float = 0.0
 _quota_notified_for_ts: float = 0.0
+_grok_intro_sent_groups: set[str] = set()  # 每次 process 前只推一次 intro，不重複
 
 
 def _load_quota_state() -> None:
@@ -1523,8 +1553,10 @@ def _gemini_group_messages(items: list[dict]) -> list[dict]:
             + "\n\n只回傳 JSON，不要說明（每個索引恰好出現一次）：\n"
             '{"groups":[{"idxs":[int,...], "reply_to": int}, ...]}'
         )
+        # 優先用 flash（分組更準確），quota 爆時降回 flash-lite
+        group_model = settings.gemini_model if not _quota_exhausted() else settings.gemini_light_model
         resp = client.models.generate_content(
-            model=settings.gemini_light_model,
+            model=group_model,
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -1554,7 +1586,11 @@ def _gemini_group_messages(items: list[dict]) -> list[dict]:
         logger.info("group gemini: %d items → %d groups", len(items), len(clean))
         return clean
     except Exception as e:
-        logger.warning("gemini group failed, fallback to each-alone: %s", str(e)[:200])
+        logger.warning("gemini group failed, trying grok: %s", str(e)[:200])
+        result = grok_client.group_messages(items)
+        if result is not None:
+            return result
+        logger.warning("grok group also failed, fallback to each-alone")
         return _heuristic_group_messages(items)
 
 
@@ -1612,16 +1648,36 @@ def _build_group_parts(items: list[dict], group_id: str) -> list:
 
 @app.on_event("startup")
 def _process_pending_on_startup() -> None:
-    """uvicorn 啟動時處理所有 pending：Gemini 分組 → 逐組用完整 chat 產生回覆 → 引用推送。"""
+    """uvicorn 啟動時處理所有 pending：分組 → 逐組 LLM 回覆 → 引用推送。
+    Gemini 耗盡時自動用 Grok fallback；兩者都耗盡才放棄。
+    """
     _load_quota_state()   # 先還原 quota 狀態，再決定要不要跑
     if settings.bot_muted:
         return
     pending = _load_pending_explicit()
     if not pending:
         return
-    if _quota_exhausted():
-        logger.info("startup: quota still exhausted, keep pending for next time")
+    gemini_gone = _quota_exhausted()
+    grok_gone = grok_client.quota_exhausted()
+    if gemini_gone and grok_gone:
+        logger.info("startup: both Gemini and Grok exhausted, keep pending for next time")
         return
+    if gemini_gone:
+        logger.info("startup: Gemini exhausted, will use Grok fallback for pending messages")
+        # 每個 group 只推一次 intro（重複觸發時不再發）
+        for group_id in pending:
+            if group_id not in _grok_intro_sent_groups:
+                try:
+                    with ApiClient(_line_config) as api_client:
+                        MessagingApi(api_client).push_message(
+                            PushMessageRequest(
+                                to=group_id,
+                                messages=[TextMessage(text="Gemini 今日用量已用完，接下來由 Grok agent 代為回覆之前積累的訊息，回覆品質可能略有不同～")],
+                            )
+                        )
+                    _grok_intro_sent_groups.add(group_id)
+                except Exception:
+                    pass
 
     for group_id, items in list(pending.items()):
         if isinstance(items, dict):  # 舊格式相容
@@ -1649,7 +1705,7 @@ def _process_pending_on_startup() -> None:
                 context = memory.get_context(group_id)
                 facts = memory.top_facts(group_id)
                 pnotes = _get_persona_notes(group_id)
-                reply_text = gemini_client.chat(parts, context, facts, pnotes)
+                reply_text = _llm_chat(parts, context, facts, pnotes)
 
                 text = _md_to_line(reply_text)
                 footer = _get_quota_footer()
@@ -1667,22 +1723,32 @@ def _process_pending_on_startup() -> None:
                             messages=[TextMessage(**msg_kwargs)],
                         )
                     )
+                bot_stats.track_line_push()
                 memory.append_turn(group_id, "user", "\n".join(it.get("text","") for it in group_items if it.get("type")=="text")[:500] or "[非文字訊息]")
                 memory.append_turn(group_id, "bot", reply_text)
                 processed_idx.update(idxs)
         except Exception as e:
+            remaining = [it for i, it in enumerate(items) if i not in processed_idx]
             if _is_quota_error(e):
                 _mark_quota_exhausted()
-                # 留下還沒處理的 items
-                remaining = [it for i, it in enumerate(items) if i not in processed_idx]
                 data = _load_pending_explicit()
                 data[group_id] = remaining
                 _save_pending_explicit_raw(data)
                 logger.warning("startup pending: quota re-exhausted, saved %d remaining for group=%s", len(remaining), group_id)
                 return
-            logger.exception("startup pending reply failed for group=%s: %s", group_id, e)
+            # LINE API 429（月額度滿）或其他錯誤：保留未送出的 items，等下次重試
+            err_str = str(e)
+            if remaining:
+                data = _load_pending_explicit()
+                data[group_id] = remaining
+                _save_pending_explicit_raw(data)
+                logger.warning("startup pending: push failed (%s), saved %d remaining for group=%s", err_str[:80], len(remaining), group_id)
+            else:
+                logger.exception("startup pending reply failed for group=%s: %s", group_id, e)
+            continue
 
         _clear_pending_explicit(group_id)
+        _grok_intro_sent_groups.discard(group_id)  # 下次 Gemini 再度 exhaust 時可重新發 intro
         logger.info("startup: group=%s all pending cleared", group_id)
 
 
@@ -1859,7 +1925,7 @@ def _handle_dinner_recommendation(event: MessageEvent, group_id: str) -> None:
     pnotes = _get_persona_notes(group_id)
     try:
         with _thinking_indicator(group_id):
-            reply_text = gemini_client.chat(_DINNER_PROMPT, context, facts, pnotes)
+            reply_text = _llm_chat(_DINNER_PROMPT, context, facts, pnotes)
     except Exception as e:
         if _is_quota_error(e):
             _mark_quota_exhausted()
@@ -2233,7 +2299,7 @@ def _reply(reply_token: str, text: str, group_id: str | None = None) -> None:
                         )
                     )
                 logger.info("fallback push_message sent to group=%s", group_id)
-                # push 成功也要記 bot 回覆（但拿不到 sent_message_id）
+                bot_stats.track_line_push()
                 memory.log_raw_message(
                     group_id, f"push_{int(time.time()*1000)}", "__bot__", text
                 )

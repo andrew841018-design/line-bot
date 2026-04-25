@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     # 預設 flash-lite，免費額度 1000/天，跟 flash 完全獨立不互相吃
     gemini_light_model: str = "gemini-2.5-flash-lite"
 
+    # ── Grok (xAI) fallback ───────────────────────────────────────────────────
+    grok_api_key: str = ""
+    grok_model: str = "grok-3-mini"
+
     # ── SQLite（本地持久化檔案）───────────────────────────────────────────────
     sqlite_path: str = "line_bot.db"
 
