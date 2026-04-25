@@ -1,0 +1,688 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LINE Bot 開發指南 — 任務卡看板</title>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Noto+Sans+TC:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0a0a0f;
+  --s1: #111117;
+  --s2: #18181f;
+  --s3: #1f1f28;
+  --br: #28283a;
+  --br2: #35354a;
+  --tx: #e4e4f0;
+  --tx2: #8888aa;
+  --tx3: #444460;
+
+  --done: #4ade80;
+  --done-bg: rgba(74,222,128,0.07);
+  --done-br: rgba(74,222,128,0.2);
+
+  --wip: #fbbf24;
+  --wip-bg: rgba(251,191,36,0.07);
+  --wip-br: rgba(251,191,36,0.25);
+
+  --todo-c: #6c9fff;
+  --todo-bg: rgba(108,159,255,0.06);
+
+  --new: #f87171;
+  --new-bg: rgba(248,113,113,0.1);
+
+  --crit: #ff6b6b;
+  --crit-bg: rgba(255,107,107,0.1);
+  --crit-br: rgba(255,107,107,0.3);
+
+  --line-c: #06c755;
+  --line-bg: rgba(6,199,85,0.07);
+  --line-br: rgba(6,199,85,0.2);
+
+  --p1c: #38bdf8;
+  --p2c: #34d399;
+  --p3c: #fb923c;
+  --p4c: #c084fc;
+  --p5c: #fbbf24;
+}
+
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--tx);font-family:'Noto Sans TC',sans-serif;font-weight:300;line-height:1.7}
+
+/* ── SIDEBAR ── */
+.sidebar{
+  position:fixed;left:0;top:0;bottom:0;width:210px;
+  background:var(--s1);border-right:1px solid var(--br);
+  overflow-y:auto;z-index:100;
+}
+.sb-logo{padding:22px 18px 18px;border-bottom:1px solid var(--br)}
+.sb-logo small{font-family:'JetBrains Mono',monospace;font-size:0.6rem;color:var(--tx3);letter-spacing:1.5px;text-transform:uppercase;display:block;margin-bottom:5px}
+.sb-logo strong{font-family:'Outfit',sans-serif;font-size:1rem;font-weight:800;color:var(--tx);letter-spacing:-0.3px}
+.sb-section{padding:14px 18px 4px;font-family:'JetBrains Mono',monospace;font-size:0.58rem;font-weight:700;letter-spacing:2px;text-transform:uppercase}
+.sb-link{display:flex;align-items:center;gap:7px;padding:4px 18px 4px 22px;font-size:0.75rem;color:var(--tx2);text-decoration:none;transition:color 0.15s,background 0.15s;border-left:2px solid transparent;font-family:'JetBrains Mono',monospace}
+.sb-link:hover{color:var(--tx);background:rgba(255,255,255,0.03)}
+.sb-link .dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+.sb-link.done-link .dot{background:var(--done)}
+.sb-link.wip-link .dot{background:var(--wip)}
+.sb-link.todo-link .dot{background:var(--br2)}
+.sb-link.crit-link .dot{background:var(--crit)}
+
+/* ── MAIN ── */
+.main{margin-left:210px;min-height:100vh}
+
+/* ── HERO ── */
+.hero{
+  padding:70px 56px 52px;
+  background:radial-gradient(ellipse 800px 400px at 60% -50%,rgba(6,199,85,0.06) 0%,transparent 70%),var(--bg);
+  border-bottom:1px solid var(--br);position:relative;overflow:hidden
+}
+.hero-tag{font-family:'JetBrains Mono',monospace;font-size:0.65rem;color:var(--line-c);letter-spacing:2.5px;text-transform:uppercase;margin-bottom:14px;opacity:.8}
+.hero h1{font-family:'Outfit',sans-serif;font-size:clamp(1.9rem,3.5vw,3rem);font-weight:800;line-height:1.1;letter-spacing:-1.5px;margin-bottom:14px}
+.hero h1 .hi{color:var(--line-c)}
+.hero-desc{font-size:.95rem;color:var(--tx2);max-width:520px;margin-bottom:36px}
+.hero-chips{display:flex;gap:10px;flex-wrap:wrap}
+.chip{font-family:'JetBrains Mono',monospace;font-size:0.65rem;padding:5px 12px;border-radius:20px;border:1px solid var(--br2);color:var(--tx2)}
+
+/* ── STATUS BAR ── */
+.statusbar{
+  padding:20px 56px;
+  background:var(--s1);border-bottom:1px solid var(--br);
+  display:flex;gap:6px;align-items:center
+}
+.stat-pill{font-family:'JetBrains Mono',monospace;font-size:.65rem;padding:4px 12px;border-radius:20px;display:flex;align-items:center;gap:6px;white-space:nowrap}
+.stat-pill .dot{width:7px;height:7px;border-radius:50%}
+.sp-done{background:var(--done-bg);border:1px solid var(--done-br);color:var(--done)}
+.sp-wip{background:var(--wip-bg);border:1px solid var(--wip-br);color:var(--wip)}
+.sp-todo{background:rgba(255,255,255,0.04);border:1px solid var(--br);color:var(--tx2)}
+.sp-crit{background:var(--crit-bg);border:1px solid var(--crit-br);color:var(--crit)}
+.stat-total{margin-left:auto;font-family:'JetBrains Mono',monospace;font-size:.65rem;color:var(--tx3)}
+
+/* ── CONTENT ── */
+.content{padding:0 56px 80px}
+
+/* ── PHASE BLOCK ── */
+.phase-block{margin-top:60px}
+.phase-hdr{display:flex;align-items:center;gap:14px;margin-bottom:28px;padding-bottom:16px;border-bottom:1px solid var(--br)}
+.phase-pill{font-family:'JetBrains Mono',monospace;font-size:.6rem;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;padding:4px 12px;border-radius:4px;border:1px solid;white-space:nowrap}
+.phase-name{font-family:'Outfit',sans-serif;font-size:1.3rem;font-weight:700;letter-spacing:-0.3px}
+.phase-meta{margin-left:auto;text-align:right;font-family:'JetBrains Mono',monospace;font-size:.6rem;color:var(--tx3);line-height:1.6}
+
+/* ── TASK SECTION ── */
+.tsection{margin-bottom:36px}
+.tsection-label{font-family:'JetBrains Mono',monospace;font-size:.6rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--tx3);margin-bottom:12px;display:flex;align-items:center;gap:10px}
+.tsection-label::after{content:'';flex:1;height:1px;background:var(--br)}
+
+/* ── TASK CARD ── */
+.task-card{
+  border:1px solid var(--br);border-radius:8px;
+  background:var(--s1);margin-bottom:10px;
+  overflow:hidden;transition:border-color .2s
+}
+.task-card:hover{border-color:var(--br2)}
+.task-card.is-done{border-left:3px solid var(--done)}
+.task-card.is-wip{border-left:3px solid var(--wip)}
+.task-card.is-crit{border-left:3px solid var(--crit)}
+.task-card.is-new-item{border-left:3px solid var(--new)}
+
+.tc-head{display:flex;align-items:center;gap:12px;padding:13px 16px;cursor:pointer;user-select:none}
+.tc-status{font-size:.85rem;width:22px;text-align:center;flex-shrink:0}
+.tc-title{flex:1;font-size:.88rem;font-weight:500;color:var(--tx)}
+.tc-title.muted{color:var(--tx2);font-weight:400}
+.crit-badge{font-family:'JetBrains Mono',monospace;font-size:.55rem;font-weight:700;color:var(--crit);background:var(--crit-bg);border:1px solid var(--crit-br);padding:1px 6px;border-radius:3px;margin-left:7px;vertical-align:middle;letter-spacing:.5px}
+.new-badge{font-family:'JetBrains Mono',monospace;font-size:.55rem;font-weight:700;color:var(--new);background:var(--new-bg);border:1px solid rgba(248,113,113,0.25);padding:1px 6px;border-radius:3px;margin-left:7px;vertical-align:middle;letter-spacing:.5px}
+.fix-badge{font-family:'JetBrains Mono',monospace;font-size:.55rem;font-weight:700;color:#34d399;background:rgba(52,211,153,0.1);border:1px solid rgba(52,211,153,0.25);padding:1px 6px;border-radius:3px;margin-left:7px;vertical-align:middle;letter-spacing:.5px}
+.tag-badge{font-family:'JetBrains Mono',monospace;font-size:.58rem;color:var(--tx3);background:rgba(255,255,255,0.04);border:1px solid var(--br);padding:2px 8px;border-radius:4px;white-space:nowrap;flex-shrink:0}
+.tc-chevron{font-size:.6rem;color:var(--tx3);transition:transform .2s;flex-shrink:0}
+.task-card.open .tc-chevron{transform:rotate(180deg)}
+
+.tc-body{display:none;padding:0 16px 16px 50px;border-top:1px solid var(--br)}
+.task-card.open .tc-body{display:block}
+
+.task-steps{list-style:none;margin-top:14px}
+.task-steps li{display:flex;gap:9px;padding:4px 0;font-size:.82rem;color:var(--tx2);line-height:1.55}
+.task-steps li::before{content:'▸';color:var(--tx3);flex-shrink:0;margin-top:1px;font-size:.65rem}
+.task-steps li code{font-family:'JetBrains Mono',monospace;font-size:.73rem;background:rgba(255,255,255,0.05);padding:1px 5px;border-radius:3px;color:var(--p1c);white-space:nowrap}
+
+/* ── DONE BAR ── */
+.done-bar{margin-top:13px;padding:9px 13px;border-radius:5px;font-size:.77rem;background:var(--done-bg);border:1px solid var(--done-br);color:var(--done)}
+.done-bar::before{content:'✓ 完成標準：';font-family:'JetBrains Mono',monospace;font-size:.65rem;opacity:.7;margin-right:4px}
+
+/* ── TEST BAR ── */
+.test-bar{margin-top:8px;padding:9px 13px;border-radius:5px;font-size:.77rem;background:rgba(56,189,248,0.06);border:1px solid rgba(56,189,248,0.2);color:#38bdf8}
+.test-bar::before{content:'⚡ 測試驗證：';font-family:'JetBrains Mono',monospace;font-size:.65rem;opacity:.7;margin-right:4px}
+
+/* ── WARN BAR ── */
+.warn-bar{margin-top:8px;padding:9px 13px;border-radius:5px;font-size:.77rem;background:var(--wip-bg);border:1px solid var(--wip-br);color:var(--wip)}
+.warn-bar::before{content:'⚠ 注意：';font-family:'JetBrains Mono',monospace;font-size:.65rem;opacity:.7;margin-right:4px}
+
+/* ── PHASE DONE BANNER ── */
+.phase-banner{margin-top:28px;padding:20px 24px;border-radius:8px;display:flex;align-items:center;gap:14px}
+.pb-icon{font-size:1.6rem;flex-shrink:0}
+.pb-text strong{font-family:'Outfit',sans-serif;font-size:.95rem;font-weight:700;display:block;margin-bottom:2px}
+.pb-text span{font-size:.8rem;opacity:.65}
+
+/* ── QUOTA TABLE ── */
+.quota-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:14px}
+.qc{background:var(--s2);border:1px solid var(--br);border-radius:6px;padding:10px 14px}
+.qc-label{font-family:'JetBrains Mono',monospace;font-size:.6rem;color:var(--tx3);letter-spacing:1px;text-transform:uppercase;margin-bottom:4px}
+.qc-val{font-family:'Outfit',sans-serif;font-size:1.2rem;font-weight:700;color:var(--tx)}
+.qc-sub{font-size:.72rem;color:var(--tx2);margin-top:2px}
+
+/* ── SCROLLBAR ── */
+::-webkit-scrollbar{width:4px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--br2);border-radius:2px}
+
+@media(max-width:860px){
+  .sidebar{display:none}.main{margin-left:0}
+  .hero{padding:36px 20px 28px}.content{padding:0 20px 60px}
+  .statusbar{padding:16px 20px;flex-wrap:wrap}
+  .quota-grid{grid-template-columns:1fr 1fr}
+}
+</style>
+</head>
+<body>
+
+<!-- SIDEBAR -->
+<nav class="sidebar">
+  <div class="sb-logo">
+    <small>// LINE Bot 開發指南</small>
+    <strong>LINE Bot Tasks</strong>
+  </div>
+
+  <div class="sb-section" style="color:var(--done)">已完成</div>
+  <a class="sb-link done-link" href="#section-done"><span class="dot"></span>已完成（5 項）</a>
+
+  <div class="sb-section" style="color:var(--wip)">進行中</div>
+  <a class="sb-link wip-link" href="#section-wip"><span class="dot"></span>等待處理（2 項）</a>
+
+  <div class="sb-section" style="color:var(--todo-c)">架構概覽</div>
+  <a class="sb-link todo-link" href="#section-arch"><span class="dot"></span>用量與額度</a>
+  <a class="sb-link todo-link" href="#section-flow"><span class="dot"></span>訊息處理流程</a>
+  <a class="sb-link todo-link" href="#section-test"><span class="dot"></span>測試全覽</a>
+</nav>
+
+<!-- MAIN -->
+<div class="main">
+<div class="hero">
+  <div class="hero-tag">LINE Bot · Gemini + Grok · FastAPI</div>
+  <h1>LINE Bot<span class="hi"> 任務看板</span></h1>
+  <p class="hero-desc">所有改動、修正、新功能的完成標準與測試驗證方式，以測試為優先</p>
+  <div class="hero-chips">
+    <span class="chip">✅ 5 已完成</span>
+    <span class="chip">🔄 2 等待處理</span>
+    <span class="chip">🧪 79 tests passing</span>
+    <span class="chip">🤖 Gemini 20/day + Grok 25/day</span>
+  </div>
+</div>
+
+<div class="statusbar">
+  <div class="stat-pill sp-done"><span class="dot" style="background:var(--done)"></span>✅ 5 已完成</div>
+  <div class="stat-pill sp-wip"><span class="dot" style="background:var(--wip)"></span>🔄 2 等待處理</div>
+  <div class="stat-pill sp-done"><span class="dot" style="background:#38bdf8"></span>🧪 79 tests</div>
+  <div class="stat-total">7 項任務 · 2026-04-25 更新</div>
+</div>
+
+<div class="content">
+
+<!-- ═══════════════ SECTION: 已完成 ═══════════════ -->
+<div class="phase-block" id="section-done">
+  <div class="phase-hdr">
+    <span class="phase-pill" style="color:var(--done);border-color:var(--done)">COMPLETED</span>
+    <span class="phase-name" style="color:var(--done)">✅ 已完成 — 5 項任務</span>
+  </div>
+
+  <!-- ── burst_filter 修復 ── -->
+  <div class="task-card is-done open" onclick="toggleCard(this)">
+    <div class="tc-head">
+      <span class="tc-status">✅</span>
+      <span class="tc-title">burst_filter 去抖動修復<span class="crit-badge">CRITICAL</span><span class="fix-badge">FIXED</span></span>
+      <span class="tag-badge">main.py:871</span>
+      <span class="tc-chevron">▼</span>
+    </div>
+    <div class="tc-body">
+      <ul class="task-steps">
+        <li>根因：所有非 @mention 文字訊息直接呼叫 <code>_handle_explicit_text()</code>，完全跳過 <code>burst_filter.add_to_burst()</code></li>
+        <li>效果：等人說完一段話才呼叫 LLM，而不是每收到一則就觸發</li>
+        <li>修復後：<code>burst_filter.add_to_burst(group_id, event.message.id, text, sender_user_id, event.reply_token)</code></li>
+        <li>所有非 @mention 文字訊息進 debounce 佇列，由 burst_filter 內部計時觸發回應</li>
+      </ul>
+      <div class="done-bar">所有非 @mention 文字訊息走 burst_filter，不直接觸發 LLM</div>
+      <div class="test-bar"><code>python test_bot_flow.py</code> — Test 1 (classify_message) + 確認 main.py:871 無直接呼叫 handle_explicit_text</div>
+    </div>
+  </div>
+
+  <!-- ── Gemini→Grok waterfall ── -->
+  <div class="task-card is-done open" onclick="toggleCard(this)">
+    <div class="tc-head">
+      <span class="tc-status">✅</span>
+      <span class="tc-title">Gemini → Grok LLM waterfall 回應</span>
+      <span class="tag-badge">main.py _llm_chat()</span>
+      <span class="tc-chevron">▼</span>
+    </div>
+    <div class="tc-body">
+      <ul class="task-steps">
+        <li>Gemini 每天 20 req 免費；Grok 每天 25 req 免費（x.ai API）</li>
+        <li>waterfall 順序：Gemini 嘗試 → 若 429/quota exhausted → 自動切換 Grok → 若也失敗 → 塞入 <code>pending_explicit_reply.json</code></li>
+        <li>Grok 用 OpenAI-compatible API（<code>https://api.x.ai/v1</code>）+ <code>grok-3-mini</code> 模型</li>
+        <li>quota exhausted 狀態存在 <code>gemini_usage.json</code>，重啟後不重置</li>
+        <li>每天 ~15:00 TW 時間自動恢復（UTC 07:00）</li>
+      </ul>
+      <div class="done-bar">Gemini 失敗時 Grok 自動接手；Grok 也失敗時寫入 pending JSON</div>
+      <div class="test-bar"><code>python test_bot_flow.py</code> — Test 4: 三情境（Gemini OK / Gemini fail+Grok OK / both fail→pending）</div>
+    </div>
+  </div>
+
+  <!-- ── Grok group_messages ── -->
+  <div class="task-card is-done open" onclick="toggleCard(this)">
+    <div class="tc-head">
+      <span class="tc-status">✅</span>
+      <span class="tc-title">Grok grouping fallback — pending 批次分組</span>
+      <span class="tag-badge">grok_client.py</span>
+      <span class="tc-chevron">▼</span>
+    </div>
+    <div class="tc-body">
+      <ul class="task-steps">
+        <li>背景：Gemini 用於 grouping（判斷哪些訊息是同一對話串，等一批說完才回應）</li>
+        <li>原本 Gemini grouping 失敗 → 直接 heuristic（每則訊息各自回，可能產生 46+ 則回應）</li>
+        <li>修復後：Gemini grouping 失敗 → 先試 Grok grouping → 才降回 heuristic</li>
+        <li><code>grok_client.group_messages(items)</code>：同樣的 prompt，回傳 <code>[{"idxs": [...], "reply_to": int}]</code> 或 <code>None</code></li>
+        <li>使用 <code>response_format={"type": "json_object"}</code> 強制 JSON 輸出</li>
+      </ul>
+      <div class="done-bar">Gemini grouping 失敗時 Grok 接管，不直接 heuristic 爆出大量回應</div>
+      <div class="test-bar"><code>python test_bot_flow.py</code> — Test 5: 輸出格式驗證（idxs 為 list、reply_to 為 int）</div>
+    </div>
+  </div>
+
+  <!-- ── pending piggyback ── -->
+  <div class="task-card is-done open" onclick="toggleCard(this)">
+    <div class="tc-head">
+      <span class="tc-status">✅</span>
+      <span class="tc-title">Pending 偷塞 piggyback — 免費回補機制</span>
+      <span class="tag-badge">main.py _reply()</span>
+      <span class="tc-chevron">▼</span>
+    </div>
+    <div class="tc-body">
+      <ul class="task-steps">
+        <li>背景：LINE push_message 每月 200 則上限，4月已用完（HTTP 429）</li>
+        <li>解法：每次有人觸發真實回應時，同時把最多 5 則 pending 回應夾帶進同一個 <code>reply_message</code>（LINE 允許 1 次 reply 最多 5 則訊息）</li>
+        <li>piggyback 格式：<br>
+          <code>📬 補回之前漏掉的訊息</code><br>
+          <code>原文：（原始訊息前 300 字）</code><br>
+          <code>回應：（LLM 生成的回應）</code>
+        </li>
+        <li>成功後從 <code>pending_explicit_reply.json</code> 移除已處理項目</li>
+        <li>LLM 失敗（exception）時靜默跳過，不影響主要回應</li>
+        <li>pending 只含真實使用者訊息（<code>__bot__</code> 條目已過濾）</li>
+      </ul>
+      <div class="done-bar">每次 reply 夾帶 1 批 pending；pending 逐漸清空；主回應不受影響</div>
+      <div class="test-bar"><code>python test_bot_flow.py</code> — Test 3: piggyback 格式符合 / LLM 失敗時 pending 不變</div>
+      <div class="warn-bar">LINE push 額度恢復後（下個月），pending 機制仍保留；piggyback 是額外補充，主流程仍用 push</div>
+    </div>
+  </div>
+
+  <!-- ── bot_stats ── -->
+  <div class="task-card is-done open" onclick="toggleCard(this)">
+    <div class="tc-head">
+      <span class="tc-status">✅</span>
+      <span class="tc-title">bot_stats.py — 每日訊息統計分析</span>
+      <span class="tag-badge">bot_stats.py</span>
+      <span class="tc-chevron">▼</span>
+    </div>
+    <div class="tc-body">
+      <ul class="task-steps">
+        <li><code>classify_message(text)</code>：把訊息分成 9 類（youtube / url / health / question / greeting / news / opinion / command / other）</li>
+        <li><code>increment(group_id, category)</code>：寫入 <code>bot_stats.json</code>，<code>{"group_id": {"date": {"category": count}}}</code> 格式</li>
+        <li>Daily briefing Discord 早報用來呈現「今天群組話題分布」</li>
+        <li>JSON 直接寫盤，不用 SQLite（輕量，無法共寫衝突）</li>
+      </ul>
+      <div class="done-bar">classify + increment 通過 round-trip 測試；JSON 格式正確</div>
+      <div class="test-bar"><code>python test_bot_flow.py</code> — Test 1: 9 個類別各一則測試 + increment 後讀回確認數量</div>
+    </div>
+  </div>
+
+  <!-- ── CI/CD ── -->
+  <div class="task-card is-done open" onclick="toggleCard(this)">
+    <div class="tc-head">
+      <span class="tc-status">✅</span>
+      <span class="tc-title">GitHub Actions CI/CD — 每次 push 自動測試</span>
+      <span class="tag-badge">.github/workflows/ci.yml</span>
+      <span class="tc-chevron">▼</span>
+    </div>
+    <div class="tc-body">
+      <ul class="task-steps">
+        <li>觸發：push to <code>main</code> 或 PR to <code>main</code></li>
+        <li>環境：ubuntu-latest + Python 3.13</li>
+        <li>建立假 <code>.env</code>（<code>GEMINI_API_KEY=dummy</code> 等），確保不會打到真實 API</li>
+        <li>執行：<code>python test_prefetch.py --quick</code>（47 tests）+ <code>python test_bot_flow.py</code>（32 tests）</li>
+        <li>全部離線測試，無真實 API 呼叫（用 <code>unittest.mock</code>）</li>
+        <li>47 + 32 = <strong>79 tests</strong> 在每次 push 後自動跑</li>
+      </ul>
+      <div class="done-bar">GitHub Actions 顯示綠燈；79 tests 全部通過</div>
+      <div class="test-bar">push 後到 GitHub → Actions tab 確認 workflow 狀態為 ✅；或本地 <code>python test_prefetch.py --quick && python test_bot_flow.py</code></div>
+    </div>
+  </div>
+
+</div><!-- /section-done -->
+
+<!-- ═══════════════ SECTION: 等待處理 ═══════════════ -->
+<div class="phase-block" id="section-wip">
+  <div class="phase-hdr">
+    <span class="phase-pill" style="color:var(--wip);border-color:var(--wip)">WAITING</span>
+    <span class="phase-name" style="color:var(--wip)">🔄 等待處理 — 2 項</span>
+    <div class="phase-meta">🔄 2 等待中</div>
+  </div>
+
+  <!-- ── pending draining ── -->
+  <div class="task-card is-wip open" onclick="toggleCard(this)">
+    <div class="tc-head">
+      <span class="tc-status">🔄</span>
+      <span class="tc-title">Pending 46 則訊息排空<span class="new-badge">待觸發</span></span>
+      <span class="tag-badge">pending_explicit_reply.json</span>
+      <span class="tc-chevron">▼</span>
+    </div>
+    <div class="tc-body">
+      <ul class="task-steps">
+        <li>現況：<code>pending_explicit_reply.json</code> 有 46 則未回應的使用者訊息（1 個群組）</li>
+        <li>排空方式：每次群組有人發訊息觸發真實 LLM 回應時，自動夾帶最多 5 則 pending 回補</li>
+        <li>Gemini 額度恢復時間：每天 ~15:00 TW（UTC 07:00）</li>
+        <li>預估：46 ÷ 5 = 最多 10 次有效回應後清空（實際視群組活躍度）</li>
+        <li>不需要主動操作，等群組自然活躍即可</li>
+      </ul>
+      <div class="done-bar">pending_explicit_reply.json 變為空物件 <code>{}</code></div>
+      <div class="test-bar">查看 pending 狀態：<code>python -c "import json; d=json.load(open('pending_explicit_reply.json')); print(sum(len(v) for v in d.values()), 'pending')"</code></div>
+      <div class="warn-bar">Gemini 額度每日重置，但 LINE push 額度 4 月已耗盡；5 月 1 日恢復後 pending 仍用 piggyback 回補（不改為 push）</div>
+    </div>
+  </div>
+
+  <!-- ── Grok silent failure ── -->
+  <div class="task-card is-wip" onclick="toggleCard(this)">
+    <div class="tc-head">
+      <span class="tc-status">⚠️</span>
+      <span class="tc-title">Grok 額度耗盡靜默失敗<span class="crit-badge">Critical #2</span></span>
+      <span class="tag-badge">grok_client.py</span>
+      <span class="tc-chevron">▼</span>
+    </div>
+    <div class="tc-body">
+      <ul class="task-steps">
+        <li>問題：Grok API 回 429 時目前只 log warning，沒有持久化「grok 也用完」的狀態</li>
+        <li>影響：Gemini 用完 + Grok 用完時，每則訊息都還是會打 Grok API（浪費 request，也可能誤算）</li>
+        <li>修復方向：在 <code>grok_usage.json</code> 追蹤 grok_exhausted_until_ts（類似 Gemini 的 <code>gemini_usage.json</code>）</li>
+        <li>耗盡後直接跳到 pending，不再打 API</li>
+        <li>重置時間：Grok 免費 25 req/day，每天 UTC 00:00 重置</li>
+      </ul>
+      <div class="done-bar">Grok 429 後寫入 grok_usage.json；下次呼叫直接 fallback 到 pending，不打 API</div>
+      <div class="test-bar"><code>python test_bot_flow.py</code> — 需新增 Test 7: mock Grok 429 → 驗證 grok_usage.json 有 exhausted_until_ts + 下次呼叫不打 API</div>
+    </div>
+  </div>
+
+</div><!-- /section-wip -->
+
+<!-- ═══════════════ SECTION: 架構概覽 ═══════════════ -->
+<div class="phase-block" id="section-arch">
+  <div class="phase-hdr">
+    <span class="phase-pill" style="color:var(--p1c);border-color:var(--p1c)">ARCH</span>
+    <span class="phase-name">用量與額度</span>
+  </div>
+
+  <div class="quota-grid">
+    <div class="qc">
+      <div class="qc-label">Gemini Flash</div>
+      <div class="qc-val" style="color:var(--done)">20</div>
+      <div class="qc-sub">req/day · UTC 07:00 重置（TW 15:00）</div>
+    </div>
+    <div class="qc">
+      <div class="qc-label">Grok (x.ai)</div>
+      <div class="qc-val" style="color:var(--p1c)">25</div>
+      <div class="qc-sub">req/day · UTC 00:00 重置</div>
+    </div>
+    <div class="qc">
+      <div class="qc-label">LINE Push</div>
+      <div class="qc-val" style="color:var(--crit)">0</div>
+      <div class="qc-sub">200/month 已耗盡 · 5月1日恢復</div>
+    </div>
+    <div class="qc">
+      <div class="qc-label">LINE Reply</div>
+      <div class="qc-val" style="color:var(--done)">∞</div>
+      <div class="qc-sub">免費 · 無限制 · piggyback 走此路</div>
+    </div>
+    <div class="qc">
+      <div class="qc-label">Pending 積壓</div>
+      <div class="qc-val" style="color:var(--wip)">46</div>
+      <div class="qc-sub">則 · 1 個群組 · 逐漸消化中</div>
+    </div>
+    <div class="qc">
+      <div class="qc-label">總測試數</div>
+      <div class="qc-val" style="color:var(--p4c)">79</div>
+      <div class="qc-sub">test_prefetch: 47 · test_bot_flow: 32</div>
+    </div>
+  </div>
+</div><!-- /section-arch -->
+
+<!-- ═══════════════ SECTION: 訊息處理流程 ═══════════════ -->
+<div class="phase-block" id="section-flow">
+  <div class="phase-hdr">
+    <span class="phase-pill" style="color:var(--p2c);border-color:var(--p2c)">FLOW</span>
+    <span class="phase-name">訊息處理流程</span>
+  </div>
+
+  <div class="task-card open" onclick="toggleCard(this)">
+    <div class="tc-head">
+      <span class="tc-status">📊</span>
+      <span class="tc-title">一則訊息進來的完整路徑</span>
+      <span class="tc-chevron">▼</span>
+    </div>
+    <div class="tc-body">
+      <ul class="task-steps">
+        <li>LINE webhook → <code>POST /callback</code> → 驗簽名 → 取出 events</li>
+        <li>判斷類型：圖片/影片/貼圖 → 忽略；YouTube URL → yt-dlp 抓字幕；一般文字 → 繼續</li>
+        <li>是否 @mention Bot？
+          → 是：直接呼叫 <code>_handle_explicit_text()</code>（立即回應）
+          → 否：<code>burst_filter.add_to_burst()</code>（等 burst 結束）
+        </li>
+        <li>burst_filter 計時結束 → <code>_handle_explicit_text()</code> → LLM waterfall</li>
+        <li>LLM waterfall：Gemini OK → 回應；Gemini 429 → Grok；Grok 也 429 → 寫 pending</li>
+        <li>回應時呼叫 <code>_reply()</code> → 同時 piggyback 最多 5 則 pending → LINE reply_message</li>
+        <li>寫入 memory DB → bot_stats.increment → 完成</li>
+      </ul>
+      <div class="test-bar">本地測試：<code>pkill -f "uvicorn main:app" && nohup .venv/bin/uvicorn main:app --host 127.0.0.1 --port 8080 > /tmp/line_bot_restart.log 2>&1 &</code> 後 curl 發假 webhook</div>
+    </div>
+  </div>
+
+  <div class="task-card" onclick="toggleCard(this)">
+    <div class="tc-head">
+      <span class="tc-status">📦</span>
+      <span class="tc-title">Pending 群組分組流程（startup 時處理積壓）</span>
+      <span class="tc-chevron">▼</span>
+    </div>
+    <div class="tc-body">
+      <ul class="task-steps">
+        <li>Bot 重啟時：讀取 pending JSON → 用 <code>_gemini_group_messages()</code> 分組（哪些訊息是同一對話串）</li>
+        <li>Gemini grouping 失敗 → <code>grok_client.group_messages()</code> → 還是失敗 → heuristic（每則各自）</li>
+        <li>分組後用 push_message 批次推送（需要 LINE push 額度）</li>
+        <li>目前 push 額度耗盡（HTTP 429）→ startup pending 推送失敗 → 改走 piggyback 機制</li>
+        <li><code>__bot__</code> 條目在處理前過濾（<code>items = [it for it in items if it.get("user_id") != "__bot__"]</code>）</li>
+      </ul>
+      <div class="test-bar"><code>python test_bot_flow.py</code> — Test 2: pending JSON read/write + __bot__ 過濾</div>
+    </div>
+  </div>
+</div><!-- /section-flow -->
+
+<!-- ═══════════════ SECTION: 測試全覽 ═══════════════ -->
+<div class="phase-block" id="section-test">
+  <div class="phase-hdr">
+    <span class="phase-pill" style="color:var(--p4c);border-color:var(--p4c)">TESTING</span>
+    <span class="phase-name">測試全覽 — 79 tests</span>
+  </div>
+
+  <div class="task-card open" onclick="toggleCard(this)">
+    <div class="tc-head">
+      <span class="tc-status">🧪</span>
+      <span class="tc-title">test_prefetch.py — 47 tests（prompt / persona 驗證）</span>
+      <span class="tc-chevron">▼</span>
+    </div>
+    <div class="tc-body">
+      <ul class="task-steps">
+        <li>執行：<code>python test_prefetch.py --quick</code>（快速模式，跳過 API 呼叫）</li>
+        <li>測試 <code>_SYSTEM_PROMPT</code> 包含關鍵規則（不插嘴：<code>"不需要回應的訊息"</code>）</li>
+        <li>測試 <code>_PERSONA_REVIEW_PROMPT</code> 包含 <code>"不主動插嘴"</code></li>
+        <li>測試 YouTube URL 偵測正確（<code>youtube.com/watch</code>、<code>youtu.be/</code>、<code>m.youtube.com</code>）</li>
+        <li>測試 <code>_md_to_line()</code> 轉換（markdown → 純文字）</li>
+        <li>測試各種群組/私聊訊息路由</li>
+      </ul>
+      <div class="test-bar"><code>python test_prefetch.py --quick</code> → 輸出應為 <code>47 passed, 0 failed</code></div>
+    </div>
+  </div>
+
+  <div class="task-card open" onclick="toggleCard(this)">
+    <div class="tc-head">
+      <span class="tc-status">🧪</span>
+      <span class="tc-title">test_bot_flow.py — 32 tests（6 模組，無 API 呼叫）</span>
+      <span class="tc-chevron">▼</span>
+    </div>
+    <div class="tc-body">
+      <ul class="task-steps">
+        <li>Test 1 — <strong>bot_stats</strong>：<code>classify_message()</code> 9 類別分類 + <code>increment()</code> round-trip</li>
+        <li>Test 2 — <strong>Pending JSON</strong>：讀寫 pending + <code>__bot__</code> 條目過濾</li>
+        <li>Test 3 — <strong>Piggyback</strong>：format 符合規範 / LLM 失敗時 pending 不變</li>
+        <li>Test 4 — <strong>LLM waterfall</strong>：Gemini OK / Gemini fail+Grok OK / both fail→pending 三情境</li>
+        <li>Test 5 — <strong>grok_client.group_messages()</strong>：回傳格式（idxs list, reply_to int）</li>
+        <li>Test 6 — <strong>Quota state</strong>：<code>gemini_usage.json</code> load/save round-trip</li>
+        <li>全用 <code>unittest.mock</code>，不打任何真實 API</li>
+      </ul>
+      <div class="test-bar"><code>python test_bot_flow.py</code> → 輸出應為 <code>Ran 32 tests in X.XXs OK</code></div>
+    </div>
+  </div>
+
+  <div class="task-card" onclick="toggleCard(this)">
+    <div class="tc-head">
+      <span class="tc-status">🔧</span>
+      <span class="tc-title">本地動態驗證流程（改完必做）</span>
+      <span class="tc-chevron">▼</span>
+    </div>
+    <div class="tc-body">
+      <ul class="task-steps">
+        <li>Step 1：重啟 uvicorn<br><code>pkill -f "uvicorn main:app" && nohup .venv/bin/uvicorn main:app --host 127.0.0.1 --port 8080 > /tmp/line_bot_restart.log 2>&1 &</code></li>
+        <li>Step 2：確認活著<br><code>curl --interface lo0 http://localhost:8080/health</code> → 應回 <code>{"status":"ok"}</code></li>
+        <li>Step 3：跑完整測試<br><code>python test_prefetch.py --quick && python test_bot_flow.py</code></li>
+        <li>Step 4：確認 log 無 ERROR<br><code>tail -20 /tmp/line_bot_restart.log</code></li>
+        <li>Step 5：commit + push → CI/CD 自動跑 GitHub Actions</li>
+      </ul>
+      <div class="done-bar">5 步全過，CI/CD 顯示 ✅</div>
+      <div class="test-bar">靜態分析（grep/read）不算驗證；必須跑動態測試看到輸出</div>
+    </div>
+  </div>
+
+  <div class="phase-banner" style="background:rgba(6,199,85,0.07);border:1px solid rgba(6,199,85,0.2)">
+    <div class="pb-icon">🤖</div>
+    <div class="pb-text">
+      <strong style="color:var(--line-c)">LINE Bot 測試驗證原則</strong>
+      <span>靜態 grep/read 只能確認程式碼存在，不能確認行為正確。每次改動後必須跑 pytest + curl，才算完成。</span>
+    </div>
+  </div>
+
+</div><!-- /section-test -->
+
+</div><!-- /content -->
+</div><!-- /main -->
+
+<script>
+function toggleCard(card) { card.classList.toggle('open'); }
+
+(function(){
+  const STORAGE_KEY = 'line_bot_guide_checks';
+  function loadChecks() {
+    try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'); } catch(e) { return {}; }
+  }
+  function saveChecks(data) { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); }
+
+  document.addEventListener('DOMContentLoaded', function() {
+    const checks = loadChecks();
+
+    document.querySelectorAll('.task-steps li').forEach(function(li, i) {
+      const id = 'step-' + i;
+      const checked = !!checks[id];
+      li.style.cursor = 'pointer';
+      li.style.userSelect = 'none';
+
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = checked;
+      cb.style.cssText = 'width:13px;height:13px;cursor:pointer;flex-shrink:0;margin-top:3px;accent-color:#06c755;';
+      cb.addEventListener('change', function(e) {
+        e.stopPropagation();
+        const d = loadChecks();
+        if (this.checked) {
+          d[id] = true;
+          li.style.opacity = '0.4';
+          li.style.textDecoration = 'line-through';
+        } else {
+          delete d[id];
+          li.style.opacity = '';
+          li.style.textDecoration = '';
+        }
+        saveChecks(d);
+      });
+
+      if (checked) {
+        li.style.opacity = '0.4';
+        li.style.textDecoration = 'line-through';
+      }
+
+      li.insertBefore(cb, li.firstChild);
+      li.addEventListener('click', function(e) {
+        if (e.target !== cb) cb.click();
+      });
+    });
+
+    document.querySelectorAll('.task-card').forEach(function(card, i) {
+      const id = 'card-' + i;
+      const head = card.querySelector('.tc-head');
+      const titleEl = card.querySelector('.tc-title');
+      if (!head) return;
+
+      const isDone = card.classList.contains('is-done');
+      const overrideChecked = checks[id];
+      const overrideUnchecked = checks[id + '_unchecked'];
+
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = overrideChecked ? true : (overrideUnchecked ? false : isDone);
+      cb.style.cssText = 'width:15px;height:15px;cursor:pointer;flex-shrink:0;accent-color:#06c755;margin-right:4px;';
+      cb.title = '標記此任務完成';
+
+      function applyState(checked) {
+        if (checked) {
+          titleEl && (titleEl.style.opacity = '0.45');
+          titleEl && (titleEl.style.textDecoration = 'line-through');
+          card.style.opacity = '0.6';
+        } else {
+          titleEl && (titleEl.style.opacity = '');
+          titleEl && (titleEl.style.textDecoration = '');
+          card.style.opacity = '';
+        }
+      }
+      applyState(cb.checked);
+
+      cb.addEventListener('change', function(e) {
+        e.stopPropagation();
+        const d = loadChecks();
+        if (this.checked) {
+          d[id] = true;
+          delete d[id + '_unchecked'];
+        } else {
+          delete d[id];
+          d[id + '_unchecked'] = true;
+        }
+        saveChecks(d);
+        applyState(this.checked);
+      });
+
+      head.insertBefore(cb, head.firstChild);
+    });
+  });
+})();
+</script>
+</body>
+</html>

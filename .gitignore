@@ -7,3 +7,7 @@ venv/
 *.log
 line_bot.db*
 [LINE]*.txt
+gemini_usage.json
+quota_state.json
+alert_state.json
+pending_explicit_reply.json

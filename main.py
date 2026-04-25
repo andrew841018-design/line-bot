@@ -16,11 +16,13 @@ LINE → FastAPI webhook → Gemini → LINE
 """
 from __future__ import annotations
 
+import json as _json
 import logging
 import mimetypes
 import os
 import re
 import time
+import uuid as _uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -1157,7 +1159,8 @@ def _extract_office_text(data: bytes, file_name: str) -> str | None:
             doc = Document(io.BytesIO(data))
             return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
         if ext in ("xlsx", "xls"):
-            import openpyxl, io
+            import openpyxl
+            import io
             wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
             lines = []
             for sheet in wb.worksheets:
@@ -1413,8 +1416,6 @@ def _quota_exhausted_message() -> str:
 
 # ── Pending（quota 爆時的所有訊息，恢復後由 Gemini 分組 + 引用回覆） ──────────
 
-import json as _json
-import uuid as _uuid
 _PENDING_EXPLICIT_PATH = os.path.join(os.path.dirname(__file__), "pending_explicit_reply.json")
 _PENDING_MEDIA_DIR = os.path.join(os.path.dirname(__file__), "pending_media")
 
@@ -1865,7 +1866,7 @@ def _handle_join(event: JoinEvent) -> None:
     # 1. 立即 reply 一則 welcome 訊息（搶在被踢之前）
     try:
         _reply(event.reply_token, f"我被加入了！{source_type}_id={target_id}")
-        print(f"[JOIN] reply sent", flush=True)
+        print("[JOIN] reply sent", flush=True)
     except Exception as e:
         print(f"[JOIN] reply FAILED: {e}", flush=True)
 
