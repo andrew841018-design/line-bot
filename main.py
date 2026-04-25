@@ -1686,6 +1686,12 @@ def _process_pending_on_startup() -> None:
             _clear_pending_explicit(group_id)
             continue
 
+        # __bot__ 條目不應出現在 pending（recovery 污染防護，正常 flow 不會有）
+        items = [it for it in items if it.get("user_id") != "__bot__"]
+        if not items:
+            _clear_pending_explicit(group_id)
+            continue
+
         # Step 1：分組
         groups = _gemini_group_messages(items)
         logger.info("startup: group=%s items=%d groups=%d", group_id, len(items), len(groups))
@@ -2251,6 +2257,44 @@ def _md_to_line(text: str) -> str:
     return "\n".join(out)
 
 
+def _pop_pending_for_piggyback(group_id: str) -> str | None:
+    """pending 有訊息且 push 額度耗盡時，從佇列頭取最多 5 則文字，
+    生成回覆，格式化成可附在 reply_message 裡的第 2 則訊息。
+    成功回格式化字串並從 pending 移除；失敗回 None，pending 不動。"""
+    pending = _load_pending_explicit()
+    items = pending.get(group_id, [])
+    if not items:
+        return None
+
+    batch = [it for it in items[:5] if it.get("type") == "text" and (it.get("text") or "").strip()]
+    if not batch:
+        # 非文字批次直接跳過（不處理）
+        return None
+
+    original = "\n".join(it["text"].strip() for it in batch)
+    try:
+        facts = memory.top_facts(group_id)
+        context = memory.get_context(group_id)
+        pnotes = _get_persona_notes(group_id)
+        reply_text = _llm_chat(original, context, facts, pnotes)
+    except Exception:
+        return None
+
+    if not reply_text:
+        return None
+
+    # 移出 pending（只移成功處理的 5 則）
+    processed_ids = {it.get("message_id") for it in batch}
+    pending[group_id] = [it for it in items if it.get("message_id") not in processed_ids]
+    if not pending[group_id]:
+        del pending[group_id]
+    _save_pending_explicit_raw(pending)
+
+    orig_preview = original[:300] + ("…" if len(original) > 300 else "")
+    reply_preview = _md_to_line(reply_text)
+    return f"📬 補回之前漏掉的訊息\n\n原文：\n{orig_preview}\n\n回應：\n{reply_preview}"
+
+
 def _reply(reply_token: str, text: str, group_id: str | None = None) -> None:
     """
     回覆 LINE 訊息。若帶 group_id,成功後會把 bot 的回覆也存進 raw_messages,
@@ -2277,13 +2321,20 @@ def _reply(reply_token: str, text: str, group_id: str | None = None) -> None:
                     group_id, len(text), text[:120])
         return
 
+    # push 額度耗盡時，偷塞 pending 進同一則 reply_message（免費）
+    messages_to_send: list = [TextMessage(text=text)]
+    if group_id:
+        pig = _pop_pending_for_piggyback(group_id)
+        if pig:
+            messages_to_send.append(TextMessage(text=pig[:5000]))
+
     resp = None
     try:
         with ApiClient(_line_config) as api_client:
             resp = MessagingApi(api_client).reply_message(
                 ReplyMessageRequest(
                     reply_token=reply_token,
-                    messages=[TextMessage(text=text)],
+                    messages=messages_to_send,
                 )
             )
     except Exception as e:
