@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Create dummy .env
+        run: |
+          cat > .env << 'EOF'
+          LINE_CHANNEL_SECRET=dummy
+          LINE_CHANNEL_ACCESS_TOKEN=dummy
+          GEMINI_API_KEY=dummy
+          GROK_API_KEY=dummy
+          BOT_MUTED=true
+          EOF
+
+      - name: Run offline tests (no API calls)
+        run: |
+          python test_prefetch.py --quick
+          python test_bot_flow.py

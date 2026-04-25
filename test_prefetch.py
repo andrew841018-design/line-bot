@@ -151,7 +151,7 @@ def test_system_prompt():
 
     # 言簡意賅
     check("風格: 言簡意賅", "言簡意賅" in _SYSTEM_PROMPT)
-    check("Rule: 不插嘴", "不要主動插嘴" in _SYSTEM_PROMPT)
+    check("Rule: 不插嘴", "不主動插嘴" in _SYSTEM_PROMPT)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
