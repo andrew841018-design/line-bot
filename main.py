@@ -70,7 +70,6 @@ import bot_stats
 import burst_filter
 import feedback_collector
 import gemini_client
-import grok_client
 import memory
 import review
 from config import settings
@@ -112,10 +111,7 @@ _line_config = Configuration(access_token=settings.line_channel_access_token)
 def _get_quota_footer() -> str:
     """每次回應時附上今日用量百分比，失敗回空字串。"""
     if _quota_exhausted():
-        grok_info = grok_client.get_quota_info()
-        if grok_info["remaining"] > 0:
-            return f"\n\n📊 Gemini 已用完，切換 Grok（剩 {grok_info['remaining']} 次）"
-        return "\n\n📊 Gemini + Grok 今日用量已用完"
+        return "\n\n📊 Gemini 今日用量已用完"
     info = gemini_client.get_gemini_quota_info()
     if info is None:
         return ""
@@ -141,20 +137,13 @@ def _llm_chat(
     facts: list[str],
     pnotes: list[dict] | None = None,
 ) -> str:
-    """Gemini → Grok fallback。呼叫端不需要感知用哪個 provider。"""
-    if not _quota_exhausted():
-        result = gemini_client.chat(user_input, context, facts, pnotes)
-        if result:
-            bot_stats.track_reply("gemini")
-        return result
-    # Gemini 已用完，嘗試 Grok（純文字 fallback，不支援圖片）
-    text_input = user_input if isinstance(user_input, str) else ""
-    if text_input and settings.grok_api_key:
-        result = grok_client.chat(text_input, context, facts, pnotes)
-        if result:
-            bot_stats.track_reply("grok")
-            return result
-    return ""
+    """Gemini chat。quota 爆時直接回空字串（caller 自行判斷）。"""
+    if _quota_exhausted():
+        return ""
+    result = gemini_client.chat(user_input, context, facts, pnotes)
+    if result:
+        bot_stats.track_reply("gemini")
+    return result
 
 
 # ── URL 預抓取（繞過 Gemini url_context 的限制）─────────────────────────────
@@ -1407,7 +1396,6 @@ def _next_gemini_reset_tw() -> tuple[str, str]:
 _QUOTA_STATE_FILE = os.path.join(os.path.dirname(__file__), "quota_state.json")
 _quota_exhausted_until_ts: float = 0.0
 _quota_notified_for_ts: float = 0.0
-_grok_intro_sent_groups: set[str] = set()  # 每次 process 前只推一次 intro，不重複
 
 
 def _load_quota_state() -> None:
@@ -1679,11 +1667,7 @@ def _gemini_group_messages(items: list[dict]) -> list[dict]:
         logger.info("group gemini: %d items → %d groups", len(items), len(clean))
         return clean
     except Exception as e:
-        logger.warning("gemini group failed, trying grok: %s", str(e)[:200])
-        result = grok_client.group_messages(items)
-        if result is not None:
-            return result
-        logger.warning("grok group also failed, fallback to each-alone")
+        logger.warning("gemini group failed, fallback to heuristic: %s", str(e)[:200])
         return _heuristic_group_messages(items)
 
 
@@ -1747,7 +1731,7 @@ def _build_group_parts(items: list[dict], group_id: str) -> list:
 @app.on_event("startup")
 def _process_pending_on_startup() -> None:
     """uvicorn 啟動時處理所有 pending：分組 → 逐組 LLM 回覆 → 引用推送。
-    Gemini 耗盡時自動用 Grok fallback；兩者都耗盡才放棄。
+    Gemini 耗盡時保留 pending 不處理，等 quota 重置後重試。
     """
     _load_quota_state()  # 先還原 quota 狀態，再決定要不要跑
     if settings.bot_muted:
@@ -1755,35 +1739,9 @@ def _process_pending_on_startup() -> None:
     pending = _load_pending_explicit()
     if not pending:
         return
-    gemini_gone = _quota_exhausted()
-    grok_gone = grok_client.quota_exhausted()
-    if gemini_gone and grok_gone:
-        logger.info(
-            "startup: both Gemini and Grok exhausted, keep pending for next time"
-        )
+    if _quota_exhausted():
+        logger.info("startup: Gemini exhausted, keep pending for next time")
         return
-    if gemini_gone:
-        logger.info(
-            "startup: Gemini exhausted, will use Grok fallback for pending messages"
-        )
-        # 每個 group 只推一次 intro（重複觸發時不再發）
-        for group_id in pending:
-            if group_id not in _grok_intro_sent_groups:
-                try:
-                    with ApiClient(_line_config) as api_client:
-                        MessagingApi(api_client).push_message(
-                            PushMessageRequest(
-                                to=group_id,
-                                messages=[
-                                    TextMessage(
-                                        text="Gemini 今日用量已用完，接下來由 Grok agent 代為回覆之前積累的訊息，回覆品質可能略有不同～"
-                                    )
-                                ],
-                            )
-                        )
-                    _grok_intro_sent_groups.add(group_id)
-                except Exception:
-                    pass
 
     for group_id, items in list(pending.items()):
         if isinstance(items, dict):  # 舊格式相容
@@ -1882,25 +1840,40 @@ def _process_pending_on_startup() -> None:
             continue
 
         _clear_pending_explicit(group_id)
-        _grok_intro_sent_groups.discard(
-            group_id
-        )  # 下次 Gemini 再度 exhaust 時可重新發 intro
         logger.info("startup: group=%s all pending cleared", group_id)
 
 
+_PENDING_RETRY_INTERVAL_SEC = 6 * 60 * 60        # 6 小時跑一次（從 30 min 降頻，避免吃光每日 quota）
+_PENDING_RETRY_QUOTA_RESERVE = 0.40              # 至少留 40% quota 給新訊息（不讓 retry 把 quota 全吃光）
+
+def _has_enough_quota_for_retry() -> bool:
+    """retry 前先檢查：今日 quota 用了 ≥ 60% 就停（保留 40% 給新訊息）。"""
+    info = gemini_client.get_gemini_quota_info()
+    if info is None:
+        return True
+    used_ratio = info["used_requests"] / max(info["limit_requests"], 1)
+    return used_ratio < (1.0 - _PENDING_RETRY_QUOTA_RESERVE)
+
+
 def _start_pending_retry_worker() -> None:
-    """背景執行緒每 30 分鐘自動重試 pending，不依賴重啟或 TCC 權限。"""
+    """背景執行緒定期重試 pending；加 quota gate 避免吃光每日額度。"""
     import threading as _threading
 
     def _worker():
         while True:
-            _threading.Event().wait(30 * 60)
-            if _load_pending_explicit() and not _quota_exhausted():
-                logger.info("pending retry worker: quota available, processing pending")
-                try:
-                    _process_pending_on_startup()
-                except Exception as e:
-                    logger.exception("pending retry worker failed: %s", e)
+            _threading.Event().wait(_PENDING_RETRY_INTERVAL_SEC)
+            if not _load_pending_explicit():
+                continue
+            if _quota_exhausted():
+                continue
+            if not _has_enough_quota_for_retry():
+                logger.info("pending retry worker: quota usage > 60%%, skip to preserve for new messages")
+                continue
+            logger.info("pending retry worker: quota available + sufficient, processing pending")
+            try:
+                _process_pending_on_startup()
+            except Exception as e:
+                logger.exception("pending retry worker failed: %s", e)
 
     t = _threading.Thread(target=_worker, daemon=True, name="pending-retry")
     t.start()

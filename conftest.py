@@ -37,7 +37,6 @@ def reset_main_globals():
     # ── before ────────────────────────────────────────────────────────────
     main._quota_exhausted_until_ts = 0.0
     main._quota_notified_for_ts = 0.0
-    main._grok_intro_sent_groups.clear()
     main._PENDING_EXPLICIT_PATH = _ORIG_PENDING_PATH
     main._QUOTA_STATE_FILE = tmp_quota_path  # isolate file I/O
     main.settings.bot_muted = True
@@ -48,7 +47,6 @@ def reset_main_globals():
     # ── after ─────────────────────────────────────────────────────────────
     main._quota_exhausted_until_ts = 0.0
     main._quota_notified_for_ts = 0.0
-    main._grok_intro_sent_groups.clear()
     main._PENDING_EXPLICIT_PATH = _ORIG_PENDING_PATH
     main._QUOTA_STATE_FILE = _ORIG_QUOTA_STATE_FILE
     main.settings.bot_muted = _ORIG_BOT_MUTED

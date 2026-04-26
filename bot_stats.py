@@ -100,7 +100,7 @@ def track_message(text: str) -> None:
 
 
 def track_reply(provider: str) -> None:
-    """成功回覆時呼叫。provider = 'gemini' | 'grok'。"""
+    """成功回覆時呼叫。provider = 'gemini'（保留 param 為 future compat）。"""
     increment("reply_sent")
     increment(f"reply_{provider}")
 
@@ -156,13 +156,12 @@ def summary_report(days: int = 30) -> str:
     total_pending = sum(d.get("msg_pending_saved", 0) for d in data)
     total_push = sum(d.get("line_push_used", 0) for d in data)
     total_gemini = sum(d.get("reply_gemini", 0) for d in data)
-    total_grok = sum(d.get("reply_grok", 0) for d in data)
 
     lines.append(
         f"收到訊息：{total_received} 則（平均 {total_received // max(len(data), 1)}/天）"
     )
     lines.append(
-        f"成功回覆：{total_replies} 則（Gemini {total_gemini} / Grok {total_grok}）"
+        f"成功回覆：{total_replies} 則（Gemini {total_gemini}）"
     )
     lines.append(f"存入 pending：{total_pending} 則（quota 爆時）")
     lines.append(f"LINE push 用量：{total_push} 則（免費上限 200/月）")
