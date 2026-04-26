@@ -355,6 +355,65 @@ def line_bot_suggestions() -> str:
 # ── 8. AI+DE 職缺建議 ─────────────────────────────────────────────────────────
 
 
+def _parse_source_breakdown(text: str) -> tuple[dict, dict]:
+    """從報告抽出兩張表：
+    - per_source_total: {source: (raw_total, ok_keyword_count, total_keyword_count)}
+    - jd_fetch: {source: (attempted, succeeded, inline)}
+    """
+    import re
+
+    per_source: dict = {}
+    jd_fetch: dict = {}
+
+    # ── 各來源抓取明細表（5 欄：平台 | 類別 | Keyword | 抓回 | 狀態）─────────
+    in_per_kw = False
+    for line in text.splitlines():
+        if "## 🔍 各來源抓取明細" in line:
+            in_per_kw = True
+            continue
+        if in_per_kw:
+            if line.startswith("###") or line.startswith("---") or line.startswith("# "):
+                in_per_kw = False
+                continue
+            stripped = line.strip()
+            if not stripped.startswith("|") or stripped.startswith("|---") or stripped.startswith("| 平台"):
+                continue
+            cols = [c.strip() for c in stripped.split("|") if c.strip()]
+            if len(cols) < 5:
+                continue
+            source, _cat, _kw, raw, status = cols[0], cols[1], cols[2], cols[3], cols[4]
+            try:
+                raw_n = int(raw)
+            except ValueError:
+                continue
+            ok = status.startswith("✅")
+            cur = per_source.get(source, (0, 0, 0))
+            per_source[source] = (cur[0] + raw_n, cur[1] + (1 if ok else 0), cur[2] + 1)
+
+    # ── JD 內文 fetch 結果表（4 欄：平台 | 嘗試 | 成功 | listing 內含）─────
+    in_jd = False
+    for line in text.splitlines():
+        if "JD 內文 fetch 結果" in line:
+            in_jd = True
+            continue
+        if in_jd:
+            if line.startswith("---") or line.startswith("# "):
+                in_jd = False
+                continue
+            stripped = line.strip()
+            if not stripped.startswith("|") or stripped.startswith("|---") or stripped.startswith("| 平台"):
+                continue
+            cols = [c.strip() for c in stripped.split("|") if c.strip()]
+            if len(cols) < 4:
+                continue
+            try:
+                jd_fetch[cols[0]] = (int(cols[1]), int(cols[2]), int(cols[3]))
+            except ValueError:
+                continue
+
+    return per_source, jd_fetch
+
+
 def job_search_summary() -> str:
     today = datetime.now().strftime("%Y-%m-%d")
     report = Path(f"/Users/andrew/Desktop/andrew/job_search/{today}.md")
@@ -381,7 +440,6 @@ def job_search_summary() -> str:
         in_must = False
         for line in text.splitlines():
             if "🔴 必投" in line:
-                section_label = "DE" if "DE" in line else "AI"
                 in_must = True
                 continue
             if in_must:
@@ -406,11 +464,31 @@ def job_search_summary() -> str:
                             url = m.group(0)[1:-1]
                         must_apply.append(f"• {company} — {title} (S{score}) {url}")
 
-        if not summary_lines and not must_apply:
+        # 多來源 breakdown（聚合 per source）
+        per_source, jd_fetch = _parse_source_breakdown(text)
+
+        if not summary_lines and not must_apply and not per_source:
             return "💼 **今日職缺**：今天沒有適合的職缺"
 
         lines = ["💼 **今日職缺 (AI+DE)**"]
         lines += summary_lines[:4]
+
+        if per_source:
+            lines.append("🔍 **各來源**")
+            # 按 raw 數降冪
+            for src, (raw, ok, total) in sorted(per_source.items(), key=lambda x: -x[1][0]):
+                mark = "" if ok == total else f" ({ok}/{total} ✅)"
+                lines.append(f"- {src}: {raw}{mark}")
+
+        if jd_fetch:
+            inline_total = sum(v[2] for v in jd_fetch.values())
+            attempted_total = sum(v[0] for v in jd_fetch.values())
+            succeeded_total = sum(v[1] for v in jd_fetch.values())
+            if attempted_total or inline_total:
+                lines.append(
+                    f"📥 **JD**：fetch {succeeded_total}/{attempted_total}, listing 內含 {inline_total}"
+                )
+
         if must_apply:
             lines.append("**🔴 必投：**")
             lines += must_apply[:5]

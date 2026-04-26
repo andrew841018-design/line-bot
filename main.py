@@ -2507,10 +2507,16 @@ def _reply(reply_token: str, text: str, group_id: str | None = None) -> None:
         return
 
     # push 額度耗盡時，偷塞 pending 進同一則 reply_message（免費）
+    # LINE reply_message 上限 5 則 → 1 則實回覆 + 最多 4 則 piggyback
+    # 「能塞多少塞多少」：迴圈 pop pending 直到滿載或 pending 空
     messages_to_send: list = [TextMessage(text=text)]
     if group_id:
-        pig = _pop_pending_for_piggyback(group_id)
-        if pig:
+        for _ in range(4):
+            if _quota_exhausted():
+                break
+            pig = _pop_pending_for_piggyback(group_id)
+            if not pig:
+                break
             messages_to_send.append(TextMessage(text=pig[:5000]))
 
     resp = None
