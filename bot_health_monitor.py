@@ -55,6 +55,88 @@ CHITCHAT_EXACT = {
 }
 
 
+def http_health() -> tuple[bool, int]:
+    """curl /health，回 (ok, http_code)。pgrep 活但 /health 死 = 殭屍狀態（如 import error）。"""
+    try:
+        r = subprocess.run(
+            ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+             "--interface", "lo0", "--max-time", "5",
+             "http://localhost:8080/health"],
+            capture_output=True, text=True, timeout=8,
+        )
+        code = int((r.stdout or "0").strip() or 0)
+        return code == 200, code
+    except Exception:
+        return False, 0
+
+
+def line_token_check() -> tuple[bool, str]:
+    """打 LINE /v2/bot/info 驗 access_token 還有效。不計入月配額。"""
+    token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+    if not token:
+        return False, "no_token_in_env"
+    try:
+        import requests
+        r = requests.get(
+            "https://api.line.me/v2/bot/info",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=8,
+        )
+        if r.status_code == 200:
+            return True, ""
+        return False, f"HTTP {r.status_code}: {r.text[:100]}"
+    except Exception as e:
+        return False, str(e)[:100]
+
+
+def webhook_endpoint_check() -> tuple[bool, str]:
+    """打 LINE /v2/bot/channel/webhook/test 端到端探測 webhook 是否能收到事件。
+    LINE 會打一個 test event 到目前設定的 webhook URL，若 endpoint 200 才算成功。
+    """
+    token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+    if not token:
+        return False, "no_token_in_env"
+    try:
+        import requests
+        r = requests.post(
+            "https://api.line.me/v2/bot/channel/webhook/test",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return False, f"HTTP {r.status_code}: {r.text[:120]}"
+        body = r.json() if r.content else {}
+        # success = true 表示 LINE 成功打到 webhook 並收到 200
+        if body.get("success"):
+            return True, ""
+        return False, f"webhook test 不回 200: {body.get('detail') or body}"
+    except Exception as e:
+        return False, str(e)[:120]
+
+
+def sqlite_integrity_check() -> tuple[bool, str]:
+    """PRAGMA integrity_check — 偵測 DB 損毀。回 (ok, msg)。"""
+    if not DB_FILE.exists():
+        return True, ""  # 沒檔不算錯（剛部署）
+    try:
+        conn = sqlite3.connect(str(DB_FILE), timeout=5)
+        cur = conn.cursor()
+        cur.execute("PRAGMA integrity_check")
+        rows = cur.fetchall()
+        conn.close()
+        result = (rows[0][0] if rows else "").strip() if rows else ""
+        if result == "ok":
+            return True, ""
+        return False, result[:200]
+    except sqlite3.DatabaseError as e:
+        return False, f"DatabaseError: {e}"
+    except Exception as e:
+        return False, str(e)[:120]
+
+
 def probe_gemini(model: str) -> tuple[bool, str]:
     """打一次最小的 Gemini call，回 (success, error_msg)。"""
     try:
@@ -273,26 +355,62 @@ def main() -> int:
     state = load_health_state()
     last_alert_ts = float(state.get("last_alert_ts", 0))
 
-    issues_l0: list[str] = []  # uvicorn / cloudflared 死掉的緊急處理
+    issues_l0: list[str] = []  # 緊急修復項
 
-    # ── L0 進程存活：uvicorn + cloudflared 死掉就直接重啟 ──────────────────
+    # ── L0a uvicorn 進程 + HTTP 200 雙重檢查（pgrep 活但 /health 死 = 殭屍） ─
     uvicorn_up = proc_alive("uvicorn.*main:app")
-    cloudflared_up = proc_alive("cloudflared tunnel")
+    health_ok, health_code = (False, 0)
+    if uvicorn_up:
+        health_ok, health_code = http_health()
+        if not health_ok:
+            # 進程活但 /health 死 → 殭屍狀態（多半是 import error 或 hung）→ 重啟
+            issues_l0.append(
+                f"🟡 uvicorn 殭屍：進程在但 /health = HTTP {health_code}（可能 import error）"
+            )
+            uvicorn_up = False  # 強制走重啟分支
 
     if not uvicorn_up:
         ok = restart_uvicorn()
         if ok:
-            issues_l0.append("✅ uvicorn 偵測死亡 → 自動重啟成功")
+            issues_l0.append("✅ uvicorn 死亡 → 自動重啟成功")
             uvicorn_up = True
         else:
-            issues_l0.append("🔴 uvicorn 死亡 → 自動重啟失敗，需手動處理")
+            issues_l0.append(
+                "🔴 uvicorn 死亡 → 重啟失敗（很可能是 import / syntax error），"
+                "請看 /tmp/line_bot_health_restart.log"
+            )
 
+    # ── L0b cloudflared 隧道存活 ──────────────────────────────────────────
+    cloudflared_up = proc_alive("cloudflared tunnel")
     if not cloudflared_up:
         ok, url = restart_cloudflared()
         if ok and url:
-            issues_l0.append(f"✅ cloudflared 偵測死亡 → 自動重啟 + LINE webhook 更新為 {url}/callback")
+            issues_l0.append(
+                f"✅ cloudflared 死亡 → 自動重啟 + LINE webhook 更新為 {url}/callback"
+            )
         else:
-            issues_l0.append("🔴 cloudflared 死亡 → 自動重啟失敗（沒抓到新 URL）")
+            issues_l0.append("🔴 cloudflared 死亡 → 重啟失敗（沒抓到新 URL）")
+
+    # ── L0c LINE token 有效性（不計月配額）────────────────────────────────
+    token_ok, token_err = line_token_check()
+    if not token_ok:
+        issues_l0.append(f"🔴 LINE token 失效：{token_err}")
+
+    # ── L0d Webhook 端到端探測（每天最多 1 次，省事件配額）───────────────
+    last_webhook_check = float(state.get("last_webhook_check_ts", 0))
+    if uvicorn_up and cloudflared_up and token_ok and now.timestamp() - last_webhook_check > 86400:
+        wh_ok, wh_err = webhook_endpoint_check()
+        state["last_webhook_check_ts"] = now.timestamp()
+        if not wh_ok:
+            issues_l0.append(f"🔴 Webhook 端到端探測失敗：{wh_err}")
+
+    # ── L0e SQLite integrity_check（每天 1 次，避免每 30 分鎖 DB）─────────
+    last_db_check = float(state.get("last_db_check_ts", 0))
+    if now.timestamp() - last_db_check > 86400:
+        db_ok, db_err = sqlite_integrity_check()
+        state["last_db_check_ts"] = now.timestamp()
+        if not db_ok:
+            issues_l0.append(f"🔴 SQLite 損毀：{db_err}")
 
     # ── L1 bot 自認狀態（free）────────────────────────────────────────────
     qstate = read_quota_state()
