@@ -291,69 +291,87 @@ def _save_dynamic_quotes(d: dict) -> None:
         pass
 
 
-def _try_append_today_quote() -> None:
-    """每天嘗試抓新雞湯加入 dynamic 池（fail-safe，不影響主流程）。
+def _today_market_snapshot() -> str:
+    """每日市場即時數據 + 頭條，當作雞湯的「今日佐證」附加。
 
-    來源策略（按順序試，第一個成功即停）：
-      1. Investopedia「Quote of the Day」（每日金融金句）
-      2. 鉅亨網每日 highlight 引言（如有）
+    來源（fail-soft，每個獨立試）：
+      1. VIX 恐慌指數（yfinance）
+      2. CNN Fear & Greed Index
+      3. 鉅亨網台股頭條
+      4. 鉅亨網全球財經頭條
 
-    抓到後歸桶 + 去重（quote 字串完全相同視為重複）+ 寫回 json。
-    抓不到完全沉默，不擋整體 briefing。
+    回傳：單行字串，例如「VIX 18.7（中性）｜鉅亨：大台積電時代來臨」
+    完全抓不到回空字串。
     """
-    try:
-        import requests
-        from bs4 import BeautifulSoup
-    except ImportError:
-        return
+    parts = []
 
-    new_quote = None
-    new_evidence = None
-
-    # 來源 1：Investopedia Quote of the Day（HTML 結構穩定多年）
+    # 1. VIX
     try:
-        r = requests.get(
-            "https://www.investopedia.com/financial-quote-of-the-day-4774908",
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=8,
-        )
-        if r.status_code == 200:
-            soup = BeautifulSoup(r.text, "lxml")
-            blockquote = soup.find("blockquote")
-            if blockquote:
-                quote_text = blockquote.get_text(" ", strip=True)
-                if 20 <= len(quote_text) <= 200:
-                    new_quote = quote_text
-                    new_evidence = f"📰 Investopedia Quote of the Day, {datetime.now().strftime('%Y-%m-%d')}"
+        import yfinance as yf
+        vix = yf.Ticker("^VIX")
+        vix_price = float(vix.fast_info.last_price)
+        # VIX 區間判定
+        if vix_price < 12:
+            vix_label = "極低"
+        elif vix_price < 18:
+            vix_label = "中性偏低"
+        elif vix_price < 25:
+            vix_label = "中性"
+        elif vix_price < 35:
+            vix_label = "偏高"
+        else:
+            vix_label = "極高恐慌"
+        parts.append(f"VIX {vix_price:.1f}（{vix_label}）")
     except Exception:
         pass
 
-    if not new_quote:
-        return
+    # 2. CNN Fear & Greed（公開 dataviz API，0-100）
+    try:
+        import requests
+        r = requests.get(
+            f"https://production.dataviz.cnn.io/index/fearandgreed/graphdata/{datetime.now().strftime('%Y-%m-%d')}",
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+                "Accept": "application/json, text/plain, */*",
+                "Origin": "https://edition.cnn.com",
+                "Referer": "https://edition.cnn.com/",
+            },
+            timeout=8,
+        )
+        if r.status_code == 200:
+            d = r.json()
+            cur = d.get("fear_and_greed", {})
+            score = cur.get("score")
+            rating = cur.get("rating", "")
+            if score is not None:
+                rating_zh = {
+                    "extreme fear": "極度恐懼", "fear": "恐懼",
+                    "neutral": "中性", "greed": "貪婪",
+                    "extreme greed": "極度貪婪",
+                }.get(rating.lower(), rating)
+                parts.append(f"F&G {score:.0f}（{rating_zh}）")
+    except Exception:
+        pass
 
-    # 用簡單 keyword heuristic 歸桶
-    txt = new_quote.lower()
-    if any(w in txt for w in ["greed", "bubble", "euphoria", "mania", "貪婪", "泡沫", "狂熱"]):
-        bucket = "雙過熱"
-    elif any(w in txt for w in ["caution", "discipline", "restraint", "patience", "紀律", "耐心", "謹慎"]):
-        bucket = "單過熱"
-    elif any(w in txt for w in ["fear", "panic", "blood", "crash", "恐懼", "恐慌", "崩盤"]):
-        bucket = "深跌"
-    elif any(w in txt for w in ["opportunity", "buy", "value", "discount", "便宜", "機會", "買進"]):
-        bucket = "買區"
-    else:
-        bucket = "中性"
+    # 3. 鉅亨網頭條
+    try:
+        import requests
+        r = requests.get(
+            "https://api.cnyes.com/media/api/v1/newslist/category/headline?limit=1",
+            timeout=8,
+        )
+        if r.status_code == 200:
+            items = r.json().get("items", {}).get("data", [])
+            if items:
+                title = items[0].get("title", "").strip()
+                if title:
+                    parts.append(f"鉅亨：{title[:50]}")
+    except Exception:
+        pass
 
-    dyn = _load_dynamic_quotes()
-    bucket_list = dyn.get(bucket, [])
-    # 去重：quote 字串相同視為重複
-    if any(q == new_quote for q, _ in bucket_list):
-        return
-    if any(q == new_quote for q, _ in _BASE_QUOTES.get(bucket, [])):
-        return
-    bucket_list.append((new_quote, new_evidence))
-    dyn[bucket] = bucket_list
-    _save_dynamic_quotes(dyn)
+    if not parts:
+        return ""
+    return "📰 今日：" + " ｜ ".join(parts)
 
 
 def _merged_pool(bucket: str) -> list:
@@ -533,6 +551,9 @@ def sox_sentiment() -> str:
         elif both_sell:
             lines.append("⚠️ **雙線同時過熱 → 注意減碼風險**")
         lines.append(_market_quote(bias_20, bias_60))
+        snapshot = _today_market_snapshot()
+        if snapshot:
+            lines.append(snapshot)
         return "\n".join(lines)
     except Exception as e:
         return f"📈 **費半指數** ⚠️ 抓取失敗：{e}"
@@ -948,9 +969,6 @@ def main():
     suggestions = line_bot_suggestions()
     if suggestions:
         sections += ["", suggestions]
-
-    # 每天嘗試抓一句新雞湯加進 dynamic 池（fail-safe，抓不到不影響）
-    _try_append_today_quote()
 
     sox = sox_sentiment()
     if sox:
