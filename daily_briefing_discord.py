@@ -101,22 +101,47 @@ def upcoming_birthdays() -> str:
     return "\n".join(lines)
 
 
+_PENDING_TODOS_FILE = LINE_BOT_DIR / "pending_todos.json"
+
+
+def _load_pending_todos() -> list:
+    """讀一次性待辦（處理完手動從 json 移除）。"""
+    if not _PENDING_TODOS_FILE.exists():
+        return []
+    try:
+        with open(_PENDING_TODOS_FILE) as f:
+            data = _json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
 def daily_todos() -> str:
     now = datetime.now()
     today = now.strftime("%m/%d")
     weekday = ["一", "二", "三", "四", "五", "六", "日"][now.weekday()]
     push_time = now.strftime("%H:%M")
-    return (
-        f"📌 **每日待辦** ({today} 週{weekday} {push_time})\n"
-        "• Mock interview 做了嗎？\n"
-        "• IBM 影片看了 30 分鐘嗎？\n"
-        "• 學車相關影片看了一則嗎？\n"
-        "• Code review 做了嗎？\n"
-        "• 小說看了 1.5 小時嗎？\n"
-        "• 重訓了 1 小時嗎？\n"
-        "• 讀經禱告了嗎？\n"
-        "• 寫日記了嗎？"
-    )
+
+    lines = [f"📌 **每日待辦** ({today} 週{weekday} {push_time})"]
+
+    # 一次性 urgent todos 排在前面（處理完叫 Claude 從 pending_todos.json 移除）
+    pending = _load_pending_todos()
+    for item in pending:
+        lines.append(f"🚨 {item}")
+    if pending:
+        lines.append("─────")
+
+    lines += [
+        "• Mock interview 做了嗎？",
+        "• IBM 影片看了 30 分鐘嗎？",
+        "• 學車相關影片看了一則嗎？",
+        "• Code review 做了嗎？",
+        "• 小說看了 1.5 小時嗎？",
+        "• 重訓了 1 小時嗎？",
+        "• 讀經禱告了嗎？",
+        "• 寫日記了嗎？",
+    ]
+    return "\n".join(lines)
 
 
 # ── 2. 爬蟲狀態 ──────────────────────────────────────────────────────────────
