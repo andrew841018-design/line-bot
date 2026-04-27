@@ -228,6 +228,111 @@ def save_health_state(d: dict) -> None:
         pass
 
 
+def autofix_webhook_endpoint() -> tuple[bool, str]:
+    """讀 cloudflared.log 抓目前 URL，PUT 到 LINE webhook endpoint。
+    解決「cloudflared 沒死但 URL drift」這類常見故障。
+    """
+    cf_log = BASE / "cloudflared.log"
+    if not cf_log.exists():
+        return False, "no cloudflared.log"
+    try:
+        import re as _re
+        urls = _re.findall(r"https://[a-z0-9-]+\.trycloudflare\.com", cf_log.read_text())
+        if not urls:
+            return False, "no URL in cloudflared.log"
+        latest = urls[-1]
+        token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+        if not token:
+            return False, "no LINE token"
+        import requests
+        r = requests.put(
+            "https://api.line.me/v2/bot/channel/webhook/endpoint",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json={"endpoint": f"{latest}/callback"},
+            timeout=10,
+        )
+        if r.status_code == 200:
+            return True, f"{latest}/callback"
+        return False, f"PUT failed HTTP {r.status_code}: {r.text[:120]}"
+    except Exception as e:
+        return False, str(e)[:120]
+
+
+def autofix_sqlite() -> tuple[bool, str]:
+    """SQLite 損毀自修：備份 → .dump 到文字 → 匯入新檔 → 替換。"""
+    if not DB_FILE.exists():
+        return False, "DB file 不存在"
+    ts_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup = DB_FILE.with_suffix(f".db.corrupt-{ts_tag}.bak")
+    fresh = DB_FILE.with_suffix(".db.fresh")
+    dump_path = DB_FILE.with_suffix(".db.dump.sql")
+    try:
+        import shutil
+
+        shutil.copy2(DB_FILE, backup)
+        # 1. dump 損毀 DB 到 SQL 文字（.dump 對部分損毀容忍度較高）
+        with open(dump_path, "w") as fout:
+            r = subprocess.run(
+                ["sqlite3", str(DB_FILE), ".dump"],
+                stdout=fout, stderr=subprocess.PIPE, timeout=60,
+            )
+            if r.returncode != 0:
+                return False, f".dump failed: {r.stderr.decode()[:120]}"
+        # 2. 匯入到新 DB
+        if fresh.exists():
+            fresh.unlink()
+        r = subprocess.run(
+            ["sqlite3", str(fresh)],
+            stdin=open(dump_path), capture_output=True, timeout=60,
+        )
+        if r.returncode != 0:
+            return False, f"replay failed: {r.stderr.decode()[:120]}"
+        # 3. integrity check 新 DB
+        conn = sqlite3.connect(str(fresh))
+        chk = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        conn.close()
+        if chk != "ok":
+            return False, f"replayed DB still 不 ok: {chk[:100]}"
+        # 4. 殺 uvicorn → 替換 → 重啟（避免 WAL/SHM 衝突）
+        subprocess.run(["pkill", "-f", "uvicorn main:app"], capture_output=True, timeout=10)
+        time.sleep(2)
+        # 清舊的 -wal / -shm
+        for ext in ("-wal", "-shm"):
+            p = Path(str(DB_FILE) + ext)
+            if p.exists():
+                p.unlink()
+        os.replace(fresh, DB_FILE)
+        dump_path.unlink(missing_ok=True)
+        return True, f"備份在 {backup.name}"
+    except Exception as e:
+        return False, str(e)[:120]
+
+
+def autofix_via_uvicorn_restart(reason: str) -> bool:
+    """通用回血：重啟 uvicorn 解殭屍 / 觸發 startup pending drain。"""
+    return restart_uvicorn()
+
+
+def line_push_quota_likely_exhausted() -> bool:
+    """近 1 小時 uvicorn.log 是否頻繁出現 LINE push 429（月配額爆的特徵）。"""
+    log = BASE / "uvicorn.log"
+    if not log.exists():
+        return False
+    try:
+        with open(log, errors="ignore") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 200_000))
+            tail = f.read()
+        # 「push failed ((429)」是 LINE push API 的特徵
+        return tail.count("push failed ((429)") >= 3
+    except Exception:
+        return False
+
+
 def proc_alive(pattern: str) -> bool:
     r = subprocess.run(["pgrep", "-f", pattern], capture_output=True)
     return r.returncode == 0
@@ -396,21 +501,42 @@ def main() -> int:
     if not token_ok:
         issues_l0.append(f"🔴 LINE token 失效：{token_err}")
 
-    # ── L0d Webhook 端到端探測（每天最多 1 次，省事件配額）───────────────
+    # ── L0d Webhook 端到端探測 + 自修（每天 1 次）──────────────────────
     last_webhook_check = float(state.get("last_webhook_check_ts", 0))
     if uvicorn_up and cloudflared_up and token_ok and now.timestamp() - last_webhook_check > 86400:
         wh_ok, wh_err = webhook_endpoint_check()
         state["last_webhook_check_ts"] = now.timestamp()
         if not wh_ok:
-            issues_l0.append(f"🔴 Webhook 端到端探測失敗：{wh_err}")
+            # 先試「URL drift 修法」：拿 cloudflared 目前 URL 強制 PUT 給 LINE
+            fix_ok, fix_msg = autofix_webhook_endpoint()
+            if fix_ok:
+                wh_ok2, wh_err2 = webhook_endpoint_check()
+                if wh_ok2:
+                    issues_l0.append(f"✅ Webhook 自修成功：endpoint 改成 {fix_msg}")
+                else:
+                    issues_l0.append(
+                        f"🔴 Webhook 改完仍失敗（{wh_err2[:80]}）— 多半是 channel_secret 不對或 LINE Console 關閉了 webhook"
+                    )
+            else:
+                issues_l0.append(
+                    f"🔴 Webhook 端到端壞且無法自修：{wh_err[:80]} | 自修也失敗：{fix_msg[:80]}"
+                )
 
-    # ── L0e SQLite integrity_check（每天 1 次，避免每 30 分鎖 DB）─────────
+    # ── L0e SQLite integrity_check + 自修（每天 1 次）─────────────────────
     last_db_check = float(state.get("last_db_check_ts", 0))
     if now.timestamp() - last_db_check > 86400:
         db_ok, db_err = sqlite_integrity_check()
         state["last_db_check_ts"] = now.timestamp()
         if not db_ok:
-            issues_l0.append(f"🔴 SQLite 損毀：{db_err}")
+            fix_ok, fix_msg = autofix_sqlite()
+            if fix_ok:
+                # 自修後要重啟 uvicorn 重新拿 connection
+                restart_uvicorn()
+                issues_l0.append(f"✅ SQLite 損毀自修成功（{fix_msg}）+ uvicorn 重啟")
+            else:
+                issues_l0.append(
+                    f"🔴 SQLite 損毀且無法自修：{db_err[:80]} | 自修失敗：{fix_msg[:80]}"
+                )
 
     # ── L1 bot 自認狀態（free）────────────────────────────────────────────
     qstate = read_quota_state()
@@ -458,16 +584,62 @@ def main() -> int:
                 f"🔴 Gemini lite 也爆了（罕見）：{err[:80]}；等 PT 隔夜重置"
             )
 
+    # 自修頻率限制：避免自動重啟風暴（同一原因 60 分內不重複自修）
+    last_silent_fix = float(state.get("last_silent_autofix_ts", 0))
+    last_pending_fix = float(state.get("last_pending_autofix_ts", 0))
+    can_silent_fix = now.timestamp() - last_silent_fix > 3600
+    can_pending_fix = now.timestamp() - last_pending_fix > 3600
+
     if silent_anomaly:
-        issues.append(
-            f"🟡 對話異常：近 2 小時家人發了 {activity['user_substantive']} 則實質訊息，"
-            f"bot 一則都沒回（總用戶 {activity['user_msgs']} / bot {activity['bot_msgs']}）"
-        )
+        line_quota_dead = line_push_quota_likely_exhausted()
+        if line_quota_dead:
+            # LINE push 月配額爆 → 重啟也沒用，純通知
+            issues.append(
+                f"🔴 對話異常但無法自修：近 2h 家人 {activity['user_substantive']} 實質訊息 0 回，"
+                f"原因是 LINE push 月配額爆（uvicorn.log 多筆 push failed 429）。等 5/1 重置。"
+            )
+        elif can_silent_fix and not auto_fixed:
+            # 通用回血：重啟 uvicorn 解殭屍 / hung thread / state 卡住
+            ok = autofix_via_uvicorn_restart("silent_anomaly")
+            state["last_silent_autofix_ts"] = now.timestamp()
+            if ok:
+                auto_fixed = True
+                issues.append(
+                    f"✅ 對話異常自修：近 2h 家人 {activity['user_substantive']} 實質訊息 0 回 → 已重啟 uvicorn"
+                )
+            else:
+                issues.append(
+                    f"🔴 對話異常且重啟失敗：家人 {activity['user_substantive']} 訊息 0 回，"
+                    f"重啟 uvicorn 沒救活，需手動處理"
+                )
+        else:
+            issues.append(
+                f"🟡 對話異常持續：近 2 小時家人發了 {activity['user_substantive']} 則實質訊息 0 回（已在 60 分內試過自修）"
+            )
 
     if pending_growth > 20:
-        issues.append(
-            f"🟡 Pending 累積：24 小時內成長 +{pending_growth}（現 {pending_now}），檢查是不是 push 月配額爆"
-        )
+        line_quota_dead = line_push_quota_likely_exhausted()
+        if line_quota_dead:
+            issues.append(
+                f"🔴 Pending +{pending_growth} 24h 不消化：LINE push 月配額爆，等 5/1 月初重置"
+            )
+        elif can_pending_fix and not auto_fixed:
+            # 重啟 uvicorn 觸發 startup pending drain
+            ok = autofix_via_uvicorn_restart("pending_growth")
+            state["last_pending_autofix_ts"] = now.timestamp()
+            if ok:
+                auto_fixed = True
+                issues.append(
+                    f"✅ Pending 累積自修：+{pending_growth} 不消化 → 重啟 uvicorn 觸發 startup pending drain"
+                )
+            else:
+                issues.append(
+                    f"🔴 Pending +{pending_growth} 重啟失敗，需手動處理"
+                )
+        else:
+            issues.append(
+                f"🟡 Pending +{pending_growth} 持續累積（已在 60 分內試過自修）"
+            )
 
     print(
         f"[{now.strftime('%Y-%m-%d %H:%M')}] uvicorn={uvicorn_up} cf={cloudflared_up} "
