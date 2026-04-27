@@ -496,10 +496,37 @@ def main() -> int:
         else:
             issues_l0.append("🔴 cloudflared 死亡 → 重啟失敗（沒抓到新 URL）")
 
-    # ── L0c LINE token 有效性（不計月配額）────────────────────────────────
+    # ── L0c LINE token 有效性 + 自修（v3 stateless refresh）──────────────
     token_ok, token_err = line_token_check()
     if not token_ok:
-        issues_l0.append(f"🔴 LINE token 失效：{token_err}")
+        # 試 refresh：有 LINE_CHANNEL_ID 就走 v3 stateless 換新 token
+        try:
+            from line_token_refresh import refresh_token
+
+            fix_ok, fix_msg = refresh_token()
+            if fix_ok:
+                # 重新驗證
+                token_ok2, _ = line_token_check()
+                if token_ok2:
+                    issues_l0.append(
+                        f"✅ LINE token 自修成功（v3 stateless 換新；{fix_msg}）"
+                    )
+                else:
+                    issues_l0.append(
+                        f"🔴 LINE token refresh 成功但 verify 仍失敗：{token_err[:80]}"
+                    )
+            elif "LINE_CHANNEL_ID not set" in fix_msg:
+                issues_l0.append(
+                    f"🔴 LINE token 失效且無法自修：{token_err[:80]}\n"
+                    "→ 請去 LINE Developer Console > Basic settings 複製 Channel ID（純數字），"
+                    "加到 .env：LINE_CHANNEL_ID=1234567890，未來就會自動換發"
+                )
+            else:
+                issues_l0.append(
+                    f"🔴 LINE token 失效，refresh 也失敗：token={token_err[:60]}, refresh={fix_msg[:80]}"
+                )
+        except Exception as e:
+            issues_l0.append(f"🔴 LINE token 失效，refresh 例外：{str(e)[:120]}")
 
     # ── L0d Webhook 端到端探測 + 自修（每天 1 次）──────────────────────
     last_webhook_check = float(state.get("last_webhook_check_ts", 0))

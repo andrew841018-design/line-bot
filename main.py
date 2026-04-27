@@ -102,7 +102,23 @@ logger = logging.getLogger("line_bot")
 app = FastAPI()
 
 _parser = WebhookParser(settings.line_channel_secret)
-_line_config = Configuration(access_token=settings.line_channel_access_token)
+
+
+def _get_line_config() -> Configuration:
+    """每次 LINE API 呼叫前用這個拿最新 token：
+    - 有 LINE_CHANNEL_ID → v3 stateless short-lived，每 15 分自動 refresh
+    - 沒設 → fallback 到 .env 的 long-lived token（向後相容）
+    """
+    try:
+        from line_token_refresh import get_line_token
+
+        tok = get_line_token() or settings.line_channel_access_token
+    except Exception:
+        tok = settings.line_channel_access_token
+    return Configuration(access_token=tok)
+
+
+_line_config = _get_line_config()  # 啟動時的 fallback；callsite 仍會用 _get_line_config() 取最新
 
 
 # ── LINE 訊息配額 ─────────────────────────────────────────────────────────────
@@ -1223,7 +1239,7 @@ def _get_member_display_name(group_id: str, user_id: str | None) -> str:
     if user_id == "__bot__":
         return "我 (bot)"
     try:
-        with ApiClient(_line_config) as api_client:
+        with ApiClient(_get_line_config()) as api_client:
             profile = MessagingApi(api_client).get_group_member_profile(
                 group_id, user_id
             )
@@ -1508,7 +1524,7 @@ def _mark_quota_exhausted() -> None:
                 "ALLOWED_GROUP_ID"
             )
             if group_id and not settings.bot_muted:
-                with ApiClient(_line_config) as api_client:
+                with ApiClient(_get_line_config()) as api_client:
                     MessagingApi(api_client).push_message(
                         PushMessageRequest(
                             to=group_id,
@@ -1841,7 +1857,7 @@ def _process_pending_on_startup() -> None:
                 if qt:
                     msg_kwargs["quote_token"] = qt
 
-                with ApiClient(_line_config) as api_client:
+                with ApiClient(_get_line_config()) as api_client:
                     MessagingApi(api_client).push_message(
                         PushMessageRequest(
                             to=group_id,
@@ -2050,7 +2066,7 @@ def _handle_join(event: JoinEvent) -> None:
     # 2. 立即查群組 summary / member count / member ids（可能因未認證而失敗，但試試）
     if group_id:
         try:
-            with ApiClient(_line_config) as api_client:
+            with ApiClient(_get_line_config()) as api_client:
                 api = MessagingApi(api_client)
                 try:
                     summary = api.get_group_summary(group_id)
@@ -2595,7 +2611,7 @@ def _reply(reply_token: str, text: str, group_id: str | None = None) -> None:
 
     resp = None
     try:
-        with ApiClient(_line_config) as api_client:
+        with ApiClient(_get_line_config()) as api_client:
             resp = MessagingApi(api_client).reply_message(
                 ReplyMessageRequest(
                     reply_token=reply_token,
@@ -2607,7 +2623,7 @@ def _reply(reply_token: str, text: str, group_id: str | None = None) -> None:
         logger.warning("reply failed: %s", str(e)[:300])
         if group_id:
             try:
-                with ApiClient(_line_config) as api_client:
+                with ApiClient(_get_line_config()) as api_client:
                     MessagingApi(api_client).push_message(
                         PushMessageRequest(
                             to=group_id,
@@ -2635,7 +2651,7 @@ def _reply(reply_token: str, text: str, group_id: str | None = None) -> None:
 
 def _download_content(message_id: str) -> bytes:
     """從 LINE 下載 image/video/audio/file 訊息的原始 bytes。"""
-    with ApiClient(_line_config) as api_client:
+    with ApiClient(_get_line_config()) as api_client:
         return bytes(MessagingApiBlob(api_client).get_message_content(message_id))
 
 

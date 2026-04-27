@@ -16,3 +16,4 @@ suggestion_history.json
 .coverage
 coverage.json
 cov_annotated/
+line_token_cache.json
