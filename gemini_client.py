@@ -432,9 +432,17 @@ def chat(
     try:
         return _run(settings.gemini_model)
     except Exception as e:
-        if "503" in str(e) and settings.gemini_model != settings.gemini_light_model:
+        err = str(e)
+        # 主 model 503 / 429 (daily quota) 都 fallback 到 lite model
+        is_503 = "503" in err
+        is_429_perday = ("429" in err or "RESOURCE_EXHAUSTED" in err) and (
+            "PerDay" in err or "free_tier_requests" in err
+        )
+        if (is_503 or is_429_perday) and settings.gemini_model != settings.gemini_light_model:
+            reason = "503" if is_503 else "429 daily quota"
             logger.warning(
-                "gemini main model 503 exhausted, falling back to %s",
+                "gemini main model %s exhausted, falling back to %s",
+                reason,
                 settings.gemini_light_model,
             )
             return _run(settings.gemini_light_model)
