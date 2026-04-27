@@ -733,6 +733,74 @@ def sox_sentiment() -> str:
         return f"📈 **費半指數** ⚠️ 抓取失敗：{e}"
 
 
+# ── 5.7 練車路線（每日輪換）────────────────────────────────────────────────
+
+# 練車路線池（純非國道版優先；起點固定 善導寺）
+_DRIVING_ROUTES = [
+    {
+        "name": "八里十三行（純非國道）",
+        "path": "重慶北路 → 環河北快速 → 64 快速 → 八里",
+        "duration": "30-40 分鐘",
+        "highlights": "練平面切快速 + 64 維持速度",
+        "level": "新手",
+    },
+    {
+        "name": "北市三高架繞圈",
+        "path": "建國高架 → 水源快速 → 福和橋 → 市民大道高架 → 環東大道 → 內湖",
+        "duration": "60-90 分鐘",
+        "highlights": "練連續匝道切換 + 北市高架網",
+        "level": "新手",
+    },
+    {
+        "name": "基隆河沿岸高架圈",
+        "path": "市民大道 → 環東大道 → 麥帥二橋 → 大直橋 → 圓山 → 重慶北高架",
+        "duration": "50-60 分鐘",
+        "highlights": "連續匝道密集 + 河岸景",
+        "level": "新手進階",
+    },
+    {
+        "name": "八里 + 台 15 西濱南下",
+        "path": "環河北 → 64 → 八里 → 台 15 西濱（往林口/桃園方向）",
+        "duration": "1.5-2 小時",
+        "highlights": "西濱長距離維持速度 + 海岸線",
+        "level": "進階",
+    },
+    {
+        "name": "板橋土城高架圈（65 快速）",
+        "path": "華江橋 → 環河南快速 → 65 快速（土城-中和）→ 折返",
+        "duration": "60 分鐘",
+        "highlights": "65 是新北車流最少快速道路",
+        "level": "新手",
+    },
+    {
+        "name": "桃園永安漁港（含國道練習，進階）",
+        "path": "建國高架 → 國道 1 → 林口交流道 → 台 61 西濱 → 永安漁港",
+        "duration": "1.5 小時",
+        "highlights": "國道 + 西濱快速兼顧",
+        "level": "進階（含國道）",
+    },
+    {
+        "name": "宜蘭礁溪（雪隧挑戰）",
+        "path": "市民大道 → 國道 5 → 雪山隧道 → 礁溪",
+        "duration": "1 小時 20 分",
+        "highlights": "12.9km 長隧道專練（限速嚴）",
+        "level": "挑戰級",
+    },
+]
+
+
+def driving_practice() -> str:
+    """每日輪換的練車路線推薦（用日期 hash 選）。"""
+    route = _DRIVING_ROUTES[datetime.now().toordinal() % len(_DRIVING_ROUTES)]
+    return (
+        f"🚗 **今日練車路線推薦**\n"
+        f"📍 {route['name']}（{route['level']}）\n"
+        f"路徑：{route['path']}\n"
+        f"⏱ {route['duration']} | 重點：{route['highlights']}\n"
+        f"起點：善導寺 | 離峰時段：平日 10-15 點"
+    )
+
+
 # ── 6. 待辦 (CLAUDE.md) ───────────────────────────────────────────────────────
 
 
@@ -1150,6 +1218,10 @@ def main():
     sox = sox_sentiment()
     if sox:
         sections += ["", sox]
+
+    drive = driving_practice()
+    if drive:
+        sections += ["", drive]
 
     jobs = job_search_summary()
     if jobs:
