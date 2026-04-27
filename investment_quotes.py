@@ -10,7 +10,83 @@
 365 天去重機制由 _pick_quote() 處理（quote_history.json）。
 """
 
-QUOTES = {
+# 額外手動加入的 5 位投資家精選 quote（Wikiquote / Brainyquote 沒收錄）
+# 已分散到對應情緒桶
+_EXTRA_AUTHORS = {
+    "雙過熱": [
+        ("市場永遠是對的，但不是永遠都立刻對 — 估值在頂部會撐很久才回歸。",
+         "邱國鷺《投資中最簡單的事》。2007 中國 A 股 PE 60+ 撐了 6 個月才崩；2015 創業板 PE 100+ 撐 10 個月。"),
+        ("The market is trapped in the present moment, mistaking the recent past for the indefinite future.",
+         "Bill Miller, Legg Mason 連續 15 年贏 S&P 的傳奇基金經理。1999-2005 持有 AAPL/AMZN 違背市場共識。"),
+    ],
+    "單過熱": [
+        ("Choosing individual stocks without any idea of what you're looking for is like running through a dynamite factory with a burning match.",
+         "Joel Greenblatt《股市天才》作者、Gotham Capital 創辦人。Magic Formula 1988-2009 年化 30%。"),
+        ("市場常獎勵錯誤行為夠久，讓你以為自己沒錯。",
+         "邱國鷺。2007 年中國地產股泡沫期間，多數投資人以為「這次不一樣」，最後 5 年才恢復元氣。"),
+    ],
+    "中性": [
+        ("The secret to investing is to figure out the value of something — and then pay a lot less.",
+         "Joel Greenblatt《You Can Be a Stock Market Genius》。價值投資核心原則。"),
+        ("Investing requires no special education, no insider information, and no IQ greater than 130.",
+         "Joel Greenblatt。任何人都可以做好投資，重點是紀律 + 框架 + 耐心。"),
+        ("100% of the information you have about a company represents the past, and 100% of the value depends on the future.",
+         "Bill Miller。投資是預測未來，不是研究歷史 — 這是價值投資哲學的轉折點。"),
+        ("Time arbitrage is taking advantage of the short-term focus of the market.",
+         "Bill Miller。市場短視 → 用 5 年眼光買進，賺 90% 投資人賺不到的時間溢酬。"),
+        ("In the long run, stocks have offered investors a real return averaging 6.7% per year.",
+         "Jeremy Siegel《Stocks for the Long Run》。1802-2024 美股實質回報年化 6.7%，無其他資產接近。"),
+        ("The growth of stocks beats the growth of any other major asset class.",
+         "Jeremy Siegel, Wharton 教授。長期股票回報超越債券、黃金、房地產、現金 — 200 年數據佐證。"),
+        ("Investment is more like a loser's game than a winner's game.",
+         "Charles Ellis《Winning the Loser's Game》。少犯錯比常正確更重要 — 像業餘網球，輸的人是失誤多的人。"),
+        ("The best results come from doing less, not more.",
+         "Charles Ellis。Vanguard 董事、被動投資布道者。50 年數據證明：少做 = 多賺。"),
+        ("Index funds are the only investment vehicle that 100% of investors can win at.",
+         "Charles Ellis。指數基金是「保證跑贏 90% 主動基金」的唯一工具。"),
+        ("Markets reward patience above all else.",
+         "Charles Ellis。耐心是投資最低門檻、最高溢酬的能力。"),
+        ("便宜是硬道理，估值是核心競爭力。",
+         "邱國鷺《投資中最簡單的事》。2008 巴菲特買 GS 折扣 30%、2012 邱買中國銀行股 PB 0.7 — 便宜不是運氣是紀律。"),
+        ("在中國市場，便宜比成長更重要 — 因為成長被高估，便宜被低估。",
+         "邱國鷺。2015 創業板 PE 100+ 崩盤時，傳統低估值藍籌反而走出獨立行情。"),
+    ],
+    "買區": [
+        ("Risk is the chance of being wrong, not the chance of having a different result than expected.",
+         "Joel Greenblatt 對風險的重新定義。波動 ≠ 風險，估值錯才是真風險。"),
+        ("If you do good valuation work and you're right, Mr. Market will pay you back.",
+         "Joel Greenblatt。Graham 的「市場先生」概念：耐心等價值兌現，市場最終會還公道。"),
+        ("Lowest average cost wins.",
+         "Bill Miller 名言。Amazon 2001 dot-com 崩盤跌 -95%，他在 5-10 美元持續加碼，10 年後賺 50 倍。"),
+        ("投資最重要的事不是預測未來，而是評估當下的安全邊際。",
+         "邱國鷺。Buffett 派核心：margin of safety > forecasting。預測難，估值簡單。"),
+        ("The most important investment you can make is in yourself.",
+         "Jeremy Siegel。學習能力 + 認知升級 = 最大複利資產，超越任何金融工具。"),
+    ],
+    "深跌": [
+        ("Fear of losing money is more powerful than the desire to gain.",
+         "Jeremy Siegel 引用 Kahneman 損失規避理論。2008/3 散戶對 -10% 的恐懼，超過 +20% 收益的期望。"),
+        ("逆向投資不是逆人性，是看清人性後的順勢。",
+         "邱國鷺。1932、2009、2020 三次大底，都是「順情緒底部 + 逆趨勢操作」的結合。"),
+    ],
+}
+
+# Brainyquote 額外動態 source（daily_briefing_discord.py 處理）
+BRAINYQUOTE_AUTHORS = [
+    ("Stanley Druckenmiller", "stanley-druckenmiller"),
+    ("Mohnish Pabrai", "mohnish-pabrai"),
+]
+
+
+def _merge_extras(base: dict, extras: dict) -> dict:
+    """合併 extras 到 base（同桶 append），不修改原 dict。"""
+    out = {k: list(v) for k, v in base.items()}
+    for bucket, items in extras.items():
+        out.setdefault(bucket, []).extend(items)
+    return out
+
+
+_RAW_QUOTES = {
     # ════════════════════════════════════════════════════════════════════════
     # 雙過熱（警惕貪婪）— 75 句
     # ════════════════════════════════════════════════════════════════════════
@@ -771,3 +847,6 @@ QUOTES = {
          "Templeton：「I have no doubt that the world's economy will continue to grow. Buy when others doubt it.」"),
     ],
 }
+
+# 對外暴露：合併 base + extras
+QUOTES = _merge_extras(_RAW_QUOTES, _EXTRA_AUTHORS)

@@ -262,7 +262,7 @@ def system_status() -> str:
 
 # 心靈雞湯池：base 365 句在 investment_quotes.py，dynamic 池每天可能累積
 # 每句配一條歷史佐證（事件 / 數據 / 名人語錄），不只勵志還能說服自己
-from investment_quotes import QUOTES as _BASE_QUOTES
+from investment_quotes import QUOTES as _BASE_QUOTES, BRAINYQUOTE_AUTHORS as _BQ_AUTHORS
 
 _DYNAMIC_QUOTES_FILE = LINE_BOT_DIR / "dynamic_quotes.json"
 
@@ -343,6 +343,28 @@ def _try_append_today_quote() -> None:
         except Exception:
             continue
 
+    # 若 Wikiquote 全 5 位都沒抓到，改試 Brainyquote 投資家清單
+    if not candidates:
+        for bq_name, bq_slug in _BQ_AUTHORS:
+            try:
+                br = requests.get(
+                    f"https://www.brainyquote.com/authors/{bq_slug}-quotes",
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=15,
+                )
+                if br.status_code != 200:
+                    continue
+                bsoup = BeautifulSoup(br.text, "lxml")
+                for el in bsoup.select(".b-qt"):
+                    txt = el.get_text(" ", strip=True)
+                    if 50 < len(txt) < 400:
+                        candidates.append(txt)
+                if candidates:
+                    author = bq_name.replace(" ", "_")
+                    break
+            except Exception:
+                continue
+
     if not candidates or not author:
         return
 
@@ -395,7 +417,9 @@ def _try_append_today_quote() -> None:
     # 用 author 名字 + 日期 hash 選一條（同一天結果一致）
     chosen = new_ones[(datetime.now().toordinal() + len(author)) % len(new_ones)]
     author_zh = author.replace("_", " ")
-    evidence = f"📚 Wikiquote / {author_zh}"
+    # 判斷來源：Wikiquote 還是 Brainyquote
+    is_brainy = any(author_zh == bq_n for bq_n, _ in _BQ_AUTHORS)
+    evidence = f"📚 {'Brainyquote' if is_brainy else 'Wikiquote'} / {author_zh}"
 
     # keyword heuristic 歸桶（英文）
     txt = chosen.lower()
