@@ -735,20 +735,21 @@ def sox_sentiment() -> str:
 
 # ── 5.7 練車路線（每日輪換）────────────────────────────────────────────────
 
-# 練車路線池（純非國道版優先；起點固定 善導寺）
+# 練車路線池（依難度由簡入難排序；起點固定 善導寺）
+# 不刪除任何路線 — 升級 _DRIVER_LEVEL 後解鎖剩餘
 _DRIVING_ROUTES = [
+    {
+        "name": "板橋土城高架圈（65 快速）",
+        "path": "華江橋 → 環河南快速 → 65 快速（土城-中和）→ 折返",
+        "duration": "60 分鐘",
+        "highlights": "65 是新北車流最少快速道路，最入門",
+        "level": "新手",
+    },
     {
         "name": "八里十三行（純非國道）",
         "path": "重慶北路 → 環河北快速 → 64 快速 → 八里",
         "duration": "30-40 分鐘",
         "highlights": "練平面切快速 + 64 維持速度",
-        "level": "新手",
-    },
-    {
-        "name": "北市三高架繞圈",
-        "path": "建國高架 → 水源快速 → 福和橋 → 市民大道高架 → 環東大道 → 內湖",
-        "duration": "60-90 分鐘",
-        "highlights": "練連續匝道切換 + 北市高架網",
         "level": "新手",
     },
     {
@@ -759,6 +760,13 @@ _DRIVING_ROUTES = [
         "level": "新手進階",
     },
     {
+        "name": "北市三高架繞圈",
+        "path": "建國高架 → 水源快速 → 福和橋 → 市民大道高架 → 環東大道 → 內湖",
+        "duration": "60-90 分鐘",
+        "highlights": "練連續匝道切換 + 北市高架網",
+        "level": "新手",
+    },
+    {
         "name": "八里 + 台 15 西濱南下",
         "path": "環河北 → 64 → 八里 → 台 15 西濱（往林口/桃園方向）",
         "duration": "1.5-2 小時",
@@ -766,14 +774,7 @@ _DRIVING_ROUTES = [
         "level": "進階",
     },
     {
-        "name": "板橋土城高架圈（65 快速）",
-        "path": "華江橋 → 環河南快速 → 65 快速（土城-中和）→ 折返",
-        "duration": "60 分鐘",
-        "highlights": "65 是新北車流最少快速道路",
-        "level": "新手",
-    },
-    {
-        "name": "桃園永安漁港（含國道練習，進階）",
+        "name": "桃園永安漁港（含國道練習）",
         "path": "建國高架 → 國道 1 → 林口交流道 → 台 61 西濱 → 永安漁港",
         "duration": "1.5 小時",
         "highlights": "國道 + 西濱快速兼顧",
@@ -790,15 +791,20 @@ _DRIVING_ROUTES = [
 
 
 def driving_practice() -> str:
-    """每日輪換的練車路線推薦（用日期 hash 選）。"""
-    route = _DRIVING_ROUTES[datetime.now().toordinal() % len(_DRIVING_ROUTES)]
-    return (
-        f"🚗 **今日練車路線推薦**\n"
-        f"📍 {route['name']}（{route['level']}）\n"
-        f"路徑：{route['path']}\n"
-        f"⏱ {route['duration']} | 重點：{route['highlights']}\n"
-        f"起點：善導寺 | 離峰時段：平日 10-15 點"
-    )
+    """列出所有練車路線（依難度由簡入難），讓 Andrew 自己挑。
+
+    路線按 _DRIVING_ROUTES 順序顯示（已是難度遞增）。
+    """
+    if not _DRIVING_ROUTES:
+        return ""
+    lines = ["🚗 **練車路線清單**（起點：善導寺，由簡入難）"]
+    for i, r in enumerate(_DRIVING_ROUTES, 1):
+        lines.append(
+            f"{i}. [{r['level']}] {r['name']}（{r['duration']}）"
+        )
+        lines.append(f"   {r['path']}")
+    lines.append("離峰時段：平日 10-15 點 / 假日清晨 6-9 點")
+    return "\n".join(lines)
 
 
 # ── 6. 待辦 (CLAUDE.md) ───────────────────────────────────────────────────────
