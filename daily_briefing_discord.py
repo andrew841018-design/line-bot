@@ -260,102 +260,178 @@ def system_status() -> str:
 
 # ── 5.5 費城半導體指數 (^SOX) 乖離率 + 買賣建議 ───────────────────────────────
 
-# 心靈雞湯池 — 依市場情緒分桶，每天用日期 hash 選不同句
+# 心靈雞湯池：base 365 句在 investment_quotes.py，dynamic 池每天可能累積
 # 每句配一條歷史佐證（事件 / 數據 / 名人語錄），不只勵志還能說服自己
-# 結構：(quote, evidence)
-_QUOTES = {
-    "雙過熱": [  # 警惕貪婪
-        ("市場的錢是賺不完的，少賺不會死，套住才會。",
-         "Buffett 1969 道瓊 800 點時關閉合夥事業全還錢給合夥人；市場 4 年後在 1973 觸頂，1974 崩 -45%。他在 580 點時才大舉回場買 Washington Post，10 年漲 12 倍。"),
-        ("別人貪婪時要恐懼。街頭討論晶片股的計程車司機變多了嗎？",
-         "1987、2000、2007 三次大頂前，散戶券商開戶數都爆衝。Robinhood 2021 Q1 新開戶 600 萬戶創高點，3 個月後 ARKK 開始崩 -67%。"),
-        ("頂部不會敲鑼打鼓。你覺得「再漲一點就賣」，往往就是該賣的時候。",
-         "Nasdaq 2000/3/10 創 5048 點，當週 BusinessWeek 封面標題《Tech is the new economy》。3 個月後跌 -35%，3 年跌 -78%。"),
-        ("獲利再投入是複利之友，但全部 all in 高點是複利之敵。",
-         "1929 道瓊頂 381 點，回到此價位等了 25 年（1954）。2000 Nasdaq 5048 點，回到此價位等了 15 年（2015）。"),
-        ("減碼不是看空，是把籌碼換成選擇權——下次大跌時的子彈。",
-         "Druckenmiller 1999 預警網路泡沫但被迫追高，當年多賺 50%，2000 全部回吐。他自評「最大遺憾是沒在頂部留現金」。"),
-        ("華爾街沒有新鮮事。每一次「這次不一樣」最後都一樣。",
-         "李佛摩名言。1929（汽車電氣新時代）、1973（漂亮 50）、2000（網路新經濟）、2008（房地產不會跌）、2022（FAANG 永動機）— 5 次崩盤前 narrative 一致。"),
-        ("高處不勝寒。在無人質疑的多頭中保留現金，是最孤獨也最珍貴的決定。",
-         "Michael Burry 2007 在房市頂時建 CDS 空頭，被基金投資人罵 6 個月要求贖回；最終《The Big Short》賺 7.5 億美元。"),
-        ("你不需要每一塊錢都賺到。少賺最後 20% 的人，才能避開 -40% 的回撤。",
-         "數學鐵則：賺最後 20% 後跌 40%，淨值剩 0.72；早 20% 出場保 1.0。前者要再漲 +39% 才追平，需要好幾年。"),
-        ("牛市裡最重的代價，是不肯下車的人付的。",
-         "Cisco 2000 從 80 跌到 8，25 年至今未回前高。GE 2008 從 60 跌到 6，17 年未回。ARKK 2021 從 159 跌到 30。"),
-        ("市場給你機會用恐懼買、用貪婪賣，多數人卻顛倒過來。",
-         "JP Morgan《Guide to Retirement》資金流統計：散戶在 2009/3、2020/3 兩個歷史底部前 3 個月淨贖回，在 2007/10、2021/11 兩個頂前 3 個月淨買進。"),
-    ],
-    "單過熱": [  # 提醒謹慎
-        ("上漲時忘記停損，下跌時才會記得。趁理性還在，先想好出場條件。",
-         "行為金融學「處置效應」(Odean 1998)：散戶賠錢部位平均持有 124 天，賺錢部位只 104 天就賣 — 賠錢硬抱比賺錢落袋多撐 19%。"),
-        ("有計畫的賣出叫紀律，沒計畫的賣出叫恐慌。",
-         "Vanguard 2014《Advisor's Alpha》研究：有書面投資計畫的客戶 30 年年化回報比沒計畫者高 3%，複利下差 2.4 倍資產。"),
-        ("當你開始算「賺多少可以辭職」時，就是該檢視部位的時候。",
-         "1999 矽谷工程師大規模辭職創業；2021 YouTube 充滿「30 歲 FIRE 財富自由」影片。前者隔年崩盤、後者隔年加密 -80%。"),
-        ("好公司不一定是好價格。耐心等回檔，是專業與業餘的分水嶺。",
-         "Buffett：「以好價格買好公司，比以好公司價買好公司重要」。他 1973 用 130 美元買 Washington Post 被笑貴，10 年後漲到 1,500。"),
-        ("風險不是波動，是你買貴了還不知道。",
-         "Cisco 2000 P/E 200 倍時被分析師認為「合理反映新經濟」。25 年後股價仍未回前高，但 EPS 已成長 4 倍 — 證明買貴才是真風險。"),
-        ("市場永遠對。你的解釋只是事後諸葛。",
-         "Keynes 1936 名言：「Markets can stay irrational longer than you can stay solvent.」（市場保持非理性的時間，可以長過你保持償付能力的時間）"),
-        ("獲利沒入袋只是浮雲，浮雲會散。",
-         "Cathie Wood 2021 帳面 ARKK 浮盈讓無數人賣房 all in，2022 跌 -67%。只有當年 take profit 的人保住資產。"),
-    ],
-    "中性": [  # 持有觀望
-        ("投資最難的不是判斷，是「什麼都不做」。",
-         "Fidelity 2014 內部研究：表現最好的帳戶都是「忘記登入」或「持有人已死亡」的客戶 — 因為他們不交易，沒踩追高殺低。"),
-        ("時間是好公司的朋友，是平庸公司的敵人。",
-         "Buffett 原話。Berkshire 1965-2024 年化 19.8% vs S&P 10.2% — 60 年複利威力差 140 倍。"),
-        ("別交易市場，要持有資產。",
-         "S&P 500 1990-2020：錯過 10 個最佳交易日，年化從 7.7% 降到 5.0%；錯過 30 個，剩 0.6%。所有最佳日通常緊鄰最差日，無法擇時。"),
-        ("10 年 10 倍不是夢，前提是你能撐過中間 5 次的 -30%。",
-         "蘋果 2003-2023 漲 250 倍，但中間經歷 2008 -60%、2013 -45%、2015 -32%、2019 -38%、2020 -32% — 不持有就拿不到複利。"),
-        ("看盤太頻繁，是把投資做成賭博。",
-         "DALBAR《QAIB 2023 報告》25 年數據：頻繁交易散戶年化 3.9% vs S&P 9.8%，落後 5.9%。差距複利下 30 年差 5 倍。"),
-        ("資產配置先做對，個股選擇再優化。",
-         "Brinson, Hood, Beebower 1986 經典研究：投資組合回報 91.5% 由資產配置決定，個股選擇只佔 4.6%，擇時 1.8%。"),
-        ("你的長期回報，取決於你能忍住不動的那段時間有多長。",
-         "Peter Lynch 1977-1990 Magellan 基金年化 29.2%，但 Fidelity 統計平均投資人實際回報 -4% — 因為都追高殺低。"),
-    ],
-    "買區": [  # 鼓勵進場
-        ("市場給好價格時不要嫌貴，給壞臉色時不要害怕。",
-         "Buffett 2008/10/16《NYT》專欄〈Buy American. I Am.〉，當時 S&P 1000 點所有人逃命；5 年後 S&P 1800，翻倍。"),
-        ("下跌不是風險，買貴才是。",
-         "蒙格名言：「真正的風險是你付太多了，不是價格波動」。波動是長期投資人的朋友。"),
-        ("別人恐懼時要貪婪。今天的鈔票就是明天的股票。",
-         "2020/3/23 S&P 觸底 2191，所有人預測再跌 40%。3 年後 S&P 4500，漲 +105%。底部最不舒服，但回報最大。"),
-        ("好公司在打折時加碼，是時間給長期投資人的紅利。",
-         "Costco 2009 大跌 -32% 時 P/E 從 22 降到 17，當時加碼者至今 16 年漲 18 倍（含股息）。"),
-        ("你的下一個十年，往往從這種「沒人想討論股票」的時刻開始。",
-         "2002/10、2009/3、2020/3 三個歷史底部，Google Trends 上「stock market」搜尋量都跌到 5 年低點。冷清才是入場時。"),
-        ("分批進場是給未知的禮物。一次梭哈是對未知的傲慢。",
-         "Vanguard 2012 研究：DCA（定期定額）在 1929-1932、2000-2002、2008-2009 三大空頭期都跑贏 Lump Sum 一次性投入 5-15%。"),
-        ("回檔不是錯誤，是市場給有準備的人的入場券。",
-         "S&P 500 過去 50 年平均每年最大回檔 -14%，但 75% 的年份仍以正報酬收場。回檔是常態不是異常。"),
-    ],
-    "深跌": [  # 逆向勇氣
-        ("鮮血中買進。當所有人都說「再跌都不奇怪」時，往往離底部不遠。",
-         "Rothschild 名言。1815 滑鐵盧戰役英國公債暴跌，Nathan Rothschild 大量買進；戰後消息明朗，價格反彈 +40%，奠定家族財富。"),
-        ("歷史上每一次「世界要完了」最後都沒完，活下來的人都贏了。",
-         "1929 大蕭條、1973 石油危機、1987 黑色星期一、2000 網路泡沫、2008 金融海嘯、2020 COVID — 6 次危機後 S&P 都復原並創新高。"),
-        ("市場最便宜的時候，永遠是最不舒服的時候。",
-         "1932/7 道瓊 41 點（從 381 跌 -89%），失業率 25%、銀行倒閉 9,000 家。20 年後道瓊 600 點，1.5 倍漲幅來自此底買進者。"),
-        ("今天買進的，是 3 年後別人 FOMO 想要的。",
-         "Nvidia 2022/10 跌到 108 美元被嫌貴。2024/6 創 1,340 美元，21 個月漲 12.4 倍。當時敢買的人是現在所有人羨慕的對象。"),
-        ("你不需要抓到最低點。在恐慌中分批買進，已經贏 90% 的人。",
-         "DALBAR 統計：散戶平均在大跌底部前 30 天到底部後 60 天之間「淨贖回」，錯過反彈最大段。"),
-        ("現金在熊市底部最有價值，這是你 6 個月前買飲料時想不到的。",
-         "1932 美國 25% 失業率時，1 美元現金能買到 1929 年 5 美元的同一家公司股票。現金在恐慌中購買力放大 5 倍。"),
-        ("市場會忘記昨天的恐懼，只記得明天的價格。",
-         "2008/11 S&P 跌至 752 點時所有媒體預測「金融體系崩潰」，1 年後 S&P 回到 1,100，3 年後 1,300。恐慌只持續 6 個月。"),
-    ],
-}
+from investment_quotes import QUOTES as _BASE_QUOTES
+
+_DYNAMIC_QUOTES_FILE = LINE_BOT_DIR / "dynamic_quotes.json"
+
+
+def _load_dynamic_quotes() -> dict:
+    """讀運行期累積的雞湯池（同 _BASE_QUOTES 結構）。檔案不存在或壞掉回空 dict。"""
+    if not _DYNAMIC_QUOTES_FILE.exists():
+        return {}
+    try:
+        with open(_DYNAMIC_QUOTES_FILE) as f:
+            data = _json.load(f)
+        # 把 list of [quote, evidence] 轉回 tuple
+        return {k: [tuple(p) for p in v] for k, v in data.items()}
+    except Exception:
+        return {}
+
+
+def _save_dynamic_quotes(d: dict) -> None:
+    try:
+        tmp = _DYNAMIC_QUOTES_FILE.with_suffix(".json.tmp")
+        with open(tmp, "w") as f:
+            _json.dump({k: [list(p) for p in v] for k, v in d.items()},
+                       f, ensure_ascii=False, indent=2)
+        os.replace(tmp, _DYNAMIC_QUOTES_FILE)
+    except Exception:
+        pass
+
+
+def _try_append_today_quote() -> None:
+    """每天嘗試抓新雞湯加入 dynamic 池（fail-safe，不影響主流程）。
+
+    來源策略（按順序試，第一個成功即停）：
+      1. Investopedia「Quote of the Day」（每日金融金句）
+      2. 鉅亨網每日 highlight 引言（如有）
+
+    抓到後歸桶 + 去重（quote 字串完全相同視為重複）+ 寫回 json。
+    抓不到完全沉默，不擋整體 briefing。
+    """
+    try:
+        import requests
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return
+
+    new_quote = None
+    new_evidence = None
+
+    # 來源 1：Investopedia Quote of the Day（HTML 結構穩定多年）
+    try:
+        r = requests.get(
+            "https://www.investopedia.com/financial-quote-of-the-day-4774908",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=8,
+        )
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.text, "lxml")
+            blockquote = soup.find("blockquote")
+            if blockquote:
+                quote_text = blockquote.get_text(" ", strip=True)
+                if 20 <= len(quote_text) <= 200:
+                    new_quote = quote_text
+                    new_evidence = f"📰 Investopedia Quote of the Day, {datetime.now().strftime('%Y-%m-%d')}"
+    except Exception:
+        pass
+
+    if not new_quote:
+        return
+
+    # 用簡單 keyword heuristic 歸桶
+    txt = new_quote.lower()
+    if any(w in txt for w in ["greed", "bubble", "euphoria", "mania", "貪婪", "泡沫", "狂熱"]):
+        bucket = "雙過熱"
+    elif any(w in txt for w in ["caution", "discipline", "restraint", "patience", "紀律", "耐心", "謹慎"]):
+        bucket = "單過熱"
+    elif any(w in txt for w in ["fear", "panic", "blood", "crash", "恐懼", "恐慌", "崩盤"]):
+        bucket = "深跌"
+    elif any(w in txt for w in ["opportunity", "buy", "value", "discount", "便宜", "機會", "買進"]):
+        bucket = "買區"
+    else:
+        bucket = "中性"
+
+    dyn = _load_dynamic_quotes()
+    bucket_list = dyn.get(bucket, [])
+    # 去重：quote 字串相同視為重複
+    if any(q == new_quote for q, _ in bucket_list):
+        return
+    if any(q == new_quote for q, _ in _BASE_QUOTES.get(bucket, [])):
+        return
+    bucket_list.append((new_quote, new_evidence))
+    dyn[bucket] = bucket_list
+    _save_dynamic_quotes(dyn)
+
+
+def _merged_pool(bucket: str) -> list:
+    """合併 base + dynamic 該桶的所有句子。"""
+    base = _BASE_QUOTES.get(bucket, [])
+    dyn = _load_dynamic_quotes().get(bucket, [])
+    return list(base) + list(dyn)
+
+
+
+
+_QUOTE_HISTORY_FILE = LINE_BOT_DIR / "quote_history.json"
+
+
+def _load_quote_history() -> dict:
+    """{bucket: {idx_str: "YYYY-MM-DD"}}"""
+    if not _QUOTE_HISTORY_FILE.exists():
+        return {}
+    try:
+        with open(_QUOTE_HISTORY_FILE) as f:
+            return _json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_quote_history(hist: dict) -> None:
+    try:
+        tmp = _QUOTE_HISTORY_FILE.with_suffix(".json.tmp")
+        with open(tmp, "w") as f:
+            _json.dump(hist, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, _QUOTE_HISTORY_FILE)
+    except Exception:
+        pass
+
+
+def _pick_quote(bucket: str) -> tuple:
+    """從指定桶選一句：優先「365 天內沒用過的」，若全用過則挑「最久沒用」的那句。
+
+    這樣保證 365 天內不重複（除非該桶池子 < 365 句且連續觸發超過池子大小天數）。
+    """
+    pool = _merged_pool(bucket)  # base 365 + dynamic 累積
+    today = datetime.now().date()
+    history = _load_quote_history()
+    bucket_hist = history.get(bucket, {})
+
+    # 找 365 天內沒用過的 idx
+    fresh_indices = []
+    for i in range(len(pool)):
+        last_used = bucket_hist.get(str(i))
+        if last_used is None:
+            fresh_indices.append(i)
+            continue
+        try:
+            last_date = datetime.strptime(last_used, "%Y-%m-%d").date()
+            if (today - last_date).days >= 365:
+                fresh_indices.append(i)
+        except ValueError:
+            fresh_indices.append(i)
+
+    if fresh_indices:
+        # 從 fresh 中用日期 hash 選一個（同一天多次呼叫得到同一句）
+        chosen = fresh_indices[today.toordinal() % len(fresh_indices)]
+    else:
+        # 所有句都在 365 天內用過 → 挑最久沒用的
+        def _last(i):
+            d = bucket_hist.get(str(i))
+            return datetime.strptime(d, "%Y-%m-%d").date() if d else today
+        chosen = min(range(len(pool)), key=_last)
+
+    # 記錄使用日期
+    bucket_hist[str(chosen)] = today.strftime("%Y-%m-%d")
+    history[bucket] = bucket_hist
+    _save_quote_history(history)
+    return pool[chosen]
 
 
 def _market_quote(bias_20: float, bias_60: float) -> str:
-    """根據雙線乖離選情緒桶，日期 hash 每天輪一句。"""
-    # 桶判定（與 _signal_* 一致的 threshold）
+    """根據雙線乖離選情緒桶，配合 365 天去重選句。"""
     overheat_20 = bias_20 > 6
     overheat_60 = bias_60 > 12
     deep_down = bias_20 < -6 or bias_60 < -10
@@ -373,9 +449,7 @@ def _market_quote(bias_20: float, bias_60: float) -> str:
     else:
         bucket = "中性"
 
-    pool = _QUOTES[bucket]
-    idx = datetime.now().toordinal() % len(pool)
-    quote, evidence = pool[idx]
+    quote, evidence = _pick_quote(bucket)
     return f"💭 {quote}\n📊 {evidence}"
 
 
@@ -874,6 +948,9 @@ def main():
     suggestions = line_bot_suggestions()
     if suggestions:
         sections += ["", suggestions]
+
+    # 每天嘗試抓一句新雞湯加進 dynamic 池（fail-safe，抓不到不影響）
+    _try_append_today_quote()
 
     sox = sox_sentiment()
     if sox:
