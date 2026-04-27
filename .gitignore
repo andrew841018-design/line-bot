@@ -11,3 +11,8 @@ gemini_usage.json
 quota_state.json
 alert_state.json
 pending_explicit_reply.json
+pushed_jobs.json
+suggestion_history.json
+.coverage
+coverage.json
+cov_annotated/

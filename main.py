@@ -1040,7 +1040,60 @@ def _handle_burst_flush(group_id: str, combined_text: str, reply_token: str) -> 
     memory.append_turn(group_id, "user", f"[burst]\n{combined_text}")
     memory.append_turn(group_id, "bot", reply_text)
     _maybe_extract_facts(group_id)
+    _maybe_capture_calendar_event(group_id, combined_text)
     _reply(reply_token, reply_text, group_id=group_id)
+
+
+def _maybe_capture_calendar_event(group_id: str, combined_text: str) -> None:
+    """從 burst 抽出家族活動 → 寫 events / 取消 events。失敗不擋主流程。"""
+    try:
+        import calendar_db
+        import calendar_extractor
+
+        data = calendar_extractor.extract(combined_text)
+        if data["is_cancellation"]:
+            kw = data.get("cancel_target_keyword")
+            target = calendar_db.find_active_event(
+                group_id, keyword=kw, near_date=data.get("date")
+            )
+            if target:
+                if data.get("date") and data["date"] != target["event_date"]:
+                    calendar_db.update_event_date(
+                        target["event_id"], data["date"], data.get("time")
+                    )
+                    logger.info(
+                        "calendar event rescheduled: %s → %s (group=%s)",
+                        target["event_id"],
+                        data["date"],
+                        group_id,
+                    )
+                else:
+                    calendar_db.cancel_event(target["event_id"])
+                    logger.info(
+                        "calendar event cancelled: %s (kw=%s, group=%s)",
+                        target["event_id"],
+                        kw,
+                        group_id,
+                    )
+            return
+        if data["has_event"] and data.get("title") and data.get("date"):
+            event_id = calendar_db.insert_event(
+                group_id=group_id,
+                title=data["title"],
+                event_date=data["date"],
+                event_time=data.get("time"),
+                location=data.get("location"),
+                participants=data.get("participants") or [],
+            )
+            logger.info(
+                "calendar event captured: %s '%s' on %s (group=%s)",
+                event_id,
+                data["title"],
+                data["date"],
+                group_id,
+            )
+    except Exception as e:
+        logger.warning("calendar capture failed: %s", e)
 
 
 # 在 module load 時把 callback 注入 burst_filter
@@ -2208,7 +2261,52 @@ def _handle_command(group_id: str, text: str) -> str | None:
             return "用法：/閉嘴 <為什麼不應該回>\n例：/閉嘴 這種只是早安問候，不用回"
         return _handle_layer2_correction(group_id, reason)
 
+    # ── 家族行事曆 ──────────────────────────────────────────────
+    if t in ("/行事曆", "/活動", "/聚餐"):
+        return _format_calendar(group_id)
+
+    if t.startswith("/取消活動 "):
+        kw = t[len("/取消活動 ") :].strip()
+        if not kw:
+            return "用法：/取消活動 <活動關鍵字>"
+        return _cancel_calendar_event(group_id, kw)
+
     return None
+
+
+def _format_calendar(group_id: str) -> str:
+    import calendar_db
+
+    events = calendar_db.list_upcoming(group_id, days=30)
+    if not events:
+        return "📅 未來 30 天沒有家族活動。"
+    lines = ["📅 **家族行事曆（未來 30 天）**"]
+    for e in events:
+        time_part = f" {e['event_time']}" if e["event_time"] else ""
+        loc_part = f" @ {e['location']}" if e["location"] else ""
+        try:
+            import json as _j
+
+            parts = _j.loads(e["participants"] or "[]")
+        except Exception:
+            parts = []
+        ppl = "、".join(parts) if parts else ""
+        ppl_part = f"（{ppl}）" if ppl else ""
+        lines.append(
+            f"• {e['event_date']}{time_part} {e['title']}{loc_part}{ppl_part}"
+        )
+    return "\n".join(lines)
+
+
+def _cancel_calendar_event(group_id: str, keyword: str) -> str:
+    import calendar_db
+
+    target = calendar_db.find_active_event(group_id, keyword=keyword)
+    if not target:
+        return f"找不到含「{keyword}」的活動。用 /行事曆 看清單。"
+    if calendar_db.cancel_event(target["event_id"]):
+        return f"已取消：{target['event_date']} {target['title']}"
+    return f"取消失敗（活動可能已被取消）：{target['title']}"
 
 
 _HELP_TEXT = (
@@ -2229,6 +2327,9 @@ _HELP_TEXT = (
     "  /檢討                   立刻跑一次過去 7 天的檢討(可接天數)\n"
     "  /採用                   列出待採用的建議\n"
     "  /採用 1 2 / 全部 / 無   把建議升級成正式規則\n"
+    "【家族行事曆】\n"
+    "  /行事曆                 列出未來 30 天的家族活動\n"
+    "  /取消活動 <關鍵字>      取消含關鍵字的活動\n"
     "【其他】\n"
     "  /group_id               顯示本群 ID\n"
     "  /help                   看這張說明"
