@@ -291,6 +291,99 @@ def _save_dynamic_quotes(d: dict) -> None:
         pass
 
 
+# 投資家 Wikiquote 來源池 — 每天輪換一位抓
+_WIKIQUOTE_AUTHORS = [
+    "Warren_Buffett", "Charlie_Munger", "Peter_Lynch", "John_C._Bogle",
+    "Benjamin_Graham", "George_Soros", "Ray_Dalio", "John_Templeton",
+    "Philip_Fisher", "Howard_Marks", "Seth_Klarman", "Jesse_Livermore",
+    "Carl_Icahn", "Jim_Rogers", "Bill_Ackman",
+]
+
+
+def _try_append_today_quote() -> None:
+    """每天輪一位投資家從 Wikiquote 抓 quote，篩掉已有的，加 1 條到 dynamic 池。
+
+    fail-safe：抓失敗 / 連線超時 / 沒新句 → 完全沉默不影響主流程。
+    每天最多加 1 條，符合「緩慢累積」原則。
+    """
+    try:
+        import requests
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return
+
+    # 用日期 hash 起點，依序試 5 位（自動跳過 404 / 抓不到 candidates 的）
+    start_idx = datetime.now().toordinal() % len(_WIKIQUOTE_AUTHORS)
+    candidates = []
+    author = None
+    for offset in range(5):
+        idx = (start_idx + offset) % len(_WIKIQUOTE_AUTHORS)
+        try_author = _WIKIQUOTE_AUTHORS[idx]
+        url = f"https://en.wikiquote.org/wiki/{try_author}"
+        try:
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+            if r.status_code != 200:
+                continue
+            soup = BeautifulSoup(r.text, "lxml")
+            content = soup.select_one("#mw-content-text")
+            if not content:
+                continue
+            top_uls = content.select("div.mw-parser-output > ul")
+            for ul in top_uls:
+                for li in ul.find_all("li", recursive=False):
+                    li_copy = BeautifulSoup(str(li), "lxml")
+                    for sub in li_copy.find_all(["ul", "ol"]):
+                        sub.extract()
+                    quote = li_copy.get_text(" ", strip=True)
+                    if 50 < len(quote) < 400:
+                        candidates.append(quote)
+            if candidates:
+                author = try_author
+                break
+        except Exception:
+            continue
+
+    if not candidates or not author:
+        return
+
+    # 已存在的 quote（base + dynamic 全桶）→ 集合做去重
+    existing = set()
+    for bucket in ["雙過熱", "單過熱", "中性", "買區", "深跌"]:
+        for q, _ in _BASE_QUOTES.get(bucket, []):
+            existing.add(q)
+    dyn = _load_dynamic_quotes()
+    for bucket_list in dyn.values():
+        for q, _ in bucket_list:
+            existing.add(q)
+
+    new_ones = [q for q in candidates if q not in existing]
+    if not new_ones:
+        return
+
+    # 用 author 名字 + 日期 hash 選一條（同一天結果一致）
+    chosen = new_ones[(datetime.now().toordinal() + len(author)) % len(new_ones)]
+    author_zh = author.replace("_", " ")
+    evidence = f"📚 Wikiquote / {author_zh}"
+
+    # keyword heuristic 歸桶（英文）
+    txt = chosen.lower()
+    if any(w in txt for w in ["greed", "bubble", "euphoria", "mania", "speculation", "bull market", "fad"]):
+        bucket = "雙過熱"
+    elif any(w in txt for w in ["caution", "discipline", "patience", "wait", "margin of safety"]):
+        bucket = "單過熱"
+    elif any(w in txt for w in ["fear", "panic", "blood", "crash", "depression", "pessimism", "crisis"]):
+        bucket = "深跌"
+    elif any(w in txt for w in ["opportunity", "buy", "value", "discount", "cheap", "bargain", "undervalued"]):
+        bucket = "買區"
+    else:
+        bucket = "中性"
+
+    bucket_list = dyn.get(bucket, [])
+    bucket_list.append((chosen, evidence))
+    dyn[bucket] = bucket_list
+    _save_dynamic_quotes(dyn)
+
+
 def _today_market_snapshot() -> str:
     """每日市場即時數據 + 頭條，當作雞湯的「今日佐證」附加。
 
@@ -969,6 +1062,9 @@ def main():
     suggestions = line_bot_suggestions()
     if suggestions:
         sections += ["", suggestions]
+
+    # 每天嘗試從 Wikiquote 抓一條新雞湯加入 dynamic 池（fail-safe）
+    _try_append_today_quote()
 
     sox = sox_sentiment()
     if sox:
