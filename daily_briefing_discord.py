@@ -346,6 +346,38 @@ def _try_append_today_quote() -> None:
     if not candidates or not author:
         return
 
+    # Bonus 來源：Howard Marks 那天額外抓 Oaktree memos 一段
+    if author == "Howard_Marks":
+        try:
+            list_r = requests.get(
+                "https://www.oaktreecapital.com/insights/memos",
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=15,
+            )
+            if list_r.status_code == 200:
+                lsoup = BeautifulSoup(list_r.text, "lxml")
+                memo_links = [a["href"] for a in lsoup.find_all("a", href=True)
+                              if "/insights/memo/" in a["href"]]
+                if memo_links:
+                    # 用日期 hash 選一篇最新的（前 5 篇輪）
+                    pick = memo_links[datetime.now().toordinal() % min(5, len(memo_links))]
+                    if not pick.startswith("http"):
+                        pick = "https://www.oaktreecapital.com" + pick
+                    memo_r = requests.get(pick, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+                    if memo_r.status_code == 200:
+                        msoup = BeautifulSoup(memo_r.text, "lxml")
+                        for p in msoup.find_all("p"):
+                            txt = p.get_text(" ", strip=True)
+                            # 找 80-300 chars 的 quotable 段落
+                            if 80 < len(txt) < 300 and "." in txt:
+                                # 取第一個句號為止當 quote
+                                first_sentence = txt.split(".")[0].strip() + "."
+                                if 50 < len(first_sentence) < 300:
+                                    candidates.insert(0, first_sentence)  # priority
+                                    break
+        except Exception:
+            pass
+
     # 已存在的 quote（base + dynamic 全桶）→ 集合做去重
     existing = set()
     for bucket in ["雙過熱", "單過熱", "中性", "買區", "深跌"]:
