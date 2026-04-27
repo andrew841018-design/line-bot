@@ -146,6 +146,90 @@ def save_health_state(d: dict) -> None:
         pass
 
 
+def proc_alive(pattern: str) -> bool:
+    r = subprocess.run(["pgrep", "-f", pattern], capture_output=True)
+    return r.returncode == 0
+
+
+def restart_uvicorn() -> bool:
+    """強制重啟 uvicorn。回 True 表示 /health 200。"""
+    try:
+        subprocess.run(
+            ["pkill", "-f", "uvicorn main:app"], capture_output=True, timeout=10
+        )
+        time.sleep(2)
+        subprocess.Popen(
+            [
+                str(BASE / ".venv/bin/uvicorn"),
+                "main:app",
+                "--host", "127.0.0.1",
+                "--port", "8080",
+            ],
+            cwd=str(BASE),
+            stdout=open("/tmp/line_bot_health_restart.log", "ab"),
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        time.sleep(5)
+        r = subprocess.run(
+            ["curl", "-s", "--interface", "lo0", "http://localhost:8080/health"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return '"status":"ok"' in (r.stdout or "")
+    except Exception:
+        return False
+
+
+def restart_cloudflared() -> tuple[bool, str]:
+    """重啟 cloudflared tunnel + 抓新 URL + 更新 LINE webhook。回 (success, new_url)。"""
+    cf_log = BASE / "cloudflared.log"
+    cf_bin = "/Users/andrew/.local/bin/cloudflared"
+    if not os.path.exists(cf_bin):
+        return False, ""
+    try:
+        subprocess.run(["pkill", "-f", "cloudflared tunnel"], capture_output=True, timeout=10)
+        time.sleep(2)
+        cf_log.write_text("")
+        subprocess.Popen(
+            [cf_bin, "tunnel", "--url", "http://127.0.0.1:8080"],
+            stdout=open(cf_log, "ab"), stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        # 等 URL 出現
+        import re as _re
+        new_url = ""
+        for _ in range(30):
+            time.sleep(1)
+            try:
+                m = _re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", cf_log.read_text())
+                if m:
+                    new_url = m.group(0)
+                    break
+            except Exception:
+                pass
+        if not new_url:
+            return False, ""
+        # 更新 LINE webhook
+        token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+        if token:
+            import requests
+            try:
+                requests.put(
+                    "https://api.line.me/v2/bot/channel/webhook/endpoint",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                    },
+                    json={"endpoint": f"{new_url}/callback"},
+                    timeout=10,
+                )
+            except Exception:
+                pass
+        return True, new_url
+    except Exception:
+        return False, ""
+
+
 def attempt_auto_fix() -> bool:
     """清 quota_state.json + 重啟 uvicorn。回 True 表示重啟成功。"""
     try:
@@ -189,6 +273,27 @@ def main() -> int:
     state = load_health_state()
     last_alert_ts = float(state.get("last_alert_ts", 0))
 
+    issues_l0: list[str] = []  # uvicorn / cloudflared 死掉的緊急處理
+
+    # ── L0 進程存活：uvicorn + cloudflared 死掉就直接重啟 ──────────────────
+    uvicorn_up = proc_alive("uvicorn.*main:app")
+    cloudflared_up = proc_alive("cloudflared tunnel")
+
+    if not uvicorn_up:
+        ok = restart_uvicorn()
+        if ok:
+            issues_l0.append("✅ uvicorn 偵測死亡 → 自動重啟成功")
+            uvicorn_up = True
+        else:
+            issues_l0.append("🔴 uvicorn 死亡 → 自動重啟失敗，需手動處理")
+
+    if not cloudflared_up:
+        ok, url = restart_cloudflared()
+        if ok and url:
+            issues_l0.append(f"✅ cloudflared 偵測死亡 → 自動重啟 + LINE webhook 更新為 {url}/callback")
+        else:
+            issues_l0.append("🔴 cloudflared 死亡 → 自動重啟失敗（沒抓到新 URL）")
+
     # ── L1 bot 自認狀態（free）────────────────────────────────────────────
     qstate = read_quota_state()
     bot_thinks_exhausted = float(qstate.get("exhausted_until_ts", 0)) > now.timestamp()
@@ -210,8 +315,8 @@ def main() -> int:
         pending_24h_ago = pending_now
     pending_growth = pending_now - pending_24h_ago
 
-    issues: list[str] = []
-    auto_fixed = False
+    issues: list[str] = list(issues_l0)
+    auto_fixed = bool(issues_l0)
     lite_ok = None  # None = 沒探測；True/False = 探測結果
 
     # ── L4 lite 探測（僅在 bot 自認爆時打，省 quota）────────────────────
@@ -247,7 +352,8 @@ def main() -> int:
         )
 
     print(
-        f"[{now.strftime('%Y-%m-%d %H:%M')}] bot_exhausted={bot_thinks_exhausted} "
+        f"[{now.strftime('%Y-%m-%d %H:%M')}] uvicorn={uvicorn_up} cf={cloudflared_up} "
+        f"bot_exhausted={bot_thinks_exhausted} "
         f"lite_probe={lite_ok} pending={pending_now} (+{pending_growth}/24h) "
         f"recent: user={activity['user_msgs']} bot={activity['bot_msgs']} substantive={activity['user_substantive']}"
     )
