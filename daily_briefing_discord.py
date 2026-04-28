@@ -841,12 +841,16 @@ def driving_practice() -> str:
     if len(_DRIVING_ROUTES) > 1:
         lines += [
             "",
-            "─────────────────────",
-            "📋 **候選路線**（升級後再選，由簡入難）",
-            "─────────────────────",
+            "📋 **候選路線**（由簡入難，要練哪條跟我說會展開細節）",
         ]
+        # 候選路線只列一行（節省字數，避免 Discord 2000 字截斷職缺 URL）
         for i, r in enumerate(_DRIVING_ROUTES[1:], 2):
-            lines += _format(i, r)
+            types = set(r.get("types", []))
+            non_focus = types - _CURRENT_FOCUS_TYPES
+            mark = "✅" if not non_focus else f"⏸ 含{','.join(sorted(non_focus))}"
+            lines.append(
+                f"{i}. {mark} [{r['level']}] {r['name']}（{r['duration']}）"
+            )
 
     lines.append("")
     lines.append("離峰時段：平日 10-15 點 / 假日清晨 6-9 點")
@@ -1281,25 +1285,21 @@ def main():
 
     message = "\n".join(sections)
 
-    # Discord 訊息上限 2000 字。截斷時要重算還在訊息內的 URL，
-    # 避免被截掉的職缺被誤記為「已推」導致下次永遠不再推
-    truncated = False
-    if len(message) > 1900:
-        message = message[:1900] + "\n…（截斷）"
-        truncated = True
+    # Discord 訊息上限 2000 字。超過則拆兩則送（avoid 截斷遺失 URL）。
+    # 拆點挑「section 邊界」(空白行)，避免拆到表格中間。
+    chunks = _split_for_discord(message, limit=1900)
 
-    ok = send_dm(message)
-    if not ok:
-        print("Discord 發送失敗", file=sys.stderr)
-        sys.exit(1)
+    sent_text = ""  # 累積真正送出去的內容（用來判斷哪些 URL 確實送到了）
+    for ch in chunks:
+        ok = send_dm(ch)
+        if not ok:
+            print("Discord 發送失敗", file=sys.stderr)
+            sys.exit(1)
+        sent_text += ch + "\n"
 
-    # 推送成功後，把確實出現在 message 裡的職缺 URL 寫入 pushed_jobs.json（永久去重）
+    # 推送成功後，把確實出現在訊息裡的職缺 URL 寫入 pushed_jobs.json（永久去重）
     if _PENDING_PUSH_URLS:
-        urls_actually_sent = (
-            [u for u in _PENDING_PUSH_URLS if u in message]
-            if truncated
-            else list(_PENDING_PUSH_URLS)
-        )
+        urls_actually_sent = [u for u in _PENDING_PUSH_URLS if u in sent_text]
         if urls_actually_sent:
             existing = _load_pushed_jobs()
             existing.update(urls_actually_sent)
@@ -1307,8 +1307,28 @@ def main():
             print(
                 f"已記錄 {len(urls_actually_sent)} 個新職缺 URL → pushed_jobs.json"
                 f"（總計 {len(existing)}）"
-                + (f"；截斷捨棄 {len(_PENDING_PUSH_URLS) - len(urls_actually_sent)} 個" if truncated else "")
             )
+
+
+def _split_for_discord(message: str, limit: int = 1900) -> list:
+    """把長訊息拆成多個 ≤ limit 字的 chunk，盡量在 section 邊界（空白行）拆。"""
+    if len(message) <= limit:
+        return [message]
+    chunks = []
+    remaining = message
+    while len(remaining) > limit:
+        # 找 limit 範圍內最後一個 \n\n（section 邊界）
+        cut = remaining.rfind("\n\n", 0, limit)
+        if cut <= 0:
+            # 沒 section 邊界 → 找 limit 內最後一個 \n
+            cut = remaining.rfind("\n", 0, limit)
+            if cut <= 0:
+                cut = limit  # 硬切（罕見）
+        chunks.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
 
 
 if __name__ == "__main__":
