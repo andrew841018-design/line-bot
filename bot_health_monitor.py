@@ -607,10 +607,28 @@ def main() -> int:
                     "⚠️ 自修失敗：bot 自認 quota 爆但 lite 探測 OK，自動重啟沒成功，需手動處理"
                 )
         else:
-            # 真的爆了，只通知不動
-            issues.append(
-                f"🔴 Gemini lite 也爆了（罕見）：{err[:80]}；等 PT 隔夜重置"
-            )
+            # lite 也爆 quota → 自動處理：清 quota_state.json + 重啟 uvicorn
+            # 重啟後新版 _lite_or_main fallback 會在 lite 失敗時改打 main，
+            # 所以即使 lite 爆，bot 還是能用 main 撐過 PT 隔夜重置（00:00 PT）
+            last_lite_fix = float(state.get("last_lite_autofix_ts", 0))
+            can_lite_fix = now.timestamp() - last_lite_fix > 3600
+            if can_lite_fix:
+                ok = autofix_via_uvicorn_restart("lite_quota_exhausted")
+                state["last_lite_autofix_ts"] = now.timestamp()
+                if ok:
+                    auto_fixed = True
+                    issues.append(
+                        f"✅ Gemini lite 爆 quota 自修：清 quota_state + 重啟 uvicorn，"
+                        f"_lite_or_main fallback 會自動把 lite 失敗轉給 main 撐過今晚（PT 隔夜重置）"
+                    )
+                else:
+                    issues.append(
+                        f"🔴 Gemini lite 爆 quota 自修失敗：{err[:80]}；需手動處理"
+                    )
+            else:
+                issues.append(
+                    f"🟡 Gemini lite 爆 quota（1 小時內已自修過）：{err[:80]}；等下個整點重試"
+                )
 
     # 自修頻率限制：避免自動重啟風暴（同一原因 60 分內不重複自修）
     last_silent_fix = float(state.get("last_silent_autofix_ts", 0))

@@ -449,6 +449,35 @@ def chat(
         raise
 
 
+def _lite_or_main(prompt, config=None):
+    """偏好 light model；lite 爆 429/RESOURCE_EXHAUSTED 自動 fallback 到 main。
+
+    這個 helper 統一處理 lite → main 的反向 fallback（main → lite 已在 chat() 內）。
+    任何「次要」呼叫（分類、feedback 掃描等）都該走這條路徑，避免 lite 爆時整支 die。
+    """
+    try:
+        return _client.models.generate_content(
+            model=settings.gemini_light_model,
+            contents=prompt,
+            config=config,
+        )
+    except Exception as e:
+        err = str(e)
+        is_429 = "429" in err or "RESOURCE_EXHAUSTED" in err
+        if is_429 and settings.gemini_light_model != settings.gemini_model:
+            logger.warning(
+                "gemini lite %s exhausted (429), falling back to main %s",
+                settings.gemini_light_model,
+                settings.gemini_model,
+            )
+            return _client.models.generate_content(
+                model=settings.gemini_model,
+                contents=prompt,
+                config=config,
+            )
+        raise
+
+
 def ocr_image(data: bytes, mime_type: str = "image/jpeg") -> str | None:
     """圖片 OCR + 描述，不帶 tools / thinking / history，快速單次呼叫。"""
     try:
@@ -588,10 +617,9 @@ def classify_burst(
         dialogue=combined_text,
     )
     try:
-        # 分類用 light model，走獨立額度不吃主 chat 的 20/天
-        response = _client.models.generate_content(
-            model=settings.gemini_light_model,
-            contents=prompt,
+        # 分類優先 light model，走獨立額度；lite 爆 quota 自動 fallback 到 main
+        response = _lite_or_main(
+            prompt,
             config=types.GenerateContentConfig(
                 thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
@@ -823,9 +851,9 @@ def scan_feedback_messages(messages: list[dict]) -> list[dict]:
     msg_lines = "\n".join(f"[weight={m['weight']}] {m['text']}" for m in messages)
     prompt = _FEEDBACK_SCAN_PROMPT.format(messages=msg_lines)
     try:
-        response = _client.models.generate_content(
-            model=settings.gemini_light_model,
-            contents=prompt,
+        # lite 爆 quota 自動 fallback 到 main
+        response = _lite_or_main(
+            prompt,
             config=types.GenerateContentConfig(
                 thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
