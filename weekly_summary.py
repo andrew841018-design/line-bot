@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import requests
 
+import family_interest
 import gemini_client
 import memory
 
@@ -66,15 +67,26 @@ def main() -> None:
         f"{joined}"
     )
 
+    # bot 摘要（Gemini 失敗就跳過，但不影響家族熱話）
     try:
         summary = gemini_client.chat(prompt, [], [], None)
+        push_text = f"📋 本週咪寶摘要\n\n{summary}"
+        _push(push_text)
+        print(f"週摘要已推播 ({len(bot_replies)} 則回應，取最近 {len(sample)} 則)")
     except Exception as e:
-        print(f"ERR Gemini: {e}")
-        return
+        print(f"ERR Gemini bot 摘要 (跳過，繼續家族熱話): {e}")
 
-    push_text = f"📋 本週咪寶摘要\n\n{summary}"
-    _push(push_text)
-    print(f"週摘要已推播 ({len(bot_replies)} 則回應，取最近 {len(sample)} 則)")
+    # 家族熱話週報（per Q5=B）— 偵測 4 主成員過去 30 天興趣 + 對應新聞
+    # 不依賴 Gemini，純 lexicon + RSS，所以 Gemini 爆 quota 不影響
+    try:
+        family_text = family_interest.render_summary(GROUP_ID, days=30)
+        if family_text:
+            _push(family_text[:4900])
+            print(f"家族熱話週報已推播（{len(family_text)} 字）")
+        else:
+            print("家族熱話無偵測到主題（過去 30 天訊息不足）")
+    except Exception as e:
+        print(f"ERR 家族熱話: {e}")
 
 
 if __name__ == "__main__":
