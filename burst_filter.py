@@ -278,7 +278,12 @@ _CHITCHAT_EXACT = {
 
 
 def _heuristic_decision(text: str) -> str | None:
-    """回傳 'skip' / 'respond' / None（交給 classifier 決定）。"""
+    """回傳 'skip' / 'respond' / None（交給 classifier 決定）。
+
+    順序很重要：問句／驚嘆句的 topic-end punct 判斷要在「太短 → skip」之前，
+    否則「今晚有誰要吃和園？」這種 9 字短問句會被誤跳。但仍要過 CHITCHAT_EXACT
+    白名單把「好喔 / 哈哈」這種純閒聊先擋掉。
+    """
     stripped = text.strip()
 
     # 整則 = 固定閒聊短語 → skip
@@ -287,19 +292,25 @@ def _heuristic_decision(text: str) -> str | None:
 
     has_url = bool(_URL_RE.search(stripped))
 
-    # 太短 + 無連結 → skip
-    if len(stripped) < HEURISTIC_SHORT_LEN and not has_url:
-        return "skip"
-
     # 含連結 → respond
     if has_url:
         return "respond"
+
+    # 末句有明確結束信號（？/！/。/～/…）→ 即使短句也要回，特別是家族問句
+    # 例：「今晚有誰要吃和園？」「會下雨嗎？」「太誇張了！」
+    # 但 4 字以下（如「我！」「對啦」）多半是 reaction，仍交給後面長度判定
+    if _TOPIC_END_RE.search(stripped) and len(stripped) >= 4:
+        return "respond"
+
+    # 太短 + 無連結 + 無結束標點 → skip
+    if len(stripped) < HEURISTIC_SHORT_LEN and not has_url:
+        return "skip"
 
     # 單一則就超過 HEURISTIC_LONG_LEN → 很可能是轉貼文章 → respond
     if len(stripped) >= HEURISTIC_LONG_LEN:
         return "respond"
 
-    # 末句有明確結束信號 → 話說完了，直接回不等 Gemini
+    # 中等長度有結束標點（其他案例已被上面 4-char 檢查接住）→ respond
     if _TOPIC_END_RE.search(stripped):
         return "respond"
 
