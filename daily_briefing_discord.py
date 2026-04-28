@@ -810,26 +810,45 @@ _CURRENT_FOCUS_TYPES = {"橋", "高架", "公路", "快速"}
 
 
 def driving_practice() -> str:
-    """列出所有練車路線（依難度由簡入難），讓 Andrew 自己挑。
+    """練車路線：#1 主練、#2-8 候選分區呈現。
 
     現階段 focus = {橋, 高架, 公路, 快速}：符合的標 ✅，不符合（如雪隧）標 ⏸。
     """
     if not _DRIVING_ROUTES:
         return ""
-    lines = [
-        "🚗 **練車路線清單**（起點：善導寺，由簡入難）",
-        "📅 現階段：每 2 週 ~ 1 個月練一次",
-        f"🎯 現階段練：{' / '.join(sorted(_CURRENT_FOCUS_TYPES))}（其餘 ⏸ 暫緩）",
-    ]
-    for i, r in enumerate(_DRIVING_ROUTES, 1):
+
+    def _format(idx: int, r: dict) -> list:
         types = set(r.get("types", []))
         non_focus = types - _CURRENT_FOCUS_TYPES
         mark = "✅" if not non_focus else f"⏸ 含 {','.join(sorted(non_focus))}"
         type_tags = "/".join(types) if types else "?"
-        lines.append(
-            f"{i}. {mark} [{r['level']}] {r['name']}（{r['duration']}，{type_tags}）"
-        )
-        lines.append(f"   {r['path']}")
+        return [
+            f"{idx}. {mark} [{r['level']}] {r['name']}（{r['duration']}，{type_tags}）",
+            f"   {r['path']}",
+        ]
+
+    lines = [
+        "🚗 **練車路線**（起點：善導寺）",
+        "📅 現階段：每 2 週 ~ 1 個月練一次",
+        f"🎯 現階段練：{' / '.join(sorted(_CURRENT_FOCUS_TYPES))}（其餘 ⏸ 暫緩）",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━━",
+        "▶️ **目前主練（focus）**",
+        "━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    lines += _format(1, _DRIVING_ROUTES[0])
+
+    if len(_DRIVING_ROUTES) > 1:
+        lines += [
+            "",
+            "─────────────────────",
+            "📋 **候選路線**（升級後再選，由簡入難）",
+            "─────────────────────",
+        ]
+        for i, r in enumerate(_DRIVING_ROUTES[1:], 2):
+            lines += _format(i, r)
+
+    lines.append("")
     lines.append("離峰時段：平日 10-15 點 / 假日清晨 6-9 點")
     return "\n".join(lines)
 
