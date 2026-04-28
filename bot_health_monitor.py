@@ -338,6 +338,20 @@ def proc_alive(pattern: str) -> bool:
     return r.returncode == 0
 
 
+def _wait_for_health(timeout: int = 30, pattern: str = "uvicorn.*main:app") -> bool:
+    """polling /health 直到 200（startup 含 prefetch + Gemini call 約 7-10s）；
+    若 process 中途死掉（import / syntax error）立刻 fail。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(1)
+        if not proc_alive(pattern):
+            return False
+        ok, _ = http_health()
+        if ok:
+            return True
+    return False
+
+
 def restart_uvicorn() -> bool:
     """強制重啟 uvicorn。回 True 表示 /health 200。"""
     try:
@@ -357,12 +371,7 @@ def restart_uvicorn() -> bool:
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-        time.sleep(5)
-        r = subprocess.run(
-            ["curl", "-s", "--interface", "lo0", "http://localhost:8080/health"],
-            capture_output=True, text=True, timeout=5,
-        )
-        return '"status":"ok"' in (r.stdout or "")
+        return _wait_for_health(timeout=30)
     except Exception:
         return False
 
@@ -442,15 +451,7 @@ def attempt_auto_fix() -> bool:
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-        time.sleep(4)
-        # health 探測
-        r = subprocess.run(
-            ["curl", "-s", "--interface", "lo0", "http://localhost:8080/health"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        return '"status":"ok"' in (r.stdout or "")
+        return _wait_for_health(timeout=30)
     except Exception:
         return False
 
