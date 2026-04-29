@@ -901,10 +901,10 @@ def line_bot_suggestions() -> str:
     # 近 7 天已推薦過的
     history = []
     if _SUGGESTION_HISTORY.exists():
+        # 永久去重：Andrew 的規則「沒叫我做 = 沒興趣，不要再推同一個」
+        # 過去推過的所有 title 全部進黑名單，每天必須是新的
         try:
-            raw = json.loads(_SUGGESTION_HISTORY.read_text())
-            cutoff = datetime.now() - timedelta(days=7)
-            history = [h for h in raw if datetime.fromisoformat(h["date"]) >= cutoff]
+            history = json.loads(_SUGGESTION_HISTORY.read_text())
         except Exception:
             history = []
 
@@ -949,7 +949,7 @@ def line_bot_suggestions() -> str:
     skipped_list = _parse_section(memory_text, "## 已略過")
     pending_list = _parse_section(memory_text, "## 待建議")
 
-    # 黑名單：已執行 + 已略過 + 近 7 天推薦過
+    # 黑名單：已執行 + 已略過 + 過去推過的所有 title（永久去重，沒採納就當沒興趣）
     blacklist = list(set(done_list + skipped_list + [h["title"] for h in history]))
 
     prompt = f"""你是 LINE bot 的產品顧問。任務：根據近 3 天群組對話，主動發想 1 個讓 Andrew 的家族 LINE bot 變更實用的新功能。
@@ -960,12 +960,12 @@ def line_bot_suggestions() -> str:
 【📋 已存在的待建議（未實作但已記下）】
 {json.dumps(pending_list, ensure_ascii=False)}
 
-【🚫 不要重複的（已實作或已拒絕，名稱相同就不行）】
+【🚫 不要重複的（過去任何時候推過的，永久黑名單）】
 {json.dumps(blacklist, ensure_ascii=False)}
 
 規則：
 1. **積極發想**：對話樣本只要有「資訊缺口、查詢需求、誤解、麻煩」就值得提建議。寧可大膽嘗試也不要消極回 null
-2. **黑名單只擋名稱完全相同**：如果你的新點子用不同方式解決類似問題、或從不同角度切入，就 OK
+2. **永久去重，不准包裝同樣概念**：黑名單裡的不只 title 完全相同不行，**用不同說法包裝同樣概念也不行**（例：「對話搜尋」vs「過去聊天記錄查詢」算同一件事）。Andrew 的規則「沒叫我做就是沒興趣」，請從**完全不同領域 / 角度 / 痛點**切入
 3. **建議方向參考**（任選一個或自創）：
    - 訂閱式提醒（股票代號、特定關鍵字觸發推播）
    - 跨群組 / 個人 DM 整合
