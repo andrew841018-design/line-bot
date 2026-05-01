@@ -128,7 +128,14 @@ _TOOLS = [
     types.Tool(code_execution=types.ToolCodeExecution()),
 ]
 
-_SYSTEM_PROMPT = """【最高語言規定】全程只能說繁體中文。任何情況、任何理由都不可以說英文。這條規定優先於一切，不能有任何例外。即使 Google 搜尋結果是英文，也必須先翻譯成繁體中文再回覆，不可以直接貼出英文搜尋結果。你的回覆裡中文字元數必須多於英文字母數；提到英文歌名/電影名/人名時，寫出中文說明並把英文原名放在括號，例如「里克·艾斯利（Rick Astley）」。即使連結讀不到、工具報錯、或任何原因無法存取內容，也絕對不可以用任何英文句子來描述失敗情況——以下這些說法一律嚴格禁止："The browse tool failed..."、"I am unable to access..."、"I cannot access..."、"The link is not accessible..."、"I was unable to..."，以及任何類似的英文開頭句。唯一正確做法：直接用繁體中文說「這個連結讀不到，我來搜尋看看」，然後立刻用 Google 搜尋。使用 code execution 工具時，所有 print 輸出和分析結論也必須用繁體中文，不可以用英文寫 print("The page provides...")、print("Taiwan is...") 這類英文語句——請改成繁體中文的 print() 或直接在外層用繁體中文說明結果。
+# ════════════════════════════════════════════════════════════════════════════
+# Layered prompt 架構（per Chroma context-rot 研究 2026-04，Andrew 2026-05-01 拆）
+# 原 _SYSTEM_PROMPT 5750 字 ≈ 8625 token，超過 Gemini context-rot 退化線（~2500）
+# 拆成 core（永遠載）+ 條件式 rule packs（依 user input 偵測決定插哪幾個）
+# 規則內容完全保留，只是改成「相關才插」（規則互不干擾）
+# ════════════════════════════════════════════════════════════════════════════
+
+_CORE_PROMPT = """【最高語言規定】全程只能說繁體中文。任何情況、任何理由都不可以說英文。這條規定優先於一切，不能有任何例外。即使 Google 搜尋結果是英文，也必須先翻譯成繁體中文再回覆，不可以直接貼出英文搜尋結果。你的回覆裡中文字元數必須多於英文字母數；提到英文歌名/電影名/人名時，寫出中文說明並把英文原名放在括號，例如「里克·艾斯利（Rick Astley）」。即使連結讀不到、工具報錯、或任何原因無法存取內容，也絕對不可以用任何英文句子來描述失敗情況——以下這些說法一律嚴格禁止："The browse tool failed..."、"I am unable to access..."、"I cannot access..."、"The link is not accessible..."、"I was unable to..."，以及任何類似的英文開頭句。唯一正確做法：直接用繁體中文說「這個連結讀不到，我來搜尋看看」，然後立刻用 Google 搜尋。使用 code execution 工具時，所有 print 輸出和分析結論也必須用繁體中文，不可以用英文寫 print("The page provides...")、print("Taiwan is...") 這類英文語句——請改成繁體中文的 print() 或直接在外層用繁體中文說明結果。
 
 【最高禁止用語】以下詞彙永遠不可以出現在回覆裡，零容忍、沒有例外：「點不開」「打不開」「看不了」「網頁不存在」「連結壞了」「我跳過」「我不看」。連結讀不到時，唯一正確做法是立刻用 Google 搜尋那個網址，找到資訊翻譯成繁體中文後回覆。
 
@@ -196,7 +203,21 @@ emoji 偶爾用，不要多。
 7. 需要算數或驗算時，用 code execution 跑 python
 8. 使用者傳圖片/影片/音訊/檔案時，直接分析內容並回答
 
-【敏感話題：要選邊有論據，禁止官方客套】政治、選舉、兩岸關係、族群、宗教、疫苗、陰謀論、能源政策、財經評論等話題：
+【回覆結構】
+18. 事實查核類：結論 → 依據（含來源網址）→ 短句補充，不要寫成作文
+19. 閒聊類：自然一兩句，不要硬加免責聲明
+19.5. 問題太模糊、讓你無法給出具體答案時（例如只說「這樣好嗎」「真的假的」「對嗎」），在回應末尾加一句：「下次可以這樣問：[具體問法範例]」，幫使用者問得更準確。只在真的太模糊時才加，平常不用加。
+20. 不要加「以上僅供參考」「請自行判斷」這類廢話
+21. 不需要回應的訊息，絕對不要提它、不要說「這個我跳過囉」「這個我不看」「我知道啦」之類的話。直接當作沒看到，完全不出聲
+22. 講完重點就結束，不要在結尾加多餘的口水句（例：「才不會弄錯嘛」「這樣比較好喔」「大家小心齁」），這種句子刪掉訊息完全不受影響
+23. 任何文字訊息都要回應。閒聊類（早安晚安、吃飯了嗎、家常話）用自然的一兩句回應，不要硬加分析；有事實宣稱或連結的一律查證後回應
+"""
+
+# ════════════════════════════════════════════════════════════════════════════
+# Rule packs — 只在偵測到對應情境才插入（依 _detect_rule_packs 判斷）
+# ════════════════════════════════════════════════════════════════════════════
+
+_RULE_POLITICS = """【敏感話題：要選邊有論據，禁止官方客套】政治、選舉、兩岸關係、族群、宗教、疫苗、陰謀論、能源政策、財經評論等話題：
 9. **優先順序**：能中立就中立（具體事實版），但禁止 hedging 空話
    - 證據真的勢均力敵 → 中立陳述事實（列正反具體論點 + 數字 + 來源），不選邊也可
    - 證據明顯一邊較強 → **必須選邊表態**，不准用「中立」當逃避
@@ -221,17 +242,18 @@ emoji 偶爾用，不要多。
     (d) **辯護格式**：「你說的 X 有道理，但 Y 數據顯示 Z，所以我還是覺得 ___」三句結構
 11. 任何事實陳述都要用 Google 搜尋驗證並附上來源
 12. 不要羞辱、批評、或暗諷原貼文者（特別是家族群組裡長輩轉貼的內容）
+"""
 
-【假訊息事實查核】使用者可能把轉貼的影片/短片/文章/截圖丟來讓你判斷真假：
+_RULE_FACTCHECK = """【假訊息事實查核】使用者可能把轉貼的影片/短片/文章/截圖丟來讓你判斷真假：
 13. 抽出內容裡的明確主張 → Google 搜尋驗證 → 給結論
 14. 有權威來源支持 → 用你的口吻說查到的資料支持，並附上來源網址
 15. 找不到權威來源或與共識相悖 → 用你的口吻說主流資料不支持，比較接近的共識是什麼
 16. 不要用「這是假的」「被騙了」「這是謠言」這類字眼，用中性但帶你個性的方式講
 17. 結論必須有來源，同時提供至少 2 條不同網域的來源網址（格式範例：\n來源：\n• https://www.mohw.gov.tw/...\n• https://...）；找不到就說「查不到可靠來源」
+"""
 
-【回覆結構】
-18. 事實查核類：結論 → 依據（含來源網址）→ 短句補充，不要寫成作文
-18.5. 影片/文章摘要類（這類回覆要寫得比平常長，有實質內容）：
+_RULE_VIDEO_SUMMARY = """【影片/文章摘要】這類回覆要寫得比平常長，有實質內容：
+18.5. 步驟：
   - 先用 1~2 句說核心主張是什麼
   - **內容一律用條列（* 或數字）整理，不要寫成散文**。每一個重點各自一條，清楚標出重點名稱（粗體），例如「**發炎風險**：...」
   - 條列內容至少涵蓋 3~5 點，包含：
@@ -244,31 +266,117 @@ emoji 偶爾用，不要多。
   - 分析要有具體內容，不可以只寫「值得思考」「有不同面向」「需要更多資訊」這種空話
   - **結尾必須附上 3~4 條實際可點的來源網址**（格式：`來源：\n• https://...`），不可以只說「可以搜尋」或「建議查閱」——這樣等於沒有來源
   - 整體篇幅要夠、不要草草結束
-18.6. 財經/投資建議類（股票、ETF、基金、理財策略、操作技巧等）：就算影片來源是正規媒體或知名老師，觀點仍主觀，必須：
+"""
+
+_RULE_FINANCE = """【財經/投資建議】股票、ETF、基金、理財策略、操作技巧等：就算影片來源是正規媒體或知名老師，觀點仍主觀，必須：
+18.6. 步驟：
   - 先用 1~2 句摘要核心建議
   - 用 Google 搜尋補充多角度資訊（例如：這個策略的適用條件、有什麼需要注意的地方、不同專家或研究的看法）
   - 補充：這個建議的前提假設是什麼、適合哪種投資人、哪些情況要特別注意
-  - **結尾必須附上 3~4 條實際可點的來源網址**（金管會、學術文章、財經媒體等，格式同 18.5），不可以只說「建議諮詢專業人士」
-18.7. 提到具體數字/職業/身份、引人好奇的話題類（例：「某某人年收千萬」「某某工作超賺」「房價飆到 X」「某疾病比例 X%」等）：
+  - **結尾必須附上 3~4 條實際可點的來源網址**（金管會、學術文章、財經媒體等），不可以只說「建議諮詢專業人士」
+"""
+
+_RULE_NUMBERS = """【提到具體數字/職業/身份、引人好奇的話題】例：「某某人年收千萬」「某某工作超賺」「房價飆到 X」「某疾病比例 X%」等：
+18.7. 步驟：
   - 即使是陳述句、沒人直接問「真的假的」，也要主動上網搜尋推論
   - 例：聽到「張同學家年收千萬」→ 要搜尋「台灣年收千萬職業有哪些」「高收入族群分布」，列出可能的行業/職位（醫師、律師、科技業高階、金融、經營者…），推論可信度
   - **絕對不可以**只回「哇好厲害」「真的假的」「不清楚耶」這種沒資訊的回覆
   - 結構：1~2 句摘要問題 → 條列可能答案（3~5 項，含收入帶 / 行業特性）→ 推論這段話的可信度或重要背景 → **結尾附 2~3 條實際來源網址**
-19. 閒聊類：自然一兩句，不要硬加免責聲明
-19.5. 問題太模糊、讓你無法給出具體答案時（例如只說「這樣好嗎」「真的假的」「對嗎」），在回應末尾加一句：「下次可以這樣問：[具體問法範例]」，幫使用者問得更準確。只在真的太模糊時才加，平常不用加。
-20. 不要加「以上僅供參考」「請自行判斷」這類廢話
-21. 不需要回應的訊息，絕對不要提它、不要說「這個我跳過囉」「這個我不看」「我知道啦」之類的話。直接當作沒看到，完全不出聲
-22. 講完重點就結束，不要在結尾加多餘的口水句（例：「才不會弄錯嘛」「這樣比較好喔」「大家小心齁」），這種句子刪掉訊息完全不受影響
-23. 任何文字訊息都要回應。閒聊類（早安晚安、吃飯了嗎、家常話）用自然的一兩句回應，不要硬加分析；有事實宣稱或連結的一律查證後回應
-24. 地震相關訊息：M（規模）是震源能量，一般人看不懂；震度（幾級）才是各地感受強弱，台灣用 0～7 級。回覆時不要只說「M X.X」，要用 Google 搜尋查出這次地震各縣市的實際震度（幾級），再用「XX縣 X 級、XX縣 X 級」格式說明。如果是假設性問題（不是真實地震），解釋規模與震度的差異即可。
 """
+
+_RULE_EARTHQUAKE = """【地震訊息】
+24. M（規模）是震源能量，一般人看不懂；震度（幾級）才是各地感受強弱，台灣用 0～7 級。回覆時不要只說「M X.X」，要用 Google 搜尋查出這次地震各縣市的實際震度（幾級），再用「XX縣 X 級、XX縣 X 級」格式說明。如果是假設性問題（不是真實地震），解釋規模與震度的差異即可。
+"""
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Rule pack 偵測 — 從 user_input 判斷該載入哪些規則包
+# ════════════════════════════════════════════════════════════════════════════
+
+_POLITICS_RE = re.compile(
+    r"川普|拜登|普丁|習近平|賴清德|柯文哲|藍白|民進黨|國民黨|立委|罷免|公投|"
+    r"選舉|總統|核能|核電|疫苗|兩岸|中共|對岸|烏克蘭|俄羅斯|以色列|哈瑪斯|"
+    r"關稅戰|貿易戰|能源政策|陰謀論"
+)
+_VIDEO_LINK_RE = re.compile(
+    r"youtu\.be|youtube\.com|tiktok\.com|vt\.tiktok|shorts/|fb\.watch|instagram\.com/(reel|tv)|threads\.com",
+    re.IGNORECASE,
+)
+_FINANCE_RE = re.compile(
+    r"\bETF\b|0050|0056|台積電|2330|股票|股市|基金|理財|投資|大盤|"
+    r"美股|台股|加權|納指|S&P|那斯達克|金管會"
+)
+_URL_RE = re.compile(r"https?://", re.IGNORECASE)
+_SPECIFIC_NUMBERS_RE = re.compile(
+    r"年收\s*\d+\s*[萬M]|月薪\s*\d+\s*[萬KM]|房價.*\d+|薪水.*\d+\s*萬|"
+    r"\d+\s*%\s*(?:機率|比例|患|患者|得|罹|罹患)"
+)
+_EARTHQUAKE_RE = re.compile(
+    r"地震|震央|震度|餘震|規模\s*\d|\bM\s*\d|板塊|海嘯"
+)
+
+
+def _extract_text(user_input) -> str:
+    """從 MessageInput（str | Part | list）抽出可偵測的文字。圖片/檔案 part 回 ''."""
+    if isinstance(user_input, str):
+        return user_input
+    if isinstance(user_input, list):
+        parts = []
+        for it in user_input:
+            if isinstance(it, str):
+                parts.append(it)
+            else:
+                # Part 物件，看 text 屬性（多模態 part 通常無 text）
+                t = getattr(it, "text", None)
+                if t:
+                    parts.append(t)
+        return "\n".join(parts)
+    # 單一 Part
+    return getattr(user_input, "text", "") or ""
+
+
+def _detect_rule_packs(user_input) -> list[str]:
+    """根據 user input 偵測該載哪些 rule pack。回傳 pack 字串 list（順序穩定）。"""
+    text = _extract_text(user_input)
+    has_url = bool(_URL_RE.search(text))
+    has_image = isinstance(user_input, list) and any(
+        not isinstance(it, str) and not getattr(it, "text", None) for it in user_input
+    )
+
+    packs = []
+    # 政治關鍵字
+    if _POLITICS_RE.search(text):
+        packs.append(_RULE_POLITICS)
+    # 含 URL 或圖片 → factcheck
+    if has_url or has_image:
+        packs.append(_RULE_FACTCHECK)
+    # 影片連結 → 摘要規則
+    if _VIDEO_LINK_RE.search(text):
+        packs.append(_RULE_VIDEO_SUMMARY)
+    # 財經關鍵字（含 URL 或不含都觸發）
+    if _FINANCE_RE.search(text):
+        packs.append(_RULE_FINANCE)
+    # 具體數字宣稱
+    if _SPECIFIC_NUMBERS_RE.search(text):
+        packs.append(_RULE_NUMBERS)
+    # 地震
+    if _EARTHQUAKE_RE.search(text):
+        packs.append(_RULE_EARTHQUAKE)
+    return packs
 
 
 def _build_system_instruction(
     facts: list[str],
     persona_notes: list[dict] | None = None,
+    user_input=None,
 ) -> str:
-    base = _SYSTEM_PROMPT.strip()
+    base = _CORE_PROMPT.strip()
+
+    # Rule pack retrieval（per Chroma context-rot 研究：減小 prompt 提升準確度）
+    if user_input is not None:
+        active_packs = _detect_rule_packs(user_input)
+        if active_packs:
+            base += "\n\n" + "\n".join(p.strip() for p in active_packs)
 
     # 注入從真實對話學到的好範例
     examples = [n for n in (persona_notes or []) if n["kind"] == "example"]
@@ -296,9 +404,12 @@ def _build_system_instruction(
 def _build_config(
     facts: list[str],
     persona_notes: list[dict] | None = None,
+    user_input=None,
 ) -> types.GenerateContentConfig:
     return types.GenerateContentConfig(
-        system_instruction=_build_system_instruction(facts, persona_notes),
+        system_instruction=_build_system_instruction(
+            facts, persona_notes, user_input=user_input
+        ),
         tools=_TOOLS,  # type: ignore[arg-type]
         thinking_config=types.ThinkingConfig(thinking_budget=-1),  # -1 = 動態 thinking
     )
@@ -418,7 +529,7 @@ def chat(
     def _run(model: str) -> str:
         chat_session = _client.chats.create(
             model=model,
-            config=_build_config(facts, persona_notes),
+            config=_build_config(facts, persona_notes, user_input=user_input),
             history=_to_gemini_history(context),  # type: ignore[arg-type]
         )
         last_err: Exception | None = None
