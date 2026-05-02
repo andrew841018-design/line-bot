@@ -1336,6 +1336,17 @@ def main():
     # 每天嘗試從 Wikiquote 抓一條新雞湯加入 dynamic 池（fail-safe）
     _try_append_today_quote()
 
+    # SOXX tracker (Phase 6 integration) — pullback briefing
+    # 週日(weekday=6)/週一(0) 內部已 gate；資料過期也回空字串。
+    try:
+        sys.path.insert(0, str(BASE / 'soxx_tracker'))
+        from integration.briefing_section import soxx_briefing_section
+        soxx_section = soxx_briefing_section()
+        if soxx_section:
+            sections += ["", soxx_section]
+    except Exception as e:
+        print(f"[soxx_briefing] skipped: {e}", file=sys.stderr)
+
     sox = sox_sentiment()
     if sox:
         sections += ["", sox]
@@ -1376,23 +1387,28 @@ def main():
 
 
 def _split_for_discord(message: str, limit: int = 1900) -> list:
-    """把長訊息拆成多個 ≤ limit 字的 chunk，盡量在 section 邊界（空白行）拆。"""
+    """Unit-atomic 拆 chunk：每個 chunk 至少含 1 個完整 unit，unit 絕不切半。
+
+    Unit = 用 "\\n\\n" 分隔的段落（每個 section）。greedy 打包，放不下就推下一 chunk。
+    若單一 unit > limit，仍整段獨立送（Discord 會嫌長但比切半好）。
+    """
     if len(message) <= limit:
         return [message]
+
+    units = [u.strip() for u in message.split("\n\n") if u.strip()]
     chunks = []
-    remaining = message
-    while len(remaining) > limit:
-        # 找 limit 範圍內最後一個 \n\n（section 邊界）
-        cut = remaining.rfind("\n\n", 0, limit)
-        if cut <= 0:
-            # 沒 section 邊界 → 找 limit 內最後一個 \n
-            cut = remaining.rfind("\n", 0, limit)
-            if cut <= 0:
-                cut = limit  # 硬切（罕見）
-        chunks.append(remaining[:cut].rstrip())
-        remaining = remaining[cut:].lstrip()
-    if remaining:
-        chunks.append(remaining)
+    current = ""
+    for unit in units:
+        candidate = f"{current}\n\n{unit}" if current else unit
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        # 加上去就爆 → flush 現有 chunk，把 unit 放新 chunk
+        if current:
+            chunks.append(current)
+        current = unit  # 單一 unit > limit 也整段保留
+    if current:
+        chunks.append(current)
     return chunks
 
 
