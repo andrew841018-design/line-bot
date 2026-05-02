@@ -182,6 +182,20 @@ _YTDLP_TIMEOUT = 12  # yt-dlp 單次提取上限（秒）
 _YTDLP_SUBTITLE_MAX_CHARS = 3000
 _YTDLP_SUBTITLE_LANGS = ["zh-TW", "zh-Hant", "zh", "zh-Hans", "en"]
 
+# Gemini Video Understanding fallback 參數
+_GEMINI_VIDEO_TIMEOUT = 60  # 整個 download + upload + analyze 的總上限（秒）
+_GEMINI_VIDEO_MAX_FILESIZE = "50M"  # yt-dlp --max-filesize
+_GEMINI_VIDEO_MIN_REMAINING_QUOTA = 5  # 今日剩餘 < 此值就不啟動（影片呼叫 token 較重）
+_GEMINI_VIDEO_THIN_THRESHOLD = 300  # 前面 prefetch 結果 < 此字數才 fallback
+# 哪些 domain 才允許走 Gemini video fallback（短影音 / JS 渲染）
+# 注意：YouTube 因為 yt-dlp 已能抓字幕，不啟動 fallback
+_GEMINI_VIDEO_DOMAINS = re.compile(
+    r"https?://(?:[a-z0-9-]+\.)*("
+    r"tiktok\.com|instagram\.com|threads\.net|facebook\.com|fb\.watch|x\.com|twitter\.com"
+    r")/",
+    re.IGNORECASE,
+)
+
 # JS 渲染 / Cloudflare 保護的網站，requests.get() 抓不到有效內容
 # 這些網站一律不 prefetch，直接讓 Gemini 用 Google Search 處理
 _JS_RENDERED_DOMAINS = re.compile(
@@ -621,6 +635,168 @@ def _fetch_instagram_embed(url: str) -> str | None:
         return None
 
 
+def _gemini_video_quota_ok() -> bool:
+    """今日 Gemini quota 剩餘 >= _GEMINI_VIDEO_MIN_REMAINING_QUOTA 才允許走 video fallback。
+
+    影片呼叫的 token 量比文字大很多（一段 30 秒影片 ~3-10k tokens），需要保留餘裕給
+    一般對話。失敗時 conservative，回 False（寧可不啟動也不要爆 quota）。
+    """
+    try:
+        info = gemini_client.get_gemini_quota_info()
+        if info is None:
+            return False
+        remaining_req = info["limit_requests"] - info["used_requests"]
+        return remaining_req >= _GEMINI_VIDEO_MIN_REMAINING_QUOTA
+    except Exception:
+        return False
+
+
+def _fetch_video_gemini(url: str) -> str | None:
+    """
+    終極 fallback：用 yt-dlp 把短影片抓下來，丟給 Gemini 2.5 Flash 用 Files API 分析。
+
+    觸發條件（caller 負責判斷）：
+      - prefetch chain 拿到的內容 < _GEMINI_VIDEO_THIN_THRESHOLD 字
+      - URL 屬於 _GEMINI_VIDEO_DOMAINS（TikTok / IG / FB / Threads / X，不含 YouTube）
+      - 今日 Gemini quota 剩餘 >= _GEMINI_VIDEO_MIN_REMAINING_QUOTA
+
+    流程：
+      1. yt-dlp 下載 MP4 到 /tmp/linebot_video_<hash>.mp4（--max-filesize 50M）
+      2. 上傳到 Gemini Files API
+      3. 輪詢直到 file.state == ACTIVE
+      4. generate_content("用繁體中文簡短描述...")
+      5. 清理：刪除 Files API 上的檔案 + 本地 mp4
+
+    任何錯誤回 None，由 caller fallback。整個流程有 60 秒總 timeout 保護。
+    """
+    if not _YTDLP_AVAILABLE:
+        return None
+
+    import hashlib
+    from pathlib import Path
+
+    start_ts = time.time()
+    url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
+    local_path = f"/tmp/linebot_video_{url_hash}.mp4"
+    uploaded_file = None
+
+    def _elapsed_ok() -> bool:
+        return (time.time() - start_ts) < _GEMINI_VIDEO_TIMEOUT
+
+    try:
+        # 1) 下載影片：優先低畫質（短影音分析不需要 1080p，能省 5-10x bandwidth）
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "max_filesize": 50 * 1024 * 1024,
+            "outtmpl": local_path,
+            # 偏好最差但有畫質的 mp4：降低 bandwidth、加快 download
+            "format": "worst[ext=mp4]/worst/mp4",
+            # 短影音 CDN 偶爾很慢，整個下載階段給 35 秒（剩 25 秒給 upload + analyze）
+            "socket_timeout": 35,
+            "overwrites": True,
+        }
+        with _yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+
+        if not os.path.exists(local_path) or os.path.getsize(local_path) == 0:
+            logger.info("gemini video fallback: download empty url=%s", url)
+            return None
+
+        if not _elapsed_ok():
+            logger.info("gemini video fallback: timeout after download url=%s", url)
+            return None
+
+        # 2) 上傳到 Files API
+        uploaded_file = gemini_client._client.files.upload(file=Path(local_path))
+
+        # 3) 輪詢直到 ACTIVE
+        while True:
+            if not _elapsed_ok():
+                logger.info(
+                    "gemini video fallback: timeout while waiting active url=%s", url
+                )
+                return None
+            f = gemini_client._client.files.get(name=uploaded_file.name)
+            state = getattr(f.state, "name", str(f.state))
+            if state == "ACTIVE":
+                uploaded_file = f
+                break
+            if state == "FAILED":
+                logger.info("gemini video fallback: file FAILED url=%s", url)
+                return None
+            time.sleep(1)
+
+        # 4) generate_content
+        prompt = (
+            "用繁體中文簡短描述這部影片的主要內容（含口白、畫面、訊息），"
+            "200 字內。如果是廣告/業配/沒重點請直說。"
+        )
+        response = gemini_client._client.models.generate_content(
+            model=settings.gemini_model,
+            contents=[uploaded_file, prompt],
+        )
+        # 計入 quota counter
+        try:
+            gemini_client._track_usage(response)
+        except Exception:
+            pass
+
+        text = (response.text or "").strip()
+        if not text:
+            logger.info("gemini video fallback: empty response url=%s", url)
+            return None
+
+        block = (
+            f"（以下是影片連結 {url} 的內容，由 Gemini Video Understanding 分析）\n"
+            f"--- 影片分析開始 ---\n"
+            f"{text}\n"
+            f"--- 影片分析結束 ---"
+        )
+        logger.info(
+            "gemini video fallback used url=%s chars=%d", url, len(block)
+        )
+        return block
+    except Exception as e:
+        logger.info("gemini video fallback failed url=%s: %s", url, e)
+        return None
+    finally:
+        # 清理 Files API 上傳的檔案
+        if uploaded_file is not None:
+            try:
+                gemini_client._client.files.delete(name=uploaded_file.name)
+            except Exception as e:
+                logger.debug("gemini video fallback: delete remote failed: %s", e)
+        # 清理本地 mp4
+        try:
+            if os.path.exists(local_path):
+                os.unlink(local_path)
+        except Exception as e:
+            logger.debug("gemini video fallback: unlink local failed: %s", e)
+
+
+def _maybe_video_fallback(url: str, current_block: str | None) -> str | None:
+    """若 current_block 太薄且 URL 是視訊平台，嘗試 Gemini video fallback。
+
+    回傳：fallback 結果 OR 原 current_block（保持原行為）
+    """
+    if not _GEMINI_VIDEO_DOMAINS.search(url):
+        return current_block
+    chars = len(current_block) if current_block else 0
+    if current_block is not None and chars >= _GEMINI_VIDEO_THIN_THRESHOLD:
+        return current_block
+    # 不做本地 quota pre-block——讓 Google server-side 決定。429 由 _fetch_video_gemini
+    # 內部 catch 後回 None，pipeline 自然 fallback 不影響流程。能送就送、不要白白浪費機會。
+    fallback = _fetch_video_gemini(url)
+    if fallback:
+        # 如果有原本的 block（薄但非空），把兩者拼起來給 model 更多 context
+        if current_block:
+            return current_block + "\n\n" + fallback
+        return fallback
+    return current_block
+
+
 def _prefetch_urls(text: str) -> str:
     """
     從文字中抽出 URL，用 Python requests 預先抓取網頁內容，
@@ -646,12 +822,15 @@ def _prefetch_urls(text: str) -> str:
             # 1) 影片平台：yt-dlp 優先（支援字幕），失敗才 fallback oEmbed
             if "tiktok.com" in u_lower:
                 block = _fetch_video_ytdlp(url) or _fetch_tiktok_meta(url)
+                # 內容太薄（< 300 chars）→ Gemini Video Understanding fallback
+                block = _maybe_video_fallback(url, block)
                 if block:
                     blocks.append(block)
                 else:
-                    logger.info("tiktok: ytdlp + oembed both failed, skip url=%s", url)
+                    logger.info("tiktok: ytdlp + oembed + gemini all failed, skip url=%s", url)
                 continue
             if "youtube.com" in u_lower or "youtu.be" in u_lower:
+                # YouTube 不走 video fallback：yt-dlp 已能抓字幕
                 block = _fetch_video_ytdlp(url) or _fetch_youtube_meta(url)
                 if block:
                     blocks.append(block)
@@ -666,9 +845,10 @@ def _prefetch_urls(text: str) -> str:
                     logger.info("reddit .json failed, skip url=%s", url)
                 continue
 
-            # 2) Instagram Reels / Posts：yt-dlp → embed 頁面 → Google Search
+            # 2) Instagram Reels / Posts：yt-dlp → embed 頁面 → Gemini video → Google Search
             if "instagram.com" in u_lower:
                 block = _fetch_video_ytdlp(url) or _fetch_instagram_embed(url)
+                block = _maybe_video_fallback(url, block)
                 if block:
                     blocks.append(block)
                 else:
@@ -678,9 +858,10 @@ def _prefetch_urls(text: str) -> str:
                     )
                 continue
 
-            # 3) 其他 JS 渲染網站（FB / X / Threads / dcard）：試 yt-dlp，失敗才 Google Search
+            # 3) 其他 JS 渲染網站（FB / X / Threads / dcard）：試 yt-dlp，再試 Gemini video，失敗才 Google Search
             if _JS_RENDERED_DOMAINS.search(url):
                 block = _fetch_video_ytdlp(url)
+                block = _maybe_video_fallback(url, block)
                 if block:
                     blocks.append(block)
                 else:

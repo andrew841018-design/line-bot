@@ -18,3 +18,4 @@ coverage.json
 cov_annotated/
 line_token_cache.json
 pending_line_push.txt
+pending_explicit_reply.json.bak*

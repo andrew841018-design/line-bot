@@ -1367,9 +1367,173 @@ def test_save_pending_quoted_and_media():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Test Z: Gemini Video Understanding fallback
+# ═══════════════════════════════════════════════════════════════════════════════
+def test_gemini_video_fallback():
+    print("\n── Test Z: Gemini Video Understanding fallback ──")
+
+    # ── Z1: _gemini_video_quota_ok 邏輯 ──
+    with patch(
+        "main.gemini_client.get_gemini_quota_info",
+        return_value={
+            "used_requests": 0,
+            "limit_requests": 20,
+            "used_tokens": 0,
+            "limit_tokens": 1_000_000,
+        },
+    ):
+        check("quota ok 充足時回 True", main._gemini_video_quota_ok() is True)
+
+    with patch(
+        "main.gemini_client.get_gemini_quota_info",
+        return_value={
+            "used_requests": 17,
+            "limit_requests": 20,
+            "used_tokens": 0,
+            "limit_tokens": 1_000_000,
+        },
+    ):
+        # 剩 3，<5 不允許
+        check("quota 剩 3 → 不允許", main._gemini_video_quota_ok() is False)
+
+    with patch("main.gemini_client.get_gemini_quota_info", return_value=None):
+        check("quota info None → 不允許", main._gemini_video_quota_ok() is False)
+
+    # ── Z2: _maybe_video_fallback：YouTube 不觸發 ──
+    with patch("main._fetch_video_gemini") as mock_fetch:
+        result = main._maybe_video_fallback(
+            "https://www.youtube.com/watch?v=abc", None
+        )
+        check("YouTube 不觸發 fallback", not mock_fetch.called)
+        check("YouTube 回傳保持原 None", result is None)
+
+    # ── Z3: _maybe_video_fallback：內容夠厚不觸發 ──
+    with patch("main._fetch_video_gemini") as mock_fetch:
+        ample = "x" * 500
+        result = main._maybe_video_fallback("https://vt.tiktok.com/abc/", ample)
+        check("ytdlp 內容已 >=300 字 → 不 fallback", not mock_fetch.called)
+        check("ytdlp 內容已豐 → 直接回傳原 block", result == ample)
+
+    # ── Z4: _maybe_video_fallback：低 quota 不觸發 ──
+    with patch("main._gemini_video_quota_ok", return_value=False):
+        with patch("main._fetch_video_gemini") as mock_fetch:
+            thin = "x" * 50
+            result = main._maybe_video_fallback(
+                "https://vt.tiktok.com/abc/", thin
+            )
+            check("低 quota → 不觸發 fallback", not mock_fetch.called)
+            check("低 quota → 回傳原本薄 block", result == thin)
+
+    # ── Z5: _maybe_video_fallback：薄內容 + TikTok + quota OK → 觸發 ──
+    with patch("main._gemini_video_quota_ok", return_value=True):
+        with patch(
+            "main._fetch_video_gemini", return_value="GEMINI_VIDEO_RESULT"
+        ) as mock_fetch:
+            thin = "x" * 50
+            result = main._maybe_video_fallback(
+                "https://vt.tiktok.com/abc/", thin
+            )
+            check("TikTok 薄內容 → 觸發 fallback", mock_fetch.called)
+            check(
+                "fallback 結果與原薄 block 拼接",
+                result is not None and "GEMINI_VIDEO_RESULT" in result,
+            )
+
+    # ── Z6: _maybe_video_fallback：原 block None + 觸發 → 回傳 fallback ──
+    with patch("main._gemini_video_quota_ok", return_value=True):
+        with patch(
+            "main._fetch_video_gemini", return_value="GEMINI_ONLY"
+        ):
+            result = main._maybe_video_fallback(
+                "https://vt.tiktok.com/abc/", None
+            )
+            check("原 None + 有 fallback → 回 fallback", result == "GEMINI_ONLY")
+
+    # ── Z7: 非影片域名（一般網頁）不觸發 ──
+    with patch("main._fetch_video_gemini") as mock_fetch:
+        result = main._maybe_video_fallback(
+            "https://news.yahoo.com/article", None
+        )
+        check("一般網頁不觸發 video fallback", not mock_fetch.called)
+
+    # ── Z8: _fetch_video_gemini：yt-dlp 不可用 → 回 None ──
+    orig_avail = main._YTDLP_AVAILABLE
+    try:
+        main._YTDLP_AVAILABLE = False
+        check(
+            "yt-dlp 不可用 → 回 None",
+            main._fetch_video_gemini("https://vt.tiktok.com/abc/") is None,
+        )
+    finally:
+        main._YTDLP_AVAILABLE = orig_avail
+
+    # ── Z9: _fetch_video_gemini：完整流程 mock ──
+    fake_file = MagicMock()
+    fake_file.name = "files/abc123"
+    fake_file.state = MagicMock()
+    fake_file.state.name = "ACTIVE"
+
+    fake_response = MagicMock()
+    fake_response.text = "這是一支搞笑短片，主角學貓叫。"
+
+    fake_client = MagicMock()
+    fake_client.files.upload.return_value = fake_file
+    fake_client.files.get.return_value = fake_file
+    fake_client.files.delete.return_value = None
+    fake_client.models.generate_content.return_value = fake_response
+
+    def fake_ydl_download(urls):
+        # 模擬 yt-dlp 下載成功：寫一個假 mp4 檔
+        import hashlib
+
+        for u in urls:
+            h = hashlib.md5(u.encode()).hexdigest()[:12]
+            with open(f"/tmp/linebot_video_{h}.mp4", "wb") as fp:
+                fp.write(b"FAKEMP4DATA")
+
+    fake_ydl = MagicMock()
+    fake_ydl.__enter__ = MagicMock(return_value=fake_ydl)
+    fake_ydl.__exit__ = MagicMock(return_value=False)
+    fake_ydl.download = MagicMock(side_effect=fake_ydl_download)
+
+    with patch("main._yt_dlp") as mock_ytdlp:
+        mock_ytdlp.YoutubeDL.return_value = fake_ydl
+        with patch("main.gemini_client._client", fake_client):
+            with patch("main.gemini_client._track_usage"):
+                block = main._fetch_video_gemini("https://vt.tiktok.com/test/")
+
+    check("完整流程回傳非 None", block is not None)
+    check(
+        "block 含 Gemini 分析標記",
+        block is not None and "影片分析開始" in block,
+    )
+    check("block 含分析文字", block is not None and "搞笑短片" in block)
+    check("upload 被呼叫", fake_client.files.upload.called)
+    check("delete 被呼叫（清理）", fake_client.files.delete.called)
+
+    # ── Z10: 完整流程 — generate_content 拋例外 → 回 None 但仍清理 ──
+    fake_client2 = MagicMock()
+    fake_client2.files.upload.return_value = fake_file
+    fake_client2.files.get.return_value = fake_file
+    fake_client2.files.delete.return_value = None
+    fake_client2.models.generate_content.side_effect = Exception("api boom")
+
+    with patch("main._yt_dlp") as mock_ytdlp2:
+        mock_ytdlp2.YoutubeDL.return_value = fake_ydl
+        with patch("main.gemini_client._client", fake_client2):
+            block2 = main._fetch_video_gemini("https://vt.tiktok.com/test2/")
+
+    check("generate 例外 → 回 None", block2 is None)
+    check("即使例外仍呼叫 delete 清理", fake_client2.files.delete.called)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 
 
 class AllTests(unittest.TestCase):
+    def test_gemini_video_fallback(self):
+        test_gemini_video_fallback()
+
     def test_handle_audio_message(self):
         test_handle_audio_message()
 
@@ -1578,6 +1742,7 @@ def test_feedback_collector_window():
 
 if __name__ == "__main__":
     tests = [
+        test_gemini_video_fallback,
         test_handle_audio_message,
         test_handle_explicit_text_exceptions,
         test_handle_burst_flush_paths,
