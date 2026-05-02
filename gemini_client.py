@@ -40,7 +40,7 @@ _USAGE_FILE = os.path.join(
 )
 _PT = ZoneInfo("America/Los_Angeles")
 _DAILY_TOKEN_LIMIT = 1_000_000
-_DAILY_REQUEST_LIMIT = 20  # gemini-2.5-flash 免費層每日請求上限
+_DAILY_REQUEST_LIMIT = 20  # gemini-2.5-flash free tier RPD（2026-05-02 AI Studio 確認；今日已用 44/20 是 Google 寬限上限）
 
 
 def _today_pt() -> str:
