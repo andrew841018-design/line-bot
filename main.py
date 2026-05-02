@@ -728,15 +728,45 @@ def _fetch_video_gemini(url: str) -> str | None:
                 return None
             time.sleep(1)
 
-        # 4) generate_content
+        # 4) generate_content — flash 滿了自動 fallback flash-lite
         prompt = (
             "用繁體中文簡短描述這部影片的主要內容（含口白、畫面、訊息），"
             "200 字內。如果是廣告/業配/沒重點請直說。"
         )
-        response = gemini_client._client.models.generate_content(
-            model=settings.gemini_model,
-            contents=[uploaded_file, prompt],
-        )
+        models_to_try = [settings.gemini_model]
+        if settings.gemini_light_model and settings.gemini_light_model != settings.gemini_model:
+            models_to_try.append(settings.gemini_light_model)
+
+        response = None
+        last_error = None
+        for model_name in models_to_try:
+            try:
+                response = gemini_client._client.models.generate_content(
+                    model=model_name,
+                    contents=[uploaded_file, prompt],
+                )
+                logger.info(
+                    "gemini video fallback: model=%s succeeded url=%s",
+                    model_name, url,
+                )
+                break
+            except Exception as e:
+                last_error = e
+                err_str = str(e)
+                is_quota = "429" in err_str or "RESOURCE_EXHAUSTED" in err_str
+                if is_quota and model_name != models_to_try[-1]:
+                    logger.info(
+                        "gemini video fallback: model=%s 429 quota, trying lite url=%s",
+                        model_name, url,
+                    )
+                    continue
+                # 非 quota 錯誤、或已經試完所有模型 → 拋給外層 except
+                raise
+
+        if response is None:
+            logger.info("gemini video fallback: all models exhausted url=%s err=%s", url, last_error)
+            return None
+
         # 計入 quota counter
         try:
             gemini_client._track_usage(response)
