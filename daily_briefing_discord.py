@@ -181,6 +181,36 @@ def crawler_status() -> str:
 # ── 3. LINE Bot 狀態 ──────────────────────────────────────────────────────────
 
 
+# ── False-positive suppression patterns（已知有自動 retry / fallback 機制的事件）
+# 加新 pattern 來解決未來類似誤報，不需動下面 _is_real_error 邏輯
+_LOG_NOISE_PATTERNS = (
+    "transient error",       # gemini ServerError / 503 自動 retry（後續成功 / fallback 不算 ERROR）
+    "falling back to",       # main → lite model fallback（已有處理）
+    "quota available, processing pending",  # retry worker 正常觸發
+    "cached quota exhausted",  # quota 鎖定下的靜默跳過（不是新故障）
+)
+
+
+def _is_real_error(line: str) -> bool:
+    """判斷 log 行是否為「真的 ERROR」需要 alert。
+
+    過濾以下 false positive：
+    - logging level 是 WARNING / INFO 但內文含 error 字眼（如 ServerError 類別名）
+    - 已知有自動 retry / fallback 處理的事件（_LOG_NOISE_PATTERNS）
+    """
+    line_lower = line.lower()
+    # 排除已知正常事件（有自動處理機制）
+    for noise in _LOG_NOISE_PATTERNS:
+        if noise in line_lower:
+            return False
+    # 排除 logging level 不是 ERROR 的行
+    if "warning" in line_lower or " info " in line_lower or "[info]" in line_lower:
+        return False
+    # 真 ERROR：含 logging level marker（空格邊界）或 Python Traceback
+    return ("[ERROR]" in line or " ERROR " in line or
+            " ERROR -" in line or "Traceback" in line)
+
+
 def line_bot_status() -> str:
     lines = []
     # uvicorn.log 尾部
@@ -190,7 +220,7 @@ def line_bot_status() -> str:
             ["tail", "-20", str(log_path)], capture_output=True, text=True
         )
         tail = result.stdout
-        errors = [l for l in tail.splitlines() if "ERROR" in l or "error" in l.lower()]
+        errors = [l for l in tail.splitlines() if _is_real_error(l)]
         if errors:
             lines.append("🤖 **LINE Bot** 🔴 有 ERROR")
             for e in errors[-3:]:
@@ -291,6 +321,33 @@ def system_status() -> str:
 from investment_quotes import QUOTES as _BASE_QUOTES, BRAINYQUOTE_AUTHORS as _BQ_AUTHORS
 
 _DYNAMIC_QUOTES_FILE = LINE_BOT_DIR / "dynamic_quotes.json"
+
+# 當下 Fed 循環：cutting / hiking / hold
+# 用途：過濾雞湯池中 framing 與當下宏觀循環衝突的句子（避免「現在升息所以股市會跌」這種錯位提醒）
+# 切換循環時更新這一行；之後可改為從 FOMC 紀要 / FedWatch 自動推算
+_FED_REGIME = "cutting"
+
+_HIKING_FRAMING = re.compile(
+    r"聯準會.{0,4}(?:還在|正在|開始|繼續|正)?\s*升息|"
+    r"(?:升息|加息).{0,3}(?:循環|週期|期間|中)|"
+    r"Fed\s+(?:is\s+)?(?:hiking|raising|tightening)|"
+    r"rate\s*hik|hiking\s+cycle|tightening\s+cycle"
+)
+_CUTTING_FRAMING = re.compile(
+    r"聯準會.{0,4}(?:還在|正在|開始|繼續|正)?\s*降息|"
+    r"(?:降息|減息).{0,3}(?:循環|週期|期間|中)|"
+    r"Fed\s+(?:is\s+)?(?:cutting|easing)|"
+    r"rate\s*cut|cutting\s+cycle|easing\s+cycle"
+)
+
+
+def _quote_matches_regime(quote_text: str) -> bool:
+    """True = 此句 framing 與當下 Fed 循環相容（或無 framing）；False = 衝突應跳過。"""
+    if _FED_REGIME == "cutting" and _HIKING_FRAMING.search(quote_text):
+        return False
+    if _FED_REGIME == "hiking" and _CUTTING_FRAMING.search(quote_text):
+        return False
+    return True
 
 
 def _load_dynamic_quotes() -> dict:
@@ -592,9 +649,14 @@ def _pick_quote(bucket: str) -> tuple:
     history = _load_quote_history()
     bucket_hist = history.get(bucket, {})
 
+    # 先排除與當下 Fed 循環衝突的 framing（避免「升息會跌」在降息週期出現）
+    regime_ok = {i for i in range(len(pool)) if _quote_matches_regime(pool[i][0])}
+    if not regime_ok:
+        regime_ok = set(range(len(pool)))  # 整桶都被擋的極端情況保底，不空回
+
     # 找 365 天內沒用過的 idx
     fresh_indices = []
-    for i in range(len(pool)):
+    for i in regime_ok:
         last_used = bucket_hist.get(str(i))
         if last_used is None:
             fresh_indices.append(i)
@@ -605,16 +667,17 @@ def _pick_quote(bucket: str) -> tuple:
                 fresh_indices.append(i)
         except ValueError:
             fresh_indices.append(i)
+    fresh_indices.sort()
 
     if fresh_indices:
         # 從 fresh 中用日期 hash 選一個（同一天多次呼叫得到同一句）
         chosen = fresh_indices[today.toordinal() % len(fresh_indices)]
     else:
-        # 所有句都在 365 天內用過 → 挑最久沒用的
+        # 所有句都在 365 天內用過 → 挑最久沒用的（仍受 regime 過濾）
         def _last(i):
             d = bucket_hist.get(str(i))
             return datetime.strptime(d, "%Y-%m-%d").date() if d else today
-        chosen = min(range(len(pool)), key=_last)
+        chosen = min(regime_ok, key=_last)
 
     # 記錄使用日期
     bucket_hist[str(chosen)] = today.strftime("%Y-%m-%d")
@@ -910,14 +973,15 @@ def line_bot_suggestions() -> str:
             history = []
 
     # 近 3 天 LINE bot 對話樣本（抽 30 則）
+    # raw_messages.created_at 存秒（INTEGER），不是毫秒；2026-05-02 修：原版用毫秒比較永遠 0 筆 → Gemini 沒原料 → 永遠回 null
     recent_msgs = []
     try:
         conn = sqlite3.connect(str(LINE_BOT_DIR / "line_bot.db"))
         cur = conn.cursor()
-        three_days_ago_ms = int((datetime.now() - timedelta(days=3)).timestamp() * 1000)
+        three_days_ago_sec = int((datetime.now() - timedelta(days=3)).timestamp())
         cur.execute(
             "SELECT user_id, text FROM raw_messages WHERE created_at > ? AND user_id != '__bot__' ORDER BY created_at DESC LIMIT 30",
-            (three_days_ago_ms,),
+            (three_days_ago_sec,),
         )
         recent_msgs = [f"{uid[:6]}: {text[:80]}" for uid, text in cur.fetchall()]
         conn.close()
