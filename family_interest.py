@@ -221,9 +221,7 @@ def render_summary(group_id: str, days: int = 30, news_per_topic: int = 2) -> st
     if not per_member:
         return ""
 
-    lines = [f"👨‍👩‍👧‍👦 **家族熱話週報**（過去 {days} 天）"]
-    lines.append("依各人最常聊的主題挑相關新聞，看看大家最近在關心什麼")
-    lines.append("")
+    lines = [f"👨‍👩‍👧‍👦 家族熱話週報（{days}天）", ""]
 
     # 收集所有觸發過的主題，去重後抓新聞（避免同主題重複 fetch）
     all_topics = set()
@@ -234,21 +232,19 @@ def render_summary(group_id: str, days: int = 30, news_per_topic: int = 2) -> st
     for t in all_topics:
         news_by_topic[t] = fetch_topic_news(t, max_items=news_per_topic)
 
-    # per member section
     for name in ["媽媽", "爸爸", "黃聖雅", "黃聖穎"]:
         if name not in per_member or not per_member[name]:
             continue
         topics = per_member[name]
-        topic_str = "、".join(f"{t}({c})" for t, c in topics)
-        lines.append(f"━━━ 👤 {name} ━━━")
-        lines.append(f"關心：{topic_str}")
-        # 每個 top 3 主題挑 1 則新聞（避免太長）
+        topic_str = " ".join(f"{t.replace('-', '')}({c})" for t, c in topics)
+        lines.append(f"{name} ▸ {topic_str}")
         for t, _ in topics[:3]:
             news = news_by_topic.get(t, [])
             if news:
                 title, url = news[0]
-                lines.append(f"📰 [{t}] {title[:40]}")
-                lines.append(f"   {url}")
+                short = title[:30] + "…" if len(title) > 30 else title
+                lines.append(f"  📰 {short}")
+                lines.append(f"  {url}")
         lines.append("")
     return "\n".join(lines).rstrip()
 
