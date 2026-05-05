@@ -1707,31 +1707,11 @@ def _mark_quota_exhausted() -> None:
         next_midnight_pt.astimezone(_TW_TZ).strftime("%Y-%m-%d %H:%M TW"),
     )
 
-    # 每天第一次爆 → 推播一次告知群組
+    # quota 爆掉不再 push 通知群組（2026-05-06 用戶要求：不要顯示「⚠️ 今日免費額度已用完」之類訊息）
+    # 只更新內部 notified_for_ts state，避免邏輯混亂；不發任何 LINE message
     if _quota_notified_for_ts != _quota_exhausted_until_ts:
         _quota_notified_for_ts = _quota_exhausted_until_ts
-        try:
-            reset_tw = next_midnight_pt.astimezone(_TW_TZ).strftime("%m-%d %H:%M")
-            notice = (
-                "⚠️ Gemini 今日免費額度已用完\n"
-                f"到 {reset_tw} TW 之前咪寶不會回覆訊息\n"
-                "（明天會自動恢復）"
-            )
-            group_id = getattr(settings, "allowed_group_id", None) or os.environ.get(
-                "ALLOWED_GROUP_ID"
-            )
-            if group_id and not settings.bot_muted:
-                with ApiClient(_get_line_config()) as api_client:
-                    MessagingApi(api_client).push_message(
-                        PushMessageRequest(
-                            to=group_id,
-                            messages=[TextMessage(text=notice)],
-                        )
-                    )
-                logger.info("quota exhausted notice pushed to group=%s", group_id)
-        except Exception as e:
-            logger.warning("quota exhausted notice push failed: %s", str(e)[:200])
-        _save_quota_state()  # notified_for_ts 更新後才存
+        _save_quota_state()
 
 
 def _quota_exhausted() -> bool:
