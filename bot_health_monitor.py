@@ -338,6 +338,47 @@ def proc_alive(pattern: str) -> bool:
     return r.returncode == 0
 
 
+def cloudflared_url_alive() -> tuple[bool, str]:
+    """讀 cloudflared.log 抓最新的 trycloudflare URL，curl {url}/health 確認真的能通。
+
+    解決「cloudflared 進程活著但 quick tunnel URL 已被 Cloudflare 回收（NXDOMAIN）」
+    這種純 proc_alive 抓不到的隱性故障。
+
+    回傳 (ok, reason)：
+      - (True, "")：URL reachable，HTTP 200
+      - (False, reason)：log 沒 URL / curl 失敗 / 非 200
+    """
+    cf_log = BASE / "cloudflared.log"
+    if not cf_log.exists():
+        return False, "no cloudflared.log"
+    try:
+        import re as _re
+
+        urls = _re.findall(
+            r"https://[a-z0-9-]+\.trycloudflare\.com", cf_log.read_text()
+        )
+        if not urls:
+            return False, "no URL in cloudflared.log"
+        latest = urls[-1]
+        try:
+            r = subprocess.run(
+                [
+                    "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                    "--max-time", "5",
+                    f"{latest}/health",
+                ],
+                capture_output=True, text=True, timeout=8,
+            )
+            code = int((r.stdout or "0").strip() or 0)
+            if code == 200:
+                return True, ""
+            return False, f"{latest} curl HTTP {code}"
+        except Exception as e:
+            return False, f"{latest} curl exception: {str(e)[:80]}"
+    except Exception as e:
+        return False, str(e)[:120]
+
+
 def _wait_for_health(timeout: int = 30, pattern: str = "uvicorn.*main:app") -> bool:
     """polling /health 直到 200（startup 含 prefetch + Gemini call 約 7-10s）；
     若 process 中途死掉（import / syntax error）立刻 fail。"""
@@ -383,7 +424,7 @@ def restart_cloudflared() -> tuple[bool, str]:
     if not os.path.exists(cf_bin):
         return False, ""
     try:
-        subprocess.run(["pkill", "-f", "cloudflared tunnel"], capture_output=True, timeout=10)
+        subprocess.run(["pkill", "-f", "cloudflared.*8080"], capture_output=True, timeout=10)
         time.sleep(2)
         cf_log.write_text("")
         subprocess.Popen(
@@ -486,14 +527,27 @@ def main() -> int:
                 "請看 /tmp/line_bot_health_restart.log"
             )
 
-    # ── L0b cloudflared 隧道存活 ──────────────────────────────────────────
-    cloudflared_up = proc_alive("cloudflared tunnel")
+    # ── L0b cloudflared 隧道存活（進程 + URL 雙重檢查）─────────────────────
+    # 純 proc_alive 抓不到「進程活但 quick tunnel URL 被 Cloudflare 回收」這種狀況
+    # （2026-05-04 事件：URL initial-does-script-beth retired，bot 黑掉 24h 沒被偵測）
+    cloudflared_proc = proc_alive("cloudflared.*8080")
+    cloudflared_up = cloudflared_proc
+    cf_url_reason = ""
+    if cloudflared_proc:
+        url_ok, cf_url_reason = cloudflared_url_alive()
+        if not url_ok:
+            cloudflared_up = False
+            issues_l0.append(
+                f"🟡 cloudflared 進程活但 URL 不通：{cf_url_reason} → 強制重啟"
+            )
+
     if not cloudflared_up:
         ok, url = restart_cloudflared()
         if ok and url:
             issues_l0.append(
-                f"✅ cloudflared 死亡 → 自動重啟 + LINE webhook 更新為 {url}/callback"
+                f"✅ cloudflared 死亡/URL drift → 自動重啟 + LINE webhook 更新為 {url}/callback"
             )
+            cloudflared_up = True
         else:
             issues_l0.append("🔴 cloudflared 死亡 → 重啟失敗（沒抓到新 URL）")
 
@@ -529,26 +583,44 @@ def main() -> int:
         except Exception as e:
             issues_l0.append(f"🔴 LINE token 失效，refresh 例外：{str(e)[:120]}")
 
-    # ── L0d Webhook 端到端探測 + 自修（每天 1 次）──────────────────────
+    # ── L0d Webhook 端到端探測 + 自修（每 6 小時 1 次）─────────────────
+    # 6h cadence (was 24h)：webhook test 不計月配額，加密度才能更早抓到 URL drift /
+    # cloudflared 死亡這類隱性故障。
     last_webhook_check = float(state.get("last_webhook_check_ts", 0))
-    if uvicorn_up and cloudflared_up and token_ok and now.timestamp() - last_webhook_check > 86400:
+    if uvicorn_up and cloudflared_up and token_ok and now.timestamp() - last_webhook_check > 21600:
         wh_ok, wh_err = webhook_endpoint_check()
         state["last_webhook_check_ts"] = now.timestamp()
         if not wh_ok:
-            # 先試「URL drift 修法」：拿 cloudflared 目前 URL 強制 PUT 給 LINE
+            # Step 1：URL drift 修法 — 拿 cloudflared 目前 URL PUT 給 LINE
             fix_ok, fix_msg = autofix_webhook_endpoint()
             if fix_ok:
                 wh_ok2, wh_err2 = webhook_endpoint_check()
                 if wh_ok2:
-                    issues_l0.append(f"✅ Webhook 自修成功：endpoint 改成 {fix_msg}")
+                    issues_l0.append(f"✅ Webhook 自修成功（URL drift fix）：endpoint 改成 {fix_msg}")
                 else:
                     issues_l0.append(
                         f"🔴 Webhook 改完仍失敗（{wh_err2[:80]}）— 多半是 channel_secret 不對或 LINE Console 關閉了 webhook"
                     )
             else:
-                issues_l0.append(
-                    f"🔴 Webhook 端到端壞且無法自修：{wh_err[:80]} | 自修也失敗：{fix_msg[:80]}"
-                )
+                # Step 2 fallback：URL drift fix 失敗（多半是 cloudflared 沒 URL 可給）→
+                # 強制重啟 cloudflared 拿全新 URL，再 recheck 一次
+                rs_ok, rs_url = restart_cloudflared()
+                if rs_ok and rs_url:
+                    wh_ok3, wh_err3 = webhook_endpoint_check()
+                    if wh_ok3:
+                        issues_l0.append(
+                            f"✅ Webhook 自修成功（fallback：重啟 cloudflared）：新 URL {rs_url}/callback"
+                        )
+                    else:
+                        issues_l0.append(
+                            f"🔴 Webhook 三段式自修全失敗：endpoint_check={wh_err[:60]} | "
+                            f"autofix_url={fix_msg[:60]} | restart_cf 後 recheck={wh_err3[:60]}"
+                        )
+                else:
+                    issues_l0.append(
+                        f"🔴 Webhook 三段式自修全失敗：endpoint_check={wh_err[:60]} | "
+                        f"autofix_url={fix_msg[:60]} | restart_cloudflared 也失敗"
+                    )
 
     # ── L0e SQLite integrity_check + 自修（每天 1 次）─────────────────────
     last_db_check = float(state.get("last_db_check_ts", 0))
