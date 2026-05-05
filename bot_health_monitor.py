@@ -768,10 +768,12 @@ def main() -> int:
     for i in issues:
         print("  -", i)
 
-    # 通知頻率限制：60 分內同類型不重複通知（除了自修成功一定通知）
-    if issues and (auto_fixed or now.timestamp() - last_alert_ts > 3600):
-        msg = "🩺 **LINE Bot 健康警示** " + now.strftime("%H:%M") + "\n" + "\n".join(issues)
-        # 加診斷上下文
+    # 通知政策（2026-05-06 改）：只有真需要使用者注意的事件才推 Discord。
+    # ✅ 自修成功 → stdout log 留 audit trail，不推（避免每 30 分鐘的自修風暴洗版）。
+    # 🔴/🟡 → 60 分 dedupe 後推 DM。
+    urgent_issues = [i for i in issues if not i.startswith("✅")]
+    if urgent_issues and now.timestamp() - last_alert_ts > 3600:
+        msg = "🩺 **LINE Bot 健康警示** " + now.strftime("%H:%M") + "\n" + "\n".join(urgent_issues)
         msg += (
             f"\n\n📊 狀態：bot 自認爆={bot_thinks_exhausted}, "
             f"pending={pending_now}, 近2h 用戶/bot={activity['user_msgs']}/{activity['bot_msgs']}"

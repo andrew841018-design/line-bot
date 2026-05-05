@@ -208,10 +208,9 @@ def test_l0d_success_via_restart_cloudflared_fallback(tmp_path, monkeypatch):
 
     rc = bhm.main()
     assert rc == 0
-    # Successful auto-fix → alert sent (success messages always send)
-    assert sent
-    msg = sent[0]
-    assert "✅" in msg
+    # 2026-05-06 policy change: autofix-only events do NOT alert.
+    # The system handled it; nothing the user needs to do → keep Discord quiet.
+    assert sent == [], "autofix-only success must not push Discord under new policy"
 
 
 # ── C. webhook check cadence (6 hours) ────────────────────────────────────────
@@ -321,3 +320,133 @@ def test_l0b_treats_url_dead_as_cloudflared_down(tmp_path, monkeypatch):
 
     bhm.main()
     assert restart_called, "stale cloudflared URL must trigger restart_cloudflared"
+
+
+# ── D. Notification policy: only urgent issues push Discord ───────────────────
+#
+# 2026-05-06: Andrew reported half-hourly Discord pings caused by Gemini lite
+# quota probes flapping. Each cycle hit "✅ 自修成功" which bypassed the 60-min
+# dedupe (auto_fixed branch). Policy now: ✅-only payloads stay in stdout log,
+# Discord push reserved for 🔴/🟡 (anything still requiring human attention).
+
+
+def _baseline_healthy(tmp_path, monkeypatch):
+    """All checks green; tests below override only the bits they need."""
+    monkeypatch.setattr(bhm, "BASE", tmp_path)
+    monkeypatch.setattr(bhm, "HEALTH_STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(bhm, "QUOTA_STATE_FILE", tmp_path / "quota.json")
+    monkeypatch.setattr(bhm, "PENDING_FILE", tmp_path / "pending.json")
+    monkeypatch.setattr(bhm, "DB_FILE", tmp_path / "noop.db")
+
+    monkeypatch.setattr(bhm, "proc_alive", lambda p: True)
+    monkeypatch.setattr(bhm, "http_health", lambda: (True, 200))
+    monkeypatch.setattr(bhm, "line_token_check", lambda: (True, ""))
+    monkeypatch.setattr(bhm, "sqlite_integrity_check", lambda: (True, ""))
+    monkeypatch.setattr(bhm, "cloudflared_url_alive", lambda: (True, ""))
+    monkeypatch.setattr(bhm, "webhook_endpoint_check", lambda: (True, ""))
+    monkeypatch.setattr(
+        bhm,
+        "count_recent_activity",
+        lambda hours=2: {"user_msgs": 0, "bot_msgs": 0, "user_substantive": 0},
+    )
+    monkeypatch.setattr(bhm, "count_pending", lambda: 0)
+
+
+def test_autofix_only_does_not_alert(tmp_path, monkeypatch):
+    """bot_thinks_exhausted=True + lite probe OK + autofix succeeds → only ✅ in
+    issues. Under new policy this MUST NOT push Discord — it's the recurring
+    half-hourly noise Andrew complained about."""
+    _baseline_healthy(tmp_path, monkeypatch)
+
+    # bot 自認 quota 爆 → 走 L4 lite probe → 探測 OK → attempt_auto_fix 成功
+    monkeypatch.setattr(
+        bhm, "read_quota_state", lambda: {"exhausted_until_ts": 9_999_999_999.0}
+    )
+    monkeypatch.setattr(bhm, "probe_gemini", lambda model: (True, ""))
+    monkeypatch.setattr(bhm, "attempt_auto_fix", lambda: True)
+
+    sent = []
+    monkeypatch.setattr(bhm, "send_dm", lambda msg: sent.append(msg))
+
+    rc = bhm.main()
+    assert rc == 0
+    assert sent == [], (
+        "autofix-only event (✅) must stay silent — it's the recurring noise "
+        "from Gemini lite probe flapping"
+    )
+
+
+def test_urgent_red_issue_still_alerts(tmp_path, monkeypatch):
+    """Real failure (🔴 cloudflared down + restart fails) MUST still push
+    Discord. Defends against the policy change accidentally muting genuine
+    incidents."""
+    _baseline_healthy(tmp_path, monkeypatch)
+
+    # cloudflared 死掉 + 重啟失敗 → 產生 🔴
+    def proc_alive(pat):
+        return "cloudflared" not in pat  # uvicorn 活，cloudflared 死
+
+    monkeypatch.setattr(bhm, "proc_alive", proc_alive)
+    monkeypatch.setattr(bhm, "restart_cloudflared", lambda: (False, ""))
+    monkeypatch.setattr(bhm, "read_quota_state", lambda: {})
+
+    sent = []
+    monkeypatch.setattr(bhm, "send_dm", lambda msg: sent.append(msg))
+
+    rc = bhm.main()
+    assert rc == 0
+    assert sent, "🔴 incident (cloudflared dead + restart failed) must alert"
+    assert "🔴" in sent[0]
+
+
+def test_urgent_yellow_issue_still_alerts(tmp_path, monkeypatch):
+    """🟡 ongoing anomaly (silent_anomaly with LINE quota dead) must alert —
+    the user can't fix it but needs to know the bot is silent."""
+    _baseline_healthy(tmp_path, monkeypatch)
+
+    # 家人發 5 則實質訊息但 bot 0 回 → silent_anomaly
+    monkeypatch.setattr(
+        bhm,
+        "count_recent_activity",
+        lambda hours=2: {"user_msgs": 5, "bot_msgs": 0, "user_substantive": 5},
+    )
+    # LINE push 配額爆 → 不能自修 → 標 🔴 純通知
+    monkeypatch.setattr(bhm, "line_push_quota_likely_exhausted", lambda: True)
+    monkeypatch.setattr(bhm, "read_quota_state", lambda: {})
+
+    sent = []
+    monkeypatch.setattr(bhm, "send_dm", lambda msg: sent.append(msg))
+
+    rc = bhm.main()
+    assert rc == 0
+    assert sent, "silent anomaly with quota exhausted must alert"
+    assert "🔴" in sent[0] or "🟡" in sent[0]
+
+
+def test_mixed_urgent_and_autofix_alerts_with_only_urgent(tmp_path, monkeypatch):
+    """If both ✅ autofix and 🔴 unfixable issues happen the same tick, alert
+    fires AND the body should still surface the 🔴 (don't drop it just because
+    autofix happened too)."""
+    _baseline_healthy(tmp_path, monkeypatch)
+
+    # bot 自認爆 + lite OK + 自修成功 → ✅
+    monkeypatch.setattr(
+        bhm, "read_quota_state", lambda: {"exhausted_until_ts": 9_999_999_999.0}
+    )
+    monkeypatch.setattr(bhm, "probe_gemini", lambda model: (True, ""))
+    monkeypatch.setattr(bhm, "attempt_auto_fix", lambda: True)
+    # 同時有 silent_anomaly + LINE quota dead → 🔴
+    monkeypatch.setattr(
+        bhm,
+        "count_recent_activity",
+        lambda hours=2: {"user_msgs": 5, "bot_msgs": 0, "user_substantive": 5},
+    )
+    monkeypatch.setattr(bhm, "line_push_quota_likely_exhausted", lambda: True)
+
+    sent = []
+    monkeypatch.setattr(bhm, "send_dm", lambda msg: sent.append(msg))
+
+    rc = bhm.main()
+    assert rc == 0
+    assert sent, "mixed payload with 🔴 component must alert"
+    assert "🔴" in sent[0], "alert body must include the 🔴 incident line"
