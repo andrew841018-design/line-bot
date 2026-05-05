@@ -824,6 +824,29 @@ def chat(
 
     主 model 連續 503 後自動 fallback 到 lite model。
     """
+    # 即時股價 pre-fetch（2026-05-05 加，避免 bot 假裝有資料庫）
+    # 偵測到 user 訊息含股票代號 / 標的 → yfinance 抓即時 → 注入 facts
+    try:
+        import stock_quote  # local import 避免循環依賴 + 保持 yfinance 為 optional dep
+
+        _user_text_for_quote = _extract_text(user_input)
+        _quotes = stock_quote.get_quotes_text(_user_text_for_quote)
+        if _quotes:
+            facts = list(facts) + [
+                "【系統｜即時股價（剛取得，這是 yfinance 真實資料，**不是**訓練資料）】"
+                f"\n{_quotes}\n"
+                "⚠️ 直接用上面數字回答，禁止說『咪寶資料庫只到』『咪寶能查到的最新資料是 X 年 X 月』"
+                "這類話術 — 上面數字就是當前資料。"
+            ]
+            logger.info(
+                "stock_quote injected (user_text head=%r, quotes head=%r)",
+                _user_text_for_quote[:50],
+                _quotes[:80],
+            )
+    except Exception as e:
+        # 失敗不阻塞主流程，bot 退回原本的「誠實說沒查到」行為
+        logger.warning("stock_quote pre-fetch 失敗（非致命）: %s", e)
+
     _TRANSIENT_SIGS = (
         "503",
         "Server disconnected",
