@@ -311,6 +311,28 @@ emoji 偶爾用，不要多。
        具體問題 → 1-3 句（含答案 + 來源）
        政治 / 影片摘要 → 6 段結構
        禁止把簡單問題寫成長篇 lecture（lecture mode 已禁），也禁止把複雜問題壓成一句敷衍
+
+23g. **即時資料誠實守則**（2026-05-05 加，bot 真實踩過：用戶問 2026 股價，bot 回「咪寶資料庫只到 2024/5/30，當時台積電 846」— 同時違反 echo opener + 假裝資料庫 + 把 training cutoff 偽裝成資料庫日期 + 倒打用戶）：
+
+   觸發：使用者問股價、匯率、即時新聞、體育比分、天氣等需要實時查詢的資訊。
+
+   ❌ 絕對禁止：
+   - 「咪寶目前的資料庫只能查詢到 X」「咪寶能查到的最新資料是 X 年 X 月」「咪寶的資料庫只到 X」（你**沒有**這個資料庫，這是 hallucination）
+   - 把訓練資料 knowledge cutoff 偽裝成「資料庫最新更新日」
+   - 引用過時資料當「事實」給用戶（例：用戶問 2026 股價，你給 2024 收盤價當「最新」）
+   - 倒打用戶：「這與您提供的數字有所不同，請您留意最新資訊」（用戶沒錯，是你不會即時查）
+   - 「投資股市還是要參考最新的市場資訊喔」「建議您查詢最新」這種敷衍結尾
+
+   ✅ 必須這樣處理：
+   (i) 第一句誠實判斷：「我沒有即時股價查詢工具」
+   (ii) 給具體查詢 URL：「台股查 https://www.twse.com.tw/、美股查 https://finance.yahoo.com/」
+   (iii) 用戶若已提供當前資料 → 直接採用，不質疑、不假裝有「自己的資料」
+   (iv) 用戶問分析/解讀（不是純查價）→ Google 搜尋最新背景再答，結構要正反方 URL + 主觀觀點 + 支持自己觀點的 URL
+   (v) 被使用者糾正（例：「今天是 2026/5/5」）→ **直接採用糾正後的事實**，不可口頭認帳但內容繼續用錯誤前提
+
+   範例（user 問「今天台積電股價多少」）：
+   ❌「咪寶目前的資料庫只能查詢到 2024 年 5 月 30 日，當時台積電是 846 元」
+   ✅「我沒有即時股價工具，台股請查 https://www.twse.com.tw/。想做什麼分析？背景資訊我可以查。」
 """
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -672,6 +694,11 @@ _ECHO_OPENERS = (
     "咪寶幫大家整理",
     "咪寶來幫大家",
     "咪寶來幫您",
+    "咪寶明白了",
+    "好的，咪寶",
+    "謝謝您的提醒",
+    "謝謝你的提醒",
+    "明白了，現在是",
 )
 _EMPTY_PHRASES = (
     "歲月不敗美人",
@@ -680,11 +707,39 @@ _EMPTY_PHRASES = (
     "值得我們深思",
     "需要重視",
     "需要社會共同關注",
+    # 假裝有 retrieval / 把 training cutoff 偽裝成資料庫（2026-05-05 加）
+    "咪寶目前的資料庫",
+    "咪寶的資料庫",
+    "咪寶能查到的最新資料",
+    "以咪寶能查到的最新",
+    "咪寶資料庫只到",
+    "咪寶目前的知識截止",
+    # 敷衍結尾 / 推託 / 空建議（2026-05-05 加，用戶反饋「每個留言都是敷衍」）
+    "投資股市還是要參考",
+    "請您留意",
+    "建議您留意",
+    "請您自行判斷",
+    "咪寶沒辦法預測",
+    "建議您參考最新",
+    "請參考最新的市場",
+    "咪寶沒有辦法",
+    "請您查詢",
 )
 
 
-def _violates_quality(reply: str) -> tuple[bool, str]:
-    """規則 0 post-check：偵測 echo opener / 空附和。回 (violates, reason)。"""
+# 專業議題回覆但缺 URL 結構檢查
+_NEWS_CASE_TOPIC_HINTS = (
+    "投資", "股市", "股票", "保險", "醫療", "教育", "法律",
+    "理財", "基金", "ETF", "房地產", "詐騙", "疫苗", "藥",
+)
+
+
+def _violates_quality(reply: str, user_input_text: str = "") -> tuple[bool, str]:
+    """規則 0 post-check：偵測 echo opener / 空附和 / 敷衍 / 缺 URL 結構。
+
+    user_input_text：使用者的訊息文字，用於判斷是否觸發專業議題的「必含 URL」要求。
+    回 (violates, reason)。
+    """
     s = (reply or "").strip()
     if not s:
         return False, ""
@@ -694,6 +749,17 @@ def _violates_quality(reply: str) -> tuple[bool, str]:
     for phrase in _EMPTY_PHRASES:
         if phrase in s:
             return True, f"empty phrase: {phrase}"
+
+    # 專業議題（投資 / 醫療 / 法律 / 保險 / 教育 / 房地產 / 詐騙）若在 user 訊息出現
+    # 但回覆 < 2 條 URL → 違反「正反方+URL+主觀+支持 URL」結構（2026-05-05 加）
+    if user_input_text and any(t in user_input_text for t in _NEWS_CASE_TOPIC_HINTS):
+        url_count = s.count("http://") + s.count("https://")
+        if url_count < 2:
+            return True, (
+                f"專業議題缺多源 URL（觸發詞在 user 訊息，回覆只有 {url_count} 條 URL，"
+                "至少需 2 條不同網域；不算 user 自己貼的）"
+            )
+
     return False, ""
 
 
@@ -779,15 +845,41 @@ def chat(
         grounding_urls: list[tuple[str, str]],
     ) -> str:
         """規則 0 post-check：違規 → retry 一次；仍違規 → 紀錄+通知後仍回覆。"""
-        violates, reason = _violates_quality(text)
+        user_text = _extract_text(user_input)
+        violates, reason = _violates_quality(text, user_text)
         if not violates:
             return _append_sources(text, grounding_urls)
         logger.warning("quality post-check 違規（%s），retry 一次", reason)
-        try:
-            retry_resp = chat_session.send_message(
+
+        # 針對不同違規類型給具體 retry 指示
+        if "缺多源 URL" in reason:
+            retry_prompt = (
+                f"上次回覆違規（{reason}）。重寫，必須含：\n"
+                "(1) 第一句具體判斷句（不是 echo / 不是『我沒辦法』）\n"
+                "(2) 至少 3 條不同網域 URL（正反兩方都要）\n"
+                "(3) 你自己的 take + 支持你 take 的對應 URL\n"
+                "(4) 結尾不要『請您留意 / 建議您查 / 還是要參考』這類廢話"
+            )
+        elif "echo opener" in reason:
+            retry_prompt = (
+                f"上次回覆違規（{reason}）。重寫，第一句必須是判斷句、"
+                "禁止用『咪寶明白了』『謝謝您』『現在是 X 年』這類重述開頭。"
+            )
+        elif "empty phrase" in reason:
+            retry_prompt = (
+                f"上次回覆違規（{reason}）。重寫：禁止假裝有資料庫、"
+                "禁止把訓練資料的 cutoff 偽裝成『資料庫最新更新日』、"
+                "禁止『請您留意 / 建議您查 / 還是要參考』敷衍結尾。"
+                "若真的不會即時查，直接說『我沒有即時 X 查詢，建議查 [具體網址]』。"
+            )
+        else:
+            retry_prompt = (
                 f"上次回覆違反規則 0（{reason}），重寫一次，"
                 "第一句必須是判斷句不是 echo。"
             )
+
+        try:
+            retry_resp = chat_session.send_message(retry_prompt)
             _track_usage(retry_resp)
             retry_text = _clean_reply((retry_resp.text or "").strip())
             retry_urls = _extract_grounding_urls(retry_resp)
@@ -796,7 +888,7 @@ def chat(
             return _append_sources(text, grounding_urls)
         if not retry_text:
             return _append_sources(text, grounding_urls)
-        violates2, reason2 = _violates_quality(retry_text)
+        violates2, reason2 = _violates_quality(retry_text, user_text)
         if violates2:
             logger.warning("quality post-check retry 後仍違規（%s）", reason2)
             _log_quality_violation(group_id, retry_text, reason2)
