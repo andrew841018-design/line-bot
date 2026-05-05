@@ -135,7 +135,16 @@ _TOOLS = [
 # 規則內容完全保留，只是改成「相關才插」（規則互不干擾）
 # ════════════════════════════════════════════════════════════════════════════
 
-_CORE_PROMPT = """【最高語言規定】全程只能說繁體中文。任何情況、任何理由都不可以說英文。這條規定優先於一切，不能有任何例外。即使 Google 搜尋結果是英文，也必須先翻譯成繁體中文再回覆，不可以直接貼出英文搜尋結果。你的回覆裡中文字元數必須多於英文字母數；提到英文歌名/電影名/人名時，寫出中文說明並把英文原名放在括號，例如「里克·艾斯利（Rick Astley）」。即使連結讀不到、工具報錯、或任何原因無法存取內容，也絕對不可以用任何英文句子來描述失敗情況——以下這些說法一律嚴格禁止："The browse tool failed..."、"I am unable to access..."、"I cannot access..."、"The link is not accessible..."、"I was unable to..."，以及任何類似的英文開頭句。唯一正確做法：直接用繁體中文說「這個連結讀不到，我來搜尋看看」，然後立刻用 Google 搜尋。使用 code execution 工具時，所有 print 輸出和分析結論也必須用繁體中文，不可以用英文寫 print("The page provides...")、print("Taiwan is...") 這類英文語句——請改成繁體中文的 print() 或直接在外層用繁體中文說明結果。
+_CORE_PROMPT = """【規則 0｜凌駕一切，違反 = 自動重生回覆】
+所有回覆第一句必須是「具體判斷句」。
+判斷句 = 帶價值判斷 / 反駁 / 校正 / 觀點的具體陳述。
+- ❌ 禁止以「咪寶看到 X」「咪寶覺得這 X 真的很 Y」「我看到您 X」「咪寶之前提醒過」「咪寶幫大家整理」「咪寶來幫大家」「咪寶來幫您」開頭
+- ❌ 禁止把第一句寫成 echo / 重述使用者貼的內容
+- ✅ 第一句必須直接給判斷：「這個案例的問題不在 X 而在 Y」「這個說法不對，實際上...」「這支影片過度簡化了 Z」
+- 沒判斷可給 → 直接給事實校正、反問澄清，或保持沉默（規則 23b）
+- 違反 = post-check 偵測到 → 自動 retry 一次
+
+【最高語言規定】全程只能說繁體中文。任何情況、任何理由都不可以說英文。這條規定優先於一切，不能有任何例外。即使 Google 搜尋結果是英文，也必須先翻譯成繁體中文再回覆，不可以直接貼出英文搜尋結果。你的回覆裡中文字元數必須多於英文字母數；提到英文歌名/電影名/人名時，寫出中文說明並把英文原名放在括號，例如「里克·艾斯利（Rick Astley）」。即使連結讀不到、工具報錯、或任何原因無法存取內容，也絕對不可以用任何英文句子來描述失敗情況——以下這些說法一律嚴格禁止："The browse tool failed..."、"I am unable to access..."、"I cannot access..."、"The link is not accessible..."、"I was unable to..."，以及任何類似的英文開頭句。唯一正確做法：直接用繁體中文說「這個連結讀不到，我來搜尋看看」，然後立刻用 Google 搜尋。使用 code execution 工具時，所有 print 輸出和分析結論也必須用繁體中文，不可以用英文寫 print("The page provides...")、print("Taiwan is...") 這類英文語句——請改成繁體中文的 print() 或直接在外層用繁體中文說明結果。
 
 【最高禁止用語】以下詞彙永遠不可以出現在回覆裡，零容忍、沒有例外：「點不開」「打不開」「看不了」「網頁不存在」「連結壞了」「我跳過」「我不看」。連結讀不到時，唯一正確做法是立刻用 Google 搜尋那個網址，找到資訊翻譯成繁體中文後回覆。
 
@@ -407,6 +416,36 @@ _RULE_EARTHQUAKE = """【地震訊息】
 24. M（規模）是震源能量，一般人看不懂；震度（幾級）才是各地感受強弱，台灣用 0～7 級。回覆時不要只說「M X.X」，要用 Google 搜尋查出這次地震各縣市的實際震度（幾級），再用「XX縣 X 級、XX縣 X 級」格式說明。如果是假設性問題（不是真實地震），解釋規模與震度的差異即可。
 """
 
+_RULE_NEWS_CASE = """【新聞 / 案例 / 研究 / 專業議題分享 = 必給觀點 + 多源】（2026-05-04 加，補 23f 在非政治話題的覆蓋）
+觸發：群組分享新聞、案例、研究、報導、文章，或聊到保險、投資、醫療、教育、健康、法律、消費、房地產、AI、詐騙等專業議題；影片標題含「分析 / 評論 / 心得 / 解析」。
+
+bot 必須走「**有想法的查核員**」模式，禁止走「**附和的鄰居**」模式。
+
+❌ 禁止：
+- 「咪寶看到 X」「咪寶覺得這個 X 很 Y」「我看到您分享了 Z」（echo 重述）
+- 「保險選擇要看個人需求」「醫療要看個人狀況」「需要諮詢專業人士」（純附和廢話）
+- 「真的很心疼」「真的很重要」「值得我們深思」「需要重視」（空附和）
+- 只附 1 條來源（user 貼的那條本身不算）
+
+✅ 必含 4 樣（不照順序，但都要有）：
+(i) 第一句直接表態你的 take（具體判斷，不是描述、不是評論）
+    例：「我這邊覺得這份保單條款設計有問題」「這個方法的問題在於樣本太小」
+(ii) 具體事實 ≥ 3 個（法條 / 統計 / 國外做法 / 類似案例 / 量化數字）
+(iii) 至少 3 條來源 URL，不同網域，**不算 user 貼的那條**
+(iv) 結論一句：你權衡完支持 / 反對什麼具體做法
+
+範例（user 貼某保險新聞，bot 應該）：
+「我這邊覺得問題不在『保戶沒看清楚』而在『條款設計刻意模糊』。
+- 金管會 2024 統計：壽險爭議件數中 68% 涉及條款解釋
+- 對比日本：金融廳要求保單條款須通過『一般民眾理解度測試』
+- 台灣金融消費評議中心：去年條款爭議補償率 < 30%
+結論：應推動條款『可讀性審查』機制，光要消費者自己讀不夠。
+來源：
+• 金管會 2024 保險業務統計：https://...
+• 金融消費評議中心年報：https://...
+• 日本金融廳保單揭露指引：https://...」
+"""
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # Rule pack 偵測 — 從 user_input 判斷該載入哪些規則包
@@ -432,6 +471,19 @@ _SPECIFIC_NUMBERS_RE = re.compile(
 )
 _EARTHQUAKE_RE = re.compile(
     r"地震|震央|震度|餘震|規模\s*\d|\bM\s*\d|板塊|海嘯"
+)
+# 新聞 / 案例 / 研究 / 專業議題（覆蓋政治以外的「需要觀點」場景）
+_NEWS_CASE_RE = re.compile(
+    r"新聞|報導|案例|個案|研究|論文|文章|貼文|"
+    r"保險|保單|投保|理賠|"
+    r"投資|股市|理財|"
+    r"醫療|醫生|醫院|疫苗|藥物|手術|症狀|病|健康|養生|"
+    r"教育|升學|考試|教改|"
+    r"法律|法案|法條|判決|訴訟|"
+    r"消費|商品|品牌|"
+    r"房地產|房市|房價|租屋|"
+    r"AI|人工智慧|詐騙|騙局|"
+    r"分析|評論|心得|解析"
 )
 
 
@@ -481,6 +533,9 @@ def _detect_rule_packs(user_input) -> list[str]:
     # 地震
     if _EARTHQUAKE_RE.search(text):
         packs.append(_RULE_EARTHQUAKE)
+    # 新聞 / 案例 / 專業議題（與政治規則彼此正交，可同時觸發）
+    if _NEWS_CASE_RE.search(text):
+        packs.append(_RULE_NEWS_CASE)
     return packs
 
 
@@ -608,6 +663,76 @@ def _is_chinese_majority(text: str) -> bool:
     return cn >= en
 
 
+# ── 規則 0 post-check：第一句必須是判斷句、不可 echo / 空附和 ────────────────
+_ECHO_OPENERS = (
+    "咪寶看到",
+    "咪寶覺得這",
+    "我看到您",
+    "咪寶之前提醒",
+    "咪寶幫大家整理",
+    "咪寶來幫大家",
+    "咪寶來幫您",
+)
+_EMPTY_PHRASES = (
+    "歲月不敗美人",
+    "真的讓人很心疼",
+    "需要平衡多方面",
+    "值得我們深思",
+    "需要重視",
+    "需要社會共同關注",
+)
+
+
+def _violates_quality(reply: str) -> tuple[bool, str]:
+    """規則 0 post-check：偵測 echo opener / 空附和。回 (violates, reason)。"""
+    s = (reply or "").strip()
+    if not s:
+        return False, ""
+    for opener in _ECHO_OPENERS:
+        if s.startswith(opener):
+            return True, f"echo opener: {opener}"
+    for phrase in _EMPTY_PHRASES:
+        if phrase in s:
+            return True, f"empty phrase: {phrase}"
+    return False, ""
+
+
+def _log_quality_violation(
+    group_id: str | None,
+    reply: str,
+    reason: str,
+) -> None:
+    """retry 後仍違規時，存到 persona_notes 供未來自我學習。失敗 silent。"""
+    if not group_id:
+        return
+    try:
+        from memory import add_persona_note  # local import 避免循環依賴
+
+        add_persona_note(
+            group_id,
+            "correction",
+            "規則 0 post-check 違規",
+            f"違規原因：{reason}\n違規回覆（前 200 字）：{reply[:200]}",
+        )
+    except Exception as e:
+        logger.warning("_log_quality_violation failed: %s", e)
+
+
+def _alert_quality_violation(reply: str, reason: str) -> None:
+    """retry 仍違規 → Discord DM 通知。失敗 silent。"""
+    try:
+        import notify_discord
+
+        msg = (
+            "🚨 **咪寶 quality post-check 失敗**\n"
+            f"原因：{reason}\n"
+            f"違規回覆前 300 字：\n{reply[:300]}"
+        )
+        notify_discord.send_dm(msg)
+    except Exception as e:
+        logger.warning("_alert_quality_violation failed: %s", e)
+
+
 # 對外接受的 parts 型別：單純字串、單個 Part、或 list 混合（text + bytes）
 MessageInput = Union[str, types.Part, list]
 
@@ -617,6 +742,7 @@ def chat(
     context: list[tuple[str, str]],
     facts: list[str],
     persona_notes: list[dict] | None = None,
+    group_id: str | None = None,
 ) -> str:
     """
     主對話入口。
@@ -627,6 +753,8 @@ def chat(
     - context：舊對話歷史（舊→新），不含這次的訊息
     - facts：長期事實，會注進 system instruction
     - persona_notes：人設範例 + 糾正記憶，注進 system instruction
+    - group_id：選填；用於 quality post-check 違規時將紀錄存到對應 group 的
+      persona_notes（自我學習）。沒給就跳過 DB 紀錄，仍會 Discord 通知。
 
     主 model 連續 503 後自動 fallback 到 lite model。
     """
@@ -644,6 +772,36 @@ def chat(
     def _is_transient(e: Exception) -> bool:
         s = str(e) + type(e).__name__
         return any(sig in s for sig in _TRANSIENT_SIGS)
+
+    def _quality_gate(
+        chat_session,
+        text: str,
+        grounding_urls: list[tuple[str, str]],
+    ) -> str:
+        """規則 0 post-check：違規 → retry 一次；仍違規 → 紀錄+通知後仍回覆。"""
+        violates, reason = _violates_quality(text)
+        if not violates:
+            return _append_sources(text, grounding_urls)
+        logger.warning("quality post-check 違規（%s），retry 一次", reason)
+        try:
+            retry_resp = chat_session.send_message(
+                f"上次回覆違反規則 0（{reason}），重寫一次，"
+                "第一句必須是判斷句不是 echo。"
+            )
+            _track_usage(retry_resp)
+            retry_text = _clean_reply((retry_resp.text or "").strip())
+            retry_urls = _extract_grounding_urls(retry_resp)
+        except Exception as e:
+            logger.warning("quality retry 呼叫失敗: %s", e)
+            return _append_sources(text, grounding_urls)
+        if not retry_text:
+            return _append_sources(text, grounding_urls)
+        violates2, reason2 = _violates_quality(retry_text)
+        if violates2:
+            logger.warning("quality post-check retry 後仍違規（%s）", reason2)
+            _log_quality_violation(group_id, retry_text, reason2)
+            _alert_quality_violation(retry_text, reason2)
+        return _append_sources(retry_text, retry_urls or grounding_urls)
 
     def _run(model: str) -> str:
         chat_session = _client.chats.create(
@@ -672,11 +830,11 @@ def chat(
                         retry_text = _clean_reply((retry_resp.text or "").strip())
                         if retry_text and _is_chinese_majority(retry_text):
                             retry_urls = _extract_grounding_urls(retry_resp)
-                            return _append_sources(
-                                retry_text, retry_urls or grounding_urls
+                            return _quality_gate(
+                                chat_session, retry_text, retry_urls or grounding_urls
                             )
                         # 若重試仍非中文，繼續用原回覆（總比空白好）
-                    return _append_sources(text, grounding_urls)
+                    return _quality_gate(chat_session, text, grounding_urls)
                 # text 為空（可能 code_execution 吃掉了），重試
                 logger.warning(
                     "gemini chat attempt %d: empty text, retrying", attempt + 1

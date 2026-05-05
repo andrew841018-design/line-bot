@@ -79,6 +79,17 @@ Verify → Review（快速）→ Commit/Push → LINE 推播判斷
 - Gemini 改 model 前先查 `project_gemini_model_selection.md`
 - 所有 token/key 從 `.env` 讀，不 hardcode，不 log
 
+### 規則 0（first-sentence-take 強制）
+（2026-05-04 加，補對 echo opener / 空附和的零容忍）
+
+- `gemini_client.py` 的 `_CORE_PROMPT` 開頭固定載入「規則 0」：所有回覆第一句必須是「具體判斷句」，不可 echo / 重述使用者貼的內容
+- 黑名單 + post-check：
+  - `_ECHO_OPENERS`：「咪寶看到」「咪寶覺得這」「我看到您」「咪寶之前提醒」「咪寶幫大家整理」「咪寶來幫大家」「咪寶來幫您」
+  - `_EMPTY_PHRASES`：「歲月不敗美人」「真的讓人很心疼」「需要平衡多方面」「值得我們深思」「需要重視」「需要社會共同關注」
+- `chat()` 流程：Gemini 回覆 → `_violates_quality()` 偵測 → 違規則自動 retry 一次（用 `規則 0` 提示）→ 仍違規則 `_log_quality_violation()` 寫進 `persona_notes` 自我學習 + `_alert_quality_violation()` 發 Discord DM。**不阻塞回覆**，回給使用者的是違規版（總比空白好）。
+- 新增黑名單詞 → 同步加到 `_ECHO_OPENERS` / `_EMPTY_PHRASES` + 規則 0 文字（兩處要對齊）
+- `_RULE_NEWS_CASE` rule pack：新聞 / 案例 / 研究 / 保險 / 醫療 / 投資 / 教育 / 法律 / 房地產 / AI 詐騙等專業議題會觸發「必給觀點 + 多源」結構（與 `_RULE_POLITICS` 正交）
+
 ---
 
 ## 已知坑：launchd push job「為什麼一陣子沒推」
