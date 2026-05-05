@@ -125,34 +125,12 @@ _line_config = _get_line_config()  # 啟動時的 fallback；callsite 仍會用 
 
 
 def _get_quota_footer() -> str:
-    """配額快爆才顯示 footer。平常聊天不需要技術 metadata 破壞對話自然度。
-
-    顯示條件：
-    - quota 爆了 → 「已用完」（紅燈）
-    - 用量 ≥ 80% → 顯示百分比警示（黃燈）
-    - 否則 → 不顯示（user 不在乎 20% / 50%）
+    """配額 footer — 用戶反饋（2026-05-05）「拿掉 📊 Gemini 今日用量 99.0%」，
+    平常 80%+ 警示移除（破壞對話自然度），只保留「真的爆了」紅燈當回覆無能信號。
     """
     if _quota_exhausted():
         return "\n\n📊 Gemini 今日用量已用完"
-    info = gemini_client.get_gemini_quota_info()
-    if info is None:
-        return ""
-    token_pct = (
-        round(info["used_tokens"] / info["limit_tokens"] * 100, 1)
-        if info["limit_tokens"]
-        else 0
-    )
-    req_pct = (
-        round(info["used_requests"] / info["limit_requests"] * 100, 1)
-        if info["limit_requests"]
-        else 0
-    )
-    pct = min(99.0, max(token_pct, req_pct))
-    if pct < 80:
-        return ""  # 平常聊天不顯示，避免破壞對話自然度
-    thinking = info.get("used_thinking_tokens", 0)
-    thinking_part = f"（思考 {thinking // 1000}k）" if thinking >= 1000 else ""
-    return f"\n\n📊 Gemini 今日用量 {pct}%{thinking_part}"
+    return ""
 
 
 def _llm_chat(

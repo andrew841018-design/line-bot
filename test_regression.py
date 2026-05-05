@@ -245,27 +245,25 @@ def test_bug5_quota_state_persists_across_restart():
 # ── Bug 6 ─────────────────────────────────────────────────────────────────────
 
 
-def test_bug6_quota_footer_shows_max_percentage():
-    """Bug 6 (7c6ce81): footer displays max(token_pct, req_pct).
-    When req_pct > token_pct, the higher value must appear in the footer.
-    Regression: footer only showed token_pct, hiding a nearly-full request quota.
+def test_bug6_quota_footer_no_percentage_unless_exhausted():
+    """Bug 6 update (2026-05-05): 用戶要求拿掉 80%+ 百分比 footer，
+    避免破壞對話自然度。只在真的 quota 爆了才顯示「已用完」，
+    其他情境（即使 99%）一律不顯示百分比。
     """
-    main._quota_exhausted_until_ts = 0.0  # Gemini NOT exhausted → normal footer branch
+    main._quota_exhausted_until_ts = 0.0  # Gemini NOT exhausted
 
+    # 即使 80%+ 也不該顯示百分比
     mock_info = {
-        "used_tokens": 30,
-        "limit_tokens": 100,  # token_pct = 30 %
-        "used_requests": 8,
-        "limit_requests": 10,  # req_pct  = 80 %
+        "used_tokens": 80,
+        "limit_tokens": 100,
+        "used_requests": 9,
+        "limit_requests": 10,
         "used_thinking_tokens": 0,
     }
     with patch("main.gemini_client.get_gemini_quota_info", return_value=mock_info):
         footer = main._get_quota_footer()
 
-    assert "80" in footer, f"Footer must show 80 (the higher value), got: {footer!r}"
-    # 30 should not appear as a quota percentage (guard both "30%" and "30.0%")
-    import re as _re
-    assert not _re.search(r"\b30\.?0?%", footer), f"Footer must NOT show 30% (the lower value), got: {footer!r}"
+    assert footer == "", f"Footer 應為空字串（不該有百分比），got: {footer!r}"
 
 
 # ── Bug 7 ─────────────────────────────────────────────────────────────────────
