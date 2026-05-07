@@ -484,7 +484,8 @@ def get_messages_since(
 
 # ── Persona Notes（人設範例 + 糾正記憶）──────────────────────────────────────
 
-_PERSONA_NOTE_CAP = 20  # 每個 group 每種 kind 最多保留幾筆（先進先出）
+_PERSONA_NOTE_CAP = 50  # 每個 group 每種 kind 最多保留幾筆（先進先出）
+# 2026-05-07 從 20 調 50：corrections 是 quality 違規累積學習，數量太少會 lose history
 
 
 def add_persona_note(

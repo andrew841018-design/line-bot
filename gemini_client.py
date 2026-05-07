@@ -627,9 +627,13 @@ def _build_system_instruction(
             base += f"（{ex['scenario']}）\n{ex['content']}\n\n"
 
     # 注入使用者糾正過的記憶 — 同樣錯誤不能再犯
+    # 2026-05-07 強化：標題語氣改強硬，標記為規則 0 同優先級延伸
     corrections = [n for n in (persona_notes or []) if n["kind"] == "correction"]
     if corrections:
-        base += "\n\n【使用者糾正過的事項 — 嚴格遵守，不要再犯】\n"
+        base += (
+            "\n\n【⚠️ 規則 0 延伸：你過去違規 / 被使用者糾正過的事項 — "
+            "**任何一條再犯 = 嚴重失敗**，比照規則 0 同優先級】\n"
+        )
         for c in corrections:
             base += f"- {c['content']}\n"
 
@@ -964,58 +968,100 @@ def chat(
         text: str,
         grounding_urls: list[tuple[str, str]],
     ) -> str:
-        """規則 0 post-check：違規 → retry 一次；仍違規 → 紀錄+通知後仍回覆。"""
+        """規則 0 post-check：違規 → retry 最多 3 次；仍違規才 log+notify。
+
+        2026-05-07 強化（用戶反饋「那要改進啊」）：
+        - retry 1 次 → 3 次
+        - retry prompt 累積前面所有違規回覆首 60 字明示禁止再用
+        - 任一輪通過提早退
+        """
         user_text = _extract_text(user_input)
         violates, reason = _violates_quality(text, user_text)
         if not violates:
             return _append_sources(text, grounding_urls)
-        logger.warning("quality post-check 違規（%s），retry 一次", reason)
 
-        # 針對不同違規類型給具體 retry 指示
-        if "缺多源 URL" in reason or "沒中心思想" in reason:
-            retry_prompt = (
-                f"上次回覆違規（{reason}）。重寫，必須符合規則 23h 完整結構：\n"
-                "(1) 第一句『我覺得 / 我這邊覺得 / 我認為 + 具體判斷』（不是純描述）\n"
-                "(2) **同意的部分 + 為何同意 + 對應 URL**：『同意 X 因為 Y（出處：URL_a）』\n"
-                "(3) **反對 / 質疑的部分 + 為何反對 + 對應 URL**：『反對 Z 因為 W（出處：URL_b）』\n"
-                "(4) 結論一句你綜合後的具體建議\n"
-                "(5) 不允許『這方式很好』『確實是一種好做法』『能幫助 X』『可以了解 Y』這種純功能描述\n"
-                "(6) 至少 2 條不同網域 URL（user 貼的那條不算）"
-            )
-        elif "echo opener" in reason:
-            retry_prompt = (
-                f"上次回覆違規（{reason}）。重寫，第一句必須是判斷句、"
-                "禁止用『咪寶明白了』『謝謝您』『現在是 X 年』這類重述開頭。"
-            )
-        elif "empty phrase" in reason:
-            retry_prompt = (
-                f"上次回覆違規（{reason}）。重寫：禁止假裝有資料庫、"
-                "禁止把訓練資料的 cutoff 偽裝成『資料庫最新更新日』、"
-                "禁止『請您留意 / 建議您查 / 還是要參考』敷衍結尾。"
-                "若真的不會即時查，直接說『我沒有即時 X 查詢，建議查 [具體網址]』。"
-            )
-        else:
-            retry_prompt = (
-                f"上次回覆違反規則 0（{reason}），重寫一次，"
-                "第一句必須是判斷句不是 echo。"
+        max_retries = 3
+        prev_violations: list[tuple[str, str]] = [(text, reason)]
+        current_text = text
+        current_urls = grounding_urls
+
+        for attempt in range(1, max_retries + 1):
+            current_reason = prev_violations[-1][1]
+            logger.warning(
+                "quality post-check 違規（%s），retry %d/%d",
+                current_reason, attempt, max_retries,
             )
 
-        try:
-            retry_resp = chat_session.send_message(retry_prompt)
-            _track_usage(retry_resp)
-            retry_text = _clean_reply((retry_resp.text or "").strip())
-            retry_urls = _extract_grounding_urls(retry_resp)
-        except Exception as e:
-            logger.warning("quality retry 呼叫失敗: %s", e)
-            return _append_sources(text, grounding_urls)
-        if not retry_text:
-            return _append_sources(text, grounding_urls)
-        violates2, reason2 = _violates_quality(retry_text, user_text)
-        if violates2:
-            logger.warning("quality post-check retry 後仍違規（%s）", reason2)
-            _log_quality_violation(group_id, retry_text, reason2)
-            _alert_quality_violation(retry_text, reason2)
-        return _append_sources(retry_text, retry_urls or grounding_urls)
+            # 累積前面所有違規回覆的首 60 字 → 明示禁止再用
+            forbidden_block = "\n".join(
+                f"  禁止重複（前 60 字）：{(t or '')[:60]}"
+                for t, _ in prev_violations
+            )
+
+            if "缺多源 URL" in current_reason or "沒中心思想" in current_reason:
+                retry_prompt = (
+                    f"上次回覆違規（{current_reason}）。重寫，必須符合規則 23h 完整結構：\n"
+                    "(1) 第一句『我覺得 / 我這邊覺得 / 我認為 + 具體判斷』\n"
+                    "(2) **同意的部分 + 為何同意 + 對應 URL**\n"
+                    "(3) **反對 / 質疑的部分 + 為何反對 + 對應 URL**\n"
+                    "(4) 結論一句\n"
+                    "(5) 至少 2 條不同網域 URL\n\n"
+                    f"前面違規過的回覆，**首 60 字一字不差禁止再用**：\n{forbidden_block}"
+                )
+            elif "echo opener" in current_reason:
+                retry_prompt = (
+                    f"上次回覆違規（{current_reason}）。重寫，第一句必須是判斷句、"
+                    "禁止『咪寶明白了 / 謝謝您 / 現在是 X 年 / 您說得對 / 完全正確』"
+                    "這類重述或純附和開頭。\n\n"
+                    f"前面違規過的回覆，**首 60 字一字不差禁止再用**：\n{forbidden_block}"
+                )
+            elif "empty phrase" in current_reason:
+                retry_prompt = (
+                    f"上次回覆違規（{current_reason}）。重寫：禁止假裝有資料庫、"
+                    "禁止把訓練資料 cutoff 偽裝成『資料庫最新更新日』、"
+                    "禁止『請您留意 / 建議您查 / 還是要參考』敷衍結尾。"
+                    "真不會查，直接說『我沒有即時 X 查詢，建議查 [具體網址]』。\n\n"
+                    f"前面違規過的回覆，**首 60 字一字不差禁止再用**：\n{forbidden_block}"
+                )
+            else:
+                retry_prompt = (
+                    f"上次回覆違反規則 0（{current_reason}），重寫，"
+                    "第一句必須是判斷句不是 echo。\n\n"
+                    f"前面違規過的回覆，**首 60 字一字不差禁止再用**：\n{forbidden_block}"
+                )
+
+            try:
+                retry_resp = chat_session.send_message(retry_prompt)
+                _track_usage(retry_resp)
+                retry_text = _clean_reply((retry_resp.text or "").strip())
+                retry_urls = _extract_grounding_urls(retry_resp)
+            except Exception as e:
+                logger.warning("quality retry %d 呼叫失敗: %s", attempt, e)
+                return _append_sources(current_text, current_urls)
+
+            if not retry_text:
+                return _append_sources(current_text, current_urls)
+
+            current_text = retry_text
+            current_urls = retry_urls or current_urls
+
+            violates_now, reason_now = _violates_quality(retry_text, user_text)
+            if not violates_now:
+                logger.info("quality post-check retry %d 通過", attempt)
+                return _append_sources(retry_text, current_urls)
+
+            prev_violations.append((retry_text, reason_now))
+
+        # 跑完 max_retries 仍違規 → log + notify
+        final_reason = prev_violations[-1][1]
+        logger.warning(
+            "quality post-check %d 次 retry 後仍違規（%s）",
+            max_retries, final_reason,
+        )
+        _log_quality_violation(group_id, current_text, final_reason)
+        _alert_quality_violation(current_text, final_reason)
+        return _append_sources(current_text, current_urls)
+
 
     def _run(model: str) -> str:
         chat_session = _client.chats.create(
