@@ -797,127 +797,19 @@ def sox_sentiment() -> str:
         return f"📈 **費半指數** ⚠️ 抓取失敗：{e}"
 
 
-# ── 5.7 練車路線（每日輪換）────────────────────────────────────────────────
-
-# 練車路線池（依難度由簡入難排序；起點固定 善導寺）
-# 不刪除任何路線 — 升級後 / 改變偏好可重新解鎖
-# types 是該路線涵蓋的道路類型 tag（用於現階段 focus 篩選顯示 ✅ vs ⏸）
-_DRIVING_ROUTES = [
-    {
-        "name": "三重 ↔ 台北（最入門）",
-        "path": "善導寺 → 忠孝西路 → 忠孝橋 → 三重重新路 → 折返（或走台北橋 / 中興橋）",
-        "duration": "20-30 分鐘",
-        "highlights": "短距離 + 橋梁切換，最低壓力起步",
-        "level": "新手",
-        "types": ["橋", "公路"],
-    },
-    {
-        "name": "板橋土城高架圈（65 快速）",
-        "path": "華江橋 → 環河南快速 → 65 快速（土城-中和）→ 折返",
-        "duration": "60 分鐘",
-        "highlights": "65 是新北車流最少快速道路",
-        "level": "新手",
-        "types": ["橋", "快速", "公路"],
-    },
-    {
-        "name": "八里十三行（純非國道）",
-        "path": "重慶北路 → 環河北快速 → 64 快速 → 八里",
-        "duration": "30-40 分鐘",
-        "highlights": "練平面切快速 + 64 維持速度",
-        "level": "新手",
-        "types": ["快速", "公路"],
-    },
-    {
-        "name": "基隆河沿岸高架圈",
-        "path": "市民大道 → 環東大道 → 麥帥二橋 → 大直橋 → 圓山 → 重慶北高架",
-        "duration": "50-60 分鐘",
-        "highlights": "連續匝道密集 + 河岸景",
-        "level": "新手進階",
-        "types": ["高架", "橋"],
-    },
-    {
-        "name": "北市三高架繞圈",
-        "path": "建國高架 → 水源快速 → 福和橋 → 市民大道高架 → 環東大道 → 內湖",
-        "duration": "60-90 分鐘",
-        "highlights": "練連續匝道切換 + 北市高架網",
-        "level": "新手",
-        "types": ["高架", "橋"],
-    },
-    {
-        "name": "八里 + 台 15 西濱南下",
-        "path": "環河北 → 64 → 八里 → 台 15 西濱（往林口/桃園方向）",
-        "duration": "1.5-2 小時",
-        "highlights": "西濱長距離維持速度 + 海岸線",
-        "level": "進階",
-        "types": ["快速", "公路"],
-    },
-    {
-        "name": "桃園永安漁港（含國道練習）",
-        "path": "建國高架 → 國道 1 → 林口交流道 → 台 61 西濱 → 永安漁港",
-        "duration": "1.5 小時",
-        "highlights": "國道 + 西濱快速兼顧",
-        "level": "進階（含國道）",
-        "types": ["高架", "國道", "快速", "公路"],
-    },
-    {
-        "name": "宜蘭礁溪（雪隧挑戰）",
-        "path": "市民大道 → 國道 5 → 雪山隧道 → 礁溪",
-        "duration": "1 小時 20 分",
-        "highlights": "12.9km 長隧道專練（限速嚴）",
-        "level": "挑戰級",
-        "types": ["國道", "隧道"],
-    },
-]
-
-# 現階段練習目標：只練這幾類道路（其餘標 ⏸ 暫緩，不刪除）
-_CURRENT_FOCUS_TYPES = {"橋", "高架", "公路", "快速"}
+# ── 5.7 每日讀書代辦（2026-05-07 加，取代原本的「練車路線」section）──────────
 
 
-def driving_practice() -> str:
-    """練車路線：#1 主練、#2-8 候選分區呈現。
-
-    現階段 focus = {橋, 高架, 公路, 快速}：符合的標 ✅，不符合（如雪隧）標 ⏸。
-    """
-    if not _DRIVING_ROUTES:
-        return ""
-
-    def _format(idx: int, r: dict) -> list:
-        types = set(r.get("types", []))
-        non_focus = types - _CURRENT_FOCUS_TYPES
-        mark = "✅" if not non_focus else f"⏸ 含 {','.join(sorted(non_focus))}"
-        type_tags = "/".join(types) if types else "?"
-        return [
-            f"{idx}. {mark} [{r['level']}] {r['name']}（{r['duration']}，{type_tags}）",
-            f"   {r['path']}",
-        ]
-
+def daily_reading() -> str:
+    """每日代辦：讀資料工程基礎一章。"""
+    today = datetime.now()  # local time（launchd 執行時 = Mac 系統時區 TW）
     lines = [
-        "🚗 **練車路線**（起點：善導寺）",
-        "📅 現階段：每 2 週 ~ 1 個月練一次",
-        f"🎯 現階段練：{' / '.join(sorted(_CURRENT_FOCUS_TYPES))}（其餘 ⏸ 暫緩）",
-        "",
-        "━━━━━━━━━━━━━━━━━━━━━",
-        "▶️ **目前主練（focus）**",
-        "━━━━━━━━━━━━━━━━━━━━━",
+        "📚 **每日代辦：資料工程基礎**",
+        f"今日（{today.strftime('%Y-%m-%d %a')}）讀《資料工程基礎》**一章**",
+        "讀完做：",
+        "  • 1 句 takeaway（寫進 mock_interview/{date}.md 或 design doc）",
+        "  • 對應到 PTT 專案的對照（這章在 PTT 哪段體現？哪段沒做？）",
     ]
-    lines += _format(1, _DRIVING_ROUTES[0])
-
-    if len(_DRIVING_ROUTES) > 1:
-        lines += [
-            "",
-            "📋 **候選路線**（由簡入難，要練哪條跟我說會展開細節）",
-        ]
-        # 候選路線只列一行（節省字數，避免 Discord 2000 字截斷職缺 URL）
-        for i, r in enumerate(_DRIVING_ROUTES[1:], 2):
-            types = set(r.get("types", []))
-            non_focus = types - _CURRENT_FOCUS_TYPES
-            mark = "✅" if not non_focus else f"⏸ 含{','.join(sorted(non_focus))}"
-            lines.append(
-                f"{i}. {mark} [{r['level']}] {r['name']}（{r['duration']}）"
-            )
-
-    lines.append("")
-    lines.append("離峰時段：平日 10-15 點 / 假日清晨 6-9 點")
     return "\n".join(lines)
 
 
@@ -1351,9 +1243,9 @@ def main():
     if sox:
         sections += ["", sox]
 
-    drive = driving_practice()
-    if drive:
-        sections += ["", drive]
+    reading = daily_reading()
+    if reading:
+        sections += ["", reading]
 
     jobs = job_search_summary()
     if jobs:
