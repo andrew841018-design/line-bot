@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 import time
 from pathlib import Path
@@ -19,8 +18,8 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 sys.path.insert(0, str(Path(__file__).parent))
 
-import requests
-from bs4 import BeautifulSoup
+import requests  # noqa: E402
+from bs4 import BeautifulSoup  # noqa: E402
 
 GROUP_ID = os.environ.get("LINE_ALLOWED_GROUP_ID") or os.environ.get(
     "ALLOWED_GROUP_ID", ""

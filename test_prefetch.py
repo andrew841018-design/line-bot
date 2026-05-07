@@ -143,7 +143,8 @@ def test_db_clean():
 
 def test_system_prompt():
     print("\n── Test 4: 系統提示詞正確性 ──")
-    from gemini_client import _SYSTEM_PROMPT
+    # 2026-05-01 layered prompt 改名：_SYSTEM_PROMPT → _CORE_PROMPT
+    from gemini_client import _CORE_PROMPT as _SYSTEM_PROMPT
 
     # 人設：溫柔可愛，不是調皮幼稚
     check("人設包含「溫柔」", "溫柔" in _SYSTEM_PROMPT)

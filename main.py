@@ -696,6 +696,7 @@ def _fetch_video_gemini(url: str) -> str | None:
                     "gemini video fallback: timeout while waiting active url=%s", url
                 )
                 return None
+            assert uploaded_file.name is not None  # narrow for mypy
             f = gemini_client._client.files.get(name=uploaded_file.name)
             state = getattr(f.state, "name", str(f.state))
             if state == "ACTIVE":
@@ -717,11 +718,12 @@ def _fetch_video_gemini(url: str) -> str | None:
 
         response = None
         last_error = None
+        contents_list = [uploaded_file, prompt]
         for model_name in models_to_try:
             try:
                 response = gemini_client._client.models.generate_content(
                     model=model_name,
-                    contents=[uploaded_file, prompt],
+                    contents=contents_list,  # type: ignore[arg-type]
                 )
                 logger.info(
                     "gemini video fallback: model=%s succeeded url=%s",
@@ -771,7 +773,7 @@ def _fetch_video_gemini(url: str) -> str | None:
         return None
     finally:
         # 清理 Files API 上傳的檔案
-        if uploaded_file is not None:
+        if uploaded_file is not None and uploaded_file.name is not None:
             try:
                 gemini_client._client.files.delete(name=uploaded_file.name)
             except Exception as e:

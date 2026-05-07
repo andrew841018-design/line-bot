@@ -730,32 +730,21 @@ def test_gemini_group_messages():
     result = main._gemini_group_messages([])
     check("空 items → []", result == [])
 
-    # Gemini fails → grok fallback → success
+    # Gemini fails → heuristic fallback (grok 已移除)
     items = [
         {"type": "text", "text": "第一則", "user_id": "USR1", "timestamp": 1000},
         {"type": "text", "text": "第二則", "user_id": "USR2", "timestamp": 1001},
     ]
-    grok_result = [{"idxs": [0], "reply_to": 0}, {"idxs": [1], "reply_to": 1}]
-    with (
-        patch("main.gemini_client._client") as mock_client,
-        patch("main.grok_client.group_messages", return_value=grok_result),
-    ):
-        mock_client.models.generate_content.side_effect = Exception("Gemini down")
-        result2 = main._gemini_group_messages(items)
-    check("Gemini 失敗 → grok fallback", result2 == grok_result)
-
-    # Gemini + grok both fail → heuristic fallback
     with (
         patch("main.gemini_client._client") as mock_client2,
-        patch("main.grok_client.group_messages", return_value=None),
         patch(
             "main._heuristic_group_messages",
             return_value=[{"idxs": [0, 1], "reply_to": 1}],
         ) as mock_heuristic,
     ):
-        mock_client2.models.generate_content.side_effect = Exception("both fail")
+        mock_client2.models.generate_content.side_effect = Exception("Gemini down")
         main._gemini_group_messages(items)
-    check("Gemini + Grok 都失敗 → heuristic", mock_heuristic.called)
+    check("Gemini 失敗 → heuristic fallback", mock_heuristic.called)
 
     # Gemini returns valid JSON → parse correctly
     mock_resp = MagicMock()
@@ -909,60 +898,8 @@ def test_build_quoted_block_recent():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Test O: grok_client edge cases
+# Test O: grok_client edge cases — 已移除（2026-04-26 grok 改為 stub）
 # ═══════════════════════════════════════════════════════════════════════════════
-def test_grok_edge_cases():
-    print("\n── Test O: grok_client 邊界案例 ──")
-
-    # _load_usage with corrupted file
-    import grok_client as gc
-
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-        f.write("INVALID JSON{{{{")
-        tmp_usage = f.name
-    orig_path = gc._USAGE_FILE
-    gc._USAGE_FILE = tmp_usage
-    data = gc._load_usage()
-    check("corrupted usage file → 回傳預設", data.get("requests") == 0)
-    gc._USAGE_FILE = orig_path
-    os.unlink(tmp_usage)
-
-    # _save_usage to read-only path → silently pass
-    gc._USAGE_FILE = "/nonexistent_dir/usage.json"
-    try:
-        gc._save_usage({"date": "2026-01-01", "requests": 0})
-        check("save_usage 失敗 → 不爆", True)
-    except Exception:
-        check("save_usage 失敗 → 不爆", False)
-    gc._USAGE_FILE = orig_path
-
-    # group_messages with items → falls through filter conditions
-    items = [
-        {
-            "type": "text",
-            "text": "很長的訊息文字",
-            "user_id": "USR1",
-            "timestamp": 1000,
-        },
-    ]
-    with patch.object(gc, "_get_client") as mock_get:
-        mock_client = MagicMock()
-        mock_get.return_value = mock_client
-        mock_resp = MagicMock()
-        mock_resp.choices = [MagicMock()]
-        mock_resp.choices[0].message.content = json.dumps(
-            {"groups": [{"idxs": [0], "reply_to": 0}]}
-        )
-        mock_client.chat.completions.create.return_value = mock_resp
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            json.dump({"date": gc._today_pt(), "requests": 0}, f)
-            tmp_gc = f.name
-        orig_gc_path = gc._USAGE_FILE
-        gc._USAGE_FILE = tmp_gc
-        result = gc.group_messages(items)
-        gc._USAGE_FILE = orig_gc_path
-        os.unlink(tmp_gc)
-    check("grok group_messages → 回傳分組", result is not None)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1029,19 +966,6 @@ def test_get_quota_footer():
     with patch("main.gemini_client.get_gemini_quota_info", return_value=None):
         result = main._get_quota_footer()
     check("gemini info=None → 空字串", result == "")
-
-    # Quota exhausted, grok remaining > 0
-    main._quota_exhausted_until_ts = time.time() + 3600
-    with patch("main.grok_client.get_quota_info", return_value={"remaining": 5}):
-        result2 = main._get_quota_footer()
-    check("quota 爆 grok 剩 5 → 含 Grok", "Grok" in result2)
-
-    # Quota exhausted, grok remaining = 0
-    with patch("main.grok_client.get_quota_info", return_value={"remaining": 0}):
-        result3 = main._get_quota_footer()
-    check(
-        "quota 爆 grok 也爆 → 含 Gemini+Grok", "Gemini" in result3 and "Grok" in result3
-    )
 
     main._quota_exhausted_until_ts = 0.0
 
@@ -1143,12 +1067,9 @@ def test_process_pending_startup_partial():
     main.settings.bot_muted = False
 
     main._quota_exhausted_until_ts = time.time() + 3600
-    with (
-        patch("main.grok_client.quota_exhausted", return_value=True),
-        patch("main._gemini_group_messages") as mock_group,
-    ):
+    with patch("main._gemini_group_messages") as mock_group:
         main._process_pending_on_startup()
-    check("both quota 爆 → 不分組", not mock_group.called)
+    check("Gemini quota 爆 → 不分組", not mock_group.called)
 
     main._quota_exhausted_until_ts = 0.0
     main.settings.bot_muted = orig_muted
@@ -1579,9 +1500,6 @@ class AllTests(unittest.TestCase):
     def test_build_quoted_block_recent(self):
         test_build_quoted_block_recent()
 
-    def test_grok_edge_cases(self):
-        test_grok_edge_cases()
-
     def test_reply_non_muted(self):
         test_reply_non_muted()
 
@@ -1758,7 +1676,6 @@ if __name__ == "__main__":
         test_build_group_parts,
         test_small_helpers,
         test_build_quoted_block_recent,
-        test_grok_edge_cases,
         test_reply_non_muted,
         test_get_quota_footer,
         test_next_gemini_reset_tw,

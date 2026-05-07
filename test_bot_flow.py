@@ -14,7 +14,11 @@ test_bot_flow.py — LINE bot 核心流程離線測試
   python test_bot_flow.py        # 全部（離線，不呼叫 LLM API）
 """
 
-import sys, os, json, tempfile, types, unittest.mock as mock
+import sys
+import os
+import json
+import tempfile
+import unittest.mock as mock
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -240,130 +244,9 @@ def test_piggyback():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Test 4: _llm_chat waterfall — Gemini → Grok
+# Test 4 & 5: Grok waterfall / fallback group format
+# ── 已移除（2026-04-26 grok 移除為 stub；保留檔案僅讓 import 不爆）
 # ══════════════════════════════════════════════════════════════════════════════
-
-
-def test_llm_chat_waterfall():
-    print("\n── Test 4: _llm_chat Gemini→Grok waterfall ──")
-    import main
-
-    # Gemini 有量 → 用 Gemini
-    with (
-        mock.patch("main._quota_exhausted", return_value=False),
-        mock.patch("main.gemini_client") as mg,
-        mock.patch("main.grok_client") as mk,
-    ):
-        mg.chat.return_value = "gemini reply"
-        mk.chat.return_value = "grok reply"
-        mk.quota_exhausted.return_value = False
-        result = main._llm_chat("hi", [], [])
-    check("Gemini 有量 → 用 Gemini", result == "gemini reply")
-    check("Gemini 有量 → Grok 未被呼叫", mk.chat.call_count == 0)
-
-    # Gemini 沒量 → fallback Grok
-    with (
-        mock.patch("main._quota_exhausted", return_value=True),
-        mock.patch("main.gemini_client") as mg2,
-        mock.patch("main.grok_client") as mk2,
-        mock.patch("main.bot_stats"),
-    ):
-        mg2.chat.return_value = ""
-        mk2.chat.return_value = "grok reply"
-        mk2.quota_exhausted.return_value = False
-        from config import settings
-
-        orig_key = settings.grok_api_key
-        settings.grok_api_key = "fake-key"
-        try:
-            result2 = main._llm_chat("hi", [], [])
-        finally:
-            settings.grok_api_key = orig_key
-    check("Gemini 沒量 → fallback Grok", result2 == "grok reply")
-
-    # 兩個都沒量 → 回空字串
-    with (
-        mock.patch("main._quota_exhausted", return_value=True),
-        mock.patch("main.grok_client") as mk3,
-        mock.patch("main.bot_stats"),
-    ):
-        mk3.quota_exhausted.return_value = True
-        mk3.chat.return_value = ""
-        from config import settings
-
-        orig_key = settings.grok_api_key
-        settings.grok_api_key = "fake-key"
-        try:
-            result3 = main._llm_chat("hi", [], [])
-        finally:
-            settings.grok_api_key = orig_key
-    check("兩個都沒量 → 回空字串", result3 == "")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Test 5: Grok group_messages fallback 格式
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-def test_grok_group_format():
-    print("\n── Test 5: Grok group_messages fallback 格式 ──")
-    import grok_client
-
-    items = [
-        {
-            "user_id": "U1",
-            "message_id": "g1",
-            "type": "text",
-            "text": "投資問題",
-            "timestamp": 1.0,
-        },
-        {
-            "user_id": "U2",
-            "message_id": "g2",
-            "type": "text",
-            "text": "台積電漲了",
-            "timestamp": 2.0,
-        },
-        {
-            "user_id": "U1",
-            "message_id": "g3",
-            "type": "text",
-            "text": "今天天氣",
-            "timestamp": 100.0,
-        },
-    ]
-
-    fake_resp = mock.MagicMock()
-    fake_resp.choices[0].message.content = json.dumps(
-        {
-            "groups": [
-                {"idxs": [0, 1], "reply_to": 1},
-                {"idxs": [2], "reply_to": 2},
-            ]
-        }
-    )
-
-    with (
-        mock.patch.object(grok_client, "_get_client") as mc,
-        mock.patch.object(grok_client, "settings") as ms,
-    ):
-        ms.grok_api_key = "fake"
-        ms.grok_model = "grok-3-mini"
-        mc.return_value.chat.completions.create.return_value = fake_resp
-
-        result = grok_client.group_messages(items)
-
-    check("回傳非 None", result is not None)
-    check("分成 2 組", result is not None and len(result) == 2)
-    check(
-        "每個索引恰好出現一次",
-        result is not None
-        and sorted(sum([g["idxs"] for g in result], [])) == [0, 1, 2],
-    )
-    check(
-        "reply_to 在各組 idxs 內",
-        result is not None and all(g["reply_to"] in g["idxs"] for g in result),
-    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -412,8 +295,6 @@ if __name__ == "__main__":
     test_bot_stats()
     test_pending_flow()
     test_piggyback()
-    test_llm_chat_waterfall()
-    test_grok_group_format()
     test_quota_state()
 
     print(f"\n{'=' * 50}")

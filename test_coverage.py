@@ -18,7 +18,6 @@ os.environ.setdefault("GROK_API_KEY", "dummy")
 os.environ.setdefault("BOT_MUTED", "true")
 
 import main  # noqa: E402
-import grok_client  # noqa: E402
 import bot_stats  # noqa: E402
 
 PASS = 0
@@ -497,26 +496,6 @@ def test_get_quota_footer():
         footer = main._get_quota_footer()
     check("有量 footer 含 %", "%" in footer)
 
-    # Gemini 用完，Grok 有量
-    main._quota_exhausted_until_ts = time.time() + 3600
-    with patch(
-        "main.grok_client.get_quota_info",
-        return_value={"remaining": 10, "used_requests": 15, "limit_requests": 25},
-    ):
-        footer2 = main._get_quota_footer()
-    check("Gemini 用完 Grok 有量 → footer 含 Grok", "Grok" in footer2)
-
-    # 兩個都用完
-    with patch(
-        "main.grok_client.get_quota_info",
-        return_value={"remaining": 0, "used_requests": 25, "limit_requests": 25},
-    ):
-        footer3 = main._get_quota_footer()
-    check(
-        "兩個都用完 → footer 含「用量已用完」",
-        "用量已用完" in footer3 or "Grok" in footer3,
-    )
-
     main._quota_exhausted_until_ts = 0.0  # 還原
 
 
@@ -579,122 +558,8 @@ def test_extract_subtitles():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Test Q: grok_client — quota & chat
+# Test Q/R/S: grok_client tests — 已移除（2026-04-26 grok 改為 stub）
 # ═══════════════════════════════════════════════════════════════════════════════
-def test_grok_client_quota():
-    print("\n── Test Q: grok_client quota ──")
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-        json.dump({"date": grok_client._today_pt(), "requests": 0}, f)
-        tmp = f.name
-    orig = grok_client._USAGE_FILE
-    grok_client._USAGE_FILE = tmp
-
-    check("初始 quota_exhausted False", not grok_client.quota_exhausted())
-
-    info = grok_client.get_quota_info()
-    check("get_quota_info 有 used_requests", "used_requests" in info)
-    check("get_quota_info used=0", info["used_requests"] == 0)
-    check("remaining = limit", info["remaining"] == grok_client._DAILY_REQUEST_LIMIT)
-
-    # 用量達上限
-    json.dump(
-        {"date": grok_client._today_pt(), "requests": grok_client._DAILY_REQUEST_LIMIT},
-        open(tmp, "w"),
-    )
-    grok_client._client = None
-    check("達上限 → quota_exhausted True", grok_client.quota_exhausted())
-
-    # 日期切換 → 重置
-    json.dump({"date": "2000-01-01", "requests": 999}, open(tmp, "w"))
-    check("過期日期 → quota_exhausted False", not grok_client.quota_exhausted())
-
-    grok_client._USAGE_FILE = orig
-    os.unlink(tmp)
-
-
-def test_grok_client_chat():
-    print("\n── Test R: grok_client chat ──")
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-        json.dump({"date": grok_client._today_pt(), "requests": 0}, f)
-        tmp = f.name
-    orig_usage = grok_client._USAGE_FILE
-    grok_client._USAGE_FILE = tmp
-    orig_client = grok_client._client
-
-    mock_completion = MagicMock()
-    mock_completion.choices = [MagicMock()]
-    mock_completion.choices[0].message.content = "Grok 的回答"
-
-    mock_openai = MagicMock()
-    mock_openai.chat.completions.create.return_value = mock_completion
-    grok_client._client = mock_openai
-
-    result = grok_client.chat("你好", [], [])
-    check("chat 成功回傳文字", result == "Grok 的回答")
-    check("usage 增加 1", json.load(open(tmp))["requests"] == 1)
-
-    # quota 爆時直接回空
-    json.dump(
-        {"date": grok_client._today_pt(), "requests": grok_client._DAILY_REQUEST_LIMIT},
-        open(tmp, "w"),
-    )
-    result2 = grok_client.chat("你好", [], [])
-    check("quota 爆 → 回空字串", result2 == "")
-
-    # API 拋例外
-    json.dump({"date": grok_client._today_pt(), "requests": 0}, open(tmp, "w"))
-    mock_openai.chat.completions.create.side_effect = Exception("API error")
-    result3 = grok_client.chat("錯誤", [], [])
-    check("API 例外 → 回空字串", result3 == "")
-
-    grok_client._USAGE_FILE = orig_usage
-    grok_client._client = orig_client
-    os.unlink(tmp)
-
-
-def test_grok_client_group_messages():
-    print("\n── Test S: grok_client group_messages ──")
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-        json.dump({"date": grok_client._today_pt(), "requests": 0}, f)
-        tmp = f.name
-    orig_usage = grok_client._USAGE_FILE
-    grok_client._USAGE_FILE = tmp
-    orig_client = grok_client._client
-
-    mock_completion = MagicMock()
-    mock_completion.choices = [MagicMock()]
-    mock_completion.choices[0].message.content = json.dumps(
-        {"groups": [{"idxs": [0, 1], "reply_to": 0}, {"idxs": [2], "reply_to": 2}]}
-    )
-
-    mock_openai = MagicMock()
-    mock_openai.chat.completions.create.return_value = mock_completion
-    grok_client._client = mock_openai
-
-    items = [
-        {"text": "a", "user_id": "u1"},
-        {"text": "b", "user_id": "u1"},
-        {"text": "c", "user_id": "u2"},
-    ]
-    result = grok_client.group_messages(items)
-    check("group_messages 非 None", result is not None)
-    check("分成 2 組", len(result) == 2)
-
-    # API 回 invalid JSON
-    mock_completion2 = MagicMock()
-    mock_completion2.choices = [MagicMock()]
-    mock_completion2.choices[0].message.content = "not json"
-    mock_openai.chat.completions.create.return_value = mock_completion2
-    result2 = grok_client.group_messages(items)
-    check("invalid JSON → None", result2 is None)
-
-    # empty items
-    result3 = grok_client.group_messages([])
-    check("empty items → None 或空", result3 is None or result3 == [])
-
-    grok_client._USAGE_FILE = orig_usage
-    grok_client._client = orig_client
-    os.unlink(tmp)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -766,9 +631,6 @@ if __name__ == "__main__":
     test_get_quota_footer()
     test_health_endpoint()
     test_extract_subtitles()
-    test_grok_client_quota()
-    test_grok_client_chat()
-    test_grok_client_group_messages()
     test_bot_stats_track()
 
     print(f"\n{'=' * 50}")

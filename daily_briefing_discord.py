@@ -20,10 +20,10 @@ sys.path.insert(
     0, str(DEP_CODE_DIR)
 )  # DEP_CODE_DIR 優先，避免 line_bot/config.py 蓋掉 dependent_code/config.py
 
-from notify_discord import send_dm
+from notify_discord import send_dm  # noqa: E402
 
 # ── 已推到 Discord 的職缺 URL 紀錄（永久去重，跟 scraper 的 seen_jobs.json 分開） ─
-import json as _json
+import json as _json  # noqa: E402
 _PUSHED_JOBS_FILE = LINE_BOT_DIR / "pushed_jobs.json"
 
 
@@ -220,7 +220,7 @@ def line_bot_status() -> str:
             ["tail", "-20", str(log_path)], capture_output=True, text=True
         )
         tail = result.stdout
-        errors = [l for l in tail.splitlines() if _is_real_error(l)]
+        errors = [ln for ln in tail.splitlines() if _is_real_error(ln)]
         if errors:
             lines.append("🤖 **LINE Bot** 🔴 有 ERROR")
             for e in errors[-3:]:
@@ -318,7 +318,7 @@ def system_status() -> str:
 
 # 心靈雞湯池：base 365 句在 investment_quotes.py，dynamic 池每天可能累積
 # 每句配一條歷史佐證（事件 / 數據 / 名人語錄），不只勵志還能說服自己
-from investment_quotes import QUOTES as _BASE_QUOTES, BRAINYQUOTE_AUTHORS as _BQ_AUTHORS
+from investment_quotes import QUOTES as _BASE_QUOTES, BRAINYQUOTE_AUTHORS as _BQ_AUTHORS  # noqa: E402
 
 _DYNAMIC_QUOTES_FILE = LINE_BOT_DIR / "dynamic_quotes.json"
 

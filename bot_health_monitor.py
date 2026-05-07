@@ -28,7 +28,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -690,8 +690,8 @@ def main() -> int:
                 if ok:
                     auto_fixed = True
                     issues.append(
-                        f"✅ Gemini lite 爆 quota 自修：清 quota_state + 重啟 uvicorn，"
-                        f"_lite_or_main fallback 會自動把 lite 失敗轉給 main 撐過今晚（PT 隔夜重置）"
+                        "✅ Gemini lite 爆 quota 自修：清 quota_state + 重啟 uvicorn，"
+                        "_lite_or_main fallback 會自動把 lite 失敗轉給 main 撐過今晚（PT 隔夜重置）"
                     )
                 else:
                     issues.append(

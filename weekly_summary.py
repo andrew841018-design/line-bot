@@ -15,11 +15,11 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 sys.path.insert(0, str(Path(__file__).parent))
 
-import requests
+import requests  # noqa: E402
 
-import family_interest
-import gemini_client
-import memory
+import family_interest  # noqa: E402
+import gemini_client  # noqa: E402
+import memory  # noqa: E402
 
 GROUP_ID = os.environ.get("LINE_ALLOWED_GROUP_ID") or os.environ.get(
     "ALLOWED_GROUP_ID", ""

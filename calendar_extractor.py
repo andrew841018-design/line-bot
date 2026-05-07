@@ -81,7 +81,7 @@ def _strip_code_fence(s: str) -> str:
 
 def extract(combined_text: str) -> dict:
     """回 dict（必含 has_event / is_cancellation 兩 key）。失敗回 has_event=false。"""
-    fail = {
+    fail: dict = {
         "has_event": False,
         "is_cancellation": False,
         "title": None,
@@ -145,13 +145,15 @@ def _normalize(data: dict) -> dict:
         "cancel_target_keyword": _s("cancel_target_keyword", 40),
     }
     # date 格式驗證：YYYY-MM-DD；否則 None
-    if out["date"]:
+    date_val = out["date"]
+    if isinstance(date_val, str) and date_val:
         try:
-            datetime.strptime(out["date"], "%Y-%m-%d")
+            datetime.strptime(date_val, "%Y-%m-%d")
         except ValueError:
             out["date"] = None
     # time：HH:MM
-    if out["time"]:
-        if not re.fullmatch(r"\d{2}:\d{2}", out["time"]):
+    time_val = out["time"]
+    if isinstance(time_val, str) and time_val:
+        if not re.fullmatch(r"\d{2}:\d{2}", time_val):
             out["time"] = None
     return out

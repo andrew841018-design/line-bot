@@ -166,7 +166,6 @@ def test_bug3_bot_entries_filtered_from_pending():
             "main._llm_chat",
             side_effect=lambda *a, **kw: llm_calls.append(True) or "reply",
         ),
-        patch("main.grok_client.quota_exhausted", return_value=False),
     ):
         main._process_pending_on_startup()
 
@@ -174,41 +173,7 @@ def test_bug3_bot_entries_filtered_from_pending():
     assert "GRP001" in cleared, "Group must be cleared even when all items are __bot__"
 
 
-# ── Bug 4 ─────────────────────────────────────────────────────────────────────
-
-
-def test_bug4_grok_intro_not_sent_twice():
-    """Bug 4 (9d2528c): Grok fallback intro sent at most once per group per session.
-    _grok_intro_sent_groups gates the push; if group already in set, no intro.
-    Regression: intro was pushed on every _process_pending_on_startup call.
-    """
-    main._quota_exhausted_until_ts = time.time() + 3600  # Gemini gone
-    main.settings.bot_muted = False
-    # Simulate intro already sent this session
-    main._grok_intro_sent_groups.add("GRP001")
-
-    push_requests: list = []
-    mock_messaging = MagicMock()
-    mock_messaging.push_message.side_effect = lambda req: push_requests.append(req)
-    mock_api_ctx = MagicMock()
-    mock_api_ctx.__enter__ = MagicMock(return_value=mock_messaging)
-    mock_api_ctx.__exit__ = MagicMock(return_value=False)
-
-    # Empty items: no LLM push will happen, so any push must be the intro
-    with (
-        patch("main._load_pending_explicit", return_value={"GRP001": []}),
-        patch("main._clear_pending_explicit"),
-        patch("main.grok_client.quota_exhausted", return_value=False),
-        patch("main.ApiClient", return_value=mock_api_ctx),
-        patch("main.MessagingApi", return_value=mock_messaging),
-    ):
-        main._process_pending_on_startup()
-
-    # No push at all means no intro was sent
-    assert len(push_requests) == 0, (
-        "Intro must NOT be sent when group is already in _grok_intro_sent_groups; "
-        f"got {len(push_requests)} push(es): {push_requests}"
-    )
+# ── Bug 4: Grok fallback intro test 已移除（2026-04-26 grok 改為 stub）─────────
 
 
 # ── Bug 5 ─────────────────────────────────────────────────────────────────────

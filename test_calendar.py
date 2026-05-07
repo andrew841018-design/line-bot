@@ -8,9 +8,7 @@ from __future__ import annotations
 
 import importlib
 import json
-import sqlite3
 from datetime import date, timedelta
-from pathlib import Path
 
 import pytest
 
@@ -159,7 +157,7 @@ def test_event_reminder_main_no_events(tmp_calendar_db, monkeypatch):
 def test_event_reminder_pushes_and_marks(tmp_calendar_db, monkeypatch):
     cd = tmp_calendar_db
     seven = (date.today() + timedelta(days=7)).isoformat()
-    eid = cd.insert_event(
+    cd.insert_event(
         group_id="G1",
         title="家族聚餐",
         event_date=seven,

@@ -24,7 +24,7 @@ import time
 from typing import Optional
 
 import requests
-import yfinance as yf
+import yfinance as yf  # type: ignore[import-untyped]
 from bs4 import BeautifulSoup
 
 logger = logging.getLogger("stock_quote")

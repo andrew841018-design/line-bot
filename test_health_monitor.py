@@ -7,8 +7,6 @@ Tests for bot_health_monitor.py:
 """
 
 import os
-import sys
-import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -34,7 +32,7 @@ def _patch_cloudflared_log(tmp_path: Path, content: str) -> None:
 
 def test_cloudflared_url_alive_returns_true_on_200(tmp_path, monkeypatch):
     """When cloudflared.log has a URL and curl returns 200, function returns (True, "")."""
-    log = _patch_cloudflared_log(
+    _patch_cloudflared_log(
         tmp_path,
         "2026-05-05T05:29:11Z INF |  https://abc-def.trycloudflare.com  |\n",
     )

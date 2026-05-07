@@ -87,7 +87,7 @@ def main() -> int:
         return 0
     if r.status_code == 429:
         # 月配額仍爆，明天再試
-        print(f"[line_bot_update_push] 429 monthly quota exhausted, retry tomorrow")
+        print("[line_bot_update_push] 429 monthly quota exhausted, retry tomorrow")
         return 0  # 不算錯誤
     # 其他狀態
     print(

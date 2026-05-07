@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 _PROJECT_DEP = Path(__file__).parent.parent / "project" / "dependent_code"
 sys.path.insert(0, str(_PROJECT_DEP))
 
-import requests
+import requests  # noqa: E402
 
 GROUP_ID = os.environ.get("LINE_ALLOWED_GROUP_ID") or os.environ.get(
     "ALLOWED_GROUP_ID", ""
