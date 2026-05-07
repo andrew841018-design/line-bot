@@ -1,0 +1,271 @@
+"""Tests for stock_quote real-time fallback chain.
+
+Covers:
+  1. _parse_yahoo_tw_html parses sample TW HTML correctly
+  2. _parse_yahoo_us_html parses sample US HTML correctly
+  3. get_quote falls through real-time → fast_info → history
+  4. get_quotes_text header shows source + timestamp from real-time
+"""
+
+from __future__ import annotations
+
+from unittest.mock import patch
+
+import stock_quote
+
+
+# ── 1. Yahoo TW parser ──────────────────────────────────────────────────────
+
+
+_TW_SAMPLE_HTML = """
+<html><body>
+  <span>2330</span>
+  <span class="Fz(32px)">2,325</span>
+  <span>75.00</span>
+  <span>(3.33%)</span>
+  <span>資料時間：2026/05/07 11:03</span>
+  <ul>
+    <li><span>成交</span><span>2,325</span></li>
+    <li><span>開盤</span><span>2,335</span></li>
+    <li><span>最高</span><span>2,345</span></li>
+    <li><span>最低</span><span>2,310</span></li>
+    <li><span>昨收</span><span>2,250</span></li>
+    <li><span>漲跌幅</span><span>3.33%</span></li>
+    <li><span>漲跌</span><span>75.00</span></li>
+  </ul>
+</body></html>
+"""
+
+
+def test_parse_yahoo_tw_html_extracts_all_fields():
+    p = stock_quote._parse_yahoo_tw_html(_TW_SAMPLE_HTML)
+    assert p is not None, "parser returned None on valid TW sample"
+    assert p["last_price"] == 2325.0
+    assert p["open"] == 2335.0
+    assert p["high"] == 2345.0
+    assert p["low"] == 2310.0
+    assert p["prev_close"] == 2250.0
+    assert p["change"] == 75.0
+    assert abs(p["change_pct"] - 3.33) < 0.01
+    assert p["timestamp"] == "2026/05/07 11:03"
+
+
+def test_parse_yahoo_tw_html_falling_stock_negates_change():
+    """頁面上「漲跌」是絕對值，下跌時 parser 要把它變負。"""
+    html = _TW_SAMPLE_HTML.replace(
+        "<span>成交</span><span>2,325</span>",
+        "<span>成交</span><span>2,200</span>",
+    )
+    p = stock_quote._parse_yahoo_tw_html(html)
+    assert p is not None
+    assert p["last_price"] == 2200.0
+    # last < prev_close (2250) → change/pct should be negative
+    assert p["change"] is not None and p["change"] < 0
+    assert p["change_pct"] is not None and p["change_pct"] < 0
+
+
+def test_parse_yahoo_tw_html_returns_none_on_garbage():
+    assert stock_quote._parse_yahoo_tw_html("<html><body>nothing</body></html>") is None
+    assert stock_quote._parse_yahoo_tw_html("") is None
+
+
+# ── 2. Yahoo US parser ──────────────────────────────────────────────────────
+
+
+_US_SAMPLE_HTML = """
+<html><body>
+  <span data-testid="qsp-price">287.51 </span>
+  <span data-testid="qsp-price-change">+3.28 </span>
+  <span data-testid="qsp-price-change-percent">(+1.16%)</span>
+  <ul>
+    <li><span>Previous Close</span>
+      <span><fin-streamer data-field="regularMarketPreviousClose" data-value="284.23">284.23</fin-streamer></span>
+    </li>
+    <li><span>Open </span>
+      <span><fin-streamer data-field="regularMarketOpen" data-value="281.92">281.92</fin-streamer></span>
+    </li>
+    <li><span>Day's Range</span>
+      <span><fin-streamer data-field="regularMarketDayRange" data-value="281.08 - 288.03">281.08 - 288.03</fin-streamer></span>
+    </li>
+  </ul>
+</body></html>
+"""
+
+
+def test_parse_yahoo_us_html_extracts_all_fields():
+    p = stock_quote._parse_yahoo_us_html(_US_SAMPLE_HTML, "AAPL")
+    assert p is not None, "parser returned None on valid US sample"
+    assert p["last_price"] == 287.51
+    assert p["change"] == 3.28
+    assert abs(p["change_pct"] - 1.16) < 0.01
+    assert p["prev_close"] == 284.23
+    assert p["open"] == 281.92
+    assert p["high"] == 288.03
+    assert p["low"] == 281.08
+
+
+def test_parse_yahoo_us_html_returns_none_on_garbage():
+    assert stock_quote._parse_yahoo_us_html("<html></html>", "AAPL") is None
+    assert stock_quote._parse_yahoo_us_html("", "AAPL") is None
+
+
+# ── 3. get_realtime_quote uses correct URL per market ───────────────────────
+
+
+def test_get_realtime_quote_tw_uses_tw_yahoo():
+    captured_urls = []
+
+    def fake_fetch(url):
+        captured_urls.append(url)
+        return _TW_SAMPLE_HTML
+
+    with patch.object(stock_quote, "_fetch_yahoo_html", side_effect=fake_fetch):
+        q = stock_quote.get_realtime_quote("2330.TW")
+
+    assert q is not None
+    assert q["symbol"] == "2330.TW"
+    assert q["source"] == "yahoo_realtime"
+    assert q["last_price"] == 2325.0
+    assert captured_urls == ["https://tw.stock.yahoo.com/quote/2330.TW"]
+
+
+def test_get_realtime_quote_us_uses_us_yahoo():
+    captured_urls = []
+
+    def fake_fetch(url):
+        captured_urls.append(url)
+        return _US_SAMPLE_HTML
+
+    with patch.object(stock_quote, "_fetch_yahoo_html", side_effect=fake_fetch):
+        q = stock_quote.get_realtime_quote("AAPL")
+
+    assert q is not None
+    assert q["symbol"] == "AAPL"
+    assert q["source"] == "yahoo_realtime"
+    assert q["last_price"] == 287.51
+    assert captured_urls == ["https://finance.yahoo.com/quote/AAPL"]
+
+
+def test_get_realtime_quote_returns_none_when_fetch_fails():
+    with patch.object(stock_quote, "_fetch_yahoo_html", return_value=None):
+        assert stock_quote.get_realtime_quote("2330.TW") is None
+
+
+# ── 4. Fallback chain ───────────────────────────────────────────────────────
+
+
+def test_get_quote_uses_realtime_first():
+    """real-time succeeds → fast_info / history not called."""
+    rt_quote = {
+        "symbol": "2330.TW", "last_price": 2325.0, "source": "yahoo_realtime",
+        "timestamp": "2026-05-07 11:03", "change": 75.0, "change_pct": 3.33,
+    }
+    with patch.object(stock_quote, "get_realtime_quote", return_value=rt_quote) as rt, \
+         patch.object(stock_quote, "get_fast_info_quote") as fi, \
+         patch.object(stock_quote, "get_history_quote") as hi:
+        out = stock_quote.get_quote("2330.TW")
+
+    assert out is rt_quote
+    assert rt.called
+    assert not fi.called
+    assert not hi.called
+
+
+def test_get_quote_falls_back_to_fast_info_when_realtime_fails():
+    fi_quote = {
+        "symbol": "2330.TW", "last_price": 2320.0, "source": "fast_info",
+        "timestamp": "2026-05-07 11:00", "change": 70.0, "change_pct": 3.11,
+    }
+    with patch.object(stock_quote, "get_realtime_quote", return_value=None), \
+         patch.object(stock_quote, "get_fast_info_quote", return_value=fi_quote) as fi, \
+         patch.object(stock_quote, "get_history_quote") as hi:
+        out = stock_quote.get_quote("2330.TW")
+
+    assert out is fi_quote
+    assert fi.called
+    assert not hi.called
+
+
+def test_get_quote_falls_back_to_history_when_both_fail():
+    hi_quote = {
+        "symbol": "2330.TW", "last_price": 2250.0, "source": "history",
+        "last_date": "2026-05-06", "timestamp": "2026-05-06",
+        "change": 30.0, "change_pct": 1.35,
+    }
+    with patch.object(stock_quote, "get_realtime_quote", return_value=None), \
+         patch.object(stock_quote, "get_fast_info_quote", return_value=None), \
+         patch.object(stock_quote, "get_history_quote", return_value=hi_quote) as hi:
+        out = stock_quote.get_quote("2330.TW")
+
+    assert out is hi_quote
+    assert hi.called
+
+
+def test_get_quote_returns_none_when_all_fail():
+    with patch.object(stock_quote, "get_realtime_quote", return_value=None), \
+         patch.object(stock_quote, "get_fast_info_quote", return_value=None), \
+         patch.object(stock_quote, "get_history_quote", return_value=None):
+        assert stock_quote.get_quote("BOGUS.XX") is None
+
+
+# ── 5. get_quotes_text header shows source + timestamp ──────────────────────
+
+
+def test_get_quotes_text_header_shows_realtime_source():
+    rt_quote = {
+        "symbol": "2330.TW",
+        "last_price": 2325.0,
+        "prev_close": 2250.0,
+        "change": 75.0,
+        "change_pct": 3.33,
+        "open": 2335.0,
+        "high": 2345.0,
+        "low": 2310.0,
+        "timestamp": "2026-05-07 11:03",
+        "last_date": "2026-05-07",
+        "source": "yahoo_realtime",
+    }
+    with patch.object(stock_quote, "get_quote", return_value=rt_quote):
+        out = stock_quote.get_quotes_text("台積電現在多少？")
+
+    assert out is not None
+    # Header must include the real-time timestamp + source label
+    assert "2026-05-07 11:03" in out
+    assert "Yahoo 即時" in out
+    # Quote line must include H/L
+    assert "2,325" in out
+    assert "2,345" in out  # high
+    assert "2,310" in out  # low
+    assert "+75.00" in out
+    assert "+3.33%" in out
+
+
+def test_get_quotes_text_header_shows_history_source_when_only_history():
+    hi_quote = {
+        "symbol": "2330.TW",
+        "last_price": 2250.0,
+        "prev_close": 2220.0,
+        "change": 30.0,
+        "change_pct": 1.35,
+        "open": None,
+        "high": None,
+        "low": None,
+        "timestamp": "2026-05-06",
+        "last_date": "2026-05-06",
+        "source": "history",
+    }
+    with patch.object(stock_quote, "get_quote", return_value=hi_quote):
+        out = stock_quote.get_quotes_text("台積電現在多少？")
+
+    assert out is not None
+    assert "2026-05-06" in out
+    assert "日線收盤" in out
+
+
+def test_get_quotes_text_returns_none_when_no_symbols():
+    assert stock_quote.get_quotes_text("今天天氣很好") is None
+
+
+def test_get_quotes_text_returns_none_when_all_quotes_fail():
+    with patch.object(stock_quote, "get_quote", return_value=None):
+        assert stock_quote.get_quotes_text("台積電現在多少？") is None
