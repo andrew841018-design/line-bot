@@ -139,8 +139,23 @@ def _llm_chat(
     facts: list[str],
     pnotes: list[dict] | None = None,
 ) -> str:
-    """Gemini chat。quota 爆時直接回空字串（caller 自行判斷）。"""
+    """Gemini chat。quota 爆時自動 fallback 到 lite_reply（規則式）。
+
+    2026-05-08：用戶要求 quota 爆時走「資料探勘」路徑（lite mode）：
+    URL 摘要 / 股價 / 計算 / 時間 / 維基 / 天氣 等簡單問句處理。
+    lite_reply 處理不了 → 回空字串（caller 沉默）。
+    """
     if _quota_exhausted():
+        try:
+            from lite_reply import lite_reply
+            from gemini_client import _extract_text
+            user_text = _extract_text(user_input)
+            lite_out = lite_reply(user_text)
+            if lite_out:
+                logger.info("quota exhausted → lite_reply hit (text=%r)", user_text[:50])
+                return lite_out
+        except Exception as e:
+            logger.warning("lite_reply failed: %s", e)
         return ""
     result = gemini_client.chat(user_input, context, facts, pnotes)
     if result:
