@@ -1,0 +1,177 @@
+"""Reminder push — LINE 群組獨立提醒排程（2026-05-08 建立）。
+
+每 15 分鐘 launchd 觸發。階梯式 push schedule（用戶要求 2026-05-08）：
+
+  ≥ 7 days：每週推一次（last_weekly_at >= 6.5 days ago）
+  4-6 days：dead zone 不推
+  ~ 3 days：推 1 次（pushed_3d = 1）
+  ~ 1 day：推 1 次（pushed_1d = 1）
+  4 hr 前：推 1 次（pushed_4hr = 1）
+  2 hr 前：推 1 次（pushed_2hr = 1）
+  1 hr 前：推 1 次（pushed_1hr = 1）
+  到時：推 1 次 + mark done（pushed_now = 1, status = 'done'）
+
+每階段都有 flag 防重複 push。launchd 每 15 分鐘跑一次提供精度 ±7.5 min。
+
+跟 daily_briefing_discord 完全獨立（不走 Discord）。
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+from datetime import datetime
+
+from linebot.v3.messaging import (
+    ApiClient, Configuration, MessagingApi, PushMessageRequest, TextMessage,
+)
+
+import memory
+from config import settings
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+)
+logger = logging.getLogger("reminder_push")
+
+
+def _push_to_group(group_id: str, text: str) -> bool:
+    """推到 LINE 群組。失敗回 False。"""
+    cfg = Configuration(access_token=settings.line_channel_access_token)
+    try:
+        with ApiClient(cfg) as api_client:
+            MessagingApi(api_client).push_message(
+                PushMessageRequest(
+                    to=group_id,
+                    messages=[TextMessage(text=text[:4900])],
+                )
+            )
+        return True
+    except Exception as e:
+        logger.warning("LINE push failed (group=%s): %s", group_id, e)
+        return False
+
+
+def _decide_stage(r: dict, now: int) -> str | None:
+    """判斷該 reminder 此刻該推哪個 stage，None = 不推。"""
+    delta = r["remind_at"] - now
+    days = delta / 86400
+    hours = delta / 3600
+
+    # 到時（-15min ~ +15min 之間，且 pushed_now 未推）
+    if -0.25 <= hours <= 0.25 and not r["pushed_now"]:
+        return "now"
+
+    # 1 hr 前（窗口 0.5 ~ 1.5 hr）
+    if 0.5 < hours <= 1.5 and not r["pushed_1hr"]:
+        return "1hr"
+
+    # 2 hr 前（窗口 1.5 ~ 2.5 hr）
+    if 1.5 < hours <= 2.5 and not r["pushed_2hr"]:
+        return "2hr"
+
+    # 4 hr 前（窗口 3.5 ~ 4.5 hr）
+    if 3.5 < hours <= 4.5 and not r["pushed_4hr"]:
+        return "4hr"
+
+    # 1 day 前（窗口 0.5 ~ 2 days，避開 4hr 前那段）
+    # 條件：4.5 hr < hours, 0.5 days < days <= 2 days
+    if hours > 4.5 and 0.5 < days <= 2 and not r["pushed_1d"]:
+        return "1d"
+
+    # 3 days 前（窗口 2 ~ 4 days）
+    if 2 < days <= 4 and not r["pushed_3d"]:
+        return "3d"
+
+    # 4-7 days dead zone（不推）
+    if 4 < days < 7:
+        return None
+
+    # ≥ 7 days：每週一次
+    if days >= 7:
+        last_weekly = r["last_weekly_at"]
+        days_since = (now - last_weekly) / 86400 if last_weekly else 999
+        if days_since >= 6.5:
+            return "weekly"
+
+    return None
+
+
+_STAGE_LABELS = {
+    "weekly": "（一週後）",
+    "3d": "（3 天後）",
+    "1d": "（明天）",
+    "4hr": "（4 小時後）",
+    "2hr": "（2 小時後）",
+    "1hr": "（1 小時後）",
+    "now": "（**現在 / 即將到時**）",
+}
+
+
+def _format_push_text(r: dict, stage: str) -> str:
+    dt = datetime.fromtimestamp(r["remind_at"])
+    label = _STAGE_LABELS.get(stage, "")
+    return f"⏰ 提醒{label}\n{dt.strftime('%Y-%m-%d %H:%M')} {r['action']}"
+
+
+def push_reminders(dry_run: bool = False) -> int:
+    """掃所有 pending reminder，依階梯式 stage 規則 push。
+
+    回 push 成功的筆數。
+    """
+    now = int(datetime.now().timestamp())
+    all_pending = memory.list_pending_reminders_full()
+    sent = 0
+
+    for r in all_pending:
+        stage = _decide_stage(r, now)
+        if stage is None:
+            continue
+
+        text = _format_push_text(r, stage)
+
+        if dry_run:
+            print(f"[DRY] rid={r['reminder_id']} stage={stage} group={r['group_id']}")
+            print(f"      {text}")
+            sent += 1
+            continue
+
+        ok = _push_to_group(r["group_id"], text)
+        if ok:
+            memory.mark_reminder_pushed(r["reminder_id"], stage)
+            logger.info(
+                "pushed rid=%d stage=%s action=%r",
+                r["reminder_id"], stage, r["action"],
+            )
+            sent += 1
+        else:
+            logger.warning(
+                "push failed rid=%d stage=%s, will retry next run",
+                r["reminder_id"], stage,
+            )
+
+    return sent
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="LINE 提醒推送（階梯式 schedule）")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="不真推 LINE，只印出來")
+    args = parser.parse_args()
+
+    sent = push_reminders(dry_run=args.dry_run)
+    if sent:
+        logger.info("reminder_push: %d 筆已推送", sent)
+
+    # 過期清理（每天 00:00 一次就夠）
+    if datetime.now().hour == 0 and datetime.now().minute < 15:
+        expired = memory.expire_old_reminders()
+        if expired:
+            logger.info("expired %d old reminders", expired)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

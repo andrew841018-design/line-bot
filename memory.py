@@ -105,19 +105,29 @@ def _init_db() -> None:
                 PRIMARY KEY (group_id, text_hash)
             );
             CREATE TABLE IF NOT EXISTS reminders (
-                reminder_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                group_id    TEXT NOT NULL,
-                user_id     TEXT NOT NULL DEFAULT '',
-                action      TEXT NOT NULL,
-                remind_at   INTEGER NOT NULL,
-                created_at  INTEGER NOT NULL,
-                status      TEXT NOT NULL DEFAULT 'pending',
-                source_text TEXT
+                reminder_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id        TEXT NOT NULL,
+                user_id         TEXT NOT NULL DEFAULT '',
+                action          TEXT NOT NULL,
+                remind_at       INTEGER NOT NULL,
+                created_at      INTEGER NOT NULL,
+                status          TEXT NOT NULL DEFAULT 'pending',
+                source_text     TEXT,
+                last_pushed_at  INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_reminders_remind_at
                 ON reminders(group_id, status, remind_at);
             """
         )
+        # reminders schema migration: add stage flag columns
+        rcols = [r[1] for r in c.execute("PRAGMA table_info(reminders)").fetchall()]
+        for col in (
+            "last_pushed_at", "weekly_count", "last_weekly_at",
+            "pushed_3d", "pushed_1d",
+            "pushed_4hr", "pushed_2hr", "pushed_1hr", "pushed_now",
+        ):
+            if col not in rcols:
+                c.execute(f"ALTER TABLE reminders ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0")
         # facts schema migration: add user_id column if missing
         cols = [r[1] for r in c.execute("PRAGMA table_info(facts)").fetchall()]
         if "user_id" not in cols:
@@ -672,3 +682,77 @@ def expire_old_reminders(threshold_seconds: int = 86400 * 3) -> int:
             (cutoff,),
         )
         return cursor.rowcount
+
+
+def list_pending_reminders_full(group_id: str | None = None) -> list[dict]:
+    """完整版 list — 含所有 stage flag 給 reminder_push.py 用。"""
+    import time
+    now = int(time.time())
+    with _conn() as c:
+        if group_id:
+            rows = c.execute(
+                "SELECT reminder_id, group_id, user_id, action, remind_at, "
+                "created_at, source_text, last_pushed_at, weekly_count, "
+                "last_weekly_at, pushed_3d, pushed_1d, "
+                "pushed_4hr, pushed_2hr, pushed_1hr, pushed_now "
+                "FROM reminders WHERE status='pending' AND group_id=? AND remind_at >= ? "
+                "ORDER BY remind_at",
+                (group_id, now - 86400),
+            ).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT reminder_id, group_id, user_id, action, remind_at, "
+                "created_at, source_text, last_pushed_at, weekly_count, "
+                "last_weekly_at, pushed_3d, pushed_1d, "
+                "pushed_4hr, pushed_2hr, pushed_1hr, pushed_now "
+                "FROM reminders WHERE status='pending' AND remind_at >= ? "
+                "ORDER BY remind_at",
+                (now - 86400,),
+            ).fetchall()
+    return [
+        {
+            "reminder_id": r[0], "group_id": r[1], "user_id": r[2],
+            "action": r[3], "remind_at": r[4], "created_at": r[5],
+            "source_text": r[6] or "",
+            "last_pushed_at": r[7], "weekly_count": r[8],
+            "last_weekly_at": r[9], "pushed_3d": r[10], "pushed_1d": r[11],
+            "pushed_4hr": r[12], "pushed_2hr": r[13],
+            "pushed_1hr": r[14], "pushed_now": r[15],
+        }
+        for r in rows
+    ]
+
+
+def mark_reminder_pushed(reminder_id: int, stage: str) -> bool:
+    """把 reminder 在某 stage push 過的 flag 打開。
+
+    stage 可選：
+      - 'weekly' → weekly_count += 1, last_weekly_at = now, last_pushed_at = now
+      - '3d' / '1d' / '4hr' / '2hr' / '1hr' / 'now' → 對應 flag = 1, last_pushed_at = now
+      - 'now' 額外把 status 標為 'done'
+    """
+    import time
+    now = int(time.time())
+    with _lock, _conn() as c:
+        if stage == "weekly":
+            c.execute(
+                "UPDATE reminders SET weekly_count = weekly_count + 1, "
+                "last_weekly_at = ?, last_pushed_at = ? WHERE reminder_id = ?",
+                (now, now, reminder_id),
+            )
+        elif stage in ("3d", "1d", "4hr", "2hr", "1hr"):
+            col = f"pushed_{stage}"
+            c.execute(
+                f"UPDATE reminders SET {col} = 1, last_pushed_at = ? "
+                f"WHERE reminder_id = ?",
+                (now, reminder_id),
+            )
+        elif stage == "now":
+            c.execute(
+                "UPDATE reminders SET pushed_now = 1, last_pushed_at = ?, "
+                "status = 'done' WHERE reminder_id = ?",
+                (now, reminder_id),
+            )
+        else:
+            return False
+        return True

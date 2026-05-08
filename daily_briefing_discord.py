@@ -116,54 +116,9 @@ def _load_pending_todos() -> list:
         return []
 
 
-def _auto_reminders() -> list[str]:
-    """從 line_bot.db 讀自動偵測的時間性 reminders（2026-05-08 加）。
-
-    回 list of formatted strings（適合放進 daily_todos 的 🚨 / ⏰ 區段）。
-    範圍：未來 30 天 + 過去 24h（避免昨晚到時沒 push 到的 reminder 漏看）
-    """
-    db_path = LINE_BOT_DIR / "line_bot.db"
-    if not db_path.exists():
-        return []
-    try:
-        conn = sqlite3.connect(str(db_path))
-        cur = conn.cursor()
-        import time as _time
-        now = int(_time.time())
-        lo = now - 86400
-        hi = now + 30 * 86400
-        cur.execute("""
-            SELECT reminder_id, action, remind_at FROM reminders
-            WHERE status='pending' AND remind_at BETWEEN ? AND ?
-            ORDER BY remind_at
-        """, (lo, hi))
-        rows = cur.fetchall()
-        conn.close()
-    except Exception:
-        return []
-
-    if not rows:
-        return []
-
-    today = datetime.now().date()
-    out = []
-    for rid, action, ts in rows:
-        dt = datetime.fromtimestamp(ts)
-        days = (dt.date() - today).days
-        if days < 0:
-            label = f"⚠️ 已過 {-days} 天"
-        elif days == 0:
-            label = "🔴 今天"
-        elif days == 1:
-            label = "🟡 明天"
-        else:
-            label = f"🟢 {days} 天後"
-        time_str = dt.strftime("%m/%d %H:%M")
-        out.append(f"⏰ {label} {time_str} {action}")
-    return out
-
-
 def daily_todos() -> str:
+    # 注意：自動偵測的 reminders 不在這裡推（2026-05-08 用戶要求 line_bot 與 discord 完全獨立）
+    # → reminder push 走 LINE bot 獨立排程（reminder_push.py）
     now = datetime.now()
     today = now.strftime("%m/%d")
     weekday = ["一", "二", "三", "四", "五", "六", "日"][now.weekday()]
@@ -171,17 +126,12 @@ def daily_todos() -> str:
 
     lines = [f"📌 **每日待辦** ({today} 週{weekday} {push_time})"]
 
-    # 自動偵測的時間性 reminders（2026-05-08 加）
-    reminders = _auto_reminders()
-    for r in reminders:
-        lines.append(r)
-
     # 一次性 urgent todos（從 pending_todos.json 讀，手動加的）
     pending = _load_pending_todos()
     for item in pending:
         lines.append(f"🚨 {item}")
 
-    if reminders or pending:
+    if pending:
         lines.append("─────")
 
     lines += [
