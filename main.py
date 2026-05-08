@@ -1103,6 +1103,11 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
         except Exception as e:
             logger.warning("[Feedback] collect_message failed: %s", e)
 
+    # 自動偵測 reminder（2026-05-08：含日期+時間 hint 的訊息抽 action 存 DB）
+    # 失敗 silent，不阻塞主流程
+    sender_uid_for_reminder = getattr(event.source, "user_id", None) or ""
+    _maybe_extract_reminder(text, group_id, sender_uid_for_reminder)
+
     # 1. 指令處理（指令不需要 @mention 也能用，方便管理）
     cmd_reply = _handle_command(group_id, text)
     if cmd_reply is not None:
@@ -2217,6 +2222,66 @@ def _maybe_extract_facts(group_id: str, user_id: str = "") -> None:
         added,
         len(memory.list_facts(group_id)),
     )
+
+
+# ── 自動偵測 reminder（2026-05-08 加，用戶要求自動記住日常事項）────────────
+
+# 候選訊息 hint：含「日期 keyword」+「時間 keyword」才送 Gemini，省 quota
+_REMINDER_DATE_HINT = re.compile(
+    r"(\d+\s*月\s*\d+|\d+/\d+|\d+號|\d+日|"
+    r"今天|今晚|明天|明日|明晚|後天|大後天|"
+    r"星期[一二三四五六日天]|週[一二三四五六日]|"
+    r"下\s*(週|周|星期|月)|這\s*(週|周|星期))"
+)
+_REMINDER_TIME_HINT = re.compile(
+    r"(\d+\s*[:：]\s*\d+|\d+\s*點|"
+    r"早上|上午|中午|下午|傍晚|晚上|凌晨|半夜|"
+    r"AM|PM|am|pm)"
+)
+
+
+def _maybe_extract_reminder(text: str, group_id: str, user_id: str = "") -> None:
+    """偵測 user 訊息中的時間性提醒事項，存進 reminders table。失敗 silent。
+
+    流程：regex pre-filter → Gemini light 抽取 → memory.add_reminder
+    """
+    if not text or len(text) > 500:
+        return
+    # 必須同時有日期 hint + 時間 hint，才送 Gemini（避免每訊息都打）
+    if not (_REMINDER_DATE_HINT.search(text) and _REMINDER_TIME_HINT.search(text)):
+        return
+
+    try:
+        result = gemini_client.extract_reminder(text)
+        if result is None:
+            return
+        # 算 remind_at（local timezone）
+        from datetime import datetime as _dt
+        try:
+            remind_dt = _dt(
+                int(result["year"]),
+                int(result["month"]),
+                int(result["day"]),
+                int(result["hour"]),
+                int(result["minute"]),
+            )
+        except (ValueError, KeyError, TypeError) as e:
+            logger.info("reminder datetime parse failed: %s, result=%s", e, result)
+            return
+        remind_at = int(remind_dt.timestamp())
+        # 過去事件不存（已過 1 hr 以上）
+        if remind_at < _dt.now().timestamp() - 3600:
+            return
+        rid = memory.add_reminder(
+            group_id, user_id, result["action"], remind_at, source_text=text[:200]
+        )
+        if rid:
+            logger.info(
+                "reminder saved: rid=%d action=%r at=%s",
+                rid, result["action"], remind_dt.strftime("%Y-%m-%d %H:%M"),
+            )
+    except Exception as e:
+        logger.warning("_maybe_extract_reminder failed: %s", e)
 
 
 # ── Join / Leave 處理 ────────────────────────────────────────────────────────

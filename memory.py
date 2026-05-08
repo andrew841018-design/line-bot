@@ -104,6 +104,18 @@ def _init_db() -> None:
                 expires_at INTEGER NOT NULL,
                 PRIMARY KEY (group_id, text_hash)
             );
+            CREATE TABLE IF NOT EXISTS reminders (
+                reminder_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id    TEXT NOT NULL,
+                user_id     TEXT NOT NULL DEFAULT '',
+                action      TEXT NOT NULL,
+                remind_at   INTEGER NOT NULL,
+                created_at  INTEGER NOT NULL,
+                status      TEXT NOT NULL DEFAULT 'pending',
+                source_text TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_reminders_remind_at
+                ON reminders(group_id, status, remind_at);
             """
         )
         # facts schema migration: add user_id column if missing
@@ -541,3 +553,122 @@ def list_persona_notes(group_id: str, kind: str | None = None) -> list[dict]:
         }
         for r in rows
     ]
+
+
+# ── Reminders（自動偵測時間性事項，2026-05-08 加）────────────────────────────
+
+
+def add_reminder(
+    group_id: str,
+    user_id: str,
+    action: str,
+    remind_at: int,
+    source_text: str = "",
+) -> int | None:
+    """新增 reminder。remind_at = epoch seconds。
+
+    去重：同 group_id + 同 action + 24h 內 remind_at 差 < 1h → 跳過（避免同訊息被多次抽）。
+    回 reminder_id；跳過時回 None。
+    """
+    import time
+    now = int(time.time())
+    with _lock, _conn() as c:
+        # 去重
+        existing = c.execute(
+            "SELECT reminder_id FROM reminders "
+            "WHERE group_id = ? AND action = ? AND status = 'pending' "
+            "AND ABS(remind_at - ?) < 3600",
+            (group_id, action, remind_at),
+        ).fetchone()
+        if existing:
+            return None
+        c.execute(
+            "INSERT INTO reminders(group_id, user_id, action, remind_at, "
+            "created_at, status, source_text) VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+            (group_id, user_id, action, remind_at, now, source_text),
+        )
+        return c.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def list_pending_reminders(
+    group_id: str | None = None,
+    within_seconds: int | None = None,
+) -> list[dict]:
+    """列出 pending reminders。
+    - group_id None → 全部 group
+    - within_seconds None → 全部未過期；給數字 → 只取「現在 - 1day ~ 現在 + within_seconds」內
+    """
+    import time
+    now = int(time.time())
+    with _conn() as c:
+        if within_seconds is not None:
+            lo = now - 86400  # 包含過去 24h（可能 user 還沒 mark done）
+            hi = now + within_seconds
+            if group_id:
+                rows = c.execute(
+                    "SELECT reminder_id, group_id, user_id, action, remind_at, "
+                    "created_at, source_text FROM reminders "
+                    "WHERE status='pending' AND group_id=? AND remind_at BETWEEN ? AND ? "
+                    "ORDER BY remind_at",
+                    (group_id, lo, hi),
+                ).fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT reminder_id, group_id, user_id, action, remind_at, "
+                    "created_at, source_text FROM reminders "
+                    "WHERE status='pending' AND remind_at BETWEEN ? AND ? "
+                    "ORDER BY remind_at",
+                    (lo, hi),
+                ).fetchall()
+        else:
+            if group_id:
+                rows = c.execute(
+                    "SELECT reminder_id, group_id, user_id, action, remind_at, "
+                    "created_at, source_text FROM reminders "
+                    "WHERE status='pending' AND group_id=? AND remind_at >= ? "
+                    "ORDER BY remind_at",
+                    (group_id, now - 86400),
+                ).fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT reminder_id, group_id, user_id, action, remind_at, "
+                    "created_at, source_text FROM reminders "
+                    "WHERE status='pending' AND remind_at >= ? "
+                    "ORDER BY remind_at",
+                    (now - 86400,),
+                ).fetchall()
+    return [
+        {
+            "reminder_id": r[0],
+            "group_id": r[1],
+            "user_id": r[2],
+            "action": r[3],
+            "remind_at": r[4],
+            "created_at": r[5],
+            "source_text": r[6] or "",
+        }
+        for r in rows
+    ]
+
+
+def mark_reminder_done(reminder_id: int) -> bool:
+    """標記 reminder 完成。"""
+    with _lock, _conn() as c:
+        cursor = c.execute(
+            "UPDATE reminders SET status='done' WHERE reminder_id=?",
+            (reminder_id,),
+        )
+        return cursor.rowcount > 0
+
+
+def expire_old_reminders(threshold_seconds: int = 86400 * 3) -> int:
+    """把過期超過 threshold（預設 3 天）的 pending reminder 標記 expired。回標記筆數。"""
+    import time
+    cutoff = int(time.time()) - threshold_seconds
+    with _lock, _conn() as c:
+        cursor = c.execute(
+            "UPDATE reminders SET status='expired' "
+            "WHERE status='pending' AND remind_at < ?",
+            (cutoff,),
+        )
+        return cursor.rowcount

@@ -116,6 +116,53 @@ def _load_pending_todos() -> list:
         return []
 
 
+def _auto_reminders() -> list[str]:
+    """從 line_bot.db 讀自動偵測的時間性 reminders（2026-05-08 加）。
+
+    回 list of formatted strings（適合放進 daily_todos 的 🚨 / ⏰ 區段）。
+    範圍：未來 30 天 + 過去 24h（避免昨晚到時沒 push 到的 reminder 漏看）
+    """
+    db_path = LINE_BOT_DIR / "line_bot.db"
+    if not db_path.exists():
+        return []
+    try:
+        conn = sqlite3.connect(str(db_path))
+        cur = conn.cursor()
+        import time as _time
+        now = int(_time.time())
+        lo = now - 86400
+        hi = now + 30 * 86400
+        cur.execute("""
+            SELECT reminder_id, action, remind_at FROM reminders
+            WHERE status='pending' AND remind_at BETWEEN ? AND ?
+            ORDER BY remind_at
+        """, (lo, hi))
+        rows = cur.fetchall()
+        conn.close()
+    except Exception:
+        return []
+
+    if not rows:
+        return []
+
+    today = datetime.now().date()
+    out = []
+    for rid, action, ts in rows:
+        dt = datetime.fromtimestamp(ts)
+        days = (dt.date() - today).days
+        if days < 0:
+            label = f"⚠️ 已過 {-days} 天"
+        elif days == 0:
+            label = "🔴 今天"
+        elif days == 1:
+            label = "🟡 明天"
+        else:
+            label = f"🟢 {days} 天後"
+        time_str = dt.strftime("%m/%d %H:%M")
+        out.append(f"⏰ {label} {time_str} {action}")
+    return out
+
+
 def daily_todos() -> str:
     now = datetime.now()
     today = now.strftime("%m/%d")
@@ -124,17 +171,23 @@ def daily_todos() -> str:
 
     lines = [f"📌 **每日待辦** ({today} 週{weekday} {push_time})"]
 
-    # 一次性 urgent todos 排在前面（處理完叫 Claude 從 pending_todos.json 移除）
+    # 自動偵測的時間性 reminders（2026-05-08 加）
+    reminders = _auto_reminders()
+    for r in reminders:
+        lines.append(r)
+
+    # 一次性 urgent todos（從 pending_todos.json 讀，手動加的）
     pending = _load_pending_todos()
     for item in pending:
         lines.append(f"🚨 {item}")
-    if pending:
+
+    if reminders or pending:
         lines.append("─────")
 
     lines += [
         "• Mock interview 做了嗎？",
         "• 修改履歷了嗎？（44 投 1 回應 = 履歷瓶頸，每天迭代）",
-        "• 讀《資料工程基礎》1 章了嗎？（讀完寫 1 句 takeaway + PTT 對照）",
+        "• 讀《資料工程基礎》1 章了嗎？(讀完寫 1 句 takeaway + PTT 對照)",
         "• 學車相關影片看了一則嗎？",
         "• Code review 做了嗎？",
         "• 小說看了 1.5 小時嗎？",

@@ -1238,6 +1238,85 @@ def _strip_code_fence(text: str) -> str:
     return text
 
 
+# ── Reminder extraction（2026-05-08 加：從用戶訊息抽提醒事項）─────────────
+
+
+def extract_reminder(text: str, today_iso: str | None = None) -> dict | None:
+    """從訊息抽 (action, datetime) 未來提醒。失敗 / 不適用回 None。
+
+    用 light model（每次 call 成本低）。
+    回傳 schema：{action, year, month, day, hour, minute}
+    """
+    if not text or len(text) > 500:
+        return None
+
+    if today_iso is None:
+        today_iso = datetime.now().strftime("%Y-%m-%d %A")
+
+    prompt = f"""任務：從下面的訊息抽出「未來時間性提醒事項」。
+
+今天日期：{today_iso}
+
+回 JSON，schema：
+{{"action": "簡短動作描述（< 30 字）",
+  "year": 年, "month": 月, "day": 日, "hour": 時, "minute": 分}}
+
+判斷規則：
+- 訊息明確指向未來特定日期+時間的具體動作 → 回 JSON
+- 沒明確時間、過去事件、純閒聊、純情緒、純資訊分享 → 回 null
+- 沒指定年份 → 用今年（最近的未來該日期）
+- 沒指定分鐘 → 0
+- 動作要保留關鍵資訊（地點、對象）但精簡
+
+範例：
+input: "22號星期五下午14:00拿喜來登贈送的生日蛋糕"
+output: {{"action": "拿喜來登贈送的生日蛋糕", "year": 2026, "month": <根據今年推>, "day": 22, "hour": 14, "minute": 0}}
+
+input: "明天早上 9 點要開會"
+output: {{"action": "開會", "year": <今年>, "month": <明天月份>, "day": <明天日期>, "hour": 9, "minute": 0}}
+
+input: "今天天氣真好"
+output: null
+
+input: "我昨天去了餐廳"
+output: null
+
+input: "下週三晚上要去看電影"
+output: {{"action": "看電影", ...下週三日期, "hour": 19, "minute": 0}}（晚上預設 19:00）
+
+訊息：{text}
+
+只回 JSON 或 null，不要解釋、不要 code fence。"""
+
+    try:
+        response = _client.models.generate_content(
+            model=settings.gemini_light_model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+        raw = _strip_code_fence((response.text or "").strip())
+        if not raw or raw.lower() in ("null", "none"):
+            return None
+        result = json.loads(raw)
+        # 驗證 schema
+        if not isinstance(result, dict):
+            return None
+        required = ("action", "month", "day", "hour", "minute")
+        if not all(k in result for k in required):
+            return None
+        # year 預設今年
+        if "year" not in result:
+            result["year"] = datetime.now().year
+        # action 長度限制
+        result["action"] = str(result["action"])[:50]
+        return result
+    except Exception as e:
+        logger.info("extract_reminder failed (non-fatal): %s", e)
+        return None
+
+
 # ── Burst 分類器（主動過濾的核心）─────────────────────────────────────────
 
 _CLASSIFY_PROMPT = """你是一個 LINE 群組 bot 的「過濾器」。下面是群組裡最近幾則訊息。
