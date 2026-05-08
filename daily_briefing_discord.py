@@ -133,11 +133,12 @@ def daily_todos() -> str:
 
     lines += [
         "• Mock interview 做了嗎？",
+        "• 修改履歷了嗎？（44 投 1 回應 = 履歷瓶頸，每天迭代）",
+        "• 讀《資料工程基礎》1 章了嗎？（讀完寫 1 句 takeaway + PTT 對照）",
         "• 學車相關影片看了一則嗎？",
         "• Code review 做了嗎？",
         "• 小說看了 1.5 小時嗎？",
         "• 重訓了 1 小時嗎？",
-        "• 健康檢查做了嗎？（微量元素檢測）",
         "• 讀經禱告了嗎？",
         "• 寫日記了嗎？",
     ]
@@ -1242,9 +1243,7 @@ def main():
     if sox:
         sections += ["", sox]
 
-    reading = daily_reading()
-    if reading:
-        sections += ["", reading]
+    # daily_reading 整合進 daily_todos 第一段（2026-05-08 用戶要求「不要兩個每日代辦欄位」）
 
     jobs = job_search_summary()
     if jobs:
