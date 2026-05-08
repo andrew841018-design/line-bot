@@ -133,7 +133,6 @@ def daily_todos() -> str:
 
     lines += [
         "• Mock interview 做了嗎？",
-        "• IBM 影片看了 30 分鐘嗎？",
         "• 學車相關影片看了一則嗎？",
         "• Code review 做了嗎？",
         "• 小說看了 1.5 小時嗎？",
