@@ -43,6 +43,11 @@ QUOTA_STATE_FILE = BASE / "quota_state.json"
 PENDING_FILE = BASE / "pending_explicit_reply.json"
 HEALTH_STATE_FILE = BASE / "health_monitor_state.json"
 DB_FILE = BASE / "line_bot.db"
+
+# launchd-managed cloudflared tunnel: kickstart 而不是 pkill+spawn，
+# 避免製造 launchd 看不見的孤兒進程。wrapper script 會 rm 後重寫 URL_FILE。
+LAUNCHD_CLOUDFLARED_LABEL = "com.andrew.line-bot-cloudflared"
+TUNNEL_URL_FILE = Path("/tmp/cloudflared_line_bot_url.txt")
 GROUP_ID = os.environ.get("LINE_ALLOWED_GROUP_ID") or os.environ.get(
     "ALLOWED_GROUP_ID", ""
 )
@@ -418,53 +423,75 @@ def restart_uvicorn() -> bool:
 
 
 def restart_cloudflared() -> tuple[bool, str]:
-    """重啟 cloudflared tunnel + 抓新 URL + 更新 LINE webhook。回 (success, new_url)。"""
-    cf_log = BASE / "cloudflared.log"
-    cf_bin = "/Users/andrew/.local/bin/cloudflared"
-    if not os.path.exists(cf_bin):
-        return False, ""
+    """launchctl kickstart launchd-managed cloudflared，等 wrapper 寫新 URL，
+    再 PUT 到 LINE webhook。回 (True, new_url) 或 (False, reason)。
+
+    用 launchctl kickstart 而不是 pkill+spawn：
+      - pkill 送 SIGTERM → graceful exit 0 → plist KeepAlive(SuccessfulExit=false) 不重拉
+      - 自己 spawn 又繞過 wrapper script、不寫 /tmp/cloudflared_line_bot_url.txt
+      → 製造 launchd 看不見的孤兒進程
+    """
+    # 抓 pre-kickstart URL，等 wrapper rm 後寫入新 URL（內容不同視為新）
+    pre_url = ""
     try:
-        subprocess.run(["pkill", "-f", "cloudflared.*8080"], capture_output=True, timeout=10)
-        time.sleep(2)
-        cf_log.write_text("")
-        subprocess.Popen(
-            [cf_bin, "tunnel", "--url", "http://127.0.0.1:8080"],
-            stdout=open(cf_log, "ab"), stderr=subprocess.STDOUT,
-            start_new_session=True,
+        pre_url = TUNNEL_URL_FILE.read_text().strip()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+    try:
+        uid = os.getuid()
+        kick = subprocess.run(
+            [
+                "launchctl", "kickstart", "-k",
+                f"gui/{uid}/{LAUNCHD_CLOUDFLARED_LABEL}",
+            ],
+            capture_output=True, timeout=10,
         )
-        # 等 URL 出現
-        import re as _re
+        if kick.returncode != 0:
+            stderr = (kick.stderr or b"").decode(errors="replace")[:120]
+            return False, f"launchctl kickstart failed (rc={kick.returncode}): {stderr}"
+
+        # poll URL file：wrapper 會 rm + 重寫，內容變了就拿到新 URL
         new_url = ""
         for _ in range(30):
             time.sleep(1)
             try:
-                m = _re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", cf_log.read_text())
-                if m:
-                    new_url = m.group(0)
-                    break
+                cur = TUNNEL_URL_FILE.read_text().strip()
+            except FileNotFoundError:
+                continue
             except Exception:
-                pass
+                continue
+            if cur and cur != pre_url:
+                new_url = cur
+                break
         if not new_url:
-            return False, ""
-        # 更新 LINE webhook
+            return False, "no fresh URL written to /tmp/cloudflared_line_bot_url.txt within 30s"
+
         token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
-        if token:
-            import requests
-            try:
-                requests.put(
-                    "https://api.line.me/v2/bot/channel/webhook/endpoint",
-                    headers={
-                        "Authorization": f"Bearer {token}",
-                        "Content-Type": "application/json",
-                    },
-                    json={"endpoint": f"{new_url}/callback"},
-                    timeout=10,
-                )
-            except Exception:
-                pass
+        if not token:
+            return False, "no LINE_CHANNEL_ACCESS_TOKEN; tunnel up but webhook not updated"
+
+        import requests
+        try:
+            r = requests.put(
+                "https://api.line.me/v2/bot/channel/webhook/endpoint",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                json={"endpoint": f"{new_url}/callback"},
+                timeout=10,
+            )
+        except Exception as e:
+            return False, f"webhook PUT exception: {str(e)[:120]}"
+        if r.status_code != 200:
+            body = (r.text or "")[:120]
+            return False, f"webhook PUT HTTP {r.status_code}: {body}"
         return True, new_url
-    except Exception:
-        return False, ""
+    except Exception as e:
+        return False, f"restart_cloudflared exception: {str(e)[:120]}"
 
 
 def attempt_auto_fix() -> bool:
@@ -542,14 +569,14 @@ def main() -> int:
             )
 
     if not cloudflared_up:
-        ok, url = restart_cloudflared()
-        if ok and url:
+        ok, url_or_reason = restart_cloudflared()
+        if ok:
             issues_l0.append(
-                f"✅ cloudflared 死亡/URL drift → 自動重啟 + LINE webhook 更新為 {url}/callback"
+                f"✅ cloudflared 死亡/URL drift → 自動重啟 + LINE webhook 更新為 {url_or_reason}/callback"
             )
             cloudflared_up = True
         else:
-            issues_l0.append("🔴 cloudflared 死亡 → 重啟失敗（沒抓到新 URL）")
+            issues_l0.append(f"🔴 cloudflared 死亡 → 重啟失敗：{url_or_reason or 'unknown'}")
 
     # ── L0c LINE token 有效性 + 自修（v3 stateless refresh）──────────────
     token_ok, token_err = line_token_check()
@@ -604,12 +631,12 @@ def main() -> int:
             else:
                 # Step 2 fallback：URL drift fix 失敗（多半是 cloudflared 沒 URL 可給）→
                 # 強制重啟 cloudflared 拿全新 URL，再 recheck 一次
-                rs_ok, rs_url = restart_cloudflared()
-                if rs_ok and rs_url:
+                rs_ok, rs_url_or_reason = restart_cloudflared()
+                if rs_ok:
                     wh_ok3, wh_err3 = webhook_endpoint_check()
                     if wh_ok3:
                         issues_l0.append(
-                            f"✅ Webhook 自修成功（fallback：重啟 cloudflared）：新 URL {rs_url}/callback"
+                            f"✅ Webhook 自修成功（fallback：重啟 cloudflared）：新 URL {rs_url_or_reason}/callback"
                         )
                     else:
                         issues_l0.append(
@@ -619,7 +646,7 @@ def main() -> int:
                 else:
                     issues_l0.append(
                         f"🔴 Webhook 三段式自修全失敗：endpoint_check={wh_err[:60]} | "
-                        f"autofix_url={fix_msg[:60]} | restart_cloudflared 也失敗"
+                        f"autofix_url={fix_msg[:60]} | restart_cloudflared={rs_url_or_reason[:80]}"
                     )
 
     # ── L0e SQLite integrity_check + 自修（每天 1 次）─────────────────────

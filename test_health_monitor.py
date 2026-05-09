@@ -448,3 +448,114 @@ def test_mixed_urgent_and_autofix_alerts_with_only_urgent(tmp_path, monkeypatch)
     assert rc == 0
     assert sent, "mixed payload with 🔴 component must alert"
     assert "🔴" in sent[0], "alert body must include the 🔴 incident line"
+
+
+# ── D. restart_cloudflared via launchctl + checks PUT status (B+C fixes) ─────
+
+
+def _fake_cloudflared_subprocess_run(url_file: Path, url: str = "https://new-url.trycloudflare.com"):
+    """Build a subprocess.run replacement: launchctl kickstart simulates the
+    wrapper script by writing `url` to `url_file`."""
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(list(cmd))
+        if list(cmd[:2]) == ["launchctl", "kickstart"]:
+            url_file.write_text(url + "\n")
+        return MagicMock(returncode=0, stderr=b"", stdout=b"")
+
+    return calls, fake_run
+
+
+def test_restart_cloudflared_uses_launchctl_kickstart(tmp_path, monkeypatch):
+    """restart_cloudflared MUST call `launchctl kickstart -k gui/<uid>/<label>`
+    and NOT pkill+spawn directly. Spawning directly orphans the process from
+    launchd (KeepAlive can't see it), and skips the wrapper that writes
+    /tmp/cloudflared_line_bot_url.txt."""
+    url_file = tmp_path / "cloudflared_line_bot_url.txt"
+    monkeypatch.setattr(bhm, "TUNNEL_URL_FILE", url_file)
+
+    calls, fake_run = _fake_cloudflared_subprocess_run(url_file)
+    monkeypatch.setattr(bhm.subprocess, "run", fake_run)
+    monkeypatch.setattr(bhm.time, "sleep", lambda s: None)
+
+    import requests as _req
+    fake_resp = MagicMock(status_code=200, text="{}")
+    monkeypatch.setattr(_req, "put", lambda *a, **kw: fake_resp)
+    monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "fake-token")
+
+    ok, url = bhm.restart_cloudflared()
+
+    assert ok is True
+    assert url == "https://new-url.trycloudflare.com"
+    assert not any(c and c[0] == "pkill" for c in calls), (
+        f"restart_cloudflared must use launchctl, not pkill+spawn. calls={calls}"
+    )
+    kicks = [c for c in calls if c[:2] == ["launchctl", "kickstart"]]
+    assert kicks, f"missing launchctl kickstart call. calls={calls}"
+    assert "-k" in kicks[0], "must use -k (kill-then-restart)"
+    assert "com.andrew.line-bot-cloudflared" in kicks[0][-1]
+
+
+def test_restart_cloudflared_fails_when_webhook_put_non_200(tmp_path, monkeypatch):
+    """If LINE webhook PUT returns non-200, restart_cloudflared must return
+    (False, msg) so the monitor doesn't log a phantom-success."""
+    url_file = tmp_path / "cloudflared_line_bot_url.txt"
+    monkeypatch.setattr(bhm, "TUNNEL_URL_FILE", url_file)
+
+    _, fake_run = _fake_cloudflared_subprocess_run(url_file)
+    monkeypatch.setattr(bhm.subprocess, "run", fake_run)
+    monkeypatch.setattr(bhm.time, "sleep", lambda s: None)
+
+    import requests as _req
+    fake_resp = MagicMock(status_code=401, text="Invalid token")
+    monkeypatch.setattr(_req, "put", lambda *a, **kw: fake_resp)
+    monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "fake-token")
+
+    ok, msg = bhm.restart_cloudflared()
+    assert ok is False, "non-200 PUT must propagate as failure"
+    assert "401" in msg, f"failure msg should mention HTTP code, got: {msg!r}"
+
+
+def test_restart_cloudflared_fails_when_url_file_not_written(tmp_path, monkeypatch):
+    """If the wrapper never writes /tmp/cloudflared_line_bot_url.txt within
+    the polling window, restart_cloudflared must return (False, msg)."""
+    url_file = tmp_path / "cloudflared_line_bot_url.txt"
+    monkeypatch.setattr(bhm, "TUNNEL_URL_FILE", url_file)
+
+    monkeypatch.setattr(
+        bhm.subprocess, "run",
+        lambda *a, **kw: MagicMock(returncode=0, stderr=b"", stdout=b""),
+    )
+    monkeypatch.setattr(bhm.time, "sleep", lambda s: None)
+    monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "fake-token")
+
+    ok, msg = bhm.restart_cloudflared()
+    assert ok is False
+    assert "URL" in msg or "url" in msg
+
+
+def test_restart_cloudflared_returns_fresh_url_not_stale(tmp_path, monkeypatch):
+    """If the URL file already exists with a stale URL pre-kickstart, the
+    function must wait for it to be rewritten by the wrapper (rm + recreate)
+    and return the FRESH URL, not the stale one."""
+    url_file = tmp_path / "cloudflared_line_bot_url.txt"
+    url_file.write_text("https://stale-url.trycloudflare.com\n")
+    monkeypatch.setattr(bhm, "TUNNEL_URL_FILE", url_file)
+
+    _, fake_run = _fake_cloudflared_subprocess_run(
+        url_file, url="https://fresh.trycloudflare.com"
+    )
+    monkeypatch.setattr(bhm.subprocess, "run", fake_run)
+    monkeypatch.setattr(bhm.time, "sleep", lambda s: None)
+
+    import requests as _req
+    fake_resp = MagicMock(status_code=200, text="{}")
+    monkeypatch.setattr(_req, "put", lambda *a, **kw: fake_resp)
+    monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "fake-token")
+
+    ok, url = bhm.restart_cloudflared()
+    assert ok is True
+    assert url == "https://fresh.trycloudflare.com", (
+        "must return the freshly-written URL, not the stale one"
+    )
