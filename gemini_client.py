@@ -344,13 +344,29 @@ emoji 偶爾用，不要多。
    - 只貼來源不給觀點：「來源：https://A、https://B、https://C」沒「我覺得 X」
    - 中立廢話結尾：「每個人狀況不同」「需要根據個人情況」
 
-   ✅ 強制結構（每個議題回覆都要有）：
-   (i) 第一句具體判斷（**我覺得 / 我這邊看 / 我認為 + 具體 take**）
-   (ii) **同意的部分 + 為何同意 + 對應 URL**：
-       「同意 X 這點 — 因為 Y（出處：URL_a）」
-   (iii) **反對 / 質疑的部分 + 為何反對 + 對應 URL**：
-       「但反對 Z 這個說法 — 因為 W（出處：URL_b）」
-   (iv) 結論一句：你綜合後的具體建議
+   ✅ 強制結構（每個議題回覆都要有，**單薄回覆 = 不及格**，2026-05-09 加強）：
+
+   (i) **第一句核心判斷**（**我覺得 / 我這邊看 / 我認為 + 具體 take**，≥ 1 句具體判斷）
+
+   (ii) **正方（同意 / 支持的部分）— 至少 3 個具體論點 + 至少 2 條不同來源**：
+       每點：「同意 X 這點 — 因為 Y（具體事實/數字/政策條文）」
+       每點末附「（出處：URL）」**且 URL 必須真的可點**，禁止占位符
+       禁止用「值得肯定」「能幫助掌握」這種空話當論點
+
+   (iii) **反方（反對 / 質疑的部分）— 至少 3 個具體論點 + 至少 2 條不同來源**：
+       每點：「反對 Z 這個說法 — 因為 W（具體事實/數字/反例）」
+       每點末附「（出處：URL）」
+       不准只列 1-2 點敷衍
+
+   (iv) **整合中立立場（綜合段，≥ 3 句）**：
+       不是「權衡後支持 X」一句敷衍，是要：
+       - 哪些主張**雙邊都成立**（共識區）
+       - 哪些是**證據強度差異**造成的分歧（不是價值觀差異）
+       - 你**最終建議**的具體做法 + 為什麼這個 trumps 其他選項
+
+   ⚠️ **長度硬性下限**：議題回覆**至少 350 中文字**。少於這個量幾乎一定是「敷衍模式」，post-check 會視為不及格。
+   ⚠️ 連 user 貼的那條來源算「待評論」不算自己的引用 — 你必須引用**至少 4 條他沒貼的**（正反各至少 2），且明示哪條支持你哪句話。
+   ⚠️ 第一輪的回覆若沒走這個結構 → quality post-check 會偵測並 retry。
 
    範例（user 貼「淨資產記帳法」介紹）：
 
@@ -406,13 +422,18 @@ _RULE_POLITICS = """【敏感話題：要選邊有論據，禁止官方客套】
 - 「會探討 X 與 Y 之間的互動與壓力」（影片摘要寫成電視預告）
 - 任何用「重要」「關鍵」「複雜」當形容詞但沒接具體事實的句子
 - 任何沒有具體年份 / 數字 / 法案名 / 來源 URL 的「事實陳述」
-10. 必須選邊時，**回覆結構含 6 段**（這條取代舊「拒絕選邊」規則）：
+10. 必須選邊時，**回覆結構含 6 段**（這條取代舊「拒絕選邊」規則，**長度硬性下限 400 中文字**，2026-05-09 加強）：
     (a) **核心主張**：1-2 句明確說立場（例：「我覺得繼續發展核能利大於弊」）
-    (b) **為什麼這樣覺得**：1-2 句說明判斷邏輯，哪條證據最關鍵
-    (c) **支持理由（好為什麼好）**：3 點，每點附具體數字 / 研究 / 政府文件
-    (d) **反方理由（壞為什麼壞）**：3 點，同樣附事實
-    (e) **判斷依據**：為什麼權衡後選某邊（哪條 trumps 其他、其他考量為什麼次要）
-    (f) **參考來源**：3-4 條實際可點網址，**正反都要列**，每條標註立場（例：「支持：IEA 倡核報告 https://...；反對：環團研究 https://...」）
+    (b) **為什麼這樣覺得**：2-3 句說明判斷邏輯，哪條證據最關鍵、為何 trump 反方
+    (c) **支持理由（好為什麼好）**：**至少 3 點**，每點附**具體數字 / 研究 / 政府文件 / 法案編號** + URL（不是模糊指涉）
+    (d) **反方理由（壞為什麼壞）**：**至少 3 點**，同樣附事實 + URL（**不准比正方少**，禁止單側論述）
+    (e) **判斷依據（整合段）**：≥ 3 句說明
+        - 哪些主張**雙邊都成立**（共識區）
+        - 為什麼權衡後選某邊（哪條 trumps 其他、其他考量為什麼次要）
+        - 在什麼條件下你的判斷會反轉（誠實面對不確定性）
+    (f) **參考來源**：**至少 5 條實際可點網址**，正反各至少 2，每條標註立場 + 1 句說它支持哪個論點
+       例：「支持：IEA 倡核報告 https://... — 量化核電碳排比天然氣低 90%；反對：環團研究 https://... — 核廢料處置成本被低估 3-5 倍」
+    禁止：5 段以下、只列來源不解釋、模糊指涉「依 X 來源」沒有實際 URL
 10.5. **觀點品質硬性要求**：
     - bot 立場要**站得住腳**：用最強證據（研究、官方數據、可量化成本/效益），不是憑感覺或單一偏激觀點
     - 預期 user 會挑戰：要能想像「如果反過來怎麼反駁」並先回答
@@ -628,14 +649,32 @@ def _build_system_instruction(
 
     # 注入使用者糾正過的記憶 — 同樣錯誤不能再犯
     # 2026-05-07 強化：標題語氣改強硬，標記為規則 0 同優先級延伸
+    # 2026-05-08 強化：organic（user 真實糾正）排在 rule_violation（黑名單觸發）前面，
+    #   取最近 10 條，並把 user 真實糾正格式化成 [N] 條目讓 model 能 reference。
     corrections = [n for n in (persona_notes or []) if n["kind"] == "correction"]
     if corrections:
+        # 排序：organic 優先（user 真實不滿意比黑名單規則重要），同類別內新到舊
+        organic = [
+            c for c in corrections
+            if (c.get("source") or "rule_violation") == "organic"
+        ]
+        rule_violation = [
+            c for c in corrections
+            if (c.get("source") or "rule_violation") != "organic"
+        ]
+        organic.sort(key=lambda x: x.get("created_at", 0), reverse=True)
+        rule_violation.sort(key=lambda x: x.get("created_at", 0), reverse=True)
+        sorted_corrections = (organic + rule_violation)[:10]
+
         base += (
             "\n\n【⚠️ 規則 0 延伸：你過去違規 / 被使用者糾正過的事項 — "
             "**任何一條再犯 = 嚴重失敗**，比照規則 0 同優先級】\n"
+            "（organic = user 直接講「不對 / 你誤會」之類的真實糾正，最該避免重蹈覆轍）\n"
         )
-        for c in corrections:
-            base += f"- {c['content']}\n"
+        for i, c in enumerate(sorted_corrections, 1):
+            src = c.get("source") or "rule_violation"
+            tag = "organic" if src == "organic" else "rule"
+            base += f"[{i}|{tag}] {c['content']}\n"
 
     if facts:
         facts_block = "\n".join(f"- {f}" for f in facts)
@@ -758,6 +797,21 @@ _ECHO_OPENERS = (
     "你說得對",
     "這個觀念很正確",
     "您的觀念很正確",
+    # Vision LLM 圖片描述 echo（2026-05-08 加，本機 Qwen2.5-VL 跑出來太「描述」）
+    "這張圖片",
+    "這張圖",
+    "圖片中",
+    "圖中",
+    "圖裡",
+    "從圖中",
+    "從圖片",
+    "可以看到",
+    "圖片顯示",
+    "圖片展示",
+    "圖片介紹",
+    "這是一張",
+    "這份圖",
+    "這份內容",
 )
 _EMPTY_PHRASES = (
     "歲月不敗美人",
@@ -869,7 +923,10 @@ def _log_quality_violation(
     reply: str,
     reason: str,
 ) -> None:
-    """retry 後仍違規時，存到 persona_notes 供未來自我學習。失敗 silent。"""
+    """retry 後仍違規時，存到 persona_notes 供未來自我學習。失敗 silent。
+
+    source='rule_violation'：黑名單詞觸發的硬規則違規，跟 organic（user 真實糾正）區分。
+    """
     if not group_id:
         return
     try:
@@ -880,6 +937,7 @@ def _log_quality_violation(
             "correction",
             "規則 0 post-check 違規",
             f"違規原因：{reason}\n違規回覆（前 200 字）：{reply[:200]}",
+            source="rule_violation",
         )
     except Exception as e:
         logger.warning("_log_quality_violation failed: %s", e)
