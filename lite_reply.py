@@ -1,21 +1,31 @@
-"""Lite reply 模式 — Gemini 配額爆時的 fallback（2026-05-08 建立）。
+"""Lite reply 模式 — Gemini 配額爆時的 fallback（2026-05-08 建立，2026-05-03 重構）。
 
-設計：規則式 intent dispatch（Siri-like），不用 LLM token。
-邏輯：input → intent classify → handler → 回應 or None。
+架構：兩階段 dispatch — 「事實查詢寫死」+「自由問答走 local LLM」+「規則式 fallback」。
 
-Intents 涵蓋：
-  1. URL 摘要         → BeautifulSoup 抓 title + description
-  2. 股價查詢         → stock_quote（已有）
-  3. 時間 / 日期      → datetime
-  4. 簡單計算         → 安全 expression eval（只允許 + - * / ( )）
-  5. 維基百科解釋     → MediaWiki API summary（中文版）
-  6. 天氣（台灣）     → CWB API
-  7. 其他（含閒聊）   → None（讓 main 層回 generic 訊息或沉默）
+Stage 1：寫死 deterministic handlers（這些事實查詢 LLM 不會比較準）
+  - YouTube oEmbed
+  - 股票即時報價 (yfinance)
+  - 匯率 (yfinance forex)
+  - 簡單計算 (eval)
+  - 時間 / 日期 (datetime)
+  - 倒數計時 / 日期距離 (datetime delta)
+  - 單位換算
+  - 維基百科 API
+
+Stage 2：local LLM 生成式（自由問答、閒聊、解釋類）
+  - 原本寫死的「___ 是什麼」「為什麼...」走這個
+  - 失敗（沒裝 / 出錯）graceful degrade 到 Stage 3
+
+Stage 3：規則式 fallback（最後 safety net，避免完全沒回應）
+  - URL 摘要（BeautifulSoup title + meta）
+  - 天氣（CWA F-C0032-001）
+  - Google 首頁 snippet（最不穩，最後一擲）
 
 設計原則：
 - 失敗一律 silent（None），caller 自己決定要不要回 fallback 訊息
 - 每個 handler 有 timeout 防卡死
-- 不接受太長輸入（> 200 字直接拒絕，避免被 inject）
+- 不接受太長輸入（> 500 字直接拒絕，避免被 inject）
+- local LLM 不存在時不 import error，graceful degrade
 """
 
 from __future__ import annotations
@@ -502,95 +512,186 @@ def _google_search_snippet(query: str) -> str | None:
         return None
 
 
-# ── 主路由 ──────────────────────────────────────────────────────────────────
+# ── handler wrappers（把 main router 內 inline 邏輯包成獨立 _try_xxx）─────
 
 
-def lite_reply(text: str) -> str | None:
-    """總入口。回 str = 找到答案；回 None = 沒辦法（caller 決定要不要回 generic）。
+def _try_youtube_info(text: str) -> str | None:
+    """YouTube URL → oEmbed 拿 title + 作者。"""
+    return _youtube_info(text)
 
-    優先序（先具體後 generic）：
-      1. YouTube URL → oEmbed 拿 title + 作者
-      2. 一般 URL → BeautifulSoup 抓 title + meta
-      3. 股票 ticker / 中文股名 → yfinance 即時
-      4. 匯率換算 → frankfurter.app
-      5. 簡單計算式 → eval safe
-      6. 時間 / 日期 → datetime
-      7. 倒數計時 / 日期距離 → datetime delta
-      8. 單位換算 → 公里/公尺/磅/公斤 等
-      9. 「___ 是什麼」 → 中文維基
-      10. 天氣 → CWA F-C0032-001
-      11. 其他知識性問題 → Google search snippet（不穩，最後一擲）
-      12. 純閒聊 → None（沉默）
-    """
-    if not text:
-        return None
-    text = text.strip()
-    if len(text) > 200:
-        return None
 
-    # 1. YouTube URL（先於一般 URL，因為 oEmbed 抓 metadata 比 scrape 乾淨）
-    yt = _youtube_info(text)
-    if yt:
-        return yt
-
-    # 2. 一般 URL
+def _try_url_summary(text: str) -> str | None:
+    """一般 URL → BeautifulSoup 抓 title + meta。"""
     urls = _URL_RE.findall(text)
-    if urls:
-        out = _summarize_url(urls[0])
-        if out:
-            return out
+    if not urls:
+        return None
+    return _summarize_url(urls[0])
 
-    # 3. 股票
+
+def _try_stock(text: str) -> str | None:
+    """股票 ticker / 中文股名 → yfinance 即時。"""
     quotes = stock_quote.get_quotes_text(text)
     if quotes:
         return f"{quotes}\n\n（lite mode：Gemini 配額用完，純查 yfinance）"
+    return None
 
-    # 4. 匯率
-    forex = _try_forex(text)
-    if forex:
-        return forex
 
-    # 5. 簡單計算
-    calc = _try_calculate(text)
-    if calc:
-        return calc
-
-    # 6. 時間 / 日期
+def _try_time_date(text: str) -> str | None:
+    """時間 / 日期 → datetime."""
     if any(k in text for k in _TIME_KEYWORDS):
         return _now_time()
     if any(k in text for k in _DATE_KEYWORDS):
         return _today_date()
+    return None
 
-    # 7. 倒數計時
-    countdown = _try_countdown(text)
-    if countdown:
-        return countdown
 
-    # 8. 單位換算
-    unit = _try_unit_convert(text)
-    if unit:
-        return unit
+def _try_wiki_lookup(text: str) -> str | None:
+    """『___ 是什麼』『什麼是 ___』『解釋一下 ___』→ 中文維基。"""
+    query = _extract_wiki_query(text)
+    if not query:
+        return None
+    return _wiki_summary(query)
 
-    # 9. 維基
-    wiki_query = _extract_wiki_query(text)
-    if wiki_query:
-        out = _wiki_summary(wiki_query)
+
+def _try_weather(text: str) -> str | None:
+    """天氣 → CWA F-C0032-001。"""
+    if not any(k in text for k in _WEATHER_KEYWORDS):
+        return None
+    return _weather_taiwan(text)
+
+
+def _try_google_snippet(text: str) -> str | None:
+    """通用問句 → Google 首頁 snippet（最不穩，最後一擲）。"""
+    if not any(k in text for k in ("是什麼", "什麼是", "為什麼", "怎麼", "如何", "?", "？")):
+        return None
+    return _google_search_snippet(text.rstrip("?？"))
+
+
+# ── 生成式 helper（local LLM）───────────────────────────────────────────────
+
+
+def _try_local_llm(text: str, context: list | None = None) -> str | None:
+    """走 local LLM。失敗 / 不可用 回 None（graceful degrade）。
+
+    本函式刻意 lazy import + 寬鬆例外處理：
+    - local_llm 模組不存在 → ImportError → return None
+    - local_llm 任何 runtime error → return None
+    - 回應太短（< 6 chars）→ return None
+    """
+    try:
+        from local_llm import chat as _llm_chat  # noqa: WPS433  (lazy import)
+    except ImportError:
+        return None
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+    try:
+        response = _llm_chat(text, context=context)
+    except Exception as e:
+        logger.info("_try_local_llm runtime error: %s", e)
+        return None
+
+    if response and isinstance(response, str) and len(response.strip()) > 5:
+        return f"{response.strip()}\n\n（lite mode — local LLM）"
+    return None
+
+
+# ── 主路由 ──────────────────────────────────────────────────────────────────
+
+
+# Stage 1：寫死 deterministic handlers（事實查詢，LLM 不會比較準）
+_STAGE1_HANDLERS = (
+    _try_youtube_info,
+    _try_stock,
+    _try_forex,
+    _try_calculate,
+    _try_time_date,
+    _try_countdown,
+    _try_unit_convert,
+    _try_wiki_lookup,
+)
+
+# Stage 3：規則式 fallback handlers（local LLM 失敗才走）
+_STAGE3_HANDLERS = (
+    _try_url_summary,
+    _try_weather,
+    _try_google_snippet,
+)
+
+
+def _intent_to_handler(intent: str):
+    """chinese_nlp intent → lite_reply handler mapping。"""
+    mapping = {
+        "stock": _try_stock,
+        "weather": _try_weather,
+        "datetime": _try_time_date,
+        "translation": None,  # 沒對應 stage1 handler，走預設
+        "transport": None,
+        "image_gen": None,    # 由 main.py 處理，lite_reply 不接
+    }
+    return mapping.get(intent)
+
+
+def lite_reply(text: str, context: list | None = None) -> str | None:
+    """總入口。回 str = 找到答案；回 None = 沒辦法（caller 決定要不要回 generic）。
+
+    架構（2026-05-03 重構）：
+      Stage 1 — 寫死 deterministic：股票/匯率/計算/時間/倒數/單位/維基/YouTube
+                這些事實查詢規則式準確度遠高於 LLM。
+      Stage 2 — local LLM 生成式：自由問答 / 解釋 / 閒聊。
+                local_llm 沒裝 → graceful degrade 到 Stage 3。
+      Stage 3 — 規則式 fallback：URL 摘要 / 天氣 / Google snippet。
+                當作 safety net，避免完全沉默。
+    """
+    if not text:
+        return None
+    text = text.strip()
+    if not text or len(text) > 500:
+        return None
+
+    # ─ Stage 0: chinese_nlp intent hint（純本機 jieba + rules，無 LLM call）─
+    # 命中 intent → 優先跑對應 handler；未命中走預設順序
+    try:
+        import chinese_nlp
+        intent_info = chinese_nlp.classify_intent(text)
+        intent = intent_info.get("intent", "general") if intent_info else "general"
+        if intent != "general":
+            priority_handler = _intent_to_handler(intent)
+            if priority_handler:
+                try:
+                    out = priority_handler(text)
+                    if out:
+                        return out
+                except Exception as e:
+                    logger.info("intent priority handler %s raised: %s", intent, e)
+    except (ImportError, Exception) as e:
+        logger.debug("chinese_nlp intent hint skipped: %s", e)
+
+    # ─ Stage 1: 寫死 deterministic（事實查詢，LLM 不準）─
+    for handler in _STAGE1_HANDLERS:
+        try:
+            out = handler(text)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.info("Stage1 handler %s raised: %s", handler.__name__, e)
+            continue
         if out:
             return out
 
-    # 10. 天氣
-    if any(k in text for k in _WEATHER_KEYWORDS):
-        out = _weather_taiwan(text)
+    # ─ Stage 2: 生成式（local LLM；自由問答 / 解釋）─
+    out = _try_local_llm(text, context=context)
+    if out:
+        return out
+
+    # ─ Stage 3: 規則式 fallback（最後 safety net）─
+    for handler in _STAGE3_HANDLERS:
+        try:
+            out = handler(text)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.info("Stage3 handler %s raised: %s", handler.__name__, e)
+            continue
         if out:
             return out
 
-    # 11. Generic Google snippet（最後一擲，不穩）
-    if any(k in text for k in ("是什麼", "什麼是", "為什麼", "怎麼", "如何", "?", "？")):
-        out = _google_search_snippet(text.rstrip("?？"))
-        if out:
-            return out
-
-    # 12. 其他 → 沉默（避免亂答）
     return None
 
 

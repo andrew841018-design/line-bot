@@ -1,0 +1,93 @@
+# LoRA fine-tune config for LINE Bot (咪寶)
+#
+# 兩套設定：mac (mlx_lm) / cuda (peft + accelerate)。同檔但實際用哪邊看你跑哪個 train script。
+# 每個欄位都標 [WHY] 給之後想動的人看。
+#
+# 如果你還沒跑過 LoRA，建議先 google「LoRA」「PEFT」「rank/alpha」基本概念再動數字。
+# 預設值是「保守、稍微訓得淺一點，避免 over-fit 小資料集」的選擇。
+
+# ─── 共用設定（兩個 backend 都會看的）────────────────────────────────────
+common:
+  # 資料：extract_data.py 跑出的 JSONL
+  train_file: data/sft.jsonl
+  # eval split — 從 train_file 切多少給 eval
+  # [WHY] 對話資料量小（< 5000 筆）時，10% eval 已足夠看 trend
+  eval_split_ratio: 0.1
+  # 隨機種子 — 讓 eval split 跟 shuffle 可重現
+  seed: 42
+  # 最大序列長度 — token-level，超過會 truncate
+  # [WHY] LINE 對話通常 < 500 字 (~ 1500 tokens)，2048 給 long-tail 留 buffer；越長越吃 RAM/VRAM
+  max_seq_length: 2048
+  # 對話模板 — 影響 user/assistant 切分標記
+  # [WHY] 必須跟 base model 的 chat_template 對齊；llama3 / qwen 各有自己的格式
+  chat_template: auto  # 大多 mlx_lm / transformers 會自己讀 model 的 tokenizer.chat_template
+
+# ─── Backend A: Mac (Apple Silicon, mlx_lm) ─────────────────────────────
+mac_mlx:
+  # Mac 友善的小模型 — M1/M2/M3 16GB 統一記憶體就能 fine-tune
+  # [WHY] 3B + 4-bit quant + LoRA 大概吃 6–8 GB，留 buffer 給系統
+  model: mlx-community/Llama-3.2-3B-Instruct-4bit
+  # 量化 — mlx_lm 預設讀已量化 weights
+  quantize: 4  # 4-bit weights，LoRA adapter 仍是 fp16
+  # LoRA hyper-params
+  lora:
+    rank: 16          # [WHY] rank=8 太低（記不住人設），rank=32 浪費 VRAM；16 是 small dataset 的甜蜜點
+    alpha: 32         # [WHY] alpha = 2 * rank 是常見起手；scaling = alpha / rank = 2.0
+    dropout: 0.05     # [WHY] dataset < 5000 時用 0.05–0.1 防 overfit；> 10000 可降到 0
+    target_modules:   # [WHY] q/k/v/o 是 attention 核心，影響「對話風格」最直接；想再細可加 ffn 但 VRAM 翻倍
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+    # bias: none      # [WHY] 加 bias adapter 通常無感但多花參數，省略
+  # 訓練 hyper-params
+  training:
+    learning_rate: 2.0e-4    # [WHY] LoRA 標準起手 1e-4 ~ 5e-4；2e-4 對小 dataset 收斂快又不太爆
+    num_epochs: 3            # [WHY] 對話資料 1–5 epoch；epoch 多會 over-fit 把 user 的口頭禪背死
+    batch_size: 4            # [WHY] 16GB Mac 上 3B 模型 max batch=4；OOM 就降到 2 或 1
+    grad_accumulation: 4     # [WHY] 等效 batch=16，平滑 loss
+    warmup_steps: 50         # [WHY] 防一開始 lr 太大爆梯度
+    weight_decay: 0.01
+    save_every_steps: 200
+    eval_every_steps: 100
+  output_dir: outputs/llama32-3b-lora
+  # 預期 wall-clock：M2 Pro 16GB / 1000 pairs / 3 epochs ≈ 4–8 hr
+  # 建議連電源 + 關閉 spotlight indexing 在訓練資料夾
+
+# ─── Backend B: CUDA (Linux GPU, transformers + peft) ───────────────────
+cuda:
+  # 雲 H100 / A100 / 4090 都能跑；7B 比 3B 更會「捕捉風格」但成本翻倍
+  model: Qwen/Qwen2.5-7B-Instruct
+  # 量化 — 訓練時用 bf16，省記憶體可改 4-bit + QLoRA
+  precision: bf16          # [WHY] H100/A100 native bf16，4090 也支援
+  use_qlora: false         # [WHY] 24 GB VRAM 卡片可改 true 降到 16 GB
+  lora:
+    rank: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+  training:
+    learning_rate: 2.0e-4
+    num_epochs: 3
+    batch_size: 4
+    grad_accumulation: 4
+    warmup_steps: 50
+    weight_decay: 0.01
+    save_every_steps: 200
+    eval_every_steps: 100
+  output_dir: outputs/qwen25-7b-lora
+  # 預期 wall-clock：H100 80GB / 1000 pairs / 3 epochs ≈ 30–90 min
+  # 預期成本：H100 spot $2/hr × 1.5 hr ≈ $3 USD（Lambda / RunPod）
+  # 4090（24GB） + QLoRA：約 2–4 hr，本地電費 ≈ NT$30；首次跑記得 nvidia-smi 看 VRAM
+
+# ─── 推論時 adapter 載入 ────────────────────────────────────────────────
+# 訓完之後 inference.py 會讀這個 adapter path
+adapter:
+  # mlx 後端
+  mac_path: outputs/llama32-3b-lora/adapters.safetensors
+  # cuda 後端 (peft format)
+  cuda_path: outputs/qwen25-7b-lora/adapter_model.safetensors

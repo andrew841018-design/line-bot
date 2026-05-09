@@ -1,8 +1,8 @@
 {
-  "pending_24h_ago": 6,
-  "pending_24h_at": 1778133666.643863,
-  "last_webhook_check_ts": 1778204072.72011,
-  "last_db_check_ts": 1778139087.777945,
-  "last_alert_ts": 1778209495.914049,
-  "last_lite_autofix_ts": 1778213111.26987
+  "pending_24h_ago": 23,
+  "pending_24h_at": 1778220339.7188,
+  "last_webhook_check_ts": 1778290735.854605,
+  "last_db_check_ts": 1778225756.445204,
+  "last_alert_ts": 1778243839.59527,
+  "last_lite_autofix_ts": 1778251074.524778
 }

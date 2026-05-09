@@ -6,7 +6,22 @@ __pycache__/
 venv/
 *.log
 line_bot.db*
-[LINE]*.txt
+finetune/data/*.jsonl
+finetune/adapters/
+finetune/eval_results/
+finetune/data/*.parquet
+*_usage.json
+# LINE 匯出聊天記錄（含真實對話 = 隱私）
+# 注意：git glob 的 [...] 是 character class，要用 \[ 跳脫字面 [
+\[LINE\]*.txt
+*LINE*.txt
+finetune/data/*.json
+finetune/data/*.enc
+finetune/data/*.db
+*.enc
+# PII mappings — un-masked originals, never sync to cloud
+finetune/data/pii_mappings.db
+finetune/data/pii_mappings.db-*
 gemini_usage.json
 quota_state.json
 alert_state.json

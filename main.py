@@ -46,6 +46,7 @@ from linebot.v3.exceptions import InvalidSignatureError  # type: ignore[import-u
 from linebot.v3.messaging import (  # type: ignore[import-untyped]
     ApiClient,
     Configuration,
+    ImageMessage,
     MessagingApi,
     MessagingApiBlob,
     PushMessageRequest,
@@ -139,23 +140,24 @@ def _llm_chat(
     facts: list[str],
     pnotes: list[dict] | None = None,
 ) -> str:
-    """Gemini chat。quota 爆時自動 fallback 到 lite_reply（規則式）。
+    """Gemini chat。quota 爆時走 llm_router.fallback_chat 4-tier waterfall。
 
-    2026-05-08：用戶要求 quota 爆時走「資料探勘」路徑（lite mode）：
-    URL 摘要 / 股價 / 計算 / 時間 / 維基 / 天氣 等簡單問句處理。
-    lite_reply 處理不了 → 回空字串（caller 沉默）。
+    2026-05-08：quota 爆時改走 4-tier waterfall（local_llm → RAG → lite_reply）。
+    全敗回空字串（caller 沉默）。
     """
     if _quota_exhausted():
         try:
-            from lite_reply import lite_reply
-            from gemini_client import _extract_text
-            user_text = _extract_text(user_input)
-            lite_out = lite_reply(user_text)
-            if lite_out:
-                logger.info("quota exhausted → lite_reply hit (text=%r)", user_text[:50])
-                return lite_out
+            import llm_router
+            out = llm_router.fallback_chat(user_input, context=context)
+            if out:
+                from gemini_client import _extract_text
+                user_text = _extract_text(user_input)
+                logger.info(
+                    "quota exhausted → fallback_chat hit (text=%r)", user_text[:50]
+                )
+                return out
         except Exception as e:
-            logger.warning("lite_reply failed: %s", e)
+            logger.warning("llm_router.fallback_chat failed: %s", e)
         return ""
     result = gemini_client.chat(user_input, context, facts, pnotes)
     if result:
@@ -945,6 +947,26 @@ def health():
     }
 
 
+_GENIMG_DIR = "/tmp/line_bot_genimg"
+_GENIMG_FILENAME_RE = re.compile(r"^[a-f0-9]{32}\.png$")
+
+
+@app.get("/static/img/{filename}")
+def serve_genimg(filename: str):
+    """Serve generated images for LINE ImageMessage（public via cloudflared）。
+
+    路徑驗證：filename 必須是 UUID hex（32 字）+ .png，避免 path traversal。
+    """
+    from fastapi.responses import FileResponse
+    from fastapi import HTTPException
+    if not _GENIMG_FILENAME_RE.match(filename):
+        raise HTTPException(status_code=400, detail="invalid filename")
+    path = os.path.join(_GENIMG_DIR, filename)
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="not found")
+    return FileResponse(path, media_type="image/png")
+
+
 # ── Webhook ───────────────────────────────────────────────────────────────────
 
 
@@ -1118,6 +1140,19 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
         except Exception as e:
             logger.warning("[Feedback] collect_message failed: %s", e)
 
+    # Organic 糾正偵測（2026-05-08 加）：user 講「不對 / 你誤會」之類的
+    # 自然糾正訊號 → 抓上一輪 user/bot 訊息拼成 correction 寫進 persona_notes
+    # 純信號擷取，**不**接管後續路由（用戶可能糾正完還想繼續對話）
+    sender_uid_for_correction = getattr(event.source, "user_id", None) or ""
+    _detect_user_correction(text, group_id, sender_uid_for_correction)
+
+    # 自動萃 knowledge graph 三元組（純本機，fire-and-forget）
+    try:
+        import knowledge_graph
+        knowledge_graph.auto_extract_kg_async(group_id, text)
+    except (ImportError, Exception) as e:
+        logger.debug("knowledge_graph extract skipped: %s", e)
+
     # 自動偵測 reminder（2026-05-08：含日期+時間 hint 的訊息抽 action 存 DB）
     # 失敗 silent，不阻塞主流程
     sender_uid_for_reminder = getattr(event.source, "user_id", None) or ""
@@ -1151,6 +1186,98 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
     )
 
 
+_IMAGE_GEN_PATTERNS = [
+    re.compile(r"^[\s]*[畫繪]一?張?[\s]*[:：]?[\s]*(.+)", re.IGNORECASE),
+    re.compile(r"^[\s]*生成圖片?[\s]*[:：]?[\s]*(.+)", re.IGNORECASE),
+    re.compile(r"^[\s]*做一?張[圖照]?[\s]*[:：]?[\s]*(.+)", re.IGNORECASE),
+    re.compile(r"^[\s]*幫我[畫繪][\s]*[:：]?[\s]*(.+)", re.IGNORECASE),
+    re.compile(r"^[\s]*draw\s+(?:me\s+)?(.+)", re.IGNORECASE),
+    re.compile(r"^[\s]*imagine\s+(.+)", re.IGNORECASE),
+]
+
+
+def _detect_image_gen_request(text: str) -> str | None:
+    """偵測「畫一張 X / 生成圖 Y / draw Z」→ 回主題；無命中回 None。"""
+    s = (text or "").strip()
+    if not s:
+        return None
+    for pat in _IMAGE_GEN_PATTERNS:
+        m = pat.match(s)
+        if m:
+            subject = m.group(1).strip()
+            if subject and len(subject) >= 2:
+                return subject
+    return None
+
+
+def _handle_image_gen(event: MessageEvent, group_id: str, subject: str) -> None:
+    """圖片生成 — 本機 mlx SD/FLUX。LINE 需要 public URL，目前先存本機。"""
+    try:
+        import image_gen_local
+    except ImportError:
+        logger.info("image_gen_local 未安裝，silent skip")
+        return
+    try:
+        png = image_gen_local.generate(subject, style="photo")
+    except Exception as e:
+        logger.warning("image_gen_local.generate failed: %s", e)
+        _reply(event.reply_token, "咪寶生成圖失敗，等下再試試喔", group_id=group_id)
+        return
+    if not png:
+        _reply(event.reply_token, "咪寶今天畫不出來（model 沒載成功）", group_id=group_id)
+        return
+    import uuid
+    out_dir = _GENIMG_DIR
+    os.makedirs(out_dir, exist_ok=True)
+    fname = f"{uuid.uuid4().hex}.png"
+    out_path = os.path.join(out_dir, fname)
+    try:
+        with open(out_path, "wb") as f:
+            f.write(png)
+    except Exception as e:
+        logger.warning("save genimg failed: %s", e)
+        return
+    # 取 public URL：env IMAGE_GEN_PUBLIC_URL 優先，否則讀 /tmp/cloudflared_line_bot_url.txt
+    public_url = os.environ.get("IMAGE_GEN_PUBLIC_URL", "").rstrip("/")
+    if not public_url:
+        try:
+            with open("/tmp/cloudflared_line_bot_url.txt") as f:
+                public_url = f.read().strip().rstrip("/")
+        except Exception:
+            public_url = ""
+
+    if public_url:
+        # 真的傳 ImageMessage
+        img_url = f"{public_url}/static/img/{fname}"
+        try:
+            with ApiClient(_line_config) as api_client:
+                MessagingApi(api_client).reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[ImageMessage(
+                            original_content_url=img_url,
+                            preview_image_url=img_url,
+                        )],
+                    )
+                )
+            memory.append_turn(group_id, "user", f"[圖片生成] {subject}")
+            memory.append_turn(group_id, "bot", f"[已傳圖] {img_url}")
+        except Exception as e:
+            logger.warning("reply ImageMessage failed: %s", e)
+            _reply(event.reply_token, f"圖生成 OK 但傳 LINE 失敗：{e}", group_id=group_id)
+        return
+
+    # 沒設 public URL → 文字 fallback（已存本機）
+    msg = (
+        f"圖片已生成（{len(png)//1024} KB）\n"
+        f"暫存：{out_path}\n"
+        f"啟動 cloudflared tunnel 後可直接傳 LINE"
+    )
+    _reply(event.reply_token, msg, group_id=group_id)
+    memory.append_turn(group_id, "user", f"[圖片生成] {subject}")
+    memory.append_turn(group_id, "bot", f"[已生成] {out_path}")
+
+
 def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -> None:
     """使用者明確叫 bot（@mention / /ai 等），立刻丟 Gemini 回覆。"""
     sender_user_id = getattr(event.source, "user_id", None) or ""
@@ -1162,6 +1289,12 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
         if raw is not None and raw[1] in _MEDIA_PLACEHOLDERS:
             _handle_media_via_quote(event, group_id, clean_text, quoted_id, raw[1])
             return
+
+    # 圖片生成請求（畫一張 / 生成圖片 / draw me ...）→ 純本機 mlx SD
+    gen_subject = _detect_image_gen_request(clean_text)
+    if gen_subject:
+        _handle_image_gen(event, group_id, gen_subject)
+        return
 
     # clean_text 空且沒引用 → 用戶只打「咪寶」等觸發詞 → 問候回應
     if not clean_text and not quoted_id:
@@ -1349,6 +1482,117 @@ _MEDIA_PLACEHOLDERS: dict[str, tuple[str, str]] = {
 _MEDIA_BYTE_LIMIT = 20 * 1024 * 1024  # 20 MB
 
 
+def _media_pipeline_fallback(
+    event: MessageEvent,
+    group_id: str,
+    clean_text: str,
+    quoted_message_id: str,
+    mime_type: str,
+    media_name: str,
+) -> None:
+    """quota 爆時的 local fallback：呼叫 media_pipeline.analyze_image / analyze_video。
+
+    任何失敗（download / import / analyze）都沉默退出，避免回給使用者一堆錯誤訊息。
+    """
+    # 1. download bytes — 失敗就沉默退出（連 Gemini 路徑也是這個 fail mode）
+    try:
+        data = _download_content(quoted_message_id)
+    except Exception as e:
+        logger.warning("media_pipeline fallback: download failed: %s", e)
+        return
+
+    if len(data) > _MEDIA_BYTE_LIMIT:
+        logger.info(
+            "media_pipeline fallback: %s too large (%d bytes), skipping",
+            media_name,
+            len(data),
+        )
+        return
+
+    # 2. 路由到 image / video pipeline
+    try:
+        if mime_type.startswith("image/"):
+            from media_pipeline import analyze_image
+
+            reply = analyze_image(data, user_prompt=clean_text or "")
+        elif mime_type.startswith("video/"):
+            from media_pipeline import analyze_video
+
+            reply = analyze_video(data, user_prompt=clean_text or "")
+        else:
+            return
+    except ImportError as e:
+        logger.warning("media_pipeline not available: %s", e)
+        return
+    except Exception as e:
+        logger.warning("media_pipeline %s fallback failed: %s", media_name, e)
+        return
+
+    # 3. 回應給 user — 沒結果就沉默
+    if not reply or not str(reply).strip():
+        logger.info("media_pipeline fallback: no reply for %s", media_name)
+        return
+
+    try:
+        memory.append_turn(group_id, "user", f"[{media_name} + 問題]\n{clean_text}")
+        memory.append_turn(group_id, "bot", reply)
+    except Exception as e:
+        logger.warning("media_pipeline fallback: memory append failed: %s", e)
+    _reply(event.reply_token, reply, group_id=group_id)
+
+
+def _audio_asr_fallback(
+    event: MessageEvent,
+    group_id: str,
+    clean_text: str,
+    quoted_message_id: str,
+    media_name: str,
+) -> None:
+    """quota 爆時的 audio fallback — 走本機 mlx-whisper。
+
+    User policy：純本機（不打 Groq / OpenAI Whisper）。下載 audio bytes →
+    audio_local.transcribe → 把轉出的文字當 user 訊息餵 fallback_chat → reply。
+    任一步失敗沉默退出。
+    """
+    try:
+        data = _download_content(quoted_message_id)
+    except Exception as e:
+        logger.warning("audio fallback download failed: %s", e)
+        return
+    if len(data) > _MEDIA_BYTE_LIMIT:
+        logger.info("audio fallback skipped: file too large (%d bytes)", len(data))
+        return
+    try:
+        import audio_local
+        text = audio_local.transcribe(bytes(data), language="zh")
+    except ImportError:
+        logger.info("audio_local not available, silent skip")
+        return
+    except Exception as e:
+        logger.warning("audio_local.transcribe failed: %s", e)
+        return
+    if not text:
+        return
+    user_input = f"{clean_text}\n\n（語音轉文字）{text}" if clean_text else text
+    try:
+        import llm_router
+        reply = llm_router.fallback_chat(
+            user_input,
+            context=memory.get_context(group_id),
+            facts=memory.top_facts(group_id),
+            persona_notes=_get_persona_notes(group_id),
+            group_id=group_id,
+        )
+    except Exception as e:
+        logger.warning("audio fallback chat failed: %s", e)
+        return
+    if not reply:
+        return
+    memory.append_turn(group_id, "user", f"[語音轉文字] {text}")
+    memory.append_turn(group_id, "bot", reply)
+    _reply(event.reply_token, reply, group_id=group_id)
+
+
 def _handle_media_via_quote(
     event: MessageEvent,
     group_id: str,
@@ -1356,15 +1600,34 @@ def _handle_media_via_quote(
     quoted_message_id: str,
     placeholder: str,
 ) -> None:
-    """使用者 @AI 並引用了一則圖片/影片/音訊 → 下載 bytes 丟 Gemini multimodal。
+    """使用者 @AI 並引用了一則圖片/影片/音訊。
 
-    LINE 的 message content 通常會保留 7 天，期限內都能重新下載。
+    圖片 → **永遠走 local media_pipeline**（OCR + vision LLM），不消耗 Gemini quota（user policy 2026-05-08）。
+    影片 → Gemini multimodal；quota 爆才 fallback local keyframes + vision LLM。
+    音訊 → Gemini multimodal；quota 爆時 `_audio_asr_fallback` 沉默退出
+            （純本機策略下不打雲端 ASR）。
     """
     mime_type, media_name = _MEDIA_PLACEHOLDERS[placeholder]
 
-    # 短路：cache 已知 quota 爆 → 靜默跳過
+    # 圖片：永遠 local，不問 quota
+    if mime_type.startswith("image/"):
+        logger.info("media quote: routing image to local media_pipeline")
+        _media_pipeline_fallback(
+            event, group_id, clean_text, quoted_message_id, mime_type, media_name
+        )
+        return
+
+    # 影片 / 音訊：quota 爆 → 影片走 local，音訊先 Groq Whisper ASR 再餵 chat fallback
     if _quota_exhausted():
-        logger.info("media quote skipped Gemini (cached quota exhausted)")
+        if mime_type.startswith("video/"):
+            logger.info("media quote (video): quota exhausted → local fallback")
+            _media_pipeline_fallback(
+                event, group_id, clean_text, quoted_message_id, mime_type, media_name
+            )
+        else:
+            _audio_asr_fallback(
+                event, group_id, clean_text, quoted_message_id, media_name
+            )
         return
 
     try:
@@ -2187,6 +2450,183 @@ def _try_save_correction(group_id: str, user_text: str) -> None:
     if any(kw in t for kw in _CORRECTION_KEYWORDS):
         memory.add_persona_note(group_id, "correction", "使用者糾正", t)
         logger.info("persona correction saved: %s", t[:60])
+
+
+# ── Organic 糾正偵測（2026-05-08 加）────────────────────────────────────────
+# user 主動講「不對 / 你誤會 / 我意思不是這個」時，把上一輪 user msg + bot reply
+# + 這次糾正三段拼起來寫進 persona_notes，source='organic'，下一輪 prompt
+# 就會把它當 negative example 放在規則 0 延伸區。
+#
+# 跟 _CORRECTION_KEYWORDS 不同：
+# - _CORRECTION_KEYWORDS 抓「未來規則」（不要 X、別再 X、以後 X）
+# - _ORGANIC_CORRECTION_KEYWORDS 抓「即時糾正上一輪回覆錯了」
+_ORGANIC_CORRECTION_KEYWORDS = (
+    "不對",
+    "不是這樣",
+    "不是這意思",
+    "你誤會",
+    "妳誤會",
+    "我說的是",
+    "我問的是",
+    "我是說",
+    "我意思是",
+    "我意思不是",
+    "重來",
+    "請重答",
+    "你答錯",
+    "妳答錯",
+    "答錯了",
+    "胡說",
+    "亂講",
+    "不是我要的",
+)
+
+
+def _weak_correction_signals(
+    text: str, prev_user_msg: str, prev_bot_msg: str
+) -> dict:
+    """除了強 keyword 以外的 5 種弱糾正信號 — 自動判斷不靠 user 配合特定詞。
+
+    Signals:
+      - opening_neg: 短訊息 (< 30 字) AND 開頭「不/沒/錯」
+      - corrective_marker: 含「應該/才對/才是/正確的是」
+      - sarcasm: 含「呵呵 / ㄏㄏ / ... / 。。。 / 笑死 / ｗ」
+      - repeat_question: 跟前一輪 user 訊息 token jaccard > 0.5（暗示重述）
+      - contrastive_negation: 「不是 X 是 Y」型句式
+      - negative_sentiment: chinese_nlp.detect_sentiment 判定負面
+
+    回 {score: int, signals: list[str]}。score >= 2 → 視為 correction。
+    """
+    signals: list[str] = []
+    t = text.strip()
+    if len(t) < 30 and t[:1] in ("不", "沒", "錯"):
+        signals.append("opening_neg")
+    if any(p in t for p in ("應該", "才對", "才是", "正確的是", "明明")):
+        signals.append("corrective_marker")
+    if any(p in t for p in ("呵呵", "ㄏㄏ", "...", "。。。", "ｗｗ", "wwww", "笑死")):
+        signals.append("sarcasm")
+    if "不是" in t and "是" in t.replace("不是", "", 1):
+        signals.append("contrastive_negation")
+    # repeat_question (跟前一輪 user 訊息 jaccard)
+    if prev_user_msg:
+        try:
+            from chinese_nlp import tokenize
+            now = set(tokenize(t))
+            prev = set(tokenize(prev_user_msg))
+            if now and prev and len(now & prev) / len(now | prev) > 0.5:
+                signals.append("repeat_question")
+        except Exception:
+            pass
+    # 負面情感
+    try:
+        from chinese_nlp import detect_sentiment
+        if detect_sentiment(t) == "negative":
+            signals.append("negative_sentiment")
+    except Exception:
+        pass
+    return {"score": len(signals), "signals": signals}
+
+
+def _detect_user_correction(
+    text: str, group_id: str, sender_user_id: str = ""
+) -> bool:
+    """偵測 user 訊息是否在糾正 bot 上一輪回覆。命中 → 寫進 organic correction。
+
+    Layer 1（強 keyword）：17 條糾正詞之一命中 → 直接視為 correction
+    Layer 2（弱信號）：6 種弱信號（情感 / 重述 / 否定句式 / 嘲諷 / corrective marker / opening neg）
+                     score >= 2 → 視為 correction
+    寫進 persona_notes（kind='correction', source='organic'）。
+    任何步驟例外都吞掉、回 False，主流程不受影響。
+    """
+    try:
+        t = (text or "").strip()
+        if len(t) < 2 or len(t) > 200:
+            return False
+
+        # 抓上一輪 user / bot 訊息
+        ctx = memory.get_context(group_id)
+        prev_user_msg = ""
+        prev_bot_msg = ""
+        # 由新→舊找最近一筆 bot，再抓它前面最近一筆 user
+        last_bot_idx = None
+        for i in range(len(ctx) - 1, -1, -1):
+            if ctx[i][0] == "bot":
+                last_bot_idx = i
+                break
+        if last_bot_idx is not None:
+            prev_bot_msg = ctx[last_bot_idx][1] or ""
+            for j in range(last_bot_idx - 1, -1, -1):
+                if ctx[j][0] == "user":
+                    prev_user_msg = ctx[j][1] or ""
+                    break
+
+        # 沒有上一輪 bot reply 可糾正 → 跳過（user 可能在糾正其他人類發言）
+        if not prev_bot_msg:
+            return False
+
+        # Layer 1：強 keyword
+        hit_keyword = any(kw in t for kw in _ORGANIC_CORRECTION_KEYWORDS)
+        # Layer 2：弱信號 score >= 2
+        weak = _weak_correction_signals(t, prev_user_msg, prev_bot_msg)
+        is_correction = hit_keyword or weak["score"] >= 2
+
+        if not is_correction:
+            return False
+
+        logger.info(
+            "organic correction detected (keyword=%s, weak_signals=%s, text=%r)",
+            hit_keyword, weak.get("signals", []), t[:60],
+        )
+
+        # 嘗試用 light Gemini call 抽一句話總結 — 失敗就直接存 raw
+        summary = _summarize_correction(prev_user_msg, prev_bot_msg, t)
+
+        note_id = memory.add_organic_correction(
+            group_id=group_id,
+            prev_user_msg=prev_user_msg,
+            prev_bot_msg=prev_bot_msg,
+            correction_msg=t,
+            summary=summary,
+        )
+        logger.info(
+            "organic correction saved (group=%s, note_id=%s, summary=%r, "
+            "correction=%r)",
+            group_id, note_id, (summary or "")[:50], t[:60],
+        )
+        return True
+    except Exception as e:
+        logger.warning("_detect_user_correction failed: %s", e)
+        return False
+
+
+def _summarize_correction(
+    prev_user_msg: str, prev_bot_msg: str, correction_msg: str
+) -> str:
+    """用 Gemini 一句話總結「bot 具體做錯什麼」。quota 爆 / 失敗回空字串。
+
+    刻意 light call：不過 system prompt、不過完整 chat 流程，
+    避免占用主對話 quota 預算。失敗 silent，caller 直接存 raw 即可。
+    """
+    if _quota_exhausted():
+        return ""
+    try:
+        prompt = (
+            "下面是一段 LINE 群對話。user 在最後一句糾正 bot 的回覆。"
+            "請用一句話（25 字內、繁體中文）總結 bot 到底做錯什麼，"
+            "讓 bot 下次不要再犯。直接給結論，不要前綴。\n\n"
+            f"user 原問：{(prev_user_msg or '')[:200]}\n"
+            f"bot 答：{(prev_bot_msg or '')[:200]}\n"
+            f"user 糾正：{(correction_msg or '')[:200]}"
+        )
+        out = gemini_client.chat(prompt, [], [])
+        if not out:
+            return ""
+        # 截到單句、去除多餘換行
+        line = out.strip().splitlines()[0].strip() if out.strip() else ""
+        return line[:120]
+    except Exception as e:
+        logger.warning("_summarize_correction failed (silent): %s", e)
+        return ""
 
 
 def _is_quota_error(e: Exception) -> bool:

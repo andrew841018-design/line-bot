@@ -92,7 +92,9 @@ def _init_db() -> None:
                 kind       TEXT NOT NULL,  -- 'example' | 'correction'
                 scenario   TEXT NOT NULL,
                 content    TEXT NOT NULL,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                source     TEXT NOT NULL DEFAULT 'rule_violation'
+                    -- 'rule_violation' (黑名單詞觸發) | 'organic' (user 真實糾正)
             );
             CREATE INDEX IF NOT EXISTS idx_persona_notes_group
                 ON persona_notes(group_id, kind);
@@ -117,8 +119,40 @@ def _init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_reminders_remind_at
                 ON reminders(group_id, status, remind_at);
+            CREATE TABLE IF NOT EXISTS kg_triples (
+                group_id    TEXT NOT NULL,
+                subject     TEXT NOT NULL,
+                relation    TEXT NOT NULL,
+                object      TEXT NOT NULL,
+                source_text TEXT,
+                created_at  INTEGER NOT NULL,
+                PRIMARY KEY (group_id, subject, relation, object)
+            );
+            CREATE INDEX IF NOT EXISTS idx_kg_triples_subject
+                ON kg_triples(group_id, subject);
+            CREATE INDEX IF NOT EXISTS idx_kg_triples_relation
+                ON kg_triples(group_id, relation);
             """
         )
+        # kg_triples schema migration: ALTER TABLE 自動補 column
+        # 2026-05-08 新增：純本機 knowledge graph 萃取
+        kg = c.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='kg_triples'"
+        ).fetchone()
+        if kg:
+            kgcols = [
+                r[1] for r in c.execute("PRAGMA table_info(kg_triples)").fetchall()
+            ]
+            if "source_text" not in kgcols:
+                c.execute(
+                    "ALTER TABLE kg_triples ADD COLUMN source_text TEXT"
+                )
+            if "created_at" not in kgcols:
+                c.execute(
+                    "ALTER TABLE kg_triples ADD COLUMN created_at "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
         # reminders schema migration: add stage flag columns
         rcols = [r[1] for r in c.execute("PRAGMA table_info(reminders)").fetchall()]
         for col in (
@@ -128,6 +162,14 @@ def _init_db() -> None:
         ):
             if col not in rcols:
                 c.execute(f"ALTER TABLE reminders ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0")
+        # persona_notes schema migration: add source column if missing
+        # 2026-05-08：區分 'rule_violation'（既有黑名單觸發）vs 'organic'（user 真實糾正）
+        pn_cols = [r[1] for r in c.execute("PRAGMA table_info(persona_notes)").fetchall()]
+        if "source" not in pn_cols:
+            c.execute(
+                "ALTER TABLE persona_notes ADD COLUMN source TEXT NOT NULL "
+                "DEFAULT 'rule_violation'"
+            )
         # facts schema migration: add user_id column if missing
         cols = [r[1] for r in c.execute("PRAGMA table_info(facts)").fetchall()]
         if "user_id" not in cols:
@@ -143,6 +185,36 @@ def _init_db() -> None:
                 DROP TABLE facts;
                 ALTER TABLE facts_new RENAME TO facts;
             """)
+
+        # embeddings schema migration: ensure model_name column exists.
+        # 2026-05-08: bge-m3 (1024 dim) / e5-large (1024) / MiniLM-L12 (384)
+        # all coexist; we tag every row with the producing model so
+        # retrieve() can filter to the same model as the active query
+        # embedding (mixing dims would break the matrix scan).
+        ec = c.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='embeddings'"
+        ).fetchone()
+        if ec:
+            ecols = [
+                r[1] for r in c.execute("PRAGMA table_info(embeddings)").fetchall()
+            ]
+            if "model_name" not in ecols:
+                c.execute(
+                    "ALTER TABLE embeddings ADD COLUMN model_name TEXT NOT NULL "
+                    "DEFAULT ''"
+                )
+            if "dim" not in ecols:
+                c.execute(
+                    "ALTER TABLE embeddings ADD COLUMN dim INTEGER NOT NULL "
+                    "DEFAULT 0"
+                )
+            # Index lets retrieve() narrow to (group_id, model_name) cheaply
+            # once we fan out across multiple models.
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_embeddings_model "
+                "ON embeddings(group_id, model_name)"
+            )
 
 
 _init_db()
@@ -511,17 +583,27 @@ _PERSONA_NOTE_CAP = 50  # 每個 group 每種 kind 最多保留幾筆（先進�
 
 
 def add_persona_note(
-    group_id: str, kind: str, scenario: str, content: str
+    group_id: str,
+    kind: str,
+    scenario: str,
+    content: str,
+    source: str = "rule_violation",
 ) -> int | None:
-    """新增一筆 persona note。kind='example'|'correction'。超過上限自動淘汰最舊的。"""
+    """新增一筆 persona note。
+
+    - kind='example'|'correction'
+    - source='rule_violation'（黑名單詞觸發、_violates_quality）|'organic'（user 真實糾正）
+    超過上限自動淘汰最舊的。
+    """
     import time
 
     now = int(time.time())
     with _lock, _conn() as c:
         c.execute(
-            "INSERT INTO persona_notes(group_id, kind, scenario, content, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (group_id, kind, scenario, content, now),
+            "INSERT INTO persona_notes"
+            "(group_id, kind, scenario, content, created_at, source) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (group_id, kind, scenario, content, now, source),
         )
         note_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
         # 淘汰舊的
@@ -536,19 +618,62 @@ def add_persona_note(
         return note_id
 
 
+def add_organic_correction(
+    group_id: str,
+    prev_user_msg: str,
+    prev_bot_msg: str,
+    correction_msg: str,
+    summary: str = "",
+) -> int | None:
+    """User 真實糾正 → 寫進 persona_notes（kind='correction', source='organic'）。
+
+    把上一輪 user 訊息 + bot 回覆 + 這次糾正三者拼起來存。如果有 summary
+    （Gemini 抽出的「具體做錯什麼」一句話），會放在 content 最前面。
+
+    回 note_id；任何步驟失敗回 None（不阻塞主流程）。
+    """
+    try:
+        prev_user = (prev_user_msg or "").strip()[:300]
+        prev_bot = (prev_bot_msg or "").strip()[:300]
+        correction = (correction_msg or "").strip()[:300]
+        summary_clean = (summary or "").strip()[:200]
+
+        if summary_clean:
+            content = (
+                f"教訓：{summary_clean}\n"
+                f"user 原問：{prev_user}\n"
+                f"咪寶當時答：{prev_bot}\n"
+                f"user 糾正：{correction}"
+            )
+        else:
+            content = (
+                f"user 原問：{prev_user}\n"
+                f"咪寶當時答：{prev_bot}\n"
+                f"user 糾正：{correction}"
+            )
+        return add_persona_note(
+            group_id, "correction", "使用者主動糾正", content, source="organic"
+        )
+    except Exception:
+        return None
+
+
 def list_persona_notes(group_id: str, kind: str | None = None) -> list[dict]:
-    """取出 persona notes。kind=None 取全部，否則只取指定種類。"""
+    """取出 persona notes。kind=None 取全部，否則只取指定種類。
+
+    回傳每筆含 source 欄位（'rule_violation' | 'organic'）。
+    """
     with _conn() as c:
         if kind:
             rows = c.execute(
-                "SELECT note_id, kind, scenario, content, created_at "
+                "SELECT note_id, kind, scenario, content, created_at, source "
                 "FROM persona_notes WHERE group_id = ? AND kind = ? "
                 "ORDER BY created_at ASC",
                 (group_id, kind),
             ).fetchall()
         else:
             rows = c.execute(
-                "SELECT note_id, kind, scenario, content, created_at "
+                "SELECT note_id, kind, scenario, content, created_at, source "
                 "FROM persona_notes WHERE group_id = ? "
                 "ORDER BY created_at ASC",
                 (group_id,),
@@ -560,6 +685,7 @@ def list_persona_notes(group_id: str, kind: str | None = None) -> list[dict]:
             "scenario": r[2],
             "content": r[3],
             "created_at": r[4],
+            "source": r[5] or "rule_violation",
         }
         for r in rows
     ]
