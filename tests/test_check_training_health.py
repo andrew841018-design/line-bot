@@ -449,11 +449,22 @@ def test_render_with_red_full_report():
 # ── G. push_discord — graceful degrade ─────────────────────────────────────
 
 def test_push_discord_no_webhook_url(monkeypatch):
+    """No webhook URL AND notify_discord Bot DM unavailable → graceful False.
+
+    push_discord() tries Bot DM (notify_discord.send_dm) first, webhook second.
+    To test the "all channels unavailable" graceful-degrade path, mock both off.
+    """
     from finetune import check_training_health as cth
+    import sys
+    sys.path.insert(0, str(cth.LINE_BOT))
+    import notify_discord
 
     monkeypatch.delenv("DISCORD_WEBHOOK_URL", raising=False)
+    monkeypatch.setattr(notify_discord, "TOKEN", None, raising=False)
+    monkeypatch.setattr(notify_discord, "USER_ID", None, raising=False)
+
     ok = cth.push_discord("test")
-    assert ok is False  # 沒 url 應 graceful degrade
+    assert ok is False  # 沒 webhook 也沒 Bot DM 應 graceful degrade
 
 
 def test_push_discord_request_exception(monkeypatch):

@@ -165,27 +165,20 @@ def test_all_conditions_met_triggers_train(env):
     notifier.assert_called_once()
 
 
-# ── (b) corrections < 30 → 不觸發 ───────────────────────────────────────────
+# ── (b) corrections < 30 → SFT pilot 仍會觸發 (per 2026-05-09 設計變更) ──────
 
 
-def test_below_organic_threshold_does_not_trigger(env, capsys):
+def test_below_organic_threshold_triggers_sft_pilot(env, capsys):
+    """2026-05-09 改：SFT pilot 不 require organic; organic<30 仍會觸發 SFT (DPO 才需 organic)."""
     atp = env["atp"]
     _mk_db_with_organic(env["db"], 29)
     _write_jsonl(env["data"] / "train.jsonl", 100)
     _write_config(env["config"], None)
 
     cond = atp.evaluate_conditions()
-    assert cond["should_trigger"] is False
-    assert cond["cond_organic"] is False
-
-    fake_runner = MagicMock()
-    rc = atp.run(runner=fake_runner)
-    assert rc == 0
-    fake_runner.assert_not_called()
-
-    out = capsys.readouterr().out
-    assert "29/30" in out
-    assert "條件不滿足" in out
+    assert cond["should_trigger"] is True       # SFT 模式仍觸發
+    assert cond["cond_organic"] is False        # 29 < 30 OK
+    assert "SFT" in cond["reason"]              # mode=SFT
 
 
 # ── (c) pairs < 80 → 不觸發 ────────────────────────────────────────────────

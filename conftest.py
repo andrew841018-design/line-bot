@@ -18,6 +18,11 @@ os.environ.setdefault("GEMINI_API_KEY", "dummy")
 os.environ.setdefault("GROK_API_KEY", "dummy")
 os.environ.setdefault("BOT_MUTED", "true")
 
+# PySpark needs to know the venv Python (system Python default breaks Java workers)
+import sys as _sys
+os.environ.setdefault("PYSPARK_PYTHON", _sys.executable)
+os.environ.setdefault("PYSPARK_DRIVER_PYTHON", _sys.executable)
+
 import main  # noqa: E402
 
 # Snapshot originals once at import time (before any test runs)
