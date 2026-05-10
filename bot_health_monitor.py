@@ -24,12 +24,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -44,10 +46,70 @@ PENDING_FILE = BASE / "pending_explicit_reply.json"
 HEALTH_STATE_FILE = BASE / "health_monitor_state.json"
 DB_FILE = BASE / "line_bot.db"
 
+# 5/9 root cause 修補：monitor 不再 hardcode log 路徑，從 launchd plist + wrapper script 動態解析。
+# 詳見 ~/scripts/launchd_introspect.py。新增/搬遷服務只要對齊 launchd convention 即可，monitor 自動跟上。
+sys.path.insert(0, str(Path.home() / "scripts"))
+try:
+    import launchd_introspect as _lid
+except ImportError:
+    _lid = None  # 單機 dev 沒裝 lib 時 fallback 到舊行為
+
+CLOUDFLARED_LABEL = "com.andrew.line-bot-cloudflared"
+# fallback 路徑（lib 不在或解析失敗時用）
+CLOUDFLARED_LOG_CANDIDATES = (
+    Path.home() / "Library" / "Logs" / "cloudflared_line_bot.log",
+    BASE / "cloudflared.log",
+)
+
+
+def _resolve_cloudflared_log():
+    """從 launchd 動態抓 logfile；找不到 fallback 候選 list。"""
+    if _lid is not None:
+        paths = _lid.discover_paths(CLOUDFLARED_LABEL, kinds=("logfile", "stdout"))
+        for kind in ("logfile", "stdout"):
+            p = paths.get(kind)
+            if p and p.exists() and p.stat().st_size > 0:
+                return p
+    for p in CLOUDFLARED_LOG_CANDIDATES:
+        try:
+            if p.exists() and p.stat().st_size > 0:
+                return p
+        except OSError:
+            continue
+    return None
+
+
+def _resolve_cloudflared_url() -> Optional[str]:
+    """先讀 wrapper 寫的 URL stash（最權威），fallback log 解析。
+
+    stash 檔由 wrapper script (~/scripts/run_cloudflared_line_bot.sh) 在每次 tunnel
+    建立時寫入；read 是原子單行操作，不會碰到 log scrape 的 stale 問題。
+    """
+    if _lid is not None:
+        url = _lid.read_url_stash(CLOUDFLARED_LABEL)
+        if url and url.startswith("https://"):
+            return url
+    cf_log = _resolve_cloudflared_log()
+    if cf_log is None:
+        return None
+    try:
+        urls = re.findall(r"https://[a-z0-9-]+\.trycloudflare\.com", cf_log.read_text())
+        return urls[-1] if urls else None
+    except OSError:
+        return None
+
 # launchd-managed cloudflared tunnel: kickstart 而不是 pkill+spawn，
 # 避免製造 launchd 看不見的孤兒進程。wrapper script 會 rm 後重寫 URL_FILE。
-LAUNCHD_CLOUDFLARED_LABEL = "com.andrew.line-bot-cloudflared"
-TUNNEL_URL_FILE = Path("/tmp/cloudflared_line_bot_url.txt")
+LAUNCHD_CLOUDFLARED_LABEL = CLOUDFLARED_LABEL  # 同一個 label，舊名留向後相容
+# stash 路徑從 launchd_introspect 動態解析；解析失敗 fallback 到 wrapper 慣例位置
+def _resolve_tunnel_url_file() -> Path:
+    if _lid is not None:
+        paths = _lid.discover_paths(CLOUDFLARED_LABEL, kinds=("url_file",))
+        p = paths.get("url_file")
+        if p:
+            return p
+    return Path("/tmp/cloudflared_line_bot_url.txt")
+TUNNEL_URL_FILE = _resolve_tunnel_url_file()
 GROUP_ID = os.environ.get("LINE_ALLOWED_GROUP_ID") or os.environ.get(
     "ALLOWED_GROUP_ID", ""
 )
@@ -234,18 +296,15 @@ def save_health_state(d: dict) -> None:
 
 
 def autofix_webhook_endpoint() -> tuple[bool, str]:
-    """讀 cloudflared.log 抓目前 URL，PUT 到 LINE webhook endpoint。
+    """抓目前 cloudflared URL，PUT 到 LINE webhook endpoint。
     解決「cloudflared 沒死但 URL drift」這類常見故障。
+
+    URL 來源優先序：(1) wrapper 寫的 stash 檔 (2) cloudflared log 解析。
     """
-    cf_log = BASE / "cloudflared.log"
-    if not cf_log.exists():
-        return False, "no cloudflared.log"
+    latest = _resolve_cloudflared_url()
+    if latest is None:
+        return False, "no cloudflared URL (stash + log 都拿不到)"
     try:
-        import re as _re
-        urls = _re.findall(r"https://[a-z0-9-]+\.trycloudflare\.com", cf_log.read_text())
-        if not urls:
-            return False, "no URL in cloudflared.log"
-        latest = urls[-1]
         token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
         if not token:
             return False, "no LINE token"
@@ -353,35 +412,24 @@ def cloudflared_url_alive() -> tuple[bool, str]:
       - (True, "")：URL reachable，HTTP 200
       - (False, reason)：log 沒 URL / curl 失敗 / 非 200
     """
-    cf_log = BASE / "cloudflared.log"
-    if not cf_log.exists():
-        return False, "no cloudflared.log"
+    latest = _resolve_cloudflared_url()
+    if latest is None:
+        return False, "no cloudflared URL (stash + log 都拿不到)"
     try:
-        import re as _re
-
-        urls = _re.findall(
-            r"https://[a-z0-9-]+\.trycloudflare\.com", cf_log.read_text()
+        r = subprocess.run(
+            [
+                "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                "--max-time", "5",
+                f"{latest}/health",
+            ],
+            capture_output=True, text=True, timeout=8,
         )
-        if not urls:
-            return False, "no URL in cloudflared.log"
-        latest = urls[-1]
-        try:
-            r = subprocess.run(
-                [
-                    "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-                    "--max-time", "5",
-                    f"{latest}/health",
-                ],
-                capture_output=True, text=True, timeout=8,
-            )
-            code = int((r.stdout or "0").strip() or 0)
-            if code == 200:
-                return True, ""
-            return False, f"{latest} curl HTTP {code}"
-        except Exception as e:
-            return False, f"{latest} curl exception: {str(e)[:80]}"
+        code = int((r.stdout or "0").strip() or 0)
+        if code == 200:
+            return True, ""
+        return False, f"{latest} curl HTTP {code}"
     except Exception as e:
-        return False, str(e)[:120]
+        return False, f"{latest} curl exception: {str(e)[:80]}"
 
 
 def _wait_for_health(timeout: int = 30, pattern: str = "uvicorn.*main:app") -> bool:

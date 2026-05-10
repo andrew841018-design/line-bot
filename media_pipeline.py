@@ -62,19 +62,172 @@ def analyze_image(
             return f"📷 OCR 抽到的文字：\n{ocr_text[:800]}\n\n（vision LLM 不可用，僅 OCR 結果）"
         return None
 
-    # Layer 2：Hybrid B — 用描述 + 多源 web search → Gemini 用既有規則包裝
-    # （只送描述文字，圖片 raw bytes 永遠不出本機）
+    # Layer 2：v4 完整 pipeline（7 步：query expansion + multi-source + full text + critique）
+    # 圖片 raw bytes 100% 本機；只把描述文字 + sources 送 Gemini 寫 reply
     import os as _os
     if _os.environ.get("MEDIA_HYBRID_DISABLED") != "1":
         try:
-            wrapped = _wrap_with_gemini_news_style(desc, ocr_text or "")
+            if _os.environ.get("MEDIA_PIPELINE_V4", "1") != "0":
+                wrapped = _v4_news_style_pipeline(desc, ocr_text or "")
+            else:
+                wrapped = _wrap_with_gemini_news_style(desc, ocr_text or "")
             if wrapped:
                 return wrapped
         except Exception as e:
-            logger.warning("hybrid B wrap failed, fallback to raw desc: %s", e)
+            logger.warning("hybrid pipeline failed, fallback to raw desc: %s", e)
 
     # Layer 3：純 vision_llm 描述（不 wrap）
     return desc
+
+
+def _v4_news_style_pipeline(desc: str, ocr_text: str = "") -> Optional[str]:
+    """v4 完整 7 步 pipeline — 比 _wrap_with_gemini_news_style 豐富 3-5x。
+
+    Step 1: vision_describe + OCR（caller 已給）
+    Step 2: query expansion（本機 14B 生 6 個多樣 search query）
+    Step 3: multi-source aggregate（DDG/GNews/Wiki × N，權威 domain 排序）
+    Step 4: top-5 full text fetch（trafilatura 平行）
+    Step 5: generate rich reply（Gemini 主 / 14B fallback，新 prompt 強制 ≥5 URL）
+    Step 6: grounding verify（grounding_local 4-signal）
+    Step 7: self-critique refine（找 hallucinate + 補 missing fact）
+
+    全步驟有 fallback；任一爆 → graceful 退到簡版。
+    """
+    # ── Step 2: Query expansion ──
+    queries = []
+    try:
+        from finetune_query_expansion import expand_queries
+        queries = expand_queries(desc, ocr_text, n=6)
+        logger.info("v4 step 2: %d queries → %s", len(queries), queries[:3])
+    except Exception as e:
+        logger.warning("v4 step 2 expand_queries failed: %s", e)
+        # fallback 用單一 query
+        queries = [(desc[:80] + " " + ocr_text[:50]).strip()]
+
+    # ── Step 3: Multi-source aggregate ──
+    sources = []
+    try:
+        from source_aggregator import aggregate_sources
+        sources = aggregate_sources(queries, total_max=18)
+        logger.info(
+            "v4 step 3: %d sources（top authority: %s）",
+            len(sources),
+            [s.get("domain") for s in sources[:3]],
+        )
+    except Exception as e:
+        logger.warning("v4 step 3 aggregate failed: %s", e)
+        return _wrap_with_gemini_news_style(desc, ocr_text)  # 退舊版
+
+    # ── Step 4: Top-5 full text fetch ──
+    rich_sources = sources
+    try:
+        from fulltext_fetcher import fetch_top_sources
+        rich_sources = fetch_top_sources(sources, top_n=5, max_chars_per=2500)
+        full_count = sum(1 for r in rich_sources if r.get("full_text"))
+        logger.info("v4 step 4: %d / %d sources fetched full text", full_count, len(rich_sources))
+    except Exception as e:
+        logger.warning("v4 step 4 fetch_top failed: %s", e)
+
+    # 拼 sources block
+    sources_block = "\n\n".join(
+        f"[{i+1}] {(r.get('title') or '')[:80]} ({r.get('domain', '?')}, "
+        f"權威 {r.get('authority_score', 0)})\n"
+        f"     URL: {r.get('url') or ''}\n"
+        f"     {(r.get('full_text') or r.get('snippet') or '')[:2000]}"
+        for i, r in enumerate(rich_sources[:10])
+    )
+
+    # ── Step 5: Generate rich reply ──
+    user_msg = (
+        f"LINE 群有人貼了一張圖。請寫一段豐富、有具體 fact、引多源的咪寶風回覆。\n\n"
+        f"【圖片描述】\n{desc}\n"
+        f"【OCR 文字】\n{ocr_text or '(無)'}\n\n"
+        f"【相關 sources（{len(rich_sources)} 條，按權威排序，前 5 已 fetch 完整內容）】\n"
+        f"{sources_block or '(沒抓到 sources)'}\n\n"
+        f"=== 結構（敘述體不要章節 header）===\n"
+        f"1. 第一段：直接給整合判斷（規則 0，第一句具體 take，含至少 1 個關鍵數字 / 名詞）\n"
+        f"2. 第二段：正方/支持方在說什麼，引 [n] sources，含人名/機構/日期\n"
+        f"3. 第三段：反方/質疑方在說什麼，引 [n] sources，含具體質疑點\n"
+        f"4. 第四段：歷史脈絡 / 背景 — 為什麼這事重要 / 過去有什麼類似案例\n"
+        f"5. 第五段：整合 — 你綜合多源後的判斷（含具體數字、機制、為什麼）\n"
+        f"6. 第六段：sources 矛盾分析 — 哪些 source 之間有不同說法（如有）\n"
+        f"7. 第七段：actionable 建議或警告（1-2 句，user 看完該做什麼）\n"
+        f"8. 最後段：來源 — 列至少 5 條，格式 `機構名 https://URL`，每條一行（從上面 sources 直接複製 URL，不編造、不 short URL）\n\n"
+        f"=== 硬性規則 ===\n"
+        f"- 必須引用至少 5 個 sources（[1][2]... 對應上面）\n"
+        f"- 來源段必須 5+ 條真實 URL（從上面 sources 區塊原樣複製）\n"
+        f"- 必須含具體：人名、日期、數字、機構（至少 5 個）\n"
+        f"- 不要 formal section header（同意/反對/判斷依據/結論）\n"
+        f"- 不要「希望對您有幫助 / 以上僅供參考」結尾\n"
+        f"- 整體 400-700 字\n"
+        f"- 忠實 follow sources（沒提的不要憑記憶補；矛盾要標出）\n\n"
+        f"直接給回覆，不要前綴。"
+    )
+
+    # 圖片 100% 本機 policy（user 2026-05-09）：跳過 Gemini，直接走本機 14B
+    # 圖片內容 / 描述都不送雲端，包括 Step 5 reply generation
+    reply = None
+    logger.info("v4 step 5 圖片走本機 14B（skip Gemini per image policy）")
+    try:
+        from local_llm import chat as local_chat
+        meibao_system = (
+            "你是 LINE 群組對話助理咪寶。風格要求：繁體中文、第一句具體判斷、"
+            "敘述體不要 section header、含具體數字/人名/日期/機構、引用至少 5 個 sources [n]、"
+            "來源段含真實 URL（5+ 條，從上面 sources 區塊原樣複製，不替換、不編造）、整體 400-700 字。"
+            "禁止「同意/反對/判斷依據/結論」formal headers、禁止「希望對您有幫助」結尾。"
+        )
+        reply = local_chat(user_msg, system_prompt=meibao_system, max_tokens=1200)
+        reply = reply.strip() if reply else None
+    except Exception as e:
+        logger.warning("v4 step 5 local_llm failed: %s", e)
+        return None
+
+    if not reply:
+        return None
+
+    # ── Step 6: Grounding verify ──
+    try:
+        import grounding_local
+        source_texts = [
+            (r.get("full_text") or r.get("snippet") or "") for r in rich_sources[:5]
+        ]
+        score = grounding_local.score_response(reply, source_texts)
+        avg = score.get("score_avg", 1.0) if score else 1.0
+        logger.info("v4 step 6 grounding score: %.2f", avg)
+    except Exception as e:
+        logger.info("v4 step 6 grounding skip: %s", e)
+
+    # ── Step 7: Self-critique refine（圖片 100% 本機 → critique/refine 也用 14B，不打 Gemini）──
+    import os as _os2
+    _os2.environ["SELF_CRITIQUE_FORCE_LOCAL"] = "1"  # 給 self_critique 用的 hint
+    try:
+        from self_critique import critique_reply, refine_reply
+        sources_for_critique = [
+            {
+                "title": r.get("title", ""),
+                "url": r.get("url", ""),
+                "text": r.get("full_text") or r.get("snippet") or "",
+            }
+            for r in rich_sources[:5]
+        ]
+        critique = critique_reply(reply, sources_for_critique)
+        n_contradicted = sum(
+            1 for c in critique.get("claims", []) if c.get("verdict") == "contradicted"
+        )
+        n_missing = len(critique.get("missing_facts", []))
+        logger.info(
+            "v4 step 7 critique: %d contradicted, %d missing facts",
+            n_contradicted, n_missing,
+        )
+        if n_contradicted > 0 or n_missing >= 2:
+            refined = refine_reply(reply, critique, sources_for_critique)
+            if refined and refined.strip():
+                logger.info("v4 step 7 refine applied")
+                return refined.strip()
+    except Exception as e:
+        logger.info("v4 step 7 critique/refine skip: %s", e)
+
+    return reply
 
 
 def _wrap_with_gemini_news_style(desc: str, ocr_text: str = "") -> Optional[str]:

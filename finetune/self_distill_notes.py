@@ -47,7 +47,7 @@ HOME = Path.home()
 NOTE_ROOTS: list[Path] = [
     HOME / "Desktop/andrew/Data_engineer/mock_interview",
     HOME / "Desktop/andrew/Data_engineer/project",
-    HOME / "Desktop/andrew/job_search",
+    HOME / "Desktop/andrew/Data_engineer/job_search",
     HOME / ".claude/projects/-Users-andrew/memory",
 ]
 

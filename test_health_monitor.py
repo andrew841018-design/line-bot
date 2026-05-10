@@ -22,11 +22,16 @@ import bot_health_monitor as bhm  # noqa: E402
 # ── A. cloudflared_url_alive ──────────────────────────────────────────────────
 
 
-def _patch_cloudflared_log(tmp_path: Path, content: str) -> None:
-    """Point bhm at a temp cloudflared.log."""
+def _patch_cloudflared_log(tmp_path: Path, content: str, monkeypatch) -> Path:
+    """Point bhm at a temp cloudflared.log。
+
+    5/9 root cause refactor 後 monitor 從 launchd_introspect 動態解析路徑，
+    測試需 (a) 關掉 _lid（避免讀到真機 stash/log）(b) 覆寫 fallback candidate。
+    """
     log = tmp_path / "cloudflared.log"
     log.write_text(content)
-    # Patch BASE-derived path: bhm uses BASE / "cloudflared.log" inline
+    monkeypatch.setattr(bhm, "_lid", None)
+    monkeypatch.setattr(bhm, "CLOUDFLARED_LOG_CANDIDATES", (log,))
     return log
 
 
@@ -35,6 +40,7 @@ def test_cloudflared_url_alive_returns_true_on_200(tmp_path, monkeypatch):
     _patch_cloudflared_log(
         tmp_path,
         "2026-05-05T05:29:11Z INF |  https://abc-def.trycloudflare.com  |\n",
+        monkeypatch,
     )
     monkeypatch.setattr(bhm, "BASE", tmp_path)
 
@@ -54,6 +60,7 @@ def test_cloudflared_url_alive_returns_false_when_curl_nxdomain(tmp_path, monkey
     _patch_cloudflared_log(
         tmp_path,
         "2026-05-05T05:29:11Z INF |  https://retired.trycloudflare.com  |\n",
+        monkeypatch,
     )
     monkeypatch.setattr(bhm, "BASE", tmp_path)
 
@@ -69,7 +76,7 @@ def test_cloudflared_url_alive_returns_false_when_curl_nxdomain(tmp_path, monkey
 
 def test_cloudflared_url_alive_no_url_in_log(tmp_path, monkeypatch):
     """If cloudflared.log has no URL yet, return (False, reason)."""
-    _patch_cloudflared_log(tmp_path, "no url here yet\n")
+    _patch_cloudflared_log(tmp_path, "no url here yet\n", monkeypatch)
     monkeypatch.setattr(bhm, "BASE", tmp_path)
 
     ok, reason = bhm.cloudflared_url_alive()
@@ -80,6 +87,8 @@ def test_cloudflared_url_alive_no_url_in_log(tmp_path, monkeypatch):
 def test_cloudflared_url_alive_no_log_file(tmp_path, monkeypatch):
     """If cloudflared.log doesn't exist, return (False, reason)."""
     monkeypatch.setattr(bhm, "BASE", tmp_path)
+    monkeypatch.setattr(bhm, "_lid", None)
+    monkeypatch.setattr(bhm, "CLOUDFLARED_LOG_CANDIDATES", (tmp_path / "missing.log",))
     ok, reason = bhm.cloudflared_url_alive()
     assert ok is False
 

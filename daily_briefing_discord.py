@@ -1061,7 +1061,7 @@ def _parse_source_breakdown(text: str) -> tuple[dict, dict]:
 
 def job_search_summary() -> str:
     today = datetime.now().strftime("%Y-%m-%d")
-    report = Path(f"/Users/andrew/Desktop/andrew/job_search/{today}.md")
+    report = Path(f"/Users/andrew/Desktop/andrew/Data_engineer/job_search/{today}.md")
     if not report.exists():
         return "💼 **今日職缺**：今天沒有適合的職缺"
     try:

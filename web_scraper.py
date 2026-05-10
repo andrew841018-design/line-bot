@@ -150,10 +150,29 @@ def _decode_ddg_redirect(href: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. Google News RSS
 # ─────────────────────────────────────────────────────────────────────────────
+def _resolve_google_news_url(redirect_url: str) -> str:
+    """Google News RSS 的 link 是 base64 encoded protobuf。用 googlenewsdecoder
+    解碼回真實 article URL。失敗回原 URL。
+    """
+    if "news.google.com" not in redirect_url:
+        return redirect_url
+    try:
+        from googlenewsdecoder import gnewsdecoder  # type: ignore
+        result = gnewsdecoder(redirect_url)
+        if result and result.get("status") and result.get("decoded_url"):
+            return result["decoded_url"]
+    except ImportError:
+        logger.debug("googlenewsdecoder 未裝，回原 redirect URL")
+    except Exception as e:
+        logger.debug("googlenewsdecoder failed: %s", e)
+    return redirect_url
+
+
 def search_google_news(query: str, k: int = 10) -> list[dict]:
     """Google News RSS — 純 HTTP，無 API key。
 
     回傳：list[{title, url, published, source}]
+    URL 自動 resolve google news redirect → 真實 article URL。
     """
     if not query or not query.strip():
         return []
@@ -182,6 +201,8 @@ def search_google_news(query: str, k: int = 10) -> list[dict]:
             source = (src_node.text or "").strip() if src_node is not None else ""
             if not title or not link:
                 continue
+            # Resolve google news redirect to real URL
+            link = _resolve_google_news_url(link)
             out.append(
                 {
                     "title": title,
