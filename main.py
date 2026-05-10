@@ -1153,6 +1153,13 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
     except (ImportError, Exception) as e:
         logger.debug("knowledge_graph extract skipped: %s", e)
 
+    # 自動分類（rule-first → Gemini lite，fire-and-forget；2026-05-10 加）
+    try:
+        import message_classifier
+        message_classifier.classify_async(group_id, event.message.id, text)
+    except (ImportError, Exception) as e:
+        logger.debug("message_classifier skipped: %s", e)
+
     # 自動偵測 reminder（2026-05-08：含日期+時間 hint 的訊息抽 action 存 DB）
     # 失敗 silent，不阻塞主流程
     sender_uid_for_reminder = getattr(event.source, "user_id", None) or ""
@@ -2855,9 +2862,61 @@ def _handle_dinner_recommendation(event: MessageEvent, group_id: str) -> None:
     _reply(event.reply_token, reply_text, group_id=group_id)
 
 
+_CLASSIFY_EMOJIS = {
+    "財經": "💰", "健康": "🏥", "警示": "🚨", "影片": "🎬", "行程": "📅", "其他": "📌",
+}
+_CLASSIFY_CMD_TO_CAT = {
+    "/今日財經": "財經",
+    "/今日健康": "健康",
+    "/今日警示": "警示",
+    "/今日影片": "影片",
+    "/今日行程": "行程",
+    "/今日其他": "其他",
+}
+
+
+def _handle_classify_command(group_id: str, text: str) -> str | None:
+    """處理 /分類 與 /今日X 系列指令；無命中回 None。2026-05-10 加。"""
+    t = text.strip()
+    if t not in _CLASSIFY_CMD_TO_CAT and t != "/分類":
+        return None
+    try:
+        import message_classifier
+        import time as _time
+        if t == "/分類":
+            counts = message_classifier.today_category_counts(group_id)
+            lines = ["📊 今日訊息分類"]
+            for cat in message_classifier.CATEGORIES:
+                n = counts.get(cat, 0)
+                lines.append(f"{_CLASSIFY_EMOJIS.get(cat, '')} {cat}: {n} 則")
+            lines.append("")
+            lines.append("查詢：/今日財經 /今日健康 /今日警示 /今日影片 /今日行程 /今日其他")
+            return "\n".join(lines)
+        cat = _CLASSIFY_CMD_TO_CAT[t]
+        rows = message_classifier.list_today_in_category(group_id, cat, limit=20)
+        emoji = _CLASSIFY_EMOJIS.get(cat, "")
+        if not rows:
+            return f"{emoji} 今日{cat}：沒有訊息"
+        out = [f"{emoji} 今日{cat} ({len(rows)} 則)"]
+        for i, r in enumerate(rows, 1):
+            ts = _time.strftime("%H:%M", _time.localtime(r["created_at"]))
+            txt = (r["text"] or "")[:60]
+            out.append(f"{i}. {ts} {txt}")
+        return "\n".join(out)
+    except Exception as e:
+        logger.warning("_handle_classify_command failed: %s", e)
+        return None
+
+
 def _handle_command(group_id: str, text: str) -> str | None:
     """有對應到指令回 str；沒有回 None。"""
     t = text.strip()
+
+    # 訊息分類查詢（2026-05-10 加）
+    classify_reply = _handle_classify_command(group_id, t)
+    if classify_reply is not None:
+        return classify_reply
+
     if t == "/group_id":
         return f"本群 group_id：\n{group_id}"
 
