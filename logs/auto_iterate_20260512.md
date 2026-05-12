@@ -1,11 +1,11 @@
-# line_bot 自動迭代報告 — 2026-05-11 12:25:06 TW
+# line_bot 自動迭代報告 — 2026-05-12 12:25:04 TW
 
-[12:25:06] ===== 開始 =====
-[12:25:06] ## Step 1: git pull
+[12:25:04] ===== 開始 =====
+[12:25:04] ## Step 1: git pull
 來自 github.com:andrew841018-design/line-bot
  * branch            main       -> FETCH_HEAD
 已經是最新的。
-[12:25:13] ## Step 2: pytest
+[12:25:10] ## Step 2: pytest
 ........................................................................ [  8%]
 ........................................................................ [ 17%]
 ........................................................................ [ 26%]
@@ -70,7 +70,7 @@ tests/test_spark_pipeline.py::test_dedup_hash_stable
     warnings.warn("Cannot infer the eval type from type hints. ", UserWarning)
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-829 passed, 95 warnings in 68.19s (0:01:08)
+829 passed, 95 warnings in 65.92s (0:01:05)
 --- Logging error ---
 Traceback (most recent call last):
   File "/opt/homebrew/Cellar/python@3.13/3.13.13/Frameworks/Python.framework/Versions/3.13/lib/python3.13/logging/__init__.py", line 1154, in emit
@@ -110,19 +110,15 @@ cat: /Users/andrew/Desktop/andrew/Data_engineer/line_bot/pending_feedback.json: 
 
 ### /tmp/line_bot_restart.log (last 30)
 ```
-(no log)
+INFO:     Started server process [41670]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8080 (Press CTRL+C to quit)
+INFO:     127.0.0.1:60538 - "GET /health HTTP/1.1" 200 OK
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [41670]
 ```
 [12:27:35] ## ✅ 全綠，無需迭代
-[12:27:36] ## Step 7: 仍有未 commit 變更，catch-all 上傳
-[main 47f3c09] auto iterate 20260511 (catch-all)
- 9 files changed, 140 insertions(+), 1459 deletions(-)
- delete mode 100644 bot_health_monitor.py
- delete mode 100644 health_monitor_state.json
- create mode 100644 logs/auto_iterate_20260511.md
- delete mode 100644 ptt_pipeline_health_state.json
- delete mode 100644 test_health_monitor.py
-To github.com:andrew841018-design/line-bot.git
-   ba8da0f..47f3c09  main -> main
-[12:27:39] ## Step 8: restart uvicorn
-[12:27:45] /health: {"status":"ok","gemini_model":"gemini-2.5-flash","gemini_light_model":"gemini-2.5-flash-lite","group_locked":true}
-[12:27:45] ===== 結束 =====
+[12:27:35] ## Step 7: 仍有未 commit 變更，catch-all 上傳

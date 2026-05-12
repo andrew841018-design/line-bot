@@ -1,0 +1,18 @@
+{
+  "capitulation_history": [
+    {
+      "date": "2026-05-11",
+      "soxl_close": 189.02000427246094,
+      "composite_score": 65,
+      "bias_20ma_pct": 24,
+      "sox_rsi": 22
+    },
+    {
+      "date": "2026-05-12",
+      "soxl_close": 189.05990600585938,
+      "composite_score": 65,
+      "bias_20ma_pct": 24,
+      "sox_rsi": 22
+    }
+  ]
+}
