@@ -1,11 +1,11 @@
-# line_bot 自動迭代報告 — 2026-05-12 12:25:04 TW
+# line_bot 自動迭代報告 — 2026-05-13 12:25:05 TW
 
-[12:25:04] ===== 開始 =====
-[12:25:04] ## Step 1: git pull
+[12:25:05] ===== 開始 =====
+[12:25:05] ## Step 1: git pull
 來自 github.com:andrew841018-design/line-bot
  * branch            main       -> FETCH_HEAD
 已經是最新的。
-[12:25:10] ## Step 2: pytest
+[12:25:11] ## Step 2: pytest
 ........................................................................ [  8%]
 ........................................................................ [ 17%]
 ........................................................................ [ 26%]
@@ -70,7 +70,7 @@ tests/test_spark_pipeline.py::test_dedup_hash_stable
     warnings.warn("Cannot infer the eval type from type hints. ", UserWarning)
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-829 passed, 95 warnings in 65.92s (0:01:05)
+829 passed, 95 warnings in 75.71s (0:01:15)
 --- Logging error ---
 Traceback (most recent call last):
   File "/opt/homebrew/Cellar/python@3.13/3.13.13/Frameworks/Python.framework/Versions/3.13/lib/python3.13/logging/__init__.py", line 1154, in emit
@@ -85,14 +85,14 @@ Call stack:
 Message: 'Closing down clientserver connection'
 Arguments: ()
 <sys>:0: DeprecationWarning: builtin type swigvarlink has no __module__ attribute
-[12:27:35] pytest 失敗數: 0
-[12:27:35] ## Step 3: pyflakes
+[12:27:47] pytest 失敗數: 0
+[12:27:47] ## Step 3: pyflakes
 ```
 /Users/andrew/Desktop/andrew/Data_engineer/line_bot/.venv/bin/python: No module named pyflakes
 ```
-[12:27:35] pyflakes 警告: 0
+[12:27:47] pyflakes 警告: 0
 0
-[12:27:35] ## Step 4: 24h quality violations
+[12:27:47] ## Step 4: 24h quality violations
 ```
 找到 5 筆 correction notes（cols=['group_id', 'note_id', 'kind', 'scenario', 'content', 'created_at', 'source']）
 - ('C83c5609ada4df93fa7f3239c24685133', 6, 'correction', '使用者糾正', '，你是我說了才記住，還是平常就會自己記住', 1778231254, 'rule_violation')
@@ -101,7 +101,7 @@ Arguments: ()
 - ('C83c5609ada4df93fa7f3239c24685133', 3, 'correction', '影片/文章摘要', '影片或文章的摘要一律用條列（* 或數字）整理重點，不要寫成散文。每個重點用粗體標題開頭，例如「**核心論點**：...」，至少3~5條。', 1776845640, 'rule_violation')
 - ('C83c5609ada4df93fa7f3239c24685133', 2, 'correction', '使用者糾正', '@All 紙盒裝食物，千萬不要放到微波爐去加熱。否則容出大量的塑膠微粒。能就已經顯示塑膠為例，傷害人體健康甚鉅。', 1776775595, 'rule_violation')
 ```
-[12:27:35] ## Step 5: launchd_health / restart log tail
+[12:27:47] ## Step 5: launchd_health / restart log tail
 ### line_bot_health_stderr.log (last 30)
 ```
 cat: /Users/andrew/Desktop/andrew/Data_engineer/line_bot/pending_feedback.json: Operation not permitted
@@ -110,24 +110,15 @@ cat: /Users/andrew/Desktop/andrew/Data_engineer/line_bot/pending_feedback.json: 
 
 ### /tmp/line_bot_restart.log (last 30)
 ```
-INFO:     Started server process [41670]
+INFO:     Started server process [95116]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
 INFO:     Uvicorn running on http://127.0.0.1:8080 (Press CTRL+C to quit)
-INFO:     127.0.0.1:60538 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53143 - "GET /health HTTP/1.1" 200 OK
 INFO:     Shutting down
 INFO:     Waiting for application shutdown.
 INFO:     Application shutdown complete.
-INFO:     Finished server process [41670]
+INFO:     Finished server process [95116]
 ```
-[12:27:35] ## ✅ 全綠，無需迭代
-[12:27:35] ## Step 7: 仍有未 commit 變更，catch-all 上傳
-[main 2c991df] auto iterate 20260512 (catch-all)
- 5 files changed, 160 insertions(+), 1 deletion(-)
- create mode 100644 logs/auto_iterate_20260512.md
- create mode 100644 soxl_signal_state.json
-To github.com:andrew841018-design/line-bot.git
-   47f3c09..2c991df  main -> main
-[12:27:41] ## Step 8: restart uvicorn
-[12:27:47] /health: {"status":"ok","gemini_model":"gemini-2.5-flash","gemini_light_model":"gemini-2.5-flash-lite","group_locked":true}
-[12:27:47] ===== 結束 =====
+[12:27:47] ## ✅ 全綠，無需迭代
+[12:27:47] ## Step 7: 仍有未 commit 變更，catch-all 上傳
