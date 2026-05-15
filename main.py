@@ -102,6 +102,22 @@ logger = logging.getLogger("line_bot")
 
 app = FastAPI()
 
+# Optional jobs router (n8n / external scheduler trigger surface).
+# Feature flag: JOBS_ROUTES_ENABLED=1 enables /jobs/* endpoints.
+# Load .env explicitly because pydantic-settings doesn't push to os.environ.
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"), override=False)
+except ImportError:
+    pass
+if os.getenv("JOBS_ROUTES_ENABLED") == "1":
+    from jobs_router import router as jobs_router, startup_sweep
+    app.include_router(jobs_router)
+
+    @app.on_event("startup")
+    async def _jobs_startup_sweep():
+        startup_sweep()
+
 _parser = WebhookParser(settings.line_channel_secret)
 
 
