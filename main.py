@@ -2281,6 +2281,48 @@ def _process_pending_on_startup() -> None:
         logger.info("startup: Gemini exhausted, keep pending for next time")
         return
 
+    # LINE 月配額爆時整個 startup processor skip：發送一定 fail，白燒 Gemini token
+    # 留 pending 給 _reply 內的 piggyback 機制慢慢消化（reply 免費，不計月配額）
+    # Fail-closed：API check 失敗也 skip，避免不確定狀態下浪費 Gemini
+    try:
+        import requests as _req
+        from line_token_refresh import get_line_token as _glt
+        _tok = _glt()
+        if _tok:
+            _h = {"Authorization": f"Bearer {_tok}"}
+            _ru = _req.get(
+                "https://api.line.me/v2/bot/message/quota/consumption",
+                headers=_h, timeout=5,
+            )
+            _rl = _req.get(
+                "https://api.line.me/v2/bot/message/quota",
+                headers=_h, timeout=5,
+            )
+            if _ru.ok and _rl.ok:
+                _used = _ru.json().get("totalUsage", 0)
+                _limit = _rl.json().get("value", 200)
+                if _used >= _limit:
+                    logger.info(
+                        "startup pending: LINE quota %d/%d exhausted, defer to piggyback",
+                        _used, _limit,
+                    )
+                    return
+            else:
+                logger.warning(
+                    "startup pending: LINE quota API non-200 (used=%s limit=%s), fail-closed skip",
+                    _ru.status_code, _rl.status_code,
+                )
+                return
+        else:
+            logger.warning("startup pending: no LINE token, fail-closed skip")
+            return
+    except Exception as _e:
+        logger.warning(
+            "startup pending: LINE quota precheck failed, fail-closed skip: %s",
+            str(_e)[:120],
+        )
+        return
+
     for group_id, items in list(pending.items()):
         if isinstance(items, dict):  # 舊格式相容
             items = [items]
@@ -3289,11 +3331,14 @@ def _pop_pending_for_piggyback(group_id: str) -> str | None:
     if not items:
         return None
 
-    batch = [
+    # 漸進式：每次只 pop 1 條 text pending（user 偏好慢消化）
+    # 先 filter type=text 再 slice [:1]，避免 PDF/audio 卡在 head 擋住後面 text
+    _text_items = [
         it
-        for it in items[:5]
+        for it in items
         if it.get("type") == "text" and (it.get("text") or "").strip()
     ]
+    batch = _text_items[:1]
     if not batch:
         # 非文字批次直接跳過（不處理）
         return None
@@ -3354,18 +3399,27 @@ def _reply(reply_token: str, text: str, group_id: str | None = None) -> None:
         )
         return
 
-    # push 額度耗盡時，偷塞 pending 進同一則 reply_message（免費）
-    # LINE reply_message 上限 5 則 → 1 則實回覆 + 最多 4 則 piggyback
-    # 「能塞多少塞多少」：迴圈 pop pending 直到滿載或 pending 空
+    # 額度耗盡時，偷塞 pending 進同一則 reply_message（免費）
+    # LINE reply_message 上限 5 則 → 1 則實回覆 + 最多 1 則 piggyback（漸進式）
+    # 「漸進 1 條 pending」：user 偏好慢慢補不要 spam
     messages_to_send: list = [TextMessage(text=text)]
     if group_id:
-        for _ in range(4):
+        for _ in range(1):
             if _quota_exhausted():
+                logger.info("piggyback skip: gemini exhausted group=%s", group_id)
                 break
             pig = _pop_pending_for_piggyback(group_id)
             if not pig:
+                # 區分「沒 pending」vs「pending 全是 non-text」(PDF/audio stuck)
+                pending_count = len(_load_pending_explicit().get(group_id, []))
+                if pending_count > 0:
+                    logger.info(
+                        "piggyback skip: pending=%d but all non-text or llm failed group=%s",
+                        pending_count, group_id,
+                    )
                 break
             messages_to_send.append(TextMessage(text=pig[:5000]))
+            logger.info("piggyback popped 1 group=%s pig_len=%d", group_id, len(pig))
 
     resp = None
     try:
