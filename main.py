@@ -1937,11 +1937,9 @@ def _handle_file_message(event: MessageEvent, group_id: str) -> None:
         )
         return
 
-    if _quota_exhausted():
-        logger.info("file handler skipped Gemini (cached quota exhausted)")
-        _reply(event.reply_token, _quota_exhausted_message(), group_id=group_id)
-        return
-
+    # 2026-05-16 改：刪 quota 短路。所有 file 路徑都應該嘗試 local fallback —
+    # local LLM / vision / OCR 不受 Gemini quota 限制，能跑就跑。
+    # 對齊 feedback_quota_fallback_never_skip.md (binary input 也不該無聲)
     try:
         data = _download_content(msg.id)
     except Exception as e:
@@ -1955,6 +1953,58 @@ def _handle_file_message(event: MessageEvent, group_id: str) -> None:
 
     # ── PDF / 圖片 → 直接送 bytes Part 給 Gemini ──────────────────────────────
     if is_native:
+        # quota 爆時走純本機 fallback：image → media_pipeline.analyze_image (mlx-vlm+OCR)；
+        # PDF → pypdf 抽文字 → _llm_chat (自帶 fallback chain)
+        if _quota_exhausted():
+            reply_text = None
+            if mime_type.startswith("image/"):
+                try:
+                    from media_pipeline import analyze_image
+                    reply_text = analyze_image(
+                        data, user_prompt=f"使用者傳了「{file_name}」這張圖，請分析"
+                    )
+                    logger.info(
+                        "file image local fallback: %s -> %d chars",
+                        file_name, len(reply_text or ""),
+                    )
+                except Exception as e:
+                    logger.warning("file image local fallback failed: %s", e)
+            elif mime_type == "application/pdf":
+                try:
+                    from pypdf import PdfReader
+                    import io
+                    reader = PdfReader(io.BytesIO(data))
+                    content = "\n".join(
+                        (p.extract_text() or "") for p in reader.pages[:30]
+                    )
+                    if content.strip():
+                        content = content[:_TEXT_CHAR_LIMIT]
+                        prompt_text = (
+                            f"(使用者傳了 PDF：{file_name})\n\n"
+                            f"--- 內容開始 ---\n{content}\n--- 內容結束 ---\n\n"
+                            "請分析這個檔案的內容並回應。"
+                        )
+                        with _thinking_indicator(group_id):
+                            reply_text = _llm_chat(prompt_text, context, facts, pnotes)
+                        logger.info(
+                            "file pdf local fallback: %s -> %d pages, %d chars text, reply %d chars",
+                            file_name, len(reader.pages), len(content), len(reply_text or ""),
+                        )
+                    else:
+                        logger.info("pdf local fallback: %s 抽不到文字 (可能是 scanned)", file_name)
+                except Exception as e:
+                    logger.warning("file pdf local fallback failed: %s", e)
+            if reply_text and reply_text.strip():
+                memory.append_turn(group_id, "user", f"[file: {file_name}]")
+                memory.append_turn(group_id, "bot", reply_text)
+                _maybe_extract_facts(group_id)
+                _reply(event.reply_token, reply_text, group_id=group_id)
+            else:
+                # local 也失敗（scanned PDF 抽不到 / vision LLM 掛了）才友善訊息
+                _reply(event.reply_token, _quota_exhausted_message(), group_id=group_id)
+            return
+
+        # quota OK → Gemini Part bytes
         from google.genai import types as _gtypes
 
         parts = [
