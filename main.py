@@ -1339,11 +1339,10 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
     # URL 預抓取：先用 Python 抓網頁內容塞進 prompt，繞過 Gemini url_context 的限制
     user_input = _prefetch_urls(user_input)
 
-    # quota 爆時早在 _handle_event 層級已存 pending，這裡不會到（但以防萬一短路）
-    if _quota_exhausted():
-        logger.info("explicit reply skipped Gemini (cached quota exhausted)")
-        return
-
+    # 2026-05-16 修：刪掉 quota 短路。
+    # Gemini quota 爆時 _llm_chat 內部會自動走 llm_router.fallback_chat
+    # (local LLM → RAG → lite_reply) 4-tier waterfall；不能在這層 return，
+    # 否則家人 @咪寶時 bot 會完全沉默。
     context = memory.get_context(group_id)
     facts = memory.top_facts(group_id, user_id=sender_user_id)
     pnotes = _get_persona_notes(group_id)
@@ -1379,12 +1378,12 @@ def _handle_burst_flush(group_id: str, combined_text: str, reply_token: str) -> 
         len(combined_text),
     )
 
-    # 短路 1：cache 已知 quota 爆 → 靜默跳過
-    if _quota_exhausted():
-        logger.info("burst flush skipped Gemini (cached quota exhausted)")
-        return
+    # 2026-05-16 修：刪掉 quota 短路。
+    # 之前在 quota 爆時直接 return 違反 docstring 寫的「會回應的情境不能靜默」原則，
+    # 也讓 llm_router.fallback_chat 4-tier waterfall（local LLM → RAG → lite_reply）
+    # 完全沒機會啟動。改成繼續走 _llm_chat，由它內部判斷走 Gemini 還是 fallback。
 
-    # 短路 2：謠言快取命中 → 直接回，省 quota
+    # cache 命中：謠言快取直接回，省 LLM 呼叫
     cached = memory.check_fact_cache(group_id, combined_text)
     if cached:
         logger.info("burst flush cache hit group=%s", group_id)
