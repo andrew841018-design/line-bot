@@ -1961,7 +1961,13 @@ def _handle_file_message(event: MessageEvent, group_id: str) -> None:
                 try:
                     from media_pipeline import analyze_image
                     reply_text = analyze_image(
-                        data, user_prompt=f"使用者傳了「{file_name}」這張圖，請分析"
+                        data,
+                        user_prompt=(
+                            "請用繁體中文分析這張圖的內容、主題、可見文字，"
+                            "第一句必須是具體判斷或結論，"
+                            "不要以「使用者」「我看到」「咪寶」「這張圖」等空話開頭。"
+                            f"\n\n[檔名：{file_name}]"
+                        ),
                     )
                     logger.info(
                         "file image local fallback: %s -> %d chars",
@@ -1974,24 +1980,62 @@ def _handle_file_message(event: MessageEvent, group_id: str) -> None:
                     from pypdf import PdfReader
                     import io
                     reader = PdfReader(io.BytesIO(data))
+                    total_pages = len(reader.pages)
                     content = "\n".join(
                         (p.extract_text() or "") for p in reader.pages[:30]
                     )
                     if content.strip():
+                        # 抽到文字 → 走 local LLM；prompt 把檔名收尾 metadata，
+                        # 開頭明確指示避免 local 14B echo opener (規則 0 違規)
                         content = content[:_TEXT_CHAR_LIMIT]
-                        prompt_text = (
-                            f"(使用者傳了 PDF：{file_name})\n\n"
-                            f"--- 內容開始 ---\n{content}\n--- 內容結束 ---\n\n"
-                            "請分析這個檔案的內容並回應。"
+                        page_note = (
+                            f"（PDF 共 {total_pages} 頁，只看前 30 頁）"
+                            if total_pages > 30 else ""
                         )
-                        with _thinking_indicator(group_id):
-                            reply_text = _llm_chat(prompt_text, context, facts, pnotes)
+                        prompt_text = (
+                            "請根據以下 PDF 內容做分析回應，用繁體中文，"
+                            "第一句必須是具體判斷或結論，"
+                            "不要以「使用者」「我看到」「咪寶」「這份檔案」等空話開頭。\n\n"
+                            f"--- PDF 內容開始 ---\n{content}\n--- PDF 內容結束 ---\n\n"
+                            f"[檔名：{file_name}]{page_note}"
+                        )
+                        reply_text = _llm_chat(prompt_text, context, facts, pnotes)
                         logger.info(
                             "file pdf local fallback: %s -> %d pages, %d chars text, reply %d chars",
-                            file_name, len(reader.pages), len(content), len(reply_text or ""),
+                            file_name, total_pages, len(content), len(reply_text or ""),
                         )
                     else:
-                        logger.info("pdf local fallback: %s 抽不到文字 (可能是 scanned)", file_name)
+                        # 抽不到文字 (scanned PDF) → rasterize 第一頁走 vision (per user 2026-05-16)
+                        logger.info(
+                            "pdf local fallback: %s 抽不到文字 → rasterize page 0 走 analyze_image",
+                            file_name,
+                        )
+                        try:
+                            import fitz
+                            doc = fitz.open(stream=data, filetype="pdf")
+                            fitz_pages = len(doc)
+                            if fitz_pages > 0:
+                                pix = doc[0].get_pixmap(dpi=150)
+                                img_bytes = pix.tobytes("png")
+                                doc.close()
+                                from media_pipeline import analyze_image
+                                reply_text = analyze_image(
+                                    img_bytes,
+                                    user_prompt=(
+                                        f"這是 scanned PDF「{file_name}」的第一頁。"
+                                        "請分析內容，第一句必須是具體判斷，"
+                                        "不要以「使用者」「我看到」「咪寶」開頭。"
+                                    ),
+                                )
+                                if reply_text and fitz_pages > 1:
+                                    reply_text = (
+                                        f"{reply_text}\n\n"
+                                        f"（scanned PDF 共 {fitz_pages} 頁，只分析第一頁）"
+                                    )
+                            else:
+                                doc.close()
+                        except Exception as e:
+                            logger.warning("pdf rasterize fallback failed: %s", e)
                 except Exception as e:
                     logger.warning("file pdf local fallback failed: %s", e)
             if reply_text and reply_text.strip():
