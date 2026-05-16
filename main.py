@@ -3415,11 +3415,11 @@ def _reply(reply_token: str, text: str, group_id: str | None = None) -> None:
         return
 
     # 額度耗盡時，偷塞 pending 進同一則 reply_message（免費）
-    # LINE reply_message 上限 5 則 → 1 則實回覆 + 最多 1 則 piggyback（漸進式）
-    # 「漸進 1 條 pending」：user 偏好慢慢補不要 spam
+    # LINE reply_message 上限 5 則 → 1 則實回覆 + 最多 4 則 piggyback
+    # 2026-05-16 改：從 1 提到 4，加速 pending drain（quota 爆等月初重置這種長窗期）
     messages_to_send: list = [TextMessage(text=text)]
     if group_id:
-        for _ in range(1):
+        for _ in range(4):
             if _quota_exhausted():
                 logger.info("piggyback skip: gemini exhausted group=%s", group_id)
                 break
