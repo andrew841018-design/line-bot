@@ -3581,50 +3581,223 @@ def _md_to_line(text: str) -> str:
 
 
 def _pop_pending_for_piggyback(group_id: str) -> str | None:
-    """pending 有訊息且 push 額度耗盡時，從佇列頭取最多 5 則文字，
-    生成回覆，格式化成可附在 reply_message 裡的第 2 則訊息。
-    成功回格式化字串並從 pending 移除；失敗回 None，pending 不動。"""
+    """pending 有訊息時，從佇列頭取 1 則處理生回覆，格式化成 piggyback 訊息。
+
+    優先序：
+      1. text pending（每次 1 條，慢消化）
+      2. 沒 text → file pending（PDF/Office/image，走 local fallback，每次 1 個）
+
+    成功回格式化字串並從 pending 移除；失敗回 None，pending 不動。
+    """
     pending = _load_pending_explicit()
     items = pending.get(group_id, [])
     if not items:
         return None
 
-    # 漸進式：每次只 pop 1 條 text pending（user 偏好慢消化）
-    # 先 filter type=text 再 slice [:1]，避免 PDF/audio 卡在 head 擋住後面 text
+    facts = memory.top_facts(group_id)
+    context = memory.get_context(group_id)
+    pnotes = _get_persona_notes(group_id)
+
+    # ── 1. text pending（user 偏好慢消化）─────────────────────────────────
     _text_items = [
         it
         for it in items
         if it.get("type") == "text" and (it.get("text") or "").strip()
     ]
     batch = _text_items[:1]
-    if not batch:
-        # 非文字批次直接跳過（不處理）
+    if batch:
+        original = "\n".join(it["text"].strip() for it in batch)
+        try:
+            reply_text = _llm_chat(original, context, facts, pnotes)
+        except Exception:
+            return None
+        if not reply_text:
+            return None
+        processed_ids = {it.get("message_id") for it in batch}
+        pending[group_id] = [
+            it for it in items if it.get("message_id") not in processed_ids
+        ]
+        if not pending[group_id]:
+            del pending[group_id]
+        _save_pending_explicit_raw(pending)
+        orig_preview = original[:300] + ("…" if len(original) > 300 else "")
+        reply_preview = _md_to_line(reply_text)
+        return f"📬 補回之前漏掉的訊息\n\n原文：\n{orig_preview}\n\n回應：\n{reply_preview}"
+
+    # ── 2. file pending（PDF/Office/image 走 local fallback）──────────────
+    _file_items = [
+        it
+        for it in items
+        if it.get("type") == "file"
+        and it.get("media_path")
+        and os.path.exists(it["media_path"])
+    ]
+    file_batch = _file_items[:1]
+    if not file_batch:
         return None
 
-    original = "\n".join(it["text"].strip() for it in batch)
+    file_item = file_batch[0]
+    file_name = file_item.get("file_name", "unknown")
+    media_path = file_item["media_path"]
     try:
-        facts = memory.top_facts(group_id)
-        context = memory.get_context(group_id)
-        pnotes = _get_persona_notes(group_id)
-        reply_text = _llm_chat(original, context, facts, pnotes)
-    except Exception:
+        with open(media_path, "rb") as f:
+            data = f.read()
+    except Exception as e:
+        logger.warning("drain pending file read failed: %s", e)
         return None
 
-    if not reply_text:
+    reply_text = _drain_pending_file(data, file_name, group_id, context, facts, pnotes)
+    if not reply_text or not reply_text.strip():
         return None
 
-    # 移出 pending（只移成功處理的 5 則）
-    processed_ids = {it.get("message_id") for it in batch}
+    # 移出 pending + 刪 media_path 檔
+    processed_ids = {file_item.get("message_id")}
     pending[group_id] = [
         it for it in items if it.get("message_id") not in processed_ids
     ]
     if not pending[group_id]:
         del pending[group_id]
     _save_pending_explicit_raw(pending)
+    try:
+        os.remove(media_path)
+    except Exception as e:
+        logger.warning("drain pending file: remove media_path failed: %s", e)
 
-    orig_preview = original[:300] + ("…" if len(original) > 300 else "")
-    reply_preview = _md_to_line(reply_text)
-    return f"📬 補回之前漏掉的訊息\n\n原文：\n{orig_preview}\n\n回應：\n{reply_preview}"
+    reply_preview = _md_to_line(reply_text)[:1500]
+    return f"📬 補回之前漏掉的檔案 [{file_name}]\n\n回應：\n{reply_preview}"
+
+
+def _drain_pending_file(
+    data: bytes,
+    file_name: str,
+    group_id: str,
+    context: list,
+    facts: list,
+    pnotes: list | None,
+) -> str | None:
+    """drain pending file → 回 reply_text。對齊 _handle_file_message 的 quota 爆 fallback：
+
+    - image → media_pipeline.analyze_image (mlx-vlm + OCR)
+    - PDF → pypdf 抽文字 → _llm_chat (fallback chain)；scanned PDF rasterize 走 vision
+    - Office (docx/xlsx/pptx) → _extract_office_text → _llm_chat
+    - text/* → decode → _llm_chat
+
+    任何失敗回 None，caller 不移 pending（下次 retry）。
+    """
+    mime_type = _guess_mime_type(file_name)
+    ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
+
+    # image
+    if mime_type.startswith("image/"):
+        try:
+            from media_pipeline import analyze_image
+            return analyze_image(
+                data,
+                user_prompt=(
+                    "請用繁體中文分析這張圖的內容、主題、可見文字，"
+                    "第一句必須是具體判斷或結論，"
+                    "不要以「使用者」「我看到」「咪寶」「這張圖」等空話開頭。"
+                    f"\n\n[檔名：{file_name}]"
+                ),
+            )
+        except Exception as e:
+            logger.warning("drain image fallback failed: %s", e)
+            return None
+
+    # PDF
+    if mime_type == "application/pdf":
+        try:
+            from pypdf import PdfReader
+            import io
+            reader = PdfReader(io.BytesIO(data))
+            total_pages = len(reader.pages)
+            content = "\n".join(
+                (p.extract_text() or "") for p in reader.pages[:30]
+            )
+            if content.strip():
+                content = content[:_TEXT_CHAR_LIMIT]
+                page_note = (
+                    f"（PDF 共 {total_pages} 頁，只看前 30 頁）"
+                    if total_pages > 30 else ""
+                )
+                prompt_text = (
+                    "請根據以下 PDF 內容做分析回應，用繁體中文，"
+                    "第一句必須是具體判斷或結論，"
+                    "不要以「使用者」「我看到」「咪寶」「這份檔案」等空話開頭。\n\n"
+                    f"--- PDF 內容開始 ---\n{content}\n--- PDF 內容結束 ---\n\n"
+                    f"[檔名：{file_name}]{page_note}"
+                )
+                return _llm_chat(prompt_text, context, facts, pnotes)
+            # scanned PDF → rasterize 第一頁
+            if len(data) > 50 * 1024 * 1024:
+                logger.info("drain pdf rasterize skip: %s 太大", file_name)
+                return None
+            try:
+                import fitz
+                doc = fitz.open(stream=data, filetype="pdf")
+                fitz_pages = len(doc)
+                img_bytes = None
+                try:
+                    if fitz_pages > 0:
+                        pix = doc[0].get_pixmap(dpi=150)
+                        try:
+                            img_bytes = pix.tobytes("png")
+                        finally:
+                            pix = None
+                finally:
+                    doc.close()
+                if img_bytes:
+                    from media_pipeline import analyze_image
+                    desc = analyze_image(
+                        img_bytes,
+                        user_prompt=(
+                            f"這是 scanned PDF「{file_name}」的第一頁。"
+                            "請分析內容，第一句必須是具體判斷，"
+                            "不要以「使用者」「我看到」「咪寶」開頭。"
+                        ),
+                    )
+                    if desc and fitz_pages > 1:
+                        return f"{desc}\n\n（scanned PDF 共 {fitz_pages} 頁，只分析第一頁）"
+                    return desc
+            except Exception as e:
+                logger.warning("drain pdf rasterize failed: %s", e)
+            return None
+        except Exception as e:
+            logger.warning("drain pdf fallback failed: %s", e)
+            return None
+
+    # Office
+    if ext in ("docx", "xlsx", "xls", "pptx"):
+        content = _extract_office_text(data, file_name)
+        if not content or not content.strip():
+            return None
+        content = content[:_TEXT_CHAR_LIMIT]
+        prompt_text = (
+            "請根據以下檔案內容做分析回應，用繁體中文，"
+            "第一句必須是具體判斷或結論。\n\n"
+            f"--- 內容開始 ---\n{content}\n--- 內容結束 ---\n\n"
+            f"[檔名：{file_name}]"
+        )
+        return _llm_chat(prompt_text, context, facts, pnotes)
+
+    # text/*
+    if mime_type.startswith("text/"):
+        try:
+            content = data.decode("utf-8", errors="replace")
+        except Exception:
+            return None
+        if not content.strip():
+            return None
+        content = content[:_TEXT_CHAR_LIMIT]
+        prompt_text = (
+            "請根據以下檔案內容做分析回應，用繁體中文，"
+            "第一句必須是具體判斷或結論。\n\n"
+            f"--- 內容開始 ---\n{content}\n--- 內容結束 ---\n\n"
+            f"[檔名：{file_name}]"
+        )
+        return _llm_chat(prompt_text, context, facts, pnotes)
+
+    return None
 
 
 def _reply(reply_token: str, text: str, group_id: str | None = None) -> None:
