@@ -1092,12 +1092,19 @@ def _handle_event(event) -> None:
         _handle_text_message(event, group_id)
         return
 
-    # 圖片：只記 placeholder，不 OCR 也不回應。
+    # 2026-05-16 改：圖片/影片走 A+B 雙路徑。
+    # A: 同步存 pending（webhook 路徑保證不丟資料）
+    # B: 非同步 _MEDIA_EXECUTOR (cap 2) 跑 local analyze → reply → remove pending
+    # B 失敗（local 跑掛 / timeout / reply 失敗）→ pending 保留給 cron retry worker drain
     if isinstance(msg, ImageMessageContent):
         memory.log_raw_message(group_id, msg.id, sender_user_id, "[圖片]")
+        _save_pending_any(event, group_id, sender_user_id, msg)
+        _MEDIA_EXECUTOR.submit(_handle_image_message, event, group_id)
         return
     if isinstance(msg, VideoMessageContent):
         memory.log_raw_message(group_id, msg.id, sender_user_id, "[影片]")
+        _save_pending_any(event, group_id, sender_user_id, msg)
+        _MEDIA_EXECUTOR.submit(_handle_video_message, event, group_id)
         return
     if isinstance(msg, AudioMessageContent):
         memory.log_raw_message(group_id, msg.id, sender_user_id, "[音訊]")
@@ -1143,6 +1150,93 @@ def _handle_audio_message(event: MessageEvent, group_id: str) -> None:
     memory.append_turn(group_id, "bot", reply_text)
     _maybe_extract_facts(group_id)
     _reply(event.reply_token, reply_text, group_id=group_id)
+
+
+def _handle_image_message(event, group_id):
+    """Pure-local image handler. Runs in _MEDIA_EXECUTOR (cap 2 concurrent).
+
+    Flow: download → media_pipeline.analyze_image (50s hard timeout per GP1 §2,
+    because reply_token TTL is ~1 min) → reply → remove from pending. On any
+    failure, leave the pending entry for the cron retry worker to drain later.
+    """
+    import threading as _threading
+    msg_id = event.message.id
+    try:
+        data = _download_content(msg_id)
+    except Exception as e:
+        logger.warning("image download failed for handler: %s", e)
+        return
+    if len(data) > _MEDIA_BYTE_LIMIT:
+        logger.info("image too large for handler: %d bytes", len(data))
+        return
+
+    holder = {"reply": None}
+
+    def _run():
+        try:
+            import media_pipeline
+            holder["reply"] = media_pipeline.analyze_image(bytes(data))
+        except Exception as e:
+            logger.warning("image analyze failed: %s", e)
+
+    t = _threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=50)
+    if t.is_alive():
+        logger.info("image analyze timeout (>50s), leaving pending for retry worker")
+        return
+    reply_text = holder["reply"]
+    if not reply_text or not reply_text.strip():
+        logger.info("image analyze returned empty, leaving pending")
+        return
+    memory.append_turn(group_id, "user", "[圖片]")
+    memory.append_turn(group_id, "bot", reply_text)
+    try:
+        _reply(event.reply_token, reply_text, group_id=group_id)
+        _remove_pending_by_msg_id(group_id, msg_id)
+    except Exception as e:
+        logger.warning("image reply failed: %s", e)
+
+
+def _handle_video_message(event, group_id):
+    """Pure-local video handler. Same shape as _handle_image_message."""
+    import threading as _threading
+    msg_id = event.message.id
+    try:
+        data = _download_content(msg_id)
+    except Exception as e:
+        logger.warning("video download failed for handler: %s", e)
+        return
+    if len(data) > _MEDIA_BYTE_LIMIT:
+        logger.info("video too large for handler: %d bytes", len(data))
+        return
+
+    holder = {"reply": None}
+
+    def _run():
+        try:
+            import media_pipeline
+            holder["reply"] = media_pipeline.analyze_video(bytes(data))
+        except Exception as e:
+            logger.warning("video analyze failed: %s", e)
+
+    t = _threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=50)
+    if t.is_alive():
+        logger.info("video analyze timeout (>50s), leaving pending for retry worker")
+        return
+    reply_text = holder["reply"]
+    if not reply_text or not reply_text.strip():
+        logger.info("video analyze returned empty, leaving pending")
+        return
+    memory.append_turn(group_id, "user", "[影片]")
+    memory.append_turn(group_id, "bot", reply_text)
+    try:
+        _reply(event.reply_token, reply_text, group_id=group_id)
+        _remove_pending_by_msg_id(group_id, msg_id)
+    except Exception as e:
+        logger.warning("video reply failed: %s", e)
 
 
 def _handle_text_message(event: MessageEvent, group_id: str) -> None:
@@ -1502,6 +1596,11 @@ _MEDIA_PLACEHOLDERS: dict[str, tuple[str, str]] = {
 
 # 單次可下載的媒體上限（LINE 上傳原本就有限制，這裡做二層保護）
 _MEDIA_BYTE_LIMIT = 20 * 1024 * 1024  # 20 MB
+
+# Bounded worker pool for image/video webhook handlers (GP1 §6: thread leak guard).
+# webhook arrival rate * vision LLM latency could exhaust threads → cap at 2 concurrent.
+from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
+_MEDIA_EXECUTOR = _ThreadPoolExecutor(max_workers=2, thread_name_prefix="media-handler")
 
 
 def _media_pipeline_fallback(
@@ -2046,17 +2145,14 @@ _PENDING_MEDIA_DIR = os.path.join(os.path.dirname(__file__), "pending_media")
 
 
 def _load_pending_explicit() -> dict:
-    try:
-        with open(_PENDING_EXPLICIT_PATH) as f:
-            return _json.load(f)
-    except Exception:
-        return {}
+    import pending_store as _ps
+    return _ps.load()
 
 
 def _save_pending_explicit_raw(data: dict) -> None:
+    import pending_store as _ps
     try:
-        with open(_PENDING_EXPLICIT_PATH, "w") as f:
-            _json.dump(data, f, ensure_ascii=False)
+        _ps.save_full(data)
     except Exception as e:
         logger.warning("save pending raw failed: %s", str(e)[:200])
 
@@ -2084,6 +2180,40 @@ def _save_pending_any(event, group_id: str, user_id: str | None, msg) -> None:
                 raw = memory.get_raw_message(group_id, qid)
                 if raw:
                     entry["quoted_original"] = raw[1]
+
+        elif isinstance(msg, ImageMessageContent):
+            entry["type"] = "image"
+            try:
+                content = _download_content(msg.id)
+                if len(content) > _MEDIA_BYTE_LIMIT:
+                    logger.info("image too large for pending: %d bytes", len(content))
+                    entry["download_failed"] = True
+                else:
+                    os.makedirs(_PENDING_MEDIA_DIR, exist_ok=True)
+                    path = os.path.join(_PENDING_MEDIA_DIR, f"{_uuid.uuid4().hex}.jpg")
+                    with open(path, "wb") as f:
+                        f.write(bytes(content))
+                    entry["media_path"] = path
+            except Exception as e:
+                logger.warning("download image for pending failed: %s", e)
+                entry["download_failed"] = True
+
+        elif isinstance(msg, VideoMessageContent):
+            entry["type"] = "video"
+            try:
+                content = _download_content(msg.id)
+                if len(content) > _MEDIA_BYTE_LIMIT:
+                    logger.info("video too large for pending: %d bytes", len(content))
+                    entry["download_failed"] = True
+                else:
+                    os.makedirs(_PENDING_MEDIA_DIR, exist_ok=True)
+                    path = os.path.join(_PENDING_MEDIA_DIR, f"{_uuid.uuid4().hex}.mp4")
+                    with open(path, "wb") as f:
+                        f.write(bytes(content))
+                    entry["media_path"] = path
+            except Exception as e:
+                logger.warning("download video for pending failed: %s", e)
+                entry["download_failed"] = True
 
         elif isinstance(msg, FileMessageContent):
             entry["type"] = "file"
@@ -2133,6 +2263,18 @@ def _clear_pending_explicit(group_id: str) -> None:
                 pass
     data.pop(group_id, None)
     _save_pending_explicit_raw(data)
+
+
+def _remove_pending_by_msg_id(group_id: str, message_id: str) -> bool:
+    """Idempotent removal of a single pending entry by message_id. Goes through
+    pending_store (fcntl + RLock + atomic) so safe across handler thread + cron
+    subprocess. Returns whether something was removed."""
+    try:
+        import pending_store as _ps
+        return _ps.remove_by_message_id(group_id, message_id)
+    except Exception as e:
+        logger.warning("remove pending by msg_id failed: %s", str(e)[:200])
+        return False
 
 
 def _heuristic_group_messages(items: list[dict]) -> list[dict]:

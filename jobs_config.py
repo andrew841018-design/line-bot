@@ -113,3 +113,12 @@ JOB_REGISTRY["job-scraper-daily"] = JobSpec(
     timeout=180,
     description="Daily 09:30 job scraper",
 )
+
+
+JOB_REGISTRY["process-pending-media"] = JobSpec(
+    command=[_LB_VENV, f"{_DATA_ENG}/line_bot/jobs/process_pending_media.py"],
+    cwd=f"{_DATA_ENG}/line_bot",
+    env={"PATH": _BASE_PATH, "HOME": "/Users/andrew", "USER": "andrew", "LOGNAME": "andrew"},
+    timeout=600,
+    description="6-hourly retry: drain pending (text/image/video/audio/file) via local LLM",
+)
