@@ -25,6 +25,18 @@ UVICORN_UP=0
 CF_UP=0
 pgrep -f "uvicorn.*main:app" >/dev/null 2>&1 && UVICORN_UP=1
 pgrep -f "cloudflared tunnel" >/dev/null 2>&1 && CF_UP=1
+
+# 殭屍偵測：pgrep 活但 /health 死（import error / hung）→ 強制走重啟分支
+# 純 pgrep 抓不到「process 活但 listen 卡住」這類隱性故障
+if [ $UVICORN_UP -eq 1 ]; then
+  HC=$(curl -s -o /dev/null -w "%{http_code}" --interface lo0 --max-time 3 \
+    http://127.0.0.1:$PORT/health 2>/dev/null || echo "000")
+  if [ "$HC" != "200" ]; then
+    say "uvicorn pgrep UP but /health=$HC → treating as DOWN (zombie)"
+    UVICORN_UP=0
+  fi
+fi
+
 say "uvicorn=$([ $UVICORN_UP -eq 1 ] && echo UP || echo DOWN)  cloudflared=$([ $CF_UP -eq 1 ] && echo UP || echo DOWN)"
 
 PT_TODAY=$(TZ='America/Los_Angeles' date '+%m-%d')
@@ -41,7 +53,7 @@ if [ $UVICORN_UP -eq 0 ]; then
     ACTION="skipped_restart_quota_likely_exhausted"
     say "uvicorn DOWN but 429>=$MAX_429_PER_DAY; skipping restart"
   else
-    say "uvicorn DOWN; attempting restart (uvicorn only, cloudflared untouched)"
+    say "uvicorn DOWN; attempting restart (with flock to avoid race w/ monitor)"
     cd "$BOT_DIR" || { say "ERR cd failed"; exit 1; }
 
     if [ ! -x .venv/bin/uvicorn ]; then
@@ -51,20 +63,42 @@ if [ $UVICORN_UP -eq 0 ]; then
       say "ERR .env missing"
       ACTION="restart_failed_no_env"
     else
-      nohup .venv/bin/uvicorn main:app --host 127.0.0.1 --port $PORT \
-        >> "$UVICORN_LOG" 2>&1 &
-      NEW_PID=$!
-      disown $NEW_PID 2>/dev/null || true
-      say "spawned uvicorn PID=$NEW_PID, waiting 5s..."
-      sleep 5
+      # flock 防 ops/monitors/line_bot.py 同時重啟造成 Errno 48 race
+      # -n = non-blocking, -w 30 = 等 30s 拿不到鎖就放棄
+      (
+        flock -w 30 9 || { say "ERR flock timeout (monitor 正在重啟)"; exit 1; }
 
-      HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 \
-        http://127.0.0.1:$PORT/ 2>/dev/null || echo "000")
-      say "post-restart HTTP=$HTTP_CODE"
+        # 殭屍升級：TERM → 2s → KILL → 1s 確保 port 釋放
+        say "pkill -TERM uvicorn..."
+        pkill -TERM -f "uvicorn main:app" 2>/dev/null || true
+        sleep 2
+        if pgrep -f "uvicorn.*main:app" >/dev/null 2>&1; then
+          say "uvicorn 仍存活, pkill -KILL..."
+          pkill -KILL -f "uvicorn main:app" 2>/dev/null || true
+          sleep 1
+        fi
 
-      case "$HTTP_CODE" in
-        2*|3*|4*) ACTION="restart_success_http_$HTTP_CODE" ;;
-        *)        ACTION="restart_failed_http_$HTTP_CODE" ;;
+        nohup .venv/bin/uvicorn main:app --host 127.0.0.1 --port $PORT \
+          >> "$UVICORN_LOG" 2>&1 &
+        NEW_PID=$!
+        disown $NEW_PID 2>/dev/null || true
+        say "spawned uvicorn PID=$NEW_PID, waiting 5s..."
+        sleep 5
+
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 \
+          http://127.0.0.1:$PORT/health 2>/dev/null || echo "000")
+        say "post-restart /health HTTP=$HTTP_CODE"
+
+        case "$HTTP_CODE" in
+          200) echo "ok" > /tmp/line_bot_restart.result ;;
+          *)   echo "fail_$HTTP_CODE" > /tmp/line_bot_restart.result ;;
+        esac
+      ) 9>/tmp/line_bot_restart.lock
+
+      RESULT=$(cat /tmp/line_bot_restart.result 2>/dev/null || echo "fail_no_result")
+      case "$RESULT" in
+        ok) ACTION="restart_success_http_200" ;;
+        *)  ACTION="restart_failed_$RESULT" ;;
       esac
     fi
   fi

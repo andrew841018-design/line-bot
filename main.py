@@ -1939,6 +1939,7 @@ def _handle_file_message(event: MessageEvent, group_id: str) -> None:
 
     if _quota_exhausted():
         logger.info("file handler skipped Gemini (cached quota exhausted)")
+        _reply(event.reply_token, _quota_exhausted_message(), group_id=group_id)
         return
 
     try:
@@ -3041,9 +3042,10 @@ _DINNER_PROMPT = """你是台北美食達人，以善導寺捷運站（台北市
 
 
 def _handle_dinner_recommendation(event: MessageEvent, group_id: str) -> None:
-    if _quota_exhausted():
-        logger.info("dinner recommendation skipped (cached quota exhausted)")
-        return
+    # 2026-05-16 改：刪 quota 短路。dinner prompt 是純 text，llm_router.fallback_chat
+    # 4-tier waterfall (local LLM → RAG → lite_reply) 能處理；對齊
+    # feedback_quota_fallback_never_skip.md。注意 file handler 因含 PDF/image bytes、
+    # _extract_text 會丟，仍保留短路 + 友善訊息（known exception）。
     context = memory.get_context(group_id)
     facts = memory.top_facts(group_id)
     pnotes = _get_persona_notes(group_id)
@@ -3054,9 +3056,14 @@ def _handle_dinner_recommendation(event: MessageEvent, group_id: str) -> None:
         if _is_quota_error(e):
             _mark_quota_exhausted()
             logger.warning("dinner recommendation quota exhausted")
+            _reply(event.reply_token, _quota_exhausted_message(), group_id=group_id)
         else:
             logger.exception("dinner recommendation failed: %s", e)
             _reply(event.reply_token, _friendly_gemini_error(e), group_id=group_id)
+        return
+    if not reply_text or not reply_text.strip():
+        # fallback_chat 全敗回空 → 給使用者明確訊息（不能送空到 LINE SDK）
+        _reply(event.reply_token, "晚餐推薦今天罷工了，等一下再試試", group_id=group_id)
         return
     _reply(event.reply_token, reply_text, group_id=group_id)
 
