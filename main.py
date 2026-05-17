@@ -1086,6 +1086,10 @@ def _handle_event(event) -> None:
     sender_user_id = getattr(event.source, "user_id", None)
 
     # ── quota 爆時：所有訊息都存 pending，等恢復後由 Gemini 分組 + 逐組引用回覆 ──
+    # 2026-05-17 加 (§3 abbreviated chain): 之前的 short-circuit return 把 reply_token
+    # 浪費掉，導致 pending 在 Gemini 爆期間無法 drain。現補 _try_piggyback_drain_with_reply_token
+    # — 在 return 前嘗試用 incoming reply_token bundle 最多 2 條 pending drain 走 local
+    # LLM fallback，免費不耗 LINE 月配額。failure pending 完整保留 (peek-then-confirm)。
     if _quota_exhausted() and isinstance(
         msg, (TextMessageContent, FileMessageContent, AudioMessageContent)
     ):
@@ -1094,6 +1098,7 @@ def _handle_event(event) -> None:
             memory.log_raw_message(group_id, msg.id, sender_user_id, msg.text or "")
             bot_stats.track_message(msg.text or "")
             bot_stats.track_pending_saved()
+        _try_piggyback_drain_with_reply_token(event.reply_token, group_id)
         return
 
     # Piggyback drain：有人留言就順手補該 group 的 pending（throttle + quota gate 在 helper 裡）
@@ -2374,6 +2379,27 @@ def _clear_pending_explicit(group_id: str) -> None:
                 pass
     data.pop(group_id, None)
     _save_pending_explicit_raw(data)
+
+
+def _commit_pending_removal(group_id: str, msg_ids: list[str]) -> int:
+    """Remove specified message_ids from group pending list, atomic save.
+    回 removed 數。給 peek-then-confirm pattern 用 (§3 GP1 C5)。
+    """
+    if not msg_ids:
+        return 0
+    msg_id_set = set(msg_ids)
+    data = _load_pending_explicit()
+    items = data.get(group_id, [])
+    new_items = [it for it in items if it.get("message_id") not in msg_id_set]
+    removed = len(items) - len(new_items)
+    if removed == 0:
+        return 0
+    if not new_items:
+        data.pop(group_id, None)
+    else:
+        data[group_id] = new_items
+    _save_pending_explicit_raw(data)
+    return removed
 
 
 def _dlq_entry(group_id: str, entry: dict, reason: str) -> None:
@@ -3783,6 +3809,140 @@ def _md_to_line(text: str) -> str:
         line = re.sub(r"\[([^\]]+)\]\((https?://[^\)]+)\)", r"\1（\2）", line)
         out.append(line)
     return "\n".join(out)
+
+
+def _peek_text_pending_for_drain(
+    group_id: str, max_count: int, deadline_sec: float
+) -> list[tuple[str, str]]:
+    """Peek up to max_count text pending items, render LLM reply (local fallback OK),
+    return list of (rendered_text, original_msg_id) WITHOUT removing from pending.
+
+    Caller 必須在 reply_message 成功後 call _commit_pending_removal(group_id, msg_ids)
+    才會真的把 entries 從 pending 拿掉 (peek-then-confirm pattern, §3 GP1 C5)。
+
+    Honors deadline_sec — 中途逾時 break。LLM 失敗的 entry skip (不阻塞後續)。
+    純 text；file/image pending 不在此快速路徑處理。
+    """
+    pending = _load_pending_explicit()
+    items = pending.get(group_id, [])
+    text_items = [
+        it for it in items
+        if it.get("type") == "text" and (it.get("text") or "").strip()
+    ]
+    if not text_items:
+        return []
+
+    facts = memory.top_facts(group_id)
+    context = memory.get_context(group_id)
+    pnotes = _get_persona_notes(group_id)
+
+    started = time.time()
+    results: list[tuple[str, str]] = []
+    for item in text_items[:max_count]:
+        if time.time() - started > deadline_sec:
+            logger.info(
+                "peek drain deadline %.1fs hit, stopping at %d/%d items group=%s",
+                deadline_sec, len(results), max_count, group_id,
+            )
+            break
+        original = item["text"].strip()
+        try:
+            reply_text = _llm_chat(original, context, facts, pnotes)
+        except Exception as e:
+            logger.warning("peek drain LLM failed for one item: %s", str(e)[:120])
+            continue
+        if not reply_text:
+            continue
+        orig_preview = original[:300] + ("…" if len(original) > 300 else "")
+        rendered = _md_to_line(reply_text)[:1800]   # 收緊到 1800 (§3 codex Q3 / GP1)
+        formatted = (
+            f"📬 補回之前漏掉的訊息\n\n原文：\n{orig_preview}\n\n回應：\n{rendered}"
+        )
+        results.append((formatted[:4900], item.get("message_id", "")))
+    return results
+
+
+def _try_piggyback_drain_with_reply_token(
+    reply_token: str | None, group_id: str
+) -> None:
+    """Gemini 爆時利用 incoming webhook 的 reply_token，把最多 2 條 pending 透過
+    本機 LLM fallback 生回覆，bundle 進**單一** reply_message API call (LINE 免費，
+    不耗月配額)。peek-then-confirm pattern：reply 失敗 pending 完整保留。
+
+    Critical guards (per §3 codex + GP1 review):
+      - drain lock 跟 _drain_pending_for_group 共用 (避免 race + lost-update)
+      - deadline 6s (webhook 是 async def 但 _handle_event 是 sync call，太久會
+        block uvicorn event loop)
+      - max_count=2 (兩條 local LLM call ≈ 2-10s 內可接受 webhook latency)
+      - peek-then-confirm (reply API fail → pending 不動，下次 webhook 再試)
+      - 中文 char cap 1800 + total reply body 保守上限
+
+    Silent on: 缺 reply_token / bot_muted / 無 pending / drain lock 拿不到 /
+    所有 LLM 失敗 / reply_message API 失敗。
+    """
+    if not reply_token or not group_id:
+        return
+    if settings.bot_muted:
+        return
+    if not _load_pending_explicit().get(group_id):
+        return
+
+    slot = _try_acquire_drain_slot(group_id)
+    if slot is None:
+        logger.info(
+            "quota-exhausted piggyback: another drain in progress group=%s",
+            group_id,
+        )
+        return
+    try:
+        rendered = _peek_text_pending_for_drain(
+            group_id, max_count=2, deadline_sec=6.0
+        )
+        if not rendered:
+            return
+
+        notice = (
+            "📵 咪寶今天 Gemini 額度用完，先用本機模型補回前面漏掉的留言。"
+            "你這則訊息會等額度恢復後再回。"
+        )
+        messages: list = [TextMessage(text=notice)]
+        for text, _msg_id in rendered:
+            messages.append(TextMessage(text=text))
+
+        try:
+            with ApiClient(_get_line_config()) as api_client:
+                MessagingApi(api_client).reply_message(
+                    ReplyMessageRequest(
+                        reply_token=reply_token, messages=messages,
+                    )
+                )
+        except Exception as e:
+            logger.warning(
+                "quota-exhausted piggyback reply failed (pending preserved): %s",
+                str(e)[:200],
+            )
+            return
+
+        # commit：reply 成功才從 pending 移除
+        committed_ids = [msg_id for _, msg_id in rendered if msg_id]
+        _commit_pending_removal(group_id, committed_ids)
+
+        # log bot's own replies + observability
+        import uuid as _uuid
+        for m in messages:
+            txt = getattr(m, "text", "")[:500]
+            uniq = f"piggyback_{_uuid.uuid4().hex[:12]}"
+            memory.log_raw_message(group_id, uniq, "__bot__", txt)
+        try:
+            bot_stats.track_reply("piggyback_local_drain")
+        except Exception:
+            pass
+        logger.info(
+            "quota-exhausted piggyback: drained %d via reply_token group=%s",
+            len(rendered), group_id,
+        )
+    finally:
+        slot.release()
 
 
 def _pop_pending_for_piggyback(group_id: str) -> str | None:
