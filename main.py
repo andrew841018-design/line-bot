@@ -22,6 +22,7 @@ import logging
 import mimetypes
 import os
 import re
+import threading
 import time
 import uuid as _uuid
 from contextlib import contextmanager
@@ -1094,6 +1095,9 @@ def _handle_event(event) -> None:
             bot_stats.track_message(msg.text or "")
             bot_stats.track_pending_saved()
         return
+
+    # Piggyback drain：有人留言就順手補該 group 的 pending（throttle + quota gate 在 helper 裡）
+    _spawn_piggyback_drain(group_id)
 
     # 文字：先記進 raw_messages（供 quote 回查 / burst look-back / Layer 2 抓 trigger）
     if isinstance(msg, TextMessageContent):
@@ -2581,88 +2585,140 @@ def _build_group_parts(items: list[dict], group_id: str) -> list:
     return parts
 
 
-@app.on_event("startup")
-def _process_pending_on_startup() -> None:
-    """uvicorn 啟動時處理所有 pending：分組 → 逐組 LLM 回覆 → 引用推送。
-    Gemini 耗盡時保留 pending 不處理，等 quota 重置後重試。
-    """
-    _load_quota_state()  # 先還原 quota 狀態，再決定要不要跑
-    if settings.bot_muted:
-        return
-    pending = _load_pending_explicit()
-    if not pending:
-        return
-    if _quota_exhausted():
-        logger.info("startup: Gemini exhausted, keep pending for next time")
-        return
+_GLOBAL_GATE_CACHE_TTL_SEC = 60                                # LINE quota API call 60s 內共用結果
+_global_gate_cache: tuple[float, bool] | None = None
+_global_gate_cache_lock = threading.Lock()
 
-    # LINE 月配額爆時整個 startup processor skip：發送一定 fail，白燒 Gemini token
-    # 留 pending 給 _reply 內的 piggyback 機制慢慢消化（reply 免費，不計月配額）
-    # Fail-closed：API check 失敗也 skip，避免不確定狀態下浪費 Gemini
+
+def _global_pending_drain_ready() -> bool:
+    """Drain pending 前的全域 gate：mute / Gemini quota / LINE 月額度。
+
+    True 才可以動。三個 caller（startup / retry worker / piggyback）共用。
+    Fail-closed：API check 失敗一律回 False，避免不確定狀態白燒 Gemini。
+    60 秒 cache 防 cross-group webhook flood 放大 LINE API 呼叫次數。
+    """
+    global _global_gate_cache
+    now = time.time()
+    with _global_gate_cache_lock:
+        if _global_gate_cache and now - _global_gate_cache[0] < _GLOBAL_GATE_CACHE_TTL_SEC:
+            return _global_gate_cache[1]
+
+    _load_quota_state()
+    if settings.bot_muted:
+        with _global_gate_cache_lock:
+            _global_gate_cache = (now, False)
+        return False
+    if _quota_exhausted():
+        logger.info("drain pending: Gemini exhausted, defer")
+        with _global_gate_cache_lock:
+            _global_gate_cache = (now, False)
+        return False
+
     try:
         import requests as _req
         from line_token_refresh import get_line_token as _glt
         _tok = _glt()
-        if _tok:
-            _h = {"Authorization": f"Bearer {_tok}"}
-            _ru = _req.get(
-                "https://api.line.me/v2/bot/message/quota/consumption",
-                headers=_h, timeout=5,
+        if not _tok:
+            logger.warning("drain pending: no LINE token, fail-closed skip")
+            with _global_gate_cache_lock:
+                _global_gate_cache = (now, False)
+            return False
+        _h = {"Authorization": f"Bearer {_tok}"}
+        _ru = _req.get(
+            "https://api.line.me/v2/bot/message/quota/consumption",
+            headers=_h, timeout=5,
+        )
+        _rl = _req.get(
+            "https://api.line.me/v2/bot/message/quota",
+            headers=_h, timeout=5,
+        )
+        if not (_ru.ok and _rl.ok):
+            logger.warning(
+                "drain pending: LINE quota API non-200 (used=%s limit=%s), fail-closed skip",
+                _ru.status_code, _rl.status_code,
             )
-            _rl = _req.get(
-                "https://api.line.me/v2/bot/message/quota",
-                headers=_h, timeout=5,
+            with _global_gate_cache_lock:
+                _global_gate_cache = (now, False)
+            return False
+        _used = _ru.json().get("totalUsage", 0)
+        _limit = _rl.json().get("value", 200)
+        if _used >= _limit:
+            logger.info(
+                "drain pending: LINE quota %d/%d exhausted, defer",
+                _used, _limit,
             )
-            if _ru.ok and _rl.ok:
-                _used = _ru.json().get("totalUsage", 0)
-                _limit = _rl.json().get("value", 200)
-                if _used >= _limit:
-                    logger.info(
-                        "startup pending: LINE quota %d/%d exhausted, defer to piggyback",
-                        _used, _limit,
-                    )
-                    return
-            else:
-                logger.warning(
-                    "startup pending: LINE quota API non-200 (used=%s limit=%s), fail-closed skip",
-                    _ru.status_code, _rl.status_code,
-                )
-                return
-        else:
-            logger.warning("startup pending: no LINE token, fail-closed skip")
-            return
+            with _global_gate_cache_lock:
+                _global_gate_cache = (now, False)
+            return False
     except Exception as _e:
         logger.warning(
-            "startup pending: LINE quota precheck failed, fail-closed skip: %s",
+            "drain pending: LINE quota precheck failed, fail-closed skip: %s",
             str(_e)[:120],
         )
-        return
+        with _global_gate_cache_lock:
+            _global_gate_cache = (now, False)
+        return False
 
-    for group_id, items in list(pending.items()):
+    with _global_gate_cache_lock:
+        _global_gate_cache = (now, True)
+    return True
+
+
+# Per-group drain lock：三 caller（startup / retry / piggyback）共用，避免同 group 兩個 thread
+# 同時 drain 重複 push（GP1 important #3 race）。lock acquire 失敗 = 已被別人在 drain → caller skip。
+_drain_locks: dict[str, threading.Lock] = {}
+_drain_lock_factory_lock = threading.Lock()
+
+
+def _try_acquire_drain_slot(group_id: str) -> threading.Lock | None:
+    """non-blocking acquire 該 group 的 drain lock。拿到回 lock object，拿不到回 None。"""
+    with _drain_lock_factory_lock:
+        if group_id not in _drain_locks:
+            _drain_locks[group_id] = threading.Lock()
+        lock = _drain_locks[group_id]
+    return lock if lock.acquire(blocking=False) else None
+
+
+def _drain_pending_for_group(group_id: str, source: str = "startup") -> bool:
+    """處理單一 group 的 pending：分組 → 逐組 LLM 回覆 → 引用推送。
+
+    呼叫前要先 _global_pending_drain_ready() == True。
+    source ∈ {"startup", "retry_worker", "piggyback"}，僅用於 log。
+    回傳 True 表示有試著 drain（不論成功失敗），False 表示因另一 caller 已在 drain 同 group
+    而 skip — 用於 piggyback 判斷要不要寫 throttle ts。
+    Gemini 中途重新爆走 _mark_quota_exhausted + 將未處理 items 寫回 pending（不 raise），
+    caller 需自己重查 `_quota_exhausted()` 決定要不要繼續下一 group（startup wrapper 有做）。
+    """
+    slot = _try_acquire_drain_slot(group_id)
+    if slot is None:
+        logger.info("%s: skip, another drain in progress for group=%s", source, group_id)
+        return False
+    try:
+        pending = _load_pending_explicit()
+        items = pending.get(group_id, [])
         if isinstance(items, dict):  # 舊格式相容
             items = [items]
-        # D1 TTL: drain 前先清超齡 entry 到 DLQ，避免反覆嘗試失敗訊息
+
+        # D1 TTL: drain 前先清超齡 entry 到 DLQ
         dropped = _drop_stale_pending(group_id)
         if dropped:
             pending = _load_pending_explicit()
             items = pending.get(group_id, [])
         if not items:
             _clear_pending_explicit(group_id)
-            continue
+            return True
 
-        # __bot__ 條目不應出現在 pending（recovery 污染防護，正常 flow 不會有）
+        # __bot__ 條目不應出現在 pending（recovery 污染防護）
         items = [it for it in items if it.get("user_id") != "__bot__"]
         if not items:
             _clear_pending_explicit(group_id)
-            continue
+            return True
 
-        # Step 1：分組
         groups = _gemini_group_messages(items)
         logger.info(
-            "startup: group=%s items=%d groups=%d", group_id, len(items), len(groups)
+            "%s: group=%s items=%d groups=%d", source, group_id, len(items), len(groups)
         )
 
-        # Step 2：逐組跑完整 gemini_client.chat()
         processed_idx = set()
         try:
             for g in groups:
@@ -2716,35 +2772,58 @@ def _process_pending_on_startup() -> None:
                 data[group_id] = remaining
                 _save_pending_explicit_raw(data)
                 logger.warning(
-                    "startup pending: quota re-exhausted, saved %d remaining for group=%s",
-                    len(remaining),
-                    group_id,
+                    "%s pending: quota re-exhausted, saved %d remaining for group=%s",
+                    source, len(remaining), group_id,
                 )
-                return
-            # LINE API 429（月額度滿）或其他錯誤：保留未送出的 items，等下次重試
+                return True
             err_str = str(e)
             if remaining:
                 data = _load_pending_explicit()
                 data[group_id] = remaining
                 _save_pending_explicit_raw(data)
                 logger.warning(
-                    "startup pending: push failed (%s), saved %d remaining for group=%s",
-                    err_str[:80],
-                    len(remaining),
-                    group_id,
+                    "%s pending: push failed (%s), saved %d remaining for group=%s",
+                    source, err_str[:80], len(remaining), group_id,
                 )
             else:
                 logger.exception(
-                    "startup pending reply failed for group=%s: %s", group_id, e
+                    "%s pending reply failed for group=%s: %s", source, group_id, e
                 )
-            continue
+            return True
 
         _clear_pending_explicit(group_id)
-        logger.info("startup: group=%s all pending cleared", group_id)
+        logger.info("%s: group=%s all pending cleared", source, group_id)
+        return True
+    finally:
+        slot.release()
+
+
+@app.on_event("startup")
+def _process_pending_on_startup() -> None:
+    """uvicorn 啟動時處理所有 pending：thin wrapper，所有實作在 helper 裡。"""
+    pending = _load_pending_explicit()
+    if not pending:
+        return
+    if not _global_pending_drain_ready():
+        return
+    for group_id in list(pending.keys()):
+        # Gemini 中途又爆，後面的 group 直接放棄這輪
+        if _quota_exhausted():
+            return
+        _drain_pending_for_group(group_id, source="startup")
 
 
 _PENDING_RETRY_INTERVAL_SEC = 6 * 60 * 60        # 6 小時跑一次（從 30 min 降頻，避免吃光每日 quota）
 _PENDING_RETRY_QUOTA_RESERVE = 0.40              # 至少留 40% quota 給新訊息（不讓 retry 把 quota 全吃光）
+_PIGGYBACK_DRAIN_THROTTLE_SEC = 30 * 60          # 同 group piggyback drain 冷卻時間（成功一次後）
+_last_piggyback_drain_ts: dict[str, float] = {}  # group_id → 上次 piggyback drain epoch
+_piggyback_drain_lock = threading.Lock()
+# ThreadPoolExecutor 限 piggyback 並行度 = 2，防 webhook 洪水製造無限 thread（GP2 critical #1）。
+# 啟動時建立 — 因為 ThreadPoolExecutor 在 import 時間建會在 multiprocessing fork 行為下有問題，
+# 但這 module 不被 fork，所以 module-level 建構安全；放在這裡讓 piggyback 函式都看得到。
+from concurrent.futures import ThreadPoolExecutor as _PiggybackTPE  # noqa: E402
+_PIGGYBACK_EXECUTOR = _PiggybackTPE(max_workers=2, thread_name_prefix="piggyback")
+
 
 def _has_enough_quota_for_retry() -> bool:
     """retry 前先檢查：今日 quota 用了 ≥ 60% 就停（保留 40% 給新訊息）。"""
@@ -2753,6 +2832,64 @@ def _has_enough_quota_for_retry() -> bool:
         return True
     used_ratio = info["used_requests"] / max(info["limit_requests"], 1)
     return used_ratio < (1.0 - _PENDING_RETRY_QUOTA_RESERVE)
+
+
+def _piggyback_drain_pending(group_id: str) -> None:
+    """webhook 收到該 group 訊息時呼叫；補該 group 的 pending。
+
+    Gates 順序（任一不過就跳過，且**不寫 throttle ts**，下次 webhook 立刻可再試）：
+      1. throttle：同 group 30 分鐘內已成功 drain
+      2. 該 group 沒 pending（fast-path bail，省 quota gate）
+      3. retry quota gate（用量 ≥ 60% 保 40% 給新訊息）
+      4. 全域 gate（mute / Gemini quota / LINE quota，含 60s cache）
+      5. per-group drain lock（拿不到 = retry worker / startup 正在 drain 同 group）
+
+    Throttle ts **僅在 _drain_pending_for_group 回傳 True 後寫**，避免 gate fail 燒掉
+    30 分鐘冷卻（GP1 critical #1）。
+    """
+    now = time.time()
+    with _piggyback_drain_lock:
+        last = _last_piggyback_drain_ts.get(group_id, 0.0)
+        if now - last < _PIGGYBACK_DRAIN_THROTTLE_SEC:
+            return
+
+    try:
+        pending = _load_pending_explicit()
+        if group_id not in pending or not pending[group_id]:
+            return
+        if not _has_enough_quota_for_retry():
+            logger.info(
+                "piggyback drain: quota usage > 60%%, skip group=%s", group_id
+            )
+            return
+        if not _global_pending_drain_ready():
+            return
+        logger.info("piggyback drain: triggered by message in group=%s", group_id)
+        attempted = _drain_pending_for_group(group_id, source="piggyback")
+        if attempted:
+            with _piggyback_drain_lock:
+                _last_piggyback_drain_ts[group_id] = time.time()
+    except Exception as e:
+        logger.exception("piggyback drain failed for group=%s: %s", group_id, e)
+
+
+def _spawn_piggyback_drain(group_id: str) -> None:
+    """ThreadPoolExecutor submit piggyback drain，不阻塞 webhook。
+
+    Fast-path bail：若 group 仍在 30 分鐘 throttle 內就不 submit，省下 executor 排隊壓力
+    （webhook 洪水時 throttle 一定先 hit）。Executor cap=2 保護 cross-group flood。
+    """
+    if not group_id:
+        return
+    with _piggyback_drain_lock:
+        last = _last_piggyback_drain_ts.get(group_id, 0.0)
+        if time.time() - last < _PIGGYBACK_DRAIN_THROTTLE_SEC:
+            return
+    try:
+        _PIGGYBACK_EXECUTOR.submit(_piggyback_drain_pending, group_id)
+    except RuntimeError:
+        # Executor shutdown（process 在 teardown）— drop，next restart 會清 pending
+        pass
 
 
 def _start_pending_retry_worker() -> None:
@@ -3653,7 +3790,9 @@ def _pop_pending_for_piggyback(group_id: str) -> str | None:
 
     優先序：
       1. text pending（每次 1 條，慢消化）
-      2. 沒 text → file pending（PDF/Office/image，走 local fallback，每次 1 個）
+      2. 沒 text → file pending（PDF/Office，走 local fallback，每次 1 個）
+      3. 沒 file → image pending（每次 1 張，走 media_pipeline.analyze_image
+         local vision；50s thread timeout 跟 _handle_image_message 對齊）
 
     成功回格式化字串並從 pending 移除；失敗回 None，pending 不動。
     """
@@ -3693,7 +3832,7 @@ def _pop_pending_for_piggyback(group_id: str) -> str | None:
         reply_preview = _md_to_line(reply_text)
         return f"📬 補回之前漏掉的訊息\n\n原文：\n{orig_preview}\n\n回應：\n{reply_preview}"
 
-    # ── 2. file pending（PDF/Office/image 走 local fallback）──────────────
+    # ── 2. file pending（PDF/Office 走 local fallback）──────────────────
     _file_items = [
         it
         for it in items
@@ -3702,25 +3841,81 @@ def _pop_pending_for_piggyback(group_id: str) -> str | None:
         and os.path.exists(it["media_path"])
     ]
     file_batch = _file_items[:1]
-    if not file_batch:
+    if file_batch:
+        file_item = file_batch[0]
+        file_name = file_item.get("file_name", "unknown")
+        media_path = file_item["media_path"]
+        try:
+            with open(media_path, "rb") as f:
+                data = f.read()
+        except Exception as e:
+            logger.warning("drain pending file read failed: %s", e)
+            return None
+
+        reply_text = _drain_pending_file(data, file_name, group_id, context, facts, pnotes)
+        if not reply_text or not reply_text.strip():
+            return None
+
+        # 移出 pending + 刪 media_path 檔
+        processed_ids = {file_item.get("message_id")}
+        pending[group_id] = [
+            it for it in items if it.get("message_id") not in processed_ids
+        ]
+        if not pending[group_id]:
+            del pending[group_id]
+        _save_pending_explicit_raw(pending)
+        try:
+            os.remove(media_path)
+        except Exception as e:
+            logger.warning("drain pending file: remove media_path failed: %s", e)
+
+        reply_preview = _md_to_line(reply_text)[:1500]
+        return f"📬 補回之前漏掉的檔案 [{file_name}]\n\n回應：\n{reply_preview}"
+
+    # ── 3. image pending（local 圖像辨識 via media_pipeline.analyze_image）─
+    _image_items = [
+        it
+        for it in items
+        if it.get("type") == "image"
+        and it.get("media_path")
+        and os.path.exists(it["media_path"])
+    ]
+    img_batch = _image_items[:1]
+    if not img_batch:
         return None
 
-    file_item = file_batch[0]
-    file_name = file_item.get("file_name", "unknown")
-    media_path = file_item["media_path"]
+    img_item = img_batch[0]
+    media_path = img_item["media_path"]
     try:
         with open(media_path, "rb") as f:
-            data = f.read()
+            img_data = f.read()
     except Exception as e:
-        logger.warning("drain pending file read failed: %s", e)
+        logger.warning("drain pending image read failed: %s", e)
         return None
 
-    reply_text = _drain_pending_file(data, file_name, group_id, context, facts, pnotes)
+    # 跟 _handle_image_message 同 50s thread timeout (reply_token TTL ~1min)
+    import threading as _threading
+    holder: dict[str, str | None] = {"reply": None}
+
+    def _run():
+        try:
+            import media_pipeline
+            holder["reply"] = media_pipeline.analyze_image(img_data)
+        except Exception as e:
+            logger.warning("piggyback image analyze failed: %s", e)
+
+    t = _threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=50)
+    if t.is_alive():
+        logger.info("piggyback image analyze timeout (>50s), leaving pending for next retry")
+        return None
+    reply_text = holder.get("reply")
     if not reply_text or not reply_text.strip():
         return None
 
-    # 移出 pending + 刪 media_path 檔
-    processed_ids = {file_item.get("message_id")}
+    # 移出 pending + 刪 media file
+    processed_ids = {img_item.get("message_id")}
     pending[group_id] = [
         it for it in items if it.get("message_id") not in processed_ids
     ]
@@ -3730,10 +3925,10 @@ def _pop_pending_for_piggyback(group_id: str) -> str | None:
     try:
         os.remove(media_path)
     except Exception as e:
-        logger.warning("drain pending file: remove media_path failed: %s", e)
+        logger.warning("drain pending image: remove media_path failed: %s", e)
 
     reply_preview = _md_to_line(reply_text)[:1500]
-    return f"📬 補回之前漏掉的檔案 [{file_name}]\n\n回應：\n{reply_preview}"
+    return f"📷 補回之前漏掉的圖片\n\n圖片分析：\n{reply_preview}"
 
 
 def _drain_pending_file(
