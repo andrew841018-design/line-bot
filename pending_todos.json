@@ -1,5 +1,12 @@
 [
-  "洗牙",
-  "檢查眼睛",
-  "重設爸爸 Apple ID 密碼"
+    "洗牙",
+    "檢查眼睛",
+    "重設爸爸 Apple ID 密碼",
+    "房屋稅單拿到 7-Eleven 用 UNI Open 信用卡刷卡繳房屋稅",
+    "完成 n8n + Gmail/Calendar/Discord 整合（卡 Cloud Console OAuth secret 下載；剩餘步驟：Safari https://console.cloud.google.com/auth/clients?project=project-4cfb37d9-c076-4608-816 點 n8n-final-2 重新走 Create → Download JSON 拿 secret；Discord 建 webhook；跑 python3 ~/Desktop/andrew/Data_engineer/n8n_workflows/wire_up.py full CID SECRET WEBHOOK_URL；n8n UI Sign in × 2 + Active=ON × 3）",
+    "n8n workflow: schedule POST /jobs/process-pending-media every 6h（從 jobs_router._per_job_token() 算 token；URL = cloudflared tunnel + /jobs/process-pending-media）",
+    "jobs_router 加 singleton lock 防止 process-pending-media 並行跑（GP2 §3 medium，避免 GPU/CPU pin）",
+    "orphan media sweep wire 到 startup hook：跑 pending_store.sweep_orphan_media() + 500MB cap（GP2 §5 deferred）",
+    "_handle_audio_message line 1115 也刪 quota 短路（feedback_quota_fallback_never_skip 範圍延伸到 audio handler）",
+    "確認 12 launchd jobs 是否真已遷到 n8n（commit 1def069 之後）— 不然新 process-pending-media job 也會沒人觸發"
 ]

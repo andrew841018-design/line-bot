@@ -989,7 +989,17 @@ def serve_genimg(filename: str):
 @app.post("/callback")
 async def callback(request: Request, x_line_signature: str = Header(None)):
     body = (await request.body()).decode("utf-8")
-    print(f"[RAW] sig={x_line_signature} len={len(body)} body={body[:800]}", flush=True)
+    if not x_line_signature:
+        client = request.client.host if request.client else "?"
+        logger.warning("missing x-line-signature header from %s body_len=%d", client, len(body))
+        raise HTTPException(status_code=400, detail="missing signature")
+    # PII protection: 預設只印 body_sha256（除錯時設 DEBUG_RAW_BODY=1 印 body[:800]）
+    if os.getenv("DEBUG_RAW_BODY") == "1":
+        print(f"[RAW] sig={x_line_signature} len={len(body)} body={body[:800]}", flush=True)
+    else:
+        import hashlib as _hl
+        _body_hash = _hl.sha256(body.encode("utf-8")).hexdigest()[:12]
+        print(f"[RAW] sig={x_line_signature} len={len(body)} body_sha256={_body_hash}", flush=True)
     try:
         events = _parser.parse(body, x_line_signature)
     except InvalidSignatureError:
@@ -2237,6 +2247,8 @@ _PENDING_EXPLICIT_PATH = os.path.join(
     os.path.dirname(__file__), "pending_explicit_reply.json"
 )
 _PENDING_MEDIA_DIR = os.path.join(os.path.dirname(__file__), "pending_media")
+_PENDING_DLQ_PATH = os.path.join(os.path.dirname(__file__), "pending_dlq.jsonl")
+_PENDING_MAX_AGE_SEC = 7 * 86400  # 7 天沒被 drain → 進 DLQ，避免 PDF/stuck entry 永久卡住
 
 
 def _load_pending_explicit() -> dict:
@@ -2358,6 +2370,57 @@ def _clear_pending_explicit(group_id: str) -> None:
                 pass
     data.pop(group_id, None)
     _save_pending_explicit_raw(data)
+
+
+def _dlq_entry(group_id: str, entry: dict, reason: str) -> None:
+    """Append-only DLQ: 一行一筆 JSON。永遠不再 retry，供之後 forensic 查看。"""
+    record = {
+        "group_id": group_id,
+        "reason": reason,
+        "dlq_at": time.time(),
+        "entry": entry,
+    }
+    try:
+        with open(_PENDING_DLQ_PATH, "a", encoding="utf-8") as f:
+            f.write(_json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning("DLQ append failed: %s", str(e)[:200])
+
+
+def _drop_stale_pending(group_id: str, max_age_sec: int = _PENDING_MAX_AGE_SEC) -> int:
+    """掃 pending 把 timestamp 超齡的 entry 移到 DLQ + 刪 media file，回 dropped 數。
+
+    保護機制：avoid PDF / non-text / failed-LLM entry 永久卡住消耗 piggyback slot。
+    timestamp 缺失的舊 entry 視為 now（不誤刪）。
+    """
+    data = _load_pending_explicit()
+    items = data.get(group_id, [])
+    if not items:
+        return 0
+    now = time.time()
+    keep, drop = [], []
+    for it in items:
+        ts = it.get("timestamp")
+        if ts is None or (now - ts) <= max_age_sec:
+            keep.append(it)
+        else:
+            drop.append(it)
+    if not drop:
+        return 0
+    for it in drop:
+        _dlq_entry(group_id, it, reason=f"age>{max_age_sec}s")
+        path = it.get("media_path")
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+    data[group_id] = keep
+    if not keep:
+        data.pop(group_id, None)
+    _save_pending_explicit_raw(data)
+    logger.info("DLQ drop: group=%s dropped=%d kept=%d", group_id, len(drop), len(keep))
+    return len(drop)
 
 
 def _remove_pending_by_msg_id(group_id: str, message_id: str) -> bool:
@@ -2578,6 +2641,11 @@ def _process_pending_on_startup() -> None:
     for group_id, items in list(pending.items()):
         if isinstance(items, dict):  # 舊格式相容
             items = [items]
+        # D1 TTL: drain 前先清超齡 entry 到 DLQ，避免反覆嘗試失敗訊息
+        dropped = _drop_stale_pending(group_id)
+        if dropped:
+            pending = _load_pending_explicit()
+            items = pending.get(group_id, [])
         if not items:
             _clear_pending_explicit(group_id)
             continue
@@ -3589,6 +3657,7 @@ def _pop_pending_for_piggyback(group_id: str) -> str | None:
 
     成功回格式化字串並從 pending 移除；失敗回 None，pending 不動。
     """
+    _drop_stale_pending(group_id)  # D1 TTL: age>7d 進 DLQ，避免 PDF stuck 卡 slot
     pending = _load_pending_explicit()
     items = pending.get(group_id, [])
     if not items:

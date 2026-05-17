@@ -122,3 +122,12 @@ JOB_REGISTRY["process-pending-media"] = JobSpec(
     timeout=600,
     description="6-hourly retry: drain pending (text/image/video/audio/file) via local LLM",
 )
+
+
+JOB_REGISTRY["weekly-hook-block-report"] = JobSpec(
+    command=[_LB_VENV, "/Users/andrew/scripts/weekly_hook_block_report.py"],
+    cwd=None,
+    env={"PATH": _BASE_PATH, "HOME": "/Users/andrew", "USER": "andrew", "LOGNAME": "andrew"},
+    timeout=60,
+    description="Sunday 09:00 weekly ironrule hook block report → Discord",
+)
