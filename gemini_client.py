@@ -888,6 +888,58 @@ _OPINION_MARKERS = (
 )
 
 
+# Sectional structure markers (2026-05-17 加，補規則 0 對「正方+反方+綜合」三段結構的執行)
+# 三類各至少一個 marker 命中才算有完整 sectional 結構
+_PRO_MARKERS = (
+    "正方", "同意的部分", "支持的部分", "好的部分",
+    "支持理由", "同意 ", "✅", "贊成",
+)
+_CON_MARKERS = (
+    "反方", "反對的部分", "質疑的部分", "壞的部分",
+    "反對理由", "反方理由", "反對 ", "❌", "質疑",
+)
+_SUMMARY_MARKERS = (
+    "綜合", "整合", "結論", "權衡", "判斷依據",
+    "最終建議", "最終立場", "最終 ", "綜合判斷",
+)
+
+# 專業議題回覆硬性下限 (per _CORE_PROMPT line 369 + _RULE_NEWS_CASE line 530-532)
+_MIN_CHARS_NEWS_CASE = 350
+_MIN_URLS_NEWS_CASE = 3
+_MIN_DOMAINS_NEWS_CASE = 2
+
+_URL_DOMAIN_RE = re.compile(r"https?://([^/\s)]+)", re.IGNORECASE)
+
+
+def _has_sectional_structure(reply: str) -> tuple[bool, list[str]]:
+    """檢查 reply 是否含正方/反方/綜合三段 sectional structure。
+    回 (has_full_structure, missing_section_names_list)。
+    """
+    has_pro = any(m in reply for m in _PRO_MARKERS)
+    has_con = any(m in reply for m in _CON_MARKERS)
+    has_summary = any(m in reply for m in _SUMMARY_MARKERS)
+    if has_pro and has_con and has_summary:
+        return True, []
+    missing = []
+    if not has_pro:
+        missing.append("正方/同意段")
+    if not has_con:
+        missing.append("反方/反對段")
+    if not has_summary:
+        missing.append("綜合/結論段")
+    return False, missing
+
+
+def _count_zh_chars(s: str) -> int:
+    """數中文 CJK Unified Ideographs 字數（不含標點英數）。"""
+    return sum(1 for c in s if "一" <= c <= "鿿")
+
+
+def _count_unique_domains(s: str) -> int:
+    """從 reply 取 URL 並 count unique netloc (主域 / 子域算同一網域簡化)。"""
+    return len({d.lower() for d in _URL_DOMAIN_RE.findall(s)})
+
+
 def _violates_quality(reply: str, user_input_text: str = "") -> tuple[bool, str]:
     """規則 0 post-check：偵測 echo opener / 空附和 / 敷衍 / 缺 URL 結構。
 
@@ -905,13 +957,22 @@ def _violates_quality(reply: str, user_input_text: str = "") -> tuple[bool, str]
             return True, f"empty phrase: {phrase}"
 
     # 專業議題（投資 / 醫療 / 法律 / 保險 / 教育 / 房地產 / 詐騙）若在 user 訊息出現
-    # 但回覆 < 2 條 URL → 違反「正反方+URL+主觀+支持 URL」結構（2026-05-05 加）
+    # 2026-05-17 強化：URL ≥ 3 條 + ≥ 2 網域 + 正方/反方/綜合 sectional + 字數 ≥ 350
+    # 補規則 0 對「正方+來源+反方+來源+綜合論點」5 件套的執行（之前只檢 URL≥2 + opinion，
+    # sectional 結構 / 字數 / domain diversity 全沒擋）
     if user_input_text and any(t in user_input_text for t in _NEWS_CASE_TOPIC_HINTS):
         url_count = s.count("http://") + s.count("https://")
-        if url_count < 2:
+        if url_count < _MIN_URLS_NEWS_CASE:
             return True, (
-                f"專業議題缺多源 URL（觸發詞在 user 訊息，回覆只有 {url_count} 條 URL，"
-                "至少需 2 條不同網域；不算 user 自己貼的）"
+                f"專業議題缺多源 URL（{url_count}/{_MIN_URLS_NEWS_CASE}，"
+                "規則 0 要求至少 3 條不同網域；不算 user 自己貼的）"
+            )
+
+        domains = _count_unique_domains(s)
+        if domains < _MIN_DOMAINS_NEWS_CASE:
+            return True, (
+                f"專業議題 URL 集中單一網域（unique domain {domains}/"
+                f"{_MIN_DOMAINS_NEWS_CASE}）— 要不同來源才能 cross-check"
             )
 
         # URL 夠了，再檢查是否有觀點 marker（「我覺得」「同意」「反對」等任一）
@@ -922,6 +983,22 @@ def _violates_quality(reply: str, user_input_text: str = "") -> tuple[bool, str]
                 "專業議題回覆有 URL 但**沒中心思想**（缺『我覺得』『我認為』『同意 X 因為』"
                 "『反對 Y 因為』『問題在於』等觀點 marker）— 違反規則 23h，需要列出 "
                 "agree/disagree + 各自理由 + 對應 URL 結構"
+            )
+
+        # Sectional 結構：必含正方 + 反方 + 綜合三段 markers
+        has_struct, missing = _has_sectional_structure(s)
+        if not has_struct:
+            return True, (
+                f"專業議題缺『正方+反方+綜合』sectional 結構（missing: "
+                f"{'、'.join(missing)}）— 規則 0 line 347-399 強制三段結構"
+            )
+
+        # 字數下限 350（per _CORE_PROMPT line 369）
+        zh = _count_zh_chars(s)
+        if zh < _MIN_CHARS_NEWS_CASE:
+            return True, (
+                f"專業議題回覆過短（中文字 {zh}/{_MIN_CHARS_NEWS_CASE}）— "
+                "規則 0 強制議題回覆 ≥ 350 字，少於這個量幾乎一定是敷衍模式"
             )
 
     return False, ""
