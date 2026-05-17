@@ -124,6 +124,15 @@ JOB_REGISTRY["process-pending-media"] = JobSpec(
 )
 
 
+JOB_REGISTRY["daily-pending-audit"] = JobSpec(
+    command=[_LB_VENV, f"{_DATA_ENG}/line_bot/jobs/daily_pending_audit.py"],
+    cwd=f"{_DATA_ENG}/line_bot",
+    env={"PATH": _BASE_PATH, "HOME": "/Users/andrew", "USER": "andrew", "LOGNAME": "andrew"},
+    timeout=60,
+    description="Daily 21:00 audit: scan pending media leftovers, push Discord DM",
+)
+
+
 JOB_REGISTRY["weekly-hook-block-report"] = JobSpec(
     command=[_LB_VENV, "/Users/andrew/scripts/weekly_hook_block_report.py"],
     cwd=None,
