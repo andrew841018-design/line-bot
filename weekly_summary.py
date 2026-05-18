@@ -40,6 +40,62 @@ def _push(text: str) -> None:
     )
 
 
+def _render_finance_summary(group_id: str, days: int = 14) -> str:
+    """純 SQL 模板輸出 — 家族財經觀點週推。
+
+    第一句判斷句、用名詞短語開頭（避 _ECHO_OPENERS 黑名單）。
+    """
+    import finance_view_db
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo as _ZI
+
+    views = finance_view_db.list_recent(group_id, limit=30)
+    if not views:
+        return ""
+
+    tw = _ZI("Asia/Taipei")
+    counts = finance_view_db.count_by_result(group_id)
+    total = sum(counts.values())
+
+    if total == 0:
+        return ""
+
+    hit = counts.get("hit", 0)
+    miss = counts.get("miss", 0)
+    pending = counts.get("pending", 0)
+
+    lines = ["📈 本週家族財經觀點", ""]
+    lines.append(
+        f"家族至今累積 {total} 條觀點，"
+        f"已驗證 {hit} 命中 / {miss} 落空，{pending} 仍待驗。"
+    )
+    lines.append("")
+
+    now = _dt.now(tz=tw)
+    cutoff_ms = int((now.timestamp() - days * 86400) * 1000)
+    recent = [v for v in views if v.get("created_at", 0) >= cutoff_ms]
+    if not recent:
+        lines.append(f"（最近 {days} 天無新觀點）")
+        return "\n".join(lines)
+
+    lines.append(f"最近 {days} 天新觀點：")
+    for v in recent[:10]:
+        label = v.get("ticker") or v.get("macro_topic") or "?"
+        d = v.get("direction") or ""
+        dir_str = {"bull": "看多", "bear": "看空", "neutral": "持平"}.get(d, "")
+        target = ""
+        if v.get("target_price"):
+            target = f" 目標 {v['target_price']}"
+        elif v.get("target_pct"):
+            target = f" 目標 {v['target_pct']:+.0f}%"
+        result = v.get("validation_result") or ""
+        result_str = {"hit": "✅", "miss": "❌", "pending": "⏳", "na": "—"}.get(result, "")
+        created = _dt.fromtimestamp(v["created_at"] / 1000, tz=tw).strftime("%m-%d")
+        speaker = v.get("display_name") or "家人"
+        lines.append(f"• {created} {speaker} {label} {dir_str}{target} {result_str}")
+    return "\n".join(lines)
+
+
 def main() -> None:
     if not GROUP_ID or not TOKEN:
         print("ERR: LINE_ALLOWED_GROUP_ID or LINE_CHANNEL_ACCESS_TOKEN not set")
@@ -87,6 +143,25 @@ def main() -> None:
             print("家族熱話無偵測到主題（過去 30 天訊息不足）")
     except Exception as e:
         print(f"ERR 家族熱話: {e}")
+
+    # 家族財經觀點週報（2026-05-18 加）— validator 先跑一次，再純 SQL 推
+    try:
+        import finance_view_validator
+        n_validated = finance_view_validator.run()
+        if n_validated:
+            print(f"finance_view validator updated {n_validated} views")
+    except Exception as e:
+        print(f"ERR finance_view validator: {e}")
+
+    try:
+        finance_text = _render_finance_summary(GROUP_ID, days=14)
+        if finance_text:
+            _push(finance_text[:4900])
+            print(f"家族財經觀點週報已推播（{len(finance_text)} 字）")
+        else:
+            print("家族財經觀點 — 過去 14 天無記錄")
+    except Exception as e:
+        print(f"ERR 家族財經觀點: {e}")
 
 
 if __name__ == "__main__":

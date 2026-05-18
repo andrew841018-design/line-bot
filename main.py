@@ -1493,6 +1493,15 @@ def _handle_burst_flush(group_id: str, combined_text: str, reply_token: str) -> 
         len(combined_text),
     )
 
+    # 2026-05-18 加：抽家族財經觀點寫入 finance_views（fire-and-forget，不擋主流程）
+    try:
+        import finance_view_extractor
+        finance_view_extractor.maybe_extract_and_save_async(
+            group_id, combined_text
+        )
+    except Exception as e:
+        logger.debug("finance_view extract skipped: %s", e)
+
     # 2026-05-16 修：刪掉 quota 短路。
     # 之前在 quota 爆時直接 return 違反 docstring 寫的「會回應的情境不能靜默」原則，
     # 也讓 llm_router.fallback_chat 4-tier waterfall（local LLM → RAG → lite_reply）
@@ -3441,6 +3450,105 @@ def _handle_classify_command(group_id: str, text: str) -> str | None:
         return None
 
 
+def _handle_finance_view_command(group_id: str, text: str) -> str | None:
+    """處理 /觀點 [可選: 家人名 | 標的]。純 SQL 聚合，不過 Gemini。
+
+    第一句必須是判斷句（line_bot CLAUDE.md 規則 0）。
+    """
+    s = (text or "").strip()
+    if not s.startswith("/觀點"):
+        return None
+
+    try:
+        import finance_view_db
+        import stock_quote
+    except ImportError as e:
+        logger.warning("finance_view import failed: %s", e)
+        return None
+
+    args = s.replace("/觀點", "", 1).strip()
+
+    if not args:
+        views = finance_view_db.list_recent(group_id, limit=10)
+        if not views:
+            return (
+                "目前家族觀點庫還是空的。\n"
+                "（聊到具體標的 + 方向時會自動記下，例「我覺得 0050 會漲到 180」）"
+            )
+        return _format_finance_views(views, header="📈 家族最近財經觀點")
+
+    tokens = args.split()
+    ticker = None
+    person = None
+    for tok in tokens:
+        try:
+            resolved = stock_quote.detect_symbols(tok)
+        except Exception:
+            resolved = None
+        if resolved:
+            ticker = resolved[0]
+        elif not person:
+            person = tok
+
+    if ticker:
+        views = finance_view_db.list_by_ticker(group_id, ticker, limit=10)
+        header = f"📈 {ticker} 相關家族觀點"
+    elif person:
+        views = finance_view_db.list_by_person(group_id, person, limit=10)
+        header = f"📈 {person} 的財經觀點"
+    else:
+        return None
+
+    if not views:
+        return f"{header}\n\n沒找到相關觀點記錄。"
+    return _format_finance_views(views, header=header)
+
+
+def _format_finance_views(views: list[dict], header: str) -> str:
+    """純 SQL 聚合輸出。第一句判斷句（規則 0）。"""
+    if not views:
+        return f"{header}\n\n沒有記錄。"
+
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo as _ZI
+
+    tw = _ZI("Asia/Taipei")
+
+    hit = sum(1 for v in views if v.get("validation_result") == "hit")
+    miss = sum(1 for v in views if v.get("validation_result") == "miss")
+    pending = sum(1 for v in views if v.get("validation_result") == "pending")
+    na = sum(1 for v in views if v.get("validation_result") == "na")
+
+    if hit and miss:
+        summary = f"共 {len(views)} 條觀點，已驗證 {hit} 命中 / {miss} 落空，{pending} 仍待驗。"
+    elif hit:
+        summary = f"共 {len(views)} 條觀點，已驗證 {hit} 命中（其餘待驗）。"
+    elif miss:
+        summary = f"共 {len(views)} 條觀點，已驗證 {miss} 落空。"
+    else:
+        summary = f"共 {len(views)} 條觀點，{pending + na} 仍待驗。"
+
+    lines = [header, "", summary, ""]
+    for v in views[:10]:
+        label = v.get("ticker") or v.get("macro_topic") or "?"
+        d = v.get("direction") or ""
+        dir_str = {"bull": "看多", "bear": "看空", "neutral": "持平"}.get(d, "")
+        target = ""
+        if v.get("target_price"):
+            target = f" 目標 {v['target_price']}"
+        elif v.get("target_pct"):
+            target = f" 目標 {v['target_pct']:+.0f}%"
+        result = v.get("validation_result") or ""
+        result_str = {"hit": "✅", "miss": "❌", "pending": "⏳", "na": "—"}.get(result, "")
+        try:
+            created = _dt.fromtimestamp(v["created_at"] / 1000, tz=tw).strftime("%m-%d")
+        except Exception:
+            created = "??"
+        speaker = v.get("display_name") or "家人"
+        lines.append(f"• {created} {speaker} {label} {dir_str}{target} {result_str}")
+    return "\n".join(lines)
+
+
 def _handle_command(group_id: str, text: str) -> str | None:
     """有對應到指令回 str；沒有回 None。"""
     t = text.strip()
@@ -3449,6 +3557,11 @@ def _handle_command(group_id: str, text: str) -> str | None:
     classify_reply = _handle_classify_command(group_id, t)
     if classify_reply is not None:
         return classify_reply
+
+    # 家族財經觀點查詢（2026-05-18 加）
+    fv_reply = _handle_finance_view_command(group_id, t)
+    if fv_reply is not None:
+        return fv_reply
 
     if t == "/group_id":
         return f"本群 group_id：\n{group_id}"
