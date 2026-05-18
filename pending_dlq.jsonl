@@ -1,0 +1,12 @@
+{"group_id": "GRP001", "reason": "age>604800s", "dlq_at": 1779021825.5959392, "entry": {"user_id": "__bot__", "text": "bot 自己的舊回覆 1", "timestamp": 100, "type": "text"}}
+{"group_id": "GRP001", "reason": "age>604800s", "dlq_at": 1779021825.596116, "entry": {"user_id": "__bot__", "text": "bot 自己的舊回覆 2", "timestamp": 101, "type": "text"}}
+{"group_id": "GRP001", "reason": "age>604800s", "dlq_at": 1779022010.728224, "entry": {"user_id": "__bot__", "text": "bot 自己的舊回覆 1", "timestamp": 100, "type": "text"}}
+{"group_id": "GRP001", "reason": "age>604800s", "dlq_at": 1779022010.728619, "entry": {"user_id": "__bot__", "text": "bot 自己的舊回覆 2", "timestamp": 101, "type": "text"}}
+{"group_id": "GRP001", "reason": "age>604800s", "dlq_at": 1779029698.635345, "entry": {"user_id": "__bot__", "text": "bot 自己的舊回覆 1", "timestamp": 100, "type": "text"}}
+{"group_id": "GRP001", "reason": "age>604800s", "dlq_at": 1779029698.635992, "entry": {"user_id": "__bot__", "text": "bot 自己的舊回覆 2", "timestamp": 101, "type": "text"}}
+{"group_id": "GRP001", "reason": "age>604800s", "dlq_at": 1779029876.8594198, "entry": {"user_id": "__bot__", "text": "bot 自己的舊回覆 1", "timestamp": 100, "type": "text"}}
+{"group_id": "GRP001", "reason": "age>604800s", "dlq_at": 1779029876.85977, "entry": {"user_id": "__bot__", "text": "bot 自己的舊回覆 2", "timestamp": 101, "type": "text"}}
+{"group_id": "GRP001", "reason": "age>604800s", "dlq_at": 1779068242.04516, "entry": {"user_id": "__bot__", "text": "bot 自己的舊回覆 1", "timestamp": 100, "type": "text"}}
+{"group_id": "GRP001", "reason": "age>604800s", "dlq_at": 1779068242.045452, "entry": {"user_id": "__bot__", "text": "bot 自己的舊回覆 2", "timestamp": 101, "type": "text"}}
+{"group_id": "GRP001", "reason": "age>604800s", "dlq_at": 1779071383.023843, "entry": {"user_id": "__bot__", "text": "bot 自己的舊回覆 1", "timestamp": 100, "type": "text"}}
+{"group_id": "GRP001", "reason": "age>604800s", "dlq_at": 1779071383.0275211, "entry": {"user_id": "__bot__", "text": "bot 自己的舊回覆 2", "timestamp": 101, "type": "text"}}
