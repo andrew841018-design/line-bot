@@ -15,9 +15,103 @@ from typing import Optional
 logger = logging.getLogger("media_pipeline")
 
 
+# ── Phase 1 media_cache helpers (byte-exact dedup, group-scoped) ───────────
+#
+# Phase 1.5 deferred (per advisor family-bot threat model recalibration):
+#   - In-flight dedup（immediate handler + drain worker 跑同 sha 同 race）
+#     — family-bot 5 人 rare event, accept；Phase 1.5 加 Python module-level
+#     `_inflight: dict[(media_type, sha), Event]` + try/finally
+#   - Telemetry to bot_stats.py (cache_hits / cache_misses) + daily briefing surface
+#   - PII regex on description / Reply quality gate / DoS limits
+#     — wrong threat model (family chat 互看 PII，非 adversarial); enterprise scope
+#   - cache_version 沒加：見 memory.insert_media_cache docstring，改 prompt
+#     後手動 DELETE invalidate
+
+_MIN_CACHE_BYTES = 1024       # 太小檔不算（preview / corrupted / sticker）
+_MIN_CACHE_REPLY_LEN = 200    # 太短 reply 不 cache（L3 raw desc 通常 < 200 字）
+
+
+def _to_bytes(media) -> Optional[bytes]:
+    """Normalize 多型 media 輸入到 bytes（只給 sha256 算），原 media 不動。"""
+    if isinstance(media, (bytes, bytearray)):
+        return bytes(media)
+    if isinstance(media, (str, Path)):
+        try:
+            with open(media, "rb") as f:
+                return f.read()
+        except Exception:
+            return None
+    return None
+
+
+def _is_cache_quality_reply(reply) -> bool:
+    """Phase 1 quality gate：排 OCR-only fallback / 太短 raw desc / 空字串。"""
+    if not reply or not reply.strip():
+        return False
+    s = reply.strip()
+    if s.startswith("📷 OCR"):           # L4 OCR-only fallback prefix
+        return False
+    if len(s) < _MIN_CACHE_REPLY_LEN:    # L3 raw desc 通常 < 200 字
+        return False
+    return True
+
+
+def _maybe_lookup_media_cache(
+    media,
+    group_id: Optional[str],
+    media_type: str,
+) -> Optional[str]:
+    """Cache hit return last_reply + bump_seen；miss / 無 group_id / 極小檔回 None。"""
+    if not group_id:
+        return None
+    image_bytes = _to_bytes(media)
+    if not image_bytes or len(image_bytes) < _MIN_CACHE_BYTES:
+        return None
+    try:
+        import memory
+        sha = memory.compute_sha256(image_bytes)
+        hit = memory.lookup_media_cache(group_id, media_type, sha)
+        if hit:
+            memory.bump_media_cache_seen(hit["cache_id"])
+            logger.info(
+                "media_cache HIT group=%s type=%s sha=%s seen=%d",
+                group_id[:8], media_type, sha[:8], hit["seen_count"] + 1,
+            )
+            return hit["last_reply"]
+    except Exception as e:
+        logger.warning("media_cache lookup failed: %s", e)
+    return None
+
+
+def _maybe_write_media_cache(
+    media,
+    group_id: Optional[str],
+    media_type: str,
+    description: Optional[str],
+    reply: str,
+) -> None:
+    """Phase 1：caller 在高品質 layer return 前 call；quality gate 內部過。"""
+    if not group_id or not _is_cache_quality_reply(reply):
+        return
+    image_bytes = _to_bytes(media)
+    if not image_bytes or len(image_bytes) < _MIN_CACHE_BYTES:
+        return
+    try:
+        import memory
+        sha = memory.compute_sha256(image_bytes)
+        memory.insert_media_cache(group_id, media_type, sha, description, reply)
+        logger.info(
+            "media_cache WRITE group=%s type=%s sha=%s reply_len=%d",
+            group_id[:8], media_type, sha[:8], len(reply),
+        )
+    except Exception as e:
+        logger.warning("media_cache write failed: %s", e)
+
+
 def analyze_image(
     image: str | Path | bytes,
     user_prompt: str = "",
+    group_id: str | None = None,
 ) -> Optional[str]:
     """對圖片產生回應。失敗回 None。
 
@@ -25,7 +119,15 @@ def analyze_image(
       1. OCR 抽文字（如果有 ocr_helper）
       2. 本機 Vision LLM（mlx-vlm Qwen2.5-VL-7B）看圖 + 用 OCR 文字輔助 prompt
       3. 本機失敗 → 至少回 OCR 文字（零雲端 fallback）
+
+    Phase 1（media_cache）：caller 傳 group_id 時走 byte-exact cache dedup
+    （group-scoped），命中跳過 v4 7-step pipeline。
     """
+    # Phase 1 media_cache lookup
+    cached = _maybe_lookup_media_cache(image, group_id, "image")
+    if cached:
+        return cached
+
     # OCR
     ocr_text = None
     try:
@@ -72,6 +174,7 @@ def analyze_image(
             else:
                 wrapped = _wrap_with_gemini_news_style(desc, ocr_text or "")
             if wrapped:
+                _maybe_write_media_cache(image, group_id, "image", desc, wrapped)
                 return wrapped
         except Exception as e:
             logger.warning("hybrid pipeline failed, fallback to raw desc: %s", e)
@@ -339,6 +442,7 @@ def _wrap_with_gemini_news_style(desc: str, ocr_text: str = "") -> Optional[str]
 def analyze_video(
     video: str | Path | bytes,
     user_prompt: str = "",
+    group_id: str | None = None,
 ) -> Optional[str]:
     """對影片產生回應。失敗回 None。
 
@@ -346,7 +450,14 @@ def analyze_video(
       1. 抽 keyframes（max 6）
       2. 本機多圖 vision LLM 看
       3. 本機失敗 → None（沉默）
+
+    Phase 1（media_cache）：caller 傳 group_id 時走 byte-exact cache dedup。
     """
+    # Phase 1 media_cache lookup
+    cached = _maybe_lookup_media_cache(video, group_id, "video")
+    if cached:
+        return cached
+
     # Keyframes
     frames = []
     try:
@@ -390,6 +501,8 @@ def analyze_video(
         except Exception:
             pass
 
+    if out and out.strip():
+        _maybe_write_media_cache(video, group_id, "video", None, out)
     return out
 
 

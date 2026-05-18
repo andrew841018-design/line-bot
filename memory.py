@@ -132,6 +132,20 @@ def _init_db() -> None:
                 ON kg_triples(group_id, subject);
             CREATE INDEX IF NOT EXISTS idx_kg_triples_relation
                 ON kg_triples(group_id, relation);
+            CREATE TABLE IF NOT EXISTS media_cache (
+                cache_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id       TEXT NOT NULL,
+                media_type     TEXT NOT NULL,
+                sha256         TEXT NOT NULL,
+                description    TEXT,
+                last_reply     TEXT NOT NULL,
+                first_seen_at  INTEGER NOT NULL,
+                last_seen_at   INTEGER NOT NULL,
+                seen_count     INTEGER NOT NULL DEFAULT 1,
+                UNIQUE (group_id, media_type, sha256)
+            );
+            CREATE INDEX IF NOT EXISTS idx_media_cache_lookup
+                ON media_cache(group_id, media_type, sha256);
             """
         )
         # kg_triples schema migration: ALTER TABLE 自動補 column
@@ -882,3 +896,92 @@ def mark_reminder_pushed(reminder_id: int, stage: str) -> bool:
         else:
             return False
         return True
+
+
+# ── Media cache（圖片 / 影片 byte-exact dedup，Phase 1 from §3 chain）────────
+
+
+def compute_sha256(data: bytes) -> str:
+    """SHA-256 hex digest，給 media_cache lookup key 用。"""
+    return hashlib.sha256(data).hexdigest()
+
+
+def lookup_media_cache(
+    group_id: str,
+    media_type: str,
+    sha256_hex: str,
+) -> dict | None:
+    """查 media_cache。命中回 dict（cache_id / description / last_reply /
+    first_seen_at / last_seen_at / seen_count），miss 回 None。
+
+    PK 含 group_id 防 cross-group leak（同 sha 在不同 group 是獨立 cache）。
+    """
+    if not group_id or not media_type or not sha256_hex:
+        return None
+    with _conn() as c:
+        row = c.execute(
+            "SELECT cache_id, description, last_reply, first_seen_at, "
+            "last_seen_at, seen_count "
+            "FROM media_cache WHERE group_id = ? AND media_type = ? AND sha256 = ?",
+            (group_id, media_type, sha256_hex),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "cache_id": row[0],
+        "description": row[1],
+        "last_reply": row[2],
+        "first_seen_at": row[3],
+        "last_seen_at": row[4],
+        "seen_count": row[5],
+    }
+
+
+def insert_media_cache(
+    group_id: str,
+    media_type: str,
+    sha256_hex: str,
+    description: str | None,
+    reply: str,
+) -> int | None:
+    """寫一筆 media_cache。回 cache_id；重複 sha / 空 reply 回 None。
+
+    Quality gate (Phase 1)：reply 空字串 / 純 whitespace 拒絕寫入（防永久空 reply）。
+    INSERT OR IGNORE：同 (group_id, media_type, sha) 已存在不覆寫。
+
+    Phase 1.5 deferred (per advisor family-bot threat model):
+      - cache_version column 沒加：改 _CORE_PROMPT / vision model / v4 pipeline 後
+        要手動 `DELETE FROM media_cache;` invalidate 舊 row（沒自動失效機制）
+      - expires_at TTL：對齊 fact_check_cache 7d，但 byte-exact 圖實測再決定
+      - In-flight dedup：同 sha 多 thread 同時跑 v4，family 5 人 rare race accept
+      - source_msg_id：debug 追溯用，YAGNI Phase 1
+    """
+    if not group_id or not media_type or not sha256_hex:
+        return None
+    if not reply or not reply.strip():
+        return None
+    now = int(_time.time())
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "INSERT OR IGNORE INTO media_cache"
+            "(group_id, media_type, sha256, description, last_reply, "
+            "first_seen_at, last_seen_at, seen_count) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
+            (group_id, media_type, sha256_hex, description, reply, now, now),
+        )
+        if cur.rowcount == 0:
+            return None
+        return c.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def bump_media_cache_seen(cache_id: int) -> None:
+    """命中 cache 後 seen_count +1、last_seen_at = now。caller 顯式 call。"""
+    if not cache_id:
+        return
+    now = int(_time.time())
+    with _lock, _conn() as c:
+        c.execute(
+            "UPDATE media_cache SET seen_count = seen_count + 1, "
+            "last_seen_at = ? WHERE cache_id = ?",
+            (now, cache_id),
+        )

@@ -1196,7 +1196,7 @@ def _handle_image_message(event, group_id):
     def _run():
         try:
             import media_pipeline
-            holder["reply"] = media_pipeline.analyze_image(bytes(data))
+            holder["reply"] = media_pipeline.analyze_image(bytes(data), group_id=group_id)
         except Exception as e:
             logger.warning("image analyze failed: %s", e)
 
@@ -1237,7 +1237,7 @@ def _handle_video_message(event, group_id):
     def _run():
         try:
             import media_pipeline
-            holder["reply"] = media_pipeline.analyze_video(bytes(data))
+            holder["reply"] = media_pipeline.analyze_video(bytes(data), group_id=group_id)
         except Exception as e:
             logger.warning("video analyze failed: %s", e)
 
@@ -1665,11 +1665,11 @@ def _media_pipeline_fallback(
         if mime_type.startswith("image/"):
             from media_pipeline import analyze_image
 
-            reply = analyze_image(data, user_prompt=clean_text or "")
+            reply = analyze_image(data, user_prompt=clean_text or "", group_id=group_id)
         elif mime_type.startswith("video/"):
             from media_pipeline import analyze_video
 
-            reply = analyze_video(data, user_prompt=clean_text or "")
+            reply = analyze_video(data, user_prompt=clean_text or "", group_id=group_id)
         else:
             return
     except ImportError as e:
@@ -1998,6 +1998,7 @@ def _handle_file_message(event: MessageEvent, group_id: str) -> None:
                             "不要以「使用者」「我看到」「咪寶」「這張圖」等空話開頭。"
                             f"\n\n[檔名：{file_name}]"
                         ),
+                        group_id=group_id,
                     )
                     logger.info(
                         "file image local fallback: %s -> %d chars",
@@ -2056,6 +2057,7 @@ def _handle_file_message(event: MessageEvent, group_id: str) -> None:
                                         "請分析內容，第一句必須是具體判斷，"
                                         "不要以「使用者」「我看到」「咪寶」開頭。"
                                     ),
+                                    group_id=group_id,
                                 )
                                 if reply_text and fitz_pages > 1:
                                     reply_text = (
@@ -4175,7 +4177,7 @@ def _pop_pending_for_piggyback(group_id: str) -> str | None:
     def _run():
         try:
             import media_pipeline
-            holder["reply"] = media_pipeline.analyze_image(img_data)
+            holder["reply"] = media_pipeline.analyze_image(img_data, group_id=group_id)
         except Exception as e:
             logger.warning("piggyback image analyze failed: %s", e)
 
@@ -4238,6 +4240,7 @@ def _drain_pending_file(
                     "不要以「使用者」「我看到」「咪寶」「這張圖」等空話開頭。"
                     f"\n\n[檔名：{file_name}]"
                 ),
+                group_id=group_id,
             )
         except Exception as e:
             logger.warning("drain image fallback failed: %s", e)
@@ -4294,6 +4297,7 @@ def _drain_pending_file(
                             "請分析內容，第一句必須是具體判斷，"
                             "不要以「使用者」「我看到」「咪寶」開頭。"
                         ),
+                        group_id=group_id,
                     )
                     if desc and fitz_pages > 1:
                         return f"{desc}\n\n（scanned PDF 共 {fitz_pages} 頁，只分析第一頁）"
