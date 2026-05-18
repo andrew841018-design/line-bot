@@ -46,8 +46,8 @@ def _generate_reply(entry: dict) -> str | None:
             except Exception as e:
                 log.warning("audio_local failed: %s", e)
                 return None
-            import llm_router
-            return llm_router.fallback_chat(
+            import lite_reply
+            return lite_reply.lite_reply(
                 f"(family voice memo transcribed)\n{text}", context=[]
             )
         if typ == "file":
@@ -65,8 +65,8 @@ def _generate_reply(entry: dict) -> str | None:
                 return None
             if not text:
                 return None
-            import llm_router
-            return llm_router.fallback_chat(
+            import lite_reply
+            return lite_reply.lite_reply(
                 f"(family sent file {fname}, content below)\n{text}", context=[]
             )
         if typ == "text":
@@ -76,8 +76,8 @@ def _generate_reply(entry: dict) -> str | None:
             qo = entry.get("quoted_original")
             if qo:
                 text = f"(quoted)\n{qo}\n\n(reply)\n{text}"
-            import llm_router
-            return llm_router.fallback_chat(text, context=[])
+            import lite_reply
+            return lite_reply.lite_reply(text, context=[])
     except Exception as e:
         log.warning(
             "generate type=%s msg_id=%s failed: %s",

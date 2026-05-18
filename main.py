@@ -157,24 +157,26 @@ def _llm_chat(
     facts: list[str],
     pnotes: list[dict] | None = None,
 ) -> str:
-    """Gemini chat。quota 爆時走 llm_router.fallback_chat 4-tier waterfall。
+    """Gemini chat。quota 爆時改走 lite_reply 純規則模板 fallback。
 
-    2026-05-08：quota 爆時改走 4-tier waterfall（local_llm → RAG → lite_reply）。
-    全敗回空字串（caller 沉默）。
+    2026-05-18：移除 local_llm / RAG / agent_loop / llm_router 等本機 text LLM 系列
+    （user directive: local 只負責圖片回應，其餘 gemini 負責）。Gemini 爆時 fallback
+    從 4-tier 簡化為 lite_reply 單 tier (Stage 1 寫死 handlers + Stage 3 rule-based,
+    lite_reply.py 內 Stage 2 local LLM 自動 graceful degrade)。全敗回 ""。
     """
     if _quota_exhausted():
         try:
-            import llm_router
-            out = llm_router.fallback_chat(user_input, context=context)
+            import lite_reply
+            from gemini_client import _extract_text
+            user_text = _extract_text(user_input)
+            out = lite_reply.lite_reply(user_text, context=context)
             if out:
-                from gemini_client import _extract_text
-                user_text = _extract_text(user_input)
                 logger.info(
-                    "quota exhausted → fallback_chat hit (text=%r)", user_text[:50]
+                    "quota exhausted → lite_reply hit (text=%r)", user_text[:50]
                 )
                 return out
         except Exception as e:
-            logger.warning("llm_router.fallback_chat failed: %s", e)
+            logger.warning("lite_reply fallback failed: %s", e)
         return ""
     result = gemini_client.chat(user_input, context, facts, pnotes)
     if result:
