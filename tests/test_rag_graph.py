@@ -304,3 +304,43 @@ def test_compiled_graph_invoke_rejects_disallowed_model_via_config():
     config = {"configurable": {"model": "evil-model-v9000"}}
     with pytest.raises(ValueError, match="Disallowed model"):
         rag_graph.get_graph().invoke(state, config=config)
+
+
+# ---------- Phase 2B.6 — config sensitivity (GP2 advisory + GP3 IMPORTANT) ----------
+
+def test_no_config_in_rag_graph_logger_args():
+    """Phase 2B.6 GP2 advisory + GP3 IMPORTANT: rag_graph.py must NOT pass
+    `config` or `configurable` to any logger call. config carries future
+    sensitive fields (tenant_id, billing keys per rag_graph docstring).
+
+    AST walk catches the Name appearing as a direct arg OR via f-string
+    interpolation (`logger.info(f"{config}")`) OR within a nested call
+    (`logger.info(json.dumps(config))`).
+
+    LIMITATIONS (GP2 NIT): does NOT catch alias rebinding
+    (`cfg2 = config; logger.info(cfg2)`) or `logger.bind(config=...)`
+    method-chain forms. Code review remains the primary contract; this
+    test is defense-in-depth against the common-case slip.
+    """
+    import ast
+    from pathlib import Path
+    src = (Path(__file__).resolve().parent.parent / "rag_graph.py").read_text("utf-8")
+    tree = ast.parse(src)
+    # `log` included for the generic `logger.log(level, msg, ...)` form
+    # (Phase 2B.6 post-impl codex NIT).
+    log_methods = {"debug", "info", "warning", "error", "critical", "exception", "log"}
+    violations = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in log_methods
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "logger"):
+            for child in ast.walk(node):
+                if isinstance(child, ast.Name) and child.id in {"config", "configurable"}:
+                    violations.append((node.lineno, ast.unparse(node)))
+                    break
+    assert not violations, (
+        f"rag_graph.py logs config/configurable (sensitive — see module docstring): "
+        f"{violations}"
+    )

@@ -1208,7 +1208,7 @@ def _chat_via_graph(
     `_node_generate` reads model from config only — no longer from state.
     """
     import rag_graph
-    state = {
+    state: rag_graph.RagInput = {
         "user_input": user_input,
         "context": context,
         "facts": facts,
@@ -1216,7 +1216,12 @@ def _chat_via_graph(
         "group_id": group_id,
     }
     config = {"configurable": {"model": settings.gemini_model}}
-    return rag_graph.get_graph().invoke(state, config=config)["response"]
+    # Phase 2B.6: state is RagInput (5 caller-set fields). langgraph at
+    # runtime accepts the dict and the graph's StateGraph(RagState) is
+    # total=False so omitting node-set fields is fine; mypy strict mode
+    # may flag the covariance — silenced as honest documentation that
+    # the caller genuinely owns only the input fields.
+    return rag_graph.get_graph().invoke(state, config=config)["response"]  # type: ignore[arg-type]
 
 
 def chat(

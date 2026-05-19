@@ -10,6 +10,7 @@ ALLOWED_GROUP_ID 為空字串時 = 尚未鎖定群組，bot 會把收到的 sour
 
 from __future__ import annotations
 
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -57,6 +58,39 @@ class Settings(BaseSettings):
     # USE_RAG_GRAPH=true + full uvicorn restart (pydantic-settings reads
     # `.env` at import; SIGHUP won't reload).
     use_rag_graph: bool = False
+
+    # ── Phase 2B.6 hardening validators ──────────────────────────────────────
+    # field-level: every Gemini model name must look like "gemini-..." (catches
+    # fat-fingered env values). model-level: gemini_model and gemini_light_model
+    # MUST differ — else rag_graph allowlist collapses to a 1-element set AND
+    # the 503/429 lite fallback gate (`model != settings.gemini_light_model`)
+    # never fires. Misconfigured `.env` will fail at import — every cron job
+    # (daily_briefing_discord, ptt_alert, feedback_push, etc.) WILL crash on
+    # startup; this is fail-fast hardening, not subtle behaviour change.
+
+    @field_validator("gemini_model", "gemini_light_model")
+    @classmethod
+    def _validate_gemini_model_name(cls, v: str) -> str:
+        # `.strip()` neutralizes trailing-space typos (GP2 NIT) so we don't
+        # silently accept e.g. "gemini-2.5-flash " which passes prefix check
+        # but fails the actual SDK call.
+        v = v.strip()
+        if not v.startswith("gemini-"):
+            raise ValueError(
+                f"Gemini model name must start with 'gemini-' (got {v!r}); "
+                "otherwise rag_graph allowlist would silently bypass on lite fallback."
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _models_distinct(self):
+        if self.gemini_model == self.gemini_light_model:
+            raise ValueError(
+                "gemini_model and gemini_light_model must differ "
+                f"(both are {self.gemini_model!r}) — otherwise rag_graph "
+                "allowlist collapses to 1 element AND 503/429 fallback never fires."
+            )
+        return self
 
 
 settings = Settings()  # type: ignore[call-arg]

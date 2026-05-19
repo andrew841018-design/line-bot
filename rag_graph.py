@@ -33,20 +33,34 @@ from gemini_core import MIN_RECALL_LEN, _NEWS_CASE_RE, _RunKwargs
 logger = logging.getLogger(__name__)
 
 
-class RagState(TypedDict, total=False):
-    """Mutable state flowing through the graph nodes.
+class RagInput(TypedDict, total=False):
+    """Phase 2B.6: caller-set subset of RagState used by
+    `gemini_client._chat_via_graph` to build the invoke input.
 
-    Per §3 chain GP1 #6: last-write-wins default merging is sufficient since
-    each field has a single writer node (no Annotated reducer needed).
-
-    Phase 2B.5: `model` removed from state — now passed via RunnableConfig.
+    Documentation-only boundary (per Phase 2B.6 GP2 NIT): TypedDict has
+    no runtime isolation — the single trusted construction site is
+    `gemini_client._chat_via_graph`. If a future contributor adds a
+    sensitive field (e.g., tenant_id) to RagState (node-set output),
+    do NOT extend RagInput to include it — keep the input surface
+    minimal and bounded.
     """
-    # Inputs (set before invoke)
     group_id: Optional[str]
     user_input: object  # str | types.Part | list (multi-modal)
     context: list
     facts: list
     persona_notes: Optional[list]
+
+
+class RagState(RagInput, total=False):
+    """Full mutable state flowing through the graph nodes — inherits the
+    5 caller-set fields from RagInput plus 5 node-derived / output fields.
+
+    Per §3 chain GP1 #6: last-write-wins default merging is sufficient since
+    each field has a single writer node (no Annotated reducer needed).
+
+    Phase 2B.5: `model` removed from state — now passed via RunnableConfig.
+    Phase 2B.6: split into RagInput (caller-set) + this (node-set superset).
+    """
     # Cached / derived
     user_text: str
     # Retrieved
@@ -54,7 +68,7 @@ class RagState(TypedDict, total=False):
     case_hits: Optional[list]
     # Output
     response: str
-    # Reserved for Phase 2B.6+ LangSmith integration (per GP2 #10)
+    # Reserved for Phase 2B.7+ LangSmith integration (per GP2 #10)
     trace_id: Optional[str]
 
 
