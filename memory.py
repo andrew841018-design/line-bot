@@ -146,6 +146,19 @@ def _init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_media_cache_lookup
                 ON media_cache(group_id, media_type, sha256);
+            CREATE TABLE IF NOT EXISTS embeddings (
+                message_id TEXT PRIMARY KEY,
+                group_id   TEXT NOT NULL,
+                text       TEXT NOT NULL,
+                embedding  BLOB NOT NULL,
+                backend    TEXT NOT NULL,
+                dim        INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                model_name TEXT NOT NULL DEFAULT '',
+                is_bot     INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_embeddings_group
+                ON embeddings(group_id);
             """
         )
         # kg_triples schema migration: ALTER TABLE 自動補 column
@@ -205,6 +218,8 @@ def _init_db() -> None:
         # all coexist; we tag every row with the producing model so
         # retrieve() can filter to the same model as the active query
         # embedding (mixing dims would break the matrix scan).
+        # 2026-05-19: add is_bot column for fast bot_only filter in
+        # embedding_recall.retrieve() (avoid JOIN on raw_messages per round).
         ec = c.execute(
             "SELECT name FROM sqlite_master "
             "WHERE type='table' AND name='embeddings'"
@@ -221,6 +236,11 @@ def _init_db() -> None:
             if "dim" not in ecols:
                 c.execute(
                     "ALTER TABLE embeddings ADD COLUMN dim INTEGER NOT NULL "
+                    "DEFAULT 0"
+                )
+            if "is_bot" not in ecols:
+                c.execute(
+                    "ALTER TABLE embeddings ADD COLUMN is_bot INTEGER NOT NULL "
                     "DEFAULT 0"
                 )
             # Index lets retrieve() narrow to (group_id, model_name) cheaply
@@ -367,7 +387,12 @@ _RAW_MESSAGE_KEEP = 2000  # 每群組保留最近 N 筆原始訊息（給 quote-
 def log_raw_message(
     group_id: str, message_id: str, user_id: str | None, text: str
 ) -> None:
-    """記錄原始訊息，供之後 quote-reply 時查詢。超過 _RAW_MESSAGE_KEEP 筆自動汰舊。"""
+    """記錄原始訊息，供之後 quote-reply 時查詢。超過 _RAW_MESSAGE_KEEP 筆自動汰舊。
+
+    2026-05-19: 加 semantic embedding hook — 寫完 raw_messages 後同步呼
+    embedding_recall.index_message。內部 try/except，失敗只 log 不阻塞主流程。
+    ~50ms ST inference，被 Gemini 回覆耗時（>2s）淹沒，webhook 延遲影響可忽略。
+    """
     if not message_id or not text:
         return
     with _lock, _conn() as c:
@@ -384,6 +409,12 @@ def log_raw_message(
             " ORDER BY created_at DESC LIMIT ?)",
             (group_id, group_id, _RAW_MESSAGE_KEEP),
         )
+    # Embedding hook — lazy import 避免循環依賴；任何錯誤都 swallow
+    try:
+        from embedding_recall import index_message as _idx
+        _idx(message_id, group_id, text, is_bot=(user_id == "__bot__"))
+    except Exception:
+        pass
 
 
 def get_raw_message(group_id: str, message_id: str) -> tuple[str | None, str] | None:

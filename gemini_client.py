@@ -640,6 +640,8 @@ def _build_system_instruction(
     facts: list[str],
     persona_notes: list[dict] | None = None,
     user_input=None,
+    recall_hits: list[dict] | None = None,
+    case_hits: list[dict] | None = None,
 ) -> str:
     base = _CORE_PROMPT.strip()
 
@@ -648,6 +650,26 @@ def _build_system_instruction(
         active_packs = _detect_rule_packs(user_input)
         if active_packs:
             base += "\n\n" + "\n".join(p.strip() for p in active_packs)
+
+    # Semantic recall (2026-05-19) — 注入語意相關的歷史對話，給 Gemini 群組脈絡用
+    if recall_hits:
+        try:
+            from embedding_recall import format_recall_block
+            block = format_recall_block(recall_hits)
+            if block:
+                base += "\n\n" + block
+        except Exception:
+            pass
+
+    # Case anchor (2026-05-19) — 新聞/案例觸發時，注入過去類似 case 的咪寶回覆作風格錨點
+    if case_hits:
+        try:
+            from embedding_recall import format_case_block
+            block = format_case_block(case_hits)
+            if block:
+                base += "\n\n" + block
+        except Exception:
+            pass
 
     # 注入從真實對話學到的好範例
     examples = [n for n in (persona_notes or []) if n["kind"] == "example"]
@@ -698,10 +720,13 @@ def _build_config(
     facts: list[str],
     persona_notes: list[dict] | None = None,
     user_input=None,
+    recall_hits: list[dict] | None = None,
+    case_hits: list[dict] | None = None,
 ) -> types.GenerateContentConfig:
     return types.GenerateContentConfig(
         system_instruction=_build_system_instruction(
-            facts, persona_notes, user_input=user_input
+            facts, persona_notes, user_input=user_input,
+            recall_hits=recall_hits, case_hits=case_hits,
         ),
         tools=_TOOLS,  # type: ignore[arg-type]
         thinking_config=types.ThinkingConfig(thinking_budget=-1),  # -1 = 動態 thinking
@@ -1207,10 +1232,32 @@ def chat(
         return _append_sources(current_text, current_urls)
 
 
+    # Semantic recall (2026-05-19) — 在主對話前撈相關歷史 + 類似 case 注入 system instruction
+    # 失敗永遠 silent，Gemini 仍照舊跑（recall_hits / case_hits 為 None 等於不注入）
+    recall_hits: list[dict] | None = None
+    case_hits: list[dict] | None = None
+    if group_id:
+        try:
+            import embedding_recall
+            _user_text_for_recall = _extract_text(user_input)
+            if _user_text_for_recall and len(_user_text_for_recall.strip()) >= 4:
+                recall_hits = embedding_recall.retrieve(
+                    group_id, _user_text_for_recall
+                ) or None
+                if _NEWS_CASE_RE.search(_user_text_for_recall):
+                    case_hits = embedding_recall.retrieve_case_pairs(
+                        group_id, _user_text_for_recall
+                    ) or None
+        except Exception as e:
+            logger.warning("semantic recall retrieve failed: %s", e)
+
     def _run(model: str) -> str:
         chat_session = _client.chats.create(
             model=model,
-            config=_build_config(facts, persona_notes, user_input=user_input),
+            config=_build_config(
+                facts, persona_notes, user_input=user_input,
+                recall_hits=recall_hits, case_hits=case_hits,
+            ),
             history=_to_gemini_history(context),  # type: ignore[arg-type]
         )
         last_err: Exception | None = None
