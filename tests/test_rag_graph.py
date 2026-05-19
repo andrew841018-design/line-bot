@@ -168,8 +168,12 @@ def test_node_generate_503_falls_back_to_lite_with_same_kwargs():
     """BLOCKER 2 fix: 503 on main model triggers ONE retry with lite model
     using the EXACT same run_kwargs (recall_hits / case_hits / facts /
     context already resolved in state). Retrieval nodes must NOT re-run.
+
+    Phase 2B.5: model now passed via config["configurable"]["model"],
+    NOT via state — `model` removed from RagState.
     """
     from unittest.mock import patch as _patch
+    from config import settings
     base_state = {
         "user_input": "hi there",
         "context": [("user", "old")],
@@ -178,25 +182,25 @@ def test_node_generate_503_falls_back_to_lite_with_same_kwargs():
         "recall_hits": [{"text": "past"}],
         "case_hits": None,
         "group_id": "C_test",
-        "model": "gemini-2.0-flash",
     }
+    config = {"configurable": {"model": settings.gemini_model}}
     calls = []
 
     def fake_run(model, **kwargs):
         calls.append((model, kwargs))
-        if model == "gemini-2.0-flash":
+        if model == settings.gemini_model:
             raise RuntimeError("503 service unavailable")
         return "lite reply"
 
     with _patch("gemini_client._run", side_effect=fake_run):
-        result = rag_graph._node_generate(base_state)
+        result = rag_graph._node_generate(base_state, config=config)
 
     assert result == {"response": "lite reply"}
     assert len(calls) == 2, f"expected exactly 2 _run calls (main + lite), got {len(calls)}"
     main_model, main_kwargs = calls[0]
     lite_model, lite_kwargs = calls[1]
-    assert main_model == "gemini-2.0-flash"
-    assert lite_model != main_model
+    assert main_model == settings.gemini_model
+    assert lite_model == settings.gemini_light_model
     # CRITICAL: lite retry must receive byte-identical resolved kwargs
     assert main_kwargs == lite_kwargs, "lite retry must reuse same kwargs (no re-retrieval)"
     assert main_kwargs["recall_hits"] == [{"text": "past"}]
@@ -204,33 +208,35 @@ def test_node_generate_503_falls_back_to_lite_with_same_kwargs():
 
 def test_node_generate_429_perday_falls_back():
     from unittest.mock import patch as _patch
+    from config import settings
     state = {
         "user_input": "hi", "context": [], "facts": [], "persona_notes": None,
         "recall_hits": None, "case_hits": None, "group_id": None,
-        "model": "gemini-2.0-flash",
     }
+    config = {"configurable": {"model": settings.gemini_model}}
 
     def fake_run(model, **kwargs):
-        if model == "gemini-2.0-flash":
+        if model == settings.gemini_model:
             raise RuntimeError("429 RESOURCE_EXHAUSTED PerDay free_tier_requests")
         return "lite reply"
 
     with _patch("gemini_client._run", side_effect=fake_run):
-        result = rag_graph._node_generate(state)
+        result = rag_graph._node_generate(state, config=config)
     assert result == {"response": "lite reply"}
 
 
 def test_node_generate_non_fallback_exception_propagates():
     """Non-503/non-429 exception must propagate unchanged (no spurious fallback)."""
     from unittest.mock import patch as _patch
+    from config import settings
     state = {
         "user_input": "hi", "context": [], "facts": [], "persona_notes": None,
         "recall_hits": None, "case_hits": None, "group_id": None,
-        "model": "gemini-2.0-flash",
     }
+    config = {"configurable": {"model": settings.gemini_model}}
     with _patch("gemini_client._run", side_effect=RuntimeError("permission denied")):
         with pytest.raises(RuntimeError, match="permission denied"):
-            rag_graph._node_generate(state)
+            rag_graph._node_generate(state, config=config)
 
 
 def test_node_generate_503_when_already_lite_does_not_recurse():
@@ -240,8 +246,61 @@ def test_node_generate_503_when_already_lite_does_not_recurse():
     state = {
         "user_input": "hi", "context": [], "facts": [], "persona_notes": None,
         "recall_hits": None, "case_hits": None, "group_id": None,
-        "model": settings.gemini_light_model,
     }
+    config = {"configurable": {"model": settings.gemini_light_model}}
     with _patch("gemini_client._run", side_effect=RuntimeError("503 unavailable")):
         with pytest.raises(RuntimeError, match="503"):
-            rag_graph._node_generate(state)
+            rag_graph._node_generate(state, config=config)
+
+
+# ---------- Phase 2B.5 — model allowlist (codex+gemini+GP2 BLOCKER consensus) ----------
+
+def test_node_generate_disallowed_model_raises_value_error():
+    """Allowlist: any model name outside {gemini_model, gemini_light_model}
+    must raise ValueError (fail-closed). Defense-in-depth for future paths
+    that might plumb user-controllable model selection.
+    """
+    state = {
+        "user_input": "hi", "context": [], "facts": [], "persona_notes": None,
+        "recall_hits": None, "case_hits": None, "group_id": None,
+    }
+    config = {"configurable": {"model": "evil-model-v9000"}}
+    with pytest.raises(ValueError, match="Disallowed model"):
+        rag_graph._node_generate(state, config=config)
+
+
+def test_node_generate_no_config_defaults_to_settings_gemini_model():
+    """When config=None (e.g. direct test call), resolve to settings.gemini_model
+    which is in allowlist by construction. No ValueError.
+    """
+    from unittest.mock import patch as _patch
+    from config import settings
+    state = {
+        "user_input": "hi", "context": [], "facts": [], "persona_notes": None,
+        "recall_hits": None, "case_hits": None, "group_id": None,
+    }
+    captured = []
+    def fake_run(model, **kwargs):
+        captured.append(model)
+        return "ok"
+    with _patch("gemini_client._run", side_effect=fake_run):
+        rag_graph._node_generate(state)  # config=None default
+    assert captured == [settings.gemini_model]
+
+
+def test_compiled_graph_invoke_rejects_disallowed_model_via_config():
+    """Codex BLOCKER lock-in: verifies langgraph 1.2.0 actually injects
+    `config` into _node_generate via signature introspection. If the
+    annotation regresses from `Optional[RunnableConfig]` to
+    `RunnableConfig | None`, config injection breaks silently and the
+    bad model would just default to settings.gemini_model (passing).
+    This invoke-level test catches that.
+    """
+    rag_graph.get_graph.cache_clear()
+    state = {
+        "user_input": "hi", "context": [], "facts": [],
+        "persona_notes": None, "group_id": None,
+    }
+    config = {"configurable": {"model": "evil-model-v9000"}}
+    with pytest.raises(ValueError, match="Disallowed model"):
+        rag_graph.get_graph().invoke(state, config=config)

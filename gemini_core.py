@@ -10,6 +10,7 @@ belongs in gemini_client until Phase 2B.2.3.
 from __future__ import annotations
 
 import re
+from typing import TypedDict
 
 __all__ = [
     "_RULE_NEWS_CASE",
@@ -22,7 +23,37 @@ __all__ = [
     "_append_sources",
     "_is_chinese_majority",
     "_count_zh_chars",
+    # Phase 2B.5 — shared constants + typed kwargs for gemini_client._run
+    "MIN_RECALL_LEN",
+    "_RunKwargs",
 ]
+
+
+# Phase 2B.5: minimum user_text strip-length to fire semantic recall +
+# case-pair retrieval. Shared between inline gemini_client.chat() and
+# rag_graph nodes (_node_semantic_retrieve, _node_case_retrieve,
+# _route_after_semantic) — single source of truth prevents future
+# re-divergence between the two paths.
+MIN_RECALL_LEN: int = 4
+
+
+class _RunKwargs(TypedDict):
+    """Phase 2B.5: typed kwargs contract for `gemini_client._run`.
+
+    Mirrors `_run`'s signature exactly (7 keyword-only args after `model`).
+    Update both definitions atomically — this dict IS the contract surface.
+
+    total=True (default): every call site must populate all 7 keys.
+    Substitutes for the previous `dict(...)` builder pattern that mypy
+    could not narrow at `**kwargs` call sites.
+    """
+    user_input: object  # MessageInput = str | types.Part | list (multi-modal)
+    context: list[tuple[str, str]]
+    facts: list[str]
+    persona_notes: list[dict] | None
+    recall_hits: list[dict] | None
+    case_hits: list[dict] | None
+    group_id: str | None
 
 
 _RULE_NEWS_CASE = """【新聞 / 案例 / 研究 / 專業議題分享 = 必給觀點 + 多源】（2026-05-04 加，補 23f 在非政治話題的覆蓋）

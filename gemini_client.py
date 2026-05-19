@@ -29,7 +29,7 @@ from google import genai
 from google.genai import types
 
 from config import settings
-from gemini_core import (  # Phase 2B.2.1-2 re-exports
+from gemini_core import (  # Phase 2B.2.1-2 + 2B.5 re-exports
     _NEWS_CASE_RE,
     _RULE_NEWS_CASE,
     _CITE_RE,
@@ -39,6 +39,8 @@ from gemini_core import (  # Phase 2B.2.1-2 re-exports
     _append_sources,
     _is_chinese_majority,
     _count_zh_chars,
+    MIN_RECALL_LEN,
+    _RunKwargs,
 )
 
 logger = logging.getLogger(__name__)
@@ -1200,6 +1202,10 @@ def _chat_via_graph(
 
     Lazy `import rag_graph` is intentional: keeps langgraph out of the
     import graph when the flag is OFF.
+
+    Phase 2B.5: model is now passed via `config={"configurable": {...}}`
+    (idiomatic langgraph) rather than as a state field. The graph's
+    `_node_generate` reads model from config only — no longer from state.
     """
     import rag_graph
     state = {
@@ -1209,7 +1215,8 @@ def _chat_via_graph(
         "persona_notes": persona_notes,
         "group_id": group_id,
     }
-    return rag_graph.get_graph().invoke(state)["response"]
+    config = {"configurable": {"model": settings.gemini_model}}
+    return rag_graph.get_graph().invoke(state, config=config)["response"]
 
 
 def chat(
@@ -1276,7 +1283,7 @@ def chat(
         try:
             import embedding_recall
             _user_text_for_recall = _extract_text(user_input)
-            if _user_text_for_recall and len(_user_text_for_recall.strip()) >= 4:
+            if _user_text_for_recall and len(_user_text_for_recall.strip()) >= MIN_RECALL_LEN:
                 recall_hits = embedding_recall.retrieve(
                     group_id, _user_text_for_recall
                 ) or None
@@ -1287,15 +1294,18 @@ def chat(
         except Exception as e:
             logger.warning("semantic recall retrieve failed: %s", e)
 
-    _run_kwargs = dict(
-        user_input=user_input,
-        context=context,
-        facts=facts,
-        persona_notes=persona_notes,
-        recall_hits=recall_hits,
-        case_hits=case_hits,
-        group_id=group_id,
-    )
+    # Phase 2B.5: typed dict literal for mypy narrowing at `**_run_kwargs` call.
+    # Shared TypedDict in gemini_core ensures graph + inline paths build
+    # byte-identical kwargs (parity-by-construction).
+    _run_kwargs: _RunKwargs = {
+        "user_input": user_input,
+        "context": context,
+        "facts": facts,
+        "persona_notes": persona_notes,
+        "recall_hits": recall_hits,
+        "case_hits": case_hits,
+        "group_id": group_id,
+    }
     try:
         return _run(settings.gemini_model, **_run_kwargs)
     except Exception as e:
