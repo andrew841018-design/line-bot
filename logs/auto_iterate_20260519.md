@@ -149,3 +149,5 @@ INFO:     Application shutdown complete.
 3. **launchd 重複 fire / 8080 port 被佔**：若 line_bot_health 重啟邏輯沒檢查 PID，常會堆兩個 uvicorn 互搶 port 80。下輪可以幫 health check job 加 `pgrep -f uvicorn` guard
 
 
+[12:51:51] iter 1 後 pytest 全綠，提早退出
+[12:51:51] ## Step 7: 仍有未 commit 變更，catch-all 上傳

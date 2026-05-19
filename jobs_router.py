@@ -38,6 +38,7 @@ from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from jobs_config import JOB_REGISTRY, JobSpec
 
@@ -62,6 +63,10 @@ _SECRET_PATTERNS = [
     (re.compile(r"(postgres(?:ql)?://[^:]+:)[^@\s]+"), r"\1REDACTED"),
 ]
 
+_DISCORD_ALERT_PURPOSE = "discord-alert"
+_DISCORD_ALERT_LIMIT = 1900
+_DISCORD_ALERT_BODY_LIMIT = 7000
+
 
 def _master_token() -> str:
     tok = os.environ.get("JOBS_MASTER_TOKEN", "")
@@ -70,10 +75,14 @@ def _master_token() -> str:
     return tok
 
 
-def _per_job_token(job_name: str) -> str:
+def _purpose_token(purpose: str) -> str:
     return hmac.new(
-        _master_token().encode(), job_name.encode(), hashlib.sha256
+        _master_token().encode(), purpose.encode(), hashlib.sha256
     ).hexdigest()
+
+
+def _per_job_token(job_name: str) -> str:
+    return _purpose_token(job_name)
 
 
 def _sanitize(text: str) -> str:
@@ -131,6 +140,73 @@ def _check_token(request: Request, job_name: str) -> None:
     expected = _per_job_token(job_name)
     if not hmac.compare_digest(received, expected):
         raise HTTPException(401, "invalid token")
+
+
+def _check_purpose_token(request: Request, purpose: str) -> None:
+    received = request.headers.get("X-Job-Token", "")
+    expected = _purpose_token(purpose)
+    if not hmac.compare_digest(received, expected):
+        raise HTTPException(401, "invalid token")
+
+
+async def _read_discord_alert_payload(request: Request) -> dict[str, Any]:
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > _DISCORD_ALERT_BODY_LIMIT:
+                raise HTTPException(413, "payload too large")
+        except ValueError:
+            raise HTTPException(400, "invalid content-length")
+
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > _DISCORD_ALERT_BODY_LIMIT:
+            raise HTTPException(413, "payload too large")
+        chunks.append(chunk)
+
+    body = b"".join(chunks)
+    if not body:
+        raise HTTPException(400, "json body required")
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise HTTPException(400, "invalid json")
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "json object required")
+    return payload
+
+
+def _discord_alert_content(payload: dict[str, Any]) -> str:
+    raw = payload.get("content") if payload.get("content") is not None else payload.get("message")
+    if not isinstance(raw, str) or not raw.strip():
+        raise HTTPException(400, "content required")
+    text = _sanitize(raw.strip())
+    suffix = "\n... (truncated)"
+    if len(text) > _DISCORD_ALERT_LIMIT:
+        text = text[: _DISCORD_ALERT_LIMIT - len(suffix)] + suffix
+    return text
+
+
+def _deliver_discord_alert(message: str) -> bool:
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(dotenv_path=_HERE / ".env", override=False)
+    except ImportError:
+        pass
+    if not os.environ.get("DISCORD_BOT_TOKEN") or not os.environ.get("DISCORD_USER_ID"):
+        raise HTTPException(503, "Discord DM is not configured")
+    try:
+        from notify_discord import send_dm
+
+        return bool(send_dm(message))
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.warning("discord alert delivery raised: %s", type(e).__name__)
+        return False
 
 
 def _check_rate_limit(job_name: str) -> None:
@@ -251,6 +327,19 @@ def _run_subprocess(job_name: str, spec: JobSpec) -> None:
                 lock_fd.close()
             except Exception:
                 pass
+
+
+@router.post("/discord-alert")
+async def discord_alert(request: Request):
+    """Local n8n failure-alert bridge to the existing Discord DM sender."""
+    _check_ip(request)
+    _check_origin(request)
+    _check_purpose_token(request, _DISCORD_ALERT_PURPOSE)
+    payload = await _read_discord_alert_payload(request)
+    message = _discord_alert_content(payload)
+    if not await run_in_threadpool(_deliver_discord_alert, message):
+        raise HTTPException(502, "discord alert delivery failed")
+    return JSONResponse(content={"sent": True})
 
 
 @router.post("/{job_name}")

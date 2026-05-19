@@ -109,3 +109,46 @@ INFO:     2001:b011:15:53e3:6c27:507c:6e1c:a1d9:0 - "GET /health HTTP/1.1" 200 O
 ```
 [12:25:28] ## ✅ 全綠，無需迭代
 [12:25:28] ## Step 7: 仍有未 commit 變更，catch-all 上傳
+[main fe3907e] auto iterate 20260518 (catch-all)
+ 12 files changed, 1793 insertions(+), 1 deletion(-)
+ create mode 100644 announce_finance_view.py
+ create mode 100644 food_extractor.py
+ create mode 100644 logs/auto_iterate_20260518.md
+ create mode 100644 pending_dlq.jsonl
+ create mode 100644 pending_media/18afaff2bedf4fc6988b416e23ebdc1d.jpg
+ create mode 100644 preflight_check.py
+ create mode 100644 recipes.json
+ create mode 100644 tests/test_food_assistant.py
+ create mode 100644 tests/test_food_extractor.py
+To github.com:andrew841018-design/line-bot.git
+   e3f9a86..fe3907e  main -> main
+[12:25:32] ## Step 8: restart uvicorn
+[12:25:39] /health: {"status":"ok","gemini_model":"gemini-2.5-flash","gemini_light_model":"gemini-2.5-flash-lite","group_locked":true}
+2026-05-18 12:25:46,244 INFO AFC is enabled with max remote calls: 10.
+2026-05-18 12:25:47,322 INFO HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+2026-05-18 12:25:47,352 INFO AFC is enabled with max remote calls: 10.
+2026-05-18 12:25:48,151 INFO HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent "HTTP/1.1 200 OK"
+======================================================================
+LINE bot preflight @ 2026-05-18T12:25:40
+======================================================================
+  [✓]  1. uvicorn process alive
+  [✓]  2. local /health 200
+  [✓]  3. cloudflared process alive
+  [✓]  4. cloudflared URL stash 可讀 + 安全 — url=https://optimum-burning-further-london.trycloudflare.com age=10934s
+  [✓]  5. cloudflared metrics 內部 URL 對 stash — metrics 200 但 ha_connections 沒露
+  [✓]  6. external https://optimum-burning-further-london.trycloudflare.com/health 200 — attempt=1
+  [✓]  7. /callback no-sig → 400 missing
+  [✓]  8. LINE token /v2/bot/info 200
+  [⚠]  9. LINE webhook URL 對齊 cloudflared — drift fixed: 'https://sat-suites-pushed-handle.trycloudflare.com/callback' → 'https://optimum-burning-further-london.trycloudflare.com/callback'
+  [↻] autofix triggered → re-run external + E2E
+  [✓]  6. external https://optimum-burning-further-london.trycloudflare.com/health 200 — attempt=1
+  [✓] 10. LINE → cloudflared → /callback E2E
+  [✓] 11. Gemini main probe
+  [✓] 12. Gemini lite probe
+  [✓] 13. SQLite integrity + WAL checkpoint
+  [✓] 14. pending file JSON load — groups=2 entries=38
+----------------------------------------------------------------------
+PREFLIGHT [PASS] critical=13/13 info=2/2 elapsed=9.2s autofix=1
+Discord DM 送出成功
+[12:25:50] preflight exit=0 (0=pass, 1=critical, 2=info-only, 3=infra)
+[12:25:50] ===== 結束 =====

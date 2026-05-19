@@ -112,6 +112,140 @@ def test_per_job_token_isolation(client):
     assert r.status_code == 401
 
 
+def test_discord_alert_route_sends_with_purpose_token(client, monkeypatch):
+    import jobs_router as jr
+
+    sent = []
+    monkeypatch.setattr(jr, "_deliver_discord_alert", lambda msg: sent.append(msg) or True)
+
+    r = client.post(
+        "/jobs/discord-alert",
+        headers={"X-Job-Token": _token_for("discord-alert")},
+        json={"content": "n8n failed"},
+    )
+    assert r.status_code == 200
+    assert r.json() == {"sent": True}
+    assert sent == ["n8n failed"]
+
+
+def test_discord_alert_route_rejects_job_token(client, monkeypatch):
+    import jobs_router as jr
+
+    monkeypatch.setattr(jr, "_deliver_discord_alert", lambda msg: True)
+    r = client.post(
+        "/jobs/discord-alert",
+        headers={"X-Job-Token": _token_for("daily-briefing-discord")},
+        json={"content": "n8n failed"},
+    )
+    assert r.status_code == 401
+
+
+def test_discord_alert_rejects_wrong_token_before_body_parse(client, monkeypatch):
+    import jobs_router as jr
+
+    monkeypatch.setattr(jr, "_deliver_discord_alert", lambda msg: True)
+    r = client.post(
+        "/jobs/discord-alert",
+        headers={"X-Job-Token": _token_for("daily-briefing-discord")},
+        content=b"not-json" * 2000,
+    )
+    assert r.status_code == 401
+
+
+def test_discord_alert_route_rejects_origin(client, monkeypatch):
+    import jobs_router as jr
+
+    monkeypatch.setattr(jr, "_deliver_discord_alert", lambda msg: True)
+    r = client.post(
+        "/jobs/discord-alert",
+        headers={
+            "X-Job-Token": _token_for("discord-alert"),
+            "Origin": "http://evil.example.com",
+        },
+        json={"content": "n8n failed"},
+    )
+    assert r.status_code == 403
+
+
+def test_discord_alert_route_rejects_non_loopback(client, monkeypatch):
+    import jobs_router as jr
+
+    monkeypatch.setattr(jr, "_ALLOWED_IPS", {"127.0.0.1"})
+    monkeypatch.setattr(jr, "_deliver_discord_alert", lambda msg: True)
+    r = client.post(
+        "/jobs/discord-alert",
+        headers={"X-Job-Token": _token_for("discord-alert")},
+        json={"content": "n8n failed"},
+    )
+    assert r.status_code == 403
+
+
+def test_discord_alert_route_rejects_empty_content(client, monkeypatch):
+    import jobs_router as jr
+
+    monkeypatch.setattr(jr, "_deliver_discord_alert", lambda msg: True)
+    r = client.post(
+        "/jobs/discord-alert",
+        headers={"X-Job-Token": _token_for("discord-alert")},
+        json={"content": "   "},
+    )
+    assert r.status_code == 400
+
+
+def test_discord_alert_route_rejects_oversize_payload(client, monkeypatch):
+    import jobs_router as jr
+
+    monkeypatch.setattr(jr, "_deliver_discord_alert", lambda msg: True)
+    r = client.post(
+        "/jobs/discord-alert",
+        headers={"X-Job-Token": _token_for("discord-alert")},
+        content=b"x" * (jr._DISCORD_ALERT_BODY_LIMIT + 1),
+    )
+    assert r.status_code == 413
+
+
+def test_discord_alert_sanitizes_before_send(client, monkeypatch):
+    import jobs_router as jr
+
+    sent = []
+    monkeypatch.setattr(jr, "_deliver_discord_alert", lambda msg: sent.append(msg) or True)
+    r = client.post(
+        "/jobs/discord-alert",
+        headers={"X-Job-Token": _token_for("discord-alert")},
+        json={"content": "Authorization: Bot super-secret-token failed"},
+    )
+    assert r.status_code == 200
+    assert "super-secret-token" not in sent[0]
+    assert "REDACTED" in sent[0]
+
+
+def test_discord_alert_truncates_before_send(client, monkeypatch):
+    import jobs_router as jr
+
+    sent = []
+    monkeypatch.setattr(jr, "_deliver_discord_alert", lambda msg: sent.append(msg) or True)
+    r = client.post(
+        "/jobs/discord-alert",
+        headers={"X-Job-Token": _token_for("discord-alert")},
+        json={"content": "x" * 5000},
+    )
+    assert r.status_code == 200
+    assert len(sent[0]) == jr._DISCORD_ALERT_LIMIT
+    assert sent[0].endswith("... (truncated)")
+
+
+def test_discord_alert_delivery_failure_returns_502(client, monkeypatch):
+    import jobs_router as jr
+
+    monkeypatch.setattr(jr, "_deliver_discord_alert", lambda msg: False)
+    r = client.post(
+        "/jobs/discord-alert",
+        headers={"X-Job-Token": _token_for("discord-alert")},
+        json={"content": "n8n failed"},
+    )
+    assert r.status_code == 502
+
+
 def test_last_run_never_executed(client):
     job = "daily-briefing-discord"
     r = client.get(
