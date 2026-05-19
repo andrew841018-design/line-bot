@@ -50,5 +50,13 @@ class Settings(BaseSettings):
     # 預設靜音；修 bug 完成後在 .env 加 BOT_MUTED=false 並 restart uvicorn 解除
     bot_muted: bool = True
 
+    # ── Feature flags ────────────────────────────────────────────────────────
+    # Phase 2B.4: route chat() RAG flow through rag_graph (LangGraph).
+    # Default OFF — flag ON must produce byte-identical output to OFF
+    # (parity contract per rag_graph.py:7-8). Flip via `.env`
+    # USE_RAG_GRAPH=true + full uvicorn restart (pydantic-settings reads
+    # `.env` at import; SIGHUP won't reload).
+    use_rag_graph: bool = False
+
 
 settings = Settings()  # type: ignore[call-arg]

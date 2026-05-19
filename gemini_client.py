@@ -43,6 +43,9 @@ from gemini_core import (  # Phase 2B.2.1-2 re-exports
 
 logger = logging.getLogger(__name__)
 
+# Phase 2B.4 operator visibility — log feature flag state once at import.
+logger.info("USE_RAG_GRAPH=%s", settings.use_rag_graph)
+
 _client = genai.Client(api_key=settings.gemini_api_key)
 
 # ── 今日 Gemini token 用量追蹤 ──────────────────────────────────────────────
@@ -1176,6 +1179,39 @@ def _run(
     raise RuntimeError("gemini chat: empty text after 3 attempts")
 
 
+def _chat_via_graph(
+    user_input,
+    context: list[tuple[str, str]],
+    facts: list[str],
+    persona_notes: list[dict] | None,
+    group_id: str | None,
+) -> str:
+    """Phase 2B.4: invoke rag_graph instead of inline RAG flow.
+
+    Behavior contract: byte-identical output to the inline chat() path
+    under same mocked `_run` / `embedding_recall` / `stock_quote`
+    (rag_graph.py:7-8). 503 / 429-PerDay fallback lives in
+    `rag_graph._node_generate` so the retry re-uses already-resolved
+    recall_hits / case_hits without re-traversing retrieval nodes.
+
+    Caller MUST pass the post-stock-mutation `facts` list — chat() does
+    `facts = list(facts) + [...]` to inject yfinance quotes BEFORE the
+    flag branch; passing the original parameter would drop stock context.
+
+    Lazy `import rag_graph` is intentional: keeps langgraph out of the
+    import graph when the flag is OFF.
+    """
+    import rag_graph
+    state = {
+        "user_input": user_input,
+        "context": context,
+        "facts": facts,
+        "persona_notes": persona_notes,
+        "group_id": group_id,
+    }
+    return rag_graph.get_graph().invoke(state)["response"]
+
+
 def chat(
     user_input: MessageInput,
     context: list[tuple[str, str]],
@@ -1219,6 +1255,18 @@ def chat(
     except Exception as e:
         # 失敗不阻塞主流程，bot 退回原本的「誠實說沒查到」行為
         logger.warning("stock_quote pre-fetch 失敗（非致命）: %s", e)
+
+    # Phase 2B.4: route through rag_graph if flag ON. Default OFF — inline
+    # path unchanged. `facts` is already post-stock-mutation here (must be).
+    # Parity contract per rag_graph.py:7-8 + §3 chain consensus.
+    if settings.use_rag_graph:
+        return _chat_via_graph(
+            user_input=user_input,
+            context=context,
+            facts=facts,
+            persona_notes=persona_notes,
+            group_id=group_id,
+        )
 
     # Semantic recall (2026-05-19) — 在主對話前撈相關歷史 + 類似 case 注入 system instruction
     # 失敗永遠 silent，Gemini 仍照舊跑（recall_hits / case_hits 為 None 等於不注入）
