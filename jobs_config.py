@@ -66,14 +66,6 @@ JOB_REGISTRY["line-bot-feedback-process"] = JobSpec(
     description="Tuesday 02:00 feedback process",
 )
 
-JOB_REGISTRY["line-bot-training-health"] = JobSpec(
-    command=["/bin/bash", "/Users/andrew/scripts/run_training_health.sh"],
-    cwd=None,
-    env={"PATH": _NVM_PATH, "HOME": "/Users/andrew", "USER": "andrew", "LOGNAME": "andrew"},
-    timeout=60,
-    description="Daily 09:00 training health",
-)
-
 JOB_REGISTRY["line-bot-health"] = JobSpec(
     command=["/bin/bash", "/Users/andrew/scripts/line_bot_health_check.sh"],
     cwd=None,
