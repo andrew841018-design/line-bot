@@ -35,6 +35,8 @@ JSONL_LOG = Path.home() / "Library" / "Logs" / "line_bot_preflight.jsonl"
 CACHE_TTL_SEC = 300
 STASH_MAX_AGE_SEC = 1800
 TUNNEL_URL_PATTERN = re.compile(r"^https://[a-z0-9-]+\.trycloudflare\.com$")
+_TRANSIENT_STATUS_RE = re.compile(r"\b(429|503)\b")
+_TRANSIENT_KEYWORDS = ("RESOURCE_EXHAUSTED", "UNAVAILABLE", "DEADLINE")
 UVICORN_PORT = 8080
 LOCAL_HEALTH_URL = f"http://127.0.0.1:{UVICORN_PORT}/health"
 LOCAL_CALLBACK_URL = f"http://127.0.0.1:{UVICORN_PORT}/callback"
@@ -72,6 +74,25 @@ def _cloudflared_metrics_port():
 def _pgrep(pattern):
     r = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True, timeout=5)
     return (r.stdout or "").strip().split("\n")[0] or None
+
+
+def _is_transient_error(result) -> bool:
+    """時間因素 error (Gemini-scoped) — 自動恢復，不送 Discord alert.
+
+    Gemini-scoped 避免 LINE 429 / cloudflared 503 被誤殺；那些 host non-Gemini
+    name 的 critical check 都是真 failure，仍會 alert。匹配需 status code (429/503)
+    AND keyword 同時出現，防 "503 bytes" 之類 false positive。
+
+    Naming contract: 所有 Gemini probe check 必須以 "Gemini" 開頭命名（見
+    check_9_gemini line ~344 `f"Gemini {label} probe"`），否則此 filter 不會 apply。
+    """
+    if not result.name.startswith("Gemini"):
+        return False
+    detail = result.detail or ""
+    if not _TRANSIENT_STATUS_RE.search(detail):
+        return False
+    upper = detail.upper()
+    return any(kw in upper for kw in _TRANSIENT_KEYWORDS)
 
 
 def _curl(url, *, timeout=10, method="GET", data=None, headers=None, interface=None):
@@ -400,6 +421,9 @@ def _finalize(results, start, *, tunnel_url, webhook_url, args):
     critical_total = sum(1 for r in results if r.critical)
     info_total = sum(1 for r in results if not r.critical)
     # GP1 C2: Gemini main + lite 都掛才 critical；單一掛降 info
+    # TODO: pre-existing bug — removes from critical_fail but doesn't promote to
+    # info_fail (line 398 filters critical=False), so single-Gemini-fail →
+    # critical_fail=[] → exit=0 PASS silently. Out of "目前不動" scope; defer.
     gemini_fails = [r for r in critical_fail if r.name.startswith("Gemini")]
     if gemini_fails and len(gemini_fails) < 2:
         critical_fail = [r for r in critical_fail if not r.name.startswith("Gemini")]
@@ -426,13 +450,20 @@ def _finalize(results, start, *, tunnel_url, webhook_url, args):
         "results": [{"idx": r.idx, "name": r.name, "status": r.status,
                      "critical": r.critical, "detail": r.detail} for r in results],
     })
-    if exit_code != 0 or autofix:
+    # Filter: Gemini transient (429 / 503) critical fail → silently logged,
+    # not Discord alerted. info_fail / autofix / non-transient critical 都仍 alert.
+    non_transient_critical = [r for r in critical_fail if not _is_transient_error(r)]
+    if non_transient_critical or info_fail or autofix:
         msg = f"🛫 **LINE bot preflight {verdict}**\n{summary}"
-        if critical_fail:
-            msg += "\n\nCritical fails:\n" + "\n".join(f"• {r.name}: {r.detail}" for r in critical_fail)
+        if non_transient_critical:
+            msg += "\n\nCritical fails:\n" + "\n".join(f"• {r.name}: {r.detail}" for r in non_transient_critical)
         if autofix:
             msg += "\n\nAutofix:\n" + "\n".join(f"• {r.name}: {r.detail}" for r in autofix)
         _send_discord_alert(msg)
+    elif critical_fail:
+        transient_names = ", ".join(r.name for r in critical_fail if _is_transient_error(r))
+        print(f"[preflight] skip discord alert (all critical fails transient: {transient_names})",
+              file=sys.stderr)
     return exit_code
 
 
