@@ -10,6 +10,10 @@ Without this, global state leaks between tests:
     pending → 10 筆使用者待回訊息被清空)
   - finance_view_db._DB_PATH module-level constant writes touch real line_bot.db
     (2026-05-18 加：跟 pending_store 同 pattern 隔離)
+  - notify_discord.send_dm / _alert_quality_violation 真實打 Discord webhook
+    (2026-05-19 事件：tests/test_chat_golden.py 用 NEWS_CASE keyword
+    + 短 mock reply 觸發 _quality_gate retry 3 次仍違規 → 真實打 Discord DM
+    騷擾使用者。fix = autouse fixture 全 test 攔住對外副作用)
 """
 
 import os
@@ -90,3 +94,26 @@ def reset_main_globals():
             os.unlink(p)
         except FileNotFoundError:
             pass
+
+
+@pytest.fixture(autouse=True)
+def block_external_side_effects(monkeypatch):
+    """禁止 test 期間打真實 Discord DM / quality-violation alert。
+
+    Root cause (2026-05-19): tests/test_chat_golden.py 用 NEWS_CASE keyword
+    （「保險」「AI 詐騙新聞解析」）+ 短 mock reply（「這是個測試回覆。」）
+    觸發 _quality_gate retry 3 次仍違規 → _alert_quality_violation 真實打
+    Discord webhook，每次 pytest 至少 4~6 通 DM。
+
+    在 conftest 一次擋住，比每個 test 自己 patch 穩；新 test 也自動受惠。
+    """
+    import notify_discord
+    monkeypatch.setattr(notify_discord, "send_dm", lambda *a, **kw: True, raising=False)
+
+    # 雙保險：直接攔 entry point，未來 production code 若新增其他 alert
+    # 也不會在 test 偷打
+    import gemini_client
+    monkeypatch.setattr(
+        gemini_client, "_alert_quality_violation",
+        lambda *a, **kw: None, raising=False,
+    )
