@@ -11,7 +11,18 @@ from __future__ import annotations
 
 import re
 
-__all__ = ["_RULE_NEWS_CASE", "_NEWS_CASE_RE"]
+__all__ = [
+    "_RULE_NEWS_CASE",
+    "_NEWS_CASE_RE",
+    # Phase 2B.2.2 — text utilities (pure, no module state)
+    "_CITE_RE",
+    "_URL_IN_TEXT_RE",
+    "_clean_reply",
+    "_extract_grounding_urls",
+    "_append_sources",
+    "_is_chinese_majority",
+    "_count_zh_chars",
+]
 
 
 _RULE_NEWS_CASE = """【新聞 / 案例 / 研究 / 專業議題分享 = 必給觀點 + 多源】（2026-05-04 加，補 23f 在非政治話題的覆蓋）
@@ -58,3 +69,70 @@ _NEWS_CASE_RE = re.compile(
     r"AI|人工智慧|詐騙|騙局|"
     r"分析|評論|心得|解析"
 )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Phase 2B.2.2 — pure text helpers (extracted 2026-05-19)
+# ════════════════════════════════════════════════════════════════════════════
+
+# Gemini grounding citation tags 對 LINE 使用者沒意義要清掉
+_CITE_RE = re.compile(r"\[cite:\w+\]|\[BROWSING_TOOL_\d+\]")
+
+_URL_IN_TEXT_RE = re.compile(r"https?://\S+")
+
+
+def _clean_reply(text: str) -> str:
+    """清除 Gemini 回覆中的 citation 標籤。"""
+    text = _CITE_RE.sub("", text)
+    text = re.sub(r"  +", " ", text)
+    return text.strip()
+
+
+def _extract_grounding_urls(response) -> list[tuple[str, str]]:
+    """從 response.candidates[0].grounding_metadata 抽出 (uri, title) 清單。"""
+    try:
+        candidates = getattr(response, "candidates", None) or []
+        if not candidates:
+            return []
+        meta = getattr(candidates[0], "grounding_metadata", None)
+        if meta is None:
+            return []
+        chunks = getattr(meta, "grounding_chunks", None) or []
+        seen: set[str] = set()
+        result = []
+        for chunk in chunks:
+            web = getattr(chunk, "web", None)
+            if web is None:
+                continue
+            uri = (getattr(web, "uri", None) or "").strip()
+            title = (getattr(web, "title", None) or "").strip()
+            if uri and uri not in seen:
+                seen.add(uri)
+                result.append((uri, title))
+        return result
+    except Exception:
+        return []
+
+
+def _append_sources(text: str, urls: list[tuple[str, str]]) -> str:
+    """若回覆裡還沒有來源網址，就把 grounding URLs 補在結尾。最多附 3 條。"""
+    if not urls:
+        return text
+    if _URL_IN_TEXT_RE.search(text):
+        return text
+    lines = ["來源："]
+    for uri, title in urls[:3]:
+        lines.append(f"• {title}\n  {uri}" if title else f"• {uri}")
+    return text + "\n\n" + "\n".join(lines)
+
+
+def _is_chinese_majority(text: str) -> bool:
+    """中文字元數 >= 英文字母數才算中文為主。"""
+    cn = len(re.findall(r"[一-鿿]", text))
+    en = len(re.findall(r"[a-zA-Z]", text))
+    return cn >= en
+
+
+def _count_zh_chars(s: str) -> int:
+    """數中文 CJK Unified Ideographs 字數（不含標點英數）。"""
+    return sum(1 for c in s if "一" <= c <= "鿿")

@@ -29,7 +29,17 @@ from google import genai
 from google.genai import types
 
 from config import settings
-from gemini_core import _NEWS_CASE_RE, _RULE_NEWS_CASE  # Phase 2B.2.1 re-export
+from gemini_core import (  # Phase 2B.2.1-2 re-exports
+    _NEWS_CASE_RE,
+    _RULE_NEWS_CASE,
+    _CITE_RE,
+    _URL_IN_TEXT_RE,
+    _clean_reply,
+    _extract_grounding_urls,
+    _append_sources,
+    _is_chinese_majority,
+    _count_zh_chars,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -707,68 +717,6 @@ def _to_gemini_history(context: list[tuple[str, str]]) -> list[types.Content]:
     return history
 
 
-# ── 回覆清理 ─────────────────────────────────────────────────────────────────
-# Gemini 的 Google Search grounding 有時會在回覆裡插入 citation 標籤，
-# 例如 [cite:BROWSING_TOOL_1]、[1]、[2] 等。這些對 LINE 使用者沒意義，要清掉。
-_CITE_RE = re.compile(r"\[cite:\w+\]|\[BROWSING_TOOL_\d+\]")
-
-
-def _clean_reply(text: str) -> str:
-    """清除 Gemini 回覆中的 citation 標籤。"""
-    text = _CITE_RE.sub("", text)
-    # 清完 tag 後可能殘留多餘空格
-    text = re.sub(r"  +", " ", text)
-    return text.strip()
-
-
-def _extract_grounding_urls(response) -> list[tuple[str, str]]:
-    """從 response.candidates[0].grounding_metadata 抽出 (uri, title) 清單。"""
-    try:
-        candidates = getattr(response, "candidates", None) or []
-        if not candidates:
-            return []
-        meta = getattr(candidates[0], "grounding_metadata", None)
-        if meta is None:
-            return []
-        chunks = getattr(meta, "grounding_chunks", None) or []
-        seen: set[str] = set()
-        result = []
-        for chunk in chunks:
-            web = getattr(chunk, "web", None)
-            if web is None:
-                continue
-            uri = (getattr(web, "uri", None) or "").strip()
-            title = (getattr(web, "title", None) or "").strip()
-            if uri and uri not in seen:
-                seen.add(uri)
-                result.append((uri, title))
-        return result
-    except Exception:
-        return []
-
-
-_URL_IN_TEXT_RE = re.compile(r"https?://\S+")
-
-
-def _append_sources(text: str, urls: list[tuple[str, str]]) -> str:
-    """若回覆裡還沒有來源網址，就把 grounding URLs 補在結尾。最多附 3 條。"""
-    if not urls:
-        return text
-    # 如果 Gemini 自己已經寫了網址就不重複附
-    if _URL_IN_TEXT_RE.search(text):
-        return text
-    lines = ["來源："]
-    for uri, title in urls[:3]:
-        lines.append(f"• {title}\n  {uri}" if title else f"• {uri}")
-    return text + "\n\n" + "\n".join(lines)
-
-
-def _is_chinese_majority(text: str) -> bool:
-    """中文字元數 >= 英文字母數才算中文為主。"""
-    cn = len(re.findall(r"[\u4e00-\u9fff]", text))
-    en = len(re.findall(r"[a-zA-Z]", text))
-    return cn >= en
-
 
 # ── 規則 0 post-check：第一句必須是判斷句、不可 echo / 空附和 ────────────────
 _ECHO_OPENERS = (
@@ -918,9 +866,7 @@ def _has_sectional_structure(reply: str) -> tuple[bool, list[str]]:
     return False, missing
 
 
-def _count_zh_chars(s: str) -> int:
-    """數中文 CJK Unified Ideographs 字數（不含標點英數）。"""
-    return sum(1 for c in s if "一" <= c <= "鿿")
+# _count_zh_chars moved to gemini_core.py (Phase 2B.2.2, 2026-05-19)
 
 
 def _count_unique_domains(s: str) -> int:
