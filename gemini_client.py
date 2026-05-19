@@ -1081,6 +1081,101 @@ def _quality_gate(
     return _append_sources(current_text, current_urls)
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# Phase 2B.2.3b — hoist _TRANSIENT_SIGS / _is_transient / _run to module level
+# ════════════════════════════════════════════════════════════════════════════
+
+_TRANSIENT_SIGS = (
+    "503",
+    "Server disconnected",
+    "Connection reset",
+    "RemoteProtocolError",
+    "ReadTimeout",
+    "ConnectError",
+    "TimeoutError",
+    "UNAVAILABLE",
+)
+
+
+def _is_transient(e: Exception) -> bool:
+    s = str(e) + type(e).__name__
+    return any(sig in s for sig in _TRANSIENT_SIGS)
+
+
+def _run(
+    model: str,
+    *,
+    user_input,
+    context: list[tuple[str, str]],
+    facts: list[str],
+    persona_notes: list[dict] | None,
+    recall_hits: list[dict] | None,
+    case_hits: list[dict] | None,
+    group_id: str | None,
+) -> str:
+    """Phase 2B.2.3b: top-level Gemini chat with 3-attempt retry + Chinese
+    rewrite + quality gate. Hoisted from chat() closure so rag_graph.py can
+    invoke from a graph node. 503/429-PerDay fallback stays in chat() wrapping
+    this function (GP1 #2: keep retry node-internal, don't model as graph edges).
+    """
+    chat_session = _client.chats.create(
+        model=model,
+        config=_build_config(
+            facts, persona_notes, user_input=user_input,
+            recall_hits=recall_hits, case_hits=case_hits,
+        ),
+        history=_to_gemini_history(context),  # type: ignore[arg-type]
+    )
+    last_err: Exception | None = None
+    for attempt in range(3):
+        try:
+            response = chat_session.send_message(user_input)
+            _track_usage(response)
+            text = (response.text or "").strip()
+            text = _clean_reply(text)
+            grounding_urls = _extract_grounding_urls(response)
+            if text:
+                if not _is_chinese_majority(text):
+                    logger.warning(
+                        "gemini reply is not Chinese-majority, requesting Chinese rewrite"
+                    )
+                    retry_resp = chat_session.send_message(
+                        "你剛才的回覆含有太多英文。請把剛才的回覆全部改成繁體中文再說一次，不要用英文。"
+                    )
+                    _track_usage(retry_resp)
+                    retry_text = _clean_reply((retry_resp.text or "").strip())
+                    if retry_text and _is_chinese_majority(retry_text):
+                        retry_urls = _extract_grounding_urls(retry_resp)
+                        return _quality_gate(
+                            chat_session, retry_text,
+                            retry_urls or grounding_urls,
+                            user_input, group_id,
+                        )
+                return _quality_gate(
+                    chat_session, text, grounding_urls,
+                    user_input, group_id,
+                )
+            logger.warning(
+                "gemini chat attempt %d: empty text, retrying", attempt + 1
+            )
+            continue
+        except Exception as e:
+            last_err = e
+            _track_failed_request()
+            if _is_transient(e) and attempt < 2:
+                logger.warning(
+                    "gemini transient error (%s), retry %d/2 after 3s",
+                    type(e).__name__,
+                    attempt + 1,
+                )
+                time.sleep(3)
+                continue
+            raise
+    if last_err:
+        raise last_err
+    raise RuntimeError("gemini chat: empty text after 3 attempts")
+
+
 def chat(
     user_input: MessageInput,
     context: list[tuple[str, str]],
@@ -1125,22 +1220,6 @@ def chat(
         # 失敗不阻塞主流程，bot 退回原本的「誠實說沒查到」行為
         logger.warning("stock_quote pre-fetch 失敗（非致命）: %s", e)
 
-    _TRANSIENT_SIGS = (
-        "503",
-        "Server disconnected",
-        "Connection reset",
-        "RemoteProtocolError",
-        "ReadTimeout",
-        "ConnectError",
-        "TimeoutError",
-        "UNAVAILABLE",
-    )
-
-    def _is_transient(e: Exception) -> bool:
-        s = str(e) + type(e).__name__
-        return any(sig in s for sig in _TRANSIENT_SIGS)
-
-
     # Semantic recall (2026-05-19) — 在主對話前撈相關歷史 + 類似 case 注入 system instruction
     # 失敗永遠 silent，Gemini 仍照舊跑（recall_hits / case_hits 為 None 等於不注入）
     recall_hits: list[dict] | None = None
@@ -1160,70 +1239,17 @@ def chat(
         except Exception as e:
             logger.warning("semantic recall retrieve failed: %s", e)
 
-    def _run(model: str) -> str:
-        chat_session = _client.chats.create(
-            model=model,
-            config=_build_config(
-                facts, persona_notes, user_input=user_input,
-                recall_hits=recall_hits, case_hits=case_hits,
-            ),
-            history=_to_gemini_history(context),  # type: ignore[arg-type]
-        )
-        last_err: Exception | None = None
-        for attempt in range(3):
-            try:
-                response = chat_session.send_message(user_input)
-                _track_usage(response)
-                text = (response.text or "").strip()
-                text = _clean_reply(text)
-                grounding_urls = _extract_grounding_urls(response)
-                if text:
-                    # 若回覆以英文為主，追加一條訊息要求改用繁體中文
-                    if not _is_chinese_majority(text):
-                        logger.warning(
-                            "gemini reply is not Chinese-majority, requesting Chinese rewrite"
-                        )
-                        retry_resp = chat_session.send_message(
-                            "你剛才的回覆含有太多英文。請把剛才的回覆全部改成繁體中文再說一次，不要用英文。"
-                        )
-                        _track_usage(retry_resp)
-                        retry_text = _clean_reply((retry_resp.text or "").strip())
-                        if retry_text and _is_chinese_majority(retry_text):
-                            retry_urls = _extract_grounding_urls(retry_resp)
-                            return _quality_gate(
-                                chat_session, retry_text,
-                                retry_urls or grounding_urls,
-                                user_input, group_id,
-                            )
-                        # 若重試仍非中文，繼續用原回覆（總比空白好）
-                    return _quality_gate(
-                        chat_session, text, grounding_urls,
-                        user_input, group_id,
-                    )
-                # text 為空（可能 code_execution 吃掉了），重試
-                logger.warning(
-                    "gemini chat attempt %d: empty text, retrying", attempt + 1
-                )
-                continue
-            except Exception as e:
-                last_err = e
-                # 失敗也要計數（Google 的 daily quota 是含失敗的）
-                _track_failed_request()
-                if _is_transient(e) and attempt < 2:
-                    logger.warning(
-                        "gemini transient error (%s), retry %d/2 after 3s",
-                        type(e).__name__,
-                        attempt + 1,
-                    )
-                    time.sleep(3)
-                    continue
-                raise
-        if last_err:
-            raise last_err
-        raise RuntimeError("gemini chat: empty text after 3 attempts")
-
+    _run_kwargs = dict(
+        user_input=user_input,
+        context=context,
+        facts=facts,
+        persona_notes=persona_notes,
+        recall_hits=recall_hits,
+        case_hits=case_hits,
+        group_id=group_id,
+    )
     try:
-        return _run(settings.gemini_model)
+        return _run(settings.gemini_model, **_run_kwargs)
     except Exception as e:
         err = str(e)
         # 主 model 503 / 429 (daily quota) 都 fallback 到 lite model
@@ -1238,7 +1264,7 @@ def chat(
                 reason,
                 settings.gemini_light_model,
             )
-            return _run(settings.gemini_light_model)
+            return _run(settings.gemini_light_model, **_run_kwargs)
         raise
 
 
