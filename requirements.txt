@@ -12,6 +12,7 @@ curl_cffi>=0.7.0
 openai>=1.0.0
 yfinance>=0.2.0
 cerebras-cloud-sdk>=1.67.0
+langgraph>=1.2.0  # Phase 2B.3 RAG flow visualization
 
 pypdf
 PyMuPDF
