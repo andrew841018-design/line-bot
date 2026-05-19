@@ -466,11 +466,13 @@ def test_reply_muted():
 # ═══════════════════════════════════════════════════════════════════════════════
 def test_save_pending_any():
     print("\n── Test I: _save_pending_any ──")
+    import pending_store
+    from pathlib import Path
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
         json.dump({}, f)
         tmp = f.name
-    orig_path = main._PENDING_EXPLICIT_PATH
-    main._PENDING_EXPLICIT_PATH = tmp
+    orig_path = pending_store.PENDING_PATH
+    pending_store.PENDING_PATH = Path(tmp)
 
     # TextMessageContent
     msg = _make_text_msg("測試訊息", "MSG_TEST")
@@ -484,15 +486,16 @@ def test_save_pending_any():
     check("pending type=text", data["GRP001"][0].get("type") == "text")
     check("pending text 正確", data["GRP001"][0].get("text") == "測試訊息")
 
-    # 非支援類型（ImageMessageContent）→ 不存
+    # ImageMessageContent → 現在也支援，但下載 dummy LINE token 會失敗 → 仍會新增 entry 並標 download_failed
     img_msg = MagicMock(spec=ImageMessageContent)
     img_msg.id = "IMG001"
     img_evt = _make_message_event(img_msg)
     main._save_pending_any(img_evt, "GRP001", "USR001", img_msg)
     data2 = json.load(open(tmp))
-    check("Image pending → 仍只有 1 筆", len(data2.get("GRP001", [])) == 1)
+    check("Image pending → 也被存進佇列", len(data2.get("GRP001", [])) == 2)
+    check("Image pending type=image", data2["GRP001"][1].get("type") == "image")
 
-    main._PENDING_EXPLICIT_PATH = orig_path
+    pending_store.PENDING_PATH = orig_path
     os.unlink(tmp)
 
 
@@ -501,6 +504,8 @@ def test_save_pending_any():
 # ═══════════════════════════════════════════════════════════════════════════════
 def test_clear_pending_explicit():
     print("\n── Test J: _clear_pending_explicit ──")
+    import pending_store
+    from pathlib import Path
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
         json.dump(
             {
@@ -510,15 +515,15 @@ def test_clear_pending_explicit():
             f,
         )
         tmp = f.name
-    orig_path = main._PENDING_EXPLICIT_PATH
-    main._PENDING_EXPLICIT_PATH = tmp
+    orig_path = pending_store.PENDING_PATH
+    pending_store.PENDING_PATH = Path(tmp)
 
     main._clear_pending_explicit("GRP001")
     data = json.load(open(tmp))
     check("clear GRP001 後不含 GRP001", "GRP001" not in data)
     check("GRP002 不受影響", "GRP002" in data)
 
-    main._PENDING_EXPLICIT_PATH = orig_path
+    pending_store.PENDING_PATH = orig_path
     os.unlink(tmp)
 
 

@@ -480,7 +480,7 @@ def main():
                 code, body = _curl_with_token(LINE_WEBHOOK_ENDPOINT, tok, timeout=5)
                 if code == 200: webhook = json.loads(body).get("endpoint", "")
             if url and webhook and _cache_still_valid(url, webhook, token=tok or ""):
-                print(f"[preflight] cache HIT — skip rerun"); return 0
+                print("[preflight] cache HIT — skip rerun"); return 0
         except Exception as e:
             print(f"[preflight] cache check failed (continuing): {e}", file=sys.stderr)
     try: return run(args)
