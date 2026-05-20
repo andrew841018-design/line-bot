@@ -5,7 +5,6 @@ Mocks `_send_discord_alert` and `_emit_jsonl`. JSONL log must always emit
 regardless of alert filter; full audit trail preserved.
 """
 import argparse
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import preflight_check as pf

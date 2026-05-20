@@ -1026,7 +1026,7 @@ def _parse_source_breakdown(text: str) -> tuple[dict, dict]:
             cols = [c.strip() for c in stripped.split("|") if c.strip()]
             if len(cols) < 5:
                 continue
-            source, _cat, _kw, raw, status = cols[0], cols[1], cols[2], cols[3], cols[4]
+            source, raw, status = cols[0], cols[3], cols[4]
             try:
                 raw_n = int(raw)
             except ValueError:

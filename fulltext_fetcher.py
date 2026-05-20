@@ -26,7 +26,7 @@ import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeoutError
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 import web_scraper
 

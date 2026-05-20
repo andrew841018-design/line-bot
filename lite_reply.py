@@ -485,7 +485,6 @@ def _google_search_snippet(query: str) -> str | None:
         return None
     try:
         url = f"https://www.google.com/search?q={quote_plus(query)}&hl=zh-TW"
-        from urllib.parse import quote_plus  # local import is_safe
         resp = requests.get(
             url,
             headers={"User-Agent": _UA, "Accept-Language": "zh-TW,zh;q=0.9"},

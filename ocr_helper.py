@@ -4,7 +4,6 @@ Lazy load EasyOCR（首次 ~30 sec download model）。
 """
 from __future__ import annotations
 import logging
-from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger("ocr_helper")
@@ -26,7 +25,7 @@ def _ensure_loaded() -> bool:
         logger.warning("EasyOCR load failed: %s", e)
         # fallback to tesseract
         try:
-            import pytesseract  # noqa
+            __import__("pytesseract")  # availability check only
             logger.info("fallback to pytesseract")
             _reader = "tesseract"
             return True

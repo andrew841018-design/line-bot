@@ -547,8 +547,6 @@ def _best_source_for_claim(claim: str, sources: list[str]) -> tuple[str, int]:
     model = _get_st_model()
     if model is not None:
         try:
-            import numpy as np  # type: ignore
-
             vecs = model.encode(
                 [claim] + list(sources),
                 convert_to_numpy=True,

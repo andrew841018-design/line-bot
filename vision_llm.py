@@ -17,9 +17,7 @@ from typing import Optional
 
 # 規則 0 / 咪寶人設 / 黑名單 post-check 共用模組
 from vision_common import (
-    _VISION_SYSTEM_PROMPT,  # re-export 給既有 import
     compose_prompt as _compose_prompt,  # re-export with old name
-    get_blacklists as _get_blacklists,  # re-export with old name
     post_check as _post_check,  # re-export with old name
 )
 

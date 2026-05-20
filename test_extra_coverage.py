@@ -979,7 +979,6 @@ def test_next_gemini_reset_tw():
     from zoneinfo import ZoneInfo
 
     # Mock time such that reset is < 60 minutes away → "還有N分鐘"
-    _TW_TZ = ZoneInfo("Asia/Taipei")
     _PT_TZ = ZoneInfo("America/Los_Angeles")
     almost_reset = datetime.now(tz=_PT_TZ).replace(
         hour=23, minute=59, second=0, microsecond=0

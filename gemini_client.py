@@ -32,8 +32,6 @@ from config import settings
 from gemini_core import (  # Phase 2B.2.1-2 + 2B.5 re-exports
     _NEWS_CASE_RE,
     _RULE_NEWS_CASE,
-    _CITE_RE,
-    _URL_IN_TEXT_RE,
     _clean_reply,
     _extract_grounding_urls,
     _append_sources,

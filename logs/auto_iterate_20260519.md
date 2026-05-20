@@ -151,3 +151,44 @@ INFO:     Application shutdown complete.
 
 [12:51:51] iter 1 後 pytest 全綠，提早退出
 [12:51:51] ## Step 7: 仍有未 commit 變更，catch-all 上傳
+[main fbbf86c] auto iterate 20260519 (catch-all)
+ 13 files changed, 347 insertions(+), 10 deletions(-)
+ create mode 100644 pending_media/8a86eb9ac7744bfca48dbe5fc1e7bbbd.jpg
+ create mode 100644 pending_media/b6a61716298049b0ab910101281f8598.jpg
+ create mode 100644 pending_media/c222b527b12c4449bd3406bcddc47b1b.jpg
+ create mode 100644 pending_media/e10c4154c38544509c003cf69330a949.jpg
+To github.com:andrew841018-design/line-bot.git
+   4db383f..fbbf86c  main -> main
+[12:51:55] ## Step 8: restart uvicorn
+[12:52:03] /health: {"status":"ok","gemini_model":"gemini-2.5-flash","gemini_light_model":"gemini-2.5-flash-lite","group_locked":true}
+2026-05-19 12:52:09,960 INFO AFC is enabled with max remote calls: 10.
+2026-05-19 12:52:10,377 INFO HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 429 Too Many Requests"
+2026-05-19 12:52:10,422 INFO AFC is enabled with max remote calls: 10.
+2026-05-19 12:52:10,643 INFO HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent "HTTP/1.1 429 Too Many Requests"
+======================================================================
+LINE bot preflight @ 2026-05-19T12:52:03
+======================================================================
+  [✓]  1. uvicorn process alive
+  [✓]  2. local /health 200
+  [✓]  3. cloudflared process alive
+  [✓]  4. cloudflared URL stash 可讀 + 安全 — url=https://bernard-acts-couples-fit.trycloudflare.com age=1522s
+  [✓]  5. cloudflared metrics 內部 URL 對 stash — metrics 200 但 ha_connections 沒露
+  [✓]  6. external https://bernard-acts-couples-fit.trycloudflare.com/health 200 — attempt=1
+  [✓]  7. /callback no-sig → 400 missing
+  [✓]  8. LINE token /v2/bot/info 200
+  [⚠]  9. LINE webhook URL 對齊 cloudflared — drift fixed: 'https://llp-repository-machinery-recommended.trycloudflare.com/callback' → 'https://bernard-acts-couples-fit.trycloudflare.com/callback'
+  [↻] autofix triggered → re-run external + E2E
+  [✓]  6. external https://bernard-acts-couples-fit.trycloudflare.com/health 200 — attempt=1
+  [✓] 10. LINE → cloudflared → /callback E2E
+  [✗] 11. Gemini main probe — 429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': 'You exceeded your current quota, please check your plan and 
+  [✗] 12. Gemini lite probe — 429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': 'You exceeded your current quota, please check your plan and 
+  [✓] 13. SQLite integrity + WAL checkpoint
+  [✓] 14. pending file JSON load — groups=2 entries=13
+----------------------------------------------------------------------
+PREFLIGHT [FAIL] critical=11/13 info=2/2 elapsed=7.8s autofix=1
+Critical fails:
+  ✗ Gemini main probe: 429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': 'You exceeded your current quota, please check your plan and 
+  ✗ Gemini lite probe: 429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': 'You exceeded your current quota, please check your plan and 
+Discord DM 送出成功
+[12:52:12] preflight exit=1 (0=pass, 1=critical, 2=info-only, 3=infra)
+[12:52:12] ===== 結束 =====
