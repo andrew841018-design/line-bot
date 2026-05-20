@@ -169,3 +169,5 @@ INFO:     Application shutdown complete.
 1. 若 production group（非 `C_test_group`）開始出現「規則 0 post-check 違規」，要看 `correction_notes` 的 `content` 看是哪類 prompt 觸發，可能要新增詞到 `_ECHO_OPENERS` / `_EMPTY_PHRASES` 或調 `_RULE_NEWS_CASE` 觸發條件。
 2. FastAPI on_event 遷移要做：3 個 startup hook 合併進 `lifespan` async context manager（建議單獨 PR，因為要動 startup 順序）。
 3. Quality alert Discord DM 防呆：`conftest.py` 已有 autouse fixture 攔住測試發 webhook（commit 347bc4e），維持這個保護。
+[12:38:18] iter 1 後 pytest 全綠，提早退出
+[12:38:19] ## Step 7: 仍有未 commit 變更，catch-all 上傳

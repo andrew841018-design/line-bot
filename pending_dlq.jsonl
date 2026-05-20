@@ -44,3 +44,5 @@
 {"group_id": "GRP001", "reason": "age>604800s", "dlq_at": 1779251310.0407522, "entry": {"user_id": "__bot__", "text": "bot 自己的舊回覆 2", "timestamp": 101, "type": "text"}}
 {"group_id": "GRP001", "reason": "age>604800s", "dlq_at": 1779251647.57852, "entry": {"user_id": "__bot__", "text": "bot 自己的舊回覆 1", "timestamp": 100, "type": "text"}}
 {"group_id": "GRP001", "reason": "age>604800s", "dlq_at": 1779251647.5788538, "entry": {"user_id": "__bot__", "text": "bot 自己的舊回覆 2", "timestamp": 101, "type": "text"}}
+{"group_id": "GRP001", "reason": "age>604800s", "dlq_at": 1779251871.415128, "entry": {"user_id": "__bot__", "text": "bot 自己的舊回覆 1", "timestamp": 100, "type": "text"}}
+{"group_id": "GRP001", "reason": "age>604800s", "dlq_at": 1779251871.416019, "entry": {"user_id": "__bot__", "text": "bot 自己的舊回覆 2", "timestamp": 101, "type": "text"}}
