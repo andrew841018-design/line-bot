@@ -4644,8 +4644,11 @@ def _reply(reply_token: str, text: str, group_id: str | None = None) -> None:
     # 額度耗盡時，偷塞 pending 進同一則 reply_message（免費）
     # LINE reply_message 上限 5 則 → 1 則實回覆 + 最多 4 則 piggyback
     # 2026-05-16 改：從 1 提到 4，加速 pending drain（quota 爆等月初重置這種長窗期）
+    # 2026-05-21 加：reminder piggyback（advisor: pending 優先，剩餘 slot 給 reminder）
     messages_to_send: list = [TextMessage(text=text)]
+    pending_reminders: list[tuple[str, int]] = []  # (event_id, offset) — reply 成功才 mark
     if group_id:
+        # Step 1: 先塞 pending（user 已選 pending 為優先）
         for _ in range(4):
             if _quota_exhausted():
                 logger.info("piggyback skip: gemini exhausted group=%s", group_id)
@@ -4662,6 +4665,22 @@ def _reply(reply_token: str, text: str, group_id: str | None = None) -> None:
                 break
             messages_to_send.append(TextMessage(text=pig[:5000]))
             logger.info("piggyback popped 1 group=%s pig_len=%d", group_id, len(pig))
+        # Step 2: 剩餘 slot 給 due reminders (LINE push quota 爆時的 fallback)
+        try:
+            import calendar_db
+            import event_reminder as _er
+            for offset in calendar_db.REMINDER_OFFSETS:
+                if len(messages_to_send) >= 5:
+                    break
+                due = calendar_db.list_due_for_reminder(days_ahead=offset)
+                for e in due:
+                    if len(messages_to_send) >= 5:
+                        break
+                    rtext = _er._format_event(e, offset)
+                    messages_to_send.append(TextMessage(text=rtext))
+                    pending_reminders.append((e["event_id"], offset))
+        except Exception as e:
+            logger.warning("reminder piggyback skip: %s", e)
 
     resp = None
     try:
@@ -4692,6 +4711,19 @@ def _reply(reply_token: str, text: str, group_id: str | None = None) -> None:
             except Exception as push_err:
                 logger.warning("fallback push also failed: %s", str(push_err)[:300])
         return
+
+    # reply 成功 → mark reminders (peek-then-confirm pattern)
+    if pending_reminders:
+        try:
+            import calendar_db as _cdb
+            for ev_id, off in pending_reminders:
+                _cdb.mark_reminded(ev_id, off)
+            logger.info(
+                "reminder piggyback marked: %d reminders group=%s",
+                len(pending_reminders), group_id,
+            )
+        except Exception as e:
+            logger.warning("reminder mark_reminded failed: %s", e)
 
     # 把 bot 自己的回覆也記進 raw_messages,供之後 quote-lookup
     if group_id is None:
