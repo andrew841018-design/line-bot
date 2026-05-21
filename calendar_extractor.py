@@ -38,8 +38,12 @@ _TW = ZoneInfo("Asia/Taipei")
 
 _PROMPT = """你是家族 LINE 群行事曆助手。從下面這段對話判斷有沒有家族活動需要記下。
 
-只認「家族實體聚會」：聚餐、出遊、生日趴、就醫陪同、家庭活動、回老家、接送。
-**不要**抓：純閒聊、工作排程、新聞、網購、抽象計畫（「以後想去」）。
+抓「家族 / 個人重要事件」三類：
+1. family_gathering — 家族實體聚會：聚餐、出遊、生日趴、回老家、接送、婚禮、滿月
+2. personal_trip   — 個人旅程：媽媽/爸爸 回台北/北上/南下/出差/搭高鐵
+3. medical         — 醫療事件：做胃鏡/大腸鏡/健檢、看醫生/牙醫、陪同就醫、打疫苗、抽血、回診
+
+**不要**抓：純閒聊、工作會議、新聞、網購、抽象計畫（「以後想去」）、純感想（「做胃鏡很可怕」）。
 
 今天是 {today}（週{weekday}）。
 
@@ -47,21 +51,22 @@ _PROMPT = """你是家族 LINE 群行事曆助手。從下面這段對話判斷�
 {dialogue}
 
 任務：
-1. 有沒有人在「邀約 / 約定 / 規劃」一個具體家族活動？→ has_event=true
-2. 有沒有人在「取消 / 改期 / 不去了」之前約好的活動？→ is_cancellation=true
+1. 有沒有人在「邀約 / 約定 / 規劃」一個具體事件？→ has_event=true
+2. 有沒有人在「取消 / 改期 / 不去了」之前約好的事件？→ is_cancellation=true
 3. 兩者都不是 → has_event=false, is_cancellation=false
 
 抽欄位（無就 null）：
-- title：簡短 6 字內，例「家族聚餐」「妹妹生日」「爺爺看醫生」
+- title：簡短 6 字內，例「家族聚餐」「媽媽回台北」「爺爺做胃鏡」
+- event_type：三選一 — "family_gathering" / "personal_trip" / "medical"
 - date：YYYY-MM-DD。模糊詞要換成今日換算後的日期：
     今天=今天日期；明天=+1；後天=+2；下週X=下個週X；本週X=本週X
 - time：24h 格式 HH:MM；下午6點→18:00；晚上8點→20:00
-- location：餐廳/地點名稱
+- location：餐廳/地點/醫院名稱
 - participants：講到誰：媽媽、爸爸、姊姊、妹妹、弟弟、全家、奶奶、爺爺…
 - cancel_target_keyword：取消時要用來找原 event 的關鍵字（活動標題裡可能出現的字）
 
 只回 JSON，不要 markdown：
-{{"has_event": false, "is_cancellation": false, "title": null, "date": null, "time": null, "location": null, "participants": [], "cancel_target_keyword": null}}
+{{"has_event": false, "is_cancellation": false, "title": null, "event_type": "family_gathering", "date": null, "time": null, "location": null, "participants": [], "cancel_target_keyword": null}}
 """
 
 
@@ -90,6 +95,7 @@ def extract(combined_text: str) -> dict:
         "location": None,
         "participants": [],
         "cancel_target_keyword": None,
+        "event_type": "family_gathering",
     }
     if not combined_text or not combined_text.strip():
         return fail
@@ -150,6 +156,13 @@ def _normalize(data: dict) -> dict:
         s = str(v).strip()
         return s[:max_len] if s else None
 
+    # event_type whitelist — import calendar_db.EVENT_TYPES 統一 source of truth
+    # (GP2 Phase 6 反饋：避免 5 處 drift)
+    from calendar_db import EVENT_TYPES as _ALLOWED_TYPES
+    et = data.get("event_type") or "family_gathering"
+    if et not in _ALLOWED_TYPES:
+        et = "family_gathering"
+
     out = {
         "has_event": has,
         "is_cancellation": cancel,
@@ -159,6 +172,7 @@ def _normalize(data: dict) -> dict:
         "location": _s("location", 80),
         "participants": parts,
         "cancel_target_keyword": _s("cancel_target_keyword", 40),
+        "event_type": et,
     }
     # date 格式驗證：YYYY-MM-DD；否則 None
     date_val = out["date"]

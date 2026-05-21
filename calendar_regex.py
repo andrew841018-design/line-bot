@@ -32,6 +32,42 @@ _FAMILY_KW = re.compile(
     r"婚禮|喜宴|滿月|彌月)"
 )
 
+# Plan C：三類 event_type 分類規則（醫療 > 個人旅程 > 家族聚會，medical 最先因更具體）
+# 注意：personal_trip「回 X」明列地名不含「家」單字，避免「回家吃飯」誤分類為 trip
+_TYPE_PATTERNS: tuple[tuple[str, re.Pattern], ...] = (
+    (
+        "medical",
+        re.compile(
+            r"做(?:胃鏡|大腸鏡|健康檢查|體檢|手術|健檢)|"
+            r"看(?:醫生|牙醫|皮膚科|眼科|耳鼻喉科)|"
+            r"陪(?:.{0,5})(?:就醫|看醫生|看病|拿藥)|"
+            r"打疫苗|抽血|健檢|回診"
+        ),
+    ),
+    (
+        "personal_trip",
+        re.compile(
+            r"回(?:台北|新北|台中|台南|高雄|花蓮|宜蘭|新竹|苗栗|嘉義|屏東|台東|老家)|"
+            r"北上|南下|出差|"
+            r"搭(?:高鐵|火車|客運|台鐵)"
+        ),
+    ),
+)
+
+
+def _classify_type(title: str) -> str | None:
+    """回 'medical' / 'personal_trip' / 'family_gathering' / None(不認)。
+
+    GP2 反饋：classify=None 不要 silently default 成 family_gathering，
+    寧可 reject 也別 mis-tag。
+    """
+    for name, pat in _TYPE_PATTERNS:
+        if pat.search(title):
+            return name
+    if _FAMILY_KW.search(title):
+        return "family_gathering"
+    return None
+
 # HH:MM — validated 00:00 to 23:59
 _TIME = r"(?:[01]?\d|2[0-3]):[0-5]\d"
 
@@ -58,6 +94,23 @@ def _make_fail() -> dict:
         "location": None,
         "participants": [],
         "cancel_target_keyword": None,
+        "event_type": "family_gathering",
+    }
+
+
+def _make_event(
+    title: str, date_iso: str, time_str: str, event_type: str
+) -> dict:
+    return {
+        "has_event": True,
+        "is_cancellation": False,
+        "title": title,
+        "date": date_iso,
+        "time": time_str,
+        "location": None,
+        "participants": [],
+        "cancel_target_keyword": None,
+        "event_type": event_type,
     }
 
 
@@ -91,17 +144,9 @@ def extract_regex_only(combined_text: str, today_tw: date) -> dict:
         target = _validate_date(year, month, day)
         time_str = m.group(4)
         title = _sanitize_title(m.group(5))
-        if target and len(title) >= 2 and _FAMILY_KW.search(title):
-            return {
-                "has_event": True,
-                "is_cancellation": False,
-                "title": title,
-                "date": target.isoformat(),
-                "time": time_str,
-                "location": None,
-                "participants": [],
-                "cancel_target_keyword": None,
-            }
+        et = _classify_type(title) if len(title) >= 2 else None
+        if target and et:
+            return _make_event(title, target.isoformat(), time_str, et)
 
     # 2. N月N日 HH:MM title — year inference: past → +1
     m = _CHINESE_DATE_TIME_TITLE.search(combined_text)
@@ -109,22 +154,14 @@ def extract_regex_only(combined_text: str, today_tw: date) -> dict:
         month, day = int(m.group(1)), int(m.group(2))
         time_str = m.group(3)
         title = _sanitize_title(m.group(4))
-        if len(title) >= 2 and _FAMILY_KW.search(title):
+        et = _classify_type(title) if len(title) >= 2 else None
+        if et:
             target = _validate_date(today_tw.year, month, day)
             if target:
                 if target < today_tw:
                     target = _validate_date(today_tw.year + 1, month, day)
                 if target:
-                    return {
-                        "has_event": True,
-                        "is_cancellation": False,
-                        "title": title,
-                        "date": target.isoformat(),
-                        "time": time_str,
-                        "location": None,
-                        "participants": [],
-                        "cancel_target_keyword": None,
-                    }
+                    return _make_event(title, target.isoformat(), time_str, et)
 
     # 3. 今天/明天/後天 HH:MM title
     m = _RELATIVE_DATE_TIME_TITLE.search(combined_text)
@@ -133,16 +170,8 @@ def extract_regex_only(combined_text: str, today_tw: date) -> dict:
         target = today_tw + timedelta(days=offset)
         time_str = m.group(2)
         title = _sanitize_title(m.group(3))
-        if len(title) >= 2 and _FAMILY_KW.search(title):
-            return {
-                "has_event": True,
-                "is_cancellation": False,
-                "title": title,
-                "date": target.isoformat(),
-                "time": time_str,
-                "location": None,
-                "participants": [],
-                "cancel_target_keyword": None,
-            }
+        et = _classify_type(title) if len(title) >= 2 else None
+        if et:
+            return _make_event(title, target.isoformat(), time_str, et)
 
     return _make_fail()

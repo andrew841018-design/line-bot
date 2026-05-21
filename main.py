@@ -1440,14 +1440,49 @@ def _handle_image_gen(event: MessageEvent, group_id: str, subject: str) -> None:
 
 _CALENDAR_QUERY_RE = re.compile(
     r"("
-    r"(?:今天|明天|後天|這週末|下週末|下週|本週|週[一二三四五六日天])"
+    # 1. 日期 + 行程動詞（原有）
+    r"(?:今天|明天|後天|昨天|前天|這週末|下週末|下週|本週|週[一二三四五六日天])"
     r".{0,8}"
     r"(?:有事|有什麼|幾點|安排|要幹嘛|要做什麼|計畫|計劃|行程)"
     r"|"
+    # 2. 行程動詞 + 日期（原有反向）
     r"(?:有事|有什麼|幾點|安排|要幹嘛|要做什麼|計畫|計劃|行程)"
     r".{0,8}"
-    r"(?:今天|明天|後天|這週末|下週末|下週|本週|週[一二三四五六日天])"
+    r"(?:今天|明天|後天|昨天|前天|這週末|下週末|下週|本週|週[一二三四五六日天])"
+    r"|"
+    # 3. 無日期：「什麼時候 / 上次 / 之前 / 哪一天 + 名詞動作」(GP1+GP2 反饋 noun anchor)
+    r"(?:什麼時候|上次|之前|哪一天|哪天)"
+    r".{0,12}"
+    r"(?:回(?:台北|新北|台中|台南|高雄|花蓮|宜蘭|新竹|苗栗|嘉義|屏東|台東|老家)|"
+    r"做(?:胃鏡|大腸鏡|健康檢查|體檢|手術|健檢)|"
+    r"看(?:醫生|牙醫|皮膚科|眼科|耳鼻喉科)|"
+    r"拿(?:蛋糕|藥|包裹|貨|禮物|花)|"
+    r"接(?:爸|媽|妹|弟|姊|爺爺|奶奶|小孩|小朋友)|"
+    r"陪(?:.{0,5})(?:就醫|看醫生|看病))"
+    r"|"
+    # 4. 反向：「名詞動作 + 什麼時候/哪一天」
+    r"(?:回(?:台北|新北|台中|台南|高雄|花蓮|宜蘭|新竹|苗栗|嘉義|屏東|台東|老家)|"
+    r"做(?:胃鏡|大腸鏡|健康檢查|體檢|手術|健檢)|"
+    r"看(?:醫生|牙醫))"
+    r".{0,12}"
+    r"(?:什麼時候|哪一天|哪天|上次|之前)"
     r")"
+)
+
+
+# 名詞 keyword whitelist — branch 2 fallback：text 含這些 keyword → search_by_keyword
+_QUERY_NOUN_KEYWORDS: tuple[str, ...] = (
+    # 地名
+    "台北", "新北", "台中", "台南", "高雄", "花蓮", "宜蘭", "新竹", "苗栗",
+    "嘉義", "屏東", "台東", "老家",
+    # 醫療
+    "胃鏡", "大腸鏡", "健檢", "體檢", "醫生", "牙醫", "看病",
+    # 家人
+    "媽媽", "爸爸", "姊姊", "妹妹", "弟弟", "爺爺", "奶奶", "全家",
+    # 物件
+    "蛋糕", "禮物",
+    # 場所
+    "喜來登",
 )
 
 
@@ -1461,18 +1496,39 @@ def _is_calendar_query(text: str) -> bool:
 
 
 def _resolve_relative_date(text: str):
-    """偵測 text 中的相對日期關鍵字 → TW timezone target date。回 None = 沒命中。"""
+    """偵測 text 中的相對日期關鍵字 → TW timezone target date。回 None = 沒命中。
+
+    支援未來：今天/明天/後天/週X、過去：昨天/前天/上週X/N天前。
+    """
     from datetime import datetime as _dt, timedelta as _td
     from zoneinfo import ZoneInfo as _ZI
     today_tw = _dt.now(_ZI("Asia/Taipei")).date()
+    # 過去先（更具體的字眼優先）
+    if "前天" in text:
+        return today_tw - _td(days=2)
+    if "昨天" in text:
+        return today_tw - _td(days=1)
     if "今天" in text:
         return today_tw
     if "明天" in text:
         return today_tw + _td(days=1)
     if "後天" in text:
         return today_tw + _td(days=2)
-    # 「週X」: 找下一個該星期幾
+    # 「N 天前」(數字)
+    m = re.search(r"(\d+)\s*天前", text)
+    if m:
+        n = min(int(m.group(1)), 365)
+        return today_tw - _td(days=n)
     wmap = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
+    # 「上週X」: 找上一個該星期幾
+    m = re.search(r"上週([一二三四五六日天])", text)
+    if m:
+        target_wd = wmap[m.group(1)]
+        delta = (today_tw.weekday() - target_wd) % 7
+        if delta == 0:
+            delta = 7  # 講「上週X」通常指上一個（即使今天是 X）
+        return today_tw - _td(days=delta)
+    # 「週X」: 找下一個該星期幾
     m = re.search(r"週([一二三四五六日天])", text)
     if m:
         target_wd = wmap[m.group(1)]
@@ -1483,19 +1539,29 @@ def _resolve_relative_date(text: str):
     return None
 
 
+# event_type → emoji prefix (plan C: 視覺區分三類)
+_TYPE_EMOJI: dict[str, str] = {
+    "family_gathering": "🍽️",
+    "personal_trip": "🚆",
+    "medical": "🏥",
+}
+
+
 def _format_calendar_event(ev: dict) -> str:
-    """events row → reply text。"""
+    """events row → reply text。Plan C：用 event_type emoji 區分三類。"""
     import json as _json
     title = ev.get("title", "")
     date_s = ev.get("event_date", "")
     time_s = ev.get("event_time") or ""
     location = ev.get("location") or ""
+    et = ev.get("event_type") or "family_gathering"
+    emoji = _TYPE_EMOJI.get(et, "🗓️")
     parts_raw = ev.get("participants") or "[]"
     try:
         parts = _json.loads(parts_raw) if isinstance(parts_raw, str) else parts_raw
     except Exception:
         parts = []
-    lines = [f"🗓️ {date_s}" + (f" {time_s}" if time_s else "") + f" {title}"]
+    lines = [f"{emoji} {date_s}" + (f" {time_s}" if time_s else "") + f" {title}"]
     if location:
         lines.append(f"📍 {location}")
     if parts:
@@ -1506,28 +1572,56 @@ def _format_calendar_event(ev: dict) -> str:
 def _handle_calendar_query(
     event: MessageEvent, group_id: str, clean_text: str
 ) -> None:
-    """deterministic 行事曆查詢：parse 相對日期 → 查 calendar_db → 回。"""
+    """deterministic 行事曆查詢 — 3 branch (plan C v3)：
+    1. 解析出具體日期 → list_past + list_upcoming 取交集
+    2. 無日期但含名詞 keyword (台北/胃鏡/媽媽...) → search_by_keyword
+    3. 無日期無名詞 → 列未來 30 天
+    """
     import calendar_db
     target = _resolve_relative_date(clean_text)
-    try:
-        events = calendar_db.list_upcoming(group_id, days=30)
-    except Exception as e:
-        logger.warning("calendar query list_upcoming failed: %s", e)
-        events = []
+
     if target:
-        hits = [e for e in events if e.get("event_date") == target.isoformat()]
+        # branch 1: 具體日期 → past+future 都掃，命中該日的列出
+        try:
+            past = calendar_db.list_past(group_id, days=90)
+            future = calendar_db.list_upcoming(group_id, days=90)
+        except Exception as e:
+            logger.warning("calendar query list_past/upcoming failed: %s", e)
+            past, future = [], []
+        target_iso = target.isoformat()
+        hits = [e for e in (past + future) if e.get("event_date") == target_iso]
         if hits:
             reply = "\n\n".join(_format_calendar_event(e) for e in hits)
         else:
-            reply = f"{target.isoformat()} 沒有家族行程喔～"
+            reply = f"{target_iso} 沒有家族行程喔～"
     else:
-        # 沒解析出明確日期 → 列未來 30 天
-        if events:
-            reply = "最近的家族行程：\n\n" + "\n\n".join(
-                _format_calendar_event(e) for e in events[:5]
-            )
+        # branch 2: 無日期 → 抽 noun keyword → search_by_keyword (future ASC + past DESC)
+        nouns = [kw for kw in _QUERY_NOUN_KEYWORDS if kw in clean_text]
+        if nouns:
+            try:
+                hits = calendar_db.search_by_keyword(group_id, nouns, limit=5)
+            except Exception as e:
+                logger.warning("calendar query search_by_keyword failed: %s", e)
+                hits = []
+            if hits:
+                reply = "找到相關行程：\n\n" + "\n\n".join(
+                    _format_calendar_event(e) for e in hits
+                )
+            else:
+                reply = f"找不到「{' / '.join(nouns)}」相關的行程～"
         else:
-            reply = "目前沒有登記的家族行程～"
+            # branch 3: 無日期無 noun → 列未來
+            try:
+                events = calendar_db.list_upcoming(group_id, days=30)
+            except Exception as e:
+                logger.warning("calendar query list_upcoming failed: %s", e)
+                events = []
+            if events:
+                reply = "最近的家族行程：\n\n" + "\n\n".join(
+                    _format_calendar_event(e) for e in events[:5]
+                )
+            else:
+                reply = "目前沒有登記的家族行程～"
     memory.append_turn(group_id, "user", clean_text)
     memory.append_turn(group_id, "bot", reply)
     _reply(event.reply_token, reply, group_id=group_id)
@@ -1762,13 +1856,15 @@ def _maybe_capture_calendar_event(group_id: str, combined_text: str) -> None:
                 event_time=data.get("time"),
                 location=data.get("location"),
                 participants=data.get("participants") or [],
+                event_type=data.get("event_type", "family_gathering"),
             )
             if event_id:
                 logger.info(
-                    "calendar event captured: %s '%s' on %s (group=%s)",
+                    "calendar event captured: %s '%s' on %s type=%s (group=%s)",
                     event_id,
                     data["title"],
                     data["date"],
+                    data.get("event_type", "family_gathering"),
                     group_id,
                 )
             else:
