@@ -45,9 +45,12 @@ def _get_token() -> str:
 
 
 _OFFSET_LABEL: dict[int, str] = {
-    3: "3 天後",
-    2: "後天",
+    -2: "前天",
+    -1: "昨天",
+    0: "今天",
     1: "明天",
+    2: "後天",
+    3: "3 天後",
 }
 
 
@@ -59,7 +62,9 @@ def _format_event(e: dict, offset: int = 7) -> str:
     except Exception:
         parts = []
     ppl_part = f"\n👥 {'、'.join(parts)}" if parts else ""
-    label = _OFFSET_LABEL.get(offset, f"{offset} 天後")
+    label = _OFFSET_LABEL.get(offset)
+    if label is None:
+        label = f"{abs(offset)} 天前" if offset < 0 else f"{offset} 天後"
     return (
         f"🔔 **{label}活動提醒**\n"
         f"📅 {e['event_date']}{time_part}\n"

@@ -1634,9 +1634,25 @@ def _handle_calendar_query(
     1. 解析出具體日期 → list_past + list_upcoming 取交集
     2. 無日期但含名詞 keyword (台北/胃鏡/媽媽...) → search_by_keyword
     3. 無日期無名詞 → 列未來 30 天
+
+    Format: 用 event_reminder._format_event（含 🔔 header）統一格式，
+    user 問「明天要幹嘛」時收到的訊息跟 launchd 主動推的 reminder 一致。
     """
     import calendar_db
+    import event_reminder as _er
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo as _ZI
+    today_tw = _dt.now(_ZI("Asia/Taipei")).date()
     target = _resolve_relative_date(clean_text)
+
+    def _fmt(ev: dict) -> str:
+        from datetime import date as _date
+        try:
+            ed = _date.fromisoformat(ev.get("event_date", ""))
+            offset = (ed - today_tw).days
+        except Exception:
+            offset = 7  # fallback default
+        return _er._format_event(ev, offset)
 
     if target:
         # branch 1: 具體日期 → past+future 都掃，命中該日的列出
@@ -1649,7 +1665,7 @@ def _handle_calendar_query(
         target_iso = target.isoformat()
         hits = [e for e in (past + future) if e.get("event_date") == target_iso]
         if hits:
-            reply = "\n\n".join(_format_calendar_event(e) for e in hits)
+            reply = "\n\n".join(_fmt(e) for e in hits)
         else:
             reply = f"{target_iso} 沒有家族行程喔～"
     else:
@@ -1662,9 +1678,7 @@ def _handle_calendar_query(
                 logger.warning("calendar query search_by_keyword failed: %s", e)
                 hits = []
             if hits:
-                reply = "找到相關行程：\n\n" + "\n\n".join(
-                    _format_calendar_event(e) for e in hits
-                )
+                reply = "找到相關行程：\n\n" + "\n\n".join(_fmt(e) for e in hits)
             else:
                 reply = f"找不到「{' / '.join(nouns)}」相關的行程～"
         else:
@@ -1676,7 +1690,7 @@ def _handle_calendar_query(
                 events = []
             if events:
                 reply = "最近的家族行程：\n\n" + "\n\n".join(
-                    _format_calendar_event(e) for e in events[:5]
+                    _fmt(e) for e in events[:5]
                 )
             else:
                 reply = "目前沒有登記的家族行程～"
