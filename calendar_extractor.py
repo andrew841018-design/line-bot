@@ -114,8 +114,24 @@ def extract(combined_text: str) -> dict:
         except Exception as e:
             err = str(e)
             logger.warning("calendar extract failed (%s): %s", model_name, err[:200])
-            if "429" not in err and "RESOURCE_EXHAUSTED" not in err:
-                break
+            # 兩個 model 都試完才走 regex fallback；不論 429 or 非 429 都 try 下個。
+            continue
+
+    # Gemini 兩 model 都 fail → 純 regex fallback（family keyword whitelist 防誤判）
+    try:
+        import calendar_regex
+        today_tw_date = datetime.now(_TW).date()
+        regex_result = calendar_regex.extract_regex_only(combined_text, today_tw_date)
+        if regex_result["has_event"]:
+            logger.info(
+                "calendar regex fallback hit: title=%r date=%s time=%s",
+                regex_result["title"],
+                regex_result["date"],
+                regex_result["time"],
+            )
+            return regex_result
+    except Exception as e:
+        logger.warning("calendar regex fallback failed: %s", e)
     return fail
 
 

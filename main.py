@@ -1095,11 +1095,33 @@ def _handle_event(event) -> None:
     if _quota_exhausted() and isinstance(
         msg, (TextMessageContent, FileMessageContent, AudioMessageContent)
     ):
-        _save_pending_any(event, group_id, sender_user_id, msg)
+        # 2026-05-21 加（§3 Phase 6 GP1 critical 反饋）：quota 爆時也要讓
+        # calendar 路徑跑：(a) explicit + calendar query → deterministic 回；
+        # (b) 純文字含 "YYYY-MM-DD HH:MM family-noun" → regex 抽 event 寫 DB。
+        # 否則家人問「明天幾點拿蛋糕」與手打日曆 string 都會被埋進 pending 永不處理。
         if isinstance(msg, TextMessageContent):
-            memory.log_raw_message(group_id, msg.id, sender_user_id, msg.text or "")
-            bot_stats.track_message(msg.text or "")
+            text = msg.text or ""
+            memory.log_raw_message(group_id, msg.id, sender_user_id, text)
+            bot_stats.track_message(text)
+            # (a) explicit + calendar query → deterministic 回
+            try:
+                clean_text = _extract_gemini_trigger(text, msg)
+            except Exception:
+                clean_text = None
+            if clean_text is not None and _is_calendar_query(clean_text):
+                burst_filter.cancel_burst(group_id)
+                _handle_calendar_query(event, group_id, clean_text)
+                return
+            # (b) 不論 explicit 與否，regex fallback 抽 family event 寫 DB
+            try:
+                _maybe_capture_calendar_event(group_id, text)
+            except Exception as e:
+                logger.warning("quota-path calendar capture failed: %s", e)
+            # 落入 pending 路徑（不重複 log_raw_message）
+            _save_pending_any(event, group_id, sender_user_id, msg)
             bot_stats.track_pending_saved()
+        else:
+            _save_pending_any(event, group_id, sender_user_id, msg)
         _try_piggyback_drain_with_reply_token(event.reply_token, group_id)
         return
 
@@ -1416,6 +1438,101 @@ def _handle_image_gen(event: MessageEvent, group_id: str, subject: str) -> None:
     memory.append_turn(group_id, "bot", f"[已生成] {out_path}")
 
 
+_CALENDAR_QUERY_RE = re.compile(
+    r"("
+    r"(?:今天|明天|後天|這週末|下週末|下週|本週|週[一二三四五六日天])"
+    r".{0,8}"
+    r"(?:有事|有什麼|幾點|安排|要幹嘛|要做什麼|計畫|計劃|行程)"
+    r"|"
+    r"(?:有事|有什麼|幾點|安排|要幹嘛|要做什麼|計畫|計劃|行程)"
+    r".{0,8}"
+    r"(?:今天|明天|後天|這週末|下週末|下週|本週|週[一二三四五六日天])"
+    r")"
+)
+
+
+def _is_calendar_query(text: str) -> bool:
+    """偵測「明天有什麼 / 爸爸明天幾點要拿蛋糕 / 後天有事嗎」等行事曆查詢。
+
+    放在 explicit handler 開頭，命中即走 deterministic calendar_db 查詢，
+    完全跳過 Gemini quota（GP2 反饋：query 不該綁 lite_reply Stage 1 handler）。
+    """
+    return bool(_CALENDAR_QUERY_RE.search(text or ""))
+
+
+def _resolve_relative_date(text: str):
+    """偵測 text 中的相對日期關鍵字 → TW timezone target date。回 None = 沒命中。"""
+    from datetime import datetime as _dt, timedelta as _td
+    from zoneinfo import ZoneInfo as _ZI
+    today_tw = _dt.now(_ZI("Asia/Taipei")).date()
+    if "今天" in text:
+        return today_tw
+    if "明天" in text:
+        return today_tw + _td(days=1)
+    if "後天" in text:
+        return today_tw + _td(days=2)
+    # 「週X」: 找下一個該星期幾
+    wmap = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
+    m = re.search(r"週([一二三四五六日天])", text)
+    if m:
+        target_wd = wmap[m.group(1)]
+        delta = (target_wd - today_tw.weekday()) % 7
+        if delta == 0:
+            delta = 7  # 講「週X」通常指下一個
+        return today_tw + _td(days=delta)
+    return None
+
+
+def _format_calendar_event(ev: dict) -> str:
+    """events row → reply text。"""
+    import json as _json
+    title = ev.get("title", "")
+    date_s = ev.get("event_date", "")
+    time_s = ev.get("event_time") or ""
+    location = ev.get("location") or ""
+    parts_raw = ev.get("participants") or "[]"
+    try:
+        parts = _json.loads(parts_raw) if isinstance(parts_raw, str) else parts_raw
+    except Exception:
+        parts = []
+    lines = [f"🗓️ {date_s}" + (f" {time_s}" if time_s else "") + f" {title}"]
+    if location:
+        lines.append(f"📍 {location}")
+    if parts:
+        lines.append(f"👥 {' / '.join(parts)}")
+    return "\n".join(lines)
+
+
+def _handle_calendar_query(
+    event: MessageEvent, group_id: str, clean_text: str
+) -> None:
+    """deterministic 行事曆查詢：parse 相對日期 → 查 calendar_db → 回。"""
+    import calendar_db
+    target = _resolve_relative_date(clean_text)
+    try:
+        events = calendar_db.list_upcoming(group_id, days=30)
+    except Exception as e:
+        logger.warning("calendar query list_upcoming failed: %s", e)
+        events = []
+    if target:
+        hits = [e for e in events if e.get("event_date") == target.isoformat()]
+        if hits:
+            reply = "\n\n".join(_format_calendar_event(e) for e in hits)
+        else:
+            reply = f"{target.isoformat()} 沒有家族行程喔～"
+    else:
+        # 沒解析出明確日期 → 列未來 30 天
+        if events:
+            reply = "最近的家族行程：\n\n" + "\n\n".join(
+                _format_calendar_event(e) for e in events[:5]
+            )
+        else:
+            reply = "目前沒有登記的家族行程～"
+    memory.append_turn(group_id, "user", clean_text)
+    memory.append_turn(group_id, "bot", reply)
+    _reply(event.reply_token, reply, group_id=group_id)
+
+
 def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -> None:
     """使用者明確叫 bot（@mention / /ai 等），立刻丟 Gemini 回覆。"""
     sender_user_id = getattr(event.source, "user_id", None) or ""
@@ -1437,6 +1554,12 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
     # clean_text 空且沒引用 → 用戶只打「咪寶」等觸發詞 → 問候回應
     if not clean_text and not quoted_id:
         _reply(event.reply_token, "嗯？\n怎麼了嗎\n要找我什麼啦", group_id=group_id)
+        return
+
+    # 行事曆查詢 — deterministic path，不依賴 Gemini quota
+    # （GP2 反饋：query 不該綁 lite_reply Stage 1，layer 對齊）
+    if clean_text and _is_calendar_query(clean_text):
+        _handle_calendar_query(event, group_id, clean_text)
         return
 
     # 純文字 + 可能的文字引用
@@ -1467,11 +1590,30 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
     except Exception as e:
         if _is_quota_error(e):
             _mark_quota_exhausted()
-            logger.warning("gemini chat (explicit) quota exhausted")
+            logger.warning(
+                "gemini chat (explicit) quota exhausted, retry via lite_reply"
+            )
+            # Retry once — 這次 _quota_exhausted()=True，_llm_chat 內部走 lite_reply
+            # 不再 silent return；空字串時回 quota_exhausted_message 至少給訊號
+            try:
+                reply_text = _llm_chat(user_input, context, facts, pnotes)
+            except Exception as e2:
+                logger.warning("lite_reply retry failed: %s", e2)
+                reply_text = ""
+            if not reply_text:
+                # quota 爆 + lite_reply 也 miss → 回 quota 訊息，但仍跑 capture
+                # （regex fallback 不靠 Gemini，家人手打的 calendar string 仍可抽）
+                _maybe_capture_calendar_event(group_id, clean_text)
+                _reply(
+                    event.reply_token,
+                    _quota_exhausted_message(),
+                    group_id=group_id,
+                )
+                return
         else:
             logger.exception("gemini chat (explicit) failed: %s", e)
             _reply(event.reply_token, _friendly_gemini_error(e), group_id=group_id)
-        return
+            return
 
     # 即時糾正偵測：使用者如果在糾正 bot，自動記住
     _try_save_correction(group_id, clean_text)
@@ -1480,6 +1622,9 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
     memory.append_turn(group_id, "bot", reply_text)
     _maybe_extract_facts(group_id, user_id=sender_user_id)
     _reply(event.reply_token, reply_text, group_id=group_id)
+    # 14:51 case: 家人在 explicit 路徑手打「YYYY-MM-DD HH:MM 拿蛋糕」，
+    # 之前 _maybe_capture_calendar_event 只在 burst 路徑跑，explicit 完全沒抽。
+    _maybe_capture_calendar_event(group_id, clean_text)
 
 
 def _handle_burst_flush(group_id: str, combined_text: str, reply_token: str) -> None:
@@ -1533,13 +1678,32 @@ def _handle_burst_flush(group_id: str, combined_text: str, reply_token: str) -> 
     except Exception as e:
         if _is_quota_error(e):
             _mark_quota_exhausted()
-            logger.warning("gemini chat (burst) quota exhausted")
+            logger.warning(
+                "gemini chat (burst) quota exhausted, retry via lite_reply"
+            )
+            try:
+                reply_text = _llm_chat(user_input, context, facts, pnotes)
+            except Exception as e2:
+                logger.warning("lite_reply retry (burst) failed: %s", e2)
+                reply_text = ""
+            if not reply_text:
+                # burst path：calendar 抽取仍跑（regex fallback 不靠 Gemini）。
+                # 雖然 docstring 寫「會回應的情境不能靜默」(line 1611)，但 burst 屬於
+                # bot 主動插話（user 沒明確提問），靜默退出比噴 quota 訊息洗 group 更好；
+                # 已透過 line 1095 quota-path 對 explicit / calendar query 走 deterministic
+                # 回覆，這條 burst path 在 quota 爆時不會被觸發（line 1095 short-circuit）。
+                logger.info(
+                    "burst quota retry miss group=%s — silent (calendar capture ran)",
+                    group_id,
+                )
+                _maybe_capture_calendar_event(group_id, combined_text)
+                return
         else:
             logger.exception("gemini chat (burst) failed: %s", e)
             _reply(
                 reply_token, "Gemini 那邊好像塞車了，等一下再回你～", group_id=group_id
             )
-        return
+            return
 
     logger.info(
         "burst gemini reply len=%d text=%s",
@@ -1599,13 +1763,21 @@ def _maybe_capture_calendar_event(group_id: str, combined_text: str) -> None:
                 location=data.get("location"),
                 participants=data.get("participants") or [],
             )
-            logger.info(
-                "calendar event captured: %s '%s' on %s (group=%s)",
-                event_id,
-                data["title"],
-                data["date"],
-                group_id,
-            )
+            if event_id:
+                logger.info(
+                    "calendar event captured: %s '%s' on %s (group=%s)",
+                    event_id,
+                    data["title"],
+                    data["date"],
+                    group_id,
+                )
+            else:
+                logger.info(
+                    "calendar event dedup hit (skipped): '%s' on %s (group=%s)",
+                    data["title"],
+                    data["date"],
+                    group_id,
+                )
     except Exception as e:
         logger.warning("calendar capture failed: %s", e)
 

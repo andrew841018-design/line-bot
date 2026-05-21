@@ -13,10 +13,17 @@ import sqlite3
 import threading
 import time
 import uuid
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from config import settings
+
+_TW = ZoneInfo("Asia/Taipei")
+
+
+def _today_tw() -> date:
+    return datetime.now(_TW).date()
 
 _DB_PATH = Path(settings.sqlite_path)
 _lock = threading.Lock()
@@ -52,6 +59,13 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_events_active "
             "ON events(group_id, status, event_date)"
         )
+        # Dedup: 同 group 同 title 同日 active event 唯一
+        # (group_id, title, event_date) WHERE status='active' — partial unique index
+        # 防 TOCTOU race（GP1 反饋）：應用層 check-then-insert 不夠，SQL 層擋住
+        c.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_dedup "
+            "ON events(group_id, title, event_date) WHERE status='active'"
+        )
 
 
 def insert_event(
@@ -66,8 +80,8 @@ def insert_event(
     event_id = uuid.uuid4().hex
     parts_json = json.dumps(participants or [], ensure_ascii=False)
     with _lock, _conn() as c:
-        c.execute(
-            "INSERT INTO events (event_id, group_id, title, event_date, event_time, "
+        cur = c.execute(
+            "INSERT OR IGNORE INTO events (event_id, group_id, title, event_date, event_time, "
             "location, participants, source_msg_id, status, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)",
             (
@@ -82,6 +96,9 @@ def insert_event(
                 int(time.time() * 1000),
             ),
         )
+        if cur.rowcount == 0:
+            # dedup hit — 同 group+title+event_date 的 active event 已存在
+            return ""
     return event_id
 
 
@@ -131,8 +148,10 @@ def update_event_date(event_id: str, new_date: str, new_time: str | None = None)
 
 
 def list_upcoming(group_id: str, days: int = 30) -> list[dict]:
-    today = date.today().isoformat()
-    until = (date.today() + timedelta(days=days)).isoformat()
+    # 用 TW timezone today（避免 UTC host 跨日誤判 — codex/GP1 反饋）
+    today_d = _today_tw()
+    today = today_d.isoformat()
+    until = (today_d + timedelta(days=days)).isoformat()
     with _lock, _conn() as c:
         c.row_factory = sqlite3.Row
         rows = c.execute(
@@ -145,7 +164,7 @@ def list_upcoming(group_id: str, days: int = 30) -> list[dict]:
 
 def list_due_for_reminder(days_ahead: int = 7) -> list[dict]:
     """回傳所有 event_date = today + days_ahead 且尚未推過提醒的 active events。"""
-    target = (date.today() + timedelta(days=days_ahead)).isoformat()
+    target = (_today_tw() + timedelta(days=days_ahead)).isoformat()
     with _lock, _conn() as c:
         c.row_factory = sqlite3.Row
         rows = c.execute(
