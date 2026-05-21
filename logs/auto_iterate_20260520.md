@@ -171,3 +171,34 @@ INFO:     Application shutdown complete.
 3. Quality alert Discord DM 防呆：`conftest.py` 已有 autouse fixture 攔住測試發 webhook（commit 347bc4e），維持這個保護。
 [12:38:18] iter 1 後 pytest 全綠，提早退出
 [12:38:19] ## Step 7: 仍有未 commit 變更，catch-all 上傳
+[main 604c2e4] auto iterate 20260520 (catch-all)
+ 4 files changed, 10 insertions(+), 1 deletion(-)
+To github.com:andrew841018-design/line-bot.git
+   2fb430b..604c2e4  main -> main
+[12:38:22] ## Step 8: restart uvicorn
+[12:38:29] /health: {"status":"ok","gemini_model":"gemini-2.5-flash","gemini_light_model":"gemini-2.5-flash-lite","group_locked":true}
+2026-05-20 12:38:33,334 INFO AFC is enabled with max remote calls: 10.
+2026-05-20 12:38:34,075 INFO HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+2026-05-20 12:38:34,110 INFO AFC is enabled with max remote calls: 10.
+2026-05-20 12:38:34,186 INFO HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent "HTTP/1.1 429 Too Many Requests"
+======================================================================
+LINE bot preflight @ 2026-05-20T12:38:30
+======================================================================
+  [✓]  1. uvicorn process alive
+  [✓]  2. local /health 200
+  [✓]  3. cloudflared process alive
+  [✓]  4. cloudflared URL stash 可讀 + 安全 — url=https://eden-intense-simply-nations.trycloudflare.com age=1503s
+  [✓]  5. cloudflared metrics 內部 URL 對 stash — metrics 200 但 ha_connections 沒露
+  [✓]  6. external https://eden-intense-simply-nations.trycloudflare.com/health 200 — attempt=1
+  [✓]  7. /callback no-sig → 400 missing
+  [✓]  8. LINE token /v2/bot/info 200
+  [✓]  9. LINE webhook URL 對齊 cloudflared
+  [✓] 10. LINE → cloudflared → /callback E2E
+  [✓] 11. Gemini main probe
+  [✗] 12. Gemini lite probe — 429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': 'You exceeded your current quota, please check your plan and 
+  [✓] 13. SQLite integrity + WAL checkpoint
+  [✓] 14. pending file JSON load — groups=2 entries=10
+----------------------------------------------------------------------
+PREFLIGHT [PASS] critical=12/12 info=2/2 elapsed=4.3s
+[12:38:34] preflight exit=0 (0=pass, 1=critical, 2=info-only, 3=infra)
+[12:38:34] ===== 結束 =====

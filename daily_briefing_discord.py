@@ -1086,14 +1086,21 @@ def job_search_summary() -> str:
         seen_url = set()
         seen_company_title = set()
         # 各 bucket 的職缺 list
-        buckets: dict = {"DE 必投": [], "DE 值得投": [], "AI 必投": [], "AI 值得投": []}
+        buckets: dict = {
+            "DE 必投": [], "DE 值得投": [],
+            "AI 必投": [], "AI 值得投": [],
+            "FIN_SW 必投": [], "FIN_SW 值得投": [],
+        }
         all_new_urls = []
 
         current_bucket = None
         for line in text.splitlines():
-            # 偵測 bucket header（## 🔴 必投 DE / ## 🟡 值得投 DE / ## 🔴 必投 AI / ## 🟡 值得投 AI）
+            # 偵測 bucket header（## 🔴 必投 DE/AI/FIN_SW / ## 🟡 值得投 DE/AI/FIN_SW）
+            # FIN_SW 偵測必須在 DE/AI 之前（"FIN_SW" 不含 "DE" 或 "AI" 子字串，但保險起見明確分支）
             if "🔴 必投" in line:
-                if "DE" in line:
+                if "FIN_SW" in line:
+                    current_bucket = "FIN_SW 必投"
+                elif "DE" in line:
                     current_bucket = "DE 必投"
                 elif "AI" in line:
                     current_bucket = "AI 必投"
@@ -1101,7 +1108,9 @@ def job_search_summary() -> str:
                     current_bucket = None
                 continue
             if "🟡 值得投" in line:
-                if "DE" in line:
+                if "FIN_SW" in line:
+                    current_bucket = "FIN_SW 值得投"
+                elif "DE" in line:
                     current_bucket = "DE 值得投"
                 elif "AI" in line:
                     current_bucket = "AI 值得投"
@@ -1183,14 +1192,16 @@ def job_search_summary() -> str:
                     f"📥 **JD**：fetch {succeeded_total}/{attempted_total}, listing 內含 {inline_total}"
                 )
 
-        # 4 個 bucket 依序輸出（每個都附 URL）
+        # 6 個 bucket 依序輸出（每個都附 URL）
         bucket_emoji = {
             "DE 必投": "🔴",
             "DE 值得投": "🟢",
             "AI 必投": "🔴",
             "AI 值得投": "🟢",
+            "FIN_SW 必投": "🔴",
+            "FIN_SW 值得投": "🟢",
         }
-        for bname in ["DE 必投", "DE 值得投", "AI 必投", "AI 值得投"]:
+        for bname in ["DE 必投", "DE 值得投", "AI 必投", "AI 值得投", "FIN_SW 必投", "FIN_SW 值得投"]:
             items = buckets[bname]
             if items:
                 lines.append(f"**{bucket_emoji[bname]} {bname}（{len(items)} 間，已過濾推過的）：**")
