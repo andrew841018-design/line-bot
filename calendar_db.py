@@ -306,6 +306,48 @@ def search_by_keyword(
     return combined[:limit]
 
 
+def search_by_title_phrase(
+    group_id: str, verb_noun_pairs: list[tuple[str, str]], limit: int = 5
+) -> list[dict]:
+    """Verb+noun phrase search on title column with `%verb%noun%` LIKE pattern.
+
+    Example: pairs=[("拿","蛋糕")] → title LIKE '%拿%蛋糕%'
+    Matches: '拿蛋糕' / '拿爸爸生日蛋糕' / '拿一個蛋糕'
+    Skips: '蛋糕拿來' (wrong order), '蛋糕' (no verb)
+
+    Same ordering rule as search_by_keyword: future ASC + past DESC.
+    """
+    if not verb_noun_pairs:
+        return []
+    today_iso = _today_tw().isoformat()
+    conditions = []
+    pattern_params: list = []
+    for v, n in verb_noun_pairs:
+        conditions.append("title LIKE ? ESCAPE '\\'")
+        pattern_params.append(f"%{_escape_like(v)}%{_escape_like(n)}%")
+    where = " OR ".join(conditions)
+    sql_future = (
+        f"SELECT * FROM events WHERE group_id = ? AND status = 'active' "
+        f"AND event_date >= ? AND ({where}) "
+        "ORDER BY event_date ASC, event_time ASC LIMIT ?"
+    )
+    sql_past = (
+        f"SELECT * FROM events WHERE group_id = ? AND status = 'active' "
+        f"AND event_date < ? AND ({where}) "
+        "ORDER BY event_date DESC, event_time DESC LIMIT ?"
+    )
+    with _lock, _conn() as c:
+        c.row_factory = sqlite3.Row
+        future_rows = c.execute(
+            sql_future, [group_id, today_iso, *pattern_params, limit]
+        ).fetchall()
+        past_rows = c.execute(
+            sql_past, [group_id, today_iso, *pattern_params, limit]
+        ).fetchall()
+    combined = [dict(r) for r in future_rows] + [dict(r) for r in past_rows]
+    return combined[:limit]
+
+
 def list_due_for_reminder(days_ahead: int = 7) -> list[dict]:
     """回傳 event_date = today + days_ahead 且該 offset 的 reminded 欄位 IS NULL 的 active events。
 

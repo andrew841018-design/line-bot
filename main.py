@@ -1543,6 +1543,36 @@ _QUERY_NOUN_KEYWORDS: tuple[str, ...] = (
     "喜來登",
 )
 
+# Verb+noun phrase 抽取 — 對應 title LIKE '%verb%noun%' 順序匹配（中間可有字）
+# 「媽媽什麼時候回台北」→ ('回', '台北') → title LIKE '%回%台北%'
+# 「哪一天拿蛋糕」→ ('拿', '蛋糕') → 也能命中「拿爸爸生日蛋糕」
+_QUERY_PHRASE_RE = re.compile(
+    r"(回)(台北|新北|台中|台南|高雄|花蓮|宜蘭|新竹|苗栗|嘉義|屏東|台東|老家)"
+    r"|(做)(胃鏡|大腸鏡|健康檢查|體檢|手術|健檢|LDCT)"
+    r"|(看)(醫生|牙醫|皮膚科|眼科|耳鼻喉科)"
+    r"|(拿)(蛋糕|藥|包裹|貨|禮物|花)"
+    r"|(接)(爸|媽|妹|弟|姊|爺爺|奶奶|小孩|小朋友)"
+    r"|(陪)(就醫|看醫生|看病)"
+    r"|(領)(藥|處方簽|包裹)"
+)
+
+
+def _extract_verb_noun_pairs(text: str) -> list[tuple[str, str]]:
+    """從 query 抽 (verb, noun) tuples。Regex 多 group，過濾出非 None pair。"""
+    pairs: list[tuple[str, str]] = []
+    for m in _QUERY_PHRASE_RE.finditer(text):
+        groups = m.groups()
+        # groups 是 14 個 (7 個 verb + 7 個 noun)，只有命中的 group 非 None
+        for i in range(0, len(groups), 2):
+            if groups[i] and groups[i + 1]:
+                pairs.append((groups[i], groups[i + 1]))
+                break
+    return pairs
+
+# 未來指向關鍵字 — 「什麼時候/哪一天/何時」預設只看未來
+_FUTURE_LEANING_RE = re.compile(r"(?:什麼時候|哪一天|哪天|何時|什麼日子)")
+_PAST_LEANING_RE = re.compile(r"(?:上次|之前|上回|前一次|何時.{0,3}過)")
+
 
 def _is_calendar_query(text: str) -> bool:
     """偵測「明天有什麼 / 爸爸明天幾點要拿蛋糕 / 後天有事嗎」等行事曆查詢。
@@ -1669,20 +1699,74 @@ def _handle_calendar_query(
         else:
             reply = f"{target_iso} 沒有家族行程喔～"
     else:
-        # branch 2: 無日期 → 抽 noun keyword → search_by_keyword (future ASC + past DESC)
-        nouns = [kw for kw in _QUERY_NOUN_KEYWORDS if kw in clean_text]
-        if nouns:
+        # branch 2: 無日期 → phrase 精準 match (動詞+名詞 token-OR) + 方向智慧 fallback
+        today_iso = today_tw.isoformat()
+        # 嚴格方向：明確「下次/以後」or「上次/之前」才強制
+        strict_future = bool(re.search(r"下次|以後|下回|未來|下回", clean_text))
+        strict_past = bool(re.search(r"上次|之前|上回|前一次", clean_text))
+
+        def _split(events: list) -> tuple[list, list]:
+            future = [e for e in events if e.get("event_date", "") >= today_iso]
+            past = [e for e in events if e.get("event_date", "") < today_iso]
+            return future, past
+
+        # Step 1: verb+noun phrase 精準 match (title LIKE '%verb%noun%' 順序匹配)
+        vn_pairs = _extract_verb_noun_pairs(clean_text)
+        phrases = [f"{v}{n}" for v, n in vn_pairs]  # for label only
+        hits_phrase: list = []
+        if vn_pairs:
             try:
-                hits = calendar_db.search_by_keyword(group_id, nouns, limit=5)
+                hits_phrase = calendar_db.search_by_title_phrase(
+                    group_id, vn_pairs, limit=10
+                )
             except Exception as e:
-                logger.warning("calendar query search_by_keyword failed: %s", e)
-                hits = []
-            if hits:
-                reply = "找到相關行程：\n\n" + "\n\n".join(_fmt(e) for e in hits)
+                logger.warning("calendar query phrase search failed: %s", e)
+
+        # Step 2: noun soft search （phrase 沒命中時的退路）
+        nouns = [kw for kw in _QUERY_NOUN_KEYWORDS if kw in clean_text]
+        hits_noun: list = []
+        if not hits_phrase and nouns:
+            try:
+                hits_noun = calendar_db.search_by_keyword(group_id, nouns, limit=10)
+            except Exception as e:
+                logger.warning("calendar query soft search failed: %s", e)
+
+        # Pick set + split into future/past
+        hits = hits_phrase if hits_phrase else hits_noun
+        future_hits, past_hits = _split(hits)
+
+        # Direction policy: 預設 future 優先；無 future 才列 past 並標明
+        if hits:
+            phrase_label = "「" + "/".join(phrases) + "」" if phrases else (
+                "「" + "/".join(nouns) + "」" if nouns else "相關"
+            )
+            soft_prefix = "" if hits_phrase else f"沒找到{phrase_label}的明確紀錄，可能相關：\n\n"
+            if strict_future:
+                if future_hits:
+                    reply = soft_prefix + "\n\n".join(_fmt(e) for e in future_hits[:3])
+                else:
+                    reply = f"沒有未來{phrase_label}的紀錄～"
+            elif strict_past:
+                if past_hits:
+                    reply = soft_prefix + "\n\n".join(_fmt(e) for e in past_hits[:3])
+                else:
+                    reply = f"沒有過去{phrase_label}的紀錄～"
+            elif future_hits:
+                # default future-leaning：有未來就只列未來
+                reply = soft_prefix + "\n\n".join(_fmt(e) for e in future_hits[:3])
+            elif past_hits:
+                # future 沒有 → 提示 + 列 past 當參考
+                reply = (
+                    f"未來沒有{phrase_label}的安排。上次：\n\n"
+                    + "\n\n".join(_fmt(e) for e in past_hits[:3])
+                )
             else:
-                reply = f"找不到「{' / '.join(nouns)}」相關的行程～"
+                reply = f"沒找到{phrase_label}的紀錄～"
+        elif phrases or nouns:
+            searched = "/".join(phrases) if phrases else "/".join(nouns)
+            reply = f"沒找到「{searched}」相關的行程～"
         else:
-            # branch 3: 無日期無 noun → 列未來
+            # Step 3: 無 phrase 無 noun → 列未來
             try:
                 events = calendar_db.list_upcoming(group_id, days=30)
             except Exception as e:
