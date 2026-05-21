@@ -32,6 +32,17 @@ _lock = threading.Lock()
 EVENT_TYPES: tuple[str, ...] = ("family_gathering", "personal_trip", "medical")
 _DEFAULT_EVENT_TYPE = "family_gathering"
 
+# Reminder offsets — T-3 / T-2 / T-1 三天每天推（user 2026-05-21 directive）
+# 加新 offset 只動這一行 + schema migration 補對應欄位
+REMINDER_OFFSETS: tuple[int, ...] = (3, 2, 1)
+
+
+def _reminded_column(offset: int) -> str:
+    """offset → reminded_Xd column name。Whitelist 驗 offset 防 SQL injection (column 不能 bind param)。"""
+    if offset not in REMINDER_OFFSETS:
+        raise ValueError(f"invalid offset {offset}; must be in {REMINDER_OFFSETS}")
+    return f"reminded_{offset}d"
+
 
 def _validate_event_type(et: str | None) -> str:
     """白名單驗證 — invalid → default。"""
@@ -88,6 +99,20 @@ def init_db() -> None:
             # 重新 verify（如果是 lock 沒做成功，下一輪 init_db 會處理）
             cols = [r[1] for r in c.execute("PRAGMA table_info(events)").fetchall()]
         assert "event_type" in cols, "event_type migration failed"
+
+        # Reminder offsets migration — T-3/T-2/T-1 三個 timestamp 欄位（NULL=未推）
+        # 同 event_type PRAGMA pre-check + duplicate-column tolerance (codex critical)
+        for off in REMINDER_OFFSETS:
+            col_name = f"reminded_{off}d"
+            if col_name not in cols:
+                try:
+                    c.execute(f"ALTER TABLE events ADD COLUMN {col_name} INTEGER")
+                except sqlite3.OperationalError as e:
+                    msg = str(e).lower()
+                    if "duplicate column" not in msg and "database is locked" not in msg:
+                        raise
+                cols = [r[1] for r in c.execute("PRAGMA table_info(events)").fetchall()]
+            assert col_name in cols, f"{col_name} migration failed"
         c.execute(
             "CREATE INDEX IF NOT EXISTS idx_events_active "
             "ON events(group_id, status, event_date)"
@@ -191,10 +216,16 @@ def cancel_event(event_id: str) -> bool:
 
 
 def update_event_date(event_id: str, new_date: str, new_time: str | None = None) -> bool:
+    """Reschedule event；reset 所有 reminded 欄位（codex critical：rescheduled event
+    必須重推 T-3/T-2/T-1，否則之前推過的 flag 會壓住新提醒）。
+    """
     with _lock, _conn() as c:
         cur = c.execute(
-            "UPDATE events SET event_date = ?, event_time = COALESCE(?, event_time), "
-            "reminded_at = NULL WHERE event_id = ?",
+            "UPDATE events SET event_date = ?, "
+            "event_time = COALESCE(?, event_time), "
+            "reminded_at = NULL, "
+            "reminded_3d = NULL, reminded_2d = NULL, reminded_1d = NULL "
+            "WHERE event_id = ?",
             (new_date, new_time, event_id),
         )
         return cur.rowcount > 0
@@ -276,24 +307,51 @@ def search_by_keyword(
 
 
 def list_due_for_reminder(days_ahead: int = 7) -> list[dict]:
-    """回傳所有 event_date = today + days_ahead 且尚未推過提醒的 active events。"""
+    """回傳 event_date = today + days_ahead 且該 offset 的 reminded 欄位 IS NULL 的 active events。
+
+    days_ahead in REMINDER_OFFSETS (3/2/1) → 查對應 reminded_Xd column
+    days_ahead = 其他值（如 legacy 7）→ 走舊 `reminded_at` graveyard column（向後相容）
+    """
     target = (_today_tw() + timedelta(days=days_ahead)).isoformat()
     with _lock, _conn() as c:
         c.row_factory = sqlite3.Row
-        rows = c.execute(
-            "SELECT * FROM events WHERE status = 'active' AND event_date = ? "
-            "AND reminded_at IS NULL",
-            (target,),
-        ).fetchall()
+        if days_ahead in REMINDER_OFFSETS:
+            col = _reminded_column(days_ahead)
+            # column name 已被 _reminded_column whitelist 驗過 (SQL injection 防護)
+            rows = c.execute(
+                f"SELECT * FROM events WHERE status = 'active' "
+                f"AND event_date = ? AND {col} IS NULL",
+                (target,),
+            ).fetchall()
+        else:
+            # legacy path（保留 reminded_at 欄位向後相容）
+            rows = c.execute(
+                "SELECT * FROM events WHERE status = 'active' AND event_date = ? "
+                "AND reminded_at IS NULL",
+                (target,),
+            ).fetchall()
     return [dict(r) for r in rows]
 
 
-def mark_reminded(event_id: str) -> None:
+def mark_reminded(event_id: str, days_ahead: int = 7) -> None:
+    """標記 offset 的 reminded 欄位為 now timestamp。
+
+    days_ahead in REMINDER_OFFSETS → 寫 reminded_Xd
+    其他值 → 寫 legacy reminded_at（向後相容）
+    """
+    ts = int(time.time() * 1000)
     with _lock, _conn() as c:
-        c.execute(
-            "UPDATE events SET reminded_at = ? WHERE event_id = ?",
-            (int(time.time() * 1000), event_id),
-        )
+        if days_ahead in REMINDER_OFFSETS:
+            col = _reminded_column(days_ahead)
+            c.execute(
+                f"UPDATE events SET {col} = ? WHERE event_id = ?",
+                (ts, event_id),
+            )
+        else:
+            c.execute(
+                "UPDATE events SET reminded_at = ? WHERE event_id = ?",
+                (ts, event_id),
+            )
 
 
 # 允許 import 時自動建表（跟 memory.py 同模式）

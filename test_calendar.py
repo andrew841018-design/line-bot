@@ -155,12 +155,13 @@ def test_event_reminder_main_no_events(tmp_calendar_db, monkeypatch):
 
 
 def test_event_reminder_pushes_and_marks(tmp_calendar_db, monkeypatch):
+    """T-3/T-2/T-1 reminders (2026-05-21 user directive)。"""
     cd = tmp_calendar_db
-    seven = (date.today() + timedelta(days=7)).isoformat()
+    one = (date.today() + timedelta(days=1)).isoformat()
     cd.insert_event(
         group_id="G1",
         title="家族聚餐",
-        event_date=seven,
+        event_date=one,
         event_time="18:00",
         location="鼎泰豐",
         participants=["全家"],
@@ -172,16 +173,17 @@ def test_event_reminder_pushes_and_marks(tmp_calendar_db, monkeypatch):
     sent = []
     monkeypatch.setattr(event_reminder, "_push", lambda text: sent.append(text) or True)
     monkeypatch.setattr(event_reminder, "GROUP_ID", "G1")
-    monkeypatch.setattr(event_reminder, "TOKEN", "dummy")
+    monkeypatch.setattr(event_reminder, "_get_token", lambda: "dummy")
 
     rc = event_reminder.main()
     assert rc == 0
     assert len(sent) == 1
     assert "家族聚餐" in sent[0]
     assert "鼎泰豐" in sent[0]
-    assert seven in sent[0]
+    assert "明天" in sent[0]  # T-1 label
+    assert one in sent[0]
 
-    # 第二次跑：不該再推
+    # 第二次跑：不該再推（idempotency invariant）
     sent.clear()
     rc = event_reminder.main()
     assert rc == 0
@@ -190,8 +192,8 @@ def test_event_reminder_pushes_and_marks(tmp_calendar_db, monkeypatch):
 
 def test_event_reminder_skips_cancelled(tmp_calendar_db, monkeypatch):
     cd = tmp_calendar_db
-    seven = (date.today() + timedelta(days=7)).isoformat()
-    eid = cd.insert_event(group_id="G1", title="X", event_date=seven)
+    one = (date.today() + timedelta(days=1)).isoformat()
+    eid = cd.insert_event(group_id="G1", title="X", event_date=one)
     cd.cancel_event(eid)
 
     import event_reminder
@@ -200,7 +202,7 @@ def test_event_reminder_skips_cancelled(tmp_calendar_db, monkeypatch):
     sent = []
     monkeypatch.setattr(event_reminder, "_push", lambda text: sent.append(text) or True)
     monkeypatch.setattr(event_reminder, "GROUP_ID", "G1")
-    monkeypatch.setattr(event_reminder, "TOKEN", "dummy")
+    monkeypatch.setattr(event_reminder, "_get_token", lambda: "dummy")
 
     rc = event_reminder.main()
     assert rc == 0
