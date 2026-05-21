@@ -1282,6 +1282,59 @@ def _handle_video_message(event, group_id):
         logger.warning("video reply failed: %s", e)
 
 
+def _try_piggyback_reminders_fast_path(
+    reply_token: str | None, group_id: str
+) -> bool:
+    """有 due reminder → 用 reply_token 直接推 + mark + return True (caller skip 後續)。
+
+    觸發路徑：user 講話但訊息不會被 burst_filter 主動回 (heuristic skip)。
+    這時 reply_token 反正會被丟掉，剛好拿來推 due reminder（LINE reply API 免費，
+    不耗月 push quota）。
+
+    Peek-then-confirm: reply 成功才 mark；失敗下次再試。
+    """
+    if not reply_token or not group_id or settings.bot_muted:
+        return False
+    try:
+        import calendar_db
+        import event_reminder as _er
+        messages: list = []
+        pending: list[tuple[str, int]] = []
+        for offset in calendar_db.REMINDER_OFFSETS:
+            if len(messages) >= 5:
+                break
+            for e in calendar_db.list_due_for_reminder(days_ahead=offset):
+                if len(messages) >= 5:
+                    break
+                messages.append(TextMessage(text=_er._format_event(e, offset)))
+                pending.append((e["event_id"], offset))
+        if not messages:
+            return False
+        try:
+            with ApiClient(_get_line_config()) as api_client:
+                MessagingApi(api_client).reply_message(
+                    ReplyMessageRequest(
+                        reply_token=reply_token, messages=messages,
+                    )
+                )
+        except Exception as e:
+            logger.warning(
+                "reminder fast-path reply failed (reminders preserved): %s",
+                str(e)[:200],
+            )
+            return False
+        for ev_id, off in pending:
+            calendar_db.mark_reminded(ev_id, off)
+        logger.info(
+            "reminder fast-path: pushed %d reminders via reply_token group=%s",
+            len(pending), group_id,
+        )
+        return True
+    except Exception as e:
+        logger.warning("reminder fast-path failed: %s", e)
+        return False
+
+
 def _handle_text_message(event: MessageEvent, group_id: str) -> None:
     text = event.message.text or ""
 
@@ -1340,6 +1393,11 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
         return
 
     # 4. 其他文字訊息 → burst_filter debounce（等對方說完再回）
+    # 4a. fast-path：如果有 due reminder 沒推過，搶在 burst_filter 累積前用 reply_token
+    # 推 reminder（LINE push quota 爆時的補救路徑 — reply API 不耗月配額）
+    if _try_piggyback_reminders_fast_path(event.reply_token, group_id):
+        return
+
     sender_user_id = getattr(event.source, "user_id", None) or ""
     burst_filter.add_to_burst(
         group_id, event.message.id, text, sender_user_id, event.reply_token
