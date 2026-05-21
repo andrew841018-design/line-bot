@@ -1579,8 +1579,19 @@ def _is_calendar_query(text: str) -> bool:
 
     放在 explicit handler 開頭，命中即走 deterministic calendar_db 查詢，
     完全跳過 Gemini quota（GP2 反饋：query 不該綁 lite_reply Stage 1 handler）。
+
+    兩階段偵測（避免 _CALENDAR_QUERY_RE verb list 沒涵蓋全部行程動詞時 miss）：
+    1. _CALENDAR_QUERY_RE 直接命中
+    2. 含問句詞（什麼時候/哪一天/哪天/何時/上次/之前）+ verb_noun phrase 命中
     """
-    return bool(_CALENDAR_QUERY_RE.search(text or ""))
+    if not text:
+        return False
+    if _CALENDAR_QUERY_RE.search(text):
+        return True
+    # 二段 fallback：問句詞 + 行程動作 phrase
+    if re.search(r"什麼時候|哪一天|哪天|何時|上次|之前", text) and _QUERY_PHRASE_RE.search(text):
+        return True
+    return False
 
 
 def _resolve_relative_date(text: str):
