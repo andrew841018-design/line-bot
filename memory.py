@@ -409,12 +409,16 @@ def log_raw_message(
             " ORDER BY created_at DESC LIMIT ?)",
             (group_id, group_id, _RAW_MESSAGE_KEEP),
         )
-    # Embedding hook — lazy import 避免循環依賴；任何錯誤都 swallow
-    try:
-        from embedding_recall import index_message as _idx
-        _idx(message_id, group_id, text, is_bot=(user_id == "__bot__"))
-    except Exception:
-        pass
+    # Embedding hook — async fire-and-forget (2026-05-21 修：sentence_transformer
+    # 首次 in-process load 要 ~10 秒，會 block webhook handler 害 reply 延遲)
+    import threading
+    def _bg_index() -> None:
+        try:
+            from embedding_recall import index_message as _idx
+            _idx(message_id, group_id, text, is_bot=(user_id == "__bot__"))
+        except Exception:
+            pass
+    threading.Thread(target=_bg_index, daemon=True).start()
 
 
 def get_raw_message(group_id: str, message_id: str) -> tuple[str | None, str] | None:

@@ -1790,9 +1790,17 @@ def _handle_calendar_query(
                         )
                     else:
                         reply = "目前沒有登記的家族行程～"
+    logger.info(
+        "calendar query reply built: len=%d preview=%r",
+        len(reply), reply[:120],
+    )
     memory.append_turn(group_id, "user", clean_text)
     memory.append_turn(group_id, "bot", reply)
-    _reply(event.reply_token, reply, group_id=group_id)
+    try:
+        _reply(event.reply_token, reply, group_id=group_id)
+        logger.info("calendar query _reply returned cleanly group=%s", group_id)
+    except Exception as e:
+        logger.warning("calendar query _reply raised: %s", e)
 
 
 def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -> None:
@@ -1821,6 +1829,10 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
     # 行事曆查詢 — deterministic path，不依賴 Gemini quota
     # （GP2 反饋：query 不該綁 lite_reply Stage 1，layer 對齊）
     if clean_text and _is_calendar_query(clean_text):
+        logger.info(
+            "calendar query routed: text=%r group=%s",
+            clean_text[:50], group_id,
+        )
         _handle_calendar_query(event, group_id, clean_text)
         return
 
