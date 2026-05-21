@@ -1794,13 +1794,25 @@ def _handle_calendar_query(
         "calendar query reply built: len=%d preview=%r",
         len(reply), reply[:120],
     )
+    # 直接呼 LINE reply API，跳過 _reply 內的 pending piggyback drain
+    # （pending drain 會跑 local LLM / vision_llm，CPU heavy 害 reply 慢 1 分鐘）
+    # 行事曆查詢應該 < 5 秒回，piggyback 留給其他 reply 路徑做
+    reply_text = _md_to_line(reply)
+    try:
+        if not settings.bot_muted:
+            with ApiClient(_get_line_config()) as api_client:
+                MessagingApi(api_client).reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text=reply_text)],
+                    )
+                )
+        logger.info("calendar query reply sent group=%s", group_id)
+    except Exception as e:
+        logger.warning("calendar query reply failed: %s", e)
+
     memory.append_turn(group_id, "user", clean_text)
     memory.append_turn(group_id, "bot", reply)
-    try:
-        _reply(event.reply_token, reply, group_id=group_id)
-        logger.info("calendar query _reply returned cleanly group=%s", group_id)
-    except Exception as e:
-        logger.warning("calendar query _reply raised: %s", e)
 
 
 def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -> None:
