@@ -1335,6 +1335,43 @@ def _try_piggyback_reminders_fast_path(
         return False
 
 
+# 自動 capture cheap pre-filter — 含日期 hint + 行程動詞 才考慮跑 Gemini extractor
+_AUTO_CAPTURE_DATE_HINT_RE = re.compile(
+    r"明天|後天|今天|這週末|下週末|下週|本週|週[一二三四五六日天]|"
+    r"\d+月\d+日|\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}|"
+    r"(?:[01]?\d|2[0-3]):[0-5]\d"
+)
+_AUTO_CAPTURE_VERB_RE = re.compile(
+    r"聚餐|生日|出遊|看醫生|拿(?:蛋糕|藥|包裹|貨|禮物|花)|"
+    r"接(?:爸|媽|妹|弟|姊|爺爺|奶奶|小孩|小朋友)|"
+    r"陪(?:.{0,5})(?:就醫|看醫生|看病)|"
+    r"回(?:台北|新北|台中|台南|高雄|花蓮|宜蘭|新竹|苗栗|嘉義|屏東|台東|老家|家)|"
+    r"做(?:胃鏡|大腸鏡|健康檢查|體檢|手術|健檢|LDCT)|"
+    r"領(?:藥|處方簽|包裹)|"
+    r"婚禮|喜宴|滿月|彌月|"
+    r"打疫苗|抽血|健檢|出差|北上|南下"
+)
+
+
+def _auto_capture_text_if_important(group_id: str, text: str) -> None:
+    """每條 text message 來時 cheap pre-filter → 通過才 async 跑 Gemini extractor。
+
+    避免每訊息都打 Gemini 燒 20 req/day quota。
+    UNIQUE INDEX 自動 dedup，重跑安全。
+    """
+    if not text or len(text.strip()) < 4 or len(text) > 500:
+        return
+    if not (_AUTO_CAPTURE_DATE_HINT_RE.search(text) and _AUTO_CAPTURE_VERB_RE.search(text)):
+        return
+    import threading
+    def _bg() -> None:
+        try:
+            _maybe_capture_calendar_event(group_id, text)
+        except Exception as e:
+            logger.warning("auto capture (every-msg) failed: %s", e)
+    threading.Thread(target=_bg, daemon=True).start()
+
+
 def _handle_text_message(event: MessageEvent, group_id: str) -> None:
     text = event.message.text or ""
 
@@ -1358,6 +1395,12 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
         knowledge_graph.auto_extract_kg_async(group_id, text)
     except (ImportError, Exception) as e:
         logger.debug("knowledge_graph extract skipped: %s", e)
+
+    # 自動偵測重要訊息（含日期+行程動詞）→ 抽 calendar event 寫進 DB
+    # (2026-05-21 user directive: 每條留言自動判定重要性)
+    # Cheap pre-filter (regex) → 通過才 spin off thread 跑 Gemini extractor
+    # 重跑由 UNIQUE INDEX (group_id, title, event_date) 自動 dedup
+    _auto_capture_text_if_important(group_id, text)
 
     # 自動分類（rule-first → Gemini lite，fire-and-forget；2026-05-10 加）
     try:
