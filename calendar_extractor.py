@@ -55,14 +55,20 @@ _PROMPT = """你是家族 LINE 群行事曆助手。從下面這段對話判斷�
 2. 有沒有人在「取消 / 改期 / 不去了」之前約好的事件？→ is_cancellation=true
 3. 兩者都不是 → has_event=false, is_cancellation=false
 
-抽欄位（無就 null）：
-- title：簡短 6 字內，例「家族聚餐」「媽媽回台北」「爺爺做胃鏡」
+抽欄位（無就 null） — 目標「人事時地物」五元素完整：
+- title：12 字內，**含動詞 + 物 / 主角**，越具體越好：
+    ✅「拿爸爸生日蛋糕」「領楊偉勛處方簽」「全家媽媽生日聚餐」「媽媽回台北做胃鏡」
+    ❌「拿蛋糕」「領藥」「聚餐」「回台北」(都太空泛)
 - event_type：三選一 — "family_gathering" / "personal_trip" / "medical"
 - date：YYYY-MM-DD。模糊詞要換成今日換算後的日期：
     今天=今天日期；明天=+1；後天=+2；下週X=下個週X；本週X=本週X
 - time：24h 格式 HH:MM；下午6點→18:00；晚上8點→20:00
-- location：餐廳/地點/醫院名稱
-- participants：講到誰：媽媽、爸爸、姊姊、妹妹、弟弟、全家、奶奶、爺爺…
+- location：餐廳/地點/醫院 + 分店名（**完整地點**），例「喜來登日本料理」「台大醫院東址1樓」「徐卅路地中海料理」
+- participants：**含角色標記**：
+    ✅ ["爸爸(壽星)", "媽媽(陪同)", "全家"]
+    ✅ ["媽媽(就醫)", "黃將修(陪同)"]
+    ✅ ["爸爸(取者)"]
+    ❌ ["爸爸"] (只列名不夠，要說明扮演什麼角色)
 - cancel_target_keyword：取消時要用來找原 event 的關鍵字（活動標題裡可能出現的字）
 
 只回 JSON，不要 markdown：
@@ -166,10 +172,10 @@ def _normalize(data: dict) -> dict:
     out = {
         "has_event": has,
         "is_cancellation": cancel,
-        "title": _s("title", 40),
+        "title": _s("title", 60),  # 放寬：含動詞+物+主角更具體
         "date": _s("date", 10),
         "time": _s("time", 5),
-        "location": _s("location", 80),
+        "location": _s("location", 120),  # 放寬：含分店/樓層更精準
         "participants": parts,
         "cancel_target_keyword": _s("cancel_target_keyword", 40),
         "event_type": et,
