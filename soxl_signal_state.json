@@ -62,6 +62,13 @@
       "composite_score": 33,
       "bias_20ma_pct": 0,
       "sox_rsi": 0
+    },
+    {
+      "date": "2026-05-21",
+      "soxl_close": 172.3300018310547,
+      "composite_score": 25,
+      "bias_20ma_pct": 2,
+      "sox_rsi": 0
     }
   ]
 }

@@ -166,6 +166,9 @@ def test_bug3_bot_entries_filtered_from_pending():
             "main._llm_chat",
             side_effect=lambda *a, **kw: llm_calls.append(True) or "reply",
         ),
+        # global drain gate（mute / Gemini quota / LINE 月額度）必須通才會進到
+        # __bot__ 過濾邏輯。test environment 沒真 LINE token，預設 fail-closed → False
+        patch("main._global_pending_drain_ready", return_value=True),
     ):
         main._process_pending_on_startup()
 

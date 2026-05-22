@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from datetime import date
 
 import pytest
 
@@ -86,6 +85,35 @@ def patched_calendar_db(monkeypatch):
     return fake_events
 
 
+def _patch_calendar_reply_capture(monkeypatch, main_mod, captured: dict):
+    """
+    _handle_calendar_query 直接呼 MessagingApi.reply_message（為了跳過 _reply 的
+    piggyback drain，2026-05-21 4d8ec69）。所以這裡 mock ApiClient / MessagingApi 來
+    capture，而不是 mock _reply。
+    """
+    class FakeMessagingApi:
+        def __init__(self, _api_client):
+            pass
+
+        def reply_message(self, request):
+            captured["text"] = request.messages[0].text
+            captured["token"] = request.reply_token
+
+    class FakeApiClient:
+        def __init__(self, _cfg):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(main_mod, "MessagingApi", FakeMessagingApi)
+    monkeypatch.setattr(main_mod, "ApiClient", FakeApiClient)
+    monkeypatch.setattr(main_mod, "_get_line_config", lambda: object())
+
+
 def test_handle_calendar_query_finds_tomorrow_event(monkeypatch, patched_calendar_db):
     """14:49 case 完整 path：問句進來 → query DB → 回 formatted event。"""
     import main
@@ -96,13 +124,9 @@ def test_handle_calendar_query_finds_tomorrow_event(monkeypatch, patched_calenda
     tomorrow = (today_tw + timedelta(days=1)).isoformat()
     patched_calendar_db[0]["event_date"] = tomorrow
 
-    captured = {}
-
-    def fake_reply(token, text, group_id=None):
-        captured["text"] = text
-        captured["token"] = token
-
-    monkeypatch.setattr(main, "_reply", fake_reply)
+    captured: dict = {}
+    _patch_calendar_reply_capture(monkeypatch, main, captured)
+    monkeypatch.setattr(main.settings, "bot_muted", False, raising=False)
     monkeypatch.setattr(main.memory, "append_turn", lambda *a, **k: None)
 
     class FakeEvent:
@@ -121,13 +145,10 @@ def test_handle_calendar_query_no_match(monkeypatch):
 
     monkeypatch.setattr(calendar_db, "list_upcoming", lambda gid, days=30: [])
     monkeypatch.setattr(main.memory, "append_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main.settings, "bot_muted", False, raising=False)
 
-    captured = {}
-
-    def fake_reply(token, text, group_id=None):
-        captured["text"] = text
-
-    monkeypatch.setattr(main, "_reply", fake_reply)
+    captured: dict = {}
+    _patch_calendar_reply_capture(monkeypatch, main, captured)
 
     class FakeEvent:
         reply_token = "fake_token"
@@ -259,11 +280,7 @@ def test_quota_path_explicit_calendar_query_reaches_deterministic_handler(monkey
         timestamp = 0
 
     # 直接呼叫 _handle_event 模擬整個 webhook 路徑
-    # （需要 isinstance 過 TextMessageContent — 用 monkeypatch 繞過）
-    from linebot.v3.webhooks import TextMessageContent
-
     # 模擬 _extract_gemini_trigger 行為 — 偵測「咪寶」前綴並回 clean_text
-    original = main._extract_gemini_trigger
     monkeypatch.setattr(
         main,
         "_extract_gemini_trigger",

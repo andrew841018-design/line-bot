@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib
-import json
 from datetime import date, timedelta
 
 import pytest
@@ -102,8 +101,6 @@ def test_classify_priority_medical_wins():
 # ── Test 6: 「你想什麼時候去日本」no-event-stored → safe empty reply ───
 def test_empty_search_safe_reply(tmp_cal_db):
     """無 stored event 時 search_by_keyword 回 [] — handler 不 crash。"""
-    import main
-
     GID = "G1"
     hits = tmp_cal_db.search_by_keyword(GID, ["日本"], limit=5)
     assert hits == []

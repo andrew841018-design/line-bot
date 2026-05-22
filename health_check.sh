@@ -108,9 +108,11 @@ if [ $CF_UP -eq 0 ]; then
   say "cloudflared DOWN; attempting restart..."
   cd "$BOT_DIR" || { say "ERR cd failed"; exit 1; }
 
-  LINE_TOKEN=$(grep '^LINE_CHANNEL_ACCESS_TOKEN=' .env | cut -d= -f2-)
+  # 2026-05-21 修：原本直接 grep .env 的 raw token 已過期（stateless token 後 LINE 改機制）
+  # 改走 line_token_refresh.get_line_token() 用 refresh_token 換新 token
+  LINE_TOKEN=$(.venv/bin/python -c "import sys; sys.path.insert(0,'.'); from dotenv import load_dotenv; load_dotenv('.env'); from line_token_refresh import get_line_token; print(get_line_token() or '')" 2>/dev/null)
   if [ -z "$LINE_TOKEN" ]; then
-    say "ERR LINE_CHANNEL_ACCESS_TOKEN not found in .env"
+    say "ERR get_line_token() returned empty (refresh failed?)"
     CF_ACTION="cf_restart_failed_no_token"
   elif [ ! -x "$CF_BIN" ]; then
     say "ERR cloudflared binary not found at $CF_BIN"
