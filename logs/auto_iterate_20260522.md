@@ -200,3 +200,5 @@ API Error: 529 Overloaded. This is a server-side issue, usually temporary — tr
 - `pytest --tb=short -q`：708 passed, 0 failed (372s)
 - `pyflakes *.py`：clean
 
+[13:00:35] iter 2 後 pytest 全綠，提早退出
+[13:00:35] ## Step 7: 仍有未 commit 變更，catch-all 上傳
