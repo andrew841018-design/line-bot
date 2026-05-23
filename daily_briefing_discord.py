@@ -148,6 +148,77 @@ def daily_todos() -> str:
     return "\n".join(lines)
 
 
+# ── 1.5 關貿 6/4 面試準備｜8 天提醒（5/26-6/3，過期自動靜默）──────────────────
+
+_INTERVIEW_PREP_REMINDERS = {
+    "05-26": (
+        "📚 **今日：LLM/RAG 概念深度**（全天 8-10h）\n"
+        "• 上午：embedding / 向量 DB / RAG flow / LangChain / prompt eng\n"
+        "• 下午：chunking / re-rank / Fine-tune vs RAG / 評估指標\n"
+        "🧮 晨間 SQL（30min）：Top-N per group（LeetCode 185）"
+    ),
+    "05-27": (
+        "📚 **今日：資料工程概念深度**（全天 8-10h）\n"
+        "• 上午：ETL/ELT、Airflow DAG、SQL 進階（窗函數/CTE）\n"
+        "• 下午：Pandas、Spark/Kafka 名詞、Star/Snowflake Schema、SCD、Data Quality\n"
+        "🧮 晨間 SQL（30min）：累計加總 / 移動平均（LeetCode 1321）"
+    ),
+    "05-28": (
+        "🔬 **今日：PTT bot 完全摸熟（6h）+ Cloud/Docker 速攻（2h）**\n"
+        "• 上午：PTT bot internals - schema / scheduler / 8-source / timezone 坑\n"
+        "• 下午：AWS/GCP/Azure 主要服務名詞 + Dockerfile/compose 基本\n"
+        "🧮 晨間 SQL（30min）：LAG/LEAD 比較（LeetCode 1407 變體）"
+    ),
+    "05-29": (
+        "🔬 **今日：LINE bot + Job Scraper 摸熟（6h）+ 概念複習（2h）**\n"
+        "• 上午：LINE bot internals - LLM router fallback / quota 切換\n"
+        "• 下午：Job Scraper - 7 平台反爬 / curl_cffi 選用理由\n"
+        "• 晚上：Day 1-4 概念總複習（為 5/30 簡報主動回憶熱身）\n"
+        "🧮 晨間 SQL（30min）：Streak 連續登入（LeetCode 601）"
+    ),
+    "05-30": (
+        "⭐ **今日：簡報製作整天（主動回憶複習日）**\n"
+        "• 09-10 默寫骨架（不看筆記）→ 找出記憶漏洞\n"
+        "• 10-11 補洞（對筆記補齊默寫不出來的）\n"
+        "• 11-13 寫講稿（每頁 30-40 秒）\n"
+        "• 13-15 做投影片（丟給 Claude/ChatGPT 排版）\n"
+        "• 15-17 對著鏡頭計時練 5 遍 + 錄影檢討\n"
+        "• 17-18 改稿\n"
+        "🧮 晨間 SQL（30min）：去重保留最新（LeetCode 1149）"
+    ),
+    "05-31": (
+        "🎤 **今日：技術 Mock 第 1 輪（3 場深問）+ 補弱項**\n"
+        "• 上午：3 場技術深問（LLM / 資料工程 / 系統設計）\n"
+        "• 下午：找出最弱 3 題深補 + 簡報順 3 遍\n"
+        "🧮 晨間 SQL（30min）：SCD Type 2 變化追蹤"
+    ),
+    "06-02": (
+        "🎤 **今日：技術 Mock 第 2 輪 + 概念盲點總複習 + 簡報最終版**\n"
+        "• 上午：Mock 第 2 輪（針對 5/31 弱項深問）\n"
+        "• 下午：概念盲點總複習 + 簡報最終版定稿\n"
+        "🧮 晨間 SQL（30min）：Time-series 缺值補齊"
+    ),
+    "06-03": (
+        "⚠️ **今日：衝刺日｜履歷 + 測驗 + 簡報順稿 + 設備檢查**\n"
+        "• 上午：完成關貿履歷表系統填寫\n"
+        "• 中午：完成 104 測驗評量\n"
+        "• 下午：簡報順稿 5 遍\n"
+        "• 傍晚：設備檢查（網路 / 視訊 / 麥克風 / 燈光 / 第二螢幕）\n"
+        "• 晚上：早睡（明天 14:00 面試）\n"
+        "🧮 晨間 SQL（30min）：複習錯題"
+    ),
+}
+
+
+def interview_prep_today() -> str:
+    """關貿 6/4 面試準備：5/26-6/3 每日提醒（過期日期自動 return 空）"""
+    today = datetime.now().strftime("%m-%d")
+    msg = _INTERVIEW_PREP_REMINDERS.get(today)
+    if not msg:
+        return ""
+    return f"🎯 **關貿 6/4 面試準備｜{today}**\n{msg}"
+
+
 # ── 2. 爬蟲狀態 ──────────────────────────────────────────────────────────────
 
 
@@ -1226,6 +1297,10 @@ _PENDING_PUSH_URLS: list = []
 
 def main():
     sections = [daily_todos()]
+
+    interview = interview_prep_today()
+    if interview:
+        sections += ["", interview]
 
     bday = upcoming_birthdays()
     if bday:
