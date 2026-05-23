@@ -22,30 +22,7 @@ sys.path.insert(
 
 from notify_discord import send_dm  # noqa: E402
 
-# ── 已推到 Discord 的職缺 URL 紀錄（永久去重，跟 scraper 的 seen_jobs.json 分開） ─
 import json as _json  # noqa: E402
-_PUSHED_JOBS_FILE = LINE_BOT_DIR / "pushed_jobs.json"
-
-
-def _load_pushed_jobs() -> set:
-    if not _PUSHED_JOBS_FILE.exists():
-        return set()
-    try:
-        with open(_PUSHED_JOBS_FILE) as f:
-            return set(_json.load(f))
-    except Exception:
-        return set()
-
-
-def _save_pushed_jobs(urls: set) -> None:
-    """原子寫入：先寫 .tmp 再 rename，避免 crash 中途產生壞檔。"""
-    try:
-        tmp = _PUSHED_JOBS_FILE.with_suffix(".json.tmp")
-        with open(tmp, "w") as f:
-            _json.dump(sorted(urls), f, ensure_ascii=False)
-        os.replace(tmp, _PUSHED_JOBS_FILE)
-    except Exception:
-        pass
 
 
 # ── 1. 每日待辦 ──────────────────────────────────────────────────────────────
@@ -164,16 +141,17 @@ _INTERVIEW_PREP_REMINDERS = {
         "🧮 晨間 SQL（30min）：累計加總 / 移動平均（LeetCode 1321）"
     ),
     "05-28": (
-        "🔬 **今日：PTT bot 完全摸熟（6h）+ Cloud/Docker 速攻（2h）**\n"
-        "• 上午：PTT bot internals - schema / scheduler / 8-source / timezone 坑\n"
-        "• 下午：AWS/GCP/Azure 主要服務名詞 + Dockerfile/compose 基本\n"
+        "🔬 **今日：PTT bot 摸熟（4h）+ design retroactive own + pgvector RAG demo 跑通（3-4h）+ Cloud 速攻（1h）**\n"
+        "• 上午：PTT bot internals - schema / scheduler / 8-source / timezone 坑 + 對 5 個 design decision 事後 own\n"
+        "• 下午：pgvector RAG demo 跑通（用 5/24 預備好的 venv + BGE cache + Colima）+ 截 5 張圖\n"
+        "• 晚上：Cloud/Docker 速攻 - AWS/GCP/Azure 主要服務名詞 + Dockerfile 概念\n"
         "🧮 晨間 SQL（30min）：LAG/LEAD 比較（LeetCode 1407 變體）"
     ),
     "05-29": (
-        "🔬 **今日：LINE bot + Job Scraper 摸熟（6h）+ 概念複習（2h）**\n"
-        "• 上午：LINE bot internals - LLM router fallback / quota 切換\n"
-        "• 下午：Job Scraper - 7 平台反爬 / curl_cffi 選用理由\n"
-        "• 晚上：Day 1-4 概念總複習（為 5/30 簡報主動回憶熱身）\n"
+        "🔬 **今日：LINE bot 摸熟（3h）+ design retroactive own + RAG 截圖整合（2h）+ 概念複習（3h）**\n"
+        "• 上午：LINE bot internals - LLM router fallback / quality gate / persona / 健康監測 + 對 5 個 design decision 事後 own\n"
+        "• 下午：RAG demo 截圖整合進簡報 wireframe + 30 秒講解稿（套 presentation_notes.md）\n"
+        "• 晚上：Day 1-4 概念總複習（為 5/30 Mock 第 1 輪熱身）\n"
         "🧮 晨間 SQL（30min）：Streak 連續登入（LeetCode 601）"
     ),
     "05-30": (
@@ -1069,227 +1047,6 @@ def line_bot_suggestions() -> str:
     return f"💡 **LINE bot 建議**：{suggestion['title']} — {suggestion['reason']}"
 
 
-# ── 8. AI+DE 職缺建議 ─────────────────────────────────────────────────────────
-
-
-def _parse_source_breakdown(text: str) -> tuple[dict, dict]:
-    """從報告抽出兩張表：
-    - per_source_total: {source: (raw_total, ok_keyword_count, total_keyword_count)}
-    - jd_fetch: {source: (attempted, succeeded, inline)}
-    """
-    per_source: dict = {}
-    jd_fetch: dict = {}
-
-    # ── 各來源抓取明細表（5 欄：平台 | 類別 | Keyword | 抓回 | 狀態）─────────
-    in_per_kw = False
-    for line in text.splitlines():
-        if "## 🔍 各來源抓取明細" in line:
-            in_per_kw = True
-            continue
-        if in_per_kw:
-            if line.startswith("###") or line.startswith("---") or line.startswith("# "):
-                in_per_kw = False
-                continue
-            stripped = line.strip()
-            if not stripped.startswith("|") or stripped.startswith("|---") or stripped.startswith("| 平台"):
-                continue
-            cols = [c.strip() for c in stripped.split("|") if c.strip()]
-            if len(cols) < 5:
-                continue
-            source, raw, status = cols[0], cols[3], cols[4]
-            try:
-                raw_n = int(raw)
-            except ValueError:
-                continue
-            ok = status.startswith("✅")
-            cur = per_source.get(source, (0, 0, 0))
-            per_source[source] = (cur[0] + raw_n, cur[1] + (1 if ok else 0), cur[2] + 1)
-
-    # ── JD 內文 fetch 結果表（4 欄：平台 | 嘗試 | 成功 | listing 內含）─────
-    in_jd = False
-    for line in text.splitlines():
-        if "JD 內文 fetch 結果" in line:
-            in_jd = True
-            continue
-        if in_jd:
-            if line.startswith("---") or line.startswith("# "):
-                in_jd = False
-                continue
-            stripped = line.strip()
-            if not stripped.startswith("|") or stripped.startswith("|---") or stripped.startswith("| 平台"):
-                continue
-            cols = [c.strip() for c in stripped.split("|") if c.strip()]
-            if len(cols) < 4:
-                continue
-            try:
-                jd_fetch[cols[0]] = (int(cols[1]), int(cols[2]), int(cols[3]))
-            except ValueError:
-                continue
-
-    return per_source, jd_fetch
-
-
-def job_search_summary() -> str:
-    today = datetime.now().strftime("%Y-%m-%d")
-    report = Path(f"/Users/andrew/Desktop/andrew/Data_engineer/job_search/{today}.md")
-    if not report.exists():
-        return "💼 **今日職缺**：今天沒有適合的職缺"
-    try:
-        text = report.read_text(errors="ignore")
-
-        # 取今日掃描結果摘要（第一個 ## 📊 段落）
-        summary_lines = []
-        in_summary = False
-        for line in text.splitlines():
-            if "## 📊 今日掃描結果" in line:
-                in_summary = True
-                continue
-            if in_summary:
-                if line.startswith("##") or line.startswith("---"):
-                    break
-                if line.strip().startswith("- ") or line.strip().startswith("> "):
-                    summary_lines.append(line.strip())
-
-        # 取所有 4 個 bucket 的職缺（DE/AI × 必投/值得投），每筆都附 URL
-        # 去重：① 之前推過（pushed_jobs.json） ② URL 相同 ③ 同公司同職位
-        pushed_urls = _load_pushed_jobs()
-        seen_url = set()
-        seen_company_title = set()
-        # 各 bucket 的職缺 list
-        buckets: dict = {
-            "DE 必投": [], "DE 值得投": [],
-            "AI 必投": [], "AI 值得投": [],
-            "FIN_SW 必投": [], "FIN_SW 值得投": [],
-        }
-        all_new_urls = []
-
-        current_bucket = None
-        for line in text.splitlines():
-            # 偵測 bucket header（## 🔴 必投 DE/AI/FIN_SW / ## 🟡 值得投 DE/AI/FIN_SW）
-            # FIN_SW 偵測必須在 DE/AI 之前（"FIN_SW" 不含 "DE" 或 "AI" 子字串，但保險起見明確分支）
-            if "🔴 必投" in line:
-                if "FIN_SW" in line:
-                    current_bucket = "FIN_SW 必投"
-                elif "DE" in line:
-                    current_bucket = "DE 必投"
-                elif "AI" in line:
-                    current_bucket = "AI 必投"
-                else:
-                    current_bucket = None
-                continue
-            if "🟡 值得投" in line:
-                if "FIN_SW" in line:
-                    current_bucket = "FIN_SW 值得投"
-                elif "DE" in line:
-                    current_bucket = "DE 值得投"
-                elif "AI" in line:
-                    current_bucket = "AI 值得投"
-                else:
-                    current_bucket = None
-                continue
-            # 進入新 ## 段（非 bucket header）→ 結束 current_bucket
-            if line.startswith("## ") and not ("🔴 必投" in line or "🟡 值得投" in line):
-                current_bucket = None
-                continue
-            if current_bucket is None:
-                continue
-
-            stripped = line.strip()
-            if not (stripped.startswith("|") and stripped[1:].strip()[:1].isdigit()):
-                continue
-            cols = [c.strip() for c in stripped.split("|") if c.strip()]
-            if len(cols) < 7:
-                continue
-
-            company = cols[1][:12]
-            # 清掉 title 裡跟公司名重複的部分
-            raw_title = cols[2]
-            company_core = re.sub(r"(股份有限公司|有限公司|\(.+?\)|（.+?）)", "", cols[1]).strip()
-            for pat in [
-                rf"^【{re.escape(company_core)}】\s*",
-                rf"^\[{re.escape(company_core)}\]\s*",
-                rf"^「{re.escape(company_core)}」\s*",
-                rf"^{re.escape(company_core)}\s*[-—|｜:：]\s*",
-            ]:
-                raw_title = re.sub(pat, "", raw_title)
-            title = raw_title[:24]
-            score = cols[5]
-            link_col = cols[6]
-            url = ""
-            m = re.search(r"\(https?://[^\)]+\)", link_col)
-            if m:
-                url = m.group(0)[1:-1]
-
-            # 過去推過 → 跳過
-            if url and url in pushed_urls:
-                continue
-            # 本次重複 → 跳過
-            if url and url in seen_url:
-                continue
-            ct_key = (cols[1], cols[2])
-            if ct_key in seen_company_title:
-                continue
-            seen_url.add(url)
-            seen_company_title.add(ct_key)
-            if url:
-                all_new_urls.append(url)
-            buckets[current_bucket].append(f"• {company} — {title} (S{score}) {url}")
-
-        # 任一 bucket 不空就有東西要推
-        any_jobs = any(buckets.values())
-
-        # 多來源 breakdown（聚合 per source）
-        per_source, jd_fetch = _parse_source_breakdown(text)
-
-        if not summary_lines and not any_jobs and not per_source:
-            return "💼 **今日職缺**：今天沒有新職缺"
-
-        lines = ["💼 **今日職缺 (AI+DE)**"]
-        lines += summary_lines[:4]
-
-        if per_source:
-            lines.append("🔍 **各來源**")
-            for src, (raw, ok, total) in sorted(per_source.items(), key=lambda x: -x[1][0]):
-                mark = "" if ok == total else f" ({ok}/{total} ✅)"
-                lines.append(f"- {src}: {raw}{mark}")
-
-        if jd_fetch:
-            inline_total = sum(v[2] for v in jd_fetch.values())
-            attempted_total = sum(v[0] for v in jd_fetch.values())
-            succeeded_total = sum(v[1] for v in jd_fetch.values())
-            if attempted_total or inline_total:
-                lines.append(
-                    f"📥 **JD**：fetch {succeeded_total}/{attempted_total}, listing 內含 {inline_total}"
-                )
-
-        # 6 個 bucket 依序輸出（每個都附 URL）
-        bucket_emoji = {
-            "DE 必投": "🔴",
-            "DE 值得投": "🟢",
-            "AI 必投": "🔴",
-            "AI 值得投": "🟢",
-            "FIN_SW 必投": "🔴",
-            "FIN_SW 值得投": "🟢",
-        }
-        for bname in ["DE 必投", "DE 值得投", "AI 必投", "AI 值得投", "FIN_SW 必投", "FIN_SW 值得投"]:
-            items = buckets[bname]
-            if items:
-                lines.append(f"**{bucket_emoji[bname]} {bname}（{len(items)} 間，已過濾推過的）：**")
-                lines += items
-
-        if not any_jobs:
-            lines.append("（今日無新職缺，全部已推過或被過濾）")
-
-        # 暫存本次新推 URL，main() 推送成功後寫入 pushed_jobs.json
-        global _PENDING_PUSH_URLS
-        _PENDING_PUSH_URLS = list(all_new_urls)
-        return "\n".join(lines)
-    except Exception as e:
-        return f"💼 **今日職缺** ⚠️ 讀取失敗：{e}"
-
-
-_PENDING_PUSH_URLS: list = []
-
 
 # ── 主流程 ────────────────────────────────────────────────────────────────────
 
@@ -1333,10 +1090,6 @@ def main():
 
     # daily_reading 整合進 daily_todos 第一段（2026-05-08 用戶要求「不要兩個每日代辦欄位」）
 
-    jobs = job_search_summary()
-    if jobs:
-        sections += ["", jobs]
-
     message = "\n".join(sections)
 
     # Discord 訊息上限 2000 字。超過則拆兩則送（avoid 截斷遺失 URL）。
@@ -1351,17 +1104,6 @@ def main():
             sys.exit(1)
         sent_text += ch + "\n"
 
-    # 推送成功後，把確實出現在訊息裡的職缺 URL 寫入 pushed_jobs.json（永久去重）
-    if _PENDING_PUSH_URLS:
-        urls_actually_sent = [u for u in _PENDING_PUSH_URLS if u in sent_text]
-        if urls_actually_sent:
-            existing = _load_pushed_jobs()
-            existing.update(urls_actually_sent)
-            _save_pushed_jobs(existing)
-            print(
-                f"已記錄 {len(urls_actually_sent)} 個新職缺 URL → pushed_jobs.json"
-                f"（總計 {len(existing)}）"
-            )
 
 
 def _split_for_discord(message: str, limit: int = 1900) -> list:
