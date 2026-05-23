@@ -117,3 +117,10 @@ def block_external_side_effects(monkeypatch):
         gemini_client, "_alert_quality_violation",
         lambda *a, **kw: None, raising=False,
     )
+    # 同步攔 _log_quality_violation — tests 在 prod line_bot.db 的 persona_notes
+    # 留下大量 C_test_group 違規記錄（2026-05-23 auto iterate 發現 24h 內 30 筆
+    # 全是 mock 回覆「這是個測試回覆。」），污染自我學習資料 + 拖慢人工排查。
+    monkeypatch.setattr(
+        gemini_client, "_log_quality_violation",
+        lambda *a, **kw: None, raising=False,
+    )

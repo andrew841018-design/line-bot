@@ -20,6 +20,13 @@ def er(monkeypatch, tmp_path):
     import memory
     import embedding_recall
 
+    # Skip when sentence-transformers model is unavailable (e.g. HF cache symlink
+    # broken because the backing volume isn't mounted). These tests exercise the
+    # real ST encoder — without it, index_message returns False and downstream
+    # assertions fail spuriously. The env issue isn't a code bug.
+    if embedding_recall._get_st_model() is None:
+        pytest.skip("sentence-transformers model unavailable in this env")
+
     monkeypatch.setattr(memory, "_DB_PATH", db)
     monkeypatch.setattr(embedding_recall, "_DB_PATH", db)
     memory._init_db()

@@ -178,17 +178,19 @@ def tmp_calendar_db(tmp_path, monkeypatch):
 def test_dedup_same_group_title_date_blocks_duplicate(tmp_calendar_db):
     """SQL UNIQUE INDEX 阻擋同 group+title+date 的 active event。"""
     cd = tmp_calendar_db
+    # 用「明天」避免時間飄移：hardcode date 會在跑測試的那天變成過去
+    future_date = (cd._today_tw() + __import__("datetime").timedelta(days=1)).isoformat()
     eid1 = cd.insert_event(
         group_id="G1",
         title="拿蛋糕",
-        event_date="2026-05-22",
+        event_date=future_date,
         event_time="14:00",
     )
     assert eid1
     eid2 = cd.insert_event(
         group_id="G1",
         title="拿蛋糕",
-        event_date="2026-05-22",
+        event_date=future_date,
         event_time="14:30",  # 不同時間也算重複
     )
     assert eid2 == ""  # dedup hit → 回空字串
@@ -331,14 +333,17 @@ def test_quota_path_text_with_event_string_captures_via_regex(monkeypatch, tmp_p
         fake_gemini_extract,
     )
 
+    # 用未來日期避免測試在執行日當天就變過去（list_upcoming 過濾掉）
+    from datetime import timedelta
+    future_date = (calendar_db._today_tw() + timedelta(days=1)).isoformat()
     # 直接呼叫 _maybe_capture_calendar_event（line 1095 quota-path 內呼叫的 fn）
     main._maybe_capture_calendar_event(
-        "G1", "2026-05-22 14:00 拿喜來登贈送的生日蛋糕"
+        "G1", f"{future_date} 14:00 拿喜來登贈送的生日蛋糕"
     )
 
     # events table 必須有一筆
     events = calendar_db.list_upcoming("G1", days=30)
     assert len(events) == 1
-    assert events[0]["event_date"] == "2026-05-22"
+    assert events[0]["event_date"] == future_date
     assert events[0]["event_time"] == "14:00"
     assert "蛋糕" in events[0]["title"]
