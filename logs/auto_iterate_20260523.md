@@ -206,3 +206,37 @@ Push 成功。
 剩下：HuggingFace symlink 還是 broken（需 user 掛 WD_BLACK），launchd job 偶發 port 8080 撞 + ssh github 連線問題；都不是 code bug。詳細記在 `logs/auto_iterate_20260523.md` 結尾總結段。
 [14:57:27] iter 1 後 pytest 全綠，提早退出
 [14:57:27] ## Step 7: 仍有未 commit 變更，catch-all 上傳
+[main 9012e32] auto iterate 20260523 (catch-all)
+ 4 files changed, 18 insertions(+), 1 deletion(-)
+To github.com:andrew841018-design/line-bot.git
+   e894ab5..9012e32  main -> main
+[14:57:31] ## Step 8: restart uvicorn
+[14:57:38] /health: {"status":"ok","gemini_model":"gemini-2.5-flash","gemini_light_model":"gemini-2.5-flash-lite","group_locked":true}
+2026-05-23 14:57:44,747 INFO AFC is enabled with max remote calls: 10.
+2026-05-23 14:57:45,923 INFO HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+2026-05-23 14:57:45,962 INFO AFC is enabled with max remote calls: 10.
+2026-05-23 14:57:49,444 INFO HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent "HTTP/1.1 200 OK"
+======================================================================
+LINE bot preflight @ 2026-05-23T14:57:39
+======================================================================
+  [✓]  1. uvicorn process alive
+  [✓]  2. local /health 200
+  [✓]  3. cloudflared process alive
+  [✓]  4. cloudflared URL stash 可讀 + 安全 — url=https://respect-coral-charter-loc.trycloudflare.com age=446s
+  [✓]  5. cloudflared metrics 內部 URL 對 stash — metrics 200 但 ha_connections 沒露
+  [✓]  6. external https://respect-coral-charter-loc.trycloudflare.com/health 200 — attempt=1
+  [✓]  7. /callback no-sig → 400 missing
+  [✓]  8. LINE token /v2/bot/info 200
+  [⚠]  9. LINE webhook URL 對齊 cloudflared — drift fixed: 'https://techrepublic-kai-hence-stockings.trycloudflare.com/callback' → 'https://respect-coral-charter-loc.trycloudflare.com/callback'
+  [↻] autofix triggered → re-run external + E2E
+  [✓]  6. external https://respect-coral-charter-loc.trycloudflare.com/health 200 — attempt=1
+  [✓] 10. LINE → cloudflared → /callback E2E
+  [✓] 11. Gemini main probe
+  [✓] 12. Gemini lite probe
+  [✓] 13. SQLite integrity + WAL checkpoint
+  [✓] 14. pending file JSON load — groups=2 entries=13
+----------------------------------------------------------------------
+PREFLIGHT [PASS] critical=13/13 info=2/2 elapsed=10.6s autofix=1
+Discord DM 送出成功
+[14:57:51] preflight exit=0 (0=pass, 1=critical, 2=info-only, 3=infra)
+[14:57:51] ===== 結束 =====
