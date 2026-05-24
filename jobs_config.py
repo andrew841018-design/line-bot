@@ -18,14 +18,6 @@ _PROJ_VENV = f"{_DATA_ENG}/project/.venv/bin/python"
 
 JOB_REGISTRY: dict[str, JobSpec] = {}
 
-JOB_REGISTRY["daily-briefing-discord"] = JobSpec(
-    command=[_PROJ_VENV, f"{_DATA_ENG}/line_bot/daily_briefing_discord.py"],
-    cwd=f"{_DATA_ENG}/project/dependent_code",
-    env={"PATH": _PROJECT_VENV_PATH, "HOME": "/Users/andrew", "USER": "andrew", "LOGNAME": "andrew"},
-    timeout=120,
-    description="Daily 10:00 Discord briefing",
-)
-
 JOB_REGISTRY["line-bot-event-reminder"] = JobSpec(
     command=[_LB_VENV, f"{_DATA_ENG}/line_bot/event_reminder.py"],
     cwd=f"{_DATA_ENG}/line_bot",
