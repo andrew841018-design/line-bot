@@ -209,3 +209,20 @@ INFO:     Finished server process [11572]
 1. 如果 `daily-briefing-discord` 永久退役，下一輪可以考慮把 tests 裡所有 `daily-briefing-discord` 替換成 `line-bot-event-reminder` 之類的「真實存在」job name，移除 fixture 的 stub injection — 不過得確保不會觸發 real subprocess（仍需要 stub 注入）。
 2. `pending_feedback.json` 健康檢查改 python 讀，消掉 stderr.log 噪音。
 3. main.py 的 3 個 `@app.on_event("startup")` 收斂成單一 lifespan handler — FastAPI 0.93+ 推薦寫法。
+全綠 ship。摘要：
+
+**修了什麼**
+- `tests/test_jobs_router.py` 的 `_env` autouse fixture 注入 `daily-briefing-discord` 的 safe stub `JobSpec`（`/bin/sh -c "echo stub"`）→ 6 個失敗 test 全綠，無 BG side effect。
+- 根因：commit `7e00e16` 把 `daily-briefing-discord` 從 `JOB_REGISTRY` 移除，但 6 個 test 仍 hardcode 用該名字 → 404 vs 預期 401/200/202/429。
+
+**驗證**
+- pytest：702 → **708 passed**, 0 failed
+- pyflakes：0 警告
+- commit `d43a07b` 已 push 到 `origin/main`
+
+**沒修但記下來**（已寫進 log）
+- 5 筆 quality violations 都是 user feedback corrections，不是黑名單觸發，不需修 code
+- `pending_feedback.json` Operation not permitted 是 launchd sandbox 對 `cat` 的限制，下次改用 python 讀檔規避
+- main.py 3 處 `@app.on_event("startup")` deprecation 警告，未來遷 lifespan handler
+[12:37:02] iter 1 後 pytest 全綠，提早退出
+[12:37:03] ## Step 7: 仍有未 commit 變更，catch-all 上傳
