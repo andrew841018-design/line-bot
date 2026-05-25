@@ -1159,6 +1159,26 @@ def _handle_event(event) -> None:
         _handle_file_message(event, group_id)
         return
 
+    # === Silent drop fix (2026-05-25 Andrew rule: 任何留言都要回覆) ===
+    # Catch-all for unknown message types (Sticker / Location / Template / etc.).
+    # 既有 design 砸到這裡會 fall-through silent return；改為 reply + enqueue pending。
+    logger.info(
+        "unknown message type %s group=%s — sending fallback reply",
+        type(msg).__name__, group_id,
+    )
+    try:
+        _save_pending_any(event, group_id, sender_user_id, msg)
+    except Exception as e:
+        logger.warning("save pending for unknown msg type failed: %s", e)
+    try:
+        _reply(
+            event.reply_token,
+            "收到，但這種訊息類型咪寶看不懂耶 😅",
+            group_id=group_id,
+        )
+    except Exception as e:
+        logger.warning("fallback reply for unknown msg type failed: %s", e)
+
 
 def _handle_audio_message(event: MessageEvent, group_id: str) -> None:
     """語音留言自動分析 — 不需要 @mention，下載後直接丟 Gemini 轉寫 + 回應。"""
@@ -2016,16 +2036,22 @@ def _handle_burst_flush(group_id: str, combined_text: str, reply_token: str) -> 
                 logger.warning("lite_reply retry (burst) failed: %s", e2)
                 reply_text = ""
             if not reply_text:
-                # burst path：calendar 抽取仍跑（regex fallback 不靠 Gemini）。
-                # 雖然 docstring 寫「會回應的情境不能靜默」(line 1611)，但 burst 屬於
-                # bot 主動插話（user 沒明確提問），靜默退出比噴 quota 訊息洗 group 更好；
-                # 已透過 line 1095 quota-path 對 explicit / calendar query 走 deterministic
-                # 回覆，這條 burst path 在 quota 爆時不會被觸發（line 1095 short-circuit）。
-                logger.info(
-                    "burst quota retry miss group=%s — silent (calendar capture ran)",
+                # 2026-05-25 Silent drop fix (Andrew 「任何人留言都要回覆」rule):
+                # 原本 silent return 違反 _handle_burst_flush docstring「會回應的情境不能靜默」。
+                # 改為 calendar capture 仍跑 + fallback quota 短訊。
+                logger.warning(
+                    "burst quota retry miss group=%s — sending quota fallback msg",
                     group_id,
                 )
                 _maybe_capture_calendar_event(group_id, combined_text)
+                try:
+                    _reply(
+                        reply_token,
+                        "Gemini 暫時忙不過來，等一下再回家人話題～",
+                        group_id=group_id,
+                    )
+                except Exception as e3:
+                    logger.warning("burst quota fallback reply failed: %s", e3)
                 return
         else:
             logger.exception("gemini chat (burst) failed: %s", e)
@@ -2040,7 +2066,20 @@ def _handle_burst_flush(group_id: str, combined_text: str, reply_token: str) -> 
         repr(reply_text[:200]) if reply_text else "(empty)",
     )
     if not reply_text or not reply_text.strip():
-        logger.warning("burst gemini returned empty reply, skipping LINE send")
+        # 2026-05-25 Silent drop fix (Andrew 「任何人留言都要回覆」rule):
+        # 原本 skip LINE send 違反 docstring「不能靜默」。改為 fallback 短訊。
+        logger.warning(
+            "burst gemini returned empty reply — sending fallback msg group=%s",
+            group_id,
+        )
+        try:
+            _reply(
+                reply_token,
+                "咪寶聽到了但這個話題不太接得上~",
+                group_id=group_id,
+            )
+        except Exception as e:
+            logger.warning("burst empty-reply fallback failed: %s", e)
         return
 
     memory.store_fact_cache(group_id, combined_text, reply_text)
