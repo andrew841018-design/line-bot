@@ -40,3 +40,8 @@ locks/
 state/
 logs/jobs/
 *.bak.20*_*
+
+# Runtime state (per-bot persistence, never sync)
+pending_dlq.jsonl
+soxl_health_state.json
+pending_media/
