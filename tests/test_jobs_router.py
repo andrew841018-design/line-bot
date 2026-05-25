@@ -19,12 +19,27 @@ def _env(monkeypatch, tmp_path):
     monkeypatch.setenv("JOBS_ROUTES_ENABLED", "1")
     # Redirect state/log dirs to tmp
     import jobs_router as jr
+    import jobs_config as jc
     monkeypatch.setattr(jr, "STATE_DIR", tmp_path / "state")
     monkeypatch.setattr(jr, "LOG_DIR", tmp_path / "logs")
     monkeypatch.setattr(jr, "LOCK_DIR", tmp_path / "locks")
     (tmp_path / "locks").mkdir()
     # TestClient sets client.host = "testclient"; allow it
     monkeypatch.setattr(jr, "_ALLOWED_IPS", {"127.0.0.1", "::1", "::ffff:127.0.0.1", "testclient"})
+    # Inject a safe stub for "daily-briefing-discord" — this job was removed
+    # from prod registry (commit 7e00e16) but tests still use the name as a
+    # stable fixture identity. Stub avoids triggering any real subprocess.
+    monkeypatch.setitem(
+        jc.JOB_REGISTRY,
+        "daily-briefing-discord",
+        jc.JobSpec(
+            command=["/bin/sh", "-c", "echo stub"],
+            cwd=None,
+            env={"PATH": "/bin:/usr/bin"},
+            timeout=5,
+            description="test stub (injected)",
+        ),
+    )
     yield
 
 
