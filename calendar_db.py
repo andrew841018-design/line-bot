@@ -32,9 +32,10 @@ _lock = threading.Lock()
 EVENT_TYPES: tuple[str, ...] = ("family_gathering", "personal_trip", "medical")
 _DEFAULT_EVENT_TYPE = "family_gathering"
 
-# Reminder offsets — T-3 / T-2 / T-1 三天每天推（user 2026-05-21 directive）
-# 加新 offset 只動這一行 + schema migration 補對應欄位
-REMINDER_OFFSETS: tuple[int, ...] = (3, 2, 1)
+# Reminder offsets — multi-tier 提醒 (Andrew 2026-05-25 directive 加 30/7-day)
+# 30 = 1 個月前 / 7 = 1 週前 / 3-2-1 = 倒數三天每天推
+# 加新 offset 只動這一行 + schema migration 自動補對應 reminded_Xd 欄位
+REMINDER_OFFSETS: tuple[int, ...] = (30, 7, 3, 2, 1)
 
 
 def _reminded_column(offset: int) -> str:
@@ -224,6 +225,7 @@ def update_event_date(event_id: str, new_date: str, new_time: str | None = None)
             "UPDATE events SET event_date = ?, "
             "event_time = COALESCE(?, event_time), "
             "reminded_at = NULL, "
+            "reminded_30d = NULL, reminded_7d = NULL, "
             "reminded_3d = NULL, reminded_2d = NULL, reminded_1d = NULL "
             "WHERE event_id = ?",
             (new_date, new_time, event_id),
