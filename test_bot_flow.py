@@ -3,12 +3,9 @@
 test_bot_flow.py — LINE bot 核心流程離線測試
 
 涵蓋：
-  1. bot_stats：訊息分類 + 計數器
-  2. Pending：存入 / 讀取 / __bot__ 過濾
-  3. Piggyback：格式 + pending 正確移除
-  4. _llm_chat：Gemini→Grok waterfall
-  5. Grok grouping：fallback 格式驗證
-  6. Quota state：load/save 往返一致
+  1. Pending：存入 / 讀取 / __bot__ 過濾
+  2. Piggyback：格式 + pending 正確移除
+  3. Quota state：load/save 往返一致
 
 用法：
   python test_bot_flow.py        # 全部（離線，不呼叫 LLM API）
@@ -19,6 +16,7 @@ import os
 import json
 import tempfile
 import unittest.mock as mock
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -36,64 +34,23 @@ def check(name: str, condition: bool, detail: str = ""):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Test 1: bot_stats — classify_message + increment
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-def test_bot_stats():
-    print("\n── Test 1: bot_stats 訊息分類 + 計數器 ──")
-    import bot_stats
-
-    cases = [
-        ("https://youtube.com/shorts/abc", "url"),
-        ("真的假的？這是謠言嗎", "fact_check"),
-        ("台積電今天漲停", "finance"),
-        ("我頭痛要看醫生", "health"),
-        ("民進黨選舉最新消息", "political"),
-        ("記者報導指出", "news"),
-        ("你覺得這樣對嗎？", "question"),
-        ("哈哈", "casual"),
-        ("[圖片]", "media"),
-    ]
-    for text, expected in cases:
-        got = bot_stats.classify_message(text)
-        check(f"classify '{text[:20]}' → {expected}", got == expected, f"got={got}")
-
-    # increment + query_range 往返
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-        tmp_db = f.name
-    orig = bot_stats._DB_PATH
-    bot_stats._DB_PATH = tmp_db
-    try:
-        bot_stats.increment("msg_received", 3, date="2099-01-01")
-        bot_stats.increment("msg_received", 2, date="2099-01-01")
-        rows = bot_stats.query_range(30)
-        day = next((r for r in rows if r["date"] == "2099-01-01"), None)
-        check(
-            "increment 累加正確",
-            day is not None and day.get("msg_received") == 5,
-            f"got={day}",
-        )
-    finally:
-        bot_stats._DB_PATH = orig
-        os.unlink(tmp_db)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Test 2: pending JSON — 存入 / 讀取 / __bot__ 過濾
+# Test 1: pending JSON — 存入 / 讀取 / __bot__ 過濾
 # ══════════════════════════════════════════════════════════════════════════════
 
 
 def test_pending_flow():
-    print("\n── Test 2: Pending JSON 基本流程 ──")
+    print("\n── Test 1: Pending JSON 基本流程 ──")
     import main
+    import pending_store
 
     with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
         json.dump({}, f)
         tmp_path = f.name
 
-    orig = main._PENDING_EXPLICIT_PATH
-    main._PENDING_EXPLICIT_PATH = tmp_path
+    orig_path = pending_store.PENDING_PATH
+    orig_lock = pending_store.LOCK_PATH
+    pending_store.PENDING_PATH = Path(tmp_path)
+    pending_store.LOCK_PATH = Path(tmp_path + ".lock")
     try:
         gid = "G_TEST"
 
@@ -144,20 +101,27 @@ def test_pending_flow():
             all(it["user_id"] != "__bot__" for it in filtered),
         )
     finally:
-        main._PENDING_EXPLICIT_PATH = orig
+        pending_store.PENDING_PATH = orig_path
+        pending_store.LOCK_PATH = orig_lock
         os.unlink(tmp_path)
+        try:
+            os.unlink(tmp_path + ".lock")
+        except FileNotFoundError:
+            pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Test 3: Piggyback — 格式 + pending 正確移除
+# Test 2: Piggyback — 格式 + pending 正確移除
 # ══════════════════════════════════════════════════════════════════════════════
 
 
 def test_piggyback():
-    print("\n── Test 3: Piggyback 格式與 pending 移除 ──")
+    print("\n── Test 2: Piggyback 格式與 pending 移除 ──")
     import main
+    import pending_store
 
     gid = "G_PIG"
+    fresh_ts = 9999999999.0
     pending_data = {
         gid: [
             {
@@ -165,36 +129,33 @@ def test_piggyback():
                 "message_id": "p1",
                 "type": "text",
                 "text": "第一則測試訊息",
-                "timestamp": 1.0,
+                "timestamp": fresh_ts,
             },
             {
                 "user_id": "U2",
                 "message_id": "p2",
                 "type": "text",
                 "text": "第二則測試訊息",
-                "timestamp": 2.0,
+                "timestamp": fresh_ts,
             },
             {
                 "user_id": "U3",
                 "message_id": "p3",
                 "type": "text",
                 "text": "第三則測試訊息",
-                "timestamp": 3.0,
+                "timestamp": fresh_ts,
             },
         ]
     }
-
-    saved = {}
-
-    def fake_save(data):
-        saved.update(data)
 
     with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
         json.dump(pending_data, f, ensure_ascii=False)
         tmp_path = f.name
 
-    orig_path = main._PENDING_EXPLICIT_PATH
-    main._PENDING_EXPLICIT_PATH = tmp_path
+    orig_path = pending_store.PENDING_PATH
+    orig_lock = pending_store.LOCK_PATH
+    pending_store.PENDING_PATH = Path(tmp_path)
+    pending_store.LOCK_PATH = Path(tmp_path + ".lock")
     try:
         with (
             mock.patch("main._llm_chat", return_value="這是測試回覆內容"),
@@ -212,19 +173,25 @@ def test_piggyback():
         check("原文含第一則內容", result is not None and "第一則測試訊息" in result)
         check("回應含 LLM 輸出", result is not None and "這是測試回覆內容" in result)
 
-        # pending 應該減少 3 則（全部被處理）
+        # piggyback 現在每次慢消化 1 則 text pending。
         remaining = main._load_pending_explicit()
         leftover = remaining.get(gid, [])
-        check("pending 3 則已移除", len(leftover) == 0, f"remaining={len(leftover)}")
+        check("pending 首則已移除", len(leftover) == 2, f"remaining={len(leftover)}")
     finally:
-        main._PENDING_EXPLICIT_PATH = orig_path
+        pending_store.PENDING_PATH = orig_path
+        pending_store.LOCK_PATH = orig_lock
         os.unlink(tmp_path)
+        try:
+            os.unlink(tmp_path + ".lock")
+        except FileNotFoundError:
+            pass
 
     # LLM 失敗時 pending 不動
     with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
         json.dump(pending_data, f, ensure_ascii=False)
         tmp_path2 = f.name
-    main._PENDING_EXPLICIT_PATH = tmp_path2
+    pending_store.PENDING_PATH = Path(tmp_path2)
+    pending_store.LOCK_PATH = Path(tmp_path2 + ".lock")
     try:
         with (
             mock.patch("main._llm_chat", return_value=""),
@@ -239,8 +206,13 @@ def test_piggyback():
         remaining2 = main._load_pending_explicit()
         check("LLM 失敗時 pending 不動", len(remaining2.get(gid, [])) == 3)
     finally:
-        main._PENDING_EXPLICIT_PATH = orig_path
+        pending_store.PENDING_PATH = orig_path
+        pending_store.LOCK_PATH = orig_lock
         os.unlink(tmp_path2)
+        try:
+            os.unlink(tmp_path2 + ".lock")
+        except FileNotFoundError:
+            pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -250,12 +222,12 @@ def test_piggyback():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Test 6: quota state load/save 往返
+# Test 3: quota state load/save 往返
 # ══════════════════════════════════════════════════════════════════════════════
 
 
 def test_quota_state():
-    print("\n── Test 6: Quota state load/save 往返 ──")
+    print("\n── Test 3: Quota state load/save 往返 ──")
     import main
 
     with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
@@ -292,7 +264,6 @@ if __name__ == "__main__":
 
     logging.basicConfig(level=logging.WARNING)
 
-    test_bot_stats()
     test_pending_flow()
     test_piggyback()
     test_quota_state()

@@ -75,7 +75,6 @@ def test_s4_unknown_message_type_must_not_silent_drop():
     with patch("main._reply") as mock_reply, \
          patch("main._save_pending_any") as mock_save_pending, \
          patch("main.memory.log_raw_message"), \
-         patch("main.bot_stats.track_message"), \
          patch("main._quota_exhausted", return_value=False), \
          patch("main._spawn_piggyback_drain"), \
          patch("main.settings.allowed_group_id", "GRP001"):

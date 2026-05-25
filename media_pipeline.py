@@ -21,7 +21,6 @@ logger = logging.getLogger("media_pipeline")
 #   - In-flight dedup（immediate handler + drain worker 跑同 sha 同 race）
 #     — family-bot 5 人 rare event, accept；Phase 1.5 加 Python module-level
 #     `_inflight: dict[(media_type, sha), Event]` + try/finally
-#   - Telemetry to bot_stats.py (cache_hits / cache_misses) + daily briefing surface
 #   - PII regex on description / Reply quality gate / DoS limits
 #     — wrong threat model (family chat 互看 PII，非 adversarial); enterprise scope
 #   - cache_version 沒加：見 memory.insert_media_cache docstring，改 prompt

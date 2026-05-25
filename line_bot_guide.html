@@ -322,26 +322,6 @@ body{background:var(--bg);color:var(--tx);font-family:'Noto Sans TC',sans-serif;
     </div>
   </div>
 
-  <!-- ── bot_stats ── -->
-  <div class="task-card is-done open" onclick="toggleCard(this)">
-    <div class="tc-head">
-      <span class="tc-status">✅</span>
-      <span class="tc-title">bot_stats.py — 每日訊息統計分析</span>
-      <span class="tag-badge">bot_stats.py</span>
-      <span class="tc-chevron">▼</span>
-    </div>
-    <div class="tc-body">
-      <ul class="task-steps">
-        <li><code>classify_message(text)</code>：把訊息分成 9 類（youtube / url / health / question / greeting / news / opinion / command / other）</li>
-        <li><code>increment(group_id, category)</code>：寫入 <code>bot_stats.json</code>，<code>{"group_id": {"date": {"category": count}}}</code> 格式</li>
-        <li>Daily briefing Discord 早報用來呈現「今天群組話題分布」</li>
-        <li>JSON 直接寫盤，不用 SQLite（輕量，無法共寫衝突）</li>
-      </ul>
-      <div class="done-bar">classify + increment 通過 round-trip 測試；JSON 格式正確</div>
-      <div class="test-bar"><code>python test_bot_flow.py</code> — Test 1: 9 個類別各一則測試 + increment 後讀回確認數量</div>
-    </div>
-  </div>
-
   <!-- ── CI/CD ── -->
   <div class="task-card is-done open" onclick="toggleCard(this)">
     <div class="tc-head">
@@ -484,7 +464,7 @@ body{background:var(--bg);color:var(--tx);font-family:'Noto Sans TC',sans-serif;
         <li>burst_filter 計時結束 → <code>_handle_explicit_text()</code> → LLM waterfall</li>
         <li>LLM waterfall：Gemini OK → 回應；Gemini 429 → Grok；Grok 也 429 → 寫 pending</li>
         <li>回應時呼叫 <code>_reply()</code> → 同時 piggyback 最多 5 則 pending → LINE reply_message</li>
-        <li>寫入 memory DB → bot_stats.increment → 完成</li>
+        <li>寫入 memory DB → 完成</li>
       </ul>
       <div class="test-bar">本地測試：<code>pkill -f "uvicorn main:app" && nohup .venv/bin/uvicorn main:app --host 127.0.0.1 --port 8080 > /tmp/line_bot_restart.log 2>&1 &</code> 後 curl 發假 webhook</div>
     </div>
@@ -543,9 +523,8 @@ body{background:var(--bg);color:var(--tx);font-family:'Noto Sans TC',sans-serif;
     </div>
     <div class="tc-body">
       <ul class="task-steps">
-        <li>Test 1 — <strong>bot_stats</strong>：<code>classify_message()</code> 9 類別分類 + <code>increment()</code> round-trip</li>
-        <li>Test 2 — <strong>Pending JSON</strong>：讀寫 pending + <code>__bot__</code> 條目過濾</li>
-        <li>Test 3 — <strong>Piggyback</strong>：format 符合規範 / LLM 失敗時 pending 不變</li>
+        <li>Test 1 — <strong>Pending JSON</strong>：讀寫 pending + <code>__bot__</code> 條目過濾</li>
+        <li>Test 2 — <strong>Piggyback</strong>：format 符合規範 / LLM 失敗時 pending 不變</li>
         <li>Test 4 — <strong>LLM waterfall</strong>：Gemini OK / Gemini fail+Grok OK / both fail→pending 三情境</li>
         <li>Test 5 — <strong>grok_client.group_messages()</strong>：回傳格式（idxs list, reply_to int）</li>
         <li>Test 6 — <strong>Quota state</strong>：<code>gemini_usage.json</code> load/save round-trip</li>

@@ -59,8 +59,6 @@ from linebot.v3.webhooks import (  # type: ignore[import-untyped]
     FileMessageContent,
     GroupSource,
     ImageMessageContent,
-    JoinEvent,
-    LeaveEvent,
     MemberJoinedEvent,
     MemberLeftEvent,
     MessageEvent,
@@ -68,7 +66,6 @@ from linebot.v3.webhooks import (  # type: ignore[import-untyped]
     VideoMessageContent,
 )
 
-import bot_stats
 import burst_filter
 import feedback_collector
 import gemini_client
@@ -178,10 +175,7 @@ def _llm_chat(
         except Exception as e:
             logger.warning("lite_reply fallback failed: %s", e)
         return ""
-    result = gemini_client.chat(user_input, context, facts, pnotes)
-    if result:
-        bot_stats.track_reply("gemini")
-    return result
+    return gemini_client.chat(user_input, context, facts, pnotes)
 
 
 # ── URL 預抓取（繞過 Gemini url_context 的限制）─────────────────────────────
@@ -1030,16 +1024,6 @@ async def callback(request: Request, x_line_signature: str = Header(None)):
 
 
 def _handle_event(event) -> None:
-    # JoinEvent: bot 被加入群組時觸發（之後可能在 1 秒內被踢出）
-    if isinstance(event, JoinEvent):
-        _handle_join(event)
-        return
-
-    # LeaveEvent: bot 被踢出群組時觸發
-    if isinstance(event, LeaveEvent):
-        _handle_leave(event)
-        return
-
     # MemberJoinedEvent / MemberLeftEvent: 其他成員進出群組
     if isinstance(event, (MemberJoinedEvent, MemberLeftEvent)):
         try:
@@ -1102,7 +1086,6 @@ def _handle_event(event) -> None:
         if isinstance(msg, TextMessageContent):
             text = msg.text or ""
             memory.log_raw_message(group_id, msg.id, sender_user_id, text)
-            bot_stats.track_message(text)
             # (a) explicit + calendar query → deterministic 回
             try:
                 clean_text = _extract_gemini_trigger(text, msg)
@@ -1119,7 +1102,6 @@ def _handle_event(event) -> None:
                 logger.warning("quota-path calendar capture failed: %s", e)
             # 落入 pending 路徑（不重複 log_raw_message）
             _save_pending_any(event, group_id, sender_user_id, msg)
-            bot_stats.track_pending_saved()
         else:
             _save_pending_any(event, group_id, sender_user_id, msg)
         _try_piggyback_drain_with_reply_token(event.reply_token, group_id)
@@ -1131,7 +1113,6 @@ def _handle_event(event) -> None:
     # 文字：先記進 raw_messages（供 quote 回查 / burst look-back / Layer 2 抓 trigger）
     if isinstance(msg, TextMessageContent):
         memory.log_raw_message(group_id, msg.id, sender_user_id, msg.text or "")
-        bot_stats.track_message(msg.text or "")
         _handle_text_message(event, group_id)
         return
 
@@ -3332,7 +3313,6 @@ def _drain_pending_for_group(group_id: str, source: str = "startup") -> bool:
                             messages=[TextMessage(**msg_kwargs)],
                         )
                     )
-                bot_stats.track_line_push()
                 memory.append_turn(
                     group_id,
                     "user",
@@ -3824,71 +3804,6 @@ def _maybe_extract_reminder(text: str, group_id: str, user_id: str = "") -> None
             )
     except Exception as e:
         logger.warning("_maybe_extract_reminder failed: %s", e)
-
-
-# ── Join / Leave 處理 ────────────────────────────────────────────────────────
-
-
-def _handle_join(event: JoinEvent) -> None:
-    """Bot 被加入群組時觸發。立即 reply + 查群組資訊。
-    目前問題：LINE 會在 < 1 秒內把 bot 踢出，所以要搶時間收集資訊。"""
-    src = event.source
-    group_id = getattr(src, "group_id", None)
-    room_id = getattr(src, "room_id", None)
-    target_id = group_id or room_id
-    source_type = "group" if group_id else ("room" if room_id else "unknown")
-    print(
-        f"[JOIN] source_type={source_type} id={target_id} reply_token={event.reply_token}",
-        flush=True,
-    )
-
-    # 1. 立即 reply 一則 welcome 訊息（搶在被踢之前）
-    try:
-        _reply(event.reply_token, f"我被加入了！{source_type}_id={target_id}")
-        print("[JOIN] reply sent", flush=True)
-    except Exception as e:
-        print(f"[JOIN] reply FAILED: {e}", flush=True)
-
-    # 2. 立即查群組 summary / member count / member ids（可能因未認證而失敗，但試試）
-    if group_id:
-        try:
-            with ApiClient(_get_line_config()) as api_client:
-                api = MessagingApi(api_client)
-                try:
-                    summary = api.get_group_summary(group_id)
-                    print(f"[JOIN] group_summary={summary}", flush=True)
-                except Exception as e:
-                    print(
-                        f"[JOIN] group_summary FAILED: {type(e).__name__}: {str(e)[:200]}",
-                        flush=True,
-                    )
-                try:
-                    count = api.get_group_member_count(group_id)
-                    print(f"[JOIN] group_member_count={count}", flush=True)
-                except Exception as e:
-                    print(
-                        f"[JOIN] group_member_count FAILED: {type(e).__name__}: {str(e)[:200]}",
-                        flush=True,
-                    )
-                try:
-                    ids = api.get_group_members_ids(group_id)
-                    print(f"[JOIN] group_members_ids={ids}", flush=True)
-                except Exception as e:
-                    print(
-                        f"[JOIN] group_members_ids FAILED: {type(e).__name__}: {str(e)[:200]}",
-                        flush=True,
-                    )
-        except Exception as e:
-            print(f"[JOIN] api_client FAILED: {e}", flush=True)
-
-
-def _handle_leave(event: LeaveEvent) -> None:
-    """Bot 被踢出群組時觸發。記錄被踢的時間點以便分析。"""
-    src = event.source
-    group_id = getattr(src, "group_id", None)
-    room_id = getattr(src, "room_id", None)
-    target_id = group_id or room_id
-    print(f"[LEAVE] id={target_id} timestamp={event.timestamp}", flush=True)
 
 
 # ── Command 處理 ──────────────────────────────────────────────────────────────
@@ -4586,16 +4501,12 @@ def _try_piggyback_drain_with_reply_token(
         committed_ids = [msg_id for _, msg_id in rendered if msg_id]
         _commit_pending_removal(group_id, committed_ids)
 
-        # log bot's own replies + observability
+        # log bot's own replies
         import uuid as _uuid
         for m in messages:
             txt = getattr(m, "text", "")[:500]
             uniq = f"piggyback_{_uuid.uuid4().hex[:12]}"
             memory.log_raw_message(group_id, uniq, "__bot__", txt)
-        try:
-            bot_stats.track_reply("piggyback_local_drain")
-        except Exception:
-            pass
         logger.info(
             "quota-exhausted piggyback: drained %d via reply_token group=%s",
             len(rendered), group_id,
@@ -4978,7 +4889,6 @@ def _reply(reply_token: str, text: str, group_id: str | None = None) -> None:
                         )
                     )
                 logger.info("fallback push_message sent to group=%s", group_id)
-                bot_stats.track_line_push()
                 memory.log_raw_message(
                     group_id, f"push_{int(time.time() * 1000)}", "__bot__", text
                 )

@@ -23,8 +23,6 @@ from linebot.v3.webhooks import (  # noqa: E402
     FileMessageContent,
     GroupSource,
     ImageMessageContent,
-    JoinEvent,
-    LeaveEvent,
     MessageEvent,
     TextMessageContent,
     VideoMessageContent,
@@ -409,63 +407,6 @@ def test_extract_office_text():
     with patch.dict("sys.modules", {"docx": None}):
         result3 = main._extract_office_text(b"fake docx", "test.docx")
     check("docx import 失敗 → return None", result3 is None)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Test F: _handle_join / _handle_leave
-# ═══════════════════════════════════════════════════════════════════════════════
-def test_handle_join_leave():
-    print("\n── Test F: _handle_join / _handle_leave ──")
-
-    # JoinEvent with group_id → reply + API calls (all mocked)
-    join_evt = MagicMock(spec=JoinEvent)
-    join_evt.source = MagicMock()
-    join_evt.source.group_id = "GRP001"
-    join_evt.source.room_id = None
-    join_evt.reply_token = "JOIN_TOKEN"
-
-    with patch("main._reply") as mock_reply, patch("main.ApiClient") as mock_api_cls:
-        mock_api = MagicMock()
-        mock_api_cls.return_value.__enter__ = MagicMock(return_value=mock_api)
-        mock_api_cls.return_value.__exit__ = MagicMock(return_value=False)
-        main._handle_join(join_evt)
-    check("JoinEvent → _reply called", mock_reply.called)
-
-    # JoinEvent with room_id only (no group_id) → reply
-    join_room = MagicMock(spec=JoinEvent)
-    join_room.source = MagicMock()
-    join_room.source.group_id = None
-    join_room.source.room_id = "ROOM001"
-    join_room.reply_token = "JOIN_ROOM_TOKEN"
-    with patch("main._reply") as mock_reply2:
-        main._handle_join(join_room)
-    check("JoinEvent room → _reply called", mock_reply2.called)
-    check(
-        "JoinEvent room → reply 含 room_id",
-        "ROOM001" in (mock_reply2.call_args[0][1] if mock_reply2.called else ""),
-    )
-
-    # JoinEvent with no group or room
-    join_none = MagicMock(spec=JoinEvent)
-    join_none.source = MagicMock()
-    join_none.source.group_id = None
-    join_none.source.room_id = None
-    join_none.reply_token = "JOIN_NONE_TOKEN"
-    with patch("main._reply") as mock_reply3:
-        main._handle_join(join_none)
-    check("JoinEvent no id → _reply called", mock_reply3.called)
-
-    # LeaveEvent → just logs, no crash
-    leave_evt = MagicMock(spec=LeaveEvent)
-    leave_evt.source = MagicMock()
-    leave_evt.source.group_id = "GRP001"
-    leave_evt.source.room_id = None
-    leave_evt.timestamp = 12345
-    try:
-        main._handle_leave(leave_evt)
-        check("LeaveEvent → 不爆", True)
-    except Exception:
-        check("LeaveEvent → 不爆", False)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -943,8 +884,7 @@ def test_reply_non_muted():
             mock_msg_api2.return_value = mock_instance2
             mock_instance2.reply_message.side_effect = Exception("expired token")
             mock_instance2.push_message.return_value = None
-            with patch("main.bot_stats.track_line_push"):
-                main._reply("EXPIRED_TOKEN", "重送訊息", group_id="GRP001")
+            main._reply("EXPIRED_TOKEN", "重送訊息", group_id="GRP001")
     check("reply 過期 → fallback push 不爆", True)
 
     # Empty text → no-op
@@ -1469,9 +1409,6 @@ class AllTests(unittest.TestCase):
     def test_extract_office_text(self):
         test_extract_office_text()
 
-    def test_handle_join_leave(self):
-        test_handle_join_leave()
-
     def test_handle_dinner_recommendation(self):
         test_handle_dinner_recommendation()
 
@@ -1578,7 +1515,6 @@ def test_handle_group_message_routing():
         txt_evt = _make_message_event(txt_msg)
         with (
             patch("main.memory.log_raw_message"),
-            patch("main.bot_stats.track_message"),
             patch("main._handle_text_message") as mock_text,
         ):
             main._handle_event(txt_evt)
@@ -1590,8 +1526,6 @@ def test_handle_group_message_routing():
         txt_evt2 = _make_message_event(txt_msg2)
         with (
             patch("main.memory.log_raw_message"),
-            patch("main.bot_stats.track_message"),
-            patch("main.bot_stats.track_pending_saved"),
             patch("main._save_pending_any") as mock_save,
         ):
             main._handle_event(txt_evt2)
@@ -1665,7 +1599,6 @@ if __name__ == "__main__":
         test_handle_burst_flush_paths,
         test_handle_file_message,
         test_extract_office_text,
-        test_handle_join_leave,
         test_handle_dinner_recommendation,
         test_handle_command_extended,
         test_handle_layer2_correction,

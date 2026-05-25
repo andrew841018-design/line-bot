@@ -21,8 +21,6 @@ from linebot.v3.webhooks import (  # noqa: E402
     FileMessageContent,
     GroupSource,
     ImageMessageContent,
-    JoinEvent,
-    LeaveEvent,
     MemberJoinedEvent,
     MessageEvent,
     TextMessageContent,
@@ -105,25 +103,6 @@ def _mock_memory():
 # ═══════════════════════════════════════════════════════════════════════════════
 def test_handle_event_routing():
     print("\n── Test A: _handle_event routing ──")
-
-    # JoinEvent → _handle_join
-    join_evt = MagicMock(spec=JoinEvent)
-    join_evt.source = MagicMock()
-    join_evt.source.group_id = "GRP001"
-    join_evt.source.room_id = None
-    join_evt.reply_token = "TOKEN"
-    with patch("main._handle_join") as mock_join, patch("main._reply"):
-        main._handle_event(join_evt)
-    check("JoinEvent → _handle_join called", mock_join.called)
-
-    # LeaveEvent → _handle_leave
-    leave_evt = MagicMock(spec=LeaveEvent)
-    leave_evt.source = MagicMock()
-    leave_evt.source.group_id = "GRP001"
-    leave_evt.timestamp = 12345
-    with patch("main._handle_leave") as mock_leave:
-        main._handle_event(leave_evt)
-    check("LeaveEvent → _handle_leave called", mock_leave.called)
 
     # MemberJoinedEvent → ignored
     member_evt = MagicMock(spec=MemberJoinedEvent)
@@ -238,7 +217,6 @@ def test_handle_event_message_types():
     txt_evt = _make_message_event(txt_msg)
     with (
         patch("main.memory.log_raw_message"),
-        patch("main.bot_stats.track_message"),
         patch("main._handle_text_message") as mock_text,
     ):
         main._handle_event(txt_evt)
@@ -254,14 +232,11 @@ def test_handle_event_quota_exhausted():
 
     with (
         patch("main.memory.log_raw_message"),
-        patch("main.bot_stats.track_message"),
-        patch("main.bot_stats.track_pending_saved") as mock_pending,
         patch("main._save_pending_any") as mock_save,
     ):
         main._handle_event(evt)
 
     check("quota 爆 → _save_pending_any called", mock_save.called)
-    check("quota 爆 → track_pending_saved called", mock_pending.called)
 
     main._quota_exhausted_until_ts = 0.0
 

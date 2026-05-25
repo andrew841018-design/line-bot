@@ -1,6 +1,6 @@
 """
 Comprehensive coverage tests — no real API calls.
-Targets: main.py, grok_client.py, bot_stats.py
+Targets: main.py, grok_client.py
 """
 
 import json
@@ -18,7 +18,6 @@ os.environ.setdefault("GROK_API_KEY", "dummy")
 os.environ.setdefault("BOT_MUTED", "true")
 
 import main  # noqa: E402
-import bot_stats  # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -563,55 +562,6 @@ def test_extract_subtitles():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Test T: bot_stats — track_* functions + query_range + summary_report
-# ═══════════════════════════════════════════════════════════════════════════════
-def test_bot_stats_track():
-    print("\n── Test T: bot_stats track functions ──")
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-        tmp_db = f.name
-    os.unlink(tmp_db)  # 讓 bot_stats 自己建
-
-    orig_db = bot_stats._DB_PATH
-    bot_stats._DB_PATH = tmp_db
-    # 重建 connection
-    bot_stats._db_conn = None
-
-    bot_stats.track_message("今天吃什麼晚餐")
-    bot_stats.track_reply("gemini")
-    bot_stats.track_reply("grok")
-    bot_stats.track_pending_saved()
-    bot_stats.track_line_push()
-
-    data = bot_stats.query_range(days=1)
-    check("query_range 有資料", len(data) > 0)
-    today_data = data[0]
-    check("msg_received 有計數", today_data.get("msg_received", 0) >= 1)
-    check("reply_gemini 有計數", today_data.get("reply_gemini", 0) >= 1)
-    check("reply_grok 有計數", today_data.get("reply_grok", 0) >= 1)
-    check("msg_pending_saved 有計數", today_data.get("msg_pending_saved", 0) >= 1)
-    check("line_push_used 有計數", today_data.get("line_push_used", 0) >= 1)
-
-    report = bot_stats.summary_report(days=30)
-    check("summary_report 非空", bool(report))
-    check("summary_report 含「統計」", "統計" in report)
-    check("summary_report 含「回覆」", "回覆" in report)
-
-    # 無資料時
-    bot_stats._db_conn = None
-    os.unlink(tmp_db)
-    bot_stats._DB_PATH = tmp_db  # 新空 DB
-    empty_report = bot_stats.summary_report(days=30)
-    check("無資料 → 提示訊息", "尚無" in empty_report or len(empty_report) > 0)
-
-    bot_stats._DB_PATH = orig_db
-    bot_stats._db_conn = None
-    try:
-        os.unlink(tmp_db)
-    except FileNotFoundError:
-        pass
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
@@ -631,7 +581,6 @@ if __name__ == "__main__":
     test_get_quota_footer()
     test_health_endpoint()
     test_extract_subtitles()
-    test_bot_stats_track()
 
     print(f"\n{'=' * 50}")
     print(f"TOTAL: {PASS} passed, {FAIL} failed")

@@ -253,8 +253,6 @@ def test_quota_path_explicit_calendar_query_reaches_deterministic_handler(monkey
     monkeypatch.setattr(main.memory, "append_turn", lambda *a, **k: None)
     monkeypatch.setattr(main.memory, "log_raw_message", lambda *a, **k: None)
     monkeypatch.setattr(main, "burst_filter", type("F", (), {"cancel_burst": lambda gid: None})())
-    monkeypatch.setattr(main.bot_stats, "track_message", lambda *a, **k: None)
-    monkeypatch.setattr(main.bot_stats, "track_pending_saved", lambda: None)
     monkeypatch.setattr(main, "_save_pending_any", lambda *a, **k: None)
     monkeypatch.setattr(main, "_try_piggyback_drain_with_reply_token", lambda *a, **k: None)
     captured = {}
