@@ -29,13 +29,13 @@ def test_migration_adds_reminded_columns(tmp_cal_db):
     tmp_cal_db.init_db()
     with tmp_cal_db._conn() as c:
         cols = [r[1] for r in c.execute("PRAGMA table_info(events)").fetchall()]
-    for off in (3, 2, 1):
+    for off in (30, 7, 3, 2, 1):
         assert f"reminded_{off}d" in cols, f"reminded_{off}d missing"
 
 
 # ── Test: REMINDER_OFFSETS constant ───────────────────────────────────
 def test_reminder_offsets_constant(tmp_cal_db):
-    assert tmp_cal_db.REMINDER_OFFSETS == (3, 2, 1)
+    assert tmp_cal_db.REMINDER_OFFSETS == (30, 7, 3, 2, 1)
 
 
 # ── Test: _reminded_column whitelist (SQL injection guard) ────────────
@@ -44,9 +44,9 @@ def test_reminded_column_whitelist(tmp_cal_db):
     assert tmp_cal_db._reminded_column(3) == "reminded_3d"
     assert tmp_cal_db._reminded_column(1) == "reminded_1d"
     with pytest.raises(ValueError):
-        tmp_cal_db._reminded_column(7)
-    with pytest.raises(ValueError):
         tmp_cal_db._reminded_column(0)
+    with pytest.raises(ValueError):
+        tmp_cal_db._reminded_column(4)  # 4 not in REMINDER_OFFSETS
     with pytest.raises(ValueError):
         # 試攻擊：注入 SQL — whitelist 必須擋
         tmp_cal_db._reminded_column(99)
