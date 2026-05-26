@@ -28,7 +28,6 @@ def temp_anniv_db(monkeypatch):
 
 
 def test_init_db_creates_tables(temp_anniv_db):
-    import anniversary
     import sqlite3
     with sqlite3.connect(temp_anniv_db) as c:
         tables = [
