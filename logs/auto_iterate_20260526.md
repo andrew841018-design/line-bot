@@ -241,3 +241,34 @@ rounds: 1
 
 [13:33:01] iter 1 後 pytest 全綠，提早退出
 [13:33:01] ## Step 7: 仍有未 commit 變更，catch-all 上傳
+[main f96c47a] auto iterate 20260526 (catch-all)
+ 5 files changed, 28 insertions(+), 2 deletions(-)
+To github.com:andrew841018-design/line-bot.git
+   0acedd1..f96c47a  main -> main
+[13:33:05] ## Step 8: restart uvicorn
+[13:33:12] /health: {"status":"ok","gemini_model":"gemini-2.5-flash","gemini_light_model":"gemini-2.5-flash-lite","group_locked":true}
+2026-05-26 13:33:16,075 INFO AFC is enabled with max remote calls: 10.
+2026-05-26 13:33:17,122 INFO HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+2026-05-26 13:33:17,151 INFO AFC is enabled with max remote calls: 10.
+2026-05-26 13:33:17,406 INFO HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent "HTTP/1.1 429 Too Many Requests"
+======================================================================
+LINE bot preflight @ 2026-05-26T13:33:13
+======================================================================
+  [✓]  1. uvicorn process alive
+  [✓]  2. local /health 200
+  [✓]  3. cloudflared process alive
+  [✓]  4. cloudflared URL stash 可讀 + 安全 — url=https://chemicals-statistical-urls-modules.trycloudflare.com age=3241s
+  [✓]  5. cloudflared metrics 內部 URL 對 stash — metrics 200 但 ha_connections 沒露
+  [✓]  6. external https://chemicals-statistical-urls-modules.trycloudflare.com/health 200 — attempt=1
+  [✓]  7. /callback no-sig → 400 missing
+  [✓]  8. LINE token /v2/bot/info 200
+  [✓]  9. LINE webhook URL 對齊 cloudflared
+  [✓] 10. LINE → cloudflared → /callback E2E
+  [✓] 11. Gemini main probe
+  [✗] 12. Gemini lite probe — 429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': 'You exceeded your current quota, please check your plan and 
+  [✓] 13. SQLite integrity + WAL checkpoint
+  [✓] 14. pending file JSON load — groups=2 entries=5
+----------------------------------------------------------------------
+PREFLIGHT [PASS] critical=12/12 info=2/2 elapsed=5.0s
+[13:33:18] preflight exit=0 (0=pass, 1=critical, 2=info-only, 3=infra)
+[13:33:18] ===== 結束 =====
