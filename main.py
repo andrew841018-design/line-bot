@@ -1063,8 +1063,10 @@ def _handle_event(event) -> None:
 
     group_id = event.source.group_id
 
-    # 若設定了 ALLOWED_GROUP_ID，只接受該群組；沒設就開放給所有邀請 bot 進去的群組
-    if settings.allowed_group_id and group_id != settings.allowed_group_id:
+    # 多群白名單（2026-05-27 multi-group）：空 list = unlock mode 接受所有群（log only）；
+    # 非空時只接受清單內。`allowed_group_ids` 是 settings 的 @computed_field：
+    # ALLOWED_GROUP_IDS env (csv) > legacy ALLOWED_GROUP_ID（單數）> []。
+    if settings.allowed_group_ids and group_id not in settings.allowed_group_ids:
         logger.info("ignoring message from non-allowed group_id=%s", group_id)
         return
 
@@ -1304,7 +1306,7 @@ def _try_piggyback_reminders_fast_path(
         for offset in calendar_db.REMINDER_OFFSETS:
             if len(messages) >= 5:
                 break
-            for e in calendar_db.list_due_for_reminder(days_ahead=offset):
+            for e in calendar_db.list_due_for_reminder(group_id, days_ahead=offset):
                 if len(messages) >= 5:
                     break
                 messages.append(TextMessage(text=_er._format_event(e, offset)))
@@ -1325,7 +1327,7 @@ def _try_piggyback_reminders_fast_path(
             )
             return False
         for ev_id, off in pending:
-            calendar_db.mark_reminded(ev_id, off)
+            calendar_db.mark_reminded(ev_id, off, group_id)
         logger.info(
             "reminder fast-path: pushed %d reminders via reply_token group=%s",
             len(pending), group_id,
@@ -4857,7 +4859,7 @@ def _reply(reply_token: str, text: str, group_id: str | None = None) -> None:
             for offset in calendar_db.REMINDER_OFFSETS:
                 if len(messages_to_send) >= 5:
                     break
-                due = calendar_db.list_due_for_reminder(days_ahead=offset)
+                due = calendar_db.list_due_for_reminder(group_id, days_ahead=offset)
                 for e in due:
                     if len(messages_to_send) >= 5:
                         break
@@ -4901,7 +4903,7 @@ def _reply(reply_token: str, text: str, group_id: str | None = None) -> None:
         try:
             import calendar_db as _cdb
             for ev_id, off in pending_reminders:
-                _cdb.mark_reminded(ev_id, off)
+                _cdb.mark_reminded(ev_id, off, group_id)
             logger.info(
                 "reminder piggyback marked: %d reminders group=%s",
                 len(pending_reminders), group_id,

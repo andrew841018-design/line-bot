@@ -38,10 +38,28 @@ _TW = ZoneInfo("Asia/Taipei")
 _DB_PATH = Path(settings.sqlite_path)
 _lock = threading.Lock()
 
-GROUP_ID = os.environ.get("LINE_ALLOWED_GROUP_ID") or os.environ.get(
-    "ALLOWED_GROUP_ID", ""
-)
 _PUSH_URL = "https://api.line.me/v2/bot/message/push"
+
+
+def _get_target_group_ids() -> list[str]:
+    """ALLOWED_GROUP_IDS (csv, multi-group) → list；legacy ALLOWED_GROUP_ID / LINE_ALLOWED_GROUP_ID
+    → single-element list；都未設 → []. Inline helper（不 import settings）保留 launchd
+    process-isolation。"""
+    raw = os.environ.get("ALLOWED_GROUP_IDS", "")
+    if raw:
+        seen: set[str] = set()
+        out: list[str] = []
+        for token in raw.split(","):
+            gid = token.strip()
+            if gid and gid not in seen:
+                seen.add(gid)
+                out.append(gid)
+        return out
+    single = (
+        os.environ.get("LINE_ALLOWED_GROUP_ID", "")
+        or os.environ.get("ALLOWED_GROUP_ID", "")
+    ).strip()
+    return [single] if single else []
 
 ANNIVERSARY_TYPES: tuple[str, ...] = ("birthday", "wedding", "memorial", "other")
 REMINDER_OFFSETS: tuple[int, ...] = (7, 1, 0)  # D-7 / D-1 / D-day
@@ -271,10 +289,10 @@ def _get_token() -> str:
         return os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 
 
-def _push(text: str) -> bool:
+def _push(group_id: str, text: str) -> bool:
     token = _get_token()
-    if not token or not GROUP_ID:
-        logger.error("missing TOKEN or GROUP_ID; skip push")
+    if not token or not group_id:
+        logger.error("missing TOKEN or group_id; skip push")
         return False
     try:
         resp = requests.post(
@@ -283,7 +301,7 @@ def _push(text: str) -> bool:
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
             },
-            json={"to": GROUP_ID, "messages": [{"type": "text", "text": text}]},
+            json={"to": group_id, "messages": [{"type": "text", "text": text}]},
             timeout=10,
         )
         return resp.status_code == 200
@@ -323,35 +341,45 @@ def push_today_reminders(group_id: str) -> int:
             if already_reminded(ann["anniversary_id"], year, offset):
                 continue
             text = _format_anniversary(ann, offset)
-            if _push(text):
+            if _push(group_id, text):
                 mark_reminded(ann["anniversary_id"], year, offset)
                 n_sent += 1
                 logger.info(
-                    "anniversary reminder sent: %s (offset=%d)",
-                    ann["person"], offset,
+                    "anniversary reminder sent group=%s person=%s offset=%d",
+                    group_id, ann["person"], offset,
                 )
     return n_sent
 
 
 def main_extractor() -> int:
-    """Launchd entrypoint: monthly incremental sweep."""
-    if not GROUP_ID:
-        logger.error("GROUP_ID 未設定")
+    """Launchd entrypoint: monthly incremental sweep across all groups."""
+    gids = _get_target_group_ids()
+    if not gids:
+        logger.error("沒有任何 target group_id（ALLOWED_GROUP_IDS / ALLOWED_GROUP_ID 都未設）")
         return 1
     init_db()
-    n = run_sweep(GROUP_ID, since_days=30)
-    logger.info("anniversary sweep done: %d new", n)
+    total = 0
+    for gid in gids:
+        n = run_sweep(gid, since_days=30)
+        total += n
+        logger.info("anniversary sweep done group=%s: %d new", gid, n)
+    logger.info("anniversary sweep total: %d new across %d group(s)", total, len(gids))
     return 0
 
 
 def main_reminder() -> int:
-    """Launchd entrypoint: daily reminder check."""
-    if not GROUP_ID:
-        logger.error("GROUP_ID 未設定")
+    """Launchd entrypoint: daily reminder check across all groups."""
+    gids = _get_target_group_ids()
+    if not gids:
+        logger.error("沒有任何 target group_id（ALLOWED_GROUP_IDS / ALLOWED_GROUP_ID 都未設）")
         return 1
     init_db()
-    n = push_today_reminders(GROUP_ID)
-    logger.info("anniversary reminders sent: %d", n)
+    total = 0
+    for gid in gids:
+        n = push_today_reminders(gid)
+        total += n
+        logger.info("anniversary reminders group=%s: %d", gid, n)
+    logger.info("anniversary reminders total: %d across %d group(s)", total, len(gids))
     return 0
 
 
@@ -364,12 +392,17 @@ if __name__ == "__main__":
     if mode == "extract":
         sys.exit(main_extractor())
     elif mode == "extract-historical":
-        if not GROUP_ID:
-            logger.error("GROUP_ID 未設定")
+        gids = _get_target_group_ids()
+        if not gids:
+            logger.error("沒有任何 target group_id；無法 historical sweep")
             sys.exit(1)
         init_db()
-        n = run_sweep(GROUP_ID, since_days=0)
-        logger.info("historical sweep done: %d new", n)
+        total = 0
+        for gid in gids:
+            n = run_sweep(gid, since_days=0)
+            total += n
+            logger.info("historical sweep group=%s: %d new", gid, n)
+        logger.info("historical sweep total: %d", total)
         sys.exit(0)
     else:
         sys.exit(main_reminder())

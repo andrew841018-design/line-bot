@@ -101,11 +101,12 @@ def test_push_today_reminders_dedup(temp_anniv_db):
 
     push_count = {"n": 0}
 
-    def fake_push(text):
+    def fake_push(group_id, text):
         push_count["n"] += 1
         return True
 
-    with patch.object(anniversary, "GROUP_ID", "GRP_TEST"), \
+    # 2026-05-27 multi-group: GROUP_ID module-global 已移除，`_push` 簽章 (group_id, text)
+    with patch.object(anniversary, "_get_target_group_ids", return_value=["GRP_TEST"]), \
          patch.object(anniversary, "_push", side_effect=fake_push):
         n1 = anniversary.push_today_reminders("GRP_TEST")
         n2 = anniversary.push_today_reminders("GRP_TEST")
@@ -116,13 +117,13 @@ def test_push_today_reminders_dedup(temp_anniv_db):
 
 def test_main_reminder_requires_group_id():
     import anniversary
-    with patch.object(anniversary, "GROUP_ID", ""):
+    with patch.object(anniversary, "_get_target_group_ids", return_value=[]):
         assert anniversary.main_reminder() == 1
 
 
 def test_main_extractor_requires_group_id():
     import anniversary
-    with patch.object(anniversary, "GROUP_ID", ""):
+    with patch.object(anniversary, "_get_target_group_ids", return_value=[]):
         assert anniversary.main_extractor() == 1
 
 

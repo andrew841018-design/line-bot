@@ -63,7 +63,7 @@ def test_list_due_for_offset_1(tmp_cal_db):
     )
     assert eid
 
-    due = tmp_cal_db.list_due_for_reminder(days_ahead=1)
+    due = tmp_cal_db.list_due_for_reminder(GID, days_ahead=1)
     assert len(due) == 1
     assert due[0]["event_id"] == eid
 
@@ -73,7 +73,7 @@ def test_list_due_for_offset_3(tmp_cal_db):
     today = date.today()
     t3 = (today + timedelta(days=3)).isoformat()
     eid = tmp_cal_db.insert_event(group_id=GID, title="3 天後活動", event_date=t3)
-    due = tmp_cal_db.list_due_for_reminder(days_ahead=3)
+    due = tmp_cal_db.list_due_for_reminder(GID, days_ahead=3)
     assert len(due) == 1
     assert due[0]["event_id"] == eid
 
@@ -85,7 +85,7 @@ def test_list_due_does_not_match_wrong_offset(tmp_cal_db):
     t1 = (today + timedelta(days=1)).isoformat()
     tmp_cal_db.insert_event(group_id=GID, title="明天活動", event_date=t1)
 
-    due_3 = tmp_cal_db.list_due_for_reminder(days_ahead=3)
+    due_3 = tmp_cal_db.list_due_for_reminder(GID, days_ahead=3)
     assert due_3 == []
 
 
@@ -96,7 +96,7 @@ def test_mark_reminded_writes_correct_column(tmp_cal_db):
     t1 = (today + timedelta(days=1)).isoformat()
     eid = tmp_cal_db.insert_event(group_id=GID, title="蛋糕", event_date=t1)
 
-    tmp_cal_db.mark_reminded(eid, days_ahead=1)
+    tmp_cal_db.mark_reminded(eid, days_ahead=1, group_id=GID)
     with tmp_cal_db._conn() as c:
         row = c.execute(
             "SELECT reminded_1d, reminded_2d, reminded_3d FROM events WHERE event_id=?",
@@ -115,14 +115,14 @@ def test_mark_reminded_idempotency_per_offset(tmp_cal_db):
     eid = tmp_cal_db.insert_event(group_id=GID, title="蛋糕", event_date=t1)
 
     # 第一次 list_due — 抓到
-    due1 = tmp_cal_db.list_due_for_reminder(days_ahead=1)
+    due1 = tmp_cal_db.list_due_for_reminder(GID, days_ahead=1)
     assert len(due1) == 1
 
     # mark 過後
-    tmp_cal_db.mark_reminded(eid, days_ahead=1)
+    tmp_cal_db.mark_reminded(eid, days_ahead=1, group_id=GID)
 
     # 第二次 list_due 同 offset — 抓不到（已 mark）
-    due2 = tmp_cal_db.list_due_for_reminder(days_ahead=1)
+    due2 = tmp_cal_db.list_due_for_reminder(GID, days_ahead=1)
     assert due2 == []
 
 
@@ -135,7 +135,7 @@ def test_mark_per_offset_independent(tmp_cal_db):
     t3 = (today + timedelta(days=3)).isoformat()
     eid = tmp_cal_db.insert_event(group_id=GID, title="A", event_date=t3)
 
-    tmp_cal_db.mark_reminded(eid, days_ahead=3)
+    tmp_cal_db.mark_reminded(eid, days_ahead=3, group_id=GID)
     with tmp_cal_db._conn() as c:
         r = c.execute(
             "SELECT reminded_1d, reminded_2d, reminded_3d FROM events WHERE event_id=?",
@@ -151,7 +151,7 @@ def test_update_event_date_resets_reminders(tmp_cal_db):
     today = date.today()
     t1 = (today + timedelta(days=1)).isoformat()
     eid = tmp_cal_db.insert_event(group_id=GID, title="A", event_date=t1)
-    tmp_cal_db.mark_reminded(eid, days_ahead=1)
+    tmp_cal_db.mark_reminded(eid, days_ahead=1, group_id=GID)
 
     # Reschedule 到 T+5
     new_date = (today + timedelta(days=5)).isoformat()
@@ -174,7 +174,7 @@ def test_cancelled_excluded_from_due(tmp_cal_db):
     eid = tmp_cal_db.insert_event(group_id=GID, title="A", event_date=t1)
     tmp_cal_db.cancel_event(eid)
 
-    due = tmp_cal_db.list_due_for_reminder(days_ahead=1)
+    due = tmp_cal_db.list_due_for_reminder(GID, days_ahead=1)
     assert due == []
 
 

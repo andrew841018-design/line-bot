@@ -26,8 +26,12 @@ import calendar_db  # noqa: E402
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-GROUP_ID = os.environ.get("LINE_ALLOWED_GROUP_ID") or os.environ.get(
-    "ALLOWED_GROUP_ID", ""
+# 2026-05-27 multi-group: event_reminder 仍是 family-only launchd job（不擴推 mom 群）。
+# 優先讀顯式 FAMILY_GROUP_ID；legacy LINE_ALLOWED_GROUP_ID / ALLOWED_GROUP_ID 作 fallback。
+GROUP_ID = (
+    os.environ.get("FAMILY_GROUP_ID")
+    or os.environ.get("LINE_ALLOWED_GROUP_ID")
+    or os.environ.get("ALLOWED_GROUP_ID", "")
 )
 _PUSH_URL = "https://api.line.me/v2/bot/message/push"
 
@@ -106,7 +110,7 @@ def main() -> int:
     total_sent = 0
     total_due = 0
     for offset in calendar_db.REMINDER_OFFSETS:
-        events = calendar_db.list_due_for_reminder(days_ahead=offset)
+        events = calendar_db.list_due_for_reminder(GROUP_ID, days_ahead=offset)
         if not events:
             logger.info("no events due for T-%d reminder", offset)
             continue
@@ -114,7 +118,7 @@ def main() -> int:
         for e in events:
             text = _format_event(e, offset)
             if _push(text):
-                calendar_db.mark_reminded(e["event_id"], offset)
+                calendar_db.mark_reminded(e["event_id"], offset, GROUP_ID)
                 total_sent += 1
                 logger.info(
                     "reminder sent (T-%d): %s '%s' on %s",

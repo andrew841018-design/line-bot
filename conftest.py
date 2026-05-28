@@ -44,6 +44,11 @@ _ORIG_PENDING_STORE_PATH = pending_store.PENDING_PATH
 _ORIG_PENDING_STORE_LOCK = pending_store.LOCK_PATH
 _ORIG_BOT_MUTED = main.settings.bot_muted
 _ORIG_ALLOWED_GROUP_ID = main.settings.allowed_group_id
+# 2026-05-27 multi-group: tests 用 main.settings.allowed_group_id = "GRP001" 設 gate target，
+# 但 webhook gate 讀 settings.allowed_group_ids（computed_field）。當 raw 從 env 載入非空時，
+# computed 走 raw 分支忽略 singular → gate 不認 test group → silent drop。
+# Fix: 每個 test setup 把 allowed_group_ids_raw 暫時清空，computed 走 singular fallback。
+_ORIG_ALLOWED_GROUP_IDS_RAW = main.settings.allowed_group_ids_raw
 _ORIG_FV_DB_PATH = finance_view_db._DB_PATH
 
 
@@ -75,6 +80,7 @@ def reset_main_globals():
     finance_view_db.init_db()  # 在 temp DB 建 schema
     main.settings.bot_muted = True
     main.settings.allowed_group_id = _ORIG_ALLOWED_GROUP_ID
+    main.settings.allowed_group_ids_raw = ""  # 清空讓 computed 走 singular fallback
 
     yield
 
@@ -88,6 +94,7 @@ def reset_main_globals():
     finance_view_db._DB_PATH = _ORIG_FV_DB_PATH
     main.settings.bot_muted = _ORIG_BOT_MUTED
     main.settings.allowed_group_id = _ORIG_ALLOWED_GROUP_ID
+    main.settings.allowed_group_ids_raw = _ORIG_ALLOWED_GROUP_IDS_RAW
 
     for p in (tmp_quota_path, tmp_pending.name, str(tmp_pending_lock), str(tmp_fv_path)):
         try:

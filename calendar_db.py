@@ -350,11 +350,15 @@ def search_by_title_phrase(
     return combined[:limit]
 
 
-def list_due_for_reminder(days_ahead: int = 7) -> list[dict]:
-    """回傳 event_date = today + days_ahead 且該 offset 的 reminded 欄位 IS NULL 的 active events。
+def list_due_for_reminder(group_id: str, days_ahead: int = 7) -> list[dict]:
+    """回傳指定 group_id 中 event_date = today + days_ahead 且該 offset 的 reminded 欄位
+    IS NULL 的 active events。
 
-    days_ahead in REMINDER_OFFSETS (3/2/1) → 查對應 reminded_Xd column
-    days_ahead = 其他值（如 legacy 7）→ 走舊 `reminded_at` graveyard column（向後相容）
+    days_ahead in REMINDER_OFFSETS (30/7/3/2/1) → 查對應 reminded_Xd column
+    days_ahead = 其他值（如 legacy）→ 走舊 `reminded_at` graveyard column（向後相容）
+
+    group_id 從 2026-05-27 multi-group 起 required —— 兩位 reviewer 都警告若漏 filter，
+    multi-group 下 piggyback drain 路徑會把家族群 events 推到 mom 群 reply_token（isolation breach）。
     """
     target = (_today_tw() + timedelta(days=days_ahead)).isoformat()
     with _lock, _conn() as c:
@@ -363,22 +367,24 @@ def list_due_for_reminder(days_ahead: int = 7) -> list[dict]:
             col = _reminded_column(days_ahead)
             # column name 已被 _reminded_column whitelist 驗過 (SQL injection 防護)
             rows = c.execute(
-                f"SELECT * FROM events WHERE status = 'active' "
+                f"SELECT * FROM events WHERE group_id = ? AND status = 'active' "
                 f"AND event_date = ? AND {col} IS NULL",
-                (target,),
+                (group_id, target),
             ).fetchall()
         else:
-            # legacy path（保留 reminded_at 欄位向後相容）
+            # legacy path（保留 reminded_at 欄位向後相容） — group_id filter 同樣加上
             rows = c.execute(
-                "SELECT * FROM events WHERE status = 'active' AND event_date = ? "
-                "AND reminded_at IS NULL",
-                (target,),
+                "SELECT * FROM events WHERE group_id = ? AND status = 'active' "
+                "AND event_date = ? AND reminded_at IS NULL",
+                (group_id, target),
             ).fetchall()
     return [dict(r) for r in rows]
 
 
-def mark_reminded(event_id: str, days_ahead: int = 7) -> None:
-    """標記 offset 的 reminded 欄位為 now timestamp。
+def mark_reminded(event_id: str, days_ahead: int, group_id: str) -> None:
+    """標記 offset 的 reminded 欄位為 now timestamp。group_id 從 2026-05-27 起 required
+    作為防禦深度（event_id 是 PK 全表唯一，理論上單 WHERE 不會誤判，但 reviewer 兩位都建議
+    強制 group_id 防 caller 漏傳）。
 
     days_ahead in REMINDER_OFFSETS → 寫 reminded_Xd
     其他值 → 寫 legacy reminded_at（向後相容）
@@ -388,13 +394,13 @@ def mark_reminded(event_id: str, days_ahead: int = 7) -> None:
         if days_ahead in REMINDER_OFFSETS:
             col = _reminded_column(days_ahead)
             c.execute(
-                f"UPDATE events SET {col} = ? WHERE event_id = ?",
-                (ts, event_id),
+                f"UPDATE events SET {col} = ? WHERE event_id = ? AND group_id = ?",
+                (ts, event_id, group_id),
             )
         else:
             c.execute(
-                "UPDATE events SET reminded_at = ? WHERE event_id = ?",
-                (ts, event_id),
+                "UPDATE events SET reminded_at = ? WHERE event_id = ? AND group_id = ?",
+                (ts, event_id, group_id),
             )
 
 

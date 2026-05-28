@@ -122,7 +122,9 @@ def test_push_daily_reminders_sends_when_due(temp_todo_db):
     tid = todo.insert_todo("GRP", "today task", "U1", today_iso)
     assert tid
 
-    with patch.object(todo, "GROUP_ID", "GRP"), \
+    # 2026-05-27 multi-group: GROUP_ID module-global 已移除，改 patch helper（從 env 讀）。
+    # `_push` signature 改為 `_push(group_id, text)`，但 patch return_value 不受影響。
+    with patch.object(todo, "_get_target_group_ids", return_value=["GRP"]), \
          patch.object(todo, "_push", return_value=True) as mock_push:
         n = todo.push_daily_reminders("GRP")
     assert n >= 1
@@ -131,11 +133,11 @@ def test_push_daily_reminders_sends_when_due(temp_todo_db):
 
 def test_main_reminder_requires_group_id():
     import todo
-    with patch.object(todo, "GROUP_ID", ""):
+    with patch.object(todo, "_get_target_group_ids", return_value=[]):
         assert todo.main_reminder() == 1
 
 
 def test_main_extractor_requires_group_id():
     import todo
-    with patch.object(todo, "GROUP_ID", ""):
+    with patch.object(todo, "_get_target_group_ids", return_value=[]):
         assert todo.main_extractor_sweep() == 1

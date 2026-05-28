@@ -37,10 +37,28 @@ _TW = ZoneInfo("Asia/Taipei")
 _DB_PATH = Path(settings.sqlite_path)
 _lock = threading.Lock()
 
-GROUP_ID = os.environ.get("LINE_ALLOWED_GROUP_ID") or os.environ.get(
-    "ALLOWED_GROUP_ID", ""
-)
 _PUSH_URL = "https://api.line.me/v2/bot/message/push"
+
+
+def _get_target_group_ids() -> list[str]:
+    """ALLOWED_GROUP_IDS (csv, multi-group) → list；legacy ALLOWED_GROUP_ID / LINE_ALLOWED_GROUP_ID
+    → single-element list；都未設 → []. Inline helper（不 import settings）保留 launchd
+    process-isolation：每個 cron job 獨立 env，pydantic-settings 失敗不會跨 script crash。"""
+    raw = os.environ.get("ALLOWED_GROUP_IDS", "")
+    if raw:
+        seen: set[str] = set()
+        out: list[str] = []
+        for token in raw.split(","):
+            gid = token.strip()
+            if gid and gid not in seen:
+                seen.add(gid)
+                out.append(gid)
+        return out
+    single = (
+        os.environ.get("LINE_ALLOWED_GROUP_ID", "")
+        or os.environ.get("ALLOWED_GROUP_ID", "")
+    ).strip()
+    return [single] if single else []
 
 TODO_STATUSES: tuple[str, ...] = ("pending", "completed", "cancelled")
 MAX_OVERDUE_DAYS_TO_REMIND = 7  # 超過 7 天 overdue 不再提醒（避免 noise）
@@ -242,10 +260,10 @@ def _get_token() -> str:
         return os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 
 
-def _push(text: str) -> bool:
+def _push(group_id: str, text: str) -> bool:
     token = _get_token()
-    if not token or not GROUP_ID:
-        logger.error("missing TOKEN or GROUP_ID; skip push")
+    if not token or not group_id:
+        logger.error("missing TOKEN or group_id; skip push")
         return False
     try:
         resp = requests.post(
@@ -254,7 +272,7 @@ def _push(text: str) -> bool:
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
             },
-            json={"to": GROUP_ID, "messages": [{"type": "text", "text": text}]},
+            json={"to": group_id, "messages": [{"type": "text", "text": text}]},
             timeout=10,
         )
         return resp.status_code == 200
@@ -283,32 +301,29 @@ def push_daily_reminders(group_id: str) -> int:
     due = list_due_today(group_id)
     overdue = list_overdue(group_id)
     if not due and not overdue:
-        logger.info("no due or overdue todos today, skip push")
+        logger.info("no due or overdue todos today, skip push group=%s", group_id)
         return 0
     text = _format_reminder(due, overdue)
-    if _push(text):
+    if _push(group_id, text):
         for t in due + overdue:
             mark_reminded(t["todo_id"])
         logger.info(
-            "daily todo reminder sent: due=%d overdue=%d", len(due), len(overdue)
+            "daily todo reminder sent group=%s due=%d overdue=%d",
+            group_id, len(due), len(overdue),
         )
         return len(due) + len(overdue)
     return 0
 
 
-def main_extractor_sweep() -> int:
-    """Launchd: incremental sweep last 7 days raw_messages for todos."""
-    if not GROUP_ID:
-        logger.error("GROUP_ID 未設定")
-        return 1
-    init_db()
+def _sweep_one_group(group_id: str) -> int:
+    """Sweep last 7 days raw_messages of a single group for todo extraction."""
     import memory
     since_ts = int((time.time() - 7 * 24 * 3600) * 1000)
     with memory._conn() as c:
         rows = c.execute(
             "SELECT message_id, user_id, text, created_at FROM raw_messages "
             "WHERE group_id=? AND created_at>=? ORDER BY created_at ASC",
-            (GROUP_ID, since_ts),
+            (group_id, since_ts),
         ).fetchall()
     n_new = 0
     for msg_id, user_id, text, _ts in rows:
@@ -317,7 +332,7 @@ def main_extractor_sweep() -> int:
         extracted = extract_from_text(text)
         for todo in extracted:
             tid = insert_todo(
-                group_id=GROUP_ID,
+                group_id=group_id,
                 task=todo["task"],
                 sender_user_id=user_id,
                 due_date=todo.get("due_date"),
@@ -326,18 +341,38 @@ def main_extractor_sweep() -> int:
             )
             if tid:
                 n_new += 1
-                logger.info("new todo: %s (due=%s)", todo["task"], todo.get("due_date"))
-    logger.info("todo sweep done: %d new", n_new)
+                logger.info(
+                    "new todo group=%s: %s (due=%s)",
+                    group_id, todo["task"], todo.get("due_date"),
+                )
+    return n_new
+
+
+def main_extractor_sweep() -> int:
+    """Launchd: incremental sweep last 7 days raw_messages for todos across all groups."""
+    gids = _get_target_group_ids()
+    if not gids:
+        logger.error("沒有任何 target group_id（ALLOWED_GROUP_IDS / ALLOWED_GROUP_ID 都未設）")
+        return 1
+    init_db()
+    total = 0
+    for gid in gids:
+        n = _sweep_one_group(gid)
+        total += n
+        logger.info("todo sweep done group=%s: %d new", gid, n)
+    logger.info("todo sweep total: %d new across %d group(s)", total, len(gids))
     return 0
 
 
 def main_reminder() -> int:
-    """Launchd: daily reminder push."""
-    if not GROUP_ID:
-        logger.error("GROUP_ID 未設定")
+    """Launchd: daily reminder push across all groups."""
+    gids = _get_target_group_ids()
+    if not gids:
+        logger.error("沒有任何 target group_id（ALLOWED_GROUP_IDS / ALLOWED_GROUP_ID 都未設）")
         return 1
     init_db()
-    push_daily_reminders(GROUP_ID)
+    for gid in gids:
+        push_daily_reminders(gid)
     return 0
 
 

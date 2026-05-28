@@ -4,14 +4,31 @@ Env loader.
 部署目標：本機 Mac + Cloudflare quick tunnel（免帳號、免付費）
 儲存：本機 SQLite (line_bot.db) — 取代 Upstash Redis，免外部服務
 
-ALLOWED_GROUP_ID 為空字串時 = 尚未鎖定群組，bot 會把收到的 source.groupId
-寫到 stdout，使用者從 log 抓出來填進 .env 再重啟鎖定。
+群組白名單（2026-05-27 multi-group 加入媽媽個人群後）：
+- ALLOWED_GROUP_IDS（複數，逗號分隔）= webhook gate 白名單；空 list = unlock mode 接受所有群（log only）
+- ALLOWED_GROUP_ID（單數，legacy）= 舊單群設定；若 ALLOWED_GROUP_IDS 未設則自動 seed 進 list
+- FAMILY_GROUP_ID（顯式）= 「家族主群」識別，給 family-only push script 用；不從 ALLOWED_GROUP_IDS[0]
+  positional 衍生，避免 reorder 環境變數靜默把家族專屬內容推到 mom 群
 """
 
 from __future__ import annotations
 
-from pydantic import field_validator, model_validator
+from pydantic import Field, computed_field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _parse_csv(raw: str) -> list[str]:
+    """Comma-CSV → list[str] with strip + dedup + drop-empty."""
+    if not raw:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for token in raw.split(","):
+        gid = token.strip()
+        if gid and gid not in seen:
+            seen.add(gid)
+            out.append(gid)
+    return out
 
 
 class Settings(BaseSettings):
@@ -34,9 +51,38 @@ class Settings(BaseSettings):
     # ── SQLite（本地持久化檔案）───────────────────────────────────────────────
     sqlite_path: str = "line_bot.db"
 
-    # ── 綁定單一群組（Q6=B）─────────────────────────────────────────────────
-    # 空字串 = 尚未鎖定，收到訊息時只會 log group id，不會呼叫 LLM
+    # ── 群組白名單 ─────────────────────────────────────────────────────────
+    # allowed_group_id（單數，legacy real field）：保留為 mutable 欄位，現有 5 個
+    # test file 直接賦值（conftest.py / test_handlers.py / test_silent_drop.py /
+    # test_regression.py / test_extra_coverage.py）才不會壞。空字串 = 尚未鎖定。
     allowed_group_id: str = ""
+
+    # allowed_group_ids_raw（單一 csv str）：env `ALLOWED_GROUP_IDS` raw 值；real list
+    # 走 `allowed_group_ids` @computed_field 衍生。**為何拆兩個**：pydantic-settings 2.6
+    # 對 `list[str]` field 強制 JSON decode（看到 `Cxxx` 而非 `["Cxxx"]` 就 crash），
+    # 沒有 NoDecode marker（2.7+ 才有）。Workaround：raw 用 str 接 env，computed_field
+    # 衍生 list。
+    allowed_group_ids_raw: str = Field(default="", validation_alias="ALLOWED_GROUP_IDS")
+
+    # family_group_id：顯式「家族主群」識別。給 family-only push script 讀
+    # （feedback_push / ptt_alert / family_interest / weekly_review / monthly_highlight
+    # / process_feedback / announce_finance_view / line_bot_update_push / weekly_summary
+    # / weekly_retro），避免 positional `[0]` anti-pattern。空字串時自動 fall back 到
+    # legacy `ALLOWED_GROUP_ID`（也不會 fall back 到 allowed_group_ids[0] — reviewer 兩位
+    # 都警告 positional fragility）。
+    family_group_id: str = ""
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def allowed_group_ids(self) -> list[str]:
+        """webhook gate 真實用的白名單。空 list = unlock mode（接受所有群，僅 log group_id）。
+        優先用 `ALLOWED_GROUP_IDS`（csv）解析；若空且 legacy `ALLOWED_GROUP_ID` 有值，
+        自動 seed 進 list 維持 backward compat。"""
+        if self.allowed_group_ids_raw:
+            return _parse_csv(self.allowed_group_ids_raw)
+        if self.allowed_group_id:
+            return [self.allowed_group_id]
+        return []
 
     # ── Bot 行為 ──────────────────────────────────────────────────────────────
     # 對話 context 保留幾輪（user + bot 各算一輪）
@@ -90,6 +136,16 @@ class Settings(BaseSettings):
                 f"(both are {self.gemini_model!r}) — otherwise rag_graph "
                 "allowlist collapses to 1 element AND 503/429 fallback never fires."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _seed_family_from_legacy(self):
+        # 若 family_group_id 未明示，fallback 到 allowed_group_id（單數 legacy 即 family）。
+        # **不** fallback 到 allowed_group_ids[0]：reviewer 兩位都警告 positional fragility
+        # ——env reorder = 家族專屬內容靜默推到 mom 群。要 multi-group 時 user 必須顯式設
+        # FAMILY_GROUP_ID。
+        if not self.family_group_id and self.allowed_group_id:
+            self.family_group_id = self.allowed_group_id
         return self
 
 

@@ -56,13 +56,13 @@ def test_30day_reminder_lifecycle(temp_db):
     )
     assert eid, "insert_event 應成功"
 
-    due_before = calendar_db.list_due_for_reminder(days_ahead=30)
+    due_before = calendar_db.list_due_for_reminder("GRP_TEST", days_ahead=30)
     assert any(e["event_id"] == eid for e in due_before), (
         "30 天後 event 應出現在 list_due_for_reminder(30)"
     )
 
-    calendar_db.mark_reminded(eid, days_ahead=30)
-    due_after = calendar_db.list_due_for_reminder(days_ahead=30)
+    calendar_db.mark_reminded(eid, days_ahead=30, group_id="GRP_TEST")
+    due_after = calendar_db.list_due_for_reminder("GRP_TEST", days_ahead=30)
     assert not any(e["event_id"] == eid for e in due_after), (
         "mark_reminded(30) 後不應再出現"
     )
@@ -79,11 +79,11 @@ def test_7day_reminder_lifecycle(temp_db):
     )
     assert eid
 
-    due_before = calendar_db.list_due_for_reminder(days_ahead=7)
+    due_before = calendar_db.list_due_for_reminder("GRP_TEST", days_ahead=7)
     assert any(e["event_id"] == eid for e in due_before)
 
-    calendar_db.mark_reminded(eid, days_ahead=7)
-    due_after = calendar_db.list_due_for_reminder(days_ahead=7)
+    calendar_db.mark_reminded(eid, days_ahead=7, group_id="GRP_TEST")
+    due_after = calendar_db.list_due_for_reminder("GRP_TEST", days_ahead=7)
     assert not any(e["event_id"] == eid for e in due_after)
 
 
@@ -98,7 +98,7 @@ def test_update_event_date_resets_30d_and_7d_reminded(temp_db):
     )
 
     for offset in calendar_db.REMINDER_OFFSETS:
-        calendar_db.mark_reminded(eid, days_ahead=offset)
+        calendar_db.mark_reminded(eid, days_ahead=offset, group_id="GRP_TEST")
 
     new_date = (date.today() + timedelta(days=45)).isoformat()
     ok = calendar_db.update_event_date(eid, new_date)

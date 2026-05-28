@@ -93,13 +93,13 @@ def test_due_for_reminder_only_picks_7days_out(tmp_calendar_db):
     eid_7 = cd.insert_event(group_id="G1", title="A", event_date=seven)
     cd.insert_event(group_id="G1", title="B", event_date=eight)
 
-    due = cd.list_due_for_reminder(days_ahead=7)
+    due = cd.list_due_for_reminder("G1", days_ahead=7)
     assert len(due) == 1
     assert due[0]["event_id"] == eid_7
 
-    cd.mark_reminded(eid_7)
+    cd.mark_reminded(eid_7, days_ahead=7, group_id="G1")
     # mark 過後不再被掃到
-    assert cd.list_due_for_reminder(days_ahead=7) == []
+    assert cd.list_due_for_reminder("G1", days_ahead=7) == []
 
 
 def test_extractor_normalize_clamps_bad_date():
