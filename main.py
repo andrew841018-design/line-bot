@@ -985,7 +985,9 @@ def serve_genimg(filename: str):
 
 @app.post("/callback")
 async def callback(request: Request, x_line_signature: str = Header(None)):
-    body = (await request.body()).decode("utf-8")
+    # N3 fix (2026-05-30): errors="replace" 避免非 UTF-8 垃圾請求在驗章前就
+    # UnicodeDecodeError → 未處理的 500。簽章仍會擋掉偽造的合法訊息。
+    body = (await request.body()).decode("utf-8", errors="replace")
     if not x_line_signature:
         client = request.client.host if request.client else "?"
         logger.warning("missing x-line-signature header from %s body_len=%d", client, len(body))
@@ -1001,7 +1003,8 @@ async def callback(request: Request, x_line_signature: str = Header(None)):
         events = _parser.parse(body, x_line_signature)
     except InvalidSignatureError:
         logger.warning("invalid signature")
-        raise HTTPException(status_code=400, detail="invalid signature")
+        # N5 fix (2026-05-30): from None 斷開例外鏈，log 不再夾雜 InvalidSignatureError traceback
+        raise HTTPException(status_code=400, detail="invalid signature") from None
 
     print(f"[PARSED] event_count={len(events)}", flush=True)
     for event in events:
@@ -1152,6 +1155,15 @@ def _handle_event(event) -> None:
         "unknown message type %s group=%s — sending fallback reply",
         type(msg).__name__, group_id,
     )
+    # I7 fix (2026-05-30): 補 log_raw_message（其他分支都有，唯獨 catch-all 漏）。
+    # redelivery 去重靠 raw_messages，沒記 → 貼圖/位置等類型 redelivery 會被當「沒收過」
+    # 重複回覆；引用該訊息問後續問題也查不到原文。
+    try:
+        msg_id = getattr(msg, "id", None)
+        if msg_id:
+            memory.log_raw_message(group_id, msg_id, sender_user_id, f"[{type(msg).__name__}]")
+    except Exception as e:
+        logger.warning("log_raw_message for unknown msg type failed: %s", e)
     try:
         _save_pending_any(event, group_id, sender_user_id, msg)
     except Exception as e:
@@ -2254,13 +2266,14 @@ def _audio_asr_fallback(
         return
     user_input = f"{clean_text}\n\n（語音轉文字）{text}" if clean_text else text
     try:
-        import llm_router
-        reply = llm_router.fallback_chat(
+        # I2 fix (2026-05-30): llm_router 已於 2026-05-18 移除（import 會 ModuleNotFoundError
+        # → 被 except 吞掉 → 語音永遠不回覆）。改走 _llm_chat，與文字主鏈一致：
+        # quota 爆時內部自動退 lite_reply。
+        reply = _llm_chat(
             user_input,
-            context=memory.get_context(group_id),
-            facts=memory.top_facts(group_id),
-            persona_notes=_get_persona_notes(group_id),
-            group_id=group_id,
+            memory.get_context(group_id),
+            memory.top_facts(group_id),
+            _get_persona_notes(group_id),
         )
     except Exception as e:
         logger.warning("audio fallback chat failed: %s", e)
@@ -2740,10 +2753,21 @@ def _load_quota_state() -> None:
 
 
 def _save_quota_state() -> None:
-    """Atomic write 防 mid-write process kill 造成 quota state 損毀。"""
+    """Atomic write 防 mid-write process kill 造成 quota state 損毀。
+
+    I1 fix (2026-05-30): 用 tempfile.mkstemp 產唯一 tmp 名，不再用固定共享
+    '<file>.tmp' — 否則 uvicorn handler 與獨立 cron process 幾乎同時寫時，
+    兩者 os.replace 互搶會把寫到一半的 tmp 搬成正式檔 → JSON 損毀 → 解析失敗
+    → exhausted_until 歸 0 → 誤判 quota 已恢復 → 狂打已爆 Gemini。
+    """
+    import tempfile
+    tmp = None
     try:
-        tmp = f"{_QUOTA_STATE_FILE}.tmp"
-        with open(tmp, "w") as f:
+        fd, tmp = tempfile.mkstemp(
+            prefix=".quota_state.", suffix=".tmp",
+            dir=os.path.dirname(_QUOTA_STATE_FILE) or ".",
+        )
+        with os.fdopen(fd, "w") as f:
             _json.dump(
                 {
                     "exhausted_until_ts": _quota_exhausted_until_ts,
@@ -2753,6 +2777,11 @@ def _save_quota_state() -> None:
             )
         os.replace(tmp, _QUOTA_STATE_FILE)
     except Exception as e:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
         logger.warning("save quota state failed: %s", e)
 
 
@@ -2905,24 +2934,19 @@ def _save_pending_any(event, group_id: str, user_id: str | None, msg) -> None:
         else:
             return
 
-        data[group_id].append(entry)
-        _save_pending_explicit_raw(data)
+        # C1 fix (2026-05-30): 走 pending_store.add 單鎖 load+append+save，
+        # 不再 load 全 dict → append → save_full 整段覆寫（跨 process/thread lost-update）。
+        import pending_store as _ps
+        _ps.add(group_id, entry)
     except Exception as e:
         logger.warning("save pending any failed: %s", str(e)[:200])
 
 
 def _clear_pending_explicit(group_id: str) -> None:
-    data = _load_pending_explicit()
-    # 清掉該 group 所有 media 檔
-    for entry in data.get(group_id, []):
-        path = entry.get("media_path")
-        if path and os.path.exists(path):
-            try:
-                os.remove(path)
-            except Exception:
-                pass
-    data.pop(group_id, None)
-    _save_pending_explicit_raw(data)
+    # C1 fix (2026-05-30): 走 pending_store.clear_group 單鎖（含刪 media 檔），
+    # 不再 load 全 dict → pop → save_full 整段覆寫（會蓋掉別 group 並發寫入）。
+    import pending_store as _ps
+    _ps.clear_group(group_id)
 
 
 def _commit_pending_removal(group_id: str, msg_ids: list[str]) -> int:
@@ -2931,18 +2955,13 @@ def _commit_pending_removal(group_id: str, msg_ids: list[str]) -> int:
     """
     if not msg_ids:
         return 0
-    msg_id_set = set(msg_ids)
-    data = _load_pending_explicit()
-    items = data.get(group_id, [])
-    new_items = [it for it in items if it.get("message_id") not in msg_id_set]
-    removed = len(items) - len(new_items)
-    if removed == 0:
-        return 0
-    if not new_items:
-        data.pop(group_id, None)
-    else:
-        data[group_id] = new_items
-    _save_pending_explicit_raw(data)
+    # C1 fix (2026-05-30): 逐筆走 pending_store.remove_by_message_id 單鎖（idempotent），
+    # 不再 load 全 dict → filter → save_full 整段覆寫（跨 process lost-update）。
+    import pending_store as _ps
+    removed = 0
+    for mid in msg_ids:
+        if mid and _ps.remove_by_message_id(group_id, mid):
+            removed += 1
     return removed
 
 
@@ -3335,11 +3354,12 @@ def _drain_pending_for_group(group_id: str, source: str = "startup") -> bool:
                 processed_idx.update(idxs)
         except Exception as e:
             remaining = [it for i, it in enumerate(items) if i not in processed_idx]
+            # C1 fix (2026-05-30): 走 pending_store.replace_group 單鎖原子寫回，
+            # 不再 load 全 dict → 指派 → save_full 整段覆寫（會吃掉並發寫入）。
+            import pending_store as _ps
             if _is_quota_error(e):
                 _mark_quota_exhausted()
-                data = _load_pending_explicit()
-                data[group_id] = remaining
-                _save_pending_explicit_raw(data)
+                _ps.replace_group(group_id, remaining)
                 logger.warning(
                     "%s pending: quota re-exhausted, saved %d remaining for group=%s",
                     source, len(remaining), group_id,
@@ -3347,9 +3367,7 @@ def _drain_pending_for_group(group_id: str, source: str = "startup") -> bool:
                 return True
             err_str = str(e)
             if remaining:
-                data = _load_pending_explicit()
-                data[group_id] = remaining
-                _save_pending_explicit_raw(data)
+                _ps.replace_group(group_id, remaining)
                 logger.warning(
                     "%s pending: push failed (%s), saved %d remaining for group=%s",
                     source, err_str[:80], len(remaining), group_id,
@@ -4559,13 +4577,8 @@ def _pop_pending_for_piggyback(group_id: str) -> str | None:
             return None
         if not reply_text:
             return None
-        processed_ids = {it.get("message_id") for it in batch}
-        pending[group_id] = [
-            it for it in items if it.get("message_id") not in processed_ids
-        ]
-        if not pending[group_id]:
-            del pending[group_id]
-        _save_pending_explicit_raw(pending)
+        # C1 fix (2026-05-30): 逐筆走單鎖移除，不再整段 save_full 覆寫。
+        _commit_pending_removal(group_id, [it.get("message_id") for it in batch])
         orig_preview = original[:300] + ("…" if len(original) > 300 else "")
         reply_preview = _md_to_line(reply_text)
         return f"📬 補回之前漏掉的訊息\n\n原文：\n{orig_preview}\n\n回應：\n{reply_preview}"
@@ -4594,18 +4607,9 @@ def _pop_pending_for_piggyback(group_id: str) -> str | None:
         if not reply_text or not reply_text.strip():
             return None
 
-        # 移出 pending + 刪 media_path 檔
-        processed_ids = {file_item.get("message_id")}
-        pending[group_id] = [
-            it for it in items if it.get("message_id") not in processed_ids
-        ]
-        if not pending[group_id]:
-            del pending[group_id]
-        _save_pending_explicit_raw(pending)
-        try:
-            os.remove(media_path)
-        except Exception as e:
-            logger.warning("drain pending file: remove media_path failed: %s", e)
+        # C1 fix (2026-05-30): 走單鎖移除（remove_by_message_id 會一併刪 media 檔），
+        # 不再整段 save_full 覆寫 + 手動 os.remove。
+        _commit_pending_removal(group_id, [file_item.get("message_id")])
 
         reply_preview = _md_to_line(reply_text)[:1500]
         return f"📬 補回之前漏掉的檔案 [{file_name}]\n\n回應：\n{reply_preview}"
@@ -4652,18 +4656,9 @@ def _pop_pending_for_piggyback(group_id: str) -> str | None:
     if not reply_text or not reply_text.strip():
         return None
 
-    # 移出 pending + 刪 media file
-    processed_ids = {img_item.get("message_id")}
-    pending[group_id] = [
-        it for it in items if it.get("message_id") not in processed_ids
-    ]
-    if not pending[group_id]:
-        del pending[group_id]
-    _save_pending_explicit_raw(pending)
-    try:
-        os.remove(media_path)
-    except Exception as e:
-        logger.warning("drain pending image: remove media_path failed: %s", e)
+    # C1 fix (2026-05-30): 走單鎖移除（remove_by_message_id 會一併刪 media 檔），
+    # 不再整段 save_full 覆寫 + 手動 os.remove。
+    _commit_pending_removal(group_id, [img_item.get("message_id")])
 
     reply_preview = _md_to_line(reply_text)[:1500]
     return f"📷 補回之前漏掉的圖片\n\n圖片分析：\n{reply_preview}"

@@ -73,14 +73,29 @@ def _load_usage() -> dict:
 
 
 def _save_usage(data: dict) -> None:
-    """Atomic write 防 mid-write process kill 造成 usage counter 損毀。"""
+    """Atomic write 防 mid-write process kill 造成 usage counter 損毀。
+
+    I1 fix (2026-05-30): 用 tempfile.mkstemp 產唯一 tmp 名，不再用固定共享
+    '<file>.tmp' — 否則 uvicorn handler 與 cron process 幾乎同時寫時，os.replace
+    互搶會把寫到一半的 tmp 搬成正式檔 → usage JSON 損毀 → _load_usage 回 {} →
+    當日用量歸 0 → bot 以為額度全滿 → 對已爆 Gemini 連續打 429。
+    """
+    import tempfile
+    tmp = None
     try:
-        tmp = f"{_USAGE_FILE}.tmp"
-        with open(tmp, "w") as f:
+        fd, tmp = tempfile.mkstemp(
+            prefix=".gemini_usage.", suffix=".tmp",
+            dir=os.path.dirname(_USAGE_FILE) or ".",
+        )
+        with os.fdopen(fd, "w") as f:
             json.dump(data, f)
         os.replace(tmp, _USAGE_FILE)
     except Exception:
-        pass
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def _track_usage(response) -> None:
@@ -850,7 +865,12 @@ _MIN_CHARS_NEWS_CASE = 350
 _MIN_URLS_NEWS_CASE = 3
 _MIN_DOMAINS_NEWS_CASE = 2
 
-_URL_DOMAIN_RE = re.compile(r"https?://([^/\s)]+)", re.IGNORECASE)
+# N1 fix (2026-05-30): 排除中文標點（，。、；：！？「」）與全形括號。原 [^/\s)]+ 在
+# URL 後緊接中文逗號（無空格，中文很常見）時會把兩個 URL 併成一個假 domain token
+# （'gov.tw，https:'）→ unique-domain 計數誤判 → 規則 0 品質 gate false +/-。
+_URL_DOMAIN_RE = re.compile(
+    r"https?://([^/\s)，。、；：！？「」（）]+)", re.IGNORECASE
+)
 
 
 def _has_sectional_structure(reply: str) -> tuple[bool, list[str]]:

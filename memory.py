@@ -35,6 +35,10 @@ def _conn() -> sqlite3.Connection:
     conn = sqlite3.connect(_DB_PATH, isolation_level=None, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+    # I3 fix (2026-05-30): 跨 process 寫同一 db（uvicorn handler thread + 獨立 cron
+    # process 如 reminder_push.py）時，沒 busy_timeout 會立刻 raise "database is locked"。
+    # 設 5s 讓 writer 等鎖釋放而非直接炸。
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
