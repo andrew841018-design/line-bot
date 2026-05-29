@@ -47,4 +47,4 @@ if __name__ == "__main__":
     import sys
 
     msg = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "測試提醒"
-    send_dm(msg)
+    sys.exit(0 if send_dm(msg) else 1)
