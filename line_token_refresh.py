@@ -46,10 +46,12 @@ def _load_cache() -> dict:
 
 
 def _save_cache(d: dict) -> None:
-    """原子寫入。"""
+    """原子寫入。檔案含活 LINE token，必須 0600 防本機 multi-user / backup tool 洩漏。"""
     tmp = CACHE_FILE.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(d, ensure_ascii=False, indent=2))
+    os.chmod(tmp, 0o600)
     os.replace(tmp, CACHE_FILE)
+    os.chmod(CACHE_FILE, 0o600)
 
 
 def refresh_token() -> tuple[bool, str]:
@@ -72,12 +74,12 @@ def refresh_token() -> tuple[bool, str]:
             timeout=10,
         )
         if r.status_code != 200:
-            return False, f"HTTP {r.status_code}: {r.text[:200]}"
+            return False, f"HTTP {r.status_code} (body redacted)"
         data = r.json()
         token = data.get("access_token")
         expires_in = int(data.get("expires_in", 900))
         if not token:
-            return False, f"no access_token in response: {r.text[:200]}"
+            return False, "no access_token in response (body redacted)"
         cache = {
             "access_token": token,
             "expires_at": int(time.time()) + expires_in,

@@ -1012,10 +1012,12 @@ async def callback(request: Request, x_line_signature: str = Header(None)):
             flush=True,
         )
         # 把整個 event 物件 dump 出來看有沒有什麼隱藏欄位
-        try:
-            print(f"[EVENT_DUMP] {event.model_dump_json()}", flush=True)
-        except Exception:
-            print(f"[EVENT_DUMP] (could not dump) repr={event!r}", flush=True)
+        # 含 user_id / message text / group_id PII；預設關閉，設 DEBUG_EVENT_DUMP=1 才印
+        if os.getenv("DEBUG_EVENT_DUMP") == "1":
+            try:
+                print(f"[EVENT_DUMP] {event.model_dump_json()}", flush=True)
+            except Exception:
+                print(f"[EVENT_DUMP] (could not dump) repr={event!r}", flush=True)
         try:
             _handle_event(event)
         except Exception as e:
@@ -1026,13 +1028,14 @@ async def callback(request: Request, x_line_signature: str = Header(None)):
 def _handle_event(event) -> None:
     # MemberJoinedEvent / MemberLeftEvent: 其他成員進出群組
     if isinstance(event, (MemberJoinedEvent, MemberLeftEvent)):
-        try:
-            print(
-                f"[MEMBER_EVT] {type(event).__name__} {event.model_dump_json()}",
-                flush=True,
-            )
-        except Exception:
-            pass
+        if os.getenv("DEBUG_EVENT_DUMP") == "1":
+            try:
+                print(
+                    f"[MEMBER_EVT] {type(event).__name__} {event.model_dump_json()}",
+                    flush=True,
+                )
+            except Exception:
+                pass
         return
 
     # 只處理群組裡的 message
@@ -2737,8 +2740,10 @@ def _load_quota_state() -> None:
 
 
 def _save_quota_state() -> None:
+    """Atomic write 防 mid-write process kill 造成 quota state 損毀。"""
     try:
-        with open(_QUOTA_STATE_FILE, "w") as f:
+        tmp = f"{_QUOTA_STATE_FILE}.tmp"
+        with open(tmp, "w") as f:
             _json.dump(
                 {
                     "exhausted_until_ts": _quota_exhausted_until_ts,
@@ -2746,6 +2751,7 @@ def _save_quota_state() -> None:
                 },
                 f,
             )
+        os.replace(tmp, _QUOTA_STATE_FILE)
     except Exception as e:
         logger.warning("save quota state failed: %s", e)
 

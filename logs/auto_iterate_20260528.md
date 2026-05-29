@@ -128,3 +128,35 @@ INFO:     2001:b011:15:72db:54cf:69b7:f916:106:0 - "GET /health HTTP/1.1" 200 OK
 ```
 [12:29:18] ## ✅ 全綠，無需迭代
 [12:29:18] ## Step 7: 仍有未 commit 變更，catch-all 上傳
+[main b15cadf] auto iterate 20260528 (catch-all)
+ 17 files changed, 429 insertions(+), 108 deletions(-)
+ create mode 100644 logs/auto_iterate_20260528.md
+To github.com:andrew841018-design/line-bot.git
+   1b90c72..b15cadf  main -> main
+[12:29:21] ## Step 8: restart uvicorn
+[12:29:29] /health: {"status":"ok","gemini_model":"gemini-2.5-flash","gemini_light_model":"gemini-2.5-flash-lite","group_locked":true}
+2026-05-28 12:29:32,998 INFO AFC is enabled with max remote calls: 10.
+2026-05-28 12:29:33,877 INFO HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+2026-05-28 12:29:33,905 INFO AFC is enabled with max remote calls: 10.
+2026-05-28 12:29:36,182 INFO HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent "HTTP/1.1 200 OK"
+======================================================================
+LINE bot preflight @ 2026-05-28T12:29:29
+======================================================================
+  [✓]  1. uvicorn process alive
+  [✓]  2. local /health 200
+  [✓]  3. cloudflared process alive
+  [✓]  4. cloudflared URL stash 可讀 + 安全 — url=https://samples-evaluated-rochester-defend.trycloudflare.com age=4631s
+  [✓]  5. cloudflared metrics 內部 URL 對 stash — metrics 200 但 ha_connections 沒露
+  [✓]  6. external https://samples-evaluated-rochester-defend.trycloudflare.com/health 200 — attempt=1
+  [✓]  7. /callback no-sig → 400 missing
+  [✓]  8. LINE token /v2/bot/info 200
+  [✓]  9. LINE webhook URL 對齊 cloudflared
+  [✓] 10. LINE → cloudflared → /callback E2E
+  [✓] 11. Gemini main probe
+  [✓] 12. Gemini lite probe
+  [✓] 13. SQLite integrity + WAL checkpoint
+  [✓] 14. pending file JSON load — groups=1 entries=4
+----------------------------------------------------------------------
+PREFLIGHT [PASS] critical=12/12 info=2/2 elapsed=6.8s
+[12:29:36] preflight exit=0 (0=pass, 1=critical, 2=info-only, 3=infra)
+[12:29:36] ===== 結束 =====

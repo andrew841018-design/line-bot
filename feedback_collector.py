@@ -62,8 +62,10 @@ def in_feedback_window() -> bool:
 
 
 def record_push_time() -> None:
-    """推播問題後呼叫，記錄時間戳供 weight 計算。"""
-    _STATE_FILE.write_text(json.dumps({"push_ts": time.time()}))
+    """推播問題後呼叫，記錄時間戳供 weight 計算。Atomic write 防 mid-write process kill。"""
+    tmp = _STATE_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({"push_ts": time.time()}))
+    tmp.replace(_STATE_FILE)
     logger.info("[Feedback] push time recorded")
 
 
@@ -91,7 +93,9 @@ def collect_message(user_id: str, text: str) -> None:
             "weight": weight,
         }
     )
-    _PENDING_FILE.write_text(json.dumps(pending, ensure_ascii=False, indent=2))
+    tmp = _PENDING_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(pending, ensure_ascii=False, indent=2))
+    tmp.replace(_PENDING_FILE)
     logger.info("[Feedback] collected weight=%d text=%r", weight, text[:50])
 
 
@@ -100,7 +104,9 @@ def load_pending() -> list[dict]:
 
 
 def clear_pending() -> None:
-    _PENDING_FILE.write_text("[]")
+    tmp = _PENDING_FILE.with_suffix(".json.tmp")
+    tmp.write_text("[]")
+    tmp.replace(_PENDING_FILE)
     logger.info("[Feedback] pending_feedback.json cleared")
 
 

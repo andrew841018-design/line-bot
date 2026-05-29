@@ -73,9 +73,12 @@ def _load_usage() -> dict:
 
 
 def _save_usage(data: dict) -> None:
+    """Atomic write 防 mid-write process kill 造成 usage counter 損毀。"""
     try:
-        with open(_USAGE_FILE, "w") as f:
+        tmp = f"{_USAGE_FILE}.tmp"
+        with open(tmp, "w") as f:
             json.dump(data, f)
+        os.replace(tmp, _USAGE_FILE)
     except Exception:
         pass
 

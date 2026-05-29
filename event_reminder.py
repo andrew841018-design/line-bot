@@ -20,8 +20,25 @@ load_dotenv(Path(__file__).parent / ".env")
 sys.path.insert(0, str(Path(__file__).parent))
 
 import requests  # noqa: E402
+from requests.adapters import HTTPAdapter  # noqa: E402
+from urllib3.util.retry import Retry  # noqa: E402
 
 import calendar_db  # noqa: E402
+
+# 2026-05-29 加 retry 防 transient 5xx 一棒打死（GP2#2）
+# Retry 重試 500/502/503/504；429 monthly quota 不重試（HTTPAdapter 預設只 retry 表列 status）
+_session = requests.Session()
+_session.mount(
+    "https://",
+    HTTPAdapter(
+        max_retries=Retry(
+            total=3,
+            backoff_factor=2,
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["POST"],
+        )
+    ),
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -84,7 +101,7 @@ def _push(text: str) -> bool:
         logger.error("missing TOKEN or GROUP_ID; skip push")
         return False
     try:
-        resp = requests.post(
+        resp = _session.post(
             _PUSH_URL,
             headers={
                 "Authorization": f"Bearer {token}",

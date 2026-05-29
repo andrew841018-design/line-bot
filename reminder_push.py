@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import time
 from datetime import datetime
 
 from linebot.v3.messaging import (
@@ -36,21 +37,44 @@ logging.basicConfig(
 logger = logging.getLogger("reminder_push")
 
 
-def _push_to_group(group_id: str, text: str) -> bool:
-    """推到 LINE 群組。失敗回 False。"""
+def _push_to_group(group_id: str, text: str, max_retries: int = 3) -> bool:
+    """推到 LINE 群組。失敗回 False。
+
+    2026-05-29 加 retry 防 transient 5xx（GP2#2）：
+      - 429（monthly quota / rate limit）：不重試，立即 False
+      - 其他 exception（5xx / network）：exponential backoff (1s/2s/4s) 重試
+    """
     cfg = Configuration(access_token=settings.line_channel_access_token)
-    try:
-        with ApiClient(cfg) as api_client:
-            MessagingApi(api_client).push_message(
-                PushMessageRequest(
-                    to=group_id,
-                    messages=[TextMessage(text=text[:4900])],
+    for attempt in range(max_retries):
+        try:
+            with ApiClient(cfg) as api_client:
+                MessagingApi(api_client).push_message(
+                    PushMessageRequest(
+                        to=group_id,
+                        messages=[TextMessage(text=text[:4900])],
+                    )
                 )
+            return True
+        except Exception as e:
+            err_str = str(e)
+            status = getattr(e, "status", None)
+            if status == 429 or "429" in err_str:
+                logger.warning("LINE push 429 quota (group=%s) — no retry", group_id)
+                return False
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt
+                logger.info(
+                    "LINE push fail (group=%s, attempt %d/%d), retry in %ds: %s",
+                    group_id, attempt + 1, max_retries, wait, err_str[:120],
+                )
+                time.sleep(wait)
+                continue
+            logger.warning(
+                "LINE push failed after %d attempts (group=%s): %s",
+                max_retries, group_id, err_str[:120],
             )
-        return True
-    except Exception as e:
-        logger.warning("LINE push failed (group=%s): %s", group_id, e)
-        return False
+            return False
+    return False
 
 
 def _decide_stage(r: dict, now: int) -> str | None:
