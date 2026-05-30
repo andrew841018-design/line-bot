@@ -1511,6 +1511,7 @@ output: {{"action": "看電影", ...下週三日期, "hour": 19, "minute": 0}}�
                 thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
         )
+        _track_usage(response)  # D1c: reminder 抽取也燒 Google quota，計入 usage 讓 reserve gate 看得到
         raw = _strip_code_fence((response.text or "").strip())
         if not raw or raw.lower() in ("null", "none"):
             return None
@@ -1528,6 +1529,12 @@ output: {{"action": "看電影", ...下週三日期, "hour": 19, "minute": 0}}�
         result["action"] = str(result["action"])[:50]
         return result
     except Exception as e:
+        err = str(e)
+        if "429" in err or "RESOURCE_EXHAUSTED" in err:
+            # R3: 429 不再靜默吞 → 計入失敗 quota + bare raise 保留原 SDK 字串，
+            # 讓 caller 用 _is_quota_error 判 PerDay 決定 mark exhausted + enqueue 補抽
+            _track_failed_request()
+            raise
         logger.info("extract_reminder failed (non-fatal): %s", e)
         return None
 

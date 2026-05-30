@@ -123,6 +123,20 @@ def _init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_reminders_remind_at
                 ON reminders(group_id, status, remind_at);
+            CREATE TABLE IF NOT EXISTS pending_reminder_extract (
+                pending_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id     TEXT NOT NULL,
+                user_id      TEXT NOT NULL DEFAULT '',
+                message_id   TEXT,
+                text         TEXT NOT NULL,
+                created_at   INTEGER NOT NULL,
+                retries      INTEGER NOT NULL DEFAULT 0,
+                status       TEXT NOT NULL DEFAULT 'pending'
+            );
+            CREATE INDEX IF NOT EXISTS idx_pending_reminder_status
+                ON pending_reminder_extract(status, created_at);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_reminder_msgid
+                ON pending_reminder_extract(message_id) WHERE message_id IS NOT NULL;
             CREATE TABLE IF NOT EXISTS kg_triples (
                 group_id    TEXT NOT NULL,
                 subject     TEXT NOT NULL,
@@ -777,6 +791,116 @@ def add_reminder(
             (group_id, user_id, action, remind_at, now, source_text),
         )
         return c.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+# ── Pending reminder extract（quota 爆時入隊、恢復後補抽，2026-05-30 加）──────────
+# forward-only：只存「當下 Gemini 不可用而無法抽取」的訊息。drain 從不重掃
+# raw_messages（否則重抽已 backfill 的舊訊息 → Gemini action 字串與手寫不同 →
+# 繞過 add_reminder 去重 → 製造重複）。
+
+
+def enqueue_pending_reminder(
+    group_id: str,
+    user_id: str,
+    text: str,
+    message_id: str | None = None,
+) -> int | None:
+    """quota 爆時把含日期+時間 hint 的訊息入隊。INSERT OR IGNORE（partial unique
+    message_id 去重）。回 pending_id；重複/失敗回 None。"""
+    import time
+    now = int(time.time())
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "INSERT OR IGNORE INTO pending_reminder_extract"
+            "(group_id, user_id, message_id, text, created_at, retries, status) "
+            "VALUES (?, ?, ?, ?, ?, 0, 'pending')",
+            (group_id, user_id, message_id, text, now),
+        )
+        if cur.rowcount == 0:
+            return None
+        return c.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def list_pending_reminder_retries(group_id: str, limit: int = 5) -> list[dict]:
+    """取該 group 待重抽的 pending（status='pending'，舊→新），上限 limit。"""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT pending_id, group_id, user_id, message_id, text, created_at, retries "
+            "FROM pending_reminder_extract "
+            "WHERE group_id = ? AND status = 'pending' "
+            "ORDER BY created_at LIMIT ?",
+            (group_id, limit),
+        ).fetchall()
+    return [
+        {
+            "pending_id": r[0], "group_id": r[1], "user_id": r[2],
+            "message_id": r[3], "text": r[4], "created_at": r[5], "retries": r[6],
+        }
+        for r in rows
+    ]
+
+
+def claim_pending_reminder(pending_id: int) -> bool:
+    """Atomic claim：status pending→processing。回 True=搶到（rowcount==1）。
+    防 piggyback drain 與 cron worker 同時抽同一筆 → 重複 reminder。"""
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "UPDATE pending_reminder_extract SET status='processing' "
+            "WHERE pending_id = ? AND status = 'pending'",
+            (pending_id,),
+        )
+        return cur.rowcount == 1
+
+
+def mark_pending_reminder(pending_id: int, status: str) -> None:
+    """標記結果：'done'（已抽存）/'dropped'（非提醒、過期）。"""
+    with _lock, _conn() as c:
+        c.execute(
+            "UPDATE pending_reminder_extract SET status = ? WHERE pending_id = ?",
+            (status, pending_id),
+        )
+
+
+def release_pending_reminder(pending_id: int) -> None:
+    """重抽又撞 quota：retries+1 並退回 'pending' 等下輪 drain。"""
+    with _lock, _conn() as c:
+        c.execute(
+            "UPDATE pending_reminder_extract "
+            "SET retries = retries + 1, status='pending' WHERE pending_id = ?",
+            (pending_id,),
+        )
+
+
+def drop_stale_pending_reminders(max_age_sec: int, group_id: str | None = None) -> int:
+    """清超齡 pending（created_at < now-max_age）→ status='dropped'。回清掉筆數。
+    不寫任何 plaintext DLQ 檔（PII 只留 DB）。"""
+    import time
+    cutoff = int(time.time()) - max_age_sec
+    with _lock, _conn() as c:
+        if group_id is not None:
+            cur = c.execute(
+                "UPDATE pending_reminder_extract SET status='dropped' "
+                "WHERE status IN ('pending','processing') AND created_at < ? "
+                "AND group_id = ?",
+                (cutoff, group_id),
+            )
+        else:
+            cur = c.execute(
+                "UPDATE pending_reminder_extract SET status='dropped' "
+                "WHERE status IN ('pending','processing') AND created_at < ?",
+                (cutoff,),
+            )
+        return cur.rowcount
+
+
+def list_pending_reminder_groups() -> list[str]:
+    """回有待重抽 pending 的 distinct group_id（cron backstop 用）。"""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT DISTINCT group_id FROM pending_reminder_extract "
+            "WHERE status = 'pending'"
+        ).fetchall()
+    return [r[0] for r in rows]
 
 
 def list_pending_reminders(

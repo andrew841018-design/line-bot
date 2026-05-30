@@ -1108,6 +1108,13 @@ def _handle_event(event) -> None:
                 _maybe_capture_calendar_event(group_id, text)
             except Exception as e:
                 logger.warning("quota-path calendar capture failed: %s", e)
+            # (c) 2026-05-30: reminder 在 quota 爆時的真正丟失路徑就在這——
+            # _handle_text_message→_maybe_extract_reminder 要到 1124 後才跑，這裡
+            # return 後永遠到不了。入隊等額度恢復補抽（site 1，主路徑；helper 自包
+            # try/except，不會炸到下面的 _save_pending_any）。
+            _enqueue_reminder_if_candidate(
+                text, group_id, sender_user_id or "", msg.id
+            )
             # 落入 pending 路徑（不重複 log_raw_message）
             _save_pending_any(event, group_id, sender_user_id, msg)
         else:
@@ -1430,7 +1437,9 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
     # 自動偵測 reminder（2026-05-08：含日期+時間 hint 的訊息抽 action 存 DB）
     # 失敗 silent，不阻塞主流程
     sender_uid_for_reminder = getattr(event.source, "user_id", None) or ""
-    _maybe_extract_reminder(text, group_id, sender_uid_for_reminder)
+    _maybe_extract_reminder(
+        text, group_id, sender_uid_for_reminder, event.message.id
+    )
 
     # 1. 指令處理（指令不需要 @mention 也能用，方便管理）
     cmd_reply = _handle_command(group_id, text)
@@ -3440,6 +3449,13 @@ def _piggyback_drain_pending(group_id: str) -> None:
         if now - last < _PIGGYBACK_DRAIN_THROTTLE_SEC:
             return
 
+    # 2026-05-30: 順帶補 reminder pending（獨立 gate + atomic claim，與 reply drain
+    # 解耦——GP2 A1）。放在 reply pending 檢查前，沒 reply pending 的 group 也會補。
+    try:
+        _drain_pending_reminders(group_id)
+    except Exception as e:
+        logger.warning("reminder drain (piggyback) failed group=%s: %s", group_id, e)
+
     try:
         pending = _load_pending_explicit()
         if group_id not in pending or not pending[group_id]:
@@ -3486,6 +3502,19 @@ def _start_pending_retry_worker() -> None:
     def _worker():
         while True:
             _threading.Event().wait(_PENDING_RETRY_INTERVAL_SEC)
+            # reminder pending backstop（2026-05-30；獨立於 reply pending，沒人留言時
+            # 也能補。各 group 的 _drain_pending_reminders 自帶 quota gate + per-cycle cap）
+            try:
+                if not _quota_exhausted():
+                    for gid in memory.list_pending_reminder_groups():
+                        # 每個 group 前重檢 reserve gate：累計用量達 60% 門檻即 break，
+                        # 保 40% 額度給新訊息（Phase6 GP2 A1：per-group cap=5 在多
+                        # group 下單檢一次會破壞 reserve 不變式 + 餓死 reply drain）
+                        if not _has_enough_quota_for_retry():
+                            break
+                        _drain_pending_reminders(gid)
+            except Exception as e:
+                logger.warning("reminder pending backstop failed: %s", e)
             if not _load_pending_explicit():
                 continue
             if _quota_exhausted():
@@ -3788,10 +3817,92 @@ _REMINDER_TIME_HINT = re.compile(
 )
 
 
-def _maybe_extract_reminder(text: str, group_id: str, user_id: str = "") -> None:
+_REMINDER_DRAIN_CAP = 5  # GP2 D1b: 每次 drain 最多抽幾筆，攤平 backlog 不燒爆當天額度
+
+
+def _enqueue_reminder_if_candidate(
+    text: str, group_id: str, user_id: str, message_id: str | None
+) -> None:
+    """quota 爆時的 reminder 補救入隊：只對含日期+時間 hint 的訊息入隊，等額度恢復
+    由 _drain_pending_reminders 重抽（forward-only，絕不重掃 raw_messages）。失敗
+    silent、自包 try/except，絕不可炸掉 caller（GP2 S4-sec：site 1 緊鄰
+    _save_pending_any，炸了會連 reply pending 一起丟）。"""
+    try:
+        if not text or len(text) > 500:
+            return
+        if not (_REMINDER_DATE_HINT.search(text) and _REMINDER_TIME_HINT.search(text)):
+            return
+        memory.enqueue_pending_reminder(group_id, user_id, text, message_id)
+    except Exception as e:
+        logger.warning("_enqueue_reminder_if_candidate failed: %s", e)
+
+
+def _drain_pending_reminders(group_id: str, limit: int = _REMINDER_DRAIN_CAP) -> None:
+    """額度恢復後補抽該 group 的 pending reminder。
+
+    GP1 R1: today_iso 用每筆 created_at 還原，相對日期（明天/今晚）才不會對到 drain
+    當天。GP2 D1: _has_enough_quota_for_retry gate + per-cycle cap，避免燒爆當天 20 次
+    + 跨餓 reply drain。GP2 A2/S1: 用 DB atomic claim（不重用 _try_acquire_drain_slot，
+    那 key 無 namespace 會 starve reply drain）。
+    """
+    if _quota_exhausted() or not _has_enough_quota_for_retry():
+        return
+    from datetime import datetime as _dt
+    try:
+        memory.drop_stale_pending_reminders(_PENDING_MAX_AGE_SEC, group_id)
+        rows = memory.list_pending_reminder_retries(group_id, limit=limit)
+    except Exception as e:
+        logger.warning("drain reminders: list failed group=%s: %s", group_id, e)
+        return
+    for row in rows:
+        pid = row["pending_id"]
+        if not memory.claim_pending_reminder(pid):  # atomic claim：搶不到表示別的 drain 在處理
+            continue
+        try:
+            # R1: 用訊息「當時」的 created_at 還原 today_iso，解相對日期
+            today_iso = _dt.fromtimestamp(row["created_at"]).strftime("%Y-%m-%d %A")
+            result = gemini_client.extract_reminder(row["text"], today_iso=today_iso)
+        except Exception as e:
+            if _is_quota_error(e):
+                _mark_quota_exhausted()
+                memory.release_pending_reminder(pid)
+                break  # 額度又爆 → 停本輪，剩下的留待下次
+            memory.release_pending_reminder(pid)  # transient 429 / 其他 → 退回等下輪
+            continue
+        if result is None:
+            memory.mark_pending_reminder(pid, "dropped")  # Gemini 判定非提醒
+            continue
+        try:
+            remind_dt = _dt(
+                int(result["year"]), int(result["month"]), int(result["day"]),
+                int(result["hour"]), int(result["minute"]),
+            )
+        except (ValueError, KeyError, TypeError):
+            memory.mark_pending_reminder(pid, "dropped")
+            continue
+        remind_at = int(remind_dt.timestamp())
+        if remind_at < _dt.now().timestamp() - 3600:  # 抽出來已過期
+            memory.mark_pending_reminder(pid, "dropped")
+            continue
+        rid = memory.add_reminder(
+            group_id, row["user_id"], result["action"], remind_at,
+            source_text=row["text"][:200],
+        )
+        memory.mark_pending_reminder(pid, "done")
+        if rid:
+            logger.info(
+                "reminder drained: rid=%d action=%r at=%s",
+                rid, result["action"], remind_dt.strftime("%Y-%m-%d %H:%M"),
+            )
+
+
+def _maybe_extract_reminder(
+    text: str, group_id: str, user_id: str = "", message_id: str | None = None
+) -> None:
     """偵測 user 訊息中的時間性提醒事項，存進 reminders table。失敗 silent。
 
     流程：regex pre-filter → Gemini light 抽取 → memory.add_reminder
+    quota 爆時 extract_reminder raise 429 → 入隊 pending 等恢復補抽（site 2）。
     """
     if not text or len(text) > 500:
         return
@@ -3802,6 +3913,10 @@ def _maybe_extract_reminder(text: str, group_id: str, user_id: str = "") -> None
     try:
         result = gemini_client.extract_reminder(text)
         if result is None:
+            # TODO(deferred, Phase6 GP-A): None 同時涵蓋「Gemini 判非提醒」與
+            # 「5xx/timeout 被 extract_reminder 吞成 None」。後者其實該入隊補抽
+            # （目前 silent drop）。未來可讓 extract_reminder 對非 429 transient
+            # 也 raise，這裡比照 429 入隊。本次 scope 限 429 quota 丟失。
             return
         # 算 remind_at（local timezone）
         from datetime import datetime as _dt
@@ -3829,7 +3944,15 @@ def _maybe_extract_reminder(text: str, group_id: str, user_id: str = "") -> None
                 rid, result["action"], remind_dt.strftime("%Y-%m-%d %H:%M"),
             )
     except Exception as e:
-        logger.warning("_maybe_extract_reminder failed: %s", e)
+        if _is_quota_error(e):
+            # site 2 (intra-request flip): 日額度爆 → mark + 入隊等恢復補抽
+            _mark_quota_exhausted()
+            _enqueue_reminder_if_candidate(text, group_id, user_id, message_id)
+        elif "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+            # transient per-minute 429 → 入隊但不 mark（不可壓死全天額度）
+            _enqueue_reminder_if_candidate(text, group_id, user_id, message_id)
+        else:
+            logger.warning("_maybe_extract_reminder failed: %s", e)
 
 
 # ── Command 處理 ──────────────────────────────────────────────────────────────
