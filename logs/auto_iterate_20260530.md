@@ -135,3 +135,13 @@ INFO:     147.92.149.168:0 - "POST /callback HTTP/1.1" 200 OK
 - 若 FastAPI 升級後 `on_event` 真的 removed，需把 main.py:115/3397/3535 三處 startup hook 改成 `lifespan` async context manager
 - 觀察 LINE 月配額重設後（每月 1 號）`drain pending` 是否有 backlog 一次推爆 → 看是否需 rate-limit drain
 - `gemini_usage.json.tmp` 被刪是 atomic write 後 cleanup 的正常產物（22c36eb 那輪修的），未來 git status 出現它再被刪都不用慌
+完成。`82b1687` 已 push origin main。
+
+**本輪摘要**：
+- pyflakes 3 條清零：`test_pending_concurrency_fix.py` 未使用的 `os`/`threading` import + `test_pending_reminder.py:132` 未使用的 `rems` 變數
+- pytest 766 全綠（112s），無 regression
+- catch-all 收進 working tree 其他改動（event_reminder.py 的 @mention 推播 + 一次性問媽媽時間 / runtime state files）
+- 24h quality violations 都是歷史 correction（unix ts 落在 3-4 月），「影片摘要必條列」規則已存在於 `gemini_client.py:512 _RULE_VIDEO_SUMMARY` 不需新增
+- log 結尾已追加「本輪總結」段（修了什麼 / 剩下什麼 / 下次該關注什麼）
+[12:35:54] iter 1 後 pytest 全綠，提早退出
+[12:35:55] ## Step 7: 仍有未 commit 變更，catch-all 上傳
