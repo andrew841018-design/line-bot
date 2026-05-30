@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -95,7 +96,15 @@ def _format_event(e: dict, offset: int = 7) -> str:
     )
 
 
-def _push(text: str) -> bool:
+# 2026-05-29 防 PII 外洩：LINE 失敗 response 理論上只 echo 屬性路徑、不 echo 值，
+# 但仍 defense-in-depth 把任何 LINE userId（U + 32 hex）遮成 U***（GP2 review 1b）。
+_UID_RE = re.compile(r"U[0-9a-f]{32}")
+
+
+def _post(messages: list) -> bool:
+    """共用底層推播：組好的 messages list → LINE push API。
+    token / GROUP_ID 缺失或非 200 回 False；失敗 log 遮蔽 userId 防 PII 外洩。
+    （_push / _push_mention 共用，遮蔽邏輯只寫一處 — GP2 DRY review）"""
     token = _get_token()
     if not token or not GROUP_ID:
         logger.error("missing TOKEN or GROUP_ID; skip push")
@@ -107,16 +116,67 @@ def _push(text: str) -> bool:
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
             },
-            json={"to": GROUP_ID, "messages": [{"type": "text", "text": text}]},
+            json={"to": GROUP_ID, "messages": messages},
             timeout=10,
         )
         if resp.status_code == 200:
             return True
-        logger.warning("LINE push failed %d: %s", resp.status_code, resp.text[:300])
+        logger.warning(
+            "LINE push failed %d: %s",
+            resp.status_code,
+            _UID_RE.sub("U***", resp.text[:300]),
+        )
         return False
     except Exception as e:
         logger.warning("LINE push exception: %s", e)
         return False
+
+
+def _push(text: str) -> bool:
+    return _post([{"type": "text", "text": text}])
+
+
+def _push_mention(text_template: str, placeholder: str, user_id: str) -> bool:
+    """textV2 + substitution 真 @mention 推播（會跳通知給被標記者）。
+    text_template 內用半形 {placeholder} 當佔位符；勿放其他非佔位符的半形 {}
+    （LINE 會把半形 {} 內的字當佔位符解析）。"""
+    return _post(
+        [
+            {
+                "type": "textV2",
+                "text": text_template,
+                "substitution": {
+                    placeholder: {
+                        "type": "mention",
+                        "mentionee": {"type": "user", "userId": user_id},
+                    }
+                },
+            }
+        ]
+    )
+
+
+# ── 2026-05-29 one-off（user directive）──────────────────────────────────────
+# 「看醫生外科」6/02 這筆事件 DB 時間 08:00 與其他記錄 13:00 兜不攏 → 不自己猜，
+# T-1（6/01）@媽媽 直接問本人確認。她回覆後寫回正確時間 + 移除這整段（含 .env MOM_USER_ID）。
+# 只在 offset==1 問一次：避免 T-3/T-2/T-1 三 offset 各問一次（每 offset idempotency 獨立，GP1 Q3）。
+# 其他 offset 對這筆事件直接 skip — 不發可能是錯誤時間的標準提醒。
+# ⚠️ 單一推播視窗：只在 6/01(T-1) 推一次；6/02 是 offset 0、不在 REMINDER_OFFSETS → 不會重列。
+#    若 6/01 推失敗（如 429）無自動 retry（下方 L217「at-least-once」註解對此 one-off 不成立）→ 需人工 6/01 兜底確認。
+_ASK_MOM_EVENT_IDS = {"a653382f7a494f509f21c5e8c8462b19"}
+_ASK_MOM_OFFSET = 1
+_ASK_MOM_PLACEHOLDER = "mom"
+_ASK_MOM_TEXT = (
+    "{mom}\n"
+    "提醒一下～6/2(二) 要看外科 陳晉興醫師（外科8診）\n"
+    "是早上 8:00 還是下午 1:00 呀？跟我說我幫你記正確 🙏"
+)
+# mention 投遞失敗 / MOM_USER_ID 未設 → fallback 純文字（仍把問題送出，不 silent drop，GP2 #6）
+_ASK_MOM_TEXT_PLAIN = (
+    "媽媽\n"
+    "提醒一下～6/2(二) 要看外科 陳晉興醫師（外科8診）\n"
+    "是早上 8:00 還是下午 1:00 呀？跟我說我幫你記正確 🙏"
+)
 
 
 def main() -> int:
@@ -133,8 +193,22 @@ def main() -> int:
             continue
         total_due += len(events)
         for e in events:
-            text = _format_event(e, offset)
-            if _push(text):
+            if e["event_id"] in _ASK_MOM_EVENT_IDS:
+                # one-off：只在 T-1 @媽媽 問時間一次；其他 offset 對這筆事件 skip
+                if offset != _ASK_MOM_OFFSET:
+                    continue
+                mom_id = os.environ.get("MOM_USER_ID")
+                pushed = (
+                    _push_mention(_ASK_MOM_TEXT, _ASK_MOM_PLACEHOLDER, mom_id)
+                    if mom_id
+                    else False
+                )
+                if not pushed:
+                    # mention 失敗（userId 未設 / 非 200）→ fallback 純文字，至少送達
+                    pushed = _push(_ASK_MOM_TEXT_PLAIN)
+            else:
+                pushed = _push(_format_event(e, offset))
+            if pushed:
                 calendar_db.mark_reminded(e["event_id"], offset, GROUP_ID)
                 total_sent += 1
                 logger.info(

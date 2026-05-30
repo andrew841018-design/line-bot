@@ -6,8 +6,6 @@ I1 — _save_quota_state / gemini_client._save_usage 用固定共享 tmp 名 →
 這些 test 在「修正前」必須 FAIL（或暴露 race window），「修正後」PASS。
 Run: pytest test_pending_concurrency_fix.py -v
 """
-import os
-import threading
 import time
 
 import pending_store

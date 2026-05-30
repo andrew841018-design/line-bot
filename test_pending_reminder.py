@@ -129,7 +129,6 @@ def test_drain_success_adds_reminder(temp_db, monkeypatch):
     monkeypatch.setattr(main, "_has_enough_quota_for_retry", lambda: True)
     main._drain_pending_reminders("G1")
     assert memory.list_pending_reminder_retries("G1") == [], "成功後應離開 pending"
-    rems = memory.list_pending_reminders("G1") if hasattr(memory, "list_pending_reminders") else None
     # reminders 表應有一筆
     with memory._conn() as c:
         n = c.execute("SELECT COUNT(*) FROM reminders WHERE action='開會'").fetchone()[0]
