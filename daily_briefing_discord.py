@@ -1144,7 +1144,13 @@ def _summarize_cramer_zh(slug: str) -> str:
         from google import genai
         from google.genai import types
 
-        client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+        # 優先用獨立 GCP project 的 key（GEMINI_CRAMER_API_KEY）與 line_bot 即時回覆/
+        # suggestions 共用的 GEMINI_API_KEY 做 quota 隔離；未設則 fallback 共用 key（向後相容）。
+        # 註：Gemini free tier quota 綁 GCP project，故隔離需「不同 project」的 key 才有效。
+        _cramer_key = os.getenv("GEMINI_CRAMER_API_KEY")
+        client = genai.Client(api_key=_cramer_key or os.getenv("GEMINI_API_KEY"))
+        if not _cramer_key:
+            print("[cramer] 用共用 GEMINI_API_KEY（未設 GEMINI_CRAMER_API_KEY 隔離）", file=sys.stderr)
         # 外部標題用三引號隔離 + 明示不可信，降低 prompt injection
         prompt = (
             "你是財經編輯。下面三引號內是 CNBC 一篇 Jim Cramer 評論的英文標題，"

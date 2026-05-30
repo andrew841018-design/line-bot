@@ -78,6 +78,7 @@ Verify → Review（快速）→ Commit/Push → LINE 推播判斷
 - 每天 LINE 群最多推一次；當天後續改動記到待推清單
 - Gemini 改 model 前先查 `project_gemini_model_selection.md`
 - 所有 token/key 從 `.env` 讀，不 hardcode，不 log
+- `GEMINI_CRAMER_API_KEY`（選配）：Cramer 每日摘要專屬，**獨立 GCP project** 的 key，與 `GEMINI_API_KEY` 做 quota 隔離（Gemini quota 綁 project，需不同 project 才有效）；未設則 fallback 共用 `GEMINI_API_KEY`，daily-briefing stderr 會印「用共用 key」提醒。見 `daily_briefing_discord.py` `_summarize_cramer_zh`。
 
 ### 規則 0（first-sentence-take 強制）
 （2026-05-04 加，補對 echo opener / 空附和的零容忍）
