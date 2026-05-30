@@ -1159,6 +1159,7 @@ def _summarize_cramer_zh(slug: str) -> str:
             "用繁體中文寫 1 句核心論點（不超過 40 字），直接給觀點，"
             "不要 echo 原標題、不要加引號或多餘前綴。"
         )
+        quota_hit = False
         for model_name in ("gemini-2.5-flash-lite", "gemini-2.5-flash"):
             try:
                 resp = client.models.generate_content(
@@ -1170,8 +1171,21 @@ def _summarize_cramer_zh(slug: str) -> str:
                 if txt:
                     return txt
             except Exception as e:
-                if "429" not in str(e) and "RESOURCE_EXHAUSTED" not in str(e):
+                if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                    quota_hit = True  # 這個 model 撞額度，繼續試下一個
+                else:
+                    quota_hit = False
                     break  # 非 quota 錯誤不再 retry 其他模型
+        # 走到這 = 沒成功 return。若因（最後試的 model）撞額度而 fallback，且用的是「獨立」
+        # Cramer key（health monitor 看不到那個 GCP project）→ 即時通知 Andrew。
+        # 未設獨立 key 時不從這推：那其實是共用 key，由 health monitor 統一報，避免 double-alert。
+        if quota_hit and _cramer_key:
+            try:
+                from notify_discord import notify_quota_pressure
+
+                notify_quota_pressure("Cramer 獨立 key", {}, "已 fallback 英文標題")
+            except Exception:
+                pass
     except Exception:
         pass
     return fallback
