@@ -1427,6 +1427,14 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
     # 重跑由 UNIQUE INDEX (group_id, title, event_date) 自動 dedup
     _auto_capture_text_if_important(group_id, text)
 
+    # 自動抽飲食 / 採購訊號（純規則 fire-and-forget，存 food_db；2026-05-31）
+    # 逐則抽、不需 user_id（v1 家庭層級，GP2 A）、不需 pre-filter（無 Gemini quota 顧慮）
+    try:
+        import food_signals
+        food_signals.extract_and_store_async(group_id, event.message.id, text)
+    except (ImportError, Exception) as e:
+        logger.debug("food_signals extract skipped: %s", e)
+
     # 自動分類（rule-first → Gemini lite，fire-and-forget；2026-05-10 加）
     try:
         import message_classifier
@@ -4157,9 +4165,48 @@ def _format_finance_views(views: list[dict], header: str) -> str:
     return "\n".join(lines)
 
 
+def _handle_food_command(group_id: str, text: str) -> str | None:
+    """家族飲食 / 食材媒合指令（純 DB 查詢，跳過 Gemini）。無命中回 None。
+
+    嚴格 == 比對（GP1 C4：寬鬆比對會短路後面所有既有指令）。
+    輸出只給全家層級、不點名個人（GP2 A）。
+    """
+    t = text.strip()
+    if t in ("/今晚煮什麼", "/煮什麼", "/食材媒合"):
+        import food_db
+        import food_recipes
+        inventory = food_db.query_inventory(group_id)
+        prefs = food_db.query_prefs(group_id)
+        msg = food_recipes.format_suggestions(inventory, prefs.get("dislikes"))
+        if not msg:
+            return (
+                "🍽️ 目前還沒記錄到家裡有什麼食材～\n"
+                "等大家在群組聊到「冰箱有…」「買了…」我就會記起來囉"
+            )
+        return msg
+    if t in ("/該買什麼", "/採購清單"):
+        import food_db
+        shopping = food_db.query_shopping(group_id)
+        if not shopping:
+            return "🛒 目前沒有待買的食材"
+        return "🛒 待買清單：\n" + "\n".join(f"・{f}" for f in shopping)
+    if t in ("/家裡有什麼", "/庫存"):
+        import food_db
+        inventory = food_db.query_inventory(group_id)
+        if not inventory:
+            return "🧊 目前還沒記錄到家裡的食材"
+        return "🧊 家裡現有：\n" + "、".join(inventory)
+    return None
+
+
 def _handle_command(group_id: str, text: str) -> str | None:
     """有對應到指令回 str；沒有回 None。"""
     t = text.strip()
+
+    # 家族飲食 / 食材媒合（2026-05-31 加；嚴格 == 無命中回 None，純 DB 跳過 Gemini）
+    food_reply = _handle_food_command(group_id, t)
+    if food_reply is not None:
+        return food_reply
 
     # 訊息分類查詢（2026-05-10 加）
     classify_reply = _handle_classify_command(group_id, t)
@@ -4339,6 +4386,10 @@ def _cancel_calendar_event(group_id: str, keyword: str) -> str:
 
 _HELP_TEXT = (
     "可用指令：\n"
+    "【飲食】\n"
+    "  /今晚煮什麼             用家裡現有食材推薦菜色\n"
+    "  /該買什麼               待買食材清單\n"
+    "  /家裡有什麼             目前記錄到的食材\n"
     "【記憶】\n"
     "  /看記憶                 看長期事實\n"
     "  /記住 <內容>            手動加一條事實\n"
