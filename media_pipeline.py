@@ -29,6 +29,75 @@ logger = logging.getLogger("media_pipeline")
 _MIN_CACHE_BYTES = 1024       # 太小檔不算（preview / corrupted / sticker）
 _MIN_CACHE_REPLY_LEN = 200    # 太短 reply 不 cache（L3 raw desc 通常 < 200 字）
 
+_local_llm_down_alerted = False  # once-per-process 告警 guard；成功生回應時 reset（見 _respond_to_ocr_text）
+
+
+def _alert_local_llm_down(reason: str) -> None:
+    """本機模型全載不進來（多半 ~/.cache/huggingface symlink 斷 / 外接碟沒掛）→ 通知 Andrew 一次。
+
+    fail-soft：絕不拋例外影響回覆；process 內去重避免洗版。
+    reason 一律當不可信字串：strip mention + 截長，避免任何 caller 不慎洩漏內容 / @everyone 轟炸。
+    """
+    global _local_llm_down_alerted
+    if _local_llm_down_alerted:
+        return
+    _local_llm_down_alerted = True
+    safe = str(reason or "").replace("@everyone", "@ everyone").replace("@here", "@ here")[:80]
+    try:
+        import notify_discord
+        notify_discord.send_dm(
+            "⚠️ LINE bot 本機 AI 模型載不進來（" + safe + "）。"
+            "圖片目前只能回降級訊息。請檢查外接碟 WD_BLACK 是否沒接 / "
+            "~/.cache/huggingface symlink 是否斷掉。"
+        )
+    except Exception as e:
+        logger.warning("_alert_local_llm_down: notify failed: %s", e)
+
+
+def _respond_to_ocr_text(ocr_text: str) -> Optional[str]:
+    """本機 vision 描述不可用時：把 OCR 文字餵本機 14B，針對『內容』生回應（非 echo / 非裸吐）。
+
+    單次快速本機呼叫（無 web search / grounding / critique），塞得進 _handle_image_message
+    的 50s reply 視窗。回傳前過 vision_common.post_check 對齊規則 0 / 黑名單。
+    本機 LLM 不可用（模型載不進來）回 None，交給 caller 走降級訊息 + 告警。
+    """
+    global _local_llm_down_alerted
+    text = (ocr_text or "").strip()
+    if not text:
+        return None
+    try:
+        from local_llm import chat as local_chat
+    except Exception as e:
+        logger.warning("_respond_to_ocr_text: local_llm import failed: %s", e)
+        return None
+    # 文字模式咪寶 prompt。不用 vision_common.compose_prompt：那是「看圖」取向、且會把內容
+    # 塞進 system 又與 user_input 重複（codex NIT-2）。規則 0 / 黑名單對齊改靠回傳後 post_check。
+    system = (
+        "你是 LINE 群組對話助理咪寶，繁體中文、短句分行、像在群裡聊天。"
+        "使用者貼了一張圖，以下是從圖中 OCR 抽到的文字。"
+        "請『根據文字的內容』回應，不是描述圖片："
+        "是問題就直接回答、是新聞/觀點就給你的判斷、是單據/文件就摘重點並點出要注意的地方。"
+        "第一句必須是具體判斷或答案，禁止 echo 複述原文，"
+        "禁止『這張圖 / 圖中顯示 / 我看到圖片』這種開頭。不確定就說不確定，不要編造數字或來源。"
+    )
+    try:
+        out = local_chat(text[:1500], system_prompt=system, max_tokens=500)
+    except Exception as e:
+        logger.warning("_respond_to_ocr_text: local_llm.chat failed: %s", e)
+        return None
+    reply = out.strip() if out and out.strip() else None
+    if not reply:
+        return None
+    try:
+        from vision_common import post_check
+        reply = (post_check(reply) or "").strip()
+    except Exception as e:
+        logger.warning("_respond_to_ocr_text: post_check skipped: %s", e)
+    if not reply:
+        return None
+    _local_llm_down_alerted = False  # 成功＝本機腦袋活著 → reset，下次真的掛掉能再告警
+    return reply
+
 
 def _to_bytes(media) -> Optional[bytes]:
     """Normalize 多型 media 輸入到 bytes（只給 sha256 算），原 media 不動。"""
@@ -158,9 +227,23 @@ def analyze_image(
         logger.warning("vision_llm failed: %s", e)
 
     if not desc or not desc.strip():
-        # 沒描述 → 至少回 OCR
+        # 沒 vision 描述（多半本機 vision 模型載不進來）。不要只裸吐 OCR
+        # （user: 要「根據 OCR 結果回應」，不是只做辨識）：先用本機 LLM 針對 OCR 內容生回應。
         if ocr_text:
-            return f"📷 OCR 抽到的文字：\n{ocr_text[:800]}\n\n（vision LLM 不可用，僅 OCR 結果）"
+            ocr_reply = _respond_to_ocr_text(ocr_text)
+            if ocr_reply:
+                _maybe_write_media_cache(image, group_id, "image", ocr_text, ocr_reply)
+                return ocr_reply
+            # 本機 LLM 也載不進來 → 誠實降級 + 一次性告警（不再裸吐 OCR 當答案）。
+            # ⚠️ 此降級訊息「絕不」寫入 media_cache：它是暫時性 model-down 狀態，模型恢復後
+            #    必須能重答；快取它會在恢復後永遠回放這句（stale-cache bug）。勿在此加 cache write。
+            _alert_local_llm_down("vision + 對話模型皆無法載入")
+            # 不附 raw OCR 文字：user 要的是「根據內容回應」，裸吐 OCR 正是要避免的行為。
+            # 本機腦袋掛掉時就誠實說明、別假裝在回答。
+            return (
+                "我有看到圖裡有文字，但我本機的 AI 模型現在載不進來，"
+                "等恢復我再針對內容仔細回你 🙏"
+            )
         return None
 
     # Layer 2：v4 完整 pipeline（7 步：query expansion + multi-source + full text + critique）
