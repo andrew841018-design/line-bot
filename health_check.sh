@@ -4,16 +4,75 @@
 
 set -u
 
+HOME="${HOME:-/Users/andrew}"
 BOT_DIR="/Users/andrew/Desktop/andrew/Data_engineer/line_bot"
 HC_LOG="$BOT_DIR/health_check.log"
 UVICORN_LOG="$BOT_DIR/uvicorn.log"
-CF_LOG="$BOT_DIR/cloudflared.log"
-CF_BIN="/Users/andrew/.local/bin/cloudflared"
 PORT=8080
 MAX_429_PER_DAY=10
+READY_TIMEOUT_SEC="${READY_TIMEOUT_SEC:-75}"
+UVICORN_LABEL="com.andrew.line-bot-uvicorn"
+UVICORN_PLIST="$HOME/Library/LaunchAgents/${UVICORN_LABEL}.plist"
+CLOUDFLARED_LABEL="com.andrew.line-bot-cloudflared"
+CLOUDFLARED_PLIST="$HOME/Library/LaunchAgents/${CLOUDFLARED_LABEL}.plist"
+CLOUDFLARED_URL_FILE="/tmp/cloudflared_line_bot_url.txt"
+RESTART_LOCK_DIR="/tmp/line_bot_restart.lockdir"
 
 ts() { date '+%Y-%m-%d %H:%M:%S %Z'; }
 say() { echo "[$(ts)] $*" >> "$HC_LOG"; }
+
+wait_for_health() {
+  local deadline=$((SECONDS + READY_TIMEOUT_SEC))
+  local http_code
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" --interface lo0 --max-time 3 \
+      "http://127.0.0.1:$PORT/health" 2>/dev/null || echo "000")
+    if [ "$http_code" = "200" ]; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+ensure_uvicorn_service() {
+  local domain="gui/$(id -u)"
+  if launchctl print "$domain/$UVICORN_LABEL" >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ ! -f "$UVICORN_PLIST" ]; then
+    say "ERR missing uvicorn plist: $UVICORN_PLIST"
+    return 1
+  fi
+  launchctl bootstrap "$domain" "$UVICORN_PLIST"
+}
+
+ensure_cloudflared_service() {
+  local domain="gui/$(id -u)"
+  if launchctl print "$domain/$CLOUDFLARED_LABEL" >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ ! -f "$CLOUDFLARED_PLIST" ]; then
+    say "ERR missing cloudflared plist: $CLOUDFLARED_PLIST"
+    return 1
+  fi
+  launchctl bootstrap "$domain" "$CLOUDFLARED_PLIST"
+}
+
+acquire_restart_lock() {
+  local deadline=$((SECONDS + 30))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if mkdir "$RESTART_LOCK_DIR" 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+release_restart_lock() {
+  rmdir "$RESTART_LOCK_DIR" 2>/dev/null || true
+}
 
 {
   echo ""
@@ -49,11 +108,7 @@ say "Gemini 429 today (PT $PT_TODAY): $COUNT_429"
 ACTION="no_action_needed"
 
 if [ $UVICORN_UP -eq 0 ]; then
-  if [ "$COUNT_429" -ge "$MAX_429_PER_DAY" ]; then
-    ACTION="skipped_restart_quota_likely_exhausted"
-    say "uvicorn DOWN but 429>=$MAX_429_PER_DAY; skipping restart"
-  else
-    say "uvicorn DOWN; attempting restart (with flock to avoid race w/ monitor)"
+    say "uvicorn DOWN; attempting restart (Gemini quota never suppresses receiver restart)"
     cd "$BOT_DIR" || { say "ERR cd failed"; exit 1; }
 
     if [ ! -x .venv/bin/uvicorn ]; then
@@ -62,107 +117,61 @@ if [ $UVICORN_UP -eq 0 ]; then
     elif [ ! -f .env ]; then
       say "ERR .env missing"
       ACTION="restart_failed_no_env"
+    elif ! acquire_restart_lock; then
+      say "ERR restart lock timeout (another restart is running)"
+      ACTION="restart_deferred_lock_busy"
     else
-      # flock 防 ops/monitors/line_bot.py 同時重啟造成 Errno 48 race
-      # -n = non-blocking, -w 30 = 等 30s 拿不到鎖就放棄
-      (
-        flock -w 30 9 || { say "ERR flock timeout (monitor 正在重啟)"; exit 1; }
-
-        # 殭屍升級：TERM → 2s → KILL → 1s 確保 port 釋放
-        say "pkill -TERM uvicorn..."
-        pkill -TERM -f "uvicorn main:app" 2>/dev/null || true
-        sleep 2
-        if pgrep -f "uvicorn.*main:app" >/dev/null 2>&1; then
-          say "uvicorn 仍存活, pkill -KILL..."
-          pkill -KILL -f "uvicorn main:app" 2>/dev/null || true
-          sleep 1
+      if ! ensure_uvicorn_service; then
+        ACTION="restart_failed_launchd_service"
+      else
+        launchctl kickstart -k "gui/$(id -u)/$UVICORN_LABEL"
+        say "kickstarted $UVICORN_LABEL"
+        if wait_for_health; then
+          say "post-restart /health HTTP=200; running preflight"
+          "$BOT_DIR/.venv/bin/python" "$BOT_DIR/preflight_check.py" --force >> "$HC_LOG" 2>&1
+          PREFLIGHT_EXIT=$?
+          say "uvicorn restart preflight exit=$PREFLIGHT_EXIT"
+          case "$PREFLIGHT_EXIT" in
+            0|2) ACTION="restart_success_http_200_preflight_${PREFLIGHT_EXIT}" ;;
+            *)   ACTION="restart_failed_preflight_${PREFLIGHT_EXIT}" ;;
+          esac
+        else
+          say "post-restart /health timeout after ${READY_TIMEOUT_SEC}s"
+          ACTION="restart_failed_health_timeout"
         fi
-
-        nohup .venv/bin/uvicorn main:app --host 127.0.0.1 --port $PORT \
-          >> "$UVICORN_LOG" 2>&1 &
-        NEW_PID=$!
-        disown $NEW_PID 2>/dev/null || true
-        say "spawned uvicorn PID=$NEW_PID, waiting 5s..."
-        sleep 5
-
-        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 \
-          http://127.0.0.1:$PORT/health 2>/dev/null || echo "000")
-        say "post-restart /health HTTP=$HTTP_CODE"
-
-        case "$HTTP_CODE" in
-          200) echo "ok" > /tmp/line_bot_restart.result ;;
-          *)   echo "fail_$HTTP_CODE" > /tmp/line_bot_restart.result ;;
-        esac
-      ) 9>/tmp/line_bot_restart.lock
-
-      RESULT=$(cat /tmp/line_bot_restart.result 2>/dev/null || echo "fail_no_result")
-      case "$RESULT" in
-        ok) ACTION="restart_success_http_200" ;;
-        *)  ACTION="restart_failed_$RESULT" ;;
-      esac
+      fi
+      release_restart_lock
     fi
-  fi
 fi
 
 if [ $CF_UP -eq 0 ]; then
-  say "cloudflared DOWN; attempting restart..."
-  cd "$BOT_DIR" || { say "ERR cd failed"; exit 1; }
-
-  # 2026-05-21 修：原本直接 grep .env 的 raw token 已過期（stateless token 後 LINE 改機制）
-  # 改走 line_token_refresh.get_line_token() 用 refresh_token 換新 token
-  LINE_TOKEN=$(.venv/bin/python -c "import sys; sys.path.insert(0,'.'); from dotenv import load_dotenv; load_dotenv('.env'); from line_token_refresh import get_line_token; print(get_line_token() or '')" 2>/dev/null)
-  if [ -z "$LINE_TOKEN" ]; then
-    say "ERR get_line_token() returned empty (refresh failed?)"
-    CF_ACTION="cf_restart_failed_no_token"
-  elif [ ! -x "$CF_BIN" ]; then
-    say "ERR cloudflared binary not found at $CF_BIN"
-    CF_ACTION="cf_restart_failed_no_binary"
+  say "cloudflared DOWN; attempting launchd restart..."
+  if ! ensure_cloudflared_service; then
+    CF_ACTION="cf_restart_failed_launchd_service"
   else
-    : > "$CF_LOG"
-    nohup "$CF_BIN" tunnel --url http://127.0.0.1:$PORT >> "$CF_LOG" 2>&1 &
-    CF_NEW_PID=$!
-    disown $CF_NEW_PID 2>/dev/null || true
-    say "spawned cloudflared PID=$CF_NEW_PID, waiting for URL..."
-
+    launchctl kickstart -k "gui/$(id -u)/$CLOUDFLARED_LABEL"
+    say "kickstarted $CLOUDFLARED_LABEL, waiting for URL stash..."
     NEW_URL=""
-    for i in $(seq 1 30); do
+    for i in $(seq 1 90); do
       sleep 1
-      NEW_URL=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' "$CF_LOG" | head -n1 || true)
+      if [ -s "$CLOUDFLARED_URL_FILE" ]; then
+        NEW_URL=$(cat "$CLOUDFLARED_URL_FILE")
+      fi
       [ -n "$NEW_URL" ] && break
     done
 
     if [ -z "$NEW_URL" ]; then
-      say "ERR cloudflared URL not found after 30s"
+      say "ERR cloudflared URL not found after 90s"
       CF_ACTION="cf_restart_failed_no_url"
     else
-      say "cloudflared new URL=$NEW_URL, verifying tunnel is ready..."
-      TUNNEL_READY=0
-      for i in $(seq 1 15); do
-        sleep 2
-        TUNNEL_HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "${NEW_URL}/health" 2>/dev/null || echo "000")
-        say "tunnel verify attempt=$i HTTP=$TUNNEL_HTTP"
-        [ "$TUNNEL_HTTP" = "200" ] && TUNNEL_READY=1 && break
-      done
-
-      if [ $TUNNEL_READY -eq 0 ]; then
-        say "WARN tunnel URL obtained but /health unreachable after 30s, updating LINE webhook anyway"
-      fi
-
-      WEBHOOK_URL="${NEW_URL}/callback"
-      HTTP_RESP=$(curl -s -o /tmp/line_webhook_resp.txt -w "%{http_code}" \
-        -X PUT https://api.line.me/v2/bot/channel/webhook/endpoint \
-        -H "Authorization: Bearer $LINE_TOKEN" \
-        -H "Content-Type: application/json" \
-        -d "{\"endpoint\": \"$WEBHOOK_URL\"}" 2>/dev/null)
-      [ -z "$HTTP_RESP" ] && HTTP_RESP="000"
-      RESP_BODY=$(cat /tmp/line_webhook_resp.txt 2>/dev/null || echo "")
-      say "LINE webhook update HTTP=$HTTP_RESP body=$RESP_BODY"
-
-      if [ "$HTTP_RESP" = "200" ]; then
-        CF_ACTION="cf_restart_success_webhook_updated url=$WEBHOOK_URL"
+      say "cloudflared new URL=$NEW_URL; running preflight to align LINE webhook"
+      "$BOT_DIR/.venv/bin/python" "$BOT_DIR/preflight_check.py" --force >> "$HC_LOG" 2>&1
+      PREFLIGHT_EXIT=$?
+      say "cloudflared restart preflight exit=$PREFLIGHT_EXIT"
+      if [ "$PREFLIGHT_EXIT" = "0" ] || [ "$PREFLIGHT_EXIT" = "2" ]; then
+        CF_ACTION="cf_restart_success_preflight_${PREFLIGHT_EXIT} url=${NEW_URL}/callback"
       else
-        CF_ACTION="cf_restart_success_tunnel_up_webhook_failed HTTP=$HTTP_RESP"
-        say "WARN tunnel is up but LINE webhook update failed"
+        CF_ACTION="cf_restart_failed_preflight_${PREFLIGHT_EXIT}"
       fi
     fi
   fi

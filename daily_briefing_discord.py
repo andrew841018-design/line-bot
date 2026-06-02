@@ -196,6 +196,355 @@ def interview_prep_today() -> str:
     return f"🎯 **關貿 6/4 面試準備｜{today}**\n{msg}"
 
 
+# ── 1.6 每日技術筆記（核可後隔天才前進）─────────────────────────────────────────
+
+_TECH_NOTE_STATE_FILE = LINE_BOT_DIR / "state" / "daily_tech_note_state.json"
+
+_TECH_NOTE_TOPICS = [
+    {
+        "id": "ptt-prefect-pipeline",
+        "scope": "ptt_project",
+        "title": "PTT 多來源 Prefect Pipeline",
+        "why": "PTT project 主線是多來源財經 corpus → PostgreSQL → QA/BERT → mart/API/RAG；JD 會看你能不能講清資料流與失敗隔離。",
+        "points": [
+            "extract、transform、load、serving layer 在 PTT project 各自負責什麼",
+            "Prefect task 怎麼切 scraper、QA、BERT、mart refresh",
+            "單一來源失敗時如何隔離，避免整條 pipeline 全掛",
+        ],
+    },
+    {
+        "id": "postgres-unified-schema",
+        "scope": "ptt_project",
+        "title": "PostgreSQL 統一 Schema 設計",
+        "why": "PTT project 把文章、來源、情緒、價格與槓桿指標收進同一個 PostgreSQL schema；這正對 JD 的數據資料庫能力。",
+        "points": [
+            "raw articles、dim/fact、mart table 的責任差異",
+            "primary key、foreign key、unique key 如何支援去重與關聯查詢",
+            "schema 變更要保留 migration 與 backfill 策略",
+        ],
+    },
+    {
+        "id": "ptt-data-quality-contracts",
+        "scope": "ptt_project",
+        "title": "PTT Data Quality 與資料契約",
+        "why": "PTT project 的爬蟲 schema、情緒分數、mart 指標都需要資料契約；JD 會重視資料品質如何擋住壞資料流到產品層。",
+        "points": [
+            "schema、range、freshness、uniqueness 是基本檢查面向",
+            "Great Expectations 與自寫 QA check 的分工",
+            "fail fast、quarantine、soft warning 對下游 mart 的影響",
+        ],
+    },
+    {
+        "id": "ptt-pii-ai-guardrails",
+        "scope": "jd_fit",
+        "title": "PTT 文本的 PII 與 AI Guardrails",
+        "why": "PTT project 會把使用者內容送進搜尋與 RAG；JD 的 AI 產品化不只看能不能回答，也看隱私與安全邊界。",
+        "points": [
+            "文章與推文進 serving 前先處理 PII 與敏感內容",
+            "RAG 回答要拒絕投資建議、個資外洩與 prompt injection",
+            "保留可稽核的處理紀錄，方便 incident review",
+        ],
+    },
+    {
+        "id": "ptt-bert-sentiment-inference",
+        "scope": "ptt_project",
+        "title": "PTT BERT 情緒分析 Inference",
+        "why": "PTT project 的情緒分數是 mart_market_state 與 RAG 回答的重要特徵；JD 會問模型輸出如何進資料管線。",
+        "points": [
+            "batch inference 如何和 pipeline task 串接",
+            "sentiment label、score、model version 要一起落庫",
+            "模型失敗時要保留重跑與 fallback 策略",
+        ],
+    },
+    {
+        "id": "mart-market-state",
+        "scope": "ptt_project",
+        "title": "mart_market_state 與 Materialized View",
+        "why": "PTT project 用 mart / MV 服務 dashboard、API、RAG；JD 的資料庫優化會看你能否用 pre-aggregation 降低查詢成本。",
+        "points": [
+            "raw table、fact table、mart、MV 的查詢定位",
+            "什麼指標適合預先彙總，什麼應保留明細查詢",
+            "refresh 策略要平衡資料新鮮度與讀取延遲",
+        ],
+    },
+    {
+        "id": "ptt-sql-window-functions",
+        "scope": "jd_fit",
+        "title": "PTT 情緒指標的 SQL Window Functions",
+        "why": "SQL window function 是資料工程 JD 高頻題；用 PTT project 的 sentiment 與 market_state 表練，比抽象題更能連到作品。",
+        "points": [
+            "用 rolling 7-day average 看情緒趨勢",
+            "用 LAG / LEAD 解釋日變化與事件前後差異",
+            "Top-N 熱門股票與 source ranking 怎麼避免 GROUP BY 不夠用",
+        ],
+    },
+    {
+        "id": "ptt-postgres-indexing",
+        "scope": "jd_fit",
+        "title": "PTT 查詢的 PostgreSQL Index 選型",
+        "why": "JD 明確重視資料庫優化；PTT project 可用 published_at、source_id、JSONB、全文搜尋與 pgvector 來講不同 index 的取捨。",
+        "points": [
+            "B-tree 適合時間、來源與等值/range filter",
+            "GIN / pg_trgm 適合 JSONB 與中文關鍵字搜尋",
+            "HNSW index 適合 pgvector，但要講 recall、latency、memory trade-off",
+        ],
+    },
+    {
+        "id": "ptt-fastapi-streamlit-serving",
+        "scope": "jd_fit",
+        "title": "PTT FastAPI / Streamlit Serving Layer",
+        "why": "PTT project 不是只有離線 ETL；JD 的系統開發會看 API、dashboard 與資料庫之間的邊界設計。",
+        "points": [
+            "FastAPI endpoint 應讀 mart 而不是每次 join raw tables",
+            "dashboard 要有 pagination、cache 與查詢時間上限",
+            "API response schema 要穩定，讓前端與 RAG tool 都能共用",
+        ],
+    },
+    {
+        "id": "ptt-rag-chunk-embedding",
+        "scope": "ptt_project",
+        "title": "PTT RAG ETL：Chunk、Embedding、pgvector",
+        "why": "PTT project 的 RAG layer 是 JD AI 產品化主線；要能講文章怎麼從資料庫變成可檢索的知識。",
+        "points": [
+            "article → chunk → embedding → vector table 的離線流程",
+            "chunk_idx 與 article_id 如何做 idempotent upsert",
+            "embedding model、dimension、index 都會影響 retrieval latency",
+        ],
+    },
+    {
+        "id": "ptt-hybrid-retrieval-rrf",
+        "scope": "ptt_project",
+        "title": "PTT Hybrid Retrieval：BM25 + Vector + RRF",
+        "why": "PTT 中文財經文本只靠 vector 容易漏 ticker 與關鍵字；JD AI 題可以用 hybrid retrieval 展示工程取捨。",
+        "points": [
+            "BM25 擅長 exact keyword，vector 擅長語意相近",
+            "RRF 可以合併不同 ranker 而不強迫分數同尺度",
+            "中文斷詞、source weighting、recency weighting 都要和產品目標對齊",
+        ],
+    },
+    {
+        "id": "ptt-rag-evaluation",
+        "scope": "jd_fit",
+        "title": "PTT RAG 評估與 Grounding",
+        "why": "JD 的 AI 產品不會只接受 demo 能回答；PTT project 要能說 retrieval 與 generation 怎麼量化驗證。",
+        "points": [
+            "golden set 要覆蓋 ticker、日期、市場狀態與文章證據",
+            "hit@k、recall@k、context precision 用來看 retrieval",
+            "faithfulness 與拒答規則用來管住 generation",
+        ],
+    },
+    {
+        "id": "ptt-prefect-vs-airflow",
+        "scope": "jd_fit",
+        "title": "PTT Orchestration：Prefect vs Airflow",
+        "why": "Airflow 是資料工程 JD 常見關鍵字；PTT project 選 Prefect 時要能講清楚規模、維運成本與替換條件。",
+        "points": [
+            "DAG、task dependency、schedule、backfill 是共同概念",
+            "Prefect 對 single-host Python pipeline 較輕，Airflow 對團隊平台較成熟",
+            "何時該升級到 Airflow：多團隊、多租戶、複雜 SLA、集中治理",
+        ],
+    },
+    {
+        "id": "ptt-idempotency-backfill",
+        "scope": "ptt_project",
+        "title": "PTT Crawler 的 Idempotency 與 Backfill",
+        "why": "PTT project 需要反覆補資料、重跑與處理外部來源不穩；JD 會看你是否能避免重複資料與污染下游。",
+        "points": [
+            "natural key、content hash、unique constraint 如何去重",
+            "ON CONFLICT / upsert 要和 schema 設計一起想",
+            "backfill 要能指定時間窗，且不破壞已核可資料",
+        ],
+    },
+    {
+        "id": "ptt-freshness-timezone",
+        "scope": "ptt_project",
+        "title": "PTT Freshness、Timezone、Market Calendar",
+        "why": "PTT project 的市場資料橫跨台股與美股；JD 會看 freshness check 是否理解時區、交易日與資料延遲。",
+        "points": [
+            "timestamp vs timestamptz 會影響 stale 判斷",
+            "台股與美股交易日、休市日、資料發布時間不同",
+            "freshness alert 要用 business calendar，避免假日誤報",
+        ],
+    },
+    {
+        "id": "ptt-snowflake-star-schema",
+        "scope": "jd_fit",
+        "title": "PTT DW：Star Schema 與 Fact/Dim",
+        "why": "PTT project 有 dim_source、fact_sentiment、mart summary；JD 的數據倉儲題可以直接用這套結構回答。",
+        "points": [
+            "fact table 存可聚合事件，dim table 存描述性維度",
+            "mart 是服務查詢與產品，不是取代 raw/fact",
+            "star schema 如何支援 BI、dashboard 與 batch metric",
+        ],
+    },
+    {
+        "id": "ptt-redis-cache-serving",
+        "scope": "jd_fit",
+        "title": "PTT API 查詢的 Redis Cache 策略",
+        "why": "JD 會問系統開發與查詢效能；PTT project 可用 mart/API/RAG tool 的重複讀取情境說明 cache 邊界。",
+        "points": [
+            "cache key 要包含 query params、日期窗與資料版本",
+            "TTL 要跟 mart refresh cadence 對齊",
+            "cache miss、stale cache、manual invalidation 都要有策略",
+        ],
+    },
+    {
+        "id": "ptt-observability-runbook",
+        "scope": "jd_fit",
+        "title": "PTT Pipeline Observability 與 Runbook",
+        "why": "PTT project 要能像 production 系統一樣被監控；JD 會看你怎麼區分資料延遲、來源失敗、QA fail 與真正 incident。",
+        "points": [
+            "logs、metrics、data quality report 分別回答不同問題",
+            "SLO 要定義 fresh enough、complete enough、query fast enough",
+            "incident 後要補測試、runbook 與監控門檻",
+        ],
+    },
+    {
+        "id": "ptt-docker-ci-reproducibility",
+        "scope": "jd_fit",
+        "title": "PTT Docker / CI / Reproducibility",
+        "why": "JD 的系統開發會看環境是否可重現；PTT project 可用 Docker Compose、pytest、migration 來講交付品質。",
+        "points": [
+            "服務、資料庫、worker 的環境變數與 dependency 要可重建",
+            "CI 先跑 schema、unit test、RAG eval smoke test",
+            "production-like fixture 能降低 demo 前才爆炸的風險",
+        ],
+    },
+]
+
+
+def _tech_note_today(now=None) -> str:
+    if now is None:
+        now = datetime.now()
+    return now.strftime("%Y-%m-%d")
+
+
+def _load_tech_note_state(state_path=None) -> dict:
+    path = Path(state_path) if state_path else _TECH_NOTE_STATE_FILE
+    if not path.exists():
+        return {}
+    try:
+        data = _json.loads(path.read_text())
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_tech_note_state(state: dict, state_path=None) -> None:
+    path = Path(state_path) if state_path else _TECH_NOTE_STATE_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_text(_json.dumps(state, ensure_ascii=False, indent=2))
+    os.replace(tmp, path)
+
+
+def _topic_index_from_state(state: dict) -> int:
+    topic_id = state.get("current_topic_id")
+    if topic_id:
+        for idx, topic in enumerate(_TECH_NOTE_TOPICS):
+            if topic["id"] == topic_id:
+                return idx
+    try:
+        idx = int(state.get("current_index", 0))
+    except Exception:
+        idx = 0
+    return max(0, min(idx, len(_TECH_NOTE_TOPICS) - 1))
+
+
+def _approved_tech_topics(state: dict) -> dict:
+    approved = state.get("approved_topics")
+    if isinstance(approved, dict):
+        return {str(k): str(v) for k, v in approved.items()}
+    if isinstance(approved, list):
+        return {str(k): "" for k in approved}
+    return {}
+
+
+def _next_unapproved_topic_index(start_idx: int, approved: dict):
+    for idx in range(start_idx, len(_TECH_NOTE_TOPICS)):
+        if _TECH_NOTE_TOPICS[idx]["id"] not in approved:
+            return idx
+    return None
+
+
+def _select_daily_tech_topic(state: dict, today: str):
+    idx = _topic_index_from_state(state)
+    approved = _approved_tech_topics(state)
+    topic = _TECH_NOTE_TOPICS[idx]
+    status = "pending"
+
+    approved_on = approved.get(topic["id"])
+    if approved_on:
+        if approved_on < today:
+            next_idx = _next_unapproved_topic_index(idx + 1, approved)
+            if next_idx is not None:
+                idx = next_idx
+                topic = _TECH_NOTE_TOPICS[idx]
+                status = "advanced"
+                state["current_started_on"] = today
+            else:
+                status = "completed"
+        else:
+            status = "approved_today"
+
+    state["current_index"] = idx
+    state["current_topic_id"] = topic["id"]
+    state["last_shown_on"] = today
+    state["approved_topics"] = approved
+    return idx, topic, status, state
+
+
+def _format_daily_tech_note(idx: int, topic: dict, status: str) -> str:
+    lines = [
+        f"🧠 **每日技術筆記**（{idx + 1}/{len(_TECH_NOTE_TOPICS)}）",
+        f"主題：**{topic['title']}**",
+        f"為什麼學：{topic['why']}",
+        "今天搞懂：",
+    ]
+    for point in topic["points"]:
+        lines.append(f"• {point}")
+    lines += [
+        "筆記摘要格式：定義 / 專案用在哪 / 一個坑 / 面試講法",
+    ]
+    if status == "approved_today":
+        lines.append("狀態：今天已核可，明天換下一題。")
+    elif status == "completed":
+        lines.append("狀態：這輪題庫已完成；可以整理總複習或補新題庫。")
+    else:
+        lines.append("狀態：等你丟筆記摘要，我確認 OK 後才前進。")
+    return "\n".join(lines)
+
+
+def daily_tech_note(now=None, state_path=None) -> str:
+    """Discord daily section：同一題維持到摘要被核可，核可隔天才前進。"""
+    today = _tech_note_today(now)
+    state = _load_tech_note_state(state_path)
+    idx, topic, status, state = _select_daily_tech_topic(state, today)
+    if "current_started_on" not in state:
+        state["current_started_on"] = today
+    _save_tech_note_state(state, state_path)
+    return _format_daily_tech_note(idx, topic, status)
+
+
+def approve_daily_tech_note(now=None, state_path=None, summary: str = "") -> str:
+    """Mark current daily tech note as reviewed. Next scheduled day advances."""
+    today = _tech_note_today(now)
+    state = _load_tech_note_state(state_path)
+    idx, topic, _status, state = _select_daily_tech_topic(state, today)
+    approved = _approved_tech_topics(state)
+    if topic["id"] in approved:
+        return f"🧠 每日技術筆記：{topic['title']} 已經核可過（{approved[topic['id']]}）。"
+
+    approved[topic["id"]] = today
+    state["approved_topics"] = approved
+    state["last_approved_topic_id"] = topic["id"]
+    state["last_approved_on"] = today
+    if summary:
+        state["last_approved_summary"] = summary[:500]
+    _save_tech_note_state(state, state_path)
+    return f"🧠 每日技術筆記：{topic['title']} 已核可；明天換下一題。"
+
+
 # ── 2. 爬蟲狀態 ──────────────────────────────────────────────────────────────
 
 
@@ -1270,6 +1619,10 @@ def main():
     if interview:
         sections += ["", interview]
 
+    tech_note = daily_tech_note()
+    if tech_note:
+        sections += ["", tech_note]
+
     bday = upcoming_birthdays()
     if bday:
         sections += ["", bday]
@@ -1348,5 +1701,22 @@ def _split_for_discord(message: str, limit: int = 1900) -> list:
     return chunks
 
 
+def _handle_cli(argv) -> bool:
+    if not argv:
+        return False
+    if argv[0] == "--approve-tech-note":
+        summary = " ".join(argv[1:]).strip()
+        print(approve_daily_tech_note(summary=summary))
+        return True
+    if argv[0] == "--preview-tech-note":
+        today = _tech_note_today()
+        state = _load_tech_note_state()
+        idx, topic, status, _state = _select_daily_tech_topic(dict(state), today)
+        print(_format_daily_tech_note(idx, topic, status))
+        return True
+    return False
+
+
 if __name__ == "__main__":
-    main()
+    if not _handle_cli(sys.argv[1:]):
+        main()

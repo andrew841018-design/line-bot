@@ -1,0 +1,102 @@
+from unittest.mock import MagicMock, patch
+
+import reminder_push
+
+
+def _row(now: int, **overrides):
+    data = {
+        "reminder_id": 7,
+        "group_id": "G1",
+        "user_id": "U1",
+        "action": "看醫生",
+        "remind_at": now + 86400,
+        "created_at": now - 3600,
+        "source_text": "明天看醫生",
+        "last_pushed_at": 0,
+        "weekly_count": 0,
+        "last_weekly_at": 0,
+        "pushed_3d": 0,
+        "pushed_1d": 0,
+        "pushed_4hr": 0,
+        "pushed_2hr": 0,
+        "pushed_1hr": 0,
+        "pushed_now": 0,
+    }
+    data.update(overrides)
+    return data
+
+
+def test_due_reminders_for_reply_returns_due_items(monkeypatch):
+    now = 1_800_000_000
+    seen = {}
+
+    def fake_list(group_id=None):
+        seen["group_id"] = group_id
+        return [_row(now)]
+
+    monkeypatch.setattr(reminder_push.memory, "list_pending_reminders_full", fake_list)
+
+    due = reminder_push.due_reminders_for_reply("G1", limit=2, now=now)
+    remind_at = reminder_push.datetime.fromtimestamp(now + 86400).strftime(
+        "%Y-%m-%d %H:%M"
+    )
+
+    assert seen["group_id"] == "G1"
+    assert due == [
+        {
+            "reminder_id": 7,
+            "group_id": "G1",
+            "stage": "1d",
+            "text": f"⏰ 提醒（明天）\n{remind_at} 看醫生",
+            "action": "看醫生",
+        }
+    ]
+
+
+def test_mark_reminders_pushed_marks_each_stage(monkeypatch):
+    marked = []
+    monkeypatch.setattr(
+        reminder_push.memory,
+        "mark_reminder_pushed",
+        lambda reminder_id, stage: marked.append((reminder_id, stage)) or True,
+    )
+
+    assert reminder_push.mark_reminders_pushed([(7, "1d"), (8, "now")]) == 2
+    assert marked == [(7, "1d"), (8, "now")]
+
+
+def test_push_to_group_uses_refreshed_line_token(monkeypatch):
+    monkeypatch.setattr(reminder_push.settings, "line_channel_access_token", "stale-token")
+    monkeypatch.setattr(reminder_push, "get_line_token", lambda: "fresh-token")
+
+    seen = {}
+
+    class FakeApiClient:
+        def __init__(self, cfg):
+            seen["token"] = cfg.access_token
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    with (
+        patch("reminder_push.ApiClient", FakeApiClient),
+        patch("reminder_push.MessagingApi") as messaging_api,
+    ):
+        messaging_api.return_value.push_message = MagicMock()
+        assert reminder_push._push_to_group("G1", "hello")
+
+    assert seen["token"] == "fresh-token"
+
+
+def test_line_access_token_falls_back_to_env_token(monkeypatch):
+    monkeypatch.setattr(reminder_push.settings, "line_channel_access_token", "env-token")
+
+    def boom():
+        raise RuntimeError("refresh down")
+
+    monkeypatch.setattr(reminder_push, "get_line_token", boom)
+
+    assert reminder_push._line_access_token() == "env-token"

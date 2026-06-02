@@ -345,3 +345,68 @@ def test_quota_path_text_with_event_string_captures_via_regex(monkeypatch, tmp_p
     assert events[0]["event_date"] == future_date
     assert events[0]["event_time"] == "14:00"
     assert "蛋糕" in events[0]["title"]
+
+
+def test_auto_capture_gate_accepts_weekday_chinese_time_dentist(monkeypatch):
+    """Real entry gate must let this wording reach calendar capture."""
+    import main
+
+    called = []
+    monkeypatch.setattr(
+        main,
+        "_maybe_capture_calendar_event",
+        lambda group_id, text, sender_user_id="": called.append(
+            (group_id, text, sender_user_id)
+        ),
+    )
+
+    class InlineThread:
+        def __init__(self, target, daemon=False):
+            self.target = target
+            self.daemon = daemon
+
+        def start(self):
+            self.target()
+
+    import threading
+    monkeypatch.setattr(threading, "Thread", InlineThread)
+
+    text = "星期四早上十點半看台大陳敏惠牙醫師"
+    main._auto_capture_text_if_important("G1", text, "U_MOM")
+
+    assert called == [("G1", text, "U_MOM")]
+
+
+def test_medical_event_subjectless_defaults_to_sender_alias(
+    monkeypatch, tmp_calendar_db
+):
+    """Subjectless medical events should still record who via sender alias."""
+    import main
+    import calendar_extractor
+
+    future_date = (tmp_calendar_db._today_tw() + __import__("datetime").timedelta(days=2)).isoformat()
+    monkeypatch.setattr(main, "_alias_from_user_id", lambda uid: "媽媽" if uid == "U_MOM" else "")
+    monkeypatch.setattr(
+        calendar_extractor,
+        "extract",
+        lambda text: {
+            "has_event": True,
+            "is_cancellation": False,
+            "title": "看台大陳敏惠牙醫師",
+            "date": future_date,
+            "time": "10:30",
+            "location": "台大",
+            "participants": [],
+            "cancel_target_keyword": None,
+            "event_type": "medical",
+        },
+    )
+
+    main._maybe_capture_calendar_event(
+        "G1", "星期四早上十點半看台大陳敏惠牙醫師", "U_MOM"
+    )
+
+    events = tmp_calendar_db.list_upcoming("G1", days=30)
+    assert len(events) == 1
+    assert events[0]["title"] == "媽媽看台大陳敏惠牙醫師"
+    assert json.loads(events[0]["participants"]) == ["媽媽(就醫)"]

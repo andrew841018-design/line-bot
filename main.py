@@ -18,6 +18,8 @@ LINE → FastAPI webhook → Gemini → LINE
 from __future__ import annotations
 
 import json as _json
+import fcntl
+import hashlib
 import logging
 import mimetypes
 import os
@@ -141,11 +143,34 @@ _line_config = _get_line_config()  # 啟動時的 fallback；callsite 仍會用 
 
 def _get_quota_footer() -> str:
     """配額 footer — 用戶反饋（2026-05-05）「拿掉 📊 Gemini 今日用量 99.0%」，
-    平常 80%+ 警示移除（破壞對話自然度），只保留「真的爆了」紅燈當回覆無能信號。
+    平常 80%+ 警示移除（破壞對話自然度）。2026-05-31 再移除「今日用量已用完」
+    footer，避免低價值 fallback 變成干擾訊息。
     """
-    if _quota_exhausted():
-        return "\n\n📊 Gemini 今日用量已用完"
     return ""
+
+
+_OUTBOUND_SYSTEM_STATUS_MARKERS = (
+    "咪寶聽到了但這個話題不太接得上",
+    "Gemini 今日用量已用完",
+    "Gemini 免費層今日請求額度已用完",
+    "今日請求額度已用完",
+    "可以再使用的時間",
+    "aistudio.google.com",
+    "Gemini 暫時忙不過來",
+    "Gemini 那邊好像塞車",
+    "Gemini 那邊暫時斷線",
+    "Gemini API key",
+    "Gemini 說這個輸入有問題",
+    "分析失敗:",
+    "model 沒載成功",
+    "傳 LINE 失敗",
+)
+
+
+def _is_system_status_outbound(text: str) -> bool:
+    """True when text is an internal/quota/status message that must not go to LINE."""
+    s = text or ""
+    return any(marker in s for marker in _OUTBOUND_SYSTEM_STATUS_MARKERS)
 
 
 def _llm_chat(
@@ -1079,46 +1104,18 @@ def _handle_event(event) -> None:
     msg = event.message
     sender_user_id = getattr(event.source, "user_id", None)
 
-    # ── quota 爆時：所有訊息都存 pending，等恢復後由 Gemini 分組 + 逐組引用回覆 ──
+    # ── quota 爆時：非文字內容先存 pending，等恢復後由 Gemini 分組 + 逐組引用回覆 ──
+    # 文字不能在這裡 short-circuit：Andrew 的規則是家人/群組文字要即時回，
+    # 正常 text path 會進 burst_filter，_handle_burst_flush 內的 _llm_chat 會在
+    # quota 狀態走 lite_reply / fallback，不應被 pending early-return 靜默吃掉。
     # 2026-05-17 加 (§3 abbreviated chain): 之前的 short-circuit return 把 reply_token
     # 浪費掉，導致 pending 在 Gemini 爆期間無法 drain。現補 _try_piggyback_drain_with_reply_token
     # — 在 return 前嘗試用 incoming reply_token bundle 最多 2 條 pending drain 走 local
     # LLM fallback，免費不耗 LINE 月配額。failure pending 完整保留 (peek-then-confirm)。
     if _quota_exhausted() and isinstance(
-        msg, (TextMessageContent, FileMessageContent, AudioMessageContent)
+        msg, (FileMessageContent, AudioMessageContent)
     ):
-        # 2026-05-21 加（§3 Phase 6 GP1 critical 反饋）：quota 爆時也要讓
-        # calendar 路徑跑：(a) explicit + calendar query → deterministic 回；
-        # (b) 純文字含 "YYYY-MM-DD HH:MM family-noun" → regex 抽 event 寫 DB。
-        # 否則家人問「明天幾點拿蛋糕」與手打日曆 string 都會被埋進 pending 永不處理。
-        if isinstance(msg, TextMessageContent):
-            text = msg.text or ""
-            memory.log_raw_message(group_id, msg.id, sender_user_id, text)
-            # (a) explicit + calendar query → deterministic 回
-            try:
-                clean_text = _extract_gemini_trigger(text, msg)
-            except Exception:
-                clean_text = None
-            if clean_text is not None and _is_calendar_query(clean_text):
-                burst_filter.cancel_burst(group_id)
-                _handle_calendar_query(event, group_id, clean_text)
-                return
-            # (b) 不論 explicit 與否，regex fallback 抽 family event 寫 DB
-            try:
-                _maybe_capture_calendar_event(group_id, text)
-            except Exception as e:
-                logger.warning("quota-path calendar capture failed: %s", e)
-            # (c) 2026-05-30: reminder 在 quota 爆時的真正丟失路徑就在這——
-            # _handle_text_message→_maybe_extract_reminder 要到 1124 後才跑，這裡
-            # return 後永遠到不了。入隊等額度恢復補抽（site 1，主路徑；helper 自包
-            # try/except，不會炸到下面的 _save_pending_any）。
-            _enqueue_reminder_if_candidate(
-                text, group_id, sender_user_id or "", msg.id
-            )
-            # 落入 pending 路徑（不重複 log_raw_message）
-            _save_pending_any(event, group_id, sender_user_id, msg)
-        else:
-            _save_pending_any(event, group_id, sender_user_id, msg)
+        _save_pending_any(event, group_id, sender_user_id, msg)
         _try_piggyback_drain_with_reply_token(event.reply_token, group_id)
         return
 
@@ -1155,11 +1152,10 @@ def _handle_event(event) -> None:
         _handle_file_message(event, group_id)
         return
 
-    # === Silent drop fix (2026-05-25 Andrew rule: 任何留言都要回覆) ===
     # Catch-all for unknown message types (Sticker / Location / Template / etc.).
-    # 既有 design 砸到這裡會 fall-through silent return；改為 reply + enqueue pending。
+    # Keep an audit/pending entry, but do not send low-value system-style replies.
     logger.info(
-        "unknown message type %s group=%s — sending fallback reply",
+        "unknown message type %s group=%s — saved pending without fallback reply",
         type(msg).__name__, group_id,
     )
     # I7 fix (2026-05-30): 補 log_raw_message（其他分支都有，唯獨 catch-all 漏）。
@@ -1175,14 +1171,6 @@ def _handle_event(event) -> None:
         _save_pending_any(event, group_id, sender_user_id, msg)
     except Exception as e:
         logger.warning("save pending for unknown msg type failed: %s", e)
-    try:
-        _reply(
-            event.reply_token,
-            "收到，但這種訊息類型咪寶看不懂耶 😅",
-            group_id=group_id,
-        )
-    except Exception as e:
-        logger.warning("fallback reply for unknown msg type failed: %s", e)
 
 
 def _handle_audio_message(event: MessageEvent, group_id: str) -> None:
@@ -1331,7 +1319,10 @@ def _try_piggyback_reminders_fast_path(
             for e in calendar_db.list_due_for_reminder(group_id, days_ahead=offset):
                 if len(messages) >= 5:
                     break
-                messages.append(TextMessage(text=_er._format_event(e, offset)))
+                spec = _er.build_reminder_message_spec(e, offset, allow_mention=False)
+                if spec is None:
+                    continue
+                messages.append(TextMessage(text=spec["text"]))
                 pending.append((e["event_id"], offset))
         if not messages:
             return False
@@ -1362,12 +1353,14 @@ def _try_piggyback_reminders_fast_path(
 
 # 自動 capture cheap pre-filter — 含日期 hint + 行程動詞 才考慮跑 Gemini extractor
 _AUTO_CAPTURE_DATE_HINT_RE = re.compile(
-    r"明天|後天|今天|這週末|下週末|下週|本週|週[一二三四五六日天]|"
+    r"明天|後天|大後天|今天|這週末|下週末|下週|本週|"
+    r"(?:星期|週|周|禮拜)[一二三四五六日天]|"
     r"\d+月\d+日|\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}|"
     r"(?:[01]?\d|2[0-3]):[0-5]\d"
 )
 _AUTO_CAPTURE_VERB_RE = re.compile(
-    r"聚餐|生日|出遊|看醫生|拿(?:蛋糕|藥|包裹|貨|禮物|花)|"
+    r"聚餐|生日|出遊|看(?:.{0,12})?(?:醫生|醫師|牙醫|牙醫師)|牙醫|"
+    r"拿(?:蛋糕|藥|包裹|貨|禮物|花)|"
     r"接(?:爸|媽|妹|弟|姊|爺爺|奶奶|小孩|小朋友)|"
     r"陪(?:.{0,5})(?:就醫|看醫生|看病)|"
     r"回(?:台北|新北|台中|台南|高雄|花蓮|宜蘭|新竹|苗栗|嘉義|屏東|台東|老家|家)|"
@@ -1377,8 +1370,77 @@ _AUTO_CAPTURE_VERB_RE = re.compile(
     r"打疫苗|抽血|健檢|出差|北上|南下"
 )
 
+_MEDICAL_ACTOR_ACTION_RE = re.compile(
+    r"看(?:.{0,12})?(?:醫生|醫師|牙醫|牙醫師)|牙醫|牙醫師|"
+    r"就醫|看病|回診|掛(?:號|醫生|醫師)|"
+    r"做(?:胃鏡|大腸鏡|健康檢查|體檢|手術|健檢|LDCT)|"
+    r"打疫苗|抽血|領(?:藥|處方簽)"
+)
+_FAMILY_ACTOR_TERMS = (
+    "媽媽", "爸爸", "姊姊", "姐姐", "妹妹", "弟弟", "哥哥",
+    "爺爺", "奶奶", "黃聖雅", "黃聖穎", "黃將修", "全家",
+)
+_FAMILY_ACTOR_NORMALIZE = {"姐姐": "姊姊"}
 
-def _auto_capture_text_if_important(group_id: str, text: str) -> None:
+
+def _alias_from_user_id(user_id: str | None) -> str:
+    """Best-effort LINE user_id -> family alias using the existing local map."""
+    if not user_id:
+        return ""
+    try:
+        import food_extractor
+        return food_extractor.alias_from_user_id(user_id) or ""
+    except Exception as e:
+        logger.debug("alias lookup skipped: %s", e)
+        return ""
+
+
+def _infer_medical_actor(text: str, user_id: str | None = None) -> str | None:
+    """Infer who the medical reminder/event is for.
+
+    Explicit family names win. For subjectless medical messages, default to the
+    sender alias because family chat shorthand like "星期四看牙醫" usually means
+    the speaker's own appointment.
+    """
+    if not text or not _MEDICAL_ACTOR_ACTION_RE.search(text):
+        return None
+    for term in _FAMILY_ACTOR_TERMS:
+        if term in text:
+            return _FAMILY_ACTOR_NORMALIZE.get(term, term)
+    alias = _alias_from_user_id(user_id)
+    if alias:
+        return alias
+    return None
+
+
+def _has_family_actor(text: str) -> bool:
+    return any(term in text for term in _FAMILY_ACTOR_TERMS)
+
+
+def _apply_medical_actor(action: str, actor: str | None) -> str:
+    if not action or not actor:
+        return action
+    action = re.sub(r"^我的", f"{actor}的", action)
+    action = re.sub(r"^我(?=看|做|掛|回診|就醫|領|打|抽)", actor, action)
+    if _has_family_actor(action):
+        return action
+    return f"{actor}{action}"
+
+
+def _with_medical_actor_participant(participants: list | None, actor: str | None) -> list:
+    parts = [str(p) for p in (participants or []) if p]
+    if not actor:
+        return parts
+    if any(actor in p for p in parts):
+        return parts
+    if actor == "全家":
+        return [actor, *parts]
+    return [f"{actor}(就醫)", *parts]
+
+
+def _auto_capture_text_if_important(
+    group_id: str, text: str, sender_user_id: str = ""
+) -> None:
     """每條 text message 來時 cheap pre-filter → 通過才 async 跑 Gemini extractor。
 
     避免每訊息都打 Gemini 燒 20 req/day quota。
@@ -1391,7 +1453,7 @@ def _auto_capture_text_if_important(group_id: str, text: str) -> None:
     import threading
     def _bg() -> None:
         try:
-            _maybe_capture_calendar_event(group_id, text)
+            _maybe_capture_calendar_event(group_id, text, sender_user_id)
         except Exception as e:
             logger.warning("auto capture (every-msg) failed: %s", e)
     threading.Thread(target=_bg, daemon=True).start()
@@ -1425,7 +1487,8 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
     # (2026-05-21 user directive: 每條留言自動判定重要性)
     # Cheap pre-filter (regex) → 通過才 spin off thread 跑 Gemini extractor
     # 重跑由 UNIQUE INDEX (group_id, title, event_date) 自動 dedup
-    _auto_capture_text_if_important(group_id, text)
+    sender_uid_for_capture = getattr(event.source, "user_id", None) or ""
+    _auto_capture_text_if_important(group_id, text, sender_uid_for_capture)
 
     # 自動抽飲食 / 採購訊號（純規則 fire-and-forget，存 food_db；2026-05-31）
     # 逐則抽、不需 user_id（v1 家庭層級，GP2 A）、不需 pre-filter（無 Gemini quota 顧慮）
@@ -1965,19 +2028,27 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
                 logger.warning("lite_reply retry failed: %s", e2)
                 reply_text = ""
             if not reply_text:
-                # quota 爆 + lite_reply 也 miss → 回 quota 訊息，但仍跑 capture
+                # quota 爆 + lite_reply 也 miss → 存 pending，不送系統/額度訊息
                 # （regex fallback 不靠 Gemini，家人手打的 calendar string 仍可抽）
                 _maybe_capture_calendar_event(group_id, clean_text)
-                _reply(
-                    event.reply_token,
-                    _quota_exhausted_message(),
-                    group_id=group_id,
-                )
+                _save_pending_burst_text(group_id, clean_text or user_input)
                 return
         else:
             logger.exception("gemini chat (explicit) failed: %s", e)
             _reply(event.reply_token, _friendly_gemini_error(e), group_id=group_id)
             return
+
+    # quota 已爆時第一次 _llm_chat 直接回 ""（內部走 lite_reply，不丟例外）→ 上面 except
+    # 不會進入。空回覆不能落到下方 _reply("")（_reply 對空字串 silent drop，違反「絕不靜默」）。
+    # lite gate 抑制空泛 substantive 回答後會更常回空 → 這裡與 burst 路徑對齊補守衛：
+    # quota 爆 → 存 pending 等 quota 回來補答；非 quota 的空回覆 → 友善提示，不靜默。
+    if not reply_text or not reply_text.strip():
+        if _quota_exhausted():
+            _maybe_capture_calendar_event(group_id, clean_text)
+            _save_pending_burst_text(group_id, clean_text or user_input)
+            return
+        _reply(event.reply_token, "我剛剛沒生出內容，等一下再問我一次好嗎？", group_id=group_id)
+        return
 
     # 即時糾正偵測：使用者如果在糾正 bot，自動記住
     _try_save_correction(group_id, clean_text)
@@ -2051,22 +2122,12 @@ def _handle_burst_flush(group_id: str, combined_text: str, reply_token: str) -> 
                 logger.warning("lite_reply retry (burst) failed: %s", e2)
                 reply_text = ""
             if not reply_text:
-                # 2026-05-25 Silent drop fix (Andrew 「任何人留言都要回覆」rule):
-                # 原本 silent return 違反 _handle_burst_flush docstring「會回應的情境不能靜默」。
-                # 改為 calendar capture 仍跑 + fallback quota 短訊。
                 logger.warning(
-                    "burst quota retry miss group=%s — sending quota fallback msg",
+                    "burst quota retry miss group=%s — saved pending and suppressed system msg",
                     group_id,
                 )
                 _maybe_capture_calendar_event(group_id, combined_text)
-                try:
-                    _reply(
-                        reply_token,
-                        "Gemini 暫時忙不過來，等一下再回家人話題～",
-                        group_id=group_id,
-                    )
-                except Exception as e3:
-                    logger.warning("burst quota fallback reply failed: %s", e3)
+                _save_pending_burst_text(group_id, combined_text)
                 return
         else:
             logger.exception("gemini chat (burst) failed: %s", e)
@@ -2081,8 +2142,16 @@ def _handle_burst_flush(group_id: str, combined_text: str, reply_token: str) -> 
         repr(reply_text[:200]) if reply_text else "(empty)",
     )
     if not reply_text or not reply_text.strip():
-        # 2026-05-25 Silent drop fix (Andrew 「任何人留言都要回覆」rule):
-        # 原本 skip LINE send 違反 docstring「不能靜默」。改為 fallback 短訊。
+        # Quota exhausted 時不要送低價值 fallback；存 pending 等 quota 回來補。
+        # 非 quota empty reply 才保留 2026-05-25 的短訊 fallback。
+        if _quota_exhausted():
+            logger.info(
+                "burst empty while quota exhausted — saved pending and suppressed low-value fallback group=%s",
+                group_id,
+            )
+            _maybe_capture_calendar_event(group_id, combined_text)
+            _save_pending_burst_text(group_id, combined_text)
+            return
         logger.warning(
             "burst gemini returned empty reply — sending fallback msg group=%s",
             group_id,
@@ -2105,7 +2174,9 @@ def _handle_burst_flush(group_id: str, combined_text: str, reply_token: str) -> 
     _reply(reply_token, reply_text, group_id=group_id)
 
 
-def _maybe_capture_calendar_event(group_id: str, combined_text: str) -> None:
+def _maybe_capture_calendar_event(
+    group_id: str, combined_text: str, sender_user_id: str = ""
+) -> None:
     """從 burst 抽出家族活動 → 寫 events / 取消 events。失敗不擋主流程。"""
     try:
         import calendar_db
@@ -2138,6 +2209,13 @@ def _maybe_capture_calendar_event(group_id: str, combined_text: str) -> None:
                     )
             return
         if data["has_event"] and data.get("title") and data.get("date"):
+            actor = None
+            if data.get("event_type") == "medical":
+                actor = _infer_medical_actor(combined_text, sender_user_id)
+                data["title"] = _apply_medical_actor(data["title"], actor)
+                data["participants"] = _with_medical_actor_participant(
+                    data.get("participants"), actor
+                )
             event_id = calendar_db.insert_event(
                 group_id=group_id,
                 title=data["title"],
@@ -2959,6 +3037,28 @@ def _save_pending_any(event, group_id: str, user_id: str | None, msg) -> None:
         logger.warning("save pending any failed: %s", str(e)[:200])
 
 
+def _save_pending_burst_text(group_id: str, text: str) -> None:
+    """Save a combined burst as pending when quota exhaustion prevents a useful reply."""
+    text = (text or "").strip()
+    if not text:
+        return
+    try:
+        import pending_store as _ps
+        _ps.add(
+            group_id,
+            {
+                "user_id": None,
+                "message_id": f"burst-{_uuid.uuid4().hex}",
+                "quote_token": None,
+                "timestamp": time.time(),
+                "type": "text",
+                "text": text,
+            },
+        )
+    except Exception as e:
+        logger.warning("save pending burst text failed: %s", str(e)[:200])
+
+
 def _clear_pending_explicit(group_id: str) -> None:
     # C1 fix (2026-05-30): 走 pending_store.clear_group 單鎖（含刪 media 檔），
     # 不再 load 全 dict → pop → save_full 整段覆寫（會蓋掉別 group 並發寫入）。
@@ -2972,14 +3072,22 @@ def _commit_pending_removal(group_id: str, msg_ids: list[str]) -> int:
     """
     if not msg_ids:
         return 0
-    # C1 fix (2026-05-30): 逐筆走 pending_store.remove_by_message_id 單鎖（idempotent），
-    # 不再 load 全 dict → filter → save_full 整段覆寫（跨 process lost-update）。
     import pending_store as _ps
-    removed = 0
-    for mid in msg_ids:
-        if mid and _ps.remove_by_message_id(group_id, mid):
-            removed += 1
-    return removed
+    return _ps.remove_by_message_ids(group_id, msg_ids)
+
+
+def _commit_pending_entries(group_id: str, entries: list[dict]) -> int:
+    """Remove only the supplied snapshot entries by message_id."""
+    if not entries:
+        return 0
+    return _commit_pending_removal(
+        group_id, [it.get("message_id") for it in entries if it.get("message_id")]
+    )
+
+
+def _pending_push_retry_key(group_id: str, msg_ids: list[str]) -> str:
+    seed = f"line_bot:pending_reply:{group_id}:{','.join(mid for mid in msg_ids if mid)}"
+    return str(_uuid.uuid5(_uuid.NAMESPACE_URL, seed))
 
 
 def _dlq_entry(group_id: str, entry: dict, reason: str) -> None:
@@ -3003,33 +3111,13 @@ def _drop_stale_pending(group_id: str, max_age_sec: int = _PENDING_MAX_AGE_SEC) 
     保護機制：avoid PDF / non-text / failed-LLM entry 永久卡住消耗 piggyback slot。
     timestamp 缺失的舊 entry 視為 now（不誤刪）。
     """
-    data = _load_pending_explicit()
-    items = data.get(group_id, [])
-    if not items:
-        return 0
-    now = time.time()
-    keep, drop = [], []
-    for it in items:
-        ts = it.get("timestamp")
-        if ts is None or (now - ts) <= max_age_sec:
-            keep.append(it)
-        else:
-            drop.append(it)
+    import pending_store as _ps
+    drop = _ps.pop_stale(group_id, max_age_sec)
     if not drop:
         return 0
     for it in drop:
         _dlq_entry(group_id, it, reason=f"age>{max_age_sec}s")
-        path = it.get("media_path")
-        if path and os.path.exists(path):
-            try:
-                os.remove(path)
-            except Exception:
-                pass
-    data[group_id] = keep
-    if not keep:
-        data.pop(group_id, None)
-    _save_pending_explicit_raw(data)
-    logger.info("DLQ drop: group=%s dropped=%d kept=%d", group_id, len(drop), len(keep))
+    logger.info("DLQ drop: group=%s dropped=%d", group_id, len(drop))
     return len(drop)
 
 
@@ -3270,19 +3358,56 @@ def _global_pending_drain_ready() -> bool:
     return True
 
 
-# Per-group drain lock：三 caller（startup / retry / piggyback）共用，避免同 group 兩個 thread
-# 同時 drain 重複 push（GP1 important #3 race）。lock acquire 失敗 = 已被別人在 drain → caller skip。
+# Per-group drain lock：三 caller（startup / retry / piggyback）共用，避免同 group 兩個
+# thread/process 同時 drain 重複 push。thread lock 擋同 process；fcntl 擋 uvicorn/launchd
+# overlap 的跨 process race。
 _drain_locks: dict[str, threading.Lock] = {}
 _drain_lock_factory_lock = threading.Lock()
+_DRAIN_LOCK_DIR = os.path.join(os.path.dirname(__file__), ".drain_locks")
 
 
-def _try_acquire_drain_slot(group_id: str) -> threading.Lock | None:
-    """non-blocking acquire 該 group 的 drain lock。拿到回 lock object，拿不到回 None。"""
+class _DrainSlot:
+    def __init__(self, thread_lock: threading.Lock, file_handle) -> None:
+        self._thread_lock = thread_lock
+        self._file_handle = file_handle
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        try:
+            fcntl.flock(self._file_handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            try:
+                self._file_handle.close()
+            finally:
+                self._thread_lock.release()
+
+
+def _try_acquire_drain_slot(group_id: str) -> _DrainSlot | None:
+    """Non-blocking acquire 該 group 的 drain slot。拿不到表示已有 drain 在跑。"""
     with _drain_lock_factory_lock:
         if group_id not in _drain_locks:
             _drain_locks[group_id] = threading.Lock()
         lock = _drain_locks[group_id]
-    return lock if lock.acquire(blocking=False) else None
+    if not lock.acquire(blocking=False):
+        return None
+    try:
+        os.makedirs(_DRAIN_LOCK_DIR, exist_ok=True)
+        digest = hashlib.sha256(group_id.encode("utf-8")).hexdigest()[:32]
+        fh = open(os.path.join(_DRAIN_LOCK_DIR, f"{digest}.lock"), "w")
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            fh.close()
+            lock.release()
+            return None
+        return _DrainSlot(lock, fh)
+    except Exception as e:
+        logger.warning("drain slot acquire failed group=%s: %s", group_id, str(e)[:120])
+        lock.release()
+        return None
 
 
 def _drain_pending_for_group(group_id: str, source: str = "startup") -> bool:
@@ -3300,24 +3425,25 @@ def _drain_pending_for_group(group_id: str, source: str = "startup") -> bool:
         logger.info("%s: skip, another drain in progress for group=%s", source, group_id)
         return False
     try:
-        pending = _load_pending_explicit()
-        items = pending.get(group_id, [])
+        import pending_store as _ps
+        _ps.ensure_message_ids(group_id)
+        items = _ps.list_for_group(group_id)
         if isinstance(items, dict):  # 舊格式相容
             items = [items]
 
         # D1 TTL: drain 前先清超齡 entry 到 DLQ
         dropped = _drop_stale_pending(group_id)
         if dropped:
-            pending = _load_pending_explicit()
-            items = pending.get(group_id, [])
+            items = _ps.list_for_group(group_id)
         if not items:
-            _clear_pending_explicit(group_id)
             return True
 
         # __bot__ 條目不應出現在 pending（recovery 污染防護）
+        bot_items = [it for it in items if it.get("user_id") == "__bot__"]
+        if bot_items:
+            _commit_pending_entries(group_id, bot_items)
         items = [it for it in items if it.get("user_id") != "__bot__"]
         if not items:
-            _clear_pending_explicit(group_id)
             return True
 
         groups = _gemini_group_messages(items)
@@ -3325,15 +3451,24 @@ def _drain_pending_for_group(group_id: str, source: str = "startup") -> bool:
             "%s: group=%s items=%d groups=%d", source, group_id, len(items), len(groups)
         )
 
-        processed_idx = set()
-        try:
-            for g in groups:
-                idxs = g["idxs"]
-                reply_to_idx = g["reply_to"]
-                group_items = [items[i] for i in idxs]
+        processed_count = 0
+        for g in groups:
+            idxs = [
+                i for i in g.get("idxs", [])
+                if isinstance(i, int) and 0 <= i < len(items)
+            ]
+            if not idxs:
+                continue
+            reply_to_idx = g.get("reply_to")
+            if not isinstance(reply_to_idx, int) or reply_to_idx not in idxs:
+                reply_to_idx = idxs[0]
+            group_items = [items[i] for i in idxs]
+            msg_ids = [it.get("message_id") for it in group_items if it.get("message_id")]
+            try:
                 parts = _build_group_parts(group_items, group_id)
                 if not parts:
-                    processed_idx.update(idxs)
+                    removed = _commit_pending_removal(group_id, msg_ids)
+                    processed_count += removed
                     continue
 
                 context = memory.get_context(group_id)
@@ -3344,6 +3479,12 @@ def _drain_pending_for_group(group_id: str, source: str = "startup") -> bool:
                 text = _md_to_line(reply_text)
                 footer = _get_quota_footer()
                 text = text[: 4900 - len(footer)] + footer
+                if _is_system_status_outbound(text):
+                    logger.info(
+                        "%s pending: suppressed system-status push group=%s preview=%r",
+                        source, group_id, text[:120],
+                    )
+                    return True
 
                 msg_kwargs = {"text": text}
                 qt = items[reply_to_idx].get("quote_token")
@@ -3355,8 +3496,38 @@ def _drain_pending_for_group(group_id: str, source: str = "startup") -> bool:
                         PushMessageRequest(
                             to=group_id,
                             messages=[TextMessage(**msg_kwargs)],
-                        )
+                        ),
+                        x_line_retry_key=_pending_push_retry_key(group_id, msg_ids),
                     )
+            except Exception as e:
+                if _is_quota_error(e):
+                    _mark_quota_exhausted()
+                    logger.warning(
+                        "%s pending: quota re-exhausted, kept unprocessed pending for group=%s",
+                        source, group_id,
+                    )
+                else:
+                    logger.warning(
+                        "%s pending: push/build failed (%s), kept unprocessed pending for group=%s",
+                        source, str(e)[:120], group_id,
+                    )
+                return True
+
+            try:
+                removed = _commit_pending_removal(group_id, msg_ids)
+                processed_count += removed
+                if removed < len(msg_ids):
+                    logger.error(
+                        "%s pending: pushed but removed %d/%d pending ids for group=%s",
+                        source, removed, len(msg_ids), group_id,
+                    )
+            except Exception as e:
+                logger.exception(
+                    "%s pending: pushed but commit removal failed for group=%s: %s",
+                    source, group_id, e,
+                )
+
+            try:
                 memory.append_turn(
                     group_id,
                     "user",
@@ -3368,35 +3539,13 @@ def _drain_pending_for_group(group_id: str, source: str = "startup") -> bool:
                     or "[非文字訊息]",
                 )
                 memory.append_turn(group_id, "bot", reply_text)
-                processed_idx.update(idxs)
-        except Exception as e:
-            remaining = [it for i, it in enumerate(items) if i not in processed_idx]
-            # C1 fix (2026-05-30): 走 pending_store.replace_group 單鎖原子寫回，
-            # 不再 load 全 dict → 指派 → save_full 整段覆寫（會吃掉並發寫入）。
-            import pending_store as _ps
-            if _is_quota_error(e):
-                _mark_quota_exhausted()
-                _ps.replace_group(group_id, remaining)
+            except Exception as e:
                 logger.warning(
-                    "%s pending: quota re-exhausted, saved %d remaining for group=%s",
-                    source, len(remaining), group_id,
+                    "%s pending: memory append failed after push group=%s: %s",
+                    source, group_id, str(e)[:120],
                 )
-                return True
-            err_str = str(e)
-            if remaining:
-                _ps.replace_group(group_id, remaining)
-                logger.warning(
-                    "%s pending: push failed (%s), saved %d remaining for group=%s",
-                    source, err_str[:80], len(remaining), group_id,
-                )
-            else:
-                logger.exception(
-                    "%s pending reply failed for group=%s: %s", source, group_id, e
-                )
-            return True
 
-        _clear_pending_explicit(group_id)
-        logger.info("%s: group=%s all pending cleared", source, group_id)
+        logger.info("%s: group=%s removed %d processed pending", source, group_id, processed_count)
         return True
     finally:
         slot.release()
@@ -3767,6 +3916,38 @@ def _is_quota_error(e: Exception) -> bool:
     )
 
 
+def _is_definite_reply_token_error(e: Exception) -> bool:
+    """Only fallback push when LINE definitely rejected the reply token.
+
+    Network timeouts/5xx are ambiguous: LINE may have accepted reply_message, so
+    pushing again can duplicate the primary response.
+    """
+    status = getattr(e, "status", None) or getattr(e, "status_code", None)
+    body = str(e).lower()
+    try:
+        status_int = int(status) if status is not None else None
+    except (TypeError, ValueError):
+        status_int = None
+    if status_int is not None and status_int >= 500:
+        return False
+    tokenish = (
+        "reply_token" in body
+        or "reply token" in body
+        or ("token" in body and ("expired" in body or "invalid" in body))
+    )
+    definite = any(
+        marker in body
+        for marker in (
+            "expired",
+            "invalid",
+            "already been used",
+            "used reply token",
+            "reply token not found",
+        )
+    )
+    return bool(tokenish and definite)
+
+
 def _friendly_gemini_error(e: Exception, file_name: str | None = None) -> str:
     """把 google-genai SDK 的錯誤翻成使用者友善訊息。"""
     err_str = str(e)
@@ -3815,7 +3996,7 @@ def _maybe_extract_facts(group_id: str, user_id: str = "") -> None:
 _REMINDER_DATE_HINT = re.compile(
     r"(\d+\s*月\s*\d+|\d+/\d+|\d+號|\d+日|"
     r"今天|今晚|明天|明日|明晚|後天|大後天|"
-    r"星期[一二三四五六日天]|週[一二三四五六日]|"
+    r"(?:星期|週|周|禮拜)[一二三四五六日天]|"
     r"下\s*(週|周|星期|月)|這\s*(週|周|星期))"
 )
 _REMINDER_TIME_HINT = re.compile(
@@ -3826,6 +4007,35 @@ _REMINDER_TIME_HINT = re.compile(
 
 
 _REMINDER_DRAIN_CAP = 5  # GP2 D1b: 每次 drain 最多抽幾筆，攤平 backlog 不燒爆當天額度
+
+
+def _calendar_regex_to_reminder_result(
+    text: str, today_tw, user_id: str | None = None
+) -> dict | None:
+    """Use deterministic calendar regex as a reminder extractor fallback."""
+    try:
+        import calendar_regex
+        data = calendar_regex.extract_regex_only(text, today_tw)
+    except Exception as e:
+        logger.debug("calendar regex reminder fallback skipped: %s", e)
+        return None
+    if not (data.get("has_event") and data.get("date") and data.get("time")):
+        return None
+    try:
+        year_s, month_s, day_s = str(data["date"]).split("-", 2)
+        hour_s, minute_s = str(data["time"]).split(":", 1)
+        actor = _infer_medical_actor(text, user_id)
+        action = _apply_medical_actor(data.get("title") or text[:30], actor)
+        return {
+            "action": action,
+            "year": int(year_s),
+            "month": int(month_s),
+            "day": int(day_s),
+            "hour": int(hour_s),
+            "minute": int(minute_s),
+        }
+    except (ValueError, TypeError):
+        return None
 
 
 def _enqueue_reminder_if_candidate(
@@ -3866,42 +4076,61 @@ def _drain_pending_reminders(group_id: str, limit: int = _REMINDER_DRAIN_CAP) ->
         pid = row["pending_id"]
         if not memory.claim_pending_reminder(pid):  # atomic claim：搶不到表示別的 drain 在處理
             continue
+        terminal_written = False
         try:
             # R1: 用訊息「當時」的 created_at 還原 today_iso，解相對日期
             today_iso = _dt.fromtimestamp(row["created_at"]).strftime("%Y-%m-%d %A")
+            msg_dt = _dt.fromtimestamp(row["created_at"])
             result = gemini_client.extract_reminder(row["text"], today_iso=today_iso)
+            if result is None:
+                result = _calendar_regex_to_reminder_result(
+                    row["text"], msg_dt.date(), row["user_id"]
+                )
+                if result is None:
+                    memory.mark_pending_reminder(pid, "dropped")  # Gemini 判定非提醒
+                    terminal_written = True
+                    continue
+            else:
+                actor = _infer_medical_actor(row["text"], row["user_id"])
+                if actor and "action" in result:
+                    result["action"] = _apply_medical_actor(str(result["action"]), actor)
+            try:
+                remind_dt = _dt(
+                    int(result["year"]), int(result["month"]), int(result["day"]),
+                    int(result["hour"]), int(result["minute"]),
+                )
+            except (ValueError, KeyError, TypeError):
+                memory.mark_pending_reminder(pid, "dropped")
+                terminal_written = True
+                continue
+            remind_at = int(remind_dt.timestamp())
+            if remind_at < _dt.now().timestamp() - 3600:  # 抽出來已過期
+                memory.mark_pending_reminder(pid, "dropped")
+                terminal_written = True
+                continue
+            rid = memory.add_reminder(
+                group_id, row["user_id"], result["action"], remind_at,
+                source_text=row["text"][:200],
+            )
+            memory.mark_pending_reminder(pid, "done")
+            terminal_written = True
+            if rid:
+                logger.info(
+                    "reminder drained: rid=%d action=%r at=%s",
+                    rid, result["action"], remind_dt.strftime("%Y-%m-%d %H:%M"),
+                )
         except Exception as e:
             if _is_quota_error(e):
                 _mark_quota_exhausted()
                 memory.release_pending_reminder(pid)
                 break  # 額度又爆 → 停本輪，剩下的留待下次
-            memory.release_pending_reminder(pid)  # transient 429 / 其他 → 退回等下輪
-            continue
-        if result is None:
-            memory.mark_pending_reminder(pid, "dropped")  # Gemini 判定非提醒
-            continue
-        try:
-            remind_dt = _dt(
-                int(result["year"]), int(result["month"]), int(result["day"]),
-                int(result["hour"]), int(result["minute"]),
+            logger.warning(
+                "drain reminders: release pending_id=%s after failure: %s",
+                pid, str(e)[:160],
             )
-        except (ValueError, KeyError, TypeError):
-            memory.mark_pending_reminder(pid, "dropped")
+            if not terminal_written:
+                memory.release_pending_reminder(pid)
             continue
-        remind_at = int(remind_dt.timestamp())
-        if remind_at < _dt.now().timestamp() - 3600:  # 抽出來已過期
-            memory.mark_pending_reminder(pid, "dropped")
-            continue
-        rid = memory.add_reminder(
-            group_id, row["user_id"], result["action"], remind_at,
-            source_text=row["text"][:200],
-        )
-        memory.mark_pending_reminder(pid, "done")
-        if rid:
-            logger.info(
-                "reminder drained: rid=%d action=%r at=%s",
-                rid, result["action"], remind_dt.strftime("%Y-%m-%d %H:%M"),
-            )
 
 
 def _maybe_extract_reminder(
@@ -3921,11 +4150,14 @@ def _maybe_extract_reminder(
     try:
         result = gemini_client.extract_reminder(text)
         if result is None:
-            # TODO(deferred, Phase6 GP-A): None 同時涵蓋「Gemini 判非提醒」與
-            # 「5xx/timeout 被 extract_reminder 吞成 None」。後者其實該入隊補抽
-            # （目前 silent drop）。未來可讓 extract_reminder 對非 429 transient
-            # 也 raise，這裡比照 429 入隊。本次 scope 限 429 quota 丟失。
-            return
+            from datetime import datetime as _dt
+            result = _calendar_regex_to_reminder_result(text, _dt.now().date(), user_id)
+            if result is None:
+                return
+        else:
+            actor = _infer_medical_actor(text, user_id)
+            if actor and "action" in result:
+                result["action"] = _apply_medical_actor(str(result["action"]), actor)
         # 算 remind_at（local timezone）
         from datetime import datetime as _dt
         try:
@@ -4669,19 +4901,25 @@ def _try_piggyback_drain_with_reply_token(
         )
         return
     try:
+        import pending_store as _ps
+        _ps.ensure_message_ids(group_id)
         rendered = _peek_text_pending_for_drain(
             group_id, max_count=2, deadline_sec=6.0
         )
         if not rendered:
             return
 
-        notice = (
-            "📵 咪寶今天 Gemini 額度用完，先用本機模型補回前面漏掉的留言。"
-            "你這則訊息會等額度恢復後再回。"
-        )
-        messages: list = [TextMessage(text=notice)]
+        messages: list = []
         for text, _msg_id in rendered:
+            if _is_system_status_outbound(text):
+                logger.info(
+                    "quota piggyback suppressed system-status text group=%s preview=%r",
+                    group_id, text[:120],
+                )
+                continue
             messages.append(TextMessage(text=text))
+        if not messages:
+            return
 
         try:
             with ApiClient(_get_line_config()) as api_client:
@@ -4715,7 +4953,9 @@ def _try_piggyback_drain_with_reply_token(
         slot.release()
 
 
-def _pop_pending_for_piggyback(group_id: str) -> str | None:
+def _peek_pending_for_piggyback(
+    group_id: str, skip_ids: set[str] | None = None
+) -> tuple[str, list[str]] | None:
     """pending 有訊息時，從佇列頭取 1 則處理生回覆，格式化成 piggyback 訊息。
 
     優先序：
@@ -4724,11 +4964,14 @@ def _pop_pending_for_piggyback(group_id: str) -> str | None:
       3. 沒 file → image pending（每次 1 張，走 media_pipeline.analyze_image
          local vision；50s thread timeout 跟 _handle_image_message 對齊）
 
-    成功回格式化字串並從 pending 移除；失敗回 None，pending 不動。
+    成功回 (格式化字串, message_ids)；失敗回 None，pending 不動。
+    caller 必須等 LINE reply 成功後才 commit removal。
     """
     _drop_stale_pending(group_id)  # D1 TTL: age>7d 進 DLQ，避免 PDF stuck 卡 slot
     pending = _load_pending_explicit()
     items = pending.get(group_id, [])
+    if skip_ids:
+        items = [it for it in items if it.get("message_id") not in skip_ids]
     if not items:
         return None
 
@@ -4751,11 +4994,12 @@ def _pop_pending_for_piggyback(group_id: str) -> str | None:
             return None
         if not reply_text:
             return None
-        # C1 fix (2026-05-30): 逐筆走單鎖移除，不再整段 save_full 覆寫。
-        _commit_pending_removal(group_id, [it.get("message_id") for it in batch])
         orig_preview = original[:300] + ("…" if len(original) > 300 else "")
         reply_preview = _md_to_line(reply_text)
-        return f"📬 補回之前漏掉的訊息\n\n原文：\n{orig_preview}\n\n回應：\n{reply_preview}"
+        return (
+            f"📬 補回之前漏掉的訊息\n\n原文：\n{orig_preview}\n\n回應：\n{reply_preview}",
+            [it.get("message_id") for it in batch if it.get("message_id")],
+        )
 
     # ── 2. file pending（PDF/Office 走 local fallback）──────────────────
     _file_items = [
@@ -4781,12 +5025,11 @@ def _pop_pending_for_piggyback(group_id: str) -> str | None:
         if not reply_text or not reply_text.strip():
             return None
 
-        # C1 fix (2026-05-30): 走單鎖移除（remove_by_message_id 會一併刪 media 檔），
-        # 不再整段 save_full 覆寫 + 手動 os.remove。
-        _commit_pending_removal(group_id, [file_item.get("message_id")])
-
         reply_preview = _md_to_line(reply_text)[:1500]
-        return f"📬 補回之前漏掉的檔案 [{file_name}]\n\n回應：\n{reply_preview}"
+        return (
+            f"📬 補回之前漏掉的檔案 [{file_name}]\n\n回應：\n{reply_preview}",
+            [file_item.get("message_id")] if file_item.get("message_id") else [],
+        )
 
     # ── 3. image pending（local 圖像辨識 via media_pipeline.analyze_image）─
     _image_items = [
@@ -4830,12 +5073,21 @@ def _pop_pending_for_piggyback(group_id: str) -> str | None:
     if not reply_text or not reply_text.strip():
         return None
 
-    # C1 fix (2026-05-30): 走單鎖移除（remove_by_message_id 會一併刪 media 檔），
-    # 不再整段 save_full 覆寫 + 手動 os.remove。
-    _commit_pending_removal(group_id, [img_item.get("message_id")])
-
     reply_preview = _md_to_line(reply_text)[:1500]
-    return f"📷 補回之前漏掉的圖片\n\n圖片分析：\n{reply_preview}"
+    return (
+        f"📷 補回之前漏掉的圖片\n\n圖片分析：\n{reply_preview}",
+        [img_item.get("message_id")] if img_item.get("message_id") else [],
+    )
+
+
+def _pop_pending_for_piggyback(group_id: str) -> str | None:
+    """Legacy pop wrapper. New reply path uses peek-then-confirm."""
+    peeked = _peek_pending_for_piggyback(group_id)
+    if not peeked:
+        return None
+    text, msg_ids = peeked
+    _commit_pending_removal(group_id, msg_ids)
+    return text
 
 
 def _drain_pending_file(
@@ -4991,6 +5243,12 @@ def _reply(reply_token: str, text: str, group_id: str | None = None) -> None:
     # LINE 單則訊息上限 5000 字；在截斷前先預留 footer 空間
     footer = _get_quota_footer()
     text = text[: 4900 - len(footer)] + footer
+    if _is_system_status_outbound(text):
+        logger.info(
+            "suppressed system-status LINE reply group=%s preview=%r",
+            group_id, text[:120],
+        )
+        return
 
     # ── Mute 守門 ─────────────────────────────────────────────────────────────
     # 修 bug 期間預設靜音。webhook 照收、classifier/chat 照跑、log 照寫，只是不送 LINE。
@@ -5008,92 +5266,187 @@ def _reply(reply_token: str, text: str, group_id: str | None = None) -> None:
     # 2026-05-16 改：從 1 提到 4，加速 pending drain（quota 爆等月初重置這種長窗期）
     # 2026-05-21 加：reminder piggyback（advisor: pending 優先，剩餘 slot 給 reminder）
     messages_to_send: list = [TextMessage(text=text)]
+    pending_commit_ids: list[str] = []
     pending_reminders: list[tuple[str, int]] = []  # (event_id, offset) — reply 成功才 mark
-    if group_id:
-        # Step 1: 先塞 pending（user 已選 pending 為優先）
-        for _ in range(4):
-            if _quota_exhausted():
-                logger.info("piggyback skip: gemini exhausted group=%s", group_id)
-                break
-            pig = _pop_pending_for_piggyback(group_id)
-            if not pig:
-                # 區分「沒 pending」vs「pending 全是 non-text」(PDF/audio stuck)
-                pending_count = len(_load_pending_explicit().get(group_id, []))
-                if pending_count > 0:
+    pending_reminder_pushes: list[tuple[int, str]] = []  # (reminder_id, stage) — reply 成功才 mark
+    pending_slot = None
+    try:
+        if group_id:
+            # Step 1: 先塞 pending（user 已選 pending 為優先）。
+            # 拿同一把 drain lock，且只 peek；reply 成功後才 commit removal。
+            if _load_pending_explicit().get(group_id):
+                pending_slot = _try_acquire_drain_slot(group_id)
+                if pending_slot is None:
                     logger.info(
-                        "piggyback skip: pending=%d but all non-text or llm failed group=%s",
-                        pending_count, group_id,
+                        "piggyback skip: another drain in progress group=%s",
+                        group_id,
                     )
-                break
-            messages_to_send.append(TextMessage(text=pig[:5000]))
-            logger.info("piggyback popped 1 group=%s pig_len=%d", group_id, len(pig))
-        # Step 2: 剩餘 slot 給 due reminders (LINE push quota 爆時的 fallback)
-        try:
-            import calendar_db
-            import event_reminder as _er
-            for offset in calendar_db.REMINDER_OFFSETS:
-                if len(messages_to_send) >= 5:
-                    break
-                due = calendar_db.list_due_for_reminder(group_id, days_ahead=offset)
-                for e in due:
+                else:
+                    import pending_store as _ps
+                    _ps.ensure_message_ids(group_id)
+                    if not _quota_exhausted():
+                        rendered = _peek_text_pending_for_drain(
+                            group_id, max_count=4, deadline_sec=6.0
+                        )
+                        for pig_text, msg_id in rendered:
+                            if _is_system_status_outbound(pig_text):
+                                logger.info(
+                                    "piggyback suppressed system-status text group=%s preview=%r",
+                                    group_id, pig_text[:120],
+                                )
+                                continue
+                            messages_to_send.append(TextMessage(text=pig_text[:5000]))
+                            if msg_id:
+                                pending_commit_ids.append(msg_id)
+                            logger.info(
+                                "piggyback peeked text group=%s pig_len=%d",
+                                group_id, len(pig_text),
+                            )
+                            if len(messages_to_send) >= 5:
+                                break
+                    else:
+                        logger.info("piggyback skip: gemini exhausted group=%s", group_id)
+                    if len(messages_to_send) == 1:
+                        pending_count = len(_load_pending_explicit().get(group_id, []))
+                        if pending_count > 0:
+                            logger.info(
+                                "piggyback skip: pending=%d but no text entry rendered group=%s",
+                                pending_count, group_id,
+                            )
+            # Step 2: 剩餘 slot 給 due reminders (LINE push quota 爆時的 fallback)
+            try:
+                import calendar_db
+                import event_reminder as _er
+                for offset in calendar_db.REMINDER_OFFSETS:
                     if len(messages_to_send) >= 5:
                         break
-                    rtext = _er._format_event(e, offset)
-                    messages_to_send.append(TextMessage(text=rtext))
-                    pending_reminders.append((e["event_id"], offset))
-        except Exception as e:
-            logger.warning("reminder piggyback skip: %s", e)
-
-    resp = None
-    try:
-        with ApiClient(_get_line_config()) as api_client:
-            resp = MessagingApi(api_client).reply_message(
-                ReplyMessageRequest(
-                    reply_token=reply_token,
-                    messages=messages_to_send,
-                )
-            )
-    except Exception as e:
-        # reply_token 過期 / 用過 / 重送事件 → fallback 到 push_message
-        logger.warning("reply failed: %s", str(e)[:300])
-        if group_id:
-            try:
-                with ApiClient(_get_line_config()) as api_client:
-                    MessagingApi(api_client).push_message(
-                        PushMessageRequest(
-                            to=group_id,
-                            messages=[TextMessage(text=text)],
+                    due = calendar_db.list_due_for_reminder(group_id, days_ahead=offset)
+                    for e in due:
+                        if len(messages_to_send) >= 5:
+                            break
+                        spec = _er.build_reminder_message_spec(
+                            e, offset, allow_mention=False
                         )
-                    )
-                logger.info("fallback push_message sent to group=%s", group_id)
-                memory.log_raw_message(
-                    group_id, f"push_{int(time.time() * 1000)}", "__bot__", text
-                )
-            except Exception as push_err:
-                logger.warning("fallback push also failed: %s", str(push_err)[:300])
-        return
+                        if spec is None:
+                            continue
+                        messages_to_send.append(TextMessage(text=spec["text"]))
+                        pending_reminders.append((e["event_id"], offset))
+            except Exception as e:
+                logger.warning("reminder piggyback skip: %s", e)
 
-    # reply 成功 → mark reminders (peek-then-confirm pattern)
-    if pending_reminders:
+            # Step 3: 再把自然語言 reminder_push 的 due reminder 塞進剩餘 slot。
+            # 這些原本只能靠 push_message；LINE monthly push quota 爆時，使用者留言觸發
+            # 的 reply_message 仍可帶出，且成功後才 mark，避免假成功。
+            try:
+                if len(messages_to_send) < 5:
+                    import reminder_push as _rp
+                    remaining = 5 - len(messages_to_send)
+                    for item in _rp.due_reminders_for_reply(
+                        group_id, limit=remaining
+                    ):
+                        messages_to_send.append(TextMessage(text=item["text"][:5000]))
+                        pending_reminder_pushes.append(
+                            (item["reminder_id"], item["stage"])
+                        )
+            except Exception as e:
+                logger.warning("reminder_push piggyback skip: %s", e)
+
+        resp = None
         try:
-            import calendar_db as _cdb
-            for ev_id, off in pending_reminders:
-                _cdb.mark_reminded(ev_id, off, group_id)
-            logger.info(
-                "reminder piggyback marked: %d reminders group=%s",
-                len(pending_reminders), group_id,
-            )
+            with ApiClient(_get_line_config()) as api_client:
+                resp = MessagingApi(api_client).reply_message(
+                    ReplyMessageRequest(
+                        reply_token=reply_token,
+                        messages=messages_to_send,
+                    )
+                )
         except Exception as e:
-            logger.warning("reminder mark_reminded failed: %s", e)
+            logger.warning("reply failed: %s", str(e)[:300])
+            if group_id and not _is_definite_reply_token_error(e):
+                logger.warning(
+                    "reply failure ambiguous; skip fallback push to avoid duplicate group=%s",
+                    group_id,
+                )
+                return
+            # reply_token 明確過期 / invalid / 已用過 → fallback 到 push_message
+            if group_id:
+                try:
+                    with ApiClient(_get_line_config()) as api_client:
+                        MessagingApi(api_client).push_message(
+                            PushMessageRequest(
+                                to=group_id,
+                                messages=[TextMessage(text=text)],
+                            )
+                        )
+                    logger.info("fallback push_message sent to group=%s", group_id)
+                    memory.log_raw_message(
+                        group_id, f"push_{int(time.time() * 1000)}", "__bot__", text
+                    )
+                except Exception as push_err:
+                    logger.warning("fallback push also failed: %s", str(push_err)[:300])
+            return
 
-    # 把 bot 自己的回覆也記進 raw_messages,供之後 quote-lookup
-    if group_id is None:
-        return
-    sent_messages = getattr(resp, "sent_messages", None) or []
-    for sm in sent_messages:
-        sm_id = getattr(sm, "id", None)
-        if sm_id:
-            memory.log_raw_message(group_id, sm_id, "__bot__", text)
+        if pending_commit_ids and group_id:
+            try:
+                removed = _commit_pending_removal(group_id, pending_commit_ids)
+                if removed < len(pending_commit_ids):
+                    logger.error(
+                        "piggyback reply succeeded but committed %d/%d pending group=%s",
+                        removed, len(pending_commit_ids), group_id,
+                    )
+                else:
+                    logger.info("piggyback committed %d pending group=%s", removed, group_id)
+            except Exception as e:
+                logger.exception(
+                    "piggyback reply succeeded but pending commit failed group=%s: %s",
+                    group_id, e,
+                )
+
+        # reply 成功 → mark reminders (peek-then-confirm pattern)
+        if pending_reminders:
+            try:
+                import calendar_db as _cdb
+                for ev_id, off in pending_reminders:
+                    _cdb.mark_reminded(ev_id, off, group_id)
+                logger.info(
+                    "reminder piggyback marked: %d reminders group=%s",
+                    len(pending_reminders), group_id,
+                )
+            except Exception as e:
+                logger.warning("reminder mark_reminded failed: %s", e)
+
+        # reply 成功 → mark reminder_push reminders (peek-then-confirm pattern)
+        if pending_reminder_pushes:
+            try:
+                import reminder_push as _rp
+                marked = _rp.mark_reminders_pushed(pending_reminder_pushes)
+                if marked < len(pending_reminder_pushes):
+                    logger.error(
+                        "reminder_push piggyback marked %d/%d reminders group=%s",
+                        marked, len(pending_reminder_pushes), group_id,
+                    )
+                else:
+                    logger.info(
+                        "reminder_push piggyback marked: %d reminders group=%s",
+                        marked, group_id,
+                    )
+            except Exception as e:
+                logger.warning("reminder_push mark_reminders_pushed failed: %s", e)
+
+        # 把 bot 自己的回覆也記進 raw_messages,供之後 quote-lookup
+        if group_id is None:
+            return
+        sent_messages = getattr(resp, "sent_messages", None) or []
+        for idx, sm in enumerate(sent_messages):
+            sm_id = getattr(sm, "id", None)
+            if sm_id:
+                sent_text = text
+                if idx < len(messages_to_send):
+                    sent_text = getattr(messages_to_send[idx], "text", text)
+                memory.log_raw_message(group_id, sm_id, "__bot__", sent_text)
+    finally:
+        if pending_slot is not None:
+            pending_slot.release()
 
 
 def _download_content(message_id: str) -> bytes:

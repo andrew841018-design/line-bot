@@ -144,9 +144,13 @@ def test_event_reminder_main_no_events(tmp_calendar_db, monkeypatch):
     import event_reminder
 
     importlib.reload(event_reminder)
-    # 監聽 _push 不該被呼叫
+    # 監聽 send 不該被呼叫
     called = []
-    monkeypatch.setattr(event_reminder, "_push", lambda text: called.append(text) or True)
+    monkeypatch.setattr(
+        event_reminder,
+        "_send_reminder_message_spec",
+        lambda spec, **_kw: called.append(spec["text"]) or event_reminder.POST_OK,
+    )
     monkeypatch.setattr(event_reminder, "GROUP_ID", "G1")
 
     rc = event_reminder.main()
@@ -171,7 +175,11 @@ def test_event_reminder_pushes_and_marks(tmp_calendar_db, monkeypatch):
 
     importlib.reload(event_reminder)
     sent = []
-    monkeypatch.setattr(event_reminder, "_push", lambda text: sent.append(text) or True)
+    monkeypatch.setattr(
+        event_reminder,
+        "_send_reminder_message_spec",
+        lambda spec, **_kw: sent.append(spec["text"]) or event_reminder.POST_OK,
+    )
     monkeypatch.setattr(event_reminder, "GROUP_ID", "G1")
     monkeypatch.setattr(event_reminder, "_get_token", lambda: "dummy")
 
@@ -200,7 +208,11 @@ def test_event_reminder_skips_cancelled(tmp_calendar_db, monkeypatch):
 
     importlib.reload(event_reminder)
     sent = []
-    monkeypatch.setattr(event_reminder, "_push", lambda text: sent.append(text) or True)
+    monkeypatch.setattr(
+        event_reminder,
+        "_send_reminder_message_spec",
+        lambda spec, **_kw: sent.append(spec["text"]) or event_reminder.POST_OK,
+    )
     monkeypatch.setattr(event_reminder, "GROUP_ID", "G1")
     monkeypatch.setattr(event_reminder, "_get_token", lambda: "dummy")
 

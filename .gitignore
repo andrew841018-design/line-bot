@@ -23,9 +23,11 @@ finetune/data/*.db
 finetune/data/pii_mappings.db
 finetune/data/pii_mappings.db-*
 gemini_usage.json
+gemini_usage.json.tmp
 quota_state.json
 alert_state.json
 pending_explicit_reply.json
+event_reminder_private.json
 pushed_jobs.json
 suggestion_history.json
 .coverage
@@ -39,9 +41,12 @@ pending_explicit_reply.json.bak*
 locks/
 state/
 logs/jobs/
+logs/auto_iterate_*.md
 *.bak.20*_*
 
 # Runtime state (per-bot persistence, never sync)
 pending_dlq.jsonl
 soxl_health_state.json
+quote_history.json
 pending_media/
+.drain_locks/

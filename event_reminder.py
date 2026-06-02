@@ -1,6 +1,6 @@
-"""家族行事曆 — T-3 / T-2 / T-1 三天提醒推播（launchd 每天 07:00 觸發）。
+"""家族行事曆 — 多 offset 活動提醒推播（launchd 每天 07:00 觸發）。
 
-每次跑時依序處理 3 種 offset (3 天後 / 後天 / 明天)，每個 event 在每個 offset
+每次跑時依序處理 calendar_db.REMINDER_OFFSETS，每個 event 在每個 offset
 只推一次（per-offset reminded_Xd 欄位 idempotency 保證）。
 
 Backward-compat: 舊 reminded_at 欄位保留，主流程已不再讀（user 2026-05-21 directive）。
@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import sys
+import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -98,49 +99,77 @@ def _format_event(e: dict, offset: int = 7) -> str:
 
 # 2026-05-29 防 PII 外洩：LINE 失敗 response 理論上只 echo 屬性路徑、不 echo 值，
 # 但仍 defense-in-depth 把任何 LINE userId（U + 32 hex）遮成 U***（GP2 review 1b）。
-_UID_RE = re.compile(r"U[0-9a-f]{32}")
+_UID_RE = re.compile(r"[UCR][0-9A-Fa-f]{32}")
+
+POST_OK = "ok"
+POST_REJECT = "definite_reject"
+POST_TRANSIENT = "transient_or_unknown"
 
 
-def _post(messages: list) -> bool:
+def _redact_line_ids(text: str) -> str:
+    return _UID_RE.sub(lambda m: f"{m.group(0)[0]}***", text or "")
+
+
+def _retry_key_for_event(e: dict, offset: int, suffix: str = "main") -> str:
+    seed = f"line_bot:event_reminder:{GROUP_ID}:{e.get('event_id')}:{offset}:{suffix}"
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, seed))
+
+
+def _post_result(messages: list, retry_key: str | None = None) -> str:
     """共用底層推播：組好的 messages list → LINE push API。
-    token / GROUP_ID 缺失或非 200 回 False；失敗 log 遮蔽 userId 防 PII 外洩。
+    token / GROUP_ID 缺失或非 200/409 回分類結果；失敗 log 先遮蔽 LINE id 再截斷。
     （_push / _push_mention 共用，遮蔽邏輯只寫一處 — GP2 DRY review）"""
     token = _get_token()
     if not token or not GROUP_ID:
         logger.error("missing TOKEN or GROUP_ID; skip push")
-        return False
+        return POST_REJECT
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "X-Line-Retry-Key": retry_key or str(uuid.uuid4()),
+    }
     try:
         resp = _session.post(
             _PUSH_URL,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
+            headers=headers,
             json={"to": GROUP_ID, "messages": messages},
             timeout=10,
         )
-        if resp.status_code == 200:
-            return True
+        if resp.status_code in (200, 409):
+            return POST_OK
+        body = _redact_line_ids(resp.text)[:300]
         logger.warning(
             "LINE push failed %d: %s",
             resp.status_code,
-            _UID_RE.sub("U***", resp.text[:300]),
+            body,
         )
-        return False
+        if resp.status_code == 429 or resp.status_code >= 500:
+            return POST_TRANSIENT
+        return POST_REJECT
     except Exception as e:
         logger.warning("LINE push exception: %s", e)
-        return False
+        return POST_TRANSIENT
 
 
-def _push(text: str) -> bool:
-    return _post([{"type": "text", "text": text}])
+def _post(messages: list, retry_key: str | None = None) -> bool:
+    return _post_result(messages, retry_key=retry_key) == POST_OK
 
 
-def _push_mention(text_template: str, placeholder: str, user_id: str) -> bool:
+def _push_result(text: str, retry_key: str | None = None) -> str:
+    return _post_result([{"type": "text", "text": text}], retry_key=retry_key)
+
+
+def _push(text: str, retry_key: str | None = None) -> bool:
+    return _push_result(text, retry_key=retry_key) == POST_OK
+
+
+def _push_mention_result(
+    text_template: str, placeholder: str, user_id: str, retry_key: str | None = None
+) -> str:
     """textV2 + substitution 真 @mention 推播（會跳通知給被標記者）。
     text_template 內用半形 {placeholder} 當佔位符；勿放其他非佔位符的半形 {}
     （LINE 會把半形 {} 內的字當佔位符解析）。"""
-    return _post(
+    return _post_result(
         [
             {
                 "type": "textV2",
@@ -152,31 +181,131 @@ def _push_mention(text_template: str, placeholder: str, user_id: str) -> bool:
                     }
                 },
             }
-        ]
+        ],
+        retry_key=retry_key,
     )
 
 
-# ── 2026-05-29 one-off（user directive）──────────────────────────────────────
-# 「看醫生外科」6/02 這筆事件 DB 時間 08:00 與其他記錄 13:00 兜不攏 → 不自己猜，
-# T-1（6/01）@媽媽 直接問本人確認。她回覆後寫回正確時間 + 移除這整段（含 .env MOM_USER_ID）。
-# 只在 offset==1 問一次：避免 T-3/T-2/T-1 三 offset 各問一次（每 offset idempotency 獨立，GP1 Q3）。
-# 其他 offset 對這筆事件直接 skip — 不發可能是錯誤時間的標準提醒。
-# ⚠️ 單一推播視窗：只在 6/01(T-1) 推一次；6/02 是 offset 0、不在 REMINDER_OFFSETS → 不會重列。
-#    若 6/01 推失敗（如 429）無自動 retry（下方 L217「at-least-once」註解對此 one-off 不成立）→ 需人工 6/01 兜底確認。
-_ASK_MOM_EVENT_IDS = {"a653382f7a494f509f21c5e8c8462b19"}
-_ASK_MOM_OFFSET = 1
-_ASK_MOM_PLACEHOLDER = "mom"
-_ASK_MOM_TEXT = (
-    "{mom}\n"
-    "提醒一下～6/2(二) 要看外科 陳晉興醫師（外科8診）\n"
-    "是早上 8:00 還是下午 1:00 呀？跟我說我幫你記正確 🙏"
-)
-# mention 投遞失敗 / MOM_USER_ID 未設 → fallback 純文字（仍把問題送出，不 silent drop，GP2 #6）
-_ASK_MOM_TEXT_PLAIN = (
-    "媽媽\n"
-    "提醒一下～6/2(二) 要看外科 陳晉興醫師（外科8診）\n"
-    "是早上 8:00 還是下午 1:00 呀？跟我說我幫你記正確 🙏"
-)
+def _push_mention(
+    text_template: str, placeholder: str, user_id: str, retry_key: str | None = None
+) -> bool:
+    return (
+        _push_mention_result(text_template, placeholder, user_id, retry_key=retry_key)
+        == POST_OK
+    )
+
+
+def _load_one_off_config() -> dict | None:
+    raw = os.environ.get("EVENT_REMINDER_ONE_OFF_JSON")
+    if raw:
+        try:
+            data = json.loads(raw)
+        except Exception as e:
+            logger.warning("invalid EVENT_REMINDER_ONE_OFF_JSON: %s", e)
+            return None
+    elif os.environ.get("REMINDER_ASK_EVENT_IDS"):
+        data = {
+            "event_ids": os.environ.get("REMINDER_ASK_EVENT_IDS", ""),
+            "offset": os.environ.get("REMINDER_ASK_OFFSET", 1),
+            "placeholder": os.environ.get("REMINDER_ASK_PLACEHOLDER", "target"),
+            "mention_text": os.environ.get("REMINDER_ASK_TEXT", ""),
+            "plain_text": os.environ.get("REMINDER_ASK_TEXT_PLAIN", ""),
+            "user_id": os.environ.get("REMINDER_ASK_USER_ID", ""),
+        }
+    else:
+        path = Path(
+            os.environ.get(
+                "EVENT_REMINDER_PRIVATE_CONFIG",
+                str(Path(__file__).parent / "event_reminder_private.json"),
+            )
+        )
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning("invalid event reminder private config %s: %s", path, e)
+            return None
+    if not isinstance(data, dict):
+        return None
+    event_ids = data.get("event_ids") or data.get("event_id") or []
+    if isinstance(event_ids, str):
+        event_ids = [x.strip() for x in event_ids.split(",") if x.strip()]
+    event_ids = {str(x) for x in event_ids if x}
+    if not event_ids:
+        return None
+    user_id = data.get("user_id") or ""
+    user_id_env = data.get("user_id_env")
+    if user_id_env and not user_id:
+        user_id = os.environ.get(str(user_id_env), "")
+    if not user_id:
+        user_id = os.environ.get("EVENT_REMINDER_ONE_OFF_USER_ID", "")
+    mention_text = str(data.get("mention_text") or data.get("text") or "")
+    plain_text = str(data.get("plain_text") or "")
+    placeholder = str(data.get("placeholder") or "target")
+    if mention_text and not plain_text:
+        plain_text = mention_text.replace(f"{{{placeholder}}}", placeholder)
+    if not (mention_text or plain_text):
+        return None
+    try:
+        offset = int(data.get("offset", 1))
+    except (TypeError, ValueError):
+        offset = 1
+    return {
+        "event_ids": event_ids,
+        "offset": offset,
+        "placeholder": placeholder,
+        "mention_text": mention_text,
+        "plain_text": plain_text,
+        "user_id": str(user_id or ""),
+    }
+
+
+def should_skip_standard_reminder(e: dict, offset: int) -> bool:
+    cfg = _load_one_off_config()
+    return bool(cfg and e.get("event_id") in cfg["event_ids"])
+
+
+def build_reminder_message_spec(
+    e: dict, offset: int, allow_mention: bool = True
+) -> dict | None:
+    """Return a delivery spec for launchd and piggyback reminder paths."""
+    cfg = _load_one_off_config()
+    if cfg and e.get("event_id") in cfg["event_ids"]:
+        if offset != cfg["offset"]:
+            return None
+        plain_text = cfg["plain_text"]
+        if allow_mention and cfg["mention_text"] and cfg["user_id"]:
+            return {
+                "kind": "mention",
+                "text": cfg["mention_text"],
+                "placeholder": cfg["placeholder"],
+                "user_id": cfg["user_id"],
+                "fallback_text": plain_text,
+            }
+        if plain_text:
+            return {"kind": "text", "text": plain_text}
+        return None
+    return {"kind": "text", "text": _format_event(e, offset)}
+
+
+def _send_reminder_message_spec(
+    spec: dict, retry_key: str | None = None, fallback_retry_key: str | None = None
+) -> str:
+    if spec.get("kind") == "mention":
+        result = _push_mention_result(
+            spec["text"],
+            spec["placeholder"],
+            spec["user_id"],
+            retry_key=retry_key,
+        )
+        if result == POST_OK:
+            return result
+        fallback_text = spec.get("fallback_text")
+        if result == POST_REJECT and fallback_text:
+            return _push_result(fallback_text, retry_key=fallback_retry_key)
+        return result
+    return _push_result(spec["text"], retry_key=retry_key)
 
 
 def main() -> int:
@@ -193,22 +322,15 @@ def main() -> int:
             continue
         total_due += len(events)
         for e in events:
-            if e["event_id"] in _ASK_MOM_EVENT_IDS:
-                # one-off：只在 T-1 @媽媽 問時間一次；其他 offset 對這筆事件 skip
-                if offset != _ASK_MOM_OFFSET:
-                    continue
-                mom_id = os.environ.get("MOM_USER_ID")
-                pushed = (
-                    _push_mention(_ASK_MOM_TEXT, _ASK_MOM_PLACEHOLDER, mom_id)
-                    if mom_id
-                    else False
-                )
-                if not pushed:
-                    # mention 失敗（userId 未設 / 非 200）→ fallback 純文字，至少送達
-                    pushed = _push(_ASK_MOM_TEXT_PLAIN)
-            else:
-                pushed = _push(_format_event(e, offset))
-            if pushed:
+            spec = build_reminder_message_spec(e, offset, allow_mention=True)
+            if spec is None:
+                continue
+            result = _send_reminder_message_spec(
+                spec,
+                retry_key=_retry_key_for_event(e, offset),
+                fallback_retry_key=_retry_key_for_event(e, offset, "fallback"),
+            )
+            if result == POST_OK:
                 calendar_db.mark_reminded(e["event_id"], offset, GROUP_ID)
                 total_sent += 1
                 logger.info(
@@ -218,7 +340,8 @@ def main() -> int:
             else:
                 # push 失敗不 mark — 下次 launchd 跑會 retry（at-least-once 保證）
                 logger.warning(
-                    "reminder push failed (T-%d): %s", offset, e["event_id"]
+                    "reminder push failed (T-%d, %s): %s",
+                    offset, result, e["event_id"]
                 )
 
     logger.info("done: %d/%d reminders sent", total_sent, total_due)

@@ -2,7 +2,8 @@
 Silent drop regression tests — verify bot 一定回覆 (Andrew 2026-05-25 rule).
 
 Per memory `feedback_bot_reply_always`: webhook handler 兩條出口必擇一
-(直接 reply OR enqueue pending)，絕不 silent drop。
+(直接 reply OR enqueue pending)，絕不 silent drop；但低價值系統式 fallback
+不要傳到 LINE。
 
 3 silent drop suspects from main.py audit (2026-05-25):
 - S4: unknown message type (Sticker / Location / Template) fall through _handle_event
@@ -68,7 +69,7 @@ def _make_sticker_like_msg():
 
 
 def test_s4_unknown_message_type_must_not_silent_drop():
-    """Sticker / Location / Template 訊息必須得到 reply 不能 silent drop。"""
+    """Sticker / Location / Template 訊息只存 pending，不回低價值 fallback。"""
     msg = _make_sticker_like_msg()
     evt = _make_message_event(msg)
 
@@ -80,11 +81,8 @@ def test_s4_unknown_message_type_must_not_silent_drop():
          patch("main.settings.allowed_group_id", "GRP001"):
         main._handle_event(evt)
 
-    called_count = mock_reply.call_count + mock_save_pending.call_count
-    assert called_count > 0, (
-        f"Silent drop: unknown message type 未呼叫 _reply 也沒 _save_pending_any "
-        f"(_reply={mock_reply.call_count}, _save_pending_any={mock_save_pending.call_count})"
-    )
+    mock_save_pending.assert_called_once()
+    mock_reply.assert_not_called()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -110,14 +108,20 @@ def test_s5a_burst_flush_quota_retry_miss_must_not_silent():
          patch("main._prefetch_urls", return_value="家人聊天 message"), \
          patch("main._reply") as mock_reply, \
          patch("main._save_pending_any") as mock_save_pending, \
+         patch("main._save_pending_burst_text") as mock_save_pending_burst, \
          patch("main._maybe_capture_calendar_event"), \
          patch("main._thinking_indicator"):
         main._handle_burst_flush("GRP001", "家人聊天 message", "TOKEN001")
 
-    called_count = mock_reply.call_count + mock_save_pending.call_count
+    called_count = (
+        mock_reply.call_count
+        + mock_save_pending.call_count
+        + mock_save_pending_burst.call_count
+    )
     assert called_count > 0, (
-        f"Silent drop: burst quota retry miss 未呼叫 _reply 也沒 _save_pending_any "
-        f"(_reply={mock_reply.call_count}, _save_pending_any={mock_save_pending.call_count})"
+        f"Silent drop: burst quota retry miss 未呼叫 _reply 也沒存 pending "
+        f"(_reply={mock_reply.call_count}, _save_pending_any={mock_save_pending.call_count}, "
+        f"_save_pending_burst_text={mock_save_pending_burst.call_count})"
     )
 
 

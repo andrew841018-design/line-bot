@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import main
+import pending_store
 from linebot.v3.webhooks import (
     GroupSource,
     MessageEvent,
@@ -140,28 +141,35 @@ def test_bug2_quote_with_empty_clean_text_calls_llm_not_greeting():
 
 def test_bug3_bot_entries_filtered_from_pending():
     """Bug 3 (ea5b877): __bot__ entries in pending must be stripped before
-    processing.  If all items are __bot__, group is cleared with no LLM call.
+    processing.  If all items are __bot__, they are removed with no LLM call.
     Regression: __bot__ entries were processed, causing duplicate pushes.
     """
     main.settings.bot_muted = False
     main._quota_exhausted_until_ts = 0.0
 
-    all_bot_pending: dict = {
+    pending_store.save_full({
         "GRP001": [
-            {"user_id": "__bot__", "text": "bot 自己的舊回覆 1", "timestamp": 100, "type": "text"},
-            {"user_id": "__bot__", "text": "bot 自己的舊回覆 2", "timestamp": 101, "type": "text"},
+            {
+                "message_id": "bot1",
+                "user_id": "__bot__",
+                "text": "bot 自己的舊回覆 1",
+                "timestamp": 100,
+                "type": "text",
+            },
+            {
+                "message_id": "bot2",
+                "user_id": "__bot__",
+                "text": "bot 自己的舊回覆 2",
+                "timestamp": 101,
+                "type": "text",
+            },
         ]
-    }
+    })
 
     llm_calls: list = []
-    cleared: list[str] = []
 
     with (
-        patch("main._load_pending_explicit", return_value=all_bot_pending),
-        patch(
-            "main._clear_pending_explicit",
-            side_effect=lambda gid: cleared.append(gid),
-        ),
+        patch("main._dlq_entry"),
         patch(
             "main._llm_chat",
             side_effect=lambda *a, **kw: llm_calls.append(True) or "reply",
@@ -173,7 +181,7 @@ def test_bug3_bot_entries_filtered_from_pending():
         main._process_pending_on_startup()
 
     assert len(llm_calls) == 0, "LLM must NOT be called when all pending items are __bot__"
-    assert "GRP001" in cleared, "Group must be cleared even when all items are __bot__"
+    assert pending_store.load().get("GRP001", []) == []
 
 
 # ── Bug 4: Grok fallback intro test 已移除（2026-04-26 grok 改為 stub）─────────
@@ -215,8 +223,8 @@ def test_bug5_quota_state_persists_across_restart():
 
 def test_bug6_quota_footer_no_percentage_unless_exhausted():
     """Bug 6 update (2026-05-05): 用戶要求拿掉 80%+ 百分比 footer，
-    避免破壞對話自然度。只在真的 quota 爆了才顯示「已用完」，
-    其他情境（即使 99%）一律不顯示百分比。
+    避免破壞對話自然度。2026-05-31 再移除 quota exhausted footer；
+    其他情境（即使 99% 或已爆）一律不顯示 footer。
     """
     main._quota_exhausted_until_ts = 0.0  # Gemini NOT exhausted
 
@@ -232,6 +240,89 @@ def test_bug6_quota_footer_no_percentage_unless_exhausted():
         footer = main._get_quota_footer()
 
     assert footer == "", f"Footer 應為空字串（不該有百分比），got: {footer!r}"
+
+    main._quota_exhausted_until_ts = time.time() + 3600
+    footer = main._get_quota_footer()
+    assert footer == "", f"Quota exhausted 時也不該附加 footer，got: {footer!r}"
+
+
+def test_bug8_burst_empty_quota_saves_pending_without_low_value_reply():
+    """Andrew 2026-05-31: quota exhausted + burst empty fallback 不要回
+    「咪寶聽到了但這個話題不太接得上~」或 quota footer；保留 pending 即可。
+    """
+    main._quota_exhausted_until_ts = time.time() + 3600
+
+    with (
+        patch("main._llm_chat", return_value=""),
+        patch("main.memory.check_fact_cache", return_value=None),
+        patch("main.memory.get_context", return_value=[]),
+        patch("main.memory.top_facts", return_value=[]),
+        patch("main._get_persona_notes", return_value=""),
+        patch("main._prefetch_urls", return_value="家人閒聊 message"),
+        patch("main._reply") as mock_reply,
+        patch("main._maybe_capture_calendar_event"),
+        patch("main._thinking_indicator", return_value=_noop_cm()),
+    ):
+        main._handle_burst_flush("GRP001", "家人閒聊 message", "TOKEN001")
+
+    assert not mock_reply.called, "Quota exhausted + empty burst must not send low-value fallback"
+    pending = pending_store.load().get("GRP001", [])
+    assert len(pending) == 1
+    assert pending[0]["type"] == "text"
+    assert pending[0]["text"] == "家人閒聊 message"
+
+
+def test_bug9_reply_suppresses_system_status_messages():
+    """Andrew 2026-05-31: LINE group must not receive internal quota/status text."""
+    main.settings.bot_muted = False
+
+    mock_api = MagicMock()
+    mock_api.__enter__ = MagicMock(return_value=mock_api)
+    mock_api.__exit__ = MagicMock(return_value=False)
+    mock_messaging = MagicMock()
+
+    blocked_text = "咪寶聽到了但這個話題不太接得上~\n\n📊 Gemini 今日用量已用完"
+
+    with (
+        patch("main.ApiClient", return_value=mock_api),
+        patch("main.MessagingApi", return_value=mock_messaging),
+        patch("main._load_pending_explicit", return_value={}),
+    ):
+        main._reply("TOKEN001", blocked_text, group_id="GRP001")
+        main._reply("TOKEN002", main._quota_exhausted_message(), group_id="GRP001")
+
+    assert not mock_messaging.reply_message.called
+    assert not mock_messaging.push_message.called
+
+
+def test_bug10_explicit_quota_miss_saves_pending_without_system_reply():
+    """Explicit @ bot quota miss should store pending and not send quota/system text."""
+    evt = _make_text_event(text="咪寶 幫我分析")
+
+    with (
+        patch(
+            "main._llm_chat",
+            side_effect=[
+                Exception("429 RESOURCE_EXHAUSTED PerDay free_tier_requests"),
+                "",
+            ],
+        ),
+        patch("main._mark_quota_exhausted"),
+        patch("main.memory.get_context", return_value=[]),
+        patch("main.memory.top_facts", return_value=[]),
+        patch("main._get_persona_notes", return_value=""),
+        patch("main._prefetch_urls", return_value="幫我分析"),
+        patch("main._maybe_capture_calendar_event"),
+        patch("main._thinking_indicator", return_value=_noop_cm()),
+        patch("main._reply") as mock_reply,
+    ):
+        main._handle_explicit_text(evt, "GRP001", "幫我分析")
+
+    assert not mock_reply.called
+    pending = pending_store.load().get("GRP001", [])
+    assert len(pending) == 1
+    assert pending[0]["type"] == "text"
+    assert pending[0]["text"] == "幫我分析"
 
 
 # ── Bug 7 ─────────────────────────────────────────────────────────────────────

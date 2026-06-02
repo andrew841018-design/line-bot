@@ -60,6 +60,10 @@ def test_take_cake_accepted():
     assert out["has_event"] is True
 
 
+def test_classify_medical_with_doctor_name_between_look_and_dentist():
+    assert calendar_regex._classify_type("看台大陳敏惠牙醫師") == "medical"
+
+
 # ── 中文日期格式 ────────────────────────────────────────────────────────────
 def test_chinese_date_same_year():
     """5月21日（today）後的同年日期。"""
@@ -101,6 +105,48 @@ def test_relative_today():
     out = calendar_regex.extract_regex_only("今天 19:00 回家吃晚餐", _TODAY)
     assert out["has_event"] is True
     assert out["date"] == "2026-05-21"
+
+
+def test_weekday_chinese_time_medical():
+    """Gemini/quota down 時，也要能抽「星期四早上十點半看牙醫」。"""
+    out = calendar_regex.extract_regex_only(
+        "星期四早上十點半看台大陳敏惠牙醫師",
+        date(2026, 6, 2),
+    )
+    assert out["has_event"] is True
+    assert out["date"] == "2026-06-04"
+    assert out["time"] == "10:30"
+    assert out["event_type"] == "medical"
+    assert "牙醫" in out["title"]
+
+
+def test_weekday_chinese_time_work_event_rejected():
+    """新增中文星期/時間 parser 仍不能放寬到工作會議。"""
+    out = calendar_regex.extract_regex_only(
+        "星期四早上十點半開週會",
+        date(2026, 6, 2),
+    )
+    assert out["has_event"] is False
+
+
+def test_weekday_rolls_forward_to_next_week():
+    out = calendar_regex.extract_regex_only(
+        "星期一早上十點看牙醫",
+        date(2026, 6, 2),
+    )
+    assert out["has_event"] is True
+    assert out["date"] == "2026-06-08"
+    assert out["time"] == "10:00"
+
+
+def test_weekday_alias_and_pm_chinese_time():
+    out = calendar_regex.extract_regex_only(
+        "禮拜四下午三點半看牙醫",
+        date(2026, 6, 2),
+    )
+    assert out["has_event"] is True
+    assert out["date"] == "2026-06-04"
+    assert out["time"] == "15:30"
 
 
 # ── HH:MM 驗證（GP1 反饋）─────────────────────────────────────────────────

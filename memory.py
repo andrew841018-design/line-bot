@@ -131,6 +131,7 @@ def _init_db() -> None:
                 text         TEXT NOT NULL,
                 created_at   INTEGER NOT NULL,
                 retries      INTEGER NOT NULL DEFAULT 0,
+                claimed_at   INTEGER NOT NULL DEFAULT 0,
                 status       TEXT NOT NULL DEFAULT 'pending'
             );
             CREATE INDEX IF NOT EXISTS idx_pending_reminder_status
@@ -178,6 +179,19 @@ def _init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_embeddings_group
                 ON embeddings(group_id);
             """
+        )
+        cols = {
+            row[1]
+            for row in c.execute("PRAGMA table_info(pending_reminder_extract)").fetchall()
+        }
+        if "claimed_at" not in cols:
+            c.execute(
+                "ALTER TABLE pending_reminder_extract "
+                "ADD COLUMN claimed_at INTEGER NOT NULL DEFAULT 0"
+            )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pending_reminder_claimed "
+            "ON pending_reminder_extract(status, claimed_at)"
         )
         # kg_triples schema migration: ALTER TABLE 自動補 column
         # 2026-05-08 新增：純本機 knowledge graph 萃取
@@ -821,8 +835,34 @@ def enqueue_pending_reminder(
         return c.execute("SELECT last_insert_rowid()").fetchone()[0]
 
 
+def reclaim_stale_pending_reminders(
+    max_processing_age_sec: int = 600, group_id: str | None = None
+) -> int:
+    """Reset processing rows whose worker likely died before release/mark."""
+    now = int(_time.time())
+    cutoff = now - max_processing_age_sec
+    with _lock, _conn() as c:
+        if group_id is not None:
+            cur = c.execute(
+                "UPDATE pending_reminder_extract "
+                "SET retries = retries + 1, status='pending', claimed_at=0 "
+                "WHERE status='processing' AND claimed_at > 0 "
+                "AND claimed_at < ? AND group_id = ?",
+                (cutoff, group_id),
+            )
+        else:
+            cur = c.execute(
+                "UPDATE pending_reminder_extract "
+                "SET retries = retries + 1, status='pending', claimed_at=0 "
+                "WHERE status='processing' AND claimed_at > 0 AND claimed_at < ?",
+                (cutoff,),
+            )
+        return cur.rowcount
+
+
 def list_pending_reminder_retries(group_id: str, limit: int = 5) -> list[dict]:
     """取該 group 待重抽的 pending（status='pending'，舊→新），上限 limit。"""
+    reclaim_stale_pending_reminders(group_id=group_id)
     with _conn() as c:
         rows = c.execute(
             "SELECT pending_id, group_id, user_id, message_id, text, created_at, retries "
@@ -845,9 +885,9 @@ def claim_pending_reminder(pending_id: int) -> bool:
     防 piggyback drain 與 cron worker 同時抽同一筆 → 重複 reminder。"""
     with _lock, _conn() as c:
         cur = c.execute(
-            "UPDATE pending_reminder_extract SET status='processing' "
+            "UPDATE pending_reminder_extract SET status='processing', claimed_at=? "
             "WHERE pending_id = ? AND status = 'pending'",
-            (pending_id,),
+            (int(_time.time()), pending_id),
         )
         return cur.rowcount == 1
 
@@ -856,7 +896,8 @@ def mark_pending_reminder(pending_id: int, status: str) -> None:
     """標記結果：'done'（已抽存）/'dropped'（非提醒、過期）。"""
     with _lock, _conn() as c:
         c.execute(
-            "UPDATE pending_reminder_extract SET status = ? WHERE pending_id = ?",
+            "UPDATE pending_reminder_extract SET status = ?, claimed_at=0 "
+            "WHERE pending_id = ?",
             (status, pending_id),
         )
 
@@ -866,7 +907,8 @@ def release_pending_reminder(pending_id: int) -> None:
     with _lock, _conn() as c:
         c.execute(
             "UPDATE pending_reminder_extract "
-            "SET retries = retries + 1, status='pending' WHERE pending_id = ?",
+            "SET retries = retries + 1, status='pending', claimed_at=0 "
+            "WHERE pending_id = ?",
             (pending_id,),
         )
 

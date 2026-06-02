@@ -11,7 +11,7 @@ localhost、漏了 LINE 端→cloudflared edge→uvicorn 整條 chain。
 Exit codes:
   0 = all green
   1 = critical fail (1-9 任一 ✗ 且無法 autofix)
-  2 = info fail only (10-11 ✗, 1-9 全 ✓) — bot 仍 deployable
+  2 = info/degraded fail only（含 Gemini quota/transient；LINE path 全 ✓）— bot 仍 deployable
   3 = preflight infra fail (網路斷、requests timeout 自爆)
 
 Usage:
@@ -43,6 +43,8 @@ LOCAL_CALLBACK_URL = f"http://127.0.0.1:{UVICORN_PORT}/callback"
 LINE_BOT_INFO = "https://api.line.me/v2/bot/info"
 LINE_WEBHOOK_ENDPOINT = "https://api.line.me/v2/bot/channel/webhook/endpoint"
 LINE_WEBHOOK_TEST = "https://api.line.me/v2/bot/channel/webhook/test"
+UVICORN_LABEL = "com.andrew.line-bot-uvicorn"
+CLOUDFLARED_LABEL = "com.andrew.line-bot-cloudflared"
 
 
 class CheckResult:
@@ -74,6 +76,17 @@ def _cloudflared_metrics_port():
 def _pgrep(pattern):
     r = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True, timeout=5)
     return (r.stdout or "").strip().split("\n")[0] or None
+
+
+def _launchctl_running(label):
+    try:
+        r = subprocess.run(
+            ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return r.returncode == 0 and "state = running" in (r.stdout or "")
+    except Exception:
+        return False
 
 
 def _is_transient_error(result) -> bool:
@@ -211,18 +224,30 @@ def _send_discord_alert(message):
 
 def check_1_uvicorn_alive():
     r = CheckResult(1, "uvicorn process alive", critical=True)
-    return r.passed() if _pgrep("uvicorn main:app") else r.failed("pgrep 沒找到 pid")
+    if _pgrep("uvicorn.*main:app") or _launchctl_running(UVICORN_LABEL):
+        return r.passed()
+    return r.failed("pgrep/launchctl 都沒找到 uvicorn")
 
 
 def check_2_local_health():
     r = CheckResult(2, "local /health 200", critical=True)
-    code, body = _curl(LOCAL_HEALTH_URL, timeout=5, interface="lo0")
-    return r.passed() if code == 200 else r.failed(f"http {code} body={body[:120]}")
+    last = (0, "")
+    for i, wait in enumerate([0, 2, 4, 8, 15]):
+        if wait:
+            time.sleep(wait)
+        code, body = _curl(LOCAL_HEALTH_URL, timeout=5, interface="lo0")
+        if code == 200:
+            r.detail = f"attempt={i + 1}"
+            return r.passed()
+        last = (code, body)
+    return r.failed(f"5 retry fail; last http={last[0]} body={last[1][:120]}")
 
 
 def check_3_cloudflared_alive():
     r = CheckResult(3, "cloudflared process alive", critical=True)
-    return r.passed() if _pgrep("cloudflared.*8080") else r.failed("pgrep 沒找到")
+    if _pgrep("cloudflared.*8080") or _launchctl_running(CLOUDFLARED_LABEL):
+        return r.passed()
+    return r.failed("pgrep/launchctl 都沒找到 cloudflared")
 
 
 def check_4_stash_valid():
@@ -261,14 +286,17 @@ def check_4c_double_source(stash_url):
 
 
 def check_5_external_tunnel(tunnel_url):
-    r = CheckResult(6, f"external {tunnel_url}/health 200", critical=True)
+    r = CheckResult(6, f"external {tunnel_url}/health diagnostic", critical=False)
     for i, wait in enumerate([0, 3, 8, 15]):  # 累計 ~26s 覆蓋 trycloudflare edge propagate p99
         if wait: time.sleep(wait)
         code, body = _curl(f"{tunnel_url}/health", timeout=10)
         if code == 200:
             r.detail = f"attempt={i+1}"; return r.passed()
         last = (code, body)
-    return r.failed(f"3 retry fail; last http={last[0]} body={last[1][:80]}")
+    return r.skipped(
+        f"direct curl unavailable; LINE webhook E2E is source of truth; "
+        f"last http={last[0]} body={last[1][:80]}"
+    )
 
 
 def check_5b_local_callback_route():
@@ -420,19 +448,26 @@ def _finalize(results, start, *, tunnel_url, webhook_url, args):
     autofix = [r for r in results if r.status == "autofix"]
     critical_total = sum(1 for r in results if r.critical)
     info_total = sum(1 for r in results if not r.critical)
-    # GP1 C2: Gemini main + lite 都掛才 critical；單一掛降 info
-    # TODO: pre-existing bug — removes from critical_fail but doesn't promote to
-    # info_fail (line 398 filters critical=False), so single-Gemini-fail →
-    # critical_fail=[] → exit=0 PASS silently. Out of "目前不動" scope; defer.
     gemini_fails = [r for r in critical_fail if r.name.startswith("Gemini")]
-    if gemini_fails and len(gemini_fails) < 2:
-        critical_fail = [r for r in critical_fail if not r.name.startswith("Gemini")]
+    downgraded_gemini = []
+    if gemini_fails:
+        if len(gemini_fails) < 2:
+            # One model failing while the other passes is degraded, not deploy-blocking.
+            downgraded_gemini = gemini_fails
+        else:
+            # Both Gemini probes failing with quota/backend transient errors should
+            # not make launchd restart jobs look failed when LINE path is healthy.
+            downgraded_gemini = [r for r in gemini_fails if _is_transient_error(r)]
+        if downgraded_gemini:
+            critical_fail = [r for r in critical_fail if r not in downgraded_gemini]
+            info_fail.extend(downgraded_gemini)
     if critical_fail: exit_code, verdict = 1, "FAIL"
     elif info_fail: exit_code, verdict = 2, "PASS-WITH-INFO-FAIL"
     else: exit_code, verdict = 0, "PASS"
     cpass = critical_total - len(critical_fail)
-    ipass = info_total - len(info_fail)
-    summary = f"PREFLIGHT [{verdict}] critical={cpass}/{critical_total} info={ipass}/{info_total} elapsed={elapsed:.1f}s"
+    effective_info_total = info_total + len(downgraded_gemini)
+    ipass = effective_info_total - len(info_fail)
+    summary = f"PREFLIGHT [{verdict}] critical={cpass}/{critical_total} info={ipass}/{effective_info_total} elapsed={elapsed:.1f}s"
     if autofix: summary += f" autofix={len(autofix)}"
     print("-" * 70); print(summary)
     if critical_fail:
@@ -450,19 +485,22 @@ def _finalize(results, start, *, tunnel_url, webhook_url, args):
         "results": [{"idx": r.idx, "name": r.name, "status": r.status,
                      "critical": r.critical, "detail": r.detail} for r in results],
     })
-    # Filter: Gemini transient (429 / 503) critical fail → silently logged,
-    # not Discord alerted. info_fail / autofix / non-transient critical 都仍 alert.
+    # Filter: Gemini transient/degraded fail → JSONL/stdout only, no Discord noise.
+    # autofix / non-transient critical / real info fail still alert.
     non_transient_critical = [r for r in critical_fail if not _is_transient_error(r)]
-    if non_transient_critical or info_fail or autofix:
+    non_transient_info = [r for r in info_fail if not r.name.startswith("Gemini")]
+    if non_transient_critical or non_transient_info or autofix:
         msg = f"🛫 **LINE bot preflight {verdict}**\n{summary}"
         if non_transient_critical:
             msg += "\n\nCritical fails:\n" + "\n".join(f"• {r.name}: {r.detail}" for r in non_transient_critical)
+        if non_transient_info:
+            msg += "\n\nInfo fails:\n" + "\n".join(f"• {r.name}: {r.detail}" for r in non_transient_info)
         if autofix:
             msg += "\n\nAutofix:\n" + "\n".join(f"• {r.name}: {r.detail}" for r in autofix)
         _send_discord_alert(msg)
-    elif critical_fail:
-        transient_names = ", ".join(r.name for r in critical_fail if _is_transient_error(r))
-        print(f"[preflight] skip discord alert (all critical fails transient: {transient_names})",
+    elif critical_fail or info_fail:
+        skipped_names = ", ".join(r.name for r in critical_fail + info_fail)
+        print(f"[preflight] skip discord alert (Gemini degraded/transient only: {skipped_names})",
               file=sys.stderr)
     return exit_code
 

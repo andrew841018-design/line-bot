@@ -142,8 +142,8 @@ def test_happy_path_drains_and_commits():
     req = call_args[0][0]
     n_msgs = len(req.messages)
     check(
-        f"bundle 訊息數 = 1 notice + 2 drain = 3 (got {n_msgs})",
-        n_msgs == 3,
+        f"bundle 訊息數 = 2 drain only, no system notice (got {n_msgs})",
+        n_msgs == 2,
     )
     # pending 該剩下 M3 (M1+M2 已 commit removed)
     remaining = state["data"].get("G1", [])

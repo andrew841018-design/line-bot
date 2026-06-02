@@ -631,6 +631,60 @@ def _intent_to_handler(intent: str):
     return mapping.get(intent)
 
 
+def _passes_helpfulness_gate(reply: str, text: str) -> bool:
+    """非確定性回覆（local LLM / search snippet）的有用性閘門。
+
+    Andrew rule（feedback_bot_reply_helpful_or_defer）：substantive 題寧可不回，也不要回
+    「restate 問題 +『應該妥善處理 / 明確確認』」這種沒具體內容的空泛 lecture。
+
+    刻意**抑制偏向**：誤殺 borderline（→ 上層 defer 到 pending，訊息不丟）可接受，
+    漏放空話才是大忌。只對 substantive 題（命中 _NEWS_CASE_TOPIC_HINTS，如房地產 / 投資 /
+    醫療 / 法律）嚴管；閒聊 / 輕量回覆一律放行，不誤殺日常對話。
+    """
+    r = (reply or "").strip()
+    if not r:
+        return False
+    # substantive = 金融 / 房產 / 法律 / 醫療等「沒 grounding 容易空話」的主題。
+    # 既有 _NEWS_CASE_TOPIC_HINTS（投資 / 房地產 / 醫療…）字面 substring 比對抓不到
+    # 「購屋款」這種說法（不含「房地產」四字），故補一組家庭常見高風險主題；
+    # 且對 text 與 reply 都比對（問題沒帶關鍵詞、但答案露餡時仍能攔）。
+    _SUBSTANTIVE_EXTRA = (
+        "購屋", "買房", "賣房", "房貸", "頭期", "貸款", "出資", "過戶", "贈與",
+        "繼承", "遺產", "報稅", "合約", "契約", "借款", "債務", "理賠",
+        "手術", "診斷", "症狀", "副作用", "訴訟", "官司", "監護", "離婚",
+    )
+    blob = (text or "") + " " + r
+    try:
+        from gemini_client import _NEWS_CASE_TOPIC_HINTS
+        hints = tuple(_NEWS_CASE_TOPIC_HINTS) + _SUBSTANTIVE_EXTRA
+    except Exception:
+        hints = _SUBSTANTIVE_EXTRA
+    substantive = any(h in blob for h in hints)
+    if not substantive:
+        return True  # 閒聊 / 輕量 → 放行
+
+    # 複用 gemini_client 既有品質檢查（echo opener / empty phrase blacklist）
+    try:
+        from gemini_client import _violates_quality
+        bad, _reason = _violates_quality(r, text)
+        if bad:
+            return False
+    except Exception:
+        pass
+
+    # 平台式空話啟發式：建議語氣 + 零具體（無數字）+ 偏短 → 視為空話抑制。
+    # （刻意寬抑制：substantive 題的有用回覆通常帶具體數字 / 名稱 / 步驟。）
+    _ADVICE_MARKERS = (
+        "應該", "建議", "最好", "需要", "妥善", "謹慎", "注意", "確認",
+        "尋求專業", "諮詢專業", "視情況", "依情況", "因人而異", "多加",
+    )
+    has_advice_modal = any(m in r for m in _ADVICE_MARKERS)
+    has_specifics = bool(re.search(r"\d", r))  # 數字 / 年份 / 百分比 / 金額
+    if has_advice_modal and not has_specifics and len(r) < 120:
+        return False
+    return True
+
+
 def lite_reply(text: str, context: list | None = None) -> str | None:
     """總入口。回 str = 找到答案；回 None = 沒辦法（caller 決定要不要回 generic）。
 
@@ -677,8 +731,10 @@ def lite_reply(text: str, context: list | None = None) -> str | None:
             return out
 
     # ─ Stage 2: 生成式（local LLM；自由問答 / 解釋）─
+    # 過 helpfulness gate：substantive 題的空泛 lecture 不送，往下 fall through 到
+    # Stage 3 網搜；都不行則最終 return None → 上層存 pending（help-or-defer）。
     out = _try_local_llm(text, context=context)
-    if out:
+    if out and _passes_helpfulness_gate(out, text):
         return out
 
     # ─ Stage 3: 規則式 fallback（最後 safety net）─
@@ -688,8 +744,13 @@ def lite_reply(text: str, context: list | None = None) -> str | None:
         except Exception as e:  # pragma: no cover - defensive
             logger.info("Stage3 handler %s raised: %s", handler.__name__, e)
             continue
-        if out:
-            return out
+        if not out:
+            continue
+        # _try_google_snippet 是非確定性 web snippet → 同樣過 gate；
+        # _try_url_summary / _try_weather 是確定性事實 → 直接放行。
+        if handler is _try_google_snippet and not _passes_helpfulness_gate(out, text):
+            continue
+        return out
 
     return None
 

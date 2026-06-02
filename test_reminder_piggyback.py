@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 from datetime import date, timedelta
 
 import pytest
@@ -74,6 +75,8 @@ def test_piggyback_marks_reminded_on_reply_success(tmp_cal_db, monkeypatch):
     monkeypatch.setattr(main, "calendar_db", tmp_cal_db, raising=False)
     import event_reminder
     monkeypatch.setattr(event_reminder, "calendar_db", tmp_cal_db)
+    import reminder_push
+    monkeypatch.setattr(reminder_push, "due_reminders_for_reply", lambda *a, **kw: [])
     # 確保 _reply 內 `import calendar_db` 拿到 tmp_cal_db（已 reload via fixture）
 
     # 跑 reply
@@ -134,6 +137,8 @@ def test_piggyback_not_marked_on_reply_failure(tmp_cal_db, monkeypatch):
     monkeypatch.setattr(main, "calendar_db", tmp_cal_db, raising=False)
     import event_reminder
     monkeypatch.setattr(event_reminder, "calendar_db", tmp_cal_db)
+    import reminder_push
+    monkeypatch.setattr(reminder_push, "due_reminders_for_reply", lambda *a, **kw: [])
 
     main._reply("fake_token", "嗨", group_id=GID)
 
@@ -143,3 +148,448 @@ def test_piggyback_not_marked_on_reply_failure(tmp_cal_db, monkeypatch):
             "SELECT reminded_1d FROM events WHERE event_id=?", (eid,),
         ).fetchone()
     assert row[0] is None
+
+
+def _seed_text_pending(pending_store, group_id: str, message_id: str = "M1") -> None:
+    pending_store.save_full(
+        {
+            group_id: [
+                {
+                    "type": "text",
+                    "message_id": message_id,
+                    "user_id": "U1",
+                    "timestamp": 1,
+                    "text": "quota 時漏掉的訊息",
+                }
+            ]
+        }
+    )
+
+
+def _patch_reply_pending_fast_path(main, monkeypatch):
+    monkeypatch.setattr(main.settings, "bot_muted", False)
+    monkeypatch.setattr(main, "_quota_exhausted", lambda: False)
+    monkeypatch.setattr(main, "_drop_stale_pending", lambda *a, **kw: 0)
+    monkeypatch.setattr(main, "_llm_chat", lambda *a, **kw: "pending reply")
+    monkeypatch.setattr(main, "_get_persona_notes", lambda group_id: [])
+    monkeypatch.setattr(main.memory, "get_context", lambda group_id: [])
+    monkeypatch.setattr(main.memory, "top_facts", lambda group_id: [])
+    monkeypatch.setattr(main.memory, "log_raw_message", lambda *a, **kw: None)
+
+    import calendar_db
+    monkeypatch.setattr(calendar_db, "list_due_for_reminder", lambda *a, **kw: [])
+    import reminder_push
+    monkeypatch.setattr(reminder_push, "due_reminders_for_reply", lambda *a, **kw: [])
+
+
+def test_reply_failure_preserves_pending_piggyback(monkeypatch):
+    """Normal _reply piggyback must be peek-then-confirm, same as quota path."""
+    import main
+    import pending_store
+
+    _seed_text_pending(pending_store, "G1")
+    _patch_reply_pending_fast_path(main, monkeypatch)
+
+    class _FakeMessagingApi:
+        def __init__(self, _):
+            pass
+
+        def reply_message(self, req):
+            raise RuntimeError("reply token expired")
+
+        def push_message(self, req):
+            return None
+
+    class _FakeApiClient:
+        def __init__(self, _cfg):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(main, "ApiClient", _FakeApiClient)
+    monkeypatch.setattr(main, "MessagingApi", _FakeMessagingApi)
+    monkeypatch.setattr(main, "_get_line_config", lambda: None)
+
+    main._reply("fake_token", "primary reply", group_id="G1")
+
+    ids = [it["message_id"] for it in pending_store.load().get("G1", [])]
+    assert ids == ["M1"]
+
+
+def test_reply_ambiguous_failure_does_not_fallback_push(monkeypatch):
+    """Timeout/5xx after reply_message may already be accepted by LINE; avoid duplicate push."""
+    import main
+    import pending_store
+
+    _seed_text_pending(pending_store, "G1")
+    _patch_reply_pending_fast_path(main, monkeypatch)
+    pushed = []
+
+    class _FakeMessagingApi:
+        def __init__(self, _):
+            pass
+
+        def reply_message(self, req):
+            raise TimeoutError("Read timed out")
+
+        def push_message(self, req):
+            pushed.append(req)
+
+    class _FakeApiClient:
+        def __init__(self, _cfg):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(main, "ApiClient", _FakeApiClient)
+    monkeypatch.setattr(main, "MessagingApi", _FakeMessagingApi)
+    monkeypatch.setattr(main, "_get_line_config", lambda: None)
+
+    main._reply("fake_token", "primary reply", group_id="G1")
+
+    assert pushed == []
+    ids = [it["message_id"] for it in pending_store.load().get("G1", [])]
+    assert ids == ["M1"]
+
+
+def test_reply_success_commits_pending_piggyback(monkeypatch):
+    import main
+    import pending_store
+
+    _seed_text_pending(pending_store, "G1")
+    _patch_reply_pending_fast_path(main, monkeypatch)
+
+    captured = {}
+
+    class _FakeMessagingApi:
+        def __init__(self, _):
+            pass
+
+        def reply_message(self, req):
+            captured["messages"] = req.messages
+
+            class _Resp:
+                sent_messages = []
+
+            return _Resp()
+
+    class _FakeApiClient:
+        def __init__(self, _cfg):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(main, "ApiClient", _FakeApiClient)
+    monkeypatch.setattr(main, "MessagingApi", _FakeMessagingApi)
+    monkeypatch.setattr(main, "_get_line_config", lambda: None)
+
+    main._reply("fake_token", "primary reply", group_id="G1")
+
+    assert len(captured["messages"]) == 2
+    assert pending_store.load().get("G1", []) == []
+
+
+def test_reply_success_marks_reminder_push_piggyback(monkeypatch):
+    import main
+    import pending_store
+    import reminder_push
+
+    pending_store.save_full({})
+    _patch_reply_pending_fast_path(main, monkeypatch)
+    monkeypatch.setattr(
+        reminder_push,
+        "due_reminders_for_reply",
+        lambda *a, **kw: [
+            {
+                "reminder_id": 6,
+                "group_id": "G1",
+                "stage": "1d",
+                "text": "⏰ 提醒（明天）\n2026-06-02 00:00 去看醫生",
+                "action": "去看醫生",
+            }
+        ],
+    )
+    marked = []
+    monkeypatch.setattr(
+        reminder_push,
+        "mark_reminders_pushed",
+        lambda reminders: marked.extend(reminders) or len(reminders),
+    )
+
+    captured = {}
+
+    class _FakeMessagingApi:
+        def __init__(self, _):
+            pass
+
+        def reply_message(self, req):
+            captured["texts"] = [m.text for m in req.messages]
+
+            class _Resp:
+                sent_messages = []
+
+            return _Resp()
+
+    class _FakeApiClient:
+        def __init__(self, _cfg):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(main, "ApiClient", _FakeApiClient)
+    monkeypatch.setattr(main, "MessagingApi", _FakeMessagingApi)
+    monkeypatch.setattr(main, "_get_line_config", lambda: None)
+
+    main._reply("fake_token", "primary reply", group_id="G1")
+
+    assert captured["texts"] == [
+        "primary reply",
+        "⏰ 提醒（明天）\n2026-06-02 00:00 去看醫生",
+    ]
+    assert marked == [(6, "1d")]
+
+
+def test_reply_failure_does_not_mark_reminder_push_piggyback(monkeypatch):
+    import main
+    import pending_store
+    import reminder_push
+
+    pending_store.save_full({})
+    _patch_reply_pending_fast_path(main, monkeypatch)
+    monkeypatch.setattr(
+        reminder_push,
+        "due_reminders_for_reply",
+        lambda *a, **kw: [
+            {
+                "reminder_id": 6,
+                "group_id": "G1",
+                "stage": "1d",
+                "text": "⏰ 提醒（明天）\n2026-06-02 00:00 去看醫生",
+                "action": "去看醫生",
+            }
+        ],
+    )
+    marked = []
+    monkeypatch.setattr(
+        reminder_push,
+        "mark_reminders_pushed",
+        lambda reminders: marked.extend(reminders) or len(reminders),
+    )
+
+    class _FakeMessagingApi:
+        def __init__(self, _):
+            pass
+
+        def reply_message(self, req):
+            raise TimeoutError("Read timed out")
+
+        def push_message(self, req):
+            raise AssertionError("ambiguous reply failure must not fallback push")
+
+    class _FakeApiClient:
+        def __init__(self, _cfg):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(main, "ApiClient", _FakeApiClient)
+    monkeypatch.setattr(main, "MessagingApi", _FakeMessagingApi)
+    monkeypatch.setattr(main, "_get_line_config", lambda: None)
+
+    main._reply("fake_token", "primary reply", group_id="G1")
+
+    assert marked == []
+
+
+def test_reply_piggyback_skips_media_entries(monkeypatch, tmp_path):
+    """Normal reply-token piggyback must stay bounded and leave media to background drain."""
+    import main
+    import pending_store
+
+    media = tmp_path / "pending.bin"
+    media.write_bytes(b"x")
+    pending_store.save_full(
+        {
+            "G1": [
+                {
+                    "type": "file",
+                    "message_id": "F1",
+                    "user_id": "U1",
+                    "timestamp": 1,
+                    "file_name": "a.pdf",
+                    "media_path": str(media),
+                }
+            ]
+        }
+    )
+    _patch_reply_pending_fast_path(main, monkeypatch)
+    monkeypatch.setattr(
+        main,
+        "_peek_pending_for_piggyback",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("media path used")),
+    )
+    captured = {}
+
+    class _FakeMessagingApi:
+        def __init__(self, _):
+            pass
+
+        def reply_message(self, req):
+            captured["messages"] = req.messages
+
+            class _Resp:
+                sent_messages = []
+
+            return _Resp()
+
+    class _FakeApiClient:
+        def __init__(self, _cfg):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(main, "ApiClient", _FakeApiClient)
+    monkeypatch.setattr(main, "MessagingApi", _FakeMessagingApi)
+    monkeypatch.setattr(main, "_get_line_config", lambda: None)
+
+    main._reply("fake_token", "primary reply", group_id="G1")
+
+    assert [m.text for m in captured["messages"]] == ["primary reply"]
+    ids = [it["message_id"] for it in pending_store.load().get("G1", [])]
+    assert ids == ["F1"]
+
+
+def test_reply_piggyback_skips_when_drain_lock_busy(monkeypatch):
+    import main
+    import pending_store
+
+    _seed_text_pending(pending_store, "G1")
+    _patch_reply_pending_fast_path(main, monkeypatch)
+
+    class _FakeMessagingApi:
+        def __init__(self, _):
+            pass
+
+        def reply_message(self, req):
+            class _Resp:
+                sent_messages = []
+
+            return _Resp()
+
+    class _FakeApiClient:
+        def __init__(self, _cfg):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(main, "ApiClient", _FakeApiClient)
+    monkeypatch.setattr(main, "MessagingApi", _FakeMessagingApi)
+    monkeypatch.setattr(main, "_get_line_config", lambda: None)
+
+    slot = main._try_acquire_drain_slot("G1")
+    assert slot is not None
+    try:
+        main._reply("fake_token", "primary reply", group_id="G1")
+    finally:
+        slot.release()
+
+    ids = [it["message_id"] for it in pending_store.load().get("G1", [])]
+    assert ids == ["M1"]
+
+
+def test_reminder_piggyback_uses_event_reminder_one_off_policy(
+    tmp_cal_db, tmp_path, monkeypatch
+):
+    """Piggyback reminders must not bypass launchd's one-off skip/ask policy."""
+    GID = "G1"
+    today = date.today()
+    tomorrow = (today + timedelta(days=1)).isoformat()
+    eid = tmp_cal_db.insert_event(
+        group_id=GID, title="private one-off",
+        event_date=tomorrow, event_time="08:00",
+        event_type="family_gathering",
+    )
+    cfg = tmp_path / "event_reminder_private.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "event_ids": [eid],
+                "offset": 2,
+                "placeholder": "target",
+                "mention_text": "{target} confirm this private event",
+                "plain_text": "confirm this private event",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("EVENT_REMINDER_PRIVATE_CONFIG", str(cfg))
+
+    import main
+    import event_reminder
+
+    monkeypatch.setattr(main.settings, "bot_muted", False)
+    monkeypatch.setattr(main, "_quota_exhausted", lambda: False)
+    monkeypatch.setattr(main, "_get_quota_footer", lambda: "")
+    monkeypatch.setattr(main, "calendar_db", tmp_cal_db, raising=False)
+    monkeypatch.setattr(event_reminder, "calendar_db", tmp_cal_db)
+    import reminder_push
+    monkeypatch.setattr(reminder_push, "due_reminders_for_reply", lambda *a, **kw: [])
+    captured: dict = {}
+
+    class _FakeMessagingApi:
+        def __init__(self, _):
+            pass
+
+        def reply_message(self, req):
+            captured["texts"] = [m.text for m in req.messages]
+
+            class _Resp:
+                sent_messages = []
+
+            return _Resp()
+
+    class _FakeApiClient:
+        def __init__(self, _cfg):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(main, "ApiClient", _FakeApiClient)
+    monkeypatch.setattr(main, "MessagingApi", _FakeMessagingApi)
+    monkeypatch.setattr(main, "_get_line_config", lambda: None)
+
+    main._reply("fake_token", "primary reply", group_id=GID)
+
+    assert captured["texts"] == ["primary reply"]

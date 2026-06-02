@@ -28,6 +28,7 @@ from linebot.v3.messaging import (
 )
 
 import memory
+from line_token_refresh import get_line_token
 from config import settings
 
 logging.basicConfig(
@@ -37,6 +38,14 @@ logging.basicConfig(
 logger = logging.getLogger("reminder_push")
 
 
+def _line_access_token() -> str:
+    try:
+        return get_line_token() or settings.line_channel_access_token
+    except Exception as e:
+        logger.warning("LINE token refresh failed, fallback to env token: %s", str(e)[:120])
+        return settings.line_channel_access_token
+
+
 def _push_to_group(group_id: str, text: str, max_retries: int = 3) -> bool:
     """推到 LINE 群組。失敗回 False。
 
@@ -44,7 +53,7 @@ def _push_to_group(group_id: str, text: str, max_retries: int = 3) -> bool:
       - 429（monthly quota / rate limit）：不重試，立即 False
       - 其他 exception（5xx / network）：exponential backoff (1s/2s/4s) 重試
     """
-    cfg = Configuration(access_token=settings.line_channel_access_token)
+    cfg = Configuration(access_token=_line_access_token())
     for attempt in range(max_retries):
         try:
             with ApiClient(cfg) as api_client:
@@ -139,40 +148,86 @@ def _format_push_text(r: dict, stage: str) -> str:
     return f"⏰ 提醒{label}\n{dt.strftime('%Y-%m-%d %H:%M')} {r['action']}"
 
 
+def _due_reminder_items(
+    group_id: str | None = None,
+    limit: int = 10_000,
+    now: int | None = None,
+) -> list[dict]:
+    """Return reminders due for their next push stage without mutating DB."""
+    if limit <= 0:
+        return []
+    now = int(datetime.now().timestamp()) if now is None else now
+    due: list[dict] = []
+    for r in memory.list_pending_reminders_full(group_id):
+        stage = _decide_stage(r, now)
+        if stage is None:
+            continue
+        due.append(
+            {
+                "reminder_id": r["reminder_id"],
+                "group_id": r["group_id"],
+                "stage": stage,
+                "text": _format_push_text(r, stage),
+                "action": r["action"],
+            }
+        )
+        if len(due) >= limit:
+            break
+    return due
+
+
+def due_reminders_for_reply(
+    group_id: str, limit: int = 4, now: int | None = None
+) -> list[dict]:
+    """Return due reminder_push entries that can piggyback on LINE reply_token.
+
+    Caller must only mark these after reply_message succeeds.
+    """
+    if limit <= 0 or not group_id:
+        return []
+    return _due_reminder_items(group_id=group_id, limit=limit, now=now)
+
+
+def mark_reminders_pushed(reminders: list[tuple[int, str]]) -> int:
+    """Mark reminder_push entries after reply_message accepted them."""
+    marked = 0
+    for reminder_id, stage in reminders:
+        if memory.mark_reminder_pushed(reminder_id, stage):
+            marked += 1
+    return marked
+
+
 def push_reminders(dry_run: bool = False) -> int:
     """掃所有 pending reminder，依階梯式 stage 規則 push。
 
     回 push 成功的筆數。
     """
-    now = int(datetime.now().timestamp())
-    all_pending = memory.list_pending_reminders_full()
     sent = 0
 
-    for r in all_pending:
-        stage = _decide_stage(r, now)
-        if stage is None:
-            continue
-
-        text = _format_push_text(r, stage)
+    for item in _due_reminder_items():
+        reminder_id = item["reminder_id"]
+        group_id = item["group_id"]
+        stage = item["stage"]
+        text = item["text"]
 
         if dry_run:
-            print(f"[DRY] rid={r['reminder_id']} stage={stage} group={r['group_id']}")
+            print(f"[DRY] rid={reminder_id} stage={stage} group={group_id}")
             print(f"      {text}")
             sent += 1
             continue
 
-        ok = _push_to_group(r["group_id"], text)
+        ok = _push_to_group(group_id, text)
         if ok:
-            memory.mark_reminder_pushed(r["reminder_id"], stage)
+            memory.mark_reminder_pushed(reminder_id, stage)
             logger.info(
                 "pushed rid=%d stage=%s action=%r",
-                r["reminder_id"], stage, r["action"],
+                reminder_id, stage, item["action"],
             )
             sent += 1
         else:
             logger.warning(
                 "push failed rid=%d stage=%s, will retry next run",
-                r["reminder_id"], stage,
+                reminder_id, stage,
             )
 
     return sent
@@ -186,7 +241,10 @@ def main() -> int:
 
     sent = push_reminders(dry_run=args.dry_run)
     if sent:
-        logger.info("reminder_push: %d 筆已推送", sent)
+        if args.dry_run:
+            logger.info("reminder_push: %d 筆待推送（dry-run）", sent)
+        else:
+            logger.info("reminder_push: %d 筆已推送", sent)
 
     # 過期清理（每天 00:00 一次就夠）
     if datetime.now().hour == 0 and datetime.now().minute < 15:

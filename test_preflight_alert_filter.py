@@ -81,6 +81,54 @@ def test_gemini_resource_exhausted_without_status_code_not_transient():
     assert pf._is_transient_error(r) is False
 
 
+# ---------- startup retry guards ----------
+
+@patch("preflight_check.time.sleep", lambda *_args, **_kwargs: None)
+def test_local_health_retries_until_ready():
+    calls = iter([(0, ""), (0, ""), (200, "ok")])
+
+    with patch("preflight_check._curl", side_effect=lambda *_a, **_kw: next(calls)):
+        result = pf.check_2_local_health()
+
+    assert result.status == "pass"
+    assert "attempt=3" in result.detail
+
+
+@patch("preflight_check.time.sleep", lambda *_args, **_kwargs: None)
+def test_local_health_fails_after_retry_budget():
+    with patch("preflight_check._curl", return_value=(0, "curl_timeout")):
+        result = pf.check_2_local_health()
+
+    assert result.status == "fail"
+    assert "retry fail" in result.detail
+
+
+def test_uvicorn_alive_accepts_launchd_when_pgrep_misses():
+    with patch("preflight_check._pgrep", return_value=None), \
+         patch("preflight_check._launchctl_running", return_value=True):
+        result = pf.check_1_uvicorn_alive()
+
+    assert result.status == "pass"
+
+
+def test_cloudflared_alive_accepts_launchd_when_pgrep_misses():
+    with patch("preflight_check._pgrep", return_value=None), \
+         patch("preflight_check._launchctl_running", return_value=True):
+        result = pf.check_3_cloudflared_alive()
+
+    assert result.status == "pass"
+
+
+@patch("preflight_check.time.sleep", lambda *_args, **_kwargs: None)
+def test_external_tunnel_direct_curl_failure_is_diagnostic_skip():
+    with patch("preflight_check._curl", return_value=(0, "dns_fail")):
+        result = pf.check_5_external_tunnel("https://x.trycloudflare.com")
+
+    assert result.critical is False
+    assert result.status == "skip"
+    assert "LINE webhook E2E" in result.detail
+
+
 # ---------- _finalize alert dispatch ----------
 
 def _gemini_fail_pair():
@@ -99,7 +147,7 @@ def test_all_gemini_transient_critical_skips_alert(mock_alert, mock_jsonl):
     exit_code = pf._finalize(results, start=0.0, tunnel_url="", webhook_url="", args=_args())
     assert mock_alert.call_count == 0
     assert mock_jsonl.call_count == 1  # JSONL still emitted (audit trail)
-    assert exit_code == 1  # transient critical still fails
+    assert exit_code == 2  # Gemini-only transient degradation is deployable
 
 
 @patch("preflight_check._emit_jsonl")
@@ -155,15 +203,14 @@ def test_all_pass_no_alert(mock_alert, mock_jsonl):
 
 @patch("preflight_check._emit_jsonl")
 @patch("preflight_check._send_discord_alert")
-def test_single_gemini_fail_existing_downgrade_no_alert(mock_alert, mock_jsonl):
-    # Pre-existing behavior (GP1 C1 deferred): single Gemini fail removes from
-    # critical_fail but doesn't promote to info_fail → exit=0 PASS, no alert.
-    # This test pins the current behavior so future fix is explicit.
+def test_single_gemini_fail_downgrades_to_info_no_alert(mock_alert, mock_jsonl):
+    # One Gemini model failing while the other is assumed available is degraded,
+    # not deploy-blocking; do not silently mark it as a clean PASS.
     results = [_make_result(11, "Gemini main probe", critical=True, status="fail",
                             detail="429 RESOURCE_EXHAUSTED")]
     exit_code = pf._finalize(results, start=0.0, tunnel_url="", webhook_url="", args=_args())
     assert mock_alert.call_count == 0
-    assert exit_code == 0  # current behavior; bug deferred
+    assert exit_code == 2
 
 
 @patch("preflight_check._emit_jsonl")

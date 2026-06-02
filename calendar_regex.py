@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 # 家族 keyword whitelist —— 動詞要配名詞，避免「拿」「接」「陪」單字濫觸
 _FAMILY_KW = re.compile(
     r"(?:聚餐|生日|出遊|看醫生|蛋糕|爺爺|奶奶|爸爸|媽媽|姊姊|妹妹|弟弟|全家|"
+    r"牙醫|"
     r"拿(?:蛋糕|藥|包裹|貨|餐|禮物|花)|"
     r"接(?:爸|媽|妹|弟|姊|爺爺|奶奶|小孩|小朋友)|"
     r"陪(?:爸|媽|妹|弟|姊|爺爺|奶奶|看醫生)|"
@@ -40,6 +41,8 @@ _TYPE_PATTERNS: tuple[tuple[str, re.Pattern], ...] = (
         re.compile(
             r"做(?:胃鏡|大腸鏡|健康檢查|體檢|手術|健檢)|"
             r"看(?:醫生|牙醫|皮膚科|眼科|耳鼻喉科)|"
+            r"看.{0,12}(?:牙醫|醫師|醫生)|"
+            r"牙醫|"
             r"陪(?:.{0,5})(?:就醫|看醫生|看病|拿藥)|"
             r"打疫苗|抽血|健檢|回診"
         ),
@@ -70,6 +73,15 @@ def _classify_type(title: str) -> str | None:
 
 # HH:MM — validated 00:00 to 23:59
 _TIME = r"(?:[01]?\d|2[0-3]):[0-5]\d"
+_CHINESE_NUM = r"[零〇一二兩三四五六七八九十]{1,3}"
+_CHINESE_TIME = (
+    rf"(?:(?:\d{{1,2}}|{_CHINESE_NUM})\s*點"
+    rf"(?:\s*(?:半|(?:\d{{1,2}}|{_CHINESE_NUM})\s*分?))?)"
+)
+_DAYPART = r"(?:早上|上午|中午|下午|傍晚|晚上|凌晨|半夜)"
+_REL_DAY = r"(?:今天|明天|後天|大後天)"
+_WEEKDAY = r"(?:(?:星期|週|周|禮拜)[一二三四五六日天])"
+_REL_OR_WEEKDAY = rf"(?:{_REL_DAY}|{_WEEKDAY})"
 
 _DATE_TIME_TITLE = re.compile(
     rf"(\d{{4}})-(\d{{1,2}})-(\d{{1,2}})\s+({_TIME})\s+([^\n\r]{{2,40}})"
@@ -81,6 +93,10 @@ _CHINESE_DATE_TIME_TITLE = re.compile(
 
 _RELATIVE_DATE_TIME_TITLE = re.compile(
     rf"(今天|明天|後天)\s*({_TIME})\s+([^\n\r]{{2,40}})"
+)
+
+_RELATIVE_CHINESE_TIME_TITLE = re.compile(
+    rf"({_REL_OR_WEEKDAY})\s*({_DAYPART})?\s*({_TIME}|{_CHINESE_TIME})\s*([^\n\r]{{2,40}})"
 )
 
 
@@ -125,6 +141,103 @@ def _validate_date(year: int, month: int, day: int) -> date | None:
         return date(year, month, day)
     except ValueError:
         return None
+
+
+_CN_DIGITS = {
+    "零": 0,
+    "〇": 0,
+    "一": 1,
+    "二": 2,
+    "兩": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
+
+
+def _parse_chinese_int(raw: str) -> int | None:
+    raw = raw.strip()
+    if not raw:
+        return None
+    if raw.isdigit():
+        return int(raw)
+    if raw == "十":
+        return 10
+    if "十" in raw:
+        left, _, right = raw.partition("十")
+        tens = 1 if left == "" else _CN_DIGITS.get(left)
+        ones = 0 if right == "" else _CN_DIGITS.get(right)
+        if tens is None or ones is None:
+            return None
+        return tens * 10 + ones
+    if len(raw) == 1:
+        return _CN_DIGITS.get(raw)
+    return None
+
+
+def _parse_time(raw_time: str, daypart: str | None = None) -> str | None:
+    raw_time = re.sub(r"\s+", "", raw_time)
+    m = re.fullmatch(_TIME, raw_time)
+    if m:
+        hour_s, minute_s = raw_time.split(":", 1)
+        hour, minute = int(hour_s), int(minute_s)
+    else:
+        m = re.fullmatch(
+            rf"(\d{{1,2}}|{_CHINESE_NUM})點(?:(半)|(\d{{1,2}}|{_CHINESE_NUM})分?)?",
+            raw_time,
+        )
+        if not m:
+            return None
+        hour = _parse_chinese_int(m.group(1))
+        if hour is None:
+            return None
+        if m.group(2):
+            minute = 30
+        elif m.group(3):
+            minute = _parse_chinese_int(m.group(3))
+            if minute is None:
+                return None
+        else:
+            minute = 0
+
+    if minute < 0 or minute > 59:
+        return None
+    if daypart in ("下午", "傍晚", "晚上") and 1 <= hour < 12:
+        hour += 12
+    elif daypart == "中午" and hour < 11:
+        hour += 12
+    elif daypart in ("凌晨", "半夜") and hour == 12:
+        hour = 0
+    if hour < 0 or hour > 23:
+        return None
+    return f"{hour:02d}:{minute:02d}"
+
+
+_WEEKDAY_TO_INDEX = {
+    "一": 0,
+    "二": 1,
+    "三": 2,
+    "四": 3,
+    "五": 4,
+    "六": 5,
+    "日": 6,
+    "天": 6,
+}
+
+
+def _target_for_relative_or_weekday(token: str, today_tw: date) -> date | None:
+    if token in ("今天", "明天", "後天", "大後天"):
+        return today_tw + timedelta(days={"今天": 0, "明天": 1, "後天": 2, "大後天": 3}[token])
+    m = re.fullmatch(r"(?:星期|週|周|禮拜)([一二三四五六日天])", token)
+    if not m:
+        return None
+    target_idx = _WEEKDAY_TO_INDEX[m.group(1)]
+    days = (target_idx - today_tw.weekday()) % 7
+    return today_tw + timedelta(days=days)
 
 
 def extract_regex_only(combined_text: str, today_tw: date) -> dict:
@@ -172,6 +285,16 @@ def extract_regex_only(combined_text: str, today_tw: date) -> dict:
         title = _sanitize_title(m.group(3))
         et = _classify_type(title) if len(title) >= 2 else None
         if et:
+            return _make_event(title, target.isoformat(), time_str, et)
+
+    # 4. 今天/星期四 + 中文時間 title（例：星期四早上十點半看牙醫）
+    m = _RELATIVE_CHINESE_TIME_TITLE.search(combined_text)
+    if m:
+        target = _target_for_relative_or_weekday(m.group(1), today_tw)
+        time_str = _parse_time(m.group(3), m.group(2))
+        title = _sanitize_title(m.group(4))
+        et = _classify_type(title) if len(title) >= 2 else None
+        if target and time_str and et:
             return _make_event(title, target.isoformat(), time_str, et)
 
     return _make_fail()

@@ -223,3 +223,58 @@ def test_global_gate_cache_returns_cached_result():
         result = main._global_pending_drain_ready()
     assert result is True
     get_tok.assert_not_called()
+
+
+def test_drain_pending_for_group_clears_stale_snapshots(monkeypatch):
+    """測試 _drain_pending_for_group 能正確清除超齡 pending entry (stale snapshot)。"""
+    _reset_piggyback_state()
+    monkeypatch.setattr(main.settings, "bot_muted", False)
+    group_id = "G_stale"
+    now_ts = time.time()
+    stale_ts = now_ts - (main._PENDING_MAX_AGE_SEC + 100)  # 確保超齡
+    fresh_ts = now_ts - 100  # 未超齡
+
+    # Seed pending store with stale and fresh items
+    pending_store.save_full({
+        group_id: [
+            {"type": "text", "message_id": "stale_1", "timestamp": stale_ts, "text": "stale message 1"},
+            {"type": "text", "message_id": "fresh_1", "timestamp": fresh_ts, "text": "fresh message 1"},
+            {"type": "text", "message_id": "stale_2", "timestamp": stale_ts, "text": "stale message 2"},
+            {"type": "text", "message_id": "fresh_2", "timestamp": fresh_ts, "text": "fresh message 2"},
+            # item with no timestamp (should be kept)
+            {"type": "text", "message_id": "no_ts_1", "text": "message with no timestamp"},
+        ]
+    })
+
+    mock_dlq = []
+    monkeypatch.setattr(
+        main,
+        "_dlq_entry",
+        lambda g, e, r=None, **kw: mock_dlq.append((g, e, r or kw.get("reason"))),
+    )
+    monkeypatch.setattr(time, "time", lambda: now_ts)  # Fix time for _drop_stale_pending calculation
+
+    with patch.object(main, "_gemini_group_messages", return_value=[]), \
+         patch.object(main, "_llm_chat", return_value="mock reply"), \
+         patch.object(main, "_md_to_line", wraps=main._md_to_line), \
+         patch.object(main, "_get_line_config", wraps=main._get_line_config), \
+         patch("main.ApiClient"), \
+         patch("main.MessagingApi"):
+
+        main._drain_pending_for_group(group_id, source="test")
+
+    # Verify stale items are moved to DLQ
+    assert len(mock_dlq) == 2
+    dlq_msg_ids = {e["message_id"] for _, e, _ in mock_dlq}
+    assert "stale_1" in dlq_msg_ids
+    assert "stale_2" in dlq_msg_ids
+
+    # Verify only fresh items and items without timestamp remain in pending store
+    final_pending = pending_store.list_for_group(group_id)
+    final_msg_ids = {item["message_id"] for item in final_pending}
+    assert len(final_msg_ids) == 3
+    assert "fresh_1" in final_msg_ids
+    assert "fresh_2" in final_msg_ids
+    assert "no_ts_1" in final_msg_ids
+    assert "stale_1" not in final_msg_ids
+    assert "stale_2" not in final_msg_ids

@@ -6,8 +6,8 @@ Flow：
 2. 啟動 / 重置一個 8 秒 debouncer（快速收集 burst）
 3. 8 秒到期 → 把這段 burst 合併成一段大文字 → 分類：
    (a) 先試 filter_rules (Layer 1/2 學到的規則)
-   (b) 啟發式：太短直接 skip；含 URL / 末句有結束標點 → 直接 respond
-   (c) 呼叫 gemini_client.classify_burst() 做最終判斷：
+   (b) 啟發式：明確閒聊短語 skip；其餘非空文字直接 respond
+   (c) classifier 保留為 fallback，但目前「有人留言就回」政策下通常不會走到：
        - "respond" → 立刻回
        - "skip"    → 略過
        - "wait"    → Gemini 判斷對方還沒說完，設 1 分鐘 timer，到期強制回
@@ -24,7 +24,6 @@ Flow：
 from __future__ import annotations
 
 import logging
-import re
 import threading
 import time
 from typing import Callable
@@ -37,9 +36,6 @@ logger = logging.getLogger(__name__)
 # ── 可調參數 ──────────────────────────────────────────────────────────────────
 SHORT_WINDOW_SECONDS = 8.0  # 初始等待窗口：快速收集 burst，然後問 Gemini
 BURST_WINDOW_SECONDS = 60.0  # Gemini 判斷對方還沒說完時，等 1 分鐘再強制回
-HEURISTIC_SHORT_LEN = 10  # 低於這個長度直接 skip（除非含 URL）
-HEURISTIC_LONG_LEN = 80  # 高於這個長度觸發「可能是轉貼長文」
-
 # ── 共享狀態（全程由 _lock 保護）──────────────────────────────────────────────
 _lock = threading.Lock()
 _pending: dict[str, list[tuple[str, str, str | None, float]]] = {}
@@ -246,9 +242,6 @@ def _match_rules(text: str, rules: list[dict]) -> str | None:
 
 # ── 啟發式 ────────────────────────────────────────────────────────────────────
 
-_URL_RE = re.compile(r"https?://\S+")
-_TOPIC_END_RE = re.compile(r"[？?！!。～~…]+\s*$")  # 末句結束信號
-
 # 常見純閒聊語助詞，整句等於這些就直接 skip
 _CHITCHAT_EXACT = {
     "哈哈",
@@ -280,9 +273,8 @@ _CHITCHAT_EXACT = {
 def _heuristic_decision(text: str) -> str | None:
     """回傳 'skip' / 'respond' / None（交給 classifier 決定）。
 
-    順序很重要：問句／驚嘆句的 topic-end punct 判斷要在「太短 → skip」之前，
-    否則「今晚有誰要吃和園？」這種 9 字短問句會被誤跳。但仍要過 CHITCHAT_EXACT
-    白名單把「好喔 / 哈哈」這種純閒聊先擋掉。
+    Andrew 的 current rule: 家人/群組裡有人留言就要回。唯一 cheap skip 是
+    明確閒聊短語，避免「好 / 哈哈」這類 reaction 造成噪音。
     """
     stripped = text.strip()
 
@@ -290,28 +282,8 @@ def _heuristic_decision(text: str) -> str | None:
     if stripped in _CHITCHAT_EXACT:
         return "skip"
 
-    has_url = bool(_URL_RE.search(stripped))
-
-    # 含連結 → respond
-    if has_url:
-        return "respond"
-
-    # 末句有明確結束信號（？/！/。/～/…）→ 即使短句也要回，特別是家族問句
-    # 例：「今晚有誰要吃和園？」「會下雨嗎？」「太誇張了！」
-    # 但 4 字以下（如「我！」「對啦」）多半是 reaction，仍交給後面長度判定
-    if _TOPIC_END_RE.search(stripped) and len(stripped) >= 4:
-        return "respond"
-
-    # 太短 + 無連結 + 無結束標點 → skip
-    if len(stripped) < HEURISTIC_SHORT_LEN and not has_url:
-        return "skip"
-
-    # 單一則就超過 HEURISTIC_LONG_LEN → 很可能是轉貼文章 → respond
-    if len(stripped) >= HEURISTIC_LONG_LEN:
-        return "respond"
-
-    # 中等長度有結束標點（其他案例已被上面 4-char 檢查接住）→ respond
-    if _TOPIC_END_RE.search(stripped):
+    # 其餘非空文字都回。8 秒 debounce 已經會把連續訊息合併成一次回覆。
+    if stripped:
         return "respond"
 
     # 其餘情境交給 classifier

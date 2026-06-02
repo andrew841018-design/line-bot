@@ -33,9 +33,9 @@ EVENT_TYPES: tuple[str, ...] = ("family_gathering", "personal_trip", "medical")
 _DEFAULT_EVENT_TYPE = "family_gathering"
 
 # Reminder offsets — multi-tier 提醒 (Andrew 2026-05-25 directive 加 30/7-day)
-# 30 = 1 個月前 / 7 = 1 週前 / 3-2-1 = 倒數三天每天推
+# 30 = 1 個月前 / 7 = 1 週前 / 3-2-1 = 倒數三天每天推 / 0 = 當天提醒
 # 加新 offset 只動這一行 + schema migration 自動補對應 reminded_Xd 欄位
-REMINDER_OFFSETS: tuple[int, ...] = (30, 7, 3, 2, 1)
+REMINDER_OFFSETS: tuple[int, ...] = (30, 7, 3, 2, 1, 0)
 
 
 def _reminded_column(offset: int) -> str:
@@ -101,7 +101,7 @@ def init_db() -> None:
             cols = [r[1] for r in c.execute("PRAGMA table_info(events)").fetchall()]
         assert "event_type" in cols, "event_type migration failed"
 
-        # Reminder offsets migration — T-3/T-2/T-1 三個 timestamp 欄位（NULL=未推）
+        # Reminder offsets migration — 每個 offset 一個 timestamp 欄位（NULL=未推）
         # 同 event_type PRAGMA pre-check + duplicate-column tolerance (codex critical)
         for off in REMINDER_OFFSETS:
             col_name = f"reminded_{off}d"
@@ -218,7 +218,7 @@ def cancel_event(event_id: str) -> bool:
 
 def update_event_date(event_id: str, new_date: str, new_time: str | None = None) -> bool:
     """Reschedule event；reset 所有 reminded 欄位（codex critical：rescheduled event
-    必須重推 T-3/T-2/T-1，否則之前推過的 flag 會壓住新提醒）。
+    必須重推所有 offset，否則之前推過的 flag 會壓住新提醒）。
     """
     with _lock, _conn() as c:
         cur = c.execute(
@@ -226,7 +226,8 @@ def update_event_date(event_id: str, new_date: str, new_time: str | None = None)
             "event_time = COALESCE(?, event_time), "
             "reminded_at = NULL, "
             "reminded_30d = NULL, reminded_7d = NULL, "
-            "reminded_3d = NULL, reminded_2d = NULL, reminded_1d = NULL "
+            "reminded_3d = NULL, reminded_2d = NULL, reminded_1d = NULL, "
+            "reminded_0d = NULL "
             "WHERE event_id = ?",
             (new_date, new_time, event_id),
         )
@@ -354,7 +355,7 @@ def list_due_for_reminder(group_id: str, days_ahead: int = 7) -> list[dict]:
     """回傳指定 group_id 中 event_date = today + days_ahead 且該 offset 的 reminded 欄位
     IS NULL 的 active events。
 
-    days_ahead in REMINDER_OFFSETS (30/7/3/2/1) → 查對應 reminded_Xd column
+    days_ahead in REMINDER_OFFSETS (30/7/3/2/1/0) → 查對應 reminded_Xd column
     days_ahead = 其他值（如 legacy）→ 走舊 `reminded_at` graveyard column（向後相容）
 
     group_id 從 2026-05-27 multi-group 起 required —— 兩位 reviewer 都警告若漏 filter，

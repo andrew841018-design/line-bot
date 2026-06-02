@@ -1,0 +1,8 @@
+{
+  "event_ids": ["event_id_to_special_case"],
+  "offset": 1,
+  "placeholder": "target",
+  "mention_text": "{target}\nPlease confirm this event time.",
+  "plain_text": "Please confirm this event time.",
+  "user_id_env": "EVENT_REMINDER_ONE_OFF_USER_ID"
+}

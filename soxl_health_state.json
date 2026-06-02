@@ -10,5 +10,8 @@
   },
   "futu_daemon|recent_fire": {
     "last_ts": "2026-05-29T20:00:04.353803"
+  },
+  "futu_daemon|launchd|recent_fire": {
+    "last_ts": "2026-06-01T20:00:04.401273"
   }
 }

@@ -480,7 +480,7 @@ def test_next_gemini_reset_tw():
 # ═══════════════════════════════════════════════════════════════════════════════
 def test_get_quota_footer():
     print("\n── Test N: _get_quota_footer ──")
-    # Gemini 有量
+    # Footer 已全部移除；quota 狀態不應污染一般回覆。
     main._quota_exhausted_until_ts = 0.0
     with patch(
         "main.gemini_client.get_gemini_quota_info",
@@ -493,7 +493,11 @@ def test_get_quota_footer():
         },
     ):
         footer = main._get_quota_footer()
-    check("有量 footer 含 %", "%" in footer)
+    check("有量 footer 空", footer == "")
+
+    main._quota_exhausted_until_ts = time.time() + 3600
+    footer = main._get_quota_footer()
+    check("quota exhausted footer 空", footer == "")
 
     main._quota_exhausted_until_ts = 0.0  # 還原
 

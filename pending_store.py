@@ -15,6 +15,7 @@ import os
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 
 BASE = Path(__file__).parent
@@ -25,6 +26,15 @@ LOCK_PATH = BASE / ".pending_explicit_reply.lock"
 logger = logging.getLogger("pending_store")
 
 _rlock = threading.RLock()
+
+
+def _unlink_media(entry: dict) -> None:
+    mp = entry.get("media_path")
+    if mp and os.path.exists(mp):
+        try:
+            os.remove(mp)
+        except OSError as e:
+            logger.warning("unlink media %s failed: %s", mp, e)
 
 
 class _FileLock:
@@ -83,6 +93,8 @@ def list_for_group(group_id: str) -> list[dict]:
     with _rlock, _FileLock(LOCK_PATH):
         data = _load_raw()
         items = data.get(group_id, [])
+        if isinstance(items, dict):
+            return [items]
         return list(items) if isinstance(items, list) else []
 
 
@@ -91,40 +103,92 @@ def add(group_id: str, entry: dict) -> None:
         data = _load_raw()
         if group_id not in data or not isinstance(data[group_id], list):
             data[group_id] = []
+        if not entry.get("message_id"):
+            entry = dict(entry)
+            entry["message_id"] = f"legacy-{uuid.uuid4().hex}"
         data[group_id].append(entry)
         _save_raw(data)
 
 
+def ensure_message_ids(group_id: str) -> int:
+    """Give legacy entries stable synthetic ids under the store lock."""
+    with _rlock, _FileLock(LOCK_PATH):
+        data = _load_raw()
+        items = data.get(group_id, [])
+        if isinstance(items, dict):
+            items = [items]
+            data[group_id] = items
+        if not isinstance(items, list):
+            return 0
+        changed = 0
+        for it in items:
+            if isinstance(it, dict) and not it.get("message_id"):
+                it["message_id"] = f"legacy-{uuid.uuid4().hex}"
+                changed += 1
+        if changed:
+            _save_raw(data)
+        return changed
+
+
 def remove_by_message_id(group_id: str, message_id: str) -> bool:
     """Idempotent. Removes matching entry + unlinks media file. Returns whether removed."""
-    if not message_id:
-        return False
+    return remove_by_message_ids(group_id, [message_id]) > 0
+
+
+def remove_by_message_ids(group_id: str, message_ids: list[str]) -> int:
+    """Idempotently remove matching entries + media files. Returns removed count."""
+    target_ids = {mid for mid in message_ids if mid}
+    if not target_ids:
+        return 0
     with _rlock, _FileLock(LOCK_PATH):
         data = _load_raw()
         items = data.get(group_id, [])
         if not isinstance(items, list):
-            return False
+            return 0
         new_items = []
-        removed = False
+        removed = 0
         for it in items:
-            if it.get("message_id") == message_id:
-                removed = True
-                mp = it.get("media_path")
-                if mp and os.path.exists(mp):
-                    try:
-                        os.remove(mp)
-                    except OSError as e:
-                        logger.warning("unlink media %s failed: %s", mp, e)
+            if it.get("message_id") in target_ids:
+                removed += 1
+                _unlink_media(it)
                 continue
             new_items.append(it)
         if not removed:
-            return False
+            return 0
         if new_items:
             data[group_id] = new_items
         else:
             data.pop(group_id, None)
         _save_raw(data)
-        return True
+        return removed
+
+
+def pop_stale(group_id: str, max_age_sec: int, now: float | None = None) -> list[dict]:
+    """Atomically remove stale entries for one group and return the dropped snapshot."""
+    now = time.time() if now is None else now
+    with _rlock, _FileLock(LOCK_PATH):
+        data = _load_raw()
+        items = data.get(group_id, [])
+        if not isinstance(items, list) or not items:
+            return []
+        keep: list[dict] = []
+        drop: list[dict] = []
+        for it in items:
+            ts = it.get("timestamp")
+            if ts is None or (now - ts) <= max_age_sec:
+                keep.append(it)
+            else:
+                drop.append(it)
+        if not drop:
+            return []
+        for it in drop:
+            _unlink_media(it)
+        if keep:
+            data[group_id] = keep
+        else:
+            data.pop(group_id, None)
+        _save_raw(data)
+        return list(drop)
 
 
 def clear_group(group_id: str) -> None:
@@ -132,12 +196,7 @@ def clear_group(group_id: str) -> None:
     with _rlock, _FileLock(LOCK_PATH):
         data = _load_raw()
         for entry in data.get(group_id, []):
-            mp = entry.get("media_path")
-            if mp and os.path.exists(mp):
-                try:
-                    os.remove(mp)
-                except OSError:
-                    pass
+            _unlink_media(entry)
         data.pop(group_id, None)
         _save_raw(data)
 

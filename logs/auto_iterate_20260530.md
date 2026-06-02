@@ -145,3 +145,34 @@ INFO:     147.92.149.168:0 - "POST /callback HTTP/1.1" 200 OK
 - log 結尾已追加「本輪總結」段（修了什麼 / 剩下什麼 / 下次該關注什麼）
 [12:35:54] iter 1 後 pytest 全綠，提早退出
 [12:35:55] ## Step 7: 仍有未 commit 變更，catch-all 上傳
+[main 80b8179] auto iterate 20260530 (catch-all)
+ 2 files changed, 12 insertions(+)
+To github.com:andrew841018-design/line-bot.git
+   82b1687..80b8179  main -> main
+[12:35:59] ## Step 8: restart uvicorn
+[12:36:06] /health: {"status":"ok","gemini_model":"gemini-2.5-flash","gemini_light_model":"gemini-2.5-flash-lite","group_locked":true}
+2026-05-30 12:36:10,404 INFO AFC is enabled with max remote calls: 10.
+2026-05-30 12:36:11,622 INFO HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+2026-05-30 12:36:11,666 INFO AFC is enabled with max remote calls: 10.
+2026-05-30 12:36:12,050 INFO HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent "HTTP/1.1 429 Too Many Requests"
+======================================================================
+LINE bot preflight @ 2026-05-30T12:36:07
+======================================================================
+  [✓]  1. uvicorn process alive
+  [✓]  2. local /health 200
+  [✓]  3. cloudflared process alive
+  [✓]  4. cloudflared URL stash 可讀 + 安全 — url=https://calculated-quantities-pound-slip.trycloudflare.com age=4730s
+  [✓]  5. cloudflared metrics 內部 URL 對 stash — metrics 200 但 ha_connections 沒露
+  [✓]  6. external https://calculated-quantities-pound-slip.trycloudflare.com/health 200 — attempt=1
+  [✓]  7. /callback no-sig → 400 missing
+  [✓]  8. LINE token /v2/bot/info 200
+  [✓]  9. LINE webhook URL 對齊 cloudflared
+  [✓] 10. LINE → cloudflared → /callback E2E
+  [✓] 11. Gemini main probe
+  [✗] 12. Gemini lite probe — 429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': 'You exceeded your current quota, please check your plan and 
+  [✓] 13. SQLite integrity + WAL checkpoint
+  [✓] 14. pending file JSON load — groups=2 entries=8
+----------------------------------------------------------------------
+PREFLIGHT [PASS] critical=12/12 info=2/2 elapsed=5.2s
+[12:36:13] preflight exit=0 (0=pass, 1=critical, 2=info-only, 3=infra)
+[12:36:13] ===== 結束 =====
