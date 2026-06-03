@@ -125,75 +125,9 @@ def daily_todos() -> str:
     return "\n".join(lines)
 
 
-# ── 1.5 關貿 6/4 面試準備｜8 天提醒（5/26-6/3，過期自動靜默）──────────────────
-
-_INTERVIEW_PREP_REMINDERS = {
-    "05-26": (
-        "📚 **今日：LLM/RAG 概念深度**（全天 8-10h）\n"
-        "• 上午：embedding / 向量 DB / RAG flow / LangChain / prompt eng\n"
-        "• 下午：chunking / re-rank / Fine-tune vs RAG / 評估指標\n"
-        "🧮 晨間 SQL（30min）：Top-N per group（LeetCode 185）"
-    ),
-    "05-27": (
-        "📚 **今日：資料工程概念深度**（全天 8-10h）\n"
-        "• 上午：ETL/ELT、Airflow DAG、SQL 進階（窗函數/CTE）\n"
-        "• 下午：Pandas、Spark/Kafka 名詞、Star/Snowflake Schema、SCD、Data Quality\n"
-        "🧮 晨間 SQL（30min）：累計加總 / 移動平均（LeetCode 1321）"
-    ),
-    "05-28": (
-        "🔬 **今日：PTT bot 摸熟（4h）+ design retroactive own + pgvector RAG demo 跑通（3-4h）+ Cloud 速攻（1h）**\n"
-        "• 上午：PTT bot internals - schema / scheduler / 8-source / timezone 坑 + 對 5 個 design decision 事後 own\n"
-        "• 下午：pgvector RAG demo 跑通（用 5/24 預備好的 venv + BGE cache + Colima）+ 截 5 張圖\n"
-        "• 晚上：Cloud/Docker 速攻 - AWS/GCP/Azure 主要服務名詞 + Dockerfile 概念\n"
-        "🧮 晨間 SQL（30min）：LAG/LEAD 比較（LeetCode 1407 變體）"
-    ),
-    "05-29": (
-        "🔬 **今日：LINE bot 摸熟（3h）+ design retroactive own + RAG 截圖整合（2h）+ 概念複習（3h）**\n"
-        "• 上午：LINE bot internals - LLM router fallback / quality gate / persona / 健康監測 + 對 5 個 design decision 事後 own\n"
-        "• 下午：RAG demo 截圖整合進簡報 wireframe + 30 秒講解稿（套 presentation_notes.md）\n"
-        "• 晚上：Day 1-4 概念總複習（為 5/30 Mock 第 1 輪熱身）\n"
-        "🧮 晨間 SQL（30min）：Streak 連續登入（LeetCode 601）"
-    ),
-    "05-30": (
-        "🎤 **今日：技術 Mock 第 1 輪（3 場深問）+ 補弱項**\n"
-        "• 上午：3 場技術深問（LLM/RAG / LINE bot LLM 工程化 / RAG demo 系統設計）\n"
-        "• 下午：找出最弱 3 題深補 + 弱項排序報告（給 6/2 用）\n"
-        "🧮 晨間 SQL（30min）：去重保留最新 / Top per group pattern（LC 1112）"
-    ),
-    "05-31": (
-        "🎤 **今日：技術 Mock 第 2 輪 + 概念盲點總複習**\n"
-        "• 上午：Mock 第 2 輪（針對 5/30 弱項深問 + Part A LLM 15 題隨抽 8 題）\n"
-        "• 下午：盲點補強 + Part D 系統設計 1 場（從 0 設計政府法規 RAG）\n"
-        "🧮 晨間 SQL（30min）：SCD Type 2 變化追蹤"
-    ),
-    "06-02": (
-        "🎤 **今日：技術 Mock 第 3 輪 + 弱項深補 + 自家專案再摸熟**\n"
-        "• 上午：Mock 第 3 輪（針對 5/30-5/31 弱項排序前 3 名集中考）\n"
-        "• 下午：PTT/LINE bot internals 第二輪複習 + 簡報順稿 3 遍\n"
-        "🧮 晨間 SQL（30min）：Time-series gap filling"
-    ),
-    "06-03": (
-        "⭐ **今日：簡報整天（主動回憶複習日）+ 最終設備檢查**\n"
-        "• 09-10 默寫骨架（不看筆記）→ 找記憶漏洞\n"
-        "• 10-13 補洞 + 寫講稿（每頁 30-40 秒）\n"
-        "• 13-15 做投影片（基於既有 10 分版 slides.md 壓縮 + 對應關貿 4 項）\n"
-        "• 15-17 對鏡頭計時練 5 遍 + 錄影檢討\n"
-        "• 17-18 改稿\n"
-        "• 19-20 最終設備檢查（網路 / 視訊 / 麥克風 / 燈光 / 副螢幕 / OPSEC 10 項）\n"
-        "• 21:30 早睡（明天 14:00 面試）\n"
-        "• 📌 履歷/104測驗請在 5/30-6/2 抽空完成，不要留 6/3\n"
-        "🧮 晨間 SQL（30min）：Pivot + CTE 綜合（LeetCode 1841）"
-    ),
-}
-
-
 def interview_prep_today() -> str:
-    """關貿 6/4 面試準備：5/26-6/3 每日提醒（過期日期自動 return 空）"""
-    today = datetime.now().strftime("%m-%d")
-    msg = _INTERVIEW_PREP_REMINDERS.get(today)
-    if not msg:
-        return ""
-    return f"🎯 **關貿 6/4 面試準備｜{today}**\n{msg}"
+    """Return an active one-off interview reminder, if configured."""
+    return ""
 
 
 # ── 1.6 每日技術筆記（核可後隔天才前進）─────────────────────────────────────────
@@ -1213,19 +1147,21 @@ def daily_reading() -> str:
     return "\n".join(lines)
 
 
-# ── 6. 待辦 (CLAUDE.md) ───────────────────────────────────────────────────────
+# ── 6. 待辦 (AGENTS.md) ───────────────────────────────────────────────────────
 
 
 def next_todos() -> str:
-    claude_md = PROJECT_DIR / "CLAUDE.md"
+    project_rules = PROJECT_DIR / "AGENTS.md"
     try:
-        content = claude_md.read_text(errors="ignore")
-        # 找「下次繼續」section
+        content = project_rules.read_text(errors="ignore")
+        # 找仍可執行的待辦 section；舊流水帳已移除。
         idx = content.rfind("下次繼續")
+        if idx == -1:
+            idx = content.rfind("進行中 / 下一步")
         if idx == -1:
             return ""
         section = content[idx : idx + 500].splitlines()
-        lines = ["📋 **下次繼續**"]
+        lines = ["📋 **專案待辦**"]
         for line in section[1:8]:
             if line.strip():
                 lines.append(line)
@@ -1245,14 +1181,7 @@ def line_bot_suggestions() -> str:
 
     load_dotenv(dotenv_path=LINE_BOT_DIR / ".env")
 
-    memory_path = Path(
-        "/Users/andrew/.claude/projects/-Users-andrew-Desktop-andrew-Data-engineer/memory/project_line_bot_feature_suggestions.md"
-    )
-
-    try:
-        memory_text = memory_path.read_text(errors="ignore")
-    except Exception:
-        memory_text = ""
+    memory_text = ""
 
     # 近 7 天已推薦過的
     history = []

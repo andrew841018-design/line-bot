@@ -4301,7 +4301,7 @@ def _handle_classify_command(group_id: str, text: str) -> str | None:
 def _handle_finance_view_command(group_id: str, text: str) -> str | None:
     """處理 /觀點 [可選: 家人名 | 標的]。純 SQL 聚合，不過 Gemini。
 
-    第一句必須是判斷句（line_bot CLAUDE.md 規則 0）。
+    第一句必須是判斷句（AGENTS.md 的 LINE bot 規則 0）。
     """
     s = (text or "").strip()
     if not s.startswith("/觀點"):

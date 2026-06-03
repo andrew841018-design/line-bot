@@ -61,7 +61,7 @@ _LEXICON = {
         "國外": r"日本|東京|京都|大阪|韓國|首爾|新加坡|泰國|越南|歐洲|美國",
     },
     "AI": {
-        "工具": r"ChatGPT|Claude|Gemini|Copilot|Midjourney|Stable\s?Diffusion",
+        "工具": r"ChatGPT|Gemini|Copilot|Midjourney|Stable\s?Diffusion",
         "應用": r"AI 圖|AI 影片|AI 配音|AI 翻譯|AI 寫作|RAG|MCP",
         "趨勢": r"AGI|大模型|LLM|生成式|算力|推理|訓練",
     },

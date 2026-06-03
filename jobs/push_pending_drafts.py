@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""一次性 push 9 條 image reply 到 family 群（Claude 已 draft 好）。
+"""一次性 push 9 條 image reply 到 family 群（draft 已準備好）。
 
 跑法：
     cd /Users/andrew/Desktop/andrew/Data_engineer/line_bot

@@ -274,8 +274,8 @@ def _run_subprocess(job_name: str, spec: JobSpec) -> None:
             rc = proc.wait(timeout=spec.timeout)
         except subprocess.TimeoutExpired:
             # Kill the WHOLE session group (start_new_session=True made one).
-            # Bash wrappers spawn descendants (e.g. claude); terminate only on
-            # the direct child leaves orphans.
+            # Bash wrappers spawn descendants; terminating only the direct child
+            # can leave orphaned processes.
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
             except (ProcessLookupError, PermissionError, OSError):

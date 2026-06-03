@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- 每日 17:30（晚餐前，對齊「今晚煮什麼」語意；GP2 補充 2）推飲食建議到家族群。
-     ⚠️ launchd 睡眠陷阱（專案 CLAUDE.md）：Mac 在 17:30 睡眠會跳過不補打。
+<!-- 每日 17:30（晚餐前，對齊「今晚煮什麼」語意）推飲食建議到家族群。
+     ⚠️ launchd 睡眠陷阱：Mac 在 17:30 睡眠會跳過不補打。
         Andrew 此時段通常在用 Mac；若不穩可加 `pmset repeat wake` 覆蓋。
      部署：cp 到 ~/Library/LaunchAgents/ 後 launchctl load。 -->
 <plist version="1.0">
