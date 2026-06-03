@@ -1131,6 +1131,331 @@ def sox_sentiment() -> str:
         return f"📈 **費半指數** ⚠️ 抓取失敗：{e}"
 
 
+_SOXX_DATA_RAW_DIR = BASE / "soxx_tracker" / "data" / "raw"
+_SOXX_FUNDAMENTALS_DIR = _SOXX_DATA_RAW_DIR / "fundamentals"
+_SOXX_PRICES_DIR = _SOXX_DATA_RAW_DIR / "prices"
+
+_GUIDANCE_TICKERS = ("NVDA", "AVGO", "AMD", "MU")
+_EQUIPMENT_TICKERS = ("ASML", "AMAT", "LRCX")
+_HYPERSCALER_TICKERS = ("MSFT", "META", "GOOG", "AMZN")
+
+
+def _cycle_float(value):
+    if value is None:
+        return None
+    try:
+        # pandas/numpy NaN has the property value != value.
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if v != v else v
+
+
+def _cycle_pct(value, digits=1):
+    v = _cycle_float(value)
+    if v is None:
+        return "—"
+    return f"{v:+.{digits}f}%"
+
+
+def _cycle_money_b(value, currency="$"):
+    v = _cycle_float(value)
+    if v is None:
+        return "—"
+    return f"{currency}{v:,.1f}B"
+
+
+def _cycle_ym(value):
+    if value is None:
+        return "—"
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y-%m")
+    return str(value)[:7]
+
+
+def _cycle_unavailable(label, detail, source=""):
+    return {
+        "label": label,
+        "status": "⚪ 資料暫缺",
+        "detail": detail,
+        "source": source,
+    }
+
+
+def _cycle_status(triggered):
+    return "⚠️ 觸發" if triggered else "✅ 未觸發"
+
+
+def _yfinance_info(ticker, cache):
+    if ticker in cache:
+        return cache[ticker]
+    try:
+        yf = cache.get("_yf")
+        if yf is None:
+            import yfinance as yf  # noqa: WPS433
+            cache["_yf"] = yf
+        info = cache["_yf"].Ticker(ticker).get_info()
+        cache[ticker] = info if isinstance(info, dict) else {}
+    except Exception:
+        cache[ticker] = {}
+    return cache[ticker]
+
+
+def _growth_rows(tickers, cache):
+    rows = []
+    for ticker in tickers:
+        info = _yfinance_info(ticker, cache)
+        revenue = _cycle_float(info.get("revenueGrowth"))
+        earnings = _cycle_float(info.get("earningsGrowth"))
+        if earnings is None:
+            earnings = _cycle_float(info.get("earningsQuarterlyGrowth"))
+        rows.append({
+            "ticker": ticker,
+            "revenue_growth_pct": revenue * 100 if revenue is not None else None,
+            "earnings_growth_pct": earnings * 100 if earnings is not None else None,
+            "forward_eps": _cycle_float(info.get("forwardEps")),
+        })
+    return rows
+
+
+def _growth_summary(rows):
+    parts = []
+    for row in rows:
+        parts.append(
+            "{ticker} 營收{rev} / EPS{eps}".format(
+                ticker=row["ticker"],
+                rev=_cycle_pct(row.get("revenue_growth_pct")),
+                eps=_cycle_pct(row.get("earnings_growth_pct")),
+            )
+        )
+    return "；".join(parts)
+
+
+def _weak_growth_count(rows):
+    count = 0
+    valid = 0
+    for row in rows:
+        rev = _cycle_float(row.get("revenue_growth_pct"))
+        eps = _cycle_float(row.get("earnings_growth_pct"))
+        if rev is None and eps is None:
+            continue
+        valid += 1
+        if (rev is not None and rev <= 0) or (eps is not None and eps <= 0):
+            count += 1
+    return count, valid
+
+
+def _load_tsmc_revenue_metric(cache):
+    try:
+        import pandas as pd  # noqa: WPS433
+        df = pd.read_parquet(_SOXX_FUNDAMENTALS_DIR / "tsmc_revenue.parquet")
+    except Exception as e:
+        return _cycle_unavailable("TSMC 月營收 YoY", f"TSMC 月營收檔讀取失敗：{e}")
+
+    if df.empty:
+        return _cycle_unavailable("TSMC 月營收 YoY", "TSMC 月營收檔為空", "TSMC IR parquet")
+
+    df = df.sort_values("month").reset_index(drop=True)
+    latest = df.iloc[-1]
+    yoys = [_cycle_float(v) for v in df["yoy_pct"].tolist()]
+    yoys = [v for v in yoys if v is not None]
+    decel = 0
+    for i in range(len(yoys) - 1, 0, -1):
+        if yoys[i] < yoys[i - 1]:
+            decel += 1
+        else:
+            break
+
+    detail = (
+        f"{_cycle_ym(latest.get('month'))} 營收 "
+        f"{_cycle_money_b(latest.get('revenue_twd_b'), currency='NT$')}，"
+        f"YoY {_cycle_pct(latest.get('yoy_pct'))}，"
+        f"MoM {_cycle_pct(latest.get('mom_pct'))}；"
+        f"YoY 連 {decel} 次放緩（規則：3 次才降溫）"
+    )
+    return {
+        "label": "TSMC 月營收 YoY",
+        "status": _cycle_status(decel >= 3),
+        "detail": detail,
+        "source": "TSMC IR parquet",
+    }
+
+
+def _load_guidance_proxy_metric(cache):
+    rows = _growth_rows(_GUIDANCE_TICKERS, cache)
+    weak, valid = _weak_growth_count(rows)
+    if valid == 0:
+        return _cycle_unavailable(
+            "NVDA / AVGO / AMD / MU 指引",
+            "yfinance 沒抓到可用的營收/EPS 成長欄位",
+            "yfinance info proxy",
+        )
+
+    return {
+        "label": "NVDA / AVGO / AMD / MU 指引（proxy）",
+        "status": _cycle_status(weak >= 2),
+        "detail": f"{_growth_summary(rows)}；弱化 {weak}/{valid} 家（規則：2 家以上才減碼）",
+        "source": "yfinance revenueGrowth/earningsGrowth proxy",
+    }
+
+
+def _load_equipment_proxy_metric(cache):
+    rows = _growth_rows(_EQUIPMENT_TICKERS, cache)
+    weak, valid = _weak_growth_count(rows)
+    if valid == 0:
+        return _cycle_unavailable(
+            "ASML / AMAT / LRCX 訂單",
+            "yfinance 沒抓到可用的設備股營收/EPS 成長欄位",
+            "yfinance info proxy",
+        )
+
+    return {
+        "label": "ASML / AMAT / LRCX 訂單（proxy）",
+        "status": _cycle_status(weak >= 2),
+        "detail": f"{_growth_summary(rows)}；弱化 {weak}/{valid} 家（規則：2 家以上才警戒）",
+        "source": "yfinance revenueGrowth/earningsGrowth proxy",
+    }
+
+
+def _load_memory_proxy_metric(cache):
+    rows = _growth_rows(("MU",), cache)
+    weak, valid = _weak_growth_count(rows)
+    if valid == 0:
+        return _cycle_unavailable(
+            "HBM / DRAM / NAND",
+            "DRAM/NAND 公開即時價格源仍缺；MU proxy 也無資料",
+            "TrendForce/DRAMeXchange paywalled note",
+        )
+
+    return {
+        "label": "HBM / DRAM / NAND（MU proxy）",
+        "status": _cycle_status(weak >= 1),
+        "detail": f"{_growth_summary(rows)}；DRAM/NAND 免費歷史價源缺，先用 MU 基本面 proxy",
+        "source": "yfinance MU proxy + local DRAM source note",
+    }
+
+
+def _load_hyperscaler_capex_metric(cache):
+    try:
+        import pandas as pd  # noqa: WPS433
+        df = pd.read_parquet(_SOXX_FUNDAMENTALS_DIR / "hyperscaler_capex.parquet")
+    except Exception as e:
+        return _cycle_unavailable("Hyperscaler capex", f"capex 檔讀取失敗：{e}")
+
+    if df.empty:
+        return _cycle_unavailable("Hyperscaler capex", "capex 檔為空", "stockanalysis parquet")
+
+    df["period_end_date"] = pd.to_datetime(df["period_end_date"])
+    latest = df.sort_values(["ticker", "period_end_date"]).groupby("ticker").tail(1)
+    latest = latest[latest["ticker"].isin(_HYPERSCALER_TICKERS)]
+    if latest.empty:
+        return _cycle_unavailable("Hyperscaler capex", "找不到 MSFT/META/GOOG/AMZN 最新 capex")
+
+    total = latest["capex_usd_b"].sum()
+    avg_yoy = latest["yoy_pct"].mean()
+    avg_qoq = latest["qoq_pct"].mean()
+    qoq_down = int((latest["qoq_pct"] < 0).sum())
+    period = _cycle_ym(latest["period_end_date"].max())
+    triggered = (_cycle_float(avg_yoy) is not None and avg_yoy <= 0) or qoq_down >= 2
+    detail = (
+        f"{period} 四大雲廠合計 capex {_cycle_money_b(total)}，"
+        f"平均 YoY {_cycle_pct(avg_yoy)}，QoQ {_cycle_pct(avg_qoq)}；"
+        f"QoQ 下滑 {qoq_down}/{len(latest)} 家（規則：2 家以上才警戒）"
+    )
+    return {
+        "label": "Hyperscaler capex",
+        "status": _cycle_status(triggered),
+        "detail": detail,
+        "source": "stockanalysis quarterly cash-flow parquet",
+    }
+
+
+def _latest_soxx_holding_tickers(limit=10):
+    try:
+        import pandas as pd  # noqa: WPS433
+        csvs = sorted(_SOXX_PRICES_DIR.glob("holdings_*.csv"))
+        if not csvs:
+            return []
+        df = pd.read_csv(csvs[-1])
+        df = df[["ticker", "weight_pct"]].copy()
+        df["weight_pct"] = pd.to_numeric(df["weight_pct"], errors="coerce")
+        df = df.dropna(subset=["ticker", "weight_pct"])
+        df = df.sort_values("weight_pct", ascending=False).head(limit)
+        return [str(t).upper() for t in df["ticker"].tolist()]
+    except Exception:
+        return []
+
+
+def _load_eps_breadth_proxy_metric(cache):
+    tickers = _latest_soxx_holding_tickers(limit=10)
+    if not tickers:
+        tickers = ("NVDA", "AVGO", "AMD", "MU", "QCOM", "AMAT", "ASML", "LRCX")
+    rows = _growth_rows(tickers, cache)
+    valid = [r for r in rows if _cycle_float(r.get("earnings_growth_pct")) is not None]
+    if not valid:
+        return _cycle_unavailable(
+            "SOXX EPS revision breadth",
+            "yfinance 沒抓到 top holdings 的 EPS 成長欄位",
+            "yfinance earningsGrowth proxy",
+        )
+
+    positive = [r for r in valid if _cycle_float(r.get("earnings_growth_pct")) > 0]
+    ratio = len(positive) / len(valid)
+    weakest = sorted(
+        valid,
+        key=lambda r: _cycle_float(r.get("earnings_growth_pct")),
+    )[:3]
+    weak_txt = "、".join(
+        f"{r['ticker']} {_cycle_pct(r.get('earnings_growth_pct'))}" for r in weakest
+    )
+    detail = (
+        f"SOXX top{len(valid)} EPS 成長為正 {len(positive)}/{len(valid)} "
+        f"({ratio * 100:.0f}%)；最弱：{weak_txt}（規則：跌破 50% 才確認擴散）"
+    )
+    return {
+        "label": "SOXX EPS revision breadth（proxy）",
+        "status": _cycle_status(ratio < 0.5),
+        "detail": detail,
+        "source": "SOXX holdings + yfinance earningsGrowth proxy",
+    }
+
+
+def _load_semiconductor_cycle_metrics():
+    cache = {}
+    loaders = (
+        ("TSMC 月營收 YoY", _load_tsmc_revenue_metric),
+        ("NVDA / AVGO / AMD / MU 指引", _load_guidance_proxy_metric),
+        ("ASML / AMAT / LRCX 訂單", _load_equipment_proxy_metric),
+        ("HBM / DRAM / NAND", _load_memory_proxy_metric),
+        ("Hyperscaler capex", _load_hyperscaler_capex_metric),
+        ("SOXX EPS revision breadth", _load_eps_breadth_proxy_metric),
+    )
+    metrics = []
+    for label, loader in loaders:
+        try:
+            metrics.append(loader(cache))
+        except Exception as e:
+            metrics.append(_cycle_unavailable(label, f"資料抓取失敗：{e}"))
+    return metrics
+
+
+def semiconductor_cycle_monitor(metrics=None) -> str:
+    """Daily Discord field for SOXX cycle-position monitoring with concrete data."""
+    metrics = metrics if metrics is not None else _load_semiconductor_cycle_metrics()
+    lines = [
+        "🧭 **半導體週期監控（SOXX 週期單）**",
+        "原則：未見週期轉弱，不因創高出清；2 項觸發先減碼，3-4 項大幅降倉，5 項以上結束週期單。",
+    ]
+    for idx, item in enumerate(metrics, start=1):
+        label = item.get("label", "未知指標")
+        status = item.get("status", "⚪ 資料暫缺")
+        detail = item.get("detail", "")
+        source = item.get("source", "")
+        suffix = f"｜{source}" if source else ""
+        lines.append(f"{idx}. {status} **{label}**：{detail}{suffix}")
+    return "\n".join(lines)
+
+
 # ── 5.7 每日讀書代辦（2026-05-07 加，取代原本的「練車路線」section）──────────
 
 
@@ -1578,9 +1903,9 @@ def main():
     except Exception as e:
         print(f"[soxx_briefing] skipped: {e}", file=sys.stderr)
 
-    sox = sox_sentiment()
-    if sox:
-        sections += ["", sox]
+    cycle_monitor = semiconductor_cycle_monitor()
+    if cycle_monitor:
+        sections += ["", cycle_monitor]
 
     # Jim Cramer 每日論述（固定顯示：有講推繁中摘要，沒講明說沒講）。
     # 放 line_bot_suggestions() 之後 → 共用 GEMINI_API_KEY 時接受被餓 → 自動 fallback 英文標題。
