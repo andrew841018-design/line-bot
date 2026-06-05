@@ -147,6 +147,113 @@ def _curl_with_token(url, token, *, timeout=10, method="GET", data=None,
     except Exception as e: return 0, f"curl_err: {str(e)[:120]}"
 
 
+def _webhook_put_retryable(code, body):
+    body = body or ""
+    if code == 400 and "Invalid webhook endpoint URL" in body:
+        return True
+    if code in (0, 408, 409, 425, 429):
+        return True
+    return 500 <= code < 600
+
+
+def _put_line_webhook_endpoint(token, endpoint, *, retry_delays=(0, 3, 8, 15)):
+    delays = tuple(retry_delays)
+    last_code, last_body = 0, ""
+    payload = json.dumps({"endpoint": endpoint})
+    for attempt, delay in enumerate(delays, start=1):
+        if delay:
+            time.sleep(delay)
+        last_code, last_body = _curl_with_token(
+            LINE_WEBHOOK_ENDPOINT,
+            token,
+            timeout=8,
+            method="PUT",
+            data=payload,
+            extra_headers=["Content-Type: application/json"],
+        )
+        if last_code == 200:
+            return last_code, last_body, attempt
+        if attempt >= len(delays) or not _webhook_put_retryable(last_code, last_body):
+            return last_code, last_body, attempt
+    return last_code, last_body, len(delays)
+
+
+def _line_path_recovery_warranted(alignment_result, e2e_result):
+    align_detail = (getattr(alignment_result, "detail", "") or "").lower()
+    if getattr(alignment_result, "status", "") == "fail":
+        if "invalid webhook endpoint url" in align_detail:
+            return True
+        if "put http 400" in align_detail or "put http 0" in align_detail:
+            return True
+        if re.search(r"put http 5\d\d", align_detail):
+            return True
+
+    e2e_detail = (getattr(e2e_result, "detail", "") or "").lower()
+    if getattr(e2e_result, "status", "") == "fail":
+        recoverable_e2e = (
+            "statuscode=530",
+            "error_status_code",
+            "could_not_connect",
+            "unknown host",
+            "statuscode=0",
+            "http 530",
+            "curl_timeout",
+        )
+        return any(p in e2e_detail for p in recoverable_e2e)
+    return False
+
+
+def _line_path_recovery_detail(alignment_result, e2e_result):
+    parts = []
+    if getattr(alignment_result, "status", "") == "fail":
+        parts.append(f"alignment={alignment_result.detail[:100]}")
+    if getattr(e2e_result, "status", "") == "fail":
+        parts.append(f"e2e={e2e_result.detail[:100]}")
+    return " | ".join(parts) or "LINE webhook path stale"
+
+
+def _restart_cloudflared_for_preflight(previous_url, *, timeout=90):
+    domain = f"gui/{os.getuid()}"
+    service = f"{domain}/{CLOUDFLARED_LABEL}"
+    plist = Path.home() / "Library" / "LaunchAgents" / f"{CLOUDFLARED_LABEL}.plist"
+    try:
+        printed = subprocess.run(
+            ["launchctl", "print", service],
+            capture_output=True, text=True, timeout=10,
+        )
+        if printed.returncode != 0:
+            if not plist.exists():
+                return False, f"missing cloudflared plist: {plist}"
+            boot = subprocess.run(
+                ["launchctl", "bootstrap", domain, str(plist)],
+                capture_output=True, text=True, timeout=10,
+            )
+            if boot.returncode != 0 and "already bootstrapped" not in (boot.stderr or ""):
+                return False, f"launchctl bootstrap rc={boot.returncode}: {(boot.stderr or '')[:160]}"
+
+        kick = subprocess.run(
+            ["launchctl", "kickstart", "-k", service],
+            capture_output=True, text=True, timeout=10,
+        )
+        if kick.returncode != 0:
+            return False, f"launchctl kickstart rc={kick.returncode}: {(kick.stderr or '')[:160]}"
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            time.sleep(1)
+            try:
+                current = TUNNEL_URL_STASH.read_text().strip()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                continue
+            if current and TUNNEL_URL_PATTERN.match(current) and current != previous_url:
+                return True, current
+        return False, f"no fresh cloudflared URL within {timeout}s"
+    except Exception as e:
+        return False, f"restart cloudflared exception: {str(e)[:120]}"
+
+
 def _line_token():
     try:
         sys.path.insert(0, str(BOT_DIR))
@@ -340,16 +447,20 @@ def check_7_webhook_alignment(tunnel_url, *, dry_run=False):
                 finally:
                     _sig.alarm(0)
             except BlockingIOError: return r.failed("flock 30s timeout — concurrent run"), expected
-            put_code, put_body = _curl_with_token(LINE_WEBHOOK_ENDPOINT, tok, timeout=8,
-                method="PUT", data=json.dumps({"endpoint": expected}),
-                extra_headers=["Content-Type: application/json"])
-            if put_code != 200: return r.failed(f"PUT http {put_code}: {put_body[:120]}"), expected
+            put_code, put_body, put_attempts = _put_line_webhook_endpoint(tok, expected)
+            if put_code != 200:
+                return r.failed(
+                    f"PUT http {put_code} after {put_attempts} attempts: {put_body[:120]}"
+                ), expected
             time.sleep(1)
             code2, body2 = _curl_with_token(LINE_WEBHOOK_ENDPOINT, tok, timeout=8)
             try: d2 = json.loads(body2)
             except Exception: return r.failed(f"recheck json: {body2[:120]}"), expected
             if d2.get("endpoint") == expected:
-                return r.autofixed(f"drift fixed: {current!r} → {expected!r}"), expected
+                detail = f"drift fixed: {current!r} → {expected!r}"
+                if put_attempts > 1:
+                    detail += f" (PUT attempts={put_attempts})"
+                return r.autofixed(detail), expected
             return r.failed(f"recheck still drift: {d2.get('endpoint')!r}"), expected
     except OSError as e: return r.failed(f"flock: {e}"), expected
 
@@ -412,28 +523,74 @@ def run(args):
     def append(r):
         results.append(r)
         print(f"  [{r.mark}] {r.idx:2d}. {r.name}{' — ' + r.detail if r.detail else ''}")
+    def line_path_once(current_tunnel_url):
+        r_align, current_webhook_url = check_7_webhook_alignment(
+            current_tunnel_url,
+            dry_run=args.dry_run,
+        )
+        post_autofix_external = None
+        if r_align.status == "autofix":
+            post_autofix_external = check_5_external_tunnel(current_tunnel_url)
+        r_e2e = check_8_line_e2e(dry_run=args.dry_run)
+        return r_align, current_webhook_url, post_autofix_external, r_e2e
+    def append_line_path(r_align, post_autofix_external, r_e2e):
+        append(r_align)
+        if post_autofix_external is not None:
+            print("  [↻] autofix triggered → re-run external + E2E")
+            append(post_autofix_external)
+        append(r_e2e)
     print("=" * 70)
     print(f"LINE bot preflight @ {datetime.now().isoformat(timespec='seconds')}")
     print("=" * 70)
     append(check_1_uvicorn_alive())
     append(check_2_local_health())
-    append(check_3_cloudflared_alive())
+    cloudflared_alive_result = check_3_cloudflared_alive()
+    append(cloudflared_alive_result)
     r4, tunnel_url = check_4_stash_valid()
     append(r4)
     if r4.status == "fail":
         return _finalize(results, start, tunnel_url="", webhook_url="", args=args)
-    append(check_4c_double_source(tunnel_url))
+    metrics_result = check_4c_double_source(tunnel_url)
+    append(metrics_result)
     append(check_5_external_tunnel(tunnel_url))
     append(check_5b_local_callback_route())
     append(check_6_line_token())
-    r7, webhook_url = check_7_webhook_alignment(tunnel_url, dry_run=args.dry_run)
-    append(r7)
-    if r7.status == "autofix":
-        print("  [↻] autofix triggered → re-run external + E2E")
-        append(check_5_external_tunnel(tunnel_url))
-        append(check_8_line_e2e(dry_run=args.dry_run))
+    r7, webhook_url, post_autofix_external, r8 = line_path_once(tunnel_url)
+    if (
+        not args.dry_run
+        and _line_path_recovery_warranted(r7, r8)
+    ):
+        append(CheckResult(15, "LINE webhook path stale recovery", critical=True).autofixed(
+            _line_path_recovery_detail(r7, r8)
+        ))
+        restart_ok, new_url_or_reason = _restart_cloudflared_for_preflight(tunnel_url)
+        if restart_ok:
+            tunnel_url = new_url_or_reason
+            append(CheckResult(16, "cloudflared restart for LINE webhook recovery", critical=True).autofixed(
+                f"new URL {tunnel_url}"
+            ))
+            post_restart_alive = check_3_cloudflared_alive()
+            if cloudflared_alive_result.status == "fail" and post_restart_alive.status != "fail":
+                cloudflared_alive_result.status = "skip"
+                cloudflared_alive_result.critical = False
+                cloudflared_alive_result.detail = f"superseded by cloudflared recovery; new URL {tunnel_url}"
+            append(post_restart_alive)
+            post_restart_metrics = check_4c_double_source(tunnel_url)
+            if metrics_result.status == "fail" and post_restart_metrics.status != "fail":
+                metrics_result.status = "skip"
+                metrics_result.critical = False
+                metrics_result.detail = f"superseded by cloudflared recovery; new URL {tunnel_url}"
+            append(post_restart_metrics)
+            append(check_5_external_tunnel(tunnel_url))
+            r7, webhook_url, post_autofix_external, r8 = line_path_once(tunnel_url)
+            append_line_path(r7, post_autofix_external, r8)
+        else:
+            append(CheckResult(16, "cloudflared restart for LINE webhook recovery", critical=True).failed(
+                new_url_or_reason
+            ))
+            append_line_path(r7, post_autofix_external, r8)
     else:
-        append(check_8_line_e2e(dry_run=args.dry_run))
+        append_line_path(r7, post_autofix_external, r8)
     append(check_9_gemini("gemini-2.5-flash", idx=11, label="main"))
     append(check_9_gemini("gemini-2.5-flash-lite", idx=12, label="lite"))
     append(check_10_sqlite())

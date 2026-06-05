@@ -6,6 +6,7 @@ notify_discord.send_dm; never touches production pending JSON or Discord.
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -85,6 +86,22 @@ def test_build_report_corrupt_status_preserved():
     assert r.pending_file_size == 123
 
 
+def test_build_report_keeps_pending_reminder_rows():
+    rows = [
+        dpa.PendingReminderRow(
+            pending_id=4,
+            group_id="G1",
+            message_id="m1",
+            created_at=1000,
+            retries=2,
+            text="明天晚上7:15去教會4樓參加嗎哪小組查經",
+        )
+    ]
+    r = dpa.build_report({}, pending_reminders=rows)
+    assert r.total_pending_reminders == 1
+    assert r.pending_reminders[0].pending_id == 4
+
+
 # ---------- format_message ----------
 
 def test_format_message_corrupt_shows_alarm():
@@ -115,6 +132,27 @@ def test_format_message_zero_with_excluded_extras():
     assert "✅" in msg
     assert "audio=1" in msg
     assert "text=1" in msg
+
+
+def test_format_message_zero_media_warns_pending_reminders():
+    r = dpa.build_report(
+        {},
+        pending_reminders=[
+            dpa.PendingReminderRow(
+                pending_id=4,
+                group_id="G1",
+                message_id="616958066751701691",
+                created_at=1700000000,
+                retries=0,
+                text="以下是正確的：6月6日星期六下午三點要出發到台大醫院新醫院1樓做MRI胸椎檢查",
+            )
+        ],
+    )
+    msg = dpa.format_message(r)
+    assert "⚠️" in msg
+    assert "reminder extract pending 1 筆" in msg
+    assert "pid=4" in msg
+    assert "MRI" in msg
 
 
 def test_format_message_with_leftover_lists_top10_and_flags():
@@ -193,6 +231,34 @@ def test_format_timestamp_defensive():
     assert dpa._format_timestamp(0) == "未知時間"
     assert "/" in dpa._format_timestamp(1700000000.5)
     assert "/" in dpa._format_timestamp("1700000000")
+
+
+def test_load_pending_reminder_rows_reads_sqlite(tmp_path):
+    db = tmp_path / "line_bot.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE pending_reminder_extract ("
+            "pending_id INTEGER PRIMARY KEY, group_id TEXT, user_id TEXT, "
+            "message_id TEXT, text TEXT, created_at INTEGER, retries INTEGER, "
+            "claimed_at INTEGER, status TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO pending_reminder_extract "
+            "(pending_id, group_id, user_id, message_id, text, created_at, retries, claimed_at, status) "
+            "VALUES (4, 'G1', 'U1', 'm1', '明天晚上7:15去教會4樓參加嗎哪小組查經', 1000, 1, 0, 'pending')"
+        )
+        conn.execute(
+            "INSERT INTO pending_reminder_extract "
+            "(pending_id, group_id, user_id, message_id, text, created_at, retries, claimed_at, status) "
+            "VALUES (5, 'G1', 'U1', 'm2', 'done row', 1001, 0, 0, 'done')"
+        )
+
+    rows = dpa.load_pending_reminder_rows(db)
+
+    assert len(rows) == 1
+    assert rows[0].pending_id == 4
+    assert rows[0].retries == 1
+    assert "嗎哪小組" in rows[0].text
 
 
 # ---------- _safe_load_pending ----------

@@ -789,6 +789,8 @@ def add_reminder(
     """
     import time
     now = int(time.time())
+    action = _normalize_reminder_text(action)
+    source_text = _normalize_reminder_text(source_text)
     with _lock, _conn() as c:
         # 去重
         existing = c.execute(
@@ -799,12 +801,84 @@ def add_reminder(
         ).fetchone()
         if existing:
             return None
+        nearby = c.execute(
+            "SELECT reminder_id, action, COALESCE(source_text, '') "
+            "FROM reminders WHERE group_id = ? AND status = 'pending' "
+            "AND ABS(remind_at - ?) < 1800",
+            (group_id, remind_at),
+        ).fetchall()
+        for existing_id, existing_action, existing_source in nearby:
+            merged_action = _merge_reminder_action(existing_action, action)
+            if not merged_action:
+                continue
+            merged_source = _merge_reminder_source(existing_source, source_text)
+            c.execute(
+                "UPDATE reminders SET action = ?, source_text = ? "
+                "WHERE reminder_id = ?",
+                (merged_action, merged_source, existing_id),
+            )
+            return existing_id
         c.execute(
             "INSERT INTO reminders(group_id, user_id, action, remind_at, "
             "created_at, status, source_text) VALUES (?, ?, ?, ?, ?, 'pending', ?)",
             (group_id, user_id, action, remind_at, now, source_text),
         )
         return c.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def _normalize_reminder_text(text: str | None) -> str:
+    """Normalize common ASR/OCR slips before reminder dedup/merge."""
+    if not text:
+        return ""
+    out = str(text).strip()
+    out = re.sub(r"嗎[？?]\s*那", "嗎哪", out)
+    replacements = {
+        "茶几": "查經",
+        "雞腿腿飯": "雞腿飯",
+    }
+    for old, new in replacements.items():
+        out = out.replace(old, new)
+    return out
+
+
+def _reminder_topic(action: str) -> str:
+    text = _normalize_reminder_text(action)
+    if "嗎哪小組" in text:
+        return "mana_group"
+    return ""
+
+
+def _merge_reminder_action(existing_action: str, new_action: str) -> str | None:
+    existing = _normalize_reminder_text(existing_action)
+    new = _normalize_reminder_text(new_action)
+    topic = _reminder_topic(existing)
+    if not topic or topic != _reminder_topic(new):
+        return None
+    if topic == "mana_group":
+        return _merge_mana_group_action(existing, new)
+    return new if len(new) > len(existing) else existing
+
+
+def _merge_mana_group_action(existing: str, new: str) -> str:
+    combined = f"{existing} {new}"
+    prefix = "媽媽行程：" if "媽媽" in combined else ""
+    details: list[str] = []
+    if "教會4樓" in combined and "教會4樓" not in details:
+        details.append("教會4樓")
+    duration = re.search(r"\d{1,2}:\d{2}\s*[-~－—]\s*\d{1,2}:\d{2}", combined)
+    if duration:
+        details.append(duration.group(0).replace(" ", ""))
+    suffix = f"（{'，'.join(details)}）" if details else ""
+    return f"{prefix}嗎哪小組查經{suffix}"
+
+
+def _merge_reminder_source(existing_source: str, new_source: str) -> str:
+    parts = []
+    for value in (existing_source, new_source):
+        value = _normalize_reminder_text(value)
+        if value and value not in parts:
+            parts.append(value)
+    return "\n---\n".join(parts)[:800]
 
 
 # ── Pending reminder extract（quota 爆時入隊、恢復後補抽，2026-05-30 加）──────────

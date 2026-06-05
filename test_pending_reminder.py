@@ -139,14 +139,15 @@ def test_maybe_extract_rewrites_first_person_action_to_sender_alias(temp_db, mon
     import memory
     import gemini_client
 
+    future = datetime.now() + timedelta(days=2)
     monkeypatch.setattr(
         gemini_client,
         "extract_reminder",
         lambda *a, **k: {
             "action": "我看台大陳敏惠牙醫師",
-            "year": 2026,
-            "month": 6,
-            "day": 4,
+            "year": future.year,
+            "month": future.month,
+            "day": future.day,
             "hour": 10,
             "minute": 30,
         },
@@ -163,6 +164,16 @@ def test_maybe_extract_rewrites_first_person_action_to_sender_alias(temp_db, mon
         ).fetchone()
     assert row is not None
     assert row[0] == "媽媽看台大陳敏惠牙醫師"
+
+
+def _future_tuesday_before_thursday() -> tuple[datetime, datetime]:
+    """Return a future Tuesday message time and its Thursday 10:30 target."""
+    target = datetime.now() + timedelta(days=1)
+    while target.weekday() != 3:  # Thursday
+        target += timedelta(days=1)
+    target = target.replace(hour=10, minute=30, second=0, microsecond=0)
+    msg_time = (target - timedelta(days=2)).replace(hour=9, minute=0)
+    return msg_time, target
 
 
 # ── drain: R1 相對日期 ────────────────────────────────────────────────────────
@@ -295,7 +306,7 @@ def test_drain_none_falls_back_to_calendar_regex_with_message_date(temp_db, monk
     memory.enqueue_pending_reminder(
         "G1", "U1", "星期四早上十點半看台大陳敏惠牙醫師", "m1"
     )
-    msg_time = datetime(2026, 6, 2, 9, 0)
+    msg_time, expected = _future_tuesday_before_thursday()
     with memory._conn() as c:
         c.execute(
             "UPDATE pending_reminder_extract SET created_at=? WHERE message_id='m1'",
@@ -309,7 +320,7 @@ def test_drain_none_falls_back_to_calendar_regex_with_message_date(temp_db, monk
 
     with memory._conn() as c:
         row = c.execute(
-            "SELECT action, datetime(remind_at,'unixepoch','+8 hours') "
+            "SELECT action, remind_at "
             "FROM reminders WHERE group_id='G1'"
         ).fetchone()
         status = c.execute(
@@ -317,7 +328,9 @@ def test_drain_none_falls_back_to_calendar_regex_with_message_date(temp_db, monk
         ).fetchone()[0]
     assert row is not None
     assert row[0] == "看台大陳敏惠牙醫師"
-    assert row[1] == "2026-06-04 10:30:00"
+    assert datetime.fromtimestamp(row[1]).strftime("%Y-%m-%d %H:%M") == (
+        expected.strftime("%Y-%m-%d %H:%M")
+    )
     assert status == "done"
 
 
@@ -330,7 +343,7 @@ def test_drain_subjectless_medical_uses_sender_alias(temp_db, monkeypatch):
     memory.enqueue_pending_reminder(
         "G1", "U_MOM", "星期四早上十點半看台大陳敏惠牙醫師", "m1"
     )
-    msg_time = datetime(2026, 6, 2, 9, 0)
+    msg_time, _expected = _future_tuesday_before_thursday()
     with memory._conn() as c:
         c.execute(
             "UPDATE pending_reminder_extract SET created_at=? WHERE message_id='m1'",
@@ -459,3 +472,59 @@ def test_extract_reminder_non_429_returns_none(monkeypatch):
 
     monkeypatch.setattr(gemini_client, "_client", _FakeClient())
     assert gemini_client.extract_reminder("6/3下午8點開會") is None
+
+
+def test_add_reminder_normalizes_common_asr_errors(temp_db):
+    """Common ASR/OCR slips should not be persisted into reminder actions."""
+    import memory
+
+    future = datetime.now() + timedelta(days=1)
+
+    memory.add_reminder(
+        "G1",
+        "U1",
+        "去教會4樓參加嗎？那小組的茶几",
+        int(future.timestamp()),
+        source_text="去教會4樓參加嗎？那小組的茶几",
+    )
+
+    with memory._conn() as c:
+        action, source_text = c.execute(
+            "SELECT action, source_text FROM reminders WHERE group_id='G1'"
+        ).fetchone()
+    assert action == "去教會4樓參加嗎哪小組的查經"
+    assert source_text == "去教會4樓參加嗎哪小組的查經"
+
+
+def test_add_reminder_merges_mana_group_duplicate_with_details(temp_db):
+    """Same-time Mana group reminders should merge richer details instead of duplicating."""
+    import memory
+
+    future = datetime.now() + timedelta(days=1)
+    remind_at = int(future.timestamp())
+
+    rid1 = memory.add_reminder(
+        "G1",
+        "U1",
+        "媽媽行程：嗎哪小組（19:15-21:30）",
+        remind_at,
+        source_text="媽媽排程圖片：6/5 19:15-21:30 嗎哪小組",
+    )
+    rid2 = memory.add_reminder(
+        "G1",
+        "U1",
+        "去教會4樓參加嗎？那小組的茶几",
+        remind_at,
+        source_text="明天晚上7:15我要去教會4樓參加嗎？那小組的茶几",
+    )
+
+    with memory._conn() as c:
+        rows = c.execute(
+            "SELECT reminder_id, action, source_text FROM reminders "
+            "WHERE group_id='G1' ORDER BY reminder_id"
+        ).fetchall()
+    assert rid2 == rid1
+    assert len(rows) == 1
+    assert rows[0][1] == "媽媽行程：嗎哪小組查經（教會4樓，19:15-21:30）"
+    assert "媽媽排程圖片" in rows[0][2]
+    assert "教會4樓參加嗎哪小組的查經" in rows[0][2]

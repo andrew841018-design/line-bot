@@ -129,6 +129,148 @@ def test_external_tunnel_direct_curl_failure_is_diagnostic_skip():
     assert "LINE webhook E2E" in result.detail
 
 
+@patch("preflight_check.time.sleep", lambda *_args, **_kwargs: None)
+def test_webhook_put_retries_invalid_endpoint_until_line_accepts():
+    calls = [
+        (400, '{"message":"Invalid webhook endpoint URL"}'),
+        (200, "{}"),
+    ]
+
+    with patch("preflight_check._curl_with_token", side_effect=calls) as curl:
+        code, body, attempts = pf._put_line_webhook_endpoint(
+            "fake-token",
+            "https://fresh.trycloudflare.com/callback",
+        )
+
+    assert code == 200
+    assert body == "{}"
+    assert attempts == 2
+    assert curl.call_count == 2
+
+
+def test_line_path_recovery_warranted_for_e2e_only_530():
+    alignment = _make_result(
+        9,
+        "LINE webhook URL 對齊 cloudflared",
+        critical=True,
+        status="pass",
+    )
+    e2e = _make_result(
+        10,
+        "LINE → cloudflared → /callback E2E",
+        critical=True,
+        status="fail",
+        detail="success=False statusCode=530 reason='ERROR_STATUS_CODE'",
+    )
+
+    assert pf._line_path_recovery_warranted(alignment, e2e) is True
+
+
+@patch("preflight_check._send_discord_alert")
+@patch("preflight_check._emit_jsonl")
+def test_run_restarts_cloudflared_when_line_webhook_path_is_stale(mock_jsonl, mock_alert):
+    def result(idx, name, *, status="pass", critical=True, detail=""):
+        r = pf.CheckResult(idx, name, critical=critical)
+        r.status = status
+        r.detail = detail
+        return r
+
+    stale = "https://stale.trycloudflare.com"
+    fresh = "https://fresh.trycloudflare.com"
+    alignment_calls = []
+
+    def fake_alignment(tunnel_url, *, dry_run=False):
+        alignment_calls.append(tunnel_url)
+        if tunnel_url == stale:
+            return (
+                result(
+                    9,
+                    "LINE webhook URL 對齊 cloudflared",
+                    status="fail",
+                    detail='PUT http 400 after 4 attempts: {"message":"Invalid webhook endpoint URL"}',
+                ),
+                f"{stale}/callback",
+            )
+        return result(9, "LINE webhook URL 對齊 cloudflared"), f"{fresh}/callback"
+
+    e2e_calls = []
+
+    def fake_e2e(*, dry_run=False):
+        e2e_calls.append(1)
+        if len(e2e_calls) == 1:
+            return result(
+                10,
+                "LINE → cloudflared → /callback E2E",
+                status="fail",
+                detail="success=False statusCode=530 reason='ERROR_STATUS_CODE'",
+            )
+        return result(10, "LINE → cloudflared → /callback E2E")
+
+    with patch("preflight_check.check_1_uvicorn_alive", return_value=result(1, "uvicorn process alive")), \
+         patch("preflight_check.check_2_local_health", return_value=result(2, "local /health 200")), \
+         patch(
+             "preflight_check.check_3_cloudflared_alive",
+             side_effect=[
+                 result(
+                     3,
+                     "cloudflared process alive",
+                     status="fail",
+                     detail="pgrep/launchctl 都沒找到 cloudflared",
+                 ),
+                 result(3, "cloudflared process alive"),
+             ],
+         ), \
+         patch(
+             "preflight_check.check_4_stash_valid",
+             return_value=(result(4, "cloudflared URL stash 可讀 + 安全"), stale),
+         ), \
+         patch(
+             "preflight_check.check_4c_double_source",
+             side_effect=[
+                 result(
+                     5,
+                     "cloudflared metrics 內部 URL 對 stash",
+                     status="fail",
+                     detail="cloudflared metrics port 抓不到",
+                 ),
+                 result(5, "cloudflared metrics 內部 URL 對 stash"),
+             ],
+         ), \
+         patch("preflight_check.check_5_external_tunnel", return_value=result(6, "external tunnel diagnostic", critical=False)), \
+         patch("preflight_check.check_5b_local_callback_route", return_value=result(7, "/callback no-sig → 400 missing")), \
+         patch("preflight_check.check_6_line_token", return_value=result(8, "LINE token /v2/bot/info 200")), \
+         patch("preflight_check.check_7_webhook_alignment", side_effect=fake_alignment), \
+         patch("preflight_check.check_8_line_e2e", side_effect=fake_e2e), \
+         patch("preflight_check.check_9_gemini", side_effect=lambda model, idx, label: result(idx, f"Gemini {label} probe")), \
+         patch("preflight_check.check_10_sqlite", return_value=result(13, "SQLite integrity + WAL checkpoint", critical=False)), \
+         patch("preflight_check.check_11_pending", return_value=result(14, "pending file JSON load", critical=False)), \
+         patch("preflight_check._restart_cloudflared_for_preflight", return_value=(True, fresh)) as restart, \
+         patch("preflight_check._line_token", return_value="fake-token"), \
+         patch("preflight_check._write_cache") as write_cache:
+        exit_code = pf.run(_args(dry_run=False))
+
+    assert exit_code == 0
+    restart.assert_called_once_with(stale)
+    assert alignment_calls == [stale, fresh]
+    assert len(e2e_calls) == 2
+    record = mock_jsonl.call_args[0][0]
+    assert record["tunnel_url"] == fresh
+    assert record["webhook_url"] == f"{fresh}/callback"
+    assert not [
+        r for r in record["results"]
+        if r["critical"] and r["status"] == "fail"
+    ]
+    assert any(
+        r["idx"] == 5 and r["status"] == "skip" and "superseded" in r["detail"]
+        for r in record["results"]
+    )
+    assert any(
+        r["idx"] == 3 and r["status"] == "skip" and "superseded" in r["detail"]
+        for r in record["results"]
+    )
+    write_cache.assert_called_once()
+
+
 # ---------- _finalize alert dispatch ----------
 
 def _gemini_fail_pair():

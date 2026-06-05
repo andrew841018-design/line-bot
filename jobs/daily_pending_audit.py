@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import os
+import sqlite3
 import sys
 import time
 from dataclasses import dataclass, field
@@ -58,8 +59,19 @@ class AuditRow:
 
 
 @dataclass
+class PendingReminderRow:
+    pending_id: int
+    group_id: str
+    message_id: str | None
+    created_at: int
+    retries: int
+    text: str
+
+
+@dataclass
 class AuditReport:
     rows: list[AuditRow] = field(default_factory=list)
+    pending_reminders: list[PendingReminderRow] = field(default_factory=list)
     type_counts: dict[str, int] = field(
         default_factory=lambda: {"image": 0, "video": 0, "file": 0}
     )
@@ -75,6 +87,10 @@ class AuditReport:
     @property
     def total_unanswered_media(self) -> int:
         return len(self.rows)
+
+    @property
+    def total_pending_reminders(self) -> int:
+        return len(self.pending_reminders)
 
 
 def _safe_load_pending() -> tuple[dict, str, int, bool]:
@@ -159,17 +175,65 @@ def _format_timestamp(ts) -> str:
         return "未知時間"
 
 
+def _short_text(text: str, limit: int = 44) -> str:
+    clean = " ".join(str(text or "").split())
+    if len(clean) <= limit:
+        return clean
+    return clean[: limit - 1] + "…"
+
+
+def load_pending_reminder_rows(
+    db_path: Path | str | None = None,
+    *,
+    limit: int = 10,
+) -> list[PendingReminderRow]:
+    """Load reminder extraction backlog for daily audit visibility."""
+    if limit <= 0:
+        return []
+    if db_path is None:
+        from config import settings
+
+        db_path = settings.sqlite_path
+    path = Path(db_path)
+    if not path.exists():
+        return []
+    try:
+        with sqlite3.connect(path) as conn:
+            rows = conn.execute(
+                "SELECT pending_id, group_id, message_id, created_at, retries, text "
+                "FROM pending_reminder_extract WHERE status='pending' "
+                "ORDER BY created_at LIMIT ?",
+                (limit,),
+            ).fetchall()
+    except sqlite3.Error as e:
+        log.warning("load pending reminder extract failed: %s", str(e)[:160])
+        return []
+    return [
+        PendingReminderRow(
+            pending_id=int(r[0]),
+            group_id=str(r[1]),
+            message_id=r[2],
+            created_at=int(r[3] or 0),
+            retries=int(r[4] or 0),
+            text=str(r[5] or ""),
+        )
+        for r in rows
+    ]
+
+
 def build_report(
     data: dict,
     *,
     load_status: str = "ok",
     file_size: int = 0,
     file_present: bool = True,
+    pending_reminders: list[PendingReminderRow] | None = None,
 ) -> AuditReport:
     report = AuditReport(
         load_status=load_status,
         pending_file_size=file_size,
         pending_file_present=file_present,
+        pending_reminders=list(pending_reminders or []),
     )
 
     if not isinstance(data, dict):
@@ -214,6 +278,7 @@ def build_report(
 
 def format_message(report: AuditReport) -> str:
     today = datetime.now().strftime("%Y-%m-%d")
+    reminder_n = report.total_pending_reminders
 
     if report.load_status == "corrupt":
         return (
@@ -228,6 +293,16 @@ def format_message(report: AuditReport) -> str:
     n = report.total_unanswered_media
 
     if n == 0:
+        if reminder_n:
+            lines = [f"⚠️ [{today}] reminder extract pending {reminder_n} 筆未轉提醒"]
+            for i, row in enumerate(report.pending_reminders[:5], 1):
+                ts = _format_timestamp(row.created_at)
+                msg_id = _short_message_id(row.message_id)
+                lines.append(
+                    f"  {i}. {ts} pid={row.pending_id} m={msg_id} "
+                    f"retry={row.retries} text={_short_text(row.text)}"
+                )
+            return "\n".join(lines)
         msg = f"✅ [{today}] pending 圖文 0 則，全部已回應"
         extras = []
         if report.audio_excluded_count > 0:
@@ -251,6 +326,8 @@ def format_message(report: AuditReport) -> str:
             f"  ⚠️ {report.download_failed_count} 則 download_failed "
             f"(無法自動補回，建議手動處理)"
         )
+    if reminder_n:
+        lines.append(f"  ⚠️ reminder extract pending {reminder_n} 筆未轉提醒")
     if report.audio_excluded_count > 0:
         lines.append(f"  audio leftover {report.audio_excluded_count} 則（已排除，非圖文）")
 
@@ -337,6 +414,7 @@ def main(argv: list[str] | None = None) -> int:
         load_status=status,
         file_size=file_size,
         file_present=present,
+        pending_reminders=load_pending_reminder_rows(),
     )
     msg = format_message(report)
     print(msg)
