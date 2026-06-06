@@ -241,6 +241,81 @@ def test_lite_reply_signature_accepts_context():
     assert out is not None  # 1+1 命中 calculator
 
 
+def test_lite_reply_stock_stage1_passes_context(monkeypatch):
+    ctx = [("user", "我覺得 NVDA 會再突破")]
+    seen = {}
+
+    def fake_quotes(text, *, context=None, **kwargs):
+        seen["text"] = text
+        seen["context"] = context
+        return "【市場報價｜測試】\nNVDA: 180.00"
+
+    monkeypatch.setattr(
+        lite_reply.stock_quote,
+        "get_contextual_quotes_text",
+        fake_quotes,
+    )
+    fake_nlp = type(sys)("chinese_nlp")
+    fake_nlp.classify_intent = lambda text: {"intent": "general"}
+    monkeypatch.setitem(sys.modules, "chinese_nlp", fake_nlp)
+
+    out = lite_reply.lite_reply("現在多少？", context=ctx)
+
+    assert out is not None
+    assert "NVDA" in out
+    assert seen == {"text": "現在多少？", "context": ctx}
+
+
+def test_lite_reply_stock_intent_priority_passes_context(monkeypatch):
+    ctx = [("user", "我覺得台積電會再突破")]
+    seen = {}
+
+    def fake_quotes(text, *, context=None, **kwargs):
+        seen["text"] = text
+        seen["context"] = context
+        return "【市場報價｜測試】\n2330.TW: 2325.00"
+
+    monkeypatch.setattr(
+        lite_reply.stock_quote,
+        "get_contextual_quotes_text",
+        fake_quotes,
+    )
+    fake_nlp = type(sys)("chinese_nlp")
+    fake_nlp.classify_intent = lambda text: {"intent": "stock"}
+    monkeypatch.setitem(sys.modules, "chinese_nlp", fake_nlp)
+
+    out = lite_reply.lite_reply("現在多少？", context=ctx)
+
+    assert out is not None
+    assert "2330.TW" in out
+    assert seen == {"text": "現在多少？", "context": ctx}
+
+
+def test_lite_reply_countdown_wins_over_contextual_stock(monkeypatch):
+    ctx = [("user", "我覺得 NVDA 會再突破")]
+    stock_called = False
+
+    def fake_quotes(*args, **kwargs):
+        nonlocal stock_called
+        stock_called = True
+        return "【市場報價｜測試】\nNVDA: 180.00"
+
+    monkeypatch.setattr(
+        lite_reply.stock_quote,
+        "get_contextual_quotes_text",
+        fake_quotes,
+    )
+    fake_nlp = type(sys)("chinese_nlp")
+    fake_nlp.classify_intent = lambda text: {"intent": "general"}
+    monkeypatch.setitem(sys.modules, "chinese_nlp", fake_nlp)
+
+    out = lite_reply.lite_reply("距離 6/15 還有多少天？", context=ctx)
+
+    assert out is not None
+    assert "距離" in out
+    assert not stock_called
+
+
 # ─── Stage 1 handler 個別 smoke ─────────────────────────────────────────
 
 

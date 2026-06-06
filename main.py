@@ -173,6 +173,21 @@ def _is_system_status_outbound(text: str) -> bool:
     return any(marker in s for marker in _OUTBOUND_SYSTEM_STATUS_MARKERS)
 
 
+def _is_market_quote_outbound(text: str) -> bool:
+    """Market quotes are reply-only; an expired reply token must not create a push."""
+    return (text or "").lstrip().startswith(("【市場報價", "【即時股價"))
+
+
+def _is_market_quote_request(text: str, context: list | None = None) -> bool:
+    """Cheaply detect quote-seeking turns before Gemini may paraphrase the answer."""
+    try:
+        import stock_quote
+        return stock_quote.should_try_contextual_quote(text or "", context=context)
+    except Exception as e:
+        logger.debug("market quote request detection skipped: %s", e)
+        return False
+
+
 def _llm_chat(
     user_input,
     context: list[tuple[str, str]],
@@ -2001,6 +2016,7 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
             clean_text if not quoted_block else f"{quoted_block}\n\n{clean_text}"
         )
 
+    quote_policy_input = user_input
     # URL 預抓取：先用 Python 抓網頁內容塞進 prompt，繞過 Gemini url_context 的限制
     user_input = _prefetch_urls(user_input)
 
@@ -2009,6 +2025,10 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
     # (local LLM → RAG → lite_reply) 4-tier waterfall；不能在這層 return，
     # 否則家人 @咪寶時 bot 會完全沉默。
     context = memory.get_context(group_id)
+    quote_reply_only = _is_market_quote_request(
+        quote_policy_input,
+        context=context,
+    )
     facts = memory.top_facts(group_id, user_id=sender_user_id)
     pnotes = _get_persona_notes(group_id)
     try:
@@ -2035,7 +2055,12 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
                 return
         else:
             logger.exception("gemini chat (explicit) failed: %s", e)
-            _reply(event.reply_token, _friendly_gemini_error(e), group_id=group_id)
+            _reply(
+                event.reply_token,
+                _friendly_gemini_error(e),
+                group_id=group_id,
+                allow_push_fallback=not quote_reply_only,
+            )
             return
 
     # quota 已爆時第一次 _llm_chat 直接回 ""（內部走 lite_reply，不丟例外）→ 上面 except
@@ -2047,7 +2072,12 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
             _maybe_capture_calendar_event(group_id, clean_text)
             _save_pending_burst_text(group_id, clean_text or user_input)
             return
-        _reply(event.reply_token, "我剛剛沒生出內容，等一下再問我一次好嗎？", group_id=group_id)
+        _reply(
+            event.reply_token,
+            "我剛剛沒生出內容，等一下再問我一次好嗎？",
+            group_id=group_id,
+            allow_push_fallback=not quote_reply_only,
+        )
         return
 
     # 即時糾正偵測：使用者如果在糾正 bot，自動記住
@@ -2056,7 +2086,12 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
     memory.append_turn(group_id, "user", user_input)
     memory.append_turn(group_id, "bot", reply_text)
     _maybe_extract_facts(group_id, user_id=sender_user_id)
-    _reply(event.reply_token, reply_text, group_id=group_id)
+    _reply(
+        event.reply_token,
+        reply_text,
+        group_id=group_id,
+        allow_push_fallback=not quote_reply_only,
+    )
     # 14:51 case: 家人在 explicit 路徑手打「YYYY-MM-DD HH:MM 拿蛋糕」，
     # 之前 _maybe_capture_calendar_event 只在 burst 路徑跑，explicit 完全沒抽。
     _maybe_capture_calendar_event(group_id, clean_text)
@@ -2087,14 +2122,21 @@ def _handle_burst_flush(group_id: str, combined_text: str, reply_token: str) -> 
     # 也讓 llm_router.fallback_chat 4-tier waterfall（local LLM → RAG → lite_reply）
     # 完全沒機會啟動。改成繼續走 _llm_chat，由它內部判斷走 Gemini 還是 fallback。
 
+    context = memory.get_context(group_id)
+    quote_reply_only = _is_market_quote_request(combined_text, context=context)
+
     # cache 命中：謠言快取直接回，省 LLM 呼叫
     cached = memory.check_fact_cache(group_id, combined_text)
     if cached:
         logger.info("burst flush cache hit group=%s", group_id)
-        _reply(reply_token, cached, group_id=group_id)
+        _reply(
+            reply_token,
+            cached,
+            group_id=group_id,
+            allow_push_fallback=not quote_reply_only,
+        )
         return
 
-    context = memory.get_context(group_id)
     facts = memory.top_facts(group_id)
     pnotes = _get_persona_notes(group_id)
 
@@ -2132,7 +2174,10 @@ def _handle_burst_flush(group_id: str, combined_text: str, reply_token: str) -> 
         else:
             logger.exception("gemini chat (burst) failed: %s", e)
             _reply(
-                reply_token, "Gemini 那邊好像塞車了，等一下再回你～", group_id=group_id
+                reply_token,
+                "Gemini 那邊好像塞車了，等一下再回你～",
+                group_id=group_id,
+                allow_push_fallback=not quote_reply_only,
             )
             return
 
@@ -2161,6 +2206,7 @@ def _handle_burst_flush(group_id: str, combined_text: str, reply_token: str) -> 
                 reply_token,
                 "咪寶聽到了但這個話題不太接得上~",
                 group_id=group_id,
+                allow_push_fallback=not quote_reply_only,
             )
         except Exception as e:
             logger.warning("burst empty-reply fallback failed: %s", e)
@@ -2171,7 +2217,12 @@ def _handle_burst_flush(group_id: str, combined_text: str, reply_token: str) -> 
     memory.append_turn(group_id, "bot", reply_text)
     _maybe_extract_facts(group_id)
     _maybe_capture_calendar_event(group_id, combined_text)
-    _reply(reply_token, reply_text, group_id=group_id)
+    _reply(
+        reply_token,
+        reply_text,
+        group_id=group_id,
+        allow_push_fallback=not quote_reply_only,
+    )
 
 
 def _maybe_capture_calendar_event(
@@ -5225,7 +5276,13 @@ def _drain_pending_file(
     return None
 
 
-def _reply(reply_token: str, text: str, group_id: str | None = None) -> None:
+def _reply(
+    reply_token: str,
+    text: str,
+    group_id: str | None = None,
+    *,
+    allow_push_fallback: bool = True,
+) -> None:
     """
     回覆 LINE 訊息。若帶 group_id,成功後會把 bot 的回覆也存進 raw_messages,
     這樣使用者引用 bot 的回覆問後續問題時,能查得到原文。
@@ -5370,6 +5427,13 @@ def _reply(reply_token: str, text: str, group_id: str | None = None) -> None:
                 return
             # reply_token 明確過期 / invalid / 已用過 → fallback 到 push_message
             if group_id:
+                if not allow_push_fallback or _is_market_quote_outbound(text):
+                    logger.info(
+                        "reply token invalid; skip fallback push group=%s quote=%s",
+                        group_id,
+                        _is_market_quote_outbound(text),
+                    )
+                    return
                 try:
                     with ApiClient(_get_line_config()) as api_client:
                         MessagingApi(api_client).push_message(

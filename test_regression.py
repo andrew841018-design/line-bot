@@ -295,6 +295,143 @@ def test_bug9_reply_suppresses_system_status_messages():
     assert not mock_messaging.push_message.called
 
 
+def test_market_quote_reply_token_expired_does_not_fallback_push(monkeypatch):
+    """Market quote replies are reply-only; expired reply token must not push to group."""
+    monkeypatch.setattr(main.settings, "bot_muted", False)
+
+    mock_api = MagicMock()
+    mock_api.__enter__ = MagicMock(return_value=mock_api)
+    mock_api.__exit__ = MagicMock(return_value=False)
+    mock_messaging = MagicMock()
+    mock_messaging.reply_message.side_effect = Exception("Invalid reply token")
+
+    quote_text = "【市場報價｜夜間參考】\nTSM ADR: 250.00"
+
+    with (
+        patch("main.ApiClient", return_value=mock_api),
+        patch("main.MessagingApi", return_value=mock_messaging),
+        patch("main._get_quota_footer", return_value=""),
+        patch("main._load_pending_explicit", return_value={}),
+    ):
+        main._reply("TOKEN001", quote_text, group_id="GRP001")
+
+    assert mock_messaging.reply_message.called
+    assert not mock_messaging.push_message.called
+
+
+def test_reply_only_market_quote_policy_skips_push_without_prefix(monkeypatch):
+    """Gemini may paraphrase quotes, so callsite policy must suppress push too."""
+    monkeypatch.setattr(main.settings, "bot_muted", False)
+
+    mock_api = MagicMock()
+    mock_api.__enter__ = MagicMock(return_value=mock_api)
+    mock_api.__exit__ = MagicMock(return_value=False)
+    mock_messaging = MagicMock()
+    mock_messaging.reply_message.side_effect = Exception("Invalid reply token")
+
+    with (
+        patch("main.ApiClient", return_value=mock_api),
+        patch("main.MessagingApi", return_value=mock_messaging),
+        patch("main._get_quota_footer", return_value=""),
+        patch("main._load_pending_explicit", return_value={}),
+    ):
+        main._reply(
+            "TOKEN001",
+            "TSM 現在約 250 美元，夜盤先看期貨。",
+            group_id="GRP001",
+            allow_push_fallback=False,
+        )
+
+    assert mock_messaging.reply_message.called
+    assert not mock_messaging.push_message.called
+
+
+def test_market_quote_request_detects_contextual_followup_without_broad_now():
+    context = [("user", "我覺得 NVDA 會再突破"), ("assistant", "要看財報")]
+
+    assert main._is_market_quote_request("現在多少？", context=context)
+    assert not main._is_market_quote_request("現在晚餐吃什麼？", context=context)
+    assert not main._is_market_quote_request("距離 6/15 還有多少天？", context=context)
+    assert not main._is_market_quote_request("NVDA 距離 6/15 還有多少天？", context=context)
+
+
+def test_explicit_market_quote_success_marks_reply_only():
+    evt = _make_text_event(text="咪寶 現在多少？")
+    context = [("user", "我覺得 NVDA 會再突破")]
+    reply_calls = []
+
+    def fake_reply(*args, **kwargs):
+        reply_calls.append((args, kwargs))
+
+    with (
+        patch("main._detect_image_gen_request", return_value=None),
+        patch("main._is_calendar_query", return_value=False),
+        patch("main._build_quoted_block", return_value=""),
+        patch("main._prefetch_urls", side_effect=lambda text: text),
+        patch("main.memory.get_context", return_value=context),
+        patch("main.memory.top_facts", return_value=[]),
+        patch("main._get_persona_notes", return_value=[]),
+        patch("main._thinking_indicator", return_value=_noop_cm()),
+        patch("main._llm_chat", return_value="NVDA 現在約 180 美元"),
+        patch("main.memory.append_turn"),
+        patch("main._try_save_correction"),
+        patch("main._maybe_extract_facts"),
+        patch("main._maybe_capture_calendar_event"),
+        patch("main._reply", side_effect=fake_reply),
+    ):
+        main._handle_explicit_text(evt, "GRP001", "現在多少？")
+
+    assert reply_calls
+    assert reply_calls[-1][1]["allow_push_fallback"] is False
+
+
+def test_burst_market_quote_error_fallback_marks_reply_only():
+    context = [("user", "我覺得 NVDA 會再突破")]
+    reply_calls = []
+
+    def fake_reply(*args, **kwargs):
+        reply_calls.append((args, kwargs))
+
+    with (
+        patch("main.memory.get_context", return_value=context),
+        patch("main.memory.check_fact_cache", return_value=None),
+        patch("main.memory.top_facts", return_value=[]),
+        patch("main._get_persona_notes", return_value=[]),
+        patch("main._prefetch_urls", side_effect=lambda text: text),
+        patch("main._thinking_indicator", return_value=_noop_cm()),
+        patch("main._llm_chat", side_effect=RuntimeError("boom")),
+        patch("main._reply", side_effect=fake_reply),
+    ):
+        main._handle_burst_flush("GRP001", "現在多少？", "TOKEN001")
+
+    assert reply_calls
+    assert reply_calls[-1][1]["allow_push_fallback"] is False
+
+
+def test_burst_market_quote_empty_fallback_marks_reply_only(monkeypatch):
+    monkeypatch.setattr(main, "_quota_exhausted_until_ts", 0)
+    context = [("user", "我覺得 NVDA 會再突破")]
+    reply_calls = []
+
+    def fake_reply(*args, **kwargs):
+        reply_calls.append((args, kwargs))
+
+    with (
+        patch("main.memory.get_context", return_value=context),
+        patch("main.memory.check_fact_cache", return_value=None),
+        patch("main.memory.top_facts", return_value=[]),
+        patch("main._get_persona_notes", return_value=[]),
+        patch("main._prefetch_urls", side_effect=lambda text: text),
+        patch("main._thinking_indicator", return_value=_noop_cm()),
+        patch("main._llm_chat", return_value=""),
+        patch("main._reply", side_effect=fake_reply),
+    ):
+        main._handle_burst_flush("GRP001", "現在多少？", "TOKEN001")
+
+    assert reply_calls
+    assert reply_calls[-1][1]["allow_push_fallback"] is False
+
+
 def test_bug10_explicit_quota_miss_saves_pending_without_system_reply():
     """Explicit @ bot quota miss should store pending and not send quota/system text."""
     evt = _make_text_event(text="咪寶 幫我分析")

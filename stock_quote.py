@@ -21,7 +21,14 @@ from __future__ import annotations
 import logging
 import re
 import time
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    TimeoutError as FuturesTimeoutError,
+    as_completed,
+)
+from datetime import datetime, timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import requests
 import yfinance as yf  # type: ignore[import-untyped]
@@ -64,6 +71,11 @@ _US_TICKERS = {
     "COIN", "MSTR", "BITO",
 }
 
+_EN_NAME_MAP = {
+    "TSMC": "2330.TW",
+    "TAIWAN SEMICONDUCTOR": "2330.TW",
+}
+
 # 指數 / 中文名 → yfinance 代號
 _INDEX_MAP = {
     "費半": "^SOX",
@@ -85,6 +97,50 @@ _INDEX_MAP = {
 }
 
 _TWSE_4DIGIT_RE = re.compile(r"(?<!\d)(\d{4})(?!\d)")
+_TW_FUTURE_SYMBOL_RE = re.compile(r"^W[A-Z]{2,4}[FGHJKMNQUVXZ]\d$")
+_TW_FUTURE_SYMBOL_SCAN_RE = re.compile(r"(?<![A-Z0-9])(W[A-Z]{2,4}[FGHJKMNQUVXZ]\d)(?![A-Z0-9])")
+_QUOTE_CONTEXT_RE = re.compile(
+    r"(股價|報價|價格|現價|市價|即時|漲跌|漲幅|跌幅|夜盤|近月|期貨|"
+    r"\bADR\b|\bquote\b|\bprice\b|多少錢|幾塊|幾元|"
+    r"(?:現在|目前).{0,8}(?:多少(?!\s*天)|多少錢|幾塊|幾元))",
+    re.IGNORECASE,
+)
+_MARKET_TERM_RE = re.compile(
+    r"股價|報價|價格|現價|市價|即時|漲跌|漲幅|跌幅|夜盤|近月|期貨|\bADR\b|\bquote\b|\bprice\b",
+    re.IGNORECASE,
+)
+_COUNTDOWN_DATE_RE = re.compile(
+    r"(\d{1,4}\s*[/\-年月.]\s*\d{1,2}|\d{1,2}\s*月\s*\d{1,2})",
+    re.IGNORECASE,
+)
+_ADR_RE = re.compile(r"\bADR\b|美國存託", re.IGNORECASE)
+_FUTURE_RE = re.compile(r"期貨|近月|夜盤|\bfuture\b|\bfutures\b", re.IGNORECASE)
+
+_TW_TZ = ZoneInfo("Asia/Taipei")
+_DAY_START_HOUR = 8
+_DAY_END_HOUR = 17
+_MONTH_CODE = {
+    1: "F",
+    2: "G",
+    3: "H",
+    4: "J",
+    5: "K",
+    6: "M",
+    7: "N",
+    8: "Q",
+    9: "U",
+    10: "V",
+    11: "X",
+    12: "Z",
+}
+_TW_ADR_MAP = {
+    "2330.TW": ("TSM", "台積電 ADR"),
+    "2303.TW": ("UMC", "聯電 ADR"),
+}
+_TW_FUTURE_MAP = {
+    "2330.TW": ("CDF", "台積電近月期貨"),
+    "2303.TW": ("CCF", "聯電近月期貨"),
+}
 
 # 抓 Yahoo 即時頁的瀏覽器 UA（不裝得太誇張，避免被擋）
 _YAHOO_UA = (
@@ -110,6 +166,16 @@ def detect_symbols(text: str) -> list[str]:
     # 1. 指數（先掃，避免「台股」被當成 4 位數抓到）
     for name, sym in _INDEX_MAP.items():
         if name in text:
+            _add(sym)
+
+    # 1.5. 台股期貨 Yahoo TW symbol（例：WCDFM6）
+    for m in _TW_FUTURE_SYMBOL_SCAN_RE.finditer(text.upper()):
+        _add(m.group(1))
+
+    # 1.6. English company aliases that are not valid Yahoo tickers.
+    upper_text = text.upper()
+    for name, sym in _EN_NAME_MAP.items():
+        if re.search(rf"(?<!\w){re.escape(name)}(?!\w)", upper_text):
             _add(sym)
 
     # 2. 中文台股名
@@ -333,7 +399,8 @@ def get_realtime_quote(symbol: str) -> Optional[dict]:
     """從 Yahoo 即時頁抓報價。失敗 / 解析不到回 None。"""
     if not symbol:
         return None
-    is_tw = symbol.endswith(".TW") or symbol.endswith(".TWO")
+    is_tw_future = _is_tw_future_symbol(symbol)
+    is_tw = symbol.endswith(".TW") or symbol.endswith(".TWO") or is_tw_future
     if is_tw:
         url = f"https://tw.stock.yahoo.com/quote/{symbol}"
     else:
@@ -349,6 +416,8 @@ def get_realtime_quote(symbol: str) -> Optional[dict]:
 
     parsed["symbol"] = symbol
     parsed["source"] = "yahoo_realtime"
+    if is_tw_future:
+        parsed["instrument_type"] = "future"
     # 為相容舊 caller，保留 last_date 欄位
     ts = parsed.get("timestamp") or ""
     parsed["last_date"] = ts.split(" ")[0] if ts else time.strftime("%Y-%m-%d")
@@ -447,6 +516,364 @@ _SOURCE_LABEL = {
     "fast_info": "Yahoo 延遲",
     "history": "日線收盤",
 }
+
+
+def _is_tw_future_symbol(symbol: str) -> bool:
+    return bool(symbol and _TW_FUTURE_SYMBOL_RE.match(symbol.upper()))
+
+
+def _coerce_taipei_now(now: datetime | None) -> datetime:
+    if now is None:
+        return datetime.now(_TW_TZ)
+    if now.tzinfo is None:
+        return now.replace(tzinfo=_TW_TZ)
+    return now.astimezone(_TW_TZ)
+
+
+def _is_daytime(now: datetime) -> bool:
+    return _DAY_START_HOUR <= now.hour < _DAY_END_HOUR
+
+
+def _third_wednesday(year: int, month: int) -> datetime:
+    first = datetime(year, month, 1, tzinfo=_TW_TZ)
+    days_until_wed = (2 - first.weekday()) % 7
+    return first + timedelta(days=days_until_wed + 14)
+
+
+def _add_months(year: int, month: int, offset: int) -> tuple[int, int]:
+    idx = (year * 12) + (month - 1) + offset
+    return idx // 12, (idx % 12) + 1
+
+
+def _future_start_month(now: datetime) -> tuple[int, int]:
+    now = _coerce_taipei_now(now)
+    expiry = _third_wednesday(now.year, now.month)
+    # 台灣股期通常每月第三個週三結算；結算日下午後直接看下一個月。
+    if now.date() > expiry.date() or (now.date() == expiry.date() and now.hour >= 14):
+        return _add_months(now.year, now.month, 1)
+    return now.year, now.month
+
+
+def _candidate_future_symbols(
+    product_code: str,
+    now: datetime | None = None,
+    months_ahead: int = 4,
+) -> list[str]:
+    """Return Yahoo TW candidate symbols for the nearest monthly stock futures."""
+    if months_ahead <= 0:
+        return []
+    now = _coerce_taipei_now(now)
+    start_year, start_month = _future_start_month(now)
+    out: list[str] = []
+    for offset in range(months_ahead):
+        year, month = _add_months(start_year, start_month, offset)
+        out.append(f"W{product_code.upper()}{_MONTH_CODE[month]}{year % 10}")
+    return out
+
+
+def _infer_context_symbols(context: list | None) -> list[str]:
+    """Look only at recent user-side messages, so bot quote output is not recycled."""
+    if not context:
+        return []
+    for item in reversed(context[-8:]):
+        role = ""
+        msg = ""
+        if isinstance(item, dict):
+            role = str(item.get("role") or item.get("speaker") or "").lower()
+            msg = str(item.get("text") or item.get("content") or "")
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            role = str(item[0]).lower()
+            msg = str(item[1])
+        else:
+            msg = str(item)
+        if role in {"assistant", "bot", "__bot__", "model"}:
+            continue
+        symbols = detect_symbols(msg)
+        if symbols:
+            return symbols
+    return []
+
+
+def _stock_currency(symbol: str) -> str:
+    if symbol.endswith(".TW") or symbol.endswith(".TWO") or _is_tw_future_symbol(symbol):
+        return "TWD"
+    if symbol.startswith("^"):
+        return "index"
+    return "USD"
+
+
+def _stock_role_label(symbol: str) -> str:
+    if symbol.startswith("^"):
+        return "指數"
+    if _is_tw_future_symbol(symbol):
+        return "近月期貨"
+    return "現股"
+
+
+def _make_quote_spec(
+    symbol: str,
+    label: str,
+    role: str,
+    currency: str,
+    group: str,
+) -> dict[str, str]:
+    return {
+        "symbol": symbol,
+        "label": label,
+        "role": role,
+        "currency": currency,
+        "group": group,
+    }
+
+
+def _base_quote_spec(symbol: str) -> dict[str, str]:
+    label = _label_for(symbol)
+    role = _stock_role_label(symbol)
+    if label and role == "現股":
+        label = f"{label}現股"
+    elif not label:
+        label = role
+    return _make_quote_spec(
+        symbol=symbol,
+        label=label,
+        role=role,
+        currency=_stock_currency(symbol),
+        group=f"base:{symbol}",
+    )
+
+
+def _quote_specs_for_symbol(
+    symbol: str,
+    *,
+    now: datetime,
+    night_mode: bool,
+    wants_adr: bool,
+    wants_future: bool,
+) -> list[dict[str, str]]:
+    specs: list[dict[str, str]] = []
+    base = symbol.upper() if _is_tw_future_symbol(symbol) else symbol
+
+    if _is_tw_future_symbol(base):
+        specs.append(_base_quote_spec(base))
+        return specs
+
+    mapped_adr = _TW_ADR_MAP.get(base)
+    mapped_future = _TW_FUTURE_MAP.get(base)
+
+    if not night_mode and not wants_adr and not wants_future:
+        specs.append(_base_quote_spec(base))
+        return specs
+
+    if wants_adr and mapped_adr:
+        adr_symbol, adr_label = mapped_adr
+        specs.append(_make_quote_spec(adr_symbol, adr_label, "ADR", "USD", f"adr:{base}"))
+
+    if wants_future and mapped_future:
+        product_code, future_label = mapped_future
+        for fut_symbol in _candidate_future_symbols(product_code, now, months_ahead=4):
+            specs.append(
+                _make_quote_spec(
+                    fut_symbol,
+                    future_label,
+                    "近月期貨",
+                    "TWD",
+                    f"future:{product_code}",
+                )
+            )
+
+    if night_mode and not wants_adr and not wants_future:
+        if mapped_adr:
+            adr_symbol, adr_label = mapped_adr
+            specs.append(_make_quote_spec(adr_symbol, adr_label, "ADR", "USD", f"adr:{base}"))
+        if mapped_future:
+            product_code, future_label = mapped_future
+            for fut_symbol in _candidate_future_symbols(product_code, now, months_ahead=4):
+                specs.append(
+                    _make_quote_spec(
+                        fut_symbol,
+                        future_label,
+                        "近月期貨",
+                        "TWD",
+                        f"future:{product_code}",
+                    )
+                )
+
+    if not specs:
+        specs.append(_base_quote_spec(base))
+    return specs
+
+
+def _dedupe_quote_specs(specs: list[dict[str, str]]) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for spec in specs:
+        key = (spec["symbol"], spec["group"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(spec)
+    return out
+
+
+def _get_contextual_quote(symbol: str) -> Optional[dict]:
+    """Quote getter for chat prefetch: realtime only, bounded by caller deadline."""
+    return get_realtime_quote(symbol)
+
+
+def _fetch_contextual_quotes_with_deadline(
+    symbols: list[str],
+    total_timeout_s: float,
+) -> dict[str, dict]:
+    if not symbols or total_timeout_s <= 0:
+        return {}
+
+    deadline = time.monotonic() + total_timeout_s
+    results: dict[str, dict] = {}
+    executor = ThreadPoolExecutor(max_workers=min(4, len(symbols)), thread_name_prefix="stock-quote")
+    futures = {}
+    try:
+        for symbol in symbols:
+            if time.monotonic() >= deadline:
+                break
+            futures[executor.submit(_get_contextual_quote, symbol)] = symbol
+
+        remaining = max(0.001, deadline - time.monotonic())
+        try:
+            for fut in as_completed(futures, timeout=remaining):
+                symbol = futures[fut]
+                try:
+                    quote = fut.result()
+                except Exception as e:
+                    logger.info("context quote fetch %s failed: %s", symbol, e)
+                    continue
+                if quote and quote.get("last_price") is not None:
+                    results[symbol] = quote
+                if time.monotonic() >= deadline:
+                    break
+        except FuturesTimeoutError:
+            logger.info("context quote fetch reached deadline symbols=%d", len(symbols))
+    finally:
+        for fut in futures:
+            fut.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+    return results
+
+
+def _format_contextual_quote_line(quote: dict, spec: dict[str, str]) -> str:
+    cp = quote.get("change_pct")
+    c = quote.get("change")
+    cp_str = f"{cp:+.2f}%" if cp is not None else "?"
+    c_str = f"{c:+.2f}" if c is not None else "?"
+    hi, lo = quote.get("high"), quote.get("low")
+    hl = ""
+    if hi is not None and lo is not None:
+        hl = f"  H {hi:,.2f} / L {lo:,.2f}"
+    source = _SOURCE_LABEL.get(quote.get("source") or "", quote.get("source") or "Yahoo")
+    return (
+        f"{spec['symbol']} ({spec['label']}/{spec['currency']}): "
+        f"{quote['last_price']:,.2f}  {c_str} ({cp_str}){hl}  [{source}]"
+    )
+
+
+def get_contextual_quotes_text(
+    text: str,
+    *,
+    context: list | None = None,
+    now: datetime | None = None,
+    max_symbols: int = 3,
+    total_timeout_s: float = 5.0,
+) -> Optional[str]:
+    """Context-aware quote fetch for chat.
+
+    Daytime in Taipei returns the discussed stock. Nighttime prefers the mapped
+    ADR and nearest monthly Taiwan stock futures, when known. Context is used
+    only when the new message is clearly asking for a quote.
+    """
+    if total_timeout_s <= 0:
+        return None
+
+    text = text or ""
+    now = _coerce_taipei_now(now)
+    symbols = _contextual_quote_symbols(text, context=context)
+    if not symbols:
+        return None
+
+    wants_adr = bool(_ADR_RE.search(text))
+    wants_future = bool(_FUTURE_RE.search(text))
+    night_mode = not _is_daytime(now)
+
+    specs: list[dict[str, str]] = []
+    for symbol in symbols[:max_symbols]:
+        specs.extend(
+            _quote_specs_for_symbol(
+                symbol,
+                now=now,
+                night_mode=night_mode,
+                wants_adr=wants_adr,
+                wants_future=wants_future,
+            )
+        )
+    specs = _dedupe_quote_specs(specs)
+    if not specs:
+        return None
+
+    quote_by_symbol = _fetch_contextual_quotes_with_deadline(
+        [spec["symbol"] for spec in specs],
+        total_timeout_s,
+    )
+    if not quote_by_symbol:
+        return None
+
+    lines: list[str] = []
+    timestamps: list[str] = []
+    emitted_roles: list[str] = []
+    emitted_groups: set[str] = set()
+    for spec in specs:
+        if spec["group"] in emitted_groups:
+            continue
+        quote = quote_by_symbol.get(spec["symbol"])
+        if not quote:
+            continue
+        emitted_groups.add(spec["group"])
+        timestamps.append(quote.get("timestamp") or quote.get("last_date") or "")
+        emitted_roles.append(spec["role"])
+        lines.append(_format_contextual_quote_line(quote, spec))
+
+    if not lines:
+        return None
+
+    header_ts = max(timestamps) if timestamps else now.strftime("%Y-%m-%d %H:%M")
+    has_adr_or_future = any(role in {"ADR", "近月期貨"} for role in emitted_roles)
+    if has_adr_or_future:
+        mode_label = "夜間 ADR/期貨參考" if night_mode else "指定 ADR/期貨參考"
+    else:
+        mode_label = "夜間報價參考" if night_mode else "日間現股"
+    return f"【市場報價｜{mode_label}｜{header_ts}】\n" + "\n".join(lines)
+
+
+def _contextual_quote_symbols(text: str, *, context: list | None = None) -> list[str]:
+    if _looks_like_non_quote_countdown(text or ""):
+        return []
+    symbols = detect_symbols(text)
+    if not symbols and _QUOTE_CONTEXT_RE.search(text or ""):
+        symbols = _infer_context_symbols(context)
+    return symbols
+
+
+def should_try_contextual_quote(text: str, *, context: list | None = None) -> bool:
+    """Cheap predicate for callers that need quote-policy metadata without fetching."""
+    return bool(_contextual_quote_symbols(text or "", context=context))
+
+
+def _looks_like_non_quote_countdown(text: str) -> bool:
+    if not text or _MARKET_TERM_RE.search(text):
+        return False
+    lowered = text.lower()
+    if "天" not in text and "days" not in lowered:
+        return False
+    if not any(k in text for k in ("距離", "離", "還有", "還剩", "多少天", "幾天")):
+        return False
+    return bool(_COUNTDOWN_DATE_RE.search(text))
 
 
 def get_quotes_text(text: str, max_symbols: int = 5) -> Optional[str]:

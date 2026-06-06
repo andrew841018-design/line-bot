@@ -1272,10 +1272,13 @@ def chat(
         import stock_quote  # local import 避免循環依賴 + 保持 yfinance 為 optional dep
 
         _user_text_for_quote = _extract_text(user_input)
-        _quotes = stock_quote.get_quotes_text(_user_text_for_quote)
+        _quotes = stock_quote.get_contextual_quotes_text(
+            _user_text_for_quote,
+            context=context,
+        )
         if _quotes:
             facts = list(facts) + [
-                "【系統｜即時股價（剛取得，這是 yfinance 真實資料，**不是**訓練資料）】"
+                "【系統｜市場報價（剛取得，這是公開報價資料，**不是**訓練資料）】"
                 f"\n{_quotes}\n"
                 "⚠️ 直接用上面數字回答，禁止說『咪寶資料庫只到』『咪寶能查到的最新資料是 X 年 X 月』"
                 "這類話術 — 上面數字就是當前資料。"

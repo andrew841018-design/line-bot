@@ -109,7 +109,7 @@ def chat_mode(request, monkeypatch):
 
 # ---------- 2-5. Retrieve call gates + or-None semantics ----------
 
-@patch("stock_quote.get_quotes_text", return_value="")
+@patch("stock_quote.get_contextual_quotes_text", return_value="")
 @patch("embedding_recall.retrieve_case_pairs")
 @patch("embedding_recall.retrieve")
 @patch("gemini_client._client")
@@ -126,7 +126,7 @@ def test_retrieve_skipped_for_short_text(mock_client, mock_retrieve, mock_case, 
     mock_case.assert_not_called()
 
 
-@patch("stock_quote.get_quotes_text", return_value="")
+@patch("stock_quote.get_contextual_quotes_text", return_value="")
 @patch("embedding_recall.retrieve_case_pairs")
 @patch("embedding_recall.retrieve", return_value=[])
 @patch("gemini_client._client")
@@ -143,7 +143,7 @@ def test_retrieve_skipped_when_no_group_id(mock_client, mock_retrieve, mock_case
     mock_case.assert_not_called()
 
 
-@patch("stock_quote.get_quotes_text", return_value="")
+@patch("stock_quote.get_contextual_quotes_text", return_value="")
 @patch("embedding_recall.retrieve_case_pairs")
 @patch("embedding_recall.retrieve", return_value=[])
 @patch("gemini_client._client")
@@ -160,7 +160,7 @@ def test_retrieve_called_for_normal_non_news_text(mock_client, mock_retrieve, mo
     mock_case.assert_not_called()
 
 
-@patch("stock_quote.get_quotes_text", return_value="")
+@patch("stock_quote.get_contextual_quotes_text", return_value="")
 @patch("embedding_recall.retrieve_case_pairs", return_value=[])
 @patch("embedding_recall.retrieve", return_value=[])
 @patch("gemini_client._client")
@@ -177,7 +177,7 @@ def test_retrieve_case_pairs_called_for_news_case_text(mock_client, mock_retriev
     mock_case.assert_called_once()
 
 
-@patch("stock_quote.get_quotes_text", return_value="")
+@patch("stock_quote.get_contextual_quotes_text", return_value="")
 @patch("embedding_recall.retrieve_case_pairs", return_value=[])
 @patch("embedding_recall.retrieve", return_value=[])
 @patch("gemini_client._build_config")
@@ -202,7 +202,7 @@ def test_empty_recall_list_becomes_none(mock_client, mock_build, _ret, _case, _s
 
 # ---------- 6. Happy path smoke ----------
 
-@patch("stock_quote.get_quotes_text", return_value="")
+@patch("stock_quote.get_contextual_quotes_text", return_value="")
 @patch("embedding_recall.retrieve_case_pairs", return_value=None)
 @patch("embedding_recall.retrieve", return_value=None)
 @patch("gemini_client._client")
@@ -220,7 +220,7 @@ def test_chat_returns_string_on_happy_path(mock_client, _ret, _case, _stock, cha
 
 # ---------- Phase 2B.4 §3 chain — parity-only divergence checks ----------
 
-@patch("stock_quote.get_quotes_text", return_value="")
+@patch("stock_quote.get_contextual_quotes_text", return_value="")
 @patch("embedding_recall.retrieve_case_pairs")
 @patch("embedding_recall.retrieve")
 @patch("gemini_client._client")
@@ -240,7 +240,7 @@ def test_short_news_case_text_does_not_call_case_pairs(mock_client, mock_retriev
     mock_case.assert_not_called()
 
 
-@patch("stock_quote.get_quotes_text", return_value="")
+@patch("stock_quote.get_contextual_quotes_text", return_value="")
 @patch("embedding_recall.retrieve_case_pairs", return_value=None)
 @patch("embedding_recall.retrieve", return_value=None)
 @patch("gemini_client._run")
@@ -258,7 +258,7 @@ def test_non_fallback_exception_propagates(mock_run, _ret, _case, _stock, chat_m
         )
 
 
-@patch("stock_quote.get_quotes_text", return_value="")
+@patch("stock_quote.get_contextual_quotes_text", return_value="")
 @patch("embedding_recall.retrieve_case_pairs", return_value=None)
 @patch("embedding_recall.retrieve", return_value=None)
 @patch("gemini_client._client")
@@ -300,7 +300,7 @@ def test_run_kwargs_byte_identical_across_modes(monkeypatch):
         with patch("gemini_client._run", side_effect=_capture_for(mode_name)), \
              patch("embedding_recall.retrieve", return_value=[{"text": "past hit"}]), \
              patch("embedding_recall.retrieve_case_pairs", return_value=[{"u": "u1", "b": "b1"}]), \
-             patch("stock_quote.get_quotes_text", return_value=""):
+             patch("stock_quote.get_contextual_quotes_text", return_value=""):
             gc.chat(
                 user_input="保險方案分析心得",  # len>=4 + NEWS_CASE → both retrieves fire
                 context=[("user", "hi"), ("assistant", "hello")],
@@ -319,3 +319,27 @@ def test_run_kwargs_byte_identical_across_modes(monkeypatch):
     assert inline_model == graph_model, f"model differs: {inline_model!r} vs {graph_model!r}"
     assert inline_kwargs == graph_kwargs, \
         f"kwargs diverge:\n  inline: {inline_kwargs}\n  graph:  {graph_kwargs}"
+
+
+@patch("stock_quote.get_contextual_quotes_text", return_value="【市場報價｜測試】\nNVDA: 180.00")
+@patch("embedding_recall.retrieve_case_pairs", return_value=None)
+@patch("embedding_recall.retrieve", return_value=None)
+@patch("gemini_client._run")
+def test_contextual_stock_quote_receives_context_and_injects_facts(mock_run, _ret, _case, mock_stock, chat_mode):
+    """Stock quote prefetch must see recent context, not only current text."""
+    mock_run.return_value = "reply"
+    ctx = [("user", "我覺得 NVDA 會再突破"), ("assistant", "要看財報")]
+
+    gc.chat(
+        user_input="現在多少？",
+        context=ctx,
+        facts=["base_fact"],
+        group_id="C_test_group",
+    )
+
+    assert mock_stock.call_count == 1
+    assert mock_stock.call_args.args[0] == "現在多少？"
+    assert mock_stock.call_args.kwargs["context"] == ctx
+    assert mock_run.call_count == 1
+    run_facts = mock_run.call_args.kwargs["facts"]
+    assert any("【市場報價｜測試】" in f for f in run_facts)

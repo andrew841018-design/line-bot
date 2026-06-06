@@ -527,11 +527,11 @@ def _try_url_summary(text: str) -> str | None:
     return _summarize_url(urls[0])
 
 
-def _try_stock(text: str) -> str | None:
+def _try_stock(text: str, context: list | None = None) -> str | None:
     """股票 ticker / 中文股名 → yfinance 即時。"""
-    quotes = stock_quote.get_quotes_text(text)
+    quotes = stock_quote.get_contextual_quotes_text(text, context=context)
     if quotes:
-        return f"{quotes}\n\n（lite mode：Gemini 配額用完，純查 yfinance）"
+        return f"{quotes}\n\n（lite mode：Gemini 配額用完，純查公開報價）"
     return None
 
 
@@ -601,11 +601,11 @@ def _try_local_llm(text: str, context: list | None = None) -> str | None:
 # Stage 1：寫死 deterministic handlers（事實查詢，LLM 不會比較準）
 _STAGE1_HANDLERS = (
     _try_youtube_info,
+    _try_countdown,
     _try_stock,
     _try_forex,
     _try_calculate,
     _try_time_date,
-    _try_countdown,
     _try_unit_convert,
     _try_wiki_lookup,
 )
@@ -629,6 +629,12 @@ def _intent_to_handler(intent: str):
         "image_gen": None,    # 由 main.py 處理，lite_reply 不接
     }
     return mapping.get(intent)
+
+
+def _call_handler(handler, text: str, context: list | None = None):
+    if handler is _try_stock:
+        return handler(text, context=context)
+    return handler(text)
 
 
 def _passes_helpfulness_gate(reply: str, text: str) -> bool:
@@ -712,7 +718,7 @@ def lite_reply(text: str, context: list | None = None) -> str | None:
             priority_handler = _intent_to_handler(intent)
             if priority_handler:
                 try:
-                    out = priority_handler(text)
+                    out = _call_handler(priority_handler, text, context=context)
                     if out:
                         return out
                 except Exception as e:
@@ -723,7 +729,7 @@ def lite_reply(text: str, context: list | None = None) -> str | None:
     # ─ Stage 1: 寫死 deterministic（事實查詢，LLM 不準）─
     for handler in _STAGE1_HANDLERS:
         try:
-            out = handler(text)
+            out = _call_handler(handler, text, context=context)
         except Exception as e:  # pragma: no cover - defensive
             logger.info("Stage1 handler %s raised: %s", handler.__name__, e)
             continue
