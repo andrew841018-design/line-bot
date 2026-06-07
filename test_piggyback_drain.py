@@ -10,8 +10,15 @@ import threading
 import time
 from unittest.mock import patch
 
+import pytest
+
 import main
 import pending_store
+
+
+@pytest.fixture(autouse=True)
+def _enable_legacy_pending_reply(monkeypatch):
+    monkeypatch.setattr(main, "_PENDING_REPLY_ENABLED", True)
 
 
 def _seed_pending(group_id: str) -> None:

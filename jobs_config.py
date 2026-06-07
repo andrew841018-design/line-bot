@@ -96,7 +96,7 @@ JOB_REGISTRY["process-pending-media"] = JobSpec(
     cwd=f"{_DATA_ENG}/line_bot",
     env={"PATH": _BASE_PATH, "HOME": "/Users/andrew", "USER": "andrew", "LOGNAME": "andrew"},
     timeout=600,
-    description="6-hourly retry: drain pending (text/image/video/audio/file) via local LLM",
+    description="Legacy pending reply drain; no-op while pending reply is disabled",
 )
 
 
@@ -105,7 +105,7 @@ JOB_REGISTRY["daily-pending-audit"] = JobSpec(
     cwd=f"{_DATA_ENG}/line_bot",
     env={"PATH": _BASE_PATH, "HOME": "/Users/andrew", "USER": "andrew", "LOGNAME": "andrew"},
     timeout=60,
-    description="Daily 21:00 audit: scan pending media leftovers, push Discord DM",
+    description="Legacy pending reply audit; no Discord while pending reply is disabled",
 )
 
 

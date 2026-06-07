@@ -15,6 +15,7 @@ BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
 
 from dotenv import load_dotenv
+from pending_reply_policy import pending_reply_enabled
 load_dotenv(BASE / ".env")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -108,6 +109,11 @@ def _send_to_group(group_id: str, text: str) -> bool:
 
 
 def main() -> int:
+    if not pending_reply_enabled():
+        log.info("pending reply disabled, skip pending media drain")
+        print({"processed": 0, "success": 0, "failed": 0, "disabled": True})
+        return 0
+
     import pending_store
     data = pending_store.load()
     if not data:

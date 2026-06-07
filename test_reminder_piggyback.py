@@ -167,6 +167,7 @@ def _seed_text_pending(pending_store, group_id: str, message_id: str = "M1") -> 
 
 
 def _patch_reply_pending_fast_path(main, monkeypatch):
+    monkeypatch.setattr(main, "_PENDING_REPLY_ENABLED", True)
     monkeypatch.setattr(main.settings, "bot_muted", False)
     monkeypatch.setattr(main, "_quota_exhausted", lambda: False)
     monkeypatch.setattr(main, "_drop_stale_pending", lambda *a, **kw: 0)

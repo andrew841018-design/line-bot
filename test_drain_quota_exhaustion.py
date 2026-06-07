@@ -18,6 +18,8 @@ import sys
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 os.environ.setdefault("LINE_CHANNEL_SECRET", "dummy_secret_32bytes_padding000")
 os.environ.setdefault("LINE_CHANNEL_ACCESS_TOKEN", "dummy")
 os.environ.setdefault("GEMINI_API_KEY", "dummy")
@@ -28,6 +30,11 @@ import main  # noqa: E402
 
 PASS = 0
 FAIL = 0
+
+
+@pytest.fixture(autouse=True)
+def _enable_legacy_pending_reply(monkeypatch):
+    monkeypatch.setattr(main, "_PENDING_REPLY_ENABLED", True)
 
 
 def check(label: str, cond: bool) -> None:

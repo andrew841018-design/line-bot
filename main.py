@@ -72,6 +72,7 @@ import burst_filter
 import feedback_collector
 import gemini_client
 import memory
+from pending_reply_policy import PENDING_REPLY_ENABLED as _DEFAULT_PENDING_REPLY_ENABLED
 import review
 from config import settings
 
@@ -1119,22 +1120,23 @@ def _handle_event(event) -> None:
     msg = event.message
     sender_user_id = getattr(event.source, "user_id", None)
 
-    # ── quota 爆時：非文字內容先存 pending，等恢復後由 Gemini 分組 + 逐組引用回覆 ──
-    # 文字不能在這裡 short-circuit：Andrew 的規則是家人/群組文字要即時回，
-    # 正常 text path 會進 burst_filter，_handle_burst_flush 內的 _llm_chat 會在
-    # quota 狀態走 lite_reply / fallback，不應被 pending early-return 靜默吃掉。
-    # 2026-05-17 加 (§3 abbreviated chain): 之前的 short-circuit return 把 reply_token
-    # 浪費掉，導致 pending 在 Gemini 爆期間無法 drain。現補 _try_piggyback_drain_with_reply_token
-    # — 在 return 前嘗試用 incoming reply_token bundle 最多 2 條 pending drain 走 local
-    # LLM fallback，免費不耗 LINE 月配額。failure pending 完整保留 (peek-then-confirm)。
+    # ── quota 爆時：非文字內容不排 pending reply ────────────────────────
+    # Andrew 2026-06-06 指示取消 pending 回覆機制；File/Audio 在額度爆時
+    # 不再寫入 pending_explicit_reply.json，也不做 reply-token 補回。
     if _quota_exhausted() and isinstance(
         msg, (FileMessageContent, AudioMessageContent)
     ):
-        _save_pending_any(event, group_id, sender_user_id, msg)
-        _try_piggyback_drain_with_reply_token(event.reply_token, group_id)
+        if _pending_reply_enabled():
+            _save_pending_any(event, group_id, sender_user_id, msg)
+            _try_piggyback_drain_with_reply_token(event.reply_token, group_id)
+        else:
+            logger.info(
+                "pending reply disabled; dropped quota-exhausted %s group=%s",
+                type(msg).__name__, group_id,
+            )
         return
 
-    # Piggyback drain：有人留言就順手補該 group 的 pending（throttle + quota gate 在 helper 裡）
+    # Piggyback reminder：有人留言時仍可補 reminder；reply pending 已由開關停用。
     _spawn_piggyback_drain(group_id)
 
     # 文字：先記進 raw_messages（供 quote 回查 / burst look-back / Layer 2 抓 trigger）
@@ -1143,18 +1145,17 @@ def _handle_event(event) -> None:
         _handle_text_message(event, group_id)
         return
 
-    # 2026-05-16 改：圖片/影片走 A+B 雙路徑。
-    # A: 同步存 pending（webhook 路徑保證不丟資料）
-    # B: 非同步 _MEDIA_EXECUTOR (cap 2) 跑 local analyze → reply → remove pending
-    # B 失敗（local 跑掛 / timeout / reply 失敗）→ pending 保留給 cron retry worker drain
+    # 2026-06-06 改：圖片/影片只走即時 local analyze；不再存 pending reply。
     if isinstance(msg, ImageMessageContent):
         memory.log_raw_message(group_id, msg.id, sender_user_id, "[圖片]")
-        _save_pending_any(event, group_id, sender_user_id, msg)
+        if _pending_reply_enabled():
+            _save_pending_any(event, group_id, sender_user_id, msg)
         _MEDIA_EXECUTOR.submit(_handle_image_message, event, group_id)
         return
     if isinstance(msg, VideoMessageContent):
         memory.log_raw_message(group_id, msg.id, sender_user_id, "[影片]")
-        _save_pending_any(event, group_id, sender_user_id, msg)
+        if _pending_reply_enabled():
+            _save_pending_any(event, group_id, sender_user_id, msg)
         _MEDIA_EXECUTOR.submit(_handle_video_message, event, group_id)
         return
     if isinstance(msg, AudioMessageContent):
@@ -1168,9 +1169,9 @@ def _handle_event(event) -> None:
         return
 
     # Catch-all for unknown message types (Sticker / Location / Template / etc.).
-    # Keep an audit/pending entry, but do not send low-value system-style replies.
+    # 只保留 raw audit；不再存 pending reply，也不送低價值 system fallback。
     logger.info(
-        "unknown message type %s group=%s — saved pending without fallback reply",
+        "unknown message type %s group=%s — ignored without pending reply",
         type(msg).__name__, group_id,
     )
     # I7 fix (2026-05-30): 補 log_raw_message（其他分支都有，唯獨 catch-all 漏）。
@@ -1182,10 +1183,11 @@ def _handle_event(event) -> None:
             memory.log_raw_message(group_id, msg_id, sender_user_id, f"[{type(msg).__name__}]")
     except Exception as e:
         logger.warning("log_raw_message for unknown msg type failed: %s", e)
-    try:
-        _save_pending_any(event, group_id, sender_user_id, msg)
-    except Exception as e:
-        logger.warning("save pending for unknown msg type failed: %s", e)
+    if _pending_reply_enabled():
+        try:
+            _save_pending_any(event, group_id, sender_user_id, msg)
+        except Exception as e:
+            logger.warning("save pending for unknown msg type failed: %s", e)
 
 
 def _handle_audio_message(event: MessageEvent, group_id: str) -> None:
@@ -2048,10 +2050,14 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
                 logger.warning("lite_reply retry failed: %s", e2)
                 reply_text = ""
             if not reply_text:
-                # quota 爆 + lite_reply 也 miss → 存 pending，不送系統/額度訊息
-                # （regex fallback 不靠 Gemini，家人手打的 calendar string 仍可抽）
                 _maybe_capture_calendar_event(group_id, clean_text)
-                _save_pending_burst_text(group_id, clean_text or user_input)
+                if _pending_reply_enabled():
+                    _save_pending_burst_text(group_id, clean_text or user_input)
+                else:
+                    logger.info(
+                        "pending reply disabled; suppress explicit quota fallback group=%s",
+                        group_id,
+                    )
                 return
         else:
             logger.exception("gemini chat (explicit) failed: %s", e)
@@ -2064,13 +2070,17 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
             return
 
     # quota 已爆時第一次 _llm_chat 直接回 ""（內部走 lite_reply，不丟例外）→ 上面 except
-    # 不會進入。空回覆不能落到下方 _reply("")（_reply 對空字串 silent drop，違反「絕不靜默」）。
-    # lite gate 抑制空泛 substantive 回答後會更常回空 → 這裡與 burst 路徑對齊補守衛：
-    # quota 爆 → 存 pending 等 quota 回來補答；非 quota 的空回覆 → 友善提示，不靜默。
+    # 不會進入。pending reply 已停用；quota empty 時不補答，也不送即時 fallback。
     if not reply_text or not reply_text.strip():
         if _quota_exhausted():
             _maybe_capture_calendar_event(group_id, clean_text)
-            _save_pending_burst_text(group_id, clean_text or user_input)
+            if _pending_reply_enabled():
+                _save_pending_burst_text(group_id, clean_text or user_input)
+            else:
+                logger.info(
+                    "pending reply disabled; suppress explicit empty quota fallback group=%s",
+                    group_id,
+                )
             return
         _reply(
             event.reply_token,
@@ -2100,7 +2110,7 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
 def _handle_burst_flush(group_id: str, combined_text: str, reply_token: str) -> None:
     """burst_filter 判定「值得主動回應」時觸發。跑在 Timer 的 thread 裡。
 
-    規則:「會回應的情境」不能靜默 — 要不是真回應，要不就回 quota 訊息。
+    quota/lite miss 時不排 pending reply，也不送即時 fallback；正常有內容才回。
     """
     logger.info(
         "burst flush triggered group=%s text_len=%d",
@@ -2164,12 +2174,15 @@ def _handle_burst_flush(group_id: str, combined_text: str, reply_token: str) -> 
                 logger.warning("lite_reply retry (burst) failed: %s", e2)
                 reply_text = ""
             if not reply_text:
-                logger.warning(
-                    "burst quota retry miss group=%s — saved pending and suppressed system msg",
-                    group_id,
-                )
+                logger.warning("burst quota retry miss group=%s", group_id)
                 _maybe_capture_calendar_event(group_id, combined_text)
-                _save_pending_burst_text(group_id, combined_text)
+                if _pending_reply_enabled():
+                    _save_pending_burst_text(group_id, combined_text)
+                else:
+                    logger.info(
+                        "pending reply disabled; suppress burst quota fallback group=%s",
+                        group_id,
+                    )
                 return
         else:
             logger.exception("gemini chat (burst) failed: %s", e)
@@ -2187,15 +2200,21 @@ def _handle_burst_flush(group_id: str, combined_text: str, reply_token: str) -> 
         repr(reply_text[:200]) if reply_text else "(empty)",
     )
     if not reply_text or not reply_text.strip():
-        # Quota exhausted 時不要送低價值 fallback；存 pending 等 quota 回來補。
+        # Quota exhausted 且 pending reply 停用時，直接短回，不再入隊補答。
         # 非 quota empty reply 才保留 2026-05-25 的短訊 fallback。
         if _quota_exhausted():
             logger.info(
-                "burst empty while quota exhausted — saved pending and suppressed low-value fallback group=%s",
+                "burst empty while quota exhausted group=%s",
                 group_id,
             )
             _maybe_capture_calendar_event(group_id, combined_text)
-            _save_pending_burst_text(group_id, combined_text)
+            if _pending_reply_enabled():
+                _save_pending_burst_text(group_id, combined_text)
+            else:
+                logger.info(
+                    "pending reply disabled; suppress burst empty quota fallback group=%s",
+                    group_id,
+                )
             return
         logger.warning(
             "burst gemini returned empty reply — sending fallback msg group=%s",
@@ -2969,7 +2988,7 @@ def _quota_exhausted_message() -> str:
     )
 
 
-# ── Pending（quota 爆時的所有訊息，恢復後由 Gemini 分組 + 引用回覆） ──────────
+# ── Legacy pending reply helpers（2026-06-06 起產品路徑預設停用）───────────
 
 _PENDING_EXPLICIT_PATH = os.path.join(
     os.path.dirname(__file__), "pending_explicit_reply.json"
@@ -2977,6 +2996,11 @@ _PENDING_EXPLICIT_PATH = os.path.join(
 _PENDING_MEDIA_DIR = os.path.join(os.path.dirname(__file__), "pending_media")
 _PENDING_DLQ_PATH = os.path.join(os.path.dirname(__file__), "pending_dlq.jsonl")
 _PENDING_MAX_AGE_SEC = 7 * 86400  # 7 天沒被 drain → 進 DLQ，避免 PDF/stuck entry 永久卡住
+_PENDING_REPLY_ENABLED = _DEFAULT_PENDING_REPLY_ENABLED
+
+
+def _pending_reply_enabled() -> bool:
+    return _PENDING_REPLY_ENABLED
 
 
 def _load_pending_explicit() -> dict:
@@ -2994,6 +3018,12 @@ def _save_pending_explicit_raw(data: dict) -> None:
 
 def _save_pending_any(event, group_id: str, user_id: str | None, msg) -> None:
     """quota 爆時把任何訊息（文字/檔案/音訊）存進佇列，每則獨立不合併。恢復時由 Gemini 判語意分組。"""
+    if not _pending_reply_enabled():
+        logger.info(
+            "pending reply disabled; skip saving message type=%s group=%s",
+            type(msg).__name__, group_id,
+        )
+        return
     try:
         data = _load_pending_explicit()
         if group_id not in data or not isinstance(data[group_id], list):
@@ -3090,6 +3120,9 @@ def _save_pending_any(event, group_id: str, user_id: str | None, msg) -> None:
 
 def _save_pending_burst_text(group_id: str, text: str) -> None:
     """Save a combined burst as pending when quota exhaustion prevents a useful reply."""
+    if not _pending_reply_enabled():
+        logger.info("pending reply disabled; skip saving burst text group=%s", group_id)
+        return
     text = (text or "").strip()
     if not text:
         return
@@ -3471,6 +3504,9 @@ def _drain_pending_for_group(group_id: str, source: str = "startup") -> bool:
     Gemini 中途重新爆走 _mark_quota_exhausted + 將未處理 items 寫回 pending（不 raise），
     caller 需自己重查 `_quota_exhausted()` 決定要不要繼續下一 group（startup wrapper 有做）。
     """
+    if not _pending_reply_enabled():
+        logger.info("%s pending: disabled, skip group=%s", source, group_id)
+        return False
     slot = _try_acquire_drain_slot(group_id)
     if slot is None:
         logger.info("%s: skip, another drain in progress for group=%s", source, group_id)
@@ -3605,6 +3641,9 @@ def _drain_pending_for_group(group_id: str, source: str = "startup") -> bool:
 @app.on_event("startup")
 def _process_pending_on_startup() -> None:
     """uvicorn 啟動時處理所有 pending：thin wrapper，所有實作在 helper 裡。"""
+    if not _pending_reply_enabled():
+        logger.info("pending reply disabled; startup drain skipped")
+        return
     pending = _load_pending_explicit()
     if not pending:
         return
@@ -3666,6 +3705,8 @@ def _piggyback_drain_pending(group_id: str) -> None:
 
     try:
         pending = _load_pending_explicit()
+        if not _pending_reply_enabled():
+            return
         if group_id not in pending or not pending[group_id]:
             return
         if not _has_enough_quota_for_retry():
@@ -3724,6 +3765,8 @@ def _start_pending_retry_worker() -> None:
             except Exception as e:
                 logger.warning("reminder pending backstop failed: %s", e)
             if not _load_pending_explicit():
+                continue
+            if not _pending_reply_enabled():
                 continue
             if _quota_exhausted():
                 continue
@@ -4937,6 +4980,8 @@ def _try_piggyback_drain_with_reply_token(
     Silent on: 缺 reply_token / bot_muted / 無 pending / drain lock 拿不到 /
     所有 LLM 失敗 / reply_message API 失敗。
     """
+    if not _pending_reply_enabled():
+        return
     if not reply_token or not group_id:
         return
     if settings.bot_muted:
@@ -5018,6 +5063,8 @@ def _peek_pending_for_piggyback(
     成功回 (格式化字串, message_ids)；失敗回 None，pending 不動。
     caller 必須等 LINE reply 成功後才 commit removal。
     """
+    if not _pending_reply_enabled():
+        return None
     _drop_stale_pending(group_id)  # D1 TTL: age>7d 進 DLQ，避免 PDF stuck 卡 slot
     pending = _load_pending_explicit()
     items = pending.get(group_id, [])
@@ -5133,6 +5180,8 @@ def _peek_pending_for_piggyback(
 
 def _pop_pending_for_piggyback(group_id: str) -> str | None:
     """Legacy pop wrapper. New reply path uses peek-then-confirm."""
+    if not _pending_reply_enabled():
+        return None
     peeked = _peek_pending_for_piggyback(group_id)
     if not peeked:
         return None
@@ -5318,10 +5367,9 @@ def _reply(
         )
         return
 
-    # 額度耗盡時，偷塞 pending 進同一則 reply_message（免費）
-    # LINE reply_message 上限 5 則 → 1 則實回覆 + 最多 4 則 piggyback
-    # 2026-05-16 改：從 1 提到 4，加速 pending drain（quota 爆等月初重置這種長窗期）
-    # 2026-05-21 加：reminder piggyback（advisor: pending 優先，剩餘 slot 給 reminder）
+    # LINE reply_message 上限 5 則。pending reply piggyback 已取消，只保留
+    # reminder piggyback；legacy pending branch 僅在 _PENDING_REPLY_ENABLED=True
+    # 的測試/rollback 場景會啟用。
     messages_to_send: list = [TextMessage(text=text)]
     pending_commit_ids: list[str] = []
     pending_reminders: list[tuple[str, int]] = []  # (event_id, offset) — reply 成功才 mark
@@ -5329,9 +5377,9 @@ def _reply(
     pending_slot = None
     try:
         if group_id:
-            # Step 1: 先塞 pending（user 已選 pending 為優先）。
-            # 拿同一把 drain lock，且只 peek；reply 成功後才 commit removal。
-            if _load_pending_explicit().get(group_id):
+            # Step 1: legacy pending reply branch。拿同一把 drain lock，且只
+            # peek；reply 成功後才 commit removal。
+            if _pending_reply_enabled() and _load_pending_explicit().get(group_id):
                 pending_slot = _try_acquire_drain_slot(group_id)
                 if pending_slot is None:
                     logger.info(

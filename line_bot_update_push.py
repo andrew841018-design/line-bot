@@ -81,7 +81,7 @@ def main() -> int:
         PENDING_FILE.unlink(missing_ok=True)
         head = msg.split("\n", 1)[0][:80]
         _notify_discord(
-            f"✅ LINE 群更新公告已推出：\n首行：{head}\n（pending 檔已清空）"
+            f"✅ LINE 群更新公告已推出：\n首行：{head}\n（草稿檔已清空）"
         )
         print(f"[line_bot_update_push] OK pushed, cleared {PENDING_FILE.name}")
         return 0

@@ -69,7 +69,7 @@ def _make_sticker_like_msg():
 
 
 def test_s4_unknown_message_type_must_not_silent_drop():
-    """Sticker / Location / Template 訊息只存 pending，不回低價值 fallback。"""
+    """Sticker / Location / Template 訊息只記 raw audit；不 pending、不回低價值 fallback。"""
     msg = _make_sticker_like_msg()
     evt = _make_message_event(msg)
 
@@ -81,7 +81,7 @@ def test_s4_unknown_message_type_must_not_silent_drop():
          patch("main.settings.allowed_group_id", "GRP001"):
         main._handle_event(evt)
 
-    mock_save_pending.assert_called_once()
+    mock_save_pending.assert_not_called()
     mock_reply.assert_not_called()
 
 
@@ -90,11 +90,8 @@ def test_s4_unknown_message_type_must_not_silent_drop():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def test_s5a_burst_flush_quota_retry_miss_must_not_silent():
-    """burst flush + Gemini primary + retry 都 quota 爆 → 必須 reply 不能 silent。
-
-    違反 _handle_burst_flush docstring 自己寫的「會回應的情境不能靜默」。
-    """
+def test_s5a_burst_flush_quota_retry_miss_suppressed_without_pending():
+    """burst flush + Gemini primary + retry 都 quota 爆 → 不 pending、不即時 fallback。"""
     with patch(
         "main._llm_chat",
         side_effect=Exception("quota exceeded for quota metric 'gemini'"),
@@ -113,16 +110,9 @@ def test_s5a_burst_flush_quota_retry_miss_must_not_silent():
          patch("main._thinking_indicator"):
         main._handle_burst_flush("GRP001", "家人聊天 message", "TOKEN001")
 
-    called_count = (
-        mock_reply.call_count
-        + mock_save_pending.call_count
-        + mock_save_pending_burst.call_count
-    )
-    assert called_count > 0, (
-        f"Silent drop: burst quota retry miss 未呼叫 _reply 也沒存 pending "
-        f"(_reply={mock_reply.call_count}, _save_pending_any={mock_save_pending.call_count}, "
-        f"_save_pending_burst_text={mock_save_pending_burst.call_count})"
-    )
+    mock_reply.assert_not_called()
+    mock_save_pending.assert_not_called()
+    mock_save_pending_burst.assert_not_called()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

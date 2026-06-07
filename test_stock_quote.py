@@ -111,6 +111,59 @@ def test_parse_yahoo_us_html_returns_none_on_garbage():
     assert stock_quote._parse_yahoo_us_html("", "AAPL") is None
 
 
+# ── 2.5. Yahoo chart parser ─────────────────────────────────────────────────
+
+
+_SOX_CHART_PAYLOAD = {
+    "chart": {
+        "result": [
+            {
+                "meta": {
+                    "symbol": "^SOX",
+                    "exchangeTimezoneName": "America/New_York",
+                    "timezone": "EDT",
+                    "regularMarketPrice": 12220.76,
+                    "previousClose": 13617.495,
+                    "regularMarketTime": 1780694159,
+                    "regularMarketDayHigh": 13111.438,
+                    "regularMarketDayLow": 12217.316,
+                },
+                "timestamp": [1780666200, 1780689540, 1780689600],
+                "indicators": {
+                    "quote": [
+                        {
+                            "open": [13062.5498, 12247.7597, 12220.7597],
+                            "high": [13111.4404, 12290.8037, 12220.7597],
+                            "low": [13062.5498, 12222.3251, 12220.7597],
+                            "close": [13062.5498, 12222.3251, 12220.7597],
+                            "volume": [0, 0, 0],
+                        }
+                    ]
+                },
+            }
+        ],
+        "error": None,
+    }
+}
+
+
+def test_parse_yahoo_chart_json_extracts_market_time_and_prev_close():
+    p = stock_quote._parse_yahoo_chart_json(_SOX_CHART_PAYLOAD, "^SOX")
+
+    assert p is not None
+    assert p["symbol"] == "^SOX"
+    assert p["source"] == "yahoo_chart"
+    assert p["last_price"] == 12220.76
+    assert p["prev_close"] == 13617.495
+    assert abs(p["change"] - (-1396.735)) < 0.01
+    assert abs(p["change_pct"] - (-10.2569)) < 0.01
+    assert p["open"] == 13062.5498
+    assert p["high"] == 13111.438
+    assert p["low"] == 12217.316
+    assert p["timestamp"] == "2026-06-05 17:15 EDT"
+    assert p["market_date"] == "2026-06-05"
+
+
 # ── 3. get_realtime_quote uses correct URL per market ───────────────────────
 
 
@@ -138,7 +191,10 @@ def test_get_realtime_quote_us_uses_us_yahoo():
         captured_urls.append(url)
         return _US_SAMPLE_HTML
 
-    with patch.object(stock_quote, "_fetch_yahoo_html", side_effect=fake_fetch):
+    with (
+        patch.object(stock_quote, "_fetch_yahoo_chart_json", return_value=None),
+        patch.object(stock_quote, "_fetch_yahoo_html", side_effect=fake_fetch),
+    ):
         q = stock_quote.get_realtime_quote("AAPL")
 
     assert q is not None
@@ -146,6 +202,19 @@ def test_get_realtime_quote_us_uses_us_yahoo():
     assert q["source"] == "yahoo_realtime"
     assert q["last_price"] == 287.51
     assert captured_urls == ["https://finance.yahoo.com/quote/AAPL"]
+
+
+def test_get_realtime_quote_us_prefers_chart_json_over_html():
+    with (
+        patch.object(stock_quote, "_fetch_yahoo_chart_json", return_value=_SOX_CHART_PAYLOAD),
+        patch.object(stock_quote, "_fetch_yahoo_html") as html_fetch,
+    ):
+        q = stock_quote.get_realtime_quote("^SOX")
+
+    assert q is not None
+    assert q["last_price"] == 12220.76
+    assert q["source"] == "yahoo_chart"
+    html_fetch.assert_not_called()
 
 
 def test_get_realtime_quote_tw_future_uses_tw_yahoo():
@@ -465,3 +534,40 @@ def test_contextual_quotes_night_unmapped_tw_does_not_mislabel_adr_future():
     assert "2317.TW" in out
     assert "【市場報價｜夜間報價參考" in out
     assert "ADR/期貨" not in out
+
+
+def test_contextual_quotes_index_daytime_not_labeled_stock():
+    now = datetime(2026, 6, 5, 10, 0, tzinfo=ZoneInfo("Asia/Taipei"))
+
+    with patch.object(stock_quote, "get_realtime_quote", return_value=_quote("^SOX", 12220.76)):
+        out = stock_quote.get_contextual_quotes_text("費半現在多少？", now=now)
+
+    assert out is not None
+    assert "【市場報價｜日間報價" in out
+    assert "日間現股" not in out
+
+
+def test_contextual_quotes_prior_market_date_labeled_close_quote():
+    now = datetime(2026, 6, 6, 14, 37, tzinfo=ZoneInfo("Asia/Taipei"))
+    sox_quote = {
+        "symbol": "^SOX",
+        "last_price": 12220.76,
+        "prev_close": 13617.495,
+        "change": -1396.735,
+        "change_pct": -10.2569,
+        "high": 13111.438,
+        "low": 12217.316,
+        "timestamp": "2026-06-05 17:15 EDT",
+        "last_date": "2026-06-05",
+        "market_date": "2026-06-05",
+        "source": "yahoo_chart",
+    }
+
+    with patch.object(stock_quote, "get_realtime_quote", return_value=sox_quote):
+        out = stock_quote.get_contextual_quotes_text("費半現在多少？", now=now)
+
+    assert out is not None
+    assert "【市場報價｜收盤報價｜2026-06-05 17:15 EDT】" in out
+    assert "12,220.76" in out
+    assert "13,617.50" not in out
+    assert "[Yahoo Chart]" in out

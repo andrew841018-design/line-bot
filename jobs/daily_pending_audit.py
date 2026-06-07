@@ -1,5 +1,4 @@
-"""Daily 21:00 audit: scan pending_explicit_reply.json for unanswered 圖文
-(image/video/file) and push a Discord DM with daily status.
+"""Legacy daily audit for pending_explicit_reply.json.
 
 Pure `build_report(data) -> AuditReport` + thin `main()` I/O driver. Audio
 intentionally excluded per user spec but surfaced as a separate line for
@@ -23,6 +22,7 @@ BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
 
 from dotenv import load_dotenv  # noqa: E402
+from pending_reply_policy import pending_reply_enabled  # noqa: E402
 
 load_dotenv(BASE / ".env")
 
@@ -407,6 +407,19 @@ def _send_discord(msg: str) -> bool:
 def main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
     dry_run = "--dry-run" in argv
+
+    if not pending_reply_enabled():
+        msg = "daily-pending-audit disabled: pending reply mechanism is off"
+        print(msg)
+        summary = {
+            "pending_reply_enabled": False,
+            "discord_sent": False,
+            "discord_skipped": True,
+        }
+        if dry_run:
+            summary["dry_run"] = True
+        _write_state(ok=True, status="disabled", summary=summary)
+        return 0
 
     data, status, file_size, present = _safe_load_pending()
     report = build_report(

@@ -177,6 +177,7 @@ def test_bug3_bot_entries_filtered_from_pending():
         # global drain gate（mute / Gemini quota / LINE 月額度）必須通才會進到
         # __bot__ 過濾邏輯。test environment 沒真 LINE token，預設 fail-closed → False
         patch("main._global_pending_drain_ready", return_value=True),
+        patch("main._PENDING_REPLY_ENABLED", True),
     ):
         main._process_pending_on_startup()
 
@@ -246,9 +247,9 @@ def test_bug6_quota_footer_no_percentage_unless_exhausted():
     assert footer == "", f"Quota exhausted 時也不該附加 footer，got: {footer!r}"
 
 
-def test_bug8_burst_empty_quota_saves_pending_without_low_value_reply():
-    """Andrew 2026-05-31: quota exhausted + burst empty fallback 不要回
-    「咪寶聽到了但這個話題不太接得上~」或 quota footer；保留 pending 即可。
+def test_bug8_burst_empty_quota_suppresses_without_pending():
+    """Andrew 2026-06-06: pending reply disabled. Quota exhausted + burst empty
+    should not send an immediate fallback and should not enqueue pending reply.
     """
     main._quota_exhausted_until_ts = time.time() + 3600
 
@@ -265,11 +266,9 @@ def test_bug8_burst_empty_quota_saves_pending_without_low_value_reply():
     ):
         main._handle_burst_flush("GRP001", "家人閒聊 message", "TOKEN001")
 
-    assert not mock_reply.called, "Quota exhausted + empty burst must not send low-value fallback"
+    mock_reply.assert_not_called()
     pending = pending_store.load().get("GRP001", [])
-    assert len(pending) == 1
-    assert pending[0]["type"] == "text"
-    assert pending[0]["text"] == "家人閒聊 message"
+    assert pending == []
 
 
 def test_bug9_reply_suppresses_system_status_messages():
@@ -432,8 +431,8 @@ def test_burst_market_quote_empty_fallback_marks_reply_only(monkeypatch):
     assert reply_calls[-1][1]["allow_push_fallback"] is False
 
 
-def test_bug10_explicit_quota_miss_saves_pending_without_system_reply():
-    """Explicit @ bot quota miss should store pending and not send quota/system text."""
+def test_bug10_explicit_quota_miss_suppresses_without_pending():
+    """Explicit @ bot quota miss should not store pending and should not reply fallback."""
     evt = _make_text_event(text="咪寶 幫我分析")
 
     with (
@@ -455,11 +454,9 @@ def test_bug10_explicit_quota_miss_saves_pending_without_system_reply():
     ):
         main._handle_explicit_text(evt, "GRP001", "幫我分析")
 
-    assert not mock_reply.called
+    mock_reply.assert_not_called()
     pending = pending_store.load().get("GRP001", [])
-    assert len(pending) == 1
-    assert pending[0]["type"] == "text"
-    assert pending[0]["text"] == "幫我分析"
+    assert pending == []
 
 
 # ── Bug 7 ─────────────────────────────────────────────────────────────────────

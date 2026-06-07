@@ -28,6 +28,7 @@ from concurrent.futures import (
 )
 from datetime import datetime, timedelta
 from typing import Optional
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import requests
@@ -225,6 +226,46 @@ def _to_float(s) -> Optional[float]:
         return None
 
 
+def _first_number(values) -> Optional[float]:
+    for value in values or []:
+        n = _to_float(value)
+        if n is not None:
+            return n
+    return None
+
+
+def _last_number(values) -> Optional[float]:
+    for value in reversed(values or []):
+        n = _to_float(value)
+        if n is not None:
+            return n
+    return None
+
+
+def _max_number(values) -> Optional[float]:
+    nums = [_to_float(v) for v in (values or [])]
+    nums = [n for n in nums if n is not None]
+    return max(nums) if nums else None
+
+
+def _min_number(values) -> Optional[float]:
+    nums = [_to_float(v) for v in (values or [])]
+    nums = [n for n in nums if n is not None]
+    return min(nums) if nums else None
+
+
+def _format_epoch_market_time(raw_ts, timezone_name: str | None) -> tuple[str, str] | None:
+    ts = _to_float(raw_ts)
+    if ts is None:
+        return None
+    try:
+        tz = ZoneInfo(timezone_name) if timezone_name else _TW_TZ
+    except Exception:
+        tz = _TW_TZ
+    dt = datetime.fromtimestamp(ts, tz)
+    return dt.strftime("%Y-%m-%d %H:%M %Z"), dt.strftime("%Y-%m-%d")
+
+
 def _fetch_yahoo_html(url: str) -> Optional[str]:
     """抓 Yahoo 頁面 HTML，timeout / 429 / 非 200 一律回 None。"""
     try:
@@ -243,6 +284,33 @@ def _fetch_yahoo_html(url: str) -> Optional[str]:
     except Exception as e:
         logger.info("yahoo fetch %s 失敗: %s", url, e)
         return None
+
+
+def _fetch_yahoo_chart_json(symbol: str) -> Optional[dict]:
+    """Fetch Yahoo chart JSON. The HTML quote page can lag behind this endpoint."""
+    if not symbol:
+        return None
+    params = {
+        "range": "1d",
+        "interval": "1m",
+        "includePrePost": "false",
+    }
+    # Yahoo chart API is more reliable with a plain UA; the full Chrome UA can
+    # intermittently get 429 even when the same endpoint is otherwise available.
+    headers = {"User-Agent": "Mozilla/5.0"}
+    encoded_symbol = quote(symbol, safe="")
+    for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+        url = f"https://{host}/v8/finance/chart/{encoded_symbol}"
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=_REQ_TIMEOUT_S)
+            if resp.status_code != 200 or not resp.text:
+                logger.info("yahoo chart fetch %s host=%s status=%s", symbol, host, resp.status_code)
+                continue
+            return resp.json()
+        except Exception as e:
+            logger.info("yahoo chart fetch %s host=%s 失敗: %s", symbol, host, e)
+            continue
+    return None
 
 
 # ── parser: Yahoo TW (tw.stock.yahoo.com/quote/{symbol}) ─────────────────────
@@ -392,6 +460,72 @@ def _parse_yahoo_us_html(html: str, symbol: str) -> Optional[dict]:
     }
 
 
+def _parse_yahoo_chart_json(payload: dict, symbol: str) -> Optional[dict]:
+    """Parse Yahoo chart JSON into the quote schema used by the bot."""
+    if not payload:
+        return None
+    try:
+        result = (payload.get("chart") or {}).get("result") or []
+        if not result:
+            return None
+        item = result[0] or {}
+        meta = item.get("meta") or {}
+        indicators = item.get("indicators") or {}
+        quote_items = indicators.get("quote") or []
+        quote_item = quote_items[0] if quote_items else {}
+    except Exception as e:
+        logger.info("yahoo chart parse %s 失敗: %s", symbol, e)
+        return None
+
+    closes = quote_item.get("close") or []
+    opens = quote_item.get("open") or []
+    highs = quote_item.get("high") or []
+    lows = quote_item.get("low") or []
+
+    last_price = _to_float(meta.get("regularMarketPrice"))
+    if last_price is None:
+        last_price = _last_number(closes)
+    if last_price is None:
+        return None
+
+    prev_close = _to_float(meta.get("previousClose"))
+    if prev_close is None:
+        prev_close = _to_float(meta.get("chartPreviousClose"))
+
+    # For 1d chart responses previousClose is normally in meta. If not, the
+    # daily arrays still give us a bounded fallback without calling yfinance.
+    numeric_closes = [_to_float(v) for v in closes]
+    numeric_closes = [v for v in numeric_closes if v is not None]
+    if prev_close is None and len(numeric_closes) >= 2:
+        prev_close = numeric_closes[-2]
+
+    change = (last_price - prev_close) if prev_close is not None else None
+    change_pct = (change / prev_close * 100) if (change is not None and prev_close) else None
+
+    market_time = _format_epoch_market_time(
+        meta.get("regularMarketTime"),
+        meta.get("exchangeTimezoneName") or meta.get("timezone"),
+    )
+    timestamp = market_date = None
+    if market_time:
+        timestamp, market_date = market_time
+
+    return {
+        "symbol": symbol,
+        "last_price": last_price,
+        "prev_close": prev_close,
+        "change": change,
+        "change_pct": change_pct,
+        "open": _first_number(opens),
+        "high": _to_float(meta.get("regularMarketDayHigh")) or _max_number(highs),
+        "low": _to_float(meta.get("regularMarketDayLow")) or _min_number(lows),
+        "timestamp": timestamp or time.strftime("%Y-%m-%d %H:%M"),
+        "last_date": market_date or time.strftime("%Y-%m-%d"),
+        "market_date": market_date,
+        "source": "yahoo_chart",
+    }
+
+
 # ── public quote getters: realtime → fast_info → history ─────────────────────
 
 
@@ -401,6 +535,13 @@ def get_realtime_quote(symbol: str) -> Optional[dict]:
         return None
     is_tw_future = _is_tw_future_symbol(symbol)
     is_tw = symbol.endswith(".TW") or symbol.endswith(".TWO") or is_tw_future
+
+    if not is_tw:
+        chart_payload = _fetch_yahoo_chart_json(symbol)
+        chart_parsed = _parse_yahoo_chart_json(chart_payload, symbol) if chart_payload else None
+        if chart_parsed and chart_parsed.get("last_price") is not None:
+            return chart_parsed
+
     if is_tw:
         url = f"https://tw.stock.yahoo.com/quote/{symbol}"
     else:
@@ -513,6 +654,7 @@ def get_quote(symbol: str, timeout_s: float = 5.0) -> Optional[dict]:
 
 _SOURCE_LABEL = {
     "yahoo_realtime": "Yahoo 即時",
+    "yahoo_chart": "Yahoo Chart",
     "fast_info": "Yahoo 延遲",
     "history": "日線收盤",
 }
@@ -775,6 +917,45 @@ def _format_contextual_quote_line(quote: dict, spec: dict[str, str]) -> str:
     )
 
 
+def _quote_market_date(quote: dict) -> str:
+    for key in ("market_date", "last_date"):
+        value = str(quote.get(key) or "").strip()
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", value):
+            return value
+    ts = str(quote.get("timestamp") or "").strip()
+    m = re.match(r"^(\d{4})[-/](\d{2})[-/](\d{2})", ts)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    return ""
+
+
+def _contextual_mode_label(
+    *,
+    night_mode: bool,
+    emitted_roles: list[str],
+    market_dates: list[str],
+    now: datetime,
+) -> str:
+    has_adr_or_future = any(role in {"ADR", "近月期貨"} for role in emitted_roles)
+    if has_adr_or_future:
+        return "夜間 ADR/期貨參考" if night_mode else "指定 ADR/期貨參考"
+
+    parsed_dates = []
+    for value in market_dates:
+        try:
+            parsed_dates.append(datetime.strptime(value, "%Y-%m-%d").date())
+        except ValueError:
+            continue
+    if parsed_dates and max(parsed_dates) < now.date():
+        return "收盤報價"
+
+    if night_mode:
+        return "夜間報價參考"
+    if emitted_roles and all(role == "現股" for role in emitted_roles):
+        return "日間現股"
+    return "日間報價"
+
+
 def get_contextual_quotes_text(
     text: str,
     *,
@@ -826,6 +1007,7 @@ def get_contextual_quotes_text(
 
     lines: list[str] = []
     timestamps: list[str] = []
+    market_dates: list[str] = []
     emitted_roles: list[str] = []
     emitted_groups: set[str] = set()
     for spec in specs:
@@ -836,6 +1018,9 @@ def get_contextual_quotes_text(
             continue
         emitted_groups.add(spec["group"])
         timestamps.append(quote.get("timestamp") or quote.get("last_date") or "")
+        market_date = _quote_market_date(quote)
+        if market_date:
+            market_dates.append(market_date)
         emitted_roles.append(spec["role"])
         lines.append(_format_contextual_quote_line(quote, spec))
 
@@ -843,11 +1028,12 @@ def get_contextual_quotes_text(
         return None
 
     header_ts = max(timestamps) if timestamps else now.strftime("%Y-%m-%d %H:%M")
-    has_adr_or_future = any(role in {"ADR", "近月期貨"} for role in emitted_roles)
-    if has_adr_or_future:
-        mode_label = "夜間 ADR/期貨參考" if night_mode else "指定 ADR/期貨參考"
-    else:
-        mode_label = "夜間報價參考" if night_mode else "日間現股"
+    mode_label = _contextual_mode_label(
+        night_mode=night_mode,
+        emitted_roles=emitted_roles,
+        market_dates=market_dates,
+        now=now,
+    )
     return f"【市場報價｜{mode_label}｜{header_ts}】\n" + "\n".join(lines)
 
 

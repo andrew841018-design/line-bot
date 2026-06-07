@@ -452,7 +452,10 @@ def test_save_pending_any():
     # TextMessageContent
     msg = _make_text_msg("測試訊息", "MSG_TEST")
     evt = _make_message_event(msg)
-    with patch("main.memory.get_raw_message", return_value=None):
+    with (
+        patch("main._PENDING_REPLY_ENABLED", True),
+        patch("main.memory.get_raw_message", return_value=None),
+    ):
         main._save_pending_any(evt, "GRP001", "USR001", msg)
 
     data = json.load(open(tmp))
@@ -465,7 +468,8 @@ def test_save_pending_any():
     img_msg = MagicMock(spec=ImageMessageContent)
     img_msg.id = "IMG001"
     img_evt = _make_message_event(img_msg)
-    main._save_pending_any(img_evt, "GRP001", "USR001", img_msg)
+    with patch("main._PENDING_REPLY_ENABLED", True):
+        main._save_pending_any(img_evt, "GRP001", "USR001", img_msg)
     data2 = json.load(open(tmp))
     check("Image pending → 也被存進佇列", len(data2.get("GRP001", [])) == 2)
     check("Image pending type=image", data2["GRP001"][1].get("type") == "image")

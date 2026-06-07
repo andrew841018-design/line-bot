@@ -24,6 +24,8 @@ import argparse, fcntl, hashlib, json, os, re, sqlite3, subprocess, sys, time
 from datetime import datetime
 from pathlib import Path
 
+from pending_reply_policy import pending_reply_enabled
+
 BOT_DIR = Path(__file__).resolve().parent
 PENDING_PATH = BOT_DIR / "pending_explicit_reply.json"
 DB_PATH = BOT_DIR / "line_bot.db"
@@ -510,6 +512,7 @@ def check_10_sqlite():
 
 def check_11_pending():
     r = CheckResult(14, "pending file JSON load", critical=False)
+    if not pending_reply_enabled(): return r.skipped("pending reply disabled")
     if not PENDING_PATH.exists(): return r.skipped("檔不存在")
     try:
         data = json.loads(PENDING_PATH.read_text())

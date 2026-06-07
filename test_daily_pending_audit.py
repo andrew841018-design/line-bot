@@ -6,6 +6,7 @@ notify_discord.send_dm; never touches production pending JSON or Discord.
 from __future__ import annotations
 
 import json
+import pytest
 import sqlite3
 import sys
 from pathlib import Path
@@ -14,6 +15,11 @@ BASE = Path(__file__).parent
 sys.path.insert(0, str(BASE / "jobs"))
 
 import daily_pending_audit as dpa  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _legacy_pending_audit_enabled(monkeypatch):
+    monkeypatch.setattr(dpa, "pending_reply_enabled", lambda: True)
 
 
 # ---------- build_report ----------
@@ -334,6 +340,31 @@ def test_main_dry_run_does_not_push(tmp_path, monkeypatch):
     rc = dpa.main(["--dry-run"])
     assert rc == 0
     assert sender.calls == []
+
+
+def test_main_skips_discord_when_pending_reply_disabled(tmp_path, monkeypatch):
+    import pending_store
+
+    fake = tmp_path / "p.json"
+    fake.write_text(json.dumps({"G1": [{"type": "image", "message_id": "m1", "timestamp": 1.0}]}))
+    monkeypatch.setattr(pending_store, "PENDING_PATH", fake)
+    monkeypatch.setattr(pending_store, "LOCK_PATH", tmp_path / ".lock")
+    state_path = tmp_path / "state" / "x.json"
+    monkeypatch.setattr(dpa, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(dpa, "STATE_PATH", state_path)
+    monkeypatch.setattr(dpa, "pending_reply_enabled", lambda: False)
+    sender = _DummySendDm(ok=True)
+    monkeypatch.setattr(dpa, "_send_discord", sender)
+
+    rc = dpa.main([])
+
+    assert rc == 0
+    assert sender.calls == []
+    state = json.loads(state_path.read_text())
+    assert state["ok"] is True
+    assert state["status"] == "disabled"
+    assert state["summary"]["discord_sent"] is False
+    assert state["summary"]["discord_skipped"] is True
 
 
 def test_main_pushes_when_leftover(tmp_path, monkeypatch):

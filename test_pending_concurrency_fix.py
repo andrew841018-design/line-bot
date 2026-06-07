@@ -65,6 +65,7 @@ def test_save_pending_any_persists_via_single_lock(monkeypatch):
     一定保留（不讀整段、不寫整段）。這條同 process 也驗證「新訊息真的有落地」。
     """
     import main
+    monkeypatch.setattr(main, "_PENDING_REPLY_ENABLED", True)
 
     pending_store.save_full({"G_other": [{"message_id": "mo", "type": "text", "text": "別組"}]})
 
@@ -82,6 +83,7 @@ def test_save_pending_any_persists_via_single_lock(monkeypatch):
 def test_save_pending_any_uses_pending_store_add(monkeypatch):
     """C1 結構保證：_save_pending_any 必須呼叫 pending_store.add，不可呼叫 save_full。"""
     import main
+    monkeypatch.setattr(main, "_PENDING_REPLY_ENABLED", True)
 
     pending_store.save_full({})
     called = {"add": 0, "save_full": 0}
@@ -149,6 +151,7 @@ def _pending_item(message_id: str, text: str = "x", age: float = 0) -> dict:
 
 def _patch_drain_fast_path(monkeypatch, push_impl):
     import main
+    monkeypatch.setattr(main, "_PENDING_REPLY_ENABLED", True)
 
     class _FakeApi:
         def __init__(self, _client):
