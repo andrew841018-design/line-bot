@@ -189,6 +189,29 @@ def _is_market_quote_request(text: str, context: list | None = None) -> bool:
         return False
 
 
+def _get_explicit_market_quote_reply(
+    text: str,
+    context: list | None = None,
+) -> str | None:
+    """Return deterministic market quote text for explicit asks, before any LLM.
+
+    Market data is factual/time-sensitive, so Gemini should not be the primary
+    answerer. This also keeps Gemini quota exhaustion from blocking stock/gold
+    quote requests that can be answered through public quote APIs.
+    """
+    if not text:
+        return None
+    try:
+        import stock_quote
+        technical = stock_quote.get_taiex_month_line_text(text)
+        if technical:
+            return technical
+        return stock_quote.get_contextual_quotes_text(text, context=context) or None
+    except Exception as e:
+        logger.info("explicit market quote deterministic path failed: %s", e)
+        return None
+
+
 def _llm_chat(
     user_input,
     context: list[tuple[str, str]],
@@ -2006,6 +2029,26 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
         _handle_calendar_query(event, group_id, clean_text)
         return
 
+    context = memory.get_context(group_id)
+    market_quote_reply = _get_explicit_market_quote_reply(
+        clean_text,
+        context=context,
+    )
+    if market_quote_reply:
+        logger.info(
+            "explicit market quote routed deterministically: text=%r group=%s",
+            clean_text[:50], group_id,
+        )
+        memory.append_turn(group_id, "user", clean_text)
+        memory.append_turn(group_id, "bot", market_quote_reply)
+        _reply(
+            event.reply_token,
+            market_quote_reply,
+            group_id=group_id,
+            allow_push_fallback=False,
+        )
+        return
+
     # 純文字 + 可能的文字引用
     quoted_block = _build_quoted_block(event.message, group_id)
     # 空 clean_text + 有引用 → 讓 Gemini 針對原文回應
@@ -2026,7 +2069,6 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
     # Gemini quota 爆時 _llm_chat 內部會自動走 llm_router.fallback_chat
     # (local LLM → RAG → lite_reply) 4-tier waterfall；不能在這層 return，
     # 否則家人 @咪寶時 bot 會完全沉默。
-    context = memory.get_context(group_id)
     quote_reply_only = _is_market_quote_request(
         quote_policy_input,
         context=context,

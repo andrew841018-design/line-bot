@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # line_bot daily health check — run by launchd at 15:00 TW
-# Restarts uvicorn and/or cloudflared if down; auto-updates LINE webhook URL on cloudflared restart.
+# Restarts uvicorn/cloudflared if down and always validates LINE → cloudflared → /callback.
+# A live cloudflared process is not enough: quick-tunnel URLs can go stale while pgrep stays UP.
 
 set -u
 
@@ -74,6 +75,29 @@ release_restart_lock() {
   rmdir "$RESTART_LOCK_DIR" 2>/dev/null || true
 }
 
+PREFLIGHT_RAN=0
+PREFLIGHT_EXIT=""
+
+run_preflight() {
+  local reason="$1"
+  PREFLIGHT_RAN=1
+  if [ ! -x "$BOT_DIR/.venv/bin/python" ]; then
+    PREFLIGHT_EXIT=127
+    say "ERR preflight python not found: $BOT_DIR/.venv/bin/python"
+    return 0
+  fi
+
+  say "$reason; running full-path preflight"
+  "$BOT_DIR/.venv/bin/python" "$BOT_DIR/preflight_check.py" --force >> "$HC_LOG" 2>&1
+  PREFLIGHT_EXIT=$?
+  say "$reason preflight exit=$PREFLIGHT_EXIT"
+  return 0
+}
+
+preflight_is_acceptable() {
+  [ "$1" = "0" ] || [ "$1" = "2" ]
+}
+
 {
   echo ""
   echo "=========================================="
@@ -101,7 +125,8 @@ say "uvicorn=$([ $UVICORN_UP -eq 1 ] && echo UP || echo DOWN)  cloudflared=$([ $
 PT_TODAY=$(TZ='America/Los_Angeles' date '+%m-%d')
 COUNT_429=0
 if [ -f "$UVICORN_LOG" ]; then
-  COUNT_429=$(grep -c "^$PT_TODAY .*429" "$UVICORN_LOG" 2>/dev/null || echo 0)
+  COUNT_429=$(grep -c "^$PT_TODAY .*429" "$UVICORN_LOG" 2>/dev/null || true)
+  COUNT_429=${COUNT_429:-0}
 fi
 say "Gemini 429 today (PT $PT_TODAY): $COUNT_429"
 
@@ -127,14 +152,18 @@ if [ $UVICORN_UP -eq 0 ]; then
         launchctl kickstart -k "gui/$(id -u)/$UVICORN_LABEL"
         say "kickstarted $UVICORN_LABEL"
         if wait_for_health; then
-          say "post-restart /health HTTP=200; running preflight"
-          "$BOT_DIR/.venv/bin/python" "$BOT_DIR/preflight_check.py" --force >> "$HC_LOG" 2>&1
-          PREFLIGHT_EXIT=$?
-          say "uvicorn restart preflight exit=$PREFLIGHT_EXIT"
-          case "$PREFLIGHT_EXIT" in
-            0|2) ACTION="restart_success_http_200_preflight_${PREFLIGHT_EXIT}" ;;
-            *)   ACTION="restart_failed_preflight_${PREFLIGHT_EXIT}" ;;
-          esac
+          UVICORN_UP=1
+          if [ $CF_UP -eq 1 ]; then
+            run_preflight "uvicorn restart"
+            if preflight_is_acceptable "$PREFLIGHT_EXIT"; then
+              ACTION="restart_success_http_200_preflight_${PREFLIGHT_EXIT}"
+            else
+              ACTION="restart_failed_preflight_${PREFLIGHT_EXIT}"
+            fi
+          else
+            say "uvicorn restarted; defer full-path preflight until cloudflared is ready"
+            ACTION="restart_success_http_200_preflight_deferred_cf_down"
+          fi
         else
           say "post-restart /health timeout after ${READY_TIMEOUT_SEC}s"
           ACTION="restart_failed_health_timeout"
@@ -164,11 +193,10 @@ if [ $CF_UP -eq 0 ]; then
       say "ERR cloudflared URL not found after 90s"
       CF_ACTION="cf_restart_failed_no_url"
     else
-      say "cloudflared new URL=$NEW_URL; running preflight to align LINE webhook"
-      "$BOT_DIR/.venv/bin/python" "$BOT_DIR/preflight_check.py" --force >> "$HC_LOG" 2>&1
-      PREFLIGHT_EXIT=$?
-      say "cloudflared restart preflight exit=$PREFLIGHT_EXIT"
-      if [ "$PREFLIGHT_EXIT" = "0" ] || [ "$PREFLIGHT_EXIT" = "2" ]; then
+      CF_UP=1
+      say "cloudflared new URL=$NEW_URL"
+      run_preflight "cloudflared restart webhook alignment"
+      if preflight_is_acceptable "$PREFLIGHT_EXIT"; then
         CF_ACTION="cf_restart_success_preflight_${PREFLIGHT_EXIT} url=${NEW_URL}/callback"
       else
         CF_ACTION="cf_restart_failed_preflight_${PREFLIGHT_EXIT}"
@@ -176,6 +204,17 @@ if [ $CF_UP -eq 0 ]; then
     fi
   fi
   say "cf_action=$CF_ACTION"
+fi
+
+if [ "$PREFLIGHT_RAN" -eq 0 ] && [ $UVICORN_UP -eq 1 ] && [ $CF_UP -eq 1 ]; then
+  run_preflight "processes UP verification"
+  if preflight_is_acceptable "$PREFLIGHT_EXIT"; then
+    ACTION="processes_up_preflight_${PREFLIGHT_EXIT}"
+  else
+    ACTION="processes_up_preflight_failed_${PREFLIGHT_EXIT}"
+  fi
+elif [ "$PREFLIGHT_RAN" -eq 0 ]; then
+  say "skip full-path preflight because process status is not ready: uvicorn=$UVICORN_UP cloudflared=$CF_UP"
 fi
 
 say "action=$ACTION"

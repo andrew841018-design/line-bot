@@ -529,6 +529,9 @@ def _try_url_summary(text: str) -> str | None:
 
 def _try_stock(text: str, context: list | None = None) -> str | None:
     """股票 ticker / 中文股名 → yfinance 即時。"""
+    taiex_technical = stock_quote.get_taiex_month_line_text(text)
+    if taiex_technical:
+        return f"{taiex_technical}\n\n（lite mode：Gemini 配額用完，純查公開報價/日線）"
     quotes = stock_quote.get_contextual_quotes_text(text, context=context)
     if quotes:
         return f"{quotes}\n\n（lite mode：Gemini 配額用完，純查公開報價）"

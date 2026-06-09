@@ -4,6 +4,7 @@
 - 台股 4 位數代號（2330、0050 等）→ 自動加 .TW
 - 美股 ticker（AAPL、NVDA、SOXL 等）
 - 指數（^SOX、^GSPC、^TWII 等）
+- 商品（黃金 / 金價 / XAU → GC=F，COMEX 黃金近月期貨）
 - 中文名稱對應（台積電 → 2330）
 
 報價來源 fallback chain（2026-05-07 加，原本只用日線收盤太慢）：
@@ -19,6 +20,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 import time
 from concurrent.futures import (
@@ -97,6 +99,28 @@ _INDEX_MAP = {
     "恐慌指數": "^VIX",
 }
 
+_COMMODITY_MAP = {
+    # Yahoo's reliable intraday gold symbol is COMEX gold futures. Treat it as
+    # a market reference, not spot XAU/USD, in bot-facing labels/prompts.
+    "GC=F": "COMEX 黃金近月期貨",
+}
+_GOLD_QUOTE_SYMBOL = "GC=F"
+_GOLD_CHINESE_RE = re.compile(r"黃金|金價|國際金|現貨金")
+_GOLD_XAU_RE = re.compile(
+    r"(?<![A-Z0-9])XAU(?:\s*[/\-.]?\s*USD)?(?![A-Z0-9])",
+    re.IGNORECASE,
+)
+_GOLD_EN_RE = re.compile(r"(?<![A-Z])GOLD(?![A-Z])", re.IGNORECASE)
+_GOLD_EN_CONTEXT_RE = re.compile(
+    r"\b(price|quote|spot|futures?|ounce|oz|usd|now|today|current)\b",
+    re.IGNORECASE,
+)
+_GOLD_NON_MARKET_RE = re.compile(r"黃金時段|黃金比例|黃金交叉")
+_NUMERIC_STOCK_CONTEXT_RE = re.compile(
+    r"股價|股票|台股|個股|現股|上市|上櫃|代號|\bticker\b|\bstock\b",
+    re.IGNORECASE,
+)
+
 _TWSE_4DIGIT_RE = re.compile(r"(?<!\d)(\d{4})(?!\d)")
 _TW_FUTURE_SYMBOL_RE = re.compile(r"^W[A-Z]{2,4}[FGHJKMNQUVXZ]\d$")
 _TW_FUTURE_SYMBOL_SCAN_RE = re.compile(r"(?<![A-Z0-9])(W[A-Z]{2,4}[FGHJKMNQUVXZ]\d)(?![A-Z0-9])")
@@ -110,6 +134,9 @@ _MARKET_TERM_RE = re.compile(
     r"股價|報價|價格|現價|市價|即時|漲跌|漲幅|跌幅|夜盤|近月|期貨|\bADR\b|\bquote\b|\bprice\b",
     re.IGNORECASE,
 )
+_TAIEX_TERM_RE = re.compile(r"台股大盤|台股|加權指數|加權|TAIEX|\^TWII", re.IGNORECASE)
+_MOVING_AVG_TERM_RE = re.compile(r"月線|20\s*日(?:線|均線)?|二十日(?:線|均線)?")
+_MOVING_AVG_ACTION_RE = re.compile(r"跌破|跌穿|摜破|守住|站上|收復|回測|破了|有破")
 _COUNTDOWN_DATE_RE = re.compile(
     r"(\d{1,4}\s*[/\-年月.]\s*\d{1,2}|\d{1,2}\s*月\s*\d{1,2})",
     re.IGNORECASE,
@@ -152,12 +179,25 @@ _YAHOO_UA = (
 _REQ_TIMEOUT_S = 3.0
 
 
+def _looks_like_gold_market_query(text: str) -> bool:
+    if not text or _GOLD_NON_MARKET_RE.search(text):
+        return False
+    if _GOLD_CHINESE_RE.search(text) or _GOLD_XAU_RE.search(text):
+        return True
+    return bool(_GOLD_EN_RE.search(text) and _GOLD_EN_CONTEXT_RE.search(text))
+
+
+def _has_explicit_numeric_stock_context(text: str) -> bool:
+    return bool(_NUMERIC_STOCK_CONTEXT_RE.search(text or ""))
+
+
 def detect_symbols(text: str) -> list[str]:
     """從文字偵測股票代號 / 標的。回 list of yfinance symbols（去重）。"""
     if not text:
         return []
     symbols: list[str] = []
     seen: set[str] = set()
+    has_gold_market_query = _looks_like_gold_market_query(text)
 
     def _add(sym: str) -> None:
         if sym not in seen:
@@ -168,6 +208,11 @@ def detect_symbols(text: str) -> list[str]:
     for name, sym in _INDEX_MAP.items():
         if name in text:
             _add(sym)
+
+    # 1.25. 商品：黃金 / XAU / gold price。先加，並在後面避免把
+    # 「4313 美元」這類價格誤抓成台股 4313.TW。
+    if has_gold_market_query:
+        _add(_GOLD_QUOTE_SYMBOL)
 
     # 1.5. 台股期貨 Yahoo TW symbol（例：WCDFM6）
     for m in _TW_FUTURE_SYMBOL_SCAN_RE.finditer(text.upper()):
@@ -189,6 +234,8 @@ def detect_symbols(text: str) -> list[str]:
         code = m.group(1)
         n = int(code)
         if 1900 <= n <= 2100:
+            continue
+        if has_gold_market_query and not _has_explicit_numeric_stock_context(text):
             continue
         _add(f"{code}.TW")
 
@@ -216,12 +263,14 @@ def _to_float(s) -> Optional[float]:
     if s is None:
         return None
     if isinstance(s, (int, float)):
-        return float(s)
+        value = float(s)
+        return value if math.isfinite(value) else None
     txt = str(s).strip().replace(",", "").replace("%", "")
     if not txt or txt in ("-", "--", "N/A"):
         return None
     try:
-        return float(txt)
+        value = float(txt)
+        return value if math.isfinite(value) else None
     except ValueError:
         return None
 
@@ -649,6 +698,146 @@ def get_quote(symbol: str, timeout_s: float = 5.0) -> Optional[dict]:
     return get_history_quote(symbol)
 
 
+def is_taiex_month_line_query(text: str) -> bool:
+    """Detect questions asking whether TAIEX broke/held the 20-day line."""
+    if not text:
+        return False
+    return bool(
+        _TAIEX_TERM_RE.search(text)
+        and _MOVING_AVG_TERM_RE.search(text)
+        and (
+            _MOVING_AVG_ACTION_RE.search(text)
+            or any(k in text for k in ("嗎", "?", "？", "如何", "怎麼看"))
+        )
+    )
+
+
+def _get_recent_daily_closes(symbol: str, period: str = "3mo") -> list[tuple[str, float]]:
+    """Return valid daily closes as (YYYY-MM-DD, close), dropping Yahoo NaN rows."""
+    try:
+        h = yf.Ticker(symbol).history(period=period, auto_adjust=False)
+    except Exception as e:
+        logger.info("history for moving average %s failed: %s", symbol, e)
+        return []
+    if h is None or len(h) == 0:
+        return []
+    out: list[tuple[str, float]] = []
+    for idx, row in h.iterrows():
+        close = _to_float(row.get("Close"))
+        if close is None:
+            close = _to_float(row.get("Adj Close"))
+        if close is None:
+            continue
+        try:
+            d = idx.strftime("%Y-%m-%d")
+        except Exception:
+            d = str(idx)[:10]
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", d):
+            out.append((d, close))
+    return out
+
+
+def _latest_quote_date(quote: dict) -> str:
+    for key in ("market_date", "last_date"):
+        value = str(quote.get(key) or "").strip()
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", value):
+            return value
+    ts = str(quote.get("timestamp") or "").strip()
+    m = re.match(r"^(\d{4})[-/](\d{2})[-/](\d{2})", ts)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    return ""
+
+
+def _taiex_20ma_from_quote(quote: dict, window: int = 20) -> Optional[float]:
+    current_close = _to_float(quote.get("last_price"))
+    if current_close is None:
+        return None
+    market_date = _latest_quote_date(quote)
+    closes = _get_recent_daily_closes("^TWII")
+    if not closes:
+        return None
+
+    if market_date:
+        previous = [close for d, close in closes if d != market_date]
+        if len(previous) >= window - 1:
+            return (sum(previous[-(window - 1):]) + current_close) / window
+
+    values = [close for _d, close in closes]
+    if len(values) >= window:
+        return sum(values[-window:]) / window
+    return None
+
+
+def _format_points(value: float | None) -> str:
+    return "?" if value is None else f"{value:,.2f}"
+
+
+def _taiex_value_label(quote: dict, now: datetime | None = None) -> str:
+    market_date = _latest_quote_date(quote)
+    now_tw = _coerce_taipei_now(now)
+    if market_date:
+        try:
+            if datetime.strptime(market_date, "%Y-%m-%d").date() < now_tw.date():
+                return "收盤"
+        except ValueError:
+            pass
+    ts = str(quote.get("timestamp") or "")
+    m = re.search(r"\b(\d{2}):(\d{2})\b", ts)
+    if m and (int(m.group(1)), int(m.group(2))) >= (13, 30):
+        return "收盤"
+    if market_date == now_tw.strftime("%Y-%m-%d") and now_tw.hour >= 14:
+        return "收盤"
+    return "目前"
+
+
+def get_taiex_month_line_text(text: str) -> Optional[str]:
+    """Answer TAIEX monthly-line questions with a yes/no technical verdict."""
+    if not is_taiex_month_line_query(text):
+        return None
+
+    quote = get_quote("^TWII")
+    if not quote:
+        return None
+    last = _to_float(quote.get("last_price"))
+    if last is None:
+        return None
+    low = _to_float(quote.get("low"))
+    high = _to_float(quote.get("high"))
+    ma20 = _taiex_20ma_from_quote(quote)
+    if ma20 is None:
+        return None
+
+    intraday_broke = low is not None and low < ma20
+    close_broke = last < ma20
+    close_label = _taiex_value_label(quote)
+
+    if intraday_broke and close_broke:
+        verdict = f"有，台股大盤盤中跌破月線，{close_label}也沒有收回。"
+    elif intraday_broke:
+        verdict = f"有，台股大盤盤中跌破月線，但{close_label}守住月線。"
+    elif close_broke:
+        verdict = f"有，台股大盤{close_label}跌破月線。"
+    else:
+        verdict = f"沒有，台股大盤盤中與{close_label}都守住月線。"
+
+    ts = quote.get("timestamp") or quote.get("last_date") or ""
+    low_line = f"低點 {_format_points(low)}" if low is not None else "低點 ?"
+    high_part = f" / 高點 {_format_points(high)}" if high is not None else ""
+    distance = last - ma20
+    pct = distance / ma20 * 100 if ma20 else 0.0
+
+    return "\n".join(
+        [
+            verdict,
+            f"1. 加權指數{close_label} {_format_points(last)}，20日線約 {_format_points(ma20)}，差距 {distance:+,.2f} 點（{pct:+.2f}%）。",
+            f"2. 盤中{low_line}{high_part}；所以重點是「低點有沒有破」和「{close_label}有沒有收回」要分開看。",
+            "3. 這種走法是跌破後拉回守線，短線仍偏震盪，還不是完全轉強。",
+            f"資料：Yahoo Finance / TWSE 日線；時間 {ts}",
+        ]
+    )
+
+
 # ── 文字輸出 ─────────────────────────────────────────────────────────────────
 
 
@@ -749,6 +938,8 @@ def _stock_role_label(symbol: str) -> str:
         return "指數"
     if _is_tw_future_symbol(symbol):
         return "近月期貨"
+    if symbol in _COMMODITY_MAP:
+        return "商品"
     return "現股"
 
 
@@ -1115,6 +1306,8 @@ def get_quotes_text(text: str, max_symbols: int = 5) -> Optional[str]:
 
 def _label_for(symbol: str) -> str:
     """yfinance symbol → 中文標籤（如有）。"""
+    if symbol in _COMMODITY_MAP:
+        return _COMMODITY_MAP[symbol]
     if symbol.endswith(".TW"):
         code = symbol.replace(".TW", "")
         for name, c in _TW_NAME_MAP.items():

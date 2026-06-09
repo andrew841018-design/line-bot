@@ -354,7 +354,7 @@ def test_market_quote_request_detects_contextual_followup_without_broad_now():
     assert not main._is_market_quote_request("NVDA 距離 6/15 還有多少天？", context=context)
 
 
-def test_explicit_market_quote_success_marks_reply_only():
+def test_explicit_market_quote_success_uses_deterministic_reply_only():
     evt = _make_text_event(text="咪寶 現在多少？")
     context = [("user", "我覺得 NVDA 會再突破")]
     reply_calls = []
@@ -365,13 +365,17 @@ def test_explicit_market_quote_success_marks_reply_only():
     with (
         patch("main._detect_image_gen_request", return_value=None),
         patch("main._is_calendar_query", return_value=False),
+        patch(
+            "main._get_explicit_market_quote_reply",
+            return_value="【市場報價｜測試】\nNVDA: 180.00",
+        ),
         patch("main._build_quoted_block", return_value=""),
         patch("main._prefetch_urls", side_effect=lambda text: text),
         patch("main.memory.get_context", return_value=context),
         patch("main.memory.top_facts", return_value=[]),
         patch("main._get_persona_notes", return_value=[]),
         patch("main._thinking_indicator", return_value=_noop_cm()),
-        patch("main._llm_chat", return_value="NVDA 現在約 180 美元"),
+        patch("main._llm_chat") as mock_llm,
         patch("main.memory.append_turn"),
         patch("main._try_save_correction"),
         patch("main._maybe_extract_facts"),
@@ -382,6 +386,49 @@ def test_explicit_market_quote_success_marks_reply_only():
 
     assert reply_calls
     assert reply_calls[-1][1]["allow_push_fallback"] is False
+    mock_llm.assert_not_called()
+
+
+def test_explicit_market_quote_quota_exhausted_still_skips_llm():
+    evt = _make_text_event(text="咪寶 黃金現在多少？")
+    reply_calls = []
+
+    def fake_reply(*args, **kwargs):
+        reply_calls.append((args, kwargs))
+
+    with (
+        patch("main._detect_image_gen_request", return_value=None),
+        patch("main._is_calendar_query", return_value=False),
+        patch(
+            "main._get_explicit_market_quote_reply",
+            return_value="【市場報價｜測試】\nCOMEX 黃金近月期貨: 4,313.00",
+        ),
+        patch("main.memory.get_context", return_value=[]),
+        patch("main._quota_exhausted", return_value=True),
+        patch("main._llm_chat") as mock_llm,
+        patch("main.memory.append_turn"),
+        patch("main._reply", side_effect=fake_reply),
+    ):
+        main._handle_explicit_text(evt, "GRP001", "黃金現在多少？")
+
+    assert reply_calls
+    assert "黃金" in reply_calls[-1][0][1]
+    assert reply_calls[-1][1]["allow_push_fallback"] is False
+    mock_llm.assert_not_called()
+
+
+def test_explicit_market_quote_helper_uses_stock_quote_without_llm():
+    with (
+        patch("stock_quote.get_taiex_month_line_text", return_value=None),
+        patch(
+            "stock_quote.get_contextual_quotes_text",
+            return_value="【市場報價｜測試】\nCOMEX 黃金近月期貨: 4,313.00",
+        ) as mock_quote,
+    ):
+        out = main._get_explicit_market_quote_reply("黃金現在多少？", context=[])
+
+    assert out and "COMEX 黃金" in out
+    mock_quote.assert_called_once()
 
 
 def test_burst_market_quote_error_fallback_marks_reply_only():

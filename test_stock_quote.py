@@ -376,6 +376,61 @@ def _quote(symbol: str, price: float = 100.0):
     }
 
 
+def _taiex_quote(last: float, low: float, high: float = 44507.49):
+    return {
+        "symbol": "^TWII",
+        "last_price": last,
+        "prev_close": 45070.94,
+        "change": last - 45070.94,
+        "change_pct": (last - 45070.94) / 45070.94 * 100,
+        "high": high,
+        "low": low,
+        "timestamp": "2026-06-08 13:33 CST",
+        "last_date": "2026-06-08",
+        "market_date": "2026-06-08",
+        "source": "yahoo_chart",
+    }
+
+
+def _ma_closes(value: float = 43100.0):
+    return [(f"2026-05-{i:02d}", value) for i in range(1, 20)]
+
+
+def test_to_float_rejects_nan():
+    assert stock_quote._to_float(float("nan")) is None
+    assert stock_quote._to_float("nan") is None
+
+
+def test_detects_taiex_month_line_question():
+    assert stock_quote.is_taiex_month_line_query("咪寶今天台股大盤有跌破月線嗎")
+    assert stock_quote.is_taiex_month_line_query("加權指數有守住20日線？")
+    assert not stock_quote.is_taiex_month_line_query("台股現在多少")
+
+
+def test_taiex_month_line_reports_intraday_break_but_close_hold(monkeypatch):
+    monkeypatch.setattr(stock_quote, "get_quote", lambda symbol: _taiex_quote(43502.78, 42376.86))
+    monkeypatch.setattr(stock_quote, "_get_recent_daily_closes", lambda symbol: _ma_closes(43100.0))
+
+    out = stock_quote.get_taiex_month_line_text("咪寶今天台股大盤有跌破月線嗎")
+
+    assert out is not None
+    assert out.startswith("有，台股大盤盤中跌破月線，但收盤守住月線。")
+    assert "43,502.78" in out
+    assert "20日線約 43,120.14" in out
+    assert "42,376.86" in out
+
+
+def test_taiex_month_line_reports_close_break(monkeypatch):
+    monkeypatch.setattr(stock_quote, "get_quote", lambda symbol: _taiex_quote(42000.0, 41900.0))
+    monkeypatch.setattr(stock_quote, "_get_recent_daily_closes", lambda symbol: _ma_closes(43100.0))
+
+    out = stock_quote.get_taiex_month_line_text("加權指數跌破月線嗎")
+
+    assert out is not None
+    assert out.startswith("有，台股大盤盤中跌破月線，收盤也沒有收回。")
+    assert "42,000.00" in out
+
+
 def test_candidate_future_symbols_current_month_first():
     now = datetime(2026, 6, 5, 21, 0, tzinfo=ZoneInfo("Asia/Taipei"))
     assert stock_quote._candidate_future_symbols("CDF", now, months_ahead=4) == [
@@ -388,6 +443,20 @@ def test_candidate_future_symbols_current_month_first():
 
 def test_detect_symbols_tsmc_english_alias_maps_to_tw_stock():
     assert stock_quote.detect_symbols("TSMC 現在多少？") == ["2330.TW"]
+
+
+def test_detect_symbols_gold_queries_map_to_gold_futures():
+    assert stock_quote.detect_symbols("黃金現在多少？") == ["GC=F"]
+    assert stock_quote.detect_symbols("XAU/USD 現在價格") == ["GC=F"]
+    assert stock_quote.detect_symbols("Gold price now") == ["GC=F"]
+
+
+def test_detect_symbols_gold_price_number_not_treated_as_tw_stock():
+    assert stock_quote.detect_symbols("金價跌到4313嗎？") == ["GC=F"]
+
+
+def test_detect_symbols_gold_without_market_context_ignored():
+    assert stock_quote.detect_symbols("When it rains gold, put out the bucket") == []
 
 
 def test_contextual_quotes_daytime_uses_stock_only():
@@ -470,6 +539,24 @@ def test_contextual_quotes_price_query_infers_recent_context_symbol():
     assert out is not None
     assert calls == ["NVDA"]
     assert "NVDA" in out
+
+
+def test_contextual_quotes_gold_uses_commodity_label():
+    now = datetime(2026, 6, 5, 10, 0, tzinfo=ZoneInfo("Asia/Taipei"))
+    calls = []
+
+    def fake_quote(symbol):
+        calls.append(symbol)
+        return _quote(symbol, 4313.0)
+
+    with patch.object(stock_quote, "get_realtime_quote", side_effect=fake_quote):
+        out = stock_quote.get_contextual_quotes_text("黃金現在多少？", now=now)
+
+    assert out is not None
+    assert calls == ["GC=F"]
+    assert "GC=F" in out
+    assert "COMEX 黃金近月期貨/USD" in out
+    assert "現股" not in out
 
 
 def test_contextual_quote_request_ignores_how_many_days_question():

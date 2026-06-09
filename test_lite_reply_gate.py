@@ -87,6 +87,20 @@ def test_lite_reply_substantive_with_specifics_replies(monkeypatch):
     assert out is not None and "244" in out  # genuinely helpful → sent
 
 
+def test_lite_stock_technical_preempts_plain_quote(monkeypatch):
+    def fail_plain_quote(*_args, **_kwargs):
+        raise AssertionError("plain quote should not run for month-line question")
+
+    monkeypatch.setattr(lr.stock_quote, "get_taiex_month_line_text", lambda text: "月線答案")
+    monkeypatch.setattr(lr.stock_quote, "get_contextual_quotes_text", fail_plain_quote)
+
+    out = lr._try_stock("咪寶今天台股大盤有跌破月線嗎")
+
+    assert out is not None
+    assert out.startswith("月線答案")
+    assert "公開報價/日線" in out
+
+
 def test_lite_reply_suppresses_snippet_platitude(monkeypatch):
     _force_skip_nlp(monkeypatch)
     monkeypatch.setattr(lr, "_STAGE1_HANDLERS", ())
