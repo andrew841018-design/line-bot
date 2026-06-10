@@ -9,6 +9,7 @@ quota 爆時 main 改 call 這邊。
 """
 from __future__ import annotations
 import logging
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -30,6 +31,118 @@ _MIN_CACHE_BYTES = 1024       # 太小檔不算（preview / corrupted / sticker�
 _MIN_CACHE_REPLY_LEN = 200    # 太短 reply 不 cache（L3 raw desc 通常 < 200 字）
 
 _local_llm_down_alerted = False  # once-per-process 告警 guard；成功生回應時 reset（見 _respond_to_ocr_text）
+
+
+_MARKET_SCREENSHOT_HINT_RE = re.compile(
+    r"牛牛|富途|Futu|Futubull|moomoo|Moomoo|道瓊|道琼|那斯達克|納斯達克|"
+    r"標普|标普|S&P|費半|费半|現貨黃金|现货黄金|XAU|\bGold\b",
+    re.IGNORECASE,
+)
+_MARKET_SCREENSHOT_SOURCE_RE = re.compile(r"牛牛|富途|Futu|Futubull|moomoo|Moomoo", re.IGNORECASE)
+_MARKET_SCREENSHOT_STRONG_TERM_RE = re.compile(
+    r"道瓊|道琼|那斯達克|納斯達克|纳斯达克|標普|标普|S\s*&\s*P|費半|费半|"
+    r"現貨黃金|现货黄金|國際金|国际金|XAU|\bGold\b|DJI|DJIA|IXIC|NDX|SPX|SOX|SOXX",
+    re.IGNORECASE,
+)
+_MARKET_ALIAS_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("道瓊指數", re.compile(r"道瓊|道琼|Dow|DJI|DJIA", re.IGNORECASE)),
+    ("納斯達克指數", re.compile(r"那斯達克|納斯達克|纳斯达克|Nasdaq|IXIC|NDX", re.IGNORECASE)),
+    ("S&P 500", re.compile(r"標普|标普|S\s*&\s*P\s*500|S&P500|SPX", re.IGNORECASE)),
+    ("費城半導體指數", re.compile(r"費半|费半|SOX|SOXX|半導體|半导体", re.IGNORECASE)),
+    ("黃金", re.compile(r"現貨黃金|现货黄金|國際金|国际金|黃金|黄金|XAU|\bGold\b", re.IGNORECASE)),
+)
+_PERCENT_RE = re.compile(r"[+\-−]?\d+(?:\.\d+)?\s*%")
+_NUMBER_RE = re.compile(r"[+\-−]?\d{1,3}(?:,\d{3})+(?:\.\d+)?|[+\-−]?\d+(?:\.\d+)?")
+
+
+def _normalize_num_token(token: str) -> str:
+    return (token or "").strip().replace("−", "-").replace(" ", "")
+
+
+def _extract_market_numbers(blob: str) -> tuple[str | None, str | None, str | None]:
+    """Return (level, change, percent) from one OCR row/window, conservatively."""
+    without_pct = _PERCENT_RE.sub(" ", blob or "")
+    numbers = [_normalize_num_token(n) for n in _NUMBER_RE.findall(without_pct)]
+    numbers = [n for n in numbers if n and n not in {"+", "-"}]
+    percent_matches = [_normalize_num_token(p) for p in _PERCENT_RE.findall(blob or "")]
+
+    level = None
+    for token in numbers:
+        try:
+            value = abs(float(token.replace(",", "")))
+        except ValueError:
+            continue
+        if "," in token or value >= 20:
+            level = token
+            break
+
+    change = None
+    for token in numbers:
+        if token == level:
+            continue
+        if token.startswith(("+", "-")):
+            change = token
+            break
+
+    percent = percent_matches[0] if percent_matches else None
+    return level, change, percent
+
+
+def _iter_market_segments(text: str) -> list[tuple[str, str]]:
+    """Split OCR text into per-symbol windows even when OCR collapsed newlines."""
+    matches: list[tuple[int, int, str]] = []
+    for label, pattern in _MARKET_ALIAS_PATTERNS:
+        for match in pattern.finditer(text or ""):
+            matches.append((match.start(), match.end(), label))
+    matches.sort(key=lambda item: item[0])
+
+    segments: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for idx, (start, _end, label) in enumerate(matches):
+        if label in seen:
+            continue
+        stop = matches[idx + 1][0] if idx + 1 < len(matches) else len(text)
+        segment = text[start:stop]
+        if segment.strip():
+            segments.append((label, segment))
+            seen.add(label)
+    return segments
+
+
+def _extract_market_screenshot_reply(ocr_text: str) -> Optional[str]:
+    """Parse Futu/moomoo/NiuNiu market screenshots from OCR text.
+
+    This path is deliberately extractive: it reports only numbers visible in the
+    image OCR and never fills missing values from Yahoo, Gemini, or memory.
+    """
+    text = (ocr_text or "").strip()
+    if not text or not _MARKET_SCREENSHOT_HINT_RE.search(text):
+        return None
+    if not (_MARKET_SCREENSHOT_SOURCE_RE.search(text) or _MARKET_SCREENSHOT_STRONG_TERM_RE.search(text)):
+        return None
+
+    rows: list[tuple[str, str | None, str | None, str | None]] = []
+    for label, segment in _iter_market_segments(text):
+        level, change, percent = _extract_market_numbers(segment)
+        if not (level or change or percent):
+            continue
+        rows.append((label, level, change, percent))
+
+    if not rows:
+        return None
+
+    out = ["我只能依附圖 OCR 到的市場數字整理，不補外部報價。"]
+    for idx, (label, level, change, percent) in enumerate(rows, 1):
+        parts = []
+        if level:
+            parts.append(level)
+        if change:
+            parts.append(f"變動 {change}")
+        if percent:
+            parts.append(f"漲跌幅 {percent}")
+        out.append(f"{idx}. {label}：" + "，".join(parts))
+    out.append("如果你說的 6% 是其中某個標的，請直接指定那一列或再傳更清楚截圖。")
+    return "\n".join(out)
 
 
 def _alert_local_llm_down(reason: str) -> None:
@@ -207,6 +320,12 @@ def analyze_image(
         logger.info("ocr_helper 未建，跳過 OCR")
     except Exception as e:
         logger.warning("OCR failed: %s", e)
+
+    if ocr_text:
+        market_reply = _extract_market_screenshot_reply(ocr_text)
+        if market_reply:
+            _maybe_write_media_cache(image, group_id, "image", ocr_text, market_reply)
+            return market_reply
 
     # 拼 prompt
     prompt = (

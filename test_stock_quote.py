@@ -1,19 +1,32 @@
-"""Tests for stock_quote real-time fallback chain.
+"""Tests for stock_quote Futu/Yahoo fallback chain.
 
 Covers:
   1. _parse_yahoo_tw_html parses sample TW HTML correctly
   2. _parse_yahoo_us_html parses sample US HTML correctly
-  3. get_quote falls through real-time → fast_info → history
-  4. get_quotes_text header shows source + timestamp from real-time
+  3. get_quote falls through Futu → real-time → fast_info → history
+  4. get_quotes_text header shows source + timestamp from chosen source
 """
 
 from __future__ import annotations
 
+import sys
+import time
+import types
 from datetime import datetime
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+import pytest
+
 import stock_quote
+
+
+@pytest.fixture(autouse=True)
+def _disable_real_futu(monkeypatch):
+    monkeypatch.setenv("FUTU_QUOTE_ENABLED", "0")
+    monkeypatch.setattr(stock_quote, "_FUTU_MODULE_CACHE", None)
+    monkeypatch.setattr(stock_quote, "_FUTU_MODULE_CACHE_NAME", "")
+    monkeypatch.setattr(stock_quote, "_FUTU_COOLDOWN_UNTIL", 0.0)
 
 
 # ── 1. Yahoo TW parser ──────────────────────────────────────────────────────
@@ -164,6 +177,159 @@ def test_parse_yahoo_chart_json_extracts_market_time_and_prev_close():
     assert p["market_date"] == "2026-06-05"
 
 
+# ── 2.6. Futu OpenD provider ────────────────────────────────────────────────
+
+
+class _FakeFutuFrame:
+    empty = False
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def to_dict(self, orient):
+        assert orient == "records"
+        return self._rows
+
+
+def test_futu_code_for_symbol_maps_supported_us_stocks_and_env_overrides(monkeypatch):
+    monkeypatch.setenv("FUTU_SYMBOL_MAP_JSON", '{"2330.TW": "TW.2330"}')
+
+    assert stock_quote._futu_code_for_symbol("AAPL") == "US.AAPL"
+    assert stock_quote._futu_code_for_symbol("SOXL") == "US.SOXL"
+    assert stock_quote._futu_code_for_symbol("GC=F") is None
+    assert stock_quote._futu_code_for_symbol("WCDFM6") is None
+    assert stock_quote._futu_code_for_symbol("2330.TW") == "TW.2330"
+
+
+def test_futu_code_for_tw_stock_defaults_to_yahoo_fallback(monkeypatch):
+    monkeypatch.delenv("FUTU_SYMBOL_MAP_JSON", raising=False)
+
+    assert stock_quote._futu_code_for_symbol("2330.TW") is None
+    assert stock_quote._futu_code_for_symbol("^TWII") is None
+    assert stock_quote._futu_code_for_symbol("^DJI") is None
+    assert stock_quote._futu_code_for_symbol("^IXIC") is None
+    assert stock_quote._futu_code_for_symbol("^GSPC") is None
+    assert stock_quote._futu_code_for_symbol("^SOX") is None
+
+
+def test_get_futu_quote_normalizes_snapshot_and_closes(monkeypatch):
+    monkeypatch.setenv("FUTU_QUOTE_ENABLED", "1")
+    monkeypatch.setattr(stock_quote, "_futu_opend_available", lambda host, port: True)
+    calls = []
+    closed = []
+
+    class FakeQuoteContext:
+        def __init__(self, host, port):
+            calls.append(("connect", host, port))
+
+        def get_market_snapshot(self, codes):
+            calls.append(("snapshot", codes))
+            return 0, _FakeFutuFrame([
+                {
+                    "code": "US.AAPL",
+                    "name": "Apple",
+                    "update_time": "2026-06-05 05:30:43",
+                    "last_price": 188.38,
+                    "open_price": 193.89,
+                    "high_price": 199.88,
+                    "low_price": 187.34,
+                    "prev_close_price": 203.19,
+                }
+            ])
+
+        def close(self):
+            closed.append(True)
+
+    fake_futu = types.SimpleNamespace(RET_OK=0, OpenQuoteContext=FakeQuoteContext)
+    monkeypatch.setitem(sys.modules, "futu", fake_futu)
+
+    q = stock_quote.get_futu_quote("AAPL")
+
+    assert q is not None
+    assert calls == [
+        ("connect", "127.0.0.1", 11111),
+        ("snapshot", ["US.AAPL"]),
+    ]
+    assert closed == [True]
+    assert q["symbol"] == "AAPL"
+    assert q["futu_code"] == "US.AAPL"
+    assert q["source"] == "futu_opend"
+    assert q["last_price"] == 188.38
+    assert q["open"] == 193.89
+    assert q["high"] == 199.88
+    assert q["low"] == 187.34
+    assert abs(q["change"] - (-14.81)) < 0.01
+    assert abs(q["change_pct"] - (-7.2887)) < 0.01
+    assert q["timestamp"] == "2026-06-05 05:30:43"
+    assert q["market_date"] == "2026-06-05"
+
+
+def test_get_futu_quote_ret_error_returns_none_and_closes(monkeypatch):
+    monkeypatch.setenv("FUTU_QUOTE_ENABLED", "1")
+    monkeypatch.setattr(stock_quote, "_futu_opend_available", lambda host, port: True)
+    closed = []
+
+    class FakeQuoteContext:
+        def __init__(self, host, port):
+            pass
+
+        def get_market_snapshot(self, codes):
+            return -1, "bad symbol"
+
+        def close(self):
+            closed.append(True)
+
+    fake_futu = types.SimpleNamespace(RET_OK=0, OpenQuoteContext=FakeQuoteContext)
+    monkeypatch.setitem(sys.modules, "futu", fake_futu)
+
+    assert stock_quote.get_futu_quote("AAPL") is None
+    assert closed == [True]
+
+
+def test_get_futu_quote_timeout_enters_cooldown(monkeypatch):
+    monkeypatch.setenv("FUTU_QUOTE_ENABLED", "1")
+    monkeypatch.setenv("FUTU_SNAPSHOT_TIMEOUT_S", "0.01")
+    monkeypatch.setenv("FUTU_TIMEOUT_COOLDOWN_S", "1")
+    monkeypatch.setattr(stock_quote, "_futu_opend_available", lambda host, port: True)
+    calls = []
+
+    class FakeQuoteContext:
+        def __init__(self, host, port):
+            calls.append("connect")
+
+        def get_market_snapshot(self, codes):
+            calls.append("snapshot")
+            time.sleep(0.2)
+            return 0, _FakeFutuFrame([{"last_price": 188.38}])
+
+        def close(self):
+            calls.append("close")
+
+    fake_futu = types.SimpleNamespace(RET_OK=0, OpenQuoteContext=FakeQuoteContext)
+    monkeypatch.setitem(sys.modules, "futu", fake_futu)
+
+    assert stock_quote.get_futu_quote("AAPL") is None
+    assert calls[:2] == ["connect", "snapshot"]
+    calls.clear()
+    assert stock_quote.get_futu_quote("AAPL") is None
+    assert calls == []
+
+
+def test_import_futu_module_uses_cached_module_without_home_mutation(monkeypatch):
+    fake_futu = types.SimpleNamespace(RET_OK=0)
+    monkeypatch.setitem(sys.modules, "futu", fake_futu)
+    monkeypatch.setenv("HOME", "/Users/andrew")
+
+    out = stock_quote._import_futu_module()
+
+    assert out is fake_futu
+    assert stock_quote._import_futu_module() is fake_futu
+    assert sys.modules["futu"] is fake_futu
+    assert stock_quote._FUTU_MODULE_CACHE is fake_futu
+    assert stock_quote._FUTU_MODULE_CACHE_NAME == "futu"
+    assert stock_quote.os.environ["HOME"] == "/Users/andrew"
+
+
 # ── 3. get_realtime_quote uses correct URL per market ───────────────────────
 
 
@@ -247,7 +413,8 @@ def test_get_quote_uses_realtime_first():
         "symbol": "2330.TW", "last_price": 2325.0, "source": "yahoo_realtime",
         "timestamp": "2026-05-07 11:03", "change": 75.0, "change_pct": 3.33,
     }
-    with patch.object(stock_quote, "get_realtime_quote", return_value=rt_quote) as rt, \
+    with patch.object(stock_quote, "get_futu_quote", return_value=None), \
+         patch.object(stock_quote, "get_realtime_quote", return_value=rt_quote) as rt, \
          patch.object(stock_quote, "get_fast_info_quote") as fi, \
          patch.object(stock_quote, "get_history_quote") as hi:
         out = stock_quote.get_quote("2330.TW")
@@ -263,7 +430,8 @@ def test_get_quote_falls_back_to_fast_info_when_realtime_fails():
         "symbol": "2330.TW", "last_price": 2320.0, "source": "fast_info",
         "timestamp": "2026-05-07 11:00", "change": 70.0, "change_pct": 3.11,
     }
-    with patch.object(stock_quote, "get_realtime_quote", return_value=None), \
+    with patch.object(stock_quote, "get_futu_quote", return_value=None), \
+         patch.object(stock_quote, "get_realtime_quote", return_value=None), \
          patch.object(stock_quote, "get_fast_info_quote", return_value=fi_quote) as fi, \
          patch.object(stock_quote, "get_history_quote") as hi:
         out = stock_quote.get_quote("2330.TW")
@@ -279,7 +447,8 @@ def test_get_quote_falls_back_to_history_when_both_fail():
         "last_date": "2026-05-06", "timestamp": "2026-05-06",
         "change": 30.0, "change_pct": 1.35,
     }
-    with patch.object(stock_quote, "get_realtime_quote", return_value=None), \
+    with patch.object(stock_quote, "get_futu_quote", return_value=None), \
+         patch.object(stock_quote, "get_realtime_quote", return_value=None), \
          patch.object(stock_quote, "get_fast_info_quote", return_value=None), \
          patch.object(stock_quote, "get_history_quote", return_value=hi_quote) as hi:
         out = stock_quote.get_quote("2330.TW")
@@ -289,10 +458,57 @@ def test_get_quote_falls_back_to_history_when_both_fail():
 
 
 def test_get_quote_returns_none_when_all_fail():
-    with patch.object(stock_quote, "get_realtime_quote", return_value=None), \
+    with patch.object(stock_quote, "get_futu_quote", return_value=None), \
+         patch.object(stock_quote, "get_realtime_quote", return_value=None), \
          patch.object(stock_quote, "get_fast_info_quote", return_value=None), \
          patch.object(stock_quote, "get_history_quote", return_value=None):
         assert stock_quote.get_quote("BOGUS.XX") is None
+
+
+def test_get_quote_prefers_futu_before_yahoo():
+    futu_quote = {
+        "symbol": "AAPL",
+        "last_price": 188.38,
+        "source": "futu_opend",
+        "timestamp": "2026-06-05 05:30:43",
+        "change": -14.81,
+        "change_pct": -7.29,
+    }
+    with (
+        patch.object(stock_quote, "get_futu_quote", return_value=futu_quote) as futu,
+        patch.object(stock_quote, "get_realtime_quote") as rt,
+        patch.object(stock_quote, "get_fast_info_quote") as fi,
+        patch.object(stock_quote, "get_history_quote") as hi,
+    ):
+        out = stock_quote.get_quote("AAPL")
+
+    assert out is futu_quote
+    futu.assert_called_once_with("AAPL")
+    rt.assert_not_called()
+    fi.assert_not_called()
+    hi.assert_not_called()
+
+
+def test_get_quote_futu_failure_falls_back_to_realtime():
+    rt_quote = {
+        "symbol": "AAPL",
+        "last_price": 190.0,
+        "source": "yahoo_chart",
+        "timestamp": "2026-06-05 09:30 EDT",
+    }
+    with (
+        patch.object(stock_quote, "get_futu_quote", return_value=None) as futu,
+        patch.object(stock_quote, "get_realtime_quote", return_value=rt_quote) as rt,
+        patch.object(stock_quote, "get_fast_info_quote") as fi,
+        patch.object(stock_quote, "get_history_quote") as hi,
+    ):
+        out = stock_quote.get_quote("AAPL")
+
+    assert out is rt_quote
+    futu.assert_called_once_with("AAPL")
+    rt.assert_called_once_with("AAPL")
+    fi.assert_not_called()
+    hi.assert_not_called()
 
 
 # ── 5. get_quotes_text header shows source + timestamp ──────────────────────
@@ -347,6 +563,30 @@ def test_get_quotes_text_header_shows_history_source_when_only_history():
     assert out is not None
     assert "2026-05-06" in out
     assert "日線收盤" in out
+
+
+def test_get_quotes_text_header_shows_futu_source():
+    futu_quote = {
+        "symbol": "AAPL",
+        "last_price": 188.38,
+        "prev_close": 203.19,
+        "change": -14.81,
+        "change_pct": -7.29,
+        "open": 193.89,
+        "high": 199.88,
+        "low": 187.34,
+        "timestamp": "2026-06-05 05:30:43",
+        "last_date": "2026-06-05",
+        "source": "futu_opend",
+    }
+    with patch.object(stock_quote, "get_quote", return_value=futu_quote):
+        out = stock_quote.get_quotes_text("AAPL 現在多少？")
+
+    assert out is not None
+    assert "2026-06-05 05:30:43" in out
+    assert "富途牛牛" in out
+    assert "188.38" in out
+    assert "-7.29%" in out
 
 
 def test_get_quotes_text_returns_none_when_no_symbols():
@@ -477,6 +717,38 @@ def test_contextual_quotes_daytime_uses_stock_only():
     assert "近月期貨" not in out
 
 
+def test_contextual_quotes_prefers_futu_without_unbounded_yfinance_fallback():
+    now = datetime(2026, 6, 5, 10, 0, tzinfo=ZoneInfo("Asia/Taipei"))
+    futu_quote = {
+        "symbol": "NVDA",
+        "last_price": 180.0,
+        "prev_close": 179.0,
+        "change": 1.0,
+        "change_pct": 0.56,
+        "high": 182.0,
+        "low": 178.0,
+        "timestamp": "2026-06-05 09:31:00",
+        "last_date": "2026-06-05",
+        "source": "futu_opend",
+    }
+
+    with (
+        patch.object(stock_quote, "get_futu_quote", return_value=futu_quote) as futu,
+        patch.object(stock_quote, "get_realtime_quote") as rt,
+        patch.object(stock_quote, "get_fast_info_quote") as fast_info,
+        patch.object(stock_quote, "get_history_quote") as history,
+    ):
+        out = stock_quote.get_contextual_quotes_text("NVDA 現在多少？", now=now)
+
+    assert out is not None
+    futu.assert_called_once_with("NVDA")
+    rt.assert_not_called()
+    fast_info.assert_not_called()
+    history.assert_not_called()
+    assert "NVDA" in out
+    assert "富途牛牛" in out
+
+
 def test_contextual_quotes_night_uses_adr_and_near_month_future():
     now = datetime(2026, 6, 5, 21, 0, tzinfo=ZoneInfo("Asia/Taipei"))
     calls = []
@@ -600,6 +872,7 @@ def test_contextual_quotes_non_future_does_not_use_unbounded_yfinance_fallback()
     now = datetime(2026, 6, 5, 10, 0, tzinfo=ZoneInfo("Asia/Taipei"))
 
     with (
+        patch.object(stock_quote, "get_futu_quote", return_value=None),
         patch.object(stock_quote, "get_realtime_quote", return_value=None),
         patch.object(stock_quote, "get_fast_info_quote") as fast_info,
         patch.object(stock_quote, "get_history_quote") as history,

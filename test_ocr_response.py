@@ -170,3 +170,77 @@ def test_analyze_image_no_desc_no_ocr_returns_none(monkeypatch):
 
     out = mp.analyze_image(b"\x00" * 2048, group_id="Gtest")
     assert out is None  # nothing to say → leave pending (unchanged contract)
+
+
+# ── market screenshot OCR grounding ─────────────────────────────────────────
+
+
+def test_extract_market_screenshot_reply_uses_only_ocr_numbers():
+    ocr = """
+    富途牛牛
+    道瓊
+    42,197.79
+    -299.29 -0.70%
+    那斯達克
+    19,406.83
+    -61.30 -0.31%
+    費半
+    5,286.93
+    -40.84 -0.77%
+    現貨黃金
+    4,313.20
+    +28.10 +0.66%
+    """
+
+    out = mp._extract_market_screenshot_reply(ocr)
+
+    assert out is not None
+    assert "依附圖 OCR" in out
+    assert "道瓊指數" in out
+    assert "42,197.79" in out
+    assert "-0.70%" in out
+    assert "黃金" in out
+    assert "4,313.20" in out
+    assert "2,308" not in out
+    assert "Yahoo" not in out
+
+
+def test_extract_market_screenshot_reply_handles_collapsed_ocr_line():
+    ocr = (
+        "富途牛牛 道瓊 42,197.79 -299.29 -0.70% "
+        "那斯達克 19,406.83 -61.30 -0.31% "
+        "現貨黃金 4,313.20 +28.10 +0.66%"
+    )
+
+    out = mp._extract_market_screenshot_reply(ocr)
+
+    assert out is not None
+    assert "道瓊指數：42,197.79" in out
+    assert "納斯達克指數：19,406.83" in out
+    assert "黃金：4,313.20" in out
+
+
+def test_extract_market_screenshot_reply_ignores_bare_gold_non_market_text():
+    assert mp._extract_market_screenshot_reply("黃金雞塊 99 元 第二件半價") is None
+
+
+def test_analyze_image_market_screenshot_short_circuits_llm(monkeypatch):
+    monkeypatch.setattr(mp, "_maybe_lookup_media_cache", lambda *a, **k: None)
+    fake_ocr = types.ModuleType("ocr_helper")
+    fake_ocr.extract_text = lambda *a, **k: "牛牛\n現貨黃金\n4,313.20\n+28.10 +0.66%"
+    monkeypatch.setitem(sys.modules, "ocr_helper", fake_ocr)
+
+    fake_vision = types.ModuleType("vision_llm")
+
+    def _vision_should_not_run(*_a, **_k):
+        raise AssertionError("vision/local LLM path should not run for market OCR")
+
+    fake_vision.describe_image = _vision_should_not_run
+    monkeypatch.setitem(sys.modules, "vision_llm", fake_vision)
+    monkeypatch.setattr(mp, "_respond_to_ocr_text", _vision_should_not_run)
+
+    out = mp.analyze_image(b"\x00" * 2048, group_id="Gtest")
+
+    assert out is not None
+    assert "4,313.20" in out
+    assert "依附圖 OCR" in out

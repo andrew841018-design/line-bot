@@ -7,10 +7,11 @@
 - 商品（黃金 / 金價 / XAU → GC=F，COMEX 黃金近月期貨）
 - 中文名稱對應（台積電 → 2330）
 
-報價來源 fallback chain（2026-05-07 加，原本只用日線收盤太慢）：
-    1. Yahoo TW / Yahoo Finance 即時頁面（requests + bs4 解析）→ 真即時
-    2. yfinance fast_info（intraday 約延遲 1-15 分）
-    3. yfinance history(period="5d")（日線收盤，最後保險）
+報價來源 fallback chain：
+    1. 富途牛牛 / Futu OpenD get_market_snapshot（本機 OpenD 可用時）
+    2. Yahoo TW / Yahoo Finance 即時頁面（requests + bs4 / chart 解析）
+    3. yfinance fast_info（intraday 約延遲 1-15 分）
+    4. yfinance history(period="5d")（日線收盤，最後保險）
 
 用法：
     from stock_quote import get_quotes_text
@@ -19,9 +20,16 @@
 
 from __future__ import annotations
 
+import importlib
+import json
 import logging
 import math
+import os
+import queue
 import re
+import socket
+import sys
+import threading
 import time
 from concurrent.futures import (
     ThreadPoolExecutor,
@@ -177,6 +185,19 @@ _YAHOO_UA = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 _REQ_TIMEOUT_S = 3.0
+_FUTU_DEFAULT_HOST = "127.0.0.1"
+_FUTU_DEFAULT_PORT = 11111
+_FUTU_OPEND_CONNECT_TIMEOUT_S = 0.35
+_FUTU_SNAPSHOT_TIMEOUT_S = 2.0
+_FUTU_TIMEOUT_COOLDOWN_S = 60.0
+_FUTU_UNSUPPORTED_SYMBOL_RE = re.compile(r"[=]")
+_FUTU_US_SYMBOL_RE = re.compile(r"^[A-Z][A-Z0-9.]{0,14}$")
+_FUTU_SYMBOL_OVERRIDES: dict[str, str] = {}
+_FUTU_IMPORT_LOCK = threading.Lock()
+_FUTU_MODULE_CACHE = None
+_FUTU_MODULE_CACHE_NAME = ""
+_FUTU_COOLDOWN_LOCK = threading.Lock()
+_FUTU_COOLDOWN_UNTIL = 0.0
 
 
 def _looks_like_gold_market_query(text: str) -> bool:
@@ -360,6 +381,298 @@ def _fetch_yahoo_chart_json(symbol: str) -> Optional[dict]:
             logger.info("yahoo chart fetch %s host=%s 失敗: %s", symbol, host, e)
             continue
     return None
+
+
+# ── provider: Futu OpenD / 富途牛牛 ───────────────────────────────────────────
+
+
+def _env_flag(name: str, default: bool = True) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def _futu_quote_enabled() -> bool:
+    return _env_flag("FUTU_QUOTE_ENABLED", default=True)
+
+
+def _futu_opend_host_port() -> tuple[str, int]:
+    host = os.getenv("FUTU_OPEND_HOST", _FUTU_DEFAULT_HOST).strip() or _FUTU_DEFAULT_HOST
+    raw_port = os.getenv("FUTU_OPEND_PORT", str(_FUTU_DEFAULT_PORT)).strip()
+    try:
+        port = int(raw_port)
+    except ValueError:
+        logger.info("invalid FUTU_OPEND_PORT=%r, using default", raw_port)
+        port = _FUTU_DEFAULT_PORT
+    return host, port
+
+
+def _env_float(name: str, default: float, *, minimum: float | None = None) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.info("invalid %s=%r, using default", name, raw)
+        return default
+    if minimum is not None and value < minimum:
+        return minimum
+    return value
+
+
+def _futu_snapshot_timeout_s() -> float:
+    return _env_float("FUTU_SNAPSHOT_TIMEOUT_S", _FUTU_SNAPSHOT_TIMEOUT_S, minimum=0.05)
+
+
+def _futu_timeout_cooldown_s() -> float:
+    return _env_float("FUTU_TIMEOUT_COOLDOWN_S", _FUTU_TIMEOUT_COOLDOWN_S, minimum=0.0)
+
+
+def _futu_symbol_map_from_env() -> dict[str, str]:
+    raw = os.getenv("FUTU_SYMBOL_MAP_JSON", "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except Exception as e:
+        logger.info("invalid FUTU_SYMBOL_MAP_JSON: %s", e)
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key, value in parsed.items():
+        k = str(key or "").strip().upper()
+        v = str(value or "").strip().upper()
+        if k and v:
+            out[k] = v
+    return out
+
+
+def _futu_code_for_symbol(symbol: str) -> Optional[str]:
+    """Map the bot's Yahoo-style symbol into a Futu OpenAPI code when known.
+
+    Taiwan stocks/futures and commodities intentionally fall back to Yahoo by
+    default because their Futu codes differ by account/market availability.
+    Add explicit mappings with FUTU_SYMBOL_MAP_JSON when they are validated.
+    """
+    if not symbol:
+        return None
+    normalized = symbol.strip().upper()
+    env_override = _futu_symbol_map_from_env().get(normalized)
+    if env_override:
+        return env_override
+
+    if normalized in _FUTU_SYMBOL_OVERRIDES:
+        return _FUTU_SYMBOL_OVERRIDES[normalized]
+    if normalized in _COMMODITY_MAP or _FUTU_UNSUPPORTED_SYMBOL_RE.search(normalized):
+        return None
+    if normalized.endswith(".TW") or normalized.endswith(".TWO"):
+        return None
+    if normalized.startswith("^") or _is_tw_future_symbol(normalized):
+        return None
+    if _FUTU_US_SYMBOL_RE.match(normalized):
+        return f"US.{normalized}"
+    return None
+
+
+def _futu_opend_available(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=_FUTU_OPEND_CONNECT_TIMEOUT_S):
+            return True
+    except OSError:
+        return False
+
+
+def _futu_in_cooldown() -> bool:
+    with _FUTU_COOLDOWN_LOCK:
+        return time.monotonic() < _FUTU_COOLDOWN_UNTIL
+
+
+def _mark_futu_cooldown() -> None:
+    global _FUTU_COOLDOWN_UNTIL
+    cooldown = _futu_timeout_cooldown_s()
+    if cooldown <= 0:
+        return
+    with _FUTU_COOLDOWN_LOCK:
+        _FUTU_COOLDOWN_UNTIL = time.monotonic() + cooldown
+
+
+def _import_futu_module():
+    """Import futu lazily while redirecting its import-time file logger.
+
+    The futu package creates a TimedRotatingFileHandler during import under
+    HOME/.com.futunn.FutuOpenD/Log. In sandboxed runs HOME may be read-only, so
+    point only this import at a writable temp home and restore HOME immediately.
+    """
+    global _FUTU_MODULE_CACHE, _FUTU_MODULE_CACHE_NAME
+    module_name = os.getenv("FUTU_PY_MODULE", "futu").strip() or "futu"
+    if _FUTU_MODULE_CACHE is not None and _FUTU_MODULE_CACHE_NAME == module_name:
+        return _FUTU_MODULE_CACHE
+
+    with _FUTU_IMPORT_LOCK:
+        if _FUTU_MODULE_CACHE is not None and _FUTU_MODULE_CACHE_NAME == module_name:
+            return _FUTU_MODULE_CACHE
+        if module_name in sys.modules:
+            _FUTU_MODULE_CACHE = sys.modules[module_name]
+            _FUTU_MODULE_CACHE_NAME = module_name
+            return _FUTU_MODULE_CACHE
+
+        old_home = os.environ.get("HOME")
+        log_home = os.getenv("FUTU_LOG_HOME", "/private/tmp/line_bot_futu_home")
+        try:
+            os.makedirs(log_home, exist_ok=True)
+            os.environ["HOME"] = log_home
+            module = importlib.import_module(module_name)
+            _FUTU_MODULE_CACHE = module
+            _FUTU_MODULE_CACHE_NAME = module_name
+            return module
+        except Exception as e:
+            logger.info("futu import failed: %s", e)
+            return None
+        finally:
+            if old_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = old_home
+
+
+def _set_futu_threads_daemon(futu) -> None:
+    try:
+        sys_config = getattr(futu, "SysConfig", None)
+        if sys_config and hasattr(sys_config, "set_all_thread_daemon"):
+            sys_config.set_all_thread_daemon(True)
+    except Exception as e:
+        logger.info("futu set_all_thread_daemon skipped: %s", e)
+
+
+def _records_from_snapshot(data) -> list[dict]:
+    if data is None:
+        return []
+    if isinstance(data, list):
+        return [row for row in data if isinstance(row, dict)]
+    if isinstance(data, dict):
+        if all(isinstance(v, list) for v in data.values()):
+            length = max((len(v) for v in data.values()), default=0)
+            return [
+                {key: values[i] for key, values in data.items() if i < len(values)}
+                for i in range(length)
+            ]
+        return [data]
+    if hasattr(data, "empty") and bool(getattr(data, "empty")):
+        return []
+    if hasattr(data, "to_dict"):
+        try:
+            records = data.to_dict("records")
+            return [row for row in records if isinstance(row, dict)]
+        except Exception:
+            return []
+    return []
+
+
+def _parse_futu_snapshot(data, symbol: str, futu_code: str) -> Optional[dict]:
+    records = _records_from_snapshot(data)
+    if not records:
+        return None
+    row = records[0]
+    last_price = _to_float(row.get("last_price"))
+    if last_price is None:
+        return None
+
+    prev_close = _to_float(row.get("prev_close_price"))
+    change = _to_float(row.get("change_val"))
+    change_pct = _to_float(row.get("change_rate"))
+    if change is None and prev_close is not None:
+        change = last_price - prev_close
+    if change_pct is None and change is not None and prev_close:
+        change_pct = change / prev_close * 100
+
+    timestamp = str(row.get("update_time") or "").strip() or time.strftime("%Y-%m-%d %H:%M")
+    m = re.match(r"^(\d{4})[-/](\d{2})[-/](\d{2})", timestamp)
+    market_date = f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else time.strftime("%Y-%m-%d")
+
+    return {
+        "symbol": symbol,
+        "futu_code": futu_code,
+        "name": str(row.get("name") or "").strip(),
+        "last_price": last_price,
+        "prev_close": prev_close,
+        "change": change,
+        "change_pct": change_pct,
+        "open": _to_float(row.get("open_price")),
+        "high": _to_float(row.get("high_price")),
+        "low": _to_float(row.get("low_price")),
+        "timestamp": timestamp,
+        "last_date": market_date,
+        "market_date": market_date,
+        "source": "futu_opend",
+    }
+
+
+def _get_futu_quote_unbounded(symbol: str, futu_code: str, host: str, port: int, futu) -> Optional[dict]:
+    quote_ctx = None
+    try:
+        _set_futu_threads_daemon(futu)
+        quote_ctx = futu.OpenQuoteContext(host=host, port=port)
+        ret, data = quote_ctx.get_market_snapshot([futu_code])
+        if ret != getattr(futu, "RET_OK", 0):
+            logger.info("futu snapshot %s failed: %s", futu_code, data)
+            return None
+        return _parse_futu_snapshot(data, symbol, futu_code)
+    except Exception as e:
+        logger.info("get_futu_quote(%s/%s) failed: %s", symbol, futu_code, e)
+        return None
+    finally:
+        if quote_ctx is not None:
+            try:
+                quote_ctx.close()
+            except Exception:
+                pass
+
+
+def _call_futu_with_timeout(symbol: str, futu_code: str, host: str, port: int, futu) -> Optional[dict]:
+    result_q: queue.Queue[Optional[dict]] = queue.Queue(maxsize=1)
+
+    def _worker() -> None:
+        result = _get_futu_quote_unbounded(symbol, futu_code, host, port, futu)
+        try:
+            result_q.put_nowait(result)
+        except queue.Full:
+            pass
+
+    worker = threading.Thread(
+        target=_worker,
+        name=f"futu-quote-{futu_code}",
+        daemon=True,
+    )
+    worker.start()
+    try:
+        return result_q.get(timeout=_futu_snapshot_timeout_s())
+    except queue.Empty:
+        logger.warning("futu snapshot timed out symbol=%s code=%s", symbol, futu_code)
+        _mark_futu_cooldown()
+        return None
+
+
+def get_futu_quote(symbol: str) -> Optional[dict]:
+    """Fetch one quote from local Futu OpenD. Failure returns None for fallback."""
+    if not _futu_quote_enabled() or _futu_in_cooldown():
+        return None
+    futu_code = _futu_code_for_symbol(symbol)
+    if not futu_code:
+        return None
+
+    host, port = _futu_opend_host_port()
+    if not _futu_opend_available(host, port):
+        logger.info("futu OpenD unavailable host=%s port=%s", host, port)
+        return None
+
+    futu = _import_futu_module()
+    if futu is None:
+        return None
+
+    return _call_futu_with_timeout(symbol, futu_code, host, port, futu)
 
 
 # ── parser: Yahoo TW (tw.stock.yahoo.com/quote/{symbol}) ─────────────────────
@@ -680,13 +993,18 @@ def get_quote(symbol: str, timeout_s: float = 5.0) -> Optional[dict]:
     """取得單一標的當前報價，依 fallback chain 嘗試。
 
     chain:
-      1. Yahoo 即時頁（real-time）
-      2. yfinance fast_info（intraday）
-      3. yfinance history(5d)（日線收盤）
+      1. 富途牛牛 / Futu OpenD snapshot
+      2. Yahoo 即時頁 / chart（real-time）
+      3. yfinance fast_info（intraday）
+      4. yfinance history(5d)（日線收盤）
 
     `timeout_s` 為相容舊 signature 保留，未使用（內部 per-call timeout 已固定 3s）。
     全失敗回 None。
     """
+    futu_quote = get_futu_quote(symbol)
+    if futu_quote and futu_quote.get("last_price") is not None:
+        return futu_quote
+
     rt = get_realtime_quote(symbol)
     if rt and rt.get("last_price") is not None:
         return rt
@@ -842,6 +1160,7 @@ def get_taiex_month_line_text(text: str) -> Optional[str]:
 
 
 _SOURCE_LABEL = {
+    "futu_opend": "富途牛牛",
     "yahoo_realtime": "Yahoo 即時",
     "yahoo_chart": "Yahoo Chart",
     "fast_info": "Yahoo 延遲",
@@ -1049,7 +1368,10 @@ def _dedupe_quote_specs(specs: list[dict[str, str]]) -> list[dict[str, str]]:
 
 
 def _get_contextual_quote(symbol: str) -> Optional[dict]:
-    """Quote getter for chat prefetch: realtime only, bounded by caller deadline."""
+    """Quote getter for chat prefetch: Futu first, then bounded Yahoo realtime."""
+    futu_quote = get_futu_quote(symbol)
+    if futu_quote and futu_quote.get("last_price") is not None:
+        return futu_quote
     return get_realtime_quote(symbol)
 
 
@@ -1296,8 +1618,8 @@ def get_quotes_text(text: str, max_symbols: int = 5) -> Optional[str]:
 
     # header：用「最即時」的時間戳 + 主要來源
     header_ts = max(timestamps) if timestamps else time.strftime("%Y-%m-%d %H:%M")
-    # 取最高優先序的 source 當主標籤（real-time > fast_info > history）
-    priority = ("yahoo_realtime", "fast_info", "history")
+    # 取最高優先序的 source 當主標籤（Futu > real-time > fast_info > history）
+    priority = ("futu_opend", "yahoo_realtime", "yahoo_chart", "fast_info", "history")
     best_src = next((s for s in priority if s in sources), sources[0])
     src_label = _SOURCE_LABEL.get(best_src, best_src)
     header = f"【即時股價｜{header_ts}（{src_label}）】"
