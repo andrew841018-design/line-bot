@@ -74,23 +74,6 @@ JOB_REGISTRY["monthly-cold-backup-reminder"] = JobSpec(
     description="Day 1 of month 09:00 cold backup reminder",
 )
 
-JOB_REGISTRY["soxl-monitor-code-review"] = JobSpec(
-    command=["/bin/bash", "/Users/andrew/scripts/soxl_monitor_code_review.sh"],
-    cwd=None,
-    env={"PATH": _BASE_PATH, "HOME": "/Users/andrew", "USER": "andrew", "LOGNAME": "andrew"},
-    timeout=600,
-    description="Daily 09:00 soxl code review",
-)
-
-JOB_REGISTRY["soxl-monitor-health-check"] = JobSpec(
-    command=[_LB_VENV, f"{_DATA_ENG}/soxx_tracker/scripts/soxl_monitor_health_check.py"],
-    cwd=f"{_DATA_ENG}/soxx_tracker",
-    env={"PATH": _BASE_PATH, "HOME": "/Users/andrew", "USER": "andrew", "LOGNAME": "andrew"},
-    timeout=60,
-    description="Daily 20:00 soxl health check",
-)
-
-
 JOB_REGISTRY["process-pending-media"] = JobSpec(
     command=[_LB_VENV, f"{_DATA_ENG}/line_bot/jobs/process_pending_media.py"],
     cwd=f"{_DATA_ENG}/line_bot",

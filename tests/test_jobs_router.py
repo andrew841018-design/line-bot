@@ -90,6 +90,24 @@ def test_trigger_unknown_job(client):
     assert r.status_code == 404
 
 
+def test_removed_soxl_code_review_job_stays_unregistered(client):
+    job = "soxl-monitor-code-review"
+    r = client.post(
+        f"/jobs/{job}",
+        headers={"X-Job-Token": _token_for(job)},
+    )
+    assert r.status_code == 404
+
+
+def test_removed_soxl_health_check_job_stays_unregistered(client):
+    job = "soxl-monitor-health-check"
+    r = client.post(
+        f"/jobs/{job}",
+        headers={"X-Job-Token": _token_for(job)},
+    )
+    assert r.status_code == 404
+
+
 def test_trigger_invalid_name_format(client):
     # Uppercase rejected by regex
     r = client.post(
