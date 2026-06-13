@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 
 
@@ -100,3 +101,62 @@ def test_one_off_policy_suppresses_standard_and_shared_with_piggyback(
     assert launchd_spec["kind"] == "mention"
     assert launchd_spec["user_id"] == "U" + "1" * 32
     assert piggyback_spec == {"kind": "text", "text": "媽媽\n請確認時間"}
+
+
+def test_standard_event_all_participants_uses_all_mention(monkeypatch):
+    import event_reminder
+
+    event = _event("E_ALL")
+    event["title"] = "家族聚餐"
+    event["participants"] = json.dumps(["全家"], ensure_ascii=False)
+
+    spec = event_reminder.build_reminder_message_spec(event, 1)
+
+    assert spec["kind"] == "textV2"
+    assert spec["message"]["text"].startswith("{all}\n")
+    assert spec["message"]["substitution"]["all"]["mentionee"] == {"type": "all"}
+    assert spec["fallback_text"].startswith("@all\n")
+
+
+def test_standard_event_participant_alias_uses_user_mention(tmp_path, monkeypatch):
+    import line_mentions
+    import event_reminder
+
+    alias_path = tmp_path / "aliases.json"
+    user_id = "U" + "1" * 32
+    alias_path.write_text(json.dumps({user_id: "媽媽"}, ensure_ascii=False))
+    monkeypatch.setenv("LINE_USER_ALIASES_PATH", str(alias_path))
+    line_mentions.clear_alias_cache()
+
+    event = _event("E_MOM")
+    event["participants"] = json.dumps(["媽媽"], ensure_ascii=False)
+
+    spec = event_reminder.build_reminder_message_spec(event, 1)
+
+    assert spec["kind"] == "textV2"
+    assert spec["message"]["text"].startswith("{p1}\n")
+    assert spec["message"]["substitution"]["p1"]["mentionee"] == {
+        "type": "user",
+        "userId": user_id,
+    }
+    assert spec["fallback_text"].startswith("@媽媽\n")
+
+
+def test_standard_event_unknown_participant_falls_back_to_plain_at(
+    tmp_path, monkeypatch
+):
+    import line_mentions
+    import event_reminder
+
+    alias_path = tmp_path / "aliases.json"
+    alias_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("LINE_USER_ALIASES_PATH", str(alias_path))
+    line_mentions.clear_alias_cache()
+
+    event = _event("E_FRIEND")
+    event["participants"] = json.dumps(["朋友"], ensure_ascii=False)
+
+    spec = event_reminder.build_reminder_message_spec(event, 1)
+
+    assert spec["kind"] == "text"
+    assert spec["text"].startswith("@朋友\n")

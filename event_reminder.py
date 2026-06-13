@@ -26,6 +26,7 @@ from requests.adapters import HTTPAdapter  # noqa: E402
 from urllib3.util.retry import Retry  # noqa: E402
 
 import calendar_db  # noqa: E402
+import line_mentions  # noqa: E402
 
 # 2026-05-29 加 retry 防 transient 5xx 一棒打死（GP2#2）
 # Retry 重試 500/502/503/504；429 monthly quota 不重試（HTTPAdapter 預設只 retry 表列 status）
@@ -286,12 +287,38 @@ def build_reminder_message_spec(
         if plain_text:
             return {"kind": "text", "text": plain_text}
         return None
-    return {"kind": "text", "text": _format_event(e, offset)}
+    text = _format_event(e, offset)
+    targets = line_mentions.event_mention_targets(e)
+    plain_labels = line_mentions.event_plain_labels(e)
+    if targets and allow_mention:
+        message = line_mentions.text_v2_dict(text, targets, plain_labels)
+        return {
+            "kind": "textV2",
+            "message": message,
+            "text": message["text"],
+            "fallback_text": line_mentions.text_with_plain_mentions(
+                text, targets, plain_labels
+            ),
+        }
+    if plain_labels:
+        return {
+            "kind": "text",
+            "text": line_mentions.text_with_plain_mentions(
+                text, targets, plain_labels
+            ),
+        }
+    return {"kind": "text", "text": text}
 
 
 def _send_reminder_message_spec(
     spec: dict, retry_key: str | None = None, fallback_retry_key: str | None = None
 ) -> str:
+    if spec.get("kind") == "textV2":
+        result = _post_result([spec["message"]], retry_key=retry_key)
+        fallback_text = spec.get("fallback_text")
+        if result == POST_REJECT and fallback_text:
+            return _push_result(fallback_text, retry_key=fallback_retry_key)
+        return result
     if spec.get("kind") == "mention":
         result = _push_mention_result(
             spec["text"],
@@ -306,6 +333,27 @@ def _send_reminder_message_spec(
             return _push_result(fallback_text, retry_key=fallback_retry_key)
         return result
     return _push_result(spec["text"], retry_key=retry_key)
+
+
+def sdk_message_from_spec(spec: dict):
+    """Convert reminder delivery spec into LINE SDK message object for reply_token paths."""
+    from linebot.v3.messaging import TextMessage  # type: ignore[import-untyped]
+
+    if spec.get("kind") == "textV2":
+        return line_mentions.sdk_message_from_text_v2_dict(spec["message"])
+    if spec.get("kind") == "mention":
+        message = {
+            "type": "textV2",
+            "text": spec["text"],
+            "substitution": {
+                spec["placeholder"]: {
+                    "type": "mention",
+                    "mentionee": {"type": "user", "userId": spec["user_id"]},
+                }
+            },
+        }
+        return line_mentions.sdk_message_from_text_v2_dict(message)
+    return TextMessage(text=str(spec.get("text") or "")[:5000])
 
 
 def main() -> int:

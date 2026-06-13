@@ -42,15 +42,15 @@ def test_due_reminders_for_reply_returns_due_items(monkeypatch):
     )
 
     assert seen["group_id"] == "G1"
-    assert due == [
-        {
-            "reminder_id": 7,
-            "group_id": "G1",
-            "stage": "1d",
-            "text": f"⏰ 提醒（明天）\n{remind_at} 看醫生",
-            "action": "看醫生",
-        }
-    ]
+    assert len(due) == 1
+    assert due[0]["reminder_id"] == 7
+    assert due[0]["group_id"] == "G1"
+    assert due[0]["stage"] == "1d"
+    assert due[0]["text"] == f"@當事人\n⏰ 提醒（明天）\n{remind_at} 看醫生"
+    assert due[0]["action"] == "看醫生"
+    assert due[0]["message"].type == "textV2"
+    assert due[0]["message"].text == f"{{target}}\n⏰ 提醒（明天）\n{remind_at} 看醫生"
+    assert due[0]["message"].substitution["target"].mentionee.user_id == "U1"
 
 
 def test_mark_reminders_pushed_marks_each_stage(monkeypatch):

@@ -261,6 +261,80 @@ def test_reply_ambiguous_failure_does_not_fallback_push(monkeypatch):
     assert ids == ["M1"]
 
 
+def test_fast_path_uses_reminder_push_mention_message_and_marks(monkeypatch):
+    """Next normal text message should be able to carry due reminder_push items."""
+    import main
+    from linebot.v3.messaging import (
+        MentionSubstitutionObject,
+        TextMessageV2,
+        UserMentionTarget,
+    )
+
+    captured: dict = {}
+    marked: list[tuple[int, str]] = []
+    reminder_message = TextMessageV2(
+        text="{target}\n⏰ 提醒（明天）\n2026-06-16 08:00 禁食",
+        substitution={
+            "target": MentionSubstitutionObject(
+                mentionee=UserMentionTarget(userId="U1")
+            )
+        },
+    )
+
+    class _FakeMessagingApi:
+        def __init__(self, _):
+            pass
+
+        def reply_message(self, req):
+            captured["messages"] = req.messages
+            captured["reply_token"] = req.reply_token
+
+    class _FakeApiClient:
+        def __init__(self, _cfg):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    import calendar_db
+    import reminder_push
+
+    monkeypatch.setattr(main.settings, "bot_muted", False)
+    monkeypatch.setattr(calendar_db, "REMINDER_OFFSETS", (1,))
+    monkeypatch.setattr(calendar_db, "list_due_for_reminder", lambda *a, **kw: [])
+    monkeypatch.setattr(
+        reminder_push,
+        "due_reminders_for_reply",
+        lambda *a, **kw: [
+            {
+                "reminder_id": 21,
+                "group_id": "G1",
+                "stage": "3d",
+                "text": "@當事人\n⏰ 提醒（3 天後）\n2026-06-16 08:00 禁食",
+                "message": reminder_message,
+                "action": "禁食",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        reminder_push,
+        "mark_reminders_pushed",
+        lambda pushes: marked.extend(pushes) or len(pushes),
+    )
+    monkeypatch.setattr(main, "ApiClient", _FakeApiClient)
+    monkeypatch.setattr(main, "MessagingApi", _FakeMessagingApi)
+    monkeypatch.setattr(main, "_get_line_config", lambda: None)
+
+    assert main._try_piggyback_reminders_fast_path("reply-token", "G1") is True
+
+    assert captured["reply_token"] == "reply-token"
+    assert captured["messages"] == [reminder_message]
+    assert marked == [(21, "3d")]
+
+
 def test_reply_success_commits_pending_piggyback(monkeypatch):
     import main
     import pending_store

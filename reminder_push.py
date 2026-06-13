@@ -28,6 +28,7 @@ from linebot.v3.messaging import (
 )
 
 import memory
+import line_mentions
 from line_token_refresh import get_line_token
 from config import settings
 
@@ -46,7 +47,9 @@ def _line_access_token() -> str:
         return settings.line_channel_access_token
 
 
-def _push_to_group(group_id: str, text: str, max_retries: int = 3) -> bool:
+def _push_to_group(
+    group_id: str, text: str, max_retries: int = 3, message: object | None = None
+) -> bool:
     """推到 LINE 群組。失敗回 False。
 
     2026-05-29 加 retry 防 transient 5xx（GP2#2）：
@@ -60,7 +63,7 @@ def _push_to_group(group_id: str, text: str, max_retries: int = 3) -> bool:
                 MessagingApi(api_client).push_message(
                     PushMessageRequest(
                         to=group_id,
-                        messages=[TextMessage(text=text[:4900])],
+                        messages=[message or TextMessage(text=text[:4900])],
                     )
                 )
             return True
@@ -148,6 +151,18 @@ def _format_push_text(r: dict, stage: str) -> str:
     return f"⏰ 提醒{label}\n{dt.strftime('%Y-%m-%d %H:%M')} {r['action']}"
 
 
+def _build_push_text_and_message(r: dict, stage: str) -> tuple[str, object]:
+    body = _format_push_text(r, stage)
+    targets = line_mentions.reminder_actor_targets(str(r.get("user_id") or ""))
+    if not targets:
+        return body, TextMessage(text=body[:4900])
+    message_dict = line_mentions.text_v2_dict(body, targets)
+    return (
+        line_mentions.text_with_plain_mentions(body, targets),
+        line_mentions.sdk_message_from_text_v2_dict(message_dict),
+    )
+
+
 def _due_reminder_items(
     group_id: str | None = None,
     limit: int = 10_000,
@@ -162,12 +177,14 @@ def _due_reminder_items(
         stage = _decide_stage(r, now)
         if stage is None:
             continue
+        text, message = _build_push_text_and_message(r, stage)
         due.append(
             {
                 "reminder_id": r["reminder_id"],
                 "group_id": r["group_id"],
                 "stage": stage,
-                "text": _format_push_text(r, stage),
+                "text": text,
+                "message": message,
                 "action": r["action"],
             }
         )
@@ -216,7 +233,7 @@ def push_reminders(dry_run: bool = False) -> int:
             sent += 1
             continue
 
-        ok = _push_to_group(group_id, text)
+        ok = _push_to_group(group_id, text, message=item.get("message"))
         if ok:
             memory.mark_reminder_pushed(reminder_id, stage)
             logger.info(

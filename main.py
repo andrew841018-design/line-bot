@@ -1359,11 +1359,20 @@ def _try_piggyback_reminders_fast_path(
             for e in calendar_db.list_due_for_reminder(group_id, days_ahead=offset):
                 if len(messages) >= 5:
                     break
-                spec = _er.build_reminder_message_spec(e, offset, allow_mention=False)
+                spec = _er.build_reminder_message_spec(e, offset, allow_mention=True)
                 if spec is None:
                     continue
-                messages.append(TextMessage(text=spec["text"]))
+                messages.append(_er.sdk_message_from_spec(spec))
                 pending.append((e["event_id"], offset))
+        import reminder_push as _rp
+        pending_pushes: list[tuple[int, str]] = []
+        if len(messages) < 5:
+            remaining = 5 - len(messages)
+            for item in _rp.due_reminders_for_reply(group_id, limit=remaining):
+                messages.append(
+                    item.get("message") or TextMessage(text=item["text"][:5000])
+                )
+                pending_pushes.append((item["reminder_id"], item["stage"]))
         if not messages:
             return False
         try:
@@ -1381,9 +1390,11 @@ def _try_piggyback_reminders_fast_path(
             return False
         for ev_id, off in pending:
             calendar_db.mark_reminded(ev_id, off, group_id)
+        if pending_pushes:
+            _rp.mark_reminders_pushed(pending_pushes)
         logger.info(
-            "reminder fast-path: pushed %d reminders via reply_token group=%s",
-            len(pending), group_id,
+            "reminder fast-path: pushed %d calendar + %d reminder_push via reply_token group=%s",
+            len(pending), len(pending_pushes), group_id,
         )
         return True
     except Exception as e:
@@ -5472,11 +5483,11 @@ def _reply(
                         if len(messages_to_send) >= 5:
                             break
                         spec = _er.build_reminder_message_spec(
-                            e, offset, allow_mention=False
+                            e, offset, allow_mention=True
                         )
                         if spec is None:
                             continue
-                        messages_to_send.append(TextMessage(text=spec["text"]))
+                        messages_to_send.append(_er.sdk_message_from_spec(spec))
                         pending_reminders.append((e["event_id"], offset))
             except Exception as e:
                 logger.warning("reminder piggyback skip: %s", e)
@@ -5491,7 +5502,9 @@ def _reply(
                     for item in _rp.due_reminders_for_reply(
                         group_id, limit=remaining
                     ):
-                        messages_to_send.append(TextMessage(text=item["text"][:5000]))
+                        messages_to_send.append(
+                            item.get("message") or TextMessage(text=item["text"][:5000])
+                        )
                         pending_reminder_pushes.append(
                             (item["reminder_id"], item["stage"])
                         )
