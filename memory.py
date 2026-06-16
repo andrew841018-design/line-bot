@@ -13,6 +13,7 @@ SQLite-backed 對話 context + 長期記憶 + 過濾器規則。
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import sqlite3
 import threading
@@ -119,6 +120,7 @@ def _init_db() -> None:
                 created_at      INTEGER NOT NULL,
                 status          TEXT NOT NULL DEFAULT 'pending',
                 source_text     TEXT,
+                mention_aliases TEXT NOT NULL DEFAULT '[]',
                 last_pushed_at  INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_reminders_remind_at
@@ -221,6 +223,11 @@ def _init_db() -> None:
         ):
             if col not in rcols:
                 c.execute(f"ALTER TABLE reminders ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0")
+        if "mention_aliases" not in rcols:
+            c.execute(
+                "ALTER TABLE reminders ADD COLUMN mention_aliases "
+                "TEXT NOT NULL DEFAULT '[]'"
+            )
         # persona_notes schema migration: add source column if missing
         # 2026-05-08：區分 'rule_violation'（既有黑名單觸發）vs 'organic'（user 真實糾正）
         pn_cols = [r[1] for r in c.execute("PRAGMA table_info(persona_notes)").fetchall()]
@@ -781,6 +788,7 @@ def add_reminder(
     action: str,
     remind_at: int,
     source_text: str = "",
+    mention_aliases: list[str] | None = None,
 ) -> int | None:
     """新增 reminder。remind_at = epoch seconds。
 
@@ -791,39 +799,79 @@ def add_reminder(
     now = int(time.time())
     action = _normalize_reminder_text(action)
     source_text = _normalize_reminder_text(source_text)
+    mentions = _normalize_mention_aliases(mention_aliases)
+    mentions_json = json.dumps(mentions, ensure_ascii=False)
     with _lock, _conn() as c:
         # 去重
         existing = c.execute(
-            "SELECT reminder_id FROM reminders "
+            "SELECT reminder_id, COALESCE(mention_aliases, '[]') FROM reminders "
             "WHERE group_id = ? AND action = ? AND status = 'pending' "
             "AND ABS(remind_at - ?) < 3600",
             (group_id, action, remind_at),
         ).fetchone()
         if existing:
+            merged_mentions = _merge_mention_aliases_json(existing[1], mentions)
+            if merged_mentions != existing[1]:
+                c.execute(
+                    "UPDATE reminders SET mention_aliases = ? WHERE reminder_id = ?",
+                    (merged_mentions, existing[0]),
+                )
             return None
         nearby = c.execute(
-            "SELECT reminder_id, action, COALESCE(source_text, '') "
+            "SELECT reminder_id, action, COALESCE(source_text, ''), "
+            "COALESCE(mention_aliases, '[]') "
             "FROM reminders WHERE group_id = ? AND status = 'pending' "
             "AND ABS(remind_at - ?) < 1800",
             (group_id, remind_at),
         ).fetchall()
-        for existing_id, existing_action, existing_source in nearby:
+        for existing_id, existing_action, existing_source, existing_mentions in nearby:
             merged_action = _merge_reminder_action(existing_action, action)
             if not merged_action:
                 continue
             merged_source = _merge_reminder_source(existing_source, source_text)
+            merged_mentions = _merge_mention_aliases_json(existing_mentions, mentions)
             c.execute(
-                "UPDATE reminders SET action = ?, source_text = ? "
+                "UPDATE reminders SET action = ?, source_text = ?, mention_aliases = ? "
                 "WHERE reminder_id = ?",
-                (merged_action, merged_source, existing_id),
+                (merged_action, merged_source, merged_mentions, existing_id),
             )
             return existing_id
         c.execute(
             "INSERT INTO reminders(group_id, user_id, action, remind_at, "
-            "created_at, status, source_text) VALUES (?, ?, ?, ?, ?, 'pending', ?)",
-            (group_id, user_id, action, remind_at, now, source_text),
+            "created_at, status, source_text, mention_aliases) "
+            "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+            (group_id, user_id, action, remind_at, now, source_text, mentions_json),
         )
         return c.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def _normalize_mention_aliases(aliases: list[str] | None) -> list[str]:
+    out: list[str] = []
+    for alias in aliases or []:
+        value = str(alias or "").strip().lstrip("@").strip()
+        if value and value not in out:
+            out.append(value)
+    return out
+
+
+def _load_mention_aliases(value: str | None) -> list[str]:
+    if not value:
+        return []
+    try:
+        loaded = json.loads(value)
+    except Exception:
+        return []
+    if not isinstance(loaded, list):
+        return []
+    return _normalize_mention_aliases([str(item) for item in loaded])
+
+
+def _merge_mention_aliases_json(existing_json: str, new_aliases: list[str]) -> str:
+    merged = _normalize_mention_aliases([
+        *_load_mention_aliases(existing_json),
+        *new_aliases,
+    ])
+    return json.dumps(merged, ensure_ascii=False)
 
 
 def _normalize_reminder_text(text: str | None) -> str:
@@ -1036,7 +1084,7 @@ def list_pending_reminders(
             if group_id:
                 rows = c.execute(
                     "SELECT reminder_id, group_id, user_id, action, remind_at, "
-                    "created_at, source_text FROM reminders "
+                    "created_at, source_text, mention_aliases FROM reminders "
                     "WHERE status='pending' AND group_id=? AND remind_at BETWEEN ? AND ? "
                     "ORDER BY remind_at",
                     (group_id, lo, hi),
@@ -1044,7 +1092,7 @@ def list_pending_reminders(
             else:
                 rows = c.execute(
                     "SELECT reminder_id, group_id, user_id, action, remind_at, "
-                    "created_at, source_text FROM reminders "
+                    "created_at, source_text, mention_aliases FROM reminders "
                     "WHERE status='pending' AND remind_at BETWEEN ? AND ? "
                     "ORDER BY remind_at",
                     (lo, hi),
@@ -1053,7 +1101,7 @@ def list_pending_reminders(
             if group_id:
                 rows = c.execute(
                     "SELECT reminder_id, group_id, user_id, action, remind_at, "
-                    "created_at, source_text FROM reminders "
+                    "created_at, source_text, mention_aliases FROM reminders "
                     "WHERE status='pending' AND group_id=? AND remind_at >= ? "
                     "ORDER BY remind_at",
                     (group_id, now - 86400),
@@ -1061,7 +1109,7 @@ def list_pending_reminders(
             else:
                 rows = c.execute(
                     "SELECT reminder_id, group_id, user_id, action, remind_at, "
-                    "created_at, source_text FROM reminders "
+                    "created_at, source_text, mention_aliases FROM reminders "
                     "WHERE status='pending' AND remind_at >= ? "
                     "ORDER BY remind_at",
                     (now - 86400,),
@@ -1075,6 +1123,7 @@ def list_pending_reminders(
             "remind_at": r[4],
             "created_at": r[5],
             "source_text": r[6] or "",
+            "mention_aliases": _load_mention_aliases(r[7]),
         }
         for r in rows
     ]
@@ -1113,7 +1162,8 @@ def list_pending_reminders_full(group_id: str | None = None) -> list[dict]:
                 "SELECT reminder_id, group_id, user_id, action, remind_at, "
                 "created_at, source_text, last_pushed_at, weekly_count, "
                 "last_weekly_at, pushed_3d, pushed_1d, "
-                "pushed_4hr, pushed_2hr, pushed_1hr, pushed_now "
+                "pushed_4hr, pushed_2hr, pushed_1hr, pushed_now, "
+                "mention_aliases "
                 "FROM reminders WHERE status='pending' AND group_id=? AND remind_at >= ? "
                 "ORDER BY remind_at",
                 (group_id, now - 86400),
@@ -1123,7 +1173,8 @@ def list_pending_reminders_full(group_id: str | None = None) -> list[dict]:
                 "SELECT reminder_id, group_id, user_id, action, remind_at, "
                 "created_at, source_text, last_pushed_at, weekly_count, "
                 "last_weekly_at, pushed_3d, pushed_1d, "
-                "pushed_4hr, pushed_2hr, pushed_1hr, pushed_now "
+                "pushed_4hr, pushed_2hr, pushed_1hr, pushed_now, "
+                "mention_aliases "
                 "FROM reminders WHERE status='pending' AND remind_at >= ? "
                 "ORDER BY remind_at",
                 (now - 86400,),
@@ -1137,6 +1188,7 @@ def list_pending_reminders_full(group_id: str | None = None) -> list[dict]:
             "last_weekly_at": r[9], "pushed_3d": r[10], "pushed_1d": r[11],
             "pushed_4hr": r[12], "pushed_2hr": r[13],
             "pushed_1hr": r[14], "pushed_now": r[15],
+            "mention_aliases": _load_mention_aliases(r[16]),
         }
         for r in rows
     ]

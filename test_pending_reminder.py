@@ -119,7 +119,11 @@ def test_maybe_extract_subjectless_medical_uses_sender_alias(temp_db, monkeypatc
     import gemini_client
 
     monkeypatch.setattr(gemini_client, "extract_reminder", lambda *a, **k: None)
-    monkeypatch.setattr(main, "_alias_from_user_id", lambda uid: "媽媽" if uid == "U_MOM" else "")
+    monkeypatch.setattr(
+        main,
+        "_alias_from_user_id",
+        lambda uid: "媽媽" if uid == "U_MOM" else "",
+    )
 
     main._maybe_extract_reminder(
         "明天早上十點半看台大陳敏惠牙醫師", "G1", "U_MOM", "m1"
@@ -152,7 +156,11 @@ def test_maybe_extract_rewrites_first_person_action_to_sender_alias(temp_db, mon
             "minute": 30,
         },
     )
-    monkeypatch.setattr(main, "_alias_from_user_id", lambda uid: "媽媽" if uid == "U_MOM" else "")
+    monkeypatch.setattr(
+        main,
+        "_alias_from_user_id",
+        lambda uid: "媽媽" if uid == "U_MOM" else "",
+    )
 
     main._maybe_extract_reminder(
         "星期四早上十點半看台大陳敏惠牙醫師", "G1", "U_MOM", "m1"
@@ -164,6 +172,49 @@ def test_maybe_extract_rewrites_first_person_action_to_sender_alias(temp_db, mon
         ).fetchone()
     assert row is not None
     assert row[0] == "媽媽看台大陳敏惠牙醫師"
+
+
+def test_maybe_extract_medical_prep_inherits_patient_and_companion(temp_db, monkeypatch):
+    """Medical prep reminders must keep patient and companion roles from context."""
+    import main
+    import memory
+    import gemini_client
+
+    future = datetime.now() + timedelta(days=2)
+    action = "正子斷層掃描當天 08:00 開始禁食 6 小時，只能喝水"
+    monkeypatch.setattr(
+        gemini_client,
+        "extract_reminder",
+        lambda *a, **k: {
+            "action": action,
+            "year": future.year,
+            "month": future.month,
+            "day": future.day,
+            "hour": 8,
+            "minute": 0,
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "_alias_from_user_id",
+        lambda uid: "媽媽" if uid == "U_MOM" else "",
+    )
+
+    text = (
+        f"{future.month}月{future.day}日星期二下午兩點前要到台大醫院東址地下1樓"
+        "做正子斷層掃描。聖雅要陪我去，大約需要兩個多小時。"
+        "當天早上8:00開始禁食 6小時。只能喝水。"
+    )
+    main._maybe_extract_reminder(text, "G1", "U_MOM", "m1")
+
+    with memory._conn() as c:
+        row = c.execute(
+            "SELECT action, mention_aliases FROM reminders "
+            "WHERE group_id='G1' AND status='pending'"
+        ).fetchone()
+    assert row is not None
+    assert row[0] == f"媽媽{action}（黃聖雅陪同）"
+    assert row[1] == '["媽媽", "黃聖雅"]'
 
 
 def _future_tuesday_before_thursday() -> tuple[datetime, datetime]:
@@ -494,6 +545,25 @@ def test_add_reminder_normalizes_common_asr_errors(temp_db):
         ).fetchone()
     assert action == "去教會4樓參加嗎哪小組的查經"
     assert source_text == "去教會4樓參加嗎哪小組的查經"
+
+
+def test_add_reminder_persists_structured_mention_aliases(temp_db):
+    import memory
+
+    future = datetime.now() + timedelta(days=1)
+
+    memory.add_reminder(
+        "G1",
+        "U_MOM",
+        "正子斷層掃描當天 08:00 開始禁食",
+        int(future.timestamp()),
+        mention_aliases=["媽媽", "黃聖雅"],
+    )
+
+    rows = memory.list_pending_reminders_full("G1")
+
+    assert len(rows) == 1
+    assert rows[0]["mention_aliases"] == ["媽媽", "黃聖雅"]
 
 
 def test_add_reminder_merges_mana_group_duplicate_with_details(temp_db):

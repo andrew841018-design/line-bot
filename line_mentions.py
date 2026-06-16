@@ -140,18 +140,54 @@ def event_plain_labels(event: dict) -> list[str]:
     return [f"@{name}" for name in names if name]
 
 
-def reminder_actor_targets(user_id: str) -> list[MentionTarget]:
-    if not user_id:
-        return []
-    label = alias_for_user_id(user_id) or "當事人"
-    return [
+def reminder_actor_targets(
+    user_id: str, mention_aliases: list[str] | str | None = None, text: str = ""
+) -> list[MentionTarget]:
+    if isinstance(mention_aliases, str) and not text:
+        text = mention_aliases
+        mention_aliases = None
+    seen_user_ids: set[str] = set()
+    targets: list[MentionTarget] = []
+    if user_id:
+        label = alias_for_user_id(user_id) or "當事人"
+        targets.append(
+            MentionTarget(
+                key="target",
+                kind="user",
+                user_id=user_id,
+                label=f"@{label}",
+            )
+        )
+        seen_user_ids.add(user_id)
+
+    for alias in mention_aliases or []:
+        _append_alias_target(targets, seen_user_ids, str(alias))
+
+    for extra_user_id, alias in load_user_aliases().items():
+        if not alias or extra_user_id in seen_user_ids:
+            continue
+        if alias not in text:
+            continue
+        _append_alias_target(targets, seen_user_ids, alias)
+    return targets
+
+
+def _append_alias_target(
+    targets: list[MentionTarget], seen_user_ids: set[str], alias: str
+) -> None:
+    name = _clean_name(alias)
+    user_id = user_id_for_alias(name)
+    if not name or not user_id or user_id in seen_user_ids:
+        return
+    targets.append(
         MentionTarget(
-            key="target",
+            key=f"p{len(targets) + 1}",
             kind="user",
             user_id=user_id,
-            label=f"@{label}",
+            label=f"@{name}",
         )
-    ]
+    )
+    seen_user_ids.add(user_id)
 
 
 def _template_prefix(

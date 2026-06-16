@@ -143,17 +143,47 @@ _STAGE_LABELS = {
     "1hr": "（1 小時後）",
     "now": "（**現在 / 即將到時**）",
 }
+_DAY_BASED_STAGES = {"weekly", "3d", "1d"}
 
 
-def _format_push_text(r: dict, stage: str) -> str:
+def _stage_label(stage: str, remind_at: int, now: int | None = None) -> str:
+    """Return a human label based on the target calendar date, not the window."""
+    if stage in _DAY_BASED_STAGES:
+        now_ts = int(datetime.now().timestamp()) if now is None else now
+        delta_days = (
+            datetime.fromtimestamp(remind_at).date()
+            - datetime.fromtimestamp(now_ts).date()
+        ).days
+        if delta_days == 0:
+            return "（今天）"
+        if delta_days == 1:
+            return "（明天）"
+        if delta_days == 2:
+            return "（後天）"
+        if delta_days == 7:
+            return "（1 週後）"
+        if delta_days == 30:
+            return "（1 個月後）"
+        if delta_days > 0:
+            return f"（{delta_days} 天後）"
+    return _STAGE_LABELS.get(stage, "")
+
+
+def _format_push_text(r: dict, stage: str, now: int | None = None) -> str:
     dt = datetime.fromtimestamp(r["remind_at"])
-    label = _STAGE_LABELS.get(stage, "")
+    label = _stage_label(stage, r["remind_at"], now=now)
     return f"⏰ 提醒{label}\n{dt.strftime('%Y-%m-%d %H:%M')} {r['action']}"
 
 
-def _build_push_text_and_message(r: dict, stage: str) -> tuple[str, object]:
-    body = _format_push_text(r, stage)
-    targets = line_mentions.reminder_actor_targets(str(r.get("user_id") or ""))
+def _build_push_text_and_message(
+    r: dict, stage: str, now: int | None = None
+) -> tuple[str, object]:
+    body = _format_push_text(r, stage, now=now)
+    targets = line_mentions.reminder_actor_targets(
+        str(r.get("user_id") or ""),
+        r.get("mention_aliases") or [],
+        str(r.get("action") or ""),
+    )
     if not targets:
         return body, TextMessage(text=body[:4900])
     message_dict = line_mentions.text_v2_dict(body, targets)
@@ -177,7 +207,7 @@ def _due_reminder_items(
         stage = _decide_stage(r, now)
         if stage is None:
             continue
-        text, message = _build_push_text_and_message(r, stage)
+        text, message = _build_push_text_and_message(r, stage, now=now)
         due.append(
             {
                 "reminder_id": r["reminder_id"],

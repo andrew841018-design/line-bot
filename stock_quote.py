@@ -130,8 +130,11 @@ _NUMERIC_STOCK_CONTEXT_RE = re.compile(
 )
 
 _TWSE_4DIGIT_RE = re.compile(r"(?<!\d)(\d{4})(?!\d)")
-_TW_FUTURE_SYMBOL_RE = re.compile(r"^W[A-Z]{2,4}[FGHJKMNQUVXZ]\d$")
-_TW_FUTURE_SYMBOL_SCAN_RE = re.compile(r"(?<![A-Z0-9])(W[A-Z]{2,4}[FGHJKMNQUVXZ]\d)(?![A-Z0-9])")
+_TW_FUTURE_ALIAS_SYMBOL_RE = re.compile(r"^W[A-Z]{2,4}[&@]$")
+_TW_FUTURE_SYMBOL_RE = re.compile(r"^W[A-Z]{2,4}(?:[FGHJKMNQUVXZ]\d|[&@])$")
+_TW_FUTURE_SYMBOL_SCAN_RE = re.compile(
+    r"(?<![A-Z0-9])(W[A-Z]{2,4}(?:[FGHJKMNQUVXZ]\d|[&@]))(?![A-Z0-9])"
+)
 _QUOTE_CONTEXT_RE = re.compile(
     r"(股價|報價|價格|現價|市價|即時|漲跌|漲幅|跌幅|夜盤|近月|期貨|"
     r"\bADR\b|\bquote\b|\bprice\b|多少錢|幾塊|幾元|"
@@ -151,6 +154,15 @@ _COUNTDOWN_DATE_RE = re.compile(
 )
 _ADR_RE = re.compile(r"\bADR\b|美國存託", re.IGNORECASE)
 _FUTURE_RE = re.compile(r"期貨|近月|夜盤|\bfuture\b|\bfutures\b", re.IGNORECASE)
+_DEFAULT_TW_QUOTE_PACKAGE_RE = re.compile(
+    r"(?:報價|行情)|(?:台股|台灣|大盤|加權|台指|夜盤).{0,8}(?:多少|價格|現價)",
+    re.IGNORECASE,
+)
+_NON_TW_DEFAULT_QUOTE_RE = re.compile(
+    r"美股|美國|納斯達克|NASDAQ|標普|道瓊|費半|黃金|金價|外匯|美元|"
+    r"BTC|BITCOIN|加密|虛擬貨幣",
+    re.IGNORECASE,
+)
 
 _TW_TZ = ZoneInfo("Asia/Taipei")
 _DAY_START_HOUR = 8
@@ -177,6 +189,9 @@ _TW_FUTURE_MAP = {
     "2330.TW": ("CDF", "台積電近月期貨"),
     "2303.TW": ("CCF", "聯電近月期貨"),
 }
+_DEFAULT_TW_STOCK_SYMBOL = "2330.TW"
+_DEFAULT_TW_INDEX_SYMBOL = "^TWII"
+_TAIEX_FUTURE_NEAR_SYMBOL = "WTX&"
 
 # 抓 Yahoo 即時頁的瀏覽器 UA（不裝得太誇張，避免被擋）
 _YAHOO_UA = (
@@ -891,6 +906,12 @@ def _parse_yahoo_chart_json(payload: dict, symbol: str) -> Optional[dict]:
 # ── public quote getters: realtime → fast_info → history ─────────────────────
 
 
+def _yahoo_tw_realtime_url(symbol: str) -> str:
+    if _TW_FUTURE_ALIAS_SYMBOL_RE.match(symbol.upper()):
+        return f"https://tw.stock.yahoo.com/future/{symbol}"
+    return f"https://tw.stock.yahoo.com/quote/{symbol}"
+
+
 def get_realtime_quote(symbol: str) -> Optional[dict]:
     """從 Yahoo 即時頁抓報價。失敗 / 解析不到回 None。"""
     if not symbol:
@@ -905,7 +926,7 @@ def get_realtime_quote(symbol: str) -> Optional[dict]:
             return chart_parsed
 
     if is_tw:
-        url = f"https://tw.stock.yahoo.com/quote/{symbol}"
+        url = _yahoo_tw_realtime_url(symbol)
     else:
         url = f"https://finance.yahoo.com/quote/{symbol}"
 
@@ -1312,6 +1333,46 @@ def _quote_specs_for_symbol(
     mapped_adr = _TW_ADR_MAP.get(base)
     mapped_future = _TW_FUTURE_MAP.get(base)
 
+    if base == _DEFAULT_TW_STOCK_SYMBOL and not wants_adr and not wants_future:
+        if not night_mode:
+            specs.append(_base_quote_spec(base))
+            specs.append(
+                _make_quote_spec(
+                    _DEFAULT_TW_INDEX_SYMBOL,
+                    "加權指數",
+                    "指數",
+                    "index",
+                    f"base:{_DEFAULT_TW_INDEX_SYMBOL}",
+                )
+            )
+            return specs
+
+        specs.append(
+            _make_quote_spec(
+                _TAIEX_FUTURE_NEAR_SYMBOL,
+                "台指期近月",
+                "近月期貨",
+                "TWD",
+                "future:WTX",
+            )
+        )
+        if mapped_future:
+            product_code, future_label = mapped_future
+            for fut_symbol in _candidate_future_symbols(product_code, now, months_ahead=4):
+                specs.append(
+                    _make_quote_spec(
+                        fut_symbol,
+                        future_label,
+                        "近月期貨",
+                        "TWD",
+                        f"future:{product_code}",
+                    )
+                )
+        if mapped_adr:
+            adr_symbol, adr_label = mapped_adr
+            specs.append(_make_quote_spec(adr_symbol, adr_label, "ADR", "USD", f"adr:{base}"))
+        return specs
+
     if not night_mode and not wants_adr and not wants_future:
         specs.append(_base_quote_spec(base))
         return specs
@@ -1442,6 +1503,20 @@ def _quote_market_date(quote: dict) -> str:
     return ""
 
 
+def _is_default_tw_quote_package_request(text: str, symbols: list[str]) -> bool:
+    if not _DEFAULT_TW_QUOTE_PACKAGE_RE.search(text or ""):
+        return False
+    if not symbols and _NON_TW_DEFAULT_QUOTE_RE.search(text or ""):
+        return False
+
+    default_symbols = {
+        _DEFAULT_TW_STOCK_SYMBOL,
+        _DEFAULT_TW_INDEX_SYMBOL,
+        _TAIEX_FUTURE_NEAR_SYMBOL,
+    }
+    return all(symbol in default_symbols for symbol in symbols)
+
+
 def _contextual_mode_label(
     *,
     night_mode: bool,
@@ -1479,9 +1554,10 @@ def get_contextual_quotes_text(
 ) -> Optional[str]:
     """Context-aware quote fetch for chat.
 
-    Daytime in Taipei returns the discussed stock. Nighttime prefers the mapped
-    ADR and nearest monthly Taiwan stock futures, when known. Context is used
-    only when the new message is clearly asking for a quote.
+    Daytime in Taipei expands the default Taiwan quote package to 2330.TW plus
+    TAIEX. Nighttime expands it to Taiwan index futures, Taiwan stock futures,
+    and mapped ADRs when known. Context is used only when the new message is
+    clearly asking for a quote.
     """
     if total_timeout_s <= 0:
         return None
@@ -1556,6 +1632,8 @@ def _contextual_quote_symbols(text: str, *, context: list | None = None) -> list
     symbols = detect_symbols(text)
     if not symbols and _QUOTE_CONTEXT_RE.search(text or ""):
         symbols = _infer_context_symbols(context)
+    if _is_default_tw_quote_package_request(text or "", symbols):
+        return [_DEFAULT_TW_STOCK_SYMBOL]
     return symbols
 
 

@@ -53,6 +53,74 @@ def test_due_reminders_for_reply_returns_due_items(monkeypatch):
     assert due[0]["message"].substitution["target"].mentionee.user_id == "U1"
 
 
+def test_due_reminder_label_uses_calendar_day_not_stage_window(monkeypatch):
+    now_dt = reminder_push.datetime(2026, 6, 14, 9, 0)
+    target_dt = reminder_push.datetime(2026, 6, 16, 8, 0)
+    now = int(now_dt.timestamp())
+
+    def fake_list(group_id=None):
+        return [_row(now, remind_at=int(target_dt.timestamp()))]
+
+    monkeypatch.setattr(reminder_push.memory, "list_pending_reminders_full", fake_list)
+
+    due = reminder_push.due_reminders_for_reply("G1", limit=2, now=now)
+
+    assert len(due) == 1
+    assert due[0]["stage"] == "1d"
+    assert due[0]["text"].startswith("@當事人\n⏰ 提醒（後天）\n")
+
+
+def test_due_reminder_mentions_companion_alias_from_action(monkeypatch):
+    now = 1_800_000_000
+    action = "曾美惠正子斷層掃描當天 08:00 開始禁食 6 小時，只能喝水（黃聖雅陪同）"
+
+    def fake_list(group_id=None):
+        return [_row(now, user_id="U_MOM", action=action)]
+
+    monkeypatch.setattr(reminder_push.memory, "list_pending_reminders_full", fake_list)
+    monkeypatch.setattr(
+        reminder_push.line_mentions,
+        "load_user_aliases",
+        lambda: {"U_MOM": "媽媽", "U_SIS": "黃聖雅"},
+    )
+
+    due = reminder_push.due_reminders_for_reply("G1", limit=2, now=now)
+
+    assert len(due) == 1
+    assert due[0]["text"].startswith("@媽媽 @黃聖雅\n⏰ 提醒（明天）\n")
+    assert due[0]["message"].text.startswith("{target} {p2}\n⏰ 提醒（明天）\n")
+    assert due[0]["message"].substitution["target"].mentionee.user_id == "U_MOM"
+    assert due[0]["message"].substitution["p2"].mentionee.user_id == "U_SIS"
+
+
+def test_due_reminder_mentions_structured_aliases_without_action_names(monkeypatch):
+    now = 1_800_000_000
+
+    def fake_list(group_id=None):
+        return [
+            _row(
+                now,
+                user_id="U_MOM",
+                action="正子斷層掃描當天 08:00 開始禁食 6 小時，只能喝水",
+                mention_aliases=["媽媽", "黃聖雅"],
+            )
+        ]
+
+    monkeypatch.setattr(reminder_push.memory, "list_pending_reminders_full", fake_list)
+    monkeypatch.setattr(
+        reminder_push.line_mentions,
+        "load_user_aliases",
+        lambda: {"U_MOM": "媽媽", "U_SIS": "黃聖雅"},
+    )
+
+    due = reminder_push.due_reminders_for_reply("G1", limit=2, now=now)
+
+    assert len(due) == 1
+    assert due[0]["text"].startswith("@媽媽 @黃聖雅\n⏰ 提醒（明天）\n")
+    assert due[0]["message"].substitution["target"].mentionee.user_id == "U_MOM"
+    assert due[0]["message"].substitution["p2"].mentionee.user_id == "U_SIS"
+
+
 def test_mark_reminders_pushed_marks_each_stage(monkeypatch):
     marked = []
     monkeypatch.setattr(

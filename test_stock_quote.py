@@ -399,6 +399,23 @@ def test_get_realtime_quote_tw_future_uses_tw_yahoo():
     assert captured_urls == ["https://tw.stock.yahoo.com/quote/WCDFM6"]
 
 
+def test_get_realtime_quote_tw_future_alias_uses_future_page():
+    captured_urls = []
+
+    def fake_fetch(url):
+        captured_urls.append(url)
+        return _TW_SAMPLE_HTML
+
+    with patch.object(stock_quote, "_fetch_yahoo_html", side_effect=fake_fetch):
+        q = stock_quote.get_realtime_quote("WTX&")
+
+    assert q is not None
+    assert q["symbol"] == "WTX&"
+    assert q["source"] == "yahoo_realtime"
+    assert q["instrument_type"] == "future"
+    assert captured_urls == ["https://tw.stock.yahoo.com/future/WTX&"]
+
+
 def test_get_realtime_quote_returns_none_when_fetch_fails():
     with patch.object(stock_quote, "_fetch_yahoo_html", return_value=None):
         assert stock_quote.get_realtime_quote("2330.TW") is None
@@ -699,7 +716,31 @@ def test_detect_symbols_gold_without_market_context_ignored():
     assert stock_quote.detect_symbols("When it rains gold, put out the bucket") == []
 
 
-def test_contextual_quotes_daytime_uses_stock_only():
+def test_contextual_quotes_daytime_uses_stock_and_taiex():
+    now = datetime(2026, 6, 5, 10, 0, tzinfo=ZoneInfo("Asia/Taipei"))
+    calls = []
+
+    def fake_quote(symbol):
+        calls.append(symbol)
+        if symbol == "2330.TW":
+            return _quote(symbol, 2325.0)
+        if symbol == "^TWII":
+            return _quote(symbol, 21650.0)
+        return None
+
+    with patch.object(stock_quote, "get_realtime_quote", side_effect=fake_quote):
+        out = stock_quote.get_contextual_quotes_text("台積電今天怎麼看", now=now)
+
+    assert out is not None
+    assert set(calls) == {"2330.TW", "^TWII"}
+    assert "2330.TW" in out
+    assert "^TWII" in out
+    assert "加權指數" in out
+    assert "TSM" not in out
+    assert "近月期貨" not in out
+
+
+def test_contextual_quotes_generic_quote_daytime_uses_tw_default_package():
     now = datetime(2026, 6, 5, 10, 0, tzinfo=ZoneInfo("Asia/Taipei"))
     calls = []
 
@@ -708,13 +749,22 @@ def test_contextual_quotes_daytime_uses_stock_only():
         return _quote(symbol, 2325.0)
 
     with patch.object(stock_quote, "get_realtime_quote", side_effect=fake_quote):
-        out = stock_quote.get_contextual_quotes_text("台積電今天怎麼看", now=now)
+        out = stock_quote.get_contextual_quotes_text("報價", now=now)
 
     assert out is not None
-    assert calls == ["2330.TW"]
+    assert set(calls) == {"2330.TW", "^TWII"}
     assert "2330.TW" in out
-    assert "TSM" not in out
-    assert "近月期貨" not in out
+    assert "^TWII" in out
+
+
+def test_contextual_quotes_generic_us_market_quote_does_not_default_to_tw_package():
+    now = datetime(2026, 6, 5, 10, 0, tzinfo=ZoneInfo("Asia/Taipei"))
+
+    with patch.object(stock_quote, "get_realtime_quote") as quote:
+        out = stock_quote.get_contextual_quotes_text("美股報價", now=now)
+
+    assert out is None
+    quote.assert_not_called()
 
 
 def test_contextual_quotes_prefers_futu_without_unbounded_yfinance_fallback():
@@ -755,6 +805,8 @@ def test_contextual_quotes_night_uses_adr_and_near_month_future():
 
     def fake_quote(symbol):
         calls.append(symbol)
+        if symbol == "WTX&":
+            return _quote(symbol, 21880.0)
         if symbol == "TSM":
             return _quote(symbol, 250.0)
         if symbol == "WCDFM6":
@@ -769,19 +821,47 @@ def test_contextual_quotes_night_uses_adr_and_near_month_future():
         out = stock_quote.get_contextual_quotes_text("台積電今天怎麼看", now=now)
 
     assert out is not None
-    assert set(calls) == {"TSM", "WCDFM6", "WCDFN6", "WCDFQ6", "WCDFU6"}
+    assert set(calls) == {"WTX&", "WCDFM6", "WCDFN6", "WCDFQ6", "WCDFU6", "TSM"}
     fast_info.assert_not_called()
     history.assert_not_called()
+    assert "WTX&" in out
+    assert "台指期" in out
     assert "TSM" in out
     assert "ADR" in out
     assert "WCDFM6" in out
     assert "近月期貨" in out
 
 
+def test_contextual_quotes_generic_quote_night_uses_tw_futures_and_adr_package():
+    now = datetime(2026, 6, 5, 21, 0, tzinfo=ZoneInfo("Asia/Taipei"))
+    calls = []
+
+    def fake_quote(symbol):
+        calls.append(symbol)
+        if symbol == "WTX&":
+            return _quote(symbol, 21880.0)
+        if symbol == "WCDFM6":
+            return _quote(symbol, 2330.0)
+        if symbol == "TSM":
+            return _quote(symbol, 250.0)
+        return None
+
+    with patch.object(stock_quote, "get_realtime_quote", side_effect=fake_quote):
+        out = stock_quote.get_contextual_quotes_text("夜間報價", now=now)
+
+    assert out is not None
+    assert set(calls) == {"WTX&", "WCDFM6", "WCDFN6", "WCDFQ6", "WCDFU6", "TSM"}
+    assert "WTX&" in out
+    assert "WCDFM6" in out
+    assert "TSM" in out
+
+
 def test_contextual_quotes_tsmc_alias_night_uses_adr_and_future():
     now = datetime(2026, 6, 5, 21, 0, tzinfo=ZoneInfo("Asia/Taipei"))
 
     def fake_quote(symbol):
+        if symbol == "WTX&":
+            return _quote(symbol, 21880.0)
         if symbol == "TSM":
             return _quote(symbol, 250.0)
         if symbol == "WCDFM6":
@@ -792,6 +872,7 @@ def test_contextual_quotes_tsmc_alias_night_uses_adr_and_future():
         out = stock_quote.get_contextual_quotes_text("TSMC 現在多少？", now=now)
 
     assert out is not None
+    assert "WTX&" in out
     assert "TSM" in out
     assert "WCDFM6" in out
 

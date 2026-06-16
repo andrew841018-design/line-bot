@@ -1424,14 +1424,38 @@ _AUTO_CAPTURE_VERB_RE = re.compile(
 _MEDICAL_ACTOR_ACTION_RE = re.compile(
     r"看(?:.{0,12})?(?:醫生|醫師|牙醫|牙醫師)|牙醫|牙醫師|"
     r"就醫|看病|回診|掛(?:號|醫生|醫師)|"
-    r"做(?:胃鏡|大腸鏡|健康檢查|體檢|手術|健檢|LDCT)|"
+    r"做(?:胃鏡|大腸鏡|健康檢查|體檢|手術|健檢|LDCT|MRI|"
+    r"正子斷層掃描|正子斷層|電腦斷層|(?<![A-Za-z])CT(?![A-Za-z])|核磁共振)|"
+    r"MRI|核磁共振|正子斷層掃描|正子斷層|PET-?CT|PET|電腦斷層|"
+    r"(?<![A-Za-z])CT(?![A-Za-z])|"
     r"打疫苗|抽血|領(?:藥|處方簽)"
 )
 _FAMILY_ACTOR_TERMS = (
     "媽媽", "爸爸", "姊姊", "姐姐", "妹妹", "弟弟", "哥哥",
-    "爺爺", "奶奶", "黃聖雅", "黃聖穎", "黃將修", "全家",
+    "爺爺", "奶奶", "聖雅", "聖穎", "黃聖雅", "黃聖穎", "黃將修", "全家",
 )
-_FAMILY_ACTOR_NORMALIZE = {"姐姐": "姊姊"}
+_FAMILY_ACTOR_NORMALIZE = {
+    "姐姐": "姊姊",
+    "妹妹": "黃聖雅",
+    "聖雅": "黃聖雅",
+    "聖穎": "黃聖穎",
+}
+
+
+def _normalize_family_actor(name: str) -> str:
+    return _FAMILY_ACTOR_NORMALIZE.get(name, name)
+
+
+def _family_name_variants(name: str) -> set[str]:
+    variants = {name}
+    for raw, normalized in _FAMILY_ACTOR_NORMALIZE.items():
+        if normalized == name:
+            variants.add(raw)
+    return variants
+
+
+def _family_name_in_text(text: str, name: str) -> bool:
+    return any(variant in text for variant in _family_name_variants(name))
 
 
 def _alias_from_user_id(user_id: str | None) -> str:
@@ -1455,27 +1479,79 @@ def _infer_medical_actor(text: str, user_id: str | None = None) -> str | None:
     """
     if not text or not _MEDICAL_ACTOR_ACTION_RE.search(text):
         return None
-    for term in _FAMILY_ACTOR_TERMS:
-        if term in text:
-            return _FAMILY_ACTOR_NORMALIZE.get(term, term)
     alias = _alias_from_user_id(user_id)
+    companions = set(_infer_medical_companions(text))
+    if alias and re.search(r"陪\s*我|陪我|陪同我", text):
+        return alias
+    for term in _FAMILY_ACTOR_TERMS:
+        normalized = _normalize_family_actor(term)
+        if normalized in companions:
+            continue
+        if term in text:
+            return normalized
     if alias:
         return alias
     return None
 
 
-def _has_family_actor(text: str) -> bool:
-    return any(term in text for term in _FAMILY_ACTOR_TERMS)
+def _infer_medical_companions(text: str) -> list[str]:
+    """Return people explicitly described as accompanying, not receiving care."""
+    if not text:
+        return []
+    companions: list[str] = []
+    for term in _FAMILY_ACTOR_TERMS:
+        normalized = _normalize_family_actor(term)
+        if normalized == "全家":
+            continue
+        escaped = re.escape(term)
+        patterns = (
+            rf"{escaped}[^。！？\n]{{0,8}}陪(?:我|你|他|她|同|診|著|去|看|就醫)",
+            rf"(?:由|請|給|找){escaped}[^。！？\n]{{0,4}}陪",
+        )
+        if any(re.search(pattern, text) for pattern in patterns):
+            if normalized not in companions:
+                companions.append(normalized)
+    return companions
 
 
-def _apply_medical_actor(action: str, actor: str | None) -> str:
-    if not action or not actor:
+def _has_family_actor(text: str, ignore_names: list[str] | None = None) -> bool:
+    ignored = set(ignore_names or [])
+    for term in _FAMILY_ACTOR_TERMS:
+        normalized = _normalize_family_actor(term)
+        if normalized in ignored:
+            continue
+        if term in text:
+            return True
+    return False
+
+
+def _apply_medical_actor(
+    action: str, actor: str | None, companions: list[str] | None = None
+) -> str:
+    if not action:
         return action
-    action = re.sub(r"^我的", f"{actor}的", action)
-    action = re.sub(r"^我(?=看|做|掛|回診|就醫|領|打|抽)", actor, action)
-    if _has_family_actor(action):
-        return action
-    return f"{actor}{action}"
+    companions = [name for name in (companions or []) if name and name != actor]
+    if actor:
+        action = re.sub(r"^我的", f"{actor}的", action)
+        action = re.sub(r"^我(?=看|做|掛|回診|就醫|領|打|抽)", actor, action)
+        if not _has_family_actor(action, ignore_names=companions):
+            action = f"{actor}{action}"
+    missing_companions = [
+        name for name in companions if not _family_name_in_text(action, name)
+    ]
+    if missing_companions:
+        action = f"{action}（{'、'.join(missing_companions)}陪同）"
+    return action
+
+
+def _medical_mention_aliases(
+    actor: str | None, companions: list[str] | None = None
+) -> list[str]:
+    aliases: list[str] = []
+    for name in [actor, *(companions or [])]:
+        if name and name not in aliases:
+            aliases.append(name)
+    return aliases
 
 
 def _with_medical_actor_participant(participants: list | None, actor: str | None) -> list:
@@ -4172,9 +4248,13 @@ def _calendar_regex_to_reminder_result(
         year_s, month_s, day_s = str(data["date"]).split("-", 2)
         hour_s, minute_s = str(data["time"]).split(":", 1)
         actor = _infer_medical_actor(text, user_id)
-        action = _apply_medical_actor(data.get("title") or text[:30], actor)
+        companions = _infer_medical_companions(text)
+        action = _apply_medical_actor(
+            data.get("title") or text[:30], actor, companions
+        )
         return {
             "action": action,
+            "mention_aliases": _medical_mention_aliases(actor, companions),
             "year": int(year_s),
             "month": int(month_s),
             "day": int(day_s),
@@ -4240,7 +4320,13 @@ def _drain_pending_reminders(group_id: str, limit: int = _REMINDER_DRAIN_CAP) ->
             else:
                 actor = _infer_medical_actor(row["text"], row["user_id"])
                 if actor and "action" in result:
-                    result["action"] = _apply_medical_actor(str(result["action"]), actor)
+                    companions = _infer_medical_companions(row["text"])
+                    result["action"] = _apply_medical_actor(
+                        str(result["action"]), actor, companions
+                    )
+                    result["mention_aliases"] = _medical_mention_aliases(
+                        actor, companions
+                    )
             try:
                 remind_dt = _dt(
                     int(result["year"]), int(result["month"]), int(result["day"]),
@@ -4258,6 +4344,7 @@ def _drain_pending_reminders(group_id: str, limit: int = _REMINDER_DRAIN_CAP) ->
             rid = memory.add_reminder(
                 group_id, row["user_id"], result["action"], remind_at,
                 source_text=row["text"][:200],
+                mention_aliases=result.get("mention_aliases") or [],
             )
             memory.mark_pending_reminder(pid, "done")
             terminal_written = True
@@ -4304,7 +4391,13 @@ def _maybe_extract_reminder(
         else:
             actor = _infer_medical_actor(text, user_id)
             if actor and "action" in result:
-                result["action"] = _apply_medical_actor(str(result["action"]), actor)
+                companions = _infer_medical_companions(text)
+                result["action"] = _apply_medical_actor(
+                    str(result["action"]), actor, companions
+                )
+                result["mention_aliases"] = _medical_mention_aliases(
+                    actor, companions
+                )
         # 算 remind_at（local timezone）
         from datetime import datetime as _dt
         try:
@@ -4323,7 +4416,8 @@ def _maybe_extract_reminder(
         if remind_at < _dt.now().timestamp() - 3600:
             return
         rid = memory.add_reminder(
-            group_id, user_id, result["action"], remind_at, source_text=text[:200]
+            group_id, user_id, result["action"], remind_at, source_text=text[:200],
+            mention_aliases=result.get("mention_aliases") or [],
         )
         if rid:
             logger.info(
