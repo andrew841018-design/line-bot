@@ -1139,6 +1139,41 @@ def mark_reminder_done(reminder_id: int) -> bool:
         return cursor.rowcount > 0
 
 
+def update_reminder_schedule(
+    reminder_id: int,
+    remind_at: int,
+    source_text: str | None = None,
+    action: str | None = None,
+) -> bool:
+    """Update a pending reminder's schedule and reset push-stage flags."""
+    action = _normalize_reminder_text(action) if action is not None else None
+    source_text = (
+        _normalize_reminder_text(source_text) if source_text is not None else None
+    )
+    with _lock, _conn() as c:
+        if action is not None:
+            cur = c.execute(
+                "UPDATE reminders SET action = ?, remind_at = ?, "
+                "source_text = COALESCE(?, source_text), "
+                "last_pushed_at = 0, weekly_count = 0, last_weekly_at = 0, "
+                "pushed_3d = 0, pushed_1d = 0, pushed_4hr = 0, "
+                "pushed_2hr = 0, pushed_1hr = 0, pushed_now = 0 "
+                "WHERE reminder_id = ? AND status = 'pending'",
+                (action, remind_at, source_text, reminder_id),
+            )
+        else:
+            cur = c.execute(
+                "UPDATE reminders SET remind_at = ?, "
+                "source_text = COALESCE(?, source_text), "
+                "last_pushed_at = 0, weekly_count = 0, last_weekly_at = 0, "
+                "pushed_3d = 0, pushed_1d = 0, pushed_4hr = 0, "
+                "pushed_2hr = 0, pushed_1hr = 0, pushed_now = 0 "
+                "WHERE reminder_id = ? AND status = 'pending'",
+                (remind_at, source_text, reminder_id),
+            )
+        return cur.rowcount > 0
+
+
 def expire_old_reminders(threshold_seconds: int = 86400 * 3) -> int:
     """把過期超過 threshold（預設 3 天）的 pending reminder 標記 expired。回標記筆數。"""
     import time

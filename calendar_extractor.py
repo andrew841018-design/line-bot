@@ -147,6 +147,80 @@ def extract(combined_text: str) -> dict:
     return fail
 
 
+def _event_key(ev: dict) -> tuple[str, str, str, str]:
+    if ev.get("date") and ev.get("time"):
+        return (
+            str(ev.get("date") or ""),
+            str(ev.get("time") or ""),
+            "",
+            "",
+        )
+    return (
+        str(ev.get("date") or ""),
+        str(ev.get("time") or ""),
+        str(ev.get("title") or ""),
+        str(ev.get("location") or ""),
+    )
+
+
+def _is_insertable_event(ev: dict) -> bool:
+    return bool(ev.get("has_event") and ev.get("title") and ev.get("date"))
+
+
+def extract_many(combined_text: str, primary: dict | None = None) -> dict:
+    """Return cancellation metadata plus all insertable events found in text.
+
+    Backward compatibility: `extract()` remains the source of the model-backed
+    single-event result. This wrapper adds a deterministic explicit-date
+    fallback so a message like "7/4 ... 以及 7/11 ..." persists both events
+    even if the model result only contains the first one.
+    """
+    first = primary if primary is not None else extract(combined_text)
+    if first.get("is_cancellation"):
+        return {
+            "is_cancellation": True,
+            "cancel_target_keyword": first.get("cancel_target_keyword"),
+            "date": first.get("date"),
+            "time": first.get("time"),
+            "events": [],
+        }
+
+    events: list[dict] = []
+    seen: set[tuple[str, str, str, str]] = set()
+
+    def _add(ev: dict) -> None:
+        if not _is_insertable_event(ev):
+            return
+        key = _event_key(ev)
+        if key in seen:
+            return
+        seen.add(key)
+        events.append(ev)
+
+    _add(first)
+
+    try:
+        import calendar_regex
+        today_tw_date = datetime.now(_TW).date()
+        regex_events = calendar_regex.extract_many_regex_only(
+            combined_text, today_tw_date
+        )
+        if events and len(regex_events) <= 1:
+            regex_events = []
+        for ev in regex_events:
+            _add(_normalize(ev))
+    except Exception as e:
+        logger.warning("calendar multi regex fallback failed: %s", e)
+
+    return {
+        "is_cancellation": False,
+        "cancel_target_keyword": None,
+        "date": None,
+        "time": None,
+        "events": events,
+    }
+
+
 def _normalize(data: dict) -> dict:
     has = bool(data.get("has_event"))
     cancel = bool(data.get("is_cancellation"))

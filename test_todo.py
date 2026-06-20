@@ -52,6 +52,27 @@ def test_insert_and_list_due_today(temp_todo_db):
     assert due[0]["task"] == "交報告"
 
 
+def test_list_pending_orders_due_dates_before_undated(temp_todo_db):
+    import todo
+    todo.insert_todo("GRP", "無日期事項", "U1", None)
+    todo.insert_todo("GRP", "明確日期事項", "U1", "2026-06-25")
+
+    pending = todo.list_pending("GRP")
+
+    assert [p["task"] for p in pending] == ["明確日期事項", "無日期事項"]
+
+
+def test_list_pending_can_filter_due_date(temp_todo_db):
+    import todo
+    todo.insert_todo("GRP", "6月25事項", "U1", "2026-06-25")
+    todo.insert_todo("GRP", "6月26事項", "U1", "2026-06-26")
+
+    pending = todo.list_pending("GRP", due_date="2026-06-25")
+
+    assert len(pending) == 1
+    assert pending[0]["task"] == "6月25事項"
+
+
 def test_insert_empty_task_returns_empty():
     import todo
     assert not todo.insert_todo("GRP", "")

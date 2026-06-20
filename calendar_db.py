@@ -216,22 +216,35 @@ def cancel_event(event_id: str) -> bool:
         return cur.rowcount > 0
 
 
-def update_event_date(event_id: str, new_date: str, new_time: str | None = None) -> bool:
+def update_event_schedule(
+    event_id: str,
+    new_date: str,
+    new_time: str | None = None,
+    title: str | None = None,
+) -> bool:
     """Reschedule event；reset 所有 reminded 欄位（codex critical：rescheduled event
     必須重推所有 offset，否則之前推過的 flag 會壓住新提醒）。
     """
+    title = (title or "").strip() or None
     with _lock, _conn() as c:
-        cur = c.execute(
-            "UPDATE events SET event_date = ?, "
-            "event_time = COALESCE(?, event_time), "
-            "reminded_at = NULL, "
-            "reminded_30d = NULL, reminded_7d = NULL, "
-            "reminded_3d = NULL, reminded_2d = NULL, reminded_1d = NULL, "
-            "reminded_0d = NULL "
-            "WHERE event_id = ?",
-            (new_date, new_time, event_id),
-        )
+        try:
+            cur = c.execute(
+                "UPDATE events SET title = COALESCE(?, title), event_date = ?, "
+                "event_time = COALESCE(?, event_time), "
+                "reminded_at = NULL, "
+                "reminded_30d = NULL, reminded_7d = NULL, "
+                "reminded_3d = NULL, reminded_2d = NULL, reminded_1d = NULL, "
+                "reminded_0d = NULL "
+                "WHERE event_id = ?",
+                (title, new_date, new_time, event_id),
+            )
+        except sqlite3.IntegrityError:
+            return False
         return cur.rowcount > 0
+
+
+def update_event_date(event_id: str, new_date: str, new_time: str | None = None) -> bool:
+    return update_event_schedule(event_id, new_date, new_time)
 
 
 def list_upcoming(group_id: str, days: int = 30) -> list[dict]:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 
 import pytest
 
@@ -42,6 +43,28 @@ def test_non_calendar_query_rejected():
     ]
     for q in falsy:
         assert main._is_calendar_query(q) is False, f"should NOT match: {q}"
+
+
+def test_todo_query_variations():
+    import main
+
+    truthy = [
+        "有哪些待辦事項？",
+        "目前有哪些提醒事項和會提醒的時間？",
+        "是不是還有其他待辦事項？",
+        "還有什麼要做的事項",
+    ]
+    for q in truthy:
+        assert main._is_todo_query(q) is True, f"should match: {q}"
+
+    falsy = [
+        "提醒我明天早上洗牙",
+        "幫我新增6/25早上洗牙",
+        "今天天氣如何",
+        "",
+    ]
+    for q in falsy:
+        assert main._is_todo_query(q) is False, f"should NOT match: {q}"
 
 
 # ── _resolve_relative_date ───────────────────────────────────────────────
@@ -156,6 +179,125 @@ def test_handle_calendar_query_no_match(monkeypatch):
     main._handle_calendar_query(FakeEvent(), "G1", "明天有什麼安排")
     assert "text" in captured
     assert "沒有" in captured["text"] or "0" in captured["text"]
+
+
+def test_build_todo_status_reply_reads_all_sources(monkeypatch):
+    import main
+    import todo
+    import calendar_db
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    monkeypatch.setattr(
+        todo,
+        "list_pending",
+        lambda gid, limit=10, due_date=None: [
+            {
+                "task": "領長期處方箋",
+                "due_date": "2026-06-25",
+                "sender_user_id": "U_MOM",
+            }
+        ],
+    )
+    reminder_ts = int(
+        datetime(2026, 6, 25, 8, 0, tzinfo=ZoneInfo("Asia/Taipei")).timestamp()
+    )
+    monkeypatch.setattr(
+        main.memory,
+        "list_pending_reminders",
+        lambda gid, within_seconds=None: [
+            {
+                "action": "全家打球",
+                "remind_at": reminder_ts,
+                "mention_aliases": ["全家"],
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        calendar_db,
+        "list_upcoming",
+        lambda gid, days=30: [
+            {
+                "title": "黃聖穎早上洗牙，看陳敏慧牙醫師",
+                "event_date": "2026-06-25",
+                "event_time": "",
+                "location": "",
+                "participants": json.dumps(["黃聖穎(就醫)"], ensure_ascii=False),
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        main,
+        "_alias_from_user_id",
+        lambda uid: "媽媽" if uid == "U_MOM" else "",
+    )
+
+    reply = main._build_todo_status_reply("G1", "有哪些待辦事項？")
+
+    assert "領長期處方箋" in reply
+    assert "2026-06-25 08:00 全家打球" in reply
+    assert "陳敏慧牙醫師" in reply
+
+
+def test_handle_todo_query_replies_immediately(monkeypatch):
+    import main
+
+    monkeypatch.setattr(
+        main,
+        "_build_todo_status_reply",
+        lambda gid, text: "目前待辦/提醒：\n精準提醒：\n- 2026-06-25 08:00 測試",
+    )
+    monkeypatch.setattr(main.memory, "append_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main.settings, "bot_muted", False, raising=False)
+
+    captured: dict = {}
+    _patch_calendar_reply_capture(monkeypatch, main, captured)
+
+    class FakeEvent:
+        reply_token = "fake_token"
+
+    main._handle_todo_query(FakeEvent(), "G1", "有哪些待辦事項？")
+
+    assert captured["text"].startswith("目前待辦/提醒")
+    assert "測試" in captured["text"]
+
+
+def test_explicit_todo_query_routes_before_llm(monkeypatch):
+    import main
+
+    captured = []
+    monkeypatch.setattr(
+        main,
+        "_handle_todo_query",
+        lambda event, group_id, clean_text: captured.append((group_id, clean_text)),
+    )
+
+    class FakeSource:
+        user_id = "U1"
+
+    class FakeMessage:
+        quoted_message_id = None
+
+    class FakeEvent:
+        source = FakeSource()
+        message = FakeMessage()
+        reply_token = "fake_token"
+
+    main._handle_explicit_text(FakeEvent(), "G1", "有哪些待辦事項？")
+
+    assert captured == [("G1", "有哪些待辦事項？")]
+
+
+def test_handle_command_todo_uses_status_builder(monkeypatch):
+    import main
+
+    monkeypatch.setattr(
+        main,
+        "_build_todo_status_reply",
+        lambda group_id, text: f"reply:{group_id}:{text}",
+    )
+
+    assert main._handle_command("G1", "/待辦") == "reply:G1:/待辦"
 
 
 # ── calendar_db dedup（GP1/GP2 反饋）─────────────────────────────────────
@@ -410,3 +552,461 @@ def test_medical_event_subjectless_defaults_to_sender_alias(
     assert len(events) == 1
     assert events[0]["title"] == "媽媽看台大陳敏惠牙醫師"
     assert json.loads(events[0]["participants"]) == ["媽媽(就醫)"]
+
+
+def test_personal_trip_first_person_defaults_to_sender_alias(
+    monkeypatch, tmp_calendar_db
+):
+    """For family shorthand, '我' means the LINE message sender."""
+    import main
+    import calendar_extractor
+
+    monkeypatch.setattr(main, "_alias_from_user_id", lambda uid: "媽媽" if uid == "U_MOM" else "")
+    monkeypatch.setattr(
+        calendar_extractor,
+        "extract",
+        lambda text: {
+            "has_event": True,
+            "is_cancellation": False,
+            "title": "我到高雄",
+            "date": "2026-06-21",
+            "time": None,
+            "location": "高雄",
+            "participants": ["我(旅者)"],
+            "cancel_target_keyword": None,
+            "event_type": "personal_trip",
+        },
+    )
+
+    main._maybe_capture_calendar_event("G1", "6/21 我到高雄", "U_MOM")
+
+    events = tmp_calendar_db.list_upcoming("G1", days=30)
+    assert len(events) == 1
+    assert events[0]["title"] == "媽媽到高雄"
+    assert json.loads(events[0]["participants"]) == ["媽媽(旅者)"]
+
+
+def test_donghai_events_default_to_dad(monkeypatch, tmp_calendar_db):
+    """Andrew's family convention: 東海-related events are usually dad's."""
+    import main
+    import calendar_extractor
+
+    monkeypatch.setattr(
+        calendar_extractor,
+        "extract",
+        lambda text: {
+            "has_event": True,
+            "is_cancellation": False,
+            "title": "東海大學校友年中交流聚餐",
+            "date": "2026-07-04",
+            "time": "10:30",
+            "location": "美僑俱樂部 California Room",
+            "participants": ["校友"],
+            "cancel_target_keyword": None,
+            "event_type": "family_gathering",
+        },
+    )
+
+    main._maybe_capture_calendar_event(
+        "G1", "東海大學校友會在美僑俱樂部聚餐", "U_ANY"
+    )
+
+    events = tmp_calendar_db.list_upcoming("G1", days=30)
+    assert len(events) == 1
+    assert json.loads(events[0]["participants"]) == ["爸爸(東海相關)", "校友"]
+
+
+def test_donghai_default_does_not_override_explicit_other_actor(
+    monkeypatch, tmp_calendar_db
+):
+    import main
+    import calendar_extractor
+
+    monkeypatch.setattr(
+        calendar_extractor,
+        "extract",
+        lambda text: {
+            "has_event": True,
+            "is_cancellation": False,
+            "title": "媽媽去東海大學",
+            "date": "2026-07-05",
+            "time": None,
+            "location": "東海大學",
+            "participants": ["媽媽(旅者)"],
+            "cancel_target_keyword": None,
+            "event_type": "personal_trip",
+        },
+    )
+
+    main._maybe_capture_calendar_event("G1", "媽媽去東海大學", "U_ANY")
+
+    events = tmp_calendar_db.list_upcoming("G1", days=30)
+    assert len(events) == 1
+    assert json.loads(events[0]["participants"]) == ["媽媽(旅者)"]
+
+
+def test_explicit_calendar_capture_passes_sender_user_id(monkeypatch):
+    import main
+
+    class FakeSource:
+        user_id = "U_MOM"
+
+    class FakeMessage:
+        quoted_message_id = None
+
+    class FakeEvent:
+        source = FakeSource()
+        message = FakeMessage()
+        reply_token = "tok"
+
+    captured = []
+    monkeypatch.setattr(main, "_detect_image_gen_request", lambda text: None)
+    monkeypatch.setattr(main, "_is_calendar_query", lambda text: False)
+    monkeypatch.setattr(main, "_get_explicit_market_quote_reply", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_build_quoted_block", lambda *a, **k: "")
+    monkeypatch.setattr(main, "_prefetch_urls", lambda text: text)
+    monkeypatch.setattr(main, "_is_market_quote_request", lambda *a, **k: False)
+    monkeypatch.setattr(main, "_get_persona_notes", lambda gid: [])
+    monkeypatch.setattr(main, "_thinking_indicator", lambda gid: nullcontext())
+    monkeypatch.setattr(main, "_llm_chat", lambda *a, **k: "ok")
+    monkeypatch.setattr(main, "_try_save_correction", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_maybe_extract_facts", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_reply", lambda *a, **k: None)
+    monkeypatch.setattr(main.memory, "get_context", lambda gid: [])
+    monkeypatch.setattr(main.memory, "top_facts", lambda *a, **k: [])
+    monkeypatch.setattr(main.memory, "append_turn", lambda *a, **k: None)
+    monkeypatch.setattr(
+        main,
+        "_maybe_capture_calendar_event",
+        lambda group_id, text, sender_user_id="": captured.append(
+            (group_id, text, sender_user_id)
+        ),
+    )
+
+    main._handle_explicit_text(FakeEvent(), "G1", "6/21 我到高雄")
+
+    assert captured == [("G1", "6/21 我到高雄", "U_MOM")]
+
+
+def test_calendar_capture_persists_second_event_when_model_returns_first_only(
+    monkeypatch, tmp_calendar_db
+):
+    import main
+    import calendar_extractor
+
+    text = (
+        "咪寶麻煩提醒我7月4日台北市東海大學校友會在美僑俱樂部聚會"
+        "上午10:30到下午14:30以及7月11日在台北六福萬怡酒店9樓-海山廳"
+        "（南港火車站B棟，忠孝東路七段359號9樓）13:10-16:30。"
+    )
+    monkeypatch.setattr(
+        calendar_extractor,
+        "extract",
+        lambda _text: {
+            "has_event": True,
+            "is_cancellation": False,
+            "title": "東海大學校友會活動（美僑俱樂部）",
+            "date": "2026-07-04",
+            "time": "10:30",
+            "location": "美僑俱樂部",
+            "participants": ["校友"],
+            "cancel_target_keyword": None,
+            "event_type": "family_gathering",
+        },
+    )
+
+    main._maybe_capture_calendar_event("G1", text, "U_DAD")
+
+    events = tmp_calendar_db.list_upcoming("G1", days=60)
+    dates = [ev["event_date"] for ev in events]
+    assert dates == ["2026-07-04", "2026-07-11"]
+    assert any("美僑" in (ev["location"] or "") for ev in events)
+    assert any("六福萬怡酒店" in (ev["location"] or "") for ev in events)
+    assert all("爸爸" in ev["participants"] for ev in events)
+
+
+def test_plain_calendar_correction_updates_event_and_reminder(monkeypatch):
+    import main
+    import calendar_db
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    today_tw = datetime.now(ZoneInfo("Asia/Taipei")).date()
+    target_date = (today_tw + timedelta(days=1)).isoformat()
+    old_dt = datetime(
+        today_tw.year,
+        today_tw.month,
+        today_tw.day,
+        4,
+        0,
+        tzinfo=ZoneInfo("Asia/Taipei"),
+    ) + timedelta(days=1)
+    event_row = {
+        "event_id": "e-ball",
+        "group_id": "G1",
+        "title": "全家打球",
+        "event_date": target_date,
+        "event_time": "04:00",
+        "location": "",
+        "participants": "[]",
+        "status": "active",
+    }
+    event_updates: list[tuple[str, str, str | None, str | None]] = []
+    reminder_updates: list[tuple[int, int, str | None, str | None]] = []
+    replies: list[str] = []
+
+    def fake_search(_gid, keywords, limit=10):
+        return [event_row] if "打球" in keywords else []
+
+    monkeypatch.setattr(calendar_db, "search_by_keyword", fake_search)
+    monkeypatch.setattr(calendar_db, "list_upcoming", lambda *a, **k: [])
+    monkeypatch.setattr(calendar_db, "list_past", lambda *a, **k: [])
+    monkeypatch.setattr(
+        calendar_db,
+        "update_event_schedule",
+        lambda event_id, new_date, new_time=None, title=None: event_updates.append(
+            (event_id, new_date, new_time, title)
+        )
+        or True,
+    )
+    monkeypatch.setattr(
+        main.memory,
+        "list_pending_reminders",
+        lambda gid: [
+            {
+                "reminder_id": 7,
+                "group_id": gid,
+                "action": "全家打球",
+                "remind_at": int(old_dt.timestamp()),
+                "source_text": "明天4點全家打球",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        main.memory,
+        "update_reminder_schedule",
+        lambda reminder_id, remind_at, source_text=None, action=None: reminder_updates.append(
+            (reminder_id, remind_at, source_text, action)
+        )
+        or True,
+    )
+    monkeypatch.setattr(main.memory, "append_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main.burst_filter, "cancel_burst", lambda gid: None)
+    monkeypatch.setattr(
+        main, "_reply", lambda _token, text, **_kw: replies.append(text)
+    )
+    monkeypatch.setattr(
+        main, "_maybe_extract_reminder", lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("correction must not be extracted as a new reminder")
+        )
+    )
+    monkeypatch.setattr(main.feedback_collector, "in_feedback_window", lambda: False)
+
+    class FakeSource:
+        user_id = "U1"
+
+    class FakeMessage:
+        id = "m1"
+        text = "明天羽球，更正為1600"
+
+    class FakeEvent:
+        source = FakeSource()
+        message = FakeMessage()
+        reply_token = "reply-token"
+
+    main._handle_text_message(FakeEvent(), "G1")
+
+    assert event_updates == [("e-ball", target_date, "16:00", "全家羽球")]
+    assert len(reminder_updates) == 1
+    updated_dt = datetime.fromtimestamp(
+        reminder_updates[0][1], tz=ZoneInfo("Asia/Taipei")
+    )
+    assert updated_dt.date().isoformat() == target_date
+    assert updated_dt.strftime("%H:%M") == "16:00"
+    assert reminder_updates[0][2] == "明天羽球，更正為1600"
+    assert reminder_updates[0][3] == "全家羽球"
+    assert replies
+    assert "已更正" in replies[0]
+    assert "全家羽球" in replies[0]
+    assert "提醒已同步更新 1 筆" in replies[0]
+
+
+def test_calendar_time_only_correction_preserves_found_event_date(monkeypatch):
+    import main
+    import calendar_db
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    today_tw = datetime.now(ZoneInfo("Asia/Taipei")).date()
+    parsed_target_date = (today_tw + timedelta(days=1)).isoformat()
+    existing_event_date = today_tw.isoformat()
+    old_dt = datetime(
+        today_tw.year,
+        today_tw.month,
+        today_tw.day,
+        4,
+        0,
+        tzinfo=ZoneInfo("Asia/Taipei"),
+    )
+    event_row = {
+        "event_id": "e-ball",
+        "group_id": "G1",
+        "title": "全家打球",
+        "event_date": existing_event_date,
+        "event_time": "04:00",
+        "location": "",
+        "participants": "[]",
+        "status": "active",
+    }
+    event_updates: list[tuple[str, str, str | None, str | None]] = []
+    reminder_updates: list[tuple[int, int, str | None, str | None]] = []
+
+    monkeypatch.setattr(
+        main,
+        "_resolve_relative_date",
+        lambda text: today_tw + timedelta(days=1) if "明天" in text else None,
+    )
+    monkeypatch.setattr(
+        calendar_db,
+        "search_by_keyword",
+        lambda _gid, keywords, limit=10: [event_row] if "打球" in keywords else [],
+    )
+    monkeypatch.setattr(calendar_db, "list_upcoming", lambda *a, **k: [])
+    monkeypatch.setattr(calendar_db, "list_past", lambda *a, **k: [])
+    monkeypatch.setattr(
+        calendar_db,
+        "update_event_schedule",
+        lambda event_id, new_date, new_time=None, title=None: event_updates.append(
+            (event_id, new_date, new_time, title)
+        )
+        or True,
+    )
+    monkeypatch.setattr(
+        main.memory,
+        "list_pending_reminders",
+        lambda gid: [
+            {
+                "reminder_id": 7,
+                "group_id": gid,
+                "action": "全家打球",
+                "remind_at": int(old_dt.timestamp()),
+                "source_text": "明天4點全家打球",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        main.memory,
+        "update_reminder_schedule",
+        lambda reminder_id, remind_at, source_text=None, action=None: reminder_updates.append(
+            (reminder_id, remind_at, source_text, action)
+        )
+        or True,
+    )
+    monkeypatch.setattr(main.memory, "append_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main.burst_filter, "cancel_burst", lambda gid: None)
+    monkeypatch.setattr(main, "_reply", lambda *a, **k: None)
+
+    class FakeSource:
+        user_id = "U1"
+
+    class FakeMessage:
+        id = "m1"
+        text = "明天羽球，更正為1600"
+
+    class FakeEvent:
+        source = FakeSource()
+        message = FakeMessage()
+        reply_token = "reply-token"
+
+    main._try_handle_calendar_correction(FakeEvent(), "G1", "明天羽球，更正為1600")
+
+    assert parsed_target_date != existing_event_date
+    assert event_updates == [("e-ball", existing_event_date, "16:00", "全家羽球")]
+    updated_dt = datetime.fromtimestamp(
+        reminder_updates[0][1], tz=ZoneInfo("Asia/Taipei")
+    )
+    assert updated_dt.date().isoformat() == existing_event_date
+    assert updated_dt.strftime("%H:%M") == "16:00"
+    assert reminder_updates[0][3] == "全家羽球"
+
+
+def test_calendar_content_only_correction_updates_titles(monkeypatch):
+    import main
+    import calendar_db
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    today_tw = datetime.now(ZoneInfo("Asia/Taipei")).date()
+    event_date = (today_tw + timedelta(days=2)).isoformat()
+    old_dt = datetime(
+        today_tw.year,
+        today_tw.month,
+        today_tw.day,
+        18,
+        0,
+        tzinfo=ZoneInfo("Asia/Taipei"),
+    ) + timedelta(days=2)
+    event_row = {
+        "event_id": "e-ball",
+        "group_id": "G1",
+        "title": "全家打球",
+        "event_date": event_date,
+        "event_time": "18:00",
+        "location": "",
+        "participants": "[]",
+        "status": "active",
+    }
+    event_updates: list[tuple[str, str, str | None, str | None]] = []
+    reminder_updates: list[tuple[int, int, str | None, str | None]] = []
+
+    monkeypatch.setattr(
+        calendar_db,
+        "search_by_keyword",
+        lambda _gid, keywords, limit=10: [event_row] if "打球" in keywords else [],
+    )
+    monkeypatch.setattr(calendar_db, "list_upcoming", lambda *a, **k: [])
+    monkeypatch.setattr(calendar_db, "list_past", lambda *a, **k: [])
+    monkeypatch.setattr(
+        calendar_db,
+        "update_event_schedule",
+        lambda event_id, new_date, new_time=None, title=None: event_updates.append(
+            (event_id, new_date, new_time, title)
+        )
+        or True,
+    )
+    monkeypatch.setattr(
+        main.memory,
+        "list_pending_reminders",
+        lambda gid: [
+            {
+                "reminder_id": 7,
+                "group_id": gid,
+                "action": "全家打球",
+                "remind_at": int(old_dt.timestamp()),
+                "source_text": "後天全家打球",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        main.memory,
+        "update_reminder_schedule",
+        lambda reminder_id, remind_at, source_text=None, action=None: reminder_updates.append(
+            (reminder_id, remind_at, source_text, action)
+        )
+        or True,
+    )
+    monkeypatch.setattr(main.memory, "append_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main.burst_filter, "cancel_burst", lambda gid: None)
+    monkeypatch.setattr(main, "_reply", lambda *a, **k: None)
+
+    class FakeEvent:
+        reply_token = "reply-token"
+
+    assert main._try_handle_calendar_correction(FakeEvent(), "G1", "打球更正為羽球")
+
+    assert event_updates == [("e-ball", event_date, None, "全家羽球")]
+    updated_dt = datetime.fromtimestamp(
+        reminder_updates[0][1], tz=ZoneInfo("Asia/Taipei")
+    )
+    assert updated_dt.strftime("%Y-%m-%d %H:%M") == old_dt.strftime("%Y-%m-%d %H:%M")
+    assert reminder_updates[0][3] == "全家羽球"

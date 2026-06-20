@@ -1495,44 +1495,227 @@ def next_todos() -> str:
         return ""
 
 
-# ── 7. LINE bot 功能建議（Gemini 生成 + 7 天去重 + 沒適合就直說）──────────────
+# ── 7. LINE bot 每日推薦（近 3 天群聊訊號 + AI / 本地產品判斷）──────────────
 
 _SUGGESTION_HISTORY = LINE_BOT_DIR / "suggestion_history.json"
 
+_LINE_BOT_SUGGESTION_CANDIDATES = [
+    {
+        "title": "健康事件追蹤與就醫提醒",
+        "keywords": ("健康", "醫生", "醫院", "看診", "掛號", "回診", "藥", "睡眠", "呼吸", "血壓", "檢查", "疼", "痛"),
+        "reason": "近 3 天健康或就醫訊號較明顯，適合把症狀、回診、用藥和檢查提醒整理成可追蹤事件。",
+        "priority": 90,
+    },
+    {
+        "title": "家庭飲食偏好與食材媒合",
+        "keywords": ("晚餐", "早餐", "午餐", "吃", "煮", "菜", "餐廳", "食材", "料理", "訂位", "便當"),
+        "reason": "群聊常出現吃飯或食材決策時，bot 可以記住偏好並直接給可煮、可買或可訂的選項。",
+        "priority": 86,
+    },
+    {
+        "title": "行程與提醒自動建議",
+        "keywords": ("明天", "今天", "下週", "幾點", "提醒", "記得", "行程", "約", "生日", "繳", "領"),
+        "reason": "對話裡有時間和待辦訊號時，bot 應主動抽出事件並建議建立提醒，避免只靠人工記。",
+        "priority": 84,
+    },
+    {
+        "title": "投資話題摘要與風險標籤",
+        "keywords": ("股票", "股價", "台積電", "2330", "SOXL", "SOXX", "ETF", "買", "賣", "投資", "美股", "大盤"),
+        "reason": "投資話題容易混雜新聞、價格和主觀判斷，適合自動補摘要、來源與風險標籤。",
+        "priority": 80,
+    },
+    {
+        "title": "連結與影片重點摘要",
+        "keywords": ("http", "youtu", "影片", "新聞", "文章", "連結", "網址", "reels", "shorts", "tiktok"),
+        "reason": "群聊貼連結時常缺少上下文，bot 可以先抓標題、重點和可信度，降低大家點開成本。",
+        "priority": 78,
+    },
+    {
+        "title": "出門前天氣交通提醒",
+        "keywords": ("天氣", "下雨", "颱風", "公車", "捷運", "火車", "高鐵", "開車", "塞車", "路況"),
+        "reason": "交通或天氣訊號出現時，bot 可以把時間、地點和風險整理成出門前提醒。",
+        "priority": 74,
+    },
+    {
+        "title": "家庭文件與帳單整理",
+        "keywords": ("發票", "帳單", "包裹", "銀行", "信用卡", "保險", "收據", "訂單", "繳費", "合約"),
+        "reason": "文件和帳單類訊息容易散落在群聊，適合自動萃取期限、金額與後續動作。",
+        "priority": 70,
+    },
+]
 
-def line_bot_suggestions() -> str:
+_LINE_BOT_GENERIC_SUGGESTIONS = [
+    {
+        "title": "群聊需求雷達",
+        "reason": "每天統計近 3 天健康、行程、投資、飲食、連結等訊號，讓下一個功能先有資料依據。",
+    },
+    {
+        "title": "未回覆高價值訊息偵測",
+        "reason": "找出群聊裡被跳過但其實需要查證、提醒或整理的訊息，優先補 bot 的實用缺口。",
+    },
+    {
+        "title": "功能候選池自動排序",
+        "reason": "把近期對話訊號轉成開發候選清單，依出現頻率、可自動化程度和家庭實用性排序。",
+    },
+]
+
+
+def _load_suggestion_history(history_path: Path) -> tuple[list, bool]:
+    if not history_path.exists():
+        return [], True
+    try:
+        data = _json.loads(history_path.read_text())
+        if isinstance(data, list):
+            return data, True
+        return [], False
+    except Exception:
+        return [], False
+
+
+def _write_suggestion_history(history_path: Path, history: list) -> bool:
+    try:
+        tmp = history_path.with_name(f"{history_path.name}.tmp")
+        tmp.write_text(_json.dumps(history, ensure_ascii=False, indent=2))
+        os.replace(tmp, history_path)
+        return True
+    except Exception:
+        return False
+
+
+def _line_bot_suggestion_group_id() -> str:
+    # Family-only recommendation: never infer from ALLOWED_GROUP_IDS order.
+    return (
+        os.getenv("FAMILY_GROUP_ID")
+        or os.getenv("LINE_ALLOWED_GROUP_ID")
+        or os.getenv("ALLOWED_GROUP_ID")
+        or ""
+    ).strip()
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _line_bot_suggestions_ai_enabled() -> bool:
+    # Recent LINE messages can contain family/private content. External LLM
+    # suggestions are therefore opt-in only.
+    return _env_flag("LINE_BOT_SUGGESTIONS_USE_AI", False)
+
+
+def _fetch_recent_line_messages(
+    db_path: Path,
+    now: datetime | None = None,
+    *,
+    group_id: str,
+    days: int = 3,
+    limit: int = 30,
+) -> list[str]:
+    if not group_id or not db_path.exists():
+        return []
+    now = now or datetime.now()
+    try:
+        conn = sqlite3.connect(str(db_path))
+        cur = conn.cursor()
+        cutoff_sec = int((now - timedelta(days=days)).timestamp())
+        cur.execute(
+            "SELECT user_id, text FROM raw_messages "
+            "WHERE group_id = ? "
+            "AND created_at > ? "
+            "AND (user_id IS NULL OR user_id != '__bot__') "
+            "ORDER BY created_at DESC LIMIT ?",
+            (group_id, cutoff_sec, limit),
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return [f"{(uid or 'unknown')[:6]}: {(text or '')[:80]}" for uid, text in rows]
+    except Exception:
+        return []
+
+
+def _normalize_suggestion_title(title: str) -> str:
+    return re.sub(r"\s+", "", str(title or "").lower())
+
+
+def _title_is_blacklisted(title: str, blacklist: list[str]) -> bool:
+    normalized = _normalize_suggestion_title(title)
+    if not normalized:
+        return True
+    for item in blacklist:
+        other = _normalize_suggestion_title(item)
+        if not other:
+            continue
+        if normalized == other:
+            return True
+        if len(normalized) >= 6 and normalized in other:
+            return True
+        if len(other) >= 6 and other in normalized:
+            return True
+    return False
+
+
+def _clean_suggestion(suggestion) -> dict | None:
+    if not isinstance(suggestion, dict):
+        return None
+    title = str(suggestion.get("title") or "").strip()
+    reason = str(suggestion.get("reason") or "").strip()
+    if not title or not reason:
+        return None
+    return {"title": title[:48], "reason": reason[:120]}
+
+
+def _local_line_bot_suggestion(recent_msgs: list[str], blacklist: list[str]) -> dict:
+    text = "\n".join(recent_msgs)
+    scored = []
+    for candidate in _LINE_BOT_SUGGESTION_CANDIDATES:
+        if _title_is_blacklisted(candidate["title"], blacklist):
+            continue
+        hits = sum(1 for keyword in candidate["keywords"] if keyword in text)
+        if hits:
+            scored.append((hits * 100 + candidate["priority"], candidate))
+
+    if scored:
+        scored.sort(key=lambda item: item[0], reverse=True)
+        best = scored[0][1]
+        return {"title": best["title"], "reason": best["reason"]}
+
+    for candidate in _LINE_BOT_GENERIC_SUGGESTIONS:
+        if not _title_is_blacklisted(candidate["title"], blacklist):
+            return dict(candidate)
+    return dict(_LINE_BOT_GENERIC_SUGGESTIONS[0])
+
+
+def line_bot_suggestions(
+    *,
+    now: datetime | None = None,
+    db_path: Path | None = None,
+    history_path: Path | None = None,
+    group_id: str | None = None,
+    use_ai: bool | None = None,
+) -> str:
     import json
     from dotenv import load_dotenv
 
+    now = now or datetime.now()
+    db_path = db_path or (LINE_BOT_DIR / "line_bot.db")
+    history_path = history_path or _SUGGESTION_HISTORY
+
     load_dotenv(dotenv_path=LINE_BOT_DIR / ".env")
+    group_id = _line_bot_suggestion_group_id() if group_id is None else group_id
+    if use_ai is None:
+        use_ai = _line_bot_suggestions_ai_enabled()
 
     memory_text = ""
 
-    # 近 7 天已推薦過的
-    history = []
-    if _SUGGESTION_HISTORY.exists():
-        # 永久去重：Andrew 的規則「沒叫我做 = 沒興趣，不要再推同一個」
-        # 過去推過的所有 title 全部進黑名單，每天必須是新的
-        try:
-            history = json.loads(_SUGGESTION_HISTORY.read_text())
-        except Exception:
-            history = []
+    # 永久去重：Andrew 的規則「沒叫我做 = 沒興趣，不要再推同一個」
+    # 過去推過的所有 title 全部進黑名單，每天必須是新的
+    history, history_ok = _load_suggestion_history(history_path)
 
     # 近 3 天 LINE bot 對話樣本（抽 30 則）
     # raw_messages.created_at 存秒（INTEGER），不是毫秒；2026-05-02 修：原版用毫秒比較永遠 0 筆 → Gemini 沒原料 → 永遠回 null
-    recent_msgs = []
-    try:
-        conn = sqlite3.connect(str(LINE_BOT_DIR / "line_bot.db"))
-        cur = conn.cursor()
-        three_days_ago_sec = int((datetime.now() - timedelta(days=3)).timestamp())
-        cur.execute(
-            "SELECT user_id, text FROM raw_messages WHERE created_at > ? AND user_id != '__bot__' ORDER BY created_at DESC LIMIT 30",
-            (three_days_ago_sec,),
-        )
-        recent_msgs = [f"{uid[:6]}: {text[:80]}" for uid, text in cur.fetchall()]
-        conn.close()
-    except Exception:
-        pass
+    recent_msgs = _fetch_recent_line_messages(db_path, now, group_id=group_id)
 
     # 解析 memory 三個 section
     def _parse_section(text: str, header: str) -> list:
@@ -1560,10 +1743,15 @@ def line_bot_suggestions() -> str:
     skipped_list = _parse_section(memory_text, "## 已略過")
     pending_list = _parse_section(memory_text, "## 待建議")
 
+    history_titles = [
+        str(h.get("title"))
+        for h in history
+        if isinstance(h, dict) and h.get("title")
+    ]
     # 黑名單：已執行 + 已略過 + 過去推過的所有 title（永久去重，沒採納就當沒興趣）
-    blacklist = list(set(done_list + skipped_list + [h["title"] for h in history]))
+    blacklist = list(set(done_list + skipped_list + history_titles))
 
-    prompt = f"""你是 LINE bot 的產品顧問。任務：根據近 3 天群組對話，主動發想 1 個讓 Andrew 的家族 LINE bot 變更實用的新功能。
+    prompt = f"""你是 LINE bot 的產品顧問。任務：每天根據近 3 天群組對話，加上你的產品判斷，推薦 1 個 Andrew 的家族 LINE bot 可能需要的新功能。
 
 【近 3 天群組對話樣本（最重要！從這裡找痛點）】
 {chr(10).join(recent_msgs) if recent_msgs else "(無樣本，但仍可基於 Andrew 個人需求發想)"}
@@ -1575,9 +1763,10 @@ def line_bot_suggestions() -> str:
 {json.dumps(blacklist, ensure_ascii=False)}
 
 規則：
-1. **積極發想**：對話樣本只要有「資訊缺口、查詢需求、誤解、麻煩」就值得提建議。寧可大膽嘗試也不要消極回 null
-2. **永久去重，不准包裝同樣概念**：黑名單裡的不只 title 完全相同不行，**用不同說法包裝同樣概念也不行**（例：「對話搜尋」vs「過去聊天記錄查詢」算同一件事）。Andrew 的規則「沒叫我做就是沒興趣」，請從**完全不同領域 / 角度 / 痛點**切入
-3. **建議方向參考**（任選一個或自創）：
+1. **每日推薦**：正常情況下必須給一條建議，回答「從 LINE 群近期討論來看，我們可能需要什麼功能」
+2. **積極發想**：對話樣本只要有「資訊缺口、查詢需求、誤解、麻煩」就值得提建議。寧可大膽嘗試也不要消極回 null
+3. **永久去重，不准包裝同樣概念**：黑名單裡的不只 title 完全相同不行，**用不同說法包裝同樣概念也不行**（例：「對話搜尋」vs「過去聊天記錄查詢」算同一件事）。Andrew 的規則「沒叫我做就是沒興趣」，請從**完全不同領域 / 角度 / 痛點**切入
+4. **建議方向參考**（任選一個或自創）：
    - 訂閱式提醒（股票代號、特定關鍵字觸發推播）
    - 跨群組 / 個人 DM 整合
    - 行事曆 / 待辦自動建立（從對話抽出時間 + 事件）
@@ -1587,8 +1776,8 @@ def line_bot_suggestions() -> str:
    - 對話搜尋（過去聊過什麼可以查）
    - 多語翻譯（英文新聞自動中譯）
    - 個人化儀表板（特定使用者的偏好行為）
-4. 至少嘗試一條建議。極度不適合才回 null。
-5. 建議要具體（標題 + 一句話理由）
+5. 至少嘗試一條建議。極度不適合才回 null。
+6. 建議要具體（標題 + 一句話理由），理由需說明它跟近期群聊訊號或你的產品判斷有何關係
 
 回 JSON，格式：
 {{"suggestion": null 或 {{"title": "標題", "reason": "一句話理由"}}}}"""
@@ -1596,58 +1785,42 @@ def line_bot_suggestions() -> str:
     # gemini-2.5-flash 跟 LINE bot 共用 quota，容易 429
     # 依序嘗試：flash-lite（quota 高）→ flash（fallback）→ 本地 fallback
     suggestion = None
-    last_error = None
-    try:
-        from google import genai
-        from google.genai import types
+    if use_ai:
+        try:
+            from google import genai
+            from google.genai import types
 
-        client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+            client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
-        for model_name in ("gemini-2.5-flash-lite", "gemini-2.5-flash"):
-            try:
-                resp = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        temperature=0.3,
-                    ),
-                )
-                data = json.loads(resp.text)
-                suggestion = data.get("suggestion")
-                last_error = None
-                break
-            except Exception as e:
-                last_error = e
-                if "429" not in str(e) and "RESOURCE_EXHAUSTED" not in str(e):
-                    break  # 非 quota 錯誤，不 retry 其他模型
-    except Exception as e:
-        last_error = e
+            for model_name in ("gemini-2.5-flash-lite", "gemini-2.5-flash"):
+                try:
+                    resp = client.models.generate_content(
+                        model=model_name,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            temperature=0.3,
+                        ),
+                    )
+                    data = json.loads(resp.text)
+                    suggestion = data.get("suggestion")
+                    break
+                except Exception as e:
+                    if "429" not in str(e) and "RESOURCE_EXHAUSTED" not in str(e):
+                        break  # 非 quota 錯誤，不 retry 其他模型
+        except Exception:
+            pass
 
-    # Gemini 全部失敗 → 本地 fallback：從 pending_list 挑一個不在黑名單的
-    if last_error is not None:
-        candidates = [p for p in pending_list if p not in blacklist]
-        if candidates:
-            import random
-
-            title = random.choice(candidates)
-            suggestion = {"title": title, "reason": "（本地挑選，Gemini quota 用盡）"}
-        else:
-            return "💡 **LINE bot 建議**：今天沒有新建議"
-
-    if not suggestion:
-        return "💡 **LINE bot 建議**：今天沒有新建議"
+    suggestion = _clean_suggestion(suggestion)
+    if not suggestion or _title_is_blacklisted(suggestion["title"], blacklist):
+        suggestion = _local_line_bot_suggestion(recent_msgs, blacklist)
 
     # 寫入歷史
-    history.append({"date": datetime.now().isoformat(), "title": suggestion["title"]})
-    try:
-        _SUGGESTION_HISTORY.write_text(
-            json.dumps(history, ensure_ascii=False, indent=2)
-        )
-    except Exception:
-        pass
+    if history_ok:
+        history.append({"date": now.isoformat(), "title": suggestion["title"]})
+        _write_suggestion_history(history_path, history)
 
-    return f"💡 **LINE bot 建議**：{suggestion['title']} — {suggestion['reason']}"
+    return f"💡 **LINE bot 每日推薦**：{suggestion['title']} — {suggestion['reason']}"
 
 
 
@@ -1762,7 +1935,6 @@ def _summarize_cramer_zh(slug: str) -> str:
             "用繁體中文寫 1 句核心論點（不超過 40 字），直接給觀點，"
             "不要 echo 原標題、不要加引號或多餘前綴。"
         )
-        quota_hit = False
         for model_name in ("gemini-2.5-flash-lite", "gemini-2.5-flash"):
             try:
                 resp = client.models.generate_content(
@@ -1775,20 +1947,11 @@ def _summarize_cramer_zh(slug: str) -> str:
                     return txt
             except Exception as e:
                 if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                    quota_hit = True  # 這個 model 撞額度，繼續試下一個
+                    continue  # 這個 model 撞額度，繼續試下一個
                 else:
-                    quota_hit = False
                     break  # 非 quota 錯誤不再 retry 其他模型
-        # 走到這 = 沒成功 return。若因（最後試的 model）撞額度而 fallback，且用的是「獨立」
-        # Cramer key（health monitor 看不到那個 GCP project）→ 即時通知 Andrew。
-        # 未設獨立 key 時不從這推：那其實是共用 key，由 health monitor 統一報，避免 double-alert。
-        if quota_hit and _cramer_key:
-            try:
-                from notify_discord import notify_quota_pressure
-
-                notify_quota_pressure("Cramer 獨立 key", {}, "已 fallback 英文標題")
-            except Exception:
-                pass
+        # Andrew 2026-06-19: quota exhaustion should silently fall back here;
+        # do not send a separate Discord quota-pressure alert.
     except Exception:
         pass
     return fallback

@@ -179,6 +179,30 @@ def list_overdue(group_id: str, max_days: int = MAX_OVERDUE_DAYS_TO_REMIND) -> l
     return [dict(r) for r in rows]
 
 
+def list_pending(
+    group_id: str,
+    limit: int = 20,
+    due_date: str | None = None,
+) -> list[dict]:
+    """List pending todos for immediate query replies."""
+    limit = max(1, min(int(limit), 50))
+    with _lock, _conn() as c:
+        c.row_factory = sqlite3.Row
+        if due_date:
+            rows = c.execute(
+                "SELECT * FROM todos WHERE group_id=? AND status='pending' "
+                "AND due_date=? ORDER BY created_at ASC LIMIT ?",
+                (group_id, due_date, limit),
+            ).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT * FROM todos WHERE group_id=? AND status='pending' "
+                "ORDER BY due_date IS NULL, due_date ASC, created_at ASC LIMIT ?",
+                (group_id, limit),
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def mark_reminded(todo_id: str) -> None:
     with _lock, _conn() as c:
         c.execute(

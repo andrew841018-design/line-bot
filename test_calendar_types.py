@@ -195,6 +195,23 @@ def test_regex_extract_sets_event_type():
     assert out["has_event"] is False
 
 
+def test_regex_extract_many_splits_two_dated_events():
+    import calendar_regex
+    from datetime import date as _d
+
+    text = (
+        "咪寶麻煩提醒我7月4日台北市東海大學校友會在美僑俱樂部聚會"
+        "上午10:30到下午14:30以及7月11日在台北六福萬怡酒店9樓-海山廳"
+        "（南港火車站B棟，忠孝東路七段359號9樓）13:10-16:30。"
+    )
+    events = calendar_regex.extract_many_regex_only(text, _d(2026, 6, 19))
+
+    assert [ev["date"] for ev in events] == ["2026-07-04", "2026-07-11"]
+    assert [ev["time"] for ev in events] == ["10:30", "13:10"]
+    assert any("美僑" in (ev["location"] or "") for ev in events)
+    assert any("六福萬怡酒店" in (ev["location"] or "") for ev in events)
+
+
 # ── 額外：past date keyword resolve ─────────────────────────────────────
 def test_resolve_past_date_keywords():
     import main

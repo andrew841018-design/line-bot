@@ -1470,6 +1470,84 @@ def _alias_from_user_id(user_id: str | None) -> str:
         return ""
 
 
+def _event_actor_role(event_type: str | None) -> str:
+    if event_type == "personal_trip":
+        return "旅者"
+    if event_type == "medical":
+        return "就醫"
+    return "主角"
+
+
+def _participants_contain_actor(participants: list[str], actor: str) -> bool:
+    return any(actor in p for p in participants)
+
+
+def _has_specific_family_actor(text: str, ignored: set[str] | None = None) -> bool:
+    ignored = ignored or set()
+    for term in _FAMILY_ACTOR_TERMS:
+        normalized = _normalize_family_actor(term)
+        if normalized in ignored:
+            continue
+        if _family_name_in_text(text, normalized):
+            return True
+    return False
+
+
+def _apply_sender_first_person_event(data: dict, sender_user_id: str | None) -> None:
+    """Resolve first-person event wording to the LINE sender alias.
+
+    Calendar extraction sees only text, so family shorthand like "我到高雄"
+    can otherwise be persisted as "我". The sender id is available in webhook
+    context; use the local alias map as a deterministic post-process.
+    """
+    actor = _alias_from_user_id(sender_user_id)
+    if not actor:
+        return
+
+    title = str(data.get("title") or "")
+    title_changed = False
+    if title:
+        new_title = re.sub(r"^我的", f"{actor}的", title)
+        new_title = re.sub(r"^我(?=[^\s，。！？!?、,.;])", actor, new_title)
+        title_changed = new_title != title
+        data["title"] = new_title
+
+    participants = [str(p) for p in (data.get("participants") or []) if p]
+    new_parts: list[str] = []
+    participant_changed = False
+    for part in participants:
+        new_part = re.sub(r"^我(?=(?:\(|（|$))", actor, part)
+        participant_changed = participant_changed or new_part != part
+        new_parts.append(new_part)
+
+    if (title_changed or participant_changed) and not _participants_contain_actor(
+        new_parts, actor
+    ):
+        new_parts.insert(0, f"{actor}({_event_actor_role(data.get('event_type'))})")
+    data["participants"] = new_parts
+
+
+def _apply_family_context_defaults(data: dict, combined_text: str) -> None:
+    """Apply stable family-specific defaults after model extraction."""
+    haystack = " ".join(
+        str(x or "")
+        for x in (
+            combined_text,
+            data.get("title"),
+            data.get("location"),
+        )
+    )
+    if "東海" not in haystack:
+        return
+    participants = [str(p) for p in (data.get("participants") or []) if p]
+    if _has_specific_family_actor(str(data.get("title") or ""), {"爸爸", "全家"}):
+        return
+    if any(_has_specific_family_actor(p, {"爸爸", "全家"}) for p in participants):
+        return
+    if not _participants_contain_actor(participants, "爸爸"):
+        data["participants"] = ["爸爸(東海相關)", *participants]
+
+
 def _infer_medical_actor(text: str, user_id: str | None = None) -> str | None:
     """Infer who the medical reminder/event is for.
 
@@ -1586,6 +1664,442 @@ def _auto_capture_text_if_important(
     threading.Thread(target=_bg, daemon=True).start()
 
 
+_CALENDAR_CORRECTION_MARKER_RE = re.compile(
+    r"(?:更正|修正|校正|改成|改為|改到|改在|改至)"
+)
+_CALENDAR_CORRECTION_NEGATION_RE = re.compile(
+    r"(?:不用|不要|先別|先不要|暫時不要).{0,6}(?:更正|修正|校正|改)"
+)
+_ZH_NUMERAL = {
+    "零": 0,
+    "〇": 0,
+    "一": 1,
+    "二": 2,
+    "兩": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
+_CALENDAR_CORRECTION_KEYWORDS: tuple[str, ...] = (
+    "羽球", "打球", "聚餐", "吃飯", "生日", "出遊", "旅行", "回台北",
+    "回老家", "看醫生", "牙醫", "洗牙", "拿蛋糕", "蛋糕", "包裹",
+    "接媽媽", "接爸爸", "媽媽", "爸爸", "姊姊", "妹妹", "弟弟", "全家",
+)
+_CALENDAR_CORRECTION_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "羽球": ("羽球", "打球"),
+    "打球": ("打球", "羽球"),
+    "洗牙": ("洗牙", "牙醫"),
+    "牙醫": ("牙醫", "洗牙"),
+}
+_CALENDAR_CORRECTION_ACTORS: tuple[str, ...] = (
+    "全家", "媽媽", "爸爸", "姊姊", "姐姐", "妹妹", "弟弟", "哥哥",
+    "爺爺", "奶奶", "黃聖雅", "黃聖穎", "聖雅", "聖穎",
+)
+
+
+def _parse_zh_int(raw: str | None) -> int | None:
+    s = (raw or "").strip()
+    if not s:
+        return None
+    if s.isdigit():
+        return int(s)
+    if s in _ZH_NUMERAL:
+        return _ZH_NUMERAL[s]
+    if s == "十":
+        return 10
+    if "十" in s:
+        left, _, right = s.partition("十")
+        tens = 1 if not left else _ZH_NUMERAL.get(left)
+        ones = 0 if not right else _ZH_NUMERAL.get(right)
+        if tens is None or ones is None:
+            return None
+        return tens * 10 + ones
+    return None
+
+
+def _parse_calendar_correction_time(text: str) -> str | None:
+    s = (text or "").strip()
+    if not s:
+        return None
+
+    m = re.search(r"(?<!\d)([01]?\d|2[0-3])\s*[:：]\s*([0-5]\d)(?!\d)", s)
+    if m:
+        return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
+
+    cn = "零〇一二兩三四五六七八九十"
+    m = re.search(
+        rf"(凌晨|早上|上午|中午|下午|晚上|傍晚|晚間)?\s*"
+        rf"(\d{{1,2}}|[{cn}]{{1,3}})\s*(?:點|時)\s*"
+        rf"(半|(?:\d{{1,2}}|[{cn}]{{1,3}})\s*分?)?",
+        s,
+    )
+    if m:
+        period = m.group(1) or ""
+        hour = _parse_zh_int(m.group(2))
+        minute_raw = (m.group(3) or "").replace("分", "").strip()
+        minute = 30 if minute_raw == "半" else (_parse_zh_int(minute_raw) or 0)
+        if hour is None or hour > 23 or minute > 59:
+            return None
+        if period in ("下午", "晚上", "傍晚", "晚間") and 1 <= hour <= 11:
+            hour += 12
+        elif period == "中午" and hour == 0:
+            hour = 12
+        return f"{hour:02d}:{minute:02d}"
+
+    m = re.search(
+        r"(?<![\d年月日/\-])([01]?\d|2[0-3])([0-5]\d)(?![\d年月日/\-])",
+        s,
+    )
+    if m:
+        return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
+    return None
+
+
+def _parse_calendar_absolute_date(text: str):
+    s = text or ""
+    today = datetime.now(ZoneInfo("Asia/Taipei")).date()
+    patterns = (
+        r"(?P<y>\d{4})[-/](?P<m>\d{1,2})[-/](?P<d>\d{1,2})",
+        r"(?P<m>\d{1,2})\s*月\s*(?P<d>\d{1,2})\s*[日號]?",
+        r"(?P<m>\d{1,2})/(?P<d>\d{1,2})",
+    )
+    for pat in patterns:
+        m = re.search(pat, s)
+        if not m:
+            continue
+        try:
+            year = int(m.groupdict().get("y") or today.year)
+            return datetime(year, int(m.group("m")), int(m.group("d"))).date()
+        except ValueError:
+            return None
+    return None
+
+
+def _resolve_calendar_correction_date(text: str):
+    return _parse_calendar_absolute_date(text) or _resolve_relative_date(text)
+
+
+def _calendar_correction_keywords(text: str) -> list[str]:
+    found: list[str] = []
+    candidates = [*_CALENDAR_CORRECTION_KEYWORDS]
+    try:
+        candidates.extend(_QUERY_NOUN_KEYWORDS)
+    except NameError:
+        pass
+    for kw in candidates:
+        if kw and kw in text and kw not in found:
+            found.append(kw)
+            for syn in _CALENDAR_CORRECTION_SYNONYMS.get(kw, ()):
+                if syn not in found:
+                    found.append(syn)
+
+    if found:
+        return found
+
+    marker = _CALENDAR_CORRECTION_MARKER_RE.search(text)
+    prefix = text[: marker.start()] if marker else text
+    cleaned = re.sub(
+        r"(今天|明天|後天|大後天|這週|本週|下週|週[一二三四五六日天]|"
+        r"\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}/\d{1,2}|"
+        r"\d{1,2}\s*月\s*\d{1,2}\s*[日號]?|"
+        r"[早上上午中午下午晚上傍晚晚間凌晨半點時分\d:：\s，,。.!！?？、])",
+        "",
+        prefix,
+    )
+    cleaned = cleaned.strip()
+    return [cleaned] if len(cleaned) >= 2 else []
+
+
+def _calendar_correction_content_candidate(text: str) -> str:
+    s = (text or "").strip()
+    if not s:
+        return ""
+    s = _CALENDAR_CORRECTION_MARKER_RE.sub(" ", s)
+    s = re.sub(r"^[\s為成到在至是:：]+", " ", s)
+    s = re.sub(
+        r"(今天|明天|後天|大後天|這週|本週|下週|週[一二三四五六日天]|"
+        r"\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}/\d{1,2}|"
+        r"\d{1,2}\s*月\s*\d{1,2}\s*[日號]?)",
+        " ",
+        s,
+    )
+    s = re.sub(r"(?<!\d)([01]?\d|2[0-3])\s*[:：]\s*([0-5]\d)(?!\d)", " ", s)
+    s = re.sub(r"(?<![\d年月日/\-])([01]?\d|2[0-3])([0-5]\d)(?![\d年月日/\-])", " ", s)
+    s = re.sub(
+        r"(凌晨|早上|上午|中午|下午|晚上|傍晚|晚間)?\s*"
+        r"[\d零〇一二兩三四五六七八九十]{1,3}\s*(?:點|時)"
+        r"(?:半|[\d零〇一二兩三四五六七八九十]{1,3}\s*分?)?",
+        " ",
+        s,
+    )
+    s = re.sub(r"[\s，,。.!！?？、]+", "", s)
+    return s if len(s) >= 2 else ""
+
+
+def _calendar_correction_title_candidate(text: str) -> str:
+    s = (text or "").strip()
+    marker = _CALENDAR_CORRECTION_MARKER_RE.search(s)
+    if not marker:
+        return ""
+    suffix = _calendar_correction_content_candidate(s[marker.end():])
+    if suffix:
+        return suffix
+    return _calendar_correction_content_candidate(s[: marker.start()])
+
+
+def _calendar_correction_new_title(text: str, target_title: str | None) -> str | None:
+    candidate = _calendar_correction_title_candidate(text)
+    if not candidate:
+        return None
+    target = (target_title or "").strip()
+    if target and candidate in target:
+        return None
+    if target and candidate == "羽球" and "打球" in target and "羽球" not in target:
+        return target.replace("打球", "羽球")
+    if target and candidate == "洗牙" and "牙醫" in target and "洗牙" not in target:
+        return target.replace("看牙醫", "洗牙").replace("牙醫", "洗牙")
+    if target:
+        for actor in _CALENDAR_CORRECTION_ACTORS:
+            normalized_actor = _normalize_family_actor(actor)
+            if normalized_actor in target and normalized_actor not in candidate:
+                if len(candidate) <= 8:
+                    return f"{normalized_actor}{candidate}"
+                break
+    return candidate
+
+
+def _parse_calendar_correction(text: str) -> dict | None:
+    s = (text or "").strip()
+    if not s or _CALENDAR_CORRECTION_NEGATION_RE.search(s):
+        return None
+    marker = _CALENDAR_CORRECTION_MARKER_RE.search(s)
+    if not marker:
+        return None
+
+    prefix = s[: marker.start()]
+    suffix = s[marker.end():]
+    suffix_date = _resolve_calendar_correction_date(suffix)
+    new_date = suffix_date
+    target_date = _resolve_calendar_correction_date(prefix)
+    if target_date is None and new_date is None:
+        target_date = _resolve_calendar_correction_date(s)
+    if new_date is None:
+        new_date = target_date
+    new_time = _parse_calendar_correction_time(
+        suffix
+    ) or _parse_calendar_correction_time(s)
+    title_candidate = _calendar_correction_title_candidate(s)
+    if new_date is None and new_time is None and not title_candidate:
+        return None
+    keywords = _calendar_correction_keywords(prefix or s)
+    if not keywords and target_date is None and not title_candidate:
+        return None
+    return {
+        "target_date": target_date.isoformat() if target_date else None,
+        "new_date": new_date.isoformat() if new_date else None,
+        "new_date_explicit": suffix_date is not None,
+        "new_time": new_time,
+        "new_title_raw": title_candidate,
+        "keywords": keywords,
+    }
+
+
+def _find_calendar_correction_event(
+    group_id: str, keywords: list[str], target_date: str | None
+) -> dict | None:
+    import calendar_db
+
+    seen: set[str] = set()
+    candidates: list[dict] = []
+    for kw in keywords:
+        try:
+            rows = calendar_db.search_by_keyword(group_id, [kw], limit=10)
+        except Exception as e:
+            logger.debug("calendar correction keyword search failed kw=%s: %s", kw, e)
+            rows = []
+        for row in rows:
+            ev_id = str(row.get("event_id") or "")
+            if ev_id and ev_id not in seen:
+                seen.add(ev_id)
+                candidates.append(row)
+
+    if target_date:
+        dated = [row for row in candidates if row.get("event_date") == target_date]
+        if dated:
+            return dated[0]
+    if candidates:
+        return candidates[0]
+
+    if target_date:
+        try:
+            events = calendar_db.list_upcoming(group_id, days=90) + calendar_db.list_past(
+                group_id, days=30
+            )
+            same_day = [row for row in events if row.get("event_date") == target_date]
+            if len(same_day) == 1:
+                return same_day[0]
+        except Exception as e:
+            logger.debug("calendar correction same-day fallback failed: %s", e)
+    return None
+
+
+def _reminder_matches_calendar_correction(
+    reminder: dict,
+    keywords: list[str],
+    target_date: str | None,
+) -> bool:
+    if target_date:
+        try:
+            rdate = datetime.fromtimestamp(
+                int(reminder["remind_at"]), tz=ZoneInfo("Asia/Taipei")
+            ).date().isoformat()
+        except Exception:
+            return False
+        if rdate != target_date:
+            return False
+    if not keywords:
+        return True
+    haystack = f"{reminder.get('action') or ''} {reminder.get('source_text') or ''}"
+    return any(kw and kw in haystack for kw in keywords)
+
+
+def _update_calendar_correction_reminders(
+    group_id: str,
+    keywords: list[str],
+    target_date: str | None,
+    new_date: str | None,
+    new_time: str | None,
+    new_action: str | None,
+    source_text: str,
+) -> int:
+    try:
+        reminders = memory.list_pending_reminders(group_id)
+    except Exception as e:
+        logger.warning("calendar correction reminder lookup failed: %s", e)
+        return 0
+
+    updated = 0
+    for reminder in reminders:
+        if not _reminder_matches_calendar_correction(reminder, keywords, target_date):
+            continue
+        try:
+            old_dt = datetime.fromtimestamp(
+                int(reminder["remind_at"]), tz=ZoneInfo("Asia/Taipei")
+            )
+            date_part = (
+                datetime.fromisoformat(new_date).date() if new_date else old_dt.date()
+            )
+            if new_time:
+                hour_s, minute_s = new_time.split(":", 1)
+                hour, minute = int(hour_s), int(minute_s)
+            else:
+                hour, minute = old_dt.hour, old_dt.minute
+            new_dt = datetime(
+                date_part.year,
+                date_part.month,
+                date_part.day,
+                hour,
+                minute,
+                tzinfo=ZoneInfo("Asia/Taipei"),
+            )
+        except Exception as e:
+            logger.debug("calendar correction reminder compose failed: %s", e)
+            continue
+        if memory.update_reminder_schedule(
+            int(reminder["reminder_id"]),
+            int(new_dt.timestamp()),
+            source_text=source_text[:200],
+            action=new_action,
+        ):
+            updated += 1
+    return updated
+
+
+def _try_handle_calendar_correction(
+    event: MessageEvent, group_id: str, text: str
+) -> bool:
+    correction = _parse_calendar_correction(text)
+    if correction is None:
+        return False
+
+    import calendar_db
+
+    keywords = list(correction["keywords"])
+    target = _find_calendar_correction_event(
+        group_id, keywords, correction.get("target_date")
+    )
+    if target:
+        for kw in (target.get("title") or "", target.get("location") or ""):
+            if kw and kw not in keywords:
+                keywords.append(kw)
+    new_title = _calendar_correction_new_title(text, (target or {}).get("title"))
+    if new_title and new_title not in keywords:
+        keywords.append(new_title)
+
+    if target and not correction.get("new_date_explicit"):
+        target_date = target.get("event_date")
+        new_date = target.get("event_date")
+    else:
+        target_date = correction.get("target_date") or (target or {}).get("event_date")
+        new_date = correction.get("new_date") or target_date
+    new_time = correction.get("new_time")
+
+    event_updated = False
+    if target and new_date:
+        try:
+            event_updated = calendar_db.update_event_schedule(
+                target["event_id"], new_date, new_time, title=new_title
+            )
+        except Exception as e:
+            logger.warning("calendar correction event update failed: %s", e)
+
+    reminders_updated = _update_calendar_correction_reminders(
+        group_id=group_id,
+        keywords=keywords,
+        target_date=target_date,
+        new_date=new_date,
+        new_time=new_time,
+        new_action=new_title,
+        source_text=text,
+    )
+
+    if not event_updated and reminders_updated == 0:
+        label = " / ".join(correction.get("keywords") or []) or "這筆"
+        when = target_date or correction.get("new_date") or "指定日期"
+        reply = f"有收到更正，但找不到 {when} 的「{label}」行程或提醒。"
+    else:
+        title = new_title or (target or {}).get("title") or "相關提醒"
+        when_parts = [new_date or ""]
+        if new_time:
+            when_parts.append(new_time)
+        when = " ".join(p for p in when_parts if p).strip()
+        reply = f"已更正：{when} {title}".strip()
+        details: list[str] = []
+        if event_updated:
+            details.append("行事曆已更新")
+        if reminders_updated:
+            details.append(f"提醒已同步更新 {reminders_updated} 筆")
+        if details:
+            reply += "\n" + "、".join(details)
+
+    burst_filter.cancel_burst(group_id)
+    memory.append_turn(group_id, "user", text)
+    memory.append_turn(group_id, "bot", reply)
+    _reply(event.reply_token, reply, group_id=group_id)
+    logger.info(
+        "calendar correction handled group=%s event_updated=%s reminders_updated=%d text=%r",
+        group_id,
+        event_updated,
+        reminders_updated,
+        text[:80],
+    )
+    return True
+
+
 def _handle_text_message(event: MessageEvent, group_id: str) -> None:
     text = event.message.text or ""
 
@@ -1596,6 +2110,11 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
             feedback_collector.collect_message(sender, text)
         except Exception as e:
             logger.warning("[Feedback] collect_message failed: %s", e)
+
+    # 使用者更正既有行程/提醒時，必須即時回覆並同步改 events + reminders。
+    # 放在 auto-capture / reminder extraction 前，避免更正句被誤當成新提醒。
+    if _try_handle_calendar_correction(event, group_id, text):
+        return
 
     # Organic 糾正偵測（2026-05-08 加）：user 講「不對 / 你誤會」之類的
     # 自然糾正訊號 → 抓上一輪 user/bot 訊息拼成 correction 寫進 persona_notes
@@ -1647,21 +2166,27 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
         _reply(event.reply_token, cmd_reply, group_id=group_id)
         return
 
-    # 2. 晚餐推薦觸發
+    # 2. 待辦 / 提醒查詢 — deterministic path，不需要 @mention 也能即時查 DB
+    if _is_todo_query(text):
+        burst_filter.cancel_burst(group_id)
+        _handle_todo_query(event, group_id, text)
+        return
+
+    # 3. 晚餐推薦觸發
     if _is_dinner_question(text):
         burst_filter.cancel_burst(group_id)
         _handle_dinner_recommendation(event, group_id)
         return
 
-    # 3. Explicit 觸發（@mention / /ai / /問 ...）→ 立刻處理，並取消 pending burst
+    # 4. Explicit 觸發（@mention / /ai / /問 ...）→ 立刻處理，並取消 pending burst
     clean_text = _extract_gemini_trigger(text, event.message)
     if clean_text is not None:
         burst_filter.cancel_burst(group_id)
         _handle_explicit_text(event, group_id, clean_text)
         return
 
-    # 4. 其他文字訊息 → burst_filter debounce（等對方說完再回）
-    # 4a. fast-path：如果有 due reminder 沒推過，搶在 burst_filter 累積前用 reply_token
+    # 5. 其他文字訊息 → burst_filter debounce（等對方說完再回）
+    # 5a. fast-path：如果有 due reminder 沒推過，搶在 burst_filter 累積前用 reply_token
     # 推 reminder（LINE push quota 爆時的補救路徑 — reply API 不耗月配額）
     if _try_piggyback_reminders_fast_path(event.reply_token, group_id):
         return
@@ -1936,6 +2461,167 @@ def _format_calendar_event(ev: dict) -> str:
     return "\n".join(lines)
 
 
+_TODO_QUERY_RE = re.compile(
+    r"(?:待辦事項|待辦|提醒事項|提醒清單|提醒列表|會提醒的時間|提醒.*時間|"
+    r"有哪些.{0,8}(?:待辦|提醒|要做|事項)|"
+    r"目前.{0,8}(?:待辦|提醒|要做)|"
+    r"還有.{0,8}(?:待辦|提醒|要做|事項))"
+)
+_TODO_CREATE_RE = re.compile(
+    r"(?:提醒我|幫我提醒|新增|加一個|加入|設定提醒|記得提醒|麻煩提醒)"
+)
+_TODO_QUERY_INTENT_RE = re.compile(
+    r"(?:哪些|目前|還有|清單|列表|查|看看|告訴我|會提醒的時間)"
+)
+
+
+def _is_todo_query(text: str) -> bool:
+    """Detect questions asking the bot to read stored todos/reminders."""
+    s = (text or "").strip()
+    if not s:
+        return False
+    if _TODO_CREATE_RE.search(s) and not _TODO_QUERY_INTENT_RE.search(s):
+        return False
+    return bool(_TODO_QUERY_RE.search(s))
+
+
+def _fmt_todo_date(value: str | None) -> str:
+    return value or "未設定日期"
+
+
+def _fmt_remind_at(ts: int | float | None) -> str:
+    if not ts:
+        return "未設定時間"
+    try:
+        return datetime.fromtimestamp(int(ts), tz=ZoneInfo("Asia/Taipei")).strftime(
+            "%Y-%m-%d %H:%M"
+        )
+    except Exception:
+        return "未設定時間"
+
+
+def _event_line(ev: dict) -> str:
+    title = ev.get("title") or ""
+    date_s = ev.get("event_date") or ""
+    time_s = ev.get("event_time") or ""
+    location = ev.get("location") or ""
+    parts_raw = ev.get("participants") or "[]"
+    try:
+        parts = _json.loads(parts_raw) if isinstance(parts_raw, str) else parts_raw
+    except Exception:
+        parts = []
+    when = f"{date_s}{(' ' + time_s) if time_s else ''}".strip()
+    tail = f" @ {location}" if location else ""
+    people = f"（{'、'.join(parts)}）" if parts else ""
+    return f"- {when} {title}{tail}{people}".strip()
+
+
+def _build_todo_status_reply(group_id: str, clean_text: str = "") -> str:
+    """Read todos + exact-time reminders + calendar events for immediate replies."""
+    import calendar_db
+    import todo
+
+    target = _resolve_relative_date(clean_text)
+    target_iso = target.isoformat() if target else None
+
+    try:
+        todos = todo.list_pending(group_id, limit=10, due_date=target_iso)
+    except Exception as e:
+        logger.warning("todo query list_pending failed: %s", e)
+        todos = []
+
+    try:
+        reminders = memory.list_pending_reminders(
+            group_id, within_seconds=90 * 86400
+        )
+    except Exception as e:
+        logger.warning("todo query list_pending_reminders failed: %s", e)
+        reminders = []
+    if target_iso:
+        reminders = [
+            r for r in reminders
+            if _fmt_remind_at(r.get("remind_at")).startswith(target_iso)
+        ]
+
+    try:
+        if target_iso:
+            events_all = (
+                calendar_db.list_past(group_id, days=90)
+                + calendar_db.list_upcoming(group_id, days=90)
+            )
+            events = [e for e in events_all if e.get("event_date") == target_iso]
+        else:
+            events = calendar_db.list_upcoming(group_id, days=30)
+    except Exception as e:
+        logger.warning("todo query calendar list failed: %s", e)
+        events = []
+
+    header = (
+        f"{target_iso} 的待辦/提醒："
+        if target_iso else "目前待辦/提醒："
+    )
+    lines: list[str] = [header]
+    has_any = False
+
+    if todos:
+        has_any = True
+        lines.append("\n待辦事項：")
+        for item in todos[:10]:
+            owner = _alias_from_user_id(item.get("sender_user_id") or "")
+            owner_part = f"（{owner}）" if owner else ""
+            lines.append(
+                f"- {_fmt_todo_date(item.get('due_date'))} {item.get('task', '')}{owner_part}"
+            )
+
+    if reminders:
+        has_any = True
+        lines.append("\n精準提醒：")
+        for item in reminders[:10]:
+            mentions = item.get("mention_aliases") or []
+            mention_part = f"（{'、'.join(mentions)}）" if mentions else ""
+            lines.append(
+                f"- {_fmt_remind_at(item.get('remind_at'))} {item.get('action', '')}{mention_part}"
+            )
+
+    if events:
+        has_any = True
+        label = "行事曆：" if target_iso else "未來 30 天行事曆："
+        lines.append(f"\n{label}")
+        for ev in events[:10]:
+            lines.append(_event_line(ev))
+
+    if not has_any:
+        return (
+            f"{target_iso} 沒有查到 pending 待辦、精準提醒或行事曆。"
+            if target_iso
+            else "目前沒有查到 pending 待辦、精準提醒或未來 30 天行事曆。"
+        )
+    return "\n".join(lines)
+
+
+def _handle_todo_query(
+    event: MessageEvent, group_id: str, clean_text: str
+) -> None:
+    """deterministic todo/reminder query path — read DB, skip LLM."""
+    reply = _build_todo_status_reply(group_id, clean_text)
+    reply_text = _md_to_line(reply)
+    try:
+        if not settings.bot_muted:
+            with ApiClient(_get_line_config()) as api_client:
+                MessagingApi(api_client).reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text=reply_text)],
+                    )
+                )
+        logger.info("todo query reply sent group=%s", group_id)
+    except Exception as e:
+        logger.warning("todo query reply failed: %s", e)
+
+    memory.append_turn(group_id, "user", clean_text)
+    memory.append_turn(group_id, "bot", reply)
+
+
 def _handle_calendar_query(
     event: MessageEvent, group_id: str, clean_text: str
 ) -> None:
@@ -2106,6 +2792,15 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
         _reply(event.reply_token, "嗯？\n怎麼了嗎\n要找我什麼啦", group_id=group_id)
         return
 
+    # 待辦 / 提醒查詢 — deterministic path，不依賴 Gemini quota
+    if clean_text and _is_todo_query(clean_text):
+        logger.info(
+            "todo query routed: text=%r group=%s",
+            clean_text[:50], group_id,
+        )
+        _handle_todo_query(event, group_id, clean_text)
+        return
+
     # 行事曆查詢 — deterministic path，不依賴 Gemini quota
     # （GP2 反饋：query 不該綁 lite_reply Stage 1，layer 對齊）
     if clean_text and _is_calendar_query(clean_text):
@@ -2179,7 +2874,7 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
                 logger.warning("lite_reply retry failed: %s", e2)
                 reply_text = ""
             if not reply_text:
-                _maybe_capture_calendar_event(group_id, clean_text)
+                _maybe_capture_calendar_event(group_id, clean_text, sender_user_id)
                 if _pending_reply_enabled():
                     _save_pending_burst_text(group_id, clean_text or user_input)
                 else:
@@ -2202,7 +2897,7 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
     # 不會進入。pending reply 已停用；quota empty 時不補答，也不送即時 fallback。
     if not reply_text or not reply_text.strip():
         if _quota_exhausted():
-            _maybe_capture_calendar_event(group_id, clean_text)
+            _maybe_capture_calendar_event(group_id, clean_text, sender_user_id)
             if _pending_reply_enabled():
                 _save_pending_burst_text(group_id, clean_text or user_input)
             else:
@@ -2233,7 +2928,7 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
     )
     # 14:51 case: 家人在 explicit 路徑手打「YYYY-MM-DD HH:MM 拿蛋糕」，
     # 之前 _maybe_capture_calendar_event 只在 burst 路徑跑，explicit 完全沒抽。
-    _maybe_capture_calendar_event(group_id, clean_text)
+    _maybe_capture_calendar_event(group_id, clean_text, sender_user_id)
 
 
 def _handle_burst_flush(group_id: str, combined_text: str, reply_token: str) -> None:
@@ -2382,20 +3077,21 @@ def _maybe_capture_calendar_event(
         import calendar_extractor
 
         data = calendar_extractor.extract(combined_text)
-        if data["is_cancellation"]:
-            kw = data.get("cancel_target_keyword")
+        extracted = calendar_extractor.extract_many(combined_text, primary=data)
+        if extracted["is_cancellation"]:
+            kw = extracted.get("cancel_target_keyword")
             target = calendar_db.find_active_event(
-                group_id, keyword=kw, near_date=data.get("date")
+                group_id, keyword=kw, near_date=extracted.get("date")
             )
             if target:
-                if data.get("date") and data["date"] != target["event_date"]:
+                if extracted.get("date") and extracted["date"] != target["event_date"]:
                     calendar_db.update_event_date(
-                        target["event_id"], data["date"], data.get("time")
+                        target["event_id"], extracted["date"], extracted.get("time")
                     )
                     logger.info(
                         "calendar event rescheduled: %s → %s (group=%s)",
                         target["event_id"],
-                        data["date"],
+                        extracted["date"],
                         group_id,
                     )
                 else:
@@ -2407,7 +3103,8 @@ def _maybe_capture_calendar_event(
                         group_id,
                     )
             return
-        if data["has_event"] and data.get("title") and data.get("date"):
+
+        for data in extracted.get("events") or []:
             actor = None
             if data.get("event_type") == "medical":
                 actor = _infer_medical_actor(combined_text, sender_user_id)
@@ -2415,6 +3112,9 @@ def _maybe_capture_calendar_event(
                 data["participants"] = _with_medical_actor_participant(
                     data.get("participants"), actor
                 )
+            else:
+                _apply_sender_first_person_event(data, sender_user_id)
+            _apply_family_context_defaults(data, combined_text)
             event_id = calendar_db.insert_event(
                 group_id=group_id,
                 title=data["title"],
@@ -4810,6 +5510,9 @@ def _handle_command(group_id: str, text: str) -> str | None:
         return _handle_layer2_correction(group_id, reason)
 
     # ── 家族行事曆 ──────────────────────────────────────────────
+    if t in ("/待辦", "/提醒事項", "/提醒清單"):
+        return _build_todo_status_reply(group_id, t)
+
     if t in ("/行事曆", "/活動", "/聚餐"):
         return _format_calendar(group_id)
 
@@ -4880,6 +5583,7 @@ _HELP_TEXT = (
     "  /採用                   列出待採用的建議\n"
     "  /採用 1 2 / 全部 / 無   把建議升級成正式規則\n"
     "【家族行事曆】\n"
+    "  /待辦                   列出 pending 待辦、提醒與近期行事曆\n"
     "  /行事曆                 列出未來 30 天的家族活動\n"
     "  /取消活動 <關鍵字>      取消含關鍵字的活動\n"
     "【其他】\n"
