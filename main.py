@@ -2159,34 +2159,47 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
     )
 
     # 1. 指令處理（指令不需要 @mention 也能用，方便管理）
-    cmd_reply = _handle_command(group_id, text)
+    sender_uid_for_command = getattr(event.source, "user_id", None) or ""
+    cmd_reply = _handle_command(
+        group_id,
+        text,
+        sender_uid_for_command,
+        event.message.id,
+    )
     if cmd_reply is not None:
         # 指令是 explicit 操作 → 取消任何待處理的 burst
         burst_filter.cancel_burst(group_id)
         _reply(event.reply_token, cmd_reply, group_id=group_id)
         return
 
-    # 2. 待辦 / 提醒查詢 — deterministic path，不需要 @mention 也能即時查 DB
+    # 2. 群組民調 — deterministic path。自然句開民調；active poll 期間讀取短回覆。
+    poll_reply = _handle_poll_text(event, group_id, text)
+    if poll_reply is not None:
+        burst_filter.cancel_burst(group_id)
+        _reply(event.reply_token, poll_reply, group_id=group_id)
+        return
+
+    # 3. 待辦 / 提醒查詢 — deterministic path，不需要 @mention 也能即時查 DB
     if _is_todo_query(text):
         burst_filter.cancel_burst(group_id)
         _handle_todo_query(event, group_id, text)
         return
 
-    # 3. 晚餐推薦觸發
+    # 4. 晚餐推薦觸發
     if _is_dinner_question(text):
         burst_filter.cancel_burst(group_id)
         _handle_dinner_recommendation(event, group_id)
         return
 
-    # 4. Explicit 觸發（@mention / /ai / /問 ...）→ 立刻處理，並取消 pending burst
+    # 5. Explicit 觸發（@mention / /ai / /問 ...）→ 立刻處理，並取消 pending burst
     clean_text = _extract_gemini_trigger(text, event.message)
     if clean_text is not None:
         burst_filter.cancel_burst(group_id)
         _handle_explicit_text(event, group_id, clean_text)
         return
 
-    # 5. 其他文字訊息 → burst_filter debounce（等對方說完再回）
-    # 5a. fast-path：如果有 due reminder 沒推過，搶在 burst_filter 累積前用 reply_token
+    # 6. 其他文字訊息 → burst_filter debounce（等對方說完再回）
+    # 6a. fast-path：如果有 due reminder 沒推過，搶在 burst_filter 累積前用 reply_token
     # 推 reminder（LINE push quota 爆時的補救路徑 — reply API 不耗月配額）
     if _try_piggyback_reminders_fast_path(event.reply_token, group_id):
         return
@@ -5372,9 +5385,57 @@ def _handle_food_command(group_id: str, text: str) -> str | None:
     return None
 
 
-def _handle_command(group_id: str, text: str) -> str | None:
+def _handle_poll_command(
+    group_id: str,
+    text: str,
+    user_id: str | None = None,
+    message_id: str = "",
+) -> str | None:
+    """Group poll commands. Kept separate so ordinary chat can still vote."""
+    try:
+        import family_poll
+
+        return family_poll.handle_command(
+            group_id,
+            text,
+            user_id=user_id,
+            source_msg_id=message_id,
+        )
+    except Exception as e:
+        logger.warning("poll command failed: %s", e)
+        return None
+
+
+def _handle_poll_text(event: MessageEvent, group_id: str, text: str) -> str | None:
+    """Natural poll creation and active-poll vote capture."""
+    try:
+        import family_poll
+
+        user_id = getattr(event.source, "user_id", None) or ""
+        msg_id = getattr(event.message, "id", "") or ""
+        return family_poll.handle_natural_message(
+            group_id,
+            text,
+            user_id=user_id,
+            source_msg_id=msg_id,
+        )
+    except Exception as e:
+        logger.warning("poll text handler failed: %s", e)
+        return None
+
+
+def _handle_command(
+    group_id: str,
+    text: str,
+    user_id: str | None = None,
+    message_id: str = "",
+) -> str | None:
     """有對應到指令回 str；沒有回 None。"""
     t = text.strip()
+
+    poll_reply = _handle_poll_command(group_id, t, user_id, message_id)
+    if poll_reply is not None:
+        return poll_reply
 
     # 家族飲食 / 食材媒合（2026-05-31 加；嚴格 == 無命中回 None，純 DB 跳過 Gemini）
     food_reply = _handle_food_command(group_id, t)
@@ -5566,6 +5627,11 @@ _HELP_TEXT = (
     "  /今晚煮什麼             用家裡現有食材推薦菜色\n"
     "  /該買什麼               待買食材清單\n"
     "  /家裡有什麼             目前記錄到的食材\n"
+    "【民調】\n"
+    "  /民調 <問題>            開一個群組民調，會 @all\n"
+    "  /民調                   看目前民調統計\n"
+    "  /催民調                 @all 提醒還沒回覆的人\n"
+    "  /關閉民調               關閉目前民調\n"
     "【記憶】\n"
     "  /看記憶                 看長期事實\n"
     "  /記住 <內容>            手動加一條事實\n"
