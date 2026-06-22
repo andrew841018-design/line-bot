@@ -27,6 +27,7 @@ from urllib3.util.retry import Retry  # noqa: E402
 
 import calendar_db  # noqa: E402
 import line_mentions  # noqa: E402
+from line_push_client import LinePushError, line_access_token, push_messages  # noqa: E402
 
 # 2026-05-29 加 retry 防 transient 5xx 一棒打死（GP2#2）
 # Retry 重試 500/502/503/504；429 monthly quota 不重試（HTTPAdapter 預設只 retry 表列 status）
@@ -53,19 +54,11 @@ GROUP_ID = (
     or os.environ.get("LINE_ALLOWED_GROUP_ID")
     or os.environ.get("ALLOWED_GROUP_ID", "")
 )
-_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 
 
 def _get_token() -> str:
-    """優先 line_token_cache.json (token_refresh job 每 10 分鐘 refresh)，
-    fallback .env long-lived token（向後相容）。"""
-    try:
-        import line_token_refresh
-        return line_token_refresh.get_line_token() or os.environ.get(
-            "LINE_CHANNEL_ACCESS_TOKEN", ""
-        )
-    except Exception:
-        return os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+    """優先 line_token_cache.json，fallback .env long-lived token（向後相容）。"""
+    return line_access_token()
 
 
 _OFFSET_LABEL: dict[int, str] = {
@@ -124,32 +117,27 @@ def _post_result(messages: list, retry_key: str | None = None) -> str:
     if not token or not GROUP_ID:
         logger.error("missing TOKEN or GROUP_ID; skip push")
         return POST_REJECT
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "X-Line-Retry-Key": retry_key or str(uuid.uuid4()),
-    }
     try:
-        resp = _session.post(
-            _PUSH_URL,
-            headers=headers,
-            json={"to": GROUP_ID, "messages": messages},
+        push_messages(
+            GROUP_ID,
+            messages,
+            retry_key=retry_key or str(uuid.uuid4()),
+            session=_session,
             timeout=10,
+            ok_statuses=(200, 409),
+            fallback_token=token,
         )
-        if resp.status_code in (200, 409):
-            return POST_OK
-        body = _redact_line_ids(resp.text)[:300]
+        return POST_OK
+    except LinePushError as e:
+        body = _redact_line_ids(e.response_text or str(e))[:300]
         logger.warning(
-            "LINE push failed %d: %s",
-            resp.status_code,
+            "LINE push failed %s: %s",
+            e.status_code or "request",
             body,
         )
-        if resp.status_code == 429 or resp.status_code >= 500:
+        if e.status_code is None or e.status_code == 429 or e.status_code >= 500:
             return POST_TRANSIENT
         return POST_REJECT
-    except Exception as e:
-        logger.warning("LINE push exception: %s", e)
-        return POST_TRANSIENT
 
 
 def _post(messages: list, retry_key: str | None = None) -> bool:

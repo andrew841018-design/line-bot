@@ -8,7 +8,9 @@ import os
 import sys
 import tempfile
 import time
+import types
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("LINE_CHANNEL_SECRET", "dummy_secret_32bytes_padding000")
@@ -40,6 +42,7 @@ def check(label: str, cond: bool) -> None:
     else:
         FAIL += 1
         print(f"  [FAIL] {label}")
+        raise AssertionError(label)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -54,14 +57,7 @@ def _make_group_source(group_id="GRP001", user_id="USR001"):
 
 
 def _make_text_msg(text="你好", msg_id="MSG001"):
-    msg = MagicMock(spec=TextMessageContent)
-    msg.id = msg_id
-    msg.text = text
-    msg.mention = None
-    msg.quoted_message_id = None
-    msg.quote_token = "qt"
-    msg.type = "text"
-    return msg
+    return TextMessageContent(id=msg_id, text=text, quoteToken="qt")
 
 
 def _make_message_event(msg, source=None, reply_token="TOKEN001"):
@@ -235,6 +231,7 @@ def test_handle_burst_flush_paths():
         patch("main._prefetch_urls", side_effect=lambda x: x),
         patch("main._llm_chat", side_effect=quota_exc),
         patch("main._mark_quota_exhausted") as mock_mark,
+        patch("main._maybe_capture_calendar_event"),
     ):
         main._handle_burst_flush("GRP001", "測試文字", "TOKEN")
     check("burst Gemini quota → mark exhausted", mock_mark.called)
@@ -253,7 +250,7 @@ def test_handle_burst_flush_paths():
         main._handle_burst_flush("GRP001", "測試文字", "TOKEN")
     check("burst 500 error → reply error msg", mock_reply.called)
 
-    # Empty LLM reply → skip send
+    # Empty LLM reply → send short fallback instead of silent drop
     with (
         patch("main.memory.check_fact_cache", return_value=None),
         patch("main.memory.get_context", return_value=[]),
@@ -264,7 +261,7 @@ def test_handle_burst_flush_paths():
         patch("main._reply") as mock_reply2,
     ):
         main._handle_burst_flush("GRP001", "測試文字", "TOKEN")
-    check("burst 空回覆 → 不 reply", not mock_reply2.called)
+    check("burst 空回覆 → fallback reply", mock_reply2.called)
 
     # Success path → store cache + reply
     with (
@@ -277,6 +274,7 @@ def test_handle_burst_flush_paths():
         patch("main.memory.store_fact_cache") as mock_store,
         patch("main.memory.append_turn"),
         patch("main._maybe_extract_facts"),
+        patch("main._maybe_capture_calendar_event"),
         patch("main._reply") as mock_reply3,
     ):
         main._handle_burst_flush("GRP001", "測試文字", "TOKEN")
@@ -309,13 +307,23 @@ def test_handle_file_message():
         "exe" in (mock_reply.call_args[0][1] if mock_reply.called else ""),
     )
 
-    # Quota exhausted → skip silently
+    # Quota exhausted still attempts local/file fallback; do not hit real local_llm.
     msg2 = _make_file_msg("test.txt")
     evt2 = _make_message_event(msg2)
     main._quota_exhausted_until_ts = time.time() + 3600
-    with patch("main._download_content") as mock_dl:
+    with (
+        patch("main._download_content", return_value=b"quota fallback content") as mock_dl,
+        patch("main.memory.get_context", return_value=[]),
+        patch("main.memory.top_facts", return_value=[]),
+        patch("main._get_persona_notes", return_value=[]),
+        patch("main._llm_chat", return_value="quota fallback reply"),
+        patch("main.memory.append_turn"),
+        patch("main._maybe_extract_facts"),
+        patch("main._reply") as mock_reply2,
+    ):
         main._handle_file_message(evt2, "GRP001")
-    check("quota 爆 file → 不 download", not mock_dl.called)
+    check("quota 爆 file → 仍嘗試 download", mock_dl.called)
+    check("quota 爆 file → fallback reply", mock_reply2.called)
     main._quota_exhausted_until_ts = 0.0
 
     # Download fails → reply error
@@ -417,11 +425,18 @@ def test_handle_dinner_recommendation():
     msg = _make_text_msg("今晚吃什麼")
     evt = _make_message_event(msg)
 
-    # quota exhausted → return early
+    # quota exhausted still goes through _llm_chat so local/lite fallback can answer.
     main._quota_exhausted_until_ts = time.time() + 3600
-    with patch("main._llm_chat") as mock_llm:
+    with (
+        patch("main.memory.get_context", return_value=[]),
+        patch("main.memory.top_facts", return_value=[]),
+        patch("main._get_persona_notes", return_value=[]),
+        patch("main._llm_chat", return_value="fallback dinner") as mock_llm,
+        patch("main._reply") as mock_reply0,
+    ):
         main._handle_dinner_recommendation(evt, "GRP001")
-    check("quota 爆 dinner → 不呼叫 LLM", not mock_llm.called)
+    check("quota 爆 dinner → 仍呼叫 LLM fallback", mock_llm.called)
+    check("quota 爆 dinner → reply fallback 結果", mock_reply0.called)
     main._quota_exhausted_until_ts = 0.0
 
     # Quota error during dinner
@@ -594,71 +609,89 @@ def test_guess_last_trigger_text():
 # ═══════════════════════════════════════════════════════════════════════════════
 def test_pop_pending_for_piggyback():
     print("\n── Test J: _pop_pending_for_piggyback ──")
+    import pending_store
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
         tmp = f.name
 
     orig_path = main._PENDING_EXPLICIT_PATH
+    orig_pending_enabled = main._PENDING_REPLY_ENABLED
+    orig_store_path = pending_store.PENDING_PATH
+    orig_store_lock = pending_store.LOCK_PATH
+    main._PENDING_REPLY_ENABLED = True
+    pending_path = Path(tmp)
+    pending_lock_path = Path(tmp + ".lock")
 
-    # Empty pending → None
-    with open(tmp, "w") as f:
-        json.dump({}, f)
-    main._PENDING_EXPLICIT_PATH = tmp
-    result = main._pop_pending_for_piggyback("GRP001")
-    check("空 pending → None", result is None)
+    try:
+        # Empty pending → None
+        with open(tmp, "w") as f:
+            json.dump({}, f)
+        main._PENDING_EXPLICIT_PATH = tmp
+        pending_store.PENDING_PATH = pending_path
+        pending_store.LOCK_PATH = pending_lock_path
+        result = main._pop_pending_for_piggyback("GRP001")
+        check("空 pending → None", result is None)
 
-    # Non-text batch → None
-    with open(tmp, "w") as f:
-        json.dump({"GRP001": [{"type": "audio", "text": ""}]}, f)
-    result2 = main._pop_pending_for_piggyback("GRP001")
-    check("非文字 pending → None", result2 is None)
+        # Non-text batch → None
+        with open(tmp, "w") as f:
+            json.dump({"GRP001": [{"type": "audio", "text": ""}]}, f)
+        result2 = main._pop_pending_for_piggyback("GRP001")
+        check("非文字 pending → None", result2 is None)
 
-    # LLM fails → None
-    with open(tmp, "w") as f:
-        json.dump({"GRP001": [{"type": "text", "text": "待回訊息"}]}, f)
-    with (
-        patch("main.memory.top_facts", return_value=[]),
-        patch("main.memory.get_context", return_value=[]),
-        patch("main._get_persona_notes", return_value=[]),
-        patch("main._llm_chat", side_effect=Exception("fail")),
-    ):
-        result3 = main._pop_pending_for_piggyback("GRP001")
-    check("LLM 失敗 → None", result3 is None)
+        # LLM fails → None
+        with open(tmp, "w") as f:
+            json.dump({"GRP001": [{"type": "text", "text": "待回訊息"}]}, f)
+        with (
+            patch("main.memory.top_facts", return_value=[]),
+            patch("main.memory.get_context", return_value=[]),
+            patch("main._get_persona_notes", return_value=[]),
+            patch("main._llm_chat", side_effect=Exception("fail")),
+        ):
+            result3 = main._pop_pending_for_piggyback("GRP001")
+        check("LLM 失敗 → None", result3 is None)
 
-    # Empty LLM reply → None
-    with open(tmp, "w") as f:
-        json.dump({"GRP001": [{"type": "text", "text": "待回訊息"}]}, f)
-    with (
-        patch("main.memory.top_facts", return_value=[]),
-        patch("main.memory.get_context", return_value=[]),
-        patch("main._get_persona_notes", return_value=[]),
-        patch("main._llm_chat", return_value=""),
-    ):
-        result4 = main._pop_pending_for_piggyback("GRP001")
-    check("LLM 空回覆 → None", result4 is None)
+        # Empty LLM reply → None
+        with open(tmp, "w") as f:
+            json.dump({"GRP001": [{"type": "text", "text": "待回訊息"}]}, f)
+        with (
+            patch("main.memory.top_facts", return_value=[]),
+            patch("main.memory.get_context", return_value=[]),
+            patch("main._get_persona_notes", return_value=[]),
+            patch("main._llm_chat", return_value=""),
+        ):
+            result4 = main._pop_pending_for_piggyback("GRP001")
+        check("LLM 空回覆 → None", result4 is None)
 
-    # Success path → returns formatted string + removes from pending
-    items = [{"type": "text", "text": "待回訊息", "message_id": "MSG_PIG"}]
-    with open(tmp, "w") as f:
-        json.dump({"GRP001": items}, f)
-    with (
-        patch("main.memory.top_facts", return_value=[]),
-        patch("main.memory.get_context", return_value=[]),
-        patch("main._get_persona_notes", return_value=[]),
-        patch("main._llm_chat", return_value="piggyback 回覆"),
-    ):
-        result5 = main._pop_pending_for_piggyback("GRP001")
-    data_after = json.load(open(tmp))
-    check(
-        "piggyback 成功 → 回傳格式化字串",
-        result5 is not None
-        and "piggyback" in (result5 or "").lower()
-        or "補回" in (result5 or ""),
-    )
-    check("piggyback 成功 → pending 已清空", "GRP001" not in data_after)
-
-    main._PENDING_EXPLICIT_PATH = orig_path
-    os.unlink(tmp)
+        # Success path → returns formatted string + removes from pending
+        items = [{"type": "text", "text": "待回訊息", "message_id": "MSG_PIG"}]
+        with open(tmp, "w") as f:
+            json.dump({"GRP001": items}, f)
+        with (
+            patch("main.memory.top_facts", return_value=[]),
+            patch("main.memory.get_context", return_value=[]),
+            patch("main._get_persona_notes", return_value=[]),
+            patch("main._llm_chat", return_value="piggyback 回覆"),
+        ):
+            result5 = main._pop_pending_for_piggyback("GRP001")
+        data_after = json.load(open(tmp))
+        check(
+            "piggyback 成功 → 回傳格式化字串",
+            (
+                result5 is not None
+                and ("piggyback" in result5.lower() or "補回" in result5)
+            ),
+        )
+        check("piggyback 成功 → pending 已清空", "GRP001" not in data_after)
+    finally:
+        main._PENDING_EXPLICIT_PATH = orig_path
+        main._PENDING_REPLY_ENABLED = orig_pending_enabled
+        pending_store.PENDING_PATH = orig_store_path
+        pending_store.LOCK_PATH = orig_store_lock
+        os.unlink(tmp)
+        try:
+            os.unlink(pending_lock_path)
+        except FileNotFoundError:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1155,75 +1188,74 @@ def test_callback_loop():
 
 def test_save_pending_quoted_and_media():
     print("\n── Test W: _save_pending_any quoted/file/audio ──")
+    import pending_store
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
         json.dump({}, f)
         tmp = f.name
     orig_path = main._PENDING_EXPLICIT_PATH
+    orig_pending_enabled = main._PENDING_REPLY_ENABLED
+    orig_store_path = pending_store.PENDING_PATH
+    orig_store_lock = pending_store.LOCK_PATH
+    pending_path = Path(tmp)
+    pending_lock_path = Path(tmp + ".lock")
     main._PENDING_EXPLICIT_PATH = tmp
+    main._PENDING_REPLY_ENABLED = True
+    pending_store.PENDING_PATH = pending_path
+    pending_store.LOCK_PATH = pending_lock_path
 
-    # TextMessageContent with quoted_message_id → lookup raw + store quoted_original
-    msg = _make_text_msg("回覆引用")
-    msg.quoted_message_id = "QUOTED_ID"
-    evt = _make_message_event(msg)
-    with patch("main.memory.get_raw_message", return_value=("uid", "原始文字")):
-        main._save_pending_any(evt, "GRP001", "USR001", msg)
-    data = json.load(open(tmp))
-    check(
-        "pending 有 quoted_original",
-        data.get("GRP001", [{}])[0].get("quoted_original") == "原始文字",
-    )
+    try:
+        # TextMessageContent with quoted_message_id → lookup raw + store quoted_original
+        msg = _make_text_msg("回覆引用")
+        msg.quoted_message_id = "QUOTED_ID"
+        evt = _make_message_event(msg)
+        with patch("main.memory.get_raw_message", return_value=("uid", "原始文字")):
+            main._save_pending_any(evt, "GRP001", "USR001", msg)
+        data = json.load(open(tmp))
+        check(
+            "pending 有 quoted_original",
+            data.get("GRP001", [{}])[0].get("quoted_original") == "原始文字",
+        )
 
-    # FileMessageContent → download + save to pending_media
-    with open(tmp, "w") as f:
-        json.dump({}, f)
-    file_msg = MagicMock(spec=FileMessageContent)
-    file_msg.id = "FILE001"
-    file_msg.file_name = "test.txt"
-    file_msg.quote_token = "qt"
-    file_msg.type = "file"
-    file_evt = _make_message_event(file_msg)
-    with (
-        patch("main._download_content", return_value=b"file content"),
-        patch("main.os.makedirs"),
-        patch(
-            "builtins.open",
-            side_effect=[
-                open(tmp),  # _load_pending_explicit read
-                MagicMock().__enter__.return_value,  # write content
-            ],
-        ),
-    ):
-        pass  # complex to mock, just test download fails path
-    # Test download fails path
-    with open(tmp, "w") as f:
-        json.dump({}, f)
-    with patch("main._download_content", side_effect=Exception("dl fail")):
-        main._save_pending_any(file_evt, "GRP001", "USR001", file_msg)
-    data2 = json.load(open(tmp))
-    check(
-        "file pending download 失敗 → download_failed=True",
-        data2.get("GRP001", [{}])[0].get("download_failed") is True,
-    )
+        # FileMessageContent → download fail path
+        with open(tmp, "w") as f:
+            json.dump({}, f)
+        file_msg = FileMessageContent(
+            id="FILE001", fileName="test.txt", fileSize=123
+        )
+        file_evt = _make_message_event(file_msg)
+        with patch("main._download_content", side_effect=Exception("dl fail")):
+            main._save_pending_any(file_evt, "GRP001", "USR001", file_msg)
+        data2 = json.load(open(tmp))
+        check(
+            "file pending download 失敗 → download_failed=True",
+            data2.get("GRP001", [{}])[0].get("download_failed") is True,
+        )
 
-    # AudioMessageContent → download fail → download_failed=True
-    with open(tmp, "w") as f:
-        json.dump({}, f)
-    aud_msg = MagicMock(spec=AudioMessageContent)
-    aud_msg.id = "AUD001"
-    aud_msg.quote_token = "qt"
-    aud_msg.type = "audio"
-    aud_evt = _make_message_event(aud_msg)
-    with patch("main._download_content", side_effect=Exception("dl fail")):
-        main._save_pending_any(aud_evt, "GRP001", "USR001", aud_msg)
-    data3 = json.load(open(tmp))
-    check(
-        "audio pending download 失敗 → download_failed=True",
-        data3.get("GRP001", [{}])[0].get("download_failed") is True,
-    )
-
-    main._PENDING_EXPLICIT_PATH = orig_path
-    os.unlink(tmp)
+        # AudioMessageContent → download fail → download_failed=True
+        with open(tmp, "w") as f:
+            json.dump({}, f)
+        aud_msg = AudioMessageContent(
+            id="AUD001", contentProvider={"type": "line"}, duration=1000
+        )
+        aud_evt = _make_message_event(aud_msg)
+        with patch("main._download_content", side_effect=Exception("dl fail")):
+            main._save_pending_any(aud_evt, "GRP001", "USR001", aud_msg)
+        data3 = json.load(open(tmp))
+        check(
+            "audio pending download 失敗 → download_failed=True",
+            data3.get("GRP001", [{}])[0].get("download_failed") is True,
+        )
+    finally:
+        main._PENDING_EXPLICIT_PATH = orig_path
+        main._PENDING_REPLY_ENABLED = orig_pending_enabled
+        pending_store.PENDING_PATH = orig_store_path
+        pending_store.LOCK_PATH = orig_store_lock
+        os.unlink(tmp)
+        try:
+            os.unlink(pending_lock_path)
+        except FileNotFoundError:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1274,15 +1306,14 @@ def test_gemini_video_fallback():
         check("ytdlp 內容已 >=300 字 → 不 fallback", not mock_fetch.called)
         check("ytdlp 內容已豐 → 直接回傳原 block", result == ample)
 
-    # ── Z4: _maybe_video_fallback：低 quota 不觸發 ──
-    with patch("main._gemini_video_quota_ok", return_value=False):
-        with patch("main._fetch_video_gemini") as mock_fetch:
-            thin = "x" * 50
-            result = main._maybe_video_fallback(
-                "https://vt.tiktok.com/abc/", thin
-            )
-            check("低 quota → 不觸發 fallback", not mock_fetch.called)
-            check("低 quota → 回傳原本薄 block", result == thin)
+    # ── Z4: _maybe_video_fallback：薄內容會嘗試 server-side fallback ──
+    with patch("main._fetch_video_gemini", return_value=None) as mock_fetch:
+        thin = "x" * 50
+        result = main._maybe_video_fallback(
+            "https://vt.tiktok.com/abc/", thin
+        )
+        check("薄影片內容 → 嘗試 fallback", mock_fetch.called)
+        check("fallback miss → 回傳原本薄 block", result == thin)
 
     # ── Z5: _maybe_video_fallback：薄內容 + TikTok + quota OK → 觸發 ──
     with patch("main._gemini_video_quota_ok", return_value=True):
@@ -1473,23 +1504,33 @@ class AllTests(unittest.TestCase):
 def test_handle_group_message_routing():
     print("\n── Test X: _handle_group_message routing ──")
     orig_allowed = main.settings.allowed_group_id
+    spawn_patch = patch("main._spawn_piggyback_drain", lambda *a, **k: None)
     main.settings.allowed_group_id = "GRP001"
+    spawn_patch.start()
     try:
         # image → log raw only (line 839-841)
         img_msg = MagicMock(spec=ImageMessageContent)
         img_msg.id = "IMG001"
         img_evt = _make_message_event(img_msg)
-        with patch("main.memory.log_raw_message") as mock_log:
+        with (
+            patch("main.memory.log_raw_message") as mock_log,
+            patch("main._MEDIA_EXECUTOR.submit") as mock_submit,
+        ):
             main._handle_event(img_evt)
         check("img → log_raw_message called", mock_log.called)
+        check("img → media worker submitted", mock_submit.called)
 
         # video → log raw only (line 842-844)
         vid_msg = MagicMock(spec=VideoMessageContent)
         vid_msg.id = "VID001"
         vid_evt = _make_message_event(vid_msg)
-        with patch("main.memory.log_raw_message") as mock_log2:
+        with (
+            patch("main.memory.log_raw_message") as mock_log2,
+            patch("main._MEDIA_EXECUTOR.submit") as mock_submit2,
+        ):
             main._handle_event(vid_evt)
         check("video → log_raw_message called", mock_log2.called)
+        check("video → media worker submitted", mock_submit2.called)
 
         # audio → _handle_audio_message (lines 845-848)
         aud_msg = MagicMock(spec=AudioMessageContent)
@@ -1520,21 +1561,24 @@ def test_handle_group_message_routing():
             main._handle_event(txt_evt)
         check("text → _handle_text_message called", mock_text.called)
 
-        # quota exhausted + text → save pending (lines 821-829)
+        # quota exhausted + text still routes to text handler; only File/Audio
+        # have a quota-exhausted early-drop branch.
         main._quota_exhausted_until_ts = time.time() + 3600
         txt_msg2 = _make_text_msg("quota burst msg")
         txt_evt2 = _make_message_event(txt_msg2)
         with (
             patch("main.memory.log_raw_message"),
-            patch("main._save_pending_any") as mock_save,
+            patch("main._handle_text_message") as mock_text2,
         ):
             main._handle_event(txt_evt2)
-        check("quota exhausted text → _save_pending_any", mock_save.called)
+        check("quota exhausted text → _handle_text_message", mock_text2.called)
         main._quota_exhausted_until_ts = 0.0
 
         # redelivery no msg_id → lines 807-808
-        null_msg = _make_text_msg()
+        null_msg = MagicMock(spec=TextMessageContent)
         null_msg.id = None
+        null_msg.text = "redelivery without id"
+        null_msg.type = "text"
         redel_evt = MagicMock(spec=MessageEvent)
         redel_evt.message = null_msg
         redel_evt.source = _make_group_source()
@@ -1548,6 +1592,7 @@ def test_handle_group_message_routing():
         check("redelivery no msg_id → early return (no log)", not mock_log3.called)
 
     finally:
+        spawn_patch.stop()
         main.settings.allowed_group_id = orig_allowed
 
 
@@ -1558,13 +1603,32 @@ def test_feedback_collector_window():
     print("\n── Test Y: feedback_collector window ──")
     orig_allowed = main.settings.allowed_group_id
     main.settings.allowed_group_id = "GRP001"
+    fake_message_classifier = types.ModuleType("message_classifier")
+    fake_message_classifier.classify_async = lambda *a, **k: None
+    fake_knowledge_graph = types.ModuleType("knowledge_graph")
+    fake_knowledge_graph.auto_extract_kg_async = lambda *a, **k: None
+    fake_food_signals = types.ModuleType("food_signals")
+    fake_food_signals.extract_and_store_async = lambda *a, **k: None
     try:
         txt_msg = _make_text_msg("feedback window msg")
         txt_evt = _make_message_event(txt_msg)
         # Call _handle_text_message directly so feedback code actually runs
         with (
+            patch.dict(
+                sys.modules,
+                {
+                    "message_classifier": fake_message_classifier,
+                    "knowledge_graph": fake_knowledge_graph,
+                    "food_signals": fake_food_signals,
+                },
+            ),
             patch("main.feedback_collector.in_feedback_window", return_value=True),
             patch("main.feedback_collector.collect_message") as mock_collect,
+            patch("main._try_handle_calendar_correction", return_value=False),
+            patch("main._detect_user_correction"),
+            patch("main._auto_capture_text_if_important"),
+            patch("main._maybe_extract_reminder"),
+            patch("main._try_piggyback_reminders_fast_path", return_value=False),
             patch("main._handle_command", return_value=None),
             patch("main._is_dinner_question", return_value=False),
             patch("main._extract_gemini_trigger", return_value=None),
@@ -1575,11 +1639,24 @@ def test_feedback_collector_window():
 
         # collect_message raises → logged, no crash (lines 898-900)
         with (
+            patch.dict(
+                sys.modules,
+                {
+                    "message_classifier": fake_message_classifier,
+                    "knowledge_graph": fake_knowledge_graph,
+                    "food_signals": fake_food_signals,
+                },
+            ),
             patch("main.feedback_collector.in_feedback_window", return_value=True),
             patch(
                 "main.feedback_collector.collect_message",
                 side_effect=RuntimeError("boom"),
             ),
+            patch("main._try_handle_calendar_correction", return_value=False),
+            patch("main._detect_user_correction"),
+            patch("main._auto_capture_text_if_important"),
+            patch("main._maybe_extract_reminder"),
+            patch("main._try_piggyback_reminders_fast_path", return_value=False),
             patch("main._handle_command", return_value=None),
             patch("main._is_dinner_question", return_value=False),
             patch("main._extract_gemini_trigger", return_value=None),

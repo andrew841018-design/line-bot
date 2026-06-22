@@ -117,8 +117,42 @@ def test_due_reminder_mentions_structured_aliases_without_action_names(monkeypat
 
     assert len(due) == 1
     assert due[0]["text"].startswith("@媽媽 @黃聖雅\n⏰ 提醒（明天）\n")
+    assert "參加人：媽媽、黃聖雅" in due[0]["text"]
     assert due[0]["message"].substitution["target"].mentionee.user_id == "U_MOM"
     assert due[0]["message"].substitution["p2"].mentionee.user_id == "U_SIS"
+
+
+def test_due_reminder_keeps_unmapped_participant_visible(monkeypatch):
+    now = 1_800_000_000
+
+    def fake_list(group_id=None):
+        return [_row(now, user_id="", mention_aliases=["黃將修"])]
+
+    monkeypatch.setattr(reminder_push.memory, "list_pending_reminders_full", fake_list)
+    monkeypatch.setattr(reminder_push.line_mentions, "load_user_aliases", lambda: {})
+
+    due = reminder_push.due_reminders_for_reply("G1", limit=2, now=now)
+
+    assert len(due) == 1
+    assert due[0]["text"].startswith("@黃將修\n⏰ 提醒（明天）\n")
+    assert "參加人：黃將修" in due[0]["text"]
+    assert due[0]["message"].type == "text"
+
+
+def test_due_reminder_mentions_all_participants(monkeypatch):
+    now = 1_800_000_000
+
+    def fake_list(group_id=None):
+        return [_row(now, user_id="U_MOM", mention_aliases=["全家"]) ]
+
+    monkeypatch.setattr(reminder_push.memory, "list_pending_reminders_full", fake_list)
+    monkeypatch.setattr(reminder_push.line_mentions, "load_user_aliases", lambda: {"U_MOM": "媽媽"})
+
+    due = reminder_push.due_reminders_for_reply("G1", limit=2, now=now)
+
+    assert len(due) == 1
+    assert due[0]["text"].startswith("@all\n")
+    assert due[0]["message"].substitution.get("all") is not None
 
 
 def test_mark_reminders_pushed_marks_each_stage(monkeypatch):
@@ -135,7 +169,7 @@ def test_mark_reminders_pushed_marks_each_stage(monkeypatch):
 
 def test_push_to_group_uses_refreshed_line_token(monkeypatch):
     monkeypatch.setattr(reminder_push.settings, "line_channel_access_token", "stale-token")
-    monkeypatch.setattr(reminder_push, "get_line_token", lambda: "fresh-token")
+    monkeypatch.setattr(reminder_push, "line_access_token", lambda: "fresh-token")
 
     seen = {}
 
@@ -149,10 +183,9 @@ def test_push_to_group_uses_refreshed_line_token(monkeypatch):
         def __exit__(self, *args):
             return False
 
-    with (
-        patch("reminder_push.ApiClient", FakeApiClient),
-        patch("reminder_push.MessagingApi") as messaging_api,
-    ):
+    with patch("reminder_push.ApiClient", FakeApiClient), patch(
+        "reminder_push.MessagingApi"
+    ) as messaging_api:
         messaging_api.return_value.push_message = MagicMock()
         assert reminder_push._push_to_group("G1", "hello")
 
@@ -161,10 +194,6 @@ def test_push_to_group_uses_refreshed_line_token(monkeypatch):
 
 def test_line_access_token_falls_back_to_env_token(monkeypatch):
     monkeypatch.setattr(reminder_push.settings, "line_channel_access_token", "env-token")
-
-    def boom():
-        raise RuntimeError("refresh down")
-
-    monkeypatch.setattr(reminder_push, "get_line_token", boom)
+    monkeypatch.setattr(reminder_push, "line_access_token", lambda: "env-token")
 
     assert reminder_push._line_access_token() == "env-token"

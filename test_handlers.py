@@ -597,6 +597,8 @@ def test_handle_explicit_text():
         patch("main.memory.get_raw_message", return_value=None),
         patch("main._build_quoted_block", return_value=None),
         patch("main._prefetch_urls", return_value="問問題"),
+        patch("main._llm_chat", return_value=""),
+        patch("main._maybe_capture_calendar_event"),
     ):
         main._handle_explicit_text(evt2, "GRP001", "問問題")
     check("quota 爆 explicit → 靜默", not mock_reply2.called)

@@ -361,7 +361,12 @@ def alias_from_user_id(user_id: str) -> str:
 # Store + fire-and-forget
 # ─────────────────────────────────────────────────────────────────────────────
 
-def extract_and_store(group_id: str, sender_alias: str, text: str) -> int:
+def extract_and_store(
+    group_id: str,
+    sender_alias: str,
+    text: str,
+    db_path=None,
+) -> int:
     """extract + 寫進 kg_triples。回新增筆數 (PK 衝突 IGNORE)。"""
     if not group_id or not text:
         return 0
@@ -374,7 +379,7 @@ def extract_and_store(group_id: str, sender_alias: str, text: str) -> int:
 
     triples = [(s["subject"], s["kind"], s["food"]) for s in signals]
     try:
-        return kg.store_triples(group_id, triples, source_text=text)
+        return kg.store_triples(group_id, triples, source_text=text, db_path=db_path)
     except Exception as e:
         logger.warning("food_extractor store failed: %s", e)
         return 0
@@ -387,10 +392,16 @@ def extract_async(group_id: str, sender_alias: str, text: str) -> None:
     """背景執行緒抽 + 寫，永不阻塞 caller。失敗 silent。"""
     if not group_id or not text or not text.strip():
         return
+    try:
+        import knowledge_graph as kg
+
+        db_path = kg._DB_PATH
+    except Exception:
+        db_path = None
 
     def _run() -> None:
         try:
-            extract_and_store(group_id, sender_alias, text)
+            extract_and_store(group_id, sender_alias, text, db_path=db_path)
         except Exception:
             pass
 

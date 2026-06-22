@@ -59,6 +59,23 @@ def test_enqueue_skips_non_candidate(temp_db):
     assert memory.list_pending_reminder_retries("G1") == []
 
 
+def test_maybe_extract_skips_non_action_date_text(temp_db, monkeypatch):
+    """只有「今天」這種日期字樣、但沒有提醒動作時，不應呼 Gemini。"""
+    import main
+    import gemini_client
+
+    called = []
+    monkeypatch.setattr(
+        gemini_client,
+        "extract_reminder",
+        lambda *a, **k: called.append(1),
+    )
+
+    main._maybe_extract_reminder("今天天氣真好啊", "G1", "U1", "m1")
+
+    assert called == []
+
+
 # ── site 2: _maybe_extract_reminder 撞 429 ───────────────────────────────────
 
 def test_maybe_extract_perday_429_marks_and_enqueues(temp_db, monkeypatch):

@@ -19,8 +19,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 sys.path.insert(0, str(Path(__file__).parent))
 
-import requests  # noqa: E402
-
+from line_push_client import line_access_token, try_push_text  # noqa: E402
 import memory  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -29,44 +28,20 @@ logger = logging.getLogger(__name__)
 GROUP_ID = os.environ.get("LINE_ALLOWED_GROUP_ID") or os.environ.get(
     "ALLOWED_GROUP_ID", ""
 )
-_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 THIRTY_DAYS_SEC = 30 * 24 * 3600
 MIN_MESSAGES_FOR_HIGHLIGHT = 20
 MAX_MESSAGES_IN_PROMPT = 1500
 
 
 def _get_token() -> str:
-    try:
-        import line_token_refresh
-        return line_token_refresh.get_line_token() or os.environ.get(
-            "LINE_CHANNEL_ACCESS_TOKEN", ""
-        )
-    except Exception:
-        return os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+    return line_access_token()
 
 
 def _push(text: str) -> bool:
-    token = _get_token()
-    if not token or not GROUP_ID:
+    if not _get_token() or not GROUP_ID:
         logger.error("missing TOKEN or GROUP_ID; skip push")
         return False
-    try:
-        resp = requests.post(
-            _PUSH_URL,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            json={"to": GROUP_ID, "messages": [{"type": "text", "text": text}]},
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            return True
-        logger.warning("LINE push failed %d: %s", resp.status_code, resp.text[:300])
-        return False
-    except Exception as e:
-        logger.warning("LINE push exception: %s", e)
-        return False
+    return try_push_text(GROUP_ID, text, timeout=10)
 
 
 def fetch_last_30d_messages(group_id: str) -> list[tuple[str, str, int]]:

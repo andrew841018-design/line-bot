@@ -40,6 +40,15 @@ def test_work_event_rejected():
     assert out["has_event"] is False
 
 
+def test_stock_news_with_date_not_event():
+    """含日期/「大漲」的股市訊息不能被誤判成提醒。"""
+    out = calendar_regex.extract_many_regex_only(
+        "美國國慶7月4日、美伊簽和約、川普生日放利多等等造成美國四大股市現在大漲，明天台股可能比較樂觀。",
+        _TODAY,
+    )
+    assert out == []
+
+
 def test_work_iso_format_rejected():
     """ISO 日期格式的工作事件也要拒絕。"""
     out = calendar_regex.extract_regex_only(

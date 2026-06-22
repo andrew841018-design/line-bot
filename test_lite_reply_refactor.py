@@ -126,6 +126,143 @@ def test_try_local_llm_passes_context(monkeypatch):
     assert captured["text"] == "最近怎樣"
 
 
+def test_try_local_llm_uses_opinion_prompt_for_shared_video(monkeypatch):
+    """議題/影片分享要明確要求 local LLM 產出正方、反方與整合見解。"""
+    fake_module = type(sys)("local_llm")
+    captured: dict = {}
+
+    def fake_chat(text, context=None, system_prompt=None, max_tokens=None, **kw):
+        captured["text"] = text
+        captured["context"] = context
+        captured["system_prompt"] = system_prompt
+        captured["max_tokens"] = max_tokens
+        return (
+            "我覺得這支影片能當入門參考，但不能把手工皂直接等於更安全。\n"
+            "正方：自己做能控制部分成分。\n"
+            "反方：配方錯或保存不當也可能刺激皮膚。\n"
+            "整合：當興趣可以，敏感肌先小範圍測試。"
+        )
+
+    fake_module.chat = fake_chat
+    monkeypatch.setitem(sys.modules, "local_llm", fake_module)
+    monkeypatch.setattr(
+        lite_reply,
+        "_collect_opinion_reference_context",
+        lambda text, context=None: "🔍 lite mode（Google 首頁 snippet）：...",
+    )
+
+    out = lite_reply._try_local_llm(
+        "這支影片分享了如何在家做手工皂，看起來很實用",
+        context=[("user", "前面在聊清潔用品")],
+    )
+
+    assert out is not None
+    assert captured["text"].startswith("這支影片")
+    assert captured["context"][-1][0] == "research"
+    assert "補充資料（可能可作為論證依據）" in captured["context"][-1][1]
+    assert captured["system_prompt"] is not None
+    assert "正方" in captured["system_prompt"]
+    assert "反方" in captured["system_prompt"]
+    assert "整合" in captured["system_prompt"]
+    assert captured["max_tokens"] >= 600
+
+
+def test_try_local_llm_uses_opinion_prompt_for_context_only_video(monkeypatch):
+    """短句+影片 context 也要觸發 opinion structure 提示。"""
+    fake_module = type(sys)("local_llm")
+    captured: dict = {}
+
+    def fake_chat(text, context=None, system_prompt=None, max_tokens=None, **kw):
+        captured["text"] = text
+        captured["context"] = context
+        captured["system_prompt"] = system_prompt
+        captured["max_tokens"] = max_tokens
+        return (
+            "正方：分享者個案的轉折有啟發性。\n"
+            "反方：缺少關鍵的財務數字與時間軸。\n"
+            "整合：內容有參考價值，但不能拿人生故事直接泛化。"
+        )
+
+    fake_module.chat = fake_chat
+    monkeypatch.setitem(sys.modules, "local_llm", fake_module)
+    monkeypatch.setattr(
+        lite_reply,
+        "_collect_opinion_reference_context",
+        lambda text, context=None: None,
+    )
+
+    context = [
+        (
+            "user",
+            "（以下是影片連結 https://www.youtube.com/watch?v=abc123 的內容，透過 yt-dlp 擷取）\n"
+            "--- 影片資訊開始 ---\n"
+            "標題：小知足 從貧窮家庭到財富自由的故事\n"
+            "上傳者：小知足\n"
+            "--- 影片資訊結束 ---",
+        ),
+    ]
+    out = lite_reply._try_local_llm("很有感", context=context)
+
+    assert out is not None
+    assert captured["context"] == context
+    assert captured["system_prompt"] is not None
+    assert "正方" in captured["system_prompt"]
+    assert captured["max_tokens"] == 700
+
+
+def test_try_local_llm_appends_search_reference_for_sparse_context(monkeypatch):
+    """缺素材時先抓 snippet 作為論點依據，再送進 local LLM。"""
+    fake_module = type(sys)("local_llm")
+    captured: dict = {}
+
+    def fake_chat(text, context=None, system_prompt=None, max_tokens=None, **kw):
+        captured["text"] = text
+        captured["context"] = context
+        captured["system_prompt"] = system_prompt
+        captured["max_tokens"] = max_tokens
+        return (
+            "正方：有些逆境故事能提供行動啟發。\n"
+            "反方：缺乏可核對財務資料時不能推廣為可複製模型。\n"
+            "整合：故事可作參考，但要回到可驗證條件。"
+        )
+
+    fake_module.chat = fake_chat
+    monkeypatch.setitem(sys.modules, "local_llm", fake_module)
+    monkeypatch.setattr(
+        lite_reply,
+        "_collect_opinion_reference_context",
+        lambda text, context=None: (
+            "🔍 lite mode（Google 首頁 snippet）：\n"
+            "關於貧窮家庭逆轉致富，關鍵在於存款、風險控管與長期紀律。\n"
+            "完整搜尋：https://www.google.com/?q=%E8%B2%A1%E5%AF%8C%E8%87%AA%E7%94%B1"
+        ),
+    )
+
+    out = lite_reply._try_local_llm("小知足從貧窮家庭出發達到財富自由的故事")
+
+    assert out is not None
+    assert captured["context"][-1][0] == "research"
+    assert "補充資料（可能可作為論證依據）" in captured["context"][-1][1]
+    assert "Google 首頁 snippet" in captured["context"][-1][1]
+    assert captured["system_prompt"] is not None
+    assert captured["max_tokens"] == 700
+
+
+def test_try_local_llm_opinion_without_evidence_fails_fast(monkeypatch):
+    """分享型主題若連素材與搜尋都拿不到，就不回。"""
+    fake_module = type(sys)("local_llm")
+    fake_module.chat = lambda *a, **kw: pytest.fail("should skip local LLM without evidence")
+    monkeypatch.setitem(sys.modules, "local_llm", fake_module)
+    monkeypatch.setattr(
+        lite_reply,
+        "_collect_opinion_reference_context",
+        lambda text, context=None: None,
+    )
+
+    out = lite_reply._try_local_llm("這個故事真的很鼓舞人心，但我只想知道你怎麼看")
+    assert out is None
+
+
 # ─── Stage 1 優先於 Stage 2 LLM ─────────────────────────────────────────
 
 

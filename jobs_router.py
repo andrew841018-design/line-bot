@@ -46,9 +46,9 @@ log = logging.getLogger("jobs")
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
 _HERE = Path(__file__).resolve().parent
-STATE_DIR = _HERE / "state"
-LOG_DIR = _HERE / "logs" / "jobs"
-LOCK_DIR = _HERE / "locks"
+STATE_DIR = Path(os.environ.get("LINE_BOT_JOB_STATE_DIR", str(_HERE / "state")))
+LOG_DIR = Path(os.environ.get("LINE_BOT_JOB_LOG_DIR", str(_HERE / "logs" / "jobs")))
+LOCK_DIR = Path(os.environ.get("LINE_BOT_JOB_LOCK_DIR", str(_HERE / "locks")))
 
 _JOB_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,40}$")
 _ALLOWED_IPS = {"127.0.0.1", "::1", "::ffff:127.0.0.1"}

@@ -7,6 +7,7 @@ first call; expect ~3-5s on the first test, cached after.
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -20,15 +21,20 @@ def er(monkeypatch, tmp_path):
     import memory
     import embedding_recall
 
-    # Skip when sentence-transformers model is unavailable (e.g. HF cache symlink
-    # broken because the backing volume isn't mounted). These tests exercise the
-    # real ST encoder — without it, index_message returns False and downstream
-    # assertions fail spuriously. The env issue isn't a code bug.
-    if embedding_recall._get_st_model() is None:
-        pytest.skip("sentence-transformers model unavailable in this env")
+    class FakeSentenceTransformer:
+        def encode(self, text, normalize_embeddings=False):
+            vec = [0.0] * embedding_recall.DIM
+            for i, ch in enumerate(str(text)):
+                vec[(ord(ch) + i) % embedding_recall.DIM] += 1.0
+            return vec
 
     monkeypatch.setattr(memory, "_DB_PATH", db)
     monkeypatch.setattr(embedding_recall, "_DB_PATH", db)
+    monkeypatch.setattr(
+        embedding_recall,
+        "_get_st_model",
+        lambda: FakeSentenceTransformer(),
+    )
     memory._init_db()
     return embedding_recall
 
@@ -55,10 +61,10 @@ def test_index_skips_when_ids_missing(er):
 def test_index_writes_with_model_tag_and_dim(er):
     ok = er.index_message("M1", "G1", "今天天氣很好啊我來說個故事")
     assert ok is True
-    c = sqlite3.connect(str(er._DB_PATH))
-    row = c.execute(
-        "SELECT model_name, dim, is_bot, backend FROM embeddings WHERE message_id='M1'"
-    ).fetchone()
+    with closing(sqlite3.connect(str(er._DB_PATH))) as c:
+        row = c.execute(
+            "SELECT model_name, dim, is_bot, backend FROM embeddings WHERE message_id='M1'"
+        ).fetchone()
     assert row[0] == er.MODEL_TAG
     assert row[1] == er.DIM
     assert row[2] == 0
@@ -67,8 +73,8 @@ def test_index_writes_with_model_tag_and_dim(er):
 
 def test_index_marks_bot_flag(er):
     er.index_message("B1", "G1", "咪寶的回覆內容夠長一些", is_bot=True)
-    c = sqlite3.connect(str(er._DB_PATH))
-    row = c.execute("SELECT is_bot FROM embeddings WHERE message_id='B1'").fetchone()
+    with closing(sqlite3.connect(str(er._DB_PATH))) as c:
+        row = c.execute("SELECT is_bot FROM embeddings WHERE message_id='B1'").fetchone()
     assert row[0] == 1
 
 
@@ -77,15 +83,14 @@ def test_index_marks_bot_flag(er):
 
 def test_retrieve_filters_out_legacy_tfidf_rows(er):
     """Old tfidf rows (model_name='') must not be returned by new ST retrieve."""
-    c = sqlite3.connect(str(er._DB_PATH))
-    c.execute(
-        "INSERT INTO embeddings"
-        "(message_id, group_id, text, embedding, backend, dim, "
-        " created_at, model_name, is_bot) "
-        "VALUES (?, ?, ?, ?, 'tfidf', 100, 1000, '', 0)",
-        ("OLD1", "G1", "舊的訊息內容老舊不該命中", b"\x00" * 400),
-    )
-    c.close()
+    with closing(sqlite3.connect(str(er._DB_PATH))) as c:
+        c.execute(
+            "INSERT INTO embeddings"
+            "(message_id, group_id, text, embedding, backend, dim, "
+            " created_at, model_name, is_bot) "
+            "VALUES (?, ?, ?, ?, 'tfidf', 100, 1000, '', 0)",
+            ("OLD1", "G1", "舊的訊息內容老舊不該命中", b"\x00" * 400),
+        )
     er.index_message("NEW1", "G1", "今天討論機器學習很有趣")
     hits = er.retrieve("G1", "機器學習")
     assert all(h["message_id"] != "OLD1" for h in hits)

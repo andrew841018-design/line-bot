@@ -11,6 +11,7 @@ Covers:
 
 import os
 import sys
+import types
 from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("LINE_CHANNEL_SECRET", "dummy_secret_32bytes_padding000")
@@ -142,8 +143,13 @@ def test_chat_retries_on_violation():
     )
 
 
-def test_chat_logs_when_retry_still_violates():
+def test_chat_logs_when_retry_still_violates(monkeypatch):
     print("\n── Test E: chat() logs + alerts when retry still violates ──")
+
+    fake_embedding_recall = types.ModuleType("embedding_recall")
+    fake_embedding_recall.retrieve = lambda *a, **k: []
+    fake_embedding_recall.retrieve_case_pairs = lambda *a, **k: []
+    monkeypatch.setitem(sys.modules, "embedding_recall", fake_embedding_recall)
 
     # 兩次都違規
     bad1 = MagicMock()

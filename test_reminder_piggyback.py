@@ -1,7 +1,7 @@
-"""Reply-token piggyback reminder tests — 2 case (advisor minimal)。
+"""Reply-token reminder behavior tests.
 
-5/22 cake scenario：今天 5/21 是 T-1，原本 launchd push 因 LINE 月配額 200/200 爆住，
-透過 _reply 在 user 講話時 piggyback reminder 進同一個 reply_message API call（免費）。
+Reminders must be delivered by their scheduled jobs, not piggybacked onto an
+unrelated user message.
 """
 
 from __future__ import annotations
@@ -27,9 +27,10 @@ def tmp_cal_db(tmp_path, monkeypatch):
     return calendar_db
 
 
-# ── Test 1: reply 成功 → reminder mark ✓ ────────────────────────────────
-def test_piggyback_marks_reminded_on_reply_success(tmp_cal_db, monkeypatch):
-    """模擬 5/22 cake T-1 場景：家人講話 → _reply 把 reminder 塞 reply_message → 成功後 mark_reminded_1d。"""
+def test_reply_does_not_bundle_calendar_reminder_on_user_message(
+    tmp_cal_db, monkeypatch
+):
+    """家人普通發言時，_reply 不應把 calendar reminder 塞進同一個 reply。"""
     GID = "G1"
     today = date.today()
     tomorrow = (today + timedelta(days=1)).isoformat()
@@ -82,26 +83,19 @@ def test_piggyback_marks_reminded_on_reply_success(tmp_cal_db, monkeypatch):
     # 跑 reply
     main._reply("fake_reply_token", "嗨", group_id=GID)
 
-    # assert: messages_to_send 含 reminder
     msgs = captured.get("messages", [])
-    assert len(msgs) >= 2  # 原 reply + reminder
-    reminder_texts = [m.text for m in msgs[1:]]
-    assert any("明天活動提醒" in t for t in reminder_texts)
-    assert any("拿生日蛋糕" in t for t in reminder_texts)
+    assert [m.text for m in msgs] == ["嗨"]
 
-    # assert: reminded_1d 已 mark
+    # scheduled event_reminder.py 仍會在原本時間處理；普通 reply 不能提前 mark。
     with tmp_cal_db._conn() as c:
         row = c.execute(
             "SELECT reminded_1d FROM events WHERE event_id=?", (eid,),
         ).fetchone()
-    assert row[0] is not None
+    assert row[0] is None
 
 
-# ── Test 2: reply 失敗（throws）→ reminder NOT marked ──────────────────
 def test_piggyback_not_marked_on_reply_failure(tmp_cal_db, monkeypatch):
-    """reply API throw → fall back push → reminder mark 不能執行（peek-then-confirm）。
-    下次 user 講話再試。
-    """
+    """reply API throw/fallback still must not mark reminder stages."""
     GID = "G1"
     today = date.today()
     tomorrow = (today + timedelta(days=1)).isoformat()
@@ -261,8 +255,8 @@ def test_reply_ambiguous_failure_does_not_fallback_push(monkeypatch):
     assert ids == ["M1"]
 
 
-def test_fast_path_uses_reminder_push_mention_message_and_marks(monkeypatch):
-    """Next normal text message should be able to carry due reminder_push items."""
+def test_fast_path_does_not_use_reply_token_for_reminder_push(monkeypatch):
+    """Normal text messages must not carry due reminder_push items."""
     import main
     from linebot.v3.messaging import (
         MentionSubstitutionObject,
@@ -328,11 +322,10 @@ def test_fast_path_uses_reminder_push_mention_message_and_marks(monkeypatch):
     monkeypatch.setattr(main, "MessagingApi", _FakeMessagingApi)
     monkeypatch.setattr(main, "_get_line_config", lambda: None)
 
-    assert main._try_piggyback_reminders_fast_path("reply-token", "G1") is True
+    assert main._try_piggyback_reminders_fast_path("reply-token", "G1") is False
 
-    assert captured["reply_token"] == "reply-token"
-    assert captured["messages"] == [reminder_message]
-    assert marked == [(21, "3d")]
+    assert captured == {}
+    assert marked == []
 
 
 def test_reply_success_commits_pending_piggyback(monkeypatch):
@@ -376,7 +369,7 @@ def test_reply_success_commits_pending_piggyback(monkeypatch):
     assert pending_store.load().get("G1", []) == []
 
 
-def test_reply_success_marks_reminder_push_piggyback(monkeypatch):
+def test_reply_does_not_bundle_reminder_push_piggyback(monkeypatch):
     import main
     import pending_store
     import reminder_push
@@ -433,11 +426,8 @@ def test_reply_success_marks_reminder_push_piggyback(monkeypatch):
 
     main._reply("fake_token", "primary reply", group_id="G1")
 
-    assert captured["texts"] == [
-        "primary reply",
-        "⏰ 提醒（明天）\n2026-06-02 00:00 去看醫生",
-    ]
-    assert marked == [(6, "1d")]
+    assert captured["texts"] == ["primary reply"]
+    assert marked == []
 
 
 def test_reply_failure_does_not_mark_reminder_push_piggyback(monkeypatch):

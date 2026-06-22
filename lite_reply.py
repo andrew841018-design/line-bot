@@ -48,6 +48,183 @@ _UA = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
+_LOCAL_LLM_OPINION_SYSTEM_PROMPT = """你是 LINE 群組助理咪寶。遇到影片、文章、案例、健康做法、投資策略、生活方法等值得評論的分享時，不可以只附和或摘要。
+
+回覆必須使用繁體中文，且固定包含：
+1. 第一句直接給你的核心判斷，不要 echo 使用者。
+2. 「正方：」列 1-2 點支持或合理之處。
+3. 「反方：」列 1-2 點風險、限制或需要查證之處。
+4. 「整合：」給統一見解與具體建議。
+
+你是 local fallback，通常沒有即時查證能力；不要假裝有來源或數據。沒有來源時就用「需要查證」或「不能只憑影片判斷」誠實標註。
+
+請先回顧使用者提供的原始素材（含 URL 抓到的影片標題、描述、字幕或引用段落）中能讀到的主張，再針對那個主張回答。不能只回「很鼓舞人心 / 很有道理」等泛泛情緒句。若素材不足，先說明「目前抓不到原始主張」並要求補充原文。控制在 180-320 個中文字。
+請只使用你看到的素材做推理：若證據缺漏，請明確點出缺哪一段，而不是替代為空泛結論。"""
+
+_LITE_OPINION_TOPIC_HINTS = (
+    "影片", "YouTube", "youtube", "影片標題", "youtube 影片", "故事",
+    "人物", "角色", "個案", "案例", "新聞", "報導", "貼文", "研究", "論文",
+    "方法", "做法", "策略", "觀點", "心得", "健康", "養生", "人生", "財富自由",
+    "貧窮", "致富", "努力", "上進", "小知足", "逆襲", "手工皂", "商業皂",
+    "化學成分", "皮膚", "投資", "理財",
+)
+_LITE_OPINION_SIGNAL_HINTS = (
+    "分享", "分享了", "看起來", "很實用", "很有趣", "可以避免", "更友善",
+    "值得", "值得學習", "值得借鏡", "值得參考", "值得反思", "值得警惕",
+    "可參考", "啟發", "有感", "有感觸", "鼓舞", "鼓舞人心", "通過", "出發",
+    "貢獻", "努力", "起點", "逆轉", "突破", "比較", "值得",
+    "比較", "值得", "好處", "壞處", "風險", "建議", "主張", "認為",
+)
+_LITE_PRO_MARKERS = (
+    "正方", "同意的部分", "支持的部分", "好的部分", "支持理由", "贊成",
+)
+_LITE_CON_MARKERS = (
+    "反方", "反對的部分", "質疑的部分", "壞的部分", "反對理由", "風險",
+)
+_LITE_SUMMARY_MARKERS = (
+    "整合", "綜合", "結論", "統一見解", "我的看法", "最終建議", "判斷",
+)
+
+
+def _context_blobs_for_local_opinion(context: list | None, max_chars: int = 1200) -> str:
+    if not context:
+        return ""
+    parts: list[str] = []
+    consumed = 0
+    # 只看近期對話，避免把整段歷史誤判；預設 1200 字為夠用上限。
+    for item in reversed(context[-6:]):
+        text: str | None = None
+        if isinstance(item, str):
+            text = item
+        elif isinstance(item, (tuple, list)) and len(item) >= 2:
+            candidate = item[1]
+            if isinstance(candidate, str):
+                text = candidate
+        elif isinstance(item, dict):
+            for key in ("text", "content", "summary", "message"):
+                candidate = item.get(key)
+                if isinstance(candidate, str):
+                    text = candidate
+                    break
+        if not text:
+            continue
+        clean = text.strip()
+        if not clean:
+            continue
+        remain = max_chars - consumed
+        if remain <= 0:
+            break
+        parts.append(clean[:remain])
+        consumed += len(clean[:remain])
+    if not parts:
+        return ""
+    return "\n".join(reversed(parts))
+
+
+def _opinion_context_contains_material(blob: str) -> bool:
+    """判斷 blob 是否有足夠素材可支撐正反方論述（避免盲目抓網路）。"""
+    if not blob:
+        return False
+    if len(blob) < 120:
+        return False
+    material_markers = (
+        "標題：",
+        "上傳者：",
+        "作者：",
+        "描述：",
+        "觀點",
+        "論點",
+        "研究",
+        "資料",
+        "字幕內容",
+        "--- 影片資訊",
+        "影片資訊",
+    )
+    return any(m in blob for m in material_markers)
+
+
+def _google_search_snippet_raw(query: str) -> str | None:
+    """不預設要求問句詞的 Google snippet 抓取，作為 opinion fallback 補充資料。"""
+    query = (query or "").strip()
+    if not query or len(query) < 12:
+        return None
+    if len(query) > 140:
+        query = query[:140]
+    try:
+        url = f"https://www.google.com/search?q={quote_plus(query)}&hl=zh-TW"
+        resp = requests.get(
+            url,
+            headers={"User-Agent": _UA, "Accept-Language": "zh-TW,zh;q=0.9"},
+            timeout=_HTTP_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return None
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for cls in ("VwiC3b", "lEBKkf", "BNeawe", "yXK7lf", "MUxGbd"):
+            el = soup.find(class_=cls)
+            if el:
+                snippet = el.get_text(" ", strip=True)[:300]
+                if snippet and len(snippet) > 20:
+                    return (
+                        f"🔍 lite mode（Google 首頁 snippet）：\n"
+                        f"{snippet}\n\n"
+                        f"完整搜尋：{url}"
+                    )
+        return None
+    except Exception as e:
+        logger.info("_google_search_snippet_raw failed: %s", e)
+        # fallthrough to duckduckgo fallback
+
+    # 如果 Google 版面無 snippet（常見反爬），退回 DuckDuckGo HTML 搜尋片段。
+    return _duckduckgo_search_snippet_raw(query)
+
+
+def _duckduckgo_search_snippet_raw(query: str) -> str | None:
+    query = (query or "").strip()
+    if not query or len(query) < 12:
+        return None
+    if len(query) > 140:
+        query = query[:140]
+    try:
+        url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
+        resp = requests.get(
+            url,
+            headers={"User-Agent": _UA, "Accept-Language": "zh-TW,zh;q=0.9"},
+            timeout=_HTTP_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return None
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for cls in ("result__snippet", "result__body", "result__a"):
+            el = soup.find(class_=cls)
+            if not el:
+                continue
+            snippet = el.get_text(" ", strip=True)[:300]
+            if snippet and len(snippet) > 20:
+                return (
+                    f"🔍 lite mode（DuckDuckGo 搜尋片段）：\n"
+                    f"{snippet}\n\n"
+                    f"完整搜尋：{url}"
+                )
+        return None
+    except Exception as e:
+        logger.info("_duckduckgo_search_snippet_raw failed: %s", e)
+        return None
+
+
+def _collect_opinion_reference_context(text: str, context: list | None = None) -> str | None:
+    """缺素材時先抓一段網路 snippets 作為補充，避免只講空泛情緒。"""
+    blob = _context_blobs_for_local_opinion(context)
+    if _opinion_context_contains_material(blob):
+        return None
+    # 直接用去除 URL 後的文字下 keyword 搜尋
+    query = re.sub(r"https?://\S+", "", (text or "")).strip()
+    if len(query) < 12:
+        return None
+    return _google_search_snippet_raw(query)
+
 
 # ── intent: URL 摘要 ──────────────────────────────────────────────────────────
 
@@ -572,6 +749,36 @@ def _try_google_snippet(text: str) -> str | None:
 # ── 生成式 helper（local LLM）───────────────────────────────────────────────
 
 
+def _requires_lite_opinion_structure(text: str, context: list | None = None) -> bool:
+    """影片/文章/案例等分享型內容，local fallback 也必須給正反方與整合見解。"""
+    t = (text or "").strip()
+    context_blob = _context_blobs_for_local_opinion(context)
+    combined = f"{t}\n{context_blob}".strip()
+    if len(combined) < 12:
+        return False
+    try:
+        from gemini_client import _NEWS_CASE_TOPIC_HINTS
+        professional_hints = tuple(_NEWS_CASE_TOPIC_HINTS)
+    except Exception:
+        professional_hints = ()
+    if any(h in combined for h in professional_hints):
+        return True
+    has_topic = any(h in combined for h in _LITE_OPINION_TOPIC_HINTS)
+    has_signal = any(h in combined for h in _LITE_OPINION_SIGNAL_HINTS)
+    return has_topic and has_signal
+
+
+def _has_lite_opinion_structure(reply: str) -> bool:
+    """Minimum local fallback shape: pro + con + integrated take."""
+    r = (reply or "").strip()
+    if not r:
+        return False
+    has_pro = any(m in r for m in _LITE_PRO_MARKERS)
+    has_con = any(m in r for m in _LITE_CON_MARKERS)
+    has_summary = any(m in r for m in _LITE_SUMMARY_MARKERS)
+    return has_pro and has_con and has_summary
+
+
 def _try_local_llm(text: str, context: list | None = None) -> str | None:
     """走 local LLM。失敗 / 不可用 回 None（graceful degrade）。
 
@@ -588,7 +795,22 @@ def _try_local_llm(text: str, context: list | None = None) -> str | None:
         return None
 
     try:
-        response = _llm_chat(text, context=context)
+        kwargs = {}
+        if _requires_lite_opinion_structure(text, context=context):
+            material_blob = _context_blobs_for_local_opinion(context)
+            has_material = _opinion_context_contains_material(material_blob)
+            evidence = None if has_material else _collect_opinion_reference_context(text, context=context)
+            if not has_material and not evidence:
+                return None
+            resolved_context: list = list(context) if context else []
+            if evidence:
+                resolved_context.append(("research", f"補充資料（可能可作為論證依據）：\n{evidence}"))
+            kwargs = {
+                "system_prompt": _LOCAL_LLM_OPINION_SYSTEM_PROMPT,
+                "max_tokens": 700,
+            }
+            context = resolved_context
+        response = _llm_chat(text, context=context, **kwargs)
     except Exception as e:
         logger.info("_try_local_llm runtime error: %s", e)
         return None
@@ -640,7 +862,7 @@ def _call_handler(handler, text: str, context: list | None = None):
     return handler(text)
 
 
-def _passes_helpfulness_gate(reply: str, text: str) -> bool:
+def _passes_helpfulness_gate(reply: str, text: str, context: list | None = None) -> bool:
     """非確定性回覆（local LLM / search snippet）的有用性閘門。
 
     Andrew rule（feedback_bot_reply_helpful_or_defer）：substantive 題寧可不回，也不要回
@@ -652,6 +874,8 @@ def _passes_helpfulness_gate(reply: str, text: str) -> bool:
     """
     r = (reply or "").strip()
     if not r:
+        return False
+    if _requires_lite_opinion_structure(text, context=context) and not _has_lite_opinion_structure(r):
         return False
     # substantive = 金融 / 房產 / 法律 / 醫療等「沒 grounding 容易空話」的主題。
     # 既有 _NEWS_CASE_TOPIC_HINTS（投資 / 房地產 / 醫療…）字面 substring 比對抓不到
@@ -743,7 +967,7 @@ def lite_reply(text: str, context: list | None = None) -> str | None:
     # 過 helpfulness gate：substantive 題的空泛 lecture 不送，往下 fall through 到
     # Stage 3 網搜；都不行則最終 return None → 上層存 pending（help-or-defer）。
     out = _try_local_llm(text, context=context)
-    if out and _passes_helpfulness_gate(out, text):
+    if out and _passes_helpfulness_gate(out, text, context=context):
         return out
 
     # ─ Stage 3: 規則式 fallback（最後 safety net）─
@@ -757,7 +981,7 @@ def lite_reply(text: str, context: list | None = None) -> str | None:
             continue
         # _try_google_snippet 是非確定性 web snippet → 同樣過 gate；
         # _try_url_summary / _try_weather 是確定性事實 → 直接放行。
-        if handler is _try_google_snippet and not _passes_helpfulness_gate(out, text):
+        if handler is _try_google_snippet and not _passes_helpfulness_gate(out, text, context=context):
             continue
         return out
 

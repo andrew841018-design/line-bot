@@ -150,6 +150,7 @@ def classify(text: str) -> str:
 
 _SCHEMA_LOCK = threading.Lock()
 _SCHEMA_ENSURED = False
+_SCHEMA_ENSURED_PATHS: set[str] = set()
 
 
 def ensure_schema(db_path: Optional[Path] = None) -> None:
@@ -158,12 +159,13 @@ def ensure_schema(db_path: Optional[Path] = None) -> None:
     SQLite 沒有 ADD COLUMN IF NOT EXISTS，先用 PRAGMA 查再決定是否 ALTER。
     """
     global _SCHEMA_ENSURED
-    if _SCHEMA_ENSURED:
+    path = Path(db_path or _DB_PATH)
+    path_key = str(path)
+    if path_key in _SCHEMA_ENSURED_PATHS:
         return
     with _SCHEMA_LOCK:
-        if _SCHEMA_ENSURED:
+        if path_key in _SCHEMA_ENSURED_PATHS:
             return
-        path = db_path or _DB_PATH
         try:
             conn = sqlite3.connect(str(path), timeout=5)
             try:
@@ -181,6 +183,7 @@ def ensure_schema(db_path: Optional[Path] = None) -> None:
                 conn.commit()
             finally:
                 conn.close()
+            _SCHEMA_ENSURED_PATHS.add(path_key)
             _SCHEMA_ENSURED = True
         except Exception as e:
             logger.warning("ensure_schema failed: %s", e)
@@ -223,11 +226,12 @@ def classify_async(group_id: str, message_id: str, text: str) -> None:
     """
     if not group_id or not message_id or not text:
         return
+    db_path = _DB_PATH
 
     def _run() -> None:
         try:
             cat = classify(text)
-            update_category(group_id, message_id, cat)
+            update_category(group_id, message_id, cat, db_path=db_path)
         except Exception:
             # 永不阻塞主流程
             pass

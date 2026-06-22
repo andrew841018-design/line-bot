@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse, fcntl, hashlib, json, os, re, sqlite3, subprocess, sys, time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 from pending_reply_policy import pending_reply_enabled
 
@@ -37,6 +38,7 @@ JSONL_LOG = Path.home() / "Library" / "Logs" / "line_bot_preflight.jsonl"
 CACHE_TTL_SEC = 300
 STASH_MAX_AGE_SEC = 1800
 TUNNEL_URL_PATTERN = re.compile(r"^https://[a-z0-9-]+\.trycloudflare\.com$")
+RESERVED_TRYCLOUDFLARE_HOSTS = {"api.trycloudflare.com"}
 _TRANSIENT_STATUS_RE = re.compile(r"\b(429|503)\b")
 _TRANSIENT_KEYWORDS = ("RESOURCE_EXHAUSTED", "UNAVAILABLE", "DEADLINE")
 UVICORN_PORT = 8080
@@ -126,6 +128,28 @@ def _curl(url, *, timeout=10, method="GET", data=None, headers=None, interface=N
         return code, body[:500]
     except subprocess.TimeoutExpired: return 0, "curl_timeout"
     except Exception as e: return 0, f"curl_err: {str(e)[:120]}"
+
+
+def _normalize_tunnel_url(raw):
+    if not raw:
+        return ""
+    candidate = str(raw).strip().rstrip("/")
+    try:
+        parsed = urlparse(candidate)
+    except ValueError:
+        return ""
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https":
+        return ""
+    if host in RESERVED_TRYCLOUDFLARE_HOSTS:
+        return ""
+    if not re.fullmatch(r"[a-z0-9-]+\.trycloudflare\.com", host):
+        return ""
+    if parsed.port or parsed.username or parsed.password:
+        return ""
+    if parsed.path not in ("", "/") or parsed.params or parsed.query or parsed.fragment:
+        return ""
+    return f"https://{host}"
 
 
 def _curl_with_token(url, token, *, timeout=10, method="GET", data=None,
@@ -244,12 +268,12 @@ def _restart_cloudflared_for_preflight(previous_url, *, timeout=90):
         while time.monotonic() < deadline:
             time.sleep(1)
             try:
-                current = TUNNEL_URL_STASH.read_text().strip()
+                current = _normalize_tunnel_url(TUNNEL_URL_STASH.read_text())
             except FileNotFoundError:
                 continue
             except OSError:
                 continue
-            if current and TUNNEL_URL_PATTERN.match(current) and current != previous_url:
+            if current and current != previous_url:
                 return True, current
         return False, f"no fresh cloudflared URL within {timeout}s"
     except Exception as e:
@@ -370,11 +394,11 @@ def check_4_stash_valid():
     age = time.time() - st.st_mtime
     url = ""
     for _ in range(2):  # retry 1 次防 cloudflared wrapper non-atomic write 撞期
-        try: url = TUNNEL_URL_STASH.read_text().strip()
+        try: url = _normalize_tunnel_url(TUNNEL_URL_STASH.read_text())
         except OSError as e: return r.failed(f"read: {e}"), ""
-        if url and TUNNEL_URL_PATTERN.match(url): break
+        if url: break
         time.sleep(0.5)
-    if not url or not TUNNEL_URL_PATTERN.match(url):
+    if not url:
         return r.failed(f"URL 非 trycloudflare.com 格式 (retry 後): {url[:80]!r}"), ""
     r.detail = f"url={url} age={int(age)}s"
     return r.passed(), url
@@ -672,7 +696,7 @@ def main():
     args = ap.parse_args()
     if not args.force:
         try:
-            url = TUNNEL_URL_STASH.read_text().strip() if TUNNEL_URL_STASH.exists() else ""
+            url = _normalize_tunnel_url(TUNNEL_URL_STASH.read_text()) if TUNNEL_URL_STASH.exists() else ""
             tok = _line_token(); webhook = ""
             if url and tok:
                 code, body = _curl_with_token(LINE_WEBHOOK_ENDPOINT, tok, timeout=5)

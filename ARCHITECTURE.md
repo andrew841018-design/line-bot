@@ -245,11 +245,12 @@ JSON state（小型常變）：`gemini_usage.json`（quota）、`pushed_jobs.jso
 |---|---|---|
 | `line-bot-token-refresh` | 每 600 秒 (10 min) | LINE channel access token refresh |
 | `line-bot-reminder-push` | 每 900 秒 (15 min) | 階梯式提醒推送（呼叫 `reminder_push.py`） |
-| `line-bot-health-monitor` | 每 1800 秒 (30 min) | uvicorn 健康檢查 + auto-restart |
+| `line-bot-health-monitor` | 每 300 秒 (5 min) | uvicorn / cloudflared / webhook 健康檢查 + auto-restart |
 | `line-bot-health` | StartCalendar | health_check.sh，輕量 ping |
 | `line-bot-distill-daily` | 每天 03:00 | `finetune/distill_daily.py` 累積 fine-tune pair |
 | `line-bot-event-reminder` | 每天 07:00 | `event_reminder.py`（行事曆事件） |
 | `line-bot-update-push` | 每天 09:00 | `line_bot_update_push.py`（產品更新摘要） |
+| `line-bot-food-push` | launchd plist | 食物/菜單相關主動推送 |
 | `line-bot-morning-restart` | StartCalendar | 早上重啟 uvicorn 確保健康 |
 | `line-bot-auto-iterate` | StartCalendar | 自動迭代開發 / health 巡檢 |
 | `line-bot-feedback-process` | 每週二 02:00 | 處理週一收的回饋 |
@@ -258,7 +259,50 @@ JSON state（小型常變）：`gemini_usage.json`（quota）、`pushed_jobs.jso
 
 ---
 
-## 7. Capability Matrix（每種訊息類型怎麼處理）
+## 7. Cloud VM Deployment Path
+
+Mac launchd is still useful as a local fallback, but it cannot guarantee replies
+while the Mac sleeps, loses network, or has an external disk removed. The
+production reliability path is now a single always-on Linux VM:
+
+```
+LINE -> Cloudflare named tunnel hostname -> 127.0.0.1:8080 -> FastAPI /callback
+```
+
+Key repo artifacts:
+
+- `ops/deploy/line_bot_cloud_runbook.md`: account-neutral VM install, cutover,
+  alert drill, and rollback procedure.
+- `ops/deploy/line_bot.env.example`: VM environment template; real secrets live
+  in `/etc/line-bot/line-bot.env` with mode `0600`.
+- `ops/deploy/line_bot_state_manifest.md`: explicit approval checklist for
+  private runtime DB/token/state transfer.
+- `ops/systemd/line-bot.service`: keeps uvicorn running on `127.0.0.1:8080`.
+- `ops/systemd/line-bot-cloud-health.timer`: runs cloud health monitoring every
+  60 seconds.
+- `ops/systemd/line-bot-*.timer`: VM equivalents for cloud-portable scheduled
+  LINE bot jobs. Push timers are not enabled by the deploy script; enable them
+  only after Mac launchd jobs are stopped and the runtime state manifest is
+  applied. Weekly cloud push timers are staggered to avoid simultaneous Sunday
+  20:00 LINE pushes.
+- `line_bot/cloud_health_monitor.py`: cheap checks every run, LINE webhook E2E
+  at most every 180 seconds when enabled, Discord alert on critical failures.
+- `line_bot/preflight_cloud.py`: cloud smoke gate that does not touch LINE APIs
+  unless `--live-line` is explicitly passed.
+- `ops/cloudflare/line-bot-tunnel.yml.example`: locally-managed Cloudflare named
+  tunnel template.
+
+Cutover safety rules:
+
+1. Keep the VM `BOT_MUTED=true` until local health, public health, and LINE
+   webhook test all pass.
+2. Do not leave Mac and VM both unmuted against the same LINE channel.
+3. Use a stable Cloudflare named tunnel hostname; do not use quick-tunnel URL
+   scraping for production.
+4. Discord alert SLA target: local/public health failures within 60 seconds;
+   LINE webhook E2E failures within 180 seconds plus network/Discord send time.
+
+## 8. Capability Matrix（每種訊息類型怎麼處理）
 
 | 訊息類型 | quota OK | quota 爆 |
 |---|---|---|
@@ -285,7 +329,7 @@ JSON state（小型常變）：`gemini_usage.json`（quota）、`pushed_jobs.jso
 
 ---
 
-## 8. Honest Limitations
+## 9. Honest Limitations
 
 不要過度自信，這些是實際短板：
 
@@ -310,7 +354,7 @@ JSON state（小型常變）：`gemini_usage.json`（quota）、`pushed_jobs.jso
 
 ---
 
-## 9. Future Work
+## 10. Future Work
 
 - **Fine-tune 14B 成「咪寶」人設**：`distill_daily.py` 累積到 3000+ pair 後跑 `train_lora.sh`，預期能把品質從 3.4/5 推到 4.0/5。Mac M2 Pro 16GB 可訓 3B 不能訓 14B；14B LoRA 要租 H100 / 用 4090 + QLoRA。
 - **70B 模型**：64GB Mac（M3 Max / M4 Pro 高配）才跑得動 Qwen2.5-72B 4-bit。能力預估接近 Gemini 90%，但速度（~5 token/s）對 LINE webhook 太慢，需要 streaming 回覆。

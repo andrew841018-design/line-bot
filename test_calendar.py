@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import importlib
 import json
-from datetime import date, timedelta
+import time
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -196,6 +198,282 @@ def test_event_reminder_pushes_and_marks(tmp_calendar_db, monkeypatch):
     rc = event_reminder.main()
     assert rc == 0
     assert sent == []
+
+
+def _to_calendar_remind_ts(event_date: str, event_time: str | None = None) -> int:
+    hhmm = event_time or "00:00"
+    y, m, d = (int(part) for part in event_date.split("-"))
+    h, minute = (int(x) for x in hhmm.split(":"))
+    return int(datetime(y, m, d, h, minute, tzinfo=ZoneInfo("Asia/Taipei")).timestamp())
+
+
+def _align_memory_db_with_calendar(calendar_db_module) -> None:
+    import memory
+
+    memory._DB_PATH = calendar_db_module._DB_PATH
+    memory._init_db()
+
+
+def test_insert_event_syncs_to_reminder(tmp_calendar_db):
+    cd = tmp_calendar_db
+    _align_memory_db_with_calendar(cd)
+    import memory
+
+    event_date = (date.today() + timedelta(days=3)).isoformat()
+    event_id = cd.insert_event(
+        group_id="G1",
+        title="爸爸健檢",
+        event_date=event_date,
+        event_time="08:00",
+        location="榮總",
+    )
+    assert event_id
+
+    reminders = memory.list_pending_reminders("G1")
+    assert len(reminders) == 1
+    assert reminders[0]["source_kind"] == "calendar_event"
+    assert reminders[0]["source_ref"] == event_id
+    assert reminders[0]["action"] == "爸爸健檢"
+    assert reminders[0]["remind_at"] == _to_calendar_remind_ts(event_date, "08:00")
+
+
+def test_update_event_syncs_reminder_time(tmp_calendar_db):
+    cd = tmp_calendar_db
+    _align_memory_db_with_calendar(cd)
+    import memory
+
+    today = date.today()
+    event_id = cd.insert_event(
+        group_id="G1",
+        title="聚餐改期",
+        event_date=today.isoformat(),
+        event_time="18:00",
+    )
+    initial = memory.list_pending_reminders("G1")
+    assert len(initial) == 1
+    assert initial[0]["remind_at"] == _to_calendar_remind_ts(today.isoformat(), "18:00")
+
+    new_date = (today + timedelta(days=4)).isoformat()
+    assert cd.update_event_date(event_id, new_date, "19:00") is True
+
+    reminders = memory.list_pending_reminders("G1")
+    assert len(reminders) == 1
+    assert reminders[0]["remind_at"] == _to_calendar_remind_ts(new_date, "19:00")
+
+
+def test_cancel_event_marks_reminder_done(tmp_calendar_db):
+    cd = tmp_calendar_db
+    _align_memory_db_with_calendar(cd)
+    import memory
+
+    event_date = (date.today() + timedelta(days=1)).isoformat()
+    event_id = cd.insert_event(
+        group_id="G1",
+        title="取消同步測試",
+        event_date=event_date,
+    )
+    assert memory.list_pending_reminders("G1"), "insert_event 應同步 pending reminder"
+
+    assert cd.cancel_event(event_id) is True
+    assert memory.list_pending_reminders("G1") == []
+
+
+def test_sync_active_events_to_reminders_backfills_existing(tmp_calendar_db):
+    cd = tmp_calendar_db
+    _align_memory_db_with_calendar(cd)
+    import memory
+
+    eid = "seeded-event-id"
+    event_date = (date.today() + timedelta(days=2)).isoformat()
+    with cd._conn() as c:
+        c.execute(
+            "INSERT INTO events (event_id, group_id, title, event_date, event_time, "
+            "location, participants, status, created_at, event_type) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, 'family_gathering')",
+            (
+                eid,
+                "G1",
+                "回家聚餐",
+                event_date,
+                "17:30",
+                "社區",
+                "[\"媽媽\"]",
+                int(time.time()),
+            ),
+        )
+
+    assert memory.list_pending_reminders("G1") == []
+
+    synced = cd.sync_active_events_to_reminders("G1")
+    reminders = memory.list_pending_reminders("G1")
+    assert synced >= 1
+    assert len(reminders) >= 1
+    assert any(
+        r["source_kind"] == "calendar_event" and r["source_ref"] == eid
+        for r in reminders
+    )
+
+
+def test_sync_active_events_to_reminders_removes_stale(tmp_calendar_db):
+    cd = tmp_calendar_db
+    _align_memory_db_with_calendar(cd)
+    import memory
+
+    event_date = (date.today() + timedelta(days=2)).isoformat()
+    eid = cd.insert_event(
+        group_id="G1",
+        title="持續保留",
+        event_date=event_date,
+        event_time="09:00",
+        location="機場",
+    )
+    assert eid
+
+    memory.upsert_reminder_for_source(
+        group_id="G1",
+        user_id="",
+        action="已過期提醒",
+        remind_at=int(time.time()) + 3600,
+        source_kind=cd.EVENT_REMINDER_SOURCE_KIND,
+        source_ref="orphan-event",
+        source_text="請刪掉我",
+    )
+    assert any(
+        r["source_ref"] == "orphan-event" and r["source_kind"] == "calendar_event"
+        for r in memory.list_pending_reminders("G1")
+    )
+
+    cd.sync_active_events_to_reminders("G1")
+    assert all(
+        not (
+            r["source_kind"] == "calendar_event"
+            and r["source_ref"] == "orphan-event"
+        )
+        for r in memory.list_pending_reminders("G1")
+    )
+    assert any(
+        r["source_ref"] == eid and r["source_kind"] == "calendar_event"
+        for r in memory.list_pending_reminders("G1")
+    )
+
+
+def test_event_reminder_payload_includes_source_msg_reference(tmp_calendar_db):
+    cd = tmp_calendar_db
+    _align_memory_db_with_calendar(cd)
+    import memory
+
+    raw_message_id = "msg-source-001"
+    raw_text = (
+        "高鐵接送：到機場前請點 https://example.com/pickup "
+        "驗證碼: ABCD1234"
+    )
+    memory.log_raw_message("G1", raw_message_id, "U_MOM", raw_text)
+
+    event_date = (date.today() + timedelta(days=3)).isoformat()
+    eid = cd.insert_event(
+        group_id="G1",
+        title="接爸爸",
+        event_date=event_date,
+        event_time="10:30",
+        location="台北松山機場",
+        source_msg_id=raw_message_id,
+    )
+    assert eid
+
+    reminders = memory.list_pending_reminders("G1")
+    assert len(reminders) == 1
+    reminder = reminders[0]
+    assert reminder["source_ref"] == eid
+    assert reminder["source_kind"] == cd.EVENT_REMINDER_SOURCE_KIND
+    assert "接送網址：" in reminder["source_text"]
+    assert "https://example.com/pickup" in reminder["source_text"]
+    assert "驗證碼" in reminder["source_text"]
+    assert "ABCD1234" in reminder["source_text"]
+
+
+def test_event_reminder_uses_raw_sender_and_participant_aliases(tmp_calendar_db):
+    cd = tmp_calendar_db
+    _align_memory_db_with_calendar(cd)
+    import memory
+
+    raw_message_id = "msg-source-actor"
+    memory.log_raw_message("G1", raw_message_id, "U_MOM", "爸爸(就醫) 明天 10:30 出發")
+
+    event_date = (date.today() + timedelta(days=4)).isoformat()
+    eid = cd.insert_event(
+        group_id="G1",
+        title="爸爸體檢",
+        event_date=event_date,
+        event_time="10:30",
+        source_msg_id=raw_message_id,
+        participants=["黃聖雅", "媽媽"],
+    )
+    assert eid
+
+    reminders = memory.list_pending_reminders_full("G1")
+    reminder = next(r for r in reminders if r["source_ref"] == eid)
+
+    assert reminder["user_id"] == "U_MOM"
+    assert reminder["mention_aliases"] == ["黃聖雅", "媽媽"]
+
+
+def test_event_reminder_merges_mentioned_names_from_raw_text(tmp_calendar_db):
+    cd = tmp_calendar_db
+    _align_memory_db_with_calendar(cd)
+    import memory
+
+    raw_message_id = "msg-source-mentions"
+    memory.log_raw_message(
+        "G1",
+        raw_message_id,
+        "U_MOM",
+        "這波家事有 @黃聖雅 陪同參與",
+    )
+
+    event_date = (date.today() + timedelta(days=4)).isoformat()
+    eid = cd.insert_event(
+        group_id="G1",
+        title="家庭聚會",
+        event_date=event_date,
+        event_time="10:30",
+        source_msg_id=raw_message_id,
+        participants=["媽媽"],
+    )
+    assert eid
+
+    reminders = memory.list_pending_reminders_full("G1")
+    reminder = next(r for r in reminders if r["source_ref"] == eid)
+
+    assert reminder["mention_aliases"] == ["媽媽", "黃聖雅"]
+
+
+def test_event_reminder_treats_raw_text_family_all_as_all(tmp_calendar_db):
+    cd = tmp_calendar_db
+    _align_memory_db_with_calendar(cd)
+    import memory
+
+    raw_message_id = "msg-source-all"
+    memory.log_raw_message(
+        "G1",
+        raw_message_id,
+        "U_MOM",
+        "今天全家去機場集合",
+    )
+
+    event_date = (date.today() + timedelta(days=4)).isoformat()
+    eid = cd.insert_event(
+        group_id="G1",
+        title="機場接機",
+        event_date=event_date,
+        event_time="10:30",
+        source_msg_id=raw_message_id,
+    )
+    assert eid
+
+    reminders = memory.list_pending_reminders_full("G1")
+    reminder = next(r for r in reminders if r["source_ref"] == eid)
+
+    assert reminder["mention_aliases"] == ["全家"]
 
 
 def test_event_reminder_skips_cancelled(tmp_calendar_db, monkeypatch):

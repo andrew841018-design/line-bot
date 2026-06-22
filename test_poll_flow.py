@@ -73,7 +73,7 @@ def _install_noop_side_modules(monkeypatch):
     )
 
 
-def test_text_flow_creates_poll_before_burst(poll_db, monkeypatch):
+def test_text_flow_ignores_natural_poll_request_without_bot_trigger(poll_db, monkeypatch):
     _install_noop_side_modules(monkeypatch)
     replies: list[str] = []
     evt = _make_text_event("爸爸想知道，今天晚上有誰可以去吃凱薩", msg_id="m1")
@@ -89,12 +89,12 @@ def test_text_flow_creates_poll_before_burst(poll_db, monkeypatch):
     ):
         main._handle_text_message(evt, G)
 
-    assert not add_to_burst.called
-    assert replies and replies[0].startswith("@all 民調開好了")
-    assert poll_db.get_active_poll(G) is not None
+    assert add_to_burst.called
+    assert replies == []
+    assert poll_db.get_active_poll(G) is None
 
 
-def test_text_flow_reads_active_poll_reply_before_burst(poll_db, monkeypatch):
+def test_text_flow_ignores_vote_without_bot_trigger(poll_db, monkeypatch):
     _install_noop_side_modules(monkeypatch)
     poll_db.create_poll(G, "今天晚上吃凱薩誰可以", user_id=FATHER)
     replies: list[str] = []
@@ -112,6 +112,100 @@ def test_text_flow_reads_active_poll_reply_before_burst(poll_db, monkeypatch):
     ):
         main._handle_text_message(evt, G)
 
+    assert add_to_burst.called
+    assert not llm_chat.called
+    assert replies == []
+
+
+def test_text_flow_creates_poll_with_explicit_bot_trigger(poll_db, monkeypatch):
+    _install_noop_side_modules(monkeypatch)
+    replies: list[str] = []
+    evt = _make_text_event(
+        "咪寶 幫我做民調：今天晚上有誰可以去吃凱薩",
+        msg_id="m3",
+    )
+
+    with (
+        patch("main.feedback_collector.in_feedback_window", return_value=False),
+        patch("main._try_handle_calendar_correction", return_value=False),
+        patch("main._detect_user_correction"),
+        patch("main._auto_capture_text_if_important"),
+        patch("main._maybe_extract_reminder"),
+        patch("main.burst_filter.add_to_burst") as add_to_burst,
+        patch("main._reply", side_effect=lambda _token, text, **_kw: replies.append(text)),
+    ):
+        main._handle_text_message(evt, G)
+
+    assert not add_to_burst.called
+    assert replies and replies[0].startswith("@all 民調開好了")
+    assert "今天晚上有誰可以去吃凱薩？" in replies[0]
+    assert poll_db.get_active_poll(G) is not None
+
+
+def test_text_flow_creates_poll_with_direct_poll_request(poll_db, monkeypatch):
+    _install_noop_side_modules(monkeypatch)
+    replies: list[str] = []
+    evt = _make_text_event(
+        "幫我做民調：今天晚上有誰可以去吃凱薩",
+        msg_id="m5",
+    )
+
+    with (
+        patch("main.feedback_collector.in_feedback_window", return_value=False),
+        patch("main._try_handle_calendar_correction", return_value=False),
+        patch("main._detect_user_correction"),
+        patch("main._auto_capture_text_if_important"),
+        patch("main._maybe_extract_reminder"),
+        patch("main.burst_filter.add_to_burst") as add_to_burst,
+        patch("main._reply", side_effect=lambda _token, text, **_kw: replies.append(text)),
+    ):
+        main._handle_text_message(evt, G)
+
+    assert not add_to_burst.called
+    assert replies and replies[0].startswith("@all 民調開好了")
+    assert poll_db.get_active_poll(G) is not None
+
+
+def test_text_flow_reads_vote_with_explicit_bot_trigger(poll_db, monkeypatch):
+    _install_noop_side_modules(monkeypatch)
+    poll_db.create_poll(G, "今天晚上吃凱薩誰可以", user_id=FATHER)
+    replies: list[str] = []
+    evt = _make_text_event("咪寶 可以", msg_id="m4")
+
+    with (
+        patch("main.feedback_collector.in_feedback_window", return_value=False),
+        patch("main._try_handle_calendar_correction", return_value=False),
+        patch("main._detect_user_correction"),
+        patch("main._auto_capture_text_if_important"),
+        patch("main._maybe_extract_reminder"),
+        patch("main.burst_filter.add_to_burst") as add_to_burst,
+        patch("main._llm_chat") as llm_chat,
+        patch("main._reply", side_effect=lambda _token, text, **_kw: replies.append(text)),
+    ):
+        main._handle_text_message(evt, G)
+
     assert not add_to_burst.called
     assert not llm_chat.called
     assert replies and "爸爸 → 可以" in replies[0]
+
+
+def test_text_flow_closes_poll_with_direct_close_request(poll_db, monkeypatch):
+    _install_noop_side_modules(monkeypatch)
+    poll_db.create_poll(G, "今天晚上吃凱薩誰可以", user_id=FATHER)
+    replies: list[str] = []
+    evt = _make_text_event("關掉民調", msg_id="m6")
+
+    with (
+        patch("main.feedback_collector.in_feedback_window", return_value=False),
+        patch("main._try_handle_calendar_correction", return_value=False),
+        patch("main._detect_user_correction"),
+        patch("main._auto_capture_text_if_important"),
+        patch("main._maybe_extract_reminder"),
+        patch("main.burst_filter.add_to_burst") as add_to_burst,
+        patch("main._reply", side_effect=lambda _token, text, **_kw: replies.append(text)),
+    ):
+        main._handle_text_message(evt, G)
+
+    assert not add_to_burst.called
+    assert replies and replies[0].startswith("已關閉民調")
+    assert poll_db.get_active_poll(G) is None

@@ -1,4 +1,4 @@
-"""tests/test_grounding_local.py — pure-mock + 1 real-integration tests
+"""tests/test_grounding_local.py — deterministic unit tests
 for grounding_local.
 
 Coverage:
@@ -21,9 +21,9 @@ Coverage:
     17. score_response: aggregates per-claim, captures low scores
     18. score_response: empty response -> 1.0
     19. score_response: empty sources but has claims -> 0.0 + uncertain
-    20. real-integration canary: "台積電 Q1 EPS 12 元" vs "...11.85" -> uncertain
+    20. canary: "台積電 Q1 EPS 12 元" vs "...11.85" -> uncertain
 
-Heavy ST loads are mocked except the canary (test 20).
+Heavy ST loads are mocked. Full pytest should not import native model runtimes.
 """
 
 from __future__ import annotations
@@ -297,16 +297,17 @@ def test_score_response_empty_sources_returns_zero() -> None:
     assert all(c["verdict"] == "uncertain" for c in r["low_score_claims"])
 
 
-# ── 20. real-integration canary (no mock) ────────────────────────────────
-def test_real_integration_canary_eps_uncertain() -> None:
+# ── 20. deterministic canary ─────────────────────────────────────────────
+def test_eps_canary_uncertain(monkeypatch: pytest.MonkeyPatch) -> None:
     """驗收 spec 指定的 sample：
         claim  = "台積電 Q1 EPS 12 元"
         source = "台積電 Q1 EPS 11.85"
     EPS 數字不一致 (12 vs 11.85，差 1.27%) → 應該落在 uncertain。
 
-    這個 test 真的會 lazy-load sentence-transformers，所以比較重，但
-    每個 session 只會載一次 model。
+    用 fake encoder 固定 cosine，避免全量單元測試載真實 sentence-transformers
+    native runtime。
     """
+    _mock_st(monkeypatch, sim_value=0.5)
     r = gl.check_claim("台積電 Q1 EPS 12 元", "台積電 Q1 EPS 11.85")
     assert r["verdict"] == "uncertain", (
         f"expected uncertain, got {r['verdict']} (score={r['score']:.3f}, "

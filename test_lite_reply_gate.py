@@ -78,6 +78,64 @@ def test_lite_reply_chitchat_still_replies(monkeypatch):
     assert out is not None and "早點睡" in out  # chitchat preserved
 
 
+def test_lite_reply_opinion_share_requires_sections(monkeypatch):
+    _force_skip_nlp(monkeypatch)
+    monkeypatch.setattr(lr, "_STAGE1_HANDLERS", ())
+    monkeypatch.setattr(lr, "_STAGE3_HANDLERS", ())
+    shallow = (
+        "這支影片分享了如何在家做手工皂，看起來很有趣也很實用，"
+        "自己動手做可以避免商業皂的化學成分，對皮膚更友善。"
+        "\n\n（lite mode — local LLM）"
+    )
+    monkeypatch.setattr(lr, "_try_local_llm", lambda text, context=None: shallow)
+
+    assert lr.lite_reply("這支影片分享了如何在家做手工皂，看起來很實用") is None
+
+
+def test_lite_reply_opinion_share_allows_structured_reply(monkeypatch):
+    _force_skip_nlp(monkeypatch)
+    monkeypatch.setattr(lr, "_STAGE1_HANDLERS", ())
+    structured = (
+        "我覺得這支影片可以當入門參考，但不能把手工皂直接等於更安全。\n"
+        "正方：自己做能控制香精、色料與油脂來源，也比較知道成分。\n"
+        "反方：手工皂仍然有氫氧化鈉皂化與保存問題，配方錯反而刺激皮膚。\n"
+        "整合：可以做興趣或禮物，但敏感肌要先小範圍測試。"
+        "\n\n（lite mode — local LLM）"
+    )
+    monkeypatch.setattr(lr, "_try_local_llm", lambda text, context=None: structured)
+
+    out = lr.lite_reply("這支影片分享了如何在家做手工皂，看起來很實用")
+
+    assert out is not None
+    assert "正方" in out
+    assert "反方" in out
+    assert "整合" in out
+
+
+def test_lite_reply_context_video_followup_requires_structured_reply(monkeypatch):
+    _force_skip_nlp(monkeypatch)
+    monkeypatch.setattr(lr, "_STAGE1_HANDLERS", ())
+    monkeypatch.setattr(lr, "_STAGE3_HANDLERS", ())
+    shallow = "這個故事很鼓舞，真的值得學習。"
+    monkeypatch.setattr(
+        lr, "_try_local_llm", lambda text, context=None: shallow + "\n\n（lite mode — local LLM）"
+    )
+    context = [
+        (
+            "user",
+            "（以下是影片連結 https://www.youtube.com/watch?v=abc123 的內容，透過 yt-dlp 擷取）\n"
+            "--- 影片資訊開始 ---\n"
+            "標題：小知足 從貧窮家庭到財富自由的故事\n"
+            "上傳者：小知足\n"
+            "描述：小知足分享她從貧窮到成功的過程。\n"
+            "--- 影片資訊結束 ---",
+        ),
+    ]
+    assert (
+        lr.lite_reply("很有感", context=context) is None
+    )  # 浅層回覆應被 gate 擋下
+
+
 def test_lite_reply_substantive_with_specifics_replies(monkeypatch):
     _force_skip_nlp(monkeypatch)
     monkeypatch.setattr(lr, "_STAGE1_HANDLERS", ())

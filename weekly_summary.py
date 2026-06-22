@@ -15,29 +15,18 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 sys.path.insert(0, str(Path(__file__).parent))
 
-import requests  # noqa: E402
-
 import family_interest  # noqa: E402
 import gemini_client  # noqa: E402
+from line_push_client import line_access_token, try_push_text  # noqa: E402
 import memory  # noqa: E402
 
 GROUP_ID = os.environ.get("LINE_ALLOWED_GROUP_ID") or os.environ.get(
     "ALLOWED_GROUP_ID", ""
 )
-TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
-_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 
 
-def _push(text: str) -> None:
-    requests.post(
-        _PUSH_URL,
-        headers={
-            "Authorization": f"Bearer {TOKEN}",
-            "Content-Type": "application/json",
-        },
-        json={"to": GROUP_ID, "messages": [{"type": "text", "text": text[:5000]}]},
-        timeout=10,
-    )
+def _push(text: str) -> bool:
+    return try_push_text(GROUP_ID, text, timeout=10)
 
 
 def _render_finance_summary(group_id: str, days: int = 14) -> str:
@@ -96,10 +85,10 @@ def _render_finance_summary(group_id: str, days: int = 14) -> str:
     return "\n".join(lines)
 
 
-def main() -> None:
-    if not GROUP_ID or not TOKEN:
+def main() -> int:
+    if not GROUP_ID or not line_access_token():
         print("ERR: LINE_ALLOWED_GROUP_ID or LINE_CHANNEL_ACCESS_TOKEN not set")
-        return
+        return 1
 
     since_ts = int(time.time()) - 7 * 86400
     all_msgs = memory.get_messages_since(GROUP_ID, since_ts, exclude_bot=False)
@@ -109,7 +98,8 @@ def main() -> None:
 
     if not bot_replies:
         print("本週沒有 bot 回應，跳過摘要推播")
-        return
+        return 0
+    push_failed = False
 
     # 每次最多取最近 20 則，避免塞爆 prompt
     sample = bot_replies[-20:]
@@ -127,8 +117,11 @@ def main() -> None:
     try:
         summary = gemini_client.chat(prompt, [], [], None)
         push_text = f"📋 本週咪寶摘要\n\n{summary}"
-        _push(push_text)
-        print(f"週摘要已推播 ({len(bot_replies)} 則回應，取最近 {len(sample)} 則)")
+        if _push(push_text):
+            print(f"週摘要已推播 ({len(bot_replies)} 則回應，取最近 {len(sample)} 則)")
+        else:
+            push_failed = True
+            print("ERR 週摘要推播失敗")
     except Exception as e:
         print(f"ERR Gemini bot 摘要 (跳過，繼續家族熱話): {e}")
 
@@ -137,8 +130,11 @@ def main() -> None:
     try:
         family_text = family_interest.render_summary(GROUP_ID, days=30)
         if family_text:
-            _push(family_text[:4900])
-            print(f"家族熱話週報已推播（{len(family_text)} 字）")
+            if _push(family_text[:4900]):
+                print(f"家族熱話週報已推播（{len(family_text)} 字）")
+            else:
+                push_failed = True
+                print("ERR 家族熱話週報推播失敗")
         else:
             print("家族熱話無偵測到主題（過去 30 天訊息不足）")
     except Exception as e:
@@ -156,13 +152,17 @@ def main() -> None:
     try:
         finance_text = _render_finance_summary(GROUP_ID, days=14)
         if finance_text:
-            _push(finance_text[:4900])
-            print(f"家族財經觀點週報已推播（{len(finance_text)} 字）")
+            if _push(finance_text[:4900]):
+                print(f"家族財經觀點週報已推播（{len(finance_text)} 字）")
+            else:
+                push_failed = True
+                print("ERR 家族財經觀點週報推播失敗")
         else:
             print("家族財經觀點 — 過去 14 天無記錄")
     except Exception as e:
         print(f"ERR 家族財經觀點: {e}")
+    return 1 if push_failed else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

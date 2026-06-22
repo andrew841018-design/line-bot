@@ -210,6 +210,7 @@ def maybe_extract_and_save_async(
     """fire-and-forget — 在 burst flush 時呼叫。"""
     if not is_finance_burst(combined_text):
         return
+    db_path = finance_view_db._DB_PATH
 
     def _run() -> None:
         try:
@@ -233,6 +234,7 @@ def maybe_extract_and_save_async(
                     confidence=v.get("confidence"),
                     condition_text=v.get("condition_text"),
                     expires_at=v.get("expires_at"),
+                    db_path=db_path,
                 )
                 logger.info(
                     "finance_view saved: %s %s %s",

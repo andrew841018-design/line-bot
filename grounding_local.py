@@ -32,6 +32,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
+import warnings
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -123,7 +124,13 @@ def _get_jieba() -> Any | None:
         if _jieba_load_failed:
             return None
         try:
-            import jieba  # type: ignore
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r"pkg_resources is deprecated as an API\..*",
+                    category=UserWarning,
+                )
+                import jieba  # type: ignore
 
             jieba.setLogLevel(logging.WARNING)
             _jieba_module = jieba

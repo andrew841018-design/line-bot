@@ -45,11 +45,7 @@ def test_update_push_success_discord_copy_avoids_pending_word(tmp_path, monkeypa
     monkeypatch.setattr(lup, "GROUP_ID", "G1")
     monkeypatch.setattr(lup, "_get_line_token", lambda: "token")
 
-    class Resp:
-        status_code = 200
-        text = "OK"
-
-    monkeypatch.setattr(lup.requests, "post", lambda *args, **kwargs: Resp())
+    monkeypatch.setattr(lup, "push_text", lambda *args, **kwargs: True)
     sent = []
     monkeypatch.setattr(lup, "_notify_discord", lambda msg: sent.append(msg))
 

@@ -30,10 +30,23 @@ if _DB_PATH.parent and str(_DB_PATH.parent) not in ("", "."):
 _lock = threading.Lock()
 
 
+class _ClosingConnection(sqlite3.Connection):
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            return super().__exit__(exc_type, exc, tb)
+        finally:
+            self.close()
+
+
 def _conn() -> sqlite3.Connection:
     # check_same_thread=False：uvicorn 會從不同 worker thread 呼進來
     # isolation_level=None：autocommit，我們用 context manager 的 lock 控制一致性
-    conn = sqlite3.connect(_DB_PATH, isolation_level=None, check_same_thread=False)
+    conn = sqlite3.connect(
+        _DB_PATH,
+        isolation_level=None,
+        check_same_thread=False,
+        factory=_ClosingConnection,
+    )
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     # I3 fix (2026-05-30): 跨 process 寫同一 db（uvicorn handler thread + 獨立 cron
@@ -119,6 +132,8 @@ def _init_db() -> None:
                 remind_at       INTEGER NOT NULL,
                 created_at      INTEGER NOT NULL,
                 status          TEXT NOT NULL DEFAULT 'pending',
+                source_kind     TEXT NOT NULL DEFAULT '',
+                source_ref      TEXT NOT NULL DEFAULT '',
                 source_text     TEXT,
                 mention_aliases TEXT NOT NULL DEFAULT '[]',
                 last_pushed_at  INTEGER NOT NULL DEFAULT 0
@@ -223,6 +238,11 @@ def _init_db() -> None:
         ):
             if col not in rcols:
                 c.execute(f"ALTER TABLE reminders ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0")
+        for col in ("source_kind", "source_ref"):
+            if col not in rcols:
+                c.execute(
+                    f"ALTER TABLE reminders ADD COLUMN {col} TEXT NOT NULL DEFAULT ''"
+                )
         if "mention_aliases" not in rcols:
             c.execute(
                 "ALTER TABLE reminders ADD COLUMN mention_aliases "
@@ -451,12 +471,29 @@ def log_raw_message(
     # Embedding hook — async fire-and-forget (2026-05-21 修：sentence_transformer
     # 首次 in-process load 要 ~10 秒，會 block webhook handler 害 reply 延遲)
     import threading
+
+    try:
+        import embedding_recall as _embedding_recall
+
+        _index_message = _embedding_recall.index_message
+        _index_db_path = _embedding_recall._DB_PATH
+    except Exception:
+        _index_message = None
+        _index_db_path = None
+
     def _bg_index() -> None:
         try:
-            from embedding_recall import index_message as _idx
-            _idx(message_id, group_id, text, is_bot=(user_id == "__bot__"))
+            if _index_message is not None:
+                _index_message(
+                    message_id,
+                    group_id,
+                    text,
+                    is_bot=(user_id == "__bot__"),
+                    db_path=_index_db_path,
+                )
         except Exception:
             pass
+
     threading.Thread(target=_bg_index, daemon=True).start()
 
 
@@ -789,12 +826,27 @@ def add_reminder(
     remind_at: int,
     source_text: str = "",
     mention_aliases: list[str] | None = None,
+    source_kind: str | None = None,
+    source_ref: str | None = None,
 ) -> int | None:
     """新增 reminder。remind_at = epoch seconds。
 
     去重：同 group_id + 同 action + 24h 內 remind_at 差 < 1h → 跳過（避免同訊息被多次抽）。
     回 reminder_id；跳過時回 None。
     """
+    if source_kind and source_ref:
+        return upsert_reminder_for_source(
+            group_id=group_id,
+            user_id=user_id,
+            action=action,
+            remind_at=remind_at,
+            source_kind=source_kind,
+            source_ref=source_ref,
+            source_text=source_text,
+            mention_aliases=mention_aliases,
+        )
+
+    # Historical path: 無 source_kind/source_ref 時保持既有行為（去重）
     import time
     now = int(time.time())
     action = _normalize_reminder_text(action)
@@ -838,11 +890,205 @@ def add_reminder(
             return existing_id
         c.execute(
             "INSERT INTO reminders(group_id, user_id, action, remind_at, "
-            "created_at, status, source_text, mention_aliases) "
-            "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
-            (group_id, user_id, action, remind_at, now, source_text, mentions_json),
+            "created_at, status, source_kind, source_ref, source_text, mention_aliases) "
+            "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
+            (
+                group_id, user_id, action, remind_at, now,
+                "", "", source_text, mentions_json
+            ),
         )
         return c.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def upsert_reminder_for_source(
+    group_id: str,
+    user_id: str,
+    action: str,
+    remind_at: int,
+    source_kind: str,
+    source_ref: str,
+    source_text: str = "",
+    mention_aliases: list[str] | None = None,
+) -> int | None:
+    """依照 source_kind/source_ref upsert pending reminder。
+
+    同一來源只保留一筆 pending reminder，改期/內容更新會更新原紀錄而非新增新紀錄。
+    回 reminder_id；重複抽取時回 None 像傳統 add_reminder 不同，因為更新已完成。
+    """
+    import time
+    now = int(time.time())
+    action = _normalize_reminder_text(action)
+    source_text = _normalize_reminder_text(source_text)
+    mentions = _normalize_mention_aliases(mention_aliases)
+    mentions_json = json.dumps(mentions, ensure_ascii=False)
+    with _lock, _conn() as c:
+        existing = c.execute(
+            "SELECT reminder_id FROM reminders "
+            "WHERE group_id = ? AND status = 'pending' "
+            "AND source_kind = ? AND source_ref = ?",
+            (group_id, source_kind, source_ref),
+        ).fetchone()
+        if existing:
+            c.execute(
+                "UPDATE reminders SET "
+                "action = ?, remind_at = ?, user_id = ?, source_text = ?, "
+                "mention_aliases = ?, source_kind = ?, source_ref = ?, "
+                "last_pushed_at = 0, weekly_count = 0, last_weekly_at = 0, "
+                "pushed_3d = 0, pushed_1d = 0, "
+                "pushed_4hr = 0, pushed_2hr = 0, pushed_1hr = 0, pushed_now = 0, "
+                "created_at = ? "
+                "WHERE reminder_id = ?",
+                (
+                    action, remind_at, user_id, source_text, mentions_json,
+                    source_kind, source_ref, now, existing[0],
+                ),
+            )
+            return existing[0]
+
+        c.execute(
+            "INSERT INTO reminders(group_id, user_id, action, remind_at, "
+            "created_at, status, source_kind, source_ref, source_text, mention_aliases) "
+            "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
+            (
+                group_id, user_id, action, remind_at,
+                now, source_kind, source_ref, source_text, mentions_json,
+            ),
+        )
+        return c.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def upsert_reminder_for_source_any_status(
+    group_id: str,
+    user_id: str,
+    action: str,
+    remind_at: int,
+    source_kind: str,
+    source_ref: str,
+    source_text: str = "",
+    mention_aliases: list[str] | None = None,
+) -> int | None:
+    """依 source_kind/source_ref upsert reminder。
+
+    差異在於：若已有相同來源但已是 done/expired，會改回 pending 並更新內容。
+    這主要用在「events 與 reminders 強一致」的資料修補流程。
+    """
+    import time
+    now = int(time.time())
+    action = _normalize_reminder_text(action)
+    source_text = _normalize_reminder_text(source_text)
+    mentions = _normalize_mention_aliases(mention_aliases)
+    mentions_json = json.dumps(mentions, ensure_ascii=False)
+
+    with _lock, _conn() as c:
+        row = c.execute(
+            "SELECT reminder_id, status FROM reminders "
+            "WHERE group_id = ? AND source_kind = ? AND source_ref = ? "
+            "ORDER BY CASE WHEN status='pending' THEN 0 ELSE 1 END, reminder_id "
+            "LIMIT 1",
+            (group_id, source_kind, source_ref),
+        ).fetchone()
+
+        if row:
+            reminder_id = row[0]
+            c.execute(
+                "UPDATE reminders SET "
+                "action = ?, remind_at = ?, user_id = ?, source_text = ?, "
+                "mention_aliases = ?, source_kind = ?, source_ref = ?, "
+                "status = 'pending', last_pushed_at = 0, weekly_count = 0, "
+                "last_weekly_at = 0, pushed_3d = 0, pushed_1d = 0, "
+                "pushed_4hr = 0, pushed_2hr = 0, pushed_1hr = 0, pushed_now = 0, "
+                "created_at = ? "
+                "WHERE reminder_id = ?",
+                (
+                    action,
+                    remind_at,
+                    user_id,
+                    source_text,
+                    mentions_json,
+                    source_kind,
+                    source_ref,
+                    now,
+                    reminder_id,
+                ),
+            )
+            return reminder_id
+
+        c.execute(
+            "INSERT INTO reminders(group_id, user_id, action, remind_at, "
+            "created_at, status, source_kind, source_ref, source_text, mention_aliases) "
+            "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
+            (
+                group_id,
+                user_id,
+                action,
+                remind_at,
+                now,
+                source_kind,
+                source_ref,
+                source_text,
+                mentions_json,
+            ),
+        )
+        return c.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def mark_reminder_done_for_source(
+    group_id: str, source_kind: str, source_ref: str
+) -> bool:
+    """依照來源標記 pending reminder 完成。"""
+    with _lock, _conn() as c:
+        cursor = c.execute(
+            "UPDATE reminders SET status='done' "
+            "WHERE group_id = ? AND status='pending' "
+            "AND source_kind = ? AND source_ref = ?",
+            (group_id, source_kind, source_ref),
+        )
+        return cursor.rowcount > 0
+
+
+def delete_pending_reminders_by_source(
+    source_kind: str,
+    keep_source_refs: list[str] | None = None,
+    group_id: str | None = None,
+) -> int:
+    """刪除指定 source_kind 的 pending reminders，保留 keep_source_refs。
+
+    用途：events 與 reminders 同步時，將已不存在的事件對應提醒清掉。
+    """
+    keep = [str(ref) for ref in (keep_source_refs or []) if str(ref)]
+    with _lock, _conn() as c:
+        if keep:
+            placeholders = ",".join(["?"] * len(keep))
+            if group_id is not None:
+                sql = (
+                    "DELETE FROM reminders "
+                    "WHERE status='pending' AND source_kind = ? "
+                    "AND group_id = ? AND source_ref NOT IN (" + placeholders + ")"
+                )
+                params = [source_kind, group_id, *keep]
+            else:
+                sql = (
+                    "DELETE FROM reminders "
+                    "WHERE status='pending' AND source_kind = ? "
+                    "AND source_ref NOT IN (" + placeholders + ")"
+                )
+                params = [source_kind, *keep]
+        else:
+            if group_id is not None:
+                sql = (
+                    "DELETE FROM reminders "
+                    "WHERE status='pending' AND source_kind = ? AND group_id = ?"
+                )
+                params = [source_kind, group_id]
+            else:
+                sql = (
+                    "DELETE FROM reminders "
+                    "WHERE status='pending' AND source_kind = ?"
+                )
+                params = [source_kind]
+
+        cursor = c.execute(sql, params)
+        return cursor.rowcount
 
 
 def _normalize_mention_aliases(aliases: list[str] | None) -> list[str]:
@@ -1084,7 +1330,8 @@ def list_pending_reminders(
             if group_id:
                 rows = c.execute(
                     "SELECT reminder_id, group_id, user_id, action, remind_at, "
-                    "created_at, source_text, mention_aliases FROM reminders "
+                    "created_at, source_kind, source_ref, source_text, mention_aliases "
+                    "FROM reminders "
                     "WHERE status='pending' AND group_id=? AND remind_at BETWEEN ? AND ? "
                     "ORDER BY remind_at",
                     (group_id, lo, hi),
@@ -1092,7 +1339,8 @@ def list_pending_reminders(
             else:
                 rows = c.execute(
                     "SELECT reminder_id, group_id, user_id, action, remind_at, "
-                    "created_at, source_text, mention_aliases FROM reminders "
+                    "created_at, source_kind, source_ref, source_text, mention_aliases "
+                    "FROM reminders "
                     "WHERE status='pending' AND remind_at BETWEEN ? AND ? "
                     "ORDER BY remind_at",
                     (lo, hi),
@@ -1101,7 +1349,8 @@ def list_pending_reminders(
             if group_id:
                 rows = c.execute(
                     "SELECT reminder_id, group_id, user_id, action, remind_at, "
-                    "created_at, source_text, mention_aliases FROM reminders "
+                    "created_at, source_kind, source_ref, source_text, mention_aliases "
+                    "FROM reminders "
                     "WHERE status='pending' AND group_id=? AND remind_at >= ? "
                     "ORDER BY remind_at",
                     (group_id, now - 86400),
@@ -1109,7 +1358,8 @@ def list_pending_reminders(
             else:
                 rows = c.execute(
                     "SELECT reminder_id, group_id, user_id, action, remind_at, "
-                    "created_at, source_text, mention_aliases FROM reminders "
+                    "created_at, source_kind, source_ref, source_text, mention_aliases "
+                    "FROM reminders "
                     "WHERE status='pending' AND remind_at >= ? "
                     "ORDER BY remind_at",
                     (now - 86400,),
@@ -1122,8 +1372,10 @@ def list_pending_reminders(
             "action": r[3],
             "remind_at": r[4],
             "created_at": r[5],
-            "source_text": r[6] or "",
-            "mention_aliases": _load_mention_aliases(r[7]),
+            "source_kind": r[6] or "",
+            "source_ref": r[7] or "",
+            "source_text": r[8] or "",
+            "mention_aliases": _load_mention_aliases(r[9]),
         }
         for r in rows
     ]
@@ -1195,7 +1447,8 @@ def list_pending_reminders_full(group_id: str | None = None) -> list[dict]:
         if group_id:
             rows = c.execute(
                 "SELECT reminder_id, group_id, user_id, action, remind_at, "
-                "created_at, source_text, last_pushed_at, weekly_count, "
+                "created_at, source_kind, source_ref, source_text, "
+                "last_pushed_at, weekly_count, "
                 "last_weekly_at, pushed_3d, pushed_1d, "
                 "pushed_4hr, pushed_2hr, pushed_1hr, pushed_now, "
                 "mention_aliases "
@@ -1206,7 +1459,8 @@ def list_pending_reminders_full(group_id: str | None = None) -> list[dict]:
         else:
             rows = c.execute(
                 "SELECT reminder_id, group_id, user_id, action, remind_at, "
-                "created_at, source_text, last_pushed_at, weekly_count, "
+                "created_at, source_kind, source_ref, source_text, "
+                "last_pushed_at, weekly_count, "
                 "last_weekly_at, pushed_3d, pushed_1d, "
                 "pushed_4hr, pushed_2hr, pushed_1hr, pushed_now, "
                 "mention_aliases "
@@ -1218,12 +1472,13 @@ def list_pending_reminders_full(group_id: str | None = None) -> list[dict]:
         {
             "reminder_id": r[0], "group_id": r[1], "user_id": r[2],
             "action": r[3], "remind_at": r[4], "created_at": r[5],
-            "source_text": r[6] or "",
-            "last_pushed_at": r[7], "weekly_count": r[8],
-            "last_weekly_at": r[9], "pushed_3d": r[10], "pushed_1d": r[11],
-            "pushed_4hr": r[12], "pushed_2hr": r[13],
-            "pushed_1hr": r[14], "pushed_now": r[15],
-            "mention_aliases": _load_mention_aliases(r[16]),
+            "source_kind": r[6] or "", "source_ref": r[7] or "",
+            "source_text": r[8] or "",
+            "last_pushed_at": r[9], "weekly_count": r[10],
+            "last_weekly_at": r[11], "pushed_3d": r[12], "pushed_1d": r[13],
+            "pushed_4hr": r[14], "pushed_2hr": r[15],
+            "pushed_1hr": r[16], "pushed_now": r[17],
+            "mention_aliases": _load_mention_aliases(r[18]),
         }
         for r in rows
     ]

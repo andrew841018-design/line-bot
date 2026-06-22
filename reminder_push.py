@@ -29,7 +29,7 @@ from linebot.v3.messaging import (
 
 import memory
 import line_mentions
-from line_token_refresh import get_line_token
+from line_push_client import line_access_token
 from config import settings
 
 logging.basicConfig(
@@ -40,11 +40,7 @@ logger = logging.getLogger("reminder_push")
 
 
 def _line_access_token() -> str:
-    try:
-        return get_line_token() or settings.line_channel_access_token
-    except Exception as e:
-        logger.warning("LINE token refresh failed, fallback to env token: %s", str(e)[:120])
-        return settings.line_channel_access_token
+    return line_access_token()
 
 
 def _push_to_group(
@@ -169,10 +165,30 @@ def _stage_label(stage: str, remind_at: int, now: int | None = None) -> str:
     return _STAGE_LABELS.get(stage, "")
 
 
+def _participant_names(r: dict) -> list[str]:
+    names = line_mentions.parse_participants(r.get("mention_aliases") or [])
+    if line_mentions.is_all_participants(names):
+        return ["全家"]
+    return names
+
+
+def _participant_plain_labels(r: dict) -> list[str]:
+    names = line_mentions.parse_participants(r.get("mention_aliases") or [])
+    if not names:
+        return []
+    if line_mentions.is_all_participants(names):
+        return ["@all"]
+    return [f"@{name}" for name in names if name]
+
+
 def _format_push_text(r: dict, stage: str, now: int | None = None) -> str:
     dt = datetime.fromtimestamp(r["remind_at"])
     label = _stage_label(stage, r["remind_at"], now=now)
-    return f"⏰ 提醒{label}\n{dt.strftime('%Y-%m-%d %H:%M')} {r['action']}"
+    body = f"⏰ 提醒{label}\n{dt.strftime('%Y-%m-%d %H:%M')} {r['action']}"
+    participants = _participant_names(r)
+    if participants:
+        body += "\n參加人：" + "、".join(participants)
+    return body
 
 
 def _build_push_text_and_message(
@@ -184,11 +200,13 @@ def _build_push_text_and_message(
         r.get("mention_aliases") or [],
         str(r.get("action") or ""),
     )
+    plain_labels = _participant_plain_labels(r) or None
     if not targets:
-        return body, TextMessage(text=body[:4900])
-    message_dict = line_mentions.text_v2_dict(body, targets)
+        text = line_mentions.text_with_plain_mentions(body, [], plain_labels)
+        return text, TextMessage(text=text[:4900])
+    message_dict = line_mentions.text_v2_dict(body, targets, plain_labels)
     return (
-        line_mentions.text_with_plain_mentions(body, targets),
+        line_mentions.text_with_plain_mentions(body, targets, plain_labels),
         line_mentions.sdk_message_from_text_v2_dict(message_dict),
     )
 

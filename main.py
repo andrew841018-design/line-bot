@@ -27,7 +27,7 @@ import re
 import threading
 import time
 import uuid as _uuid
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -101,7 +101,20 @@ for _h in logging.getLogger().handlers:
 
 logger = logging.getLogger("line_bot")
 
-app = FastAPI()
+
+@asynccontextmanager
+async def _app_lifespan(_app: FastAPI):
+    """Run the same startup hooks previously registered via app.on_event."""
+    if os.getenv("JOBS_ROUTES_ENABLED") == "1":
+        _startup_sweep = globals().get("startup_sweep")
+        if callable(_startup_sweep):
+            _startup_sweep()
+    _process_pending_on_startup()
+    _init_on_startup()
+    yield
+
+
+app = FastAPI(lifespan=_app_lifespan)
 
 # Optional jobs router (n8n / external scheduler trigger surface).
 # Feature flag: JOBS_ROUTES_ENABLED=1 enables /jobs/* endpoints.
@@ -115,10 +128,6 @@ if os.getenv("JOBS_ROUTES_ENABLED") == "1":
     from jobs_router import router as jobs_router, startup_sweep
     app.include_router(jobs_router)
 
-    @app.on_event("startup")
-    async def _jobs_startup_sweep():
-        startup_sweep()
-
 _parser = WebhookParser(settings.line_channel_secret)
 
 
@@ -127,13 +136,9 @@ def _get_line_config() -> Configuration:
     - 有 LINE_CHANNEL_ID → v3 stateless short-lived，每 15 分自動 refresh
     - 沒設 → fallback 到 .env 的 long-lived token（向後相容）
     """
-    try:
-        from line_token_refresh import get_line_token
+    from line_push_client import line_configuration
 
-        tok = get_line_token() or settings.line_channel_access_token
-    except Exception:
-        tok = settings.line_channel_access_token
-    return Configuration(access_token=tok)
+    return line_configuration()
 
 
 _line_config = _get_line_config()  # 啟動時的 fallback；callsite 仍會用 _get_line_config() 取最新
@@ -1338,15 +1343,17 @@ def _handle_video_message(event, group_id):
 def _try_piggyback_reminders_fast_path(
     reply_token: str | None, group_id: str
 ) -> bool:
-    """有 due reminder → 用 reply_token 直接推 + mark + return True (caller skip 後續)。
+    """Legacy reply-token reminder fallback.
 
-    觸發路徑：user 講話但訊息不會被 burst_filter 主動回 (heuristic skip)。
-    這時 reply_token 反正會被丟掉，剛好拿來推 due reminder（LINE reply API 免費，
-    不耗月 push quota）。
-
-    Peek-then-confirm: reply 成功才 mark；失敗下次再試。
+    Product behavior is scheduled-only now: ordinary user messages must not
+    trigger reminder delivery or mark reminder stages.
     """
-    if not reply_token or not group_id or settings.bot_muted:
+    if (
+        not _reminder_reply_piggyback_enabled()
+        or not reply_token
+        or not group_id
+        or settings.bot_muted
+    ):
         return False
     try:
         import calendar_db
@@ -1644,7 +1651,10 @@ def _with_medical_actor_participant(participants: list | None, actor: str | None
 
 
 def _auto_capture_text_if_important(
-    group_id: str, text: str, sender_user_id: str = ""
+    group_id: str,
+    text: str,
+    sender_user_id: str = "",
+    message_id: str = "",
 ) -> None:
     """每條 text message 來時 cheap pre-filter → 通過才 async 跑 Gemini extractor。
 
@@ -1656,11 +1666,13 @@ def _auto_capture_text_if_important(
     if not (_AUTO_CAPTURE_DATE_HINT_RE.search(text) and _AUTO_CAPTURE_VERB_RE.search(text)):
         return
     import threading
+
     def _bg() -> None:
         try:
-            _maybe_capture_calendar_event(group_id, text, sender_user_id)
+            _maybe_capture_calendar_event(group_id, text, sender_user_id, message_id)
         except Exception as e:
             logger.warning("auto capture (every-msg) failed: %s", e)
+
     threading.Thread(target=_bg, daemon=True).start()
 
 
@@ -2111,6 +2123,9 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
         except Exception as e:
             logger.warning("[Feedback] collect_message failed: %s", e)
 
+    if _try_one_shot_reply(event, group_id):
+        return
+
     # 使用者更正既有行程/提醒時，必須即時回覆並同步改 events + reminders。
     # 放在 auto-capture / reminder extraction 前，避免更正句被誤當成新提醒。
     if _try_handle_calendar_correction(event, group_id, text):
@@ -2134,7 +2149,9 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
     # Cheap pre-filter (regex) → 通過才 spin off thread 跑 Gemini extractor
     # 重跑由 UNIQUE INDEX (group_id, title, event_date) 自動 dedup
     sender_uid_for_capture = getattr(event.source, "user_id", None) or ""
-    _auto_capture_text_if_important(group_id, text, sender_uid_for_capture)
+    _auto_capture_text_if_important(
+        group_id, text, sender_uid_for_capture, event.message.id
+    )
 
     # 自動抽飲食 / 採購訊號（純規則 fire-and-forget，存 food_db；2026-05-31）
     # 逐則抽、不需 user_id（v1 家庭層級，GP2 A）、不需 pre-filter（無 Gemini quota 顧慮）
@@ -2151,7 +2168,7 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
     except (ImportError, Exception) as e:
         logger.debug("message_classifier skipped: %s", e)
 
-    # 自動偵測 reminder（2026-05-08：含日期+時間 hint 的訊息抽 action 存 DB）
+    # 自動偵測 reminder（2026-05-08：含日期 + 時間/行動 hint 才抽，缺時間先當 00:00）
     # 失敗 silent，不阻塞主流程
     sender_uid_for_reminder = getattr(event.source, "user_id", None) or ""
     _maybe_extract_reminder(
@@ -2172,8 +2189,13 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
         _reply(event.reply_token, cmd_reply, group_id=group_id)
         return
 
-    # 2. 群組民調 — deterministic path。自然句開民調；active poll 期間讀取短回覆。
-    poll_reply = _handle_poll_text(event, group_id, text)
+    # 2. Explicit poll request — only when the user calls the bot.
+    clean_text = _extract_gemini_trigger(text, event.message)
+    poll_reply = (
+        _handle_explicit_poll_text(event, group_id, clean_text)
+        if clean_text is not None
+        else None
+    )
     if poll_reply is not None:
         burst_filter.cancel_burst(group_id)
         _reply(event.reply_token, poll_reply, group_id=group_id)
@@ -2192,7 +2214,6 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
         return
 
     # 5. Explicit 觸發（@mention / /ai / /問 ...）→ 立刻處理，並取消 pending burst
-    clean_text = _extract_gemini_trigger(text, event.message)
     if clean_text is not None:
         burst_filter.cancel_burst(group_id)
         _handle_explicit_text(event, group_id, clean_text)
@@ -2486,6 +2507,9 @@ _TODO_CREATE_RE = re.compile(
 _TODO_QUERY_INTENT_RE = re.compile(
     r"(?:哪些|目前|還有|清單|列表|查|看看|告訴我|會提醒的時間)"
 )
+_TODO_DETAIL_QUERY_RE = re.compile(r"(?:細節|詳細|完整|網址|連結|驗證碼|票券|預約編號)")
+_REMINDER_KNOWN_MENTION_ALIASES = {"爸爸", "媽媽", "黃聖雅", "黃聖穎"}
+_REMINDER_DETAIL_PREFIXES = ("地點", "預約編號", "接送網址", "票券驗證碼", "驗證碼")
 
 
 def _is_todo_query(text: str) -> bool:
@@ -2513,6 +2537,20 @@ def _fmt_remind_at(ts: int | float | None) -> str:
         return "未設定時間"
 
 
+def _fmt_reminder_report_time(ts: int | float | None) -> str:
+    if not ts:
+        return "時間待補"
+    try:
+        dt = datetime.fromtimestamp(int(ts), tz=ZoneInfo("Asia/Taipei"))
+    except Exception:
+        return "時間待補"
+    weekday = "一二三四五六日"[dt.weekday()]
+    date_part = f"{dt.month}/{dt.day}（{weekday}）"
+    if dt.hour == 0 and dt.minute == 0:
+        return f"{date_part}時間待補"
+    return f"{date_part}{dt.strftime('%H:%M')}"
+
+
 def _event_line(ev: dict) -> str:
     title = ev.get("title") or ""
     date_s = ev.get("event_date") or ""
@@ -2529,9 +2567,153 @@ def _event_line(ev: dict) -> str:
     return f"- {when} {title}{tail}{people}".strip()
 
 
+def _wants_todo_details(text: str) -> bool:
+    return bool(_TODO_DETAIL_QUERY_RE.search(text or ""))
+
+
+def _text_message_with_mentions(text: str) -> tuple[str, object]:
+    reply_text = _md_to_line(text)[:4900]
+    try:
+        import line_mentions
+
+        aliases = line_mentions.aliases_mentioned_in_text(reply_text)
+        targets = []
+        seen_user_ids: set[str] = set()
+        if "@all" in reply_text or "全家" in reply_text:
+            targets.append(
+                line_mentions.MentionTarget(key="all", kind="all", label="@all")
+            )
+        seen: set[str] = set()
+        deduped_aliases: list[str] = []
+        for alias in aliases:
+            clean_alias = str(alias or "").strip().lstrip("@")
+            if not clean_alias or clean_alias == "全家" or clean_alias in seen:
+                continue
+            deduped_aliases.append(clean_alias)
+            seen.add(clean_alias)
+        for alias in deduped_aliases:
+            user_id = line_mentions.user_id_for_alias(alias)
+            if not user_id or user_id in seen_user_ids:
+                continue
+            targets.append(
+                line_mentions.MentionTarget(
+                    key=f"p{len(targets) + 1}",
+                    kind="user",
+                    user_id=user_id,
+                    label=f"@{alias}",
+                )
+            )
+            seen_user_ids.add(user_id)
+        if targets:
+            message_dict = line_mentions.text_v2_dict(reply_text, targets)
+            return reply_text, line_mentions.sdk_message_from_text_v2_dict(message_dict)
+    except Exception as e:
+        logger.warning("build mention reply failed; fallback text message: %s", str(e)[:200])
+    return reply_text, TextMessage(text=reply_text)
+
+
+def _split_action_detail(action: str) -> tuple[str, list[str]]:
+    action = str(action or "").strip()
+    m = re.match(r"^(.*?)[（(]([^()（）]+)[）)]$", action)
+    if not m:
+        return action, []
+    title = m.group(1).strip()
+    detail = m.group(2).strip()
+    return title or action, [detail] if detail else []
+
+
+def _reminder_source_detail_lines(item: dict, action_title: str) -> list[str]:
+    source_text = str(item.get("source_text") or "").strip()
+    if not source_text:
+        return []
+    parts = [p.strip().strip("。") for p in re.split(r"[；;\n]+", source_text) if p.strip()]
+    detail_parts: list[str] = []
+    keyed_lines: list[str] = []
+    for idx, part in enumerate(parts):
+        clean = part.strip().strip("()（）")
+        if not clean:
+            continue
+        if clean == "時間待補":
+            continue
+        if idx == 0 and (clean == action_title or clean in action_title or action_title in clean):
+            continue
+        if re.match(r"^(時間|參加人)[:：]", clean):
+            continue
+        if clean.startswith(_REMINDER_DETAIL_PREFIXES):
+            keyed_lines.append(_normalize_reminder_detail_line(clean))
+            continue
+        detail_parts.append(clean)
+    lines: list[str] = []
+    if detail_parts:
+        lines.append("細節：" + "；".join(detail_parts))
+    lines.extend(keyed_lines)
+    return lines
+
+
+def _normalize_reminder_detail_line(clean: str) -> str:
+    for prefix in _REMINDER_DETAIL_PREFIXES:
+        if not clean.startswith(prefix):
+            continue
+        value = clean[len(prefix):].strip()
+        if value.startswith(("：", ":")):
+            value = value[1:].strip()
+        return f"{prefix}：{value}" if value else prefix
+    return clean
+
+
+def _format_reminder_participants(mentions: list[str] | tuple[str, ...] | None) -> str:
+    labels: list[str] = []
+    for raw in mentions or []:
+        name = str(raw or "").strip().lstrip("@")
+        if not name:
+            continue
+        if name == "全家":
+            label = "@all"
+        elif name in _REMINDER_KNOWN_MENTION_ALIASES:
+            label = f"@{name}"
+        else:
+            label = name
+        if label not in labels:
+            labels.append(label)
+    return "、".join(labels)
+
+
+def _format_reminder_report_item(item: dict, index: int) -> list[str]:
+    action_title, action_details = _split_action_detail(str(item.get("action") or ""))
+    lines = [
+        f"{index}. {_fmt_reminder_report_time(item.get('remind_at'))}",
+        f"事項：{action_title}",
+    ]
+    source_detail_lines = _reminder_source_detail_lines(item, action_title)
+    action_details = [
+        detail for detail in action_details
+        if not any(detail in source_line for source_line in source_detail_lines)
+    ]
+    detail_lines = ["細節：" + "；".join(action_details)] if action_details else []
+    detail_lines.extend(source_detail_lines)
+    for detail in detail_lines:
+        if detail.startswith("細節：") and any(
+            existing.startswith("細節：") and detail.removeprefix("細節：") in existing
+            for existing in lines
+        ):
+            continue
+        if detail not in lines:
+            lines.append(detail)
+    participants = _format_reminder_participants(item.get("mention_aliases") or [])
+    if participants:
+        lines.append(f"參加人：{participants}")
+    return lines
+
+
 def _build_todo_status_reply(group_id: str, clean_text: str = "") -> str:
-    """Read todos + exact-time reminders + calendar events for immediate replies."""
-    import calendar_db
+    """Read todos + reminders for immediate replies."""
+    try:
+        import calendar_db
+
+        calendar_db.sync_active_events_to_reminders(group_id)
+    except Exception as e:
+        logger.warning("failed to sync active events for todo view: %s", e)
+
     import todo
 
     target = _resolve_relative_date(clean_text)
@@ -2555,24 +2737,16 @@ def _build_todo_status_reply(group_id: str, clean_text: str = "") -> str:
             r for r in reminders
             if _fmt_remind_at(r.get("remind_at")).startswith(target_iso)
         ]
+    else:
+        now_ts = int(datetime.now(tz=ZoneInfo("Asia/Taipei")).timestamp())
+        reminders = [
+            r for r in reminders
+            if int(r.get("remind_at") or 0) >= now_ts
+        ]
 
-    try:
-        if target_iso:
-            events_all = (
-                calendar_db.list_past(group_id, days=90)
-                + calendar_db.list_upcoming(group_id, days=90)
-            )
-            events = [e for e in events_all if e.get("event_date") == target_iso]
-        else:
-            events = calendar_db.list_upcoming(group_id, days=30)
-    except Exception as e:
-        logger.warning("todo query calendar list failed: %s", e)
-        events = []
-
-    header = (
-        f"{target_iso} 的待辦/提醒："
-        if target_iso else "目前待辦/提醒："
-    )
+    header = f"{target_iso} 的待辦/提醒：" if target_iso else "目前待辦/提醒："
+    if reminders and not todos:
+        header = f"{target_iso} 的提醒事項＆細節：" if target_iso else "未來提醒事項＆細節"
     lines: list[str] = [header]
     has_any = False
 
@@ -2588,26 +2762,15 @@ def _build_todo_status_reply(group_id: str, clean_text: str = "") -> str:
 
     if reminders:
         has_any = True
-        lines.append("\n精準提醒：")
-        for item in reminders[:10]:
-            mentions = item.get("mention_aliases") or []
-            mention_part = f"（{'、'.join(mentions)}）" if mentions else ""
-            lines.append(
-                f"- {_fmt_remind_at(item.get('remind_at'))} {item.get('action', '')}{mention_part}"
-            )
-
-    if events:
-        has_any = True
-        label = "行事曆：" if target_iso else "未來 30 天行事曆："
-        lines.append(f"\n{label}")
-        for ev in events[:10]:
-            lines.append(_event_line(ev))
+        lines.append("\n提醒事項：")
+        for idx, item in enumerate(reminders[:10], start=1):
+            lines.append("\n".join(_format_reminder_report_item(item, idx)))
 
     if not has_any:
         return (
-            f"{target_iso} 沒有查到 pending 待辦、精準提醒或行事曆。"
+            f"{target_iso} 沒有查到 pending 待辦或提醒事項。"
             if target_iso
-            else "目前沒有查到 pending 待辦、精準提醒或未來 30 天行事曆。"
+            else "目前沒有查到 pending 待辦或提醒事項。"
         )
     return "\n".join(lines)
 
@@ -2617,14 +2780,14 @@ def _handle_todo_query(
 ) -> None:
     """deterministic todo/reminder query path — read DB, skip LLM."""
     reply = _build_todo_status_reply(group_id, clean_text)
-    reply_text = _md_to_line(reply)
+    reply_text, message = _text_message_with_mentions(reply)
     try:
         if not settings.bot_muted:
             with ApiClient(_get_line_config()) as api_client:
                 MessagingApi(api_client).reply_message(
                     ReplyMessageRequest(
                         reply_token=event.reply_token,
-                        messages=[TextMessage(text=reply_text)],
+                        messages=[message],
                     )
                 )
         logger.info("todo query reply sent group=%s", group_id)
@@ -2805,6 +2968,13 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
         _reply(event.reply_token, "嗯？\n怎麼了嗎\n要找我什麼啦", group_id=group_id)
         return
 
+    # 群組民調 — 僅限 explicit bot trigger，不再由普通聊天自動開 poll / 記 vote。
+    if clean_text:
+        poll_reply = _handle_explicit_poll_text(event, group_id, clean_text)
+        if poll_reply is not None:
+            _reply(event.reply_token, poll_reply, group_id=group_id)
+            return
+
     # 待辦 / 提醒查詢 — deterministic path，不依賴 Gemini quota
     if clean_text and _is_todo_query(clean_text):
         logger.info(
@@ -2887,7 +3057,12 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
                 logger.warning("lite_reply retry failed: %s", e2)
                 reply_text = ""
             if not reply_text:
-                _maybe_capture_calendar_event(group_id, clean_text, sender_user_id)
+                _maybe_capture_calendar_event(
+                    group_id,
+                    clean_text,
+                    sender_user_id,
+                    getattr(event.message, "id", "") if getattr(event, "message", None) else "",
+                )
                 if _pending_reply_enabled():
                     _save_pending_burst_text(group_id, clean_text or user_input)
                 else:
@@ -2910,7 +3085,12 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
     # 不會進入。pending reply 已停用；quota empty 時不補答，也不送即時 fallback。
     if not reply_text or not reply_text.strip():
         if _quota_exhausted():
-            _maybe_capture_calendar_event(group_id, clean_text, sender_user_id)
+            _maybe_capture_calendar_event(
+                group_id,
+                clean_text,
+                sender_user_id,
+                getattr(event.message, "id", "") if getattr(event, "message", None) else "",
+            )
             if _pending_reply_enabled():
                 _save_pending_burst_text(group_id, clean_text or user_input)
             else:
@@ -2941,7 +3121,12 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
     )
     # 14:51 case: 家人在 explicit 路徑手打「YYYY-MM-DD HH:MM 拿蛋糕」，
     # 之前 _maybe_capture_calendar_event 只在 burst 路徑跑，explicit 完全沒抽。
-    _maybe_capture_calendar_event(group_id, clean_text, sender_user_id)
+    _maybe_capture_calendar_event(
+        group_id,
+        clean_text,
+        sender_user_id,
+        getattr(event.message, "id", "") if getattr(event, "message", None) else "",
+    )
 
 
 def _handle_burst_flush(group_id: str, combined_text: str, reply_token: str) -> None:
@@ -3012,7 +3197,7 @@ def _handle_burst_flush(group_id: str, combined_text: str, reply_token: str) -> 
                 reply_text = ""
             if not reply_text:
                 logger.warning("burst quota retry miss group=%s", group_id)
-                _maybe_capture_calendar_event(group_id, combined_text)
+                _maybe_capture_calendar_event(group_id, combined_text, message_id="")
                 if _pending_reply_enabled():
                     _save_pending_burst_text(group_id, combined_text)
                 else:
@@ -3021,15 +3206,14 @@ def _handle_burst_flush(group_id: str, combined_text: str, reply_token: str) -> 
                         group_id,
                     )
                 return
-        else:
-            logger.exception("gemini chat (burst) failed: %s", e)
-            _reply(
-                reply_token,
-                "Gemini 那邊好像塞車了，等一下再回你～",
-                group_id=group_id,
-                allow_push_fallback=not quote_reply_only,
-            )
-            return
+        logger.exception("gemini chat (burst) failed: %s", e)
+        _reply(
+            reply_token,
+            "Gemini 那邊好像塞車了，等一下再回你～",
+            group_id=group_id,
+            allow_push_fallback=not quote_reply_only,
+        )
+        return
 
     logger.info(
         "burst gemini reply len=%d text=%s",
@@ -3044,7 +3228,7 @@ def _handle_burst_flush(group_id: str, combined_text: str, reply_token: str) -> 
                 "burst empty while quota exhausted group=%s",
                 group_id,
             )
-            _maybe_capture_calendar_event(group_id, combined_text)
+            _maybe_capture_calendar_event(group_id, combined_text, message_id="")
             if _pending_reply_enabled():
                 _save_pending_burst_text(group_id, combined_text)
             else:
@@ -3072,7 +3256,7 @@ def _handle_burst_flush(group_id: str, combined_text: str, reply_token: str) -> 
     memory.append_turn(group_id, "user", f"[burst]\n{combined_text}")
     memory.append_turn(group_id, "bot", reply_text)
     _maybe_extract_facts(group_id)
-    _maybe_capture_calendar_event(group_id, combined_text)
+    _maybe_capture_calendar_event(group_id, combined_text, message_id="")
     _reply(
         reply_token,
         reply_text,
@@ -3082,7 +3266,10 @@ def _handle_burst_flush(group_id: str, combined_text: str, reply_token: str) -> 
 
 
 def _maybe_capture_calendar_event(
-    group_id: str, combined_text: str, sender_user_id: str = ""
+    group_id: str,
+    combined_text: str,
+    sender_user_id: str = "",
+    message_id: str = "",
 ) -> None:
     """從 burst 抽出家族活動 → 寫 events / 取消 events。失敗不擋主流程。"""
     try:
@@ -3136,6 +3323,7 @@ def _maybe_capture_calendar_event(
                 location=data.get("location"),
                 participants=data.get("participants") or [],
                 event_type=data.get("event_type", "family_gathering"),
+                source_msg_id=message_id,
             )
             if event_id:
                 logger.info(
@@ -3837,12 +4025,85 @@ _PENDING_EXPLICIT_PATH = os.path.join(
 )
 _PENDING_MEDIA_DIR = os.path.join(os.path.dirname(__file__), "pending_media")
 _PENDING_DLQ_PATH = os.path.join(os.path.dirname(__file__), "pending_dlq.jsonl")
+_ONE_SHOT_REPLY_PATH = os.path.join(os.path.dirname(__file__), "one_shot_replies.json")
 _PENDING_MAX_AGE_SEC = 7 * 86400  # 7 天沒被 drain → 進 DLQ，避免 PDF/stuck entry 永久卡住
 _PENDING_REPLY_ENABLED = _DEFAULT_PENDING_REPLY_ENABLED
+_REMINDER_REPLY_PIGGYBACK_ENABLED = False
+
+
+def _load_one_shot_replies() -> dict[str, str]:
+    try:
+        with open(_ONE_SHOT_REPLY_PATH, encoding="utf-8") as f:
+            data = _json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        logger.warning("load one-shot replies failed: %s", str(e)[:200])
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        str(group_id): str(text)
+        for group_id, text in data.items()
+        if str(group_id).strip() and str(text).strip()
+    }
+
+
+def _save_one_shot_replies(data: dict[str, str]) -> None:
+    tmp_path = f"{_ONE_SHOT_REPLY_PATH}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        _json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp_path, _ONE_SHOT_REPLY_PATH)
+
+
+def queue_one_shot_reply(group_id: str, text: str) -> None:
+    group_id = (group_id or "").strip()
+    text = (text or "").strip()
+    if not group_id or not text:
+        raise ValueError("group_id and text are required")
+    data = _load_one_shot_replies()
+    data[group_id] = text
+    _save_one_shot_replies(data)
+
+
+def _try_one_shot_reply(event: MessageEvent, group_id: str) -> bool:
+    data = _load_one_shot_replies()
+    text = data.get(group_id)
+    if not text:
+        return False
+    reply_text, message = _text_message_with_mentions(text)
+    if settings.bot_muted:
+        logger.info("[MUTED] would one-shot reply group=%s len=%d", group_id, len(reply_text))
+        return False
+    try:
+        with ApiClient(_get_line_config()) as api_client:
+            MessagingApi(api_client).reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[message],
+                )
+            )
+    except Exception as e:
+        logger.warning("one-shot reply failed; preserved group=%s: %s", group_id, str(e)[:300])
+        return False
+    data.pop(group_id, None)
+    _save_one_shot_replies(data)
+    try:
+        memory.append_turn(group_id, "bot", reply_text)
+    except Exception:
+        pass
+    logger.info("one-shot reply sent and cleared group=%s", group_id)
+    return True
 
 
 def _pending_reply_enabled() -> bool:
     return _PENDING_REPLY_ENABLED
+
+
+def _reminder_reply_piggyback_enabled() -> bool:
+    """Reminder delivery is owned by scheduled jobs, not unrelated replies."""
+    return _REMINDER_REPLY_PIGGYBACK_ENABLED
 
 
 def _load_pending_explicit() -> dict:
@@ -4480,7 +4741,6 @@ def _drain_pending_for_group(group_id: str, source: str = "startup") -> bool:
         slot.release()
 
 
-@app.on_event("startup")
 def _process_pending_on_startup() -> None:
     """uvicorn 啟動時處理所有 pending：thin wrapper，所有實作在 helper 裡。"""
     if not _pending_reply_enabled():
@@ -4625,7 +4885,6 @@ def _start_pending_retry_worker() -> None:
     t.start()
 
 
-@app.on_event("startup")
 def _init_on_startup() -> None:
     _load_quota_state()
     _start_pending_retry_worker()
@@ -4935,14 +5194,31 @@ _REMINDER_DATE_HINT = re.compile(
     r"(?:星期|週|周|禮拜)[一二三四五六日天]|"
     r"下\s*(週|周|星期|月)|這\s*(週|周|星期))"
 )
-_REMINDER_TIME_HINT = re.compile(
-    r"(\d+\s*[:：]\s*\d+|\d+\s*點|"
-    r"早上|上午|中午|下午|傍晚|晚上|凌晨|半夜|"
-    r"AM|PM|am|pm)"
+_REMINDER_TIME_OR_ACTION_HINT = re.compile(
+    r"(\d{1,2}\s*[:：點時]|\d{1,2}\s*:\s*\d{2}|"
+    r"早上|上午|中午|下午|晚上|今晚|明晚|"
+    r"提醒|記得|別忘|要|開會|會議|預約|回診|看診|看醫生|"
+    r"訂|買|拿|取|接送|出發|到站|繳|付款|聚餐|報到)"
 )
 
-
 _REMINDER_DRAIN_CAP = 5  # GP2 D1b: 每次 drain 最多抽幾筆，攤平 backlog 不燒爆當天額度
+
+
+def _has_calendar_event_like_content(text: str, today_tw: object | None = None) -> bool:
+    """判斷文字是否像家族事件，避免同訊息同時進 events + reminders。"""
+    if not text:
+        return False
+    try:
+        import calendar_regex
+
+        if today_tw is None:
+            from datetime import date as _date
+
+            today_tw = _date.today()
+        return bool(calendar_regex.extract_many_regex_only(text, today_tw, require_time=False))
+    except Exception as e:
+        logger.debug("calendar event-like parse failed in reminder gate: %s", e)
+        return False
 
 
 def _calendar_regex_to_reminder_result(
@@ -4951,15 +5227,21 @@ def _calendar_regex_to_reminder_result(
     """Use deterministic calendar regex as a reminder extractor fallback."""
     try:
         import calendar_regex
-        data = calendar_regex.extract_regex_only(text, today_tw)
+        events = calendar_regex.extract_many_regex_only(text, today_tw, require_time=False)
     except Exception as e:
         logger.debug("calendar regex reminder fallback skipped: %s", e)
         return None
-    if not (data.get("has_event") and data.get("date") and data.get("time")):
+
+    data = events[0] if events else None
+    if not (data is not None and data.get("has_event") and data.get("date")):
         return None
+
     try:
         year_s, month_s, day_s = str(data["date"]).split("-", 2)
-        hour_s, minute_s = str(data["time"]).split(":", 1)
+        if data.get("time"):
+            hour_s, minute_s = str(data["time"]).split(":", 1)
+        else:
+            hour_s, minute_s = "0", "0"
         actor = _infer_medical_actor(text, user_id)
         companions = _infer_medical_companions(text)
         action = _apply_medical_actor(
@@ -4981,14 +5263,16 @@ def _calendar_regex_to_reminder_result(
 def _enqueue_reminder_if_candidate(
     text: str, group_id: str, user_id: str, message_id: str | None
 ) -> None:
-    """quota 爆時的 reminder 補救入隊：只對含日期+時間 hint 的訊息入隊，等額度恢復
+    """quota 爆時的 reminder 補救入隊：只對含日期 + 時間/行動 hint 的訊息入隊，等額度恢復
     由 _drain_pending_reminders 重抽（forward-only，絕不重掃 raw_messages）。失敗
     silent、自包 try/except，絕不可炸掉 caller（GP2 S4-sec：site 1 緊鄰
     _save_pending_any，炸了會連 reply pending 一起丟）。"""
     try:
         if not text or len(text) > 500:
             return
-        if not (_REMINDER_DATE_HINT.search(text) and _REMINDER_TIME_HINT.search(text)):
+        if not _REMINDER_DATE_HINT.search(text):
+            return
+        if not _REMINDER_TIME_OR_ACTION_HINT.search(text):
             return
         memory.enqueue_pending_reminder(group_id, user_id, text, message_id)
     except Exception as e:
@@ -5090,10 +5374,11 @@ def _maybe_extract_reminder(
     """
     if not text or len(text) > 500:
         return
-    # 必須同時有日期 hint + 時間 hint，才送 Gemini（避免每訊息都打）
-    if not (_REMINDER_DATE_HINT.search(text) and _REMINDER_TIME_HINT.search(text)):
+    # 必須有日期 + 時間/行動 hint 才送 Gemini（避免「今天天氣」也燒 quota）
+    if not _REMINDER_DATE_HINT.search(text):
         return
-
+    if not _REMINDER_TIME_OR_ACTION_HINT.search(text):
+        return
     try:
         result = gemini_client.extract_reminder(text)
         if result is None:
@@ -5391,14 +5676,47 @@ def _handle_poll_command(
     user_id: str | None = None,
     message_id: str = "",
 ) -> str | None:
-    """Group poll commands. Kept separate so ordinary chat can still vote."""
+    """Group poll commands. Slash commands remain available without a bot mention."""
+    t = (text or "").strip()
+    poll_command_prefixes = (
+        "/民調",
+        "/投票",
+        "/催民調",
+        "/提醒民調",
+        "/關閉民調",
+        "/結束民調",
+        "/取消民調",
+        "幫我做民調",
+        "幫我們做民調",
+        "幫大家做民調",
+        "幫我開民調",
+        "幫我們開民調",
+        "做民調",
+        "開民調",
+        "建立民調",
+        "發起民調",
+        "弄民調",
+        "關掉民調",
+        "關閉民調",
+        "結束民調",
+        "取消民調",
+        "停掉民調",
+        "停止民調",
+        "民調關掉",
+        "民調關閉",
+        "民調結束",
+        "民調取消",
+    )
+    if not t.startswith(poll_command_prefixes):
+        return None
     try:
         import family_poll
 
-        return family_poll.handle_command(
+        return family_poll.handle_explicit_message(
             group_id,
-            text,
+            t,
             user_id=user_id,
+            sender_alias=_get_member_display_name(group_id, user_id) if user_id else "",
             source_msg_id=message_id,
         )
     except Exception as e:
@@ -5406,8 +5724,29 @@ def _handle_poll_command(
         return None
 
 
+def _handle_explicit_poll_text(
+    event: MessageEvent, group_id: str, text: str
+) -> str | None:
+    """Poll creation/votes only after an explicit bot trigger."""
+    try:
+        import family_poll
+
+        user_id = getattr(event.source, "user_id", None) or ""
+        msg_id = getattr(event.message, "id", "") or ""
+        return family_poll.handle_explicit_message(
+            group_id,
+            text,
+            user_id=user_id,
+            sender_alias=_get_member_display_name(group_id, user_id) if user_id else "",
+            source_msg_id=msg_id,
+        )
+    except Exception as e:
+        logger.warning("explicit poll handler failed: %s", e)
+        return None
+
+
 def _handle_poll_text(event: MessageEvent, group_id: str, text: str) -> str | None:
-    """Natural poll creation and active-poll vote capture."""
+    """Legacy natural poll handler; ordinary chat no longer calls this path."""
     try:
         import family_poll
 
@@ -5417,6 +5756,7 @@ def _handle_poll_text(event: MessageEvent, group_id: str, text: str) -> str | No
             group_id,
             text,
             user_id=user_id,
+            sender_alias=_get_member_display_name(group_id, user_id) if user_id else "",
             source_msg_id=msg_id,
         )
     except Exception as e:
@@ -5465,6 +5805,8 @@ def _handle_command(
             return "目前沒有任何記憶。要讓我記住什麼，用：\n/記住 <內容>"
         return "目前的記憶：\n" + "\n".join(f"• {f}" for f in facts)
 
+    if t == "/記住":
+        return "用法：/記住 <要記住的內容>"
     if t.startswith("/記住 "):
         fact = t[len("/記住 ") :].strip()
         if not fact:
@@ -5473,6 +5815,8 @@ def _handle_command(
             return f"好，記住了：{fact}"
         return f"這條已經在記憶裡了：{fact}"
 
+    if t == "/忘記":
+        return "用法：/忘記 <關鍵字>"
     if t.startswith("/忘記 "):
         keyword = t[len("/忘記 ") :].strip()
         if not keyword:
@@ -5489,6 +5833,8 @@ def _handle_command(
         return f"已清除 {n} 條記憶。"
 
     # ── Layer 1：使用者手動管理過濾規則 ──────────────────────────────
+    if t == "/不要回":
+        return "用法：/不要回 <這類訊息的特徵，例如「早安」「中午吃什麼」>"
     if t.startswith("/不要回 "):
         pattern = t[len("/不要回 ") :].strip()
         if not pattern:
@@ -5496,6 +5842,8 @@ def _handle_command(
         rid = memory.add_filter_rule(group_id, "skip", pattern, source="user")
         return f"好，以後訊息裡有「{pattern}」就不主動回。(規則 #{rid})"
 
+    if t == "/以後要查":
+        return "用法：/以後要查 <這類訊息的特徵，例如「某醫師說」「疫苗」>"
     if t.startswith("/以後要查 "):
         pattern = t[len("/以後要查 ") :].strip()
         if not pattern:
@@ -5649,7 +5997,7 @@ _HELP_TEXT = (
     "  /採用                   列出待採用的建議\n"
     "  /採用 1 2 / 全部 / 無   把建議升級成正式規則\n"
     "【家族行事曆】\n"
-    "  /待辦                   列出 pending 待辦、提醒與近期行事曆\n"
+    "  /待辦                   列出待辦與提醒事項\n"
     "  /行事曆                 列出未來 30 天的家族活動\n"
     "  /取消活動 <關鍵字>      取消含關鍵字的活動\n"
     "【其他】\n"
@@ -6284,9 +6632,9 @@ def _reply(
         )
         return
 
-    # LINE reply_message 上限 5 則。pending reply piggyback 已取消，只保留
-    # reminder piggyback；legacy pending branch 僅在 _PENDING_REPLY_ENABLED=True
-    # 的測試/rollback 場景會啟用。
+    # LINE reply_message 上限 5 則。pending reply piggyback 已取消；reminders
+    # 也只由 scheduled jobs 發送，避免任何普通發言觸發整份提醒清單。
+    # legacy pending branch 僅在 _PENDING_REPLY_ENABLED=True 的測試/rollback 場景會啟用。
     messages_to_send: list = [TextMessage(text=text)]
     pending_commit_ids: list[str] = []
     pending_reminders: list[tuple[str, int]] = []  # (event_id, offset) — reply 成功才 mark
@@ -6335,45 +6683,47 @@ def _reply(
                                 "piggyback skip: pending=%d but no text entry rendered group=%s",
                                 pending_count, group_id,
                             )
-            # Step 2: 剩餘 slot 給 due reminders (LINE push quota 爆時的 fallback)
-            try:
-                import calendar_db
-                import event_reminder as _er
-                for offset in calendar_db.REMINDER_OFFSETS:
-                    if len(messages_to_send) >= 5:
-                        break
-                    due = calendar_db.list_due_for_reminder(group_id, days_ahead=offset)
-                    for e in due:
+            if _reminder_reply_piggyback_enabled():
+                # Step 2: 剩餘 slot 給 due reminders (legacy quota fallback)
+                try:
+                    import calendar_db
+                    import event_reminder as _er
+                    for offset in calendar_db.REMINDER_OFFSETS:
                         if len(messages_to_send) >= 5:
                             break
-                        spec = _er.build_reminder_message_spec(
-                            e, offset, allow_mention=True
+                        due = calendar_db.list_due_for_reminder(
+                            group_id, days_ahead=offset
                         )
-                        if spec is None:
-                            continue
-                        messages_to_send.append(_er.sdk_message_from_spec(spec))
-                        pending_reminders.append((e["event_id"], offset))
-            except Exception as e:
-                logger.warning("reminder piggyback skip: %s", e)
+                        for e in due:
+                            if len(messages_to_send) >= 5:
+                                break
+                            spec = _er.build_reminder_message_spec(
+                                e, offset, allow_mention=True
+                            )
+                            if spec is None:
+                                continue
+                            messages_to_send.append(_er.sdk_message_from_spec(spec))
+                            pending_reminders.append((e["event_id"], offset))
+                except Exception as e:
+                    logger.warning("reminder piggyback skip: %s", e)
 
-            # Step 3: 再把自然語言 reminder_push 的 due reminder 塞進剩餘 slot。
-            # 這些原本只能靠 push_message；LINE monthly push quota 爆時，使用者留言觸發
-            # 的 reply_message 仍可帶出，且成功後才 mark，避免假成功。
-            try:
-                if len(messages_to_send) < 5:
-                    import reminder_push as _rp
-                    remaining = 5 - len(messages_to_send)
-                    for item in _rp.due_reminders_for_reply(
-                        group_id, limit=remaining
-                    ):
-                        messages_to_send.append(
-                            item.get("message") or TextMessage(text=item["text"][:5000])
-                        )
-                        pending_reminder_pushes.append(
-                            (item["reminder_id"], item["stage"])
-                        )
-            except Exception as e:
-                logger.warning("reminder_push piggyback skip: %s", e)
+                # Step 3: 再把自然語言 reminder_push 的 due reminder 塞進剩餘 slot。
+                try:
+                    if len(messages_to_send) < 5:
+                        import reminder_push as _rp
+                        remaining = 5 - len(messages_to_send)
+                        for item in _rp.due_reminders_for_reply(
+                            group_id, limit=remaining
+                        ):
+                            messages_to_send.append(
+                                item.get("message")
+                                or TextMessage(text=item["text"][:5000])
+                            )
+                            pending_reminder_pushes.append(
+                                (item["reminder_id"], item["stage"])
+                            )
+                except Exception as e:
+                    logger.warning("reminder_push piggyback skip: %s", e)
 
         resp = None
         try:

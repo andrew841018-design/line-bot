@@ -10,3 +10,7 @@ def test_notify_quota_pressure_is_disabled(monkeypatch):
 
     assert notify_discord.notify_quota_pressure("line_bot 共用 key", state) is False
     assert state == {}
+
+
+def test_discord_timeout_is_capped_for_monitor_sla():
+    assert notify_discord.DISCORD_TIMEOUT == (3, 7)

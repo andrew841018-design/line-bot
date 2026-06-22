@@ -203,7 +203,7 @@ def extract_many(combined_text: str, primary: dict | None = None) -> dict:
         import calendar_regex
         today_tw_date = datetime.now(_TW).date()
         regex_events = calendar_regex.extract_many_regex_only(
-            combined_text, today_tw_date
+            combined_text, today_tw_date, require_time=False
         )
         if events and len(regex_events) <= 1:
             regex_events = []

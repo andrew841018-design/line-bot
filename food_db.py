@@ -25,6 +25,7 @@ from config import settings
 
 _DB_PATH = Path(settings.sqlite_path)
 _lock = threading.Lock()
+_INIT_PATHS: set[str] = set()
 
 # v1：所有 signal 歸屬「家庭」層級，不分個人（GP2 blocker A）
 HOUSEHOLD_SUBJECT = "家庭"
@@ -56,37 +57,49 @@ def is_valid_kind(kind: str) -> bool:
     return kind in FOOD_KINDS
 
 
-def _conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(_DB_PATH, isolation_level=None, check_same_thread=False)
+def _db_path(db_path: Path | str | None = None) -> Path:
+    return Path(db_path) if db_path is not None else _DB_PATH
+
+
+def _conn(db_path: Path | str | None = None) -> sqlite3.Connection:
+    conn = sqlite3.connect(_db_path(db_path), isolation_level=None, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 
-def init_db() -> None:
-    with _lock, _conn() as c:
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS family_food (
-                group_id      TEXT NOT NULL,
-                source_msg_id TEXT NOT NULL DEFAULT '',
-                kind          TEXT NOT NULL,
-                food          TEXT NOT NULL,
-                subject       TEXT NOT NULL DEFAULT '家庭',
-                source_text   TEXT,
-                created_at    INTEGER NOT NULL,
-                PRIMARY KEY (group_id, source_msg_id, kind, food)
+def init_db(db_path: Path | str | None = None) -> None:
+    path = _db_path(db_path)
+    path_key = str(path)
+    if path_key in _INIT_PATHS:
+        return
+    with _lock:
+        if path_key in _INIT_PATHS:
+            return
+        with _conn(path) as c:
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS family_food (
+                    group_id      TEXT NOT NULL,
+                    source_msg_id TEXT NOT NULL DEFAULT '',
+                    kind          TEXT NOT NULL,
+                    food          TEXT NOT NULL,
+                    subject       TEXT NOT NULL DEFAULT '家庭',
+                    source_text   TEXT,
+                    created_at    INTEGER NOT NULL,
+                    PRIMARY KEY (group_id, source_msg_id, kind, food)
+                )
+                """
             )
-            """
-        )
-        c.execute(
-            "CREATE INDEX IF NOT EXISTS idx_family_food_lookup "
-            "ON family_food(group_id, food, created_at)"
-        )
-        c.execute(
-            "CREATE INDEX IF NOT EXISTS idx_family_food_kind "
-            "ON family_food(group_id, kind, created_at)"
-        )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_family_food_lookup "
+                "ON family_food(group_id, food, created_at)"
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_family_food_kind "
+                "ON family_food(group_id, kind, created_at)"
+            )
+        _INIT_PATHS.add(path_key)
 
 
 def insert_signal(
@@ -96,6 +109,7 @@ def insert_signal(
     source_msg_id: str = "",
     source_text: str | None = None,
     created_at_ms: int | None = None,
+    db_path: Path | str | None = None,
 ) -> bool:
     """寫一筆飲食 signal。回 True=新增、False=dedup 命中或參數無效。
 
@@ -106,7 +120,8 @@ def insert_signal(
         return False
     st = (source_text or "")[:500] or None
     ts = created_at_ms if created_at_ms is not None else int(time.time() * 1000)
-    with _lock, _conn() as c:
+    init_db(db_path)
+    with _lock, _conn(db_path) as c:
         cur = c.execute(
             "INSERT OR IGNORE INTO family_food "
             "(group_id, source_msg_id, kind, food, subject, source_text, created_at) "

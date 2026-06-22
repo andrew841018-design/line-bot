@@ -9,7 +9,6 @@
 """
 from __future__ import annotations
 
-import json
 import sys
 import time
 from pathlib import Path
@@ -20,9 +19,8 @@ sys.path.insert(0, str(BASE))
 from dotenv import load_dotenv
 load_dotenv(BASE / ".env")
 
-import requests
 import pending_store
-from line_token_refresh import get_line_token
+from line_push_client import LinePushError, line_access_token, push_messages
 
 
 GROUP = "C83c5609ada4df93fa7f3239c24685133"
@@ -128,7 +126,7 @@ DRAFTS: dict[str, str] = {
 
 
 def main() -> int:
-    token = get_line_token()
+    token = line_access_token()
     if not token:
         print("ERROR: no LINE token")
         return 1
@@ -138,9 +136,6 @@ def main() -> int:
     if not items:
         print("INFO: pending empty, nothing to push")
         return 0
-
-    url = "https://api.line.me/v2/bot/message/push"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
     pushed = failed = skipped = 0
     for entry in list(items):
@@ -159,22 +154,16 @@ def main() -> int:
         msg: dict = {"type": "text", "text": text}
         if qt:
             msg["quoteToken"] = qt
-        body = {"to": GROUP, "messages": [msg]}
-
         try:
-            r = requests.post(url, headers=headers, data=json.dumps(body), timeout=15)
-        except Exception as e:
+            push_messages(GROUP, [msg], timeout=15, fallback_token=token)
+        except LinePushError as e:
             failed += 1
-            print(f"  ❌ {suffix} network: {e!s}[:120]")
+            print(f"  ❌ {suffix} push failed: {str(e)[:200]}")
             continue
 
-        if r.status_code == 200:
-            pending_store.remove_by_message_id(GROUP, mid)
-            pushed += 1
-            print(f"  ✓ {suffix} pushed + removed from pending")
-        else:
-            failed += 1
-            print(f"  ❌ {suffix} HTTP {r.status_code}: {r.text[:200]}")
+        pending_store.remove_by_message_id(GROUP, mid)
+        pushed += 1
+        print(f"  ✓ {suffix} pushed + removed from pending")
 
         time.sleep(1.2)
 

@@ -86,6 +86,15 @@ _COMMAND_PREFIXES = ("/民調", "/投票")
 _STATUS_COMMANDS = ("/民調", "/投票", "/民調狀態", "/看民調", "/投票狀態")
 _NUDGE_COMMANDS = ("/催民調", "/提醒民調")
 _CLOSE_COMMANDS = ("/關閉民調", "/結束民調", "/取消民調")
+_EXPLICIT_CREATE_RE = re.compile(
+    r"^(?:(?:(?:請|麻煩|可以)?\s*幫(?:我|我們|大家)?\s*)|(?:麻煩你?|請你?)\s*)?"
+    r"(?:(?:做|開|建立|建|發起|弄)\s*)?"
+    r"(?:一個|個|一下|下)?\s*(?:民調|投票)(?:\s*[:：,，]\s*|\s+|$)(.*)$"
+)
+_EXPLICIT_NON_VOTE_RE = re.compile(
+    r"幫我|幫忙|請問|查|搜尋|分析|解釋|怎麼|為什麼|可不可以|能不能"
+)
+_POLL_CLOSE_WORD_RE = re.compile(r"關掉|關閉|結束|取消|停掉|停止")
 
 
 @dataclass(frozen=True)
@@ -181,14 +190,23 @@ def _target_for_alias(alias: str) -> VoteTarget:
     return VoteTarget(key=f"alias:{alias}", alias=alias)
 
 
-def _target_for_user(user_id: str | None) -> VoteTarget | None:
+def _clean_sender_alias(sender_alias: str | None) -> str:
+    alias = (sender_alias or "").strip()
+    return alias if alias and alias not in {"某人"} else ""
+
+
+def _target_for_user(
+    user_id: str | None,
+    *,
+    sender_alias: str | None = None,
+) -> VoteTarget | None:
     alias = alias_from_user_id(user_id)
     if alias:
         return _target_for_alias(alias)
+    alias = _clean_sender_alias(sender_alias) or "群組成員"
     if not user_id:
-        return None
-    short = user_id[-4:] if len(user_id) >= 4 else user_id
-    return VoteTarget(key=f"user:{user_id}", alias=f"成員{short}")
+        return _target_for_alias(alias)
+    return VoteTarget(key=f"user:{user_id}", alias=alias)
 
 
 def _normalize_question(text: str) -> str:
@@ -227,13 +245,14 @@ def create_poll(
     question: str,
     *,
     user_id: str | None = None,
+    sender_alias: str | None = None,
     source_msg_id: str = "",
     source_text: str | None = None,
 ) -> dict:
     question = _normalize_question(question)
     topic = _topic_from_question(question)
     now = _now_ms()
-    created_by_alias = alias_from_user_id(user_id)
+    created_by_alias = alias_from_user_id(user_id) or _clean_sender_alias(sender_alias)
     with _lock, _conn() as c:
         cur = c.execute(
             "INSERT OR IGNORE INTO family_polls "
@@ -270,6 +289,7 @@ def try_create_poll_from_text(
     text: str,
     *,
     user_id: str | None = None,
+    sender_alias: str | None = None,
     source_msg_id: str = "",
 ) -> dict | None:
     if not looks_like_poll_request(text):
@@ -279,6 +299,7 @@ def try_create_poll_from_text(
         group_id,
         question,
         user_id=user_id,
+        sender_alias=sender_alias,
         source_msg_id=source_msg_id,
         source_text=text,
     )
@@ -337,7 +358,12 @@ def _choice_from_text(text: str) -> str | None:
     return None
 
 
-def _targets_from_text(text: str, user_id: str | None) -> list[VoteTarget]:
+def _targets_from_text(
+    text: str,
+    user_id: str | None,
+    *,
+    sender_alias: str | None = None,
+) -> list[VoteTarget]:
     found: list[VoteTarget] = []
     seen: set[str] = set()
     for raw, canonical in _alias_patterns():
@@ -345,7 +371,7 @@ def _targets_from_text(text: str, user_id: str | None) -> list[VoteTarget]:
             target = _target_for_alias(canonical)
             found.append(target)
             seen.add(canonical)
-    sender = _target_for_user(user_id)
+    sender = _target_for_user(user_id, sender_alias=sender_alias)
     has_first_person = "我" in text or "偶" in text
     if sender and (has_first_person or not found):
         if sender.key not in {t.key for t in found}:
@@ -368,6 +394,7 @@ def record_vote_from_text(
     text: str,
     *,
     user_id: str | None = None,
+    sender_alias: str | None = None,
     source_msg_id: str = "",
 ) -> dict | None:
     poll = get_active_poll(group_id)
@@ -379,12 +406,16 @@ def record_vote_from_text(
         choice = _choice_from_text(segment)
         if choice is None:
             continue
-        targets = _targets_from_text(segment, user_id)
+        targets = _targets_from_text(segment, user_id, sender_alias=sender_alias)
         for target in targets:
             updates.append((target, choice))
     if not updates:
         choice = _choice_from_text(text)
-        targets = _targets_from_text(text, user_id) if choice else []
+        targets = (
+            _targets_from_text(text, user_id, sender_alias=sender_alias)
+            if choice
+            else []
+        )
         updates = [(target, choice) for target in targets if choice]
     if not updates:
         return None
@@ -481,11 +512,11 @@ def format_vote_reply(result: dict) -> str:
     updates = result.get("updates") or [
         (alias, result["choice"]) for alias in result.get("targets", [])
     ]
-    update_text = "、".join(
+    update_text = "\n".join(
         f"{alias} → {_CHOICE_LABELS.get(choice, choice)}"
         for alias, choice in updates
     )
-    lines = [f"已更新：{update_text}", format_summary(poll)]
+    lines = [update_text, format_summary(poll)]
     if result.get("ambiguous_count", 0) > len(result["targets"]):
         lines.append("如果你是幫多個人回，請直接寫名字，例如「爸爸和媽媽可以」。")
     return "\n\n".join(lines)
@@ -504,6 +535,7 @@ def handle_command(
     text: str,
     *,
     user_id: str | None = None,
+    sender_alias: str | None = None,
     source_msg_id: str = "",
 ) -> str | None:
     t = (text or "").strip()
@@ -518,6 +550,7 @@ def handle_command(
                 group_id,
                 question,
                 user_id=user_id,
+                sender_alias=sender_alias,
                 source_msg_id=source_msg_id,
                 source_text=text,
             )
@@ -540,17 +573,93 @@ def handle_command(
     return None
 
 
+def _parse_explicit_create_request(text: str) -> tuple[bool, str]:
+    m = _EXPLICIT_CREATE_RE.match((text or "").strip())
+    if not m:
+        return False, ""
+    return True, (m.group(1) or "").strip(" ：:,，")
+
+
+def _looks_like_close_request(text: str) -> bool:
+    s = (text or "").strip()
+    if not s or len(s) > 50:
+        return False
+    return bool(("民調" in s or "投票" in s) and _POLL_CLOSE_WORD_RE.search(s))
+
+
+def _looks_like_explicit_vote(text: str) -> bool:
+    s = (text or "").strip()
+    if not s or len(s) > 60 or _EXPLICIT_NON_VOTE_RE.search(s):
+        return False
+    return _choice_from_text(s) is not None
+
+
+def handle_explicit_message(
+    group_id: str,
+    text: str,
+    *,
+    user_id: str | None = None,
+    sender_alias: str | None = None,
+    source_msg_id: str = "",
+) -> str | None:
+    command_reply = handle_command(
+        group_id,
+        text,
+        user_id=user_id,
+        sender_alias=sender_alias,
+        source_msg_id=source_msg_id,
+    )
+    if command_reply is not None:
+        return command_reply
+
+    is_create_request, question = _parse_explicit_create_request(text)
+    if is_create_request:
+        if not question:
+            return "要開民調請這樣說：幫我做民調：<要統計的事情>"
+        poll = create_poll(
+            group_id,
+            question,
+            user_id=user_id,
+            sender_alias=sender_alias,
+            source_msg_id=source_msg_id,
+            source_text=text,
+        )
+        return format_created_reply(poll)
+
+    if _looks_like_close_request(text):
+        poll = close_active_poll(group_id)
+        if not poll:
+            return "目前沒有進行中的民調可以關閉。"
+        return "已關閉民調。\n" + format_summary(poll, include_pending=False)
+
+    if not _looks_like_explicit_vote(text):
+        return None
+
+    result = record_vote_from_text(
+        group_id,
+        text,
+        user_id=user_id,
+        sender_alias=sender_alias,
+        source_msg_id=source_msg_id,
+    )
+    if result:
+        return format_vote_reply(result)
+    return None
+
+
 def handle_natural_message(
     group_id: str,
     text: str,
     *,
     user_id: str | None = None,
+    sender_alias: str | None = None,
     source_msg_id: str = "",
 ) -> str | None:
     poll = try_create_poll_from_text(
         group_id,
         text,
         user_id=user_id,
+        sender_alias=sender_alias,
         source_msg_id=source_msg_id,
     )
     if poll:
@@ -559,6 +668,7 @@ def handle_natural_message(
         group_id,
         text,
         user_id=user_id,
+        sender_alias=sender_alias,
         source_msg_id=source_msg_id,
     )
     if result:

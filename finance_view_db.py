@@ -25,59 +25,72 @@ from config import settings
 
 _DB_PATH = Path(settings.sqlite_path)
 _lock = threading.Lock()
+_INIT_PATHS: set[str] = set()
 
 
-def _conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(_DB_PATH, isolation_level=None, check_same_thread=False)
+def _db_path(db_path: Path | str | None = None) -> Path:
+    return Path(db_path) if db_path is not None else _DB_PATH
+
+
+def _conn(db_path: Path | str | None = None) -> sqlite3.Connection:
+    conn = sqlite3.connect(_db_path(db_path), isolation_level=None, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 
-def init_db() -> None:
-    with _lock, _conn() as c:
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS finance_views (
-                view_id               TEXT PRIMARY KEY,
-                group_id              TEXT NOT NULL,
-                source_msg_id         TEXT,
-                user_id               TEXT NOT NULL,
-                display_name          TEXT NOT NULL,
-                raw_text              TEXT NOT NULL,
-                symbol_type           TEXT NOT NULL,
-                ticker                TEXT,
-                macro_topic           TEXT,
-                direction             TEXT,
-                time_frame            TEXT,
-                horizon_days          INTEGER,
-                target_price          REAL,
-                target_pct            REAL,
-                confidence            TEXT,
-                condition_text        TEXT,
-                validated_price_start REAL,
-                validated_price_end   REAL,
-                status                TEXT NOT NULL DEFAULT 'active',
-                created_at            INTEGER NOT NULL,
-                expires_at            TEXT,
-                last_validated_at     INTEGER,
-                validation_result     TEXT NOT NULL DEFAULT 'pending',
-                validation_detail     TEXT
+def init_db(db_path: Path | str | None = None) -> None:
+    path = _db_path(db_path)
+    path_key = str(path)
+    if path_key in _INIT_PATHS:
+        return
+    with _lock:
+        if path_key in _INIT_PATHS:
+            return
+        with _conn(path) as c:
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS finance_views (
+                    view_id               TEXT PRIMARY KEY,
+                    group_id              TEXT NOT NULL,
+                    source_msg_id         TEXT,
+                    user_id               TEXT NOT NULL,
+                    display_name          TEXT NOT NULL,
+                    raw_text              TEXT NOT NULL,
+                    symbol_type           TEXT NOT NULL,
+                    ticker                TEXT,
+                    macro_topic           TEXT,
+                    direction             TEXT,
+                    time_frame            TEXT,
+                    horizon_days          INTEGER,
+                    target_price          REAL,
+                    target_pct            REAL,
+                    confidence            TEXT,
+                    condition_text        TEXT,
+                    validated_price_start REAL,
+                    validated_price_end   REAL,
+                    status                TEXT NOT NULL DEFAULT 'active',
+                    created_at            INTEGER NOT NULL,
+                    expires_at            TEXT,
+                    last_validated_at     INTEGER,
+                    validation_result     TEXT NOT NULL DEFAULT 'pending',
+                    validation_detail     TEXT
+                )
+                """
             )
-            """
-        )
-        c.execute(
-            "CREATE INDEX IF NOT EXISTS idx_fv_group_created "
-            "ON finance_views(group_id, created_at)"
-        )
-        c.execute(
-            "CREATE INDEX IF NOT EXISTS idx_fv_group_ticker_created "
-            "ON finance_views(group_id, ticker, created_at)"
-        )
-        c.execute(
-            "CREATE INDEX IF NOT EXISTS idx_fv_expires_result "
-            "ON finance_views(expires_at, validation_result)"
-        )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_fv_group_created "
+                "ON finance_views(group_id, created_at)"
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_fv_group_ticker_created "
+                "ON finance_views(group_id, ticker, created_at)"
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_fv_expires_result "
+                "ON finance_views(expires_at, validation_result)"
+            )
+        _INIT_PATHS.add(path_key)
 
 
 def insert_view(
@@ -97,10 +110,12 @@ def insert_view(
     confidence: Optional[str],
     condition_text: Optional[str],
     expires_at: Optional[str],
+    db_path: Path | str | None = None,
 ) -> str:
     view_id = uuid.uuid4().hex
     now_ms = int(time.time() * 1000)
-    with _lock, _conn() as c:
+    init_db(db_path)
+    with _lock, _conn(db_path) as c:
         c.execute(
             """
             INSERT INTO finance_views (

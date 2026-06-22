@@ -13,6 +13,8 @@ import sqlite3
 import threading
 import time
 import uuid
+import re
+from collections.abc import Mapping
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -36,6 +38,109 @@ _DEFAULT_EVENT_TYPE = "family_gathering"
 # 30 = 1 個月前 / 7 = 1 週前 / 3-2-1 = 倒數三天每天推 / 0 = 當天提醒
 # 加新 offset 只動這一行 + schema migration 自動補對應 reminded_Xd 欄位
 REMINDER_OFFSETS: tuple[int, ...] = (30, 7, 3, 2, 1, 0)
+EVENT_REMINDER_SOURCE_KIND = "calendar_event"
+_EVENT_REMINDER_URL_RE = re.compile(r"https?://[^\s\]\)；，。？！!?]+")
+_EVENT_REMINDER_CODE_RE = re.compile(
+    r"(?:驗證碼|認證碼|校驗碼|接機碼|確認碼|領車碼|出發碼|code|OTP|passcode)"
+    r"\s*[:：]?\s*([A-Za-z0-9]{4,12})",
+    re.IGNORECASE,
+)
+
+
+def _extract_event_reference_info(raw_text: str | None) -> tuple[list[str], list[str]]:
+    """從 LINE 原文訊息抓 URL 與驗證碼，供 reminder source_text 補充。"""
+    if not raw_text:
+        return [], []
+    text = str(raw_text).strip()
+    if not text:
+        return [], []
+
+    urls: list[str] = []
+    for url in _EVENT_REMINDER_URL_RE.findall(text):
+        cleaned = re.sub(r"[\]】。，,;；>)]$", "", url)
+        if cleaned and cleaned not in urls:
+            urls.append(cleaned)
+
+    codes: list[str] = []
+    for m in _EVENT_REMINDER_CODE_RE.finditer(text):
+        code = (m.group(1) or "").strip()
+        if code and code not in codes:
+            codes.append(code)
+
+    return urls, codes
+
+
+def _event_participants(event: Mapping[str, object]) -> list[str]:
+    """Normalize event participants from db/json/list payload into displayable names."""
+
+    raw = event.get("participants", "[]")
+    if isinstance(raw, list):
+        values = raw
+    elif isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        try:
+            loaded = json.loads(text)
+        except Exception:
+            return []
+        values = loaded if isinstance(loaded, list) else []
+    else:
+        return []
+
+    participants: list[str] = []
+    for item in values:
+        name = str(item).strip()
+        if name:
+            clean_name = _clean_participant_name(name)
+            if clean_name:
+                participants.append(clean_name)
+    return participants
+
+
+def _merge_mention_aliases(*buckets: list[str] | None) -> list[str]:
+    out: list[str] = []
+    for aliases in buckets:
+        for alias in aliases or []:
+            name = _clean_participant_name(str(alias))
+            if not name or name in out:
+                continue
+            out.append(name)
+    return out
+
+
+def _raw_text_reminder_aliases(text: str) -> list[str]:
+    """Only explicit raw mentions should add reminder mention targets.
+
+    A family member name in the source text can be the event subject ("爸爸體檢"),
+    not necessarily someone to tag. Keep explicit @mentions and broad family
+    mentions such as "全家".
+    """
+    if not text:
+        return []
+    from line_mentions import aliases_mentioned_in_text
+
+    explicit_mentions = " ".join(
+        m.group(0).replace("＠", "@")
+        for m in re.finditer(r"[@＠][A-Za-z0-9_\u4e00-\u9fff]{1,30}", text)
+    )
+    broad_mentions = " ".join(
+        term for term in ("全家", "大家", "所有人", "全部", "全員", "@all", "everyone")
+        if term in text
+    )
+    return aliases_mentioned_in_text(f"{explicit_mentions} {broad_mentions}".strip())
+
+
+def _clean_participant_name(name: str) -> str:
+    cleaned = str(name or "").strip()
+    if not cleaned:
+        return ""
+    cleaned = cleaned.lstrip("@")
+    for marker in ("(", "（"):
+        if marker in cleaned:
+            cleaned = cleaned.split(marker, 1)[0].strip()
+            break
+    return cleaned
 
 
 def _reminded_column(offset: int) -> str:
@@ -53,6 +158,124 @@ def _validate_event_type(et: str | None) -> str:
 # LIKE wildcard escape — escape 順序：先 \ 再 _ / %（順序錯會 double-escape）
 def _escape_like(s: str) -> str:
     return s.replace("\\", "\\\\").replace("_", "\\_").replace("%", "\\%")
+
+
+def _ensure_memory_db_path() -> None:
+    """Keep memory._DB_PATH 對齊 calendar_db._DB_PATH（避免 test env drift）。"""
+    import memory
+
+    if str(memory._DB_PATH) != str(_DB_PATH):
+        memory._DB_PATH = _DB_PATH
+        memory._init_db()
+
+
+def _event_reminder_payload(event: Mapping[str, object]) -> tuple[str, str]:
+    title = str(event.get("title", "") or "").strip()
+    action = title or "家族行事曆提醒"
+
+    source_parts = [title]
+    location = str(event.get("location", "") or "").strip()
+    if location:
+        source_parts.append(f"地點：{location}")
+    event_time = str(event.get("event_time", "") or "").strip()
+    if event_time:
+        source_parts.append(f"時間：{event_time}")
+    participants = _event_participants(event)
+    if participants:
+        source_parts.append("參加人：" + "、".join(participants))
+    source_msg_id = str(event.get("source_msg_id") or "").strip()
+    group_id = str(event.get("group_id") or "").strip()
+    location_has_reference = "接送網址" in location or "驗證碼" in location
+    if source_msg_id and group_id and not location_has_reference:
+        try:
+            import memory
+
+            _ensure_memory_db_path()
+            raw = memory.get_raw_message(group_id, source_msg_id)
+            if raw and raw[1]:
+                urls, codes = _extract_event_reference_info(raw[1])
+                if urls:
+                    source_parts.append(f"接送網址：{'、'.join(urls)}")
+                if codes:
+                    source_parts.append(f"驗證碼：{'、'.join(codes)}")
+        except Exception:
+            pass
+    return action, "；".join([p for p in source_parts if p])
+
+
+def _event_to_remind_at(event_date: str, event_time: str | None) -> int | None:
+    if not event_date:
+        return None
+    try:
+        if event_time:
+            hour, minute = map(int, str(event_time).strip().split(":", 1))
+        else:
+            hour, minute = 0, 0
+        y, m, d = (int(x) for x in str(event_date).split("-"))
+        dt = datetime(y, m, d, hour, minute, tzinfo=_TW)
+        return int(dt.timestamp())
+    except Exception:
+        return None
+
+
+def _upsert_event_reminder(event: Mapping[str, object]) -> bool:
+    if not event:
+        return False
+    remind_at = _event_to_remind_at(
+        str(event.get("event_date", "")), event.get("event_time")  # type: ignore[arg-type]
+    )
+    if remind_at is None:
+        return False
+    action, source_text = _event_reminder_payload(event)
+    import memory
+
+    group_id = str(event.get("group_id", "") or "").strip()
+    source_msg_id = str(event.get("source_msg_id", "") or "").strip()
+    raw_text = ""
+    reminder_user_id = ""
+    if source_msg_id and group_id:
+        try:
+            _ensure_memory_db_path()
+            raw = memory.get_raw_message(group_id, source_msg_id)
+            if raw and raw[0]:
+                reminder_user_id = str(raw[0]).strip()
+            if raw and raw[1]:
+                raw_text = str(raw[1] or "")
+        except Exception:
+            pass
+
+    mention_aliases = _merge_mention_aliases(
+        _event_participants(event),
+        _raw_text_reminder_aliases(raw_text),
+    )
+
+    _ensure_memory_db_path()
+    try:
+        if hasattr(memory, "upsert_reminder_for_source_any_status"):
+            memory.upsert_reminder_for_source_any_status(
+                group_id=str(event.get("group_id", "")),
+                user_id=reminder_user_id,
+                action=action,
+                remind_at=remind_at,
+                source_kind=EVENT_REMINDER_SOURCE_KIND,
+                source_ref=str(event.get("event_id", "")),
+                source_text=source_text,
+                mention_aliases=mention_aliases,
+            )
+        else:
+            memory.upsert_reminder_for_source(
+                group_id=str(event.get("group_id", "")),
+                user_id=reminder_user_id,
+                action=action,
+                remind_at=remind_at,
+                source_kind=EVENT_REMINDER_SOURCE_KIND,
+                source_ref=str(event.get("event_id", "")),
+                source_text=source_text,
+                mention_aliases=mention_aliases,
+            )
+        return True
+    except Exception:
+        return False
 
 
 def _conn() -> sqlite3.Connection:
@@ -140,6 +363,7 @@ def insert_event(
     event_id = uuid.uuid4().hex
     parts_json = json.dumps(participants or [], ensure_ascii=False)
     et = _validate_event_type(event_type)
+    event: dict[str, object] | None = None
     with _lock, _conn() as c:
         cur = c.execute(
             "INSERT OR IGNORE INTO events (event_id, group_id, title, event_date, event_time, "
@@ -162,7 +386,79 @@ def insert_event(
             # dedup hit — 同 group+title+event_date 的 active event 已存在
             # GP1+gemini 反饋：跨 type 同 title+date 也會被 silent drop（by design）
             return ""
+        event = {
+            "event_id": event_id,
+            "group_id": group_id,
+            "title": title,
+            "event_date": event_date,
+            "event_time": event_time,
+            "location": location,
+            "participants": parts_json,
+            "source_msg_id": source_msg_id,
+            "status": "active",
+            "event_type": et,
+        }
+    if event:
+        _upsert_event_reminder(event)
     return event_id
+
+
+def sync_active_events_to_reminders(group_id: str | None = None) -> int:
+    """回填 events → reminders（缺漏補齊）。"""
+    _ensure_memory_db_path()
+    with _lock, _conn() as c:
+        c.row_factory = sqlite3.Row
+        if group_id:
+            rows = c.execute(
+                "SELECT event_id, group_id, title, event_date, event_time, "
+                "location, participants, status, source_msg_id FROM events "
+                "WHERE group_id = ? AND status='active'",
+                (group_id,),
+            ).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT event_id, group_id, title, event_date, event_time, "
+                "location, participants, status, source_msg_id FROM events "
+                "WHERE status='active'",
+            ).fetchall()
+
+    synced = 0
+    for row in rows:
+        event = dict(row)
+        if _upsert_event_reminder(event):
+            synced += 1
+
+    try:
+        import memory
+
+        with _lock, _conn() as c:
+            if group_id:
+                active_refs = [
+                    str(r[0])
+                    for r in c.execute(
+                        "SELECT event_id FROM events "
+                        "WHERE group_id = ? AND status='active'",
+                        (group_id,),
+                    ).fetchall()
+                    if r[0]
+                ]
+            else:
+                active_refs = [
+                    str(r[0])
+                    for r in c.execute(
+                        "SELECT event_id FROM events WHERE status='active'"
+                    ).fetchall()
+                    if r[0]
+                ]
+            memory.delete_pending_reminders_by_source(
+                source_kind=EVENT_REMINDER_SOURCE_KIND,
+                keep_source_refs=active_refs,
+                group_id=group_id,
+            )
+    except Exception:
+        pass
+
+    return synced
 
 
 def find_active_event(
@@ -209,11 +505,27 @@ def find_active_event(
 
 def cancel_event(event_id: str) -> bool:
     with _lock, _conn() as c:
+        row = c.execute(
+            "SELECT group_id FROM events WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
         cur = c.execute(
             "UPDATE events SET status = 'cancelled' WHERE event_id = ? AND status = 'active'",
             (event_id,),
         )
-        return cur.rowcount > 0
+        ok = cur.rowcount > 0
+    if ok and row:
+        import memory
+
+        try:
+            _ensure_memory_db_path()
+            memory.mark_reminder_done_for_source(
+                row[0], EVENT_REMINDER_SOURCE_KIND, event_id
+            )
+        except Exception:
+            pass
+        return True
+    return False
 
 
 def update_event_schedule(
@@ -226,6 +538,8 @@ def update_event_schedule(
     必須重推所有 offset，否則之前推過的 flag 會壓住新提醒）。
     """
     title = (title or "").strip() or None
+    updated = False
+    event: dict[str, object] | None = None
     with _lock, _conn() as c:
         try:
             cur = c.execute(
@@ -240,7 +554,28 @@ def update_event_schedule(
             )
         except sqlite3.IntegrityError:
             return False
-        return cur.rowcount > 0
+        if cur.rowcount == 0:
+            return False
+        row = c.execute(
+            "SELECT event_id, group_id, title, event_date, event_time, "
+            "location, participants, source_msg_id FROM events WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+        if row:
+            event = {
+                "event_id": row[0],
+                "group_id": row[1],
+                "title": row[2],
+                "event_date": row[3],
+                "event_time": row[4],
+                "location": row[5],
+                "participants": row[6],
+                "source_msg_id": row[7],
+            }
+            updated = True
+    if updated and event:
+        _upsert_event_reminder(event)
+    return updated
 
 
 def update_event_date(event_id: str, new_date: str, new_time: str | None = None) -> bool:

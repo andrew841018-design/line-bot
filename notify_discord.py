@@ -6,7 +6,10 @@ from zoneinfo import ZoneInfo
 import requests
 from dotenv import load_dotenv
 
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
+if os.getenv("LINE_BOT_DISABLE_DOTENV", "").lower() not in {"1", "true", "yes", "on"}:
+    load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
+
+DISCORD_TIMEOUT = (3, 7)
 
 
 def send_dm(message: str) -> bool:
@@ -23,7 +26,7 @@ def send_dm(message: str) -> bool:
         "https://discord.com/api/v10/users/@me/channels",
         headers=headers,
         json={"recipient_id": user_id},
-        timeout=(5, 15),
+        timeout=DISCORD_TIMEOUT,
     )
     if r.status_code != 200:
         print(f"建立 DM 失敗: {r.status_code}")
@@ -36,7 +39,7 @@ def send_dm(message: str) -> bool:
         f"https://discord.com/api/v10/channels/{channel_id}/messages",
         headers=headers,
         json={"content": message},
-        timeout=(5, 15),
+        timeout=DISCORD_TIMEOUT,
     )
     if r.status_code != 200:
         print(f"送訊息失敗: {r.status_code}")

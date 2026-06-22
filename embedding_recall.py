@@ -59,8 +59,25 @@ _DB_PATH = Path(settings.sqlite_path)
 _lock = threading.Lock()
 
 
-def _conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(_DB_PATH, isolation_level=None, check_same_thread=False)
+class _ClosingConnection(sqlite3.Connection):
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            return super().__exit__(exc_type, exc, tb)
+        finally:
+            self.close()
+
+
+def _db_path(db_path: Path | str | None = None) -> Path:
+    return Path(db_path) if db_path is not None else _DB_PATH
+
+
+def _conn(db_path: Path | str | None = None) -> sqlite3.Connection:
+    conn = sqlite3.connect(
+        _db_path(db_path),
+        isolation_level=None,
+        check_same_thread=False,
+        factory=_ClosingConnection,
+    )
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
@@ -119,6 +136,7 @@ def index_message(
     group_id: str,
     text: str,
     is_bot: bool = False,
+    db_path: Path | str | None = None,
 ) -> bool:
     """Embed `text` and store. Returns True if a row was written.
 
@@ -138,7 +156,7 @@ def index_message(
             return False
         blob = _serialize(vec)
         now = int(_time.time())
-        with _lock, _conn() as c:
+        with _lock, _conn(db_path) as c:
             c.execute(
                 "INSERT OR REPLACE INTO embeddings"
                 "(message_id, group_id, text, embedding, backend, dim, "

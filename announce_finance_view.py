@@ -11,15 +11,11 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 sys.path.insert(0, str(Path(__file__).parent))
 
-import requests  # noqa: E402
+from line_push_client import LinePushError, line_access_token, push_text  # noqa: E402
 
-from line_token_refresh import get_line_token  # noqa: E402
-
-TOKEN = get_line_token() or os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 GROUP_ID = os.environ.get("LINE_ALLOWED_GROUP_ID") or os.environ.get(
     "ALLOWED_GROUP_ID", ""
 )
-URL = "https://api.line.me/v2/bot/message/push"
 
 MSG = """📈 家族財經觀點追蹤器上線
 
@@ -34,20 +30,17 @@ MSG = """📈 家族財經觀點追蹤器上線
 
 
 def main() -> int:
-    if not TOKEN or not GROUP_ID:
+    token = line_access_token()
+    if not token or not GROUP_ID:
         print("ERR: env not set")
         return 1
-    resp = requests.post(
-        URL,
-        headers={
-            "Authorization": f"Bearer {TOKEN}",
-            "Content-Type": "application/json",
-        },
-        json={"to": GROUP_ID, "messages": [{"type": "text", "text": MSG[:5000]}]},
-        timeout=10,
-    )
-    print(resp.status_code, resp.text[:300])
-    return 0 if resp.ok else 1
+    try:
+        push_text(GROUP_ID, MSG[:5000], timeout=10, fallback_token=token)
+    except LinePushError as e:
+        print(f"{e.status_code or 'ERR'} {e.response_text[:300]}")
+        return 1
+    print("200 OK")
+    return 0
 
 
 if __name__ == "__main__":

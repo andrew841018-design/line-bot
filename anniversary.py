@@ -27,9 +27,8 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 sys.path.insert(0, str(Path(__file__).parent))
 
-import requests  # noqa: E402
-
 from config import settings  # noqa: E402
+from line_push_client import try_push_text  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -38,7 +37,6 @@ _TW = ZoneInfo("Asia/Taipei")
 _DB_PATH = Path(settings.sqlite_path)
 _lock = threading.Lock()
 
-_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 
 
 def _get_target_group_ids() -> list[str]:
@@ -280,13 +278,9 @@ def run_sweep(group_id: str, since_days: int = 0) -> int:
 
 
 def _get_token() -> str:
-    try:
-        import line_token_refresh
-        return line_token_refresh.get_line_token() or os.environ.get(
-            "LINE_CHANNEL_ACCESS_TOKEN", ""
-        )
-    except Exception:
-        return os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+    from line_push_client import line_access_token
+
+    return line_access_token()
 
 
 def _push(group_id: str, text: str) -> bool:
@@ -294,20 +288,7 @@ def _push(group_id: str, text: str) -> bool:
     if not token or not group_id:
         logger.error("missing TOKEN or group_id; skip push")
         return False
-    try:
-        resp = requests.post(
-            _PUSH_URL,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            json={"to": group_id, "messages": [{"type": "text", "text": text}]},
-            timeout=10,
-        )
-        return resp.status_code == 200
-    except Exception as e:
-        logger.warning("LINE push exception: %s", e)
-        return False
+    return try_push_text(group_id, text, timeout=10)
 
 
 _TYPE_LABEL = {

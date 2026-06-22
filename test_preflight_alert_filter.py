@@ -21,6 +21,16 @@ def _args(**kw):
     return argparse.Namespace(force=kw.get("force", True), dry_run=kw.get("dry_run", True))
 
 
+# ---------- tunnel URL validation ----------
+
+def test_preflight_rejects_reserved_trycloudflare_api_url():
+    assert pf._normalize_tunnel_url("https://api.trycloudflare.com") == ""
+    assert pf._normalize_tunnel_url("https://api.trycloudflare.com/tunnel") == ""
+    assert pf._normalize_tunnel_url("https://fresh.trycloudflare.com") == (
+        "https://fresh.trycloudflare.com"
+    )
+
+
 # ---------- _is_transient_error ----------
 
 def test_gemini_429_resource_exhausted_is_transient():

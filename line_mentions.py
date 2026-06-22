@@ -16,6 +16,7 @@ from typing import Any
 
 _DEFAULT_ALIAS_PATH = Path(__file__).with_name("user_aliases.json")
 _SPLIT_RE = re.compile(r"[、,，/\s]+")
+_MENTION_TOKEN_RE = re.compile(r"@([A-Za-z0-9_\u4e00-\u9fff]{1,30})")
 _ALL_PARTICIPANT_NAMES = {
     "@all",
     "all",
@@ -106,6 +107,52 @@ def parse_participants(value: Any) -> list[str]:
     return names
 
 
+def aliases_mentioned_in_text(text: str) -> list[str]:
+    """從文字抽取可辨識到的 family aliases（包含 @標記與直接名稱）。"""
+    aliases: list[str] = []
+    if not text:
+        return aliases
+
+    raw_aliases = load_user_aliases()
+    if not raw_aliases:
+        return aliases
+
+    normalized = (text or "").replace("＠", "@").strip()
+    alias_values = [alias for alias in raw_aliases.values() if isinstance(alias, str)]
+    alias_set = {_clean_name(alias): alias for alias in alias_values if _clean_name(alias)}
+    all_aliases = {_clean_name(name) for name in _ALL_PARTICIPANT_NAMES}
+
+    seen = set()
+    for candidate in _MENTION_TOKEN_RE.findall(normalized):
+        name = _clean_name(candidate)
+        if not name:
+            continue
+        canonical = alias_set.get(name)
+        if not canonical:
+            continue
+        if canonical not in seen:
+            aliases.append(canonical)
+            seen.add(canonical)
+
+    for canonical in alias_set.values():
+        if canonical in seen:
+            continue
+        if canonical in normalized:
+            aliases.append(canonical)
+            seen.add(canonical)
+
+    for alias in all_aliases:
+        if alias in {"", "@all"}:
+            continue
+        if alias in seen:
+            continue
+        if alias in normalized:
+            aliases.append(alias)
+            seen.add(alias)
+
+    return aliases
+
+
 def is_all_participants(names: list[str]) -> bool:
     return any(_clean_name(name).lower() in _ALL_PARTICIPANT_NAMES for name in names)
 
@@ -146,6 +193,11 @@ def reminder_actor_targets(
     if isinstance(mention_aliases, str) and not text:
         text = mention_aliases
         mention_aliases = None
+
+    aliases = [str(alias) for alias in (mention_aliases or []) if str(alias).strip()]
+    if is_all_participants(aliases):
+        return [MentionTarget(key="all", kind="all", label="@all")]
+
     seen_user_ids: set[str] = set()
     targets: list[MentionTarget] = []
     if user_id:
@@ -160,7 +212,7 @@ def reminder_actor_targets(
         )
         seen_user_ids.add(user_id)
 
-    for alias in mention_aliases or []:
+    for alias in aliases:
         _append_alias_target(targets, seen_user_ids, str(alias))
 
     for extra_user_id, alias in load_user_aliases().items():

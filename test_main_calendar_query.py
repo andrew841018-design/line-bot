@@ -121,6 +121,7 @@ def _patch_calendar_reply_capture(monkeypatch, main_mod, captured: dict):
         def reply_message(self, request):
             captured["text"] = request.messages[0].text
             captured["token"] = request.reply_token
+            captured["message"] = request.messages[0]
 
     class FakeApiClient:
         def __init__(self, _cfg):
@@ -184,7 +185,6 @@ def test_handle_calendar_query_no_match(monkeypatch):
 def test_build_todo_status_reply_reads_all_sources(monkeypatch):
     import main
     import todo
-    import calendar_db
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
@@ -210,19 +210,15 @@ def test_build_todo_status_reply_reads_all_sources(monkeypatch):
                 "action": "全家打球",
                 "remind_at": reminder_ts,
                 "mention_aliases": ["全家"],
-            }
-        ],
-    )
-    monkeypatch.setattr(
-        calendar_db,
-        "list_upcoming",
-        lambda gid, days=30: [
+                "source_kind": "",
+                "source_ref": "",
+            },
             {
-                "title": "黃聖穎早上洗牙，看陳敏慧牙醫師",
-                "event_date": "2026-06-25",
-                "event_time": "",
-                "location": "",
-                "participants": json.dumps(["黃聖穎(就醫)"], ensure_ascii=False),
+                "action": "黃聖穎早上洗牙，看陳敏慧牙醫師",
+                "remind_at": reminder_ts,
+                "mention_aliases": [],
+                "source_kind": "calendar_event",
+                "source_ref": "e1",
             }
         ],
     )
@@ -235,8 +231,46 @@ def test_build_todo_status_reply_reads_all_sources(monkeypatch):
     reply = main._build_todo_status_reply("G1", "有哪些待辦事項？")
 
     assert "領長期處方箋" in reply
-    assert "2026-06-25 08:00 全家打球" in reply
+    assert "1. 6/25（四）08:00" in reply
+    assert "事項：全家打球" in reply
+    assert "參加人：@all" in reply
     assert "陳敏慧牙醫師" in reply
+
+
+def test_build_todo_status_reply_detail_query_includes_source_text(monkeypatch):
+    import main
+    import todo
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    monkeypatch.setattr(todo, "list_pending", lambda gid, limit=10, due_date=None: [])
+    reminder_ts = int(
+        datetime(2026, 7, 16, 14, 30, tzinfo=ZoneInfo("Asia/Taipei")).timestamp()
+    )
+    monkeypatch.setattr(
+        main.memory,
+        "list_pending_reminders",
+        lambda gid, within_seconds=None: [
+            {
+                "action": "機場接送（去紐西蘭）7/16去程",
+                "remind_at": reminder_ts,
+                "mention_aliases": ["黃將修"],
+                "source_text": (
+                    "機場接送（去紐西蘭）7/16去程；"
+                    "接送網址：https://68666.tw/TwMI；票券驗證碼：8459"
+                ),
+            }
+        ],
+    )
+
+    reply = main._build_todo_status_reply("G1", "未來提醒事項細節，包含網址驗證碼")
+
+    assert "機場接送（去紐西蘭）7/16去程" in reply
+    assert "1. 7/16（四）14:30" in reply
+    assert "接送網址：https://68666.tw/TwMI" in reply
+    assert "票券驗證碼：8459" in reply
+    assert "https://68666.tw/TwMI" in reply
+    assert "8459" in reply
 
 
 def test_handle_todo_query_replies_immediately(monkeypatch):
@@ -260,6 +294,88 @@ def test_handle_todo_query_replies_immediately(monkeypatch):
 
     assert captured["text"].startswith("目前待辦/提醒")
     assert "測試" in captured["text"]
+
+
+def test_one_shot_reply_intercepts_next_text_and_clears(monkeypatch):
+    import main
+
+    monkeypatch.setattr(main.feedback_collector, "in_feedback_window", lambda: False)
+    monkeypatch.setattr(main.settings, "bot_muted", False, raising=False)
+    monkeypatch.setattr(main.memory, "append_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_load_one_shot_replies", lambda: {"G1": "完整提醒清單"})
+    saved: list[dict] = []
+    monkeypatch.setattr(main, "_save_one_shot_replies", lambda data: saved.append(data))
+    monkeypatch.setattr(
+        main,
+        "_try_handle_calendar_correction",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not continue")),
+    )
+    captured: dict = {}
+    _patch_calendar_reply_capture(monkeypatch, main, captured)
+
+    class FakeMessage:
+        text = "隨便說什麼"
+
+    class FakeEvent:
+        reply_token = "fake_token"
+        message = FakeMessage()
+
+    main._handle_text_message(FakeEvent(), "G1")
+
+    assert captured["text"] == "完整提醒清單"
+    assert captured["token"] == "fake_token"
+    assert saved == [{}]
+
+
+def test_one_shot_reply_uses_text_v2_for_known_mentions(monkeypatch):
+    import main
+
+    monkeypatch.setattr(main.feedback_collector, "in_feedback_window", lambda: False)
+    monkeypatch.setattr(main.settings, "bot_muted", False, raising=False)
+    monkeypatch.setattr(main.memory, "append_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_load_one_shot_replies", lambda: {"G1": "參加人：@爸爸"})
+    saved: list[dict] = []
+    monkeypatch.setattr(main, "_save_one_shot_replies", lambda data: saved.append(data))
+    monkeypatch.setattr(
+        main.line_mentions if hasattr(main, "line_mentions") else __import__("line_mentions"),
+        "load_user_aliases",
+        lambda: {"U_DAD": "爸爸"},
+    )
+    captured: dict = {}
+    _patch_calendar_reply_capture(monkeypatch, main, captured)
+
+    class FakeMessage:
+        text = "隨便說什麼"
+
+    class FakeEvent:
+        reply_token = "fake_token"
+        message = FakeMessage()
+
+    main._handle_text_message(FakeEvent(), "G1")
+
+    assert captured["message"].type == "textV2"
+    assert captured["message"].text.startswith("{p1}\n")
+    assert captured["message"].substitution["p1"].mentionee.user_id == "U_DAD"
+    assert saved == [{}]
+
+
+def test_mention_builder_keeps_all_and_named_mentions(monkeypatch):
+    import main
+    import line_mentions
+
+    monkeypatch.setattr(
+        line_mentions,
+        "load_user_aliases",
+        lambda: {"U_DAD": "爸爸", "U_MOM": "媽媽"},
+    )
+
+    _text, message = main._text_message_with_mentions("參加人：@all、@爸爸、@媽媽")
+
+    assert message.type == "textV2"
+    assert message.text.startswith("{all} {p2} {p3}\n")
+    assert message.substitution["all"].mentionee.type == "all"
+    assert message.substitution["p2"].mentionee.user_id == "U_DAD"
+    assert message.substitution["p3"].mentionee.user_id == "U_MOM"
 
 
 def test_explicit_todo_query_routes_before_llm(monkeypatch):
@@ -497,8 +613,8 @@ def test_auto_capture_gate_accepts_weekday_chinese_time_dentist(monkeypatch):
     monkeypatch.setattr(
         main,
         "_maybe_capture_calendar_event",
-        lambda group_id, text, sender_user_id="": called.append(
-            (group_id, text, sender_user_id)
+        lambda group_id, text, sender_user_id="", message_id="": called.append(
+            (group_id, text, sender_user_id, message_id)
         ),
     )
 
@@ -516,7 +632,7 @@ def test_auto_capture_gate_accepts_weekday_chinese_time_dentist(monkeypatch):
     text = "星期四早上十點半看台大陳敏惠牙醫師"
     main._auto_capture_text_if_important("G1", text, "U_MOM")
 
-    assert called == [("G1", text, "U_MOM")]
+    assert called == [("G1", text, "U_MOM", "")]
 
 
 def test_medical_event_subjectless_defaults_to_sender_alias(
@@ -560,6 +676,12 @@ def test_personal_trip_first_person_defaults_to_sender_alias(
     """For family shorthand, '我' means the LINE message sender."""
     import main
     import calendar_extractor
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    event_date = (
+        datetime.now(ZoneInfo("Asia/Taipei")).date() + timedelta(days=1)
+    ).isoformat()
 
     monkeypatch.setattr(main, "_alias_from_user_id", lambda uid: "媽媽" if uid == "U_MOM" else "")
     monkeypatch.setattr(
@@ -569,7 +691,7 @@ def test_personal_trip_first_person_defaults_to_sender_alias(
             "has_event": True,
             "is_cancellation": False,
             "title": "我到高雄",
-            "date": "2026-06-21",
+            "date": event_date,
             "time": None,
             "location": "高雄",
             "participants": ["我(旅者)"],
@@ -578,7 +700,7 @@ def test_personal_trip_first_person_defaults_to_sender_alias(
         },
     )
 
-    main._maybe_capture_calendar_event("G1", "6/21 我到高雄", "U_MOM")
+    main._maybe_capture_calendar_event("G1", f"{event_date} 我到高雄", "U_MOM")
 
     events = tmp_calendar_db.list_upcoming("G1", days=30)
     assert len(events) == 1
@@ -678,14 +800,14 @@ def test_explicit_calendar_capture_passes_sender_user_id(monkeypatch):
     monkeypatch.setattr(
         main,
         "_maybe_capture_calendar_event",
-        lambda group_id, text, sender_user_id="": captured.append(
-            (group_id, text, sender_user_id)
+        lambda group_id, text, sender_user_id="", message_id="": captured.append(
+            (group_id, text, sender_user_id, message_id)
         ),
     )
 
     main._handle_explicit_text(FakeEvent(), "G1", "6/21 我到高雄")
 
-    assert captured == [("G1", "6/21 我到高雄", "U_MOM")]
+    assert captured == [("G1", "6/21 我到高雄", "U_MOM", "")]
 
 
 def test_calendar_capture_persists_second_event_when_model_returns_first_only(

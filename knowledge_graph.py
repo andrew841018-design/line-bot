@@ -332,16 +332,20 @@ _DB_PATH = Path(settings.sqlite_path)
 _lock = threading.Lock()
 
 
-def _conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(_DB_PATH, isolation_level=None, check_same_thread=False)
+def _db_path(db_path: Path | str | None = None) -> Path:
+    return Path(db_path) if db_path is not None else _DB_PATH
+
+
+def _conn(db_path: Path | str | None = None) -> sqlite3.Connection:
+    conn = sqlite3.connect(_db_path(db_path), isolation_level=None, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 
-def _ensure_table() -> None:
+def _ensure_table(db_path: Path | str | None = None) -> None:
     """確保 kg_triples table 存在（同 memory.py 那邊也會做一次，這裡是 defensive）。"""
-    with _lock, _conn() as c:
+    with _lock, _conn(db_path) as c:
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS kg_triples (
@@ -372,13 +376,15 @@ def store_triples(
     group_id: str,
     triples: list[tuple[str, str, str]],
     source_text: str = "",
+    db_path: Path | str | None = None,
 ) -> int:
     """寫入 kg_triples，回真正新增的筆數（PRIMARY KEY 衝突會 IGNORE）。"""
     if not triples:
         return 0
+    _ensure_table(db_path)
     now = int(_time.time())
     added = 0
-    with _lock, _conn() as c:
+    with _lock, _conn(db_path) as c:
         for s, r, o in triples:
             cur = c.execute(
                 "INSERT OR IGNORE INTO kg_triples"
@@ -442,12 +448,13 @@ def auto_extract_kg_async(group_id: str, text: str) -> None:
     """背景執行緒抽 + 寫，不阻塞 caller。失敗 silently swallow。"""
     if not group_id or not text:
         return
+    db_path = _DB_PATH
 
     def _run() -> None:
         try:
             triples = extract_triples(text)
             if triples:
-                store_triples(group_id, triples, source_text=text)
+                store_triples(group_id, triples, source_text=text, db_path=db_path)
         except Exception:
             # 永不阻塞主流程
             pass

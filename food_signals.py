@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import food_db
 
@@ -225,7 +226,12 @@ def extract(text: str) -> list[dict]:
     return unique
 
 
-def extract_and_store(group_id: str, source_msg_id: str, text: str) -> int:
+def extract_and_store(
+    group_id: str,
+    source_msg_id: str,
+    text: str,
+    db_path: Path | str | None = None,
+) -> int:
     """extract + 寫進 food_db.family_food。回新增筆數（dedup 不計）。"""
     if not group_id or not text:
         return 0
@@ -237,7 +243,7 @@ def extract_and_store(group_id: str, source_msg_id: str, text: str) -> int:
         try:
             if food_db.insert_signal(
                 group_id, s["kind"], s["food"],
-                source_msg_id=source_msg_id or "", source_text=text,
+                source_msg_id=source_msg_id or "", source_text=text, db_path=db_path,
             ):
                 n += 1
         except Exception as e:
@@ -252,10 +258,11 @@ def extract_and_store_async(group_id: str, source_msg_id: str, text: str) -> Non
     """背景執行緒抽 + 寫，永不阻塞 caller。失敗 silent。"""
     if not group_id or not text or not text.strip():
         return
+    db_path = food_db._DB_PATH
 
     def _run() -> None:
         try:
-            extract_and_store(group_id, source_msg_id, text)
+            extract_and_store(group_id, source_msg_id, text, db_path=db_path)
         except Exception:
             pass
 

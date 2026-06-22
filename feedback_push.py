@@ -15,13 +15,13 @@ import time
 
 from linebot.v3.messaging import (
     ApiClient,
-    Configuration,
     MessagingApi,
     PushMessageRequest,
     TextMessage,
 )
 
 import feedback_collector
+from line_push_client import line_access_token, line_configuration
 from config import settings
 
 logging.basicConfig(
@@ -35,6 +35,10 @@ _QUESTION = (
 )
 
 
+def _line_access_token() -> str:
+    return line_access_token()
+
+
 def _push(group_id: str, text: str, max_retries: int = 3) -> None:
     """推 feedback 問題到 LINE。
 
@@ -43,7 +47,7 @@ def _push(group_id: str, text: str, max_retries: int = 3) -> None:
       - 429：raise（不重試，caller 看 monthly quota 不可解）
       - 5xx / network：exponential backoff (1s/2s/4s) 重試
     """
-    cfg = Configuration(access_token=settings.line_channel_access_token)
+    cfg = line_configuration()
     last_exc: Exception | None = None
     for attempt in range(max_retries):
         try:

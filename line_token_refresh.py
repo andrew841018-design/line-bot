@@ -3,12 +3,12 @@
 設計：
 - v3 stateless token 15 分鐘到期；用 channel_id + channel_secret 隨時換新
 - 結果寫到 line_token_cache.json（被 .gitignore），不污染 .env
-- token_helper.get_line_token() 是統一入口，過期前 60 秒自動 refresh
+- line_push_client.line_access_token() 是 push 腳本統一入口，過期前 60 秒自動 refresh
 - launchd 也每 10 分鐘主動跑一次當保險
 - 沒設 LINE_CHANNEL_ID 就 fallback 用 .env 的 long-lived token（向後相容）
 
 使用：
-- main.py / 推播 script 改用 token_helper.get_line_token() 而非直接讀 settings
+- main.py / 推播 script 改用 line_push_client 而非直接讀 settings / .env token
 - 一次性設定：在 LINE Developer Console > Basic settings 複製 Channel ID（純數字），
   加到 .env：`LINE_CHANNEL_ID=1234567890`
 """
@@ -26,12 +26,13 @@ import requests
 from dotenv import load_dotenv
 
 BASE = Path(__file__).parent
-load_dotenv(BASE / ".env")
+if os.environ.get("LINE_BOT_DISABLE_DOTENV", "").lower() not in {"1", "true", "yes", "on"}:
+    load_dotenv(BASE / ".env")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-CACHE_FILE = BASE / "line_token_cache.json"
+CACHE_FILE = Path(os.environ.get("LINE_TOKEN_CACHE_FILE", str(BASE / "line_token_cache.json")))
 TOKEN_ENDPOINT = "https://api.line.me/oauth2/v3/token"
 EXPIRY_BUFFER_SEC = 60  # 提前 60 秒視為過期
 

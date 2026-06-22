@@ -16,12 +16,13 @@ import os
 import sys
 from pathlib import Path
 
-import requests
 from dotenv import load_dotenv
 
 BASE = Path(__file__).parent
 load_dotenv(BASE / ".env")
 sys.path.insert(0, str(BASE))
+
+from line_push_client import LinePushError, line_access_token, push_text  # noqa: E402
 
 PENDING_FILE = BASE / "pending_line_push.txt"
 GROUP_ID = os.environ.get("LINE_ALLOWED_GROUP_ID") or os.environ.get(
@@ -31,11 +32,7 @@ GROUP_ID = os.environ.get("LINE_ALLOWED_GROUP_ID") or os.environ.get(
 
 def _get_line_token() -> str:
     """v3 stateless 優先，fallback long-lived。"""
-    try:
-        from line_token_refresh import get_line_token
-        return get_line_token()
-    except Exception:
-        return os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+    return line_access_token()
 
 
 def _notify_discord(text: str) -> None:
@@ -63,20 +60,22 @@ def main() -> int:
         print("[line_bot_update_push] no LINE token", file=sys.stderr)
         return 1
     try:
-        r = requests.post(
-            "https://api.line.me/v2/bot/message/push",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            json={"to": GROUP_ID, "messages": [{"type": "text", "text": msg[:4900]}]},
-            timeout=15,
+        push_text(GROUP_ID, msg[:4900], timeout=15, fallback_token=token)
+    except LinePushError as e:
+        if e.status_code == 429:
+            # 月配額仍爆，明天再試
+            print("[line_bot_update_push] 429 monthly quota exhausted, retry tomorrow")
+            return 0
+        # 其他狀態
+        print(
+            f"[line_bot_update_push] HTTP {e.status_code or 'ERR'}: {e.response_text[:200]}",
+            file=sys.stderr,
         )
-    except Exception as e:
-        print(f"[line_bot_update_push] request exception: {e}", file=sys.stderr)
+        _notify_discord(
+            f"⚠️ LINE 群更新公告 push 失敗 HTTP {e.status_code or 'ERR'}：{e.response_text[:200]}"
+        )
         return 1
-
-    if r.status_code == 200:
+    else:
         # 成功 → 清空 pending、通知 Andrew
         PENDING_FILE.unlink(missing_ok=True)
         head = msg.split("\n", 1)[0][:80]
@@ -85,19 +84,6 @@ def main() -> int:
         )
         print(f"[line_bot_update_push] OK pushed, cleared {PENDING_FILE.name}")
         return 0
-    if r.status_code == 429:
-        # 月配額仍爆，明天再試
-        print("[line_bot_update_push] 429 monthly quota exhausted, retry tomorrow")
-        return 0  # 不算錯誤
-    # 其他狀態
-    print(
-        f"[line_bot_update_push] HTTP {r.status_code}: {r.text[:200]}",
-        file=sys.stderr,
-    )
-    _notify_discord(
-        f"⚠️ LINE 群更新公告 push 失敗 HTTP {r.status_code}：{r.text[:200]}"
-    )
-    return 1
 
 
 if __name__ == "__main__":

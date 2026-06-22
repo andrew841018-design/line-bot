@@ -37,6 +37,59 @@ def test_natural_sentence_creates_poll_with_all(family_poll_db):
     assert "可以 0 人" in out
 
 
+def test_explicit_message_creates_poll(family_poll_db):
+    out = family_poll_db.handle_explicit_message(
+        G,
+        "幫我做民調：今天晚上有誰可以去吃凱薩",
+        user_id=FATHER,
+        source_msg_id="m1",
+    )
+
+    assert out is not None
+    assert out.startswith("@all 民調開好了")
+    assert "今天晚上有誰可以去吃凱薩？" in out
+
+
+def test_explicit_message_closes_poll_with_natural_close_request(family_poll_db):
+    family_poll_db.create_poll(G, "今晚吃凱薩誰可以", user_id=FATHER)
+
+    out = family_poll_db.handle_explicit_message(
+        G,
+        "這民調可以關掉了？",
+        user_id=FATHER,
+        source_msg_id="m1",
+    )
+
+    assert out is not None
+    assert out.startswith("已關閉民調")
+    assert family_poll_db.get_active_poll(G) is None
+
+
+def test_explicit_message_close_request_without_active_poll(family_poll_db):
+    out = family_poll_db.handle_explicit_message(
+        G,
+        "關掉民調",
+        user_id=FATHER,
+        source_msg_id="m1",
+    )
+
+    assert out == "目前沒有進行中的民調可以關閉。"
+
+
+def test_explicit_message_does_not_capture_general_help_as_vote(family_poll_db):
+    family_poll_db.create_poll(G, "今晚吃凱薩誰可以", user_id=FATHER)
+
+    out = family_poll_db.handle_explicit_message(
+        G,
+        "可以幫我查一下天氣",
+        user_id=FATHER,
+        source_msg_id="m2",
+    )
+
+    assert out is None
+    assert family_poll_db.summarize_poll(family_poll_db.get_active_poll(G))["yes"] == []
+
+
 def test_sender_short_reply_updates_active_poll(family_poll_db):
     family_poll_db.handle_natural_message(
         G,
@@ -53,8 +106,28 @@ def test_sender_short_reply_updates_active_poll(family_poll_db):
     )
 
     assert out is not None
+    assert not out.startswith("已更新：")
     assert "爸爸 → 可以" in out
     assert "可以 1 人：爸爸" in out
+
+
+def test_unknown_sender_uses_display_name_not_user_code(family_poll_db):
+    unknown_user = "U0000000000000000000000000000462b"
+    family_poll_db.create_poll(G, "今晚吃凱薩誰可以", user_id=FATHER)
+
+    out = family_poll_db.handle_natural_message(
+        G,
+        "可以",
+        user_id=unknown_user,
+        sender_alias="王小明",
+        source_msg_id="m2",
+    )
+
+    assert out is not None
+    assert "王小明 → 可以" in out
+    assert "可以 1 人：王小明" in out
+    assert "成員462b" not in out
+    assert "0000462b" not in out
 
 
 def test_named_mixed_votes_in_one_message(family_poll_db):
@@ -73,6 +146,7 @@ def test_named_mixed_votes_in_one_message(family_poll_db):
     )
 
     assert out is not None
+    assert not out.startswith("已更新：")
     assert "媽媽 → 不行" in out
     assert "爸爸 → 可以" in out
     assert "可以 1 人：爸爸" in out

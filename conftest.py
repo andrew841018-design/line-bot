@@ -17,24 +17,58 @@ Without this, global state leaks between tests:
 """
 
 import os
+import importlib
 import pathlib
+import sqlite3
 import tempfile
+import time
+import warnings
+from pathlib import Path
 
 import pytest
+
+try:
+    from pydantic.warnings import PydanticDeprecatedSince212
+
+    warnings.filterwarnings(
+        "ignore",
+        message=(
+            r"Using `@model_validator` with mode='after' on a classmethod "
+            r"is deprecated\..*"
+        ),
+        category=PydanticDeprecatedSince212,
+        module=r"google\.genai\.types",
+    )
+except Exception:
+    pass
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"pkg_resources is deprecated as an API\..*",
+    category=UserWarning,
+    module=r"jieba\._compat",
+)
 
 os.environ.setdefault("LINE_CHANNEL_SECRET", "dummy_secret_32bytes_padding000")
 os.environ.setdefault("LINE_CHANNEL_ACCESS_TOKEN", "dummy")
 os.environ.setdefault("GEMINI_API_KEY", "dummy")
 os.environ.setdefault("GROK_API_KEY", "dummy")
 os.environ.setdefault("BOT_MUTED", "true")
+_ORIG_SQLITE_ENV = os.environ.get("SQLITE_PATH")
+_POST_TEST_SQLITE_PATH = Path(tempfile.gettempdir()) / (
+    f"line_bot_pytest_quarantine_{os.getpid()}.db"
+)
+os.environ["SQLITE_PATH"] = str(_POST_TEST_SQLITE_PATH)
 
 # PySpark needs to know the venv Python (system Python default breaks Java workers)
 import sys as _sys
 os.environ.setdefault("PYSPARK_PYTHON", _sys.executable)
 os.environ.setdefault("PYSPARK_DRIVER_PYTHON", _sys.executable)
 
+import config  # noqa: E402
 import finance_view_db  # noqa: E402
 import main  # noqa: E402
+import memory  # noqa: E402
 import pending_store  # noqa: E402
 
 # Snapshot originals once at import time (before any test runs)
@@ -43,6 +77,7 @@ _ORIG_PENDING_PATH = main._PENDING_EXPLICIT_PATH
 _ORIG_PENDING_STORE_PATH = pending_store.PENDING_PATH
 _ORIG_PENDING_STORE_LOCK = pending_store.LOCK_PATH
 _ORIG_BOT_MUTED = main.settings.bot_muted
+_ORIG_PENDING_REPLY_ENABLED = main._PENDING_REPLY_ENABLED
 _ORIG_ALLOWED_GROUP_ID = main.settings.allowed_group_id
 # 2026-05-27 multi-group: tests 用 main.settings.allowed_group_id = "GRP001" 設 gate target，
 # 但 webhook gate 讀 settings.allowed_group_ids（computed_field）。當 raw 從 env 載入非空時，
@@ -50,6 +85,75 @@ _ORIG_ALLOWED_GROUP_ID = main.settings.allowed_group_id
 # Fix: 每個 test setup 把 allowed_group_ids_raw 暫時清空，computed 走 singular fallback。
 _ORIG_ALLOWED_GROUP_IDS_RAW = main.settings.allowed_group_ids_raw
 _ORIG_FV_DB_PATH = finance_view_db._DB_PATH
+_ORIG_MEMORY_DB_PATH = memory._DB_PATH
+
+_SQLITE_MODULE_NAMES = (
+    "memory",
+    "calendar_db",
+    "embedding_recall",
+    "todo",
+    "finance_view_db",
+    "food_db",
+    "family_poll",
+    "anniversary",
+    "knowledge_graph",
+    "message_classifier",
+)
+
+
+def _sqlite_sidecar_paths(db_path: Path) -> tuple[str, str, str]:
+    return (str(db_path), f"{db_path}-wal", f"{db_path}-shm")
+
+
+def _configure_sqlite_module(module_name: str, db_path: Path) -> None:
+    module = importlib.import_module(module_name)
+    if hasattr(module, "_DB_PATH"):
+        module._DB_PATH = db_path
+
+    if module_name == "memory":
+        init = module._init_db
+    elif module_name == "knowledge_graph":
+        if not hasattr(module, "_ensure_table"):
+            return
+        init = module._ensure_table
+    elif module_name == "message_classifier":
+        if not hasattr(module, "ensure_schema"):
+            return
+        module._SCHEMA_ENSURED = False
+        if hasattr(module, "_SCHEMA_ENSURED_PATHS"):
+            module._SCHEMA_ENSURED_PATHS.clear()
+        init = lambda: module.ensure_schema(db_path)
+    elif hasattr(module, "init_db"):
+        init = module.init_db
+    else:
+        return
+
+    for attempt in range(8):
+        try:
+            init()
+            return
+        except sqlite3.OperationalError as e:
+            if "database is locked" not in str(e).lower() or attempt == 7:
+                raise
+            time.sleep(0.05 * (attempt + 1))
+
+
+def _configure_test_sqlite(db_path: Path) -> None:
+    os.environ["SQLITE_PATH"] = str(db_path)
+    config.settings.sqlite_path = str(db_path)
+    main.settings.sqlite_path = str(db_path)
+    for module_name in _SQLITE_MODULE_NAMES:
+        _configure_sqlite_module(module_name, db_path)
+
+
+def _restore_sqlite_paths() -> None:
+    """After a test, never point async-capable modules back at production DB.
+
+    Background daemon threads/executors may still run after fixture teardown.
+    Keeping module globals on a quarantine DB makes future missed async writers
+    fail safe instead of writing through to the real line_bot.db.
+    """
+    _configure_test_sqlite(_POST_TEST_SQLITE_PATH)
 
 
 @pytest.fixture(autouse=True)
@@ -65,19 +169,19 @@ def reset_main_globals():
     tmp_pending_path = pathlib.Path(tmp_pending.name)
     tmp_pending_lock = pathlib.Path(tmp_pending.name + ".lock")
 
-    tmp_fv = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-    tmp_fv.close()
-    tmp_fv_path = pathlib.Path(tmp_fv.name)
+    tmp_app_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp_app_db.close()
+    tmp_app_db_path = Path(tmp_app_db.name)
 
     # ── before ────────────────────────────────────────────────────────────
+    _configure_test_sqlite(tmp_app_db_path)
     main._quota_exhausted_until_ts = 0.0
     main._quota_notified_for_ts = 0.0
+    main._PENDING_REPLY_ENABLED = _ORIG_PENDING_REPLY_ENABLED
     main._PENDING_EXPLICIT_PATH = str(tmp_pending_path)
     main._QUOTA_STATE_FILE = tmp_quota_path  # isolate file I/O
     pending_store.PENDING_PATH = tmp_pending_path  # 防 production pending 被寫穿
     pending_store.LOCK_PATH = tmp_pending_lock
-    finance_view_db._DB_PATH = tmp_fv_path  # 防 production line_bot.db 被寫穿
-    finance_view_db.init_db()  # 在 temp DB 建 schema
     main.settings.bot_muted = True
     main.settings.allowed_group_id = _ORIG_ALLOWED_GROUP_ID
     main.settings.allowed_group_ids_raw = ""  # 清空讓 computed 走 singular fallback
@@ -87,16 +191,22 @@ def reset_main_globals():
     # ── after ─────────────────────────────────────────────────────────────
     main._quota_exhausted_until_ts = 0.0
     main._quota_notified_for_ts = 0.0
+    main._PENDING_REPLY_ENABLED = _ORIG_PENDING_REPLY_ENABLED
     main._PENDING_EXPLICIT_PATH = _ORIG_PENDING_PATH
     main._QUOTA_STATE_FILE = _ORIG_QUOTA_STATE_FILE
     pending_store.PENDING_PATH = _ORIG_PENDING_STORE_PATH
     pending_store.LOCK_PATH = _ORIG_PENDING_STORE_LOCK
-    finance_view_db._DB_PATH = _ORIG_FV_DB_PATH
+    _restore_sqlite_paths()
     main.settings.bot_muted = _ORIG_BOT_MUTED
     main.settings.allowed_group_id = _ORIG_ALLOWED_GROUP_ID
     main.settings.allowed_group_ids_raw = _ORIG_ALLOWED_GROUP_IDS_RAW
 
-    for p in (tmp_quota_path, tmp_pending.name, str(tmp_pending_lock), str(tmp_fv_path)):
+    for p in (
+        tmp_quota_path,
+        tmp_pending.name,
+        str(tmp_pending_lock),
+        *_sqlite_sidecar_paths(tmp_app_db_path),
+    ):
         try:
             os.unlink(p)
         except FileNotFoundError:

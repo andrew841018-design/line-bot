@@ -20,13 +20,12 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import requests  # noqa: E402
 from bs4 import BeautifulSoup  # noqa: E402
+from line_push_client import line_access_token, try_push_text  # noqa: E402
 
 GROUP_ID = os.environ.get("LINE_ALLOWED_GROUP_ID") or os.environ.get(
     "ALLOWED_GROUP_ID", ""
 )
-TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 
-_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 _STATE_FILE = Path(__file__).parent / "alert_state.json"
 
 # 台灣周邊地理範圍
@@ -48,16 +47,8 @@ def _save_state(state: dict) -> None:
     _STATE_FILE.write_text(json.dumps(state, ensure_ascii=False))
 
 
-def _push(text: str) -> None:
-    requests.post(
-        _PUSH_URL,
-        headers={
-            "Authorization": f"Bearer {TOKEN}",
-            "Content-Type": "application/json",
-        },
-        json={"to": GROUP_ID, "messages": [{"type": "text", "text": text[:5000]}]},
-        timeout=10,
-    )
+def _push(text: str) -> bool:
+    return try_push_text(GROUP_ID, text, timeout=10)
 
 
 def _fetch_earthquakes() -> list[dict]:
@@ -125,14 +116,15 @@ def _fetch_typhoon() -> list[dict]:
         return []
 
 
-def main() -> None:
-    if not GROUP_ID or not TOKEN:
+def main() -> int:
+    if not GROUP_ID or not line_access_token():
         print("ERR: LINE_ALLOWED_GROUP_ID or LINE_CHANNEL_ACCESS_TOKEN not set")
-        return
+        return 1
 
     state = _load_state()
     pushed_ids: list[str] = state.get("pushed_ids", [])
     new_pushed: list[str] = []
+    push_failed = False
 
     all_alerts = _fetch_earthquakes() + _fetch_typhoon()
 
@@ -140,9 +132,12 @@ def main() -> None:
         aid = alert["id"]
         if aid in pushed_ids:
             continue
-        _push(alert["text"])
-        new_pushed.append(aid)
-        print(f"推播警示：{alert['text'][:60]}")
+        if _push(alert["text"]):
+            new_pushed.append(aid)
+            print(f"推播警示：{alert['text'][:60]}")
+        else:
+            push_failed = True
+            print(f"推播警示失敗，保留待下次重試：{alert['text'][:60]}", file=sys.stderr)
         time.sleep(0.5)
 
     if new_pushed:
@@ -150,7 +145,8 @@ def main() -> None:
         _save_state({"pushed_ids": all_ids})
     else:
         print("無新警示")
+    return 1 if push_failed else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -27,10 +27,17 @@ _FAMILY_KW = re.compile(
     r"牙醫|東海|校友|美僑|六福萬怡|"
     r"拿(?:蛋糕|藥|包裹|貨|餐|禮物|花)|"
     r"接(?:爸|媽|妹|弟|姊|爺爺|奶奶|小孩|小朋友)|"
+    r"接送|接機|機場接送|機場|搭機|打球|羽球|洗牙|預約|"
     r"陪(?:爸|媽|妹|弟|姊|爺爺|奶奶|看醫生)|"
     r"喜來登|"
     r"回(?:家|老家)|"
     r"婚禮|喜宴|滿月|彌月)"
+)
+
+_FAMILY_ACTION_HINT = re.compile(
+    r"(?:聚餐|聚會|活動|看醫生|看病|洗牙|預約|領|拿|接送|接機|機場|打球|"
+    r"到|回台北|回台中|回高雄|回老家|去|帶|送|領藥|參加|"
+    r"全家|爸爸|媽媽|姊姊|妹妹|弟弟|蛋糕|生日)"
 )
 
 # Plan C：三類 event_type 分類規則（醫療 > 個人旅程 > 家族聚會，medical 最先因更具體）
@@ -71,8 +78,8 @@ def _classify_type(title: str) -> str | None:
         return "family_gathering"
     return None
 
-# HH:MM — validated 00:00 to 23:59
-_TIME = r"(?:[01]?\d|2[0-3]):[0-5]\d"
+# HH:MM 或 HHMM — validated 00:00 to 23:59（支援「1430」、「08:30」）
+_TIME = r"(?:[01]?\d|2[0-3])(?::[0-5]\d|[0-5]\d)"
 _CHINESE_NUM = r"[零〇一二兩三四五六七八九十]{1,3}"
 _CHINESE_TIME = (
     rf"(?:(?:\d{{1,2}}|{_CHINESE_NUM})\s*點"
@@ -228,7 +235,14 @@ def _parse_time(raw_time: str, daypart: str | None = None) -> str | None:
     raw_time = re.sub(r"\s+", "", raw_time)
     m = re.fullmatch(_TIME, raw_time)
     if m:
-        hour_s, minute_s = raw_time.split(":", 1)
+        if ":" in raw_time:
+            hour_s, minute_s = raw_time.split(":", 1)
+        elif len(raw_time) == 3:
+            hour_s, minute_s = raw_time[:-2], raw_time[-2:]
+        elif len(raw_time) == 4:
+            hour_s, minute_s = raw_time[:2], raw_time[2:4]
+        else:
+            return None
         hour, minute = int(hour_s), int(minute_s)
     else:
         m = re.fullmatch(
@@ -361,13 +375,29 @@ def _strip_date_prefix(segment: str) -> str:
 
 
 def _extract_location(segment_body: str) -> str | None:
+    # 避免在「現在大漲」這類句子誤命中「在」作為關鍵字。
+    # 僅接受句首或「空白/標點」前綴後的「在/地點」。
     m = re.search(
-        rf"(?:在|地點[:：])\s*(.+?)(?={_DAYPART}|{_TIME}|$|。|，|；|;)",
+        rf"(?:^|[\s，、。；；：()（）])(?:在|地點[:：])\s*(.+?)(?={_DAYPART}|{_TIME}|$|。|，|；|;)",
         segment_body,
     )
     if not m:
+        # 「校友會在美僑俱樂部」前面不是標點，但後面明顯是場地；
+        # 保守開 fallback，避免把「現在大漲」這類一般文字當 location。
+        m = re.search(
+            rf"在\s*(.+?)(?={_DAYPART}|{_TIME}|$|。|，|；|;)",
+            segment_body,
+        )
+        if m and not re.search(
+            r"美僑|六福萬怡|俱樂部|酒店|飯店|餐廳|醫院|診所|會館|會議室|"
+            r"廳|樓|館|中心|機場|車站|火車站|捷運站",
+            m.group(1),
+        ):
+            m = None
+    if not m:
         return None
     location = re.sub(r"[（(][^）)]*$", "", m.group(1)).strip(" ，。；;、")
+    location = re.sub(r"(?:聚會|活動|集合)$", "", location).strip(" ，。；;、")
     return location[:120] if location else None
 
 
@@ -383,11 +413,17 @@ def _title_for_fragment(segment_body: str, location: str | None, combined_text: 
         return f"{location}活動"[:30]
     raw = re.sub(_TIME_RANGE_IN_TEXT, "", segment_body)
     raw = re.sub(_TIME_IN_TEXT, "", raw)
-    raw = re.sub(r"^(?:以及|和|並且|、|，|,)", "", raw).strip()
+    raw = re.sub(r"^(?:以及|和|並且|、|，|,|的)", "", raw).strip()
     return _sanitize_title(raw or "行程")
 
 
-def _fragment_event(segment: str, today_tw: date, combined_text: str) -> dict | None:
+def _fragment_event(
+    segment: str,
+    today_tw: date,
+    combined_text: str,
+    *,
+    require_time: bool = True,
+) -> dict | None:
     token_match = _DATE_PREFIX.match(segment.strip())
     if not token_match:
         return None
@@ -397,23 +433,36 @@ def _fragment_event(segment: str, today_tw: date, combined_text: str) -> dict | 
     body = _strip_date_prefix(segment)
     time_str = _first_time_in_text(body)
     if not time_str:
-        return None
+        if require_time:
+            return None
+        time_str = None
     location = _extract_location(body)
     title = _title_for_fragment(body, location, combined_text)
     et = _classify_type(f"{title} {body} {combined_text}")
     if not et:
+        return None
+    if et == "family_gathering" and not location and not _FAMILY_ACTION_HINT.search(title):
         return None
     ev = _make_event(title, target.isoformat(), time_str, et)
     ev["location"] = location
     return ev
 
 
-def extract_many_regex_only(combined_text: str, today_tw: date) -> list[dict]:
+def extract_many_regex_only(
+    combined_text: str,
+    today_tw: date,
+    require_time: bool = True,
+) -> list[dict]:
     """Extract multiple explicit date/time events from one message.
 
-    This is intentionally conservative: every fragment must have its own date
-    and time. It is used as a backstop when model extraction persists only the
-    first event in a multi-event LINE message.
+    This is intentionally conservative:
+    - default: every fragment must have its own date and time.
+    - require_time=False: allow date-only fragments and keep time as None,
+      used by reminder backfill/event sync workflows where missing time should
+      still become a valid midnight reminder/event.
+
+    It is used as a backstop when model extraction persists only the first
+    event in a multi-event LINE message.
     """
     if not combined_text or not combined_text.strip():
         return []
@@ -426,7 +475,7 @@ def extract_many_regex_only(combined_text: str, today_tw: date) -> list[dict]:
     for idx, match in enumerate(matches):
         end = matches[idx + 1].start() if idx + 1 < len(matches) else len(combined_text)
         segment = combined_text[match.start():end]
-        ev = _fragment_event(segment, today_tw, combined_text)
+        ev = _fragment_event(segment, today_tw, combined_text, require_time=require_time)
         if ev:
             events.append(ev)
 
