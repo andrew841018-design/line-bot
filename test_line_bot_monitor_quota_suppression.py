@@ -130,7 +130,7 @@ def test_alert_cooldown_is_per_issue_type(monkeypatch):
     assert due_keys == [monitor._alert_issue_key(second)]
 
 
-def test_quota_autofix_failure_sends_discord(monkeypatch):
+def test_quota_exhausted_does_not_probe_or_autofix(monkeypatch):
     monitor = _load_monitor(monkeypatch)
     saved = _stub_healthy_environment(
         monkeypatch,
@@ -143,6 +143,8 @@ def test_quota_autofix_failure_sends_discord(monkeypatch):
         },
     )
     messages = []
+    probe_calls = []
+    autofix_calls = []
 
     monkeypatch.setattr(
         monitor,
@@ -152,17 +154,17 @@ def test_quota_autofix_failure_sends_discord(monkeypatch):
     monkeypatch.setattr(
         monitor,
         "probe_gemini",
-        lambda model: (False, "quota exhausted"),
+        lambda model: probe_calls.append(model) or (False, "quota exhausted"),
     )
     monkeypatch.setattr(
         monitor,
         "attempt_auto_fix",
-        lambda: (False, "wait_health_timeout"),
+        lambda: autofix_calls.append(1) or (False, "wait_health_timeout"),
     )
     monkeypatch.setattr(monitor, "send_dm", lambda msg: messages.append(msg) or True)
 
     assert monitor.main() == 0
-    assert messages
-    assert "Gemini lite 爆 quota 自修失敗" in messages[0]
-    assert saved.get("last_alert_ts", 0) > 0
-    assert saved.get("alert_issue_ts")
+    assert probe_calls == []
+    assert autofix_calls == []
+    assert messages == []
+    assert saved.get("last_alert_ts", 0) == 0

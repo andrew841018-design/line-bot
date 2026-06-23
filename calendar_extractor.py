@@ -120,13 +120,24 @@ def extract(combined_text: str) -> dict:
                     temperature=0.1,
                 ),
             )
+            gemini_client._track_usage(resp)
+        except Exception as e:
+            gemini_client._track_failed_request()
+            err = str(e)
+            logger.warning(
+                "calendar extract failed (%s): %s", model_name, err[:200]
+            )
+            # 兩個 model 都試完才走 regex fallback；不論 429 or 非 429 都 try 下個。
+            continue
+        try:
             text = _strip_code_fence(resp.text or "")
             data = json.loads(text)
             return _normalize(data)
         except Exception as e:
             err = str(e)
-            logger.warning("calendar extract failed (%s): %s", model_name, err[:200])
-            # 兩個 model 都試完才走 regex fallback；不論 429 or 非 429 都 try 下個。
+            logger.warning(
+                "calendar extract parse failed (%s): %s", model_name, err[:200]
+            )
             continue
 
     # Gemini 兩 model 都 fail → 純 regex fallback（family keyword whitelist 防誤判）

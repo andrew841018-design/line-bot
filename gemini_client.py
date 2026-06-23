@@ -1362,13 +1362,16 @@ def _lite_or_main(prompt, config=None):
     任何「次要」呼叫（分類、feedback 掃描等）都該走這條路徑，避免 lite 爆時整支 die。
     """
     try:
-        return _client.models.generate_content(
+        response = _client.models.generate_content(
             model=settings.gemini_light_model,
             contents=prompt,
             config=config,
         )
+        _track_usage(response)
+        return response
     except Exception as e:
         err = str(e)
+        _track_failed_request()
         is_429 = "429" in err or "RESOURCE_EXHAUSTED" in err
         if is_429 and settings.gemini_light_model != settings.gemini_model:
             logger.warning(
@@ -1376,11 +1379,17 @@ def _lite_or_main(prompt, config=None):
                 settings.gemini_light_model,
                 settings.gemini_model,
             )
-            return _client.models.generate_content(
-                model=settings.gemini_model,
-                contents=prompt,
-                config=config,
-            )
+            try:
+                response = _client.models.generate_content(
+                    model=settings.gemini_model,
+                    contents=prompt,
+                    config=config,
+                )
+                _track_usage(response)
+                return response
+            except Exception:
+                _track_failed_request()
+                raise
         raise
 
 

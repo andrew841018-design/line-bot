@@ -1,7 +1,7 @@
 """Reply-token reminder behavior tests.
 
-Reminders must be delivered by their scheduled jobs, not piggybacked onto an
-unrelated user message.
+Due reminders are still delivered by scheduled jobs first, but can also
+piggyback on ordinary group reply tokens when LINE push quota is exhausted.
 """
 
 from __future__ import annotations
@@ -27,10 +27,10 @@ def tmp_cal_db(tmp_path, monkeypatch):
     return calendar_db
 
 
-def test_reply_does_not_bundle_calendar_reminder_on_user_message(
+def test_reply_bundles_calendar_reminder_on_user_message(
     tmp_cal_db, monkeypatch
 ):
-    """家人普通發言時，_reply 不應把 calendar reminder 塞進同一個 reply。"""
+    """家人普通發言時，_reply 可把 due calendar reminder 塞進同一個 reply。"""
     GID = "G1"
     today = date.today()
     tomorrow = (today + timedelta(days=1)).isoformat()
@@ -83,15 +83,17 @@ def test_reply_does_not_bundle_calendar_reminder_on_user_message(
     # 跑 reply
     main._reply("fake_reply_token", "嗨", group_id=GID)
 
-    msgs = captured.get("messages", [])
-    assert [m.text for m in msgs] == ["嗨"]
+    texts = [m.text for m in captured.get("messages", [])]
+    assert texts[0] == "嗨"
+    assert len(texts) == 2
+    assert "拿生日蛋糕" in texts[1]
 
-    # scheduled event_reminder.py 仍會在原本時間處理；普通 reply 不能提前 mark。
+    # reply 成功後才 mark，避免 scheduled job 重複推同一階段。
     with tmp_cal_db._conn() as c:
         row = c.execute(
             "SELECT reminded_1d FROM events WHERE event_id=?", (eid,),
         ).fetchone()
-    assert row[0] is None
+    assert row[0] is not None
 
 
 def test_piggyback_not_marked_on_reply_failure(tmp_cal_db, monkeypatch):
@@ -255,8 +257,8 @@ def test_reply_ambiguous_failure_does_not_fallback_push(monkeypatch):
     assert ids == ["M1"]
 
 
-def test_fast_path_does_not_use_reply_token_for_reminder_push(monkeypatch):
-    """Normal text messages must not carry due reminder_push items."""
+def test_fast_path_uses_reply_token_for_reminder_push(monkeypatch):
+    """Normal text messages can carry due reminder_push items."""
     import main
     from linebot.v3.messaging import (
         MentionSubstitutionObject,
@@ -322,10 +324,12 @@ def test_fast_path_does_not_use_reply_token_for_reminder_push(monkeypatch):
     monkeypatch.setattr(main, "MessagingApi", _FakeMessagingApi)
     monkeypatch.setattr(main, "_get_line_config", lambda: None)
 
-    assert main._try_piggyback_reminders_fast_path("reply-token", "G1") is False
+    assert main._try_piggyback_reminders_fast_path("reply-token", "G1") is True
 
-    assert captured == {}
-    assert marked == []
+    assert captured["reply_token"] == "reply-token"
+    assert len(captured["messages"]) == 1
+    assert captured["messages"][0].text.startswith("{target}\n⏰ 提醒（明天）")
+    assert marked == [(21, "3d")]
 
 
 def test_reply_success_commits_pending_piggyback(monkeypatch):
@@ -369,7 +373,7 @@ def test_reply_success_commits_pending_piggyback(monkeypatch):
     assert pending_store.load().get("G1", []) == []
 
 
-def test_reply_does_not_bundle_reminder_push_piggyback(monkeypatch):
+def test_reply_bundles_reminder_push_piggyback(monkeypatch):
     import main
     import pending_store
     import reminder_push
@@ -426,8 +430,11 @@ def test_reply_does_not_bundle_reminder_push_piggyback(monkeypatch):
 
     main._reply("fake_token", "primary reply", group_id="G1")
 
-    assert captured["texts"] == ["primary reply"]
-    assert marked == []
+    assert captured["texts"] == [
+        "primary reply",
+        "⏰ 提醒（明天）\n2026-06-02 00:00 去看醫生",
+    ]
+    assert marked == [(6, "1d")]
 
 
 def test_reply_failure_does_not_mark_reminder_push_piggyback(monkeypatch):

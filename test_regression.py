@@ -506,6 +506,254 @@ def test_bug10_explicit_quota_miss_suppresses_without_pending():
     assert pending == []
 
 
+def test_quota_saver_side_task_gate_reserves_main_reply_requests(monkeypatch):
+    monkeypatch.setattr(main, "_quota_exhausted", lambda: False)
+    monkeypatch.setattr(
+        main.gemini_client,
+        "get_gemini_quota_info",
+        lambda: {
+            "used_tokens": 1000,
+            "limit_tokens": 1_000_000,
+            "used_requests": 12,
+            "limit_requests": 20,
+            "used_thinking_tokens": 0,
+        },
+    )
+
+    assert not main._gemini_side_task_allowed("test_side_task")
+
+
+def test_quota_saver_fact_extract_skips_before_counter_bump(monkeypatch):
+    bump = MagicMock()
+    extract = MagicMock()
+
+    monkeypatch.setattr(main, "_gemini_side_task_allowed", lambda reason: False)
+    monkeypatch.setattr(main.memory, "bump_and_should_extract", bump)
+    monkeypatch.setattr(main.gemini_client, "extract_facts", extract)
+
+    main._maybe_extract_facts("GRP001")
+
+    bump.assert_not_called()
+    extract.assert_not_called()
+
+
+def test_quota_saver_calendar_capture_uses_regex_path_without_gemini(monkeypatch):
+    import calendar_db
+    import calendar_extractor
+
+    inserted: list[dict] = []
+
+    def fake_extract_many(text, primary=None):
+        assert primary is not None
+        assert primary["has_event"] is False
+        return {
+            "is_cancellation": False,
+            "cancel_target_keyword": None,
+            "date": None,
+            "time": None,
+            "events": [
+                {
+                    "has_event": True,
+                    "title": "預約羽球場",
+                    "date": "2099-07-05",
+                    "time": "18:00",
+                    "location": None,
+                    "participants": [],
+                    "event_type": "family_gathering",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(main, "_gemini_side_task_allowed", lambda reason: False)
+    monkeypatch.setattr(
+        calendar_extractor,
+        "extract",
+        MagicMock(side_effect=AssertionError("Gemini calendar extractor called")),
+    )
+    monkeypatch.setattr(calendar_extractor, "extract_many", fake_extract_many)
+    monkeypatch.setattr(
+        calendar_db,
+        "insert_event",
+        lambda **kw: inserted.append(kw) or 42,
+    )
+
+    main._maybe_capture_calendar_event(
+        "GRP001", "6/28 18:00 預約7/5羽球場地", "USR001", "MSG001"
+    )
+
+    assert inserted
+    assert inserted[0]["title"] == "預約羽球場"
+
+
+def test_quota_saver_reminder_uses_regex_without_gemini(monkeypatch):
+    saved: list[tuple] = []
+
+    monkeypatch.setattr(main, "_gemini_side_task_allowed", lambda reason: False)
+    monkeypatch.setattr(
+        main.gemini_client,
+        "extract_reminder",
+        MagicMock(side_effect=AssertionError("Gemini reminder extractor called")),
+    )
+    monkeypatch.setattr(
+        main,
+        "_calendar_regex_to_reminder_result",
+        lambda text, today, user_id: {
+            "action": "預約羽球場",
+            "year": 2099,
+            "month": 7,
+            "day": 5,
+            "hour": 18,
+            "minute": 0,
+            "mention_aliases": [],
+        },
+    )
+    monkeypatch.setattr(
+        main.memory,
+        "add_reminder",
+        lambda *args, **kwargs: saved.append((args, kwargs)) or 7,
+    )
+
+    main._maybe_extract_reminder(
+        "6/28 18:00 記得預約7/5羽球場地", "GRP001", "USR001", "MSG001"
+    )
+
+    assert saved
+    assert saved[0][0][2] == "預約羽球場"
+
+
+def test_quota_saver_classifier_is_rule_only_by_default(monkeypatch):
+    import message_classifier
+
+    main.settings.allowed_group_id = "GRP001"
+    main.settings.bot_muted = False
+    evt = _make_text_event(text="這是一則普通閒聊，沒有明確分類詞")
+    updated: list[str] = []
+
+    monkeypatch.delenv("GEMINI_CLASSIFIER_FALLBACK_ENABLED", raising=False)
+
+    with (
+        patch("main.feedback_collector.in_feedback_window", return_value=False),
+        patch("main._try_one_shot_reply", return_value=False),
+        patch("main._try_handle_calendar_correction", return_value=False),
+        patch("main._detect_user_correction"),
+        patch("main._auto_capture_text_if_important"),
+        patch("main._maybe_extract_reminder"),
+        patch("message_classifier.classify_async") as mock_async,
+        patch(
+            "message_classifier.update_category",
+            side_effect=lambda group_id, message_id, category: updated.append(category),
+        ),
+        patch("main._handle_command", return_value=None),
+        patch("main._is_dinner_question", return_value=False),
+        patch("main._extract_gemini_trigger", return_value=None),
+        patch("main.burst_filter.add_to_burst"),
+    ):
+        main._handle_text_message(evt, "GRP001")
+
+    mock_async.assert_not_called()
+    assert updated == [message_classifier.DEFAULT_CATEGORY]
+
+
+def test_quota_exhausted_llm_chat_uses_direct_local_when_lite_misses(monkeypatch):
+    import sys
+    import types
+
+    fake_lite = types.ModuleType("lite_reply")
+    fake_lite.lite_reply = lambda text, context=None: None
+
+    local_calls: list[dict] = []
+    fake_local = types.ModuleType("local_llm")
+
+    def fake_local_chat(text, context=None, system_prompt="", max_tokens=0):
+        local_calls.append({
+            "text": text,
+            "context": context,
+            "system_prompt": system_prompt,
+            "max_tokens": max_tokens,
+        })
+        return "本機模型回覆"
+
+    fake_local.chat = fake_local_chat
+    monkeypatch.setitem(sys.modules, "lite_reply", fake_lite)
+    monkeypatch.setitem(sys.modules, "local_llm", fake_local)
+    monkeypatch.setattr(main, "_quota_exhausted", lambda: True)
+
+    out = main._llm_chat(
+        "買房子的錢阿婆有出一部分要怎麼處理",
+        [("user", "前文")],
+        [],
+        [],
+    )
+
+    assert "本機模型回覆" in out
+    assert "local LLM fallback" in out
+    assert local_calls
+    assert local_calls[0]["context"] == [("user", "前文")]
+    assert local_calls[0]["max_tokens"] == 360
+
+
+def test_quota_exhausted_llm_chat_rechecks_gemini_before_local(monkeypatch):
+    import time
+
+    main._quota_exhausted_until_ts = time.time() + 3600
+    main._quota_last_probe_ts = 0.0
+    monkeypatch.setattr(main, "_GEMINI_QUOTA_RECHECK_INTERVAL_SEC", 1800)
+    monkeypatch.setattr(main, "_save_quota_state", lambda: None)
+    monkeypatch.setattr(main.gemini_client, "chat", lambda *a, **kw: "Gemini 回覆")
+
+    out = main._llm_chat("你好", [], [], [])
+
+    assert out == "Gemini 回覆"
+    assert main._quota_exhausted_until_ts == 0.0
+    assert main._quota_notified_for_ts == 0.0
+    assert main._quota_last_probe_ts > 0
+
+
+def test_quota_exhausted_llm_chat_recheck_429_falls_back_local(monkeypatch):
+    import time
+
+    marked: list[bool] = []
+    main._quota_exhausted_until_ts = time.time() + 3600
+    main._quota_last_probe_ts = 0.0
+    monkeypatch.setattr(main, "_GEMINI_QUOTA_RECHECK_INTERVAL_SEC", 1800)
+    monkeypatch.setattr(main, "_save_quota_state", lambda: None)
+    monkeypatch.setattr(
+        main.gemini_client,
+        "chat",
+        MagicMock(side_effect=Exception("429 RESOURCE_EXHAUSTED PerDay")),
+    )
+    monkeypatch.setattr(main, "_mark_quota_exhausted", lambda: marked.append(True))
+    monkeypatch.setattr(main, "_local_text_llm_fallback", lambda *a, **kw: "local 回覆")
+
+    out = main._llm_chat("你好", [], [], [])
+
+    assert out == "local 回覆"
+    assert marked == [True]
+    assert main._quota_last_probe_ts > 0
+
+
+def test_quota_exhausted_startup_prewarms_local_llm(monkeypatch):
+    started: list[dict] = []
+
+    class FakeThread:
+        def __init__(self, target, daemon=False, name=""):
+            started.append({"target": target, "daemon": daemon, "name": name})
+
+        def start(self):
+            started[-1]["started"] = True
+
+    monkeypatch.setattr(main, "_local_text_prewarm_started", False)
+    monkeypatch.setattr(main, "_quota_exhausted", lambda: True)
+    monkeypatch.setattr(main.threading, "Thread", FakeThread)
+
+    main._prewarm_local_text_llm_if_needed()
+
+    assert started
+    assert started[0]["daemon"] is True
+    assert started[0]["name"] == "local-llm-prewarm"
+    assert started[0]["started"] is True
+
+
 # ── Bug 7 ─────────────────────────────────────────────────────────────────────
 
 

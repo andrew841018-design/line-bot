@@ -67,6 +67,7 @@ os.environ.setdefault("PYSPARK_DRIVER_PYTHON", _sys.executable)
 
 import config  # noqa: E402
 import finance_view_db  # noqa: E402
+import gemini_client  # noqa: E402
 import main  # noqa: E402
 import memory  # noqa: E402
 import pending_store  # noqa: E402
@@ -86,6 +87,7 @@ _ORIG_ALLOWED_GROUP_ID = main.settings.allowed_group_id
 _ORIG_ALLOWED_GROUP_IDS_RAW = main.settings.allowed_group_ids_raw
 _ORIG_FV_DB_PATH = finance_view_db._DB_PATH
 _ORIG_MEMORY_DB_PATH = memory._DB_PATH
+_ORIG_GEMINI_USAGE_FILE = gemini_client._USAGE_FILE
 
 _SQLITE_MODULE_NAMES = (
     "memory",
@@ -162,6 +164,9 @@ def reset_main_globals():
     tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
     tmp.close()
     tmp_quota_path = tmp.name
+    tmp_usage = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+    tmp_usage.write(b'{"date":"pytest","tokens":0,"requests":0}')
+    tmp_usage.close()
 
     tmp_pending = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
     tmp_pending.write(b"{}")
@@ -177,6 +182,8 @@ def reset_main_globals():
     _configure_test_sqlite(tmp_app_db_path)
     main._quota_exhausted_until_ts = 0.0
     main._quota_notified_for_ts = 0.0
+    main._quota_last_probe_ts = 0.0
+    gemini_client._USAGE_FILE = tmp_usage.name
     main._PENDING_REPLY_ENABLED = _ORIG_PENDING_REPLY_ENABLED
     main._PENDING_EXPLICIT_PATH = str(tmp_pending_path)
     main._QUOTA_STATE_FILE = tmp_quota_path  # isolate file I/O
@@ -191,6 +198,8 @@ def reset_main_globals():
     # ── after ─────────────────────────────────────────────────────────────
     main._quota_exhausted_until_ts = 0.0
     main._quota_notified_for_ts = 0.0
+    main._quota_last_probe_ts = 0.0
+    gemini_client._USAGE_FILE = _ORIG_GEMINI_USAGE_FILE
     main._PENDING_REPLY_ENABLED = _ORIG_PENDING_REPLY_ENABLED
     main._PENDING_EXPLICIT_PATH = _ORIG_PENDING_PATH
     main._QUOTA_STATE_FILE = _ORIG_QUOTA_STATE_FILE
@@ -203,6 +212,7 @@ def reset_main_globals():
 
     for p in (
         tmp_quota_path,
+        tmp_usage.name,
         tmp_pending.name,
         str(tmp_pending_lock),
         *_sqlite_sidecar_paths(tmp_app_db_path),

@@ -127,6 +127,17 @@ def extract(combined_text: str) -> list[dict]:
                     temperature=0.1,
                 ),
             )
+            gemini_client._track_usage(resp)
+        except Exception as e:
+            gemini_client._track_failed_request()
+            err = str(e)
+            logger.warning(
+                "finance_view extract failed (%s): %s", model_name, err[:200]
+            )
+            if "429" not in err and "RESOURCE_EXHAUSTED" not in err:
+                break
+            continue
+        try:
             text = _strip_code_fence(resp.text or "")
             data = json.loads(text)
             if isinstance(data, list):
@@ -134,9 +145,12 @@ def extract(combined_text: str) -> list[dict]:
             return []
         except Exception as e:
             err = str(e)
-            logger.warning("finance_view extract failed (%s): %s", model_name, err[:200])
-            if "429" not in err and "RESOURCE_EXHAUSTED" not in err:
-                break
+            logger.warning(
+                "finance_view extract parse failed (%s): %s",
+                model_name,
+                err[:200],
+            )
+            break
     return []
 
 

@@ -217,20 +217,62 @@ def _get_explicit_market_quote_reply(
         return None
 
 
+_LOCAL_TEXT_FALLBACK_SYSTEM_PROMPT = """你是 LINE 群組助理咪寶。現在雲端 Gemini 額度暫時用完，只能用本機 LLM 回覆。
+請用繁體中文，第一句直接給判斷或回答，不要重述使用者問題。
+若題目需要即時查證、最新價格、外部網頁或醫療法律投資專業判斷，而使用者沒有提供足夠資料，請明確說「本機模式無法即時查證」，但仍給可用的大方向、條件與下一步。
+控制在 80 到 260 個中文字，避免空泛安慰。"""
+
+_GEMINI_QUOTA_RECHECK_INTERVAL_SEC = int(
+    os.environ.get("GEMINI_QUOTA_RECHECK_INTERVAL_SEC", "1800")
+)
+
+
+def _local_text_llm_fallback(
+    user_text: str,
+    context: list[tuple[str, str]] | None = None,
+) -> str:
+    """Direct local text LLM fallback for quota outage after lite_reply misses."""
+    text = (user_text or "").strip()
+    if not text:
+        return ""
+    try:
+        from local_llm import chat as local_chat
+
+        out = local_chat(
+            text,
+            context=context,
+            system_prompt=_LOCAL_TEXT_FALLBACK_SYSTEM_PROMPT,
+            max_tokens=360,
+        )
+    except Exception as e:
+        logger.warning("local text fallback failed: %s", e)
+        return ""
+    if out and isinstance(out, str) and len(out.strip()) > 5:
+        return f"{out.strip()}\n\n（local LLM fallback）"
+    return ""
+
+
 def _llm_chat(
     user_input,
     context: list[tuple[str, str]],
     facts: list[str],
     pnotes: list[dict] | None = None,
 ) -> str:
-    """Gemini chat。quota 爆時改走 lite_reply 純規則模板 fallback。
-
-    2026-05-18：移除 local_llm / RAG / agent_loop / llm_router 等本機 text LLM 系列
-    （user directive: local 只負責圖片回應，其餘 gemini 負責）。Gemini 爆時 fallback
-    從 4-tier 簡化為 lite_reply 單 tier (Stage 1 寫死 handlers + Stage 3 rule-based,
-    lite_reply.py 內 Stage 2 local LLM 自動 graceful degrade)。全敗回 ""。
-    """
+    """Gemini chat; when quota is exhausted, fall back to local text generation."""
     if _quota_exhausted():
+        if _quota_recheck_allowed():
+            _record_quota_recheck_attempt()
+            try:
+                reply = gemini_client.chat(user_input, context, facts, pnotes)
+            except Exception as e:
+                if _is_quota_error(e):
+                    _mark_quota_exhausted()
+                    logger.warning("gemini quota recheck still exhausted")
+                else:
+                    logger.warning("gemini quota recheck failed: %s", e)
+            else:
+                _clear_quota_exhausted_after_recheck()
+                return reply
         try:
             import lite_reply
             from gemini_client import _extract_text
@@ -243,6 +285,15 @@ def _llm_chat(
                 return out
         except Exception as e:
             logger.warning("lite_reply fallback failed: %s", e)
+            try:
+                from gemini_client import _extract_text
+                user_text = _extract_text(user_input)
+            except Exception:
+                user_text = str(user_input)
+        out = _local_text_llm_fallback(user_text, context=context)
+        if out:
+            logger.info("quota exhausted → local text fallback hit")
+            return out
         return ""
     return gemini_client.chat(user_input, context, facts, pnotes)
 
@@ -725,6 +776,48 @@ def _gemini_video_quota_ok() -> bool:
         remaining_req = info["limit_requests"] - info["used_requests"]
         return remaining_req >= _GEMINI_VIDEO_MIN_REMAINING_QUOTA
     except Exception:
+        return False
+
+
+_GEMINI_SIDE_TASK_MIN_REMAINING_REQUESTS = int(
+    os.environ.get("GEMINI_SIDE_TASK_MIN_REMAINING_REQUESTS", "16")
+)
+_GEMINI_SIDE_TASK_MIN_REMAINING_TOKENS = int(
+    os.environ.get("GEMINI_SIDE_TASK_MIN_REMAINING_TOKENS", "50000")
+)
+
+
+def _gemini_side_task_allowed(reason: str = "side_task") -> bool:
+    """Return True only when optional Gemini work can run without eating reply budget."""
+    try:
+        if _quota_exhausted():
+            logger.info("skip Gemini %s: quota exhausted", reason)
+            return False
+        info = gemini_client.get_gemini_quota_info()
+        if info is None:
+            logger.info("skip Gemini %s: usage unavailable", reason)
+            return False
+        remaining_req = int(info["limit_requests"]) - int(info["used_requests"])
+        remaining_tokens = int(info["limit_tokens"]) - int(info["used_tokens"])
+        if remaining_req <= _GEMINI_SIDE_TASK_MIN_REMAINING_REQUESTS:
+            logger.info(
+                "skip Gemini %s: remaining_requests=%d reserve=%d",
+                reason,
+                remaining_req,
+                _GEMINI_SIDE_TASK_MIN_REMAINING_REQUESTS,
+            )
+            return False
+        if remaining_tokens <= _GEMINI_SIDE_TASK_MIN_REMAINING_TOKENS:
+            logger.info(
+                "skip Gemini %s: remaining_tokens=%d reserve=%d",
+                reason,
+                remaining_tokens,
+                _GEMINI_SIDE_TASK_MIN_REMAINING_TOKENS,
+            )
+            return False
+        return True
+    except Exception as e:
+        logger.info("skip Gemini %s: budget check failed: %s", reason, e)
         return False
 
 
@@ -1343,10 +1436,10 @@ def _handle_video_message(event, group_id):
 def _try_piggyback_reminders_fast_path(
     reply_token: str | None, group_id: str
 ) -> bool:
-    """Legacy reply-token reminder fallback.
+    """Use an ordinary group message's reply_token to deliver due reminders.
 
-    Product behavior is scheduled-only now: ordinary user messages must not
-    trigger reminder delivery or mark reminder stages.
+    LINE push_message can hit monthly 429 quota; reply_message does not use that
+    quota. Stages are marked only after reply_message succeeds.
     """
     if (
         not _reminder_reply_piggyback_enabled()
@@ -2161,10 +2254,28 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
     except (ImportError, Exception) as e:
         logger.debug("food_signals extract skipped: %s", e)
 
-    # 自動分類（rule-first → Gemini lite，fire-and-forget；2026-05-10 加）
+    # 自動分類：預設只走本機規則，Gemini fallback 必須明確開 env。
+    # 這條會在每則文字訊息觸發；若 rule miss 就打 Gemini，會快速吃掉每日 RPD。
     try:
         import message_classifier
-        message_classifier.classify_async(group_id, event.message.id, text)
+
+        rule_cat = message_classifier.classify_rule(text)
+        if rule_cat is not None:
+            message_classifier.update_category(group_id, event.message.id, rule_cat)
+        else:
+            classifier_fallback = os.environ.get(
+                "GEMINI_CLASSIFIER_FALLBACK_ENABLED", ""
+            ).lower() in {"1", "true", "yes", "on"}
+            if classifier_fallback and _gemini_side_task_allowed(
+                "message_classifier"
+            ):
+                message_classifier.classify_async(group_id, event.message.id, text)
+            else:
+                message_classifier.update_category(
+                    group_id,
+                    event.message.id,
+                    message_classifier.DEFAULT_CATEGORY,
+                )
     except (ImportError, Exception) as e:
         logger.debug("message_classifier skipped: %s", e)
 
@@ -3030,10 +3141,8 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
     # URL 預抓取：先用 Python 抓網頁內容塞進 prompt，繞過 Gemini url_context 的限制
     user_input = _prefetch_urls(user_input)
 
-    # 2026-05-16 修：刪掉 quota 短路。
-    # Gemini quota 爆時 _llm_chat 內部會自動走 llm_router.fallback_chat
-    # (local LLM → RAG → lite_reply) 4-tier waterfall；不能在這層 return，
-    # 否則家人 @咪寶時 bot 會完全沉默。
+    # Gemini quota 爆時仍要進 _llm_chat；內部會先跑 deterministic lite_reply，
+    # miss 後直接走 local_llm，避免家人 @咪寶時 bot 沉默。
     quote_reply_only = _is_market_quote_request(
         quote_policy_input,
         context=context,
@@ -3049,8 +3158,8 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
             logger.warning(
                 "gemini chat (explicit) quota exhausted, retry via lite_reply"
             )
-            # Retry once — 這次 _quota_exhausted()=True，_llm_chat 內部走 lite_reply
-            # 不再 silent return；空字串時回 quota_exhausted_message 至少給訊號
+            # Retry once — 這次 _quota_exhausted()=True，_llm_chat 內部走
+            # deterministic lite_reply → direct local_llm fallback。
             try:
                 reply_text = _llm_chat(user_input, context, facts, pnotes)
             except Exception as e2:
@@ -3081,8 +3190,7 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
             )
             return
 
-    # quota 已爆時第一次 _llm_chat 直接回 ""（內部走 lite_reply，不丟例外）→ 上面 except
-    # 不會進入。pending reply 已停用；quota empty 時不補答，也不送即時 fallback。
+    # local fallback 全敗時 _llm_chat 才會回空；pending reply 已停用時保持靜默。
     if not reply_text or not reply_text.strip():
         if _quota_exhausted():
             _maybe_capture_calendar_event(
@@ -3142,17 +3250,16 @@ def _handle_burst_flush(group_id: str, combined_text: str, reply_token: str) -> 
 
     # 2026-05-18 加：抽家族財經觀點寫入 finance_views（fire-and-forget，不擋主流程）
     try:
-        import finance_view_extractor
-        finance_view_extractor.maybe_extract_and_save_async(
-            group_id, combined_text
-        )
+        if _gemini_side_task_allowed("finance_view_extract"):
+            import finance_view_extractor
+            finance_view_extractor.maybe_extract_and_save_async(
+                group_id, combined_text
+            )
     except Exception as e:
         logger.debug("finance_view extract skipped: %s", e)
 
-    # 2026-05-16 修：刪掉 quota 短路。
-    # 之前在 quota 爆時直接 return 違反 docstring 寫的「會回應的情境不能靜默」原則，
-    # 也讓 llm_router.fallback_chat 4-tier waterfall（local LLM → RAG → lite_reply）
-    # 完全沒機會啟動。改成繼續走 _llm_chat，由它內部判斷走 Gemini 還是 fallback。
+    # quota 爆時也繼續走 _llm_chat；內部會用 deterministic lite_reply，
+    # miss 後接 direct local_llm fallback。
 
     context = memory.get_context(group_id)
     quote_reply_only = _is_market_quote_request(combined_text, context=context)
@@ -3276,7 +3383,20 @@ def _maybe_capture_calendar_event(
         import calendar_db
         import calendar_extractor
 
-        data = calendar_extractor.extract(combined_text)
+        if _gemini_side_task_allowed("calendar_capture"):
+            data = calendar_extractor.extract(combined_text)
+        else:
+            data = {
+                "has_event": False,
+                "is_cancellation": False,
+                "title": None,
+                "date": None,
+                "time": None,
+                "location": None,
+                "participants": [],
+                "cancel_target_keyword": None,
+                "event_type": "family_gathering",
+            }
         extracted = calendar_extractor.extract_many(combined_text, primary=data)
         if extracted["is_cancellation"]:
             kw = extracted.get("cancel_target_keyword")
@@ -3931,16 +4051,18 @@ def _next_gemini_reset_tw() -> tuple[str, str]:
 _QUOTA_STATE_FILE = os.path.join(os.path.dirname(__file__), "quota_state.json")
 _quota_exhausted_until_ts: float = 0.0
 _quota_notified_for_ts: float = 0.0
+_quota_last_probe_ts: float = 0.0
 
 
 def _load_quota_state() -> None:
     """從磁碟還原 quota exhausted 狀態，避免重啟後重複嘗試已耗盡的 quota。"""
-    global _quota_exhausted_until_ts, _quota_notified_for_ts
+    global _quota_exhausted_until_ts, _quota_notified_for_ts, _quota_last_probe_ts
     try:
         with open(_QUOTA_STATE_FILE) as f:
             d = _json.load(f)
         _quota_exhausted_until_ts = float(d.get("exhausted_until_ts", 0))
         _quota_notified_for_ts = float(d.get("notified_for_ts", 0))
+        _quota_last_probe_ts = float(d.get("last_probe_ts", 0))
     except FileNotFoundError:
         pass
     except Exception as e:
@@ -3967,6 +4089,7 @@ def _save_quota_state() -> None:
                 {
                     "exhausted_until_ts": _quota_exhausted_until_ts,
                     "notified_for_ts": _quota_notified_for_ts,
+                    "last_probe_ts": _quota_last_probe_ts,
                 },
                 f,
             )
@@ -4008,6 +4131,29 @@ def _quota_exhausted() -> bool:
     return time.time() < _quota_exhausted_until_ts
 
 
+def _quota_recheck_allowed() -> bool:
+    """Allow a sparse Gemini retry in case cached quota exhaustion is stale."""
+    if not _quota_exhausted():
+        return False
+    if _GEMINI_QUOTA_RECHECK_INTERVAL_SEC <= 0:
+        return False
+    return time.time() - _quota_last_probe_ts >= _GEMINI_QUOTA_RECHECK_INTERVAL_SEC
+
+
+def _record_quota_recheck_attempt() -> None:
+    global _quota_last_probe_ts
+    _quota_last_probe_ts = time.time()
+    _save_quota_state()
+
+
+def _clear_quota_exhausted_after_recheck() -> None:
+    global _quota_exhausted_until_ts, _quota_notified_for_ts
+    _quota_exhausted_until_ts = 0.0
+    _quota_notified_for_ts = 0.0
+    _save_quota_state()
+    logger.warning("gemini quota cache cleared after successful recheck")
+
+
 def _quota_exhausted_message() -> str:
     """quota 爆時統一的使用者訊息(含動態台灣重置時間)。"""
     abs_str, rel_str = _next_gemini_reset_tw()
@@ -4028,7 +4174,7 @@ _PENDING_DLQ_PATH = os.path.join(os.path.dirname(__file__), "pending_dlq.jsonl")
 _ONE_SHOT_REPLY_PATH = os.path.join(os.path.dirname(__file__), "one_shot_replies.json")
 _PENDING_MAX_AGE_SEC = 7 * 86400  # 7 天沒被 drain → 進 DLQ，避免 PDF/stuck entry 永久卡住
 _PENDING_REPLY_ENABLED = _DEFAULT_PENDING_REPLY_ENABLED
-_REMINDER_REPLY_PIGGYBACK_ENABLED = False
+_REMINDER_REPLY_PIGGYBACK_ENABLED = True
 
 
 def _load_one_shot_replies() -> dict[str, str]:
@@ -4102,7 +4248,7 @@ def _pending_reply_enabled() -> bool:
 
 
 def _reminder_reply_piggyback_enabled() -> bool:
-    """Reminder delivery is owned by scheduled jobs, not unrelated replies."""
+    """Allow due reminders to ride on reply_token when someone talks in-group."""
     return _REMINDER_REPLY_PIGGYBACK_ENABLED
 
 
@@ -4885,8 +5031,44 @@ def _start_pending_retry_worker() -> None:
     t.start()
 
 
+_local_text_prewarm_started = False
+
+
+def _prewarm_local_text_llm_if_needed() -> None:
+    """Preload local LLM in background during quota outage to avoid cold reply."""
+    global _local_text_prewarm_started
+    if _local_text_prewarm_started:
+        return
+    if not _quota_exhausted():
+        return
+    disabled = os.environ.get("LOCAL_LLM_PREWARM_DISABLED", "").lower()
+    if disabled in {"1", "true", "yes", "on"}:
+        return
+    _local_text_prewarm_started = True
+
+    def _run() -> None:
+        start = time.time()
+        try:
+            import local_llm
+
+            ensure_loaded = getattr(local_llm, "_ensure_loaded", None)
+            ok = bool(ensure_loaded()) if callable(ensure_loaded) else False
+            model_name = getattr(local_llm, "loaded_model_name", lambda: None)()
+            logger.info(
+                "local text fallback prewarm ok=%s model=%s seconds=%.1f",
+                ok,
+                model_name,
+                time.time() - start,
+            )
+        except Exception as e:
+            logger.warning("local text fallback prewarm failed: %s", e)
+
+    threading.Thread(target=_run, daemon=True, name="local-llm-prewarm").start()
+
+
 def _init_on_startup() -> None:
     _load_quota_state()
+    _prewarm_local_text_llm_if_needed()
     _start_pending_retry_worker()
 
 
@@ -5171,9 +5353,18 @@ def _friendly_gemini_error(e: Exception, file_name: str | None = None) -> str:
 
 def _maybe_extract_facts(group_id: str, user_id: str = "") -> None:
     """每 N 輪抽一次長期事實，user_id 有值時存為 per-user 事實。"""
+    if not _gemini_side_task_allowed("fact_extract"):
+        return
     if not memory.bump_and_should_extract(group_id):
         return
-    new_facts = gemini_client.extract_facts(memory.get_context(group_id))
+    try:
+        new_facts = gemini_client.extract_facts(memory.get_context(group_id))
+    except Exception as e:
+        if _is_quota_error(e):
+            _mark_quota_exhausted()
+        else:
+            logger.warning("auto fact extract failed: %s", e)
+        return
     added = 0
     for f in new_facts:
         if memory.add_fact(group_id, f, user_id=user_id):
@@ -5379,12 +5570,19 @@ def _maybe_extract_reminder(
         return
     if not _REMINDER_TIME_OR_ACTION_HINT.search(text):
         return
+    gemini_allowed = _gemini_side_task_allowed("reminder_extract")
     try:
-        result = gemini_client.extract_reminder(text)
+        result = gemini_client.extract_reminder(text) if gemini_allowed else None
         if result is None:
             from datetime import datetime as _dt
-            result = _calendar_regex_to_reminder_result(text, _dt.now().date(), user_id)
+            result = _calendar_regex_to_reminder_result(
+                text, _dt.now().date(), user_id
+            )
             if result is None:
+                if not gemini_allowed:
+                    _enqueue_reminder_if_candidate(
+                        text, group_id, user_id, message_id
+                    )
                 return
         else:
             actor = _infer_medical_actor(text, user_id)
@@ -6632,8 +6830,8 @@ def _reply(
         )
         return
 
-    # LINE reply_message 上限 5 則。pending reply piggyback 已取消；reminders
-    # 也只由 scheduled jobs 發送，避免任何普通發言觸發整份提醒清單。
+    # LINE reply_message 上限 5 則。pending reply piggyback 已取消；due
+    # reminders 可趁正常 reply 一起送，作為 LINE push quota 429 時的補救路徑。
     # legacy pending branch 僅在 _PENDING_REPLY_ENABLED=True 的測試/rollback 場景會啟用。
     messages_to_send: list = [TextMessage(text=text)]
     pending_commit_ids: list[str] = []
