@@ -70,6 +70,33 @@ def test_due_reminder_label_uses_calendar_day_not_stage_window(monkeypatch):
     assert due[0]["text"].startswith("@當事人\n⏰ 提醒（後天）\n")
 
 
+def test_far_future_reminder_does_not_weekly_push_immediately(monkeypatch):
+    """Very distant reminders should stay quiet until they are within 30 days."""
+    now = 1_800_000_000
+
+    def fake_list(group_id=None):
+        return [_row(now, remind_at=now + 192 * 86400, action="明年初檢查")]
+
+    monkeypatch.setattr(reminder_push.memory, "list_pending_reminders_full", fake_list)
+
+    assert reminder_push.due_reminders_for_reply("G1", limit=2, now=now) == []
+
+
+def test_weekly_reminder_starts_within_30_days(monkeypatch):
+    now = 1_800_000_000
+
+    def fake_list(group_id=None):
+        return [_row(now, remind_at=now + 30 * 86400, action="一個月後檢查")]
+
+    monkeypatch.setattr(reminder_push.memory, "list_pending_reminders_full", fake_list)
+
+    due = reminder_push.due_reminders_for_reply("G1", limit=2, now=now)
+
+    assert len(due) == 1
+    assert due[0]["stage"] == "weekly"
+    assert "（1 個月後）" in due[0]["text"]
+
+
 def test_due_reminder_mentions_companion_alias_from_action(monkeypatch):
     now = 1_800_000_000
     action = "曾美惠正子斷層掃描當天 08:00 開始禁食 6 小時，只能喝水（黃聖雅陪同）"

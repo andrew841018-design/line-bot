@@ -2,7 +2,8 @@
 
 每 15 分鐘 launchd 觸發。階梯式 push schedule（用戶要求 2026-05-08）：
 
-  ≥ 7 days：每週推一次（last_weekly_at >= 6.5 days ago）
+  7-30 days：每週推一次（last_weekly_at >= 6.5 days ago）
+  > 30 days：太遠，不主動推
   4-6 days：dead zone 不推
   ~ 3 days：推 1 次（pushed_3d = 1）
   ~ 1 day：推 1 次（pushed_1d = 1）
@@ -120,8 +121,8 @@ def _decide_stage(r: dict, now: int) -> str | None:
     if 4 < days < 7:
         return None
 
-    # ≥ 7 days：每週一次
-    if days >= 7:
+    # 7-30 days：每週一次；超過 30 天太早，不主動推。
+    if 7 <= days <= 30:
         last_weekly = r["last_weekly_at"]
         days_since = (now - last_weekly) / 86400 if last_weekly else 999
         if days_since >= 6.5:
