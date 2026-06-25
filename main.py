@@ -141,9 +141,6 @@ def _get_line_config() -> Configuration:
     return line_configuration()
 
 
-_line_config = _get_line_config()  # 啟動時的 fallback；callsite 仍會用 _get_line_config() 取最新
-
-
 # ── LINE 訊息配額 ─────────────────────────────────────────────────────────────
 
 
@@ -1118,7 +1115,8 @@ def health():
         "status": "ok",
         "gemini_model": settings.gemini_model,
         "gemini_light_model": settings.gemini_light_model,
-        "group_locked": bool(settings.allowed_group_id),
+        "group_locked": bool(settings.allowed_group_ids),
+        "allowed_group_count": len(settings.allowed_group_ids),
     }
 
 
@@ -1145,6 +1143,12 @@ def serve_genimg(filename: str):
 # ── Webhook ───────────────────────────────────────────────────────────────────
 
 
+def _hash_text(value: str) -> str:
+    import hashlib as _hl
+
+    return _hl.sha256((value or "").encode("utf-8")).hexdigest()[:12]
+
+
 @app.post("/callback")
 async def callback(request: Request, x_line_signature: str = Header(None)):
     # N3 fix (2026-05-30): errors="replace" 避免非 UTF-8 垃圾請求在驗章前就
@@ -1154,13 +1158,11 @@ async def callback(request: Request, x_line_signature: str = Header(None)):
         client = request.client.host if request.client else "?"
         logger.warning("missing x-line-signature header from %s body_len=%d", client, len(body))
         raise HTTPException(status_code=400, detail="missing signature")
-    # PII protection: 預設只印 body_sha256（除錯時設 DEBUG_RAW_BODY=1 印 body[:800]）
+    # PII protection: never print raw signature or body; hashes are enough to correlate retries.
     if os.getenv("DEBUG_RAW_BODY") == "1":
-        print(f"[RAW] sig={x_line_signature} len={len(body)} body={body[:800]}", flush=True)
+        print(f"[RAW] debug=1 sig_sha256={_hash_text(x_line_signature)} len={len(body)} body_sha256={_hash_text(body)}", flush=True)
     else:
-        import hashlib as _hl
-        _body_hash = _hl.sha256(body.encode("utf-8")).hexdigest()[:12]
-        print(f"[RAW] sig={x_line_signature} len={len(body)} body_sha256={_body_hash}", flush=True)
+        print(f"[RAW] sig_sha256={_hash_text(x_line_signature)} len={len(body)} body_sha256={_hash_text(body)}", flush=True)
     try:
         events = _parser.parse(body, x_line_signature)
     except InvalidSignatureError:
@@ -2406,7 +2408,7 @@ def _handle_image_gen(event: MessageEvent, group_id: str, subject: str) -> None:
         # 真的傳 ImageMessage
         img_url = f"{public_url}/static/img/{fname}"
         try:
-            with ApiClient(_line_config) as api_client:
+            with ApiClient(_get_line_config()) as api_client:
                 MessagingApi(api_client).reply_message(
                     ReplyMessageRequest(
                         reply_token=event.reply_token,

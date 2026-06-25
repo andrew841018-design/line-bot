@@ -225,6 +225,56 @@ def test_node_generate_429_perday_falls_back():
     assert result == {"response": "lite reply"}
 
 
+def test_node_generate_uses_caller_settings_when_config_settings_drift(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import patch as _patch
+    import gemini_client
+
+    state = {
+        "user_input": "hi", "context": [], "facts": [], "persona_notes": None,
+        "recall_hits": None, "case_hits": None, "group_id": None,
+    }
+    caller_settings = SimpleNamespace(
+        gemini_model="caller-main",
+        gemini_light_model="caller-lite",
+    )
+    monkeypatch.setattr(gemini_client, "settings", caller_settings)
+    config = {"configurable": {"model": "caller-main"}}
+    calls = []
+
+    def fake_run(model, **kwargs):
+        calls.append(model)
+        if model == "caller-main":
+            raise RuntimeError("503 service unavailable")
+        return "caller lite reply"
+
+    with _patch("gemini_client._run", side_effect=fake_run):
+        result = rag_graph._node_generate(state, config=config)
+
+    assert result == {"response": "caller lite reply"}
+    assert calls == ["caller-main", "caller-lite"]
+
+
+def test_node_generate_rejects_config_settings_model_when_caller_settings_drift(monkeypatch):
+    from types import SimpleNamespace
+    from config import settings as config_settings
+    import gemini_client
+
+    state = {
+        "user_input": "hi", "context": [], "facts": [], "persona_notes": None,
+        "recall_hits": None, "case_hits": None, "group_id": None,
+    }
+    caller_settings = SimpleNamespace(
+        gemini_model="caller-main",
+        gemini_light_model="caller-lite",
+    )
+    monkeypatch.setattr(gemini_client, "settings", caller_settings)
+    config = {"configurable": {"model": config_settings.gemini_model}}
+
+    with pytest.raises(ValueError, match="Disallowed model"):
+        rag_graph._node_generate(state, config=config)
+
+
 def test_node_generate_non_fallback_exception_propagates():
     """Non-503/non-429 exception must propagate unchanged (no spurious fallback)."""
     from unittest.mock import patch as _patch

@@ -107,8 +107,6 @@ def test_message_classifier_async_keeps_spawn_time_db_path(monkeypatch, tmp_path
 
 
 def test_memory_embedding_async_passes_spawn_time_db_path(monkeypatch, tmp_path):
-    import threading
-
     import embedding_recall
     import memory
 
@@ -117,18 +115,15 @@ def test_memory_embedding_async_passes_spawn_time_db_path(monkeypatch, tmp_path)
     spawn_db = tmp_path / "spawn.db"
     restored_db = tmp_path / "restored.db"
 
-    class FakeThread:
-        def __init__(self, target, **kwargs):
-            self.target = target
-
-        def start(self):
-            targets.append(self.target)
+    class FakeExecutor:
+        def submit(self, target):
+            targets.append(target)
 
     def fake_index_message(message_id, group_id, text, is_bot=False, db_path=None):
         calls.append(db_path)
         return True
 
-    monkeypatch.setattr(threading, "Thread", FakeThread)
+    monkeypatch.setattr(memory, "_EMBED_EXECUTOR", FakeExecutor())
     monkeypatch.setattr(embedding_recall, "index_message", fake_index_message)
     monkeypatch.setattr(embedding_recall, "_DB_PATH", spawn_db)
 

@@ -522,14 +522,14 @@ def check_9_gemini(model, *, idx, label):
 
 
 def check_10_sqlite():
-    r = CheckResult(13, "SQLite integrity + WAL checkpoint", critical=False)
+    r = CheckResult(13, "SQLite integrity + passive WAL checkpoint", critical=False)
     if not DB_PATH.exists(): return r.skipped("DB 不存在")
     try:
         conn = sqlite3.connect(str(DB_PATH), timeout=5)
         chk = conn.execute("PRAGMA integrity_check").fetchone()
         if chk and chk[0] != "ok":
             conn.close(); return r.failed(f"integrity: {chk[0]!r}")
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)"); conn.close()
+        conn.execute("PRAGMA wal_checkpoint(PASSIVE)"); conn.close()
         return r.passed()
     except Exception as e: return r.failed(str(e)[:120])
 

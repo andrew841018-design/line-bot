@@ -18,6 +18,7 @@ import re
 import sqlite3
 import threading
 import time as _time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from config import settings
@@ -28,6 +29,8 @@ if _DB_PATH.parent and str(_DB_PATH.parent) not in ("", "."):
 
 # sqlite3 在多 thread 寫入時需要 serialize，用一個全域 lock 最單純
 _lock = threading.Lock()
+_EMBED_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="embedding-index")
+_EMBED_INFLIGHT = threading.BoundedSemaphore(32)
 
 
 class _ClosingConnection(sqlite3.Connection):
@@ -468,10 +471,7 @@ def log_raw_message(
             " ORDER BY created_at DESC LIMIT ?)",
             (group_id, group_id, _RAW_MESSAGE_KEEP),
         )
-    # Embedding hook — async fire-and-forget (2026-05-21 修：sentence_transformer
-    # 首次 in-process load 要 ~10 秒，會 block webhook handler 害 reply 延遲)
-    import threading
-
+    # Embedding hook — async fire-and-forget with bounded in-flight work.
     try:
         import embedding_recall as _embedding_recall
 
@@ -493,8 +493,15 @@ def log_raw_message(
                 )
         except Exception:
             pass
+        finally:
+            _EMBED_INFLIGHT.release()
 
-    threading.Thread(target=_bg_index, daemon=True).start()
+    if not _EMBED_INFLIGHT.acquire(blocking=False):
+        return
+    try:
+        _EMBED_EXECUTOR.submit(_bg_index)
+    except Exception:
+        _EMBED_INFLIGHT.release()
 
 
 def get_raw_message(group_id: str, message_id: str) -> tuple[str | None, str] | None:
