@@ -63,8 +63,21 @@ ANNIVERSARY_TYPES: tuple[str, ...] = ("birthday", "wedding", "memorial", "other"
 REMINDER_OFFSETS: tuple[int, ...] = (7, 1, 0)  # D-7 / D-1 / D-day
 
 
+class _ClosingConnection(sqlite3.Connection):
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            return super().__exit__(exc_type, exc, tb)
+        finally:
+            self.close()
+
+
 def _conn() -> sqlite3.Connection:
-    c = sqlite3.connect(_DB_PATH, isolation_level=None, check_same_thread=False)
+    c = sqlite3.connect(
+        _DB_PATH,
+        isolation_level=None,
+        check_same_thread=False,
+        factory=_ClosingConnection,
+    )
     c.execute("PRAGMA journal_mode=WAL")
     c.execute("PRAGMA synchronous=NORMAL")
     return c

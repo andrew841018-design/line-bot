@@ -872,6 +872,24 @@ _URL_DOMAIN_RE = re.compile(
     r"https?://([^/\s)，。、；：！？「」（）]+)", re.IGNORECASE
 )
 
+_INTERNAL_TRACE_PREFIX_RE = re.compile(
+    r"^\s*(THOUGHT|ANALYSIS|REASONING)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_INTERNAL_TRACE_MARKERS = (
+    "The user is asking",
+    "My response should",
+    "Let's ensure it adheres to the rules",
+    "Let's re-evaluate",
+    "As per rule",
+    "I must respond",
+    "I need to clarify",
+    "First sentence needs",
+    "This directly answers",
+    "Rule 0:",
+    "規則 0:",
+)
+
 
 def _has_sectional_structure(reply: str) -> tuple[bool, list[str]]:
     """檢查 reply 是否含正方/反方/綜合三段 sectional structure。
@@ -900,6 +918,17 @@ def _count_unique_domains(s: str) -> int:
     return len({d.lower() for d in _URL_DOMAIN_RE.findall(s)})
 
 
+def _looks_like_internal_trace(reply: str) -> bool:
+    """Detect leaked reasoning/checklist text before it reaches LINE."""
+    head = (reply or "").lstrip()[:2000]
+    if not head:
+        return False
+    if _INTERNAL_TRACE_PREFIX_RE.match(head):
+        return True
+    hits = sum(marker in head for marker in _INTERNAL_TRACE_MARKERS)
+    return hits >= 2
+
+
 def _violates_quality(reply: str, user_input_text: str = "") -> tuple[bool, str]:
     """規則 0 post-check：偵測 echo opener / 空附和 / 敷衍 / 缺 URL 結構。
 
@@ -909,6 +938,8 @@ def _violates_quality(reply: str, user_input_text: str = "") -> tuple[bool, str]
     s = (reply or "").strip()
     if not s:
         return False, ""
+    if _looks_like_internal_trace(s):
+        return True, "internal trace leakage: THOUGHT/reasoning checklist"
     for opener in _ECHO_OPENERS:
         if s.startswith(opener):
             return True, f"echo opener: {opener}"
@@ -1043,7 +1074,15 @@ def _quality_gate(
             for t, _ in prev_violations
         )
 
-        if "缺多源 URL" in current_reason or "沒中心思想" in current_reason:
+        if "internal trace leakage" in current_reason:
+            retry_prompt = (
+                f"上次回覆違規（{current_reason}）。重寫：只輸出要發給 LINE 使用者的正式繁體中文回答。\n"
+                "嚴禁輸出 THOUGHT、ANALYSIS、REASONING、英文推理、自我檢查、規則清單、"
+                "「The user is...」「My response should...」「Let's...」等內部分析文字。\n"
+                "直接從結論或判斷句開始；如果是查證/影片/新聞案例，使用正方、反方、整合、結論格式。\n\n"
+                f"前面違規過的回覆，**首 60 字一字不差禁止再用**：\n{forbidden_block}"
+            )
+        elif "缺多源 URL" in current_reason or "沒中心思想" in current_reason:
             retry_prompt = (
                 f"上次回覆違規（{current_reason}）。重寫，必須符合規則 23h 完整結構：\n"
                 "(1) 第一句『我覺得 / 我這邊覺得 / 我認為 + 具體判斷』\n"
@@ -1161,6 +1200,13 @@ def _run(
             text = _clean_reply(text)
             grounding_urls = _extract_grounding_urls(response)
             if text:
+                user_text = _extract_text(user_input)
+                trace_leaked, trace_reason = _violates_quality(text, user_text)
+                if trace_leaked and "internal trace leakage" in trace_reason:
+                    return _quality_gate(
+                        chat_session, text, grounding_urls,
+                        user_input, group_id,
+                    )
                 if not _is_chinese_majority(text):
                     logger.warning(
                         "gemini reply is not Chinese-majority, requesting Chinese rewrite"

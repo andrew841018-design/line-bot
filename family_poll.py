@@ -103,8 +103,21 @@ class VoteTarget:
     alias: str
 
 
+class _ClosingConnection(sqlite3.Connection):
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            return super().__exit__(exc_type, exc, tb)
+        finally:
+            self.close()
+
+
 def _conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(_DB_PATH, isolation_level=None, check_same_thread=False)
+    conn = sqlite3.connect(
+        _DB_PATH,
+        isolation_level=None,
+        check_same_thread=False,
+        factory=_ClosingConnection,
+    )
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=5000")

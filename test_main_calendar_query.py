@@ -188,6 +188,14 @@ def test_build_todo_status_reply_reads_all_sources(monkeypatch):
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            base = datetime(2026, 6, 24, 12, 0, tzinfo=ZoneInfo("Asia/Taipei"))
+            return base if tz is None else base.astimezone(tz)
+
+    monkeypatch.setattr(main, "datetime", FixedDateTime)
+
     monkeypatch.setattr(
         todo,
         "list_pending",

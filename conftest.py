@@ -48,6 +48,16 @@ warnings.filterwarnings(
     category=UserWarning,
     module=r"jieba\._compat",
 )
+warnings.filterwarnings(
+    "ignore",
+    message=r"builtin type SwigPy(?:Packed|Object) has no __module__ attribute",
+    category=DeprecationWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r"builtin type swigvarlink has no __module__ attribute",
+    category=DeprecationWarning,
+)
 
 os.environ.setdefault("LINE_CHANNEL_SECRET", "dummy_secret_32bytes_padding000")
 os.environ.setdefault("LINE_CHANNEL_ACCESS_TOKEN", "dummy")

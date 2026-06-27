@@ -29,7 +29,6 @@ from typing import Any
 warnings.filterwarnings("ignore", message=".*pkg_resources.*")
 
 import jieba  # noqa: E402
-import jieba.analyse  # noqa: E402
 import jieba.posseg as pseg  # noqa: E402
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -431,6 +430,8 @@ def extract_keywords(text: str, top_k: int = 5) -> list[tuple[str, float]]:
     """
     if not text or not text.strip():
         return []
+    import jieba.analyse  # lazy import: jieba opens idf.txt during analyse setup
+
     raw = jieba.analyse.extract_tags(text, topK=top_k * 3, withWeight=True)
     out: list[tuple[str, float]] = []
     for word, score in raw:

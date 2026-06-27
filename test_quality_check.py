@@ -89,6 +89,24 @@ def test_violates_quality_empty_phrases():
     check("empty: 需要重視 → True", bad)
 
 
+def test_violates_quality_internal_trace():
+    print("\n── Test B2: _violates_quality internal trace leakage ──")
+
+    leaked = (
+        "THOUGHT\n"
+        "The user is correcting my previous response for containing English.\n"
+        "My response should:\n"
+        "1. Apologize for the error.\n"
+        "Let's re-evaluate the previous response.\n"
+        "這支影片是視覺化想像，不是真實紀錄。"
+    )
+    bad, reason = gemini_client._violates_quality(leaked)
+    check("internal trace: THOUGHT → True", bad)
+    check("internal trace reason", "internal trace" in reason)
+    assert bad
+    assert "internal trace" in reason
+
+
 def test_violates_quality_clean():
     print("\n── Test C: _violates_quality clean reply passes ──")
 
@@ -141,6 +159,44 @@ def test_chat_retries_on_violation():
         "retry prompt 含『規則 0』",
         "規則 0" in second_call_args,
     )
+
+
+def test_chat_retries_on_internal_trace():
+    print("\n── Test D2: chat() retries on internal trace leakage ──")
+
+    bad_response = MagicMock()
+    bad_response.text = (
+        "THOUGHT\n"
+        "The user is asking a question.\n"
+        "My response should be concise.\n"
+        "Rule 0: OK.\n"
+        "這是不該外洩的推理。"
+    )
+    bad_response.usage_metadata = MagicMock(total_token_count=10, thinking_token_count=0)
+    bad_response.candidates = []
+
+    good_response = MagicMock()
+    good_response.text = "這支影片是視覺化想像，不是真實紀錄。"
+    good_response.usage_metadata = MagicMock(total_token_count=10, thinking_token_count=0)
+    good_response.candidates = []
+
+    mock_chat = MagicMock()
+    mock_chat.send_message.side_effect = [bad_response, good_response]
+
+    with (
+        patch("gemini_client._client") as mock_client,
+        patch.object(gemini_client, "_track_usage"),
+    ):
+        mock_client.chats.create.return_value = mock_chat
+        result = gemini_client.chat("這影片是真的嗎？", [], [])
+
+    check("internal trace → retry", mock_chat.send_message.call_count == 2)
+    check("retry 後乾淨回覆被回傳", result == "這支影片是視覺化想像，不是真實紀錄。")
+    second_call_args = mock_chat.send_message.call_args_list[1][0][0]
+    check("retry prompt 禁止 THOUGHT", "THOUGHT" in second_call_args)
+    assert mock_chat.send_message.call_count == 2
+    assert result == "這支影片是視覺化想像，不是真實紀錄。"
+    assert "THOUGHT" in second_call_args
 
 
 def test_chat_logs_when_retry_still_violates(monkeypatch):
@@ -320,8 +376,10 @@ def test_violates_quality_non_news_case_skips_sectional_check():
 if __name__ == "__main__":
     test_violates_quality_echo_openers()
     test_violates_quality_empty_phrases()
+    test_violates_quality_internal_trace()
     test_violates_quality_clean()
     test_chat_retries_on_violation()
+    test_chat_retries_on_internal_trace()
     test_chat_logs_when_retry_still_violates()
     test_chat_clean_reply_passes_through()
     test_detect_rule_packs_news_case()

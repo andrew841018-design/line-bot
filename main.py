@@ -170,10 +170,39 @@ _OUTBOUND_SYSTEM_STATUS_MARKERS = (
 )
 
 
+_OUTBOUND_INTERNAL_TRACE_MARKERS = (
+    "The user is asking",
+    "My response should",
+    "Let's ensure it adheres to the rules",
+    "As per rule",
+    "I must respond",
+    "I need to clarify",
+    "First sentence needs",
+    "This directly answers",
+    "Rule 0:",
+    "規則 0:",
+)
+
+
+def _is_internal_trace_outbound(text: str) -> bool:
+    """True when an LLM exposed hidden reasoning/checklist text."""
+    s = (text or "").lstrip()
+    if not s:
+        return False
+    head = s[:2000]
+    if re.match(r"(?is)^(THOUGHT|ANALYSIS|REASONING)\b", head):
+        return True
+    hits = sum(marker in head for marker in _OUTBOUND_INTERNAL_TRACE_MARKERS)
+    return hits >= 2
+
+
 def _is_system_status_outbound(text: str) -> bool:
     """True when text is an internal/quota/status message that must not go to LINE."""
     s = text or ""
-    return any(marker in s for marker in _OUTBOUND_SYSTEM_STATUS_MARKERS)
+    return (
+        any(marker in s for marker in _OUTBOUND_SYSTEM_STATUS_MARKERS)
+        or _is_internal_trace_outbound(s)
+    )
 
 
 def _is_market_quote_outbound(text: str) -> bool:
@@ -216,6 +245,7 @@ def _get_explicit_market_quote_reply(
 
 _LOCAL_TEXT_FALLBACK_SYSTEM_PROMPT = """你是 LINE 群組助理咪寶。現在雲端 Gemini 額度暫時用完，只能用本機 LLM 回覆。
 請用繁體中文，第一句直接給判斷或回答，不要重述使用者問題。
+只能輸出要發到 LINE 的正式回覆；嚴禁輸出 THOUGHT、ANALYSIS、REASONING、英文推理、自我檢查或規則清單。
 若題目需要即時查證、最新價格、外部網頁或醫療法律投資專業判斷，而使用者沒有提供足夠資料，請明確說「本機模式無法即時查證」，但仍給可用的大方向、條件與下一步。
 控制在 80 到 260 個中文字，避免空泛安慰。"""
 

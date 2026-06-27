@@ -294,6 +294,36 @@ def test_bug9_reply_suppresses_system_status_messages():
     assert not mock_messaging.push_message.called
 
 
+def test_bug10_reply_suppresses_llm_internal_trace():
+    """LLM reasoning/checklist text must never be sent to the LINE group."""
+    main.settings.bot_muted = False
+
+    mock_api = MagicMock()
+    mock_api.__enter__ = MagicMock(return_value=mock_api)
+    mock_api.__exit__ = MagicMock(return_value=False)
+    mock_messaging = MagicMock()
+
+    leaked_text = (
+        "THOUGHT\n"
+        "The user is asking \"你們是去紐西蘭\".\n"
+        "My response should:\n"
+        "1. Directly answer the question.\n"
+        "Let's ensure it adheres to the rules:\n"
+        "• Rule 0: 具體判斷句 - OK.\n"
+        "咪寶沒有要去紐西蘭喔。"
+    )
+
+    with (
+        patch("main.ApiClient", return_value=mock_api),
+        patch("main.MessagingApi", return_value=mock_messaging),
+        patch("main._load_pending_explicit", return_value={}),
+    ):
+        main._reply("TOKEN001", leaked_text, group_id="GRP001")
+
+    assert not mock_messaging.reply_message.called
+    assert not mock_messaging.push_message.called
+
+
 def test_market_quote_reply_token_expired_does_not_fallback_push(monkeypatch):
     """Market quote replies are reply-only; expired reply token must not push to group."""
     monkeypatch.setattr(main.settings, "bot_muted", False)
@@ -710,11 +740,17 @@ def test_quota_exhausted_llm_chat_rechecks_gemini_before_local(monkeypatch):
 
 
 def test_quota_exhausted_llm_chat_recheck_429_falls_back_local(monkeypatch):
+    import sys
     import time
+    import types
 
     marked: list[bool] = []
+    fake_lite = types.ModuleType("lite_reply")
+    fake_lite.lite_reply = lambda text, context=None: None
+
     main._quota_exhausted_until_ts = time.time() + 3600
     main._quota_last_probe_ts = 0.0
+    monkeypatch.setitem(sys.modules, "lite_reply", fake_lite)
     monkeypatch.setattr(main, "_GEMINI_QUOTA_RECHECK_INTERVAL_SEC", 1800)
     monkeypatch.setattr(main, "_save_quota_state", lambda: None)
     monkeypatch.setattr(
