@@ -1550,7 +1550,7 @@ _AUTO_CAPTURE_VERB_RE = re.compile(
     r"做(?:胃鏡|大腸鏡|健康檢查|體檢|手術|健檢|LDCT)|"
     r"領(?:藥|處方簽|包裹)|"
     r"婚禮|喜宴|滿月|彌月|"
-    r"打疫苗|抽血|健檢|出差|北上|南下"
+    r"打(?:疫苗|球|羽球)|羽球|行程|活動|抽血|健檢|出差|北上|南下"
 )
 
 _MEDICAL_ACTOR_ACTION_RE = re.compile(
@@ -1775,6 +1775,64 @@ def _with_medical_actor_participant(participants: list | None, actor: str | None
     return [f"{actor}(就醫)", *parts]
 
 
+def _capture_calendar_events_regex_only(
+    group_id: str,
+    combined_text: str,
+    sender_user_id: str = "",
+    message_id: str = "",
+) -> int:
+    """Persist explicit date/time family events without Gemini.
+
+    This path runs before reply generation, so lite/local mode cannot say an
+    event was recorded while the DB still lacks the corresponding reminder.
+    """
+    try:
+        import calendar_db
+        import calendar_regex
+
+        today_tw = datetime.now(ZoneInfo("Asia/Taipei")).date()
+        events = calendar_regex.extract_many_regex_only(
+            combined_text, today_tw, require_time=True
+        )
+        inserted = 0
+        for data in events:
+            if not (data.get("has_event") and data.get("title") and data.get("date")):
+                continue
+            if data.get("event_type") == "medical":
+                actor = _infer_medical_actor(combined_text, sender_user_id)
+                data["title"] = _apply_medical_actor(data["title"], actor)
+                data["participants"] = _with_medical_actor_participant(
+                    data.get("participants"), actor
+                )
+            else:
+                _apply_sender_first_person_event(data, sender_user_id)
+            _apply_family_context_defaults(data, combined_text)
+            event_id = calendar_db.insert_event(
+                group_id=group_id,
+                title=data["title"],
+                event_date=data["date"],
+                event_time=data.get("time"),
+                location=data.get("location"),
+                participants=data.get("participants") or [],
+                event_type=data.get("event_type", "family_gathering"),
+                source_msg_id=message_id,
+            )
+            if event_id:
+                inserted += 1
+                logger.info(
+                    "calendar event captured by local regex: %s '%s' on %s type=%s (group=%s)",
+                    event_id,
+                    data["title"],
+                    data["date"],
+                    data.get("event_type", "family_gathering"),
+                    group_id,
+                )
+        return inserted
+    except Exception as e:
+        logger.warning("local calendar regex capture failed: %s", e)
+        return 0
+
+
 def _auto_capture_text_if_important(
     group_id: str,
     text: str,
@@ -1789,6 +1847,8 @@ def _auto_capture_text_if_important(
     if not text or len(text.strip()) < 4 or len(text) > 500:
         return
     if not (_AUTO_CAPTURE_DATE_HINT_RE.search(text) and _AUTO_CAPTURE_VERB_RE.search(text)):
+        return
+    if _capture_calendar_events_regex_only(group_id, text, sender_user_id, message_id):
         return
     import threading
 
@@ -2356,14 +2416,20 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
         _handle_dinner_recommendation(event, group_id)
         return
 
-    # 5. Explicit 觸發（@mention / /ai / /問 ...）→ 立刻處理，並取消 pending burst
+    # 5. 未點名但明顯是可查資料問句 → 即時查網路資料後回覆
+    if clean_text is None and _is_web_research_question(text):
+        if _handle_web_research_question(event, group_id, text):
+            burst_filter.cancel_burst(group_id)
+            return
+
+    # 6. Explicit 觸發（@mention / /ai / /問 ...）→ 立刻處理，並取消 pending burst
     if clean_text is not None:
         burst_filter.cancel_burst(group_id)
         _handle_explicit_text(event, group_id, clean_text)
         return
 
-    # 6. 其他文字訊息 → burst_filter debounce（等對方說完再回）
-    # 6a. fast-path：如果有 due reminder 沒推過，搶在 burst_filter 累積前用 reply_token
+    # 7. 其他文字訊息 → burst_filter debounce（等對方說完再回）
+    # 7a. fast-path：如果有 due reminder 沒推過，搶在 burst_filter 累積前用 reply_token
     # 推 reminder（LINE push quota 爆時的補救路徑 — reply API 不耗月配額）
     if _try_piggyback_reminders_fast_path(event.reply_token, group_id):
         return
@@ -5692,6 +5758,261 @@ _DINNER_PROMPT = """你是台北美食達人，以善導寺捷運站（台北市
 💰 價位（每人約 NT$XXX）
 
 回覆風格：親切自然，像朋友推薦，繁體中文，不要加多餘的前言或結語。"""
+
+
+_WEB_RESEARCH_QUESTION_HINTS = (
+    "?",
+    "？",
+    "嗎",
+    "呢",
+    "如何",
+    "怎麼",
+    "怎樣",
+    "哪",
+    "什麼",
+    "為什麼",
+    "可不可以",
+    "能不能",
+    "可以",
+    "支援",
+    "相容",
+    "推薦",
+    "比較",
+    "差在哪",
+    "值得",
+    "好不好",
+    "有沒有",
+    "有什麼",
+    "最近",
+)
+_WEB_RESEARCH_PUBLIC_HINTS = (
+    # time-sensitive / public facts
+    "新聞",
+    "近況",
+    "趨勢",
+    "行情",
+    "走勢",
+    # markets / economics
+    "美股",
+    "台股",
+    "港股",
+    "股票",
+    "股市",
+    "大盤",
+    "匯率",
+    "利率",
+    "油價",
+    "金價",
+    "房市",
+    "經濟",
+    # place / weather / travel / local recommendations
+    "氣候",
+    "天氣",
+    "溫度",
+    "降雨",
+    "季節",
+    "好玩",
+    "景點",
+    "旅遊",
+    "旅行",
+    "自由行",
+    "行程",
+    "必去",
+    "交通",
+    "簽證",
+    "餐廳",
+    "住宿",
+    # products / software / compatibility
+    "支援",
+    "相容",
+    "規格",
+    "版本",
+    "安裝",
+    "價格",
+    "評價",
+    "評測",
+    "m1",
+    "m2",
+    "m3",
+    "m4",
+    "apple silicon",
+    "mac",
+    "晶片",
+    # official / policy / availability
+    "政策",
+    "法規",
+    "規定",
+    "開放",
+    "營業",
+    "票價",
+    "官方",
+    "來源",
+    "資料",
+)
+_WEB_RESEARCH_RECOMMENDATION_RE = re.compile(
+    r"(哪裡|哪邊|哪兒|哪里|哪個|有什麼|有哪些|推薦|好玩|景點|怎麼去|怎麼玩)"
+)
+_WEB_RESEARCH_DEFINITION_RE = re.compile(r"(什麼是|是什麼|介紹一下|解釋一下)")
+_WEB_RESEARCH_SUBJECT_STOPWORDS_RE = re.compile(
+    r"(請問|你覺得|你認為|可以|可不可以|能不能|嗎|呢|如何|怎麼|怎樣|"
+    r"哪裡|哪邊|哪兒|哪里|哪個|有什麼|有哪些|推薦|好玩|景點|怎麼去|怎麼玩|"
+    r"爸爸|媽媽|阿公|阿嬤|奶奶|爺爺|哥哥|姐姐|妹妹|弟弟|你|我|他|她|它|這個|那個)"
+)
+
+
+def _has_web_research_subject(text: str) -> bool:
+    subject = _WEB_RESEARCH_SUBJECT_STOPWORDS_RE.sub("", text or "")
+    subject = re.sub(r"[\s?？。！!，,、：:；;（）()]+", "", subject)
+    return len(subject) >= 2
+
+
+def _is_web_research_question(text: str) -> bool:
+    """Detect public-info questions worth answering immediately with web research."""
+    s = (text or "").strip()
+    if not s or len(s) > 180:
+        return False
+    lower = s.lower()
+    has_question = any(h in lower for h in _WEB_RESEARCH_QUESTION_HINTS)
+    if not has_question:
+        return False
+    if _URL_RE.search(s):
+        return True
+    if _WEB_RESEARCH_DEFINITION_RE.search(s):
+        return _has_web_research_subject(s)
+    if _WEB_RESEARCH_RECOMMENDATION_RE.search(s):
+        return _has_web_research_subject(s)
+    return any(h in lower for h in _WEB_RESEARCH_PUBLIC_HINTS)
+
+
+def _build_web_research_queries(text: str) -> list[str]:
+    base = re.sub(r"\s+", " ", (text or "").strip(" \t\r\n?？。！!"))
+    if not base:
+        return []
+    lower = base.lower()
+    queries = [base]
+    if any(h in base for h in ("最近", "最新", "今天", "現在", "目前", "新聞", "行情", "走勢")):
+        queries.append(f"{base} 最新 2026")
+    if any(h in base for h in ("氣候", "天氣", "旅遊", "旅行", "景點", "行程", "簽證", "交通")):
+        queries.append(f"{base} 官方 旅遊資訊")
+    if any(h in lower for h in ("支援", "相容", "規格", "版本", "安裝", "m1", "m2", "m3", "m4", "apple silicon", "mac")):
+        queries.append(f"{base} official support")
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for q in queries:
+        if q and q not in seen:
+            deduped.append(q)
+            seen.add(q)
+    return deduped[:3]
+
+
+def _collect_web_research_sources(text: str) -> list[dict]:
+    queries = _build_web_research_queries(text)
+    if not queries:
+        return []
+    try:
+        import source_aggregator
+        sources = source_aggregator.aggregate_sources(queries, total_max=6)
+    except Exception as e:
+        logger.info("web research source aggregation failed: %s", e)
+        return []
+    if not sources:
+        return []
+    try:
+        import fulltext_fetcher
+        return fulltext_fetcher.fetch_top_sources(
+            sources,
+            top_n=2,
+            max_chars_per=1200,
+            timeout_per_task=3.0,
+            max_workers=2,
+        )
+    except Exception as e:
+        logger.info("web research full-text enrichment skipped: %s", e)
+        return sources
+
+
+def _format_web_research_sources(sources: list[dict], limit: int = 5) -> str:
+    if not sources:
+        return ""
+    blocks: list[str] = []
+    for idx, src in enumerate(sources[:limit], 1):
+        title = str(src.get("title") or "").strip()
+        url = str(src.get("url") or "").strip()
+        domain = str(src.get("domain") or "").strip()
+        body = str(src.get("full_text") or src.get("snippet") or "").strip()
+        if len(body) > 700:
+            body = body[:700] + "..."
+        parts = [f"[{idx}] {title or domain or url}"]
+        if domain:
+            parts.append(f"domain: {domain}")
+        if url:
+            parts.append(f"url: {url}")
+        if body:
+            parts.append(f"內容摘錄: {body}")
+        blocks.append("\n".join(parts))
+    return "\n\n".join(blocks)
+
+
+def _build_web_research_prompt(text: str, sources: list[dict] | None = None) -> str:
+    today_tw = datetime.now(ZoneInfo("Asia/Taipei")).date().isoformat()
+    source_block = _format_web_research_sources(sources or [])
+    if not source_block:
+        source_block = (
+            "本機爬蟲沒有抓到足夠資料。請使用 Google Search grounding 補查，"
+            "再用查到的資料回答；不要只靠模型記憶。"
+        )
+    return (
+        "這是一則 LINE 群組裡沒有明確 @ bot、但明顯在問公開資料或推薦的問題。\n"
+        "請根據本機爬蟲資料回答；如果資料不足或題目涉及最新狀態，"
+        "請再使用 Google Search / 可用網路資料補查。\n"
+        "回答規則：第一句直接給具體判斷或建議；用繁體中文；"
+        "控制在 5-9 行；不要空泛重述問題；事實或近期資訊要附簡短來源名稱或網址。\n"
+        "如果問題範圍太大，先分成幾個最實用方向回答，最後指出要縮小範圍才能排細節。\n\n"
+        f"今天台灣日期：{today_tw}\n"
+        f"使用者原文：{text.strip()}\n\n"
+        f"本機爬蟲資料：\n{source_block}"
+    )
+
+
+def _handle_web_research_question(
+    event: MessageEvent,
+    group_id: str,
+    text: str,
+) -> bool:
+    """Immediate no-mention path for public-info questions; returns True when consumed."""
+    sender_user_id = getattr(event.source, "user_id", None) or ""
+    context = memory.get_context(group_id)
+    facts = memory.top_facts(group_id, user_id=sender_user_id)
+    pnotes = _get_persona_notes(group_id)
+    try:
+        with _thinking_indicator(group_id):
+            sources = _collect_web_research_sources(text)
+            prompt_text = _build_web_research_prompt(text, sources)
+            reply_text = _llm_chat(prompt_text, context, facts, pnotes)
+    except Exception as e:
+        if _is_quota_error(e):
+            _mark_quota_exhausted()
+            logger.warning("web research question quota exhausted, retry via fallback")
+            try:
+                sources = _collect_web_research_sources(text)
+                prompt_text = _build_web_research_prompt(text, sources)
+                reply_text = _llm_chat(prompt_text, context, facts, pnotes)
+            except Exception as e2:
+                logger.warning("web research question fallback failed: %s", e2)
+                return True
+        else:
+            logger.warning("web research immediate path failed: %s", e)
+            return False
+
+    if not reply_text or not reply_text.strip():
+        logger.info("web research question returned empty group=%s", group_id)
+        return True
+
+    memory.append_turn(group_id, "user", text)
+    memory.append_turn(group_id, "bot", reply_text)
+    _reply(event.reply_token, reply_text, group_id=group_id)
+    return True
 
 
 def _handle_dinner_recommendation(event: MessageEvent, group_id: str) -> None:

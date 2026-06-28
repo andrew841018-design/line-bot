@@ -1433,6 +1433,35 @@ def update_reminder_schedule(
         return cur.rowcount > 0
 
 
+def delete_stale_pending_reminders(
+    grace_seconds: int = 3600,
+    group_id: str | None = None,
+) -> int:
+    """Delete pending reminders that are clearly past their due window.
+
+    `reminder_push` still has a ±15 minute "now" stage. A 1-hour default grace
+    keeps that path intact while preventing stale pending rows from lingering
+    for days.
+    """
+    import time
+
+    cutoff = int(time.time()) - max(0, int(grace_seconds))
+    with _lock, _conn() as c:
+        if group_id is not None:
+            cursor = c.execute(
+                "DELETE FROM reminders "
+                "WHERE status='pending' AND group_id=? AND remind_at < ?",
+                (group_id, cutoff),
+            )
+        else:
+            cursor = c.execute(
+                "DELETE FROM reminders "
+                "WHERE status='pending' AND remind_at < ?",
+                (cutoff,),
+            )
+        return cursor.rowcount
+
+
 def expire_old_reminders(threshold_seconds: int = 86400 * 3) -> int:
     """把過期超過 threshold（預設 3 天）的 pending reminder 標記 expired。回標記筆數。"""
     import time

@@ -615,6 +615,39 @@ def test_quota_saver_calendar_capture_uses_regex_path_without_gemini(monkeypatch
     assert inserted[0]["title"] == "預約羽球場"
 
 
+def test_auto_capture_local_regex_saves_shared_badminton_events(monkeypatch):
+    import calendar_db
+    from datetime import datetime as real_datetime
+
+    inserted: list[dict] = []
+
+    class FixedDateTime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 6, 27, tzinfo=tz)
+
+    monkeypatch.setattr(main, "datetime", FixedDateTime)
+    monkeypatch.setattr(
+        calendar_db,
+        "insert_event",
+        lambda **kw: inserted.append(kw) or f"event-{len(inserted)}",
+    )
+
+    main._auto_capture_text_if_important(
+        "GRP001",
+        "咪寶：幫我排入行程：\n7/5 1600和7/12 1800 全家打羽球",
+        "USR001",
+        "MSG001",
+    )
+
+    assert [
+        (item["event_date"], item["event_time"], item["title"]) for item in inserted
+    ] == [
+        ("2026-07-05", "16:00", "全家打羽球"),
+        ("2026-07-12", "18:00", "全家打羽球"),
+    ]
+
+
 def test_quota_saver_reminder_uses_regex_without_gemini(monkeypatch):
     saved: list[tuple] = []
 

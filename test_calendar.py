@@ -207,6 +207,11 @@ def _to_calendar_remind_ts(event_date: str, event_time: str | None = None) -> in
     return int(datetime(y, m, d, h, minute, tzinfo=ZoneInfo("Asia/Taipei")).timestamp())
 
 
+def _month_day_label(event_date: str) -> str:
+    _, month_s, day_s = event_date.split("-")
+    return f"{int(month_s)}/{int(day_s)}"
+
+
 def _align_memory_db_with_calendar(calendar_db_module) -> None:
     import memory
 
@@ -235,6 +240,87 @@ def test_insert_event_syncs_to_reminder(tmp_calendar_db):
     assert reminders[0]["source_ref"] == event_id
     assert reminders[0]["action"] == "爸爸健檢"
     assert reminders[0]["remind_at"] == _to_calendar_remind_ts(event_date, "08:00")
+
+
+def test_badminton_event_syncs_to_booking_reminder_on_booking_window(tmp_calendar_db):
+    cd = tmp_calendar_db
+    _align_memory_db_with_calendar(cd)
+    import memory
+
+    event_date = (date.today() + timedelta(days=10)).isoformat()
+    event_id = cd.insert_event(
+        group_id="G1",
+        title="全家打羽球",
+        event_date=event_date,
+        event_time="16:00",
+        participants=["黃聖雅"],
+    )
+    assert event_id
+
+    reminders = memory.list_pending_reminders("G1")
+    assert len(reminders) == 1
+    expected_at = _to_calendar_remind_ts(event_date, "18:00") - 7 * 86400
+    assert reminders[0]["source_kind"] == "calendar_event"
+    assert reminders[0]["source_ref"] == event_id
+    assert reminders[0]["remind_at"] == expected_at
+    assert reminders[0]["action"] == f"黃聖雅負責預約{_month_day_label(event_date)}打羽球場地"
+    assert reminders[0]["mention_aliases"] == ["黃聖雅"]
+
+    cd.sync_active_events_to_reminders("G1")
+    resynced = memory.list_pending_reminders("G1")
+    assert len(resynced) == 1
+    assert resynced[0]["remind_at"] == expected_at
+
+
+def test_badminton_event_can_override_booking_lead_days(tmp_calendar_db):
+    cd = tmp_calendar_db
+    _align_memory_db_with_calendar(cd)
+    import memory
+
+    event_date = (date.today() + timedelta(days=10)).isoformat()
+    event_id = cd.insert_event(
+        group_id="G1",
+        title="全家打羽球",
+        event_date=event_date,
+        event_time="16:00",
+        participants=["黃聖雅"],
+    )
+    assert event_id
+
+    assert cd.update_event_reminder_lead_days(event_id, 5) is True
+
+    expected_at = _to_calendar_remind_ts(event_date, "18:00") - 5 * 86400
+    reminders = memory.list_pending_reminders("G1")
+    assert len(reminders) == 1
+    assert reminders[0]["source_ref"] == event_id
+    assert reminders[0]["remind_at"] == expected_at
+    assert reminders[0]["action"] == f"黃聖雅負責預約{_month_day_label(event_date)}打羽球場地"
+
+    cd.sync_active_events_to_reminders("G1")
+    resynced = memory.list_pending_reminders("G1")
+    assert len(resynced) == 1
+    assert resynced[0]["remind_at"] == expected_at
+
+
+def test_badminton_event_with_family_marker_keeps_all_mention(tmp_calendar_db):
+    cd = tmp_calendar_db
+    _align_memory_db_with_calendar(cd)
+    import memory
+
+    event_date = (date.today() + timedelta(days=10)).isoformat()
+    event_id = cd.insert_event(
+        group_id="G1",
+        title="全家打羽球",
+        event_date=event_date,
+        event_time="18:00",
+        participants=["全家"],
+    )
+    assert event_id
+
+    reminders = memory.list_pending_reminders("G1")
+    assert len(reminders) == 1
+    assert reminders[0]["action"] == f"預約{_month_day_label(event_date)}打羽球場地"
+    assert reminders[0]["mention_aliases"] == ["全家"]
 
 
 def test_update_event_syncs_reminder_time(tmp_calendar_db):

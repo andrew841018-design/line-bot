@@ -417,12 +417,43 @@ def _title_for_fragment(segment_body: str, location: str | None, combined_text: 
     return _sanitize_title(raw or "行程")
 
 
+def _is_weak_fragment_title(title: str | None) -> bool:
+    """Return True when a fragment only contains a connector/noise word.
+
+    Example: "7/5 1600和7/12 1800 全家打羽球" gives the first fragment title
+    "和"; the actual shared title lives after the final date/time fragment.
+    """
+    cleaned = re.sub(r"[\s，,、。；;：:（）()]+", "", title or "")
+    return cleaned in {"", "行程", "和", "以及", "並且", "還有", "及", "與", "跟", "同"}
+
+
+def _shared_tail_title(combined_text: str, today_tw: date) -> str | None:
+    matches = list(_DATE_TOKEN.finditer(combined_text))
+    if len(matches) < 2:
+        return None
+    tail = combined_text[matches[-1].start() :]
+    token_match = _DATE_PREFIX.match(tail.strip())
+    if not token_match:
+        return None
+    if not _parse_date_token(token_match.group(0), today_tw):
+        return None
+    body = _strip_date_prefix(tail)
+    location = _extract_location(body)
+    title = _title_for_fragment(body, location, combined_text)
+    if _is_weak_fragment_title(title):
+        return None
+    if not _classify_type(f"{title} {body} {combined_text}"):
+        return None
+    return title
+
+
 def _fragment_event(
     segment: str,
     today_tw: date,
     combined_text: str,
     *,
     require_time: bool = True,
+    fallback_title: str | None = None,
 ) -> dict | None:
     token_match = _DATE_PREFIX.match(segment.strip())
     if not token_match:
@@ -438,6 +469,8 @@ def _fragment_event(
         time_str = None
     location = _extract_location(body)
     title = _title_for_fragment(body, location, combined_text)
+    if fallback_title and _is_weak_fragment_title(title):
+        title = fallback_title
     et = _classify_type(f"{title} {body} {combined_text}")
     if not et:
         return None
@@ -472,10 +505,17 @@ def extract_many_regex_only(
         events.append(first)
 
     matches = list(_DATE_TOKEN.finditer(combined_text))
+    fallback_title = _shared_tail_title(combined_text, today_tw)
     for idx, match in enumerate(matches):
         end = matches[idx + 1].start() if idx + 1 < len(matches) else len(combined_text)
         segment = combined_text[match.start():end]
-        ev = _fragment_event(segment, today_tw, combined_text, require_time=require_time)
+        ev = _fragment_event(
+            segment,
+            today_tw,
+            combined_text,
+            require_time=require_time,
+            fallback_title=fallback_title,
+        )
         if ev:
             events.append(ev)
 

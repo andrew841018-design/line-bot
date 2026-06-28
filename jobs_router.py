@@ -1,7 +1,7 @@
 """HTTP-triggerable job dispatcher.
 
 Security:
-  1. IP allowlist: loopback only
+  1. IP allowlist: loopback only unless JOBS_ALLOW_PUBLIC_HTTP=1
   2. Origin header reject (browser CSRF defense)
   3. Path regex on {job_name}
   4. Registry lookup -> 404 if unknown
@@ -10,7 +10,8 @@ Security:
 
 Process:
   - BackgroundTasks runs _run_subprocess
-  - subprocess.Popen with EXPLICIT env (no os.environ inheritance)
+  - subprocess.Popen with explicit env by default
+    (JOBS_SUBPROCESS_INHERIT_ENV=1 lets Cloud Run jobs see runtime secrets)
   - timeout -> SIGTERM 5s grace -> SIGKILL
   - Atomic state write (tmp + os.replace)
   - PID tracked; startup_sweep marks dead-PID 'running' as 'interrupted'
@@ -95,6 +96,26 @@ def _sanitize(text: str) -> str:
     return text
 
 
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _public_http_enabled() -> bool:
+    return _env_flag("JOBS_ALLOW_PUBLIC_HTTP")
+
+
+def _inherit_env_enabled() -> bool:
+    return _env_flag("JOBS_SUBPROCESS_INHERIT_ENV")
+
+
+def _subprocess_env(spec_env: dict[str, str]) -> dict[str, str]:
+    if not _inherit_env_enabled():
+        return spec_env
+    merged = dict(os.environ)
+    merged.update(spec_env)
+    return merged
+
+
 def _state_path(job_name: str) -> Path:
     return STATE_DIR / f"last_run_{job_name}.json"
 
@@ -114,7 +135,9 @@ def _atomic_write(path: Path, data: dict) -> None:
         raise
 
 
-def _check_ip(request: Request) -> None:
+def _check_ip(request: Request, *, allow_public: bool = False) -> None:
+    if allow_public and _public_http_enabled():
+        return
     host = request.client.host if request.client else ""
     if host not in _ALLOWED_IPS:
         raise HTTPException(403, f"IP not allowed: {host}")
@@ -262,7 +285,7 @@ def _run_subprocess(job_name: str, spec: JobSpec) -> None:
         proc = subprocess.Popen(
             spec.command,
             cwd=spec.cwd,
-            env=spec.env,
+            env=_subprocess_env(spec.env),
             stdout=log_file,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -332,7 +355,7 @@ def _run_subprocess(job_name: str, spec: JobSpec) -> None:
 @router.post("/discord-alert")
 async def discord_alert(request: Request):
     """Local n8n failure-alert bridge to the existing Discord DM sender."""
-    _check_ip(request)
+    _check_ip(request, allow_public=True)
     _check_origin(request)
     _check_purpose_token(request, _DISCORD_ALERT_PURPOSE)
     payload = await _read_discord_alert_payload(request)
@@ -344,7 +367,7 @@ async def discord_alert(request: Request):
 
 @router.post("/{job_name}")
 async def trigger_job(job_name: str, request: Request, background_tasks: BackgroundTasks):
-    _check_ip(request)
+    _check_ip(request, allow_public=True)
     _check_origin(request)
     spec = _validate_job_name(job_name)
     _check_token(request, job_name)
@@ -355,7 +378,7 @@ async def trigger_job(job_name: str, request: Request, background_tasks: Backgro
 
 @router.get("/{job_name}/last-run")
 async def last_run(job_name: str, request: Request):
-    _check_ip(request)
+    _check_ip(request, allow_public=True)
     _check_origin(request)
     _validate_job_name(job_name)
     _check_token(request, job_name)

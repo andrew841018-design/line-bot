@@ -7,6 +7,7 @@ drain 的成功·dropped·過期·quota-gate·release。
 """
 
 import os
+import sqlite3
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -57,6 +58,31 @@ def test_enqueue_skips_non_candidate(temp_db):
     import memory
     main._enqueue_reminder_if_candidate("今天天氣真好啊", "G1", "U1", "m1")
     assert memory.list_pending_reminder_retries("G1") == []
+
+
+def test_delete_stale_pending_reminders_keeps_recent_past(temp_db):
+    import time
+    import memory
+
+    now = int(time.time())
+    stale_id = memory.add_reminder("G1", "U1", "過期提醒", now - 7200)
+    recent_id = memory.add_reminder("G1", "U1", "剛過提醒", now - 1800)
+    future_id = memory.add_reminder("G1", "U1", "未來提醒", now + 7200)
+
+    deleted = memory.delete_stale_pending_reminders(grace_seconds=3600)
+
+    assert deleted == 1
+    with sqlite3.connect(temp_db) as c:
+        rows = dict(
+            c.execute(
+                "SELECT reminder_id, status FROM reminders "
+                "WHERE reminder_id IN (?, ?, ?)",
+                (stale_id, recent_id, future_id),
+            ).fetchall()
+        )
+    assert stale_id not in rows
+    assert rows[recent_id] == "pending"
+    assert rows[future_id] == "pending"
 
 
 def test_maybe_extract_skips_non_action_date_text(temp_db, monkeypatch):

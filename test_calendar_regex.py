@@ -49,6 +49,20 @@ def test_stock_news_with_date_not_event():
     assert out == []
 
 
+def test_multiple_slash_dates_share_tail_title():
+    """「7/5 1600和7/12 1800 全家打羽球」兩個日期共用尾端事件標題。"""
+    out = calendar_regex.extract_many_regex_only(
+        "7/5 1600和7/12 1800 全家打羽球",
+        date(2026, 6, 27),
+    )
+    assert [
+        (item["date"], item["time"], item["title"]) for item in out
+    ] == [
+        ("2026-07-05", "16:00", "全家打羽球"),
+        ("2026-07-12", "18:00", "全家打羽球"),
+    ]
+
+
 def test_work_iso_format_rejected():
     """ISO 日期格式的工作事件也要拒絕。"""
     out = calendar_regex.extract_regex_only(

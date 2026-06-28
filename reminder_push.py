@@ -38,6 +38,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s | %(message)s",
 )
 logger = logging.getLogger("reminder_push")
+STALE_PENDING_GRACE_SECONDS = 3600
 
 
 def _line_access_token() -> str:
@@ -268,6 +269,12 @@ def push_reminders(dry_run: bool = False) -> int:
 
     回 push 成功的筆數。
     """
+    deleted = memory.delete_stale_pending_reminders(
+        grace_seconds=STALE_PENDING_GRACE_SECONDS
+    )
+    if deleted:
+        logger.info("deleted %d stale pending reminders", deleted)
+
     sent = 0
 
     for item in _due_reminder_items():

@@ -17,6 +17,8 @@ from fastapi.testclient import TestClient
 def _env(monkeypatch, tmp_path):
     monkeypatch.setenv("JOBS_MASTER_TOKEN", "test-master-token-fixture")
     monkeypatch.setenv("JOBS_ROUTES_ENABLED", "1")
+    monkeypatch.delenv("JOBS_ALLOW_PUBLIC_HTTP", raising=False)
+    monkeypatch.delenv("JOBS_SUBPROCESS_INHERIT_ENV", raising=False)
     # Redirect state/log dirs to tmp
     import jobs_router as jr
     import jobs_config as jc
@@ -68,8 +70,44 @@ def test_list_jobs_rejects_origin(client):
     assert r.status_code == 403
 
 
+def test_list_jobs_stays_loopback_only_when_public_http_enabled(client, monkeypatch):
+    import jobs_router as jr
+
+    monkeypatch.setenv("JOBS_ALLOW_PUBLIC_HTTP", "1")
+    monkeypatch.setattr(jr, "_ALLOWED_IPS", {"127.0.0.1"})
+
+    r = client.get("/jobs")
+
+    assert r.status_code == 403
+
+
 def test_trigger_missing_token(client):
     r = client.post("/jobs/daily-briefing-discord")
+    assert r.status_code == 401
+
+
+def test_public_http_flag_allows_tokened_trigger_from_non_loopback(client, monkeypatch):
+    import jobs_router as jr
+
+    monkeypatch.setenv("JOBS_ALLOW_PUBLIC_HTTP", "1")
+    monkeypatch.setattr(jr, "_ALLOWED_IPS", {"127.0.0.1"})
+
+    r = client.post(
+        "/jobs/daily-briefing-discord",
+        headers={"X-Job-Token": _token_for("daily-briefing-discord")},
+    )
+
+    assert r.status_code == 202
+
+
+def test_public_http_flag_does_not_bypass_job_token(client, monkeypatch):
+    import jobs_router as jr
+
+    monkeypatch.setenv("JOBS_ALLOW_PUBLIC_HTTP", "1")
+    monkeypatch.setattr(jr, "_ALLOWED_IPS", {"127.0.0.1"})
+
+    r = client.post("/jobs/daily-briefing-discord")
+
     assert r.status_code == 401
 
 
@@ -347,6 +385,29 @@ def test_sanitize_strips_bearer():
     out = jr._sanitize(s)
     assert "abc123def456" not in out
     assert "REDACTED" in out
+
+
+def test_subprocess_env_is_explicit_by_default(monkeypatch):
+    import jobs_router as jr
+
+    monkeypatch.delenv("JOBS_SUBPROCESS_INHERIT_ENV", raising=False)
+    monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "runtime-token")
+
+    env = jr._subprocess_env({"PATH": "/bin"})
+
+    assert env == {"PATH": "/bin"}
+
+
+def test_subprocess_env_can_inherit_runtime_env(monkeypatch):
+    import jobs_router as jr
+
+    monkeypatch.setenv("JOBS_SUBPROCESS_INHERIT_ENV", "1")
+    monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "runtime-token")
+
+    env = jr._subprocess_env({"PATH": "/bin"})
+
+    assert env["LINE_CHANNEL_ACCESS_TOKEN"] == "runtime-token"
+    assert env["PATH"] == "/bin"
 
 
 def test_startup_sweep_marks_dead_pid_interrupted(tmp_path):

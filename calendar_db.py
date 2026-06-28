@@ -45,6 +45,7 @@ _EVENT_REMINDER_CODE_RE = re.compile(
     r"\s*[:：]?\s*([A-Za-z0-9]{4,12})",
     re.IGNORECASE,
 )
+_BADMINTON_RE = re.compile(r"羽球")
 
 
 def _extract_event_reference_info(raw_text: str | None) -> tuple[list[str], list[str]]:
@@ -143,6 +144,40 @@ def _clean_participant_name(name: str) -> str:
     return cleaned
 
 
+def _is_badminton_event(event: Mapping[str, object]) -> bool:
+    haystack = " ".join(
+        str(event.get(key, "") or "")
+        for key in ("title", "location", "source_text")
+    )
+    return bool(_BADMINTON_RE.search(haystack))
+
+
+def _format_month_day(event_date: str) -> str:
+    try:
+        _, month_s, day_s = str(event_date).split("-", 2)
+        return f"{int(month_s)}/{int(day_s)}"
+    except Exception:
+        return str(event_date)
+
+
+def _event_reminder_lead_days(event: Mapping[str, object]) -> int:
+    raw = event.get("reminder_lead_days")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            days = int(raw)
+        except (TypeError, ValueError):
+            days = -1
+        if 0 <= days <= 365:
+            return days
+    return 7 if _is_badminton_event(event) else 0
+
+
+def _event_reminder_time(event: Mapping[str, object]) -> object:
+    if _is_badminton_event(event):
+        return "18:00"
+    return event.get("event_time")
+
+
 def _reminded_column(offset: int) -> str:
     """offset → reminded_Xd column name。Whitelist 驗 offset 防 SQL injection (column 不能 bind param)。"""
     if offset not in REMINDER_OFFSETS:
@@ -171,6 +206,25 @@ def _ensure_memory_db_path() -> None:
 
 def _event_reminder_payload(event: Mapping[str, object]) -> tuple[str, str]:
     title = str(event.get("title", "") or "").strip()
+    participants = _event_participants(event)
+    if _is_badminton_event(event):
+        event_date = str(event.get("event_date", "") or "").strip()
+        event_time = str(event.get("event_time", "") or "").strip()
+        responsible = [p for p in participants if p and p != "全家"]
+        prefix = f"{'、'.join(responsible)}負責" if responsible else ""
+        action = f"{prefix}預約{_format_month_day(event_date)}打羽球場地"
+        source_parts = [f"活動：{title or '打羽球'}"]
+        if event_date:
+            source_parts.append(f"活動日期：{event_date}")
+        if event_time:
+            source_parts.append(f"活動時間：{event_time}")
+        if responsible:
+            source_parts.append("預約負責人：" + "、".join(responsible))
+        elif participants:
+            source_parts.append("預約標注：" + "、".join(participants))
+        source_parts.append("提醒規則：活動前 7 天預約場地")
+        return action, "；".join([p for p in source_parts if p])
+
     action = title or "家族行事曆提醒"
 
     source_parts = [title]
@@ -180,7 +234,6 @@ def _event_reminder_payload(event: Mapping[str, object]) -> tuple[str, str]:
     event_time = str(event.get("event_time", "") or "").strip()
     if event_time:
         source_parts.append(f"時間：{event_time}")
-    participants = _event_participants(event)
     if participants:
         source_parts.append("參加人：" + "、".join(participants))
     source_msg_id = str(event.get("source_msg_id") or "").strip()
@@ -203,7 +256,12 @@ def _event_reminder_payload(event: Mapping[str, object]) -> tuple[str, str]:
     return action, "；".join([p for p in source_parts if p])
 
 
-def _event_to_remind_at(event_date: str, event_time: str | None) -> int | None:
+def _event_to_remind_at(
+    event_date: str,
+    event_time: str | None,
+    *,
+    days_before: int = 0,
+) -> int | None:
     if not event_date:
         return None
     try:
@@ -213,6 +271,8 @@ def _event_to_remind_at(event_date: str, event_time: str | None) -> int | None:
             hour, minute = 0, 0
         y, m, d = (int(x) for x in str(event_date).split("-"))
         dt = datetime(y, m, d, hour, minute, tzinfo=_TW)
+        if days_before:
+            dt = dt - timedelta(days=days_before)
         return int(dt.timestamp())
     except Exception:
         return None
@@ -221,8 +281,11 @@ def _event_to_remind_at(event_date: str, event_time: str | None) -> int | None:
 def _upsert_event_reminder(event: Mapping[str, object]) -> bool:
     if not event:
         return False
+    days_before = _event_reminder_lead_days(event)
     remind_at = _event_to_remind_at(
-        str(event.get("event_date", "")), event.get("event_time")  # type: ignore[arg-type]
+        str(event.get("event_date", "")),
+        _event_reminder_time(event),  # type: ignore[arg-type]
+        days_before=days_before,
     )
     if remind_at is None:
         return False
@@ -244,10 +307,12 @@ def _upsert_event_reminder(event: Mapping[str, object]) -> bool:
         except Exception:
             pass
 
-    mention_aliases = _merge_mention_aliases(
-        _event_participants(event),
-        _raw_text_reminder_aliases(raw_text),
-    )
+    participant_aliases = _event_participants(event)
+    raw_aliases = _raw_text_reminder_aliases(raw_text)
+    if _is_badminton_event(event) and participant_aliases:
+        mention_aliases = participant_aliases
+    else:
+        mention_aliases = _merge_mention_aliases(participant_aliases, raw_aliases)
 
     _ensure_memory_db_path()
     try:
@@ -313,7 +378,8 @@ def init_db() -> None:
                 source_msg_id  TEXT,
                 status         TEXT NOT NULL DEFAULT 'active',
                 created_at     INTEGER NOT NULL,
-                reminded_at    INTEGER
+                reminded_at    INTEGER,
+                reminder_lead_days INTEGER
             )
             """
         )
@@ -336,6 +402,15 @@ def init_db() -> None:
             # 重新 verify（如果是 lock 沒做成功，下一輪 init_db 會處理）
             cols = [r[1] for r in c.execute("PRAGMA table_info(events)").fetchall()]
         assert "event_type" in cols, "event_type migration failed"
+        if "reminder_lead_days" not in cols:
+            try:
+                c.execute("ALTER TABLE events ADD COLUMN reminder_lead_days INTEGER")
+            except sqlite3.OperationalError as e:
+                msg = str(e).lower()
+                if "duplicate column" not in msg and "database is locked" not in msg:
+                    raise
+            cols = [r[1] for r in c.execute("PRAGMA table_info(events)").fetchall()]
+        assert "reminder_lead_days" in cols, "reminder_lead_days migration failed"
 
         # Reminder offsets migration — 每個 offset 一個 timestamp 欄位（NULL=未推）
         # 同 event_type PRAGMA pre-check + duplicate-column tolerance (codex critical)
@@ -424,14 +499,14 @@ def sync_active_events_to_reminders(group_id: str | None = None) -> int:
         if group_id:
             rows = c.execute(
                 "SELECT event_id, group_id, title, event_date, event_time, "
-                "location, participants, status, source_msg_id FROM events "
+                "location, participants, status, source_msg_id, reminder_lead_days FROM events "
                 "WHERE group_id = ? AND status='active'",
                 (group_id,),
             ).fetchall()
         else:
             rows = c.execute(
                 "SELECT event_id, group_id, title, event_date, event_time, "
-                "location, participants, status, source_msg_id FROM events "
+                "location, participants, status, source_msg_id, reminder_lead_days FROM events "
                 "WHERE status='active'",
             ).fetchall()
 
@@ -571,7 +646,8 @@ def update_event_schedule(
             return False
         row = c.execute(
             "SELECT event_id, group_id, title, event_date, event_time, "
-            "location, participants, source_msg_id FROM events WHERE event_id = ?",
+            "location, participants, source_msg_id, reminder_lead_days "
+            "FROM events WHERE event_id = ?",
             (event_id,),
         ).fetchone()
         if row:
@@ -584,6 +660,7 @@ def update_event_schedule(
                 "location": row[5],
                 "participants": row[6],
                 "source_msg_id": row[7],
+                "reminder_lead_days": row[8],
             }
             updated = True
     if updated and event:
@@ -593,6 +670,37 @@ def update_event_schedule(
 
 def update_event_date(event_id: str, new_date: str, new_time: str | None = None) -> bool:
     return update_event_schedule(event_id, new_date, new_time)
+
+
+def update_event_reminder_lead_days(event_id: str, lead_days: int | None) -> bool:
+    normalized_days = None
+    if lead_days is not None:
+        try:
+            normalized_days = int(lead_days)
+        except (TypeError, ValueError):
+            return False
+        if not 0 <= normalized_days <= 365:
+            return False
+    event: dict[str, object] | None = None
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "UPDATE events SET reminder_lead_days = ? WHERE event_id = ?",
+            (normalized_days, event_id),
+        )
+        if cur.rowcount == 0:
+            return False
+        c.row_factory = sqlite3.Row
+        row = c.execute(
+            "SELECT event_id, group_id, title, event_date, event_time, "
+            "location, participants, source_msg_id, reminder_lead_days "
+            "FROM events WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+        if row:
+            event = dict(row)
+    if event:
+        _upsert_event_reminder(event)
+    return True
 
 
 def list_upcoming(group_id: str, days: int = 30) -> list[dict]:

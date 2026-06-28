@@ -82,6 +82,20 @@ def test_far_future_reminder_does_not_weekly_push_immediately(monkeypatch):
     assert reminder_push.due_reminders_for_reply("G1", limit=2, now=now) == []
 
 
+def test_push_reminders_deletes_stale_pending_before_scan(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        reminder_push.memory,
+        "delete_stale_pending_reminders",
+        lambda grace_seconds: calls.append(grace_seconds) or 2,
+    )
+    monkeypatch.setattr(reminder_push, "_due_reminder_items", lambda: [])
+
+    assert reminder_push.push_reminders(dry_run=True) == 0
+    assert calls == [reminder_push.STALE_PENDING_GRACE_SECONDS]
+
+
 def test_weekly_reminder_starts_within_30_days(monkeypatch):
     now = 1_800_000_000
 
