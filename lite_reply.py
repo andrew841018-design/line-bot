@@ -167,7 +167,7 @@ def _google_search_snippet_raw(query: str) -> str | None:
                 snippet = el.get_text(" ", strip=True)[:300]
                 if snippet and len(snippet) > 20:
                     return (
-                        f"🔍 lite mode（Google 首頁 snippet）：\n"
+                        f"🔍 Google 搜尋片段：\n"
                         f"{snippet}\n\n"
                         f"完整搜尋：{url}"
                     )
@@ -204,7 +204,7 @@ def _duckduckgo_search_snippet_raw(query: str) -> str | None:
             snippet = el.get_text(" ", strip=True)[:300]
             if snippet and len(snippet) > 20:
                 return (
-                    f"🔍 lite mode（DuckDuckGo 搜尋片段）：\n"
+                    f"🔍 DuckDuckGo 搜尋片段：\n"
                     f"{snippet}\n\n"
                     f"完整搜尋：{url}"
                 )
@@ -268,7 +268,7 @@ def _summarize_url(url: str) -> str | None:
             out.append(f"📰 {title}")
         if desc:
             out.append(f"\n{desc}")
-        out.append("\n\n（lite mode：Gemini 配額用完，僅抓網頁摘要）")
+        out.append("\n\n（網頁摘要）")
         return "".join(out)
     except Exception as e:
         logger.info("_summarize_url failed (%s): %s", url, e)
@@ -358,7 +358,7 @@ def _wiki_summary(query: str) -> str | None:
         out = f"📖 維基百科：{title}\n\n{extract[:400]}"
         if page_url:
             out += f"\n\n{page_url}"
-        out += "\n\n（lite mode：Gemini 配額用完，從維基抓的）"
+        out += "\n\n（來源：維基百科）"
         return out
     except Exception as e:
         logger.info("_wiki_summary failed (%s): %s", query, e)
@@ -443,7 +443,7 @@ def _weather_taiwan(text: str = "") -> str | None:
             f"  降雨機率：{pop_pct}%\n"
             f"  氣溫：{min_temp}°C ~ {max_temp}°C\n"
             f"  舒適度：{ci_desc}\n\n"
-            "（lite mode：CWA F-C0032-001 公開資料）"
+            "（來源：CWA F-C0032-001 公開資料）"
         )
     except Exception as e:
         logger.info("_weather_taiwan failed: %s", e)
@@ -643,7 +643,7 @@ def _youtube_info(text: str) -> str | None:
             f"🎬 {data.get('title', '?')}\n"
             f"  頻道：{data.get('author_name', '?')}\n"
             f"  https://youtu.be/{video_id}\n\n"
-            "（lite mode：oEmbed metadata，無內容摘要）"
+            "（來源：oEmbed metadata，無內容摘要）"
         )
     except Exception as e:
         logger.info("_youtube_info failed: %s", e)
@@ -678,7 +678,7 @@ def _google_search_snippet(query: str) -> str | None:
                 snippet = el.get_text(" ", strip=True)[:300]
                 if snippet and len(snippet) > 20:
                     return (
-                        f"🔍 lite mode（Google 首頁 snippet）：\n"
+                        f"🔍 Google 搜尋片段：\n"
                         f"{snippet}\n\n"
                         f"完整搜尋：{url}"
                     )
@@ -708,10 +708,10 @@ def _try_stock(text: str, context: list | None = None) -> str | None:
     """股票 ticker / 中文股名 → yfinance 即時。"""
     taiex_technical = stock_quote.get_taiex_month_line_text(text)
     if taiex_technical:
-        return f"{taiex_technical}\n\n（lite mode：Gemini 配額用完，純查公開報價/日線）"
+        return f"{taiex_technical}\n\n（來源：公開報價/日線）"
     quotes = stock_quote.get_contextual_quotes_text(text, context=context)
     if quotes:
-        return f"{quotes}\n\n（lite mode：Gemini 配額用完，純查公開報價）"
+        return f"{quotes}\n\n（來源：公開報價）"
     return None
 
 
@@ -816,7 +816,7 @@ def _try_local_llm(text: str, context: list | None = None) -> str | None:
         return None
 
     if response and isinstance(response, str) and len(response.strip()) > 5:
-        return f"{response.strip()}\n\n（lite mode — local LLM）"
+        return response.strip()
     return None
 
 

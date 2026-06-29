@@ -145,8 +145,17 @@ def test_classify_gemini_exception_returns_None():
 
 
 @pytest.fixture
-def tmp_db(tmp_path):
+def tmp_db(tmp_path, monkeypatch):
     """Synthetic raw_messages DB（與 prod schema 一致）。"""
+    real_localtime = time.localtime
+    fixed_now = time.struct_time((2026, 6, 29, 12, 0, 0, 0, 180, -1))
+
+    def fake_localtime(*args):
+        if args:
+            return real_localtime(*args)
+        return fixed_now
+
+    monkeypatch.setattr(time, "localtime", fake_localtime)
     db = tmp_path / "test_line_bot.db"
     conn = sqlite3.connect(str(db))
     conn.execute("""
@@ -160,12 +169,16 @@ def tmp_db(tmp_path):
         )
     """)
     # Insert 4 rows: 2 today (財經 + 健康), 1 today no-cat, 1 yesterday (財經)
-    now = int(time.time())
-    yesterday = now - 86400 - 3600  # 25h ago to be safe
+    now = time.localtime()
+    today_start = int(time.mktime((
+        now.tm_year, now.tm_mon, now.tm_mday,
+        0, 0, 0, 0, 0, -1
+    )))
+    yesterday = today_start - 3600
     rows = [
-        ("g1", "m1", "u1", "TSMC 漲", now - 100),
-        ("g1", "m2", "u1", "感冒了", now - 50),
-        ("g1", "m3", "u1", "閒聊", now - 25),
+        ("g1", "m1", "u1", "TSMC 漲", today_start + 60),
+        ("g1", "m2", "u1", "感冒了", today_start + 120),
+        ("g1", "m3", "u1", "閒聊", today_start + 180),
         ("g1", "m4", "u1", "昨天 0050 配息", yesterday),
     ]
     conn.executemany(
@@ -255,9 +268,15 @@ def test_classify_async_runs_in_thread(tmp_db, monkeypatch):
     monkeypatch.setattr(mc, "_DB_PATH", tmp_db)
     mc._SCHEMA_ENSURED = False
 
+    class FakeThread:
+        def __init__(self, target, **kwargs):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(mc.threading, "Thread", FakeThread)
     mc.classify_async("g1", "m3", "TSMC 大漲")
-    # wait for background thread
-    time.sleep(0.5)
     conn = sqlite3.connect(str(tmp_db))
     cur = conn.execute("SELECT category FROM raw_messages WHERE message_id='m3'")
     cat = cur.fetchone()[0]

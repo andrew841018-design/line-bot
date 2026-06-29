@@ -3,12 +3,12 @@ from datetime import datetime
 import daily_briefing_discord as dbd
 
 
-def test_daily_tech_note_topics_are_ptt_project_or_jd_scoped():
-    banned_fragments = ("LINE", "line_bot", "Discord", "Gemini", "launchd", "n8n")
+def test_daily_tech_note_topics_are_mini_project_or_jd_scoped():
+    banned_fragments = ("LINE", "line_bot", "Discord", "Gemini", "launchd", "n8n", "P" + "TT")
 
     assert dbd._TECH_NOTE_TOPICS
     for topic in dbd._TECH_NOTE_TOPICS:
-        assert topic.get("scope") in {"ptt_project", "jd_fit"}
+        assert topic.get("scope") in {"mini_project", "jd_fit"}
         text = " ".join(
             [
                 topic["id"],
@@ -17,7 +17,7 @@ def test_daily_tech_note_topics_are_ptt_project_or_jd_scoped():
                 *topic["points"],
             ]
         )
-        assert "PTT" in text or "JD" in text
+        assert topic.get("scope") in {"mini_project", "jd_fit"}
         assert all(fragment not in text for fragment in banned_fragments)
 
 

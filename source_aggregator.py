@@ -176,7 +176,6 @@ _TIER_LOW_QUALITY: frozenset[str] = frozenset(
     {
         "kknews.cc",
         "every.tw",
-        "pttnews.cc",
         "buzzhand.com",
         "buzzlife.com.tw",
         "coco01.today",

@@ -96,7 +96,7 @@ def test_try_local_llm_returns_none_on_short_response(monkeypatch):
 
 
 def test_try_local_llm_returns_response_when_valid(monkeypatch):
-    """local_llm 回有效字串 → 加上 lite mode footer 回傳。"""
+    """local_llm 回有效字串 → 只回正式內容，不顯示 model footer。"""
     fake_module = type(sys)("local_llm")
     fake_module.chat = lambda *a, **kw: "這是 LLM 自主生成的回應內容"
     monkeypatch.setitem(sys.modules, "local_llm", fake_module)
@@ -104,7 +104,8 @@ def test_try_local_llm_returns_response_when_valid(monkeypatch):
     out = lite_reply._try_local_llm("為什麼天空是藍的")
     assert out is not None
     assert "這是 LLM 自主生成的回應內容" in out
-    assert "local LLM" in out
+    assert "local LLM" not in out
+    assert "lite mode" not in out
 
 
 def test_try_local_llm_passes_context(monkeypatch):
@@ -148,7 +149,7 @@ def test_try_local_llm_uses_opinion_prompt_for_shared_video(monkeypatch):
     monkeypatch.setattr(
         lite_reply,
         "_collect_opinion_reference_context",
-        lambda text, context=None: "🔍 lite mode（Google 首頁 snippet）：...",
+        lambda text, context=None: "🔍 Google 搜尋片段：...",
     )
 
     out = lite_reply._try_local_llm(
@@ -232,7 +233,7 @@ def test_try_local_llm_appends_search_reference_for_sparse_context(monkeypatch):
         lite_reply,
         "_collect_opinion_reference_context",
         lambda text, context=None: (
-            "🔍 lite mode（Google 首頁 snippet）：\n"
+            "🔍 Google 搜尋片段：\n"
             "關於貧窮家庭逆轉致富，關鍵在於存款、風險控管與長期紀律。\n"
             "完整搜尋：https://www.google.com/?q=%E8%B2%A1%E5%AF%8C%E8%87%AA%E7%94%B1"
         ),
@@ -243,7 +244,7 @@ def test_try_local_llm_appends_search_reference_for_sparse_context(monkeypatch):
     assert out is not None
     assert captured["context"][-1][0] == "research"
     assert "補充資料（可能可作為論證依據）" in captured["context"][-1][1]
-    assert "Google 首頁 snippet" in captured["context"][-1][1]
+    assert "Google 搜尋片段" in captured["context"][-1][1]
     assert captured["system_prompt"] is not None
     assert captured["max_tokens"] == 700
 

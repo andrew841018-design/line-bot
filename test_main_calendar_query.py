@@ -625,6 +625,7 @@ def test_auto_capture_gate_accepts_weekday_chinese_time_dentist(monkeypatch):
             (group_id, text, sender_user_id, message_id)
         ),
     )
+    monkeypatch.setattr(main, "_capture_calendar_events_regex_only", lambda *a, **k: 0)
 
     class InlineThread:
         def __init__(self, target, daemon=False):

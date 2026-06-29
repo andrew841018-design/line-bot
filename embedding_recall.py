@@ -149,6 +149,14 @@ def index_message(
     if not message_id or not group_id:
         return False
     if not _should_index(text):
+        try:
+            with _lock, _conn(db_path) as c:
+                c.execute(
+                    "DELETE FROM embeddings WHERE message_id=? AND group_id=?",
+                    (message_id, group_id),
+                )
+        except Exception as e:
+            logger.warning("delete stale embedding failed for %s: %s", message_id, e)
         return False
     try:
         vec = embed(text)

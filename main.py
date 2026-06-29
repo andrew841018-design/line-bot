@@ -205,6 +205,27 @@ def _is_system_status_outbound(text: str) -> bool:
     )
 
 
+def _strip_user_visible_mode_labels(text: str) -> str:
+    """Remove internal fallback/model labels from text before it reaches LINE."""
+    s = text or ""
+    replacements = {
+        "🔍 lite mode（Google 首頁 snippet）：": "🔍 Google 搜尋片段：",
+        "🔍 lite mode（DuckDuckGo 搜尋片段）：": "🔍 DuckDuckGo 搜尋片段：",
+    }
+    for old, new in replacements.items():
+        s = s.replace(old, new)
+    patterns = (
+        r"\n{0,3}（\s*lite mode\s*[—-]\s*local LLM\s*）",
+        r"\n{0,3}（\s*local LLM fallback\s*）",
+        r"\n{0,3}（\s*lite mode[^）]*）",
+        r"\n{0,3}\(\s*lite mode[^)]*\)",
+        r"\n{0,3}\(\s*local LLM fallback\s*\)",
+    )
+    for pattern in patterns:
+        s = re.sub(pattern, "", s, flags=re.IGNORECASE)
+    return s.strip()
+
+
 def _is_market_quote_outbound(text: str) -> bool:
     """Market quotes are reply-only; an expired reply token must not create a push."""
     return (text or "").lstrip().startswith(("【市場報價", "【即時股價"))
@@ -275,7 +296,7 @@ def _local_text_llm_fallback(
         logger.warning("local text fallback failed: %s", e)
         return ""
     if out and isinstance(out, str) and len(out.strip()) > 5:
-        return f"{out.strip()}\n\n（local LLM fallback）"
+        return out.strip()
     return ""
 
 
@@ -628,7 +649,7 @@ def _fetch_reddit_meta(url: str) -> str | None:
                     url,
                     timeout=_PREFETCH_TIMEOUT,
                     allow_redirects=True,
-                    headers={"User-Agent": "ptt-line-bot/1.0"},
+                    headers={"User-Agent": "andrew-line-bot/1.0"},
                 )
                 target = r.url
                 logger.info("reddit short url resolved: %s → %s", url, target)
@@ -651,7 +672,7 @@ def _fetch_reddit_meta(url: str) -> str | None:
         resp = _requests.get(
             json_url,
             timeout=_PREFETCH_TIMEOUT,
-            headers={"User-Agent": "ptt-line-bot/1.0 (LINE chatbot prefetcher)"},
+            headers={"User-Agent": "andrew-line-bot/1.0 (LINE chatbot prefetcher)"},
         )
         if resp.status_code != 200:
             logger.info("reddit .json HTTP %d url=%s", resp.status_code, json_url)
@@ -1179,6 +1200,27 @@ def _hash_text(value: str) -> str:
     return _hl.sha256((value or "").encode("utf-8")).hexdigest()[:12]
 
 
+def _safe_event_debug_dump(event) -> str:
+    src = getattr(event, "source", None)
+    msg = getattr(event, "message", None)
+    payload = {
+        "event_type": type(event).__name__,
+        "source_type": type(src).__name__ if src else None,
+        "group_id": getattr(src, "group_id", None) if src else None,
+    }
+    user_id = getattr(src, "user_id", None) if src else None
+    if user_id:
+        payload["user_id_sha256"] = _hash_text(user_id)
+    if msg is not None:
+        payload["message_type"] = getattr(msg, "type", type(msg).__name__)
+        payload["message_id"] = getattr(msg, "id", None)
+        text = getattr(msg, "text", None)
+        if text is not None:
+            payload["text_len"] = len(text)
+            payload["text_sha256"] = _hash_text(text)
+    return _json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
 @app.post("/callback")
 async def callback(request: Request, x_line_signature: str = Header(None)):
     # N3 fix (2026-05-30): errors="replace" 避免非 UTF-8 垃圾請求在驗章前就
@@ -1208,13 +1250,12 @@ async def callback(request: Request, x_line_signature: str = Header(None)):
             f"[EVENT] type={type(event).__name__} source={type(src).__name__ if src else None} group_id={gid}",
             flush=True,
         )
-        # 把整個 event 物件 dump 出來看有沒有什麼隱藏欄位
-        # 含 user_id / message text / group_id PII；預設關閉，設 DEBUG_EVENT_DUMP=1 才印
+        # Debug dump is sanitized: no raw message text or raw user_id.
         if os.getenv("DEBUG_EVENT_DUMP") == "1":
             try:
-                print(f"[EVENT_DUMP] {event.model_dump_json()}", flush=True)
+                print(f"[EVENT_DUMP] {_safe_event_debug_dump(event)}", flush=True)
             except Exception:
-                print(f"[EVENT_DUMP] (could not dump) repr={event!r}", flush=True)
+                print("[EVENT_DUMP] (could not dump sanitized event)", flush=True)
         try:
             _handle_event(event)
         except Exception as e:
@@ -1228,7 +1269,7 @@ def _handle_event(event) -> None:
         if os.getenv("DEBUG_EVENT_DUMP") == "1":
             try:
                 print(
-                    f"[MEMBER_EVT] {type(event).__name__} {event.model_dump_json()}",
+                    f"[MEMBER_EVT] {_safe_event_debug_dump(event)}",
                     flush=True,
                 )
             except Exception:
@@ -1289,14 +1330,17 @@ def _handle_event(event) -> None:
             )
         return
 
-    # Piggyback reminder：有人留言時仍可補 reminder；reply pending 已由開關停用。
-    _spawn_piggyback_drain(group_id)
-
     # 文字：先記進 raw_messages（供 quote 回查 / burst look-back / Layer 2 抓 trigger）
     if isinstance(msg, TextMessageContent):
-        memory.log_raw_message(group_id, msg.id, sender_user_id, msg.text or "")
+        text_body = msg.text or ""
+        memory.log_raw_message(group_id, msg.id, sender_user_id, text_body)
+        # Piggyback reminder：有人留言時仍可補 reminder；reply pending 已由開關停用。
+        _spawn_piggyback_drain(group_id)
         _handle_text_message(event, group_id)
         return
+
+    # Piggyback reminder：非文字內容仍可補 reminder；文字在上方先做衝突 gate。
+    _spawn_piggyback_drain(group_id)
 
     # 2026-06-06 改：圖片/影片只走即時 local analyze；不再存 pending reply。
     if isinstance(msg, ImageMessageContent):
@@ -2299,10 +2343,14 @@ def _try_handle_calendar_correction(
 
 def _handle_text_message(event: MessageEvent, group_id: str) -> None:
     text = event.message.text or ""
+    source = getattr(event, "source", None)
+    sender_user_id = getattr(source, "user_id", None) or ""
+    message_id = getattr(event.message, "id", "") or ""
+    clean_text = _extract_gemini_trigger(text, event.message)
 
     # 回饋收集：20:00 ~ 02:00 TW 窗口內，將文字訊息存入 pending_feedback.json
     if feedback_collector.in_feedback_window():
-        sender = getattr(event.source, "user_id", None) or "unknown"
+        sender = sender_user_id or "unknown"
         try:
             feedback_collector.collect_message(sender, text)
         except Exception as e:
@@ -2319,8 +2367,7 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
     # Organic 糾正偵測（2026-05-08 加）：user 講「不對 / 你誤會」之類的
     # 自然糾正訊號 → 抓上一輪 user/bot 訊息拼成 correction 寫進 persona_notes
     # 純信號擷取，**不**接管後續路由（用戶可能糾正完還想繼續對話）
-    sender_uid_for_correction = getattr(event.source, "user_id", None) or ""
-    _detect_user_correction(text, group_id, sender_uid_for_correction)
+    _detect_user_correction(text, group_id, sender_user_id)
 
     # 自動萃 knowledge graph 三元組（純本機，fire-and-forget）
     try:
@@ -2333,16 +2380,15 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
     # (2026-05-21 user directive: 每條留言自動判定重要性)
     # Cheap pre-filter (regex) → 通過才 spin off thread 跑 Gemini extractor
     # 重跑由 UNIQUE INDEX (group_id, title, event_date) 自動 dedup
-    sender_uid_for_capture = getattr(event.source, "user_id", None) or ""
     _auto_capture_text_if_important(
-        group_id, text, sender_uid_for_capture, event.message.id
+        group_id, text, sender_user_id, message_id
     )
 
     # 自動抽飲食 / 採購訊號（純規則 fire-and-forget，存 food_db；2026-05-31）
     # 逐則抽、不需 user_id（v1 家庭層級，GP2 A）、不需 pre-filter（無 Gemini quota 顧慮）
     try:
         import food_signals
-        food_signals.extract_and_store_async(group_id, event.message.id, text)
+        food_signals.extract_and_store_async(group_id, message_id, text)
     except (ImportError, Exception) as e:
         logger.debug("food_signals extract skipped: %s", e)
 
@@ -2353,7 +2399,7 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
 
         rule_cat = message_classifier.classify_rule(text)
         if rule_cat is not None:
-            message_classifier.update_category(group_id, event.message.id, rule_cat)
+            message_classifier.update_category(group_id, message_id, rule_cat)
         else:
             classifier_fallback = os.environ.get(
                 "GEMINI_CLASSIFIER_FALLBACK_ENABLED", ""
@@ -2361,11 +2407,11 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
             if classifier_fallback and _gemini_side_task_allowed(
                 "message_classifier"
             ):
-                message_classifier.classify_async(group_id, event.message.id, text)
+                message_classifier.classify_async(group_id, message_id, text)
             else:
                 message_classifier.update_category(
                     group_id,
-                    event.message.id,
+                    message_id,
                     message_classifier.DEFAULT_CATEGORY,
                 )
     except (ImportError, Exception) as e:
@@ -2373,18 +2419,16 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
 
     # 自動偵測 reminder（2026-05-08：含日期 + 時間/行動 hint 才抽，缺時間先當 00:00）
     # 失敗 silent，不阻塞主流程
-    sender_uid_for_reminder = getattr(event.source, "user_id", None) or ""
     _maybe_extract_reminder(
-        text, group_id, sender_uid_for_reminder, event.message.id
+        text, group_id, sender_user_id, message_id
     )
 
     # 1. 指令處理（指令不需要 @mention 也能用，方便管理）
-    sender_uid_for_command = getattr(event.source, "user_id", None) or ""
     cmd_reply = _handle_command(
         group_id,
         text,
-        sender_uid_for_command,
-        event.message.id,
+        sender_user_id,
+        message_id,
     )
     if cmd_reply is not None:
         # 指令是 explicit 操作 → 取消任何待處理的 burst
@@ -2393,7 +2437,6 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
         return
 
     # 2. Explicit poll request — only when the user calls the bot.
-    clean_text = _extract_gemini_trigger(text, event.message)
     poll_reply = (
         _handle_explicit_poll_text(event, group_id, clean_text)
         if clean_text is not None
@@ -2434,9 +2477,8 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
     if _try_piggyback_reminders_fast_path(event.reply_token, group_id):
         return
 
-    sender_user_id = getattr(event.source, "user_id", None) or ""
     burst_filter.add_to_burst(
-        group_id, event.message.id, text, sender_user_id, event.reply_token
+        group_id, message_id, text, sender_user_id, event.reply_token
     )
 
 
@@ -4253,12 +4295,12 @@ def _clear_quota_exhausted_after_recheck() -> None:
 
 
 def _quota_exhausted_message() -> str:
-    """quota 爆時統一的使用者訊息(含動態台灣重置時間)。"""
+    """quota 爆時統一的內部狀態訊息(含動態台灣重置時間)。"""
     abs_str, rel_str = _next_gemini_reset_tw()
     return (
-        f"Gemini 免費層今日請求額度已用完 (flash 每天 20 次)。\n"
+        f"今日請求額度已用完。\n"
         f"可以再使用的時間:{abs_str}(台灣時間,{rel_str})\n"
-        f"想馬上恢復 → https://aistudio.google.com 綁卡開 pay-as-you-go"
+        f"想馬上恢復，需開啟 pay-as-you-go。"
     )
 
 
@@ -7162,6 +7204,9 @@ def _reply(
         return
     # Markdown → LINE 純文字
     text = _md_to_line(text)
+    text = _strip_user_visible_mode_labels(text)
+    if not text or not text.strip():
+        return
     # LINE 單則訊息上限 5000 字；在截斷前先預留 footer 空間
     footer = _get_quota_footer()
     text = text[: 4900 - len(footer)] + footer

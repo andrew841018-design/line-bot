@@ -58,7 +58,7 @@ def test_lite_reply_substantive_platitude_returns_none(monkeypatch):
     monkeypatch.setattr(lr, "_STAGE1_HANDLERS", ())
     monkeypatch.setattr(
         lr, "_try_local_llm",
-        lambda text, context=None: PLATITUDE + "\n\n（lite mode — local LLM）",
+        lambda text, context=None: PLATITUDE,
     )
     monkeypatch.setattr(lr, "_try_google_snippet", lambda text: None)
     monkeypatch.setattr(lr, "_STAGE3_HANDLERS", (lr._try_google_snippet,))
@@ -72,7 +72,7 @@ def test_lite_reply_chitchat_still_replies(monkeypatch):
     monkeypatch.setattr(lr, "_STAGE1_HANDLERS", ())
     monkeypatch.setattr(
         lr, "_try_local_llm",
-        lambda text, context=None: "早點睡喔，晚安～\n\n（lite mode — local LLM）",
+        lambda text, context=None: "早點睡喔，晚安～",
     )
     out = lr.lite_reply("晚安")
     assert out is not None and "早點睡" in out  # chitchat preserved
@@ -85,7 +85,6 @@ def test_lite_reply_opinion_share_requires_sections(monkeypatch):
     shallow = (
         "這支影片分享了如何在家做手工皂，看起來很有趣也很實用，"
         "自己動手做可以避免商業皂的化學成分，對皮膚更友善。"
-        "\n\n（lite mode — local LLM）"
     )
     monkeypatch.setattr(lr, "_try_local_llm", lambda text, context=None: shallow)
 
@@ -100,7 +99,6 @@ def test_lite_reply_opinion_share_allows_structured_reply(monkeypatch):
         "正方：自己做能控制香精、色料與油脂來源，也比較知道成分。\n"
         "反方：手工皂仍然有氫氧化鈉皂化與保存問題，配方錯反而刺激皮膚。\n"
         "整合：可以做興趣或禮物，但敏感肌要先小範圍測試。"
-        "\n\n（lite mode — local LLM）"
     )
     monkeypatch.setattr(lr, "_try_local_llm", lambda text, context=None: structured)
 
@@ -118,7 +116,7 @@ def test_lite_reply_context_video_followup_requires_structured_reply(monkeypatch
     monkeypatch.setattr(lr, "_STAGE3_HANDLERS", ())
     shallow = "這個故事很鼓舞，真的值得學習。"
     monkeypatch.setattr(
-        lr, "_try_local_llm", lambda text, context=None: shallow + "\n\n（lite mode — local LLM）"
+        lr, "_try_local_llm", lambda text, context=None: shallow
     )
     context = [
         (
@@ -139,7 +137,7 @@ def test_lite_reply_context_video_followup_requires_structured_reply(monkeypatch
 def test_lite_reply_substantive_with_specifics_replies(monkeypatch):
     _force_skip_nlp(monkeypatch)
     monkeypatch.setattr(lr, "_STAGE1_HANDLERS", ())
-    good = "贈與稅每年免稅額 244 萬，超過要申報，可分年贈與。\n\n（lite mode — local LLM）"
+    good = "贈與稅每年免稅額 244 萬，超過要申報，可分年贈與。"
     monkeypatch.setattr(lr, "_try_local_llm", lambda text, context=None: good)
     out = lr.lite_reply("阿婆出錢買房贈與稅怎麼算")
     assert out is not None and "244" in out  # genuinely helpful → sent

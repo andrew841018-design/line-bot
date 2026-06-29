@@ -126,7 +126,7 @@ def _try_news(text: str) -> str | None:
                 lines.append(f"  {link[:120]}")
         if len(lines) <= 1:
             return None
-        lines.append("\n\n（lite mode：Google News RSS）")
+        lines.append("\n\n（來源：Google News RSS）")
         return "\n".join(lines)
     except Exception as e:
         logger.info("_try_news failed (%s): %s", query, e)
@@ -250,7 +250,7 @@ def _try_translate(text: str) -> str | None:
             f"🌐 翻譯（{src_lang or 'auto'} → {target}）\n\n"
             f"原文：{content[:200]}\n"
             f"譯文：{translated[:400]}\n\n"
-            "（lite mode：Google Translate gtx）"
+            "（來源：Google Translate gtx）"
         )
     except Exception as e:
         logger.info("_try_translate failed: %s", e)
@@ -306,7 +306,7 @@ def _try_garbage_time(text: str) -> str | None:
                 "data.taipei 該資料集目前回空集合，可能 dataset ID 已調整。\n\n"
                 "請改查：https://www-ws.gov.taipei/Default.aspx?tabid=85\n"
                 "（北市環保局垃圾車 GPS 即時點位）\n\n"
-                "（lite mode：開放資料 endpoint 暫時失效）"
+                "（開放資料 endpoint 暫時失效）"
             )
 
         if target_li:
@@ -331,7 +331,7 @@ def _try_garbage_time(text: str) -> str | None:
                 lines.append(f"\n• {addr or line}")
                 if t1:
                     lines.append(f"  時間：{t1}")
-            lines.append("\n\n（lite mode：data.taipei 開放資料）")
+            lines.append("\n\n（來源：data.taipei 開放資料）")
             return "\n".join(lines)
 
         # 沒指定里 → 給前 5 個 sample
@@ -345,7 +345,7 @@ def _try_garbage_time(text: str) -> str | None:
             if t1:
                 lines.append(f"  時間：{t1}")
         lines.append("\n\n💡 提示：問『XX 里 倒垃圾』可查特定里")
-        lines.append("\n（lite mode：data.taipei 開放資料）")
+        lines.append("\n（來源：data.taipei 開放資料）")
         return "\n".join(lines)
     except Exception as e:
         logger.info("_try_garbage_time failed: %s", e)
@@ -563,7 +563,7 @@ def _try_bus_arrival(text: str) -> str | None:
                         continue
                     lines.append(f"  - {full_name}：預估 {eta}")
                 if len(lines) > 1:
-                    lines.append("\n（lite mode：PDA 5284 即時動態）")
+                    lines.append("\n（來源：PDA 5284 即時動態）")
                     return "\n".join(lines)
     except Exception as e:
         logger.info("_try_bus_arrival PDA path failed: %s", e)
@@ -625,7 +625,7 @@ def _try_bus_arrival(text: str) -> str | None:
                 eta = f"{est // 60} 分鐘"
             lines.append(f"  - {full_name}：預估 {eta}")
         if len(lines) > 1:
-            lines.append("\n（lite mode：TDX 即時 API）")
+            lines.append("\n（來源：TDX 即時 API）")
             return "\n".join(lines)
         return None
     except Exception as e:
@@ -714,14 +714,14 @@ def _try_invoice_lottery(text: str) -> str | None:
                 f"🧾 統一發票 {title}\n\n"
                 f"{text_block[:400]}\n\n"
                 f"來源：{url}\n"
-                "（lite mode：財政部開放資料）"
+                "（來源：財政部開放資料）"
             )
 
         return (
             f"🧾 統一發票 {title}\n\n"
             + "\n".join(prize_lines)
             + f"\n\n來源：{url}\n"
-            "（lite mode：財政部開放資料）"
+            "（來源：財政部開放資料）"
         )
     except Exception as e:
         logger.info("_try_invoice_lottery failed: %s", e)

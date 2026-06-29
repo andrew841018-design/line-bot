@@ -114,7 +114,7 @@ def daily_todos() -> str:
     lines += [
         "• Mock interview 做了嗎？",
         "• 修改履歷了嗎？（44 投 1 回應 = 履歷瓶頸，每天迭代）",
-        "• 讀《資料工程基礎》1 章了嗎？(讀完寫 1 句 takeaway + PTT 對照)",
+        "• 讀《資料工程基礎》1 章了嗎？(讀完寫 1 句 takeaway + Mini Project/JD 對照)",
         "• 學車相關影片看了一則嗎？",
         "• Code review 做了嗎？",
         "• 小說看了 1.5 小時嗎？",
@@ -136,212 +136,212 @@ _TECH_NOTE_STATE_FILE = LINE_BOT_DIR / "state" / "daily_tech_note_state.json"
 
 _TECH_NOTE_TOPICS = [
     {
-        "id": "ptt-prefect-pipeline",
-        "scope": "ptt_project",
-        "title": "PTT 多來源 Prefect Pipeline",
-        "why": "PTT project 主線是多來源財經 corpus → PostgreSQL → QA/BERT → mart/API/RAG；JD 會看你能不能講清資料流與失敗隔離。",
+        "id": "mini-project-architecture",
+        "scope": "mini_project",
+        "title": "Mini Project End-to-End Architecture",
+        "why": "JD 會看你能不能把 ingestion、storage、transform、serving、monitoring 串成一條可維護的資料系統。",
         "points": [
-            "extract、transform、load、serving layer 在 PTT project 各自負責什麼",
-            "Prefect task 怎麼切 scraper、QA、BERT、mart refresh",
-            "單一來源失敗時如何隔離，避免整條 pipeline 全掛",
+            "sources、raw、staging、warehouse、mart、serving 各自負責什麼",
+            "為什麼不能只做 notebook 或單一 dashboard",
+            "一般 DE 與財經 / AI DE 兩種 pitch 如何共用同一個 backbone",
         ],
     },
     {
-        "id": "postgres-unified-schema",
-        "scope": "ptt_project",
-        "title": "PostgreSQL 統一 Schema 設計",
-        "why": "PTT project 把文章、來源、情緒、價格與槓桿指標收進同一個 PostgreSQL schema；這正對 JD 的數據資料庫能力。",
-        "points": [
-            "raw articles、dim/fact、mart table 的責任差異",
-            "primary key、foreign key、unique key 如何支援去重與關聯查詢",
-            "schema 變更要保留 migration 與 backfill 策略",
-        ],
-    },
-    {
-        "id": "ptt-data-quality-contracts",
-        "scope": "ptt_project",
-        "title": "PTT Data Quality 與資料契約",
-        "why": "PTT project 的爬蟲 schema、情緒分數、mart 指標都需要資料契約；JD 會重視資料品質如何擋住壞資料流到產品層。",
-        "points": [
-            "schema、range、freshness、uniqueness 是基本檢查面向",
-            "Great Expectations 與自寫 QA check 的分工",
-            "fail fast、quarantine、soft warning 對下游 mart 的影響",
-        ],
-    },
-    {
-        "id": "ptt-pii-ai-guardrails",
+        "id": "data-contracts-schema",
         "scope": "jd_fit",
-        "title": "PTT 文本的 PII 與 AI Guardrails",
-        "why": "PTT project 會把使用者內容送進搜尋與 RAG；JD 的 AI 產品化不只看能不能回答，也看隱私與安全邊界。",
+        "title": "Data Contract 與 Schema 設計",
+        "why": "外部資料源不穩時，資料契約是避免壞資料流進 mart/API/AI layer 的第一道防線。",
         "points": [
-            "文章與推文進 serving 前先處理 PII 與敏感內容",
-            "RAG 回答要拒絕投資建議、個資外洩與 prompt injection",
-            "保留可稽核的處理紀錄，方便 incident review",
+            "欄位型別、nullable、accepted values、unique key 怎麼定義",
+            "schema validation、quarantine、fail fast 的取捨",
+            "contract 變更時 migration 與 backfill 要怎麼配合",
         ],
     },
     {
-        "id": "ptt-bert-sentiment-inference",
-        "scope": "ptt_project",
-        "title": "PTT BERT 情緒分析 Inference",
-        "why": "PTT project 的情緒分數是 mart_market_state 與 RAG 回答的重要特徵；JD 會問模型輸出如何進資料管線。",
+        "id": "raw-staging-mart-layers",
+        "scope": "mini_project",
+        "title": "Raw / Staging / Mart Layers",
+        "why": "一般 DE 面試很常考資料分層；這也是作品能不能從 demo 變成 pipeline 的分水嶺。",
         "points": [
-            "batch inference 如何和 pipeline task 串接",
-            "sentiment label、score、model version 要一起落庫",
-            "模型失敗時要保留重跑與 fallback 策略",
+            "raw layer 保留原始資料與 ingested_at 的目的",
+            "staging layer 做型別整理、去重、欄位標準化",
+            "mart layer 服務 API/dashboard/分析查詢，避免每次重算 heavy join",
         ],
     },
     {
-        "id": "mart-market-state",
-        "scope": "ptt_project",
-        "title": "mart_market_state 與 Materialized View",
-        "why": "PTT project 用 mart / MV 服務 dashboard、API、RAG；JD 的資料庫優化會看你能否用 pre-aggregation 降低查詢成本。",
-        "points": [
-            "raw table、fact table、mart、MV 的查詢定位",
-            "什麼指標適合預先彙總，什麼應保留明細查詢",
-            "refresh 策略要平衡資料新鮮度與讀取延遲",
-        ],
-    },
-    {
-        "id": "ptt-sql-window-functions",
+        "id": "incremental-etl-backfill",
         "scope": "jd_fit",
-        "title": "PTT 情緒指標的 SQL Window Functions",
-        "why": "SQL window function 是資料工程 JD 高頻題；用 PTT project 的 sentiment 與 market_state 表練，比抽象題更能連到作品。",
+        "title": "Incremental ETL、Idempotency、Backfill",
+        "why": "能安全重跑與補資料，是資料工程專案有沒有 production sense 的核心。",
         "points": [
-            "用 rolling 7-day average 看情緒趨勢",
-            "用 LAG / LEAD 解釋日變化與事件前後差異",
-            "Top-N 熱門股票與 source ranking 怎麼避免 GROUP BY 不夠用",
+            "natural key、content hash、unique constraint 如何防重",
+            "ON CONFLICT / upsert 與 delete-insert window 的取捨",
+            "指定日期窗 backfill 時如何避免污染已核可資料",
         ],
     },
     {
-        "id": "ptt-postgres-indexing",
+        "id": "sql-analytics-validation",
         "scope": "jd_fit",
-        "title": "PTT 查詢的 PostgreSQL Index 選型",
-        "why": "JD 明確重視資料庫優化；PTT project 可用 published_at、source_id、JSONB、全文搜尋與 pgvector 來講不同 index 的取捨。",
+        "title": "SQL Analytics 與 Validation Queries",
+        "why": "SQL 不只是面試題，也是驗證 pipeline 結果正不正確的工具。",
         "points": [
-            "B-tree 適合時間、來源與等值/range filter",
-            "GIN / pg_trgm 適合 JSONB 與中文關鍵字搜尋",
-            "HNSW index 適合 pgvector，但要講 recall、latency、memory trade-off",
+            "用 conditional aggregation 做狀態/品質分類",
+            "用 window function 做 rolling metrics、Top-N、變化量",
+            "用 reconciliation query 比對 raw、staging、mart 數字是否一致",
         ],
     },
     {
-        "id": "ptt-fastapi-streamlit-serving",
+        "id": "warehouse-fact-dim-grain",
         "scope": "jd_fit",
-        "title": "PTT FastAPI / Streamlit Serving Layer",
-        "why": "PTT project 不是只有離線 ETL；JD 的系統開發會看 API、dashboard 與資料庫之間的邊界設計。",
+        "title": "Warehouse Fact / Dimension / Grain",
+        "why": "普通 DE 與 analytics engineering 都會看你是否懂 table grain 和 fact/dim 邊界。",
         "points": [
-            "FastAPI endpoint 應讀 mart 而不是每次 join raw tables",
-            "dashboard 要有 pagination、cache 與查詢時間上限",
-            "API response schema 要穩定，讓前端與 RAG tool 都能共用",
+            "fact table 一列代表什麼事件或統計粒度",
+            "dimension table 放描述欄位，支援 filter/group by",
+            "grain 不清會造成重複計算、join 放大或漏算",
         ],
     },
     {
-        "id": "ptt-rag-chunk-embedding",
-        "scope": "ptt_project",
-        "title": "PTT RAG ETL：Chunk、Embedding、pgvector",
-        "why": "PTT project 的 RAG layer 是 JD AI 產品化主線；要能講文章怎麼從資料庫變成可檢索的知識。",
-        "points": [
-            "article → chunk → embedding → vector table 的離線流程",
-            "chunk_idx 與 article_id 如何做 idempotent upsert",
-            "embedding model、dimension、index 都會影響 retrieval latency",
-        ],
-    },
-    {
-        "id": "ptt-hybrid-retrieval-rrf",
-        "scope": "ptt_project",
-        "title": "PTT Hybrid Retrieval：BM25 + Vector + RRF",
-        "why": "PTT 中文財經文本只靠 vector 容易漏 ticker 與關鍵字；JD AI 題可以用 hybrid retrieval 展示工程取捨。",
-        "points": [
-            "BM25 擅長 exact keyword，vector 擅長語意相近",
-            "RRF 可以合併不同 ranker 而不強迫分數同尺度",
-            "中文斷詞、source weighting、recency weighting 都要和產品目標對齊",
-        ],
-    },
-    {
-        "id": "ptt-rag-evaluation",
+        "id": "dbt-transform-discipline",
         "scope": "jd_fit",
-        "title": "PTT RAG 評估與 Grounding",
-        "why": "JD 的 AI 產品不會只接受 demo 能回答；PTT project 要能說 retrieval 與 generation 怎麼量化驗證。",
+        "title": "dbt / SQL Transform Discipline",
+        "why": "許多 DE/JD 會把 SQL transform、tests、lineage 視為基本能力，即使不用 dbt 也要有同等紀律。",
         "points": [
-            "golden set 要覆蓋 ticker、日期、市場狀態與文章證據",
-            "hit@k、recall@k、context precision 用來看 retrieval",
-            "faithfulness 與拒答規則用來管住 generation",
+            "staging、intermediate、mart models 的責任分工",
+            "not_null、unique、accepted_values、relationship tests 怎麼覆蓋風險",
+            "lineage graph 如何協助 debug 下游數字異常",
         ],
     },
     {
-        "id": "ptt-prefect-vs-airflow",
+        "id": "airflow-dag-orchestration",
         "scope": "jd_fit",
-        "title": "PTT Orchestration：Prefect vs Airflow",
-        "why": "Airflow 是資料工程 JD 常見關鍵字；PTT project 選 Prefect 時要能講清楚規模、維運成本與替換條件。",
+        "title": "Airflow DAG Orchestration",
+        "why": "Airflow 是資料工程 JD 高頻關鍵字；要能講 DAG、dependency、retry、backfill，不是只會跑 cron。",
         "points": [
-            "DAG、task dependency、schedule、backfill 是共同概念",
-            "Prefect 對 single-host Python pipeline 較輕，Airflow 對團隊平台較成熟",
-            "何時該升級到 Airflow：多團隊、多租戶、複雜 SLA、集中治理",
+            "DAG 與 task dependency 如何表達 pipeline 順序",
+            "retry、catchup、backfill、SLA/freshness alert 的語意",
+            "source failure 時如何隔離，避免不必要地拖垮整條流程",
         ],
     },
     {
-        "id": "ptt-idempotency-backfill",
-        "scope": "ptt_project",
-        "title": "PTT Crawler 的 Idempotency 與 Backfill",
-        "why": "PTT project 需要反覆補資料、重跑與處理外部來源不穩；JD 會看你是否能避免重複資料與污染下游。",
-        "points": [
-            "natural key、content hash、unique constraint 如何去重",
-            "ON CONFLICT / upsert 要和 schema 設計一起想",
-            "backfill 要能指定時間窗，且不破壞已核可資料",
-        ],
-    },
-    {
-        "id": "ptt-freshness-timezone",
-        "scope": "ptt_project",
-        "title": "PTT Freshness、Timezone、Market Calendar",
-        "why": "PTT project 的市場資料橫跨台股與美股；JD 會看 freshness check 是否理解時區、交易日與資料延遲。",
-        "points": [
-            "timestamp vs timestamptz 會影響 stale 判斷",
-            "台股與美股交易日、休市日、資料發布時間不同",
-            "freshness alert 要用 business calendar，避免假日誤報",
-        ],
-    },
-    {
-        "id": "ptt-snowflake-star-schema",
+        "id": "docker-compose-reproducibility",
         "scope": "jd_fit",
-        "title": "PTT DW：Star Schema 與 Fact/Dim",
-        "why": "PTT project 有 dim_source、fact_sentiment、mart summary；JD 的數據倉儲題可以直接用這套結構回答。",
+        "title": "Docker / Docker Compose Reproducibility",
+        "why": "作品要可重現；Docker Compose 能展示 DB、API、Airflow、worker 怎麼一起跑。",
         "points": [
-            "fact table 存可聚合事件，dim table 存描述性維度",
-            "mart 是服務查詢與產品，不是取代 raw/fact",
-            "star schema 如何支援 BI、dashboard 與 batch metric",
+            "Dockerfile 如何固定 runtime、dependency、entrypoint",
+            "Compose 服務邊界：db、api、airflow scheduler/webserver、worker",
+            "volume、network、env var、healthcheck 分別解決什麼問題",
         ],
     },
     {
-        "id": "ptt-redis-cache-serving",
+        "id": "cicd-pipeline-design",
         "scope": "jd_fit",
-        "title": "PTT API 查詢的 Redis Cache 策略",
-        "why": "JD 會問系統開發與查詢效能；PTT project 可用 mart/API/RAG tool 的重複讀取情境說明 cache 邊界。",
+        "title": "CI/CD Pipeline Design",
+        "why": "CI/CD 能證明工程交付品質：測試、build、smoke check、部署不是靠手動記憶。",
         "points": [
-            "cache key 要包含 query params、日期窗與資料版本",
-            "TTL 要跟 mart refresh cadence 對齊",
-            "cache miss、stale cache、manual invalidation 都要有策略",
+            "CI 做 lint、unit test、SQL/schema check、Docker build、API smoke test",
+            "CD 在 main/tag 或 manual approval 後部署 demo target",
+            "部署後 health check 與 rollback plan 要能說清楚",
         ],
     },
     {
-        "id": "ptt-observability-runbook",
+        "id": "cd-demo-deployment",
+        "scope": "mini_project",
+        "title": "CD Demo Deployment",
+        "why": "Andrew 指定 CD 要納入；demo deployment 能讓作品從本機專案變成可交付系統。",
+        "points": [
+            "VM + Docker Compose 是 8 週內最務實的 CD target",
+            "部署必須使用已 build image/artifact，不吃本機隱藏狀態",
+            "post-deploy smoke check 至少驗 API health、dashboard 或 sample mart query",
+        ],
+    },
+    {
+        "id": "k8s-deployment-tradeoff",
         "scope": "jd_fit",
-        "title": "PTT Pipeline Observability 與 Runbook",
-        "why": "PTT project 要能像 production 系統一樣被監控；JD 會看你怎麼區分資料延遲、來源失敗、QA fail 與真正 incident。",
+        "title": "K8s Deployment Trade-off",
+        "why": "K8s 加分但不應壓過資料工程主線；要能說清楚何時需要、何時太重。",
+        "points": [
+            "Deployment、Service、Ingress、ConfigMap、Secret 的基本責任",
+            "K8s 解決 rollout、restart、scaling、service discovery，但提高維運成本",
+            "本專案先 Docker/Airflow/CI/CD，K8s 作為 Week 9-10 stretch",
+        ],
+    },
+    {
+        "id": "observability-freshness",
+        "scope": "jd_fit",
+        "title": "Observability、Freshness、Runbook",
+        "why": "資料工程不是只產出資料，也要知道資料何時壞、何時遲、哪裡壞。",
         "points": [
             "logs、metrics、data quality report 分別回答不同問題",
-            "SLO 要定義 fresh enough、complete enough、query fast enough",
-            "incident 後要補測試、runbook 與監控門檻",
+            "freshness、completeness、latency 可以定成基本 SLO",
+            "runbook 要包含重跑、停損、回復、通知與事後補測試",
         ],
     },
     {
-        "id": "ptt-docker-ci-reproducibility",
+        "id": "security-secrets-iam",
         "scope": "jd_fit",
-        "title": "PTT Docker / CI / Reproducibility",
-        "why": "JD 的系統開發會看環境是否可重現；PTT project 可用 Docker Compose、pytest、migration 來講交付品質。",
+        "title": "Secrets、IAM、Least Privilege",
+        "why": "外部 API、DB、CD deploy 都會碰到 secret；硬編碼或亂給權限會直接扣分。",
         "points": [
-            "服務、資料庫、worker 的環境變數與 dependency 要可重建",
-            "CI 先跑 schema、unit test、RAG eval smoke test",
-            "production-like fixture 能降低 demo 前才爆炸的風險",
+            ".env.example、secret manager placeholder、CI secret 的分工",
+            "runtime role 只給需要的 DB/API/cloud 權限",
+            "log、error message、dashboard 不應洩漏 token 或 credential",
+        ],
+    },
+    {
+        "id": "cost-reliability-tradeoff",
+        "scope": "jd_fit",
+        "title": "Cost / Reliability Trade-off",
+        "why": "JD 常期待你能做工程取捨，而不是所有東西都上最貴最複雜的解法。",
+        "points": [
+            "batch vs near-real-time 的成本與 freshness 取捨",
+            "self-hosted Postgres vs managed DB / warehouse 的責任分工",
+            "cache、mart、materialized view 各自解決什麼延遲問題",
+        ],
+    },
+    {
+        "id": "api-dashboard-serving",
+        "scope": "mini_project",
+        "title": "API / Dashboard Serving Layer",
+        "why": "DE project 最終要讓資料被使用；serving layer 可以展示產品化與查詢效能意識。",
+        "points": [
+            "FastAPI/dashboard 應讀 mart，不應每次掃 raw tables",
+            "response schema、pagination、timeout、cache 要有邊界",
+            "demo 要能展示 latest indicator、historical trend、source drill-down",
+        ],
+    },
+    {
+        "id": "financial-domain-indicators",
+        "scope": "mini_project",
+        "title": "Financial Alternative Data Indicators",
+        "why": "投財經 / AI DE 時，需要把資料工程能力連到金融資料與投資指標，而不只是泛用 pipeline。",
+        "points": [
+            "每個 indicator 的資料來源、更新頻率、可信度與延遲",
+            "市場日曆、時區、資料發布時間會影響 freshness 判斷",
+            "指標只能作為分析訊號，不能包裝成保證獲利模型",
+        ],
+    },
+    {
+        "id": "rag-eval-guardrails",
+        "scope": "jd_fit",
+        "title": "RAG Evaluation 與 Guardrails",
+        "why": "AI DE 不是只做聊天 demo；要能量化 retrieval，並限制 AI 回答範圍。",
+        "points": [
+            "golden queries 要覆蓋 ticker、日期、來源、指標與 out-of-scope 問題",
+            "hit@k、recall@k、MRR 可先做 deterministic retrieval eval",
+            "guardrails 要拒絕無資料依據、投資保證、secret/PII 類問題",
+        ],
+    },
+    {
+        "id": "linux-bash-ops",
+        "scope": "jd_fit",
+        "title": "Linux / Bash / Ops Fundamentals",
+        "why": "CI runner、container、VM、Airflow worker 都會回到 shell、檔案路徑、exit code 與 log。",
+        "points": [
+            "scripts 要有明確參數、exit code、stderr/stdout 與錯誤處理",
+            "env var、working directory、relative path 是常見部署坑",
+            "Makefile 或 scripts 可以把常用操作標準化，降低 demo 失誤",
         ],
     },
 ]
@@ -632,16 +632,6 @@ def system_status() -> str:
             use_pct = int(parts[4].replace("%", ""))
             if use_pct > 90:
                 lines.append(f"🔴 磁碟：{parts[4]} 使用（可用 {parts[3]}）")
-
-    # ETL log：只有 ERROR 才顯示（WARNING 不顯示）
-    today_log = (
-        PROJECT_DIR / "logs" / f"wayback_{datetime.now().strftime('%Y%m%d')}.log"
-    )
-    if today_log.exists():
-        content = today_log.read_text(errors="ignore")
-        err_count = content.count("ERROR")
-        if err_count > 0:
-            lines.append(f"🔴 今日 ETL log：{err_count} ERROR")
 
     if len(lines) == 1:
         return ""
@@ -1467,7 +1457,7 @@ def daily_reading() -> str:
         f"今日（{today.strftime('%Y-%m-%d %a')}）讀《資料工程基礎》**一章**",
         "讀完做：",
         "  • 1 句 takeaway（寫進 mock_interview/{date}.md 或 design doc）",
-        "  • 對應到 PTT 專案的對照（這章在 PTT 哪段體現？哪段沒做？）",
+        "  • 對應到 Mini Project 的對照（這章在哪段體現？哪段沒做？）",
     ]
     return "\n".join(lines)
 

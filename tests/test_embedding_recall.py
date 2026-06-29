@@ -49,8 +49,30 @@ def test_index_skips_short_text(er):
 
 
 def test_index_skips_placeholders(er):
-    for ph in ("[圖片]", "[影片]", "[音訊]", "[語音留言]", "[sticker]"):
+    for ph in (
+        "[圖片]",
+        "[影片]",
+        "[音訊]",
+        "[語音留言]",
+        "[sticker]",
+    ):
         assert er.index_message(f"M_{ph}", "G1", ph) is False
+
+
+def test_placeholder_update_deletes_stale_embedding(er):
+    assert er.index_message("M1", "G1", "這是一段已經被索引的舊訊息內容") is True
+
+    with closing(sqlite3.connect(str(er._DB_PATH))) as c:
+        assert c.execute(
+            "SELECT text FROM embeddings WHERE message_id='M1' AND group_id='G1'"
+        ).fetchone() is not None
+
+    assert er.index_message("M1", "G1", "[圖片]") is False
+
+    with closing(sqlite3.connect(str(er._DB_PATH))) as c:
+        assert c.execute(
+            "SELECT text FROM embeddings WHERE message_id='M1' AND group_id='G1'"
+        ).fetchone() is None
 
 
 def test_index_skips_when_ids_missing(er):

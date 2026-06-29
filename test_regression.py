@@ -95,6 +95,21 @@ def test_bug1_non_mention_routes_to_burst_filter():
     assert not mock_llm.called, "LLM must NOT be called directly for non-mention text"
 
 
+def test_safe_event_debug_dump_redacts_text_and_user_id():
+    evt = _make_text_event(
+        text="這是一段不應該被 debug dump 印出的私人訊息",
+        user_id="USR_SECRET",
+    )
+
+    dumped = main._safe_event_debug_dump(evt)
+
+    assert "私人訊息" not in dumped
+    assert "USR_SECRET" not in dumped
+    assert "MSG001" in dumped
+    assert "text_sha256" in dumped
+    assert "user_id_sha256" in dumped
+
+
 # ── Bug 2 ─────────────────────────────────────────────────────────────────────
 
 
@@ -322,6 +337,39 @@ def test_bug10_reply_suppresses_llm_internal_trace():
 
     assert not mock_messaging.reply_message.called
     assert not mock_messaging.push_message.called
+
+
+def test_reply_strips_user_visible_mode_labels(monkeypatch):
+    """Internal fallback/model labels must not be sent to the LINE group."""
+    monkeypatch.setattr(main.settings, "bot_muted", False)
+
+    mock_api = MagicMock()
+    mock_api.__enter__ = MagicMock(return_value=mock_api)
+    mock_api.__exit__ = MagicMock(return_value=False)
+    mock_messaging = MagicMock()
+
+    text = (
+        "這是正式回覆。\n\n"
+        "（lite mode — local LLM）\n\n"
+        "🔍 lite mode（Google 首頁 snippet）：\n"
+        "搜尋摘要\n\n"
+        "（local LLM fallback）"
+    )
+
+    with (
+        patch("main.ApiClient", return_value=mock_api),
+        patch("main.MessagingApi", return_value=mock_messaging),
+        patch("main._load_pending_explicit", return_value={}),
+    ):
+        main._reply("TOKEN001", text, group_id="GRP001")
+
+    request = mock_messaging.reply_message.call_args.args[0]
+    sent = request.messages[0].text
+    assert "這是正式回覆" in sent
+    assert "Google 搜尋片段" in sent
+    assert "搜尋摘要" in sent
+    assert "lite mode" not in sent
+    assert "local LLM" not in sent
 
 
 def test_market_quote_reply_token_expired_does_not_fallback_push(monkeypatch):
@@ -749,7 +797,7 @@ def test_quota_exhausted_llm_chat_uses_direct_local_when_lite_misses(monkeypatch
     )
 
     assert "本機模型回覆" in out
-    assert "local LLM fallback" in out
+    assert "local LLM fallback" not in out
     assert local_calls
     assert local_calls[0]["context"] == [("user", "前文")]
     assert local_calls[0]["max_tokens"] == 360

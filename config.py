@@ -65,7 +65,7 @@ class Settings(BaseSettings):
     allowed_group_ids_raw: str = Field(default="", validation_alias="ALLOWED_GROUP_IDS")
 
     # family_group_id：顯式「家族主群」識別。給 family-only push script 讀
-    # （feedback_push / ptt_alert / family_interest / weekly_review / monthly_highlight
+    # （feedback_push / family_interest / weekly_review / monthly_highlight
     # / process_feedback / announce_finance_view / line_bot_update_push / weekly_summary
     # / weekly_retro），避免 positional `[0]` anti-pattern。空字串時自動 fall back 到
     # legacy `ALLOWED_GROUP_ID`（也不會 fall back 到 allowed_group_ids[0] — reviewer 兩位
@@ -111,7 +111,7 @@ class Settings(BaseSettings):
     # MUST differ — else rag_graph allowlist collapses to a 1-element set AND
     # the 503/429 lite fallback gate (`model != settings.gemini_light_model`)
     # never fires. Misconfigured `.env` will fail at import — every cron job
-    # (daily_briefing_discord, ptt_alert, feedback_push, etc.) WILL crash on
+    # (daily_briefing_discord, feedback_push, etc.) WILL crash on
     # startup; this is fail-fast hardening, not subtle behaviour change.
 
     @field_validator("gemini_model", "gemini_light_model")

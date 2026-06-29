@@ -235,7 +235,7 @@ agent_loop.Agent.run(user_msg, context)
 | `reminders` | 階梯式提醒 | `reminder_id, group_id, user_id, action, remind_at, status, last_pushed_at, weekly_count, last_weekly_at, pushed_3d, pushed_1d, pushed_4hr, pushed_2hr, pushed_1hr, pushed_now` |
 | `embeddings` | RAG 向量（sentence-transformers BLOB） | `message_id, group_id, vector, dim, backend, created_at`；`idx_embeddings_group` |
 
-JSON state（小型常變）：`gemini_usage.json`（quota）、`pushed_jobs.json`、`quota_state.json`、`pending_explicit_reply.json`、`feedback_state.json`、`alert_state.json`、`health_monitor_state.json`、`ptt_pipeline_health_state.json`、`line_token_cache.json`。
+JSON state（小型常變）：`gemini_usage.json`（quota）、`pushed_jobs.json`、`quota_state.json`、`pending_explicit_reply.json`、`feedback_state.json`、`alert_state.json`、`health_monitor_state.json`、`line_token_cache.json`。
 
 ---
 

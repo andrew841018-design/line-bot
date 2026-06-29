@@ -25,26 +25,6 @@ def test_cwa_alert_does_not_mark_failed_push_as_sent(tmp_path, monkeypatch):
     assert not state_file.exists()
 
 
-def test_ptt_alert_does_not_mark_failed_push_as_sent(tmp_path, monkeypatch):
-    import ptt_alert
-
-    state_file = tmp_path / "ptt_alert_state.json"
-    monkeypatch.setattr(ptt_alert, "_STATE_FILE", state_file)
-    monkeypatch.setattr(ptt_alert, "GROUP_ID", "G1")
-    monkeypatch.setattr(ptt_alert, "line_access_token", lambda: "token")
-    monkeypatch.setattr(ptt_alert, "_push", lambda text: False)
-    monkeypatch.setattr(
-        ptt_alert,
-        "_fetch_ptt_alerts",
-        lambda: [{"id": "a1", "text": "ptt alert"}],
-    )
-
-    rc = ptt_alert.main()
-
-    assert rc == 1
-    assert not state_file.exists()
-
-
 def test_weekly_summary_returns_failure_when_push_fails(monkeypatch):
     import weekly_summary
 
