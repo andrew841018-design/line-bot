@@ -85,7 +85,7 @@ JOB_REGISTRY["monthly-cold-backup-reminder"] = JobSpec(
     command=[_user_script("monthly_cold_backup_reminder.sh")],
     cwd=None,
     env=_base_env(),
-    timeout=30,
+    timeout=180,
     description="Day 1 of month 09:00 cold backup reminder",
 )
 
