@@ -1,5 +1,6 @@
 from unittest.mock import MagicMock, patch
 
+import config
 import reminder_push
 
 
@@ -209,7 +210,7 @@ def test_mark_reminders_pushed_marks_each_stage(monkeypatch):
 
 
 def test_push_to_group_uses_refreshed_line_token(monkeypatch):
-    monkeypatch.setattr(reminder_push.settings, "line_channel_access_token", "stale-token")
+    monkeypatch.setattr(config.settings, "line_channel_access_token", "stale-token")
     monkeypatch.setattr(reminder_push, "line_access_token", lambda: "fresh-token")
 
     seen = {}
@@ -234,7 +235,7 @@ def test_push_to_group_uses_refreshed_line_token(monkeypatch):
 
 
 def test_line_access_token_falls_back_to_env_token(monkeypatch):
-    monkeypatch.setattr(reminder_push.settings, "line_channel_access_token", "env-token")
+    monkeypatch.setattr(config.settings, "line_channel_access_token", "env-token")
     monkeypatch.setattr(reminder_push, "line_access_token", lambda: "env-token")
 
     assert reminder_push._line_access_token() == "env-token"

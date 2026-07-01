@@ -31,7 +31,6 @@ from linebot.v3.messaging import (
 import memory
 import line_mentions
 from line_push_client import line_access_token
-from config import settings
 
 logging.basicConfig(
     level=logging.INFO,

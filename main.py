@@ -106,9 +106,8 @@ logger = logging.getLogger("line_bot")
 async def _app_lifespan(_app: FastAPI):
     """Run the same startup hooks previously registered via app.on_event."""
     if os.getenv("JOBS_ROUTES_ENABLED") == "1":
-        _startup_sweep = globals().get("startup_sweep")
-        if callable(_startup_sweep):
-            _startup_sweep()
+        from jobs_router import startup_sweep as _ss
+        _ss()
     _process_pending_on_startup()
     _init_on_startup()
     yield
@@ -125,7 +124,7 @@ try:
 except ImportError:
     pass
 if os.getenv("JOBS_ROUTES_ENABLED") == "1":
-    from jobs_router import router as jobs_router, startup_sweep
+    from jobs_router import router as jobs_router
     app.include_router(jobs_router)
 
 _parser = WebhookParser(settings.line_channel_secret)

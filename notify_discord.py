@@ -64,7 +64,5 @@ def notify_quota_pressure(project, state, detail=""):
 
 
 if __name__ == "__main__":
-    import sys
-
     msg = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "測試提醒"
     sys.exit(0 if send_dm(msg) else 1)
