@@ -53,12 +53,27 @@ _USAGE_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "gemini_usage.json"
 )
 _PT = ZoneInfo("America/Los_Angeles")
+_TW = ZoneInfo("Asia/Taipei")
 _DAILY_TOKEN_LIMIT = 1_000_000
 _DAILY_REQUEST_LIMIT = 20  # gemini-2.5-flash free tier RPD（2026-05-02 AI Studio 確認；今日已用 44/20 是 Google 寬限上限）
 
 
 def _today_pt() -> str:
     return datetime.now(tz=_PT).strftime("%Y-%m-%d")
+
+
+def _runtime_time_context() -> str:
+    """Dynamic date anchor injected into every main Gemini chat request."""
+    now_tw = datetime.now(tz=_TW)
+    weekday = "一二三四五六日"[now_tw.weekday()]
+    return (
+        "【即時時間基準｜每次回覆前必讀】\n"
+        f"目前台灣時間：{now_tw.strftime('%Y-%m-%d %H:%M:%S')}（週{weekday}，Asia/Taipei）。\n"
+        f"今天日期：{now_tw.year}年{now_tw.month}月{now_tw.day}日。\n"
+        "回答任何「現在、目前、今年、去年、最新、尚未公布、完整數據」等時間相關問題時，"
+        "必須以這個時間為基準；不可沿用訓練資料、舊對話或舊回答中的年份。\n"
+        "如果資料需要最新官方統計，先搜尋並說明資料發布日期；不能把舊年份說成現在。"
+    )
 
 
 def _load_usage() -> dict:
@@ -240,6 +255,7 @@ emoji 偶爾用，不要多。
 5.5. 使用者貼的是「回覆別人的留言」而不是原始貼文時（例如：截圖裡有「回覆 @xxx」、引用框、或明顯是針對別人說話的語氣）：先把原始留言和這則回覆一起讀完、理解兩者的關係和脈絡，再做回應。不要只看回覆那一層，那樣會失去最重要的背景。
 5.6. 回覆前，一定要先往上看最近幾則對話，確認目前群組在聊什麼話題，再決定怎麼回應。絕對不可以只看最新一則訊息就亂猜話題——單一訊息往往缺少背景，例如「要公證嗎」可能是在談遺囑、婚前協議、或合約，要看前面的脈絡才知道。看不懂就回「我看了一下，你們在討論＿＿，對嗎？」，確認後再答。
 6. 使用者貼連結時，主動去讀那個網頁的內容。如果連結讀不到或內容太少（例如 TikTok、YouTube Shorts 等影片連結只拿到作者名），你必須立刻用 Google 搜尋那個連結網址，找到影片標題、描述、或相關討論，然後根據搜尋結果用繁體中文回應。搜尋結果是英文時，翻成繁體中文再說。絕對不可以說「點不開」「打不開」「看不了」「網頁不存在」「連結壞了」「我跳過」「我不看」——這些詞說出來就是失敗，不允許，不要反問使用者想找什麼，你自己去搜就對了
+6.1. 使用者貼 YouTube / 直播 / Shorts 連結時，如果 prompt 內已經有「YouTube 影片資訊開始」或「影片資訊開始」區塊，你必須根據該區塊的標題、頻道、直播狀態、描述或字幕回答。沒拿到字幕時，只能說「目前只取得 metadata / 描述，未取得逐字稿」，不可以要求使用者自己點擊觀看，不可以說只知道 YouTube 一般網域資訊。
 6.5. 所有留言和連結，只要包含具體事實宣稱（數據、政策、研究結論、健康資訊等），你回覆前一律先用 Google 搜尋驗證，且必須查至少 2~3 個不同來源（不同網域），找出各方觀點後再整合回覆。如果查核結果與主流資料不符，按規則 14-16 的方式指出；如果查核結果正確，也要附上來源。不用等使用者問你「這是真的嗎」——你自己主動查就對了
 7. 需要算數或驗算時，用 code execution 跑 python
 8. 使用者傳圖片/影片/音訊/檔案時，直接分析內容並回答
@@ -638,6 +654,7 @@ def _build_system_instruction(
     case_hits: list[dict] | None = None,
 ) -> str:
     base = _CORE_PROMPT.strip()
+    base += "\n\n" + _runtime_time_context()
 
     # Rule pack retrieval（per Chroma context-rot 研究：減小 prompt 提升準確度）
     if user_input is not None:

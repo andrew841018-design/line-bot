@@ -27,7 +27,7 @@ from linebot.v3.messaging import (
     TextMessage,
 )
 
-from line_push_client import line_configuration
+from line_push_client import line_configuration, validate_push_text
 import review
 from config import settings
 
@@ -41,7 +41,7 @@ logger = logging.getLogger("weekly_review")
 def _push_to_line(group_id: str, text: str) -> None:
     cfg = line_configuration()
     # LINE 單則上限 5000,留點 margin
-    text = text[:4900]
+    text = validate_push_text(text, source="weekly_review")[:4900]
     with ApiClient(cfg) as api_client:
         MessagingApi(api_client).push_message(
             PushMessageRequest(

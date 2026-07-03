@@ -30,7 +30,7 @@ from linebot.v3.messaging import (
 
 import memory
 import line_mentions
-from line_push_client import line_access_token
+from line_push_client import line_access_token, validate_push_text
 
 logging.basicConfig(
     level=logging.INFO,
@@ -53,6 +53,9 @@ def _push_to_group(
       - 429（monthly quota / rate limit）：不重試，立即 False
       - 其他 exception（5xx / network）：exponential backoff (1s/2s/4s) 重試
     """
+    safe_text = validate_push_text(text, source="reminder_push")
+    if safe_text != text:
+        message = TextMessage(text=safe_text[:4900])
     cfg = Configuration(access_token=_line_access_token())
     for attempt in range(max_retries):
         try:
@@ -60,7 +63,7 @@ def _push_to_group(
                 MessagingApi(api_client).push_message(
                     PushMessageRequest(
                         to=group_id,
-                        messages=[message or TextMessage(text=text[:4900])],
+                        messages=[message or TextMessage(text=safe_text[:4900])],
                     )
                 )
             return True
@@ -204,12 +207,14 @@ def _build_push_text_and_message(
     plain_labels = _participant_plain_labels(r) or None
     if not targets:
         text = line_mentions.text_with_plain_mentions(body, [], plain_labels)
+        text = validate_push_text(text, source="reminder_push")
         return text, TextMessage(text=text[:4900])
     message_dict = line_mentions.text_v2_dict(body, targets, plain_labels)
-    return (
-        line_mentions.text_with_plain_mentions(body, targets, plain_labels),
-        line_mentions.sdk_message_from_text_v2_dict(message_dict),
-    )
+    plain_text = line_mentions.text_with_plain_mentions(body, targets, plain_labels)
+    safe_plain = validate_push_text(plain_text, source="reminder_push")
+    if safe_plain != plain_text:
+        return safe_plain, TextMessage(text=safe_plain[:4900])
+    return (plain_text, line_mentions.sdk_message_from_text_v2_dict(message_dict))
 
 
 def _due_reminder_items(

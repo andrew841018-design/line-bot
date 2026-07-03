@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -64,6 +65,24 @@ def test_news_case_regex_skips_casual_chat():
     samples = ["你好", "謝謝", "今天天氣不錯", "晚安"]
     for s in samples:
         assert not gc._NEWS_CASE_RE.search(s), f"Should NOT match: {s!r}"
+
+
+def test_system_instruction_injects_runtime_taipei_date(monkeypatch):
+    """Main Gemini chat must not rely on stale model/training-year context."""
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            base = cls(2026, 7, 2, 10, 30, 45)
+            return base.replace(tzinfo=tz) if tz else base
+
+    monkeypatch.setattr(gc, "datetime", FixedDateTime)
+
+    out = gc._build_system_instruction(facts=[], persona_notes=[])
+
+    assert "即時時間基準" in out
+    assert "目前台灣時間：2026-07-02 10:30:45" in out
+    assert "今天日期：2026年7月2日" in out
+    assert "不可沿用訓練資料、舊對話或舊回答中的年份" in out
 
 
 # ---------- Mock fixtures ----------

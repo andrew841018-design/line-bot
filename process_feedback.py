@@ -20,7 +20,7 @@ from linebot.v3.messaging import (
 
 import feedback_collector
 import gemini_client
-from line_push_client import line_configuration
+from line_push_client import line_configuration, validate_push_text
 import memory
 from config import settings
 
@@ -39,6 +39,7 @@ def _is_quota_error(e: Exception) -> bool:
 
 
 def _push(group_id: str, text: str) -> None:
+    text = validate_push_text(text, source="process_feedback")
     cfg = line_configuration()
     with ApiClient(cfg) as api_client:
         MessagingApi(api_client).push_message(

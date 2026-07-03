@@ -107,6 +107,15 @@ JOB_REGISTRY["daily-pending-audit"] = JobSpec(
 )
 
 
+JOB_REGISTRY["daily-line-bot-review"] = JobSpec(
+    command=[_LB_PYTHON, str(_HERE / "jobs" / "daily_line_bot_review.py")],
+    cwd=str(_HERE),
+    env=_base_env(),
+    timeout=420,
+    description="Daily LINE bot lifecycle review and feature suggestion → Discord",
+)
+
+
 JOB_REGISTRY["weekly-hook-block-report"] = JobSpec(
     command=[_LB_PYTHON, _user_script("weekly_hook_block_report.py")],
     cwd=None,

@@ -91,10 +91,12 @@ def _send_to_group(group_id: str, text: str) -> bool:
     try:
         from linebot.v3 import messaging as _msg
         from line_token_refresh import get_line_token
+        from line_push_client import validate_push_text
         token = get_line_token()
         if not token:
             log.warning("no LINE token")
             return False
+        text = validate_push_text(text, source="process_pending_media")
         cfg = _msg.Configuration(access_token=token)
         with _msg.ApiClient(cfg) as api_client:
             api = _msg.MessagingApi(api_client)

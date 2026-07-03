@@ -14,9 +14,13 @@ Bug refs (commit SHA prefix):
   Bug 7 (e2cfb86/ee45f0d): _reply() skips empty/whitespace text
 """
 
+import sys
 import time
+import types
 from contextlib import contextmanager
+from datetime import datetime
 from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -68,6 +72,427 @@ def _make_text_event(
 @contextmanager
 def _noop_cm():
     yield
+
+
+class _FixedDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        base = cls(2026, 7, 2, 10, 30, tzinfo=ZoneInfo("Asia/Taipei"))
+        return base if tz is None else base.astimezone(tz)
+
+
+def test_prepare_outbound_text_blocks_stale_date_before_line_api(monkeypatch):
+    monkeypatch.setattr(main.output_validator, "datetime", _FixedDateTime)
+
+    prepared = main._prepare_outbound_text(
+        "現在是2024年，2025年的完整數據尚未發布。",
+        source="regression",
+    )
+
+    assert "過期的年份基準" in prepared
+    assert "2024年" not in prepared
+
+
+def test_prepare_outbound_text_keeps_normal_local_status(monkeypatch):
+    monkeypatch.setattr(main.output_validator, "datetime", _FixedDateTime)
+
+    prepared = main._prepare_outbound_text(
+        "目前沒有查到 pending 待辦或提醒事項。",
+        source="regression",
+    )
+
+    assert prepared == "目前沒有查到 pending 待辦或提醒事項。"
+
+
+def test_blocked_outbound_text_is_not_stored_as_raw_bot_memory(monkeypatch):
+    monkeypatch.setattr(main.output_validator, "datetime", _FixedDateTime)
+    stored: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(main.memory, "append_turn", lambda *args: stored.append(args))
+
+    main._append_bot_turn(
+        "GRP001",
+        "現在是2024年，2025年的完整數據尚未發布。",
+        source="regression_memory",
+    )
+
+    assert len(stored) == 1
+    assert stored[0][:2] == ("GRP001", "bot")
+    assert "過期的年份基準" in stored[0][2]
+    assert "2024年" not in stored[0][2]
+
+
+def test_build_quoted_block_includes_media_description():
+    msg = MagicMock(spec=TextMessageContent)
+    msg.quoted_message_id = "IMG001"
+
+    with (
+        patch("main.memory.get_raw_message", return_value=("USR002", "[圖片]")),
+        patch(
+            "main.memory.get_raw_message_meta",
+            return_value={
+                "media_type": "image",
+                "mime_type": "image/jpeg",
+                "file_name": "",
+                "description": "畫面是一張收據，上面總金額是 1200 元。",
+            },
+        ),
+        patch("main._get_member_display_name", return_value="Alice"),
+    ):
+        block = main._build_quoted_block(msg, "GRP001")
+
+    assert block is not None
+    assert "[Alice]: [圖片]" in block
+    assert "媒體資訊：image / image/jpeg" in block
+    assert "已知內容摘要：畫面是一張收據" in block
+
+
+def test_non_explicit_quoted_text_enters_burst_with_original_context():
+    evt = _make_text_event(text="這個可以嗎", quoted_message_id="Q001")
+    captured: dict[str, str] = {}
+
+    with (
+        patch("main.feedback_collector.in_feedback_window", return_value=False),
+        patch("main._try_one_shot_reply", return_value=False),
+        patch("main._try_handle_calendar_correction", return_value=False),
+        patch("main._detect_user_correction"),
+        patch("main._auto_capture_text_if_important"),
+        patch("main._maybe_extract_reminder"),
+        patch("main._handle_command", return_value=None),
+        patch("main._handle_explicit_poll_text", return_value=None),
+        patch("main._is_todo_query", return_value=False),
+        patch("main._is_dinner_question", return_value=False),
+        patch("main._is_web_research_question", return_value=False),
+        patch("main._try_piggyback_reminders_fast_path", return_value=False),
+        patch("main._extract_gemini_trigger", return_value=None),
+        patch("main.memory.get_raw_message", return_value=("USR002", "原始文字內容")),
+        patch("main.memory.get_raw_message_meta", return_value=None),
+        patch("main._get_member_display_name", return_value="Alice"),
+        patch("main.burst_filter.add_to_burst") as mock_burst,
+    ):
+        main._handle_text_message(evt, "GRP001")
+
+    args = mock_burst.call_args.args
+    captured["text"] = args[2]
+    assert "原始訊息 開始" in captured["text"]
+    assert "原始文字內容" in captured["text"]
+    assert "目前回覆 開始" in captured["text"]
+    assert "這個可以嗎" in captured["text"]
+
+
+def test_non_explicit_quoted_url_followup_routes_to_web_research():
+    evt = _make_text_event(text="這個真的假的", quoted_message_id="Q001")
+
+    with (
+        patch("main.feedback_collector.in_feedback_window", return_value=False),
+        patch("main._try_one_shot_reply", return_value=False),
+        patch("main._try_handle_calendar_correction", return_value=False),
+        patch("main._detect_user_correction"),
+        patch("main._auto_capture_text_if_important"),
+        patch("main._maybe_extract_reminder"),
+        patch("main._handle_command", return_value=None),
+        patch("main._handle_explicit_poll_text", return_value=None),
+        patch("main._is_todo_query", return_value=False),
+        patch("main._is_dinner_question", return_value=False),
+        patch("main._is_web_research_question", return_value=False),
+        patch("main._extract_gemini_trigger", return_value=None),
+        patch("main.memory.get_raw_message", return_value=("USR002", "原始連結 https://example.com/a")),
+        patch("main.memory.get_raw_message_meta", return_value=None),
+        patch("main._get_member_display_name", return_value="Alice"),
+        patch("main._handle_web_research_question", return_value=True) as mock_web,
+        patch("main.burst_filter.cancel_burst") as mock_cancel,
+        patch("main.burst_filter.add_to_burst") as mock_burst,
+    ):
+        main._handle_text_message(evt, "GRP001")
+
+    mock_web.assert_called_once()
+    research_text = mock_web.call_args.args[2]
+    assert "原始連結 https://example.com/a" in research_text
+    assert "這個真的假的" in research_text
+    mock_cancel.assert_called_once_with("GRP001")
+    mock_burst.assert_not_called()
+
+
+def test_non_explicit_quoted_media_followup_routes_to_media_quote():
+    evt = _make_text_event(text="這張是什麼", quoted_message_id="IMG001")
+
+    with (
+        patch("main.feedback_collector.in_feedback_window", return_value=False),
+        patch("main._try_one_shot_reply", return_value=False),
+        patch("main._try_handle_calendar_correction", return_value=False),
+        patch("main._detect_user_correction"),
+        patch("main._auto_capture_text_if_important"),
+        patch("main._maybe_extract_reminder"),
+        patch("main._handle_command", return_value=None),
+        patch("main._handle_explicit_poll_text", return_value=None),
+        patch("main._is_todo_query", return_value=False),
+        patch("main._is_dinner_question", return_value=False),
+        patch("main._is_web_research_question", return_value=False),
+        patch("main._extract_gemini_trigger", return_value=None),
+        patch("main.memory.get_raw_message", return_value=("USR002", "[圖片]")),
+        patch("main.memory.get_raw_message_meta", return_value=None),
+        patch("main._get_member_display_name", return_value="Alice"),
+        patch("main._handle_media_via_quote") as mock_media,
+        patch("main.burst_filter.add_to_burst") as mock_burst,
+    ):
+        main._handle_text_message(evt, "GRP001")
+
+    mock_media.assert_called_once_with(evt, "GRP001", "這張是什麼", "IMG001", "[圖片]")
+    mock_burst.assert_not_called()
+
+
+def test_quoted_media_description_fallback_answers_when_bytes_missing():
+    evt = _make_text_event(text="這張是什麼", quoted_message_id="IMG001")
+    stored_user: list[str] = []
+    fake_local = types.ModuleType("local_llm")
+    fake_local.chat = lambda *a, **k: (
+        "圖片內容：這張是在講收據，總金額看起來是 1200 元。\n"
+        "正方：有金額摘要方便快速對帳。\n"
+        "反方：只看摘要可能漏掉日期、品項或付款方式。\n"
+        "統一論點：先用它當線索，再回原收據核對細節。"
+    )
+
+    with (
+        patch.dict(sys.modules, {"local_llm": fake_local}),
+        patch(
+            "main.memory.get_raw_message_meta",
+            return_value={"description": "畫面是一張收據，上面總金額是 1200 元。"},
+        ),
+        patch("main.memory.get_context", return_value=[]),
+        patch("main._llm_chat") as mock_llm_chat,
+        patch("main.memory.append_turn", side_effect=lambda _g, _r, t: stored_user.append(t)),
+        patch("main._append_bot_turn") as mock_bot_turn,
+        patch("main._reply") as mock_reply,
+    ):
+        handled = main._handle_quoted_media_description_fallback(
+            evt, "GRP001", "這張是什麼", "IMG001", "圖片"
+        )
+
+    assert handled
+    assert "既有摘要" in stored_user[0]
+    mock_llm_chat.assert_not_called()
+    mock_bot_turn.assert_called_once()
+    mock_reply.assert_called_once()
+    sent = mock_reply.call_args.args[1]
+    assert "圖片內容：" in sent
+    assert "正方：" in sent
+    assert "反方：" in sent
+    assert "統一論點：" in sent
+
+
+def test_youtube_live_ytdlp_metadata_is_usable_without_subtitles(monkeypatch):
+    info = {
+        "title": "重大新聞直播",
+        "uploader": "新聞頻道",
+        "channel_url": "https://www.youtube.com/@news",
+        "webpage_url": "https://www.youtube.com/watch?v=LIVE1234567",
+        "is_live": True,
+        "live_status": "is_live",
+        "description": "今天直播討論最新國際情勢與市場反應。",
+        "view_count": 12345,
+        "duration": None,
+        "subtitles": {},
+        "automatic_captions": {},
+    }
+
+    class FakeYDL:
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def extract_info(self, url, download=False):
+            assert not download
+            return info
+
+    monkeypatch.setattr(main, "_YTDLP_AVAILABLE", True)
+    monkeypatch.setattr(main, "_yt_dlp", MagicMock(YoutubeDL=FakeYDL))
+    monkeypatch.setattr(main, "_extract_subtitles_from_info", lambda _info: None)
+
+    block = main._fetch_video_ytdlp("https://www.youtube.com/watch?v=LIVE1234567")
+
+    assert block is not None
+    assert "標題：重大新聞直播" in block
+    assert "頻道：新聞頻道" in block
+    assert "直播狀態：正在直播" in block
+    assert "今天直播討論最新國際情勢" in block
+    assert "未取得可用字幕或逐字稿" in block
+    assert "請自行" not in block
+
+
+def test_youtube_oembed_fallback_does_not_tell_user_to_click(monkeypatch):
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "title": "直播標題",
+        "author_name": "直播頻道",
+    }
+    monkeypatch.setattr(main._requests, "get", lambda *a, **kw: mock_resp)
+
+    block = main._fetch_youtube_meta("https://youtube.com/watch?v=LIVE1234567")
+
+    assert block is not None
+    assert "標題：直播標題" in block
+    assert "頻道：直播頻道" in block
+    assert "資料限制" in block
+    assert "請自行" not in block
+    assert "自己點" not in block
+
+
+def test_prefetch_youtube_trims_trailing_punctuation(monkeypatch):
+    seen: list[str] = []
+
+    def fake_ytdlp(url):
+        seen.append(url)
+        return "YOUTUBE_BLOCK"
+
+    monkeypatch.setattr(main, "_fetch_video_ytdlp", fake_ytdlp)
+    monkeypatch.setattr(main, "_fetch_youtube_meta", lambda _url: None)
+
+    out = main._prefetch_urls("看這個 https://youtu.be/LIVE1234567。")
+
+    assert seen == ["https://www.youtube.com/watch?v=LIVE1234567"]
+    assert "YOUTUBE_BLOCK" in out
+
+
+def test_youtube_live_url_is_canonicalized():
+    assert (
+        main._canonical_youtube_url("https://www.youtube.com/live/LIVE1234567?si=abc")
+        == "https://www.youtube.com/watch?v=LIVE1234567"
+    )
+    assert (
+        main._canonical_youtube_url("https://www.youtube.com/embed/LIVE1234567")
+        == "https://www.youtube.com/watch?v=LIVE1234567"
+    )
+
+
+def test_youtube_html_metadata_fallback_parses_player_response(monkeypatch):
+    seen: list[str] = []
+    html = """
+    <html><head>
+      <meta property="og:url" content="https://www.youtube.com/watch?v=LIVE1234567">
+    </head><body>
+      <script>
+        var ytInitialPlayerResponse = {"videoDetails":{"title":"現場直播標題","author":"現場頻道","shortDescription":"直播描述文字","isLiveContent":true,"lengthSeconds":"123","viewCount":"4567"}};
+      </script>
+    </body></html>
+    """
+
+    def fake_get(url, **kwargs):
+        seen.append(url)
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.text = html
+        return resp
+
+    monkeypatch.setattr(main._requests, "get", fake_get)
+
+    block = main._fetch_youtube_html_meta(
+        "https://www.youtube.com/live/LIVE1234567?si=abc"
+    )
+
+    assert seen == ["https://www.youtube.com/watch?v=LIVE1234567"]
+    assert block is not None
+    assert "標題：現場直播標題" in block
+    assert "頻道：現場頻道" in block
+    assert "直播狀態：直播內容或直播重播" in block
+    assert "描述：直播描述文字" in block
+    assert "不要要求使用者自行點擊觀看" in block
+
+
+def test_prefetch_youtube_all_fetchers_fail_still_adds_context(monkeypatch):
+    monkeypatch.setattr(main, "_fetch_video_ytdlp", lambda _url: None)
+    monkeypatch.setattr(main, "_fetch_youtube_meta", lambda _url: None)
+    monkeypatch.setattr(main, "_fetch_youtube_html_meta", lambda _url: None)
+
+    out = main._prefetch_urls("幫我看 https://www.youtube.com/live/LIVE1234567。")
+
+    assert "系統已辨識為 YouTube 影片或直播" in out
+    assert "影片 ID：LIVE1234567" in out
+    assert "禁止使用把操作交回使用者" in out
+    assert "幫我看 https://www.youtube.com/live/LIVE1234567。" in out
+
+
+def test_prefetch_accepts_bare_youtube_url(monkeypatch):
+    seen: list[str] = []
+
+    def fake_context(url):
+        seen.append(url)
+        return "YOUTUBE_BLOCK"
+
+    monkeypatch.setattr(main, "_fetch_youtube_context", fake_context)
+
+    out = main._prefetch_urls("幫我看 youtu.be/LIVE1234567")
+
+    assert seen == ["https://youtu.be/LIVE1234567"]
+    assert "YOUTUBE_BLOCK" in out
+
+
+def test_prefetch_prioritizes_youtube_when_third_url(monkeypatch):
+    seen: list[str] = []
+
+    def fake_context(url):
+        seen.append(url)
+        return "YOUTUBE_BLOCK"
+
+    class FakeResp:
+        status_code = 200
+        text = "<html><body>" + ("一般網頁內容 " * 20) + "</body></html>"
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(main, "_fetch_youtube_context", fake_context)
+    monkeypatch.setattr(main._requests, "get", lambda *a, **kw: FakeResp())
+
+    out = main._prefetch_urls(
+        "先看 https://example.com/a 再看 https://example.org/b "
+        "最後看 https://www.youtube.com/live/LIVE1234567"
+    )
+
+    assert seen == ["https://www.youtube.com/live/LIVE1234567"]
+    assert "YOUTUBE_BLOCK" in out
+
+
+def test_web_research_youtube_question_prefetches_before_llm(monkeypatch):
+    captured: dict[str, str] = {}
+    event = _make_text_event(
+        "這直播在講什麼 https://www.youtube.com/live/LIVE1234567",
+        group_id="GRP001",
+    )
+
+    def fake_llm(prompt, context, facts, pnotes):
+        captured["prompt"] = prompt
+        return "這場直播主題可從 metadata 判斷。"
+
+    monkeypatch.setattr(main, "_fetch_youtube_context", lambda _url: "YOUTUBE_CONTEXT_BLOCK")
+    monkeypatch.setattr(main, "_collect_web_research_sources", lambda _text: [])
+    monkeypatch.setattr(main, "_llm_chat", fake_llm)
+    monkeypatch.setattr(main, "_thinking_indicator", lambda _group_id: _noop_cm())
+
+    with (
+        patch("main.memory.get_context", return_value=[]),
+        patch("main.memory.top_facts", return_value=[]),
+        patch("main._get_persona_notes", return_value=[]),
+        patch("main.memory.append_turn"),
+        patch("main._append_bot_turn"),
+        patch("main._reply"),
+    ):
+        handled = main._handle_web_research_question(
+            event,
+            "GRP001",
+            "這直播在講什麼 https://www.youtube.com/live/LIVE1234567",
+        )
+
+    assert handled
+    assert "YOUTUBE_CONTEXT_BLOCK" in captured["prompt"]
+
+
+def test_web_research_detects_bare_youtube_url_question():
+    assert main._is_web_research_question("這直播在講什麼 youtu.be/LIVE1234567")
 
 
 # ── Bug 1 ─────────────────────────────────────────────────────────────────────
@@ -370,6 +795,33 @@ def test_reply_strips_user_visible_mode_labels(monkeypatch):
     assert "搜尋摘要" in sent
     assert "lite mode" not in sent
     assert "local LLM" not in sent
+
+
+def test_reply_blocks_youtube_link_failure_before_line_api(monkeypatch):
+    """YouTube deflection text must be replaced before reaching LINE."""
+    monkeypatch.setattr(main.settings, "bot_muted", False)
+
+    mock_api = MagicMock()
+    mock_api.__enter__ = MagicMock(return_value=mock_api)
+    mock_api.__exit__ = MagicMock(return_value=False)
+    mock_messaging = MagicMock()
+    bad_reply = (
+        "這個 YouTube 直播連結本身未提供預覽內容，最直接的方式是點擊觀看以了解即時資訊。\n"
+        "我目前手邊的資料僅包含 YouTube 的一般網域資訊，無法解析此直播的具體內容。"
+    )
+
+    with (
+        patch("main.ApiClient", return_value=mock_api),
+        patch("main.MessagingApi", return_value=mock_messaging),
+        patch("main._load_pending_explicit", return_value={}),
+    ):
+        main._reply("TOKEN001", bad_reply, group_id="GRP001")
+
+    request = mock_messaging.reply_message.call_args.args[0]
+    sent = request.messages[0].text
+    assert "YouTube 連結解析流程沒有正確啟動" in sent
+    assert "點擊觀看" not in sent
+    assert "無法解析此直播" not in sent
 
 
 def test_market_quote_reply_token_expired_does_not_fallback_push(monkeypatch):
@@ -801,6 +1253,9 @@ def test_quota_exhausted_llm_chat_uses_direct_local_when_lite_misses(monkeypatch
     assert local_calls
     assert local_calls[0]["context"] == [("user", "前文")]
     assert local_calls[0]["max_tokens"] == 360
+    assert "即時時間基準" in local_calls[0]["system_prompt"]
+    assert "目前台灣時間" in local_calls[0]["system_prompt"]
+    assert "不要沿用舊年份" in local_calls[0]["system_prompt"]
 
 
 def test_quota_exhausted_llm_chat_rechecks_gemini_before_local(monkeypatch):

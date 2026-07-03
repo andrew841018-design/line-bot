@@ -11,6 +11,8 @@ import logging
 import os
 from collections.abc import Iterable
 
+import output_validator
+
 logger = logging.getLogger("line_push_client")
 
 PUSH_URL = "https://api.line.me/v2/bot/message/push"
@@ -60,6 +62,42 @@ def line_configuration(fallback_token: str | None = None):
     return Configuration(access_token=line_access_token(fallback_token=fallback_token))
 
 
+def validate_push_text(text: str, *, source: str = "line_push_client") -> str:
+    """Return LINE-bound text or a safe replacement if validation blocks it."""
+    result = output_validator.validate_outbound_text(text or "")
+    if not result.ok:
+        logger.warning(
+            "outbound push validation blocked source=%s reason=%s preview=%r",
+            source,
+            result.reason,
+            (text or "")[:160],
+        )
+    return result.text
+
+
+def _validated_message_dict(message: dict, *, source: str) -> dict:
+    msg = dict(message)
+    msg_type = msg.get("type")
+    text = msg.get("text")
+    if msg_type not in {"text", "textV2"} or not isinstance(text, str):
+        return msg
+
+    safe_text = validate_push_text(text, source=source)
+    if msg_type == "textV2" and safe_text != text:
+        return {"type": "text", "text": safe_text[:5000]}
+    msg["text"] = safe_text[:5000]
+    return msg
+
+
+def _validated_messages(messages: Iterable[dict], *, source: str) -> list[dict]:
+    return [
+        _validated_message_dict(msg, source=source)
+        if isinstance(msg, dict)
+        else msg
+        for msg in messages
+    ]
+
+
 def push_messages(
     to: str,
     messages: Iterable[dict],
@@ -88,12 +126,13 @@ def push_messages(
     if retry_key:
         headers["X-Line-Retry-Key"] = retry_key
 
+    validated_messages = _validated_messages(messages, source="push_messages")
     transport = session or requests
     try:
         resp = transport.post(
             PUSH_URL,
             headers=headers,
-            json={"to": group_id, "messages": list(messages)},
+            json={"to": group_id, "messages": validated_messages},
             timeout=timeout,
         )
     except Exception as e:

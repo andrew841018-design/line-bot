@@ -72,6 +72,7 @@ import burst_filter
 import feedback_collector
 import gemini_client
 import memory
+import output_validator
 from pending_reply_policy import PENDING_REPLY_ENABLED as _DEFAULT_PENDING_REPLY_ENABLED
 import review
 from config import settings
@@ -225,6 +226,30 @@ def _strip_user_visible_mode_labels(text: str) -> str:
     return s.strip()
 
 
+def _prepare_outbound_text(text: str, *, source: str = "reply") -> str:
+    """Normalize and validate text before it reaches any LINE text API."""
+    prepared = _strip_user_visible_mode_labels(_md_to_line(text))
+    if not prepared.strip():
+        return ""
+    result = output_validator.validate_outbound_text(prepared)
+    if not result.ok:
+        logger.warning(
+            "outbound validation blocked source=%s reason=%s preview=%r",
+            source,
+            result.reason,
+            prepared[:160],
+        )
+        return result.text
+    return result.text
+
+
+def _append_bot_turn(group_id: str, text: str, *, source: str = "bot_memory") -> None:
+    """Store the validated user-visible bot text, not a blocked raw draft."""
+    safe_text = _prepare_outbound_text(text, source=source)
+    if safe_text:
+        memory.append_turn(group_id, "bot", safe_text)
+
+
 def _is_market_quote_outbound(text: str) -> bool:
     """Market quotes are reply-only; an expired reply token must not create a push."""
     return (text or "").lstrip().startswith(("【市場報價", "【即時股價"))
@@ -269,6 +294,25 @@ _LOCAL_TEXT_FALLBACK_SYSTEM_PROMPT = """你是 LINE 群組助理咪寶。現在�
 若題目需要即時查證、最新價格、外部網頁或醫療法律投資專業判斷，而使用者沒有提供足夠資料，請明確說「本機模式無法即時查證」，但仍給可用的大方向、條件與下一步。
 控制在 80 到 260 個中文字，避免空泛安慰。"""
 
+
+def _runtime_time_context_for_local_llm() -> str:
+    now_tw = datetime.now(ZoneInfo("Asia/Taipei"))
+    weekday = "一二三四五六日"[now_tw.weekday()]
+    return (
+        "即時時間基準："
+        f"目前台灣時間 {now_tw.strftime('%Y-%m-%d %H:%M:%S')}（週{weekday}，Asia/Taipei）。"
+        f"今天日期是 {now_tw.year}年{now_tw.month}月{now_tw.day}日。"
+        "回答現在、目前、今年、去年、最新、完整數據時，以此為準，不要沿用舊年份。"
+    )
+
+
+def _local_text_fallback_system_prompt() -> str:
+    return (
+        _LOCAL_TEXT_FALLBACK_SYSTEM_PROMPT.rstrip()
+        + "\n"
+        + _runtime_time_context_for_local_llm()
+    )
+
 _GEMINI_QUOTA_RECHECK_INTERVAL_SEC = int(
     os.environ.get("GEMINI_QUOTA_RECHECK_INTERVAL_SEC", "1800")
 )
@@ -288,7 +332,7 @@ def _local_text_llm_fallback(
         out = local_chat(
             text,
             context=context,
-            system_prompt=_LOCAL_TEXT_FALLBACK_SYSTEM_PROMPT,
+            system_prompt=_local_text_fallback_system_prompt(),
             max_tokens=360,
         )
     except Exception as e:
@@ -348,6 +392,12 @@ def _llm_chat(
 # ── URL 預抓取（繞過 Gemini url_context 的限制）─────────────────────────────
 
 _URL_RE = re.compile(r"https?://\S+")
+_YOUTUBE_BARE_URL_RE = re.compile(
+    r"(?<![A-Za-z0-9./:-])"
+    r"(?:www\.|m\.)?"
+    r"(?:youtube\.com|youtube-nocookie\.com|youtu\.be)/\S+",
+    re.IGNORECASE,
+)
 _PREFETCH_TIMEOUT = 5  # 秒，避免拖太久讓 reply_token 過期
 _PREFETCH_MAX_CHARS = 5000  # 截斷上限，避免塞爆 prompt
 _PREFETCH_MAX_URLS = 2  # 一次最多抓幾個連結
@@ -356,6 +406,7 @@ _PREFETCH_MIN_CHARS = 80  # 低於此長度視為垃圾（JS 渲染空殼），�
 _YTDLP_TIMEOUT = 12  # yt-dlp 單次提取上限（秒）
 _YTDLP_SUBTITLE_MAX_CHARS = 3000
 _YTDLP_SUBTITLE_LANGS = ["zh-TW", "zh-Hant", "zh", "zh-Hans", "en"]
+_YTDLP_DESCRIPTION_MAX_CHARS = 1500
 
 # Gemini Video Understanding fallback 參數
 _GEMINI_VIDEO_TIMEOUT = 60  # 整個 download + upload + analyze 的總上限（秒）
@@ -407,6 +458,160 @@ def _parse_vtt(vtt_text: str) -> str:
     return "\n".join(deduped)
 
 
+def _clean_prefetch_url(url: str) -> str:
+    """Trim punctuation often included when users paste links in chat."""
+    return (url or "").strip().rstrip("。．，,、；;：:！!？?）)]}>\"'")
+
+
+def _with_scheme_for_youtube(url: str) -> str:
+    cleaned = _clean_prefetch_url(url)
+    if cleaned and not re.match(r"https?://", cleaned, re.IGNORECASE):
+        if _YOUTUBE_BARE_URL_RE.fullmatch(cleaned):
+            return f"https://{cleaned}"
+    return cleaned
+
+
+def _is_youtube_url(url: str) -> bool:
+    from urllib.parse import urlparse
+
+    lower = _with_scheme_for_youtube(url).lower()
+    host = urlparse(lower).netloc
+    return (
+        host == "youtu.be"
+        or host.endswith(".youtu.be")
+        or host == "youtube.com"
+        or host.endswith(".youtube.com")
+        or host == "youtube-nocookie.com"
+        or host.endswith(".youtube-nocookie.com")
+    )
+
+
+def _extract_prefetch_urls(text: str) -> list[str]:
+    """Extract HTTP URLs plus bare YouTube URLs, prioritizing YouTube later."""
+    raw_urls = list(_URL_RE.findall(text or ""))
+    raw_urls.extend(
+        match.group(0) for match in _YOUTUBE_BARE_URL_RE.finditer(text or "")
+    )
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for raw_url in raw_urls:
+        cleaned = _with_scheme_for_youtube(raw_url)
+        if not cleaned or cleaned in seen:
+            continue
+        deduped.append(cleaned)
+        seen.add(cleaned)
+    return deduped
+
+
+def _extract_youtube_video_id(url: str) -> str | None:
+    """Return a YouTube video id from common watch/shorts/live/embed forms."""
+    from urllib.parse import parse_qs, urlparse
+
+    cleaned = _with_scheme_for_youtube(url)
+    if not cleaned:
+        return None
+    parsed = urlparse(cleaned)
+    host = parsed.netloc.lower()
+    path = parsed.path or ""
+
+    def _valid(candidate: str | None) -> str | None:
+        candidate = (candidate or "").strip()
+        if re.fullmatch(r"[A-Za-z0-9_-]{11}", candidate):
+            return candidate
+        return None
+
+    if host == "youtu.be" or host.endswith(".youtu.be"):
+        return _valid(path.lstrip("/").split("/", 1)[0])
+
+    is_youtube_host = (
+        host == "youtube.com"
+        or host.endswith(".youtube.com")
+        or host == "youtube-nocookie.com"
+        or host.endswith(".youtube-nocookie.com")
+    )
+    if not is_youtube_host:
+        return None
+
+    if path == "/watch":
+        return _valid((parse_qs(parsed.query).get("v") or [""])[0])
+
+    for prefix in ("/shorts/", "/live/", "/embed/", "/v/"):
+        if path.startswith(prefix):
+            return _valid(path[len(prefix) :].split("/", 1)[0])
+
+    return None
+
+
+def _canonical_youtube_url(url: str) -> str:
+    video_id = _extract_youtube_video_id(url)
+    if video_id:
+        return f"https://www.youtube.com/watch?v={video_id}"
+    return _clean_prefetch_url(url)
+
+
+def _format_duration_seconds(duration: object) -> str | None:
+    try:
+        total = int(duration)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if total <= 0:
+        return None
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def _youtube_live_status_label(info: dict) -> str | None:
+    live_status = str(info.get("live_status") or "").strip().lower()
+    if info.get("is_live") or live_status == "is_live":
+        return "正在直播"
+    if live_status in {"is_upcoming", "is_upcoming_event"}:
+        return "預定直播"
+    if info.get("was_live") or live_status in {"was_live", "post_live"}:
+        return "直播已結束 / 重播"
+    if live_status:
+        return live_status
+    return None
+
+
+def _append_youtube_metadata_lines(lines: list[str], info: dict) -> None:
+    title = (info.get("title") or "").strip()
+    uploader = (info.get("uploader") or info.get("channel") or "").strip()
+    channel_url = (info.get("channel_url") or info.get("uploader_url") or "").strip()
+    webpage_url = (info.get("webpage_url") or "").strip()
+    duration_text = (
+        info.get("duration_string") or _format_duration_seconds(info.get("duration"))
+    )
+    live_label = _youtube_live_status_label(info)
+    view_count = info.get("view_count")
+    description = (info.get("description") or "").strip()
+
+    if title:
+        lines.append(f"標題：{title}")
+    if uploader:
+        lines.append(f"頻道：{uploader}")
+    if channel_url:
+        lines.append(f"頻道網址：{channel_url}")
+    if webpage_url:
+        lines.append(f"影片網址：{webpage_url}")
+    if live_label:
+        lines.append(f"直播狀態：{live_label}")
+    if duration_text:
+        lines.append(f"長度：{duration_text}")
+    if isinstance(view_count, int):
+        lines.append(f"觀看次數：{view_count:,}")
+    if description:
+        desc = (
+            description[:_YTDLP_DESCRIPTION_MAX_CHARS] + "…（描述截斷）"
+            if len(description) > _YTDLP_DESCRIPTION_MAX_CHARS
+            else description
+        )
+        lines.append(f"描述：{desc}")
+
+
 def _extract_subtitles_from_info(info: dict) -> str | None:
     """從 yt-dlp info dict 拿字幕文字（優先人工字幕 → 自動生成，語言優先順序見常數）。"""
     for subs_dict in (
@@ -455,30 +660,29 @@ def _fetch_video_ytdlp(url: str) -> str | None:
         if not info:
             return None
 
+        if info.get("_type") == "playlist" and info.get("entries"):
+            first = next((e for e in info.get("entries") or [] if e), None)
+            if isinstance(first, dict):
+                info = first
+
         title = (info.get("title") or "").strip()
         uploader = (info.get("uploader") or info.get("channel") or "").strip()
         description = (info.get("description") or "").strip()
-        duration = info.get("duration")
+        subtitle_text = _extract_subtitles_from_info(info)
 
-        if not title and not uploader:
+        if not any((title, uploader, description, subtitle_text)):
             return None
 
         lines = [f"（以下是影片連結 {url} 的內容，透過 yt-dlp 擷取）"]
         lines.append("--- 影片資訊開始 ---")
-        if title:
-            lines.append(f"標題：{title}")
-        if uploader:
-            lines.append(f"上傳者：{uploader}")
-        if duration:
-            m, s = divmod(int(duration), 60)
-            lines.append(f"長度：{m}:{s:02d}")
-        if description:
-            desc = description[:500] + "…" if len(description) > 500 else description
-            lines.append(f"描述：{desc}")
-
-        subtitle_text = _extract_subtitles_from_info(info)
+        _append_youtube_metadata_lines(lines, info)
         if subtitle_text:
             lines.append(f"\n字幕內容：\n{subtitle_text}")
+        else:
+            lines.append(
+                "\n字幕內容：未取得可用字幕或逐字稿；請根據上方標題、頻道、"
+                "直播狀態與描述判斷主題，不要聲稱已看完整影片。"
+            )
 
         lines.append("--- 影片資訊結束 ---")
         block = "\n".join(lines)
@@ -613,7 +817,10 @@ def _fetch_youtube_meta(url: str) -> str | None:
             lines.append(f"標題：{title}")
         if author:
             lines.append(f"頻道：{author}")
-        lines.append("（備註：oEmbed 只給標題與頻道，影片實際內容請自行參考連結）")
+        lines.append(
+            "資料限制：oEmbed 只提供標題與頻道，未取得字幕或逐字稿；"
+            "請仍根據可取得的 metadata 判斷直播/影片主題，並標示資訊限制。"
+        )
         lines.append("--- YouTube 影片資訊結束 ---")
         block = "\n".join(lines)
         logger.info("youtube oembed OK url=%s chars=%d", url, len(block))
@@ -621,6 +828,153 @@ def _fetch_youtube_meta(url: str) -> str | None:
     except Exception as e:
         logger.info("youtube oembed failed url=%s: %s", url, e)
         return None
+
+
+def _meta_content(soup: BeautifulSoup, key: str) -> str:
+    for attr in ("property", "name", "itemprop"):
+        tag = soup.find("meta", attrs={attr: key})
+        if tag and tag.get("content"):
+            return str(tag.get("content")).strip()
+    return ""
+
+
+def _extract_youtube_player_response(html_text: str) -> dict | None:
+    marker = "ytInitialPlayerResponse"
+    start_at = html_text.find(marker)
+    while start_at >= 0:
+        equals_at = html_text.find("=", start_at)
+        json_start = html_text.find("{", equals_at if equals_at >= 0 else start_at)
+        if json_start < 0:
+            return None
+        try:
+            data, _ = _json.JSONDecoder().raw_decode(html_text[json_start:])
+        except ValueError:
+            start_at = html_text.find(marker, start_at + len(marker))
+            continue
+        if isinstance(data, dict):
+            return data
+        return None
+    return None
+
+
+def _format_count(value: object) -> str | None:
+    try:
+        return f"{int(str(value)):,}"
+    except (TypeError, ValueError):
+        return None
+
+
+def _fetch_youtube_html_meta(url: str) -> str | None:
+    """Fetch YouTube watch HTML and parse og/meta + ytInitialPlayerResponse."""
+    try:
+        canonical_url = _canonical_youtube_url(url)
+        resp = _requests.get(
+            canonical_url,
+            timeout=_PREFETCH_TIMEOUT,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+                "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6",
+            },
+        )
+        if resp.status_code != 200:
+            logger.info("youtube html HTTP %d url=%s", resp.status_code, canonical_url)
+            return None
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        player = _extract_youtube_player_response(resp.text) or {}
+        details = player.get("videoDetails") if isinstance(player, dict) else {}
+        if not isinstance(details, dict):
+            details = {}
+
+        title = (
+            (details.get("title") or "").strip()
+            or _meta_content(soup, "og:title")
+            or (soup.title.get_text(strip=True) if soup.title else "")
+        )
+        author = (details.get("author") or "").strip() or _meta_content(
+            soup, "author"
+        )
+        description = (
+            (details.get("shortDescription") or "").strip()
+            or _meta_content(soup, "og:description")
+            or _meta_content(soup, "description")
+        )
+        duration_text = _format_duration_seconds(details.get("lengthSeconds"))
+        view_count = _format_count(details.get("viewCount"))
+        is_live = bool(details.get("isLiveContent"))
+        video_url = _meta_content(soup, "og:url") or canonical_url
+
+        if not any((title, author, description)):
+            logger.info("youtube html empty metadata url=%s", canonical_url)
+            return None
+
+        lines = [
+            f"（以下是 YouTube 連結 {url} 的影片資訊，透過 YouTube HTML metadata 擷取）"
+        ]
+        lines.append("--- YouTube 影片資訊開始 ---")
+        if title:
+            lines.append(f"標題：{title}")
+        if author:
+            lines.append(f"頻道：{author}")
+        if video_url:
+            lines.append(f"影片網址：{video_url}")
+        if is_live:
+            lines.append("直播狀態：直播內容或直播重播")
+        if duration_text:
+            lines.append(f"長度：{duration_text}")
+        if view_count:
+            lines.append(f"觀看次數：{view_count}")
+        if description:
+            desc = (
+                description[:_YTDLP_DESCRIPTION_MAX_CHARS] + "…（描述截斷）"
+                if len(description) > _YTDLP_DESCRIPTION_MAX_CHARS
+                else description
+            )
+            lines.append(f"描述：{desc}")
+        lines.append(
+            "字幕內容：未取得可用字幕或逐字稿；請根據上方標題、頻道、"
+            "直播狀態與描述判斷主題，不要要求使用者自行點擊觀看。"
+        )
+        lines.append("--- YouTube 影片資訊結束 ---")
+        block = "\n".join(lines)
+        logger.info("youtube html metadata OK url=%s chars=%d", canonical_url, len(block))
+        return block
+    except Exception as e:
+        logger.info("youtube html metadata failed url=%s: %s", url, e)
+        return None
+
+
+def _youtube_unavailable_block(url: str) -> str:
+    cleaned = _clean_prefetch_url(url)
+    canonical_url = _canonical_youtube_url(cleaned)
+    video_id = _extract_youtube_video_id(cleaned)
+    lines = [
+        f"（以下是 YouTube 連結 {cleaned} 的抓取狀態；系統已辨識為 YouTube 影片或直播）",
+        "--- YouTube 影片資訊開始 ---",
+    ]
+    if video_id:
+        lines.append(f"影片 ID：{video_id}")
+    if canonical_url:
+        lines.append(f"影片網址：{canonical_url}")
+    lines.append(
+        "抓取結果：yt-dlp、oEmbed、YouTube HTML metadata 這次都沒有取得標題、描述或字幕。"
+    )
+    lines.append(
+        "回覆要求：請明確說這次抓取未取得可用 metadata，建議稍後重試或補貼標題/截圖；"
+        "禁止使用把操作交回使用者、只描述平台網域、或要求補關鍵字才處理的退讓話術。"
+    )
+    lines.append("--- YouTube 影片資訊結束 ---")
+    return "\n".join(lines)
+
+
+def _fetch_youtube_context(url: str) -> str:
+    canonical_url = _canonical_youtube_url(url)
+    return (
+        _fetch_video_ytdlp(canonical_url)
+        or _fetch_youtube_meta(canonical_url)
+        or _fetch_youtube_html_meta(canonical_url)
+        or _youtube_unavailable_block(url)
+    )
 
 
 # Reddit 短網址 pattern：
@@ -1059,13 +1413,19 @@ def _prefetch_urls(text: str) -> str:
     其他 JS 渲染網站（IG/threads/FB/X/dcard）仍 skip，交給 Gemini Google Search。
     一般靜態網頁走 HTML prefetch + BeautifulSoup 文字萃取。
     """
-    urls = _URL_RE.findall(text)
+    urls = _extract_prefetch_urls(text)
     if not urls:
         return text
 
     blocks = []
-    for url in urls[:_PREFETCH_MAX_URLS]:
+    youtube_urls = [url for url in urls if _is_youtube_url(url)]
+    other_urls = [url for url in urls if not _is_youtube_url(url)]
+    ordered_urls = (youtube_urls + other_urls)[:_PREFETCH_MAX_URLS]
+    for raw_url in ordered_urls:
         try:
+            url = _clean_prefetch_url(raw_url)
+            if not url:
+                continue
             u_lower = url.lower()
 
             # 1) 影片平台：yt-dlp 優先（支援字幕），失敗才 fallback oEmbed
@@ -1078,13 +1438,10 @@ def _prefetch_urls(text: str) -> str:
                 else:
                     logger.info("tiktok: ytdlp + oembed + gemini all failed, skip url=%s", url)
                 continue
-            if "youtube.com" in u_lower or "youtu.be" in u_lower:
-                # YouTube 不走 video fallback：yt-dlp 已能抓字幕
-                block = _fetch_video_ytdlp(url) or _fetch_youtube_meta(url)
-                if block:
-                    blocks.append(block)
-                else:
-                    logger.info("youtube: ytdlp + oembed both failed, skip url=%s", url)
+            if _is_youtube_url(url):
+                # YouTube 不走 Gemini video fallback：yt-dlp/oEmbed/HTML metadata
+                # 已能提供可用 context；全失敗時也保留辨識狀態避免 LLM 只看裸網址。
+                blocks.append(_fetch_youtube_context(url))
                 continue
             if "reddit.com" in u_lower or "redd.it" in u_lower:
                 block = _fetch_reddit_meta(url)
@@ -1344,23 +1701,41 @@ def _handle_event(event) -> None:
     # 2026-06-06 改：圖片/影片只走即時 local analyze；不再存 pending reply。
     if isinstance(msg, ImageMessageContent):
         memory.log_raw_message(group_id, msg.id, sender_user_id, "[圖片]")
+        memory.log_raw_message_meta(
+            group_id, msg.id, media_type="image", mime_type="image/jpeg"
+        )
         if _pending_reply_enabled():
             _save_pending_any(event, group_id, sender_user_id, msg)
         _MEDIA_EXECUTOR.submit(_handle_image_message, event, group_id)
         return
     if isinstance(msg, VideoMessageContent):
         memory.log_raw_message(group_id, msg.id, sender_user_id, "[影片]")
+        memory.log_raw_message_meta(
+            group_id, msg.id, media_type="video", mime_type="video/mp4"
+        )
         if _pending_reply_enabled():
             _save_pending_any(event, group_id, sender_user_id, msg)
         _MEDIA_EXECUTOR.submit(_handle_video_message, event, group_id)
         return
     if isinstance(msg, AudioMessageContent):
         memory.log_raw_message(group_id, msg.id, sender_user_id, "[音訊]")
+        memory.log_raw_message_meta(
+            group_id, msg.id, media_type="audio", mime_type="audio/m4a"
+        )
         _handle_audio_message(event, group_id)
         return
 
     # 檔案：只處理文字檔，其他婉拒（file 很罕見，不是 burst 的一部分）
     if isinstance(msg, FileMessageContent):
+        file_name = getattr(msg, "file_name", "") or "unknown"
+        memory.log_raw_message(group_id, msg.id, sender_user_id, f"[檔案: {file_name}]")
+        memory.log_raw_message_meta(
+            group_id,
+            msg.id,
+            media_type="file",
+            mime_type=_guess_mime_type(file_name),
+            file_name=file_name,
+        )
         _handle_file_message(event, group_id)
         return
 
@@ -1415,8 +1790,15 @@ def _handle_audio_message(event: MessageEvent, group_id: str) -> None:
         return
     if not reply_text or not reply_text.strip():
         return
+    memory.log_raw_message_meta(
+        group_id,
+        event.message.id,
+        media_type="audio",
+        mime_type="audio/m4a",
+        description=reply_text,
+    )
     memory.append_turn(group_id, "user", "[語音留言]")
-    memory.append_turn(group_id, "bot", reply_text)
+    _append_bot_turn(group_id, reply_text)
     _maybe_extract_facts(group_id)
     _reply(event.reply_token, reply_text, group_id=group_id)
 
@@ -1458,8 +1840,11 @@ def _handle_image_message(event, group_id):
     if not reply_text or not reply_text.strip():
         logger.info("image analyze returned empty, leaving pending")
         return
+    memory.log_raw_message_meta(
+        group_id, msg_id, media_type="image", mime_type="image/jpeg", description=reply_text
+    )
     memory.append_turn(group_id, "user", "[圖片]")
-    memory.append_turn(group_id, "bot", reply_text)
+    _append_bot_turn(group_id, reply_text)
     try:
         _reply(event.reply_token, reply_text, group_id=group_id)
         _remove_pending_by_msg_id(group_id, msg_id)
@@ -1499,8 +1884,11 @@ def _handle_video_message(event, group_id):
     if not reply_text or not reply_text.strip():
         logger.info("video analyze returned empty, leaving pending")
         return
+    memory.log_raw_message_meta(
+        group_id, msg_id, media_type="video", mime_type="video/mp4", description=reply_text
+    )
     memory.append_turn(group_id, "user", "[影片]")
-    memory.append_turn(group_id, "bot", reply_text)
+    _append_bot_turn(group_id, reply_text)
     try:
         _reply(event.reply_token, reply_text, group_id=group_id)
         _remove_pending_by_msg_id(group_id, msg_id)
@@ -2328,7 +2716,7 @@ def _try_handle_calendar_correction(
 
     burst_filter.cancel_burst(group_id)
     memory.append_turn(group_id, "user", text)
-    memory.append_turn(group_id, "bot", reply)
+    _append_bot_turn(group_id, reply)
     _reply(event.reply_token, reply, group_id=group_id)
     logger.info(
         "calendar correction handled group=%s event_updated=%s reminders_updated=%d text=%r",
@@ -2342,6 +2730,7 @@ def _try_handle_calendar_correction(
 
 def _handle_text_message(event: MessageEvent, group_id: str) -> None:
     text = event.message.text or ""
+    text_with_quote_context = _text_with_quote_context(event.message, group_id, text)
     source = getattr(event, "source", None)
     sender_user_id = getattr(source, "user_id", None) or ""
     message_id = getattr(event.message, "id", "") or ""
@@ -2459,9 +2848,34 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
         return
 
     # 5. 未點名但明顯是可查資料問句 → 即時查網路資料後回覆
-    if clean_text is None and _is_web_research_question(text):
-        if _handle_web_research_question(event, group_id, text):
+    quoted_has_url = text_with_quote_context != text and bool(
+        _extract_prefetch_urls(text_with_quote_context)
+    )
+    quoted_web_followup = quoted_has_url and bool(
+        re.search(r"這個|這篇|這則|真假|真的假的|可以嗎|能信嗎|怎麼看|如何|值得|推薦", text)
+    )
+    if clean_text is None and (
+        _is_web_research_question(text) or quoted_web_followup
+    ):
+        research_text = text_with_quote_context if quoted_web_followup else text
+        if _handle_web_research_question(event, group_id, research_text):
             burst_filter.cancel_burst(group_id)
+            return
+
+    quoted_id = getattr(event.message, "quoted_message_id", None)
+    quoted_media_followup = bool(
+        quoted_id
+        and clean_text is None
+        and re.search(
+            r"這個|這張|這則|這影片|這段|是什麼|怎麼看|幫我看|分析|判斷|真假|可以嗎|哪裡",
+            text,
+        )
+    )
+    if quoted_media_followup:
+        raw = memory.get_raw_message(group_id, quoted_id)
+        if raw is not None and raw[1] in _MEDIA_PLACEHOLDERS:
+            burst_filter.cancel_burst(group_id)
+            _handle_media_via_quote(event, group_id, text, quoted_id, raw[1])
             return
 
     # 6. Explicit 觸發（@mention / /ai / /問 ...）→ 立刻處理，並取消 pending burst
@@ -2477,7 +2891,7 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
         return
 
     burst_filter.add_to_burst(
-        group_id, message_id, text, sender_user_id, event.reply_token
+        group_id, message_id, text_with_quote_context, sender_user_id, event.reply_token
     )
 
 
@@ -2556,7 +2970,7 @@ def _handle_image_gen(event: MessageEvent, group_id: str, subject: str) -> None:
                     )
                 )
             memory.append_turn(group_id, "user", f"[圖片生成] {subject}")
-            memory.append_turn(group_id, "bot", f"[已傳圖] {img_url}")
+            _append_bot_turn(group_id, f"[已傳圖] {img_url}")
         except Exception as e:
             logger.warning("reply ImageMessage failed: %s", e)
             _reply(event.reply_token, f"圖生成 OK 但傳 LINE 失敗：{e}", group_id=group_id)
@@ -2570,7 +2984,7 @@ def _handle_image_gen(event: MessageEvent, group_id: str, subject: str) -> None:
     )
     _reply(event.reply_token, msg, group_id=group_id)
     memory.append_turn(group_id, "user", f"[圖片生成] {subject}")
-    memory.append_turn(group_id, "bot", f"[已生成] {out_path}")
+    _append_bot_turn(group_id, f"[已生成] {out_path}")
 
 
 _CALENDAR_QUERY_RE = re.compile(
@@ -2821,8 +3235,10 @@ def _wants_todo_details(text: str) -> bool:
     return bool(_TODO_DETAIL_QUERY_RE.search(text or ""))
 
 
-def _text_message_with_mentions(text: str) -> tuple[str, object]:
-    reply_text = _md_to_line(text)[:4900]
+def _text_message_with_mentions(
+    text: str, *, validation_source: str = "text_message_with_mentions"
+) -> tuple[str, object]:
+    reply_text = _prepare_outbound_text(text, source=validation_source)[:4900]
     try:
         import line_mentions
 
@@ -3045,7 +3461,7 @@ def _handle_todo_query(
         logger.warning("todo query reply failed: %s", e)
 
     memory.append_turn(group_id, "user", clean_text)
-    memory.append_turn(group_id, "bot", reply)
+    _append_bot_turn(group_id, reply)
 
 
 def _handle_calendar_query(
@@ -3177,7 +3593,7 @@ def _handle_calendar_query(
     # 直接呼 LINE reply API，跳過 _reply 內的 pending piggyback drain
     # （pending drain 會跑 local LLM / vision_llm，CPU heavy 害 reply 慢 1 分鐘）
     # 行事曆查詢應該 < 5 秒回，piggyback 留給其他 reply 路徑做
-    reply_text = _md_to_line(reply)
+    reply_text = _prepare_outbound_text(reply, source="calendar_query")
     try:
         if not settings.bot_muted:
             with ApiClient(_get_line_config()) as api_client:
@@ -3192,7 +3608,7 @@ def _handle_calendar_query(
         logger.warning("calendar query reply failed: %s", e)
 
     memory.append_turn(group_id, "user", clean_text)
-    memory.append_turn(group_id, "bot", reply)
+    _append_bot_turn(group_id, reply)
 
 
 def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -> None:
@@ -3255,7 +3671,7 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
             clean_text[:50], group_id,
         )
         memory.append_turn(group_id, "user", clean_text)
-        memory.append_turn(group_id, "bot", market_quote_reply)
+        _append_bot_turn(group_id, market_quote_reply)
         _reply(
             event.reply_token,
             market_quote_reply,
@@ -3319,6 +3735,20 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
                         group_id,
                     )
                 return
+        elif _is_gemini_unavailable_error(e):
+            logger.warning(
+                "gemini chat (explicit) unavailable, retry via local text fallback: %s",
+                e,
+            )
+            reply_text = _local_text_llm_fallback(user_input, context=context)
+            if not reply_text:
+                _reply(
+                    event.reply_token,
+                    "我剛剛接不上雲端，本機也沒生出內容；等一下再問我一次。",
+                    group_id=group_id,
+                    allow_push_fallback=not quote_reply_only,
+                )
+                return
         else:
             logger.exception("gemini chat (explicit) failed: %s", e)
             _reply(
@@ -3358,7 +3788,7 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
     _try_save_correction(group_id, clean_text)
 
     memory.append_turn(group_id, "user", user_input)
-    memory.append_turn(group_id, "bot", reply_text)
+    _append_bot_turn(group_id, reply_text)
     _maybe_extract_facts(group_id, user_id=sender_user_id)
     _reply(
         event.reply_token,
@@ -3452,17 +3882,30 @@ def _handle_burst_flush(group_id: str, combined_text: str, reply_token: str) -> 
                         group_id,
                     )
                 return
-        logger.exception("gemini chat (burst) failed: %s", e)
-        _reply(
-            reply_token,
-            "Gemini 那邊好像塞車了，等一下再回你～",
-            group_id=group_id,
-            allow_push_fallback=not quote_reply_only,
-        )
-        return
+        elif _is_gemini_unavailable_error(e):
+            logger.warning(
+                "gemini chat (burst) unavailable, retry via local text fallback: %s",
+                e,
+            )
+            reply_text = _local_text_llm_fallback(user_input, context=context)
+            if not reply_text:
+                logger.warning(
+                    "burst unavailable local fallback miss group=%s",
+                    group_id,
+                )
+                return
+        else:
+            logger.exception("gemini chat (burst) failed: %s", e)
+            _reply(
+                reply_token,
+                "Gemini 那邊好像塞車了，等一下再回你～",
+                group_id=group_id,
+                allow_push_fallback=not quote_reply_only,
+            )
+            return
 
     logger.info(
-        "burst gemini reply len=%d text=%s",
+        "burst llm reply len=%d text=%s",
         len(reply_text) if reply_text else 0,
         repr(reply_text[:200]) if reply_text else "(empty)",
     )
@@ -3500,7 +3943,7 @@ def _handle_burst_flush(group_id: str, combined_text: str, reply_token: str) -> 
 
     memory.store_fact_cache(group_id, combined_text, reply_text)
     memory.append_turn(group_id, "user", f"[burst]\n{combined_text}")
-    memory.append_turn(group_id, "bot", reply_text)
+    _append_bot_turn(group_id, reply_text)
     _maybe_extract_facts(group_id)
     _maybe_capture_calendar_event(group_id, combined_text, message_id="")
     _reply(
@@ -3634,7 +4077,7 @@ def _media_pipeline_fallback(
     quoted_message_id: str,
     mime_type: str,
     media_name: str,
-) -> None:
+) -> bool:
     """quota 爆時的 local fallback：呼叫 media_pipeline.analyze_image / analyze_video。
 
     任何失敗（download / import / analyze）都沉默退出，避免回給使用者一堆錯誤訊息。
@@ -3644,7 +4087,9 @@ def _media_pipeline_fallback(
         data = _download_content(quoted_message_id)
     except Exception as e:
         logger.warning("media_pipeline fallback: download failed: %s", e)
-        return
+        return _handle_quoted_media_description_fallback(
+            event, group_id, clean_text, quoted_message_id, media_name
+        )
 
     if len(data) > _MEDIA_BYTE_LIMIT:
         logger.info(
@@ -3652,7 +4097,7 @@ def _media_pipeline_fallback(
             media_name,
             len(data),
         )
-        return
+        return False
 
     # 2. 路由到 image / video pipeline
     try:
@@ -3665,25 +4110,122 @@ def _media_pipeline_fallback(
 
             reply = analyze_video(data, user_prompt=clean_text or "", group_id=group_id)
         else:
-            return
+            return False
     except ImportError as e:
         logger.warning("media_pipeline not available: %s", e)
-        return
+        return False
     except Exception as e:
         logger.warning("media_pipeline %s fallback failed: %s", media_name, e)
-        return
+        return False
 
     # 3. 回應給 user — 沒結果就沉默
     if not reply or not str(reply).strip():
         logger.info("media_pipeline fallback: no reply for %s", media_name)
-        return
+        return False
 
     try:
         memory.append_turn(group_id, "user", f"[{media_name} + 問題]\n{clean_text}")
-        memory.append_turn(group_id, "bot", reply)
+        memory.log_raw_message_meta(
+            group_id,
+            quoted_message_id,
+            media_type="image" if mime_type.startswith("image/") else "video",
+            mime_type=mime_type,
+            description=str(reply),
+        )
+        _append_bot_turn(group_id, reply)
     except Exception as e:
         logger.warning("media_pipeline fallback: memory append failed: %s", e)
     _reply(event.reply_token, reply, group_id=group_id)
+    return True
+
+
+def _handle_quoted_media_description_fallback(
+    event: MessageEvent,
+    group_id: str,
+    clean_text: str,
+    quoted_message_id: str,
+    media_name: str,
+) -> bool:
+    """Answer a media quote from a cached prior media description when bytes are gone."""
+    meta = memory.get_raw_message_meta(group_id, quoted_message_id) or {}
+    description = str(meta.get("description") or "").strip()
+    if not description:
+        return False
+    prompt_text = (
+        f"(使用者引用了一則{media_name}向你提問，但原始媒體目前下載不到。"
+        "以下是先前分析這則媒體時留下的內容摘要；請合併目前問題回答，"
+        "並在不確定處明確說明是根據既有摘要判斷。)\n\n"
+        f"--- {media_name}既有摘要 開始 ---\n{description[:2500]}\n"
+        f"--- {media_name}既有摘要 結束 ---\n\n"
+        f"使用者目前問題：{clean_text or '請根據這則媒體內容回應。'}"
+    )
+    try:
+        if media_name == "圖片":
+            from local_llm import chat as local_chat
+            from media_pipeline import (
+                _build_image_argument_prompt,
+                _ensure_image_argument_structure,
+            )
+
+            image_task = _build_image_argument_prompt(
+                clean_text or "請根據這則圖片既有摘要回應。"
+            )
+            image_prompt = (
+                f"{image_task}\n\n"
+                f"--- 圖片既有摘要 開始 ---\n{description[:2500]}\n"
+                f"--- 圖片既有摘要 結束 ---"
+            )
+
+            reply = local_chat(
+                image_prompt,
+                context=memory.get_context(group_id),
+                system_prompt=(
+                    "你是 LINE 群組助理咪寶。圖片內容與圖片摘要必須維持本機處理，"
+                    "不可要求雲端查圖。請根據既有圖片摘要與使用者問題回答。"
+                    "固定使用四段：圖片內容、正方、反方、統一論點。"
+                    "資訊不足就明確說不足，不要編造。"
+                ),
+                max_tokens=700,
+            )
+            reply = _ensure_image_argument_structure(
+                reply,
+                desc=description,
+                ocr_text=clean_text or "",
+            )
+        else:
+            reply = _llm_chat(
+                prompt_text,
+                memory.get_context(group_id),
+                memory.top_facts(group_id),
+                _get_persona_notes(group_id),
+            )
+    except Exception as e:
+        logger.warning("quoted media description fallback chat failed: %s", e)
+        if media_name == "圖片":
+            try:
+                from media_pipeline import _ensure_image_argument_structure
+
+                reply = _ensure_image_argument_structure(
+                    description,
+                    desc=description,
+                    ocr_text=clean_text or "",
+                )
+                if reply:
+                    memory.append_turn(group_id, "user", prompt_text)
+                    _append_bot_turn(group_id, reply)
+                    _reply(event.reply_token, reply, group_id=group_id)
+                    return True
+            except Exception as fallback_error:
+                logger.warning(
+                    "quoted image deterministic fallback failed: %s", fallback_error
+                )
+        return False
+    if not reply or not reply.strip():
+        return False
+    memory.append_turn(group_id, "user", prompt_text)
+    _append_bot_turn(group_id, reply)
+    _reply(event.reply_token, reply, group_id=group_id)
+    return True
 
 
 def _audio_asr_fallback(
@@ -3735,7 +4277,7 @@ def _audio_asr_fallback(
     if not reply:
         return
     memory.append_turn(group_id, "user", f"[語音轉文字] {text}")
-    memory.append_turn(group_id, "bot", reply)
+    _append_bot_turn(group_id, reply)
     _reply(event.reply_token, reply, group_id=group_id)
 
 
@@ -3780,6 +4322,10 @@ def _handle_media_via_quote(
         data = _download_content(quoted_message_id)
     except Exception as e:
         logger.warning("download quoted media failed: %s", e)
+        if _handle_quoted_media_description_fallback(
+            event, group_id, clean_text, quoted_message_id, media_name
+        ):
+            return
         _reply(
             event.reply_token,
             f"這則{media_name}下載不到（LINE 最多保留 7 天，可能已經過期）。"
@@ -3789,6 +4335,10 @@ def _handle_media_via_quote(
         return
 
     if len(data) > _MEDIA_BYTE_LIMIT:
+        if _handle_quoted_media_description_fallback(
+            event, group_id, clean_text, quoted_message_id, media_name
+        ):
+            return
         _reply(
             event.reply_token,
             f"這則{media_name}太大（{len(data) / 1024 / 1024:.1f} MB），"
@@ -3819,7 +4369,7 @@ def _handle_media_via_quote(
         return
 
     memory.append_turn(group_id, "user", f"[{media_name} + 問題]\n{prompt_text}")
-    memory.append_turn(group_id, "bot", reply_text)
+    _append_bot_turn(group_id, reply_text)
     _maybe_extract_facts(group_id)
     _reply(event.reply_token, reply_text, group_id=group_id)
 
@@ -3833,10 +4383,22 @@ def _build_quoted_block(message: TextMessageContent, group_id: str) -> str | Non
     if raw is not None:
         sender_user_id, original_text = raw
         sender_name = _get_member_display_name(group_id, sender_user_id)
+        meta = memory.get_raw_message_meta(group_id, quoted_id) or {}
+        meta_lines: list[str] = []
+        media_type = str(meta.get("media_type") or "").strip()
+        mime_type = str(meta.get("mime_type") or "").strip()
+        file_name = str(meta.get("file_name") or "").strip()
+        description = str(meta.get("description") or "").strip()
+        if media_type or mime_type or file_name:
+            parts = [p for p in (media_type, mime_type, file_name) if p]
+            meta_lines.append("媒體資訊：" + " / ".join(parts))
+        if description:
+            meta_lines.append(f"已知內容摘要：{description[:1500]}")
+        meta_block = ("\n" + "\n".join(meta_lines)) if meta_lines else ""
         return (
             "(使用者引用了下面這則原始訊息向你提問)\n"
             f"--- 原始訊息 開始 ---\n"
-            f"[{sender_name}]: {original_text}\n"
+            f"[{sender_name}]: {original_text}{meta_block}\n"
             f"--- 原始訊息 結束 ---"
         )
 
@@ -3857,6 +4419,21 @@ def _build_quoted_block(message: TextMessageContent, group_id: str) -> str | Non
         "以下是群組最近的對話紀錄,請從中推斷使用者引用的是哪一則,\n"
         "並據此回應。不要跟使用者說你找不到原文。)\n"
         f"--- 最近對話 開始 ---\n{ctx_block}\n--- 最近對話 結束 ---"
+    )
+
+
+def _text_with_quote_context(
+    message: TextMessageContent, group_id: str, text: str
+) -> str:
+    """Combine the current text with the original quoted message, if any."""
+    quoted_block = _build_quoted_block(message, group_id)
+    if not quoted_block:
+        return text
+    return (
+        f"{quoted_block}\n\n"
+        "(下面是使用者目前這則回覆；回答時必須合併理解原始訊息與目前回覆，"
+        "不要只看目前這一句。)\n"
+        f"--- 目前回覆 開始 ---\n{text}\n--- 目前回覆 結束 ---"
     )
 
 
@@ -3976,32 +4553,54 @@ def _handle_file_message(event: MessageEvent, group_id: str) -> None:
     facts = memory.top_facts(group_id)
     pnotes = _get_persona_notes(group_id)
 
-    # ── PDF / 圖片 → 直接送 bytes Part 給 Gemini ──────────────────────────────
+    # ── PDF / 圖片 ───────────────────────────────────────────────────────────
     if is_native:
-        # quota 爆時走純本機 fallback：image → media_pipeline.analyze_image (mlx-vlm+OCR)；
-        # PDF → pypdf 抽文字 → _llm_chat (自帶 fallback chain)
+        # 圖片永遠走純本機 media_pipeline，不把 image bytes 或圖片摘要送 Gemini。
+        if mime_type.startswith("image/"):
+            try:
+                from media_pipeline import analyze_image
+
+                reply_text = analyze_image(
+                    data,
+                    user_prompt=(
+                        "請分析這張圖片檔案，說明圖片內容、正方、反方與統一論點。"
+                        f"\n\n[檔名：{file_name}]"
+                    ),
+                    group_id=group_id,
+                )
+                logger.info(
+                    "file image local analyze: %s -> %d chars",
+                    file_name,
+                    len(reply_text or ""),
+                )
+            except Exception as e:
+                logger.warning("file image local analyze failed: %s", e)
+                reply_text = None
+            if reply_text and reply_text.strip():
+                memory.log_raw_message_meta(
+                    group_id,
+                    msg.id,
+                    media_type="file",
+                    mime_type=mime_type,
+                    file_name=file_name,
+                    description=reply_text,
+                )
+                memory.append_turn(group_id, "user", f"[file image: {file_name}]")
+                _append_bot_turn(group_id, reply_text)
+                _maybe_extract_facts(group_id)
+                _reply(event.reply_token, reply_text, group_id=group_id)
+            else:
+                _reply(
+                    event.reply_token,
+                    "這張圖片我這邊暫時分析不到，可能是本機圖片模型還沒載好。",
+                    group_id=group_id,
+                )
+            return
+
+        # PDF quota 爆時走純本機 fallback：pypdf 抽文字 → _llm_chat (自帶 fallback chain)
         if _quota_exhausted():
             reply_text = None
-            if mime_type.startswith("image/"):
-                try:
-                    from media_pipeline import analyze_image
-                    reply_text = analyze_image(
-                        data,
-                        user_prompt=(
-                            "請用繁體中文分析這張圖的內容、主題、可見文字，"
-                            "第一句必須是具體判斷或結論，"
-                            "不要以「使用者」「我看到」「咪寶」「這張圖」等空話開頭。"
-                            f"\n\n[檔名：{file_name}]"
-                        ),
-                        group_id=group_id,
-                    )
-                    logger.info(
-                        "file image local fallback: %s -> %d chars",
-                        file_name, len(reply_text or ""),
-                    )
-                except Exception as e:
-                    logger.warning("file image local fallback failed: %s", e)
-            elif mime_type == "application/pdf":
+            if mime_type == "application/pdf":
                 try:
                     from pypdf import PdfReader
                     import io
@@ -4066,8 +4665,16 @@ def _handle_file_message(event: MessageEvent, group_id: str) -> None:
                 except Exception as e:
                     logger.warning("file pdf local fallback failed: %s", e)
             if reply_text and reply_text.strip():
+                memory.log_raw_message_meta(
+                    group_id,
+                    msg.id,
+                    media_type="file",
+                    mime_type=mime_type,
+                    file_name=file_name,
+                    description=reply_text,
+                )
                 memory.append_turn(group_id, "user", f"[file: {file_name}]")
-                memory.append_turn(group_id, "bot", reply_text)
+                _append_bot_turn(group_id, reply_text)
                 _maybe_extract_facts(group_id)
                 _reply(event.reply_token, reply_text, group_id=group_id)
             else:
@@ -4096,8 +4703,16 @@ def _handle_file_message(event: MessageEvent, group_id: str) -> None:
                 group_id=group_id,
             )
             return
+        memory.log_raw_message_meta(
+            group_id,
+            msg.id,
+            media_type="file",
+            mime_type=mime_type,
+            file_name=file_name,
+            description=reply_text,
+        )
         memory.append_turn(group_id, "user", f"[file: {file_name}]")
-        memory.append_turn(group_id, "bot", reply_text)
+        _append_bot_turn(group_id, reply_text)
         _maybe_extract_facts(group_id)
         _reply(event.reply_token, reply_text, group_id=group_id)
         return
@@ -4141,8 +4756,16 @@ def _handle_file_message(event: MessageEvent, group_id: str) -> None:
         )
         return
 
+    memory.log_raw_message_meta(
+        group_id,
+        msg.id,
+        media_type="file",
+        mime_type=mime_type,
+        file_name=file_name,
+        description=reply_text,
+    )
     memory.append_turn(group_id, "user", f"[file: {file_name}]")
-    memory.append_turn(group_id, "bot", reply_text)
+    _append_bot_turn(group_id, reply_text)
     _maybe_extract_facts(group_id)
     _reply(event.reply_token, reply_text, group_id=group_id)
 
@@ -4375,7 +4998,7 @@ def _try_one_shot_reply(event: MessageEvent, group_id: str) -> bool:
     data.pop(group_id, None)
     _save_one_shot_replies(data)
     try:
-        memory.append_turn(group_id, "bot", reply_text)
+        _append_bot_turn(group_id, reply_text)
     except Exception:
         pass
     logger.info("one-shot reply sent and cleared group=%s", group_id)
@@ -4447,6 +5070,13 @@ def _save_pending_any(event, group_id: str, user_id: str | None, msg) -> None:
                     with open(path, "wb") as f:
                         f.write(bytes(content))
                     entry["media_path"] = path
+                    memory.log_raw_message_meta(
+                        group_id,
+                        msg.id,
+                        media_type="image",
+                        mime_type="image/jpeg",
+                        media_path=path,
+                    )
             except Exception as e:
                 logger.warning("download image for pending failed: %s", e)
                 entry["download_failed"] = True
@@ -4464,6 +5094,13 @@ def _save_pending_any(event, group_id: str, user_id: str | None, msg) -> None:
                     with open(path, "wb") as f:
                         f.write(bytes(content))
                     entry["media_path"] = path
+                    memory.log_raw_message_meta(
+                        group_id,
+                        msg.id,
+                        media_type="video",
+                        mime_type="video/mp4",
+                        media_path=path,
+                    )
             except Exception as e:
                 logger.warning("download video for pending failed: %s", e)
                 entry["download_failed"] = True
@@ -4478,6 +5115,14 @@ def _save_pending_any(event, group_id: str, user_id: str | None, msg) -> None:
                 with open(path, "wb") as f:
                     f.write(bytes(content))
                 entry["media_path"] = path
+                memory.log_raw_message_meta(
+                    group_id,
+                    msg.id,
+                    media_type="file",
+                    file_name=entry["file_name"],
+                    mime_type=_guess_mime_type(entry["file_name"]),
+                    media_path=path,
+                )
             except Exception as e:
                 logger.warning("download file for pending failed: %s", e)
                 entry["download_failed"] = True
@@ -4492,6 +5137,13 @@ def _save_pending_any(event, group_id: str, user_id: str | None, msg) -> None:
                     f.write(bytes(content))
                 entry["media_path"] = path
                 entry["mime_type"] = "audio/m4a"
+                memory.log_raw_message_meta(
+                    group_id,
+                    msg.id,
+                    media_type="audio",
+                    mime_type="audio/m4a",
+                    media_path=path,
+                )
             except Exception as e:
                 logger.warning("download audio for pending failed: %s", e)
                 entry["download_failed"] = True
@@ -4951,7 +5603,7 @@ def _drain_pending_for_group(group_id: str, source: str = "startup") -> bool:
                 pnotes = _get_persona_notes(group_id)
                 reply_text = _llm_chat(parts, context, facts, pnotes)
 
-                text = _md_to_line(reply_text)
+                text = _prepare_outbound_text(reply_text, source="pending_push")
                 footer = _get_quota_footer()
                 text = text[: 4900 - len(footer)] + footer
                 if _is_system_status_outbound(text):
@@ -5013,7 +5665,7 @@ def _drain_pending_for_group(group_id: str, source: str = "startup") -> bool:
                     )[:500]
                     or "[非文字訊息]",
                 )
-                memory.append_turn(group_id, "bot", reply_text)
+                _append_bot_turn(group_id, reply_text)
             except Exception as e:
                 logger.warning(
                     "%s pending: memory append failed after push group=%s: %s",
@@ -5430,6 +6082,13 @@ def _is_quota_error(e: Exception) -> bool:
     return ("429" in s or "RESOURCE_EXHAUSTED" in s) and (
         "PerDay" in s or "free_tier_requests" in s
     )
+
+
+def _is_gemini_unavailable_error(e: Exception) -> bool:
+    """True for transient Gemini availability failures that local LLM can cover."""
+    s = str(e)
+    lower = s.lower()
+    return "503" in s or "unavailable" in lower or "high demand" in lower
 
 
 def _is_definite_reply_token_error(e: Exception) -> bool:
@@ -5916,7 +6575,7 @@ def _is_web_research_question(text: str) -> bool:
     has_question = any(h in lower for h in _WEB_RESEARCH_QUESTION_HINTS)
     if not has_question:
         return False
-    if _URL_RE.search(s):
+    if _extract_prefetch_urls(s):
         return True
     if _WEB_RESEARCH_DEFINITION_RE.search(s):
         return _has_web_research_subject(s)
@@ -6029,7 +6688,8 @@ def _handle_web_research_question(
     try:
         with _thinking_indicator(group_id):
             sources = _collect_web_research_sources(text)
-            prompt_text = _build_web_research_prompt(text, sources)
+            research_text = _prefetch_urls(text)
+            prompt_text = _build_web_research_prompt(research_text, sources)
             reply_text = _llm_chat(prompt_text, context, facts, pnotes)
     except Exception as e:
         if _is_quota_error(e):
@@ -6037,7 +6697,8 @@ def _handle_web_research_question(
             logger.warning("web research question quota exhausted, retry via fallback")
             try:
                 sources = _collect_web_research_sources(text)
-                prompt_text = _build_web_research_prompt(text, sources)
+                research_text = _prefetch_urls(text)
+                prompt_text = _build_web_research_prompt(research_text, sources)
                 reply_text = _llm_chat(prompt_text, context, facts, pnotes)
             except Exception as e2:
                 logger.warning("web research question fallback failed: %s", e2)
@@ -6051,7 +6712,7 @@ def _handle_web_research_question(
         return True
 
     memory.append_turn(group_id, "user", text)
-    memory.append_turn(group_id, "bot", reply_text)
+    _append_bot_turn(group_id, reply_text)
     _reply(event.reply_token, reply_text, group_id=group_id)
     return True
 
@@ -6070,12 +6731,18 @@ def _handle_dinner_recommendation(event: MessageEvent, group_id: str) -> None:
     except Exception as e:
         if _is_quota_error(e):
             _mark_quota_exhausted()
-            logger.warning("dinner recommendation quota exhausted")
-            _reply(event.reply_token, _quota_exhausted_message(), group_id=group_id)
+            logger.warning("dinner recommendation quota exhausted, retry via local")
+            reply_text = _local_text_llm_fallback(_DINNER_PROMPT, context=context)
+        elif _is_gemini_unavailable_error(e):
+            logger.warning(
+                "dinner recommendation unavailable, retry via local: %s",
+                e,
+            )
+            reply_text = _local_text_llm_fallback(_DINNER_PROMPT, context=context)
         else:
             logger.exception("dinner recommendation failed: %s", e)
             _reply(event.reply_token, _friendly_gemini_error(e), group_id=group_id)
-        return
+            return
     if not reply_text or not reply_text.strip():
         # fallback_chat 全敗回空 → 給使用者明確訊息（不能送空到 LINE SDK）
         _reply(event.reply_token, "晚餐推薦今天罷工了，等一下再試試", group_id=group_id)
@@ -6811,7 +7478,9 @@ def _peek_text_pending_for_drain(
         if not reply_text:
             continue
         orig_preview = original[:300] + ("…" if len(original) > 300 else "")
-        rendered = _md_to_line(reply_text)[:1800]   # 收緊到 1800 (§3 codex Q3 / GP1)
+        rendered = _prepare_outbound_text(
+            reply_text, source="pending_peek"
+        )[:1800]   # 收緊到 1800 (§3 codex Q3 / GP1)
         formatted = (
             f"📬 補回之前漏掉的訊息\n\n原文：\n{orig_preview}\n\n回應：\n{rendered}"
         )
@@ -6950,7 +7619,9 @@ def _peek_pending_for_piggyback(
         if not reply_text:
             return None
         orig_preview = original[:300] + ("…" if len(original) > 300 else "")
-        reply_preview = _md_to_line(reply_text)
+        reply_preview = _prepare_outbound_text(
+            reply_text, source="legacy_pending_piggyback"
+        )
         return (
             f"📬 補回之前漏掉的訊息\n\n原文：\n{orig_preview}\n\n回應：\n{reply_preview}",
             [it.get("message_id") for it in batch if it.get("message_id")],
@@ -6980,7 +7651,9 @@ def _peek_pending_for_piggyback(
         if not reply_text or not reply_text.strip():
             return None
 
-        reply_preview = _md_to_line(reply_text)[:1500]
+        reply_preview = _prepare_outbound_text(
+            reply_text, source="legacy_pending_file_piggyback"
+        )[:1500]
         return (
             f"📬 補回之前漏掉的檔案 [{file_name}]\n\n回應：\n{reply_preview}",
             [file_item.get("message_id")] if file_item.get("message_id") else [],
@@ -7028,7 +7701,9 @@ def _peek_pending_for_piggyback(
     if not reply_text or not reply_text.strip():
         return None
 
-    reply_preview = _md_to_line(reply_text)[:1500]
+    reply_preview = _prepare_outbound_text(
+        reply_text, source="legacy_pending_image_piggyback"
+    )[:1500]
     return (
         f"📷 補回之前漏掉的圖片\n\n圖片分析：\n{reply_preview}",
         [img_item.get("message_id")] if img_item.get("message_id") else [],
@@ -7201,9 +7876,8 @@ def _reply(
     """
     if not text or not text.strip():
         return
-    # Markdown → LINE 純文字
-    text = _md_to_line(text)
-    text = _strip_user_visible_mode_labels(text)
+    # Markdown → LINE 純文字，並在 LINE API 呼叫前做最後 factual-safety gate。
+    text = _prepare_outbound_text(text, source="reply")
     if not text or not text.strip():
         return
     # LINE 單則訊息上限 5000 字；在截斷前先預留 footer 空間

@@ -89,6 +89,17 @@ def _init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_raw_messages_time
                 ON raw_messages(group_id, created_at);
+            CREATE TABLE IF NOT EXISTS raw_message_meta (
+                group_id    TEXT NOT NULL,
+                message_id  TEXT NOT NULL,
+                media_type  TEXT NOT NULL DEFAULT '',
+                mime_type   TEXT NOT NULL DEFAULT '',
+                file_name   TEXT NOT NULL DEFAULT '',
+                media_path  TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
+                updated_at  INTEGER NOT NULL,
+                PRIMARY KEY (group_id, message_id)
+            );
             CREATE TABLE IF NOT EXISTS filter_rules (
                 group_id   TEXT NOT NULL,
                 rule_id    INTEGER NOT NULL,
@@ -515,6 +526,71 @@ def get_raw_message(group_id: str, message_id: str) -> tuple[str | None, str] | 
         if row:
             return (row[0], row[1])
         return None
+
+
+def log_raw_message_meta(
+    group_id: str,
+    message_id: str,
+    *,
+    media_type: str = "",
+    mime_type: str = "",
+    file_name: str = "",
+    media_path: str = "",
+    description: str = "",
+) -> None:
+    """Attach retrievable metadata to a raw LINE message for quote handling."""
+    if not group_id or not message_id:
+        return
+    with _lock, _conn() as c:
+        c.execute(
+            """
+            INSERT INTO raw_message_meta
+                (group_id, message_id, media_type, mime_type, file_name,
+                 media_path, description, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%s','now'))
+            ON CONFLICT(group_id, message_id) DO UPDATE SET
+                media_type = COALESCE(NULLIF(excluded.media_type, ''), media_type),
+                mime_type = COALESCE(NULLIF(excluded.mime_type, ''), mime_type),
+                file_name = COALESCE(NULLIF(excluded.file_name, ''), file_name),
+                media_path = COALESCE(NULLIF(excluded.media_path, ''), media_path),
+                description = COALESCE(NULLIF(excluded.description, ''), description),
+                updated_at = excluded.updated_at
+            """,
+            (
+                group_id,
+                message_id,
+                media_type or "",
+                mime_type or "",
+                file_name or "",
+                media_path or "",
+                (description or "")[:4000],
+            ),
+        )
+
+
+def get_raw_message_meta(group_id: str, message_id: str) -> dict | None:
+    """Return quote/media metadata for a raw message, if available."""
+    if not group_id or not message_id:
+        return None
+    with _conn() as c:
+        row = c.execute(
+            """
+            SELECT media_type, mime_type, file_name, media_path, description, updated_at
+            FROM raw_message_meta
+            WHERE group_id = ? AND message_id = ?
+            """,
+            (group_id, message_id),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "media_type": row[0],
+        "mime_type": row[1],
+        "file_name": row[2],
+        "media_path": row[3],
+        "description": row[4],
+        "updated_at": row[5],
+    }
 
 
 def bump_and_should_extract(group_id: str) -> bool:
@@ -1629,6 +1705,14 @@ def insert_media_cache(
         if cur.rowcount == 0:
             return None
         return c.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def delete_media_cache(cache_id: int) -> None:
+    """Delete one media_cache row, used to invalidate stale cache formats."""
+    if not cache_id:
+        return
+    with _lock, _conn() as c:
+        c.execute("DELETE FROM media_cache WHERE cache_id = ?", (cache_id,))
 
 
 def bump_media_cache_seen(cache_id: int) -> None:

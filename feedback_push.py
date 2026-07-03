@@ -21,7 +21,7 @@ from linebot.v3.messaging import (
 )
 
 import feedback_collector
-from line_push_client import line_access_token, line_configuration
+from line_push_client import line_access_token, line_configuration, validate_push_text
 from config import settings
 
 logging.basicConfig(
@@ -47,6 +47,7 @@ def _push(group_id: str, text: str, max_retries: int = 3) -> None:
       - 429：raise（不重試，caller 看 monthly quota 不可解）
       - 5xx / network：exponential backoff (1s/2s/4s) 重試
     """
+    text = validate_push_text(text, source="feedback_push")
     cfg = line_configuration()
     last_exc: Exception | None = None
     for attempt in range(max_retries):

@@ -27,7 +27,12 @@ from urllib3.util.retry import Retry  # noqa: E402
 
 import calendar_db  # noqa: E402
 import line_mentions  # noqa: E402
-from line_push_client import LinePushError, line_access_token, push_messages  # noqa: E402
+from line_push_client import (  # noqa: E402
+    LinePushError,
+    line_access_token,
+    push_messages,
+    validate_push_text,
+)
 
 # 2026-05-29 加 retry 防 transient 5xx 一棒打死（GP2#2）
 # Retry 重試 500/502/503/504；429 monthly quota 不重試（HTTPAdapter 預設只 retry 表列 status）
@@ -263,11 +268,18 @@ def build_reminder_message_spec(
     if cfg and e.get("event_id") in cfg["event_ids"]:
         if offset != cfg["offset"]:
             return None
-        plain_text = cfg["plain_text"]
+        plain_text = validate_push_text(
+            cfg["plain_text"], source="event_reminder"
+        )
         if allow_mention and cfg["mention_text"] and cfg["user_id"]:
+            mention_text = validate_push_text(
+                cfg["mention_text"], source="event_reminder"
+            )
+            if mention_text != cfg["mention_text"]:
+                return {"kind": "text", "text": mention_text}
             return {
                 "kind": "mention",
-                "text": cfg["mention_text"],
+                "text": mention_text,
                 "placeholder": cfg["placeholder"],
                 "user_id": cfg["user_id"],
                 "fallback_text": plain_text,
@@ -276,23 +288,33 @@ def build_reminder_message_spec(
             return {"kind": "text", "text": plain_text}
         return None
     text = _format_event(e, offset)
+    safe_text = validate_push_text(text, source="event_reminder")
+    if safe_text != text:
+        return {"kind": "text", "text": safe_text}
     targets = line_mentions.event_mention_targets(e)
     plain_labels = line_mentions.event_plain_labels(e)
     if targets and allow_mention:
         message = line_mentions.text_v2_dict(text, targets, plain_labels)
+        fallback_text = validate_push_text(
+            line_mentions.text_with_plain_mentions(text, targets, plain_labels),
+            source="event_reminder",
+        )
+        if fallback_text != line_mentions.text_with_plain_mentions(
+            text, targets, plain_labels
+        ):
+            return {"kind": "text", "text": fallback_text}
         return {
             "kind": "textV2",
             "message": message,
             "text": message["text"],
-            "fallback_text": line_mentions.text_with_plain_mentions(
-                text, targets, plain_labels
-            ),
+            "fallback_text": fallback_text,
         }
     if plain_labels:
         return {
             "kind": "text",
-            "text": line_mentions.text_with_plain_mentions(
-                text, targets, plain_labels
+            "text": validate_push_text(
+                line_mentions.text_with_plain_mentions(text, targets, plain_labels),
+                source="event_reminder",
             ),
         }
     return {"kind": "text", "text": text}
@@ -328,8 +350,16 @@ def sdk_message_from_spec(spec: dict):
     from linebot.v3.messaging import TextMessage  # type: ignore[import-untyped]
 
     if spec.get("kind") == "textV2":
+        fallback_text = str(spec.get("fallback_text") or spec.get("text") or "")
+        safe_text = validate_push_text(fallback_text, source="event_reminder_sdk")
+        if safe_text != fallback_text:
+            return TextMessage(text=safe_text[:5000])
         return line_mentions.sdk_message_from_text_v2_dict(spec["message"])
     if spec.get("kind") == "mention":
+        fallback_text = str(spec.get("fallback_text") or spec.get("text") or "")
+        safe_text = validate_push_text(fallback_text, source="event_reminder_sdk")
+        if safe_text != fallback_text:
+            return TextMessage(text=safe_text[:5000])
         message = {
             "type": "textV2",
             "text": spec["text"],
@@ -341,7 +371,10 @@ def sdk_message_from_spec(spec: dict):
             },
         }
         return line_mentions.sdk_message_from_text_v2_dict(message)
-    return TextMessage(text=str(spec.get("text") or "")[:5000])
+    safe_text = validate_push_text(
+        str(spec.get("text") or ""), source="event_reminder_sdk"
+    )
+    return TextMessage(text=safe_text[:5000])
 
 
 def main() -> int:

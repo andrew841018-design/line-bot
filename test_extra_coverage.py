@@ -169,6 +169,52 @@ def test_handle_explicit_text_exceptions():
     check("explicit quota error → mark exhausted", mock_mark.called)
     check("explicit quota error → 不 reply", not mock_reply.called)
 
+    # Quota on first call, local fallback text on retry → reply that text.
+    with (
+        patch("main.memory.get_context", return_value=[]),
+        patch("main.memory.top_facts", return_value=[]),
+        patch("main._get_persona_notes", return_value=[]),
+        patch("main._prefetch_urls", return_value="問題"),
+        patch("main._llm_chat", side_effect=[quota_exc, "本機 explicit 回覆"]),
+        patch("main._mark_quota_exhausted") as mock_mark_retry,
+        patch("main.memory.append_turn"),
+        patch("main._maybe_extract_facts"),
+        patch("main._try_save_correction"),
+        patch("main._maybe_capture_calendar_event"),
+        patch("main._reply") as mock_reply_retry,
+    ):
+        main._handle_explicit_text(evt, "GRP001", "問題")
+    sent_retry = mock_reply_retry.call_args[0][1] if mock_reply_retry.called else ""
+    check("explicit quota retry → mark exhausted", mock_mark_retry.called)
+    check("explicit quota retry → reply local text", sent_retry == "本機 explicit 回覆")
+
+    # Gemini transient unavailable → local fallback, not suppressible system status.
+    unavailable_exc = Exception("503 UNAVAILABLE high demand")
+    with (
+        patch("main.memory.get_context", return_value=[]),
+        patch("main.memory.top_facts", return_value=[]),
+        patch("main._get_persona_notes", return_value=[]),
+        patch("main._prefetch_urls", return_value="問題"),
+        patch("main._llm_chat", side_effect=unavailable_exc),
+        patch("main._local_text_llm_fallback", return_value="本機 explicit 503 回覆") as mock_local,
+        patch("main.memory.append_turn"),
+        patch("main._maybe_extract_facts"),
+        patch("main._try_save_correction"),
+        patch("main._maybe_capture_calendar_event"),
+        patch("main._reply") as mock_reply_unavailable,
+    ):
+        main._handle_explicit_text(evt, "GRP001", "問題")
+    sent_unavailable = (
+        mock_reply_unavailable.call_args[0][1]
+        if mock_reply_unavailable.called
+        else ""
+    )
+    check("explicit 503 → local fallback called", mock_local.called)
+    check(
+        "explicit 503 → reply local text",
+        sent_unavailable == "本機 explicit 503 回覆",
+    )
+
     # Non-quota exception → reply with error
     other_exc = Exception("500 internal server error")
     with (
@@ -235,6 +281,52 @@ def test_handle_burst_flush_paths():
     ):
         main._handle_burst_flush("GRP001", "測試文字", "TOKEN")
     check("burst Gemini quota → mark exhausted", mock_mark.called)
+
+    # First Gemini call hits quota, retry returns local LLM text. The retry result
+    # must continue through the normal reply path instead of being swallowed by
+    # the original exception handler.
+    with (
+        patch("main.memory.check_fact_cache", return_value=None),
+        patch("main.memory.get_context", return_value=[]),
+        patch("main.memory.top_facts", return_value=[]),
+        patch("main._get_persona_notes", return_value=[]),
+        patch("main._prefetch_urls", side_effect=lambda x: x),
+        patch("main._llm_chat", side_effect=[quota_exc, "本機回覆"]),
+        patch("main._mark_quota_exhausted") as mock_mark2,
+        patch("main.memory.store_fact_cache") as mock_store2,
+        patch("main.memory.append_turn"),
+        patch("main._maybe_extract_facts"),
+        patch("main._maybe_capture_calendar_event"),
+        patch("main._reply") as mock_reply_local,
+    ):
+        main._handle_burst_flush("GRP001", "測試文字", "TOKEN")
+    sent_text = mock_reply_local.call_args[0][1] if mock_reply_local.called else ""
+    check("burst quota retry → mark exhausted", mock_mark2.called)
+    check("burst quota retry → reply local LLM text", sent_text == "本機回覆")
+    check("burst quota retry → store local LLM text", mock_store2.called)
+
+    # Gemini transient/unavailable error should also degrade to local LLM for
+    # burst replies instead of sending a suppressible system-status message.
+    unavailable_exc = Exception("503 UNAVAILABLE high demand")
+    with (
+        patch("main.memory.check_fact_cache", return_value=None),
+        patch("main.memory.get_context", return_value=[]),
+        patch("main.memory.top_facts", return_value=[]),
+        patch("main._get_persona_notes", return_value=[]),
+        patch("main._prefetch_urls", side_effect=lambda x: x),
+        patch("main._llm_chat", side_effect=unavailable_exc),
+        patch("main._local_text_llm_fallback", return_value="本機503回覆") as mock_local,
+        patch("main.memory.store_fact_cache") as mock_store503,
+        patch("main.memory.append_turn"),
+        patch("main._maybe_extract_facts"),
+        patch("main._maybe_capture_calendar_event"),
+        patch("main._reply") as mock_reply503,
+    ):
+        main._handle_burst_flush("GRP001", "測試文字", "TOKEN")
+    sent_text503 = mock_reply503.call_args[0][1] if mock_reply503.called else ""
+    check("burst 503 → local fallback called", mock_local.called)
+    check("burst 503 → reply local LLM text", sent_text503 == "本機503回覆")
+    check("burst 503 → store local LLM text", mock_store503.called)
 
     # Non-quota error → reply error
     other_exc = Exception("500 server down")
@@ -370,6 +462,34 @@ def test_handle_file_message():
         main._handle_file_message(evt5, "GRP001")
     check("PDF 檔 → reply", mock_reply5.called)
 
+    # Image file (native) → always local media_pipeline, never Gemini _llm_chat
+    msg_img = _make_file_msg("photo.jpg")
+    evt_img = _make_message_event(msg_img)
+    fake_media = types.ModuleType("media_pipeline")
+    fake_media.analyze_image = MagicMock(
+        return_value=(
+            "圖片內容：圖片在講產品廣告。\n"
+            "正方：可快速看到主打賣點。\n"
+            "反方：缺少來源與完整規格。\n"
+            "統一論點：先當廣告線索，購買前回原頁查證。"
+        )
+    )
+    with (
+        patch.dict(sys.modules, {"media_pipeline": fake_media}),
+        patch("main._download_content", return_value=b"fake image bytes"),
+        patch("main.memory.get_context", return_value=[]),
+        patch("main.memory.top_facts", return_value=[]),
+        patch("main._get_persona_notes", return_value=[]),
+        patch("main._llm_chat") as mock_llm_chat_img,
+        patch("main.memory.append_turn"),
+        patch("main._maybe_extract_facts"),
+        patch("main._reply") as mock_reply_img,
+    ):
+        main._handle_file_message(evt_img, "GRP001")
+    check("圖片檔 → local analyze_image", fake_media.analyze_image.called)
+    check("圖片檔 → 不走 _llm_chat/Gemini", not mock_llm_chat_img.called)
+    check("圖片檔 → reply", mock_reply_img.called)
+
     # Gemini quota error during file processing
     msg6 = _make_file_msg("test.txt")
     evt6 = _make_message_event(msg6)
@@ -446,10 +566,34 @@ def test_handle_dinner_recommendation():
         patch("main.memory.top_facts", return_value=[]),
         patch("main._get_persona_notes", return_value=[]),
         patch("main._llm_chat", side_effect=quota_exc),
+        patch("main._local_text_llm_fallback", return_value="local dinner") as mock_local,
         patch("main._mark_quota_exhausted") as mock_mark,
+        patch("main._reply") as mock_reply_quota,
     ):
         main._handle_dinner_recommendation(evt, "GRP001")
     check("dinner quota error → mark exhausted", mock_mark.called)
+    check("dinner quota error → local fallback", mock_local.called)
+    check(
+        "dinner quota error → reply local fallback",
+        mock_reply_quota.call_args[0][1] == "local dinner",
+    )
+
+    # Gemini unavailable during dinner → local fallback
+    unavailable_exc = Exception("503 UNAVAILABLE high demand")
+    with (
+        patch("main.memory.get_context", return_value=[]),
+        patch("main.memory.top_facts", return_value=[]),
+        patch("main._get_persona_notes", return_value=[]),
+        patch("main._llm_chat", side_effect=unavailable_exc),
+        patch("main._local_text_llm_fallback", return_value="local dinner 503") as mock_local503,
+        patch("main._reply") as mock_reply503,
+    ):
+        main._handle_dinner_recommendation(evt, "GRP001")
+    check("dinner 503 → local fallback", mock_local503.called)
+    check(
+        "dinner 503 → reply local fallback",
+        mock_reply503.call_args[0][1] == "local dinner 503",
+    )
 
     # Non-quota error → reply error
     other_exc = Exception("500 server error")
@@ -997,14 +1141,15 @@ def test_prefetch_error_branches():
         result3 = main._fetch_tiktok_meta("https://www.tiktok.com/@user/video/789")
     check("tiktok 404 → None", result3 is None)
 
-    # _prefetch_urls: youtube both fail
+    # _prefetch_urls: youtube all fetchers fail but still add a context block
     text_with_yt = "看這個 https://youtube.com/watch?v=TEST123"
     with (
         patch("main._fetch_video_ytdlp", return_value=None),
         patch("main._fetch_youtube_meta", return_value=None),
+        patch("main._fetch_youtube_html_meta", return_value=None),
     ):
         result4 = main._prefetch_urls(text_with_yt)
-    check("youtube ytdlp+oembed 都失敗 → 回傳原文", text_with_yt in result4)
+    check("youtube 全失敗 → 仍保留辨識狀態", "系統已辨識為 YouTube 影片或直播" in result4)
 
     # _prefetch_urls: reddit fetch fails
     text_with_reddit = "看這個 https://reddit.com/r/test/comments/abc/title"

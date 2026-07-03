@@ -622,8 +622,12 @@ def _try_unit_convert(text: str) -> str | None:
 
 
 _YOUTUBE_URL_RE = re.compile(
-    r"(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)"
-    r"([A-Za-z0-9_-]{11})"
+    r"(?:https?://)?(?:(?:www|m)\.)?(?:"
+    r"youtu\.be/|"
+    r"youtube(?:-nocookie)?\.com/(?:shorts/|live/|embed/)|"
+    r"youtube\.com/watch\?(?:[^\s#]*&)?v="
+    r")([A-Za-z0-9_-]{11})",
+    re.IGNORECASE,
 )
 
 
@@ -643,7 +647,7 @@ def _youtube_info(text: str) -> str | None:
             f"🎬 {data.get('title', '?')}\n"
             f"  頻道：{data.get('author_name', '?')}\n"
             f"  https://youtu.be/{video_id}\n\n"
-            "（來源：oEmbed metadata，無內容摘要）"
+            "目前只取得標題與頻道，還沒有逐字稿；可先用這些資訊判斷直播/影片主題。"
         )
     except Exception as e:
         logger.info("_youtube_info failed: %s", e)
@@ -693,6 +697,13 @@ def _google_search_snippet(query: str) -> str | None:
 
 def _try_youtube_info(text: str) -> str | None:
     """YouTube URL → oEmbed 拿 title + 作者。"""
+    return _youtube_info(text)
+
+
+def _try_youtube_info_from_long_text(text: str) -> str | None:
+    """Allow quota fallback to answer YouTube URLs before the 500-char gate."""
+    if not _YOUTUBE_URL_RE.search(text or ""):
+        return None
     return _youtube_info(text)
 
 
@@ -932,8 +943,10 @@ def lite_reply(text: str, context: list | None = None) -> str | None:
     if not text:
         return None
     text = text.strip()
-    if not text or len(text) > 500:
+    if not text:
         return None
+    if len(text) > 500:
+        return _try_youtube_info_from_long_text(text)
 
     # ─ Stage 0: chinese_nlp intent hint（純本機 jieba + rules，無 LLM call）─
     # 命中 intent → 優先跑對應 handler；未命中走預設順序

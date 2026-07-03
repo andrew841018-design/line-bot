@@ -367,9 +367,26 @@ def test_lite_reply_rejects_empty():
 
 
 def test_lite_reply_rejects_too_long():
-    """> 500 chars 直接拒絕（避免 prompt injection）。"""
+    """> 500 chars without a YouTube URL is rejected to avoid prompt injection."""
     huge = "a" * 600
     assert lite_reply.lite_reply(huge) is None
+
+
+def test_lite_reply_long_youtube_prompt_still_uses_youtube_handler(monkeypatch):
+    class FakeResp:
+        status_code = 200
+
+        def json(self):
+            return {"title": "長 prompt 直播標題", "author_name": "直播頻道"}
+
+    monkeypatch.setattr(lite_reply.requests, "get", lambda *a, **kw: FakeResp())
+
+    huge = "a" * 600 + " https://www.youtube.com/live/LIVE1234567"
+    out = lite_reply.lite_reply(huge)
+
+    assert out is not None
+    assert "長 prompt 直播標題" in out
+    assert "目前只取得標題與頻道" in out
 
 
 def test_lite_reply_signature_accepts_context():
