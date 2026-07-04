@@ -3172,8 +3172,28 @@ _TODO_QUERY_INTENT_RE = re.compile(
     r"(?:哪些|目前|還有|清單|列表|查|看看|告訴我|會提醒的時間)"
 )
 _TODO_DETAIL_QUERY_RE = re.compile(r"(?:細節|詳細|完整|網址|連結|驗證碼|票券|預約編號)")
+_REMINDER_TIMING_MARKER_RE = re.compile(r"(?:什麼時候|何時|哪一天|哪天|幾點)")
+_REMINDER_TIMING_KEYWORD_ALIASES: dict[str, tuple[str, ...]] = {
+    "壁球": ("壁球", "squash"),
+}
 _REMINDER_KNOWN_MENTION_ALIASES = {"爸爸", "媽媽", "黃聖雅", "黃聖穎"}
 _REMINDER_DETAIL_PREFIXES = ("地點", "預約編號", "接送網址", "票券驗證碼", "驗證碼")
+
+
+def _reminder_timing_query_keywords(text: str) -> list[str]:
+    s = (text or "").strip()
+    if not s or not _REMINDER_TIMING_MARKER_RE.search(s):
+        return []
+    lower = s.lower()
+    keywords: list[str] = []
+    for label, aliases in _REMINDER_TIMING_KEYWORD_ALIASES.items():
+        if any(alias.lower() in lower for alias in aliases):
+            keywords.append(label)
+    return keywords
+
+
+def _is_reminder_timing_query(text: str) -> bool:
+    return bool(_reminder_timing_query_keywords(text))
 
 
 def _is_todo_query(text: str) -> bool:
@@ -3183,6 +3203,8 @@ def _is_todo_query(text: str) -> bool:
         return False
     if _TODO_CREATE_RE.search(s) and not _TODO_QUERY_INTENT_RE.search(s):
         return False
+    if _is_reminder_timing_query(s):
+        return True
     return bool(_TODO_QUERY_RE.search(s))
 
 
@@ -3371,6 +3393,38 @@ def _format_reminder_report_item(item: dict, index: int) -> list[str]:
     return lines
 
 
+def _reminder_match_terms(keywords: list[str]) -> list[str]:
+    terms: list[str] = []
+    for keyword in keywords:
+        for term in _REMINDER_TIMING_KEYWORD_ALIASES.get(keyword, (keyword,)):
+            clean = str(term or "").strip().lower()
+            if clean and clean not in terms:
+                terms.append(clean)
+    return terms
+
+
+def _reminder_matches_timing_keywords(item: dict, keywords: list[str]) -> bool:
+    terms = _reminder_match_terms(keywords)
+    if not terms:
+        return True
+    aliases = item.get("mention_aliases") or []
+    if isinstance(aliases, str):
+        try:
+            aliases = _json.loads(aliases)
+        except Exception:
+            aliases = [aliases]
+    if not isinstance(aliases, (list, tuple, set)):
+        aliases = [aliases]
+    haystack = " ".join(
+        [
+            str(item.get("action") or ""),
+            str(item.get("source_text") or ""),
+            " ".join(str(alias or "") for alias in aliases),
+        ]
+    ).lower()
+    return any(term in haystack for term in terms)
+
+
 def _build_todo_status_reply(group_id: str, clean_text: str = "") -> str:
     """Read todos + reminders for immediate replies."""
     try:
@@ -3384,11 +3438,14 @@ def _build_todo_status_reply(group_id: str, clean_text: str = "") -> str:
 
     target = _resolve_relative_date(clean_text)
     target_iso = target.isoformat() if target else None
+    timing_keywords = _reminder_timing_query_keywords(clean_text)
 
     try:
         todos = todo.list_pending(group_id, limit=10, due_date=target_iso)
     except Exception as e:
         logger.warning("todo query list_pending failed: %s", e)
+        todos = []
+    if timing_keywords:
         todos = []
 
     try:
@@ -3409,9 +3466,21 @@ def _build_todo_status_reply(group_id: str, clean_text: str = "") -> str:
             r for r in reminders
             if int(r.get("remind_at") or 0) >= now_ts
         ]
+    if timing_keywords:
+        reminders = [
+            r for r in reminders
+            if _reminder_matches_timing_keywords(r, timing_keywords)
+        ]
 
     header = f"{target_iso} 的待辦/提醒：" if target_iso else "目前待辦/提醒："
-    if reminders and not todos:
+    if timing_keywords:
+        keyword_label = "、".join(timing_keywords)
+        header = (
+            f"{target_iso} 的{keyword_label}相關提醒事項＆細節："
+            if target_iso
+            else f"{keyword_label}相關提醒事項＆細節"
+        )
+    elif reminders and not todos:
         header = f"{target_iso} 的提醒事項＆細節：" if target_iso else "未來提醒事項＆細節"
     lines: list[str] = [header]
     has_any = False
@@ -3433,6 +3502,10 @@ def _build_todo_status_reply(group_id: str, clean_text: str = "") -> str:
             lines.append("\n".join(_format_reminder_report_item(item, idx)))
 
     if not has_any:
+        if timing_keywords:
+            keyword_label = "、".join(timing_keywords)
+            prefix = f"{target_iso} " if target_iso else "目前"
+            return f"{prefix}沒有查到{keyword_label}相關 pending 待辦或提醒事項。"
         return (
             f"{target_iso} 沒有查到 pending 待辦或提醒事項。"
             if target_iso

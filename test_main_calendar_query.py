@@ -67,6 +67,14 @@ def test_todo_query_variations():
         assert main._is_todo_query(q) is False, f"should NOT match: {q}"
 
 
+def test_squash_timing_query_routes_to_reminders():
+    import main
+
+    for q in ("什麼時候打壁球", "壁球什麼時候"):
+        assert main._is_todo_query(q) is True, f"should match reminder query: {q}"
+        assert main._is_calendar_query(q) is False, f"should not use calendar query: {q}"
+
+
 # ── _resolve_relative_date ───────────────────────────────────────────────
 def test_resolve_relative_date_tomorrow():
     import main
@@ -279,6 +287,95 @@ def test_build_todo_status_reply_detail_query_includes_source_text(monkeypatch):
     assert "票券驗證碼：8459" in reply
     assert "https://68666.tw/TwMI" in reply
     assert "8459" in reply
+
+
+def test_build_todo_status_reply_filters_squash_timing_query(monkeypatch):
+    import main
+    import todo
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            base = datetime(2026, 7, 3, 20, 0, tzinfo=ZoneInfo("Asia/Taipei"))
+            return base if tz is None else base.astimezone(tz)
+
+    monkeypatch.setattr(main, "datetime", FixedDateTime)
+    monkeypatch.setattr(
+        todo,
+        "list_pending",
+        lambda gid, limit=10, due_date=None: [
+            {"task": "買牛奶", "due_date": "2026-07-04", "sender_user_id": "U1"}
+        ],
+    )
+    squash_ts = int(
+        datetime(2026, 7, 6, 19, 0, tzinfo=ZoneInfo("Asia/Taipei")).timestamp()
+    )
+    dental_ts = int(
+        datetime(2026, 7, 5, 9, 0, tzinfo=ZoneInfo("Asia/Taipei")).timestamp()
+    )
+    monkeypatch.setattr(
+        main.memory,
+        "list_pending_reminders",
+        lambda gid, within_seconds=None: [
+            {
+                "action": "打壁球",
+                "remind_at": squash_ts,
+                "mention_aliases": [],
+                "source_text": "活動：打壁球；地點：運動中心",
+            },
+            {
+                "action": "洗牙",
+                "remind_at": dental_ts,
+                "mention_aliases": [],
+                "source_text": "牙醫回診",
+            },
+        ],
+    )
+
+    reply = main._build_todo_status_reply("G1", "什麼時候打壁球")
+
+    assert "壁球相關提醒事項＆細節" in reply
+    assert "事項：打壁球" in reply
+    assert "運動中心" in reply
+    assert "洗牙" not in reply
+    assert "買牛奶" not in reply
+
+
+def test_build_todo_status_reply_squash_no_match(monkeypatch):
+    import main
+    import todo
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            base = datetime(2026, 7, 3, 20, 0, tzinfo=ZoneInfo("Asia/Taipei"))
+            return base if tz is None else base.astimezone(tz)
+
+    monkeypatch.setattr(main, "datetime", FixedDateTime)
+    monkeypatch.setattr(todo, "list_pending", lambda gid, limit=10, due_date=None: [])
+    dental_ts = int(
+        datetime(2026, 7, 5, 9, 0, tzinfo=ZoneInfo("Asia/Taipei")).timestamp()
+    )
+    monkeypatch.setattr(
+        main.memory,
+        "list_pending_reminders",
+        lambda gid, within_seconds=None: [
+            {
+                "action": "洗牙",
+                "remind_at": dental_ts,
+                "mention_aliases": [],
+                "source_text": "牙醫回診",
+            }
+        ],
+    )
+
+    reply = main._build_todo_status_reply("G1", "壁球什麼時候")
+
+    assert reply == "目前沒有查到壁球相關 pending 待辦或提醒事項。"
 
 
 def test_handle_todo_query_replies_immediately(monkeypatch):
