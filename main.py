@@ -3804,8 +3804,14 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
                     _save_pending_burst_text(group_id, clean_text or user_input)
                 else:
                     logger.info(
-                        "pending reply disabled; suppress explicit quota fallback group=%s",
+                        "pending reply disabled; sending explicit visible degraded fallback group=%s",
                         group_id,
+                    )
+                    _reply(
+                        event.reply_token,
+                        _visible_llm_degraded_reply(),
+                        group_id=group_id,
+                        allow_push_fallback=not quote_reply_only,
                     )
                 return
         elif _is_gemini_unavailable_error(e):
@@ -3832,7 +3838,7 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
             )
             return
 
-    # local fallback 全敗時 _llm_chat 才會回空；pending reply 已停用時保持靜默。
+    # local fallback 全敗時 _llm_chat 才會回空；pending reply 停用時改送可見降級回覆。
     if not reply_text or not reply_text.strip():
         if _quota_exhausted():
             _maybe_capture_calendar_event(
@@ -3845,8 +3851,14 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
                 _save_pending_burst_text(group_id, clean_text or user_input)
             else:
                 logger.info(
-                    "pending reply disabled; suppress explicit empty quota fallback group=%s",
+                    "pending reply disabled; sending explicit empty visible degraded fallback group=%s",
                     group_id,
+                )
+                _reply(
+                    event.reply_token,
+                    _visible_llm_degraded_reply(),
+                    group_id=group_id,
+                    allow_push_fallback=not quote_reply_only,
                 )
             return
         _reply(
@@ -3882,7 +3894,8 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
 def _handle_burst_flush(group_id: str, combined_text: str, reply_token: str) -> None:
     """burst_filter 判定「值得主動回應」時觸發。跑在 Timer 的 thread 裡。
 
-    quota/lite miss 時不排 pending reply，也不送即時 fallback；正常有內容才回。
+    quota/lite/local miss 時不排 pending reply，但仍送一則可見的降級回覆，
+    避免群組誤判 bot 掛掉。
     """
     logger.info(
         "burst flush triggered group=%s text_len=%d",
@@ -3951,8 +3964,14 @@ def _handle_burst_flush(group_id: str, combined_text: str, reply_token: str) -> 
                     _save_pending_burst_text(group_id, combined_text)
                 else:
                     logger.info(
-                        "pending reply disabled; suppress burst quota fallback group=%s",
+                        "pending reply disabled; sending burst visible degraded fallback group=%s",
                         group_id,
+                    )
+                    _reply(
+                        reply_token,
+                        _visible_llm_degraded_reply(),
+                        group_id=group_id,
+                        allow_push_fallback=not quote_reply_only,
                     )
                 return
         elif _is_gemini_unavailable_error(e):
@@ -3995,8 +4014,14 @@ def _handle_burst_flush(group_id: str, combined_text: str, reply_token: str) -> 
                 _save_pending_burst_text(group_id, combined_text)
             else:
                 logger.info(
-                    "pending reply disabled; suppress burst empty quota fallback group=%s",
+                    "pending reply disabled; sending burst empty visible degraded fallback group=%s",
                     group_id,
+                )
+                _reply(
+                    reply_token,
+                    _visible_llm_degraded_reply(),
+                    group_id=group_id,
+                    allow_push_fallback=not quote_reply_only,
                 )
             return
         logger.warning(
@@ -4997,6 +5022,11 @@ def _quota_exhausted_message() -> str:
         f"可以再使用的時間:{abs_str}(台灣時間,{rel_str})\n"
         f"想馬上恢復，需開啟 pay-as-you-go。"
     )
+
+
+def _visible_llm_degraded_reply() -> str:
+    """User-visible fallback when cloud and local LLM paths both miss."""
+    return "我有收到，但現在只能先回簡短模式；複雜問題等一下再問我一次，我再補完整。"
 
 
 # ── Legacy pending reply helpers（2026-06-06 起產品路徑預設停用）───────────

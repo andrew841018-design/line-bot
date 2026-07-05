@@ -242,6 +242,103 @@ def test_insert_event_syncs_to_reminder(tmp_calendar_db):
     assert reminders[0]["remind_at"] == _to_calendar_remind_ts(event_date, "08:00")
 
 
+def test_event_sync_removes_duplicate_generic_reminder(tmp_calendar_db):
+    cd = tmp_calendar_db
+    _align_memory_db_with_calendar(cd)
+    import memory
+
+    event_date = (date.today() + timedelta(days=1)).isoformat()
+    remind_at = _to_calendar_remind_ts(event_date, "20:00")
+    generic_id = memory.add_reminder(
+        "G1",
+        "U_GENERIC",
+        "全家 南港運動中心打壁球",
+        remind_at,
+        source_text="咪寶，幫我記得：\n7/4 全家 南港運動中心 20:00~21:00打壁球",
+        mention_aliases=["媽媽"],
+    )
+    assert generic_id
+    with memory._conn() as c:
+        c.execute(
+            "UPDATE reminders SET last_pushed_at=?, weekly_count=?, "
+            "last_weekly_at=?, pushed_1d=? WHERE reminder_id=?",
+            (123, 2, 122, 1, generic_id),
+        )
+
+    event_id = cd.insert_event(
+        group_id="G1",
+        title="全家 南港運動中心打壁球",
+        event_date=event_date,
+        event_time="20:00",
+        participants=["全家"],
+    )
+    assert event_id
+
+    reminders = memory.list_pending_reminders_full("G1")
+    assert len(reminders) == 1
+    assert reminders[0]["source_kind"] == "calendar_event"
+    assert reminders[0]["source_ref"] == event_id
+    assert reminders[0]["action"] == "全家 南港運動中心打壁球"
+    assert reminders[0]["remind_at"] == remind_at
+    assert reminders[0]["mention_aliases"] == ["全家", "媽媽"]
+    assert "咪寶" not in reminders[0]["source_text"]
+    assert reminders[0]["last_pushed_at"] == 123
+    assert reminders[0]["weekly_count"] == 2
+    assert reminders[0]["last_weekly_at"] == 122
+    assert reminders[0]["pushed_1d"] == 1
+
+
+def test_duplicate_cleanup_keeps_distinct_same_time_reminders(tmp_calendar_db):
+    cd = tmp_calendar_db
+    _align_memory_db_with_calendar(cd)
+    import memory
+
+    event_date = (date.today() + timedelta(days=1)).isoformat()
+    remind_at = _to_calendar_remind_ts(event_date, "18:00")
+    assert memory.add_reminder("G1", "U1", "買牛奶", remind_at)
+    assert memory.add_reminder("G1", "U1", "成功高中活動", remind_at)
+
+    deleted = memory.delete_duplicate_pending_reminders("G1")
+
+    reminders = memory.list_pending_reminders("G1")
+    assert deleted == 0
+    assert [r["action"] for r in reminders] == ["買牛奶", "成功高中活動"]
+
+
+def test_duplicate_cleanup_keeps_lowest_id_for_same_priority(tmp_calendar_db):
+    cd = tmp_calendar_db
+    _align_memory_db_with_calendar(cd)
+    import memory
+
+    event_date = (date.today() + timedelta(days=1)).isoformat()
+    remind_at = _to_calendar_remind_ts(event_date, "18:00")
+    with memory._conn() as c:
+        c.execute(
+            "INSERT INTO reminders(group_id, user_id, action, remind_at, created_at, "
+            "status, source_kind, source_ref, source_text, mention_aliases) "
+            "VALUES (?, ?, ?, ?, ?, 'pending', '', '', ?, ?)",
+            ("G1", "U1", "同優先級提醒", remind_at, 10, "first", "[]"),
+        )
+        first_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+        c.execute(
+            "INSERT INTO reminders(group_id, user_id, action, remind_at, created_at, "
+            "status, source_kind, source_ref, source_text, mention_aliases) "
+            "VALUES (?, ?, ?, ?, ?, 'pending', '', '', ?, ?)",
+            ("G1", "U2", "同優先級提醒", remind_at, 20, "second", "[\"爸爸\"]"),
+        )
+        second_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+    assert first_id < second_id
+
+    deleted = memory.delete_duplicate_pending_reminders("G1")
+
+    reminders = memory.list_pending_reminders("G1")
+    assert deleted == 1
+    assert len(reminders) == 1
+    assert reminders[0]["reminder_id"] == first_id
+    assert reminders[0]["source_text"] == "first\n---\nsecond"
+    assert reminders[0]["mention_aliases"] == ["爸爸"]
+
+
 def test_badminton_event_syncs_to_booking_reminder_on_booking_window(tmp_calendar_db):
     cd = tmp_calendar_db
     _align_memory_db_with_calendar(cd)
@@ -300,6 +397,34 @@ def test_badminton_event_can_override_booking_lead_days(tmp_calendar_db):
     resynced = memory.list_pending_reminders("G1")
     assert len(resynced) == 1
     assert resynced[0]["remind_at"] == expected_at
+
+
+def test_badminton_event_with_zero_lead_uses_event_reminder_text(tmp_calendar_db):
+    cd = tmp_calendar_db
+    _align_memory_db_with_calendar(cd)
+    import memory
+
+    event_date = (date.today() + timedelta(days=1)).isoformat()
+    event_id = cd.insert_event(
+        group_id="G1",
+        title="成功高中打羽球",
+        event_date=event_date,
+        event_time="18:00",
+        location="成功高中",
+        participants=["全家"],
+    )
+    assert event_id
+
+    assert cd.update_event_reminder_lead_days(event_id, 0) is True
+
+    reminders = memory.list_pending_reminders("G1")
+    assert len(reminders) == 1
+    assert reminders[0]["source_ref"] == event_id
+    assert reminders[0]["action"] == "成功高中打羽球"
+    assert reminders[0]["remind_at"] == _to_calendar_remind_ts(event_date, "18:00")
+    assert "預約" not in reminders[0]["action"]
+    assert "地點：成功高中" in reminders[0]["source_text"]
+    assert reminders[0]["mention_aliases"] == ["全家"]
 
 
 def test_badminton_event_with_family_marker_keeps_all_mention(tmp_calendar_db):

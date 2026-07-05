@@ -3,6 +3,8 @@
 """
 from __future__ import annotations
 import logging
+import os
+from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger("local_llm")
@@ -17,6 +19,36 @@ _model = None
 _tokenizer = None
 _loaded_name: Optional[str] = None
 _loaded_adapter: Optional[str] = None
+_cache_unavailable_logged = False
+
+
+def _huggingface_cache_root() -> Path:
+    """Return the HF cache root used before mlx_lm starts loading models."""
+    if os.environ.get("HF_HOME"):
+        return Path(os.environ["HF_HOME"]).expanduser()
+    if os.environ.get("HUGGINGFACE_HUB_CACHE"):
+        return Path(os.environ["HUGGINGFACE_HUB_CACHE"]).expanduser().parent
+    return Path.home() / ".cache" / "huggingface"
+
+
+def _huggingface_cache_available() -> bool:
+    """Avoid slow model-load attempts when the HF cache symlink is broken."""
+    global _cache_unavailable_logged
+    root = _huggingface_cache_root()
+    try:
+        if root.is_symlink() and not root.exists():
+            if not _cache_unavailable_logged:
+                target = os.readlink(root)
+                logger.warning(
+                    "huggingface cache symlink target missing: %s -> %s",
+                    root,
+                    target,
+                )
+                _cache_unavailable_logged = True
+            return False
+    except OSError as e:
+        logger.warning("huggingface cache status check failed: %s", e)
+    return True
 
 
 def _ensure_loaded() -> bool:
@@ -28,6 +60,8 @@ def _ensure_loaded() -> bool:
     global _model, _tokenizer, _loaded_name, _loaded_adapter
     if _model is not None:
         return True
+    if not _huggingface_cache_available():
+        return False
     try:
         from mlx_lm import load
     except Exception as e:

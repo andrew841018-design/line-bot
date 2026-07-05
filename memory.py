@@ -1004,6 +1004,7 @@ def upsert_reminder_for_source(
     source_text = _normalize_reminder_text(source_text)
     mentions = _normalize_mention_aliases(mention_aliases)
     mentions_json = json.dumps(mentions, ensure_ascii=False)
+    reminder_id: int
     with _lock, _conn() as c:
         existing = c.execute(
             "SELECT reminder_id FROM reminders "
@@ -1026,18 +1027,21 @@ def upsert_reminder_for_source(
                     source_kind, source_ref, now, existing[0],
                 ),
             )
-            return existing[0]
+            reminder_id = existing[0]
+        else:
+            c.execute(
+                "INSERT INTO reminders(group_id, user_id, action, remind_at, "
+                "created_at, status, source_kind, source_ref, source_text, mention_aliases) "
+                "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
+                (
+                    group_id, user_id, action, remind_at,
+                    now, source_kind, source_ref, source_text, mentions_json,
+                ),
+            )
+            reminder_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
 
-        c.execute(
-            "INSERT INTO reminders(group_id, user_id, action, remind_at, "
-            "created_at, status, source_kind, source_ref, source_text, mention_aliases) "
-            "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
-            (
-                group_id, user_id, action, remind_at,
-                now, source_kind, source_ref, source_text, mentions_json,
-            ),
-        )
-        return c.execute("SELECT last_insert_rowid()").fetchone()[0]
+    delete_duplicate_pending_reminders(group_id)
+    return reminder_id
 
 
 def upsert_reminder_for_source_any_status(
@@ -1061,6 +1065,7 @@ def upsert_reminder_for_source_any_status(
     source_text = _normalize_reminder_text(source_text)
     mentions = _normalize_mention_aliases(mention_aliases)
     mentions_json = json.dumps(mentions, ensure_ascii=False)
+    reminder_id: int
 
     with _lock, _conn() as c:
         row = c.execute(
@@ -1094,25 +1099,27 @@ def upsert_reminder_for_source_any_status(
                     reminder_id,
                 ),
             )
-            return reminder_id
+        else:
+            c.execute(
+                "INSERT INTO reminders(group_id, user_id, action, remind_at, "
+                "created_at, status, source_kind, source_ref, source_text, mention_aliases) "
+                "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
+                (
+                    group_id,
+                    user_id,
+                    action,
+                    remind_at,
+                    now,
+                    source_kind,
+                    source_ref,
+                    source_text,
+                    mentions_json,
+                ),
+            )
+            reminder_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
 
-        c.execute(
-            "INSERT INTO reminders(group_id, user_id, action, remind_at, "
-            "created_at, status, source_kind, source_ref, source_text, mention_aliases) "
-            "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
-            (
-                group_id,
-                user_id,
-                action,
-                remind_at,
-                now,
-                source_kind,
-                source_ref,
-                source_text,
-                mentions_json,
-            ),
-        )
-        return c.execute("SELECT last_insert_rowid()").fetchone()[0]
+    delete_duplicate_pending_reminders(group_id)
+    return reminder_id
 
 
 def mark_reminder_done_for_source(
@@ -1256,6 +1263,196 @@ def _merge_reminder_source(existing_source: str, new_source: str) -> str:
         if value and value not in parts:
             parts.append(value)
     return "\n---\n".join(parts)[:800]
+
+
+_REMINDER_PUSH_FLAG_COLUMNS: tuple[str, ...] = (
+    "last_pushed_at",
+    "weekly_count",
+    "last_weekly_at",
+    "pushed_3d",
+    "pushed_1d",
+    "pushed_4hr",
+    "pushed_2hr",
+    "pushed_1hr",
+    "pushed_now",
+)
+
+
+def _reminder_source_priority(row: sqlite3.Row) -> int:
+    source_kind = str(row["source_kind"] or "")
+    source_ref = str(row["source_ref"] or "")
+    if source_kind == "calendar_event" and source_ref:
+        return 0
+    if source_kind and source_ref:
+        return 1
+    return 2
+
+
+def _best_duplicate_reminder(rows: list[sqlite3.Row]) -> sqlite3.Row:
+    return min(
+        rows,
+        key=lambda row: (
+            _reminder_source_priority(row),
+            int(row["reminder_id"]),
+        ),
+    )
+
+
+def _merged_duplicate_source_text(keep: sqlite3.Row, rows: list[sqlite3.Row]) -> str:
+    keep_source = _normalize_reminder_text(keep["source_text"])
+    if str(keep["source_kind"] or "") == "calendar_event":
+        if keep_source:
+            return keep_source
+        for row in rows:
+            source = _normalize_reminder_text(row["source_text"])
+            if source:
+                return source
+        return ""
+
+    merged = ""
+    for row in rows:
+        merged = _merge_reminder_source(merged, str(row["source_text"] or ""))
+    return merged
+
+
+def delete_duplicate_pending_reminders(
+    group_id: str | None = None,
+    remind_at_tolerance_seconds: int = 60,
+) -> int:
+    """Delete duplicate pending reminders and merge lightweight metadata.
+
+    Duplicate means same group, same normalized action, and near-identical
+    remind_at. Source-backed reminders, especially calendar events, are kept
+    over generic extracted rows because event sync can regenerate them.
+    Same-priority ties keep the lowest reminder_id. Mention aliases are unioned,
+    and push-stage flags use the max value so already-sent stages are preserved.
+    """
+    tolerance = max(0, int(remind_at_tolerance_seconds))
+    with _lock, _conn() as c:
+        c.row_factory = sqlite3.Row
+        if group_id is not None:
+            rows = c.execute(
+                "SELECT reminder_id, group_id, user_id, action, remind_at, "
+                "created_at, source_kind, source_ref, source_text, "
+                "last_pushed_at, weekly_count, last_weekly_at, pushed_3d, "
+                "pushed_1d, pushed_4hr, pushed_2hr, pushed_1hr, pushed_now, "
+                "mention_aliases "
+                "FROM reminders WHERE status='pending' AND group_id=? "
+                "ORDER BY group_id, action, remind_at, reminder_id",
+                (group_id,),
+            ).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT reminder_id, group_id, user_id, action, remind_at, "
+                "created_at, source_kind, source_ref, source_text, "
+                "last_pushed_at, weekly_count, last_weekly_at, pushed_3d, "
+                "pushed_1d, pushed_4hr, pushed_2hr, pushed_1hr, pushed_now, "
+                "mention_aliases "
+                "FROM reminders WHERE status='pending' "
+                "ORDER BY group_id, action, remind_at, reminder_id",
+            ).fetchall()
+
+        def flush(cluster: list[sqlite3.Row]) -> int:
+            if len(cluster) < 2:
+                return 0
+
+            keep = _best_duplicate_reminder(cluster)
+            keep_id = int(keep["reminder_id"])
+            duplicate_ids = [
+                int(row["reminder_id"])
+                for row in cluster
+                if int(row["reminder_id"]) != keep_id
+            ]
+            if not duplicate_ids:
+                return 0
+
+            merge_order = [
+                keep,
+                *[
+                    row for row in cluster
+                    if int(row["reminder_id"]) != keep_id
+                ],
+            ]
+            merged_aliases: list[str] = []
+            for row in merge_order:
+                merged_aliases.extend(_load_mention_aliases(row["mention_aliases"]))
+            merged_aliases_json = json.dumps(
+                _normalize_mention_aliases(merged_aliases),
+                ensure_ascii=False,
+            )
+            merged_source = _merged_duplicate_source_text(keep, cluster)
+            user_id = str(keep["user_id"] or "")
+            if not user_id:
+                user_id = next(
+                    (str(row["user_id"]) for row in cluster if row["user_id"]),
+                    "",
+                )
+            created_at = min(int(row["created_at"] or 0) for row in cluster)
+            push_values = {
+                col: max(int(row[col] or 0) for row in cluster)
+                for col in _REMINDER_PUSH_FLAG_COLUMNS
+            }
+
+            c.execute(
+                "UPDATE reminders SET user_id=?, source_text=?, mention_aliases=?, "
+                "created_at=?, last_pushed_at=?, weekly_count=?, last_weekly_at=?, "
+                "pushed_3d=?, pushed_1d=?, pushed_4hr=?, pushed_2hr=?, "
+                "pushed_1hr=?, pushed_now=? WHERE reminder_id=?",
+                (
+                    user_id,
+                    merged_source,
+                    merged_aliases_json,
+                    created_at,
+                    push_values["last_pushed_at"],
+                    push_values["weekly_count"],
+                    push_values["last_weekly_at"],
+                    push_values["pushed_3d"],
+                    push_values["pushed_1d"],
+                    push_values["pushed_4hr"],
+                    push_values["pushed_2hr"],
+                    push_values["pushed_1hr"],
+                    push_values["pushed_now"],
+                    keep_id,
+                ),
+            )
+
+            placeholders = ",".join(["?"] * len(duplicate_ids))
+            cursor = c.execute(
+                f"DELETE FROM reminders WHERE reminder_id IN ({placeholders})",
+                duplicate_ids,
+            )
+            return cursor.rowcount
+
+        deleted = 0
+        cluster: list[sqlite3.Row] = []
+        cluster_key: tuple[str, str] | None = None
+        cluster_start_ts = 0
+
+        for row in rows:
+            action = _normalize_reminder_text(row["action"])
+            if not action:
+                deleted += flush(cluster)
+                cluster = []
+                cluster_key = None
+                continue
+
+            key = (str(row["group_id"] or ""), action)
+            row_ts = int(row["remind_at"] or 0)
+            if (
+                cluster
+                and cluster_key == key
+                and abs(row_ts - cluster_start_ts) <= tolerance
+            ):
+                cluster.append(row)
+                continue
+
+            deleted += flush(cluster)
+            cluster = [row]
+            cluster_key = key
+            cluster_start_ts = row_ts
+
+        deleted += flush(cluster)
+        return deleted
 
 
 # ── Pending reminder extract（quota 爆時入隊、恢復後補抽，2026-05-30 加）──────────
@@ -1405,6 +1602,7 @@ def list_pending_reminders(
     - within_seconds None → 全部未過期；給數字 → 只取「現在 - 1day ~ 現在 + within_seconds」內
     """
     import time
+    delete_duplicate_pending_reminders(group_id)
     now = int(time.time())
     with _conn() as c:
         if within_seconds is not None:
@@ -1554,6 +1752,7 @@ def expire_old_reminders(threshold_seconds: int = 86400 * 3) -> int:
 def list_pending_reminders_full(group_id: str | None = None) -> list[dict]:
     """完整版 list — 含所有 stage flag 給 reminder_push.py 用。"""
     import time
+    delete_duplicate_pending_reminders(group_id)
     now = int(time.time())
     with _conn() as c:
         if group_id:

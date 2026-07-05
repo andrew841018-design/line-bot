@@ -687,9 +687,9 @@ def test_bug6_quota_footer_no_percentage_unless_exhausted():
     assert footer == "", f"Quota exhausted 時也不該附加 footer，got: {footer!r}"
 
 
-def test_bug8_burst_empty_quota_suppresses_without_pending():
-    """Andrew 2026-06-06: pending reply disabled. Quota exhausted + burst empty
-    should not send an immediate fallback and should not enqueue pending reply.
+def test_bug8_burst_empty_quota_replies_without_pending():
+    """Andrew 2026-07-04: pending reply disabled. Quota exhausted + burst empty
+    should send a visible degraded reply but should not enqueue pending reply.
     """
     main._quota_exhausted_until_ts = time.time() + 3600
 
@@ -706,9 +706,47 @@ def test_bug8_burst_empty_quota_suppresses_without_pending():
     ):
         main._handle_burst_flush("GRP001", "家人閒聊 message", "TOKEN001")
 
-    mock_reply.assert_not_called()
+    mock_reply.assert_called_once_with(
+        "TOKEN001",
+        main._visible_llm_degraded_reply(),
+        group_id="GRP001",
+        allow_push_fallback=True,
+    )
     pending = pending_store.load().get("GRP001", [])
     assert pending == []
+
+
+def test_explicit_empty_quota_replies_visible_without_pending(monkeypatch):
+    """Explicit bot call should not go silent when quota and local fallback both miss."""
+    evt = _make_text_event("咪寶 幫我分析")
+    monkeypatch.setattr(main, "_quota_exhausted", lambda: True)
+
+    with (
+        patch("main._detect_image_gen_request", return_value=""),
+        patch("main._handle_explicit_poll_text", return_value=None),
+        patch("main._is_todo_query", return_value=False),
+        patch("main._is_calendar_query", return_value=False),
+        patch("main._get_explicit_market_quote_reply", return_value=""),
+        patch("main.memory.get_context", return_value=[]),
+        patch("main._build_quoted_block", return_value=None),
+        patch("main._prefetch_urls", return_value="幫我分析"),
+        patch("main._is_market_quote_request", return_value=False),
+        patch("main.memory.top_facts", return_value=[]),
+        patch("main._get_persona_notes", return_value=""),
+        patch("main._llm_chat", return_value=""),
+        patch("main._pending_reply_enabled", return_value=False),
+        patch("main._reply") as mock_reply,
+        patch("main._maybe_capture_calendar_event"),
+        patch("main._thinking_indicator", return_value=_noop_cm()),
+    ):
+        main._handle_explicit_text(evt, "GRP001", "幫我分析")
+
+    mock_reply.assert_called_once_with(
+        "TOKEN001",
+        main._visible_llm_degraded_reply(),
+        group_id="GRP001",
+        allow_push_fallback=True,
+    )
 
 
 def test_bug9_reply_suppresses_system_status_messages():
@@ -732,6 +770,7 @@ def test_bug9_reply_suppresses_system_status_messages():
 
     assert not mock_messaging.reply_message.called
     assert not mock_messaging.push_message.called
+    assert not main._is_system_status_outbound(main._visible_llm_degraded_reply())
 
 
 def test_bug10_reply_suppresses_llm_internal_trace():
@@ -1008,8 +1047,8 @@ def test_burst_market_quote_empty_fallback_marks_reply_only(monkeypatch):
     assert reply_calls[-1][1]["allow_push_fallback"] is False
 
 
-def test_bug10_explicit_quota_miss_suppresses_without_pending():
-    """Explicit @ bot quota miss should not store pending and should not reply fallback."""
+def test_bug10_explicit_quota_miss_replies_without_pending():
+    """Explicit @ bot quota miss should send visible fallback without pending."""
     evt = _make_text_event(text="咪寶 幫我分析")
 
     with (
@@ -1031,7 +1070,12 @@ def test_bug10_explicit_quota_miss_suppresses_without_pending():
     ):
         main._handle_explicit_text(evt, "GRP001", "幫我分析")
 
-    mock_reply.assert_not_called()
+    mock_reply.assert_called_once_with(
+        "TOKEN001",
+        main._visible_llm_degraded_reply(),
+        group_id="GRP001",
+        allow_push_fallback=True,
+    )
     pending = pending_store.load().get("GRP001", [])
     assert pending == []
 

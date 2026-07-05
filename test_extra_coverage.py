@@ -163,11 +163,16 @@ def test_handle_explicit_text_exceptions():
         patch("main._prefetch_urls", return_value="問題"),
         patch("main._llm_chat", side_effect=quota_exc),
         patch("main._mark_quota_exhausted") as mock_mark,
+        patch("main._maybe_capture_calendar_event"),
         patch("main._reply") as mock_reply,
     ):
         main._handle_explicit_text(evt, "GRP001", "問題")
     check("explicit quota error → mark exhausted", mock_mark.called)
-    check("explicit quota error → 不 reply", not mock_reply.called)
+    check(
+        "explicit quota error → visible degraded reply",
+        mock_reply.call_args
+        and mock_reply.call_args.args[1] == main._visible_llm_degraded_reply(),
+    )
 
     # Quota on first call, local fallback text on retry → reply that text.
     with (

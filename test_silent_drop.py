@@ -90,8 +90,8 @@ def test_s4_unknown_message_type_must_not_silent_drop():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def test_s5a_burst_flush_quota_retry_miss_suppressed_without_pending():
-    """burst flush + Gemini primary + retry 都 quota 爆 → 不 pending、不即時 fallback。"""
+def test_s5a_burst_flush_quota_retry_miss_replies_without_pending():
+    """burst flush + Gemini primary + retry 都 quota 爆 → 回可見 fallback、不 pending。"""
     with patch(
         "main._llm_chat",
         side_effect=Exception("quota exceeded for quota metric 'gemini'"),
@@ -110,7 +110,12 @@ def test_s5a_burst_flush_quota_retry_miss_suppressed_without_pending():
          patch("main._thinking_indicator"):
         main._handle_burst_flush("GRP001", "家人聊天 message", "TOKEN001")
 
-    mock_reply.assert_not_called()
+    mock_reply.assert_called_once_with(
+        "TOKEN001",
+        main._visible_llm_degraded_reply(),
+        group_id="GRP001",
+        allow_push_fallback=True,
+    )
     mock_save_pending.assert_not_called()
     mock_save_pending_burst.assert_not_called()
 

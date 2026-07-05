@@ -171,12 +171,12 @@ def test_lite_reply_suppresses_snippet_platitude(monkeypatch):
 # ── C1: explicit-path must defer (not silent-drop) when gate→None during quota outage ──
 
 
-def test_explicit_path_suppresses_without_pending_when_lite_misses(monkeypatch):
+def test_explicit_path_replies_without_pending_when_lite_misses(monkeypatch):
     """The gate makes lite_reply return None for substantive platitudes; on the explicit
     path (@咪寶 <question>) with Gemini quota already exhausted, `_llm_chat` returns ""
-    WITHOUT raising → the except block is skipped. Without the C1 guard this falls through
-    to _reply("") = silent drop. Pending reply is disabled, and Andrew does not
-    want an immediate fallback either, so assert it suppresses without enqueue."""
+    WITHOUT raising → the except block is skipped. The C1 guard must not restore
+    pending reply, but it should send a small visible fallback so the bot does
+    not look dead."""
     import main
     from unittest.mock import MagicMock, patch
 
@@ -202,4 +202,9 @@ def test_explicit_path_suppresses_without_pending_when_lite_misses(monkeypatch):
         main._handle_explicit_text(evt, "GRP001", "買房子的錢阿婆有出一部分要怎麼處理")
 
     mock_pending.assert_not_called()
-    mock_reply.assert_not_called()
+    mock_reply.assert_called_once_with(
+        "TOKEN_C1",
+        main._visible_llm_degraded_reply(),
+        group_id="GRP001",
+        allow_push_fallback=True,
+    )

@@ -152,6 +152,10 @@ def _is_badminton_event(event: Mapping[str, object]) -> bool:
     return bool(_BADMINTON_RE.search(haystack))
 
 
+def _uses_badminton_booking_workflow(event: Mapping[str, object]) -> bool:
+    return _is_badminton_event(event) and _event_reminder_lead_days(event) > 0
+
+
 def _format_month_day(event_date: str) -> str:
     try:
         _, month_s, day_s = str(event_date).split("-", 2)
@@ -173,7 +177,7 @@ def _event_reminder_lead_days(event: Mapping[str, object]) -> int:
 
 
 def _event_reminder_time(event: Mapping[str, object]) -> object:
-    if _is_badminton_event(event):
+    if _uses_badminton_booking_workflow(event):
         return "18:00"
     return event.get("event_time")
 
@@ -207,7 +211,7 @@ def _ensure_memory_db_path() -> None:
 def _event_reminder_payload(event: Mapping[str, object]) -> tuple[str, str]:
     title = str(event.get("title", "") or "").strip()
     participants = _event_participants(event)
-    if _is_badminton_event(event):
+    if _uses_badminton_booking_workflow(event):
         event_date = str(event.get("event_date", "") or "").strip()
         event_time = str(event.get("event_time", "") or "").strip()
         responsible = [p for p in participants if p and p != "全家"]
@@ -543,6 +547,7 @@ def sync_active_events_to_reminders(group_id: str | None = None) -> int:
                 keep_source_refs=active_refs,
                 group_id=group_id,
             )
+            memory.delete_duplicate_pending_reminders(group_id=group_id)
     except Exception:
         pass
 
