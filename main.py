@@ -292,7 +292,8 @@ _LOCAL_TEXT_FALLBACK_SYSTEM_PROMPT = """你是 LINE 群組助理咪寶。現在�
 請用繁體中文，第一句直接給判斷或回答，不要重述使用者問題。
 只能輸出要發到 LINE 的正式回覆；嚴禁輸出 THOUGHT、ANALYSIS、REASONING、英文推理、自我檢查或規則清單。
 若題目需要即時查證、最新價格、外部網頁或醫療法律投資專業判斷，而使用者沒有提供足夠資料，請明確說「本機模式無法即時查證」，但仍給可用的大方向、條件與下一步。
-控制在 80 到 260 個中文字，避免空泛安慰。"""
+控制在 80 到 260 個中文字，避免空泛安慰。
+如果只能輸出「有一定道理」「需要進一步查證」「需要多方面考量」「保持健康生活方式」這類模板句，請輸出空字串，不要回。"""
 
 
 def _runtime_time_context_for_local_llm() -> str:
@@ -7981,17 +7982,18 @@ def _reply(
         return
     # Markdown → LINE 純文字，並在 LINE API 呼叫前做最後 factual-safety gate。
     text = _prepare_outbound_text(text, source="reply")
-    if not text or not text.strip():
-        return
+    primary_suppressed = not bool(text and text.strip())
     # LINE 單則訊息上限 5000 字；在截斷前先預留 footer 空間
     footer = _get_quota_footer()
-    text = text[: 4900 - len(footer)] + footer
-    if _is_system_status_outbound(text):
+    if not primary_suppressed:
+        text = text[: 4900 - len(footer)] + footer
+    if not primary_suppressed and _is_system_status_outbound(text):
         logger.info(
             "suppressed system-status LINE reply group=%s preview=%r",
             group_id, text[:120],
         )
-        return
+        text = ""
+        primary_suppressed = True
 
     # ── Mute 守門 ─────────────────────────────────────────────────────────────
     # 修 bug 期間預設靜音。webhook 照收、classifier/chat 照跑、log 照寫，只是不送 LINE。
@@ -8007,7 +8009,7 @@ def _reply(
     # LINE reply_message 上限 5 則。pending reply piggyback 已取消；due
     # reminders 可趁正常 reply 一起送，作為 LINE push quota 429 時的補救路徑。
     # legacy pending branch 僅在 _PENDING_REPLY_ENABLED=True 的測試/rollback 場景會啟用。
-    messages_to_send: list = [TextMessage(text=text)]
+    messages_to_send: list = [] if primary_suppressed else [TextMessage(text=text)]
     pending_commit_ids: list[str] = []
     pending_reminders: list[tuple[str, int]] = []  # (event_id, offset) — reply 成功才 mark
     pending_reminder_pushes: list[tuple[int, str]] = []  # (reminder_id, stage) — reply 成功才 mark
@@ -8016,7 +8018,11 @@ def _reply(
         if group_id:
             # Step 1: legacy pending reply branch。拿同一把 drain lock，且只
             # peek；reply 成功後才 commit removal。
-            if _pending_reply_enabled() and _load_pending_explicit().get(group_id):
+            if (
+                messages_to_send
+                and _pending_reply_enabled()
+                and _load_pending_explicit().get(group_id)
+            ):
                 pending_slot = _try_acquire_drain_slot(group_id)
                 if pending_slot is None:
                     logger.info(
@@ -8074,7 +8080,10 @@ def _reply(
                             )
                             if spec is None:
                                 continue
-                            messages_to_send.append(_er.sdk_message_from_spec(spec))
+                            reminder_message = _er.sdk_message_from_spec(spec)
+                            if reminder_message is None:
+                                continue
+                            messages_to_send.append(reminder_message)
                             pending_reminders.append((e["event_id"], offset))
                 except Exception as e:
                     logger.warning("reminder piggyback skip: %s", e)
@@ -8098,6 +8107,9 @@ def _reply(
                     logger.warning("reminder_push piggyback skip: %s", e)
 
         resp = None
+        if not messages_to_send:
+            logger.info("reply suppressed with no piggyback messages group=%s", group_id)
+            return
         try:
             with ApiClient(_get_line_config()) as api_client:
                 resp = MessagingApi(api_client).reply_message(
@@ -8116,11 +8128,12 @@ def _reply(
                 return
             # reply_token 明確過期 / invalid / 已用過 → fallback 到 push_message
             if group_id:
-                if not allow_push_fallback or _is_market_quote_outbound(text):
+                if primary_suppressed or not allow_push_fallback or _is_market_quote_outbound(text):
                     logger.info(
-                        "reply token invalid; skip fallback push group=%s quote=%s",
+                        "reply token invalid; skip fallback push group=%s quote=%s primary_suppressed=%s",
                         group_id,
                         _is_market_quote_outbound(text),
+                        primary_suppressed,
                     )
                     return
                 try:

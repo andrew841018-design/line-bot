@@ -160,3 +160,11 @@ def test_standard_event_unknown_participant_falls_back_to_plain_at(
 
     assert spec["kind"] == "text"
     assert spec["text"].startswith("@朋友\n")
+
+
+def test_sdk_message_from_spec_returns_none_when_validation_suppresses(monkeypatch):
+    import event_reminder
+
+    monkeypatch.setattr(event_reminder, "validate_push_text", lambda *_a, **_kw: "")
+
+    assert event_reminder.sdk_message_from_spec({"kind": "text", "text": "x"}) is None

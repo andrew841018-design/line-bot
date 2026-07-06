@@ -75,7 +75,7 @@ def validate_push_text(text: str, *, source: str = "line_push_client") -> str:
     return result.text
 
 
-def _validated_message_dict(message: dict, *, source: str) -> dict:
+def _validated_message_dict(message: dict, *, source: str) -> dict | None:
     msg = dict(message)
     msg_type = msg.get("type")
     text = msg.get("text")
@@ -83,6 +83,9 @@ def _validated_message_dict(message: dict, *, source: str) -> dict:
         return msg
 
     safe_text = validate_push_text(text, source=source)
+    if not safe_text.strip():
+        logger.info("suppressed empty LINE push text source=%s", source)
+        return None
     if msg_type == "textV2" and safe_text != text:
         return {"type": "text", "text": safe_text[:5000]}
     msg["text"] = safe_text[:5000]
@@ -90,12 +93,15 @@ def _validated_message_dict(message: dict, *, source: str) -> dict:
 
 
 def _validated_messages(messages: Iterable[dict], *, source: str) -> list[dict]:
-    return [
-        _validated_message_dict(msg, source=source)
-        if isinstance(msg, dict)
-        else msg
-        for msg in messages
-    ]
+    out = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            out.append(msg)
+            continue
+        validated = _validated_message_dict(msg, source=source)
+        if validated is not None:
+            out.append(validated)
+    return out
 
 
 def push_messages(
@@ -127,6 +133,12 @@ def push_messages(
         headers["X-Line-Retry-Key"] = retry_key
 
     validated_messages = _validated_messages(messages, source="push_messages")
+    if not validated_messages:
+        logger.info("LINE push skipped because all messages were suppressed group=%s", group_id)
+        raise LinePushError(
+            "all LINE push messages were suppressed by outbound validation",
+            status_code=400,
+        )
     transport = session or requests
     try:
         resp = transport.post(

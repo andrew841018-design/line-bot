@@ -863,6 +863,104 @@ def test_reply_blocks_youtube_link_failure_before_line_api(monkeypatch):
     assert "無法解析此直播" not in sent
 
 
+def test_reply_suppresses_low_value_checkin_commitment_before_line_api(monkeypatch):
+    """Bot-as-human check-in commitments should be removed, not rewritten."""
+    monkeypatch.setattr(main.settings, "bot_muted", False)
+    monkeypatch.setattr(main, "_reminder_reply_piggyback_enabled", lambda: False)
+
+    mock_api = MagicMock()
+    mock_api.__enter__ = MagicMock(return_value=mock_api)
+    mock_api.__exit__ = MagicMock(return_value=False)
+    mock_messaging = MagicMock()
+
+    with (
+        patch("main.ApiClient", return_value=mock_api),
+        patch("main.MessagingApi", return_value=mock_messaging),
+        patch("main._load_pending_explicit", return_value={}),
+    ):
+        main._reply("TOKEN001", "好喔，我們會好好打卡的。", group_id="GRP001")
+
+    assert not mock_messaging.reply_message.called
+    assert not mock_messaging.push_message.called
+
+
+def test_reply_suppresses_low_value_helpless_text_before_line_api(monkeypatch):
+    """Generic filler with no concrete help should not reach LINE."""
+    monkeypatch.setattr(main.settings, "bot_muted", False)
+    monkeypatch.setattr(main, "_reminder_reply_piggyback_enabled", lambda: False)
+
+    mock_api = MagicMock()
+    mock_api.__enter__ = MagicMock(return_value=mock_api)
+    mock_api.__exit__ = MagicMock(return_value=False)
+    mock_messaging = MagicMock()
+
+    with (
+        patch("main.ApiClient", return_value=mock_api),
+        patch("main.MessagingApi", return_value=mock_messaging),
+        patch("main._load_pending_explicit", return_value={}),
+    ):
+        main._reply(
+            "TOKEN001",
+            "這個說法有一定道理，但需要進一步查證和具體分析。",
+            group_id="GRP001",
+        )
+
+    assert not mock_messaging.reply_message.called
+    assert not mock_messaging.push_message.called
+
+
+def test_reply_suppressed_primary_can_still_send_due_reminder_piggyback(monkeypatch):
+    """Suppressing a low-value primary reply must not block useful due reminders."""
+    import calendar_db
+    import reminder_push
+
+    monkeypatch.setattr(main.settings, "bot_muted", False)
+    monkeypatch.setattr(main, "_reminder_reply_piggyback_enabled", lambda: True)
+    monkeypatch.setattr(main, "_pending_reply_enabled", lambda: False)
+    monkeypatch.setattr(main, "_load_pending_explicit", lambda: {})
+    monkeypatch.setattr(calendar_db, "REMINDER_OFFSETS", [])
+
+    reminder_message = main.TextMessage(text="⏰ 提醒（明天）\n2026-07-20 08:00 打卡")
+    monkeypatch.setattr(
+        reminder_push,
+        "due_reminders_for_reply",
+        lambda *a, **kw: [
+            {
+                "reminder_id": 7,
+                "stage": "1d",
+                "text": reminder_message.text,
+                "message": reminder_message,
+            }
+        ],
+    )
+    marked: list[tuple[int, str]] = []
+    monkeypatch.setattr(
+        reminder_push,
+        "mark_reminders_pushed",
+        lambda rows: marked.extend(rows) or len(rows),
+    )
+
+    mock_api = MagicMock()
+    mock_api.__enter__ = MagicMock(return_value=mock_api)
+    mock_api.__exit__ = MagicMock(return_value=False)
+    mock_messaging = MagicMock()
+
+    with (
+        patch("main.ApiClient", return_value=mock_api),
+        patch("main.MessagingApi", return_value=mock_messaging),
+    ):
+        main._reply(
+            "TOKEN001",
+            "這個說法有一定道理，但需要進一步查證和具體分析。",
+            group_id="GRP001",
+        )
+
+    request = mock_messaging.reply_message.call_args.args[0]
+    assert len(request.messages) == 1
+    assert request.messages[0].text == reminder_message.text
+    assert marked == [(7, "1d")]
+
+
 def test_market_quote_reply_token_expired_does_not_fallback_push(monkeypatch):
     """Market quote replies are reply-only; expired reply token must not push to group."""
     monkeypatch.setattr(main.settings, "bot_muted", False)

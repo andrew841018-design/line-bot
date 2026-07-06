@@ -2,9 +2,16 @@ import importlib.util
 from pathlib import Path
 
 
+def _repo_root() -> Path:
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "ops" / "monitors" / "line_bot.py").exists():
+            return parent
+    raise AssertionError("cannot locate repo root with ops/monitors/line_bot.py")
+
+
 def _load_monitor(monkeypatch):
-    root = Path(__file__).resolve().parents[1]
-    monkeypatch.setenv("LINE_BOT_DIR", str(root / "line_bot"))
+    root = _repo_root()
+    monkeypatch.setenv("LINE_BOT_DIR", str(Path(__file__).resolve().parent))
     spec = importlib.util.spec_from_file_location(
         "line_bot_monitor_for_test",
         root / "ops" / "monitors" / "line_bot.py",

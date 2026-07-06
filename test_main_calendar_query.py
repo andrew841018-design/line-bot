@@ -819,6 +819,10 @@ def test_donghai_events_default_to_dad(monkeypatch, tmp_calendar_db):
     import main
     import calendar_extractor
 
+    event_date = (
+        tmp_calendar_db._today_tw()
+        + __import__("datetime").timedelta(days=1)
+    ).isoformat()
     monkeypatch.setattr(
         calendar_extractor,
         "extract",
@@ -826,7 +830,7 @@ def test_donghai_events_default_to_dad(monkeypatch, tmp_calendar_db):
             "has_event": True,
             "is_cancellation": False,
             "title": "東海大學校友年中交流聚餐",
-            "date": "2026-07-04",
+            "date": event_date,
             "time": "10:30",
             "location": "美僑俱樂部 California Room",
             "participants": ["校友"],
@@ -922,9 +926,11 @@ def test_calendar_capture_persists_second_event_when_model_returns_first_only(
     import main
     import calendar_extractor
 
+    date1 = tmp_calendar_db._today_tw() + __import__("datetime").timedelta(days=7)
+    date2 = tmp_calendar_db._today_tw() + __import__("datetime").timedelta(days=14)
     text = (
-        "咪寶麻煩提醒我7月4日台北市東海大學校友會在美僑俱樂部聚會"
-        "上午10:30到下午14:30以及7月11日在台北六福萬怡酒店9樓-海山廳"
+        f"咪寶麻煩提醒我{date1.month}月{date1.day}日台北市東海大學校友會在美僑俱樂部聚會"
+        f"上午10:30到下午14:30以及{date2.month}月{date2.day}日在台北六福萬怡酒店9樓-海山廳"
         "（南港火車站B棟，忠孝東路七段359號9樓）13:10-16:30。"
     )
     monkeypatch.setattr(
@@ -934,7 +940,7 @@ def test_calendar_capture_persists_second_event_when_model_returns_first_only(
             "has_event": True,
             "is_cancellation": False,
             "title": "東海大學校友會活動（美僑俱樂部）",
-            "date": "2026-07-04",
+            "date": date1.isoformat(),
             "time": "10:30",
             "location": "美僑俱樂部",
             "participants": ["校友"],
@@ -947,7 +953,7 @@ def test_calendar_capture_persists_second_event_when_model_returns_first_only(
 
     events = tmp_calendar_db.list_upcoming("G1", days=60)
     dates = [ev["event_date"] for ev in events]
-    assert dates == ["2026-07-04", "2026-07-11"]
+    assert dates == [date1.isoformat(), date2.isoformat()]
     assert any("美僑" in (ev["location"] or "") for ev in events)
     assert any("六福萬怡酒店" in (ev["location"] or "") for ev in events)
     assert all("爸爸" in ev["participants"] for ev in events)

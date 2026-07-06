@@ -1,6 +1,8 @@
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import pytest
+
 import line_push_client
 import output_validator
 
@@ -81,6 +83,84 @@ def test_blocks_common_youtube_deflection_variants():
         result = output_validator.validate_outbound_text(text, now=_NOW)
         assert not result.ok, text
         assert result.reason == "youtube_link_failure", text
+
+
+def test_blocks_low_value_checkin_commitment_reply():
+    examples = [
+        "好喔，我們會好好打卡的。",
+        "收到，我們會記得打卡。",
+        "好，我會準時簽到。",
+        "我們會按時報到",
+        "好的，我會打卡。",
+        "嗯，我們會簽到。",
+        "OK，我會記得打卡。",
+        "好喔，我們會好好打卡，請放心。",
+    ]
+
+    for text in examples:
+        result = output_validator.validate_outbound_text(text, now=_NOW)
+        assert not result.ok, text
+        assert result.reason == "low_value_checkin_commitment", text
+        assert result.text == ""
+
+
+def test_allows_useful_checkin_reminder_or_advice():
+    examples = [
+        "已設定提醒：2026-07-20 08:00 打卡。",
+        "建議 08:30 前完成打卡，入口在一樓櫃台。",
+        "請問打卡時間是什麼時候？",
+        "好的，我知道了。",
+        "我會幫你設定提醒。",
+    ]
+
+    for text in examples:
+        result = output_validator.validate_outbound_text(text, now=_NOW)
+        assert result.ok, text
+        assert result.text == text
+
+
+def test_blocks_low_value_helpless_reply():
+    examples = [
+        "這個說法有一定道理，但需要進一步查證和具體分析。",
+        "這個議題需要多方面考量，建議大家再確認。",
+        "長期來看要保持健康的生活方式，均衡飲食、適度運動。",
+        "這件事視情況而定，建議諮詢專業人士。",
+    ]
+
+    for text in examples:
+        result = output_validator.validate_outbound_text(text, now=_NOW)
+        assert not result.ok, text
+        assert result.reason == "low_value_helpless_reply", text
+        assert result.text == ""
+
+
+def test_allows_helpful_reply_with_concrete_value():
+    examples = [
+        "這個說法要小心：衛福部資料顯示慢性發炎和癌症風險相關，但不是單一食物直接致癌。來源：https://www.hpa.gov.tw/",
+        "處理方式：第一步先截圖保存紀錄，第二步打給銀行客服，第三步停止入金直到 IBKR 審核完成。",
+        "建議 08:30 前完成打卡，入口在一樓櫃台。",
+        "已設定提醒：2026-07-20 08:00 打卡。",
+        "建議你先確認預約是否成功，必要時到櫃台補登。",
+        "建議先確認資料欄位是否一致，必要時補一個 migration。",
+        "建議先確認 maps.app.goo.gl/abc 的集合地點。",
+        "第一點先確認原始訊息，第二點再回覆具體處理方式。",
+        "⏰ 提醒（明天）\n2026-07-20 08:00 我們會打卡",
+    ]
+
+    for text in examples:
+        result = output_validator.validate_outbound_text(text, now=_NOW)
+        assert result.ok, text
+        assert result.text == text
+
+
+def test_blocks_low_value_reply_with_fake_numeric_specificity():
+    result = output_validator.validate_outbound_text(
+        "這個議題需要多方面考量，建議大家再確認 1 下。",
+        now=_NOW,
+    )
+
+    assert not result.ok
+    assert result.reason == "low_value_helpless_reply"
 
 
 def test_allows_honest_youtube_transcript_limit_with_useful_answer():
@@ -176,6 +256,38 @@ def test_line_push_client_sanitizes_raw_text_message_before_post():
     sent_text = captured["json"]["messages"][0]["text"]
     assert "過期的年份基準" in sent_text
     assert "2024年" not in sent_text
+
+
+def test_line_push_client_rejects_all_suppressed_empty_text_message():
+    class Session:
+        def post(self, *args, **kwargs):  # pragma: no cover - should not be called
+            raise AssertionError("suppressed push should not call LINE API")
+
+    with pytest.raises(line_push_client.LinePushError) as exc:
+        line_push_client.push_messages(
+            "GROUP",
+            [{"type": "text", "text": "好喔，我們會好好打卡的。"}],
+            session=Session(),
+            fallback_token="token",
+        )
+
+    assert exc.value.status_code == 400
+
+
+def test_line_push_client_rejects_all_suppressed_low_value_helpless_text():
+    class Session:
+        def post(self, *args, **kwargs):  # pragma: no cover - should not be called
+            raise AssertionError("suppressed push should not call LINE API")
+
+    with pytest.raises(line_push_client.LinePushError) as exc:
+        line_push_client.push_messages(
+            "GROUP",
+            [{"type": "text", "text": "這個議題需要多方面考量，建議大家再確認。"}],
+            session=Session(),
+            fallback_token="token",
+        )
+
+    assert exc.value.status_code == 400
 
 
 def test_line_push_client_downgrades_blocked_textv2_to_plain_text():

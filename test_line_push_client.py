@@ -60,3 +60,25 @@ def test_try_push_text_returns_false_on_non_accepted_status(monkeypatch):
             return SimpleNamespace(status_code=429, text="quota")
 
     assert line_push_client.try_push_text("G1", "hello", session=FakeSession()) is False
+
+
+def test_push_text_raises_when_all_messages_suppressed(monkeypatch):
+    monkeypatch.setattr(line_push_client, "line_access_token", lambda fallback_token=None: "token")
+
+    class FakeSession:
+        def post(self, *args, **kwargs):  # pragma: no cover - should not be called
+            raise AssertionError("suppressed push should not call LINE API")
+
+    with pytest.raises(line_push_client.LinePushError) as exc:
+        line_push_client.push_text(
+            "G1",
+            "這個說法有一定道理，但需要進一步查證和具體分析。",
+            session=FakeSession(),
+        )
+
+    assert exc.value.status_code == 400
+    assert line_push_client.try_push_text(
+        "G1",
+        "這個說法有一定道理，但需要進一步查證和具體分析。",
+        session=FakeSession(),
+    ) is False

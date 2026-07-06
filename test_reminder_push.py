@@ -54,6 +54,18 @@ def test_due_reminders_for_reply_returns_due_items(monkeypatch):
     assert due[0]["message"].substitution["target"].mentionee.user_id == "U1"
 
 
+def test_due_reminders_skip_when_validation_suppresses(monkeypatch):
+    now = 1_800_000_000
+    monkeypatch.setattr(
+        reminder_push.memory,
+        "list_pending_reminders_full",
+        lambda group_id=None: [_row(now)],
+    )
+    monkeypatch.setattr(reminder_push, "validate_push_text", lambda *_a, **_kw: "")
+
+    assert reminder_push.due_reminders_for_reply("G1", limit=2, now=now) == []
+
+
 def test_due_reminder_label_uses_calendar_day_not_stage_window(monkeypatch):
     now_dt = reminder_push.datetime(2026, 6, 14, 9, 0)
     target_dt = reminder_push.datetime(2026, 6, 16, 8, 0)

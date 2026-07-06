@@ -271,10 +271,14 @@ def build_reminder_message_spec(
         plain_text = validate_push_text(
             cfg["plain_text"], source="event_reminder"
         )
+        if not plain_text.strip():
+            return None
         if allow_mention and cfg["mention_text"] and cfg["user_id"]:
             mention_text = validate_push_text(
                 cfg["mention_text"], source="event_reminder"
             )
+            if not mention_text.strip():
+                return None
             if mention_text != cfg["mention_text"]:
                 return {"kind": "text", "text": mention_text}
             return {
@@ -290,6 +294,8 @@ def build_reminder_message_spec(
     text = _format_event(e, offset)
     safe_text = validate_push_text(text, source="event_reminder")
     if safe_text != text:
+        if not safe_text.strip():
+            return None
         return {"kind": "text", "text": safe_text}
     targets = line_mentions.event_mention_targets(e)
     plain_labels = line_mentions.event_plain_labels(e)
@@ -299,6 +305,8 @@ def build_reminder_message_spec(
             line_mentions.text_with_plain_mentions(text, targets, plain_labels),
             source="event_reminder",
         )
+        if not fallback_text.strip():
+            return None
         if fallback_text != line_mentions.text_with_plain_mentions(
             text, targets, plain_labels
         ):
@@ -310,12 +318,15 @@ def build_reminder_message_spec(
             "fallback_text": fallback_text,
         }
     if plain_labels:
+        plain_text = validate_push_text(
+            line_mentions.text_with_plain_mentions(text, targets, plain_labels),
+            source="event_reminder",
+        )
+        if not plain_text.strip():
+            return None
         return {
             "kind": "text",
-            "text": validate_push_text(
-                line_mentions.text_with_plain_mentions(text, targets, plain_labels),
-                source="event_reminder",
-            ),
+            "text": plain_text,
         }
     return {"kind": "text", "text": text}
 
@@ -352,12 +363,16 @@ def sdk_message_from_spec(spec: dict):
     if spec.get("kind") == "textV2":
         fallback_text = str(spec.get("fallback_text") or spec.get("text") or "")
         safe_text = validate_push_text(fallback_text, source="event_reminder_sdk")
+        if not safe_text.strip():
+            return None
         if safe_text != fallback_text:
             return TextMessage(text=safe_text[:5000])
         return line_mentions.sdk_message_from_text_v2_dict(spec["message"])
     if spec.get("kind") == "mention":
         fallback_text = str(spec.get("fallback_text") or spec.get("text") or "")
         safe_text = validate_push_text(fallback_text, source="event_reminder_sdk")
+        if not safe_text.strip():
+            return None
         if safe_text != fallback_text:
             return TextMessage(text=safe_text[:5000])
         message = {
@@ -374,6 +389,8 @@ def sdk_message_from_spec(spec: dict):
     safe_text = validate_push_text(
         str(spec.get("text") or ""), source="event_reminder_sdk"
     )
+    if not safe_text.strip():
+        return None
     return TextMessage(text=safe_text[:5000])
 
 

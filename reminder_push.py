@@ -54,6 +54,9 @@ def _push_to_group(
       - 其他 exception（5xx / network）：exponential backoff (1s/2s/4s) 重試
     """
     safe_text = validate_push_text(text, source="reminder_push")
+    if not safe_text.strip():
+        logger.info("reminder push suppressed empty text group=%s", group_id)
+        return False
     if safe_text != text:
         message = TextMessage(text=safe_text[:4900])
     cfg = Configuration(access_token=_line_access_token())
@@ -197,7 +200,7 @@ def _format_push_text(r: dict, stage: str, now: int | None = None) -> str:
 
 def _build_push_text_and_message(
     r: dict, stage: str, now: int | None = None
-) -> tuple[str, object]:
+) -> tuple[str, object | None]:
     body = _format_push_text(r, stage, now=now)
     targets = line_mentions.reminder_actor_targets(
         str(r.get("user_id") or ""),
@@ -208,10 +211,14 @@ def _build_push_text_and_message(
     if not targets:
         text = line_mentions.text_with_plain_mentions(body, [], plain_labels)
         text = validate_push_text(text, source="reminder_push")
+        if not text.strip():
+            return "", None
         return text, TextMessage(text=text[:4900])
     message_dict = line_mentions.text_v2_dict(body, targets, plain_labels)
     plain_text = line_mentions.text_with_plain_mentions(body, targets, plain_labels)
     safe_plain = validate_push_text(plain_text, source="reminder_push")
+    if not safe_plain.strip():
+        return "", None
     if safe_plain != plain_text:
         return safe_plain, TextMessage(text=safe_plain[:4900])
     return (plain_text, line_mentions.sdk_message_from_text_v2_dict(message_dict))
@@ -232,6 +239,13 @@ def _due_reminder_items(
         if stage is None:
             continue
         text, message = _build_push_text_and_message(r, stage, now=now)
+        if not text.strip() or message is None:
+            logger.info(
+                "skip reminder due item after validation rid=%s stage=%s",
+                r.get("reminder_id"),
+                stage,
+            )
+            continue
         due.append(
             {
                 "reminder_id": r["reminder_id"],

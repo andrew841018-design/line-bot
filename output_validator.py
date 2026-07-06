@@ -42,6 +42,8 @@ _YOUTUBE_LINK_FAILURE_SAFE_TEXT = (
     "請重新貼一次連結，我會改用 yt-dlp、oEmbed、HTML metadata 重新抓取。"
 )
 
+_LOW_VALUE_REPLY_SAFE_TEXT = ""
+
 _CURRENT_YEAR_CLAIM_PATTERNS = (
     re.compile(
         r"(?:現在|目前|當前|今天)[，,、\s]*(?:日期|時間|年份)?[，,、\s]*(?:是|為|=)\s*(20\d{2})\s*年?"
@@ -101,6 +103,48 @@ _YOUTUBE_LINK_FAILURE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_CHECKIN_COMMITMENT_RE = re.compile(
+    r"(?:我|我們|大家)\s*"
+    r"(?:一定會|會)?\s*"
+    r"(?:好好|記得|準時|確實|乖乖|按時|去)?\s*"
+    r"(?:打卡|簽到|報到)"
+)
+_ACK_PREFIX_RE = re.compile(
+    r"^\s*(?:好(?:喔|哦|啊|啦)?|好的|收到|了解|知道了|ok|OK|沒問題|放心)"
+    r"[，,、。！!\s]*"
+)
+_USEFUL_CHECKIN_CONTEXT_RE = re.compile(
+    r"(?:已設定|設定提醒|⏰\s*提醒|提醒[（(:：]|將於|預計|建議|地點|入口|期限|截至|"
+    r"資料|規定|規則|需要|前完成|後補|時間[:：]|日期[:：]|20\d{2}[-/年])"
+)
+_LOW_VALUE_HELPLESS_RE = re.compile(
+    r"(?:"
+    r"有一定道理(?:，|,)?但需要進一步查證|"
+    r"需要進一步查證(?:和|與)?具體分析|"
+    r"需要(?:多方面|更多資訊|更完整資訊|綜合)考量|"
+    r"需要更多資訊才能判斷|"
+    r"保持健康的生活方式|"
+    r"均衡飲食[、，,](?:並)?適度運動|"
+    r"尋求專業(?:醫師|人士|協助)|"
+    r"諮詢專業(?:醫師|人士|意見)|"
+    r"視情況而定|"
+    r"因人而異"
+    r")"
+)
+_CONCRETE_HELP_RE = re.compile(
+    r"(?:"
+    r"https?://|www\.|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?:/\S*)?|"
+    r"20\d{2}|[0-9０-９]{1,3}(?:[:：][0-9０-９]{2}|[/.-][0-9０-９]|[%％]|"
+    r"\s*(?:元|萬|億|人|件|筆|次|天|小時|分鐘|公里|km|KM))|"
+    r"第[一二三四五六七八九十百]+[點項]|"
+    r"(?:來源|出處|依據|資料日期|截至|發布日期)[:：]|"
+    r"(?:已設定|設定提醒|提醒[:：]|預約編號|驗證碼|接送網址)|"
+    r"(?:第一步|第二步|第三步|步驟|先.+再|先.+最後|做法[:：]|處理方式[:：])|"
+    r"(?:打給|聯絡|申請|取消|改期|上傳|截圖|保存|不要入金|停止交易)"
+    r")",
+    re.IGNORECASE,
+)
+
 
 def _fold_width_digits(text: str) -> str:
     return text.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
@@ -144,13 +188,39 @@ def _youtube_link_failure_without_context(text: str) -> bool:
     )
 
 
+def _low_value_checkin_commitment_reply(text: str) -> bool:
+    folded = _fold_width_digits(text)
+    compact = re.sub(r"\s+", "", folded)
+    if not compact:
+        return False
+    if _USEFUL_CHECKIN_CONTEXT_RE.search(folded):
+        return False
+    if not _CHECKIN_COMMITMENT_RE.search(folded):
+        return False
+    return bool(_ACK_PREFIX_RE.match(folded)) or len(compact) <= 36
+
+
+def _low_value_helpless_reply(text: str) -> bool:
+    folded = _fold_width_digits(text)
+    compact = re.sub(r"\s+", "", folded)
+    if not compact:
+        return False
+    if not _LOW_VALUE_HELPLESS_RE.search(folded):
+        return False
+    if _CONCRETE_HELP_RE.search(folded):
+        return False
+    return len(compact) <= 220
+
+
 def validate_outbound_text(text: str, *, now: datetime | None = None) -> ValidationResult:
     """Validate a LINE-bound text message.
 
-    The validator blocks only patterns that are highly likely to be harmful:
-    stale runtime-year assertions, model/database cutoff claims, and latest or
-    official-statistics claims that contain numbers but no verifiable source
-    hint.  It does not attempt to prove every fact in arbitrary prose.
+    The validator blocks only patterns that are highly likely to be harmful or
+    noisy: stale runtime-year assertions, model/database cutoff claims, latest
+    or official-statistics claims without a verifiable source hint, YouTube
+    deflection text, short bot-as-human check-in commitments, and generic
+    filler that does not add concrete help.  It does not attempt to prove every
+    fact in arbitrary prose.
     """
     original = text or ""
     if not original.strip():
@@ -173,6 +243,20 @@ def validate_outbound_text(text: str, *, now: datetime | None = None) -> Validat
             ok=False,
             text=_YOUTUBE_LINK_FAILURE_SAFE_TEXT,
             reason="youtube_link_failure",
+        )
+
+    if _low_value_checkin_commitment_reply(original):
+        return ValidationResult(
+            ok=False,
+            text=_LOW_VALUE_REPLY_SAFE_TEXT,
+            reason="low_value_checkin_commitment",
+        )
+
+    if _low_value_helpless_reply(original):
+        return ValidationResult(
+            ok=False,
+            text=_LOW_VALUE_REPLY_SAFE_TEXT,
+            reason="low_value_helpless_reply",
         )
 
     if _high_risk_current_data_without_verification(original):
