@@ -44,6 +44,8 @@ _YOUTUBE_LINK_FAILURE_SAFE_TEXT = (
 
 _LOW_VALUE_REPLY_SAFE_TEXT = ""
 
+_INTERNAL_TRACE_SAFE_TEXT = ""
+
 _CURRENT_YEAR_CLAIM_PATTERNS = (
     re.compile(
         r"(?:現在|目前|當前|今天)[，,、\s]*(?:日期|時間|年份)?[，,、\s]*(?:是|為|=)\s*(20\d{2})\s*年?"
@@ -144,6 +146,18 @@ _CONCRETE_HELP_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+_INTERNAL_TRACE_RE = re.compile(
+    r"(?:"
+    r"^\s*(?:\[\[?\s*)?(?:思考|推理|內心獨白|草稿|系統思考)(?:\s*\]?\])?\s*[:：]?"
+    r"|^\s*\[\[?\s*分析\s*\]?\]\s*[:：]?"
+    r"|^\s*(?:reasoning|thought|analysis)\s*[:：]?"
+    r"|^\s*<\s*(?:thinking|analysis|reasoning)\s*>"
+    r"|^\s*```(?:thinking|analysis|reasoning)"
+    r"|使用者貼了一個|判斷問題類型|處理連結內容|遵循規則|回覆結構|執行 concise_search"
+    r"|The user (?:posted|shared|sent)|I need to determine|response structure"
+    r")",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 def _fold_width_digits(text: str) -> str:
@@ -212,6 +226,35 @@ def _low_value_helpless_reply(text: str) -> bool:
     return len(compact) <= 220
 
 
+def _internal_trace_reply(text: str) -> bool:
+    head = (text or "").lstrip()[:2500]
+    if not head:
+        return False
+    if _INTERNAL_TRACE_RE.search(head):
+        return True
+    strong_markers = (
+        "我需要判斷使用者",
+        "我需要判斷",
+        "I need to determine",
+        "The user posted",
+        "The user shared",
+        "The user sent",
+        "response structure",
+    )
+    if any(marker.lower() in head.lower() for marker in strong_markers):
+        return True
+    markers = (
+        "我應該先",
+        "我會嘗試",
+        "如果搜尋",
+        "第一句判斷句",
+        "規則 6",
+        "Google 搜尋該連結",
+        "concise_search",
+    )
+    return sum(1 for marker in markers if marker in head) >= 2
+
+
 def validate_outbound_text(text: str, *, now: datetime | None = None) -> ValidationResult:
     """Validate a LINE-bound text message.
 
@@ -227,6 +270,13 @@ def validate_outbound_text(text: str, *, now: datetime | None = None) -> Validat
         return ValidationResult(ok=True, text=original)
 
     runtime = _runtime_now(now)
+    if _internal_trace_reply(original):
+        return ValidationResult(
+            ok=False,
+            text=_INTERNAL_TRACE_SAFE_TEXT,
+            reason="internal_trace_leak",
+        )
+
     reason = _stale_current_year_reason(original, now=runtime)
     if reason:
         return ValidationResult(ok=False, text=_STALE_TIME_SAFE_TEXT, reason=reason)

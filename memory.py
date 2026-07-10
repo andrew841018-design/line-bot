@@ -625,6 +625,66 @@ def get_recent_raw_messages(
     return list(reversed([(r[0], r[1], r[2], r[3]) for r in rows]))
 
 
+def search_raw_messages(
+    group_id: str,
+    query: str,
+    *,
+    limit: int = 5,
+    exclude_bot: bool = True,
+) -> list[tuple[str, str | None, str, int]]:
+    """Keyword search over retained raw LINE messages, newest first.
+
+    The search is intentionally local and group-scoped: split the user query
+    into terms and require every term to appear in the message text.
+    """
+    def _search_terms(q: str) -> list[str]:
+        raw_terms = [
+            t.strip()
+            for t in re.split(r"\s+", q or "")
+            if len(t.strip()) >= 2
+        ]
+        if len(raw_terms) != 1:
+            return raw_terms
+        only = raw_terms[0]
+        if len(only) <= 4 or not re.search(r"[\u4e00-\u9fff]", only):
+            return raw_terms
+        parts = [
+            p.strip()
+            for p in re.split(
+                r"(?:去|回|的|關於|有關|日期|時間|對話紀錄|聊天紀錄|聊天記錄|歷史訊息)",
+                only,
+            )
+            if len(p.strip()) >= 2
+        ]
+        return parts or raw_terms
+
+    terms = _search_terms(query)
+    if not group_id or not terms:
+        return []
+    limit = max(1, min(int(limit or 5), 20))
+
+    def _like_pattern(term: str) -> str:
+        escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        return f"%{escaped}%"
+
+    where = ["group_id = ?"]
+    params: list[object] = [group_id]
+    if exclude_bot:
+        where.append("(user_id IS NULL OR user_id != '__bot__')")
+    for term in terms[:5]:
+        where.append("text LIKE ? ESCAPE '\\'")
+        params.append(_like_pattern(term))
+    sql = (
+        "SELECT message_id, user_id, text, created_at FROM raw_messages "
+        f"WHERE {' AND '.join(where)} "
+        "ORDER BY created_at DESC LIMIT ?"
+    )
+    params.append(limit)
+    with _conn() as c:
+        rows = c.execute(sql, params).fetchall()
+    return [(r[0], r[1], r[2], r[3]) for r in rows]
+
+
 def get_last_bot_reply(group_id: str) -> tuple[str, str] | None:
     """拿最近一則 bot 自己發過的訊息，回傳 (message_id, text) 或 None。
     給 /閉嘴 指令用，用於找出「上一則要被糾正的 bot 回覆」。"""

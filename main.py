@@ -181,7 +181,107 @@ _OUTBOUND_INTERNAL_TRACE_MARKERS = (
     "This directly answers",
     "Rule 0:",
     "規則 0:",
+    "判斷問題類型",
+    "處理連結內容",
+    "回覆結構",
+    "執行 concise_search",
+    "我需要判斷",
 )
+
+
+_reply_mention_targets_lock = threading.Lock()
+_reply_mention_targets_by_token: dict[str, list] = {}
+
+
+def _extract_reply_payload_targets(message: TextMessageContent) -> list:
+    """從 incoming message mention payload 抽出可直接套用的實體 mention target。"""
+    if not message:
+        return []
+    mention = getattr(message, "mention", None)
+    if mention is None:
+        return []
+    mentionees = getattr(mention, "mentionees", None) or []
+    raw_text = str(getattr(message, "text", "") or "")
+
+    import line_mentions
+
+    targets = []
+    seen_user_ids: set[str] = set()
+    for mentionee in mentionees:
+        user_id = (
+            getattr(mentionee, "user_id", None)
+            if not isinstance(mentionee, dict)
+            else None
+        ) or (
+            getattr(mentionee, "userId", None)
+            if not isinstance(mentionee, dict)
+            else None
+        )
+        if user_id is None and isinstance(mentionee, dict):
+            user_id = mentionee.get("user_id") or mentionee.get("userId")
+        if not isinstance(user_id, str) or not user_id.strip():
+            continue
+        user_id = user_id.strip()
+        if user_id in seen_user_ids:
+            continue
+        seen_user_ids.add(user_id)
+
+        label = None
+        idx = (
+            getattr(mentionee, "index", None)
+            if not isinstance(mentionee, dict)
+            else mentionee.get("index")
+        )
+        length = (
+            getattr(mentionee, "length", None)
+            if not isinstance(mentionee, dict)
+            else mentionee.get("length")
+        )
+        if isinstance(idx, int) and isinstance(length, int) and idx >= 0 and length > 0:
+            end = idx + length
+            if idx <= len(raw_text) and end <= len(raw_text):
+                candidate = raw_text[idx:end].replace("＠", "@").strip()
+                if candidate.startswith("@"):
+                    candidate = candidate[1:]
+                if candidate:
+                    label = f"@{candidate}"
+        if not label:
+            alias = line_mentions.alias_for_user_id(user_id)
+            label = f"@{alias}" if alias else "@當事人"
+
+        targets.append(
+            line_mentions.MentionTarget(
+                key=f"p{len(targets) + 1}",
+                kind="user",
+                user_id=user_id,
+                label=label,
+            )
+        )
+    return targets
+
+
+def _register_reply_mention_targets(reply_token: str | None, message: TextMessageContent) -> None:
+    if not reply_token or not message:
+        return
+    targets = _extract_reply_payload_targets(message)
+    if not targets:
+        return
+    with _reply_mention_targets_lock:
+        _reply_mention_targets_by_token[str(reply_token)] = targets
+
+
+def _consume_reply_mention_targets(reply_token: str | None) -> list:
+    if not reply_token:
+        return []
+    with _reply_mention_targets_lock:
+        return _reply_mention_targets_by_token.pop(str(reply_token), [])
+
+
+def _clear_reply_mention_targets(reply_token: str | None) -> None:
+    if not reply_token:
+        return
+    with _reply_mention_targets_lock:
+        _reply_mention_targets_by_token.pop(str(reply_token), None)
 
 
 def _is_internal_trace_outbound(text: str) -> bool:
@@ -190,7 +290,10 @@ def _is_internal_trace_outbound(text: str) -> bool:
     if not s:
         return False
     head = s[:2000]
-    if re.match(r"(?is)^(THOUGHT|ANALYSIS|REASONING)\b", head):
+    if re.match(
+        r"(?is)^(?:THOUGHT|ANALYSIS|REASONING)\b|^\s*(?:\[\[?\s*)?(?:思考|推理)(?:\s*\]?\])?\s*[:：]?|^\s*\[\[?\s*分析\s*\]?\]\s*[:：]?",
+        head,
+    ):
         return True
     hits = sum(marker in head for marker in _OUTBOUND_INTERNAL_TRACE_MARKERS)
     return hits >= 2
@@ -1693,7 +1796,11 @@ def _handle_event(event) -> None:
         memory.log_raw_message(group_id, msg.id, sender_user_id, text_body)
         # Piggyback reminder：有人留言時仍可補 reminder；reply pending 已由開關停用。
         _spawn_piggyback_drain(group_id)
-        _handle_text_message(event, group_id)
+        _register_reply_mention_targets(event.reply_token, msg)
+        try:
+            _handle_text_message(event, group_id)
+        finally:
+            _clear_reply_mention_targets(event.reply_token)
         return
 
     # Piggyback reminder：非文字內容仍可補 reminder；文字在上方先做衝突 gate。
@@ -3028,11 +3135,11 @@ _QUERY_NOUN_KEYWORDS: tuple[str, ...] = (
     # 醫療
     "胃鏡", "大腸鏡", "健檢", "體檢", "醫生", "牙醫", "看病",
     # 家人
-    "媽媽", "爸爸", "姊姊", "妹妹", "弟弟", "爺爺", "奶奶", "全家",
+    "媽媽", "爸爸", "姊姊", "妹妹", "弟弟", "爺爺", "奶奶", "全家", "黃將修",
     # 物件
     "蛋糕", "禮物",
     # 場所
-    "喜來登",
+    "喜來登", "紐西蘭", "奧克蘭", "機場", "桃園機場", "接送",
 )
 
 # Verb+noun phrase 抽取 — 對應 title LIKE '%verb%noun%' 順序匹配（中間可有字）
@@ -3046,6 +3153,7 @@ _QUERY_PHRASE_RE = re.compile(
     r"|(接)(爸|媽|妹|弟|姊|爺爺|奶奶|小孩|小朋友)"
     r"|(陪)(就醫|看醫生|看病)"
     r"|(領)(藥|處方簽|包裹)"
+    r"|(去)(紐西蘭|奧克蘭|機場|桃園機場)"
 )
 
 
@@ -3081,9 +3189,50 @@ def _is_calendar_query(text: str) -> bool:
     if _CALENDAR_QUERY_RE.search(text):
         return True
     # 二段 fallback：問句詞 + 行程動作 phrase
-    if re.search(r"什麼時候|哪一天|哪天|何時|上次|之前", text) and _QUERY_PHRASE_RE.search(text):
+    query_marker = re.search(r"什麼時候|哪一天|哪天|何時|上次|之前|日期|時間|幾號", text)
+    if query_marker and _QUERY_PHRASE_RE.search(text):
         return True
+    if query_marker and any(kw in text for kw in _QUERY_NOUN_KEYWORDS):
+        person_terms = ("媽媽", "爸爸", "姊姊", "妹妹", "弟弟", "爺爺", "奶奶", "黃將修")
+        trip_terms = ("紐西蘭", "奧克蘭")
+        trip_intent = re.search(r"去|回|出發|返台|班機|機場|接送|行程|旅程|旅行", text)
+        if trip_intent or (
+            any(p in text for p in person_terms)
+            and any(t in text for t in trip_terms)
+        ):
+            return True
+        return False
     return False
+
+
+def _strip_conversation_record_words(text: str) -> str:
+    return re.sub(
+        r"(?:的)?(?:對話紀錄|聊天紀錄|聊天記錄|歷史訊息|群組訊息)\s*$",
+        "",
+        text or "",
+    ).strip(" ：:，,。")
+
+
+def _calendar_event_has_any(ev: dict, keywords: list[str]) -> bool:
+    haystack = " ".join(
+        str(ev.get(k) or "")
+        for k in ("title", "location", "participants")
+    )
+    return any(kw in haystack for kw in keywords)
+
+
+def _filter_calendar_events_by_person_and_topic(
+    events: list[dict],
+    family_nouns: list[str],
+    other_nouns: list[str],
+) -> list[dict]:
+    if not (family_nouns and other_nouns):
+        return events
+    return [
+        e for e in events
+        if _calendar_event_has_any(e, family_nouns)
+        and _calendar_event_has_any(e, other_nouns)
+    ]
 
 
 def _resolve_relative_date(text: str):
@@ -3180,6 +3329,18 @@ _REMINDER_TIMING_KEYWORD_ALIASES: dict[str, tuple[str, ...]] = {
 _REMINDER_KNOWN_MENTION_ALIASES = {"爸爸", "媽媽", "黃聖雅", "黃聖穎"}
 _REMINDER_DETAIL_PREFIXES = ("地點", "預約編號", "接送網址", "票券驗證碼", "驗證碼")
 
+_CONVERSATION_SEARCH_RE = re.compile(
+    r"(?:搜尋|查詢|查|找).{0,8}(?:對話紀錄|聊天紀錄|聊天記錄|歷史訊息|群組訊息)"
+    r"|(?:對話紀錄|聊天紀錄|聊天記錄|歷史訊息|群組訊息).{0,8}(?:搜尋|查詢|查|找)"
+)
+_CONVERSATION_SEARCH_COMMAND_RE = re.compile(
+    r"(?:請)?(?:幫我)?(?:搜尋|查詢|查|找)\s*(?:一下)?\s*"
+    r"(?:對話紀錄|聊天紀錄|聊天記錄|歷史訊息|群組訊息)?\s*"
+    r"(?:關於|有關|裡面|中)?\s*"
+    r"|(?:對話紀錄|聊天紀錄|聊天記錄|歷史訊息|群組訊息)\s*"
+    r"(?:搜尋|查詢|查|找)?\s*(?:關於|有關)?\s*"
+)
+
 
 def _reminder_timing_query_keywords(text: str) -> list[str]:
     s = (text or "").strip()
@@ -3207,6 +3368,69 @@ def _is_todo_query(text: str) -> bool:
     if _is_reminder_timing_query(s):
         return True
     return bool(_TODO_QUERY_RE.search(s))
+
+
+def _is_conversation_search_query(text: str) -> bool:
+    return bool(_CONVERSATION_SEARCH_RE.search(text or ""))
+
+
+def _extract_conversation_search_query(text: str) -> str:
+    s = (text or "").strip()
+    s = _CONVERSATION_SEARCH_COMMAND_RE.sub("", s, count=1).strip(" ：:，,。")
+    # Remove remaining command nouns if the regex only consumed the verb side.
+    s = re.sub(
+        r"^(?:對話紀錄|聊天紀錄|聊天記錄|歷史訊息|群組訊息)\s*",
+        "",
+        s,
+    ).strip(" ：:，,。")
+    return _strip_conversation_record_words(s)
+
+
+def _format_raw_message_search_hit(row: tuple[str, str | None, str, int], idx: int) -> str:
+    _message_id, user_id, text, created_at = row
+    try:
+        when = datetime.fromtimestamp(
+            int(created_at), tz=ZoneInfo("Asia/Taipei")
+        ).strftime("%m/%d %H:%M")
+    except Exception:
+        when = "時間未知"
+    who = _alias_from_user_id(user_id or "") if user_id else ""
+    who_part = f"（{who}）" if who else ""
+    snippet = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(snippet) > 120:
+        snippet = snippet[:117] + "..."
+    return f"{idx}. {when}{who_part} {snippet}"
+
+
+def _build_conversation_search_reply(group_id: str, clean_text: str) -> str:
+    query = _extract_conversation_search_query(clean_text)
+    if not query:
+        return (
+            "可以查對話紀錄。\n"
+            "請在後面加關鍵字，例如：\n"
+            "搜尋對話紀錄 紐西蘭\n"
+            "搜尋對話紀錄 黃將修"
+        )
+    try:
+        hits = memory.search_raw_messages(group_id, query, limit=5, exclude_bot=True)
+    except Exception as e:
+        logger.warning("conversation search failed: %s", e)
+        hits = []
+    if not hits:
+        return f"最近保留的對話紀錄裡，沒有找到「{query}」。"
+    lines = [f"找到「{query}」相關對話："]
+    for idx, row in enumerate(hits, start=1):
+        lines.append(_format_raw_message_search_hit(row, idx))
+    return "\n".join(lines)
+
+
+def _handle_conversation_search_query(
+    event: MessageEvent, group_id: str, clean_text: str
+) -> None:
+    reply = _build_conversation_search_reply(group_id, clean_text)
+    _reply(event.reply_token, reply, group_id=group_id)
+    memory.append_turn(group_id, "user", clean_text)
+    _append_bot_turn(group_id, reply)
 
 
 def _fmt_todo_date(value: str | None) -> str:
@@ -3259,24 +3483,72 @@ def _wants_todo_details(text: str) -> bool:
 
 
 def _text_message_with_mentions(
-    text: str, *, validation_source: str = "text_message_with_mentions"
+    text: str,
+    *,
+    validation_source: str = "text_message_with_mentions",
+    prepared: bool = False,
+    limit: int = 4900,
+    quote_token: str | None = None,
+    explicit_only: bool = False,
+    reply_targets: list | None = None,
 ) -> tuple[str, object]:
-    reply_text = _prepare_outbound_text(text, source=validation_source)[:4900]
+    reply_text = str(text or "")
+    if not prepared:
+        reply_text = _prepare_outbound_text(reply_text, source=validation_source)
+    reply_text = reply_text[:limit]
     try:
         import line_mentions
 
-        aliases = line_mentions.aliases_mentioned_in_text(reply_text)
+        if explicit_only:
+            aliases = []
+            for candidate in re.findall(
+                r"@([A-Za-z0-9_\u4e00-\u9fff]{1,30})",
+                reply_text.replace("＠", "@"),
+            ):
+                clean = str(candidate or "").strip().lstrip("@")
+                if clean and clean not in aliases:
+                    aliases.append(clean)
+        else:
+            aliases = line_mentions.aliases_mentioned_in_text(reply_text)
         targets = []
         seen_user_ids: set[str] = set()
-        if "@all" in reply_text or "全家" in reply_text:
+        seen_labels: set[str] = set()
+        if "@all" in reply_text or (not explicit_only and "全家" in reply_text):
             targets.append(
                 line_mentions.MentionTarget(key="all", kind="all", label="@all")
             )
+            seen_labels.add("@all")
+
+        for target in reply_targets or []:
+            kind = getattr(target, "kind", None)
+            if kind != "user":
+                continue
+            user_id = str(getattr(target, "user_id", "") or "").strip()
+            if not user_id or user_id in seen_user_ids:
+                continue
+            raw_label = str(getattr(target, "label", "") or "").strip() or "@當事人"
+            if raw_label in seen_labels:
+                continue
+            targets.append(
+                line_mentions.MentionTarget(
+                    key=f"p{len(targets) + 1}",
+                    kind="user",
+                    user_id=user_id,
+                    label=raw_label,
+                )
+            )
+            seen_user_ids.add(user_id)
+            seen_labels.add(raw_label)
+
         seen: set[str] = set()
         deduped_aliases: list[str] = []
         for alias in aliases:
             clean_alias = str(alias or "").strip().lstrip("@")
-            if not clean_alias or clean_alias == "全家" or clean_alias in seen:
+            if (
+                not clean_alias
+                or clean_alias == "全家"
+                or clean_alias in seen
+            ):
                 continue
             deduped_aliases.append(clean_alias)
             seen.add(clean_alias)
@@ -3284,21 +3556,28 @@ def _text_message_with_mentions(
             user_id = line_mentions.user_id_for_alias(alias)
             if not user_id or user_id in seen_user_ids:
                 continue
+            label = f"@{alias}"
+            if label in seen_labels:
+                continue
             targets.append(
                 line_mentions.MentionTarget(
                     key=f"p{len(targets) + 1}",
                     kind="user",
                     user_id=user_id,
-                    label=f"@{alias}",
+                    label=label,
                 )
             )
             seen_user_ids.add(user_id)
+            seen_labels.add(label)
         if targets:
             message_dict = line_mentions.text_v2_dict(reply_text, targets)
-            return reply_text, line_mentions.sdk_message_from_text_v2_dict(message_dict)
+            return reply_text, line_mentions.sdk_message_from_text_v2_dict(
+                message_dict,
+                quote_token=quote_token,
+            )
     except Exception as e:
         logger.warning("build mention reply failed; fallback text message: %s", str(e)[:200])
-    return reply_text, TextMessage(text=reply_text)
+    return reply_text, TextMessage(text=reply_text, quoteToken=quote_token)
 
 
 def _split_action_detail(action: str) -> tuple[str, list[str]]:
@@ -3592,6 +3871,13 @@ def _handle_calendar_query(
         def _past(events: list) -> list:
             return [e for e in events if e.get("event_date", "") < today_iso]
 
+        family_kw = ("媽媽", "爸爸", "姊姊", "妹妹", "弟弟", "爺爺", "奶奶", "黃將修")
+        family_nouns = [kw for kw in family_kw if kw in clean_text]
+        other_nouns = [
+            kw for kw in _QUERY_NOUN_KEYWORDS
+            if kw in clean_text and kw not in family_kw
+        ]
+
         # Step 1: phrase 精準 match (title LIKE '%verb%noun%')
         vn_pairs = _extract_verb_noun_pairs(clean_text)
         phrases = [f"{v}{n}" for v, n in vn_pairs]
@@ -3614,18 +3900,18 @@ def _handle_calendar_query(
                 reply = f"沒有過去{phrase_label or '相關'}的紀錄～"
         else:
             # default: future-only — phrase 命中未來就列；沒未來改 noun fallback 找未來
-            phrase_future = _future(hits_phrase)
+            phrase_future = _filter_calendar_events_by_person_and_topic(
+                _future(hits_phrase), family_nouns, other_nouns
+            )
             if phrase_future:
                 reply = "\n\n".join(_fmt(e) for e in phrase_future[:3])
             else:
                 # Soft fallback: 優先 family member 的未來事件
-                family_kw = ("媽媽", "爸爸", "姊姊", "妹妹", "弟弟", "爺爺", "奶奶")
-                family_nouns = [kw for kw in family_kw if kw in clean_text]
-                other_nouns = [
-                    kw for kw in _QUERY_NOUN_KEYWORDS
-                    if kw in clean_text and kw not in family_kw
-                ]
-                search_nouns = family_nouns if family_nouns else other_nouns
+                search_nouns = (
+                    family_nouns + other_nouns
+                    if family_nouns and other_nouns
+                    else family_nouns or other_nouns
+                )
                 noun_future: list = []
                 if search_nouns:
                     try:
@@ -3633,6 +3919,9 @@ def _handle_calendar_query(
                             group_id, search_nouns, limit=10
                         )
                         noun_future = _future(hits_noun)
+                        noun_future = _filter_calendar_events_by_person_and_topic(
+                            noun_future, family_nouns, other_nouns
+                        )
                     except Exception as e:
                         logger.warning("calendar noun fallback failed: %s", e)
                 if noun_future:
@@ -3668,13 +3957,20 @@ def _handle_calendar_query(
     # （pending drain 會跑 local LLM / vision_llm，CPU heavy 害 reply 慢 1 分鐘）
     # 行事曆查詢應該 < 5 秒回，piggyback 留給其他 reply 路徑做
     reply_text = _prepare_outbound_text(reply, source="calendar_query")
+    reply_text, message = _text_message_with_mentions(
+        reply_text,
+        validation_source="calendar_query_mentions",
+        prepared=True,
+        limit=5000,
+        explicit_only=True,
+    )
     try:
         if not settings.bot_muted:
             with ApiClient(_get_line_config()) as api_client:
                 MessagingApi(api_client).reply_message(
                     ReplyMessageRequest(
                         reply_token=event.reply_token,
-                        messages=[TextMessage(text=reply_text)],
+                        messages=[message],
                     )
                 )
         logger.info("calendar query reply sent group=%s", group_id)
@@ -3714,6 +4010,15 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
         if poll_reply is not None:
             _reply(event.reply_token, poll_reply, group_id=group_id)
             return
+
+    # 對話紀錄搜尋 — deterministic path，不依賴 Gemini quota
+    if clean_text and _is_conversation_search_query(clean_text):
+        logger.info(
+            "conversation search routed: text=%r group=%s",
+            clean_text[:50], group_id,
+        )
+        _handle_conversation_search_query(event, group_id, clean_text)
+        return
 
     # 待辦 / 提醒查詢 — deterministic path，不依賴 Gemini quota
     if clean_text and _is_todo_query(clean_text):
@@ -5717,16 +6022,21 @@ def _drain_pending_for_group(group_id: str, source: str = "startup") -> bool:
                     )
                     return True
 
-                msg_kwargs = {"text": text}
                 qt = items[reply_to_idx].get("quote_token")
-                if qt:
-                    msg_kwargs["quote_token"] = qt
+                text, message = _text_message_with_mentions(
+                    text,
+                    validation_source="pending_push_mentions",
+                    prepared=True,
+                    limit=5000,
+                    quote_token=str(qt) if qt else None,
+                    explicit_only=True,
+                )
 
                 with ApiClient(_get_line_config()) as api_client:
                     MessagingApi(api_client).push_message(
                         PushMessageRequest(
                             to=group_id,
-                            messages=[TextMessage(**msg_kwargs)],
+                            messages=[message],
                         ),
                         x_line_retry_key=_pending_push_retry_key(group_id, msg_ids),
                     )
@@ -8009,7 +8319,18 @@ def _reply(
     # LINE reply_message 上限 5 則。pending reply piggyback 已取消；due
     # reminders 可趁正常 reply 一起送，作為 LINE push quota 429 時的補救路徑。
     # legacy pending branch 僅在 _PENDING_REPLY_ENABLED=True 的測試/rollback 場景會啟用。
-    messages_to_send: list = [] if primary_suppressed else [TextMessage(text=text)]
+    reply_targets = _consume_reply_mention_targets(reply_token)
+    primary_message = None
+    if not primary_suppressed:
+        text, primary_message = _text_message_with_mentions(
+            text,
+            validation_source="reply_mentions",
+            prepared=True,
+            limit=5000,
+            explicit_only=True,
+            reply_targets=reply_targets,
+        )
+    messages_to_send: list = [] if primary_suppressed else [primary_message]
     pending_commit_ids: list[str] = []
     pending_reminders: list[tuple[str, int]] = []  # (event_id, offset) — reply 成功才 mark
     pending_reminder_pushes: list[tuple[int, str]] = []  # (reminder_id, stage) — reply 成功才 mark
@@ -8043,7 +8364,13 @@ def _reply(
                                     group_id, pig_text[:120],
                                 )
                                 continue
-                            messages_to_send.append(TextMessage(text=pig_text[:5000]))
+                            _pig_text, pig_message = _text_message_with_mentions(
+                                pig_text,
+                                validation_source="reply_piggyback_mentions",
+                                limit=5000,
+                                explicit_only=True,
+                            )
+                            messages_to_send.append(pig_message)
                             if msg_id:
                                 pending_commit_ids.append(msg_id)
                             logger.info(
@@ -8098,7 +8425,12 @@ def _reply(
                         ):
                             messages_to_send.append(
                                 item.get("message")
-                                or TextMessage(text=item["text"][:5000])
+                                or _text_message_with_mentions(
+                                    item["text"],
+                                    validation_source="reminder_push_piggyback_mentions",
+                                    limit=5000,
+                                    explicit_only=True,
+                                )[1]
                             )
                             pending_reminder_pushes.append(
                                 (item["reminder_id"], item["stage"])
@@ -8137,11 +8469,19 @@ def _reply(
                     )
                     return
                 try:
+                    _push_text, push_message = _text_message_with_mentions(
+                        text,
+                        validation_source="reply_push_fallback_mentions",
+                        prepared=True,
+                        limit=5000,
+                        explicit_only=True,
+                        reply_targets=reply_targets,
+                    )
                     with ApiClient(_get_line_config()) as api_client:
                         MessagingApi(api_client).push_message(
                             PushMessageRequest(
                                 to=group_id,
-                                messages=[TextMessage(text=text)],
+                                messages=[push_message],
                             )
                         )
                     logger.info("fallback push_message sent to group=%s", group_id)

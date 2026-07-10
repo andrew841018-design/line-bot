@@ -56,6 +56,50 @@ def test_blocks_internal_knowledge_cutoff_claim():
     assert "內部資料庫" in result.text
 
 
+def test_blocks_chinese_internal_trace_leak():
+    result = output_validator.validate_outbound_text(
+        "[[思考]]\n使用者貼了一個 Threads 連結，並沒有明確提問。\n"
+        "我需要判斷使用者可能的意圖。\n\n"
+        "正式回覆：這個連結需要先查內容。",
+        now=_NOW,
+    )
+
+    assert not result.ok
+    assert result.reason == "internal_trace_leak"
+    assert result.text == ""
+
+
+def test_blocks_single_strong_internal_trace_marker():
+    result = output_validator.validate_outbound_text(
+        "我需要判斷使用者可能的意圖。正式回覆：這個連結要先查內容。",
+        now=_NOW,
+    )
+
+    assert not result.ok
+    assert result.reason == "internal_trace_leak"
+
+
+def test_blocks_english_internal_trace_prose():
+    result = output_validator.validate_outbound_text(
+        "The user posted a Threads link and did not ask a clear question. "
+        "Final answer: please provide the post text.",
+        now=_NOW,
+    )
+
+    assert not result.ok
+    assert result.reason == "internal_trace_leak"
+
+
+def test_allows_user_facing_analysis_heading():
+    result = output_validator.validate_outbound_text(
+        "分析：這張圖的重點是會議時間改到 7/20。",
+        now=_NOW,
+    )
+
+    assert result.ok
+    assert result.text.startswith("分析：")
+
+
 def test_blocks_youtube_link_failure_reply_before_line_delivery():
     bad_reply = (
         "這個 YouTube 直播連結本身未提供預覽內容，最直接的方式是點擊觀看以了解即時資訊。\n"

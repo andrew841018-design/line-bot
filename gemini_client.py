@@ -896,7 +896,7 @@ _URL_DOMAIN_RE = re.compile(
 )
 
 _INTERNAL_TRACE_PREFIX_RE = re.compile(
-    r"^\s*(THOUGHT|ANALYSIS|REASONING)\b",
+    r"^\s*(?:(THOUGHT|ANALYSIS|REASONING)\b|(?:\[\[?\s*)?(?:思考|推理|內部思考)(?:\s*\]?\])?\s*[:：]?|\[\[?\s*分析\s*\]?\]\s*[:：]?)",
     re.IGNORECASE | re.DOTALL,
 )
 _INTERNAL_TRACE_MARKERS = (
@@ -911,6 +911,16 @@ _INTERNAL_TRACE_MARKERS = (
     "This directly answers",
     "Rule 0:",
     "規則 0:",
+    "判斷問題類型",
+    "處理連結內容",
+    "回覆結構",
+    "執行 concise_search",
+    "我需要判斷",
+    "The user posted",
+    "The user shared",
+    "The user sent",
+    "I need to determine",
+    "response structure",
 )
 
 
@@ -947,6 +957,17 @@ def _looks_like_internal_trace(reply: str) -> bool:
     if not head:
         return False
     if _INTERNAL_TRACE_PREFIX_RE.match(head):
+        return True
+    strong_markers = (
+        "我需要判斷使用者",
+        "我需要判斷",
+        "I need to determine",
+        "The user posted",
+        "The user shared",
+        "The user sent",
+        "response structure",
+    )
+    if any(marker.lower() in head.lower() for marker in strong_markers):
         return True
     hits = sum(marker in head for marker in _INTERNAL_TRACE_MARKERS)
     return hits >= 2
@@ -1085,6 +1106,11 @@ def _quality_gate(
     current_text = text
     current_urls = grounding_urls
 
+    def _blocked_if_internal_trace(value: str, why: str) -> str:
+        if "internal trace leakage" in why or _looks_like_internal_trace(value):
+            return ""
+        return _append_sources(value, current_urls)
+
     for attempt in range(1, max_retries + 1):
         current_reason = prev_violations[-1][1]
         logger.warning(
@@ -1144,10 +1170,10 @@ def _quality_gate(
             retry_urls = _extract_grounding_urls(retry_resp)
         except Exception as e:
             logger.warning("quality retry %d 呼叫失敗: %s", attempt, e)
-            return _append_sources(current_text, current_urls)
+            return _blocked_if_internal_trace(current_text, current_reason)
 
         if not retry_text:
-            return _append_sources(current_text, current_urls)
+            return _blocked_if_internal_trace(current_text, current_reason)
 
         current_text = retry_text
         current_urls = retry_urls or current_urls
@@ -1166,7 +1192,7 @@ def _quality_gate(
     )
     _log_quality_violation(group_id, current_text, final_reason)
     _alert_quality_violation(current_text, final_reason)
-    return _append_sources(current_text, current_urls)
+    return _blocked_if_internal_trace(current_text, final_reason)
 
 
 # ════════════════════════════════════════════════════════════════════════════

@@ -106,6 +106,36 @@ def test_violates_quality_internal_trace():
     assert bad
     assert "internal trace" in reason
 
+    chinese_leak = (
+        "[[思考]]\n"
+        "使用者貼了一個 Threads 連結，並沒有明確提問。\n"
+        "判斷問題類型：可能是希望摘要。\n"
+        "回覆結構：第一句具體判斷。"
+    )
+    bad, reason = gemini_client._violates_quality(chinese_leak)
+    check("internal trace: [[思考]] → True", bad)
+    assert bad
+    assert "internal trace" in reason
+
+    bad, reason = gemini_client._violates_quality(
+        "我需要判斷使用者可能的意圖。正式回覆：這個連結要先查內容。"
+    )
+    check("internal trace: single strong marker → True", bad)
+    assert bad
+    assert "internal trace" in reason
+
+    bad, reason = gemini_client._violates_quality(
+        "The user posted a Threads link and did not ask a clear question. "
+        "Final answer: please provide the post text."
+    )
+    check("internal trace: English prose → True", bad)
+    assert bad
+    assert "internal trace" in reason
+
+    bad, _ = gemini_client._violates_quality("分析：這張圖的重點是會議時間改到 7/20。")
+    check("user-facing 分析 heading allowed", not bad)
+    assert not bad
+
 
 def test_violates_quality_clean():
     print("\n── Test C: _violates_quality clean reply passes ──")
@@ -197,6 +227,33 @@ def test_chat_retries_on_internal_trace():
     assert mock_chat.send_message.call_count == 2
     assert result == "這支影片是視覺化想像，不是真實紀錄。"
     assert "THOUGHT" in second_call_args
+
+
+def test_quality_gate_fail_closed_when_internal_trace_retries_exhaust(monkeypatch):
+    print("\n── Test D3: quality gate fails closed for repeated internal trace ──")
+
+    bad = (
+        "[[思考]]\n"
+        "使用者貼了一個 Threads 連結，並沒有明確提問。\n"
+        "我需要判斷使用者可能的意圖。"
+    )
+    responses = []
+    for _ in range(3):
+        resp = MagicMock()
+        resp.text = bad
+        resp.usage_metadata = MagicMock(total_token_count=10, thinking_token_count=0)
+        resp.candidates = []
+        responses.append(resp)
+
+    mock_chat = MagicMock()
+    mock_chat.send_message.side_effect = responses
+    monkeypatch.setattr(gemini_client, "_log_quality_violation", lambda *a, **k: None)
+    monkeypatch.setattr(gemini_client, "_alert_quality_violation", lambda *a, **k: None)
+
+    result = gemini_client._quality_gate(mock_chat, bad, [], "threads link", "G1")
+
+    assert result == ""
+    assert mock_chat.send_message.call_count == 3
 
 
 def test_chat_logs_when_retry_still_violates(monkeypatch):

@@ -303,7 +303,7 @@ def text_v2_dict(
     }
 
 
-def sdk_message_from_text_v2_dict(message: dict):
+def sdk_message_from_text_v2_dict(message: dict, quote_token: str | None = None):
     from linebot.v3.messaging import (  # type: ignore[import-untyped]
         AllMentionTarget,
         MentionSubstitutionObject,
@@ -324,4 +324,5 @@ def sdk_message_from_text_v2_dict(message: dict):
     return TextMessageV2(
         text=str(message.get("text") or ""),
         substitution=substitution or None,
+        quoteToken=quote_token,
     )

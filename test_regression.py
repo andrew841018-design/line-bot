@@ -803,6 +803,34 @@ def test_bug10_reply_suppresses_llm_internal_trace():
     assert not mock_messaging.push_message.called
 
 
+def test_reply_suppresses_chinese_internal_trace():
+    """Chinese scratchpad text must never be sent to the LINE group."""
+    main.settings.bot_muted = False
+
+    mock_api = MagicMock()
+    mock_api.__enter__ = MagicMock(return_value=mock_api)
+    mock_api.__exit__ = MagicMock(return_value=False)
+    mock_messaging = MagicMock()
+
+    leaked_text = (
+        "[[思考]]\n"
+        "使用者貼了一個 Threads 連結，並沒有明確提問。\n"
+        "1. 判斷問題類型：可能是摘要。\n"
+        "2. 回覆結構：第一句具體判斷。\n"
+        "正式回覆：這則貼文需要先讀內容。"
+    )
+
+    with (
+        patch("main.ApiClient", return_value=mock_api),
+        patch("main.MessagingApi", return_value=mock_messaging),
+        patch("main._load_pending_explicit", return_value={}),
+    ):
+        main._reply("TOKEN001", leaked_text, group_id="GRP001")
+
+    assert not mock_messaging.reply_message.called
+    assert not mock_messaging.push_message.called
+
+
 def test_reply_strips_user_visible_mode_labels(monkeypatch):
     """Internal fallback/model labels must not be sent to the LINE group."""
     monkeypatch.setattr(main.settings, "bot_muted", False)
@@ -834,6 +862,124 @@ def test_reply_strips_user_visible_mode_labels(monkeypatch):
     assert "搜尋摘要" in sent
     assert "lite mode" not in sent
     assert "local LLM" not in sent
+
+
+def test_reply_uses_text_v2_for_known_plain_mentions(monkeypatch):
+    """Plain @ labels in ordinary replies should become real LINE mentions."""
+    monkeypatch.setattr(main.settings, "bot_muted", False)
+    monkeypatch.setattr(main, "_reminder_reply_piggyback_enabled", lambda: False)
+
+    import line_mentions
+
+    monkeypatch.setattr(line_mentions, "load_user_aliases", lambda: {"U_DAD": "爸爸"})
+    mock_api = MagicMock()
+    mock_api.__enter__ = MagicMock(return_value=mock_api)
+    mock_api.__exit__ = MagicMock(return_value=False)
+    mock_messaging = MagicMock()
+
+    with (
+        patch("main.ApiClient", return_value=mock_api),
+        patch("main.MessagingApi", return_value=mock_messaging),
+        patch("main._load_pending_explicit", return_value={}),
+    ):
+        main._reply("TOKEN001", "@爸爸 記得看這個", group_id="GRP001")
+
+    request = mock_messaging.reply_message.call_args.args[0]
+    message = request.messages[0]
+    assert message.type == "textV2"
+    assert message.text.startswith("{p1}\n")
+    assert message.substitution["p1"].mentionee.user_id == "U_DAD"
+
+
+def test_reply_uses_incoming_mention_payload_targets():
+    """Reply payload should notify mentioned user IDs, even when reply text has no @alias."""
+    mock_api = MagicMock()
+    mock_api.__enter__ = MagicMock(return_value=mock_api)
+    mock_api.__exit__ = MagicMock(return_value=False)
+    mock_messaging = MagicMock()
+
+    msg = MagicMock(spec=TextMessageContent)
+    msg.id = "MSG001"
+    msg.text = "幫我確認這件事"
+    msg.mention = MagicMock()
+    mentionee = MagicMock()
+    mentionee.user_id = "U_DAD"
+    mentionee.index = 0
+    mentionee.length = 2
+    mentionee.type = "user"
+    msg.mention.mentionees = [mentionee]
+
+    main._register_reply_mention_targets("TOKEN001", msg)
+
+    with (
+        patch("main.ApiClient", return_value=mock_api),
+        patch("main.MessagingApi", return_value=mock_messaging),
+        patch("main._load_pending_explicit", return_value={}),
+        patch.object(main.settings, "bot_muted", False),
+        patch.object(main, "_reminder_reply_piggyback_enabled", lambda: False),
+    ):
+        main._reply("TOKEN001", "幫我確認這件事", group_id="GRP001")
+
+    request = mock_messaging.reply_message.call_args.args[0]
+    message = request.messages[0]
+    assert message.type == "textV2"
+    assert message.text.startswith("{p1}\n")
+    assert message.substitution["p1"].mentionee.user_id == "U_DAD"
+    assert main._consume_reply_mention_targets("TOKEN001") == []
+
+
+def test_reply_fallback_push_uses_text_v2_for_known_plain_mentions(monkeypatch):
+    """Expired reply token fallback must not downgrade real mentions to plain text."""
+    monkeypatch.setattr(main.settings, "bot_muted", False)
+    monkeypatch.setattr(main, "_reminder_reply_piggyback_enabled", lambda: False)
+
+    import line_mentions
+
+    monkeypatch.setattr(line_mentions, "load_user_aliases", lambda: {"U_DAD": "爸爸"})
+    mock_api = MagicMock()
+    mock_api.__enter__ = MagicMock(return_value=mock_api)
+    mock_api.__exit__ = MagicMock(return_value=False)
+    mock_messaging = MagicMock()
+    mock_messaging.reply_message.side_effect = Exception("Invalid reply token")
+
+    with (
+        patch("main.ApiClient", return_value=mock_api),
+        patch("main.MessagingApi", return_value=mock_messaging),
+        patch("main._load_pending_explicit", return_value={}),
+    ):
+        main._reply("TOKEN001", "@爸爸 記得看這個", group_id="GRP001")
+
+    request = mock_messaging.push_message.call_args.args[0]
+    message = request.messages[0]
+    assert message.type == "textV2"
+    assert message.text.startswith("{p1}\n")
+    assert message.substitution["p1"].mentionee.user_id == "U_DAD"
+
+
+def test_reply_does_not_mention_bare_alias_without_at(monkeypatch):
+    """Ordinary replies should not notify people unless the label is explicit."""
+    monkeypatch.setattr(main.settings, "bot_muted", False)
+    monkeypatch.setattr(main, "_reminder_reply_piggyback_enabled", lambda: False)
+
+    import line_mentions
+
+    monkeypatch.setattr(line_mentions, "load_user_aliases", lambda: {"U_DAD": "爸爸"})
+    mock_api = MagicMock()
+    mock_api.__enter__ = MagicMock(return_value=mock_api)
+    mock_api.__exit__ = MagicMock(return_value=False)
+    mock_messaging = MagicMock()
+
+    with (
+        patch("main.ApiClient", return_value=mock_api),
+        patch("main.MessagingApi", return_value=mock_messaging),
+        patch("main._load_pending_explicit", return_value={}),
+    ):
+        main._reply("TOKEN001", "爸爸剛剛說的那件事，我晚點整理。", group_id="GRP001")
+
+    request = mock_messaging.reply_message.call_args.args[0]
+    message = request.messages[0]
+    assert message.type == "text"
+    assert "爸爸" in message.text
 
 
 def test_reply_blocks_youtube_link_failure_before_line_api(monkeypatch):

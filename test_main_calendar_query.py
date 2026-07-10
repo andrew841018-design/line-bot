@@ -26,6 +26,7 @@ def test_calendar_query_variations():
         "今天有什麼計畫",
         "週六有事嗎",
         "下週六的行程",
+        "黃將修去紐西蘭的日期",
     ]
     for q in truthy:
         assert main._is_calendar_query(q) is True, f"should match: {q}"
@@ -39,6 +40,8 @@ def test_non_calendar_query_rejected():
         "美國股市怎樣",
         "幫我畫一張圖",
         "蛋糕好吃嗎",
+        "紐西蘭時間現在幾點",
+        "紐西蘭日期格式怎麼寫",
         "",
     ]
     for q in falsy:
@@ -73,6 +76,67 @@ def test_squash_timing_query_routes_to_reminders():
     for q in ("什麼時候打壁球", "壁球什麼時候"):
         assert main._is_todo_query(q) is True, f"should match reminder query: {q}"
         assert main._is_calendar_query(q) is False, f"should not use calendar query: {q}"
+
+
+def test_conversation_search_query_variations():
+    import main
+
+    assert main._is_conversation_search_query("搜尋對話紀錄") is True
+    assert main._is_conversation_search_query("查聊天紀錄 紐西蘭") is True
+    assert main._is_conversation_search_query("對話紀錄搜尋 黃將修") is True
+    assert main._is_conversation_search_query("今天天氣如何") is False
+
+
+def test_build_conversation_search_reply_requires_keyword():
+    import main
+
+    reply = main._build_conversation_search_reply("G1", "搜尋對話紀錄")
+
+    assert "請在後面加關鍵字" in reply
+    assert "搜尋對話紀錄 紐西蘭" in reply
+
+
+def test_build_conversation_search_reply_lists_keyword_hits(monkeypatch):
+    import main
+
+    monkeypatch.setattr(
+        main.memory,
+        "search_raw_messages",
+        lambda gid, query, limit=5, exclude_bot=True: [
+            ("m1", "U_DAD", "黃將修 7/16 去紐西蘭，7/28 回來", 1783200000),
+        ],
+    )
+    monkeypatch.setattr(main, "_alias_from_user_id", lambda uid: "爸爸")
+
+    reply = main._build_conversation_search_reply("G1", "搜尋對話紀錄 紐西蘭")
+
+    assert "找到「紐西蘭」相關對話" in reply
+    assert "黃將修 7/16 去紐西蘭" in reply
+    assert "（爸爸）" in reply
+
+
+def test_search_raw_messages_splits_chinese_trip_terms():
+    import memory
+
+    memory.log_raw_message(
+        "G1",
+        "m1",
+        "U_DAD",
+        "黃將修 7/16 去紐西蘭，7/28 回來",
+    )
+
+    hits = memory.search_raw_messages("G1", "黃將修去紐西蘭", limit=5)
+
+    assert len(hits) == 1
+    assert hits[0][0] == "m1"
+    assert "7/16" in hits[0][2]
+
+
+def test_extract_conversation_search_query_strips_trailing_record_words():
+    import main
+
+    assert main._extract_conversation_search_query("查一下紐西蘭的聊天紀錄") == "紐西蘭"
+    assert main._extract_conversation_search_query("找黃將修的對話紀錄") == "黃將修"
 
 
 # ── _resolve_relative_date ───────────────────────────────────────────────
@@ -188,6 +252,144 @@ def test_handle_calendar_query_no_match(monkeypatch):
     main._handle_calendar_query(FakeEvent(), "G1", "明天有什麼安排")
     assert "text" in captured
     assert "沒有" in captured["text"] or "0" in captured["text"]
+
+
+def test_handle_calendar_query_uses_text_v2_for_known_mentions(monkeypatch):
+    import main
+    import calendar_db
+    import event_reminder
+    import line_mentions
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    target_date = (
+        datetime.now(ZoneInfo("Asia/Taipei")).date() + timedelta(days=1)
+    ).isoformat()
+    event = {
+        "event_id": "e1",
+        "group_id": "G1",
+        "title": "打壁球",
+        "event_date": target_date,
+        "event_time": "19:00",
+        "location": "南港運動中心",
+        "participants": "[]",
+        "status": "active",
+    }
+    monkeypatch.setattr(calendar_db, "list_past", lambda gid, days=90: [])
+    monkeypatch.setattr(calendar_db, "list_upcoming", lambda gid, days=90: [event])
+    monkeypatch.setattr(event_reminder, "_format_event", lambda ev, offset: "@爸爸\n打壁球")
+    monkeypatch.setattr(line_mentions, "load_user_aliases", lambda: {"U_DAD": "爸爸"})
+    monkeypatch.setattr(main.memory, "append_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_append_bot_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main.settings, "bot_muted", False, raising=False)
+
+    captured: dict = {}
+    _patch_calendar_reply_capture(monkeypatch, main, captured)
+
+    class FakeEvent:
+        reply_token = "fake_token"
+
+    main._handle_calendar_query(FakeEvent(), "G1", "明天有什麼安排")
+
+    assert captured["message"].type == "textV2"
+    assert captured["message"].text.startswith("{p1}\n")
+    assert captured["message"].substitution["p1"].mentionee.user_id == "U_DAD"
+
+
+def test_handle_calendar_query_finds_hwang_new_zealand_dates(monkeypatch):
+    import main
+    import calendar_db
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    first = datetime.now(ZoneInfo("Asia/Taipei")).date() + timedelta(days=7)
+    second = first + timedelta(days=12)
+
+    events = [
+        {
+            "event_id": "nz-out",
+            "group_id": "G1",
+            "title": f"機場接送（去紐西蘭）{first.month}/{first.day}去程",
+            "event_date": first.isoformat(),
+            "event_time": "14:30",
+            "location": "桃園機場；預約編號F15309511",
+            "participants": "[\"黃將修(被接送)\"]",
+            "status": "active",
+        },
+        {
+            "event_id": "nz-back",
+            "group_id": "G1",
+            "title": f"機場接送（去紐西蘭）{second.month}/{second.day}回程",
+            "event_date": second.isoformat(),
+            "event_time": "",
+            "location": "桃園機場；時間待補",
+            "participants": "[\"黃將修(被接送)\"]",
+            "status": "active",
+        },
+    ]
+
+    monkeypatch.setattr(calendar_db, "search_by_title_phrase", lambda *a, **k: [])
+    monkeypatch.setattr(calendar_db, "search_by_keyword", lambda *a, **k: events)
+    monkeypatch.setattr(main.memory, "append_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_append_bot_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main.settings, "bot_muted", False, raising=False)
+
+    captured: dict = {}
+    _patch_calendar_reply_capture(monkeypatch, main, captured)
+
+    class FakeEvent:
+        reply_token = "fake_token"
+
+    main._handle_calendar_query(FakeEvent(), "G1", "黃將修去紐西蘭的日期")
+
+    assert first.isoformat() in captured["text"]
+    assert "14:30" in captured["text"]
+    assert second.isoformat() in captured["text"]
+    assert "去紐西蘭" in captured["text"]
+
+
+def test_hwang_new_zealand_query_filters_wrong_phrase_hit(monkeypatch):
+    import main
+    import calendar_db
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    first = datetime.now(ZoneInfo("Asia/Taipei")).date() + timedelta(days=7)
+    wrong = {
+        "event_id": "wrong",
+        "group_id": "G1",
+        "title": f"機場接送（去紐西蘭）{first.month}/{first.day}去程",
+        "event_date": first.isoformat(),
+        "event_time": "10:00",
+        "location": "桃園機場",
+        "participants": "[\"王小明(被接送)\"]",
+        "status": "active",
+    }
+    correct = dict(wrong)
+    correct.update(
+        {
+            "event_id": "correct",
+            "event_time": "14:30",
+            "participants": "[\"黃將修(被接送)\"]",
+        }
+    )
+
+    monkeypatch.setattr(calendar_db, "search_by_title_phrase", lambda *a, **k: [wrong])
+    monkeypatch.setattr(calendar_db, "search_by_keyword", lambda *a, **k: [wrong, correct])
+    monkeypatch.setattr(main.memory, "append_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_append_bot_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main.settings, "bot_muted", False, raising=False)
+
+    captured: dict = {}
+    _patch_calendar_reply_capture(monkeypatch, main, captured)
+
+    class FakeEvent:
+        reply_token = "fake_token"
+
+    main._handle_calendar_query(FakeEvent(), "G1", "黃將修去紐西蘭的日期")
+
+    assert "14:30" in captured["text"]
+    assert "王小明" not in captured["text"]
 
 
 def test_build_todo_status_reply_reads_all_sources(monkeypatch):
@@ -853,6 +1055,9 @@ def test_donghai_default_does_not_override_explicit_other_actor(
 ):
     import main
     import calendar_extractor
+    from datetime import timedelta
+
+    future_date = (tmp_calendar_db._today_tw() + timedelta(days=1)).isoformat()
 
     monkeypatch.setattr(
         calendar_extractor,
@@ -861,7 +1066,7 @@ def test_donghai_default_does_not_override_explicit_other_actor(
             "has_event": True,
             "is_cancellation": False,
             "title": "媽媽去東海大學",
-            "date": "2026-07-05",
+            "date": future_date,
             "time": None,
             "location": "東海大學",
             "participants": ["媽媽(旅者)"],
