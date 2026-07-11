@@ -18,6 +18,8 @@ import re
 import sqlite3
 import threading
 import time as _time
+import uuid
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -163,12 +165,26 @@ def _init_db() -> None:
                 created_at   INTEGER NOT NULL,
                 retries      INTEGER NOT NULL DEFAULT 0,
                 claimed_at   INTEGER NOT NULL DEFAULT 0,
+                claim_token  TEXT NOT NULL DEFAULT '',
                 status       TEXT NOT NULL DEFAULT 'pending'
             );
             CREATE INDEX IF NOT EXISTS idx_pending_reminder_status
                 ON pending_reminder_extract(status, created_at);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_reminder_msgid
                 ON pending_reminder_extract(message_id) WHERE message_id IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS reminder_confirmation_outbox (
+                confirmation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id        TEXT NOT NULL,
+                source_ref      TEXT NOT NULL,
+                text            TEXT NOT NULL,
+                created_at      INTEGER NOT NULL,
+                claimed_at      INTEGER NOT NULL DEFAULT 0,
+                claim_token     TEXT NOT NULL DEFAULT '',
+                status          TEXT NOT NULL DEFAULT 'pending',
+                UNIQUE(group_id, source_ref)
+            );
+            CREATE INDEX IF NOT EXISTS idx_reminder_confirmation_pending
+                ON reminder_confirmation_outbox(group_id, status, created_at);
             CREATE TABLE IF NOT EXISTS kg_triples (
                 group_id    TEXT NOT NULL,
                 subject     TEXT NOT NULL,
@@ -220,10 +236,26 @@ def _init_db() -> None:
                 "ALTER TABLE pending_reminder_extract "
                 "ADD COLUMN claimed_at INTEGER NOT NULL DEFAULT 0"
             )
+        if "claim_token" not in cols:
+            c.execute(
+                "ALTER TABLE pending_reminder_extract "
+                "ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''"
+            )
         c.execute(
             "CREATE INDEX IF NOT EXISTS idx_pending_reminder_claimed "
             "ON pending_reminder_extract(status, claimed_at)"
         )
+        outbox_cols = {
+            row[1]
+            for row in c.execute(
+                "PRAGMA table_info(reminder_confirmation_outbox)"
+            ).fetchall()
+        }
+        if "claim_token" not in outbox_cols:
+            c.execute(
+                "ALTER TABLE reminder_confirmation_outbox "
+                "ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''"
+            )
         # kg_triples schema migration: ALTER TABLE 自動補 column
         # 2026-05-08 新增：純本機 knowledge graph 萃取
         kg = c.execute(
@@ -962,6 +994,94 @@ def list_persona_notes(group_id: str, kind: str | None = None) -> list[dict]:
 # ── Reminders（自動偵測時間性事項，2026-05-08 加）────────────────────────────
 
 
+def _add_reminder_with_outcome_conn(
+    c: sqlite3.Connection,
+    group_id: str,
+    user_id: str,
+    action: str,
+    remind_at: int,
+    source_text: str,
+    mentions: list[str],
+    now: int,
+) -> tuple[int, str]:
+    mentions_json = json.dumps(mentions, ensure_ascii=False)
+    existing = c.execute(
+        "SELECT reminder_id, COALESCE(mention_aliases, '[]') FROM reminders "
+        "WHERE group_id = ? AND action = ? AND status = 'pending' "
+        "AND ABS(remind_at - ?) < 3600",
+        (group_id, action, remind_at),
+    ).fetchone()
+    if existing:
+        merged_mentions = _merge_mention_aliases_json(existing[1], mentions)
+        if merged_mentions != existing[1]:
+            c.execute(
+                "UPDATE reminders SET mention_aliases = ? WHERE reminder_id = ?",
+                (merged_mentions, existing[0]),
+            )
+        return int(existing[0]), "duplicate"
+    nearby = c.execute(
+        "SELECT reminder_id, action, COALESCE(source_text, ''), "
+        "COALESCE(mention_aliases, '[]') "
+        "FROM reminders WHERE group_id = ? AND status = 'pending' "
+        "AND ABS(remind_at - ?) < 1800",
+        (group_id, remind_at),
+    ).fetchall()
+    for existing_id, existing_action, existing_source, existing_mentions in nearby:
+        merged_action = _merge_reminder_action(existing_action, action)
+        if not merged_action:
+            continue
+        merged_source = _merge_reminder_source(existing_source, source_text)
+        merged_mentions = _merge_mention_aliases_json(existing_mentions, mentions)
+        c.execute(
+            "UPDATE reminders SET action = ?, source_text = ?, mention_aliases = ? "
+            "WHERE reminder_id = ?",
+            (merged_action, merged_source, merged_mentions, existing_id),
+        )
+        return int(existing_id), "merged"
+    c.execute(
+        "INSERT INTO reminders(group_id, user_id, action, remind_at, "
+        "created_at, status, source_kind, source_ref, source_text, mention_aliases) "
+        "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
+        (
+            group_id, user_id, action, remind_at, now,
+            "", "", source_text, mentions_json
+        ),
+    )
+    reminder_id = int(c.execute("SELECT last_insert_rowid()").fetchone()[0])
+    return reminder_id, "created"
+
+
+def add_reminder_with_outcome(
+    group_id: str,
+    user_id: str,
+    action: str,
+    remind_at: int,
+    source_text: str = "",
+    mention_aliases: list[str] | None = None,
+) -> tuple[int, str]:
+    """Atomically add or merge a reminder and return its write outcome.
+
+    Outcome is one of ``created``, ``duplicate``, or ``merged``. The explicit
+    immediate transaction serializes the dedupe read/write across processes.
+    """
+    now = int(_time.time())
+    action = _normalize_reminder_text(action)
+    source_text = _normalize_reminder_text(source_text)
+    mentions = _normalize_mention_aliases(mention_aliases)
+    with _lock, _conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        return _add_reminder_with_outcome_conn(
+            c,
+            group_id,
+            user_id,
+            action,
+            remind_at,
+            source_text,
+            mentions,
+            now,
+        )
+
+
 def add_reminder(
     group_id: str,
     user_id: str,
@@ -975,7 +1095,7 @@ def add_reminder(
     """新增 reminder。remind_at = epoch seconds。
 
     去重：同 group_id + 同 action + 24h 內 remind_at 差 < 1h → 跳過（避免同訊息被多次抽）。
-    回 reminder_id；跳過時回 None。
+    回 reminder_id；完全重複時回 None。
     """
     if source_kind and source_ref:
         return upsert_reminder_for_source(
@@ -989,58 +1109,110 @@ def add_reminder(
             mention_aliases=mention_aliases,
         )
 
-    # Historical path: 無 source_kind/source_ref 時保持既有行為（去重）
-    import time
-    now = int(time.time())
+    reminder_id, outcome = add_reminder_with_outcome(
+        group_id=group_id,
+        user_id=user_id,
+        action=action,
+        remind_at=remind_at,
+        source_text=source_text,
+        mention_aliases=mention_aliases,
+    )
+    return None if outcome == "duplicate" else reminder_id
+
+
+def _get_reminder_conn(c: sqlite3.Connection, reminder_id: int) -> dict | None:
+    row = c.execute(
+        "SELECT reminder_id, group_id, user_id, action, remind_at, status, "
+        "source_text, mention_aliases FROM reminders WHERE reminder_id=?",
+        (int(reminder_id),),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "reminder_id": int(row[0]),
+        "group_id": str(row[1]),
+        "user_id": str(row[2]),
+        "action": str(row[3]),
+        "remind_at": int(row[4]),
+        "status": str(row[5]),
+        "source_text": str(row[6] or ""),
+        "mention_aliases": _load_mention_aliases(row[7]),
+    }
+
+
+def get_reminder(reminder_id: int) -> dict | None:
+    """Return the canonical persisted reminder row used for acknowledgements."""
+    with _conn() as c:
+        return _get_reminder_conn(c, reminder_id)
+
+
+def complete_pending_reminder_with_confirmation(
+    pending_id: int,
+    pending_claim_token: str,
+    group_id: str,
+    user_id: str,
+    action: str,
+    remind_at: int,
+    source_text: str,
+    mention_aliases: list[str] | None,
+    confirmation_factory: Callable[[str, dict], str],
+) -> tuple[int, str, dict]:
+    """Atomically persist a drained reminder, acknowledgement, and terminal state."""
+    now = int(_time.time())
     action = _normalize_reminder_text(action)
     source_text = _normalize_reminder_text(source_text)
     mentions = _normalize_mention_aliases(mention_aliases)
-    mentions_json = json.dumps(mentions, ensure_ascii=False)
     with _lock, _conn() as c:
-        # 去重
-        existing = c.execute(
-            "SELECT reminder_id, COALESCE(mention_aliases, '[]') FROM reminders "
-            "WHERE group_id = ? AND action = ? AND status = 'pending' "
-            "AND ABS(remind_at - ?) < 3600",
-            (group_id, action, remind_at),
+        c.execute("BEGIN IMMEDIATE")
+        pending = c.execute(
+            "SELECT status, group_id, claim_token FROM pending_reminder_extract "
+            "WHERE pending_id=?",
+            (int(pending_id),),
         ).fetchone()
-        if existing:
-            merged_mentions = _merge_mention_aliases_json(existing[1], mentions)
-            if merged_mentions != existing[1]:
-                c.execute(
-                    "UPDATE reminders SET mention_aliases = ? WHERE reminder_id = ?",
-                    (merged_mentions, existing[0]),
-                )
-            return None
-        nearby = c.execute(
-            "SELECT reminder_id, action, COALESCE(source_text, ''), "
-            "COALESCE(mention_aliases, '[]') "
-            "FROM reminders WHERE group_id = ? AND status = 'pending' "
-            "AND ABS(remind_at - ?) < 1800",
-            (group_id, remind_at),
-        ).fetchall()
-        for existing_id, existing_action, existing_source, existing_mentions in nearby:
-            merged_action = _merge_reminder_action(existing_action, action)
-            if not merged_action:
-                continue
-            merged_source = _merge_reminder_source(existing_source, source_text)
-            merged_mentions = _merge_mention_aliases_json(existing_mentions, mentions)
-            c.execute(
-                "UPDATE reminders SET action = ?, source_text = ?, mention_aliases = ? "
-                "WHERE reminder_id = ?",
-                (merged_action, merged_source, merged_mentions, existing_id),
-            )
-            return existing_id
+        if (
+            pending is None
+            or pending[0] != "processing"
+            or pending[1] != group_id
+            or pending[2] != pending_claim_token
+        ):
+            raise RuntimeError("pending reminder claim is no longer owned")
+        reminder_id, outcome = _add_reminder_with_outcome_conn(
+            c,
+            group_id,
+            user_id,
+            action,
+            remind_at,
+            source_text,
+            mentions,
+            now,
+        )
+        persisted = _get_reminder_conn(c, reminder_id)
+        if persisted is None:
+            raise RuntimeError("persisted reminder row is missing")
+        confirmation_text = str(confirmation_factory(outcome, persisted) or "").strip()
+        if not confirmation_text:
+            raise RuntimeError("reminder confirmation text is empty")
         c.execute(
-            "INSERT INTO reminders(group_id, user_id, action, remind_at, "
-            "created_at, status, source_kind, source_ref, source_text, mention_aliases) "
-            "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO reminder_confirmation_outbox"
+            "(group_id, source_ref, text, created_at, claimed_at, claim_token, status) "
+            "VALUES (?, ?, ?, ?, 0, '', 'pending')",
             (
-                group_id, user_id, action, remind_at, now,
-                "", "", source_text, mentions_json
+                group_id,
+                f"pending_reminder:{int(pending_id)}",
+                confirmation_text,
+                now,
             ),
         )
-        return c.execute("SELECT last_insert_rowid()").fetchone()[0]
+        completed = c.execute(
+            "UPDATE pending_reminder_extract "
+            "SET status='done', claimed_at=0, claim_token='' "
+            "WHERE pending_id=? AND status='processing' AND group_id=? "
+            "AND claim_token=?",
+            (int(pending_id), group_id, pending_claim_token),
+        )
+        if completed.rowcount != 1:
+            raise RuntimeError("pending reminder completion lost its claim")
+        return reminder_id, outcome, persisted
 
 
 def upsert_reminder_for_source(
@@ -1515,6 +1687,136 @@ def delete_duplicate_pending_reminders(
         return deleted
 
 
+# ── Reminder creation confirmations ──────────────────────────────────────────
+
+
+def enqueue_reminder_confirmation(
+    group_id: str,
+    source_ref: str,
+    text: str,
+) -> int | None:
+    """Persist one idempotent reminder acknowledgement for later piggyback."""
+    import time
+
+    group_id = str(group_id or "").strip()
+    source_ref = str(source_ref or "").strip()
+    text = str(text or "").strip()
+    if not group_id or not source_ref or not text:
+        return None
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "INSERT OR IGNORE INTO reminder_confirmation_outbox"
+            "(group_id, source_ref, text, created_at, claimed_at, status) "
+            "VALUES (?, ?, ?, ?, 0, 'pending')",
+            (group_id, source_ref, text, int(time.time())),
+        )
+        if cur.rowcount == 0:
+            row = c.execute(
+                "SELECT confirmation_id FROM reminder_confirmation_outbox "
+                "WHERE group_id=? AND source_ref=?",
+                (group_id, source_ref),
+            ).fetchone()
+            return int(row[0]) if row else None
+        return int(c.execute("SELECT last_insert_rowid()").fetchone()[0])
+
+
+def claim_reminder_confirmations(
+    group_id: str,
+    limit: int = 4,
+    stale_after_sec: int = 600,
+) -> list[dict]:
+    """Claim pending acknowledgements so concurrent replies cannot double-send."""
+    if not group_id or limit <= 0:
+        return []
+    now = int(_time.time())
+    cutoff = now - max(1, int(stale_after_sec))
+    claimed: list[dict] = []
+    with _lock, _conn() as c:
+        c.execute(
+            "UPDATE reminder_confirmation_outbox "
+            "SET status='pending', claimed_at=0, claim_token='' "
+            "WHERE group_id=? AND status='sending' AND claimed_at < ?",
+            (group_id, cutoff),
+        )
+        rows = c.execute(
+            "SELECT confirmation_id, source_ref, text, created_at "
+            "FROM reminder_confirmation_outbox "
+            "WHERE group_id=? AND status='pending' "
+            "ORDER BY created_at, confirmation_id LIMIT ?",
+            (group_id, int(limit)),
+        ).fetchall()
+        for confirmation_id, source_ref, text, created_at in rows:
+            claim_token = uuid.uuid4().hex
+            cur = c.execute(
+                "UPDATE reminder_confirmation_outbox "
+                "SET status='sending', claimed_at=?, claim_token=? "
+                "WHERE confirmation_id=? AND group_id=? AND status='pending'",
+                (now, claim_token, confirmation_id, group_id),
+            )
+            if cur.rowcount == 1:
+                claimed.append(
+                    {
+                        "confirmation_id": int(confirmation_id),
+                        "source_ref": str(source_ref),
+                        "text": str(text),
+                        "created_at": int(created_at),
+                        "claim_token": claim_token,
+                    }
+                )
+    return claimed
+
+
+def release_reminder_confirmations(
+    group_id: str,
+    claims: list[tuple[int, str]],
+) -> int:
+    """Return claimed acknowledgements to pending after a failed LINE reply."""
+    normalized = [
+        (int(confirmation_id), str(claim_token))
+        for confirmation_id, claim_token in claims
+        if int(confirmation_id) > 0 and str(claim_token)
+    ]
+    if not group_id or not normalized:
+        return 0
+    released = 0
+    with _lock, _conn() as c:
+        for confirmation_id, claim_token in normalized:
+            cur = c.execute(
+                "UPDATE reminder_confirmation_outbox "
+                "SET status='pending', claimed_at=0, claim_token='' "
+                "WHERE group_id=? AND status='sending' "
+                "AND confirmation_id=? AND claim_token=?",
+                (group_id, confirmation_id, claim_token),
+            )
+            released += int(cur.rowcount)
+    return released
+
+
+def delete_sent_reminder_confirmations(
+    group_id: str,
+    claims: list[tuple[int, str]],
+) -> int:
+    """Delete acknowledgements only after LINE accepted the piggyback reply."""
+    normalized = [
+        (int(confirmation_id), str(claim_token))
+        for confirmation_id, claim_token in claims
+        if int(confirmation_id) > 0 and str(claim_token)
+    ]
+    if not group_id or not normalized:
+        return 0
+    deleted = 0
+    with _lock, _conn() as c:
+        for confirmation_id, claim_token in normalized:
+            cur = c.execute(
+                "DELETE FROM reminder_confirmation_outbox "
+                "WHERE group_id=? AND status='sending' "
+                "AND confirmation_id=? AND claim_token=?",
+                (group_id, confirmation_id, claim_token),
+            )
+            deleted += int(cur.rowcount)
+    return deleted
+
+
 # ── Pending reminder extract（quota 爆時入隊、恢復後補抽，2026-05-30 加）──────────
 # forward-only：只存「當下 Gemini 不可用而無法抽取」的訊息。drain 從不重掃
 # raw_messages（否則重抽已 backfill 的舊訊息 → Gemini action 字串與手寫不同 →
@@ -1553,7 +1855,7 @@ def reclaim_stale_pending_reminders(
         if group_id is not None:
             cur = c.execute(
                 "UPDATE pending_reminder_extract "
-                "SET retries = retries + 1, status='pending', claimed_at=0 "
+                "SET retries = retries + 1, status='pending', claimed_at=0, claim_token='' "
                 "WHERE status='processing' AND claimed_at > 0 "
                 "AND claimed_at < ? AND group_id = ?",
                 (cutoff, group_id),
@@ -1561,7 +1863,7 @@ def reclaim_stale_pending_reminders(
         else:
             cur = c.execute(
                 "UPDATE pending_reminder_extract "
-                "SET retries = retries + 1, status='pending', claimed_at=0 "
+                "SET retries = retries + 1, status='pending', claimed_at=0, claim_token='' "
                 "WHERE status='processing' AND claimed_at > 0 AND claimed_at < ?",
                 (cutoff,),
             )
@@ -1588,37 +1890,42 @@ def list_pending_reminder_retries(group_id: str, limit: int = 5) -> list[dict]:
     ]
 
 
-def claim_pending_reminder(pending_id: int) -> bool:
-    """Atomic claim：status pending→processing。回 True=搶到（rowcount==1）。
+def claim_pending_reminder(pending_id: int) -> str | None:
+    """Atomic claim：status pending→processing。成功回 owner token。
     防 piggyback drain 與 cron worker 同時抽同一筆 → 重複 reminder。"""
+    claim_token = uuid.uuid4().hex
     with _lock, _conn() as c:
         cur = c.execute(
-            "UPDATE pending_reminder_extract SET status='processing', claimed_at=? "
+            "UPDATE pending_reminder_extract "
+            "SET status='processing', claimed_at=?, claim_token=? "
             "WHERE pending_id = ? AND status = 'pending'",
-            (int(_time.time()), pending_id),
+            (int(_time.time()), claim_token, pending_id),
+        )
+        return claim_token if cur.rowcount == 1 else None
+
+
+def mark_pending_reminder(pending_id: int, status: str, claim_token: str) -> bool:
+    """標記結果：'done'（已抽存）/'dropped'（非提醒、過期）。"""
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "UPDATE pending_reminder_extract "
+            "SET status = ?, claimed_at=0, claim_token='' "
+            "WHERE pending_id = ? AND status='processing' AND claim_token=?",
+            (status, pending_id, claim_token),
         )
         return cur.rowcount == 1
 
 
-def mark_pending_reminder(pending_id: int, status: str) -> None:
-    """標記結果：'done'（已抽存）/'dropped'（非提醒、過期）。"""
-    with _lock, _conn() as c:
-        c.execute(
-            "UPDATE pending_reminder_extract SET status = ?, claimed_at=0 "
-            "WHERE pending_id = ?",
-            (status, pending_id),
-        )
-
-
-def release_pending_reminder(pending_id: int) -> None:
+def release_pending_reminder(pending_id: int, claim_token: str) -> bool:
     """重抽又撞 quota：retries+1 並退回 'pending' 等下輪 drain。"""
     with _lock, _conn() as c:
-        c.execute(
+        cur = c.execute(
             "UPDATE pending_reminder_extract "
-            "SET retries = retries + 1, status='pending', claimed_at=0 "
-            "WHERE pending_id = ?",
-            (pending_id,),
+            "SET retries = retries + 1, status='pending', claimed_at=0, claim_token='' "
+            "WHERE pending_id = ? AND status='processing' AND claim_token=?",
+            (pending_id, claim_token),
         )
+        return cur.rowcount == 1
 
 
 def drop_stale_pending_reminders(max_age_sec: int, group_id: str | None = None) -> int:

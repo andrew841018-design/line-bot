@@ -373,6 +373,191 @@ def test_reply_success_commits_pending_piggyback(monkeypatch):
     assert pending_store.load().get("G1", []) == []
 
 
+def test_reply_piggybacks_and_commits_reminder_creation_confirmation(monkeypatch):
+    import line_mentions
+    import main
+    import pending_store
+
+    pending_store.save_full({})
+    _patch_reply_pending_fast_path(main, monkeypatch)
+    monkeypatch.setattr(
+        main.memory,
+        "claim_reminder_confirmations",
+        lambda group_id, limit: [
+            {
+                "confirmation_id": 41,
+                "source_ref": "pending_reminder:7",
+                "text": "已新增提醒\n時間：2026-07-16 09:00\n事項：買按摩油\n對象：@爸爸",
+                "created_at": 1,
+                "claim_token": "claim-41",
+            }
+        ],
+    )
+    deleted = []
+    released = []
+    monkeypatch.setattr(
+        main.memory,
+        "delete_sent_reminder_confirmations",
+        lambda group_id, ids: deleted.extend(ids) or len(ids),
+    )
+    monkeypatch.setattr(
+        main.memory,
+        "release_reminder_confirmations",
+        lambda group_id, ids: released.extend(ids) or len(ids),
+    )
+    monkeypatch.setattr(
+        line_mentions,
+        "user_id_for_alias",
+        lambda alias: "U_DAD" if alias == "爸爸" else None,
+    )
+    captured = {}
+
+    class _FakeMessagingApi:
+        def __init__(self, _):
+            pass
+
+        def reply_message(self, req):
+            captured["messages"] = req.messages
+
+            class _Resp:
+                sent_messages = []
+
+            return _Resp()
+
+        def push_message(self, req):
+            raise AssertionError("confirmation must not use push_message")
+
+    class _FakeApiClient:
+        def __init__(self, _cfg):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(main, "ApiClient", _FakeApiClient)
+    monkeypatch.setattr(main, "MessagingApi", _FakeMessagingApi)
+    monkeypatch.setattr(main, "_get_line_config", lambda: None)
+
+    main._reply("fake_token", "primary reply", group_id="G1")
+
+    assert len(captured["messages"]) == 2
+    assert type(captured["messages"][1]).__name__ == "TextMessageV2"
+    assert deleted == [(41, "claim-41")]
+    assert released == []
+
+
+def test_reply_failure_releases_reminder_creation_confirmation(monkeypatch):
+    import main
+    import pending_store
+
+    pending_store.save_full({})
+    _patch_reply_pending_fast_path(main, monkeypatch)
+    monkeypatch.setattr(
+        main.memory,
+        "claim_reminder_confirmations",
+        lambda group_id, limit: [
+            {
+                "confirmation_id": 42,
+                "source_ref": "pending_reminder:8",
+                "text": "已新增提醒\n時間：2026-07-16 09:00\n事項：買按摩油",
+                "created_at": 1,
+                "claim_token": "claim-42",
+            }
+        ],
+    )
+    deleted = []
+    released = []
+    monkeypatch.setattr(
+        main.memory,
+        "delete_sent_reminder_confirmations",
+        lambda group_id, ids: deleted.extend(ids) or len(ids),
+    )
+    monkeypatch.setattr(
+        main.memory,
+        "release_reminder_confirmations",
+        lambda group_id, ids: released.extend(ids) or len(ids),
+    )
+
+    class _FakeMessagingApi:
+        def __init__(self, _):
+            pass
+
+        def reply_message(self, req):
+            raise TimeoutError("ambiguous reply failure")
+
+        def push_message(self, req):
+            raise AssertionError("ambiguous reply failure must not push")
+
+    class _FakeApiClient:
+        def __init__(self, _cfg):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(main, "ApiClient", _FakeApiClient)
+    monkeypatch.setattr(main, "MessagingApi", _FakeMessagingApi)
+    monkeypatch.setattr(main, "_get_line_config", lambda: None)
+
+    main._reply("fake_token", "primary reply", group_id="G1")
+
+    assert deleted == []
+    assert released == [(42, "claim-42")]
+
+
+def test_outbox_failure_does_not_block_primary_reply(monkeypatch):
+    import main
+    import pending_store
+
+    pending_store.save_full({})
+    _patch_reply_pending_fast_path(main, monkeypatch)
+    monkeypatch.setattr(
+        main.memory,
+        "claim_reminder_confirmations",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("outbox unavailable")),
+    )
+    captured = {}
+
+    class _FakeMessagingApi:
+        def __init__(self, _):
+            pass
+
+        def reply_message(self, req):
+            captured["texts"] = [message.text for message in req.messages]
+
+            class _Resp:
+                sent_messages = []
+
+            return _Resp()
+
+        def push_message(self, req):
+            raise AssertionError("primary reply should use reply_message")
+
+    class _FakeApiClient:
+        def __init__(self, _cfg):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(main, "ApiClient", _FakeApiClient)
+    monkeypatch.setattr(main, "MessagingApi", _FakeMessagingApi)
+    monkeypatch.setattr(main, "_get_line_config", lambda: None)
+
+    main._reply("fake_token", "primary reply", group_id="G1")
+
+    assert captured["texts"] == ["primary reply"]
+
+
 def test_reply_bundles_reminder_push_piggyback(monkeypatch):
     import main
     import pending_store

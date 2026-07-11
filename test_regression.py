@@ -1460,8 +1460,8 @@ def test_quota_saver_reminder_uses_regex_without_gemini(monkeypatch):
     )
     monkeypatch.setattr(
         main.memory,
-        "add_reminder",
-        lambda *args, **kwargs: saved.append((args, kwargs)) or 7,
+        "add_reminder_with_outcome",
+        lambda *args, **kwargs: (saved.append((args, kwargs)) or 7, "created"),
     )
 
     main._maybe_extract_reminder(
@@ -1470,6 +1470,60 @@ def test_quota_saver_reminder_uses_regex_without_gemini(monkeypatch):
 
     assert saved
     assert saved[0][0][2] == "預約羽球場"
+
+
+def test_successful_reminder_creation_replies_once_and_stops_chat_routing(monkeypatch):
+    evt = _make_text_event(
+        text="咪寶：提醒我7月16到7月28日在紐西蘭期間要買按摩油"
+    )
+    parsed = {
+        "action": "紐西蘭期間要買（7/16-7/28）：按摩油",
+        "year": 2026,
+        "month": 7,
+        "day": 16,
+        "hour": 9,
+        "minute": 0,
+        "mention_aliases": ["爸爸"],
+    }
+    confirmation = (
+        "已新增提醒\n"
+        "時間：2026-07-16 09:00\n"
+        "事項：紐西蘭期間要買（7/16-7/28）：按摩油\n"
+        "對象：@爸爸"
+    )
+
+    with (
+        patch("main.feedback_collector.in_feedback_window", return_value=False),
+        patch("main._try_one_shot_reply", return_value=True) as mock_one_shot,
+        patch("main._try_handle_calendar_correction", return_value=False),
+        patch("main._detect_user_correction"),
+        patch("knowledge_graph.auto_extract_kg_async"),
+        patch("food_signals.extract_and_store_async"),
+        patch("message_classifier.classify_rule", return_value="other"),
+        patch("message_classifier.update_category"),
+        patch("main._extract_gemini_trigger", return_value=None),
+        patch("main._explicit_range_reminder_result", return_value=parsed),
+        patch("main._auto_capture_text_if_important") as mock_calendar_capture,
+        patch("main._maybe_extract_reminder", return_value=confirmation) as mock_extract,
+        patch("main._handle_command") as mock_command,
+        patch("main.burst_filter.add_to_burst") as mock_burst,
+        patch("main.burst_filter.cancel_burst") as mock_cancel,
+        patch("main._reply") as mock_reply,
+    ):
+        main._handle_text_message(evt, "GRP001")
+
+    mock_calendar_capture.assert_not_called()
+    mock_one_shot.assert_not_called()
+    assert mock_extract.call_args.kwargs["precomputed_result"] == parsed
+    mock_command.assert_not_called()
+    mock_burst.assert_not_called()
+    mock_cancel.assert_called_once_with("GRP001")
+    mock_reply.assert_called_once_with(
+        "TOKEN001",
+        confirmation,
+        group_id="GRP001",
+        allow_push_fallback=False,
+    )
 
 
 def test_quota_saver_classifier_is_rule_only_by_default(monkeypatch):

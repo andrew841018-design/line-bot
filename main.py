@@ -447,7 +447,7 @@ def _local_text_llm_fallback(
     return ""
 
 
-def _llm_chat(
+def _gemini_llm_chat(
     user_input,
     context: list[tuple[str, str]],
     facts: list[str],
@@ -491,6 +491,32 @@ def _llm_chat(
             return out
         return ""
     return gemini_client.chat(user_input, context, facts, pnotes)
+
+
+def _llm_chat(
+    user_input,
+    context: list[tuple[str, str]],
+    facts: list[str],
+    pnotes: list[dict] | None = None,
+) -> str:
+    """Primary cloud route: Claude first, then the existing Gemini chain.
+
+    Claude is opt-in through ``ANTHROPIC_API_KEY``/``CLAUDE_API_KEY``.  The
+    Claude client owns its persisted quota gate and returns ``None`` for quota,
+    unsupported media, or transient failures; all of those paths continue into
+    the unchanged Gemini/local fallback behavior below.
+    """
+    try:
+        from claude_client import chat as claude_chat
+
+        claude_reply = claude_chat(user_input, context, facts, pnotes)
+    except Exception as e:
+        # A provider integration must never block the existing reply path.
+        logger.warning("Claude route failed before Gemini fallback: %s", e)
+        claude_reply = None
+    if claude_reply:
+        return claude_reply
+    return _gemini_llm_chat(user_input, context, facts, pnotes)
 
 
 # ── URL 預抓取（繞過 Gemini url_context 的限制）─────────────────────────────
@@ -2843,6 +2869,7 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
     sender_user_id = getattr(source, "user_id", None) or ""
     message_id = getattr(event.message, "id", "") or ""
     clean_text = _extract_gemini_trigger(text, event.message)
+    range_reminder_result = _explicit_range_reminder_result(text, sender_user_id)
 
     # 回饋收集：20:00 ~ 02:00 TW 窗口內，將文字訊息存入 pending_feedback.json
     if feedback_collector.in_feedback_window():
@@ -2852,7 +2879,7 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
         except Exception as e:
             logger.warning("[Feedback] collect_message failed: %s", e)
 
-    if _try_one_shot_reply(event, group_id):
+    if range_reminder_result is None and _try_one_shot_reply(event, group_id):
         return
 
     # 使用者更正既有行程/提醒時，必須即時回覆並同步改 events + reminders。
@@ -2876,9 +2903,10 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
     # (2026-05-21 user directive: 每條留言自動判定重要性)
     # Cheap pre-filter (regex) → 通過才 spin off thread 跑 Gemini extractor
     # 重跑由 UNIQUE INDEX (group_id, title, event_date) 自動 dedup
-    _auto_capture_text_if_important(
-        group_id, text, sender_user_id, message_id
-    )
+    if range_reminder_result is None:
+        _auto_capture_text_if_important(
+            group_id, text, sender_user_id, message_id
+        )
 
     # 自動抽飲食 / 採購訊號（純規則 fire-and-forget，存 food_db；2026-05-31）
     # 逐則抽、不需 user_id（v1 家庭層級，GP2 A）、不需 pre-filter（無 Gemini quota 顧慮）
@@ -2913,11 +2941,23 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
     except (ImportError, Exception) as e:
         logger.debug("message_classifier skipped: %s", e)
 
-    # 自動偵測 reminder（2026-05-08：含日期 + 時間/行動 hint 才抽，缺時間先當 00:00）
-    # 失敗 silent，不阻塞主流程
-    _maybe_extract_reminder(
-        text, group_id, sender_user_id, message_id
+    # 自動偵測 reminder；成功、重複或排隊都要明確回覆群組。
+    reminder_confirmation = _maybe_extract_reminder(
+        text,
+        group_id,
+        sender_user_id,
+        message_id,
+        precomputed_result=range_reminder_result,
     )
+    if isinstance(reminder_confirmation, str) and reminder_confirmation.strip():
+        burst_filter.cancel_burst(group_id)
+        _reply(
+            event.reply_token,
+            reminder_confirmation,
+            group_id=group_id,
+            allow_push_fallback=False,
+        )
+        return
 
     # 1. 指令處理（指令不需要 @mention 也能用，方便管理）
     cmd_reply = _handle_command(
@@ -6603,8 +6643,184 @@ _REMINDER_TIME_OR_ACTION_HINT = re.compile(
     r"提醒|記得|別忘|要|開會|會議|預約|回診|看診|看醫生|"
     r"訂|買|拿|取|接送|出發|到站|繳|付款|聚餐|報到)"
 )
+_REMINDER_RANGE_RE = re.compile(
+    r"(?:(?P<start_year>\d{4})\s*年\s*)?"
+    r"(?P<start_month>\d{1,2})\s*(?:月|/)\s*(?P<start_day>\d{1,2})\s*(?:日|號)?\s*"
+    r"(?:到|至|[~～\-－—])\s*"
+    r"(?:(?P<end_year>\d{4})\s*年\s*)?"
+    r"(?:(?P<end_month>\d{1,2})\s*(?:月|/)\s*)?"
+    r"(?P<end_day>\d{1,2})\s*(?:日|號)?"
+)
+_RANGE_BUY_RE = re.compile(
+    r"(?:在\s*(?P<location>[^，。；;：:\n]{1,40}?)\s*期間\s*)?"
+    r"要買\s*[:：]?\s*(?P<items>.+)$",
+    re.DOTALL,
+)
 
 _REMINDER_DRAIN_CAP = 5  # GP2 D1b: 每次 drain 最多抽幾筆，攤平 backlog 不燒爆當天額度
+
+
+def _explicit_range_reminder_result(
+    text: str,
+    user_id: str | None = None,
+    now_tw: datetime | None = None,
+) -> dict | None:
+    """Parse explicit date-range shopping reminders without using Gemini."""
+    if not text or not re.search(r"提醒\s*(?:我|我們|一下)?", text):
+        return None
+    range_match = _REMINDER_RANGE_RE.search(text)
+    buy_match = _RANGE_BUY_RE.search(text)
+    if range_match is None or buy_match is None:
+        return None
+
+    from datetime import date as _date
+
+    now_tw = now_tw or datetime.now(ZoneInfo("Asia/Taipei"))
+    try:
+        start_year_raw = range_match.group("start_year")
+        end_year_raw = range_match.group("end_year")
+        start_year = int(start_year_raw or now_tw.year)
+        start_month = int(range_match.group("start_month"))
+        start_day = int(range_match.group("start_day"))
+        end_month = int(range_match.group("end_month") or start_month)
+        end_day = int(range_match.group("end_day"))
+        end_year = int(end_year_raw or start_year)
+        start_date = _date(start_year, start_month, start_day)
+        end_date = _date(end_year, end_month, end_day)
+        if not end_year_raw and end_date < start_date:
+            end_year += 1
+            end_date = _date(end_year, end_month, end_day)
+        if (start_year_raw or end_year_raw) and end_date < now_tw.date():
+            return None
+        if not start_year_raw and not end_year_raw and end_date < now_tw.date():
+            start_year += 1
+            end_year += 1
+            start_date = _date(start_year, start_month, start_day)
+            end_date = _date(end_year, end_month, end_day)
+    except (TypeError, ValueError):
+        return None
+    if end_date < start_date:
+        return None
+
+    reminder_date = start_date if start_date >= now_tw.date() else now_tw.date()
+    hour, minute = 9, 0
+    schedule_segment = text[range_match.end():buy_match.start()]
+    time_match = re.search(
+        r"(?:(?P<period>早上|上午|下午|晚上)\s*)?"
+        r"(?P<hour>\d{1,2})(?:\s*[:：]\s*(?P<minute>\d{2})|\s*點(?:\s*(?P<point_minute>\d{1,2})\s*分?)?)",
+        schedule_segment,
+    )
+    if time_match:
+        hour = int(time_match.group("hour"))
+        minute = int(time_match.group("minute") or time_match.group("point_minute") or 0)
+        period = time_match.group("period") or ""
+        if period in {"下午", "晚上"} and hour < 12:
+            hour += 12
+        if period in {"早上", "上午"} and hour == 12:
+            hour = 0
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    if reminder_date == now_tw.date():
+        candidate = datetime(
+            reminder_date.year,
+            reminder_date.month,
+            reminder_date.day,
+            hour,
+            minute,
+            tzinfo=now_tw.tzinfo,
+        )
+        if candidate <= now_tw:
+            candidate = now_tw + timedelta(minutes=5)
+            hour, minute = candidate.hour, candidate.minute
+
+    raw_items = str(buy_match.group("items") or "")
+    target_metadata = re.search(
+        r"(?:\s*[\n。；;，,]\s*|\s+)對象\s*[:：]",
+        raw_items,
+    )
+    if target_metadata:
+        raw_items = raw_items[:target_metadata.start()]
+    items = re.sub(r"\s+", " ", raw_items).strip("。；; ")
+    if not items:
+        return None
+    location = str(buy_match.group("location") or "").strip()
+    range_label = f"{start_month}/{start_day}-{end_month}/{end_day}"
+    scope = f"{location}期間" if location else "期間"
+    action = f"{scope}要買（{range_label}）：{items}"
+
+    mention_aliases: list[str] = []
+    if re.search(r"提醒\s*我", text):
+        sender_alias = _alias_from_user_id(str(user_id or ""))
+        if sender_alias:
+            mention_aliases.append(sender_alias)
+    target_match = re.search(r"對象\s*[:：]\s*([^\n。；;]+)", text)
+    if target_match:
+        for raw_target in re.split(r"[、,，/與和及\s]+", target_match.group(1)):
+            target = raw_target.strip().lstrip("@＠")
+            if target and target not in mention_aliases:
+                mention_aliases.append(target)
+
+    return {
+        "action": action,
+        "mention_aliases": mention_aliases,
+        "year": reminder_date.year,
+        "month": reminder_date.month,
+        "day": reminder_date.day,
+        "hour": hour,
+        "minute": minute,
+        "range_end": end_date.isoformat(),
+    }
+
+
+def _format_reminder_write_confirmation(
+    outcome: str,
+    action: str,
+    remind_dt: datetime,
+    mention_aliases: list[str] | None = None,
+) -> str:
+    titles = {
+        "created": "已新增提醒",
+        "duplicate": "提醒已存在，未重複新增",
+        "merged": "已更新既有提醒，未重複新增",
+    }
+    lines = [
+        titles.get(outcome, "提醒已處理"),
+        f"時間：{remind_dt.strftime('%Y-%m-%d %H:%M')}",
+        f"事項：{str(action or '').strip()}",
+    ]
+    aliases = [str(alias).strip().lstrip("@") for alias in mention_aliases or []]
+    aliases = [alias for idx, alias in enumerate(aliases) if alias and alias not in aliases[:idx]]
+    if aliases:
+        lines.append("對象：" + "、".join(f"@{alias}" for alias in aliases))
+    return "\n".join(lines)
+
+
+def _format_persisted_reminder_confirmation(
+    outcome: str,
+    reminder_id: int,
+    fallback_action: str,
+    fallback_dt: datetime,
+    fallback_aliases: list[str] | None = None,
+) -> str:
+    persisted = memory.get_reminder(reminder_id)
+    if persisted is None:
+        return _format_reminder_write_confirmation(
+            outcome, fallback_action, fallback_dt, fallback_aliases
+        )
+    saved_dt = datetime.fromtimestamp(
+        int(persisted["remind_at"]), ZoneInfo("Asia/Taipei")
+    )
+    return _format_reminder_write_confirmation(
+        outcome,
+        str(persisted["action"]),
+        saved_dt,
+        persisted.get("mention_aliases") or [],
+    )
+
+
+def _format_queued_reminder_confirmation(already_queued: bool = False) -> str:
+    title = "提醒已在待處理佇列，尚未新增" if already_queued else "提醒已排入待處理，尚未新增"
+    return f"{title}\n完成建立後，會再於群組確認。"
 
 
 def _has_calendar_event_like_content(text: str, today_tw: object | None = None) -> bool:
@@ -6665,21 +6881,23 @@ def _calendar_regex_to_reminder_result(
 
 def _enqueue_reminder_if_candidate(
     text: str, group_id: str, user_id: str, message_id: str | None
-) -> None:
+) -> str | None:
     """quota 爆時的 reminder 補救入隊：只對含日期 + 時間/行動 hint 的訊息入隊，等額度恢復
     由 _drain_pending_reminders 重抽（forward-only，絕不重掃 raw_messages）。失敗
     silent、自包 try/except，絕不可炸掉 caller（GP2 S4-sec：site 1 緊鄰
     _save_pending_any，炸了會連 reply pending 一起丟）。"""
     try:
         if not text or len(text) > 500:
-            return
+            return None
         if not _REMINDER_DATE_HINT.search(text):
-            return
+            return None
         if not _REMINDER_TIME_OR_ACTION_HINT.search(text):
-            return
-        memory.enqueue_pending_reminder(group_id, user_id, text, message_id)
+            return None
+        pending_id = memory.enqueue_pending_reminder(group_id, user_id, text, message_id)
+        return "queued" if pending_id is not None else "already_queued"
     except Exception as e:
         logger.warning("_enqueue_reminder_if_candidate failed: %s", e)
+        return None
 
 
 def _drain_pending_reminders(group_id: str, limit: int = _REMINDER_DRAIN_CAP) -> None:
@@ -6690,9 +6908,8 @@ def _drain_pending_reminders(group_id: str, limit: int = _REMINDER_DRAIN_CAP) ->
     + 跨餓 reply drain。GP2 A2/S1: 用 DB atomic claim（不重用 _try_acquire_drain_slot，
     那 key 無 namespace 會 starve reply drain）。
     """
-    if _quota_exhausted() or not _has_enough_quota_for_retry():
-        return
     from datetime import datetime as _dt
+    quota_available = not _quota_exhausted() and _has_enough_quota_for_retry()
     try:
         memory.drop_stale_pending_reminders(_PENDING_MAX_AGE_SEC, group_id)
         rows = memory.list_pending_reminder_retries(group_id, limit=limit)
@@ -6700,24 +6917,40 @@ def _drain_pending_reminders(group_id: str, limit: int = _REMINDER_DRAIN_CAP) ->
         logger.warning("drain reminders: list failed group=%s: %s", group_id, e)
         return
     for row in rows:
+        local_result = _explicit_range_reminder_result(
+            row["text"],
+            row["user_id"],
+            now_tw=_dt.fromtimestamp(
+                row["created_at"], ZoneInfo("Asia/Taipei")
+            ),
+        )
+        if local_result is None and not quota_available:
+            continue
         pid = row["pending_id"]
-        if not memory.claim_pending_reminder(pid):  # atomic claim：搶不到表示別的 drain 在處理
+        pending_claim_token = memory.claim_pending_reminder(pid)
+        if not pending_claim_token:
             continue
         terminal_written = False
         try:
             # R1: 用訊息「當時」的 created_at 還原 today_iso，解相對日期
-            today_iso = _dt.fromtimestamp(row["created_at"]).strftime("%Y-%m-%d %A")
-            msg_dt = _dt.fromtimestamp(row["created_at"])
-            result = gemini_client.extract_reminder(row["text"], today_iso=today_iso)
+            msg_dt = _dt.fromtimestamp(
+                row["created_at"], ZoneInfo("Asia/Taipei")
+            )
+            today_iso = msg_dt.strftime("%Y-%m-%d %A")
+            result = local_result
+            if result is None:
+                result = gemini_client.extract_reminder(row["text"], today_iso=today_iso)
             if result is None:
                 result = _calendar_regex_to_reminder_result(
                     row["text"], msg_dt.date(), row["user_id"]
                 )
                 if result is None:
-                    memory.mark_pending_reminder(pid, "dropped")  # Gemini 判定非提醒
+                    memory.mark_pending_reminder(
+                        pid, "dropped", pending_claim_token
+                    )
                     terminal_written = True
                     continue
-            else:
+            elif local_result is None:
                 actor = _infer_medical_actor(row["text"], row["user_id"])
                 if actor and "action" in result:
                     companions = _infer_medical_companions(row["text"])
@@ -6731,24 +6964,43 @@ def _drain_pending_reminders(group_id: str, limit: int = _REMINDER_DRAIN_CAP) ->
                 remind_dt = _dt(
                     int(result["year"]), int(result["month"]), int(result["day"]),
                     int(result["hour"]), int(result["minute"]),
+                    tzinfo=ZoneInfo("Asia/Taipei"),
                 )
             except (ValueError, KeyError, TypeError):
-                memory.mark_pending_reminder(pid, "dropped")
+                memory.mark_pending_reminder(pid, "dropped", pending_claim_token)
                 terminal_written = True
                 continue
             remind_at = int(remind_dt.timestamp())
-            if remind_at < _dt.now().timestamp() - 3600:  # 抽出來已過期
-                memory.mark_pending_reminder(pid, "dropped")
+            if remind_at < _dt.now(ZoneInfo("Asia/Taipei")).timestamp() - 3600:
+                memory.mark_pending_reminder(pid, "dropped", pending_claim_token)
                 terminal_written = True
                 continue
-            rid = memory.add_reminder(
-                group_id, row["user_id"], result["action"], remind_at,
-                source_text=row["text"][:200],
-                mention_aliases=result.get("mention_aliases") or [],
+            def _confirmation_factory(write_outcome: str, persisted: dict) -> str:
+                saved_dt = _dt.fromtimestamp(
+                    int(persisted["remind_at"]), ZoneInfo("Asia/Taipei")
+                )
+                return _format_reminder_write_confirmation(
+                    write_outcome,
+                    str(persisted["action"]),
+                    saved_dt,
+                    persisted.get("mention_aliases") or [],
+                )
+
+            rid, outcome, _persisted = (
+                memory.complete_pending_reminder_with_confirmation(
+                    pending_id=pid,
+                    pending_claim_token=pending_claim_token,
+                    group_id=group_id,
+                    user_id=row["user_id"],
+                    action=str(result["action"]),
+                    remind_at=remind_at,
+                    source_text=row["text"],
+                    mention_aliases=result.get("mention_aliases") or [],
+                    confirmation_factory=_confirmation_factory,
+                )
             )
-            memory.mark_pending_reminder(pid, "done")
             terminal_written = True
-            if rid:
+            if outcome == "created":
                 logger.info(
                     "reminder drained: rid=%d action=%r at=%s",
                     rid, result["action"], remind_dt.strftime("%Y-%m-%d %H:%M"),
@@ -6756,21 +7008,25 @@ def _drain_pending_reminders(group_id: str, limit: int = _REMINDER_DRAIN_CAP) ->
         except Exception as e:
             if _is_quota_error(e):
                 _mark_quota_exhausted()
-                memory.release_pending_reminder(pid)
+                memory.release_pending_reminder(pid, pending_claim_token)
                 break  # 額度又爆 → 停本輪，剩下的留待下次
             logger.warning(
                 "drain reminders: release pending_id=%s after failure: %s",
                 pid, str(e)[:160],
             )
             if not terminal_written:
-                memory.release_pending_reminder(pid)
+                memory.release_pending_reminder(pid, pending_claim_token)
             continue
 
 
 def _maybe_extract_reminder(
-    text: str, group_id: str, user_id: str = "", message_id: str | None = None
-) -> None:
-    """偵測 user 訊息中的時間性提醒事項，存進 reminders table。失敗 silent。
+    text: str,
+    group_id: str,
+    user_id: str = "",
+    message_id: str | None = None,
+    precomputed_result: dict | None = None,
+) -> str | None:
+    """Persist a reminder and return an honest group acknowledgement.
 
     流程：regex pre-filter → Gemini light 抽取 → memory.add_reminder
     quota 爆時 extract_reminder raise 429 → 入隊 pending 等恢復補抽（site 2）。
@@ -6782,21 +7038,28 @@ def _maybe_extract_reminder(
         return
     if not _REMINDER_TIME_OR_ACTION_HINT.search(text):
         return
+    local_result = precomputed_result or _explicit_range_reminder_result(text, user_id)
     gemini_allowed = _gemini_side_task_allowed("reminder_extract")
     try:
-        result = gemini_client.extract_reminder(text) if gemini_allowed else None
+        result = local_result
+        if result is None:
+            result = gemini_client.extract_reminder(text) if gemini_allowed else None
         if result is None:
             from datetime import datetime as _dt
             result = _calendar_regex_to_reminder_result(
-                text, _dt.now().date(), user_id
+                text, _dt.now(ZoneInfo("Asia/Taipei")).date(), user_id
             )
             if result is None:
                 if not gemini_allowed:
-                    _enqueue_reminder_if_candidate(
+                    queue_outcome = _enqueue_reminder_if_candidate(
                         text, group_id, user_id, message_id
                     )
+                    if queue_outcome:
+                        return _format_queued_reminder_confirmation(
+                            already_queued=queue_outcome == "already_queued"
+                        )
                 return
-        else:
+        elif local_result is None:
             actor = _infer_medical_actor(text, user_id)
             if actor and "action" in result:
                 companions = _infer_medical_companions(text)
@@ -6815,33 +7078,54 @@ def _maybe_extract_reminder(
                 int(result["day"]),
                 int(result["hour"]),
                 int(result["minute"]),
+                tzinfo=ZoneInfo("Asia/Taipei"),
             )
         except (ValueError, KeyError, TypeError) as e:
             logger.info("reminder datetime parse failed: %s, result=%s", e, result)
             return
         remind_at = int(remind_dt.timestamp())
         # 過去事件不存（已過 1 hr 以上）
-        if remind_at < _dt.now().timestamp() - 3600:
+        if remind_at < _dt.now(ZoneInfo("Asia/Taipei")).timestamp() - 3600:
             return
-        rid = memory.add_reminder(
-            group_id, user_id, result["action"], remind_at, source_text=text[:200],
+        rid, outcome = memory.add_reminder_with_outcome(
+            group_id, user_id, result["action"], remind_at, source_text=text,
             mention_aliases=result.get("mention_aliases") or [],
         )
-        if rid:
+        if outcome == "created":
             logger.info(
                 "reminder saved: rid=%d action=%r at=%s",
                 rid, result["action"], remind_dt.strftime("%Y-%m-%d %H:%M"),
             )
+        return _format_persisted_reminder_confirmation(
+            outcome,
+            rid,
+            str(result["action"]),
+            remind_dt,
+            result.get("mention_aliases") or [],
+        )
     except Exception as e:
         if _is_quota_error(e):
             # site 2 (intra-request flip): 日額度爆 → mark + 入隊等恢復補抽
             _mark_quota_exhausted()
-            _enqueue_reminder_if_candidate(text, group_id, user_id, message_id)
+            queue_outcome = _enqueue_reminder_if_candidate(
+                text, group_id, user_id, message_id
+            )
+            if queue_outcome:
+                return _format_queued_reminder_confirmation(
+                    already_queued=queue_outcome == "already_queued"
+                )
         elif "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
             # transient per-minute 429 → 入隊但不 mark（不可壓死全天額度）
-            _enqueue_reminder_if_candidate(text, group_id, user_id, message_id)
+            queue_outcome = _enqueue_reminder_if_candidate(
+                text, group_id, user_id, message_id
+            )
+            if queue_outcome:
+                return _format_queued_reminder_confirmation(
+                    already_queued=queue_outcome == "already_queued"
+                )
         else:
             logger.warning("_maybe_extract_reminder failed: %s", e)
+        return None
 
 
 # ── Command 處理 ──────────────────────────────────────────────────────────────
@@ -8332,6 +8616,8 @@ def _reply(
         )
     messages_to_send: list = [] if primary_suppressed else [primary_message]
     pending_commit_ids: list[str] = []
+    pending_confirmation_claims: list[tuple[int, str]] = []
+    confirmations_committed = False
     pending_reminders: list[tuple[str, int]] = []  # (event_id, offset) — reply 成功才 mark
     pending_reminder_pushes: list[tuple[int, str]] = []  # (reminder_id, stage) — reply 成功才 mark
     pending_slot = None
@@ -8388,6 +8674,45 @@ def _reply(
                                 "piggyback skip: pending=%d but no text entry rendered group=%s",
                                 pending_count, group_id,
                             )
+            # Reminder creation acknowledgements are durable and ride on a
+            # normal reply. They never intercept an unrelated inbound message
+            # and are deleted only after LINE accepts this reply.
+            if messages_to_send and len(messages_to_send) < 5:
+                confirmation_start = len(messages_to_send)
+                try:
+                    remaining = 5 - len(messages_to_send)
+                    confirmations = memory.claim_reminder_confirmations(
+                        group_id, limit=remaining
+                    )
+                    for confirmation in confirmations:
+                        claim = (
+                            int(confirmation["confirmation_id"]),
+                            str(confirmation["claim_token"]),
+                        )
+                        pending_confirmation_claims.append(claim)
+                        _confirmation_text, confirmation_message = (
+                            _text_message_with_mentions(
+                                confirmation["text"],
+                                validation_source="reminder_confirmation_mentions",
+                                limit=5000,
+                                explicit_only=True,
+                            )
+                        )
+                        messages_to_send.append(confirmation_message)
+                except Exception as e:
+                    del messages_to_send[confirmation_start:]
+                    if pending_confirmation_claims:
+                        try:
+                            memory.release_reminder_confirmations(
+                                group_id, pending_confirmation_claims
+                            )
+                        except Exception as release_error:
+                            logger.warning(
+                                "reminder confirmation recovery failed: %s",
+                                release_error,
+                            )
+                    pending_confirmation_claims = []
+                    logger.warning("reminder confirmation piggyback skipped: %s", e)
             if _reminder_reply_piggyback_enabled():
                 # Step 2: 剩餘 slot 給 due reminders (legacy quota fallback)
                 try:
@@ -8508,6 +8833,22 @@ def _reply(
                     group_id, e,
                 )
 
+        if pending_confirmation_claims and group_id:
+            try:
+                deleted = memory.delete_sent_reminder_confirmations(
+                    group_id, pending_confirmation_claims
+                )
+                confirmations_committed = deleted == len(pending_confirmation_claims)
+                if not confirmations_committed:
+                    logger.error(
+                        "reminder confirmations deleted %d/%d group=%s",
+                        deleted,
+                        len(pending_confirmation_claims),
+                        group_id,
+                    )
+            except Exception as e:
+                logger.warning("reminder confirmation commit failed: %s", e)
+
         # reply 成功 → mark reminders (peek-then-confirm pattern)
         if pending_reminders:
             try:
@@ -8551,6 +8892,13 @@ def _reply(
                     sent_text = getattr(messages_to_send[idx], "text", text)
                 memory.log_raw_message(group_id, sm_id, "__bot__", sent_text)
     finally:
+        if pending_confirmation_claims and group_id and not confirmations_committed:
+            try:
+                memory.release_reminder_confirmations(
+                    group_id, pending_confirmation_claims
+                )
+            except Exception as e:
+                logger.warning("reminder confirmation release failed: %s", e)
         if pending_slot is not None:
             pending_slot.release()
 

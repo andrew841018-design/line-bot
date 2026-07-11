@@ -13,7 +13,7 @@ Env loader.
 
 from __future__ import annotations
 
-from pydantic import Field, computed_field, field_validator, model_validator
+from pydantic import AliasChoices, Field, computed_field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -47,6 +47,49 @@ class Settings(BaseSettings):
     # 「輕活」模型（classifier / fact 抽取 / Layer 2 規則生成）
     # 預設 flash-lite，免費額度 1000/天，跟 flash 完全獨立不互相吃
     gemini_light_model: str = "gemini-2.5-flash-lite"
+
+    # ── Claude（optional primary cloud provider）───────────────────────────
+    # Claude is attempted before Gemini for main replies when a key is set.
+    # Multiple aliases keep local `.env` and the lifecycle agent convention
+    # compatible without duplicating secrets.
+    claude_api_key: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "claude_api_key",
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_API_KEY",
+            "AGENT_CLAUDE_API_KEY",
+        ),
+    )
+    claude_model: str = Field(
+        default="claude-sonnet-4-5-20250929",
+        validation_alias=AliasChoices(
+            "claude_model",
+            "ANTHROPIC_MODEL",
+            "CLAUDE_MODEL",
+            "AGENT_CLAUDE_MODEL",
+        ),
+    )
+    # A quota/rate-limit gate is persisted across restarts. Keep this
+    # configurable because billing reset and rate-limit windows differ.
+    claude_quota_cooldown_sec: int = Field(
+        default=3600,
+        validation_alias="CLAUDE_QUOTA_COOLDOWN_SEC",
+    )
+    claude_request_timeout_sec: int = Field(
+        default=20,
+        validation_alias="CLAUDE_REQUEST_TIMEOUT_SEC",
+    )
+    claude_cli_timeout_sec: int = Field(
+        default=60,
+        validation_alias="CLAUDE_CLI_TIMEOUT_SEC",
+    )
+    # Optional account-session route. The client auto-enables this after an
+    # API billing-balance error, but the flag also supports CLI-only setups.
+    claude_use_cli: bool = Field(
+        default=False,
+        validation_alias="CLAUDE_USE_CLI",
+    )
 
     # ── SQLite（本地持久化檔案）───────────────────────────────────────────────
     sqlite_path: str = "line_bot.db"
