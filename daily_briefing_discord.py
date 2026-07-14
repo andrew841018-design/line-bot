@@ -428,25 +428,50 @@ def _select_daily_tech_topic(state: dict, today: str):
     return idx, topic, status, state
 
 
-def _format_daily_tech_note(idx: int, topic: dict, status: str) -> str:
+def _format_daily_tech_note(idx: int, topic: dict, status: str, due_reviews=None) -> str:
     lines = [
         f"🧠 **每日技術筆記**（{idx + 1}/{len(_TECH_NOTE_TOPICS)}）",
         f"主題：**{topic['title']}**",
         f"為什麼學：{topic['why']}",
+        "先不看筆記，用自己的話回答：它是什麼、主要負責什麼、核心組成或為什麼重要？",
         "今天搞懂：",
     ]
     for point in topic["points"]:
         lines.append(f"• {point}")
     lines += [
-        "筆記摘要格式：定義 / 專案用在哪 / 一個坑 / 面試講法",
+        "修正版格式：定義 / 專案用在哪 / 一個坑 / 面試講法",
+        "學習閉環：無提示初答 → 回饋 → 自己修正版 → 核可 → D+1/D+3/D+7/D+14 一分鐘回想",
     ]
+    if due_reviews:
+        lines.append("今日到期回想（先不看舊答案）：")
+        lines.extend(f"• {label}：{title}" for label, title in due_reviews)
     if status == "approved_today":
         lines.append("狀態：今天已核可，明天換下一題。")
     elif status == "completed":
         lines.append("狀態：這輪題庫已完成；可以整理總複習或補新題庫。")
     else:
-        lines.append("狀態：等你丟筆記摘要，我確認 OK 後才前進。")
+        lines.append("狀態：等你先無提示作答；修正版確認 OK 後才前進。")
     return "\n".join(lines)
+
+
+def _tech_note_review_schedule(approved_on: str) -> dict:
+    base = datetime.strptime(approved_on, "%Y-%m-%d").date()
+    return {f"D+{days}": (base + timedelta(days=days)).isoformat() for days in (1, 3, 7, 14)}
+
+
+def _due_tech_note_reviews(state: dict, today: str) -> list:
+    schedules = state.get("review_schedules")
+    if not isinstance(schedules, dict):
+        return []
+    titles = {topic["id"]: topic["title"] for topic in _TECH_NOTE_TOPICS}
+    due = []
+    for topic_id, schedule in schedules.items():
+        if not isinstance(schedule, dict):
+            continue
+        for label, due_on in schedule.items():
+            if due_on == today:
+                due.append((label, titles.get(topic_id, topic_id)))
+    return due
 
 
 def daily_tech_note(now=None, state_path=None) -> str:
@@ -456,8 +481,9 @@ def daily_tech_note(now=None, state_path=None) -> str:
     idx, topic, status, state = _select_daily_tech_topic(state, today)
     if "current_started_on" not in state:
         state["current_started_on"] = today
+    due_reviews = _due_tech_note_reviews(state, today)
     _save_tech_note_state(state, state_path)
-    return _format_daily_tech_note(idx, topic, status)
+    return _format_daily_tech_note(idx, topic, status, due_reviews)
 
 
 def approve_daily_tech_note(now=None, state_path=None, summary: str = "") -> str:
@@ -473,10 +499,17 @@ def approve_daily_tech_note(now=None, state_path=None, summary: str = "") -> str
     state["approved_topics"] = approved
     state["last_approved_topic_id"] = topic["id"]
     state["last_approved_on"] = today
+    review_schedules = state.get("review_schedules")
+    if not isinstance(review_schedules, dict):
+        review_schedules = {}
+    schedule = _tech_note_review_schedule(today)
+    review_schedules[topic["id"]] = schedule
+    state["review_schedules"] = review_schedules
     if summary:
         state["last_approved_summary"] = summary[:500]
     _save_tech_note_state(state, state_path)
-    return f"🧠 每日技術筆記：{topic['title']} 已核可；明天換下一題。"
+    schedule_text = " / ".join(f"{label} {due_on}" for label, due_on in schedule.items())
+    return f"🧠 每日技術筆記：{topic['title']} 已核可；明天換下一題。間隔回想：{schedule_text}。"
 
 
 # ── 2. 爬蟲狀態 ──────────────────────────────────────────────────────────────

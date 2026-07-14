@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 
 import daily_briefing_discord as dbd
@@ -30,9 +31,12 @@ def test_daily_tech_note_initializes_first_topic(tmp_path):
     )
 
     assert "🧠 **每日技術筆記**" in msg
+    assert "先不看筆記" in msg
+    assert "無提示初答" in msg
+    assert "D+1/D+3/D+7/D+14" in msg
     assert "1/" in msg
     assert dbd._TECH_NOTE_TOPICS[0]["title"] in msg
-    assert "等你丟筆記摘要" in msg
+    assert "等你先無提示作答" in msg
     assert state_path.exists()
 
 
@@ -75,10 +79,20 @@ def test_daily_tech_note_approved_today_advances_tomorrow(tmp_path):
     )
 
     assert "已核可" in approved
+    state = json.loads(state_path.read_text())
+    assert state["review_schedules"]["mini-project-architecture"] == {
+        "D+1": "2026-06-01",
+        "D+3": "2026-06-03",
+        "D+7": "2026-06-07",
+        "D+14": "2026-06-14",
+    }
+    assert "D+1 2026-06-01" in approved
     assert dbd._TECH_NOTE_TOPICS[0]["title"] in same_day
     assert "明天換下一題" in same_day
-    assert dbd._TECH_NOTE_TOPICS[1]["title"] in next_day
-    assert dbd._TECH_NOTE_TOPICS[0]["title"] not in next_day
+    assert f"主題：**{dbd._TECH_NOTE_TOPICS[1]['title']}**" in next_day
+    assert "今日到期回想（先不看舊答案）" in next_day
+    assert "D+1：Mini Project End-to-End Architecture" in next_day
+    assert f"主題：**{dbd._TECH_NOTE_TOPICS[0]['title']}**" not in next_day
 
 
 def test_approve_daily_tech_note_is_idempotent_for_current_topic(tmp_path):

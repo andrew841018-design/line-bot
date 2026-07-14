@@ -13,6 +13,8 @@ Env loader.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from pydantic import AliasChoices, Field, computed_field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -93,6 +95,21 @@ class Settings(BaseSettings):
 
     # ── SQLite（本地持久化檔案）───────────────────────────────────────────────
     sqlite_path: str = "line_bot.db"
+
+    @field_validator("sqlite_path", mode="before")
+    @classmethod
+    def _resolve_sqlite_path(cls, value: str) -> str:
+        """Anchor relative SQLite paths to the bot package, not process cwd.
+
+        launchd jobs and webhook workers can have different working directories;
+        a relative path therefore risks opening a second database or failing to
+        open one at all. Explicit absolute paths remain unchanged.
+        """
+        raw = str(value or "line_bot.db").strip()
+        path = Path(raw).expanduser()
+        if path.is_absolute():
+            return str(path)
+        return str((Path(__file__).resolve().parent / path).resolve())
 
     # ── 群組白名單 ─────────────────────────────────────────────────────────
     # allowed_group_id（單數，legacy real field）：保留為 mutable 欄位，現有 5 個
