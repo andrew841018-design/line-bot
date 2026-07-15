@@ -31,6 +31,18 @@ from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+# Internal modules read selected settings during import, so load the local
+# environment before importing them.
+try:
+    from dotenv import load_dotenv as _load_dotenv
+
+    _load_dotenv(
+        dotenv_path=os.path.join(os.path.dirname(__file__), ".env"),
+        override=False,
+    )
+except ImportError:
+    pass
+
 import requests as _requests
 from bs4 import BeautifulSoup
 
@@ -70,6 +82,7 @@ from linebot.v3.webhooks import (  # type: ignore[import-untyped]
 
 import burst_filter
 import feedback_collector
+import food_safety_client
 import gemini_client
 import memory
 import output_validator
@@ -106,6 +119,7 @@ logger = logging.getLogger("line_bot")
 @asynccontextmanager
 async def _app_lifespan(_app: FastAPI):
     """Run the same startup hooks previously registered via app.on_event."""
+    food_safety_client.warm_cache_async()
     if os.getenv("JOBS_ROUTES_ENABLED") == "1":
         from jobs_router import startup_sweep as _ss
         _ss()
@@ -118,12 +132,6 @@ app = FastAPI(lifespan=_app_lifespan)
 
 # Optional jobs router (n8n / external scheduler trigger surface).
 # Feature flag: JOBS_ROUTES_ENABLED=1 enables /jobs/* endpoints.
-# Load .env explicitly because pydantic-settings doesn't push to os.environ.
-try:
-    from dotenv import load_dotenv as _load_dotenv
-    _load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"), override=False)
-except ImportError:
-    pass
 if os.getenv("JOBS_ROUTES_ENABLED") == "1":
     from jobs_router import router as jobs_router
     app.include_router(jobs_router)
@@ -191,6 +199,38 @@ _OUTBOUND_INTERNAL_TRACE_MARKERS = (
 
 _reply_mention_targets_lock = threading.Lock()
 _reply_mention_targets_by_token: dict[str, list] = {}
+
+_inbound_reply_lock = threading.Lock()
+_inbound_reply_by_token: dict[str, tuple[str, str, float]] = {}
+
+
+def _register_inbound_reply_token(
+    reply_token: str | None, group_id: str, message_id: str
+) -> None:
+    """Keep the inbound-event identity available to burst reply threads."""
+    if not reply_token or not group_id or not message_id:
+        return
+    now = time.time()
+    with _inbound_reply_lock:
+        stale = [
+            token
+            for token, (_, _, seen_at) in _inbound_reply_by_token.items()
+            if now - seen_at > 180
+        ]
+        for token in stale:
+            _inbound_reply_by_token.pop(token, None)
+        _inbound_reply_by_token[str(reply_token)] = (group_id, message_id, now)
+
+
+def _mark_inbound_reply_succeeded(reply_token: str | None) -> None:
+    """Persist reply success so future LINE redelivery can be safely skipped."""
+    if not reply_token:
+        return
+    with _inbound_reply_lock:
+        event = _inbound_reply_by_token.pop(str(reply_token), None)
+    if event is not None:
+        group_id, message_id, _ = event
+        memory.mark_inbound_event_replied(group_id, message_id)
 
 
 def _extract_reply_payload_targets(message: TextMessageContent) -> list:
@@ -1769,24 +1809,10 @@ def _handle_event(event) -> None:
         return
 
     # ── 重送事件處理 ──────────────────────────────────────────────────────
-    # 隧道斷線期間 LINE 送不進來的訊息,恢復後會帶 is_redelivery=True 重新投遞。
-    # 不能無腦跳過 — 查 raw_messages,如果我們從沒收過,就要補處理。
-    # reply_token 一定已過期,但 _reply 會 fallback 到 push_message。
+    # raw_messages 會在路由前寫入，不能用它判斷是否已成功回覆。只有
+    # LINE 已接受回覆才跳過；短暫 processing lease 擋同時重送，過期則重試。
     dctx = getattr(event, "delivery_context", None)
     is_redelivery = bool(dctx and getattr(dctx, "is_redelivery", False))
-    if is_redelivery:
-        msg = getattr(event, "message", None)
-        msg_id = getattr(msg, "id", None) if msg else None
-        gid = event.source.group_id
-        if msg_id and gid:
-            existing = memory.get_raw_message(gid, msg_id)
-            if existing is not None:
-                logger.info("skip truly-duplicate redelivery msg_id=%s", msg_id)
-                return
-            logger.info("processing missed redelivery msg_id=%s group=%s", msg_id, gid)
-        else:
-            logger.info("skip redelivered event (no msg_id)")
-            return
 
     group_id = event.source.group_id
 
@@ -1798,6 +1824,26 @@ def _handle_event(event) -> None:
         return
 
     msg = event.message
+    msg_id = getattr(msg, "id", None) if msg else None
+    if not msg_id:
+        if is_redelivery:
+            logger.info("skip redelivered event (no msg_id)")
+            return
+    else:
+        inbound_state = memory.begin_inbound_event(group_id, msg_id)
+        if is_redelivery and inbound_state in {"replied", "processing"}:
+            logger.info(
+                "skip redelivery state=%s msg_id=%s", inbound_state, msg_id
+            )
+            return
+        if is_redelivery:
+            logger.info(
+                "processing %s redelivery msg_id=%s group=%s",
+                inbound_state,
+                msg_id,
+                group_id,
+            )
+        _register_inbound_reply_token(event.reply_token, group_id, msg_id)
     sender_user_id = getattr(event.source, "user_id", None)
 
     # ── quota 爆時：非文字內容不排 pending reply ────────────────────────
@@ -2079,6 +2125,7 @@ def _try_piggyback_reminders_fast_path(
                         reply_token=reply_token, messages=messages,
                     )
                 )
+            _mark_inbound_reply_succeeded(reply_token)
         except Exception as e:
             logger.warning(
                 "reminder fast-path reply failed (reminders preserved): %s",
@@ -2990,6 +3037,10 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
         return
 
     # 4. 晚餐推薦觸發
+    if _handle_restaurant_food_safety(event, group_id, text):
+        burst_filter.cancel_burst(group_id)
+        return
+
     if _is_dinner_question(text):
         burst_filter.cancel_burst(group_id)
         _handle_dinner_recommendation(event, group_id)
@@ -3117,6 +3168,7 @@ def _handle_image_gen(event: MessageEvent, group_id: str, subject: str) -> None:
                         )],
                     )
                 )
+            _mark_inbound_reply_succeeded(event.reply_token)
             memory.append_turn(group_id, "user", f"[圖片生成] {subject}")
             _append_bot_turn(group_id, f"[已傳圖] {img_url}")
         except Exception as e:
@@ -3849,6 +3901,7 @@ def _handle_todo_query(
                         messages=[message],
                     )
                 )
+            _mark_inbound_reply_succeeded(event.reply_token)
         logger.info("todo query reply sent group=%s", group_id)
     except Exception as e:
         logger.warning("todo query reply failed: %s", e)
@@ -4013,6 +4066,7 @@ def _handle_calendar_query(
                         messages=[message],
                     )
                 )
+            _mark_inbound_reply_succeeded(event.reply_token)
         logger.info("calendar query reply sent group=%s", group_id)
     except Exception as e:
         logger.warning("calendar query reply failed: %s", e)
@@ -5441,6 +5495,7 @@ def _try_one_shot_reply(event: MessageEvent, group_id: str) -> bool:
                     messages=[message],
                 )
             )
+        _mark_inbound_reply_succeeded(event.reply_token)
     except Exception as e:
         logger.warning("one-shot reply failed; preserved group=%s: %s", group_id, str(e)[:300])
         return False
@@ -7145,6 +7200,43 @@ def _is_dinner_question(text: str) -> bool:
     return any(kw in text for kw in _DINNER_KEYWORDS)
 
 
+def _handle_restaurant_food_safety(
+    event: MessageEvent,
+    group_id: str,
+    text: str,
+) -> bool:
+    """Check a named restaurant before dinner/order-related group replies."""
+    lookup_text = text
+    try:
+        source = getattr(event, "source", None)
+        sender_id = getattr(source, "user_id", None)
+        message = getattr(event, "message", None)
+        message_text = getattr(message, "text", None)
+        lookup_text = (
+            _strip_mentions(message) if isinstance(message_text, str) else text
+        )
+        reply_text = food_safety_client.check_restaurant_message(
+            lookup_text,
+            group_id=group_id,
+            sender_id=sender_id,
+        )
+    except Exception as exc:
+        logger.warning("restaurant food-safety lookup skipped: %s", exc)
+        if food_safety_client.should_fail_closed_on_lookup_error(lookup_text):
+            _reply(
+                event.reply_token,
+                food_safety_client.official_dataset_unavailable_message(),
+                group_id=group_id,
+                allow_push_fallback=False,
+            )
+            return True
+        return False
+    if not reply_text:
+        return False
+    _reply(event.reply_token, reply_text, group_id=group_id, allow_push_fallback=False)
+    return True
+
+
 _DINNER_PROMPT = """你是台北美食達人，以善導寺捷運站（台北市中正區）為中心，推薦附近步行可達的晚餐餐廳。
 
 以下餐廳請勿推薦：喜來登、阜杭豆漿、雙月食品社。
@@ -8075,6 +8167,18 @@ def _extract_gemini_trigger(text: str, message: TextMessageContent) -> str | Non
     return None
 
 
+def _utf16_offset_to_python_index(text: str, offset: int) -> int:
+    """Convert LINE's UTF-16 code-unit offset into a Python string index."""
+    if offset <= 0:
+        return 0
+    units = 0
+    for index, character in enumerate(text):
+        units += 2 if ord(character) > 0xFFFF else 1
+        if units >= offset:
+            return index + 1
+    return len(text)
+
+
 def _strip_mentions(message: TextMessageContent) -> str:
     """把訊息裡所有 @mention 的子字串挖掉，只留真正的問題。"""
     text = message.text or ""
@@ -8084,7 +8188,13 @@ def _strip_mentions(message: TextMessageContent) -> str:
     mentionees = getattr(mention, "mentionees", None) or []
     # 從後往前刪，避免 index 位移
     ranges = sorted(
-        [(m.index, m.index + m.length) for m in mentionees],
+        [
+            (
+                _utf16_offset_to_python_index(text, m.index),
+                _utf16_offset_to_python_index(text, m.index + m.length),
+            )
+            for m in mentionees
+        ],
         key=lambda x: x[0],
         reverse=True,
     )
@@ -8248,6 +8358,7 @@ def _try_piggyback_drain_with_reply_token(
                         reply_token=reply_token, messages=messages,
                     )
                 )
+            _mark_inbound_reply_succeeded(reply_token)
         except Exception as e:
             logger.warning(
                 "quota-exhausted piggyback reply failed (pending preserved): %s",
@@ -8775,6 +8886,7 @@ def _reply(
                         messages=messages_to_send,
                     )
                 )
+                _mark_inbound_reply_succeeded(reply_token)
         except Exception as e:
             logger.warning("reply failed: %s", str(e)[:300])
             if group_id and not _is_definite_reply_token_error(e):
@@ -8810,6 +8922,7 @@ def _reply(
                             )
                         )
                     logger.info("fallback push_message sent to group=%s", group_id)
+                    _mark_inbound_reply_succeeded(reply_token)
                     memory.log_raw_message(
                         group_id, f"push_{int(time.time() * 1000)}", "__bot__", text
                     )

@@ -151,22 +151,23 @@ def test_handle_event_redelivery():
     msg = _make_text_msg()
     evt = _make_message_event(msg, redelivery=True)
 
-    # 已存在 → skip
+    # 只有 durable reply success 才能 skip；raw_messages 已存在不代表已回覆。
     with (
-        patch("main.memory.get_raw_message", return_value=("text", "舊訊息")),
+        patch("main.memory.begin_inbound_event", return_value="retry"),
         patch("main.memory.log_raw_message") as mock_log,
+        patch("main._handle_text_message") as mock_handle,
     ):
         main._handle_event(evt)
-    check("redelivery 已存在 → skip", not mock_log.called)
+    check("redelivery processing state → retry", mock_log.called and mock_handle.called)
 
-    # 不存在 → 補處理
+    # 已確認回覆成功 → 安全跳過
     with (
-        patch("main.memory.get_raw_message", return_value=None),
+        patch("main.memory.begin_inbound_event", return_value="replied"),
         patch("main.memory.log_raw_message") as mock_log2,
-        patch("main._handle_text_message"),
+        patch("main._handle_text_message") as mock_handle2,
     ):
         main._handle_event(evt)
-    check("redelivery 不存在 → log raw", mock_log2.called)
+    check("redelivery replied state → skip", not mock_log2.called and not mock_handle2.called)
 
 
 def test_handle_event_message_types():
@@ -266,6 +267,7 @@ def test_handle_text_message():
     evt2 = _make_message_event(msg2)
     with (
         patch("main._handle_command", return_value=None),
+        patch("main._handle_restaurant_food_safety", return_value=False),
         patch("main._is_dinner_question", return_value=True),
         patch("main.burst_filter.cancel_burst"),
         patch("main._handle_dinner_recommendation") as mock_dinner,

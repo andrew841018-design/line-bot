@@ -91,6 +91,16 @@ def _init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_raw_messages_time
                 ON raw_messages(group_id, created_at);
+            CREATE TABLE IF NOT EXISTS inbound_events (
+                group_id    TEXT NOT NULL,
+                message_id  TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                created_at  INTEGER NOT NULL,
+                updated_at  INTEGER NOT NULL,
+                PRIMARY KEY (group_id, message_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_inbound_events_updated
+                ON inbound_events(updated_at);
             CREATE TABLE IF NOT EXISTS raw_message_meta (
                 group_id    TEXT NOT NULL,
                 message_id  TEXT NOT NULL,
@@ -487,6 +497,61 @@ def store_fact_cache(group_id: str, text: str, result: str) -> None:
 # ── 計數器（決定何時觸發事實抽取）──────────────────────────────────────────
 
 _RAW_MESSAGE_KEEP = 2000  # 每群組保留最近 N 筆原始訊息（給 quote-reply 查詢用）
+
+# raw_messages is written before routing, so it cannot prove that LINE got a
+# reply. Keep a short processing lease for concurrent redeliveries, then allow
+# a later delivery to retry an event that never reached a successful reply.
+_INBOUND_PROCESSING_LEASE_SECONDS = 30
+_INBOUND_EVENT_RETENTION_SECONDS = 14 * 86400
+
+
+def begin_inbound_event(group_id: str, message_id: str) -> str:
+    """Claim an inbound event: ``new``, ``processing``, ``retry`` or ``replied``."""
+    if not group_id or not message_id:
+        return "new"
+    now = int(_time.time())
+    with _lock, _conn() as c:
+        c.execute(
+            "DELETE FROM inbound_events WHERE updated_at < ?",
+            (now - _INBOUND_EVENT_RETENTION_SECONDS,),
+        )
+        row = c.execute(
+            "SELECT status, updated_at FROM inbound_events "
+            "WHERE group_id = ? AND message_id = ?",
+            (group_id, message_id),
+        ).fetchone()
+        if row is None:
+            c.execute(
+                "INSERT INTO inbound_events "
+                "(group_id, message_id, status, created_at, updated_at) "
+                "VALUES (?, ?, 'processing', ?, ?)",
+                (group_id, message_id, now, now),
+            )
+            return "new"
+        status, updated_at = row
+        if status == "replied":
+            return "replied"
+        if now - int(updated_at) < _INBOUND_PROCESSING_LEASE_SECONDS:
+            return "processing"
+        c.execute(
+            "UPDATE inbound_events SET status = 'processing', updated_at = ? "
+            "WHERE group_id = ? AND message_id = ?",
+            (now, group_id, message_id),
+        )
+        return "retry"
+
+
+def mark_inbound_event_replied(group_id: str, message_id: str) -> None:
+    """Record that LINE accepted a reply for an inbound event."""
+    if not group_id or not message_id:
+        return
+    now = int(_time.time())
+    with _lock, _conn() as c:
+        c.execute(
+            "UPDATE inbound_events SET status = 'replied', updated_at = ? "
+            "WHERE group_id = ? AND message_id = ?",
+            (now, group_id, message_id),
+        )
 
 
 def log_raw_message(
