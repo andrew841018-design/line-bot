@@ -63,6 +63,21 @@ def test_multiple_slash_dates_share_tail_title():
     ]
 
 
+def test_multiple_slash_dates_support_daypart_and_inline_time_range():
+    out = calendar_regex.extract_many_regex_only(
+        "8/1下午 打羽球\n8/2晚上打壁球19:00-20:00",
+        date(2026, 7, 17),
+        require_time=True,
+    )
+
+    assert [
+        (item["date"], item["time"], item["title"]) for item in out
+    ] == [
+        ("2026-08-01", "15:00", "打羽球"),
+        ("2026-08-02", "19:00", "打壁球"),
+    ]
+
+
 def test_work_iso_format_rejected():
     """ISO 日期格式的工作事件也要拒絕。"""
     out = calendar_regex.extract_regex_only(

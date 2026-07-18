@@ -1526,6 +1526,41 @@ def test_successful_reminder_creation_replies_once_and_stops_chat_routing(monkey
     )
 
 
+def test_add_reminder_followup_uses_previous_message_and_stops_chat_routing(monkeypatch):
+    evt = _make_text_event(text="咪寶：新增提醒")
+    previous_text = "8/1下午 打羽球\n8/2晚上打壁球19:00-20:00"
+    recent = [
+        ("PREV001", "USR001", previous_text, int(time.time()) - 30),
+        ("MSG001", "USR001", evt.message.text, int(time.time())),
+    ]
+
+    with (
+        patch("main.datetime", _FixedDateTime),
+        patch("main.feedback_collector.in_feedback_window", return_value=False),
+        patch("main.memory.get_recent_raw_messages", return_value=recent),
+        patch("main._try_one_shot_reply", return_value=False),
+        patch("main._try_handle_calendar_correction", return_value=False),
+        patch("main._detect_user_correction"),
+        patch("knowledge_graph.auto_extract_kg_async"),
+        patch("food_signals.extract_and_store_async"),
+        patch("message_classifier.classify_rule", return_value="other"),
+        patch("message_classifier.update_category"),
+        patch("main._auto_capture_text_if_important"),
+        patch("main._maybe_extract_reminder", return_value=None),
+        patch("main._handle_explicit_text") as mock_explicit,
+        patch("main._reply") as mock_reply,
+    ):
+        main._handle_text_message(evt, "GRP001")
+
+    mock_explicit.assert_not_called()
+    mock_reply.assert_called_once()
+    confirmation = mock_reply.call_args.args[1]
+    assert confirmation.startswith("已新增 2 筆提醒")
+    assert "2026-08-01 15:00 打羽球" in confirmation
+    assert "2026-08-02 19:00 打壁球" in confirmation
+    assert "我沒有設定提醒的功能" not in confirmation
+
+
 def test_quota_saver_classifier_is_rule_only_by_default(monkeypatch):
     import message_classifier
 

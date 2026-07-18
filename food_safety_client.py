@@ -244,6 +244,14 @@ _DIRECT_NAME_EXCLUSION_RE = re.compile(
 )
 _BOT_ADDRESS_RE = re.compile(r"^(?:米堡|米寶|咪寶|咪宝)[，,、:：\s]*")
 _QUERY_EDGE_CHARS = " \t，,、：:。！？!?；;"
+_URL_IN_TEXT_RE = re.compile(r"(?:https?://|www\.)", re.IGNORECASE)
+_BARE_SCHEDULE_RE = re.compile(
+    r"^(?:\d{4}-\d{1,2}-\d{1,2}|\d{1,2}/\d{1,2}|\d{1,2}月\d{1,2}日)(?=$|\D)"
+)
+_BARE_SCHEDULE_ACTION_RE = re.compile(
+    r"打(?:羽球|壁球|球)|羽球|壁球|聚餐|一起吃飯|吃飯|行程|活動|"
+    r"開會|會議|看醫生|回診|出發|到站|預約場地"
+)
 
 # These are conversational wrappers rather than food/store vocabulary. The
 # parser repeatedly removes them from the edges, which lets new combinations
@@ -966,7 +974,23 @@ def _catalog_subject(text: str, *, max_length: int = 100) -> str:
 
 def _direct_catalog_subject(text: str) -> str:
     """Accept a bare store/product token, not a conversational sentence."""
-    subject = _catalog_subject(text, max_length=40)
+    cleaned = _BOT_ADDRESS_RE.sub("", _without_leading_mentions(text)).strip(
+        _QUERY_EDGE_CHARS
+    )
+    if _URL_IN_TEXT_RE.search(cleaned):
+        return ""
+    if (
+        _BARE_SCHEDULE_RE.search(cleaned)
+        and (
+            _BARE_SCHEDULE_ACTION_RE.search(cleaned)
+            or (
+                not _FOOD_SUBJECT_HINT_RE.search(cleaned)
+                and not _MERCHANT_SHAPE_RE.search(cleaned)
+            )
+        )
+    ):
+        return ""
+    subject = _catalog_subject(cleaned, max_length=40)
     if (
         not subject
         or _DIRECT_CATALOG_PROSE_RE.search(subject)

@@ -988,7 +988,14 @@ def test_direct_unmatched_food_or_store_returns_official_no_match(monkeypatch):
     )
     food_safety_client.reset_cache()
 
-    for subject in ("乳香世家牛奶", "水餃", "蒸餃", "便當", "全新餐館"):
+    for subject in (
+        "乳香世家牛奶",
+        "水餃",
+        "蒸餃",
+        "便當",
+        "全新餐館",
+        "7/11鮪魚飯糰",
+    ):
         reply = food_safety_client.check_restaurant_message(subject)
         assert reply is not None
         assert f"查無「{subject}」" in reply
@@ -1291,6 +1298,24 @@ def test_non_food_safety_questions_do_not_route_or_fetch(monkeypatch):
         "這個網站安全嗎",
         "台積電安全嗎",
         "手機能買嗎",
+    ):
+        assert food_safety_client.check_restaurant_message(text) is None
+
+    get.assert_not_called()
+
+
+def test_url_and_calendar_schedule_do_not_route_or_fetch(monkeypatch):
+    get = Mock(side_effect=AssertionError("non-food text must not fetch dataset"))
+    monkeypatch.setattr(food_safety_client.requests, "get", get)
+    food_safety_client.reset_cache()
+
+    for text in (
+        "https://vt.tiktok.com/ZSXPy5qv2/",
+        "https://example.com/article?id=1",
+        "8/1下午 打羽球\n8/2晚上打壁球19:00-20:00",
+        "8/1打羽球",
+        "8/1晚上全家聚餐",
+        "咪寶 8/1應該可以",
     ):
         assert food_safety_client.check_restaurant_message(text) is None
 
