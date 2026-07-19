@@ -11,12 +11,14 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
 import threading
 import time
 import unicodedata
+from urllib.parse import urlsplit
 
 import requests
 
@@ -37,6 +39,7 @@ _ORDER_CONTEXT_TTL_SECONDS = max(
 )
 _FETCH_TIMEOUT = (3.0, 8.0)
 _FETCH_FAILURE_BACKOFF_SECONDS = 30.0
+_DEFAULT_MAX_FRESHNESS_SECONDS = 48 * 3600
 _MIN_FLOW_ROWS = max(1, int(os.getenv("FOOD_SAFETY_MIN_FLOW_ROWS", "3000")))
 _MIN_MERCHANT_ALIASES = max(
     1, int(os.getenv("FOOD_SAFETY_MIN_MERCHANT_ALIASES", "900"))
@@ -44,8 +47,22 @@ _MIN_MERCHANT_ALIASES = max(
 _MIN_RETAINED_RATIO = min(
     1.0, max(0.0, float(os.getenv("FOOD_SAFETY_MIN_RETAINED_RATIO", "1.0")))
 )
+_MIN_FLOW_RETAINED_RATIO = min(
+    1.0,
+    max(0.0, float(os.getenv("FOOD_SAFETY_MIN_FLOW_RETAINED_RATIO", "0.90"))),
+)
+_MIN_ALIAS_RETAINED_RATIO = min(
+    1.0,
+    max(0.0, float(os.getenv("FOOD_SAFETY_MIN_ALIAS_RETAINED_RATIO", "0.99"))),
+)
 _MAX_DATASET_AGE_SECONDS = max(
-    3600, int(os.getenv("FOOD_SAFETY_MAX_DATASET_AGE_SECONDS", str(48 * 3600)))
+    3600,
+    int(
+        os.getenv(
+            "FOOD_SAFETY_MAX_DATASET_AGE_SECONDS",
+            str(_DEFAULT_MAX_FRESHNESS_SECONDS),
+        )
+    ),
 )
 _MAX_FUTURE_SKEW_SECONDS = max(
     0, int(os.getenv("FOOD_SAFETY_MAX_FUTURE_SKEW_SECONDS", "600"))
@@ -55,7 +72,7 @@ _MAX_OFFICIAL_DATA_AGE_SECONDS = max(
     int(
         os.getenv(
             "FOOD_SAFETY_MAX_OFFICIAL_DATA_AGE_SECONDS",
-            str(48 * 3600),
+            str(_DEFAULT_MAX_FRESHNESS_SECONDS),
         )
     ),
 )
@@ -492,15 +509,74 @@ def _parse_dataset_timestamp(value: object) -> datetime | None:
     return parsed if parsed.tzinfo is not None else None
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _validated_freshness_timestamps(
+    payload: object, *, now: datetime | None = None
+) -> tuple[datetime, datetime, list[datetime]] | None:
+    if not isinstance(payload, dict):
+        return None
+    generated_datetime = _parse_dataset_timestamp(payload.get("generated_at"))
+    official_data_datetime = _parse_dataset_timestamp(
+        payload.get("official_data_updated_at")
+    )
+    official_source_syncs = payload.get("official_source_syncs")
+    if (
+        generated_datetime is None
+        or official_data_datetime is None
+        or not isinstance(official_source_syncs, dict)
+        or set(official_source_syncs) != _REQUIRED_OFFICIAL_SOURCE_SYNCS
+    ):
+        return None
+    parsed_source_syncs: list[datetime] = []
+    for source_name, synced_at in official_source_syncs.items():
+        if not isinstance(source_name, str) or not source_name.strip():
+            return None
+        parsed = _parse_dataset_timestamp(synced_at)
+        if parsed is None:
+            return None
+        parsed_source_syncs.append(parsed)
+
+    checked_at = now or _utc_now()
+    freshness_checks = (
+        (generated_datetime, _MAX_DATASET_AGE_SECONDS),
+        (official_data_datetime, _MAX_OFFICIAL_DATA_AGE_SECONDS),
+        *((source_sync, _MAX_OFFICIAL_DATA_AGE_SECONDS) for source_sync in parsed_source_syncs),
+    )
+    for timestamp, max_age_seconds in freshness_checks:
+        age_seconds = (checked_at - timestamp).total_seconds()
+        if age_seconds > max_age_seconds or age_seconds < -_MAX_FUTURE_SKEW_SECONDS:
+            return None
+    if official_data_datetime.astimezone(timezone.utc) != min(
+        parsed_source_syncs
+    ).astimezone(timezone.utc):
+        return None
+    return generated_datetime, official_data_datetime, parsed_source_syncs
+
+
 def _flow_record_keys(rows: list[object]) -> set[tuple[str, str]]:
     return {
         (
-            str(row.get("source_url") or "").strip(),
+            _flow_source_identity(str(row.get("source_url") or "")),
             str(row.get("stable_key") or "").strip(),
         )
         for row in rows
         if isinstance(row, dict)
     }
+
+
+def _flow_source_identity(value: str) -> str:
+    try:
+        parsed = urlsplit(value.strip())
+    except (TypeError, ValueError):
+        return value.strip()
+    host = (parsed.hostname or "").casefold()
+    path = parsed.path.casefold()
+    if host in {"fda.gov.tw", "www.fda.gov.tw"} and path == "/tc/includes/getfile.ashx":
+        return "https://www.fda.gov.tw/tc/includes/getfile.ashx"
+    return value.strip()
 
 
 def _alias_record_keys(rows: list[object]) -> set[tuple[str, str, str]]:
@@ -569,9 +645,17 @@ def _manifest_accepts_dataset(dataset: dict, manifest: dict) -> bool:
         or dataset_generated < manifest_generated
     ):
         return False
+    previous_flow_keys = {
+        (_flow_source_identity(source_url), stable_key)
+        for source_url, stable_key in _manifest_key_rows(
+            manifest.get("flow_keys"), "flow_keys"
+        )
+    }
     return bool(
-        _manifest_key_rows(manifest.get("flow_keys"), "flow_keys").issubset(
-            _flow_record_keys(dataset.get("flow_rows", []))
+        _retains_minimum(
+            previous_flow_keys,
+            _flow_record_keys(dataset.get("flow_rows", [])),
+            _MIN_FLOW_RETAINED_RATIO,
         )
         and _manifest_aliases_accept_dataset(dataset, manifest)
         and _manifest_key_rows(
@@ -585,7 +669,7 @@ def _manifest_aliases_accept_dataset(dataset: dict, manifest: dict) -> bool:
         manifest.get("alias_keys"), "alias_keys", key_length=3
     )
     current = _alias_record_keys(dataset.get("merchant_aliases", []))
-    if not previous.issubset(current):
+    if not _retains_minimum(previous, current, _MIN_ALIAS_RETAINED_RATIO):
         return False
     business_names = {
         normalize_text(str(row.get("normalized_business_name") or ""))
@@ -598,6 +682,12 @@ def _manifest_aliases_accept_dataset(dataset: dict, manifest: dict) -> bool:
         if normalized_alias != canonical_name or canonical_name not in business_names:
             return False
     return True
+
+
+def _retains_minimum(previous: set, current: set, ratio: float) -> bool:
+    if not previous:
+        return True
+    return len(previous & current) >= math.ceil(len(previous) * ratio)
 
 
 def _write_accepted_manifest(dataset: dict) -> None:
@@ -634,7 +724,10 @@ def _write_accepted_manifest(dataset: dict) -> None:
 
 
 def _valid_dataset(
-    payload: object, previous_dataset: dict | None = None
+    payload: object,
+    previous_dataset: dict | None = None,
+    *,
+    now: datetime | None = None,
 ) -> dict | None:
     if not isinstance(payload, dict):
         return None
@@ -645,46 +738,10 @@ def _valid_dataset(
         or not _SNAPSHOT_ID_RE.fullmatch(snapshot_id.strip())
     ):
         return None
-    generated_datetime = _parse_dataset_timestamp(payload.get("generated_at"))
-    official_data_datetime = _parse_dataset_timestamp(
-        payload.get("official_data_updated_at")
-    )
-    if generated_datetime is None or official_data_datetime is None:
+    freshness_timestamps = _validated_freshness_timestamps(payload, now=now)
+    if freshness_timestamps is None:
         return None
-    official_source_syncs = payload.get("official_source_syncs")
-    if not isinstance(official_source_syncs, dict) or not official_source_syncs:
-        return None
-    if set(official_source_syncs) != _REQUIRED_OFFICIAL_SOURCE_SYNCS:
-        return None
-    parsed_source_syncs: list[datetime] = []
-    for source_name, synced_at in official_source_syncs.items():
-        if not isinstance(source_name, str) or not source_name.strip():
-            return None
-        parsed = _parse_dataset_timestamp(synced_at)
-        if parsed is None:
-            return None
-        parsed_source_syncs.append(parsed)
-    now = datetime.now(timezone.utc)
-    dataset_age = (now - generated_datetime).total_seconds()
-    official_data_age = (now - official_data_datetime).total_seconds()
-    if dataset_age > _MAX_DATASET_AGE_SECONDS:
-        return None
-    if dataset_age < -_MAX_FUTURE_SKEW_SECONDS:
-        return None
-    if official_data_age > _MAX_OFFICIAL_DATA_AGE_SECONDS:
-        return None
-    if official_data_age < -_MAX_FUTURE_SKEW_SECONDS:
-        return None
-    for source_sync in parsed_source_syncs:
-        source_age = (now - source_sync).total_seconds()
-        if source_age > _MAX_OFFICIAL_DATA_AGE_SECONDS:
-            return None
-        if source_age < -_MAX_FUTURE_SKEW_SECONDS:
-            return None
-    if official_data_datetime.astimezone(timezone.utc) != min(
-        parsed_source_syncs
-    ).astimezone(timezone.utc):
-        return None
+    generated_datetime, _, _ = freshness_timestamps
     coverage = payload.get("coverage")
     aliases = payload.get("merchant_aliases")
     flow_rows = payload.get("flow_rows")
@@ -769,7 +826,7 @@ def _valid_dataset(
         }:
             return None
         record_key = (
-            str(row["source_url"]).strip(),
+            _flow_source_identity(str(row["source_url"])),
             str(row["stable_key"]).strip(),
         )
         if record_key in flow_record_keys:
@@ -836,20 +893,26 @@ def _valid_dataset(
             return None
         previous_rows = previous_dataset.get("flow_rows")
         if isinstance(previous_rows, list) and previous_rows:
-            minimum_retained = int(len(previous_rows) * _MIN_RETAINED_RATIO)
-            if len(flow_rows) < minimum_retained:
-                return None
-            if not _flow_record_keys(previous_rows).issubset(flow_record_keys):
+            if (
+                len(flow_rows)
+                < math.ceil(len(previous_rows) * _MIN_FLOW_RETAINED_RATIO)
+                or not _retains_minimum(
+                    _flow_record_keys(previous_rows),
+                    flow_record_keys,
+                    _MIN_FLOW_RETAINED_RATIO,
+                )
+            ):
                 return None
         previous_aliases = previous_dataset.get("merchant_aliases")
         if isinstance(previous_aliases, list) and previous_aliases:
-            minimum_aliases = int(
-                len(previous_aliases) * _MIN_RETAINED_RATIO
-            )
-            if len(aliases) < minimum_aliases:
-                return None
-            if not _alias_record_keys(previous_aliases).issubset(
-                _alias_record_keys(aliases)
+            if (
+                len(aliases)
+                < math.ceil(len(previous_aliases) * _MIN_ALIAS_RETAINED_RATIO)
+                or not _retains_minimum(
+                    _alias_record_keys(previous_aliases),
+                    _alias_record_keys(aliases),
+                    _MIN_ALIAS_RETAINED_RATIO,
+                )
             ):
                 return None
         previous_catalog = previous_dataset.get("catalog_matches")
@@ -866,7 +929,11 @@ def _load_dataset() -> dict | None:
     now = time.monotonic()
     previous_dataset = None
     with _cache_condition:
-        if _cached_dataset is not None and now - _cached_at < _CACHE_TTL_SECONDS:
+        if (
+            _cached_dataset is not None
+            and now - _cached_at < _CACHE_TTL_SECONDS
+            and _validated_freshness_timestamps(_cached_dataset) is not None
+        ):
             return _cached_dataset
         if now - _last_fetch_failure_at < _FETCH_FAILURE_BACKOFF_SECONDS:
             return None
@@ -881,6 +948,7 @@ def _load_dataset() -> dict | None:
             if (
                 _cached_dataset is not None
                 and refreshed_at - _cached_at < _CACHE_TTL_SECONDS
+                and _validated_freshness_timestamps(_cached_dataset) is not None
             ):
                 return _cached_dataset
             return None
@@ -925,6 +993,7 @@ def _cache_snapshot() -> tuple[dict | None, bool, bool]:
         fresh = bool(
             _cached_dataset is not None
             and now - _cached_at < _CACHE_TTL_SECONDS
+            and _validated_freshness_timestamps(_cached_dataset) is not None
         )
         return _cached_dataset, fresh, _dataset_refreshing
 
@@ -1129,7 +1198,7 @@ def _format_missing_query() -> str:
 
 def _format_dataset_unavailable() -> str:
     return (
-        "⚠️ 官方食安資料暫時無法連線，目前不能完成核對。\n"
+        "⚠️ 官方資料無法通過必要驗證，目前不能完成食安核對。\n"
         "請稍後再查；這次不會改用一般網路摘要代替官方資料。\n"
         "完整查詢：https://food-safety-finder.pages.dev/"
     )

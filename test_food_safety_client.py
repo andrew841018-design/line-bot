@@ -98,6 +98,12 @@ def _dataset(*, rows=None):
     }
 
 
+def _assert_neutral_unavailable(reply):
+    assert reply is not None
+    assert "官方資料無法通過必要驗證" in reply
+    assert "無法連線" not in reply
+
+
 def test_restaurant_order_returns_official_warning(monkeypatch):
     row = {
         "business_name": "鬍鬚張-A007門市",
@@ -708,6 +714,50 @@ def test_dataset_validation_rejects_stale_or_future_generated_at(monkeypatch):
     assert food_safety_client._valid_dataset(future) is None
 
 
+def test_production_freshness_default_is_48_hours():
+    assert food_safety_client._DEFAULT_MAX_FRESHNESS_SECONDS == 48 * 3600
+
+
+@pytest.mark.parametrize("timestamp_kind", ["generated", "official", "source"])
+@pytest.mark.parametrize("extra_seconds, accepted", [(0, True), (1, False)])
+def test_dataset_freshness_48_hour_boundaries(
+    monkeypatch, timestamp_kind, extra_seconds, accepted
+):
+    monkeypatch.setattr(food_safety_client, "_MAX_DATASET_AGE_SECONDS", 48 * 3600)
+    monkeypatch.setattr(
+        food_safety_client, "_MAX_OFFICIAL_DATA_AGE_SECONDS", 48 * 3600
+    )
+    now = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
+    current_timestamp = now.isoformat()
+    boundary_timestamp = (
+        now - timedelta(hours=48, seconds=extra_seconds)
+    ).isoformat()
+    payload = _dataset()
+    payload["generated_at"] = current_timestamp
+    payload["official_data_updated_at"] = current_timestamp
+    payload["official_source_syncs"] = {
+        source_name: current_timestamp
+        for source_name in food_safety_client._REQUIRED_OFFICIAL_SOURCE_SYNCS
+    }
+
+    if timestamp_kind == "generated":
+        payload["generated_at"] = boundary_timestamp
+    elif timestamp_kind == "official":
+        payload["official_data_updated_at"] = boundary_timestamp
+        payload["official_source_syncs"] = {
+            source_name: boundary_timestamp
+            for source_name in food_safety_client._REQUIRED_OFFICIAL_SOURCE_SYNCS
+        }
+    else:
+        source_name = next(iter(food_safety_client._REQUIRED_OFFICIAL_SOURCE_SYNCS))
+        payload["official_data_updated_at"] = boundary_timestamp
+        payload["official_source_syncs"][source_name] = boundary_timestamp
+
+    result = food_safety_client._valid_dataset(payload, now=now)
+
+    assert (result is not None) is accepted
+
+
 def test_dataset_validation_uses_official_sync_freshness_not_export_time(monkeypatch):
     monkeypatch.setattr(
         food_safety_client, "_MAX_OFFICIAL_DATA_AGE_SECONDS", 86400
@@ -870,6 +920,97 @@ def test_persisted_manifest_rejects_cold_start_removals(monkeypatch, mutation):
     assert food_safety_client._load_dataset() is None
 
 
+@pytest.mark.parametrize(("retained", "accepted"), [(9, True), (8, False)])
+def test_flow_retention_allows_only_ninety_percent_rolling_revision(
+    monkeypatch, retained, accepted
+):
+    monkeypatch.setattr(food_safety_client, "_MIN_FLOW_RETAINED_RATIO", 0.90)
+    previous = _dataset(
+        rows=[
+            {
+                "business_name": f"官方業者-{index}",
+                "normalized_business_name": f"官方業者{index}",
+                "food_name": "受影響食品",
+                "stable_key": f"flow-{index}",
+            }
+            for index in range(10)
+        ]
+    )
+    current = json.loads(json.dumps(previous, ensure_ascii=False))
+    current["snapshot_id"] = "b" * 32
+    current["generated_at"] = "2026-07-14T01:00:00+00:00"
+    current["flow_rows"] = current["flow_rows"][:retained]
+    current["coverage"]["official_flow_records"] = retained
+    current["coverage"]["official_businesses"] = retained
+
+    assert (food_safety_client._valid_dataset(current, previous) is current) is accepted
+
+
+def test_manifest_keeps_alias_and_catalog_retention_strict(monkeypatch):
+    monkeypatch.setattr(food_safety_client, "_MIN_FLOW_RETAINED_RATIO", 0.90)
+    monkeypatch.setattr(food_safety_client, "_MIN_ALIAS_RETAINED_RATIO", 0.99)
+    previous = _dataset(
+        rows=[
+            {
+                "business_name": f"官方業者-{index}",
+                "normalized_business_name": f"官方業者{index}",
+                "food_name": "受影響食品",
+                "stable_key": f"flow-{index}",
+            }
+            for index in range(10)
+        ]
+    )
+    previous["merchant_aliases"].append(
+        {
+            "normalized_alias": "官方業者0",
+            "canonical_name": "官方業者0",
+            "alias_kind": "merchant",
+        }
+    )
+    current = json.loads(json.dumps(previous, ensure_ascii=False))
+    current["snapshot_id"] = "b" * 32
+    current["generated_at"] = "2026-07-14T01:00:00+00:00"
+    current["flow_rows"] = current["flow_rows"][:9]
+    current["coverage"]["official_flow_records"] = 9
+    current["coverage"]["official_businesses"] = 9
+    current["merchant_aliases"] = current["merchant_aliases"][:-1]
+
+    food_safety_client._write_accepted_manifest(previous)
+
+    manifest = food_safety_client._load_accepted_manifest()
+    assert manifest is not None
+    assert not food_safety_client._manifest_accepts_dataset(current, manifest)
+
+
+def test_manifest_treats_rotating_tfda_attachment_query_as_same_source(monkeypatch):
+    monkeypatch.setattr(food_safety_client, "_MIN_FLOW_RETAINED_RATIO", 1.0)
+    previous = _dataset(
+        rows=[
+            {
+                "business_name": "官方業者",
+                "normalized_business_name": "官方業者",
+                "food_name": "受影響食品",
+                "stable_key": "same-flow",
+                "source_url": "https://www.fda.gov.tw/tc/includes/GetFile.ashx?id=old",
+            }
+        ]
+    )
+    current = json.loads(json.dumps(previous, ensure_ascii=False))
+    current["snapshot_id"] = "b" * 32
+    current["generated_at"] = "2026-07-14T01:00:00+00:00"
+    current["flow_rows"][0]["source_url"] = (
+        "https://www.fda.gov.tw/tc/includes/GetFile.ashx?id=new&type=2"
+    )
+
+    assert food_safety_client._valid_dataset(current, previous) is current
+
+    food_safety_client._write_accepted_manifest(previous)
+
+    manifest = food_safety_client._load_accepted_manifest()
+    assert manifest is not None
+    assert food_safety_client._manifest_accepts_dataset(current, manifest)
+
+
 def test_persisted_manifest_rejects_alias_kind_change(monkeypatch):
     previous = _dataset(
         rows=[
@@ -963,8 +1104,7 @@ def test_startup_brand_fallback_reports_recent_failure(monkeypatch):
 
     reply = food_safety_client.check_restaurant_message("鬍鬚張")
 
-    assert reply is not None
-    assert "官方食安資料暫時無法連線" in reply
+    _assert_neutral_unavailable(reply)
     get.assert_not_called()
 
 
@@ -2111,9 +2251,8 @@ def test_known_restaurant_order_reports_official_dataset_unavailable(monkeypatch
 
     reply = food_safety_client.check_restaurant_message("今晚訂鬍鬚張")
 
-    assert reply is not None
-    assert "官方食安資料暫時無法連線" in reply
-    assert "目前不能完成核對" in reply
+    _assert_neutral_unavailable(reply)
+    assert "目前不能完成食安核對" in reply
 
 
 def test_cold_unknown_restaurant_order_reports_official_dataset_unavailable(
@@ -2127,9 +2266,8 @@ def test_cold_unknown_restaurant_order_reports_official_dataset_unavailable(
 
     reply = food_safety_client.check_restaurant_message("預訂麥當勞")
 
-    assert reply is not None
-    assert "官方食安資料暫時無法連線" in reply
-    assert "目前不能完成核對" in reply
+    _assert_neutral_unavailable(reply)
+    assert "目前不能完成食安核對" in reply
 
 
 def test_unknown_restaurant_order_fails_closed_on_unexpected_lookup_error():
@@ -2137,17 +2275,30 @@ def test_unknown_restaurant_order_fails_closed_on_unexpected_lookup_error():
     assert not food_safety_client.should_fail_closed_on_lookup_error("預約市立醫院")
 
 
-def test_explicit_lookup_reports_official_dataset_unavailable(monkeypatch):
-    def fail(*args, **kwargs):
-        raise food_safety_client.requests.RequestException("offline")
-
-    monkeypatch.setattr(food_safety_client.requests, "get", fail)
+@pytest.mark.parametrize("failure_kind", ["network", "stale", "schema"])
+def test_explicit_lookup_failures_use_neutral_unavailable_wording(
+    monkeypatch, failure_kind
+):
+    if failure_kind == "network":
+        get = Mock(side_effect=food_safety_client.requests.RequestException("offline"))
+    else:
+        payload = _dataset()
+        if failure_kind == "stale":
+            monkeypatch.setattr(
+                food_safety_client, "_MAX_DATASET_AGE_SECONDS", 48 * 3600
+            )
+            payload["generated_at"] = (
+                datetime.now(timezone.utc) - timedelta(hours=48, seconds=1)
+            ).isoformat()
+        else:
+            payload["schema_version"] = 2
+        get = Mock(return_value=_Response(payload))
+    monkeypatch.setattr(food_safety_client.requests, "get", get)
     food_safety_client.reset_cache()
 
     reply = food_safety_client.check_restaurant_message("幫我查鬍鬚張食安")
 
-    assert reply is not None
-    assert "官方食安資料暫時無法連線" in reply
+    _assert_neutral_unavailable(reply)
     assert "稍後再查" in reply
 
 
@@ -2160,8 +2311,7 @@ def test_bare_food_lookup_reports_official_dataset_unavailable(monkeypatch):
 
     reply = food_safety_client.check_restaurant_message("乳香世家牛奶")
 
-    assert reply is not None
-    assert "官方食安資料暫時無法連線" in reply
+    _assert_neutral_unavailable(reply)
 
 
 def test_concurrent_cold_cache_uses_one_dataset_fetch(monkeypatch):
@@ -2208,6 +2358,40 @@ def test_expired_cache_is_not_used_when_refresh_fails(monkeypatch):
     monkeypatch.setattr(food_safety_client.requests, "get", fail)
 
     assert food_safety_client._load_dataset() is None
+
+
+def test_cache_within_ttl_is_rejected_after_absolute_freshness_boundary(monkeypatch):
+    monkeypatch.setattr(food_safety_client, "_MAX_DATASET_AGE_SECONDS", 48 * 3600)
+    monkeypatch.setattr(
+        food_safety_client, "_MAX_OFFICIAL_DATA_AGE_SECONDS", 48 * 3600
+    )
+    initial_now = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
+    boundary_timestamp = (initial_now - timedelta(hours=48)).isoformat()
+    payload = _dataset()
+    payload["generated_at"] = boundary_timestamp
+    payload["official_data_updated_at"] = boundary_timestamp
+    payload["official_source_syncs"] = {
+        source_name: boundary_timestamp
+        for source_name in food_safety_client._REQUIRED_OFFICIAL_SOURCE_SYNCS
+    }
+    assert food_safety_client._valid_dataset(payload, now=initial_now) is not None
+
+    food_safety_client.reset_cache()
+    with food_safety_client._cache_condition:
+        food_safety_client._cached_dataset = payload
+        food_safety_client._cached_at = food_safety_client.time.monotonic()
+    monkeypatch.setattr(
+        food_safety_client,
+        "_utc_now",
+        lambda: initial_now + timedelta(seconds=1),
+    )
+    get = Mock(side_effect=food_safety_client.requests.RequestException("offline"))
+    monkeypatch.setattr(food_safety_client.requests, "get", get)
+
+    reply = food_safety_client.check_restaurant_message("今晚訂鬍鬚張")
+
+    _assert_neutral_unavailable(reply)
+    get.assert_called_once()
 
 
 def test_unexpected_fetch_exception_clears_single_flight_flag(monkeypatch):
@@ -2356,8 +2540,7 @@ def test_product_marked_direct_query_reports_recent_warm_failure(monkeypatch):
 
     for product in ("(丸大)一級棒A", "訂製品_甜麵醬含香油及乳酸20kg"):
         reply = food_safety_client.check_restaurant_message(product)
-        assert reply is not None
-        assert "官方食安資料暫時無法連線" in reply
+        _assert_neutral_unavailable(reply)
     get.assert_not_called()
 
 
@@ -2413,7 +2596,7 @@ def test_main_explicit_lookup_exception_fails_closed(monkeypatch):
 
     assert handled is True
     reply.assert_called_once()
-    assert "官方食安資料暫時無法連線" in reply.call_args.args[1]
+    _assert_neutral_unavailable(reply.call_args.args[1])
     assert reply.call_args.kwargs["allow_push_fallback"] is False
 
 
@@ -2436,10 +2619,8 @@ def test_main_bare_lookup_exception_fails_closed(monkeypatch):
         assert main._handle_restaurant_food_safety(event, "GROUP", text) is True
 
     assert reply.call_count == 2
-    assert all(
-        "官方食安資料暫時無法連線" in call.args[1]
-        for call in reply.call_args_list
-    )
+    for call in reply.call_args_list:
+        _assert_neutral_unavailable(call.args[1])
 
 
 def test_main_ordinary_chatter_exception_keeps_normal_routing(monkeypatch):
