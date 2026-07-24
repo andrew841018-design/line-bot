@@ -1076,15 +1076,27 @@ def test_reply_suppressed_primary_can_still_send_due_reminder_piggyback(monkeypa
                 "stage": "1d",
                 "text": reminder_message.text,
                 "message": reminder_message,
+                "action": "打卡",
+                "remind_at": 1_784_496_000,
+                "weekly_count": 0,
             }
         ],
     )
     marked: list[tuple[int, str]] = []
     monkeypatch.setattr(
-        reminder_push,
-        "mark_reminders_pushed",
-        lambda rows: marked.extend(rows) or len(rows),
+        main.memory,
+        "claim_natural_reminder_delivery",
+        lambda *_a, **_k: {
+            "reminder_id": 7,
+            "claim_token": "claim",
+        },
     )
+    monkeypatch.setattr(
+        main.memory,
+        "finalize_natural_reminder_delivery",
+        lambda claim: marked.append((claim["reminder_id"], "1d")) or True,
+    )
+    monkeypatch.setattr(main.memory, "is_reminder_pending", lambda *_a, **_k: True)
 
     mock_api = MagicMock()
     mock_api.__enter__ = MagicMock(return_value=mock_api)

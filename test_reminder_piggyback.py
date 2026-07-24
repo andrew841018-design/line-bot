@@ -172,6 +172,7 @@ def _patch_reply_pending_fast_path(main, monkeypatch):
     monkeypatch.setattr(main.memory, "get_context", lambda group_id: [])
     monkeypatch.setattr(main.memory, "top_facts", lambda group_id: [])
     monkeypatch.setattr(main.memory, "log_raw_message", lambda *a, **kw: None)
+    monkeypatch.setattr(main.memory, "is_reminder_pending", lambda *a, **kw: True)
 
     import calendar_db
     monkeypatch.setattr(calendar_db, "list_due_for_reminder", lambda *a, **kw: [])
@@ -312,14 +313,25 @@ def test_fast_path_uses_reply_token_for_reminder_push(monkeypatch):
                 "text": "@當事人\n⏰ 提醒（3 天後）\n2026-06-16 08:00 禁食",
                 "message": reminder_message,
                 "action": "禁食",
+                "remind_at": 1_781_574_400,
+                "weekly_count": 0,
             }
         ],
     )
     monkeypatch.setattr(
-        reminder_push,
-        "mark_reminders_pushed",
-        lambda pushes: marked.extend(pushes) or len(pushes),
+        main.memory,
+        "claim_natural_reminder_delivery",
+        lambda *_a, **_k: {
+            "reminder_id": 21,
+            "claim_token": "claim",
+        },
     )
+    monkeypatch.setattr(
+        main.memory,
+        "finalize_natural_reminder_delivery",
+        lambda claim: marked.append((claim["reminder_id"], "3d")) or True,
+    )
+    monkeypatch.setattr(main.memory, "is_reminder_pending", lambda _gid, _rid: True)
     monkeypatch.setattr(main, "ApiClient", _FakeApiClient)
     monkeypatch.setattr(main, "MessagingApi", _FakeMessagingApi)
     monkeypatch.setattr(main, "_get_line_config", lambda: None)
@@ -575,14 +587,24 @@ def test_reply_bundles_reminder_push_piggyback(monkeypatch):
                 "stage": "1d",
                 "text": "⏰ 提醒（明天）\n2026-06-02 00:00 去看醫生",
                 "action": "去看醫生",
+                "remind_at": 1_780_336_000,
+                "weekly_count": 0,
             }
         ],
     )
     marked = []
     monkeypatch.setattr(
-        reminder_push,
-        "mark_reminders_pushed",
-        lambda reminders: marked.extend(reminders) or len(reminders),
+        main.memory,
+        "claim_natural_reminder_delivery",
+        lambda *_a, **_k: {
+            "reminder_id": 6,
+            "claim_token": "claim",
+        },
+    )
+    monkeypatch.setattr(
+        main.memory,
+        "finalize_natural_reminder_delivery",
+        lambda claim: marked.append((claim["reminder_id"], "1d")) or True,
     )
 
     captured = {}

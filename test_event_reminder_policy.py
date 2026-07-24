@@ -100,7 +100,12 @@ def test_one_off_policy_suppresses_standard_and_shared_with_piggyback(
 
     assert launchd_spec["kind"] == "mention"
     assert launchd_spec["user_id"] == "U" + "1" * 32
-    assert piggyback_spec == {"kind": "text", "text": "媽媽\n請確認時間"}
+    assert piggyback_spec == {
+        "kind": "text",
+        "text": "媽媽\n請確認時間",
+        "source_kind": "calendar_event",
+        "source_ref": "E1",
+    }
 
 
 def test_standard_event_all_participants_uses_all_mention(monkeypatch):

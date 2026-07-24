@@ -113,6 +113,7 @@ def push_messages(
     session=None,
     ok_statuses: tuple[int, ...] = (200,),
     fallback_token: str | None = None,
+    sent_message_ids: list[str] | None = None,
 ) -> bool:
     """Push LINE messages and raise LinePushError on non-accepted responses."""
     import requests
@@ -152,6 +153,20 @@ def push_messages(
 
     status = int(getattr(resp, "status_code", 0) or 0)
     if status in ok_statuses:
+        if sent_message_ids is not None:
+            try:
+                payload = resp.json()
+                sent = payload.get("sentMessages", []) if isinstance(payload, dict) else []
+                for item in sent:
+                    if not isinstance(item, dict):
+                        continue
+                    message_id = str(item.get("id") or "").strip()
+                    if message_id:
+                        sent_message_ids.append(message_id)
+            except Exception:
+                # Older/fake transports may not expose JSON. Delivery success
+                # remains authoritative; missing archival metadata is non-fatal.
+                pass
         return True
 
     body = (getattr(resp, "text", "") or "")[:500]

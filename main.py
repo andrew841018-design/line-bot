@@ -2091,10 +2091,15 @@ def _try_piggyback_reminders_fast_path(
         or settings.bot_muted
     ):
         return False
+    event_delivery_claims: list[dict] = []
+    natural_delivery_claims: list[dict] = []
+    delivery_started = False
+    delivery_accepted = False
     try:
         import calendar_db
         import event_reminder as _er
         messages: list = []
+        message_plain_texts: list[str] = []
         pending: list[tuple[str, int]] = []
         for offset in calendar_db.REMINDER_OFFSETS:
             if len(messages) >= 5:
@@ -2105,43 +2110,170 @@ def _try_piggyback_reminders_fast_path(
                 spec = _er.build_reminder_message_spec(e, offset, allow_mention=True)
                 if spec is None:
                     continue
-                messages.append(_er.sdk_message_from_spec(spec))
+                sdk_message = _er.sdk_message_from_spec(spec)
+                if sdk_message is None:
+                    continue
+                messages.append(sdk_message)
+                message_plain_texts.append(
+                    str(spec.get("fallback_text") or spec.get("text") or "")
+                )
                 pending.append((e["event_id"], offset))
         import reminder_push as _rp
-        pending_pushes: list[tuple[int, str]] = []
+        pending_pushes: list[dict] = []
         if len(messages) < 5:
             remaining = 5 - len(messages)
             for item in _rp.due_reminders_for_reply(group_id, limit=remaining):
+                if not memory.is_reminder_pending(
+                    group_id, int(item["reminder_id"])
+                ):
+                    continue
                 messages.append(
                     item.get("message") or TextMessage(text=item["text"][:5000])
                 )
-                pending_pushes.append((item["reminder_id"], item["stage"]))
+                message_plain_texts.append(str(item["text"]))
+                pending_pushes.append(item)
+        # Atomically claim every reminder at the last possible point before
+        # delivery. Cancellation and all other sender paths use the same DB
+        # fence, so only one side can authorize this occurrence.
+        keep = [True] * len(messages)
+        kept_pending: list[tuple[str, int]] = []
+        for idx, item in enumerate(pending):
+            event_id, offset = item
+            claim = memory.claim_calendar_reminder_delivery(
+                group_id,
+                calendar_db.EVENT_REMINDER_SOURCE_KIND,
+                str(event_id),
+                offset,
+                transport="reply",
+            )
+            if claim is None:
+                keep[idx] = False
+                continue
+            kept_pending.append((event_id, offset))
+            event_delivery_claims.append(claim)
+        kept_pushes: list[dict] = []
+        natural_start = len(pending)
+        for idx, item in enumerate(pending_pushes, start=natural_start):
+            claim = memory.claim_natural_reminder_delivery(
+                group_id,
+                int(item["reminder_id"]),
+                str(item["stage"]),
+                expected_action=str(item["action"]),
+                expected_remind_at=int(item["remind_at"]),
+                expected_weekly_count=int(item.get("weekly_count") or 0),
+                transport="reply",
+            )
+            if claim is None:
+                keep[idx] = False
+                continue
+            kept_pushes.append(item)
+            natural_delivery_claims.append(claim)
+        if not all(keep):
+            messages = [message for idx, message in enumerate(messages) if keep[idx]]
+            message_plain_texts = [
+                plain for idx, plain in enumerate(message_plain_texts) if keep[idx]
+            ]
+            pending = kept_pending
+            pending_pushes = kept_pushes
         if not messages:
             return False
         try:
+            delivery_started = True
             with ApiClient(_get_line_config()) as api_client:
-                MessagingApi(api_client).reply_message(
+                response = MessagingApi(api_client).reply_message(
                     ReplyMessageRequest(
                         reply_token=reply_token, messages=messages,
                     )
                 )
             _mark_inbound_reply_succeeded(reply_token)
+            delivery_accepted = True
         except Exception as e:
+            claims = [*event_delivery_claims, *natural_delivery_claims]
+            if _is_definite_reply_token_error(e):
+                memory.release_reminder_delivery_claims(claims)
+            else:
+                memory.mark_reminder_delivery_claims_uncertain(claims)
             logger.warning(
                 "reminder fast-path reply failed (reminders preserved): %s",
                 str(e)[:200],
             )
             return False
-        for ev_id, off in pending:
-            calendar_db.mark_reminded(ev_id, off, group_id)
-        if pending_pushes:
-            _rp.mark_reminders_pushed(pending_pushes)
+        try:
+            sent_messages = getattr(response, "sent_messages", None) or []
+            for idx, sent in enumerate(sent_messages):
+                sent_id = getattr(sent, "id", None)
+                if not sent_id:
+                    continue
+                plain_text = (
+                    message_plain_texts[idx]
+                    if idx < len(message_plain_texts)
+                    else str(getattr(messages[idx], "text", "") or "")
+                )
+                memory.log_raw_message(
+                    group_id,
+                    str(sent_id),
+                    "__bot__",
+                    plain_text,
+                )
+                if idx < len(pending):
+                    event_id, _offset = pending[idx]
+                    memory.log_sent_reminder_reference(
+                        group_id,
+                        str(sent_id),
+                        source_kind=calendar_db.EVENT_REMINDER_SOURCE_KIND,
+                        source_ref=str(event_id),
+                    )
+                else:
+                    natural_index = idx - len(pending)
+                    if natural_index < len(pending_pushes):
+                        item = pending_pushes[natural_index]
+                        reference_kwargs: dict[str, object] = {
+                            "reminder_id": int(item["reminder_id"])
+                        }
+                        if item.get("source_kind") and item.get("source_ref"):
+                            reference_kwargs.update(
+                                {
+                                    "source_kind": str(item["source_kind"]),
+                                    "source_ref": str(item["source_ref"]),
+                                }
+                            )
+                        memory.log_sent_reminder_reference(
+                            group_id,
+                            str(sent_id),
+                            **reference_kwargs,
+                        )
+        except Exception as archive_error:
+            # Reply 已被 LINE 接受；archive 失敗不可讓 caller 重送。
+            logger.error(
+                "reminder fast-path delivered but sent-message archive failed "
+                "group=%s: %s",
+                group_id,
+                str(archive_error)[:200],
+            )
+        for claim in event_delivery_claims:
+            if not memory.finalize_calendar_reminder_delivery(claim):
+                logger.error(
+                    "fast-path event claim finalization failed source=%s",
+                    claim.get("source_ref"),
+                )
+        for claim in natural_delivery_claims:
+            if not memory.finalize_natural_reminder_delivery(claim):
+                logger.error(
+                    "fast-path natural claim finalization failed rid=%s",
+                    claim.get("reminder_id"),
+                )
         logger.info(
             "reminder fast-path: pushed %d calendar + %d reminder_push via reply_token group=%s",
             len(pending), len(pending_pushes), group_id,
         )
         return True
     except Exception as e:
+        claims = [*event_delivery_claims, *natural_delivery_claims]
+        if claims:
+            if delivery_started or delivery_accepted:
+                memory.mark_reminder_delivery_claims_uncertain(claims)
+            else:
+                memory.release_reminder_delivery_claims(claims)
         logger.warning("reminder fast-path failed: %s", e)
         return False
 
@@ -2909,8 +3041,572 @@ def _try_handle_calendar_correction(
     return True
 
 
+def _try_handle_reminder_cancellation(
+    event: MessageEvent, group_id: str, text: str
+) -> bool:
+    """Cancel one exact reminder before any AI or reminder-creation route runs."""
+    import reminder_cancel
+
+    quoted_message_id = getattr(event.message, "quoted_message_id", None)
+    quoted_text: str | None = None
+    quoted_reminder_ref: dict | None = None
+    if quoted_message_id:
+        quoted = memory.get_raw_message(group_id, str(quoted_message_id))
+        # Empty string means a quote exists but its archived text is unavailable.
+        quoted_text = quoted[1] if quoted is not None else ""
+        quoted_reminder_ref = memory.get_sent_reminder_reference(
+            group_id,
+            str(quoted_message_id),
+        )
+
+    request = reminder_cancel.parse_cancel_request(
+        text,
+        quoted_text,
+        quoted_identity_bound=quoted_reminder_ref is not None,
+    )
+    if request.status is reminder_cancel.CancelParseStatus.NOT_CANCEL:
+        return False
+
+    burst_filter.cancel_burst(group_id)
+    reply: str
+    if request.status is reminder_cancel.CancelParseStatus.AMBIGUOUS:
+        reply = (
+            "目前沒有唯一鎖定要取消的提醒，可能有多筆。\n"
+            "請貼上完整的「時間＋事項」，或直接回覆提醒訊息後說「這則取消」。"
+        )
+    else:
+        candidates = memory.list_reminder_cancellation_candidates(
+            group_id,
+            include_cancelled=True,
+            include_terminal=bool(
+                quoted_message_id and quoted_reminder_ref is None
+            )
+            or request.current_reference is not None,
+        )
+        pending = [row for row in candidates if row.get("status") == "pending"]
+        cancelled = [row for row in candidates if row.get("status") == "cancelled"]
+        terminal = [
+            row
+            for row in candidates
+            if row.get("status") in {"done", "expired"}
+        ]
+        reference = request.reference
+        no_identity_match = reminder_cancel.CancelResolution(
+            status=reminder_cancel.CancelResolutionStatus.NOT_FOUND,
+            reference=reference,
+            reason="no_bound_identity_match",
+        )
+        mapped_reminder_id: int | None = None
+        mapped_status = ""
+        source_ref = ""
+        source_status = ""
+        unbound_calendar_quote = False
+        calendar_source_ambiguous = False
+        calendar_source_unavailable = False
+        if quoted_reminder_ref:
+            bound_source_kind = str(
+                quoted_reminder_ref.get("source_kind") or ""
+            )
+            bound_source_ref = str(
+                quoted_reminder_ref.get("source_ref") or ""
+            )
+            if bound_source_kind == "calendar_event" and bound_source_ref:
+                source_ref = bound_source_ref
+                current_calendar_reference = request.current_reference
+                if (
+                    current_calendar_reference is not None
+                    and current_calendar_reference.reference_kind
+                    == "calendar_event"
+                ):
+                    import calendar_db
+
+                    current_event_dt = datetime.fromtimestamp(
+                        current_calendar_reference.remind_at,
+                        tz=ZoneInfo("Asia/Taipei"),
+                    )
+                    current_event_rows: dict[str, dict] = {}
+                    current_titles = (
+                        current_calendar_reference.action_variants
+                        or (current_calendar_reference.action,)
+                    )
+                    for current_title in current_titles:
+                        exact_rows = calendar_db.find_active_events_exact(
+                            group_id,
+                            title=str(current_title),
+                            event_date=current_event_dt.strftime("%Y-%m-%d"),
+                            event_time=(
+                                current_event_dt.strftime("%H:%M")
+                                if current_calendar_reference.event_time_specified
+                                else None
+                            ),
+                        )
+                        for exact_row in exact_rows:
+                            exact_event_id = str(
+                                exact_row.get("event_id") or ""
+                            )
+                            if exact_event_id:
+                                current_event_rows[exact_event_id] = exact_row
+                    current_location = reminder_cancel.normalize_action(
+                        current_calendar_reference.location_hint
+                    )
+                    if current_location:
+                        current_event_rows = {
+                            event_id: event_row
+                            for event_id, event_row in current_event_rows.items()
+                            if reminder_cancel.normalize_action(
+                                event_row.get("location") or ""
+                            )
+                            == current_location
+                        }
+                    if set(current_event_rows) != {source_ref}:
+                        source_ref = ""
+                        calendar_source_unavailable = True
+            elif quoted_reminder_ref.get("reminder_id") is not None:
+                mapped_reminder_id = int(
+                    quoted_reminder_ref["reminder_id"]
+                )
+        elif (
+            reference is not None
+            and reference.reference_kind == "calendar_event"
+        ):
+            if reference.source is reminder_cancel.ReferenceSource.QUOTED:
+                # Historical outbound messages have no durable identity
+                # binding. Refuse to infer a source from visible text because
+                # an old quote can collide with a recreated identical event.
+                unbound_calendar_quote = True
+            else:
+                import calendar_db
+
+                event_dt = datetime.fromtimestamp(
+                    reference.remind_at,
+                    tz=ZoneInfo("Asia/Taipei"),
+                )
+                event_rows_by_id: dict[str, dict] = {}
+                titles = reference.action_variants or (reference.action,)
+                for title in titles:
+                    event_rows = calendar_db.find_active_events_exact(
+                        group_id,
+                        title=str(title),
+                        event_date=event_dt.strftime("%Y-%m-%d"),
+                        event_time=(
+                            event_dt.strftime("%H:%M")
+                            if reference.event_time_specified
+                            else None
+                        ),
+                    )
+                    for event_row in event_rows:
+                        event_id = str(event_row.get("event_id") or "")
+                        if event_id:
+                            event_rows_by_id[event_id] = event_row
+                if len(event_rows_by_id) == 1:
+                    selected_event = next(iter(event_rows_by_id.values()))
+                    pasted_location = reminder_cancel.normalize_action(
+                        reference.location_hint
+                    )
+                    stored_location = reminder_cancel.normalize_action(
+                        selected_event.get("location") or ""
+                    )
+                    if pasted_location and pasted_location != stored_location:
+                        calendar_source_unavailable = True
+                    else:
+                        try:
+                            mirror_ready = (
+                                calendar_db.ensure_event_reminder_mirror(
+                                    selected_event
+                                )
+                            )
+                        except Exception:
+                            mirror_ready = False
+                        if mirror_ready:
+                            source_ref = str(
+                                selected_event.get("event_id") or ""
+                            )
+                        else:
+                            calendar_source_unavailable = True
+                elif len(event_rows_by_id) > 1:
+                    calendar_source_ambiguous = True
+                else:
+                    calendar_source_unavailable = True
+        elif (
+            reference is not None
+            and reference.source is reminder_cancel.ReferenceSource.CURRENT
+        ):
+            source_backed_rows = [
+                row
+                for row in candidates
+                if str(row.get("source_kind") or "") == "calendar_event"
+                and str(row.get("source_ref") or "")
+            ]
+            source_backed_resolution = reminder_cancel.resolve_cancel_request(
+                request,
+                source_backed_rows,
+            )
+            if (
+                source_backed_resolution.status
+                is reminder_cancel.CancelResolutionStatus.MATCHED
+            ):
+                matched_source_row = next(
+                    (
+                        row
+                        for row in source_backed_rows
+                        if int(row["reminder_id"])
+                        == int(source_backed_resolution.reminder_id)
+                    ),
+                    None,
+                )
+                if matched_source_row is not None:
+                    matched_source_status = str(
+                        matched_source_row.get("status") or ""
+                    )
+                    pending_resolution = reminder_cancel.resolve_cancel_request(
+                        request,
+                        pending,
+                    )
+                    if (
+                        matched_source_status != "pending"
+                        and pending_resolution.status
+                        in {
+                            reminder_cancel.CancelResolutionStatus.MATCHED,
+                            reminder_cancel.CancelResolutionStatus.AMBIGUOUS,
+                        }
+                    ):
+                        # A terminal/cancelled source may be an older identity
+                        # than a newly recreated generic reminder with identical
+                        # visible text. Current pasted text cannot distinguish
+                        # them, so do not leave the live reminder untouched
+                        # while claiming success on the old source.
+                        calendar_source_ambiguous = True
+                    else:
+                        source_ref = str(matched_source_row["source_ref"])
+            elif (
+                source_backed_resolution.status
+                is reminder_cancel.CancelResolutionStatus.AMBIGUOUS
+            ):
+                calendar_source_ambiguous = True
+
+        if mapped_reminder_id is not None:
+            bound_row = memory.get_reminder(mapped_reminder_id)
+            if (
+                bound_row is not None
+                and bound_row.get("group_id") == group_id
+                and str(bound_row.get("source_kind") or "")
+                == "calendar_event"
+                and str(bound_row.get("source_ref") or "")
+            ):
+                # Natural lead-time reminders carry the same durable calendar
+                # source. Let that source identity win even after this
+                # particular reminder row becomes done/expired, so replying to
+                # the actual outbound message tombstones all later offsets.
+                source_ref = str(bound_row["source_ref"])
+                mapped_reminder_id = None
+
+        if mapped_reminder_id is not None:
+            mapped_row = memory.get_reminder(mapped_reminder_id)
+            if (
+                mapped_row is not None
+                and mapped_row.get("group_id") == group_id
+            ):
+                mapped_status = str(mapped_row.get("status") or "")
+                mapped_resolution = reminder_cancel.CancelResolution(
+                    status=reminder_cancel.CancelResolutionStatus.MATCHED,
+                    reminder_id=int(mapped_row["reminder_id"]),
+                    action=str(mapped_row["action"]),
+                    remind_at=int(mapped_row["remind_at"]),
+                    reference=reference,
+                )
+                if mapped_status == "pending":
+                    resolution = mapped_resolution
+                    previous_resolution = no_identity_match
+                elif mapped_status == "cancelled":
+                    resolution = no_identity_match
+                    previous_resolution = mapped_resolution
+                else:
+                    resolution = no_identity_match
+                    previous_resolution = no_identity_match
+            else:
+                resolution = no_identity_match
+                previous_resolution = no_identity_match
+        elif source_ref:
+            source_candidates = (
+                memory.list_reminder_source_cancellation_candidates(
+                    group_id,
+                    "calendar_event",
+                    source_ref,
+                )
+            )
+            source_resolution = reminder_cancel.resolve_cancel_request_by_source(
+                request,
+                source_candidates,
+                source_kind="calendar_event",
+                source_ref=source_ref,
+            )
+            no_source_match = reminder_cancel.CancelResolution(
+                status=reminder_cancel.CancelResolutionStatus.NOT_FOUND,
+                reference=reference,
+                reason="no_source_status_match",
+            )
+            if (
+                source_resolution.status
+                is reminder_cancel.CancelResolutionStatus.MATCHED
+            ):
+                source_row = next(
+                    (
+                        row
+                        for row in source_candidates
+                        if int(row["reminder_id"])
+                        == int(source_resolution.reminder_id)
+                    ),
+                    None,
+                )
+                source_status = (
+                    str(source_row.get("status") or "")
+                    if source_row is not None
+                    else ""
+                )
+                if source_status == "cancelled":
+                    resolution = no_source_match
+                    previous_resolution = source_resolution
+                elif source_status in {"pending", "done", "expired"}:
+                    resolution = source_resolution
+                    previous_resolution = no_source_match
+                else:
+                    resolution = no_source_match
+                    previous_resolution = no_source_match
+            else:
+                resolution = source_resolution
+                previous_resolution = no_source_match
+        elif (
+            unbound_calendar_quote
+            or calendar_source_ambiguous
+            or calendar_source_unavailable
+        ):
+            resolution = reminder_cancel.CancelResolution(
+                status=reminder_cancel.CancelResolutionStatus.AMBIGUOUS,
+                reference=reference,
+                reason=(
+                    "quoted_calendar_identity_unavailable"
+                    if unbound_calendar_quote
+                    else (
+                        "multiple_calendar_sources"
+                        if calendar_source_ambiguous
+                        else "calendar_source_unavailable"
+                    )
+                ),
+            )
+            previous_resolution = no_identity_match
+        else:
+            resolution = reminder_cancel.resolve_cancel_request(request, pending)
+            previous_resolution = reminder_cancel.resolve_cancel_request(
+                request, cancelled
+            )
+            terminal_resolution = reminder_cancel.resolve_cancel_request(
+                request,
+                terminal,
+            )
+            if (
+                resolution.status
+                is reminder_cancel.CancelResolutionStatus.MATCHED
+                and terminal_resolution.status
+                in {
+                    reminder_cancel.CancelResolutionStatus.MATCHED,
+                    reminder_cancel.CancelResolutionStatus.AMBIGUOUS,
+                }
+            ):
+                resolution = reminder_cancel.CancelResolution(
+                    status=reminder_cancel.CancelResolutionStatus.AMBIGUOUS,
+                    reference=reference,
+                    reason="quoted_identity_matches_terminal_and_pending",
+                )
+
+        if resolution.status is reminder_cancel.CancelResolutionStatus.MATCHED:
+            if previous_resolution.status in {
+                reminder_cancel.CancelResolutionStatus.MATCHED,
+                reminder_cancel.CancelResolutionStatus.AMBIGUOUS,
+            }:
+                reply = (
+                    "同一時間與事項同時有已取消和待處理的紀錄，"
+                    "無法確認引用的是舊提醒還是新提醒，因此先沒有變更。\n"
+                    "請查看目前提醒清單後，再貼上要取消的那一筆。"
+                )
+            else:
+                if source_ref:
+                    cancelled_row = memory.cancel_reminder_for_source(
+                        group_id,
+                        int(resolution.reminder_id),
+                        str(resolution.action),
+                        int(resolution.remind_at),
+                        "calendar_event",
+                        source_ref,
+                        source_status,
+                    )
+                else:
+                    cancelled_row = memory.cancel_pending_reminder(
+                        group_id,
+                        int(resolution.reminder_id),
+                        str(resolution.action),
+                        int(resolution.remind_at),
+                    )
+                if cancelled_row is None and source_ref:
+                    latest_source_rows = (
+                        memory.list_reminder_source_cancellation_candidates(
+                            group_id,
+                            "calendar_event",
+                            source_ref,
+                        )
+                    )
+                    latest_target = next(
+                        (
+                            row
+                            for row in latest_source_rows
+                            if int(row["reminder_id"])
+                            == int(resolution.reminder_id)
+                        ),
+                        None,
+                    )
+                    if (
+                        latest_target is not None
+                        and latest_target.get("status") in {"done", "expired"}
+                    ):
+                        cancelled_row = memory.cancel_reminder_for_source(
+                            group_id,
+                            int(latest_target["reminder_id"]),
+                            str(latest_target["action"]),
+                            int(latest_target["remind_at"]),
+                            "calendar_event",
+                            source_ref,
+                            str(latest_target["status"]),
+                        )
+                if cancelled_row is not None:
+                    when = datetime.fromtimestamp(
+                        int(cancelled_row["remind_at"]),
+                        tz=ZoneInfo("Asia/Taipei"),
+                    ).strftime("%Y-%m-%d %H:%M")
+                    if cancelled_row.get("_delivery_in_flight"):
+                        reply = (
+                            "已取消後續提醒\n"
+                            "這一則已開始傳送，仍可能送達。\n"
+                            f"時間：{when}\n"
+                            f"事項：{cancelled_row['action']}"
+                        )
+                    else:
+                        reply = (
+                            "已取消提醒\n"
+                            f"時間：{when}\n"
+                            f"事項：{cancelled_row['action']}"
+                        )
+                else:
+                    # A sender or another cancellation may have won the race.
+                    if source_ref:
+                        latest_source_rows = (
+                            memory.list_reminder_source_cancellation_candidates(
+                                group_id,
+                                "calendar_event",
+                                source_ref,
+                            )
+                        )
+                        latest_cancelled = [
+                            row
+                            for row in latest_source_rows
+                            if row.get("status") == "cancelled"
+                        ]
+                        repeated = (
+                            reminder_cancel.resolve_cancel_request_by_source(
+                                request,
+                                latest_cancelled,
+                                source_kind="calendar_event",
+                                source_ref=source_ref,
+                            )
+                        )
+                    elif mapped_reminder_id is not None:
+                        latest_row = memory.get_reminder(mapped_reminder_id)
+                        if (
+                            latest_row is not None
+                            and latest_row.get("group_id") == group_id
+                            and latest_row.get("status") == "cancelled"
+                        ):
+                            repeated = reminder_cancel.CancelResolution(
+                                status=(
+                                    reminder_cancel.CancelResolutionStatus.MATCHED
+                                ),
+                                reminder_id=int(latest_row["reminder_id"]),
+                                action=str(latest_row["action"]),
+                                remind_at=int(latest_row["remind_at"]),
+                                reference=reference,
+                            )
+                        else:
+                            repeated = no_identity_match
+                    else:
+                        latest = memory.list_reminder_cancellation_candidates(
+                            group_id, include_cancelled=True
+                        )
+                        latest_cancelled = [
+                            row
+                            for row in latest
+                            if row.get("status") == "cancelled"
+                        ]
+                        repeated = reminder_cancel.resolve_cancel_request(
+                            request, latest_cancelled
+                        )
+                    if (
+                        repeated.status
+                        is reminder_cancel.CancelResolutionStatus.MATCHED
+                    ):
+                        reply = "這則提醒已經取消過了，不會再推送。"
+                    else:
+                        reply = (
+                            "這則提醒的狀態剛剛已變更，沒有再做取消。\n"
+                            "請查看提醒清單確認目前狀態。"
+                        )
+        elif resolution.status is reminder_cancel.CancelResolutionStatus.AMBIGUOUS:
+            if resolution.reason == "calendar_source_unavailable":
+                reply = (
+                    "目前無法確認這則活動提醒的來源，先沒有取消。\n"
+                    "請直接回覆原提醒後說「這則取消」。"
+                )
+            else:
+                reply = (
+                    "找到多筆完全相同的提醒，先沒有取消。\n"
+                    "請提供更明確的時間與事項。"
+                )
+        else:
+            if (
+                previous_resolution.status
+                is reminder_cancel.CancelResolutionStatus.MATCHED
+            ):
+                reply = "這則提醒已經取消過了，不會再推送。"
+            elif (
+                previous_resolution.status
+                is reminder_cancel.CancelResolutionStatus.AMBIGUOUS
+            ):
+                reply = "找到多筆已取消的相同提醒；目前沒有變更任何提醒。"
+            else:
+                reply = (
+                    "沒有找到時間與事項都相符的待取消提醒，先沒有變更。\n"
+                    "請查看提醒清單，或回覆原提醒後說「這則取消」。"
+                )
+
+    _reply(
+        event.reply_token,
+        reply,
+        group_id=group_id,
+        include_auxiliary=False,
+    )
+    logger.info(
+        "reminder cancellation handled group=%s result=%r text_len=%d",
+        group_id,
+        reply.splitlines()[0],
+        len(text),
+    )
+    return True
+
+
 def _handle_text_message(event: MessageEvent, group_id: str) -> None:
     text = event.message.text or ""
+    # Cancellation must run before quote-context expansion, one-shot replies,
+    # calendar capture, classifiers, and reminder extraction.  Otherwise a
+    # pasted cancellation can be misread as a new reminder.
+    if _try_handle_reminder_cancellation(event, group_id, text):
+        return
     text_with_quote_context = _text_with_quote_context(event.message, group_id, text)
     source = getattr(event, "source", None)
     sender_user_id = getattr(source, "user_id", None) or ""
@@ -3895,13 +4591,30 @@ def _handle_todo_query(
     try:
         if not settings.bot_muted:
             with ApiClient(_get_line_config()) as api_client:
-                MessagingApi(api_client).reply_message(
+                response = MessagingApi(api_client).reply_message(
                     ReplyMessageRequest(
                         reply_token=event.reply_token,
                         messages=[message],
                     )
                 )
             _mark_inbound_reply_succeeded(event.reply_token)
+            try:
+                for sent in getattr(response, "sent_messages", None) or []:
+                    sent_id = getattr(sent, "id", None)
+                    if sent_id:
+                        memory.log_raw_message(
+                            group_id,
+                            str(sent_id),
+                            "__bot__",
+                            reply_text,
+                        )
+            except Exception as archive_error:
+                logger.error(
+                    "todo reply delivered but sent-message archive failed "
+                    "group=%s: %s",
+                    group_id,
+                    str(archive_error)[:200],
+                )
         logger.info("todo query reply sent group=%s", group_id)
     except Exception as e:
         logger.warning("todo query reply failed: %s", e)
@@ -8672,6 +9385,7 @@ def _reply(
     group_id: str | None = None,
     *,
     allow_push_fallback: bool = True,
+    include_auxiliary: bool = True,
 ) -> None:
     """
     回覆 LINE 訊息。若帶 group_id,成功後會把 bot 的回覆也存進 raw_messages,
@@ -8726,17 +9440,28 @@ def _reply(
             reply_targets=reply_targets,
         )
     messages_to_send: list = [] if primary_suppressed else [primary_message]
+    message_reminder_refs: list[dict | None] = (
+        [] if primary_suppressed else [None]
+    )
     pending_commit_ids: list[str] = []
     pending_confirmation_claims: list[tuple[int, str]] = []
     confirmations_committed = False
-    pending_reminders: list[tuple[str, int]] = []  # (event_id, offset) — reply 成功才 mark
-    pending_reminder_pushes: list[tuple[int, str]] = []  # (reminder_id, stage) — reply 成功才 mark
+    pending_reminders: list[tuple[str, int]] = []
+    pending_reminder_pushes: list[dict] = []
+    pending_reminder_indexes: list[int] = []
+    pending_reminder_push_indexes: list[int] = []
+    event_delivery_claims: list[dict] = []
+    natural_delivery_claims: list[dict] = []
+    reminder_delivery_started = False
+    reminder_delivery_settled = False
     pending_slot = None
     try:
         if group_id:
             # Step 1: legacy pending reply branch。拿同一把 drain lock，且只
             # peek；reply 成功後才 commit removal。
             if (
+                include_auxiliary
+                and
                 messages_to_send
                 and _pending_reply_enabled()
                 and _load_pending_explicit().get(group_id)
@@ -8768,6 +9493,7 @@ def _reply(
                                 explicit_only=True,
                             )
                             messages_to_send.append(pig_message)
+                            message_reminder_refs.append(None)
                             if msg_id:
                                 pending_commit_ids.append(msg_id)
                             logger.info(
@@ -8788,7 +9514,7 @@ def _reply(
             # Reminder creation acknowledgements are durable and ride on a
             # normal reply. They never intercept an unrelated inbound message
             # and are deleted only after LINE accepts this reply.
-            if messages_to_send and len(messages_to_send) < 5:
+            if include_auxiliary and messages_to_send and len(messages_to_send) < 5:
                 confirmation_start = len(messages_to_send)
                 try:
                     remaining = 5 - len(messages_to_send)
@@ -8810,8 +9536,10 @@ def _reply(
                             )
                         )
                         messages_to_send.append(confirmation_message)
+                        message_reminder_refs.append(None)
                 except Exception as e:
                     del messages_to_send[confirmation_start:]
+                    del message_reminder_refs[confirmation_start:]
                     if pending_confirmation_claims:
                         try:
                             memory.release_reminder_confirmations(
@@ -8824,7 +9552,7 @@ def _reply(
                             )
                     pending_confirmation_claims = []
                     logger.warning("reminder confirmation piggyback skipped: %s", e)
-            if _reminder_reply_piggyback_enabled():
+            if include_auxiliary and _reminder_reply_piggyback_enabled():
                 # Step 2: 剩餘 slot 給 due reminders (legacy quota fallback)
                 try:
                     import calendar_db
@@ -8846,7 +9574,16 @@ def _reply(
                             reminder_message = _er.sdk_message_from_spec(spec)
                             if reminder_message is None:
                                 continue
+                            pending_reminder_indexes.append(len(messages_to_send))
                             messages_to_send.append(reminder_message)
+                            message_reminder_refs.append(
+                                {
+                                    "source_kind": (
+                                        calendar_db.EVENT_REMINDER_SOURCE_KIND
+                                    ),
+                                    "source_ref": str(e["event_id"]),
+                                }
+                            )
                             pending_reminders.append((e["event_id"], offset))
                 except Exception as e:
                     logger.warning("reminder piggyback skip: %s", e)
@@ -8859,6 +9596,13 @@ def _reply(
                         for item in _rp.due_reminders_for_reply(
                             group_id, limit=remaining
                         ):
+                            if not memory.is_reminder_pending(
+                                group_id, int(item["reminder_id"])
+                            ):
+                                continue
+                            pending_reminder_push_indexes.append(
+                                len(messages_to_send)
+                            )
                             messages_to_send.append(
                                 item.get("message")
                                 or _text_message_with_mentions(
@@ -8868,17 +9612,95 @@ def _reply(
                                     explicit_only=True,
                                 )[1]
                             )
-                            pending_reminder_pushes.append(
-                                (item["reminder_id"], item["stage"])
+                            message_reminder_refs.append(
+                                {
+                                    "reminder_id": int(item["reminder_id"]),
+                                    "source_kind": str(
+                                        item.get("source_kind") or ""
+                                    ),
+                                    "source_ref": str(
+                                        item.get("source_ref") or ""
+                                    ),
+                                }
                             )
+                            pending_reminder_pushes.append(item)
                 except Exception as e:
                     logger.warning("reminder_push piggyback skip: %s", e)
 
         resp = None
+        # Claims are the shared linearization point for cancellation, cron
+        # pushes, and both reply-token paths. Keep the primary reply and drop
+        # only reminder items that cannot atomically acquire their occurrence.
+        drop_indexes: set[int] = set()
+        kept_event_reminders: list[tuple[str, int]] = []
+        for idx, item in zip(pending_reminder_indexes, pending_reminders):
+            event_id, offset = item
+            try:
+                import calendar_db as _cdb_guard
+
+                claim = memory.claim_calendar_reminder_delivery(
+                    group_id or "",
+                    _cdb_guard.EVENT_REMINDER_SOURCE_KIND,
+                    str(event_id),
+                    offset,
+                    transport="reply",
+                )
+            except Exception as guard_error:
+                logger.warning(
+                    "event reminder delivery claim failed: %s",
+                    guard_error,
+                )
+                claim = None
+            if claim is None:
+                drop_indexes.add(idx)
+            else:
+                kept_event_reminders.append((event_id, offset))
+                event_delivery_claims.append(claim)
+        kept_natural_reminders: list[dict] = []
+        for idx, item in zip(
+            pending_reminder_push_indexes, pending_reminder_pushes
+        ):
+            try:
+                claim = memory.claim_natural_reminder_delivery(
+                    group_id or "",
+                    int(item["reminder_id"]),
+                    str(item["stage"]),
+                    expected_action=str(item["action"]),
+                    expected_remind_at=int(item["remind_at"]),
+                    expected_weekly_count=int(item.get("weekly_count") or 0),
+                    transport="reply",
+                )
+            except Exception as guard_error:
+                logger.warning(
+                    "natural reminder delivery claim failed: %s",
+                    guard_error,
+                )
+                claim = None
+            if claim is None:
+                drop_indexes.add(idx)
+            else:
+                kept_natural_reminders.append(item)
+                natural_delivery_claims.append(claim)
+        if drop_indexes:
+            messages_to_send = [
+                message
+                for idx, message in enumerate(messages_to_send)
+                if idx not in drop_indexes
+            ]
+            message_reminder_refs = [
+                reference
+                for idx, reference in enumerate(message_reminder_refs)
+                if idx not in drop_indexes
+            ]
+            pending_reminders = kept_event_reminders
+            pending_reminder_pushes = kept_natural_reminders
         if not messages_to_send:
             logger.info("reply suppressed with no piggyback messages group=%s", group_id)
             return
         try:
+            reminder_delivery_started = bool(
+                event_delivery_claims or natural_delivery_claims
+            )
             with ApiClient(_get_line_config()) as api_client:
                 resp = MessagingApi(api_client).reply_message(
                     ReplyMessageRequest(
@@ -8888,8 +9710,18 @@ def _reply(
                 )
                 _mark_inbound_reply_succeeded(reply_token)
         except Exception as e:
+            delivery_claims = [
+                *event_delivery_claims,
+                *natural_delivery_claims,
+            ]
+            definite_reply_failure = _is_definite_reply_token_error(e)
+            if definite_reply_failure:
+                memory.release_reminder_delivery_claims(delivery_claims)
+            else:
+                memory.mark_reminder_delivery_claims_uncertain(delivery_claims)
+            reminder_delivery_settled = True
             logger.warning("reply failed: %s", str(e)[:300])
-            if group_id and not _is_definite_reply_token_error(e):
+            if group_id and not definite_reply_failure:
                 logger.warning(
                     "reply failure ambiguous; skip fallback push to avoid duplicate group=%s",
                     group_id,
@@ -8915,7 +9747,7 @@ def _reply(
                         reply_targets=reply_targets,
                     )
                     with ApiClient(_get_line_config()) as api_client:
-                        MessagingApi(api_client).push_message(
+                        push_response = MessagingApi(api_client).push_message(
                             PushMessageRequest(
                                 to=group_id,
                                 messages=[push_message],
@@ -8923,9 +9755,35 @@ def _reply(
                         )
                     logger.info("fallback push_message sent to group=%s", group_id)
                     _mark_inbound_reply_succeeded(reply_token)
-                    memory.log_raw_message(
-                        group_id, f"push_{int(time.time() * 1000)}", "__bot__", text
-                    )
+                    try:
+                        archived = False
+                        for sent in (
+                            getattr(push_response, "sent_messages", None) or []
+                        ):
+                            sent_id = getattr(sent, "id", None)
+                            if not sent_id:
+                                continue
+                            memory.log_raw_message(
+                                group_id,
+                                str(sent_id),
+                                "__bot__",
+                                text,
+                            )
+                            archived = True
+                        if not archived:
+                            memory.log_raw_message(
+                                group_id,
+                                f"push_{int(time.time() * 1000)}",
+                                "__bot__",
+                                text,
+                            )
+                    except Exception as archive_error:
+                        logger.error(
+                            "fallback push delivered but sent-message archive "
+                            "failed group=%s: %s",
+                            group_id,
+                            str(archive_error)[:200],
+                        )
                 except Exception as push_err:
                     logger.warning("fallback push also failed: %s", str(push_err)[:300])
             return
@@ -8962,49 +9820,74 @@ def _reply(
             except Exception as e:
                 logger.warning("reminder confirmation commit failed: %s", e)
 
-        # reply 成功 → mark reminders (peek-then-confirm pattern)
-        if pending_reminders:
+        # Archive accepted message IDs while delivery claims still pin each
+        # natural reminder identity. Finalizing first would let dedupe delete a
+        # bound reminder_id before its outbound reference is persisted.
+        if group_id is not None:
             try:
-                import calendar_db as _cdb
-                for ev_id, off in pending_reminders:
-                    _cdb.mark_reminded(ev_id, off, group_id)
-                logger.info(
-                    "reminder piggyback marked: %d reminders group=%s",
-                    len(pending_reminders), group_id,
+                sent_messages = getattr(resp, "sent_messages", None) or []
+                for idx, sm in enumerate(sent_messages):
+                    sm_id = getattr(sm, "id", None)
+                    if sm_id:
+                        sent_text = text
+                        if idx < len(messages_to_send):
+                            sent_text = getattr(messages_to_send[idx], "text", text)
+                        memory.log_raw_message(group_id, sm_id, "__bot__", sent_text)
+                        reference = (
+                            message_reminder_refs[idx]
+                            if idx < len(message_reminder_refs)
+                            else None
+                        )
+                        if reference:
+                            memory.log_sent_reminder_reference(
+                                group_id,
+                                str(sm_id),
+                                reminder_id=reference.get("reminder_id"),
+                                source_kind=str(
+                                    reference.get("source_kind") or ""
+                                ),
+                                source_ref=str(
+                                    reference.get("source_ref") or ""
+                                ),
+                            )
+            except Exception as archive_error:
+                # LINE already accepted the reply. Archival is best-effort and
+                # must never make webhook redelivery send the same reply again.
+                logger.error(
+                    "reply delivered but sent-message archive failed group=%s: %s",
+                    group_id,
+                    str(archive_error)[:200],
                 )
-            except Exception as e:
-                logger.warning("reminder mark_reminded failed: %s", e)
 
-        # reply 成功 → mark reminder_push reminders (peek-then-confirm pattern)
-        if pending_reminder_pushes:
+        # LINE accepted the batch. Finalize only claims owned by this sender;
+        # cancellation that linearized after the claim remains authoritative.
+        for claim in event_delivery_claims:
+            if not memory.finalize_calendar_reminder_delivery(claim):
+                logger.error(
+                    "event reminder claim finalization failed source=%s group=%s",
+                    claim.get("source_ref"),
+                    group_id,
+                )
+        for claim in natural_delivery_claims:
+            if not memory.finalize_natural_reminder_delivery(claim):
+                logger.error(
+                    "natural reminder claim finalization failed rid=%s group=%s",
+                    claim.get("reminder_id"),
+                    group_id,
+                )
+        reminder_delivery_settled = True
+    finally:
+        delivery_claims = [*event_delivery_claims, *natural_delivery_claims]
+        if delivery_claims and not reminder_delivery_settled:
             try:
-                import reminder_push as _rp
-                marked = _rp.mark_reminders_pushed(pending_reminder_pushes)
-                if marked < len(pending_reminder_pushes):
-                    logger.error(
-                        "reminder_push piggyback marked %d/%d reminders group=%s",
-                        marked, len(pending_reminder_pushes), group_id,
+                if reminder_delivery_started:
+                    memory.mark_reminder_delivery_claims_uncertain(
+                        delivery_claims
                     )
                 else:
-                    logger.info(
-                        "reminder_push piggyback marked: %d reminders group=%s",
-                        marked, group_id,
-                    )
+                    memory.release_reminder_delivery_claims(delivery_claims)
             except Exception as e:
-                logger.warning("reminder_push mark_reminders_pushed failed: %s", e)
-
-        # 把 bot 自己的回覆也記進 raw_messages,供之後 quote-lookup
-        if group_id is None:
-            return
-        sent_messages = getattr(resp, "sent_messages", None) or []
-        for idx, sm in enumerate(sent_messages):
-            sm_id = getattr(sm, "id", None)
-            if sm_id:
-                sent_text = text
-                if idx < len(messages_to_send):
-                    sent_text = getattr(messages_to_send[idx], "text", text)
-                memory.log_raw_message(group_id, sm_id, "__bot__", sent_text)
-    finally:
+                logger.warning("reminder delivery claim recovery failed: %s", e)
         if pending_confirmation_claims and group_id and not confirmations_committed:
             try:
                 memory.release_reminder_confirmations(

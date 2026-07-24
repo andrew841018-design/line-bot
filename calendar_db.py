@@ -282,7 +282,11 @@ def _event_to_remind_at(
         return None
 
 
-def _upsert_event_reminder(event: Mapping[str, object]) -> bool:
+def _upsert_event_reminder(
+    event: Mapping[str, object],
+    *,
+    preserve_existing: bool = False,
+) -> bool:
     if not event:
         return False
     days_before = _event_reminder_lead_days(event)
@@ -320,8 +324,21 @@ def _upsert_event_reminder(event: Mapping[str, object]) -> bool:
 
     _ensure_memory_db_path()
     try:
-        if hasattr(memory, "upsert_reminder_for_source_any_status"):
-            memory.upsert_reminder_for_source_any_status(
+        if preserve_existing:
+            if not hasattr(memory, "ensure_reminder_for_source"):
+                return False
+            reminder_id = memory.ensure_reminder_for_source(
+                group_id=str(event.get("group_id", "")),
+                user_id=reminder_user_id,
+                action=action,
+                remind_at=remind_at,
+                source_kind=EVENT_REMINDER_SOURCE_KIND,
+                source_ref=str(event.get("event_id", "")),
+                source_text=source_text,
+                mention_aliases=mention_aliases,
+            )
+        elif hasattr(memory, "upsert_reminder_for_source_any_status"):
+            reminder_id = memory.upsert_reminder_for_source_any_status(
                 group_id=str(event.get("group_id", "")),
                 user_id=reminder_user_id,
                 action=action,
@@ -332,7 +349,7 @@ def _upsert_event_reminder(event: Mapping[str, object]) -> bool:
                 mention_aliases=mention_aliases,
             )
         else:
-            memory.upsert_reminder_for_source(
+            reminder_id = memory.upsert_reminder_for_source(
                 group_id=str(event.get("group_id", "")),
                 user_id=reminder_user_id,
                 action=action,
@@ -342,9 +359,33 @@ def _upsert_event_reminder(event: Mapping[str, object]) -> bool:
                 source_text=source_text,
                 mention_aliases=mention_aliases,
             )
-        return True
+        return reminder_id is not None
     except Exception:
         return False
+
+
+def ensure_event_reminder_mirror(event: Mapping[str, object]) -> bool:
+    """Safely backfill one event source without reviving terminal reminders."""
+
+    return _upsert_event_reminder(event, preserve_existing=True)
+
+
+def ensure_active_event_reminder_mirrors(group_id: str | None = None) -> int:
+    """Insert missing reminder mirrors for active legacy calendar events."""
+
+    _ensure_memory_db_path()
+    with _lock, _conn() as c:
+        c.row_factory = sqlite3.Row
+        if group_id:
+            rows = c.execute(
+                "SELECT * FROM events WHERE group_id=? AND status='active'",
+                (group_id,),
+            ).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT * FROM events WHERE status='active'",
+            ).fetchall()
+    return sum(ensure_event_reminder_mirror(dict(row)) for row in rows)
 
 
 class _ClosingConnection(sqlite3.Connection):
@@ -594,6 +635,102 @@ def find_active_event(
             if r["event_date"] == near_date:
                 return dict(r)
     return dict(rows[0])
+
+
+def find_active_events_exact(
+    group_id: str,
+    *,
+    title: str,
+    event_date: str,
+    event_time: str | None,
+) -> list[dict]:
+    """Return every normalized-exact active event for a reminder reference.
+
+    Titles use the same NFKC/whitespace/casefold contract as natural-reminder
+    cancellation. Returning every match lets the caller fail closed when raw
+    titles differ but normalize to the same user-visible value.
+    """
+
+    import reminder_cancel
+
+    with _lock, _conn() as c:
+        c.row_factory = sqlite3.Row
+        rows = c.execute(
+            "SELECT * FROM events WHERE group_id=? AND status='active'",
+            (group_id,),
+        ).fetchall()
+    normalized_title = reminder_cancel.normalize_action(title)
+    target_schedule = _event_schedule_minute_key(event_date, event_time)
+    if not normalized_title or target_schedule is None:
+        return []
+    return [
+        dict(row)
+        for row in rows
+        if reminder_cancel.normalize_action(row["title"]) == normalized_title
+        and _event_schedule_minute_key(
+            row["event_date"],
+            row["event_time"],
+        )
+        == target_schedule
+    ]
+
+
+def _event_time_minute_key(value: object) -> tuple[int, int] | None:
+    """Normalize stored ``H:MM``/``HH:MM`` values to one calendar minute."""
+
+    parts = str(value or "").strip().split(":")
+    if len(parts) != 2:
+        return None
+    try:
+        hour, minute = (int(part) for part in parts)
+    except ValueError:
+        return None
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+        return None
+    return hour, minute
+
+
+def _event_schedule_minute_key(
+    event_date: object,
+    event_time: object,
+) -> tuple[int, int, int, int | None, int | None] | None:
+    """Normalize a stored event schedule without trusting string padding."""
+
+    date_parts = str(event_date or "").strip().split("-")
+    if len(date_parts) != 3:
+        return None
+    try:
+        year, month, day = (int(part) for part in date_parts)
+        date(year, month, day)
+    except (TypeError, ValueError):
+        return None
+    raw_time = str(event_time or "").strip()
+    if not raw_time:
+        return year, month, day, None, None
+    time_key = _event_time_minute_key(raw_time)
+    if time_key is None:
+        return None
+    return year, month, day, time_key[0], time_key[1]
+
+
+def find_active_event_exact(
+    group_id: str,
+    *,
+    title: str,
+    event_date: str,
+    event_time: str | None,
+) -> dict | None:
+    """Return one normalized-exact active event, or ``None`` if ambiguous."""
+
+    rows = find_active_events_exact(
+        group_id,
+        title=title,
+        event_date=event_date,
+        event_time=event_time,
+    )
+    if len(rows) != 1:
+        return None
+    return rows[0]
 
 
 def cancel_event(event_id: str) -> bool:
@@ -853,7 +990,30 @@ def list_due_for_reminder(group_id: str, days_ahead: int = 7) -> list[dict]:
                 "AND event_date = ? AND reminded_at IS NULL",
                 (group_id, target),
             ).fetchall()
-    return [dict(r) for r in rows]
+    events = [dict(r) for r in rows]
+    if not events:
+        return []
+
+    # A user may cancel the reminder while keeping the calendar event active.
+    # The cancelled source row is a durable tombstone shared by both reminder
+    # senders; do not let event_reminder.py bypass that preference.
+    import memory
+
+    _ensure_memory_db_path()
+    events = [
+        event
+        for event in events
+        if ensure_event_reminder_mirror(event)
+    ]
+    return [
+        event
+        for event in events
+        if not memory.is_reminder_source_cancelled(
+            group_id,
+            EVENT_REMINDER_SOURCE_KIND,
+            str(event.get("event_id") or ""),
+        )
+    ]
 
 
 def mark_reminded(event_id: str, days_ahead: int, group_id: str) -> None:

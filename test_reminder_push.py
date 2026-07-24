@@ -38,9 +38,9 @@ def test_due_reminders_for_reply_returns_due_items(monkeypatch):
     monkeypatch.setattr(reminder_push.memory, "list_pending_reminders_full", fake_list)
 
     due = reminder_push.due_reminders_for_reply("G1", limit=2, now=now)
-    remind_at = reminder_push.datetime.fromtimestamp(now + 86400).strftime(
-        "%Y-%m-%d %H:%M"
-    )
+    remind_at = reminder_push.datetime.fromtimestamp(
+        now + 86400, reminder_push._TW
+    ).strftime("%Y-%m-%d %H:%M")
 
     assert seen["group_id"] == "G1"
     assert len(due) == 1
@@ -244,6 +244,72 @@ def test_push_to_group_uses_refreshed_line_token(monkeypatch):
         assert reminder_push._push_to_group("G1", "hello")
 
     assert seen["token"] == "fresh-token"
+
+
+def test_push_to_group_forwards_deterministic_retry_key(monkeypatch):
+    monkeypatch.setattr(reminder_push, "_line_access_token", lambda: "token")
+    seen = {}
+
+    class FakeApiClient:
+        def __init__(self, _cfg):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class FakeMessagingApi:
+        def __init__(self, _client):
+            pass
+
+        def push_message(self, _request, x_line_retry_key=None):
+            seen["retry_key"] = x_line_retry_key
+            return MagicMock(sent_messages=[])
+
+    monkeypatch.setattr(reminder_push, "ApiClient", FakeApiClient)
+    monkeypatch.setattr(reminder_push, "MessagingApi", FakeMessagingApi)
+
+    assert reminder_push._push_to_group(
+        "G1",
+        "提醒",
+        retry_key="123e4567-e89b-12d3-a456-426614174000",
+    )
+    assert seen["retry_key"] == "123e4567-e89b-12d3-a456-426614174000"
+
+
+def test_push_to_group_treats_retry_key_conflict_as_already_delivered(monkeypatch):
+    monkeypatch.setattr(reminder_push, "_line_access_token", lambda: "token")
+
+    class RetryAccepted(Exception):
+        status = 409
+
+    class FakeApiClient:
+        def __init__(self, _cfg):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class FakeMessagingApi:
+        def __init__(self, _client):
+            pass
+
+        def push_message(self, _request, x_line_retry_key=None):
+            raise RetryAccepted("already accepted")
+
+    monkeypatch.setattr(reminder_push, "ApiClient", FakeApiClient)
+    monkeypatch.setattr(reminder_push, "MessagingApi", FakeMessagingApi)
+
+    assert reminder_push._push_to_group(
+        "G1",
+        "提醒",
+        retry_key="123e4567-e89b-12d3-a456-426614174000",
+    )
 
 
 def test_line_access_token_falls_back_to_env_token(monkeypatch):

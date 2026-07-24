@@ -114,7 +114,11 @@ def _retry_key_for_event(e: dict, offset: int, suffix: str = "main") -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, seed))
 
 
-def _post_result(messages: list, retry_key: str | None = None) -> str:
+def _post_result(
+    messages: list,
+    retry_key: str | None = None,
+    reminder_refs: list[dict | None] | None = None,
+) -> str:
     """共用底層推播：組好的 messages list → LINE push API。
     token / GROUP_ID 缺失或非 200/409 回分類結果；失敗 log 先遮蔽 LINE id 再截斷。
     （_push / _push_mention 共用，遮蔽邏輯只寫一處 — GP2 DRY review）"""
@@ -123,6 +127,7 @@ def _post_result(messages: list, retry_key: str | None = None) -> str:
         logger.error("missing TOKEN or GROUP_ID; skip push")
         return POST_REJECT
     try:
+        sent_message_ids: list[str] = []
         push_messages(
             GROUP_ID,
             messages,
@@ -131,7 +136,45 @@ def _post_result(messages: list, retry_key: str | None = None) -> str:
             timeout=10,
             ok_statuses=(200, 409),
             fallback_token=token,
+            sent_message_ids=sent_message_ids,
         )
+        try:
+            import memory
+
+            for idx, message_id in enumerate(sent_message_ids):
+                message = messages[idx] if idx < len(messages) else {}
+                text = (
+                    str(message.get("text") or "")
+                    if isinstance(message, dict)
+                    else ""
+                )
+                if text:
+                    memory.log_raw_message(
+                        GROUP_ID,
+                        message_id,
+                        "__bot__",
+                        text,
+                    )
+                    reference = (
+                        reminder_refs[idx]
+                        if reminder_refs is not None and idx < len(reminder_refs)
+                        else None
+                    )
+                    if reference:
+                        memory.log_sent_reminder_reference(
+                            GROUP_ID,
+                            message_id,
+                            reminder_id=reference.get("reminder_id"),
+                            source_kind=str(reference.get("source_kind") or ""),
+                            source_ref=str(reference.get("source_ref") or ""),
+                        )
+        except Exception as archive_error:
+            # The LINE request already succeeded. Never convert an archival
+            # failure into a retry that would duplicate the reminder.
+            logger.error(
+                "event reminder delivered but sent-message archive failed: %s",
+                str(archive_error)[:200],
+            )
         return POST_OK
     except LinePushError as e:
         body = _redact_line_ids(e.response_text or str(e))[:300]
@@ -149,8 +192,16 @@ def _post(messages: list, retry_key: str | None = None) -> bool:
     return _post_result(messages, retry_key=retry_key) == POST_OK
 
 
-def _push_result(text: str, retry_key: str | None = None) -> str:
-    return _post_result([{"type": "text", "text": text}], retry_key=retry_key)
+def _push_result(
+    text: str,
+    retry_key: str | None = None,
+    reminder_ref: dict | None = None,
+) -> str:
+    return _post_result(
+        [{"type": "text", "text": text}],
+        retry_key=retry_key,
+        reminder_refs=[reminder_ref],
+    )
 
 
 def _push(text: str, retry_key: str | None = None) -> bool:
@@ -158,7 +209,11 @@ def _push(text: str, retry_key: str | None = None) -> bool:
 
 
 def _push_mention_result(
-    text_template: str, placeholder: str, user_id: str, retry_key: str | None = None
+    text_template: str,
+    placeholder: str,
+    user_id: str,
+    retry_key: str | None = None,
+    reminder_ref: dict | None = None,
 ) -> str:
     """textV2 + substitution 真 @mention 推播（會跳通知給被標記者）。
     text_template 內用半形 {placeholder} 當佔位符；勿放其他非佔位符的半形 {}
@@ -177,6 +232,7 @@ def _push_mention_result(
             }
         ],
         retry_key=retry_key,
+        reminder_refs=[reminder_ref],
     )
 
 
@@ -264,6 +320,10 @@ def build_reminder_message_spec(
     e: dict, offset: int, allow_mention: bool = True
 ) -> dict | None:
     """Return a delivery spec for launchd and piggyback reminder paths."""
+    reminder_ref = {
+        "source_kind": calendar_db.EVENT_REMINDER_SOURCE_KIND,
+        "source_ref": str(e.get("event_id") or ""),
+    }
     cfg = _load_one_off_config()
     if cfg and e.get("event_id") in cfg["event_ids"]:
         if offset != cfg["offset"]:
@@ -280,23 +340,24 @@ def build_reminder_message_spec(
             if not mention_text.strip():
                 return None
             if mention_text != cfg["mention_text"]:
-                return {"kind": "text", "text": mention_text}
+                return {"kind": "text", "text": mention_text, **reminder_ref}
             return {
                 "kind": "mention",
                 "text": mention_text,
                 "placeholder": cfg["placeholder"],
                 "user_id": cfg["user_id"],
                 "fallback_text": plain_text,
+                **reminder_ref,
             }
         if plain_text:
-            return {"kind": "text", "text": plain_text}
+            return {"kind": "text", "text": plain_text, **reminder_ref}
         return None
     text = _format_event(e, offset)
     safe_text = validate_push_text(text, source="event_reminder")
     if safe_text != text:
         if not safe_text.strip():
             return None
-        return {"kind": "text", "text": safe_text}
+        return {"kind": "text", "text": safe_text, **reminder_ref}
     targets = line_mentions.event_mention_targets(e)
     plain_labels = line_mentions.event_plain_labels(e)
     if targets and allow_mention:
@@ -310,12 +371,13 @@ def build_reminder_message_spec(
         if fallback_text != line_mentions.text_with_plain_mentions(
             text, targets, plain_labels
         ):
-            return {"kind": "text", "text": fallback_text}
+            return {"kind": "text", "text": fallback_text, **reminder_ref}
         return {
             "kind": "textV2",
             "message": message,
             "text": message["text"],
             "fallback_text": fallback_text,
+            **reminder_ref,
         }
     if plain_labels:
         plain_text = validate_push_text(
@@ -327,18 +389,31 @@ def build_reminder_message_spec(
         return {
             "kind": "text",
             "text": plain_text,
+            **reminder_ref,
         }
-    return {"kind": "text", "text": text}
+    return {"kind": "text", "text": text, **reminder_ref}
 
 
 def _send_reminder_message_spec(
     spec: dict, retry_key: str | None = None, fallback_retry_key: str | None = None
 ) -> str:
+    reminder_ref = {
+        "source_kind": str(spec.get("source_kind") or ""),
+        "source_ref": str(spec.get("source_ref") or ""),
+    }
     if spec.get("kind") == "textV2":
-        result = _post_result([spec["message"]], retry_key=retry_key)
+        result = _post_result(
+            [spec["message"]],
+            retry_key=retry_key,
+            reminder_refs=[reminder_ref],
+        )
         fallback_text = spec.get("fallback_text")
         if result == POST_REJECT and fallback_text:
-            return _push_result(fallback_text, retry_key=fallback_retry_key)
+            return _push_result(
+                fallback_text,
+                retry_key=fallback_retry_key,
+                reminder_ref=reminder_ref,
+            )
         return result
     if spec.get("kind") == "mention":
         result = _push_mention_result(
@@ -346,14 +421,23 @@ def _send_reminder_message_spec(
             spec["placeholder"],
             spec["user_id"],
             retry_key=retry_key,
+            reminder_ref=reminder_ref,
         )
         if result == POST_OK:
             return result
         fallback_text = spec.get("fallback_text")
         if result == POST_REJECT and fallback_text:
-            return _push_result(fallback_text, retry_key=fallback_retry_key)
+            return _push_result(
+                fallback_text,
+                retry_key=fallback_retry_key,
+                reminder_ref=reminder_ref,
+            )
         return result
-    return _push_result(spec["text"], retry_key=retry_key)
+    return _push_result(
+        spec["text"],
+        retry_key=retry_key,
+        reminder_ref=reminder_ref,
+    )
 
 
 def sdk_message_from_spec(spec: dict):
@@ -411,19 +495,69 @@ def main() -> int:
             spec = build_reminder_message_spec(e, offset, allow_mention=True)
             if spec is None:
                 continue
-            result = _send_reminder_message_spec(
-                spec,
-                retry_key=_retry_key_for_event(e, offset),
-                fallback_retry_key=_retry_key_for_event(e, offset, "fallback"),
+            # Cancellation can race with list_due_for_reminder(). Recheck the
+            # durable tombstone immediately before the external LINE request.
+            try:
+                import memory
+
+                if memory.is_reminder_source_cancelled(
+                    GROUP_ID,
+                    calendar_db.EVENT_REMINDER_SOURCE_KIND,
+                    str(e.get("event_id") or ""),
+                ):
+                    logger.info(
+                        "skip cancelled event reminder before push: %s",
+                        e.get("event_id"),
+                    )
+                    continue
+            except Exception as guard_error:
+                # Fail closed: an unavailable cancellation store must not risk
+                # pushing something the user may just have cancelled.
+                logger.warning(
+                    "event reminder cancellation guard failed; skip %s: %s",
+                    e.get("event_id"),
+                    str(guard_error)[:160],
+                )
+                continue
+            claim = memory.claim_calendar_reminder_delivery(
+                GROUP_ID,
+                calendar_db.EVENT_REMINDER_SOURCE_KIND,
+                str(e.get("event_id") or ""),
+                offset,
+                transport="push",
             )
+            if claim is None:
+                logger.info(
+                    "skip unclaimed event reminder before push: %s T-%d",
+                    e.get("event_id"),
+                    offset,
+                )
+                continue
+            try:
+                result = _send_reminder_message_spec(
+                    spec,
+                    retry_key=str(claim["retry_key"]),
+                    fallback_retry_key=str(claim["fallback_retry_key"]),
+                )
+            except Exception:
+                memory.release_reminder_delivery_claim(claim)
+                raise
             if result == POST_OK:
-                calendar_db.mark_reminded(e["event_id"], offset, GROUP_ID)
+                finalized = memory.finalize_calendar_reminder_delivery(claim)
+                if not finalized:
+                    logger.error(
+                        "event delivery accepted but claim finalization failed "
+                        "(T-%d, %s)",
+                        offset,
+                        e["event_id"],
+                    )
                 total_sent += 1
                 logger.info(
                     "reminder sent (T-%d): %s '%s' on %s",
                     offset, e["event_id"], e["title"], e["event_date"],
                 )
             else:
+                memory.release_reminder_delivery_claim(claim)
                 # push 失敗不 mark — 下次 launchd 跑會 retry（at-least-once 保證）
                 logger.warning(
                     "reminder push failed (T-%d, %s): %s",

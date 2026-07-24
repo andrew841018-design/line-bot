@@ -23,6 +23,7 @@ import argparse
 import logging
 import time
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from linebot.v3.messaging import (
     ApiClient, Configuration, MessagingApi, PushMessageRequest, TextMessage,
@@ -38,6 +39,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("reminder_push")
 STALE_PENDING_GRACE_SECONDS = 3600
+_TW = ZoneInfo("Asia/Taipei")
 
 
 def _line_access_token() -> str:
@@ -45,7 +47,14 @@ def _line_access_token() -> str:
 
 
 def _push_to_group(
-    group_id: str, text: str, max_retries: int = 3, message: object | None = None
+    group_id: str,
+    text: str,
+    max_retries: int = 3,
+    message: object | None = None,
+    reminder_id: int | None = None,
+    source_kind: str = "",
+    source_ref: str = "",
+    retry_key: str | None = None,
 ) -> bool:
     """推到 LINE 群組。失敗回 False。
 
@@ -63,16 +72,70 @@ def _push_to_group(
     for attempt in range(max_retries):
         try:
             with ApiClient(cfg) as api_client:
-                MessagingApi(api_client).push_message(
-                    PushMessageRequest(
-                        to=group_id,
-                        messages=[message or TextMessage(text=safe_text[:4900])],
-                    )
+                request = PushMessageRequest(
+                    to=group_id,
+                    messages=[message or TextMessage(text=safe_text[:4900])],
+                )
+                api = MessagingApi(api_client)
+                response = (
+                    api.push_message(request, x_line_retry_key=retry_key)
+                    if retry_key
+                    else api.push_message(request)
+                )
+            # LINE 已接受後，archive 失敗不可觸發 retry，否則會重複推播。
+            try:
+                for sent in getattr(response, "sent_messages", None) or []:
+                    sent_id = getattr(sent, "id", None)
+                    if sent_id:
+                        memory.log_raw_message(
+                            group_id,
+                            str(sent_id),
+                            "__bot__",
+                            safe_text,
+                        )
+                        if reminder_id is not None or (
+                            source_kind and source_ref
+                        ):
+                            reference_kwargs: dict[str, object] = {
+                                "reminder_id": (
+                                    int(reminder_id)
+                                    if reminder_id is not None
+                                    else None
+                                )
+                            }
+                            if source_kind and source_ref:
+                                reference_kwargs.update(
+                                    {
+                                        "source_kind": source_kind,
+                                        "source_ref": source_ref,
+                                    }
+                                )
+                            memory.log_sent_reminder_reference(
+                                group_id,
+                                str(sent_id),
+                                **reference_kwargs,
+                            )
+            except Exception as archive_error:
+                logger.error(
+                    "reminder push delivered but sent-message archive failed "
+                    "group=%s: %s",
+                    group_id,
+                    str(archive_error)[:200],
                 )
             return True
         except Exception as e:
             err_str = str(e)
             status = getattr(e, "status", None)
+            if status is None:
+                status = getattr(e, "status_code", None)
+            if status == 409:
+                # A deterministic X-Line-Retry-Key returning 409 means LINE
+                # accepted the same logical delivery earlier.
+                logger.info(
+                    "LINE push retry key already accepted (group=%s)",
+                    group_id,
+                )
+                return True
             if status == 429 or "429" in err_str:
                 logger.warning("LINE push 429 quota (group=%s) — no retry", group_id)
                 return False
@@ -152,10 +215,10 @@ _DAY_BASED_STAGES = {"weekly", "3d", "1d"}
 def _stage_label(stage: str, remind_at: int, now: int | None = None) -> str:
     """Return a human label based on the target calendar date, not the window."""
     if stage in _DAY_BASED_STAGES:
-        now_ts = int(datetime.now().timestamp()) if now is None else now
+        now_ts = int(datetime.now(_TW).timestamp()) if now is None else now
         delta_days = (
-            datetime.fromtimestamp(remind_at).date()
-            - datetime.fromtimestamp(now_ts).date()
+            datetime.fromtimestamp(remind_at, _TW).date()
+            - datetime.fromtimestamp(now_ts, _TW).date()
         ).days
         if delta_days == 0:
             return "（今天）"
@@ -189,7 +252,7 @@ def _participant_plain_labels(r: dict) -> list[str]:
 
 
 def _format_push_text(r: dict, stage: str, now: int | None = None) -> str:
-    dt = datetime.fromtimestamp(r["remind_at"])
+    dt = datetime.fromtimestamp(r["remind_at"], _TW)
     label = _stage_label(stage, r["remind_at"], now=now)
     body = f"⏰ 提醒{label}\n{dt.strftime('%Y-%m-%d %H:%M')} {r['action']}"
     participants = _participant_names(r)
@@ -254,6 +317,10 @@ def _due_reminder_items(
                 "text": text,
                 "message": message,
                 "action": r["action"],
+                "remind_at": r["remind_at"],
+                "weekly_count": int(r.get("weekly_count") or 0),
+                "source_kind": str(r.get("source_kind") or ""),
+                "source_ref": str(r.get("source_ref") or ""),
             }
         )
         if len(due) >= limit:
@@ -291,7 +358,7 @@ def push_reminders(dry_run: bool = False) -> int:
         grace_seconds=STALE_PENDING_GRACE_SECONDS
     )
     if deleted:
-        logger.info("deleted %d stale pending reminders", deleted)
+        logger.info("cleaned %d stale pending reminders", deleted)
 
     sent = 0
 
@@ -307,15 +374,56 @@ def push_reminders(dry_run: bool = False) -> int:
             sent += 1
             continue
 
-        ok = _push_to_group(group_id, text, message=item.get("message"))
+        # The claim is the delivery linearization point shared with
+        # cancellation and reply-token piggyback senders.
+        if not memory.is_reminder_pending(group_id, reminder_id):
+            logger.info(
+                "skip no-longer-pending reminder before push rid=%d group=%s",
+                reminder_id,
+                group_id,
+            )
+            continue
+        claim = memory.claim_natural_reminder_delivery(
+            group_id,
+            reminder_id,
+            stage,
+            expected_action=str(item["action"]),
+            expected_remind_at=int(item["remind_at"]),
+            expected_weekly_count=int(item.get("weekly_count") or 0),
+            transport="push",
+        )
+        if claim is None:
+            logger.info(
+                "skip unclaimed reminder before push rid=%d group=%s",
+                reminder_id,
+                group_id,
+            )
+            continue
+
+        ok = _push_to_group(
+            group_id,
+            text,
+            message=item.get("message"),
+            reminder_id=reminder_id,
+            source_kind=str(item.get("source_kind") or ""),
+            source_ref=str(item.get("source_ref") or ""),
+            retry_key=str(claim["retry_key"]),
+        )
         if ok:
-            memory.mark_reminder_pushed(reminder_id, stage)
+            finalized = memory.finalize_natural_reminder_delivery(claim)
+            if not finalized:
+                logger.error(
+                    "delivery accepted but claim finalization failed rid=%d stage=%s",
+                    reminder_id,
+                    stage,
+                )
             logger.info(
                 "pushed rid=%d stage=%s action=%r",
                 reminder_id, stage, item["action"],
             )
             sent += 1
         else:
+            memory.release_reminder_delivery_claim(claim)
             logger.warning(
                 "push failed rid=%d stage=%s, will retry next run",
                 reminder_id, stage,
