@@ -13,12 +13,20 @@ import main
 class _Response:
     def __init__(self, payload):
         self._payload = payload
+        self.headers = {}
+        self.closed = False
 
     def raise_for_status(self):
         return None
 
     def json(self):
         return self._payload
+
+    def iter_content(self, chunk_size):
+        yield json.dumps(self._payload, ensure_ascii=False).encode("utf-8")
+
+    def close(self):
+        self.closed = True
 
 
 @pytest.fixture(autouse=True)
@@ -2312,6 +2320,287 @@ def test_bare_food_lookup_reports_official_dataset_unavailable(monkeypatch):
     reply = food_safety_client.check_restaurant_message("乳香世家牛奶")
 
     _assert_neutral_unavailable(reply)
+
+
+def test_transient_dns_failure_retries_once_then_recovers(monkeypatch):
+    response = _Response(_dataset())
+    get = Mock(
+        side_effect=[
+            food_safety_client.requests.ConnectionError("temporary DNS failure"),
+            response,
+        ]
+    )
+    sleep = Mock()
+    write_manifest = Mock()
+    monkeypatch.setattr(food_safety_client.requests, "get", get)
+    monkeypatch.setattr(food_safety_client.time, "sleep", sleep)
+    monkeypatch.setattr(
+        food_safety_client, "_write_accepted_manifest", write_manifest
+    )
+    food_safety_client.reset_cache()
+
+    dataset = food_safety_client._load_dataset()
+
+    assert dataset is not None
+    assert get.call_count == 2
+    assert all(call.kwargs["stream"] is True for call in get.call_args_list)
+    sleep.assert_called_once_with(food_safety_client._FETCH_RETRY_DELAY_SECONDS)
+    write_manifest.assert_called_once_with(dataset)
+    assert food_safety_client._last_fetch_failure_at == 0.0
+    assert response.closed is True
+
+
+def test_transient_connection_failures_exhaust_retry_budget(monkeypatch):
+    get = Mock(
+        side_effect=food_safety_client.requests.ConnectionError(
+            "temporary connection failure"
+        )
+    )
+    sleep = Mock()
+    monkeypatch.setattr(food_safety_client.requests, "get", get)
+    monkeypatch.setattr(food_safety_client.time, "sleep", sleep)
+    food_safety_client.reset_cache()
+
+    assert food_safety_client._load_dataset() is None
+    assert get.call_count == food_safety_client._FETCH_MAX_ATTEMPTS
+    assert sleep.call_count == food_safety_client._FETCH_MAX_ATTEMPTS - 1
+    assert food_safety_client._dataset_refreshing is False
+    assert food_safety_client._last_fetch_failure_at > 0.0
+
+    assert food_safety_client._load_dataset() is None
+    assert get.call_count == food_safety_client._FETCH_MAX_ATTEMPTS
+
+
+@pytest.mark.parametrize("status_code", [404, 429, 503])
+def test_http_error_is_not_retried(monkeypatch, status_code):
+    response = _Response(_dataset())
+    response.raise_for_status = Mock(
+        side_effect=food_safety_client.requests.HTTPError(
+            f"HTTP {status_code}",
+            response=Mock(status_code=status_code),
+        )
+    )
+    get = Mock(return_value=response)
+    sleep = Mock()
+    write_manifest = Mock()
+    monkeypatch.setattr(food_safety_client.requests, "get", get)
+    monkeypatch.setattr(food_safety_client.time, "sleep", sleep)
+    monkeypatch.setattr(
+        food_safety_client, "_write_accepted_manifest", write_manifest
+    )
+    food_safety_client.reset_cache()
+
+    assert food_safety_client._load_dataset() is None
+    get.assert_called_once()
+    sleep.assert_not_called()
+    write_manifest.assert_not_called()
+
+
+def test_ssl_error_is_not_retried(monkeypatch):
+    get = Mock(
+        side_effect=food_safety_client.requests.exceptions.SSLError(
+            "certificate verification failed"
+        )
+    )
+    sleep = Mock()
+    monkeypatch.setattr(food_safety_client.requests, "get", get)
+    monkeypatch.setattr(food_safety_client.time, "sleep", sleep)
+    food_safety_client.reset_cache()
+
+    assert food_safety_client._load_dataset() is None
+    get.assert_called_once()
+    sleep.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(
+            food_safety_client.requests.exceptions.ReadTimeout("read timed out"),
+            id="read-timeout",
+        ),
+        pytest.param(
+            food_safety_client.requests.RequestException("other request failure"),
+            id="generic-request-error",
+        ),
+    ],
+)
+def test_non_connection_request_error_is_not_retried(monkeypatch, error):
+    get = Mock(side_effect=error)
+    sleep = Mock()
+    monkeypatch.setattr(food_safety_client.requests, "get", get)
+    monkeypatch.setattr(food_safety_client.time, "sleep", sleep)
+    food_safety_client.reset_cache()
+
+    assert food_safety_client._load_dataset() is None
+    get.assert_called_once()
+    sleep.assert_not_called()
+
+
+def test_retry_waiter_budget_covers_all_bounded_attempts():
+    expected_operation_budget = (
+        food_safety_client._FETCH_MAX_ATTEMPTS
+        * food_safety_client._FETCH_TIMEOUT[0]
+        + food_safety_client._FETCH_TIMEOUT[1]
+        + (food_safety_client._FETCH_MAX_ATTEMPTS - 1)
+        * food_safety_client._FETCH_RETRY_DELAY_SECONDS
+    )
+
+    assert (
+        food_safety_client._FETCH_OPERATION_TIMEOUT_SECONDS
+        == expected_operation_budget
+    )
+    assert food_safety_client._FETCH_OPERATION_TIMEOUT_SECONDS <= 15.0
+    assert food_safety_client._FETCH_WAITER_TIMEOUT_SECONDS == (
+        expected_operation_budget + food_safety_client._FETCH_WAITER_SLACK_SECONDS
+    )
+    assert food_safety_client._FETCH_WAITER_TIMEOUT_SECONDS <= 16.0
+
+
+def test_fetch_operation_deadline_is_enforced(monkeypatch):
+    release_fetch = threading.Event()
+
+    def get(*args, **kwargs):
+        assert release_fetch.wait(timeout=2)
+        return _Response(_dataset())
+
+    monkeypatch.setattr(food_safety_client.requests, "get", get)
+    monkeypatch.setattr(food_safety_client, "_FETCH_OPERATION_TIMEOUT_SECONDS", 0.05)
+    food_safety_client.reset_cache()
+
+    started_at = food_safety_client.time.monotonic()
+    assert food_safety_client._load_dataset() is None
+    elapsed = food_safety_client.time.monotonic() - started_at
+
+    assert elapsed < 0.5
+    assert food_safety_client._dataset_refreshing is False
+    assert food_safety_client._last_fetch_failure_at > 0.0
+    with food_safety_client._fetch_worker_lock:
+        worker = food_safety_client._fetch_worker
+    assert worker is not None and worker.is_alive()
+    release_fetch.set()
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+    with food_safety_client._fetch_worker_lock:
+        assert food_safety_client._fetch_worker is None
+
+
+def test_body_read_connection_error_is_not_retried(monkeypatch):
+    response = _Response(_dataset())
+    response.iter_content = Mock(
+        side_effect=food_safety_client.requests.ConnectionError(
+            "wrapped body read timeout"
+        )
+    )
+    get = Mock(return_value=response)
+    sleep = Mock()
+    monkeypatch.setattr(food_safety_client.requests, "get", get)
+    monkeypatch.setattr(food_safety_client.time, "sleep", sleep)
+    food_safety_client.reset_cache()
+
+    assert food_safety_client._load_dataset() is None
+    get.assert_called_once()
+    sleep.assert_not_called()
+    assert response.closed is True
+
+
+def test_invalid_json_is_not_retried(monkeypatch):
+    response = _Response(_dataset())
+    response.iter_content = Mock(return_value=iter([b"{malformed"]))
+    get = Mock(return_value=response)
+    sleep = Mock()
+    write_manifest = Mock()
+    monkeypatch.setattr(food_safety_client.requests, "get", get)
+    monkeypatch.setattr(food_safety_client.time, "sleep", sleep)
+    monkeypatch.setattr(
+        food_safety_client, "_write_accepted_manifest", write_manifest
+    )
+    food_safety_client.reset_cache()
+
+    assert food_safety_client._load_dataset() is None
+    get.assert_called_once()
+    sleep.assert_not_called()
+    write_manifest.assert_not_called()
+
+
+def test_timed_out_fetch_worker_is_not_duplicated_after_backoff(monkeypatch):
+    release_fetch = threading.Event()
+    get = Mock(
+        side_effect=lambda *args, **kwargs: (
+            release_fetch.wait(timeout=2) and _Response(_dataset())
+        )
+    )
+    monkeypatch.setattr(food_safety_client.requests, "get", get)
+    monkeypatch.setattr(food_safety_client, "_FETCH_OPERATION_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(food_safety_client, "_FETCH_FAILURE_BACKOFF_SECONDS", 0.0)
+    food_safety_client.reset_cache()
+
+    assert food_safety_client._load_dataset() is None
+    assert food_safety_client._load_dataset() is None
+    assert get.call_count == 1
+
+    with food_safety_client._fetch_worker_lock:
+        worker = food_safety_client._fetch_worker
+    assert worker is not None and worker.is_alive()
+    release_fetch.set()
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+    assert food_safety_client._cached_dataset is None
+
+
+def test_oversized_dataset_response_fails_closed(monkeypatch):
+    response = _Response(_dataset())
+    response.headers = {
+        "Content-Length": str(food_safety_client._FETCH_MAX_RESPONSE_BYTES + 1)
+    }
+    get = Mock(return_value=response)
+    monkeypatch.setattr(food_safety_client.requests, "get", get)
+    food_safety_client.reset_cache()
+
+    assert food_safety_client._load_dataset() is None
+    get.assert_called_once()
+    assert response.closed is True
+
+
+def test_concurrent_cold_cache_transient_recovery_uses_one_retry_sequence(
+    monkeypatch,
+):
+    retry_started = threading.Event()
+    release_retry = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+    sleeps = []
+
+    def get(*args, **kwargs):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            call_number = calls
+        if call_number == 1:
+            raise food_safety_client.requests.ConnectionError(
+                "temporary DNS failure"
+            )
+        return _Response(_dataset())
+
+    def sleep(delay):
+        sleeps.append(delay)
+        retry_started.set()
+        assert release_retry.wait(timeout=2)
+
+    monkeypatch.setattr(food_safety_client.requests, "get", get)
+    monkeypatch.setattr(food_safety_client.time, "sleep", sleep)
+    food_safety_client.reset_cache()
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = [executor.submit(food_safety_client._load_dataset) for _ in range(6)]
+        assert retry_started.wait(timeout=1)
+        release_retry.set()
+        results = [future.result(timeout=3) for future in futures]
+
+    assert calls == 2
+    assert sleeps == [food_safety_client._FETCH_RETRY_DELAY_SECONDS]
+    assert all(result is results[0] for result in results)
+    assert results[0] is not None
 
 
 def test_concurrent_cold_cache_uses_one_dataset_fetch(monkeypatch):

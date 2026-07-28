@@ -14,6 +14,7 @@ import logging
 import math
 import os
 from pathlib import Path
+from queue import Empty, Queue
 import re
 import threading
 import time
@@ -38,6 +39,19 @@ _ORDER_CONTEXT_TTL_SECONDS = max(
     int(os.getenv("FOOD_SAFETY_ORDER_CONTEXT_TTL_SECONDS", "600")),
 )
 _FETCH_TIMEOUT = (3.0, 8.0)
+_FETCH_MAX_ATTEMPTS = 2
+_FETCH_RETRY_DELAY_SECONDS = 0.25
+_FETCH_WAITER_SLACK_SECONDS = 1.0
+# Only connection-stage failures are retried, so the read budget is counted once.
+_FETCH_OPERATION_TIMEOUT_SECONDS = (
+    _FETCH_MAX_ATTEMPTS * _FETCH_TIMEOUT[0]
+    + _FETCH_TIMEOUT[1]
+    + (_FETCH_MAX_ATTEMPTS - 1) * _FETCH_RETRY_DELAY_SECONDS
+)
+_FETCH_WAITER_TIMEOUT_SECONDS = (
+    _FETCH_OPERATION_TIMEOUT_SECONDS + _FETCH_WAITER_SLACK_SECONDS
+)
+_FETCH_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 _FETCH_FAILURE_BACKOFF_SECONDS = 30.0
 _DEFAULT_MAX_FRESHNESS_SECONDS = 48 * 3600
 _MIN_FLOW_ROWS = max(1, int(os.getenv("FOOD_SAFETY_MIN_FLOW_ROWS", "3000")))
@@ -100,6 +114,8 @@ _REQUIRED_OFFICIAL_SOURCE_SYNCS = frozenset(
 )
 _cache_lock = threading.Lock()
 _cache_condition = threading.Condition(_cache_lock)
+_fetch_worker_lock = threading.Lock()
+_fetch_worker: threading.Thread | None = None
 _context_lock = threading.Lock()
 _cached_dataset: dict | None = None
 _cached_at = 0.0
@@ -924,6 +940,129 @@ def _valid_dataset(
     return payload
 
 
+def _fetch_dataset_response(deadline: float) -> requests.Response:
+    """Open a streamed response, retrying only a connection-stage failure."""
+    for attempt in range(1, _FETCH_MAX_ATTEMPTS + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise requests.Timeout(
+                "food safety dataset fetch exceeded its operation deadline"
+            )
+        try:
+            return requests.get(
+                FOOD_SAFETY_DATA_URL,
+                timeout=(
+                    min(_FETCH_TIMEOUT[0], remaining),
+                    min(_FETCH_TIMEOUT[1], remaining),
+                ),
+                stream=True,
+            )
+        except requests.exceptions.SSLError:
+            raise
+        except requests.exceptions.ConnectionError as exc:
+            if attempt >= _FETCH_MAX_ATTEMPTS:
+                raise
+            if deadline - time.monotonic() <= _FETCH_RETRY_DELAY_SECONDS:
+                raise requests.Timeout(
+                    "food safety dataset fetch exceeded its operation deadline"
+                ) from exc
+            logger.warning(
+                "food safety dataset connection failure; retrying attempt %d/%d "
+                "after %s",
+                attempt + 1,
+                _FETCH_MAX_ATTEMPTS,
+                type(exc).__name__,
+            )
+            time.sleep(_FETCH_RETRY_DELAY_SECONDS)
+    raise RuntimeError("food safety fetch attempt loop exhausted unexpectedly")
+
+
+def _read_dataset_payload(response: requests.Response, deadline: float) -> object:
+    content_length = response.headers.get("Content-Length")
+    if content_length is not None:
+        try:
+            declared_size = int(content_length)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("food safety dataset has invalid content length") from exc
+        if declared_size < 0 or declared_size > _FETCH_MAX_RESPONSE_BYTES:
+            raise ValueError("food safety dataset exceeds response size limit")
+
+    body = bytearray()
+    chunks = response.iter_content(chunk_size=64 * 1024)
+    while True:
+        if time.monotonic() >= deadline:
+            raise requests.Timeout(
+                "food safety dataset body exceeded its operation deadline"
+            )
+        try:
+            chunk = next(chunks)
+        except StopIteration:
+            break
+        if not chunk:
+            continue
+        body.extend(chunk)
+        if len(body) > _FETCH_MAX_RESPONSE_BYTES:
+            raise ValueError("food safety dataset exceeds response size limit")
+    return json.loads(body)
+
+
+def _fetch_dataset_payload(deadline: float) -> object:
+    response = _fetch_dataset_response(deadline)
+    try:
+        response.raise_for_status()
+        return _read_dataset_payload(response, deadline)
+    finally:
+        response.close()
+
+
+def _fetch_dataset_payload_with_deadline() -> object:
+    global _fetch_worker
+    outcome: Queue[tuple[bool, object]] = Queue(maxsize=1)
+    deadline = time.monotonic() + _FETCH_OPERATION_TIMEOUT_SECONDS
+
+    def fetch() -> None:
+        result = None
+        try:
+            result = (True, _fetch_dataset_payload(deadline))
+        except Exception as exc:
+            result = (False, exc)
+        finally:
+            with _fetch_worker_lock:
+                if _fetch_worker is threading.current_thread():
+                    _fetch_worker = None
+        if result is not None:
+            outcome.put_nowait(result)
+
+    with _fetch_worker_lock:
+        if _fetch_worker is not None and _fetch_worker.is_alive():
+            raise requests.ConnectionError(
+                "previous food safety dataset fetch is still in progress"
+            )
+        worker = threading.Thread(
+            target=fetch,
+            name="food-safety-dataset-fetch",
+            daemon=True,
+        )
+        _fetch_worker = worker
+        try:
+            worker.start()
+        except Exception:
+            _fetch_worker = None
+            raise
+    try:
+        remaining = max(0.0, deadline - time.monotonic())
+        succeeded, value = outcome.get(timeout=remaining)
+    except Empty as exc:
+        raise requests.Timeout(
+            "food safety dataset fetch exceeded its operation deadline"
+        ) from exc
+    if succeeded:
+        return value
+    if isinstance(value, BaseException):
+        raise value
+    raise RuntimeError("food safety fetch worker returned an invalid outcome")
+
+
 def _load_dataset() -> dict | None:
     global _cached_dataset, _cached_at, _dataset_refreshing, _last_fetch_failure_at
     now = time.monotonic()
@@ -938,7 +1077,7 @@ def _load_dataset() -> dict | None:
         if now - _last_fetch_failure_at < _FETCH_FAILURE_BACKOFF_SECONDS:
             return None
         if _dataset_refreshing:
-            deadline = now + sum(_FETCH_TIMEOUT) + 1.0
+            deadline = now + _FETCH_WAITER_TIMEOUT_SECONDS
             while _dataset_refreshing:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -958,9 +1097,8 @@ def _load_dataset() -> dict | None:
     dataset = None
     try:
         accepted_manifest = _load_accepted_manifest()
-        response = requests.get(FOOD_SAFETY_DATA_URL, timeout=_FETCH_TIMEOUT)
-        response.raise_for_status()
-        dataset = _valid_dataset(response.json(), previous_dataset)
+        payload = _fetch_dataset_payload_with_deadline()
+        dataset = _valid_dataset(payload, previous_dataset)
         if (
             dataset is not None
             and accepted_manifest is not None
