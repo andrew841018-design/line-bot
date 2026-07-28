@@ -1021,6 +1021,7 @@ def _fetch_dataset_payload_with_deadline() -> object:
     deadline = time.monotonic() + _FETCH_OPERATION_TIMEOUT_SECONDS
 
     def fetch() -> None:
+        global _fetch_worker
         result = None
         try:
             result = (True, _fetch_dataset_payload(deadline))
