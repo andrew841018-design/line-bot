@@ -2285,24 +2285,38 @@ _AUTO_CAPTURE_DATE_HINT_RE = re.compile(
     r"\d+月\d+日|\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}|"
     r"(?:[01]?\d|2[0-3]):[0-5]\d"
 )
+_MEDICAL_DEPARTMENT_RE_TEXT = (
+    r"(?:胸腔外科|胸腔內科|心臟內科|心臟血管外科|神經內科|神經外科|"
+    r"肝膽腸胃科|腸胃內科|胃腸科|消化內科|泌尿科|骨科|皮膚科|眼科|"
+    r"耳鼻喉科|婦產科|小兒科|兒科|精神科|復健科|腫瘤科|血液科|"
+    r"感染科|家醫科|家庭醫學科|新陳代謝科|內分泌科|乳房外科|"
+    r"大腸直腸外科|整形外科|一般外科|腎臟科|風濕免疫科|牙科)"
+)
 _AUTO_CAPTURE_VERB_RE = re.compile(
-    r"聚餐|生日|出遊|看(?:.{0,12})?(?:醫生|醫師|牙醫|牙醫師)|牙醫|"
+    r"聚餐|生日|出遊|"
+    rf"看(?:.{{0,12}})?(?:醫生|醫師|牙醫|牙醫師|{_MEDICAL_DEPARTMENT_RE_TEXT})|"
+    r"牙醫|"
     r"拿(?:蛋糕|藥|包裹|貨|禮物|花)|"
     r"接(?:爸|媽|妹|弟|姊|爺爺|奶奶|小孩|小朋友)|"
     r"陪(?:.{0,5})(?:就醫|看醫生|看病)|"
     r"回(?:台北|新北|台中|台南|高雄|花蓮|宜蘭|新竹|苗栗|嘉義|屏東|台東|老家|家)|"
     r"做(?:胃鏡|大腸鏡|健康檢查|體檢|手術|健檢|LDCT)|"
+    r"(?:做|照|安排|接受)\s*(?:[Mm]\s*[Rr]\s*[Ii]|[Pp][Ee][Tt](?:-?[Cc][Tt])?)|"
+    r"[Mm]\s*[Rr]\s*[Ii].{0,8}(?:掃描|檢查|結果|影像)|"
+    r"[Pp][Ee][Tt](?:-?[Cc][Tt]|.{0,4}(?:掃描|檢查|結果|影像))|"
     r"領(?:藥|處方簽|包裹)|"
     r"婚禮|喜宴|滿月|彌月|"
     r"打(?:疫苗|球|羽球)|羽球|行程|活動|抽血|健檢|出差|北上|南下"
 )
 
 _MEDICAL_ACTOR_ACTION_RE = re.compile(
-    r"看(?:.{0,12})?(?:醫生|醫師|牙醫|牙醫師)|牙醫|牙醫師|"
+    rf"看(?:.{{0,12}})?(?:醫生|醫師|牙醫|牙醫師|{_MEDICAL_DEPARTMENT_RE_TEXT})|"
+    r"牙醫|牙醫師|"
     r"就醫|看病|回診|掛(?:號|醫生|醫師)|"
     r"做(?:胃鏡|大腸鏡|健康檢查|體檢|手術|健檢|LDCT|MRI|"
     r"正子斷層掃描|正子斷層|電腦斷層|(?<![A-Za-z])CT(?![A-Za-z])|核磁共振)|"
-    r"MRI|核磁共振|正子斷層掃描|正子斷層|PET-?CT|PET|電腦斷層|"
+    r"[Mm]\s*[Rr]\s*[Ii]|核磁共振|正子斷層掃描|正子斷層|"
+    r"[Pp][Ee][Tt]-?[Cc][Tt]|[Pp][Ee][Tt]|電腦斷層|"
     r"(?<![A-Za-z])CT(?![A-Za-z])|"
     r"打疫苗|抽血|領(?:藥|處方簽)"
 )
@@ -2530,14 +2544,82 @@ def _capture_calendar_events_regex_only(
     This path runs before reply generation, so lite/local mode cannot say an
     event was recorded while the DB still lacks the corresponding reminder.
     """
+    durable_state = False
     try:
         import calendar_db
         import calendar_regex
+
+        pending_row = None
+        pending_claim_token = None
+        if message_id:
+            pending_row = memory.get_pending_reminder_extract_by_message(
+                group_id,
+                message_id,
+            )
+            if pending_row and pending_row.get("status") == "processing":
+                return -1
+            if pending_row and pending_row.get("status") == "pending":
+                pending_claim_token = memory.claim_pending_reminder(
+                    int(pending_row["pending_id"])
+                )
+                if not pending_claim_token:
+                    return -1
 
         today_tw = datetime.now(ZoneInfo("Asia/Taipei")).date()
         events = calendar_regex.extract_many_regex_only(
             combined_text, today_tw, require_time=True
         )
+        if not events:
+            _release_pending_extract_claim(
+                pending_row,
+                pending_claim_token,
+            )
+            return 0
+
+        if message_id:
+            source_history = calendar_db.find_events_by_source_message(
+                group_id,
+                message_id,
+            )
+            if source_history:
+                durable_state = True
+                active = [
+                    event
+                    for event in source_history
+                    if event.get("status") == "active"
+                ]
+                mirrors_ok = (
+                    bool(active)
+                    and len(active) == len(source_history)
+                    and len(active) == len(events)
+                )
+                if mirrors_ok:
+                    mirrors_ok = all(
+                        calendar_db.synchronize_pending_event_reminder_mirror(event)
+                        and _has_pending_calendar_mirror(
+                            group_id,
+                            str(event["event_id"]),
+                        )
+                        for event in active
+                    )
+                if mirrors_ok and _finish_pending_extract_for_calendar_event(
+                    pending_row,
+                    pending_claim_token,
+                ):
+                    return len(active)
+                _release_pending_extract_claim(
+                    pending_row,
+                    pending_claim_token,
+                )
+                logger.warning(
+                    "calendar source history blocks recapture group=%s message=%s",
+                    group_id,
+                    message_id,
+                )
+                return -1
+            if pending_row and pending_row.get("status") == "done":
+                return -1
+
         inserted = 0
         for data in events:
             if not (data.get("has_event") and data.get("title") and data.get("date")):
@@ -2562,19 +2644,69 @@ def _capture_calendar_events_regex_only(
                 source_msg_id=message_id,
             )
             if event_id:
-                inserted += 1
-                logger.info(
-                    "calendar event captured by local regex: %s '%s' on %s type=%s (group=%s)",
-                    event_id,
-                    data["title"],
-                    data["date"],
-                    data.get("event_type", "family_gathering"),
-                    group_id,
+                durable_state = True
+                event = calendar_db.get_active_event_by_id(group_id, event_id)
+                mirror_ok = bool(
+                    event
+                    and calendar_db.synchronize_pending_event_reminder_mirror(event)
+                    and _has_pending_calendar_mirror(group_id, event_id)
                 )
+                if mirror_ok:
+                    inserted += 1
+                    logger.info(
+                        "calendar event captured by local regex: %s '%s' on %s "
+                        "type=%s (group=%s)",
+                        event_id,
+                        data["title"],
+                        data["date"],
+                        data.get("event_type", "family_gathering"),
+                        group_id,
+                    )
+                else:
+                    logger.warning(
+                        "calendar event captured but reminder mirror incomplete: "
+                        "event_id=%s group=%s",
+                        event_id,
+                        group_id,
+                    )
+        if inserted != len(events):
+            _release_pending_extract_claim(
+                pending_row,
+                pending_claim_token,
+            )
+            return -1
+        if not _finish_pending_extract_for_calendar_event(
+            pending_row,
+            pending_claim_token,
+        ):
+            _release_pending_extract_claim(
+                pending_row,
+                pending_claim_token,
+            )
+            return -1
         return inserted
     except Exception as e:
+        try:
+            _release_pending_extract_claim(
+                locals().get("pending_row"),
+                locals().get("pending_claim_token"),
+            )
+        except Exception:
+            pass
         logger.warning("local calendar regex capture failed: %s", e)
-        return 0
+        if message_id and not durable_state:
+            try:
+                import calendar_db
+
+                durable_state = bool(
+                    calendar_db.find_events_by_source_message(
+                        group_id,
+                        message_id,
+                    )
+                )
+            except Exception:
+                pass
+        return -1 if durable_state else 0
 
 
 def _auto_capture_text_if_important(
@@ -2582,18 +2714,26 @@ def _auto_capture_text_if_important(
     text: str,
     sender_user_id: str = "",
     message_id: str = "",
-) -> None:
+) -> bool | None:
     """每條 text message 來時 cheap pre-filter → 通過才 async 跑 Gemini extractor。
 
     避免每訊息都打 Gemini 燒 20 req/day quota。
     UNIQUE INDEX 自動 dedup，重跑安全。
     """
     if not text or len(text.strip()) < 4 or len(text) > 500:
-        return
+        return False
     if not (_AUTO_CAPTURE_DATE_HINT_RE.search(text) and _AUTO_CAPTURE_VERB_RE.search(text)):
-        return
-    if _capture_calendar_events_regex_only(group_id, text, sender_user_id, message_id):
-        return
+        return False
+    capture_count = _capture_calendar_events_regex_only(
+        group_id,
+        text,
+        sender_user_id,
+        message_id,
+    )
+    if capture_count > 0:
+        return True
+    if capture_count < 0:
+        return None
     import threading
 
     def _bg() -> None:
@@ -2603,6 +2743,419 @@ def _auto_capture_text_if_important(
             logger.warning("auto capture (every-msg) failed: %s", e)
 
     threading.Thread(target=_bg, daemon=True).start()
+    return False
+
+
+_MISSED_REMINDER_REPAIR_RE = re.compile(
+    r"\s*(?:(?:@?咪寶)[，,:：\s]*)?"
+    r"(?:這(?:個|則|筆|項)|剛剛那(?:個|則|筆|項)|上面那(?:個|則|筆|項))"
+    r"\s*(?:提醒|行程)?\s*"
+    r"(?:漏掉(?:了)?|漏了|沒(?:有)?(?:記到|加到|新增|建立)(?:提醒|行程)?|"
+    r"忘(?:了)?(?:記|加|新增|建立)(?:提醒|行程)(?:了)?)"
+    r"\s*[。！？!?]?\s*$"
+)
+_EXPLICIT_CLOCK_RE = re.compile(
+    r"(?:[01]?\d|2[0-3])(?::[0-5]\d|[0-5]\d)|"
+    r"(?:\d{1,2}|[零〇一二兩三四五六七八九十]{1,3})\s*點"
+)
+_INFERRED_DAYPART_RE = re.compile(r"早上|上午|中午|下午|傍晚|晚上")
+
+
+def _has_pending_calendar_mirror(group_id: str, event_id: str) -> bool:
+    import calendar_db
+
+    rows = memory.list_reminder_source_cancellation_candidates(
+        group_id,
+        calendar_db.EVENT_REMINDER_SOURCE_KIND,
+        event_id,
+    )
+    return len(rows) == 1 and rows[0].get("status") == "pending"
+
+
+def _finish_pending_extract_for_calendar_event(
+    pending_row: dict | None,
+    claim_token: str | None,
+) -> bool:
+    if not pending_row:
+        return True
+    if pending_row.get("status") == "done":
+        return True
+    if pending_row.get("status") == "dropped":
+        return memory.complete_dropped_pending_reminder(
+            int(pending_row["pending_id"])
+        )
+    if not claim_token:
+        return False
+    if memory.mark_pending_reminder(
+        int(pending_row["pending_id"]),
+        "done",
+        claim_token,
+    ):
+        return True
+    refreshed = memory.get_pending_reminder_extract_by_message(
+        str(pending_row.get("group_id") or ""),
+        str(pending_row.get("message_id") or ""),
+    )
+    if refreshed and refreshed.get("status") == "done":
+        return True
+    logger.warning(
+        "quoted reminder repair lost pending claim pending_id=%s",
+        pending_row.get("pending_id"),
+    )
+    return False
+
+
+def _release_pending_extract_claim(
+    pending_row: dict | None,
+    claim_token: str | None,
+) -> None:
+    if pending_row and claim_token:
+        memory.release_pending_reminder(
+            int(pending_row["pending_id"]),
+            claim_token,
+        )
+
+
+def _calendar_repair_title_key(title: object) -> str:
+    import reminder_cancel
+
+    normalized = reminder_cancel.normalize_action(title)
+    normalized = re.sub(r"早上|上午|中午|下午|傍晚|晚上|凌晨|半夜", "", normalized)
+    return re.sub(r"[\s，,。；;：:（）()「」『』]+", "", normalized)
+
+
+def _format_source_calendar_capture_confirmation(
+    group_id: str,
+    message_id: str,
+    source_text: str,
+) -> str | None:
+    import calendar_db
+
+    events = calendar_db.find_active_events_by_source_message(
+        group_id,
+        message_id,
+    )
+    if not events:
+        return None
+    if not all(
+        _has_pending_calendar_mirror(group_id, str(event["event_id"]))
+        for event in events
+    ):
+        return None
+    time_note = ""
+    daypart = _INFERRED_DAYPART_RE.search(source_text)
+    if daypart and not _EXPLICIT_CLOCK_RE.search(source_text):
+        time_note = f"（依「{daypart.group(0)}」預設）"
+    if len(events) > 1:
+        lines = [f"已新增 {len(events)} 筆提醒"]
+        for event in events:
+            lines.append(
+                f"{event['event_date']} {event['event_time']} {event['title']}"
+            )
+        return "\n".join(lines)
+    event = events[0]
+    return "\n".join(
+        (
+            "已新增提醒",
+            f"時間：{event['event_date']} {event['event_time']}{time_note}",
+            f"事項：{event['title']}",
+        )
+    )
+
+
+def _try_handle_missed_reminder_repair(
+    event: MessageEvent,
+    group_id: str,
+    text: str,
+) -> bool:
+    """Repair a quoted missed reminder without an LLM or recent-message guess."""
+
+    repair_text = text or ""
+    if not _MISSED_REMINDER_REPAIR_RE.fullmatch(repair_text):
+        return False
+
+    quoted_id = str(
+        getattr(getattr(event, "message", None), "quoted_message_id", "") or ""
+    ).strip()
+    if not quoted_id:
+        _reply(
+            event.reply_token,
+            "我找不到你指的內容。請直接回覆原本那則訊息，再說「這個漏掉了」。",
+            group_id=group_id,
+            allow_push_fallback=False,
+            include_auxiliary=False,
+        )
+        return True
+
+    raw = memory.get_raw_message_record(group_id, quoted_id)
+    if raw is None:
+        _reply(
+            event.reply_token,
+            "找不到原本那則訊息，先沒有建立提醒。請直接回覆原訊息並補上完整日期與時間。",
+            group_id=group_id,
+            allow_push_fallback=False,
+            include_auxiliary=False,
+        )
+        return True
+
+    import calendar_db
+    import calendar_regex
+
+    source_text = str(raw.get("text") or "")
+    original_dt = datetime.fromtimestamp(
+        int(raw["created_at"]),
+        ZoneInfo("Asia/Taipei"),
+    )
+    parsed_source = calendar_regex.extract_many_regex_only(
+        source_text,
+        original_dt.date(),
+        require_time=True,
+    )
+    source_history = calendar_db.find_events_by_source_message(
+        group_id,
+        quoted_id,
+    )
+    source_events = [
+        item for item in source_history if item.get("status") == "active"
+    ]
+    pending_row = memory.get_pending_reminder_extract_by_message(
+        group_id,
+        quoted_id,
+    )
+    if (
+        source_events
+        and len(parsed_source) > 1
+        and (
+            len(source_history) != len(parsed_source)
+            or len(source_events) != len(parsed_source)
+        )
+    ):
+        _reply(
+            event.reply_token,
+            "原訊息包含多個行程，但目前只找到部分資料，提醒同步尚未完成；先不回報新增。",
+            group_id=group_id,
+            allow_push_fallback=False,
+            include_auxiliary=False,
+        )
+        return True
+    if len(source_history) > 1:
+        _reply(
+            event.reply_token,
+            "這則原訊息已連到多筆行程，提醒同步尚未完成；先不回報完成，避免漏掉其中一筆。",
+            group_id=group_id,
+            allow_push_fallback=False,
+            include_auxiliary=False,
+        )
+        return True
+    if source_history and not source_events:
+        if pending_row and pending_row.get("status") == "pending":
+            cancelled_token = memory.claim_pending_reminder(
+                int(pending_row["pending_id"])
+            )
+            if cancelled_token:
+                memory.mark_pending_reminder(
+                    int(pending_row["pending_id"]),
+                    "dropped",
+                    cancelled_token,
+                )
+        _reply(
+            event.reply_token,
+            "這則提醒已取消，先不重新建立；若要恢復，請明確說「恢復這則提醒」。",
+            group_id=group_id,
+            allow_push_fallback=False,
+            include_auxiliary=False,
+        )
+        return True
+
+    pending_claim_token: str | None = None
+    if (
+        pending_row
+        and pending_row.get("status") == "done"
+        and not source_events
+    ):
+        _reply(
+            event.reply_token,
+            "這則訊息已處理過，先不重複建立；請用提醒清單確認。",
+            group_id=group_id,
+            allow_push_fallback=False,
+            include_auxiliary=False,
+        )
+        return True
+    if pending_row and pending_row.get("status") == "pending":
+        pending_claim_token = memory.claim_pending_reminder(
+            int(pending_row["pending_id"])
+        )
+        if not pending_claim_token:
+            _reply(
+                event.reply_token,
+                "這則提醒正在處理，先不重複建立。",
+                group_id=group_id,
+                allow_push_fallback=False,
+                include_auxiliary=False,
+            )
+            return True
+    elif pending_row and pending_row.get("status") == "processing":
+        _reply(
+            event.reply_token,
+            "這則提醒正在處理，先不重複建立。",
+            group_id=group_id,
+            allow_push_fallback=False,
+            include_auxiliary=False,
+        )
+        return True
+
+    created = False
+    event_data: dict | None = source_events[0] if source_events else None
+    try:
+        if event_data is None:
+            parsed = parsed_source
+            if len(parsed) != 1:
+                _release_pending_extract_claim(
+                    pending_row,
+                    pending_claim_token,
+                )
+                _reply(
+                    event.reply_token,
+                    "我找到原訊息，但無法唯一判定完整日期、時間與事項，先沒有建立提醒。",
+                    group_id=group_id,
+                    allow_push_fallback=False,
+                    include_auxiliary=False,
+                )
+                return True
+
+            data = parsed[0]
+            if data.get("event_type") == "medical":
+                actor = _infer_medical_actor(source_text, str(raw.get("user_id") or ""))
+                companions = _infer_medical_companions(source_text)
+                data["title"] = _apply_medical_actor(
+                    str(data["title"]),
+                    actor,
+                    companions,
+                )
+                data["participants"] = _with_medical_actor_participant(
+                    data.get("participants"),
+                    actor,
+                )
+            else:
+                _apply_sender_first_person_event(
+                    data,
+                    str(raw.get("user_id") or ""),
+                )
+            _apply_family_context_defaults(data, source_text)
+
+            legacy_candidates = calendar_db.find_unbound_active_events_by_schedule(
+                group_id,
+                event_date=str(data["date"]),
+                event_time=data.get("time"),
+                event_type=str(data.get("event_type") or "family_gathering"),
+            )
+            matching_legacy = [
+                candidate
+                for candidate in legacy_candidates
+                if _calendar_repair_title_key(candidate.get("title"))
+                == _calendar_repair_title_key(data.get("title"))
+            ]
+            if len(matching_legacy) > 1:
+                raise RuntimeError("multiple legacy calendar candidates matched")
+            if len(matching_legacy) == 1:
+                legacy_id = str(matching_legacy[0]["event_id"])
+                if not calendar_db.bind_event_source_message(
+                    group_id,
+                    legacy_id,
+                    quoted_id,
+                ):
+                    raise RuntimeError("legacy calendar source binding failed")
+                event_data = calendar_db.get_active_event_by_id(
+                    group_id,
+                    legacy_id,
+                )
+            if event_data is None:
+                event_id = calendar_db.insert_event(
+                    group_id,
+                    title=str(data["title"]),
+                    event_date=str(data["date"]),
+                    event_time=data.get("time"),
+                    location=data.get("location"),
+                    participants=data.get("participants") or [],
+                    event_type=str(data.get("event_type") or "family_gathering"),
+                    source_msg_id=quoted_id,
+                )
+                if event_id:
+                    created = True
+                    event_data = calendar_db.get_active_event_by_id(
+                        group_id,
+                        event_id,
+                    )
+                else:
+                    exact = calendar_db.find_active_events_exact(
+                        group_id,
+                        title=str(data["title"]),
+                        event_date=str(data["date"]),
+                        event_time=data.get("time"),
+                    )
+                    if len(exact) == 1 and calendar_db.bind_event_source_message(
+                        group_id,
+                        str(exact[0]["event_id"]),
+                        quoted_id,
+                    ):
+                        event_data = calendar_db.get_active_event_by_id(
+                            group_id,
+                            str(exact[0]["event_id"]),
+                        )
+
+        if event_data is None:
+            raise RuntimeError("calendar event was not persisted")
+        if not calendar_db.synchronize_pending_event_reminder_mirror(event_data):
+            raise RuntimeError("calendar reminder mirror was not persisted")
+        if not _has_pending_calendar_mirror(
+            group_id,
+            str(event_data["event_id"]),
+        ):
+            raise RuntimeError("calendar reminder mirror is not pending")
+        if not _finish_pending_extract_for_calendar_event(
+            pending_row,
+            pending_claim_token,
+        ):
+            raise RuntimeError("pending reminder completion was not persisted")
+    except Exception as exc:
+        _release_pending_extract_claim(pending_row, pending_claim_token)
+        logger.warning(
+            "quoted missed reminder repair incomplete group=%s source=%s: %s",
+            group_id,
+            quoted_id,
+            str(exc)[:160],
+        )
+        _reply(
+            event.reply_token,
+            "已找到行程，但提醒同步尚未完成，先不回報新增；請再回覆一次原訊息。",
+            group_id=group_id,
+            allow_push_fallback=False,
+            include_auxiliary=False,
+        )
+        return True
+
+    time_note = ""
+    if (
+        _INFERRED_DAYPART_RE.search(source_text)
+        and not _EXPLICIT_CLOCK_RE.search(source_text)
+    ):
+        daypart = _INFERRED_DAYPART_RE.search(source_text)
+        time_note = f"（依「{daypart.group(0)}」預設）" if daypart else ""
+    heading = "已補上提醒" if created else "這則提醒已存在，未重複新增"
+    _reply(
+        event.reply_token,
+        "\n".join(
+            (
+                heading,
+                f"時間：{event_data['event_date']} {event_data['event_time']}{time_note}",
+                f"事項：{event_data['title']}",
+            )
+        ),
+        group_id=group_id,
+        allow_push_fallback=False,
+        include_auxiliary=False,
+    )
+    return True
 
 
 _CALENDAR_CORRECTION_MARKER_RE = re.compile(
@@ -3607,12 +4160,17 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
     # pasted cancellation can be misread as a new reminder.
     if _try_handle_reminder_cancellation(event, group_id, text):
         return
-    text_with_quote_context = _text_with_quote_context(event.message, group_id, text)
     source = getattr(event, "source", None)
     sender_user_id = getattr(source, "user_id", None) or ""
     message_id = getattr(event.message, "id", "") or ""
     clean_text = _extract_gemini_trigger(text, event.message)
     range_reminder_result = _explicit_range_reminder_result(text, sender_user_id)
+
+    if _try_handle_missed_reminder_repair(event, group_id, text):
+        burst_filter.cancel_burst(group_id)
+        return
+
+    text_with_quote_context = _text_with_quote_context(event.message, group_id, text)
 
     # 回饋收集：20:00 ~ 02:00 TW 窗口內，將文字訊息存入 pending_feedback.json
     if feedback_collector.in_feedback_window():
@@ -3646,10 +4204,17 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
     # (2026-05-21 user directive: 每條留言自動判定重要性)
     # Cheap pre-filter (regex) → 通過才 spin off thread 跑 Gemini extractor
     # 重跑由 UNIQUE INDEX (group_id, title, event_date) 自動 dedup
+    calendar_event_captured = False
+    calendar_event_blocked = False
     if range_reminder_result is None:
-        _auto_capture_text_if_important(
-            group_id, text, sender_user_id, message_id
+        auto_capture_result = _auto_capture_text_if_important(
+            group_id,
+            text,
+            sender_user_id,
+            message_id,
         )
+        calendar_event_captured = auto_capture_result is True
+        calendar_event_blocked = auto_capture_result is None
 
     # 自動抽飲食 / 採購訊號（純規則 fire-and-forget，存 food_db；2026-05-31）
     # 逐則抽、不需 user_id（v1 家庭層級，GP2 A）、不需 pre-filter（無 Gemini quota 顧慮）
@@ -3685,13 +4250,22 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
         logger.debug("message_classifier skipped: %s", e)
 
     # 自動偵測 reminder；成功、重複或排隊都要明確回覆群組。
-    reminder_confirmation = _maybe_extract_reminder(
-        text,
-        group_id,
-        sender_user_id,
-        message_id,
-        precomputed_result=range_reminder_result,
-    )
+    if calendar_event_captured:
+        reminder_confirmation = _format_source_calendar_capture_confirmation(
+            group_id,
+            message_id,
+            text,
+        )
+    elif calendar_event_blocked:
+        reminder_confirmation = None
+    else:
+        reminder_confirmation = _maybe_extract_reminder(
+            text,
+            group_id,
+            sender_user_id,
+            message_id,
+            precomputed_result=range_reminder_result,
+        )
     if isinstance(reminder_confirmation, str) and reminder_confirmation.strip():
         burst_filter.cancel_burst(group_id)
         _reply(
@@ -7668,6 +8242,111 @@ def _enqueue_reminder_if_candidate(
         return None
 
 
+def _resolve_claimed_pending_from_bound_event(
+    group_id: str,
+    row: dict,
+    claim_token: str,
+) -> str:
+    """Resolve a claimed pending row from its durable calendar source."""
+
+    import calendar_db
+
+    message_id = str(row.get("message_id") or "")
+    if not message_id:
+        return "absent"
+    source_history = calendar_db.find_events_by_source_message(
+        group_id,
+        message_id,
+    )
+    if not source_history:
+        return "absent"
+
+    pending_id = int(row["pending_id"])
+    active_events = [
+        event for event in source_history if event.get("status") == "active"
+    ]
+    if not active_events or len(active_events) != len(source_history):
+        memory.mark_pending_reminder(pending_id, "dropped", claim_token)
+        logger.error(
+            "drain reminders: invalid source event history pending_id=%s "
+            "message=%s count=%s",
+            pending_id,
+            message_id,
+            len(source_history),
+        )
+        return "dropped"
+
+    import calendar_regex
+
+    created_at = datetime.fromtimestamp(
+        int(row["created_at"]),
+        ZoneInfo("Asia/Taipei"),
+    )
+    parsed = calendar_regex.extract_many_regex_only(
+        str(row.get("text") or ""),
+        created_at.date(),
+        require_time=True,
+    )
+    if len(active_events) > 1 or len(parsed) > 1:
+        parsed_keys = sorted(
+            (
+                str(item.get("date") or ""),
+                str(item.get("time") or ""),
+                str(item.get("event_type") or "family_gathering"),
+            )
+            for item in parsed
+        )
+        source_keys = sorted(
+            (
+                str(item.get("event_date") or ""),
+                str(item.get("event_time") or ""),
+                str(item.get("event_type") or "family_gathering"),
+            )
+            for item in active_events
+        )
+        if parsed_keys != source_keys:
+            memory.release_pending_reminder(pending_id, claim_token)
+            logger.error(
+                "drain reminders: source event set mismatch pending_id=%s "
+                "message=%s parsed=%s source=%s",
+                pending_id,
+                message_id,
+                parsed_keys,
+                source_keys,
+            )
+            return "released"
+
+    mirrors_ok = all(
+        calendar_db.synchronize_pending_event_reminder_mirror(event)
+        and _has_pending_calendar_mirror(
+            group_id,
+            str(event["event_id"]),
+        )
+        for event in active_events
+    )
+    if mirrors_ok and memory.mark_pending_reminder(
+            pending_id,
+            "done",
+            claim_token,
+    ):
+        logger.info(
+            "drain reminders: finalized source-bound events "
+            "pending_id=%s event_ids=%s",
+            pending_id,
+            [event["event_id"] for event in active_events],
+        )
+        return "done"
+
+    memory.release_pending_reminder(pending_id, claim_token)
+    logger.warning(
+        "drain reminders: source-bound event mirrors incomplete "
+        "pending_id=%s event_ids=%s",
+        pending_id,
+        [event["event_id"] for event in active_events],
+    )
+    return "released"
+
+
 def _drain_pending_reminders(group_id: str, limit: int = _REMINDER_DRAIN_CAP) -> None:
     """額度恢復後補抽該 group 的 pending reminder。
 
@@ -7685,6 +8364,37 @@ def _drain_pending_reminders(group_id: str, limit: int = _REMINDER_DRAIN_CAP) ->
         logger.warning("drain reminders: list failed group=%s: %s", group_id, e)
         return
     for row in rows:
+        message_id = str(row.get("message_id") or "")
+        if message_id:
+            try:
+                import calendar_db
+
+                source_history = calendar_db.find_events_by_source_message(
+                    group_id,
+                    message_id,
+                )
+                if source_history:
+                    pid = int(row["pending_id"])
+                    claim_token = memory.claim_pending_reminder(pid)
+                    if not claim_token:
+                        continue
+                    try:
+                        _resolve_claimed_pending_from_bound_event(
+                            group_id,
+                            row,
+                            claim_token,
+                        )
+                    except Exception:
+                        memory.release_pending_reminder(pid, claim_token)
+                        raise
+                    continue
+            except Exception as e:
+                logger.warning(
+                    "drain reminders: source-bound recovery failed message=%s: %s",
+                    message_id,
+                    str(e)[:160],
+                )
+                continue
         local_result = _explicit_range_reminder_result(
             row["text"],
             row["user_id"],
@@ -7700,6 +8410,14 @@ def _drain_pending_reminders(group_id: str, limit: int = _REMINDER_DRAIN_CAP) ->
             continue
         terminal_written = False
         try:
+            source_resolution = _resolve_claimed_pending_from_bound_event(
+                group_id,
+                row,
+                pending_claim_token,
+            )
+            if source_resolution != "absent":
+                terminal_written = source_resolution in {"done", "dropped"}
+                continue
             # R1: 用訊息「當時」的 created_at 還原 today_iso，解相對日期
             msg_dt = _dt.fromtimestamp(
                 row["created_at"], ZoneInfo("Asia/Taipei")
@@ -7814,8 +8532,11 @@ def _maybe_extract_reminder(
             result = gemini_client.extract_reminder(text) if gemini_allowed else None
         if result is None:
             from datetime import datetime as _dt
+
             result = _calendar_regex_to_reminder_result(
-                text, _dt.now(ZoneInfo("Asia/Taipei")).date(), user_id
+                text,
+                _dt.now(ZoneInfo("Asia/Taipei")).date(),
+                user_id,
             )
             if result is None:
                 if not gemini_allowed:

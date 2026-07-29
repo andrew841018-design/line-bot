@@ -218,7 +218,7 @@ def test_range_shopping_reminder_is_created_without_gemini(temp_db, monkeypatch)
     import main
     import memory
 
-    now_tw = datetime(2026, 7, 10, 12, 0, tzinfo=ZoneInfo("Asia/Taipei"))
+    now_tw = datetime(2099, 7, 10, 12, 0, tzinfo=ZoneInfo("Asia/Taipei"))
     monkeypatch.setattr(main, "_gemini_side_task_allowed", lambda reason: True)
     monkeypatch.setattr(
         gemini_client,
@@ -254,9 +254,9 @@ def test_range_shopping_reminder_is_created_without_gemini(temp_db, monkeypatch)
         ).fetchone()
     assert row is not None
     remind_dt = datetime.fromtimestamp(row[1], ZoneInfo("Asia/Taipei"))
-    assert remind_dt.strftime("%Y-%m-%d %H:%M") == "2026-07-16 09:00"
+    assert remind_dt.strftime("%Y-%m-%d %H:%M") == "2099-07-16 09:00"
     assert row[1] == int(
-        datetime(2026, 7, 16, 9, 0, tzinfo=ZoneInfo("Asia/Taipei")).timestamp()
+        datetime(2099, 7, 16, 9, 0, tzinfo=ZoneInfo("Asia/Taipei")).timestamp()
     )
     assert "7/16-7/28" in row[0]
     assert "降血糖、血壓的保健食品" in row[0]
@@ -277,7 +277,7 @@ def test_repeated_range_reminder_reports_existing_without_duplicate(temp_db, mon
     parsed = main._explicit_range_reminder_result(
         text,
         "U_DAD",
-        now_tw=datetime(2026, 7, 10, 12, 0, tzinfo=ZoneInfo("Asia/Taipei")),
+        now_tw=datetime(2099, 7, 10, 12, 0, tzinfo=ZoneInfo("Asia/Taipei")),
     )
     assert parsed is not None
 
@@ -553,6 +553,7 @@ def test_drain_relative_date_uses_taiwan_day_at_midnight_boundary(temp_db, monke
     monkeypatch.setattr(gemini_client, "extract_reminder", fake_extract)
     monkeypatch.setattr(main, "_quota_exhausted", lambda: False)
     monkeypatch.setattr(main, "_has_enough_quota_for_retry", lambda: True)
+    monkeypatch.setattr(memory, "drop_stale_pending_reminders", lambda *_a, **_k: 0)
 
     main._drain_pending_reminders("G1")
 

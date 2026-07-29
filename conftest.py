@@ -234,7 +234,7 @@ def reset_main_globals():
 
 
 @pytest.fixture(autouse=True)
-def block_external_side_effects(monkeypatch):
+def block_external_side_effects(monkeypatch, request):
     """禁止 test 期間打真實 Discord DM / quality-violation alert。
 
     Root cause (2026-05-19): tests/test_chat_golden.py 用 NEWS_CASE keyword
@@ -261,3 +261,11 @@ def block_external_side_effects(monkeypatch):
         gemini_client, "_log_quality_violation",
         lambda *a, **kw: None, raising=False,
     )
+    if request.path.name != "test_embedding_recall.py":
+        import embedding_recall
+        monkeypatch.setattr(
+            embedding_recall,
+            "index_message",
+            lambda *a, **kw: None,
+            raising=False,
+        )

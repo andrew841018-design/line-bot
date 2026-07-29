@@ -666,6 +666,28 @@ def get_raw_message(group_id: str, message_id: str) -> tuple[str | None, str] | 
         return None
 
 
+def get_raw_message_record(group_id: str, message_id: str) -> dict | None:
+    """Return one exact group-scoped raw message with its original timestamp."""
+
+    if not group_id or not message_id:
+        return None
+    with _conn() as c:
+        row = c.execute(
+            "SELECT group_id, message_id, user_id, text, created_at "
+            "FROM raw_messages WHERE group_id=? AND message_id=?",
+            (group_id, message_id),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "group_id": str(row[0]),
+        "message_id": str(row[1]),
+        "user_id": str(row[2] or ""),
+        "text": str(row[3] or ""),
+        "created_at": int(row[4]),
+    }
+
+
 def log_sent_reminder_reference(
     group_id: str,
     message_id: str,
@@ -2345,6 +2367,102 @@ def ensure_reminder_for_source(
     return reminder_id
 
 
+def synchronize_pending_reminder_for_source(
+    group_id: str,
+    user_id: str,
+    action: str,
+    remind_at: int,
+    source_kind: str,
+    source_ref: str,
+    source_text: str = "",
+    mention_aliases: list[str] | None = None,
+    *,
+    require_active_calendar_event: bool = False,
+) -> int | None:
+    """Atomically create or refresh one pending source mirror.
+
+    Existing delivery counters/flags are preserved. Terminal source rows and
+    inactive calendar events are durable tombstones and are never revived.
+    """
+
+    group_id = str(group_id or "").strip()
+    source_kind = str(source_kind or "").strip()
+    source_ref = str(source_ref or "").strip()
+    action = _normalize_reminder_text(action)
+    if not group_id or not source_kind or not source_ref or not action:
+        return None
+    source_text = _normalize_reminder_text(source_text)
+    mentions_json = json.dumps(
+        _normalize_mention_aliases(mention_aliases),
+        ensure_ascii=False,
+    )
+    now = int(_time.time())
+    with _lock, _conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        if require_active_calendar_event:
+            event = c.execute(
+                "SELECT 1 FROM events WHERE group_id=? AND event_id=? "
+                "AND status='active' LIMIT 1",
+                (group_id, source_ref),
+            ).fetchone()
+            if event is None:
+                return None
+        rows = c.execute(
+            "SELECT reminder_id, status FROM reminders "
+            "WHERE group_id=? AND source_kind=? AND source_ref=? "
+            "ORDER BY reminder_id",
+            (group_id, source_kind, source_ref),
+        ).fetchall()
+        if len(rows) > 1:
+            return None
+        if rows:
+            reminder_id, status = int(rows[0][0]), str(rows[0][1])
+            if status != "pending":
+                return None
+            c.execute(
+                "UPDATE reminders SET user_id=?, action=?, remind_at=?, "
+                "source_text=?, mention_aliases=? "
+                "WHERE reminder_id=? AND status='pending'",
+                (
+                    str(user_id or ""),
+                    action,
+                    int(remind_at),
+                    source_text,
+                    mentions_json,
+                    reminder_id,
+                ),
+            )
+        else:
+            cursor = c.execute(
+                "INSERT INTO reminders("
+                "group_id, user_id, action, remind_at, created_at, status, "
+                "source_kind, source_ref, source_text, mention_aliases"
+                ") VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
+                (
+                    group_id,
+                    str(user_id or ""),
+                    action,
+                    int(remind_at),
+                    now,
+                    source_kind,
+                    source_ref,
+                    source_text,
+                    mentions_json,
+                ),
+            )
+            reminder_id = int(cursor.lastrowid)
+
+    delete_duplicate_pending_reminders(group_id)
+    with _conn() as c:
+        survivor = c.execute(
+            "SELECT reminder_id FROM reminders WHERE group_id=? "
+            "AND source_kind=? AND source_ref=? AND status='pending' "
+            "ORDER BY reminder_id LIMIT 1",
+            (group_id, source_kind, source_ref),
+        ).fetchone()
+    return int(survivor[0]) if survivor is not None else None
+
+
 def upsert_reminder_for_source_any_status(
     group_id: str,
     user_id: str,
@@ -3032,6 +3150,37 @@ def enqueue_pending_reminder(
         return c.execute("SELECT last_insert_rowid()").fetchone()[0]
 
 
+def get_pending_reminder_extract_by_message(
+    group_id: str,
+    message_id: str,
+) -> dict | None:
+    """Return the exact group/message extraction row regardless of status."""
+
+    if not group_id or not message_id:
+        return None
+    with _conn() as c:
+        row = c.execute(
+            "SELECT pending_id, group_id, user_id, message_id, text, created_at, "
+            "retries, claimed_at, claim_token, status "
+            "FROM pending_reminder_extract WHERE group_id=? AND message_id=?",
+            (group_id, message_id),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "pending_id": int(row[0]),
+        "group_id": str(row[1]),
+        "user_id": str(row[2] or ""),
+        "message_id": str(row[3] or ""),
+        "text": str(row[4] or ""),
+        "created_at": int(row[5]),
+        "retries": int(row[6]),
+        "claimed_at": int(row[7] or 0),
+        "claim_token": str(row[8] or ""),
+        "status": str(row[9]),
+    }
+
+
 def reclaim_stale_pending_reminders(
     max_processing_age_sec: int = 600, group_id: str | None = None
 ) -> int:
@@ -3099,6 +3248,19 @@ def mark_pending_reminder(pending_id: int, status: str, claim_token: str) -> boo
             "SET status = ?, claimed_at=0, claim_token='' "
             "WHERE pending_id = ? AND status='processing' AND claim_token=?",
             (status, pending_id, claim_token),
+        )
+        return cur.rowcount == 1
+
+
+def complete_dropped_pending_reminder(pending_id: int) -> bool:
+    """Promote one explicitly repaired dropped extraction to done."""
+
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "UPDATE pending_reminder_extract "
+            "SET status='done', claimed_at=0, claim_token='' "
+            "WHERE pending_id=? AND status='dropped'",
+            (pending_id,),
         )
         return cur.rowcount == 1
 

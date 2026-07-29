@@ -286,6 +286,7 @@ def _upsert_event_reminder(
     event: Mapping[str, object],
     *,
     preserve_existing: bool = False,
+    synchronize_pending: bool = False,
 ) -> bool:
     if not event:
         return False
@@ -324,7 +325,19 @@ def _upsert_event_reminder(
 
     _ensure_memory_db_path()
     try:
-        if preserve_existing:
+        if synchronize_pending:
+            reminder_id = memory.synchronize_pending_reminder_for_source(
+                group_id=group_id,
+                user_id=reminder_user_id,
+                action=action,
+                remind_at=remind_at,
+                source_kind=EVENT_REMINDER_SOURCE_KIND,
+                source_ref=str(event.get("event_id", "")),
+                source_text=source_text,
+                mention_aliases=mention_aliases,
+                require_active_calendar_event=True,
+            )
+        elif preserve_existing:
             if not hasattr(memory, "ensure_reminder_for_source"):
                 return False
             reminder_id = memory.ensure_reminder_for_source(
@@ -368,6 +381,14 @@ def ensure_event_reminder_mirror(event: Mapping[str, object]) -> bool:
     """Safely backfill one event source without reviving terminal reminders."""
 
     return _upsert_event_reminder(event, preserve_existing=True)
+
+
+def synchronize_pending_event_reminder_mirror(
+    event: Mapping[str, object],
+) -> bool:
+    """Create or refresh one pending mirror without reviving terminal rows."""
+
+    return _upsert_event_reminder(event, synchronize_pending=True)
 
 
 def ensure_active_event_reminder_mirrors(group_id: str | None = None) -> int:
@@ -635,6 +656,106 @@ def find_active_event(
             if r["event_date"] == near_date:
                 return dict(r)
     return dict(rows[0])
+
+
+def find_active_events_by_source_message(
+    group_id: str,
+    source_msg_id: str,
+) -> list[dict]:
+    """Return active events bound to one exact group-scoped LINE message."""
+
+    if not group_id or not source_msg_id:
+        return []
+    with _lock, _conn() as c:
+        c.row_factory = sqlite3.Row
+        rows = c.execute(
+            "SELECT * FROM events WHERE group_id=? AND source_msg_id=? "
+            "AND status='active' ORDER BY created_at, event_id",
+            (group_id, source_msg_id),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def find_events_by_source_message(
+    group_id: str,
+    source_msg_id: str,
+) -> list[dict]:
+    """Return every event status bound to one exact source message."""
+
+    if not group_id or not source_msg_id:
+        return []
+    with _lock, _conn() as c:
+        c.row_factory = sqlite3.Row
+        rows = c.execute(
+            "SELECT * FROM events WHERE group_id=? AND source_msg_id=? "
+            "ORDER BY created_at, event_id",
+            (group_id, source_msg_id),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def find_unbound_active_events_by_schedule(
+    group_id: str,
+    *,
+    event_date: str,
+    event_time: str | None,
+    event_type: str,
+) -> list[dict]:
+    """Return unbound active candidates for conservative legacy reconciliation."""
+
+    with _lock, _conn() as c:
+        c.row_factory = sqlite3.Row
+        rows = c.execute(
+            "SELECT * FROM events WHERE group_id=? AND event_date=? "
+            "AND COALESCE(event_time, '')=COALESCE(?, '') AND event_type=? "
+            "AND status='active' AND COALESCE(source_msg_id, '')='' "
+            "ORDER BY created_at, event_id",
+            (group_id, event_date, event_time, event_type),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_active_event_by_id(group_id: str, event_id: str) -> dict | None:
+    """Return one exact active event in the requested group."""
+
+    if not group_id or not event_id:
+        return None
+    with _lock, _conn() as c:
+        c.row_factory = sqlite3.Row
+        row = c.execute(
+            "SELECT * FROM events WHERE group_id=? AND event_id=? "
+            "AND status='active'",
+            (group_id, event_id),
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def bind_event_source_message(
+    group_id: str,
+    event_id: str,
+    source_msg_id: str,
+) -> bool:
+    """Bind a legacy event to its source without overwriting another source."""
+
+    if not group_id or not event_id or not source_msg_id:
+        return False
+    with _lock, _conn() as c:
+        row = c.execute(
+            "SELECT source_msg_id FROM events WHERE group_id=? AND event_id=? "
+            "AND status='active'",
+            (group_id, event_id),
+        ).fetchone()
+        if row is None:
+            return False
+        current = str(row[0] or "").strip()
+        if current:
+            return current == source_msg_id
+        cur = c.execute(
+            "UPDATE events SET source_msg_id=? WHERE group_id=? AND event_id=? "
+            "AND status='active' AND COALESCE(source_msg_id, '')=''",
+            (source_msg_id, group_id, event_id),
+        )
+        return cur.rowcount == 1
 
 
 def find_active_events_exact(

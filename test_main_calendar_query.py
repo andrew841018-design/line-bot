@@ -463,7 +463,7 @@ def test_build_todo_status_reply_detail_query_includes_source_text(monkeypatch):
 
     monkeypatch.setattr(todo, "list_pending", lambda gid, limit=10, due_date=None: [])
     reminder_ts = int(
-        datetime(2026, 7, 16, 14, 30, tzinfo=ZoneInfo("Asia/Taipei")).timestamp()
+        datetime(2099, 7, 16, 14, 30, tzinfo=ZoneInfo("Asia/Taipei")).timestamp()
     )
     monkeypatch.setattr(
         main.memory,

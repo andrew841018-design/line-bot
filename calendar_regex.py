@@ -27,7 +27,7 @@ _FAMILY_KW = re.compile(
     r"牙醫|東海|校友|美僑|六福萬怡|"
     r"拿(?:蛋糕|藥|包裹|貨|餐|禮物|花)|"
     r"接(?:爸|媽|妹|弟|姊|爺爺|奶奶|小孩|小朋友)|"
-    r"接送|接機|機場接送|機場|搭機|打球|羽球|洗牙|預約|"
+    r"接送|接機|機場接送|機場|搭機|打球|羽球|壁球|洗牙|預約|"
     r"陪(?:爸|媽|妹|弟|姊|爺爺|奶奶|看醫生)|"
     r"喜來登|"
     r"回(?:家|老家)|"
@@ -35,9 +35,18 @@ _FAMILY_KW = re.compile(
 )
 
 _FAMILY_ACTION_HINT = re.compile(
-    r"(?:聚餐|聚會|活動|看醫生|看病|洗牙|預約|領|拿|接送|接機|機場|打球|"
+    r"(?:聚餐|聚會|活動|看醫生|看病|洗牙|預約|領|拿|接送|接機|機場|"
+    r"打球|羽球|壁球|"
     r"到|回台北|回台中|回高雄|回老家|去|帶|送|領藥|參加|"
     r"全家|爸爸|媽媽|姊姊|妹妹|弟弟|蛋糕|生日)"
+)
+
+_MEDICAL_DEPARTMENT = (
+    r"(?:胸腔外科|胸腔內科|心臟內科|心臟血管外科|神經內科|神經外科|"
+    r"肝膽腸胃科|腸胃內科|胃腸科|消化內科|泌尿科|骨科|皮膚科|眼科|"
+    r"耳鼻喉科|婦產科|小兒科|兒科|精神科|復健科|腫瘤科|血液科|"
+    r"感染科|家醫科|家庭醫學科|新陳代謝科|內分泌科|乳房外科|"
+    r"大腸直腸外科|整形外科|一般外科|腎臟科|風濕免疫科|牙科)"
 )
 
 # Plan C：三類 event_type 分類規則（醫療 > 個人旅程 > 家族聚會，medical 最先因更具體）
@@ -47,11 +56,16 @@ _TYPE_PATTERNS: tuple[tuple[str, re.Pattern], ...] = (
         "medical",
         re.compile(
             r"做(?:胃鏡|大腸鏡|健康檢查|體檢|手術|健檢)|"
-            r"看(?:醫生|牙醫|皮膚科|眼科|耳鼻喉科)|"
+            rf"看(?:醫生|牙醫|{_MEDICAL_DEPARTMENT})|"
             r"看.{0,12}(?:牙醫|醫師|醫生)|"
             r"牙醫|"
             r"陪(?:.{0,5})(?:就醫|看醫生|看病|拿藥)|"
-            r"打疫苗|抽血|健檢|回診"
+            r"打疫苗|抽血|健檢|回診|"
+            r"(?:做|照|安排|接受)\s*(?<![A-Za-z])(?:MRI|PET(?:-CT)?)(?![A-Za-z])|"
+            r"(?<![A-Za-z])MRI(?![A-Za-z]).{0,8}(?:掃描|檢查|結果|影像)|"
+            r"(?<![A-Za-z])PET(?![A-Za-z]).{0,4}(?:掃描|檢查|結果|影像)|"
+            r"(?<![A-Za-z])PET-CT(?![A-Za-z])|"
+            r"核磁共振|正子斷層"
         ),
     ),
     (
@@ -63,6 +77,38 @@ _TYPE_PATTERNS: tuple[tuple[str, re.Pattern], ...] = (
         ),
     ),
 )
+
+
+def _normalize_event_text(text: str) -> str:
+    """Normalize only unambiguous medical scan spellings."""
+
+    normalized = re.sub(
+        r"(?<![A-Za-z])[Mm]\s*[Rr]\s*[Ii](?![A-Za-z])"
+        r"(?=.{0,8}(?:掃描|檢查|結果|影像))",
+        "MRI",
+        text,
+    )
+    normalized = re.sub(
+        r"(?<![A-Za-z])[Pp][Ee][Tt](?=\s*(?:掃描|檢查|正子))",
+        "PET",
+        normalized,
+    )
+    normalized = re.sub(
+        r"(?<![A-Za-z])[Pp][Ee][Tt]-?[Cc][Tt](?![A-Za-z])",
+        "PET-CT",
+        normalized,
+    )
+    normalized = re.sub(
+        r"((?:做|照|安排|接受)\s*)[Mm]\s*[Rr]\s*[Ii](?![A-Za-z])",
+        r"\1MRI",
+        normalized,
+    )
+    normalized = re.sub(
+        r"((?:做|照|安排|接受)\s*)[Pp][Ee][Tt](?![A-Za-z])",
+        r"\1PET",
+        normalized,
+    )
+    return normalized
 
 
 def _classify_type(title: str) -> str | None:
@@ -79,13 +125,23 @@ def _classify_type(title: str) -> str | None:
     return None
 
 # HH:MM 或 HHMM — validated 00:00 to 23:59（支援「1430」、「08:30」）
-_TIME = r"(?:[01]?\d|2[0-3])(?::[0-5]\d|[0-5]\d)"
+_TIME_COLON = r"(?:[01]?\d|2[0-3]):[0-5]\d"
+_TIME_COMPACT = r"(?:[01]?\d|2[0-3])[0-5]\d"
+_TIME = rf"(?:{_TIME_COLON}|{_TIME_COMPACT})"
 _CHINESE_NUM = r"[零〇一二兩三四五六七八九十]{1,3}"
 _CHINESE_TIME = (
     rf"(?:(?:\d{{1,2}}|{_CHINESE_NUM})\s*點"
     rf"(?:\s*(?:半|(?:\d{{1,2}}|{_CHINESE_NUM})\s*分?))?)"
 )
 _DAYPART = r"(?:早上|上午|中午|下午|傍晚|晚上|凌晨|半夜)"
+_DAYPART_DEFAULTS = {
+    "早上": "09:00",
+    "上午": "09:00",
+    "中午": "12:00",
+    "下午": "15:00",
+    "傍晚": "18:00",
+    "晚上": "19:00",
+}
 _REL_DAY = r"(?:今天|明天|後天|大後天)"
 _WEEKDAY = r"(?:(?:星期|週|周|禮拜)[一二三四五六日天])"
 _REL_OR_WEEKDAY = rf"(?:{_REL_DAY}|{_WEEKDAY})"
@@ -112,10 +168,23 @@ _DATE_TOKEN = re.compile(
 _DATE_PREFIX = re.compile(
     r"^(?:(\d{4})-(\d{1,2})-(\d{1,2})|(\d{1,2})月(\d{1,2})日|(\d{1,2})/(\d{1,2}))"
 )
-_TIME_IN_TEXT = re.compile(rf"({_DAYPART})?\s*({_TIME}|{_CHINESE_TIME})")
+_TIME_IN_TEXT = re.compile(
+    rf"(?:(?P<compact_daypart>{_DAYPART})\s*"
+    rf"(?P<compact_time>{_TIME_COMPACT})|"
+    rf"(?P<regular_daypart>{_DAYPART})?\s*"
+    rf"(?P<regular_time>{_TIME_COLON}|{_CHINESE_TIME}|"
+    rf"(?<![\s\S]){_TIME_COMPACT}))"
+)
+_DAYPART_IN_TEXT = re.compile(_DAYPART)
 _TIME_RANGE_IN_TEXT = re.compile(
-    rf"({_DAYPART})?\s*({_TIME}|{_CHINESE_TIME})\s*(?:-|~|～|到|至)\s*"
-    rf"({_DAYPART})?\s*({_TIME}|{_CHINESE_TIME})"
+    rf"(?:(?P<range_compact_daypart>{_DAYPART})\s*"
+    rf"(?P<range_daypart_compact_start>{_TIME_COMPACT})|"
+    rf"(?<![\s\S])(?P<range_leading_compact_start>{_TIME_COMPACT})|"
+    rf"(?:(?P<range_regular_daypart>{_DAYPART})\s*)?"
+    rf"(?P<range_regular_start>{_TIME_COLON}|{_CHINESE_TIME}))"
+    rf"\s*(?:-|~|～|到|至)\s*"
+    rf"(?:(?P<range_end_daypart>{_DAYPART})\s*)?"
+    rf"(?P<range_end>{_TIME_COLON}|{_CHINESE_TIME}|{_TIME_COMPACT})"
 )
 
 
@@ -265,6 +334,8 @@ def _parse_time(raw_time: str, daypart: str | None = None) -> str | None:
 
     if minute < 0 or minute > 59:
         return None
+    if daypart == "晚上" and hour == 12:
+        return None
     if daypart in ("下午", "傍晚", "晚上") and 1 <= hour < 12:
         hour += 12
     elif daypart == "中午" and hour < 11:
@@ -279,11 +350,23 @@ def _parse_time(raw_time: str, daypart: str | None = None) -> str | None:
 def _first_time_in_text(text: str) -> str | None:
     range_match = _TIME_RANGE_IN_TEXT.search(text)
     if range_match:
-        return _parse_time(range_match.group(2), range_match.group(1))
+        return _parse_time(
+            range_match.group("range_daypart_compact_start")
+            or range_match.group("range_leading_compact_start")
+            or range_match.group("range_regular_start"),
+            range_match.group("range_compact_daypart")
+            or range_match.group("range_regular_daypart"),
+        )
     m = _TIME_IN_TEXT.search(text)
-    if not m:
-        return None
-    return _parse_time(m.group(2), m.group(1))
+    if m:
+        return _parse_time(
+            m.group("compact_time") or m.group("regular_time"),
+            m.group("compact_daypart") or m.group("regular_daypart"),
+        )
+    daypart = _DAYPART_IN_TEXT.search(text)
+    if daypart:
+        return _DAYPART_DEFAULTS.get(daypart.group(0))
+    return None
 
 
 _WEEKDAY_TO_INDEX = {
@@ -318,26 +401,27 @@ def extract_regex_only(combined_text: str, today_tw: date) -> dict:
     """
     if not combined_text or not combined_text.strip():
         return _make_fail()
+    combined_text = _normalize_event_text(combined_text)
 
     # 1. YYYY-MM-DD HH:MM title
     m = _DATE_TIME_TITLE.search(combined_text)
     if m:
         year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
         target = _validate_date(year, month, day)
-        time_str = m.group(4)
+        time_str = _parse_time(m.group(4))
         title = _sanitize_title(m.group(5))
         et = _classify_type(title) if len(title) >= 2 else None
-        if target and et:
+        if target and time_str and et:
             return _make_event(title, target.isoformat(), time_str, et)
 
     # 2. N月N日 HH:MM title — year inference: past → +1
     m = _CHINESE_DATE_TIME_TITLE.search(combined_text)
     if m:
         month, day = int(m.group(1)), int(m.group(2))
-        time_str = m.group(3)
+        time_str = _parse_time(m.group(3))
         title = _sanitize_title(m.group(4))
         et = _classify_type(title) if len(title) >= 2 else None
-        if et:
+        if time_str and et:
             target = _validate_date(today_tw.year, month, day)
             if target:
                 if target < today_tw:
@@ -350,10 +434,10 @@ def extract_regex_only(combined_text: str, today_tw: date) -> dict:
     if m:
         offset = {"今天": 0, "明天": 1, "後天": 2}[m.group(1)]
         target = today_tw + timedelta(days=offset)
-        time_str = m.group(2)
+        time_str = _parse_time(m.group(2))
         title = _sanitize_title(m.group(3))
         et = _classify_type(title) if len(title) >= 2 else None
-        if et:
+        if time_str and et:
             return _make_event(title, target.isoformat(), time_str, et)
 
     # 4. 今天/星期四 + 中文時間 title（例：星期四早上十點半看牙醫）
@@ -378,14 +462,18 @@ def _extract_location(segment_body: str) -> str | None:
     # 避免在「現在大漲」這類句子誤命中「在」作為關鍵字。
     # 僅接受句首或「空白/標點」前綴後的「在/地點」。
     m = re.search(
-        rf"(?:^|[\s，、。；；：()（）])(?:在|地點[:：])\s*(.+?)(?={_DAYPART}|{_TIME}|$|。|，|；|;)",
+        rf"(?:^|[\s，、。；；：()（）])(?:在|地點[:：])\s*(.+?)"
+        rf"(?={_DAYPART}|{_TIME_COLON}|{_CHINESE_TIME}|做|看|回診|抽血|"
+        rf"打疫苗|MRI|PET|核磁|正子|全家|聚餐|打羽球|打壁球|$|。|，|；|;)",
         segment_body,
     )
     if not m:
         # 「校友會在美僑俱樂部」前面不是標點，但後面明顯是場地；
         # 保守開 fallback，避免把「現在大漲」這類一般文字當 location。
         m = re.search(
-            rf"在\s*(.+?)(?={_DAYPART}|{_TIME}|$|。|，|；|;)",
+            rf"在\s*(.+?)(?={_DAYPART}|{_TIME_COLON}|{_CHINESE_TIME}|做|看|"
+            rf"回診|抽血|打疫苗|MRI|PET|核磁|正子|全家|聚餐|打羽球|"
+            rf"打壁球|$|。|，|；|;)",
             segment_body,
         )
         if m and not re.search(
@@ -410,9 +498,25 @@ def _title_for_fragment(segment_body: str, location: str | None, combined_text: 
             return "東海大學校友會活動（美僑俱樂部）"
         return "東海大學校友會活動"
     if location:
+        action_body = re.sub(_TIME_RANGE_IN_TEXT, "", segment_body)
+        action_body = re.sub(_TIME_IN_TEXT, "", action_body)
+        action_body = re.sub(_DAYPART_IN_TEXT, "", action_body)
+        action_body = re.sub(
+            rf"(?:^|[\s，、。；；：()（）])(?:在|地點[:：])\s*{re.escape(location)}",
+            " ",
+            action_body,
+            count=1,
+        )
+        action_body = action_body.strip(" ，。；;、")
+        if (
+            action_body
+            and _classify_type(f"{action_body} {combined_text}") == "medical"
+        ):
+            return _sanitize_title(action_body)
         return f"{location}活動"[:30]
     raw = re.sub(_TIME_RANGE_IN_TEXT, "", segment_body)
     raw = re.sub(_TIME_IN_TEXT, "", raw)
+    raw = re.sub(_DAYPART_IN_TEXT, "", raw)
     raw = re.sub(r"^(?:以及|和|並且|、|，|,|的)", "", raw).strip()
     return _sanitize_title(raw or "行程")
 
@@ -471,7 +575,7 @@ def _fragment_event(
     title = _title_for_fragment(body, location, combined_text)
     if fallback_title and _is_weak_fragment_title(title):
         title = fallback_title
-    et = _classify_type(f"{title} {body} {combined_text}")
+    et = _classify_type(f"{title} {body}")
     if not et:
         return None
     if et == "family_gathering" and not location and not _FAMILY_ACTION_HINT.search(title):
@@ -499,6 +603,7 @@ def extract_many_regex_only(
     """
     if not combined_text or not combined_text.strip():
         return []
+    combined_text = _normalize_event_text(combined_text)
     events: list[dict] = []
     first = extract_regex_only(combined_text, today_tw)
     if first.get("has_event"):

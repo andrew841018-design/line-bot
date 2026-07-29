@@ -78,6 +78,216 @@ def test_multiple_slash_dates_support_daypart_and_inline_time_range():
     ]
 
 
+def test_subjectless_medical_slash_date_uses_daypart_default_and_normalizes_scans():
+    out = calendar_regex.extract_many_regex_only(
+        "8/18 早上看胸腔外科陳晉興，看M R I跟Pet掃描結果",
+        date(2026, 7, 29),
+        require_time=True,
+    )
+
+    assert len(out) == 1
+    assert out[0]["date"] == "2026-08-18"
+    assert out[0]["time"] == "09:00"
+    assert out[0]["event_type"] == "medical"
+    assert out[0]["title"] == "看胸腔外科陳晉興，看MRI跟PET掃描結果"
+    assert out[0]["location"] is None
+
+
+def test_explicit_time_overrides_medical_daypart_default():
+    out = calendar_regex.extract_many_regex_only(
+        "8/18 早上10:30看胸腔外科",
+        date(2026, 7, 29),
+        require_time=True,
+    )
+
+    assert len(out) == 1
+    assert out[0]["time"] == "10:30"
+
+
+def test_ordinary_english_pet_is_not_medical():
+    out = calendar_regex.extract_many_regex_only(
+        "8/18 早上 pet meetup",
+        date(2026, 7, 29),
+        require_time=True,
+    )
+
+    assert out == []
+
+
+def test_uppercase_scan_acronyms_without_medical_context_are_rejected():
+    assert calendar_regex.extract_many_regex_only(
+        "8/18 早上 PET meetup",
+        date(2026, 7, 29),
+        require_time=True,
+    ) == []
+    assert calendar_regex.extract_many_regex_only(
+        "8/18 早上 MRI workshop",
+        date(2026, 7, 29),
+        require_time=True,
+    ) == []
+
+
+def test_lowercase_mri_scan_is_normalized_with_medical_context():
+    out = calendar_regex.extract_many_regex_only(
+        "8/18 早上 mri掃描",
+        date(2026, 7, 29),
+        require_time=True,
+    )
+
+    assert len(out) == 1
+    assert out[0]["event_type"] == "medical"
+    assert out[0]["title"] == "MRI掃描"
+
+
+def test_chinese_nonmedical_ke_words_are_not_departments():
+    for text in (
+        "8/18 早上看百科全書",
+        "8/18 早上看這本科幻片",
+        "8/18 早上看理工科介紹",
+    ):
+        assert calendar_regex.extract_many_regex_only(
+            text,
+            date(2026, 7, 29),
+            require_time=True,
+        ) == []
+
+
+def test_location_number_is_not_compact_clock():
+    out = calendar_regex.extract_many_regex_only(
+        "8/18 下午去台北101聚餐",
+        date(2026, 7, 29),
+        require_time=True,
+    )
+
+    assert len(out) == 1
+    assert out[0]["time"] == "15:00"
+    assert "101" in out[0]["title"]
+
+
+def test_spaced_location_number_is_not_compact_clock():
+    out = calendar_regex.extract_many_regex_only(
+        "8/18 下午去台北 101 聚餐",
+        date(2026, 7, 29),
+        require_time=True,
+    )
+
+    assert len(out) == 1
+    assert out[0]["time"] == "15:00"
+    assert "101" in out[0]["title"]
+
+
+def test_spaced_daypart_compact_clock_is_explicit_time():
+    out = calendar_regex.extract_many_regex_only(
+        "8/18 下午 1430 全家聚餐",
+        date(2026, 7, 29),
+        require_time=True,
+    )
+
+    assert len(out) == 1
+    assert out[0]["time"] == "14:30"
+
+
+def test_iso_compact_clock_is_canonical_and_not_duplicated():
+    out = calendar_regex.extract_many_regex_only(
+        "2026-08-18 1430 全家聚餐",
+        date(2026, 7, 29),
+    )
+
+    assert len(out) == 1
+    assert out[0]["time"] == "14:30"
+
+
+def test_chinese_date_compact_clock_is_canonical_and_not_duplicated():
+    out = calendar_regex.extract_many_regex_only(
+        "8月18日 1430 全家聚餐",
+        date(2026, 7, 29),
+    )
+
+    assert len(out) == 1
+    assert out[0]["time"] == "14:30"
+
+
+def test_relative_date_compact_clock_is_canonical():
+    out = calendar_regex.extract_many_regex_only(
+        "明天 1430 全家聚餐",
+        date(2026, 7, 29),
+    )
+
+    assert len(out) == 1
+    assert out[0]["time"] == "14:30"
+
+
+def test_compact_time_ranges_remove_both_ends_from_title():
+    for text in (
+        "8/18 1400 - 1600 全家聚餐",
+        "8/18 1400至1600 全家聚餐",
+    ):
+        out = calendar_regex.extract_many_regex_only(
+            text,
+            date(2026, 7, 29),
+            require_time=True,
+        )
+        assert len(out) == 1
+        assert out[0]["time"] == "14:00"
+        assert out[0]["title"] == "全家聚餐"
+
+
+def test_room_number_range_is_not_compact_time_range():
+    out = calendar_regex.extract_many_regex_only(
+        "8/18 下午在會議室101-102全家聚餐",
+        date(2026, 7, 29),
+        require_time=True,
+    )
+
+    assert len(out) == 1
+    assert out[0]["time"] == "15:00"
+    assert "101-102" in (out[0]["location"] or out[0]["title"])
+
+
+def test_preceding_scan_verb_is_medical_context():
+    for text in ("8/18 早上做MRI", "8/18 早上照mri"):
+        out = calendar_regex.extract_many_regex_only(
+            text,
+            date(2026, 7, 29),
+            require_time=True,
+        )
+        assert len(out) == 1
+        assert out[0]["event_type"] == "medical"
+
+
+def test_medical_location_stops_before_action_and_preserves_action_title():
+    out = calendar_regex.extract_many_regex_only(
+        "8/18 早上在台大醫院做MRI胸椎檢查",
+        date(2026, 7, 29),
+        require_time=True,
+    )
+
+    assert len(out) == 1
+    assert out[0]["location"] == "台大醫院"
+    assert out[0]["title"] == "做MRI胸椎檢查"
+    assert out[0]["event_type"] == "medical"
+
+
+def test_medical_location_keeps_inspection_center_suffix():
+    out = calendar_regex.extract_many_regex_only(
+        "8/18 早上在聯合醫院影像檢查中心看胸腔外科",
+        date(2026, 7, 29),
+        require_time=True,
+    )
+
+    assert len(out) == 1
+    assert out[0]["location"] == "聯合醫院影像檢查中心"
+    assert out[0]["title"] == "看胸腔外科"
+
+
+def test_ambiguous_evening_twelve_is_rejected():
+    assert calendar_regex.extract_many_regex_only(
+        "8/18 晚上12點看胸腔外科",
+        date(2026, 7, 29),
+        require_time=True,
+    ) == []
+
+
 def test_work_iso_format_rejected():
     """ISO 日期格式的工作事件也要拒絕。"""
     out = calendar_regex.extract_regex_only(
@@ -223,6 +433,18 @@ def test_title_strips_control_chars():
     if out["has_event"]:
         assert "\x07" not in out["title"]
         assert "\x1f" not in out["title"]
+
+
+def test_mixed_multi_event_classification_is_fragment_local():
+    events = calendar_regex.extract_many_regex_only(
+        "8/1 18:00 全家聚餐\n8/2 09:00 看胸腔外科",
+        date(2026, 7, 29),
+    )
+
+    assert [(event["title"], event["event_type"]) for event in events] == [
+        ("全家聚餐", "family_gathering"),
+        ("看胸腔外科", "medical"),
+    ]
 
 
 # ── 邊界：空字串 / 無 family keyword ─────────────────────────────────────
