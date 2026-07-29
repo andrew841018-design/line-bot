@@ -524,6 +524,11 @@ def main() -> int:
                 calendar_db.EVENT_REMINDER_SOURCE_KIND,
                 str(e.get("event_id") or ""),
                 offset,
+                expected_title=str(e.get("title") or ""),
+                expected_event_date=str(e.get("event_date") or ""),
+                expected_event_time=e.get("event_time"),
+                expected_location=str(e.get("location") or ""),
+                expected_participants=str(e.get("participants") or "[]"),
                 transport="push",
             )
             if claim is None:

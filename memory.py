@@ -62,6 +62,39 @@ def _conn() -> sqlite3.Connection:
     return conn
 
 
+def _ensure_pending_source_unique_index(c: sqlite3.Connection) -> bool:
+    index_sql = (
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "idx_reminders_pending_source_unique "
+        "ON reminders(group_id, source_kind, source_ref) "
+        "WHERE status='pending' AND source_kind<>'' AND source_ref<>''"
+    )
+    started_transaction = not c.in_transaction
+    if started_transaction:
+        c.execute("BEGIN IMMEDIATE")
+    try:
+        duplicate_source = c.execute(
+            "SELECT 1 FROM reminders WHERE status='pending' "
+            "AND source_kind<>'' AND source_ref<>'' "
+            "GROUP BY group_id, source_kind, source_ref HAVING COUNT(*)>1 "
+            "LIMIT 1"
+        ).fetchone()
+        if duplicate_source is not None:
+            if started_transaction:
+                c.execute("ROLLBACK")
+            raise RuntimeError(
+                "pending reminder source identity is not unique"
+            )
+        c.execute(index_sql)
+        if started_transaction:
+            c.execute("COMMIT")
+        return True
+    except Exception:
+        if started_transaction and c.in_transaction:
+            c.execute("ROLLBACK")
+        raise
+
+
 def _init_db() -> None:
     with _lock, _conn() as c:
         c.executescript(
@@ -339,6 +372,7 @@ def _init_db() -> None:
                 "ALTER TABLE reminders ADD COLUMN mention_aliases "
                 "TEXT NOT NULL DEFAULT '[]'"
             )
+        _ensure_pending_source_unique_index(c)
         # persona_notes schema migration: add source column if missing
         # 2026-05-08：區分 'rule_violation'（既有黑名單觸發）vs 'organic'（user 真實糾正）
         pn_cols = [r[1] for r in c.execute("PRAGMA table_info(persona_notes)").fetchall()]
@@ -1750,6 +1784,11 @@ def claim_natural_reminder_delivery(
     expected_action: str,
     expected_remind_at: int,
     expected_weekly_count: int = 0,
+    expected_user_id: str | None = None,
+    expected_source_kind: str | None = None,
+    expected_source_ref: str | None = None,
+    expected_source_text: str | None = None,
+    expected_mention_aliases: list[str] | None = None,
     transport: str,
 ) -> dict | None:
     """Atomically authorize one natural-reminder delivery occurrence."""
@@ -1774,13 +1813,33 @@ def claim_natural_reminder_delivery(
         row = c.execute(
             "SELECT action, remind_at, weekly_count, source_kind, source_ref, "
             "pushed_3d, pushed_1d, pushed_4hr, pushed_2hr, pushed_1hr, "
-            "pushed_now FROM reminders "
+            "pushed_now, user_id, source_text, mention_aliases FROM reminders "
             "WHERE group_id=? AND reminder_id=? AND status='pending'",
             (group_id, reminder_id),
         ).fetchone()
         if row is None:
             return None
         if str(row[0]) != str(expected_action) or int(row[1]) != expected_remind_at:
+            return None
+        if expected_user_id is not None and str(row[11] or "") != str(
+            expected_user_id
+        ):
+            return None
+        if expected_source_kind is not None and str(row[3] or "") != str(
+            expected_source_kind
+        ):
+            return None
+        if expected_source_ref is not None and str(row[4] or "") != str(
+            expected_source_ref
+        ):
+            return None
+        if expected_source_text is not None and str(row[12] or "") != str(
+            expected_source_text
+        ):
+            return None
+        if expected_mention_aliases is not None and _load_mention_aliases(
+            row[13]
+        ) != _normalize_mention_aliases(expected_mention_aliases):
             return None
         if stage == "weekly":
             if int(row[2] or 0) != expected_weekly_count:
@@ -1883,6 +1942,11 @@ def claim_calendar_reminder_delivery(
     source_ref: str,
     offset: int,
     *,
+    expected_title: str,
+    expected_event_date: str,
+    expected_event_time: str | None,
+    expected_location: str,
+    expected_participants: str,
     transport: str,
 ) -> dict | None:
     """Atomically authorize one calendar-event reminder offset."""
@@ -1917,10 +1981,23 @@ def claim_calendar_reminder_delivery(
             return None
         try:
             event = c.execute(
-                f"SELECT title, event_date, COALESCE(event_time, '') "
+                f"SELECT title, event_date, COALESCE(event_time, ''), "
+                f"COALESCE(location, ''), COALESCE(participants, '[]') "
                 f"FROM events WHERE group_id=? AND event_id=? "
-                f"AND status='active' AND {column} IS NULL",
-                (group_id, source_ref),
+                f"AND status='active' AND {column} IS NULL "
+                "AND title=? AND event_date=? "
+                "AND COALESCE(event_time, '')=? "
+                "AND COALESCE(location, '')=? "
+                "AND COALESCE(participants, '[]')=?",
+                (
+                    group_id,
+                    source_ref,
+                    str(expected_title),
+                    str(expected_event_date),
+                    str(expected_event_time or ""),
+                    str(expected_location or ""),
+                    str(expected_participants or "[]"),
+                ),
             ).fetchone()
         except sqlite3.OperationalError:
             return None
@@ -1977,6 +2054,8 @@ def claim_calendar_reminder_delivery(
         "expected_title": str(event[0]),
         "expected_event_date": str(event[1]),
         "expected_event_time": str(event[2] or ""),
+        "expected_location": str(event[3] or ""),
+        "expected_participants": str(event[4] or "[]"),
     }
 
 
@@ -2906,32 +2985,6 @@ def delete_duplicate_pending_reminders(
                 # strand stale-claim recovery on a different occurrence.
                 push_values["weekly_count"] = int(keep["weekly_count"] or 0)
 
-            c.execute(
-                "UPDATE reminders SET user_id=?, source_kind=?, source_ref=?, "
-                "source_text=?, mention_aliases=?, created_at=?, "
-                "last_pushed_at=?, weekly_count=?, last_weekly_at=?, "
-                "pushed_3d=?, pushed_1d=?, pushed_4hr=?, pushed_2hr=?, "
-                "pushed_1hr=?, pushed_now=? WHERE reminder_id=?",
-                (
-                    user_id,
-                    source_kind,
-                    source_ref,
-                    merged_source,
-                    merged_aliases_json,
-                    created_at,
-                    push_values["last_pushed_at"],
-                    push_values["weekly_count"],
-                    push_values["last_weekly_at"],
-                    push_values["pushed_3d"],
-                    push_values["pushed_1d"],
-                    push_values["pushed_4hr"],
-                    push_values["pushed_2hr"],
-                    push_values["pushed_1hr"],
-                    push_values["pushed_now"],
-                    keep_id,
-                ),
-            )
-
             placeholders = ",".join(["?"] * len(duplicate_ids))
             c.execute(
                 "UPDATE sent_reminder_refs SET reminder_id=? "
@@ -2957,6 +3010,31 @@ def delete_duplicate_pending_reminders(
             cursor = c.execute(
                 f"DELETE FROM reminders WHERE reminder_id IN ({placeholders})",
                 duplicate_ids,
+            )
+            c.execute(
+                "UPDATE reminders SET user_id=?, source_kind=?, source_ref=?, "
+                "source_text=?, mention_aliases=?, created_at=?, "
+                "last_pushed_at=?, weekly_count=?, last_weekly_at=?, "
+                "pushed_3d=?, pushed_1d=?, pushed_4hr=?, pushed_2hr=?, "
+                "pushed_1hr=?, pushed_now=? WHERE reminder_id=?",
+                (
+                    user_id,
+                    source_kind,
+                    source_ref,
+                    merged_source,
+                    merged_aliases_json,
+                    created_at,
+                    push_values["last_pushed_at"],
+                    push_values["weekly_count"],
+                    push_values["last_weekly_at"],
+                    push_values["pushed_3d"],
+                    push_values["pushed_1d"],
+                    push_values["pushed_4hr"],
+                    push_values["pushed_2hr"],
+                    push_values["pushed_1hr"],
+                    push_values["pushed_now"],
+                    keep_id,
+                ),
             )
             return cursor.rowcount
 

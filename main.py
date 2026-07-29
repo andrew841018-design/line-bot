@@ -2100,7 +2100,7 @@ def _try_piggyback_reminders_fast_path(
         import event_reminder as _er
         messages: list = []
         message_plain_texts: list[str] = []
-        pending: list[tuple[str, int]] = []
+        pending: list[tuple[dict, int]] = []
         for offset in calendar_db.REMINDER_OFFSETS:
             if len(messages) >= 5:
                 break
@@ -2117,7 +2117,7 @@ def _try_piggyback_reminders_fast_path(
                 message_plain_texts.append(
                     str(spec.get("fallback_text") or spec.get("text") or "")
                 )
-                pending.append((e["event_id"], offset))
+                pending.append((dict(e), offset))
         import reminder_push as _rp
         pending_pushes: list[dict] = []
         if len(messages) < 5:
@@ -2138,12 +2138,20 @@ def _try_piggyback_reminders_fast_path(
         keep = [True] * len(messages)
         kept_pending: list[tuple[str, int]] = []
         for idx, item in enumerate(pending):
-            event_id, offset = item
+            event_snapshot, offset = item
+            event_id = str(event_snapshot["event_id"])
             claim = memory.claim_calendar_reminder_delivery(
                 group_id,
                 calendar_db.EVENT_REMINDER_SOURCE_KIND,
-                str(event_id),
+                event_id,
                 offset,
+                expected_title=str(event_snapshot.get("title") or ""),
+                expected_event_date=str(event_snapshot.get("event_date") or ""),
+                expected_event_time=event_snapshot.get("event_time"),
+                expected_location=str(event_snapshot.get("location") or ""),
+                expected_participants=str(
+                    event_snapshot.get("participants") or "[]"
+                ),
                 transport="reply",
             )
             if claim is None:
@@ -2161,6 +2169,31 @@ def _try_piggyback_reminders_fast_path(
                 expected_action=str(item["action"]),
                 expected_remind_at=int(item["remind_at"]),
                 expected_weekly_count=int(item.get("weekly_count") or 0),
+                expected_user_id=(
+                    str(item.get("user_id") or "")
+                    if "user_id" in item
+                    else None
+                ),
+                expected_source_kind=(
+                    str(item.get("source_kind") or "")
+                    if "source_kind" in item
+                    else None
+                ),
+                expected_source_ref=(
+                    str(item.get("source_ref") or "")
+                    if "source_ref" in item
+                    else None
+                ),
+                expected_source_text=(
+                    str(item.get("source_text") or "")
+                    if "source_text" in item
+                    else None
+                ),
+                expected_mention_aliases=(
+                    list(item.get("mention_aliases") or [])
+                    if "mention_aliases" in item
+                    else None
+                ),
                 transport="reply",
             )
             if claim is None:
@@ -2306,7 +2339,7 @@ _AUTO_CAPTURE_VERB_RE = re.compile(
     r"[Pp][Ee][Tt](?:-?[Cc][Tt]|.{0,4}(?:掃描|檢查|結果|影像))|"
     r"領(?:藥|處方簽|包裹)|"
     r"婚禮|喜宴|滿月|彌月|"
-    r"打(?:疫苗|球|羽球)|羽球|行程|活動|抽血|健檢|出差|北上|南下"
+    r"打(?:疫苗|球|羽球)|羽球|壁球|行程|活動|抽血|健檢|出差|北上|南下"
 )
 
 _MEDICAL_ACTOR_ACTION_RE = re.compile(
@@ -3164,6 +3197,51 @@ _CALENDAR_CORRECTION_MARKER_RE = re.compile(
 _CALENDAR_CORRECTION_NEGATION_RE = re.compile(
     r"(?:不用|不要|先別|先不要|暫時不要).{0,6}(?:更正|修正|校正|改)"
 )
+_QUOTED_CORRECTION_DATE_RE = re.compile(
+    r"(?<!\d)(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}|"
+    r"\d{1,2}\s*月\s*\d{1,2}\s*[日號]?|"
+    r"\d{1,2}/\d{1,2})(?!\d)"
+)
+_QUOTED_CORRECTION_RELATIVE_DATE_RE = re.compile(
+    r"今天|明天|後天|大後天"
+)
+_QUOTED_CORRECTION_DAYPART = r"(?:凌晨|早上|上午|中午|下午|晚上|傍晚|晚間|半夜)"
+_QUOTED_CORRECTION_NUMERIC_CLOCK = (
+    r"(?<!\d)(?:(?:2[0-3]|[01]?\d)[:：][0-5]\d|"
+    r"(?:2[0-3]|[01]?\d)[0-5]\d)(?!\d)"
+)
+_QUOTED_CORRECTION_CHINESE_CLOCK = (
+    r"(?:\d{1,2}|[零〇一二兩三四五六七八九十]{1,3})\s*(?:點|時)\s*"
+    r"(?:半|(?:\d{1,2}|[零〇一二兩三四五六七八九十]{1,3})\s*分?)?"
+)
+_QUOTED_CORRECTION_CLOCK_TOKEN = (
+    rf"(?:{_QUOTED_CORRECTION_DAYPART}\s*)?"
+    rf"(?:{_QUOTED_CORRECTION_NUMERIC_CLOCK}|"
+    rf"{_QUOTED_CORRECTION_CHINESE_CLOCK})"
+)
+_QUOTED_CORRECTION_RANGE_SEPARATOR = r"(?:-|－|—|–|~|～|至|到)"
+_QUOTED_CORRECTION_CLOCK_RANGE_RE = re.compile(
+    rf"(?P<start>{_QUOTED_CORRECTION_CLOCK_TOKEN})\s*"
+    rf"{_QUOTED_CORRECTION_RANGE_SEPARATOR}\s*"
+    rf"(?P<end>{_QUOTED_CORRECTION_CLOCK_TOKEN})"
+)
+_QUOTED_CORRECTION_CLOCK_RE = re.compile(_QUOTED_CORRECTION_CLOCK_TOKEN)
+_QUOTED_CORRECTION_RANGE_CANDIDATE_RE = re.compile(
+    rf"(?<!\d)(?P<start>(?:{_QUOTED_CORRECTION_DAYPART}\s*)?"
+    rf"(?:\d{{3,5}}|\d{{1,2}}[:：]\d{{2,3}}|"
+    rf"{_QUOTED_CORRECTION_CHINESE_CLOCK}))\s*"
+    rf"{_QUOTED_CORRECTION_RANGE_SEPARATOR}\s*"
+    rf"(?P<end>(?:{_QUOTED_CORRECTION_DAYPART}\s*)?"
+    rf"(?:\d{{3,5}}|\d{{1,2}}[:：]\d{{2,3}}|"
+    rf"{_QUOTED_CORRECTION_CHINESE_CLOCK}))(?!\d)"
+)
+_QUOTED_CORRECTION_THREE_DIGIT_RANGE_RE = re.compile(
+    rf"(?<!\d)\d{{3}}\s*{_QUOTED_CORRECTION_RANGE_SEPARATOR}\s*"
+    r"\d{3}(?!\d)"
+)
+_QUOTED_CORRECTION_FIELD_LABEL_RE = re.compile(
+    r"^(?:把)?\s*(日期|時間|標題|事項|內容)\s*$"
+)
 _ZH_NUMERAL = {
     "零": 0,
     "〇": 0,
@@ -3179,7 +3257,7 @@ _ZH_NUMERAL = {
     "九": 9,
 }
 _CALENDAR_CORRECTION_KEYWORDS: tuple[str, ...] = (
-    "羽球", "打球", "聚餐", "吃飯", "生日", "出遊", "旅行", "回台北",
+    "羽球", "壁球", "打球", "聚餐", "吃飯", "生日", "出遊", "旅行", "回台北",
     "回老家", "看醫生", "牙醫", "洗牙", "拿蛋糕", "蛋糕", "包裹",
     "接媽媽", "接爸爸", "媽媽", "爸爸", "姊姊", "妹妹", "弟弟", "全家",
 )
@@ -3220,9 +3298,27 @@ def _parse_calendar_correction_time(text: str) -> str | None:
     if not s:
         return None
 
-    m = re.search(r"(?<!\d)([01]?\d|2[0-3])\s*[:：]\s*([0-5]\d)(?!\d)", s)
+    def apply_daypart(period: str, hour: int) -> int | None:
+        if period == "晚上" and hour == 12:
+            return None
+        if period in ("下午", "晚上", "傍晚", "晚間") and 1 <= hour <= 11:
+            return hour + 12
+        if period == "中午" and 1 <= hour <= 10:
+            return hour + 12
+        if period in ("凌晨", "半夜") and hour == 12:
+            return 0
+        return hour
+
+    m = re.search(
+        rf"({_QUOTED_CORRECTION_DAYPART})?\s*"
+        r"(?<!\d)([01]?\d|2[0-3])\s*[:：]\s*([0-5]\d)(?!\d)",
+        s,
+    )
     if m:
-        return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
+        hour = apply_daypart(m.group(1) or "", int(m.group(2)))
+        if hour is None:
+            return None
+        return f"{hour:02d}:{int(m.group(3)):02d}"
 
     cn = "零〇一二兩三四五六七八九十"
     m = re.search(
@@ -3238,19 +3334,225 @@ def _parse_calendar_correction_time(text: str) -> str | None:
         minute = 30 if minute_raw == "半" else (_parse_zh_int(minute_raw) or 0)
         if hour is None or hour > 23 or minute > 59:
             return None
-        if period in ("下午", "晚上", "傍晚", "晚間") and 1 <= hour <= 11:
-            hour += 12
-        elif period == "中午" and hour == 0:
-            hour = 12
+        hour = apply_daypart(period, hour)
+        if hour is None:
+            return None
         return f"{hour:02d}:{minute:02d}"
 
     m = re.search(
-        r"(?<![\d年月日/\-])([01]?\d|2[0-3])([0-5]\d)(?![\d年月日/\-])",
+        rf"({_QUOTED_CORRECTION_DAYPART})?\s*"
+        r"(?<![\d年月日/\-])(2[0-3]|[01]?\d)([0-5]\d)"
+        r"(?![\d年月日/\-])",
         s,
     )
     if m:
-        return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
+        hour = apply_daypart(m.group(1) or "", int(m.group(2)))
+        if hour is None:
+            return None
+        return f"{hour:02d}:{int(m.group(3)):02d}"
     return None
+
+
+def _parse_quoted_calendar_correction(text: str) -> dict:
+    s = (text or "").strip()
+    marker = _CALENDAR_CORRECTION_MARKER_RE.search(s)
+    if not marker or _CALENDAR_CORRECTION_NEGATION_RE.search(s):
+        return {"status": "invalid"}
+
+    prefix = s[: marker.start()].strip(" \t，,。.!！?？:：")
+    suffix = s[marker.end():].strip()
+    field_match = _QUOTED_CORRECTION_FIELD_LABEL_RE.fullmatch(prefix)
+    field = field_match.group(1) if field_match else ""
+    if not field:
+        suffix_field = re.match(
+            r"^(?:把)?\s*(日期|時間|標題|事項|內容)\s*",
+            suffix,
+        )
+        if suffix_field:
+            field = suffix_field.group(1)
+            suffix = suffix[suffix_field.end():]
+    if field in {"標題", "事項", "內容"}:
+        suffix = re.sub(r"^[\s:：]+", "", suffix)
+        if marker.group(0) in {"更正", "修正", "校正"}:
+            suffix = re.sub(r"^為\s*", "", suffix, count=1)
+            suffix = re.sub(
+                r"^(?:改成|改為|改到|改在|改至)\s*",
+                "",
+                suffix,
+                count=1,
+            )
+        new_title = re.sub(r"[\x00-\x1f\x7f]+", " ", suffix)
+        new_title = re.sub(r"\s+", " ", new_title).strip(
+            " \t，,。.!！?？、:："
+        )
+        if (
+            not new_title
+            or len(new_title) > 80
+            or new_title.isdigit()
+            or new_title
+            in {
+                "日期",
+                "時間",
+                "標題",
+                "事項",
+                "內容",
+                "一下",
+                "這個",
+                "那個",
+            }
+        ):
+            return {"status": "invalid"}
+        return {
+            "status": "ok",
+            "new_date": None,
+            "new_time": None,
+            "new_title": new_title,
+        }
+
+    suffix = re.sub(r"^[\s:：]+", "", suffix)
+    if marker.group(0) in {"更正", "修正", "校正"}:
+        suffix = re.sub(r"^為\s*", "", suffix, count=1)
+        suffix = re.sub(
+            r"^(?:改成|改為|改到|改在|改至)\s*",
+            "",
+            suffix,
+            count=1,
+        )
+
+    absolute_dates = list(_QUOTED_CORRECTION_DATE_RE.finditer(suffix))
+    relative_dates = list(
+        _QUOTED_CORRECTION_RELATIVE_DATE_RE.finditer(suffix)
+    )
+    if len(absolute_dates) + len(relative_dates) > 1:
+        return {"status": "invalid"}
+
+    new_date: str | None = None
+    if absolute_dates:
+        raw_date = absolute_dates[0].group(0)
+        normalized = re.sub(r"\s+", "", raw_date)
+        normalized = normalized.replace("月", "-").replace("日", "").replace("號", "")
+        normalized = normalized.replace("/", "-")
+        parts = normalized.split("-")
+        try:
+            if len(parts) == 3:
+                parsed_date = datetime(
+                    int(parts[0]), int(parts[1]), int(parts[2])
+                ).date()
+                new_date = parsed_date.isoformat()
+            elif len(parts) == 2:
+                month, day = int(parts[0]), int(parts[1])
+                datetime(2000, month, day)
+                new_date = f"{month:02d}-{day:02d}"
+            else:
+                return {"status": "invalid"}
+        except ValueError:
+            return {"status": "invalid"}
+    elif relative_dates:
+        relative = _resolve_relative_date(relative_dates[0].group(0))
+        if relative is None:
+            return {"status": "invalid"}
+        new_date = relative.isoformat()
+
+    time_source = _QUOTED_CORRECTION_DATE_RE.sub(" ", suffix)
+    time_source = _QUOTED_CORRECTION_RELATIVE_DATE_RE.sub(" ", time_source)
+    time_source = time_source.strip()
+    if _QUOTED_CORRECTION_THREE_DIGIT_RANGE_RE.search(time_source):
+        return {"status": "invalid"}
+    for candidate in _QUOTED_CORRECTION_RANGE_CANDIDATE_RE.finditer(
+        time_source
+    ):
+        strict = _QUOTED_CORRECTION_CLOCK_RANGE_RE.fullmatch(candidate.group(0))
+        if strict is None:
+            return {"status": "invalid"}
+        if (
+            _parse_calendar_correction_time(strict.group("start")) is None
+            or _parse_calendar_correction_time(strict.group("end")) is None
+        ):
+            return {"status": "invalid"}
+
+    ranges = list(_QUOTED_CORRECTION_CLOCK_RANGE_RE.finditer(time_source))
+    if len(ranges) > 1:
+        return {"status": "invalid"}
+    time_scan = time_source
+    new_time: str | None = None
+    if ranges:
+        new_time = _parse_calendar_correction_time(ranges[0].group("start"))
+        if (
+            new_time is None
+            or _parse_calendar_correction_time(ranges[0].group("end")) is None
+        ):
+            return {"status": "invalid"}
+        time_scan = _QUOTED_CORRECTION_CLOCK_RANGE_RE.sub(" ", time_scan)
+    remaining_clocks = list(_QUOTED_CORRECTION_CLOCK_RE.finditer(time_scan))
+    if len(remaining_clocks) > 1 or (ranges and remaining_clocks):
+        return {"status": "invalid"}
+    if not ranges and remaining_clocks:
+        clock_token = remaining_clocks[0].group(0).strip()
+        if (
+            not field
+            and clock_token in {"一點", "1點"}
+            and not re.search(_QUOTED_CORRECTION_DAYPART, clock_token)
+        ):
+            new_time = None
+        else:
+            new_time = _parse_calendar_correction_time(clock_token)
+
+    title_scan = _QUOTED_CORRECTION_DATE_RE.sub(" ", suffix)
+    title_scan = _QUOTED_CORRECTION_RELATIVE_DATE_RE.sub(" ", title_scan)
+    title_scan = _QUOTED_CORRECTION_CLOCK_RANGE_RE.sub(" ", title_scan)
+    title_scan = _QUOTED_CORRECTION_CLOCK_RE.sub(" ", title_scan)
+    title_scan = re.sub(r"^\s*(?:大約|約|從)\s*", "", title_scan)
+    title_scan = re.sub(
+        r"^(?:日期|時間|標題|事項|內容)\s*[:：]?\s*",
+        "",
+        title_scan,
+    )
+    title_scan = re.sub(r"[\x00-\x1f\x7f]+", " ", title_scan)
+    title_scan = re.sub(r"[\s，,。.!！?？、:：]+", " ", title_scan).strip()
+    new_title = title_scan or None
+    if not field and new_title:
+        new_title = re.sub(
+            r"(?:可以嗎|好嗎|對嗎|行嗎|可以吧|好吧)$",
+            "",
+            new_title,
+        ).strip()
+        new_title = re.sub(r"嗎$", "", new_title).strip()
+        has_calendar_title_hint = any(
+            keyword in new_title
+            for keyword in (
+                *_CALENDAR_CORRECTION_KEYWORDS,
+                *_CALENDAR_CORRECTION_ACTORS,
+            )
+        )
+        if not has_calendar_title_hint:
+            new_title = None
+
+    if field in {"日期", "時間"}:
+        new_title = None
+    if field == "日期" and new_date is None:
+        return {"status": "invalid"}
+    if field == "時間" and new_time is None:
+        return {"status": "invalid"}
+    if field in {"標題", "事項", "內容"} and new_title is None:
+        return {"status": "invalid"}
+    if new_title in {"日期", "時間", "標題", "事項", "內容", "一下", "這個", "那個"}:
+        return {"status": "invalid"}
+    if new_title and (len(new_title) > 80 or new_title.isdigit()):
+        return {"status": "invalid"}
+    if (
+        new_time is None
+        and re.search(r"(?<!\d)\d{3,5}(?!\d)", suffix)
+        and field != "標題"
+    ):
+        return {"status": "invalid"}
+    if new_date is None and new_time is None and new_title is None:
+        return {"status": "invalid"}
+    return {
+        "status": "ok",
+        "new_date": new_date,
+        "new_time": new_time,
+        "new_title": new_title,
+    }
 
 
 def _parse_calendar_absolute_date(text: str):
@@ -3322,7 +3624,7 @@ def _calendar_correction_content_candidate(text: str) -> str:
         s,
     )
     s = re.sub(r"(?<!\d)([01]?\d|2[0-3])\s*[:：]\s*([0-5]\d)(?!\d)", " ", s)
-    s = re.sub(r"(?<![\d年月日/\-])([01]?\d|2[0-3])([0-5]\d)(?![\d年月日/\-])", " ", s)
+    s = re.sub(r"(?<![\d年月日/\-])(2[0-3]|[01]?\d)([0-5]\d)(?![\d年月日/\-])", " ", s)
     s = re.sub(
         r"(凌晨|早上|上午|中午|下午|晚上|傍晚|晚間)?\s*"
         r"[\d零〇一二兩三四五六七八九十]{1,3}\s*(?:點|時)"
@@ -3542,26 +3844,45 @@ def _try_handle_calendar_correction(
         new_date = correction.get("new_date") or target_date
     new_time = correction.get("new_time")
 
+    correction_status = "not_found"
     event_updated = False
+    reminders_updated = 0
     if target and new_date:
         try:
-            event_updated = calendar_db.update_event_schedule(
-                target["event_id"], new_date, new_time, title=new_title
+            result = calendar_db.correct_event_and_reminder_by_id(
+                group_id,
+                str(target["event_id"]),
+                new_date=new_date,
+                new_time=new_time,
+                new_title=new_title,
             )
+            correction_status = str(result.get("status") or "unavailable")
+            event_updated = correction_status == "updated"
+            reminders_updated = 1 if event_updated else 0
         except Exception as e:
             logger.warning("calendar correction event update failed: %s", e)
+            correction_status = "unavailable"
+    elif not target:
+        reminders_updated = _update_calendar_correction_reminders(
+            group_id=group_id,
+            keywords=keywords,
+            target_date=target_date,
+            new_date=new_date,
+            new_time=new_time,
+            new_action=new_title,
+            source_text=text,
+        )
+        if reminders_updated:
+            correction_status = "updated"
 
-    reminders_updated = _update_calendar_correction_reminders(
-        group_id=group_id,
-        keywords=keywords,
-        target_date=target_date,
-        new_date=new_date,
-        new_time=new_time,
-        new_action=new_title,
-        source_text=text,
-    )
-
-    if not event_updated and reminders_updated == 0:
+    if correction_status == "busy":
+        reply = (
+            "這筆提醒正在推送中，為避免送出舊內容，目前沒有變更。\n"
+            "請稍後再更正。"
+        )
+    elif correction_status == "unchanged":
+        reply = "這筆行程與提醒已是相同內容，沒有重複更新。"
+    elif correction_status not in {"updated"}:
         label = " / ".join(correction.get("keywords") or []) or "這筆"
         when = target_date or correction.get("new_date") or "指定日期"
         reply = f"有收到更正，但找不到 {when} 的「{label}」行程或提醒。"
@@ -3590,6 +3911,122 @@ def _try_handle_calendar_correction(
         event_updated,
         reminders_updated,
         text[:80],
+    )
+    return True
+
+
+def _try_handle_quoted_calendar_correction(
+    event: MessageEvent,
+    group_id: str,
+    text: str,
+) -> bool:
+    message = getattr(event, "message", None)
+    quoted_message_id = getattr(message, "quoted_message_id", None)
+    if not quoted_message_id or not _CALENDAR_CORRECTION_MARKER_RE.search(text or ""):
+        return False
+
+    try:
+        parsed = _parse_quoted_calendar_correction(text)
+    except Exception:
+        logger.exception(
+            "quoted calendar correction parse failed group=%s source=%s",
+            group_id,
+            quoted_message_id,
+        )
+        parsed = {"status": "unavailable"}
+    if parsed.get("status") != "ok":
+        if parsed.get("status") == "unavailable":
+            reply = (
+                "行程與提醒未能一起完成更新，因此沒有回報成功。\n"
+                "原資料已保留，請稍後再試一次。"
+            )
+        else:
+            reply = (
+                "有收到更正，但內容不完整或格式無法確認，因此沒有變更。\n"
+                "請回覆原訊息，清楚寫要改的日期、時間或事項。"
+            )
+    else:
+        try:
+            import calendar_db
+
+            parsed_date = parsed.get("new_date")
+            new_date: str | None = None
+            new_month_day: tuple[int, int] | None = None
+            if parsed_date:
+                date_parts = str(parsed_date).split("-")
+                if len(date_parts) == 3:
+                    new_date = str(parsed_date)
+                elif len(date_parts) == 2:
+                    new_month_day = (int(date_parts[0]), int(date_parts[1]))
+
+            result = calendar_db.correct_quoted_event_and_reminder(
+                group_id,
+                str(quoted_message_id),
+                new_date=new_date,
+                new_month_day=new_month_day,
+                new_time=parsed.get("new_time"),
+                new_title=parsed.get("new_title"),
+            )
+        except Exception:
+            logger.exception(
+                "quoted calendar correction failed group=%s source=%s",
+                group_id,
+                quoted_message_id,
+            )
+            result = {"status": "unavailable"}
+        status = str(result.get("status") or "unavailable")
+        if status in {"updated", "unchanged"}:
+            persisted = result["event"]
+            heading = (
+                "已更正行程與提醒"
+                if status == "updated"
+                else "這筆行程與提醒已是相同內容"
+            )
+            when = str(persisted.get("event_date") or "")
+            if persisted.get("event_time"):
+                when += f" {persisted['event_time']}"
+            reply = "\n".join(
+                (
+                    heading,
+                    f"時間：{when}",
+                    f"事項：{persisted.get('title') or '未命名行程'}",
+                )
+            )
+        elif status == "busy":
+            reply = (
+                "這筆提醒正在推送中，為避免送出舊內容，目前沒有變更。\n"
+                "請稍後再回覆原訊息更正。"
+            )
+        elif status == "conflict":
+            reply = "更正後會和另一筆行程重複，因此沒有變更。"
+        elif status in {"ambiguous", "mirror_missing"}:
+            reply = (
+                "引用內容無法唯一對應一筆行程與提醒，因此沒有變更。\n"
+                "請回覆要修改的那一則原始提醒。"
+            )
+        elif status == "terminal":
+            reply = "這筆行程或提醒已取消／結束，因此沒有重新啟用或變更。"
+        elif status == "not_found":
+            reply = "在這個群組找不到引用訊息對應的行程，因此沒有變更。"
+        else:
+            reply = (
+                "行程與提醒未能一起完成更新，因此沒有回報成功。\n"
+                "原資料已保留，請稍後再試一次。"
+            )
+
+    burst_filter.cancel_burst(group_id)
+    _reply(
+        event.reply_token,
+        reply,
+        group_id=group_id,
+        allow_push_fallback=False,
+        include_auxiliary=False,
+    )
+    logger.info(
+        "quoted calendar correction handled group=%s source=%s result=%r",
+        group_id,
+        quoted_message_id,
+        reply.splitlines()[0],
     )
     return True
 
@@ -4159,6 +4596,8 @@ def _handle_text_message(event: MessageEvent, group_id: str) -> None:
     # calendar capture, classifiers, and reminder extraction.  Otherwise a
     # pasted cancellation can be misread as a new reminder.
     if _try_handle_reminder_cancellation(event, group_id, text):
+        return
+    if _try_handle_quoted_calendar_correction(event, group_id, text):
         return
     source = getattr(event, "source", None)
     sender_user_id = getattr(source, "user_id", None) or ""
@@ -5772,15 +6211,26 @@ def _maybe_capture_calendar_event(
             )
             if target:
                 if extracted.get("date") and extracted["date"] != target["event_date"]:
-                    calendar_db.update_event_date(
-                        target["event_id"], extracted["date"], extracted.get("time")
-                    )
-                    logger.info(
-                        "calendar event rescheduled: %s → %s (group=%s)",
-                        target["event_id"],
-                        extracted["date"],
+                    correction = calendar_db.correct_event_and_reminder_by_id(
                         group_id,
+                        str(target["event_id"]),
+                        new_date=extracted["date"],
+                        new_time=extracted.get("time"),
+                        new_title=None,
                     )
+                    if correction.get("status") in {"updated", "unchanged"}:
+                        logger.info(
+                            "calendar event rescheduled: %s → %s (group=%s)",
+                            target["event_id"],
+                            extracted["date"],
+                            group_id,
+                        )
+                    else:
+                        logger.warning(
+                            "calendar event reschedule skipped: %s status=%s",
+                            target["event_id"],
+                            correction.get("status"),
+                        )
                 else:
                     calendar_db.cancel_event(target["event_id"])
                     logger.info(
@@ -10167,7 +10617,7 @@ def _reply(
     pending_commit_ids: list[str] = []
     pending_confirmation_claims: list[tuple[int, str]] = []
     confirmations_committed = False
-    pending_reminders: list[tuple[str, int]] = []
+    pending_reminders: list[tuple[dict, int]] = []
     pending_reminder_pushes: list[dict] = []
     pending_reminder_indexes: list[int] = []
     pending_reminder_push_indexes: list[int] = []
@@ -10305,7 +10755,7 @@ def _reply(
                                     "source_ref": str(e["event_id"]),
                                 }
                             )
-                            pending_reminders.append((e["event_id"], offset))
+                            pending_reminders.append((dict(e), offset))
                 except Exception as e:
                     logger.warning("reminder piggyback skip: %s", e)
 
@@ -10355,15 +10805,27 @@ def _reply(
         drop_indexes: set[int] = set()
         kept_event_reminders: list[tuple[str, int]] = []
         for idx, item in zip(pending_reminder_indexes, pending_reminders):
-            event_id, offset = item
+            event_snapshot, offset = item
+            event_id = str(event_snapshot["event_id"])
             try:
                 import calendar_db as _cdb_guard
 
                 claim = memory.claim_calendar_reminder_delivery(
                     group_id or "",
                     _cdb_guard.EVENT_REMINDER_SOURCE_KIND,
-                    str(event_id),
+                    event_id,
                     offset,
+                    expected_title=str(event_snapshot.get("title") or ""),
+                    expected_event_date=str(
+                        event_snapshot.get("event_date") or ""
+                    ),
+                    expected_event_time=event_snapshot.get("event_time"),
+                    expected_location=str(
+                        event_snapshot.get("location") or ""
+                    ),
+                    expected_participants=str(
+                        event_snapshot.get("participants") or "[]"
+                    ),
                     transport="reply",
                 )
             except Exception as guard_error:
@@ -10389,6 +10851,31 @@ def _reply(
                     expected_action=str(item["action"]),
                     expected_remind_at=int(item["remind_at"]),
                     expected_weekly_count=int(item.get("weekly_count") or 0),
+                    expected_user_id=(
+                        str(item.get("user_id") or "")
+                        if "user_id" in item
+                        else None
+                    ),
+                    expected_source_kind=(
+                        str(item.get("source_kind") or "")
+                        if "source_kind" in item
+                        else None
+                    ),
+                    expected_source_ref=(
+                        str(item.get("source_ref") or "")
+                        if "source_ref" in item
+                        else None
+                    ),
+                    expected_source_text=(
+                        str(item.get("source_text") or "")
+                        if "source_text" in item
+                        else None
+                    ),
+                    expected_mention_aliases=(
+                        list(item.get("mention_aliases") or [])
+                        if "mention_aliases" in item
+                        else None
+                    ),
                     transport="reply",
                 )
             except Exception as guard_error:

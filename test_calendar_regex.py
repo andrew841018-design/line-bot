@@ -221,6 +221,8 @@ def test_compact_time_ranges_remove_both_ends_from_title():
     for text in (
         "8/18 1400 - 1600 全家聚餐",
         "8/18 1400至1600 全家聚餐",
+        "8/18 1400–1600 全家聚餐",
+        "8/18 14：00-16：00 全家聚餐",
     ):
         out = calendar_regex.extract_many_regex_only(
             text,
@@ -230,6 +232,53 @@ def test_compact_time_ranges_remove_both_ends_from_title():
         assert len(out) == 1
         assert out[0]["time"] == "14:00"
         assert out[0]["title"] == "全家聚餐"
+
+
+def test_wallball_incident_compact_range_is_consumed_without_title_leak():
+    out = calendar_regex.extract_many_regex_only(
+        "8/2 1900-2000\n全家壁球",
+        date(2026, 7, 29),
+        require_time=True,
+    )
+
+    assert [
+        (item["date"], item["time"], item["title"], item["event_type"])
+        for item in out
+    ] == [
+        ("2026-08-02", "19:00", "全家壁球", "family_gathering"),
+    ]
+
+
+def test_compact_range_supports_20xx_and_23xx_endpoints():
+    for text in (
+        "8/2 1900-2000 全家壁球",
+        "8/2 2200-2300 全家壁球",
+    ):
+        out = calendar_regex.extract_many_regex_only(
+            text,
+            date(2026, 7, 29),
+            require_time=True,
+        )
+        assert len(out) == 1
+        assert out[0]["title"] == "全家壁球"
+
+
+def test_compact_time_does_not_partially_match_five_digits():
+    for text in (
+        "8/2 1900-20000 全家壁球",
+        "8/2 1900-2360 全家壁球",
+        "8/2 2360-2000 全家壁球",
+        "8/2 2360-2000全家壁球",
+        "8/2 900-20000 全家壁球",
+        "8/2 09:00-20000 全家壁球",
+        "8/2 晚上八點-二十五點 全家壁球",
+        "8/2 晚上八點-二十五點全家壁球",
+    ):
+        assert calendar_regex.extract_many_regex_only(
+            text,
+            date(2026, 7, 29),
+            require_time=True,
+        ) == []
 
 
 def test_room_number_range_is_not_compact_time_range():
@@ -242,6 +291,48 @@ def test_room_number_range_is_not_compact_time_range():
     assert len(out) == 1
     assert out[0]["time"] == "15:00"
     assert "101-102" in (out[0]["location"] or out[0]["title"])
+
+
+def test_leading_three_digit_room_range_is_not_a_time_range():
+    for text in (
+        "8/2 101-102號房全家聚餐",
+        "8/2 101-102 全家壁球",
+    ):
+        assert calendar_regex.extract_many_regex_only(
+            text,
+            date(2026, 7, 29),
+            require_time=True,
+        ) == []
+
+
+def test_room_range_is_preserved_while_later_clock_is_extracted():
+    for text in (
+        "8/2 101-102號房 下午3點全家聚餐",
+        "8/2 下午3點 101-102號房全家聚餐",
+    ):
+        out = calendar_regex.extract_many_regex_only(
+            text,
+            date(2026, 7, 29),
+            require_time=True,
+        )
+        assert len(out) == 1
+        assert out[0]["time"] == "15:00"
+        assert "101-102" in (out[0]["location"] or out[0]["title"])
+
+
+def test_room_range_allows_later_compact_clock_or_range():
+    for text in (
+        "8/2 101-102號房 1900全家聚餐",
+        "8/2 101-102號房 1900-2000全家聚餐",
+    ):
+        out = calendar_regex.extract_many_regex_only(
+            text,
+            date(2026, 7, 29),
+            require_time=True,
+        )
+        assert len(out) == 1
+        assert out[0]["time"] == "19:00"
+        assert "101-102" in (out[0]["location"] or out[0]["title"])
 
 
 def test_preceding_scan_verb_is_medical_context():

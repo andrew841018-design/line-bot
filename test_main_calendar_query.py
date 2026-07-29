@@ -1202,11 +1202,12 @@ def test_plain_calendar_correction_updates_event_and_reminder(monkeypatch):
     monkeypatch.setattr(calendar_db, "list_past", lambda *a, **k: [])
     monkeypatch.setattr(
         calendar_db,
-        "update_event_schedule",
-        lambda event_id, new_date, new_time=None, title=None: event_updates.append(
-            (event_id, new_date, new_time, title)
+        "correct_event_and_reminder_by_id",
+        lambda group_id, event_id, new_date=None, new_time=None, new_title=None:
+        event_updates.append(
+            (event_id, new_date, new_time, new_title)
         )
-        or True,
+        or {"status": "updated"},
     )
     monkeypatch.setattr(
         main.memory,
@@ -1256,14 +1257,7 @@ def test_plain_calendar_correction_updates_event_and_reminder(monkeypatch):
     main._handle_text_message(FakeEvent(), "G1")
 
     assert event_updates == [("e-ball", target_date, "16:00", "全家羽球")]
-    assert len(reminder_updates) == 1
-    updated_dt = datetime.fromtimestamp(
-        reminder_updates[0][1], tz=ZoneInfo("Asia/Taipei")
-    )
-    assert updated_dt.date().isoformat() == target_date
-    assert updated_dt.strftime("%H:%M") == "16:00"
-    assert reminder_updates[0][2] == "明天羽球，更正為1600"
-    assert reminder_updates[0][3] == "全家羽球"
+    assert reminder_updates == []
     assert replies
     assert "已更正" in replies[0]
     assert "全家羽球" in replies[0]
@@ -1314,11 +1308,12 @@ def test_calendar_time_only_correction_preserves_found_event_date(monkeypatch):
     monkeypatch.setattr(calendar_db, "list_past", lambda *a, **k: [])
     monkeypatch.setattr(
         calendar_db,
-        "update_event_schedule",
-        lambda event_id, new_date, new_time=None, title=None: event_updates.append(
-            (event_id, new_date, new_time, title)
+        "correct_event_and_reminder_by_id",
+        lambda group_id, event_id, new_date=None, new_time=None, new_title=None:
+        event_updates.append(
+            (event_id, new_date, new_time, new_title)
         )
-        or True,
+        or {"status": "updated"},
     )
     monkeypatch.setattr(
         main.memory,
@@ -1361,12 +1356,7 @@ def test_calendar_time_only_correction_preserves_found_event_date(monkeypatch):
 
     assert parsed_target_date != existing_event_date
     assert event_updates == [("e-ball", existing_event_date, "16:00", "全家羽球")]
-    updated_dt = datetime.fromtimestamp(
-        reminder_updates[0][1], tz=ZoneInfo("Asia/Taipei")
-    )
-    assert updated_dt.date().isoformat() == existing_event_date
-    assert updated_dt.strftime("%H:%M") == "16:00"
-    assert reminder_updates[0][3] == "全家羽球"
+    assert reminder_updates == []
 
 
 def test_calendar_content_only_correction_updates_titles(monkeypatch):
@@ -1407,11 +1397,12 @@ def test_calendar_content_only_correction_updates_titles(monkeypatch):
     monkeypatch.setattr(calendar_db, "list_past", lambda *a, **k: [])
     monkeypatch.setattr(
         calendar_db,
-        "update_event_schedule",
-        lambda event_id, new_date, new_time=None, title=None: event_updates.append(
-            (event_id, new_date, new_time, title)
+        "correct_event_and_reminder_by_id",
+        lambda group_id, event_id, new_date=None, new_time=None, new_title=None:
+        event_updates.append(
+            (event_id, new_date, new_time, new_title)
         )
-        or True,
+        or {"status": "updated"},
     )
     monkeypatch.setattr(
         main.memory,
@@ -1444,8 +1435,4 @@ def test_calendar_content_only_correction_updates_titles(monkeypatch):
     assert main._try_handle_calendar_correction(FakeEvent(), "G1", "打球更正為羽球")
 
     assert event_updates == [("e-ball", event_date, None, "全家羽球")]
-    updated_dt = datetime.fromtimestamp(
-        reminder_updates[0][1], tz=ZoneInfo("Asia/Taipei")
-    )
-    assert updated_dt.strftime("%Y-%m-%d %H:%M") == old_dt.strftime("%Y-%m-%d %H:%M")
-    assert reminder_updates[0][3] == "全家羽球"
+    assert reminder_updates == []

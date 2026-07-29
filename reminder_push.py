@@ -319,8 +319,11 @@ def _due_reminder_items(
                 "action": r["action"],
                 "remind_at": r["remind_at"],
                 "weekly_count": int(r.get("weekly_count") or 0),
+                "user_id": str(r.get("user_id") or ""),
                 "source_kind": str(r.get("source_kind") or ""),
                 "source_ref": str(r.get("source_ref") or ""),
+                "source_text": str(r.get("source_text") or ""),
+                "mention_aliases": list(r.get("mention_aliases") or []),
             }
         )
         if len(due) >= limit:
@@ -390,6 +393,29 @@ def push_reminders(dry_run: bool = False) -> int:
             expected_action=str(item["action"]),
             expected_remind_at=int(item["remind_at"]),
             expected_weekly_count=int(item.get("weekly_count") or 0),
+            expected_user_id=(
+                str(item.get("user_id") or "") if "user_id" in item else None
+            ),
+            expected_source_kind=(
+                str(item.get("source_kind") or "")
+                if "source_kind" in item
+                else None
+            ),
+            expected_source_ref=(
+                str(item.get("source_ref") or "")
+                if "source_ref" in item
+                else None
+            ),
+            expected_source_text=(
+                str(item.get("source_text") or "")
+                if "source_text" in item
+                else None
+            ),
+            expected_mention_aliases=(
+                list(item.get("mention_aliases") or [])
+                if "mention_aliases" in item
+                else None
+            ),
             transport="push",
         )
         if claim is None:

@@ -674,6 +674,11 @@ def test_legacy_due_event_mirror_is_created_once_and_can_be_claimed(
         "calendar_event",
         event_id,
         1,
+        expected_title=str(event["title"]),
+        expected_event_date=str(event["event_date"]),
+        expected_event_time=str(event["event_time"]),
+        expected_location=str(event.get("location") or ""),
+        expected_participants=str(event.get("participants") or "[]"),
         transport="push",
     )
     assert claim is not None

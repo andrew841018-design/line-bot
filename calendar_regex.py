@@ -125,13 +125,15 @@ def _classify_type(title: str) -> str | None:
     return None
 
 # HH:MM 或 HHMM — validated 00:00 to 23:59（支援「1430」、「08:30」）
-_TIME_COLON = r"(?:[01]?\d|2[0-3]):[0-5]\d"
-_TIME_COMPACT = r"(?:[01]?\d|2[0-3])[0-5]\d"
+_TIME_COLON = r"(?:[01]?\d|2[0-3])[:：][0-5]\d"
+_TIME_COMPACT = r"(?<!\d)(?:2[0-3]|[01]?\d)[0-5]\d(?!\d)"
+_TIME_COMPACT_4 = r"(?<!\d)(?:2[0-3]|[01]\d)[0-5]\d(?!\d)"
 _TIME = rf"(?:{_TIME_COLON}|{_TIME_COMPACT})"
 _CHINESE_NUM = r"[零〇一二兩三四五六七八九十]{1,3}"
+_CHINESE_MINUTE = rf"(?:(?<!\d)\d{{1,2}}(?!\d)|{_CHINESE_NUM})"
 _CHINESE_TIME = (
-    rf"(?:(?:\d{{1,2}}|{_CHINESE_NUM})\s*點"
-    rf"(?:\s*(?:半|(?:\d{{1,2}}|{_CHINESE_NUM})\s*分?))?)"
+    rf"(?:(?:(?<!\d)\d{{1,2}}(?!\d)|{_CHINESE_NUM})\s*點"
+    rf"(?:\s*(?:半|{_CHINESE_MINUTE}\s*分?))?)"
 )
 _DAYPART = r"(?:早上|上午|中午|下午|傍晚|晚上|凌晨|半夜)"
 _DAYPART_DEFAULTS = {
@@ -176,15 +178,33 @@ _TIME_IN_TEXT = re.compile(
     rf"(?<![\s\S]){_TIME_COMPACT}))"
 )
 _DAYPART_IN_TEXT = re.compile(_DAYPART)
+_TIME_RANGE_SEPARATOR = r"(?:-|－|—|–|~|～|到|至)"
 _TIME_RANGE_IN_TEXT = re.compile(
     rf"(?:(?P<range_compact_daypart>{_DAYPART})\s*"
     rf"(?P<range_daypart_compact_start>{_TIME_COMPACT})|"
-    rf"(?<![\s\S])(?P<range_leading_compact_start>{_TIME_COMPACT})|"
+    rf"(?<![\s\S])(?P<range_leading_compact_start>{_TIME_COMPACT_4})|"
     rf"(?:(?P<range_regular_daypart>{_DAYPART})\s*)?"
     rf"(?P<range_regular_start>{_TIME_COLON}|{_CHINESE_TIME}))"
-    rf"\s*(?:-|~|～|到|至)\s*"
+    rf"\s*{_TIME_RANGE_SEPARATOR}\s*"
     rf"(?:(?P<range_end_daypart>{_DAYPART})\s*)?"
     rf"(?P<range_end>{_TIME_COLON}|{_CHINESE_TIME}|{_TIME_COMPACT})"
+)
+_BROAD_TIME_RANGE_CANDIDATE_RE = re.compile(
+    rf"(?<!\S)(?:(?:{_DAYPART}\s*)"
+    rf"(?:\d{{3,5}}|\d{{1,2}}[:：]\d{{2,3}}|{_CHINESE_TIME})|"
+    rf"(?:\d{{4,5}}|\d{{1,2}}[:：]\d{{2,3}}|{_CHINESE_TIME}))"
+    rf"\s*{_TIME_RANGE_SEPARATOR}\s*"
+    rf"(?:{_DAYPART}\s*)?"
+    rf"(?:\d{{3,5}}|\d{{1,2}}[:：]\d{{2,3}}|{_CHINESE_TIME})(?!\d)"
+)
+_UNQUALIFIED_THREE_DIGIT_RANGE_RE = re.compile(
+    rf"^\d{{3}}\s*{_TIME_RANGE_SEPARATOR}\s*\d{{4,5}}(?!\d)"
+)
+_THREE_DIGIT_RANGE_AT_START_RE = re.compile(
+    r"^\d{3}\s*(?:-|－|—|–|~|～|到|至)\s*\d{3}(?!\d)"
+)
+_THREE_DIGIT_RANGE_RE = re.compile(
+    r"(?<!\d)\d{3}\s*(?:-|－|—|–|~|～|到|至)\s*\d{3}(?!\d)"
 )
 
 
@@ -302,6 +322,7 @@ def _parse_chinese_int(raw: str) -> int | None:
 
 def _parse_time(raw_time: str, daypart: str | None = None) -> str | None:
     raw_time = re.sub(r"\s+", "", raw_time)
+    raw_time = raw_time.replace("：", ":")
     m = re.fullmatch(_TIME, raw_time)
     if m:
         if ":" in raw_time:
@@ -348,15 +369,32 @@ def _parse_time(raw_time: str, daypart: str | None = None) -> str | None:
 
 
 def _first_time_in_text(text: str) -> str | None:
+    masked = _THREE_DIGIT_RANGE_AT_START_RE.sub(" ", text, count=1)
+    if masked != text:
+        after_room = re.match(
+            r"^\s*(?:號?房|房間|室|樓)\s*",
+            masked,
+        )
+        text = masked[after_room.end():] if after_room else masked
     range_match = _TIME_RANGE_IN_TEXT.search(text)
     if range_match:
-        return _parse_time(
+        if (
+            range_match.group("range_leading_compact_start")
+            and len(re.sub(r"\D", "", range_match.group("range_end"))) != 4
+        ):
+            return None
+        start = _parse_time(
             range_match.group("range_daypart_compact_start")
             or range_match.group("range_leading_compact_start")
             or range_match.group("range_regular_start"),
             range_match.group("range_compact_daypart")
             or range_match.group("range_regular_daypart"),
         )
+        end = _parse_time(
+            range_match.group("range_end"),
+            range_match.group("range_end_daypart"),
+        )
+        return start if start is not None and end is not None else None
     m = _TIME_IN_TEXT.search(text)
     if m:
         return _parse_time(
@@ -367,6 +405,18 @@ def _first_time_in_text(text: str) -> str | None:
     if daypart:
         return _DAYPART_DEFAULTS.get(daypart.group(0))
     return None
+
+
+def _has_malformed_compact_range(text: str) -> bool:
+    if _UNQUALIFIED_THREE_DIGIT_RANGE_RE.search(text):
+        return True
+    for match in _BROAD_TIME_RANGE_CANDIDATE_RE.finditer(text):
+        strict = _TIME_RANGE_IN_TEXT.fullmatch(match.group(0))
+        if strict is None:
+            return True
+        if _first_time_in_text(strict.group(0)) is None:
+            return True
+    return False
 
 
 _WEEKDAY_TO_INDEX = {
@@ -402,6 +452,8 @@ def extract_regex_only(combined_text: str, today_tw: date) -> dict:
     if not combined_text or not combined_text.strip():
         return _make_fail()
     combined_text = _normalize_event_text(combined_text)
+    if _has_malformed_compact_range(combined_text):
+        return _make_fail()
 
     # 1. YYYY-MM-DD HH:MM title
     m = _DATE_TIME_TITLE.search(combined_text)
@@ -489,6 +541,25 @@ def _extract_location(segment_body: str) -> str | None:
     return location[:120] if location else None
 
 
+def _strip_fragment_time_tokens(text: str) -> str:
+    protected: list[str] = []
+
+    def protect(match: re.Match) -> str:
+        protected.append(match.group(0))
+        return f"ROOMRANGEPLACEHOLDER{len(protected) - 1}"
+
+    stripped = _THREE_DIGIT_RANGE_RE.sub(protect, text)
+    stripped = re.sub(_TIME_RANGE_IN_TEXT, "", stripped)
+    stripped = re.sub(_TIME_IN_TEXT, "", stripped)
+    stripped = re.sub(_DAYPART_IN_TEXT, "", stripped)
+    for index, original in enumerate(protected):
+        stripped = stripped.replace(
+            f"ROOMRANGEPLACEHOLDER{index}",
+            original,
+        )
+    return stripped
+
+
 def _title_for_fragment(segment_body: str, location: str | None, combined_text: str) -> str:
     haystack = f"{segment_body} {combined_text}"
     if "東海" in haystack and "校友" in haystack:
@@ -498,9 +569,7 @@ def _title_for_fragment(segment_body: str, location: str | None, combined_text: 
             return "東海大學校友會活動（美僑俱樂部）"
         return "東海大學校友會活動"
     if location:
-        action_body = re.sub(_TIME_RANGE_IN_TEXT, "", segment_body)
-        action_body = re.sub(_TIME_IN_TEXT, "", action_body)
-        action_body = re.sub(_DAYPART_IN_TEXT, "", action_body)
+        action_body = _strip_fragment_time_tokens(segment_body)
         action_body = re.sub(
             rf"(?:^|[\s，、。；；：()（）])(?:在|地點[:：])\s*{re.escape(location)}",
             " ",
@@ -514,9 +583,7 @@ def _title_for_fragment(segment_body: str, location: str | None, combined_text: 
         ):
             return _sanitize_title(action_body)
         return f"{location}活動"[:30]
-    raw = re.sub(_TIME_RANGE_IN_TEXT, "", segment_body)
-    raw = re.sub(_TIME_IN_TEXT, "", raw)
-    raw = re.sub(_DAYPART_IN_TEXT, "", raw)
+    raw = _strip_fragment_time_tokens(segment_body)
     raw = re.sub(r"^(?:以及|和|並且|、|，|,|的)", "", raw).strip()
     return _sanitize_title(raw or "行程")
 
@@ -566,6 +633,8 @@ def _fragment_event(
     if not target:
         return None
     body = _strip_date_prefix(segment)
+    if _has_malformed_compact_range(body):
+        return None
     time_str = _first_time_in_text(body)
     if not time_str:
         if require_time:

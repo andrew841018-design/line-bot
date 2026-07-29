@@ -424,6 +424,7 @@ def _conn() -> sqlite3.Connection:
         check_same_thread=False,
         factory=_ClosingConnection,
     )
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     return conn
@@ -728,6 +729,477 @@ def get_active_event_by_id(group_id: str, event_id: str) -> dict | None:
             (group_id, event_id),
         ).fetchone()
     return dict(row) if row is not None else None
+
+
+def _resolve_quoted_event_id_conn(
+    c: sqlite3.Connection,
+    group_id: str,
+    quoted_message_id: str,
+) -> tuple[str, str | None]:
+    resolved_ids = {
+        str(row[0])
+        for row in c.execute(
+            "SELECT event_id FROM events "
+            "WHERE group_id=? AND source_msg_id=?",
+            (group_id, quoted_message_id),
+        ).fetchall()
+        if row[0]
+    }
+
+    sent_ref = c.execute(
+        "SELECT reminder_id, source_kind, source_ref "
+        "FROM sent_reminder_refs WHERE group_id=? AND message_id=?",
+        (group_id, quoted_message_id),
+    ).fetchone()
+    if sent_ref is not None:
+        reminder_id = int(sent_ref[0]) if sent_ref[0] is not None else None
+        declared_kind = str(sent_ref[1] or "")
+        declared_ref = str(sent_ref[2] or "")
+        sent_ids: set[str] = set()
+
+        if declared_kind or declared_ref:
+            if declared_kind != EVENT_REMINDER_SOURCE_KIND or not declared_ref:
+                return "not_found", None
+            declared_event = c.execute(
+                "SELECT 1 FROM events WHERE group_id=? AND event_id=?",
+                (group_id, declared_ref),
+            ).fetchone()
+            if declared_event is None:
+                return "not_found", None
+            sent_ids.add(declared_ref)
+
+        if reminder_id is not None:
+            reminder_source = c.execute(
+                "SELECT source_kind, source_ref FROM reminders "
+                "WHERE group_id=? AND reminder_id=?",
+                (group_id, reminder_id),
+            ).fetchone()
+            if reminder_source is None:
+                return "not_found", None
+            reminder_kind = str(reminder_source[0] or "")
+            reminder_ref = str(reminder_source[1] or "")
+            if (
+                reminder_kind != EVENT_REMINDER_SOURCE_KIND
+                or not reminder_ref
+            ):
+                return "not_found", None
+            if declared_ref and reminder_ref != declared_ref:
+                return "ambiguous", None
+            reminder_event = c.execute(
+                "SELECT 1 FROM events WHERE group_id=? AND event_id=?",
+                (group_id, reminder_ref),
+            ).fetchone()
+            if reminder_event is None:
+                return "not_found", None
+            sent_ids.add(reminder_ref)
+
+        if not sent_ids:
+            return "not_found", None
+        resolved_ids.update(sent_ids)
+
+    if not resolved_ids:
+        return "not_found", None
+    if len(resolved_ids) != 1:
+        return "ambiguous", None
+    return "resolved", next(iter(resolved_ids))
+
+
+def _corrected_event_payload_conn(
+    c: sqlite3.Connection,
+    event: Mapping[str, object],
+) -> tuple[str, int, str]:
+    days_before = _event_reminder_lead_days(event)
+    remind_at = _event_to_remind_at(
+        str(event.get("event_date", "")),
+        _event_reminder_time(event),  # type: ignore[arg-type]
+        days_before=days_before,
+    )
+    if remind_at is None:
+        raise ValueError("corrected event has no valid reminder timestamp")
+
+    title = str(event.get("title", "") or "").strip()
+    participants = _event_participants(event)
+    if _uses_badminton_booking_workflow(event):
+        event_date = str(event.get("event_date", "") or "").strip()
+        event_time = str(event.get("event_time", "") or "").strip()
+        responsible = [p for p in participants if p and p != "全家"]
+        prefix = f"{'、'.join(responsible)}負責" if responsible else ""
+        action = f"{prefix}預約{_format_month_day(event_date)}打羽球場地"
+        source_parts = [f"活動：{title or '打羽球'}"]
+        if event_date:
+            source_parts.append(f"活動日期：{event_date}")
+        if event_time:
+            source_parts.append(f"活動時間：{event_time}")
+        if responsible:
+            source_parts.append("預約負責人：" + "、".join(responsible))
+        elif participants:
+            source_parts.append("預約標注：" + "、".join(participants))
+        source_parts.append("提醒規則：活動前 7 天預約場地")
+        return action, remind_at, "；".join(source_parts)
+
+    action = title or "家族行事曆提醒"
+    source_parts = [title]
+    location = str(event.get("location", "") or "").strip()
+    if location:
+        source_parts.append(f"地點：{location}")
+    event_time = str(event.get("event_time", "") or "").strip()
+    if event_time:
+        source_parts.append(f"時間：{event_time}")
+    if participants:
+        source_parts.append("參加人：" + "、".join(participants))
+
+    source_msg_id = str(event.get("source_msg_id") or "").strip()
+    group_id = str(event.get("group_id") or "").strip()
+    if source_msg_id and group_id and "接送網址" not in location and "驗證碼" not in location:
+        raw = c.execute(
+            "SELECT text FROM raw_messages WHERE group_id=? AND message_id=?",
+            (group_id, source_msg_id),
+        ).fetchone()
+        if raw and raw[0]:
+            urls, codes = _extract_event_reference_info(str(raw[0]))
+            if urls:
+                source_parts.append(f"接送網址：{'、'.join(urls)}")
+            if codes:
+                source_parts.append(f"驗證碼：{'、'.join(codes)}")
+    return action, remind_at, "；".join(part for part in source_parts if part)
+
+
+def _resolve_corrected_date(
+    current_date: str,
+    new_date: str | None,
+    new_month_day: tuple[int, int] | None,
+) -> str:
+    current = datetime.strptime(current_date, "%Y-%m-%d").date()
+    if new_date:
+        return datetime.strptime(new_date, "%Y-%m-%d").date().isoformat()
+    if new_month_day is None:
+        return current.isoformat()
+
+    month, day = (int(new_month_day[0]), int(new_month_day[1]))
+    candidates: list[date] = []
+    for year in (current.year - 1, current.year, current.year + 1):
+        try:
+            candidates.append(date(year, month, day))
+        except ValueError:
+            continue
+    if not candidates:
+        raise ValueError("invalid corrected month/day")
+    return min(
+        candidates,
+        key=lambda candidate: (
+            abs((candidate - current).days),
+            candidate < current,
+        ),
+    ).isoformat()
+
+
+def _corrected_title_participants(title: str | None) -> list[str]:
+    text = str(title or "")
+    if "全家" in text:
+        return ["全家"]
+    aliases = (
+        ("媽媽", "媽媽"),
+        ("爸爸", "爸爸"),
+        ("姊姊", "姊姊"),
+        ("姐姐", "姊姊"),
+        ("妹妹", "妹妹"),
+        ("弟弟", "弟弟"),
+        ("哥哥", "哥哥"),
+        ("爺爺", "爺爺"),
+        ("奶奶", "奶奶"),
+        ("黃聖雅", "黃聖雅"),
+        ("黃聖穎", "黃聖穎"),
+        ("聖雅", "黃聖雅"),
+        ("聖穎", "黃聖穎"),
+    )
+    participants: list[str] = []
+    for alias, normalized in aliases:
+        if alias in text and normalized not in participants:
+            participants.append(normalized)
+    return participants
+
+
+def correct_quoted_event_and_reminder(
+    group_id: str,
+    quoted_message_id: str,
+    *,
+    new_date: str | None,
+    new_month_day: tuple[int, int] | None,
+    new_time: str | None,
+    new_title: str | None,
+    _resolved_event_id: str | None = None,
+) -> dict:
+    """Atomically correct one exact quoted event and its pending mirror."""
+
+    if not group_id or (not quoted_message_id and not _resolved_event_id):
+        return {"status": "not_found"}
+    normalized_title = (
+        re.sub(r"[\x00-\x1f\x7f]+", " ", str(new_title or "")).strip()
+        if new_title is not None
+        else None
+    )
+    if normalized_title is not None:
+        normalized_title = re.sub(r"\s+", " ", normalized_title)
+        if not normalized_title or len(normalized_title) > 80:
+            return {"status": "invalid"}
+    if new_time is not None:
+        try:
+            datetime.strptime(new_time, "%H:%M")
+        except ValueError:
+            return {"status": "invalid"}
+    if (
+        new_date is None
+        and new_month_day is None
+        and new_time is None
+        and normalized_title is None
+    ):
+        return {"status": "invalid"}
+
+    try:
+        with _lock, _conn() as c:
+            c.row_factory = sqlite3.Row
+            c.execute("BEGIN IMMEDIATE")
+            if _resolved_event_id:
+                event_id = str(_resolved_event_id)
+            else:
+                identity_status, event_id = _resolve_quoted_event_id_conn(
+                    c,
+                    group_id,
+                    quoted_message_id,
+                )
+                if identity_status != "resolved" or event_id is None:
+                    return {"status": identity_status}
+
+            event_row = c.execute(
+                "SELECT * FROM events WHERE group_id=? AND event_id=?",
+                (group_id, event_id),
+            ).fetchone()
+            if event_row is None:
+                return {"status": "not_found"}
+            if str(event_row["status"]) != "active":
+                return {"status": "terminal"}
+
+            mirror_rows = c.execute(
+                "SELECT * FROM reminders WHERE group_id=? "
+                "AND source_kind=? AND source_ref=? ORDER BY reminder_id",
+                (group_id, EVENT_REMINDER_SOURCE_KIND, event_id),
+            ).fetchall()
+            if not mirror_rows:
+                return {"status": "mirror_missing"}
+            if len(mirror_rows) != 1:
+                return {"status": "ambiguous"}
+            reminder_row = mirror_rows[0]
+            if str(reminder_row["status"]) != "pending":
+                return {"status": "terminal"}
+
+            live_claim = c.execute(
+                "SELECT 1 FROM reminder_delivery_claims "
+                "WHERE group_id=? AND state='sending' AND claimed_at>=? AND ("
+                "(delivery_kind='calendar' AND subject_ref=?) OR "
+                "(delivery_kind='natural' AND subject_ref=?) OR "
+                "(source_kind=? AND source_ref=?)) LIMIT 1",
+                (
+                    group_id,
+                    int(time.time()) - 15 * 60,
+                    event_id,
+                    str(reminder_row["reminder_id"]),
+                    EVENT_REMINDER_SOURCE_KIND,
+                    event_id,
+                ),
+            ).fetchone()
+            if live_claim is not None:
+                return {"status": "busy"}
+            c.execute(
+                "UPDATE reminder_delivery_claims SET state='uncertain' "
+                "WHERE group_id=? AND state='sending' AND claimed_at<? AND ("
+                "(delivery_kind='calendar' AND subject_ref=?) OR "
+                "(delivery_kind='natural' AND subject_ref=?) OR "
+                "(source_kind=? AND source_ref=?))",
+                (
+                    group_id,
+                    int(time.time()) - 15 * 60,
+                    event_id,
+                    str(reminder_row["reminder_id"]),
+                    EVENT_REMINDER_SOURCE_KIND,
+                    event_id,
+                ),
+            )
+
+            desired = dict(event_row)
+            desired["event_date"] = _resolve_corrected_date(
+                str(event_row["event_date"]),
+                new_date,
+                new_month_day,
+            )
+            desired["event_time"] = (
+                new_time
+                if new_time is not None
+                else event_row["event_time"]
+            )
+            desired["title"] = (
+                normalized_title
+                if normalized_title is not None
+                else str(event_row["title"])
+            )
+            corrected_participants = _corrected_title_participants(
+                normalized_title
+            )
+            desired_mentions = str(reminder_row["mention_aliases"] or "[]")
+            if normalized_title is not None:
+                desired["participants"] = json.dumps(
+                    corrected_participants,
+                    ensure_ascii=False,
+                )
+                desired_mentions = json.dumps(
+                    corrected_participants,
+                    ensure_ascii=False,
+                )
+            action, remind_at, source_text = _corrected_event_payload_conn(
+                c,
+                desired,
+            )
+
+            event_changed = any(
+                desired[key] != event_row[key]
+                for key in ("title", "event_date", "event_time", "participants")
+            )
+            schedule_changed = any(
+                desired[key] != event_row[key]
+                for key in ("event_date", "event_time")
+            )
+            reminder_schedule_changed = (
+                remind_at != int(reminder_row["remind_at"])
+            )
+            reminder_changed = any(
+                (
+                    action != str(reminder_row["action"]),
+                    remind_at != int(reminder_row["remind_at"]),
+                    source_text != str(reminder_row["source_text"] or ""),
+                    desired_mentions
+                    != str(reminder_row["mention_aliases"] or "[]"),
+                )
+            )
+            if event_changed:
+                if schedule_changed:
+                    event_update = c.execute(
+                        "UPDATE events SET title=?, event_date=?, event_time=?, "
+                        "participants=?, reminded_at=NULL, "
+                        "reminded_30d=NULL, reminded_7d=NULL, "
+                        "reminded_3d=NULL, reminded_2d=NULL, "
+                        "reminded_1d=NULL, reminded_0d=NULL "
+                        "WHERE group_id=? AND event_id=? AND status='active'",
+                        (
+                            desired["title"],
+                            desired["event_date"],
+                            desired["event_time"],
+                            desired["participants"],
+                            group_id,
+                            event_id,
+                        ),
+                    )
+                else:
+                    event_update = c.execute(
+                        "UPDATE events SET title=?, event_date=?, event_time=?, "
+                        "participants=? "
+                        "WHERE group_id=? AND event_id=? AND status='active'",
+                        (
+                            desired["title"],
+                            desired["event_date"],
+                            desired["event_time"],
+                            desired["participants"],
+                            group_id,
+                            event_id,
+                        ),
+                    )
+                if event_update.rowcount != 1:
+                    raise RuntimeError("quoted event compare-and-set failed")
+            if reminder_changed:
+                if reminder_schedule_changed:
+                    reminder_update = c.execute(
+                        "UPDATE reminders SET action=?, remind_at=?, "
+                        "source_text=?, mention_aliases=?, last_pushed_at=0, "
+                        "weekly_count=0, last_weekly_at=0, pushed_3d=0, "
+                        "pushed_1d=0, pushed_4hr=0, pushed_2hr=0, "
+                        "pushed_1hr=0, pushed_now=0 "
+                        "WHERE group_id=? AND reminder_id=? AND status='pending' "
+                        "AND source_kind=? AND source_ref=?",
+                        (
+                            action,
+                            remind_at,
+                            source_text,
+                            desired_mentions,
+                            group_id,
+                            int(reminder_row["reminder_id"]),
+                            EVENT_REMINDER_SOURCE_KIND,
+                            event_id,
+                        ),
+                    )
+                else:
+                    reminder_update = c.execute(
+                        "UPDATE reminders SET action=?, remind_at=?, "
+                        "source_text=?, mention_aliases=? "
+                        "WHERE group_id=? AND reminder_id=? AND status='pending' "
+                        "AND source_kind=? AND source_ref=?",
+                        (
+                            action,
+                            remind_at,
+                            source_text,
+                            desired_mentions,
+                            group_id,
+                            int(reminder_row["reminder_id"]),
+                            EVENT_REMINDER_SOURCE_KIND,
+                            event_id,
+                        ),
+                    )
+                if reminder_update.rowcount != 1:
+                    raise RuntimeError("quoted reminder compare-and-set failed")
+
+            persisted_event = c.execute(
+                "SELECT * FROM events WHERE group_id=? AND event_id=?",
+                (group_id, event_id),
+            ).fetchone()
+            persisted_reminder = c.execute(
+                "SELECT * FROM reminders WHERE group_id=? AND reminder_id=?",
+                (group_id, int(reminder_row["reminder_id"])),
+            ).fetchone()
+            if persisted_event is None or persisted_reminder is None:
+                raise RuntimeError("quoted correction persisted row missing")
+            return {
+                "status": (
+                    "updated"
+                    if event_changed or reminder_changed
+                    else "unchanged"
+                ),
+                "event": dict(persisted_event),
+                "reminder": dict(persisted_reminder),
+            }
+    except sqlite3.IntegrityError as exc:
+        if "unique constraint failed" in str(exc).lower():
+            return {"status": "conflict"}
+        return {"status": "unavailable"}
+    except (OSError, RuntimeError, sqlite3.Error, ValueError):
+        return {"status": "unavailable"}
+
+
+def correct_event_and_reminder_by_id(
+    group_id: str,
+    event_id: str,
+    *,
+    new_date: str | None,
+    new_time: str | None,
+    new_title: str | None,
+) -> dict:
+    """Atomically correct an already-resolved event and its exact mirror."""
+
+    return correct_quoted_event_and_reminder(
+        group_id,
+        "",
+        new_date=new_date,
+        new_month_day=None,
+        new_time=new_time,
+        new_title=new_title,
+        _resolved_event_id=event_id,
+    )
 
 
 def bind_event_source_message(
