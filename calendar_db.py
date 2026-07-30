@@ -20,6 +20,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from config import settings
+import reminder_intent
 
 _TW = ZoneInfo("Asia/Taipei")
 
@@ -499,10 +500,335 @@ def init_db() -> None:
         # Dedup: 同 group 同 title 同日 active event 唯一
         # (group_id, title, event_date) WHERE status='active' — partial unique index
         # 防 TOCTOU race（GP1 反饋）：應用層 check-then-insert 不夠，SQL 層擋住
+        c.execute("DROP INDEX IF EXISTS idx_events_dedup")
         c.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_dedup "
-            "ON events(group_id, title, event_date) WHERE status='active'"
+            "ON events(group_id, title, event_date, COALESCE(event_time, '')) "
+            "WHERE status='active'"
         )
+
+
+def _semantic_event_score(event: Mapping[str, object]) -> tuple[int, int, int]:
+    title = reminder_intent.normalize_text(event.get("title"))
+    return (
+        int(bool(str(event.get("source_msg_id") or "").strip())),
+        int(bool(str(event.get("location") or "").strip())),
+        len(title),
+    )
+
+
+def _semantic_event_candidates_conn(
+    c: sqlite3.Connection,
+    incoming: Mapping[str, object],
+) -> list[sqlite3.Row]:
+    key = reminder_intent.event_semantic_key(incoming.get("title"))
+    if not key:
+        return []
+    rows = c.execute(
+        "SELECT * FROM events WHERE group_id=? AND event_date=? "
+        "AND status='active' ORDER BY created_at, event_id",
+        (
+            str(incoming.get("group_id") or ""),
+            str(incoming.get("event_date") or ""),
+        ),
+    ).fetchall()
+    incoming_source = str(incoming.get("source_msg_id") or "").strip()
+    incoming_location = reminder_intent.normalize_text(incoming.get("location"))
+    incoming_participants = set(_event_participants(incoming))
+    candidates: list[sqlite3.Row] = []
+    for row in rows:
+        current = dict(row)
+        if not reminder_intent.event_titles_are_semantically_compatible(
+            current.get("title"),
+            incoming.get("title"),
+        ):
+            continue
+        current_source = str(current.get("source_msg_id") or "").strip()
+        if incoming_source and current_source and incoming_source != current_source:
+            continue
+        if str(current.get("event_type") or "") != str(
+            incoming.get("event_type") or ""
+        ):
+            same_source = bool(incoming_source) and incoming_source == current_source
+            one_sourceful = bool(incoming_source) != bool(current_source)
+            if not (same_source or one_sourceful):
+                continue
+        current_location = reminder_intent.normalize_text(current.get("location"))
+        if (
+            incoming_location
+            and current_location
+            and incoming_location != current_location
+        ):
+            continue
+        current_participants = set(_event_participants(current))
+        if (
+            incoming_participants
+            and current_participants
+            and incoming_participants.isdisjoint(current_participants)
+        ):
+            continue
+        if not reminder_intent.schedules_are_compatible(
+            current.get("event_time"),
+            current.get("title"),
+            incoming.get("event_time"),
+            incoming.get("title"),
+        ):
+            continue
+        candidates.append(row)
+    return candidates
+
+
+def _semantic_desired_event(
+    existing: Mapping[str, object],
+    incoming: Mapping[str, object],
+) -> dict[str, object]:
+    desired = dict(existing)
+    existing_source = str(existing.get("source_msg_id") or "").strip()
+    incoming_source = str(incoming.get("source_msg_id") or "").strip()
+    if incoming_source and not existing_source:
+        for key in (
+            "title",
+            "event_time",
+            "location",
+            "participants",
+            "source_msg_id",
+            "event_type",
+        ):
+            desired[key] = incoming.get(key)
+        return desired
+    if existing_source and not incoming_source:
+        return desired
+
+    if _semantic_event_score(incoming) > _semantic_event_score(existing):
+        desired["title"] = incoming.get("title")
+    existing_location = str(existing.get("location") or "").strip()
+    incoming_location = str(incoming.get("location") or "").strip()
+    if incoming_location and len(incoming_location) > len(existing_location):
+        desired["location"] = incoming_location
+    merged_participants = _merge_mention_aliases(
+        _event_participants(existing),
+        _event_participants(incoming),
+    )
+    desired["participants"] = json.dumps(merged_participants, ensure_ascii=False)
+    if not existing_source and incoming_source:
+        desired["source_msg_id"] = incoming_source
+    return desired
+
+
+def _merge_semantic_event_conn(
+    c: sqlite3.Connection,
+    existing_row: sqlite3.Row,
+    incoming: Mapping[str, object],
+) -> tuple[str, str]:
+    existing = dict(existing_row)
+    event_id = str(existing["event_id"])
+    desired = _semantic_desired_event(existing, incoming)
+    changed_fields = (
+        "title",
+        "event_time",
+        "location",
+        "participants",
+        "source_msg_id",
+        "event_type",
+    )
+    if not any(desired.get(key) != existing.get(key) for key in changed_fields):
+        return event_id, "duplicate"
+
+    mirror_rows = c.execute(
+        "SELECT * FROM reminders WHERE group_id=? AND source_kind=? "
+        "AND source_ref=? ORDER BY reminder_id",
+        (
+            str(existing["group_id"]),
+            EVENT_REMINDER_SOURCE_KIND,
+            event_id,
+        ),
+    ).fetchall()
+    if len(mirror_rows) != 1 or str(mirror_rows[0]["status"]) != "pending":
+        return event_id, "blocked"
+    mirror = mirror_rows[0]
+    stale_before = int(time.time()) - 15 * 60
+    live_claim = c.execute(
+        "SELECT 1 FROM reminder_delivery_claims "
+        "WHERE group_id=? AND state='sending' AND claimed_at>=? AND ("
+        "(delivery_kind='calendar' AND subject_ref=?) OR "
+        "(delivery_kind='natural' AND subject_ref=?) OR "
+        "(source_kind=? AND source_ref=?)) LIMIT 1",
+        (
+            str(existing["group_id"]),
+            stale_before,
+            event_id,
+            str(mirror["reminder_id"]),
+            EVENT_REMINDER_SOURCE_KIND,
+            event_id,
+        ),
+    ).fetchone()
+    if live_claim is not None:
+        return event_id, "busy"
+    c.execute(
+        "UPDATE reminder_delivery_claims SET state='uncertain' "
+        "WHERE group_id=? AND state='sending' AND claimed_at<? AND ("
+        "(delivery_kind='calendar' AND subject_ref=?) OR "
+        "(delivery_kind='natural' AND subject_ref=?) OR "
+        "(source_kind=? AND source_ref=?))",
+        (
+            str(existing["group_id"]),
+            stale_before,
+            event_id,
+            str(mirror["reminder_id"]),
+            EVENT_REMINDER_SOURCE_KIND,
+            event_id,
+        ),
+    )
+
+    schedule_changed = desired.get("event_time") != existing.get("event_time")
+    action, remind_at, source_text = _corrected_event_payload_conn(c, desired)
+    existing_aliases: list[str] = []
+    try:
+        loaded_aliases = json.loads(str(mirror["mention_aliases"] or "[]"))
+        if isinstance(loaded_aliases, list):
+            existing_aliases = [str(alias) for alias in loaded_aliases]
+    except Exception:
+        pass
+    mention_aliases = json.dumps(
+        _merge_mention_aliases(
+            existing_aliases,
+            _event_participants(desired),
+        ),
+        ensure_ascii=False,
+    )
+    reminder_schedule_changed = remind_at != int(mirror["remind_at"])
+
+    event_reset_sql = (
+        ", reminded_at=NULL, reminded_30d=NULL, reminded_7d=NULL, "
+        "reminded_3d=NULL, reminded_2d=NULL, reminded_1d=NULL, reminded_0d=NULL"
+        if schedule_changed
+        else ""
+    )
+    updated_event = c.execute(
+        "UPDATE events SET title=?, event_time=?, location=?, participants=?, "
+        f"source_msg_id=?, event_type=?{event_reset_sql} "
+        "WHERE group_id=? AND event_id=? AND status='active'",
+        (
+            desired.get("title"),
+            desired.get("event_time"),
+            desired.get("location"),
+            desired.get("participants"),
+            desired.get("source_msg_id"),
+            desired.get("event_type"),
+            str(existing["group_id"]),
+            event_id,
+        ),
+    )
+    if updated_event.rowcount != 1:
+        raise RuntimeError("semantic event compare-and-set failed")
+
+    reminder_reset_sql = (
+        ", last_pushed_at=0, weekly_count=0, last_weekly_at=0, "
+        "pushed_3d=0, pushed_1d=0, pushed_4hr=0, pushed_2hr=0, "
+        "pushed_1hr=0, pushed_now=0"
+        if reminder_schedule_changed
+        else ""
+    )
+    updated_reminder = c.execute(
+        "UPDATE reminders SET action=?, remind_at=?, source_text=?, "
+        f"mention_aliases=?{reminder_reset_sql} "
+        "WHERE group_id=? AND reminder_id=? AND status='pending' "
+        "AND source_kind=? AND source_ref=?",
+        (
+            action,
+            remind_at,
+            source_text,
+            mention_aliases,
+            str(existing["group_id"]),
+            int(mirror["reminder_id"]),
+            EVENT_REMINDER_SOURCE_KIND,
+            event_id,
+        ),
+    )
+    if updated_reminder.rowcount != 1:
+        raise RuntimeError("semantic reminder compare-and-set failed")
+    return event_id, "merged"
+
+
+def insert_event_with_outcome(
+    group_id: str,
+    title: str,
+    event_date: str,
+    event_time: str | None = None,
+    location: str | None = None,
+    participants: list[str] | None = None,
+    source_msg_id: str | None = None,
+    event_type: str = 'family_gathering',
+) -> tuple[str, str]:
+    event_id = uuid.uuid4().hex
+    parts_json = json.dumps(participants or [], ensure_ascii=False)
+    et = _validate_event_type(event_type)
+    incoming: dict[str, object] = {
+        "event_id": event_id,
+        "group_id": group_id,
+        "title": title,
+        "event_date": event_date,
+        "event_time": event_time,
+        "location": location,
+        "participants": parts_json,
+        "source_msg_id": source_msg_id,
+        "status": "active",
+        "event_type": et,
+    }
+    event: dict[str, object] | None = None
+    try:
+        with _lock, _conn() as c:
+            c.row_factory = sqlite3.Row
+            c.execute("BEGIN IMMEDIATE")
+            candidates = _semantic_event_candidates_conn(c, incoming)
+            if len(candidates) > 1:
+                return "", "ambiguous"
+            if len(candidates) == 1:
+                return _merge_semantic_event_conn(c, candidates[0], incoming)
+            cur = c.execute(
+                "INSERT OR IGNORE INTO events (event_id, group_id, title, "
+                "event_date, event_time, location, participants, source_msg_id, "
+                "status, created_at, event_type) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)",
+                (
+                    event_id,
+                    group_id,
+                    title,
+                    event_date,
+                    event_time,
+                    location,
+                    parts_json,
+                    source_msg_id,
+                    int(time.time() * 1000),
+                    et,
+                ),
+            )
+            if cur.rowcount == 0:
+                exact = c.execute(
+                    "SELECT event_id, source_msg_id FROM events "
+                    "WHERE group_id=? AND title=? "
+                    "AND event_date=? AND COALESCE(event_time, '')=COALESCE(?, '') "
+                    "AND status='active'",
+                    (group_id, title, event_date, event_time),
+                ).fetchone()
+                if exact:
+                    existing_source = str(exact[1] or "").strip()
+                    incoming_source = str(source_msg_id or "").strip()
+                    if (
+                        existing_source
+                        and incoming_source
+                        and existing_source != incoming_source
+                    ):
+                        return "", "conflict"
+                    return str(exact[0]), "duplicate"
+                return "", "conflict"
+            event = incoming
+    except (sqlite3.Error, OSError, RuntimeError, ValueError):
+        return "", "unavailable"
+    if event:
+        if not _upsert_event_reminder(event):
+            return event_id, "mirror_incomplete"
+    return event_id, "created"
 
 
 def insert_event(
@@ -513,49 +839,21 @@ def insert_event(
     location: str | None = None,
     participants: list[str] | None = None,
     source_msg_id: str | None = None,
-    event_type: str = 'family_gathering',
+    event_type: str = "family_gathering",
 ) -> str:
-    event_id = uuid.uuid4().hex
-    parts_json = json.dumps(participants or [], ensure_ascii=False)
-    et = _validate_event_type(event_type)
-    event: dict[str, object] | None = None
-    with _lock, _conn() as c:
-        cur = c.execute(
-            "INSERT OR IGNORE INTO events (event_id, group_id, title, event_date, event_time, "
-            "location, participants, source_msg_id, status, created_at, event_type) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)",
-            (
-                event_id,
-                group_id,
-                title,
-                event_date,
-                event_time,
-                location,
-                parts_json,
-                source_msg_id,
-                int(time.time() * 1000),
-                et,
-            ),
-        )
-        if cur.rowcount == 0:
-            # dedup hit — 同 group+title+event_date 的 active event 已存在
-            # GP1+gemini 反饋：跨 type 同 title+date 也會被 silent drop（by design）
-            return ""
-        event = {
-            "event_id": event_id,
-            "group_id": group_id,
-            "title": title,
-            "event_date": event_date,
-            "event_time": event_time,
-            "location": location,
-            "participants": parts_json,
-            "source_msg_id": source_msg_id,
-            "status": "active",
-            "event_type": et,
-        }
-    if event:
-        _upsert_event_reminder(event)
-    return event_id
+    """Backward-compatible insert API: only newly created events return an id."""
+
+    event_id, outcome = insert_event_with_outcome(
+        group_id=group_id,
+        title=title,
+        event_date=event_date,
+        event_time=event_time,
+        location=location,
+        participants=participants,
+        source_msg_id=source_msg_id,
+        event_type=event_type,
+    )
+    return event_id if outcome == "created" else ""
 
 
 def sync_active_events_to_reminders(group_id: str | None = None) -> int:

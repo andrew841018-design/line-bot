@@ -18,6 +18,8 @@ import logging
 import re
 from datetime import date, timedelta
 
+import reminder_intent
+
 logger = logging.getLogger(__name__)
 
 
@@ -236,6 +238,15 @@ def _make_event(
         "cancel_target_keyword": None,
         "event_type": event_type,
     }
+
+
+def _accepted_event(source_text: str, event: dict) -> dict:
+    if reminder_intent.should_reject_reminder_candidate(
+        source_text,
+        event.get("title"),
+    ):
+        return _make_fail()
+    return event
 
 
 def _dedupe_events(events: list[dict]) -> list[dict]:
@@ -464,7 +475,10 @@ def extract_regex_only(combined_text: str, today_tw: date) -> dict:
         title = _sanitize_title(m.group(5))
         et = _classify_type(title) if len(title) >= 2 else None
         if target and time_str and et:
-            return _make_event(title, target.isoformat(), time_str, et)
+            return _accepted_event(
+                combined_text,
+                _make_event(title, target.isoformat(), time_str, et),
+            )
 
     # 2. N月N日 HH:MM title — year inference: past → +1
     m = _CHINESE_DATE_TIME_TITLE.search(combined_text)
@@ -479,7 +493,10 @@ def extract_regex_only(combined_text: str, today_tw: date) -> dict:
                 if target < today_tw:
                     target = _validate_date(today_tw.year + 1, month, day)
                 if target:
-                    return _make_event(title, target.isoformat(), time_str, et)
+                    return _accepted_event(
+                        combined_text,
+                        _make_event(title, target.isoformat(), time_str, et),
+                    )
 
     # 3. 今天/明天/後天 HH:MM title
     m = _RELATIVE_DATE_TIME_TITLE.search(combined_text)
@@ -490,7 +507,10 @@ def extract_regex_only(combined_text: str, today_tw: date) -> dict:
         title = _sanitize_title(m.group(3))
         et = _classify_type(title) if len(title) >= 2 else None
         if time_str and et:
-            return _make_event(title, target.isoformat(), time_str, et)
+            return _accepted_event(
+                combined_text,
+                _make_event(title, target.isoformat(), time_str, et),
+            )
 
     # 4. 今天/星期四 + 中文時間 title（例：星期四早上十點半看牙醫）
     m = _RELATIVE_CHINESE_TIME_TITLE.search(combined_text)
@@ -500,7 +520,10 @@ def extract_regex_only(combined_text: str, today_tw: date) -> dict:
         title = _sanitize_title(m.group(4))
         et = _classify_type(title) if len(title) >= 2 else None
         if target and time_str and et:
-            return _make_event(title, target.isoformat(), time_str, et)
+            return _accepted_event(
+                combined_text,
+                _make_event(title, target.isoformat(), time_str, et),
+            )
 
     return _make_fail()
 
@@ -651,6 +674,8 @@ def _fragment_event(
         return None
     ev = _make_event(title, target.isoformat(), time_str, et)
     ev["location"] = location
+    if reminder_intent.should_reject_reminder_candidate(combined_text, title):
+        return None
     return ev
 
 

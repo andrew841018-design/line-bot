@@ -740,8 +740,8 @@ def tmp_calendar_db(tmp_path, monkeypatch):
     return calendar_db
 
 
-def test_dedup_same_group_title_date_blocks_duplicate(tmp_calendar_db):
-    """SQL UNIQUE INDEX 阻擋同 group+title+date 的 active event。"""
+def test_same_group_title_date_allows_distinct_explicit_times(tmp_calendar_db):
+    """Same title/date is not a duplicate when both explicit times differ."""
     cd = tmp_calendar_db
     # 用「明天」避免時間飄移：hardcode date 會在跑測試的那天變成過去
     future_date = (cd._today_tw() + __import__("datetime").timedelta(days=1)).isoformat()
@@ -756,12 +756,13 @@ def test_dedup_same_group_title_date_blocks_duplicate(tmp_calendar_db):
         group_id="G1",
         title="拿蛋糕",
         event_date=future_date,
-        event_time="14:30",  # 不同時間也算重複
+        event_time="14:30",
     )
-    assert eid2 == ""  # dedup hit → 回空字串
+    assert eid2
+    assert eid2 != eid1
     events = cd.list_upcoming("G1", days=30)
-    assert len(events) == 1
-    assert events[0]["event_time"] == "14:00"  # 第一筆保留
+    assert len(events) == 2
+    assert {event["event_time"] for event in events} == {"14:00", "14:30"}
 
 
 def test_dedup_different_date_allowed(tmp_calendar_db):

@@ -28,6 +28,7 @@ from zoneinfo import ZoneInfo
 from google import genai
 from google.genai import types
 
+import reminder_intent
 from config import settings
 from gemini_core import (  # Phase 2B.2.1-2 + 2B.5 re-exports
     _NEWS_CASE_RE,
@@ -1571,6 +1572,8 @@ def extract_reminder(text: str, today_iso: str | None = None) -> dict | None:
     """
     if not text or len(text) > 500:
         return None
+    if reminder_intent.is_obvious_noncommittal_source(text):
+        return None
 
     if today_iso is None:
         today_iso = datetime.now().strftime("%Y-%m-%d %A")
@@ -1634,6 +1637,11 @@ output: {{"action": "看電影", ...下週三日期, "hour": 19, "minute": 0}}�
             result["year"] = datetime.now().year
         # action 長度限制
         result["action"] = str(result["action"])[:50]
+        if reminder_intent.should_reject_reminder_candidate(
+            text,
+            result["action"],
+        ):
+            return None
         return result
     except Exception as e:
         err = str(e)

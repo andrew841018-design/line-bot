@@ -518,7 +518,7 @@ def test_partial_multi_event_capture_blocks_all_fallbacks(monkeypatch):
             "VALUES (?, ?, 'U_MOM', ?, 1)",
             (GROUP_ID, message_id, text),
         )
-    original_insert = calendar_db.insert_event
+    original_insert = calendar_db.insert_event_with_outcome
     calls = 0
 
     def flaky_insert(*args, **kwargs):
@@ -528,7 +528,7 @@ def test_partial_multi_event_capture_blocks_all_fallbacks(monkeypatch):
             raise RuntimeError("second event failed")
         return original_insert(*args, **kwargs)
 
-    monkeypatch.setattr(calendar_db, "insert_event", flaky_insert)
+    monkeypatch.setattr(calendar_db, "insert_event_with_outcome", flaky_insert)
     result = main._capture_calendar_events_regex_only(
         GROUP_ID,
         text,

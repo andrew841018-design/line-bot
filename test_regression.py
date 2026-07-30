@@ -1427,11 +1427,11 @@ def test_auto_capture_local_regex_saves_shared_badminton_events(monkeypatch):
             return cls(2026, 6, 27, tzinfo=tz)
 
     monkeypatch.setattr(main, "datetime", FixedDateTime)
-    monkeypatch.setattr(
-        calendar_db,
-        "insert_event",
-        lambda **kw: inserted.append(kw) or f"event-{len(inserted)}",
-    )
+    def capture_event(**kwargs):
+        inserted.append(kwargs)
+        return f"event-{len(inserted)}", "created"
+
+    monkeypatch.setattr(calendar_db, "insert_event_with_outcome", capture_event)
 
     main._auto_capture_text_if_important(
         "GRP001",

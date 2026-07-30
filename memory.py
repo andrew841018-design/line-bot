@@ -24,6 +24,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import reminder_intent
 from config import settings
 
 _DB_PATH = Path(settings.sqlite_path)
@@ -1253,6 +1254,59 @@ def _add_reminder_with_outcome_conn(
                 (merged_mentions, existing[0]),
             )
         return int(existing[0]), "duplicate"
+    weak_nearby = c.execute(
+        "SELECT reminder_id, action, COALESCE(source_text, ''), "
+        "COALESCE(mention_aliases, '[]'), COALESCE(source_kind, ''), "
+        "COALESCE(source_ref, '') "
+        "FROM reminders WHERE group_id=? AND status='pending' "
+        "AND ABS(remind_at - ?) < 60 ORDER BY reminder_id",
+        (group_id, remind_at),
+    ).fetchall()
+    incoming_is_weak = reminder_intent.is_weak_reminder_action(action)
+    strong_rows = [
+        row
+        for row in weak_nearby
+        if not reminder_intent.is_weak_reminder_action(row[1])
+    ]
+    weak_rows = [
+        row
+        for row in weak_nearby
+        if reminder_intent.is_weak_reminder_action(row[1])
+        and not str(row[4] or "")
+        and not str(row[5] or "")
+    ]
+    if incoming_is_weak and len(strong_rows) == 1:
+        strong = strong_rows[0]
+        merged_mentions = _merge_mention_aliases_json(strong[3], mentions)
+        if merged_mentions != strong[3]:
+            c.execute(
+                "UPDATE reminders SET mention_aliases=? WHERE reminder_id=?",
+                (merged_mentions, int(strong[0])),
+            )
+        return int(strong[0]), "duplicate"
+    if not incoming_is_weak and len(weak_rows) == 1 and not strong_rows:
+        weak = weak_rows[0]
+        live_claim = c.execute(
+            "SELECT 1 FROM reminder_delivery_claims "
+            "WHERE group_id=? AND delivery_kind='natural' AND subject_ref=? "
+            "AND state IN ('sending', 'uncertain') LIMIT 1",
+            (group_id, str(weak[0])),
+        ).fetchone()
+        if live_claim is not None:
+            return int(weak[0]), "duplicate"
+        merged_mentions = _merge_mention_aliases_json(weak[3], mentions)
+        c.execute(
+            "UPDATE reminders SET user_id=?, action=?, source_text=?, "
+            "mention_aliases=? WHERE reminder_id=? AND status='pending'",
+            (
+                user_id or "",
+                action,
+                source_text,
+                merged_mentions,
+                int(weak[0]),
+            ),
+        )
+        return int(weak[0]), "merged"
     nearby = c.execute(
         "SELECT reminder_id, action, COALESCE(source_text, ''), "
         "COALESCE(mention_aliases, '[]') "

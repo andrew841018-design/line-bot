@@ -30,6 +30,7 @@ from zoneinfo import ZoneInfo
 from google.genai import types
 
 import gemini_client
+import reminder_intent
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -105,6 +106,8 @@ def extract(combined_text: str) -> dict:
     }
     if not combined_text or not combined_text.strip():
         return fail
+    if reminder_intent.is_obvious_noncommittal_source(combined_text):
+        return fail
 
     today, weekday = _today_tw()
     prompt = _PROMPT.format(today=today, weekday=weekday, dialogue=combined_text[:2000])
@@ -131,8 +134,13 @@ def extract(combined_text: str) -> dict:
             continue
         try:
             text = _strip_code_fence(resp.text or "")
-            data = json.loads(text)
-            return _normalize(data)
+            data = _normalize(json.loads(text))
+            if data.get("has_event") and reminder_intent.should_reject_reminder_candidate(
+                combined_text,
+                data.get("title"),
+            ):
+                return fail
+            return data
         except Exception as e:
             err = str(e)
             logger.warning(
@@ -159,18 +167,11 @@ def extract(combined_text: str) -> dict:
 
 
 def _event_key(ev: dict) -> tuple[str, str, str, str]:
-    if ev.get("date") and ev.get("time"):
-        return (
-            str(ev.get("date") or ""),
-            str(ev.get("time") or ""),
-            "",
-            "",
-        )
     return (
         str(ev.get("date") or ""),
         str(ev.get("time") or ""),
-        str(ev.get("title") or ""),
-        str(ev.get("location") or ""),
+        reminder_intent.event_semantic_key(ev.get("title")),
+        f"{ev.get('event_type') or ''}:{ev.get('location') or ''}",
     )
 
 
@@ -201,6 +202,11 @@ def extract_many(combined_text: str, primary: dict | None = None) -> dict:
 
     def _add(ev: dict) -> None:
         if not _is_insertable_event(ev):
+            return
+        if reminder_intent.should_reject_reminder_candidate(
+            combined_text,
+            ev.get("title"),
+        ):
             return
         key = _event_key(ev)
         if key in seen:
@@ -277,4 +283,15 @@ def _normalize(data: dict) -> dict:
     if isinstance(time_val, str) and time_val:
         if not re.fullmatch(r"\d{2}:\d{2}", time_val):
             out["time"] = None
+    if reminder_intent.has_internal_prompt_artifact(out["title"]):
+        out.update(
+            {
+                "has_event": False,
+                "title": None,
+                "date": None,
+                "time": None,
+                "location": None,
+                "participants": [],
+            }
+        )
     return out

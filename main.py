@@ -86,6 +86,7 @@ import food_safety_client
 import gemini_client
 import memory
 import output_validator
+import reminder_intent
 from pending_reply_policy import PENDING_REPLY_ENABLED as _DEFAULT_PENDING_REPLY_ENABLED
 import review
 from config import settings
@@ -2666,7 +2667,7 @@ def _capture_calendar_events_regex_only(
             else:
                 _apply_sender_first_person_event(data, sender_user_id)
             _apply_family_context_defaults(data, combined_text)
-            event_id = calendar_db.insert_event(
+            event_id, write_outcome = calendar_db.insert_event_with_outcome(
                 group_id=group_id,
                 title=data["title"],
                 event_date=data["date"],
@@ -2676,7 +2677,7 @@ def _capture_calendar_events_regex_only(
                 event_type=data.get("event_type", "family_gathering"),
                 source_msg_id=message_id,
             )
-            if event_id:
+            if event_id and write_outcome in {"created", "merged", "duplicate"}:
                 durable_state = True
                 event = calendar_db.get_active_event_by_id(group_id, event_id)
                 mirror_ok = bool(
@@ -2688,11 +2689,12 @@ def _capture_calendar_events_regex_only(
                     inserted += 1
                     logger.info(
                         "calendar event captured by local regex: %s '%s' on %s "
-                        "type=%s (group=%s)",
+                        "type=%s outcome=%s (group=%s)",
                         event_id,
                         data["title"],
                         data["date"],
                         data.get("event_type", "family_gathering"),
+                        write_outcome,
                         group_id,
                     )
                 else:
@@ -2754,6 +2756,8 @@ def _auto_capture_text_if_important(
     UNIQUE INDEX 自動 dedup，重跑安全。
     """
     if not text or len(text.strip()) < 4 or len(text) > 500:
+        return False
+    if reminder_intent.is_obvious_noncommittal_source(text):
         return False
     if not (_AUTO_CAPTURE_DATE_HINT_RE.search(text) and _AUTO_CAPTURE_VERB_RE.search(text)):
         return False
@@ -6189,6 +6193,8 @@ def _maybe_capture_calendar_event(
         import calendar_db
         import calendar_extractor
 
+        if reminder_intent.is_obvious_noncommittal_source(combined_text):
+            return
         if _gemini_side_task_allowed("calendar_capture"):
             data = calendar_extractor.extract(combined_text)
         else:
@@ -8681,6 +8687,8 @@ def _enqueue_reminder_if_candidate(
     try:
         if not text or len(text) > 500:
             return None
+        if reminder_intent.is_obvious_noncommittal_source(text):
+            return None
         if not _REMINDER_DATE_HINT.search(text):
             return None
         if not _REMINDER_TIME_OR_ACTION_HINT.search(text):
@@ -8814,6 +8822,16 @@ def _drain_pending_reminders(group_id: str, limit: int = _REMINDER_DRAIN_CAP) ->
         logger.warning("drain reminders: list failed group=%s: %s", group_id, e)
         return
     for row in rows:
+        if reminder_intent.is_obvious_noncommittal_source(row["text"]):
+            pending_id = int(row["pending_id"])
+            rejected_claim = memory.claim_pending_reminder(pending_id)
+            if rejected_claim:
+                memory.mark_pending_reminder(
+                    pending_id,
+                    "dropped",
+                    rejected_claim,
+                )
+            continue
         message_id = str(row.get("message_id") or "")
         if message_id:
             try:
@@ -8896,6 +8914,17 @@ def _drain_pending_reminders(group_id: str, limit: int = _REMINDER_DRAIN_CAP) ->
                     result["mention_aliases"] = _medical_mention_aliases(
                         actor, companions
                     )
+            if reminder_intent.should_reject_reminder_candidate(
+                row["text"],
+                result.get("action"),
+            ):
+                memory.mark_pending_reminder(
+                    pid,
+                    "dropped",
+                    pending_claim_token,
+                )
+                terminal_written = True
+                continue
             try:
                 remind_dt = _dt(
                     int(result["year"]), int(result["month"]), int(result["day"]),
@@ -8969,6 +8998,8 @@ def _maybe_extract_reminder(
     """
     if not text or len(text) > 500:
         return
+    if reminder_intent.is_obvious_noncommittal_source(text):
+        return
     # 必須有日期 + 時間/行動 hint 才送 Gemini（避免「今天天氣」也燒 quota）
     if not _REMINDER_DATE_HINT.search(text):
         return
@@ -9008,6 +9039,11 @@ def _maybe_extract_reminder(
                 result["mention_aliases"] = _medical_mention_aliases(
                     actor, companions
                 )
+        if reminder_intent.should_reject_reminder_candidate(
+            text,
+            result.get("action"),
+        ):
+            return
         # 算 remind_at（local timezone）
         from datetime import datetime as _dt
         try:
