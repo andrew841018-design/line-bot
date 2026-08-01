@@ -68,6 +68,58 @@ def test_cancel(tmp_calendar_db):
     assert cd.cancel_event(eid) is False
 
 
+def test_find_active_event_does_not_fall_back_on_selector_miss(tmp_calendar_db):
+    cd = tmp_calendar_db
+    cd.insert_event(
+        group_id="G1",
+        title="家族聚餐",
+        event_date=(date.today() + timedelta(days=10)).isoformat(),
+    )
+
+    assert cd.find_active_event("G1", keyword="不存在的活動") is None
+    assert cd.find_active_event("G1", near_date="2099-12-31") is None
+    assert cd.find_active_event("G1") is None
+
+
+def test_find_active_event_refuses_ambiguous_selector(tmp_calendar_db):
+    cd = tmp_calendar_db
+    event_date = (date.today() + timedelta(days=10)).isoformat()
+    cd.insert_event(group_id="G1", title="台北聚餐", event_date=event_date)
+    cd.insert_event(group_id="G1", title="桃園聚餐", event_date=event_date)
+
+    assert cd.find_active_event("G1", keyword="聚餐") is None
+    assert cd.find_active_event("G1", near_date=event_date) is None
+
+
+def test_find_active_event_combines_keyword_and_date_selectors(tmp_calendar_db):
+    cd = tmp_calendar_db
+    first_date = (date.today() + timedelta(days=10)).isoformat()
+    second_date = (date.today() + timedelta(days=11)).isoformat()
+    first_id = cd.insert_event(
+        group_id="G1",
+        title="台北聚餐",
+        event_date=first_date,
+    )
+    cd.insert_event(
+        group_id="G1",
+        title="桃園聚餐",
+        event_date=second_date,
+    )
+
+    target = cd.find_active_event(
+        "G1",
+        keyword="聚餐",
+        near_date=first_date,
+    )
+    assert target is not None
+    assert target["event_id"] == first_id
+    assert cd.find_active_event(
+        "G1",
+        keyword="台北",
+        near_date=second_date,
+    ) is None
+
+
 def test_reschedule(tmp_calendar_db):
     cd = tmp_calendar_db
     today = date.today()

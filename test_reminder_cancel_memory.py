@@ -160,6 +160,87 @@ def test_cancel_first_blocks_natural_delivery_claim(reminder_db):
     ) is None
 
 
+def test_cancel_unique_reminder_for_local_date_is_group_scoped(reminder_db):
+    import memory
+
+    target_id = _insert_reminder(
+        reminder_db,
+        group_id="G1",
+        action="目標",
+        remind_at=2_000,
+    )
+    adjacent_id = _insert_reminder(
+        reminder_db,
+        group_id="G1",
+        action="目標",
+        remind_at=999,
+    )
+    other_group_id = _insert_reminder(
+        reminder_db,
+        group_id="G2",
+        action="別群",
+        remind_at=2_000,
+    )
+
+    result = memory.cancel_unique_reminder_for_local_date(
+        "G1", "2030-08-08", 1_000, 3_000
+    )
+
+    assert result["status"] == "cancelled"
+    assert result["reminder"]["reminder_id"] == target_id
+    assert _row(reminder_db, target_id)[2] == "cancelled"
+    assert _row(reminder_db, adjacent_id)[2] == "pending"
+    assert _row(reminder_db, other_group_id)[2] == "pending"
+
+
+def test_cancel_unique_reminder_for_local_date_refuses_multiple(reminder_db):
+    import memory
+
+    first_id = _insert_reminder(
+        reminder_db,
+        action="第一件",
+        remind_at=2_000,
+    )
+    second_id = _insert_reminder(
+        reminder_db,
+        action="第二件",
+        remind_at=2_500,
+    )
+
+    result = memory.cancel_unique_reminder_for_local_date(
+        "G1", "2030-08-08", 1_000, 3_000
+    )
+
+    assert result == {"status": "ambiguous", "count": 2, "reminder": None}
+    assert _row(reminder_db, first_id)[2] == "pending"
+    assert _row(reminder_db, second_id)[2] == "pending"
+
+
+def test_cancel_unique_reminder_for_local_date_cancels_semantic_cluster(
+    reminder_db,
+):
+    import memory
+
+    first_id = _insert_reminder(
+        reminder_db,
+        action="同一件事",
+        remind_at=2_000,
+    )
+    duplicate_id = _insert_reminder(
+        reminder_db,
+        action="同一件事",
+        remind_at=2_050,
+    )
+
+    result = memory.cancel_unique_reminder_for_local_date(
+        "G1", "2030-08-08", 1_000, 3_000
+    )
+
+    assert result["status"] == "cancelled"
+    assert _row(reminder_db, first_id)[2] == "cancelled"
+    assert _row(reminder_db, duplicate_id)[2] == "cancelled"
+
+
 def test_claim_first_cancellation_is_truthful_and_preserved_on_finalize(
     reminder_db,
 ):

@@ -11,6 +11,7 @@ from linebot.v3.webhooks import GroupSource, MessageEvent, TextMessageContent
 
 import main
 import memory
+import reminder_cancel
 import reminder_push
 
 
@@ -56,6 +57,7 @@ def _event(text: str, *, quoted_message_id: str | None = None) -> MessageEvent:
     event.message = message
     event.source = source
     event.reply_token = "reply-token"
+    event.delivery_context = SimpleNamespace(is_redelivery=False)
     return event
 
 
@@ -93,6 +95,339 @@ def _archive_bot_message(
             source_kind=source_kind,
             source_ref=source_ref,
         )
+
+
+def _freeze_date_cancel_clock(monkeypatch) -> None:
+    monkeypatch.setattr(
+        reminder_cancel,
+        "_coerce_now",
+        lambda _now: datetime(2030, 8, 1, 12, 0, tzinfo=TW),
+    )
+
+
+def test_line_inbound_no_activity_date_cancels_unique_pending(monkeypatch):
+    _freeze_date_cancel_clock(monkeypatch)
+    target_id = _seed("G1", "桃園高鐵上皮拉提斯", "2030-08-08 09:00")
+    adjacent_id = _seed("G1", "隔天事項", "2030-08-09 00:00")
+    other_group_id = _seed("G2", "別群事項", "2030-08-08 10:00")
+    replies: list[tuple[str, dict]] = []
+
+    def must_not_run(*_args, **_kwargs):
+        raise AssertionError("date cancellation must stop all later routing")
+
+    monkeypatch.setattr(main.settings, "allowed_group_id", "G1")
+    monkeypatch.setattr(main.settings, "allowed_group_ids_raw", "")
+    piggyback_calls: list[str] = []
+
+    def piggyback_after_cancel(group_id):
+        assert _status(target_id) == "cancelled"
+        piggyback_calls.append(group_id)
+
+    monkeypatch.setattr(main, "_spawn_piggyback_drain", piggyback_after_cancel)
+    monkeypatch.setattr(main, "_try_handle_quoted_calendar_correction", must_not_run)
+    monkeypatch.setattr(main, "_try_handle_missed_reminder_repair", must_not_run)
+    monkeypatch.setattr(main, "_try_one_shot_reply", must_not_run)
+    monkeypatch.setattr(main, "_try_handle_calendar_correction", must_not_run)
+    monkeypatch.setattr(main, "_auto_capture_text_if_important", must_not_run)
+    monkeypatch.setattr(main, "_maybe_extract_reminder", must_not_run)
+    monkeypatch.setattr(main.burst_filter, "cancel_burst", lambda _gid: None)
+    monkeypatch.setattr(
+        main,
+        "_reply",
+        lambda _token, text, **kwargs: replies.append((text, kwargs)),
+    )
+
+    main._handle_event(_event("咪寶8/8沒有活動 取消"))
+
+    assert _status(target_id) == "cancelled"
+    assert _status(adjacent_id) == "pending"
+    assert _status(other_group_id) == "pending"
+    assert len(replies) == 1
+    assert "已取消提醒" in replies[0][0]
+    assert "2030-08-08 09:00" in replies[0][0]
+    assert "桃園高鐵上皮拉提斯" in replies[0][0]
+    assert replies[0][1]["include_auxiliary"] is False
+    assert memory.get_raw_message("G1", "incoming-cancel") is not None
+    assert piggyback_calls == ["G1"]
+
+
+def test_no_activity_date_with_multiple_pending_fails_closed(monkeypatch):
+    _freeze_date_cancel_clock(monkeypatch)
+    first_id = _seed("G1", "第一件事", "2030-08-08 09:00")
+    second_id = _seed("G1", "第二件事", "2030-08-08 19:00")
+    replies: list[str] = []
+    monkeypatch.setattr(main.burst_filter, "cancel_burst", lambda _gid: None)
+    monkeypatch.setattr(
+        main,
+        "_reply",
+        lambda _token, text, **_kwargs: replies.append(text),
+    )
+
+    main._handle_text_message(_event("咪寶8/8沒有活動 取消"), "G1")
+
+    assert _status(first_id) == "pending"
+    assert _status(second_id) == "pending"
+    assert replies and "同一天找到多筆" in replies[0]
+
+
+def test_no_activity_date_checks_all_pending_before_source_identity(monkeypatch):
+    _freeze_date_cancel_clock(monkeypatch)
+    import calendar_db
+
+    event_id = calendar_db.insert_event(
+        group_id="G1",
+        title="來源型活動",
+        event_date="2030-08-08",
+        event_time="09:00",
+    )
+    source_row = next(
+        row
+        for row in memory.list_reminder_cancellation_candidates("G1")
+        if row.get("source_ref") == event_id
+    )
+    generic_id = _seed("G1", "一般提醒", "2030-08-08 19:00")
+    replies: list[str] = []
+    monkeypatch.setattr(main.burst_filter, "cancel_burst", lambda _gid: None)
+    monkeypatch.setattr(
+        main,
+        "_reply",
+        lambda _token, text, **_kwargs: replies.append(text),
+    )
+
+    main._handle_text_message(_event("咪寶8/8沒有活動 取消"), "G1")
+
+    assert _status(int(source_row["reminder_id"])) == "pending"
+    assert _status(generic_id) == "pending"
+    assert replies and "同一天找到多筆" in replies[0]
+
+
+def test_no_activity_date_rechecks_uniqueness_inside_cancel_transaction(
+    monkeypatch,
+):
+    _freeze_date_cancel_clock(monkeypatch)
+    first_id = _seed("G1", "原本唯一事項", "2030-08-08 09:00")
+    real_cancel = memory.cancel_unique_reminder_for_local_date
+    inserted: list[int] = []
+
+    def insert_competitor_then_cancel(group_id, target_date, start_at, end_at):
+        inserted.append(_seed("G1", "競態新增事項", "2030-08-08 19:00"))
+        return real_cancel(group_id, target_date, start_at, end_at)
+
+    replies: list[str] = []
+    monkeypatch.setattr(
+        memory,
+        "cancel_unique_reminder_for_local_date",
+        insert_competitor_then_cancel,
+    )
+    monkeypatch.setattr(main.burst_filter, "cancel_burst", lambda _gid: None)
+    monkeypatch.setattr(
+        main,
+        "_reply",
+        lambda _token, text, **_kwargs: replies.append(text),
+    )
+
+    main._handle_text_message(_event("咪寶8/8沒有活動 取消"), "G1")
+
+    assert _status(first_id) == "pending"
+    assert inserted and _status(inserted[0]) == "pending"
+    assert replies and "同一天找到多筆" in replies[0]
+
+
+def test_no_activity_date_uses_calendar_event_date_not_lead_time(monkeypatch):
+    import calendar_db
+
+    _freeze_date_cancel_clock(monkeypatch)
+    event_id = calendar_db.insert_event(
+        group_id="G1",
+        title="全家打羽球",
+        event_date="2030-08-08",
+        event_time="19:00",
+    )
+    source_row = next(
+        row
+        for row in memory.list_reminder_cancellation_candidates("G1")
+        if row.get("source_ref") == event_id
+    )
+    assert datetime.fromtimestamp(int(source_row["remind_at"]), tz=TW).date() == date(
+        2030, 8, 1
+    )
+    replies: list[str] = []
+    monkeypatch.setattr(main.burst_filter, "cancel_burst", lambda _gid: None)
+    monkeypatch.setattr(
+        main,
+        "_reply",
+        lambda _token, text, **_kwargs: replies.append(text),
+    )
+
+    main._handle_text_message(_event("咪寶8/8沒有活動 取消"), "G1")
+
+    assert _status(int(source_row["reminder_id"])) == "cancelled"
+    assert replies and "已取消提醒" in replies[0]
+
+
+def test_no_activity_date_does_not_cancel_later_calendar_event_lead_time(
+    monkeypatch,
+):
+    import calendar_db
+
+    _freeze_date_cancel_clock(monkeypatch)
+    event_id = calendar_db.insert_event(
+        group_id="G1",
+        title="全家打羽球",
+        event_date="2030-08-15",
+        event_time="19:00",
+    )
+    source_row = next(
+        row
+        for row in memory.list_reminder_cancellation_candidates("G1")
+        if row.get("source_ref") == event_id
+    )
+    assert datetime.fromtimestamp(int(source_row["remind_at"]), tz=TW).date() == date(
+        2030, 8, 8
+    )
+    replies: list[str] = []
+    monkeypatch.setattr(main.burst_filter, "cancel_burst", lambda _gid: None)
+    monkeypatch.setattr(
+        main,
+        "_reply",
+        lambda _token, text, **_kwargs: replies.append(text),
+    )
+
+    main._handle_text_message(_event("咪寶8/8沒有活動 取消"), "G1")
+
+    assert _status(int(source_row["reminder_id"])) == "pending"
+    assert replies and "沒有找到" in replies[0]
+
+
+def test_no_activity_date_persists_tombstone_for_mirrorless_calendar_event(
+    monkeypatch,
+):
+    import calendar_db
+
+    _freeze_date_cancel_clock(monkeypatch)
+    event_id = calendar_db.insert_event(
+        group_id="G1",
+        title="鏡像缺漏活動",
+        event_date="2030-08-08",
+        event_time="19:00",
+    )
+    with memory._conn() as conn:
+        conn.execute(
+            "DELETE FROM reminders WHERE group_id='G1' "
+            "AND source_kind='calendar_event' AND source_ref=?",
+            (event_id,),
+        )
+    replies: list[str] = []
+    monkeypatch.setattr(main.burst_filter, "cancel_burst", lambda _gid: None)
+    monkeypatch.setattr(
+        main,
+        "_reply",
+        lambda _token, text, **_kwargs: replies.append(text),
+    )
+
+    main._handle_text_message(_event("咪寶8/8沒有活動 取消"), "G1")
+
+    candidates = memory.list_reminder_cancellation_candidates(
+        "G1",
+        include_cancelled=True,
+    )
+    tombstones = [
+        row
+        for row in candidates
+        if row.get("source_kind") == "calendar_event"
+        and row.get("source_ref") == event_id
+    ]
+    assert len(tombstones) == 1
+    assert tombstones[0]["status"] == "cancelled"
+    assert replies and "已取消提醒" in replies[0]
+
+
+def test_no_activity_date_cancels_duplicate_rows_for_one_calendar_source(
+    monkeypatch,
+):
+    import calendar_db
+
+    _freeze_date_cancel_clock(monkeypatch)
+    event_id = calendar_db.insert_event(
+        group_id="G1",
+        title="重複鏡像活動",
+        event_date="2030-08-08",
+        event_time="19:00",
+    )
+    with memory._conn() as conn:
+        conn.execute(
+            "INSERT INTO reminders("
+            "group_id, user_id, action, remind_at, created_at, status, "
+            "source_kind, source_ref, source_text, mention_aliases"
+            ") SELECT group_id, user_id, action, remind_at, created_at, "
+            "'done', source_kind, source_ref, source_text, mention_aliases "
+            "FROM reminders WHERE group_id='G1' "
+            "AND source_kind='calendar_event' AND source_ref=? LIMIT 1",
+            (event_id,),
+        )
+    replies: list[str] = []
+    monkeypatch.setattr(main.burst_filter, "cancel_burst", lambda _gid: None)
+    monkeypatch.setattr(
+        main,
+        "_reply",
+        lambda _token, text, **_kwargs: replies.append(text),
+    )
+
+    main._handle_text_message(_event("咪寶8/8沒有活動 取消"), "G1")
+
+    source_rows = [
+        row
+        for row in memory.list_reminder_cancellation_candidates(
+            "G1",
+            include_cancelled=True,
+        )
+        if row.get("source_ref") == event_id
+    ]
+    assert len(source_rows) == 2
+    assert {row["status"] for row in source_rows} == {"cancelled"}
+    assert replies and "已取消提醒" in replies[0]
+
+
+def test_no_activity_date_treats_cancelled_calendar_history_as_one_source(
+    monkeypatch,
+):
+    import calendar_db
+
+    _freeze_date_cancel_clock(monkeypatch)
+    event_id = calendar_db.insert_event(
+        group_id="G1",
+        title="已取消鏡像活動",
+        event_date="2030-08-08",
+        event_time="19:00",
+    )
+    with memory._conn() as conn:
+        conn.execute(
+            "UPDATE reminders SET status='cancelled' "
+            "WHERE group_id='G1' AND source_kind='calendar_event' "
+            "AND source_ref=?",
+            (event_id,),
+        )
+        conn.execute(
+            "INSERT INTO reminders("
+            "group_id, user_id, action, remind_at, created_at, status, "
+            "source_kind, source_ref, source_text, mention_aliases"
+            ") SELECT group_id, user_id, action, remind_at, created_at, "
+            "'cancelled', source_kind, source_ref, source_text, mention_aliases "
+            "FROM reminders WHERE group_id='G1' "
+            "AND source_kind='calendar_event' AND source_ref=? LIMIT 1",
+            (event_id,),
+        )
+    replies: list[str] = []
+    monkeypatch.setattr(main.burst_filter, "cancel_burst", lambda _gid: None)
+    monkeypatch.setattr(
+        main,
+        "_reply",
+        lambda _token, text, **_kwargs: replies.append(text),
+    )
+
+    main._handle_text_message(_event("咪寶8/8沒有活動 取消"), "G1")
+
+    assert replies and "已經取消過" in replies[0]
 
 
 def test_quote_cancel_routes_before_creation_and_cancels_exact_reminder(monkeypatch):

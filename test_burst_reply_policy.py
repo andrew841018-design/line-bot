@@ -120,10 +120,11 @@ def test_quota_exhausted_text_still_enters_text_handler():
         patch("main._handle_text_message") as mock_text_handler,
         patch("main._save_pending_any") as mock_save_pending,
         patch("main._try_piggyback_drain_with_reply_token") as mock_piggyback,
-        patch("main._spawn_piggyback_drain"),
+        patch("main._spawn_piggyback_drain") as mock_spawn,
     ):
         main._handle_event(event)
 
     mock_text_handler.assert_called_once_with(event, "GRP001")
+    mock_spawn.assert_called_once_with("GRP001")
     mock_save_pending.assert_not_called()
     mock_piggyback.assert_not_called()

@@ -996,8 +996,10 @@ def find_active_event(
     near_date: str | None = None,
     event_type: str | None = None,
 ) -> dict | None:
-    """找最近的一筆 active event 用來取消／更新。
-    優先順序：event_type 過濾 → keyword 命中 title or location → near_date 一致 → 最近建立的。
+    """Find one unambiguous active event for cancellation or correction.
+
+    A supplied keyword or date is a required selector. If it matches zero or
+    multiple rows, fail closed instead of falling back to the newest event.
 
     TODO (GP1+GP2 Phase 6): event_type filter 已加但 caller `/取消活動 <keyword>`
     (main.py:_cancel_calendar_event) 目前**沒**傳入。Cross-type collision 風險 medium：
@@ -1021,15 +1023,19 @@ def find_active_event(
             ).fetchall()
     if not rows:
         return None
+    if not keyword and not near_date:
+        return None
+    matched = list(rows)
     if keyword:
-        for r in rows:
-            if keyword in (r["title"] or "") or keyword in (r["location"] or ""):
-                return dict(r)
+        matched = [
+            r
+            for r in matched
+            if keyword in (r["title"] or "")
+            or keyword in (r["location"] or "")
+        ]
     if near_date:
-        for r in rows:
-            if r["event_date"] == near_date:
-                return dict(r)
-    return dict(rows[0])
+        matched = [r for r in matched if r["event_date"] == near_date]
+    return dict(matched[0]) if len(matched) == 1 else None
 
 
 def find_active_events_by_source_message(

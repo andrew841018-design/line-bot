@@ -1,6 +1,6 @@
 """Focused tests for deterministic natural-language reminder cancellation."""
 
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -21,6 +21,126 @@ ACTION = "查看251巷租金是否入郵局帳戶，催繳吳秀英"
 
 def _epoch(year: int, month: int, day: int, hour: int, minute: int) -> int:
     return int(datetime(year, month, day, hour, minute, tzinfo=TAIPEI).timestamp())
+
+
+def test_parses_mibao_no_activity_date_cancellation():
+    request = parse_cancel_request(
+        "咪寶8/8沒有活動 取消",
+        now=datetime(2026, 8, 1, 14, 30, tzinfo=TAIPEI),
+    )
+
+    assert request.status is CancelParseStatus.READY
+    assert request.reference is not None
+    assert request.reference.reference_kind == "scheduled_local_date"
+    assert request.reference.target_date == date(2026, 8, 8)
+    assert request.reference.action == ""
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "@咪寶 8月8日沒有行程，刪掉提醒",
+        "LINE BOT：8/8 無安排；移除",
+    ],
+)
+def test_parses_narrow_no_activity_date_cancellation_variants(text):
+    request = parse_cancel_request(
+        text,
+        now=datetime(2026, 8, 1, 14, 30, tzinfo=TAIPEI),
+    )
+
+    assert request.status is CancelParseStatus.READY
+    assert request.reference is not None
+    assert request.reference.target_date == date(2026, 8, 8)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "8/8沒有活動 取消",
+        "咪寶8/8沒有活動",
+        "咪寶8/8沒有活動取消",
+        "咪寶8/8沒有活動 不要取消",
+        "咪寶8/8沒有活動 要取消嗎？",
+        "咪寶8/8不是沒有活動 取消",
+        "咪寶8/8有活動 取消",
+        "咪寶如果8/8沒有活動就取消",
+    ],
+)
+def test_rejects_unsafe_or_incomplete_no_activity_date_cancellation(text):
+    request = parse_cancel_request(
+        text,
+        now=datetime(2026, 8, 1, 14, 30, tzinfo=TAIPEI),
+    )
+
+    assert request.status is CancelParseStatus.NOT_CANCEL
+
+
+def test_invalid_no_activity_date_is_handled_without_a_reference():
+    request = parse_cancel_request(
+        "咪寶2/30沒有活動 取消",
+        now=datetime(2026, 2, 1, 14, 30, tzinfo=TAIPEI),
+    )
+
+    assert request.status is CancelParseStatus.AMBIGUOUS
+    assert request.reference is None
+    assert request.reason == "invalid_date_only_reference"
+
+
+def test_no_activity_past_date_fails_closed_instead_of_rolling_year():
+    request = parse_cancel_request(
+        "咪寶8/8沒有活動 取消",
+        now=datetime(2026, 8, 9, 0, 1, tzinfo=TAIPEI),
+    )
+
+    assert request.status is CancelParseStatus.AMBIGUOUS
+    assert request.reference is None
+    assert request.reason == "invalid_date_only_reference"
+
+
+def test_no_activity_february_29_requires_a_valid_current_year_date():
+    request = parse_cancel_request(
+        "咪寶2/29沒有活動 取消",
+        now=datetime(2026, 2, 1, 0, 1, tzinfo=TAIPEI),
+    )
+
+    assert request.status is CancelParseStatus.AMBIGUOUS
+    assert request.reference is None
+
+
+def test_date_only_resolution_uses_taipei_date_and_requires_uniqueness():
+    request = parse_cancel_request(
+        "咪寶8/8沒有活動 取消",
+        now=datetime(2026, 8, 1, 14, 30, tzinfo=TAIPEI),
+    )
+    target = {
+        "reminder_id": 1,
+        "action": "桃園高鐵上皮拉提斯",
+        "remind_at": _epoch(2026, 8, 8, 9, 0),
+    }
+    adjacent = {
+        "reminder_id": 2,
+        "action": "隔天事項",
+        "remind_at": _epoch(2026, 8, 9, 0, 0),
+    }
+
+    matched = resolve_cancel_request(request, [target, adjacent])
+    assert matched.status is CancelResolutionStatus.MATCHED
+    assert matched.reminder_id == 1
+
+    ambiguous = resolve_cancel_request(
+        request,
+        [
+            target,
+            {
+                "reminder_id": 3,
+                "action": "同日另一件事",
+                "remind_at": _epoch(2026, 8, 8, 23, 59),
+            },
+        ],
+    )
+    assert ambiguous.status is CancelResolutionStatus.AMBIGUOUS
+    assert ambiguous.reason == "multiple_date_matches"
 
 
 def test_parses_pasted_scheduled_reminder_with_explicit_cancel_intent():

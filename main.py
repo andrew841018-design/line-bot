@@ -1868,13 +1868,14 @@ def _handle_event(event) -> None:
     if isinstance(msg, TextMessageContent):
         text_body = msg.text or ""
         memory.log_raw_message(group_id, msg.id, sender_user_id, text_body)
-        # Piggyback reminder：有人留言時仍可補 reminder；reply pending 已由開關停用。
-        _spawn_piggyback_drain(group_id)
         _register_reply_mention_targets(event.reply_token, msg)
         try:
             _handle_text_message(event, group_id)
         finally:
             _clear_reply_mention_targets(event.reply_token)
+        # Every synchronous cancellation/correction route above has finished
+        # before reminder catch-up can claim and send stale data.
+        _spawn_piggyback_drain(group_id)
         return
 
     # Piggyback reminder：非文字內容仍可補 reminder；文字在上方先做衝突 gate。
@@ -4086,6 +4087,103 @@ def _try_handle_reminder_cancellation(
             if row.get("status") in {"done", "expired"}
         ]
         reference = request.reference
+        if (
+            reference is not None
+            and reference.reference_kind == "scheduled_local_date"
+        ):
+            target_date = reference.target_date
+            if target_date is None:
+                reply = "日期格式無法確認，沒有變更任何提醒。"
+            else:
+                start_dt = datetime(
+                    target_date.year,
+                    target_date.month,
+                    target_date.day,
+                    tzinfo=ZoneInfo("Asia/Taipei"),
+                )
+                result = memory.cancel_unique_reminder_for_local_date(
+                    group_id,
+                    target_date.isoformat(),
+                    int(start_dt.timestamp()),
+                    int((start_dt + timedelta(days=1)).timestamp()),
+                )
+                cancelled_row = result.get("reminder")
+                if result.get("status") == "cancelled" and cancelled_row:
+                    when = datetime.fromtimestamp(
+                        int(cancelled_row["remind_at"]),
+                        tz=ZoneInfo("Asia/Taipei"),
+                    ).strftime("%Y-%m-%d %H:%M")
+                    if cancelled_row.get("_delivery_in_flight"):
+                        reply = (
+                            "已取消後續提醒\n"
+                            "這一則已開始傳送，仍可能送達。\n"
+                            f"時間：{when}\n"
+                            f"事項：{cancelled_row['action']}"
+                        )
+                    else:
+                        reply = (
+                            "已取消提醒\n"
+                            f"時間：{when}\n"
+                            f"事項：{cancelled_row['action']}"
+                        )
+                elif result.get("status") == "ambiguous":
+                    reply = (
+                        "同一天找到多筆提醒或活動，先沒有取消。\n"
+                        "請提供要取消的時間與事項。"
+                    )
+                elif result.get("status") == "already_cancelled":
+                    reply = "這一天的提醒已經取消過了，不會再推送。"
+                elif result.get("status") == "unavailable":
+                    reply = (
+                        "找到這一天的活動，但提醒來源目前無法確認，"
+                        "先沒有取消。\n"
+                        "請回覆原提醒後說「這則取消」。"
+                    )
+                else:
+                    latest = memory.list_reminder_cancellation_candidates(
+                        group_id,
+                        include_cancelled=True,
+                    )
+                    previous_resolution = reminder_cancel.resolve_cancel_request(
+                        request,
+                        [
+                            row
+                            for row in latest
+                            if row.get("status") == "cancelled"
+                        ],
+                    )
+                    if (
+                        previous_resolution.status
+                        is reminder_cancel.CancelResolutionStatus.MATCHED
+                    ):
+                        reply = "這一天的提醒已經取消過了，不會再推送。"
+                    elif (
+                        previous_resolution.status
+                        is reminder_cancel.CancelResolutionStatus.AMBIGUOUS
+                    ):
+                        reply = (
+                            "這一天已有多筆已取消提醒；"
+                            "目前沒有變更任何提醒。"
+                        )
+                    else:
+                        reply = (
+                            "這一天沒有找到待取消提醒，先沒有變更。\n"
+                            "請查看提醒清單確認日期。"
+                        )
+            _reply(
+                event.reply_token,
+                reply,
+                group_id=group_id,
+                include_auxiliary=False,
+            )
+            logger.info(
+                "date-only reminder cancellation handled group=%s "
+                "result=%r text_len=%d",
+                group_id,
+                reply.splitlines()[0],
+                len(text),
+            )
+            return True
         no_identity_match = reminder_cancel.CancelResolution(
             status=reminder_cancel.CancelResolutionStatus.NOT_FOUND,
             reference=reference,
@@ -4595,7 +4693,10 @@ def _try_handle_reminder_cancellation(
     return True
 
 
-def _handle_text_message(event: MessageEvent, group_id: str) -> None:
+def _handle_text_message(
+    event: MessageEvent,
+    group_id: str,
+) -> None:
     text = event.message.text or ""
     # Cancellation must run before quote-context expansion, one-shot replies,
     # calendar capture, classifiers, and reminder extraction.  Otherwise a
@@ -6213,11 +6314,17 @@ def _maybe_capture_calendar_event(
         extracted = calendar_extractor.extract_many(combined_text, primary=data)
         if extracted["is_cancellation"]:
             kw = extracted.get("cancel_target_keyword")
-            target = calendar_db.find_active_event(
-                group_id, keyword=kw, near_date=extracted.get("date")
+            is_reschedule = bool(
+                kw
+                and extracted.get("date")
+                and re.search(
+                    r"(?:改期|改到|改成|改為|改至|改在|延後|延期|延到|挪到|換到)",
+                    combined_text,
+                )
             )
-            if target:
-                if extracted.get("date") and extracted["date"] != target["event_date"]:
+            if is_reschedule:
+                target = calendar_db.find_active_event(group_id, keyword=kw)
+                if target:
                     correction = calendar_db.correct_event_and_reminder_by_id(
                         group_id,
                         str(target["event_id"]),
@@ -6225,27 +6332,26 @@ def _maybe_capture_calendar_event(
                         new_time=extracted.get("time"),
                         new_title=None,
                     )
-                    if correction.get("status") in {"updated", "unchanged"}:
-                        logger.info(
-                            "calendar event rescheduled: %s → %s (group=%s)",
-                            target["event_id"],
-                            extracted["date"],
-                            group_id,
-                        )
-                    else:
-                        logger.warning(
-                            "calendar event reschedule skipped: %s status=%s",
-                            target["event_id"],
-                            correction.get("status"),
-                        )
-                else:
-                    calendar_db.cancel_event(target["event_id"])
                     logger.info(
-                        "calendar event cancelled: %s (kw=%s, group=%s)",
+                        "calendar event reschedule result: %s → %s "
+                        "status=%s group=%s",
                         target["event_id"],
-                        kw,
+                        extracted["date"],
+                        correction.get("status"),
                         group_id,
                     )
+                return
+            target = calendar_db.find_active_event(
+                group_id, keyword=kw, near_date=extracted.get("date")
+            )
+            if target:
+                calendar_db.cancel_event(target["event_id"])
+                logger.info(
+                    "calendar event cancelled: %s (kw=%s, group=%s)",
+                    target["event_id"],
+                    kw,
+                    group_id,
+                )
             return
 
         for data in extracted.get("events") or []:

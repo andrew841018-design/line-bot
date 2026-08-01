@@ -765,6 +765,93 @@ def test_same_group_title_date_allows_distinct_explicit_times(tmp_calendar_db):
     assert {event["event_time"] for event in events} == {"14:00", "14:30"}
 
 
+def test_calendar_capture_reschedules_only_with_explicit_reschedule_words(
+    tmp_calendar_db,
+    monkeypatch,
+):
+    import calendar_extractor
+    import main
+
+    old_date = (
+        tmp_calendar_db._today_tw() + __import__("datetime").timedelta(days=3)
+    ).isoformat()
+    new_date = (
+        tmp_calendar_db._today_tw() + __import__("datetime").timedelta(days=5)
+    ).isoformat()
+    event_id = tmp_calendar_db.insert_event(
+        group_id="G1",
+        title="家族聚餐",
+        event_date=old_date,
+        event_time="18:00",
+    )
+    extracted = {
+        "is_cancellation": True,
+        "cancel_target_keyword": "家族聚餐",
+        "date": new_date,
+        "time": "19:00",
+        "events": [],
+    }
+    monkeypatch.setattr(main, "_gemini_side_task_allowed", lambda _name: True)
+    monkeypatch.setattr(calendar_extractor, "extract", lambda _text: extracted)
+    monkeypatch.setattr(
+        calendar_extractor,
+        "extract_many",
+        lambda _text, primary=None: extracted,
+    )
+
+    main._maybe_capture_calendar_event(
+        "G1",
+        f"家族聚餐改到{new_date}晚上七點",
+    )
+
+    events = tmp_calendar_db.list_upcoming("G1", days=30)
+    updated = next(event for event in events if event["event_id"] == event_id)
+    assert updated["event_date"] == new_date
+    assert updated["event_time"] == "19:00"
+
+
+def test_calendar_capture_cancellation_selector_mismatch_does_not_reschedule(
+    tmp_calendar_db,
+    monkeypatch,
+):
+    import calendar_extractor
+    import main
+
+    old_date = (
+        tmp_calendar_db._today_tw() + __import__("datetime").timedelta(days=3)
+    ).isoformat()
+    wrong_date = (
+        tmp_calendar_db._today_tw() + __import__("datetime").timedelta(days=5)
+    ).isoformat()
+    event_id = tmp_calendar_db.insert_event(
+        group_id="G1",
+        title="家族聚餐",
+        event_date=old_date,
+        event_time="18:00",
+    )
+    extracted = {
+        "is_cancellation": True,
+        "cancel_target_keyword": "家族聚餐",
+        "date": wrong_date,
+        "time": None,
+        "events": [],
+    }
+    monkeypatch.setattr(main, "_gemini_side_task_allowed", lambda _name: True)
+    monkeypatch.setattr(calendar_extractor, "extract", lambda _text: extracted)
+    monkeypatch.setattr(
+        calendar_extractor,
+        "extract_many",
+        lambda _text, primary=None: extracted,
+    )
+
+    main._maybe_capture_calendar_event("G1", "取消家族聚餐")
+
+    events = tmp_calendar_db.list_upcoming("G1", days=30)
+    unchanged = next(event for event in events if event["event_id"] == event_id)
+    assert unchanged["event_date"] == old_date
+    assert unchanged["status"] == "active"
+
+
 def test_dedup_different_date_allowed(tmp_calendar_db):
     cd = tmp_calendar_db
     eid1 = cd.insert_event(

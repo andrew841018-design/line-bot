@@ -1693,6 +1693,232 @@ def cancel_pending_reminder(
         return row
 
 
+def cancel_unique_reminder_for_local_date(
+    group_id: str,
+    target_date: str,
+    start_at: int,
+    end_at: int,
+) -> dict:
+    """Atomically cancel one logical reminder target for a Taipei date.
+
+    Generic reminders are selected by ``remind_at``. Calendar-backed reminders
+    are selected by their source event's ``event_date`` so lead-time booking
+    notifications cannot be mistaken for activities on the notification day.
+    """
+
+    target_date = str(target_date or "").strip()
+    start_at = int(start_at)
+    end_at = int(end_at)
+    if not group_id or not target_date or end_at <= start_at:
+        return {"status": "invalid", "count": 0, "reminder": None}
+
+    with _lock, _conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        generic_rows = c.execute(
+            "SELECT reminder_id, action, remind_at, source_kind, source_ref "
+            "FROM reminders WHERE group_id=? AND status='pending' "
+            "AND remind_at>=? AND remind_at<? "
+            "AND NOT (source_kind='calendar_event' "
+            "AND COALESCE(source_ref, '')<>'') "
+            "ORDER BY remind_at, reminder_id",
+            (group_id, start_at, end_at),
+        ).fetchall()
+
+        event_groups: dict[str, list[tuple]] = {}
+        has_events_table = c.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='events'"
+        ).fetchone()
+        if has_events_table is not None:
+            event_rows = c.execute(
+                "SELECT e.event_id, e.title, e.event_time, "
+                "r.reminder_id, r.action, r.remind_at, "
+                "r.status, r.source_kind, r.source_ref "
+                "FROM events AS e LEFT JOIN reminders AS r "
+                "ON r.group_id=e.group_id "
+                "AND r.source_kind='calendar_event' "
+                "AND r.source_ref=e.event_id "
+                "WHERE e.group_id=? AND e.status='active' "
+                "AND e.event_date=? "
+                "ORDER BY e.event_id, r.reminder_id",
+                (group_id, target_date),
+            ).fetchall()
+            for row in event_rows:
+                event_groups.setdefault(str(row[0]), []).append(tuple(row))
+
+        generic_clusters: list[list[tuple]] = []
+        source_cluster_indexes: dict[tuple[str, str], int] = {}
+        for raw_row in generic_rows:
+            row = tuple(raw_row)
+            source_kind = str(row[3] or "")
+            source_ref = str(row[4] or "")
+            if source_kind and source_ref:
+                source_key = (source_kind, source_ref)
+                cluster_index = source_cluster_indexes.get(source_key)
+                if cluster_index is None:
+                    source_cluster_indexes[source_key] = len(generic_clusters)
+                    generic_clusters.append([row])
+                else:
+                    generic_clusters[cluster_index].append(row)
+                continue
+
+            normalized_action = _reminder_equivalence_key(row[1])
+            cluster = next(
+                (
+                    candidate
+                    for candidate in generic_clusters
+                    if not str(candidate[0][3] or "")
+                    and not str(candidate[0][4] or "")
+                    and _reminder_equivalence_key(candidate[0][1])
+                    == normalized_action
+                    and abs(int(candidate[0][2]) - int(row[2])) <= 60
+                ),
+                None,
+            )
+            if cluster is None:
+                generic_clusters.append([row])
+            else:
+                cluster.append(row)
+
+        targets: list[tuple[str, object]] = [
+            ("generic", tuple(cluster)) for cluster in generic_clusters
+        ]
+        cancelled_calendar_rows: list[tuple] = []
+        for rows in event_groups.values():
+            materialized = [row for row in rows if row[3] is not None]
+            eligible = [
+                row
+                for row in materialized
+                if str(row[6] or "") in {"pending", "done", "expired"}
+            ]
+            cancelled = [
+                row for row in materialized if str(row[6] or "") == "cancelled"
+            ]
+            if eligible:
+                targets.append(("calendar", tuple(eligible)))
+            elif cancelled:
+                cancelled_calendar_rows.append(cancelled[0])
+            else:
+                targets.append(("calendar_missing", rows[0]))
+
+        if len(targets) > 1:
+            return {
+                "status": "ambiguous",
+                "count": len(targets),
+                "reminder": None,
+            }
+        if not targets:
+            if len(cancelled_calendar_rows) == 1:
+                reminder = _get_reminder_conn(
+                    c,
+                    int(cancelled_calendar_rows[0][3]),
+                )
+                return {
+                    "status": "already_cancelled",
+                    "count": 0,
+                    "reminder": reminder,
+                }
+            if len(cancelled_calendar_rows) > 1:
+                return {
+                    "status": "ambiguous",
+                    "count": len(cancelled_calendar_rows),
+                    "reminder": None,
+                }
+            return {"status": "not_found", "count": 0, "reminder": None}
+
+        target_kind, selected = targets[0]
+        if target_kind == "generic":
+            selected_rows = tuple(selected)
+            representative = selected_rows[0]
+            reminder_id = int(representative[0])
+            action = str(representative[1])
+            remind_at = int(representative[2])
+            source_kind = str(representative[3] or "")
+            source_ref = str(representative[4] or "")
+        elif target_kind == "calendar":
+            selected_rows = tuple(selected)
+            representative = selected_rows[0]
+            reminder_id = int(representative[3])
+            action = str(representative[4])
+            remind_at = int(representative[5])
+            source_kind = str(representative[7] or "")
+            source_ref = str(representative[8] or "")
+        else:
+            source_ref = str(selected[0] or "")
+            action = str(selected[1] or "家族行事曆提醒")
+            event_time = str(selected[2] or "").strip()
+            hour = 0
+            minute = 0
+            if re.fullmatch(r"\d{1,2}:\d{2}", event_time):
+                parsed_hour, parsed_minute = map(int, event_time.split(":"))
+                if 0 <= parsed_hour <= 23 and 0 <= parsed_minute <= 59:
+                    hour = parsed_hour
+                    minute = parsed_minute
+            remind_at = start_at + hour * 3600 + minute * 60
+            cursor = c.execute(
+                "INSERT INTO reminders("
+                "group_id, user_id, action, remind_at, created_at, status, "
+                "source_kind, source_ref, source_text, mention_aliases"
+                ") VALUES (?, '', ?, ?, ?, 'cancelled', "
+                "'calendar_event', ?, ?, '[]')",
+                (
+                    group_id,
+                    action,
+                    remind_at,
+                    int(_time.time()),
+                    source_ref,
+                    action,
+                ),
+            )
+            reminder = _get_reminder_conn(c, int(cursor.lastrowid))
+            return {
+                "status": "cancelled",
+                "count": 1,
+                "reminder": reminder,
+            }
+
+        delivery = _semantic_delivery_claim_conn(
+            c,
+            group_id=group_id,
+            reminder_id=reminder_id,
+            action=action,
+            remind_at=remind_at,
+            source_kind=source_kind,
+            source_ref=source_ref,
+            include_semantic=(target_kind == "generic"),
+            restrict_to_source_cluster=bool(source_kind and source_ref),
+        )
+        if target_kind in {"generic", "calendar"}:
+            reminder_id_index = 0 if target_kind == "generic" else 3
+            reminder_ids = [
+                int(row[reminder_id_index]) for row in selected_rows
+            ]
+            placeholders = ",".join(["?"] * len(reminder_ids))
+            status_clause = (
+                "status='pending'"
+                if target_kind == "generic"
+                else "status IN ('pending', 'done', 'expired')"
+            )
+            cursor = c.execute(
+                "UPDATE reminders SET status='cancelled' "
+                f"WHERE group_id=? AND {status_clause} "
+                f"AND reminder_id IN ({placeholders})",
+                [group_id, *reminder_ids],
+            )
+            expected_updates = len(reminder_ids)
+        if cursor.rowcount != expected_updates:
+            return {"status": "not_found", "count": 0, "reminder": None}
+        reminder = _get_reminder_conn(c, reminder_id)
+        if reminder is not None and delivery is not None:
+            reminder["_delivery_in_flight"] = True
+            reminder["_delivery_state"] = str(delivery[0] or "sending")
+        return {
+            "status": "cancelled" if reminder is not None else "not_found",
+            "count": 1 if reminder is not None else 0,
+            "reminder": reminder,
+        }
+
+
 def cancel_reminder_for_source(
     group_id: str,
     reminder_id: int,

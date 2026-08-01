@@ -16,7 +16,7 @@ There is no fuzzy, newest-row, or LLM fallback.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from enum import Enum
 import re
 import unicodedata
@@ -65,6 +65,7 @@ class ReminderReference:
     reference_kind: str = "scheduled_reminder"
     event_time_specified: bool = False
     location_hint: str = ""
+    target_date: date | None = None
 
 
 @dataclass(frozen=True)
@@ -177,6 +178,18 @@ _HELP_PATTERNS = (
 )
 _INVOCATION_PATTERN = (
     r"(?:(?:[@＠]\s*)?(?:line\s*bot|咪寶)\s*[:：，,]?\s*)?"
+)
+_DATE_ONLY_NO_ACTIVITY_CANCEL_RE = re.compile(
+    r"^(?:[@＠]\s*)?(?:line\s*bot|咪寶)\s*[:：，,]?\s*"
+    r"(?P<date_month>\d{1,2})\s*(?:/|月)\s*"
+    r"(?P<date_day>\d{1,2})\s*(?:日|號|号)?\s*"
+    r"(?:沒有|没有|沒|没|無|无)\s*(?:任何\s*)?"
+    r"(?:活動|活动|行程|安排)"
+    r"(?:\s+|[，,；;]\s*)"
+    rf"{_CANCEL_VERB_PATTERN}"
+    r"(?:\s*(?:這天|这天|當天|当天|當日|当日)\s*(?:的)?)?"
+    r"\s*(?:提醒)?(?:\s*(?:一下|吧))?\s*[。.!！]?$",
+    re.IGNORECASE,
 )
 _DEICTIC_PATTERN = r"(?:這|該)(?:一)?(?:個|則)"
 _TARGET_PATTERN = rf"(?:(?:{_DEICTIC_PATTERN}\s*)?提醒|{_DEICTIC_PATTERN})"
@@ -409,6 +422,34 @@ def _todo_reference_from_match(
         remind_at=remind_at,
         source=source,
         action_variants=action_variants_tuple,
+    )
+
+
+def _date_only_reference_from_match(
+    match: re.Match[str],
+    source: ReferenceSource,
+    now: datetime,
+) -> ReminderReference | None:
+    month = int(match.group("date_month"))
+    day = int(match.group("date_day"))
+    try:
+        target_date = date(now.year, month, day)
+    except ValueError:
+        return None
+    if target_date < now.date():
+        return None
+    target_midnight = datetime(
+        target_date.year,
+        target_date.month,
+        target_date.day,
+        tzinfo=TAIPEI,
+    )
+    return ReminderReference(
+        action="",
+        remind_at=int(target_midnight.timestamp()),
+        source=source,
+        reference_kind="scheduled_local_date",
+        target_date=target_date,
     )
 
 
@@ -702,6 +743,31 @@ def parse_cancel_request(
 
     text = str(current_text or "")
     has_quote = quoted_text is not None
+    local_now = _coerce_now(now)
+    date_only_match = _DATE_ONLY_NO_ACTIVITY_CANCEL_RE.fullmatch(
+        unicodedata.normalize("NFKC", text).strip()
+    )
+    if date_only_match is not None:
+        reference = _date_only_reference_from_match(
+            date_only_match,
+            ReferenceSource.CURRENT,
+            local_now,
+        )
+        if reference is None:
+            return CancelRequest(
+                status=CancelParseStatus.AMBIGUOUS,
+                reason="invalid_date_only_reference",
+            )
+        if has_quote or quoted_identity_bound:
+            return CancelRequest(
+                status=CancelParseStatus.AMBIGUOUS,
+                current_reference=reference,
+                reason="date_only_reference_with_quote",
+            )
+        return CancelRequest(
+            status=CancelParseStatus.READY,
+            current_reference=reference,
+        )
     bare_quoted_cancel = bool(
         has_quote
         and _BARE_QUOTED_CANCEL_RE.fullmatch(
@@ -717,7 +783,6 @@ def parse_cancel_request(
             reason="no_explicit_cancel_intent",
         )
 
-    local_now = _coerce_now(now)
     current_references = _extract_references(
         text,
         ReferenceSource.CURRENT,
@@ -854,10 +919,19 @@ def resolve_cancel_request(
         remind_at = _candidate_epoch_seconds(candidate.get("remind_at"))
         if remind_at is None:
             continue
-        if (
-            normalize_action(action) in reference_actions
-            and remind_at // 60 == reference_minute
-        ):
+        if reference.reference_kind == "scheduled_local_date":
+            target_date = reference.target_date
+            is_match = bool(
+                target_date is not None
+                and datetime.fromtimestamp(remind_at, tz=TAIPEI).date()
+                == target_date
+            )
+        else:
+            is_match = bool(
+                normalize_action(action) in reference_actions
+                and remind_at // 60 == reference_minute
+            )
+        if is_match:
             matches.append((reminder_id, action, remind_at))
 
     if not matches:
@@ -870,7 +944,11 @@ def resolve_cancel_request(
         return CancelResolution(
             status=CancelResolutionStatus.AMBIGUOUS,
             reference=reference,
-            reason="multiple_exact_matches",
+            reason=(
+                "multiple_date_matches"
+                if reference.reference_kind == "scheduled_local_date"
+                else "multiple_exact_matches"
+            ),
         )
 
     reminder_id, action, remind_at = matches[0]
