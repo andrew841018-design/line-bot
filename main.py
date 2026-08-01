@@ -85,6 +85,7 @@ import feedback_collector
 import food_safety_client
 import gemini_client
 import memory
+import mibao_identity
 import output_validator
 import reminder_intent
 from pending_reply_policy import PENDING_REPLY_ENABLED as _DEFAULT_PENDING_REPLY_ENABLED
@@ -10056,7 +10057,74 @@ _TEXT_MENTION_PREFIXES = (
 )
 
 # 直接叫名字也算觸發（長輩不用 @，直接說「咪寶...」）
-_BOT_NAME_KEYWORDS = ("咪寶",)
+_BOT_NAME_KEYWORDS = mibao_identity.ALIASES
+
+
+def _strip_bot_name_vocative(text: str) -> tuple[str, bool]:
+    """Strip a leading/trailing bot-name vocative, preserving subject names."""
+    punctuation = "，,、。！!？?：: \t"
+    image_subject = _detect_image_gen_request(text)
+    subject_is_exact_alias = mibao_identity.is_exact_mibao_alias(image_subject or "")
+    for alias in _BOT_NAME_KEYWORDS:
+        flags = re.IGNORECASE if alias.isascii() else 0
+        escaped = re.escape(alias)
+        if alias.isascii():
+            leading = re.match(
+                rf"^(?:@|＠)?{escaped}(?=$|[\s，,、。！!？?：:])",
+                text,
+                flags,
+            )
+        else:
+            leading = re.match(rf"^(?:@|＠)?{escaped}", text, flags)
+        if leading:
+            return text[leading.end():].lstrip(punctuation), True
+
+        recipient = re.search(
+            rf"\s*(?:(?:送)?給\s*(?:@|＠)?{escaped}(?:\s*看(?:看)?)?"
+            rf"|讓\s*(?:@|＠)?{escaped}\s*看(?:看)?)"
+            rf"[\s，,、。！!？?：:]*$",
+            text,
+            flags,
+        )
+        if recipient:
+            return text[:recipient.start()].rstrip(punctuation), True
+
+        if not subject_is_exact_alias:
+            trailing = re.search(
+                rf"[\s，,、。！!？?：:]+(?:@|＠)?{escaped}[\s，,、。！!？?：:]*$",
+                text,
+                flags,
+            )
+            if trailing:
+                return text[:trailing.start()].rstrip(punctuation), True
+    return text, False
+
+
+def _normalize_addressed_self_image_request(text: str) -> str:
+    """Resolve an unambiguous addressed self-portrait subject to Mibao."""
+    subject = _detect_image_gen_request(text)
+    if not subject:
+        return text
+    exact_self = re.fullmatch(
+        r"(?:你|妳)(?:自己(?:的模樣|的樣子)?|的模樣|的樣子)[。！!？? ]*",
+        subject,
+    )
+    own_visual_self = re.match(r"(?:你|妳)自己的(?:模樣|樣子)", subject)
+    posed_self = re.match(r"(?:你|妳)自己(?!的)", subject)
+    visual_self = re.match(r"(?:你|妳)的(?:模樣|樣子)", subject)
+    matched = exact_self or own_visual_self or posed_self or visual_self
+    if not matched:
+        return text
+    normalized_subject = subject[:matched.start()] + mibao_identity.NAME + subject[matched.end():]
+    return text.replace(subject, normalized_subject, 1)
+
+
+def _finalize_addressed_trigger(text: str) -> str:
+    """Normalize text from every explicit bot-addressing route."""
+    clean = (text or "").strip().lstrip("，,、。！!？?：: \t")
+    if _detect_image_gen_request(clean):
+        clean, _ = _strip_bot_name_vocative(clean)
+    return _normalize_addressed_self_image_request(clean)
 
 
 def _extract_gemini_trigger(text: str, message: TextMessageContent) -> str | None:
@@ -10073,20 +10141,21 @@ def _extract_gemini_trigger(text: str, message: TextMessageContent) -> str | Non
         if t == prefix.strip():
             return ""
         if t.startswith(prefix):
-            return t[len(prefix) :].strip()
+            return _finalize_addressed_trigger(t[len(prefix):])
     if _is_mentioned(message):
-        return _strip_mentions(message).strip()
+        return _finalize_addressed_trigger(_strip_mentions(message))
     # fallback：桌機 LINE @mention 不帶結構，只有純文字 @AI
     for prefix in _TEXT_MENTION_PREFIXES:
         if t == prefix.strip():
             return ""
         if t.lower().startswith(prefix.lower()):
-            return t[len(prefix) :].strip()
-    # 名字偵測：訊息裡出現 bot 名字就觸發，把名字挖掉後剩下的當問題
-    for name in _BOT_NAME_KEYWORDS:
-        if name in t:
-            clean = t.replace(name, "", 1).strip("，,、。！!？? \t")
-            return clean
+            return _finalize_addressed_trigger(t[len(prefix):])
+    # 名稱在開頭/句尾是稱呼，名稱在產圖主題或句中則保留語意。
+    if mibao_identity.is_mibao_subject(t):
+        clean, addressed = _strip_bot_name_vocative(t)
+        if addressed:
+            return _finalize_addressed_trigger(clean)
+        return t
     return None
 
 

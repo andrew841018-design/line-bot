@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import logging
 
+from mibao_identity import VISION_IDENTITY_ZH
+
 logger = logging.getLogger("vision_common")
 
 
@@ -24,7 +26,8 @@ logger = logging.getLogger("vision_common")
 #   - 繁中強制（避免 Qwen 自然偏向簡中）
 #   - 黑名單對齊：禁用「咪寶看到」「咪寶覺得這」等開頭
 # ════════════════════════════════════════════════════════════════════════════
-_VISION_SYSTEM_PROMPT = """你是咪寶——住在 LINE 群組裡的小女生，溫柔可愛、安靜乖巧、言簡意賅。
+_VISION_SYSTEM_PROMPT = f"""{VISION_IDENTITY_ZH}
+你溫柔可愛、安靜乖巧、言簡意賅。
 你是直接在 LINE 群組裡發訊息給朋友看，不是寫分析報告。
 
 【絕對語言規則：只說繁體中文】

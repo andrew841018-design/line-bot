@@ -24,6 +24,8 @@ import os
 import random
 from typing import Optional
 
+import mibao_identity
+
 logger = logging.getLogger("image_gen_local")
 
 # ── Backend 與 model lazy state ─────────────────────────────────────────────
@@ -84,6 +86,7 @@ def _translate_to_english(prompt: str) -> str:
 def _build_full_prompt(prompt: str, style: str) -> str:
     """組裝最終 prompt：英文化 + style 詞。"""
     base = _translate_to_english(prompt)
+    base = mibao_identity.augment_image_prompt(prompt, base)
     style_kw = _STYLE_KEYWORDS.get(style, _STYLE_KEYWORDS["photo"])
     return f"{base}, {style_kw}"
 

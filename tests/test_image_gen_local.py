@@ -249,3 +249,60 @@ def test_active_backend_reflects_state():
         ig.generate("hi")
 
     assert ig.active_backend() == "sdxl_turbo"
+
+
+# ── (l) 咪寶 canonical visual identity ─────────────────────────────────────
+
+
+@pytest.mark.parametrize("subject", [
+    "咪寶坐在窗邊",
+    "小貓咪寶坐在窗邊",
+    "Mibao by a window",
+    "mibao sleeping on a blanket",
+])
+def test_mibao_alias_adds_canonical_identity(subject):
+    import image_gen_local as ig
+    import mibao_identity
+
+    with patch("image_gen_local._translate_to_english", return_value="scene translation"):
+        final_prompt = ig._build_full_prompt(subject, "photo")
+
+    assert mibao_identity.IMAGE_PROMPT_EN in final_prompt
+    assert final_prompt.count(mibao_identity.IMAGE_PROMPT_EN) == 1
+    assert "scene translation" in final_prompt
+    assert "photorealistic" in final_prompt
+
+
+@pytest.mark.parametrize("subject", [
+    "一隻虎斑貓坐在窗邊",
+    "米寶在睡覺",
+    "貓咪寶寶在睡覺",
+    "mibaox by a window",
+])
+def test_unrelated_or_near_match_does_not_add_mibao_identity(subject):
+    import image_gen_local as ig
+    import mibao_identity
+
+    with patch("image_gen_local._translate_to_english", return_value="scene translation"):
+        final_prompt = ig._build_full_prompt(subject, "photo")
+
+    assert final_prompt == "scene translation, photorealistic, detailed, soft lighting, sharp focus, 4k"
+    assert mibao_identity.IMAGE_PROMPT_EN not in final_prompt
+
+
+def test_translator_cannot_invent_mibao_identity():
+    import image_gen_local as ig
+    import mibao_identity
+
+    with patch("image_gen_local._translate_to_english", return_value="Mibao in a garden"):
+        final_prompt = ig._build_full_prompt("一隻普通貓在花園", "photo")
+
+    assert mibao_identity.IMAGE_PROMPT_EN not in final_prompt
+
+
+def test_repeated_mibao_alias_adds_identity_once():
+    import image_gen_local as ig
+    import mibao_identity
+
+    final_prompt = ig._build_full_prompt("Mibao and Mibao", "photo")
+    assert final_prompt.count(mibao_identity.IMAGE_PROMPT_EN) == 1
