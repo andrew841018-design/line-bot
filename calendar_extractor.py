@@ -224,8 +224,28 @@ def extract_many(combined_text: str, primary: dict | None = None) -> dict:
         )
         if events and len(regex_events) <= 1:
             regex_events = []
-        for ev in regex_events:
-            _add(_normalize(ev))
+        normalized_regex_events = [_normalize(ev) for ev in regex_events]
+        counterpart_index: int | None = None
+        if events and normalized_regex_events:
+            first_schedule = (
+                str(events[0].get("date") or ""),
+                str(events[0].get("time") or ""),
+            )
+            schedule_matches = [
+                index
+                for index, event in enumerate(normalized_regex_events)
+                if (
+                    str(event.get("date") or ""),
+                    str(event.get("time") or ""),
+                )
+                == first_schedule
+            ]
+            if len(schedule_matches) == 1:
+                counterpart_index = schedule_matches[0]
+        for index, ev in enumerate(normalized_regex_events):
+            if index == counterpart_index:
+                continue
+            _add(ev)
     except Exception as e:
         logger.warning("calendar multi regex fallback failed: %s", e)
 

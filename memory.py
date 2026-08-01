@@ -1277,12 +1277,6 @@ def _add_reminder_with_outcome_conn(
     ]
     if incoming_is_weak and len(strong_rows) == 1:
         strong = strong_rows[0]
-        merged_mentions = _merge_mention_aliases_json(strong[3], mentions)
-        if merged_mentions != strong[3]:
-            c.execute(
-                "UPDATE reminders SET mention_aliases=? WHERE reminder_id=?",
-                (merged_mentions, int(strong[0])),
-            )
         return int(strong[0]), "duplicate"
     if not incoming_is_weak and len(weak_rows) == 1 and not strong_rows:
         weak = weak_rows[0]

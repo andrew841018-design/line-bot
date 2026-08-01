@@ -1401,11 +1401,11 @@ def test_quota_saver_calendar_capture_uses_regex_path_without_gemini(monkeypatch
         MagicMock(side_effect=AssertionError("Gemini calendar extractor called")),
     )
     monkeypatch.setattr(calendar_extractor, "extract_many", fake_extract_many)
-    monkeypatch.setattr(
-        calendar_db,
-        "insert_event",
-        lambda **kw: inserted.append(kw) or 42,
-    )
+    def capture_event(**kwargs):
+        inserted.append(kwargs)
+        return "event-1", "created"
+
+    monkeypatch.setattr(calendar_db, "insert_event_with_outcome", capture_event)
 
     main._maybe_capture_calendar_event(
         "GRP001", "6/28 18:00 預約7/5羽球場地", "USR001", "MSG001"

@@ -55,7 +55,7 @@ _WEAK_ACTION_RE = re.compile(
     r"晚上嗎|早上嗎|下午嗎|要不要"
     r")"
 )
-_CLAUSE_SPLIT_RE = re.compile(r"[\n\r。；;！!?？]+")
+_CLAUSE_SPLIT_RE = re.compile(r"[\n\r，,。；;！!?？]+")
 _QUESTION_BOUNDARY_RE = re.compile(r"嗎(?!哪)|[?？]")
 _PUNCT_OR_SPACE_RE = re.compile(r"[\s，,、。；;：:！？!?（）()\[\]【】「」『』]+")
 _TIME_RANGE_RE = re.compile(
@@ -180,7 +180,8 @@ def is_obvious_noncommittal_source(source_text: object) -> bool:
             fragment
             and not _QUESTION_RE.search(fragment)
             and _DATE_HINT_RE.search(fragment)
-            and _TIME_HINT_RE.search(fragment)
+            and not _AVAILABILITY_ONLY_RE.search(fragment)
+            and not is_weak_reminder_action(fragment)
             and len(_action_key(fragment)) >= 2
         ):
             return False

@@ -6258,7 +6258,7 @@ def _maybe_capture_calendar_event(
             else:
                 _apply_sender_first_person_event(data, sender_user_id)
             _apply_family_context_defaults(data, combined_text)
-            event_id = calendar_db.insert_event(
+            event_id, write_outcome = calendar_db.insert_event_with_outcome(
                 group_id=group_id,
                 title=data["title"],
                 event_date=data["date"],
@@ -6268,20 +6268,23 @@ def _maybe_capture_calendar_event(
                 event_type=data.get("event_type", "family_gathering"),
                 source_msg_id=message_id,
             )
-            if event_id:
+            if event_id and write_outcome in {"created", "merged", "duplicate"}:
                 logger.info(
-                    "calendar event captured: %s '%s' on %s type=%s (group=%s)",
+                    "calendar event captured: %s '%s' on %s type=%s "
+                    "outcome=%s (group=%s)",
                     event_id,
                     data["title"],
                     data["date"],
                     data.get("event_type", "family_gathering"),
+                    write_outcome,
                     group_id,
                 )
             else:
-                logger.info(
-                    "calendar event dedup hit (skipped): '%s' on %s (group=%s)",
+                logger.warning(
+                    "calendar event write skipped: '%s' on %s outcome=%s (group=%s)",
                     data["title"],
                     data["date"],
+                    write_outcome,
                     group_id,
                 )
     except Exception as e:

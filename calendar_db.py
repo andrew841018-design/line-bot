@@ -497,15 +497,34 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_events_active "
             "ON events(group_id, status, event_date)"
         )
-        # Dedup: 同 group 同 title 同日 active event 唯一
-        # (group_id, title, event_date) WHERE status='active' — partial unique index
-        # 防 TOCTOU race（GP1 反饋）：應用層 check-then-insert 不夠，SQL 層擋住
-        c.execute("DROP INDEX IF EXISTS idx_events_dedup")
-        c.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_dedup "
+        # Migrate the old date-only key once. The transaction keeps the legacy
+        # uniqueness constraint live until the replacement can be created.
+        desired_index_sql = (
+            "CREATE UNIQUE INDEX idx_events_dedup "
             "ON events(group_id, title, event_date, COALESCE(event_time, '')) "
             "WHERE status='active'"
         )
+        existing_index = c.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' "
+            "AND name='idx_events_dedup'"
+        ).fetchone()
+        def normalize_index_sql(sql: object) -> str:
+            return "".join(str(sql or "").lower().split())
+
+        if existing_index is None:
+            c.execute(desired_index_sql)
+        elif normalize_index_sql(existing_index[0]) != normalize_index_sql(
+            desired_index_sql
+        ):
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                c.execute("DROP INDEX idx_events_dedup")
+                c.execute(desired_index_sql)
+            except Exception:
+                c.execute("ROLLBACK")
+                raise
+            else:
+                c.execute("COMMIT")
 
 
 def _semantic_event_score(event: Mapping[str, object]) -> tuple[int, int, int]:
@@ -750,6 +769,55 @@ def _merge_semantic_event_conn(
     return event_id, "merged"
 
 
+def _insert_new_event_reminder_conn(
+    c: sqlite3.Connection,
+    event: Mapping[str, object],
+) -> int:
+    action, remind_at, source_text = _corrected_event_payload_conn(c, event)
+    group_id = str(event.get("group_id") or "").strip()
+    event_id = str(event.get("event_id") or "").strip()
+    if not group_id or not event_id:
+        raise ValueError("calendar event mirror has no source identity")
+
+    source_msg_id = str(event.get("source_msg_id") or "").strip()
+    reminder_user_id = ""
+    raw_text = ""
+    if source_msg_id:
+        raw = c.execute(
+            "SELECT user_id, text FROM raw_messages "
+            "WHERE group_id=? AND message_id=?",
+            (group_id, source_msg_id),
+        ).fetchone()
+        if raw is not None:
+            reminder_user_id = str(raw[0] or "").strip()
+            raw_text = str(raw[1] or "")
+
+    participant_aliases = _event_participants(event)
+    raw_aliases = _raw_text_reminder_aliases(raw_text)
+    if _is_badminton_event(event) and participant_aliases:
+        mention_aliases = participant_aliases
+    else:
+        mention_aliases = _merge_mention_aliases(participant_aliases, raw_aliases)
+    cursor = c.execute(
+        "INSERT INTO reminders("
+        "group_id, user_id, action, remind_at, created_at, status, "
+        "source_kind, source_ref, source_text, mention_aliases"
+        ") VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
+        (
+            group_id,
+            reminder_user_id,
+            action,
+            remind_at,
+            int(time.time()),
+            EVENT_REMINDER_SOURCE_KIND,
+            event_id,
+            source_text,
+            json.dumps(mention_aliases, ensure_ascii=False),
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
 def insert_event_with_outcome(
     group_id: str,
     title: str,
@@ -775,8 +843,8 @@ def insert_event_with_outcome(
         "status": "active",
         "event_type": et,
     }
-    event: dict[str, object] | None = None
     try:
+        _ensure_memory_db_path()
         with _lock, _conn() as c:
             c.row_factory = sqlite3.Row
             c.execute("BEGIN IMMEDIATE")
@@ -822,12 +890,15 @@ def insert_event_with_outcome(
                         return "", "conflict"
                     return str(exact[0]), "duplicate"
                 return "", "conflict"
-            event = incoming
+            _insert_new_event_reminder_conn(c, incoming)
     except (sqlite3.Error, OSError, RuntimeError, ValueError):
         return "", "unavailable"
-    if event:
-        if not _upsert_event_reminder(event):
-            return event_id, "mirror_incomplete"
+    try:
+        import memory
+
+        memory.delete_duplicate_pending_reminders(group_id)
+    except Exception:
+        pass
     return event_id, "created"
 
 
@@ -853,7 +924,11 @@ def insert_event(
         source_msg_id=source_msg_id,
         event_type=event_type,
     )
-    return event_id if outcome == "created" else ""
+    if outcome == "created":
+        return event_id
+    if outcome in {"duplicate", "merged", "conflict", "ambiguous", "busy", "blocked"}:
+        return ""
+    raise RuntimeError(f"calendar event write failed: {outcome}")
 
 
 def sync_active_events_to_reminders(group_id: str | None = None) -> int:

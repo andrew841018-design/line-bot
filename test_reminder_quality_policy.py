@@ -45,6 +45,25 @@ def test_explicit_or_independent_committed_candidates_are_kept(source, action):
     assert not reminder_intent.should_reject_reminder_candidate(source, action)
 
 
+def test_question_gate_keeps_date_only_commitment_in_separate_clause():
+    import reminder_intent
+
+    source = "8/18 看胸腔外科\nMRI結果好了嗎？"
+    assert not reminder_intent.is_obvious_noncommittal_source(source)
+    assert not reminder_intent.should_reject_reminder_candidate(
+        source,
+        "看胸腔外科",
+    )
+
+
+def test_question_gate_rejects_date_only_availability_in_separate_clause():
+    import reminder_intent
+
+    assert reminder_intent.is_obvious_noncommittal_source(
+        "8/18 也可以，MRI結果好了嗎？"
+    )
+
+
 def test_internal_prompt_artifacts_are_rejected():
     import reminder_intent
 
@@ -205,6 +224,106 @@ def test_semantic_calendar_duplicate_prefers_sourceful_richer_event(
     assert len(mirrors) == 1
     assert mirrors[0]["source_ref"] == canonical_id
     assert mirrors[0]["action"] == "晚上回台北"
+
+
+def test_new_event_and_reminder_mirror_roll_back_together(
+    semantic_calendar_db,
+    monkeypatch,
+):
+    calendar_db, memory = semantic_calendar_db
+
+    def fail_mirror(*_args, **_kwargs):
+        raise RuntimeError("injected mirror failure")
+
+    monkeypatch.setattr(
+        calendar_db,
+        "_insert_new_event_reminder_conn",
+        fail_mirror,
+        raising=False,
+    )
+    event_id, outcome = calendar_db.insert_event_with_outcome(
+        group_id="G1",
+        title="看胸腔外科",
+        event_date=(date.today() + timedelta(days=10)).isoformat(),
+        source_msg_id="m-source",
+        event_type="medical",
+    )
+
+    assert event_id == ""
+    assert outcome == "unavailable"
+    assert calendar_db.list_upcoming("G1", days=30) == []
+    assert memory.list_pending_reminders_full("G1") == []
+
+
+def test_legacy_insert_event_surfaces_unavailable_write(monkeypatch):
+    import calendar_db
+
+    monkeypatch.setattr(
+        calendar_db,
+        "insert_event_with_outcome",
+        lambda **_kwargs: ("", "unavailable"),
+    )
+    with pytest.raises(RuntimeError, match="unavailable"):
+        calendar_db.insert_event(
+            group_id="G1",
+            title="看胸腔外科",
+            event_date="2026-08-18",
+        )
+
+
+def test_calendar_index_init_is_idempotent(semantic_calendar_db):
+    calendar_db, _memory = semantic_calendar_db
+    with calendar_db._conn() as connection:
+        before = connection.execute("PRAGMA schema_version").fetchone()[0]
+
+    calendar_db.init_db()
+
+    with calendar_db._conn() as connection:
+        after = connection.execute("PRAGMA schema_version").fetchone()[0]
+    assert after == before
+
+
+def test_model_and_regex_unique_schedule_counterpart_is_not_duplicated(monkeypatch):
+    import calendar_extractor
+    import calendar_regex
+
+    primary = {
+        "has_event": True,
+        "is_cancellation": False,
+        "title": "家庭返台行程",
+        "date": "2026-08-11",
+        "time": "19:00",
+        "location": None,
+        "participants": [],
+        "event_type": "personal_trip",
+    }
+    regex_events = [
+        {
+            **primary,
+            "title": "回台北",
+        },
+        {
+            **primary,
+            "title": "去桃園",
+            "date": "2026-08-12",
+            "time": None,
+        },
+    ]
+    monkeypatch.setattr(
+        calendar_regex,
+        "extract_many_regex_only",
+        lambda *_args, **_kwargs: regex_events,
+    )
+
+    result = calendar_extractor.extract_many(
+        "8/11 晚上回台北，8/12 去桃園",
+        primary=primary,
+    )
+
+    assert [event["title"] for event in result["events"]] == [
+        "家庭返台行程",
+        "去桃園",
+    ]
 
 
 def test_sourceful_calendar_event_ignores_source_less_synthetic_duplicate(
@@ -450,3 +569,34 @@ def test_weak_incoming_reminder_does_not_replace_richer_peer(
     assert outcome == "duplicate"
     assert weak_id == rich_id
     assert memory.get_reminder(rich_id)["action"] == "桃園高鐵上皮拉提斯"
+
+
+def test_weak_incoming_reminder_does_not_mutate_richer_mentions(
+    monkeypatch,
+    tmp_path,
+):
+    import memory
+
+    db_path = tmp_path / "weak-incoming-mentions.db"
+    monkeypatch.setattr(memory, "_DB_PATH", Path(db_path))
+    memory._init_db()
+    remind_at = int(datetime.now(ZoneInfo("Asia/Taipei")).timestamp()) + 86400
+
+    rich_id, _ = memory.add_reminder_with_outcome(
+        "G1",
+        "U1",
+        "桃園高鐵上皮拉提斯",
+        remind_at,
+        mention_aliases=["媽媽"],
+    )
+    weak_id, outcome = memory.add_reminder_with_outcome(
+        "G1",
+        "U2",
+        "8/8",
+        remind_at,
+        mention_aliases=["爸爸"],
+    )
+
+    assert outcome == "duplicate"
+    assert weak_id == rich_id
+    assert memory.get_reminder(rich_id)["mention_aliases"] == ["媽媽"]
