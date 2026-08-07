@@ -115,7 +115,7 @@ def test_question_gate_skips_model_queue_and_persistence(monkeypatch, tmp_path):
     monkeypatch.setattr(main.gemini_client, "extract_reminder", forbidden)
     monkeypatch.setattr(memory, "add_reminder_with_outcome", forbidden)
     monkeypatch.setattr(memory, "enqueue_pending_reminder", forbidden)
-    monkeypatch.setattr(main, "_gemini_side_task_allowed", lambda *_args: True)
+    monkeypatch.setattr(main, "_gemini_side_task_allowed", lambda *_a, **_k: True)
 
     assert (
         main._maybe_extract_reminder(

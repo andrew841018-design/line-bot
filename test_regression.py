@@ -1336,28 +1336,84 @@ def test_bug10_explicit_quota_miss_replies_without_pending():
     assert pending == []
 
 
+def _quota_info_stub(used_requests: int):
+    """Build a get_gemini_quota_info() stub that tolerates any future signature.
+
+    The lambdas MUST accept *args/**kwargs: _gemini_side_task_allowed wraps its
+    whole body in `except Exception: return False` (main.py:1392-1394), so a
+    TypeError from an arity mismatch would be laundered into a False result and
+    silently satisfy any negative assertion below.
+    """
+    return lambda *_a, **_k: {
+        "used_tokens": 1000,
+        "limit_tokens": 1_000_000,
+        "used_requests": used_requests,
+        "limit_requests": 20,
+        "used_thinking_tokens": 0,
+    }
+
+
 def test_quota_saver_side_task_gate_reserves_main_reply_requests(monkeypatch):
-    monkeypatch.setattr(main, "_quota_exhausted", lambda: False)
+    monkeypatch.setattr(main, "_quota_exhausted", lambda *_a, **_k: False)
+    monkeypatch.setattr(
+        main.gemini_client, "get_gemini_quota_info", _quota_info_stub(12)
+    )
+
+    assert not main._gemini_side_task_allowed("test_side_task")
+
+
+def test_lite_only_side_task_ignores_flash_request_reserve(monkeypatch):
+    """flash-lite has an independent ~1000/day budget (config.py:50-51).
+
+    A lite-only side task must stay allowed even when flash's 20-request budget
+    is nearly spent, otherwise reminder_extract dies after 4 calls/day and the
+    bot answers real questions with the queued-reminder canned reply.
+    """
+    monkeypatch.setattr(main, "_quota_exhausted", lambda *_a, **_k: False)
+    monkeypatch.setattr(
+        main.gemini_client, "get_gemini_quota_info", _quota_info_stub(19)
+    )
+
+    assert not main._gemini_side_task_allowed("flash_side_task")
+    assert main._gemini_side_task_allowed("lite_side_task", uses_flash=False)
+
+
+def test_lite_only_side_task_ignores_flash_exhaustion_flag(monkeypatch):
+    """_quota_exhausted() is set by an observed flash 429 PerDay; it says
+    nothing about lite, so it must not gate a lite-only side task."""
+    monkeypatch.setattr(main, "_quota_exhausted", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        main.gemini_client, "get_gemini_quota_info", _quota_info_stub(0)
+    )
+
+    assert not main._gemini_side_task_allowed("flash_side_task")
+    assert main._gemini_side_task_allowed("lite_side_task", uses_flash=False)
+
+
+def test_lite_only_side_task_still_honours_token_reserve(monkeypatch):
+    """_DAILY_TOKEN_LIMIT is tracked flat across both models, so the token
+    reserve must keep applying even when uses_flash=False."""
+    monkeypatch.setattr(main, "_quota_exhausted", lambda *_a, **_k: False)
     monkeypatch.setattr(
         main.gemini_client,
         "get_gemini_quota_info",
-        lambda: {
-            "used_tokens": 1000,
+        lambda *_a, **_k: {
+            "used_tokens": 999_000,
             "limit_tokens": 1_000_000,
-            "used_requests": 12,
+            "used_requests": 0,
             "limit_requests": 20,
             "used_thinking_tokens": 0,
         },
     )
 
-    assert not main._gemini_side_task_allowed("test_side_task")
+    assert not main._gemini_side_task_allowed("lite_side_task", uses_flash=False)
 
 
 def test_quota_saver_fact_extract_skips_before_counter_bump(monkeypatch):
     bump = MagicMock()
     extract = MagicMock()
 
-    monkeypatch.setattr(main, "_gemini_side_task_allowed", lambda reason: False)
+    monkeypatch.setattr(main, "_gemini_side_task_allowed", lambda *_a, **_k: False)
     monkeypatch.setattr(main.memory, "bump_and_should_extract", bump)
     monkeypatch.setattr(main.gemini_client, "extract_facts", extract)
 
@@ -1394,7 +1450,7 @@ def test_quota_saver_calendar_capture_uses_regex_path_without_gemini(monkeypatch
             ],
         }
 
-    monkeypatch.setattr(main, "_gemini_side_task_allowed", lambda reason: False)
+    monkeypatch.setattr(main, "_gemini_side_task_allowed", lambda *_a, **_k: False)
     monkeypatch.setattr(
         calendar_extractor,
         "extract",
@@ -1451,7 +1507,7 @@ def test_auto_capture_local_regex_saves_shared_badminton_events(monkeypatch):
 def test_quota_saver_reminder_uses_regex_without_gemini(monkeypatch):
     saved: list[tuple] = []
 
-    monkeypatch.setattr(main, "_gemini_side_task_allowed", lambda reason: False)
+    monkeypatch.setattr(main, "_gemini_side_task_allowed", lambda *_a, **_k: False)
     monkeypatch.setattr(
         main.gemini_client,
         "extract_reminder",

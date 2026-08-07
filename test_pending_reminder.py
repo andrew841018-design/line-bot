@@ -120,8 +120,17 @@ def test_maybe_extract_skips_non_action_date_text(temp_db, monkeypatch):
 
 # ── site 2: _maybe_extract_reminder 撞 429 ───────────────────────────────────
 
-def test_maybe_extract_perday_429_marks_and_enqueues(temp_db, monkeypatch):
-    """R3: 日額度 429 → _mark_quota_exhausted + 入隊。"""
+def test_maybe_extract_perday_429_enqueues_without_marking_flash_exhausted(
+    temp_db, monkeypatch
+):
+    """日額度 429 → 入隊補抽，但**不得** _mark_quota_exhausted。
+
+    extract_reminder() 只打 flash-lite（gemini_client.py:1620），而
+    _mark_quota_exhausted() 會把 flash 的 requests 用 max() 釘死在 20
+    （gemini_client.py:149，不可逆）並設全域旗標到 PT 午夜（main.py:7219-7232）。
+    lite 的額度與 flash 完全獨立（config.py:50-51），所以一次 lite 的 429 絕不能
+    連坐讓所有 flash side task 死一整天 —— 那正是家人問問題卻收到罐頭回覆的成因。
+    """
     import main
     import memory
     import gemini_client
@@ -132,7 +141,7 @@ def test_maybe_extract_perday_429_marks_and_enqueues(temp_db, monkeypatch):
     confirmation = main._maybe_extract_reminder(
         "6/3下午8點開會", "G1", "U1", "m1"
     )
-    assert marked == [1], "PerDay 429 應 mark exhausted"
+    assert marked == [], "lite-only 的 PerDay 429 不可連坐 mark flash 全天爆"
     assert len(memory.list_pending_reminder_retries("G1")) == 1, "應入隊補抽"
     assert confirmation == "提醒已排入待處理，尚未新增\n完成建立後，會再於群組確認。"
 
@@ -219,7 +228,7 @@ def test_range_shopping_reminder_is_created_without_gemini(temp_db, monkeypatch)
     import memory
 
     now_tw = datetime(2099, 7, 10, 12, 0, tzinfo=ZoneInfo("Asia/Taipei"))
-    monkeypatch.setattr(main, "_gemini_side_task_allowed", lambda reason: True)
+    monkeypatch.setattr(main, "_gemini_side_task_allowed", lambda *_a, **_k: True)
     monkeypatch.setattr(
         gemini_client,
         "extract_reminder",
@@ -271,7 +280,7 @@ def test_repeated_range_reminder_reports_existing_without_duplicate(temp_db, mon
     import main
     import memory
 
-    monkeypatch.setattr(main, "_gemini_side_task_allowed", lambda reason: False)
+    monkeypatch.setattr(main, "_gemini_side_task_allowed", lambda *_a, **_k: False)
     monkeypatch.setattr(main, "_alias_from_user_id", lambda uid: "爸爸")
     text = "咪寶：提醒我7月16到7月28日在紐西蘭期間要買：按摩油。"
     parsed = main._explicit_range_reminder_result(

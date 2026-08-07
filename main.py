@@ -1360,10 +1360,27 @@ _GEMINI_SIDE_TASK_MIN_REMAINING_TOKENS = int(
 )
 
 
-def _gemini_side_task_allowed(reason: str = "side_task") -> bool:
-    """Return True only when optional Gemini work can run without eating reply budget."""
+def _gemini_side_task_allowed(
+    reason: str = "side_task", *, uses_flash: bool = True
+) -> bool:
+    """Return True only when optional Gemini work can run without eating reply budget.
+
+    `uses_flash=False` marks a side task that *only* ever calls
+    `settings.gemini_light_model`. flash-lite carries its own ~1000/day free
+    allowance that is completely independent of flash's 20 RPD (config.py:50-51),
+    so the two flash-scoped guards below must not gate it:
+
+    * `_quota_exhausted()` — set from an observed 429 **PerDay**, which only ever
+      tells us flash is spent; it says nothing about lite.
+    * the `_GEMINI_SIDE_TASK_MIN_REMAINING_REQUESTS` reserve — sized against
+      flash's 20-request budget so one family reply (worst case ~14 requests via
+      the `_run` retry loop + `_quality_gate`) still fits.
+
+    The token reserve is still enforced for every caller because
+    `_DAILY_TOKEN_LIMIT` is tracked flat across both models.
+    """
     try:
-        if _quota_exhausted():
+        if uses_flash and _quota_exhausted():
             logger.info("skip Gemini %s: quota exhausted", reason)
             return False
         info = gemini_client.get_gemini_quota_info()
@@ -1372,7 +1389,7 @@ def _gemini_side_task_allowed(reason: str = "side_task") -> bool:
             return False
         remaining_req = int(info["limit_requests"]) - int(info["used_requests"])
         remaining_tokens = int(info["limit_tokens"]) - int(info["used_tokens"])
-        if remaining_req <= _GEMINI_SIDE_TASK_MIN_REMAINING_REQUESTS:
+        if uses_flash and remaining_req <= _GEMINI_SIDE_TASK_MIN_REMAINING_REQUESTS:
             logger.info(
                 "skip Gemini %s: remaining_requests=%d reserve=%d",
                 reason,
@@ -9116,7 +9133,11 @@ def _maybe_extract_reminder(
     if not _REMINDER_TIME_OR_ACTION_HINT.search(text):
         return
     local_result = precomputed_result or _explicit_range_reminder_result(text, user_id)
-    gemini_allowed = _gemini_side_task_allowed("reminder_extract")
+    # extract_reminder() only ever calls settings.gemini_light_model with no
+    # flash fallback (gemini_client.py:1619-1626), so it must not be gated on
+    # flash's 20-request reserve — that starved this path to 4 calls/day and made
+    # the bot answer real questions with the queued-reminder canned reply.
+    gemini_allowed = _gemini_side_task_allowed("reminder_extract", uses_flash=False)
     try:
         result = local_result
         if result is None:
@@ -9190,8 +9211,14 @@ def _maybe_extract_reminder(
         )
     except Exception as e:
         if _is_quota_error(e):
-            # site 2 (intra-request flip): 日額度爆 → mark + 入隊等恢復補抽
-            _mark_quota_exhausted()
+            # site 2 (intra-request flip): 日額度爆 → 入隊等恢復補抽。
+            #
+            # 這裡**刻意不呼叫** `_mark_quota_exhausted()`：唯一會 raise 到這裡的
+            # 是 extract_reminder()，而它只打 flash-lite（gemini_client.py:1620）。
+            # `_mark_quota_exhausted()` 會把 flash 的 requests 用 max() 釘死在 20
+            # （gemini_client.py:149，不可逆）並設全域旗標到 PT 午夜
+            # （main.py:7219-7232）→ 一次 **lite** 的 429 就讓**所有** side task
+            # 死一整天。跨模型污染，lite 的額度與 flash 完全獨立（config.py:50-51）。
             queue_outcome = _enqueue_reminder_if_candidate(
                 text, group_id, user_id, message_id
             )

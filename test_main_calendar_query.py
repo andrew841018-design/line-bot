@@ -791,7 +791,7 @@ def test_calendar_capture_reschedules_only_with_explicit_reschedule_words(
         "time": "19:00",
         "events": [],
     }
-    monkeypatch.setattr(main, "_gemini_side_task_allowed", lambda _name: True)
+    monkeypatch.setattr(main, "_gemini_side_task_allowed", lambda *_a, **_k: True)
     monkeypatch.setattr(calendar_extractor, "extract", lambda _text: extracted)
     monkeypatch.setattr(
         calendar_extractor,
@@ -836,7 +836,7 @@ def test_calendar_capture_cancellation_selector_mismatch_does_not_reschedule(
         "time": None,
         "events": [],
     }
-    monkeypatch.setattr(main, "_gemini_side_task_allowed", lambda _name: True)
+    monkeypatch.setattr(main, "_gemini_side_task_allowed", lambda *_a, **_k: True)
     monkeypatch.setattr(calendar_extractor, "extract", lambda _text: extracted)
     monkeypatch.setattr(
         calendar_extractor,
