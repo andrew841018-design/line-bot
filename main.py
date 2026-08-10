@@ -4868,6 +4868,13 @@ def _handle_text_message(
         _handle_todo_query(event, group_id, text)
         return
 
+    # 3b. 未點名或把「咪寶」打錯時，真正的自然語言行程問句仍直接查本機 DB。
+    # 正確 explicit trigger 留給後面的 _handle_explicit_text，避免同一則回兩次。
+    if clean_text is None and _is_calendar_query(text):
+        burst_filter.cancel_burst(group_id)
+        _handle_calendar_query(event, group_id, text)
+        return
+
     # 4. 晚餐推薦觸發
     if _handle_restaurant_food_safety(event, group_id, text):
         burst_filter.cancel_burst(group_id)
@@ -5119,7 +5126,13 @@ def _is_calendar_query(text: str) -> bool:
     if query_marker and any(kw in text for kw in _QUERY_NOUN_KEYWORDS):
         person_terms = ("媽媽", "爸爸", "姊姊", "妹妹", "弟弟", "爺爺", "奶奶", "黃將修")
         trip_terms = ("紐西蘭", "奧克蘭")
-        trip_intent = re.search(r"去|回|出發|返台|班機|機場|接送|行程|旅程|旅行", text)
+        trip_intent = re.search(
+            r"去|前往|出發|返台|返家|回國|回來|"
+            r"回(?:到)?(?:家|台北|新北|台中|台南|高雄|花蓮|宜蘭|新竹|"
+            r"苗栗|嘉義|屏東|台東|老家)|"
+            r"班機|機場|接送|行程|旅程|旅行|北上|南下",
+            text,
+        )
         if trip_intent or (
             any(p in text for p in person_terms)
             and any(t in text for t in trip_terms)
@@ -5157,6 +5170,215 @@ def _filter_calendar_events_by_person_and_topic(
         if _calendar_event_has_any(e, family_nouns)
         and _calendar_event_has_any(e, other_nouns)
     ]
+
+
+_RETURN_HOME_QUERY_RE = re.compile(r"(?:回|返|到)(?:到)?家|回來")
+_RETURN_HOME_DIRECT_RE_TEMPLATE = (
+    r"(?:回|返|返回|回到){city}|返台|回家|返家"
+)
+_REMOTE_EVENT_RE = re.compile(
+    r"線上|視訊|遠端|電話會議|[Zz]oom|[Tt]eams|Google\s*Meet"
+)
+_HOME_CITY_POIS: dict[str, tuple[str, ...]] = {
+    "台北": ("考選部",),
+}
+
+
+def _return_home_query_actor(text: str) -> str | None:
+    """Return the named family member for a natural-language return-home query."""
+    if not text or not _RETURN_HOME_QUERY_RE.search(text):
+        return None
+    if not re.search(r"什麼時候|何時|哪一天|哪天|幾時|多久|何日", text):
+        return None
+    for term in sorted(_FAMILY_ACTOR_TERMS, key=len, reverse=True):
+        if term == "全家" or term not in text:
+            continue
+        return _normalize_family_actor(term)
+    return None
+
+
+def _calendar_event_participant_text(event: dict) -> str:
+    raw = event.get("participants")
+    if isinstance(raw, list):
+        return " ".join(str(value or "") for value in raw)
+    if isinstance(raw, str):
+        try:
+            loaded = _json.loads(raw)
+        except Exception:
+            return raw
+        if isinstance(loaded, list):
+            return " ".join(str(value or "") for value in loaded)
+        return raw
+    return ""
+
+
+def _calendar_explicit_actors(event: dict) -> set[str]:
+    haystack = " ".join(
+        (
+            str(event.get("title") or ""),
+            _calendar_event_participant_text(event),
+        )
+    )
+    actors: set[str] = set()
+    for term in _FAMILY_ACTOR_TERMS:
+        if term != "全家" and term in haystack:
+            actors.add(_normalize_family_actor(term))
+    return actors
+
+
+def _source_is_first_person_itinerary(source_text: str) -> bool:
+    text = str(source_text or "").strip()
+    if not text:
+        return False
+    text = re.sub(r"^(?:@?咪寶|米堡|米寶|咪宝)[，,、:：\s]*", "", text)
+    if re.match(
+        r"^我\s*(?:整理|轉貼|轉傳|幫|替|提醒|問|詢問|聽|看到|記錄|紀錄|分享)",
+        text,
+    ):
+        return False
+    return bool(
+        re.match(
+            r"^我(?=\s|\d|的行程|會|要|將|預計|今天|明天|後天|週|星期|禮拜)",
+            text,
+        )
+    )
+
+
+def _calendar_event_owned_by_actor(
+    group_id: str,
+    event: dict,
+    actor: str,
+) -> bool:
+    """Conservatively attribute one event to a family member within one group."""
+    if not group_id or not actor:
+        return False
+    event_group = str(event.get("group_id") or group_id)
+    if event_group != group_id or str(event.get("status") or "active") != "active":
+        return False
+
+    normalized_actor = _normalize_family_actor(actor)
+    explicit_actors = _calendar_explicit_actors(event)
+    if explicit_actors:
+        return normalized_actor in explicit_actors
+
+    source_msg_id = str(event.get("source_msg_id") or "").strip()
+    if not source_msg_id:
+        return False
+    raw = memory.get_raw_message(group_id, source_msg_id)
+    if raw is None:
+        return False
+    source_user_id, source_text = raw
+    source_actor = _normalize_family_actor(_alias_from_user_id(source_user_id))
+    return bool(
+        source_actor
+        and source_actor == normalized_actor
+        and _source_is_first_person_itinerary(source_text)
+    )
+
+
+def _calendar_event_home_city_evidence(
+    event: dict,
+    home_city: str,
+) -> str | None:
+    """Return physical home-city evidence, excluding remote/online commitments."""
+    title = str(event.get("title") or "")
+    location = str(event.get("location") or "")
+    haystack = f"{title} {location}".strip()
+    if not haystack or _REMOTE_EVENT_RE.search(haystack):
+        return None
+    if home_city and home_city in haystack:
+        return home_city
+    for poi in _HOME_CITY_POIS.get(home_city, ()):
+        if poi not in haystack:
+            continue
+        if poi in location or re.search(
+            rf"(?:去|到|在|前往|抵達){re.escape(poi)}|"
+            rf"{re.escape(poi)}.{{0,16}}(?:開會|會議|報到|考試|活動)",
+            haystack,
+        ):
+            return poi
+    return None
+
+
+def _calendar_event_is_direct_home_return(event: dict, home_city: str) -> bool:
+    haystack = " ".join(
+        str(event.get(key) or "") for key in ("title", "location")
+    )
+    if re.search(r"(?:不|沒有|沒|取消|改天).{0,3}(?:回|返)", haystack):
+        return False
+    pattern = _RETURN_HOME_DIRECT_RE_TEMPLATE.format(city=re.escape(home_city))
+    return bool(re.search(pattern, haystack))
+
+
+def _short_calendar_date(event: dict) -> str:
+    try:
+        parsed = datetime.strptime(str(event.get("event_date") or ""), "%Y-%m-%d")
+        return f"{parsed.month}/{parsed.day}"
+    except Exception:
+        return str(event.get("event_date") or "日期未明")
+
+
+def _build_return_home_calendar_reply(
+    group_id: str,
+    clean_text: str,
+    events: list[dict],
+    today_iso: str,
+    home_city: str = "台北",
+) -> str | None:
+    """Answer return-home questions from owned events with explicit confidence."""
+    actor = _return_home_query_actor(clean_text)
+    if actor is None:
+        return None
+
+    candidates = [
+        event
+        for event in events
+        if str(event.get("event_date") or "") >= today_iso
+        and _calendar_event_owned_by_actor(group_id, event, actor)
+    ]
+    candidates.sort(
+        key=lambda event: (
+            str(event.get("event_date") or ""),
+            str(event.get("event_time") or ""),
+            str(event.get("event_id") or ""),
+        )
+    )
+
+    direct = next(
+        (
+            event
+            for event in candidates
+            if _calendar_event_is_direct_home_return(event, home_city)
+        ),
+        None,
+    )
+    if direct is not None:
+        date_label = _short_calendar_date(direct)
+        title = str(direct.get("title") or f"回{home_city}")
+        return (
+            f"{actor}目前最直接的行程紀錄是 {date_label}「{title}」。\n"
+            f"所以照目前資料，{actor}預計 {date_label} 回到{home_city}；"
+            "沒有記到確切到家時間。"
+        )
+
+    for event in candidates:
+        place = _calendar_event_home_city_evidence(event, home_city)
+        if place is None:
+            continue
+        date_label = _short_calendar_date(event)
+        title = str(event.get("title") or "未命名行程")
+        return (
+            f"目前沒有直接寫{actor}幾點回家。\n"
+            f"但{actor} {date_label} 有「{title}」，可確認是在{home_city}的"
+            f"實體行程（{place}）。\n"
+            f"如果家是{home_city}，依行程推測，{actor}最晚 {date_label} 的這個"
+            f"行程開始前應已回到{home_city}；無法判斷確切到家時間。"
+        )
+
+    return (
+        f"目前能確認是{actor}的未來行程裡，沒有直接寫回家／回{home_city}時間，"
+        f"也沒有足以推斷的{home_city}實體行程，所以暫時無法判斷。"
+    )
 
 
 def _resolve_relative_date(text: str):
@@ -5786,7 +6008,22 @@ def _handle_calendar_query(
             offset = 7  # fallback default
         return _er._format_event(ev, offset)
 
-    if target:
+    home_actor = _return_home_query_actor(clean_text)
+    if home_actor:
+        try:
+            home_events = calendar_db.list_upcoming(group_id, days=90)
+        except Exception as e:
+            logger.warning("return-home calendar query failed: %s", e)
+            reply = "目前暫時讀不到家族行程，無法可靠判斷回家時間。"
+        else:
+            reply = _build_return_home_calendar_reply(
+                group_id,
+                clean_text,
+                home_events,
+                today_tw.isoformat(),
+                home_city=os.getenv("FAMILY_HOME_CITY", "台北").strip() or "台北",
+            ) or "目前行程不足以判斷回家時間。"
+    elif target:
         # branch 1: 具體日期 → past+future 都掃，命中該日的列出
         try:
             past = calendar_db.list_past(group_id, days=90)

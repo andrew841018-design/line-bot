@@ -27,6 +27,7 @@ def test_calendar_query_variations():
         "週六有事嗎",
         "下週六的行程",
         "黃將修去紐西蘭的日期",
+        "米堡，媽媽什麼時候回家",
     ]
     for q in truthy:
         assert main._is_calendar_query(q) is True, f"should match: {q}"
@@ -42,6 +43,10 @@ def test_non_calendar_query_rejected():
         "蛋糕好吃嗎",
         "紐西蘭時間現在幾點",
         "紐西蘭日期格式怎麼寫",
+        "媽媽什麼時候回我訊息",
+        "媽媽何時回覆群組",
+        "媽媽什麼時候回電話",
+        "媽媽何時方便聊天",
         "",
     ]
     for q in falsy:
@@ -346,6 +351,266 @@ def test_handle_calendar_query_finds_hwang_new_zealand_dates(monkeypatch):
     assert "14:30" in captured["text"]
     assert second.isoformat() in captured["text"]
     assert "去紐西蘭" in captured["text"]
+
+
+def test_handle_calendar_query_infers_mom_return_home_from_owned_schedule(
+    monkeypatch,
+):
+    """The real 2026-08-10 failure: 回家 means home-city return, not private-data denial."""
+    import main
+    import calendar_db
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    today = datetime.now(ZoneInfo("Asia/Taipei")).date()
+    return_day = today + timedelta(days=1)
+    taoyuan_day = today + timedelta(days=2)
+    exam_day = today + timedelta(days=3)
+    source_text = (
+        f"我 {return_day.month}/{return_day.day} 晚上回台北 "
+        f"{taoyuan_day.month}/{taoyuan_day.day} 去桃園\n"
+        f"{exam_day.month}/{exam_day.day} 早上看風濕免疫科 "
+        "下午 考選部開國考題庫建置會議"
+    )
+    events = [
+        {
+            "event_id": "return",
+            "group_id": "G1",
+            "title": "晚上回台北",
+            "event_date": return_day.isoformat(),
+            "event_time": "",
+            "location": "",
+            "participants": "[]",
+            "source_msg_id": "mom-schedule",
+            "status": "active",
+        },
+        {
+            "event_id": "taoyuan",
+            "group_id": "G1",
+            "title": "去桃園",
+            "event_date": taoyuan_day.isoformat(),
+            "event_time": "",
+            "location": "",
+            "participants": "[]",
+            "source_msg_id": "mom-schedule",
+            "status": "active",
+        },
+        {
+            "event_id": "exam",
+            "group_id": "G1",
+            "title": "早上看風濕免疫科 下午 考選部開國考題庫建置會議",
+            "event_date": exam_day.isoformat(),
+            "event_time": "",
+            "location": "",
+            "participants": "[]",
+            "source_msg_id": "mom-schedule",
+            "status": "active",
+        },
+    ]
+
+    monkeypatch.setattr(calendar_db, "list_upcoming", lambda *a, **k: events)
+    monkeypatch.setattr(calendar_db, "search_by_title_phrase", lambda *a, **k: [])
+    monkeypatch.setattr(calendar_db, "search_by_keyword", lambda *a, **k: events)
+    monkeypatch.setattr(
+        main.memory,
+        "get_raw_message",
+        lambda gid, mid: ("U_MOM", source_text) if mid == "mom-schedule" else None,
+    )
+    monkeypatch.setattr(
+        main, "_alias_from_user_id", lambda uid: "媽媽" if uid == "U_MOM" else ""
+    )
+    monkeypatch.setattr(main.memory, "append_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_append_bot_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main.settings, "bot_muted", False, raising=False)
+
+    captured: dict = {}
+    _patch_calendar_reply_capture(monkeypatch, main, captured)
+
+    class FakeEvent:
+        reply_token = "fake_token"
+
+    main._handle_calendar_query(FakeEvent(), "G1", "米堡，媽媽什麼時候回家")
+
+    assert f"{return_day.month}/{return_day.day}" in captured["text"]
+    assert "晚上回台北" in captured["text"]
+    assert "媽媽" in captured["text"]
+    assert "目前最直接的行程紀錄" in captured["text"]
+    assert "沒有記到確切到家時間" in captured["text"]
+    assert "無法查詢" not in captured["text"]
+
+
+def test_handle_calendar_query_cautiously_infers_home_by_taipei_commitment(
+    monkeypatch,
+):
+    """A home-city appointment is an upper bound, never an invented arrival time."""
+    import main
+    import calendar_db
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    today = datetime.now(ZoneInfo("Asia/Taipei")).date()
+    exam_day = today + timedelta(days=3)
+    event = {
+        "event_id": "exam",
+        "group_id": "G1",
+        "title": "下午 考選部開國考題庫建置會議",
+        "event_date": exam_day.isoformat(),
+        "event_time": "",
+        "location": "",
+        "participants": "[]",
+        "source_msg_id": "mom-schedule",
+        "status": "active",
+    }
+    source_text = f"我 {exam_day.month}/{exam_day.day} 下午去考選部開會"
+
+    monkeypatch.setattr(calendar_db, "list_upcoming", lambda *a, **k: [event])
+    monkeypatch.setattr(calendar_db, "search_by_title_phrase", lambda *a, **k: [])
+    monkeypatch.setattr(calendar_db, "search_by_keyword", lambda *a, **k: [event])
+    monkeypatch.setattr(
+        main.memory,
+        "get_raw_message",
+        lambda gid, mid: ("U_MOM", source_text),
+    )
+    monkeypatch.setattr(
+        main, "_alias_from_user_id", lambda uid: "媽媽" if uid == "U_MOM" else ""
+    )
+    monkeypatch.setattr(main.memory, "append_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_append_bot_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main.settings, "bot_muted", False, raising=False)
+
+    captured: dict = {}
+    _patch_calendar_reply_capture(monkeypatch, main, captured)
+
+    class FakeEvent:
+        reply_token = "fake_token"
+
+    main._handle_calendar_query(FakeEvent(), "G1", "媽媽何時會回家？")
+
+    assert f"最晚 {exam_day.month}/{exam_day.day}" in captured["text"]
+    assert "考選部" in captured["text"]
+    assert "台北" in captured["text"]
+    assert "依行程推測" in captured["text"]
+    assert "無法判斷確切到家時間" in captured["text"]
+
+
+def test_unaddressed_natural_calendar_question_routes_before_burst(monkeypatch):
+    """A calendar question stays useful even when the family misspells the bot name."""
+    import main
+
+    routed: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(main, "_try_handle_reminder_cancellation", lambda *a: False)
+    monkeypatch.setattr(main, "_try_handle_quoted_calendar_correction", lambda *a: False)
+    monkeypatch.setattr(main, "_extract_gemini_trigger", lambda *a: None)
+    monkeypatch.setattr(main, "_explicit_range_reminder_result", lambda *a: None)
+    monkeypatch.setattr(main, "_try_handle_missed_reminder_repair", lambda *a: False)
+    monkeypatch.setattr(main, "_text_with_quote_context", lambda _m, _g, t: t)
+    monkeypatch.setattr(main.feedback_collector, "in_feedback_window", lambda: False)
+    monkeypatch.setattr(main, "_try_one_shot_reply", lambda *a: False)
+    monkeypatch.setattr(main, "_try_handle_calendar_correction", lambda *a: False)
+    monkeypatch.setattr(main, "_detect_user_correction", lambda *a: None)
+    monkeypatch.setattr(main, "_auto_capture_text_if_important", lambda *a: False)
+    monkeypatch.setattr(main, "_maybe_extract_reminder", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_handle_command", lambda *a: None)
+    monkeypatch.setattr(main, "_is_todo_query", lambda _t: False)
+    monkeypatch.setattr(main, "_is_calendar_query", lambda _t: True)
+    monkeypatch.setattr(
+        main,
+        "_handle_calendar_query",
+        lambda _event, gid, text: routed.append((gid, text)),
+    )
+    monkeypatch.setattr(
+        main.burst_filter,
+        "add_to_burst",
+        lambda *a, **k: pytest.fail("calendar query must not reach burst LLM"),
+    )
+
+    class FakeMessage:
+        id = "m1"
+        text = "米堡，媽媽什麼時候回家"
+        quoted_message_id = None
+
+    class FakeSource:
+        user_id = "U1"
+
+    class FakeEvent:
+        message = FakeMessage()
+        source = FakeSource()
+        reply_token = "token"
+
+    main._handle_text_message(FakeEvent(), "G1")
+
+    assert routed == [("G1", "米堡，媽媽什麼時候回家")]
+
+
+def test_calendar_event_owner_requires_same_group_first_person_source(monkeypatch):
+    import main
+
+    event = {
+        "group_id": "G1",
+        "status": "active",
+        "title": "下午去考選部開會",
+        "participants": "[]",
+        "source_msg_id": "m1",
+    }
+    source_text = "我 8/13 下午去考選部開會"
+    monkeypatch.setattr(
+        main.memory,
+        "get_raw_message",
+        lambda gid, mid: ("U_MOM", source_text) if (gid, mid) == ("G1", "m1") else None,
+    )
+    monkeypatch.setattr(
+        main, "_alias_from_user_id", lambda uid: "媽媽" if uid == "U_MOM" else ""
+    )
+
+    assert main._calendar_event_owned_by_actor("G1", event, "媽媽") is True
+
+    cross_group = dict(event, group_id="G2")
+    assert main._calendar_event_owned_by_actor("G1", cross_group, "媽媽") is False
+
+    monkeypatch.setattr(
+        main.memory, "get_raw_message", lambda gid, mid: ("U_MOM", "8/13 考選部開會")
+    )
+    assert main._calendar_event_owned_by_actor("G1", event, "媽媽") is False
+
+
+def test_calendar_event_explicit_other_person_blocks_sender_owner(monkeypatch):
+    import main
+
+    event = {
+        "group_id": "G1",
+        "status": "active",
+        "title": "爸爸下午去考選部開會",
+        "participants": '["爸爸"]',
+        "source_msg_id": "m1",
+    }
+    monkeypatch.setattr(
+        main.memory,
+        "get_raw_message",
+        lambda gid, mid: ("U_MOM", "我整理爸爸的行程：8/13 去考選部"),
+    )
+    monkeypatch.setattr(
+        main, "_alias_from_user_id", lambda uid: "媽媽" if uid == "U_MOM" else ""
+    )
+
+    assert main._calendar_event_owned_by_actor("G1", event, "媽媽") is False
+    assert main._calendar_event_owned_by_actor("G1", event, "爸爸") is True
+
+
+def test_calendar_home_city_evidence_rejects_remote_commitment():
+    import main
+
+    physical = {
+        "title": "下午去考選部開國考題庫建置會議",
+        "location": "",
+    }
+    remote = {
+        "title": "考選部線上會議",
+        "location": "Zoom",
+    }
+
+    assert main._calendar_event_home_city_evidence(physical, "台北") == "考選部"
+    assert main._calendar_event_home_city_evidence(remote, "台北") is None
 
 
 def test_hwang_new_zealand_query_filters_wrong_phrase_hit(monkeypatch):
