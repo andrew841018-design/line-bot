@@ -2776,7 +2776,17 @@ def _auto_capture_text_if_important(
     """
     if not text or len(text.strip()) < 4 or len(text) > 500:
         return False
-    if reminder_intent.is_obvious_noncommittal_source(text):
+    explicit_reminder_creation = _has_explicit_reminder_creation_intent(text)
+    if _is_negated_reminder_request(text):
+        return False
+    if _is_reported_reminder_statement(text):
+        return False
+    if _is_bare_add_question(text) and not explicit_reminder_creation:
+        return False
+    if (
+        reminder_intent.is_obvious_noncommittal_source(text)
+        and not explicit_reminder_creation
+    ):
         return False
     if not (_AUTO_CAPTURE_DATE_HINT_RE.search(text) and _AUTO_CAPTURE_VERB_RE.search(text)):
         return False
@@ -4750,6 +4760,68 @@ def _handle_text_message(
     if _try_handle_calendar_correction(event, group_id, text):
         return
 
+    # Read-only deterministic queries must run before automatic event/reminder
+    # extraction.  Otherwise a question such as「明天有什麼會議」can consume
+    # Gemini quota—or, on an extractor false positive, create data and reply
+    # with a reminder confirmation instead of answering the query.
+    cmd_reply = _handle_command(
+        group_id,
+        text,
+        sender_user_id,
+        message_id,
+    )
+    if cmd_reply is not None:
+        burst_filter.cancel_burst(group_id)
+        _reply(event.reply_token, cmd_reply, group_id=group_id)
+        return
+
+    poll_reply = (
+        _handle_explicit_poll_text(event, group_id, clean_text)
+        if clean_text is not None
+        else None
+    )
+    if poll_reply is not None:
+        burst_filter.cancel_burst(group_id)
+        _reply(event.reply_token, poll_reply, group_id=group_id)
+        return
+
+    calendar_query_text = clean_text if clean_text is not None else text
+    explicit_reminder_creation = _has_explicit_reminder_creation_intent(text)
+    reported_reminder_statement = _is_reported_reminder_statement(text)
+    if (
+        range_reminder_result is None
+        and not explicit_reminder_creation
+        and not reported_reminder_statement
+        and _is_todo_query(calendar_query_text)
+    ):
+        burst_filter.cancel_burst(group_id)
+        _handle_todo_query(event, group_id, calendar_query_text)
+        return
+
+    if (
+        range_reminder_result is None
+        and not explicit_reminder_creation
+        and not reported_reminder_statement
+        and _is_calendar_query(calendar_query_text)
+    ):
+        burst_filter.cancel_burst(group_id)
+        _handle_calendar_query(event, group_id, calendar_query_text)
+        return
+
+    non_schedule_question = (
+        _is_public_event_discovery_query(calendar_query_text)
+        or _is_travel_duration_question(calendar_query_text)
+    )
+    skip_auto_capture = (
+        non_schedule_question
+        or explicit_reminder_creation
+        or reported_reminder_statement
+    )
+    skip_reminder_extraction = (
+        reported_reminder_statement
+        or (non_schedule_question and not explicit_reminder_creation)
+    )
+
     # Organic 糾正偵測（2026-05-08 加）：user 講「不對 / 你誤會」之類的
     # 自然糾正訊號 → 抓上一輪 user/bot 訊息拼成 correction 寫進 persona_notes
     # 純信號擷取，**不**接管後續路由（用戶可能糾正完還想繼續對話）
@@ -4768,7 +4840,7 @@ def _handle_text_message(
     # 重跑由 UNIQUE INDEX (group_id, title, event_date) 自動 dedup
     calendar_event_captured = False
     calendar_event_blocked = False
-    if range_reminder_result is None:
+    if range_reminder_result is None and not skip_auto_capture:
         auto_capture_result = _auto_capture_text_if_important(
             group_id,
             text,
@@ -4812,7 +4884,9 @@ def _handle_text_message(
         logger.debug("message_classifier skipped: %s", e)
 
     # 自動偵測 reminder；成功、重複或排隊都要明確回覆群組。
-    if calendar_event_captured:
+    if skip_reminder_extraction:
+        reminder_confirmation = None
+    elif calendar_event_captured:
         reminder_confirmation = _format_source_calendar_capture_confirmation(
             group_id,
             message_id,
@@ -4836,43 +4910,6 @@ def _handle_text_message(
             group_id=group_id,
             allow_push_fallback=False,
         )
-        return
-
-    # 1. 指令處理（指令不需要 @mention 也能用，方便管理）
-    cmd_reply = _handle_command(
-        group_id,
-        text,
-        sender_user_id,
-        message_id,
-    )
-    if cmd_reply is not None:
-        # 指令是 explicit 操作 → 取消任何待處理的 burst
-        burst_filter.cancel_burst(group_id)
-        _reply(event.reply_token, cmd_reply, group_id=group_id)
-        return
-
-    # 2. Explicit poll request — only when the user calls the bot.
-    poll_reply = (
-        _handle_explicit_poll_text(event, group_id, clean_text)
-        if clean_text is not None
-        else None
-    )
-    if poll_reply is not None:
-        burst_filter.cancel_burst(group_id)
-        _reply(event.reply_token, poll_reply, group_id=group_id)
-        return
-
-    # 3. 待辦 / 提醒查詢 — deterministic path，不需要 @mention 也能即時查 DB
-    if _is_todo_query(text):
-        burst_filter.cancel_burst(group_id)
-        _handle_todo_query(event, group_id, text)
-        return
-
-    # 3b. 未點名或把「咪寶」打錯時，真正的自然語言行程問句仍直接查本機 DB。
-    # 正確 explicit trigger 留給後面的 _handle_explicit_text，避免同一則回兩次。
-    if clean_text is None and _is_calendar_query(text):
-        burst_filter.cancel_burst(group_id)
-        _handle_calendar_query(event, group_id, text)
         return
 
     # 4. 晚餐推薦觸發
@@ -5026,18 +5063,45 @@ def _handle_image_gen(event: MessageEvent, group_id: str, subject: str) -> None:
     _append_bot_turn(group_id, f"[已生成] {out_path}")
 
 
+_CALENDAR_RELATIVE_DATE_PATTERN = (
+    r"(?:今晚|明晚|明後天|大後天|大前天|今天|明天|後天|昨天|前天|"
+    r"(?:這個|這|本|下個|下)(?:週|周)末|週末|"
+    r"(?:下下|下個|本|這|下)?(?:週|周|星期|禮拜)[一二三四五六日天]|"
+    r"(?:本|這|下|下個|下下)(?:週|周|星期|禮拜))"
+)
+_CALENDAR_ABSOLUTE_DATE_PATTERN = (
+    r"(?:\d{4}[-/.](?:1[0-2]|0?[1-9])[-/.](?:3[01]|[12]\d|0?[1-9])|"
+    r"\d{4}年(?:1[0-2]|0?[1-9])月(?:3[01]|[12]\d|0?[1-9])(?:日|號)|"
+    r"(?:1[0-2]|0?[1-9])/(?:3[01]|[12]\d|0?[1-9])|"
+    r"(?:1[0-2]|0?[1-9])\u6708(?:3[01]|[12]\d|0?[1-9])(?:日|號))"
+)
+_CALENDAR_QUERY_DATE_PATTERN = (
+    rf"(?:{_CALENDAR_RELATIVE_DATE_PATTERN}|{_CALENDAR_ABSOLUTE_DATE_PATTERN})"
+)
+
+
 _CALENDAR_QUERY_RE = re.compile(
     r"("
     # 1. 日期 + 行程動詞（原有）
-    r"(?:今天|明天|後天|昨天|前天|這週末|下週末|下週|本週|週[一二三四五六日天])"
-    r".{0,8}"
-    r"(?:有事|有什麼|幾點|安排|要幹嘛|要做什麼|計畫|計劃|行程)"
+    + _CALENDAR_QUERY_DATE_PATTERN
+    + r".{0,8}"
+    r"(?:有事(?:嗎|呢|？|\?)|要幹嘛|要做什麼|"
+    r"(?:的)?(?:安排|計畫|計劃|行程)"
+    r"(?:是什麼|有哪些|呢|嗎|[？?]|\s*$)|"
+    r"(?:有什麼|有哪些|有沒有)(?:活動|聚會|會議|聚餐|要做的)|"
+    r"有什麼約(?:要去|要赴|需要|嗎|呢)|"
+    r"有(?:活動|聚會|會議|聚餐)"
+    r"(?:(?:要去|要參加|需要參加|需要出席|要準備))?(?:嗎|呢|？|\?)|"
+    r"有什麼(?:事|安排|行程|計畫|計劃|活動|聚會|會議|約|要做的)?"
+    r"(?:嗎|呢)?[？?。！!\s]*$)"
     r"|"
     # 2. 行程動詞 + 日期（原有反向）
-    r"(?:有事|有什麼|幾點|安排|要幹嘛|要做什麼|計畫|計劃|行程)"
+    r"(?:有事(?:嗎|呢|？|\?)|要幹嘛|要做什麼|"
+    r"(?:安排|計畫|計劃|行程)(?:是什麼|有哪些|呢|嗎|[？?])|"
+    r"有什麼(?:事|安排|行程|計畫|計劃|活動|聚會|會議|約|要做的))"
     r".{0,8}"
-    r"(?:今天|明天|後天|昨天|前天|這週末|下週末|下週|本週|週[一二三四五六日天])"
-    r"|"
+    + _CALENDAR_QUERY_DATE_PATTERN
+    + r"|"
     # 3. 無日期：「什麼時候 / 上次 / 之前 / 哪一天 + 名詞動作」(GP1+GP2 反饋 noun anchor)
     r"(?:什麼時候|上次|之前|哪一天|哪天)"
     r".{0,12}"
@@ -5056,6 +5120,375 @@ _CALENDAR_QUERY_RE = re.compile(
     r"(?:什麼時候|哪一天|哪天|上次|之前)"
     r")"
 )
+
+_NON_CALENDAR_GENERIC_QUERY_RE = re.compile(
+    _CALENDAR_QUERY_DATE_PATTERN
+    + r"(?=.{0,24}有什麼)"
+    r"(?=.{0,24}(?:新聞|天氣|氣象|餐廳|推薦|好吃|美食|電影|影城|股票|股市|大盤))"
+)
+_TAIWAN_PUBLIC_EVENT_CITIES = (
+    "台北", "新北", "基隆", "桃園", "新竹", "苗栗", "台中",
+    "彰化", "南投", "雲林", "嘉義", "台南", "高雄", "屏東", "宜蘭",
+    "花蓮", "台東", "澎湖", "金門", "馬祖",
+)
+_NEW_ZEALAND_PUBLIC_EVENT_CITIES = (
+    "奧克蘭", "威靈頓", "基督城", "皇后鎮", "羅托魯瓦", "陶波",
+)
+_PUBLIC_EVENT_CITIES = (
+    "台灣",
+    *_TAIWAN_PUBLIC_EVENT_CITIES,
+    "紐西蘭",
+    *_NEW_ZEALAND_PUBLIC_EVENT_CITIES,
+)
+_PUBLIC_EVENT_CITY_PATTERN = "(?:" + "|".join(_PUBLIC_EVENT_CITIES) + ")"
+_PUBLIC_EVENT_PLACE_PATTERN = (
+    rf"(?:{_PUBLIC_EVENT_CITY_PATTERN}|[\u4e00-\u9fff]{{1,8}}"
+    r"(?:市|縣|區|鎮|鄉|村|島|國))"
+)
+_GENERIC_CALENDAR_PLACE_RE = re.compile(
+    r"[\u4e00-\u9fff]{1,8}(?:市|縣|區|鎮|鄉|村|島|國)"
+)
+_PUBLIC_EVENT_QUERY_RE = re.compile(
+    r"(?:"
+    + _CALENDAR_QUERY_DATE_PATTERN
+    + r".{0,12}"
+    + _PUBLIC_EVENT_PLACE_PATTERN + r"|"
+    + _PUBLIC_EVENT_PLACE_PATTERN
+    + r".{0,12}"
+    + _CALENDAR_QUERY_DATE_PATTERN
+    + r".{0,12})"
+    r".{0,12}(?:(?:有什麼|有哪些)"
+    r"(?:活動|聚會|會議|聚餐|展覽|市集|演出)|"
+    r"(?:有沒有|有)(?:活動|展覽|市集|演出)(?:嗎|呢|[？?])?)"
+)
+_PUBLIC_EVENT_DISCOVERY_RE = re.compile(
+    r"(?:有什麼|有哪些).{0,6}(?:活動|展覽|市集|演出)"
+)
+_PUBLIC_EVENT_NON_PLACE_WORDS_RE = re.compile(
+    r"我們|我|家裡|全家|家族|家庭|我的行程|預計|大概|可能|會|要|"
+    r"今晚|明晚|凌晨|早上|上午|中午|下午|傍晚|晚上|"
+    r"在|去|到|前往|請問|想知道|想查|查詢|幫我查|幫忙查|"
+    r"[\s，,、:：]"
+)
+_PUBLIC_RECOMMENDATION_QUERY_RE = re.compile(
+    _CALENDAR_QUERY_DATE_PATTERN
+    + r".{0,20}(?:有什麼|有哪些)"
+    r".{0,12}(?:活動|聚會|聚餐|展覽|市集|演出)"
+    r".{0,12}(?:適合|推薦|好玩|可以去|可以參加|能參加|可以報名|值得去)"
+)
+_PRIVATE_SCHEDULE_DATE_RE = re.compile(_CALENDAR_QUERY_DATE_PATTERN)
+_CALENDAR_ABSOLUTE_DATE_TOKEN_RE = re.compile(_CALENDAR_ABSOLUTE_DATE_PATTERN)
+_CALENDAR_TRAVEL_ORIGIN_PATTERN = (
+    rf"(?:{_PUBLIC_EVENT_CITY_PATTERN}|家裡|家中|住處|"
+    r"[\u4e00-\u9fff]{1,8}(?:機場|車站|高鐵站|火車站|醫院|公司|學校))"
+)
+_PRIVATE_SCHEDULE_ACTOR_GAP_RE = re.compile(
+    rf"^[，,\s]*(?:(?:預計|大概|可能|會|要|早上|上午|中午|下午|晚上)"
+    rf"[，,\s]*)*(?:在)?(?:{_PUBLIC_EVENT_CITY_PATTERN})?"
+    rf"[，,\s]*(?:(?:早上|上午|中午|下午|晚上)[，,\s]*)*$"
+)
+
+
+def _looks_like_public_event_place_query(text: str) -> bool:
+    """Detect open-ended public discovery with a free-form place token."""
+    discovery = _PUBLIC_EVENT_DISCOVERY_RE.search(text)
+    if discovery is None:
+        return False
+
+    def is_place_fragment(fragment: str) -> bool:
+        cleaned = fragment
+        for term in sorted(_FAMILY_ACTOR_TERMS, key=len, reverse=True):
+            cleaned = cleaned.replace(term, "")
+        cleaned = _PUBLIC_EVENT_NON_PLACE_WORDS_RE.sub("", cleaned)
+        return bool(
+            re.fullmatch(r"[\u4e00-\u9fffA-Za-z·.'-]{2,20}", cleaned)
+        )
+
+    for date_match in _PRIVATE_SCHEDULE_DATE_RE.finditer(text):
+        if date_match.end() <= discovery.start():
+            if is_place_fragment(text[date_match.end():discovery.start()]):
+                return True
+            prefix = text[:date_match.start()]
+            prefix = re.split(r"[。！？!?；;\n]", prefix)[-1]
+            if is_place_fragment(prefix):
+                return True
+    return False
+
+
+def _is_travel_duration_question(text: str) -> bool:
+    return bool(
+        re.search(
+            r"(?:從|由).{1,16}(?:回(?:到)?|返|返回).{0,12}"
+            r"(?:要|需|需要)?多久|"
+            r"(?:回(?:到)?|返|返回).{0,12}"
+            r"(?:車程|路程|交通時間).{0,6}多久",
+            text,
+        )
+    )
+
+
+def _is_public_event_discovery_query(text: str) -> bool:
+    return bool(
+        _PUBLIC_EVENT_QUERY_RE.search(text)
+        or _looks_like_public_event_place_query(text)
+    )
+
+
+def _calendar_query_places(text: str) -> list[str]:
+    generic_places: list[str] = []
+    for match in re.finditer(
+        r"(?:在|去|到|前往)(?P<place>[\u4e00-\u9fffA-Za-z0-9·.-]{2,12}?)"
+        r"(?=(?:有什麼|有哪些|有沒有|有活動|有會議|有聚會|"
+        r"有聚餐|開什麼會|要參加(?:哪些|什麼)會議|要做什麼))",
+        text,
+    ):
+        place = re.sub(
+            r"(?:今晚|明晚|凌晨|早上|上午|中午|下午|傍晚|晚上)$",
+            "",
+            match.group("place"),
+        )
+        if place:
+            generic_places.append(place)
+    for match in re.finditer(
+        rf"(?:在|去|到|前往)(?P<place>{_GENERIC_CALENDAR_PLACE_RE.pattern})",
+        text,
+    ):
+        generic_places.append(match.group("place"))
+
+    query_match = re.search(r"有什麼|有哪些|有沒有", text)
+    for date_match in _PRIVATE_SCHEDULE_DATE_RE.finditer(text):
+        if query_match and date_match.end() <= query_match.start():
+            middle = text[date_match.end():query_match.start()]
+            for term in sorted(_FAMILY_ACTOR_TERMS, key=len, reverse=True):
+                middle = middle.replace(term, "")
+            middle = re.sub(
+                r"我們|我的行程|預計|大概|可能|早上|上午|中午|下午|"
+                r"晚上|在|去|到|前往|[\s，,、]",
+                "",
+                middle,
+            )
+            if _GENERIC_CALENDAR_PLACE_RE.fullmatch(middle):
+                generic_places.append(middle)
+
+    places = list(dict.fromkeys(generic_places))
+    for pois in _HOME_CITY_POIS.values():
+        for poi in pois:
+            if re.search(rf"(?:在|去|到|前往){re.escape(poi)}", text):
+                places.append(poi)
+    for known_place in _PUBLIC_EVENT_CITIES:
+        if known_place not in text:
+            continue
+        if any(known_place in generic_place for generic_place in generic_places):
+            continue
+        places.append(known_place)
+    return sorted(set(places), key=lambda place: (-len(place), place))
+
+
+def _has_private_family_schedule_cue(text: str) -> bool:
+    """Require a family actor to be grammatically tied to the dated schedule."""
+    if re.search(r"我的行程|家裡|全家|家族|家庭行程|家族行程", text):
+        return True
+    actor_mentions = _family_actors_in_text(text)
+    actor_mentions.extend(
+        (match.start(), match.end(), "我們")
+        for match in re.finditer(r"我們", text)
+    )
+    date_mentions = list(_PRIVATE_SCHEDULE_DATE_RE.finditer(text))
+    for actor_start, actor_end, _actor in actor_mentions:
+        for date_match in date_mentions:
+            if actor_end <= date_match.start():
+                gap = text[actor_end:date_match.start()]
+            elif date_match.end() <= actor_start:
+                gap = text[date_match.end():actor_start]
+            else:
+                return True
+            if _PRIVATE_SCHEDULE_ACTOR_GAP_RE.fullmatch(gap):
+                return True
+    return False
+
+
+def _calendar_query_subject_actors(text: str) -> set[str]:
+    """Return the nearest queried actor(s), excluding reporters and beneficiaries."""
+    mentions = _family_actors_in_text(text)
+    query_match = re.search(
+        r"有什麼|有哪些|有沒有|有(?:活動|聚會|會議|聚餐).{0,6}(?:嗎|呢|[？?])",
+        text,
+    )
+    if query_match:
+        modality_subject = re.search(
+            r"(?:需要|要)(?P<subject>.{0,24}?)(?:出席|參加|去)",
+            text[query_match.end():],
+        )
+        if modality_subject:
+            modality_actors = {
+                actor
+                for _start, _end, actor in _family_actors_in_text(
+                    modality_subject.group("subject")
+                )
+            }
+            if modality_actors:
+                return modality_actors
+        post_mentions = [
+            mention for mention in mentions if mention[0] >= query_match.end()
+        ]
+        for seed_index in range(len(post_mentions) - 1, -1, -1):
+            seed = post_mentions[seed_index]
+            after_actor = text[seed[1]:]
+            if not re.match(
+                r"[，,\s]*(?:要去|會去|將去|去|要參加|會參加|參加|"
+                r"需要參加|需要出席|要出席|會出席|出席)(?:的)?",
+                after_actor,
+            ):
+                continue
+            selected = [seed]
+            left_index = seed_index - 1
+            joint_left = seed
+            while left_index >= 0:
+                previous = post_mentions[left_index]
+                connector = text[previous[1]:joint_left[0]]
+                if not re.fullmatch(r"\s*(?:和|跟|與|及|、)\s*", connector):
+                    break
+                selected.append(previous)
+                joint_left = previous
+                left_index -= 1
+            before_first = text[query_match.end():joint_left[0]]
+            if re.search(r"(?:是|由)?[，,\s]*$", before_first):
+                return {mention[2] for mention in selected}
+
+    date_mentions = list(_PRIVATE_SCHEDULE_DATE_RE.finditer(text))
+    tied_mentions: list[tuple[int, int, str]] = []
+    for mention in mentions:
+        for date_match in date_mentions:
+            if mention[1] <= date_match.start():
+                gap = text[mention[1]:date_match.start()]
+            elif date_match.end() <= mention[0]:
+                gap = text[date_match.end():mention[0]]
+            else:
+                gap = ""
+            if _PRIVATE_SCHEDULE_ACTOR_GAP_RE.fullmatch(gap):
+                tied_mentions.append(mention)
+                break
+    if not tied_mentions:
+        return set()
+    nearest = tied_mentions[-1]
+    selected = [nearest]
+    query_start = query_match.start() if query_match else len(text)
+    before_query = [mention for mention in mentions if mention[1] <= query_start]
+    nearest_index = before_query.index(nearest)
+    joint_left = nearest
+    for previous in reversed(before_query[:nearest_index]):
+        connector = text[previous[1]:joint_left[0]]
+        if not re.fullmatch(r"\s*(?:和|跟|與|及|、)\s*", connector):
+            break
+        selected.append(previous)
+        joint_left = previous
+    joint_right = nearest
+    for following in before_query[nearest_index + 1:]:
+        connector = text[joint_right[1]:following[0]]
+        if not re.fullmatch(r"\s*(?:和|跟|與|及|、)\s*", connector):
+            break
+        selected.append(following)
+        joint_right = following
+    if query_match and re.search(
+        r"問|想知道|想查|查詢|幫.{0,6}查|請問",
+        text[nearest[1]:query_match.start()],
+    ):
+        return set()
+    return {mention[2] for mention in selected}
+
+
+def _calendar_query_is_first_person_subject(text: str) -> bool:
+    """Whether singular「我」is grammatically tied to the dated schedule query."""
+    query_match = re.search(r"有什麼|有哪些|有沒有", text)
+    if not query_match:
+        return False
+    if re.search(
+        r"(?:有什麼|有哪些|有沒有).{0,12}(?:是|由)?[，,\s]*我"
+        r"[，,\s]*(?:要去|會去|將去|去|要參加|會參加|參加|"
+        r"需要參加|需要出席|要出席|會出席|出席)(?:的)?",
+        text,
+    ):
+        return True
+    if re.search(
+        r"(?:有什麼|有哪些|有沒有).{0,16}(?:需要|要)"
+        r".{0,12}我.{0,12}(?:出席|參加|去)",
+        text,
+    ):
+        return True
+    pronouns = list(re.finditer(r"我(?!們)", text[:query_match.start()]))
+    dates = list(_PRIVATE_SCHEDULE_DATE_RE.finditer(text[:query_match.start()]))
+    for pronoun in pronouns:
+        for date_match in dates:
+            if pronoun.end() <= date_match.start():
+                gap = text[pronoun.end():date_match.start()]
+            elif date_match.end() <= pronoun.start():
+                gap = text[date_match.end():pronoun.start()]
+            else:
+                gap = ""
+            actor_terms = "|".join(
+                re.escape(term)
+                for term in sorted(_FAMILY_ACTOR_TERMS, key=len, reverse=True)
+                if term != "全家"
+            )
+            joint_gap = re.fullmatch(
+                rf"[，,\s]*(?:(?:和|跟|與|及|、)[，,\s]*"
+                rf"(?:{actor_terms})[，,\s]*)+",
+                gap,
+            )
+            if not (
+                _PRIVATE_SCHEDULE_ACTOR_GAP_RE.fullmatch(gap)
+                or re.fullmatch(r"[，,\s]*的行程[，,\s]*", gap)
+                or joint_gap
+            ):
+                continue
+            if re.search(
+                r"問|想知道|想查|查詢|請問",
+                text[pronoun.end():query_match.start()],
+            ):
+                continue
+            return True
+    return False
+
+
+def _calendar_query_first_person_joint_actors(text: str) -> set[str]:
+    """Named family members joined with singular「我」in the queried subject."""
+    query_match = re.search(r"有什麼|有哪些|有沒有", text)
+    query_start = query_match.start() if query_match else len(text)
+    nodes: list[tuple[int, int, str | None]] = [
+        (start, end, actor)
+        for start, end, actor in _family_actors_in_text(text[:query_start])
+    ]
+    nodes.extend(
+        (match.start(), match.end(), None)
+        for match in re.finditer(r"我(?!們)", text[:query_start])
+    )
+    nodes.sort(key=lambda item: item[0])
+    connector_re = re.compile(r"\s*(?:和|跟|與|及|、)\s*")
+    actors: set[str] = set()
+    for self_index, node in enumerate(nodes):
+        if node[2] is not None:
+            continue
+        left = self_index - 1
+        current = node
+        while left >= 0:
+            previous = nodes[left]
+            if not connector_re.fullmatch(text[previous[1]:current[0]]):
+                break
+            if previous[2]:
+                actors.add(previous[2])
+            current = previous
+            left -= 1
+        right = self_index + 1
+        current = node
+        while right < len(nodes):
+            following = nodes[right]
+            if not connector_re.fullmatch(text[current[1]:following[0]]):
+                break
+            if following[2]:
+                actors.add(following[2])
+            current = following
+            right += 1
+    return actors
 
 
 # 名詞 keyword whitelist — branch 2 fallback：text 含這些 keyword → search_by_keyword
@@ -5103,6 +5536,71 @@ def _extract_verb_noun_pairs(text: str) -> list[tuple[str, str]]:
 # 未來指向關鍵字 — 「什麼時候/哪一天/何時」預設只看未來
 _FUTURE_LEANING_RE = re.compile(r"(?:什麼時候|哪一天|哪天|何時|什麼日子)")
 _PAST_LEANING_RE = re.compile(r"(?:上次|之前|上回|前一次|何時.{0,3}過)")
+_HOME_WORD_SUFFIX_GUARD = r"(?!樂福|庭|族|事|用|具|人|政|禽|畜|教|鄉|長)"
+_CALENDAR_TIMING_QUERY_RE = re.compile(
+    rf"什麼時候|什麼時間|哪一天|哪天|何時|幾點|幾時|多久|何日|"
+    rf"上次|之前|幾號|(?:的)?日期(?:是什麼|呢|嗎|[？?]|\s*$)|"
+    rf"(?:回來|回(?:到)?家{_HOME_WORD_SUFFIX_GUARD}|"
+    rf"到(?:達)?家{_HOME_WORD_SUFFIX_GUARD})(?:的)?(?:時間|日期)"
+    rf"(?:是)?(?:什麼時候|什麼時間|幾點|幾時|何時|"
+    rf"哪天|哪一天|幾號|呢|嗎|[？?])"
+)
+
+
+def _home_city_arrival_query_match(text: str, home_city: str) -> re.Match | None:
+    city = re.escape(home_city)
+    return re.search(
+        rf"(?:(?:什麼時候|什麼時間|何時|幾點|幾時)"
+        rf"[\s，,、:：]*(?:(?:才|預計|大概|可能|會|能|可以|搭車|"
+        rf"坐車|開車|搭高鐵|搭火車|搭飛機|"
+        rf"(?:從|由){_CALENDAR_TRAVEL_ORIGIN_PATTERN})[\s，,、:：]*)*"
+        rf"(?:到達|抵達|到){city}|"
+        rf"(?:到達|抵達|到){city}[\s，,、:：]*(?:是)?"
+        rf"(?:幾點|何時|什麼時候|什麼時間))",
+        text,
+    )
+
+
+def _home_return_yes_no_query_match(
+    text: str,
+    home_city: str,
+) -> re.Match | None:
+    city = re.escape(home_city)
+    movement = (
+        rf"(?:回(?:到)?|返|返回){city}|"
+        rf"回來|"
+        rf"(?:回(?:到)?|返)家{_HOME_WORD_SUFFIX_GUARD}|"
+        rf"到(?:達)?家{_HOME_WORD_SUFFIX_GUARD}"
+    )
+    confirmation_tail = (
+        r"(?:\s*(?:了)?(?:嗎|呢|吧|沒)[？?]?|"
+        r"\s*[，,]?\s*(?:是嗎|沒錯吧|好嗎|對嗎|對吧|對不對|是不是)"
+        r"[？?]?|\s*[？?])"
+    )
+    modal_movement = (
+        rf"(?:是否|是不是|會不會|能不能(?:夠)?|要不要|可不可以|可否|"
+        rf"有沒有(?:辦法)?)[^，,；;。]{{0,8}}(?:{movement})|"
+        rf"回不回(?:得)?(?:{city}|家|來|去)"
+    )
+    direct_match = re.search(
+        rf"(?:(?:{movement}){confirmation_tail}|"
+        rf"(?:{modal_movement})(?:{confirmation_tail})?)\s*$",
+        text or "",
+    )
+    if direct_match is not None:
+        return direct_match
+    short_question = re.search(
+        rf"(?:{movement})(?P<tail>[^，,；;。]{{0,8}})[？?]\s*$",
+        text or "",
+    )
+    if short_question is None:
+        return None
+    if re.search(
+        r"什麼|哪|幾|怎麼|如何|誰|多少|為什麼|吃|去哪|做什麼",
+        short_question.group("tail"),
+    ):
+        return None
+    return short_question
 
 
 def _is_calendar_query(text: str) -> bool:
@@ -5117,18 +5615,97 @@ def _is_calendar_query(text: str) -> bool:
     """
     if not text:
         return False
+    if (
+        re.search(r"^(?:你)?記得", text)
+        and re.search(r"(?:嗎|呢|[？?])\s*$", text)
+        and _PRIVATE_SCHEDULE_DATE_RE.search(text)
+        and _family_actors_in_text(text)
+        and re.search(r"開會|會議|看診|就醫|上課|上班|活動|行程", text)
+    ):
+        return True
+    if _is_travel_duration_question(text):
+        return False
+    if _NON_CALENDAR_GENERIC_QUERY_RE.search(text):
+        return False
+    if _PUBLIC_RECOMMENDATION_QUERY_RE.search(text):
+        return False
+    if _is_public_event_discovery_query(text):
+        query_subjects = _calendar_query_subject_actors(text)
+        first_person_subject = _calendar_query_is_first_person_subject(text)
+        query_marker = re.search(r"有什麼|有哪些|有沒有", text)
+        reporter_intent = bool(
+            query_marker
+            and re.search(
+                r"問|想知道|想查|查詢|幫.{0,6}查|請問",
+                text[:query_marker.start()],
+            )
+        )
+        private_schedule = (
+            bool(query_subjects)
+            or first_person_subject
+            or (
+                _has_private_family_schedule_cue(text)
+                and not reporter_intent
+            )
+        )
+        if not private_schedule:
+            return False
+    else:
+        private_schedule = (
+            _has_private_family_schedule_cue(text)
+            or bool(_calendar_query_subject_actors(text))
+            or _calendar_query_is_first_person_subject(text)
+        )
+    if (
+        private_schedule
+        and _PRIVATE_SCHEDULE_DATE_RE.search(text)
+        and re.search(
+            r"(?:有什麼|有哪些|有沒有).{0,8}"
+            r"(?:活動|聚會|會議|聚餐|行程|安排|計畫|計劃|要做的)",
+            text,
+        )
+    ):
+        return True
+    if _PRIVATE_SCHEDULE_DATE_RE.search(text) and re.search(
+        r"開什麼會|要參加(?:哪些|什麼)會議|"
+        r"(?:哪些|什麼)會議要參加",
+        text,
+    ):
+        return True
     if _CALENDAR_QUERY_RE.search(text):
         return True
     # 二段 fallback：問句詞 + 行程動作 phrase
-    query_marker = re.search(r"什麼時候|哪一天|哪天|何時|上次|之前|日期|時間|幾號", text)
+    query_marker = _CALENDAR_TIMING_QUERY_RE.search(text)
     if query_marker and _QUERY_PHRASE_RE.search(text):
+        return True
+    if query_marker and re.search(
+        r"出門|上班|上課|開會|看診|就醫|報到|聚餐|出差|旅行",
+        text,
+    ):
+        return True
+    configured_home_city = os.getenv("FAMILY_HOME_CITY", "台北").strip() or "台北"
+    if _return_home_query_actor(text, configured_home_city) is not None:
+        return True
+    if (
+        query_marker
+        and _family_actors_in_text(text)
+        and (
+            re.search(
+                rf"(?:回(?:到)?|回來|返|返回){re.escape(configured_home_city)}",
+                text,
+            )
+            or _home_city_arrival_query_match(text, configured_home_city)
+        )
+    ):
         return True
     if query_marker and any(kw in text for kw in _QUERY_NOUN_KEYWORDS):
         person_terms = ("媽媽", "爸爸", "姊姊", "妹妹", "弟弟", "爺爺", "奶奶", "黃將修")
         trip_terms = ("紐西蘭", "奧克蘭")
         trip_intent = re.search(
-            r"去|前往|出發|返台|返家|回國|回來|"
-            r"回(?:到)?(?:家|台北|新北|台中|台南|高雄|花蓮|宜蘭|新竹|"
+            rf"去|前往|出發|返台|返家{_HOME_WORD_SUFFIX_GUARD}|回國|回來|"
+            rf"到(?:達)?家{_HOME_WORD_SUFFIX_GUARD}|"
+            rf"回(?:到)?家{_HOME_WORD_SUFFIX_GUARD}|"
+            r"回(?:到)?(?:台北|新北|桃園|台中|台南|高雄|花蓮|宜蘭|新竹|"
             r"苗栗|嘉義|屏東|台東|老家)|"
             r"班機|機場|接送|行程|旅程|旅行|北上|南下",
             text,
@@ -5172,29 +5749,380 @@ def _filter_calendar_events_by_person_and_topic(
     ]
 
 
-_RETURN_HOME_QUERY_RE = re.compile(r"(?:回|返|到)(?:到)?家|回來")
-_RETURN_HOME_DIRECT_RE_TEMPLATE = (
-    r"(?:回|返|返回|回到){city}|返台|回家|返家"
-)
-_REMOTE_EVENT_RE = re.compile(
-    r"線上|視訊|遠端|電話會議|[Zz]oom|[Tt]eams|Google\s*Meet"
-)
-_HOME_CITY_POIS: dict[str, tuple[str, ...]] = {
-    "台北": ("考選部",),
+_CALENDAR_DAYPART_RANGES: dict[str, tuple[int, int]] = {
+    "凌晨": (0, 359),
+    "早上": (300, 719),
+    "上午": (300, 719),
+    "中午": (660, 839),
+    "下午": (720, 1079),
+    "傍晚": (1020, 1199),
+    "晚上": (1080, 1439),
+    "今晚": (1080, 1439),
+    "明晚": (1080, 1439),
 }
 
 
-def _return_home_query_actor(text: str) -> str | None:
-    """Return the named family member for a natural-language return-home query."""
-    if not text or not _RETURN_HOME_QUERY_RE.search(text):
-        return None
-    if not re.search(r"什麼時候|何時|哪一天|哪天|幾時|多久|何日", text):
-        return None
-    for term in sorted(_FAMILY_ACTOR_TERMS, key=len, reverse=True):
-        if term == "全家" or term not in text:
-            continue
-        return _normalize_family_actor(term)
+def _calendar_query_daypart(text: str) -> str | None:
+    for daypart in ("今晚", "明晚", "凌晨", "早上", "上午", "中午", "下午", "傍晚", "晚上"):
+        if daypart in text:
+            return daypart
     return None
+
+
+def _calendar_event_matches_query_daypart(event: dict, daypart: str) -> bool:
+    event_time = str(event.get("event_time") or "").strip()
+    if re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", event_time):
+        hour, minute = (int(part) for part in event_time.split(":"))
+        value = hour * 60 + minute
+        start, end = _CALENDAR_DAYPART_RANGES[daypart]
+        return start <= value <= end
+    haystack = " ".join(
+        str(event.get(key) or "") for key in ("title", "location")
+    )
+    return daypart in haystack
+
+
+def _filter_calendar_events_by_query_topic(
+    events: list[dict],
+    text: str,
+) -> list[dict]:
+    verb_noun_pairs = _extract_verb_noun_pairs(text)
+    if verb_noun_pairs:
+        return [
+            event
+            for event in events
+            if any(
+                re.search(
+                    rf"{re.escape(verb)}.{{0,16}}{re.escape(noun)}",
+                    " ".join(
+                        str(event.get(key) or "")
+                        for key in ("title", "location", "participants")
+                    ),
+                )
+                for verb, noun in verb_noun_pairs
+            )
+        ]
+    topic_mappings = (
+        (("會議", "開會", "開什麼會"), ("會議", "開會")),
+        (("聚會",), ("聚會",)),
+        (("聚餐",), ("聚餐", "吃飯")),
+        (("看診",), ("看診", "看醫生", "看牙醫", "就醫")),
+        (("出門",), ("出門",)),
+        (("上班",), ("上班",)),
+        (("上課",), ("上課",)),
+    )
+    for query_terms, event_terms in topic_mappings:
+        if any(term in text for term in query_terms):
+            return [
+                event
+                for event in events
+                if _calendar_event_has_any(event, list(event_terms))
+            ]
+    return events
+
+
+def _filter_calendar_events_by_owned_actors(
+    group_id: str,
+    events: list[dict],
+    actors: list[str],
+    raw_cache: dict[str, tuple[str | None, str, int | None] | None],
+) -> list[dict]:
+    normalized_actors = {
+        _normalize_family_actor(actor) for actor in actors if actor
+    }
+    if not normalized_actors:
+        return events
+    return [
+        event
+        for event in events
+        if any(
+            _calendar_event_owned_by_actor(
+                group_id,
+                event,
+                actor,
+                raw_cache=raw_cache,
+            )
+            for actor in normalized_actors
+        )
+    ]
+
+
+_RETURN_HOME_QUERY_RE = re.compile(
+    rf"(?:回(?:到)?|返|到(?:達)?)家{_HOME_WORD_SUFFIX_GUARD}"
+)
+_RETURN_HOME_BARE_COMEBACK_SUFFIX = (
+    r"(?=(?:了|呢|嗎|吧|喔|哦|啊|呀|啦|嘛|欸|耶|齁)?"
+    r"[\s，,。；;！？!?]*$)"
+)
+_RETURN_HOME_BARE_COMEBACK_CLAUSE_BOUNDARY = (
+    r"(?=(?:了|呢|嗎|吧|喔|哦|啊|呀|啦|嘛|欸|耶|齁)?"
+    r"(?:[\s，,。；;！？!?]|後|之後|再|然後|接著|隨後|$))"
+)
+_RETURN_HOME_BARE_COMEBACK_RE = re.compile(
+    r"回來" + _RETURN_HOME_BARE_COMEBACK_SUFFIX
+)
+_RETURN_HOME_REVERSE_QUERY_RE = re.compile(
+    rf"(?:回來|回(?:到)?家{_HOME_WORD_SUFFIX_GUARD}|"
+    rf"到(?:達)?家{_HOME_WORD_SUFFIX_GUARD})(?:的)?(?:時間|日期)"
+    rf"(?:是)?[　\s，,、]*(?:什麼時候|什麼時間|幾點|幾時|"
+    rf"何時|哪天|哪一天|幾號|呢|嗎|[？?])"
+)
+_CALENDAR_SELF_ACTOR = "__calendar_self__"
+_CALENDAR_AMBIGUOUS_ACTOR = "__calendar_ambiguous__"
+_RETURN_HOME_UNCERTAINTY_PATTERN = (
+    r"(?:尚未決定|未決定|尚未|還未|未能|未(?!來)|還沒|"
+    r"暫無|尚無|是否|可能|也許|應該|"
+    r"大概(?!\s*(?:凌晨|早上|上午|中午|下午|傍晚|晚上|今晚|"
+    r"\d{{1,2}}(?:點|[:：]\d{{2}})))|或許|"
+    r"無法|拒絕|放棄|暫不|"
+    r"(?<!不是)不(?!過|只|但|僅|是|得不)|沒有|沒|取消|改天)"
+)
+_RETURN_HOME_DIRECT_RE_TEMPLATE = (
+    r"(?:後|完(?:(?!"
+    + _RETURN_HOME_UNCERTAINTY_PATTERN
+    + r")[^，,；;。]){{0,4}}|再|就)[\s，,、]*"
+    r"(?:回到|返回|回|返){city}|"
+    r"(?:^|[\s，,、；;。]|預計|預定|預備|計畫|將|會|要|"
+    r"準備|確定|決定|打算|即將|"
+    r"結束後|之後|吃完飯|用完餐|完|再|就|"
+    r"已|終於|早上|上午|中午|下午|"
+    r"晚上|今晚|今天|明天|後天|我|媽媽|爸爸|姊姊|姐姐|妹妹|弟弟|"
+    r"哥哥|爺爺|奶奶|搭車|開車|坐車|搭高鐵|搭火車|"
+    r"搭飛機|搭計程車|坐高鐵|坐火車|坐飛機|坐計程車|"
+    r"前往|接|送|陪|帶)"
+    r"[\s，,、]*(?:回到|回來|返回|回|返){city}|"
+    r"(?:從|由)[^，,；;。]{{1,12}}(?:回到|返回|回|返){city}|"
+    r"(?:從|由)(?:"
+    + _PUBLIC_EVENT_CITY_PATTERN
+    + r"|家裡|家中|住處|[\u4e00-\u9fff]+(?:機場|車站|高鐵站|"
+    r"火車站|醫院|公司|學校))"
+    r"(?:(?:搭|坐)(?:車|高鐵|火車|飛機|計程車))?"
+    r"(?:到達|抵達|到){city}|"
+    r"(?:到達|抵達){city}|"
+    r"(?:^|[\s，,、；;。]|預計|預定|預備|計畫|將|會|要|準備|確定|"
+    r"決定|打算|即將|已|終於|早上|上午|中午|下午|"
+    r"晚上|今晚|今天|明天|後天|我|媽媽|爸爸|姊姊|姐姐|妹妹|弟弟|"
+    r"哥哥|爺爺|奶奶|搭車|開車|坐車|搭高鐵|搭火車|搭飛機|"
+    r"搭計程車|坐高鐵|坐火車|坐飛機|坐計程車|前往)"
+    r"[\s，,、]*到{city}|"
+    r"(?:^|[\s，,、；;。]|預計|預定|預備|計畫|將|會|要|準備|確定|"
+    r"決定|打算|即將|已|終於|早上|上午|中午|下午|"
+    r"晚上|今晚|今天|明天|後天|我|媽媽|爸爸|姊姊|姐姐|妹妹|弟弟|"
+    r"哥哥|爺爺|奶奶)[\s，,、]*回來"
+    + _RETURN_HOME_BARE_COMEBACK_CLAUSE_BOUNDARY
+    + r"|"
+    rf"(?:回家|返家|到(?:達)?家){_HOME_WORD_SUFFIX_GUARD}"
+)
+_REMOTE_EVENT_RE = re.compile(
+    r"線上|視訊|遠端|電話會議|電話(?:參加|加入|連線)|語音(?:參加|加入|連線)|"
+    r"(?:電話|打電話|語音|line語音|用line).{0,8}(?:討論|開會|會議|參加|加入|連線)|"
+    r"(?:討論|開會|會議).{0,8}(?:電話|語音|line)|"
+    r"https?://|zoom|teams|google\s*meet|webex|meet\.jit",
+    re.IGNORECASE,
+)
+_CALENDAR_OWNERSHIP_ACTION_RE = re.compile(
+    r"前往|抵達|到達|回到|返回|參加|出席|報到|開會|就醫|看診|"
+    r"看(?:醫生|牙醫|[^，,；;。]{0,10}科)|"
+    r"做(?:胃鏡|大腸鏡|健康檢查|體檢|手術|健檢)|"
+    r"(?<!提|講|說|談|寫|找)到(?=台灣|台北|新北|桃園|台中|台南|高雄|"
+    r"花蓮|宜蘭|新竹|苗栗|嘉義|屏東|台東|紐西蘭|奧克蘭|考選部|機場)|"
+    r"去|回|返|抽血|聚餐|旅行|出差"
+)
+_SOURCE_DATE_TOKEN_RE = re.compile(
+    r"(?<!\d)(?:(?P<year>\d{4})[-/.])?"
+    r"(?P<month>1[0-2]|0?[1-9])(?:[-/.]|月)"
+    r"(?P<day>3[01]|[12]\d|0?[1-9])(?:日)?"
+)
+_SOURCE_RELATIVE_DATE_TOKEN_RE = re.compile(_CALENDAR_RELATIVE_DATE_PATTERN)
+_HOME_CITY_POIS: dict[str, tuple[str, ...]] = {
+    "台北": ("考選部",),
+}
+_CALENDAR_RAW_MISSING = object()
+
+
+def _return_home_query_actor(text: str, home_city: str = "台北") -> str | None:
+    """Return the named family member for a natural-language return-home query."""
+    query_text = text or ""
+    home_matches: list[re.Match] = []
+    home_matches.extend(_RETURN_HOME_REVERSE_QUERY_RE.finditer(query_text))
+    home_matches.extend(_RETURN_HOME_QUERY_RE.finditer(query_text))
+    if home_city:
+        home_matches.extend(
+            re.finditer(
+                rf"(?:回(?:到)?|回來|返|返回){re.escape(home_city)}",
+                query_text,
+            )
+        )
+        arrival_match = _home_city_arrival_query_match(query_text, home_city)
+        if arrival_match is not None:
+            home_matches.append(arrival_match)
+    yes_no_match = _home_return_yes_no_query_match(query_text, home_city)
+    if yes_no_match is not None:
+        home_matches.append(yes_no_match)
+    home_matches.extend(_RETURN_HOME_BARE_COMEBACK_RE.finditer(query_text))
+    home_matches.extend(
+        re.finditer(
+            r"回來[\s，,、]*(?:的)?(?:時間)?(?:是)?[\s，,、]*"
+            r"(?:幾點|幾時|何時|什麼時候|什麼時間)",
+            query_text,
+        )
+    )
+    home_match = max(home_matches, key=lambda match: match.start(), default=None)
+    if not home_match:
+        return None
+    if (
+        not _CALENDAR_TIMING_QUERY_RE.search(query_text)
+        and not _home_return_yes_no_query_match(query_text, home_city)
+    ):
+        return None
+
+    # Bind the actor to the movement proposition that is actually being asked.
+    # A later statement about someone else must not override an earlier question.
+    for clause_match in reversed(
+        list(re.finditer(r"[^。！？!?；;\n]+(?:[。！？!?；;\n]+|$)", query_text))
+    ):
+        clause_text = clause_match.group(0).strip()
+        timing_matches = list(_CALENDAR_TIMING_QUERY_RE.finditer(clause_text))
+        clause_yes_no = _home_return_yes_no_query_match(clause_text, home_city)
+        if not timing_matches and clause_yes_no is None:
+            continue
+        clause_candidates = [
+            candidate
+            for candidate in home_matches
+            if clause_match.start() <= candidate.start() < clause_match.end()
+        ]
+        if not clause_candidates:
+            continue
+        if clause_yes_no is not None:
+            home_match = max(clause_candidates, key=lambda match: match.start())
+            break
+        marker = timing_matches[-1]
+        marker_start = clause_match.start() + marker.start()
+        marker_end = clause_match.start() + marker.end()
+
+        def marker_distance(candidate: re.Match) -> int:
+            if candidate.end() <= marker_start:
+                return marker_start - candidate.end()
+            if marker_end <= candidate.start():
+                return candidate.start() - marker_end
+            return 0
+
+        home_match = min(
+            clause_candidates,
+            key=lambda match: (marker_distance(match), -match.start()),
+        )
+        break
+
+    nodes: list[tuple[int, int, str]] = list(_family_actors_in_text(query_text))
+    nodes.extend(
+        (match.start(), match.end(), _CALENDAR_SELF_ACTOR)
+        for match in re.finditer(r"我(?!們)", query_text)
+    )
+    pronouns = [
+        match
+        for match in re.finditer(r"她|他", query_text)
+        if match.end() <= home_match.start()
+    ]
+    if pronouns:
+        pronoun = pronouns[-1]
+        named_before_pronoun = {
+            actor
+            for start, end, actor in _family_actors_in_text(query_text)
+            if end <= pronoun.start()
+        }
+        compatible_actors = (
+            {"媽媽", "姊姊", "黃聖雅", "奶奶"}
+            if pronoun.group(0) == "她"
+            else {"爸爸", "弟弟", "哥哥", "爺爺", "黃聖穎", "黃將修"}
+        )
+        compatible_mentions = named_before_pronoun & compatible_actors
+        if len(compatible_mentions) == 1:
+            return next(iter(compatible_mentions))
+        return None
+    preceding = [node for node in nodes if node[1] <= home_match.start()]
+    if preceding:
+        latest_by_actor = {node[2]: node for node in preceding}
+        distinct_preceding = sorted(
+            latest_by_actor.values(), key=lambda node: node[0]
+        )
+        nearest = distinct_preceding[-1]
+        if len(distinct_preceding) >= 2:
+            previous = distinct_preceding[-2]
+            connector = query_text[previous[1]:nearest[0]]
+            if re.fullmatch(r"[\s，,、]*(?:和|跟|與|及|或|還是|、)[\s，,、]*", connector):
+                return _CALENDAR_AMBIGUOUS_ACTOR
+        return nearest[2]
+
+    unique_actors = {node[2] for node in nodes}
+    if len(unique_actors) == 1:
+        return next(iter(unique_actors))
+    return None
+
+
+def _calendar_nondated_query_subjects(text: str) -> tuple[set[str], bool]:
+    """Resolve named/self subjects for timing queries without a date anchor."""
+    timing_matches = list(_CALENDAR_TIMING_QUERY_RE.finditer(text))
+    timing_match = timing_matches[-1] if timing_matches else None
+    all_nodes: list[tuple[int, int, str]] = list(_family_actors_in_text(text))
+    all_nodes.extend(
+        (match.start(), match.end(), _CALENDAR_SELF_ACTOR)
+        for match in re.finditer(r"我(?!們)", text)
+    )
+    all_nodes.sort(key=lambda node: node[0])
+    nodes: list[tuple[int, int, str]] = []
+    if timing_match:
+        pre_nodes = [
+            node for node in all_nodes if node[1] <= timing_match.start()
+        ]
+        action_match = _QUERY_PHRASE_RE.search(text, timing_match.end())
+        if not action_match:
+            action_match = re.search(
+                r"出門|上班|上課|開會|看診|就醫|報到|聚餐|"
+                r"出差|旅行|參加|出席|前往|回|返|去|拿",
+                text[timing_match.end():],
+            )
+            if action_match:
+                action_start = timing_match.end() + action_match.start()
+            else:
+                action_start = len(text)
+        else:
+            action_start = action_match.start()
+        nodes = [
+            node
+            for node in all_nodes
+            if timing_match.end() <= node[0] and node[1] <= action_start
+        ]
+        if (
+            nodes
+            and pre_nodes
+            and re.search(
+                r"幫忙|代替|幫|替",
+                text[timing_match.end():nodes[0][0]],
+            )
+        ):
+            nodes = pre_nodes
+        if not nodes:
+            nodes = pre_nodes
+    else:
+        nodes = all_nodes
+    if not nodes:
+        return set(), False
+    while len(nodes) >= 2 and re.search(
+        r"幫忙|代替|幫|替",
+        text[nodes[-2][1]:nodes[-1][0]],
+    ):
+        nodes.pop()
+
+    selected = [nodes[-1]]
+    current = nodes[-1]
+    for previous in reversed(nodes[:-1]):
+        connector = text[previous[1]:current[0]]
+        if not re.fullmatch(r"[\s，,、]*(?:和|跟|與|及|、)[\s，,、]*", connector):
+            break
+        selected.append(previous)
+        current = previous
+    values = {node[2] for node in selected}
+    return values - {_CALENDAR_SELF_ACTOR}, _CALENDAR_SELF_ACTOR in values
 
 
 def _calendar_event_participant_text(event: dict) -> str:
@@ -5212,17 +6140,304 @@ def _calendar_event_participant_text(event: dict) -> str:
     return ""
 
 
-def _calendar_explicit_actors(event: dict) -> set[str]:
-    haystack = " ".join(
-        (
-            str(event.get("title") or ""),
-            _calendar_event_participant_text(event),
+def _family_actors_in_text(text: str) -> list[tuple[int, int, str]]:
+    candidates: list[tuple[int, int, str]] = []
+    for term in sorted(_FAMILY_ACTOR_TERMS, key=len, reverse=True):
+        if term == "全家":
+            continue
+        for match in re.finditer(re.escape(term), text):
+            candidates.append(
+                (match.start(), match.end(), _normalize_family_actor(term))
+            )
+    candidates.sort(key=lambda item: (item[0], -(item[1] - item[0])))
+    mentions: list[tuple[int, int, str]] = []
+    for candidate in candidates:
+        if any(
+            candidate[0] < existing[1] and candidate[1] > existing[0]
+            for existing in mentions
+        ):
+            continue
+        mentions.append(candidate)
+    mentions.sort(key=lambda item: item[0])
+    return mentions
+
+
+def _calendar_joint_prefix_is_physical(prefix: str) -> bool:
+    if "的" in prefix:
+        return False
+    return bool(
+        re.fullmatch(
+            r"[\s，,、]*(?:(?:一起|一同|共同|都|也|預計|要|會|將|"
+            r"今天|明天|後天|早上|上午|中午|下午|晚上|搭車|開車|坐車|"
+            r"搭高鐵|搭火車|搭飛機|(?:從|由)[^，,；;。的]{1,12}|"
+            r"(?:搭|坐)[^，,；;。的]{1,8})"
+            r"[\s，,、]*)*",
+            prefix,
         )
     )
+
+
+def _calendar_title_action_actors(title: str) -> set[str]:
+    """Attribute actions to the nearest preceding family name, not every mention."""
     actors: set[str] = set()
-    for term in _FAMILY_ACTOR_TERMS:
-        if term != "全家" and term in haystack:
-            actors.add(_normalize_family_actor(term))
+    mentions = _family_actors_in_text(title)
+    for action in _CALENDAR_OWNERSHIP_ACTION_RE.finditer(title):
+        preceding = [
+            mention
+            for mention in mentions
+            if mention[1] <= action.start() and action.start() - mention[1] <= 18
+        ]
+        if preceding:
+            nearest = max(preceding, key=lambda item: item[1])
+            proxy_prefix = title[max(0, nearest[0] - 4):nearest[0]]
+            if re.search(r"(?:替|代替|幫|幫忙)\s*$", proxy_prefix):
+                ordered = sorted(preceding, key=lambda item: item[1])
+                if len(ordered) >= 2:
+                    actors.add(ordered[-2][2])
+                continue
+            ordered = sorted(preceding, key=lambda item: item[1])
+            action_prefix = title[nearest[1]:action.start()]
+            prefix_is_joint = _calendar_joint_prefix_is_physical(action_prefix)
+            previous = ordered[-2] if len(ordered) >= 2 else None
+            connector = (
+                title[previous[1]:nearest[0]] if previous is not None else ""
+            )
+            connector_is_joint = bool(
+                re.fullmatch(
+                    r"\s*(?:和|跟|與|及|、|陪|帶|載|接|送)\s*",
+                    connector,
+                )
+            )
+            role_is_companion = bool(
+                re.search(r"(?:跟|和|與|陪|帶|載|接|送)\s*$", proxy_prefix)
+            )
+            if not prefix_is_joint and (connector_is_joint or role_is_companion):
+                if previous is not None:
+                    actors.add(previous[2])
+                continue
+            actors.add(nearest[2])
+            if not re.search(
+                r"提醒|詢問|問|告訴|通知|討論|轉告|替|代替|幫|陪",
+                action_prefix,
+            ):
+                joint_right = nearest
+                for previous in reversed(ordered[:-1]):
+                    connector = title[previous[1]:joint_right[0]]
+                    if not re.fullmatch(
+                        r"\s*(?:和|跟|與|及|、|陪|帶|載|接|送)\s*",
+                        connector,
+                    ):
+                        break
+                    actors.add(previous[2])
+                    joint_right = previous
+    return actors
+
+
+def _calendar_has_first_person_passenger_transport(
+    text: str,
+    home_city: str | None = None,
+) -> bool:
+    """Recognize a raw speaker as the passenger, not the named driver."""
+    actor_pattern = "|".join(
+        re.escape(term)
+        for term in sorted(_FAMILY_ACTOR_TERMS, key=len, reverse=True)
+        if term != "全家"
+    )
+    affirmative_filler = (
+        r"(?:(?:今天|明天|後天|早上|上午|中午|下午|傍晚|晚上|今晚|"
+        r"確定|決定|已安排|答應|會|要|將|預計|準備|打算)\s*){0,4}"
+    )
+    passenger_verb = r"(?:順路\s*)?(?:載(?:著)?|送|陪(?:同)?|接|帶(?:著)?)"
+    configured_home_city = (
+        home_city or os.getenv("FAMILY_HOME_CITY", "台北").strip() or "台北"
+    )
+    city = re.escape(configured_home_city)
+    return_movement = (
+        rf"(?:回(?:到)?|返|返回){city}|回家|返家|到(?:達)?家|"
+        rf"回來{_RETURN_HOME_BARE_COMEBACK_CLAUSE_BOUNDARY}"
+    )
+    return_lookahead = rf"(?=(?:{return_movement}))"
+    return bool(
+        re.search(
+            rf"(?:{actor_pattern})\s*{affirmative_filler}(?:開車)?\s*"
+            rf"{passenger_verb}\s*我(?:一起|一同|共同)?\s*{return_lookahead}|"
+            rf"我\s*{affirmative_filler}(?:"
+            rf"由\s*(?:{actor_pattern})\s*{affirmative_filler}(?:開車)?\s*"
+            rf"{passenger_verb}|"
+            rf"(?:搭|坐)\s*(?:{actor_pattern})的車)\s*{return_lookahead}",
+            text,
+        )
+    )
+
+
+def _calendar_physical_action_actors(text: str) -> set[str]:
+    """Return the people physically taking the movement in one event phrase."""
+    actor_pattern = "|".join(
+        re.escape(term)
+        for term in sorted(_FAMILY_ACTOR_TERMS, key=len, reverse=True)
+        if term != "全家"
+    )
+    action_pattern = _CALENDAR_OWNERSHIP_ACTION_RE.pattern
+    passenger_transport = re.search(
+        rf"(?P<passenger>{actor_pattern})\s*(?:"
+        rf"由\s*(?:{actor_pattern})(?:開車)?(?:載|送|陪|接)|"
+        rf"(?:搭|坐)\s*(?:{actor_pattern})的車)"
+        rf"[^，,；;。]{{0,4}}(?:{action_pattern})",
+        text,
+    )
+    if passenger_transport is not None:
+        return {
+            _normalize_family_actor(passenger_transport.group("passenger"))
+        }
+    assisted = re.search(
+        rf"(?P<requester>{actor_pattern})\s*(?:請|讓|叫)\s*"
+        rf"(?:{actor_pattern})(?:開車)?(?:載|送|陪|接)\s*"
+        rf"(?P<passenger>她|他|自己|{actor_pattern})\s*"
+        rf"(?:{action_pattern})",
+        text,
+    )
+    if assisted is not None:
+        passenger = assisted.group("passenger")
+        if passenger in {"她", "他", "自己"}:
+            passenger = assisted.group("requester")
+        return {_normalize_family_actor(passenger)}
+
+    sequential_self = re.search(
+        rf"(?P<actor>{actor_pattern})[^，,；;。]{{0,8}}"
+        rf"(?:告訴|提醒|詢問|問|確認)[^，,；;。]{{0,6}}"
+        rf"(?:{actor_pattern})(?:後|之後)(?:自己)?\s*"
+        rf"(?:{action_pattern})",
+        text,
+    )
+    if sequential_self is not None:
+        return {_normalize_family_actor(sequential_self.group("actor"))}
+
+    return _calendar_title_action_actors(text)
+
+
+def _calendar_home_return_action_actors(
+    text: str,
+    home_city: str = "台北",
+    speaker_actor: str = "",
+) -> set[str]:
+    """Bind only the return-home movement in a multi-action sentence."""
+    if not text:
+        return set()
+    city = re.escape(home_city)
+    movement_re = re.compile(
+        rf"(?:回(?:到)?|返|返回){city}|回家|返家|到(?:達)?家|"
+        rf"回來{_RETURN_HOME_BARE_COMEBACK_CLAUSE_BOUNDARY}"
+    )
+    mentions = _family_actors_in_text(text)
+    actors: set[str] = set()
+    for movement in movement_re.finditer(text):
+        clause_start = max(
+            text.rfind(mark, 0, movement.start()) for mark in "，,；;。"
+        ) + 1
+        local = text[clause_start:movement.end()]
+        if speaker_actor and _calendar_has_first_person_passenger_transport(
+            local,
+            home_city,
+        ):
+            actors.add(_normalize_family_actor(speaker_actor))
+            continue
+        if re.search(
+            r"(?:由[^，,；;。]{0,12}(?:載|送|陪|接)|"
+            r"(?:搭|坐)[^，,；;。]{0,12}的車|"
+            r"(?:請|讓|叫)[^，,；;。]{0,12}(?:載|送|陪|接))",
+            local,
+        ):
+            actors.update(_calendar_physical_action_actors(local))
+            continue
+        preceding = [
+            mention
+            for mention in mentions
+            if clause_start <= mention[0] < movement.start()
+            and movement.start() - mention[1] <= 24
+        ]
+        if not preceding:
+            continue
+        ordered = sorted(preceding, key=lambda item: item[1])
+        nearest = ordered[-1]
+        actors.add(nearest[2])
+        if not _calendar_joint_prefix_is_physical(
+            text[nearest[1]:movement.start()]
+        ):
+            continue
+        joint_right = nearest
+        for previous in reversed(ordered[:-1]):
+            connector = text[previous[1]:joint_right[0]]
+            if not re.fullmatch(r"\s*(?:和|跟|與|及|、)\s*", connector):
+                break
+            actors.add(previous[2])
+            joint_right = previous
+    return actors
+
+
+def _calendar_event_phrase_actors(text: str) -> set[str]:
+    """Return action actors, or the nearest actor owning a nominal event phrase."""
+    action_actors = _calendar_physical_action_actors(text)
+    if action_actors:
+        return action_actors
+    mentions = _family_actors_in_text(text)
+    actors: set[str] = set()
+    for noun in re.finditer(
+        r"考選部[^，,；;。]{0,16}(?:會議|活動)|"
+        r"會議|活動|看診|就醫|聚餐|行程|約診|門診",
+        text,
+    ):
+        preceding = [
+            mention
+            for mention in mentions
+            if mention[1] <= noun.start() and noun.start() - mention[1] <= 18
+        ]
+        if preceding:
+            actors.add(max(preceding, key=lambda item: item[1])[2])
+    return actors
+
+
+def _calendar_companion_action_actors(title: str) -> set[str]:
+    """Return named companions; they do not replace an inherited itinerary owner."""
+    companions: set[str] = set()
+    mentions = _family_actors_in_text(title)
+    for action in _CALENDAR_OWNERSHIP_ACTION_RE.finditer(title):
+        preceding = [
+            mention
+            for mention in mentions
+            if mention[1] <= action.start() and action.start() - mention[1] <= 18
+        ]
+        if not preceding:
+            continue
+        nearest = max(preceding, key=lambda item: item[1])
+        role_prefix = title[max(0, nearest[0] - 4):nearest[0]]
+        action_prefix = title[nearest[1]:action.start()]
+        prefix_is_joint = _calendar_joint_prefix_is_physical(action_prefix)
+        if prefix_is_joint and re.search(
+            r"(?:跟|和|與|陪|帶|載|接|送)\s*$", role_prefix
+        ):
+            companions.add(nearest[2])
+    return companions
+
+
+def _calendar_explicit_actors(event: dict) -> set[str]:
+    participant_text = _calendar_event_participant_text(event)
+    title = str(event.get("title") or "")
+    participant_actors = {
+        actor
+        for _start, _end, actor in _family_actors_in_text(
+            participant_text
+        )
+    }
+    actors = participant_actors | _calendar_title_action_actors(title)
+    shared_family = "全家" in participant_text or bool(
+        "全家" in title and _CALENDAR_OWNERSHIP_ACTION_RE.search(title)
+    )
+    if shared_family:
+        actors.update(
+            _normalize_family_actor(term)
+            for term in _FAMILY_ACTOR_TERMS
+            if term != "全家"
+        )
     return actors
 
 
@@ -5231,23 +6446,356 @@ def _source_is_first_person_itinerary(source_text: str) -> bool:
     if not text:
         return False
     text = re.sub(r"^(?:@?咪寶|米堡|米寶|咪宝)[，,、:：\s]*", "", text)
-    if re.match(
-        r"^我\s*(?:整理|轉貼|轉傳|幫|替|提醒|問|詢問|聽|看到|記錄|紀錄|分享)",
-        text,
-    ):
+    if not text.startswith("我"):
         return False
+    remainder = text[1:].lstrip()
+    remainder = re.sub(r"^[，,、:：\s]*", "", remainder)
+    remainder = re.sub(r"^(?:的行程)[，,、:：\s]*", "", remainder)
+    remainder = re.sub(r"^(?:會|要|將|預計)\s*", "", remainder)
+    remainder = re.sub(r"^(?:在|於)\s*", "", remainder)
     return bool(
-        re.match(
-            r"^我(?=\s|\d|的行程|會|要|將|預計|今天|明天|後天|週|星期|禮拜)",
-            text,
-        )
+        _SOURCE_DATE_TOKEN_RE.match(remainder)
+        or _SOURCE_RELATIVE_DATE_TOKEN_RE.match(remainder)
     )
+
+
+def _calendar_source_raw(
+    group_id: str,
+    event: dict,
+    cache: dict[str, tuple[str | None, str, int | None] | None] | None = None,
+) -> tuple[str | None, str, int | None] | None:
+    source_msg_id = str(event.get("source_msg_id") or "").strip()
+    if not source_msg_id:
+        return None
+    if cache is not None:
+        cached = cache.get(source_msg_id, _CALENDAR_RAW_MISSING)
+        if cached is not _CALENDAR_RAW_MISSING:
+            return cached
+    raw: tuple[str | None, str, int | None] | None = None
+    try:
+        record = memory.get_raw_message_record(group_id, source_msg_id)
+        if (
+            record
+            and str(record.get("group_id") or "") == group_id
+            and str(record.get("message_id") or "") == source_msg_id
+        ):
+            raw = (
+                str(record.get("user_id") or "") or None,
+                str(record.get("text") or ""),
+                int(record.get("created_at"))
+                if record.get("created_at") is not None
+                else None,
+            )
+    except Exception as e:
+        logger.warning(
+            "calendar source record lookup failed group=%s message=%s: %s",
+            group_id,
+            source_msg_id,
+            str(e)[:160],
+        )
+    if raw is None:
+        try:
+            basic_raw = memory.get_raw_message(group_id, source_msg_id)
+            if basic_raw is not None:
+                raw = (basic_raw[0], basic_raw[1], None)
+        except Exception as e:
+            logger.warning(
+                "calendar source lookup failed group=%s message=%s: %s",
+                group_id,
+                source_msg_id,
+                str(e)[:160],
+            )
+    if cache is not None:
+        cache[source_msg_id] = raw
+    return raw
+
+
+def _calendar_raw_source_date(
+    raw: tuple[str | None, str, int | None] | None,
+):
+    if raw is None or raw[2] is None:
+        return None
+    try:
+        return datetime.fromtimestamp(
+            raw[2],
+            tz=ZoneInfo("Asia/Taipei"),
+        ).date()
+    except Exception:
+        return None
+
+
+def _source_dated_clauses(source_text: str) -> list[tuple[re.Match, str]]:
+    matches = list(_SOURCE_DATE_TOKEN_RE.finditer(source_text))
+    return [
+        (
+            match,
+            source_text[
+                match.start():matches[index + 1].start()
+                if index + 1 < len(matches)
+                else len(source_text)
+            ],
+        )
+        for index, match in enumerate(matches)
+    ]
+
+
+def _source_relative_dated_clauses(
+    source_text: str,
+) -> list[tuple[re.Match, str]]:
+    matches = list(_SOURCE_RELATIVE_DATE_TOKEN_RE.finditer(source_text))
+    return [
+        (
+            match,
+            source_text[
+                match.start():matches[index + 1].start()
+                if index + 1 < len(matches)
+                else len(source_text)
+            ],
+        )
+        for index, match in enumerate(matches)
+    ]
+
+
+def _source_timed_clauses(
+    source_text: str,
+) -> list[tuple[str, re.Match, str]]:
+    matches = [
+        ("absolute", match) for match in _SOURCE_DATE_TOKEN_RE.finditer(source_text)
+    ]
+    matches.extend(
+        ("relative", match)
+        for match in _SOURCE_RELATIVE_DATE_TOKEN_RE.finditer(source_text)
+    )
+    matches.sort(key=lambda item: item[1].start())
+    return [
+        (
+            kind,
+            match,
+            source_text[
+                match.start():matches[index + 1][1].start()
+                if index + 1 < len(matches)
+                else len(source_text)
+            ],
+        )
+        for index, (kind, match) in enumerate(matches)
+    ]
+
+
+def _source_clause_for_event(
+    source_text: str,
+    event_date: str,
+    event_title: str = "",
+    source_date=None,
+) -> str:
+    try:
+        target = datetime.strptime(event_date, "%Y-%m-%d").date()
+    except Exception:
+        return ""
+    timed_clauses = _source_timed_clauses(source_text)
+    if not timed_clauses:
+        return str(source_text or "").strip()
+    if (
+        len(timed_clauses) == 1
+        and timed_clauses[0][0] == "relative"
+        and source_date is None
+    ):
+        return str(source_text or "").strip()
+    matching_clauses: list[str] = []
+    for kind, match, clause in timed_clauses:
+        if kind == "relative":
+            if target in _resolve_calendar_query_dates(
+                match.group(0),
+                reference_date=source_date,
+            ):
+                matching_clauses.append(clause.strip())
+            continue
+        year_text = match.group("year")
+        source_year = getattr(source_date, "year", None)
+        year_matches = (
+            int(year_text) == target.year
+            if year_text
+            else source_year is None or int(source_year) == target.year
+        )
+        if year_matches and (
+            int(match.group("month")) == target.month
+            and int(match.group("day")) == target.day
+        ):
+            matching_clauses.append(clause.strip())
+    if matching_clauses:
+        return " ".join(clause for clause in matching_clauses if clause)
+    if _REMOTE_EVENT_RE.search(str(source_text or "")):
+        return str(source_text or "").strip()
+    return ""
+
+
+def _calendar_clause_title_score(event_title: str, clause: str) -> int:
+    def _normalized(value: str) -> str:
+        normalized = _SOURCE_DATE_TOKEN_RE.sub("", str(value or ""))
+        normalized = _SOURCE_RELATIVE_DATE_TOKEN_RE.sub("", normalized)
+        for term in sorted(_FAMILY_ACTOR_TERMS, key=len, reverse=True):
+            normalized = normalized.replace(term, "")
+        normalized = re.sub(
+            r"我|早上|上午|中午|下午|傍晚|晚上|今晚|預計|可能|大概|"
+            r"會|將|要|[\s，,、。；;：:（）()「」『』]",
+            "",
+            normalized,
+        )
+        return normalized
+
+    title_key = _normalized(event_title)
+    clause_key = _normalized(clause)
+    if not title_key or not clause_key:
+        return 0
+    if title_key == clause_key:
+        return 100 + len(title_key)
+    if len(title_key) >= 2 and title_key in clause_key:
+        return len(title_key)
+    if len(clause_key) >= 2 and clause_key in title_key:
+        return len(clause_key)
+    return 0
+
+
+def _source_itinerary_actor_for_event(
+    source_text: str,
+    source_actor: str,
+    event_date: str,
+    event_title: str = "",
+    source_date=None,
+) -> str:
+    """Carry a first-person itinerary owner only until a dated actor switch."""
+    text = str(source_text or "").strip()
+    if not text or not event_date:
+        return ""
+    cleaned = re.sub(r"^(?:@?咪寶|米堡|米寶|咪宝)[，,、:：\s]*", "", text)
+    first_person_itinerary = _source_is_first_person_itinerary(cleaned)
+    current_actor = source_actor if first_person_itinerary else ""
+    try:
+        target = datetime.strptime(event_date, "%Y-%m-%d").date()
+    except Exception:
+        return ""
+
+    def _actor_after_clause(current: str, clause: str) -> str:
+        actor_term_pattern = "|".join(
+            re.escape(term)
+            for term in sorted(_FAMILY_ACTOR_TERMS, key=len, reverse=True)
+            if term != "全家"
+        )
+        if (
+            source_actor
+            and _calendar_has_first_person_passenger_transport(clause)
+            and _CALENDAR_OWNERSHIP_ACTION_RE.search(clause)
+        ):
+            return source_actor
+        clause_actors = _calendar_title_action_actors(clause)
+        companion_actors = _calendar_companion_action_actors(clause)
+        mentioned_actors = {
+            actor for _start, _end, actor in _family_actors_in_text(clause)
+        }
+        if clause_actors and clause_actors.issubset(companion_actors):
+            return current
+        if len(clause_actors) == 1:
+            return next(iter(clause_actors))
+        if len(clause_actors) > 1:
+            return ""
+        if current and re.search(
+            rf"(?:替|代替|幫|幫忙)\s*(?:{actor_term_pattern}).{{0,12}}"
+            rf"(?:{_CALENDAR_OWNERSHIP_ACTION_RE.pattern})",
+            clause,
+        ):
+            return current
+        if len(mentioned_actors) == 1:
+            mentioned_actor = next(iter(mentioned_actors))
+            actor_terms = "|".join(
+                re.escape(term)
+                for term in _FAMILY_ACTOR_TERMS
+                if term != "全家"
+                and _normalize_family_actor(term) == mentioned_actor
+            )
+            if actor_terms and re.search(
+                rf"(?:的是|由)\s*(?:{actor_terms})|"
+                rf"(?:{actor_terms}).{{0,4}}(?:的行程|本人)",
+                clause,
+            ):
+                return mentioned_actor
+            return ""
+        if mentioned_actors:
+            return ""
+        if re.search(
+            rf"我.{{0,12}}(?:{_CALENDAR_OWNERSHIP_ACTION_RE.pattern})",
+            clause,
+        ):
+            return source_actor
+        return current
+
+    timed_clauses = _source_timed_clauses(cleaned)
+    if not timed_clauses:
+        action_actors = _calendar_title_action_actors(cleaned)
+        companion_actors = _calendar_companion_action_actors(cleaned)
+        if (
+            first_person_itinerary
+            and action_actors
+            and action_actors.issubset(companion_actors)
+        ):
+            return source_actor
+        if len(action_actors) == 1:
+            return next(iter(action_actors))
+        if len(action_actors) > 1:
+            return ""
+        return source_actor if first_person_itinerary else ""
+
+    records: list[tuple[str, bool, int, str]] = []
+    for kind, match, clause in timed_clauses:
+        current_actor = _actor_after_clause(current_actor, clause)
+        matches_date = False
+        if kind == "relative":
+            matches_date = bool(
+                source_date is None and len(timed_clauses) == 1
+            ) or target in _resolve_calendar_query_dates(
+                match.group(0),
+                reference_date=source_date,
+            )
+        else:
+            year_text = match.group("year")
+            source_year = getattr(source_date, "year", None)
+            year_matches = (
+                int(year_text) == target.year
+                if year_text
+                else source_year is None or int(source_year) == target.year
+            )
+            matches_date = year_matches and (
+                int(match.group("month")) == target.month
+                and int(match.group("day")) == target.day
+            )
+        records.append(
+            (
+                current_actor,
+                matches_date,
+                _calendar_clause_title_score(event_title, clause),
+                kind,
+            )
+        )
+
+    dated_records = [record for record in records if record[1]]
+    if len(dated_records) == 1:
+        return dated_records[0][0]
+    if dated_records:
+        best_score = max(record[2] for record in dated_records)
+        best_records = [record for record in dated_records if record[2] == best_score]
+        best_actors = {record[0] for record in best_records if record[0]}
+        if best_score > 0 and len(best_records) == 1:
+            return best_records[0][0]
+        if len(best_actors) == 1:
+            return next(iter(best_actors))
+        return ""
+
+    return ""
 
 
 def _calendar_event_owned_by_actor(
     group_id: str,
     event: dict,
     actor: str,
+    raw_cache: dict[str, tuple[str | None, str, int | None] | None] | None = None,
 ) -> bool:
     """Conservatively attribute one event to a family member within one group."""
     if not group_id or not actor:
@@ -5257,36 +6805,362 @@ def _calendar_event_owned_by_actor(
         return False
 
     normalized_actor = _normalize_family_actor(actor)
+    title = str(event.get("title") or "")
+    title_phrase_actors = _calendar_event_phrase_actors(title)
+    title_companions = _calendar_companion_action_actors(title)
+    home_city = os.getenv("FAMILY_HOME_CITY", "台北").strip() or "台北"
+    title_return_actors = _calendar_home_return_action_actors(title, home_city)
+    raw = _calendar_source_raw(group_id, event, raw_cache)
+    source_event_actor = ""
+    source_companions: set[str] = set()
+    source_clause = ""
+    source_return_actors: set[str] = set()
+    if raw is not None:
+        source_user_id, source_text = raw[0], raw[1]
+        source_date = _calendar_raw_source_date(raw)
+        source_actor = _normalize_family_actor(
+            _alias_from_user_id(source_user_id)
+        )
+        if source_actor:
+            source_event_actor = _source_itinerary_actor_for_event(
+                source_text,
+                source_actor,
+                str(event.get("event_date") or ""),
+                event_title=title,
+                source_date=source_date,
+            )
+        source_clause = _source_clause_for_event(
+            source_text,
+            str(event.get("event_date") or ""),
+            event_title=title,
+            source_date=source_date,
+        )
+        source_companions = _calendar_companion_action_actors(source_clause)
+        source_return_actors = _calendar_home_return_action_actors(
+            source_clause,
+            home_city,
+            speaker_actor=source_actor,
+        )
+
+    if (
+        title_return_actors
+        and source_return_actors
+        and not title_return_actors.intersection(source_return_actors)
+    ):
+        return False
+
+    source_conflicts = bool(
+        source_event_actor
+        and source_event_actor != normalized_actor
+        and normalized_actor not in source_companions
+    )
+    title_conflicts = bool(
+        title_phrase_actors
+        and normalized_actor not in title_phrase_actors
+        and not (
+            source_event_actor == normalized_actor
+            and title_phrase_actors.issubset(title_companions)
+        )
+    )
+    if normalized_actor in title_phrase_actors:
+        return not source_conflicts
     explicit_actors = _calendar_explicit_actors(event)
     if explicit_actors:
-        return normalized_actor in explicit_actors
+        if normalized_actor in explicit_actors:
+            return not source_conflicts and not title_conflicts
+        participant_text = _calendar_event_participant_text(event)
+        participant_actors = {
+            participant_actor
+            for _start, _end, participant_actor in _family_actors_in_text(
+                participant_text
+            )
+        }
+        participant_is_authoritative = bool(
+            "全家" in participant_text
+            or (
+                participant_actors
+                and not participant_actors.issubset(title_companions)
+            )
+        )
+        if (
+            participant_is_authoritative
+            or not explicit_actors.issubset(title_companions)
+        ):
+            return False
 
-    source_msg_id = str(event.get("source_msg_id") or "").strip()
-    if not source_msg_id:
-        return False
-    raw = memory.get_raw_message(group_id, source_msg_id)
     if raw is None:
         return False
-    source_user_id, source_text = raw
-    source_actor = _normalize_family_actor(_alias_from_user_id(source_user_id))
     return bool(
-        source_actor
-        and source_actor == normalized_actor
-        and _source_is_first_person_itinerary(source_text)
+        source_event_actor == normalized_actor
+        or normalized_actor in source_companions
     )
 
 
 def _calendar_event_home_city_evidence(
     event: dict,
     home_city: str,
+    source_clause: str = "",
 ) -> str | None:
     """Return physical home-city evidence, excluding remote/online commitments."""
     title = str(event.get("title") or "")
     location = str(event.get("location") or "")
-    haystack = f"{title} {location}".strip()
+    haystack = f"{title} {location} {source_clause}".strip()
     if not haystack or _REMOTE_EVENT_RE.search(haystack):
         return None
-    if home_city and home_city in haystack:
+    if re.search(
+        r"(?:考選部|會議|開會)[^，,；;。]{0,16}"
+        r"(?:簡報|紀錄|邀請函|資料|議程|錄影|心得)"
+        r"[^，,；;。]{0,8}(?:準備|整理|寄送|製作|撰寫|觀看|處理)",
+        haystack,
+    ):
+        return None
+    if re.search(r"取消|改期|延期|不去|不參加|暫停|作廢", haystack):
+        return None
+    if re.search(
+        r"(?:不用|不需要|無需|不必|沒有要|沒要|別|不要|不能|"
+        r"沒辦法|無法|禁止|不可以|不會|不打算|不想|不願意|拒絕)\s*"
+        r"(?:去|到|前往|參加|出席|報到)",
+        haystack,
+    ):
+        return None
+    place_terms = [home_city] if home_city else []
+    place_terms.extend(_HOME_CITY_POIS.get(home_city, ()))
+    place_pattern = "|".join(
+        re.escape(place) for place in place_terms if place
+    )
+    if place_pattern and re.search(
+        rf"(?:不在|沒有在|沒在)\s*(?:{place_pattern})",
+        haystack,
+    ):
+        return None
+    place_movement = r"(?:去|到|在|位於|現身於|前往|抵達|參加|出席|報到)"
+    if place_pattern and (
+        re.search(
+            rf"(?:可能|也許|或許|應該|大概|還不確定|不確定|尚未確定|未確定|"
+            rf"尚未決定|還沒決定|未決定)"
+            rf"[^，,；;。]{{0,18}}(?:{place_pattern})",
+            haystack,
+        )
+        or re.search(
+            rf"(?:{place_movement})[^，,；;。]{{0,6}}(?:{place_pattern})"
+            rf"[^，,；;。]{{0,8}}(?:待確認|視情況|未定|不確定|"
+            rf"尚未決定|還沒決定|未決定)",
+            haystack,
+        )
+    ):
+        return None
+    if place_pattern:
+        place_match = re.search(rf"(?:{place_pattern})", haystack)
+        if place_match is not None:
+            place_tail = re.split(
+                r"[，,；;。]",
+                haystack[place_match.end():],
+                maxsplit=1,
+            )[0]
+            uncertainty = re.search(
+                r"待確認|視情況|未定|尚未決定|還沒決定|未決定|"
+                r"不確定|不一定",
+                place_tail,
+            )
+            if uncertainty is not None and not re.search(
+                r"(?:時間|幾點|班次|車次)[^，,；;。]{0,4}$",
+                place_tail[:uncertainty.start()],
+            ):
+                return None
+        clauses = [
+            clause.strip()
+            for clause in re.split(r"[，,；;。]", haystack)
+            if clause.strip()
+        ]
+        relevant_clauses: list[str] = []
+        for index, clause in enumerate(clauses):
+            if not re.search(rf"(?:{place_pattern})", clause):
+                continue
+            relevant_clauses.append(clause)
+            if index + 1 < len(clauses) and re.match(
+                r"^(?:(?:會場|場地|地點)|(?:將)?(?:在|於))",
+                clauses[index + 1],
+            ):
+                relevant_clauses.append(clauses[index + 1])
+
+        for clause in relevant_clauses:
+            venue_marker = re.search(r"(?:會場|場地|地點)", clause)
+            if venue_marker is not None:
+                assertion = clause[venue_marker.end():].strip()
+                is_assertion = bool(
+                    re.match(
+                        r"(?:確定|已|尚|還|不|另|待|未|之|改|換|"
+                        r"在|於|是|為|設|訂|選|[:：])",
+                        assertion,
+                    )
+                )
+                if is_assertion:
+                    has_alternative = bool(
+                        re.search(r"或|還是|二選一|擇一|[/／、]", assertion)
+                    )
+                    has_home_venue = bool(
+                        re.search(rf"(?:{place_pattern})", assertion)
+                    )
+                    if has_alternative or not has_home_venue:
+                        return None
+
+            locative_venue = re.search(
+                r"(?:將)?(?:在|於)\s*(?P<venue>[^，,；;。]{1,16})"
+                r"(?:舉辦|開會|進行)",
+                clause,
+            )
+            if locative_venue is None:
+                continue
+            venue = locative_venue.group("venue").strip()
+            date_token = (
+                r"(?:今天|明天|後天|大後天|本週|這週|下週|"
+                r"週[一二三四五六日天]|星期[一二三四五六日天]|"
+                r"禮拜[一二三四五六日天]|\d{1,2}/\d{1,2})"
+            )
+            daypart_token = r"(?:凌晨|早上|上午|中午|下午|傍晚|晚上|今晚)"
+            clock_token = (
+                r"(?:\d{1,2}(?::\d{2}|點(?:半|\d{1,2}分)?)|"
+                r"[零〇一二三四五六七八九十兩]{1,3}點(?:半)?)"
+            )
+            time_only = bool(
+                venue
+                and re.fullmatch(
+                    rf"(?:{date_token})?(?:{daypart_token})?(?:{clock_token})?",
+                    venue,
+                )
+            )
+            if not time_only and not re.search(rf"(?:{place_pattern})", venue):
+                return None
+    directive_movement = None
+    if place_pattern:
+        directive_actor_pattern = "|".join(
+            re.escape(term)
+            for term in sorted(_FAMILY_ACTOR_TERMS, key=len, reverse=True)
+            if term != "全家"
+        )
+        directive_movement = re.search(
+            rf"(?:(?P<verb>提醒|通知|叫|請|讓|告訴|建議|要求|拜託|希望|邀請)\s*"
+            rf"(?:{directive_actor_pattern}|我|他|她)|"
+            rf"(?:{directive_actor_pattern}|我|他|她)\s*(?:"
+            rf"被[^，,；;。]{{0,8}}(?:要求|提醒|通知|建議)|"
+            rf"受邀|收到通知|接到通知))"
+            rf"(?P<gap>[^，,；;。]{{0,12}})(?:{place_movement})"
+            rf"[^，,；;。]{{0,6}}(?:{place_pattern})",
+            haystack,
+        )
+    directive_gap = (
+        directive_movement.group("gap").strip()
+        if directive_movement is not None
+        else ""
+    )
+    directive_prefix = (
+        haystack[:directive_movement.start()]
+        if directive_movement is not None
+        else ""
+    )
+    directive_is_sequence = bool(
+        directive_movement is not None
+        and directive_movement.group("verb") in {"提醒", "告訴"}
+        and re.search(rf"(?:{directive_actor_pattern})", directive_prefix)
+        and re.fullmatch(r"(?:後|之後|然後)(?:自己)?", directive_gap)
+    )
+    directive_is_affirmed = bool(
+        directive_movement is not None
+        and directive_movement.group("verb") is None
+        and re.fullmatch(
+            r"(?:後|之後|然後)(?:確定|決定|已安排)", directive_gap
+        )
+    )
+    directive_is_transport = bool(
+        re.search(
+            r"(?:載|送|陪|接)(?:我|她|他|媽媽|爸爸|妹妹)",
+            directive_gap,
+        )
+    )
+    if (
+        directive_movement is not None
+        and not directive_is_sequence
+        and not directive_is_affirmed
+        and not directive_is_transport
+    ):
+        later_affirmation = re.search(
+            rf"(?:後來|現在|但|不過)[^，,；;。]{{0,8}}"
+            rf"(?:確定|決定|會|要|將|已安排)[^，,；;。]{{0,8}}"
+            rf"(?:{place_movement})[^，,；;。]{{0,6}}(?:{place_pattern})",
+            haystack[directive_movement.end():],
+        )
+        if later_affirmation is None:
+            return None
+    if place_pattern and re.search(
+        rf"(?:{place_pattern})[^，,；;。]{{0,16}}"
+        rf"(?:改到|移到|改在|改至|換到|移至|改去|改成|改為|移師|變更至|"
+        rf"改地點|地點改)",
+        haystack,
+    ):
+        return None
+    other_place_pattern = "|".join(
+        re.escape(place)
+        for place in _PUBLIC_EVENT_CITIES
+        if place and place != home_city
+    )
+    if (
+        place_pattern
+        and other_place_pattern
+        and re.search(rf"(?:{place_pattern})", haystack)
+        and re.search(
+            rf"(?:改到|移到|改在|改至|換到|移至|改去|改成|改為|移師|變更至)\s*"
+            rf"(?:{other_place_pattern})",
+            haystack,
+        )
+    ):
+        return None
+    if other_place_pattern and re.search(
+            rf"不是\s*在?\s*(?:{place_pattern})"
+            rf"[^，,；;。]{{0,8}}(?:而是)?\s*在\s*"
+            rf"(?:{other_place_pattern})",
+            haystack,
+        ):
+        return None
+    meta_place_claim = bool(
+        place_pattern
+        and re.search(
+            rf"(?:討論|規劃|準備|籌備|籌辦|安排|製作|整理|寄送|撰寫|"
+            rf"觀看|處理|詢問|查詢|查看|搜尋|研究|說明|確認|問|查)"
+            rf"[^，,；;。]{{0,12}}(?:{place_pattern})",
+            haystack,
+        )
+    )
+    completed_meta_then_physical = bool(
+        place_pattern
+        and re.search(
+            rf"(?:討論|規劃|準備|籌備|籌辦|安排|製作|整理|寄送|撰寫|"
+            rf"觀看|處理|詢問|查詢|查看|搜尋|研究|說明|確認|問|查)"
+            rf"(?:完|結束)?(?:後|之後|再|就)[^，,；;。]{{0,8}}"
+            rf"(?:去|到|在|前往|抵達|參加|出席|報到)"
+            rf"[^，,；;。]{{0,6}}(?:{place_pattern})",
+            haystack,
+        )
+    )
+    if meta_place_claim and not completed_meta_then_physical:
+        return None
+    if location and any(
+        place != home_city and place in location
+        for place in _PUBLIC_EVENT_CITIES
+    ):
+        return None
+    if home_city and home_city in location:
+        return home_city
+    for poi in _HOME_CITY_POIS.get(home_city, ()):
+        if poi in location:
+            return poi
+    if location:
+        return None
+    if home_city and re.search(
+        rf"(?:去|到|在|前往|抵達){re.escape(home_city)}|"
+        rf"{re.escape(home_city)}.{{0,16}}(?:開會|會議|報到|考試|活動|"
+        rf"看診|就醫|聚餐|上班|出席)",
+        haystack,
+    ):
         return home_city
     for poi in _HOME_CITY_POIS.get(home_city, ()):
         if poi not in haystack:
@@ -5300,14 +7174,453 @@ def _calendar_event_home_city_evidence(
     return None
 
 
-def _calendar_event_is_direct_home_return(event: dict, home_city: str) -> bool:
+_CALENDAR_QUERY_PLACE_CHILDREN: dict[str, tuple[str, ...]] = {
+    "台灣": _TAIWAN_PUBLIC_EVENT_CITIES,
+    "紐西蘭": _NEW_ZEALAND_PUBLIC_EVENT_CITIES,
+}
+
+
+def _calendar_event_matches_query_place(
+    event: dict,
+    query_place: str,
+    source_clause: str = "",
+) -> bool:
+    if _calendar_event_home_city_evidence(
+        event,
+        query_place,
+        source_clause=source_clause,
+    ):
+        return True
+    return any(
+        _calendar_event_home_city_evidence(
+            event,
+            child_place,
+            source_clause=source_clause,
+        )
+        for child_place in _CALENDAR_QUERY_PLACE_CHILDREN.get(query_place, ())
+    )
+
+
+_RETURN_MODAL_UNCERTAINTY_PATTERN = (
+    r"(?:是否(?:能|可以)?|能不能|能否|會不會|要不要|可不可以)"
+    r"(?:真的|順利|確定|最終|最後)?"
+    r"(?:成行|回來|回去|返回|返程|回程|返台|回家|到家|"
+    r"回(?=$|[\s，,；;。？?]))|"
+    r"回不回(?:得)?(?:來|去)"
+)
+_RETURN_STATUS_UNCERTAINTY_PATTERN = (
+    r"視情況|尚待確認|"
+    r"還要確認|要再確認|需要再確認|"
+    r"還不知道|還不清楚|不知道|不清楚|尚無定論|再看看|到時候再說|"
+    r"仍待確認|尚不確定|仍未決定|有變數|說不準|"
+    r"還沒決定|還不確定|尚未決定|還沒有最後決定|"
+    r"還沒確定|尚未確定|沒有確定|不確定|未確定|未決定|"
+    r"再確認|待確認|待定|未定|"
+    r"不一定|取消|改天|改期|無法|拒絕|放棄|"
+    r"不會了|不載了|不送了|不陪了|不接了|不帶了|反悔了"
+)
+_RETURN_CONDITIONAL_UNCERTAINTY_PATTERN = (
+    r"|(?:要看|看|視).{0,8}(?:再)?決定"
+    r"|等.{0,8}(?:(?:才|再)(?:能)?決定)"
+)
+_POST_RETURN_UNCERTAINTY_RE = re.compile(
+    _RETURN_MODAL_UNCERTAINTY_PATTERN
+    + "|(?:"
+    + _RETURN_STATUS_UNCERTAINTY_PATTERN
+    + ")"
+    + _RETURN_CONDITIONAL_UNCERTAINTY_PATTERN
+)
+
+
+_RETURN_UNDECIDED_MODAL_RE = re.compile(
+    r"(?:不確定)?(?:是否|是不是|能不能(?:夠)?|能否|可不可以|可否|"
+    r"會不會|要不要|有沒有(?:辦法)?)([^，,；;。]+)"
+)
+_RETURN_UNDECIDED_LEADING_FILLER_RE = re.compile(
+    r"^(?:到底|真的|順利|確定|最終|最後|如期|有辦法|"
+    r"能夠?|可以|會|要)"
+)
+_RETURN_UNDECIDED_STATUS_SUFFIX_RE = re.compile(
+    r"[\s？?！!（）()]*"
+    r"(?:目前|現在|暫時)?(?:"
+    + _RETURN_STATUS_UNCERTAINTY_PATTERN
+    + r")"
+    r"[\s？?！!（）()]*$"
+)
+
+
+def _return_undecided_action_target(text: str) -> str | None:
+    match = _RETURN_UNDECIDED_MODAL_RE.search(text)
+    if match is None:
+        return None
+    target = match.group(1).strip()
+    while True:
+        stripped = _RETURN_UNDECIDED_LEADING_FILLER_RE.sub("", target, count=1)
+        if stripped == target:
+            break
+        target = stripped.strip()
+    target = _RETURN_UNDECIDED_STATUS_SUFFIX_RE.sub("", target).strip(
+        " \t？?！!（）()"
+    )
+    return re.sub(r"(?:呢|嗎|啊|呀|啦|嘛|欸|耶|齁)+$", "", target)
+
+
+def _return_undecided_target_is_return(
+    target: str | None,
+    home_city: str,
+) -> bool:
+    if not target:
+        return False
+    city = re.escape(home_city)
+    return bool(
+        re.fullmatch(
+            rf"(?:成行|回|回去|回來|返回|返程|回程|返台|回家|到家|"
+            rf"(?:回(?:到)?|返|返回){city})",
+            target,
+        )
+    )
+
+
+def _return_uncertainty_is_about_downstream_action(
+    text: str,
+    home_city: str,
+) -> bool:
+    return_context = (
+        rf"返程|回程|是否成行|能不能成行|會不會成行|"
+        rf"回不回(?:得)?(?:來|去)|回得(?:來|去)|"
+        rf"這件事|這個安排|這部分|這趟|"
+        rf"(?:回(?:到)?|返回|返){re.escape(home_city)}|回家|返家|到(?:達)?家"
+    )
+    if re.search(return_context, text):
+        return False
+    undecided_target = _return_undecided_action_target(text)
+    if undecided_target is not None:
+        return not _return_undecided_target_is_return(
+            undecided_target,
+            home_city,
+        )
+    if re.search(
+        r"去|吃|聚餐|晚餐|午餐|早餐|公司|上班|開會|看診|就醫|"
+        r"購物|逛街|運動|散步|看電影|活動",
+        text,
+    ):
+        return True
+    return False
+
+
+def _return_claim_has_post_uncertainty(
+    haystack: str,
+    home_city: str,
+) -> bool:
+    city = re.escape(home_city)
+    movement_re = re.compile(
+        rf"(?:回(?:到)?|返回|返){city}|回家|返家|到(?:達)?家|"
+        rf"回來{_RETURN_HOME_BARE_COMEBACK_CLAUSE_BOUNDARY}"
+    )
+    for movement_match in movement_re.finditer(haystack):
+        tail = haystack[movement_match.end():]
+        clauses = re.split(r"[，,；;。]", tail)
+        same_clause = clauses[0].strip()
+        same_clause_target = _return_undecided_action_target(same_clause)
+        if _return_undecided_target_is_return(
+            same_clause_target,
+            home_city,
+        ):
+            return True
+        continuation = re.sub(
+            r"^(?:後|之後|再|然後|接著|隨後)",
+            "",
+            same_clause,
+        )
+        has_continuation_connector = continuation != same_clause
+        continuation_is_downstream = bool(
+            has_continuation_connector
+            and _return_uncertainty_is_about_downstream_action(
+                continuation,
+                home_city,
+            )
+        )
+        if not continuation_is_downstream and _POST_RETURN_UNCERTAINTY_RE.search(
+            same_clause
+        ):
+            return True
+
+        for clause in clauses[1:]:
+            normalized = re.sub(
+                r"^(?:但|不過|只是)?(?:目前|現在|暫時)?",
+                "",
+                clause.strip(),
+            )
+            if not normalized:
+                continue
+            uncertainty = _POST_RETURN_UNCERTAINTY_RE.search(normalized)
+            normalized_target = _return_undecided_action_target(normalized)
+            return_modal_uncertain = _return_undecided_target_is_return(
+                normalized_target,
+                home_city,
+            )
+            if not uncertainty and not return_modal_uncertain:
+                continue
+            downstream = _return_uncertainty_is_about_downstream_action(
+                normalized,
+                home_city,
+            )
+            if downstream:
+                continue
+            return True
+    return False
+
+
+def _calendar_event_is_direct_home_return(
+    event: dict,
+    home_city: str,
+    source_clause: str = "",
+) -> bool:
     haystack = " ".join(
         str(event.get(key) or "") for key in ("title", "location")
     )
-    if re.search(r"(?:不|沒有|沒|取消|改天).{0,3}(?:回|返)", haystack):
+    if source_clause:
+        haystack = f"{haystack} {source_clause}"
+    if _REMOTE_EVENT_RE.search(haystack):
         return False
+    city = re.escape(home_city)
+    affirmed_movement = (
+        rf"(?:回(?:到)?|返|返回){city}|回家|返家|到(?:達)?家|"
+        rf"回來{_RETURN_HOME_BARE_COMEBACK_CLAUSE_BOUNDARY}"
+    )
+    current_affirmation = re.search(
+        rf"(?:現在|後來)[^，,；;。]{{0,8}}"
+        rf"(?:確定|決定|預計|會|將|要)[^，,；;。]{{0,6}}"
+        rf"(?:{affirmed_movement})",
+        haystack,
+    )
+    if current_affirmation is not None:
+        haystack = haystack[current_affirmation.start():]
+    actor_pattern = "|".join(
+        re.escape(term)
+        for term in _FAMILY_ACTOR_TERMS
+        if term != "全家"
+    )
+    assisted_return = re.search(
+        rf"(?P<requester>{actor_pattern})\s*(?:請|讓|叫)\s*"
+        rf"(?:{actor_pattern})(?:開車)?(?:載|送|陪|接)\s*"
+        rf"(?P<passenger>她|他|自己|{actor_pattern})\s*"
+        rf"(?P<movement>{affirmed_movement})",
+        haystack,
+    )
+    imperative_movement = re.search(
+        rf"(?P<verb>要求|讓|叫|告訴|請|提醒)\s*"
+        rf"(?:{actor_pattern}|他|她)"
+        rf"(?P<gap>[^，,；;。]{{0,12}})(?:{affirmed_movement})",
+        haystack,
+    )
+    imperative_gap = (
+        imperative_movement.group("gap").strip()
+        if imperative_movement is not None
+        else ""
+    )
+    imperative_is_sequence = bool(
+        imperative_movement is not None
+        and imperative_movement.group("verb") in {"提醒", "告訴"}
+        and re.search(rf"(?:{actor_pattern})", haystack[:imperative_movement.start()])
+        and re.fullmatch(r"(?:後|之後|然後)(?:自己)?", imperative_gap)
+    )
+    if (
+        imperative_movement is not None
+        and assisted_return is None
+        and not imperative_is_sequence
+    ):
+        return False
+    original_plan = re.search(
+        rf"(?:原本|本來)\s*(?:預計|要|會|打算|計畫|準備)?\s*"
+        rf"(?:{affirmed_movement})",
+        haystack,
+    )
+    if original_plan is not None:
+        later_affirmation = re.search(
+            rf"(?:現在|後來)[^，,；;。]{{0,8}}"
+            rf"(?:確定|決定|預計|會|將|要)[^，,；;。]{{0,6}}"
+            rf"(?:{affirmed_movement})",
+            haystack[original_plan.end():],
+        )
+        if later_affirmation is None:
+            return False
+    movement_object = rf"(?:回(?:到)?|返回|返){city}"
+    if re.search(
+        rf"{movement_object}(?:的)?(?:資料|文件|報告|清單|資訊)",
+        haystack,
+    ):
+        return False
+    if _home_return_yes_no_query_match(haystack.strip(), home_city):
+        return False
+    direct_haystack = re.sub(
+        rf"(?:不是|不能|不得)不(?={affirmed_movement})",
+        "",
+        haystack,
+    )
+    if assisted_return is not None:
+        passenger = assisted_return.group("passenger")
+        if passenger in {"她", "他", "自己"}:
+            passenger = assisted_return.group("requester")
+        direct_haystack = (
+            direct_haystack[:assisted_return.start()]
+            + f"{passenger}搭車{assisted_return.group('movement')}"
+            + direct_haystack[assisted_return.end():]
+        )
+    direct_haystack = re.sub(
+        r"(?:叫(?:計程車|uber|車)|(?:請|讓)司機(?:載|送|接)"
+        r"(?:我|她|他|媽媽|爸爸)?)",
+        "搭車",
+        direct_haystack,
+        flags=re.IGNORECASE,
+    )
+    direct_haystack = re.sub(
+        rf"(?P<passenger>{actor_pattern})\s*(?:"
+        rf"由\s*(?:{actor_pattern})(?:開車)?(?:載|送|陪|接)|"
+        rf"(?:搭|坐)\s*(?:{actor_pattern})的車)",
+        r"\g<passenger>搭車",
+        direct_haystack,
+    )
+    direct_haystack = re.sub(
+        rf"(?P<actor>{actor_pattern})\s*(?:跟|和|與)\s*家人"
+        rf"(?:一起|一同|共同)?(?={affirmed_movement})",
+        r"\g<actor>搭車",
+        direct_haystack,
+    )
+    direct_haystack = re.sub(
+        rf"(?:我們)?全家(?:一起|一同|共同)?(?={affirmed_movement})",
+        "搭車",
+        direct_haystack,
+    )
+    direct_haystack = re.sub(
+        rf"(?:一起|一同|共同)(?={affirmed_movement})",
+        "",
+        direct_haystack,
+    )
+    direct_haystack = re.sub(
+        rf"請假(?=(?:回(?:到)?|返回|返){city})",
+        "請假後",
+        direct_haystack,
+    )
+    direct_haystack = re.sub(
+        rf"後自己(?=(?:回(?:到)?|返回|返){city})",
+        "後",
+        direct_haystack,
+    )
+    direct_haystack = re.sub(
+        rf"(?:帶|拿|穿)[^，,；;。]{{1,12}}(?=(?:回(?:到)?|返回|返){city})",
+        "帶",
+        direct_haystack,
+    )
+    direct_haystack = re.sub(
+        rf"照[^，,；;。]{{0,12}}路線(?=(?:回(?:到)?|返回|返){city})",
+        "前往",
+        direct_haystack,
+    )
+    direct_haystack = re.sub(
+        r"大概\s*(?:凌晨|早上|上午|中午|下午|傍晚|晚上|今晚|"
+        r"\d{1,2}(?:點|[:：]\d{2}))",
+        "",
+        direct_haystack,
+    )
+    direct_haystack = re.sub(
+        rf"(?:我|她|他|媽媽|爸爸)?(?:還|尚|仍)?"
+        rf"(?:不知道|不清楚|未決定|還沒決定|尚未決定)?"
+        rf"怎麼(?:回(?:到)?{city}|回家|返程|回程|回)"
+        rf"(?:還沒決定|尚未決定|未決定|未定|不確定|待確認)?",
+        "",
+        direct_haystack,
+    )
+    certainty_haystack = re.sub(
+        r"(?:要看|看|視).{0,8}(?:再)?決定(?:幾點|時間)"
+        r"(?:出發|返程|回程)?|"
+        r"等.{0,8}(?:(?:才|再)(?:能)?決定)(?:幾點|時間)"
+        r"(?:出發|返程|回程)?|"
+        r"(?:不確定|尚未確定|還沒確定|未確定)"
+        r"(?:是)?(?:確切)?(?:抵達|到家)?(?:的)?(?:幾點|時間)|"
+        r"(?:我|她|他|媽媽|爸爸)?(?:還|尚|仍)?"
+        r"(?:不確定|尚未確定|還沒確定|未確定|"
+        r"尚未決定|還沒決定|未決定|不知道|不清楚)"
+        r"(?:(?:要)?(?:搭|坐))?(?:幾點|哪(?:一)?班)(?:的)?"
+        r"(?:車|高鐵|火車|飛機|班機|客運|捷運)(?=\s*(?:$|[，,；;。]))|"
+        r"(?:我|她|他|媽媽|爸爸)?(?:還|尚|仍)?"
+        r"(?:不確定|尚未確定|還沒確定|未確定|"
+        r"尚未決定|還沒決定|未決定|不知道|不清楚)"
+        r"(?:(?:航班|班機|火車|高鐵|客運)(?:的)?時間|"
+        r"(?:返程|回程)(?:的)?(?:時間|班次|車次))|"
+        r"(?:我|她|他|媽媽|爸爸)?(?:還|尚|仍)?"
+        r"(?:不確定|尚未確定|還沒確定|未確定|"
+        r"尚未決定|還沒決定|未決定|不知道|不清楚)"
+        r"(?:要)?(?:搭|坐)(?:車|高鐵|火車|飛機|班機|客運|捷運)"
+        r"(?:還是|或)(?:車|高鐵|火車|飛機|班機|客運|捷運)|"
+        r"(?:我|她|他|媽媽|爸爸)?(?:還|尚|仍)?"
+        r"(?:不確定|尚未確定|還沒確定|未確定|"
+        r"尚未決定|還沒決定|未決定|不知道|不清楚)"
+        r"(?:要)?(?:搭|坐)(?:什麼|哪種)(?:交通工具|車)|"
+        r"(?:我|她|他|媽媽|爸爸)?(?:還|尚|仍)?"
+        r"(?:不確定|尚未確定|還沒確定|未確定|"
+        r"尚未決定|還沒決定|未決定|不知道|不清楚)交通方式|"
+        r"交通方式(?:還沒決定|尚未決定|未決定|未定|不確定|待確認)|"
+        r"(?:車次|班次)(?:未定|不確定|待確認|尚未確定|還沒確定)|"
+        r"(?:我|她|他|媽媽|爸爸)?(?:還|尚|仍)?(?:不知道|不清楚)"
+        r"(?:是)?(?:確切)?(?:抵達|到家)?(?:的)?(?:幾點|時間)|"
+        r"(?:抵達|到家|確切)?(?:的)?(?:幾點|時間)"
+        r"(?:(?:還|尚|仍)?(?:不知道|不清楚)|還沒決定|尚未決定|"
+        r"未決定|未定|不確定|待確認)|"
+        r"(?:返程|回程)(?:的)?(?:幾點|時間|班次|車次)"
+        r"(?:還沒決定|尚未決定|未決定|未定|不確定|待確認)|"
+        r"(?:再確認|需要確認|還要確認)"
+        r"(?:抵達|到家|確切)?(?:的)?時間",
+        "",
+        direct_haystack,
+    )
+    certainty_haystack = re.sub(r"不過|不只|不但|不僅", "", certainty_haystack)
     pattern = _RETURN_HOME_DIRECT_RE_TEMPLATE.format(city=re.escape(home_city))
-    return bool(re.search(pattern, haystack))
+    movement = rf"(?:回(?:到)?|返|返回){re.escape(home_city)}"
+    bare_comeback = rf"回來{_RETURN_HOME_BARE_COMEBACK_CLAUSE_BOUNDARY}"
+    if re.search(
+        rf"(?:討論|規劃|詢問|確認|查詢|查看|搜尋|研究|"
+        rf"安排|預訂|購買|提醒|說明|查).{{0,12}}{movement}"
+        rf".{{0,8}}(?:行程|計畫|交通|班機|機票|車票|票務|"
+        rf"訂位|安排|時間)|"
+        rf"{movement}(?:的)?(?:行程|計畫|交通).{{0,8}}"
+        rf"(?:規劃|說明會|討論|安排|會議)|"
+        rf"{movement}.{{0,4}}(?:說明會|討論會)|"
+        rf"(?:提醒|(?:跟|向).{{0,8}}確認).{{0,16}}{bare_comeback}",
+        haystack,
+    ):
+        return False
+    if re.search(
+        rf"{_RETURN_HOME_UNCERTAINTY_PATTERN}[^，,；;。]*(?:{movement}|"
+        rf"回家|返家|到(?:達)?家|{bare_comeback})",
+        certainty_haystack,
+    ):
+        return False
+    if _return_claim_has_post_uncertainty(certainty_haystack, home_city):
+        return False
+    return bool(re.search(pattern, direct_haystack))
+
+
+def _calendar_event_has_explicit_arrival_time_semantics(
+    event: dict,
+    home_city: str,
+) -> bool:
+    haystack = " ".join(
+        str(event.get(key) or "") for key in ("title", "location")
+    )
+    actor_pattern = "|".join(
+        re.escape(term)
+        for term in _FAMILY_ACTOR_TERMS
+        if term != "全家"
+    )
+    return bool(
+        re.search(
+            rf"(?:到達|抵達){re.escape(home_city)}|"
+            rf"(?:^|(?:{actor_pattern})|我)[\s，,、]*到{re.escape(home_city)}|"
+            rf"(?:到達|抵達)?家{_HOME_WORD_SUFFIX_GUARD}",
+            haystack,
+        )
+    )
 
 
 def _short_calendar_date(event: dict) -> str:
@@ -5318,55 +7631,248 @@ def _short_calendar_date(event: dict) -> str:
         return str(event.get("event_date") or "日期未明")
 
 
+def _calendar_event_time_state(
+    event: dict,
+    today_iso: str,
+    now_hhmm: str | None,
+) -> str:
+    event_date = str(event.get("event_date") or "")
+    if event_date != today_iso:
+        return "future" if event_date > today_iso else "past"
+    event_time = str(event.get("event_time") or "").strip()
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", event_time):
+        return "today_unknown"
+    if not now_hhmm:
+        return "future"
+    return "today_past" if event_time < now_hhmm else "future"
+
+
 def _build_return_home_calendar_reply(
     group_id: str,
     clean_text: str,
     events: list[dict],
     today_iso: str,
     home_city: str = "台北",
+    now_hhmm: str | None = None,
+    actor_override: str | None = None,
+    target_date_isos: set[str] | None = None,
 ) -> str | None:
     """Answer return-home questions from owned events with explicit confidence."""
-    actor = _return_home_query_actor(clean_text)
+    actor = actor_override or _return_home_query_actor(
+        clean_text,
+        home_city=home_city,
+    )
     if actor is None:
         return None
 
-    candidates = [
-        event
-        for event in events
-        if str(event.get("event_date") or "") >= today_iso
-        and _calendar_event_owned_by_actor(group_id, event, actor)
-    ]
+    raw_cache: dict[str, tuple[str | None, str, int | None] | None] = {}
+    candidates: list[tuple[dict, str, str]] = []
+    for event in events:
+        event_date = str(event.get("event_date") or "")
+        if target_date_isos is not None and event_date not in target_date_isos:
+            continue
+        if target_date_isos is None and event_date < today_iso:
+            continue
+        if not _calendar_event_owned_by_actor(
+            group_id,
+            event,
+            actor,
+            raw_cache=raw_cache,
+        ):
+            continue
+        raw = _calendar_source_raw(group_id, event, raw_cache)
+        source_clause = ""
+        source_owner = ""
+        if raw is not None:
+            raw_source_actor = _normalize_family_actor(
+                _alias_from_user_id(raw[0])
+            )
+            source_clause = _source_clause_for_event(
+                raw[1],
+                event_date,
+                event_title=str(event.get("title") or ""),
+                source_date=_calendar_raw_source_date(raw),
+            )
+            if _source_timed_clauses(raw[1]) and not source_clause:
+                continue
+            if raw_source_actor:
+                source_owner = _source_itinerary_actor_for_event(
+                    raw[1],
+                    raw_source_actor,
+                    event_date,
+                    event_title=str(event.get("title") or ""),
+                    source_date=_calendar_raw_source_date(raw),
+                )
+        normalized_actor = _normalize_family_actor(actor)
+        title = str(event.get("title") or "")
+        title_actors = _calendar_event_phrase_actors(title)
+        title_companions = _calendar_companion_action_actors(title)
+        if (
+            title_actors
+            and normalized_actor not in title_actors
+            and not (
+                source_owner == normalized_actor
+                and title_actors.issubset(title_companions)
+            )
+        ):
+            continue
+        source_actors = _calendar_event_phrase_actors(source_clause)
+        source_companions = _calendar_companion_action_actors(source_clause)
+        source_actors.update(
+            _calendar_home_return_action_actors(
+                source_clause,
+                home_city,
+                speaker_actor=source_owner,
+            )
+        )
+        if (
+            source_actors
+            and normalized_actor not in source_actors
+            and not (
+                source_owner == normalized_actor
+                and source_actors.issubset(source_companions)
+            )
+        ):
+            continue
+        if (
+            source_owner
+            and source_owner != normalized_actor
+            and normalized_actor not in source_companions
+        ):
+            continue
+        if (
+            title_actors
+            and source_actors
+            and not title_actors.intersection(source_actors)
+            and not title_actors.issubset(title_companions)
+            and not source_actors.issubset(source_companions)
+        ):
+            continue
+        candidates.append((event, source_clause, source_owner))
     candidates.sort(
-        key=lambda event: (
-            str(event.get("event_date") or ""),
-            str(event.get("event_time") or ""),
-            str(event.get("event_id") or ""),
+        key=lambda candidate: (
+            str(candidate[0].get("event_date") or ""),
+            str(candidate[0].get("event_time") or ""),
+            str(candidate[0].get("event_id") or ""),
         )
     )
 
-    direct = next(
-        (
-            event
-            for event in candidates
-            if _calendar_event_is_direct_home_return(event, home_city)
-        ),
-        None,
-    )
+    direct = None
+    for event, source_clause, source_owner in candidates:
+        title_return_actors = _calendar_home_return_action_actors(
+            str(event.get("title") or ""),
+            home_city,
+        )
+        source_return_actors = _calendar_home_return_action_actors(
+            source_clause,
+            home_city,
+            speaker_actor=source_owner,
+        )
+        inherited_companions = _calendar_companion_action_actors(
+            str(event.get("title") or "")
+        ) | _calendar_companion_action_actors(source_clause)
+        inherited_first_person_return = bool(
+            source_owner == normalized_actor
+            and (title_return_actors | source_return_actors)
+            and (title_return_actors | source_return_actors).issubset(
+                inherited_companions
+            )
+        )
+        actor_mismatch = (
+            title_return_actors
+            and normalized_actor not in title_return_actors
+        ) or (
+            source_return_actors
+            and normalized_actor not in source_return_actors
+        )
+        if actor_mismatch and not inherited_first_person_return:
+            continue
+        if _calendar_event_is_direct_home_return(
+            event,
+            home_city,
+            source_clause=source_clause,
+        ):
+            direct = event
+            break
     if direct is not None:
         date_label = _short_calendar_date(direct)
         title = str(direct.get("title") or f"回{home_city}")
+        time_state = _calendar_event_time_state(direct, today_iso, now_hhmm)
+        if time_state == "today_past":
+            event_time = str(direct.get("event_time") or "")
+            return (
+                f"{actor}今天 {event_time} 有「{title}」的行程紀錄，時間已經過了。\n"
+                "但行程紀錄不能證明人已經到家，目前狀態仍無法確認。"
+            )
+        if time_state == "today_unknown":
+            daypart_match = re.search(
+                r"凌晨|早上|上午|中午|下午|傍晚|晚上|今晚",
+                title,
+            )
+            daypart = daypart_match.group(0) if daypart_match else ""
+            if daypart:
+                when = daypart if daypart == "今晚" else f"今天{daypart}"
+                return (
+                    f"{actor}今天有「{title}」的行程紀錄。\n"
+                    f"所以照目前資料，{actor}預計{when}回到{home_city}；"
+                    "沒有記到確切到家時間，且行程紀錄不能證明人已經到家。"
+                )
+            return (
+                f"{actor}今天有「{title}」的行程紀錄，但沒有記時間。\n"
+                "因此無法確認已經回來，或確切會在幾點到家。"
+            )
+        event_time = str(direct.get("event_time") or "").strip()
+        if time_state == "past":
+            time_label = f" {event_time}" if event_time else ""
+            return (
+                f"{actor}在 {date_label}{time_label} 有「{title}」的過去行程紀錄。\n"
+                "但行程紀錄不能證明當時已經到家。"
+            )
+        if re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", event_time):
+            if not _calendar_event_has_explicit_arrival_time_semantics(
+                direct,
+                home_city,
+            ):
+                return (
+                    f"{actor}目前最直接的行程紀錄是 {date_label} {event_time}"
+                    f"「{title}」。\n"
+                    f"{event_time} 是這筆返程行程的記錄時間；"
+                    "沒有足以確認的抵達或到家時間。"
+                )
+            return (
+                f"{actor}目前最直接的行程紀錄是 {date_label} {event_time}"
+                f"「{title}」。\n"
+                f"所以照目前資料，預計 {date_label} {event_time} 回到{home_city}；"
+                "這是行程記錄的預計時間，不能證明人已經到家。"
+            )
         return (
             f"{actor}目前最直接的行程紀錄是 {date_label}「{title}」。\n"
             f"所以照目前資料，{actor}預計 {date_label} 回到{home_city}；"
             "沒有記到確切到家時間。"
         )
 
-    for event in candidates:
-        place = _calendar_event_home_city_evidence(event, home_city)
+    for event, source_clause, _source_owner in candidates:
+        place = _calendar_event_home_city_evidence(
+            event,
+            home_city,
+            source_clause=source_clause,
+        )
         if place is None:
             continue
         date_label = _short_calendar_date(event)
         title = str(event.get("title") or "未命名行程")
+        time_state = _calendar_event_time_state(event, today_iso, now_hhmm)
+        if time_state in {"today_past", "today_unknown"}:
+            timing = (
+                "時間已經過了"
+                if time_state == "today_past"
+                else "沒有記時間"
+            )
+            return (
+                f"{actor}今天有「{title}」這項{home_city}實體行程（{place}），"
+                f"但{timing}。\n"
+                f"行程本身不能確認{actor}目前是否已回到{home_city}或已經到家。"
+            )
         return (
             f"目前沒有直接寫{actor}幾點回家。\n"
             f"但{actor} {date_label} 有「{title}」，可確認是在{home_city}的"
@@ -5375,29 +7881,52 @@ def _build_return_home_calendar_reply(
             f"行程開始前應已回到{home_city}；無法判斷確切到家時間。"
         )
 
+    if target_date_isos:
+        requested_dates = sorted(target_date_isos)
+        labels = []
+        for value in requested_dates:
+            try:
+                parsed = datetime.strptime(value, "%Y-%m-%d")
+                labels.append(f"{parsed.month}/{parsed.day}")
+            except ValueError:
+                labels.append(value)
+        scope = f"指定日期（{'、'.join(labels)}）"
+    else:
+        scope = "未來"
     return (
-        f"目前能確認是{actor}的未來行程裡，沒有直接寫回家／回{home_city}時間，"
-        f"也沒有足以推斷的{home_city}實體行程，所以暫時無法判斷。"
+        f"目前能確認是{actor}的{scope}行程裡，"
+        f"沒有直接寫回家／回{home_city}時間，"
+        f"也沒有足以推斷的{home_city}實體行程，"
+        "所以暫時無法判斷。"
     )
 
 
-def _resolve_relative_date(text: str):
+def _resolve_relative_date(text: str, reference_date=None):
     """偵測 text 中的相對日期關鍵字 → TW timezone target date。回 None = 沒命中。
 
     支援未來：今天/明天/後天/週X、過去：昨天/前天/上週X/N天前。
     """
     from datetime import datetime as _dt, timedelta as _td
     from zoneinfo import ZoneInfo as _ZI
-    today_tw = _dt.now(_ZI("Asia/Taipei")).date()
+    now_tw = _dt.now(_ZI("Asia/Taipei"))
+    today_tw = reference_date or now_tw.date()
     # 過去先（更具體的字眼優先）
+    if "大前天" in text:
+        return today_tw - _td(days=3)
     if "前天" in text:
         return today_tw - _td(days=2)
     if "昨天" in text:
         return today_tw - _td(days=1)
     if "今天" in text:
         return today_tw
+    if "今晚" in text:
+        return today_tw
     if "明天" in text:
         return today_tw + _td(days=1)
+    if "明晚" in text:
+        return today_tw + _td(days=1)
+    if "大後天" in text:
+        return today_tw + _td(days=3)
     if "後天" in text:
         return today_tw + _td(days=2)
     # 「N 天前」(數字)
@@ -5423,6 +7952,117 @@ def _resolve_relative_date(text: str):
             delta = 7  # 講「週X」通常指下一個
         return today_tw + _td(days=delta)
     return None
+
+
+def _resolve_calendar_query_dates(text: str, reference_date=None) -> tuple:
+    """Resolve one calendar query to one or more concrete Taipei dates."""
+    from datetime import datetime as _dt, timedelta as _td
+    from zoneinfo import ZoneInfo as _ZI
+
+    today_tw = reference_date or _dt.now(_ZI("Asia/Taipei")).date()
+    week_start = today_tw - _td(days=today_tw.weekday())
+    explicit = re.search(
+        r"(?<!\d)(?P<year>\d{4})[-/.](?P<month>1[0-2]|0?[1-9])"
+        r"[-/.](?P<day>3[01]|[12]\d|0?[1-9])(?!\d)",
+        text,
+    )
+    if explicit:
+        try:
+            return (
+                _dt(
+                    int(explicit.group("year")),
+                    int(explicit.group("month")),
+                    int(explicit.group("day")),
+                ).date(),
+            )
+        except ValueError:
+            return ()
+    explicit_zh = re.search(
+        r"(?<!\d)(?P<year>\d{4})年(?P<month>1[0-2]|0?[1-9])月"
+        r"(?P<day>3[01]|[12]\d|0?[1-9])(?:日|號)(?!\d)",
+        text,
+    )
+    if explicit_zh:
+        try:
+            return (
+                _dt(
+                    int(explicit_zh.group("year")),
+                    int(explicit_zh.group("month")),
+                    int(explicit_zh.group("day")),
+                ).date(),
+            )
+        except ValueError:
+            return ()
+    month_day = re.search(
+        r"(?<![\d/.年-])(?P<month>1[0-2]|0?[1-9])"
+        r"(?:/|月)(?P<day>3[01]|[12]\d|0?[1-9])(?:日|號)?(?!\d)",
+        text,
+    )
+    if month_day:
+        try:
+            candidate = _dt(
+                today_tw.year,
+                int(month_day.group("month")),
+                int(month_day.group("day")),
+            ).date()
+            if candidate < today_tw and not re.search(
+                r"上次|之前|上回|前一次|過去",
+                text,
+            ):
+                candidate = candidate.replace(year=today_tw.year + 1)
+            return (candidate,)
+        except ValueError:
+            return ()
+    if "明後天" in text:
+        return (today_tw + _td(days=1), today_tw + _td(days=2))
+    if re.search(r"(?:下個|下)(?:週|周)末", text):
+        saturday = week_start + _td(days=12)
+        return (saturday, saturday + _td(days=1))
+    if re.search(r"(?:(?:這個|這|本)(?:週|周)末|週末)", text):
+        saturday = week_start + _td(days=5)
+        return (saturday, saturday + _td(days=1))
+
+    wmap = {
+        "一": 0,
+        "二": 1,
+        "三": 2,
+        "四": 3,
+        "五": 4,
+        "六": 5,
+        "日": 6,
+        "天": 6,
+    }
+    weekday_match = re.search(
+        r"(?:(下下|下個|下|本|這))?(?:週|周|星期|禮拜)"
+        r"([一二三四五六日天])",
+        text,
+    )
+    if weekday_match:
+        prefix, weekday_text = weekday_match.groups()
+        if prefix in {"本", "這"}:
+            return (week_start + _td(days=wmap[weekday_text]),)
+        if prefix in {"下", "下個"}:
+            return (week_start + _td(days=7 + wmap[weekday_text]),)
+        if prefix == "下下":
+            return (week_start + _td(days=14 + wmap[weekday_text]),)
+        delta = (wmap[weekday_text] - today_tw.weekday()) % 7
+        if delta == 0:
+            delta = 7
+        return (today_tw + _td(days=delta),)
+
+    if re.search(r"(?:本|這)(?:週|周|星期|禮拜)", text):
+        return tuple(week_start + _td(days=offset) for offset in range(7))
+    if re.search(r"(?:下|下個)(?:週|周|星期|禮拜)", text):
+        next_week = week_start + _td(days=7)
+        return tuple(next_week + _td(days=offset) for offset in range(7))
+    if re.search(r"下下(?:週|周|星期|禮拜)", text):
+        next_next_week = week_start + _td(days=14)
+        return tuple(
+            next_next_week + _td(days=offset) for offset in range(7)
+        )
+
+    resolved = _resolve_relative_date(text, reference_date=today_tw)
+    return (resolved,) if resolved is not None else ()
 
 
 # event_type → emoji prefix (plan C: 視覺區分三類)
@@ -5464,8 +8104,29 @@ _TODO_QUERY_RE = re.compile(
 _TODO_CREATE_RE = re.compile(
     r"(?:提醒我|幫我提醒|新增|加一個|加入|設定提醒|記得提醒|麻煩提醒)"
 )
+_EXPLICIT_REMINDER_CREATE_RE = re.compile(
+    r"(?:提醒我|幫我提醒|請提醒我|麻煩提醒我|可以提醒我|能不能提醒我|"
+    r"記得提醒|(?:請|可以|能不能|幫我)?設定\s*"
+    r"(?:一個|這個|這則)?\s*提醒|"
+    r"(?:新增|建立|加入)\s*(?:一個|這個|這則)?\s*提醒|"
+    r"(?:幫我)?(?:加一個|新增|建立|加入).{0,24}提醒)"
+)
 _TODO_QUERY_INTENT_RE = re.compile(
     r"(?:哪些|目前|還有|清單|列表|查|看看|告訴我|會提醒的時間)"
+)
+_REMINDER_STATUS_QUERY_RE = re.compile(
+    r"(?:你)?(?:有沒有|有|是否)(?:已經)?提醒我.{0,24}(?:嗎|呢|[？?])|"
+    r"(?:你)?(?:記得|會)提醒我.{0,24}(?:嗎|呢|[？?])|"
+    r"^(?:(?:咪寶|米堡)[，,\s]*)?(?:你)?(?:已經)?"
+    r"提醒我.{0,24}了(?:嗎|呢|[？?])|"
+    r"^(?:(?:咪寶|米堡)[，,\s]*)?(?:你)?(?:已經)?"
+    r"提醒我.{0,24}了沒[？?]?$|"
+    r"^(?:(?:咪寶|米堡)[，,\s]*)?(?:你)?已經"
+    r"提醒我.{0,24}(?:嗎|呢|[？?])|"
+    r"^(?:(?:咪寶|米堡)[，,\s]*)?(?:你)?"
+    r"提醒過我.{0,24}(?:嗎|呢|[？?])|"
+    r"(?:要|可以)?(?:新增|建立|加入|設定|加)\s*"
+    r"(?:一個|這個|這則)?\s*(?:新的?)?\s*提醒(?:了)?(?:嗎|呢|[？?])"
 )
 _TODO_DETAIL_QUERY_RE = re.compile(r"(?:細節|詳細|完整|網址|連結|驗證碼|票券|預約編號)")
 _REMINDER_TIMING_MARKER_RE = re.compile(r"(?:什麼時候|何時|哪一天|哪天|幾點)")
@@ -5509,11 +8170,449 @@ def _is_todo_query(text: str) -> bool:
     s = (text or "").strip()
     if not s:
         return False
+    if _is_direct_bot_reminder_status_query(s):
+        return True
+    if _REMINDER_STATUS_QUERY_RE.search(s):
+        return True
     if _TODO_CREATE_RE.search(s) and not _TODO_QUERY_INTENT_RE.search(s):
         return False
     if _is_reminder_timing_query(s):
         return True
     return bool(_TODO_QUERY_RE.search(s))
+
+
+def _is_bare_add_question(text: str) -> bool:
+    s = text or ""
+    if re.search(r"(?:新增|加入).{0,12}(?:什麼|哪些|哪)", s):
+        return True
+    if re.search(r"(?:什麼|哪些|哪).{0,12}(?:新增|加入)", s):
+        return True
+    if re.search(
+        r"(?:要|可以)?(?:新增|建立|加入|設定|加)\s*"
+        r"(?:一個|這個|這則)?\s*(?:新的?)?\s*提醒(?:了)?(?:嗎|呢|[？?])",
+        s,
+    ):
+        return True
+    return "提醒" not in s and bool(
+        re.search(r"(?:新增|加入).{0,12}(?:嗎|呢|[？?])", s)
+    )
+
+
+def _normalize_reminder_intent_text(text: str) -> str:
+    return re.sub(
+        r"^(?:@?(?:咪寶|米堡)[\s，,：:]*|/問\s*)",
+        "",
+        (text or "").strip(),
+        count=1,
+    ).strip()
+
+
+def _is_direct_bot_reminder_status_query(text: str) -> bool:
+    """Distinguish a bot-status question from reported third-party speech."""
+    s = _normalize_reminder_intent_text(text)
+    separator = r"[\s，,：:]*"
+    direct_prefix = (
+        rf"(?:(?:不好意思{separator})?"
+        rf"(?:請問|我想問(?:一下)?|想問(?:一下)?|麻煩問(?:一下)?)"
+        rf"{separator})?"
+        rf"(?:(?:你|咪寶|米堡){separator})?"
+        rf"(?:(?:今天|昨天|之前|剛才|剛剛|稍早|目前|現在|到底|究竟)"
+        rf"{separator})*"
+    )
+    question_tail = r"(?:(?:嗎|呢)(?:[？?])?|[？?])"
+    return bool(
+        re.fullmatch(
+            direct_prefix
+            + rf"(?:(?:有沒有|有|是否)(?:已經)?提醒我.{{0,24}}{question_tail}|"
+            rf"(?:記得|會)提醒我.{{0,24}}{question_tail}|"
+            rf"(?:已經)?提醒我.{{0,24}}了{question_tail}|"
+            r"(?:已經)?提醒我.{0,24}了沒[？?]?|"
+            rf"已經提醒我.{{0,24}}{question_tail}|"
+            rf"提醒過我.{{0,24}}{question_tail})",
+            s,
+        )
+    )
+
+
+def _is_reported_reminder_statement(text: str) -> bool:
+    s = _normalize_reminder_intent_text(text)
+    if _is_direct_bot_reminder_status_query(s):
+        return False
+    actor_terms = "|".join(
+        re.escape(term)
+        for term in sorted(_FAMILY_ACTOR_TERMS, key=len, reverse=True)
+        if term != "全家"
+    )
+    identity_term_pattern = r"(?:誰|哪(?:一個)?人|哪(?:一)?位|什麼人|何人)"
+    if re.search(r"提醒我的[^，,。；;？?]+", s):
+        return True
+    relative_clause = re.search(
+        r"提醒我(?P<body>[^，,。；;？?]{1,24}?)的"
+        r"(?P<tail>[^，,。；;？?]+)",
+        s,
+    )
+    if relative_clause is not None:
+        body = relative_clause.group("body").strip()
+        tail = relative_clause.group("tail").strip()
+        direct_content = bool(
+            re.search(
+                r"(?:要|需要|應該|得)(?:做|帶|拿|買|準備|確認|查|問|"
+                r"聯絡|通知)\s*$",
+                body,
+            )
+        )
+        direct_information_action = bool(
+            re.match(r"(?:查|確認|問|詢問|查清楚|弄清楚)", body)
+            and re.fullmatch(
+                r"(?:地點|物流|地址|醫院|位置|原因|時間)"
+                r"[^，,。；;？?]{0,8}(?:為什麼|在哪|哪裡)",
+                tail,
+            )
+        )
+        direct_identity_action = bool(
+            re.match(r"(?:查|確認|問|詢問|查清楚|弄清楚)", body)
+            and re.search(
+                r"(?:負責|開會|出席|參加|接送|值班|主持|報到)",
+                body,
+            )
+            and re.fullmatch(
+                r"人[^，,。；;？?]{0,8}"
+                r"(?:到底|究竟)?(?:會|可能|應該|大概|也許)?是\s*"
+                rf"{identity_term_pattern}",
+                tail,
+            )
+        )
+        person_object_action = bool(
+            re.match(
+                r"(?:聯絡|通知|跟|向|找|問|詢問|請|叫|催|回覆|傳訊息給)",
+                body,
+            )
+            and (
+                bool(
+                    re.search(
+                        r"(?:確認|帶|拿|交|傳|告訴|通知|詢問|問)",
+                        tail,
+                    )
+                )
+                or bool(
+                    re.match(
+                        r"人(?:是否|是不是|是要|會不會|要不要|能否|可否)",
+                        tail,
+                    )
+                )
+            )
+        )
+        simple_possessive_content = bool(
+            re.match(
+                r"(?:買|帶|拿|準備|整理|記錄|查看|收|取|查|確認|繳|"
+                r"付款|支付|寄|提交|領|預約|打|聯絡|處理|傳)",
+                body,
+            )
+            and bool(
+                re.fullmatch(
+                    r"[^，,。；;？?]{0,8}(?:報表|帳單|費用|文件|報告|藥|"
+                    r"門診|電話|資料|東西|物品|包裹|信件|表單|票|證件|"
+                    r"健保卡|禮物|雨傘|鑰匙|早餐|簡報)",
+                    tail,
+                )
+            )
+        )
+        if not any(
+            (
+                direct_content,
+                direct_information_action,
+                direct_identity_action,
+                person_object_action,
+                simple_possessive_content,
+            )
+        ):
+            return True
+    modal_question = re.search(
+        r"(?:能不能|可不可以|(?<!不)可以)[^，,。；;]{0,32}提醒我",
+        s,
+    )
+    if modal_question is not None:
+        delegated = re.search(
+            r"(?:請|讓)\s*(?P<subject>[^，,。；;]{1,20}?)\s*提醒我",
+            modal_question.group(0),
+        )
+        if delegated is not None:
+            subject = _PRIVATE_SCHEDULE_DATE_RE.sub("", delegated.group("subject"))
+            subject = re.sub(
+                r"早上|上午|中午|下午|傍晚|晚上|凌晨|今晚|明晚|"
+                r"先|提前|再|稍後|到時|\s",
+                "",
+                subject,
+            )
+            if subject and subject not in {"你", "我", "咪寶", "米堡"}:
+                return True
+        prefix = s[:modal_question.start()].strip()
+        if not prefix:
+            return False
+        if re.fullmatch(
+            r"(?:(?:不好意思|麻煩)\s*)?(?:我\s*)?"
+            r"(?:想(?:請)?問|請問)?",
+            prefix,
+        ):
+            return False
+        if re.fullmatch(
+            r"(?:關於|有關)\s*(?:我)?[^，,。；;]{1,24}[，,]?",
+            prefix,
+        ):
+            return False
+        date_matches = list(_PRIVATE_SCHEDULE_DATE_RE.finditer(prefix))
+        if date_matches:
+            date_match = date_matches[-1]
+            residue = prefix[:date_match.start()] + prefix[date_match.end():]
+            residue = re.sub(
+                r"早上|上午|中午|下午|傍晚|晚上|凌晨|今晚|明晚|"
+                r"(?:[01]?\d|2[0-3])(?:[:：][0-5]\d|\s*點(?:半)?)?|"
+                r"[一二兩三四五六七八九十]{1,3}\s*點(?:半)?|[\s，,]",
+                "",
+                residue,
+            )
+            if not residue or re.search(
+                r"(?:生日|的(?:藥|回診|行程|事情|活動|約))$",
+                residue,
+            ):
+                return False
+        return True
+    clarification = re.match(
+        r"^(?:我是說|我的意思是說|我想說)\s*",
+        s,
+    )
+    if clarification is not None:
+        remainder = s[clarification.end():]
+        date_match = _PRIVATE_SCHEDULE_DATE_RE.search(remainder)
+        reminder_match = re.search(r"(?:提醒我|幫我提醒|記得提醒)", remainder)
+        if date_match is not None and reminder_match is not None:
+            if reminder_match.start() < date_match.start():
+                if not remainder[:reminder_match.start()].strip():
+                    return False
+            else:
+                subject_gap = (
+                    remainder[:date_match.start()]
+                    + remainder[date_match.end():reminder_match.start()]
+                )
+                if not re.search(
+                    r"(?:她|他|媽媽|爸爸|妹妹|姐姐|哥哥|醫生|醫師|同事|"
+                    r"朋友|老師|主管|老闆|護理師|阿姨|說|問|表示|提到)",
+                    subject_gap,
+                ):
+                    return False
+    bare_reminder = re.search(r"提醒我", s)
+    if bare_reminder is not None:
+        prefix = s[:bare_reminder.start()].strip()
+        clause_prefix = re.split(r"[，,。；;]", prefix)[-1].strip()
+        if not clause_prefix:
+            return False
+        direct_recipient_re = re.compile(
+            r"(?:(?:我想)?(?:請|麻煩)(?:你|咪寶|米堡)|"
+            r"你|咪寶|米堡)"
+        )
+        recipient = direct_recipient_re.match(clause_prefix)
+        if recipient is not None:
+            recipient_tail = clause_prefix[recipient.end():]
+            recipient_tail = _PRIVATE_SCHEDULE_DATE_RE.sub("", recipient_tail)
+            recipient_tail = re.sub(
+                r"早上|上午|中午|下午|傍晚|晚上|凌晨|今晚|明晚|"
+                r"記得|務必|一定要|先|提前|再|稍後|到時|幫我|幫忙|要|\s",
+                "",
+                recipient_tail,
+            )
+            if not recipient_tail:
+                return False
+        if re.fullmatch(
+            r"(?:請|麻煩|幫我|記得|務必|一定要|先|提前|再|稍後|到時|"
+            r"不要忘記|別忘了|我是說|我的意思是說|我想說|"
+            r"不能不|不得不|不只(?:是)?要|不但要|不僅要)*",
+            clause_prefix,
+        ):
+            return False
+        if re.fullmatch(
+            r"(?:關於|有關)\s*(?:我)?[^，,。；;]{1,24}",
+            prefix.strip("，,"),
+        ):
+            return False
+        date_matches = list(_PRIVATE_SCHEDULE_DATE_RE.finditer(clause_prefix))
+        if date_matches:
+            command_prefix = re.match(
+                r"(?:請|麻煩|幫我|記得|務必|一定要|先|提前|再|稍後|到時|\s)*",
+                clause_prefix,
+            )
+            date_is_clause_leading = bool(
+                command_prefix is not None
+                and date_matches[0].start() == command_prefix.end()
+            )
+            residue = _PRIVATE_SCHEDULE_DATE_RE.sub("", clause_prefix)
+            recipient_residue = re.sub(
+                r"早上|上午|中午|下午|傍晚|晚上|凌晨|今晚|明晚|"
+                r"(?:[01]?\d|2[0-3])(?:[:：][0-5]\d|\s*點(?:半)?)?|"
+                r"[一二兩三四五六七八九十]{1,3}\s*點(?:半)?|\s",
+                "",
+                residue,
+            )
+            date_recipient = direct_recipient_re.match(recipient_residue)
+            if date_recipient is not None:
+                recipient_tail = re.sub(
+                    r"記得|務必|一定要|先|提前|再|稍後|到時|幫我|幫忙|要|\s",
+                    "",
+                    recipient_residue[date_recipient.end():],
+                )
+                if not recipient_tail:
+                    return False
+            residue = re.sub(
+                r"早上|上午|中午|下午|傍晚|晚上|凌晨|今晚|明晚|"
+                r"(?:[01]?\d|2[0-3])(?:[:：][0-5]\d|\s*點(?:半)?)?|"
+                r"[一二兩三四五六七八九十]{1,3}\s*點(?:半)?|"
+                r"請|麻煩|幫我|記得|務必|一定要|先|提前|再|稍後|到時|\s",
+                "",
+                residue,
+            )
+            if not residue or re.search(
+                r"(?:生日|的?(?:藥|回診|行程|事情|活動|約))$",
+                residue,
+            ):
+                return False
+            if date_is_clause_leading and re.search(
+                r"(?:前|後|之前|之後|以前|以後|時)$",
+                residue,
+            ):
+                return False
+            if date_is_clause_leading and (
+                residue == "要"
+                or re.search(
+                    r"(?:出門|下班|開會|上班|上課|看診|吃藥)$",
+                    residue,
+                )
+            ):
+                return False
+        elif re.search(
+            r"(?:生日|的?(?:藥|回診|行程|事情|活動|約))$",
+            clause_prefix,
+        ):
+            return False
+        return True
+    if re.search(
+        rf"(?:{actor_terms}|我媽|我爸|她|他|醫生|醫師|同事|朋友|"
+        rf"老師|主管|老闆|護理師|阿姨).{{0,8}}"
+        r"(?:說|問|告訴|表示|提到)[^，,。；;]{0,32}提醒我",
+        s,
+    ):
+        return True
+    reported_question = re.search(
+        r"(?P<subject>[^\s，,。；;]{1,12})問[^，,。；;]{0,32}提醒我",
+        s,
+    )
+    if reported_question is not None:
+        subject = reported_question.group("subject")
+        if not re.search(r"(?:^|我)(?:想|想要)?$|請$", subject):
+            return True
+    return bool(
+        re.search(
+            r"(?:說|告訴|表示|提到)[^，,。；;]{0,32}提醒我",
+            s,
+        )
+    )
+
+
+def _is_negated_reminder_request(text: str) -> bool:
+    s = _normalize_reminder_intent_text(text)
+    polite_request = re.search(
+        r"(?:能不能|可不可以|(?<!不)可以)[^，,。；;]{0,24}提醒我",
+        s,
+    )
+    if polite_request is not None and not re.search(
+        r"(?:不要|不用|不必|別)[^，,。；;]{0,16}提醒",
+        polite_request.group(0),
+    ):
+        return False
+    if re.search(
+        r"(?:不要|別)\s*(?:忘記|忘了)\s*提醒我|"
+        r"(?:不能|不得|不可以)\s*不\s*提醒我|"
+        r"(?:能不能|可不可以)\s*(?:幫我)?\s*提醒我|"
+        r"(?:不只(?:是)?|不但|不僅)\s*(?:要|需要|得)?\s*(?:你)?\s*提醒我",
+        s,
+    ):
+        return False
+    return bool(
+        re.search(
+            r"(?:請|先|暫時)?\s*(?:不要|不用|不必|別)\s*"
+            r"(?!\s*(?:忘記|忘了))[^，,。；;]{0,12}?(?:提醒|記得|別忘)",
+            s,
+        )
+        or re.search(
+            r"(?:我)?不是(?:要|叫|說)(?:你)?[^，,。；;]{0,12}提醒我|"
+            r"(?:我)?(?:沒有|沒)(?:有)?(?:要(?:你)?|說要)"
+            r"[^，,。；;]{0,12}提醒我",
+            s,
+        )
+        or re.search(
+            r"(?:我)?(?:不是(?:想要|請|希望)|不(?:想要|想讓|希望|需要)|"
+            r"並不需要|無需)(?:你)?[^，,。；;]{0,12}提醒我",
+            s,
+        )
+        or re.search(r"(?:不|沒|別|無需|拒絕)[^，,。；;]{0,24}提醒我", s)
+    )
+
+
+def _has_explicit_reminder_creation_intent(text: str) -> bool:
+    """Keep explicit reminder requests ahead of read-only query routing."""
+    s = _normalize_reminder_intent_text(text)
+    if not s or _is_negated_reminder_request(s):
+        return False
+    if _is_direct_bot_reminder_status_query(s):
+        return False
+    if _REMINDER_STATUS_QUERY_RE.search(s):
+        return False
+    if _is_reported_reminder_statement(s):
+        return False
+    if _is_bare_add_question(s):
+        return False
+    create_match = _EXPLICIT_REMINDER_CREATE_RE.search(s)
+    if create_match is not None:
+        return True
+    remember = re.search(r"(?:記得|別忘)(?:要)?", s)
+    if remember is None:
+        return False
+    reminder_action = re.compile(
+        r"查|查看|確認|買|帶|拿|取|繳|付款|訂|預約|打電話|聯絡|"
+        r"開會|上班|上課|看診|回診|出發|報到|接送|處理|提交|寄|傳"
+    )
+    prefix = s[:remember.start()]
+    if not prefix.strip(" \t，,。；;"):
+        if re.search(r"(?:嗎|呢|[？?])\s*$", s):
+            after_remember = s[remember.end():].lstrip(" \t，,。；;")
+            actor_terms = "|".join(
+                re.escape(term)
+                for term in sorted(_FAMILY_ACTOR_TERMS, key=len, reverse=True)
+                if term != "全家"
+            )
+            if re.match(rf"(?:我(?!們)|{actor_terms})", after_remember):
+                return False
+            if re.search(
+                rf"(?:我(?!們)|{actor_terms}).{{0,24}}"
+                r"(?:要|會|需要)?(?:開會|會議|看診|就醫|上課|上班|活動|行程)",
+                after_remember,
+            ):
+                return False
+        return bool(reminder_action.search(s[remember.end():]))
+
+    for date_match in _PRIVATE_SCHEDULE_DATE_RE.finditer(s):
+        if date_match.end() > remember.start():
+            continue
+        gap = re.sub(
+            r"早上|上午|中午|下午|傍晚|晚上|凌晨|今晚|明晚|"
+            r"務必|一定要|一定|"
+            r"(?:[01]?\d|2[0-3])(?:[:：][0-5]\d|\s*點(?:半)?)?|"
+            r"[一二兩三四五六七八九十]{1,3}\s*點(?:半)?|"
+            r"[\s，,。；;（）()]",
+            "",
+            s[date_match.end():remember.start()],
+        )
+        if not gap:
+            return True
+    return False
 
 
 def _is_conversation_search_query(text: str) -> bool:
@@ -5996,8 +9095,12 @@ def _handle_calendar_query(
     import event_reminder as _er
     from datetime import datetime as _dt
     from zoneinfo import ZoneInfo as _ZI
-    today_tw = _dt.now(_ZI("Asia/Taipei")).date()
-    target = _resolve_relative_date(clean_text)
+    now_tw = _dt.now(_ZI("Asia/Taipei"))
+    today_tw = now_tw.date()
+    target_dates = _resolve_calendar_query_dates(clean_text)
+    invalid_absolute_date = bool(
+        _CALENDAR_ABSOLUTE_DATE_TOKEN_RE.search(clean_text)
+    ) and not target_dates
 
     def _fmt(ev: dict) -> str:
         from datetime import date as _date
@@ -6008,35 +9111,185 @@ def _handle_calendar_query(
             offset = 7  # fallback default
         return _er._format_event(ev, offset)
 
-    home_actor = _return_home_query_actor(clean_text)
-    if home_actor:
-        try:
-            home_events = calendar_db.list_upcoming(group_id, days=90)
-        except Exception as e:
-            logger.warning("return-home calendar query failed: %s", e)
-            reply = "目前暫時讀不到家族行程，無法可靠判斷回家時間。"
+    home_city = os.getenv("FAMILY_HOME_CITY", "台北").strip() or "台北"
+    home_actor = _return_home_query_actor(clean_text, home_city=home_city)
+    resolved_home_actor = home_actor
+    home_actor_error: str | None = None
+    if home_actor == _CALENDAR_AMBIGUOUS_ACTOR:
+        home_actor_error = "請一次指定一位家人，我才能查對應的回家行程。"
+    elif home_actor == _CALENDAR_SELF_ACTOR:
+        sender_user_id = str(
+            getattr(getattr(event, "source", None), "user_id", "") or ""
+        )
+        sender_actor = _normalize_family_actor(
+            _alias_from_user_id(sender_user_id)
+        )
+        known_actors = {
+            _normalize_family_actor(term)
+            for term in _FAMILY_ACTOR_TERMS
+            if term != "全家"
+        }
+        if sender_actor in known_actors:
+            resolved_home_actor = sender_actor
         else:
+            home_actor_error = (
+                "我目前無法辨識你對應的家庭成員，"
+                "因此不會顯示其他人的回家行程。"
+            )
+    if invalid_absolute_date:
+        reply = "這個日期看起來無效，請用實際存在的日期再查一次。"
+    elif home_actor_error:
+        reply = home_actor_error
+    elif resolved_home_actor:
+        try:
+            home_target_isos = (
+                {target_date.isoformat() for target_date in target_dates}
+                if target_dates
+                else None
+            )
+            if target_dates:
+                home_future_days = max(
+                    90,
+                    max(
+                        (target_date - today_tw).days
+                        for target_date in target_dates
+                    ),
+                )
+                home_past_days = max(
+                    90,
+                    max(
+                        (today_tw - target_date).days
+                        for target_date in target_dates
+                    ),
+                )
+                home_events = calendar_db.list_past(
+                    group_id,
+                    days=home_past_days,
+                ) + calendar_db.list_upcoming(
+                    group_id,
+                    days=home_future_days,
+                )
+            else:
+                home_events = calendar_db.list_upcoming(group_id, days=90)
             reply = _build_return_home_calendar_reply(
                 group_id,
                 clean_text,
                 home_events,
                 today_tw.isoformat(),
-                home_city=os.getenv("FAMILY_HOME_CITY", "台北").strip() or "台北",
+                home_city=home_city,
+                now_hhmm=now_tw.strftime("%H:%M"),
+                actor_override=resolved_home_actor,
+                target_date_isos=home_target_isos,
             ) or "目前行程不足以判斷回家時間。"
-    elif target:
+        except Exception as e:
+            logger.warning("return-home calendar query failed: %s", e)
+            reply = "目前暫時讀不到家族行程，無法可靠判斷回家時間。"
+    elif target_dates:
         # branch 1: 具體日期 → past+future 都掃，命中該日的列出
+        future_days = max(
+            90,
+            max((target_date - today_tw).days for target_date in target_dates),
+        )
+        past_days = max(
+            90,
+            max((today_tw - target_date).days for target_date in target_dates),
+        )
         try:
-            past = calendar_db.list_past(group_id, days=90)
-            future = calendar_db.list_upcoming(group_id, days=90)
+            past = calendar_db.list_past(group_id, days=past_days)
+            future = calendar_db.list_upcoming(group_id, days=future_days)
         except Exception as e:
             logger.warning("calendar query list_past/upcoming failed: %s", e)
             past, future = [], []
-        target_iso = target.isoformat()
-        hits = [e for e in (past + future) if e.get("event_date") == target_iso]
-        if hits:
+        target_isos = {target_date.isoformat() for target_date in target_dates}
+        target_label = (
+            target_dates[0].isoformat()
+            if len(target_dates) == 1
+            else f"{target_dates[0].isoformat()}～{target_dates[-1].isoformat()}"
+        )
+        hits = [
+            e for e in (past + future) if e.get("event_date") in target_isos
+        ]
+        query_actors = _calendar_query_subject_actors(clean_text)
+        first_person_query = _calendar_query_is_first_person_subject(clean_text)
+        first_person_actor_unknown = False
+        if first_person_query:
+            query_actors.update(
+                _calendar_query_first_person_joint_actors(clean_text)
+            )
+            sender_user_id = str(
+                getattr(getattr(event, "source", None), "user_id", "") or ""
+            )
+            sender_actor = _normalize_family_actor(
+                _alias_from_user_id(sender_user_id)
+            )
+            known_actors = {
+                _normalize_family_actor(term)
+                for term in _FAMILY_ACTOR_TERMS
+                if term != "全家"
+            }
+            if sender_actor in known_actors:
+                query_actors.add(sender_actor)
+            else:
+                first_person_actor_unknown = True
+        query_places = _calendar_query_places(clean_text)
+        raw_cache: dict[str, tuple[str | None, str, int | None] | None] = {}
+        if first_person_actor_unknown:
+            hits = []
+        elif query_actors:
+            hits = [
+                row
+                for row in hits
+                if any(
+                    _calendar_event_owned_by_actor(
+                        group_id,
+                        row,
+                        actor,
+                        raw_cache=raw_cache,
+                    )
+                    for actor in query_actors
+                )
+            ]
+        hits = _filter_calendar_events_by_query_topic(hits, clean_text)
+        query_daypart = _calendar_query_daypart(clean_text)
+        if query_daypart:
+            hits = [
+                row
+                for row in hits
+                if _calendar_event_matches_query_daypart(row, query_daypart)
+            ]
+        if query_places:
+            place_hits: list[dict] = []
+            for row in hits:
+                raw = _calendar_source_raw(group_id, row, raw_cache)
+                source_clause = (
+                    _source_clause_for_event(
+                        raw[1],
+                        str(row.get("event_date") or ""),
+                        event_title=str(row.get("title") or ""),
+                        source_date=_calendar_raw_source_date(raw),
+                    )
+                    if raw is not None
+                    else ""
+                )
+                if any(
+                    _calendar_event_matches_query_place(
+                        row,
+                        place,
+                        source_clause=source_clause,
+                    )
+                    for place in query_places
+                ):
+                    place_hits.append(row)
+            hits = place_hits
+        if first_person_actor_unknown:
+            reply = (
+                f"{target_label} 我目前無法辨識你對應的家庭成員，"
+                "因此不會顯示其他人的行程。"
+            )
+        elif hits:
             reply = "\n\n".join(_fmt(e) for e in hits)
         else:
-            reply = f"{target_iso} 沒有家族行程喔～"
+            reply = f"{target_label} 沒有家族行程喔～"
     else:
         # branch 2: 無日期 → **預設只看未來**（user 2026-05-21 directive:
         # 「任何詢問通常都在問未來，不用回應過去」）
@@ -6050,8 +9303,28 @@ def _handle_calendar_query(
         def _past(events: list) -> list:
             return [e for e in events if e.get("event_date", "") < today_iso]
 
-        family_kw = ("媽媽", "爸爸", "姊姊", "妹妹", "弟弟", "爺爺", "奶奶", "黃將修")
-        family_nouns = [kw for kw in family_kw if kw in clean_text]
+        family_kw = tuple(term for term in _FAMILY_ACTOR_TERMS if term != "全家")
+        subject_actors, self_subject = _calendar_nondated_query_subjects(
+            clean_text
+        )
+        nondated_self_unknown = False
+        if self_subject:
+            sender_user_id = str(
+                getattr(getattr(event, "source", None), "user_id", "") or ""
+            )
+            sender_actor = _normalize_family_actor(
+                _alias_from_user_id(sender_user_id)
+            )
+            known_actors = {
+                _normalize_family_actor(term)
+                for term in _FAMILY_ACTOR_TERMS
+                if term != "全家"
+            }
+            if sender_actor in known_actors:
+                subject_actors.add(sender_actor)
+            else:
+                nondated_self_unknown = True
+        family_nouns = sorted(subject_actors)
         other_nouns = [
             kw for kw in _QUERY_NOUN_KEYWORDS
             if kw in clean_text and kw not in family_kw
@@ -6061,6 +9334,9 @@ def _handle_calendar_query(
         vn_pairs = _extract_verb_noun_pairs(clean_text)
         phrases = [f"{v}{n}" for v, n in vn_pairs]
         hits_phrase: list = []
+        ownership_cache: dict[
+            str, tuple[str | None, str, int | None] | None
+        ] = {}
         if vn_pairs:
             try:
                 hits_phrase = calendar_db.search_by_title_phrase(
@@ -6072,7 +9348,12 @@ def _handle_calendar_query(
 
         if strict_past:
             # 「上次媽媽什麼時候回台北」→ 只看 past (user 明確要過去)
-            phrase_past = _past(hits_phrase)
+            phrase_past = _filter_calendar_events_by_owned_actors(
+                group_id,
+                _past(hits_phrase),
+                family_nouns,
+                ownership_cache,
+            )
             if phrase_past:
                 reply = "\n\n".join(_fmt(e) for e in phrase_past[:3])
             else:
@@ -6081,6 +9362,12 @@ def _handle_calendar_query(
             # default: future-only — phrase 命中未來就列；沒未來改 noun fallback 找未來
             phrase_future = _filter_calendar_events_by_person_and_topic(
                 _future(hits_phrase), family_nouns, other_nouns
+            )
+            phrase_future = _filter_calendar_events_by_owned_actors(
+                group_id,
+                phrase_future,
+                family_nouns,
+                ownership_cache,
             )
             if phrase_future:
                 reply = "\n\n".join(_fmt(e) for e in phrase_future[:3])
@@ -6100,6 +9387,12 @@ def _handle_calendar_query(
                         noun_future = _future(hits_noun)
                         noun_future = _filter_calendar_events_by_person_and_topic(
                             noun_future, family_nouns, other_nouns
+                        )
+                        noun_future = _filter_calendar_events_by_owned_actors(
+                            group_id,
+                            noun_future,
+                            family_nouns,
+                            ownership_cache,
                         )
                     except Exception as e:
                         logger.warning("calendar noun fallback failed: %s", e)
@@ -6128,6 +9421,11 @@ def _handle_calendar_query(
                         )
                     else:
                         reply = "目前沒有登記的家族行程～"
+        if nondated_self_unknown:
+            reply = (
+                "我目前無法辨識你對應的家庭成員，"
+                "因此不會顯示其他人的行程。"
+            )
     logger.info(
         "calendar query reply built: len=%d preview=%r",
         len(reply), reply[:120],
@@ -9362,7 +12660,17 @@ def _maybe_extract_reminder(
     """
     if not text or len(text) > 500:
         return
-    if reminder_intent.is_obvious_noncommittal_source(text):
+    explicit_reminder_creation = _has_explicit_reminder_creation_intent(text)
+    if _is_negated_reminder_request(text):
+        return
+    if _is_reported_reminder_statement(text):
+        return
+    if _is_bare_add_question(text) and not explicit_reminder_creation:
+        return
+    if (
+        reminder_intent.is_obvious_noncommittal_source(text)
+        and not explicit_reminder_creation
+    ):
         return
     # 必須有日期 + 時間/行動 hint 才送 Gemini（避免「今天天氣」也燒 quota）
     if not _REMINDER_DATE_HINT.search(text):
@@ -9407,9 +12715,12 @@ def _maybe_extract_reminder(
                 result["mention_aliases"] = _medical_mention_aliases(
                     actor, companions
                 )
-        if reminder_intent.should_reject_reminder_candidate(
-            text,
-            result.get("action"),
+        if (
+            reminder_intent.should_reject_reminder_candidate(
+                text,
+                result.get("action"),
+            )
+            and not explicit_reminder_creation
         ):
             return
         # 算 remind_at（local timezone）
