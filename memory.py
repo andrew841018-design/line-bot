@@ -2436,7 +2436,13 @@ def finalize_natural_reminder_delivery(claim: dict) -> bool:
 def finalize_calendar_reminder_delivery(claim: dict) -> bool:
     """Mark one claimed event offset, then release its delivery fence."""
 
-    offset = int(claim.get("offset") or -1)
+    raw_offset = claim.get("offset")
+    if raw_offset is None or isinstance(raw_offset, bool):
+        return False
+    try:
+        offset = int(raw_offset)
+    except (TypeError, ValueError):
+        return False
     if offset not in _CALENDAR_DELIVERY_OFFSETS:
         return False
     params, where = _delivery_claim_where(claim)

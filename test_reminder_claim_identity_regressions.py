@@ -685,6 +685,96 @@ def test_legacy_due_event_mirror_is_created_once_and_can_be_claimed(
     assert memory.release_reminder_delivery_claim(claim)
 
 
+def test_calendar_offset_zero_claim_can_be_finalized(
+    isolated_reminder_db,
+):
+    db_path, memory, calendar_db = isolated_reminder_db
+    event_id = "calendar-offset-zero"
+    event = _insert_legacy_event(
+        db_path,
+        calendar_db,
+        event_id=event_id,
+        days_ahead=0,
+    )
+    assert calendar_db.ensure_event_reminder_mirror(event)
+
+    claim = memory.claim_calendar_reminder_delivery(
+        "G1",
+        "calendar_event",
+        event_id,
+        0,
+        expected_title=str(event["title"]),
+        expected_event_date=str(event["event_date"]),
+        expected_event_time=str(event["event_time"]),
+        expected_location=str(event.get("location") or ""),
+        expected_participants=str(event.get("participants") or "[]"),
+        transport="reply",
+    )
+    assert claim is not None
+    assert claim["offset"] == 0
+
+    assert memory.finalize_calendar_reminder_delivery(claim)
+    with sqlite3.connect(db_path) as conn:
+        event_state = conn.execute(
+            "SELECT reminded_0d, reminded_1d, reminded_2d, reminded_3d, "
+            "reminded_7d, reminded_30d FROM events WHERE event_id=?",
+            (event_id,),
+        ).fetchone()
+        persisted_claim = conn.execute(
+            "SELECT 1 FROM reminder_delivery_claims WHERE claim_token=?",
+            (claim["claim_token"],),
+        ).fetchone()
+    assert event_state is not None
+    assert event_state[0] is not None
+    assert event_state[1:] == (None, None, None, None, None)
+    assert persisted_claim is None
+    assert memory.finalize_calendar_reminder_delivery(claim) is False
+
+
+@pytest.mark.parametrize("invalid_offset", [None, "", "invalid", False, 4])
+def test_calendar_finalize_rejects_invalid_offset_without_releasing_claim(
+    isolated_reminder_db,
+    invalid_offset,
+):
+    db_path, memory, calendar_db = isolated_reminder_db
+    event_id = f"invalid-calendar-offset-{invalid_offset!r}"
+    event = _insert_legacy_event(
+        db_path,
+        calendar_db,
+        event_id=event_id,
+        days_ahead=0,
+    )
+    assert calendar_db.ensure_event_reminder_mirror(event)
+    claim = memory.claim_calendar_reminder_delivery(
+        "G1",
+        "calendar_event",
+        event_id,
+        0,
+        expected_title=str(event["title"]),
+        expected_event_date=str(event["event_date"]),
+        expected_event_time=str(event["event_time"]),
+        expected_location=str(event.get("location") or ""),
+        expected_participants=str(event.get("participants") or "[]"),
+        transport="reply",
+    )
+    assert claim is not None
+    malformed_claim = {**claim, "offset": invalid_offset}
+
+    assert memory.finalize_calendar_reminder_delivery(malformed_claim) is False
+    with sqlite3.connect(db_path) as conn:
+        event_state = conn.execute(
+            "SELECT reminded_0d FROM events WHERE event_id=?",
+            (event_id,),
+        ).fetchone()
+        claim_state = conn.execute(
+            "SELECT state FROM reminder_delivery_claims WHERE claim_token=?",
+            (claim["claim_token"],),
+        ).fetchone()
+    assert event_state == (None,)
+    assert claim_state == ("sending",)
+    assert memory.release_reminder_delivery_claim(claim)
+
+
 @pytest.mark.parametrize("terminal_status", ["done", "expired", "cancelled"])
 def test_legacy_mirror_ensure_never_revives_terminal_source_rows(
     isolated_reminder_db,

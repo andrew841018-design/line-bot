@@ -4732,6 +4732,17 @@ def test_first_person_passenger_return_supports_affirmative_modals(
         "我 8/12 爸爸答應載我回台北，不過現在不會了",
         "我 8/12 爸爸答應載我回台北，但現在不載了",
         "我 8/12 爸爸答應載我回台北，後來反悔了",
+        "我 8/12 爸爸答應載我回台北，但現在不載我了",
+        "我 8/12 爸爸答應送我回台北，不過後來不送我了",
+        "我 8/12 爸爸答應陪我回台北，但現在不陪我了",
+        "我 8/12 爸爸答應接我回台北，但現在不接我了",
+        "我 8/12 爸爸答應帶我回台北，但現在不帶我了",
+        "我 8/12 爸爸答應載我回台北，但現在不會載我了",
+        "我 8/12 爸爸答應送我回台北，但現在不會送我了",
+        "我 8/12 爸爸答應陪我回台北，但現在不會陪我了",
+        "我 8/12 爸爸答應接我回台北，但現在不會接我了",
+        "我 8/12 爸爸答應帶我回台北，但現在不會帶我了",
+        "我 8/12 爸爸答應載我回台北，8/12不載我了",
     ),
 )
 def test_first_person_passenger_negative_or_question_is_not_direct(
@@ -4780,6 +4791,165 @@ def test_first_person_passenger_negative_or_question_is_not_direct(
 
     assert reply is not None
     assert "媽媽預計 8/12 回到台北" not in reply
+
+
+@pytest.mark.parametrize(
+    ("source_text", "event_title", "event_date"),
+    (
+        (
+            "我 8/12 爸爸載我回台北，後天不載我了",
+            "8/12爸爸載媽媽回台北",
+            "2026-08-12",
+        ),
+        (
+            "我明天爸爸載我回台北，週二不載我了",
+            "8/11爸爸載媽媽回台北",
+            "2026-08-11",
+        ),
+    ),
+)
+def test_mixed_date_family_revocation_fails_closed(
+    monkeypatch,
+    source_text,
+    event_title,
+    event_date,
+):
+    import main
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    created_at = int(
+        datetime(2026, 8, 10, 12, 0, tzinfo=ZoneInfo("Asia/Taipei")).timestamp()
+    )
+    monkeypatch.setattr(
+        main.memory,
+        "get_raw_message_record",
+        lambda _gid, _mid: {
+            "group_id": "G1",
+            "message_id": "m1",
+            "user_id": "U_MOM",
+            "text": source_text,
+            "created_at": created_at,
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "_alias_from_user_id",
+        lambda uid: "媽媽" if uid == "U_MOM" else "",
+    )
+
+    reply = main._build_return_home_calendar_reply(
+        "G1",
+        "媽媽什麼時候回家",
+        [
+            {
+                "group_id": "G1",
+                "status": "active",
+                "title": event_title,
+                "event_date": event_date,
+                "participants": '["媽媽"]',
+                "source_msg_id": "m1",
+            }
+        ],
+        "2026-08-11",
+    )
+
+    assert reply is not None
+    assert "媽媽目前最直接的行程紀錄" not in reply
+    assert "預計" not in reply
+
+
+def test_today_and_weekday_revocation_fails_closed_without_source_time():
+    import main
+
+    assert not main._calendar_event_is_direct_home_return(
+        {"title": "媽媽今天回台北，週二不載我了", "location": ""},
+        "台北",
+    )
+    assert not main._calendar_event_is_direct_home_return(
+        {"title": "爸爸週二載我回台北，本週二不載我了", "location": ""},
+        "台北",
+    )
+    assert not main._calendar_event_is_direct_home_return(
+        {"title": "媽媽週末回台北，這週末不載我了", "location": ""},
+        "台北",
+    )
+
+
+def test_bare_and_prefixed_weekday_revocation_uses_source_semantics(monkeypatch):
+    import main
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    created_at = int(
+        datetime(2026, 8, 6, 12, 0, tzinfo=ZoneInfo("Asia/Taipei")).timestamp()
+    )
+    monkeypatch.setattr(
+        main.memory,
+        "get_raw_message_record",
+        lambda _gid, _mid: {
+            "group_id": "G1",
+            "message_id": "m1",
+            "user_id": "U_MOM",
+            "text": "我週三爸爸載我回台北，下週三不載我了",
+            "created_at": created_at,
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "_alias_from_user_id",
+        lambda uid: "媽媽" if uid == "U_MOM" else "",
+    )
+
+    reply = main._build_return_home_calendar_reply(
+        "G1",
+        "媽媽什麼時候回家",
+        [
+            {
+                "group_id": "G1",
+                "status": "active",
+                "title": "週三爸爸載媽媽回台北",
+                "event_date": "2026-08-12",
+                "participants": '["媽媽"]',
+                "source_msg_id": "m1",
+            }
+        ],
+        "2026-08-11",
+    )
+
+    assert reply is not None
+    assert "媽媽預計 8/12 回到台北" not in reply
+
+
+@pytest.mark.parametrize(
+    "title",
+    (
+        "媽媽回台北後不載爸爸了",
+        "爸爸接我回台北，之後不接妹妹了",
+        "爸爸送我回台北，接著不送爸爸了",
+        "爸爸陪我回台北，然後不陪妹妹了",
+        "爸爸載我回台北，回家後不載爸爸了",
+        "爸爸接我回台北以後不接妹妹了",
+        "爸爸接我回台北，以後不接妹妹了",
+        "爸爸接我回台北，接下來不接妹妹了",
+        "爸爸接我回台北，後續不接妹妹了",
+        "媽媽回台北，但之後不載爸爸了",
+        "媽媽回台北，只是接下來不陪爸爸了",
+        "媽媽回台北，但後續不接妹妹了",
+        "爸爸明天載我回台北，後天不載我了",
+        "爸爸8/12載我回台北，8/13不載我了",
+        "爸爸今天接我回台北，明天不接妹妹了",
+        "爸爸週三送我回台北，週四不送我了",
+        "爸爸本週三送我回台北，本週四不送我了",
+    ),
+)
+def test_return_home_followed_by_downstream_transport_change_stays_direct(title):
+    import main
+
+    assert main._calendar_event_is_direct_home_return(
+        {"title": title, "location": ""},
+        "台北",
+    )
 
 
 @pytest.mark.parametrize(

@@ -7217,7 +7217,8 @@ _RETURN_STATUS_UNCERTAINTY_PATTERN = (
     r"還沒確定|尚未確定|沒有確定|不確定|未確定|未決定|"
     r"再確認|待確認|待定|未定|"
     r"不一定|取消|改天|改期|無法|拒絕|放棄|"
-    r"不會了|不載了|不送了|不陪了|不接了|不帶了|反悔了"
+    r"不會了|不(?:會|再)?(?:載|送|陪|接|帶)"
+    r"(?:我|她|他|媽媽|爸爸|妹妹)?了|反悔了"
 )
 _RETURN_CONDITIONAL_UNCERTAINTY_PATTERN = (
     r"|(?:要看|看|視).{0,8}(?:再)?決定"
@@ -7246,6 +7247,9 @@ _RETURN_UNDECIDED_STATUS_SUFFIX_RE = re.compile(
     + _RETURN_STATUS_UNCERTAINTY_PATTERN
     + r")"
     r"[\s？?！!（）()]*$"
+)
+_RETURN_CONTINUATION_PREFIX_PATTERN = (
+    r"(?:回家後|接下來|之後|以後|然後|接著|隨後|後續|後(?!來|天)|再)"
 )
 
 
@@ -7308,6 +7312,62 @@ def _return_uncertainty_is_about_downstream_action(
     return False
 
 
+def _calendar_date_comparison_family(date_text: str) -> str:
+    """Return a stable date-token family for comparisons without source time."""
+    if _CALENDAR_ABSOLUTE_DATE_TOKEN_RE.fullmatch(date_text):
+        return "absolute"
+    if re.fullmatch(
+        r"(?:今晚|明晚|明後天|大後天|大前天|今天|明天|後天|昨天|前天)",
+        date_text,
+    ):
+        return "relative_day"
+    weekday = re.fullmatch(
+        r"(?:(下下|下個|本|這|下))?(?:週|周|星期|禮拜)"
+        r"[一二三四五六日天]",
+        date_text,
+    )
+    if weekday:
+        prefix = weekday.group(1) or "bare"
+        prefix_family = {
+            "這": "current",
+            "本": "current",
+            "下": "next",
+            "下個": "next",
+            "下下": "next2",
+            "bare": "bare",
+        }[prefix]
+        return f"weekday_{prefix_family}"
+    weekend = re.fullmatch(
+        r"(?:(這個|這|本|下個|下)(?:週|周)末|週末)",
+        date_text,
+    )
+    if weekend:
+        prefix = weekend.group(1) or "bare"
+        prefix_family = {
+            "這個": "current",
+            "這": "current",
+            "本": "current",
+            "下": "next",
+            "下個": "next",
+            "bare": "bare",
+        }[prefix]
+        return f"weekend_{prefix_family}"
+    week_range = re.fullmatch(
+        r"(?:(本|這|下|下個|下下)(?:週|周|星期|禮拜))",
+        date_text,
+    )
+    if week_range:
+        prefix_family = {
+            "這": "current",
+            "本": "current",
+            "下": "next",
+            "下個": "next",
+            "下下": "next2",
+        }[week_range.group(1)]
+        return f"week_range_{prefix_family}"
+    return ""
+
+
 def _return_claim_has_post_uncertainty(
     haystack: str,
     home_city: str,
@@ -7318,6 +7378,18 @@ def _return_claim_has_post_uncertainty(
         rf"回來{_RETURN_HOME_BARE_COMEBACK_CLAUSE_BOUNDARY}"
     )
     for movement_match in movement_re.finditer(haystack):
+        proposition_start = max(
+            haystack.rfind(separator, 0, movement_match.start())
+            for separator in ("，", ",", "；", ";", "。")
+        ) + 1
+        movement_date_matches = list(
+            _PRIVATE_SCHEDULE_DATE_RE.finditer(
+                haystack[proposition_start:movement_match.start()]
+            )
+        )
+        movement_date_text = (
+            movement_date_matches[-1].group(0) if movement_date_matches else ""
+        )
         tail = haystack[movement_match.end():]
         clauses = re.split(r"[，,；;。]", tail)
         same_clause = clauses[0].strip()
@@ -7327,17 +7399,25 @@ def _return_claim_has_post_uncertainty(
             home_city,
         ):
             return True
+        sequence_probe = re.sub(r"^(?:但|不過|只是)", "", same_clause)
         continuation = re.sub(
-            r"^(?:後|之後|再|然後|接著|隨後)",
+            rf"^{_RETURN_CONTINUATION_PREFIX_PATTERN}",
             "",
-            same_clause,
+            sequence_probe,
         )
-        has_continuation_connector = continuation != same_clause
+        has_continuation_connector = continuation != sequence_probe
         continuation_is_downstream = bool(
             has_continuation_connector
-            and _return_uncertainty_is_about_downstream_action(
-                continuation,
-                home_city,
+            and (
+                _return_uncertainty_is_about_downstream_action(
+                    continuation,
+                    home_city,
+                )
+                or re.search(
+                    r"不(?:會|再)?(?:載|送|陪|接|帶)"
+                    r"(?:我|她|他|媽媽|爸爸|妹妹)?了",
+                    continuation,
+                )
             )
         )
         if not continuation_is_downstream and _POST_RETURN_UNCERTAINTY_RE.search(
@@ -7346,10 +7426,42 @@ def _return_claim_has_post_uncertainty(
             return True
 
         for clause in clauses[1:]:
+            clause_text = clause.strip()
+            sequence_probe = re.sub(r"^(?:但|不過|只是)", "", clause_text)
+            later_date_match = re.match(
+                rf"^\s*(?P<date>{_CALENDAR_QUERY_DATE_PATTERN})",
+                sequence_probe,
+            )
+            distinct_dated_proposition = False
+            if movement_date_text and later_date_match:
+                later_date_text = later_date_match.group("date")
+                movement_family = _calendar_date_comparison_family(
+                    movement_date_text
+                )
+                later_family = _calendar_date_comparison_family(later_date_text)
+                # Without the raw message's creation date, only tokens from the
+                # same semantic family are stable to compare.  For example,
+                # "明天" and "週二" can name the same day even if a later query
+                # would resolve them differently.
+                if movement_family and movement_family == later_family:
+                    movement_dates = set(
+                        _resolve_calendar_query_dates(movement_date_text)
+                    )
+                    later_dates = set(
+                        _resolve_calendar_query_dates(later_date_text)
+                    )
+                    distinct_dated_proposition = bool(
+                        movement_dates
+                        and later_dates
+                        and movement_dates.isdisjoint(later_dates)
+                    )
+            explicit_downstream_sequence = bool(
+                re.match(rf"^{_RETURN_CONTINUATION_PREFIX_PATTERN}", sequence_probe)
+            )
             normalized = re.sub(
                 r"^(?:但|不過|只是)?(?:目前|現在|暫時)?",
                 "",
-                clause.strip(),
+                clause_text,
             )
             if not normalized:
                 continue
@@ -7365,6 +7477,18 @@ def _return_claim_has_post_uncertainty(
                 normalized,
                 home_city,
             )
+            if explicit_downstream_sequence and re.search(
+                r"不(?:會|再)?(?:載|送|陪|接|帶)"
+                r"(?:我|她|他|媽媽|爸爸|妹妹)?了",
+                normalized,
+            ):
+                downstream = True
+            if distinct_dated_proposition and re.search(
+                r"不(?:會|再)?(?:載|送|陪|接|帶)"
+                r"(?:我|她|他|媽媽|爸爸|妹妹)?了",
+                normalized,
+            ):
+                downstream = True
             if downstream:
                 continue
             return True
