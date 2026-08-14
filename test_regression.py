@@ -358,6 +358,170 @@ def test_prefetch_youtube_trims_trailing_punctuation(monkeypatch):
     assert "YOUTUBE_BLOCK" in out
 
 
+def test_prefetch_google_maps_short_link_extracts_location_from_redirect(monkeypatch):
+    from urllib.parse import quote
+
+    location = "100臺北市中正區黎明里忠孝西路一段38號台北凱撒大飯店"
+    calls: list[tuple[str, dict]] = []
+
+    class FakeResp:
+        status_code = 302
+        headers = {
+            "Location": (
+                "https://maps.google.com?"
+                f"q={quote(location)}&ftid=place-id"
+            )
+        }
+
+        def close(self):
+            pass
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs))
+        return FakeResp()
+
+    monkeypatch.setattr(main._requests, "get", fake_get)
+
+    out = main._prefetch_urls("https://maps.app.goo.gl/example")
+
+    assert f"Google 地圖地點：{location}" in out
+    assert "不要要求使用者另外提供店名或地址" in out
+    assert len(calls) == 1
+    assert calls[0][0] == "https://maps.app.goo.gl/example"
+    assert calls[0][1]["allow_redirects"] is False
+
+
+def test_prefetch_google_maps_validates_each_redirect_before_request(monkeypatch):
+    calls: list[str] = []
+
+    class FakeResp:
+        status_code = 302
+
+        def __init__(self, location):
+            self.headers = {"Location": location}
+
+        def close(self):
+            pass
+
+    responses = {
+        "https://maps.app.goo.gl/first": FakeResp(
+            "https://maps.app.goo.gl/second"
+        ),
+        "https://maps.app.goo.gl/second": FakeResp(
+            "https://maps.google.com.evil.example/maps?q=Fake+Shop"
+        ),
+    }
+
+    def fake_get(url, **_kwargs):
+        calls.append(url)
+        return responses[url]
+
+    monkeypatch.setattr(main._requests, "get", fake_get)
+
+    original = "https://maps.app.goo.gl/first"
+    out = main._prefetch_urls(original)
+
+    assert out == original
+    assert calls == [
+        "https://maps.app.goo.gl/first",
+        "https://maps.app.goo.gl/second",
+    ]
+    assert "Fake Shop" not in out
+
+
+def test_prefetch_google_maps_redirect_loop_fails_closed(monkeypatch):
+    calls: list[str] = []
+
+    class FakeResp:
+        status_code = 302
+
+        def __init__(self, location):
+            self.headers = {"Location": location}
+
+        def close(self):
+            pass
+
+    responses = {
+        "https://maps.app.goo.gl/a": FakeResp("https://maps.app.goo.gl/b"),
+        "https://maps.app.goo.gl/b": FakeResp("https://maps.app.goo.gl/a"),
+    }
+
+    def fake_get(url, **_kwargs):
+        calls.append(url)
+        return responses[url]
+
+    monkeypatch.setattr(main._requests, "get", fake_get)
+
+    original = "https://maps.app.goo.gl/a"
+    out = main._prefetch_urls(original)
+
+    assert out == original
+    assert calls == ["https://maps.app.goo.gl/a", "https://maps.app.goo.gl/b"]
+
+
+def test_prefetch_google_maps_missing_query_fails_closed(monkeypatch):
+    calls: list[str] = []
+
+    class FakeResp:
+        status_code = 302
+        headers = {
+            "Location": "https://maps.google.com/maps?ftid=place-id-only"
+        }
+
+        def close(self):
+            pass
+
+    def fake_get(url, **_kwargs):
+        calls.append(url)
+        return FakeResp()
+
+    monkeypatch.setattr(main._requests, "get", fake_get)
+
+    original = "https://maps.app.goo.gl/no-query"
+    out = main._prefetch_urls(original)
+
+    assert out == original
+    assert calls == [original]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://maps.app.goo.gl/example",
+        "https://user@maps.app.goo.gl/example",
+        "https://maps.app.goo.gl:444/example",
+    ],
+)
+def test_prefetch_google_maps_rejects_invalid_transport_before_request(
+    monkeypatch, url
+):
+    monkeypatch.setattr(
+        main._requests,
+        "get",
+        lambda *_args, **_kwargs: pytest.fail("invalid Maps URL was requested"),
+    )
+
+    assert main._prefetch_urls(url) == url
+
+
+def test_google_maps_query_is_normalized_and_bounded():
+    from urllib.parse import quote
+
+    value = "台北凱撒\n大飯店\u202e"
+    kind, location = main._google_maps_url_kind(
+        f"https://maps.google.com?q={quote(value)}"
+    )
+
+    assert kind == "terminal"
+    assert location == "台北凱撒 大飯店"
+
+    kind, location = main._google_maps_url_kind(
+        f"https://maps.google.com?q={'x' * 301}"
+    )
+    assert kind == "terminal"
+    assert location is None
+
+
 def test_youtube_live_url_is_canonicalized():
     assert (
         main._canonical_youtube_url("https://www.youtube.com/live/LIVE1234567?si=abc")

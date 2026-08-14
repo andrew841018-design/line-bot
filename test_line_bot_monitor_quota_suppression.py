@@ -25,8 +25,13 @@ def _load_monitor(monkeypatch):
 def _stub_healthy_environment(monkeypatch, monitor, state=None):
     saved = {}
     state = dict(state or {})
+
+    def save_health_state(data):
+        saved.update(data)
+        return True
+
     monkeypatch.setattr(monitor, "load_health_state", lambda: dict(state))
-    monkeypatch.setattr(monitor, "save_health_state", lambda d: saved.update(d))
+    monkeypatch.setattr(monitor, "save_health_state", save_health_state)
     monkeypatch.setattr(monitor, "proc_alive", lambda pattern: True)
     monkeypatch.setattr(monitor, "http_health", lambda: (True, 200))
     monkeypatch.setattr(monitor, "check_main_py_drift", lambda: 0)
