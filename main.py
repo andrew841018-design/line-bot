@@ -17,6 +17,7 @@ LINE → FastAPI webhook → Gemini → LINE
 
 from __future__ import annotations
 
+import asyncio
 import json as _json
 import fcntl
 import hashlib
@@ -56,6 +57,7 @@ except ImportError:
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from google.genai import types
+from starlette.concurrency import run_in_threadpool
 from linebot.v3 import WebhookParser  # type: ignore[import-untyped]
 from linebot.v3.exceptions import InvalidSignatureError  # type: ignore[import-untyped]
 from linebot.v3.messaging import (  # type: ignore[import-untyped]
@@ -121,6 +123,8 @@ logger = logging.getLogger("line_bot")
 @asynccontextmanager
 async def _app_lifespan(_app: FastAPI):
     """Run the same startup hooks previously registered via app.on_event."""
+    _app.state.webhook_handler_loop = asyncio.get_running_loop()
+    _app.state.webhook_handler_lock = asyncio.Lock()
     food_safety_client.warm_cache_async()
     if os.getenv("JOBS_ROUTES_ENABLED") == "1":
         from jobs_router import startup_sweep as _ss
@@ -1908,6 +1912,27 @@ def serve_genimg(filename: str):
 # ── Webhook ───────────────────────────────────────────────────────────────────
 
 
+_WEBHOOK_EVENT_HANDLER_LOCK = threading.Lock()
+
+
+def _handle_webhook_event_serialized(event) -> None:
+    """Keep a cancelled callback's live worker from overlapping its successor."""
+    with _WEBHOOK_EVENT_HANDLER_LOCK:
+        _handle_event(event)
+
+
+def _webhook_handler_lock(request: Request) -> asyncio.Lock:
+    """Return the FIFO handler lock for this app's current event loop."""
+    loop = asyncio.get_running_loop()
+    state = request.app.state
+    lock = getattr(state, "webhook_handler_lock", None)
+    if lock is None or getattr(state, "webhook_handler_loop", None) is not loop:
+        lock = asyncio.Lock()
+        state.webhook_handler_loop = loop
+        state.webhook_handler_lock = lock
+    return lock
+
+
 def _hash_text(value: str) -> str:
     import hashlib as _hl
 
@@ -1957,23 +1982,26 @@ async def callback(request: Request, x_line_signature: str = Header(None)):
         raise HTTPException(status_code=400, detail="invalid signature") from None
 
     print(f"[PARSED] event_count={len(events)}", flush=True)
-    for event in events:
-        src = getattr(event, "source", None)
-        gid = getattr(src, "group_id", None) if src else None
-        print(
-            f"[EVENT] type={type(event).__name__} source={type(src).__name__ if src else None} group_id={gid}",
-            flush=True,
-        )
-        # Debug dump is sanitized: no raw message text or raw user_id.
-        if os.getenv("DEBUG_EVENT_DUMP") == "1":
+    # Keep the whole parsed batch ordered. Some callback-owned file/global state
+    # is not independently safe for interleaved event handlers.
+    async with _webhook_handler_lock(request):
+        for event in events:
+            src = getattr(event, "source", None)
+            gid = getattr(src, "group_id", None) if src else None
+            print(
+                f"[EVENT] type={type(event).__name__} source={type(src).__name__ if src else None} group_id={gid}",
+                flush=True,
+            )
+            # Debug dump is sanitized: no raw message text or raw user_id.
+            if os.getenv("DEBUG_EVENT_DUMP") == "1":
+                try:
+                    print(f"[EVENT_DUMP] {_safe_event_debug_dump(event)}", flush=True)
+                except Exception:
+                    print("[EVENT_DUMP] (could not dump sanitized event)", flush=True)
             try:
-                print(f"[EVENT_DUMP] {_safe_event_debug_dump(event)}", flush=True)
-            except Exception:
-                print("[EVENT_DUMP] (could not dump sanitized event)", flush=True)
-        try:
-            _handle_event(event)
-        except Exception as e:
-            logger.exception("handle_event failed: %s", e)
+                await run_in_threadpool(_handle_webhook_event_serialized, event)
+            except Exception as e:
+                logger.exception("handle_event failed: %s", e)
     return {"ok": True}
 
 
