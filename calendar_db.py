@@ -1183,6 +1183,18 @@ def _resolve_quoted_event_id_conn(
     return "resolved", next(iter(resolved_ids))
 
 
+def resolve_quoted_event_identity(
+    group_id: str,
+    quoted_message_id: str,
+) -> tuple[str, str | None]:
+    """Resolve an inbound source or sent reminder to one group-scoped event."""
+
+    if not group_id or not quoted_message_id:
+        return "not_found", None
+    with _lock, _conn() as c:
+        return _resolve_quoted_event_id_conn(c, group_id, quoted_message_id)
+
+
 def _corrected_event_payload_conn(
     c: sqlite3.Connection,
     event: Mapping[str, object],

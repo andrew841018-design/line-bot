@@ -249,6 +249,51 @@ def test_parse_quoted_calendar_correction_rejects_invalid_or_empty_fields(text):
     assert main._parse_quoted_calendar_correction(text)["status"] == "invalid"
 
 
+@pytest.mark.parametrize(
+    ("text", "expected_time"),
+    (
+        ("應該是20:00", "20:00"),
+        ("其實是09：05！", "09:05"),
+        ("原來是 07:30", "07:30"),
+    ),
+)
+def test_parse_markerless_quoted_time_assertion_preserves_title(
+    text,
+    expected_time,
+):
+    import main
+
+    assert main._parse_markerless_quoted_calendar_correction(text) == {
+        "status": "ok",
+        "new_date": None,
+        "new_time": expected_time,
+        "new_title": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "20:00",
+        "20:00 才對",
+        "應該是24:00",
+        "應該是20:60",
+        "應該是2000",
+        "應該是晚上8點",
+        "應該是20:00嗎",
+        "應該是20:00？",
+        "應該是20:00-21:00",
+        "應該是8/20 20:00",
+        "應該是20:00 聚餐",
+        "收到20:00",
+    ),
+)
+def test_parse_markerless_quoted_time_assertion_rejects_ambiguous_text(text):
+    import main
+
+    assert main._parse_markerless_quoted_calendar_correction(text)["status"] == "invalid"
+
+
 def test_wallball_incident_passes_auto_capture_prefilter(monkeypatch):
     import main
 
@@ -1069,6 +1114,375 @@ def test_quoted_route_replies_with_persisted_result_and_disables_push_fallback(
     assert replies[0][1]["allow_push_fallback"] is False
     assert replies[0][1]["include_auxiliary"] is False
     assert cancelled_bursts == ["G1"]
+
+
+def test_markerless_quoted_time_assertion_uses_atomic_route_and_preserves_title(
+    monkeypatch,
+):
+    import main
+    import calendar_db
+
+    calls: list[tuple[tuple, dict]] = []
+    replies: list[tuple[str, dict]] = []
+    cancelled_bursts: list[str] = []
+
+    def correct(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {
+            "status": "updated",
+            "event": {
+                "event_date": "2026-08-03",
+                "event_time": "20:00",
+                "title": "全家壁球",
+            },
+            "reminder": {"action": "全家壁球"},
+        }
+
+    monkeypatch.setattr(
+        calendar_db,
+        "correct_quoted_event_and_reminder",
+        correct,
+    )
+    monkeypatch.setattr(
+        calendar_db,
+        "resolve_quoted_event_identity",
+        lambda *_args, **_kwargs: ("resolved", "synthetic-event"),
+    )
+    monkeypatch.setattr(
+        main,
+        "_reply",
+        lambda token, text, **kwargs: replies.append((text, kwargs)),
+    )
+    monkeypatch.setattr(
+        main.burst_filter,
+        "cancel_burst",
+        lambda group_id: cancelled_bursts.append(group_id),
+    )
+
+    class Message:
+        quoted_message_id = "synthetic-source-message"
+
+    class Event:
+        message = Message()
+        reply_token = "synthetic-reply-token"
+
+    assert main._try_handle_quoted_calendar_correction(
+        Event(),
+        "SYNTHETIC_GROUP",
+        "應該是20:00",
+    )
+    assert len(calls) == 1
+    assert calls[0][0][:2] == (
+        "SYNTHETIC_GROUP",
+        "synthetic-source-message",
+    )
+    assert calls[0][1] == {
+        "new_date": None,
+        "new_month_day": None,
+        "new_time": "20:00",
+        "new_title": None,
+    }
+    assert "2026-08-03 20:00" in replies[0][0]
+    assert "全家壁球" in replies[0][0]
+    assert replies[0][1]["allow_push_fallback"] is False
+    assert replies[0][1]["include_auxiliary"] is False
+    assert cancelled_bursts == ["SYNTHETIC_GROUP"]
+
+
+def test_markerless_quoted_time_non_calendar_source_falls_through(monkeypatch):
+    import main
+    import calendar_db
+
+    replies: list[str] = []
+    cancelled_bursts: list[str] = []
+    monkeypatch.setattr(
+        calendar_db,
+        "resolve_quoted_event_identity",
+        lambda *_args, **_kwargs: ("not_found", None),
+    )
+    monkeypatch.setattr(
+        calendar_db,
+        "correct_quoted_event_and_reminder",
+        lambda *_args, **_kwargs: pytest.fail("non-calendar quote must not mutate"),
+    )
+    monkeypatch.setattr(
+        main,
+        "_reply",
+        lambda _token, text, **_kwargs: replies.append(text),
+    )
+    monkeypatch.setattr(
+        main.burst_filter,
+        "cancel_burst",
+        lambda group_id: cancelled_bursts.append(group_id),
+    )
+
+    class Message:
+        quoted_message_id = "synthetic-non-calendar-source"
+
+    class Event:
+        message = Message()
+        reply_token = "synthetic-reply-token"
+
+    assert not main._try_handle_quoted_calendar_correction(
+        Event(),
+        "SYNTHETIC_GROUP",
+        "應該是20:00",
+    )
+    assert replies == []
+    assert cancelled_bursts == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "20:00",
+        "2026",
+        "20:00 是什麼意思？",
+        "應該是20:00嗎",
+        "應該是8/20 20:00",
+        "應該是晚上8點",
+        "應該是20:00 聚餐",
+        "20:00 才對",
+    ),
+)
+def test_non_exact_markerless_time_for_calendar_source_falls_through(
+    monkeypatch,
+    text,
+):
+    import main
+    import calendar_db
+
+    replies: list[tuple[str, dict]] = []
+    cancelled_bursts: list[str] = []
+    monkeypatch.setattr(
+        calendar_db,
+        "resolve_quoted_event_identity",
+        lambda *_args, **_kwargs: pytest.fail(
+            "non-exact shorthand must not enter calendar identity routing"
+        ),
+    )
+    monkeypatch.setattr(
+        calendar_db,
+        "correct_quoted_event_and_reminder",
+        lambda *_args, **_kwargs: pytest.fail("ambiguous shorthand must not mutate"),
+    )
+    monkeypatch.setattr(
+        main,
+        "_reply",
+        lambda _token, text, **kwargs: replies.append((text, kwargs)),
+    )
+    monkeypatch.setattr(
+        main.burst_filter,
+        "cancel_burst",
+        lambda group_id: cancelled_bursts.append(group_id),
+    )
+
+    class Message:
+        quoted_message_id = "synthetic-calendar-source"
+
+    class Event:
+        message = Message()
+        reply_token = "synthetic-reply-token"
+
+    assert not main._try_handle_quoted_calendar_correction(
+        Event(),
+        "SYNTHETIC_GROUP",
+        text,
+    )
+    assert replies == []
+    assert cancelled_bursts == []
+
+
+def test_markerless_quoted_time_assertion_updates_event_and_mirror_atomically(
+    correction_db,
+    monkeypatch,
+):
+    import main
+
+    db_path, memory, calendar_db = correction_db
+    event_id, reminder_id = _insert_source_event(db_path, calendar_db)
+    before_event = calendar_db.get_active_event_by_id("G1", event_id)
+    before_reminder = memory.get_reminder(reminder_id)
+    assert before_event is not None
+    assert before_reminder is not None
+    replies: list[str] = []
+    cancelled_bursts: list[str] = []
+    monkeypatch.setattr(
+        main,
+        "_reply",
+        lambda _token, text, **_kwargs: replies.append(text),
+    )
+    monkeypatch.setattr(
+        main.burst_filter,
+        "cancel_burst",
+        lambda group_id: cancelled_bursts.append(group_id),
+    )
+    monkeypatch.setattr(
+        main.burst_filter,
+        "add_to_burst",
+        lambda *_args, **_kwargs: pytest.fail("correction must not enter burst"),
+    )
+    monkeypatch.setattr(
+        main,
+        "_try_one_shot_reply",
+        lambda *_args, **_kwargs: pytest.fail("correction must stop before one-shot"),
+    )
+    monkeypatch.setattr(
+        main,
+        "_auto_capture_text_if_important",
+        lambda *_args, **_kwargs: pytest.fail("correction must not auto-capture"),
+    )
+    monkeypatch.setattr(
+        main,
+        "_maybe_extract_reminder",
+        lambda *_args, **_kwargs: pytest.fail("correction must not create a reminder"),
+    )
+    monkeypatch.setattr(
+        main,
+        "_llm_chat",
+        lambda *_args, **_kwargs: pytest.fail("correction must not reach an LLM"),
+    )
+
+    class Message:
+        id = "synthetic-correction-message"
+        text = "應該是20:00"
+        quoted_message_id = "source-message"
+
+    class Source:
+        user_id = "SYNTHETIC_USER"
+
+    class Event:
+        message = Message()
+        source = Source()
+        reply_token = "synthetic-reply-token"
+
+    main._handle_text_message(Event(), "G1")
+
+    event = calendar_db.get_active_event_by_id("G1", event_id)
+    reminder = memory.get_reminder(reminder_id)
+    assert event is not None
+    assert reminder is not None
+    assert event["event_id"] == event_id
+    assert event["event_date"] == "2026-08-02"
+    assert event["event_time"] == "20:00"
+    assert event["title"] == "全家打球"
+    assert event["participants"] == before_event["participants"]
+    assert reminder["reminder_id"] == reminder_id
+    assert reminder["action"] == "全家打球"
+    assert reminder["mention_aliases"] == before_reminder["mention_aliases"]
+    assert reminder["source_kind"] == before_reminder["source_kind"]
+    assert reminder["source_ref"] == before_reminder["source_ref"]
+    assert datetime.fromtimestamp(reminder["remind_at"], tz=_TW).strftime(
+        "%Y-%m-%d %H:%M"
+    ) == "2026-08-02 20:00"
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM reminders").fetchone()[0] == 1
+    assert replies and replies[0].startswith("已更正行程與提醒")
+    assert cancelled_bursts == ["G1"]
+
+
+def test_markerless_time_assertion_replying_to_sent_reminder_updates_same_identity(
+    correction_db,
+    monkeypatch,
+):
+    import main
+
+    db_path, memory, calendar_db = correction_db
+    event_id, reminder_id = _insert_source_event(db_path, calendar_db)
+    assert memory.log_sent_reminder_reference(
+        "G1",
+        "synthetic-sent-reminder",
+        reminder_id=reminder_id,
+        source_kind="calendar_event",
+        source_ref=event_id,
+    )
+    replies: list[str] = []
+    cancelled_bursts: list[str] = []
+    monkeypatch.setattr(
+        main,
+        "_reply",
+        lambda _token, text, **_kwargs: replies.append(text),
+    )
+    monkeypatch.setattr(
+        main.burst_filter,
+        "cancel_burst",
+        lambda group_id: cancelled_bursts.append(group_id),
+    )
+
+    class Message:
+        quoted_message_id = "synthetic-sent-reminder"
+
+    class Event:
+        message = Message()
+        reply_token = "synthetic-reply-token"
+
+    assert main._try_handle_quoted_calendar_correction(
+        Event(),
+        "G1",
+        "應該是20:00",
+    )
+    event = calendar_db.get_active_event_by_id("G1", event_id)
+    reminder = memory.get_reminder(reminder_id)
+    assert event is not None and event["event_time"] == "20:00"
+    assert reminder is not None
+    assert reminder["source_ref"] == event_id
+    assert datetime.fromtimestamp(reminder["remind_at"], tz=_TW).strftime(
+        "%Y-%m-%d %H:%M"
+    ) == "2026-08-02 20:00"
+    assert replies and replies[0].startswith("已更正行程與提醒")
+    assert cancelled_bursts == ["G1"]
+
+
+def test_non_exact_time_replying_to_sent_reminder_falls_through_without_mutation(
+    correction_db,
+    monkeypatch,
+):
+    import main
+
+    db_path, memory, calendar_db = correction_db
+    event_id, reminder_id = _insert_source_event(db_path, calendar_db)
+    assert memory.log_sent_reminder_reference(
+        "G1",
+        "synthetic-sent-reminder",
+        reminder_id=reminder_id,
+        source_kind="calendar_event",
+        source_ref=event_id,
+    )
+    replies: list[str] = []
+    cancelled_bursts: list[str] = []
+    monkeypatch.setattr(
+        main,
+        "_reply",
+        lambda _token, text, **_kwargs: replies.append(text),
+    )
+    monkeypatch.setattr(
+        main.burst_filter,
+        "cancel_burst",
+        lambda group_id: cancelled_bursts.append(group_id),
+    )
+
+    class Message:
+        quoted_message_id = "synthetic-sent-reminder"
+
+    class Event:
+        message = Message()
+        reply_token = "synthetic-reply-token"
+
+    assert not main._try_handle_quoted_calendar_correction(
+        Event(),
+        "G1",
+        "20:00 才對",
+    )
+    event = calendar_db.get_active_event_by_id("G1", event_id)
+    reminder = memory.get_reminder(reminder_id)
+    assert event is not None and event["event_time"] == "19:00"
+    assert reminder is not None
+    assert datetime.fromtimestamp(reminder["remind_at"], tz=_TW).strftime(
+        "%Y-%m-%d %H:%M"
+    ) == "2026-08-02 19:00"
+    assert replies == []
+    assert cancelled_bursts == []
 
 
 def test_invalid_quoted_correction_is_consumed_without_mutation(monkeypatch):

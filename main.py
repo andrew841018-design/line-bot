@@ -83,6 +83,7 @@ from linebot.v3.webhooks import (  # type: ignore[import-untyped]
 )
 
 import burst_filter
+from correction_memory import ORGANIC_CORRECTION_PREFIXES, is_question_like
 import feedback_collector
 import food_safety_client
 import gemini_client
@@ -3427,6 +3428,11 @@ _CALENDAR_CORRECTION_MARKER_RE = re.compile(
 _CALENDAR_CORRECTION_NEGATION_RE = re.compile(
     r"(?:不用|不要|先別|先不要|暫時不要).{0,6}(?:更正|修正|校正|改)"
 )
+_MARKERLESS_QUOTED_TIME_CORRECTION_RE = re.compile(
+    r"^\s*(?:應該是|其實是|原來是|正確是|才是|沒錯|是)\s*"
+    r"(?P<hour>(?:[01]\d|2[0-3]))[:：](?P<minute>[0-5]\d)"
+    r"\s*[。！!]?\s*$"
+)
 _QUOTED_CORRECTION_DATE_RE = re.compile(
     r"(?<!\d)(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}|"
     r"\d{1,2}\s*月\s*\d{1,2}\s*[日號]?|"
@@ -3581,6 +3587,20 @@ def _parse_calendar_correction_time(text: str) -> str | None:
             return None
         return f"{hour:02d}:{int(m.group(3)):02d}"
     return None
+
+
+def _parse_markerless_quoted_calendar_correction(text: str) -> dict:
+    """Parse one narrow time-only correction bound to an exact quoted source."""
+
+    match = _MARKERLESS_QUOTED_TIME_CORRECTION_RE.fullmatch(text or "")
+    if match is None:
+        return {"status": "invalid"}
+    return {
+        "status": "ok",
+        "new_date": None,
+        "new_time": f"{match.group('hour')}:{match.group('minute')}",
+        "new_title": None,
+    }
 
 
 def _parse_quoted_calendar_correction(text: str) -> dict:
@@ -4152,11 +4172,25 @@ def _try_handle_quoted_calendar_correction(
 ) -> bool:
     message = getattr(event, "message", None)
     quoted_message_id = getattr(message, "quoted_message_id", None)
-    if not quoted_message_id or not _CALENDAR_CORRECTION_MARKER_RE.search(text or ""):
+    if not quoted_message_id:
         return False
 
+    markerless = not _CALENDAR_CORRECTION_MARKER_RE.search(text or "")
     try:
-        parsed = _parse_quoted_calendar_correction(text)
+        if markerless:
+            parsed = _parse_markerless_quoted_calendar_correction(text)
+            if parsed.get("status") != "ok":
+                return False
+            import calendar_db
+
+            identity_status, _event_id = calendar_db.resolve_quoted_event_identity(
+                group_id,
+                str(quoted_message_id),
+            )
+            if identity_status == "not_found":
+                return False
+        else:
+            parsed = _parse_quoted_calendar_correction(text)
     except Exception:
         logger.exception(
             "quoted calendar correction parse failed group=%s source=%s",
@@ -5022,7 +5056,7 @@ def _handle_text_message(
     # Organic 糾正偵測（2026-05-08 加）：user 講「不對 / 你誤會」之類的
     # 自然糾正訊號 → 抓上一輪 user/bot 訊息拼成 correction 寫進 persona_notes
     # 純信號擷取，**不**接管後續路由（用戶可能糾正完還想繼續對話）
-    _detect_user_correction(text, group_id, sender_user_id)
+    _detect_user_correction(text, group_id, sender_user_id, message_id)
 
     # 自動萃 knowledge graph 三元組（純本機，fire-and-forget）
     try:
@@ -9975,7 +10009,12 @@ def _handle_explicit_text(event: MessageEvent, group_id: str, clean_text: str) -
         return
 
     # 即時糾正偵測：使用者如果在糾正 bot，自動記住
-    _try_save_correction(group_id, clean_text)
+    _try_save_correction(
+        group_id,
+        clean_text,
+        sender_user_id=sender_user_id,
+        message_id=getattr(event.message, "id", "") or "",
+    )
 
     memory.append_turn(group_id, "user", user_input)
     _append_bot_turn(group_id, reply_text)
@@ -12105,33 +12144,77 @@ def _thinking_indicator(group_id: str | None, delay: float = 3.0):
 
 def _get_persona_notes(group_id: str) -> list[dict]:
     """取出 persona notes，供 gemini_client.chat() 注入 system prompt。"""
-    return memory.list_persona_notes(group_id)
+    return memory.list_persona_notes_for_prompt(group_id)
 
 
-# 糾正偵測：使用者 @mention bot 時如果內容像糾正，自動存下來
-_CORRECTION_KEYWORDS = (
-    "不要",
-    "不准",
-    "別再",
-    "下次",
-    "記住",
-    "以後",
-    "不可以",
-    "禁止",
-    "不能",
-    "改掉",
-    "不用",
+# 糾正偵測：使用者 @mention bot 時如果內容像糾正，自動存下來。
+# 只接受明確指令/穩定限制；一般問句或敘述不得污染最高優先 prompt。
+_CORRECTION_DIRECTIVE_RE = re.compile(
+    r"^\s*"
+    r"(?:(?:不對|不是這樣|我是說|我的意思是|你誤會(?:了)?|請修正|改掉)"
+    r"\s*[,，:：;；]?\s*)*"
+    r"(?:(?:咪寶|bot|你)\s*[:：,，]?\s*)?"
+    r"(?:(?:我希望你|麻煩你|請你?|記住|以後|下次)\s*)*"
+    r"(?:不要|不准|別|勿|不可以|禁止|不能|不用|不應該|不應|不該|"
+    r"不必|無需|無須|毋須|不得|嚴禁|不宜|避免|請勿)(?:再)?\s*"
+    r"(?:把|提|說|講|回|答|傳|推|刪|洩|公開|揭露|顯示|寫|標|用|走|去|"
+    r"忘記|重複|透露|包含|給|叫|主動|這樣|那樣)\S*",
+    re.IGNORECASE,
+)
+_CORRECTION_DECLARATIVE_RE = re.compile(
+    r"^(?:自駕|開車(?:時)?|回答(?:時)?|回覆(?:時)?|咪寶|bot).{0,12}"
+    r"(?:不走|不經過|不去|不公開|不洩漏|不揭露|不顯示|不刪除|"
+    r"不傳送|不推播)\S*",
+    re.IGNORECASE,
 )
 
 
-def _try_save_correction(group_id: str, user_text: str) -> None:
+def _is_question_like_correction(text: str) -> bool:
+    """Fail closed before either correction-ingestion route writes memory."""
+    return is_question_like(text)
+
+
+def _correction_actor_key(group_id: str, sender_user_id: str) -> str:
+    """Group-scoped pseudonym; never persist the raw LINE user id."""
+    if not sender_user_id:
+        return ""
+    material = f"{group_id}\0{sender_user_id}".encode("utf-8")
+    return hashlib.sha256(material).hexdigest()
+
+
+def _try_save_correction(
+    group_id: str,
+    user_text: str,
+    sender_user_id: str = "",
+    message_id: str = "",
+) -> None:
     """如果 user_text 看起來像是在糾正 bot 的行為，存成 persona correction。"""
     t = user_text.strip()
-    if len(t) < 4 or len(t) > 100:
+    if len(t) < 3 or len(t) > 100:
         return
-    if any(kw in t for kw in _CORRECTION_KEYWORDS):
-        memory.add_persona_note(group_id, "correction", "使用者糾正", t)
-        logger.info("persona correction saved: %s", t[:60])
+    if _is_question_like_correction(t):
+        return
+    if _CORRECTION_DIRECTIVE_RE.match(t) or _CORRECTION_DECLARATIVE_RE.match(t):
+        try:
+            memory.record_organic_correction_observation(
+                group_id=group_id,
+                observation_id=(
+                    f"line:{message_id}"
+                    if message_id
+                    else f"explicit:{_uuid.uuid4().hex}"
+                ),
+                scenario="使用者糾正",
+                content=t,
+                candidate_rule=t,
+                source_message_id=message_id,
+                actor_key=_correction_actor_key(group_id, sender_user_id),
+            )
+            logger.info("persona correction saved: %s", t[:60])
+        except Exception as exc:
+            logger.warning(
+                "persona correction save failed without blocking reply: %s",
+                exc,
+            )
 
 
 # ── Organic 糾正偵測（2026-05-08 加）────────────────────────────────────────
@@ -12142,26 +12225,7 @@ def _try_save_correction(group_id: str, user_text: str) -> None:
 # 跟 _CORRECTION_KEYWORDS 不同：
 # - _CORRECTION_KEYWORDS 抓「未來規則」（不要 X、別再 X、以後 X）
 # - _ORGANIC_CORRECTION_KEYWORDS 抓「即時糾正上一輪回覆錯了」
-_ORGANIC_CORRECTION_KEYWORDS = (
-    "不對",
-    "不是這樣",
-    "不是這意思",
-    "你誤會",
-    "妳誤會",
-    "我說的是",
-    "我問的是",
-    "我是說",
-    "我意思是",
-    "我意思不是",
-    "重來",
-    "請重答",
-    "你答錯",
-    "妳答錯",
-    "答錯了",
-    "胡說",
-    "亂講",
-    "不是我要的",
-)
+_ORGANIC_CORRECTION_KEYWORDS = ORGANIC_CORRECTION_PREFIXES
 
 
 def _weak_correction_signals(
@@ -12210,7 +12274,10 @@ def _weak_correction_signals(
 
 
 def _detect_user_correction(
-    text: str, group_id: str, sender_user_id: str = ""
+    text: str,
+    group_id: str,
+    sender_user_id: str = "",
+    message_id: str = "",
 ) -> bool:
     """偵測 user 訊息是否在糾正 bot 上一輪回覆。命中 → 寫進 organic correction。
 
@@ -12223,6 +12290,8 @@ def _detect_user_correction(
     try:
         t = (text or "").strip()
         if len(t) < 2 or len(t) > 200:
+            return False
+        if _is_question_like_correction(t):
             return False
 
         # 抓上一輪 user / bot 訊息
@@ -12269,6 +12338,11 @@ def _detect_user_correction(
             prev_bot_msg=prev_bot_msg,
             correction_msg=t,
             summary=summary,
+            observation_id=(
+                f"line:{message_id}" if message_id else f"organic:{_uuid.uuid4().hex}"
+            ),
+            source_message_id=message_id,
+            actor_key=_correction_actor_key(group_id, sender_user_id),
         )
         logger.info(
             "organic correction saved (group=%s, note_id=%s, summary=%r, "

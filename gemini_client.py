@@ -709,9 +709,50 @@ def _build_system_instruction(
             c for c in corrections
             if (c.get("source") or "rule_violation") != "organic"
         ]
-        organic.sort(key=lambda x: x.get("created_at", 0), reverse=True)
+        organic_by_recent = sorted(
+            organic,
+            key=lambda x: (
+                int(x.get("last_seen_at") or x.get("created_at", 0)),
+                int(x.get("canonical_rule_id") or x.get("note_id") or 0),
+            ),
+            reverse=True,
+        )
+        organic_by_recurrence = sorted(
+            organic,
+            key=lambda x: (
+                int(x.get("occurrence_count") or 1),
+                int(x.get("last_seen_at") or x.get("created_at", 0)),
+                int(x.get("canonical_rule_id") or x.get("note_id") or 0),
+            ),
+            reverse=True,
+        )
+        # Preserve immediate correction memory while still boosting repeated
+        # failures.  Without a recency reserve, ten old recurrent rules can
+        # evict a brand-new correction from the very next prompt.
+        selected_organic: list[dict] = []
+        selected_ids: set[tuple] = set()
+        for candidate in organic_by_recent[:3] + organic_by_recurrence:
+            identity = (
+                candidate.get("canonical_rule_id"),
+                candidate.get("note_id"),
+                candidate.get("content"),
+            )
+            if identity in selected_ids:
+                continue
+            selected_ids.add(identity)
+            selected_organic.append(candidate)
+            if len(selected_organic) == 10:
+                break
+        selected_organic.sort(
+            key=lambda x: (
+                int(x.get("occurrence_count") or 1),
+                int(x.get("last_seen_at") or x.get("created_at", 0)),
+                int(x.get("canonical_rule_id") or x.get("note_id") or 0),
+            ),
+            reverse=True,
+        )
         rule_violation.sort(key=lambda x: x.get("created_at", 0), reverse=True)
-        sorted_corrections = (organic + rule_violation)[:10]
+        sorted_corrections = (selected_organic + rule_violation)[:10]
 
         base += (
             "\n\n【⚠️ 規則 0 延伸：你過去違規 / 被使用者糾正過的事項 — "
@@ -721,7 +762,9 @@ def _build_system_instruction(
         for i, c in enumerate(sorted_corrections, 1):
             src = c.get("source") or "rule_violation"
             tag = "organic" if src == "organic" else "rule"
-            base += f"[{i}|{tag}] {c['content']}\n"
+            occurrence = int(c.get("occurrence_count") or 1)
+            recurrence_tag = f"|出現 {occurrence} 次" if occurrence > 1 else ""
+            base += f"[{i}|{tag}{recurrence_tag}] {c['content']}\n"
 
     if facts:
         facts_block = "\n".join(f"- {f}" for f in facts)

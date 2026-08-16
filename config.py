@@ -165,6 +165,11 @@ class Settings(BaseSettings):
     # `.env` at import; SIGHUP won't reload).
     use_rag_graph: bool = False
 
+    # Group-local organic correction canonicalization.  The projection is
+    # additive; setting this false restores the legacy raw recent-10 prompt
+    # without deleting audit or canonical data.
+    correction_canonical_memory_enabled: bool = True
+
     # ── Phase 2B.6 hardening validators ──────────────────────────────────────
     # field-level: every Gemini model name must look like "gemini-..." (catches
     # fat-fingered env values). model-level: gemini_model and gemini_light_model

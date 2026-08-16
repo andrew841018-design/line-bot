@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import threading
@@ -181,11 +182,63 @@ def _init_db() -> None:
                 scenario   TEXT NOT NULL,
                 content    TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
-                source     TEXT NOT NULL DEFAULT 'rule_violation'
+                source     TEXT NOT NULL DEFAULT 'rule_violation',
                     -- 'rule_violation' (黑名單詞觸發) | 'organic' (user 真實糾正)
+                correction_linked INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_persona_notes_group
                 ON persona_notes(group_id, kind);
+            CREATE TABLE IF NOT EXISTS correction_rules (
+                rule_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id         TEXT NOT NULL,
+                canonical_key    TEXT NOT NULL,
+                canonical_rule   TEXT NOT NULL,
+                status           TEXT NOT NULL DEFAULT 'active',
+                occurrence_count INTEGER NOT NULL DEFAULT 1 CHECK(occurrence_count >= 0),
+                first_seen_at    INTEGER NOT NULL,
+                last_seen_at     INTEGER NOT NULL,
+                matcher_version  TEXT NOT NULL DEFAULT 'local-v1',
+                semantic_context TEXT NOT NULL DEFAULT '',
+                UNIQUE(group_id, canonical_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_correction_rules_group_recent
+                ON correction_rules(group_id, status, last_seen_at DESC, rule_id DESC);
+            CREATE INDEX IF NOT EXISTS idx_correction_rules_group_recurrence
+                ON correction_rules(
+                    group_id, status, occurrence_count DESC,
+                    last_seen_at DESC, rule_id DESC
+                );
+            CREATE TABLE IF NOT EXISTS correction_observations (
+                group_id          TEXT NOT NULL,
+                observation_id    TEXT NOT NULL,
+                note_id           INTEGER NOT NULL UNIQUE,
+                source_message_id TEXT NOT NULL DEFAULT '',
+                actor_key         TEXT NOT NULL DEFAULT '',
+                scenario          TEXT NOT NULL,
+                content           TEXT NOT NULL,
+                candidate_rule    TEXT NOT NULL,
+                decision          TEXT NOT NULL,
+                canonical_rule_id INTEGER,
+                match_score       REAL NOT NULL DEFAULT 0,
+                matcher_version   TEXT NOT NULL DEFAULT 'local-v1',
+                observed_at       INTEGER NOT NULL,
+                PRIMARY KEY (group_id, observation_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_correction_observations_rule
+                ON correction_observations(group_id, canonical_rule_id, observed_at);
+            CREATE TABLE IF NOT EXISTS correction_rule_events (
+                event_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id         TEXT NOT NULL,
+                action           TEXT NOT NULL,
+                rule_id          INTEGER,
+                observation_id   TEXT NOT NULL DEFAULT '',
+                payload_json     TEXT NOT NULL DEFAULT '{}',
+                reverts_event_id INTEGER,
+                created_at       INTEGER NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_correction_rule_single_undo
+                ON correction_rule_events(group_id, reverts_event_id)
+                WHERE reverts_event_id IS NOT NULL;
             CREATE TABLE IF NOT EXISTS fact_check_cache (
                 group_id   TEXT NOT NULL,
                 text_hash  TEXT NOT NULL,
@@ -381,6 +434,68 @@ def _init_db() -> None:
             c.execute(
                 "ALTER TABLE persona_notes ADD COLUMN source TEXT NOT NULL "
                 "DEFAULT 'rule_violation'"
+            )
+        if "correction_linked" not in pn_cols:
+            c.execute(
+                "ALTER TABLE persona_notes ADD COLUMN correction_linked "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+        # Idempotent crash repair: ALTER TABLE autocommits in some migration
+        # paths, so startup must repair a flag left stale between ALTER/UPDATE.
+        c.execute(
+            "UPDATE persona_notes SET correction_linked=1 WHERE "
+            "source='organic' AND correction_linked=0 AND EXISTS ("
+            "SELECT 1 FROM correction_observations o "
+            "WHERE o.note_id=persona_notes.note_id)"
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_persona_notes_prompt_projection "
+            "ON persona_notes(group_id, kind, source, correction_linked, "
+            "created_at, note_id)"
+        )
+        rule_cols = [
+            r[1] for r in c.execute("PRAGMA table_info(correction_rules)").fetchall()
+        ]
+        if "semantic_context" not in rule_cols:
+            c.execute(
+                "ALTER TABLE correction_rules ADD COLUMN semantic_context "
+                "TEXT NOT NULL DEFAULT ''"
+            )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_correction_rules_semantic_repair "
+            "ON correction_rules(rule_id) "
+            "WHERE status='active' AND semantic_context=''"
+        )
+        # Crash/intermediate-schema repair: a rule may already have absorbed a
+        # direction-bearing observation before this column existed.  Rebuild
+        # empty state from immutable members before accepting new matches.
+        from correction_memory import combine_semantic_contexts
+
+        empty_semantic_rules = c.execute(
+            "SELECT rule_id, group_id, canonical_rule FROM correction_rules "
+            "WHERE status='active' AND semantic_context=''"
+        ).fetchall()
+        for semantic_rule_id, semantic_group_id, canonical_rule in empty_semantic_rules:
+            member_texts = [
+                row[0]
+                for row in c.execute(
+                    "SELECT candidate_rule FROM correction_observations "
+                    "WHERE group_id=? AND canonical_rule_id=? "
+                    "ORDER BY observed_at, observation_id",
+                    (semantic_group_id, int(semantic_rule_id)),
+                ).fetchall()
+            ]
+            rebuilt_semantic = combine_semantic_contexts(
+                member_texts or [canonical_rule]
+            )
+            c.execute(
+                "UPDATE correction_rules SET semantic_context=? "
+                "WHERE rule_id=? AND group_id=? AND semantic_context=''",
+                (
+                    rebuilt_semantic or "none",
+                    int(semantic_rule_id),
+                    semantic_group_id,
+                ),
             )
         # facts schema migration: add user_id column if missing
         cols = [r[1] for r in c.execute("PRAGMA table_info(facts)").fetchall()]
@@ -1113,8 +1228,9 @@ def get_messages_since(
 
 # ── Persona Notes（人設範例 + 糾正記憶）──────────────────────────────────────
 
-_PERSONA_NOTE_CAP = 50  # 每個 group 每種 kind 最多保留幾筆（先進先出）
-# 2026-05-07 從 20 調 50：corrections 是 quality 違規累積學習，數量太少會 lose history
+_PERSONA_NOTE_CAP = 50
+# 每個 group/kind/source 最多保留 50 筆「未連結」note。Canonical organic
+# audits 是不可變的 source of truth，不受 FIFO 清理；prompt 只讀投影。
 
 
 def add_persona_note(
@@ -1141,14 +1257,20 @@ def add_persona_note(
             (group_id, kind, scenario, content, now, source),
         )
         note_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
-        # 淘汰舊的
+        # Retention is source-local.  Canonical organic observations keep an
+        # immutable persona-note audit; a burst of automated rule violations
+        # must never delete those rows and leave dangling observation links.
         c.execute(
             "DELETE FROM persona_notes WHERE note_id IN ("
-            "  SELECT note_id FROM persona_notes "
-            "  WHERE group_id = ? AND kind = ? "
-            "  ORDER BY created_at DESC LIMIT -1 OFFSET ?"
+            "  SELECT p.note_id FROM persona_notes p "
+            "  WHERE p.group_id = ? AND p.kind = ? AND p.source = ? "
+            "  AND NOT EXISTS ("
+            "    SELECT 1 FROM correction_observations o "
+            "    WHERE o.note_id = p.note_id"
+            "  ) "
+            "  ORDER BY p.created_at DESC, p.note_id DESC LIMIT -1 OFFSET ?"
             ")",
-            (group_id, kind, _PERSONA_NOTE_CAP),
+            (group_id, kind, source, _PERSONA_NOTE_CAP),
         )
         return note_id
 
@@ -1159,6 +1281,10 @@ def add_organic_correction(
     prev_bot_msg: str,
     correction_msg: str,
     summary: str = "",
+    observation_id: str = "",
+    source_message_id: str = "",
+    actor_key: str = "",
+    observed_at: int | None = None,
 ) -> int | None:
     """User 真實糾正 → 寫進 persona_notes（kind='correction', source='organic'）。
 
@@ -1186,9 +1312,21 @@ def add_organic_correction(
                 f"咪寶當時答：{prev_bot}\n"
                 f"user 糾正：{correction}"
             )
-        return add_persona_note(
-            group_id, "correction", "使用者主動糾正", content, source="organic"
+        outcome = record_organic_correction_observation(
+            group_id=group_id,
+            observation_id=(
+                observation_id
+                or source_message_id
+                or f"organic:{uuid.uuid4().hex}"
+            ),
+            scenario="使用者主動糾正",
+            content=content,
+            candidate_rule=summary_clean or correction,
+            source_message_id=source_message_id,
+            actor_key=actor_key,
+            observed_at=observed_at,
         )
+        return int(outcome["note_id"])
     except Exception:
         return None
 
@@ -1224,6 +1362,727 @@ def list_persona_notes(group_id: str, kind: str | None = None) -> list[dict]:
         }
         for r in rows
     ]
+
+
+# ── Canonical organic correction projection ────────────────────────────────
+
+_CORRECTION_MATCHER_VERSION = "local-v1"
+_CORRECTION_DECISIONS = {"distinct", "equivalent", "ambiguous", "conflict"}
+
+
+def _canonical_correction_enabled() -> bool:
+    """Runtime rollback switch; env override is intentionally read per call."""
+    raw = os.environ.get("CORRECTION_CANONICAL_MEMORY_ENABLED")
+    if raw is None:
+        return bool(
+            getattr(settings, "correction_canonical_memory_enabled", True)
+        )
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _correction_rule_rows_conn(c: sqlite3.Connection, group_id: str) -> list[dict]:
+    rows = c.execute(
+        "SELECT rule_id, canonical_rule, canonical_key, occurrence_count, "
+        "first_seen_at, last_seen_at, matcher_version, semantic_context "
+        "FROM correction_rules WHERE group_id=? AND status='active' "
+        "ORDER BY last_seen_at DESC, rule_id DESC",
+        (group_id,),
+    ).fetchall()
+    return [
+        {
+            "rule_id": int(r[0]),
+            "canonical_rule": r[1],
+            "canonical_key": r[2],
+            "occurrence_count": int(r[3]),
+            "first_seen_at": int(r[4]),
+            "last_seen_at": int(r[5]),
+            "matcher_version": r[6],
+            "semantic_context": r[7] or "",
+        }
+        for r in rows
+    ]
+
+
+def _correction_rule_rows_for_prompt_conn(
+    c: sqlite3.Connection,
+    group_id: str,
+) -> list[dict]:
+    """Return a bounded union of recent and recurrent active rules."""
+    rows = c.execute(
+        "WITH selected(rule_id) AS ("
+        " SELECT rule_id FROM ("
+        "  SELECT rule_id FROM correction_rules "
+        "  INDEXED BY idx_correction_rules_group_recent "
+        "  WHERE group_id=? AND status='active' AND occurrence_count>0 "
+        "  ORDER BY last_seen_at DESC, rule_id DESC LIMIT 10"
+        " ) UNION "
+        " SELECT rule_id FROM ("
+        "  SELECT rule_id FROM correction_rules "
+        "  INDEXED BY idx_correction_rules_group_recurrence "
+        "  WHERE group_id=? AND status='active' AND occurrence_count>0 "
+        "  ORDER BY occurrence_count DESC, last_seen_at DESC, rule_id DESC LIMIT 10"
+        " )"
+        ") "
+        "SELECT r.rule_id, r.canonical_rule, r.canonical_key, "
+        "r.occurrence_count, r.first_seen_at, r.last_seen_at, r.matcher_version, "
+        "r.semantic_context "
+        "FROM correction_rules r JOIN selected s ON s.rule_id=r.rule_id "
+        "ORDER BY r.last_seen_at DESC, r.rule_id DESC",
+        (group_id, group_id),
+    ).fetchall()
+    return [
+        {
+            "rule_id": int(r[0]),
+            "canonical_rule": r[1],
+            "canonical_key": r[2],
+            "occurrence_count": int(r[3]),
+            "first_seen_at": int(r[4]),
+            "last_seen_at": int(r[5]),
+            "matcher_version": r[6],
+            "semantic_context": r[7] or "",
+        }
+        for r in rows
+    ]
+
+
+def _canonical_key(candidate: str, *, suffix: str = "") -> str:
+    from correction_memory import normalize_rule
+
+    normalized = normalize_rule(candidate)
+    material = normalized if not suffix else f"{normalized}\0{suffix}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _insert_rule_conn(
+    c: sqlite3.Connection,
+    group_id: str,
+    candidate: str,
+    observed_at: int,
+    *,
+    key_suffix: str = "",
+) -> int:
+    from correction_memory import semantic_context
+
+    key = _canonical_key(candidate, suffix=key_suffix)
+    semantic = semantic_context(candidate) or "none"
+    try:
+        c.execute(
+            "INSERT INTO correction_rules"
+            "(group_id, canonical_key, canonical_rule, status, occurrence_count, "
+            " first_seen_at, last_seen_at, matcher_version, semantic_context) "
+            "VALUES (?, ?, ?, 'active', 0, ?, ?, ?, ?)",
+            (
+                group_id,
+                key,
+                candidate,
+                observed_at,
+                observed_at,
+                _CORRECTION_MATCHER_VERSION,
+                semantic,
+            ),
+        )
+        return int(c.execute("SELECT last_insert_rowid()").fetchone()[0])
+    except sqlite3.IntegrityError:
+        row = c.execute(
+            "SELECT rule_id FROM correction_rules "
+            "WHERE group_id=? AND canonical_key=?",
+            (group_id, key),
+        ).fetchone()
+        if row is None:
+            raise
+        return int(row[0])
+
+
+def _recompute_rule_conn(c: sqlite3.Connection, group_id: str, rule_id: int) -> None:
+    row = c.execute(
+        "SELECT COUNT(*), MIN(observed_at), MAX(observed_at) "
+        "FROM correction_observations "
+        "WHERE group_id=? AND canonical_rule_id=?",
+        (group_id, rule_id),
+    ).fetchone()
+    count = int(row[0] or 0)
+    if count == 0:
+        c.execute(
+            "UPDATE correction_rules SET occurrence_count=0, status='retired' "
+            "WHERE group_id=? AND rule_id=?",
+            (group_id, rule_id),
+        )
+        return
+    from correction_memory import combine_semantic_contexts
+
+    member_rows = c.execute(
+        "SELECT candidate_rule FROM correction_observations "
+        "WHERE group_id=? AND canonical_rule_id=? ORDER BY observed_at, observation_id",
+        (group_id, rule_id),
+    ).fetchall()
+    semantic = combine_semantic_contexts(member[0] for member in member_rows) or "none"
+    c.execute(
+        "UPDATE correction_rules SET occurrence_count=?, first_seen_at=?, "
+        "last_seen_at=?, status='active', semantic_context=? "
+        "WHERE group_id=? AND rule_id=?",
+        (count, int(row[1]), int(row[2]), semantic, group_id, rule_id),
+    )
+
+
+def _event_conn(
+    c: sqlite3.Connection,
+    group_id: str,
+    action: str,
+    *,
+    rule_id: int | None = None,
+    observation_id: str = "",
+    payload: dict | None = None,
+    reverts_event_id: int | None = None,
+    created_at: int | None = None,
+) -> int:
+    c.execute(
+        "INSERT INTO correction_rule_events"
+        "(group_id, action, rule_id, observation_id, payload_json, "
+        " reverts_event_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            group_id,
+            action,
+            rule_id,
+            observation_id,
+            json.dumps(payload or {}, ensure_ascii=False, sort_keys=True),
+            reverts_event_id,
+            int(created_at or _time.time()),
+        ),
+    )
+    return int(c.execute("SELECT last_insert_rowid()").fetchone()[0])
+
+
+def _assign_correction_observation_conn(
+    c: sqlite3.Connection,
+    *,
+    group_id: str,
+    observation_id: str,
+    note_id: int,
+    scenario: str,
+    content: str,
+    candidate_rule: str,
+    source_message_id: str,
+    actor_key: str,
+    observed_at: int,
+    adjudicator=None,
+) -> dict:
+    from correction_memory import default_adjudicator, extract_candidate_rule
+
+    candidate = extract_candidate_rule(content, candidate_rule)
+    existing = _correction_rule_rows_conn(c, group_id)
+    matcher = adjudicator or default_adjudicator
+    try:
+        raw_decision = matcher(existing, candidate)
+    except Exception:
+        raw_decision = {"decision": "ambiguous", "score": 0.0}
+    decision = str((raw_decision or {}).get("decision", "ambiguous"))
+    if decision not in _CORRECTION_DECISIONS:
+        decision = "ambiguous"
+    try:
+        score = max(0.0, min(1.0, float((raw_decision or {}).get("score", 0.0))))
+    except (TypeError, ValueError):
+        score = 0.0
+    match_reason = str((raw_decision or {}).get("reason", ""))[:240]
+
+    rule_id: int | None = None
+    if decision == "equivalent":
+        try:
+            proposed_id = int((raw_decision or {}).get("rule_id"))
+        except (TypeError, ValueError):
+            proposed_id = 0
+        if proposed_id and any(r["rule_id"] == proposed_id for r in existing):
+            rule_id = proposed_id
+        else:
+            decision = "ambiguous"
+    elif decision == "distinct" and candidate:
+        rule_id = _insert_rule_conn(c, group_id, candidate, observed_at)
+        # An exact normalized key may already exist even when an injected
+        # matcher said "distinct".  Treat the unique projection as equivalent.
+        if any(r["rule_id"] == rule_id for r in existing):
+            decision = "equivalent"
+            score = max(score, 1.0)
+    elif decision == "distinct":
+        decision = "ambiguous"
+
+    c.execute(
+        "INSERT INTO correction_observations"
+        "(group_id, observation_id, note_id, source_message_id, actor_key, "
+        " scenario, content, candidate_rule, decision, canonical_rule_id, "
+        " match_score, matcher_version, observed_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            group_id,
+            observation_id,
+            note_id,
+            source_message_id,
+            actor_key,
+            scenario,
+            content,
+            candidate,
+            decision,
+            rule_id,
+            score,
+            _CORRECTION_MATCHER_VERSION,
+            observed_at,
+        ),
+    )
+    c.execute(
+        "UPDATE persona_notes SET correction_linked=1 "
+        "WHERE note_id=? AND group_id=?",
+        (note_id, group_id),
+    )
+
+    occurrence = 0
+    status = decision
+    if rule_id is not None:
+        _recompute_rule_conn(c, group_id, rule_id)
+        occurrence = int(
+            c.execute(
+                "SELECT occurrence_count FROM correction_rules "
+                "WHERE group_id=? AND rule_id=?",
+                (group_id, rule_id),
+            ).fetchone()[0]
+        )
+        status = "new" if occurrence == 1 else "recurrent"
+    _event_conn(
+        c,
+        group_id,
+        "create" if status == "new" else ("merge" if status == "recurrent" else decision),
+        rule_id=rule_id,
+        observation_id=observation_id,
+        payload={"decision": decision, "score": score, "reason": match_reason},
+        created_at=observed_at,
+    )
+    return {
+        "note_id": note_id,
+        "observation_id": observation_id,
+        "rule_id": rule_id,
+        "status": status,
+        "occurrence_count": occurrence,
+        "is_recurrence": occurrence > 1,
+    }
+
+
+def record_organic_correction_observation(
+    group_id: str,
+    observation_id: str,
+    scenario: str,
+    content: str,
+    candidate_rule: str = "",
+    source_message_id: str = "",
+    actor_key: str = "",
+    observed_at: int | None = None,
+    adjudicator=None,
+) -> dict:
+    """Append one raw audit and update its group-local canonical projection.
+
+    ``observation_id`` is the transport idempotency key.  Matcher failure is
+    fail-closed: the raw audit is still stored with an ``ambiguous`` decision.
+    """
+    group = (group_id or "").strip()
+    observation = (observation_id or "").strip()
+    if not group or not observation or len(observation) > 240:
+        raise ValueError("group_id and bounded observation_id are required")
+    scenario_clean = (scenario or "使用者主動糾正").strip()[:120]
+    content_clean = (content or "").strip()[:1600]
+    when = int(observed_at or _time.time())
+
+    with _lock, _conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            duplicate = c.execute(
+                "SELECT note_id, canonical_rule_id, decision FROM "
+                "correction_observations WHERE group_id=? AND observation_id=?",
+                (group, observation),
+            ).fetchone()
+            if duplicate is not None:
+                occurrence = 0
+                if duplicate[1] is not None:
+                    row = c.execute(
+                        "SELECT occurrence_count FROM correction_rules "
+                        "WHERE group_id=? AND rule_id=?",
+                        (group, int(duplicate[1])),
+                    ).fetchone()
+                    occurrence = int(row[0]) if row else 0
+                c.execute("COMMIT")
+                return {
+                    "note_id": int(duplicate[0]),
+                    "observation_id": observation,
+                    "rule_id": int(duplicate[1]) if duplicate[1] is not None else None,
+                    "status": "duplicate",
+                    "occurrence_count": occurrence,
+                    "is_recurrence": occurrence > 1,
+                }
+
+            c.execute(
+                "INSERT INTO persona_notes"
+                "(group_id, kind, scenario, content, created_at, source) "
+                "VALUES (?, 'correction', ?, ?, ?, 'organic')",
+                (group, scenario_clean, content_clean, when),
+            )
+            note_id = int(c.execute("SELECT last_insert_rowid()").fetchone()[0])
+            outcome = _assign_correction_observation_conn(
+                c,
+                group_id=group,
+                observation_id=observation,
+                note_id=note_id,
+                scenario=scenario_clean,
+                content=content_clean,
+                candidate_rule=candidate_rule,
+                source_message_id=(source_message_id or observation)[:240],
+                actor_key=(actor_key or "")[:128],
+                observed_at=when,
+                adjudicator=adjudicator,
+            )
+            c.execute("COMMIT")
+            return outcome
+        except Exception:
+            if c.in_transaction:
+                c.execute("ROLLBACK")
+            raise
+
+
+def list_organic_correction_audits(group_id: str) -> list[dict]:
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT observation_id, note_id, source_message_id, actor_key, "
+            "scenario, content, candidate_rule, decision, canonical_rule_id, "
+            "match_score, matcher_version, observed_at "
+            "FROM correction_observations WHERE group_id=? "
+            "ORDER BY observed_at, observation_id",
+            (group_id,),
+        ).fetchall()
+    return [
+        {
+            "observation_id": r[0],
+            "note_id": int(r[1]),
+            "source_message_id": r[2],
+            "actor_key": r[3],
+            "scenario": r[4],
+            "content": r[5],
+            "candidate_rule": r[6],
+            "decision": r[7],
+            "canonical_rule_id": int(r[8]) if r[8] is not None else None,
+            "match_score": float(r[9]),
+            "matcher_version": r[10],
+            "observed_at": int(r[11]),
+        }
+        for r in rows
+    ]
+
+
+def list_canonical_organic_corrections(group_id: str) -> list[dict]:
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT rule_id, canonical_rule, occurrence_count, first_seen_at, "
+            "last_seen_at, matcher_version FROM correction_rules "
+            "WHERE group_id=? AND status='active' AND occurrence_count>0 "
+            "ORDER BY last_seen_at DESC, occurrence_count DESC, rule_id DESC",
+            (group_id,),
+        ).fetchall()
+    return [
+        {
+            "rule_id": int(r[0]),
+            "canonical_rule": r[1],
+            "occurrence_count": int(r[2]),
+            "recurrence_count": max(int(r[2]) - 1, 0),
+            "is_recurrence": int(r[2]) > 1,
+            "first_seen_at": int(r[3]),
+            "last_seen_at": int(r[4]),
+            "matcher_version": r[5],
+        }
+        for r in rows
+    ]
+
+
+def list_persona_notes_for_prompt(group_id: str) -> list[dict]:
+    """Return legacy notes or a deduplicated canonical organic projection."""
+    if not _canonical_correction_enabled():
+        return list_persona_notes(group_id)
+
+    # Raw notes, canonical rules, and observation links must come from one WAL
+    # read snapshot.  Separate connections can straddle a backfill commit and
+    # briefly omit a correction from both the legacy and canonical projections.
+    with _conn() as c:
+        c.execute("BEGIN")
+        try:
+            note_rows = []
+            for kind, source, linked in (
+                ("example", None, None),
+                ("correction", "rule_violation", None),
+                ("correction", "organic", 0),
+            ):
+                if source is None:
+                    rows = c.execute(
+                        "SELECT note_id, kind, scenario, content, created_at, source "
+                        "FROM persona_notes WHERE group_id=? AND kind=? "
+                        "ORDER BY created_at ASC, note_id ASC LIMIT ?",
+                        (group_id, kind, _PERSONA_NOTE_CAP),
+                    ).fetchall()
+                elif linked is None:
+                    rows = c.execute(
+                        "SELECT note_id, kind, scenario, content, created_at, source "
+                        "FROM persona_notes WHERE group_id=? AND kind=? "
+                        "AND source<>'organic' "
+                        "ORDER BY created_at ASC, note_id ASC LIMIT ?",
+                        (group_id, kind, _PERSONA_NOTE_CAP),
+                    ).fetchall()
+                else:
+                    rows = c.execute(
+                        "SELECT note_id, kind, scenario, content, created_at, source "
+                        "FROM persona_notes WHERE group_id=? AND kind=? "
+                        "AND source='organic' AND correction_linked=0 "
+                        "ORDER BY created_at ASC, note_id ASC LIMIT ?",
+                        (group_id, kind, _PERSONA_NOTE_CAP),
+                    ).fetchall()
+                note_rows.extend(rows)
+            note_rows.sort(key=lambda row: (int(row[4]), int(row[0])))
+            rule_rows = _correction_rule_rows_for_prompt_conn(c, group_id)
+            c.execute("COMMIT")
+        except Exception:
+            if c.in_transaction:
+                c.execute("ROLLBACK")
+            raise
+    all_notes = [
+        {
+            "note_id": int(row[0]),
+            "kind": row[1],
+            "scenario": row[2],
+            "content": row[3],
+            "created_at": int(row[4]),
+            "source": row[5] or "rule_violation",
+        }
+        for row in note_rows
+    ]
+    examples = [n for n in all_notes if n["kind"] == "example"]
+    nonorganic = [
+        n for n in all_notes
+        if n["kind"] == "correction" and n.get("source") != "organic"
+    ]
+    canonical = [
+        {
+            "note_id": rule["rule_id"],
+            "kind": "correction",
+            "scenario": "使用者糾正（canonical）",
+            "content": rule["canonical_rule"],
+            "created_at": rule["last_seen_at"],
+            "last_seen_at": rule["last_seen_at"],
+            "source": "organic",
+            "canonical_rule_id": rule["rule_id"],
+            "occurrence_count": rule["occurrence_count"],
+            "recurrence_count": rule["recurrence_count"],
+            "is_recurrence": rule["is_recurrence"],
+        }
+        for rule in (
+            {
+                **row,
+                "recurrence_count": max(int(row["occurrence_count"]) - 1, 0),
+                "is_recurrence": int(row["occurrence_count"]) > 1,
+            }
+            for row in rule_rows
+            if int(row["occurrence_count"]) > 0
+        )
+    ]
+    # The snapshot query only returned still-unlinked organic notes, so rollout
+    # loses no legacy rule without materializing the entire immutable audit log.
+    legacy_organic = [
+        n for n in all_notes
+        if n["kind"] == "correction"
+        and n.get("source") == "organic"
+    ]
+    return examples + canonical + legacy_organic + nonorganic
+
+
+def backfill_organic_corrections(
+    group_id: str | None = None,
+    *,
+    dry_run: bool = True,
+    limit: int | None = None,
+) -> dict:
+    """Project retained legacy organic notes without mutating their raw rows."""
+    sql = (
+        "SELECT p.note_id, p.group_id, p.scenario, p.content, p.created_at "
+        "FROM persona_notes p LEFT JOIN correction_observations o "
+        "ON o.note_id=p.note_id WHERE p.kind='correction' AND p.source='organic' "
+        "AND o.note_id IS NULL"
+    )
+    params: list[object] = []
+    if group_id:
+        sql += " AND p.group_id=?"
+        params.append(group_id)
+    sql += " ORDER BY p.created_at, p.note_id"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(max(0, int(limit)))
+    with _conn() as c:
+        pending = c.execute(sql, tuple(params)).fetchall()
+    if dry_run:
+        return {"eligible": len(pending), "linked": 0, "unresolved": 0}
+
+    linked = 0
+    unresolved = 0
+    for note_id, gid, scenario, content, created_at in pending:
+        observation_id = f"legacy:{int(note_id)}"
+        with _lock, _conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                current = c.execute(
+                    "SELECT p.scenario, p.content, p.created_at "
+                    "FROM persona_notes p LEFT JOIN correction_observations o "
+                    "ON o.note_id=p.note_id WHERE p.note_id=? AND p.group_id=? "
+                    "AND p.kind='correction' AND p.source='organic' "
+                    "AND o.note_id IS NULL",
+                    (int(note_id), gid),
+                ).fetchone()
+                if current is None:
+                    c.execute("COMMIT")
+                    continue
+                scenario, content, created_at = current
+                outcome = _assign_correction_observation_conn(
+                    c,
+                    group_id=gid,
+                    observation_id=observation_id,
+                    note_id=int(note_id),
+                    scenario=scenario,
+                    content=content,
+                    candidate_rule="",
+                    source_message_id="",
+                    actor_key="",
+                    observed_at=int(created_at),
+                )
+                c.execute("COMMIT")
+            except Exception:
+                if c.in_transaction:
+                    c.execute("ROLLBACK")
+                raise
+        linked += 1
+        if outcome["rule_id"] is None:
+            unresolved += 1
+    return {"eligible": len(pending), "linked": linked, "unresolved": unresolved}
+
+
+def split_correction_rule(
+    group_id: str,
+    rule_id: int,
+    observation_ids: list[str],
+) -> int:
+    """Move selected observations into a new canonical; raw audits stay intact."""
+    selected = list(dict.fromkeys(x.strip() for x in observation_ids if x.strip()))
+    if not selected:
+        raise ValueError("at least one observation_id is required")
+    with _lock, _conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            source = c.execute(
+                "SELECT canonical_rule FROM correction_rules "
+                "WHERE group_id=? AND rule_id=? AND status='active'",
+                (group_id, int(rule_id)),
+            ).fetchone()
+            if source is None:
+                raise ValueError("active source rule not found in group")
+            marks = ",".join("?" for _ in selected)
+            rows = c.execute(
+                "SELECT observation_id, candidate_rule, observed_at "
+                "FROM correction_observations WHERE group_id=? "
+                "AND canonical_rule_id=? AND observation_id IN (" + marks + ")",
+                (group_id, int(rule_id), *selected),
+            ).fetchall()
+            if len(rows) != len(selected):
+                raise ValueError("one or more observations do not belong to source rule")
+            rows_by_id = {r[0]: r for r in rows}
+            first = min(rows, key=lambda r: (int(r[2]), r[0]))
+            new_text = first[1] or source[0]
+            split_token = uuid.uuid4().hex
+            new_rule_id = _insert_rule_conn(
+                c,
+                group_id,
+                new_text,
+                int(first[2]),
+                key_suffix=f"split:{split_token}",
+            )
+            c.execute(
+                "UPDATE correction_observations SET canonical_rule_id=? "
+                "WHERE group_id=? "
+                "AND observation_id IN (" + marks + ")",
+                (new_rule_id, group_id, *selected),
+            )
+            _recompute_rule_conn(c, group_id, int(rule_id))
+            _recompute_rule_conn(c, group_id, new_rule_id)
+            event_id = _event_conn(
+                c,
+                group_id,
+                "split",
+                rule_id=int(rule_id),
+                payload={
+                    "source_rule_id": int(rule_id),
+                    "new_rule_id": new_rule_id,
+                    "observation_ids": selected,
+                    "previous": {
+                        obs_id: {
+                            "canonical_rule_id": int(rule_id),
+                            "decision": "unchanged",
+                        }
+                        for obs_id in rows_by_id
+                    },
+                },
+            )
+            c.execute("COMMIT")
+            return event_id
+        except Exception:
+            if c.in_transaction:
+                c.execute("ROLLBACK")
+            raise
+
+
+def undo_correction_rule_event(group_id: str, event_id: int) -> bool:
+    """Undo one split exactly once and append an undo event."""
+    with _lock, _conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            row = c.execute(
+                "SELECT action, payload_json FROM correction_rule_events "
+                "WHERE group_id=? AND event_id=?",
+                (group_id, int(event_id)),
+            ).fetchone()
+            if row is None or row[0] != "split":
+                c.execute("ROLLBACK")
+                return False
+            if c.execute(
+                "SELECT 1 FROM correction_rule_events "
+                "WHERE group_id=? AND reverts_event_id=?",
+                (group_id, int(event_id)),
+            ).fetchone():
+                c.execute("ROLLBACK")
+                return False
+            payload = json.loads(row[1])
+            source_rule_id = int(payload["source_rule_id"])
+            new_rule_id = int(payload["new_rule_id"])
+            observation_ids = list(payload["observation_ids"])
+            marks = ",".join("?" for _ in observation_ids)
+            moved = c.execute(
+                "UPDATE correction_observations SET canonical_rule_id=? "
+                "WHERE group_id=? "
+                "AND canonical_rule_id=? AND observation_id IN (" + marks + ")",
+                (source_rule_id, group_id, new_rule_id, *observation_ids),
+            )
+            if moved.rowcount != len(observation_ids):
+                raise RuntimeError("split state drift; undo refused")
+            _recompute_rule_conn(c, group_id, source_rule_id)
+            _recompute_rule_conn(c, group_id, new_rule_id)
+            _event_conn(
+                c,
+                group_id,
+                "undo_split",
+                rule_id=source_rule_id,
+                payload={"restored_observation_ids": observation_ids},
+                reverts_event_id=int(event_id),
+            )
+            c.execute("COMMIT")
+            return True
+        except Exception:
+            if c.in_transaction:
+                c.execute("ROLLBACK")
+            raise
 
 
 # ── Reminders（自動偵測時間性事項，2026-05-08 加）────────────────────────────

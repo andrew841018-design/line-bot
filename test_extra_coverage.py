@@ -949,23 +949,23 @@ def test_small_helpers():
 
     # _get_persona_notes
     with patch(
-        "main.memory.list_persona_notes", return_value=[{"note": "test"}]
+        "main.memory.list_persona_notes_for_prompt", return_value=[{"note": "test"}]
     ) as mock_notes:
         main._get_persona_notes("GRP001")
     check("_get_persona_notes → calls list_persona_notes", mock_notes.called)
 
     # _try_save_correction
-    with patch("main.memory.add_persona_note") as mock_add:
+    with patch("main.memory.record_organic_correction_observation") as mock_add:
         main._try_save_correction("GRP001", "x")  # too short → skip
     check("糾正太短 → 不 add", not mock_add.called)
 
-    with patch("main.memory.add_persona_note") as mock_add2:
+    with patch("main.memory.record_organic_correction_observation") as mock_add2:
         main._try_save_correction("GRP001", "這是一段普通訊息，沒有任何糾正關鍵字")
     check("無糾正關鍵字 → 不 add", not mock_add2.called)
 
-    with patch("main.memory.add_persona_note") as mock_add3:
+    with patch("main.memory.record_organic_correction_observation") as mock_add3:
         main._try_save_correction("GRP001", "以後不要這樣回")
-    check("有糾正關鍵字 → add persona note", mock_add3.called)
+    check("有糾正關鍵字 → record correction", mock_add3.called)
 
     # _maybe_extract_facts - bump returns True
     with (
