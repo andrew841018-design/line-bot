@@ -20,19 +20,22 @@ Usage:
   python preflight_check.py --dry-run      # mock LINE API
 """
 from __future__ import annotations
-import argparse, fcntl, hashlib, json, os, re, sqlite3, subprocess, sys, time
+import argparse, fcntl, hashlib, json, os, re, sqlite3, stat, subprocess, sys, time
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
 from pending_reply_policy import pending_reply_enabled
+from quick_tunnel_dns import quick_tunnel_api_dns_check as _shared_quick_tunnel_api_dns_check
 
 BOT_DIR = Path(__file__).resolve().parent
 PENDING_PATH = BOT_DIR / "pending_explicit_reply.json"
 DB_PATH = BOT_DIR / "line_bot.db"
 TUNNEL_URL_STASH = Path("/tmp/cloudflared_line_bot_url.txt")
 CLOUDFLARED_LOG = Path.home() / "Library" / "Logs" / "cloudflared_line_bot.log"
+CLOUDFLARED_STDOUT_LOG = Path.home() / "Library" / "Logs" / "cloudflared_line_bot_stdout.log"
 LOCK_PATH = Path("/tmp/line_bot_preflight.lock")
+CLOUDFLARED_RESTART_LOCK_PATH = Path("/tmp/line_bot_cloudflared_restart.lock")
 CACHE_PATH = Path("/tmp/line_bot_preflight_last_ok.json")
 JSONL_LOG = Path.home() / "Library" / "Logs" / "line_bot_preflight.jsonl"
 CACHE_TTL_SEC = 300
@@ -182,13 +185,31 @@ def _webhook_put_retryable(code, body):
     return 500 <= code < 600
 
 
-def _put_line_webhook_endpoint(token, endpoint, *, retry_delays=(0, 3, 8, 15)):
+def _current_tunnel_generation():
+    try:
+        return _normalize_tunnel_url(TUNNEL_URL_STASH.read_text())
+    except OSError:
+        return ""
+
+
+def _put_line_webhook_endpoint(
+    token,
+    endpoint,
+    *,
+    retry_delays=(0, 3, 8, 15),
+    expected_generation_url=None,
+):
     delays = tuple(retry_delays)
     last_code, last_body = 0, ""
     payload = json.dumps({"endpoint": endpoint})
     for attempt, delay in enumerate(delays, start=1):
         if delay:
             time.sleep(delay)
+        if (
+            expected_generation_url
+            and _current_tunnel_generation() != expected_generation_url
+        ):
+            return 409, "tunnel generation superseded before webhook PUT", attempt
         last_code, last_body = _curl_with_token(
             LINE_WEBHOOK_ENDPOINT,
             token,
@@ -198,6 +219,11 @@ def _put_line_webhook_endpoint(token, endpoint, *, retry_delays=(0, 3, 8, 15)):
             extra_headers=["Content-Type: application/json"],
         )
         if last_code == 200:
+            if (
+                expected_generation_url
+                and _current_tunnel_generation() != expected_generation_url
+            ):
+                return 409, "tunnel generation superseded after webhook PUT", attempt
             return last_code, last_body, attempt
         if attempt >= len(delays) or not _webhook_put_retryable(last_code, last_body):
             return last_code, last_body, attempt
@@ -238,11 +264,73 @@ def _line_path_recovery_detail(alignment_result, e2e_result):
     return " | ".join(parts) or "LINE webhook path stale"
 
 
-def _restart_cloudflared_for_preflight(previous_url, *, timeout=90):
+def _quick_tunnel_api_dns_check():
+    return _shared_quick_tunnel_api_dns_check()
+
+
+def _try_cloudflared_restart_lock():
+    fd = None
+    handle = None
+    try:
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(CLOUDFLARED_RESTART_LOCK_PATH, flags, 0o600)
+        os.fchmod(fd, 0o600)
+        handle = os.fdopen(fd, "r+", encoding="utf-8")
+        fd = None
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return handle
+    except (BlockingIOError, OSError):
+        if handle is not None:
+            handle.close()
+        elif fd is not None:
+            os.close(fd)
+        return None
+
+
+def _release_cloudflared_restart_lock(handle):
+    if handle is None:
+        return
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
+def _cloudflared_runtime_failure_tail(start_size: int) -> str:
+    try:
+        with CLOUDFLARED_STDOUT_LOG.open(errors="ignore") as stream:
+            stream.seek(max(0, start_size))
+            tail = stream.read()[-4000:]
+    except OSError:
+        return ""
+    matches = [
+        line.strip()
+        for line in tail.splitlines()
+        if "failed to request quick Tunnel" in line or "lookup api.trycloudflare.com" in line
+    ]
+    return matches[-1][:240] if matches else ""
+
+
+def _restart_cloudflared_for_preflight(previous_url, *, timeout=90, lock_handle=None):
+    owns_lock = lock_handle is None
+    if owns_lock:
+        lock_handle = _try_cloudflared_restart_lock()
+        if lock_handle is None:
+            return False, "cloudflared_restart_busy"
+    log_start_size = 0
+    try:
+        log_start_size = CLOUDFLARED_STDOUT_LOG.stat().st_size
+    except OSError:
+        pass
     domain = f"gui/{os.getuid()}"
     service = f"{domain}/{CLOUDFLARED_LABEL}"
     plist = Path.home() / "Library" / "LaunchAgents" / f"{CLOUDFLARED_LABEL}.plist"
     try:
+        dns_ok, dns_reason = _quick_tunnel_api_dns_check()
+        if not dns_ok:
+            return False, dns_reason
         printed = subprocess.run(
             ["launchctl", "print", service],
             capture_output=True, text=True, timeout=10,
@@ -275,9 +363,16 @@ def _restart_cloudflared_for_preflight(previous_url, *, timeout=90):
                 continue
             if current and current != previous_url:
                 return True, current
-        return False, f"no fresh cloudflared URL within {timeout}s"
+        runtime_failure = _cloudflared_runtime_failure_tail(log_start_size)
+        detail = f"no fresh cloudflared URL within {timeout}s"
+        if runtime_failure:
+            detail += f"; cloudflared: {runtime_failure}"
+        return False, detail
     except Exception as e:
         return False, f"restart cloudflared exception: {str(e)[:120]}"
+    finally:
+        if owns_lock:
+            _release_cloudflared_restart_lock(lock_handle)
 
 
 def _line_token():
@@ -385,12 +480,18 @@ def check_3_cloudflared_alive():
 
 def check_4_stash_valid():
     r = CheckResult(4, "cloudflared URL stash 可讀 + 安全", critical=True)
-    if not TUNNEL_URL_STASH.exists():
+    try:
+        st = TUNNEL_URL_STASH.lstat()
+    except FileNotFoundError:
         return r.failed(f"{TUNNEL_URL_STASH} 不存在"), ""
-    try: st = TUNNEL_URL_STASH.stat()
-    except OSError as e: return r.failed(f"stat: {e}"), ""
+    except OSError as e:
+        return r.failed(f"stat: {e}"), ""
+    if not stat.S_ISREG(st.st_mode):
+        return r.failed("stash 不是 regular file（拒絕 symlink/device）"), ""
     if st.st_uid != os.getuid():
         return r.failed(f"stash 不屬於當前 uid (owner={st.st_uid}) — 可能被 tamper"), ""
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return r.failed(f"stash group/world writable (mode={oct(st.st_mode & 0o777)})"), ""
     age = time.time() - st.st_mtime
     url = ""
     for _ in range(2):  # retry 1 次防 cloudflared wrapper non-atomic write 撞期
@@ -402,6 +503,22 @@ def check_4_stash_valid():
         return r.failed(f"URL 非 trycloudflare.com 格式 (retry 後): {url[:80]!r}"), ""
     r.detail = f"url={url} age={int(age)}s"
     return r.passed(), url
+
+
+def _stash_allows_cold_bootstrap() -> bool:
+    """Only an absent or safely-owned empty regular stash may bootstrap."""
+    try:
+        st = TUNNEL_URL_STASH.lstat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return bool(
+        stat.S_ISREG(st.st_mode)
+        and st.st_uid == os.getuid()
+        and not (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+        and st.st_size == 0
+    )
 
 
 def check_4c_double_source(stash_url):
@@ -449,7 +566,13 @@ def check_6_line_token():
     return r.passed() if code == 200 else r.failed(f"http {code} body={body[:120]}")
 
 
-def check_7_webhook_alignment(tunnel_url, *, dry_run=False):
+def check_7_webhook_alignment(
+    tunnel_url,
+    *,
+    dry_run=False,
+    allow_mutation=True,
+    expected_generation_url=None,
+):
     r = CheckResult(9, "LINE webhook URL 對齊 cloudflared", critical=True)
     tok = _line_token()
     if not tok: return r.failed("no token"), ""
@@ -461,6 +584,11 @@ def check_7_webhook_alignment(tunnel_url, *, dry_run=False):
     current = d.get("endpoint", "")
     if current == expected: return r.passed(), expected
     if dry_run: return r.autofixed(f"DRY-RUN: would PUT {current!r} → {expected!r}"), expected
+    if not allow_mutation:
+        return r.failed(
+            f"drift detected {current!r} != {expected!r}; mutation deferred pending "
+            "LINE E2E and fresh tunnel generation"
+        ), current
     try:
         with open(LOCK_PATH, "w") as lk:
             try:
@@ -473,7 +601,21 @@ def check_7_webhook_alignment(tunnel_url, *, dry_run=False):
                 finally:
                     _sig.alarm(0)
             except BlockingIOError: return r.failed("flock 30s timeout — concurrent run"), expected
-            put_code, put_body, put_attempts = _put_line_webhook_endpoint(tok, expected)
+            if expected_generation_url:
+                try:
+                    active_generation = _normalize_tunnel_url(TUNNEL_URL_STASH.read_text())
+                except OSError:
+                    active_generation = ""
+                if active_generation != expected_generation_url:
+                    return r.failed(
+                        "webhook PUT blocked: tunnel generation superseded "
+                        f"({active_generation!r} != {expected_generation_url!r})"
+                    ), current
+            put_code, put_body, put_attempts = _put_line_webhook_endpoint(
+                tok,
+                expected,
+                expected_generation_url=expected_generation_url,
+            )
             if put_code != 200:
                 return r.failed(
                     f"PUT http {put_code} after {put_attempts} attempts: {put_body[:120]}"
@@ -550,15 +692,29 @@ def run(args):
     def append(r):
         results.append(r)
         print(f"  [{r.mark}] {r.idx:2d}. {r.name}{' — ' + r.detail if r.detail else ''}")
-    def line_path_once(current_tunnel_url):
+    def line_path_once(
+        current_tunnel_url,
+        *,
+        allow_alignment_mutation,
+        expected_generation_url=None,
+    ):
         r_align, current_webhook_url = check_7_webhook_alignment(
             current_tunnel_url,
             dry_run=args.dry_run,
+            allow_mutation=allow_alignment_mutation,
+            expected_generation_url=expected_generation_url,
         )
         post_autofix_external = None
         if r_align.status == "autofix":
             post_autofix_external = check_5_external_tunnel(current_tunnel_url)
         r_e2e = check_8_line_e2e(dry_run=args.dry_run)
+        if (
+            r_e2e.status == "pass"
+            and r_align.status == "fail"
+            and "mutation deferred" in (r_align.detail or "")
+        ):
+            r_align.critical = False
+            r_align.detail += "; active LINE endpoint retained because E2E is healthy"
         return r_align, current_webhook_url, post_autofix_external, r_e2e
     def append_line_path(r_align, post_autofix_external, r_e2e):
         append(r_align)
@@ -575,14 +731,73 @@ def run(args):
     append(cloudflared_alive_result)
     r4, tunnel_url = check_4_stash_valid()
     append(r4)
+    bootstrap_lock = None
+    bootstrap_fresh_generation = False
     if r4.status == "fail":
-        return _finalize(results, start, tunnel_url="", webhook_url="", args=args)
-    metrics_result = check_4c_double_source(tunnel_url)
-    append(metrics_result)
-    append(check_5_external_tunnel(tunnel_url))
-    append(check_5b_local_callback_route())
-    append(check_6_line_token())
-    r7, webhook_url, post_autofix_external, r8 = line_path_once(tunnel_url)
+        cold_bootstrap_allowed = (
+            not args.dry_run
+            and cloudflared_alive_result.status == "fail"
+            and _stash_allows_cold_bootstrap()
+        )
+        if not cold_bootstrap_allowed:
+            return _finalize(results, start, tunnel_url="", webhook_url="", args=args)
+        bootstrap_lock = _try_cloudflared_restart_lock()
+        if bootstrap_lock is None:
+            append(CheckResult(16, "cloudflared cold bootstrap", critical=True).failed(
+                "cloudflared_restart_busy"
+            ))
+            return _finalize(results, start, tunnel_url="", webhook_url="", args=args)
+        restart_ok, new_url_or_reason = _restart_cloudflared_for_preflight(
+            "",
+            lock_handle=bootstrap_lock,
+        )
+        if not restart_ok:
+            _release_cloudflared_restart_lock(bootstrap_lock)
+            bootstrap_lock = None
+            append(CheckResult(16, "cloudflared cold bootstrap", critical=True).failed(
+                new_url_or_reason
+            ))
+            return _finalize(results, start, tunnel_url="", webhook_url="", args=args)
+        post_bootstrap_stash, tunnel_url = check_4_stash_valid()
+        append(post_bootstrap_stash)
+        if post_bootstrap_stash.status == "fail":
+            _release_cloudflared_restart_lock(bootstrap_lock)
+            bootstrap_lock = None
+            append(CheckResult(16, "cloudflared cold bootstrap", critical=True).failed(
+                "fresh generation failed secure stash validation"
+            ))
+            return _finalize(results, start, tunnel_url="", webhook_url="", args=args)
+        r4.status = "skip"
+        r4.critical = False
+        r4.detail = f"superseded by safe cold bootstrap; new URL {tunnel_url}"
+        bootstrap_fresh_generation = True
+        append(CheckResult(16, "cloudflared cold bootstrap", critical=True).autofixed(
+            f"new URL {tunnel_url}"
+        ))
+        post_bootstrap_alive = check_3_cloudflared_alive()
+        append(post_bootstrap_alive)
+        if post_bootstrap_alive.status != "fail":
+            cloudflared_alive_result.status = "skip"
+            cloudflared_alive_result.critical = False
+            cloudflared_alive_result.detail = (
+                f"superseded by safe cold bootstrap; new URL {tunnel_url}"
+            )
+    try:
+        metrics_result = check_4c_double_source(tunnel_url)
+        append(metrics_result)
+        append(check_5_external_tunnel(tunnel_url))
+        append(check_5b_local_callback_route())
+        append(check_6_line_token())
+        r7, webhook_url, post_autofix_external, r8 = line_path_once(
+            tunnel_url,
+            allow_alignment_mutation=bootstrap_fresh_generation,
+            expected_generation_url=(
+                tunnel_url if bootstrap_fresh_generation else None
+            ),
+        )
+    finally:
+        if bootstrap_lock is not None:
+            _release_cloudflared_restart_lock(bootstrap_lock)
     if (
         not args.dry_run
         and _line_path_recovery_warranted(r7, r8)
@@ -590,28 +805,42 @@ def run(args):
         append(CheckResult(15, "LINE webhook path stale recovery", critical=True).autofixed(
             _line_path_recovery_detail(r7, r8)
         ))
-        restart_ok, new_url_or_reason = _restart_cloudflared_for_preflight(tunnel_url)
-        if restart_ok:
-            tunnel_url = new_url_or_reason
-            append(CheckResult(16, "cloudflared restart for LINE webhook recovery", critical=True).autofixed(
-                f"new URL {tunnel_url}"
-            ))
-            post_restart_alive = check_3_cloudflared_alive()
-            if cloudflared_alive_result.status == "fail" and post_restart_alive.status != "fail":
-                cloudflared_alive_result.status = "skip"
-                cloudflared_alive_result.critical = False
-                cloudflared_alive_result.detail = f"superseded by cloudflared recovery; new URL {tunnel_url}"
-            append(post_restart_alive)
-            post_restart_metrics = check_4c_double_source(tunnel_url)
-            if metrics_result.status == "fail" and post_restart_metrics.status != "fail":
-                metrics_result.status = "skip"
-                metrics_result.critical = False
-                metrics_result.detail = f"superseded by cloudflared recovery; new URL {tunnel_url}"
-            append(post_restart_metrics)
-            append(check_5_external_tunnel(tunnel_url))
-            r7, webhook_url, post_autofix_external, r8 = line_path_once(tunnel_url)
-            append_line_path(r7, post_autofix_external, r8)
+        recovery_lock = _try_cloudflared_restart_lock()
+        if recovery_lock is None:
+            restart_ok, new_url_or_reason = False, "cloudflared_restart_busy"
         else:
+            try:
+                restart_ok, new_url_or_reason = _restart_cloudflared_for_preflight(
+                    tunnel_url,
+                    lock_handle=recovery_lock,
+                )
+                if restart_ok:
+                    tunnel_url = new_url_or_reason
+                    append(CheckResult(16, "cloudflared restart for LINE webhook recovery", critical=True).autofixed(
+                        f"new URL {tunnel_url}"
+                    ))
+                    post_restart_alive = check_3_cloudflared_alive()
+                    if cloudflared_alive_result.status == "fail" and post_restart_alive.status != "fail":
+                        cloudflared_alive_result.status = "skip"
+                        cloudflared_alive_result.critical = False
+                        cloudflared_alive_result.detail = f"superseded by cloudflared recovery; new URL {tunnel_url}"
+                    append(post_restart_alive)
+                    post_restart_metrics = check_4c_double_source(tunnel_url)
+                    if metrics_result.status == "fail" and post_restart_metrics.status != "fail":
+                        metrics_result.status = "skip"
+                        metrics_result.critical = False
+                        metrics_result.detail = f"superseded by cloudflared recovery; new URL {tunnel_url}"
+                    append(post_restart_metrics)
+                    append(check_5_external_tunnel(tunnel_url))
+                    r7, webhook_url, post_autofix_external, r8 = line_path_once(
+                        tunnel_url,
+                        allow_alignment_mutation=True,
+                        expected_generation_url=tunnel_url,
+                    )
+                    append_line_path(r7, post_autofix_external, r8)
+            finally:
+                _release_cloudflared_restart_lock(recovery_lock)
+        if not restart_ok:
             append(CheckResult(16, "cloudflared restart for LINE webhook recovery", critical=True).failed(
                 new_url_or_reason
             ))

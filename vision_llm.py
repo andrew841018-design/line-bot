@@ -10,10 +10,13 @@ System prompt / post-check / compose_prompt 抽到 vision_common.py，
 給本機 vision_llm 跟雲端 vision_cloud（Together AI）共用。
 """
 from __future__ import annotations
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import logging
+import os
 import sys
+import threading
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional, TypeVar
 
 # 規則 0 / 咪寶人設 / 黑名單 post-check 共用模組
 from vision_common import (
@@ -33,6 +36,54 @@ _processor = None
 _loaded_name = None
 
 
+class VisionBusyError(RuntimeError):
+    """The single MLX worker is already running an inference."""
+
+
+class VisionTimeoutError(TimeoutError):
+    """The caller's reply budget expired before MLX returned."""
+
+
+_T = TypeVar("_T")
+_VISION_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vision-mlx")
+# MLX GPU streams are thread-affine. One active task and zero queued tasks keeps
+# every load/generate call on the same long-lived worker and prevents stale work
+# from piling up after a LINE reply-token deadline has expired.
+_VISION_ADMISSION = threading.BoundedSemaphore(1)
+_vision_worker_ident: int | None = None
+
+
+def _invoke_on_vision_worker(fn: Callable[[], _T]) -> _T:
+    global _vision_worker_ident
+    _vision_worker_ident = threading.get_ident()
+    return fn()
+
+
+def _run_on_vision_worker(
+    fn: Callable[[], _T], *, timeout_sec: float | None = None
+) -> _T:
+    """Run one MLX operation on its owner thread without an executor backlog."""
+    if threading.get_ident() == _vision_worker_ident:
+        return fn()
+    if not _VISION_ADMISSION.acquire(blocking=False):
+        raise VisionBusyError("vision worker is busy")
+    try:
+        future = _VISION_EXECUTOR.submit(_invoke_on_vision_worker, fn)
+    except BaseException:
+        _VISION_ADMISSION.release()
+        raise
+    future.add_done_callback(lambda _future: _VISION_ADMISSION.release())
+    try:
+        if timeout_sec is None:
+            return future.result()
+        return future.result(timeout=max(0.0, float(timeout_sec)))
+    except FutureTimeoutError as exc:
+        # A running native MLX call is not safely cancellable. The completion
+        # callback releases admission only once the future is truly done.
+        future.cancel()
+        raise VisionTimeoutError("vision worker exceeded caller deadline") from exc
+
+
 def _ensure_loaded() -> bool:
     global _model, _processor, _loaded_name
     if _model is not None:
@@ -49,7 +100,7 @@ def _ensure_loaded() -> bool:
     return False
 
 
-def describe_image(
+def _describe_image_on_worker(
     image_path: str | Path | bytes,
     prompt: Optional[str] = None,
     max_tokens: int = 600,
@@ -60,9 +111,10 @@ def describe_image(
     prompt 為 None 時使用預設「請描述圖中的重點」+ 咪寶人設。
     回傳前會跑 _post_check 對齊規則 0。
     """
-    if not _ensure_loaded():
-        return None
+    temp_path: str | None = None
     try:
+        if not _ensure_loaded():
+            return None
         from mlx_vlm import generate
         from mlx_vlm.prompt_utils import apply_chat_template
 
@@ -72,7 +124,8 @@ def describe_image(
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
             tmp.write(image_path)
             tmp.close()
-            image_path = tmp.name
+            temp_path = tmp.name
+            image_path = temp_path
 
         composed = _compose_prompt(prompt or "")
         formatted = apply_chat_template(
@@ -91,9 +144,29 @@ def describe_image(
     except Exception as e:
         logger.warning("describe_image failed: %s", e)
         return None
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
 
 
-def chat_with_images(
+def describe_image(
+    image_path: str | Path | bytes,
+    prompt: Optional[str] = None,
+    max_tokens: int = 600,
+    *,
+    timeout_sec: float | None = None,
+) -> Optional[str]:
+    """Single-image inference pinned to the dedicated MLX worker thread."""
+    return _run_on_vision_worker(
+        lambda: _describe_image_on_worker(image_path, prompt, max_tokens),
+        timeout_sec=timeout_sec,
+    )
+
+
+def _chat_with_images_on_worker(
     user_text: str,
     image_paths: list,
     max_tokens: int = 600,
@@ -123,6 +196,20 @@ def chat_with_images(
     except Exception as e:
         logger.warning("chat_with_images failed: %s", e)
         return None
+
+
+def chat_with_images(
+    user_text: str,
+    image_paths: list,
+    max_tokens: int = 600,
+    *,
+    timeout_sec: float | None = None,
+) -> Optional[str]:
+    """Multi-image inference pinned to the same dedicated MLX worker."""
+    return _run_on_vision_worker(
+        lambda: _chat_with_images_on_worker(user_text, image_paths, max_tokens),
+        timeout_sec=timeout_sec,
+    )
 
 
 if __name__ == "__main__":

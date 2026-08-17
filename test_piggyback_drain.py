@@ -43,7 +43,7 @@ def _reset_piggyback_state() -> None:
     with main._drain_lock_factory_lock:
         main._drain_locks.clear()
     with main._global_gate_cache_lock:
-        main._global_gate_cache = None
+        main._global_gate_cache = {}
 
 
 def test_piggyback_skips_when_no_pending_for_group(monkeypatch):
@@ -69,7 +69,7 @@ def test_piggyback_throttles_within_window_after_successful_drain(monkeypatch):
         main._piggyback_drain_pending("G1")
         main._piggyback_drain_pending("G1")
     assert drain.call_count == 1
-    drain.assert_called_with("G1", source="piggyback")
+    drain.assert_called_with("G1", source="piggyback", local_media_only=False)
 
 
 def test_piggyback_runs_again_after_throttle_window(monkeypatch):
@@ -225,7 +225,7 @@ def test_global_gate_cache_returns_cached_result():
     _reset_piggyback_state()
     # 預先把 cache 設為 (now, True)，模擬上次有 check 過
     with main._global_gate_cache_lock:
-        main._global_gate_cache = (time.time(), True)
+        main._global_gate_cache = {False: (time.time(), True)}
     with patch("line_token_refresh.get_line_token") as get_tok:
         result = main._global_pending_drain_ready()
     assert result is True

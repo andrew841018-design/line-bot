@@ -687,6 +687,7 @@ _RAW_MESSAGE_KEEP = 2000  # 每群組保留最近 N 筆原始訊息（給 quote-
 # reply. Keep a short processing lease for concurrent redeliveries, then allow
 # a later delivery to retry an event that never reached a successful reply.
 _INBOUND_PROCESSING_LEASE_SECONDS = 30
+_INBOUND_MEDIA_PROCESSING_LEASE_SECONDS = 120
 _INBOUND_EVENT_RETENTION_SECONDS = 14 * 86400
 
 
@@ -716,7 +717,12 @@ def begin_inbound_event(group_id: str, message_id: str) -> str:
         status, updated_at = row
         if status == "replied":
             return "replied"
-        if now - int(updated_at) < _INBOUND_PROCESSING_LEASE_SECONDS:
+        lease_seconds = (
+            _INBOUND_MEDIA_PROCESSING_LEASE_SECONDS
+            if status == "media_processing"
+            else _INBOUND_PROCESSING_LEASE_SECONDS
+        )
+        if now - int(updated_at) < lease_seconds:
             return "processing"
         c.execute(
             "UPDATE inbound_events SET status = 'processing', updated_at = ? "
@@ -724,6 +730,19 @@ def begin_inbound_event(group_id: str, message_id: str) -> str:
             (now, group_id, message_id),
         )
         return "retry"
+
+
+def mark_inbound_event_media_processing(group_id: str, message_id: str) -> None:
+    """Extend the durable processing claim while bounded media work is active."""
+    if not group_id or not message_id:
+        return
+    now = int(_time.time())
+    with _lock, _conn() as c:
+        c.execute(
+            "UPDATE inbound_events SET status = 'media_processing', updated_at = ? "
+            "WHERE group_id = ? AND message_id = ? AND status != 'replied'",
+            (now, group_id, message_id),
+        )
 
 
 def mark_inbound_event_replied(group_id: str, message_id: str) -> None:

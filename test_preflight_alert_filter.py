@@ -5,9 +5,12 @@ Mocks `_send_discord_alert` and `_emit_jsonl`. JSONL log must always emit
 regardless of alert filter; full audit trail preserved.
 """
 import argparse
+import json
+import socket
 from unittest.mock import patch
 
 import preflight_check as pf
+from quick_tunnel_dns import quick_tunnel_api_dns_check
 
 
 def _make_result(idx, name, *, critical, status, detail=""):
@@ -29,6 +32,80 @@ def test_preflight_rejects_reserved_trycloudflare_api_url():
     assert pf._normalize_tunnel_url("https://fresh.trycloudflare.com") == (
         "https://fresh.trycloudflare.com"
     )
+
+
+def test_preflight_stash_rejects_symlink(tmp_path):
+    target = tmp_path / "target"
+    target.write_text("https://fresh.trycloudflare.com\n")
+    target.chmod(0o600)
+    stash = tmp_path / "stash"
+    stash.symlink_to(target)
+
+    with patch("preflight_check.TUNNEL_URL_STASH", stash):
+        result, url = pf.check_4_stash_valid()
+
+    assert result.status == "fail"
+    assert "regular file" in result.detail
+    assert url == ""
+
+
+def test_preflight_stash_rejects_group_writable_file(tmp_path):
+    stash = tmp_path / "stash"
+    stash.write_text("https://fresh.trycloudflare.com\n")
+    stash.chmod(0o620)
+
+    with patch("preflight_check.TUNNEL_URL_STASH", stash):
+        result, url = pf.check_4_stash_valid()
+
+    assert result.status == "fail"
+    assert "group/world writable" in result.detail
+    assert url == ""
+
+
+def test_webhook_put_is_generation_fenced(tmp_path):
+    stash = tmp_path / "stash"
+    stash.write_text("https://superseding.trycloudflare.com\n")
+    stash.chmod(0o600)
+    current = "https://old.trycloudflare.com/callback"
+
+    with patch("preflight_check.TUNNEL_URL_STASH", stash), \
+         patch("preflight_check._line_token", return_value="fake-token"), \
+         patch(
+             "preflight_check._curl_with_token",
+             return_value=(200, json.dumps({"endpoint": current})),
+         ), \
+         patch("preflight_check._put_line_webhook_endpoint") as put_webhook:
+        result, actual = pf.check_7_webhook_alignment(
+            "https://fresh.trycloudflare.com",
+            expected_generation_url="https://fresh.trycloudflare.com",
+        )
+
+    assert result.status == "fail"
+    assert "generation superseded" in result.detail
+    assert actual == current
+    put_webhook.assert_not_called()
+
+
+def test_quick_tunnel_dns_uses_system_resolver_and_accepts_ipv6():
+    answer = [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2606:4700::1", 443, 0, 0))]
+    with patch("quick_tunnel_dns.socket.getaddrinfo", return_value=answer) as lookup:
+        ok, reason = quick_tunnel_api_dns_check(timeout=1)
+
+    assert ok is True
+    assert reason == ""
+    lookup.assert_called_once()
+
+
+def test_quick_tunnel_dns_reports_system_resolver_failure():
+    with patch(
+        "quick_tunnel_dns.socket.getaddrinfo",
+        side_effect=socket.gaierror(socket.EAI_NONAME, "nodename nor servname provided"),
+    ):
+        ok, reason = quick_tunnel_api_dns_check(timeout=1)
+
+    assert ok is False
+    assert "dns_resolution_failed(api.trycloudflare.com)" in reason
+    assert "system resolver" in reason
 
 
 # ---------- _is_transient_error ----------
@@ -158,6 +235,69 @@ def test_webhook_put_retries_invalid_endpoint_until_line_accepts():
     assert curl.call_count == 2
 
 
+def test_webhook_put_aborts_retry_when_generation_changes(tmp_path):
+    stash = tmp_path / "stash"
+    fresh = "https://fresh.trycloudflare.com"
+    stash.write_text(f"{fresh}\n")
+    stash.chmod(0o600)
+
+    def first_put(*_args, **_kwargs):
+        stash.write_text("https://superseding.trycloudflare.com\n")
+        return 400, '{"message":"Invalid webhook endpoint URL"}'
+
+    with patch("preflight_check.TUNNEL_URL_STASH", stash), \
+         patch("preflight_check.time.sleep"), \
+         patch("preflight_check._curl_with_token", side_effect=first_put) as curl:
+        code, body, attempts = pf._put_line_webhook_endpoint(
+            "fake-token",
+            f"{fresh}/callback",
+            retry_delays=(0, 0),
+            expected_generation_url=fresh,
+        )
+
+    assert code == 409
+    assert "superseded after webhook PUT" not in body
+    assert "superseded before webhook PUT" in body
+    assert attempts == 2
+    assert curl.call_count == 1
+
+
+def test_webhook_put_rejects_200_when_generation_changes(tmp_path):
+    stash = tmp_path / "stash"
+    fresh = "https://fresh.trycloudflare.com"
+    stash.write_text(f"{fresh}\n")
+    stash.chmod(0o600)
+
+    def successful_but_superseded(*_args, **_kwargs):
+        stash.write_text("https://superseding.trycloudflare.com\n")
+        return 200, "{}"
+
+    with patch("preflight_check.TUNNEL_URL_STASH", stash), \
+         patch("preflight_check._curl_with_token", side_effect=successful_but_superseded):
+        code, body, attempts = pf._put_line_webhook_endpoint(
+            "fake-token",
+            f"{fresh}/callback",
+            retry_delays=(0,),
+            expected_generation_url=fresh,
+        )
+
+    assert code == 409
+    assert "superseded after webhook PUT" in body
+    assert attempts == 1
+
+
+def test_curl_with_token_keeps_secret_out_of_argv():
+    secret = "line-secret-must-not-appear-in-argv"
+    completed = type("Completed", (), {"stdout": '{}\n200'})()
+    with patch("preflight_check.subprocess.run", return_value=completed) as run:
+        code, body = pf._curl_with_token(pf.LINE_BOT_INFO, secret)
+
+    assert code == 200
+    assert secret not in " ".join(run.call_args.args[0])
+    assert secret in run.call_args.kwargs["input"]
+    assert secret not in body
+
+
 def test_line_path_recovery_warranted_for_e2e_only_530():
     alignment = _make_result(
         9,
@@ -176,6 +316,186 @@ def test_line_path_recovery_warranted_for_e2e_only_530():
     assert pf._line_path_recovery_warranted(alignment, e2e) is True
 
 
+def test_preflight_cloudflared_restart_fails_fast_when_quick_tunnel_dns_is_blocked():
+    with patch(
+        "preflight_check._quick_tunnel_api_dns_check",
+        return_value=(
+            False,
+            "dns_resolution_failed(api.trycloudflare.com): "
+            "resolver returned no IP address; VPN/private DNS may be blocking it",
+        ),
+    ), patch("preflight_check.subprocess.run") as run, patch(
+        "preflight_check.time.sleep"
+    ) as sleep:
+        ok, reason = pf._restart_cloudflared_for_preflight(
+            "https://stale.trycloudflare.com"
+        )
+
+    assert ok is False
+    assert "dns_resolution_failed(api.trycloudflare.com)" in reason
+    run.assert_not_called()
+    sleep.assert_not_called()
+
+
+@patch("preflight_check._send_discord_alert")
+@patch("preflight_check._emit_jsonl")
+def test_run_dns_blocked_never_puts_stale_webhook_before_recovery_gate(
+    mock_jsonl, mock_alert, tmp_path
+):
+    def result(idx, name, *, status="pass", critical=True, detail=""):
+        r = pf.CheckResult(idx, name, critical=critical)
+        r.status = status
+        r.detail = detail
+        return r
+
+    stale = "https://stale.trycloudflare.com"
+    current = "https://still-live.trycloudflare.com/callback"
+
+    def fake_line_api(url, *_args, **_kwargs):
+        if url == pf.LINE_WEBHOOK_ENDPOINT:
+            return 200, json.dumps({"endpoint": current})
+        if url == pf.LINE_WEBHOOK_TEST:
+            return 200, json.dumps(
+                {
+                    "success": False,
+                    "statusCode": 0,
+                    "reason": "COULD_NOT_CONNECT",
+                }
+            )
+        raise AssertionError(f"unexpected LINE API URL: {url}")
+
+    with patch("preflight_check.CLOUDFLARED_RESTART_LOCK_PATH", tmp_path / "restart.lock"), \
+         patch("preflight_check.check_1_uvicorn_alive", return_value=result(1, "uvicorn process alive")), \
+         patch("preflight_check.check_2_local_health", return_value=result(2, "local /health 200")), \
+         patch("preflight_check.check_3_cloudflared_alive", return_value=result(3, "cloudflared process alive", status="fail")), \
+         patch("preflight_check.check_4_stash_valid", return_value=(result(4, "cloudflared URL stash"), stale)), \
+         patch("preflight_check.check_4c_double_source", return_value=result(5, "cloudflared metrics", status="fail")), \
+         patch("preflight_check.check_5_external_tunnel", return_value=result(6, "external tunnel", critical=False)), \
+         patch("preflight_check.check_5b_local_callback_route", return_value=result(7, "callback route")), \
+         patch("preflight_check.check_6_line_token", return_value=result(8, "LINE token")), \
+         patch("preflight_check.check_9_gemini", side_effect=lambda model, idx, label: result(idx, f"Gemini {label}")), \
+         patch("preflight_check.check_10_sqlite", return_value=result(13, "SQLite", critical=False)), \
+         patch("preflight_check.check_11_pending", return_value=result(14, "pending", critical=False)), \
+         patch("preflight_check._line_token", return_value="fake-token"), \
+         patch("preflight_check._curl_with_token", side_effect=fake_line_api), \
+         patch("preflight_check._put_line_webhook_endpoint") as put_webhook, \
+         patch(
+             "preflight_check._quick_tunnel_api_dns_check",
+             return_value=(
+                 False,
+                 "dns_resolution_failed(api.trycloudflare.com): "
+                 "system resolver returned no IP address",
+             ),
+         ), \
+         patch("preflight_check._write_cache"):
+        exit_code = pf.run(_args(dry_run=False))
+
+    assert exit_code == 1
+    put_webhook.assert_not_called()
+    record = mock_jsonl.call_args[0][0]
+    assert any(
+        r["idx"] == 16 and "dns_resolution_failed" in r["detail"]
+        for r in record["results"]
+    )
+
+
+@patch("preflight_check._send_discord_alert")
+@patch("preflight_check._emit_jsonl")
+def test_run_bootstraps_missing_stash_once_under_preflight_owner(
+    mock_jsonl, mock_alert, tmp_path
+):
+    def result(idx, name, *, status="pass", critical=True, detail=""):
+        r = pf.CheckResult(idx, name, critical=critical)
+        r.status = status
+        r.detail = detail
+        return r
+
+    stash = tmp_path / "missing-stash"
+    fresh = "https://fresh.trycloudflare.com"
+    alignment_kwargs = []
+
+    def fake_restart(previous_url, **_kwargs):
+        assert previous_url == ""
+        stash.write_text(f"{fresh}\n")
+        stash.chmod(0o600)
+        return True, fresh
+
+    def fake_alignment(tunnel_url, **kwargs):
+        alignment_kwargs.append(kwargs)
+        return result(9, "LINE webhook URL alignment"), f"{tunnel_url}/callback"
+
+    with patch("preflight_check.TUNNEL_URL_STASH", stash), \
+         patch("preflight_check.CLOUDFLARED_RESTART_LOCK_PATH", tmp_path / "restart.lock"), \
+         patch("preflight_check.check_1_uvicorn_alive", return_value=result(1, "uvicorn")), \
+         patch("preflight_check.check_2_local_health", return_value=result(2, "local health")), \
+         patch(
+             "preflight_check.check_3_cloudflared_alive",
+             side_effect=[
+                 result(3, "cloudflared", status="fail", detail="not running"),
+                 result(3, "cloudflared"),
+             ],
+         ), \
+         patch("preflight_check.check_4c_double_source", return_value=result(5, "metrics")), \
+         patch("preflight_check.check_5_external_tunnel", return_value=result(6, "external", critical=False)), \
+         patch("preflight_check.check_5b_local_callback_route", return_value=result(7, "callback")), \
+         patch("preflight_check.check_6_line_token", return_value=result(8, "token")), \
+         patch("preflight_check.check_7_webhook_alignment", side_effect=fake_alignment), \
+         patch("preflight_check.check_8_line_e2e", return_value=result(10, "E2E")), \
+         patch("preflight_check.check_9_gemini", side_effect=lambda model, idx, label: result(idx, f"Gemini {label}")), \
+         patch("preflight_check.check_10_sqlite", return_value=result(13, "SQLite", critical=False)), \
+         patch("preflight_check.check_11_pending", return_value=result(14, "pending", critical=False)), \
+         patch("preflight_check._restart_cloudflared_for_preflight", side_effect=fake_restart) as restart, \
+         patch("preflight_check._write_cache"):
+        exit_code = pf.run(_args(dry_run=False))
+
+    assert exit_code == 0
+    restart.assert_called_once()
+    assert restart.call_args.args == ("",)
+    assert alignment_kwargs == [
+        {
+            "dry_run": False,
+            "allow_mutation": True,
+            "expected_generation_url": fresh,
+        }
+    ]
+    record = mock_jsonl.call_args.args[0]
+    assert record["tunnel_url"] == fresh
+    assert not [
+        item
+        for item in record["results"]
+        if item["critical"] and item["status"] == "fail"
+    ]
+
+
+@patch("preflight_check._send_discord_alert")
+@patch("preflight_check._emit_jsonl")
+def test_run_unsafe_stash_fails_closed_without_restart(
+    mock_jsonl, mock_alert, tmp_path
+):
+    target = tmp_path / "target"
+    target.write_text("https://unsafe.trycloudflare.com\n")
+    stash = tmp_path / "stash"
+    stash.symlink_to(target)
+
+    passed = lambda idx, name, critical=True: _make_result(
+        idx, name, critical=critical, status="pass"
+    )
+    with patch("preflight_check.TUNNEL_URL_STASH", stash), \
+         patch("preflight_check.check_1_uvicorn_alive", return_value=passed(1, "uvicorn")), \
+         patch("preflight_check.check_2_local_health", return_value=passed(2, "health")), \
+         patch(
+             "preflight_check.check_3_cloudflared_alive",
+             return_value=_make_result(3, "cloudflared", critical=True, status="fail"),
+         ), \
+         patch("preflight_check._restart_cloudflared_for_preflight") as restart:
+        exit_code = pf.run(_args(dry_run=False))
+
+    assert exit_code == 1
+    restart.assert_not_called()
+    record = mock_jsonl.call_args.args[0]
+    assert any("regular file" in item["detail"] for item in record["results"])
+
+
 @patch("preflight_check._send_discord_alert")
 @patch("preflight_check._emit_jsonl")
 def test_run_restarts_cloudflared_when_line_webhook_path_is_stale(mock_jsonl, mock_alert):
@@ -189,7 +509,7 @@ def test_run_restarts_cloudflared_when_line_webhook_path_is_stale(mock_jsonl, mo
     fresh = "https://fresh.trycloudflare.com"
     alignment_calls = []
 
-    def fake_alignment(tunnel_url, *, dry_run=False):
+    def fake_alignment(tunnel_url, **_kwargs):
         alignment_calls.append(tunnel_url)
         if tunnel_url == stale:
             return (
@@ -260,7 +580,9 @@ def test_run_restarts_cloudflared_when_line_webhook_path_is_stale(mock_jsonl, mo
         exit_code = pf.run(_args(dry_run=False))
 
     assert exit_code == 0
-    restart.assert_called_once_with(stale)
+    restart.assert_called_once()
+    assert restart.call_args.args == (stale,)
+    assert restart.call_args.kwargs["lock_handle"] is not None
     assert alignment_calls == [stale, fresh]
     assert len(e2e_calls) == 2
     record = mock_jsonl.call_args[0][0]

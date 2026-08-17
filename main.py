@@ -130,6 +130,30 @@ async def _app_lifespan(_app: FastAPI):
     if os.getenv("JOBS_ROUTES_ENABLED") == "1":
         from jobs_router import startup_sweep as _ss
         _ss()
+    import pending_store as _pending_store
+
+    hardened = 0
+    swept = 0
+    swept_locks = 0
+    try:
+        hardened = _pending_store.harden_media_permissions()
+    except Exception as exc:
+        logger.warning("pending media permission hardening failed: %s", exc)
+    try:
+        swept = _pending_store.sweep_orphan_media()
+    except Exception as exc:
+        logger.warning("pending media orphan sweep failed: %s", exc)
+    try:
+        swept_locks = _pending_store.sweep_delivery_lock_files()
+    except Exception as exc:
+        logger.warning("pending media delivery-lock sweep failed: %s", exc)
+    if hardened or swept or swept_locks:
+        logger.info(
+            "pending media startup maintenance hardened=%d swept=%d locks=%d",
+            hardened,
+            swept,
+            swept_locks,
+        )
     _process_pending_on_startup()
     _init_on_startup()
     yield
@@ -237,7 +261,13 @@ def _mark_inbound_reply_succeeded(reply_token: str | None) -> None:
         event = _inbound_reply_by_token.pop(str(reply_token), None)
     if event is not None:
         group_id, message_id, _ = event
-        memory.mark_inbound_event_replied(group_id, message_id)
+        try:
+            memory.mark_inbound_event_replied(group_id, message_id)
+        except Exception as exc:
+            # LINE acceptance is already authoritative. A local bookkeeping
+            # failure must not be reclassified as a transport failure or cause
+            # a fallback send of the same content.
+            logger.error("inbound reply accepted but durable mark failed: %s", exc)
 
 
 def _extract_reply_payload_targets(message: TextMessageContent) -> list:
@@ -2047,6 +2077,13 @@ def _handle_event(event) -> None:
             logger.info("skip redelivered event (no msg_id)")
             return
     else:
+        if (
+            is_redelivery
+            and isinstance(msg, (ImageMessageContent, VideoMessageContent))
+            and _was_media_delivery_tombstoned(group_id, msg_id)
+        ):
+            logger.info("skip redelivered media with confirmed delivery tombstone")
+            return
         inbound_state = memory.begin_inbound_event(group_id, msg_id)
         if is_redelivery and inbound_state in {"replied", "processing"}:
             logger.info(
@@ -2102,18 +2139,20 @@ def _handle_event(event) -> None:
         memory.log_raw_message_meta(
             group_id, msg.id, media_type="image", mime_type="image/jpeg"
         )
+        memory.mark_inbound_event_media_processing(group_id, msg.id)
         if _pending_reply_enabled():
             _save_pending_any(event, group_id, sender_user_id, msg)
-        _MEDIA_EXECUTOR.submit(_handle_image_message, event, group_id)
+        _submit_media_handler(_handle_image_message, event, group_id, "圖片")
         return
     if isinstance(msg, VideoMessageContent):
         memory.log_raw_message(group_id, msg.id, sender_user_id, "[影片]")
         memory.log_raw_message_meta(
             group_id, msg.id, media_type="video", mime_type="video/mp4"
         )
+        memory.mark_inbound_event_media_processing(group_id, msg.id)
         if _pending_reply_enabled():
             _save_pending_any(event, group_id, sender_user_id, msg)
-        _MEDIA_EXECUTOR.submit(_handle_video_message, event, group_id)
+        _submit_media_handler(_handle_video_message, event, group_id, "影片")
         return
     if isinstance(msg, AudioMessageContent):
         memory.log_raw_message(group_id, msg.id, sender_user_id, "[音訊]")
@@ -2201,97 +2240,192 @@ def _handle_audio_message(event: MessageEvent, group_id: str) -> None:
     _reply(event.reply_token, reply_text, group_id=group_id)
 
 
-def _handle_image_message(event, group_id):
-    """Pure-local image handler. Runs in _MEDIA_EXECUTOR (cap 2 concurrent).
+def _handle_image_message(event, group_id, *, deadline_monotonic: float | None = None):
+    delivery_slot = _try_acquire_media_delivery_slot(group_id, event.message.id)
+    if delivery_slot is None:
+        logger.info("image delivery already owned by another local retry")
+        return
+    try:
+        if _was_media_delivery_tombstoned(group_id, event.message.id):
+            _remove_pending_by_msg_id(group_id, event.message.id)
+            logger.info("image delivery already completed before handler start")
+            return
+        return _handle_image_message_owned(
+            event,
+            group_id,
+            deadline_monotonic=deadline_monotonic,
+        )
+    finally:
+        delivery_slot.release()
 
-    Flow: download → media_pipeline.analyze_image (50s hard timeout per GP1 §2,
-    because reply_token TTL is ~1 min) → reply → remove from pending. On any
-    failure, leave the pending entry for the cron retry worker to drain later.
-    """
-    import threading as _threading
+
+def _handle_image_message_owned(
+    event, group_id, *, deadline_monotonic: float | None = None
+):
+    """Pure-local image handler with one bounded, visible terminal outcome."""
     msg_id = event.message.id
-    try:
+    reply_deadline = deadline_monotonic or (time.monotonic() + _MEDIA_REPLY_BUDGET_SEC)
+    analysis_deadline = reply_deadline - _MEDIA_REPLY_SEND_RESERVE_SEC
+    if analysis_deadline <= time.monotonic():
+        _reply_media_failure(
+            event, group_id, "圖片", "reply deadline exhausted", delivery_slot_owned=True
+        )
+        return
+
+    def _analyze() -> str | None:
         data = _download_content(msg_id)
-    except Exception as e:
-        logger.warning("image download failed for handler: %s", e)
-        return
-    if len(data) > _MEDIA_BYTE_LIMIT:
-        logger.info("image too large for handler: %d bytes", len(data))
-        return
+        if len(data) > _MEDIA_BYTE_LIMIT:
+            raise _MediaTooLargeError("image exceeds local byte limit")
+        import media_pipeline
 
-    holder = {"reply": None}
+        return media_pipeline.analyze_image(bytes(data), group_id=group_id)
 
-    def _run():
-        try:
-            import media_pipeline
-            holder["reply"] = media_pipeline.analyze_image(bytes(data), group_id=group_id)
-        except Exception as e:
-            logger.warning("image analyze failed: %s", e)
-
-    t = _threading.Thread(target=_run, daemon=True)
-    t.start()
-    t.join(timeout=50)
-    if t.is_alive():
-        logger.info("image analyze timeout (>50s), leaving pending for retry worker")
-        return
-    reply_text = holder["reply"]
-    if not reply_text or not reply_text.strip():
-        logger.info("image analyze returned empty, leaving pending")
-        return
-    memory.log_raw_message_meta(
-        group_id, msg_id, media_type="image", mime_type="image/jpeg", description=reply_text
-    )
-    memory.append_turn(group_id, "user", "[圖片]")
-    _append_bot_turn(group_id, reply_text)
     try:
-        _reply(event.reply_token, reply_text, group_id=group_id)
-        _remove_pending_by_msg_id(group_id, msg_id)
+        reply_text = _run_media_analysis(_analyze, analysis_deadline)
     except Exception as e:
-        logger.warning("image reply failed: %s", e)
+        reason = (
+            "analysis capacity busy or timed out"
+            if isinstance(e, (_MediaAnalysisBusyError, _MediaAnalysisTimeoutError))
+            else "too large"
+            if isinstance(e, _MediaTooLargeError)
+            else "download or analysis failed"
+        )
+        logger.warning("image analyze failed (%s): %s", reason, e)
+        _reply_media_failure(event, group_id, "圖片", reason, delivery_slot_owned=True)
+        return
+    if not reply_text or not reply_text.strip():
+        _reply_media_failure(
+            event, group_id, "圖片", "analysis returned empty", delivery_slot_owned=True
+        )
+        return
+    if time.monotonic() > analysis_deadline:
+        _reply_media_failure(
+            event,
+            group_id,
+            "圖片",
+            "analysis completed after deadline",
+            delivery_slot_owned=True,
+        )
+        return
+    try:
+        memory.log_raw_message_meta(
+            group_id,
+            msg_id,
+            media_type="image",
+            mime_type="image/jpeg",
+            description=reply_text,
+        )
+    except Exception as exc:
+        logger.warning("image analysis metadata write failed: %s", exc)
+    delivered = _reply(
+        event.reply_token,
+        reply_text,
+        group_id=group_id,
+        allow_push_fallback=False,
+        include_auxiliary=False,
+    )
+    if delivered:
+        if not _record_media_delivery_tombstone(group_id, msg_id):
+            logger.error("image delivered but persistent media fence failed")
+        _remove_pending_by_msg_id(group_id, msg_id)
+        memory.append_turn(group_id, "user", "[圖片]")
+        _append_bot_turn(group_id, reply_text)
+    else:
+        logger.warning("image reply was not confirmed by LINE")
 
 
-def _handle_video_message(event, group_id):
-    """Pure-local video handler. Same shape as _handle_image_message."""
-    import threading as _threading
+def _handle_video_message(event, group_id, *, deadline_monotonic: float | None = None):
+    delivery_slot = _try_acquire_media_delivery_slot(group_id, event.message.id)
+    if delivery_slot is None:
+        logger.info("video delivery already owned by another local retry")
+        return
+    try:
+        if _was_media_delivery_tombstoned(group_id, event.message.id):
+            _remove_pending_by_msg_id(group_id, event.message.id)
+            logger.info("video delivery already completed before handler start")
+            return
+        return _handle_video_message_owned(
+            event,
+            group_id,
+            deadline_monotonic=deadline_monotonic,
+        )
+    finally:
+        delivery_slot.release()
+
+
+def _handle_video_message_owned(
+    event, group_id, *, deadline_monotonic: float | None = None
+):
+    """Pure-local video handler with the same bounded outcome contract."""
     msg_id = event.message.id
-    try:
+    reply_deadline = deadline_monotonic or (time.monotonic() + _MEDIA_REPLY_BUDGET_SEC)
+    analysis_deadline = reply_deadline - _MEDIA_REPLY_SEND_RESERVE_SEC
+    if analysis_deadline <= time.monotonic():
+        _reply_media_failure(
+            event, group_id, "影片", "reply deadline exhausted", delivery_slot_owned=True
+        )
+        return
+
+    def _analyze() -> str | None:
         data = _download_content(msg_id)
-    except Exception as e:
-        logger.warning("video download failed for handler: %s", e)
-        return
-    if len(data) > _MEDIA_BYTE_LIMIT:
-        logger.info("video too large for handler: %d bytes", len(data))
-        return
+        if len(data) > _MEDIA_BYTE_LIMIT:
+            raise _MediaTooLargeError("video exceeds local byte limit")
+        import media_pipeline
 
-    holder = {"reply": None}
+        return media_pipeline.analyze_video(bytes(data), group_id=group_id)
 
-    def _run():
-        try:
-            import media_pipeline
-            holder["reply"] = media_pipeline.analyze_video(bytes(data), group_id=group_id)
-        except Exception as e:
-            logger.warning("video analyze failed: %s", e)
-
-    t = _threading.Thread(target=_run, daemon=True)
-    t.start()
-    t.join(timeout=50)
-    if t.is_alive():
-        logger.info("video analyze timeout (>50s), leaving pending for retry worker")
-        return
-    reply_text = holder["reply"]
-    if not reply_text or not reply_text.strip():
-        logger.info("video analyze returned empty, leaving pending")
-        return
-    memory.log_raw_message_meta(
-        group_id, msg_id, media_type="video", mime_type="video/mp4", description=reply_text
-    )
-    memory.append_turn(group_id, "user", "[影片]")
-    _append_bot_turn(group_id, reply_text)
     try:
-        _reply(event.reply_token, reply_text, group_id=group_id)
-        _remove_pending_by_msg_id(group_id, msg_id)
+        reply_text = _run_media_analysis(_analyze, analysis_deadline)
     except Exception as e:
-        logger.warning("video reply failed: %s", e)
+        reason = (
+            "analysis capacity busy or timed out"
+            if isinstance(e, (_MediaAnalysisBusyError, _MediaAnalysisTimeoutError))
+            else "too large"
+            if isinstance(e, _MediaTooLargeError)
+            else "download or analysis failed"
+        )
+        logger.warning("video analyze failed (%s): %s", reason, e)
+        _reply_media_failure(event, group_id, "影片", reason, delivery_slot_owned=True)
+        return
+    if not reply_text or not reply_text.strip():
+        _reply_media_failure(
+            event, group_id, "影片", "analysis returned empty", delivery_slot_owned=True
+        )
+        return
+    if time.monotonic() > analysis_deadline:
+        _reply_media_failure(
+            event,
+            group_id,
+            "影片",
+            "analysis completed after deadline",
+            delivery_slot_owned=True,
+        )
+        return
+    try:
+        memory.log_raw_message_meta(
+            group_id,
+            msg_id,
+            media_type="video",
+            mime_type="video/mp4",
+            description=reply_text,
+        )
+    except Exception as exc:
+        logger.warning("video analysis metadata write failed: %s", exc)
+    delivered = _reply(
+        event.reply_token,
+        reply_text,
+        group_id=group_id,
+        allow_push_fallback=False,
+        include_auxiliary=False,
+    )
+    if delivered:
+        if not _record_media_delivery_tombstone(group_id, msg_id):
+            logger.error("video delivered but persistent media fence failed")
+        _remove_pending_by_msg_id(group_id, msg_id)
+        memory.append_turn(group_id, "user", "[影片]")
+        _append_bot_turn(group_id, reply_text)
+    else:
+        logger.warning("video reply was not confirmed by LINE")
 
 
 def _try_piggyback_reminders_fast_path(
@@ -10329,8 +10463,195 @@ _MEDIA_BYTE_LIMIT = 20 * 1024 * 1024  # 20 MB
 
 # Bounded worker pool for image/video webhook handlers (GP1 §6: thread leak guard).
 # webhook arrival rate * vision LLM latency could exhaust threads → cap at 2 concurrent.
-from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
+from concurrent.futures import (
+    ThreadPoolExecutor as _ThreadPoolExecutor,
+    TimeoutError as _FutureTimeoutError,
+)
 _MEDIA_EXECUTOR = _ThreadPoolExecutor(max_workers=2, thread_name_prefix="media-handler")
+_MEDIA_HANDLER_SLOTS = threading.BoundedSemaphore(2)
+_MEDIA_ANALYSIS_EXECUTOR = _ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="media-analysis"
+)
+_MEDIA_ANALYSIS_SLOT = threading.BoundedSemaphore(1)
+_MEDIA_REPLY_BUDGET_SEC = 45.0
+_MEDIA_REPLY_SEND_RESERVE_SEC = 5.0
+_LOCAL_MEDIA_DELIVERY_TTL_SEC = 14 * 86400
+_LOCAL_MEDIA_DELIVERY_MAX = 4096
+_local_media_deliveries: dict[str, float] = {}
+_local_media_deliveries_lock = threading.Lock()
+
+
+class _MediaAnalysisBusyError(RuntimeError):
+    pass
+
+
+class _MediaAnalysisTimeoutError(TimeoutError):
+    pass
+
+
+class _MediaTooLargeError(ValueError):
+    pass
+
+
+def _run_media_analysis(fn, deadline_monotonic: float):
+    """Bound download, preprocessing, and MLX behind one zero-backlog owner."""
+    admission_slot = _MEDIA_ANALYSIS_SLOT
+    if not admission_slot.acquire(blocking=False):
+        raise _MediaAnalysisBusyError("media analysis worker is busy")
+    try:
+        future = _MEDIA_ANALYSIS_EXECUTOR.submit(fn)
+    except BaseException:
+        admission_slot.release()
+        raise
+    future.add_done_callback(lambda _future: admission_slot.release())
+    remaining = deadline_monotonic - time.monotonic()
+    if remaining <= 0:
+        future.cancel()
+        raise _MediaAnalysisTimeoutError("media analysis deadline exhausted")
+    try:
+        return future.result(timeout=remaining)
+    except _FutureTimeoutError as exc:
+        # A running task cannot be killed safely. It owns the sole slot until
+        # completion; the handler returns a receipt and discards the late result.
+        future.cancel()
+        raise _MediaAnalysisTimeoutError("media analysis exceeded reply deadline") from exc
+
+
+def _media_reply_deadline(event) -> float:
+    """Absolute monotonic deadline, including webhook delivery age."""
+    remaining = _MEDIA_REPLY_BUDGET_SEC
+    event_ts = getattr(event, "timestamp", None)
+    try:
+        if not isinstance(event_ts, (int, float)) or event_ts < 1_000_000_000_000:
+            raise ValueError("timestamp is not epoch milliseconds")
+        event_epoch = float(event_ts) / 1000.0
+        remaining -= max(0.0, time.time() - event_epoch)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return time.monotonic() + max(0.0, remaining)
+
+
+def _reply_media_failure(
+    event,
+    group_id: str,
+    media_name: str,
+    reason: str,
+    *,
+    delivery_slot_owned: bool = False,
+) -> bool:
+    """End a terminal media attempt visibly; never rely on legacy media drain."""
+    delivery_slot = None
+    if not delivery_slot_owned:
+        delivery_slot = _try_acquire_media_delivery_slot(group_id, event.message.id)
+        if delivery_slot is None:
+            logger.info("%s failure outcome already owned by local retry", media_name)
+            return False
+    try:
+        logger.info("%s analysis %s; sending visible retry receipt", media_name, reason)
+        delivered = _reply(
+            event.reply_token,
+            f"這個{media_name}我這次沒分析成功，請稍後再傳一次 🙏",
+            group_id=group_id,
+            allow_push_fallback=False,
+            include_auxiliary=False,
+        )
+        if delivered:
+            if not _record_media_delivery_tombstone(group_id, event.message.id):
+                logger.error(
+                    "%s failure receipt delivered but persistent fence failed",
+                    media_name,
+                )
+            _remove_pending_by_msg_id(group_id, event.message.id)
+        return delivered
+    finally:
+        if delivery_slot is not None:
+            delivery_slot.release()
+
+
+def _record_media_delivery_tombstone(group_id: str, message_id: str) -> bool:
+    _remember_local_media_delivery(group_id, message_id)
+    try:
+        import pending_store as _ps
+
+        return _ps.mark_media_delivered(group_id, message_id)
+    except Exception as exc:
+        logger.error("media delivery tombstone write failed: %s", exc)
+        return False
+
+
+def _was_media_delivery_tombstoned(group_id: str, message_id: str) -> bool:
+    if _was_media_delivered_in_process(group_id, message_id):
+        return True
+    try:
+        import pending_store as _ps
+
+        return _ps.was_media_delivered(group_id, message_id)
+    except Exception as exc:
+        logger.warning("media delivery tombstone read failed: %s", exc)
+        return False
+
+
+def _local_media_delivery_key(group_id: str, message_id: str) -> str:
+    return hashlib.sha256(f"{group_id}\0{message_id}".encode("utf-8")).hexdigest()
+
+
+def _prune_local_media_deliveries(now: float) -> None:
+    cutoff = now - _LOCAL_MEDIA_DELIVERY_TTL_SEC
+    stale = [
+        key for key, delivered_at in _local_media_deliveries.items() if delivered_at < cutoff
+    ]
+    for key in stale:
+        _local_media_deliveries.pop(key, None)
+    overflow = len(_local_media_deliveries) - _LOCAL_MEDIA_DELIVERY_MAX
+    if overflow > 0:
+        for key in list(_local_media_deliveries)[:overflow]:
+            _local_media_deliveries.pop(key, None)
+
+
+def _remember_local_media_delivery(group_id: str, message_id: str) -> None:
+    now = time.time()
+    key = _local_media_delivery_key(group_id, message_id)
+    with _local_media_deliveries_lock:
+        _prune_local_media_deliveries(now)
+        _local_media_deliveries[key] = now
+
+
+def _was_media_delivered_in_process(group_id: str, message_id: str) -> bool:
+    now = time.time()
+    key = _local_media_delivery_key(group_id, message_id)
+    with _local_media_deliveries_lock:
+        _prune_local_media_deliveries(now)
+        return key in _local_media_deliveries
+
+
+def _submit_media_handler(handler, event, group_id: str, media_name: str) -> bool:
+    """Admit at most two live handlers; ThreadPoolExecutor's queue stays empty."""
+    deadline = _media_reply_deadline(event)
+    if deadline <= time.monotonic():
+        _reply_media_failure(event, group_id, media_name, "arrived after reply deadline")
+        return False
+    if not _MEDIA_HANDLER_SLOTS.acquire(blocking=False):
+        _reply_media_failure(event, group_id, media_name, "handler capacity busy")
+        return False
+
+    def _run() -> None:
+        try:
+            handler(event, group_id, deadline_monotonic=deadline)
+        except Exception as exc:
+            # The exception may occur after LINE accepted a reply but while
+            # best-effort local bookkeeping runs. Never emit a second outcome
+            # from an ambiguous state; durable redelivery handles no-reply cases.
+            logger.exception("unexpected %s handler failure: %s", media_name, exc)
+        finally:
+            _MEDIA_HANDLER_SLOTS.release()
+
+    try:
+        _MEDIA_EXECUTOR.submit(_run)
+    except BaseException:
+        _MEDIA_HANDLER_SLOTS.release()
+        _reply_media_failure(event, group_id, media_name, "handler submit failed")
+        return False
+    return True
 
 
 def _media_pipeline_fallback(
@@ -11296,14 +11617,14 @@ def _save_pending_explicit_raw(data: dict) -> None:
         logger.warning("save pending raw failed: %s", str(e)[:200])
 
 
-def _save_pending_any(event, group_id: str, user_id: str | None, msg) -> None:
+def _save_pending_any(event, group_id: str, user_id: str | None, msg) -> bool:
     """quota 爆時把任何訊息（文字/檔案/音訊）存進佇列，每則獨立不合併。恢復時由 Gemini 判語意分組。"""
     if not _pending_reply_enabled():
         logger.info(
             "pending reply disabled; skip saving message type=%s group=%s",
             type(msg).__name__, group_id,
         )
-        return
+        return False
     try:
         data = _load_pending_explicit()
         if group_id not in data or not isinstance(data[group_id], list):
@@ -11334,10 +11655,8 @@ def _save_pending_any(event, group_id: str, user_id: str | None, msg) -> None:
                     logger.info("image too large for pending: %d bytes", len(content))
                     entry["download_failed"] = True
                 else:
-                    os.makedirs(_PENDING_MEDIA_DIR, exist_ok=True)
-                    path = os.path.join(_PENDING_MEDIA_DIR, f"{_uuid.uuid4().hex}.jpg")
-                    with open(path, "wb") as f:
-                        f.write(bytes(content))
+                    import pending_store as _ps
+                    path = _ps.write_pending_media(bytes(content), ".jpg")
                     entry["media_path"] = path
                     memory.log_raw_message_meta(
                         group_id,
@@ -11358,10 +11677,8 @@ def _save_pending_any(event, group_id: str, user_id: str | None, msg) -> None:
                     logger.info("video too large for pending: %d bytes", len(content))
                     entry["download_failed"] = True
                 else:
-                    os.makedirs(_PENDING_MEDIA_DIR, exist_ok=True)
-                    path = os.path.join(_PENDING_MEDIA_DIR, f"{_uuid.uuid4().hex}.mp4")
-                    with open(path, "wb") as f:
-                        f.write(bytes(content))
+                    import pending_store as _ps
+                    path = _ps.write_pending_media(bytes(content), ".mp4")
                     entry["media_path"] = path
                     memory.log_raw_message_meta(
                         group_id,
@@ -11379,10 +11696,8 @@ def _save_pending_any(event, group_id: str, user_id: str | None, msg) -> None:
             entry["file_name"] = getattr(msg, "file_name", "unknown")
             try:
                 content = _download_content(msg.id)
-                os.makedirs(_PENDING_MEDIA_DIR, exist_ok=True)
-                path = os.path.join(_PENDING_MEDIA_DIR, f"{_uuid.uuid4().hex}.bin")
-                with open(path, "wb") as f:
-                    f.write(bytes(content))
+                import pending_store as _ps
+                path = _ps.write_pending_media(bytes(content), ".bin")
                 entry["media_path"] = path
                 memory.log_raw_message_meta(
                     group_id,
@@ -11400,10 +11715,8 @@ def _save_pending_any(event, group_id: str, user_id: str | None, msg) -> None:
             entry["type"] = "audio"
             try:
                 content = _download_content(msg.id)
-                os.makedirs(_PENDING_MEDIA_DIR, exist_ok=True)
-                path = os.path.join(_PENDING_MEDIA_DIR, f"{_uuid.uuid4().hex}.m4a")
-                with open(path, "wb") as f:
-                    f.write(bytes(content))
+                import pending_store as _ps
+                path = _ps.write_pending_media(bytes(content), ".m4a")
                 entry["media_path"] = path
                 entry["mime_type"] = "audio/m4a"
                 memory.log_raw_message_meta(
@@ -11417,14 +11730,21 @@ def _save_pending_any(event, group_id: str, user_id: str | None, msg) -> None:
                 logger.warning("download audio for pending failed: %s", e)
                 entry["download_failed"] = True
         else:
-            return
+            return False
 
         # C1 fix (2026-05-30): 走 pending_store.add 單鎖 load+append+save，
         # 不再 load 全 dict → append → save_full 整段覆寫（跨 process/thread lost-update）。
         import pending_store as _ps
-        _ps.add(group_id, entry)
+        return _ps.add_unique(group_id, entry)
     except Exception as e:
+        try:
+            if isinstance(locals().get("entry"), dict):
+                import pending_store as _ps
+                _ps.discard_untracked_media(entry)
+        except Exception:
+            pass
         logger.warning("save pending any failed: %s", str(e)[:200])
+        return False
 
 
 def _save_pending_burst_text(group_id: str, text: str) -> None:
@@ -11673,32 +11993,43 @@ def _build_group_parts(items: list[dict], group_id: str) -> list:
 
 
 _GLOBAL_GATE_CACHE_TTL_SEC = 60                                # LINE quota API call 60s 內共用結果
-_global_gate_cache: tuple[float, bool] | None = None
+_global_gate_cache: dict[bool, tuple[float, bool]] = {}
 _global_gate_cache_lock = threading.Lock()
 
 
-def _global_pending_drain_ready() -> bool:
+def _pending_snapshot_has_media(pending: dict) -> bool:
+    return any(
+        isinstance(items, list)
+        and any(
+            isinstance(item, dict) and item.get("type") in {"image", "video"}
+            for item in items
+        )
+        for items in pending.values()
+    )
+
+
+def _global_pending_drain_ready(*, allow_local_media: bool = False) -> bool:
     """Drain pending 前的全域 gate：mute / Gemini quota / LINE 月額度。
 
     True 才可以動。三個 caller（startup / retry worker / piggyback）共用。
     Fail-closed：API check 失敗一律回 False，避免不確定狀態白燒 Gemini。
     60 秒 cache 防 cross-group webhook flood 放大 LINE API 呼叫次數。
     """
-    global _global_gate_cache
     now = time.time()
     with _global_gate_cache_lock:
-        if _global_gate_cache and now - _global_gate_cache[0] < _GLOBAL_GATE_CACHE_TTL_SEC:
-            return _global_gate_cache[1]
+        cached = _global_gate_cache.get(allow_local_media)
+        if cached and now - cached[0] < _GLOBAL_GATE_CACHE_TTL_SEC:
+            return cached[1]
 
     _load_quota_state()
     if settings.bot_muted:
         with _global_gate_cache_lock:
-            _global_gate_cache = (now, False)
+            _global_gate_cache[allow_local_media] = (now, False)
         return False
-    if _quota_exhausted():
+    if _quota_exhausted() and not allow_local_media:
         logger.info("drain pending: Gemini exhausted, defer")
         with _global_gate_cache_lock:
-            _global_gate_cache = (now, False)
+            _global_gate_cache[allow_local_media] = (now, False)
         return False
 
     try:
@@ -11708,7 +12039,7 @@ def _global_pending_drain_ready() -> bool:
         if not _tok:
             logger.warning("drain pending: no LINE token, fail-closed skip")
             with _global_gate_cache_lock:
-                _global_gate_cache = (now, False)
+                _global_gate_cache[allow_local_media] = (now, False)
             return False
         _h = {"Authorization": f"Bearer {_tok}"}
         _ru = _req.get(
@@ -11725,7 +12056,7 @@ def _global_pending_drain_ready() -> bool:
                 _ru.status_code, _rl.status_code,
             )
             with _global_gate_cache_lock:
-                _global_gate_cache = (now, False)
+                _global_gate_cache[allow_local_media] = (now, False)
             return False
         _used = _ru.json().get("totalUsage", 0)
         _limit = _rl.json().get("value", 200)
@@ -11735,7 +12066,7 @@ def _global_pending_drain_ready() -> bool:
                 _used, _limit,
             )
             with _global_gate_cache_lock:
-                _global_gate_cache = (now, False)
+                _global_gate_cache[allow_local_media] = (now, False)
             return False
     except Exception as _e:
         logger.warning(
@@ -11743,11 +12074,11 @@ def _global_pending_drain_ready() -> bool:
             str(_e)[:120],
         )
         with _global_gate_cache_lock:
-            _global_gate_cache = (now, False)
+            _global_gate_cache[allow_local_media] = (now, False)
         return False
 
     with _global_gate_cache_lock:
-        _global_gate_cache = (now, True)
+        _global_gate_cache[allow_local_media] = (now, True)
     return True
 
 
@@ -11757,12 +12088,23 @@ def _global_pending_drain_ready() -> bool:
 _drain_locks: dict[str, threading.Lock] = {}
 _drain_lock_factory_lock = threading.Lock()
 _DRAIN_LOCK_DIR = os.path.join(os.path.dirname(__file__), ".drain_locks")
+_media_delivery_locks: dict[str, dict] = {}
+_media_delivery_lock_factory_lock = threading.Lock()
+_MEDIA_DELIVERY_LOCK_DIR = os.path.join(
+    os.path.dirname(__file__), ".pending_media_state", "delivery_locks"
+)
 
 
 class _DrainSlot:
-    def __init__(self, thread_lock: threading.Lock, file_handle) -> None:
+    def __init__(
+        self,
+        thread_lock: threading.Lock,
+        file_handle,
+        on_release=None,
+    ) -> None:
         self._thread_lock = thread_lock
         self._file_handle = file_handle
+        self._on_release = on_release
         self._released = False
 
     def release(self) -> None:
@@ -11776,6 +12118,8 @@ class _DrainSlot:
                 self._file_handle.close()
             finally:
                 self._thread_lock.release()
+                if self._on_release is not None:
+                    self._on_release()
 
 
 def _try_acquire_drain_slot(group_id: str) -> _DrainSlot | None:
@@ -11803,7 +12147,74 @@ def _try_acquire_drain_slot(group_id: str) -> _DrainSlot | None:
         return None
 
 
-def _drain_pending_for_group(group_id: str, source: str = "startup") -> bool:
+def _try_acquire_media_delivery_slot(
+    group_id: str, message_id: str
+) -> _DrainSlot | None:
+    """Cross-thread/process claim spanning media analysis through delivery."""
+    identity = hashlib.sha256(f"{group_id}\0{message_id}".encode("utf-8")).hexdigest()
+    with _media_delivery_lock_factory_lock:
+        entry = _media_delivery_locks.get(identity)
+        if entry is None:
+            entry = {"lock": threading.Lock(), "refs": 0}
+            _media_delivery_locks[identity] = entry
+        entry["refs"] += 1
+        lock = entry["lock"]
+
+    def _release_entry_ref() -> None:
+        with _media_delivery_lock_factory_lock:
+            current = _media_delivery_locks.get(identity)
+            if current is not entry:
+                return
+            current["refs"] -= 1
+            if current["refs"] <= 0:
+                _media_delivery_locks.pop(identity, None)
+
+    if not lock.acquire(blocking=False):
+        _release_entry_ref()
+        return None
+    try:
+        os.makedirs(_MEDIA_DELIVERY_LOCK_DIR, mode=0o700, exist_ok=True)
+        os.chmod(os.path.dirname(_MEDIA_DELIVERY_LOCK_DIR), 0o700)
+        os.chmod(_MEDIA_DELIVERY_LOCK_DIR, 0o700)
+        try:
+            guard_path = os.path.join(
+                os.path.dirname(_MEDIA_DELIVERY_LOCK_DIR), "delivery_locks.guard"
+            )
+            guard_fd = os.open(guard_path, os.O_WRONLY | os.O_CREAT, 0o600)
+            os.fchmod(guard_fd, 0o600)
+            guard = os.fdopen(guard_fd, "w")
+            fcntl.flock(guard.fileno(), fcntl.LOCK_SH)
+            try:
+                lock_path = os.path.join(_MEDIA_DELIVERY_LOCK_DIR, f"{identity}.lock")
+                fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+                os.fchmod(fd, 0o600)
+                fh = os.fdopen(fd, "w")
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    fh.close()
+                    lock.release()
+                    _release_entry_ref()
+                    return None
+            finally:
+                fcntl.flock(guard.fileno(), fcntl.LOCK_UN)
+                guard.close()
+        except Exception:
+            raise
+        return _DrainSlot(lock, fh, on_release=_release_entry_ref)
+    except Exception as exc:
+        logger.warning("media delivery slot acquire failed: %s", str(exc)[:120])
+        lock.release()
+        _release_entry_ref()
+        return None
+
+
+def _drain_pending_for_group(
+    group_id: str,
+    source: str = "startup",
+    *,
+    local_media_only: bool = False,
+) -> bool:
     """處理單一 group 的 pending：分組 → 逐組 LLM 回覆 → 引用推送。
 
     呼叫前要先 _global_pending_drain_ready() == True。
@@ -11842,7 +12253,91 @@ def _drain_pending_for_group(group_id: str, source: str = "startup") -> bool:
         if not items:
             return True
 
-        groups = _gemini_group_messages(items)
+        delivered_media = [
+            item
+            for item in items
+            if item.get("type") in {"image", "video"}
+            and _was_media_delivery_tombstoned(
+                group_id, str(item.get("message_id") or "")
+            )
+        ]
+        if delivered_media:
+            try:
+                removed = _commit_pending_entries(group_id, delivered_media)
+            except Exception as exc:
+                logger.exception(
+                    "%s pending: tombstone pre-clean failed; retrying under delivery claim for group=%s: %s",
+                    source,
+                    group_id,
+                    exc,
+                )
+            else:
+                if removed == len(delivered_media):
+                    delivered_ids = {
+                        str(item.get("message_id") or "") for item in delivered_media
+                    }
+                    items = [
+                        item
+                        for item in items
+                        if str(item.get("message_id") or "") not in delivered_ids
+                    ]
+                else:
+                    logger.error(
+                        "%s pending: tombstone pre-clean removed %d/%d; retaining snapshot for claimed cleanup group=%s",
+                        source,
+                        removed,
+                        len(delivered_media),
+                        group_id,
+                    )
+        if not items:
+            return True
+
+        # Split private media before cloud topic grouping. Gemini sees only
+        # non-media entries; each image/video is retried locally as a singleton.
+        media_idxs = [
+            idx for idx, item in enumerate(items) if item.get("type") in {"image", "video"}
+        ]
+        non_media_pairs = [
+            (idx, item)
+            for idx, item in enumerate(items)
+            if item.get("type") not in {"image", "video"}
+        ]
+        groups: list[dict] = [
+            {"idxs": [idx], "reply_to": idx} for idx in media_idxs
+        ]
+        if non_media_pairs and not (_quota_exhausted() or local_media_only):
+            non_media_items = [item for _, item in non_media_pairs]
+            original_idx = [idx for idx, _ in non_media_pairs]
+            for grouped_item in _gemini_group_messages(non_media_items):
+                local_idxs = [
+                    idx
+                    for idx in grouped_item.get("idxs", [])
+                    if isinstance(idx, int) and 0 <= idx < len(original_idx)
+                ]
+                if not local_idxs:
+                    continue
+                mapped_idxs = [original_idx[idx] for idx in local_idxs]
+                local_reply_to = grouped_item.get("reply_to")
+                reply_to = (
+                    original_idx[local_reply_to]
+                    if isinstance(local_reply_to, int)
+                    and 0 <= local_reply_to < len(original_idx)
+                    and local_reply_to in local_idxs
+                    else mapped_idxs[0]
+                )
+                groups.append({"idxs": mapped_idxs, "reply_to": reply_to})
+        if _quota_exhausted() or local_media_only:
+            groups.sort(
+                key=lambda group: (
+                    0
+                    if items[min(group.get("idxs") or [0])].get("type")
+                    in {"image", "video"}
+                    else 1,
+                    min(group.get("idxs") or [len(items)]),
+                )
+            )
+        else:
+            groups.sort(key=lambda group: min(group.get("idxs") or [len(items)]))
         logger.info(
             "%s: group=%s items=%d groups=%d", source, group_id, len(items), len(groups)
         )
@@ -11860,17 +12355,77 @@ def _drain_pending_for_group(group_id: str, source: str = "startup") -> bool:
                 reply_to_idx = idxs[0]
             group_items = [items[i] for i in idxs]
             msg_ids = [it.get("message_id") for it in group_items if it.get("message_id")]
-            try:
-                parts = _build_group_parts(group_items, group_id)
-                if not parts:
-                    removed = _commit_pending_removal(group_id, msg_ids)
-                    processed_count += removed
+            media_item = (
+                group_items[0]
+                if len(group_items) == 1
+                and group_items[0].get("type") in {"image", "video"}
+                else None
+            )
+            media_delivery_slot = None
+            if media_item is not None:
+                media_delivery_slot = _try_acquire_media_delivery_slot(
+                    group_id, str(media_item.get("message_id") or "")
+                )
+                if media_delivery_slot is None:
+                    logger.info(
+                        "%s pending: media delivery already owned; retained for group=%s",
+                        source,
+                        group_id,
+                    )
                     continue
+                if _was_media_delivery_tombstoned(
+                    group_id, str(media_item.get("message_id") or "")
+                ):
+                    try:
+                        try:
+                            removed = _commit_pending_removal(group_id, msg_ids)
+                            processed_count += removed
+                        except Exception as exc:
+                            logger.exception(
+                                "%s pending: tombstoned cleanup failed; retained for group=%s: %s",
+                                source,
+                                group_id,
+                                exc,
+                            )
+                    finally:
+                        media_delivery_slot.release()
+                    continue
+            try:
+                if media_item is not None:
+                    media_path = media_item.get("media_path")
+                    if not media_path or not os.path.exists(media_path):
+                        raise FileNotFoundError("saved media is unavailable")
 
-                context = memory.get_context(group_id)
-                facts = memory.top_facts(group_id)
-                pnotes = _get_persona_notes(group_id)
-                reply_text = _llm_chat(parts, context, facts, pnotes)
+                    def _retry_saved_media() -> str | None:
+                        with open(media_path, "rb") as media_file:
+                            media_bytes = media_file.read()
+                        import media_pipeline
+
+                        if media_item.get("type") == "image":
+                            return media_pipeline.analyze_image(
+                                media_bytes, group_id=group_id
+                            )
+                        return media_pipeline.analyze_video(
+                            media_bytes, group_id=group_id
+                        )
+
+                    reply_text = _run_media_analysis(
+                        _retry_saved_media,
+                        time.monotonic() + _MEDIA_REPLY_BUDGET_SEC,
+                    )
+                    if not reply_text or not reply_text.strip():
+                        raise RuntimeError("saved media analysis returned empty")
+                else:
+                    parts = _build_group_parts(group_items, group_id)
+                    if not parts:
+                        removed = _commit_pending_removal(group_id, msg_ids)
+                        processed_count += removed
+                        continue
+
+                    context = memory.get_context(group_id)
+                    facts = memory.top_facts(group_id)
+                    pnotes = _get_persona_notes(group_id)
+                    reply_text = _llm_chat(parts, context, facts, pnotes)
 
                 text = _prepare_outbound_text(reply_text, source="pending_push")
                 footer = _get_quota_footer()
@@ -11880,6 +12435,8 @@ def _drain_pending_for_group(group_id: str, source: str = "startup") -> bool:
                         "%s pending: suppressed system-status push group=%s preview=%r",
                         source, group_id, text[:120],
                     )
+                    if media_delivery_slot is not None:
+                        media_delivery_slot.release()
                     return True
 
                 qt = items[reply_to_idx].get("quote_token")
@@ -11901,18 +12458,45 @@ def _drain_pending_for_group(group_id: str, source: str = "startup") -> bool:
                         x_line_retry_key=_pending_push_retry_key(group_id, msg_ids),
                     )
             except Exception as e:
-                if _is_quota_error(e):
+                if _is_line_retry_key_conflict(e):
+                    logger.info(
+                        "%s pending: LINE retry key already accepted; committing local cleanup",
+                        source,
+                    )
+                elif _is_quota_error(e):
                     _mark_quota_exhausted()
                     logger.warning(
                         "%s pending: quota re-exhausted, kept unprocessed pending for group=%s",
                         source, group_id,
                     )
+                    if media_delivery_slot is not None:
+                        media_delivery_slot.release()
+                    return True
                 else:
                     logger.warning(
                         "%s pending: push/build failed (%s), kept unprocessed pending for group=%s",
                         source, str(e)[:120], group_id,
                     )
-                return True
+                    if media_delivery_slot is not None:
+                        media_delivery_slot.release()
+                    return True
+
+            if media_item is not None:
+                message_id = str(media_item.get("message_id") or "")
+                if not _record_media_delivery_tombstone(group_id, message_id):
+                    logger.error(
+                        "%s pending: push accepted but persistent tombstone failed group=%s",
+                        source,
+                        group_id,
+                    )
+                try:
+                    memory.mark_inbound_event_replied(group_id, message_id)
+                except Exception as exc:
+                    logger.error(
+                        "%s pending: accepted push inbound mark failed: %s",
+                        source,
+                        exc,
+                    )
 
             try:
                 removed = _commit_pending_removal(group_id, msg_ids)
@@ -11927,6 +12511,14 @@ def _drain_pending_for_group(group_id: str, source: str = "startup") -> bool:
                     "%s pending: pushed but commit removal failed for group=%s: %s",
                     source, group_id, e,
                 )
+            finally:
+                # Keep the cross-process claim through durable pending cleanup.
+                # The persistent tombstone can fail after LINE has accepted the
+                # push, so releasing earlier would let another process observe
+                # the still-pending item and send a duplicate.
+                if media_delivery_slot is not None:
+                    media_delivery_slot.release()
+                    media_delivery_slot = None
 
             try:
                 memory.append_turn(
@@ -11952,7 +12544,7 @@ def _drain_pending_for_group(group_id: str, source: str = "startup") -> bool:
         slot.release()
 
 
-def _process_pending_on_startup() -> None:
+def _process_pending_on_startup(*, local_media_only: bool = False) -> None:
     """uvicorn 啟動時處理所有 pending：thin wrapper，所有實作在 helper 裡。"""
     if not _pending_reply_enabled():
         logger.info("pending reply disabled; startup drain skipped")
@@ -11960,13 +12552,20 @@ def _process_pending_on_startup() -> None:
     pending = _load_pending_explicit()
     if not pending:
         return
-    if not _global_pending_drain_ready():
+    has_media = _pending_snapshot_has_media(pending)
+    if not _global_pending_drain_ready(allow_local_media=has_media):
         return
     for group_id in list(pending.keys()):
         # Gemini 中途又爆，後面的 group 直接放棄這輪
-        if _quota_exhausted():
-            return
-        _drain_pending_for_group(group_id, source="startup")
+        if _quota_exhausted() and not _pending_snapshot_has_media(
+            {group_id: pending.get(group_id)}
+        ):
+            continue
+        _drain_pending_for_group(
+            group_id,
+            source="startup",
+            local_media_only=(local_media_only or _quota_exhausted()),
+        )
 
 
 _PENDING_RETRY_INTERVAL_SEC = 6 * 60 * 60        # 6 小時跑一次（從 30 min 降頻，避免吃光每日 quota）
@@ -12022,15 +12621,23 @@ def _piggyback_drain_pending(group_id: str) -> None:
             return
         if group_id not in pending or not pending[group_id]:
             return
-        if not _has_enough_quota_for_retry():
+        group_has_media = _pending_snapshot_has_media(
+            {group_id: pending.get(group_id)}
+        )
+        reserve_ok = _has_enough_quota_for_retry()
+        if not group_has_media and not reserve_ok:
             logger.info(
                 "piggyback drain: quota usage > 60%%, skip group=%s", group_id
             )
             return
-        if not _global_pending_drain_ready():
+        if not _global_pending_drain_ready(allow_local_media=group_has_media):
             return
         logger.info("piggyback drain: triggered by message in group=%s", group_id)
-        attempted = _drain_pending_for_group(group_id, source="piggyback")
+        attempted = _drain_pending_for_group(
+            group_id,
+            source="piggyback",
+            local_media_only=(group_has_media and not reserve_ok),
+        )
         if attempted:
             with _piggyback_drain_lock:
                 _last_piggyback_drain_ts[group_id] = time.time()
@@ -12077,18 +12684,23 @@ def _start_pending_retry_worker() -> None:
                         _drain_pending_reminders(gid)
             except Exception as e:
                 logger.warning("reminder pending backstop failed: %s", e)
-            if not _load_pending_explicit():
+            pending_snapshot = _load_pending_explicit()
+            if not pending_snapshot:
                 continue
             if not _pending_reply_enabled():
                 continue
-            if _quota_exhausted():
+            has_media = _pending_snapshot_has_media(pending_snapshot)
+            if _quota_exhausted() and not has_media:
                 continue
-            if not _has_enough_quota_for_retry():
+            reserve_ok = _has_enough_quota_for_retry()
+            if not has_media and not reserve_ok:
                 logger.info("pending retry worker: quota usage > 60%%, skip to preserve for new messages")
                 continue
             logger.info("pending retry worker: quota available + sufficient, processing pending")
             try:
-                _process_pending_on_startup()
+                _process_pending_on_startup(
+                    local_media_only=(has_media and not reserve_ok)
+                )
             except Exception as e:
                 logger.exception("pending retry worker failed: %s", e)
 
@@ -12391,6 +13003,15 @@ def _is_quota_error(e: Exception) -> bool:
     return ("429" in s or "RESOURCE_EXHAUSTED" in s) and (
         "PerDay" in s or "free_tier_requests" in s
     )
+
+
+def _is_line_retry_key_conflict(e: Exception) -> bool:
+    """LINE 409 means the deterministic retry-key request was accepted before."""
+    status = getattr(e, "status", None) or getattr(e, "status_code", None)
+    try:
+        return int(status) == 409
+    except (TypeError, ValueError):
+        return "409" in str(e) and "retry" in str(e).lower()
 
 
 def _is_gemini_unavailable_error(e: Exception) -> bool:
@@ -14741,7 +15362,7 @@ def _reply(
     *,
     allow_push_fallback: bool = True,
     include_auxiliary: bool = True,
-) -> None:
+) -> bool:
     """
     回覆 LINE 訊息。若帶 group_id,成功後會把 bot 的回覆也存進 raw_messages,
     這樣使用者引用 bot 的回覆問後續問題時,能查得到原文。
@@ -14749,11 +15370,14 @@ def _reply(
     若 reply_token 已過期（例如 redelivery）且有 group_id,
     自動 fallback 到 push_message 補送。
 
+    只有 LINE 明確接受 reply 或 fallback push 時回傳 True；模糊失敗、
+    靜音或內容被抑制時回傳 False，讓需要 durable cleanup 的 caller 判斷。
+
     settings.bot_muted=True 時整個函式 short-circuit:
     不 reply、不 push、只把原本要送的 text 寫進 log 方便除錯。
     """
     if not text or not text.strip():
-        return
+        return False
     # Markdown → LINE 純文字，並在 LINE API 呼叫前做最後 factual-safety gate。
     text = _prepare_outbound_text(text, source="reply")
     primary_suppressed = not bool(text and text.strip())
@@ -14778,7 +15402,7 @@ def _reply(
             len(text),
             text[:120],
         )
-        return
+        return False
 
     # LINE reply_message 上限 5 則。pending reply piggyback 已取消；due
     # reminders 可趁正常 reply 一起送，作為 LINE push quota 429 時的補救路徑。
@@ -15088,7 +15712,7 @@ def _reply(
             pending_reminder_pushes = kept_natural_reminders
         if not messages_to_send:
             logger.info("reply suppressed with no piggyback messages group=%s", group_id)
-            return
+            return False
         try:
             reminder_delivery_started = bool(
                 event_delivery_claims or natural_delivery_claims
@@ -15118,7 +15742,7 @@ def _reply(
                     "reply failure ambiguous; skip fallback push to avoid duplicate group=%s",
                     group_id,
                 )
-                return
+                return False
             # reply_token 明確過期 / invalid / 已用過 → fallback 到 push_message
             if group_id:
                 if primary_suppressed or not allow_push_fallback or _is_market_quote_outbound(text):
@@ -15128,7 +15752,7 @@ def _reply(
                         _is_market_quote_outbound(text),
                         primary_suppressed,
                     )
-                    return
+                    return False
                 try:
                     _push_text, push_message = _text_message_with_mentions(
                         text,
@@ -15176,9 +15800,10 @@ def _reply(
                             group_id,
                             str(archive_error)[:200],
                         )
+                    return True
                 except Exception as push_err:
                     logger.warning("fallback push also failed: %s", str(push_err)[:300])
-            return
+            return False
 
         if pending_commit_ids and group_id:
             try:
@@ -15289,6 +15914,7 @@ def _reply(
                 logger.warning("reminder confirmation release failed: %s", e)
         if pending_slot is not None:
             pending_slot.release()
+    return True
 
 
 def _download_content(message_id: str) -> bytes:

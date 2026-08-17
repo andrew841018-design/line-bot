@@ -61,7 +61,7 @@ JOB_REGISTRY["line-bot-weekly-summary"] = JobSpec(
     command=[_LB_PYTHON, _lb_script("weekly_summary.py")],
     cwd=str(_HERE),
     env=_base_env(),
-    timeout=60,
+    timeout=180,
     description="Sunday 20:00 weekly summary",
 )
 

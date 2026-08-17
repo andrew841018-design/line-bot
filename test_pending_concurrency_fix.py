@@ -80,26 +80,26 @@ def test_save_pending_any_persists_via_single_lock(monkeypatch):
         f"別組 pending 不該被動到: {data}"
 
 
-def test_save_pending_any_uses_pending_store_add(monkeypatch):
-    """C1 結構保證：_save_pending_any 必須呼叫 pending_store.add，不可呼叫 save_full。"""
+def test_save_pending_any_uses_pending_store_add_unique(monkeypatch):
+    """Pending writes use one locked, message-id-deduplicated RMW operation."""
     import main
     monkeypatch.setattr(main, "_PENDING_REPLY_ENABLED", True)
 
     pending_store.save_full({})
-    called = {"add": 0, "save_full": 0}
+    called = {"add_unique": 0, "save_full": 0}
 
-    real_add = pending_store.add
+    real_add_unique = pending_store.add_unique
     real_save_full = pending_store.save_full
 
-    def spy_add(gid, entry):
-        called["add"] += 1
-        return real_add(gid, entry)
+    def spy_add_unique(gid, entry):
+        called["add_unique"] += 1
+        return real_add_unique(gid, entry)
 
     def spy_save_full(data):
         called["save_full"] += 1
         return real_save_full(data)
 
-    monkeypatch.setattr(pending_store, "add", spy_add)
+    monkeypatch.setattr(pending_store, "add_unique", spy_add_unique)
     monkeypatch.setattr(pending_store, "save_full", spy_save_full)
     # _save_pending_explicit_raw 內部也呼叫 save_full → 一併攔
     monkeypatch.setattr(main, "_save_pending_explicit_raw",
@@ -115,7 +115,7 @@ def test_save_pending_any_uses_pending_store_add(monkeypatch):
 
     main._save_pending_any(ev, "G1", "U1", m)
 
-    assert called["add"] == 1, "應走 pending_store.add（單鎖 RMW）"
+    assert called["add_unique"] == 1, "應走 pending_store.add_unique（單鎖 RMW）"
     assert called["save_full"] == 0, "不可走 save_full 整段覆寫（C1 lost-update 根因）"
 
 

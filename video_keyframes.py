@@ -5,13 +5,18 @@
 """
 from __future__ import annotations
 import logging
+import os
+import shutil
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 
 logger = logging.getLogger("video_keyframes")
 
 _FFMPEG = "/opt/homebrew/bin/ffmpeg"  # M-series Mac brew 路徑
+_TEMP_VIDEO_BY_FRAME_DIR: dict[str, str] = {}
+_TEMP_VIDEO_LOCK = threading.Lock()
 
 
 def extract_keyframes(
@@ -24,13 +29,16 @@ def extract_keyframes(
     video_path 可以是檔案路徑或 bytes。
     """
     # bytes → temp file
+    temp_video_path: str | None = None
     if isinstance(video_path, bytes):
         tmp_video = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
         tmp_video.write(video_path)
         tmp_video.close()
-        video_path = tmp_video.name
+        temp_video_path = tmp_video.name
+        video_path = temp_video_path
 
     out_dir = Path(tempfile.mkdtemp(prefix="kf_"))
+    frames: list[Path] = []
 
     # 試 scene-change selector
     try:
@@ -46,10 +54,11 @@ def extract_keyframes(
         if result.returncode != 0:
             logger.warning("scene-change extract failed: %s", result.stderr.decode()[:200])
             # fallback: 固定間隔抽
-            return _fallback_uniform(video_path, out_dir, max_frames)
+            frames = _fallback_uniform(video_path, out_dir, max_frames)
+            return frames
         frames = sorted(out_dir.glob("frame_*.jpg"))
         if not frames:
-            return _fallback_uniform(video_path, out_dir, max_frames)
+            frames = _fallback_uniform(video_path, out_dir, max_frames)
         return frames
     except subprocess.TimeoutExpired:
         logger.warning("ffmpeg timeout")
@@ -57,6 +66,18 @@ def extract_keyframes(
     except Exception as e:
         logger.warning("extract_keyframes failed: %s", e)
         return []
+    finally:
+        if frames:
+            if temp_video_path:
+                with _TEMP_VIDEO_LOCK:
+                    _TEMP_VIDEO_BY_FRAME_DIR[str(out_dir)] = temp_video_path
+        else:
+            shutil.rmtree(out_dir, ignore_errors=True)
+            if temp_video_path:
+                try:
+                    os.unlink(temp_video_path)
+                except OSError:
+                    pass
 
 
 def _fallback_uniform(video_path, out_dir: Path, max_frames: int) -> list[Path]:
@@ -98,7 +119,13 @@ def cleanup(frames: list[Path]) -> None:
         return
     parent = frames[0].parent
     try:
-        import shutil
         shutil.rmtree(parent, ignore_errors=True)
     except Exception:
         pass
+    with _TEMP_VIDEO_LOCK:
+        temp_video_path = _TEMP_VIDEO_BY_FRAME_DIR.pop(str(parent), None)
+    if temp_video_path:
+        try:
+            os.unlink(temp_video_path)
+        except OSError:
+            pass

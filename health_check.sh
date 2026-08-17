@@ -6,17 +6,15 @@
 set -u
 
 HOME="${HOME:-/Users/andrew}"
-BOT_DIR="/Users/andrew/Desktop/andrew/Data_engineer/line_bot"
-HC_LOG="$BOT_DIR/health_check.log"
+BOT_DIR="${BOT_DIR:-/Users/andrew/Desktop/andrew/Data_engineer/line_bot}"
+HC_LOG="${HC_LOG:-$BOT_DIR/health_check.log}"
 UVICORN_LOG="$BOT_DIR/uvicorn.log"
 PORT=8080
 MAX_429_PER_DAY=10
 READY_TIMEOUT_SEC="${READY_TIMEOUT_SEC:-75}"
 UVICORN_LABEL="com.andrew.line-bot-uvicorn"
 UVICORN_PLIST="$HOME/Library/LaunchAgents/${UVICORN_LABEL}.plist"
-CLOUDFLARED_LABEL="com.andrew.line-bot-cloudflared"
-CLOUDFLARED_PLIST="$HOME/Library/LaunchAgents/${CLOUDFLARED_LABEL}.plist"
-CLOUDFLARED_URL_FILE="/tmp/cloudflared_line_bot_url.txt"
+CLOUDFLARED_URL_FILE="${CLOUDFLARED_URL_FILE:-/tmp/cloudflared_line_bot_url.txt}"
 RESTART_LOCK_DIR="/tmp/line_bot_restart.lockdir"
 
 ts() { date '+%Y-%m-%d %H:%M:%S %Z'; }
@@ -46,18 +44,6 @@ ensure_uvicorn_service() {
     return 1
   fi
   launchctl bootstrap "$domain" "$UVICORN_PLIST"
-}
-
-ensure_cloudflared_service() {
-  local domain="gui/$(id -u)"
-  if launchctl print "$domain/$CLOUDFLARED_LABEL" >/dev/null 2>&1; then
-    return 0
-  fi
-  if [ ! -f "$CLOUDFLARED_PLIST" ]; then
-    say "ERR missing cloudflared plist: $CLOUDFLARED_PLIST"
-    return 1
-  fi
-  launchctl bootstrap "$domain" "$CLOUDFLARED_PLIST"
 }
 
 acquire_restart_lock() {
@@ -97,6 +83,48 @@ run_preflight() {
 preflight_is_acceptable() {
   [ "$1" = "0" ] || [ "$1" = "2" ]
 }
+
+quick_tunnel_api_dns_ready() {
+  "$BOT_DIR/.venv/bin/python" "$BOT_DIR/quick_tunnel_dns.py" --timeout 5 \
+    >/dev/null 2>&1
+}
+
+recover_cloudflared() {
+  say "cloudflared DOWN; delegating restart + fresh generation + webhook E2E to preflight..."
+  if ! quick_tunnel_api_dns_ready; then
+    say "ERR cloudflared restart blocked: system resolver cannot resolve api.trycloudflare.com; VPN/private DNS may be blocking it"
+    CF_ACTION="cf_restart_blocked_dns"
+  else
+    PREVIOUS_URL=""
+    if [ -s "$CLOUDFLARED_URL_FILE" ]; then
+      PREVIOUS_URL=$(cat "$CLOUDFLARED_URL_FILE")
+    fi
+    # preflight is the sole recovery owner: it acquires the shared lock and
+    # keeps restart -> fresh stash -> generation-fenced PUT -> E2E atomic.
+    run_preflight "cloudflared down recovery"
+    CANDIDATE_URL=""
+    if [ -s "$CLOUDFLARED_URL_FILE" ]; then
+      CANDIDATE_URL=$(cat "$CLOUDFLARED_URL_FILE")
+    fi
+    if preflight_is_acceptable "$PREFLIGHT_EXIT" \
+      && [[ "$CANDIDATE_URL" =~ ^https://[a-z0-9-]+\.trycloudflare\.com$ ]] \
+      && [ "$CANDIDATE_URL" != "https://api.trycloudflare.com" ] \
+      && [ "$CANDIDATE_URL" != "$PREVIOUS_URL" ]; then
+      CF_UP=1
+      CF_ACTION="cf_restart_success_preflight_${PREFLIGHT_EXIT} url=${CANDIDATE_URL}/callback"
+    elif preflight_is_acceptable "$PREFLIGHT_EXIT"; then
+      say "ERR preflight returned success without a fresh valid tunnel generation"
+      CF_ACTION="cf_restart_failed_no_fresh_url"
+    else
+      CF_ACTION="cf_restart_failed_preflight_${PREFLIGHT_EXIT}"
+    fi
+  fi
+  say "cf_action=$CF_ACTION"
+}
+
+if [ "${HEALTH_CHECK_SOURCE_ONLY:-0}" = "1" ]; then
+  return 0 2>/dev/null || exit 0
+fi
 
 {
   echo ""
@@ -174,36 +202,7 @@ if [ $UVICORN_UP -eq 0 ]; then
 fi
 
 if [ $CF_UP -eq 0 ]; then
-  say "cloudflared DOWN; attempting launchd restart..."
-  if ! ensure_cloudflared_service; then
-    CF_ACTION="cf_restart_failed_launchd_service"
-  else
-    launchctl kickstart -k "gui/$(id -u)/$CLOUDFLARED_LABEL"
-    say "kickstarted $CLOUDFLARED_LABEL, waiting for URL stash..."
-    NEW_URL=""
-    for i in $(seq 1 90); do
-      sleep 1
-      if [ -s "$CLOUDFLARED_URL_FILE" ]; then
-        NEW_URL=$(cat "$CLOUDFLARED_URL_FILE")
-      fi
-      [ -n "$NEW_URL" ] && break
-    done
-
-    if [ -z "$NEW_URL" ]; then
-      say "ERR cloudflared URL not found after 90s"
-      CF_ACTION="cf_restart_failed_no_url"
-    else
-      CF_UP=1
-      say "cloudflared new URL=$NEW_URL"
-      run_preflight "cloudflared restart webhook alignment"
-      if preflight_is_acceptable "$PREFLIGHT_EXIT"; then
-        CF_ACTION="cf_restart_success_preflight_${PREFLIGHT_EXIT} url=${NEW_URL}/callback"
-      else
-        CF_ACTION="cf_restart_failed_preflight_${PREFLIGHT_EXIT}"
-      fi
-    fi
-  fi
-  say "cf_action=$CF_ACTION"
+  recover_cloudflared
 fi
 
 if [ "$PREFLIGHT_RAN" -eq 0 ] && [ $UVICORN_UP -eq 1 ] && [ $CF_UP -eq 1 ]; then

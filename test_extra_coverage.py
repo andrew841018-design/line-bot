@@ -1664,7 +1664,7 @@ def test_handle_group_message_routing():
         img_evt = _make_message_event(img_msg)
         with (
             patch("main.memory.log_raw_message") as mock_log,
-            patch("main._MEDIA_EXECUTOR.submit") as mock_submit,
+            patch("main._submit_media_handler") as mock_submit,
         ):
             main._handle_event(img_evt)
         check("img → log_raw_message called", mock_log.called)
@@ -1676,7 +1676,7 @@ def test_handle_group_message_routing():
         vid_evt = _make_message_event(vid_msg)
         with (
             patch("main.memory.log_raw_message") as mock_log2,
-            patch("main._MEDIA_EXECUTOR.submit") as mock_submit2,
+            patch("main._submit_media_handler") as mock_submit2,
         ):
             main._handle_event(vid_evt)
         check("video → log_raw_message called", mock_log2.called)
