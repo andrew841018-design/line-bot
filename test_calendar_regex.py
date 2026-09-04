@@ -400,7 +400,7 @@ def test_take_cake_accepted():
 
 
 def test_classify_medical_with_doctor_name_between_look_and_dentist():
-    assert calendar_regex._classify_type("看台大陳敏惠牙醫師") == "medical"
+    assert calendar_regex._classify_type("看台大測試牙醫乙") == "medical"
 
 
 # ── 中文日期格式 ────────────────────────────────────────────────────────────
@@ -449,7 +449,7 @@ def test_relative_today():
 def test_weekday_chinese_time_medical():
     """Gemini/quota down 時，也要能抽「星期四早上十點半看牙醫」。"""
     out = calendar_regex.extract_regex_only(
-        "星期四早上十點半看台大陳敏惠牙醫師",
+        "星期四早上十點半看台大測試牙醫乙",
         date(2026, 6, 2),
     )
     assert out["has_event"] is True

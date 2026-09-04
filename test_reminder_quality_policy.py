@@ -68,7 +68,7 @@ def test_internal_prompt_artifacts_are_rejected():
     import reminder_intent
 
     assert reminder_intent.has_internal_prompt_artifact(
-        "找江福田醫師加號--- 原始訊息 結束 ---(下面是使用者目"
+        "找測試醫師乙加號--- 原始訊息 結束 ---(下面是使用者目"
     )
 
 
@@ -334,7 +334,7 @@ def test_sourceful_calendar_event_ignores_source_less_synthetic_duplicate(
 
     canonical_id, _ = calendar_db.insert_event_with_outcome(
         group_id="G1",
-        title="早上找江福田醫師加號 看心律不整",
+        title="早上找測試醫師乙加號 看心律不整",
         event_date=event_date,
         event_time=None,
         source_msg_id="m-source",
@@ -342,7 +342,7 @@ def test_sourceful_calendar_event_ignores_source_less_synthetic_duplicate(
     )
     duplicate_id, outcome = calendar_db.insert_event_with_outcome(
         group_id="G1",
-        title="找江福田醫師加號 看心律不整",
+        title="找測試醫師乙加號 看心律不整",
         event_date=event_date,
         event_time="09:00",
         source_msg_id=None,
@@ -352,7 +352,7 @@ def test_sourceful_calendar_event_ignores_source_less_synthetic_duplicate(
     assert outcome == "duplicate"
     assert duplicate_id == canonical_id
     event = calendar_db.get_active_event_by_id("G1", canonical_id)
-    assert event["title"] == "早上找江福田醫師加號 看心律不整"
+    assert event["title"] == "早上找測試醫師乙加號 看心律不整"
     assert event["event_time"] is None
 
 

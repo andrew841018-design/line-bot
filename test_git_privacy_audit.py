@@ -41,6 +41,7 @@ def test_forbidden_private_artifact_paths_are_rejected():
         (("2026-" + "11-16 14:30 回診").encode(), "private_schedule"),
         (("媽媽 " + "/".join(("8", "30")) + " 11:00 回診").encode(), "private_schedule"),
         ("參加人：私人姓名甲".encode(), "private_name"),
+        (("陳" + "某醫師").encode(), "private_name"),
     ],
 )
 def test_categories_are_detected_without_rendering_values(content: bytes, category: str):

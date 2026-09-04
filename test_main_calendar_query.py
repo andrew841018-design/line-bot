@@ -5483,7 +5483,7 @@ def test_build_todo_status_reply_reads_all_sources(monkeypatch):
                 "source_ref": "",
             },
             {
-                "action": "弟弟早上洗牙，看陳敏慧牙醫師",
+                "action": "弟弟早上洗牙，看測試牙醫乙",
                 "remind_at": reminder_ts,
                 "mention_aliases": [],
                 "source_kind": "calendar_event",
@@ -5503,7 +5503,7 @@ def test_build_todo_status_reply_reads_all_sources(monkeypatch):
     assert "1. 6/25（四）08:00" in reply
     assert "事項：全家打球" in reply
     assert "參加人：@all" in reply
-    assert "陳敏慧牙醫師" in reply
+    assert "測試牙醫乙" in reply
 
 
 def test_build_todo_status_reply_detail_query_includes_source_text(monkeypatch):
@@ -6076,7 +6076,7 @@ def test_auto_capture_gate_accepts_weekday_chinese_time_dentist(monkeypatch):
     import threading
     monkeypatch.setattr(threading, "Thread", InlineThread)
 
-    text = "星期四早上十點半看台大陳敏惠牙醫師"
+    text = "星期四早上十點半看台大測試牙醫乙"
     main._auto_capture_text_if_important("G1", text, "U_MOM")
 
     assert called == [("G1", text, "U_MOM", "")]
@@ -6097,7 +6097,7 @@ def test_medical_event_subjectless_defaults_to_sender_alias(
         lambda text: {
             "has_event": True,
             "is_cancellation": False,
-            "title": "看台大陳敏惠牙醫師",
+            "title": "看台大測試牙醫乙",
             "date": future_date,
             "time": "10:30",
             "location": "台大",
@@ -6108,12 +6108,12 @@ def test_medical_event_subjectless_defaults_to_sender_alias(
     )
 
     main._maybe_capture_calendar_event(
-        "G1", "星期四早上十點半看台大陳敏惠牙醫師", "U_MOM"
+        "G1", "星期四早上十點半看台大測試牙醫乙", "U_MOM"
     )
 
     events = tmp_calendar_db.list_upcoming("G1", days=30)
     assert len(events) == 1
-    assert events[0]["title"] == "媽媽看台大陳敏惠牙醫師"
+    assert events[0]["title"] == "媽媽看台大測試牙醫乙"
     assert json.loads(events[0]["participants"]) == ["媽媽(就醫)"]
 
 

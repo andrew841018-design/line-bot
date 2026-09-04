@@ -176,7 +176,7 @@ def test_maybe_extract_none_falls_back_to_calendar_regex(temp_db, monkeypatch):
 
     monkeypatch.setattr(gemini_client, "extract_reminder", lambda *a, **k: None)
 
-    main._maybe_extract_reminder("明天早上十點半看台大陳敏惠牙醫師", "G1", "U1", "m1")
+    main._maybe_extract_reminder("明天早上十點半看台大測試牙醫乙", "G1", "U1", "m1")
 
     with memory._conn() as c:
         row = c.execute(
@@ -402,7 +402,7 @@ def test_maybe_extract_subjectless_medical_uses_sender_alias(temp_db, monkeypatc
     )
 
     main._maybe_extract_reminder(
-        "明天早上十點半看台大陳敏惠牙醫師", "G1", "U_MOM", "m1"
+        "明天早上十點半看台大測試牙醫乙", "G1", "U_MOM", "m1"
     )
 
     with memory._conn() as c:
@@ -410,7 +410,7 @@ def test_maybe_extract_subjectless_medical_uses_sender_alias(temp_db, monkeypatc
             "SELECT action FROM reminders WHERE group_id='G1' AND status='pending'"
         ).fetchone()
     assert row is not None
-    assert row[0] == "媽媽看台大陳敏惠牙醫師"
+    assert row[0] == "媽媽看台大測試牙醫乙"
 
 
 def test_maybe_extract_rewrites_first_person_action_to_sender_alias(temp_db, monkeypatch):
@@ -424,7 +424,7 @@ def test_maybe_extract_rewrites_first_person_action_to_sender_alias(temp_db, mon
         gemini_client,
         "extract_reminder",
         lambda *a, **k: {
-            "action": "我看台大陳敏惠牙醫師",
+            "action": "我看台大測試牙醫乙",
             "year": future.year,
             "month": future.month,
             "day": future.day,
@@ -439,7 +439,7 @@ def test_maybe_extract_rewrites_first_person_action_to_sender_alias(temp_db, mon
     )
 
     main._maybe_extract_reminder(
-        "星期四早上十點半看台大陳敏惠牙醫師", "G1", "U_MOM", "m1"
+        "星期四早上十點半看台大測試牙醫乙", "G1", "U_MOM", "m1"
     )
 
     with memory._conn() as c:
@@ -447,7 +447,7 @@ def test_maybe_extract_rewrites_first_person_action_to_sender_alias(temp_db, mon
             "SELECT action FROM reminders WHERE group_id='G1' AND status='pending'"
         ).fetchone()
     assert row is not None
-    assert row[0] == "媽媽看台大陳敏惠牙醫師"
+    assert row[0] == "媽媽看台大測試牙醫乙"
 
 
 def test_maybe_extract_medical_prep_inherits_patient_and_companion(temp_db, monkeypatch):
@@ -684,7 +684,7 @@ def test_drain_none_falls_back_to_calendar_regex_with_message_date(temp_db, monk
     import gemini_client
 
     memory.enqueue_pending_reminder(
-        "G1", "U1", "星期四早上十點半看台大陳敏惠牙醫師", "m1"
+        "G1", "U1", "星期四早上十點半看台大測試牙醫乙", "m1"
     )
     msg_time, expected = _future_tuesday_before_thursday()
     with memory._conn() as c:
@@ -707,7 +707,7 @@ def test_drain_none_falls_back_to_calendar_regex_with_message_date(temp_db, monk
             "SELECT status FROM pending_reminder_extract WHERE message_id='m1'"
         ).fetchone()[0]
     assert row is not None
-    assert row[0] == "看台大陳敏惠牙醫師"
+    assert row[0] == "看台大測試牙醫乙"
     assert datetime.fromtimestamp(row[1]).strftime("%Y-%m-%d %H:%M") == (
         expected.strftime("%Y-%m-%d %H:%M")
     )
@@ -721,7 +721,7 @@ def test_drain_subjectless_medical_uses_sender_alias(temp_db, monkeypatch):
     import gemini_client
 
     memory.enqueue_pending_reminder(
-        "G1", "U_MOM", "星期四早上十點半看台大陳敏惠牙醫師", "m1"
+        "G1", "U_MOM", "星期四早上十點半看台大測試牙醫乙", "m1"
     )
     msg_time, _expected = _future_tuesday_before_thursday()
     with memory._conn() as c:
@@ -741,7 +741,7 @@ def test_drain_subjectless_medical_uses_sender_alias(temp_db, monkeypatch):
             "SELECT action FROM reminders WHERE group_id='G1' AND status='pending'"
         ).fetchone()
     assert row is not None
-    assert row[0] == "媽媽看台大陳敏惠牙醫師"
+    assert row[0] == "媽媽看台大測試牙醫乙"
 
 
 def test_drain_expired_drops(temp_db, monkeypatch):

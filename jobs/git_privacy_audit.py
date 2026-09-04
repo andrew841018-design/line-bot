@@ -30,6 +30,14 @@ _CREDENTIAL_PATTERNS = (
 )
 _PHONE_RE = re.compile(r"(?<!\d)09\d{2}[- ]?\d{3}[- ]?\d{3}(?!\d)")
 _EMAIL_RE = re.compile(r"(?<![A-Za-z0-9._%+-])([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})(?![A-Za-z0-9.-])")
+_NAMED_CLINICIAN_RE = re.compile(
+    r"(?:王|李|張|劉|陳|楊|黃|趙|吳|周|徐|孫|馬|朱|胡|郭|何|林|高|羅|鄭|"
+    r"梁|謝|宋|唐|許|韓|馮|鄧|曹|彭|曾|蕭|田|董|袁|潘|于|蔣|蔡|余|杜|"
+    r"葉|程|蘇|魏|呂|丁|任|沈|姚|盧|姜|崔|鍾|譚|陸|汪|范|金|石|廖|賈|"
+    r"夏|韋|傅|方|白|鄒|孟|熊|秦|邱|江|尹|薛|閻|段|雷|侯|龍|史|陶|黎|"
+    r"賀|顧|毛|郝|龔|邵|萬|錢|嚴|賴|武|戴|莫|孔|向|湯)"
+    r"[\u4e00-\u9fff]{0,2}(?:牙醫師|醫師)"
+)
 _PRIVATE_SCHEDULE_DATE_RE = re.compile(
     r"(?:20(?:2[0-9]|[3-8][0-9]|9[0-8]))[-/]\d{1,2}[-/]\d{1,2}"
     r"|(?<![\d/])(?:1[0-2]|0?[1-9])(?:/|月)(?:3[01]|[12]\d|0?[1-9])(?:日|號)?"
@@ -158,6 +166,8 @@ def scan_blob(
     ):
         categories.add("private_schedule")
     if any(term in text for term in _normalize_private_terms(private_terms)):
+        categories.add("private_name")
+    if _NAMED_CLINICIAN_RE.search(text):
         categories.add("private_name")
     return [Finding(category, path, revision) for category in sorted(categories)]
 

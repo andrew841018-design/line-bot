@@ -1394,7 +1394,7 @@ def test_non_restaurant_reservations_do_not_route_or_fetch(monkeypatch):
         "我要訂機票",
         "預定機票",
         "預訂住宿",
-        "預約王醫師",
+        "預約測試醫師乙",
         "預約市立醫院",
         "預訂民宿",
         "預訂飯店",
