@@ -262,7 +262,10 @@ def scan_remote_main(repo: Path | str) -> list[Finding]:
 
 def scan_index(repo: Path | str) -> list[Finding]:
     root = Path(repo).resolve()
-    raw = _run_git(root, ["ls-files", "-z", "--cached"])
+    raw = _run_git(
+        root,
+        ["diff", "--cached", "--name-only", "-z", "--diff-filter=ACMR"],
+    )
     paths = [item.decode("utf-8", errors="surrogateescape") for item in raw.split(b"\0") if item]
     return _scan_paths(root, paths, lambda path: _run_git(root, ["show", f":{path}"]), revision="index")
 

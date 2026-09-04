@@ -130,6 +130,18 @@ def test_index_and_worktree_detect_uncommitted_private_content(tmp_path: Path):
     assert any(item.category == "phone_number" for item in audit.scan_worktree(repo))
 
 
+def test_index_scope_does_not_rescan_unchanged_base_content(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "user_aliases.json").write_text("{}\n", encoding="utf-8")
+    _commit(repo, "legacy base")
+    (repo / "safe.txt").write_text("safe\n", encoding="utf-8")
+    _git(repo, "add", "safe.txt")
+
+    assert audit.scan_index(repo) == []
+
+
 def test_remote_scan_refreshes_and_checks_remote_main(tmp_path: Path):
     remote = tmp_path / "remote.git"
     source = tmp_path / "source"
