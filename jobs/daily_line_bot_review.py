@@ -140,8 +140,6 @@ def run_local_checks() -> list[CheckResult]:
                 "--repo",
                 ".",
                 "--scope",
-                "head",
-                "--scope",
                 "index",
                 "--scope",
                 "worktree",

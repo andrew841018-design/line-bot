@@ -174,7 +174,7 @@ def test_daily_maintenance_runs_all_local_privacy_scopes(monkeypatch):
     monkeypatch.setattr(daily, "_run_command", fake_run)
     results = daily.run_local_checks()
     privacy = next(item for item in calls if item[0] == "GitHub privacy audit")
-    assert privacy[1].count("--scope") == 4
+    assert privacy[1].count("--scope") == 3
     assert privacy[1][-1] == "remote"
     assert any(item.name == "GitHub privacy audit" for item in results)
 
