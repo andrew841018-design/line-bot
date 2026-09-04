@@ -15,7 +15,7 @@ import memory
 TW = ZoneInfo("Asia/Taipei")
 GROUP_ID = "G1"
 ORIGINAL_ID = "original-medical-message"
-ORIGINAL_TEXT = "8/18 早上看胸腔外科陳晉興，看M R I跟Pet掃描結果"
+ORIGINAL_TEXT = "8/18 早上看胸腔外科測試醫師甲，看M R I跟Pet掃描結果"
 
 
 def _event(
@@ -110,7 +110,7 @@ def test_quote_missed_repairs_original_without_llm_or_quota(monkeypatch):
     assert events[0]["event_date"] == "2026-08-18"
     assert events[0]["event_time"] == "09:00"
     assert events[0]["event_type"] == "medical"
-    assert events[0]["title"] == "媽媽看胸腔外科陳晉興，看MRI跟PET掃描結果"
+    assert events[0]["title"] == "媽媽看胸腔外科測試醫師甲，看MRI跟PET掃描結果"
     assert events[0]["location"] is None
     assert "媽媽" in events[0]["participants"]
 
@@ -131,7 +131,7 @@ def test_quote_missed_repairs_original_without_llm_or_quota(monkeypatch):
     assert replies == [
         "已補上提醒\n"
         "時間：2026-08-18 09:00（依「早上」預設）\n"
-        "事項：媽媽看胸腔外科陳晉興，看MRI跟PET掃描結果"
+        "事項：媽媽看胸腔外科測試醫師甲，看MRI跟PET掃描結果"
     ]
 
 
@@ -153,7 +153,7 @@ def test_original_medical_message_auto_captures_without_repair(monkeypatch):
         ORIGINAL_ID,
     )
     assert len(events) == 1
-    assert events[0]["title"] == "媽媽看胸腔外科陳晉興，看MRI跟PET掃描結果"
+    assert events[0]["title"] == "媽媽看胸腔外科測試醫師甲，看MRI跟PET掃描結果"
     assert events[0]["event_time"] == "09:00"
     pending = memory.get_pending_reminder_extract_by_message(
         GROUP_ID,
@@ -337,13 +337,13 @@ def test_quote_missed_reuses_unique_legacy_event_with_presentation_differences(
 ):
     _seed_original()
     _patch_sender_alias(monkeypatch)
-    legacy_title = "媽媽早上看胸腔外科陳晉興，看 MRI 跟 PET 掃描結果"
+    legacy_title = "媽媽早上看胸腔外科測試醫師甲，看 MRI 跟 PET 掃描結果"
     legacy_id = calendar_db.insert_event(
         group_id=GROUP_ID,
         title=legacy_title,
         event_date="2026-08-18",
         event_time="09:00",
-        location="胸腔外科 陳晉興",
+        location="胸腔外科 測試醫師甲",
         participants=["媽媽"],
         event_type="medical",
     )
@@ -556,7 +556,7 @@ def test_partial_multi_event_capture_blocks_all_fallbacks(monkeypatch):
 
 
 def test_quote_missed_partial_multi_event_is_not_reported_complete(monkeypatch):
-    text = "8/1 18:00 全家聚餐\n8/2 09:00 看胸腔外科"
+    text = "8/1 18:00 全家聚餐\n8/2 09:00 看胸腔外科"  # privacy-safe-fixture
     created_at = int(datetime(2026, 7, 29, 11, 27, tzinfo=TW).timestamp())
     with memory._conn() as conn:
         conn.execute(
@@ -617,7 +617,7 @@ def test_quote_missed_partial_multi_event_is_not_reported_complete(monkeypatch):
 
 
 def test_quote_missed_multiple_source_events_does_not_drop_pending(monkeypatch):
-    text = "8/1 18:00 全家聚餐\n8/2 09:00 看胸腔外科"
+    text = "8/1 18:00 全家聚餐\n8/2 09:00 看胸腔外科"  # privacy-safe-fixture
     created_at = int(datetime(2026, 7, 29, 11, 27, tzinfo=TW).timestamp())
     with memory._conn() as conn:
         conn.execute(
@@ -634,8 +634,8 @@ def test_quote_missed_multiple_source_events_does_not_drop_pending(monkeypatch):
     )
     assert pending_id is not None
     for title, event_date, event_time, event_type in (
-        ("全家聚餐", "2026-08-01", "18:00", "family_gathering"),
-        ("看胸腔外科", "2026-08-02", "09:00", "medical"),
+        ("全家聚餐", "2026-08-01", "18:00", "family_gathering"),  # privacy-safe-fixture
+        ("看胸腔外科", "2026-08-02", "09:00", "medical"),  # privacy-safe-fixture
     ):
         assert calendar_db.insert_event(
             group_id=GROUP_ID,
@@ -664,7 +664,7 @@ def test_quote_missed_multiple_source_events_does_not_drop_pending(monkeypatch):
 
 
 def test_drain_recovers_multiple_source_events_only_after_all_mirrors_exist():
-    text = "8/1 18:00 全家聚餐\n8/2 09:00 看胸腔外科"
+    text = "8/1 18:00 全家聚餐\n8/2 09:00 看胸腔外科"  # privacy-safe-fixture
     created_at = int(datetime(2026, 7, 29, 11, 27, tzinfo=TW).timestamp())
     with memory._conn() as conn:
         conn.execute(
@@ -690,8 +690,8 @@ def test_drain_recovers_multiple_source_events_only_after_all_mirrors_exist():
             source_msg_id=ORIGINAL_ID,
         )
         for title, event_date, event_time, event_type in (
-            ("全家聚餐", "2026-08-01", "18:00", "family_gathering"),
-            ("看胸腔外科", "2026-08-02", "09:00", "medical"),
+            ("全家聚餐", "2026-08-01", "18:00", "family_gathering"),  # privacy-safe-fixture
+            ("看胸腔外科", "2026-08-02", "09:00", "medical"),  # privacy-safe-fixture
         )
     ]
     assert all(event_ids)
@@ -795,7 +795,7 @@ def test_drain_recovers_source_bound_event_without_llm_and_retries_mirror(
     _patch_sender_alias(monkeypatch)
     event_id = calendar_db.insert_event(
         group_id=GROUP_ID,
-        title="媽媽看胸腔外科陳晉興，看MRI跟PET掃描結果",
+        title="媽媽看胸腔外科測試醫師甲，看MRI跟PET掃描結果",
         event_date="2026-08-18",
         event_time="09:00",
         participants=["媽媽"],

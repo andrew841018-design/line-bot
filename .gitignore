@@ -38,11 +38,19 @@ line_token_cache.json
 pending_line_push.txt
 pending_explicit_reply.json.bak*
 
+# Private identity/runtime inputs — local use only, never publish.
+user_aliases.json
+family_roles.local.json
+privacy_terms.local.txt
+privacy_terms.local.json
+feedback_state.json
+pending_feedback.json
+jobs/push_pending_drafts.py
+
 # Runtime dirs for jobs dispatcher
 locks/
 state/
-logs/jobs/
-logs/auto_iterate_*.md
+logs/
 *.bak.20*_*
 
 # Runtime state (per-bot persistence, never sync)

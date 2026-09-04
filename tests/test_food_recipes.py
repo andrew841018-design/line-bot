@@ -49,7 +49,7 @@ def test_disclaimer_present():
 def test_no_personal_naming():
     # GP2 A：輸出不得點名任何家庭成員
     out = fr.format_suggestions(["蛋", "虱目魚肚", "高麗菜"])
-    for name in ("媽媽", "爸爸", "黃聖雅", "黃聖穎"):
+    for name in ("媽媽", "爸爸", "妹妹", "弟弟"):
         assert name not in out
 
 

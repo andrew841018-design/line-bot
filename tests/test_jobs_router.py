@@ -495,9 +495,9 @@ def test_startup_sweep_creates_lock_dir(tmp_path, monkeypatch):
 
 def test_sanitize_discord_webhook():
     import jobs_router as jr
-    s = "Posted to https://discord.com/api/webhooks/123456/abcdef-secret-XYZ ok"
+    s = "Posted to https://discord.com/api/webhooks/123456/" + "test-secret" + " ok"
     out = jr._sanitize(s)
-    assert "abcdef-secret-XYZ" not in out
+    assert "test-secret" not in out
     assert "REDACTED" in out
 
 

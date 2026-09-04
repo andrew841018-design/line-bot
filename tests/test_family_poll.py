@@ -3,8 +3,8 @@ import importlib
 import pytest
 
 G = "C_family_poll_test"
-FATHER = "U38f817726f256ec1fdfa51cf57f4a645"
-MOTHER = "U9fde03d0fe1e0669eccc8b9b4ecc28a6"
+FATHER = "U" + "1" * 32
+MOTHER = "U" + "2" * 32
 
 
 @pytest.fixture()
@@ -16,6 +16,12 @@ def family_poll_db(tmp_path, monkeypatch):
     import family_poll
 
     monkeypatch.setattr(family_poll, "_DB_PATH", db_path)
+    aliases_path = tmp_path / "user_aliases.json"
+    aliases_path.write_text(
+        '{"' + FATHER + '": "爸爸", "' + MOTHER + '": "媽媽"}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(family_poll, "_ALIASES_PATH", aliases_path)
     family_poll.init_db()
     family_poll.clear_group(G)
     yield family_poll
@@ -112,7 +118,7 @@ def test_sender_short_reply_updates_active_poll(family_poll_db):
 
 
 def test_unknown_sender_uses_display_name_not_user_code(family_poll_db):
-    unknown_user = "U0000000000000000000000000000462b"
+    unknown_user = "U" + "3" * 32
     family_poll_db.create_poll(G, "今晚吃凱薩誰可以", user_id=FATHER)
 
     out = family_poll_db.handle_natural_message(

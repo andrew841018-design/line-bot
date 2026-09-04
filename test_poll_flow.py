@@ -9,7 +9,7 @@ import main
 from linebot.v3.webhooks import GroupSource, MessageEvent, TextMessageContent
 
 G = "C_poll_flow_test"
-FATHER = "U38f817726f256ec1fdfa51cf57f4a645"
+FATHER = "U" + "1" * 32
 
 
 @pytest.fixture()
@@ -21,6 +21,9 @@ def poll_db(tmp_path, monkeypatch):
     import family_poll
 
     monkeypatch.setattr(family_poll, "_DB_PATH", db_path)
+    aliases_path = tmp_path / "user_aliases.json"
+    aliases_path.write_text('{"' + FATHER + '": "爸爸"}\n', encoding="utf-8")
+    monkeypatch.setattr(family_poll, "_ALIASES_PATH", aliases_path)
     family_poll.init_db()
     family_poll.clear_group(G)
     yield family_poll

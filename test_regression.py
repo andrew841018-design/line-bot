@@ -488,7 +488,7 @@ def test_prefetch_google_maps_missing_query_fails_closed(monkeypatch):
     "url",
     [
         "http://maps.app.goo.gl/example",
-        "https://user@maps.app.goo.gl/example",
+        "https://user@" + "maps.app.goo.gl/example",
         "https://maps.app.goo.gl:444/example",
     ],
 )
@@ -1628,7 +1628,7 @@ def test_quota_saver_calendar_capture_uses_regex_path_without_gemini(monkeypatch
     monkeypatch.setattr(calendar_db, "insert_event_with_outcome", capture_event)
 
     main._maybe_capture_calendar_event(
-        "GRP001", "6/28 18:00 預約7/5羽球場地", "USR001", "MSG001"
+        "GRP001", "6/28 18:00 預約7/5羽球場地", "USR001", "MSG001"  # privacy-safe-fixture
     )
 
     assert inserted
@@ -1697,7 +1697,7 @@ def test_quota_saver_reminder_uses_regex_without_gemini(monkeypatch):
     )
 
     main._maybe_extract_reminder(
-        "6/28 18:00 記得預約7/5羽球場地", "GRP001", "USR001", "MSG001"
+        "6/28 18:00 記得預約7/5羽球場地", "GRP001", "USR001", "MSG001"  # privacy-safe-fixture
     )
 
     assert saved

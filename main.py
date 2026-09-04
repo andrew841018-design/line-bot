@@ -87,6 +87,7 @@ from correction_memory import ORGANIC_CORRECTION_PREFIXES, is_question_like
 import feedback_collector
 import food_safety_client
 import gemini_client
+import line_mentions
 import memory
 import mibao_identity
 import output_validator
@@ -2707,13 +2708,12 @@ _MEDICAL_ACTOR_ACTION_RE = re.compile(
 )
 _FAMILY_ACTOR_TERMS = (
     "媽媽", "爸爸", "姊姊", "姐姐", "妹妹", "弟弟", "哥哥",
-    "爺爺", "奶奶", "聖雅", "聖穎", "黃聖雅", "黃聖穎", "黃將修", "全家",
+    "爺爺", "奶奶", "哥哥", "全家",
+    *line_mentions.configured_family_aliases(include_short=True),
 )
 _FAMILY_ACTOR_NORMALIZE = {
     "姐姐": "姊姊",
-    "妹妹": "黃聖雅",
-    "聖雅": "黃聖雅",
-    "聖穎": "黃聖穎",
+    **line_mentions.configured_family_alias_mapping(include_short=True),
 }
 
 
@@ -3639,7 +3639,7 @@ _CALENDAR_CORRECTION_SYNONYMS: dict[str, tuple[str, ...]] = {
 }
 _CALENDAR_CORRECTION_ACTORS: tuple[str, ...] = (
     "全家", "媽媽", "爸爸", "姊姊", "姐姐", "妹妹", "弟弟", "哥哥",
-    "爺爺", "奶奶", "黃聖雅", "黃聖穎", "聖雅", "聖穎",
+    "爺爺", "奶奶", *line_mentions.configured_family_aliases(include_short=True),
 )
 
 
@@ -5864,7 +5864,7 @@ _QUERY_NOUN_KEYWORDS: tuple[str, ...] = (
     # 醫療
     "胃鏡", "大腸鏡", "健檢", "體檢", "醫生", "牙醫", "看病",
     # 家人
-    "媽媽", "爸爸", "姊姊", "妹妹", "弟弟", "爺爺", "奶奶", "全家", "黃將修",
+    "媽媽", "爸爸", "姊姊", "妹妹", "弟弟", "爺爺", "奶奶", "全家", "哥哥",
     # 物件
     "蛋糕", "禮物",
     # 場所
@@ -6064,7 +6064,7 @@ def _is_calendar_query(text: str) -> bool:
     ):
         return True
     if query_marker and any(kw in text for kw in _QUERY_NOUN_KEYWORDS):
-        person_terms = ("媽媽", "爸爸", "姊姊", "妹妹", "弟弟", "爺爺", "奶奶", "黃將修")
+        person_terms = ("媽媽", "爸爸", "姊姊", "妹妹", "弟弟", "爺爺", "奶奶", "哥哥")
         trip_terms = ("紐西蘭", "奧克蘭")
         trip_intent = re.search(
             rf"去|前往|出發|返台|返家{_HOME_WORD_SUFFIX_GUARD}|回國|回來|"
@@ -6396,9 +6396,9 @@ def _return_home_query_actor(text: str, home_city: str = "台北") -> str | None
             if end <= pronoun.start()
         }
         compatible_actors = (
-            {"媽媽", "姊姊", "黃聖雅", "奶奶"}
+            {"媽媽", "姊姊", "妹妹", "奶奶"}
             if pronoun.group(0) == "她"
-            else {"爸爸", "弟弟", "哥哥", "爺爺", "黃聖穎", "黃將修"}
+            else {"爸爸", "弟弟", "哥哥", "爺爺", "弟弟", "哥哥"}
         )
         compatible_mentions = named_before_pronoun & compatible_actors
         if len(compatible_mentions) == 1:
@@ -8622,7 +8622,10 @@ _REMINDER_TIMING_MARKER_RE = re.compile(r"(?:什麼時候|何時|哪一天|哪�
 _REMINDER_TIMING_KEYWORD_ALIASES: dict[str, tuple[str, ...]] = {
     "壁球": ("壁球", "squash"),
 }
-_REMINDER_KNOWN_MENTION_ALIASES = {"爸爸", "媽媽", "黃聖雅", "黃聖穎"}
+_REMINDER_KNOWN_MENTION_ALIASES = {
+    "爸爸", "媽媽", "姊姊", "妹妹", "弟弟",
+    *line_mentions.configured_family_aliases(include_short=True),
+}
 _REMINDER_DETAIL_PREFIXES = ("地點", "預約編號", "接送網址", "票券驗證碼", "驗證碼")
 
 _CONVERSATION_SEARCH_RE = re.compile(
@@ -9143,7 +9146,7 @@ def _build_conversation_search_reply(group_id: str, clean_text: str) -> str:
             "可以查對話紀錄。\n"
             "請在後面加關鍵字，例如：\n"
             "搜尋對話紀錄 紐西蘭\n"
-            "搜尋對話紀錄 黃將修"
+            "搜尋對話紀錄 哥哥"
         )
     try:
         hits = memory.search_raw_messages(group_id, query, limit=5, exclude_bot=True)

@@ -127,7 +127,7 @@ def test_main_returns_1_when_discord_fails(tmp_path, monkeypatch):
 
 def test_report_output_redacts_raw_chat_and_line_user_ids(tmp_path, monkeypatch, capsys):
     state_path = _patch_state(monkeypatch, tmp_path)
-    raw_user = "U9fde03d0fe1e0669eccc8b9b4ecc28a6"
+    raw_user = "U" + "a" * 32
     raw_chat = "爸爸的完整私密聊天內容不要出現在 Discord 裡面"
     monkeypatch.setattr(
         dlbr,
@@ -185,16 +185,16 @@ def test_build_feature_suggestion_forces_local_only(monkeypatch):
 
 def test_sanitize_redacts_common_secret_shapes():
     text = (
-        "key=abc Bearer token-value X-Goog-Api-Key: AIza12345678901234567890 "
+        "key=abc Bearer token-value X-Goog-Api-Key: " + "AIza" + "1" * 20 + " "
         "Authorization: Bot xyz https://discord.com/api/webhooks/123/secret "
-        "postgres://user:pass@example/db sk-1234567890abcdefghijklmnop"
+        "postgres://user:pass@example/db " + "sk-" + "1" * 24
     )
 
     out = dlbr._sanitize(text)
 
     assert "abc" not in out
     assert "token-value" not in out
-    assert "AIza12345678901234567890" not in out
+    assert "AIza" + "1" * 20 not in out
     assert "Bot xyz" not in out
     assert "/secret" not in out
     assert ":pass@" not in out

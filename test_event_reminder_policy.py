@@ -22,9 +22,9 @@ def test_line_id_redaction_handles_all_prefixes_and_case():
 
     text = (
         "bad "
-        "UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA "
-        "Cbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb "
-        "R1234567890abcdef1234567890ABCDEF"
+        + "U" + "A" * 32 + " "
+        + "C" + "b" * 32 + " "
+        + "R" + "1234567890abcdef" * 2
     )
 
     redacted = event_reminder._redact_line_ids(text)
@@ -32,9 +32,9 @@ def test_line_id_redaction_handles_all_prefixes_and_case():
     assert "U***" in redacted
     assert "C***" in redacted
     assert "R***" in redacted
-    assert "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" not in redacted
-    assert "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" not in redacted
-    assert "1234567890abcdef1234567890ABCDEF" not in redacted
+    assert "A" * 32 not in redacted
+    assert "b" * 32 not in redacted
+    assert "1234567890abcdef" * 2 not in redacted
 
 
 def test_post_result_sends_retry_key_and_accepts_409(monkeypatch):

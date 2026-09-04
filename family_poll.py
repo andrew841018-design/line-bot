@@ -44,11 +44,11 @@ _DEFAULT_FAMILY_ALIASES = {
     "媽媽": "媽媽",
     "媽咪": "媽媽",
     "老媽": "媽媽",
-    "黃聖雅": "黃聖雅",
-    "聖雅": "黃聖雅",
-    "妹妹": "黃聖雅",
-    "黃聖穎": "黃聖穎",
-    "聖穎": "黃聖穎",
+    "姊姊": "姊姊",
+    "姐姐": "姊姊",
+    "妹妹": "妹妹",
+    "哥哥": "哥哥",
+    "弟弟": "弟弟",
 }
 
 _POLL_REQUEST_RE = re.compile(
@@ -63,7 +63,7 @@ _POLL_REQUEST_RE = re.compile(
 )
 _POLL_INTENT_WORD_RE = re.compile(r"民調|投票|統計一下|調查一下")
 _QUESTION_PREFIX_RE = re.compile(
-    r"^(?:(?:爸爸|媽媽|黃聖雅|黃聖穎|聖雅|聖穎|妹妹)\s*)?"
+    r"^(?:(?:爸爸|媽媽|姊姊|姐姐|妹妹|哥哥|弟弟)\s*)?"
     r"(?:想知道|想問|問一下|統計一下|調查一下|確認一下)"
     r"[，,：:\s]*"
 )
@@ -76,7 +76,7 @@ _MAYBE_RE = re.compile(
 _YES_RE = re.compile(
     r"(?<!不)(?:可以|方便|ok|OK|Ok|\+1|加一|"
     r"會去|要去|我去|我也去|我吃|我也吃|我要|我也要|"
-    r"爸爸要|媽媽要|聖雅要|聖穎要|爸爸去|媽媽去|聖雅去|聖穎去|"
+    r"爸爸要|媽媽要|姊姊要|妹妹要|弟弟要|爸爸去|媽媽去|姊姊去|妹妹去|弟弟去|"
     r"好啊|好喔|好啦|^好$|^可$)"
 )
 _VOTE_SEGMENT_SPLIT_RE = re.compile(r"[，,、。；;\n]+")
@@ -195,7 +195,12 @@ def _known_family_names() -> list[str]:
 def _alias_patterns() -> list[tuple[str, str]]:
     mapping = dict(_DEFAULT_FAMILY_ALIASES)
     for alias in _load_aliases().values():
-        mapping.setdefault(alias, alias)
+        clean = alias.strip()
+        if not clean:
+            continue
+        mapping.setdefault(clean, clean)
+        if len(clean) == 3 and all("\u4e00" <= ch <= "\u9fff" for ch in clean):
+            mapping.setdefault(clean[1:], clean)
     return sorted(mapping.items(), key=lambda item: len(item[0]), reverse=True)
 
 

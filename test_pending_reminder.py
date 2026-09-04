@@ -478,7 +478,7 @@ def test_maybe_extract_medical_prep_inherits_patient_and_companion(temp_db, monk
 
     text = (
         f"{future.month}月{future.day}日星期二下午兩點前要到台大醫院東址地下1樓"
-        "做正子斷層掃描。聖雅要陪我去，大約需要兩個多小時。"
+        "做正子斷層掃描。妹妹要陪我去，大約需要兩個多小時。"
         "當天早上8:00開始禁食 6小時。只能喝水。"
     )
     main._maybe_extract_reminder(text, "G1", "U_MOM", "m1")
@@ -489,8 +489,8 @@ def test_maybe_extract_medical_prep_inherits_patient_and_companion(temp_db, monk
             "WHERE group_id='G1' AND status='pending'"
         ).fetchone()
     assert row is not None
-    assert row[0] == f"媽媽{action}（黃聖雅陪同）"
-    assert row[1] == '["媽媽", "黃聖雅"]'
+    assert row[0] == f"媽媽{action}（妹妹陪同）"
+    assert row[1] == '["媽媽", "妹妹"]'
 
 
 def _future_tuesday_before_thursday() -> tuple[datetime, datetime]:
@@ -921,13 +921,13 @@ def test_add_reminder_persists_structured_mention_aliases(temp_db):
         "U_MOM",
         "正子斷層掃描當天 08:00 開始禁食",
         int(future.timestamp()),
-        mention_aliases=["媽媽", "黃聖雅"],
+        mention_aliases=["媽媽", "妹妹"],
     )
 
     rows = memory.list_pending_reminders_full("G1")
 
     assert len(rows) == 1
-    assert rows[0]["mention_aliases"] == ["媽媽", "黃聖雅"]
+    assert rows[0]["mention_aliases"] == ["媽媽", "妹妹"]
 
 
 def test_add_reminder_with_outcome_distinguishes_create_duplicate_and_merge(temp_db):

@@ -198,7 +198,7 @@ def extract_from_text(text: str) -> list[dict]:
         "回 JSON list（無就回 []）:\n"
         '[{"person": "媽媽", "anniversary_type": "birthday", "month": 6, "day": 4}, ...]\n\n'
         "anniversary_type 限 'birthday' / 'wedding' / 'memorial' / 'other'\n"
-        "person 用稱謂或人名（媽媽 / 黃將修 / 妹妹）\n\n"
+        "person 用稱謂或人名（媽媽 / 哥哥 / 妹妹）\n\n"
         f"【訊息】\n{text[:1500]}\n"
     )
     try:

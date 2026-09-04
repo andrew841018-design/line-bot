@@ -101,15 +101,15 @@ def _freeze_date_cancel_clock(monkeypatch) -> None:
     monkeypatch.setattr(
         reminder_cancel,
         "_coerce_now",
-        lambda _now: datetime(2030, 8, 1, 12, 0, tzinfo=TW),
+        lambda _now: datetime(2099, 8, 1, 12, 0, tzinfo=TW),
     )
 
 
 def test_line_inbound_no_activity_date_cancels_unique_pending(monkeypatch):
     _freeze_date_cancel_clock(monkeypatch)
-    target_id = _seed("G1", "桃園高鐵上皮拉提斯", "2030-08-08 09:00")
-    adjacent_id = _seed("G1", "隔天事項", "2030-08-09 00:00")
-    other_group_id = _seed("G2", "別群事項", "2030-08-08 10:00")
+    target_id = _seed("G1", "桃園高鐵上皮拉提斯", "2099-08-08 09:00")
+    adjacent_id = _seed("G1", "隔天事項", "2099-08-09 00:00")
+    other_group_id = _seed("G2", "別群事項", "2099-08-08 10:00")
     replies: list[tuple[str, dict]] = []
 
     def must_not_run(*_args, **_kwargs):
@@ -144,7 +144,7 @@ def test_line_inbound_no_activity_date_cancels_unique_pending(monkeypatch):
     assert _status(other_group_id) == "pending"
     assert len(replies) == 1
     assert "已取消提醒" in replies[0][0]
-    assert "2030-08-08 09:00" in replies[0][0]
+    assert "2099-08-08 09:00" in replies[0][0]
     assert "桃園高鐵上皮拉提斯" in replies[0][0]
     assert replies[0][1]["include_auxiliary"] is False
     assert memory.get_raw_message("G1", "incoming-cancel") is not None
@@ -153,8 +153,8 @@ def test_line_inbound_no_activity_date_cancels_unique_pending(monkeypatch):
 
 def test_no_activity_date_with_multiple_pending_fails_closed(monkeypatch):
     _freeze_date_cancel_clock(monkeypatch)
-    first_id = _seed("G1", "第一件事", "2030-08-08 09:00")
-    second_id = _seed("G1", "第二件事", "2030-08-08 19:00")
+    first_id = _seed("G1", "第一件事", "2099-08-08 09:00")
+    second_id = _seed("G1", "第二件事", "2099-08-08 19:00")
     replies: list[str] = []
     monkeypatch.setattr(main.burst_filter, "cancel_burst", lambda _gid: None)
     monkeypatch.setattr(
@@ -177,7 +177,7 @@ def test_no_activity_date_checks_all_pending_before_source_identity(monkeypatch)
     event_id = calendar_db.insert_event(
         group_id="G1",
         title="來源型活動",
-        event_date="2030-08-08",
+        event_date="2099-08-08",
         event_time="09:00",
     )
     source_row = next(
@@ -185,7 +185,7 @@ def test_no_activity_date_checks_all_pending_before_source_identity(monkeypatch)
         for row in memory.list_reminder_cancellation_candidates("G1")
         if row.get("source_ref") == event_id
     )
-    generic_id = _seed("G1", "一般提醒", "2030-08-08 19:00")
+    generic_id = _seed("G1", "一般提醒", "2099-08-08 19:00")
     replies: list[str] = []
     monkeypatch.setattr(main.burst_filter, "cancel_burst", lambda _gid: None)
     monkeypatch.setattr(
@@ -205,12 +205,12 @@ def test_no_activity_date_rechecks_uniqueness_inside_cancel_transaction(
     monkeypatch,
 ):
     _freeze_date_cancel_clock(monkeypatch)
-    first_id = _seed("G1", "原本唯一事項", "2030-08-08 09:00")
+    first_id = _seed("G1", "原本唯一事項", "2099-08-08 09:00")
     real_cancel = memory.cancel_unique_reminder_for_local_date
     inserted: list[int] = []
 
     def insert_competitor_then_cancel(group_id, target_date, start_at, end_at):
-        inserted.append(_seed("G1", "競態新增事項", "2030-08-08 19:00"))
+        inserted.append(_seed("G1", "競態新增事項", "2099-08-08 19:00"))
         return real_cancel(group_id, target_date, start_at, end_at)
 
     replies: list[str] = []
@@ -240,7 +240,7 @@ def test_no_activity_date_uses_calendar_event_date_not_lead_time(monkeypatch):
     event_id = calendar_db.insert_event(
         group_id="G1",
         title="全家打羽球",
-        event_date="2030-08-08",
+        event_date="2099-08-08",
         event_time="19:00",
     )
     source_row = next(
@@ -249,7 +249,7 @@ def test_no_activity_date_uses_calendar_event_date_not_lead_time(monkeypatch):
         if row.get("source_ref") == event_id
     )
     assert datetime.fromtimestamp(int(source_row["remind_at"]), tz=TW).date() == date(
-        2030, 8, 1
+        2099, 8, 1
     )
     replies: list[str] = []
     monkeypatch.setattr(main.burst_filter, "cancel_burst", lambda _gid: None)
@@ -274,7 +274,7 @@ def test_no_activity_date_does_not_cancel_later_calendar_event_lead_time(
     event_id = calendar_db.insert_event(
         group_id="G1",
         title="全家打羽球",
-        event_date="2030-08-15",
+        event_date="2099-08-15",
         event_time="19:00",
     )
     source_row = next(
@@ -283,7 +283,7 @@ def test_no_activity_date_does_not_cancel_later_calendar_event_lead_time(
         if row.get("source_ref") == event_id
     )
     assert datetime.fromtimestamp(int(source_row["remind_at"]), tz=TW).date() == date(
-        2030, 8, 8
+        2099, 8, 8
     )
     replies: list[str] = []
     monkeypatch.setattr(main.burst_filter, "cancel_burst", lambda _gid: None)
@@ -308,7 +308,7 @@ def test_no_activity_date_persists_tombstone_for_mirrorless_calendar_event(
     event_id = calendar_db.insert_event(
         group_id="G1",
         title="鏡像缺漏活動",
-        event_date="2030-08-08",
+        event_date="2099-08-08",
         event_time="19:00",
     )
     with memory._conn() as conn:
@@ -351,7 +351,7 @@ def test_no_activity_date_cancels_duplicate_rows_for_one_calendar_source(
     event_id = calendar_db.insert_event(
         group_id="G1",
         title="重複鏡像活動",
-        event_date="2030-08-08",
+        event_date="2099-08-08",
         event_time="19:00",
     )
     with memory._conn() as conn:
@@ -397,7 +397,7 @@ def test_no_activity_date_treats_cancelled_calendar_history_as_one_source(
     event_id = calendar_db.insert_event(
         group_id="G1",
         title="已取消鏡像活動",
-        event_date="2030-08-08",
+        event_date="2099-08-08",
         event_time="19:00",
     )
     with memory._conn() as conn:
@@ -432,10 +432,10 @@ def test_no_activity_date_treats_cancelled_calendar_history_as_one_source(
 
 def test_quote_cancel_routes_before_creation_and_cancels_exact_reminder(monkeypatch):
     action = "查看租金是否入帳，若未入帳就催繳"
-    reminder_id = _seed("G1", action, "2030-07-25 04:00")
+    reminder_id = _seed("G1", action, "2099-07-25 04:00")
     _archive_bot_message(
         "sent-reminder",
-        f"@媽媽\n⏰ 提醒（明天）\n2030-07-25 04:00 {action}",
+        f"@媽媽\n⏰ 提醒（明天）\n2099-07-25 04:00 {action}",
     )
     replies: list[tuple[str, dict]] = []
 
@@ -461,7 +461,7 @@ def test_quote_cancel_routes_before_creation_and_cancels_exact_reminder(monkeypa
     assert _status(reminder_id) == "cancelled"
     assert len(replies) == 1
     assert "已取消提醒" in replies[0][0]
-    assert "2030-07-25 04:00" in replies[0][0]
+    assert "2099-07-25 04:00" in replies[0][0]
     assert action in replies[0][0]
     assert replies[0][1]["include_auxiliary"] is False
 
@@ -475,21 +475,21 @@ def test_pasted_event_location_terminal_command_cancels_only_exact_source(
     target_ref = calendar_db.insert_event(
         group_id="G1",
         title=title,
-        event_date="2030-07-25",
+        event_date="2099-07-25",
         event_time="01:10",
         location="紐西蘭一望無際的公路旅行中",
     )
     distractor_ref = calendar_db.insert_event(
         group_id="G1",
         title="其他活動",
-        event_date="2030-07-25",
+        event_date="2099-07-25",
         event_time="01:10",
         location="紐西蘭一望無際的公路旅行中",
     )
     other_group_ref = calendar_db.insert_event(
         group_id="G2",
         title=title,
-        event_date="2030-07-25",
+        event_date="2099-07-25",
         event_time="01:10",
         location="紐西蘭一望無際的公路旅行中",
     )
@@ -518,7 +518,7 @@ def test_pasted_event_location_terminal_command_cancels_only_exact_source(
     main._handle_text_message(
         _event(
             "**後天活動提醒**\n"
-            "📅 2030-07-25 01:10\n"
+            "📅 2099-07-25 01:10\n"
             f"🎯 {title}\n"
             "📍 紐西蘭一望無際的公路旅行中。這個取消"
         ),
@@ -547,7 +547,7 @@ def test_pasted_calendar_location_mismatch_fails_closed(monkeypatch):
     event_id = calendar_db.insert_event(
         group_id="G1",
         title=title,
-        event_date="2030-07-25",
+        event_date="2099-07-25",
         event_time="01:10",
         location="真正地點",
     )
@@ -567,7 +567,7 @@ def test_pasted_calendar_location_mismatch_fails_closed(monkeypatch):
     main._handle_text_message(
         _event(
             "**後天活動提醒**\n"
-            "📅 2030-07-25 01:10\n"
+            "📅 2099-07-25 01:10\n"
             f"🎯 {title}\n"
             "📍 完全不同地點。這個取消"
         ),
@@ -590,7 +590,7 @@ def test_bound_quote_with_conflicting_current_location_is_ambiguous(
     event_id = calendar_db.insert_event(
         group_id="G1",
         title=title,
-        event_date="2030-07-25",
+        event_date="2099-07-25",
         event_time="01:10",
         location="地點A",
     )
@@ -602,7 +602,7 @@ def test_bound_quote_with_conflicting_current_location_is_ambiguous(
     _archive_bot_message(
         "bound-location-a",
         "🔔 **後天活動提醒**\n"
-        "📅 2030-07-25 01:10\n"
+        "📅 2099-07-25 01:10\n"
         f"🎯 {title}"
         + (f"\n📍 {quoted_location}" if quoted_location else ""),
         source_kind=calendar_db.EVENT_REMINDER_SOURCE_KIND,
@@ -619,7 +619,7 @@ def test_bound_quote_with_conflicting_current_location_is_ambiguous(
     main._handle_text_message(
         _event(
             "取消提醒\n"
-            "📅 2030-07-25 01:10\n"
+            "📅 2099-07-25 01:10\n"
             f"🎯 {title}\n"
             "📍 地點B",
             quoted_message_id="bound-location-a",
@@ -641,7 +641,7 @@ def test_bound_natural_quote_validates_explicit_current_calendar_location(
     event_id = calendar_db.insert_event(
         group_id="G1",
         title=title,
-        event_date="2030-07-25",
+        event_date="2099-07-25",
         event_time="01:10",
         location="地點A",
     )
@@ -652,7 +652,7 @@ def test_bound_natural_quote_validates_explicit_current_calendar_location(
     )
     _archive_bot_message(
         "bound-natural-location-a",
-        f"⏰ 提醒（明天）\n2030-07-25 01:10 {title}",
+        f"⏰ 提醒（明天）\n2099-07-25 01:10 {title}",
         source_kind=calendar_db.EVENT_REMINDER_SOURCE_KIND,
         source_ref=event_id,
     )
@@ -667,7 +667,7 @@ def test_bound_natural_quote_validates_explicit_current_calendar_location(
     main._handle_text_message(
         _event(
             "**後天活動提醒**\n"
-            "📅 2030-07-25 01:10\n"
+            "📅 2099-07-25 01:10\n"
             f"🎯 {title}\n"
             "📍 地點B。這個取消",
             quoted_message_id="bound-natural-location-a",
@@ -696,7 +696,7 @@ def test_pasted_calendar_never_falls_back_to_generic_when_source_unavailable(
         event_id = calendar_db.insert_event(
             group_id="G1",
             title=title,
-            event_date="2030-07-25",
+            event_date="2099-07-25",
             event_time="01:10",
             location="來源地點",
         )
@@ -723,7 +723,7 @@ def test_pasted_calendar_never_falls_back_to_generic_when_source_unavailable(
                 fail_mirror,
             )
 
-    generic_id = _seed("G1", title, "2030-07-25 01:10")
+    generic_id = _seed("G1", title, "2099-07-25 01:10")
     replies: list[tuple[str, dict]] = []
 
     def must_not_run(*_args, **_kwargs):
@@ -743,7 +743,7 @@ def test_pasted_calendar_never_falls_back_to_generic_when_source_unavailable(
     main._handle_text_message(
         _event(
             "**後天活動提醒**\n"
-            "📅 2030-07-25 01:10\n"
+            "📅 2099-07-25 01:10\n"
             f"🎯 {title}\n"
             "📍 來源地點。這個取消"
         ),
@@ -768,14 +768,14 @@ def test_old_mapped_natural_quote_never_cancels_recreated_identical_reminder(
     monkeypatch,
 ):
     action = "繳交管理費"
-    old_id = _seed("G1", action, "2030-07-25 04:00")
+    old_id = _seed("G1", action, "2099-07-25 04:00")
     _archive_bot_message(
         "old-natural-reminder",
-        f"⏰ 提醒（明天）\n2030-07-25 04:00 {action}",
+        f"⏰ 提醒（明天）\n2099-07-25 04:00 {action}",
         reminder_id=old_id,
     )
     assert memory.mark_reminder_pushed(old_id, "now")
-    new_id = _seed("G1", action, "2030-07-25 04:00")
+    new_id = _seed("G1", action, "2099-07-25 04:00")
     replies: list[str] = []
     monkeypatch.setattr(
         main,
@@ -796,7 +796,7 @@ def test_old_mapped_natural_quote_never_cancels_recreated_identical_reminder(
 
 def test_cancellation_reports_truthfully_when_delivery_claim_won(monkeypatch):
     action = "繳交管理費"
-    when = "2030-07-25 04:00"
+    when = "2099-07-25 04:00"
     reminder_id = _seed("G1", action, when)
     claim = memory.claim_natural_reminder_delivery(
         "G1",
@@ -833,13 +833,13 @@ def test_cancellation_reports_truthfully_when_delivery_claim_won(monkeypatch):
 
 def test_old_unbound_natural_quote_treats_done_row_as_ambiguity(monkeypatch):
     action = "繳交停車費"
-    old_id = _seed("G1", action, "2030-07-25 04:00")
+    old_id = _seed("G1", action, "2099-07-25 04:00")
     _archive_bot_message(
         "old-unbound-natural-reminder",
-        f"⏰ 提醒（明天）\n2030-07-25 04:00 {action}",
+        f"⏰ 提醒（明天）\n2099-07-25 04:00 {action}",
     )
     assert memory.mark_reminder_pushed(old_id, "now")
-    new_id = _seed("G1", action, "2030-07-25 04:00")
+    new_id = _seed("G1", action, "2099-07-25 04:00")
     replies: list[str] = []
     monkeypatch.setattr(
         main,
@@ -869,7 +869,7 @@ def test_old_mapped_event_quote_cannot_cancel_recreated_identical_event(
     old_event_id = calendar_db.insert_event(
         group_id="G1",
         title="家庭聚餐",
-        event_date="2030-07-25",
+        event_date="2099-07-25",
         event_time="18:00",
     )
     old_source = next(
@@ -880,7 +880,7 @@ def test_old_mapped_event_quote_cannot_cancel_recreated_identical_event(
     _archive_bot_message(
         "old-event-reminder",
         "🔔 **明天活動提醒**\n"
-        "📅 2030-07-25 18:00\n"
+        "📅 2099-07-25 18:00\n"
         "🎯 家庭聚餐",
         source_kind=calendar_db.EVENT_REMINDER_SOURCE_KIND,
         source_ref=old_event_id,
@@ -891,7 +891,7 @@ def test_old_mapped_event_quote_cannot_cancel_recreated_identical_event(
     new_event_id = calendar_db.insert_event(
         group_id="G1",
         title="家庭聚餐",
-        event_date="2030-07-25",
+        event_date="2099-07-25",
         event_time="18:00",
     )
     new_source = next(
@@ -925,7 +925,7 @@ def test_bound_one_off_event_quote_does_not_require_standard_visible_format(
     event_id = calendar_db.insert_event(
         group_id="G1",
         title="確認接送時間",
-        event_date="2030-08-03",
+        event_date="2099-08-03",
         event_time="12:00",
     )
     source_row = next(
@@ -1012,7 +1012,7 @@ def test_bound_nonstandard_quote_and_explicit_other_target_change_nothing(
     event_id = calendar_db.insert_event(
         group_id="G1",
         title="確認接送時間",
-        event_date="2030-08-03",
+        event_date="2099-08-03",
         event_time="12:00",
     )
     source_row = next(
@@ -1020,7 +1020,7 @@ def test_bound_nonstandard_quote_and_explicit_other_target_change_nothing(
         for row in memory.list_reminder_cancellation_candidates("G1")
         if row["source_ref"] == event_id
     )
-    other_id = _seed("G1", "繳信用卡", "2030-08-04 09:00")
+    other_id = _seed("G1", "繳信用卡", "2099-08-04 09:00")
     _archive_bot_message(
         "one-off-event-reminder",
         "媽媽\n請確認明天接送時間",
@@ -1037,7 +1037,7 @@ def test_bound_nonstandard_quote_and_explicit_other_target_change_nothing(
 
     main._handle_text_message(
         _event(
-            "取消提醒\n2030-08-04 09:00 繳信用卡",
+            "取消提醒\n2099-08-04 09:00 繳信用卡",
             quoted_message_id="one-off-event-reminder",
         ),
         "G1",
@@ -1056,13 +1056,13 @@ def test_pasted_calendar_action_variants_with_two_sources_are_ambiguous(
     short_event = calendar_db.insert_event(
         group_id="G1",
         title="家庭聚餐",
-        event_date="2030-08-03",
+        event_date="2099-08-03",
         event_time="18:00",
     )
     raw_event = calendar_db.insert_event(
         group_id="G1",
         title="家庭聚餐 這則取消",
-        event_date="2030-08-03",
+        event_date="2099-08-03",
         event_time="18:00",
     )
     rows = {
@@ -1081,7 +1081,7 @@ def test_pasted_calendar_action_variants_with_two_sources_are_ambiguous(
     main._handle_text_message(
         _event(
             "取消提醒\n"
-            "📅 2030-08-03 18:00\n"
+            "📅 2099-08-03 18:00\n"
             "🎯 家庭聚餐 這則取消"
         ),
         "G1",
@@ -1098,13 +1098,13 @@ def test_pasted_calendar_nfkc_equivalent_titles_are_ambiguous(monkeypatch):
     ascii_event = calendar_db.insert_event(
         group_id="G1",
         title="ABC",
-        event_date="2030-08-03",
+        event_date="2099-08-03",
         event_time="18:00",
     )
     fullwidth_event = calendar_db.insert_event(
         group_id="G1",
         title="ＡＢＣ",
-        event_date="2030-08-03",
+        event_date="2099-08-03",
         event_time="18:00",
     )
     rows = {
@@ -1123,7 +1123,7 @@ def test_pasted_calendar_nfkc_equivalent_titles_are_ambiguous(monkeypatch):
     main._handle_text_message(
         _event(
             "取消提醒\n"
-            "📅 2030-08-03 18:00\n"
+            "📅 2099-08-03 18:00\n"
             "🎯 ABC"
         ),
         "G1",
@@ -1140,13 +1140,13 @@ def test_pasted_calendar_equivalent_minute_formats_are_ambiguous(monkeypatch):
     padded_event = calendar_db.insert_event(
         group_id="G1",
         title="ABC",
-        event_date="2030-08-03",
+        event_date="2099-08-03",
         event_time="04:00",
     )
     unpadded_event = calendar_db.insert_event(
         group_id="G1",
         title="ＡＢＣ",
-        event_date="2030-08-03",
+        event_date="2099-08-03",
         event_time="4:00",
     )
     rows = {
@@ -1165,7 +1165,7 @@ def test_pasted_calendar_equivalent_minute_formats_are_ambiguous(monkeypatch):
     main._handle_text_message(
         _event(
             "取消提醒\n"
-            "📅 2030-08-03 04:00\n"
+            "📅 2099-08-03 04:00\n"
             "🎯 ABC"
         ),
         "G1",
@@ -1182,13 +1182,13 @@ def test_pasted_calendar_equivalent_date_formats_are_ambiguous(monkeypatch):
     padded_event = calendar_db.insert_event(
         group_id="G1",
         title="ABC",
-        event_date="2030-08-03",
+        event_date="2099-08-03",
         event_time="04:00",
     )
     unpadded_event = calendar_db.insert_event(
         group_id="G1",
         title="ＡＢＣ",
-        event_date="2030-8-3",
+        event_date="2099-8-3",
         event_time="04:00",
     )
     rows = {
@@ -1207,7 +1207,7 @@ def test_pasted_calendar_equivalent_date_formats_are_ambiguous(monkeypatch):
     main._handle_text_message(
         _event(
             "取消提醒\n"
-            "📅 2030-08-03 04:00\n"
+            "📅 2099-08-03 04:00\n"
             "🎯 ABC"
         ),
         "G1",
@@ -1219,10 +1219,10 @@ def test_pasted_calendar_equivalent_date_formats_are_ambiguous(monkeypatch):
 
 
 def test_quoted_action_suffix_does_not_cancel_different_shorter_action(monkeypatch):
-    shorter_id = _seed("G1", "買", "2030-07-25 04:00")
+    shorter_id = _seed("G1", "買", "2099-07-25 04:00")
     _archive_bot_message(
         "old-sent-reminder",
-        "@媽媽\n⏰ 提醒（明天）\n2030-07-25 04:00 買這個",
+        "@媽媽\n⏰ 提醒（明天）\n2099-07-25 04:00 買這個",
     )
     replies: list[str] = []
     monkeypatch.setattr(
@@ -1243,8 +1243,8 @@ def test_quoted_action_suffix_does_not_cancel_different_shorter_action(monkeypat
 
 def test_pasted_rendered_reminder_selects_time_when_actions_are_equal(monkeypatch):
     action = "查看251巷租金是否入郵局帳戶，催繳代書"
-    four = _seed("G1", action, "2030-07-25 04:00")
-    eight = _seed("G1", action, "2030-07-25 08:00")
+    four = _seed("G1", action, "2099-07-25 04:00")
+    eight = _seed("G1", action, "2099-07-25 08:00")
     replies: list[str] = []
 
     monkeypatch.setattr(
@@ -1257,7 +1257,7 @@ def test_pasted_rendered_reminder_selects_time_when_actions_are_equal(monkeypatc
     main._handle_text_message(
         _event(
             "取消提醒（明天）\n"
-            f"2030-07-25 04:00 {action}\n"
+            f"2099-07-25 04:00 {action}\n"
             "這一則"
         ),
         "G1",
@@ -1265,13 +1265,13 @@ def test_pasted_rendered_reminder_selects_time_when_actions_are_equal(monkeypatc
 
     assert _status(four) == "cancelled"
     assert _status(eight) == "pending"
-    assert replies and "2030-07-25 04:00" in replies[0]
+    assert replies and "2099-07-25 04:00" in replies[0]
 
 
 def test_ambiguous_action_only_cancel_does_not_mutate(monkeypatch):
     action = "查看租金是否入帳"
-    four = _seed("G1", action, "2030-07-25 04:00")
-    eight = _seed("G1", action, "2030-07-25 08:00")
+    four = _seed("G1", action, "2099-07-25 04:00")
+    eight = _seed("G1", action, "2099-07-25 08:00")
     replies: list[str] = []
 
     monkeypatch.setattr(
@@ -1293,10 +1293,10 @@ def test_ambiguous_action_only_cancel_does_not_mutate(monkeypatch):
 
 def test_creation_acknowledgement_quote_can_be_cancelled(monkeypatch):
     action = "領取護照"
-    reminder_id = _seed("G1", action, "2030-08-03 10:30")
+    reminder_id = _seed("G1", action, "2099-08-03 10:30")
     _archive_bot_message(
         "creation-ack",
-        "已新增提醒\n時間：2030-08-03 10:30\n事項：領取護照",
+        "已新增提醒\n時間：2099-08-03 10:30\n事項：領取護照",
     )
     replies: list[str] = []
     monkeypatch.setattr(
@@ -1317,11 +1317,11 @@ def test_creation_acknowledgement_quote_can_be_cancelled(monkeypatch):
 
 def test_old_cancelled_and_identical_new_pending_are_ambiguous(monkeypatch):
     action = "繳房租"
-    old_id = _seed("G1", action, "2030-08-03 10:30")
+    old_id = _seed("G1", action, "2099-08-03 10:30")
     assert memory.cancel_pending_reminder(
-        "G1", old_id, action, _ts("2030-08-03 10:30")
+        "G1", old_id, action, _ts("2099-08-03 10:30")
     )
-    new_id = _seed("G1", action, "2030-08-03 10:30")
+    new_id = _seed("G1", action, "2099-08-03 10:30")
     replies: list[str] = []
     monkeypatch.setattr(
         main,
@@ -1331,7 +1331,7 @@ def test_old_cancelled_and_identical_new_pending_are_ambiguous(monkeypatch):
     monkeypatch.setattr(main.burst_filter, "cancel_burst", lambda _gid: None)
 
     main._handle_text_message(
-        _event("取消提醒 2030-08-03 10:30 繳房租"),
+        _event("取消提醒 2099-08-03 10:30 繳房租"),
         "G1",
     )
 
@@ -1379,11 +1379,11 @@ def test_scheduled_push_archives_real_line_message_id(monkeypatch):
 
     assert reminder_push._push_to_group(
         "G1",
-        "⏰ 提醒\n2030-01-02 04:00 繳費",
+        "⏰ 提醒\n2099-01-02 04:00 繳費",
         reminder_id=77,
     )
     assert archived == [
-        ("G1", "line-sent-reminder", "__bot__", "⏰ 提醒\n2030-01-02 04:00 繳費")
+        ("G1", "line-sent-reminder", "__bot__", "⏰ 提醒\n2099-01-02 04:00 繳費")
     ]
     assert references == [(("G1", "line-sent-reminder"), {"reminder_id": 77})]
 
@@ -1419,25 +1419,25 @@ def test_scheduled_push_archive_failure_does_not_retry_delivery(monkeypatch):
         lambda *_args: (_ for _ in ()).throw(RuntimeError("archive down")),
     )
 
-    assert reminder_push._push_to_group("G1", "⏰ 提醒\n2030-01-02 04:00 繳費")
+    assert reminder_push._push_to_group("G1", "⏰ 提醒\n2099-01-02 04:00 繳費")
     assert calls == 1
 
 
 def test_scheduled_reminder_render_uses_taipei_timezone():
-    remind_at = _ts("2030-01-02 04:00")
+    remind_at = _ts("2099-01-02 04:00")
     row = {
         "remind_at": remind_at,
         "action": "繳費",
         "mention_aliases": [],
     }
 
-    text = reminder_push._format_push_text(row, "1d", now=_ts("2030-01-01 04:00"))
+    text = reminder_push._format_push_text(row, "1d", now=_ts("2099-01-01 04:00"))
 
-    assert "2030-01-02 04:00 繳費" in text
+    assert "2099-01-02 04:00 繳費" in text
 
 
 def test_fast_path_reminder_reply_archives_sent_id_and_plain_text(monkeypatch):
-    plain = "⏰ 提醒（明天）\n2030-01-02 04:00 繳費"
+    plain = "⏰ 提醒（明天）\n2099-01-02 04:00 繳費"
     archived: list[tuple[str, str, str | None, str]] = []
     references: list[tuple[tuple, dict]] = []
 
@@ -1475,7 +1475,7 @@ def test_fast_path_reminder_reply_archives_sent_id_and_plain_text(monkeypatch):
                     "text": plain,
                     "message": TextMessage(text=plain),
                     "action": "繳費",
-                    "remind_at": _ts("2030-01-02 04:00"),
+                    "remind_at": _ts("2099-01-02 04:00"),
                     "weekly_count": 0,
                 }
             ],
@@ -1565,9 +1565,9 @@ def test_quote_cancels_lead_time_calendar_reminder_by_exact_event_source(
     event_id = calendar_db.insert_event(
         group_id="G1",
         title="全家打羽球",
-        event_date="2030-07-25",
+        event_date="2099-07-25",
         event_time="16:00",
-        participants=["黃聖雅"],
+        participants=["妹妹"],
     )
     assert event_id
     source_row = next(
@@ -1576,15 +1576,15 @@ def test_quote_cancels_lead_time_calendar_reminder_by_exact_event_source(
         if row["source_kind"] == calendar_db.EVENT_REMINDER_SOURCE_KIND
         and row["source_ref"] == event_id
     )
-    assert source_row["action"] == "黃聖雅負責預約7/25打羽球場地"
-    assert source_row["remind_at"] == _ts("2030-07-18 18:00")
+    assert source_row["action"] == "妹妹負責預約7/25打羽球場地"
+    assert source_row["remind_at"] == _ts("2099-07-18 18:00")
 
     _archive_bot_message(
         "lead-time-event-reminder",
         "🔔 **1 週後活動提醒**\n"
-        "📅 2030-07-25 16:00\n"
+        "📅 2099-07-25 16:00\n"
         "🎯 全家打羽球\n"
-        "👥 黃聖雅",
+        "👥 妹妹",
         source_kind=calendar_db.EVENT_REMINDER_SOURCE_KIND,
         source_ref=event_id,
     )
@@ -1617,7 +1617,7 @@ def test_lead_time_calendar_cancel_race_reports_idempotent_success(monkeypatch):
     event_id = calendar_db.insert_event(
         group_id="G1",
         title="親子打羽球",
-        event_date="2030-08-03",
+        event_date="2099-08-03",
         event_time="15:00",
         participants=["爸爸"],
     )
@@ -1630,7 +1630,7 @@ def test_lead_time_calendar_cancel_race_reports_idempotent_success(monkeypatch):
     _archive_bot_message(
         "racing-event-reminder",
         "🔔 **1 週後活動提醒**\n"
-        "📅 2030-08-03 15:00\n"
+        "📅 2099-08-03 15:00\n"
         "🎯 親子打羽球\n"
         "👥 爸爸",
         source_kind=calendar_db.EVENT_REMINDER_SOURCE_KIND,
@@ -1670,7 +1670,7 @@ def test_source_cancel_retries_when_sender_moves_pending_to_done(monkeypatch):
     event_id = calendar_db.insert_event(
         group_id="G1",
         title="朋友打羽球",
-        event_date="2030-08-10",
+        event_date="2099-08-10",
         event_time="14:00",
         participants=["爸爸"],
     )
@@ -1682,7 +1682,7 @@ def test_source_cancel_retries_when_sender_moves_pending_to_done(monkeypatch):
     _archive_bot_message(
         "sender-race-event-reminder",
         "🔔 **1 週後活動提醒**\n"
-        "📅 2030-08-10 14:00\n"
+        "📅 2099-08-10 14:00\n"
         "🎯 朋友打羽球\n"
         "👥 爸爸",
         source_kind=calendar_db.EVENT_REMINDER_SOURCE_KIND,
@@ -1730,7 +1730,7 @@ def test_later_event_notification_can_tombstone_done_lead_time_source(
     event_id = calendar_db.insert_event(
         group_id="G1",
         title="家庭打羽球",
-        event_date="2030-07-25",
+        event_date="2099-07-25",
         event_time="16:00",
         participants=["媽媽"],
     )
@@ -1743,7 +1743,7 @@ def test_later_event_notification_can_tombstone_done_lead_time_source(
     assert memory.mark_reminder_pushed(source_row["reminder_id"], "now")
     assert _status(source_row["reminder_id"]) == "done"
 
-    monkeypatch.setattr(calendar_db, "_today_tw", lambda: date(2030, 7, 22))
+    monkeypatch.setattr(calendar_db, "_today_tw", lambda: date(2099, 7, 22))
     assert [
         event["event_id"]
         for event in calendar_db.list_due_for_reminder("G1", days_ahead=3)
@@ -1752,7 +1752,7 @@ def test_later_event_notification_can_tombstone_done_lead_time_source(
     _archive_bot_message(
         "later-event-reminder",
         "🔔 **3 天後活動提醒**\n"
-        "📅 2030-07-25 16:00\n"
+        "📅 2099-07-25 16:00\n"
         "🎯 家庭打羽球\n"
         "👥 媽媽",
         source_kind=calendar_db.EVENT_REMINDER_SOURCE_KIND,
@@ -1792,7 +1792,7 @@ def test_historical_natural_message_id_pivots_to_done_calendar_source(
     event_id = calendar_db.insert_event(
         group_id="G1",
         title="家庭聚餐",
-        event_date="2030-07-25",
+        event_date="2099-07-25",
         event_time="16:00",
         participants=["媽媽"],
     )
@@ -1810,7 +1810,7 @@ def test_historical_natural_message_id_pivots_to_done_calendar_source(
             "INSERT INTO raw_messages"
             "(group_id, message_id, user_id, text, created_at) "
             "VALUES ('G1', 'historical-natural-reminder', '__bot__', ?, 1)",
-            ("⏰ 提醒（現在 / 即將到時）\n2030-07-25 16:00 家庭聚餐",),
+            ("⏰ 提醒（現在 / 即將到時）\n2099-07-25 16:00 家庭聚餐",),
         )
         # Historical rows stored only reminder_id. The mapped reminder itself
         # carries the durable calendar source and must be pivoted at cancel time.
@@ -1821,7 +1821,7 @@ def test_historical_natural_message_id_pivots_to_done_calendar_source(
             (source_row["reminder_id"],),
         )
 
-    monkeypatch.setattr(calendar_db, "_today_tw", lambda: date(2030, 7, 22))
+    monkeypatch.setattr(calendar_db, "_today_tw", lambda: date(2099, 7, 22))
     assert [
         event["event_id"]
         for event in calendar_db.list_due_for_reminder("G1", days_ahead=3)
@@ -1851,7 +1851,7 @@ def test_pasted_done_natural_reminder_tombstones_calendar_source(monkeypatch):
     event_id = calendar_db.insert_event(
         group_id="G1",
         title="家庭聚餐",
-        event_date="2030-07-25",
+        event_date="2099-07-25",
         event_time="16:00",
         participants=["媽媽"],
     )
@@ -1863,7 +1863,7 @@ def test_pasted_done_natural_reminder_tombstones_calendar_source(monkeypatch):
     )
     assert memory.mark_reminder_pushed(source_row["reminder_id"], "now")
     assert _status(source_row["reminder_id"]) == "done"
-    monkeypatch.setattr(calendar_db, "_today_tw", lambda: date(2030, 7, 22))
+    monkeypatch.setattr(calendar_db, "_today_tw", lambda: date(2099, 7, 22))
     assert [
         event["event_id"]
         for event in calendar_db.list_due_for_reminder("G1", days_ahead=3)
@@ -1881,7 +1881,7 @@ def test_pasted_done_natural_reminder_tombstones_calendar_source(monkeypatch):
         _event(
             "取消提醒\n"
             "⏰ 提醒（現在 / 即將到時）\n"
-            "2030-07-25 16:00 家庭聚餐"
+            "2099-07-25 16:00 家庭聚餐"
         ),
         "G1",
     )
@@ -1901,7 +1901,7 @@ def test_pasted_terminal_source_and_recreated_pending_is_ambiguous(
     event_id = calendar_db.insert_event(
         group_id="G1",
         title="家庭聚餐",
-        event_date="2030-07-25",
+        event_date="2099-07-25",
         event_time="16:00",
     )
     source_row = next(
@@ -1914,7 +1914,7 @@ def test_pasted_terminal_source_and_recreated_pending_is_ambiguous(
             "UPDATE reminders SET status=? WHERE reminder_id=?",
             (terminal_status, source_row["reminder_id"]),
         )
-    generic_id = _seed("G1", "家庭聚餐", "2030-07-25 16:00")
+    generic_id = _seed("G1", "家庭聚餐", "2099-07-25 16:00")
 
     replies: list[str] = []
     monkeypatch.setattr(
@@ -1928,7 +1928,7 @@ def test_pasted_terminal_source_and_recreated_pending_is_ambiguous(
         _event(
             "取消提醒\n"
             "⏰ 提醒（現在 / 即將到時）\n"
-            "2030-07-25 16:00 家庭聚餐"
+            "2099-07-25 16:00 家庭聚餐"
         ),
         "G1",
     )
@@ -1948,7 +1948,7 @@ def test_pasted_pending_source_cancels_nfkc_equivalent_generic_peer(
     event_id = calendar_db.insert_event(
         group_id="G1",
         title="ＡＢＣ",
-        event_date="2030-07-25",
+        event_date="2099-07-25",
         event_time="16:00",
     )
     source_row = next(
@@ -1956,7 +1956,7 @@ def test_pasted_pending_source_cancels_nfkc_equivalent_generic_peer(
         for row in memory.list_reminder_cancellation_candidates("G1")
         if row["source_ref"] == event_id
     )
-    generic_id = _seed("G1", "ABC", "2030-07-25 16:00")
+    generic_id = _seed("G1", "ABC", "2099-07-25 16:00")
 
     replies: list[str] = []
     monkeypatch.setattr(
@@ -1967,7 +1967,7 @@ def test_pasted_pending_source_cancels_nfkc_equivalent_generic_peer(
     monkeypatch.setattr(main.burst_filter, "cancel_burst", lambda _gid: None)
 
     main._handle_text_message(
-        _event("取消提醒\n2030-07-25 16:00 ABC"),
+        _event("取消提醒\n2099-07-25 16:00 ABC"),
         "G1",
     )
 
@@ -2109,10 +2109,10 @@ def test_normal_reply_piggyback_archives_natural_reminder_identity(monkeypatch):
                 {
                     "reminder_id": 88,
                     "stage": "1d",
-                    "text": "⏰ 提醒（明天）\n2030-01-02 04:00 繳費",
-                    "message": TextMessage(text="⏰ 提醒\n2030-01-02 04:00 繳費"),
+                    "text": "⏰ 提醒（明天）\n2099-01-02 04:00 繳費",
+                    "message": TextMessage(text="⏰ 提醒\n2099-01-02 04:00 繳費"),
                     "action": "繳費",
-                    "remind_at": _ts("2030-01-02 04:00"),
+                    "remind_at": _ts("2099-01-02 04:00"),
                     "weekly_count": 0,
                 }
             ],
@@ -2234,7 +2234,7 @@ def test_scheduled_sender_skips_reminder_cancelled_after_due_snapshot(monkeypatc
                 "reminder_id": 7,
                 "group_id": "G1",
                 "stage": "1d",
-                "text": "⏰ 提醒（明天）\n2030-01-02 04:00 繳費",
+                "text": "⏰ 提醒（明天）\n2099-01-02 04:00 繳費",
                 "message": TextMessage(text="提醒"),
                 "action": "繳費",
             }
@@ -2258,7 +2258,7 @@ def test_scheduled_sender_skips_reminder_cancelled_after_due_snapshot(monkeypatc
 
 def test_scheduled_sender_claims_before_external_delivery(monkeypatch):
     action = "繳信用卡"
-    when = "2030-01-02 04:00"
+    when = "2099-01-02 04:00"
     reminder_id = _seed("G1", action, when)
     observed: dict[str, object] = {}
 
@@ -2369,7 +2369,7 @@ def test_fast_reply_claims_natural_reminder_before_line(monkeypatch):
     import calendar_db
 
     action = "繳電費"
-    when = "2030-01-02 04:00"
+    when = "2099-01-02 04:00"
     reminder_id = _seed("G1", action, when)
     observed: dict[str, object] = {}
 
@@ -2514,10 +2514,10 @@ def test_fast_path_failed_claim_blocks_cancelled_reminder(monkeypatch):
             {
                 "reminder_id": 7,
                 "stage": "1d",
-                "text": "⏰ 提醒（明天）\n2030-01-02 04:00 繳費",
+                "text": "⏰ 提醒（明天）\n2099-01-02 04:00 繳費",
                 "message": TextMessage(text="提醒"),
                 "action": "繳費",
-                "remind_at": _ts("2030-01-02 04:00"),
+                "remind_at": _ts("2099-01-02 04:00"),
                 "weekly_count": 0,
             }
         ],
@@ -2582,10 +2582,10 @@ def test_normal_reply_failed_claim_drops_cancelled_piggyback(monkeypatch):
             {
                 "reminder_id": 7,
                 "stage": "1d",
-                "text": "⏰ 提醒（明天）\n2030-01-02 04:00 繳費",
+                "text": "⏰ 提醒（明天）\n2099-01-02 04:00 繳費",
                 "message": TextMessage(text="提醒"),
                 "action": "繳費",
-                "remind_at": _ts("2030-01-02 04:00"),
+                "remind_at": _ts("2099-01-02 04:00"),
                 "weekly_count": 0,
             }
         ],

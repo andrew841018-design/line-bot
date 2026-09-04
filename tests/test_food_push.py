@@ -38,6 +38,6 @@ def test_no_personal_naming(monkeypatch):
     food_db.insert_signal(G, "has_food", "蛋", source_msg_id="m1")
     food_db.insert_signal(G, "has_food", "虱目魚肚", source_msg_id="m2")
     msg = food_push.build_message()
-    for name in ("媽媽", "爸爸", "黃聖雅", "黃聖穎"):
+    for name in ("媽媽", "爸爸", "妹妹", "弟弟"):
         assert name not in msg
     food_db.clear_group(G)

@@ -20,6 +20,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from config import settings
+import line_mentions
 import reminder_intent
 
 _TW = ZoneInfo("Asia/Taipei")
@@ -1298,10 +1299,7 @@ def _corrected_title_participants(title: str | None) -> list[str]:
         ("哥哥", "哥哥"),
         ("爺爺", "爺爺"),
         ("奶奶", "奶奶"),
-        ("黃聖雅", "黃聖雅"),
-        ("黃聖穎", "黃聖穎"),
-        ("聖雅", "黃聖雅"),
-        ("聖穎", "黃聖穎"),
+        *line_mentions.configured_family_alias_mapping(include_short=True).items(),
     )
     participants: list[str] = []
     for alias, normalized in aliases:

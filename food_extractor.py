@@ -25,6 +25,8 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import line_mentions
+
 logger = logging.getLogger("food_extractor")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -123,7 +125,8 @@ def is_food(token: str) -> bool:
 
 _NAMED_SUBJECTS = (
     "媽媽", "爸爸", "姊姊", "姐姐", "哥哥", "弟弟", "妹妹",
-    "黃聖雅", "黃聖穎", "阿婆", "阿公", "奶奶", "爺爺", "舅舅", "阿姨",
+    "阿婆", "阿公", "奶奶", "爺爺", "舅舅", "阿姨",
+    *line_mentions.configured_family_aliases(include_short=True),
 )
 
 _SUBJECT_VERB_RE = re.compile(
@@ -327,7 +330,7 @@ def extract(text: str, sender_alias: str = "") -> list[dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Alias lookup (user_id → 媽媽 / 爸爸 / 黃聖雅 / 黃聖穎)
+# Alias lookup (user_id → local-only family display alias)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _ALIASES_PATH = Path(__file__).parent / "user_aliases.json"
@@ -351,7 +354,7 @@ def _load_aliases() -> dict[str, str]:
 
 
 def alias_from_user_id(user_id: str) -> str:
-    """user_id → 中文別名（媽媽 / 爸爸 / 黃聖雅 / 黃聖穎）；找不到回空字串。"""
+    """user_id → 本機設定的中文別名；找不到回空字串。"""
     if not user_id:
         return ""
     return _load_aliases().get(user_id, "")

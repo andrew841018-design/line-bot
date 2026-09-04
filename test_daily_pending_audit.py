@@ -208,7 +208,8 @@ def test_format_message_truncated_strictly_under_limit(monkeypatch):
 
 def test_hash_user_short_preserves_manual_label():
     assert dpa._hash_user_short("U_papa_manual") == "U_papa_manual"
-    assert dpa._hash_user_short("U9fde03d0fe1e0669eccc8b9b4ecc28a6").startswith("U9fde03")
+    raw_user = "U" + "a" * 32
+    assert dpa._hash_user_short(raw_user).startswith("Uaaaaa")
     assert dpa._hash_user_short(None) == "?"
 
 
@@ -216,7 +217,7 @@ def test_short_file_name_hashes_and_keeps_extension():
     assert dpa._short_file_name(None) == ""
     short_pdf = dpa._short_file_name("a.pdf")
     assert short_pdf.endswith(".pdf") and len(short_pdf) == len("xxxxxx.pdf")
-    long = dpa._short_file_name("114年度-曾美惠-非常長的-報表.pdf")
+    long = dpa._short_file_name("114年度-測試病患甲-非常長的-報表.pdf")
     assert long.endswith(".pdf")
     # Hash must NOT leak any Chinese / context from the original name
     assert "曾" not in long

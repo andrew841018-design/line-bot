@@ -126,7 +126,7 @@ def test_weekly_reminder_starts_within_30_days(monkeypatch):
 
 def test_due_reminder_mentions_companion_alias_from_action(monkeypatch):
     now = 1_800_000_000
-    action = "曾美惠正子斷層掃描當天 08:00 開始禁食 6 小時，只能喝水（黃聖雅陪同）"
+    action = "測試病患甲正子斷層掃描當天 08:00 開始禁食 6 小時，只能喝水（妹妹陪同）"
 
     def fake_list(group_id=None):
         return [_row(now, user_id="U_MOM", action=action)]
@@ -135,13 +135,13 @@ def test_due_reminder_mentions_companion_alias_from_action(monkeypatch):
     monkeypatch.setattr(
         reminder_push.line_mentions,
         "load_user_aliases",
-        lambda: {"U_MOM": "媽媽", "U_SIS": "黃聖雅"},
+        lambda: {"U_MOM": "媽媽", "U_SIS": "妹妹"},
     )
 
     due = reminder_push.due_reminders_for_reply("G1", limit=2, now=now)
 
     assert len(due) == 1
-    assert due[0]["text"].startswith("@媽媽 @黃聖雅\n⏰ 提醒（明天）\n")
+    assert due[0]["text"].startswith("@媽媽 @妹妹\n⏰ 提醒（明天）\n")
     assert due[0]["message"].text.startswith("{target} {p2}\n⏰ 提醒（明天）\n")
     assert due[0]["message"].substitution["target"].mentionee.user_id == "U_MOM"
     assert due[0]["message"].substitution["p2"].mentionee.user_id == "U_SIS"
@@ -156,7 +156,7 @@ def test_due_reminder_mentions_structured_aliases_without_action_names(monkeypat
                 now,
                 user_id="U_MOM",
                 action="正子斷層掃描當天 08:00 開始禁食 6 小時，只能喝水",
-                mention_aliases=["媽媽", "黃聖雅"],
+                mention_aliases=["媽媽", "妹妹"],
             )
         ]
 
@@ -164,14 +164,14 @@ def test_due_reminder_mentions_structured_aliases_without_action_names(monkeypat
     monkeypatch.setattr(
         reminder_push.line_mentions,
         "load_user_aliases",
-        lambda: {"U_MOM": "媽媽", "U_SIS": "黃聖雅"},
+        lambda: {"U_MOM": "媽媽", "U_SIS": "妹妹"},
     )
 
     due = reminder_push.due_reminders_for_reply("G1", limit=2, now=now)
 
     assert len(due) == 1
-    assert due[0]["text"].startswith("@媽媽 @黃聖雅\n⏰ 提醒（明天）\n")
-    assert "參加人：媽媽、黃聖雅" in due[0]["text"]
+    assert due[0]["text"].startswith("@媽媽 @妹妹\n⏰ 提醒（明天）\n")
+    assert "參加人：媽媽、妹妹" in due[0]["text"]
     assert due[0]["message"].substitution["target"].mentionee.user_id == "U_MOM"
     assert due[0]["message"].substitution["p2"].mentionee.user_id == "U_SIS"
 
@@ -180,7 +180,7 @@ def test_due_reminder_keeps_unmapped_participant_visible(monkeypatch):
     now = 1_800_000_000
 
     def fake_list(group_id=None):
-        return [_row(now, user_id="", mention_aliases=["黃將修"])]
+        return [_row(now, user_id="", mention_aliases=["哥哥"])]
 
     monkeypatch.setattr(reminder_push.memory, "list_pending_reminders_full", fake_list)
     monkeypatch.setattr(reminder_push.line_mentions, "load_user_aliases", lambda: {})
@@ -188,8 +188,8 @@ def test_due_reminder_keeps_unmapped_participant_visible(monkeypatch):
     due = reminder_push.due_reminders_for_reply("G1", limit=2, now=now)
 
     assert len(due) == 1
-    assert due[0]["text"].startswith("@黃將修\n⏰ 提醒（明天）\n")
-    assert "參加人：黃將修" in due[0]["text"]
+    assert due[0]["text"].startswith("@哥哥\n⏰ 提醒（明天）\n")
+    assert "參加人：哥哥" in due[0]["text"]
     assert due[0]["message"].type == "text"
 
 

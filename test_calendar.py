@@ -402,7 +402,7 @@ def test_badminton_event_syncs_to_booking_reminder_on_booking_window(tmp_calenda
         title="全家打羽球",
         event_date=event_date,
         event_time="16:00",
-        participants=["黃聖雅"],
+        participants=["妹妹"],
     )
     assert event_id
 
@@ -412,8 +412,8 @@ def test_badminton_event_syncs_to_booking_reminder_on_booking_window(tmp_calenda
     assert reminders[0]["source_kind"] == "calendar_event"
     assert reminders[0]["source_ref"] == event_id
     assert reminders[0]["remind_at"] == expected_at
-    assert reminders[0]["action"] == f"黃聖雅負責預約{_month_day_label(event_date)}打羽球場地"
-    assert reminders[0]["mention_aliases"] == ["黃聖雅"]
+    assert reminders[0]["action"] == f"妹妹負責預約{_month_day_label(event_date)}打羽球場地"
+    assert reminders[0]["mention_aliases"] == ["妹妹"]
 
     cd.sync_active_events_to_reminders("G1")
     resynced = memory.list_pending_reminders("G1")
@@ -432,7 +432,7 @@ def test_badminton_event_can_override_booking_lead_days(tmp_calendar_db):
         title="全家打羽球",
         event_date=event_date,
         event_time="16:00",
-        participants=["黃聖雅"],
+        participants=["妹妹"],
     )
     assert event_id
 
@@ -443,7 +443,7 @@ def test_badminton_event_can_override_booking_lead_days(tmp_calendar_db):
     assert len(reminders) == 1
     assert reminders[0]["source_ref"] == event_id
     assert reminders[0]["remind_at"] == expected_at
-    assert reminders[0]["action"] == f"黃聖雅負責預約{_month_day_label(event_date)}打羽球場地"
+    assert reminders[0]["action"] == f"妹妹負責預約{_month_day_label(event_date)}打羽球場地"
 
     cd.sync_active_events_to_reminders("G1")
     resynced = memory.list_pending_reminders("G1")
@@ -669,7 +669,7 @@ def test_event_reminder_uses_raw_sender_and_participant_aliases(tmp_calendar_db)
         event_date=event_date,
         event_time="10:30",
         source_msg_id=raw_message_id,
-        participants=["黃聖雅", "媽媽"],
+        participants=["妹妹", "媽媽"],
     )
     assert eid
 
@@ -677,20 +677,26 @@ def test_event_reminder_uses_raw_sender_and_participant_aliases(tmp_calendar_db)
     reminder = next(r for r in reminders if r["source_ref"] == eid)
 
     assert reminder["user_id"] == "U_MOM"
-    assert reminder["mention_aliases"] == ["黃聖雅", "媽媽"]
+    assert reminder["mention_aliases"] == ["妹妹", "媽媽"]
 
 
-def test_event_reminder_merges_mentioned_names_from_raw_text(tmp_calendar_db):
+def test_event_reminder_merges_mentioned_names_from_raw_text(
+    tmp_calendar_db, tmp_path, monkeypatch
+):
     cd = tmp_calendar_db
     _align_memory_db_with_calendar(cd)
     import memory
+
+    aliases_path = tmp_path / "user_aliases.json"
+    aliases_path.write_text('{"U_TEST":"妹妹"}\n', encoding="utf-8")
+    monkeypatch.setenv("LINE_USER_ALIASES_PATH", str(aliases_path))
 
     raw_message_id = "msg-source-mentions"
     memory.log_raw_message(
         "G1",
         raw_message_id,
         "U_MOM",
-        "這波家事有 @黃聖雅 陪同參與",
+        "這波家事有 @妹妹 陪同參與",
     )
 
     event_date = (date.today() + timedelta(days=4)).isoformat()
@@ -707,7 +713,7 @@ def test_event_reminder_merges_mentioned_names_from_raw_text(tmp_calendar_db):
     reminders = memory.list_pending_reminders_full("G1")
     reminder = next(r for r in reminders if r["source_ref"] == eid)
 
-    assert reminder["mention_aliases"] == ["媽媽", "黃聖雅"]
+    assert reminder["mention_aliases"] == ["媽媽", "妹妹"]
 
 
 def test_event_reminder_treats_raw_text_family_all_as_all(tmp_calendar_db):

@@ -80,7 +80,7 @@ def test_multiple_slash_dates_support_daypart_and_inline_time_range():
 
 def test_subjectless_medical_slash_date_uses_daypart_default_and_normalizes_scans():
     out = calendar_regex.extract_many_regex_only(
-        "8/18 早上看胸腔外科陳晉興，看M R I跟Pet掃描結果",
+        "8/18 早上看胸腔外科測試醫師甲，看M R I跟Pet掃描結果",
         date(2026, 7, 29),
         require_time=True,
     )
@@ -89,7 +89,7 @@ def test_subjectless_medical_slash_date_uses_daypart_default_and_normalizes_scan
     assert out[0]["date"] == "2026-08-18"
     assert out[0]["time"] == "09:00"
     assert out[0]["event_type"] == "medical"
-    assert out[0]["title"] == "看胸腔外科陳晉興，看MRI跟PET掃描結果"
+    assert out[0]["title"] == "看胸腔外科測試醫師甲，看MRI跟PET掃描結果"
     assert out[0]["location"] is None
 
 
@@ -307,8 +307,8 @@ def test_leading_three_digit_room_range_is_not_a_time_range():
 
 def test_room_range_is_preserved_while_later_clock_is_extracted():
     for text in (
-        "8/2 101-102號房 下午3點全家聚餐",
-        "8/2 下午3點 101-102號房全家聚餐",
+        "8/2 101-102號房 下午3點全家聚餐",  # privacy-safe-fixture
+        "8/2 下午3點 101-102號房全家聚餐",  # privacy-safe-fixture
     ):
         out = calendar_regex.extract_many_regex_only(
             text,
@@ -406,7 +406,7 @@ def test_classify_medical_with_doctor_name_between_look_and_dentist():
 # ── 中文日期格式 ────────────────────────────────────────────────────────────
 def test_chinese_date_same_year():
     """5月21日（today）後的同年日期。"""
-    out = calendar_regex.extract_regex_only("12月25日 18:00 全家聚餐", _TODAY)
+    out = calendar_regex.extract_regex_only("12月25日 18:00 全家聚餐", _TODAY)  # privacy-safe-fixture
     assert out["has_event"] is True
     assert out["date"] == "2026-12-25"
     assert out["time"] == "18:00"
@@ -415,14 +415,14 @@ def test_chinese_date_same_year():
 def test_chinese_date_year_rollover():
     """跨年：12 月時講「1月3日」應該對應明年。"""
     dec_today = date(2026, 12, 20)
-    out = calendar_regex.extract_regex_only("1月3日 18:00 全家聚餐", dec_today)
+    out = calendar_regex.extract_regex_only("1月3日 18:00 全家聚餐", dec_today)  # privacy-safe-fixture
     assert out["has_event"] is True
     assert out["date"] == "2027-01-03"
 
 
 def test_chinese_date_today_same_day():
     """同一天的日期應該保留（不會誤判推到明年）。"""
-    out = calendar_regex.extract_regex_only("5月21日 18:00 全家聚餐", _TODAY)
+    out = calendar_regex.extract_regex_only("5月21日 18:00 全家聚餐", _TODAY)  # privacy-safe-fixture
     assert out["has_event"] is True
     assert out["date"] == "2026-05-21"
 
@@ -528,7 +528,7 @@ def test_title_strips_control_chars():
 
 def test_mixed_multi_event_classification_is_fragment_local():
     events = calendar_regex.extract_many_regex_only(
-        "8/1 18:00 全家聚餐\n8/2 09:00 看胸腔外科",
+        "8/1 18:00 全家聚餐\n8/2 09:00 看胸腔外科",  # privacy-safe-fixture
         date(2026, 7, 29),
     )
 

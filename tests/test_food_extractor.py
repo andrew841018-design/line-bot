@@ -118,7 +118,7 @@ def test_wants_bought_basic():
 
 def test_wants_bought_question_modal_low_confidence():
     """「以後可以買虱目魚丸嗎」— 疑問 + 未來 → confidence='low'。"""
-    signals = fx.extract("以後可以買虱目魚丸嗎", sender_alias="黃聖雅")
+    signals = fx.extract("以後可以買虱目魚丸嗎", sender_alias="妹妹")
     wb = [s for s in signals if s["kind"] == "wants_bought"]
     assert wb, f"應該抽 wants_bought (low confidence)，got: {signals}"
     assert all(s["confidence"] == "low" for s in wb)
@@ -171,7 +171,7 @@ def test_likes_food_first_person_default_sender():
 # ── dislikes_food ───────────────────────────────────────────────────────────
 
 def test_dislikes_food_explicit():
-    signals = fx.extract("我不喜歡吃虱目魚丸", sender_alias="黃聖雅")
+    signals = fx.extract("我不喜歡吃虱目魚丸", sender_alias="妹妹")
     assert any(
         s["kind"] == "dislikes_food" and s["food"] == "虱目魚丸"
         for s in signals
@@ -180,7 +180,7 @@ def test_dislikes_food_explicit():
 
 def test_dislikes_food_reason_only_does_not_flip_to_likes():
     """「虱目魚肚的魚刺好多」— 抱怨刺，不該誤判 likes。"""
-    signals = fx.extract("虱目魚肚的魚刺好多", sender_alias="黃聖雅")
+    signals = fx.extract("虱目魚肚的魚刺好多", sender_alias="妹妹")
     assert all(s["kind"] != "likes_food" for s in signals)
 
 
@@ -288,11 +288,15 @@ def test_extract_and_store_records_source_text(food_test_group):
 
 # ── alias_from_user_id ──────────────────────────────────────────────────────
 
-def test_alias_lookup_from_user_id():
-    """user_aliases.json 內的 4 個 id 應該能查到別名。"""
-    assert fx.alias_from_user_id("U9fde03d0fe1e0669eccc8b9b4ecc28a6") == "媽媽"
-    assert fx.alias_from_user_id("U38f817726f256ec1fdfa51cf57f4a645") == "爸爸"
-    assert fx.alias_from_user_id("U32fa3b194d6aeac31d3eefdcf3fcec4a") == "黃聖雅"
+def test_alias_lookup_from_user_id(tmp_path, monkeypatch):
+    """Local aliases are read without committing real LINE identifiers."""
+    user_id = "U" + "1" * 32
+    aliases_path = tmp_path / "user_aliases.json"
+    aliases_path.write_text('{"' + user_id + '": "妹妹"}\n', encoding="utf-8")
+    monkeypatch.setattr(fx, "_ALIASES_PATH", aliases_path)
+    monkeypatch.setattr(fx, "_ALIASES_CACHE", None)
+
+    assert fx.alias_from_user_id(user_id) == "妹妹"
 
 
 def test_alias_lookup_unknown_returns_empty():

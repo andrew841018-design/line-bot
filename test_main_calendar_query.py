@@ -26,7 +26,7 @@ def test_calendar_query_variations():
         "今天有什麼計畫",
         "週六有事嗎",
         "下週六的行程",
-        "黃將修去紐西蘭的日期",
+        "哥哥去紐西蘭的日期",
         "米堡，媽媽什麼時候回家",
         "媽媽幾點回家",
         "媽媽什麼時間回家",
@@ -57,8 +57,8 @@ def test_calendar_query_variations():
         "明天我們的行程有什麼活動",
         "姐姐明天在台北有什麼活動",
         "哥哥明天在台北有什麼活動",
-        "黃將修明天在台北有什麼活動",
-        "黃聖雅明天在台北有什麼活動",
+        "哥哥明天在台北有什麼活動",
+        "妹妹明天在台北有什麼活動",
         "明天早上媽媽在台北有什麼活動",
         "媽媽預計明天在台北有什麼活動",
         "媽媽什麼時候到台北",
@@ -298,7 +298,7 @@ def test_conversation_search_query_variations():
 
     assert main._is_conversation_search_query("搜尋對話紀錄") is True
     assert main._is_conversation_search_query("查聊天紀錄 紐西蘭") is True
-    assert main._is_conversation_search_query("對話紀錄搜尋 黃將修") is True
+    assert main._is_conversation_search_query("對話紀錄搜尋 哥哥") is True
     assert main._is_conversation_search_query("今天天氣如何") is False
 
 
@@ -318,7 +318,7 @@ def test_build_conversation_search_reply_lists_keyword_hits(monkeypatch):
         main.memory,
         "search_raw_messages",
         lambda gid, query, limit=5, exclude_bot=True: [
-            ("m1", "U_DAD", "黃將修 7/16 去紐西蘭，7/28 回來", 1783200000),
+            ("m1", "U_DAD", "哥哥 7/16 去紐西蘭，7/28 回來", 1783200000),
         ],
     )
     monkeypatch.setattr(main, "_alias_from_user_id", lambda uid: "爸爸")
@@ -326,7 +326,7 @@ def test_build_conversation_search_reply_lists_keyword_hits(monkeypatch):
     reply = main._build_conversation_search_reply("G1", "搜尋對話紀錄 紐西蘭")
 
     assert "找到「紐西蘭」相關對話" in reply
-    assert "黃將修 7/16 去紐西蘭" in reply
+    assert "哥哥 7/16 去紐西蘭" in reply
     assert "（爸爸）" in reply
 
 
@@ -337,10 +337,10 @@ def test_search_raw_messages_splits_chinese_trip_terms():
         "G1",
         "m1",
         "U_DAD",
-        "黃將修 7/16 去紐西蘭，7/28 回來",
+        "哥哥 7/16 去紐西蘭，7/28 回來",
     )
 
-    hits = memory.search_raw_messages("G1", "黃將修去紐西蘭", limit=5)
+    hits = memory.search_raw_messages("G1", "哥哥去紐西蘭", limit=5)
 
     assert len(hits) == 1
     assert hits[0][0] == "m1"
@@ -351,7 +351,7 @@ def test_extract_conversation_search_query_strips_trailing_record_words():
     import main
 
     assert main._extract_conversation_search_query("查一下紐西蘭的聊天紀錄") == "紐西蘭"
-    assert main._extract_conversation_search_query("找黃將修的對話紀錄") == "黃將修"
+    assert main._extract_conversation_search_query("找哥哥的對話紀錄") == "哥哥"
 
 
 # ── _resolve_relative_date ───────────────────────────────────────────────
@@ -611,7 +611,7 @@ def test_handle_calendar_query_finds_hwang_new_zealand_dates(monkeypatch):
             "event_date": first.isoformat(),
             "event_time": "14:30",
             "location": "桃園機場；預約編號F15309511",
-            "participants": "[\"黃將修(被接送)\"]",
+            "participants": "[\"哥哥(被接送)\"]",
             "status": "active",
         },
         {
@@ -621,7 +621,7 @@ def test_handle_calendar_query_finds_hwang_new_zealand_dates(monkeypatch):
             "event_date": second.isoformat(),
             "event_time": "",
             "location": "桃園機場；時間待補",
-            "participants": "[\"黃將修(被接送)\"]",
+            "participants": "[\"哥哥(被接送)\"]",
             "status": "active",
         },
     ]
@@ -638,7 +638,7 @@ def test_handle_calendar_query_finds_hwang_new_zealand_dates(monkeypatch):
     class FakeEvent:
         reply_token = "fake_token"
 
-    main._handle_calendar_query(FakeEvent(), "G1", "黃將修去紐西蘭的日期")
+    main._handle_calendar_query(FakeEvent(), "G1", "哥哥去紐西蘭的日期")
 
     assert first.isoformat() in captured["text"]
     assert "14:30" in captured["text"]
@@ -2980,7 +2980,7 @@ def test_calendar_title_recognizes_joint_action_subjects():
     assert main._calendar_title_action_actors("媽媽、爸爸及妹妹一起回台北") == {
         "媽媽",
         "爸爸",
-        "黃聖雅",
+        "妹妹",
     }
     for title in (
         "媽媽陪爸爸去考選部",
@@ -3029,8 +3029,8 @@ def test_return_home_query_actor_uses_home_subject_not_reporter():
         "媽媽和爸爸什麼時候回家",
         "媽媽或爸爸什麼時候回家",
         "媽媽還是爸爸什麼時候回家",
-        "媽媽和黃聖雅什麼時候回家",
-        "媽媽或黃聖穎什麼時候回家",
+        "媽媽和妹妹什麼時候回家",
+        "媽媽或弟弟什麼時候回家",
     ):
         assert (
             main._return_home_query_actor(query)
@@ -5421,7 +5421,7 @@ def test_hwang_new_zealand_query_filters_wrong_phrase_hit(monkeypatch):
         {
             "event_id": "correct",
             "event_time": "14:30",
-            "participants": "[\"黃將修(被接送)\"]",
+            "participants": "[\"哥哥(被接送)\"]",
         }
     )
 
@@ -5437,7 +5437,7 @@ def test_hwang_new_zealand_query_filters_wrong_phrase_hit(monkeypatch):
     class FakeEvent:
         reply_token = "fake_token"
 
-    main._handle_calendar_query(FakeEvent(), "G1", "黃將修去紐西蘭的日期")
+    main._handle_calendar_query(FakeEvent(), "G1", "哥哥去紐西蘭的日期")
 
     assert "14:30" in captured["text"]
     assert "王小明" not in captured["text"]
@@ -5483,7 +5483,7 @@ def test_build_todo_status_reply_reads_all_sources(monkeypatch):
                 "source_ref": "",
             },
             {
-                "action": "黃聖穎早上洗牙，看陳敏慧牙醫師",
+                "action": "弟弟早上洗牙，看陳敏慧牙醫師",
                 "remind_at": reminder_ts,
                 "mention_aliases": [],
                 "source_kind": "calendar_event",
@@ -5523,7 +5523,7 @@ def test_build_todo_status_reply_detail_query_includes_source_text(monkeypatch):
             {
                 "action": "機場接送（去紐西蘭）7/16去程",
                 "remind_at": reminder_ts,
-                "mention_aliases": ["黃將修"],
+                "mention_aliases": ["哥哥"],
                 "source_text": (
                     "機場接送（去紐西蘭）7/16去程；"
                     "接送網址：https://68666.tw/TwMI；票券驗證碼：8459"

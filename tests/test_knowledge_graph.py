@@ -107,10 +107,11 @@ def test_no_match_random_text():
 
 
 def test_user_phone():
-    """「我的電話是 0912345678」 → (user, phone, 0912345678)"""
-    triples = kg.extract_triples("我的電話是 0912345678")
+    """Synthetic phone input is classified without committing a real number."""
+    phone = "0900-000-000"
+    triples = kg.extract_triples(f"我的電話是 {phone}")
     assert any(
-        t[0] == "user" and t[1] == "phone" and "0912345678" in t[2] for t in triples
+        t[0] == "user" and t[1] == "phone" and phone in t[2] for t in triples
     ), f"Expected phone, got: {triples}"
 
 
@@ -189,11 +190,11 @@ def test_query_filter_by_subject(kg_test_group):
 def test_query_filter_by_relation(kg_test_group):
     kg.store_triples(kg_test_group, [
         ("user", "name", "Andrew"),
-        ("user", "phone", "0912345678"),
+        ("user", "phone", "0900-000-000"),
     ])
     rows = kg.query_triples(kg_test_group, relation="phone")
     assert len(rows) == 1
-    assert rows[0]["object"] == "0912345678"
+    assert rows[0]["object"] == "0900-000-000"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

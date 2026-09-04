@@ -17,6 +17,9 @@ jobs:
         with:
           python-version: "3.13"
 
+      - name: Block private LINE bot data
+        run: python jobs/git_privacy_audit.py --repo . --scope head
+
       - name: Install dependencies
         run: pip install -r requirements.txt
 

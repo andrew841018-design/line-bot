@@ -133,6 +133,25 @@ def run_local_checks() -> list[CheckResult]:
     existing_targets = [target for target in py_compile_targets if (BASE / target).exists()]
     return [
         _run_command(
+            "GitHub privacy audit",
+            [
+                sys.executable,
+                "jobs/git_privacy_audit.py",
+                "--repo",
+                ".",
+                "--scope",
+                "head",
+                "--scope",
+                "index",
+                "--scope",
+                "worktree",
+                "--scope",
+                "remote",
+            ],
+            cwd=BASE,
+            timeout_s=120,
+        ),
+        _run_command(
             "git diff --check",
             ["git", "diff", "--check"],
             cwd=BASE,

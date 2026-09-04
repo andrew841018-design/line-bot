@@ -232,7 +232,8 @@ def render_summary(group_id: str, days: int = 30, news_per_topic: int = 2) -> st
     for t in all_topics:
         news_by_topic[t] = fetch_topic_news(t, max_items=news_per_topic)
 
-    for name in ["媽媽", "爸爸", "黃聖雅", "黃聖穎"]:
+    configured_order = list(dict.fromkeys(_load_aliases().values()))
+    for name in configured_order:
         if name not in per_member or not per_member[name]:
             continue
         topics = per_member[name]

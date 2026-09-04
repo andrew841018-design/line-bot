@@ -15,6 +15,7 @@ from typing import Any
 
 
 _DEFAULT_ALIAS_PATH = Path(__file__).with_name("user_aliases.json")
+_DEFAULT_ROLE_ALIAS_PATH = Path(__file__).with_name("family_roles.local.json")
 _SPLIT_RE = re.compile(r"[、,，/\s]+")
 _MENTION_TOKEN_RE = re.compile(r"@([A-Za-z0-9_\u4e00-\u9fff]{1,30})")
 _ALL_PARTICIPANT_NAMES = {
@@ -41,6 +42,12 @@ def _alias_path() -> Path:
     return Path(os.environ.get("LINE_USER_ALIASES_PATH") or _DEFAULT_ALIAS_PATH)
 
 
+def _role_alias_path() -> Path:
+    return Path(
+        os.environ.get("LINE_FAMILY_ROLE_ALIASES_PATH") or _DEFAULT_ROLE_ALIAS_PATH
+    )
+
+
 def _clean_name(name: str) -> str:
     return str(name or "").strip().lstrip("@").strip()
 
@@ -62,6 +69,37 @@ def load_user_aliases() -> dict[str, str]:
     return aliases
 
 
+def configured_family_alias_mapping(*, include_short: bool = True) -> dict[str, str]:
+    """Return local-only display aliases without embedding private names in code."""
+
+    mapping: dict[str, str] = {}
+    aliases = load_user_aliases()
+    canonical_values = {_clean_name(label) for label in aliases.values()}
+    for label in aliases.values():
+        clean = _clean_name(label)
+        if not clean:
+            continue
+        mapping[clean] = clean
+        if include_short and len(clean) == 3 and all("\u4e00" <= ch <= "\u9fff" for ch in clean):
+            mapping.setdefault(clean[1:], clean)
+    path = _role_alias_path()
+    try:
+        roles = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
+        roles = {}
+    if isinstance(roles, dict):
+        for role, label in roles.items():
+            clean_role = _clean_name(role)
+            clean_label = _clean_name(label)
+            if clean_role and clean_label in canonical_values:
+                mapping[clean_role] = clean_label
+    return mapping
+
+
+def configured_family_aliases(*, include_short: bool = True) -> tuple[str, ...]:
+    return tuple(configured_family_alias_mapping(include_short=include_short))
+
+
 def clear_alias_cache() -> None:
     return None
 
@@ -74,8 +112,9 @@ def user_id_for_alias(name: str) -> str | None:
     target = _clean_name(name)
     if not target:
         return None
+    canonical = configured_family_alias_mapping(include_short=True).get(target, target)
     for user_id, alias in load_user_aliases().items():
-        if _clean_name(alias) == target:
+        if _clean_name(alias) == canonical:
             return user_id
     return None
 
@@ -118,8 +157,7 @@ def aliases_mentioned_in_text(text: str) -> list[str]:
         return aliases
 
     normalized = (text or "").replace("＠", "@").strip()
-    alias_values = [alias for alias in raw_aliases.values() if isinstance(alias, str)]
-    alias_set = {_clean_name(alias): alias for alias in alias_values if _clean_name(alias)}
+    alias_set = configured_family_alias_mapping(include_short=True)
     all_aliases = {_clean_name(name) for name in _ALL_PARTICIPANT_NAMES}
 
     seen = set()

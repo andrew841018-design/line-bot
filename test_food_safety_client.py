@@ -797,7 +797,7 @@ def test_dataset_validation_rejects_injected_merchant_alias():
     )
     payload["merchant_aliases"].append(
         {
-            "normalized_alias": "黃將修",
+            "normalized_alias": "哥哥",
             "canonical_name": "彰化泰山企業股份有限公司",
             "alias_kind": "merchant",
         }
@@ -1172,12 +1172,12 @@ def test_long_apple_policy_statement_does_not_trigger_food_safety(monkeypatch):
     food_safety_client.reset_cache()
     variants = [
         (
-            "@黃將修 @Emily 不要買美國蘋果，因為美國廠商要求把我們台灣的蘋果農藥標準"
+            "@哥哥 @TestMember 不要買美國蘋果，因為美國廠商要求把我們台灣的蘋果農藥標準"
             "放大六倍，從原來0.5ppm放大為3ppm。台灣已經接受，公告之後如果沒有什麼意見，"
             "之後的標準就是3ppm；但是美國他們自己吃的蘋果標準是0ppm。"
         ),
         (
-            "黃將修emily不要買美國蘋果因為美國廠商要求把我們台灣的蘋果農藥標準放大六倍"
+            "哥哥testmember不要買美國蘋果因為美國廠商要求把我們台灣的蘋果農藥標準放大六倍"
             "從原來05ppm放大為3ppm台灣已經接受公告之後如果意見之後的標準就3ppn"
             "但美國他們自己的蘋果標準0ppm"
         ),
@@ -1626,13 +1626,13 @@ def test_product_query_strips_leading_line_mentions(monkeypatch):
     food_safety_client.reset_cache()
 
     reply = food_safety_client.check_restaurant_message(
-        "@黃將修 @Emily 幫我查乳香世家牛奶食安"
+        "@哥哥 @TestMember 幫我查乳香世家牛奶食安"
     )
 
     assert reply is not None
     assert "查無「乳香世家牛奶」" in reply
-    assert "黃將修" not in reply
-    assert "Emily" not in reply
+    assert "哥哥" not in reply
+    assert "TestMember" not in reply
 
 
 def test_product_query_strips_comma_separated_line_mentions(monkeypatch):
@@ -1644,13 +1644,13 @@ def test_product_query_strips_comma_separated_line_mentions(monkeypatch):
     food_safety_client.reset_cache()
 
     reply = food_safety_client.check_restaurant_message(
-        "@黃將修，@Emily 幫我查乳香世家牛奶食安"
+        "@哥哥，@TestMember 幫我查乳香世家牛奶食安"
     )
 
     assert reply is not None
     assert "查無「乳香世家牛奶」" in reply
-    assert "黃將修" not in reply
-    assert "Emily" not in reply
+    assert "哥哥" not in reply
+    assert "TestMember" not in reply
 
 
 def test_explicit_lookup_allows_trailing_whitespace(monkeypatch):
@@ -2943,8 +2943,8 @@ def test_main_handler_uses_line_mention_ranges_for_spaced_names(monkeypatch):
     event = Mock()
     event.reply_token = "reply-token"
     event.source.user_id = "USER-A"
-    event.message.text = "@Emily Chen 幫我查乳香世家牛奶食安"
-    mentionee = Mock(index=0, length=len("@Emily Chen"))
+    event.message.text = "@Test Member 幫我查乳香世家牛奶食安"
+    mentionee = Mock(index=0, length=len("@Test Member"))
     event.message.mention.mentionees = [mentionee]
     captured = {}
 
@@ -2961,8 +2961,8 @@ def test_main_handler_uses_line_mention_ranges_for_spaced_names(monkeypatch):
 
 def test_line_mention_ranges_use_utf16_offsets():
     message = Mock()
-    message.text = "😀 @Emily Chen 幫我查乳香世家牛奶食安"
-    mentionee = Mock(index=3, length=len("@Emily Chen"))
+    message.text = "😀 @Test Member 幫我查乳香世家牛奶食安"
+    mentionee = Mock(index=3, length=len("@Test Member"))
     message.mention.mentionees = [mentionee]
 
     stripped = main._strip_mentions(message)
