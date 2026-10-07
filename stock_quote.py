@@ -395,6 +395,101 @@ def _has_explicit_numeric_stock_context(text: str) -> bool:
     return bool(_NUMERIC_STOCK_CONTEXT_RE.search(text or ""))
 
 
+# 2026-10-07: everyday numbers became tickers — 「明天0930出發」→ 0930.TW,
+# 「門牌 1234 號」→ 1234.TW (黑松) — and the explicit reply became that quote, or
+# 【市場報價｜暫時無法取得】 after a 5 s fetch under the webhook lock.  A TW code
+# now needs quote intent nearby (or is the whole ask: 「2330」「2330 今天怎樣」)
+# and never counts when it reads as a time, an address/room/extension/phone
+# number or a year.  No 4-digit listing starts with 0 except these old ETFs.
+_TW_4DIGIT_ETF_CODES = frozenset({"0050", "0051", "0052", "0053", "0055", "0056", "0057", "0061"})
+_TW_CODE_INTENT_RE = re.compile(
+    r"股|價格|價位|現價|多少|幾塊|幾元|漲|跌|收盤|開盤|盤中|盤後|夜盤|報價|行情|走勢|成交|張|"
+    r"殖利率|配息|除息|除權|本益比|營收|財報|法說|均線|月線|季線|年線|K線|支撐|突破|"
+    r"買進|賣出|加碼|減碼|停損|停利|套牢|這檔|那檔|哪檔|代號|上市|上櫃|"
+    r"(?<![A-Za-z])(?:ETF|EPS|TWSE|TPEX|stocks?|shares?|prices?|quotes?|ticker)(?![A-Za-z])|"
+    + "|".join(re.escape(name) for name in sorted(_TW_NAME_MAP, key=len, reverse=True)),
+    re.IGNORECASE,
+)
+_INTENT_WINDOW = 12
+_CODE_LIST_SEP = r"(?:\s*[、,，/／&＆+＋和跟與及或]\s*|\s+)"
+_CODE_RUN_HEAD_RE = re.compile(rf"(?:(?<!\d)\d{{4,6}}{_CODE_LIST_SEP})+$")
+_CODE_RUN_TAIL_RE = re.compile(rf"(?:{_CODE_LIST_SEP}\d{{4,6}}(?!\d))+")
+_SENTENCE_END_RE = re.compile(r"[。！!？?\n]")
+_CODE_ONLY_ASK_RE = re.compile(
+    r"\s*(?:(?:@?咪寶|米堡|請問|問一下|幫我|幫忙|麻煩|查一下|查詢|查|看一下|看看|那麼|那|"
+    r"今天|今日|現在|目前|最近)[\s，,：:]*)*"
+    rf"\d{{4,6}}(?:{_CODE_LIST_SEP}\d{{4,6}})*"
+    r"[\s，,]*(?:(?:今天|今日|現在|目前|最近|明天|的|會|怎樣|怎麼樣|如何|表現|還好嗎|好嗎|呢|啊|啦)[\s，,]*)*"
+    r"[?？!！。.~～]*\s*"
+)
+_NOT_CODE_BEFORE_RE = re.compile(
+    r"(?:\d\s*[-－~～〜]|\d{1,2}[:：]\d{2}\s*(?:[到至或、/／,，]\s*)?|時間\s*[:：]?|"
+    r"(?:門牌|地址|住址|房間|房號|號碼|分機|電話|手機|市話|傳真|專線|區號|編號|序號|單號|訂單|"
+    r"帳號|卡號|密碼|驗證碼|車牌|車號|學號|座號|桌號|末四碼|後四碼|尾數)(?:號碼|號)?\s*(?:是|為)?\s*[:：#＃]?|"
+    r"[#＃]|西元|民國|公元)\s*$"
+)
+_NOT_CODE_AFTER_RE = re.compile(
+    r"\s*(?:[:：]\d{2}|[-－~～〜]\s*\d|(?:[到至或、/／,，]\s*)?\d{1,2}[:：]\d{2}|"
+    r"分(?:鐘)?(?![析享批紅散割配類點時])|出發|集合|起床|睡覺|開會|見面|碰面|會合|抵達|到達|出門|"
+    r"上班|下班|上課|下課|放學|報到|登機|起飛|降落|發車|開門(?!紅)|關門|打烊|吃飯|左右|"
+    r"(?:的|那|這)?(?:班|車次|高鐵|台鐵|火車|客運|公車|捷運|航班|班機|飛機)|"
+    r"號(?![稱召])|樓(?![上下主])|室|巷|弄|棟|房(?![地價市貸])|年(?![線報增減化均營]))"
+)
+
+
+def _non_code_number(text: str, start: int, end: int) -> bool:
+    """Digits that read as a time, an address/room/extension/phone number or a year."""
+    return bool(
+        _NOT_CODE_BEFORE_RE.search(text[max(0, start - 12):start])
+        or _NOT_CODE_AFTER_RE.match(text[end:end + 12])
+    )
+
+
+def _quote_intent_near(text: str, start: int, end: int) -> bool:
+    """Quote intent a few characters from the code, or from the code list it sits in."""
+    head = _CODE_RUN_HEAD_RE.search(text[max(0, start - 64):start])
+    if head:
+        start -= len(head.group(0))
+    tail = _CODE_RUN_TAIL_RE.match(text[end:end + 64])
+    if tail:
+        end += tail.end()
+    before = _SENTENCE_END_RE.split(text[max(0, start - _INTENT_WINDOW):start])[-1]
+    after = _SENTENCE_END_RE.split(text[end:end + _INTENT_WINDOW])[0]
+    return bool(_TW_CODE_INTENT_RE.search(before) or _TW_CODE_INTENT_RE.search(after))
+
+
+def _tw_code_wanted(text: str, start: int, end: int) -> bool:
+    """Whether the digits at ``text[start:end]`` are asked about as a TW listing."""
+    code = text[start:end]
+    if len(code) == 4 and code.startswith("0") and code not in _TW_4DIGIT_ETF_CODES:
+        return False
+    if _non_code_number(text, start, end):
+        return False
+    return _quote_intent_near(text, start, end) or bool(
+        len(text) <= 40 and _CODE_ONLY_ASK_RE.fullmatch(text)
+    )
+
+
+# A one-letter ticker (V, F, T…) only with explicit intent: $V, V 股價, V stock,
+# 美股 V — never 「V 字反轉」 or 「Plan B」.
+_LETTER_TICKER_BEFORE_RE = re.compile(r"(?:美股|股票|代號|ticker|stock)\s*[:：]?\s*$", re.IGNORECASE)
+_LETTER_TICKER_AFTER_RE = re.compile(
+    r"\s*(?:的\s*)?(?:股價|股票|報價|現價|收盤|開盤|走勢|stocks?|shares?|prices?|quotes?|ticker)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
+
+def _letter_ticker_wanted(text: str, start: int, end: int) -> bool:
+    before = text[max(0, start - 8):start]
+    if before.endswith("$"):
+        return True
+    return text[start:end].isupper() and bool(
+        _LETTER_TICKER_BEFORE_RE.search(before)
+        or _LETTER_TICKER_AFTER_RE.match(text[end:end + 12])
+        or (len(text) <= 4 and text.strip(" ?？") == text[start:end])
+    )
+
+
 # 2026-09-26: links are never tickers — `watch?v=` read as V (Visa), `/shorts/`
 # as SHORTS.  A ticker typed right after a link (「…?v=1，台積電2330」) still
 # counts for local parsing; the Yahoo name search never sees any part of a link.
@@ -449,22 +544,30 @@ def detect_symbols(text: str) -> list[str]:
     if _KOREA_MARKET_RE.search(text):
         korean_suffix = ".KQ" if re.search(r"KOSDAQ|코스닥", text, re.IGNORECASE) else ".KS"
         for match in _KOREA_NUMERIC_RE.finditer(text):
+            if _non_code_number(text, match.start(1), match.end(1)):
+                continue
             code = match.group(1)
             market_bound_numeric_codes.add(code)
             _add(f"{code}{korean_suffix}")
     elif _JAPAN_MARKET_RE.search(text):
         for match in _MARKET_NUMERIC_RE.finditer(text):
+            if _non_code_number(text, match.start(1), match.end(1)):
+                continue
             code = match.group(1)
             market_bound_numeric_codes.add(code)
             _add(f"{code}.T")
     elif _HONG_KONG_MARKET_RE.search(text):
         for match in _MARKET_NUMERIC_RE.finditer(text):
+            if _non_code_number(text, match.start(1), match.end(1)):
+                continue
             code = match.group(1)
             market_bound_numeric_codes.add(code)
             _add(f"{code}.HK")
     elif _TAIWAN_MARKET_RE.search(text):
         for match in _MARKET_NUMERIC_RE.finditer(text):
             if _numeric_amount(text, match.start(1), match.end(1)):
+                continue
+            if not _tw_code_wanted(text, match.start(1), match.end(1)):
                 continue
             code = match.group(1)
             market_bound_numeric_codes.add(code)
@@ -537,18 +640,26 @@ def detect_symbols(text: str) -> list[str]:
             continue
         if has_gold_market_query and not _has_explicit_numeric_stock_context(text):
             continue
+        if not _tw_code_wanted(text, m.start(1), m.end(1)):
+            continue
         _add(f"{code}.TW")
 
-    # 4. 0050 / 0056 等 ETF（4 位數 regex 會抓到，這邊保險再補）
+    # 4. 0050 / 0056 等 ETF（4 位數 regex 會抓到，這邊保險再補；同樣要有查價意圖）
     for code in ("0050", "0056", "0061", "00878", "00919", "00929"):
-        if re.search(rf"(?<!\d){code}(?!\d)", text):
+        if any(
+            _tw_code_wanted(text, m.start(), m.end())
+            for m in re.finditer(rf"(?<!\d){code}(?!\d)", text)
+        ):
             _add(f"{code}.TW")
 
-    # 5. 美股 ticker（用 \b word boundary，case insensitive）
+    # 5. 美股 ticker（用 \b word boundary，case insensitive；單字母要明確查價）
     for ticker in _US_TICKERS:
         # 處理 BRK.B 這類含點的 ticker
         pat = re.escape(ticker)
-        if re.search(rf"(?<!\w){pat}(?!\w)", text, re.IGNORECASE):
+        if any(
+            len(ticker) > 1 or _letter_ticker_wanted(text, m.start(), m.end())
+            for m in re.finditer(rf"(?<!\w){pat}(?!\w)", text, re.IGNORECASE)
+        ):
             _add(ticker)
 
     # Explicit uppercase US ticker outside the legacy common-ticker set.  A
@@ -562,6 +673,8 @@ def detect_symbols(text: str) -> list[str]:
             ):
                 continue
             ticker = match.group(1)
+            if len(ticker) == 1 and not _letter_ticker_wanted(text, match.start(1), match.end(1)):
+                continue
             if ticker not in _GENERIC_US_TICKER_STOPWORDS:
                 _add(ticker)
 
