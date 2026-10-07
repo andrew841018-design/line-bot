@@ -477,7 +477,28 @@ def _invoke_flush(
             return
         if superseded:
             return
+    # 延遲觀測：這批最早／最晚一則進 burst 到交給 main 等了幾秒（不記內容）。
+    # main 的 "burst flush triggered" 只拿得到 message_ids，所以記在這裡。
+    first_age_s, last_age_s = _pending_ages(pending)
+    logger.info(
+        "burst flush handoff group=%s n_msgs=%d first_age_s=%.2f last_age_s=%.2f",
+        group_id,
+        len(pending),
+        first_age_s,
+        last_age_s,
+    )
     _on_flush(group_id, combined_text, reply_token, message_ids)
+
+
+def _pending_ages(
+    pending: list[tuple[str, str, str | None, float]],
+) -> tuple[float, float]:
+    """(oldest, newest) seconds since add_to_burst queued them; logs only."""
+    stamps = [item[3] for item in pending]
+    if not stamps:
+        return 0.0, 0.0
+    now = time.time()
+    return now - min(stamps), now - max(stamps)
 
 
 # ── 規則匹配 ──────────────────────────────────────────────────────────────────

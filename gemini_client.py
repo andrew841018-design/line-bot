@@ -1469,6 +1469,24 @@ def _chose_no_reply(response) -> bool:
         return False
 
 
+def _log_chat_done(reply: str, model: str, started: float, attempts: int) -> str:
+    """Latency line for a generation ``_run`` returns normally; never the text.
+
+    ``attempts`` counts ``_run``'s own send attempts (empty-text / transient
+    retries), not the Chinese rewrite or ``_quality_gate`` retries; the
+    seconds include all of them.  Logging must never change the outcome, so
+    the length is read defensively.
+    """
+    logger.info(
+        "gemini chat done model=%s secs=%.2f attempts=%d len=%d",
+        model,
+        time.monotonic() - started,
+        attempts,
+        len(reply) if isinstance(reply, str) else 0,
+    )
+    return reply
+
+
 def _run(
     model: str,
     *,
@@ -1495,6 +1513,7 @@ def _run(
     details of the response behind the returned text are recorded in
     ``reply_provenance.record_grounding``.
     """
+    started = time.monotonic()
     chat_session = _client.chats.create(
         model=model,
         config=_build_config(
@@ -1526,15 +1545,16 @@ def _run(
                 # has nothing new; re-sending the same prompt only squeezes out
                 # an agree-and-restate reply and burns the 20-request budget.
                 logger.info("gemini chat: model chose not to reply")
-                return ""
+                return _log_chat_done("", model, started, attempt + 1)
             if text:
                 user_text = _extract_text(user_input)
                 trace_leaked, trace_reason = _violates_quality(text, user_text)
                 if trace_leaked and "internal trace leakage" in trace_reason:
-                    return _quality_gate(
+                    reply = _quality_gate(
                         chat_session, text, grounding_urls,
                         user_input, group_id, response=response, **gate,
                     )
+                    return _log_chat_done(reply, model, started, attempt + 1)
                 if not _is_chinese_majority(text):
                     logger.warning(
                         "gemini reply is not Chinese-majority, requesting Chinese rewrite"
@@ -1548,15 +1568,17 @@ def _run(
                         retry_urls = _extract_grounding_urls(retry_resp)
                         if retry_urls:
                             reply_provenance.mark_searched()
-                        return _quality_gate(
+                        reply = _quality_gate(
                             chat_session, retry_text,
                             retry_urls or grounding_urls,
                             user_input, group_id, response=retry_resp, **gate,
                         )
-                return _quality_gate(
+                        return _log_chat_done(reply, model, started, attempt + 1)
+                reply = _quality_gate(
                     chat_session, text, grounding_urls,
                     user_input, group_id, response=response, **gate,
                 )
+                return _log_chat_done(reply, model, started, attempt + 1)
             logger.warning(
                 "gemini chat attempt %d: empty text, retrying", attempt + 1
             )
