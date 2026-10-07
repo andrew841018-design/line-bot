@@ -6530,21 +6530,30 @@ def _handle_text_message(
     group_id: str,
 ) -> None:
     text = event.message.text or ""
-    # 咪寶選單（2026-10-05）：整則只是「選單」就回 Flex 按鈕卡片。放在最前面，
-    # 因為觸發詞不可能是取消／改期等提醒操作；偵測失敗時照常往下走。
+    # 咪寶選單（2026-10-05）：整則只是「選單」就回 Flex 按鈕卡片，「/大字選單」
+    # 回同一組按鈕的大字卡片。放在最前面，因為觸發詞不可能是取消／改期等提醒
+    # 操作；偵測失敗時照常往下走。
     # 觸發詞本身沒有內容，所以不取消別人正在累積的 burst。
-    menu_requested = False
+    menu_requested = large_menu_requested = False
     if "選單" in text and len(text) <= 64:  # 長貼文不用再多跑一次稱呼解析
         try:
             import flex_menu
 
-            menu_requested = flex_menu.is_menu_request(
-                text, _extract_gemini_trigger(text, event.message)
-            )
+            addressed_text = _extract_gemini_trigger(text, event.message)
+            menu_requested = flex_menu.is_menu_request(text, addressed_text)
+            large_menu_requested = flex_menu.is_large_menu_request(text, addressed_text)
         except Exception:
             logger.exception("flex menu detection failed; continuing normal routing")
     if menu_requested:
         _reply(event.reply_token, flex_menu.ALT_TEXT, group_id=group_id, menu_card=True)
+        return
+    if large_menu_requested:
+        _reply(
+            event.reply_token,
+            flex_menu.LARGE_ALT_TEXT,
+            group_id=group_id,
+            large_menu_card=True,
+        )
         return
     # Cancellation must run before quote-context expansion, one-shot replies,
     # calendar capture, classifiers, and reminder extraction.  Otherwise a
@@ -20111,6 +20120,7 @@ def _cancel_calendar_event(group_id: str, keyword: str) -> str:
 _HELP_TEXT = (
     "可用指令：\n"
     "  選單                    叫出按鈕選單（也可打 /選單）\n"
+    "  /大字選單               大字按鈕卡片（一直留在聊天裡，不會收起）\n"
     "【飲食】\n"
     "  /今晚煮什麼             用家裡現有食材推薦菜色\n"
     "  /該買什麼               待買食材清單\n"
@@ -20867,6 +20877,7 @@ def _reply(
     primary_reminder_ref: dict | None = None,
     primary_delivery: dict | None = None,
     menu_card: bool = False,
+    large_menu_card: bool = False,
 ) -> bool:
     """
     回覆 LINE 訊息。若帶 group_id,成功後會把 bot 的回覆也存進 raw_messages,
@@ -20890,6 +20901,8 @@ def _reply(
     傳卡片的 altText，照樣過檢查、寫進 raw_messages。卡片一律不搭到期提醒
     （Flex 被拒時錯誤不含 token，搭車的提醒會被標成不確定而卡住），也不 push
     fallback（會把 altText 當純文字推出去）；組卡失敗就不送並結案。
+
+    ``large_menu_card``（/大字選單）：同上，主訊息改成 flex_menu 的大字卡片。
     """
     if not text or not text.strip():
         if reply_provenance.dropped():
@@ -20932,14 +20945,18 @@ def _reply(
     # legacy pending branch 僅在 _PENDING_REPLY_ENABLED=True 的測試/rollback 場景會啟用。
     reply_targets = _consume_reply_mention_targets(reply_token)
     primary_message = None
-    if menu_card:
+    if menu_card or large_menu_card:
         include_auxiliary = False
         allow_push_fallback = False
         if not primary_suppressed:
             try:
                 import flex_menu
 
-                primary_message = flex_menu.menu_message()
+                primary_message = (
+                    flex_menu.large_menu_message()
+                    if large_menu_card
+                    else flex_menu.menu_message()
+                )
             except Exception:
                 logger.exception("flex menu card build failed group=%s", group_id)
                 text = ""

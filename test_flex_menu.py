@@ -1,9 +1,10 @@
-"""咪寶選單（Flex 按鈕卡片）測試。2026-10-05 加。"""
+"""咪寶選單（Flex 按鈕卡片）測試。2026-10-05 加，10-07 加大字版（/大字選單）。"""
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import time
 from datetime import date, timedelta
@@ -248,7 +249,8 @@ def test_long_text_mentioning_menu_skips_detection():
 
 def test_menu_card_has_exactly_one_call_site():
     source = Path(main.__file__).read_text(encoding="utf-8")
-    assert source.count("menu_card=True") == 1
+    # \b：不要把 large_menu_card=True 也算進來。
+    assert len(re.findall(r"\bmenu_card=True", source)) == 1
 
 
 # ── 按鈕送出的文字都接得到原本的處理（走完整 _handle_event） ───────────────
@@ -440,6 +442,7 @@ def test_help_text_has_no_mention_and_lists_the_menu():
     assert "@" not in main._HELP_TEXT
     assert "＠" not in main._HELP_TEXT
     assert "選單" in main._HELP_TEXT
+    assert "/大字選單" in main._HELP_TEXT
     for removed in ("/清除記憶", "/清除規則", "/忘記", "/採用"):
         assert removed not in main._HELP_TEXT
 
@@ -547,3 +550,186 @@ def test_silenced_member_quoting_a_bot_message_gets_normal_routing():
     reply, _complete = _handle_as_silenced(event, quotes_bot=True)
     reply.assert_called_once()
     assert reply.call_args.kwargs["menu_card"] is True
+
+
+# ── 大字選單：同一組按鈕、字放大的卡片（2026-10-07） ─────────────────────────
+# Andrew：「同時保留大圖版（不會收回去）的選單……唯一差別只是不會收回去＋大字」
+
+
+def _large_menu_buttons() -> list[dict]:
+    return flex_menu.build_large_menu()["body"]["contents"]
+
+
+def test_large_menu_has_the_same_buttons_in_the_same_order():
+    actions = [box["action"] for box in _large_menu_buttons()]
+    assert [(a["label"], a["text"]) for a in actions] == list(flex_menu.BUTTONS)
+    assert all(a["type"] == "message" for a in actions)
+
+
+def test_large_menu_uses_large_text():
+    menu = flex_menu.build_large_menu()
+    assert menu["size"] == "giga"
+    assert menu["header"]["contents"][0]["size"] == "3xl"
+    for box in _large_menu_buttons():
+        (label,) = box["contents"]
+        assert label["text"] == box["action"]["label"]
+        assert label["size"] == "xxl"
+
+
+def test_large_menu_respects_line_flex_limits():
+    menu = flex_menu.build_large_menu()
+    for box in _large_menu_buttons():
+        action = box["action"]
+        assert 0 < len(action["label"]) <= LABEL_MAX
+        assert 0 < len(action["text"]) <= ACTION_TEXT_MAX
+    assert 0 < len(flex_menu.LARGE_ALT_TEXT) <= ALT_TEXT_MAX
+    assert len(json.dumps(menu, ensure_ascii=False).encode("utf-8")) <= BUBBLE_MAX_BYTES
+
+
+def test_large_menu_round_trips_through_sdk_without_dropping_keys():
+    menu = flex_menu.build_large_menu()
+    assert FlexContainer.from_dict(menu).to_dict() == menu
+
+
+def test_large_menu_is_its_own_card():
+    message = flex_menu.large_menu_message()
+    assert isinstance(message, FlexMessage)
+    assert message.alt_text == flex_menu.LARGE_ALT_TEXT
+    assert message.to_dict()["contents"] == flex_menu.build_large_menu()
+    assert message.to_dict() != flex_menu.menu_message().to_dict()
+
+
+def test_large_menu_static_strings_survive_the_outbound_text_pipeline():
+    strings = [flex_menu.LARGE_ALT_TEXT, flex_menu.LARGE_TITLE, flex_menu.LARGE_SUBTITLE]
+    for s in strings:
+        assert main._md_to_line(s) == s
+    # 只有 altText 會當文字走 _reply 的檢查（_prepare_outbound_text、系統狀態抑制）。
+    assert (
+        main._prepare_outbound_text(flex_menu.LARGE_ALT_TEXT, source="reply")
+        == flex_menu.LARGE_ALT_TEXT
+    )
+    assert not main._is_system_status_outbound(flex_menu.LARGE_ALT_TEXT)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "大字選單", "/大字選單", "／大字選單", " /大字選單 ", "大字選單？", "/大字選單！",
+        "咪寶 大字選單", "咪寶大字選單", "@咪寶 /大字選單", "/ai 大字選單", "大字選單 咪寶",
+    ],
+)
+def test_large_menu_trigger_forms_are_accepted(text):
+    addressed = main._extract_gemini_trigger(text, _message(text))
+    assert "選單" in text  # _handle_text_message 的前置檢查
+    assert flex_menu.is_large_menu_request(text, addressed)
+    assert not flex_menu.is_menu_request(text, addressed)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["我要大字選單", "大字選單呢", "大字 選單", "/大字", "大字", "@爸爸 大字選單", "選單", "/選單"],
+)
+def test_non_large_menu_text_is_rejected(text):
+    addressed = main._extract_gemini_trigger(text, _message(text))
+    assert not flex_menu.is_large_menu_request(text, addressed)
+
+
+def test_large_menu_trigger_replies_with_card_before_any_reminder_route():
+    event = _event(_message("/大字選單"))
+    with (
+        patch("main._reply") as reply,
+        patch("main.burst_filter.cancel_burst") as cancel_burst,
+        patch("main._try_handle_reminder_cancellation") as cancellation,
+    ):
+        main._handle_text_message(event, "G_TEST")
+
+    reply.assert_called_once_with(
+        "TOKEN_MENU", flex_menu.LARGE_ALT_TEXT, group_id="G_TEST", large_menu_card=True
+    )
+    cancel_burst.assert_not_called()
+    cancellation.assert_not_called()
+
+
+@pytest.mark.parametrize("text", ["/大字選單", "大字選單"])
+def test_large_menu_reaches_the_card_through_the_whole_event_path(text, no_network):
+    before = _row_counts()
+    with patch("main._reply") as reply:
+        _handle_as_member(_event(_message(text)))
+
+    reply.assert_called_once_with(
+        "TOKEN_MENU", flex_menu.LARGE_ALT_TEXT, group_id="G_TEST", large_menu_card=True
+    )
+    assert _row_counts() == before
+
+
+def test_large_menu_card_has_exactly_one_call_site():
+    source = Path(main.__file__).read_text(encoding="utf-8")
+    assert source.count("large_menu_card=True") == 1
+
+
+def _reply_with_large_card(api, **overrides):
+    kwargs = dict(group_id="G_TEST", large_menu_card=True)
+    kwargs.update(overrides)
+    with (
+        patch("main.MessagingApi", return_value=api),
+        patch("main.ApiClient"),
+        patch.object(main, "_get_line_config", return_value=MagicMock()),
+    ):
+        return main._reply("TOKEN_MENU", flex_menu.LARGE_ALT_TEXT, **kwargs)
+
+
+def test_reply_sends_only_the_large_card_and_archives_alt_text():
+    api = _fake_line_api()
+    with (
+        patch.object(main.settings, "bot_muted", False),
+        patch.object(main.memory, "log_raw_message") as archive,
+        patch("reminder_push.due_reminders_for_reply") as due,
+    ):
+        ok = _reply_with_large_card(api, include_auxiliary=True)  # _reply 必須自己關掉搭車
+
+    assert ok is True
+    sent = api.reply_message.call_args[0][0].messages
+    assert len(sent) == 1
+    assert isinstance(sent[0], FlexMessage)
+    assert sent[0].to_dict() == flex_menu.large_menu_message().to_dict()
+    due.assert_not_called()
+    archive.assert_any_call("G_TEST", "SENT_1", "__bot__", flex_menu.LARGE_ALT_TEXT)
+
+
+def test_large_card_never_push_falls_back_even_if_caller_allows_it():
+    api = _fake_line_api(reply_side_effect=Exception("Invalid reply token"))
+    with patch.object(main.settings, "bot_muted", False):
+        ok = _reply_with_large_card(api, allow_push_fallback=True)
+
+    assert ok is False
+    api.push_message.assert_not_called()
+
+
+def test_large_card_build_failure_sends_nothing_and_closes_the_event():
+    api = _fake_line_api()
+    with (
+        patch.object(main.settings, "bot_muted", False),
+        patch("flex_menu.large_menu_message", side_effect=RuntimeError("bad card")),
+        patch.object(main, "_mark_inbound_reply_completed_no_reply") as complete,
+    ):
+        ok = _reply_with_large_card(api)
+
+    assert ok is False
+    api.reply_message.assert_not_called()
+    complete.assert_called_once_with("TOKEN_MENU")
+
+
+def test_large_card_is_not_sent_when_bot_is_muted():
+    api = _fake_line_api()
+    with patch.object(main.settings, "bot_muted", True):
+        ok = _reply_with_large_card(api)
+
+    assert ok is False
+    api.reply_message.assert_not_called()
+
+
+def test_silenced_member_unquoted_large_menu_gets_no_reply():
+    event = _event(_message("/大字選單"), user_id="U_SISTER")
+    reply, complete = _handle_as_silenced(event, quotes_bot=False)
+    reply.assert_not_called()
+    complete.assert_called_once_with("G_TEST", ["MSG_MENU"])
