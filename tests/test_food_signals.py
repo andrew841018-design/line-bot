@@ -1,4 +1,4 @@
-"""test_food_signals.py — 純規則抽取 7 種 relation + canonical + cancel + 餐廳黑名單 + 存 DB。"""
+"""test_food_signals.py — 純規則抽取 8 種 relation + canonical + cancel + 餐廳黑名單 + 存 DB。"""
 import pytest
 
 import food_db as fdb
@@ -215,4 +215,85 @@ def test_store_no_longer_needed_leaves_shopping_without_reaching_home():
     fs.extract_and_store(G, "m2", "蛋不用買了")
     assert fdb.query_shopping(G) == []
     assert fdb.query_inventory(G) == []
+    fdb.clear_group(G)
+
+
+# ── 2026-10-07 review：常見講法不能被新規則判錯 ─────────────────────────────
+
+
+@pytest.mark.parametrize("text, expected", [
+    # 「還有」在清單裡是「和」
+    ("要買蛋還有牛奶", {("wants_bought", "蛋"), ("wants_bought", "牛奶")}),
+    ("幫我買雞蛋還有豆腐", {("wants_bought", "蛋"), ("wants_bought", "豆腐")}),
+    ("要買蛋、牛奶，還有青菜", {("wants_bought", f) for f in ("蛋", "牛奶", "青菜")}),
+    ("我買了蛋還有牛奶", {(k, f) for k in ("bought", "has_food") for f in ("蛋", "牛奶")}),
+    ("冰箱還有蛋，還有牛奶", {("has_food", "蛋"), ("has_food", "牛奶")}),
+    ("要買牛奶，冰箱還有蛋", {("wants_bought", "牛奶"), ("has_food", "蛋")}),
+    # 「沒了」只管同一段
+    ("蛋還很多，牛奶沒了", {("finished_food", "牛奶")}),
+    ("牛奶還有半瓶，蛋沒了", {("finished_food", "蛋")}),
+    ("要買蛋、牛奶、豆腐，青菜沒了",
+     {("wants_bought", f) for f in ("蛋", "牛奶", "豆腐")} | {("finished_food", "青菜")}),
+    ("冰箱裡面有蛋、牛奶跟豆腐，可是青菜沒了",
+     {("has_food", f) for f in ("蛋", "牛奶", "豆腐")} | {("finished_food", "青菜")}),
+    ("蛋跟牛奶都沒了", {("finished_food", "蛋"), ("finished_food", "牛奶")}),
+    # 前一段的「買了」不算到自己那段說沒買的食物
+    ("買了牛奶，但蛋沒買到", {("bought", "牛奶"), ("has_food", "牛奶")}),
+    ("蛋買了，牛奶還沒買", {("bought", "蛋"), ("has_food", "蛋")}),
+    ("蛋買了 牛奶還要買", {("bought", "蛋"), ("has_food", "蛋")}),
+    ("我買了蛋，牛奶也要", {("bought", "蛋"), ("has_food", "蛋")}),
+    ("買了牛奶，蛋，青菜", {(k, f) for k in ("bought", "has_food") for f in ("牛奶", "蛋", "青菜")}),
+    # 「不用買了」不是「買了」
+    ("蛋不用買了，牛奶要買", {("skip_buying", "蛋")}),
+    # 「沒有蛋了」
+    ("冰箱沒有蛋了，要買蛋", {("finished_food", "蛋"), ("wants_bought", "蛋")}),
+    # 不是在問
+    ("我買了牛奶你呢", {("bought", "牛奶"), ("has_food", "牛奶")}),
+    ("冰箱不是還有蛋嗎", {("has_food", "蛋")}),
+    ("我買了蛋 你要吃嗎", {("bought", "蛋"), ("has_food", "蛋")}),
+    ("冰箱有蛋嗎 要買牛奶", {("wants_bought", "牛奶")}),
+    # 「X 我已經買了」
+    ("牛奶我已經買了喔", {("bought", "牛奶"), ("has_food", "牛奶")}),
+])
+def test_everyday_phrasings(text, expected):
+    assert _pairs(text) == expected
+
+
+@pytest.mark.parametrize("text", [
+    "可以幫我買蛋嗎", "可以幫我買蛋嗎？", "幫我買蛋好嗎", "你可以幫我買蛋嗎？謝謝", "可不可以幫我買蛋",
+])
+def test_polite_requests_still_go_on_the_list(text):
+    assert _pairs(text) == {("wants_bought", "蛋")}
+
+
+@pytest.mark.parametrize("text", [
+    "需要幫忙買蛋嗎？", "需不需要買蛋", "我在全聯 需不需要買蛋", "用不用買蛋", "怎麼不買蛋",
+    "冰箱還有蛋嗎～", "冰箱還有蛋嗎😅", "冰箱還有蛋嗎?!", "買了蛋嗎 我現在在全聯", "蛋沒了嗎 我去買",
+    "蛋不要買太多", "蛋不要買低脂的", "水果不要買太多，會壞掉",
+    "媽剛去市場買蛋回來", "我去全聯買的蛋放冰箱了", "去哪裡買蛋比較便宜", "去年買的醬油還沒用完",
+    "等你買了蛋回來再煮", "你買了蛋記得放冰箱", "今天買蛋好了", "蛋沒吃完",
+])
+def test_these_change_nothing(text):
+    assert _pairs(text) == set()
+
+
+@pytest.mark.parametrize("text", ["不用去全聯買蛋了", "不用幫我買蛋了", "蛋暫時不用買", "蛋不用買了啦", "不需要買蛋"])
+def test_more_ways_to_say_no_longer_needed(text):
+    assert _pairs(text) == {("skip_buying", "蛋")}
+
+
+@pytest.mark.parametrize("text", ["我買了雞排", "我買了蛋餅", "剛剛買了鹽酥雞", "中午買了排骨便當", "買了蛋糕", "買了珍珠奶茶"])
+def test_takeout_with_a_food_inside_its_name_records_nothing(text):
+    assert _pairs(text) == set()
+
+
+@pytest.mark.parametrize("text, food", [("我買了三個便當回去", "便當"), ("我在超商買了咖啡", "咖啡"), ("幫爸買了滷肉飯", "滷肉飯")])
+def test_ready_meals_bought_are_not_at_home(text, food):
+    assert _pairs(text) == {("bought", food)}
+
+
+def test_last_mention_in_a_message_decides():
+    fdb.clear_group(G)
+    fs.extract_and_store(G, "m1", "我以為家裡還有蛋，結果蛋吃完了，剛剛買了一盒蛋")
+    assert fdb.query_inventory(G) == ["蛋"]
     fdb.clear_group(G)

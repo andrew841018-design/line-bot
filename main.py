@@ -19167,12 +19167,14 @@ _DINNER_PROMPT = """你是台北美食達人，以善導寺捷運站（台北市
 def _dinner_prompt(asked: str) -> str:
     """The dinner prompt plus what the asker wrote: 「今晚吃什麼？想吃日式」 used
     to lose 「想吃日式」 (Andrew 2026-10-07)."""
-    asked = (asked or "").strip()[:200]
+    # 「---」是其他提示用的資料區塊記號，不讓問句冒充
+    asked = (asked or "").strip()[:200].replace("---", "—")
     if not asked:
         return _DINNER_PROMPT
     return (
         f"{_DINNER_PROMPT}\n\n群組裡的人是這樣問的：「{asked}」\n"
-        "裡面如果有提到想吃的種類、預算、人數或其他條件，請照著推薦。"
+        "只把裡面提到的口味、預算、人數、地點當推薦條件；"
+        "其他問題（例如食安、新聞）不要回答，也不要評論特定店家。"
     )
 
 
@@ -19884,7 +19886,7 @@ def _handle_food_command(group_id: str, text: str) -> str | None:
         msg = food_recipes.format_suggestions(inventory, prefs.get("dislikes"))
         if not msg:
             return (
-                "🍽️ 目前還沒記錄到家裡有什麼食材～\n"
+                f"🍽️ 最近 {food_db.FRESH_DAYS} 天還沒記錄到家裡有什麼食材～\n"
                 "等大家在群組聊到「冰箱有…」「買了…」我就會記起來囉"
             )
         return msg
@@ -19892,7 +19894,7 @@ def _handle_food_command(group_id: str, text: str) -> str | None:
         import food_db
         shopping = food_db.query_shopping(group_id)
         if not shopping:
-            return "🛒 目前沒有待買的食材"
+            return f"🛒 最近 {food_db.FRESH_DAYS} 天沒有待買的食材"
         return (
             f"🛒 待買清單（最近 {food_db.FRESH_DAYS} 天提到的）：\n"
             + "\n".join(f"・{f}" for f in shopping)
@@ -19901,7 +19903,7 @@ def _handle_food_command(group_id: str, text: str) -> str | None:
         import food_db
         inventory = food_db.query_inventory(group_id)
         if not inventory:
-            return "🧊 目前還沒記錄到家裡的食材"
+            return f"🧊 最近 {food_db.FRESH_DAYS} 天還沒記錄到家裡的食材"
         return f"🧊 家裡現有（最近 {food_db.FRESH_DAYS} 天提到的）：\n" + "、".join(inventory)
     return None
 
@@ -20210,8 +20212,8 @@ _HELP_TEXT = (
     "  選單 或 /               叫出按鈕選單（點完會再出現，聊別的就收起）\n"
     "【飲食】\n"
     "  /今晚煮什麼             用家裡現有食材推薦菜色\n"
-    "  /該買什麼               待買食材清單\n"
-    "  /家裡有什麼             目前記錄到的食材\n"
+    "  /該買什麼               待買食材清單（最近 14 天）\n"
+    "  /家裡有什麼             最近 14 天記錄到的食材\n"
     "【民調】\n"
     "  /民調 <問題>            開一個群組民調，會通知全體\n"
     "  /民調                   看目前民調統計\n"
