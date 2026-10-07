@@ -81,18 +81,15 @@ _OFFSET_LABEL: dict[int, str] = {
 def _format_event(e: dict, offset: int = 7) -> str:
     time_part = f" {e['event_time']}" if e["event_time"] else ""
     loc_part = f"\n📍 {e['location']}" if e["location"] else ""
-    try:
-        parts = json.loads(e["participants"] or "[]")
-    except Exception:
-        parts = []
-    ppl_part = f"\n👥 {'、'.join(parts)}" if parts else ""
     label = _OFFSET_LABEL.get(offset)
     if label is None:
         label = f"{abs(offset)} 天前" if offset < 0 else f"{offset} 天後"
+    # 「🎯 媽媽 家長會」: the people lead the title, so no 👥 line
+    # (Andrew 2026-10-07: 主詞放前面).  The @ line above still pings them.
     return (
         f"🔔 **{label}活動提醒**\n"
         f"📅 {e['event_date']}{time_part}\n"
-        f"🎯 {e['title']}{loc_part}{ppl_part}"
+        f"🎯 {calendar_db.event_shown_title(e)}{loc_part}"
     )
 
 

@@ -102,6 +102,17 @@ def _event_participants(event: Mapping[str, object]) -> list[str]:
     return participants
 
 
+def event_shown_title(event: Mapping[str, object]) -> str:
+    """「媽媽、爸爸 家長會」: the title with the people in front, as pushes,
+    receipts and the calendar list show an event (Andrew 2026-10-07: 主詞放前面)."""
+
+    import reminder_overview
+
+    return reminder_overview.subject_first(
+        str(event.get("title") or ""), _event_participants(event)
+    )
+
+
 def _merge_mention_aliases(*buckets: list[str] | None) -> list[str]:
     out: list[str] = []
     for aliases in buckets:
@@ -2027,10 +2038,16 @@ def find_active_events_exact(
     target_schedule = _event_schedule_minute_key(event_date, event_time)
     if not normalized_title or target_schedule is None:
         return []
+    # A pasted push shows the people first (「媽媽 家長會」); that reads as the
+    # event too.
     return [
         dict(row)
         for row in rows
-        if reminder_cancel.normalize_action(row["title"]) == normalized_title
+        if normalized_title
+        in {
+            reminder_cancel.normalize_action(row["title"]),
+            reminder_cancel.normalize_action(event_shown_title(dict(row))),
+        }
         and _event_schedule_minute_key(
             row["event_date"],
             row["event_time"],

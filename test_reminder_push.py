@@ -226,7 +226,9 @@ def test_due_reminder_mentions_structured_aliases_without_action_names(monkeypat
 
     assert len(due) == 1
     assert due[0]["text"].startswith("@媽媽 @測試成員甲\n⏰ 提醒（明天）\n")
-    assert "參加人：媽媽、測試成員甲" in due[0]["text"]
+    # 2026-10-07 主詞放前面: the people lead the action; no 參加人 line
+    assert "16:00 媽媽、測試成員甲 正子斷層掃描當天" in due[0]["text"]
+    assert "參加人" not in due[0]["text"]
     assert due[0]["message"].substitution["target"].mentionee.user_id == "U_MOM"
     assert due[0]["message"].substitution["p2"].mentionee.user_id == "U_SIS"
 
@@ -244,7 +246,7 @@ def test_due_reminder_keeps_unmapped_participant_visible(monkeypatch):
 
     assert len(due) == 1
     assert due[0]["text"].startswith("@哥哥\n⏰ 提醒（明天）\n")
-    assert "參加人：哥哥" in due[0]["text"]
+    assert due[0]["text"].endswith("16:00 哥哥 看醫生")  # 主詞放前面, no 參加人 line
     assert due[0]["message"].type == "text"
 
 

@@ -106,8 +106,11 @@ def people_names(raw: object) -> tuple[str, ...]:
 
 def subject_prefix(text: str, people: object) -> list[str]:
     """The names :func:`subject_first` puts in front of ``text``."""
+    import line_mentions
+
     names = [name for name in _names(people) if name not in text]
-    if any(name in _EVERYONE for name in names):
+    # all／大家／所有人… are the whole family: one 「全家」, as pushes say it
+    if any(name in _EVERYONE or line_mentions.is_all_participants([name]) for name in names):
         return [] if "全家" in text else ["全家"]
     return names
 
@@ -118,7 +121,23 @@ def subject_first(text: str, people: object) -> str:
     全家／all 算一個人，寫「全家」。
     """
     names = subject_prefix(text, people)
-    return f"{'、'.join(names)} {text}" if names else text
+    if not names:
+        return text
+    return f"{'、'.join(names)} {text}" if text else "、".join(names)
+
+
+def shown_names(shown: str, text: str) -> tuple[str, ...] | None:
+    """Undo :func:`subject_first`: the names in front of ``text`` in ``shown``.
+
+    () when ``shown`` is ``text`` itself, None when it is neither.  Normalize
+    both the same way first; nothing here checks that the names are people.
+    """
+    if shown == text:
+        return ()
+    if not text or not shown.endswith(" " + text):
+        return None
+    names = tuple(shown[: -len(text) - 1].split("、"))
+    return names if all(names) else None
 
 
 def _make_item(

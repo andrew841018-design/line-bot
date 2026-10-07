@@ -308,11 +308,12 @@ def test_maybe_extract_returns_group_confirmation_after_insert(temp_db, monkeypa
         "m1",
     )
 
+    # 2026-10-07 主詞放前面: the people lead 事項 (爸爸 is already in it); the
+    # 對象 line is gone and only a person LINE can ping gets an @ line on top.
     assert confirmation == (
         "已新增提醒\n"
         f"時間：{future:%Y-%m-%d} 10:30\n"
-        "事項：幫爸爸買按摩油\n"
-        "對象：@爸爸"
+        "事項：幫爸爸買按摩油"
     )
 
 
@@ -403,8 +404,7 @@ def test_month_only_vaccine_reminder_is_persisted_without_gemini_or_pending(
         "已新增提醒\n"
         "時間：2098-10-01 12:00（未指定日期，預設當月 1 日；"
         "未指定時間，預設 12:00）\n"
-        "事項：打流感和covid 的疫苗\n"
-        "對象：@爸爸"
+        "事項：爸爸 打流感和covid 的疫苗"
     )
 
 
@@ -1491,8 +1491,7 @@ def test_explicit_single_reminder_is_persisted_without_gemini_or_pending(
     assert confirmation == (
         "已新增提醒\n"
         "時間：2099-08-23 12:00（未指定時間，預設 12:00）\n"
-        "事項：領米\n"
-        "對象：@爸爸"
+        "事項：爸爸 領米"
     )
 
 

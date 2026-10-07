@@ -4177,7 +4177,8 @@ def _format_source_calendar_capture_confirmation(
         lines = [f"已新增 {len(events)} 筆提醒"]
         for event in events:
             lines.append(
-                f"{event['event_date']} {event['event_time']} {event['title']}"
+                f"{event['event_date']} {event['event_time']} "
+                f"{calendar_db.event_shown_title(event)}"
             )
         return ReminderReceipt("\n".join(lines), mirror_ids, mirror_ids, event_ids)
     event = events[0]
@@ -4186,7 +4187,7 @@ def _format_source_calendar_capture_confirmation(
             (
                 "已新增提醒",
                 f"時間：{event['event_date']} {event['event_time']}{time_note}",
-                f"事項：{event['title']}",
+                f"事項：{calendar_db.event_shown_title(event)}",
             )
         ),
         mirror_ids,
@@ -4480,7 +4481,7 @@ def _try_handle_missed_reminder_repair(
             (
                 heading,
                 f"時間：{event_data['event_date']} {event_data['event_time']}{time_note}",
-                f"事項：{event_data['title']}",
+                f"事項：{calendar_db.event_shown_title(event_data)}",
             )
         ),
         group_id=group_id,
@@ -5324,7 +5325,9 @@ def _try_handle_quoted_calendar_correction(
                 (
                     heading,
                     f"時間：{when}",
-                    f"事項：{persisted.get('title') or '未命名行程'}",
+                    "事項：" + calendar_db.event_shown_title(
+                        {**persisted, "title": persisted.get("title") or "未命名行程"}
+                    ),
                 )
             )
         elif status == "busy":
@@ -5447,13 +5450,13 @@ def _try_handle_reminder_cancellation(
                             "已取消後續提醒\n"
                             "這一則已開始傳送，仍可能送達。\n"
                             f"時間：{when}\n"
-                            f"事項：{cancelled_row['action']}"
+                            f"事項：{_reminder_shown_action(cancelled_row)}"
                         )
                     else:
                         reply = (
                             "已取消提醒\n"
                             f"時間：{when}\n"
-                            f"事項：{cancelled_row['action']}"
+                            f"事項：{_reminder_shown_action(cancelled_row)}"
                         )
                 elif result.get("status") == "ambiguous":
                     reply = (
@@ -5908,13 +5911,13 @@ def _try_handle_reminder_cancellation(
                             "已取消後續提醒\n"
                             "這一則已開始傳送，仍可能送達。\n"
                             f"時間：{when}\n"
-                            f"事項：{cancelled_row['action']}"
+                            f"事項：{_reminder_shown_action(cancelled_row)}"
                         )
                     else:
                         reply = (
                             "已取消提醒\n"
                             f"時間：{when}\n"
-                            f"事項：{cancelled_row['action']}"
+                            f"事項：{_reminder_shown_action(cancelled_row)}"
                         )
                 else:
                     # A sender or another cancellation may have won the race.
@@ -6207,11 +6210,34 @@ def _event_taipei_datetime(event: MessageEvent) -> datetime:
     return now
 
 
+def _reminder_shown_action(row: dict) -> str:
+    """「媽媽 家長會」: a reminder row as messages show it (Andrew 2026-10-07: 主詞放前面)."""
+    import reminder_overview
+
+    return reminder_overview.subject_first(str(row.get("action") or ""), row.get("mention_aliases"))
+
+
 def _loose_reminder_action(value: str) -> str:
     import reminder_cancel
 
     # Archived bot text went through _md_to_line, which drops * _ `.
     return reminder_cancel.normalize_action(re.sub(r"[*_`]", "", str(value or "")))
+
+
+def _quote_shows_reminder(
+    shown: str, row: dict, known: set[str], *, require_own: bool = True
+) -> bool:
+    """A quoted push or receipt shows this reminder: its action as stored, or
+    with the people first (Andrew 2026-10-07: 主詞放前面)."""
+    import reminder_cancel
+
+    return reminder_cancel.shown_action_matches(
+        {_loose_reminder_action(shown)},
+        re.sub(r"[*_`]", "", str(row.get("action") or "")),
+        row.get("mention_aliases"),
+        known,
+        require_own=require_own,
+    )
 
 
 def _quoted_reschedule_target(
@@ -6224,6 +6250,7 @@ def _quoted_reschedule_target(
     not a bot reminder; otherwise (refusal reason, None).
     """
     import calendar_db
+    import reminder_cancel
     import reminder_reschedule as rr
 
     quoted = memory.get_raw_message(group_id, quoted_message_id)
@@ -6259,23 +6286,28 @@ def _quoted_reschedule_target(
             return "not_generic", None
         if row["status"] != "pending":
             return "terminal", None
+        # The message may show the people first (「媽媽 家長會」); someone added
+        # to the reminder since then does not make the quote stale.
         if visible.status == rr.QUOTED_ONE and (
-            _loose_reminder_action(visible.action) != _loose_reminder_action(row["action"])
+            not _quote_shows_reminder(
+                visible.action, row, reminder_cancel.known_people([row]), require_own=False
+            )
             or int(visible.remind_at or 0) // 60 != int(row["remind_at"]) // 60
         ):
             return "stale_quote", None
         return "generic", row
     if not from_bot or visible.status == rr.QUOTED_NONE:
         return "none", None
-    key = _loose_reminder_action(visible.action)
     minute = int(visible.remind_at or 0) // 60
+    candidates = memory.list_reminder_cancellation_candidates(
+        group_id, include_cancelled=True, include_terminal=True
+    )
+    known = reminder_cancel.known_people(candidates)
     rows = [
         row
-        for row in memory.list_reminder_cancellation_candidates(
-            group_id, include_cancelled=True, include_terminal=True
-        )
-        if _loose_reminder_action(row["action"]) == key
-        and int(row["remind_at"]) // 60 == minute
+        for row in candidates
+        if int(row["remind_at"]) // 60 == minute
+        and _quote_shows_reminder(visible.action, row, known)
     ]
     pending = [row for row in rows if row["status"] == "pending"]
     if not rows:
@@ -6310,13 +6342,18 @@ def _reschedule_replay_reply(group_id: str, logged: dict) -> tuple[str, dict | N
             row["remind_at"] == new_at
             and memory.reminder_action_hash(row["action"]) == logged["new_action_hash"]
         ):
+            people = row.get("mention_aliases")
             if old_at == new_at and logged["old_action_hash"] == logged["new_action_hash"]:
-                reply = rr.unchanged_receipt(new_at, row["action"])
+                reply = rr.unchanged_receipt(new_at, row["action"], people)
             else:
-                reply = rr.updated_receipt(old_at, new_at, row["action"])
+                reply = rr.updated_receipt(old_at, new_at, row["action"], people)
         else:
             reply = rr.replay_receipt(
-                old_at, new_at, current_at=row["remind_at"], current_action=row["action"]
+                old_at,
+                new_at,
+                current_at=row["remind_at"],
+                current_action=row["action"],
+                people=row.get("mention_aliases"),
             )
         if not _reschedule_receipt_displayable(reply):
             return fallback
@@ -6414,10 +6451,11 @@ def _apply_quoted_reschedule(
         return status, rr.refusal_text(status), None
     old_at = int(row["remind_at"])
     unchanged = new_at == old_at and new_action == row["action"]
+    people = row.get("mention_aliases")
     planned = (
-        rr.unchanged_receipt(old_at, new_action)
+        rr.unchanged_receipt(old_at, new_action, people)
         if unchanged
-        else rr.updated_receipt(old_at, new_at, new_action)
+        else rr.updated_receipt(old_at, new_at, new_action, people)
     )
     if not _reschedule_receipt_displayable(planned):
         return "display_unsafe", rr.refusal_text("display_unsafe"), None
@@ -6571,7 +6609,7 @@ def _handle_text_message(
         if status in {"updated", "unchanged"}:
             saved = memory.get_reminder(restated["reminder_id"])
             when = datetime.fromtimestamp(saved["remind_at"], ZoneInfo("Asia/Taipei"))
-            reply = f"已更新提醒\n時間：{when:%Y-%m-%d %H:%M}\n事項：{saved['action']}"
+            reply = f"已更新提醒\n時間：{when:%Y-%m-%d %H:%M}\n事項：{_reminder_shown_action(saved)}"
         else:
             reply = "尚未更新提醒：無法安全確認唯一事項，或提醒正在處理中。請回覆原始提醒再更正。"
         burst_filter.cancel_burst(group_id)
@@ -10353,24 +10391,23 @@ _TYPE_EMOJI: dict[str, str] = {
 
 
 def _format_calendar_event(ev: dict) -> str:
-    """events row → reply text。Plan C：用 event_type emoji 區分三類。"""
-    import json as _json
-    title = ev.get("title", "")
+    """events row → reply text。Plan C：用 event_type emoji 區分三類。
+
+    The people lead the title, 「媽媽、爸爸 家長會」 (Andrew 2026-10-07: 主詞放前面).
+    """
+    import calendar_db
+
     date_s = ev.get("event_date", "")
     time_s = ev.get("event_time") or ""
     location = ev.get("location") or ""
     et = ev.get("event_type") or "family_gathering"
     emoji = _TYPE_EMOJI.get(et, "🗓️")
-    parts_raw = ev.get("participants") or "[]"
-    try:
-        parts = _json.loads(parts_raw) if isinstance(parts_raw, str) else parts_raw
-    except Exception:
-        parts = []
-    lines = [f"{emoji} {date_s}" + (f" {time_s}" if time_s else "") + f" {title}"]
+    lines = [
+        f"{emoji} {date_s}" + (f" {time_s}" if time_s else "")
+        + f" {calendar_db.event_shown_title(ev)}"
+    ]
     if location:
         lines.append(f"📍 {location}")
-    if parts:
-        lines.append(f"👥 {' / '.join(parts)}")
     return "\n".join(lines)
 
 
@@ -10411,14 +10448,6 @@ _TODO_DETAIL_QUERY_RE = re.compile(r"(?:細節|詳細|完整|網址|連結|驗�
 _REMINDER_TIMING_MARKER_RE = re.compile(r"(?:什麼時候|何時|哪一天|哪天|幾點)")
 _REMINDER_TIMING_KEYWORD_ALIASES: dict[str, tuple[str, ...]] = {
     "壁球": ("壁球", "squash"),
-}
-_REMINDER_KNOWN_MENTION_ALIASES = {
-    "爸爸",
-    "媽媽",
-    "姊姊",
-    "妹妹",
-    "弟弟",
-    *line_mentions.configured_family_aliases(include_short=True),
 }
 _REMINDER_DETAIL_PREFIXES = ("地點", "預約編號", "接送網址", "票券驗證碼", "驗證碼")
 
@@ -11101,7 +11130,16 @@ def _text_message_with_mentions(
             seen_user_ids.add(user_id)
             seen_labels.add(label)
         if targets:
-            message_dict = line_mentions.text_v2_dict(reply_text, targets)
+            body, plain_labels = reply_text, None
+            first, newline, rest = reply_text.partition("\n")
+            tokens = first.split()
+            if newline and rest.strip() and tokens and all(
+                token[0] in "@＠" and len(token) > 1 for token in tokens
+            ):
+                # The text opens with its own @ line (a reminder receipt):
+                # ping there instead of adding a second line of the same names.
+                body, plain_labels = rest, [token.replace("＠", "@") for token in tokens]
+            message_dict = line_mentions.text_v2_dict(body, targets, plain_labels)
             return reply_text, line_mentions.sdk_message_from_text_v2_dict(
                 message_dict,
                 quote_token=quote_token,
@@ -11160,23 +11198,6 @@ def _normalize_reminder_detail_line(clean: str) -> str:
     return clean
 
 
-def _format_reminder_participants(mentions: list[str] | tuple[str, ...] | None) -> str:
-    labels: list[str] = []
-    for raw in mentions or []:
-        name = str(raw or "").strip().lstrip("@")
-        if not name:
-            continue
-        if name == "全家":
-            label = "@all"
-        elif name in _REMINDER_KNOWN_MENTION_ALIASES:
-            label = f"@{name}"
-        else:
-            label = name
-        if label not in labels:
-            labels.append(label)
-    return "、".join(labels)
-
-
 def _format_reminder_report_item(item: dict, index: int) -> list[str]:
     action_title, action_details = _split_action_detail(str(item.get("action") or ""))
     lines = [
@@ -11204,9 +11225,6 @@ def _format_reminder_report_item(item: dict, index: int) -> list[str]:
     merged = _merged_detail_line(item.get("merged_details") or [], action_title, lines)
     if merged:
         lines.append(merged)
-    participants = _format_reminder_participants(item.get("mention_aliases") or [])
-    if participants:
-        lines.append(f"參加人：{participants}")
     return lines
 
 
@@ -11292,14 +11310,14 @@ def _format_todo_overview_line(entry, index: int) -> str:
 def _format_reminder_entry_details(entry, index: int) -> list[str]:
     import reminder_overview
 
-    item = dict(entry.rows[0], action=entry.action, mention_aliases=[])
+    item = dict(entry.rows[0], action=entry.action)
     if not item.get("source_text"):
         item["source_text"] = next(
             (row.get("source_text") for row in entry.rows if row.get("source_text")), ""
         )
     lines = _format_reminder_report_item(item, index)
     lines[0] = f"{index}. {_fmt_overview_when(entry.event_date, entry.clock, no_clock='時間待補')}"
-    # 人放在事項最前面（主詞放前面），不再另列參加人：那一行的 @ 會真的提醒到每個人
+    # 人放在事項最前面（主詞放前面），沒有另一行參加人（那一行的 @ 會真的提醒到每個人）
     people = [name for name in entry.people if name not in entry.action]
     lines[1] = "事項：" + reminder_overview.subject_first(lines[1].removeprefix("事項："), people)
     return lines
@@ -17849,17 +17867,31 @@ def _format_reminder_write_confirmation(
         )
     elif time_default_kind in {"no_daypart", True}:
         time_line += "（未指定時間，預設 12:00）"
+    import reminder_overview
+
+    aliases = [str(alias).strip().lstrip("@") for alias in mention_aliases or []]
+    aliases = [alias for idx, alias in enumerate(aliases) if alias and alias not in aliases[:idx]]
+    # 「事項：媽媽 家長會」 (Andrew 2026-10-07: 主詞放前面).  The old 對象 line
+    # pinged them; the @ line on top now does, like a push.
     lines = [
         titles.get(outcome, "提醒已處理"),
         time_line,
-        f"事項：{str(action or '').strip()}",
+        f"事項：{reminder_overview.subject_first(str(action or '').strip(), aliases)}",
     ]
     if detail_line:
         lines.append(detail_line)
-    aliases = [str(alias).strip().lstrip("@") for alias in mention_aliases or []]
-    aliases = [alias for idx, alias in enumerate(aliases) if alias and alias not in aliases[:idx]]
-    if aliases:
-        lines.append("對象：" + "、".join(f"@{alias}" for alias in aliases))
+    mentions: list[str] = []
+    for alias in aliases:
+        if alias.casefold() == "all":
+            mention = "@all"
+        elif line_mentions.user_id_for_alias(alias):
+            mention = f"@{alias}"
+        else:
+            continue  # the old line never pinged it either; 事項 names it
+        if mention not in mentions:
+            mentions.append(mention)
+    if mentions:
+        lines.insert(0, " ".join(mentions))
     return "\n".join(lines)
 
 

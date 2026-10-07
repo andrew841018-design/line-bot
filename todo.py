@@ -300,19 +300,27 @@ def _push(group_id: str, text: str) -> bool:
     return try_push_text(group_id, text, timeout=10)
 
 
+def _owner_first(todo_row: dict) -> str:
+    """「媽媽 繳學費」: whose todo, by family name, then the task (Andrew
+    2026-10-07: 主詞放前面; the end of a user id told nobody who it was)."""
+    import line_mentions
+    import reminder_overview
+
+    owner = line_mentions.alias_for_user_id(str(todo_row.get("sender_user_id") or "")) or ""
+    return reminder_overview.subject_first(str(todo_row.get("task") or ""), [owner] if owner else [])
+
+
 def _format_reminder(todos_due: list[dict], todos_overdue: list[dict]) -> str:
     """Compose daily reminder message."""
     lines = ["📋 今日 TODO 提醒"]
     if todos_due:
         lines.append("\n🔔 今天到期：")
         for t in todos_due:
-            sender = (t.get("sender_user_id") or "")[-6:] or "?"
-            lines.append(f"- [{sender}] {t['task']}")
+            lines.append(f"- {_owner_first(t)}")
     if todos_overdue:
         lines.append("\n⚠️ 已逾期 (7 天內):")
         for t in todos_overdue:
-            sender = (t.get("sender_user_id") or "")[-6:] or "?"
-            lines.append(f"- [{sender}] {t['task']} (due {t['due_date']})")
+            lines.append(f"- {_owner_first(t)} (due {t['due_date']})")
     return "\n".join(lines)
 
 

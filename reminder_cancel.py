@@ -885,26 +885,40 @@ def _candidate_epoch_seconds(value: object) -> int | None:
     return int(parsed.timestamp())
 
 
-def _shown_action_matches(
+def known_people(candidates: Iterable[Mapping[str, object]]) -> set[str]:
+    """Everyone the reminders name, normalized, plus 全家."""
+
+    return {"全家"} | {
+        normalize_action(name)
+        for candidate in candidates
+        for name in reminder_overview.people_names(candidate.get("mention_aliases"))
+    }
+
+
+def shown_action_matches(
     reference_actions: set[str],
     action: str,
     people: object,
-    known_people: set[str],
+    known: set[str],
+    *,
+    require_own: bool = True,
 ) -> bool:
     """The reference names this action as the bot shows it: as stored, or with
-    the people in front (「成員甲、成員乙 家長會」, the reminder list since
-    2026-10-07).  The names in front must all be people the reminders know, and
-    include this reminder's own, so 「買 牛奶」 never reads as 「牛奶」."""
+    the people in front (「成員甲、成員乙 家長會」, every reminder message since
+    2026-10-07).  The names in front must all be people the reminders know (so
+    「買 牛奶」 never reads as 「牛奶」) and, with ``require_own``, include this
+    reminder's own, so the name tells two same-time reminders apart."""
 
     key = normalize_action(action)
-    if key in reference_actions:
-        return True
     own = {normalize_action(name) for name in reminder_overview.subject_prefix(action, people)}
     for shown in reference_actions:
-        if not shown.endswith(" " + key):
+        names = reminder_overview.shown_names(shown, key)
+        if names is None:
             continue
-        names = {normalize_action(name) for name in shown[: -len(key) - 1].split("、")}
-        if "" not in names and names <= known_people and ("全家" in names or own <= names):
+        if not names:
+            return True
+        named = set(names)
+        if named <= known and (not require_own or "全家" in named or own <= named):
             return True
     return False
 
@@ -936,11 +950,7 @@ def resolve_cancel_request(
     reference_actions = _normalized_action_variants(reference)
     reference_minute = reference.remind_at // 60
     candidates = list(candidates)
-    known_people = {"全家"} | {
-        normalize_action(name)
-        for candidate in candidates
-        for name in reminder_overview.people_names(candidate.get("mention_aliases"))
-    }
+    known = known_people(candidates)
     matches: list[tuple[int, str, int]] = []
     for candidate in candidates:
         try:
@@ -961,11 +971,11 @@ def resolve_cancel_request(
         else:
             is_match = bool(
                 remind_at // 60 == reference_minute
-                and _shown_action_matches(
+                and shown_action_matches(
                     reference_actions,
                     action,
                     candidate.get("mention_aliases"),
-                    known_people,
+                    known,
                 )
             )
         if is_match:

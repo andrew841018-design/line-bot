@@ -891,16 +891,26 @@ def format_when(epoch: int) -> str:
     return datetime.fromtimestamp(int(epoch), TAIPEI).strftime("%Y-%m-%d %H:%M")
 
 
-def updated_receipt(old_at: int, new_at: int, action: str) -> str:
+def _shown(action: str, people: object) -> str:
+    """「媽媽 家長會」 (Andrew 2026-10-07: 主詞放前面)."""
+    import reminder_overview
+
+    return reminder_overview.subject_first(action, people)
+
+
+def updated_receipt(old_at: int, new_at: int, action: str, people: object = ()) -> str:
     if int(old_at) == int(new_at):
         head = "已更新提醒（時間不變，地點已更新）"
     else:
         head = f"已更新提醒（{format_when(old_at)} → {format_when(new_at)}）"
-    return f"{head}\n時間：{format_when(new_at)}\n事項：{action}"
+    return f"{head}\n時間：{format_when(new_at)}\n事項：{_shown(action, people)}"
 
 
-def unchanged_receipt(remind_at: int, action: str) -> str:
-    return f"提醒本來就是這個時間，沒有變更。\n時間：{format_when(remind_at)}\n事項：{action}"
+def unchanged_receipt(remind_at: int, action: str, people: object = ()) -> str:
+    return (
+        f"提醒本來就是這個時間，沒有變更。\n時間：{format_when(remind_at)}"
+        f"\n事項：{_shown(action, people)}"
+    )
 
 
 def replay_receipt(
@@ -909,13 +919,14 @@ def replay_receipt(
     *,
     current_at: int | None = None,
     current_action: str | None = None,
+    people: object = (),
 ) -> str:
     head = f"這則更正先前已處理（{format_when(old_at)} → {format_when(new_at)}）"
     if current_at is None or current_action is None:
         return head + "。"
     return (
         f"{head}，之後提醒又被改過。\n"
-        f"時間：{format_when(current_at)}\n事項：{current_action}"
+        f"時間：{format_when(current_at)}\n事項：{_shown(current_action, people)}"
     )
 
 
