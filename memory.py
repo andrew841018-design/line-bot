@@ -996,6 +996,27 @@ def log_raw_message(
         _EMBED_INFLIGHT.release()
 
 
+def raw_message_sender_near(
+    group_id: str, at_ts: int, quote: str = "", window_sec: int = 180
+) -> str | None:
+    """The one family member who sent ``quote`` (or, failing that, the only one
+    who wrote anything) in the ``window_sec`` before ``at_ts``; else None.
+
+    Repairs finance views stored before 2026-10-07 without their speaker.
+    """
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT user_id, text FROM raw_messages "
+            "WHERE group_id = ? AND created_at BETWEEN ? AND ? "
+            "AND user_id IS NOT NULL AND user_id NOT IN ('', '__bot__')",
+            (group_id, int(at_ts) - int(window_sec), int(at_ts) + 5),
+        ).fetchall()
+    needle = "".join((quote or "").split())
+    quoted = {uid for uid, text in rows if needle and needle in "".join((text or "").split())}
+    candidates = quoted or {uid for uid, _text in rows}
+    return next(iter(candidates)) if len(candidates) == 1 else None
+
+
 def get_raw_message(group_id: str, message_id: str) -> tuple[str | None, str] | None:
     """查原始訊息。回傳 (user_id, text) 或 None。"""
     with _conn() as c:

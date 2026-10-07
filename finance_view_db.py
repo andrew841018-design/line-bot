@@ -149,6 +149,15 @@ def insert_view(
     return view_id
 
 
+def set_speaker(view_id: str, user_id: str, display_name: str, db_path: Path | str | None = None) -> None:
+    """Fill in who said a view (rows stored before 2026-10-07 say 自己／家人)."""
+    with _lock, _conn(db_path) as c:
+        c.execute(
+            "UPDATE finance_views SET user_id = ?, display_name = ? WHERE view_id = ?",
+            (user_id, display_name, view_id),
+        )
+
+
 def list_recent(group_id: str, limit: int = 10) -> list[dict]:
     with _lock, _conn() as c:
         c.row_factory = sqlite3.Row

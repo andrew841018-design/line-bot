@@ -11274,21 +11274,34 @@ def _fmt_overview_when(event_date, clock: str | None, *, no_clock: str = "") -> 
 
 
 def _format_todo_overview_line(entry, index: int) -> str:
-    """「1. 10/12（日）14:00 家長會（媽媽）」: when, what, who; no details, no @."""
+    """「1. 10/12（日）14:00 媽媽 家長會」: when, who, what; no details, no @.
+
+    The person comes first (Andrew 2026-10-07: 主詞放前面); someone already in
+    the wording (「媽媽回診（姊姊陪同）」) is not repeated.
+    """
+    import reminder_overview
+
     title = _split_action_detail(entry.action)[0]
-    people = [name for name in entry.people if name not in title]
-    who = f"（{'、'.join(people)}）" if people else ""
-    return f"{index}. {_fmt_overview_when(entry.event_date, entry.clock)} {title}{who}"
+    people = [name for name in entry.people if name not in entry.action]
+    return (
+        f"{index}. {_fmt_overview_when(entry.event_date, entry.clock)} "
+        f"{reminder_overview.subject_first(title, people)}"
+    )
 
 
 def _format_reminder_entry_details(entry, index: int) -> list[str]:
-    item = dict(entry.rows[0], action=entry.action, mention_aliases=list(entry.people))
+    import reminder_overview
+
+    item = dict(entry.rows[0], action=entry.action, mention_aliases=[])
     if not item.get("source_text"):
         item["source_text"] = next(
             (row.get("source_text") for row in entry.rows if row.get("source_text")), ""
         )
     lines = _format_reminder_report_item(item, index)
     lines[0] = f"{index}. {_fmt_overview_when(entry.event_date, entry.clock, no_clock='時間待補')}"
+    # 人放在事項最前面（主詞放前面），不再另列參加人：那一行的 @ 會真的提醒到每個人
+    people = [name for name in entry.people if name not in entry.action]
+    lines[1] = "事項：" + reminder_overview.subject_first(lines[1].removeprefix("事項："), people)
     return lines
 
 
@@ -11407,10 +11420,8 @@ def _build_todo_status_reply(group_id: str, clean_text: str = "") -> str:
         lines.append("\n待辦事項：")
         for entry in todo_entries[:10]:
             item = entry.todos[0]
-            owner_part = f"（{item['owner']}）" if item.get("owner") else ""
-            lines.append(
-                f"- {_fmt_todo_date(item.get('due_date') or None)} {item.get('task', '')}{owner_part}"
-            )
+            task = reminder_overview.subject_first(str(item.get("task") or ""), item.get("owner"))
+            lines.append(f"- {_fmt_todo_date(item.get('due_date') or None)} {task}")
 
     if reminder_entries:
         lines.append("\n提醒事項：")
@@ -12399,14 +12410,45 @@ def _retryable_burst_db_call(operation, *args, **kwargs):
         raise
 
 
-def _start_burst_finance_extraction(group_id: str, combined_text: str) -> None:
-    """Start the best-effort finance side task after retry-safe work is done."""
+def _finance_speaker_name(group_id: str, user_id: str | None) -> str:
+    """The family name of whoever wrote a finance view; '' when unknown."""
+    if not user_id:
+        return ""
+    try:
+        import line_mentions
+
+        name = line_mentions.alias_for_user_id(user_id) or ""
+    except Exception:
+        name = ""
+    name = name or _alias_from_user_id(user_id)
+    if not name:
+        display = _get_member_display_name(group_id, user_id)
+        name = "" if display in ("群組成員", "某人") else display
+    return name
+
+
+def _start_burst_finance_extraction(
+    group_id: str, combined_text: str, message_ids: list | None = None
+) -> None:
+    """Start the best-effort finance side task after retry-safe work is done.
+
+    Each message's sender goes along, so a view is stored under the name of
+    whoever said it, never 「自己」 (Andrew 2026-10-07).
+    """
     try:
         if _gemini_side_task_allowed("finance_view_extract"):
             import finance_view_extractor
 
+            speakers = []
+            for message_id in message_ids or []:
+                raw = memory.get_raw_message(group_id, str(message_id))
+                if raw and raw[1]:
+                    speakers.append((str(message_id), raw[0] or "", raw[1]))
             finance_view_extractor.maybe_extract_and_save_async(
-                group_id, combined_text
+                group_id,
+                combined_text,
+                speakers=speakers,
+                resolve_speaker=lambda user_id: _finance_speaker_name(group_id, user_id),
             )
     except Exception as exc:
         logger.debug("finance_view extract skipped: %s", exc)
@@ -12466,7 +12508,7 @@ def _handle_burst_flush(
 
     from types import SimpleNamespace
     if not has_quote_context(combined_text) and _requires_public_research(combined_text):
-        _start_burst_finance_extraction(group_id, combined_text)
+        _start_burst_finance_extraction(group_id, combined_text, message_ids)
         _handle_web_research_question(
             SimpleNamespace(source=SimpleNamespace(user_id=""), reply_token=reply_token),
             group_id, combined_text, addressed=False,
@@ -12498,7 +12540,7 @@ def _handle_burst_flush(
                 reply_token, group_id=group_id, message_ids=message_ids
             )
             return
-        _start_burst_finance_extraction(group_id, combined_text)
+        _start_burst_finance_extraction(group_id, combined_text, message_ids)
         _reply(
             reply_token,
             cached,
@@ -12654,7 +12696,7 @@ def _handle_burst_flush(
         memory.append_turn, group_id, "user", f"[burst]\n{combined_text}"
     )
     _append_bot_turn(group_id, reply_text)
-    _start_burst_finance_extraction(group_id, combined_text)
+    _start_burst_finance_extraction(group_id, combined_text, message_ids)
     _maybe_extract_facts(group_id)
     _burst_capture_calendar_event(group_id, combined_text, message_ids)
     _reply(
@@ -19812,6 +19854,13 @@ def _handle_finance_view_command(group_id: str, text: str) -> str | None:
         elif not person:
             person = tok
 
+    if person:
+        try:
+            import line_mentions
+
+            person = line_mentions.configured_family_alias_mapping().get(person, person)
+        except Exception:
+            pass
     if ticker:
         views = finance_view_db.list_by_ticker(group_id, ticker, limit=10)
         header = f"📈 {ticker} 相關家族觀點"
@@ -19851,6 +19900,7 @@ def _format_finance_views(views: list[dict], header: str) -> str:
         summary = f"共 {len(views)} 條觀點，{pending + na} 仍待驗。"
 
     lines = [header, "", summary, ""]
+    names: dict[str, str] = {}
     for v in views[:10]:
         label = v.get("ticker") or v.get("macro_topic") or "?"
         d = v.get("direction") or ""
@@ -19866,9 +19916,37 @@ def _format_finance_views(views: list[dict], header: str) -> str:
             created = _dt.fromtimestamp(v["created_at"] / 1000, tz=tw).strftime("%m-%d")
         except Exception:
             created = "??"
-        speaker = v.get("display_name") or "家人"
+        speaker = _finance_view_speaker(v, names)
         lines.append(f"• {created} {speaker} {label} {dir_str}{target} {result_str}")
     return "\n".join(lines)
+
+
+def _finance_view_speaker(view: dict, names: dict[str, str]) -> str:
+    """Who said a view. Rows stored before 2026-10-07 can say 自己／家人: look the
+    sender up again (by user_id, or by the message around that moment) and save it."""
+    import finance_view_extractor
+
+    speaker = view.get("display_name") or ""
+    if speaker and speaker not in finance_view_extractor.AMBIGUOUS_SPEAKERS:
+        return speaker
+    group_id = view.get("group_id") or ""
+    user_id = view.get("user_id") or ""
+    try:
+        if not user_id and view.get("created_at"):
+            user_id = memory.raw_message_sender_near(
+                group_id, int(view["created_at"]) // 1000, view.get("raw_text") or ""
+            ) or ""
+        if user_id and user_id not in names:
+            names[user_id] = _finance_speaker_name(group_id, user_id)
+        name = names.get(user_id, "") if user_id else ""
+        if name and view.get("view_id"):
+            import finance_view_db
+
+            finance_view_db.set_speaker(view["view_id"], user_id, name)
+    except Exception as exc:
+        logger.debug("finance view speaker repair skipped: %s", exc)
+        name = ""
+    return name or "家人"
 
 
 def _handle_food_command(group_id: str, text: str) -> str | None:

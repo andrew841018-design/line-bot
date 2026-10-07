@@ -10,6 +10,9 @@
 - prefilter 命中財經 lexicon 才送 Gemini（省 quota，今日已 6.4x 超載）
 - 用 settings.gemini_light_model（gemini-2.5-flash-lite）+ thinking_budget=0
 - fail-soft（不擋 burst 主流程）
+- 誰說的由程式決定（2026-10-07 Andrew：「自己看多」誰知道自己是誰）：每則訊息
+  標上發話者的名字再送 Gemini，存的人名、user_id、訊息 id 都取自那則訊息的發話者，
+  不收「自己／我／家人」這種稱呼。
 """
 
 from __future__ import annotations
@@ -19,13 +22,14 @@ import logging
 import re
 import threading
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Callable, Optional, Sequence
 from zoneinfo import ZoneInfo
 
 from google.genai import types
 
 import finance_view_db
 import gemini_client
+import quote_context
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -70,6 +74,8 @@ _PROMPT = """你是家族 LINE 群財經觀點記錄員。從下面對話判斷�
 
 今天是 {today}。
 
+每則訊息前面標著［編號］和發話者的名字。觀點裡的「我／自己」就是那則訊息的發話者。
+
 【對話】
 {dialogue}
 
@@ -86,7 +92,8 @@ _PROMPT = """你是家族 LINE 群財經觀點記錄員。從下面對話判斷�
 - target_pct: 目標漲跌幅 %（數字）或 null
 - confidence: "low" | "mid" | "high"
 - condition_text: 條件句（例「若 Fed 升息則」）或 null
-- speaker_hint: 提出人的稱謂（媽媽 / 爸爸 / 妹妹 / 弟弟 / 姊姊 / 自己），無法判斷則 null
+- msg_index: 這個觀點出自哪一則訊息（［編號］的數字），看不出來則 null
+- speaker_hint: 這個觀點是誰的。通常就是那則訊息的發話者；發話者在轉述別人時（例「媽媽說 0050 會漲」）填被轉述的人。不要填「自己」「我」，看不出來則 null
 - raw_quote: 原始一句話（< 80 字）
 
 只回 JSON array（即使 0 個也回 []），不要 markdown：
@@ -209,9 +216,72 @@ def _normalize(view: dict) -> dict:
         "confidence": confidence,
         "condition_text": _s("condition_text", 200),
         "speaker_hint": _s("speaker_hint", 12),
+        "msg_index": _i("msg_index"),
         "raw_quote": _s("raw_quote", 200) or "",
         "expires_at": _calc_expires_at(horizon_days),
     }
+
+
+# 不是人名的稱呼：存之前一定換成發話者的名字。
+AMBIGUOUS_SPEAKERS = frozenset({
+    "自己", "我", "本人", "我們", "家人", "某人", "群組成員", "大家", "他", "她", "對方",
+})
+# (訊息 id, 發話者 user_id, 訊息原文)
+Speaker = tuple[str, str, str]
+
+
+def _family_name(name: str) -> str:
+    """「媽媽」→ the name the family file gives her, so 「媽媽說…」 is filed with
+    everything else she said (``/觀點 媽媽`` looks up the same name)."""
+    try:
+        import line_mentions
+
+        return line_mentions.configured_family_alias_mapping().get(name, name)
+    except Exception:
+        return name
+
+
+def _labelled_dialogue(speakers: Sequence[Speaker], names: dict[str, str]) -> str:
+    return "\n".join(
+        f"［{i}］{names.get(uid) or '家人'}：{text}"
+        for i, (_mid, uid, text) in enumerate(speakers, start=1)
+    )
+
+
+def _attribute_speaker(
+    view: dict, speakers: Sequence[Speaker], names: dict[str, str]
+) -> tuple[str, str, str] | None:
+    """(訊息 id, user_id, 名字)：這個觀點是哪一則訊息的發話者說的。找不到回 None。"""
+    def pick(index: int) -> tuple[str, str, str]:
+        mid, uid, text = speakers[index]
+        name = names.get(uid, "")
+        hint = (view.get("speaker_hint") or "").strip()
+        # 轉述別人（「媽媽說 0050 會漲」）：只有那則訊息真的寫了這個人才算數
+        if hint and hint not in AMBIGUOUS_SPEAKERS and hint != name and hint in text:
+            return mid, "", _family_name(hint)
+        return mid, uid, name
+
+    index = view.get("msg_index")
+    if isinstance(index, int) and 1 <= index <= len(speakers):
+        return pick(index - 1)
+    quote = re.sub(r"\s+", "", view.get("raw_quote") or "")
+    if quote:
+        hits = [i for i, (_m, _u, text) in enumerate(speakers) if quote in re.sub(r"\s+", "", text)]
+        if len({speakers[i][1] for i in hits}) == 1:
+            return pick(hits[0])
+    if len({uid for _m, uid, _t in speakers}) == 1:
+        return pick(0)
+    hint = (view.get("speaker_hint") or "").strip()
+    if hint and hint not in AMBIGUOUS_SPEAKERS:
+        for i, (_m, uid, _t) in enumerate(speakers):
+            if names.get(uid) == hint:
+                return pick(i)
+    subject = (view.get("ticker") or "").split(".")[0] or (view.get("macro_topic") or "")
+    if subject:
+        for i, (_m, _u, text) in enumerate(speakers):
+            if subject in text:
+                return pick(i)
+    return None
 
 
 def maybe_extract_and_save_async(
@@ -220,22 +290,51 @@ def maybe_extract_and_save_async(
     source_msg_id: Optional[str] = None,
     user_id_default: str = "",
     display_name_default: str = "家人",
+    *,
+    speakers: Sequence[Speaker] | None = None,
+    resolve_speaker: Callable[[str], str] | None = None,
 ) -> None:
-    """fire-and-forget — 在 burst flush 時呼叫。"""
+    """fire-and-forget — 在 burst flush 時呼叫。
+
+    ``speakers`` 是這次 burst 每則訊息的 (訊息 id, user_id, 原文)；``resolve_speaker``
+    把 user_id 換成家人的名字（可能要問 LINE，所以在背景執行緒裡呼叫）。
+    """
     if not is_finance_burst(combined_text):
         return
     db_path = finance_view_db._DB_PATH
+    speakers = list(speakers or [])
 
     def _run() -> None:
         try:
-            views = extract(combined_text)
+            names: dict[str, str] = {}
+            for _mid, uid, _text in speakers:
+                if uid and uid not in names:
+                    try:
+                        name = (resolve_speaker(uid) if resolve_speaker else "") or ""
+                    except Exception:
+                        name = ""
+                    names[uid] = "" if name in AMBIGUOUS_SPEAKERS else name
+            dialogue = combined_text
+            if speakers:
+                dialogue = _labelled_dialogue(speakers, names)
+                if quote_context.has_quote_context(combined_text):
+                    # 引用的原文只在合併的文字裡
+                    dialogue += "\n\n【含引用原文的完整對話，參考用】\n" + combined_text
+            views = extract(dialogue)
             for v in views:
-                display = v.get("speaker_hint") or display_name_default
+                attributed = _attribute_speaker(v, speakers, names) if speakers else None
+                if attributed:
+                    msg_id, user_id, display = attributed
+                else:
+                    msg_id, user_id, display = source_msg_id, user_id_default, ""
+                    hint = v.get("speaker_hint") or ""
+                    if hint not in AMBIGUOUS_SPEAKERS:
+                        display = _family_name(hint)
                 finance_view_db.insert_view(
                     group_id=group_id,
-                    source_msg_id=source_msg_id,
-                    user_id=user_id_default,
-                    display_name=display,
+                    source_msg_id=msg_id,
+                    user_id=user_id,
+                    display_name=display or display_name_default,
                     raw_text=v.get("raw_quote", "")[:200],
                     symbol_type=v["symbol_type"],
                     ticker=v.get("ticker"),
@@ -252,7 +351,7 @@ def maybe_extract_and_save_async(
                 )
                 logger.info(
                     "finance_view saved: %s %s %s",
-                    display,
+                    display or display_name_default,
                     v.get("ticker") or v.get("macro_topic"),
                     v.get("direction"),
                 )

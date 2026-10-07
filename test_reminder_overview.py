@@ -15,6 +15,7 @@ import pytest
 import calendar_db
 import main
 import memory
+import reminder_cancel as rc
 import reminder_intent as ri
 import reminder_overview as ro
 
@@ -313,7 +314,8 @@ def test_reminder_list_command_lists_an_event_once(command):
     reply = main._build_todo_status_reply(G, command)
 
     weekday = "一二三四五六日"[day.weekday()]
-    assert reply == f"目前待辦/提醒：\n1. {_md(day)}（{weekday}）15:00 家長會（成員甲）"
+    # 主詞放前面（2026-10-07）
+    assert reply == f"目前待辦/提醒：\n1. {_md(day)}（{weekday}）15:00 成員甲 家長會"
 
 
 def test_detail_query_still_shows_details_but_one_item_per_event():
@@ -323,7 +325,8 @@ def test_detail_query_still_shows_details_but_one_item_per_event():
     reply = main._build_todo_status_reply(G, "提醒清單細節")
 
     assert "提醒事項：" in reply
-    assert reply.count("事項：家長會") == 1
+    assert reply.count("事項：成員甲 家長會") == 1
+    assert "參加人" not in reply and "@" not in reply
     assert "\n2. " not in reply
     assert "前一天提醒" not in reply and "當天提醒" not in reply
 
@@ -372,3 +375,102 @@ def test_todo_query_reply_pings_nobody_named_in_the_list(monkeypatch):
 
     assert len(sent) == 1
     assert sent[0].to_dict()["type"] == "text"  # a textV2 message would carry mentions
+
+
+# ── 主詞放前面（Andrew 2026-10-07） ─────────────────────────────────────────
+
+
+@pytest.mark.parametrize("text, people, expected", [
+    ("家長會", ["成員甲"], "成員甲 家長會"),
+    ("家長會", ["成員甲", "成員乙"], "成員甲、成員乙 家長會"),
+    ("成員甲回診", ["成員甲"], "成員甲回診"),            # 已經寫在事項裡
+    ("家族烤肉", ["全家"], "全家 家族烤肉"),
+    ("全家打球", ["全家"], "全家打球"),
+    ("家族烤肉", ["成員甲", "all"], "全家 家族烤肉"),      # 全家包含所有人
+    ("繳學費", [], "繳學費"),
+])
+def test_subject_first(text, people, expected):
+    assert ro.subject_first(text, people) == expected
+
+
+def test_a_companion_already_in_the_wording_is_not_moved_up():
+    day = _day(4)
+    row = _row("成員甲回診（成員乙陪同）", _at(day, 14), mentions=("成員甲", "成員乙"))
+
+    line = main._format_todo_overview_line(ro.build_entries([row])[0], 1)
+
+    assert line.endswith("14:00 成員甲回診")
+
+
+def _weekday(day) -> str:
+    return "一二三四五六日"[day.weekday()]
+
+
+@pytest.mark.parametrize("mentions", [("成員甲",), ("成員甲", "成員乙"), ("all",), ()])
+def test_quoting_the_detail_list_still_cancels_the_reminder(mentions):
+    day = _day(5)
+    reminder_id = _insert(_row("家長會", _at(day, 15), mentions=mentions))
+    detail = main._build_todo_status_reply(G, "提醒清單細節")
+
+    request = rc.parse_cancel_request("取消", quoted_text=detail)
+    resolution = rc.resolve_cancel_request(
+        request, memory.list_reminder_cancellation_candidates(G)
+    )
+
+    assert resolution.status is rc.CancelResolutionStatus.MATCHED
+    assert resolution.reminder_id == reminder_id
+
+
+def test_the_name_in_front_does_not_bring_back_the_original_message():
+    day = _day(5)
+    _insert(_row("家長會", _at(day, 15), mentions=("成員甲",), source_text="下週五下午三點家長會"))
+
+    detail = main._build_todo_status_reply(G, "提醒清單細節")
+
+    assert "事項：成員甲 家長會" in detail
+    assert "細節：" not in detail
+
+
+def _resolve_quoted(day, shown: str, candidates: list[dict]):
+    quoted = f"1. {_md(day)}（{_weekday(day)}）15:00\n事項：{shown}"
+    return rc.resolve_cancel_request(rc.parse_cancel_request("取消", quoted_text=quoted), candidates)
+
+
+def _candidate(reminder_id: int, action: str, at: int, mentions: list[str]) -> dict:
+    return {"reminder_id": reminder_id, "action": action, "remind_at": at, "mention_aliases": mentions}
+
+
+def test_the_name_in_front_tells_two_same_time_reminders_apart():
+    day = _day(5)
+    at = _at(day, 15)
+    candidates = [
+        _candidate(1, "家長會", at, ["成員甲"]),
+        _candidate(2, "家長會", at, ["成員乙"]),
+    ]
+
+    resolution = _resolve_quoted(day, "成員乙 家長會", candidates)
+
+    assert resolution.status is rc.CancelResolutionStatus.MATCHED
+    assert resolution.reminder_id == 2
+
+
+def test_one_list_item_for_two_reminders_still_asks_which():
+    day = _day(5)
+    at = _at(day, 15)
+    candidates = [
+        _candidate(1, "家長會", at, ["成員甲"]),
+        _candidate(2, "家長會", at, ["成員甲", "成員乙"]),
+    ]
+
+    resolution = _resolve_quoted(day, "成員甲、成員乙 家長會", candidates)
+
+    assert resolution.status is rc.CancelResolutionStatus.AMBIGUOUS
+
+
+def test_words_in_front_that_are_not_people_are_not_dropped():
+    day = _day(5)
+    at = _at(day, 15)
+    candidates = [_candidate(1, "牛奶", at, []), _candidate(2, "繳費", at, ["成員甲"])]
+
+    assert _resolve_quoted(day, "買 牛奶", candidates).status is rc.CancelResolutionStatus.NOT_FOUND
+    assert _resolve_quoted(day, "成員乙 繳費", candidates).status is rc.CancelResolutionStatus.NOT_FOUND

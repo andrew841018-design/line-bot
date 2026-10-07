@@ -23,6 +23,8 @@ import unicodedata
 from typing import Iterable, Mapping
 from zoneinfo import ZoneInfo
 
+import reminder_overview
+
 
 TAIPEI = ZoneInfo("Asia/Taipei")
 
@@ -883,6 +885,30 @@ def _candidate_epoch_seconds(value: object) -> int | None:
     return int(parsed.timestamp())
 
 
+def _shown_action_matches(
+    reference_actions: set[str],
+    action: str,
+    people: object,
+    known_people: set[str],
+) -> bool:
+    """The reference names this action as the bot shows it: as stored, or with
+    the people in front (「成員甲、成員乙 家長會」, the reminder list since
+    2026-10-07).  The names in front must all be people the reminders know, and
+    include this reminder's own, so 「買 牛奶」 never reads as 「牛奶」."""
+
+    key = normalize_action(action)
+    if key in reference_actions:
+        return True
+    own = {normalize_action(name) for name in reminder_overview.subject_prefix(action, people)}
+    for shown in reference_actions:
+        if not shown.endswith(" " + key):
+            continue
+        names = {normalize_action(name) for name in shown[: -len(key) - 1].split("、")}
+        if "" not in names and names <= known_people and ("全家" in names or own <= names):
+            return True
+    return False
+
+
 def resolve_cancel_request(
     request: CancelRequest,
     candidates: Iterable[Mapping[str, object]],
@@ -909,6 +935,12 @@ def resolve_cancel_request(
 
     reference_actions = _normalized_action_variants(reference)
     reference_minute = reference.remind_at // 60
+    candidates = list(candidates)
+    known_people = {"全家"} | {
+        normalize_action(name)
+        for candidate in candidates
+        for name in reminder_overview.people_names(candidate.get("mention_aliases"))
+    }
     matches: list[tuple[int, str, int]] = []
     for candidate in candidates:
         try:
@@ -928,8 +960,13 @@ def resolve_cancel_request(
             )
         else:
             is_match = bool(
-                normalize_action(action) in reference_actions
-                and remind_at // 60 == reference_minute
+                remind_at // 60 == reference_minute
+                and _shown_action_matches(
+                    reference_actions,
+                    action,
+                    candidate.get("mention_aliases"),
+                    known_people,
+                )
             )
         if is_match:
             matches.append((reminder_id, action, remind_at))

@@ -99,6 +99,28 @@ def _with_people(text: str, names: tuple[str, ...]) -> str:
     return f"{' '.join(missing)} {text}".strip() if missing else text
 
 
+def people_names(raw: object) -> tuple[str, ...]:
+    """Mention aliases as plain names, without @ or repeats."""
+    return _names(raw)
+
+
+def subject_prefix(text: str, people: object) -> list[str]:
+    """The names :func:`subject_first` puts in front of ``text``."""
+    names = [name for name in _names(people) if name not in text]
+    if any(name in _EVERYONE for name in names):
+        return [] if "全家" in text else ["全家"]
+    return names
+
+
+def subject_first(text: str, people: object) -> str:
+    """「媽媽 家長會」：還沒寫在 text 裡的人放最前面（Andrew 2026-10-07：主詞放前面）。
+
+    全家／all 算一個人，寫「全家」。
+    """
+    names = subject_prefix(text, people)
+    return f"{'、'.join(names)} {text}" if names else text
+
+
 def _make_item(
     source: dict,
     *,
