@@ -179,7 +179,8 @@ LINE webhook (image)
     else:
         media_pipeline.analyze_image(bytes, user_prompt)
           ├─ ocr_helper.extract_text      （optional）
-          └─ vision_llm.describe_image    （Qwen2.5-VL-7B）
+          ├─ vision_llm.describe_image    （Qwen2.5-VL-7B）
+          └─ 沒人提問時只留糾正或建議（image_reply.unsolicited_image_reply），純描述圖片不回
   → 回 LINE
 ```
 

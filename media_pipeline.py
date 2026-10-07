@@ -16,7 +16,12 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from image_reply import IMAGE_RESPONSE_CONTRACT, is_image_context_echo, render_image_reply
+from image_reply import (
+    IMAGE_RESPONSE_CONTRACT,
+    is_image_context_echo,
+    render_image_reply,
+    unsolicited_image_reply,
+)
 from video_reply import VIDEO_COMMENTARY_CONTRACT, VIDEO_CACHE_VERSION
 
 logger = logging.getLogger("media_pipeline")
@@ -100,11 +105,16 @@ _MARKET_ALIAS_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 _PERCENT_RE = re.compile(r"[+\-−]?\d+(?:\.\d+)?\s*%")
 _NUMBER_RE = re.compile(r"[+\-−]?\d{1,3}(?:,\d{3})+(?:\.\d+)?|[+\-−]?\d+(?:\.\d+)?")
 _IMAGE_ARGUMENT_CONTRACT = IMAGE_RESPONSE_CONTRACT
-_IMAGE_CACHE_VERSION = b"image-response-only-v2\0"
+# v3 (2026-10-07): replies cached before the correction-or-advice policy may
+# only retell the picture, or carry post_check's old 「從圖裡看，」 rewrite.
+_IMAGE_CACHE_VERSION = b"image-response-only-v3\0"
+# The task for a picture nobody asked about.  「請分析這張圖片」 invited the
+# model to retell what the picture shows.
+_UNASKED_IMAGE_TASK = "有人把這張圖貼到群組，沒有另外提問。"
 
 
 def _build_image_argument_prompt(user_prompt: str = "") -> str:
-    task = (user_prompt or "").strip() or "請分析這張圖片。"
+    task = (user_prompt or "").strip() or _UNASKED_IMAGE_TASK
     return f"{task}\n\n{_IMAGE_ARGUMENT_CONTRACT}"
 
 
@@ -494,11 +504,24 @@ def analyze_image(
     group_id: str | None = None,
     *,
     timeout_sec: float | None = None,
+    unsolicited: bool | None = None,
 ) -> Optional[str]:
-    """Return only the answer, including for cached and fallback results."""
-    return render_image_reply(_analyze_image(
+    """Return only the answer, including for cached and fallback results.
+
+    ``unsolicited`` (default: no ``user_prompt``) means nobody asked about the
+    picture, so only a correction or advice is returned (Andrew 2026-10-07:
+    不要說明圖的內容); a reply that only retells the picture becomes None.
+    With ``unsolicited=True`` a ``user_prompt`` is context such as a file
+    name, not a question.
+    """
+    if unsolicited is None:
+        unsolicited = not user_prompt.strip()
+    elif unsolicited and user_prompt.strip():
+        user_prompt = f"{_UNASKED_IMAGE_TASK}\n\n{user_prompt.strip()}"
+    reply = render_image_reply(_analyze_image(
         image, user_prompt=user_prompt, group_id=group_id, timeout_sec=timeout_sec
     ))
+    return unsolicited_image_reply(reply) if unsolicited else reply
 
 
 def _analyze_image(

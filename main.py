@@ -6530,7 +6530,7 @@ def _handle_text_message(
     group_id: str,
 ) -> None:
     text = event.message.text or ""
-    # 咪寶選單（2026-10-05）：整則只是「選單」就回 Flex 按鈕卡片。放在最前面，
+    # 咪寶選單（2026-10-05）：整則只是「選單」就回 Quick Reply 按鈕。放在最前面，
     # 因為觸發詞不可能是取消／改期等提醒操作；偵測失敗時照常往下走。
     # 觸發詞本身沒有內容，所以不取消別人正在累積的 burst。
     menu_requested = False
@@ -6544,7 +6544,7 @@ def _handle_text_message(
         except Exception:
             logger.exception("flex menu detection failed; continuing normal routing")
     if menu_requested:
-        _reply(event.reply_token, flex_menu.ALT_TEXT, group_id=group_id, menu_card=True)
+        _reply(event.reply_token, flex_menu.PROMPT_TEXT, group_id=group_id, menu_card=True)
         return
     # Cancellation must run before quote-context expansion, one-shot replies,
     # calendar capture, classifiers, and reminder extraction.  Otherwise a
@@ -11258,8 +11258,42 @@ def _reminder_matches_timing_keywords(item: dict, keywords: list[str]) -> bool:
     return any(term in haystack for term in terms)
 
 
+_TODO_OVERVIEW_LIMIT = 20
+
+
+def _fmt_overview_when(event_date, clock: str | None, *, no_clock: str = "") -> str:
+    if event_date is None:
+        return "日期未定"
+    weekday = "一二三四五六日"[event_date.weekday()]
+    return f"{event_date.month}/{event_date.day}（{weekday}）{clock or no_clock}"
+
+
+def _format_todo_overview_line(entry, index: int) -> str:
+    """「1. 10/12（日）14:00 家長會（媽媽）」: when, what, who; no details, no @."""
+    title = _split_action_detail(entry.action)[0]
+    people = [name for name in entry.people if name not in title]
+    who = f"（{'、'.join(people)}）" if people else ""
+    return f"{index}. {_fmt_overview_when(entry.event_date, entry.clock)} {title}{who}"
+
+
+def _format_reminder_entry_details(entry, index: int) -> list[str]:
+    item = dict(entry.rows[0], action=entry.action, mention_aliases=list(entry.people))
+    if not item.get("source_text"):
+        item["source_text"] = next(
+            (row.get("source_text") for row in entry.rows if row.get("source_text")), ""
+        )
+    lines = _format_reminder_report_item(item, index)
+    lines[0] = f"{index}. {_fmt_overview_when(entry.event_date, entry.clock, no_clock='時間待補')}"
+    return lines
+
+
 def _build_todo_status_reply(group_id: str, clean_text: str = "") -> str:
-    """Read todos + reminders for immediate replies."""
+    """Read todos + reminders for immediate replies.
+
+    2026-10-07 (Andrew)：同一件事只列一筆。前一天／當天提醒、行事曆副本、同一件
+    事的待辦都由 reminder_overview 併成一筆；沒問細節時每筆只列日期、時間、事項
+    與人（「我只要知道有哪些代辦事項，這樣就好，多餘的不要」）。
+    """
     try:
         import calendar_db
 
@@ -11270,6 +11304,7 @@ def _build_todo_status_reply(group_id: str, clean_text: str = "") -> str:
     except Exception as e:
         logger.warning("failed to add missing event mirrors for todo view: %s", type(e).__name__)
 
+    import reminder_overview
     import todo
 
     target = _resolve_relative_date(clean_text)
@@ -11291,12 +11326,7 @@ def _build_todo_status_reply(group_id: str, clean_text: str = "") -> str:
     except Exception as e:
         logger.warning("todo query list_pending_reminders failed: %s", e)
         reminders = []
-    if target_iso:
-        reminders = [
-            r for r in reminders
-            if _fmt_remind_at(r.get("remind_at")).startswith(target_iso)
-        ]
-    else:
+    if not target_iso:
         now_ts = int(datetime.now(tz=ZoneInfo("Asia/Taipei")).timestamp())
         reminders = [
             r for r in reminders
@@ -11308,36 +11338,31 @@ def _build_todo_status_reply(group_id: str, clean_text: str = "") -> str:
             if _reminder_matches_timing_keywords(r, timing_keywords)
         ]
 
-    header = f"{target_iso} 的待辦/提醒：" if target_iso else "目前待辦/提醒："
-    if timing_keywords:
-        keyword_label = "、".join(timing_keywords)
-        header = (
-            f"{target_iso} 的{keyword_label}相關提醒事項＆細節："
-            if target_iso
-            else f"{keyword_label}相關提醒事項＆細節"
-        )
-    elif reminders and not todos:
-        header = f"{target_iso} 的提醒事項＆細節：" if target_iso else "未來提醒事項＆細節"
-    lines: list[str] = [header]
-    has_any = False
-
-    if todos:
-        has_any = True
-        lines.append("\n待辦事項：")
-        for item in todos[:10]:
-            owner = _alias_from_user_id(item.get("sender_user_id") or "")
-            owner_part = f"（{owner}）" if owner else ""
-            lines.append(
-                f"- {_fmt_todo_date(item.get('due_date'))} {item.get('task', '')}{owner_part}"
+    entries = reminder_overview.build_entries(
+        reminders,
+        [
+            reminder_overview.todo_item(
+                item.get("task"),
+                item.get("due_date"),
+                owner=_alias_from_user_id(item.get("sender_user_id") or ""),
+                user_id=str(item.get("sender_user_id") or ""),
             )
+            for item in todos
+        ],
+    )
+    if target_iso:
+        # The day's events, plus anything that reminds on that day (a 前一天
+        # reminder for the next day's event).
+        entries = [
+            entry for entry in entries
+            if entry.event_date == target
+            or any(
+                _fmt_remind_at(row.get("remind_at")).startswith(target_iso)
+                for row in entry.rows
+            )
+        ]
 
-    if reminders:
-        has_any = True
-        lines.append("\n提醒事項：")
-        for idx, item in enumerate(reminders[:10], start=1):
-            lines.append("\n".join(_format_reminder_report_item(item, idx)))
-
-    if not has_any:
+    if not entries:
         if timing_keywords:
             keyword_label = "、".join(timing_keywords)
             prefix = f"{target_iso} " if target_iso else "目前"
@@ -11347,6 +11372,45 @@ def _build_todo_status_reply(group_id: str, clean_text: str = "") -> str:
             if target_iso
             else "目前沒有查到 pending 待辦或提醒事項。"
         )
+
+    if not timing_keywords and not _wants_todo_details(clean_text):
+        lines = [f"{target_iso} 的待辦/提醒：" if target_iso else "目前待辦/提醒："]
+        shown = entries[:_TODO_OVERVIEW_LIMIT]
+        lines.extend(
+            _format_todo_overview_line(entry, index)
+            for index, entry in enumerate(shown, start=1)
+        )
+        if len(entries) > len(shown):
+            lines.append(f"（另有 {len(entries) - len(shown)} 筆未列出）")
+        return "\n".join(lines)
+
+    todo_entries = [entry for entry in entries if not entry.rows]
+    reminder_entries = [entry for entry in entries if entry.rows]
+    header = f"{target_iso} 的待辦/提醒：" if target_iso else "目前待辦/提醒："
+    if timing_keywords:
+        keyword_label = "、".join(timing_keywords)
+        header = (
+            f"{target_iso} 的{keyword_label}相關提醒事項＆細節："
+            if target_iso
+            else f"{keyword_label}相關提醒事項＆細節"
+        )
+    elif reminder_entries and not todo_entries:
+        header = f"{target_iso} 的提醒事項＆細節：" if target_iso else "未來提醒事項＆細節"
+    lines: list[str] = [header]
+
+    if todo_entries:
+        lines.append("\n待辦事項：")
+        for entry in todo_entries[:10]:
+            item = entry.todos[0]
+            owner_part = f"（{item['owner']}）" if item.get("owner") else ""
+            lines.append(
+                f"- {_fmt_todo_date(item.get('due_date') or None)} {item.get('task', '')}{owner_part}"
+            )
+
+    if reminder_entries:
+        lines.append("\n提醒事項：")
+        for idx, entry in enumerate(reminder_entries[:10], start=1):
+            lines.append("\n".join(_format_reminder_entry_details(entry, idx)))
     return "\n".join(lines)
 
 
@@ -11355,7 +11419,9 @@ def _handle_todo_query(
 ) -> None:
     """deterministic todo/reminder query path — read DB, skip LLM."""
     reply = _build_todo_status_reply(group_id, clean_text)
-    reply_text, message = _text_message_with_mentions(reply)
+    # Only a written @ mentions anyone: names in the list (「回診（媽媽）」,
+    # 「（全家）」) are not a reason to ping them (2026-10-07).
+    reply_text, message = _text_message_with_mentions(reply, explicit_only=True)
     try:
         if not settings.bot_muted:
             with ApiClient(_get_line_config()) as api_client:
@@ -13555,11 +13621,9 @@ def _handle_file_message(event: MessageEvent, group_id: str) -> None:
 
                 reply_text = analyze_image(
                     data,
-                    user_prompt=(
-                        "請根據這張圖片檔案直接回應，不附圖片解析內容。"
-                        f"\n\n[檔名：{file_name}]"
-                    ),
+                    user_prompt=f"[檔名：{file_name}]",
                     group_id=group_id,
+                    unsolicited=True,
                 )
                 logger.info(
                     "file image local analyze: %s -> %d chars",
@@ -20748,13 +20812,9 @@ def _drain_pending_file(
             from media_pipeline import analyze_image
             return analyze_image(
                 data,
-                user_prompt=(
-                    "請根據圖片內容直接回應，不附解析或OCR摘錄，"
-                    "第一句必須是具體判斷或結論，"
-                    "不要以「使用者」「我看到」「咪寶」「這張圖」等空話開頭。"
-                    f"\n\n[檔名：{file_name}]"
-                ),
+                user_prompt=f"[檔名：{file_name}]",
                 group_id=group_id,
+                unsolicited=True,
             )
         except Exception as e:
             logger.warning("drain image fallback failed: %s", e)
@@ -20886,10 +20946,11 @@ def _reply(
     settings.bot_muted=True 時整個函式 short-circuit:
     不 reply、不 push、只把原本要送的 text 寫進 log 方便除錯。
 
-    ``menu_card``（咪寶選單）為真時：主訊息改成 flex_menu 的固定卡片，``text``
-    傳卡片的 altText，照樣過檢查、寫進 raw_messages。卡片一律不搭到期提醒
-    （Flex 被拒時錯誤不含 token，搭車的提醒會被標成不確定而卡住），也不 push
-    fallback（會把 altText 當純文字推出去）；組卡失敗就不送並結案。
+    ``menu_card``（咪寶選單）為真時：主訊息改成 flex_menu 的固定選單訊息（文字＋
+    Quick Reply 按鈕），``text`` 傳同一段文字，照樣過檢查、寫進 raw_messages。
+    選單一律不搭到期提醒（LINE 只顯示最後一則訊息的 Quick Reply，搭車的提醒會
+    把按鈕蓋掉；選單被拒時錯誤也不含 token，搭車的提醒會被標成不確定而卡住），
+    也不 push fallback（只會推出沒有按鈕的文字）；組訊息失敗就不送並結案。
     """
     if not text or not text.strip():
         if reply_provenance.dropped():

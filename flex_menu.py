@@ -1,22 +1,25 @@
-"""咪寶選單：家族群組的 Flex 按鈕卡片（2026-10-05 加）。
+"""咪寶選單：家族群組叫得出來、用完會自己收起的按鈕列（2026-10-05 加，10-07 改）。
 
-群組聊天室不會顯示圖文選單（Rich menu），所以改成有人打「選單」時回一張
-Flex 卡片。每顆按鈕都是 message action：點了等於點的人自己打出那串文字，
-後面完全走既有的文字指令路由（靜音成員、結案紀錄、引用都照舊）。
+群組聊天室不會顯示圖文選單（Rich menu），所以有人打「選單」時回一則短訊息，
+按鈕掛在 LINE Quick Reply 上：浮在輸入框上方，點了任一顆、或群組裡任何人再
+傳一則訊息就自動收起（Andrew 2026-10-07：要的時候叫出來，不要的時候縮回去）。
+原本的 Flex 卡片送出後會一直佔著聊天畫面，Flex 本身也沒有收合的做法。
 
-卡片只用 reply token 回覆，不主動推播；內容全是固定字串，不含模型輸出。
+每顆按鈕都是 message action：點了等於點的人自己打出那串文字，後面完全走既有
+的文字指令路由（靜音成員、結案紀錄、引用都照舊）。
+
+選單只用 reply token 回覆，不主動推播；內容全是固定字串，不含模型輸出。
 """
 
 from __future__ import annotations
 
 import unicodedata
 
-ALT_TEXT = "咪寶選單：點開看按鈕"
-TITLE = "咪寶選單"
-SUBTITLE = "點按鈕＝幫你打出指令"
+# 選單訊息本身的文字：留在聊天紀錄裡的只有這一行，按鈕收起後不佔版面。
+PROMPT_TEXT = "咪寶選單在下方👇 點按鈕＝幫你打出指令，用完會自動收起"
 
 # (按鈕文字, 點了之後送出的文字)。送出的文字必須永遠接得到既有路由：
-# 舊卡片會一直留在聊天紀錄裡可以點，改名或拿掉指令前先看
+# 舊的 Flex 卡片會一直留在聊天紀錄裡可以點，改名或拿掉指令前先看
 # test_flex_menu.SHIPPED_BUTTON_TEXTS。
 BUTTONS: tuple[tuple[str, str], ...] = (
     ("📋 提醒清單", "/提醒清單"),
@@ -39,37 +42,24 @@ def is_menu_request(text: str, addressed_text: str | None = None) -> bool:
     return _normalize(text) in _TRIGGERS or _normalize(addressed_text) in _TRIGGERS
 
 
-def build_menu() -> dict:
-    """卡片的 Flex JSON（bubble）。"""
-    return {
-        "type": "bubble",
-        "header": {
-            "type": "box",
-            "layout": "vertical",
-            "contents": [
-                {"type": "text", "text": TITLE, "weight": "bold", "size": "lg"},
-                {"type": "text", "text": SUBTITLE, "size": "xs", "color": "#888888"},
-            ],
-        },
-        "body": {
-            "type": "box",
-            "layout": "vertical",
-            "spacing": "sm",
-            "contents": [
-                {
-                    "type": "button",
-                    "style": "secondary",
-                    "height": "sm",
-                    "action": {"type": "message", "label": label, "text": text},
-                }
-                for label, text in BUTTONS
-            ],
-        },
-    }
-
-
 def menu_message():
-    """回傳可以直接放進 ReplyMessageRequest 的 FlexMessage。"""
-    from linebot.v3.messaging import FlexContainer, FlexMessage  # type: ignore[import-untyped]
+    """回傳可以直接放進 ReplyMessageRequest 的文字訊息，按鈕掛在 Quick Reply。
 
-    return FlexMessage(alt_text=ALT_TEXT, contents=FlexContainer.from_dict(build_menu()))
+    LINE 只顯示一次回覆裡最後一則訊息的 Quick Reply，所以這則必須單獨送。
+    """
+    from linebot.v3.messaging import (  # type: ignore[import-untyped]
+        MessageAction,
+        QuickReply,
+        QuickReplyItem,
+        TextMessage,
+    )
+
+    return TextMessage(
+        text=PROMPT_TEXT,
+        quick_reply=QuickReply(
+            items=[
+                QuickReplyItem(action=MessageAction(label=label, text=text))
+                for label, text in BUTTONS
+            ]
+        ),
+    )

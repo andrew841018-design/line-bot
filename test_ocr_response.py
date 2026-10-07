@@ -314,14 +314,14 @@ def _vision_down(monkeypatch):
 
 def test_analyze_image_no_desc_returns_ocr_response_and_caches(monkeypatch, _vision_down):
     writes = []
-    monkeypatch.setattr(mp, "_respond_to_ocr_text", lambda t: "這是針對內容的回應。")
+    monkeypatch.setattr(mp, "_respond_to_ocr_text", lambda t: "合計少算了一筆，建議核對明細。")
     monkeypatch.setattr(mp, "_maybe_write_media_cache", lambda *a, **k: writes.append(a))
 
     out = mp.analyze_image(b"\x00" * 2048, group_id="Gtest")
 
     assert out is not None
     assert "圖片內容：" not in out
-    assert "這是針對內容的回應" in out
+    assert "合計少算了一筆" in out
     assert len(writes) == 1  # the real OCR response IS cached
 
 

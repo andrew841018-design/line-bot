@@ -158,3 +158,94 @@ def test_quoted_image_never_echoes_cached_description(monkeypatch):
     event = types.SimpleNamespace(reply_token="synthetic")
     assert not main._handle_quoted_media_description_fallback(event, "group", "合理嗎", "image", "圖片")
     assert sent == []
+
+
+# ── Unasked pictures: correction or advice only (Andrew 2026-10-07) ──────────
+# 「不要說明圖的內容，要也是糾正圖說錯的地方或者是給予建議」
+
+
+@pytest.mark.parametrize("raw", [
+    "某月某日的睡眠數據。睡眠分數為85分，評等為良好。",
+    "圖片顯示了某月某日的睡眠數據。睡眠分數為85分，評等為良好。",
+    "好溫馨的全家福～",
+    "這是會議摘要，共三點。",
+])
+def test_unasked_picture_retelling_is_no_reply(raw):
+    assert policy.unsolicited_image_reply(raw) is None
+
+
+@pytest.mark.parametrize("raw, expected", [
+    # a leading 「圖片顯示…」 retelling goes, the advice stays
+    (
+        "圖片顯示了某月某日的睡眠數據。深睡只有40分鐘偏少，建議睡前一小時別滑手機。",
+        "深睡只有40分鐘偏少，建議睡前一小時別滑手機。",
+    ),
+    # the correction leans on the sentence before it, so that sentence stays
+    (
+        "圖上寫每天喝3000cc水。這對需要限水的人其實太多了。",
+        "圖上寫每天喝3000cc水。這對需要限水的人其實太多了。",
+    ),
+    ("圖中的單位寫錯了，應該是 ml/kg/min。", "圖中的單位寫錯了，應該是 ml/kg/min。"),
+    ("補助能降低購車成本，但仍要比較後續保養支出。", "補助能降低購車成本，但仍要比較後續保養支出。"),
+    ("圖片內容：SECRET_OCR\n回覆：先核對總成本。", "回覆：先核對總成本。"),
+])
+def test_unasked_picture_keeps_correction_or_advice(raw, expected):
+    assert policy.unsolicited_image_reply(raw) == expected
+
+
+def test_market_screenshot_judgment_still_goes_out_unasked():
+    ocr = "富途牛牛 道瓊指數 42000.00 +210.50 +0.50% 費城半導體指數 5000.00 -50.00 -1.00%"
+    reply = mp._extract_market_screenshot_reply(ocr)
+    assert reply
+    assert policy.unsolicited_image_reply(reply) == reply
+
+
+def test_post_check_no_longer_cuts_into_a_description():
+    # It used to cut 20-odd characters and prepend 「從圖裡看，」, turning
+    # 「10月2日」 into 「月2日」 and still only describing the picture.
+    raw = "圖片顯示了某月某日的睡眠數據，睡眠分數為85分。"
+    assert vision_common.post_check(raw) == raw
+
+
+def test_post_check_drops_an_echo_opener_that_is_its_own_clause():
+    assert vision_common.post_check("您說得對，深睡偏少。") == "深睡偏少。"
+    assert vision_common.post_check("您說得對！") == ""
+
+
+def _fake_vision(monkeypatch, reply, captured=None):
+    monkeypatch.setattr(mp, "_maybe_lookup_media_cache", lambda *_a, **_k: None)
+    monkeypatch.setattr(mp, "_maybe_write_media_cache", lambda *_a, **_k: None)
+    ocr = types.ModuleType("ocr_helper")
+    ocr.extract_text = lambda *_a, **_k: None
+    vision = types.ModuleType("vision_llm")
+
+    def describe_image(_image, prompt=None, **_kwargs):
+        if captured is not None:
+            captured.append(prompt)
+        return reply
+
+    vision.describe_image = describe_image
+    monkeypatch.setitem(sys.modules, "ocr_helper", ocr)
+    monkeypatch.setitem(sys.modules, "vision_llm", vision)
+
+
+def test_unasked_picture_that_is_only_described_gets_no_reply(monkeypatch):
+    prompts = []
+    _fake_vision(monkeypatch, "圖片顯示了某月某日的睡眠數據。睡眠分數為85分。", prompts)
+    assert mp.analyze_image(b"synthetic") is None
+    assert "請分析這張圖片" not in prompts[0]
+    assert "沒有另外提問" in prompts[0]
+    assert "只能輸出兩種內容" in prompts[0]
+
+
+def test_asked_picture_may_answer_with_what_it_shows(monkeypatch):
+    _fake_vision(monkeypatch, "睡眠分數為85分。")
+    assert mp.analyze_image(b"synthetic", user_prompt="分數幾分？") == "睡眠分數為85分。"
+
+
+def test_image_file_counts_as_unasked_with_its_name_as_context(monkeypatch):
+    prompts = []
+    _fake_vision(monkeypatch, "睡眠分數為85分。", prompts)
+    assert mp.analyze_image(b"synthetic", user_prompt="[檔名：a.jpg]", unsolicited=True) is None
+    assert "沒有另外提問" in prompts[0]
+    assert "[檔名：a.jpg]" in prompts[0]

@@ -812,6 +812,32 @@ def has_reminder_offset_marker(text: object) -> bool:
     return bool(_SAME_EVENT_OFFSET_RE.search(normalize_text(text)))
 
 
+_OFFSET_DAYS_RE = re.compile(r"前一天|前(\d+)天|前([一二三四五六七])天|當天")
+
+
+def reminder_offset_days(text: object) -> int | None:
+    """Days from a 「…（前N天提醒）」 reminder to its event; None if unknown (提前) or unlabelled."""
+
+    marker = _SAME_EVENT_OFFSET_RE.search(normalize_text(text))
+    words = _OFFSET_DAYS_RE.search(marker.group()) if marker else None
+    if words is None:
+        return None
+    if words.group() == "前一天":
+        return 1
+    if words.group() == "當天":
+        return 0
+    if words.group(1):
+        return int(words.group(1))
+    return _CHINESE_DIGITS[words.group(2)]
+
+
+def strip_reminder_offset_marker(text: object) -> str:
+    """The action without its 「（前一天提醒）」-style label."""
+
+    stripped = _SAME_EVENT_OFFSET_RE.sub(" ", str(text or ""))
+    return re.sub(r"\s+", " ", stripped).strip(" ，,、:：")
+
+
 def time_kind_from_default(default_kind: object) -> str:
     """Stored time kind of a reminder created with ``_time_default_kind``."""
 

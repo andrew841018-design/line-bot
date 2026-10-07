@@ -135,13 +135,21 @@ _HEADER_PREFIXES = (
 )
 
 
+_CLAUSE_BREAKS = "，,。．！!：:；;\n"
+
+
 def post_check(reply: str) -> str:
     """對齊 gemini_client._violates_quality 的精簡版。
 
     偵測順序：
     1. header prefix（「具體判斷句：」之類）→ 砍到 colon 後第一個非空字元
-    2. echo opener → 砍前 N 字加 prefix 重組
+    2. echo opener → opener 自成一個子句（「您說得對，」）就拿掉；否則留原文 + log
     3. empty phrase → 留原文 + log
+
+    2026-10-07 前第 2 步會砍掉前 20 幾個字再補「從圖裡看，」：砍在句子中間
+    （「10月2日」變「月2日」），剩下的還是在描述圖。描述式開頭（「圖片中顯示…」）
+    現在保留原文，有沒有糾正或建議交給 image_reply.unsolicited_image_reply 判斷；
+    硬拿掉「圖上寫」這類開頭會讓圖上的說法看起來像咪寶自己的主張。
     """
     s = (reply or "").strip()
     if not s:
@@ -156,12 +164,15 @@ def post_check(reply: str) -> str:
 
     echo_openers, empty_phrases = get_blacklists()
 
-    # 1. echo opener：開頭命中 → 砍掉前 N 字 + 加 prefix 重組
+    # 1. echo opener：開頭命中
     for opener in echo_openers:
         if s.startswith(opener):
-            cleaned = s[min(30, len(opener) + 20):].lstrip("，。、,. \n　")
-            logger.info("post_check: echo opener hit (%s) → 重組", opener)
-            return f"從圖裡看，{cleaned}" if cleaned else s
+            rest = s[len(opener):]
+            if rest[:1] and rest[0] in _CLAUSE_BREAKS:
+                logger.info("post_check: echo opener clause dropped (%s)", opener)
+                return rest.lstrip(_CLAUSE_BREAKS + " 　")
+            logger.info("post_check: echo opener hit (%s) — 保留原文未重組", opener)
+            return s
 
     # 2. empty phrase：句中命中 → 不重組（會變更語意），記 log 即可
     for phrase in empty_phrases:

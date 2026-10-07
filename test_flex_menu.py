@@ -1,8 +1,7 @@
-"""咪寶選單（Flex 按鈕卡片）測試。2026-10-05 加。"""
+"""咪寶選單（Quick Reply 按鈕）測試。2026-10-05 加，10-07 由 Flex 卡片改成 Quick Reply。"""
 
 from __future__ import annotations
 
-import json
 import os
 import socket
 import time
@@ -23,17 +22,17 @@ import flex_menu  # noqa: E402
 import main  # noqa: E402
 import memory  # noqa: E402
 import reminder_push  # noqa: E402
-from linebot.v3.messaging import FlexContainer, FlexMessage, TextMessage  # noqa: E402
+from linebot.v3.messaging import TextMessage  # noqa: E402
 from linebot.v3.webhooks import GroupSource, MessageEvent, TextMessageContent  # noqa: E402
 
-# LINE Flex 限制：button label 40 字、message action text 300 字、altText 1500 字、
-# 單張 bubble JSON 30 KB。
-LABEL_MAX = 40
+# LINE Quick Reply 限制：最多 13 顆、action label 20 字、message action text 300 字；
+# 文字訊息 5000 字。
+QUICK_REPLY_MAX_ITEMS = 13
+LABEL_MAX = 20
 ACTION_TEXT_MAX = 300
-ALT_TEXT_MAX = 1500
-BUBBLE_MAX_BYTES = 30 * 1024
+TEXT_MAX = 5000
 
-# 已經發出去的卡片會永遠留在聊天紀錄裡可以點，所以這份清單只能加、不能刪，
+# 已經發出去的 Flex 卡片會永遠留在聊天紀錄裡可以點，所以這份清單只能加、不能刪，
 # 而且每一個都要永遠接得到原本的處理路徑。刻意寫死，不要改成從 flex_menu 匯入。
 SHIPPED_BUTTON_TEXTS = (
     "/提醒清單",
@@ -111,7 +110,7 @@ def _fake_line_api(*, reply_side_effect=None) -> MagicMock:
     return api
 
 
-# ── 卡片內容 ──────────────────────────────────────────────────────────────
+# ── 選單內容 ──────────────────────────────────────────────────────────────
 
 
 def test_every_button_text_is_recorded_as_shipped():
@@ -123,32 +122,44 @@ def test_every_shipped_text_has_a_routing_test():
     assert set(SHIPPED_BUTTON_TEXTS) == set(_COMMAND_ROUTES) | {"/help", "今晚吃什麼？"}
 
 
-def test_menu_respects_line_flex_limits():
-    menu = flex_menu.build_menu()
-    buttons = menu["body"]["contents"]
-    assert len(buttons) == len(flex_menu.BUTTONS) == 5
-    for button in buttons:
-        action = button["action"]
+def test_menu_respects_line_quick_reply_limits():
+    items = flex_menu.menu_message().to_dict()["quickReply"]["items"]
+    assert len(items) == len(flex_menu.BUTTONS) == 5
+    assert len(items) <= QUICK_REPLY_MAX_ITEMS
+    for item in items:
+        action = item["action"]
         assert action["type"] == "message"
         assert 0 < len(action["label"]) <= LABEL_MAX
         assert 0 < len(action["text"]) <= ACTION_TEXT_MAX
-    assert 0 < len(flex_menu.ALT_TEXT) <= ALT_TEXT_MAX
-    assert len(json.dumps(menu, ensure_ascii=False).encode("utf-8")) <= BUBBLE_MAX_BYTES
+    assert 0 < len(flex_menu.PROMPT_TEXT) <= TEXT_MAX
 
 
-def test_menu_round_trips_through_sdk_without_dropping_keys():
-    menu = flex_menu.build_menu()
-    assert FlexContainer.from_dict(menu).to_dict() == menu
+def test_menu_is_one_text_message_with_buttons_on_its_quick_reply():
+    # 收得起來的關鍵：按鈕掛在 Quick Reply，不是會一直留在聊天畫面的卡片。
+    message = flex_menu.menu_message()
+    assert isinstance(message, TextMessage)
+    assert message.to_dict() == {
+        "type": "text",
+        "text": flex_menu.PROMPT_TEXT,
+        "quickReply": {
+            "items": [
+                {"type": "action", "action": {"type": "message", "label": label, "text": text}}
+                for label, text in flex_menu.BUTTONS
+            ]
+        },
+    }
 
 
 def test_static_strings_survive_the_outbound_text_pipeline():
-    strings = [flex_menu.ALT_TEXT, flex_menu.TITLE, flex_menu.SUBTITLE]
-    strings += [label for label, _ in flex_menu.BUTTONS]
+    strings = [flex_menu.PROMPT_TEXT] + [label for label, _ in flex_menu.BUTTONS]
     for s in strings:
         assert main._md_to_line(s) == s
-    # 只有 altText 會當文字走 _reply 的檢查（_prepare_outbound_text、系統狀態抑制）。
-    assert main._prepare_outbound_text(flex_menu.ALT_TEXT, source="reply") == flex_menu.ALT_TEXT
-    assert not main._is_system_status_outbound(flex_menu.ALT_TEXT)
+    # 只有選單文字會走 _reply 的檢查（_prepare_outbound_text、系統狀態抑制）。
+    assert (
+        main._prepare_outbound_text(flex_menu.PROMPT_TEXT, source="reply")
+        == flex_menu.PROMPT_TEXT
+    )
+    assert not main._is_system_status_outbound(flex_menu.PROMPT_TEXT)
 
 
 # ── 觸發詞 ────────────────────────────────────────────────────────────────
@@ -195,7 +206,7 @@ def test_non_trigger_text_is_rejected(text):
 # ── _handle_text_message 的選單分支 ────────────────────────────────────────
 
 
-def test_menu_trigger_replies_with_card_before_any_reminder_route():
+def test_menu_trigger_replies_with_menu_before_any_reminder_route():
     event = _event(_message("選單"))
     with (
         patch("main._reply") as reply,
@@ -205,7 +216,7 @@ def test_menu_trigger_replies_with_card_before_any_reminder_route():
         main._handle_text_message(event, "G_TEST")
 
     reply.assert_called_once_with(
-        "TOKEN_MENU", flex_menu.ALT_TEXT, group_id="G_TEST", menu_card=True
+        "TOKEN_MENU", flex_menu.PROMPT_TEXT, group_id="G_TEST", menu_card=True
     )
     cancel_burst.assert_not_called()
     cancellation.assert_not_called()
@@ -277,7 +288,7 @@ def test_shipped_command_buttons_route_to_their_handlers(text, no_network):
     reply.assert_called_once()
     args, kwargs = reply.call_args
     assert args[1] == handled[0]
-    # 按鈕回覆是一般文字回覆：照常可以搭到期提醒、沒有卡片。
+    # 按鈕回覆是一般文字回覆：照常可以搭到期提醒、不再掛選單。
     assert kwargs.get("menu_card", False) is False
     assert kwargs.get("include_auxiliary", True) is True
     assert _row_counts() == before
@@ -451,10 +462,10 @@ def test_help_reply_is_plain_text_message():
     assert isinstance(message, TextMessage)
 
 
-# ── _reply 的卡片路徑 ──────────────────────────────────────────────────────
+# ── _reply 的選單路徑 ──────────────────────────────────────────────────────
 
 
-def _reply_with_card(api, **overrides):
+def _reply_with_menu(api, **overrides):
     kwargs = dict(group_id="G_TEST", menu_card=True)
     kwargs.update(overrides)
     with (
@@ -462,55 +473,56 @@ def _reply_with_card(api, **overrides):
         patch("main.ApiClient"),
         patch.object(main, "_get_line_config", return_value=MagicMock()),
     ):
-        return main._reply("TOKEN_MENU", flex_menu.ALT_TEXT, **kwargs)
+        return main._reply("TOKEN_MENU", flex_menu.PROMPT_TEXT, **kwargs)
 
 
-def test_reply_sends_only_the_card_and_archives_alt_text():
+def test_reply_sends_only_the_menu_and_archives_its_text():
     api = _fake_line_api()
     with (
         patch.object(main.settings, "bot_muted", False),
         patch.object(main.memory, "log_raw_message") as archive,
         patch("reminder_push.due_reminders_for_reply") as due,
     ):
-        ok = _reply_with_card(api, include_auxiliary=True)  # _reply 必須自己關掉搭車
+        ok = _reply_with_menu(api, include_auxiliary=True)  # _reply 必須自己關掉搭車
 
     assert ok is True
     sent = api.reply_message.call_args[0][0].messages
+    # 只有一則：LINE 只顯示最後一則訊息的 Quick Reply，搭車的提醒會把按鈕蓋掉。
     assert len(sent) == 1
-    assert isinstance(sent[0], FlexMessage)
+    assert isinstance(sent[0], TextMessage)
     assert sent[0].to_dict() == flex_menu.menu_message().to_dict()
     due.assert_not_called()
-    archive.assert_any_call("G_TEST", "SENT_1", "__bot__", flex_menu.ALT_TEXT)
+    archive.assert_any_call("G_TEST", "SENT_1", "__bot__", flex_menu.PROMPT_TEXT)
 
 
-def test_card_never_push_falls_back_even_if_caller_allows_it():
+def test_menu_never_push_falls_back_even_if_caller_allows_it():
     api = _fake_line_api(reply_side_effect=Exception("Invalid reply token"))
     assert main._is_definite_reply_token_error(Exception("Invalid reply token"))
     with patch.object(main.settings, "bot_muted", False):
-        ok = _reply_with_card(api, allow_push_fallback=True)
+        ok = _reply_with_menu(api, allow_push_fallback=True)
 
     assert ok is False
     api.push_message.assert_not_called()
 
 
-def test_card_build_failure_sends_nothing_and_closes_the_event():
+def test_menu_build_failure_sends_nothing_and_closes_the_event():
     api = _fake_line_api()
     with (
         patch.object(main.settings, "bot_muted", False),
-        patch("flex_menu.menu_message", side_effect=RuntimeError("bad card")),
+        patch("flex_menu.menu_message", side_effect=RuntimeError("bad menu")),
         patch.object(main, "_mark_inbound_reply_completed_no_reply") as complete,
     ):
-        ok = _reply_with_card(api)
+        ok = _reply_with_menu(api)
 
     assert ok is False
     api.reply_message.assert_not_called()
     complete.assert_called_once_with("TOKEN_MENU")
 
 
-def test_card_is_not_sent_when_bot_is_muted():
+def test_menu_is_not_sent_when_bot_is_muted():
     api = _fake_line_api()
     with patch.object(main.settings, "bot_muted", True):
-        ok = _reply_with_card(api)
+        ok = _reply_with_menu(api)
 
     assert ok is False
     api.reply_message.assert_not_called()

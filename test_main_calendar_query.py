@@ -6090,11 +6090,21 @@ def test_build_todo_status_reply_reads_all_sources(monkeypatch):
 
     reply = main._build_todo_status_reply("G1", "有哪些待辦事項？")
 
-    assert "領長期處方箋" in reply
-    assert "1. 6/25（四）08:00" in reply
-    assert "事項：全家打球" in reply
-    assert "參加人：@all" in reply
-    assert "測試牙醫乙" in reply
+    # 2026-10-07: one line per item, todos and reminders in one list, no details or @.
+    assert reply == (
+        "目前待辦/提醒：\n"
+        "1. 6/25（四） 領長期處方箋（媽媽）\n"
+        "2. 6/25（四）08:00 全家打球\n"
+        "3. 6/25（四）08:00 弟弟早上洗牙，看測試牙醫乙"
+    )
+
+    details = main._build_todo_status_reply("G1", "有哪些待辦事項的細節？")
+
+    assert "- 2026-06-25 領長期處方箋（媽媽）" in details
+    assert "1. 6/25（四）08:00" in details
+    assert "事項：全家打球" in details
+    assert "參加人：@all" in details
+    assert "測試牙醫乙" in details
 
 
 def test_build_todo_status_reply_detail_query_includes_source_text(monkeypatch):
