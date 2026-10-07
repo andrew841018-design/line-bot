@@ -81,6 +81,7 @@ os.environ.setdefault("PYSPARK_PYTHON", _sys.executable)
 os.environ.setdefault("PYSPARK_DRIVER_PYTHON", _sys.executable)
 
 import burst_filter  # noqa: E402
+import claude_client  # noqa: E402
 import config  # noqa: E402
 import finance_view_db  # noqa: E402
 import gemini_client  # noqa: E402
@@ -209,6 +210,10 @@ def reset_main_globals():
         burst_filter._timers.clear()
         burst_filter._pending.clear()
         burst_filter._last_reply_tokens.clear()
+    # 2026-10-07: CLI timeouts faked by one test must not leave the CLI
+    # resting (claude_client's timeout breaker) in the next.
+    claude_client._cli_timeout_streak = 0
+    claude_client._cli_timeout_breaker_until = 0.0
     _configure_test_sqlite(tmp_app_db_path)
     main._quota_exhausted_until_ts = 0.0
     main._quota_notified_for_ts = 0.0
@@ -229,6 +234,8 @@ def reset_main_globals():
     yield
 
     # ── after ─────────────────────────────────────────────────────────────
+    claude_client._cli_timeout_streak = 0
+    claude_client._cli_timeout_breaker_until = 0.0
     main._quota_exhausted_until_ts = 0.0
     main._quota_notified_for_ts = 0.0
     main._quota_last_probe_ts = 0.0
