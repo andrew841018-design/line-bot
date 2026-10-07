@@ -40,12 +40,17 @@ FOOD_KINDS: tuple[str, ...] = (
     "likes_food",       # 喜歡 X
     "dislikes_food",    # 不喜歡 X
     "finished_food",    # X 沒了 / 吃完
+    "skip_buying",      # X 不用買了（2026-10-07）
 )
 
 # 對立事件對：同 food 取最新一筆決定當前狀態
 _INVENTORY_KINDS = ("has_food", "finished_food")
-_SHOPPING_KINDS = ("wants_bought", "bought")
+_SHOPPING_KINDS = ("wants_bought", "bought", "skip_buying")
 _PREF_KINDS = ("likes_food", "dislikes_food")
+
+# 家裡有什麼／該買什麼只算最近 N 天有人提過的（2026-10-07 Andrew：會一直留著
+# 一個月前說過的蛋）。再提一次就重新算；喜好不過期。
+FRESH_DAYS = 14
 
 # 中性營養標籤 / 過敏原白名單（GP2 D：禁自由字串，防滑坡到「降血壓 / 控糖」等醫療標籤）
 NUTRITION_TAGS: tuple[str, ...] = (
@@ -150,16 +155,18 @@ def _foods_with_latest_kind(
     group_id: str,
     pair_kinds: tuple[str, ...],
     active_kind: str,
+    since_ms: int = 0,
 ) -> list[str]:
     """回傳 group 內「最新一筆 pair_kinds 事件 == active_kind」的 food 清單。
 
     GP1 Critical 2 核心：用「最新事件定狀態」取代集合差。
     tie-break：同 created_at 用 rowid 較大者為最新。
+    ``since_ms``：那筆最新事件要不早於這個時間才算（過期就不列）。
     """
     ph = ",".join("?" * len(pair_kinds))
     rows = c.execute(
         f"SELECT f1.food FROM family_food f1 "
-        f"WHERE f1.group_id = ? AND f1.kind = ? "
+        f"WHERE f1.group_id = ? AND f1.kind = ? AND f1.created_at >= ? "
         f"AND NOT EXISTS ("
         f"  SELECT 1 FROM family_food f2 "
         f"  WHERE f2.group_id = f1.group_id AND f2.food = f1.food "
@@ -167,21 +174,31 @@ def _foods_with_latest_kind(
         f"  AND (f2.created_at > f1.created_at "
         f"       OR (f2.created_at = f1.created_at AND f2.rowid > f1.rowid))"
         f")",
-        (group_id, active_kind, *pair_kinds),
+        (group_id, active_kind, since_ms, *pair_kinds),
     ).fetchall()
     return sorted({r[0] for r in rows})
 
 
+def _fresh_since_ms() -> int:
+    return int(time.time() * 1000) - FRESH_DAYS * 86400 * 1000
+
+
 def query_inventory(group_id: str) -> list[str]:
-    """家裡現有食材：每個 food 最新事件為 has_food（未被 finished_food 蓋過）。"""
+    """家裡現有食材：每個 food 最新事件為 has_food（未被 finished_food 蓋過），
+    而且是最近 FRESH_DAYS 天內提的。"""
     with _lock, _conn() as c:
-        return _foods_with_latest_kind(c, group_id, _INVENTORY_KINDS, "has_food")
+        return _foods_with_latest_kind(
+            c, group_id, _INVENTORY_KINDS, "has_food", _fresh_since_ms()
+        )
 
 
 def query_shopping(group_id: str) -> list[str]:
-    """待買清單：每個 food 最新事件為 wants_bought（未被 bought 蓋過）。"""
+    """待買清單：每個 food 最新事件為 wants_bought（未被 bought／skip_buying 蓋過），
+    而且是最近 FRESH_DAYS 天內提的。"""
     with _lock, _conn() as c:
-        return _foods_with_latest_kind(c, group_id, _SHOPPING_KINDS, "wants_bought")
+        return _foods_with_latest_kind(
+            c, group_id, _SHOPPING_KINDS, "wants_bought", _fresh_since_ms()
+        )
 
 
 def query_prefs(group_id: str) -> dict[str, list[str]]:

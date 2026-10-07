@@ -19164,6 +19164,18 @@ _DINNER_PROMPT = """你是台北美食達人，以善導寺捷運站（台北市
 回覆風格：親切自然，像朋友推薦，繁體中文，不要加多餘的前言或結語。"""
 
 
+def _dinner_prompt(asked: str) -> str:
+    """The dinner prompt plus what the asker wrote: 「今晚吃什麼？想吃日式」 used
+    to lose 「想吃日式」 (Andrew 2026-10-07)."""
+    asked = (asked or "").strip()[:200]
+    if not asked:
+        return _DINNER_PROMPT
+    return (
+        f"{_DINNER_PROMPT}\n\n群組裡的人是這樣問的：「{asked}」\n"
+        "裡面如果有提到想吃的種類、預算、人數或其他條件，請照著推薦。"
+    )
+
+
 _WEB_RESEARCH_QUESTION_HINTS = (
     "?",
     "？",
@@ -19670,21 +19682,23 @@ def _handle_dinner_recommendation(event: MessageEvent, group_id: str) -> None:
     context = memory.get_context(group_id)
     facts = memory.top_facts(group_id)
     pnotes = _get_persona_notes(group_id)
-    menu_buttons = _is_menu_button_text(getattr(getattr(event, "message", None), "text", ""))
+    asked = str(getattr(getattr(event, "message", None), "text", "") or "")
+    menu_buttons = _is_menu_button_text(asked)
+    prompt = _dinner_prompt(asked)
     try:
         with _thinking_indicator(group_id):
-            reply_text = _llm_chat(_DINNER_PROMPT, context, facts, pnotes)
+            reply_text = _llm_chat(prompt, context, facts, pnotes)
     except Exception as e:
         if _is_quota_error(e):
             _mark_quota_exhausted()
             logger.warning("dinner recommendation quota exhausted, retry via local")
-            reply_text = _local_text_llm_fallback(_DINNER_PROMPT, context=context)
+            reply_text = _local_text_llm_fallback(prompt, context=context)
         elif _is_gemini_unavailable_error(e):
             logger.warning(
                 "dinner recommendation unavailable, retry via local: %s",
                 e,
             )
-            reply_text = _local_text_llm_fallback(_DINNER_PROMPT, context=context)
+            reply_text = _local_text_llm_fallback(prompt, context=context)
         else:
             logger.exception("dinner recommendation failed: %s", e)
             _reply(
@@ -19879,13 +19893,16 @@ def _handle_food_command(group_id: str, text: str) -> str | None:
         shopping = food_db.query_shopping(group_id)
         if not shopping:
             return "🛒 目前沒有待買的食材"
-        return "🛒 待買清單：\n" + "\n".join(f"・{f}" for f in shopping)
+        return (
+            f"🛒 待買清單（最近 {food_db.FRESH_DAYS} 天提到的）：\n"
+            + "\n".join(f"・{f}" for f in shopping)
+        )
     if t in ("/家裡有什麼", "/庫存"):
         import food_db
         inventory = food_db.query_inventory(group_id)
         if not inventory:
             return "🧊 目前還沒記錄到家裡的食材"
-        return "🧊 家裡現有：\n" + "、".join(inventory)
+        return f"🧊 家裡現有（最近 {food_db.FRESH_DAYS} 天提到的）：\n" + "、".join(inventory)
     return None
 
 

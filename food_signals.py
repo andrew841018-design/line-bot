@@ -91,10 +91,13 @@ _WANTS_TO_EAT_TRIGGER = re.compile(r"(?<![不沒])(?:想吃|想喝|好想吃|好
 _WANTS_BOUGHT_TRIGGER = re.compile(
     r"(?<![不沒])(?:要買|需要買|可以買|想買|"
     r"幫(?:我|忙)再?買|還要買|多買|可買|再買|去買|"
-    r"要[一二三四五六七八九十百\d去再]{1,3}買)"
+    r"要[一二三四五六七八九十百\d去再]{1,3}買|"
+    # 2026-10-07：「記得買蛋」「順便買」「去全聯買牛奶」（去和買中間隔了地方）
+    r"記得要?買|順便買|去.{1,6}買(?![了到回好過]))"
 )
+# 「沒買到蛋」「沒有買到」不是買到了（2026-10-07）
 _BOUGHT_TRIGGER = re.compile(
-    r"(?:買了|買回家?|買到了?|已經買|剛買|今天買|這次買|買回來|在.{0,5}買的)"
+    r"(?<!沒)(?<!沒有)(?:買了|買回家?|買到了?|已經買|剛買|今天買|這次買|買回來|在.{0,5}買的)"
 )
 # OV 語序「X買了」（食物在動詞前）的到貨回報——buy-verb 緊接 food，故 anchored `^`
 # 比對 food 後 15 字。負向 lookahead 擋問句／反問（「買了嗎/沒」），否則會把
@@ -103,22 +106,33 @@ _BOUGHT_TRIGGER = re.compile(
 _BOUGHT_SUFFIX_TRIGGER = re.compile(
     r"^(?:買了|買回來了?|買回家了?|買好了|買到了?)(?![嗎呢啊吧?？沒])"
 )
+# 2026-10-07 拿掉煮／蒸／炒／煎／烤／燉／滷：「我晚上煮麵」「在餐廳吃烤鴨」不代表家裡有。
 _HAS_FOOD_TRIGGER = re.compile(
-    r"(?:冰箱(?:裡)?有|還有|家裡有|我帶了|我提了|還剩|有剩|煮|蒸|炒|煎|烤|燉|滷)"
+    r"(?:冰箱(?:裡)?有|還有|家裡有|我帶了|我提了|還剩|有剩)"
 )
-_FINISHED_TRIGGER = re.compile(r"(?:吃完|喝完|沒剩|用完|全光|光了)")
+# 2026-10-07 加「沒了／沒有了／吃光…」：「蛋沒了」是最常見的講法。
+_FINISHED_TRIGGER = re.compile(r"(?:吃完|喝完|沒剩|用完|全光|光了|沒了|沒有了|吃光|喝光|用光)")
+# 「不用買蛋了」「蛋不用買了」：從待買清單拿掉，但不算買到（2026-10-07）。
+# 「要不要買」「買不買」是在問，「不要買太多」還是要買，都不算。
+_SKIP_BUYING_PREFIX_TRIGGER = re.compile(
+    r"(?:(?<!要)不要|不用|不必|不需要?|先不要|先別|別|(?<!買)不)再?買(?!太?多|那麼多|這麼多)"
+)
+_SKIP_BUYING_SUFFIX_TRIGGER = re.compile(
+    r"^(?:也|就|先|都)?(?:不要|不用|不必|不需要?|別|不)再?買"
+)
 
-# (kind, pattern, side)：'prefix' = food 前 15 字、'suffix' = food 後 15 字
-# bought-suffix 放最後 = first-match fallback：prefix 路徑（買了X / 要買X）先贏，沒命中才
-#   用 suffix 補 OV 語序（X買了）。2026-06-01 修單食物 OV 缺口。
+# (kind, pattern, side)：'prefix' = food 前 15 字、'suffix' = food 後 15 字。
+# 2026-10-07 起取離 food 最近的 trigger（同距離才看這裡的先後）：「已經買了蛋，以後再買
+#   牛奶」的牛奶最近的是「再買」，不是前一句的「買了」。
 # DEFERRED：多食物 OV 清單「蛋和牛奶買了」只蓋緊鄰動詞的最後一個 food（anchored suffix），
 #   前面的會漏；見 tests/test_food_signals.py::test_bought_multi_food_ov_still_partial（xfail）。
-#   prefix 問句 FP「買了蛋嗎」仍會記 bought（baseline 既有，非本次引入），v2 一併處理。
 #   suffix 反問「蛋買了還是沒買?」單字 lookahead 擋不掉（買了後接「還」非阻擋字）→ 罕見 OV
 #   反問會誤記 bought；realism 低（家庭群少見此句式），v2 再補（如偵測「還是」）。
 _TRIGGER_PIPELINE = [
     ("dislikes_food", _DISLIKE_TRIGGER, "prefix"),
     ("finished_food", _FINISHED_TRIGGER, "suffix"),
+    ("skip_buying", _SKIP_BUYING_SUFFIX_TRIGGER, "suffix"),
+    ("skip_buying", _SKIP_BUYING_PREFIX_TRIGGER, "prefix"),
     ("bought", _BOUGHT_TRIGGER, "prefix"),
     ("wants_bought", _WANTS_BOUGHT_TRIGGER, "prefix"),
     ("wants_to_eat", _WANTS_TO_EAT_TRIGGER, "prefix"),
@@ -127,11 +141,20 @@ _TRIGGER_PIPELINE = [
     ("bought", _BOUGHT_SUFFIX_TRIGGER, "suffix"),
 ]
 
+# 「沒…買」是沒去買；「蛋沒了，要買蛋」的「沒了」不是（2026-10-07）。
 _CANCEL_CUE = re.compile(
-    r"沒.{0,15}買|沒去買|取消|算了|不買了?|不要了|本來.{0,30}沒|沒有再|忘了買|沒空買"
+    r"沒(?!了|有了|剩).{0,15}買|沒去買|取消|算了|不買了?|不要了|本來.{0,30}沒|沒有再|忘了買|沒空買"
 )
-_SENTENCE_SPLIT = re.compile(r"[。！？!?\n]+")
+# 一句連同句尾的標點，問號才看得到。
+_SENTENCE_RE = re.compile(r"[^。！？!?\n]+[。！？!?]*")
 _QUESTION_END = re.compile(r"[嗎呢?？]\s*$")
+# 「冰箱有蛋嗎，要買牛奶」：只有問句那一段不算數。頓號常用在清單裡，不當分段。
+_CLAUSE_BREAK = re.compile(r"[，,；;]")
+_CLAUSE_QUESTION = re.compile(r"[嗎呢?？]\s*$|了沒\s*$|有沒有|是不是")
+# 會改變家裡有什麼／該買什麼的事件：問句裡的不記（「家裡還有蘋果嗎」）。
+_STATE_KINDS = frozenset({"has_food", "finished_food", "bought", "wants_bought", "skip_buying"})
+# 買到了也算家裡有，但這幾樣不是食材。
+_NON_FOOD_ITEMS = frozenset({"消痔丸", "衛生紙", "牙膏", "澱粉類", "蛋白質", "蔬菜類"})
 _FUTURE_HINT = re.compile(r"以後|未來|有空")
 _RESTAURANTS = frozenset({
     "和園", "鬍鬚張", "爭鮮", "麥當勞", "肯德基", "摩斯", "漢堡王",
@@ -165,14 +188,32 @@ def _find_food_occurrences(sentence: str) -> list[tuple[int, int, str]]:
 
 
 def _classify_food(sentence: str, fstart: int, fend: int) -> str | None:
-    """根據 food 前/後 15 字 trigger 判定 kind。"""
+    """根據 food 前/後 15 字 trigger 判定 kind：離 food 最近的 trigger 贏。"""
     prefix = sentence[max(0, fstart - 15):fstart]
     suffix = sentence[fend:fend + 15]
-    for kind, pattern, side in _TRIGGER_PIPELINE:
-        target = prefix if side == "prefix" else suffix
-        if pattern.search(target):
-            return kind
-    return None
+    best: tuple[int, int, str] | None = None
+    for order, (kind, pattern, side) in enumerate(_TRIGGER_PIPELINE):
+        if side == "prefix":
+            hits = list(pattern.finditer(prefix))
+            if not hits:
+                continue
+            distance = len(prefix) - hits[-1].end()
+        else:
+            hit = pattern.search(suffix)
+            if hit is None:
+                continue
+            distance = hit.start()
+        if best is None or (distance, order) < best[:2]:
+            best = (distance, order, kind)
+    return best[2] if best else None
+
+
+def _clause_is_question(sentence: str, fstart: int, fend: int) -> bool:
+    """food 所在那一段（以逗號、分號分段）是不是在問。"""
+    start = max((m.end() for m in _CLAUSE_BREAK.finditer(sentence, 0, fstart)), default=0)
+    after = _CLAUSE_BREAK.search(sentence, fend)
+    clause = sentence[start:after.start() if after else len(sentence)]
+    return bool(_CLAUSE_QUESTION.search(clause.strip()))
 
 
 def extract(text: str) -> list[dict]:
@@ -189,8 +230,8 @@ def extract(text: str) -> list[dict]:
 
     cancelled = bool(_CANCEL_CUE.search(text))
     signals: list[dict] = []
-    for sentence in _SENTENCE_SPLIT.split(text):
-        sentence = sentence.strip()
+    for match in _SENTENCE_RE.finditer(text):
+        sentence = match.group().strip()
         if not sentence:
             continue
         # 餐廳問句（含餐廳名 + 問號 OR「還是」）→ 整句 skip
@@ -207,12 +248,23 @@ def extract(text: str) -> list[dict]:
                 continue
             if cancelled and kind in ("wants_bought", "wants_to_eat"):
                 continue
+            if kind in _STATE_KINDS and _clause_is_question(sentence, fstart, fend):
+                continue
+            confidence = "low" if question_modal else "high"
             signals.append({
                 "kind": kind,
                 "food": canonical(food),     # 存 canonical（GP1 C5e）
                 "surface": food,
-                "confidence": "low" if question_modal else "high",
+                "confidence": confidence,
             })
+            if kind == "bought" and food not in _NON_FOOD_ITEMS:
+                # 買回來了，家裡就有（2026-10-07）
+                signals.append({
+                    "kind": "has_food",
+                    "food": canonical(food),
+                    "surface": food,
+                    "confidence": confidence,
+                })
 
     # dedupe within text（相同 kind+food 只留一次）
     seen: set[tuple[str, str]] = set()

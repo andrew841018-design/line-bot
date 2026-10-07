@@ -9,6 +9,12 @@ import food_db as fdb
 
 G = "C_food_db_test"
 G2 = "C_food_db_test_2"
+DAY_MS = 86400 * 1000
+
+
+def _ago(ms: int) -> int:
+    """An event ``ms`` milliseconds ago (家裡有什麼／該買什麼只算最近 FRESH_DAYS 天)."""
+    return int(time.time() * 1000) - ms
 
 
 def _setup():
@@ -31,21 +37,63 @@ def test_invalid_kind_rejected():
 def test_inventory_latest_event_wins():
     # GP1 Critical 2：買→吃完→又買，最新是 has → 在庫
     _setup()
-    fdb.insert_signal(G, "has_food", "蛋", source_msg_id="m1", created_at_ms=1000)
-    fdb.insert_signal(G, "finished_food", "蛋", source_msg_id="m2", created_at_ms=2000)
+    fdb.insert_signal(G, "has_food", "蛋", source_msg_id="m1", created_at_ms=_ago(3000))
+    fdb.insert_signal(G, "finished_food", "蛋", source_msg_id="m2", created_at_ms=_ago(2000))
     assert "蛋" not in fdb.query_inventory(G)   # 最新是 finished
-    fdb.insert_signal(G, "has_food", "蛋", source_msg_id="m3", created_at_ms=3000)
+    fdb.insert_signal(G, "has_food", "蛋", source_msg_id="m3", created_at_ms=_ago(1000))
     assert "蛋" in fdb.query_inventory(G)        # 最新又是 has
 
 
 def test_shopping_latest_event_wins():
     # GP1 Critical 2：上週買過蛋，本週又要買 → 本週 wants 不該被舊 bought 消掉
     _setup()
-    fdb.insert_signal(G, "wants_bought", "蛋", source_msg_id="m1", created_at_ms=1000)
-    fdb.insert_signal(G, "bought", "蛋", source_msg_id="m2", created_at_ms=2000)
+    fdb.insert_signal(G, "wants_bought", "蛋", source_msg_id="m1", created_at_ms=_ago(3000))
+    fdb.insert_signal(G, "bought", "蛋", source_msg_id="m2", created_at_ms=_ago(2000))
     assert "蛋" not in fdb.query_shopping(G)     # 已買
-    fdb.insert_signal(G, "wants_bought", "蛋", source_msg_id="m3", created_at_ms=3000)
+    fdb.insert_signal(G, "wants_bought", "蛋", source_msg_id="m3", created_at_ms=_ago(1000))
     assert "蛋" in fdb.query_shopping(G)          # 又要買（最新 wants）
+
+
+# ── 2026-10-07：沒人再提的東西會自己消失；「不用買了」從待買清單拿掉 ──────────
+
+
+def test_inventory_forgets_food_nobody_mentioned_lately():
+    _setup()
+    stale = (fdb.FRESH_DAYS + 1) * DAY_MS
+    fdb.insert_signal(G, "has_food", "蛋", source_msg_id="m1", created_at_ms=_ago(stale))
+    fdb.insert_signal(G, "has_food", "魚", source_msg_id="m2", created_at_ms=_ago(DAY_MS))
+    assert fdb.query_inventory(G) == ["魚"]
+
+
+def test_mentioning_food_again_brings_it_back():
+    _setup()
+    stale = (fdb.FRESH_DAYS + 1) * DAY_MS
+    fdb.insert_signal(G, "has_food", "蛋", source_msg_id="m1", created_at_ms=_ago(stale))
+    fdb.insert_signal(G, "has_food", "蛋", source_msg_id="m2", created_at_ms=_ago(1000))
+    assert fdb.query_inventory(G) == ["蛋"]
+
+
+def test_shopping_forgets_old_requests():
+    _setup()
+    stale = (fdb.FRESH_DAYS + 1) * DAY_MS
+    fdb.insert_signal(G, "wants_bought", "牛奶", source_msg_id="m1", created_at_ms=_ago(stale))
+    fdb.insert_signal(G, "wants_bought", "蛋", source_msg_id="m2", created_at_ms=_ago(1000))
+    assert fdb.query_shopping(G) == ["蛋"]
+
+
+def test_no_longer_needed_leaves_the_shopping_list():
+    _setup()
+    fdb.insert_signal(G, "wants_bought", "蛋", source_msg_id="m1", created_at_ms=_ago(2000))
+    fdb.insert_signal(G, "skip_buying", "蛋", source_msg_id="m2", created_at_ms=_ago(1000))
+    assert fdb.query_shopping(G) == []
+    assert fdb.query_inventory(G) == []  # 不用買不等於買到了
+
+
+def test_preferences_do_not_expire():
+    _setup()
+    long_ago = (fdb.FRESH_DAYS + 30) * DAY_MS
+    fdb.insert_signal(G, "dislikes_food", "苦瓜", source_msg_id="m1", created_at_ms=_ago(long_ago))
+    assert fdb.query_prefs(G)["dislikes"] == ["苦瓜"]
 
 
 def test_dedup_same_msg():

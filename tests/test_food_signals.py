@@ -116,3 +116,103 @@ def test_bought_not_suppressed_by_future_hint_in_sentence():
 def test_bought_multi_food_ov_still_partial():
     # 顯性標記已知缺口：anchored suffix 只蓋緊鄰動詞的 food，前面的會漏（非隱形）
     assert ("bought", "蛋") in _pairs("蛋和牛奶買了")
+
+
+# ── 2026-10-07：更多講法、問句與煮東西不算、買到了也算家裡有 ───────────────────
+# Andrew：「家裡有什麼」會一直留著一個月前說過的蛋，「蛋沒了」也拿不掉。
+
+
+@pytest.mark.parametrize("text", ["蛋沒了", "冰箱裡的蛋沒了", "蛋沒有了", "蛋用光了"])
+def test_ran_out_phrasings_finish_the_food(text):
+    assert ("finished_food", "蛋") in _pairs(text)
+
+
+def test_ran_out_then_asked_to_buy():
+    # 「沒了」不是「沒買」：要買的那一筆不能被取消
+    assert _pairs("牛奶沒了，要買牛奶") == {("finished_food", "牛奶"), ("wants_bought", "牛奶")}
+
+
+@pytest.mark.parametrize("text", ["蛋不用買了", "不用買蛋了", "蛋先不要買", "別買蛋", "蛋就不買了"])
+def test_no_longer_needed_phrasings(text):
+    assert _pairs(text) == {("skip_buying", "蛋")}
+
+
+@pytest.mark.parametrize("text", ["要不要買蛋", "買不買蛋", "不要買太多蛋", "不用買那麼多蛋"])
+def test_asking_or_limiting_is_not_no_longer_needed(text):
+    assert ("skip_buying", "蛋") not in _pairs(text)
+
+
+def test_bought_food_is_also_at_home():
+    assert _pairs("買了牛奶") == {("bought", "牛奶"), ("has_food", "牛奶")}
+    assert _pairs("蛋買回來了") == {("bought", "蛋"), ("has_food", "蛋")}
+
+
+def test_bought_non_food_is_not_at_home():
+    assert _pairs("買了衛生紙") == {("bought", "衛生紙")}
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["家裡還有蘋果嗎", "冰箱有蛋?", "冰箱有蛋？", "冰箱有沒有蛋", "買了蛋嗎", "要買蛋嗎", "蛋沒了嗎？", "牛奶喝完了沒"],
+)
+def test_questions_change_nothing(text):
+    assert _pairs(text) == set()
+
+
+def test_only_the_question_clause_is_skipped():
+    assert _pairs("冰箱有蛋嗎，要買牛奶") == {("wants_bought", "牛奶")}
+
+
+@pytest.mark.parametrize("text", ["我晚上煮麵", "今天煮了番茄炒蛋", "昨天在餐廳吃烤鴨"])
+def test_cooking_or_eating_out_is_not_having(text):
+    assert not any(kind == "has_food" for kind, _food in _pairs(text))
+
+
+@pytest.mark.parametrize("text", ["沒買到蛋", "沒有買到蛋", "還沒買回來蛋"])
+def test_not_getting_it_is_not_bought(text):
+    assert ("bought", "蛋") not in _pairs(text)
+
+
+@pytest.mark.parametrize("text, food", [("記得買蛋", "蛋"), ("明天去全聯買牛奶", "牛奶"), ("順便買青菜", "青菜")])
+def test_more_ways_to_ask_for_buying(text, food):
+    assert ("wants_bought", food) in _pairs(text)
+
+
+def test_buying_at_a_store_already_is_bought():
+    assert ("bought", "牛奶") in _pairs("我昨天去全聯買了牛奶")
+
+
+def test_each_food_takes_the_nearest_trigger():
+    # 前一段的「買了」不再算到後面的牛奶身上
+    assert _pairs("已經買了蛋，以後再買牛奶") == {
+        ("bought", "蛋"), ("has_food", "蛋"), ("wants_bought", "牛奶"),
+    }
+    assert ("bought", "牛奶") not in _pairs("買了蛋還要買牛奶")
+    assert ("wants_bought", "牛奶") in _pairs("買了蛋還要買牛奶")
+
+
+def test_a_list_after_one_trigger_is_all_wanted():
+    assert _pairs("要買蛋、牛奶、青菜") == {
+        ("wants_bought", "蛋"), ("wants_bought", "牛奶"), ("wants_bought", "青菜"),
+    }
+
+
+def test_store_bought_lands_in_inventory_and_leaves_shopping():
+    fdb.clear_group(G)
+    fs.extract_and_store(G, "m1", "要買牛奶")
+    assert fdb.query_shopping(G) == ["牛奶"]
+    fs.extract_and_store(G, "m2", "牛奶買了")
+    assert fdb.query_shopping(G) == []
+    assert fdb.query_inventory(G) == ["牛奶"]
+    fs.extract_and_store(G, "m3", "牛奶沒了")
+    assert fdb.query_inventory(G) == []
+    fdb.clear_group(G)
+
+
+def test_store_no_longer_needed_leaves_shopping_without_reaching_home():
+    fdb.clear_group(G)
+    fs.extract_and_store(G, "m1", "要買蛋")
+    fs.extract_and_store(G, "m2", "蛋不用買了")
+    assert fdb.query_shopping(G) == []
+    assert fdb.query_inventory(G) == []
+    fdb.clear_group(G)
