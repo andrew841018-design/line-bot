@@ -6530,19 +6530,19 @@ def _handle_text_message(
     group_id: str,
 ) -> None:
     text = event.message.text or ""
-    # 咪寶選單（2026-10-05）：整則只是「選單」就回 Quick Reply 按鈕。放在最前面，
-    # 因為觸發詞不可能是取消／改期等提醒操作；偵測失敗時照常往下走。
+    # 咪寶選單（2026-10-05）：整則只是「選單」或「/」就回 Quick Reply 按鈕。放在
+    # 最前面，因為觸發詞不可能是取消／改期等提醒操作；偵測失敗時照常往下走。
     # 觸發詞本身沒有內容，所以不取消別人正在累積的 burst。
     menu_requested = False
-    if "選單" in text and len(text) <= 64:  # 長貼文不用再多跑一次稱呼解析
-        try:
-            import flex_menu
+    try:
+        import flex_menu
 
-            menu_requested = flex_menu.is_menu_request(
-                text, _extract_gemini_trigger(text, event.message)
-            )
-        except Exception:
-            logger.exception("flex menu detection failed; continuing normal routing")
+        # 長貼文、跟選單無關的訊息不用再多跑一次稱呼解析
+        menu_requested = flex_menu.might_be_menu_request(text) and flex_menu.is_menu_request(
+            text, _extract_gemini_trigger(text, event.message)
+        )
+    except Exception:
+        logger.exception("flex menu detection failed; continuing normal routing")
     if menu_requested:
         _reply(event.reply_token, flex_menu.PROMPT_TEXT, group_id=group_id, menu_card=True)
         return
@@ -6647,7 +6647,12 @@ def _handle_text_message(
     )
     if cmd_reply is not None:
         burst_filter.cancel_burst(group_id)
-        _reply(event.reply_token, cmd_reply, group_id=group_id)
+        _reply(
+            event.reply_token,
+            cmd_reply,
+            group_id=group_id,
+            menu_buttons=_is_menu_button_text(text),
+        )
         return
 
     poll_reply = (
@@ -19665,6 +19670,7 @@ def _handle_dinner_recommendation(event: MessageEvent, group_id: str) -> None:
     context = memory.get_context(group_id)
     facts = memory.top_facts(group_id)
     pnotes = _get_persona_notes(group_id)
+    menu_buttons = _is_menu_button_text(getattr(getattr(event, "message", None), "text", ""))
     try:
         with _thinking_indicator(group_id):
             reply_text = _llm_chat(_DINNER_PROMPT, context, facts, pnotes)
@@ -19681,7 +19687,12 @@ def _handle_dinner_recommendation(event: MessageEvent, group_id: str) -> None:
             reply_text = _local_text_llm_fallback(_DINNER_PROMPT, context=context)
         else:
             logger.exception("dinner recommendation failed: %s", e)
-            _reply(event.reply_token, _friendly_gemini_error(e), group_id=group_id)
+            _reply(
+                event.reply_token,
+                _friendly_gemini_error(e),
+                group_id=group_id,
+                menu_buttons=menu_buttons,
+            )
             return
     if not reply_text or not reply_text.strip():
         if reply_provenance.dropped():
@@ -19689,9 +19700,14 @@ def _handle_dinner_recommendation(event: MessageEvent, group_id: str) -> None:
             _reply(event.reply_token, "", group_id=group_id)
             return
         # fallback_chat 全敗回空 → 給使用者明確訊息（不能送空到 LINE SDK）
-        _reply(event.reply_token, "晚餐推薦今天罷工了，等一下再試試", group_id=group_id)
+        _reply(
+            event.reply_token,
+            "晚餐推薦今天罷工了，等一下再試試",
+            group_id=group_id,
+            menu_buttons=menu_buttons,
+        )
         return
-    _reply(event.reply_token, reply_text, group_id=group_id)
+    _reply(event.reply_token, reply_text, group_id=group_id, menu_buttons=menu_buttons)
 
 
 _CLASSIFY_EMOJIS = {
@@ -20174,7 +20190,7 @@ def _cancel_calendar_event(group_id: str, keyword: str) -> str:
 
 _HELP_TEXT = (
     "可用指令：\n"
-    "  選單                    叫出按鈕選單（也可打 /選單）\n"
+    "  選單 或 /               叫出按鈕選單（點完會再出現，聊別的就收起）\n"
     "【飲食】\n"
     "  /今晚煮什麼             用家裡現有食材推薦菜色\n"
     "  /該買什麼               待買食材清單\n"
@@ -20917,6 +20933,27 @@ def _drain_pending_file(
     return None
 
 
+def _is_menu_button_text(text: str | None) -> bool:
+    """The message is one of the 咪寶選單 buttons' commands (typed or tapped)."""
+    try:
+        import flex_menu
+
+        return flex_menu.is_button_text(text)
+    except Exception:
+        logger.exception("menu button check failed")
+        return False
+
+
+def _attach_menu_buttons(message, group_id: str | None) -> None:
+    """Hang the menu's Quick Reply on ``message``; a failure only loses the buttons."""
+    try:
+        import flex_menu
+
+        message.quick_reply = flex_menu.quick_reply()
+    except Exception:
+        logger.exception("menu buttons not attached group=%s", group_id)
+
+
 def _reply(
     reply_token: str,
     text: str,
@@ -20927,6 +20964,7 @@ def _reply(
     primary_reminder_ref: dict | None = None,
     primary_delivery: dict | None = None,
     menu_card: bool = False,
+    menu_buttons: bool = False,
 ) -> bool:
     """
     回覆 LINE 訊息。若帶 group_id,成功後會把 bot 的回覆也存進 raw_messages,
@@ -20951,6 +20989,9 @@ def _reply(
     選單一律不搭到期提醒（LINE 只顯示最後一則訊息的 Quick Reply，搭車的提醒會
     把按鈕蓋掉；選單被拒時錯誤也不含 token，搭車的提醒會被標成不確定而卡住），
     也不 push fallback（只會推出沒有按鈕的文字）；組訊息失敗就不送並結案。
+
+    ``menu_buttons``（按了選單按鈕的回覆）：選單的 Quick Reply 再掛到這次回覆的
+    最後一則上，連續點下一顆不用重打「選單」；搭車的提醒照送（2026-10-07）。
     """
     if not text or not text.strip():
         if reply_provenance.dropped():
@@ -21405,6 +21446,9 @@ def _reply(
             if primary_suppressed:
                 _mark_inbound_reply_completed_no_reply(reply_token)
             return False
+        if menu_buttons:
+            # LINE shows only the last message's Quick Reply.
+            _attach_menu_buttons(messages_to_send[-1], group_id)
         try:
             reminder_delivery_started = bool(
                 event_delivery_claims or natural_delivery_claims

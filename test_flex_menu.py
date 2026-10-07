@@ -40,6 +40,13 @@ SHIPPED_BUTTON_TEXTS = (
     "今晚吃什麼？",
     "/觀點",
     "/help",
+    # 2026-10-07：只打「/」叫出的選單列出所有不用補字、只讀的指令。
+    "/今晚煮什麼",
+    "/該買什麼",
+    "/家裡有什麼",
+    "/民調",
+    "/看記憶",
+    "/規則",
 )
 
 # 指令型按鈕 → 應該接手的既有處理函式。/help 與晚餐推薦另有專門測試。
@@ -47,6 +54,13 @@ _COMMAND_ROUTES = {
     "/提醒清單": "_build_todo_status_reply",
     "/行事曆": "_format_calendar",
     "/觀點": "_handle_finance_view_command",
+    "/今晚煮什麼": "_handle_food_command",
+    "/該買什麼": "_handle_food_command",
+    "/家裡有什麼": "_handle_food_command",
+    "/民調": "_handle_poll_command",
+    # 這兩個直接寫在 _handle_command 裡
+    "/看記憶": "_handle_command",
+    "/規則": "_handle_command",
 }
 
 
@@ -124,7 +138,7 @@ def test_every_shipped_text_has_a_routing_test():
 
 def test_menu_respects_line_quick_reply_limits():
     items = flex_menu.menu_message().to_dict()["quickReply"]["items"]
-    assert len(items) == len(flex_menu.BUTTONS) == 5
+    assert len(items) == len(flex_menu.BUTTONS) == 11
     assert len(items) <= QUICK_REPLY_MAX_ITEMS
     for item in items:
         action = item["action"]
@@ -167,7 +181,11 @@ def test_static_strings_survive_the_outbound_text_pipeline():
 
 @pytest.mark.parametrize(
     "text",
-    ["選單", "選單\n", " 選單 ", "/選單", "／選單", "選單？", "選單?", "選單！"],
+    [
+        "選單", "選單\n", " 選單 ", "/選單", "／選單", "選單？", "選單?", "選單！",
+        # 2026-10-07：只打一個「/」送出也叫得出來（LINE 收不到正在輸入的字）
+        "/", "／", " / ",
+    ],
 )
 def test_plain_trigger_forms_are_accepted(text):
     assert flex_menu.is_menu_request(text, main._extract_gemini_trigger(text, _message(text)))
@@ -197,7 +215,10 @@ def test_mobile_mention_structure_is_what_makes_an_unknown_label_count():
 
 @pytest.mark.parametrize(
     "text",
-    ["這個選單", "選單呢", "選單🙏", "@爸爸 選單", "咪寶", "", "選單。", "看選單"],
+    [
+        "這個選單", "選單呢", "選單🙏", "@爸爸 選單", "咪寶", "", "選單。", "看選單",
+        "//", "a/", "/ 選單", "https://example.com/",
+    ],
 )
 def test_non_trigger_text_is_rejected(text):
     assert not flex_menu.is_menu_request(text, main._extract_gemini_trigger(text, _message(text)))
@@ -288,9 +309,10 @@ def test_shipped_command_buttons_route_to_their_handlers(text, no_network):
     reply.assert_called_once()
     args, kwargs = reply.call_args
     assert args[1] == handled[0]
-    # 按鈕回覆是一般文字回覆：照常可以搭到期提醒、不再掛選單。
+    # 按鈕回覆是一般文字回覆：照常可以搭到期提醒，不是選單本身，但會把按鈕再掛回去。
     assert kwargs.get("menu_card", False) is False
     assert kwargs.get("include_auxiliary", True) is True
+    assert kwargs.get("menu_buttons") is True
     assert _row_counts() == before
 
 
@@ -301,6 +323,7 @@ def test_shipped_help_button_returns_help_text(no_network):
 
     reply.assert_called_once()
     assert reply.call_args[0][1] == main._HELP_TEXT
+    assert reply.call_args.kwargs.get("menu_buttons") is True
     assert _row_counts() == before
 
 
@@ -375,8 +398,8 @@ def test_reminder_list_button_does_not_revive_or_reset_sent_reminders(no_network
     assert mirror_count() == count_before  # 也沒有偷插一筆新的待推送副本
 
 
-def test_button_reply_still_piggybacks_due_reminders_with_mentions(monkeypatch):
-    """硬性條件：按鈕回覆搭車送出的到期提醒，提及照舊（爸爸→本人、全家→全體）。"""
+def _arm_two_due_reminders(monkeypatch) -> None:
+    """兩則到期提醒會搭下一次回覆的車：一則提及爸爸、一則提及全家。"""
     now = int(time.time())
     monkeypatch.setattr(reminder_push.line_mentions, "load_user_aliases", lambda: {"U_DAD": "爸爸"})
     base_row = {
@@ -422,6 +445,8 @@ def test_button_reply_still_piggybacks_due_reminders_with_mentions(monkeypatch):
     monkeypatch.setattr(main.memory, "finalize_natural_reminder_delivery", lambda claim: True)
     monkeypatch.setattr(main.memory, "log_raw_message", lambda *a, **kw: None)
 
+
+def _sent_by_reply(text: str = "清單", **kwargs) -> list:
     api = _fake_line_api()
     with (
         patch.object(main.settings, "bot_muted", False),
@@ -429,9 +454,16 @@ def test_button_reply_still_piggybacks_due_reminders_with_mentions(monkeypatch):
         patch("main.ApiClient"),
         patch.object(main, "_get_line_config", return_value=MagicMock()),
     ):
-        main._reply("TOKEN_MENU", "清單", group_id="G_TEST")
+        main._reply("TOKEN_MENU", text, group_id="G_TEST", **kwargs)
+    return api.reply_message.call_args[0][0].messages
 
-    sent = api.reply_message.call_args[0][0].messages
+
+def test_button_reply_still_piggybacks_due_reminders_with_mentions(monkeypatch):
+    """硬性條件：按鈕回覆搭車送出的到期提醒，提及照舊（爸爸→本人、全家→全體）。"""
+    _arm_two_due_reminders(monkeypatch)
+
+    sent = _sent_by_reply()
+
     assert getattr(sent[0], "text", None) == "清單"
     reminder_messages = sent[1:]
     assert len(reminder_messages) == 2
@@ -442,6 +474,96 @@ def test_button_reply_still_piggybacks_due_reminders_with_mentions(monkeypatch):
     ]
     assert "U_DAD" in user_mentions
     assert reminder_messages[1].substitution.get("all") is not None
+
+
+# ── 點完按鈕，答案下方再出現按鈕（2026-10-07） ──────────────────────────────
+# Andrew：「我要叫出選單（多次），我得重複打/選單，多次，很麻煩」
+
+
+def _quick_reply_of(message):
+    return message.to_dict().get("quickReply")
+
+
+def test_menu_buttons_come_back_on_a_button_reply():
+    sent = _sent_by_reply(menu_buttons=True, include_auxiliary=False)
+
+    assert len(sent) == 1
+    assert _quick_reply_of(sent[0]) == flex_menu.quick_reply().to_dict()
+
+
+def test_a_plain_reply_carries_no_menu_buttons():
+    sent = _sent_by_reply(include_auxiliary=False)
+
+    assert _quick_reply_of(sent[0]) is None
+
+
+def test_menu_buttons_ride_on_the_last_message_after_piggybacked_reminders(monkeypatch):
+    # LINE 只顯示最後一則的 Quick Reply；搭車的提醒照送、提及照舊。
+    _arm_two_due_reminders(monkeypatch)
+
+    sent = _sent_by_reply(menu_buttons=True)
+
+    assert len(sent) == 3
+    assert [_quick_reply_of(message) is not None for message in sent] == [False, False, True]
+    assert sent[2].substitution.get("all") is not None
+
+
+def test_menu_buttons_failure_still_sends_the_answer():
+    with patch("flex_menu.quick_reply", side_effect=RuntimeError("bad buttons")):
+        sent = _sent_by_reply(menu_buttons=True, include_auxiliary=False)
+
+    assert [getattr(message, "text", None) for message in sent] == ["清單"]
+    assert _quick_reply_of(sent[0]) is None
+
+
+def test_slash_alone_replies_with_the_menu():
+    event = _event(_message("/"))
+    with (
+        patch("main._reply") as reply,
+        patch("main._try_handle_reminder_cancellation") as cancellation,
+    ):
+        main._handle_text_message(event, "G_TEST")
+
+    reply.assert_called_once_with(
+        "TOKEN_MENU", flex_menu.PROMPT_TEXT, group_id="G_TEST", menu_card=True
+    )
+    cancellation.assert_not_called()
+
+
+@pytest.mark.parametrize("text", ["選單", "/", "／"])
+def test_menu_triggers_reach_the_menu_through_the_whole_event_path(text, no_network):
+    with patch("main._reply") as reply:
+        _handle_as_member(_event(_message(text)))
+
+    reply.assert_called_once_with(
+        "TOKEN_MENU", flex_menu.PROMPT_TEXT, group_id="G_TEST", menu_card=True
+    )
+
+
+def test_a_command_outside_the_menu_does_not_bring_the_buttons(no_network):
+    # 「/指令」也回說明文字，但它不是選單上的按鈕。
+    with patch("main._reply") as reply:
+        _handle_as_member(_event(_message("/指令")))
+
+    reply.assert_called_once()
+    assert reply.call_args[0][1] == main._HELP_TEXT
+    assert reply.call_args.kwargs.get("menu_buttons") is False
+
+
+@pytest.mark.parametrize("text, expected", [("今晚吃什麼？", True), ("晚餐要吃什麼", False)])
+def test_dinner_button_reply_brings_the_buttons_back(text, expected):
+    with (
+        patch("main._llm_chat", return_value="今晚吃火鍋"),
+        patch("main.memory.get_context", return_value=[]),
+        patch("main.memory.top_facts", return_value=[]),
+        patch("main._get_persona_notes", return_value=[]),
+        patch("main._reply") as reply,
+    ):
+        main._handle_dinner_recommendation(_event(_message(text)), "G_TEST")
+
+    reply.assert_called_once()
+    assert reply.call_args[0][1] == "今晚吃火鍋"
+    assert reply.call_args.kwargs.get("menu_buttons") is expected
 
 
 # ── 說明文字 ──────────────────────────────────────────────────────────────
