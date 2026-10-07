@@ -448,6 +448,50 @@ def _cli_failure_kind(detail: str) -> str:
     return "other"
 
 
+# 2026-10-07: a hung CLI cost every message the full CLAUDE_CLI_TIMEOUT_SEC
+# before Gemini was tried.  After this many timeouts in a row the CLI rests.
+# Only a successful call ends the streak or a rest (an error or a usage limit
+# in between does not), so one more timeout after a rest starts the next one.
+# In memory and apart from the quota gate: a timeout says nothing about
+# quota, and a restart simply tries the CLI again.
+_CLI_TIMEOUT_BREAKER_THRESHOLD = 2
+_CLI_TIMEOUT_BREAKER_COOLDOWN_SEC = 600
+_CLI_BREAKER_LOCK = threading.Lock()
+_cli_timeout_streak = 0
+_cli_timeout_breaker_until = 0.0
+
+
+def _cli_timeout_breaker_remaining() -> float:
+    """Seconds the CLI still rests after repeated timeouts (0 = it may run)."""
+    return max(0.0, _cli_timeout_breaker_until - time.time())
+
+
+def _record_cli_outcome(started: float, outcome: str) -> None:
+    """Log one CLI call's seconds and outcome, and feed the timeout breaker.
+
+    ``outcome`` is ok / empty / timeout / error / limit, never CLI output
+    (it can echo family chat).
+    """
+    global _cli_timeout_streak, _cli_timeout_breaker_until
+    logger.info("claude cli secs=%.2f outcome=%s", time.monotonic() - started, outcome)
+    if outcome in ("ok", "empty"):
+        with _CLI_BREAKER_LOCK:
+            _cli_timeout_streak = 0
+            _cli_timeout_breaker_until = 0.0
+    elif outcome == "timeout":
+        with _CLI_BREAKER_LOCK:
+            _cli_timeout_streak += 1
+            streak = _cli_timeout_streak
+            if streak >= _CLI_TIMEOUT_BREAKER_THRESHOLD:
+                _cli_timeout_breaker_until = time.time() + _CLI_TIMEOUT_BREAKER_COOLDOWN_SEC
+        if streak >= _CLI_TIMEOUT_BREAKER_THRESHOLD:
+            logger.warning(
+                "Claude CLI timed out %d times in a row; timeout breaker open for %ds",
+                streak,
+                _CLI_TIMEOUT_BREAKER_COOLDOWN_SEC,
+            )
+
+
 def _chat_via_cli(
     user_input: Any,
     context: list[tuple[str, str]],
@@ -469,6 +513,11 @@ def _chat_via_cli(
         for name, value in os.environ.items()
         if not _CHILD_SECRET_ENV_RE.search(name)
     }
+    # 2026-10-07: each reply starts a fresh CLI, which needs no update check,
+    # telemetry or error reports on the way.  A value set on purpose (e.g. in
+    # the launchd plist) wins; Andrew's own sessions still update the install.
+    child_env.setdefault("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+    child_env.setdefault("DISABLE_AUTOUPDATER", "1")
     timeout = max(10, int(settings.claude_cli_timeout_sec))
     # 2026-09-26: without these flags `claude -p` loaded Andrew's own Claude Code
     # setup — default opus model, hooks, CLAUDE.md, MCP servers — and replies
@@ -478,6 +527,7 @@ def _chat_via_cli(
     # never argv, and the session is not saved under ~/.claude.
     _remove_stale_prompt_files()
     system_prompt_path = ""
+    started = time.monotonic()
     try:
         fd, system_prompt_path = tempfile.mkstemp(prefix=_PROMPT_FILE_PREFIX, suffix=".txt")
         try:
@@ -515,8 +565,10 @@ def _chat_via_cli(
             env=child_env,
         )
     except subprocess.TimeoutExpired as exc:
+        _record_cli_outcome(started, "timeout")
         raise ClaudeProviderError(f"CLI timeout after {timeout}s") from exc
     except (OSError, ValueError) as exc:
+        _record_cli_outcome(started, "error")
         raise ClaudeCliUnavailable(type(exc).__name__) from exc
     finally:
         if system_prompt_path:
@@ -531,27 +583,33 @@ def _chat_via_cli(
         if _stderr_reports_limit(stderr) or any(
             _is_limit_notice_line(line) for line in stdout.splitlines()
         ):
+            _record_cli_outcome(started, "limit")
             raise ClaudeCliLimitReached(
                 f"CLI usage limit (exit {completed.returncode})",
                 until=_cli_limit_until(stderr, time.time()),
             )
         detail = (stderr or stdout or "CLI failed").strip()
         if _quota_error(completed.returncode, detail):
+            _record_cli_outcome(started, "limit")
             raise ClaudeQuotaExhausted(f"CLI quota or rate limit (exit {completed.returncode})")
+        _record_cli_outcome(started, "error")
         raise ClaudeProviderError(
             f"CLI exit {completed.returncode} ({_cli_failure_kind(detail)})"
         )
     text = stdout.strip()
     if _is_limit_notice_line(text):
         # Printed as if it were the answer: never send it to the family.
+        _record_cli_outcome(started, "limit")
         raise ClaudeCliLimitReached(
             "CLI usage limit (exit 0)", until=_cli_limit_until(stderr, time.time())
         )
     if is_empty_marker(text):
         # A clean exit with nothing printed is Claude following
         # NO_REPEAT_CONTRACT ("nothing new → empty string"), not a failure.
+        _record_cli_outcome(started, "empty")
         logger.info("primary reply provider=claude-cli chose not to reply")
         return ""
+    _record_cli_outcome(started, "ok")
     logger.info("primary reply provider=claude-cli")
     return text
 
@@ -612,6 +670,10 @@ def chat(
         # 2026-09-27: a quota error from the CLI cools it down too.
         if quota_exhausted():
             logger.info("Claude quota gate active; using Gemini")
+            return None
+        resting = _cli_timeout_breaker_remaining()
+        if resting > 0:
+            logger.info("Claude CLI timeout breaker open (%.0fs left); using Gemini", resting)
             return None
         try:
             result = _chat_via_cli(user_input, context, facts, persona_notes)

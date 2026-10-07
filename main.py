@@ -111,6 +111,8 @@ logging.basicConfig(
 
 # log 時間戳用 PT（Gemini quota 以這個為準）+ TW（使用者看這個）雙時區，
 # 避免「現在才 0800 為什麼 quota 就爆了」的誤判 — Gemini 的「一天」是 PT 的一天。
+# PT 帶毫秒，回覆延遲才量得出來；開頭的 "MM-DD " 不能動：health_check.sh 用
+# "^$PT_TODAY .*429" 數當天 429，daily_briefing_discord 用 " ERROR " 找錯誤行。
 class _DualTZFormatter(logging.Formatter):
     _PT = ZoneInfo("America/Los_Angeles")
     _TW = ZoneInfo("Asia/Taipei")
@@ -118,7 +120,10 @@ class _DualTZFormatter(logging.Formatter):
     def formatTime(self, record, datefmt=None):
         pt = datetime.fromtimestamp(record.created, tz=self._PT)
         tw = datetime.fromtimestamp(record.created, tz=self._TW)
-        return f"{pt.strftime('%m-%d %H:%M:%S')} PT ({tw.strftime('%H:%M')} TW)"
+        return (
+            f"{pt.strftime('%m-%d %H:%M:%S')}.{int(record.msecs):03d} PT "
+            f"({tw.strftime('%H:%M')} TW)"
+        )
 
 
 for _h in logging.getLogger().handlers:
@@ -343,7 +348,17 @@ def _mark_inbound_reply_succeeded(reply_token: str | None) -> None:
     with _inbound_reply_lock:
         event = _inbound_reply_by_token.get(str(reply_token))
     if event is not None:
-        group_id, message_ids, _ = event
+        group_id, message_ids, seen_at = event
+        # 延遲觀測（只記 id、則數、秒數）。seen_at 是 token 綁定的時間：單則
+        # 訊息在 _handle_event 綁，burst 在 flush 時重綁整批，所以 burst 等待
+        # flush 的秒數記在 burst_filter 的 "burst flush handoff"。回覆失敗改走
+        # fallback push 成功時也會到這裡（前一行是 "fallback push_message sent"）。
+        logger.info(
+            "reply accepted group=%s msgs=%d handler_to_accept_s=%.2f",
+            group_id,
+            len(message_ids),
+            time.time() - seen_at,
+        )
         try:
             if len(message_ids) == 1:
                 memory.mark_inbound_event_replied(group_id, message_ids[0])
@@ -12135,9 +12150,16 @@ def _handle_explicit_text(
     )
     facts = memory.top_facts(group_id, user_id=sender_user_id)
     pnotes = _get_persona_notes(group_id)
+    llm_started = time.monotonic()
     try:
         with _thinking_indicator(group_id):
             reply_text = _caller_checked(_llm_chat, user_input, context, facts, pnotes)
+        # 延遲觀測：只記秒數與長度，不記內容。
+        logger.info(
+            "explicit llm done secs=%.2f len=%d",
+            time.monotonic() - llm_started,
+            len(reply_text) if isinstance(reply_text, str) else 0,
+        )
     except Exception as e:
         if _is_quota_error(e):
             _mark_quota_exhausted()
