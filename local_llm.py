@@ -6,6 +6,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Optional
+from reply_policy import NO_REPEAT_CONTRACT
 
 logger = logging.getLogger("local_llm")
 from local_llm_config import LOCAL_LLM_MODEL, LOCAL_LLM_FALLBACKS
@@ -20,6 +21,26 @@ _tokenizer = None
 _loaded_name: Optional[str] = None
 _loaded_adapter: Optional[str] = None
 _cache_unavailable_logged = False
+_runtime_enabled = True
+_runtime_reason = "standalone"
+_runtime_disabled_logged = False
+
+
+def configure_runtime(*, enabled: bool, reason: str = "") -> None:
+    """Fence native MLX away from a long-lived server process when requested.
+
+    Standalone jobs stay enabled by default.  The FastAPI server disables this
+    before startup work because a native Metal abort cannot be contained by
+    Python exception handling and would otherwise terminate the webhook server.
+    """
+    global _runtime_enabled, _runtime_reason, _runtime_disabled_logged
+    _runtime_enabled = bool(enabled)
+    _runtime_reason = str(reason or "unspecified")
+    _runtime_disabled_logged = False
+
+
+def runtime_enabled() -> bool:
+    return _runtime_enabled
 
 
 def _huggingface_cache_root() -> Path:
@@ -58,6 +79,15 @@ def _ensure_loaded() -> bool:
     `adapter_path=` kwarg）。adapter 沒成功不致命，會 fallback 到純 base。
     """
     global _model, _tokenizer, _loaded_name, _loaded_adapter
+    global _runtime_disabled_logged
+    if not _runtime_enabled:
+        if not _runtime_disabled_logged:
+            logger.info(
+                "local text MLX disabled for runtime=%s",
+                _runtime_reason,
+            )
+            _runtime_disabled_logged = True
+        return False
     if _model is not None:
         return True
     if not _huggingface_cache_available():
@@ -117,7 +147,7 @@ def loaded_adapter_path() -> Optional[str]:
 def chat(
     user_input: str,
     context: list[tuple[str, str]] | None = None,
-    system_prompt: str = "你是個友善的 LINE 群組對話助理咪寶，用繁體中文簡短回覆。",
+    system_prompt: str = "你是個友善的 LINE 群組對話助理咪寶，用繁體中文簡短回覆。\n" + NO_REPEAT_CONTRACT,
     max_tokens: int = 400,
 ) -> Optional[str]:
     """跟 Gemini 那條 chat 介面相容。失敗回 None。

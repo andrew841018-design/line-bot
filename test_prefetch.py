@@ -196,9 +196,13 @@ def test_empty_reply_handling():
     import inspect
     import gemini_client
 
-    # retry 邏輯可能在 chat() 或重構後的 _chat_with_model()
-    retry_fn = getattr(gemini_client, "_chat_with_model", None) or gemini_client.chat
-    src = inspect.getsource(retry_fn)
+    # retry 邏輯可能在 chat()、舊版 _chat_with_model() 或現行共用的 _run()
+    # （chat() 經 _run() 呼叫模型）；合併檢查，避免重構搬位置就誤判失敗。
+    retry_fns = [
+        getattr(gemini_client, name, None)
+        for name in ("chat", "_chat_with_model", "_run")
+    ]
+    src = "\n".join(inspect.getsource(fn) for fn in retry_fns if callable(fn))
     check("chat() 有空回覆重試", "empty text, retrying" in src)
     check("chat() 有重試 loop", "for attempt in range" in src)
 

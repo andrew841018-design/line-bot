@@ -112,11 +112,17 @@ def user_id_for_alias(name: str) -> str | None:
     target = _clean_name(name)
     if not target:
         return None
-    canonical = configured_family_alias_mapping(include_short=True).get(target, target)
+    configured = configured_family_alias_mapping(include_short=True)
+    canonical = configured.get(target, target)
     for user_id, alias in load_user_aliases().items():
         if _clean_name(alias) == canonical:
             return user_id
     return None
+
+
+def user_id_for_family_role(role: str) -> str | None:
+    """Resolve a configured family role (for example ``妹妹``) to a user id."""
+    return user_id_for_alias(role)
 
 
 def parse_participants(value: Any) -> list[str]:

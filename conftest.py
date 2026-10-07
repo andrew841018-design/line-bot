@@ -64,6 +64,11 @@ os.environ.setdefault("LINE_CHANNEL_ACCESS_TOKEN", "dummy")
 os.environ.setdefault("GEMINI_API_KEY", "dummy")
 os.environ.setdefault("GROK_API_KEY", "dummy")
 os.environ.setdefault("BOT_MUTED", "true")
+# Semantic restatement judge calls Gemini; unit tests enable it explicitly with a fake.
+os.environ.setdefault("LINE_BOT_RESTATEMENT_JUDGE", "0")
+# 2026-10-04: the separate-quota last Gemini tier stays off unless a test
+# turns it on (many tests script exactly the two 2.5 models).
+os.environ.setdefault("GEMINI_LAST_TIER_MODEL", "")
 _ORIG_SQLITE_ENV = os.environ.get("SQLITE_PATH")
 _POST_TEST_SQLITE_PATH = Path(tempfile.gettempdir()) / (
     f"line_bot_pytest_quarantine_{os.getpid()}.db"
@@ -75,6 +80,7 @@ import sys as _sys
 os.environ.setdefault("PYSPARK_PYTHON", _sys.executable)
 os.environ.setdefault("PYSPARK_DRIVER_PYTHON", _sys.executable)
 
+import burst_filter  # noqa: E402
 import config  # noqa: E402
 import finance_view_db  # noqa: E402
 import gemini_client  # noqa: E402
@@ -98,6 +104,8 @@ _ORIG_ALLOWED_GROUP_IDS_RAW = main.settings.allowed_group_ids_raw
 _ORIG_FV_DB_PATH = finance_view_db._DB_PATH
 _ORIG_MEMORY_DB_PATH = memory._DB_PATH
 _ORIG_GEMINI_USAGE_FILE = gemini_client._USAGE_FILE
+_ORIG_GEMINI_MODEL_USAGE_FILE = gemini_client._MODEL_USAGE_FILE
+_ORIG_GEMINI_MODEL_USAGE_LOCK_FILE = gemini_client._MODEL_USAGE_LOCK_FILE
 
 _SQLITE_MODULE_NAMES = (
     "memory",
@@ -177,6 +185,9 @@ def reset_main_globals():
     tmp_usage = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
     tmp_usage.write(b'{"date":"pytest","tokens":0,"requests":0}')
     tmp_usage.close()
+    tmp_model_usage = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+    tmp_model_usage.write(b"{}")
+    tmp_model_usage.close()
 
     tmp_pending = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
     tmp_pending.write(b"{}")
@@ -189,11 +200,23 @@ def reset_main_globals():
     tmp_app_db_path = Path(tmp_app_db.name)
 
     # ── before ────────────────────────────────────────────────────────────
+    # 2026-09-27: an 8 s burst timer left by an earlier test (e.g. an event run
+    # through _handle_event) must not flush inside this one and hit its
+    # patched _llm_chat / _reply.
+    with burst_filter._lock:
+        for timer in burst_filter._timers.values():
+            timer.cancel()
+        burst_filter._timers.clear()
+        burst_filter._pending.clear()
+        burst_filter._last_reply_tokens.clear()
     _configure_test_sqlite(tmp_app_db_path)
     main._quota_exhausted_until_ts = 0.0
     main._quota_notified_for_ts = 0.0
     main._quota_last_probe_ts = 0.0
     gemini_client._USAGE_FILE = tmp_usage.name
+    gemini_client._MODEL_USAGE_FILE = tmp_model_usage.name
+    gemini_client._MODEL_USAGE_LOCK_FILE = tmp_model_usage.name + ".lock"
+    gemini_client._last_tier_backoff_until = 0.0
     main._PENDING_REPLY_ENABLED = _ORIG_PENDING_REPLY_ENABLED
     main._PENDING_EXPLICIT_PATH = str(tmp_pending_path)
     main._QUOTA_STATE_FILE = tmp_quota_path  # isolate file I/O
@@ -210,6 +233,9 @@ def reset_main_globals():
     main._quota_notified_for_ts = 0.0
     main._quota_last_probe_ts = 0.0
     gemini_client._USAGE_FILE = _ORIG_GEMINI_USAGE_FILE
+    gemini_client._MODEL_USAGE_FILE = _ORIG_GEMINI_MODEL_USAGE_FILE
+    gemini_client._MODEL_USAGE_LOCK_FILE = _ORIG_GEMINI_MODEL_USAGE_LOCK_FILE
+    gemini_client._last_tier_backoff_until = 0.0
     main._PENDING_REPLY_ENABLED = _ORIG_PENDING_REPLY_ENABLED
     main._PENDING_EXPLICIT_PATH = _ORIG_PENDING_PATH
     main._QUOTA_STATE_FILE = _ORIG_QUOTA_STATE_FILE
@@ -223,6 +249,8 @@ def reset_main_globals():
     for p in (
         tmp_quota_path,
         tmp_usage.name,
+        tmp_model_usage.name,
+        tmp_model_usage.name + ".lock",
         tmp_pending.name,
         str(tmp_pending_lock),
         *_sqlite_sidecar_paths(tmp_app_db_path),
@@ -269,3 +297,14 @@ def block_external_side_effects(monkeypatch, request):
             lambda *a, **kw: None,
             raising=False,
         )
+
+    # 2026-09-27: nothing fetched through safe_fetch leaves the machine — no
+    # lookup, and no address counts as public, so even a literal public IP is
+    # refused before connecting.  Transport tests re-open their local server.
+    import safe_fetch
+
+    def _no_lookup(_host, _port):
+        raise safe_fetch.BlockedURL("tests never resolve hostnames")
+
+    monkeypatch.setattr(safe_fetch, "_resolve", _no_lookup)
+    monkeypatch.setattr(safe_fetch, "is_public_ip", lambda _ip: False)

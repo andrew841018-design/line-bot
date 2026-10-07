@@ -79,7 +79,8 @@ def test_quota_remediation_failure_enters_discord_urgent_list(monkeypatch):
     ]) == [remediation_failure]
 
 
-def test_discord_send_false_does_not_update_alert_cooldown(monkeypatch):
+def test_discord_send_false_does_not_update_alert_cooldown(monkeypatch, tmp_path):
+    monkeypatch.setenv("LINE_BOT_MONITOR_LOCK_FILE", str(tmp_path / "monitor.lock"))
     monitor = _load_monitor(monkeypatch)
     saved = _stub_healthy_environment(
         monkeypatch,
@@ -102,7 +103,8 @@ def test_discord_send_false_does_not_update_alert_cooldown(monkeypatch):
     assert not saved.get("alert_issue_ts")
 
 
-def test_discord_send_none_counts_as_success(monkeypatch):
+def test_discord_send_none_counts_as_success(monkeypatch, tmp_path):
+    monkeypatch.setenv("LINE_BOT_MONITOR_LOCK_FILE", str(tmp_path / "monitor.lock"))
     monitor = _load_monitor(monkeypatch)
     saved = _stub_healthy_environment(
         monkeypatch,
@@ -142,7 +144,8 @@ def test_alert_cooldown_is_per_issue_type(monkeypatch):
     assert due_keys == [monitor._alert_issue_key(second)]
 
 
-def test_quota_exhausted_does_not_probe_or_autofix(monkeypatch):
+def test_quota_exhausted_does_not_probe_or_autofix(monkeypatch, tmp_path):
+    monkeypatch.setenv("LINE_BOT_MONITOR_LOCK_FILE", str(tmp_path / "monitor.lock"))
     monitor = _load_monitor(monkeypatch)
     saved = _stub_healthy_environment(
         monkeypatch,

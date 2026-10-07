@@ -112,7 +112,6 @@ def daily_todos() -> str:
         lines.append("─────")
 
     lines += [
-        "• Mock interview 做了嗎？",
         "• 修改履歷了嗎？（44 投 1 回應 = 履歷瓶頸，每天迭代）",
         "• 讀《資料工程基礎》1 章了嗎？(讀完寫 1 句 takeaway + Mini Project/JD 對照)",
         "• 學車相關影片看了一則嗎？",
@@ -1489,7 +1488,7 @@ def daily_reading() -> str:
         "📚 **每日代辦：資料工程基礎**",
         f"今日（{today.strftime('%Y-%m-%d %a')}）讀《資料工程基礎》**一章**",
         "讀完做：",
-        "  • 1 句 takeaway（寫進 mock_interview/{date}.md 或 design doc）",
+        "  • 1 句 takeaway（寫進 design doc）",
         "  • 對應到 Mini Project 的對照（這章在哪段體現？哪段沒做？）",
     ]
     return "\n".join(lines)
@@ -2071,31 +2070,11 @@ def main():
         if part:
             sections += ["", part]
 
-    suggestions = line_bot_suggestions()
-    if suggestions:
-        sections += ["", suggestions]
-
     # 每天嘗試從 Wikiquote 抓一條新雞湯加入 dynamic 池（fail-safe）
     _try_append_today_quote()
 
-    # SOXX tracker (Phase 6 integration) — pullback briefing
-    # 週日(weekday=6)/週一(0) 內部已 gate；資料過期也回空字串。
-    try:
-        sys.path.insert(0, str(BASE / 'soxx_tracker'))
-        from integration.briefing_section import soxx_briefing_section
-        soxx_section = soxx_briefing_section()
-        if soxx_section:
-            sections += ["", soxx_section]
-    except Exception as e:
-        print(f"[soxx_briefing] skipped: {e}", file=sys.stderr)
-
-    cycle_monitor = semiconductor_cycle_monitor()
-    if cycle_monitor:
-        sections += ["", cycle_monitor]
-
-    # Jim Cramer 每日論述（固定顯示：有講推繁中摘要，沒講明說沒講）。
-    # 放 line_bot_suggestions() 之後 → 共用 GEMINI_API_KEY 時接受被餓 → 自動 fallback 英文標題。
-    sections += ["", jim_cramer_daily()]
+    # Market coverage is owned by the dedicated daily entry-plan report.
+    # Keep this briefing's non-market sections and motivational quote collection.
 
     # daily_reading 整合進 daily_todos 第一段（2026-05-08 用戶要求「不要兩個每日代辦欄位」）
 

@@ -355,7 +355,7 @@ _GOOD_NEWS_REPLY = """我這邊覺得這份保險條款設計有問題，問題�
 
 
 def test_violates_quality_news_case_missing_sectional_structure():
-    print("\n── Test H1: news case 缺正方/反方/綜合 sectional 結構 → violate ──")
+    print("\n── Test H1: news case 不強制正方/反方/綜合結構 → pass ──")
 
     # 字數夠、URL 夠、有觀點 marker，但沒有正方/反方/綜合段
     reply = (
@@ -366,9 +366,8 @@ def test_violates_quality_news_case_missing_sectional_structure():
     bad, reason = gemini_client._violates_quality(
         reply, user_input_text="這份保險條款合理嗎"
     )
-    check("缺正方/反方/綜合段結構 → violate", bad)
-    check("reason 提到 sectional",
-          "正方" in reason or "反方" in reason or "綜合" in reason or "結構" in reason)
+    check("不再強制 sectional 結構 → pass", not bad)
+    check("不再產生結構違規原因", reason == "")
 
 
 def test_violates_quality_news_case_complete_passes():
@@ -380,7 +379,7 @@ def test_violates_quality_news_case_complete_passes():
 
 
 def test_violates_quality_news_case_url_threshold_bumped_to_3():
-    print("\n── Test H3: URL 門檻提高到 3 條 ──")
+    print("\n── Test H3: 不強制 URL 數量 ──")
     # 完整 sectional + 字數夠，但只 2 條 URL
     reply = (
         "我這邊覺得問題在 X。\n正方：同意 A B C。\n反方：反對 D E F。\n"
@@ -390,11 +389,11 @@ def test_violates_quality_news_case_url_threshold_bumped_to_3():
     bad, reason = gemini_client._violates_quality(
         reply, user_input_text="保險"
     )
-    check(f"URL 只 2 條應 violate (門檻 3)，got reason={reason!r}", bad)
+    check(f"URL 只 2 條仍可通過，got reason={reason!r}", not bad)
 
 
 def test_violates_quality_news_case_single_domain_violates():
-    print("\n── Test H4: 3 條 URL 但全是同一網域 → violate ──")
+    print("\n── Test H4: 不強制不同來源網域 ──")
     reply = (
         "我覺得問題在 X。\n正方：同意 ABC。\n反方：反對 DEF。\n綜合判斷：權衡後選 X。"
         + "詳細理由如下這是補字數。" * 50 +
@@ -403,11 +402,11 @@ def test_violates_quality_news_case_single_domain_violates():
     bad, reason = gemini_client._violates_quality(
         reply, user_input_text="保險"
     )
-    check(f"URL 集中單網域 → violate，got reason={reason!r}", bad)
+    check(f"URL 集中單網域仍可通過，got reason={reason!r}", not bad)
 
 
 def test_violates_quality_news_case_too_short_violates():
-    print("\n── Test H5: 字數 < 350 → violate ──")
+    print("\n── Test H5: 不強制 350 字下限 ──")
     # 有 sectional + 3 URL + 多網域，但太短
     reply = (
         "我覺得問題在 X。正方：同意 A B C。反方：反對 D E F。綜合判斷：選 X。"
@@ -416,7 +415,7 @@ def test_violates_quality_news_case_too_short_violates():
     bad, reason = gemini_client._violates_quality(
         reply, user_input_text="保險"
     )
-    check(f"字數 < 350 → violate，got reason={reason!r}", bad)
+    check(f"短回覆仍可通過，got reason={reason!r}", not bad)
 
 
 def test_violates_quality_non_news_case_skips_sectional_check():

@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 from config import settings
 import line_mentions
 import reminder_intent
+from sqlite_security import connect_private_sqlite
 
 _TW = ZoneInfo("Asia/Taipei")
 
@@ -184,6 +185,21 @@ def _event_reminder_time(event: Mapping[str, object]) -> object:
     return event.get("event_time")
 
 
+def calendar_event_reminder_anchor(
+    event: Mapping[str, object],
+) -> tuple[int, str | None]:
+    """Return the natural-reminder day offset and explicit clock.
+
+    The calendar sender owns date-level stages. When this anchor has an
+    explicit clock, the natural sender owns the intraday stages on the anchor
+    day so the two schedulers never compete for the same delivery window.
+    """
+
+    raw_clock = str(_event_reminder_time(event) or "").strip()
+    clock = raw_clock if re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", raw_clock) else None
+    return _event_reminder_lead_days(event), clock
+
+
 def _reminded_column(offset: int) -> str:
     """offset → reminded_Xd column name。Whitelist 驗 offset 防 SQL injection (column 不能 bind param)。"""
     if offset not in REMINDER_OFFSETS:
@@ -338,6 +354,7 @@ def _upsert_event_reminder(
                 source_text=source_text,
                 mention_aliases=mention_aliases,
                 require_active_calendar_event=True,
+                expected_calendar_event=dict(event),
             )
         elif preserve_existing:
             if not hasattr(memory, "ensure_reminder_for_source"):
@@ -420,7 +437,7 @@ class _ClosingConnection(sqlite3.Connection):
 
 
 def _conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(
+    conn = connect_private_sqlite(
         _DB_PATH,
         isolation_level=None,
         check_same_thread=False,
@@ -901,6 +918,371 @@ def insert_event_with_outcome(
     except Exception:
         pass
     return event_id, "created"
+
+
+_LEGACY_REPAIR_PUSH_COLUMNS: tuple[str, ...] = (
+    "last_pushed_at",
+    "weekly_count",
+    "last_weekly_at",
+    "pushed_3d",
+    "pushed_1d",
+    "pushed_4hr",
+    "pushed_2hr",
+    "pushed_1hr",
+    "pushed_now",
+)
+
+
+def repair_legacy_reminders_as_calendar_events(
+    group_id: str,
+    *,
+    reminder_expectations: list[Mapping[str, object]],
+    event_specs: list[Mapping[str, object]],
+    correction_message_ids: list[str] | None = None,
+) -> tuple[list[str], str]:
+    """Atomically migrate exact legacy reminder rows into canonical events.
+
+    This is intentionally a compare-and-set repair primitive, not a heuristic
+    migration. Callers must provide the exact legacy preimage and map each new
+    event to the legacy reminder ids it replaces. Existing unrelated rows are
+    never modified. A deterministic event id makes a completed repair
+    idempotent, while any partial or drifted state fails closed.
+    """
+
+    normalized_group = str(group_id or "").strip()
+    if not normalized_group or not reminder_expectations or not event_specs:
+        return [], "invalid"
+    expected_by_id: dict[int, Mapping[str, object]] = {}
+    try:
+        for expectation in reminder_expectations:
+            reminder_id = int(expectation["reminder_id"])
+            if reminder_id <= 0 or reminder_id in expected_by_id:
+                return [], "invalid"
+            expected_by_id[reminder_id] = expectation
+    except (KeyError, TypeError, ValueError):
+        return [], "invalid"
+
+    normalized_specs: list[dict[str, object]] = []
+    mapped_ids: set[int] = set()
+    for spec in event_specs:
+        try:
+            title = str(spec["title"] or "").strip()
+            event_date = str(spec["event_date"] or "").strip()
+            event_time = str(spec.get("event_time") or "").strip() or None
+            legacy_ids = tuple(int(value) for value in spec["legacy_reminder_ids"])
+        except (KeyError, TypeError, ValueError):
+            return [], "invalid"
+        raw_participants = spec.get("participants", [])
+        if not isinstance(raw_participants, (list, tuple)):
+            return [], "invalid"
+        if (
+            not title
+            or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", event_date)
+            or not legacy_ids
+            or any(value not in expected_by_id for value in legacy_ids)
+            or mapped_ids.intersection(legacy_ids)
+        ):
+            return [], "invalid"
+        mapped_ids.update(legacy_ids)
+        event_id = str(spec.get("event_id") or "").strip() or uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"line-bot:legacy-calendar-repair:{normalized_group}:{event_date}:{title}",
+        ).hex
+        normalized_specs.append(
+            {
+                "event_id": event_id,
+                "group_id": normalized_group,
+                "title": title,
+                "event_date": event_date,
+                "event_time": event_time,
+                "location": str(spec.get("location") or "").strip() or None,
+                "participants": json.dumps(
+                    [str(value).strip() for value in raw_participants if str(value).strip()],
+                    ensure_ascii=False,
+                ),
+                "source_msg_id": str(spec.get("source_msg_id") or "").strip() or None,
+                "status": "active",
+                "event_type": _validate_event_type(str(spec.get("event_type") or "")),
+                "legacy_reminder_ids": legacy_ids,
+            }
+        )
+    if mapped_ids != set(expected_by_id):
+        return [], "invalid"
+
+    event_ids = [str(spec["event_id"]) for spec in normalized_specs]
+    try:
+        _ensure_memory_db_path()
+        with _lock, _conn() as c:
+            c.row_factory = sqlite3.Row
+            c.execute("BEGIN IMMEDIATE")
+            existing_events = c.execute(
+                f"SELECT * FROM events WHERE group_id=? AND event_id IN ({','.join(['?'] * len(event_ids))})",
+                (normalized_group, *event_ids),
+            ).fetchall()
+            if existing_events:
+                if len(existing_events) != len(event_ids):
+                    return [], "conflict"
+                events_by_id = {
+                    str(row["event_id"]): row for row in existing_events
+                }
+                for spec in normalized_specs:
+                    row = events_by_id.get(str(spec["event_id"]))
+                    if row is None:
+                        return [], "conflict"
+                    for key in (
+                        "group_id",
+                        "title",
+                        "event_date",
+                        "event_time",
+                        "location",
+                        "source_msg_id",
+                        "status",
+                        "event_type",
+                    ):
+                        if str(row[key] or "") != str(spec[key] or ""):
+                            return [], "conflict"
+                    if _event_participants(dict(row)) != _event_participants(spec):
+                        return [], "conflict"
+                old_rows = c.execute(
+                    f"SELECT * FROM reminders WHERE group_id=? AND reminder_id IN ({','.join(['?'] * len(expected_by_id))})",
+                    (normalized_group, *expected_by_id),
+                ).fetchall()
+                mirrors = c.execute(
+                    f"SELECT * FROM reminders WHERE group_id=? AND source_kind=? AND source_ref IN ({','.join(['?'] * len(event_ids))})",
+                    (normalized_group, EVENT_REMINDER_SOURCE_KIND, *event_ids),
+                ).fetchall()
+                if len(old_rows) != len(expected_by_id) or any(
+                    str(row["status"]) != "cancelled" for row in old_rows
+                ):
+                    return [], "conflict"
+                mirrors_by_source: dict[str, list[sqlite3.Row]] = {}
+                for row in mirrors:
+                    mirrors_by_source.setdefault(str(row["source_ref"]), []).append(row)
+                old_by_id = {int(row["reminder_id"]): row for row in old_rows}
+                for spec in normalized_specs:
+                    event_mirrors = mirrors_by_source.get(str(spec["event_id"]), [])
+                    if len(event_mirrors) != 1 or str(event_mirrors[0]["status"]) != "pending":
+                        return [], "conflict"
+                    mirror = event_mirrors[0]
+                    expected_push = {
+                        column: max(
+                            int(old_by_id[value][column] or 0)
+                            for value in spec["legacy_reminder_ids"]
+                        )
+                        for column in _LEGACY_REPAIR_PUSH_COLUMNS
+                    }
+                    event_row = events_by_id[str(spec["event_id"])]
+                    for offset, push_column in (
+                        (3, "pushed_3d"),
+                        (1, "pushed_1d"),
+                        (0, "pushed_now"),
+                    ):
+                        if (
+                            expected_push[push_column]
+                            and event_row[f"reminded_{offset}d"] is None
+                        ):
+                            return [], "conflict"
+                    if any(
+                        int(mirror[column] or 0) < expected_push[column]
+                        for column in _LEGACY_REPAIR_PUSH_COLUMNS
+                    ):
+                        return [], "conflict"
+                    expected_remind_at = _event_to_remind_at(
+                        str(spec["event_date"]),
+                        spec["event_time"],  # type: ignore[arg-type]
+                    )
+                    if int(mirror["remind_at"]) != int(expected_remind_at or -1):
+                        return [], "conflict"
+                    expected_action, _expected_at, expected_source = (
+                        _corrected_event_payload_conn(c, spec)
+                    )
+                    raw_user_id = ""
+                    raw_text = ""
+                    source_msg_id = str(spec.get("source_msg_id") or "")
+                    if source_msg_id:
+                        raw = c.execute(
+                            "SELECT user_id,text FROM raw_messages "
+                            "WHERE group_id=? AND message_id=?",
+                            (normalized_group, source_msg_id),
+                        ).fetchone()
+                        if raw is not None:
+                            raw_user_id = str(raw[0] or "").strip()
+                            raw_text = str(raw[1] or "")
+                    expected_aliases = _merge_mention_aliases(
+                        _event_participants(spec),
+                        _raw_text_reminder_aliases(raw_text),
+                    )
+                    if (
+                        str(mirror["action"] or "") != expected_action
+                        or str(mirror["source_text"] or "") != expected_source
+                        or str(mirror["user_id"] or "") != raw_user_id
+                        or _event_participants(
+                            {"participants": mirror["mention_aliases"]}
+                        )
+                        != expected_aliases
+                    ):
+                        return [], "conflict"
+                    bad_migrated_ref = c.execute(
+                        "SELECT 1 FROM sent_reminder_refs WHERE group_id=? "
+                        "AND reminder_id=? AND NOT (source_kind=? AND source_ref=?) "
+                        "LIMIT 1",
+                        (
+                            normalized_group,
+                            int(mirror["reminder_id"]),
+                            EVENT_REMINDER_SOURCE_KIND,
+                            spec["event_id"],
+                        ),
+                    ).fetchone()
+                    if bad_migrated_ref is not None:
+                        return [], "conflict"
+                lingering_refs = c.execute(
+                    f"SELECT 1 FROM sent_reminder_refs WHERE group_id=? "
+                    f"AND reminder_id IN ({','.join(['?'] * len(expected_by_id))}) LIMIT 1",
+                    (normalized_group, *expected_by_id),
+                ).fetchone()
+                if lingering_refs is not None:
+                    return [], "conflict"
+                return event_ids, "already_applied"
+
+            placeholders = ",".join(["?"] * len(expected_by_id))
+            legacy_rows = c.execute(
+                f"SELECT * FROM reminders WHERE group_id=? AND reminder_id IN ({placeholders}) ORDER BY reminder_id",
+                (normalized_group, *expected_by_id),
+            ).fetchall()
+            if len(legacy_rows) != len(expected_by_id):
+                return [], "conflict"
+            for row in legacy_rows:
+                expectation = expected_by_id[int(row["reminder_id"])]
+                for key in ("action", "remind_at", "status", "source_kind", "source_ref"):
+                    expected = expectation.get(key, "" if key in {"source_kind", "source_ref"} else None)
+                    actual = row[key]
+                    if key == "remind_at":
+                        if int(actual) != int(expected):
+                            return [], "conflict"
+                    elif str(actual or "") != str(expected or ""):
+                        return [], "conflict"
+
+            required_messages = {
+                str(spec.get("source_msg_id") or "") for spec in normalized_specs
+                if str(spec.get("source_msg_id") or "")
+            }
+            required_messages.update(str(value) for value in (correction_message_ids or []) if str(value))
+            if required_messages:
+                message_placeholders = ",".join(["?"] * len(required_messages))
+                found_messages = c.execute(
+                    f"SELECT message_id FROM raw_messages WHERE group_id=? AND message_id IN ({message_placeholders})",
+                    (normalized_group, *sorted(required_messages)),
+                ).fetchall()
+                if {str(row[0]) for row in found_messages} != required_messages:
+                    return [], "conflict"
+
+            live_claim = c.execute(
+                f"SELECT 1 FROM reminder_delivery_claims WHERE group_id=? "
+                f"AND state IN ('sending','uncertain') AND subject_ref IN ({placeholders}) LIMIT 1",
+                (normalized_group, *(str(value) for value in expected_by_id)),
+            ).fetchone()
+            if live_claim is not None:
+                return [], "busy"
+
+            for spec in normalized_specs:
+                semantic_candidates = _semantic_event_candidates_conn(c, spec)
+                if semantic_candidates:
+                    return [], "conflict"
+                mapped_placeholders = ",".join(
+                    ["?"] * len(spec["legacy_reminder_ids"])
+                )
+                bad_sent_ref = c.execute(
+                    "SELECT 1 FROM sent_reminder_refs WHERE group_id=? "
+                    f"AND reminder_id IN ({mapped_placeholders}) AND NOT ("
+                    "(COALESCE(source_kind,'')='' AND COALESCE(source_ref,'')='') OR "
+                    "(source_kind=? AND source_ref=?)) LIMIT 1",
+                    (
+                        normalized_group,
+                        *spec["legacy_reminder_ids"],
+                        EVENT_REMINDER_SOURCE_KIND,
+                        spec["event_id"],
+                    ),
+                ).fetchone()
+                if bad_sent_ref is not None:
+                    return [], "conflict"
+
+            legacy_by_id = {int(row["reminder_id"]): row for row in legacy_rows}
+            for spec in normalized_specs:
+                updated_mirror = c.execute(
+                    "INSERT INTO events(event_id,group_id,title,event_date,event_time,"
+                    "location,participants,source_msg_id,status,created_at,event_type) "
+                    "VALUES (?,?,?,?,?,?,?,?, 'active', ?, ?)",
+                    (
+                        spec["event_id"],
+                        normalized_group,
+                        spec["title"],
+                        spec["event_date"],
+                        spec["event_time"],
+                        spec["location"],
+                        spec["participants"],
+                        spec["source_msg_id"],
+                        int(time.time() * 1000),
+                        spec["event_type"],
+                    ),
+                )
+                if updated_mirror.rowcount != 1:
+                    raise RuntimeError("calendar repair mirror compare-and-set failed")
+                mirror_id = _insert_new_event_reminder_conn(c, spec)
+                mapped_rows = [legacy_by_id[value] for value in spec["legacy_reminder_ids"]]
+                push_values = {
+                    column: max(int(row[column] or 0) for row in mapped_rows)
+                    for column in _LEGACY_REPAIR_PUSH_COLUMNS
+                }
+                c.execute(
+                    "UPDATE reminders SET last_pushed_at=?,weekly_count=?,last_weekly_at=?,"
+                    "pushed_3d=?,pushed_1d=?,pushed_4hr=?,pushed_2hr=?,pushed_1hr=?,pushed_now=? "
+                    "WHERE group_id=? AND reminder_id=? AND status='pending' "
+                    "AND source_kind=? AND source_ref=?",
+                    (
+                        *(push_values[column] for column in _LEGACY_REPAIR_PUSH_COLUMNS),
+                        normalized_group,
+                        mirror_id,
+                        EVENT_REMINDER_SOURCE_KIND,
+                        spec["event_id"],
+                    ),
+                )
+                event_offset_updates = {
+                    3: push_values["pushed_3d"],
+                    1: push_values["pushed_1d"],
+                    0: push_values["pushed_now"],
+                }
+                for offset, was_pushed in event_offset_updates.items():
+                    if was_pushed:
+                        c.execute(
+                            f"UPDATE events SET reminded_{offset}d=? WHERE group_id=? AND event_id=?",
+                            (
+                                (push_values["last_pushed_at"] or int(time.time())) * 1000,
+                                normalized_group,
+                                spec["event_id"],
+                            ),
+                        )
+                mapped_placeholders = ",".join(["?"] * len(spec["legacy_reminder_ids"]))
+                c.execute(
+                    "UPDATE sent_reminder_refs SET reminder_id=?,source_kind=?,source_ref=? "
+                    f"WHERE group_id=? AND reminder_id IN ({mapped_placeholders})",
+                    (
+                        mirror_id,
+                        EVENT_REMINDER_SOURCE_KIND,
+                        spec["event_id"],
+                        normalized_group,
+                        *spec["legacy_reminder_ids"],
+                    ),
+                )
+            cancelled = c.execute(
+                f"UPDATE reminders SET status='cancelled' WHERE group_id=? "
+                f"AND status='pending' AND reminder_id IN ({placeholders})",
+                (normalized_group, *expected_by_id),
+            )
+            if cancelled.rowcount != len(expected_by_id):
+                raise RuntimeError("legacy reminder repair compare-and-set failed")
+    except (OSError, RuntimeError, sqlite3.Error, ValueError):
+        return [], "unavailable"
+    return event_ids, "created"
 
 
 def insert_event(
@@ -1856,6 +2238,44 @@ def list_past(group_id: str, days: int = 30) -> list[dict]:
             (group_id, since, today_iso),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def list_upcoming_by_title_keyword(
+    group_id: str,
+    keyword: str,
+    limit: int = 5,
+) -> list[dict]:
+    """Return bounded future canonical events whose title contains ``keyword``.
+
+    This reader is intentionally narrower than :func:`search_by_keyword`: a
+    topic-only schedule question must not match another event merely because
+    its location or participants happen to contain the topic text.
+    """
+    normalized_group_id = str(group_id or "").strip()
+    normalized_keyword = str(keyword or "").strip()
+    if not normalized_group_id or not normalized_keyword:
+        return []
+    try:
+        bounded_limit = max(1, min(int(limit), 50))
+    except (TypeError, ValueError):
+        bounded_limit = 5
+    title_pattern = f"%{_escape_like(normalized_keyword)}%"
+    with _lock, _conn() as c:
+        c.row_factory = sqlite3.Row
+        rows = c.execute(
+            "SELECT event_id, group_id, title, event_date, event_time, status "
+            "FROM events WHERE group_id = ? AND status = 'active' "
+            "AND event_date >= ? AND title LIKE ? ESCAPE '\\' "
+            "ORDER BY event_date ASC, COALESCE(event_time, '') ASC, event_id ASC "
+            "LIMIT ?",
+            (
+                normalized_group_id,
+                _today_tw().isoformat(),
+                title_pattern,
+                bounded_limit,
+            ),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def search_by_keyword(

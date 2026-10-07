@@ -51,6 +51,278 @@ def test_insert_and_list(tmp_calendar_db):
     assert json.loads(events[0]["participants"]) == ["媽媽", "爸爸"]
 
 
+def test_repair_legacy_reminders_as_calendar_events_is_atomic_and_idempotent(
+    tmp_calendar_db,
+):
+    cd = tmp_calendar_db
+    cd._ensure_memory_db_path()
+    with cd._conn() as conn:
+        conn.executemany(
+            "INSERT INTO raw_messages(group_id,message_id,user_id,text,created_at) "
+            "VALUES (?,?,?,?,?)",
+            [
+                ("G1", "M-SCHEDULE", "U1", "兩堂皮拉提斯課", 1),
+                ("G1", "M-CORRECTION", "U1", "時間更正", 2),
+            ],
+        )
+        first = conn.execute(
+            "INSERT INTO reminders(group_id,user_id,action,remind_at,created_at,"
+            "status,source_kind,source_ref,source_text,mention_aliases,last_pushed_at,"
+            "weekly_count,last_weekly_at,pushed_3d) "
+            "VALUES ('G1','U1','有皮拉提斯 南崁上課',100,1,'pending','','','原始','[\"全家\"]',90,2,80,1)"
+        ).lastrowid
+        second = conn.execute(
+            "INSERT INTO reminders(group_id,user_id,action,remind_at,created_at,"
+            "status,source_kind,source_ref,source_text,mention_aliases,last_pushed_at,"
+            "weekly_count,last_weekly_at) "
+            "VALUES ('G1','U1','皮拉提斯 南崁上課',200,1,'pending','','','原始','[\"全家\"]',70,3,60)"
+        ).lastrowid
+        conn.execute(
+            "INSERT INTO sent_reminder_refs(group_id,message_id,reminder_id,created_at) "
+            "VALUES ('G1','OUT-1',?,1)",
+            (first,),
+        )
+
+    expectations = [
+        {
+            "reminder_id": first,
+            "action": "有皮拉提斯 南崁上課",
+            "remind_at": 100,
+            "status": "pending",
+            "source_kind": "",
+            "source_ref": "",
+        },
+        {
+            "reminder_id": second,
+            "action": "皮拉提斯 南崁上課",
+            "remind_at": 200,
+            "status": "pending",
+            "source_kind": "",
+            "source_ref": "",
+        },
+    ]
+    specs = [
+        {
+            "title": "皮拉提斯（包班）",
+            "event_date": "2099-08-30",
+            "event_time": "11:00",
+            "location": "南崁",
+            "participants": ["全家"],
+            "source_msg_id": "M-SCHEDULE",
+            "legacy_reminder_ids": [first],
+        },
+        {
+            "title": "皮拉提斯（包班）",
+            "event_date": "2099-09-13",
+            "event_time": "11:00",
+            "location": "南崁",
+            "participants": ["全家"],
+            "source_msg_id": "M-SCHEDULE",
+            "legacy_reminder_ids": [second],
+        },
+    ]
+
+    event_ids, outcome = cd.repair_legacy_reminders_as_calendar_events(
+        "G1",
+        reminder_expectations=expectations,
+        event_specs=specs,
+        correction_message_ids=["M-CORRECTION"],
+    )
+
+    assert outcome == "created"
+    assert len(event_ids) == 2
+    with cd._conn() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM events WHERE group_id='G1' AND status='active'"
+        ).fetchone()[0] == 2
+        assert conn.execute(
+            "SELECT COUNT(*) FROM reminders WHERE group_id='G1' AND status='cancelled' "
+            "AND reminder_id IN (?,?)",
+            (first, second),
+        ).fetchone()[0] == 2
+        mirrors = conn.execute(
+            "SELECT reminder_id,source_ref,weekly_count,pushed_3d FROM reminders "
+            "WHERE group_id='G1' AND source_kind='calendar_event' ORDER BY remind_at"
+        ).fetchall()
+        assert [(row[2], row[3]) for row in mirrors] == [(2, 1), (3, 0)]
+        sent_ref = conn.execute(
+            "SELECT reminder_id,source_kind,source_ref FROM sent_reminder_refs "
+            "WHERE group_id='G1' AND message_id='OUT-1'"
+        ).fetchone()
+        assert tuple(sent_ref) == (mirrors[0][0], "calendar_event", event_ids[0])
+        assert conn.execute(
+            "SELECT reminded_3d FROM events WHERE event_id=?",
+            (event_ids[0],),
+        ).fetchone()[0] == 90 * 1000
+
+    same_ids, second_outcome = cd.repair_legacy_reminders_as_calendar_events(
+        "G1",
+        reminder_expectations=expectations,
+        event_specs=specs,
+        correction_message_ids=["M-CORRECTION"],
+    )
+    assert (same_ids, second_outcome) == (event_ids, "already_applied")
+
+    with cd._conn() as conn:
+        conn.execute(
+            "UPDATE events SET reminded_3d=NULL WHERE group_id='G1' AND event_id=?",
+            (event_ids[0],),
+        )
+    flag_drift_ids, flag_drift_outcome = cd.repair_legacy_reminders_as_calendar_events(
+        "G1",
+        reminder_expectations=expectations,
+        event_specs=specs,
+        correction_message_ids=["M-CORRECTION"],
+    )
+    assert (flag_drift_ids, flag_drift_outcome) == ([], "conflict")
+    with cd._conn() as conn:
+        conn.execute(
+            "UPDATE events SET reminded_3d=? WHERE group_id='G1' AND event_id=?",
+            (90 * 1000, event_ids[0]),
+        )
+        conn.execute(
+            "UPDATE reminders SET action='漂移內容' WHERE reminder_id=?",
+            (mirrors[0][0],),
+        )
+    mirror_drift_ids, mirror_drift_outcome = cd.repair_legacy_reminders_as_calendar_events(
+        "G1",
+        reminder_expectations=expectations,
+        event_specs=specs,
+        correction_message_ids=["M-CORRECTION"],
+    )
+    assert (mirror_drift_ids, mirror_drift_outcome) == ([], "conflict")
+    with cd._conn() as conn:
+        conn.execute(
+            "UPDATE reminders SET action='皮拉提斯（包班）' WHERE reminder_id=?",
+            (mirrors[0][0],),
+        )
+        conn.execute(
+            "UPDATE sent_reminder_refs SET source_ref='OTHER' "
+            "WHERE group_id='G1' AND message_id='OUT-1'"
+        )
+    ref_drift_ids, ref_drift_outcome = cd.repair_legacy_reminders_as_calendar_events(
+        "G1",
+        reminder_expectations=expectations,
+        event_specs=specs,
+        correction_message_ids=["M-CORRECTION"],
+    )
+    assert (ref_drift_ids, ref_drift_outcome) == ([], "conflict")
+    with cd._conn() as conn:
+        conn.execute(
+            "UPDATE sent_reminder_refs SET source_ref=? "
+            "WHERE group_id='G1' AND message_id='OUT-1'",
+            (event_ids[0],),
+        )
+        conn.execute(
+            "UPDATE events SET event_time='12:00' WHERE group_id='G1' AND event_id=?",
+            (event_ids[0],),
+        )
+    drift_ids, drift_outcome = cd.repair_legacy_reminders_as_calendar_events(
+        "G1",
+        reminder_expectations=expectations,
+        event_specs=specs,
+        correction_message_ids=["M-CORRECTION"],
+    )
+    assert (drift_ids, drift_outcome) == ([], "conflict")
+
+
+def test_repair_legacy_reminders_rejects_preimage_drift_without_partial_write(
+    tmp_calendar_db,
+):
+    cd = tmp_calendar_db
+    cd._ensure_memory_db_path()
+    with cd._conn() as conn:
+        conn.execute(
+            "INSERT INTO raw_messages(group_id,message_id,user_id,text,created_at) "
+            "VALUES ('G1','M1','U1','皮拉提斯',1)"
+        )
+        reminder_id = conn.execute(
+            "INSERT INTO reminders(group_id,user_id,action,remind_at,created_at,status) "
+            "VALUES ('G1','U1','真正內容',100,1,'pending')"
+        ).lastrowid
+
+    event_ids, outcome = cd.repair_legacy_reminders_as_calendar_events(
+        "G1",
+        reminder_expectations=[
+            {
+                "reminder_id": reminder_id,
+                "action": "錯誤前像",
+                "remind_at": 100,
+                "status": "pending",
+                "source_kind": "",
+                "source_ref": "",
+            }
+        ],
+        event_specs=[
+            {
+                "title": "皮拉提斯",
+                "event_date": "2099-08-30",
+                "event_time": "11:00",
+                "source_msg_id": "M1",
+                "legacy_reminder_ids": [reminder_id],
+            }
+        ],
+    )
+
+    assert (event_ids, outcome) == ([], "conflict")
+    with cd._conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT status FROM reminders WHERE reminder_id=?",
+            (reminder_id,),
+        ).fetchone()[0] == "pending"
+
+
+def test_repair_legacy_reminders_refuses_prelinked_sent_reference(tmp_calendar_db):
+    cd = tmp_calendar_db
+    cd._ensure_memory_db_path()
+    with cd._conn() as conn:
+        conn.execute(
+            "INSERT INTO raw_messages(group_id,message_id,user_id,text,created_at) "
+            "VALUES ('G1','M1','U1','皮拉提斯',1)"
+        )
+        reminder_id = conn.execute(
+            "INSERT INTO reminders(group_id,user_id,action,remind_at,created_at,status) "
+            "VALUES ('G1','U1','有皮拉提斯上課',100,1,'pending')"
+        ).lastrowid
+        conn.execute(
+            "INSERT INTO sent_reminder_refs(group_id,message_id,reminder_id,source_kind,"
+            "source_ref,created_at) VALUES ('G1','OUT-1',?,'calendar_event','OTHER',1)",
+            (reminder_id,),
+        )
+
+    event_ids, outcome = cd.repair_legacy_reminders_as_calendar_events(
+        "G1",
+        reminder_expectations=[
+            {
+                "reminder_id": reminder_id,
+                "action": "有皮拉提斯上課",
+                "remind_at": 100,
+                "status": "pending",
+                "source_kind": "",
+                "source_ref": "",
+            }
+        ],
+        event_specs=[
+            {
+                "title": "皮拉提斯",
+                "event_date": "2099-08-30",
+                "event_time": "11:00",
+                "source_msg_id": "M1",
+                "legacy_reminder_ids": [reminder_id],
+            }
+        ],
+    )
+
+    assert (event_ids, outcome) == ([], "conflict")
+    with cd._conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT status FROM reminders WHERE reminder_id=?",
+            (reminder_id,),
+        ).fetchone()[0] == "pending"
+
+
 def test_cancel(tmp_calendar_db):
     cd = tmp_calendar_db
     eid = cd.insert_event(
@@ -79,6 +351,47 @@ def test_find_active_event_does_not_fall_back_on_selector_miss(tmp_calendar_db):
     assert cd.find_active_event("G1", keyword="不存在的活動") is None
     assert cd.find_active_event("G1", near_date="2099-12-31") is None
     assert cd.find_active_event("G1") is None
+
+
+def test_list_upcoming_by_title_keyword_is_group_scoped_and_nearest_first(
+    tmp_calendar_db,
+):
+    cd = tmp_calendar_db
+    today = cd._today_tw()
+    past = (today - timedelta(days=1)).isoformat()
+    first = (today + timedelta(days=2)).isoformat()
+    second = (today + timedelta(days=16)).isoformat()
+
+    cd.insert_event("G1", "皮拉提斯（包班）", past, event_time="11:00")
+    cancelled_id = cd.insert_event(
+        "G1", "皮拉提斯（取消）", first, event_time="09:00"
+    )
+    cd.cancel_event(cancelled_id)
+    cd.insert_event(
+        "G1", "家族聚餐", first, event_time="10:00", location="皮拉提斯教室"
+    )
+    first_id = cd.insert_event(
+        "G1", "皮拉提斯（包班）", first, event_time="11:00"
+    )
+    second_id = cd.insert_event(
+        "G1", "皮拉提斯（包班）", second, event_time="11:00"
+    )
+    cd.insert_event("G2", "皮拉提斯（別群）", first, event_time="08:00")
+
+    rows = cd.list_upcoming_by_title_keyword("G1", "皮拉提斯", limit=5)
+
+    assert [row["event_id"] for row in rows] == [first_id, second_id]
+    assert all(row["group_id"] == "G1" for row in rows)
+    assert all(row["status"] == "active" for row in rows)
+
+
+def test_list_upcoming_by_title_keyword_escapes_like_wildcards(tmp_calendar_db):
+    cd = tmp_calendar_db
+    event_date = (cd._today_tw() + timedelta(days=2)).isoformat()
+    cd.insert_event("G1", "皮拉提斯（包班）", event_date)
+
+    assert cd.list_upcoming_by_title_keyword("G1", "%", limit=5) == []
+    assert cd.list_upcoming_by_title_keyword("G1", "_", limit=5) == []
 
 
 def test_find_active_event_refuses_ambiguous_selector(tmp_calendar_db):
@@ -402,7 +715,7 @@ def test_badminton_event_syncs_to_booking_reminder_on_booking_window(tmp_calenda
         title="全家打羽球",
         event_date=event_date,
         event_time="16:00",
-        participants=["妹妹"],
+        participants=["測試成員甲"],
     )
     assert event_id
 
@@ -412,8 +725,8 @@ def test_badminton_event_syncs_to_booking_reminder_on_booking_window(tmp_calenda
     assert reminders[0]["source_kind"] == "calendar_event"
     assert reminders[0]["source_ref"] == event_id
     assert reminders[0]["remind_at"] == expected_at
-    assert reminders[0]["action"] == f"妹妹負責預約{_month_day_label(event_date)}打羽球場地"
-    assert reminders[0]["mention_aliases"] == ["妹妹"]
+    assert reminders[0]["action"] == f"測試成員甲負責預約{_month_day_label(event_date)}打羽球場地"
+    assert reminders[0]["mention_aliases"] == ["測試成員甲"]
 
     cd.sync_active_events_to_reminders("G1")
     resynced = memory.list_pending_reminders("G1")
@@ -432,7 +745,7 @@ def test_badminton_event_can_override_booking_lead_days(tmp_calendar_db):
         title="全家打羽球",
         event_date=event_date,
         event_time="16:00",
-        participants=["妹妹"],
+        participants=["測試成員甲"],
     )
     assert event_id
 
@@ -443,7 +756,7 @@ def test_badminton_event_can_override_booking_lead_days(tmp_calendar_db):
     assert len(reminders) == 1
     assert reminders[0]["source_ref"] == event_id
     assert reminders[0]["remind_at"] == expected_at
-    assert reminders[0]["action"] == f"妹妹負責預約{_month_day_label(event_date)}打羽球場地"
+    assert reminders[0]["action"] == f"測試成員甲負責預約{_month_day_label(event_date)}打羽球場地"
 
     cd.sync_active_events_to_reminders("G1")
     resynced = memory.list_pending_reminders("G1")
@@ -669,7 +982,7 @@ def test_event_reminder_uses_raw_sender_and_participant_aliases(tmp_calendar_db)
         event_date=event_date,
         event_time="10:30",
         source_msg_id=raw_message_id,
-        participants=["妹妹", "媽媽"],
+        participants=["測試成員甲", "媽媽"],
     )
     assert eid
 
@@ -677,26 +990,20 @@ def test_event_reminder_uses_raw_sender_and_participant_aliases(tmp_calendar_db)
     reminder = next(r for r in reminders if r["source_ref"] == eid)
 
     assert reminder["user_id"] == "U_MOM"
-    assert reminder["mention_aliases"] == ["妹妹", "媽媽"]
+    assert reminder["mention_aliases"] == ["測試成員甲", "媽媽"]
 
 
-def test_event_reminder_merges_mentioned_names_from_raw_text(
-    tmp_calendar_db, tmp_path, monkeypatch
-):
+def test_event_reminder_merges_mentioned_names_from_raw_text(tmp_calendar_db):
     cd = tmp_calendar_db
     _align_memory_db_with_calendar(cd)
     import memory
-
-    aliases_path = tmp_path / "user_aliases.json"
-    aliases_path.write_text('{"U_TEST":"妹妹"}\n', encoding="utf-8")
-    monkeypatch.setenv("LINE_USER_ALIASES_PATH", str(aliases_path))
 
     raw_message_id = "msg-source-mentions"
     memory.log_raw_message(
         "G1",
         raw_message_id,
         "U_MOM",
-        "這波家事有 @妹妹 陪同參與",
+        "這波家事有 @測試成員甲 陪同參與",
     )
 
     event_date = (date.today() + timedelta(days=4)).isoformat()
@@ -713,7 +1020,7 @@ def test_event_reminder_merges_mentioned_names_from_raw_text(
     reminders = memory.list_pending_reminders_full("G1")
     reminder = next(r for r in reminders if r["source_ref"] == eid)
 
-    assert reminder["mention_aliases"] == ["媽媽", "妹妹"]
+    assert reminder["mention_aliases"] == ["媽媽", "測試成員甲"]
 
 
 def test_event_reminder_treats_raw_text_family_all_as_all(tmp_calendar_db):

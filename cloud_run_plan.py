@@ -21,7 +21,7 @@ DEFAULT_REGION = "asia-east1"
 DEFAULT_SERVICE = "line-bot"
 DEFAULT_ENV_VARS = {
     "BOT_MUTED": "true",
-    "SQLITE_PATH": "/tmp/line_bot.db",
+    "SQLITE_PATH": "/tmp/line_bot-private/line_bot.db",
     "LOCAL_LLM_PREWARM_DISABLED": "1",
     "JOBS_ROUTES_ENABLED": "0",
     "JOBS_ALLOW_PUBLIC_HTTP": "0",

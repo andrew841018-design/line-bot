@@ -12,9 +12,11 @@ import base64
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -22,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from config import settings
+from reply_policy import is_empty_marker
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +49,20 @@ class ClaudeProviderError(RuntimeError):
 
 class ClaudeCliUnavailable(ClaudeProviderError):
     """The optional logged-in Claude CLI is not installed or not executable."""
+
+
+class ClaudeCliLimitReached(ClaudeQuotaExhausted):
+    """The logged-in account hit its Claude usage limit; ``until`` = retry time."""
+
+    def __init__(self, message: str, *, until: float) -> None:
+        super().__init__(message)
+        self.until = until
+
+
+# claude_usage.json is read-modify-written (the gate keys next to prefer_cli);
+# webhook threads and burst timers share this process.
+_STATE_LOCK = threading.Lock()
+_QUOTA_KEYS = ("quota_exhausted_until", "reason")
 
 
 def _load_state() -> dict[str, Any]:
@@ -103,20 +120,35 @@ def quota_status(now: float | None = None) -> dict[str, Any]:
     }
 
 
-def _mark_quota_exhausted(reason: str) -> None:
-    cooldown = max(60, int(settings.claude_quota_cooldown_sec))
-    _save_state(
-        {
-            "quota_exhausted_until": time.time() + cooldown,
-            "reason": reason[:160],
-            "updated_at": time.time(),
-        }
-    )
+def _mark_quota_exhausted(reason: str, *, until: float | None = None) -> None:
+    """Open the provider gate, merged into the state (keeps ``prefer_cli``).
+
+    2026-10-04: this used to rewrite the whole file.  Production has no API
+    key, so the CLI runs only because of ``prefer_cli``; losing it on the
+    first quota error disabled Claude for good.  ``reason`` is a category,
+    never CLI output.
+    """
+    now = time.time()
+    if until is None:
+        until = now + max(60, int(settings.claude_quota_cooldown_sec))
+    with _STATE_LOCK:
+        state = _load_state()
+        state["quota_exhausted_until"] = until
+        state["reason"] = reason[:160]
+        state["updated_at"] = now
+        _save_state(state)
 
 
 def _clear_quota_exhausted() -> None:
-    if _load_state().get("quota_exhausted_until"):
-        _save_state({})
+    """Close the gate: drop only the gate keys, keep ``prefer_cli``."""
+    with _STATE_LOCK:
+        state = _load_state()
+        if not state.get("quota_exhausted_until"):
+            return
+        for key in _QUOTA_KEYS:
+            state.pop(key, None)
+        state["updated_at"] = time.time()
+        _save_state(state)
 
 
 def _prefer_cli() -> bool:
@@ -124,7 +156,14 @@ def _prefer_cli() -> bool:
 
 
 def _remember_cli_preference() -> None:
-    _save_state({"prefer_cli": True, "updated_at": time.time()})
+    """A working CLI: prefer it from now on; any (expired) gate is over."""
+    with _STATE_LOCK:
+        state = _load_state()
+        state["prefer_cli"] = True
+        for key in _QUOTA_KEYS:
+            state.pop(key, None)
+        state["updated_at"] = time.time()
+        _save_state(state)
 
 
 def _cli_executable() -> str | None:
@@ -208,6 +247,19 @@ def _merge_history(context: list[tuple[str, str]] | None) -> list[dict[str, Any]
     return messages
 
 
+def _with_no_search_contract(system: str) -> str:
+    """Claude runs without any search tool (CLI ``--tools ""``; API without tools).
+
+    2026-10-03: it denied a recent, widely reported event from stale memory and
+    claimed to have re-checked; the shared prompt never told it it cannot search.
+    """
+    import gemini_client
+    import reply_policy
+
+    system = gemini_client.without_search_instructions(system)
+    return f"{system}\n\n{reply_policy.NO_SEARCH_CONTRACT}"
+
+
 def _build_payload(
     user_input: Any,
     context: list[tuple[str, str]],
@@ -221,10 +273,12 @@ def _build_payload(
     # does not silently remove the user's existing response constraints.
     import gemini_client
 
-    system = gemini_client._build_system_instruction(
-        facts,
-        persona_notes,
-        user_input=user_input,
+    system = _with_no_search_contract(
+        gemini_client._build_system_instruction(
+            facts,
+            persona_notes,
+            user_input=user_input,
+        )
     )
     messages = _merge_history(context)
     if messages and messages[-1]["role"] == "user":
@@ -267,10 +321,12 @@ def _build_cli_prompt(
         return None
     import gemini_client
 
-    system = gemini_client._build_system_instruction(
-        facts,
-        persona_notes,
-        user_input=user_input,
+    system = _with_no_search_contract(
+        gemini_client._build_system_instruction(
+            facts,
+            persona_notes,
+            user_input=user_input,
+        )
     )
     history = _merge_history(context)
     history_lines = []
@@ -310,6 +366,88 @@ def _api_credit_empty(error_text: str) -> bool:
     )
 
 
+_PROMPT_FILE_PREFIX = "line-bot-claude-"
+_STALE_PROMPT_FILE_SEC = 600
+_CHILD_SECRET_ENV_RE = re.compile(
+    r"API[_-]?KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH", re.IGNORECASE
+)
+
+
+def _remove_stale_prompt_files() -> None:
+    """Delete system-prompt files a killed worker left behind (they hold facts)."""
+    cutoff = time.time() - _STALE_PROMPT_FILE_SEC
+    try:
+        for path in Path(tempfile.gettempdir()).glob(_PROMPT_FILE_PREFIX + "*.txt"):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+
+# 2026-10-04: the account's usage limit (shared with Andrew's own Claude Code)
+# was classified "exit 1 (other)": no cooldown, a failed call for every
+# message.  Notices seen: "Claude AI usage limit reached|<epoch>", "5-hour
+# limit reached ∙ resets 3pm", "Weekly limit reached ∙ resets Oct 9, 3pm",
+# "You've hit your limit · resets 11pm (Asia/Taipei)".  stdout can echo chat
+# or model text, so it only counts as a short line that is nothing but such a
+# notice, and a reset epoch is read from stderr alone (a 7-day cooldown from
+# echoed text would silence Claude for a week).
+_CLI_LIMIT_RE = re.compile(
+    r"usage limit|limit reached|hit your limit|(?:5-hour|weekly|session|opus) limit|/upgrade",
+    re.IGNORECASE,
+)
+_CLI_LIMIT_RESETS_RE = re.compile(r"\bresets?\b", re.IGNORECASE)
+_CLI_LIMIT_LINE_RE = re.compile(
+    r"(?:claude ai )?usage limit reached(?:\s*\|\s*\d{9,11})?"
+    r"|(?:5-hour|weekly|session|opus|sonnet)(?: usage)? limit reached\b.{0,80}"
+    r"|you(?:'|’)ve hit your (?:usage )?limit\b.{0,80}",
+    re.IGNORECASE,
+)
+_CLI_LIMIT_LINE_MAX_CHARS = 160
+_CLI_LIMIT_EPOCH_RE = re.compile(r"limit reached\s*\|\s*(\d{10})\b", re.IGNORECASE)
+_CLI_LIMIT_MIN_SEC = 600
+_CLI_LIMIT_MAX_SEC = 7 * 86400
+
+
+def _stderr_reports_limit(stderr: str) -> bool:
+    text = stderr or ""
+    if _CLI_LIMIT_RE.search(text):
+        return True
+    return "limit" in text.lower() and _CLI_LIMIT_RESETS_RE.search(text) is not None
+
+
+def _is_limit_notice_line(line: str) -> bool:
+    line = (line or "").strip()
+    return (
+        0 < len(line) <= _CLI_LIMIT_LINE_MAX_CHARS
+        and _CLI_LIMIT_LINE_RE.fullmatch(line) is not None
+    )
+
+
+def _cli_limit_until(stderr: str, now: float) -> float:
+    """Retry time: the epoch the CLI printed on stderr (10 min–7 days), else
+    ``CLAUDE_CLI_LIMIT_COOLDOWN_SEC`` from now."""
+    match = _CLI_LIMIT_EPOCH_RE.search(stderr or "")
+    if match:
+        until = float(match.group(1))
+        return min(max(until, now + _CLI_LIMIT_MIN_SEC), now + _CLI_LIMIT_MAX_SEC)
+    return now + max(60, int(getattr(settings, "claude_cli_limit_cooldown_sec", 1800)))
+
+
+def _cli_failure_kind(detail: str) -> str:
+    lowered = (detail or "").lower()
+    if any(k in lowered for k in ("log in", "login", "auth", "unauthorized", "401", "403")):
+        return "auth"
+    if "model" in lowered:
+        return "model"
+    if "unknown option" in lowered or "error: option" in lowered:
+        return "usage"
+    return "other"
+
+
 def _chat_via_cli(
     user_input: Any,
     context: list[tuple[str, str]],
@@ -323,49 +461,97 @@ def _chat_via_cli(
     if prompt_parts is None:
         return None
     system_prompt, user_prompt = prompt_parts
-    child_env = os.environ.copy()
     # Force account-session auth. An API key in the child environment would
-    # make Claude Code charge the API account instead of Settings > Usage.
-    for name in (
-        "ANTHROPIC_API_KEY",
-        "CLAUDE_API_KEY",
-        "AGENT_CLAUDE_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-    ):
-        child_env.pop(name, None)
+    # make Claude Code charge the API account instead of Settings > Usage; the
+    # bot's other credentials (Gemini, LINE, Discord…) are no business of it.
+    child_env = {
+        name: value
+        for name, value in os.environ.items()
+        if not _CHILD_SECRET_ENV_RE.search(name)
+    }
     timeout = max(10, int(settings.claude_cli_timeout_sec))
+    # 2026-09-26: without these flags `claude -p` loaded Andrew's own Claude Code
+    # setup — default opus model, hooks, CLAUDE.md, MCP servers — and replies
+    # timed out after 60 s.  --safe-mode drops customisations but keeps the
+    # account login (--bare would demand an API key); --setting-sources "" skips
+    # user/project/local settings.  Chat text goes through stdin and a 0600 file,
+    # never argv, and the session is not saved under ~/.claude.
+    _remove_stale_prompt_files()
+    system_prompt_path = ""
     try:
+        fd, system_prompt_path = tempfile.mkstemp(prefix=_PROMPT_FILE_PREFIX, suffix=".txt")
+        try:
+            handle = os.fdopen(fd, "w", encoding="utf-8")
+        except BaseException:
+            os.close(fd)
+            raise
+        with handle:
+            handle.write(system_prompt)
         completed = subprocess.run(
             [
                 executable,
                 "-p",
-                user_prompt,
-                "--system-prompt",
-                system_prompt,
+                "--system-prompt-file",
+                system_prompt_path,
+                "--model",
+                settings.claude_cli_model,
                 "--effort",
                 "low",
                 "--output-format",
                 "text",
+                "--safe-mode",
+                "--setting-sources",
+                "",
+                "--strict-mcp-config",
+                "--tools",
+                "",
+                "--no-session-persistence",
             ],
+            input=user_prompt,
             check=False,
             text=True,
             capture_output=True,
-            stdin=subprocess.DEVNULL,
             timeout=timeout,
             env=child_env,
         )
     except subprocess.TimeoutExpired as exc:
         raise ClaudeProviderError(f"CLI timeout after {timeout}s") from exc
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         raise ClaudeCliUnavailable(type(exc).__name__) from exc
+    finally:
+        if system_prompt_path:
+            try:
+                os.unlink(system_prompt_path)
+            except OSError as exc:
+                logger.warning("claude prompt file not removed error_type=%s", type(exc).__name__)
+    stdout = completed.stdout or ""
+    stderr = completed.stderr or ""
     if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout or "CLI failed").strip()
+        # The raw output can echo the conversation; logs and state get a category.
+        if _stderr_reports_limit(stderr) or any(
+            _is_limit_notice_line(line) for line in stdout.splitlines()
+        ):
+            raise ClaudeCliLimitReached(
+                f"CLI usage limit (exit {completed.returncode})",
+                until=_cli_limit_until(stderr, time.time()),
+            )
+        detail = (stderr or stdout or "CLI failed").strip()
         if _quota_error(completed.returncode, detail):
-            raise ClaudeQuotaExhausted(detail[:1200])
-        raise ClaudeProviderError(detail[:300])
-    text = (completed.stdout or "").strip()
-    if not text:
-        raise ClaudeProviderError("CLI returned empty output")
+            raise ClaudeQuotaExhausted(f"CLI quota or rate limit (exit {completed.returncode})")
+        raise ClaudeProviderError(
+            f"CLI exit {completed.returncode} ({_cli_failure_kind(detail)})"
+        )
+    text = stdout.strip()
+    if _is_limit_notice_line(text):
+        # Printed as if it were the answer: never send it to the family.
+        raise ClaudeCliLimitReached(
+            "CLI usage limit (exit 0)", until=_cli_limit_until(stderr, time.time())
+        )
+    if is_empty_marker(text):
+        # A clean exit with nothing printed is Claude following
+        # NO_REPEAT_CONTRACT ("nothing new → empty string"), not a failure.
+        logger.info("primary reply provider=claude-cli chose not to reply")
+        return ""
     logger.info("primary reply provider=claude-cli")
     return text
 
@@ -423,11 +609,15 @@ def chat(
 ) -> str | None:
     """Try Claude once; return ``None`` to let the caller use Gemini."""
     if settings.claude_use_cli or _prefer_cli():
+        # 2026-09-27: a quota error from the CLI cools it down too.
+        if quota_exhausted():
+            logger.info("Claude quota gate active; using Gemini")
+            return None
         try:
             result = _chat_via_cli(user_input, context, facts, persona_notes)
         except ClaudeQuotaExhausted as exc:
-            _mark_quota_exhausted(str(exc))
-            logger.warning("Claude CLI quota gate opened; using Gemini")
+            _mark_quota_exhausted(str(exc), until=getattr(exc, "until", None))
+            logger.warning("Claude CLI quota gate opened (%s); using Gemini", exc)
             return None
         except ClaudeCliUnavailable:
             if not settings.claude_api_key:
@@ -436,10 +626,12 @@ def chat(
             logger.warning("Claude CLI request failed; using Gemini (%s)", exc)
             return None
         else:
-            if result:
-                _remember_cli_preference()
-                return result
-            return None
+            if result is None:  # unsupported media for the text-only CLI
+                return None
+            _remember_cli_preference()
+            # "" = nothing new to add; the caller stays silent instead of
+            # asking Gemini to say something anyway.
+            return result
 
     if not settings.claude_api_key:
         return None
@@ -451,7 +643,8 @@ def chat(
         logger.info("Claude input contains unsupported media; using Gemini")
         return None
     try:
-        text = _response_text(_request(payload))
+        data = _request(payload)
+        text = _response_text(data)
     except ClaudeQuotaExhausted as exc:
         error_text = str(exc)
         if _api_credit_empty(error_text):
@@ -460,14 +653,14 @@ def chat(
             except ClaudeCliUnavailable:
                 pass
             except ClaudeQuotaExhausted as cli_exc:
-                _mark_quota_exhausted(str(cli_exc))
-                logger.warning("Claude CLI quota gate opened; using Gemini")
+                _mark_quota_exhausted(str(cli_exc), until=getattr(cli_exc, "until", None))
+                logger.warning("Claude CLI quota gate opened (%s); using Gemini", cli_exc)
                 return None
             except ClaudeProviderError as cli_exc:
                 logger.warning("Claude CLI fallback failed; using Gemini (%s)", cli_exc)
                 return None
             else:
-                if result:
+                if result is not None:
                     _remember_cli_preference()
                     return result
         _mark_quota_exhausted(error_text)
@@ -476,7 +669,12 @@ def chat(
     except ClaudeProviderError as exc:
         logger.warning("Claude request failed; using Gemini (%s)", exc)
         return None
-    if not text:
+    if is_empty_marker(text):
+        if isinstance(data, dict) and data.get("stop_reason") == "end_turn":
+            # Finished normally with nothing new to add: stay silent.
+            _clear_quota_exhausted()
+            logger.info("primary reply provider=claude model=%s chose not to reply", settings.claude_model)
+            return ""
         logger.warning("Claude returned empty output; using Gemini")
         return None
     _clear_quota_exhausted()

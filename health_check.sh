@@ -15,10 +15,17 @@ READY_TIMEOUT_SEC="${READY_TIMEOUT_SEC:-75}"
 UVICORN_LABEL="com.andrew.line-bot-uvicorn"
 UVICORN_PLIST="$HOME/Library/LaunchAgents/${UVICORN_LABEL}.plist"
 CLOUDFLARED_URL_FILE="${CLOUDFLARED_URL_FILE:-/tmp/cloudflared_line_bot_url.txt}"
-RESTART_LOCK_DIR="/tmp/line_bot_restart.lockdir"
+RESTART_LOCK_LIB="$BOT_DIR/restart_lock.sh"
 
 ts() { date '+%Y-%m-%d %H:%M:%S %Z'; }
 say() { echo "[$(ts)] $*" >> "$HC_LOG"; }
+
+if [ ! -r "$RESTART_LOCK_LIB" ]; then
+  say "ERR restart lock helper missing: $RESTART_LOCK_LIB"
+  exit 1
+fi
+# shellcheck source=restart_lock.sh
+source "$RESTART_LOCK_LIB"
 
 wait_for_health() {
   local deadline=$((SECONDS + READY_TIMEOUT_SEC))
@@ -44,21 +51,6 @@ ensure_uvicorn_service() {
     return 1
   fi
   launchctl bootstrap "$domain" "$UVICORN_PLIST"
-}
-
-acquire_restart_lock() {
-  local deadline=$((SECONDS + 30))
-  while [ "$SECONDS" -lt "$deadline" ]; do
-    if mkdir "$RESTART_LOCK_DIR" 2>/dev/null; then
-      return 0
-    fi
-    sleep 1
-  done
-  return 1
-}
-
-release_restart_lock() {
-  rmdir "$RESTART_LOCK_DIR" 2>/dev/null || true
 }
 
 PREFLIGHT_RAN=0
@@ -92,7 +84,7 @@ quick_tunnel_api_dns_ready() {
 recover_cloudflared() {
   say "cloudflared DOWN; delegating restart + fresh generation + webhook E2E to preflight..."
   if ! quick_tunnel_api_dns_ready; then
-    say "ERR cloudflared restart blocked: system resolver cannot resolve api.trycloudflare.com; VPN/private DNS may be blocking it"
+    say "ERR cloudflared restart blocked: authenticated DoH/static-edge bootstrap unavailable"
     CF_ACTION="cf_restart_blocked_dns"
   else
     PREVIOUS_URL=""
@@ -171,9 +163,15 @@ if [ $UVICORN_UP -eq 0 ]; then
       say "ERR .env missing"
       ACTION="restart_failed_no_env"
     elif ! acquire_restart_lock; then
-      say "ERR restart lock timeout (another restart is running)"
-      ACTION="restart_deferred_lock_busy"
+      if [ "$RESTART_LOCK_ERROR_KIND" = "busy" ]; then
+        say "ERR restart lock timeout (another restart is running)"
+        ACTION="restart_deferred_lock_busy"
+      else
+        say "ERR restart lock setup/validation failed"
+        ACTION="restart_failed_lock_error"
+      fi
     else
+      trap release_restart_lock EXIT
       if ! ensure_uvicorn_service; then
         ACTION="restart_failed_launchd_service"
       else
@@ -198,6 +196,7 @@ if [ $UVICORN_UP -eq 0 ]; then
         fi
       fi
       release_restart_lock
+      trap - EXIT
     fi
 fi
 

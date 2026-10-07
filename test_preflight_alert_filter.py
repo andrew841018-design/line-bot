@@ -6,11 +6,10 @@ regardless of alert filter; full audit trail preserved.
 """
 import argparse
 import json
-import socket
 from unittest.mock import patch
 
 import preflight_check as pf
-from quick_tunnel_dns import quick_tunnel_api_dns_check
+from quick_tunnel_dns import BootstrapError, quick_tunnel_api_dns_check
 
 
 def _make_result(idx, name, *, critical, status, detail=""):
@@ -86,9 +85,15 @@ def test_webhook_put_is_generation_fenced(tmp_path):
     put_webhook.assert_not_called()
 
 
-def test_quick_tunnel_dns_uses_system_resolver_and_accepts_ipv6():
-    answer = [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2606:4700::1", 443, 0, 0))]
-    with patch("quick_tunnel_dns.socket.getaddrinfo", return_value=answer) as lookup:
+def test_quick_tunnel_dns_accepts_authenticated_doh_bootstrap():
+    bootstrap = type(
+        "Bootstrap",
+        (),
+        {"api_ips": ("104.16.230.132",), "edges": ("198.41.200.13:7844", "198.41.192.7:7844")},
+    )()
+    with patch("quick_tunnel_dns.build_bootstrap", return_value=bootstrap) as lookup, \
+         patch("quick_tunnel_dns._api_tls_ready", return_value=True), \
+         patch("quick_tunnel_dns._edge_transport_ready", return_value=True):
         ok, reason = quick_tunnel_api_dns_check(timeout=1)
 
     assert ok is True
@@ -96,16 +101,15 @@ def test_quick_tunnel_dns_uses_system_resolver_and_accepts_ipv6():
     lookup.assert_called_once()
 
 
-def test_quick_tunnel_dns_reports_system_resolver_failure():
+def test_quick_tunnel_dns_reports_doh_bootstrap_failure():
     with patch(
-        "quick_tunnel_dns.socket.getaddrinfo",
-        side_effect=socket.gaierror(socket.EAI_NONAME, "nodename nor servname provided"),
+        "quick_tunnel_dns.build_bootstrap",
+        side_effect=BootstrapError("doh_transport_unavailable"),
     ):
         ok, reason = quick_tunnel_api_dns_check(timeout=1)
 
     assert ok is False
-    assert "dns_resolution_failed(api.trycloudflare.com)" in reason
-    assert "system resolver" in reason
+    assert "doh_transport_unavailable" in reason
 
 
 # ---------- _is_transient_error ----------
@@ -316,7 +320,7 @@ def test_line_path_recovery_warranted_for_e2e_only_530():
     assert pf._line_path_recovery_warranted(alignment, e2e) is True
 
 
-def test_preflight_cloudflared_restart_fails_fast_when_quick_tunnel_dns_is_blocked():
+def test_preflight_cloudflared_restart_fails_fast_when_quick_tunnel_dns_is_blocked(tmp_path):
     with patch(
         "preflight_check._quick_tunnel_api_dns_check",
         return_value=(
@@ -324,7 +328,10 @@ def test_preflight_cloudflared_restart_fails_fast_when_quick_tunnel_dns_is_block
             "dns_resolution_failed(api.trycloudflare.com): "
             "resolver returned no IP address; VPN/private DNS may be blocking it",
         ),
-    ), patch("preflight_check.subprocess.run") as run, patch(
+        ), patch(
+            "preflight_check.CLOUDFLARED_RESTART_LOCK_PATH",
+            tmp_path / "cloudflared.lock",
+        ), patch("preflight_check.subprocess.run") as run, patch(
         "preflight_check.time.sleep"
     ) as sleep:
         ok, reason = pf._restart_cloudflared_for_preflight(
@@ -498,7 +505,9 @@ def test_run_unsafe_stash_fails_closed_without_restart(
 
 @patch("preflight_check._send_discord_alert")
 @patch("preflight_check._emit_jsonl")
-def test_run_restarts_cloudflared_when_line_webhook_path_is_stale(mock_jsonl, mock_alert):
+def test_run_restarts_cloudflared_when_line_webhook_path_is_stale(
+    mock_jsonl, mock_alert, tmp_path
+):
     def result(idx, name, *, status="pass", critical=True, detail=""):
         r = pf.CheckResult(idx, name, critical=critical)
         r.status = status
@@ -574,7 +583,8 @@ def test_run_restarts_cloudflared_when_line_webhook_path_is_stale(mock_jsonl, mo
          patch("preflight_check.check_9_gemini", side_effect=lambda model, idx, label: result(idx, f"Gemini {label} probe")), \
          patch("preflight_check.check_10_sqlite", return_value=result(13, "SQLite integrity + WAL checkpoint", critical=False)), \
          patch("preflight_check.check_11_pending", return_value=result(14, "pending file JSON load", critical=False)), \
-         patch("preflight_check._restart_cloudflared_for_preflight", return_value=(True, fresh)) as restart, \
+             patch("preflight_check._restart_cloudflared_for_preflight", return_value=(True, fresh)) as restart, \
+             patch("preflight_check.CLOUDFLARED_RESTART_LOCK_PATH", tmp_path / "restart.lock"), \
          patch("preflight_check._line_token", return_value="fake-token"), \
          patch("preflight_check._write_cache") as write_cache:
         exit_code = pf.run(_args(dry_run=False))

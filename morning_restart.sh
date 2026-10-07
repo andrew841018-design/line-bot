@@ -10,10 +10,17 @@ UVICORN_LOG="$HOME/Library/Logs/line_bot_uvicorn.log"
 READY_TIMEOUT_SEC="${READY_TIMEOUT_SEC:-75}"
 UVICORN_LABEL="com.andrew.line-bot-uvicorn"
 UVICORN_PLIST="$HOME/Library/LaunchAgents/${UVICORN_LABEL}.plist"
-RESTART_LOCK_DIR="/tmp/line_bot_restart.lockdir"
+RESTART_LOCK_LIB="$BOT_DIR/restart_lock.sh"
 
 ts() { date '+%Y-%m-%d %H:%M:%S %Z'; }
 say() { echo "[$(ts)] $*" >> "$LOG"; }
+
+if [ ! -r "$RESTART_LOCK_LIB" ]; then
+    say "morning_restart 失敗，restart lock helper 不存在"
+    exit 1
+fi
+# shellcheck source=restart_lock.sh
+source "$RESTART_LOCK_LIB"
 
 wait_for_health() {
     local deadline=$((SECONDS + READY_TIMEOUT_SEC))
@@ -41,25 +48,18 @@ ensure_uvicorn_service() {
     launchctl bootstrap "$domain" "$UVICORN_PLIST"
 }
 
-acquire_restart_lock() {
-    local deadline=$((SECONDS + 30))
-    while [ "$SECONDS" -lt "$deadline" ]; do
-        if mkdir "$RESTART_LOCK_DIR" 2>/dev/null; then
-            return 0
-        fi
-        sleep 1
-    done
-    return 1
-}
-
-release_restart_lock() {
-    rmdir "$RESTART_LOCK_DIR" 2>/dev/null || true
-}
+if [ "${MORNING_RESTART_SOURCE_ONLY:-0}" = "1" ]; then
+    return 0 2>/dev/null || exit 0
+fi
 
 say "morning_restart 開始"
 
 if ! acquire_restart_lock; then
-    say "morning_restart 失敗，restart lock busy"
+    if [ "$RESTART_LOCK_ERROR_KIND" = "busy" ]; then
+        say "morning_restart 失敗，restart lock busy"
+    else
+        say "morning_restart 失敗，restart lock setup/validation error"
+    fi
     exit 1
 fi
 trap release_restart_lock EXIT

@@ -12,10 +12,10 @@
 2. refine_reply(reply, critique, sources_full_text) → str
    - 根據 critique 重寫 reply：
        a. 砍掉 contradicted / unsupported claims
-       b. 補上 missing_facts
+       b. 只補會影響原答案正確性或理解的必要事實
        c. 標出 contradictions 並表態
-       d. 保留原結構（正反方 + 整合 + actionable + 來源 URL）
-       e. 比原 reply 豐富 1.5x
+       d. 保留原意與必要的 actionable 建議
+       e. 優先精簡，不為了看起來完整而擴寫
    - Gemini → 14B fallback；兩條都爆 → 直接回原 reply（不阻塞）。
 
 主流程整合（main.py 之後可以這樣串）：
@@ -31,6 +31,7 @@ import json
 import logging
 import re
 from typing import Any
+from reply_policy import NO_REPEAT_CONTRACT
 
 logger = logging.getLogger(__name__)
 
@@ -77,18 +78,20 @@ _CRITIQUE_PROMPT = """下面是一段 LINE 群 bot 對某張圖的回覆，以�
 只回 JSON，不要 markdown / code fence。
 """
 
-_REFINE_PROMPT = """根據下面 critique，重寫上面 reply：
+_REFINE_PROMPT = NO_REPEAT_CONTRACT + "\n" + """根據下面 critique，重寫上面 reply：
 1. 砍掉 contradicted / unsupported claims
-2. 補上 missing_facts
-3. 標出 contradictions 並表態
-4. 保持原結構（正反方+整合+actionable+來源 URL）
-5. 輸出比原 reply 豐富 1.5x（更多具體 fact / 數字 / 人名）
+2. missing_facts 只在影響原答案正確性或理解時補充，不為完整性擴寫
+3. contradictions 若影響原答案，簡短說明必要的不確定性
+4. 保留原意與真正有助於使用者的 actionable 建議
+5. 用最少必要字數清楚表達，不要重複背景或湊長度
 
 ⚠️ 硬性規則 — 不可違反：
-- **必須在最後保留來源 URL 段**：列至少 5 條 URL，格式 `機構名 https://URL`，每條一行
-- URL 從 Full sources 直接複製（不編造、不短化、不省略）
-- 即使原 reply 沒列來源段，refined 版本也必須加上
-- 來源段是分開段落，不要嵌進敘述體裡
+- 只輸出給 LINE 使用者看的正式回答，不要輸出思緒、推理、規則檢查、解釋處理流程或不回覆的理由
+- 不強制正方／反方段落，也不預設列來源清單；只有使用者明確要求時才列已提供且可核實的來源
+
+【使用者要求】
+{user_prompt}
+使用者明確指定的正反方段落與可核實來源必須保留；修正錯誤事實時不要刪掉仍然適用的格式或來源。
 
 【原 reply】
 {reply}
@@ -100,7 +103,6 @@ _REFINE_PROMPT = """根據下面 critique，重寫上面 reply：
 {full_text_block}
 
 直接給 refined reply。不要 markdown code fence、不要前言。
-記得：最後必須有「來源：」段含至少 5 條真實 URL。
 """
 
 
@@ -357,6 +359,7 @@ def refine_reply(
     reply: str,
     critique: dict[str, list[Any]] | None,
     sources_full_text: list[dict] | None,
+    user_prompt: str = "",
 ) -> str:
     """根據 critique 改寫 reply。Gemini → 14B fallback。
 
@@ -376,6 +379,7 @@ def refine_reply(
     prompt = _REFINE_PROMPT.format(
         reply=reply.strip(),
         critique_json=critique_json,
+        user_prompt=user_prompt.strip() or "未指定額外格式；保留原意並精簡回答",
         full_text_block=full_text_block,
     )
 

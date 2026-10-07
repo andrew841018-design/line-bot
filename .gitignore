@@ -59,3 +59,7 @@ soxl_health_state.json
 quote_history.json
 pending_media/
 .drain_locks/
+
+.pending_media_state/
+
+finetune/data/

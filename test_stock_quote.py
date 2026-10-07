@@ -549,9 +549,10 @@ def test_get_quotes_text_header_shows_realtime_source():
         out = stock_quote.get_quotes_text("台積電現在多少？")
 
     assert out is not None
-    # Header must include the real-time timestamp + source label
+    # Header must include the quote timestamp + an honest source label.
     assert "2026-05-07 11:03" in out
-    assert "Yahoo 即時" in out
+    assert "Yahoo 最新公開報價（可能延遲）" in out
+    assert "Yahoo 即時" not in out
     # Quote line must include H/L
     assert "2,325" in out
     assert "2,345" in out  # high
@@ -601,7 +602,7 @@ def test_get_quotes_text_header_shows_futu_source():
 
     assert out is not None
     assert "2026-06-05 05:30:43" in out
-    assert "富途牛牛" in out
+    assert "富途市場快照" in out
     assert "188.38" in out
     assert "-7.29%" in out
 
@@ -796,7 +797,7 @@ def test_contextual_quotes_prefers_futu_without_unbounded_yfinance_fallback():
     fast_info.assert_not_called()
     history.assert_not_called()
     assert "NVDA" in out
-    assert "富途牛牛" in out
+    assert "富途市場快照" in out
 
 
 def test_contextual_quotes_night_uses_adr_and_near_month_future():
@@ -821,7 +822,9 @@ def test_contextual_quotes_night_uses_adr_and_near_month_future():
         out = stock_quote.get_contextual_quotes_text("台積電今天怎麼看", now=now)
 
     assert out is not None
-    assert set(calls) == {"WTX&", "WCDFM6", "WCDFN6", "WCDFQ6", "WCDFU6", "TSM"}
+    assert set(calls) == {
+        "2330.TW", "^TWII", "WTX&", "WCDFM6", "WCDFN6", "WCDFQ6", "WCDFU6", "TSM"
+    }
     fast_info.assert_not_called()
     history.assert_not_called()
     assert "WTX&" in out
@@ -850,7 +853,9 @@ def test_contextual_quotes_generic_quote_night_uses_tw_futures_and_adr_package()
         out = stock_quote.get_contextual_quotes_text("夜間報價", now=now)
 
     assert out is not None
-    assert set(calls) == {"WTX&", "WCDFM6", "WCDFN6", "WCDFQ6", "WCDFU6", "TSM"}
+    assert set(calls) == {
+        "2330.TW", "^TWII", "WTX&", "WCDFM6", "WCDFN6", "WCDFQ6", "WCDFU6", "TSM"
+    }
     assert "WTX&" in out
     assert "WCDFM6" in out
     assert "TSM" in out
@@ -908,7 +913,8 @@ def test_contextual_quotes_gold_uses_commodity_label():
     assert out is not None
     assert calls == ["GC=F"]
     assert "GC=F" in out
-    assert "COMEX 黃金近月期貨/USD" in out
+    assert "GC=F｜COMEX 黃金近月期貨" in out
+    assert "價格：4,313.00 USD" in out
     assert "現股" not in out
 
 
@@ -973,7 +979,8 @@ def test_contextual_quotes_night_unmapped_tw_does_not_mislabel_adr_future():
 
     assert out is not None
     assert "2317.TW" in out
-    assert "【市場報價｜夜間報價參考" in out
+    assert "【市場報價｜最近現貨收盤" in out
+    assert "沒有可驗證的對應期貨／ADR" in out
     assert "ADR/期貨" not in out
 
 
@@ -984,8 +991,8 @@ def test_contextual_quotes_index_daytime_not_labeled_stock():
         out = stock_quote.get_contextual_quotes_text("費半現在多少？", now=now)
 
     assert out is not None
-    assert "【市場報價｜日間報價" in out
-    assert "日間現股" not in out
+    assert "【市場報價｜最近現貨收盤" in out
+    assert "現股" not in out
 
 
 def test_contextual_quotes_prior_market_date_labeled_close_quote():
@@ -1008,7 +1015,8 @@ def test_contextual_quotes_prior_market_date_labeled_close_quote():
         out = stock_quote.get_contextual_quotes_text("費半現在多少？", now=now)
 
     assert out is not None
-    assert "【市場報價｜收盤報價｜2026-06-05 17:15 EDT】" in out
+    assert "【市場報價｜最近現貨收盤｜2026-06-05 17:15 EDT】" in out
     assert "12,220.76" in out
     assert "13,617.50" not in out
-    assert "[Yahoo Chart]" in out
+    assert "時間：2026-06-05 17:15 EDT" in out
+    assert "來源：Yahoo 最新公開報價（可能延遲）" in out

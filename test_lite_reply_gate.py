@@ -5,8 +5,8 @@ Bug: lite/local-LLM fallback emitted vague platitudes for substantive questions
 (feedback_bot_reply_helpful_or_defer): substantive 題寧可不回也別回空泛 lecture；
 gate 抑制空話 → fall through 到網搜 → 仍不行 return None → 上層存 pending。
 
-Gate is suppression-biased: false positive (defer a borderline reply) is cheap;
-false negative (leak a platitude) is the cardinal sin. Chitchat must NOT be nuked.
+Reject empty advice while accepting concise actionable replies, even without
+numbers or section headings. Chitchat must remain available.
 """
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ def _force_skip_nlp(monkeypatch):
 
 
 def test_gate_suppresses_substantive_platitude():
-    # substantive (購屋/出資) + advice modal + no specifics + short → suppress
+    # Known vague advice does not answer how to handle the contribution.
     assert lr._passes_helpfulness_gate(PLATITUDE, "買房子的錢阿婆有出一部分要怎麼弄") is False
 
 
@@ -78,17 +78,19 @@ def test_lite_reply_chitchat_still_replies(monkeypatch):
     assert out is not None and "早點睡" in out  # chitchat preserved
 
 
-def test_lite_reply_opinion_share_requires_sections(monkeypatch):
+def test_lite_reply_opinion_share_allows_concise_actionable_reply(monkeypatch):
     _force_skip_nlp(monkeypatch)
     monkeypatch.setattr(lr, "_STAGE1_HANDLERS", ())
     monkeypatch.setattr(lr, "_STAGE3_HANDLERS", ())
-    shallow = (
-        "這支影片分享了如何在家做手工皂，看起來很有趣也很實用，"
-        "自己動手做可以避免商業皂的化學成分，對皮膚更友善。"
-    )
-    monkeypatch.setattr(lr, "_try_local_llm", lambda text, context=None: shallow)
+    answer = "手工皂不一定更溫和；建議敏感肌先小範圍試用，若刺痛就停用。"
+    monkeypatch.setattr(lr, "_try_local_llm", lambda text, context=None: answer)
 
-    assert lr.lite_reply("這支影片分享了如何在家做手工皂，看起來很實用") is None
+    assert lr.lite_reply("這支影片分享了如何在家做手工皂，看起來很實用") == answer
+
+
+def test_gate_passes_short_actionable_reply_without_digits():
+    reply = "建議先保留匯款紀錄，確認出資是借款還是贈與，再依約定辦理登記。"
+    assert lr._passes_helpfulness_gate(reply, "買房子的錢家人有出資要怎麼弄")
 
 
 def test_lite_reply_opinion_share_allows_structured_reply(monkeypatch):
@@ -110,7 +112,7 @@ def test_lite_reply_opinion_share_allows_structured_reply(monkeypatch):
     assert "整合" in out
 
 
-def test_lite_reply_context_video_followup_requires_structured_reply(monkeypatch):
+def test_lite_reply_context_video_followup_rejects_empty_praise(monkeypatch):
     _force_skip_nlp(monkeypatch)
     monkeypatch.setattr(lr, "_STAGE1_HANDLERS", ())
     monkeypatch.setattr(lr, "_STAGE3_HANDLERS", ())

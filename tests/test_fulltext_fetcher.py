@@ -146,6 +146,36 @@ def test_fetch_exception_falls_back_to_snippet(tmp_cache_db):
         assert src["full_text"] == f"Snippet text for article {i}"
 
 
+def test_cache_permission_failure_bypasses_cache_but_still_fetches(tmp_cache_db):
+    sources = _mk_sources(1)
+    calls = []
+
+    def fake_fetch(url, max_chars=5000):
+        calls.append(url)
+        return "FETCHED WITHOUT CACHE"
+
+    with (
+        patch.object(
+            fulltext_fetcher,
+            "_connect",
+            side_effect=PermissionError("cache unavailable"),
+        ),
+        patch.object(
+            fulltext_fetcher.web_scraper,
+            "fetch_full_text",
+            side_effect=fake_fetch,
+        ),
+    ):
+        out = fulltext_fetcher.fetch_top_sources(
+            sources,
+            top_n=1,
+            cache_db=tmp_cache_db,
+        )
+
+    assert calls == [sources[0]["url"]]
+    assert out[0]["full_text"] == "FETCHED WITHOUT CACHE"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. timeout → fallback snippet
 # ─────────────────────────────────────────────────────────────────────────────

@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Optional
 
 import web_scraper
+from sqlite_security import connect_private_sqlite, harden_private_sqlite_sidecars
 
 logger = logging.getLogger("fulltext_fetcher")
 
@@ -55,25 +56,29 @@ def _connect(db_path: Path | str) -> sqlite3.Connection:
     WAL mode for concurrent read tolerance（multi-thread fetch 可能同時讀寫）。
     """
     db_path = Path(db_path)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(str(db_path), timeout=10.0)
-    # WAL: 多 writer 衝突容忍度高
+    con = connect_private_sqlite(db_path, timeout=10.0)
     try:
-        con.execute("PRAGMA journal_mode=WAL")
-    except sqlite3.Error:
-        # 部分檔系統不支援 WAL（e.g. NFS） — 忽略，回 default journal
-        pass
-    con.execute(
-        """
-        CREATE TABLE IF NOT EXISTS web_text_cache (
-            url TEXT PRIMARY KEY,
-            fetched_at INTEGER NOT NULL,
-            content TEXT NOT NULL
+        # WAL: 多 writer 衝突容忍度高
+        try:
+            con.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.Error:
+            # 部分檔系統不支援 WAL（e.g. NFS） — 忽略，回 default journal
+            pass
+        harden_private_sqlite_sidecars(db_path)
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS web_text_cache (
+                url TEXT PRIMARY KEY,
+                fetched_at INTEGER NOT NULL,
+                content TEXT NOT NULL
+            )
+            """
         )
-        """
-    )
-    con.commit()
-    return con
+        con.commit()
+        return con
+    except Exception:
+        con.close()
+        raise
 
 
 def _cache_lookup(
@@ -84,8 +89,8 @@ def _cache_lookup(
         return None
     try:
         con = _connect(db_path)
-    except sqlite3.Error as e:
-        logger.info("cache connect failed: %s", e)
+    except (OSError, RuntimeError, sqlite3.Error) as e:
+        logger.info("cache connect failed: %s", type(e).__name__)
         return None
     try:
         cur = con.execute(
@@ -116,8 +121,8 @@ def _cache_store(db_path: Path | str, url: str, content: str) -> None:
         return
     try:
         con = _connect(db_path)
-    except sqlite3.Error as e:
-        logger.info("cache connect-for-write failed: %s", e)
+    except (OSError, RuntimeError, sqlite3.Error) as e:
+        logger.info("cache connect-for-write failed: %s", type(e).__name__)
         return
     try:
         con.execute(
@@ -233,6 +238,7 @@ def fetch_top_sources(
         # 沒有任何可抓的 URL → 對 head 全部 fallback snippet
         for src in head:
             src["full_text"] = src.get("snippet", "") or ""
+            src["evidence_kind"] = "snippet"
         return out
 
     # 啟 thread pool
@@ -260,8 +266,10 @@ def fetch_top_sources(
         text = results.get(idx)
         if text:
             src["full_text"] = text
+            src["evidence_kind"] = "full_text"
         else:
             src["full_text"] = src.get("snippet", "") or ""
+            src["evidence_kind"] = "snippet"
 
     return out
 

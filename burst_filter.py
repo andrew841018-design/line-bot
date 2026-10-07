@@ -24,12 +24,14 @@ Flow：
 from __future__ import annotations
 
 import logging
+import sqlite3
 import threading
 import time
 from typing import Callable
 
 import gemini_client
 import memory
+from quote_context import QUOTE_CONTEXT_RULE, has_quote_context
 
 logger = logging.getLogger(__name__)
 
@@ -42,12 +44,105 @@ _pending: dict[str, list[tuple[str, str, str | None, float]]] = {}
 _timers: dict[str, threading.Timer] = {}
 _last_reply_tokens: dict[str, str] = {}
 _waiting_groups: set[str] = set()  # Gemini 說「還沒說完」的 group，等 1 分鐘
+_generations: dict[str, int] = {}
+_cancelled_generations: dict[str, int] = {}
+_claimed_generations: set[tuple[str, int]] = set()
+_retry_attempts: dict[str, tuple[int, int]] = {}
+_MAX_RETRY_SAFE_ATTEMPTS = 1
 
-# main.py 在 import 後注入的 callback；簽名 = (group_id, combined_text, reply_token)
-_on_flush: Callable[[str, str, str], None] | None = None
+# main.py 在 import 後注入的 callback；簽名包含整個 burst 的 message_ids。
+_on_flush: Callable[[str, str, str, list[str]], None] | None = None
 
 
-def register_on_flush(fn: Callable[[str, str, str], None]) -> None:
+class RetryableBurstError(RuntimeError):
+    """A burst failed before any outbound delivery could have started."""
+
+
+def _merge_pending(
+    older: list[tuple[str, str, str | None, float]],
+    newer: list[tuple[str, str, str | None, float]],
+) -> list[tuple[str, str, str | None, float]]:
+    merged: list[tuple[str, str, str | None, float]] = []
+    seen_message_ids: set[str] = set()
+    for item in [*older, *newer]:
+        message_id = item[0]
+        if message_id and message_id in seen_message_ids:
+            continue
+        if message_id:
+            seen_message_ids.add(message_id)
+        merged.append(item)
+    return merged
+
+
+def _restore_retryable_burst(
+    group_id: str,
+    pending: list[tuple[str, str, str | None, float]],
+    reply_token: str,
+    force_respond: bool,
+    generation: int,
+) -> bool:
+    """Restore a provably pre-delivery failure without clobbering newer work."""
+    with _lock:
+        current_generation = _generations.get(group_id, 0)
+        claimed = (group_id, generation) in _claimed_generations
+        if (
+            _cancelled_generations.get(group_id, -1) >= generation
+            and not claimed
+        ):
+            if _retry_attempts.get(group_id, (None, 0))[0] == generation:
+                _retry_attempts.pop(group_id, None)
+            return False
+
+        newer = _pending.get(group_id, [])
+        if current_generation != generation:
+            if not newer or group_id not in _timers:
+                if not claimed:
+                    return False
+            else:
+                _pending[group_id] = _merge_pending(pending, newer)
+                if force_respond:
+                    _waiting_groups.add(group_id)
+                return True
+
+        retry_generation, attempts = _retry_attempts.get(
+            group_id, (generation, 0)
+        )
+        if retry_generation != generation:
+            attempts = 0
+        if attempts >= _MAX_RETRY_SAFE_ATTEMPTS:
+            _pending[group_id] = list(pending)
+            _last_reply_tokens[group_id] = reply_token
+            _retry_attempts.pop(group_id, None)
+            if force_respond:
+                _waiting_groups.add(group_id)
+            return False
+
+        _pending[group_id] = list(pending)
+        _last_reply_tokens[group_id] = reply_token
+        if force_respond:
+            _waiting_groups.add(group_id)
+        retry_generation = _schedule_locked(
+            group_id, SHORT_WINDOW_SECONDS, force_respond
+        )
+        _retry_attempts[group_id] = (retry_generation, attempts + 1)
+        return True
+
+
+def _schedule_locked(group_id: str, delay: float, force_respond: bool) -> int:
+    generation = _generations.get(group_id, 0) + 1
+    _generations[group_id] = generation
+    timer = threading.Timer(
+        delay,
+        _flush_burst,
+        args=[group_id, force_respond, generation],
+    )
+    timer.daemon = True
+    _timers[group_id] = timer
+    timer.start()
+    return generation
+
+
+def register_on_flush(fn: Callable[[str, str, str, list[str]], None]) -> None:
     """讓 main.py 在 import filter 時把 flush callback 注入進來。"""
     global _on_flush
     _on_flush = fn
@@ -70,47 +165,116 @@ def add_to_burst(
         old = _timers.pop(group_id, None)
         if old is not None:
             old.cancel()
+        _retry_attempts.pop(group_id, None)
         if group_id in _waiting_groups:
             # Gemini 已說還沒說完 — 新訊息重置 1 分鐘等待
-            t = threading.Timer(
-                BURST_WINDOW_SECONDS, _flush_burst, args=[group_id, True]
-            )
+            _schedule_locked(group_id, BURST_WINDOW_SECONDS, True)
         else:
             # 初始 8 秒快速收集
-            t = threading.Timer(
-                SHORT_WINDOW_SECONDS, _flush_burst, args=[group_id, False]
-            )
-        t.daemon = True
-        _timers[group_id] = t
-        t.start()
+            _schedule_locked(group_id, SHORT_WINDOW_SECONDS, False)
 
 
-def cancel_burst(group_id: str) -> None:
-    """取消待處理的 burst（使用者後來直接 @mention，explicit 會接手）。"""
+def cancel_burst(group_id: str) -> list[tuple[str, str, str | None, float]]:
+    """取消待處理的 burst（使用者後來直接 @mention，explicit 會接手）。
+
+    2026-09-27: the cancelled messages stay in the conversation and are
+    returned, so an @mention right after a shared link can still see it.
+    """
     with _lock:
+        generation = _generations.get(group_id, 0) + 1
+        _generations[group_id] = generation
+        _cancelled_generations[group_id] = generation
         t = _timers.pop(group_id, None)
         if t is not None:
             t.cancel()
-        _pending.pop(group_id, None)
+        pending = _pending.pop(group_id, None)
         _last_reply_tokens.pop(group_id, None)
         _waiting_groups.discard(group_id)
+        _retry_attempts.pop(group_id, None)
+    if pending:
+        _complete_without_reply(group_id, pending)
+        _remember_cancelled(group_id, pending)
+    return list(pending or [])
 
 
-def _flush_burst(group_id: str, force_respond: bool = False) -> None:
+def _remember_cancelled(
+    group_id: str,
+    pending: list[tuple[str, str, str | None, float]],
+) -> None:
+    """Plain append only: no fact or calendar extraction before the reply.
+
+    Same text a flush would store; chit-chat a flush would skip is not kept.
+    """
+    text = _combine(pending)
+    if not text or _heuristic_decision(text) == "skip":
+        return
+    try:
+        memory.append_turn(group_id, "user", f"[burst]\n{text}")
+    except Exception as exc:
+        logger.warning(
+            "cancelled burst not remembered group=%s error_type=%s",
+            group_id, type(exc).__name__,
+        )
+
+
+def _flush_burst(
+    group_id: str,
+    force_respond: bool = False,
+    generation: int | None = None,
+) -> None:
     """Timer callback — 跑在自己的 thread。"""
     with _lock:
+        current_generation = _generations.get(group_id, 0)
+        if generation is not None and generation != current_generation:
+            return
+        processing_generation = current_generation
         pending = _pending.pop(group_id, None)
         _timers.pop(group_id, None)
         reply_token = _last_reply_tokens.pop(group_id, None)
-        _waiting_groups.discard(group_id)
 
     if not pending or reply_token is None:
+        with _lock:
+            if _retry_attempts.get(group_id, (None, 0))[0] == processing_generation:
+                _retry_attempts.pop(group_id, None)
         return
 
     try:
-        _classify_and_maybe_respond(group_id, pending, reply_token, force_respond)
+        _classify_and_maybe_respond(
+            group_id,
+            pending,
+            reply_token,
+            force_respond,
+            processing_generation,
+        )
+    except RetryableBurstError as e:
+        _restore_retryable_burst(
+            group_id,
+            pending,
+            reply_token,
+            force_respond,
+            processing_generation,
+        )
+        logger.exception("burst flush failed before delivery: %s", e)
     except Exception as e:
+        with _lock:
+            if _retry_attempts.get(group_id, (None, 0))[0] == processing_generation:
+                _retry_attempts.pop(group_id, None)
+            if _generations.get(group_id, 0) == processing_generation:
+                _waiting_groups.discard(group_id)
         logger.exception("burst flush failed: %s", e)
+    else:
+        with _lock:
+            if _retry_attempts.get(group_id, (None, 0))[0] == processing_generation:
+                _retry_attempts.pop(group_id, None)
+            if (
+                _generations.get(group_id, 0) == processing_generation
+                and group_id not in _pending
+                and group_id not in _timers
+            ):
+                _waiting_groups.discard(group_id)
+    finally:
+        with _lock:
+            _claimed_generations.discard((group_id, processing_generation))
 
 
 def _classify_and_maybe_respond(
@@ -118,11 +282,12 @@ def _classify_and_maybe_respond(
     pending: list[tuple[str, str, str | None, float]],
     reply_token: str,
     force_respond: bool = False,
+    generation: int | None = None,
 ) -> None:
     # 把 pending 合成一段連續的對話文字
-    combined_text = "\n".join(text for _, text, _, _ in pending if text)
-    combined_text = combined_text.strip()
+    combined_text = _combine(pending)
     if not combined_text:
+        _complete_without_reply(group_id, pending)
         return
 
     # 等了 1 分鐘 → 直接回，不再問 Gemini
@@ -132,10 +297,19 @@ def _classify_and_maybe_respond(
             group_id,
             _truncate(combined_text, 80),
         )
-        _invoke_flush(group_id, combined_text, reply_token)
+        _invoke_flush(
+            group_id, combined_text, reply_token, pending, generation=generation
+        )
         return
 
-    rules = memory.list_filter_rules(group_id)
+    try:
+        rules = memory.list_filter_rules(group_id)
+    except sqlite3.OperationalError as exc:
+        if "unable to open database file" in str(exc).lower():
+            raise RetryableBurstError(
+                "filter-rule store unavailable before delivery"
+            ) from exc
+        raise
 
     # Step 1: Layer 1/2 學到的規則優先
     rule_decision = _match_rules(combined_text, rules)
@@ -145,6 +319,7 @@ def _classify_and_maybe_respond(
             group_id,
             _truncate(combined_text, 80),
         )
+        _complete_without_reply(group_id, pending)
         return
     if rule_decision == "must_answer":
         logger.info(
@@ -152,7 +327,9 @@ def _classify_and_maybe_respond(
             group_id,
             _truncate(combined_text, 80),
         )
-        _invoke_flush(group_id, combined_text, reply_token)
+        _invoke_flush(
+            group_id, combined_text, reply_token, pending, generation=generation
+        )
         return
 
     # Step 2: 啟發式捷徑（越快回越好，不耗 Gemini quota）
@@ -163,6 +340,7 @@ def _classify_and_maybe_respond(
             group_id,
             _truncate(combined_text, 80),
         )
+        _complete_without_reply(group_id, pending)
         return
     if heur == "respond":
         logger.info(
@@ -170,7 +348,9 @@ def _classify_and_maybe_respond(
             group_id,
             _truncate(combined_text, 80),
         )
-        _invoke_flush(group_id, combined_text, reply_token)
+        _invoke_flush(
+            group_id, combined_text, reply_token, pending, generation=generation
+        )
         return
 
     # Step 3: 交給 Gemini 分類器
@@ -183,38 +363,121 @@ def _classify_and_maybe_respond(
     )
 
     if decision == "respond":
-        _invoke_flush(group_id, combined_text, reply_token)
+        _invoke_flush(
+            group_id, combined_text, reply_token, pending, generation=generation
+        )
     elif decision == "wait":
         # Gemini 說對方還沒說完 → 把訊息放回，等 1 分鐘後強制回
+        stale = False
+        superseded = False
         with _lock:
-            _waiting_groups.add(group_id)
-            existing = _pending.get(group_id, [])
-            _pending[group_id] = pending + existing  # 舊訊息在前，保留順序
-            if group_id not in _last_reply_tokens:
-                _last_reply_tokens[group_id] = reply_token
-            old = _timers.pop(group_id, None)
-            if old is not None:
-                old.cancel()
-            t = threading.Timer(
-                BURST_WINDOW_SECONDS, _flush_burst, args=[group_id, True]
-            )
-            t.daemon = True
-            _timers[group_id] = t
-            t.start()
+            if generation is not None and _cancelled_generations.get(
+                group_id, -1
+            ) >= generation:
+                stale = True
+            elif (
+                generation is not None
+                and _generations.get(group_id, 0) != generation
+            ):
+                newer = _pending.get(group_id, [])
+                if newer and group_id in _timers:
+                    _pending[group_id] = _merge_pending(pending, newer)
+                    _waiting_groups.add(group_id)
+                    old = _timers.pop(group_id)
+                    old.cancel()
+                    _schedule_locked(group_id, BURST_WINDOW_SECONDS, True)
+                    superseded = True
+                else:
+                    stale = True
+            else:
+                _waiting_groups.add(group_id)
+                existing = _pending.get(group_id, [])
+                _pending[group_id] = pending + existing  # 舊訊息在前，保留順序
+                if group_id not in _last_reply_tokens:
+                    _last_reply_tokens[group_id] = reply_token
+                old = _timers.pop(group_id, None)
+                if old is not None:
+                    old.cancel()
+                _schedule_locked(group_id, BURST_WINDOW_SECONDS, True)
+        if stale:
+            _complete_without_reply(group_id, pending)
+            _remember_cancelled(group_id, pending)  # cancel_burst found it already taken
+            return
+        if superseded:
+            return
         logger.info(
             "burst waiting 1 min (group=%s, reason=%s, text=%s)",
             group_id,
             reason,
             _truncate(combined_text, 80),
         )
-    # else "skip": 不回
+    else:
+        _complete_without_reply(group_id, pending)
 
 
-def _invoke_flush(group_id: str, combined_text: str, reply_token: str) -> None:
+def _combine(pending: list[tuple[str, str, str | None, float]]) -> str:
+    """The burst as one text; quoted messages keep their own boundaries."""
+    texts = [text for _, text, _, _ in pending if text]
+    if any(has_quote_context(text) for text in texts):
+        combined_text = QUOTE_CONTEXT_RULE + "\n" + "\n".join(
+            f"--- 群組訊息 {index} 開始 ---\n{text}\n--- 群組訊息 {index} 結束 ---"
+            for index, text in enumerate(texts, 1)
+        )
+    else:
+        combined_text = "\n".join(texts)
+    return combined_text.strip()
+
+
+def _complete_without_reply(
+    group_id: str,
+    pending: list[tuple[str, str, str | None, float]],
+) -> None:
+    """Close a burst that policy deliberately chose not to answer."""
+    message_ids = [message_id for message_id, *_rest in pending if message_id]
+    try:
+        memory.mark_inbound_events_completed_no_reply(group_id, message_ids)
+    except Exception as exc:
+        # Leave the events open on bookkeeping failure so monitoring fails safe.
+        logger.warning("burst no-reply completion failed group=%s: %s", group_id, exc)
+
+
+def _invoke_flush(
+    group_id: str,
+    combined_text: str,
+    reply_token: str,
+    pending: list[tuple[str, str, str | None, float]],
+    generation: int | None = None,
+) -> None:
     if _on_flush is None:
         logger.warning("filter._on_flush not registered; dropping burst")
         return
-    _on_flush(group_id, combined_text, reply_token)
+    message_ids = list(
+        dict.fromkeys(message_id for message_id, *_rest in pending if message_id)
+    )
+    if generation is not None:
+        stale = False
+        superseded = False
+        with _lock:
+            if _cancelled_generations.get(group_id, -1) >= generation:
+                stale = True
+            elif _generations.get(group_id, 0) != generation:
+                newer = _pending.get(group_id, [])
+                if newer and group_id in _timers:
+                    _pending[group_id] = _merge_pending(pending, newer)
+                    superseded = True
+                else:
+                    stale = True
+            else:
+                # This lock-protected claim is the handoff linearization point:
+                # cancellation before it wins; after it, the callback owns delivery.
+                _claimed_generations.add((group_id, generation))
+        if stale:
+            _complete_without_reply(group_id, pending)
+            _remember_cancelled(group_id, pending)  # cancel_burst found it already taken
+            return
+        if superseded:
+            return
+    _on_flush(group_id, combined_text, reply_token, message_ids)
 
 
 # ── 規則匹配 ──────────────────────────────────────────────────────────────────

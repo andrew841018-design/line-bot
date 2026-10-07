@@ -86,7 +86,7 @@ def test_vision_calls_use_one_worker_and_reject_concurrent_load(monkeypatch):
     assert [type(exc).__name__ for exc in errors] == ["VisionBusyError"]
 
 
-def test_image_empty_result_sends_visible_receipt_when_pending_disabled(monkeypatch):
+def test_image_empty_result_does_not_send_generic_failure_receipt(monkeypatch):
     import main
 
     fake_media = types.ModuleType("media_pipeline")
@@ -108,13 +108,7 @@ def test_image_empty_result_sends_visible_receipt_when_pending_disabled(monkeypa
 
     main._handle_image_message(event, "group")
 
-    assert len(replies) == 1
-    args, kwargs = replies[0]
-    assert args[0] == "reply-token"
-    assert "稍後再傳一次" in args[1]
-    assert kwargs["group_id"] == "group"
-    assert kwargs["allow_push_fallback"] is False
-    assert kwargs["include_auxiliary"] is False
+    assert replies == []
 
 
 def test_timed_out_vision_keeps_admission_until_native_call_finishes(monkeypatch):
@@ -165,7 +159,7 @@ def test_timed_out_vision_keeps_admission_until_native_call_finishes(monkeypatch
         time.sleep(0.01)
 
 
-def test_media_handler_overflow_replies_without_queueing(monkeypatch):
+def test_media_handler_overflow_silently_terminalizes_without_queueing(monkeypatch):
     import main
 
     slots = threading.BoundedSemaphore(2)
@@ -180,10 +174,19 @@ def test_media_handler_overflow_replies_without_queueing(monkeypatch):
         lambda *_args, **_kwargs: submit_calls.append(object()),
     )
     replies: list[tuple[tuple, dict]] = []
+    completed: list[tuple[str, str]] = []
     monkeypatch.setattr(
         main,
         "_reply",
         lambda *args, **kwargs: replies.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        main,
+        "_mark_inbound_reply_completed_no_reply",
+        lambda _token, *, group_id, message_ids: completed.append(
+            (group_id, message_ids[0])
+        )
+        or True,
     )
     event = SimpleNamespace(
         reply_token="reply-token",
@@ -197,11 +200,11 @@ def test_media_handler_overflow_replies_without_queueing(monkeypatch):
 
     assert accepted is False
     assert submit_calls == []
-    assert len(replies) == 1
-    assert replies[0][1]["include_auxiliary"] is False
+    assert replies == []
+    assert completed == [("group", "image-message")]
 
 
-def test_seven_image_burst_has_one_outcome_per_reply_token(monkeypatch):
+def test_seven_image_burst_silently_terminalizes_every_inbound(monkeypatch):
     import main
 
     slots = threading.BoundedSemaphore(2)
@@ -218,6 +221,13 @@ def test_seven_image_burst_has_one_outcome_per_reply_token(monkeypatch):
         main,
         "_reply",
         lambda reply_token, *_args, **_kwargs: replies.append(reply_token),
+    )
+    completed: list[str] = []
+    monkeypatch.setattr(
+        main,
+        "_mark_inbound_reply_completed_no_reply",
+        lambda _token, *, group_id, message_ids: completed.append(message_ids[0])
+        or True,
     )
 
     def terminal_handler(event, group_id, *, deadline_monotonic):
@@ -241,8 +251,8 @@ def test_seven_image_burst_has_one_outcome_per_reply_token(monkeypatch):
     for run in queued:
         run()
 
-    assert sorted(replies) == [f"reply-{idx}" for idx in range(7)]
-    assert len(set(replies)) == 7
+    assert replies == []
+    assert sorted(completed) == [f"image-{idx}" for idx in range(7)]
 
 
 def test_media_processing_claim_blocks_same_message_redelivery(monkeypatch, tmp_path):
@@ -263,7 +273,141 @@ def test_media_processing_claim_blocks_same_message_redelivery(monkeypatch, tmp_
     assert memory.begin_inbound_event("group", "same-message") == "processing"
 
 
-def test_media_failure_receipt_removes_pending_only_after_confirmed_delivery(monkeypatch):
+def test_completed_no_reply_is_a_terminal_redelivery_state(monkeypatch, tmp_path):
+    import memory
+
+    monkeypatch.setattr(memory, "_DB_PATH", tmp_path / "memory.sqlite3")
+    memory._init_db()
+
+    assert memory.begin_inbound_event("group", "intentional-skip") == "new"
+    assert memory.mark_inbound_events_completed_no_reply(
+        "group", ["intentional-skip"]
+    ) == 1
+    assert (
+        memory.begin_inbound_event("group", "intentional-skip")
+        == "completed_no_reply"
+    )
+
+
+def test_quoted_image_followup_local_miss_silently_terminalizes_inbound(
+    monkeypatch, tmp_path
+):
+    import main
+    import memory
+
+    monkeypatch.setattr(memory, "_DB_PATH", tmp_path / "memory.sqlite3")
+    memory._init_db()
+    assert memory.begin_inbound_event("group", "followup-message") == "new"
+
+    fallback = MagicMock(return_value=False)
+    reply = MagicMock()
+    monkeypatch.setattr(main, "_media_pipeline_fallback", fallback)
+    monkeypatch.setattr(main, "_reply", reply)
+    event = SimpleNamespace(
+        reply_token="followup-reply-token",
+        message=SimpleNamespace(id="followup-message"),
+    )
+
+    main._handle_media_via_quote(
+        event,
+        "group",
+        "這張是什麼",
+        "quoted-image",
+        "[圖片]",
+    )
+
+    fallback.assert_called_once_with(
+        event,
+        "group",
+        "這張是什麼",
+        "quoted-image",
+        "image/jpeg",
+        "圖片",
+    )
+    reply.assert_not_called()
+    assert (
+        memory.get_inbound_event_status("group", "followup-message")
+        == "completed_no_reply"
+    )
+    assert memory.get_inbound_event_status("group", "quoted-image") is None
+
+
+def test_quoted_image_followup_handled_fallback_does_not_silent_complete(
+    monkeypatch,
+):
+    import main
+
+    monkeypatch.setattr(main, "_media_pipeline_fallback", lambda *_args, **_kwargs: True)
+    complete = MagicMock()
+    monkeypatch.setattr(main, "_mark_inbound_reply_completed_no_reply", complete)
+    event = SimpleNamespace(
+        reply_token="followup-reply-token",
+        message=SimpleNamespace(id="followup-message"),
+    )
+
+    main._handle_media_via_quote(
+        event,
+        "group",
+        "這張是什麼",
+        "quoted-image",
+        "[圖片]",
+    )
+
+    complete.assert_not_called()
+
+
+def test_batch_reply_mark_is_atomic_and_does_not_insert_missing_rows(
+    monkeypatch, tmp_path
+):
+    import sqlite3
+    import memory
+
+    monkeypatch.setattr(memory, "_DB_PATH", tmp_path / "memory.sqlite3")
+    memory._init_db()
+    memory.begin_inbound_event("group", "first")
+    memory.begin_inbound_event("group", "second")
+    with memory._conn() as conn:
+        conn.execute(
+            "CREATE TRIGGER fail_second_batch_mark "
+            "BEFORE UPDATE ON inbound_events "
+            "WHEN OLD.message_id = 'second' "
+            "BEGIN SELECT RAISE(ABORT, 'second mark failed'); END"
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="second mark failed"):
+        memory.mark_inbound_events_replied(
+            "group", ["first", "second", "first", "missing"]
+        )
+
+    with memory._conn() as conn:
+        rows = conn.execute(
+            "SELECT message_id, status FROM inbound_events ORDER BY message_id"
+        ).fetchall()
+    assert rows == [("first", "processing"), ("second", "processing")]
+
+
+def test_batch_reply_mark_updates_existing_rows_without_inserting_missing(
+    monkeypatch, tmp_path
+):
+    import memory
+
+    monkeypatch.setattr(memory, "_DB_PATH", tmp_path / "memory.sqlite3")
+    memory._init_db()
+    memory.begin_inbound_event("group", "first")
+    memory.begin_inbound_event("group", "second")
+
+    assert memory.mark_inbound_events_replied(
+        "group", ["first", "missing", "second", "first"]
+    ) == 2
+
+    with memory._conn() as conn:
+        rows = conn.execute(
+            "SELECT message_id, status FROM inbound_events ORDER BY message_id"
+        ).fetchall()
+    assert rows == [("first", "replied"), ("second", "replied")]
+
+
+def test_image_failure_removes_pending_only_after_durable_silent_completion(monkeypatch):
     import main
 
     event = SimpleNamespace(
@@ -276,29 +420,64 @@ def test_media_failure_receipt_removes_pending_only_after_confirmed_delivery(mon
         "_remove_pending_by_msg_id",
         lambda group_id, message_id: removed.append((group_id, message_id)),
     )
-    monkeypatch.setattr(main, "_record_media_delivery_tombstone", lambda *_args: True)
-    monkeypatch.setattr(main, "_reply", lambda *_args, **_kwargs: False)
+    reply = MagicMock()
+    tombstone = MagicMock()
+    monkeypatch.setattr(main, "_reply", reply)
+    monkeypatch.setattr(main, "_record_media_delivery_tombstone", tombstone)
+    monkeypatch.setattr(
+        main, "_mark_inbound_reply_completed_no_reply", lambda *_args, **_kwargs: False
+    )
     assert main._reply_media_failure(event, "group", "圖片", "test") is False
     assert removed == []
 
-    monkeypatch.setattr(main, "_reply", lambda *_args, **_kwargs: True)
-    assert main._reply_media_failure(event, "group", "圖片", "test") is True
+    monkeypatch.setattr(
+        main, "_mark_inbound_reply_completed_no_reply", lambda *_args, **_kwargs: True
+    )
+    assert main._reply_media_failure(event, "group", "圖片", "test") is False
     assert removed == [("group", "same-message")]
+    reply.assert_not_called()
+    tombstone.assert_not_called()
 
-    event.message.id = "fence-failed-message"
-    monkeypatch.setattr(main, "_record_media_delivery_tombstone", lambda *_args: False)
-    assert main._reply_media_failure(event, "group", "圖片", "test") is True
-    assert removed == [
-        ("group", "same-message"),
-        ("group", "fence-failed-message"),
-    ]
+
+def test_video_failure_is_silent_and_removes_pending_only_after_durable_completion(
+    monkeypatch,
+):
+    import main
+
+    event = SimpleNamespace(
+        reply_token="reply-token",
+        message=SimpleNamespace(id="video-message"),
+    )
+    removed: list[tuple[str, str]] = []
+    reply = MagicMock()
+    tombstone = MagicMock()
+    monkeypatch.setattr(main, "_reply", reply)
+    monkeypatch.setattr(main, "_record_media_delivery_tombstone", tombstone)
+    monkeypatch.setattr(
+        main,
+        "_remove_pending_by_msg_id",
+        lambda group_id, message_id: removed.append((group_id, message_id)),
+    )
+    monkeypatch.setattr(
+        main, "_mark_inbound_reply_completed_no_reply", lambda *_args, **_kwargs: False
+    )
+    assert main._reply_media_failure(event, "group", "影片", "test") is False
+    assert removed == []
+
+    monkeypatch.setattr(
+        main, "_mark_inbound_reply_completed_no_reply", lambda *_args, **_kwargs: True
+    )
+    assert main._reply_media_failure(event, "group", "影片", "test") is False
+    assert removed == [("group", "video-message")]
+    reply.assert_not_called()
+    tombstone.assert_not_called()
 
 
 def test_confirmed_image_reply_clears_pending_before_memory_bookkeeping(monkeypatch):
     import main
 
     fake_media = types.ModuleType("media_pipeline")
-    fake_media.analyze_image = lambda *_args, **_kwargs: "圖片摘要"
+    fake_media.analyze_image = lambda *_args, **_kwargs: "先核對資料日期再判斷。"
     monkeypatch.setitem(sys.modules, "media_pipeline", fake_media)
     monkeypatch.setattr(main, "_download_content", lambda _message_id: b"image")
     monkeypatch.setattr(main, "_MEDIA_ANALYSIS_SLOT", threading.BoundedSemaphore(1))
@@ -334,6 +513,144 @@ def test_confirmed_image_reply_clears_pending_before_memory_bookkeeping(monkeypa
     main._handle_image_message(event, "group")
 
     assert order == ["tombstone", "remove", "append-user", "append-bot"]
+
+
+def test_image_handler_passes_remaining_deadline_to_vision(monkeypatch):
+    import main
+
+    captured = {}
+    fake_media = types.ModuleType("media_pipeline")
+
+    def analyze_image(*_args, **kwargs):
+        captured.update(kwargs)
+        return "先核對資料日期再判斷。"
+
+    fake_media.analyze_image = analyze_image
+    monkeypatch.setitem(sys.modules, "media_pipeline", fake_media)
+    monkeypatch.setattr(main, "_download_content", lambda _message_id: b"image")
+    monkeypatch.setattr(main, "_run_media_analysis", lambda fn, _deadline: fn())
+    monkeypatch.setattr(main, "_reply", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(main, "_record_media_delivery_tombstone", lambda *_args: True)
+    monkeypatch.setattr(main, "_remove_pending_by_msg_id", lambda *_args: None)
+    monkeypatch.setattr(main.memory, "log_raw_message_meta", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main.memory, "append_turn", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main, "_append_bot_turn", lambda *_args, **_kwargs: None)
+    event = SimpleNamespace(
+        reply_token="reply-token", message=SimpleNamespace(id="image-message")
+    )
+    deadline = time.monotonic() + 20
+
+    main._handle_image_message_owned(
+        event, "group", deadline_monotonic=deadline
+    )
+
+    assert 0 < captured["timeout_sec"] <= 20
+
+
+def test_image_handler_suppresses_ocr_and_completes_without_delivery(monkeypatch):
+    import main
+
+    fake_media = types.ModuleType("media_pipeline")
+    fake_media.analyze_image = lambda *_a, **_k: "⚠️ 文字辨識降級結果：OCR 文字摘錄：A123"
+    monkeypatch.setitem(sys.modules, "media_pipeline", fake_media)
+    monkeypatch.setattr(main, "_download_content", lambda _id: b"image")
+    monkeypatch.setattr(main, "_run_media_analysis", lambda fn, _deadline: fn())
+    sent, completed = [], []
+    monkeypatch.setattr(main, "_reply", lambda *_a, **_k: sent.append(True))
+    monkeypatch.setattr(main, "_record_media_delivery_tombstone", lambda *_a: sent.append(True))
+    monkeypatch.setattr(main, "_reply_media_failure", lambda *_a, **_k: completed.append(True))
+    event = SimpleNamespace(reply_token="synthetic", message=SimpleNamespace(id="image-message"))
+    main._handle_image_message_owned(event, "group", deadline_monotonic=time.monotonic() + 20)
+    assert sent == []
+    assert completed == [True]
+
+
+def test_failed_ocr_degraded_reply_keeps_pending_without_tombstone(monkeypatch):
+    import main
+
+    fallback = (
+        "⚠️ 文字辨識降級結果：這次沒有完成完整看圖。\n\n"
+        "OCR 文字摘錄：訂單編號 A123。\n\n"
+        "能力限制：OCR 可能誤讀，不能取代完整視覺判讀。"
+    )
+    fake_media = types.ModuleType("media_pipeline")
+    fake_media.analyze_image = lambda *_args, **_kwargs: fallback
+    monkeypatch.setitem(sys.modules, "media_pipeline", fake_media)
+    monkeypatch.setattr(main, "_download_content", lambda _message_id: b"image")
+    monkeypatch.setattr(main, "_run_media_analysis", lambda fn, _deadline: fn())
+    monkeypatch.setattr(main, "_reply", lambda *_a, **_k: False)
+    side_effects = []
+    monkeypatch.setattr(
+        main,
+        "_record_media_delivery_tombstone",
+        lambda *_a: side_effects.append("tombstone") or True,
+    )
+    monkeypatch.setattr(
+        main,
+        "_remove_pending_by_msg_id",
+        lambda *_a: side_effects.append("remove"),
+    )
+    monkeypatch.setattr(main.memory, "log_raw_message_meta", lambda *_a, **_k: None)
+    event = SimpleNamespace(
+        reply_token="reply-token", message=SimpleNamespace(id="image-message")
+    )
+
+    main._handle_image_message_owned(
+        event,
+        "group",
+        deadline_monotonic=time.monotonic() + 20,
+    )
+
+    assert side_effects == []
+
+
+def test_outer_media_timeout_does_not_abort_unowned_vision_process(monkeypatch):
+    import main
+
+    class FakeFuture:
+        def __init__(self):
+            self.cancelled = False
+
+        def add_done_callback(self, _callback):
+            return None
+
+        def result(self, timeout):
+            assert timeout > 0
+            raise main._FutureTimeoutError()
+
+        def cancel(self):
+            self.cancelled = True
+
+    future = FakeFuture()
+    monkeypatch.setattr(main, "_MEDIA_ANALYSIS_SLOT", threading.BoundedSemaphore(1))
+    monkeypatch.setattr(
+        main._MEDIA_ANALYSIS_EXECUTOR,
+        "submit",
+        lambda _fn: future,
+    )
+    aborted = []
+    fake_vision = types.ModuleType("vision_llm")
+    fake_vision.abort_active_request = lambda: aborted.append(True) or True
+    monkeypatch.setitem(sys.modules, "vision_llm", fake_vision)
+
+    with pytest.raises(main._MediaAnalysisTimeoutError):
+        main._run_media_analysis(lambda: None, time.monotonic() + 1)
+
+    assert future.cancelled is True
+    assert aborted == []
+
+
+def test_local_vision_worker_starts_in_background(monkeypatch):
+    import main
+
+    started = []
+    fake_vision = types.ModuleType("vision_llm")
+    fake_vision.start_background_worker = lambda: started.append(True) or False
+    monkeypatch.setitem(sys.modules, "vision_llm", fake_vision)
+
+    main._start_local_vision_worker()
+
+    assert started == [True]
 
 
 def test_whole_video_pipeline_timeout_keeps_frames_until_background_finishes(
@@ -500,6 +817,285 @@ def test_reply_stays_confirmed_when_local_inbound_mark_fails(monkeypatch):
     api.push_message.assert_not_called()
 
 
+def test_confirmed_batch_reply_marks_every_inbound_event(monkeypatch):
+    import main
+
+    marked: list[tuple[str, list[str]]] = []
+    monkeypatch.setattr(main, "_inbound_reply_by_token", {})
+    monkeypatch.setattr(
+        main.memory,
+        "mark_inbound_events_replied",
+        lambda group_id, message_ids: marked.append((group_id, message_ids))
+        or len(message_ids),
+    )
+
+    main._register_inbound_reply_batch(
+        "reply-token", "group", ["first", "second", "first", ""]
+    )
+    main._mark_inbound_reply_succeeded("reply-token")
+
+    assert marked == [("group", ["first", "second"])]
+    assert "reply-token" not in main._inbound_reply_by_token
+
+
+def test_failed_batch_mark_keeps_reply_token_mapping(monkeypatch):
+    import main
+
+    monkeypatch.setattr(main, "_inbound_reply_by_token", {})
+    monkeypatch.setattr(
+        main.memory,
+        "mark_inbound_events_replied",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("sqlite unavailable")),
+    )
+
+    main._register_inbound_reply_batch(
+        "reply-token", "group", ["first", "second"]
+    )
+    main._mark_inbound_reply_succeeded("reply-token")
+
+    assert "reply-token" in main._inbound_reply_by_token
+
+
+def test_silent_batch_completion_pops_mapping_only_after_durable_mark(monkeypatch):
+    import main
+
+    monkeypatch.setattr(main, "_inbound_reply_by_token", {})
+    marked: list[tuple[str, list[str]]] = []
+    monkeypatch.setattr(
+        main.memory,
+        "mark_inbound_events_completed_no_reply",
+        lambda group_id, message_ids: marked.append((group_id, message_ids))
+        or len(message_ids),
+    )
+    main._register_inbound_reply_batch(
+        "reply-token", "group", ["first", "second", "first"]
+    )
+
+    assert main._mark_inbound_reply_completed_no_reply("reply-token") is True
+    assert marked == [("group", ["first", "second"])]
+    assert "reply-token" not in main._inbound_reply_by_token
+
+
+def test_silent_batch_completion_failure_keeps_mapping(monkeypatch, caplog):
+    import main
+
+    private_group = "PRIVATE_GROUP_SENTINEL"
+    monkeypatch.setattr(main, "_inbound_reply_by_token", {})
+    monkeypatch.setattr(
+        main.memory,
+        "mark_inbound_events_completed_no_reply",
+        lambda *_args: 0,
+    )
+    main._register_inbound_reply_batch(
+        "reply-token", private_group, ["first", "second"]
+    )
+
+    assert main._mark_inbound_reply_completed_no_reply("reply-token") is False
+    assert "reply-token" in main._inbound_reply_by_token
+    assert private_group not in caplog.text
+
+
+@pytest.mark.parametrize("definite_failure", [False, True])
+@pytest.mark.parametrize("link_nonanswer", [False, True])
+def test_rejected_primary_terminalizes_when_reminder_only_reply_fails(
+    monkeypatch, definite_failure, link_nonanswer
+):
+    import calendar_db
+    import main
+    import reminder_push
+    from linebot.v3.messaging import TextMessage
+
+    monkeypatch.setattr(main.settings, "bot_muted", False)
+    monkeypatch.setattr(main, "_pending_reply_enabled", lambda: False)
+    monkeypatch.setattr(main, "_reminder_reply_piggyback_enabled", lambda: True)
+    monkeypatch.setattr(calendar_db, "list_due_for_reminder", lambda *_a, **_k: [])
+    monkeypatch.setattr(
+        reminder_push,
+        "due_reminders_for_reply",
+        lambda *_a, **_k: [
+            {
+                "reminder_id": 7,
+                "stage": "due",
+                "action": "領米",
+                "remind_at": 1,
+                "weekly_count": 0,
+                "text": "提醒：領米",
+                "message": TextMessage(text="提醒：領米"),
+            }
+        ],
+    )
+    monkeypatch.setattr(main.memory, "is_reminder_pending", lambda *_a: True)
+    monkeypatch.setattr(
+        main.memory,
+        "claim_natural_reminder_delivery",
+        lambda *_a, **_k: {"claim_token": "claim"},
+    )
+    release = MagicMock()
+    uncertain = MagicMock()
+    monkeypatch.setattr(main.memory, "release_reminder_delivery_claims", release)
+    monkeypatch.setattr(
+        main.memory, "mark_reminder_delivery_claims_uncertain", uncertain
+    )
+    monkeypatch.setattr(
+        main, "_is_definite_reply_token_error", lambda _exc: definite_failure
+    )
+    completed = MagicMock(return_value=True)
+    monkeypatch.setattr(main, "_mark_inbound_reply_completed_no_reply", completed)
+    messaging = MagicMock()
+    messaging.reply_message.side_effect = RuntimeError("reply failed")
+    monkeypatch.setattr(main, "MessagingApi", lambda _client: messaging)
+    api_client = MagicMock()
+    api_client.__enter__.return_value = object()
+    monkeypatch.setattr(main, "ApiClient", lambda _config: api_client)
+
+    assert (
+        main._reply(
+            "reply-token",
+            ("這個連結讀不到內容，請補充影片標題或描述。"
+             if link_nonanswer else main._visible_llm_degraded_reply()),
+            group_id="group",
+        )
+        is False
+    )
+    completed.assert_called_once_with("reply-token")
+    if definite_failure:
+        release.assert_called_once()
+        uncertain.assert_not_called()
+    else:
+        uncertain.assert_called_once()
+        release.assert_not_called()
+    messaging.push_message.assert_not_called()
+
+
+def test_synthetic_pending_rejected_output_cleans_without_inbound_row(monkeypatch):
+    import main
+
+    mark = MagicMock()
+    monkeypatch.setattr(main.memory, "get_inbound_event_status", lambda *_args: None)
+    monkeypatch.setattr(main.memory, "mark_inbound_events_completed_no_reply", mark)
+    remove = MagicMock(return_value=1)
+    monkeypatch.setattr(main, "_commit_pending_removal", remove)
+
+    assert main._complete_pending_without_reply("group", ["burst-synthetic"]) is True
+    mark.assert_not_called()
+    remove.assert_called_once_with("group", ["burst-synthetic"])
+
+
+def test_pending_rejected_cleanup_failure_is_contained(monkeypatch):
+    import main
+
+    monkeypatch.setattr(main.memory, "get_inbound_event_status", lambda *_args: None)
+    monkeypatch.setattr(
+        main,
+        "_commit_pending_removal",
+        lambda *_args: (_ for _ in ()).throw(OSError("disk unavailable")),
+    )
+
+    assert main._complete_pending_without_reply("group", ["burst-synthetic"]) is False
+
+
+def test_batch_mark_does_not_remove_a_concurrent_reply_token_rebind(monkeypatch):
+    import main
+
+    monkeypatch.setattr(main, "_inbound_reply_by_token", {})
+
+    def mark_then_rebind(group_id, message_ids):
+        main._register_inbound_reply_batch(
+            "reply-token", "group", ["new-first", "new-second"]
+        )
+        return len(message_ids)
+
+    monkeypatch.setattr(
+        main.memory, "mark_inbound_events_replied", mark_then_rebind
+    )
+    main._register_inbound_reply_batch(
+        "reply-token", "group", ["old-first", "old-second"]
+    )
+
+    main._mark_inbound_reply_succeeded("reply-token")
+
+    rebound = main._inbound_reply_by_token["reply-token"]
+    assert rebound[0] == "group"
+    assert rebound[1] == ("new-first", "new-second")
+
+
+def test_definite_reply_failure_marks_batch_only_after_fallback_push(monkeypatch):
+    import main
+
+    marked: list[tuple[str, list[str]]] = []
+    monkeypatch.setattr(main, "_inbound_reply_by_token", {})
+    monkeypatch.setattr(main.settings, "bot_muted", False)
+    monkeypatch.setattr(main, "_get_quota_footer", lambda: "")
+    monkeypatch.setattr(main, "_prepare_outbound_text", lambda text, **_kwargs: text)
+    monkeypatch.setattr(main, "_is_definite_reply_token_error", lambda _exc: True)
+    monkeypatch.setattr(main.memory, "log_raw_message", lambda *_args: None)
+    monkeypatch.setattr(
+        main.memory,
+        "mark_inbound_events_replied",
+        lambda group_id, message_ids: marked.append((group_id, message_ids))
+        or len(message_ids),
+    )
+    api = MagicMock()
+    api.reply_message.side_effect = RuntimeError("expired reply token")
+    api.push_message.return_value = SimpleNamespace(sent_messages=[])
+    monkeypatch.setattr(main, "MessagingApi", lambda _client: api)
+    api_client = MagicMock()
+    api_client.__enter__.return_value = object()
+    monkeypatch.setattr(main, "ApiClient", lambda _config: api_client)
+    main._register_inbound_reply_batch(
+        "reply-token", "group", ["first", "second"]
+    )
+
+    assert main._reply(
+        "reply-token",
+        "已完成",
+        group_id="group",
+        allow_push_fallback=True,
+        include_auxiliary=False,
+    )
+
+    api.push_message.assert_called_once()
+    assert marked == [("group", ["first", "second"])]
+
+
+def test_ambiguous_reply_failure_leaves_batch_open(monkeypatch):
+    import main
+
+    marked: list[tuple[str, list[str]]] = []
+    monkeypatch.setattr(main, "_inbound_reply_by_token", {})
+    monkeypatch.setattr(main.settings, "bot_muted", False)
+    monkeypatch.setattr(main, "_get_quota_footer", lambda: "")
+    monkeypatch.setattr(main, "_prepare_outbound_text", lambda text, **_kwargs: text)
+    monkeypatch.setattr(main, "_is_definite_reply_token_error", lambda _exc: False)
+    monkeypatch.setattr(
+        main.memory,
+        "mark_inbound_events_replied",
+        lambda group_id, message_ids: marked.append((group_id, message_ids))
+        or len(message_ids),
+    )
+    api = MagicMock()
+    api.reply_message.side_effect = RuntimeError("ambiguous transport failure")
+    monkeypatch.setattr(main, "MessagingApi", lambda _client: api)
+    api_client = MagicMock()
+    api_client.__enter__.return_value = object()
+    monkeypatch.setattr(main, "ApiClient", lambda _config: api_client)
+    main._register_inbound_reply_batch(
+        "reply-token", "group", ["first", "second"]
+    )
+
+    assert not main._reply(
+        "reply-token",
+        "未確認",
+        group_id="group",
+        allow_push_fallback=True,
+        include_auxiliary=False,
+    )
+
+    api.push_message.assert_not_called()
+    assert marked == []
+    assert "reply-token" in main._inbound_reply_by_token
+
+
 def test_pending_store_add_unique_deduplicates_media(monkeypatch, tmp_path):
     import pending_store
 
@@ -521,8 +1117,9 @@ def test_pending_store_add_unique_deduplicates_media(monkeypatch, tmp_path):
     assert not duplicate_media.exists()
 
 
+@pytest.mark.parametrize("no_image_answer", [False, True])
 def test_pending_media_drain_retries_locally_and_keeps_until_push_succeeds(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, no_image_answer
 ):
     import main
     import pending_store
@@ -581,7 +1178,7 @@ def test_pending_media_drain_retries_locally_and_keeps_until_push_succeeds(
     monkeypatch.setattr(main.memory, "append_turn", lambda *_args: None)
     monkeypatch.setattr(main, "_append_bot_turn", lambda *_args: None)
     fake_media = types.ModuleType("media_pipeline")
-    result = {"image": None, "video": "本機影片摘要"}
+    result = {"image": None if no_image_answer else "先核對總成本。", "video": "本機影片摘要"}
     local_calls: list[str] = []
 
     def analyze_image(*_args, **_kwargs):
@@ -601,28 +1198,32 @@ def test_pending_media_drain_retries_locally_and_keeps_until_push_succeeds(
     api_client.__enter__.return_value = object()
     monkeypatch.setattr(main, "ApiClient", lambda _config: api_client)
 
+    messaging.push_message.side_effect = RuntimeError("synthetic delivery failure")
     assert main._drain_pending_for_group("group", source="test") is True
-    assert len(pending_store.list_for_group("group")) == 2
-    messaging.push_message.assert_not_called()
-    assert local_calls == ["image"]
+    assert len(pending_store.list_for_group("group")) == (1 if no_image_answer else 2)
+    assert messaging.push_message.call_count == 1
+    assert local_calls == (["image", "video"] if no_image_answer else ["image"])
+    assert not pending_store.was_media_delivered("group", "image-message")
+    assert not pending_store.was_media_delivered("group", "video-message")
+    messaging.reset_mock()
 
-    result["image"] = "本機圖片摘要"
     class RetryConflict(RuntimeError):
         status = 409
 
     messaging.push_message.side_effect = RetryConflict("retry key already accepted")
     assert main._drain_pending_for_group("group", source="test") is True
     assert pending_store.list_for_group("group") == []
-    assert messaging.push_message.call_count == 2
+    assert messaging.push_message.call_count == (1 if no_image_answer else 2)
     retry_keys = [
         call.kwargs["x_line_retry_key"] for call in messaging.push_message.call_args_list
     ]
-    assert retry_keys == [
+    expected_keys = [
         main._pending_push_retry_key("group", ["image-message"]),
         main._pending_push_retry_key("group", ["video-message"]),
     ]
-    assert local_calls == ["image", "image", "video"]
-    assert pending_store.was_media_delivered("group", "image-message")
+    assert retry_keys == (expected_keys[1:] if no_image_answer else expected_keys)
+    assert local_calls == (["image", "video", "video"] if no_image_answer else ["image", "image", "video"])
+    assert pending_store.was_media_delivered("group", "image-message") is not no_image_answer
     assert pending_store.was_media_delivered("group", "video-message")
     assert not media_path.exists()
     assert not video_path.exists()
@@ -759,6 +1360,124 @@ def test_tombstoned_pending_commit_failure_releases_delivery_claim(
     claim = main._try_acquire_media_delivery_slot("group", "image-message")
     assert claim is not None
     claim.release()
+
+
+def test_completed_no_reply_pending_media_is_cleaned_without_analysis_or_send(
+    monkeypatch, tmp_path
+):
+    import main
+    import pending_store
+
+    monkeypatch.setattr(main, "_PENDING_REPLY_ENABLED", True)
+    monkeypatch.setattr(pending_store, "BASE", tmp_path)
+    monkeypatch.setattr(pending_store, "PENDING_PATH", tmp_path / "pending.json")
+    monkeypatch.setattr(pending_store, "LOCK_PATH", tmp_path / "pending.lock")
+    image_path = tmp_path / "saved.jpg"
+    image_path.write_bytes(b"image")
+    pending_store.save_full(
+        {
+            "group": [
+                {
+                    "type": "image",
+                    "message_id": "image-message",
+                    "media_path": str(image_path),
+                    "timestamp": time.time(),
+                }
+            ]
+        }
+    )
+
+    class GroupSlot:
+        def release(self):
+            pass
+
+    monkeypatch.setattr(main, "_try_acquire_drain_slot", lambda _group_id: GroupSlot())
+    monkeypatch.setattr(main, "_drop_stale_pending", lambda _group_id: [])
+    monkeypatch.setattr(
+        main.memory,
+        "get_inbound_event_status",
+        lambda _group_id, _message_id: "completed_no_reply",
+    )
+    monkeypatch.setattr(
+        main,
+        "_run_media_analysis",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("must not analyze")),
+    )
+    messaging = MagicMock()
+    monkeypatch.setattr(main, "MessagingApi", lambda _client: messaging)
+
+    assert main._drain_pending_for_group("group", source="test") is True
+    assert pending_store.list_for_group("group") == []
+    assert not image_path.exists()
+    messaging.push_message.assert_not_called()
+
+
+def test_one_shot_rejected_degraded_text_is_cleared_without_line_send(monkeypatch):
+    import main
+
+    event = SimpleNamespace(reply_token="reply-token")
+    saved: list[dict] = []
+    monkeypatch.setattr(
+        main,
+        "_load_one_shot_replies",
+        lambda: {"group": main._visible_llm_degraded_reply()},
+    )
+    monkeypatch.setattr(main, "_save_one_shot_replies", lambda data: saved.append(data))
+    monkeypatch.setattr(
+        main, "_mark_inbound_reply_completed_no_reply", lambda _token: True
+    )
+    messaging = MagicMock()
+    monkeypatch.setattr(main, "MessagingApi", lambda _client: messaging)
+
+    assert main._try_one_shot_reply(event, "group") is True
+    assert saved == [{}]
+    messaging.reply_message.assert_not_called()
+
+
+def test_one_shot_rejected_text_is_purged_even_when_inbound_mark_fails(monkeypatch):
+    import main
+
+    event = SimpleNamespace(reply_token="reply-token")
+    saved: list[dict] = []
+    monkeypatch.setattr(
+        main,
+        "_load_one_shot_replies",
+        lambda: {"group": main._visible_llm_degraded_reply()},
+    )
+    monkeypatch.setattr(main, "_save_one_shot_replies", lambda data: saved.append(data))
+    monkeypatch.setattr(
+        main, "_mark_inbound_reply_completed_no_reply", lambda _token: False
+    )
+    messaging = MagicMock()
+    monkeypatch.setattr(main, "MessagingApi", lambda _client: messaging)
+
+    assert main._try_one_shot_reply(event, "group") is True
+    assert saved == [{}]
+    messaging.reply_message.assert_not_called()
+
+
+def test_one_shot_purge_failure_does_not_consume_current_inbound(monkeypatch):
+    import main
+
+    event = SimpleNamespace(reply_token="reply-token")
+    monkeypatch.setattr(
+        main,
+        "_load_one_shot_replies",
+        lambda: {"group": main._visible_llm_degraded_reply()},
+    )
+    monkeypatch.setattr(
+        main,
+        "_save_one_shot_replies",
+        lambda _data: (_ for _ in ()).throw(OSError("read-only filesystem")),
+    )
+    complete = MagicMock()
+    monkeypatch.setattr(main, "_mark_inbound_reply_completed_no_reply", complete)
+    messaging = MagicMock()
+    monkeypatch.setattr(main, "MessagingApi", lambda _client: messaging)
+
+    assert main._try_one_shot_reply(event, "group") is False
+    complete.assert_not_called()
+    messaging.reply_message.assert_not_called()
 
 
 def test_media_delivery_tombstone_is_private_hashed_and_blocks_redelivery(
@@ -945,7 +1664,10 @@ def test_lifespan_runs_storage_maintenance_before_pending_and_continues_on_error
 
     order: list[str] = []
     monkeypatch.delenv("JOBS_ROUTES_ENABLED", raising=False)
-    monkeypatch.setattr(main.food_safety_client, "warm_cache_async", lambda: None)
+    monkeypatch.setattr(main, "_start_local_vision_worker", lambda: None)
+    fake_vision = types.ModuleType("vision_llm")
+    fake_vision.shutdown_background_worker = lambda: None
+    monkeypatch.setitem(sys.modules, "vision_llm", fake_vision)
     monkeypatch.setattr(
         pending_store,
         "harden_media_permissions",
@@ -973,3 +1695,126 @@ def test_lifespan_runs_storage_maintenance_before_pending_and_continues_on_error
 
     # A hardening failure is logged, and startup still reaches pending/init.
     assert order == ["sweep", "locks", "pending", "init", "yield"]
+
+
+def test_lifespan_startup_failure_still_shuts_down_vision(monkeypatch):
+    import main
+
+    order = []
+    monkeypatch.setattr(main, "_configure_local_text_llm_runtime", lambda: None)
+    monkeypatch.setattr(
+        main, "_start_local_vision_worker", lambda: order.append("start")
+    )
+    fake_vision = types.ModuleType("vision_llm")
+    fake_vision.shutdown_background_worker = lambda: order.append("stop")
+    monkeypatch.setitem(sys.modules, "vision_llm", fake_vision)
+    fake_pending = types.ModuleType("pending_store")
+    fake_pending.harden_media_permissions = lambda: 0
+    fake_pending.sweep_orphan_media = lambda: 0
+    fake_pending.sweep_delivery_lock_files = lambda: 0
+    monkeypatch.setitem(sys.modules, "pending_store", fake_pending)
+    monkeypatch.delenv("JOBS_ROUTES_ENABLED", raising=False)
+    monkeypatch.setattr(main, "_process_pending_on_startup", lambda: None)
+    monkeypatch.setattr(
+        main,
+        "_init_on_startup",
+        lambda: (_ for _ in ()).throw(RuntimeError("startup failed")),
+    )
+    app = SimpleNamespace(state=SimpleNamespace())
+
+    async def run_lifespan():
+        async with main._app_lifespan(app):
+            raise AssertionError("startup failure must prevent yield")
+
+    with pytest.raises(RuntimeError, match="startup failed"):
+        asyncio.run(run_lifespan())
+
+    assert order == ["start", "stop"]
+
+
+def test_lifespan_awaits_vision_maintenance_before_worker_shutdown(monkeypatch):
+    import main
+
+    order = []
+    maintenance_started = asyncio.Event()
+    release_never = asyncio.Event()
+
+    async def fake_maintenance():
+        order.append("maintenance_start")
+        maintenance_started.set()
+        try:
+            await release_never.wait()
+        finally:
+            order.append("maintenance_stop")
+
+    fake_pending = types.ModuleType("pending_store")
+    fake_pending.harden_media_permissions = lambda: 0
+    fake_pending.sweep_orphan_media = lambda: 0
+    fake_pending.sweep_delivery_lock_files = lambda: 0
+    monkeypatch.setitem(sys.modules, "pending_store", fake_pending)
+    monkeypatch.delenv("JOBS_ROUTES_ENABLED", raising=False)
+    monkeypatch.setattr(main, "_configure_local_text_llm_runtime", lambda: None)
+    monkeypatch.setattr(main, "_start_local_vision_worker", lambda: order.append("worker_start"))
+    monkeypatch.setattr(main, "_maintain_local_vision_worker", fake_maintenance)
+    monkeypatch.setattr(main, "_process_pending_on_startup", lambda: None)
+    monkeypatch.setattr(main, "_init_on_startup", lambda: None)
+    fake_vision = types.ModuleType("vision_llm")
+    fake_vision.shutdown_background_worker = lambda: order.append("worker_stop")
+    monkeypatch.setitem(sys.modules, "vision_llm", fake_vision)
+    app = SimpleNamespace(state=SimpleNamespace())
+
+    async def run_lifespan():
+        async with main._app_lifespan(app):
+            await maintenance_started.wait()
+            order.append("yield")
+
+    asyncio.run(run_lifespan())
+
+    assert order == [
+        "worker_start",
+        "maintenance_start",
+        "yield",
+        "maintenance_stop",
+        "worker_stop",
+    ]
+
+
+def test_vision_maintenance_keeps_bounded_cleanup_off_event_loop(monkeypatch):
+    import main
+
+    entered = threading.Event()
+    release = threading.Event()
+    real_sleep = asyncio.sleep
+
+    def blocking_tick():
+        entered.set()
+        assert release.wait(timeout=1)
+        return "failed"
+
+    async def immediate_sleep(_delay):
+        await real_sleep(0)
+
+    fake_vision = types.ModuleType("vision_llm")
+    fake_vision.maintenance_tick = blocking_tick
+    monkeypatch.setitem(sys.modules, "vision_llm", fake_vision)
+    monkeypatch.setattr(main.asyncio, "sleep", immediate_sleep)
+
+    async def exercise():
+        task = asyncio.create_task(main._maintain_local_vision_worker())
+        try:
+            for _ in range(20):
+                if entered.is_set():
+                    break
+                await real_sleep(0.005)
+            assert entered.is_set()
+            # If maintenance ran directly on the loop, execution could not
+            # reach this assertion until the supervisor cleanup returned.
+            assert not release.is_set()
+            release.set()
+            await real_sleep(0.01)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    asyncio.run(exercise())

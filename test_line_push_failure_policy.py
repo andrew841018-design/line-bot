@@ -74,7 +74,7 @@ def test_weekly_summary_main_passes_bounded_source_as_context(monkeypatch):
     monkeypatch.setattr(weekly_summary.gemini_client, "chat", fake_chat)
     monkeypatch.setattr(weekly_summary, "_push", lambda text: True)
     monkeypatch.setattr(weekly_summary.family_interest, "render_summary", lambda *a, **kw: "")
-    monkeypatch.setattr(weekly_summary, "_render_finance_summary", lambda *a, **kw: "")
+    monkeypatch.setattr(weekly_summary, "_start_family_workers", lambda *a, **kw: None)
     monkeypatch.setitem(sys.modules, "finance_view_validator", SimpleNamespace(run=lambda: 0))
 
     assert weekly_summary.main() == 0
@@ -117,7 +117,7 @@ def test_weekly_summary_returns_failure_when_push_fails(monkeypatch):
     monkeypatch.setattr(weekly_summary.gemini_client, "chat", lambda *a, **kw: "summary")
     monkeypatch.setattr(weekly_summary, "_push", lambda text: False)
     monkeypatch.setattr(weekly_summary.family_interest, "render_summary", lambda *a, **kw: "")
-    monkeypatch.setattr(weekly_summary, "_render_finance_summary", lambda *a, **kw: "")
+    monkeypatch.setattr(weekly_summary, "_start_family_workers", lambda *a, **kw: None)
     monkeypatch.setitem(sys.modules, "finance_view_validator", SimpleNamespace(run=lambda: 0))
 
     assert weekly_summary.main() == 1

@@ -303,9 +303,10 @@ def _fetch_ddg(query: str, k: int) -> list[dict]:
     return out
 
 
-def _fetch_gnews(query: str, k: int) -> list[dict]:
+def _fetch_gnews(query: str, k: int, resolve_urls: bool = True) -> list[dict]:
     try:
-        rows = web_scraper.search_google_news(query, k=k) or []
+        rows = (web_scraper.search_google_news(query, k=k) if resolve_urls else
+                web_scraper.search_google_news(query, k=k, resolve_urls=False)) or []
     except Exception as e:  # noqa: BLE001
         logger.info("GoogleNews search failed (%s): %s", query, e)
         return []
@@ -316,13 +317,14 @@ def _fetch_gnews(query: str, k: int) -> list[dict]:
         url = r.get("url") or ""
         if not url:
             continue
-        # gnews 沒 snippet；用 source 名稱湊（caller 自己決定要不要用）
-        snippet = r.get("snippet") or r.get("source") or ""
+        # Publisher names are metadata, not evidence about the claim.
+        snippet = r.get("snippet") or ""
         out.append(
             {
                 "title": r.get("title") or "",
                 "url": url,
                 "snippet": snippet,
+                "published": r.get("published") or "",
                 "source_query": query,
                 "engine": "gnews",
             }
@@ -356,7 +358,7 @@ def _fetch_wiki(title: str, lang: str) -> Optional[dict]:
 
 
 def aggregate_sources(
-    queries: list[str], total_max: int = 18
+    queries: list[str], total_max: int = 18, *, resolve_news_urls: bool = True
 ) -> list[dict]:
     """V4 Step 3 entry point.
 
@@ -404,7 +406,7 @@ def aggregate_sources(
             if kind == "ddg":
                 futures.append(ex.submit(_fetch_ddg, arg, k))
             elif kind == "gnews":
-                futures.append(ex.submit(_fetch_gnews, arg, k))
+                futures.append(ex.submit(_fetch_gnews, arg, k, resolve_news_urls))
         # Wiki en + zh
         futures.append(ex.submit(_fetch_wiki, primary_q, "en"))
         futures.append(ex.submit(_fetch_wiki, primary_q, "zh"))

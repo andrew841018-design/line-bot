@@ -29,3 +29,26 @@ def test_ensure_loaded_skips_broken_hf_cache_symlink(monkeypatch, tmp_path):
 
     assert local_llm._ensure_loaded() is False
     assert mlx_imports == []
+
+
+def test_runtime_policy_blocks_mlx_import_before_model_load(monkeypatch):
+    monkeypatch.setattr(local_llm, "_model", None)
+    monkeypatch.setattr(local_llm, "_tokenizer", None)
+    local_llm.configure_runtime(enabled=False, reason="uvicorn")
+
+    real_import = builtins.__import__
+    mlx_imports: list[str] = []
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "mlx_lm":
+            mlx_imports.append(name)
+            raise AssertionError("disabled server policy must not import mlx_lm")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    try:
+        assert local_llm._ensure_loaded() is False
+        assert local_llm.chat("測試問題") is None
+        assert mlx_imports == []
+    finally:
+        local_llm.configure_runtime(enabled=True, reason="test cleanup")

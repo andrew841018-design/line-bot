@@ -162,6 +162,9 @@ def test_handle_explicit_text_exceptions():
         patch("main._get_persona_notes", return_value=[]),
         patch("main._prefetch_urls", return_value="問題"),
         patch("main._llm_chat", side_effect=quota_exc),
+        # 2026-10-04: the retry goes straight to the Gemini fallback chain
+        # instead of re-running the failed Claude CLI.
+        patch("main._gemini_llm_chat", return_value=""),
         patch("main._mark_quota_exhausted") as mock_mark,
         patch("main._maybe_capture_calendar_event"),
         patch("main._reply") as mock_reply,
@@ -169,7 +172,7 @@ def test_handle_explicit_text_exceptions():
         main._handle_explicit_text(evt, "GRP001", "問題")
     check("explicit quota error → mark exhausted", mock_mark.called)
     check(
-        "explicit quota error → visible degraded reply",
+        "explicit quota error → generic fallback sink",
         mock_reply.call_args
         and mock_reply.call_args.args[1] == main._visible_llm_degraded_reply(),
     )
@@ -180,7 +183,8 @@ def test_handle_explicit_text_exceptions():
         patch("main.memory.top_facts", return_value=[]),
         patch("main._get_persona_notes", return_value=[]),
         patch("main._prefetch_urls", return_value="問題"),
-        patch("main._llm_chat", side_effect=[quota_exc, "本機 explicit 回覆"]),
+        patch("main._llm_chat", side_effect=quota_exc),
+        patch("main._gemini_llm_chat", return_value="本機 explicit 回覆"),
         patch("main._mark_quota_exhausted") as mock_mark_retry,
         patch("main.memory.append_turn"),
         patch("main._maybe_extract_facts"),
@@ -281,6 +285,7 @@ def test_handle_burst_flush_paths():
         patch("main._get_persona_notes", return_value=[]),
         patch("main._prefetch_urls", side_effect=lambda x: x),
         patch("main._llm_chat", side_effect=quota_exc),
+        patch("main._gemini_llm_chat", return_value=""),
         patch("main._mark_quota_exhausted") as mock_mark,
         patch("main._maybe_capture_calendar_event"),
     ):
@@ -296,7 +301,8 @@ def test_handle_burst_flush_paths():
         patch("main.memory.top_facts", return_value=[]),
         patch("main._get_persona_notes", return_value=[]),
         patch("main._prefetch_urls", side_effect=lambda x: x),
-        patch("main._llm_chat", side_effect=[quota_exc, "本機回覆"]),
+        patch("main._llm_chat", side_effect=quota_exc) as mock_cloud2,
+        patch("main._gemini_llm_chat", return_value="本機回覆"),
         patch("main._mark_quota_exhausted") as mock_mark2,
         patch("main.memory.store_fact_cache") as mock_store2,
         patch("main.memory.append_turn"),
@@ -307,6 +313,7 @@ def test_handle_burst_flush_paths():
         main._handle_burst_flush("GRP001", "測試文字", "TOKEN")
     sent_text = mock_reply_local.call_args[0][1] if mock_reply_local.called else ""
     check("burst quota retry → mark exhausted", mock_mark2.called)
+    check("burst quota retry → one cloud attempt", mock_cloud2.call_count == 1)
     check("burst quota retry → reply local LLM text", sent_text == "本機回覆")
     check("burst quota retry → store local LLM text", mock_store2.called)
 
@@ -995,7 +1002,7 @@ def test_build_quoted_block_recent():
     msg = _make_text_msg("回覆")
     msg.quoted_message_id = "MISSING_ID"
 
-    # DB 找不到 + 有近期對話 → 用近期對話
+    # DB 找不到 + 有近期對話 → 不猜測原文
     recent = [("m1", "USR001", "說了這些話", 1000)]
     with (
         patch("main.memory.get_raw_message", return_value=None),
@@ -1004,8 +1011,8 @@ def test_build_quoted_block_recent():
     ):
         result = main._build_quoted_block(msg, "GRP001")
     check(
-        "找不到但有近期對話 → 含近期訊息",
-        result is not None and "說了這些話" in (result or ""),
+        "找不到但有近期對話 → 明確缺失且不混入近期訊息",
+        result is not None and "說了這些話" not in result and "未取得" in result,
     )
 
     # DB 找不到 + 無近期對話
@@ -1016,7 +1023,7 @@ def test_build_quoted_block_recent():
         result2 = main._build_quoted_block(msg, "GRP001")
     check(
         "找不到且無近期對話 → 包含說明",
-        result2 is not None and "不在記憶中" in (result2 or ""),
+        result2 is not None and "未取得" in (result2 or ""),
     )
 
 

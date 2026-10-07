@@ -11,6 +11,8 @@ from datetime import datetime
 import re
 from zoneinfo import ZoneInfo
 
+import reply_policy
+
 
 _TW = ZoneInfo("Asia/Taipei")
 
@@ -37,10 +39,7 @@ _UNVERIFIED_CURRENT_DATA_SAFE_TEXT = (
     "請重新問一次，我會改用官方來源查證後回答。"
 )
 
-_YOUTUBE_LINK_FAILURE_SAFE_TEXT = (
-    "這則回覆在送出前被擋下：YouTube 連結解析流程沒有正確啟動。"
-    "請重新貼一次連結，我會改用 yt-dlp、oEmbed、HTML metadata 重新抓取。"
-)
+_YOUTUBE_LINK_FAILURE_SAFE_TEXT = ""
 
 _LOW_VALUE_REPLY_SAFE_TEXT = ""
 
@@ -87,7 +86,9 @@ _VERIFICATION_HINT_RE = re.compile(
     re.IGNORECASE,
 )
 
-_YOUTUBE_CONTEXT_RE = re.compile(r"(?:youtube|youtu\.be|直播|影片連結|影片網址)", re.IGNORECASE)
+_YOUTUBE_CONTEXT_RE = re.compile(
+    r"(?:youtube|youtu\.be|shorts|直播|影片|連結|網址|網頁)", re.IGNORECASE,
+)
 _YOUTUBE_LINK_FAILURE_RE = re.compile(
     r"(?:"
     r"直接點擊|點擊觀看|自己點|自行點|請點擊連結|請打開原連結|請到\s*YouTube\s*查看|"
@@ -104,6 +105,111 @@ _YOUTUBE_LINK_FAILURE_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+
+_LINK_NONANSWER_RE = re.compile(
+    r"(?:連結|網址|網頁|影片|內容)[^。！？!?\n]{0,18}(?:讀不到|抓不到|沒有取得|沒有.*具體內容)|"
+    r"(?:無法|不能|沒辦法)[^。！？!?\n]{0,30}(?:根據|判斷|確認)[^。！？!?\n]{0,35}(?:連結|影片|主張|問題)|"
+    r"(?:只有|僅有|僅包含|只能提供)[^。！？!?\n]{0,40}(?:一般資訊|網域資訊|平台資訊)|"
+    r"(?:請|可嘗試|(?:如果|若)(?:您|你)?方便)[^。！？!?\n]{0,18}(?:提供|補充|補貼)[^。！？!?\n]{0,24}(?:標題|描述|截圖|關鍵字)|"
+    r"(?:只取得|只拿到)[^。！？!?\n]{0,20}(?:metadata|標題|描述)|"
+    r"(?:未取得|沒有取得|讀不到|抓不到)[^。！？!?\n]{0,15}(?:字幕|逐字稿|內容)|"
+    r"連結解析流程沒有正確啟動|請重新貼一次連結|我會盡力協助查找|"
+    r"(?:我會|我可以|我能)[^。！？!?\n]{0,45}(?:重新抓取|協助查找)|"
+    r"^(?:直播|影片)內容隨時變動$|^具體涵蓋的主題、發布者及時效性$|"
+    r"^若(?:您|你)是想查詢特定主題的(?:直播|影片)內容$|"
+    r"^(?:請)?(?:稍後|晚點)(?:再試|重試)|^才能判斷$|"
+    r"(?:這|此|該)[^。！？!?\n]{0,10}(?:是|為)[^。！？!?\n]{0,30}(?:youtube|shorts|短影音)[^。！？!?\n]{0,12}(?:連結|網址)",
+    re.IGNORECASE,
+)
+# 2026-09-26「由於沒有取得影片的字幕…，無法判斷其具體論述…」: once the reply
+# itself says the subtitles are missing, a subject-less "cannot judge" clause
+# is the bot describing its missing material, not an evaluation.
+_MISSING_TRANSCRIPT_RE = re.compile(
+    r"(?:沒有|沒|未能?|無法)(?:取得|拿到|抓到|讀到|看到)?[^。！？!?\n，,]{0,12}(?:字幕|逐字稿)"
+    r"|只(?:看得到|看到|拿到|取得)[^。！？!?\n，,]{0,8}(?:標題|描述)"
+)
+# The whole clause is only that status (「由於沒有取得影片的字幕或逐字稿」);
+# 「這支影片沒有字幕會讓聽障者難以理解口白」 says something more.
+_MISSING_TRANSCRIPT_STATUS_RE = re.compile(
+    r"(?:由於|因為|因)?(?:目前|暫時)?(?:這支|這個|這則|該|此)?(?:影片|短片|連結|直播)?(?:目前|暫時)?"
+    r"(?:沒有|沒|未能?|無法)(?:取得|拿到|抓到|讀到|看到)?(?:這支|該)?(?:影片)?的?"
+    r"(?:字幕|逐字稿)(?:或(?:字幕|逐字稿))?(?:內容)?"
+    r"|(?:目前)?只(?:看得到|看到|拿到|取得)(?:這支|該)?(?:影片)?的?(?:標題|描述)"
+    r"(?:(?:和|與|、|及)(?:頻道|描述|標題))?(?:資訊|資料)?"
+)
+_SELF_CANNOT_ASSESS_RE = re.compile(
+    r"^(?:由於|因此|所以|因而|也|進而)?(?:我|咪寶)?(?:暫時|目前)?(?:無法|不能|沒辦法)(?:進一步)?"
+    r"(?:判斷|核實|確認|查證|證實|評估)"
+)
+# Next to that status, advice (「…所以建議先核對原始公告」) or a stated reason the
+# claim is wrong (「無法判斷真假因為標題數字與官方統計不符」) is still an answer —
+# a keyword inside what could not be judged (「無法判斷影片中的數據…」) is not,
+# nor is asking the user to supply, repost or open the link themselves.
+_FRAGMENT_ADVICE_RE = re.compile(
+    r"建議|應該|應先|最好|記得|避免|小心|要注意|可以先|請先|先(?:比對|核對|查證|確認)"
+)
+_FRAGMENT_REASON_RE = re.compile(
+    r"(?:因為|由於|原因是)[^。！？!?；;，,\n]*(?:不符|錯|誤|過時|不實|假)"
+)
+_FRAGMENT_DEFLECTION_RE = re.compile(
+    r"提供|補充|補貼|重貼|重新貼|稍後|晚點|點擊|點開|自己點|自行點|自己看|自行觀看"
+)
+
+
+def _explained_after_colon(fragment: str) -> bool:
+    """「無法判斷完整論述是否正確：標題把年利率誤寫成月利率」 gives the evidence."""
+    parts = re.split(r"[：:]", fragment, maxsplit=1)
+    if len(parts) < 2:
+        return False
+    rest = parts[1].strip()
+    return (
+        len(re.sub(r"[^\w]", "", rest)) >= 6
+        and not _MISSING_TRANSCRIPT_STATUS_RE.fullmatch(rest)
+        and not _SELF_CANNOT_ASSESS_RE.search(rest)
+        and not _FRAGMENT_DEFLECTION_RE.search(rest)
+    )
+_LINK_TROUBLESHOOT_RE = re.compile(
+    r"(?:設為私人|獲邀帳號|權限設定|地區限制|DNS|HTTP\s*[45]\d\d|"
+    r"清除[^。！？!?\n]{0,8}快取|更新[^。！？!?\n]{0,8}瀏覽器|"
+    r"(?:設定|新增|建立)[^。！？!?\n]{0,20}提醒|提醒時間)", re.IGNORECASE,
+)
+
+
+def is_link_failure_nonanswer(text: str) -> bool:
+    """Reject status/deflection-only replies, retaining useful answer clauses."""
+    if not _YOUTUBE_CONTEXT_RE.search(text or ""):
+        return False
+    # Echoed URLs or a source footer cannot rescue an otherwise empty answer.
+    body = re.sub(r"https?://[^\s，。]+", "", text, flags=re.IGNORECASE)
+    fragments = re.split(r"[。！？!?；;，,\n]+|但是?|不過|然而", body)
+    missing_transcript = bool(_MISSING_TRANSCRIPT_RE.search(body))
+    rejected = False
+    for fragment in fragments:
+        fragment = fragment.strip(" \t*#-，,:：")
+        if not fragment or re.fullmatch(
+            r"(?:來源|出處)(?:[:：]\s*(?:YouTube(?:\s*Shorts)?))?|"
+            r"抱歉|很抱歉|不好意思|謝謝您的理解|因此|所以|如果方便|希望這有幫助", fragment,
+            re.IGNORECASE,
+        ):
+            continue
+        if _LINK_TROUBLESHOOT_RE.search(fragment):
+            return False
+        if missing_transcript:
+            if _MISSING_TRANSCRIPT_STATUS_RE.fullmatch(fragment):
+                rejected = True
+                continue
+            advice = bool(_FRAGMENT_ADVICE_RE.search(fragment)) and not _FRAGMENT_DEFLECTION_RE.search(fragment)
+            if _SELF_CANNOT_ASSESS_RE.search(fragment):
+                if advice or _FRAGMENT_REASON_RE.search(fragment) or _explained_after_colon(fragment):
+                    return False
+                rejected = True
+                continue
+            if advice and not _YOUTUBE_LINK_FAILURE_RE.search(fragment):
+                return False
+        if not (_YOUTUBE_LINK_FAILURE_RE.search(fragment) or _LINK_NONANSWER_RE.search(fragment)):
+            return False
+        rejected = True
+    return rejected
 
 _CHECKIN_COMMITMENT_RE = re.compile(
     r"(?:我|我們|大家)\s*"
@@ -148,12 +254,14 @@ _CONCRETE_HELP_RE = re.compile(
 )
 _INTERNAL_TRACE_RE = re.compile(
     r"(?:"
-    r"^\s*(?:\[\[?\s*)?(?:思考|推理|內心獨白|草稿|系統思考)(?:\s*\]?\])?\s*[:：]?"
+    r"^\s*(?:\[\[?\s*)?(?:思考|推理|內心獨白|草稿|系統思考)(?:\s*\]?\])?\s*(?:[:：]|$)"
     r"|^\s*\[\[?\s*分析\s*\]?\]\s*[:：]?"
-    r"|^\s*(?:reasoning|thought|analysis)\s*[:：]?"
+    r"|^\s*(?:reasoning|thought|analysis)\s*(?:[:：]|$)"
     r"|^\s*<\s*(?:thinking|analysis|reasoning)\s*>"
     r"|^\s*```(?:thinking|analysis|reasoning)"
-    r"|使用者貼了一個|判斷問題類型|處理連結內容|遵循規則|回覆結構|執行 concise_search"
+    r"|使用者貼了一個|判斷問題類型|處理連結內容|遵循規則|執行 concise_search|^\s*回覆結構\s*[:：]"
+    r"|^\s*(?:思緒|內部判斷|判斷結果)\s*[:：]"
+    r"|^\s*[（(]?(?:保持沉默|靜默)[）)。.!！\s]*$|(?:不產生(?:實際)?回覆|這則訊息不需要回覆)|(?:我|咪寶|助手|助理|bot)(?:應該|應|會|決定|選擇)?(?:保持沉默|靜默|不回覆)|(?:因此|所以)[，,\s]*(?:應該|應)?保持沉默|^\s*(?:決定|選擇)(?:不回覆|不回應)|(?:這|此)[^。！？!?\n]{0,24}(?:訊息|閒聊)[^。！？!?\n]{0,12}(?:不用|不必|無需|不需)(?:回覆|回應)"
     r"|The user (?:posted|shared|sent)|I need to determine|response structure"
     r")",
     re.IGNORECASE | re.MULTILINE,
@@ -196,10 +304,7 @@ def _high_risk_current_data_without_verification(text: str) -> bool:
 
 
 def _youtube_link_failure_without_context(text: str) -> bool:
-    folded = _fold_width_digits(text)
-    return bool(_YOUTUBE_CONTEXT_RE.search(folded)) and bool(
-        _YOUTUBE_LINK_FAILURE_RE.search(folded)
-    )
+    return is_link_failure_nonanswer(_fold_width_digits(text))
 
 
 def _low_value_checkin_commitment_reply(text: str) -> bool:
@@ -234,12 +339,10 @@ def _internal_trace_reply(text: str) -> bool:
         return True
     strong_markers = (
         "我需要判斷使用者",
-        "我需要判斷",
         "I need to determine",
         "The user posted",
         "The user shared",
         "The user sent",
-        "response structure",
     )
     if any(marker.lower() in head.lower() for marker in strong_markers):
         return True
@@ -269,6 +372,10 @@ def validate_outbound_text(text: str, *, now: datetime | None = None) -> Validat
     if not original.strip():
         return ValidationResult(ok=True, text=original)
 
+    # A printed placeholder such as 「（輸出空字串）」 is never a reply (2026-10-04).
+    if reply_policy.is_printed_placeholder(original):
+        return ValidationResult(ok=False, text="", reason="empty_output_marker")
+
     runtime = _runtime_now(now)
     if _internal_trace_reply(original):
         return ValidationResult(
@@ -276,6 +383,9 @@ def validate_outbound_text(text: str, *, now: datetime | None = None) -> Validat
             text=_INTERNAL_TRACE_SAFE_TEXT,
             reason="internal_trace_leak",
         )
+
+    if _youtube_link_failure_without_context(original):
+        return ValidationResult(ok=False, text="", reason="youtube_link_failure")
 
     reason = _stale_current_year_reason(original, now=runtime)
     if reason:
@@ -286,13 +396,6 @@ def validate_outbound_text(text: str, *, now: datetime | None = None) -> Validat
             ok=False,
             text=_INTERNAL_SOURCE_SAFE_TEXT,
             reason="internal_source_claim",
-        )
-
-    if _youtube_link_failure_without_context(original):
-        return ValidationResult(
-            ok=False,
-            text=_YOUTUBE_LINK_FAILURE_SAFE_TEXT,
-            reason="youtube_link_failure",
         )
 
     if _low_value_checkin_commitment_reply(original):

@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 
 from config import settings
+from sqlite_security import connect_private_sqlite
 
 _DB_PATH = Path(settings.sqlite_path)
 _lock = threading.Lock()
@@ -70,7 +71,7 @@ class _ClosingConnection(sqlite3.Connection):
 
 
 def _conn(db_path: Path | str | None = None) -> sqlite3.Connection:
-    conn = sqlite3.connect(
+    conn = connect_private_sqlite(
         _db_path(db_path),
         isolation_level=None,
         check_same_thread=False,

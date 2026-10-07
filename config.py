@@ -49,6 +49,26 @@ class Settings(BaseSettings):
     # 「輕活」模型（classifier / fact 抽取 / Layer 2 規則生成）
     # 預設 flash-lite，免費額度 1000/天，跟 flash 完全獨立不互相吃
     gemini_light_model: str = "gemini-2.5-flash-lite"
+    # 2026-10-04 last tier: the free tier counts requests per model
+    # (quotaId GenerateRequestsPerDayPerProjectPerModel-FreeTier), so when both
+    # models above are spent this one still answers chat and reminder
+    # extraction.  "" disables it; a name equal to either model above, or one
+    # that is not a Gemini model, is ignored (gemini_client.last_tier_model).
+    gemini_last_tier_model: str = Field(
+        default="gemini-3.1-flash-lite",
+        validation_alias="GEMINI_LAST_TIER_MODEL",
+    )
+    # Requests per Pacific day the bot may spend on it for chat + extraction.
+    # The restatement judge (same model by default) is not capped by this.
+    gemini_last_tier_daily_cap: int = Field(
+        default=40,
+        validation_alias="GEMINI_LAST_TIER_DAILY_CAP",
+    )
+
+    @field_validator("gemini_last_tier_model", mode="before")
+    @classmethod
+    def _strip_last_tier_model(cls, value) -> str:
+        return str(value or "").strip()
 
     # ── Claude（optional primary cloud provider）───────────────────────────
     # Claude is attempted before Gemini for main replies when a key is set.
@@ -85,6 +105,19 @@ class Settings(BaseSettings):
     claude_cli_timeout_sec: int = Field(
         default=60,
         validation_alias="CLAUDE_CLI_TIMEOUT_SEC",
+    )
+    # The CLI otherwise uses the account's own Claude Code default model
+    # (opus), which is too slow for a chat reply.  An alias tracks the latest.
+    claude_cli_model: str = Field(
+        default="sonnet",
+        validation_alias="CLAUDE_CLI_MODEL",
+    )
+    # The account's usage limit (5-hour / weekly) shared with Andrew's own
+    # Claude Code.  Without a reset time on stderr the CLI rests this long, so
+    # a probe costs about two failed calls an hour.
+    claude_cli_limit_cooldown_sec: int = Field(
+        default=1800,
+        validation_alias="CLAUDE_CLI_LIMIT_COOLDOWN_SEC",
     )
     # Optional account-session route. The client auto-enables this after an
     # API billing-balance error, but the flag also supports CLI-only setups.

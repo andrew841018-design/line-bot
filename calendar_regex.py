@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from datetime import date, timedelta
 
 import reminder_intent
@@ -154,8 +155,13 @@ _DATE_TIME_TITLE = re.compile(
     rf"(\d{{4}})-(\d{{1,2}})-(\d{{1,2}})\s+({_TIME})\s+([^\n\r]{{2,40}})"
 )
 
+# An explicit year: 2026年, 115年 or 民國99年 (the 民國 year +1911), spaces
+# allowed.  Any other number before 年 (「25 年」) is a year we cannot read:
+# the date makes no event rather than being read as yearless.
+_YEAR_NUM = r"民國\s*\d{1,3}|\d{1,4}"
+_NO_YEAR = r"(?<!\d)(?<!\d年)(?<!\d年\s)(?<!\d\s年)"
 _CHINESE_DATE_TIME_TITLE = re.compile(
-    rf"(\d{{1,2}})月(\d{{1,2}})日\s*({_TIME})\s+([^\n\r]{{2,40}})"
+    rf"(?:({_YEAR_NUM})\s*年\s*|{_NO_YEAR})(\d{{1,2}})月(\d{{1,2}})日\s*({_TIME})\s+([^\n\r]{{2,40}})"
 )
 
 _RELATIVE_DATE_TIME_TITLE = re.compile(
@@ -167,10 +173,20 @@ _RELATIVE_CHINESE_TIME_TITLE = re.compile(
 )
 
 _DATE_TOKEN = re.compile(
-    r"(?:\d{4}-\d{1,2}-\d{1,2}|\d{1,2}月\d{1,2}日|\d{1,2}/\d{1,2})"
+    rf"(?:\d{{4}}-\d{{1,2}}-\d{{1,2}}|(?:(?:{_YEAR_NUM})\s*年\s*|{_NO_YEAR})\d{{1,2}}月\d{{1,2}}日"
+    r"|\d{1,2}/\d{1,2})"
 )
 _DATE_PREFIX = re.compile(
-    r"^(?:(\d{4})-(\d{1,2})-(\d{1,2})|(\d{1,2})月(\d{1,2})日|(\d{1,2})/(\d{1,2}))"
+    rf"^(?:(\d{{4}})-(\d{{1,2}})-(\d{{1,2}})|(?:({_YEAR_NUM})\s*年\s*|{_NO_YEAR})(\d{{1,2}})月(\d{{1,2}})日"
+    r"|(\d{1,2})/(\d{1,2}))"
+)
+# 「2028年1月5日、1月6日」「2025年9月24日到9月26日」: a date in a list or range
+# shares the year written on the date before it.
+# Between them only a weekday mark or a time: 「1月5日（三）晚上7點、1月6日」.  A bare
+# 「，」 starts a new sentence: 「生日是1940年10月10日，10月10日聚餐」.
+_LIST_OR_RANGE_GAP_RE = re.compile(
+    rf"\s*(?:[（(][一二三四五六日天][)）])?\s*(?:{_DAYPART})?\s*(?:{_TIME}|{_CHINESE_TIME})?\s*"
+    r"(?:、|和|跟|及|與|到|至|~|～|-|－|—)\s*"
 )
 _TIME_IN_TEXT = re.compile(
     rf"(?:(?P<compact_daypart>{_DAYPART})\s*"
@@ -279,16 +295,65 @@ def _validate_date(year: int, month: int, day: int) -> date | None:
         return None
 
 
-def _parse_date_token(token: str, today_tw: date) -> date | None:
+def _explicit_year(token: str) -> int | None:
+    """「2026年」, a Republic-of-China 「115年」「民國99年」 (+1911); None for 「25年」."""
+    digits = re.sub(r"\D", "", token)
+    if token.lstrip().startswith("民國") or (len(digits) == 3 and digits.startswith("1")):
+        return int(digits) + 1911
+    return int(digits) if len(digits) == 4 else None
+
+
+def _month_day(token: str) -> tuple[int, int] | None:
+    m = _DATE_PREFIX.match(token)
+    if not m:
+        return None
+    if m.group(1):
+        return int(m.group(2)), int(m.group(3))
+    if m.group(5):
+        return int(m.group(5)), int(m.group(6))
+    return int(m.group(7)), int(m.group(8))
+
+
+def _shared_years(text: str) -> dict[int, int]:
+    """Start of each date token → the year it shares with the date before it.
+
+    「2026年12月31日到1月2日」: a later date that comes earlier in the calendar is
+    in the next year.
+    """
+    hints: dict[int, int] = {}
+    matches = list(_DATE_TOKEN.finditer(text))
+    for match, following in zip(matches, matches[1:]):
+        prefix = _DATE_PREFIX.match(match.group(0))
+        if prefix and prefix.group(1):
+            year = int(prefix.group(1))
+        elif prefix and prefix.group(4):
+            year = _explicit_year(prefix.group(4)) or 0  # unreadable: shares "no event"
+        else:
+            year = hints.get(match.start())
+        if year is not None and _LIST_OR_RANGE_GAP_RE.fullmatch(text[match.end():following.start()]):
+            here, there = _month_day(match.group(0)), _month_day(following.group(0))
+            hints[following.start()] = year + 1 if year and here and there and there < here else year
+    return hints
+
+
+def _parse_date_token(token: str, today_tw: date, year_hint: int | None = None) -> date | None:
     m = _DATE_PREFIX.match(token)
     if not m:
         return None
     if m.group(1):
         return _validate_date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
     if m.group(4):
-        month, day = int(m.group(4)), int(m.group(5))
+        # An explicit year is the year meant; a date already past is no event.
+        year = _explicit_year(m.group(4))
+        target = _validate_date(year, int(m.group(5)), int(m.group(6))) if year else None
+        return target if target and target >= today_tw else None
+    if m.group(5):
+        month, day = int(m.group(5)), int(m.group(6))
     else:
-        month, day = int(m.group(6)), int(m.group(7))
+        month, day = int(m.group(7)), int(m.group(8))
+    if year_hint is not None:
+        target = _validate_date(year_hint, month, day)
+        return target if target and target >= today_tw else None
     target = _validate_date(today_tw.year, month, day)
     if target and target < today_tw:
         target = _validate_date(today_tw.year + 1, month, day)
@@ -467,6 +532,8 @@ def extract_regex_only(combined_text: str, today_tw: date) -> dict:
         return _make_fail()
 
     # 1. YYYY-MM-DD HH:MM title
+    # TODO(2026-10-03 review): unlike 「YYYY年M月D日」, a past ISO date still makes an
+    # event; test_calendar_regex pins the 5/22 case, so settle the ISO rule first.
     m = _DATE_TIME_TITLE.search(combined_text)
     if m:
         year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
@@ -480,23 +547,29 @@ def extract_regex_only(combined_text: str, today_tw: date) -> dict:
                 _make_event(title, target.isoformat(), time_str, et),
             )
 
-    # 2. N月N日 HH:MM title — year inference: past → +1
+    # 2. (YYYY年)N月N日 HH:MM title — no year: past → +1; explicit past year: no event
     m = _CHINESE_DATE_TIME_TITLE.search(combined_text)
     if m:
-        month, day = int(m.group(1)), int(m.group(2))
-        time_str = _parse_time(m.group(3))
-        title = _sanitize_title(m.group(4))
+        month, day = int(m.group(2)), int(m.group(3))
+        time_str = _parse_time(m.group(4))
+        title = _sanitize_title(m.group(5))
         et = _classify_type(title) if len(title) >= 2 else None
         if time_str and et:
-            target = _validate_date(today_tw.year, month, day)
-            if target:
-                if target < today_tw:
+            explicit = bool(m.group(1))
+            year = _explicit_year(m.group(1)) if explicit else _shared_years(combined_text).get(m.start(2))
+            if explicit or year is not None:
+                target = _validate_date(year, month, day) if year else None
+                if target and target < today_tw:
+                    target = None
+            else:
+                target = _validate_date(today_tw.year, month, day)
+                if target and target < today_tw:
                     target = _validate_date(today_tw.year + 1, month, day)
-                if target:
-                    return _accepted_event(
-                        combined_text,
-                        _make_event(title, target.isoformat(), time_str, et),
-                    )
+            if target:
+                return _accepted_event(
+                    combined_text,
+                    _make_event(title, target.isoformat(), time_str, et),
+                )
 
     # 3. 今天/明天/後天 HH:MM title
     m = _RELATIVE_DATE_TIME_TITLE.search(combined_text)
@@ -605,6 +678,8 @@ def _title_for_fragment(segment_body: str, location: str | None, combined_text: 
             and _classify_type(f"{action_body} {combined_text}") == "medical"
         ):
             return _sanitize_title(action_body)
+        if re.search(r"(?:需要|必須|記得|要|需)帶", action_body):
+            return f"{location}，{action_body}"
         return f"{location}活動"[:30]
     raw = _strip_fragment_time_tokens(segment_body)
     raw = re.sub(r"^(?:以及|和|並且|、|，|,|的)", "", raw).strip()
@@ -648,11 +723,12 @@ def _fragment_event(
     *,
     require_time: bool = True,
     fallback_title: str | None = None,
+    year_hint: int | None = None,
 ) -> dict | None:
     token_match = _DATE_PREFIX.match(segment.strip())
     if not token_match:
         return None
-    target = _parse_date_token(token_match.group(0), today_tw)
+    target = _parse_date_token(token_match.group(0), today_tw, year_hint)
     if not target:
         return None
     body = _strip_date_prefix(segment)
@@ -705,6 +781,7 @@ def extract_many_regex_only(
 
     matches = list(_DATE_TOKEN.finditer(combined_text))
     fallback_title = _shared_tail_title(combined_text, today_tw)
+    shared_years = _shared_years(combined_text)
     for idx, match in enumerate(matches):
         end = matches[idx + 1].start() if idx + 1 < len(matches) else len(combined_text)
         segment = combined_text[match.start():end]
@@ -714,8 +791,342 @@ def extract_many_regex_only(
             combined_text,
             require_time=require_time,
             fallback_title=fallback_title,
+            year_hint=shared_years.get(match.start()),
         )
         if ev:
             events.append(ev)
 
     return _dedupe_events(events)
+
+
+# ── Schedule lists (2026-10-04) ───────────────────────────────────────────────
+# A message whose every line starts with a date is a schedule the family wants
+# kept, e.g. a trip: "10/23去海邊一日遊\n24、26 市區自由行\n10/25跟團一日遊".
+# Strict on purpose (GP1 C1): one non-schedule line, a range, a fraction, a
+# recap word or a question rejects the whole message.
+
+_SCHEDULE_MAX_ITEMS = 6
+_SCHEDULE_PAST_WINDOW_DAYS = 120
+_SCHEDULE_FUTURE_LIMIT_DAYS = 200
+_SCHEDULE_ROLL_GAP_DAYS = 10
+_SCHEDULE_TITLE_LIMIT = 40
+_SCHEDULE_NUM = r"(?:\d{1,2}|[零〇一二兩三四五六七八九十]{1,3})"
+_SCHEDULE_WEEKDAY = (
+    r"(?:\s*[（(]\s*(?:星期|週|周|禮拜)?\s*[一二三四五六日天]\s*[）)]"
+    r"|\s*(?:星期|週|周|禮拜)[一二三四五六日天])"
+)
+_SCHEDULE_DAY_SEPARATOR = r"\s*(?:[、,，]|及|和|與)\s*"
+# A bare day number followed by a counter is a quantity ("3、4個人"), not a day.
+_SCHEDULE_NOT_A_DAY = (
+    r"(?!\s*(?:個|人|位|次|天|小時|點|分|歲|元|塊|樓|%|成|折|倍|顆|杯|份|張|本|件|號樓))"
+)
+_SCHEDULE_DATE_RE = re.compile(
+    rf"(?:(?P<year>\d{{4}})\s*(?:年|/|-)\s*)?"
+    rf"(?P<month>{_SCHEDULE_NUM})\s*(?P<sep>月|/)\s*"
+    rf"(?P<day>{_SCHEDULE_NUM})(?!\d)\s*(?P<suffix>日|號)?"
+    rf"(?:{_SCHEDULE_WEEKDAY})?"
+)
+_SCHEDULE_EXTRA_DAY_RE = re.compile(
+    rf"{_SCHEDULE_DAY_SEPARATOR}(?P<day>\d{{1,2}})(?!\d){_SCHEDULE_NOT_A_DAY}"
+    rf"\s*(?:日|號)?(?:{_SCHEDULE_WEEKDAY})?"
+)
+_SCHEDULE_LEADING_DAY_RE = re.compile(
+    rf"(?P<day>\d{{1,2}})(?!\d){_SCHEDULE_NOT_A_DAY}\s*(?P<suffix>日|號)?"
+    rf"(?:{_SCHEDULE_WEEKDAY})?"
+)
+_SCHEDULE_RANGE_TAIL_RE = re.compile(
+    rf"\s*(?:-|－|—|–|~|～|到|至)\s*(?:\d{{4}}\s*(?:年|/|-)\s*)?"
+    rf"(?:{_SCHEDULE_NUM}\s*(?:月|/)\s*)?{_SCHEDULE_NUM}(?!\d)"
+)
+_SCHEDULE_BODY_DATE_RE = re.compile(rf"{_SCHEDULE_NUM}\s*(?:月|/)\s*{_SCHEDULE_NUM}")
+# 1/2 杯, 1/3 的價格: a fraction, not a date (N1 keeps only measure/price cues).
+_SCHEDULE_FRACTION_TAIL_RE = re.compile(
+    r"\s*(?:杯|匙|碗|瓶|罐|包|顆|片|塊|公克|公斤|克|斤|兩|"
+    r"(?:ml|cc|g)(?![a-z])|的?價(?:格|錢)?|折|倍)",
+    re.IGNORECASE,
+)
+_SCHEDULE_REJECT_RE = re.compile(r"上次|昨天|之前|去年|已經|曾經|[?？]|嗎(?!哪)")
+_SCHEDULE_ACTIVITY_RE = re.compile(
+    r"去|回|到|出發|搭|飛|入住|退房|看醫生|看診|回診|打疫苗|接種|開會|上課|"
+    r"聚餐|吃飯|參加|報到|預約|接送|拿|領|買|繳|辦|考試|面試|旅遊|旅行|"
+    r"一日遊|自由行|跟團|出國|出遊|行程"
+)
+# GP1 r2 (2026-10-05): a called-off line still names its trip (不去了,
+# 取消去台中, 沒辦法去), and forecasts / prices carry 到 / 回 / 去 too
+# (晴到多雲, 漲到32元, 回檔).  One such line rejects the whole message.
+_SCHEDULE_CALLED_OFF_RE = re.compile(
+    r"取消|作罷|延期|改期|改天|順延|延後|喊停|停辦|停課|停班|算了|免了|"
+    r"無法|不能|不行|不克|不便|不方便|不一定|不確定|來不及|趕不上|"
+    r"沒辦法|沒空|沒法|沒有要|改(?:成|為)不|別去|甭去|"
+    r"(?:去|回|來|到|走|參加|出發)不(?:了|成)|"
+    r"(?:不|沒有?)(?:要|用|必|會|想|打算|準備|再)?"
+    r"(?:(?:跟|陪|帶|載|和|與|同)[^\s，,。；;!！]{1,4}?)?"
+    r"(?:去|回|來|過去|出發|出國|出門|出遊|參加|跟團|赴|報到)"
+)
+_SCHEDULE_WEATHER_WORD = r"(?:多雲|雷陣雨|陣雨|雷雨|豪雨|大雨|小雨|晴|陰|雨|雪|霧)"
+_SCHEDULE_FORECAST_OR_PRICE_RE = re.compile(
+    r"\d+(?:\.\d+)?\s*(?:度|°|℃)|"
+    r"天氣|氣溫|溫度|低溫|高溫|體感|濕度|降雨|雨量|紫外線|空氣品質|"
+    r"晴天|晴朗|陰天|雨天|多雲|陣雨|雷雨|豪雨|大雨|小雨|下雨|颱風|寒流|冷氣團|"
+    r"鋒面|東北季風|梅雨|降溫|回溫|回暖|轉涼|轉冷|下雪|降雪|"
+    r"(?<![一-鿿])[晴陰雨](?![一-鿿])|[晴陰雨](?=\s*(?:到|轉|時))|"
+    r"(?<=[到轉時有])[晴陰雨](?![一-鿿])|"
+    r"油價|股價|房價|金價|價格|價錢|漲價|降價|漲停|跌停|漲幅|跌幅|"
+    r"大盤|台股|美股|加權|指數|收盤|開盤|除息|除權|股利|配息|殖利率|匯率|利率|"
+    r"升息|降息|回檔|回升|回落|回跌|回彈|回穩|反彈|"
+    r"(?:漲|跌|降)(?:了|到|至|破|\s*\d)"
+)
+# (回)到 before a number is a price, a temperature or a range, and between
+# two weather words a forecast: neither counts as the line's activity.
+_SCHEDULE_NOT_AN_ACTIVITY_RE = re.compile(
+    rf"{_SCHEDULE_WEATHER_WORD}\s*(?:到|轉|時)\s*{_SCHEDULE_WEATHER_WORD}|"
+    r"[回去]?到(?=\s*(?:\d|[零〇一二兩三四五六七八九十百千]+\s*(?:度|元|塊|%|成|倍)))"
+)
+_SCHEDULE_BULLET_RE = re.compile(r"^[-*•・●◆▪]\s*")
+_SCHEDULE_TITLE_COMMAND_RE = re.compile(r"^提醒(?:我們|我|大家)?\s*")
+
+
+def _schedule_int(raw: str | None) -> int | None:
+    if not raw:
+        return None
+    return _parse_chinese_int(raw)
+
+
+def _resolve_schedule_date(
+    year: int | None, month: int, day: int, today_tw: date
+) -> date | None:
+    """Pick the year for a written date; None when it reads as past or far off."""
+    if year is not None:
+        target = _validate_date(year, month, day)
+        if target is None or target < today_tw:
+            return None
+    else:
+        target = _validate_date(today_tw.year, month, day)
+        if target is not None and target < today_tw:
+            if (today_tw - target).days <= _SCHEDULE_PAST_WINDOW_DAYS:
+                return None  # a recap of something recent, not a plan
+            target = _validate_date(today_tw.year + 1, month, day)
+        elif target is None:
+            target = _validate_date(today_tw.year + 1, month, day)
+        if target is None:
+            return None
+    if (target - today_tw).days > _SCHEDULE_FUTURE_LIMIT_DAYS:
+        return None
+    return target
+
+
+def _continue_schedule_day(previous: date, day: int, today_tw: date) -> date | None:
+    """A bare day after a dated one keeps its month; a smaller day starts the next."""
+    target = _validate_date(previous.year, previous.month, day)
+    if target is None or day < previous.day:
+        year, month = (
+            (previous.year + 1, 1)
+            if previous.month == 12
+            else (previous.year, previous.month + 1)
+        )
+        target = _validate_date(year, month, day)
+        if target is None or (target - previous).days > _SCHEDULE_ROLL_GAP_DAYS:
+            return None
+    if target < today_tw or (target - today_tw).days > _SCHEDULE_FUTURE_LIMIT_DAYS:
+        return None
+    return target
+
+
+def _schedule_line_dates(
+    line: str, previous: date | None, today_tw: date
+) -> tuple[list[date], str] | None:
+    """Return (dates, rest of the line) or None when the line is not a schedule."""
+    dates: list[date] = []
+    match = _SCHEDULE_DATE_RE.match(line)
+    if match is not None:
+        month = _schedule_int(match.group("month"))
+        day = _schedule_int(match.group("day"))
+        if month is None or day is None:
+            return None
+        plain_slash = (
+            match.group("sep") == "/"
+            and not match.group("year")
+            and not match.group("suffix")
+        )
+        if plain_slash and _SCHEDULE_FRACTION_TAIL_RE.match(line, match.end()):
+            return None
+        year = int(match.group("year")) if match.group("year") else None
+        first = _resolve_schedule_date(year, month, day, today_tw)
+        if first is None:
+            return None
+        dates.append(first)
+        position = match.end()
+    else:
+        if previous is None:
+            return None  # 「24、26 X」 needs a dated line above it
+        match = _SCHEDULE_LEADING_DAY_RE.match(line)
+        if match is None:
+            return None
+        has_more = _SCHEDULE_EXTRA_DAY_RE.match(line, match.end()) is not None
+        if not has_more and not match.group("suffix"):
+            return None  # a lone number is not a day
+        first = _continue_schedule_day(previous, int(match.group("day")), today_tw)
+        if first is None:
+            return None
+        dates.append(first)
+        position = match.end()
+    while True:
+        extra = _SCHEDULE_EXTRA_DAY_RE.match(line, position)
+        if extra is None:
+            break
+        following = _continue_schedule_day(dates[-1], int(extra.group("day")), today_tw)
+        if following is None:
+            return None
+        dates.append(following)
+        position = extra.end()
+    rest = line[position:]
+    if _SCHEDULE_RANGE_TAIL_RE.match(rest):
+        return None  # 10/23-10/26: a range belongs to the range parser
+    return dates, rest
+
+
+def _schedule_line_is_plan(body: str) -> bool:
+    """A dated line's text names an activity that is still going ahead."""
+    if _SCHEDULE_CALLED_OFF_RE.search(body):
+        return False
+    if _SCHEDULE_FORECAST_OR_PRICE_RE.search(body):
+        return False
+    return bool(_SCHEDULE_ACTIVITY_RE.search(_SCHEDULE_NOT_AN_ACTIVITY_RE.sub(" ", body)))
+
+
+def _schedule_line_time(body: str) -> tuple[str | None, str | None] | None:
+    """(clock, daypart) of one line; None when its time is malformed."""
+    if _has_malformed_compact_range(body):
+        return None
+    if _TIME_RANGE_IN_TEXT.search(body) or _TIME_IN_TEXT.search(body):
+        clock = _first_time_in_text(body)
+        return (clock, None) if clock else None
+    daypart = _DAYPART_IN_TEXT.search(body)
+    return None, daypart.group(0) if daypart else None
+
+
+def extract_schedule_lines(text: str, today_tw: date) -> list[dict]:
+    """Parse a message whose every non-empty line starts with a date.
+
+    Returns ``[{date, title, time, daypart}]`` sorted by date, or ``[]`` when
+    any line is not a dated activity, is called off or negated (不去了,
+    取消…, 沒辦法去), is a forecast, price or market line (晴到多雲,
+    漲到32元), or is a range, any date reads as recent past or more than 200
+    days ahead, the message reminisces or asks, or it lists more than six
+    items.  ``time`` is an explicit clock ("HH:MM") and ``daypart`` a stated
+    daypart; both None means no time was given.
+    A line that starts with only day numbers (「24、26 X」) continues the month
+    of the line above; a smaller day moves to the next month.
+    """
+    if not text or not str(text).strip():
+        return []
+    lines = [
+        unicodedata.normalize("NFKC", raw).strip()
+        for raw in str(text).splitlines()
+    ]
+    lines = [_SCHEDULE_BULLET_RE.sub("", line, count=1) for line in lines if line]
+    if not lines or _SCHEDULE_REJECT_RE.search("\n".join(lines)):
+        return []
+    items: list[dict] = []
+    previous: date | None = None
+    for line in lines:
+        parsed = _schedule_line_dates(line, previous, today_tw)
+        if parsed is None:
+            return []
+        dates, rest = parsed
+        body = re.sub(r"^[\s:：,，、。\-–—~～]+", "", rest).strip()
+        if not body or _SCHEDULE_BODY_DATE_RE.search(body):
+            return []
+        if not _schedule_line_is_plan(body):
+            return []
+        line_time = _schedule_line_time(body)
+        if line_time is None:
+            return []
+        clock, daypart = line_time
+        title = _strip_fragment_time_tokens(body)
+        title = _SCHEDULE_TITLE_COMMAND_RE.sub("", re.sub(r"\s+", " ", title).strip())
+        title = re.sub(r"[\x00-\x1f\x7f]", "", title).strip(" ，,。；;、:：-")
+        if len(re.findall(r"[一-鿿A-Za-z0-9]", title)) < 2:
+            return []
+        title = title[:_SCHEDULE_TITLE_LIMIT]
+        for target in dates:
+            item = {
+                "date": target.isoformat(),
+                "title": title,
+                "time": clock,
+                "daypart": daypart,
+            }
+            if item not in items:
+                items.append(item)
+        previous = dates[-1]
+    if len(items) > _SCHEDULE_MAX_ITEMS:
+        return []
+    return sorted(items, key=lambda item: (item["date"], item["time"] or ""))
+
+
+_CONTEXTUAL_APPOINTMENT_PAIR_RE = re.compile(
+    r"^\s*我?\s*"
+    r"(?P<month>\d{1,2})月(?P<day1>\d{1,2})(?:日|號)"
+    r"(?P<body1>[^，,。；;\n]{2,100})"
+    r"\s*[，,；;]\s*"
+    r"(?P<day2>\d{1,2})(?:日|號)"
+    r"(?P<body2>[^，,。；;\n]{2,100})"
+    r"\s*[。！!]?\s*$"
+)
+
+
+def extract_contextual_appointment_pair(
+    text: str,
+    source_date: date,
+) -> list[dict]:
+    """Parse one narrow two-appointment source for a later reminder command.
+
+    The second date may inherit the first date's month, but no month/year
+    rollover is guessed.  This helper is deliberately not wired into the
+    general calendar extractor: it exists only for a same-sender, immediately
+    following command that independently proves both lead dates.
+    """
+
+    normalized = _normalize_event_text(text or "")
+    match = _CONTEXTUAL_APPOINTMENT_PAIR_RE.fullmatch(normalized)
+    if match is None:
+        return []
+    try:
+        month = int(match.group("month"))
+        first = date(source_date.year, month, int(match.group("day1")))
+        if first < source_date:
+            first = date(source_date.year + 1, month, int(match.group("day1")))
+        second = date(first.year, month, int(match.group("day2")))
+    except ValueError:
+        return []
+    if second < first:
+        return []
+
+    parsed: list[dict] = []
+    for target, group_name in ((first, "body1"), (second, "body2")):
+        body = str(match.group(group_name) or "").strip()
+        if _has_malformed_compact_range(body):
+            return []
+        event_time = _first_time_in_text(body)
+        title = _sanitize_title(_strip_fragment_time_tokens(body))
+        event_type = _classify_type(f"{title} {body}")
+        if event_type is None and re.search(
+            r"(?:牙科|植牙|殖牙|回診|拆(?:手術)?線)",
+            f"{title} {body}",
+        ):
+            event_type = "medical"
+        if (
+            not title
+            or event_type != "medical"
+            or reminder_intent.should_reject_reminder_candidate(normalized, title)
+        ):
+            return []
+        parsed.append(
+            {
+                "date": target.isoformat(),
+                "time": event_time,
+                "title": title,
+                "event_type": event_type,
+            }
+        )
+    return parsed

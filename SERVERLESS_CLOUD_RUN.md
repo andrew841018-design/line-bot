@@ -77,7 +77,7 @@ Initial phase 1 values:
 
 ```text
 BOT_MUTED=true
-SQLITE_PATH=/tmp/line_bot.db
+SQLITE_PATH=/tmp/line_bot-private/line_bot.db
 LOCAL_LLM_PREWARM_DISABLED=1
 JOBS_ROUTES_ENABLED=0
 JOBS_ALLOW_PUBLIC_HTTP=0
@@ -117,7 +117,7 @@ gcloud run deploy line-bot \
   --min-instances 0 \
   --max-instances 1 \
   --timeout 300 \
-  --set-env-vars BOT_MUTED=true,SQLITE_PATH=/tmp/line_bot.db,LOCAL_LLM_PREWARM_DISABLED=1,JOBS_ROUTES_ENABLED=0,JOBS_ALLOW_PUBLIC_HTTP=0,JOBS_SUBPROCESS_INHERIT_ENV=1
+  --set-env-vars BOT_MUTED=true,SQLITE_PATH=/tmp/line_bot-private/line_bot.db,LOCAL_LLM_PREWARM_DISABLED=1,JOBS_ROUTES_ENABLED=0,JOBS_ALLOW_PUBLIC_HTTP=0,JOBS_SUBPROCESS_INHERIT_ENV=1
 ```
 
 Then set non-sensitive env vars directly:
@@ -213,7 +213,7 @@ Before claiming full parity with the Mac bot, choose a durable state backend:
 
 - Current decision: keep SQLite for the local/Mac bot because reminder and
   family-event volume is small. Do not migrate to Postgres just for capacity.
-- Lowest-code temporary path: accept ephemeral `/tmp/line_bot.db` for webhook
+- Lowest-code temporary path: accept ephemeral `/tmp/line_bot-private/line_bot.db` for webhook; the bot creates the owner-only parent directory before opening SQLite.
   replies only.
 - Better free-tier path: migrate conversation/reminder state to a managed
   Postgres/SQLite-compatible service with a free plan, then update `memory.py`,

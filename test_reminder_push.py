@@ -1,5 +1,7 @@
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 import config
 import reminder_push
 
@@ -83,6 +85,47 @@ def test_due_reminder_label_uses_calendar_day_not_stage_window(monkeypatch):
     assert due[0]["text"].startswith("@當事人\n⏰ 提醒（後天）\n")
 
 
+@pytest.mark.parametrize(
+    ("seconds_until", "expected"),
+    [
+        (7 * 86400, None),
+        (3 * 86400, None),
+        (1 * 86400, None),
+        (4 * 3600, "4hr"),
+        (2 * 3600, "2hr"),
+        (1 * 3600, "1hr"),
+        (0, "now"),
+    ],
+)
+def test_timed_calendar_mirror_keeps_only_intraday_natural_stages(
+    seconds_until,
+    expected,
+):
+    now = 1_800_000_000
+    row = _row(
+        now,
+        remind_at=now + seconds_until,
+        source_kind="calendar_event",
+        source_ref="E1",
+        source_text="皮拉提斯；時間：11:00",
+    )
+
+    assert reminder_push._decide_stage(row, now) == expected
+
+
+def test_all_day_calendar_mirror_has_no_natural_intraday_stage():
+    now = 1_800_000_000
+    row = _row(
+        now,
+        remind_at=now + 4 * 3600,
+        source_kind="calendar_event",
+        source_ref="E1",
+        source_text="家族聚餐；參加人：全家",
+    )
+
+    assert reminder_push._decide_stage(row, now) is None
+
+
 def test_far_future_reminder_does_not_weekly_push_immediately(monkeypatch):
     """Very distant reminders should stay quiet until they are within 30 days."""
     now = 1_800_000_000
@@ -105,8 +148,20 @@ def test_push_reminders_deletes_stale_pending_before_scan(monkeypatch):
     )
     monkeypatch.setattr(reminder_push, "_due_reminder_items", lambda: [])
 
-    assert reminder_push.push_reminders(dry_run=True) == 0
+    assert reminder_push.push_reminders() == 0
     assert calls == [reminder_push.STALE_PENDING_GRACE_SECONDS]
+
+
+def test_dry_run_does_not_delete_stale_pending_reminders(monkeypatch):
+    # 2026-10-04 (GP2 S5): --dry-run is a read-only look at what is due.
+    monkeypatch.setattr(
+        reminder_push.memory,
+        "delete_stale_pending_reminders",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("dry run wrote")),
+    )
+    monkeypatch.setattr(reminder_push.memory, "list_pending_reminders_full", lambda *a, **k: [])
+
+    assert reminder_push.push_reminders(dry_run=True) == 0
 
 
 def test_weekly_reminder_starts_within_30_days(monkeypatch):
@@ -126,7 +181,7 @@ def test_weekly_reminder_starts_within_30_days(monkeypatch):
 
 def test_due_reminder_mentions_companion_alias_from_action(monkeypatch):
     now = 1_800_000_000
-    action = "測試病患甲正子斷層掃描當天 08:00 開始禁食 6 小時，只能喝水（妹妹陪同）"
+    action = "曾美惠正子斷層掃描當天 08:00 開始禁食 6 小時，只能喝水（測試成員甲陪同）"
 
     def fake_list(group_id=None):
         return [_row(now, user_id="U_MOM", action=action)]
@@ -135,13 +190,13 @@ def test_due_reminder_mentions_companion_alias_from_action(monkeypatch):
     monkeypatch.setattr(
         reminder_push.line_mentions,
         "load_user_aliases",
-        lambda: {"U_MOM": "媽媽", "U_SIS": "妹妹"},
+        lambda: {"U_MOM": "媽媽", "U_SIS": "測試成員甲"},
     )
 
     due = reminder_push.due_reminders_for_reply("G1", limit=2, now=now)
 
     assert len(due) == 1
-    assert due[0]["text"].startswith("@媽媽 @妹妹\n⏰ 提醒（明天）\n")
+    assert due[0]["text"].startswith("@媽媽 @測試成員甲\n⏰ 提醒（明天）\n")
     assert due[0]["message"].text.startswith("{target} {p2}\n⏰ 提醒（明天）\n")
     assert due[0]["message"].substitution["target"].mentionee.user_id == "U_MOM"
     assert due[0]["message"].substitution["p2"].mentionee.user_id == "U_SIS"
@@ -156,7 +211,7 @@ def test_due_reminder_mentions_structured_aliases_without_action_names(monkeypat
                 now,
                 user_id="U_MOM",
                 action="正子斷層掃描當天 08:00 開始禁食 6 小時，只能喝水",
-                mention_aliases=["媽媽", "妹妹"],
+                mention_aliases=["媽媽", "測試成員甲"],
             )
         ]
 
@@ -164,14 +219,14 @@ def test_due_reminder_mentions_structured_aliases_without_action_names(monkeypat
     monkeypatch.setattr(
         reminder_push.line_mentions,
         "load_user_aliases",
-        lambda: {"U_MOM": "媽媽", "U_SIS": "妹妹"},
+        lambda: {"U_MOM": "媽媽", "U_SIS": "測試成員甲"},
     )
 
     due = reminder_push.due_reminders_for_reply("G1", limit=2, now=now)
 
     assert len(due) == 1
-    assert due[0]["text"].startswith("@媽媽 @妹妹\n⏰ 提醒（明天）\n")
-    assert "參加人：媽媽、妹妹" in due[0]["text"]
+    assert due[0]["text"].startswith("@媽媽 @測試成員甲\n⏰ 提醒（明天）\n")
+    assert "參加人：媽媽、測試成員甲" in due[0]["text"]
     assert due[0]["message"].substitution["target"].mentionee.user_id == "U_MOM"
     assert due[0]["message"].substitution["p2"].mentionee.user_id == "U_SIS"
 
@@ -317,3 +372,74 @@ def test_line_access_token_falls_back_to_env_token(monkeypatch):
     monkeypatch.setattr(reminder_push, "line_access_token", lambda: "env-token")
 
     assert reminder_push._line_access_token() == "env-token"
+
+
+# ── fixR5a (GP1 r4 #1/#2): a later, fuller mention is shown, never adopted ──
+# The reminder keeps its wording (the calendar pairing and quoted cancel /
+# reschedule read it); absorbed wordings that add words go on one 細節 line.
+
+
+def _absorbed(*wordings: str) -> list[dict]:
+    return [
+        {"key": f"k{index}", "action": wording, "text": wording}
+        for index, wording in enumerate(wordings)
+    ]
+
+
+def _tomorrow_text(now: int) -> str:
+    return reminder_push.datetime.fromtimestamp(
+        now + 86400, reminder_push._TW
+    ).strftime("%Y-%m-%d %H:%M")
+
+
+def test_a_push_shows_a_fuller_absorbed_wording_on_one_detail_line():
+    now = 1_800_000_000
+    row = _row(now, action="看牙醫", merged_details=_absorbed("看牙醫順便洗牙"))
+
+    text, message = reminder_push._build_push_text_and_message(row, "1d", now=now)
+
+    body = f"⏰ 提醒（明天）\n{_tomorrow_text(now)} 看牙醫\n細節：看牙醫順便洗牙"
+    assert text == f"@當事人\n{body}"
+    assert message.text == f"{{target}}\n{body}"
+
+
+@pytest.mark.parametrize(
+    "absorbed",
+    [
+        [],
+        _absorbed("看牙醫"),                                # the same words
+        _absorbed("牙醫", "看 牙醫", "看牙醫！"),            # fewer words, spacing, punctuation
+        _absorbed("看牙醫（前一天提醒）", "看牙醫順便洗牙（當天提醒）"),   # labels
+    ],
+)
+def test_a_push_without_new_words_keeps_todays_text(absorbed):
+    now = 1_800_000_000
+    row = _row(now, action="看牙醫", merged_details=absorbed)
+
+    assert reminder_push._format_push_text(row, "1d", now=now) == (
+        f"⏰ 提醒（明天）\n{_tomorrow_text(now)} 看牙醫"
+    )
+
+
+def test_the_detail_line_lists_each_fuller_wording_once_and_at_most_three():
+    line = reminder_push.fuller_detail_line(
+        "看牙醫",
+        _absorbed(
+            "看牙醫順便洗牙", "看牙醫 順便洗牙", "看牙醫順便洗牙和拿藥",
+            "帶健保卡", "停車在B2", "記得帶掛號單",
+        ),
+    )
+
+    assert line == "細節：看牙醫順便洗牙和拿藥；帶健保卡；停車在B2"
+
+
+def test_the_detail_line_stays_on_one_line_within_120_characters():
+    assert reminder_push.fuller_detail_line(
+        "看牙醫", _absorbed("甲" * 100, "乙" * 30, "丙丙")
+    ) == "細節：" + "甲" * 100 + "；丙丙"
+    long_line = reminder_push.fuller_detail_line("看牙醫", _absorbed("看牙醫" + "甲" * 150))
+    assert long_line.startswith("細節：看牙醫甲") and long_line.endswith("…")
+    assert len(long_line.removeprefix("細節：")) == 120
+    assert reminder_push.fuller_detail_line("看牙醫", _absorbed("看牙醫\n順便洗牙")) == (
+        "細節：看牙醫 順便洗牙"
+    )

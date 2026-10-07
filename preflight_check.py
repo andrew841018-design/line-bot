@@ -69,15 +69,59 @@ class CheckResult:
 
 
 def _cloudflared_metrics_port():
-    if not CLOUDFLARED_LOG.exists(): return None
-    try:
-        with open(CLOUDFLARED_LOG, errors="ignore") as f:
-            f.seek(0, 2); size = f.tell(); f.seek(max(0, size - 200_000))
-            tail = f.read()
-        m = list(re.finditer(r"metrics server on 127\.0\.0\.1:(\d+)", tail))
-        if m: return int(m[-1].group(1))
-    except OSError: pass
-    return None
+    candidates = []
+    for tie_breaker, path in enumerate(
+        (CLOUDFLARED_LOG, CLOUDFLARED_STDOUT_LOG)
+    ):
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        try:
+            fd = os.open(path, flags)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+        try:
+            file_stat = os.fstat(fd)
+            if (
+                not stat.S_ISREG(file_stat.st_mode)
+                or file_stat.st_uid != os.getuid()
+                or file_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            ):
+                return None
+            start = max(0, file_stat.st_size - 200_000)
+            os.lseek(fd, start, os.SEEK_SET)
+            raw_tail = os.read(fd, min(200_000, file_stat.st_size - start))
+        except OSError:
+            return None
+        finally:
+            os.close(fd)
+        candidates.append(
+            (
+                file_stat.st_mtime_ns,
+                tie_breaker,
+                raw_tail.decode(errors="ignore"),
+            )
+        )
+    if not candidates:
+        return None
+    tail = max(candidates)[2]
+    metrics = list(
+        re.finditer(r"metrics server on 127\.0\.0\.1:(\d+)", tail)
+    )
+    if not metrics:
+        return None
+    generation = list(
+        re.finditer(r"Requesting new quick Tunnel|Generated Connector ID:", tail)
+    )
+    if generation and generation[-1].start() > metrics[-1].start():
+        return None
+    port = int(metrics[-1].group(1))
+    return port if 1 <= port <= 65_535 else None
 
 
 def _pgrep(pattern):

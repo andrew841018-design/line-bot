@@ -267,7 +267,6 @@ def test_handle_text_message():
     evt2 = _make_message_event(msg2)
     with (
         patch("main._handle_command", return_value=None),
-        patch("main._handle_restaurant_food_safety", return_value=False),
         patch("main._is_dinner_question", return_value=True),
         patch("main.burst_filter.cancel_burst"),
         patch("main._handle_dinner_recommendation") as mock_dinner,
@@ -527,12 +526,12 @@ def test_build_quoted_block():
     check("有引用且 DB 找到 → 非 None", result2 is not None)
     check("有引用且 DB 找到 → 含原文", "被引用的原文" in (result2 or ""))
 
-    # 有 quoted_message_id，DB 找不到 → None
+    # 有 quoted_message_id，DB 找不到 → 明確的未取得狀態
     msg3 = _make_text_msg("回覆")
     msg3.quoted_message_id = "MISSING_ID"
     with patch("main.memory.get_raw_message", return_value=None):
         result3 = main._build_quoted_block(msg3, "GRP001")
-    check("引用 DB 找不到 → None", result3 is None)
+    check("引用 DB 找不到 → 未取得", result3 is not None and "未取得" in result3)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

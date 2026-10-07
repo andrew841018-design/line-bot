@@ -168,7 +168,7 @@ def _resolve_google_news_url(redirect_url: str) -> str:
     return redirect_url
 
 
-def search_google_news(query: str, k: int = 10) -> list[dict]:
+def search_google_news(query: str, k: int = 10, *, resolve_urls: bool = True) -> list[dict]:
     """Google News RSS — 純 HTTP，無 API key。
 
     回傳：list[{title, url, published, source}]
@@ -202,7 +202,8 @@ def search_google_news(query: str, k: int = 10) -> list[dict]:
             if not title or not link:
                 continue
             # Resolve google news redirect to real URL
-            link = _resolve_google_news_url(link)
+            if resolve_urls:
+                link = _resolve_google_news_url(link)
             out.append(
                 {
                     "title": title,

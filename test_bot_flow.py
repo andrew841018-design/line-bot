@@ -158,6 +158,9 @@ def test_piggyback():
     pending_store.LOCK_PATH = Path(tmp_path + ".lock")
     try:
         with (
+            # 2026-06 起 pending reply 預設停用（pending_reply_policy）；
+            # 這裡只驗 legacy piggyback 格式，因此明確開啟開關。
+            mock.patch("main._pending_reply_enabled", return_value=True),
             mock.patch("main._llm_chat", return_value="這是測試回覆內容"),
             mock.patch("main._get_persona_notes", return_value=[]),
             mock.patch("main.memory") as mock_mem,
@@ -194,6 +197,7 @@ def test_piggyback():
     pending_store.LOCK_PATH = Path(tmp_path2 + ".lock")
     try:
         with (
+            mock.patch("main._pending_reply_enabled", return_value=True),
             mock.patch("main._llm_chat", return_value=""),
             mock.patch("main._get_persona_notes", return_value=[]),
             mock.patch("main.memory") as mock_mem,
@@ -211,6 +215,31 @@ def test_piggyback():
         os.unlink(tmp_path2)
         try:
             os.unlink(tmp_path2 + ".lock")
+        except FileNotFoundError:
+            pass
+
+    # 現行預設：pending reply 停用時不得回覆或移除 pending
+    with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
+        json.dump(pending_data, f, ensure_ascii=False)
+        tmp_path3 = f.name
+    pending_store.PENDING_PATH = Path(tmp_path3)
+    pending_store.LOCK_PATH = Path(tmp_path3 + ".lock")
+    try:
+        with (
+            mock.patch("main._pending_reply_enabled", return_value=False),
+            mock.patch("main._llm_chat", return_value="不應被呼叫") as mock_llm,
+        ):
+            result3 = main._pop_pending_for_piggyback(gid)
+        check("pending 停用時回 None", result3 is None)
+        check("pending 停用時不呼叫 LLM", not mock_llm.called)
+        remaining3 = main._load_pending_explicit()
+        check("pending 停用時 pending 不動", len(remaining3.get(gid, [])) == 3)
+    finally:
+        pending_store.PENDING_PATH = orig_path
+        pending_store.LOCK_PATH = orig_lock
+        os.unlink(tmp_path3)
+        try:
+            os.unlink(tmp_path3 + ".lock")
         except FileNotFoundError:
             pass
 

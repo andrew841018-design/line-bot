@@ -253,9 +253,9 @@ JSON state（小型常變）：`gemini_usage.json`（quota）、`pushed_jobs.jso
 | `line-bot-food-push` | launchd plist | 食物/菜單相關主動推送 |
 | `line-bot-morning-restart` | StartCalendar | 早上重啟 uvicorn 確保健康 |
 | `line-bot-auto-iterate` | StartCalendar | 自動迭代開發 / health 巡檢 |
-| `line-bot-feedback-process` | 每週二 02:00 | 處理週一收的回饋 |
-| `line-bot-feedback-push` | 每週日 20:00 | 推一次回饋問題到 LINE 群（pmset 19:55 喚醒） |
-| `line-bot-weekly-summary` | 每週日 20:00 | 週報摘要 |
+| `line-bot-feedback-process` | 已停用（2026-10-04） | 原本每週二 02:00 處理週日提問收到的回饋；n8n 與 launchd 排程都已停用 |
+| `line-bot-feedback-push` | 已停用（2026-10-04） | 原本每週日 20:00 推回饋問題到 LINE 群；Andrew 取消，n8n 排程已停用 |
+| `line-bot-weekly-summary` | 每週日 20:00 | 週報摘要＋家族熱話（不附新聞連結；不再含財經觀點段落）（pmset 19:55 喚醒） |
 
 ---
 

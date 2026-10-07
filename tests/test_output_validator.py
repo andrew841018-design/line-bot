@@ -112,7 +112,7 @@ def test_blocks_youtube_link_failure_reply_before_line_delivery():
 
     assert not result.ok
     assert result.reason == "youtube_link_failure"
-    assert "YouTube 連結解析流程沒有正確啟動" in result.text
+    assert result.text == ""
 
 
 def test_blocks_common_youtube_deflection_variants():

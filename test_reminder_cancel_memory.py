@@ -489,6 +489,8 @@ def test_cancel_pending_reminder_is_atomic_group_scoped_compare_and_set(reminder
         "source_ref": "",
         "source_text": "查看租金是否入帳",
         "mention_aliases": [],
+        "time_kind": None,
+        "merged_details": [],
     }
     assert _row(reminder_db, reminder_id)[2] == "cancelled"
     assert (

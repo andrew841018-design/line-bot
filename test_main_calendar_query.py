@@ -16,6 +16,58 @@ def test_1449_verbatim_classified_as_calendar_query():
     assert main._is_calendar_query("爸爸明天幾點要拿蛋糕？") is True
 
 
+def test_pilates_nondated_date_query_routes_from_mibao_alias():
+    """Prove-It: the reported wording must reach the deterministic calendar path."""
+    import main
+
+    class FakeMessage:
+        text = "米堡，皮拉提斯行程是哪一天？"
+        mention = None
+
+    clean = main._extract_gemini_trigger(FakeMessage.text, FakeMessage())
+
+    assert clean == "皮拉提斯行程是哪一天？"
+    assert main._is_calendar_query(clean) is True
+    assert main._is_todo_query(clean) is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["米堡好吃嗎？", "我想吃 米堡", "晚餐想吃：米堡", "推薦 米堡"],
+)
+def test_rice_burger_common_noun_does_not_trigger_bot(text):
+    import main
+
+    class FakeMessage:
+        mention = None
+
+    FakeMessage.text = text
+
+    assert main._extract_gemini_trigger(text, FakeMessage()) is None
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "皮拉提斯是什麼？",
+        "皮拉提斯有哪些好處？",
+        "皮拉提斯怎麼做？",
+        "皮拉提斯課程有哪些種類？",
+        "皮拉提斯是哪一天發明的？",
+        "台北哪家皮拉提斯推薦？",
+        "提醒我皮拉提斯行程是哪一天",
+        "皮拉提斯行程取消",
+    ],
+)
+def test_pilates_knowledge_and_write_queries_do_not_use_nondated_calendar_route(
+    query,
+):
+    import main
+
+    assert main._calendar_nondated_schedule_topic_query(query) is None
+    assert main._is_calendar_query(query) is False
+
+
 def test_calendar_query_variations():
     import main
 
@@ -506,6 +558,139 @@ def _patch_calendar_reply_capture(monkeypatch, main_mod, captured: dict):
     monkeypatch.setattr(main_mod, "MessagingApi", FakeMessagingApi)
     monkeypatch.setattr(main_mod, "ApiClient", FakeApiClient)
     monkeypatch.setattr(main_mod, "_get_line_config", lambda: object())
+
+
+def test_nondated_pilates_query_returns_only_nearest_canonical_event(monkeypatch):
+    import calendar_db
+    import main
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    today = datetime.now(ZoneInfo("Asia/Taipei")).date()
+    unrelated_date = (today + timedelta(days=1)).isoformat()
+    nearest_date = today + timedelta(days=2)
+    later_date = today + timedelta(days=16)
+
+    events = [
+        {
+            "event_id": "unrelated",
+            "group_id": "G1",
+            "title": "家族聚餐",
+            "event_date": unrelated_date,
+            "event_time": "18:00",
+            "location": "SECRET-UNRELATED",
+            "participants": '["媽媽"]',
+            "status": "active",
+        },
+        {
+            "event_id": "pilates-nearest",
+            "group_id": "G1",
+            "title": "皮拉提斯（包班）",
+            "event_date": nearest_date.isoformat(),
+            "event_time": "11:00",
+            "location": "SECRET-LOCATION",
+            "participants": '["SECRET-PARTICIPANT"]',
+            "status": "active",
+        },
+        {
+            "event_id": "pilates-later",
+            "group_id": "G1",
+            "title": "皮拉提斯（包班）",
+            "event_date": later_date.isoformat(),
+            "event_time": "11:00",
+            "location": "",
+            "participants": "[]",
+            "status": "active",
+        },
+    ]
+    lookup: dict = {}
+
+    def fake_lookup(group_id, keyword, limit=5):
+        lookup.update(group_id=group_id, keyword=keyword, limit=limit)
+        return events
+
+    monkeypatch.setattr(
+        calendar_db,
+        "list_upcoming_by_title_keyword",
+        fake_lookup,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        calendar_db,
+        "list_upcoming",
+        lambda *_a, **_k: pytest.fail("must not list unrelated family events"),
+    )
+    monkeypatch.setattr(
+        main.memory,
+        "list_generic_reminders_between",
+        lambda *_a, **_k: pytest.fail("must not read reminder projections"),
+    )
+    monkeypatch.setattr(main.memory, "append_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_append_bot_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main.settings, "bot_muted", False, raising=False)
+    captured: dict = {}
+    _patch_calendar_reply_capture(monkeypatch, main, captured)
+
+    class FakeEvent:
+        reply_token = "fake-token"
+
+    main._handle_calendar_query(
+        FakeEvent(),
+        "G1",
+        "皮拉提斯行程是哪一天？",
+    )
+
+    assert lookup == {"group_id": "G1", "keyword": "皮拉提斯", "limit": 5}
+    assert captured["text"] == (
+        f"下一次皮拉提斯行程是 {nearest_date.month}/{nearest_date.day} 11:00。"
+    )
+    assert f"{later_date.month}/{later_date.day}" not in captured["text"]
+    assert "SECRET" not in captured["text"]
+
+
+@pytest.mark.parametrize(
+    "rows,error,expected",
+    [
+        ([], None, "未來沒有登記的皮拉提斯行程。"),
+        (None, OSError("db unavailable"), "目前暫時讀不到家族行程，無法確認皮拉提斯日期。"),
+    ],
+)
+def test_nondated_pilates_query_distinguishes_empty_from_read_failure(
+    monkeypatch,
+    rows,
+    error,
+    expected,
+):
+    import calendar_db
+    import main
+
+    def fake_lookup(*_a, **_k):
+        if error is not None:
+            raise error
+        return rows
+
+    monkeypatch.setattr(
+        calendar_db,
+        "list_upcoming_by_title_keyword",
+        fake_lookup,
+        raising=False,
+    )
+    monkeypatch.setattr(main.memory, "append_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_append_bot_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main.settings, "bot_muted", False, raising=False)
+    captured: dict = {}
+    _patch_calendar_reply_capture(monkeypatch, main, captured)
+
+    class FakeEvent:
+        reply_token = "fake-token"
+
+    main._handle_calendar_query(
+        FakeEvent(),
+        "G1",
+        "皮拉提斯行程是哪一天？",
+    )
+
+    assert captured["text"] == expected
 
 
 def test_handle_calendar_query_finds_tomorrow_event(monkeypatch, patched_calendar_db):
@@ -1318,6 +1503,382 @@ def test_weekend_calendar_query_lists_both_weekend_days(monkeypatch):
     assert "週日活動" in captured["text"]
 
 
+def test_weekend_calendar_query_includes_matching_reminder_when_event_missing(
+    monkeypatch,
+):
+    """Prove-It: a reminder-backed family activity must not become "no event"."""
+    import calendar_db
+    import main
+    from datetime import date, datetime
+    from zoneinfo import ZoneInfo
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = datetime(
+                2026,
+                8,
+                27,
+                12,
+                0,
+                tzinfo=ZoneInfo("Asia/Taipei"),
+            )
+            return value if tz is None else value.astimezone(tz)
+
+    remind_at = int(
+        datetime(
+            2026,
+            8,
+            30,
+            11,
+            0,
+            tzinfo=ZoneInfo("Asia/Taipei"),
+        ).timestamp()
+    )
+    monkeypatch.setattr(main, "datetime", FixedDateTime)
+    monkeypatch.setattr(
+        main,
+        "_resolve_calendar_query_dates",
+        lambda _text: (date(2026, 8, 29), date(2026, 8, 30)),
+    )
+    monkeypatch.setattr(calendar_db, "list_past", lambda *a, **k: [])
+    monkeypatch.setattr(calendar_db, "list_upcoming", lambda *a, **k: [])
+    monkeypatch.setattr(
+        main.memory,
+        "list_generic_reminders_between",
+        lambda *a, **k: [
+            {
+                "reminder_id": 309,
+                "group_id": "G1",
+                "action": "皮拉提斯 南崁上課（包班）",
+                "remind_at": remind_at,
+                "source_text": "8/30 11:00 南崁皮拉提斯（包班），全家",
+                "source_kind": "",
+                "source_ref": "",
+                "mention_aliases": ["全家"],
+            }
+        ],
+    )
+    monkeypatch.setattr(main.memory, "append_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_append_bot_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main.settings, "bot_muted", False, raising=False)
+    captured: dict = {}
+    _patch_calendar_reply_capture(monkeypatch, main, captured)
+
+    class FakeEvent:
+        reply_token = "fake-token"
+
+    main._handle_calendar_query(
+        FakeEvent(),
+        "G1",
+        "@咪寶 這週末有皮拉提斯行程？",
+    )
+
+    assert "皮拉提斯" in captured["text"]
+    assert "南崁" in captured["text"]
+    assert "11:00" in captured["text"]
+    assert "提醒紀錄" in captured["text"]
+    assert "沒有家族行程" not in captured["text"]
+
+
+def test_weekend_calendar_query_does_not_treat_default_reminder_time_as_event_time(
+    monkeypatch,
+):
+    import calendar_db
+    import main
+    from datetime import date, datetime
+    from zoneinfo import ZoneInfo
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = datetime(2026, 8, 27, 12, 0, tzinfo=ZoneInfo("Asia/Taipei"))
+            return value if tz is None else value.astimezone(tz)
+
+    def at(hour: int) -> int:
+        return int(
+            datetime(2026, 8, 30, hour, 0, tzinfo=ZoneInfo("Asia/Taipei")).timestamp()
+        )
+
+    monkeypatch.setattr(main, "datetime", FixedDateTime)
+    monkeypatch.setattr(
+        main,
+        "_resolve_calendar_query_dates",
+        lambda _text: (date(2026, 8, 29), date(2026, 8, 30)),
+    )
+    monkeypatch.setattr(calendar_db, "list_past", lambda *a, **k: [])
+    monkeypatch.setattr(calendar_db, "list_upcoming", lambda *a, **k: [])
+    monkeypatch.setattr(
+        main.memory,
+        "list_generic_reminders_between",
+        lambda *a, **k: [
+            {
+                "reminder_id": 309,
+                "group_id": "G1",
+                "action": "有皮拉提斯 南崁上課（包班），全家",
+                "remind_at": at(0),
+                "source_text": "8/30、9/13早上有皮拉提斯 南崁上課（包班），全家",
+                "mention_aliases": ["全家"],
+            },
+            {
+                "reminder_id": 319,
+                "group_id": "G1",
+                "action": "曾美惠、哥哥皮拉提斯",
+                "remind_at": at(9),
+                "source_text": "8/30、9/13早上有皮拉提斯喔",
+                "mention_aliases": ["曾美惠", "哥哥"],
+            },
+        ],
+    )
+    monkeypatch.setattr(main.memory, "append_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_append_bot_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main.settings, "bot_muted", False, raising=False)
+    captured: dict = {}
+    _patch_calendar_reply_capture(monkeypatch, main, captured)
+
+    class FakeEvent:
+        reply_token = "fake-token"
+
+    main._handle_calendar_query(FakeEvent(), "G1", "@咪寶 這週末有皮拉提斯行程？")
+
+    assert "皮拉提斯" in captured["text"]
+    assert "提醒紀錄" in captured["text"]
+    assert "時間待確認" in captured["text"]
+    assert " 00:00" not in captured["text"]
+    assert " 09:00" not in captured["text"]
+
+
+def test_generic_weekend_query_does_not_project_todo_reminders(monkeypatch):
+    import calendar_db
+    import main
+    from datetime import date, datetime
+    from zoneinfo import ZoneInfo
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = datetime(2026, 8, 27, 12, 0, tzinfo=ZoneInfo("Asia/Taipei"))
+            return value if tz is None else value.astimezone(tz)
+
+    monkeypatch.setattr(main, "datetime", FixedDateTime)
+    monkeypatch.setattr(
+        main,
+        "_resolve_calendar_query_dates",
+        lambda _text: (date(2026, 8, 29), date(2026, 8, 30)),
+    )
+    monkeypatch.setattr(calendar_db, "list_past", lambda *a, **k: [])
+    monkeypatch.setattr(calendar_db, "list_upcoming", lambda *a, **k: [])
+    monkeypatch.setattr(
+        main.memory,
+        "list_generic_reminders_between",
+        lambda *a, **k: pytest.fail("generic queries must not read legacy reminders"),
+    )
+    monkeypatch.setattr(main.memory, "append_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_append_bot_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main.settings, "bot_muted", False, raising=False)
+    captured: dict = {}
+    _patch_calendar_reply_capture(monkeypatch, main, captured)
+
+    class FakeEvent:
+        reply_token = "fake-token"
+
+    main._handle_calendar_query(FakeEvent(), "G1", "@咪寶 這週末有什麼行程？")
+
+    assert "沒有家族行程" in captured["text"]
+
+
+def test_canonical_pilates_event_wins_without_reading_legacy_reminders(monkeypatch):
+    import calendar_db
+    import main
+    from datetime import date, datetime
+    from zoneinfo import ZoneInfo
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = datetime(2026, 8, 27, 12, 0, tzinfo=ZoneInfo("Asia/Taipei"))
+            return value if tz is None else value.astimezone(tz)
+
+    event = {
+        "event_id": "E1",
+        "group_id": "G1",
+        "title": "皮拉提斯（包班）",
+        "event_date": "2026-08-30",
+        "event_time": "11:00",
+        "location": "南崁",
+        "participants": '["全家"]',
+        "status": "active",
+    }
+    monkeypatch.setattr(main, "datetime", FixedDateTime)
+    monkeypatch.setattr(
+        main,
+        "_resolve_calendar_query_dates",
+        lambda _text: (date(2026, 8, 29), date(2026, 8, 30)),
+    )
+    monkeypatch.setattr(calendar_db, "list_past", lambda *a, **k: [])
+    monkeypatch.setattr(calendar_db, "list_upcoming", lambda *a, **k: [event])
+    monkeypatch.setattr(
+        main.memory,
+        "list_generic_reminders_between",
+        lambda *a, **k: pytest.fail("canonical event must remain authoritative"),
+    )
+    monkeypatch.setattr(main.memory, "append_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_append_bot_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main.settings, "bot_muted", False, raising=False)
+    captured: dict = {}
+    _patch_calendar_reply_capture(monkeypatch, main, captured)
+
+    class FakeEvent:
+        reply_token = "fake-token"
+
+    main._handle_calendar_query(FakeEvent(), "G1", "@咪寶 這週末有皮拉提斯行程？")
+
+    assert captured["text"].count("皮拉提斯") == 1
+    assert "2026-08-30 11:00" in captured["text"]
+    assert "提醒紀錄" not in captured["text"]
+
+
+def test_pilates_query_read_failure_does_not_claim_no_schedule(monkeypatch):
+    import calendar_db
+    import main
+    from datetime import date, datetime
+    from zoneinfo import ZoneInfo
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = datetime(2026, 8, 27, 12, 0, tzinfo=ZoneInfo("Asia/Taipei"))
+            return value if tz is None else value.astimezone(tz)
+
+    monkeypatch.setattr(main, "datetime", FixedDateTime)
+    monkeypatch.setattr(
+        main,
+        "_resolve_calendar_query_dates",
+        lambda _text: (date(2026, 8, 29), date(2026, 8, 30)),
+    )
+    monkeypatch.setattr(calendar_db, "list_past", lambda *a, **k: [])
+    monkeypatch.setattr(calendar_db, "list_upcoming", lambda *a, **k: [])
+    monkeypatch.setattr(
+        main.memory,
+        "list_generic_reminders_between",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("db unavailable")),
+    )
+    monkeypatch.setattr(main.memory, "append_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_append_bot_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main.settings, "bot_muted", False, raising=False)
+    captured: dict = {}
+    _patch_calendar_reply_capture(monkeypatch, main, captured)
+
+    class FakeEvent:
+        reply_token = "fake-token"
+
+    main._handle_calendar_query(FakeEvent(), "G1", "@咪寶 這週末有皮拉提斯行程？")
+
+    assert "無法完整讀取" in captured["text"]
+    assert "沒有家族行程" not in captured["text"]
+
+
+@pytest.mark.parametrize(
+    "action,source_text",
+    [
+        ("去皮拉提斯上課", "8/30皮拉提斯上課，前一天提醒我"),
+        ("去皮拉提斯上課，確認碼 ABCD", "8/29去皮拉提斯上課，確認碼 ABCD"),
+        ("去皮拉提斯OTP碼1234", "8/29去皮拉提斯OTP碼1234"),
+        ("去皮拉提斯passcode是1234", "8/29去皮拉提斯passcode是1234"),
+        ("去皮拉提斯code碼ABCD", "8/29去皮拉提斯code碼ABCD"),
+        ("去皮拉提斯上課", "8/29取貨；8/30皮拉提斯上課"),
+        ("去皮拉提斯上課", "8/29取貨，8/30皮拉提斯上課"),
+        ("去皮拉提斯上課", "8/29取貨、8/30皮拉提斯上課"),
+    ],
+)
+def test_legacy_pilates_projection_rejects_lead_dates_and_sensitive_codes(
+    monkeypatch,
+    action,
+    source_text,
+):
+    import calendar_db
+    import main
+    from datetime import date, datetime
+    from zoneinfo import ZoneInfo
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = datetime(2026, 8, 27, 12, 0, tzinfo=ZoneInfo("Asia/Taipei"))
+            return value if tz is None else value.astimezone(tz)
+
+    remind_at = int(
+        datetime(2026, 8, 29, 9, 0, tzinfo=ZoneInfo("Asia/Taipei")).timestamp()
+    )
+    monkeypatch.setattr(main, "datetime", FixedDateTime)
+    monkeypatch.setattr(
+        main,
+        "_resolve_calendar_query_dates",
+        lambda _text: (date(2026, 8, 29),),
+    )
+    monkeypatch.setattr(calendar_db, "list_past", lambda *a, **k: [])
+    monkeypatch.setattr(calendar_db, "list_upcoming", lambda *a, **k: [])
+    monkeypatch.setattr(
+        main.memory,
+        "list_generic_reminders_between",
+        lambda *a, **k: [
+            {
+                "reminder_id": 1,
+                "group_id": "G1",
+                "action": action,
+                "remind_at": remind_at,
+                "source_text": source_text,
+                "mention_aliases": ["全家"],
+            }
+        ],
+    )
+    monkeypatch.setattr(main.memory, "append_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_append_bot_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main.settings, "bot_muted", False, raising=False)
+    captured: dict = {}
+    _patch_calendar_reply_capture(monkeypatch, main, captured)
+
+    class FakeEvent:
+        reply_token = "fake-token"
+
+    main._handle_calendar_query(FakeEvent(), "G1", "@咪寶 8/29有皮拉提斯行程？")
+
+    assert "沒有家族行程" in captured["text"]
+    assert "ABCD" not in captured["text"]
+
+
+def test_legacy_pilates_projection_never_echoes_raw_action_details():
+    import main
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    remind_at = int(
+        datetime(2026, 8, 30, 11, 0, tzinfo=ZoneInfo("Asia/Taipei")).timestamp()
+    )
+    events = main._legacy_activity_reminders_as_events(
+        [
+            {
+                "reminder_id": 1,
+                "group_id": "G1",
+                "action": "去皮拉提斯上課，會員編號 Z9SECRET",
+                "remind_at": remind_at,
+                "source_text": "8/30 11:00 南崁皮拉提斯包班",
+                "mention_aliases": ["全家"],
+            }
+        ],
+        topic="皮拉提斯",
+        target_date_isos={"2026-08-30"},
+        query_actors=set(),
+        query_places=[],
+        query_daypart=None,
+    )
+
+    assert len(events) == 1
+    assert events[0]["title"] == "皮拉提斯（包班；提醒紀錄）"
+    assert events[0]["location"] == "南崁"
+    assert "Z9SECRET" not in str(events[0])
+
+
 @pytest.mark.parametrize(
     "query",
     [
@@ -1788,7 +2349,6 @@ def test_reported_reminder_with_embedded_home_query_stays_in_chat(
     monkeypatch.setattr(food_signals, "extract_and_store_async", lambda *a: None)
     monkeypatch.setattr(message_classifier, "classify_rule", lambda _t: "other")
     monkeypatch.setattr(message_classifier, "update_category", lambda *a: None)
-    monkeypatch.setattr(main, "_handle_restaurant_food_safety", lambda *a: False)
     monkeypatch.setattr(main, "_is_dinner_question", lambda _t: False)
     monkeypatch.setattr(main, "_is_web_research_question", lambda _t: False)
     monkeypatch.setattr(main, "_try_piggyback_reminders_fast_path", lambda *a: False)
@@ -1842,6 +2402,8 @@ def test_reported_reminder_with_embedded_home_query_stays_in_chat(
         "咪寶，能不能提醒我明天開會",
         "@咪寶 可以提醒我明天開會嗎？",
         "/問 能不能提醒我明天開會",
+        "咪寶明天領米",
+        "咪寶，我明天去領米",
         "咪寶，媽媽明天生日提醒我買蛋糕",
         "咪寶，媽媽明天回診提醒我帶健保卡",
         "咪寶，媽媽8/13的約提醒我帶文件",
@@ -1907,6 +2469,7 @@ def test_reported_reminder_with_embedded_home_query_stays_in_chat(
         "明天提醒我拿爸爸的鑰匙",
         "明天提醒我準備媽媽的早餐",
         "明天提醒我整理公司的簡報",
+        "明天提醒我交媽媽寫的作業",
         "請明天提醒我買媽媽的生日禮物",
         "麻煩明天提醒我帶小明的雨傘",
         "明天請提醒我拿爸爸的鑰匙",
@@ -2105,6 +2668,36 @@ def test_bare_add_query_cannot_create_calendar_or_reminder(monkeypatch, text):
 
     assert main._auto_capture_text_if_important("G1", text, "U1", "m1") is False
     assert main._maybe_extract_reminder(text, "G1", "U1", "m1") is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "咪寶明天領包裹好不好",
+        "咪寶明天拿藥行不行",
+        "咪寶明天打球可否",
+        "咪寶明天參加婚禮好不好",
+        "咪寶明天聚餐好不好",
+    ],
+)
+def test_bare_bot_decision_question_cannot_reach_calendar_capture(
+    monkeypatch,
+    text,
+):
+    import main
+
+    monkeypatch.setattr(
+        main,
+        "_capture_calendar_events_regex_only",
+        lambda *_a, **_k: pytest.fail("decision question must not create calendar data"),
+    )
+    monkeypatch.setattr(
+        main,
+        "_maybe_capture_calendar_event",
+        lambda *_a, **_k: pytest.fail("decision question must not start background capture"),
+    )
+
+    assert main._auto_capture_text_if_important("G1", text, "U1", "m1") is False
 
 
 @pytest.mark.parametrize(
@@ -2436,13 +3029,12 @@ def test_generic_web_question_is_not_intercepted_by_calendar_fast_path(
         "_handle_calendar_query",
         lambda *_a: pytest.fail("generic web query must not reach calendar"),
     )
-    monkeypatch.setattr(main, "_handle_restaurant_food_safety", lambda *a: False)
     monkeypatch.setattr(main, "_is_dinner_question", lambda _t: False)
     monkeypatch.setattr(main, "_is_web_research_question", lambda _t: True)
     monkeypatch.setattr(
         main,
         "_handle_web_research_question",
-        lambda _event, _gid, query: routed.append(query) or True,
+        lambda _event, _gid, query, **_kw: routed.append(query) or True,
     )
 
     class FakeMessage:
@@ -2497,7 +3089,6 @@ def test_schedule_noun_statement_stays_in_ordinary_chat(monkeypatch, text):
         "_handle_calendar_query",
         lambda *_a: pytest.fail("ordinary chat must not reach calendar"),
     )
-    monkeypatch.setattr(main, "_handle_restaurant_food_safety", lambda *a: False)
     monkeypatch.setattr(main, "_is_dinner_question", lambda _t: False)
     monkeypatch.setattr(main, "_is_web_research_question", lambda _t: False)
     monkeypatch.setattr(main, "_try_piggyback_reminders_fast_path", lambda *a: False)
@@ -2980,7 +3571,7 @@ def test_calendar_title_recognizes_joint_action_subjects():
     assert main._calendar_title_action_actors("媽媽、爸爸及妹妹一起回台北") == {
         "媽媽",
         "爸爸",
-        "妹妹",
+        main._normalize_family_actor("妹妹"),
     }
     for title in (
         "媽媽陪爸爸去考選部",
@@ -5859,6 +6450,51 @@ def test_calendar_capture_reschedules_only_with_explicit_reschedule_words(
     updated = next(event for event in events if event["event_id"] == event_id)
     assert updated["event_date"] == new_date
     assert updated["event_time"] == "19:00"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "明天提醒我領米是什麼意思？",
+        "媽媽說「明天提醒我領米」",
+        "咪寶明天上課取消了",
+        "2/30早上9點提醒我領米，3/1早上10點提醒我買菜",
+        "8/25 25:00提醒我領米，8/26 10:00提醒我買菜",
+        "8/24提醒我每天吃藥，8/25提醒我回診",
+        "8/25 9點提醒我吃藥，每天都要，8/26 10點回診",  # privacy-safe-fixture
+        "8/24提醒我，8/25提醒我",
+        "8/24提醒我吃藥了嗎？8/25提醒我回診",
+        "8/24提醒我領米這句話，8/25交作業",
+        "8/24提醒我領米設定了沒，8/25交作業",
+        "8/24提醒我領米是什麼意思，8/25交作業",
+        "8/24提醒我領米，不用新增，8/25交作業",
+        "8/24提醒我領米，8/25每天回診",
+        "8/24提醒我領米，8/25每日吃藥",
+        "8/24提醒我領米，8/25每週開會",
+        "8/24提醒我領米，8/25天天運動",
+    ],
+)
+def test_direct_calendar_capture_respects_reminder_no_write_boundary(
+    tmp_calendar_db,
+    monkeypatch,
+    text,
+):
+    import calendar_extractor
+    import main
+
+    extractor_calls = []
+    monkeypatch.setattr(main, "_gemini_side_task_allowed", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        calendar_extractor,
+        "extract",
+        lambda *_a, **_k: extractor_calls.append((_a, _k)),
+    )
+    before = tmp_calendar_db.list_upcoming("G1", days=30)
+
+    main._maybe_capture_calendar_event("G1", text, "U1", "m-suppressed")
+
+    assert extractor_calls == []
+    assert tmp_calendar_db.list_upcoming("G1", days=30) == before
 
 
 def test_calendar_capture_cancellation_selector_mismatch_does_not_reschedule(

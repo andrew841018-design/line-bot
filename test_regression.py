@@ -17,6 +17,7 @@ Bug refs (commit SHA prefix):
 import sys
 import time
 import types
+import asyncio
 from contextlib import contextmanager
 from datetime import datetime
 from unittest.mock import MagicMock, patch
@@ -206,8 +207,9 @@ def test_non_explicit_quoted_url_followup_routes_to_web_research():
 
     mock_web.assert_called_once()
     research_text = mock_web.call_args.args[2]
-    assert "原始連結 https://example.com/a" in research_text
-    assert "這個真的假的" in research_text
+    assert research_text == "這個真的假的 https://example.com/a"
+    import public_research
+    assert public_research.public_query(research_text) == research_text
     mock_cancel.assert_called_once_with("GRP001")
     mock_burst.assert_not_called()
 
@@ -273,7 +275,7 @@ def test_quoted_media_description_fallback_answers_when_bytes_missing():
     mock_bot_turn.assert_called_once()
     mock_reply.assert_called_once()
     sent = mock_reply.call_args.args[1]
-    assert "圖片內容：" in sent
+    assert "圖片內容：" not in sent
     assert "正方：" in sent
     assert "反方：" in sent
     assert "統一論點：" in sent
@@ -576,7 +578,8 @@ def test_prefetch_youtube_all_fetchers_fail_still_adds_context(monkeypatch):
 
     assert "系統已辨識為 YouTube 影片或直播" in out
     assert "影片 ID：LIVE1234567" in out
-    assert "禁止使用把操作交回使用者" in out
+    assert "失敗狀態只供內部使用" in out
+    assert "仍無內容就輸出空字串" in out
     assert "幫我看 https://www.youtube.com/live/LIVE1234567。" in out
 
 
@@ -851,9 +854,9 @@ def test_bug6_quota_footer_no_percentage_unless_exhausted():
     assert footer == "", f"Quota exhausted 時也不該附加 footer，got: {footer!r}"
 
 
-def test_bug8_burst_empty_quota_replies_without_pending():
+def test_bug8_burst_empty_quota_routes_to_silent_sink_without_pending():
     """Andrew 2026-07-04: pending reply disabled. Quota exhausted + burst empty
-    should send a visible degraded reply but should not enqueue pending reply.
+    routes through the generic fallback sink and must not enqueue pending reply.
     """
     main._quota_exhausted_until_ts = time.time() + 3600
 
@@ -880,8 +883,114 @@ def test_bug8_burst_empty_quota_replies_without_pending():
     assert pending == []
 
 
-def test_explicit_empty_quota_replies_visible_without_pending(monkeypatch):
-    """Explicit bot call should not go silent when quota and local fallback both miss."""
+def test_burst_unavailable_local_miss_routes_to_silent_sink(monkeypatch):
+    monkeypatch.setattr(main, "_quota_exhausted", lambda: False)
+
+    with (
+        patch("main._llm_chat", side_effect=RuntimeError("503 unavailable")),
+        patch("main._local_text_llm_fallback", return_value=""),
+        patch("main.memory.check_fact_cache", return_value=None),
+        patch("main.memory.get_context", return_value=[]),
+        patch("main.memory.top_facts", return_value=[]),
+        patch("main._get_persona_notes", return_value=[]),
+        patch("main._prefetch_urls", return_value="值得回覆的內容"),
+        patch("main._reply") as mock_reply,
+        patch("main._thinking_indicator", return_value=_noop_cm()),
+    ):
+        main._handle_burst_flush("GRP001", "值得回覆的內容", "TOKEN001")
+
+    mock_reply.assert_called_once_with(
+        "TOKEN001",
+        main._visible_llm_degraded_reply(),
+        group_id="GRP001",
+        allow_push_fallback=True,
+    )
+
+
+def test_burst_unclassified_gemini_failure_routes_to_silent_sink(monkeypatch):
+    """Empty-after-retry RuntimeError routes through the suppressed legacy sink."""
+    monkeypatch.setattr(main, "_quota_exhausted", lambda: False)
+
+    with (
+        patch(
+            "main._llm_chat",
+            side_effect=RuntimeError("gemini chat: empty text after 3 attempts"),
+        ),
+        patch("main.memory.check_fact_cache", return_value=None),
+        patch("main.memory.get_context", return_value=[]),
+        patch("main.memory.top_facts", return_value=[]),
+        patch("main._get_persona_notes", return_value=[]),
+        patch("main._prefetch_urls", return_value="值得回覆的內容"),
+        patch("main._reply") as mock_reply,
+        patch("main._thinking_indicator", return_value=_noop_cm()),
+    ):
+        main._handle_burst_flush("GRP001", "值得回覆的內容", "TOKEN001")
+
+    mock_reply.assert_called_once_with(
+        "TOKEN001",
+        main._visible_llm_degraded_reply(),
+        group_id="GRP001",
+        allow_push_fallback=True,
+    )
+
+
+def test_web_research_empty_lookup_reports_no_evidence(monkeypatch):
+    event = _make_text_event("幫我查這件事", group_id="GRP001")
+    monkeypatch.setattr(main, "_collect_web_research_sources", lambda _text: [])
+    monkeypatch.setattr(main, "_prefetch_urls", lambda _text: "查詢素材")
+    monkeypatch.setattr(main, "_llm_chat", lambda *args, **kwargs: "")
+    monkeypatch.setattr(main, "_thinking_indicator", lambda _group_id: _noop_cm())
+
+    with (
+        patch("main.memory.get_context", return_value=[]),
+        patch("main.memory.top_facts", return_value=[]),
+        patch("main._get_persona_notes", return_value=[]),
+        patch("main._reply") as mock_reply,
+    ):
+        handled = main._handle_web_research_question(
+            event, "GRP001", "幫我查這件事"
+        )
+
+    assert handled is True
+    import public_research
+    mock_reply.assert_called_once_with(
+        "TOKEN001",
+        public_research.NO_EVIDENCE,
+        group_id="GRP001",
+    )
+
+
+def test_lifespan_disables_local_text_runtime_before_pending_drain(monkeypatch):
+    order: list[str] = []
+    fake_pending = types.ModuleType("pending_store")
+    fake_pending.harden_media_permissions = lambda: 0
+    fake_pending.sweep_orphan_media = lambda: 0
+    fake_pending.sweep_delivery_lock_files = lambda: 0
+    monkeypatch.setitem(sys.modules, "pending_store", fake_pending)
+    monkeypatch.delenv("JOBS_ROUTES_ENABLED", raising=False)
+    monkeypatch.setattr(
+        main, "_configure_local_text_llm_runtime", lambda: order.append("policy")
+    )
+    monkeypatch.setattr(main, "_start_local_vision_worker", lambda: None)
+    fake_vision = types.ModuleType("vision_llm")
+    fake_vision.shutdown_background_worker = lambda: None
+    monkeypatch.setitem(sys.modules, "vision_llm", fake_vision)
+    monkeypatch.setattr(
+        main, "_process_pending_on_startup", lambda: order.append("pending")
+    )
+    monkeypatch.setattr(main, "_init_on_startup", lambda: order.append("init"))
+
+    async def run_lifespan() -> None:
+        async with main._app_lifespan(MagicMock()):
+            order.append("yield")
+
+    asyncio.run(run_lifespan())
+
+    assert order == ["policy", "pending", "init", "yield"]
+
+
+def test_explicit_empty_quota_routes_to_silent_sink_without_pending(monkeypatch):
+    """Explicit miss routes to the sink and does not enqueue a stale reply."""
     evt = _make_text_event("咪寶 幫我分析")
     monkeypatch.setattr(main, "_quota_exhausted", lambda: True)
 
@@ -913,6 +1022,39 @@ def test_explicit_empty_quota_replies_visible_without_pending(monkeypatch):
     )
 
 
+def test_explicit_unclassified_gemini_failure_routes_to_silent_sink(monkeypatch):
+    evt = _make_text_event("咪寶 幫我分析")
+    monkeypatch.setattr(main, "_quota_exhausted", lambda: False)
+
+    with (
+        patch("main._detect_image_gen_request", return_value=""),
+        patch("main._handle_explicit_poll_text", return_value=None),
+        patch("main._is_todo_query", return_value=False),
+        patch("main._is_calendar_query", return_value=False),
+        patch("main._get_explicit_market_quote_reply", return_value=""),
+        patch("main.memory.get_context", return_value=[]),
+        patch("main._build_quoted_block", return_value=None),
+        patch("main._prefetch_urls", return_value="幫我分析"),
+        patch("main._is_market_quote_request", return_value=False),
+        patch("main.memory.top_facts", return_value=[]),
+        patch("main._get_persona_notes", return_value=""),
+        patch(
+            "main._llm_chat",
+            side_effect=RuntimeError("gemini chat: empty text after 3 attempts"),
+        ),
+        patch("main._reply") as mock_reply,
+        patch("main._thinking_indicator", return_value=_noop_cm()),
+    ):
+        main._handle_explicit_text(evt, "GRP001", "幫我分析")
+
+    mock_reply.assert_called_once_with(
+        "TOKEN001",
+        main._visible_llm_degraded_reply(),
+        group_id="GRP001",
+        allow_push_fallback=True,
+    )
+
+
 def test_bug9_reply_suppresses_system_status_messages():
     """Andrew 2026-05-31: LINE group must not receive internal quota/status text."""
     main.settings.bot_muted = False
@@ -931,10 +1073,34 @@ def test_bug9_reply_suppresses_system_status_messages():
     ):
         main._reply("TOKEN001", blocked_text, group_id="GRP001")
         main._reply("TOKEN002", main._quota_exhausted_message(), group_id="GRP001")
+        visible_sent = main._reply(
+            "TOKEN003", main._visible_llm_degraded_reply(), group_id="GRP001"
+        )
 
-    assert not mock_messaging.reply_message.called
+    assert visible_sent is False
+    mock_messaging.reply_message.assert_not_called()
     assert not mock_messaging.push_message.called
-    assert not main._is_system_status_outbound(main._visible_llm_degraded_reply())
+    assert main._is_system_status_outbound(main._visible_llm_degraded_reply())
+
+
+def test_user_rejected_generic_degraded_messages_are_system_suppressed():
+    assert main._is_system_status_outbound(
+        "這個圖片我這次沒分析成功，請稍後再傳一次 🙏"
+    )
+    assert main._is_system_status_outbound(
+        "這個影片我這次沒分析成功，請稍後再傳一次 🙏"
+    )
+    assert main._is_system_status_outbound(main._visible_llm_degraded_reply())
+    useful_ocr = (
+        "⚠️ 文字辨識降級結果：這次沒有完成完整看圖。\n\n"
+        "OCR 文字摘錄：這個圖片我這次沒分析成功，請稍後再傳一次 🙏\n\n"
+        "能力限制：OCR 可能誤讀，不能取代完整視覺判讀。"
+    )
+    assert main._is_user_rejected_degraded_outbound(useful_ocr)
+    assert main._is_system_status_outbound(useful_ocr)
+    useful_video_ocr = useful_ocr.replace("圖片", "影片")
+    assert main._is_user_rejected_degraded_outbound(useful_video_ocr)
+    assert main._is_system_status_outbound(useful_video_ocr)
 
 
 def test_bug10_reply_suppresses_llm_internal_trace():
@@ -1147,8 +1313,9 @@ def test_reply_does_not_mention_bare_alias_without_at(monkeypatch):
 
 
 def test_reply_blocks_youtube_link_failure_before_line_api(monkeypatch):
-    """YouTube deflection text must be replaced before reaching LINE."""
+    """YouTube deflection text must be suppressed before reaching LINE."""
     monkeypatch.setattr(main.settings, "bot_muted", False)
+    monkeypatch.setattr(main, "_reminder_reply_piggyback_enabled", lambda: False)
 
     mock_api = MagicMock()
     mock_api.__enter__ = MagicMock(return_value=mock_api)
@@ -1166,11 +1333,8 @@ def test_reply_blocks_youtube_link_failure_before_line_api(monkeypatch):
     ):
         main._reply("TOKEN001", bad_reply, group_id="GRP001")
 
-    request = mock_messaging.reply_message.call_args.args[0]
-    sent = request.messages[0].text
-    assert "YouTube 連結解析流程沒有正確啟動" in sent
-    assert "點擊觀看" not in sent
-    assert "無法解析此直播" not in sent
+    mock_messaging.reply_message.assert_not_called()
+    mock_messaging.push_message.assert_not_called()
 
 
 def test_reply_suppresses_low_value_checkin_commitment_before_line_api(monkeypatch):
@@ -1215,6 +1379,34 @@ def test_reply_suppresses_low_value_helpless_text_before_line_api(monkeypatch):
             group_id="GRP001",
         )
 
+    assert not mock_messaging.reply_message.called
+    assert not mock_messaging.push_message.called
+
+
+def test_reply_suppressed_primary_closes_inbound_as_completed_no_reply(monkeypatch):
+    """A safety-blocked reply must not leave its inbound event processing forever."""
+    monkeypatch.setattr(main.settings, "bot_muted", False)
+    monkeypatch.setattr(main, "_reminder_reply_piggyback_enabled", lambda: False)
+
+    mock_api = MagicMock()
+    mock_api.__enter__ = MagicMock(return_value=mock_api)
+    mock_api.__exit__ = MagicMock(return_value=False)
+    mock_messaging = MagicMock()
+
+    with (
+        patch("main.ApiClient", return_value=mock_api),
+        patch("main.MessagingApi", return_value=mock_messaging),
+        patch("main._load_pending_explicit", return_value={}),
+        patch("main._mark_inbound_reply_completed_no_reply") as mark_completed,
+    ):
+        result = main._reply(
+            "TOKEN001",
+            "這個說法有一定道理，但需要進一步查證和具體分析。",
+            group_id="GRP001",
+        )
+
+    assert result is False
+    mark_completed.assert_called_once_with("TOKEN001")
     assert not mock_messaging.reply_message.called
     assert not mock_messaging.push_message.called
 
@@ -1474,11 +1666,10 @@ def test_bug10_explicit_quota_miss_replies_without_pending():
     with (
         patch(
             "main._llm_chat",
-            side_effect=[
-                Exception("429 RESOURCE_EXHAUSTED PerDay free_tier_requests"),
-                "",
-            ],
+            side_effect=Exception("429 RESOURCE_EXHAUSTED PerDay free_tier_requests"),
         ),
+        # 2026-10-04: the retry skips the failed Claude CLI.
+        patch("main._gemini_llm_chat", return_value=""),
         patch("main._mark_quota_exhausted"),
         patch("main.memory.get_context", return_value=[]),
         patch("main.memory.top_facts", return_value=[]),
@@ -1755,6 +1946,76 @@ def test_successful_reminder_creation_replies_once_and_stops_chat_routing(monkey
         confirmation,
         group_id="GRP001",
         allow_push_fallback=False,
+        # 2026-10-04: receipts name their own reminders so the same reply never
+        # piggybacks them; a plain string carries none.
+        primary_reminder_ref=None,
+        # GP2 r2/r3: _reply reports whether the receipt text itself went out.
+        primary_delivery={},
+    )
+
+
+def test_month_only_reminder_precompute_bypasses_health_chat_and_calendar_capture():
+    evt = _make_text_event(
+        text="咪寶： 提醒我十月份要打流感和covid 的疫苗"
+    )
+    parsed = {
+        "action": "打流感和covid 的疫苗",
+        "year": 2026,
+        "month": 10,
+        "day": 1,
+        "hour": 12,
+        "minute": 0,
+        "mention_aliases": ["爸爸"],
+        "_date_default_kind": "month_start",
+        "_time_default_kind": "no_daypart",
+        "_trusted_direct_request": True,
+    }
+    confirmation = (
+        "已新增提醒\n"
+        "時間：2026-10-01 12:00（未指定日期，預設當月 1 日；"
+        "未指定時間，預設 12:00）\n"
+        "事項：打流感和covid 的疫苗\n"
+        "對象：@爸爸"
+    )
+
+    with (
+        patch("main.feedback_collector.in_feedback_window", return_value=False),
+        patch("main._try_one_shot_reply", return_value=True) as mock_one_shot,
+        patch("main._try_handle_calendar_correction", return_value=False),
+        patch("main._detect_user_correction"),
+        patch("knowledge_graph.auto_extract_kg_async"),
+        patch("food_signals.extract_and_store_async"),
+        patch("message_classifier.classify_rule", return_value="健康"),
+        patch("message_classifier.update_category"),
+        patch("main._extract_gemini_trigger", return_value=None),
+        patch("main._explicit_range_reminder_result", return_value=None),
+        patch("main._explicit_month_reminder_result", return_value=parsed),
+        patch("main._explicit_single_reminder_result", return_value=None),
+        patch("main._auto_capture_text_if_important") as mock_calendar_capture,
+        patch("main._maybe_extract_reminder", return_value=confirmation) as mock_extract,
+        patch("main._handle_command", return_value=None) as mock_command,
+        patch("main.burst_filter.add_to_burst") as mock_burst,
+        patch("main.burst_filter.cancel_burst") as mock_cancel,
+        patch("main._reply") as mock_reply,
+    ):
+        main._handle_text_message(evt, "GRP001")
+
+    mock_calendar_capture.assert_not_called()
+    mock_one_shot.assert_not_called()
+    assert mock_extract.call_args.kwargs["precomputed_result"] == parsed
+    mock_command.assert_called_once()
+    mock_burst.assert_not_called()
+    mock_cancel.assert_called_once_with("GRP001")
+    mock_reply.assert_called_once_with(
+        "TOKEN001",
+        confirmation,
+        group_id="GRP001",
+        allow_push_fallback=False,
+        # 2026-10-04: receipts name their own reminders so the same reply never
+        # piggybacks them; a plain string carries none.
+        primary_reminder_ref=None,
+        # GP2 r2/r3: _reply reports whether the receipt text itself went out.
+        primary_delivery={},
     )
 
 
@@ -1914,6 +2175,8 @@ def test_quota_exhausted_llm_chat_recheck_429_falls_back_local(monkeypatch):
 
 
 def test_quota_exhausted_startup_prewarms_local_llm(monkeypatch):
+    import local_llm
+
     started: list[dict] = []
 
     class FakeThread:
@@ -1926,6 +2189,7 @@ def test_quota_exhausted_startup_prewarms_local_llm(monkeypatch):
     monkeypatch.setattr(main, "_local_text_prewarm_started", False)
     monkeypatch.setattr(main, "_quota_exhausted", lambda: True)
     monkeypatch.setattr(main.threading, "Thread", FakeThread)
+    local_llm.configure_runtime(enabled=True, reason="test opt-in")
 
     main._prewarm_local_text_llm_if_needed()
 
@@ -1933,6 +2197,40 @@ def test_quota_exhausted_startup_prewarms_local_llm(monkeypatch):
     assert started[0]["daemon"] is True
     assert started[0]["name"] == "local-llm-prewarm"
     assert started[0]["started"] is True
+
+
+def test_quota_startup_skips_local_prewarm_under_default_server_policy(monkeypatch):
+    import local_llm
+
+    monkeypatch.delenv("LINE_BOT_ALLOW_INPROCESS_LOCAL_LLM", raising=False)
+    monkeypatch.setattr(main, "_local_text_prewarm_started", False)
+    monkeypatch.setattr(main, "_quota_exhausted", lambda: True)
+    monkeypatch.setattr(
+        main.threading,
+        "Thread",
+        lambda *args, **kwargs: pytest.fail(
+            "default-off uvicorn policy must not create a local prewarm thread"
+        ),
+    )
+
+    main._configure_local_text_llm_runtime()
+    try:
+        main._prewarm_local_text_llm_if_needed()
+        assert main._local_text_prewarm_started is False
+        assert local_llm.runtime_enabled() is False
+    finally:
+        local_llm.configure_runtime(enabled=True, reason="test cleanup")
+
+
+def test_server_local_text_runtime_requires_explicit_positive_opt_in(monkeypatch):
+    import local_llm
+
+    monkeypatch.setenv("LINE_BOT_ALLOW_INPROCESS_LOCAL_LLM", "1")
+    try:
+        main._configure_local_text_llm_runtime()
+        assert local_llm.runtime_enabled() is True
+    finally:
+        local_llm.configure_runtime(enabled=True, reason="test cleanup")
 
 
 # ── Bug 7 ─────────────────────────────────────────────────────────────────────
@@ -1964,3 +2262,26 @@ def test_bug7_reply_skips_empty_text():
     assert not mock_messaging.reply_message.called, (
         "LINE reply_message must NOT be called when text is empty/whitespace"
     )
+
+
+# ── LINE mention 範圍（UTF-16 offset、含空白的名字）─────────────────────────────
+
+
+def test_line_mention_ranges_use_utf16_offsets():
+    message = MagicMock()
+    message.text = "😀 @Emily Chen 幫我查乳香世家牛奶食安"
+    mentionee = MagicMock(index=3, length=len("@Emily Chen"))
+    message.mention.mentionees = [mentionee]
+
+    stripped = main._strip_mentions(message)
+
+    assert stripped == "😀  幫我查乳香世家牛奶食安"
+
+
+def test_line_mention_ranges_cover_spaced_names():
+    message = MagicMock()
+    message.text = "@Emily Chen 幫我查乳香世家牛奶食安"
+    mentionee = MagicMock(index=0, length=len("@Emily Chen"))
+    message.mention.mentionees = [mentionee]
+
+    assert main._strip_mentions(message) == " 幫我查乳香世家牛奶食安"

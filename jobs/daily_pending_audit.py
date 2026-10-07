@@ -69,6 +69,22 @@ class PendingReminderRow:
 
 
 @dataclass
+class DroppedReminderRow:
+    """A queued reminder extraction that ended without a reminder.
+
+    Ids, time and a fixed reason only: chat text never leaves the machine.
+    """
+
+    pending_id: int
+    dropped_at: int
+    reason: str
+
+
+DROPPED_WINDOW_SEC = 86400
+DROPPED_LIST_LIMIT = 10
+
+
+@dataclass
 class AuditReport:
     rows: list[AuditRow] = field(default_factory=list)
     pending_reminders: list[PendingReminderRow] = field(default_factory=list)
@@ -219,6 +235,69 @@ def load_pending_reminder_rows(
         )
         for r in rows
     ]
+
+
+def load_dropped_reminder_rows(
+    db_path: Path | str | None = None,
+    *,
+    now: int | float | None = None,
+    window_sec: int = DROPPED_WINDOW_SEC,
+) -> list[DroppedReminderRow]:
+    """Queued reminders dropped in the last 24 hours (closed silently in the group)."""
+    if db_path is None:
+        from config import settings
+
+        db_path = settings.sqlite_path
+    path = Path(db_path)
+    if not path.exists():
+        return []
+    since = int((time.time() if now is None else now) - window_sec)
+    try:
+        with sqlite3.connect(path) as conn:
+            rows = conn.execute(
+                "SELECT pending_id, dropped_at, drop_reason "
+                "FROM pending_reminder_extract "
+                "WHERE status='dropped' AND dropped_at >= ? "
+                "ORDER BY dropped_at, pending_id",
+                (since,),
+            ).fetchall()
+    except sqlite3.Error as e:
+        log.warning("load dropped reminder rows failed: %s", type(e).__name__)
+        return []
+    return [
+        DroppedReminderRow(
+            pending_id=int(r[0]),
+            dropped_at=int(r[1] or 0),
+            reason=str(r[2] or "unknown"),
+        )
+        for r in rows
+    ]
+
+
+def format_dropped_reminders(
+    rows: list[DroppedReminderRow],
+    *,
+    now: int | float | None = None,
+) -> str:
+    """Discord DM section for Andrew: counts, ids, Taipei time and reason only."""
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo("Asia/Taipei")
+    today = datetime.fromtimestamp(time.time() if now is None else now, tz)
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row.reason] = counts.get(row.reason, 0) + 1
+    summary = "、".join(f"{reason} {count}" for reason, count in sorted(counts.items()))
+    lines = [
+        f"🗑️ [{today:%Y-%m-%d}] 近 24 小時丟棄的待處理提醒 {len(rows)} 筆"
+        f"（{summary}）"
+    ]
+    for i, row in enumerate(rows[:DROPPED_LIST_LIMIT], 1):
+        when = datetime.fromtimestamp(row.dropped_at, tz).strftime("%m/%d %H:%M")
+        lines.append(f"  {i}. pid={row.pending_id} {when} {row.reason}")
+    if len(rows) > DROPPED_LIST_LIMIT:
+        lines.append(f"  …另 {len(rows) - DROPPED_LIST_LIMIT} 筆")
+    return "\n".join(lines)
 
 
 def build_report(
@@ -408,18 +487,43 @@ def main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
     dry_run = "--dry-run" in argv
 
+    # Dropped reminder extractions close silently in the group (2026-10-04),
+    # so Andrew sees them here whether or not the legacy pending replies run.
+    dropped = load_dropped_reminder_rows()
+    dropped_msg = format_dropped_reminders(dropped) if dropped else ""
+
     if not pending_reply_enabled():
-        msg = "daily-pending-audit disabled: pending reply mechanism is off"
-        print(msg)
+        if not dropped:
+            msg = "daily-pending-audit disabled: pending reply mechanism is off"
+            print(msg)
+            summary = {
+                "pending_reply_enabled": False,
+                "discord_sent": False,
+                "discord_skipped": True,
+            }
+            if dry_run:
+                summary["dry_run"] = True
+            _write_state(ok=True, status="disabled", summary=summary)
+            return 0
+        print(dropped_msg)
         summary = {
             "pending_reply_enabled": False,
-            "discord_sent": False,
-            "discord_skipped": True,
+            "dropped_reminder_count": len(dropped),
+            "msg_len": len(dropped_msg),
         }
         if dry_run:
             summary["dry_run"] = True
-        _write_state(ok=True, status="disabled", summary=summary)
-        return 0
+            _write_state(ok=True, status="dry_run", summary=summary)
+            return 0
+        sent = _send_discord(dropped_msg)
+        summary["discord_sent"] = sent
+        summary["discord_skipped"] = False
+        _write_state(
+            ok=sent,
+            status="dropped_reminders_reported" if sent else "discord_send_failed",
+            summary=summary,
+        )
+        return 0 if sent else 1
 
     data, status, file_size, present = _safe_load_pending()
     report = build_report(
@@ -430,6 +534,11 @@ def main(argv: list[str] | None = None) -> int:
         pending_reminders=load_pending_reminder_rows(),
     )
     msg = format_message(report)
+    if dropped_msg:
+        msg = f"{msg}\n\n{dropped_msg}"
+        if len(msg) > DISCORD_MSG_MAX:
+            suffix = "\n…(truncated)"
+            msg = msg[: DISCORD_MSG_MAX - len(suffix)] + suffix
     print(msg)
 
     summary = {
@@ -442,6 +551,7 @@ def main(argv: list[str] | None = None) -> int:
         "text_excluded_count": report.text_excluded_count,
         "msg_len": len(msg),
         "suppress_ok_dm": SUPPRESS_OK_DM,
+        "dropped_reminder_count": len(dropped),
     }
 
     if dry_run:
@@ -450,7 +560,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     should_push = True
-    if SUPPRESS_OK_DM and status == "ok" and report.total_unanswered_media == 0:
+    if (
+        SUPPRESS_OK_DM
+        and status == "ok"
+        and report.total_unanswered_media == 0
+        and not dropped
+    ):
         should_push = False
         log.info("SUPPRESS_OK_DM on + 0 leftover → skip Discord")
 

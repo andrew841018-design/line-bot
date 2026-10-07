@@ -1,7 +1,8 @@
 """Fail-closed privacy audit for Git revisions and pending pushes.
 
-Output intentionally contains only category counts: never matched values or
-paths, because CI and maintenance output can itself leave the machine.
+The command intentionally reports only category counts.  It never prints a
+matched value or file path because its own output may be copied into CI logs or
+operational notifications.
 """
 from __future__ import annotations
 
@@ -50,9 +51,22 @@ _PRIVATE_SCHEDULE_TOPIC_RE = re.compile(
 _SYNTHETIC_SCHEDULE_MARKER = "privacy-safe-fixture"
 _SAFE_PRIVATE_TERM_RE = re.compile(r"^(?:測試|範例|示例|假名|TEST|EXAMPLE)", re.IGNORECASE)
 _GENERIC_FAMILY_TERMS = {
-    "爸爸", "媽媽", "父親", "母親", "哥哥", "弟弟", "姊姊", "姐姐",
-    "妹妹", "爺爺", "奶奶", "阿公", "阿婆", "全家",
+    "爸爸",
+    "媽媽",
+    "父親",
+    "母親",
+    "哥哥",
+    "弟弟",
+    "姊姊",
+    "姐姐",
+    "妹妹",
+    "爺爺",
+    "奶奶",
+    "阿公",
+    "阿婆",
+    "全家",
 }
+
 _FORBIDDEN_EXACT = {
     "user_aliases.json",
     "family_roles.local.json",
@@ -72,24 +86,49 @@ _FORBIDDEN_DB_RE = re.compile(
     re.IGNORECASE,
 )
 _TEXT_SUFFIXES = {
-    "", ".cfg", ".conf", ".csv", ".env", ".html", ".ini", ".js",
-    ".json", ".jsonl", ".md", ".py", ".rst", ".sh", ".sql", ".toml",
-    ".key", ".pem", ".ts", ".txt", ".yaml", ".yml",
+    "",
+    ".cfg",
+    ".conf",
+    ".csv",
+    ".env",
+    ".html",
+    ".ini",
+    ".js",
+    ".key",
+    ".json",
+    ".jsonl",
+    ".md",
+    ".py",
+    ".rst",
+    ".pem",
+    ".sh",
+    ".sql",
+    ".toml",
+    ".ts",
+    ".txt",
+    ".yaml",
+    ".yml",
 }
 _MAX_TEXT_BYTES = 2 * 1024 * 1024
 
 
 @dataclass(frozen=True)
 class Finding:
+    """A privacy category tied to a path, never to the matched payload."""
+
     category: str
     path: str = ""
     revision: str = ""
 
 
-def _run_git(repo: Path, args: Sequence[str]) -> bytes:
+def _run_git(repo: Path, args: Sequence[str], *, input_text: str | None = None) -> bytes:
     completed = subprocess.run(
-        ["git", *args], cwd=repo, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, check=False,
+        ["git", *args],
+        cwd=repo,
+        input=None if input_text is None else input_text.encode(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
     )
     if completed.returncode != 0:
         raise RuntimeError("git privacy audit could not inspect repository state")
@@ -106,11 +145,9 @@ def _is_forbidden_path(path: str) -> bool:
 
 
 def _looks_textual(path: str, data: bytes) -> bool:
-    return (
-        len(data) <= _MAX_TEXT_BYTES
-        and b"\0" not in data[:8192]
-        and PurePosixPath(path).suffix.lower() in _TEXT_SUFFIXES
-    )
+    if len(data) > _MAX_TEXT_BYTES or b"\0" in data[:8192]:
+        return False
+    return PurePosixPath(path).suffix.lower() in _TEXT_SUFFIXES
 
 
 def _normalize_private_terms(private_terms: Iterable[str]) -> tuple[str, ...]:
@@ -118,11 +155,12 @@ def _normalize_private_terms(private_terms: Iterable[str]) -> tuple[str, ...]:
     for value in private_terms:
         term = str(value).strip()
         if (
-            len(term) >= 2
-            and term not in _GENERIC_FAMILY_TERMS
-            and not _SAFE_PRIVATE_TERM_RE.match(term)
+            len(term) < 2
+            or term in _GENERIC_FAMILY_TERMS
+            or _SAFE_PRIVATE_TERM_RE.match(term)
         ):
-            clean.add(term)
+            continue
+        clean.add(term)
     return tuple(sorted(clean, key=lambda item: (-len(item), item)))
 
 
@@ -133,6 +171,8 @@ def scan_blob(
     private_terms: Iterable[str] = (),
     revision: str = "",
 ) -> list[Finding]:
+    """Scan one blob without retaining or returning the matched value."""
+
     categories: set[str] = set()
     if _is_forbidden_path(path):
         categories.add("forbidden_path")
@@ -184,6 +224,8 @@ def _collect_json_strings(value: object) -> Iterable[str]:
 
 
 def load_private_terms(repo: Path) -> tuple[str, ...]:
+    """Load local-only private terms without ever reporting their values."""
+
     terms: list[str] = []
     for name in (
         "user_aliases.json",
@@ -193,50 +235,42 @@ def load_private_terms(repo: Path) -> tuple[str, ...]:
         path = repo / name
         if path.is_file() and not path.is_symlink():
             try:
-                terms.extend(_collect_json_strings(json.loads(path.read_text(encoding="utf-8"))))
+                terms.extend(
+                    _collect_json_strings(json.loads(path.read_text(encoding="utf-8")))
+                )
             except (OSError, UnicodeError, json.JSONDecodeError):
                 raise RuntimeError("local private-term source could not be read safely") from None
-    path = repo / "privacy_terms.local.txt"
-    if path.is_file() and not path.is_symlink():
+    text_terms = repo / "privacy_terms.local.txt"
+    if text_terms.is_file() and not text_terms.is_symlink():
         try:
-            terms.extend(path.read_text(encoding="utf-8").splitlines())
+            terms.extend(text_terms.read_text(encoding="utf-8").splitlines())
         except (OSError, UnicodeError):
+            raise RuntimeError("local private-term source could not be read safely") from None
+    json_terms = repo / "privacy_terms.local.json"
+    if json_terms.is_file() and not json_terms.is_symlink():
+        try:
+            terms.extend(_collect_json_strings(json.loads(json_terms.read_text(encoding="utf-8"))))
+        except (OSError, UnicodeError, json.JSONDecodeError):
             raise RuntimeError("local private-term source could not be read safely") from None
     return _normalize_private_terms(terms)
 
 
-def _scan_paths(
-    repo: Path,
-    paths: Iterable[str],
-    blob_loader,
-    *,
-    revision: str,
-) -> list[Finding]:
+def _scan_tree(repo: Path, treeish: str, *, revision: str) -> list[Finding]:
     private_terms = load_private_terms(repo)
+    raw_names = _run_git(repo, ["ls-tree", "-r", "-z", "--name-only", treeish])
     findings: list[Finding] = []
-    for path in paths:
-        try:
-            blob = blob_loader(path)
-        except (OSError, RuntimeError):
-            findings.append(Finding("unreadable_file", path, revision))
+    for raw_path in raw_names.split(b"\0"):
+        if not raw_path:
             continue
+        path = raw_path.decode("utf-8", errors="surrogateescape")
+        blob = _run_git(repo, ["show", f"{treeish}:{path}"])
         findings.extend(scan_blob(path, blob, private_terms=private_terms, revision=revision))
     return findings
 
 
-def _tree_paths(repo: Path, treeish: str) -> list[str]:
-    raw = _run_git(repo, ["ls-tree", "-r", "-z", "--name-only", treeish])
-    return [item.decode("utf-8", errors="surrogateescape") for item in raw.split(b"\0") if item]
-
-
 def scan_revision(repo: Path | str, revision: str) -> list[Finding]:
-    root = Path(repo).resolve()
-    return _scan_paths(
-        root,
-        _tree_paths(root, revision),
-        lambda path: _run_git(root, ["show", f"{revision}:{path}"]),
-        revision=revision,
-    )
+    repo_path = Path(repo).resolve()
+    return _scan_tree(repo_path, revision, revision=revision)
 
 
 def scan_remote_main(repo: Path | str) -> list[Finding]:
@@ -246,9 +280,9 @@ def scan_remote_main(repo: Path | str) -> list[Finding]:
     must not be reported as proof that the remote branch is clean.
     """
 
-    root = Path(repo).resolve()
+    repo_path = Path(repo).resolve()
     _run_git(
-        root,
+        repo_path,
         [
             "fetch",
             "--quiet",
@@ -257,32 +291,65 @@ def scan_remote_main(repo: Path | str) -> list[Finding]:
             "+refs/heads/main:refs/remotes/origin/main",
         ],
     )
-    return scan_revision(root, "refs/remotes/origin/main")
+    return scan_revision(repo_path, "refs/remotes/origin/main")
 
 
 def scan_index(repo: Path | str) -> list[Finding]:
-    root = Path(repo).resolve()
-    raw = _run_git(
-        root,
+    repo_path = Path(repo).resolve()
+    private_terms = load_private_terms(repo_path)
+    raw_names = _run_git(
+        repo_path,
         ["diff", "--cached", "--name-only", "-z", "--diff-filter=ACMR"],
     )
-    paths = [item.decode("utf-8", errors="surrogateescape") for item in raw.split(b"\0") if item]
-    return _scan_paths(root, paths, lambda path: _run_git(root, ["show", f":{path}"]), revision="index")
+    findings: list[Finding] = []
+    for raw_path in raw_names.split(b"\0"):
+        if not raw_path:
+            continue
+        path = raw_path.decode("utf-8", errors="surrogateescape")
+        try:
+            blob = _run_git(repo_path, ["show", f":{path}"])
+        except RuntimeError:
+            findings.append(Finding("unreadable_index", path, "index"))
+            continue
+        findings.extend(scan_blob(path, blob, private_terms=private_terms, revision="index"))
+    return findings
 
 
 def scan_worktree(repo: Path | str) -> list[Finding]:
-    root = Path(repo).resolve()
-    raw = _run_git(root, ["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
-    paths = [item.decode("utf-8", errors="surrogateescape") for item in raw.split(b"\0") if item]
-    return _scan_paths(root, paths, lambda path: (root / path).read_bytes(), revision="worktree")
+    repo_path = Path(repo).resolve()
+    private_terms = load_private_terms(repo_path)
+    raw_names = _run_git(
+        repo_path,
+        ["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+    )
+    findings: list[Finding] = []
+    for raw_path in raw_names.split(b"\0"):
+        if not raw_path:
+            continue
+        path = raw_path.decode("utf-8", errors="surrogateescape")
+        full_path = repo_path / path
+        if not full_path.is_file() or full_path.is_symlink():
+            continue
+        try:
+            blob = full_path.read_bytes()
+        except OSError:
+            findings.append(Finding("unreadable_file", path, "worktree"))
+            continue
+        findings.extend(scan_blob(path, blob, private_terms=private_terms, revision="worktree"))
+    return findings
 
 
 def _dedupe(findings: Iterable[Finding]) -> list[Finding]:
-    return sorted(set(findings), key=lambda finding: (finding.category, finding.revision, finding.path))
+    return sorted(
+        set(findings),
+        key=lambda finding: (finding.category, finding.revision, finding.path),
+    )
 
 
 def scan_push_updates(repo: Path | str, update_lines: Iterable[str]) -> list[Finding]:
-    root = Path(repo).resolve()
+    """Scan every commit introduced by pre-push ref update lines."""
+
+    repo_path = Path(repo).resolve()
     findings: list[Finding] = []
     for line in update_lines:
         fields = line.strip().split()
@@ -296,9 +363,9 @@ def scan_push_updates(repo: Path | str, update_lines: Iterable[str]) -> list[Fin
         rev_args = ["rev-list", local_oid, "--not", "--remotes"]
         if not _ZERO_OID_RE.fullmatch(remote_oid):
             rev_args = ["rev-list", f"{remote_oid}..{local_oid}"]
-        revisions = _run_git(root, rev_args).decode("ascii", errors="strict").splitlines()
+        revisions = _run_git(repo_path, rev_args).decode("ascii", errors="strict").splitlines()
         for revision in revisions:
-            findings.extend(scan_revision(root, revision))
+            findings.extend(_scan_tree(repo_path, revision, revision=revision))
     return _dedupe(findings)
 
 
@@ -310,7 +377,7 @@ def format_summary(findings: Iterable[Finding]) -> str:
     return f"privacy_audit=failed findings={sum(counts.values())} categories={categories}"
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Audit Git content for private LINE bot data")
     parser.add_argument("--repo", default=".")
     parser.add_argument(
@@ -319,21 +386,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         choices=("head", "index", "worktree", "remote", "push"),
         required=True,
     )
-    args = parser.parse_args(argv)
-    root = Path(args.repo).resolve()
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    repo = Path(args.repo).resolve()
     findings: list[Finding] = []
     try:
         for scope in dict.fromkeys(args.scope):
             if scope == "head":
-                findings.extend(scan_revision(root, "HEAD"))
+                findings.extend(scan_revision(repo, "HEAD"))
             elif scope == "index":
-                findings.extend(scan_index(root))
+                findings.extend(scan_index(repo))
             elif scope == "worktree":
-                findings.extend(scan_worktree(root))
+                findings.extend(scan_worktree(repo))
             elif scope == "remote":
-                findings.extend(scan_remote_main(root))
+                findings.extend(scan_remote_main(repo))
             else:
-                findings.extend(scan_push_updates(root, sys.stdin.read().splitlines()))
+                findings.extend(scan_push_updates(repo, sys.stdin.read().splitlines()))
     except (OSError, RuntimeError, UnicodeError, ValueError):
         findings.append(Finding("audit_error"))
     findings = _dedupe(findings)

@@ -31,6 +31,7 @@ from pathlib import Path
 import numpy as np
 
 from config import settings
+from sqlite_security import connect_private_sqlite
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +73,7 @@ def _db_path(db_path: Path | str | None = None) -> Path:
 
 
 def _conn(db_path: Path | str | None = None) -> sqlite3.Connection:
-    conn = sqlite3.connect(
+    conn = connect_private_sqlite(
         _db_path(db_path),
         isolation_level=None,
         check_same_thread=False,

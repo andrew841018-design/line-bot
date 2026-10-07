@@ -28,6 +28,7 @@ load_dotenv(Path(__file__).parent / ".env")
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config import settings  # noqa: E402
+from sqlite_security import connect_private_sqlite
 from line_push_client import try_push_text  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -72,7 +73,7 @@ class _ClosingConnection(sqlite3.Connection):
 
 
 def _conn() -> sqlite3.Connection:
-    c = sqlite3.connect(
+    c = connect_private_sqlite(
         _DB_PATH,
         isolation_level=None,
         check_same_thread=False,

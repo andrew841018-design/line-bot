@@ -73,14 +73,16 @@ def test_semiconductor_cycle_monitor_covers_cycle_exit_signals():
     assert "20 日線" not in msg
 
 
-def test_main_includes_semiconductor_cycle_monitor(monkeypatch):
+def test_main_excludes_retired_market_sections(monkeypatch):
     sent: list[str] = []
-    original_monitor = dbd.semiconductor_cycle_monitor
+
+    def retired_market_section():
+        raise AssertionError("retired market section should not run")
 
     fake_pkg = types.ModuleType("integration")
     fake_pkg.__path__ = []
     fake_module = types.ModuleType("integration.briefing_section")
-    fake_module.soxx_briefing_section = lambda: ""
+    fake_module.soxx_briefing_section = retired_market_section
     fake_pkg.briefing_section = fake_module
     monkeypatch.setitem(sys.modules, "integration", fake_pkg)
     monkeypatch.setitem(sys.modules, "integration.briefing_section", fake_module)
@@ -94,25 +96,29 @@ def test_main_includes_semiconductor_cycle_monitor(monkeypatch):
     monkeypatch.setattr(dbd, "line_bot_status", lambda: "")
     monkeypatch.setattr(dbd, "git_status", lambda: "")
     monkeypatch.setattr(dbd, "system_status", lambda: "")
-    monkeypatch.setattr(dbd, "line_bot_suggestions", lambda: "")
+    monkeypatch.setattr(
+        dbd,
+        "line_bot_suggestions",
+        lambda: (_ for _ in ()).throw(AssertionError("proposal generator ran")),
+    )
     monkeypatch.setattr(dbd, "_try_append_today_quote", lambda: None)
     monkeypatch.setattr(
         dbd,
         "semiconductor_cycle_monitor",
-        lambda: original_monitor(metrics=_cycle_metrics_fixture()),
+        retired_market_section,
     )
     monkeypatch.setattr(
         dbd,
         "sox_sentiment",
         lambda: (_ for _ in ()).throw(AssertionError("sox_sentiment should not run")),
     )
-    monkeypatch.setattr(dbd, "jim_cramer_daily", lambda: "")
+    monkeypatch.setattr(dbd, "jim_cramer_daily", retired_market_section)
 
     dbd.main()
 
     assert sent
     text = "\n".join(sent)
-    assert "半導體週期監控" in text
-    assert "TSMC 月營收 YoY" in text
-    assert "2026-04 營收 NT$410.7B" in text
+    assert "每日待辦" in text
+    assert "半導體週期監控" not in text
+    assert "TSMC 月營收 YoY" not in text
     assert "費城半導體指數 (^SOX)" not in text

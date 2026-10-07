@@ -37,6 +37,13 @@ def test_default_deploy_plan_is_muted_and_small():
     assert "GEMINI_API_KEY" not in joined
 
 
+def test_default_deploy_plan_uses_private_sqlite_parent():
+    sqlite_path = Path(crp.DEFAULT_ENV_VARS["SQLITE_PATH"])
+
+    assert sqlite_path == Path("/tmp/line_bot-private/line_bot.db")
+    assert sqlite_path.parent != Path("/tmp")
+
+
 def test_scheduler_command_contains_token_header_without_master_secret():
     cmd = crp.scheduler_command(
         service_url="https://line-bot.example.run.app/",

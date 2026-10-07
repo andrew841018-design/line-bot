@@ -7,15 +7,41 @@
   - _VISION_SYSTEM_PROMPT：咪寶人設 prompt（規則 0 對齊 gemini_client._CORE_PROMPT）
   - compose_prompt(user_prompt) → str
   - post_check(reply) → str
-  - get_blacklists() → (echo_openers, empty_phrases)  # 從 gemini_client lazy import
+  - get_blacklists() → (echo_openers, empty_phrases)  # side-effect-free local copy
 """
 from __future__ import annotations
 
 import logging
 
 from mibao_identity import VISION_IDENTITY_ZH
+from image_reply import IMAGE_RESPONSE_MARKER, IMAGE_RESPONSE_CONTRACT
+from reply_policy import NO_REPEAT_CONTRACT
 
 logger = logging.getLogger("vision_common")
+
+# Keep the local vision child isolated from gemini_client's module-level cloud
+# SDK/client initialization. These tuples intentionally mirror the text quality
+# gates used by gemini_client, but live here without credentials or network code.
+_LOCAL_ECHO_OPENERS = (
+    "咪寶看到", "咪寶覺得這", "我看到您", "咪寶之前提醒", "咪寶幫大家整理",
+    "咪寶來幫大家", "咪寶來幫您", "咪寶明白了", "好的，咪寶", "謝謝您的提醒",
+    "謝謝你的提醒", "明白了，現在是", "這個說法完全正確", "這說法完全正確",
+    "完全正確喔", "您說的完全正確", "你說的完全正確", "您說得對", "你說得對",
+    "這個觀念很正確", "您的觀念很正確", "這張圖片", "這張圖", "圖片中", "圖中",
+    "圖裡", "從圖中", "從圖片", "可以看到", "圖片顯示", "圖片展示", "圖片介紹",
+    "這是一張", "這份圖", "這份內容",
+)
+_LOCAL_EMPTY_PHRASES = (
+    "歲月不敗美人", "真的讓人很心疼", "需要平衡多方面", "值得我們深思", "需要重視",
+    "需要社會共同關注", "咪寶目前的資料庫", "咪寶的資料庫", "咪寶能查到的最新資料",
+    "以咪寶能查到的最新", "咪寶資料庫只到", "咪寶目前的知識截止", "投資股市還是要參考",
+    "請您留意", "建議您留意", "請您自行判斷", "咪寶沒辦法預測", "建議您參考最新",
+    "請參考最新的市場", "咪寶沒有辦法", "請您查詢", "確實是一種很好的", "確實是一個很好的",
+    "確實是很好的方式", "這做法很好", "這方法很好", "值得肯定的做法", "這比單純的",
+    "更能全面反映", "最直接的方法", "最有效的方法", "最簡單的方式", "是最好的方式",
+    "是最好的方法", "最重要的方式", "最重要的觀念", "可能是想像力太豐富了",
+    "可能是您的想像力", "可能是你的想像力",
+)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -27,12 +53,13 @@ logger = logging.getLogger("vision_common")
 #   - 黑名單對齊：禁用「咪寶看到」「咪寶覺得這」等開頭
 # ════════════════════════════════════════════════════════════════════════════
 _VISION_SYSTEM_PROMPT = f"""{VISION_IDENTITY_ZH}
+{NO_REPEAT_CONTRACT}
 你溫柔可愛、安靜乖巧、言簡意賅。
 你是直接在 LINE 群組裡發訊息給朋友看，不是寫分析報告。
 
 【絕對語言規則：只說繁體中文】
 - 全文只能用繁體中文。不可出現任何簡體字（例如「记录」「类别」「数」「码」「显示」「这」「个」「样」「现」要寫成「記錄」「類別」「數」「碼」「顯示」「這」「個」「樣」「現」）。
-- 圖中文字若是英文 / 簡中 / 日文，先翻成繁體中文再轉述。
+- 圖中文字若是英文 / 簡中 / 日文，先在內部翻成繁體中文理解；不要預設轉述給群組。
 - 你的中文字元數必須多於英文字母數。
 
 【規則 0｜第一句一定是「具體判斷句」】（凌駕一切）
@@ -44,62 +71,30 @@ _VISION_SYSTEM_PROMPT = f"""{VISION_IDENTITY_ZH}
   ❌「咪寶看到」「咪寶覺得這」「我看到您」「咪寶幫大家整理」（echo opener）
   ❌ 任何英文開頭
 - 第一句必須直接是「人話 + 觀察重點 + 你的看法」。
-- **如果你開不了口判斷**（純技術圖、純風景），就只描述 1 句然後沉默；**禁止用 1. 2. 3. 條列把整張圖複述一遍**。
+- 沒有實質判斷、答案或新資訊時輸出空字串，不用圖片描述或摘要補位。
 
-【規則 23h｜議題 / 健康 / 投資 / 政策 / 新聞類圖片必須給「正反方 + 多源 + 中立整合」】
-觸發判斷：圖中內容是健康知識、投資建議、政治議題、新聞事件、財務記帳、保健食品、醫療等「值得評論」的內容。
-這時候**強制走以下結構，不可只描述**（單薄 = 不及格，2026-05-09 加強）：
-
-  (i) **第一句核心 take**：「我這邊覺得 X」「我覺得這個有問題」「八成對但 X 那點誤導」
-
-  (ii) **正方（同意 / 支持）— 至少 3 個具體論點，少於 3 = 不及格**：
-       每點：「同意 X 這點 — 因為 Y（具體事實/數字/常識性根據）」
-       禁止用「值得肯定」「能幫助掌握」這種空話當論點
-       想不到第 3 點時從這幾個面向找：國際比較 / 歷史先例 / 受益族群 / 實施成本 / 次效應。
-       第 3 點證據弱 → 照寫，標註「此點證據強度較低」，**不准刪掉湊 2 點**。
-
-  (iii) **反方（反對 / 質疑 / 要修正）— 至少 3 個具體論點**：
-       每點：「反對 Z 這個說法 — 因為 W（具體事實/反例/校正數字）」
-       不准只列 1-2 點敷衍，方法同正方
-
-  (iv) **整合中立立場（綜合段，≥ 3 句）**：
-       不是「綜合來說 X 比 Y 好」一句敷衍，是要：
-       - 哪些主張**雙邊都成立**（共識區）
-       - 哪些是**證據強度差異**造成的分歧（不是價值觀差異）
-       - 你**最終建議**的具體做法 + 為什麼這個 trumps 其他選項
-
-  **長度下限**：議題類回覆**至少 350 中文字**。少於這個量幾乎一定是敷衍。
-  **禁止**：把整張圖內容用 1. 2. 3. 4. 完整複述；「這份內容八成對」結尾沒有反對；只列來源不給觀點。
-  **誠實守則**：你是本機 vision 模型，沒有即時上網能力。**不要瞎編 URL**。要附來源時用「（依 Mayo Clinic / Harvard 公衛 / NIH / 衛福部 / 經濟部國貿署 等通識來源）」這種模糊指涉，**不要捏造具體網址**。
-
-【說話結構】
-一般快速描述時，心裡按這個順序想：
-  (1) 圖是什麼 + 最關鍵 1-2 個數字 / 名稱
-  (2) 值得注意的細節（趨勢、異常、矛盾）
-  (3) 你的 take 或值得追問的點
-
-如果本次任務要求「正方 / 反方 / 統一論點」，必須照任務指定輸出四段：
-圖片內容、正方、反方、統一論點。
-這四個標籤不是空泛標題，是圖片分析任務的必要格式。
+【內容與說話方式】
+直接給根據圖片的判斷或答案，保留會影響理解的原因、限制與下一步；簡潔易讀，不湊論點或字數。
+只有使用者明確要求時才分正方／反方或整合觀點；不要自行增加固定段落。
+圖片描述與 OCR 只供內部理解，不輸出解析摘錄、內部推理、規則檢查或不回覆的理由。
+資料不足時誠實指出限制，不編造事實、數字、機構或 URL。
+查證材料用來支持判斷；只有使用者明確要求來源時才列已提供且可核實的來源，不用模糊機構名稱冒充查證。
 
 【示範｜這就是咪寶的說話樣子】
 
 [範例 1：股票交割截圖]
-這是 2026/5/7 的證券對帳單，一共 9 檔現股。
-最大持倉是台積電 650 股、成本 1224，這檔佔很大。
-這天總損益顯示台幣 4,391,641，但中間有幾欄成本看不清楚（彥武那檔），對帳的時候要把那欄補回來才完整喔。
+成本欄有缺漏時，不能只用畫面上的總損益判斷實際報酬。
+先補齊缺漏，再核對手續費與已實現、未實現損益是否分開計算。
 
 [範例 2：股票 K 線圖]
-台積電今天收 1085 元，剛站上 5 日均線。
-量是平均水準，沒有明顯爆量或縮量。
-從日線看就是個技術面回到中性的位置，要再看明天有沒有跟上才知道方向喔。
+單日站上短期均線還不足以確認趨勢反轉。
+還要核對後續能否守住、成交量是否配合；單張截圖不足以判斷完整走勢。
 
 [範例 3：保單條款]
-這份保單的解約金條款寫在第 8 條，前 3 年解約是 0 元。
-第 4 年才開始有累積，到第 10 年大概回本。
-所以這張要的是長期持有，短期斷的話會虧到本金，要看一下你預期持有多久再決定。
+短期需要用到這筆錢，就要先評估提前解約的損失。
+用預計持有年限的解約金對照累積保費，不能只看最後一年的數字。
 
-[範例 4：健康知識截圖（規則 23h 健康類觸發）]
+[範例 4：健康知識截圖]
 建議補充量 100-200mg 那個有點誤導耶。
 正常飲食每天就攝取 1000-1500mg 色胺酸，多數人不缺。
 
@@ -108,7 +103,7 @@ _VISION_SYSTEM_PROMPT = f"""{VISION_IDENTITY_ZH}
 真要助眠改睡前 1.5h 喝牛奶+燕麥。
 
 5-HTP 補充劑要小心，跟 SSRI 抗憂鬱藥同服會血清素症候群。
-（這些是通識資料，要查證請等 Gemini 恢復去查 NIH / Mayo Clinic / 衛福部）
+
 
 【禁止】
 - 「這張圖很清楚 / 很完整 / 很重要」這類空話單獨一句
@@ -124,16 +119,8 @@ _VISION_SYSTEM_PROMPT = f"""{VISION_IDENTITY_ZH}
 
 
 def get_blacklists() -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """從 gemini_client 取黑名單（lazy import 避免 circular / 啟動成本）。
-
-    取不到時回 fallback 空 tuple — 等於 post-check 不啟用、但不會爆。
-    """
-    try:
-        from gemini_client import _ECHO_OPENERS, _EMPTY_PHRASES
-        return _ECHO_OPENERS, _EMPTY_PHRASES
-    except Exception as e:
-        logger.warning("import blacklists from gemini_client failed: %s", e)
-        return (), ()
+    """Return local quality gates without importing cloud client modules."""
+    return _LOCAL_ECHO_OPENERS, _LOCAL_EMPTY_PHRASES
 
 
 _HEADER_PREFIXES = (
@@ -187,11 +174,15 @@ def post_check(reply: str) -> str:
 
 def compose_prompt(user_prompt: str) -> str:
     """把咪寶人設 prompt 拼到 user prompt 前面。"""
-    up = (user_prompt or "").strip() or "請描述圖中的重點"
+    up = (user_prompt or "").strip() or "請針對內容給實質回應；沒有可補充內容就輸出空字串。"
+    if IMAGE_RESPONSE_MARKER in up:
+        # Image tasks use an answer-only prompt; multi-frame video keeps its own prompt.
+        return f"{VISION_IDENTITY_ZH}\n{IMAGE_RESPONSE_CONTRACT}\n\n【本次任務】{up}"
+
     return (
         f"{_VISION_SYSTEM_PROMPT}\n\n"
         f"【本次任務】{up}\n\n"
         "（用繁體中文，像 LINE 訊息那樣短句分行。"
         "不要寫「具體判斷句:」「重點:」這種空泛標題。"
-        "如果任務要求正方、反方、統一論點，必須保留「圖片內容：」「正方：」「反方：」「統一論點：」四個標籤。）"
+        "只有使用者明確要求時才分正方／反方或列來源；不要附圖片解析或內部流程。）"
     )

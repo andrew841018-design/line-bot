@@ -309,17 +309,15 @@ def test_quote_missed_does_not_duplicate_already_drained_pending(monkeypatch):
 def test_quote_missed_repairs_dropped_pending_row(monkeypatch):
     pending_id = _seed_original()
     assert pending_id is not None
-    with memory._conn() as conn:
-        conn.execute(
-            "UPDATE pending_reminder_extract SET status='dropped' WHERE pending_id=?",
-            (pending_id,),
-        )
+    claim_token = memory.claim_pending_reminder(pending_id)
+    assert claim_token
+    assert memory.drop_pending_reminder(pending_id, claim_token, GROUP_ID, "model_null")
     _patch_sender_alias(monkeypatch)
-    replies: list[str] = []
+    replies: list[tuple[str, dict]] = []
     monkeypatch.setattr(
         main,
         "_reply",
-        lambda _token, text, **_kwargs: replies.append(text),
+        lambda _token, text, **kwargs: replies.append((text, kwargs)),
     )
 
     main._handle_text_message(_event(), GROUP_ID)
@@ -328,8 +326,16 @@ def test_quote_missed_repairs_dropped_pending_row(monkeypatch):
         GROUP_ID,
         ORIGINAL_ID,
     )
+    with memory._conn() as conn:
+        receipt = conn.execute(
+            "SELECT text, status FROM reminder_confirmation_outbox "
+            "WHERE group_id=? AND source_ref=?",
+            (GROUP_ID, f"pending_reminder:{pending_id}"),
+        ).fetchone()
     assert pending is not None and pending["status"] == "done"
-    assert replies[0].startswith("已補上提醒")
+    assert replies[0][0].startswith("已補上提醒")
+    assert replies[0][1]["include_auxiliary"] is False
+    assert receipt is None  # drops are silent since 2026-10-04
 
 
 def test_quote_missed_reuses_unique_legacy_event_with_presentation_differences(
@@ -408,7 +414,14 @@ def test_quote_missed_does_not_resurrect_cancelled_source(monkeypatch):
         GROUP_ID,
         ORIGINAL_ID,
     )
+    with memory._conn() as conn:
+        receipt_count = conn.execute(
+            "SELECT COUNT(*) FROM reminder_confirmation_outbox "
+            "WHERE group_id=? AND source_ref=?",
+            (GROUP_ID, f"pending_reminder:{pending_id}"),
+        ).fetchone()[0]
     assert pending is not None and pending["status"] == "dropped"
+    assert receipt_count == 0
     assert replies == [
         "這則提醒已取消，先不重新建立；若要恢復，請明確說「恢復這則提醒」。"
     ]
@@ -851,3 +864,64 @@ def test_drain_recovers_source_bound_event_without_llm_and_retries_mirror(
     )
     assert len(mirrors) == 1
     assert mirrors[0]["status"] == "pending"
+
+
+def test_stale_drain_finishes_active_source_without_failure_receipt():
+    pending_id = _seed_original()
+    assert pending_id is not None
+    event_id = calendar_db.insert_event(
+        group_id=GROUP_ID,
+        title="媽媽看胸腔外科",
+        event_date="2026-08-18",
+        event_time="09:00",
+        participants=["媽媽"],
+        source_msg_id=ORIGINAL_ID,
+        event_type="medical",
+    )
+    assert event_id
+
+    main._drain_pending_reminders(GROUP_ID)
+
+    pending = memory.get_pending_reminder_extract_by_message(
+        GROUP_ID,
+        ORIGINAL_ID,
+    )
+    with memory._conn() as conn:
+        receipt_count = conn.execute(
+            "SELECT COUNT(*) FROM reminder_confirmation_outbox "
+            "WHERE group_id=? AND source_ref=?",
+            (GROUP_ID, f"pending_reminder:{pending_id}"),
+        ).fetchone()[0]
+    assert pending is not None and pending["status"] == "done"
+    assert receipt_count == 0
+
+
+def test_stale_drain_classifies_cancelled_source_without_failure_receipt():
+    pending_id = _seed_original()
+    assert pending_id is not None
+    event_id = calendar_db.insert_event(
+        group_id=GROUP_ID,
+        title="媽媽看胸腔外科",
+        event_date="2026-08-18",
+        event_time="09:00",
+        participants=["媽媽"],
+        source_msg_id=ORIGINAL_ID,
+        event_type="medical",
+    )
+    assert event_id
+    assert calendar_db.cancel_event(event_id)
+
+    main._drain_pending_reminders(GROUP_ID)
+
+    pending = memory.get_pending_reminder_extract_by_message(
+        GROUP_ID,
+        ORIGINAL_ID,
+    )
+    with memory._conn() as conn:
+        receipt_count = conn.execute(
+            "SELECT COUNT(*) FROM reminder_confirmation_outbox "
+            "WHERE group_id=? AND source_ref=?",
+            (GROUP_ID, f"pending_reminder:{pending_id}"),
+        ).fetchone()[0]
+    assert pending is not None and pending["status"] == "dropped"
+    assert receipt_count == 0

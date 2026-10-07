@@ -27,10 +27,9 @@ from pathlib import Path
 
 import reminder_intent
 from config import settings
+from sqlite_security import connect_private_sqlite
 
 _DB_PATH = Path(settings.sqlite_path)
-if _DB_PATH.parent and str(_DB_PATH.parent) not in ("", "."):
-    _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 # sqlite3 在多 thread 寫入時需要 serialize，用一個全域 lock 最單純
 _lock = threading.Lock()
@@ -49,18 +48,23 @@ class _ClosingConnection(sqlite3.Connection):
 def _conn() -> sqlite3.Connection:
     # check_same_thread=False：uvicorn 會從不同 worker thread 呼進來
     # isolation_level=None：autocommit，我們用 context manager 的 lock 控制一致性
-    conn = sqlite3.connect(
+    conn = connect_private_sqlite(
         _DB_PATH,
         isolation_level=None,
         check_same_thread=False,
         factory=_ClosingConnection,
     )
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    # I3 fix (2026-05-30): 跨 process 寫同一 db（uvicorn handler thread + 獨立 cron
-    # process 如 reminder_push.py）時，沒 busy_timeout 會立刻 raise "database is locked"。
-    # 設 5s 讓 writer 等鎖釋放而非直接炸。
-    conn.execute("PRAGMA busy_timeout=5000")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        # I3 fix (2026-05-30): 跨 process 寫同一 db（uvicorn handler thread + 獨立 cron
+        # process 如 reminder_push.py）時，沒 busy_timeout 會立刻 raise "database is locked"。
+        # 設 5s 讓 writer 等鎖釋放而非直接炸。
+        conn.execute("PRAGMA busy_timeout=5000")
+    except BaseException:
+        # The caller never gets the connection, so its closing __exit__ never runs.
+        conn.close()
+        raise
     return conn
 
 
@@ -97,6 +101,24 @@ def _ensure_pending_source_unique_index(c: sqlite3.Connection) -> bool:
         raise
 
 
+def _add_column(c: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    """Add one column; another process may be doing the same."""
+    for attempt in range(8):
+        try:
+            c.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "database is locked" in message and attempt < 7:
+                _time.sleep(0.05 * (attempt + 1))
+                continue
+            if "duplicate column" not in message:
+                raise
+        break
+    columns = {r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in columns:
+        raise RuntimeError(f"{table}.{column} migration failed")
+
+
 def _init_db() -> None:
     with _lock, _conn() as c:
         c.executescript(
@@ -127,6 +149,12 @@ def _init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_raw_messages_time
                 ON raw_messages(group_id, created_at);
+            CREATE TABLE IF NOT EXISTS raw_message_quotes (
+                group_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                quoted_message_id TEXT NOT NULL,
+                PRIMARY KEY (group_id, message_id)
+            );
             CREATE TABLE IF NOT EXISTS sent_reminder_refs (
                 group_id    TEXT NOT NULL,
                 message_id  TEXT NOT NULL,
@@ -136,6 +164,19 @@ def _init_db() -> None:
                 created_at  INTEGER NOT NULL,
                 PRIMARY KEY (group_id, message_id)
             );
+            CREATE TABLE IF NOT EXISTS reminder_reschedule_log (
+                group_id        TEXT NOT NULL,
+                message_id      TEXT NOT NULL,
+                reminder_id     INTEGER NOT NULL,
+                old_remind_at   INTEGER NOT NULL,
+                new_remind_at   INTEGER NOT NULL,
+                old_action_hash TEXT NOT NULL,
+                new_action_hash TEXT NOT NULL,
+                created_at      INTEGER NOT NULL,
+                PRIMARY KEY (group_id, message_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_reminder_reschedule_log_created
+                ON reminder_reschedule_log(created_at);
             CREATE TABLE IF NOT EXISTS inbound_events (
                 group_id    TEXT NOT NULL,
                 message_id  TEXT NOT NULL,
@@ -373,6 +414,13 @@ def _init_db() -> None:
                 "ALTER TABLE pending_reminder_extract "
                 "ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''"
             )
+        # 2026-10-04: dropped rows close silently; the daily audit reads these.
+        for col, ddl in (
+            ("dropped_at", "dropped_at INTEGER NOT NULL DEFAULT 0"),
+            ("drop_reason", "drop_reason TEXT NOT NULL DEFAULT ''"),
+        ):
+            if col not in cols:
+                _add_column(c, "pending_reminder_extract", col, ddl)
         c.execute(
             "CREATE INDEX IF NOT EXISTS idx_pending_reminder_claimed "
             "ON pending_reminder_extract(status, claimed_at)"
@@ -407,6 +455,12 @@ def _init_db() -> None:
                     "ALTER TABLE kg_triples ADD COLUMN created_at "
                     "INTEGER NOT NULL DEFAULT 0"
                 )
+        # 2026-10-04: rows stored before this column existed replay as ungrounded.
+        fc_cols = {r[1] for r in c.execute("PRAGMA table_info(fact_check_cache)").fetchall()}
+        if "grounded" not in fc_cols:
+            _add_column(
+                c, "fact_check_cache", "grounded", "grounded INTEGER NOT NULL DEFAULT 0"
+            )
         # reminders schema migration: add stage flag columns
         rcols = [r[1] for r in c.execute("PRAGMA table_info(reminders)").fetchall()]
         for col in (
@@ -426,6 +480,13 @@ def _init_db() -> None:
                 "ALTER TABLE reminders ADD COLUMN mention_aliases "
                 "TEXT NOT NULL DEFAULT '[]'"
             )
+        # 2026-09-28 同事件合併：時間是否明確（NULL＝舊資料、固定）與吸收的說法。
+        for col, ddl in (
+            ("time_kind", "time_kind TEXT"),
+            ("merged_details", "merged_details TEXT NOT NULL DEFAULT '[]'"),
+        ):
+            if col not in rcols:
+                _add_column(c, "reminders", col, ddl)
         _ensure_pending_source_unique_index(c)
         # persona_notes schema migration: add source column if missing
         # 2026-05-08：區分 'rule_violation'（既有黑名單觸發）vs 'organic'（user 真實糾正）
@@ -650,31 +711,49 @@ def _cache_key(text: str) -> str:
     return hashlib.sha256(normalized.encode()).hexdigest()
 
 
-def check_fact_cache(group_id: str, text: str) -> str | None:
-    """查快取，若命中且未過期回傳 cached result，否則回 None。"""
+class FactCacheHit(str):
+    """A cached reply; ``grounded`` is True only for rows stored with search backing."""
+
+    grounded: bool
+
+    def __new__(cls, text: str, grounded: bool = False):
+        hit = super().__new__(cls, text)
+        hit.grounded = bool(grounded)
+        return hit
+
+
+def check_fact_cache(group_id: str, text: str) -> FactCacheHit | None:
+    """查快取，若命中且未過期回傳 cached result（帶 grounded 標記），否則回 None。"""
     if len(text.strip()) < 80:
         return None
     key = _cache_key(text)
     now = int(_time.time())
     with _conn() as c:
         row = c.execute(
-            "SELECT result FROM fact_check_cache WHERE group_id = ? AND text_hash = ? AND expires_at > ?",
+            "SELECT result, grounded FROM fact_check_cache "
+            "WHERE group_id = ? AND text_hash = ? AND expires_at > ?",
             (group_id, key, now),
         ).fetchone()
-    return row[0] if row else None
+    return FactCacheHit(row[0], grounded=bool(row[1])) if row else None
 
 
-def store_fact_cache(group_id: str, text: str, result: str) -> None:
-    """存入快取，TTL = _CACHE_TTL_DAYS 天。"""
-    if len(text.strip()) < 80:
+def store_fact_cache(group_id: str, text: str, result: str, grounded: bool = False) -> None:
+    """存入快取，TTL = _CACHE_TTL_DAYS 天。
+
+    2026-10-04: only replies backed by a search are cached (a made-up reply
+    cached on 9/30 would otherwise replay for a week); they carry the
+    ``grounded`` marker so a replay counts as backed.
+    """
+    if not grounded or len(text.strip()) < 80:
         return
     key = _cache_key(text)
     now = int(_time.time())
     expires = now + _CACHE_TTL_DAYS * 86400
     with _lock, _conn() as c:
         c.execute(
-            "INSERT OR REPLACE INTO fact_check_cache(group_id, text_hash, result, created_at, expires_at) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO fact_check_cache"
+            "(group_id, text_hash, result, created_at, expires_at, grounded) "
+            "VALUES (?, ?, ?, ?, ?, 1)",
             (group_id, key, result, now, expires),
         )
 
@@ -715,8 +794,8 @@ def begin_inbound_event(group_id: str, message_id: str) -> str:
             )
             return "new"
         status, updated_at = row
-        if status == "replied":
-            return "replied"
+        if status in {"replied", "completed_no_reply"}:
+            return status
         lease_seconds = (
             _INBOUND_MEDIA_PROCESSING_LEASE_SECONDS
             if status == "media_processing"
@@ -758,8 +837,91 @@ def mark_inbound_event_replied(group_id: str, message_id: str) -> None:
         )
 
 
+def mark_inbound_events_replied(group_id: str, message_ids: list[str]) -> int:
+    """Atomically mark every existing event covered by one accepted reply."""
+    ids = list(
+        dict.fromkeys(str(message_id) for message_id in message_ids if message_id)
+    )
+    if not group_id or not ids:
+        return 0
+    now = int(_time.time())
+    with _lock, _conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            before = c.total_changes
+            c.executemany(
+                "UPDATE inbound_events SET status = 'replied', updated_at = ? "
+                "WHERE group_id = ? AND message_id = ? "
+                "AND status NOT IN ('replied', 'completed_no_reply')",
+                [(now, group_id, message_id) for message_id in ids],
+            )
+            marked = c.total_changes - before
+            c.execute("COMMIT")
+            return marked
+        except Exception:
+            if c.in_transaction:
+                c.execute("ROLLBACK")
+            raise
+
+
+_TRANSIENT_OPEN_ERROR_RE = re.compile(r"unable to open database file|disk i/o error", re.IGNORECASE)
+# One UPDATE per this many ids: in autocommit each statement may wait
+# busy_timeout, so a burst waits for the lock once instead of once per message.
+_COMPLETE_BATCH = 500
+
+
+def mark_inbound_events_completed_no_reply(
+    group_id: str, message_ids: list[str]
+) -> int:
+    """Durably close intentionally silent inbound events.
+
+    This is distinct from ``replied``: it prevents redelivery/reply-gap false
+    positives without claiming that LINE accepted an outbound message.
+    """
+    ids = list(
+        dict.fromkeys(str(message_id) for message_id in message_ids if message_id)
+    )
+    if not group_id or not ids:
+        return 0
+    for attempt in range(2):
+        now = int(_time.time())
+        try:
+            with _lock, _conn() as c:
+                before = c.total_changes
+                for start in range(0, len(ids), _COMPLETE_BATCH):
+                    batch = ids[start:start + _COMPLETE_BATCH]
+                    c.execute(
+                        "UPDATE inbound_events SET status = 'completed_no_reply', updated_at = ? "
+                        "WHERE group_id = ? AND status != 'replied' "
+                        f"AND message_id IN ({','.join('?' * len(batch))})",
+                        [now, group_id, *batch],
+                    )
+                return c.total_changes - before
+        except sqlite3.OperationalError as exc:
+            # One quick retry for a transient open/I-O failure, outside _lock.
+            # "database is locked" already waited busy_timeout, so it is final.
+            if attempt or not _TRANSIENT_OPEN_ERROR_RE.search(str(exc)):
+                raise
+            _time.sleep(0.2)
+    return 0
+
+
+def get_inbound_event_status(group_id: str, message_id: str) -> str | None:
+    """Return the durable terminal/processing state without claiming the event."""
+    if not group_id or not message_id:
+        return None
+    with _lock, _conn() as c:
+        row = c.execute(
+            "SELECT status FROM inbound_events "
+            "WHERE group_id = ? AND message_id = ?",
+            (group_id, message_id),
+        ).fetchone()
+    return str(row[0]) if row else None
+
+
 def log_raw_message(
-    group_id: str, message_id: str, user_id: str | None, text: str
+    group_id: str, message_id: str, user_id: str | None, text: str,
+    *, quoted_message_id: str | None = None, index_for_recall: bool = True,
 ) -> None:
     """記錄原始訊息，供之後 quote-reply 時查詢。超過 _RAW_MESSAGE_KEEP 筆自動汰舊。
 
@@ -776,6 +938,11 @@ def log_raw_message(
             "VALUES (?, ?, ?, ?, strftime('%s','now'))",
             (group_id, message_id, user_id, text),
         )
+        if isinstance(quoted_message_id, str) and quoted_message_id.strip():
+            c.execute(
+                "INSERT OR REPLACE INTO raw_message_quotes VALUES (?, ?, ?)",
+                (group_id, message_id, quoted_message_id.strip()),
+            )
         # 汰舊：只保留最近 _RAW_MESSAGE_KEEP 筆
         c.execute(
             "DELETE FROM raw_messages WHERE group_id = ? AND message_id NOT IN "
@@ -789,6 +956,13 @@ def log_raw_message(
             "(SELECT message_id FROM raw_messages WHERE group_id = ?)",
             (group_id, group_id),
         )
+        c.execute(
+            "DELETE FROM raw_message_quotes WHERE group_id = ? "
+            "AND message_id NOT IN (SELECT message_id FROM raw_messages WHERE group_id = ?)",
+            (group_id, group_id),
+        )
+    if not index_for_recall:
+        return
     # Embedding hook — async fire-and-forget with bounded in-flight work.
     try:
         import embedding_recall as _embedding_recall
@@ -833,6 +1007,18 @@ def get_raw_message(group_id: str, message_id: str) -> tuple[str | None, str] | 
         if row:
             return (row[0], row[1])
         return None
+
+
+def get_quoted_message_id(group_id: str, message_id: str) -> str | None:
+    """Recover only the exact persisted edge in this group, never a recent guess."""
+    if not isinstance(message_id, str) or not message_id:
+        return None
+    with _conn() as c:
+        row = c.execute(
+            "SELECT quoted_message_id FROM raw_message_quotes WHERE group_id=? AND message_id=?",
+            (group_id, message_id),
+        ).fetchone()
+    return str(row[0]) if row else None
 
 
 def get_raw_message_record(group_id: str, message_id: str) -> dict | None:
@@ -1024,6 +1210,72 @@ def get_recent_raw_messages(
             (group_id, limit),
         ).fetchall()
     return list(reversed([(r[0], r[1], r[2], r[3]) for r in rows]))
+
+
+def get_contextual_reminder_source(
+    group_id: str,
+    current_message_id: str,
+    *,
+    max_age_sec: int = 180,
+) -> dict | None:
+    """Return the exact preceding same-sender human row for a follow-up.
+
+    Ordering is anchored to the current row's ``(created_at, rowid)`` so two
+    messages written in the same second remain deterministic.  One immediate
+    bot acknowledgement may sit between the source and the command; another
+    human row or more bot chatter makes the context ambiguous and fails closed.
+    """
+
+    if not group_id or not current_message_id or max_age_sec <= 0:
+        return None
+    with _conn() as c:
+        current = c.execute(
+            "SELECT rowid,user_id,text,created_at FROM raw_messages "
+            "WHERE group_id=? AND message_id=?",
+            (group_id, current_message_id),
+        ).fetchone()
+        if current is None or not str(current[1] or ""):
+            return None
+        rows = c.execute(
+            "SELECT rowid,message_id,user_id,text,created_at FROM raw_messages "
+            "WHERE group_id=? AND (created_at<? OR (created_at=? AND rowid<?)) "
+            "ORDER BY created_at DESC,rowid DESC LIMIT 3",
+            (group_id, int(current[3]), int(current[3]), int(current[0])),
+        ).fetchall()
+    bot_rows: list[str] = []
+    source = None
+    for row in rows:
+        if str(row[2] or "") == "__bot__":
+            bot_rows.append(str(row[3] or ""))
+            if len(bot_rows) > 1:
+                return None
+            continue
+        source = row
+        break
+    # This narrow follow-up is valid only after the preceding source was
+    # durably acknowledged as a reminder.  Without that fence, its generic
+    # extraction can race this four-slot batch and add a fifth legacy row.
+    if (
+        source is None
+        or len(bot_rows) != 1
+        or "已新增提醒" not in bot_rows[0]
+    ):
+        return None
+    if str(source[2] or "") != str(current[1] or ""):
+        return None
+    age = int(current[3]) - int(source[4])
+    if age < 0 or age > int(max_age_sec):
+        return None
+    return {
+        "group_id": group_id,
+        "message_id": str(source[1]),
+        "user_id": str(source[2] or ""),
+        "text": str(source[3] or ""),
+        "created_at": int(source[4]),
+        "current_message_id": current_message_id,
+        "current_text": str(current[2] or ""),
+        "current_created_at": int(current[3]),
+    }
 
 
 def search_raw_messages(
@@ -2107,6 +2359,333 @@ def undo_correction_rule_event(group_id: str, event_id: int) -> bool:
 # ── Reminders（自動偵測時間性事項，2026-05-08 加）────────────────────────────
 
 
+_MERGED_DETAIL_LIMIT = 20
+_MERGED_DETAIL_TEXT_LIMIT = 300
+# Same-day stages: once one of these went out, the family has been told the
+# time for today, so a later mention must not move it (day-level stages stay
+# valid when the time moves within the same day).
+_SAME_DAY_PUSH_COLUMNS: tuple[str, ...] = (
+    "pushed_4hr",
+    "pushed_2hr",
+    "pushed_1hr",
+    "pushed_now",
+)
+
+
+def _reminder_hhmm(remind_at: int) -> str:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    return datetime.fromtimestamp(int(remind_at), ZoneInfo("Asia/Taipei")).strftime(
+        "%H:%M"
+    )
+
+
+def _load_merged_details(raw: object) -> list[dict]:
+    try:
+        value = json.loads(raw or "[]")
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict) and item.get("key")]
+
+
+def _merged_detail_fragment(action: str, source_text: str) -> dict:
+    """One absorbed mention; the key makes a replayed message a no-op."""
+    action = _normalize_reminder_text(action)
+    text = _normalize_reminder_text(source_text)[:_MERGED_DETAIL_TEXT_LIMIT]
+    digest = hashlib.sha1(
+        f"{_reminder_equivalence_key(action)}\n{_reminder_equivalence_key(text)}".encode(
+            "utf-8"
+        )
+    ).hexdigest()[:16]
+    return {"key": digest, "action": action, "text": text}
+
+
+def merged_detail_key(action: str, source_text: str) -> str:
+    """The merged_details key a row's own words get when another row absorbs it."""
+    return _merged_detail_fragment(action, source_text)["key"]
+
+
+def _store_merged_detail_conn(
+    c: sqlite3.Connection,
+    reminder_id: int,
+    raw_details: object,
+    kept_action: str,
+    kept_source: str,
+    fragment: dict,
+) -> bool:
+    """Record an absorbed mention; False when it adds nothing or the list is full."""
+    if fragment["key"] == _merged_detail_fragment(kept_action, kept_source)["key"]:
+        return False
+    fragments = _load_merged_details(raw_details)
+    if len(fragments) >= _MERGED_DETAIL_LIMIT or any(
+        item["key"] == fragment["key"] for item in fragments
+    ):
+        return False
+    fragments.append(fragment)
+    c.execute(
+        "UPDATE reminders SET merged_details=? WHERE reminder_id=? AND status='pending'",
+        (json.dumps(fragments, ensure_ascii=False), int(reminder_id)),
+    )
+    return True
+
+
+def _delivery_in_flight_conn(
+    c: sqlite3.Connection,
+    group_id: str,
+    reminder_id: int,
+    action: str,
+    remind_at: int,
+) -> bool:
+    return (
+        _semantic_delivery_claim_conn(
+            c,
+            group_id=group_id,
+            reminder_id=int(reminder_id),
+            action=action,
+            remind_at=int(remind_at),
+        )
+        is not None
+    )
+
+
+def _promote_time_kind_conn(
+    c: sqlite3.Connection,
+    reminder_id: int,
+    stored_kind: str | None,
+    stored_at: int,
+    incoming_kind: str | None,
+    incoming_hhmm: str,
+) -> None:
+    """Raise a kept reminder's time kind when a more specific mention confirms its time.
+
+    Only upward (none < daypart < clock). Unknown kinds never promote, and a
+    legacy row (NULL) is already fixed. Allowed during a delivery claim: the
+    claim does not depend on this column.
+    """
+    if incoming_kind is None or stored_kind is None:
+        return
+    if reminder_intent.time_rank(incoming_kind) <= reminder_intent.time_rank(stored_kind):
+        return
+    if reminder_intent.time_is_confirmed_by(
+        _reminder_hhmm(stored_at), incoming_kind, incoming_hhmm
+    ):
+        c.execute(
+            "UPDATE reminders SET time_kind=? WHERE reminder_id=? AND status='pending'",
+            (incoming_kind, int(reminder_id)),
+        )
+
+
+def _mention_sets_a_new_time(
+    stored_kind: str | None,
+    stored_at: int,
+    incoming_kind: str | None,
+    incoming_hhmm: str,
+) -> bool:
+    """A more specific mention that does not just confirm the stored time."""
+    return (
+        incoming_kind is not None
+        and stored_kind is not None
+        and reminder_intent.time_rank(incoming_kind) > reminder_intent.time_rank(stored_kind)
+        and not reminder_intent.time_is_confirmed_by(
+            _reminder_hhmm(stored_at), incoming_kind, incoming_hhmm
+        )
+    )
+
+
+def _same_event_calendar_mirror_conn(
+    c: sqlite3.Connection,
+    group_id: str,
+    user_id: str,
+    action: str,
+    remind_at: int,
+    mentions: list[str],
+    time_kind: str,
+    now: int,
+    day_start: int,
+) -> int | None:
+    """A pending same-day calendar mirror describing this event, read only."""
+    rows = c.execute(
+        "SELECT reminder_id, action, COALESCE(source_text, ''), "
+        "COALESCE(mention_aliases, '[]'), remind_at, time_kind, "
+        "COALESCE(merged_details, '[]'), COALESCE(user_id, '') "
+        "FROM reminders WHERE group_id=? AND status='pending' "
+        "AND source_kind='calendar_event' AND source_ref<>'' "
+        "AND remind_at>=? AND remind_at<? AND remind_at>? ORDER BY reminder_id",
+        (group_id, int(day_start), int(day_start) + 86400, int(now)),
+    ).fetchall()
+    incoming_hhmm = _reminder_hhmm(remind_at)
+    for row in rows:
+        if reminder_intent.has_reminder_offset_marker(row[1]):
+            continue
+        identity = [row[1], *(item.get("action") or "" for item in _load_merged_details(row[6]))]
+        if reminder_intent.mention_matches_reminder(
+            action,
+            row[1],
+            time_kind=time_kind,
+            hhmm=incoming_hhmm,
+            kept_kind=row[5],
+            kept_hhmm=_reminder_hhmm(row[4]),
+            kept_identity=identity,
+            kept_source=row[2],
+            mentions=mentions,
+            kept_mentions=_load_mention_aliases(row[3]),
+            same_author=bool(user_id) and row[7] == user_id,
+        ):
+            return int(row[0])
+    return None
+
+
+def _merge_same_event_conn(
+    c: sqlite3.Connection,
+    group_id: str,
+    user_id: str,
+    action: str,
+    remind_at: int,
+    source_text: str,
+    mentions: list[str],
+    time_kind: str,
+    now: int,
+    fragment: dict,
+) -> tuple[int, str] | None:
+    """Fold a repeated mention of one event into its pending reminder.
+
+    Honor-or-insert: returns (reminder_id, outcome) only when the kept reminder
+    will still remind at the time the new mention asks for; None means insert
+    a new reminder as before.
+
+    The kept reminder's wording (``action``) never changes here, even when the
+    mention says more (fixR5a, GP1 r4 #1 #2): the calendar pairing reads the
+    event title against it and quoted cancel / reschedule match the messages
+    already sent by it.  The mention goes into merged_details, and the push
+    and the receipt show a fuller wording on a 「細節：…」 line
+    (reminder_push.fuller_detail_line).
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    day = datetime.fromtimestamp(int(remind_at), ZoneInfo("Asia/Taipei"))
+    start = int(
+        datetime(day.year, day.month, day.day, tzinfo=ZoneInfo("Asia/Taipei")).timestamp()
+    )
+    rows = c.execute(
+        "SELECT reminder_id, action, COALESCE(source_text, ''), "
+        "COALESCE(mention_aliases, '[]'), remind_at, time_kind, "
+        "COALESCE(merged_details, '[]'), pushed_4hr, pushed_2hr, pushed_1hr, pushed_now, "
+        "COALESCE(user_id, '') "
+        "FROM reminders WHERE group_id=? AND status='pending' "
+        # 2026-10-04: a trip day created from a dated list (schedule_line) is
+        # the same kind of user reminder; later mentions join it.
+        "AND source_kind IN ('', 'contextual_create_once', 'schedule_line') "
+        "AND remind_at>=? AND remind_at<? AND remind_at>? ORDER BY reminder_id",
+        (group_id, start, start + 86400, int(now)),
+    ).fetchall()
+    incoming_hhmm = _reminder_hhmm(remind_at)
+    candidates = []
+    for row in rows:
+        if reminder_intent.has_reminder_offset_marker(row[1]):
+            continue
+        kept_mentions = _load_mention_aliases(row[3])
+        names = tuple(dict.fromkeys([*mentions, *kept_mentions]))
+        identity = [row[1], *(item.get("action") or "" for item in _load_merged_details(row[6]))]
+        stored_hhmm = _reminder_hhmm(row[4])
+        same_author = bool(user_id) and row[11] == user_id
+        # 2026-10-04: the same test the push-time fold uses, now with the
+        # narrow same-author, same-clock loosening (e1/e3).  Only this way
+        # round: a row that reads into the mention but not the other way
+        # (fixC12's reverse reading) gets the mention as a row of its own,
+        # because merged here it kept its older words (fixR4b, GP1 r3 #2).
+        # The fold pairs the two at the next moment and keeps the row with
+        # the most content; the receipt's own reply leaves both alone
+        # (reminder_push keep_ids / same_event_ids).
+        if not reminder_intent.mention_matches_reminder(
+            action,
+            row[1],
+            time_kind=time_kind,
+            hhmm=incoming_hhmm,
+            kept_kind=row[5],
+            kept_hhmm=stored_hhmm,
+            kept_identity=identity,
+            kept_source=row[2],
+            mentions=mentions,
+            kept_mentions=kept_mentions,
+            same_author=same_author,
+        ):
+            continue
+        candidates.append((row, names, identity, stored_hhmm, same_author))
+    if len(candidates) > 1:
+        # A refused move kept the vague row and added the new time; a later
+        # mention belongs to the one row that already reminds at its time.
+        keeping = [
+            candidate
+            for candidate in candidates
+            if not _mention_sets_a_new_time(
+                candidate[0][5], int(candidate[0][4]), time_kind, incoming_hhmm
+            )
+        ]
+        if len(keeping) == 1:
+            candidates = keeping
+    if not candidates:
+        # 2026-10-04 (P4 item 3, GP1 I11): only when no natural reminder
+        # matched, a separate pass checks the same day's calendar mirrors.  A
+        # match means the calendar already reminds about this event: report a
+        # duplicate, insert nothing and leave the mirror as it is.
+        mirror_id = _same_event_calendar_mirror_conn(
+            c, group_id, user_id, action, remind_at, mentions, time_kind, now, start
+        )
+        if mirror_id is not None:
+            return mirror_id, "duplicate"
+        return None
+    if len(candidates) != 1:
+        return None
+
+    row, names, identity, stored_hhmm, same_author = candidates[0]
+    reminder_id = int(row[0])
+    in_flight = _delivery_in_flight_conn(c, group_id, reminder_id, row[1], int(row[4]))
+    merged_mentions = _merge_mention_aliases_json(row[3], mentions)
+    wants_move = reminder_intent.time_rank(time_kind) > reminder_intent.time_rank(
+        row[5]
+    ) and not reminder_intent.time_is_confirmed_by(stored_hhmm, time_kind, incoming_hhmm)
+    if wants_move:
+        movable = (
+            row[5] is not None
+            and int(remind_at) > int(now)
+            and not any(int(flag or 0) for flag in row[7:11])
+            and not in_flight
+            and reminder_intent.same_event_move_match(
+                action, row[1], identity, names, same_author=same_author
+            )
+        )
+        if not movable:
+            return None
+        _store_merged_detail_conn(c, reminder_id, row[6], row[1], row[2], fragment)
+        c.execute(
+            "UPDATE reminders SET remind_at=?, time_kind=?, mention_aliases=? "
+            "WHERE reminder_id=? AND status='pending'",
+            (
+                int(remind_at),
+                time_kind,
+                merged_mentions,
+                reminder_id,
+            ),
+        )
+        return reminder_id, "merged"
+
+    _promote_time_kind_conn(c, reminder_id, row[5], int(row[4]), time_kind, incoming_hhmm)
+    if in_flight:
+        return reminder_id, "duplicate"
+    changed = _store_merged_detail_conn(c, reminder_id, row[6], row[1], row[2], fragment)
+    if merged_mentions != row[3]:
+        c.execute(
+            "UPDATE reminders SET mention_aliases=? WHERE reminder_id=?",
+            (merged_mentions, reminder_id),
+        )
+        changed = True
+    return reminder_id, "merged" if changed else "duplicate"
+
+
 def _add_reminder_with_outcome_conn(
     c: sqlite3.Connection,
     group_id: str,
@@ -2116,14 +2695,42 @@ def _add_reminder_with_outcome_conn(
     source_text: str,
     mentions: list[str],
     now: int,
+    time_kind: str | None = None,
 ) -> tuple[int, str]:
     mentions_json = json.dumps(mentions, ensure_ascii=False)
-    existing = c.execute(
-        "SELECT reminder_id, COALESCE(mention_aliases, '[]') FROM reminders "
+    incoming_hhmm = _reminder_hhmm(remind_at)
+    fragment = _merged_detail_fragment(action, source_text)
+    retired = c.execute(
+        "SELECT reminder_id FROM reminders WHERE group_id=? AND user_id=? "
+        "AND source_kind='restated_generic_old' AND status='cancelled' "
+        "AND source_text=? AND source_text<>'' LIMIT 1",
+        (group_id, user_id, source_text),
+    ).fetchone()
+    if retired:
+        return int(retired[0]), "inactive"
+    exact = c.execute(
+        "SELECT reminder_id, COALESCE(mention_aliases, '[]'), remind_at, time_kind, "
+        "COALESCE(merged_details, '[]'), COALESCE(source_text, '') FROM reminders "
         "WHERE group_id = ? AND action = ? AND status = 'pending' "
         "AND ABS(remind_at - ?) < 3600",
         (group_id, action, remind_at),
-    ).fetchone()
+    ).fetchall()
+    existing = exact[0] if exact else None
+    if existing and _mention_sets_a_new_time(existing[3], int(existing[2]), time_kind, incoming_hhmm):
+        # 「明天回診」then「明天11點15分回診」: let the same-event step move it
+        # under its guards instead of calling it a duplicate at the default time,
+        # unless a row already keeps this time (an earlier refused move inserted it).
+        existing = next(
+            (
+                row
+                for row in exact[1:]
+                if not _mention_sets_a_new_time(row[3], int(row[2]), time_kind, incoming_hhmm)
+                and reminder_intent.times_compatible(
+                    row[3], _reminder_hhmm(row[2]), time_kind, incoming_hhmm
+                )
+            ),
+            None,
+        )
     if existing:
         merged_mentions = _merge_mention_aliases_json(existing[1], mentions)
         if merged_mentions != existing[1]:
@@ -2131,11 +2738,23 @@ def _add_reminder_with_outcome_conn(
                 "UPDATE reminders SET mention_aliases = ? WHERE reminder_id = ?",
                 (merged_mentions, existing[0]),
             )
+        _promote_time_kind_conn(
+            c, int(existing[0]), existing[3], int(existing[2]), time_kind, incoming_hhmm
+        )
+        if reminder_intent.times_compatible(
+            existing[3], _reminder_hhmm(existing[2]), time_kind, incoming_hhmm
+        ) and not _delivery_in_flight_conn(
+            c, group_id, int(existing[0]), action, int(existing[2])
+        ):
+            _store_merged_detail_conn(
+                c, int(existing[0]), existing[4], action, existing[5], fragment
+            )
         return int(existing[0]), "duplicate"
     weak_nearby = c.execute(
         "SELECT reminder_id, action, COALESCE(source_text, ''), "
         "COALESCE(mention_aliases, '[]'), COALESCE(source_kind, ''), "
-        "COALESCE(source_ref, '') "
+        "COALESCE(source_ref, ''), remind_at, time_kind, "
+        "COALESCE(merged_details, '[]') "
         "FROM reminders WHERE group_id=? AND status='pending' "
         "AND ABS(remind_at - ?) < 60 ORDER BY reminder_id",
         (group_id, remind_at),
@@ -2155,9 +2774,17 @@ def _add_reminder_with_outcome_conn(
     ]
     if incoming_is_weak and len(strong_rows) == 1:
         strong = strong_rows[0]
+        _promote_time_kind_conn(
+            c, int(strong[0]), strong[7], int(strong[6]), time_kind, incoming_hhmm
+        )
+        if not _delivery_in_flight_conn(c, group_id, int(strong[0]), strong[1], int(strong[6])):
+            _store_merged_detail_conn(c, int(strong[0]), strong[8], strong[1], strong[2], fragment)
         return int(strong[0]), "duplicate"
     if not incoming_is_weak and len(weak_rows) == 1 and not strong_rows:
         weak = weak_rows[0]
+        _promote_time_kind_conn(
+            c, int(weak[0]), weak[7], int(weak[6]), time_kind, incoming_hhmm
+        )
         live_claim = c.execute(
             "SELECT 1 FROM reminder_delivery_claims "
             "WHERE group_id=? AND delivery_kind='natural' AND subject_ref=? "
@@ -2178,33 +2805,98 @@ def _add_reminder_with_outcome_conn(
                 int(weak[0]),
             ),
         )
+        # The weak row's own words are replaced; keep them as an absorbed detail.
+        _store_merged_detail_conn(
+            c,
+            int(weak[0]),
+            weak[8],
+            action,
+            source_text,
+            _merged_detail_fragment(weak[1], weak[2]),
+        )
         return int(weak[0]), "merged"
     nearby = c.execute(
         "SELECT reminder_id, action, COALESCE(source_text, ''), "
-        "COALESCE(mention_aliases, '[]') "
+        "COALESCE(mention_aliases, '[]'), remind_at, time_kind, "
+        "pushed_4hr, pushed_2hr, pushed_1hr, pushed_now "
         "FROM reminders WHERE group_id = ? AND status = 'pending' "
         "AND ABS(remind_at - ?) < 1800",
         (group_id, remind_at),
     ).fetchall()
-    for existing_id, existing_action, existing_source, existing_mentions in nearby:
+    for (
+        existing_id,
+        existing_action,
+        existing_source,
+        existing_mentions,
+        existing_at,
+        existing_kind,
+        *same_day_flags,
+    ) in nearby:
         merged_action = _merge_reminder_action(existing_action, action)
         if not merged_action:
             continue
+        takes_new_time = _mention_sets_a_new_time(
+            existing_kind, int(existing_at), time_kind, incoming_hhmm
+        )
+        if takes_new_time and (
+            int(remind_at) <= int(now) or any(int(flag or 0) for flag in same_day_flags)
+        ):
+            # a clock for a 嗎哪 reminder already announced today (or a time
+            # already past): leave it as it is and add the new time
+            continue
+        _promote_time_kind_conn(
+            c, int(existing_id), existing_kind, int(existing_at), time_kind, incoming_hhmm
+        )
+        if _delivery_in_flight_conn(
+            c, group_id, int(existing_id), existing_action, int(existing_at)
+        ):
+            continue
         merged_source = _merge_reminder_source(existing_source, source_text)
         merged_mentions = _merge_mention_aliases_json(existing_mentions, mentions)
+        if takes_new_time:
+            # 「媽媽嗎哪小組查經」 then 「嗎哪小組查經 19:20」: one group, the stated time
+            c.execute(
+                "UPDATE reminders SET action = ?, source_text = ?, mention_aliases = ?, "
+                "remind_at = ?, time_kind = ? WHERE reminder_id = ?",
+                (
+                    merged_action,
+                    merged_source,
+                    merged_mentions,
+                    int(remind_at),
+                    time_kind,
+                    existing_id,
+                ),
+            )
+            return int(existing_id), "merged"
         c.execute(
             "UPDATE reminders SET action = ?, source_text = ?, mention_aliases = ? "
             "WHERE reminder_id = ?",
             (merged_action, merged_source, merged_mentions, existing_id),
         )
         return int(existing_id), "merged"
+    if time_kind is not None:
+        same_event = _merge_same_event_conn(
+            c,
+            group_id,
+            user_id,
+            action,
+            remind_at,
+            source_text,
+            mentions,
+            time_kind,
+            now,
+            fragment,
+        )
+        if same_event is not None:
+            return same_event
     c.execute(
         "INSERT INTO reminders(group_id, user_id, action, remind_at, "
-        "created_at, status, source_kind, source_ref, source_text, mention_aliases) "
-        "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
+        "created_at, status, source_kind, source_ref, source_text, mention_aliases, "
+        "time_kind) "
+        "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)",
         (
             group_id, user_id, action, remind_at, now,
-            "", "", source_text, mentions_json
+            "", "", source_text, mentions_json, time_kind
         ),
     )
     reminder_id = int(c.execute("SELECT last_insert_rowid()").fetchone()[0])
@@ -2218,19 +2910,42 @@ def add_reminder_with_outcome(
     remind_at: int,
     source_text: str = "",
     mention_aliases: list[str] | None = None,
+    time_kind: str | None = None,
+    *,
+    source_kind: str = "",
+    source_ref: str = "",
 ) -> tuple[int, str]:
     """Atomically add or merge a reminder and return its write outcome.
 
-    Outcome is one of ``created``, ``duplicate``, or ``merged``. The explicit
-    immediate transaction serializes the dedupe read/write across processes.
+    Outcome is one of ``created``, ``duplicate``, ``merged`` or ``inactive``.
+    The explicit immediate transaction serializes the dedupe read/write across
+    processes.  With a source identity (``source_kind`` + ``source_ref``, e.g.
+    one line of a schedule message) the same source is written at most once:
+    a pending row answers ``duplicate`` and a cancelled/finished one
+    ``inactive``, so a resend or a later quote never revives it.
     """
     now = int(_time.time())
     action = _normalize_reminder_text(action)
     source_text = _normalize_reminder_text(source_text)
     mentions = _normalize_mention_aliases(mention_aliases)
+    source_kind = str(source_kind or "").strip()
+    source_ref = str(source_ref or "").strip()
+    keyed = bool(source_kind and source_ref)
     with _lock, _conn() as c:
         c.execute("BEGIN IMMEDIATE")
-        return _add_reminder_with_outcome_conn(
+        if keyed:
+            known = c.execute(
+                "SELECT reminder_id, status FROM reminders "
+                "WHERE group_id=? AND source_kind=? AND source_ref=? "
+                "ORDER BY CASE WHEN status='pending' THEN 0 ELSE 1 END, reminder_id "
+                "LIMIT 1",
+                (group_id, source_kind, source_ref),
+            ).fetchone()
+            if known is not None:
+                return int(known[0]), (
+                    "duplicate" if known[1] == "pending" else "inactive"
+                )
+        reminder_id, outcome = _add_reminder_with_outcome_conn(
             c,
             group_id,
             user_id,
@@ -2239,7 +2954,323 @@ def add_reminder_with_outcome(
             source_text,
             mentions,
             now,
+            time_kind,
         )
+        if keyed and outcome == "created":
+            c.execute(
+                "UPDATE reminders SET source_kind=?, source_ref=? WHERE reminder_id=?",
+                (source_kind, source_ref, reminder_id),
+            )
+        return reminder_id, outcome
+
+
+def get_contextual_legacy_reminder(
+    group_id: str,
+    user_id: str,
+    source_text: str,
+) -> dict | None:
+    """Return one exact source-less pending row eligible for batch CAS."""
+
+    if not group_id or not user_id or not source_text:
+        return None
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT reminder_id,group_id,user_id,action,remind_at,status,"
+            "source_kind,source_ref,source_text,mention_aliases,"
+            "last_pushed_at,weekly_count,last_weekly_at,pushed_3d,pushed_1d,"
+            "pushed_4hr,pushed_2hr,pushed_1hr,pushed_now "
+            "FROM reminders WHERE group_id=? AND user_id=? AND status='pending' "
+            "AND source_kind='' AND source_ref='' AND source_text=? "
+            "ORDER BY reminder_id LIMIT 2",
+            (group_id, user_id, _normalize_reminder_text(source_text)),
+        ).fetchall()
+    if len(rows) != 1:
+        return None
+    row = rows[0]
+    keys = (
+        "reminder_id", "group_id", "user_id", "action", "remind_at", "status",
+        "source_kind", "source_ref", "source_text", "mention_aliases",
+        "last_pushed_at", "weekly_count", "last_weekly_at", "pushed_3d",
+        "pushed_1d", "pushed_4hr", "pushed_2hr", "pushed_1hr", "pushed_now",
+    )
+    result = dict(zip(keys, row))
+    result["reminder_id"] = int(result["reminder_id"])
+    result["remind_at"] = int(result["remind_at"])
+    result["mention_aliases"] = _load_mention_aliases(result["mention_aliases"])
+    for key in _REMINDER_PUSH_FLAG_COLUMNS:
+        result[key] = int(result[key] or 0)
+    return result
+
+
+def complete_contextual_date_reminder_batch(
+    *,
+    group_id: str,
+    user_id: str,
+    plan: dict,
+    pending_id: int | None = None,
+    pending_claim_token: str | None = None,
+    legacy_reminder_id: int | None = None,
+) -> dict:
+    """Atomically reconcile one four-slot contextual exact-date batch.
+
+    This deliberately bypasses ordinary reminder near-time merging.  Stable
+    source identities are the idempotency key; a partial or drifted batch is a
+    conflict rather than something to guess through.
+    """
+
+    source_message_id = str(plan.get("source_message_id") or "")
+    command_message_id = str(plan.get("command_message_id") or "")
+    source_text = _normalize_reminder_text(plan.get("source_text"))
+    command_text = _normalize_reminder_text(plan.get("command_text"))
+    specs = list(plan.get("reminders") or [])
+    if (
+        not group_id
+        or not user_id
+        or not source_message_id
+        or not command_message_id
+        or not source_text
+        or not command_text
+        or len(specs) != 4
+    ):
+        raise ValueError("invalid contextual reminder batch")
+    normalized_specs: list[dict] = []
+    source_refs: set[str] = set()
+    for spec in specs:
+        action = _normalize_reminder_text(spec.get("action"))
+        source_kind = str(spec.get("source_kind") or "").strip()
+        source_ref = str(spec.get("source_ref") or "").strip()
+        remind_at = int(spec.get("remind_at") or 0)
+        mentions = _normalize_mention_aliases(spec.get("mention_aliases"))
+        if (
+            not action
+            or remind_at <= 0
+            or source_kind != "contextual_date_once"
+            or not source_ref.startswith(f"{command_message_id}:")
+            or source_ref in source_refs
+        ):
+            raise ValueError("invalid contextual reminder slot")
+        source_refs.add(source_ref)
+        normalized_specs.append(
+            {
+                "action": action,
+                "remind_at": remind_at,
+                "source_kind": source_kind,
+                "source_ref": source_ref,
+                "mention_aliases": mentions,
+            }
+        )
+    expected_refs = {
+        f"{command_message_id}:{slot}"
+        for slot in ("lead:0", "same:0", "lead:1", "same:1")
+    }
+    if source_refs != expected_refs:
+        raise ValueError("invalid contextual reminder slot set")
+    if pending_id is not None and not pending_claim_token:
+        raise ValueError("pending claim token is required")
+
+    expected_legacy = plan.get("legacy_expected")
+    with _lock, _conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        source_raw = c.execute(
+            "SELECT user_id,text FROM raw_messages WHERE group_id=? AND message_id=?",
+            (group_id, source_message_id),
+        ).fetchone()
+        command_raw = c.execute(
+            "SELECT user_id,text FROM raw_messages WHERE group_id=? AND message_id=?",
+            (group_id, command_message_id),
+        ).fetchone()
+        if (
+            source_raw is None
+            or command_raw is None
+            or str(source_raw[0] or "") != user_id
+            or str(command_raw[0] or "") != user_id
+            or _normalize_reminder_text(source_raw[1]) != source_text
+            or _normalize_reminder_text(command_raw[1]) != command_text
+        ):
+            raise RuntimeError("contextual reminder raw-message identity drift")
+        has_events_table = c.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+        ).fetchone()
+        if has_events_table is not None:
+            source_event = c.execute(
+                "SELECT 1 FROM events WHERE group_id=? AND source_msg_id=? "
+                "AND status='active' LIMIT 1",
+                (group_id, source_message_id),
+            ).fetchone()
+            if source_event is not None:
+                # A calendar event has its own mirror/sender ownership.  Do
+                # not add four natural reminders beside it and create a fifth
+                # independently deliverable identity.
+                raise RuntimeError("contextual source is already calendar-bound")
+        if pending_id is not None:
+            pending = c.execute(
+                "SELECT group_id,user_id,message_id,text,status,claim_token "
+                "FROM pending_reminder_extract WHERE pending_id=?",
+                (int(pending_id),),
+            ).fetchone()
+            if (
+                pending is None
+                or str(pending[0]) != group_id
+                or str(pending[1] or "") != user_id
+                or str(pending[2] or "") != command_message_id
+                or _normalize_reminder_text(pending[3]) != command_text
+                or str(pending[4]) != "processing"
+                or str(pending[5] or "") != str(pending_claim_token)
+            ):
+                raise RuntimeError("contextual reminder pending claim drift")
+
+        existing_rows = c.execute(
+            "SELECT reminder_id,action,remind_at,status,source_kind,source_ref,"
+            "source_text,mention_aliases FROM reminders WHERE group_id=? "
+            "AND source_kind='contextual_date_once' AND source_ref IN (?,?,?,?)",
+            (group_id, *[spec["source_ref"] for spec in normalized_specs]),
+        ).fetchall()
+        generic_source_rows = c.execute(
+            "SELECT reminder_id FROM reminders WHERE group_id=? AND user_id=? "
+            "AND status='pending' AND source_kind='' AND source_ref='' "
+            "AND source_text=? ORDER BY reminder_id LIMIT 2",
+            (group_id, user_id, source_text),
+        ).fetchall()
+        expected_by_ref = {spec["source_ref"]: spec for spec in normalized_specs}
+        if existing_rows:
+            if generic_source_rows:
+                raise RuntimeError("contextual reminder duplicate has legacy residue")
+            if len(existing_rows) != len(normalized_specs):
+                raise RuntimeError("contextual reminder batch is partial")
+            for row in existing_rows:
+                expected = expected_by_ref.get(str(row[5] or ""))
+                if (
+                    expected is None
+                    or str(row[1]) != expected["action"]
+                    or int(row[2]) != expected["remind_at"]
+                    or str(row[3]) != "pending"
+                    or str(row[4]) != expected["source_kind"]
+                    or _normalize_reminder_text(row[6]) != command_text
+                    or _load_mention_aliases(row[7]) != expected["mention_aliases"]
+                ):
+                    raise RuntimeError("contextual reminder batch payload drift")
+            if pending_id is not None:
+                completed = c.execute(
+                    "UPDATE pending_reminder_extract SET status='done',claimed_at=0,"
+                    "claim_token='' WHERE pending_id=? AND status='processing' "
+                    "AND claim_token=?",
+                    (int(pending_id), str(pending_claim_token)),
+                )
+                if completed.rowcount != 1:
+                    raise RuntimeError("contextual reminder pending completion drift")
+            return {
+                "outcome": "duplicate",
+                "reminder_ids": sorted(int(row[0]) for row in existing_rows),
+            }
+
+        if legacy_reminder_id is None and generic_source_rows:
+            raise RuntimeError("contextual legacy reminder is ambiguous")
+        if legacy_reminder_id is not None and (
+            len(generic_source_rows) != 1
+            or int(generic_source_rows[0][0]) != int(legacy_reminder_id)
+        ):
+            raise RuntimeError("contextual legacy reminder identity drift")
+
+        legacy_slot = next(
+            spec for spec in normalized_specs if spec["source_ref"].endswith(":same:0")
+        )
+        reminder_ids: list[int] = []
+        if legacy_reminder_id is not None:
+            if not isinstance(expected_legacy, dict):
+                raise RuntimeError("contextual legacy preimage is required")
+            row = c.execute(
+                "SELECT reminder_id,group_id,user_id,action,remind_at,status,"
+                "source_kind,source_ref,source_text,mention_aliases,"
+                "last_pushed_at,weekly_count,last_weekly_at,pushed_3d,pushed_1d,"
+                "pushed_4hr,pushed_2hr,pushed_1hr,pushed_now "
+                "FROM reminders WHERE reminder_id=?",
+                (int(legacy_reminder_id),),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("contextual legacy reminder is missing")
+            actual = {
+                "reminder_id": int(row[0]), "group_id": str(row[1]),
+                "user_id": str(row[2] or ""), "action": str(row[3]),
+                "remind_at": int(row[4]), "status": str(row[5]),
+                "source_kind": str(row[6] or ""), "source_ref": str(row[7] or ""),
+                "source_text": str(row[8] or ""),
+                "mention_aliases": _load_mention_aliases(row[9]),
+            }
+            for index, key in enumerate(_REMINDER_PUSH_FLAG_COLUMNS, start=10):
+                actual[key] = int(row[index] or 0)
+            compare_keys = (
+                "reminder_id", "group_id", "user_id", "action", "remind_at",
+                "status", "source_kind", "source_ref", "source_text",
+                "mention_aliases", *_REMINDER_PUSH_FLAG_COLUMNS,
+            )
+            if any(actual.get(key) != expected_legacy.get(key) for key in compare_keys):
+                raise RuntimeError("contextual legacy reminder preimage drift")
+            if (
+                actual["group_id"] != group_id
+                or actual["user_id"] != user_id
+                or actual["status"] != "pending"
+                or actual["remind_at"]
+                != int(plan.get("legacy_expected_remind_at") or 0)
+                or actual["source_kind"]
+                or actual["source_ref"]
+                or _normalize_reminder_text(actual["source_text"]) != source_text
+                or any(actual[key] for key in _REMINDER_PUSH_FLAG_COLUMNS)
+            ):
+                raise RuntimeError("contextual legacy reminder is not safe to reconcile")
+            protected = c.execute(
+                "SELECT 1 FROM reminder_delivery_claims WHERE group_id=? "
+                "AND delivery_kind='natural' AND subject_ref=? "
+                "AND state IN ('sending','uncertain') LIMIT 1",
+                (group_id, str(legacy_reminder_id)),
+            ).fetchone()
+            sent_ref = c.execute(
+                "SELECT 1 FROM sent_reminder_refs WHERE group_id=? AND reminder_id=? LIMIT 1",
+                (group_id, int(legacy_reminder_id)),
+            ).fetchone()
+            if protected is not None or sent_ref is not None:
+                raise RuntimeError("contextual legacy reminder has delivery history")
+            updated = c.execute(
+                "UPDATE reminders SET action=?,remind_at=?,source_kind=?,source_ref=?,"
+                "source_text=?,mention_aliases=? WHERE reminder_id=? AND status='pending'",
+                (
+                    legacy_slot["action"], legacy_slot["remind_at"],
+                    legacy_slot["source_kind"], legacy_slot["source_ref"],
+                    command_text,
+                    json.dumps(legacy_slot["mention_aliases"], ensure_ascii=False),
+                    int(legacy_reminder_id),
+                ),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError("contextual legacy reminder update lost")
+            reminder_ids.append(int(legacy_reminder_id))
+
+        now = int(_time.time())
+        for spec in normalized_specs:
+            if legacy_reminder_id is not None and spec is legacy_slot:
+                continue
+            inserted = c.execute(
+                "INSERT INTO reminders(group_id,user_id,action,remind_at,created_at,"
+                "status,source_kind,source_ref,source_text,mention_aliases) "
+                "VALUES (?,?,?,?,?,'pending',?,?,?,?)",
+                (
+                    group_id, user_id, spec["action"], spec["remind_at"], now,
+                    spec["source_kind"], spec["source_ref"], command_text,
+                    json.dumps(spec["mention_aliases"], ensure_ascii=False),
+                ),
+            )
+            if inserted.rowcount != 1:
+                raise RuntimeError("contextual reminder insert failed")
+            reminder_ids.append(int(c.execute("SELECT last_insert_rowid()").fetchone()[0]))
+        if pending_id is not None:
+            completed = c.execute(
+                "UPDATE pending_reminder_extract SET status='done',claimed_at=0,"
+                "claim_token='' WHERE pending_id=? AND status='processing' "
+                "AND claim_token=?",
+                (int(pending_id), str(pending_claim_token)),
+            )
+            if completed.rowcount != 1:
+                raise RuntimeError("contextual reminder pending completion lost")
+        return {"outcome": "created", "reminder_ids": sorted(reminder_ids)}
 
 
 def add_reminder(
@@ -2283,8 +3314,8 @@ def add_reminder(
 def _get_reminder_conn(c: sqlite3.Connection, reminder_id: int) -> dict | None:
     row = c.execute(
         "SELECT reminder_id, group_id, user_id, action, remind_at, status, "
-        "source_kind, source_ref, source_text, mention_aliases "
-        "FROM reminders WHERE reminder_id=?",
+        "source_kind, source_ref, source_text, mention_aliases, time_kind, "
+        "merged_details FROM reminders WHERE reminder_id=?",
         (int(reminder_id),),
     ).fetchone()
     if row is None:
@@ -2300,6 +3331,8 @@ def _get_reminder_conn(c: sqlite3.Connection, reminder_id: int) -> dict | None:
         "source_ref": str(row[7] or ""),
         "source_text": str(row[8] or ""),
         "mention_aliases": _load_mention_aliases(row[9]),
+        "time_kind": row[10],
+        "merged_details": _load_merged_details(row[11]),
     }
 
 
@@ -3384,7 +4417,7 @@ def is_reminder_source_cancelled(
     return row is not None
 
 
-def complete_pending_reminder_with_confirmation(
+def complete_pending_reminder(
     pending_id: int,
     pending_claim_token: str,
     group_id: str,
@@ -3393,9 +4426,13 @@ def complete_pending_reminder_with_confirmation(
     remind_at: int,
     source_text: str,
     mention_aliases: list[str] | None,
-    confirmation_factory: Callable[[str, dict], str],
+    time_kind: str | None = None,
 ) -> tuple[int, str, dict]:
-    """Atomically persist a drained reminder, acknowledgement, and terminal state."""
+    """Atomically persist a drained reminder and close its queue row.
+
+    No acknowledgement is queued (2026-10-04, 「不用確認」): the reminder's own
+    next push is the family's signal.
+    """
     now = int(_time.time())
     action = _normalize_reminder_text(action)
     source_text = _normalize_reminder_text(source_text)
@@ -3423,24 +4460,11 @@ def complete_pending_reminder_with_confirmation(
             source_text,
             mentions,
             now,
+            time_kind,
         )
         persisted = _get_reminder_conn(c, reminder_id)
         if persisted is None:
             raise RuntimeError("persisted reminder row is missing")
-        confirmation_text = str(confirmation_factory(outcome, persisted) or "").strip()
-        if not confirmation_text:
-            raise RuntimeError("reminder confirmation text is empty")
-        c.execute(
-            "INSERT OR IGNORE INTO reminder_confirmation_outbox"
-            "(group_id, source_ref, text, created_at, claimed_at, claim_token, status) "
-            "VALUES (?, ?, ?, ?, 0, '', 'pending')",
-            (
-                group_id,
-                f"pending_reminder:{int(pending_id)}",
-                confirmation_text,
-                now,
-            ),
-        )
         completed = c.execute(
             "UPDATE pending_reminder_extract "
             "SET status='done', claimed_at=0, claim_token='' "
@@ -3615,11 +4639,13 @@ def synchronize_pending_reminder_for_source(
     mention_aliases: list[str] | None = None,
     *,
     require_active_calendar_event: bool = False,
+    expected_calendar_event: dict | None = None,
 ) -> int | None:
     """Atomically create or refresh one pending source mirror.
 
     Existing delivery counters/flags are preserved. Terminal source rows and
     inactive calendar events are durable tombstones and are never revived.
+    A supplied calendar snapshot must still match inside the write transaction.
     """
 
     group_id = str(group_id or "").strip()
@@ -3636,14 +4662,34 @@ def synchronize_pending_reminder_for_source(
     now = int(_time.time())
     with _lock, _conn() as c:
         c.execute("BEGIN IMMEDIATE")
-        if require_active_calendar_event:
+        if require_active_calendar_event or expected_calendar_event is not None:
             event = c.execute(
-                "SELECT 1 FROM events WHERE group_id=? AND event_id=? "
+                "SELECT title, event_date, event_time, location, participants, "
+                "source_msg_id, event_type, reminder_lead_days, status "
+                "FROM events WHERE group_id=? AND event_id=? "
                 "AND status='active' LIMIT 1",
                 (group_id, source_ref),
             ).fetchone()
             if event is None:
                 return None
+            if expected_calendar_event is not None:
+                # Exclude delivery flags: a push does not change the payload.
+                # Compare under the same write lock to fence stale repair jobs.
+                fields = (
+                    "title", "event_date", "event_time", "location", "participants",
+                    "source_msg_id", "event_type", "reminder_lead_days", "status",
+                )
+                for field, current in zip(fields, event):
+                    expected = expected_calendar_event.get(field)
+                    if field == "participants":
+                        try:
+                            current = json.loads(current or "[]")
+                            if isinstance(expected, str) or expected is None:
+                                expected = json.loads(expected or "[]")
+                        except (TypeError, ValueError):
+                            return None
+                    if current != expected:
+                        return None
         rows = c.execute(
             "SELECT reminder_id, status FROM reminders "
             "WHERE group_id=? AND source_kind=? AND source_ref=? "
@@ -4020,7 +5066,7 @@ def delete_duplicate_pending_reminders(
                 "created_at, source_kind, source_ref, source_text, "
                 "last_pushed_at, weekly_count, last_weekly_at, pushed_3d, "
                 "pushed_1d, pushed_4hr, pushed_2hr, pushed_1hr, pushed_now, "
-                "mention_aliases "
+                "mention_aliases, time_kind, merged_details "
                 "FROM reminders WHERE status='pending' AND group_id=? "
                 "ORDER BY group_id, action, remind_at, reminder_id",
                 (group_id,),
@@ -4031,7 +5077,7 @@ def delete_duplicate_pending_reminders(
                 "created_at, source_kind, source_ref, source_text, "
                 "last_pushed_at, weekly_count, last_weekly_at, pushed_3d, "
                 "pushed_1d, pushed_4hr, pushed_2hr, pushed_1hr, pushed_now, "
-                "mention_aliases "
+                "mention_aliases, time_kind, merged_details "
                 "FROM reminders WHERE status='pending' "
                 "ORDER BY group_id, action, remind_at, reminder_id",
             ).fetchall()
@@ -4118,6 +5164,22 @@ def delete_duplicate_pending_reminders(
                 ensure_ascii=False,
             )
             merged_source = _merged_duplicate_source_text(keep, cluster)
+            best_rank = max(
+                reminder_intent.time_rank(row["time_kind"]) for row in cluster
+            )
+            time_kind = keep["time_kind"]
+            if reminder_intent.time_rank(time_kind) < best_rank:
+                time_kind = next(
+                    row["time_kind"]
+                    for row in merge_order
+                    if reminder_intent.time_rank(row["time_kind"]) == best_rank
+                )
+            fragments: list[dict] = []
+            for row in merge_order:
+                for item in _load_merged_details(row["merged_details"]):
+                    if all(item["key"] != kept["key"] for kept in fragments):
+                        fragments.append(item)
+            merged_details = json.dumps(fragments, ensure_ascii=False)
             source_kind = str(keep["source_kind"] or "")
             source_ref = str(keep["source_ref"] or "")
             if not source_kind or not source_ref:
@@ -4174,7 +5236,8 @@ def delete_duplicate_pending_reminders(
                 "source_text=?, mention_aliases=?, created_at=?, "
                 "last_pushed_at=?, weekly_count=?, last_weekly_at=?, "
                 "pushed_3d=?, pushed_1d=?, pushed_4hr=?, pushed_2hr=?, "
-                "pushed_1hr=?, pushed_now=? WHERE reminder_id=?",
+                "pushed_1hr=?, pushed_now=?, time_kind=?, merged_details=? "
+                "WHERE reminder_id=?",
                 (
                     user_id,
                     source_kind,
@@ -4191,6 +5254,8 @@ def delete_duplicate_pending_reminders(
                     push_values["pushed_2hr"],
                     push_values["pushed_1hr"],
                     push_values["pushed_now"],
+                    time_kind,
+                    merged_details,
                     keep_id,
                 ),
             )
@@ -4417,6 +5482,29 @@ def get_pending_reminder_extract_by_message(
     }
 
 
+def get_pending_reminder_extract(pending_id: int) -> dict | None:
+    """Return one exact pending-extraction row by durable id."""
+
+    if int(pending_id) <= 0:
+        return None
+    with _conn() as c:
+        row = c.execute(
+            "SELECT pending_id,group_id,user_id,message_id,text,created_at,retries,"
+            "claimed_at,claim_token,status FROM pending_reminder_extract "
+            "WHERE pending_id=?",
+            (int(pending_id),),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "pending_id": int(row[0]), "group_id": str(row[1]),
+        "user_id": str(row[2] or ""), "message_id": str(row[3] or ""),
+        "text": str(row[4] or ""), "created_at": int(row[5]),
+        "retries": int(row[6]), "claimed_at": int(row[7] or 0),
+        "claim_token": str(row[8] or ""), "status": str(row[9]),
+    }
+
+
 def reclaim_stale_pending_reminders(
     max_processing_age_sec: int = 600, group_id: str | None = None
 ) -> int:
@@ -4442,17 +5530,43 @@ def reclaim_stale_pending_reminders(
         return cur.rowcount
 
 
-def list_pending_reminder_retries(group_id: str, limit: int = 5) -> list[dict]:
-    """取該 group 待重抽的 pending（status='pending'，舊→新），上限 limit。"""
+def list_pending_reminder_retries(
+    group_id: str,
+    limit: int = 5,
+    *,
+    after_created_at: int | None = None,
+    after_pending_id: int | None = None,
+) -> list[dict]:
+    """取該 group 待重抽的 pending（status='pending'，舊→新）。
+
+    ``after_*`` 是穩定的 keyset cursor；local-only backstop 用它跨頁尋找
+    可本機解析的提醒，避免前一頁都是 Gemini-dependent rows 時永久餓死。
+    """
     reclaim_stale_pending_reminders(group_id=group_id)
     with _conn() as c:
-        rows = c.execute(
-            "SELECT pending_id, group_id, user_id, message_id, text, created_at, retries "
-            "FROM pending_reminder_extract "
-            "WHERE group_id = ? AND status = 'pending' "
-            "ORDER BY created_at LIMIT ?",
-            (group_id, limit),
-        ).fetchall()
+        if after_created_at is None or after_pending_id is None:
+            rows = c.execute(
+                "SELECT pending_id, group_id, user_id, message_id, text, "
+                "created_at, retries FROM pending_reminder_extract "
+                "WHERE group_id = ? AND status = 'pending' "
+                "ORDER BY created_at, pending_id LIMIT ?",
+                (group_id, limit),
+            ).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT pending_id, group_id, user_id, message_id, text, "
+                "created_at, retries FROM pending_reminder_extract "
+                "WHERE group_id = ? AND status = 'pending' "
+                "AND (created_at > ? OR (created_at = ? AND pending_id > ?)) "
+                "ORDER BY created_at, pending_id LIMIT ?",
+                (
+                    group_id,
+                    int(after_created_at),
+                    int(after_created_at),
+                    int(after_pending_id),
+                    limit,
+                ),
+            ).fetchall()
     return [
         {
             "pending_id": r[0], "group_id": r[1], "user_id": r[2],
@@ -4477,13 +5591,80 @@ def claim_pending_reminder(pending_id: int) -> str | None:
 
 
 def mark_pending_reminder(pending_id: int, status: str, claim_token: str) -> bool:
-    """標記結果：'done'（已抽存）/'dropped'（非提醒、過期）。"""
+    """Mark a successfully persisted extraction as done."""
+    if status != "done":
+        raise ValueError(
+            "non-success terminal states require an explicit pending reminder API: "
+            "drop_pending_reminder(pending_id, claim_token, group_id, reason)"
+        )
     with _lock, _conn() as c:
         cur = c.execute(
             "UPDATE pending_reminder_extract "
             "SET status = ?, claimed_at=0, claim_token='' "
             "WHERE pending_id = ? AND status='processing' AND claim_token=?",
             (status, pending_id, claim_token),
+        )
+        return cur.rowcount == 1
+
+
+# Why a queued extraction ended without a reminder.  A fixed set: the daily
+# audit shows these to Andrew, so exception text never lands here.
+PENDING_REMINDER_DROP_REASONS = frozenset(
+    {
+        "no_date",
+        "model_null",
+        "expired",
+        "stale",
+        "invalid_source",
+        "cancelled_source",
+    }
+)
+
+
+def drop_pending_reminder(
+    pending_id: int,
+    claim_token: str,
+    group_id: str,
+    reason: str,
+) -> bool:
+    """Close one claimed queue row silently (2026-10-04: no group receipt).
+
+    Only the claim owner can drop it.  Returns False when the claim was lost.
+    """
+
+    if reason not in PENDING_REMINDER_DROP_REASONS:
+        raise ValueError("unknown pending reminder drop reason")
+    group_id = str(group_id or "").strip()
+    claim_token = str(claim_token or "").strip()
+    if not group_id or not claim_token:
+        raise ValueError("pending reminder drop needs its group and claim token")
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "UPDATE pending_reminder_extract "
+            "SET status='dropped', claimed_at=0, claim_token='', "
+            "dropped_at=?, drop_reason=? "
+            "WHERE pending_id=? AND group_id=? AND status='processing' "
+            "AND claim_token=?",
+            (int(_time.time()), reason, int(pending_id), group_id, claim_token),
+        )
+        return cur.rowcount == 1
+
+
+def drop_pending_reminder_for_cancelled_source(
+    pending_id: int,
+    group_id: str,
+    claim_token: str,
+) -> bool:
+    """Drop a queue mirror whose durable calendar source was cancelled."""
+
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "UPDATE pending_reminder_extract "
+            "SET status='dropped', claimed_at=0, claim_token='', "
+            "dropped_at=?, drop_reason='cancelled_source' "
+            "WHERE pending_id=? AND group_id=? AND status='processing' "
+            "AND claim_token=?",
+            (int(_time.time()), int(pending_id), str(group_id), str(claim_token)),
         )
         return cur.rowcount == 1
 
@@ -4513,26 +5694,56 @@ def release_pending_reminder(pending_id: int, claim_token: str) -> bool:
         return cur.rowcount == 1
 
 
-def drop_stale_pending_reminders(max_age_sec: int, group_id: str | None = None) -> int:
+def drop_stale_pending_reminders(
+    max_age_sec: int,
+    group_id: str | None = None,
+) -> int:
     """清超齡 pending（created_at < now-max_age）→ status='dropped'。回清掉筆數。
-    不寫任何 plaintext DLQ 檔（PII 只留 DB）。"""
+    不寫任何 plaintext DLQ 檔（PII 只留 DB），也不寫群組回執（2026-10-04）。"""
     import time
+
     cutoff = int(time.time()) - max_age_sec
     with _lock, _conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        event_columns = {
+            str(row[1]) for row in c.execute("PRAGMA table_info(events)").fetchall()
+        }
+        source_guard = ""
+        if {"group_id", "source_msg_id"}.issubset(event_columns):
+            source_guard = (
+                " AND (p.message_id IS NULL OR NOT EXISTS ("
+                "SELECT 1 FROM events AS e WHERE e.group_id=p.group_id "
+                "AND e.source_msg_id=p.message_id))"
+            )
         if group_id is not None:
-            cur = c.execute(
-                "UPDATE pending_reminder_extract SET status='dropped' "
-                "WHERE status IN ('pending','processing') AND created_at < ? "
-                "AND group_id = ?",
+            rows = c.execute(
+                "SELECT p.pending_id, p.group_id FROM pending_reminder_extract AS p "
+                "WHERE p.status IN ('pending','processing') AND p.created_at < ? "
+                "AND p.group_id = ?" + source_guard,
                 (cutoff, group_id),
-            )
+            ).fetchall()
         else:
-            cur = c.execute(
-                "UPDATE pending_reminder_extract SET status='dropped' "
-                "WHERE status IN ('pending','processing') AND created_at < ?",
+            rows = c.execute(
+                "SELECT p.pending_id, p.group_id FROM pending_reminder_extract AS p "
+                "WHERE p.status IN ('pending','processing') AND p.created_at < ?"
+                + source_guard,
                 (cutoff,),
+            ).fetchall()
+        now = int(time.time())
+        dropped = 0
+        for pending_id, row_group_id in rows:
+            completed = c.execute(
+                "UPDATE pending_reminder_extract "
+                "SET status='dropped', claimed_at=0, claim_token='', "
+                "dropped_at=?, drop_reason='stale' "
+                "WHERE pending_id=? AND group_id=? "
+                "AND status IN ('pending','processing') AND created_at < ?",
+                (now, int(pending_id), str(row_group_id), cutoff),
             )
-        return cur.rowcount
+            if completed.rowcount != 1:
+                raise RuntimeError("stale pending reminder drop lost its row")
+            dropped += 1
+        return dropped
 
 
 def list_pending_reminder_groups() -> list[str]:
@@ -4563,7 +5774,8 @@ def list_pending_reminders(
             if group_id:
                 rows = c.execute(
                     "SELECT reminder_id, group_id, user_id, action, remind_at, "
-                    "created_at, source_kind, source_ref, source_text, mention_aliases "
+                    "created_at, source_kind, source_ref, source_text, mention_aliases, "
+                    "time_kind, merged_details "
                     "FROM reminders "
                     "WHERE status='pending' AND group_id=? AND remind_at BETWEEN ? AND ? "
                     "ORDER BY remind_at",
@@ -4572,7 +5784,8 @@ def list_pending_reminders(
             else:
                 rows = c.execute(
                     "SELECT reminder_id, group_id, user_id, action, remind_at, "
-                    "created_at, source_kind, source_ref, source_text, mention_aliases "
+                    "created_at, source_kind, source_ref, source_text, mention_aliases, "
+                    "time_kind, merged_details "
                     "FROM reminders "
                     "WHERE status='pending' AND remind_at BETWEEN ? AND ? "
                     "ORDER BY remind_at",
@@ -4582,7 +5795,8 @@ def list_pending_reminders(
             if group_id:
                 rows = c.execute(
                     "SELECT reminder_id, group_id, user_id, action, remind_at, "
-                    "created_at, source_kind, source_ref, source_text, mention_aliases "
+                    "created_at, source_kind, source_ref, source_text, mention_aliases, "
+                    "time_kind, merged_details "
                     "FROM reminders "
                     "WHERE status='pending' AND group_id=? AND remind_at >= ? "
                     "ORDER BY remind_at",
@@ -4591,7 +5805,8 @@ def list_pending_reminders(
             else:
                 rows = c.execute(
                     "SELECT reminder_id, group_id, user_id, action, remind_at, "
-                    "created_at, source_kind, source_ref, source_text, mention_aliases "
+                    "created_at, source_kind, source_ref, source_text, mention_aliases, "
+                    "time_kind, merged_details "
                     "FROM reminders "
                     "WHERE status='pending' AND remind_at >= ? "
                     "ORDER BY remind_at",
@@ -4609,8 +5824,85 @@ def list_pending_reminders(
             "source_ref": r[7] or "",
             "source_text": r[8] or "",
             "mention_aliases": _load_mention_aliases(r[9]),
+            "time_kind": r[10],
+            "merged_details": _load_merged_details(r[11]),
         }
         for r in rows
+    ]
+
+
+def list_generic_reminders_between(
+    group_id: str,
+    start_at: int,
+    end_at: int,
+    *,
+    topic: str | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    """Pure read of non-cancelled natural reminders in ``[start_at, end_at)``.
+
+    Calendar queries use this narrow reader as a fail-closed compatibility
+    bridge for legacy rows that were saved as reminders instead of events.
+    Unlike :func:`list_pending_reminders`, this function performs no cleanup,
+    deduplication, or other database mutation.
+    """
+
+    normalized_group_id = str(group_id or "").strip()
+    normalized_start = int(start_at)
+    normalized_end = int(end_at)
+    normalized_limit = max(1, min(int(limit), 200))
+    if not normalized_group_id or normalized_end <= normalized_start:
+        return []
+    normalized_topic = str(topic or "").strip()
+    topic_clause = ""
+    parameters: list[object] = [
+        normalized_group_id,
+        normalized_start,
+        normalized_end,
+    ]
+    if normalized_topic:
+        escaped_topic = (
+            normalized_topic.replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        topic_clause = (
+            "AND (action LIKE ? ESCAPE '\\' OR "
+            "COALESCE(source_text, '') LIKE ? ESCAPE '\\') "
+        )
+        topic_pattern = f"%{escaped_topic}%"
+        parameters.extend((topic_pattern, topic_pattern))
+    parameters.append(normalized_limit + 1)
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT reminder_id, group_id, user_id, action, remind_at, "
+            "created_at, status, source_kind, source_ref, source_text, mention_aliases "
+            "FROM reminders "
+            "WHERE status IN ('pending','done','expired') AND group_id=? "
+            "AND remind_at>=? AND remind_at<? "
+            "AND COALESCE(source_kind, '')='' "
+            "AND COALESCE(source_ref, '')='' "
+            f"{topic_clause}"
+            "ORDER BY remind_at, reminder_id LIMIT ?",
+            parameters,
+        ).fetchall()
+    if len(rows) > normalized_limit:
+        raise RuntimeError("legacy reminder query result was truncated")
+    return [
+        {
+            "reminder_id": int(row[0]),
+            "group_id": str(row[1]),
+            "user_id": str(row[2] or ""),
+            "action": str(row[3] or ""),
+            "remind_at": int(row[4]),
+            "created_at": int(row[5]),
+            "status": str(row[6] or ""),
+            "source_kind": str(row[7] or ""),
+            "source_ref": str(row[8] or ""),
+            "source_text": str(row[9] or ""),
+            "mention_aliases": _load_mention_aliases(row[10]),
+        }
+        for row in rows
     ]
 
 
@@ -4638,7 +5930,8 @@ def update_reminder_schedule(
     with _lock, _conn() as c:
         if action is not None:
             cur = c.execute(
-                "UPDATE reminders SET action = ?, remind_at = ?, "
+                "UPDATE reminders SET action = ?, remind_at = ?, time_kind = 'clock', "
+                "merged_details = '[]', "
                 "source_text = COALESCE(?, source_text), "
                 "last_pushed_at = 0, weekly_count = 0, last_weekly_at = 0, "
                 "pushed_3d = 0, pushed_1d = 0, pushed_4hr = 0, "
@@ -4648,7 +5941,8 @@ def update_reminder_schedule(
             )
         else:
             cur = c.execute(
-                "UPDATE reminders SET remind_at = ?, "
+                "UPDATE reminders SET remind_at = ?, time_kind = 'clock', "
+                "merged_details = '[]', "
                 "source_text = COALESCE(?, source_text), "
                 "last_pushed_at = 0, weekly_count = 0, last_weekly_at = 0, "
                 "pushed_3d = 0, pushed_1d = 0, pushed_4hr = 0, "
@@ -4657,6 +5951,229 @@ def update_reminder_schedule(
                 (remind_at, source_text, reminder_id),
             )
         return cur.rowcount > 0
+
+
+# Quoted reschedules (2026-10-03): the log lets a redelivered webhook replay
+# what its message already did instead of re-applying it over a later edit.
+# It keeps only times and action hashes (receipts render from the live row)
+# and follows the inbound_events retention.
+_RESCHEDULE_LOG_RETENTION_SECONDS = _INBOUND_EVENT_RETENTION_SECONDS
+
+
+def reminder_action_hash(action: str) -> str:
+    return hashlib.sha256(str(action or "").encode("utf-8")).hexdigest()
+
+
+def _get_reschedule_log_conn(
+    c: sqlite3.Connection, group_id: str, message_id: str
+) -> dict | None:
+    row = c.execute(
+        "SELECT reminder_id, old_remind_at, new_remind_at, old_action_hash, "
+        "new_action_hash FROM reminder_reschedule_log "
+        "WHERE group_id=? AND message_id=? AND created_at>=?",
+        (group_id, message_id, int(_time.time()) - _RESCHEDULE_LOG_RETENTION_SECONDS),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "reminder_id": int(row[0]),
+        "old_remind_at": int(row[1]),
+        "new_remind_at": int(row[2]),
+        "old_action_hash": str(row[3]),
+        "new_action_hash": str(row[4]),
+    }
+
+
+def get_reminder_reschedule_log(group_id: str, message_id: str) -> dict | None:
+    """Return what an inbound message already did to a reminder, if anything."""
+    if not group_id or not message_id:
+        return None
+    with _conn() as c:
+        return _get_reschedule_log_conn(c, group_id, message_id)
+
+
+def _reminder_source_pipeline_busy_conn(
+    c: sqlite3.Connection, group_id: str, user_id: str, source_text: str
+) -> bool:
+    """Same in-flight checks as reminder_restatement.reconcile."""
+    if not source_text:
+        return False
+    queued = c.execute(
+        "SELECT 1 FROM pending_reminder_extract WHERE group_id=? AND user_id=? "
+        "AND text=? AND status='processing' LIMIT 1",
+        (group_id, user_id, source_text),
+    ).fetchone()
+    if queued is not None:
+        return True
+    outbox = c.execute(
+        "SELECT 1 FROM reminder_confirmation_outbox AS o WHERE o.group_id=? "
+        "AND o.status IN ('pending','processing') AND (o.source_ref IN ("
+        "SELECT message_id FROM raw_messages WHERE group_id=? AND user_id=? AND text=?) "
+        "OR o.source_ref IN (SELECT 'pending_reminder:' || pending_id "
+        "FROM pending_reminder_extract WHERE group_id=? AND user_id=? AND text=?)) "
+        "LIMIT 1",
+        (group_id, group_id, user_id, source_text, group_id, user_id, source_text),
+    ).fetchone()
+    return outbox is not None
+
+
+def _insert_reschedule_log_conn(
+    c: sqlite3.Connection,
+    group_id: str,
+    message_id: str,
+    reminder_id: int,
+    previous: dict,
+    new_action: str,
+    new_remind_at: int,
+) -> None:
+    now = int(_time.time())
+    c.execute(
+        "DELETE FROM reminder_reschedule_log WHERE created_at < ?",
+        (now - _RESCHEDULE_LOG_RETENTION_SECONDS,),
+    )
+    c.execute(
+        "INSERT INTO reminder_reschedule_log(group_id, message_id, reminder_id, "
+        "old_remind_at, new_remind_at, old_action_hash, new_action_hash, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            group_id,
+            message_id,
+            int(reminder_id),
+            int(previous["remind_at"]),
+            int(new_remind_at),
+            reminder_action_hash(str(previous["action"])),
+            reminder_action_hash(new_action),
+            now,
+        ),
+    )
+
+
+def reschedule_generic_reminder(
+    group_id: str,
+    reminder_id: int,
+    *,
+    inbound_message_id: str,
+    expected_action: str,
+    expected_remind_at: int,
+    new_remind_at: int,
+    new_action: str,
+) -> dict:
+    """Atomically move one pending generic reminder for a quoted reschedule.
+
+    ``status`` is one of updated, unchanged, replayed, not_found, not_generic,
+    terminal, conflict, duplicate, collision, busy, delivery_uncertain or
+    unavailable.  Refusals write nothing; updated/unchanged also record the
+    inbound message so a redelivery replays it (``replayed``).  Any natural
+    delivery claim (sending or uncertain) blocks the change: a sender may still
+    deliver the old text, and an uncertain fence must not be dropped.
+    A time change follows update_reminder_schedule: push stages reset,
+    time_kind becomes 'clock' (a later vaguer mention cannot move it) and
+    absorbed merged_details are cleared.
+    """
+    if not group_id or not inbound_message_id:
+        return {"status": "unavailable"}
+    try:
+        reminder_id = int(reminder_id)
+        new_remind_at = int(new_remind_at)
+        new_action = str(new_action)
+        with _lock, _conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            logged = _get_reschedule_log_conn(c, group_id, inbound_message_id)
+            if logged is not None:
+                return {"status": "replayed", "log": logged}
+            row = _get_reminder_conn(c, reminder_id)
+            if row is None or row["group_id"] != group_id:
+                return {"status": "not_found"}
+            if row["source_kind"] or row["source_ref"]:
+                return {"status": "not_generic"}
+            if row["status"] != "pending":
+                return {"status": "terminal"}
+            if row["action"] != str(expected_action) or row["remind_at"] != int(
+                expected_remind_at
+            ):
+                return {"status": "conflict"}
+            claim_states = {
+                str(state[0])
+                for state in c.execute(
+                    "SELECT state FROM reminder_delivery_claims WHERE group_id=? "
+                    "AND delivery_kind='natural' AND subject_ref=? "
+                    "AND state IN ('sending', 'uncertain')",
+                    (group_id, str(reminder_id)),
+                ).fetchall()
+            }
+            if "sending" in claim_states:
+                return {"status": "busy"}
+            if "uncertain" in claim_states:
+                return {"status": "delivery_uncertain"}
+            if _reminder_source_pipeline_busy_conn(
+                c, group_id, row["user_id"], row["source_text"]
+            ):
+                return {"status": "busy"}
+            peers = c.execute(
+                "SELECT action, remind_at FROM reminders WHERE group_id=? "
+                "AND status='pending' AND reminder_id<>?",
+                (group_id, reminder_id),
+            ).fetchall()
+            old_key = _reminder_equivalence_key(row["action"])
+            new_key = _reminder_equivalence_key(new_action)
+            if any(
+                _reminder_equivalence_key(peer[0]) == old_key
+                and abs(int(peer[1]) - row["remind_at"]) <= 60
+                for peer in peers
+            ):
+                return {"status": "duplicate"}
+            time_changed = new_remind_at != row["remind_at"]
+            if not time_changed and new_action == row["action"]:
+                _insert_reschedule_log_conn(
+                    c, group_id, inbound_message_id, reminder_id, row,
+                    new_action, new_remind_at,
+                )
+                return {"status": "unchanged", "reminder": row, "previous": row}
+            if any(
+                _reminder_equivalence_key(peer[0]) in {old_key, new_key}
+                and abs(int(peer[1]) - new_remind_at) <= 60
+                for peer in peers
+            ):
+                return {"status": "collision"}
+            reset = ""
+            if time_changed:
+                reset = ", " + ", ".join(
+                    f"{column}=0" for column in _REMINDER_PUSH_FLAG_COLUMNS
+                ) + ", time_kind='clock', merged_details='[]'"
+            cursor = c.execute(
+                "UPDATE reminders SET action=?, remind_at=?" + reset + " "
+                "WHERE group_id=? AND reminder_id=? AND status='pending' "
+                "AND action=? AND remind_at=? "
+                "AND COALESCE(source_kind, '')='' AND COALESCE(source_ref, '')=''",
+                (
+                    new_action,
+                    new_remind_at,
+                    group_id,
+                    reminder_id,
+                    row["action"],
+                    row["remind_at"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("reminder reschedule compare-and-set failed")
+            if row["source_text"]:
+                c.execute(
+                    "UPDATE pending_reminder_extract SET status='dropped', "
+                    "claimed_at=0, claim_token='' WHERE group_id=? AND user_id=? "
+                    "AND text=? AND status='pending'",
+                    (group_id, row["user_id"], row["source_text"]),
+                )
+            _insert_reschedule_log_conn(
+                c, group_id, inbound_message_id, reminder_id, row,
+                new_action, new_remind_at,
+            )
+            return {
+                "status": "updated",
+                "reminder": _get_reminder_conn(c, reminder_id),
+                "previous": row,
+            }
+    except (OSError, RuntimeError, ValueError, sqlite3.Error):
+        return {"status": "unavailable"}
 
 
 def delete_stale_pending_reminders(
@@ -4671,16 +6188,27 @@ def delete_stale_pending_reminders(
     a user can cancel future notifications without deleting the calendar event.
     """
     import time
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
 
-    cutoff = int(time.time()) - max(0, int(grace_seconds))
+    now = int(time.time())
+    cutoff = now - max(0, int(grace_seconds))
+    today_tw = datetime.fromtimestamp(now, ZoneInfo("Asia/Taipei")).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    contextual_cutoff = int(today_tw.timestamp())
     with _lock, _conn() as c:
         c.execute("BEGIN IMMEDIATE")
         if group_id is not None:
             expired = c.execute(
                 "UPDATE reminders SET status='expired' "
                 "WHERE status='pending' AND group_id=? AND remind_at < ? "
-                "AND source_kind<>'' AND source_ref<>''",
-                (group_id, cutoff),
+                "AND source_kind<>'' AND source_ref<>'' "
+                "AND NOT (source_kind='contextual_date_once' AND remind_at>=?)",
+                (group_id, cutoff, contextual_cutoff),
             ).rowcount
             deleted = c.execute(
                 "DELETE FROM reminders "
@@ -4692,8 +6220,9 @@ def delete_stale_pending_reminders(
             expired = c.execute(
                 "UPDATE reminders SET status='expired' "
                 "WHERE status='pending' AND remind_at < ? "
-                "AND source_kind<>'' AND source_ref<>''",
-                (cutoff,),
+                "AND source_kind<>'' AND source_ref<>'' "
+                "AND NOT (source_kind='contextual_date_once' AND remind_at>=?)",
+                (cutoff, contextual_cutoff),
             ).rowcount
             deleted = c.execute(
                 "DELETE FROM reminders "
@@ -4717,10 +6246,17 @@ def expire_old_reminders(threshold_seconds: int = 86400 * 3) -> int:
         return cursor.rowcount
 
 
-def list_pending_reminders_full(group_id: str | None = None) -> list[dict]:
-    """完整版 list — 含所有 stage flag 給 reminder_push.py 用。"""
+def list_pending_reminders_full(
+    group_id: str | None = None, *, dedupe: bool = True
+) -> list[dict]:
+    """完整版 list — 含所有 stage flag 給 reminder_push.py 用。
+
+    ``dedupe=False`` skips the exact-duplicate cleanup so a caller can read
+    without writing (reminder_push --dry-run).
+    """
     import time
-    delete_duplicate_pending_reminders(group_id)
+    if dedupe:
+        delete_duplicate_pending_reminders(group_id)
     now = int(time.time())
     with _conn() as c:
         if group_id:
@@ -4730,7 +6266,7 @@ def list_pending_reminders_full(group_id: str | None = None) -> list[dict]:
                 "last_pushed_at, weekly_count, "
                 "last_weekly_at, pushed_3d, pushed_1d, "
                 "pushed_4hr, pushed_2hr, pushed_1hr, pushed_now, "
-                "mention_aliases "
+                "mention_aliases, time_kind, merged_details "
                 "FROM reminders WHERE status='pending' AND group_id=? AND remind_at >= ? "
                 "ORDER BY remind_at",
                 (group_id, now - 86400),
@@ -4742,7 +6278,7 @@ def list_pending_reminders_full(group_id: str | None = None) -> list[dict]:
                 "last_pushed_at, weekly_count, "
                 "last_weekly_at, pushed_3d, pushed_1d, "
                 "pushed_4hr, pushed_2hr, pushed_1hr, pushed_now, "
-                "mention_aliases "
+                "mention_aliases, time_kind, merged_details "
                 "FROM reminders WHERE status='pending' AND remind_at >= ? "
                 "ORDER BY remind_at",
                 (now - 86400,),
@@ -4758,6 +6294,8 @@ def list_pending_reminders_full(group_id: str | None = None) -> list[dict]:
             "pushed_4hr": r[14], "pushed_2hr": r[15],
             "pushed_1hr": r[16], "pushed_now": r[17],
             "mention_aliases": _load_mention_aliases(r[18]),
+            "time_kind": r[19],
+            "merged_details": _load_merged_details(r[20]),
         }
         for r in rows
     ]
@@ -4797,6 +6335,181 @@ def mark_reminder_pushed(reminder_id: int, stage: str) -> bool:
         else:
             return False
         return cursor.rowcount == 1
+
+
+def fold_same_event_reminders(primary: dict, peers: list[dict]) -> list[int]:
+    """Fold pending rows of one event into ``primary`` before a push.
+
+    2026-10-04 Andrew「同一件事只留一筆、階段照舊」(P4 item 1).  ``primary``
+    and ``peers`` are the row snapshots reminder_push planned the fold from.
+    In one immediate transaction each peer is re-checked: still pending,
+    unchanged since the snapshot, not a calendar mirror or a 前一天／當天 pair,
+    and with no delivery in flight.  Its words and absorbed details are added
+    to the primary's merged_details (same fragments as the write-time merge),
+    the peer is cancelled, and outbound messages bound to it are re-bound to
+    the primary, so quoting an older push still reaches the reminder that
+    remains.  A peer at the very same time also hands over the stages it
+    already sent (and its last weekly notice), so the same notice is never
+    sent twice for one moment; rows at other times hand over nothing, their
+    stages were about another clock.  Nothing is pushed here.  Returns the
+    folded ids.
+    """
+    group_id = str(primary.get("group_id") or "")
+    primary_id = int(primary["reminder_id"])
+    folded: list[int] = []
+    with _lock, _conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        kept = c.execute(
+            "SELECT action, remind_at, COALESCE(source_text, ''), "
+            "COALESCE(merged_details, '[]'), COALESCE(source_kind, ''), "
+            "COALESCE(source_ref, '') FROM reminders "
+            "WHERE group_id=? AND reminder_id=? AND status='pending'",
+            (group_id, primary_id),
+        ).fetchone()
+        if (
+            kept is None
+            or str(kept[0]) != str(primary.get("action") or "")
+            or int(kept[1]) != int(primary["remind_at"])
+            or kept[4] == "contextual_date_once"
+            or (kept[4] == "calendar_event" and kept[5])
+        ):
+            return []
+        fragments = _load_merged_details(kept[3])
+        known_keys = {item["key"] for item in fragments}
+        own_key = _merged_detail_fragment(str(kept[0]), str(kept[2]))["key"]
+        sent_flags = [0, 0, 0, 0, 0]  # pushed_3d, 1d, 4hr, 2hr, 1hr
+        last_weekly_at = 0
+        for peer in peers:
+            peer_id = int(peer["reminder_id"])
+            if peer_id == primary_id or peer_id in folded:
+                continue
+            row = c.execute(
+                "SELECT action, remind_at, COALESCE(source_text, ''), "
+                "COALESCE(merged_details, '[]'), COALESCE(user_id, ''), "
+                "COALESCE(mention_aliases, '[]'), time_kind, "
+                "COALESCE(source_kind, ''), COALESCE(source_ref, ''), "
+                "pushed_3d, pushed_1d, pushed_4hr, pushed_2hr, pushed_1hr, "
+                "last_weekly_at FROM reminders "
+                "WHERE group_id=? AND reminder_id=? AND status='pending'",
+                (group_id, peer_id),
+            ).fetchone()
+            if row is None:
+                continue
+            if (
+                str(row[0]) != str(peer.get("action") or "")
+                or int(row[1]) != int(peer["remind_at"])
+                or str(row[4]) != str(peer.get("user_id") or "")
+                or _load_mention_aliases(row[5])
+                != _normalize_mention_aliases(list(peer.get("mention_aliases") or []))
+                or row[6] != peer.get("time_kind")
+            ):
+                continue  # changed since the fold was planned
+            if row[7] == "contextual_date_once" or (row[7] == "calendar_event" and row[8]):
+                continue
+            if _delivery_in_flight_conn(c, group_id, peer_id, str(row[0]), int(row[1])):
+                continue
+            for fragment in (
+                _merged_detail_fragment(str(row[0]), str(row[2])),
+                *_load_merged_details(row[3]),
+            ):
+                if (
+                    fragment["key"] == own_key
+                    or fragment["key"] in known_keys
+                    or len(fragments) >= _MERGED_DETAIL_LIMIT
+                ):
+                    continue
+                fragments.append(fragment)
+                known_keys.add(fragment["key"])
+            if int(row[1]) == int(kept[1]):
+                sent_flags = [max(a, int(b or 0)) for a, b in zip(sent_flags, row[9:14])]
+                last_weekly_at = max(last_weekly_at, int(row[14] or 0))
+            folded.append(peer_id)
+        if not folded:
+            return []
+        c.execute(
+            "UPDATE reminders SET merged_details=?, "
+            "pushed_3d=MAX(pushed_3d, ?), pushed_1d=MAX(pushed_1d, ?), "
+            "pushed_4hr=MAX(pushed_4hr, ?), pushed_2hr=MAX(pushed_2hr, ?), "
+            "pushed_1hr=MAX(pushed_1hr, ?), last_weekly_at=MAX(last_weekly_at, ?) "
+            "WHERE reminder_id=? AND status='pending'",
+            (json.dumps(fragments, ensure_ascii=False), *sent_flags, last_weekly_at, primary_id),
+        )
+        marks = ",".join("?" for _ in folded)
+        c.execute(
+            "UPDATE reminders SET status='cancelled' "
+            f"WHERE status='pending' AND reminder_id IN ({marks})",
+            folded,
+        )
+        c.execute(
+            "UPDATE sent_reminder_refs SET reminder_id=?, source_kind=?, source_ref=? "
+            f"WHERE group_id=? AND reminder_id IN ({marks})",
+            (primary_id, str(kept[4]), str(kept[5]), group_id, *folded),
+        )
+    return folded
+
+
+# 2026-10-04: a creation receipt already tells the family about the reminder,
+# so the stage open at that moment (or opening within these minutes) must not
+# follow it as a second message.  "now" is the reminder itself and is never
+# consumed.
+CONSUME_OPEN_STAGE_HORIZON_SECONDS = 20 * 60
+
+
+def consume_open_stages(reminder_ids, now: int | None = None) -> int:
+    """Mark the stages a delivered creation receipt stood in for.
+
+    For each pending reminder in ``reminder_ids``, every ladder stage that is
+    open at ``now`` or opens within the next 20 minutes is recorded as sent:
+    3d/1d/4hr/2hr/1hr set their flag, weekly only sets ``last_weekly_at`` (the
+    weekly counter is untouched).  "now" is never marked.  Idempotent; returns
+    how many stage marks were newly made.  Call it only after LINE accepted
+    the receipt; silent creations (pending drains) must not call it, because
+    the next stage push is then the family's only signal.
+    """
+    import reminder_stages
+
+    ids = sorted({int(rid) for rid in (reminder_ids or []) if rid is not None})
+    if not ids:
+        return 0
+    now = int(_time.time()) if now is None else int(now)
+    placeholders = ",".join("?" for _ in ids)
+    marked = 0
+    with _lock, _conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        c.row_factory = sqlite3.Row
+        rows = c.execute(
+            "SELECT reminder_id, remind_at, source_kind, source_ref, source_text, "
+            "last_weekly_at, pushed_3d, pushed_1d, pushed_4hr, pushed_2hr, "
+            "pushed_1hr, pushed_now FROM reminders "
+            f"WHERE status='pending' AND reminder_id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        for row in rows:
+            row = dict(row)
+            stages = reminder_stages.stages_opening_within(
+                row, now, CONSUME_OPEN_STAGE_HORIZON_SECONDS
+            )
+            for stage in stages:
+                if stage not in reminder_stages.CONSUMABLE_STAGES:
+                    continue
+                if stage == "weekly":
+                    if not reminder_stages.weekly_owed(row.get("last_weekly_at"), now):
+                        continue
+                    cursor = c.execute(
+                        "UPDATE reminders SET last_weekly_at=? "
+                        "WHERE reminder_id=? AND status='pending'",
+                        (now, int(row["reminder_id"])),
+                    )
+                    row["last_weekly_at"] = now
+                else:
+                    column = reminder_stages.FLAG_COLUMNS[stage]
+                    cursor = c.execute(
+                        f"UPDATE reminders SET {column}=1 "
+                        f"WHERE reminder_id=? AND status='pending' AND {column}=0",
+                        (int(row["reminder_id"]),),
+                    )
+                marked += int(cursor.rowcount == 1)
+    return marked
 
 
 # ── Media cache（圖片 / 影片 byte-exact dedup，Phase 1 from §3 chain）────────

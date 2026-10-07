@@ -56,37 +56,15 @@ class _RunKwargs(TypedDict):
     group_id: str | None
 
 
-_RULE_NEWS_CASE = """【新聞 / 案例 / 研究 / 專業議題分享 = 必給觀點 + 多源】（2026-05-04 加，補 23f 在非政治話題的覆蓋）
-觸發：群組分享新聞、案例、研究、報導、文章，或聊到保險、投資、醫療、教育、健康、法律、消費、房地產、AI、詐騙等專業議題；影片標題含「分析 / 評論 / 心得 / 解析」。
-
-bot 必須走「**有想法的查核員**」模式，禁止走「**附和的鄰居**」模式。
-
-❌ 禁止：
-- 「咪寶看到 X」「咪寶覺得這個 X 很 Y」「我看到您分享了 Z」（echo 重述）
-- 「保險選擇要看個人需求」「醫療要看個人狀況」「需要諮詢專業人士」（純附和廢話）
-- 「真的很心疼」「真的很重要」「值得我們深思」「需要重視」（空附和）
-- 只附 1 條來源（user 貼的那條本身不算）
-
-✅ 必含 4 樣（不照順序，但都要有）：
-(i) 第一句直接表態你的 take（具體判斷，不是描述、不是評論）
-    例：「我這邊覺得這份保單條款設計有問題」「這個方法的問題在於樣本太小」
-(ii) 具體事實 ≥ 3 個（法條 / 統計 / 國外做法 / 類似案例 / 量化數字）
-(iii) 至少 3 條來源 URL，不同網域，**不算 user 貼的那條**
-(iv) 結論一句：你權衡完支持 / 反對什麼具體做法
-
-範例（user 貼某保險新聞，bot 應該）：
-「我這邊覺得問題不在『保戶沒看清楚』而在『條款設計刻意模糊』。
-- 金管會 2024 統計：壽險爭議件數中 68% 涉及條款解釋
-- 對比日本：金融廳要求保單條款須通過『一般民眾理解度測試』
-- 台灣金融消費評議中心：去年條款爭議補償率 < 30%
-結論：應推動條款『可讀性審查』機制，光要消費者自己讀不夠。
-來源：
-• 金管會 2024 保險業務統計：https://...
-• 金融消費評議中心年報：https://...
-• 日本金融廳保單揭露指引：https://...」
+_RULE_NEWS_CASE = """【新聞／案例／研究／專業議題】
+先查證實際主張，第一句直接給具體判斷，補充必要事實、風險或可執行建議。
+不要重述貼文、空泛附和、編造數字；保留關鍵條件及不確定性。
+不強制論點數、正反方、來源清單或最低字數。使用者明確要求才展開正反方或列來源。
 """
 
 
+# 新版輸出規格會在 gemini_client 組裝 system instruction 時最後追加，
+# 這裡保留既有常數名稱與偵測 regex，避免破壞 import 相容性。
 # 新聞 / 案例 / 研究 / 專業議題（覆蓋政治以外的「需要觀點」場景）
 _NEWS_CASE_RE = re.compile(
     r"新聞|報導|案例|個案|研究|論文|文章|貼文|"
@@ -145,16 +123,44 @@ def _extract_grounding_urls(response) -> list[tuple[str, str]]:
         return []
 
 
-def _append_sources(text: str, urls: list[tuple[str, str]]) -> str:
-    """若回覆裡還沒有來源網址，就把 grounding URLs 補在結尾。最多附 3 條。"""
-    if not urls:
+def _append_sources(
+    text: str, urls: list[tuple[str, str]], *, user_text: str = ""
+) -> str:
+    """Append available grounding links only for an explicit source request."""
+    if not text.strip() or not urls:
         return text
-    if _URL_IN_TEXT_RE.search(text):
+    # Evaluate request clauses separately so a negated format preference does
+    # not cancel an explicit source request in a later clause.
+    wants_sources = False
+    for clause in re.split(r"[，,。；;!?\n]|\bbut\b", user_text, flags=re.IGNORECASE):
+        if re.search(
+            r"(?:不用|不必|不要|不需|無需)[^，,。；;]{0,8}(?:來源|出處|連結|網址)"
+            r"|\b(?:no|without|omit|exclude|do not|don't|dont)\b.{0,25}\b(?:sources?|citations?|references?|links?)\b",
+            clause, re.IGNORECASE,
+        ):
+            wants_sources = False
+        elif re.search(
+            r"(?:請|給我|提供|列出|附上|附|查看|想看).{0,8}(?:來源|出處|參考資料|網址|連結)"
+            r"|(?:來源|出處)(?:呢|在哪|是什麼|是甚麼)"
+            r"|^\s*(?:來源|出處|參考資料)[？?]?\s*$"
+            r"|\b(?:include|provide|show|list|cite|give|add|attach)\b.{0,20}\b(?:sources?|citations?|references?|links?)\b"
+            r"|\b(?:what|where)\b.{0,8}\b(?:are|is)\b.{0,10}\b(?:sources?|references?)\b"
+            r"|^\s*(?:sources?|citations?|references?)(?:\s+please)?\s*$",
+            clause, re.IGNORECASE,
+        ):
+            wants_sources = True
+    if not wants_sources or _URL_IN_TEXT_RE.search(text):
         return text
-    lines = ["來源："]
-    for uri, title in urls[:3]:
-        lines.append(f"• {title}\n  {uri}" if title else f"• {uri}")
-    return text + "\n\n" + "\n".join(lines)
+    links = []
+    seen = set()
+    for url, title in urls:
+        if not url.startswith(("https://", "http://")) or url in seen:
+            continue
+        seen.add(url)
+        links.append(f"{title.strip() or '來源'} {url}")
+        if len(links) == 3:
+            break
+    return text + "\n\n來源：\n" + "\n".join(links) if links else text
 
 
 def _is_chinese_majority(text: str) -> bool:

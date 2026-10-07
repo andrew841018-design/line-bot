@@ -32,7 +32,7 @@ def test_noncommittal_candidates_are_rejected(source, action):
     [
         ("請提醒我8/2早上9點打球好嗎？", "打球"),
         (
-            "@雅 @哥哥 @測試病患甲 8/8還是15早上你們有空嗎 九點桃園高鐵上皮拉提斯",
+            "@雅 @哥哥 @曾美惠 8/8還是15早上你們有空嗎 九點桃園高鐵上皮拉提斯",
             "桃園高鐵上皮拉提斯",
         ),
         ("8/1 17:00 羽球\n你要不要來？", "羽球"),
@@ -165,9 +165,14 @@ def test_pending_question_is_dropped_before_model_call(monkeypatch, tmp_path):
         outbox_count = c.execute(
             "SELECT COUNT(*) FROM reminder_confirmation_outbox WHERE group_id='G1'"
         ).fetchone()[0]
+        reason = c.execute(
+            "SELECT drop_reason FROM pending_reminder_extract "
+            "WHERE group_id='G1' AND message_id='m-question'"
+        ).fetchone()[0]
     assert status == "dropped"
     assert reminder_count == 0
-    assert outbox_count == 0
+    assert outbox_count == 0  # dropped silently (2026-10-04)
+    assert reason == "invalid_source"
 
 
 @pytest.fixture

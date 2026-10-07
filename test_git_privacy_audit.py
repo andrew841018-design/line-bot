@@ -9,51 +9,85 @@ from jobs import git_privacy_audit as audit
 
 
 def _git(repo: Path, *args: str) -> str:
-    result = subprocess.run(["git", *args], cwd=repo, check=True, text=True, capture_output=True)
-    return result.stdout.strip()
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    return completed.stdout.strip()
 
 
 def _commit(repo: Path, message: str) -> str:
     _git(repo, "add", "-A")
-    _git(repo, "-c", "user.name=Privacy Test", "-c", "user.email=privacy-test@example.invalid", "commit", "-m", message)
+    _git(
+        repo,
+        "-c",
+        "user.name=Privacy Test",
+        "-c",
+        "user.email=privacy-test@example.invalid",
+        "commit",
+        "-m",
+        message,
+    )
     return _git(repo, "rev-parse", "HEAD")
 
 
 def test_forbidden_private_artifact_paths_are_rejected():
-    paths = (
-        "user_aliases.json", "family_roles.local.json", "privacy_terms.local.txt",
-        "pending_dlq.jsonl", "pending_feedback.json",
-        "feedback_state.json", "logs/auto_iterate_20990101.md", "line_bot.db",
-        "event_reminder_private.json", "finetune/data/private.jsonl",
-        "runtime/private.sqlite3", "runtime/private.db-wal",
-    )
-    for path in paths:
-        assert {item.category for item in audit.scan_blob(path, b"safe")} == {"forbidden_path"}
+    for path in (
+        "user_aliases.json",
+        "family_roles.local.json",
+        "privacy_terms.local.txt",
+        "pending_dlq.jsonl",
+        "pending_feedback.json",
+        "feedback_state.json",
+        "logs/auto_iterate_20260904.md",
+        "line_bot.db",
+        "event_reminder_private.json",
+        "finetune/data/private.jsonl",
+        "runtime/private.sqlite3",
+        "runtime/private.db-wal",
+    ):
+        findings = audit.scan_blob(path, b"safe placeholder")
+        assert {finding.category for finding in findings} == {"forbidden_path"}
 
 
 @pytest.mark.parametrize(
     ("content", "category"),
     [
-        (("group=\"C" + "1" * 32 + "\"").encode(), "line_identifier"),
-        (("api_key=\"sk-" + "1" * 24 + "\"").encode(), "credential"),
-        (("phone 09" + "12-345-678").encode(), "phone_number"),
-        (("mail owner@" + "private-domain.tw").encode(), "email_address"),
+        (("group = \"C" + "1" * 32 + "\"").encode(), "line_identifier"),
+        (("api_key = \"sk-" + "1" * 24 + "\"").encode(), "credential"),
+        (("聯絡電話 09" + "12-345-678").encode(), "phone_number"),
+        (("信箱 owner@" + "private-domain.tw").encode(), "email_address"),
         (("2026-" + "11-16 14:30 回診").encode(), "private_schedule"),
         (("媽媽 " + "/".join(("8", "30")) + " 11:00 回診").encode(), "private_schedule"),
         ("參加人：私人姓名甲".encode(), "private_name"),
         (("陳" + "某醫師").encode(), "private_name"),
     ],
 )
-def test_categories_are_detected_without_rendering_values(content: bytes, category: str):
-    findings = audit.scan_blob("sample.txt", content, private_terms={"私人姓名甲"})
-    assert category in {item.category for item in findings}
+def test_sensitive_content_categories_are_detected_without_storing_values(
+    content: bytes,
+    category: str,
+):
+    findings = audit.scan_blob(
+        "sample.txt",
+        content,
+        private_terms={"私人姓名甲"},
+    )
+    assert category in {finding.category for finding in findings}
     rendered = audit.format_summary(findings)
     assert content.decode() not in rendered
     assert "sample.txt" not in rendered
 
 
-def test_synthetic_placeholders_are_allowed():
-    safe = "U_TEST_SENDER\n測試成員甲\n2099-01-01 12:00 測試行程\nprivacy-test@example.invalid\n".encode()
+def test_obvious_test_placeholders_and_example_contacts_are_allowed():
+    safe = (
+        "U_TEST_SENDER\n"
+        "測試成員甲\n"
+        "2099-01-01 12:00 測試行程\n"
+        "privacy-test@example.invalid\n"
+    ).encode()
     assert audit.scan_blob("test_fixture.txt", safe) == []
 
 
@@ -67,19 +101,28 @@ def test_oversized_text_fails_closed():
     assert {item.category for item in findings} == {"oversized_text"}
 
 
-def test_revision_uses_local_private_terms_without_reporting_them(tmp_path: Path):
+def test_scan_revision_loads_private_terms_locally_but_never_reports_them(
+    tmp_path: Path,
+):
     repo = tmp_path / "repo"
     repo.mkdir()
     _git(repo, "init", "-q")
-    (repo / "public.py").write_text('owner="私人姓名甲"\n', encoding="utf-8")
+    (repo / "public.py").write_text('owner = "私人姓名甲"\n', encoding="utf-8")
     _commit(repo, "private name")
-    (repo / "user_aliases.json").write_text('{"U_LOCAL":"私人姓名甲"}\n', encoding="utf-8")
+    (repo / "user_aliases.json").write_text(
+        '{"U_LOCAL_ONLY": "私人姓名甲"}\n',
+        encoding="utf-8",
+    )
+
     findings = audit.scan_revision(repo, "HEAD")
-    assert any(item.category == "private_name" for item in findings)
+
+    assert any(f.category == "private_name" for f in findings)
     assert "私人姓名甲" not in audit.format_summary(findings)
 
 
-def test_push_scans_intermediate_commit_even_when_tip_deleted_leak(tmp_path: Path):
+def test_push_range_scans_intermediate_commits_even_if_tip_removed_the_leak(
+    tmp_path: Path,
+):
     repo = tmp_path / "repo"
     repo.mkdir()
     _git(repo, "init", "-q")
@@ -89,17 +132,27 @@ def test_push_scans_intermediate_commit_even_when_tip_deleted_leak(tmp_path: Pat
     _commit(repo, "leak")
     (repo / "user_aliases.json").unlink()
     tip = _commit(repo, "remove")
-    findings = audit.scan_push_updates(repo, [f"refs/heads/main {tip} refs/heads/main {base}"])
-    assert any(item.category == "forbidden_path" for item in findings)
+
+    findings = audit.scan_push_updates(
+        repo,
+        [f"refs/heads/main {tip} refs/heads/main {base}"],
+    )
+
+    assert any(f.category == "forbidden_path" for f in findings)
 
 
-def test_push_skips_branch_deletion(tmp_path: Path):
+def test_push_range_skips_branch_deletion(tmp_path: Path):
     repo = tmp_path / "repo"
     repo.mkdir()
     _git(repo, "init", "-q")
     (repo / "safe.txt").write_text("safe\n", encoding="utf-8")
     tip = _commit(repo, "base")
-    assert audit.scan_push_updates(repo, [f"(delete) {'0' * 40} refs/heads/main {tip}"]) == []
+    zeros = "0" * 40
+
+    assert audit.scan_push_updates(
+        repo,
+        [f"(delete) {zeros} refs/heads/main {tip}"],
+    ) == []
 
 
 def test_new_remote_branch_does_not_rescan_existing_remote_history(tmp_path: Path):
@@ -116,30 +169,6 @@ def test_new_remote_branch_does_not_rescan_existing_remote_history(tmp_path: Pat
         [f"refs/heads/privacy-clean {tip} refs/heads/privacy-clean {'0' * 40}"],
     )
     assert findings == []
-
-
-def test_index_and_worktree_detect_uncommitted_private_content(tmp_path: Path):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    _git(repo, "init", "-q")
-    (repo / "safe.txt").write_text("safe\n", encoding="utf-8")
-    _commit(repo, "base")
-    (repo / "staged.txt").write_text("phone 09" + "12-345-678\n", encoding="utf-8")
-    _git(repo, "add", "staged.txt")
-    assert any(item.category == "phone_number" for item in audit.scan_index(repo))
-    assert any(item.category == "phone_number" for item in audit.scan_worktree(repo))
-
-
-def test_index_scope_does_not_rescan_unchanged_base_content(tmp_path: Path):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    _git(repo, "init", "-q")
-    (repo / "user_aliases.json").write_text("{}\n", encoding="utf-8")
-    _commit(repo, "legacy base")
-    (repo / "safe.txt").write_text("safe\n", encoding="utf-8")
-    _git(repo, "add", "safe.txt")
-
-    assert audit.scan_index(repo) == []
 
 
 def test_remote_scan_refreshes_and_checks_remote_main(tmp_path: Path):
@@ -161,39 +190,58 @@ def test_remote_scan_refreshes_and_checks_remote_main(tmp_path: Path):
     assert any(item.category == "forbidden_path" for item in findings)
 
 
-def test_cli_output_is_bounded_and_redacted(tmp_path: Path, capsys):
+def test_cli_output_is_bounded_and_contains_no_matching_payload(
+    tmp_path: Path,
+    capsys,
+):
     repo = tmp_path / "repo"
     repo.mkdir()
     _git(repo, "init", "-q")
-    secret = "sk-" + "1" * 24
-    (repo / "leak.txt").write_text(f'token="{secret}"\n', encoding="utf-8")
+    (repo / "leak.txt").write_text(
+        'token="sk-' + "1" * 24 + '"\n',
+        encoding="utf-8",
+    )
     _commit(repo, "leak")
+
     assert audit.main(["--repo", str(repo), "--scope", "head"]) == 1
     output = capsys.readouterr().out
     assert "privacy_audit=failed" in output
-    assert secret not in output and "leak.txt" not in output and len(output) < 500
+    assert "sk-" + "1" * 24 not in output
+    assert "leak.txt" not in output
+    assert len(output) < 500
 
 
-def test_daily_maintenance_runs_all_local_privacy_scopes(monkeypatch):
-    from jobs import daily_line_bot_review as daily
+def test_index_and_worktree_scopes_detect_uncommitted_private_content(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "safe.txt").write_text("safe\n", encoding="utf-8")
+    _commit(repo, "base")
+    (repo / "staged.txt").write_text("聯絡電話 09" + "12-345-678\n", encoding="utf-8")
+    _git(repo, "add", "staged.txt")
 
-    calls = []
-
-    def fake_run(name, command, *, cwd, timeout_s):
-        calls.append((name, command, timeout_s))
-        return daily.CheckResult(name, "passed", "privacy_audit=passed findings=0", 0)
-
-    monkeypatch.setattr(daily, "_run_command", fake_run)
-    results = daily.run_local_checks()
-    privacy = next(item for item in calls if item[0] == "GitHub privacy audit")
-    assert privacy[1].count("--scope") == 3
-    assert privacy[1][-1] == "remote"
-    assert any(item.name == "GitHub privacy audit" for item in results)
+    assert any(f.category == "phone_number" for f in audit.scan_index(repo))
+    assert any(f.category == "phone_number" for f in audit.scan_worktree(repo))
 
 
-def test_pre_push_hook_uses_push_scope():
-    source = (Path(__file__).parent / ".githooks" / "pre-push").read_text(encoding="utf-8")
-    assert "jobs/git_privacy_audit.py" in source and "--scope push" in source
+def test_index_scope_does_not_rescan_unchanged_base_content(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "user_aliases.json").write_text("{}\n", encoding="utf-8")
+    _commit(repo, "legacy base")
+    (repo / "safe.txt").write_text("safe\n", encoding="utf-8")
+    _git(repo, "add", "safe.txt")
+
+    assert audit.scan_index(repo) == []
+
+
+def test_pre_push_hook_invokes_push_scope_without_echoing_stdin():
+    hook = Path(__file__).parent / ".githooks" / "pre-push"
+    source = hook.read_text(encoding="utf-8")
+    assert "jobs/git_privacy_audit.py" in source
+    assert "--scope push" in source
+    assert "set -eu" in source
 
 
 def test_local_role_alias_preserves_runtime_behavior_without_public_name(

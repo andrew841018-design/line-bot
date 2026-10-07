@@ -316,6 +316,18 @@ def should_skip_standard_reminder(e: dict, offset: int) -> bool:
     return bool(cfg and e.get("event_id") in cfg["event_ids"])
 
 
+def standard_sender_owns_event_stage(e: dict, offset: int) -> bool:
+    """Whether the calendar sender owns this date-level stage.
+
+    A timed event's anchor day is intentionally left to the natural reminder
+    mirror, which supplies 4/2/1-hour and at-time delivery. All other day-level
+    offsets, and all-day anchor dates, stay with this sender.
+    """
+
+    lead_days, clock = calendar_db.calendar_event_reminder_anchor(e)
+    return not (clock and offset == lead_days)
+
+
 def build_reminder_message_spec(
     e: dict, offset: int, allow_mention: bool = True
 ) -> dict | None:
@@ -351,6 +363,11 @@ def build_reminder_message_spec(
             }
         if plain_text:
             return {"kind": "text", "text": plain_text, **reminder_ref}
+        return None
+    # This builder is shared by launchd and both reply-token piggyback paths.
+    # Keep the ownership fence here so no caller can emit a date-level message
+    # for a timed anchor day that the natural intraday sender owns.
+    if not standard_sender_owns_event_stage(e, offset):
         return None
     text = _format_event(e, offset)
     safe_text = validate_push_text(text, source="event_reminder")

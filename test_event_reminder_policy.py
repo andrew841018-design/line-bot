@@ -123,6 +123,77 @@ def test_standard_event_all_participants_uses_all_mention(monkeypatch):
     assert spec["fallback_text"].startswith("@all\n")
 
 
+def test_timed_event_day_is_owned_by_natural_intraday_sender(monkeypatch):
+    import event_reminder
+    import reminder_push
+
+    event = _event("E_TIMED")
+    event["event_time"] = "11:00"
+    now = 1_800_000_000
+    mirror = {
+        "remind_at": now + 4 * 3600,
+        "source_kind": "calendar_event",
+        "source_ref": "E_TIMED",
+        "source_text": "皮拉提斯；時間：11:00",
+        "pushed_4hr": 0,
+        "pushed_2hr": 0,
+        "pushed_1hr": 0,
+        "pushed_now": 0,
+        "pushed_1d": 0,
+        "pushed_3d": 0,
+        "last_weekly_at": 0,
+    }
+
+    eligible = [
+        event_reminder.standard_sender_owns_event_stage(event, 0),
+        reminder_push._decide_stage(mirror, now) is not None,
+    ]
+
+    assert eligible == [False, True]
+
+
+def test_all_day_event_day_is_owned_only_by_calendar_sender():
+    import event_reminder
+    import reminder_push
+
+    event = _event("E_ALL_DAY")
+    event["event_time"] = None
+    now = 1_800_000_000
+    mirror = {
+        "remind_at": now + 4 * 3600,
+        "source_kind": "calendar_event",
+        "source_ref": "E_ALL_DAY",
+        "source_text": "家族聚餐；參加人：全家",
+        "pushed_4hr": 0,
+        "pushed_2hr": 0,
+        "pushed_1hr": 0,
+        "pushed_now": 0,
+        "pushed_1d": 0,
+        "pushed_3d": 0,
+        "last_weekly_at": 0,
+    }
+
+    eligible = [
+        event_reminder.standard_sender_owns_event_stage(event, 0),
+        reminder_push._decide_stage(mirror, now) is not None,
+    ]
+
+    assert eligible == [True, False]
+
+
+def test_shared_builder_fences_timed_anchor_day_for_every_sender(monkeypatch):
+    import event_reminder
+
+    monkeypatch.delenv("REMINDER_ASK_EVENT_IDS", raising=False)
+    event = _event("E_TIMED")
+    event["event_time"] = "11:00"
+
+    assert event_reminder.build_reminder_message_spec(event, 0) is None
+
+    event["event_time"] = None
+    assert event_reminder.build_reminder_message_spec(event, 0) is not None
+
+
 def test_standard_event_participant_alias_uses_user_mention(tmp_path, monkeypatch):
     import line_mentions
     import event_reminder

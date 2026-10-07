@@ -18,12 +18,15 @@ import threading
 from pathlib import Path
 from typing import Optional
 
+from config import settings
+from sqlite_security import connect_private_sqlite
+
 logger = logging.getLogger(__name__)
 
 CATEGORIES = ["財經", "健康", "警示", "影片", "行程", "其他"]
 DEFAULT_CATEGORY = "其他"
 
-_DB_PATH = Path(__file__).parent / "line_bot.db"
+_DB_PATH = Path(settings.sqlite_path)
 
 # ── Rule-based patterns（命中即回，省 Gemini 配額）─────────────────────────
 
@@ -167,7 +170,7 @@ def ensure_schema(db_path: Optional[Path] = None) -> None:
         if path_key in _SCHEMA_ENSURED_PATHS:
             return
         try:
-            conn = sqlite3.connect(str(path), timeout=5)
+            conn = connect_private_sqlite(path, timeout=5)
             try:
                 cur = conn.cursor()
                 cur.execute("PRAGMA table_info(raw_messages)")
@@ -201,7 +204,7 @@ def update_category(
     path = db_path or _DB_PATH
     try:
         ensure_schema(path)
-        conn = sqlite3.connect(str(path), timeout=5)
+        conn = connect_private_sqlite(path, timeout=5)
         try:
             conn.execute(
                 "UPDATE raw_messages SET category=? "
@@ -259,7 +262,7 @@ def list_today_in_category(
     path = db_path or _DB_PATH
     try:
         ensure_schema(path)
-        conn = sqlite3.connect(str(path), timeout=5)
+        conn = connect_private_sqlite(path, timeout=5)
         try:
             cur = conn.cursor()
             # created_at 是 unix timestamp（秒）；今天 = 從本地午夜 0 點起
@@ -301,7 +304,7 @@ def today_category_counts(
     path = db_path or _DB_PATH
     try:
         ensure_schema(path)
-        conn = sqlite3.connect(str(path), timeout=5)
+        conn = connect_private_sqlite(path, timeout=5)
         try:
             cur = conn.cursor()
             import time as _time

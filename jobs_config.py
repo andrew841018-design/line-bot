@@ -112,7 +112,7 @@ JOB_REGISTRY["daily-line-bot-review"] = JobSpec(
     cwd=str(_HERE),
     env=_base_env(),
     timeout=420,
-    description="Daily LINE bot lifecycle review and feature suggestion → Discord",
+    description="Daily LINE bot lifecycle review status → Discord",
 )
 
 

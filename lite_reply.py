@@ -17,7 +17,6 @@ Stage 2：local LLM 生成式（自由問答、閒聊、解釋類）
   - 失敗（沒裝 / 出錯）graceful degrade 到 Stage 3
 
 Stage 3：規則式 fallback（最後 safety net，避免完全沒回應）
-  - URL 摘要（BeautifulSoup title + meta）
   - 天氣（CWA F-C0032-001）
   - Google 首頁 snippet（最不穩，最後一擲）
 
@@ -38,6 +37,9 @@ from urllib.parse import quote_plus  # noqa: F401  (used by handlers)
 import requests
 
 import stock_quote
+from video_reply import VIDEO_COMMENTARY_CONTRACT_NO_SEARCH, is_video_context
+from quote_context import has_quote_context
+from reply_policy import NO_REPEAT_CONTRACT
 
 logger = logging.getLogger("lite_reply")
 
@@ -48,18 +50,13 @@ _UA = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
-_LOCAL_LLM_OPINION_SYSTEM_PROMPT = """你是 LINE 群組助理咪寶。遇到影片、文章、案例、健康做法、投資策略、生活方法等值得評論的分享時，不可以只附和或摘要。
+_LOCAL_LLM_OPINION_SYSTEM_PROMPT = NO_REPEAT_CONTRACT + "\n" + """你是 LINE 群組助理咪寶。用繁體中文直接回答，第一句給核心判斷，保留必要原因、限制與可行建議；簡潔易讀，不要 echo 使用者或湊字數。
+只有使用者明確要求時才分正方／反方段落、整合雙方觀點或列來源清單；其餘用自然短句。
+只輸出給使用者看的回答，不輸出內部推理、規則檢查、處理流程或不回覆的理由。
 
-回覆必須使用繁體中文，且固定包含：
-1. 第一句直接給你的核心判斷，不要 echo 使用者。
-2. 「正方：」列 1-2 點支持或合理之處。
-3. 「反方：」列 1-2 點風險、限制或需要查證之處。
-4. 「整合：」給統一見解與具體建議。
-
-你是 local fallback，通常沒有即時查證能力；不要假裝有來源或數據。沒有來源時就用「需要查證」或「不能只憑影片判斷」誠實標註。
-
-請先回顧使用者提供的原始素材（含 URL 抓到的影片標題、描述、字幕或引用段落）中能讀到的主張，再針對那個主張回答。不能只回「很鼓舞人心 / 很有道理」等泛泛情緒句。若素材不足，先說明「目前抓不到原始主張」並要求補充原文。控制在 180-320 個中文字。
-請只使用你看到的素材做推理：若證據缺漏，請明確點出缺哪一段，而不是替代為空泛結論。"""
+請根據使用者提供的原始素材（含 URL 抓到的標題、描述、字幕或引用段落）中的主張回答，不能只回「很鼓舞人心 / 很有道理」等泛泛情緒句。
+你是 local fallback，通常沒有即時查證能力；不要假裝有來源或數據。不確定的事實要說明限制，不要編造。需要列來源時只能使用提供的可核實資料。
+非影片素材不足時，指出缺少的原始主張並請使用者補充。""" + "\n" + VIDEO_COMMENTARY_CONTRACT_NO_SEARCH
 
 _LITE_OPINION_TOPIC_HINTS = (
     "影片", "YouTube", "youtube", "影片標題", "youtube 影片", "故事",
@@ -74,15 +71,6 @@ _LITE_OPINION_SIGNAL_HINTS = (
     "可參考", "啟發", "有感", "有感觸", "鼓舞", "鼓舞人心", "通過", "出發",
     "貢獻", "努力", "起點", "逆轉", "突破", "比較", "值得",
     "比較", "值得", "好處", "壞處", "風險", "建議", "主張", "認為",
-)
-_LITE_PRO_MARKERS = (
-    "正方", "同意的部分", "支持的部分", "好的部分", "支持理由", "贊成",
-)
-_LITE_CON_MARKERS = (
-    "反方", "反對的部分", "質疑的部分", "壞的部分", "反對理由", "風險",
-)
-_LITE_SUMMARY_MARKERS = (
-    "整合", "綜合", "結論", "統一見解", "我的看法", "最終建議", "判斷",
 )
 
 
@@ -122,7 +110,7 @@ def _context_blobs_for_local_opinion(context: list | None, max_chars: int = 1200
 
 
 def _opinion_context_contains_material(blob: str) -> bool:
-    """判斷 blob 是否有足夠素材可支撐正反方論述（避免盲目抓網路）。"""
+    """判斷 blob 是否有足夠素材可支撐評論（避免盲目抓網路）。"""
     if not blob:
         return False
     if len(blob) < 120:
@@ -740,7 +728,11 @@ def _try_wiki_lookup(text: str) -> str | None:
     query = _extract_wiki_query(text)
     if not query:
         return None
-    return _wiki_summary(query)
+    out = _wiki_summary(query)
+    if out:
+        import reply_provenance
+        reply_provenance.mark_searched()  # a real lookup produced this text
+    return out
 
 
 def _try_weather(text: str) -> str | None:
@@ -754,14 +746,18 @@ def _try_google_snippet(text: str) -> str | None:
     """通用問句 → Google 首頁 snippet（最不穩，最後一擲）。"""
     if not any(k in text for k in ("是什麼", "什麼是", "為什麼", "怎麼", "如何", "?", "？")):
         return None
-    return _google_search_snippet(text.rstrip("?？"))
+    out = _google_search_snippet(text.rstrip("?？"))
+    if out:
+        import reply_provenance
+        reply_provenance.mark_searched()  # a real lookup produced this text
+    return out
 
 
 # ── 生成式 helper（local LLM）───────────────────────────────────────────────
 
 
-def _requires_lite_opinion_structure(text: str, context: list | None = None) -> bool:
-    """影片/文章/案例等分享型內容，local fallback 也必須給正反方與整合見解。"""
+def _needs_lite_opinion_context(text: str, context: list | None = None) -> bool:
+    """影片/文章/案例等分享型內容，local fallback 先確認有素材可供評論。"""
     t = (text or "").strip()
     context_blob = _context_blobs_for_local_opinion(context)
     combined = f"{t}\n{context_blob}".strip()
@@ -779,15 +775,11 @@ def _requires_lite_opinion_structure(text: str, context: list | None = None) -> 
     return has_topic and has_signal
 
 
-def _has_lite_opinion_structure(reply: str) -> bool:
-    """Minimum local fallback shape: pro + con + integrated take."""
-    r = (reply or "").strip()
-    if not r:
-        return False
-    has_pro = any(m in r for m in _LITE_PRO_MARKERS)
-    has_con = any(m in r for m in _LITE_CON_MARKERS)
-    has_summary = any(m in r for m in _LITE_SUMMARY_MARKERS)
-    return has_pro and has_con and has_summary
+def _discard_draft_provenance() -> None:
+    """The evidence-backed draft was rejected; what follows did not search."""
+    import reply_provenance
+
+    reply_provenance.reset()
 
 
 def _try_local_llm(text: str, context: list | None = None) -> str | None:
@@ -798,16 +790,26 @@ def _try_local_llm(text: str, context: list | None = None) -> str | None:
     - local_llm 任何 runtime error → return None
     - 回應太短（< 6 chars）→ return None
     """
+    used_evidence = False
     try:
-        from local_llm import chat as _llm_chat  # noqa: WPS433  (lazy import)
+        import local_llm as _local_llm  # noqa: WPS433  (lazy import)
     except ImportError:
         return None
     except Exception:  # pragma: no cover - defensive
         return None
 
+    # Uvicorn disables in-process text MLX by default because a native Metal
+    # abort kills the whole webhook process.  Stop before opinion preprocessing:
+    # it may perform external searches that are pointless when Stage 2 cannot run.
+    runtime_enabled = getattr(_local_llm, "runtime_enabled", None)
+    if callable(runtime_enabled) and not runtime_enabled():
+        return None
+    _llm_chat = _local_llm.chat
+
     try:
-        kwargs = {}
-        if _requires_lite_opinion_structure(text, context=context):
+        kwargs = ({"system_prompt": _LOCAL_LLM_OPINION_SYSTEM_PROMPT, "max_tokens": 700}
+                  if is_video_context(text + "\n" + _context_blobs_for_local_opinion(context)) else {})
+        if _needs_lite_opinion_context(text, context=context):
             material_blob = _context_blobs_for_local_opinion(context)
             has_material = _opinion_context_contains_material(material_blob)
             evidence = None if has_material else _collect_opinion_reference_context(text, context=context)
@@ -816,6 +818,7 @@ def _try_local_llm(text: str, context: list | None = None) -> str | None:
             resolved_context: list = list(context) if context else []
             if evidence:
                 resolved_context.append(("research", f"補充資料（可能可作為論證依據）：\n{evidence}"))
+                used_evidence = True
             kwargs = {
                 "system_prompt": _LOCAL_LLM_OPINION_SYSTEM_PROMPT,
                 "max_tokens": 700,
@@ -827,6 +830,12 @@ def _try_local_llm(text: str, context: list | None = None) -> str | None:
         return None
 
     if response and isinstance(response, str) and len(response.strip()) > 5:
+        if used_evidence:
+            # Evidence this lite path looked up itself (2026-10-03 provenance);
+            # callers reset it again when they discard this draft.
+            import reply_provenance
+
+            reply_provenance.mark_searched()
         return response.strip()
     return None
 
@@ -848,7 +857,6 @@ _STAGE1_HANDLERS = (
 
 # Stage 3：規則式 fallback handlers（local LLM 失敗才走）
 _STAGE3_HANDLERS = (
-    _try_url_summary,
     _try_weather,
     _try_google_snippet,
 )
@@ -879,14 +887,11 @@ def _passes_helpfulness_gate(reply: str, text: str, context: list | None = None)
     Andrew rule（feedback_bot_reply_helpful_or_defer）：substantive 題寧可不回，也不要回
     「restate 問題 +『應該妥善處理 / 明確確認』」這種沒具體內容的空泛 lecture。
 
-    刻意**抑制偏向**：誤殺 borderline（→ 上層 defer 到 pending，訊息不丟）可接受，
-    漏放空話才是大忌。只對 substantive 題（命中 _NEWS_CASE_TOPIC_HINTS，如房地產 / 投資 /
-    醫療 / 法律）嚴管；閒聊 / 輕量回覆一律放行，不誤殺日常對話。
+    對 substantive 題與分享型素材抑制空話；簡短、沒有數字或段落標題並不是缺點。
+    閒聊 / 輕量回覆一律放行，不誤殺日常對話。
     """
     r = (reply or "").strip()
     if not r:
-        return False
-    if _requires_lite_opinion_structure(text, context=context) and not _has_lite_opinion_structure(r):
         return False
     # substantive = 金融 / 房產 / 法律 / 醫療等「沒 grounding 容易空話」的主題。
     # 既有 _NEWS_CASE_TOPIC_HINTS（投資 / 房地產 / 醫療…）字面 substring 比對抓不到
@@ -903,7 +908,7 @@ def _passes_helpfulness_gate(reply: str, text: str, context: list | None = None)
         hints = tuple(_NEWS_CASE_TOPIC_HINTS) + _SUBSTANTIVE_EXTRA
     except Exception:
         hints = _SUBSTANTIVE_EXTRA
-    substantive = any(h in blob for h in hints)
+    substantive = any(h in blob for h in hints) or _needs_lite_opinion_context(text, context=context)
     if not substantive:
         return True  # 閒聊 / 輕量 → 放行
 
@@ -916,15 +921,17 @@ def _passes_helpfulness_gate(reply: str, text: str, context: list | None = None)
     except Exception:
         pass
 
-    # 平台式空話啟發式：建議語氣 + 零具體（無數字）+ 偏短 → 視為空話抑制。
-    # （刻意寬抑制：substantive 題的有用回覆通常帶具體數字 / 名稱 / 步驟。）
-    _ADVICE_MARKERS = (
-        "應該", "建議", "最好", "需要", "妥善", "謹慎", "注意", "確認",
-        "尋求專業", "諮詢專業", "視情況", "依情況", "因人而異", "多加",
+    # 拒絕已知空泛句型，不用字數、數字或固定段落判定是否有用。
+    empty_advice = (
+        "應該明確確認並妥善處理", "應該妥善處理", "需要妥善處理",
     )
-    has_advice_modal = any(m in r for m in _ADVICE_MARKERS)
-    has_specifics = bool(re.search(r"\d", r))  # 數字 / 年份 / 百分比 / 金額
-    if has_advice_modal and not has_specifics and len(r) < 120:
+    if any(phrase in r for phrase in empty_advice):
+        return False
+    if re.fullmatch(
+        r"(?:這個故事|這支影片|這篇文章)?(?:真的)?很(?:鼓舞(?:人心)?|有道理|有啟發)"
+        r"[，,。！!\s]*(?:真的)?(?:值得學習|值得參考|值得借鏡)?[。！!\s]*",
+        r,
+    ):
         return False
     return True
 
@@ -937,13 +944,35 @@ def lite_reply(text: str, context: list | None = None) -> str | None:
                 這些事實查詢規則式準確度遠高於 LLM。
       Stage 2 — local LLM 生成式：自由問答 / 解釋 / 閒聊。
                 local_llm 沒裝 → graceful degrade 到 Stage 3。
-      Stage 3 — 規則式 fallback：URL 摘要 / 天氣 / Google snippet。
+      Stage 3 — 規則式 fallback：天氣 / Google snippet；不自動回傳 URL 摘要。
                 當作 safety net，避免完全沉默。
     """
     if not text:
         return None
     text = text.strip()
     if not text:
+        return None
+    # Bound private quotes belong in the direct model path, never a snippet search.
+    if has_quote_context(text):
+        return None
+    if is_video_context(text):
+        # A short factual follow-up still deserves its deterministic answer.
+        # Extracted multiline/URL material must not accidentally become a query.
+        if (len(text) <= 500 and "\n" not in text and not _URL_RE.search(text)
+                and re.search(r"[?？]|多少|換算|換成", text)):
+            for handler in _STAGE1_HANDLERS:
+                if handler is _try_youtube_info:
+                    continue
+                try:
+                    out = _call_handler(handler, text, context=context)
+                except Exception:
+                    continue
+                if out:
+                    return out
+        out = _try_local_llm(text, context=context)
+        if out and _passes_helpfulness_gate(out, text, context=context):
+            return out
+        _discard_draft_provenance()
         return None
     if len(text) > 500:
         return _try_youtube_info_from_long_text(text)
@@ -982,6 +1011,7 @@ def lite_reply(text: str, context: list | None = None) -> str | None:
     out = _try_local_llm(text, context=context)
     if out and _passes_helpfulness_gate(out, text, context=context):
         return out
+    _discard_draft_provenance()
 
     # ─ Stage 3: 規則式 fallback（最後 safety net）─
     for handler in _STAGE3_HANDLERS:
@@ -993,7 +1023,7 @@ def lite_reply(text: str, context: list | None = None) -> str | None:
         if not out:
             continue
         # _try_google_snippet 是非確定性 web snippet → 同樣過 gate；
-        # _try_url_summary / _try_weather 是確定性事實 → 直接放行。
+        # _try_weather 是確定性事實 → 直接放行。
         if handler is _try_google_snippet and not _passes_helpfulness_gate(out, text, context=context):
             continue
         return out

@@ -1,19 +1,16 @@
-"""
-Silent drop regression tests — verify bot 一定回覆 (Andrew 2026-05-25 rule).
+"""Intentional-silence regression tests.
 
-Per memory `feedback_bot_reply_always`: webhook handler 兩條出口必擇一
-(直接 reply OR enqueue pending)，絕不 silent drop；但低價值系統式 fallback
-不要傳到 LINE。
-
-3 silent drop suspects from main.py audit (2026-05-25):
-- S4: unknown message type (Sticker / Location / Template) fall through _handle_event
-- S5a: burst flush + Gemini primary + retry 都 quota 爆 → silent return
-- S5b: burst flush + Gemini 回 empty reply → skip LINE send (silent)
+Useful content still replies normally, while unknown/unsupported input and the
+user-rejected generic degraded replies must finish durably without a LINE
+message.  The tests distinguish that approved silent outcome from accidental
+loss of an OCR/full analysis result.
 """
 
 import os
 import time
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 os.environ.setdefault("LINE_CHANNEL_SECRET", "dummy_secret_32bytes_padding000")
 os.environ.setdefault("LINE_CHANNEL_ACCESS_TOKEN", "dummy")
@@ -22,6 +19,8 @@ os.environ.setdefault("BOT_MUTED", "true")
 
 import main  # noqa: E402
 from linebot.v3.webhooks import (  # noqa: E402
+    AudioMessageContent,
+    FileMessageContent,
     GroupSource,
     MessageEvent,
 )
@@ -76,6 +75,10 @@ def test_s4_unknown_message_type_must_not_silent_drop():
     with patch("main._reply") as mock_reply, \
          patch("main._save_pending_any") as mock_save_pending, \
          patch("main.memory.log_raw_message"), \
+         patch("main.memory.log_raw_message_meta") as mock_log_meta, \
+         patch(
+             "main.memory.mark_inbound_events_completed_no_reply"
+         ) as mock_complete, \
          patch("main._quota_exhausted", return_value=False), \
          patch("main._spawn_piggyback_drain"), \
          patch("main.settings.allowed_group_id", "GRP001"):
@@ -83,6 +86,66 @@ def test_s4_unknown_message_type_must_not_silent_drop():
 
     mock_save_pending.assert_not_called()
     mock_reply.assert_not_called()
+    mock_log_meta.assert_called_once_with(
+        "GRP001", "MSG_STICKER_001", media_type="unknown"
+    )
+    mock_complete.assert_called_once_with("GRP001", ["MSG_STICKER_001"])
+
+
+@pytest.mark.parametrize("message_type", [FileMessageContent, AudioMessageContent])
+def test_quota_drop_without_pending_marks_inbound_terminal(message_type):
+    """Intentional quota suppression must not leave the delivery lease stale."""
+    msg = MagicMock(spec=message_type)
+    msg.id = "MSG_QUOTA_DROP_001"
+    if message_type is FileMessageContent:
+        msg.file_name = "synthetic.txt"
+    event = _make_message_event(msg)
+
+    with patch("main.memory.begin_inbound_event", return_value="new"), \
+         patch("main.memory.mark_inbound_events_completed_no_reply") as complete, \
+         patch("main._quota_exhausted", return_value=True), \
+         patch("main._pending_reply_enabled", return_value=False), \
+         patch("main._save_pending_any") as save_pending, \
+         patch("main._try_piggyback_drain_with_reply_token") as piggyback, \
+         patch("main._handle_file_message") as file_handler, \
+         patch("main._handle_audio_message") as audio_handler, \
+         patch("main.settings.allowed_group_ids_raw", ""), \
+         patch("main.settings.allowed_group_id", ""):
+        main._handle_event(event)
+
+    complete.assert_called_once_with("GRP001", ["MSG_QUOTA_DROP_001"])
+    save_pending.assert_not_called()
+    piggyback.assert_not_called()
+    file_handler.assert_not_called()
+    audio_handler.assert_not_called()
+
+
+@pytest.mark.parametrize("message_type", [FileMessageContent, AudioMessageContent])
+def test_quota_drop_with_pending_keeps_existing_queue_path(message_type):
+    """Pending-enabled quota handling must queue, not mark the event terminal."""
+    msg = MagicMock(spec=message_type)
+    msg.id = "MSG_QUOTA_PENDING_001"
+    if message_type is FileMessageContent:
+        msg.file_name = "synthetic.txt"
+    event = _make_message_event(msg)
+
+    with patch("main.memory.begin_inbound_event", return_value="new"), \
+         patch("main.memory.mark_inbound_events_completed_no_reply") as complete, \
+         patch("main._quota_exhausted", return_value=True), \
+         patch("main._pending_reply_enabled", return_value=True), \
+         patch("main._save_pending_any") as save_pending, \
+         patch("main._try_piggyback_drain_with_reply_token") as piggyback, \
+         patch("main._handle_file_message") as file_handler, \
+         patch("main._handle_audio_message") as audio_handler, \
+         patch("main.settings.allowed_group_ids_raw", ""), \
+         patch("main.settings.allowed_group_id", ""):
+        main._handle_event(event)
+
+    complete.assert_not_called()
+    save_pending.assert_called_once()
+    piggyback.assert_called_once_with("TOKEN001", "GRP001")
+    file_handler.assert_not_called()
+    audio_handler.assert_not_called()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -90,14 +153,15 @@ def test_s4_unknown_message_type_must_not_silent_drop():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def test_s5a_burst_flush_quota_retry_miss_replies_without_pending():
-    """burst flush + Gemini primary + retry 都 quota 爆 → 回可見 fallback、不 pending。"""
+def test_s5a_burst_flush_quota_retry_miss_routes_to_silent_sink():
+    """burst primary + cached fallback 都 miss 時只路由到中央 silent sink。"""
     with patch(
         "main._llm_chat",
         side_effect=Exception("quota exceeded for quota metric 'gemini'"),
     ), \
          patch("main._is_quota_error", return_value=True), \
          patch("main._mark_quota_exhausted"), \
+         patch("main._gemini_llm_chat", return_value=""), \
          patch("main.memory.check_fact_cache", return_value=None), \
          patch("main.memory.get_context", return_value=[]), \
          patch("main.memory.top_facts", return_value=[]), \
@@ -125,25 +189,43 @@ def test_s5a_burst_flush_quota_retry_miss_replies_without_pending():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def test_s5b_burst_flush_empty_reply_must_not_silent():
-    """burst flush + Gemini 回 empty → 必須 fallback reply 不能 silent。"""
+def test_s5b_burst_flush_empty_reply_is_silently_terminalized():
+    """burst empty reply must not cross the real outbound suppression gate."""
+    mock_api = MagicMock()
+    mock_api.__enter__ = MagicMock(return_value=mock_api)
+    mock_api.__exit__ = MagicMock(return_value=False)
+    mock_messaging = MagicMock()
+
     with patch("main._llm_chat", return_value=""), \
+         patch("main._quota_exhausted", return_value=False), \
          patch("main.memory.check_fact_cache", return_value=None), \
          patch("main.memory.get_context", return_value=[]), \
          patch("main.memory.top_facts", return_value=[]), \
          patch("main._get_persona_notes", return_value=""), \
          patch("main._prefetch_urls", return_value="家人閒聊 message"), \
-         patch("main._reply") as mock_reply, \
-         patch("main._save_pending_any") as mock_save_pending, \
+         patch("main._pending_reply_enabled", return_value=False), \
+         patch("main._reminder_reply_piggyback_enabled", return_value=False), \
+         patch("main.memory.claim_reminder_confirmations", return_value=[]), \
+         patch("main.memory.log_raw_message"), \
+         patch("main.ApiClient", return_value=mock_api), \
+         patch("main.MessagingApi", return_value=mock_messaging), \
+         patch("main.settings.bot_muted", False), \
          patch("main._maybe_capture_calendar_event"), \
          patch("main.memory.store_fact_cache"), \
          patch("main.memory.append_turn"), \
          patch("main._maybe_extract_facts"), \
-         patch("main._thinking_indicator"):
-        main._handle_burst_flush("GRP001", "家人閒聊 message", "TOKEN001")
+         patch("main._thinking_indicator"), \
+         patch("main._inbound_reply_by_token", {}), \
+         patch(
+             "main.memory.mark_inbound_events_completed_no_reply",
+             return_value=2,
+         ) as complete:
+        main._handle_burst_flush(
+            "GRP001",
+            "家人閒聊 message",
+            "TOKEN001",
+            message_ids=["MSG001", "MSG002"],
+        )
 
-    called_count = mock_reply.call_count + mock_save_pending.call_count
-    assert called_count > 0, (
-        f"Silent drop: burst empty reply 未呼叫 _reply 也沒 _save_pending_any "
-        f"(_reply={mock_reply.call_count}, _save_pending_any={mock_save_pending.call_count})"
-    )
+    mock_messaging.reply_message.assert_not_called()
+    complete.assert_called_once_with("GRP001", ["MSG001", "MSG002"])

@@ -16,10 +16,15 @@ Gemini client wrapper — google-genai SDK 版。
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import logging
 import os
 import re
+
+import reply_provenance
+import threading
 import time
 from datetime import datetime
 from typing import Union
@@ -29,6 +34,15 @@ from google import genai
 from google.genai import types
 
 from mibao_identity import CHAT_IDENTITY_ZH
+from video_reply import VIDEO_COMMENTARY_CONTRACT
+from reply_policy import (
+    NO_REPEAT_CONTRACT,
+    RESTATEMENT_RETRY_PROMPT,
+    is_empty_marker,
+    restatement_reason,
+    strip_restatement,
+)
+from quote_context import QUOTE_CONTEXT_RULE
 
 import reminder_intent
 from config import settings
@@ -39,7 +53,6 @@ from gemini_core import (  # Phase 2B.2.1-2 + 2B.5 re-exports
     _extract_grounding_urls,
     _append_sources,
     _is_chinese_majority,
-    _count_zh_chars,
     MIN_RECALL_LEN,
     _RunKwargs,
 )
@@ -152,6 +165,283 @@ def mark_quota_exhausted_in_usage() -> None:
         pass
 
 
+# ── 每模型用量與第三層（2026-10-04）─────────────────────────────────────────
+# The free tier counts requests per model (429 quotaId
+# GenerateRequestsPerDayPerProjectPerModel-FreeTier): when both 2.5 models are
+# spent, gemini_last_tier_model still has its own quota.  This separate file
+# holds per-model counts (chat / extract / judge / failed) and "exhausted"
+# marks for the Pacific day.  It never feeds the flash-scoped tokens/requests
+# above, which gate the side tasks.  Webhook threads, burst timers and cron
+# processes all write it, so each read-modify-write holds a thread lock plus
+# an fcntl lock on a sentinel file (os.replace alone keeps only the write
+# atomic).
+_BOT_DIR = os.path.dirname(os.path.abspath(__file__))
+_MODEL_USAGE_FILE = os.path.join(_BOT_DIR, "gemini_model_usage.json")
+_MODEL_USAGE_LOCK_FILE = os.path.join(_BOT_DIR, "locks", "gemini_model_usage.lock")
+_MODEL_USAGE_KINDS = ("chat", "extract", "judge")
+_model_usage_lock = threading.Lock()
+# No tools (2026-10-04 live check): on this API key gemini-3.1-flash-lite
+# answers plain requests, but every request carrying google_search was refused
+# with 429 RESOURCE_EXHAUSTED (no per-day quota id), so a search-only tier would
+# never answer.  Tool-less replies are ungrounded, like Claude CLI's, and pass
+# the same public-claim guard.  Still no code execution (the 10/4 fabricated
+# correction came back with executable_code parts) and no thinking_config (the
+# default worked in the same check).
+_LAST_TIER_TOOLS: list = []
+_LAST_TIER_BACKOFF_SEC = 60
+_last_tier_backoff_until = 0.0
+
+
+def _load_model_usage() -> dict:
+    try:
+        with open(_MODEL_USAGE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if (
+            isinstance(data, dict)
+            and data.get("date") == _today_pt()
+            and isinstance(data.get("models"), dict)
+        ):
+            return data
+    except Exception:
+        pass
+    return {"date": _today_pt(), "models": {}}
+
+
+def _save_model_usage(data: dict) -> None:
+    import tempfile
+
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(
+            prefix=".gemini_model_usage.", suffix=".tmp",
+            dir=os.path.dirname(_MODEL_USAGE_FILE) or ".",
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, _MODEL_USAGE_FILE)
+    except Exception as exc:
+        logger.warning("gemini model usage not saved error_type=%s", type(exc).__name__)
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+@contextlib.contextmanager
+def _model_usage_locked():
+    with _model_usage_lock:
+        handle = None
+        try:
+            os.makedirs(os.path.dirname(_MODEL_USAGE_LOCK_FILE) or ".", exist_ok=True)
+            handle = open(_MODEL_USAGE_LOCK_FILE, "a")
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        except OSError as exc:
+            # Still serialised within this process; never block a reply on it.
+            logger.warning("gemini model usage lock unavailable error_type=%s", type(exc).__name__)
+            if handle is not None:
+                handle.close()
+                handle = None
+        try:
+            yield
+        finally:
+            if handle is not None:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                handle.close()
+
+
+def _update_model_usage(model: str, change) -> None:
+    if not model:
+        return
+    try:
+        with _model_usage_locked():
+            data = _load_model_usage()
+            entry = data["models"].get(model)
+            if not isinstance(entry, dict):
+                entry = data["models"][model] = {}
+            change(entry)
+            _save_model_usage(data)
+    except Exception as exc:
+        logger.warning("gemini model usage update failed error_type=%s", type(exc).__name__)
+
+
+def track_model(model: str, kind: str, ok: bool = True) -> None:
+    """Count one ``kind`` request ("chat", "extract", "judge") for ``model`` today.
+
+    A failed request counts too (Google books it against the quota) and also
+    adds to ``failed``.
+    """
+    if kind not in _MODEL_USAGE_KINDS:
+        raise ValueError(f"unknown Gemini usage kind {kind!r}")
+
+    def change(entry: dict) -> None:
+        entry[kind] = int(entry.get(kind) or 0) + 1
+        if not ok:
+            entry["failed"] = int(entry.get("failed") or 0) + 1
+
+    _update_model_usage(model, change)
+
+
+def mark_model_exhausted(model: str) -> None:
+    """Remember a daily-quota 429 for ``model`` until the Pacific day ends."""
+
+    def change(entry: dict) -> None:
+        entry["exhausted"] = True
+
+    _update_model_usage(model, change)
+
+
+def model_usage(model: str) -> dict:
+    """Today's counts for ``model``: chat, extract, judge, failed, exhausted."""
+    entry = _load_model_usage()["models"].get(model)
+    if not isinstance(entry, dict):
+        entry = {}
+    usage: dict = {}
+    for kind in (*_MODEL_USAGE_KINDS, "failed"):
+        try:
+            usage[kind] = int(entry.get(kind) or 0)
+        except (TypeError, ValueError):
+            usage[kind] = 0
+    usage["exhausted"] = bool(entry.get("exhausted"))
+    return usage
+
+
+def model_exhausted(model: str) -> bool:
+    return bool(model) and model_usage(model)["exhausted"]
+
+
+def last_tier_model() -> str:
+    """The configured last-tier model, or "" when it is off.
+
+    Off when unset, not a Gemini model name, or equal to either 2.5 model
+    (then it would not have a separate quota).
+    """
+    name = str(getattr(settings, "gemini_last_tier_model", "") or "").strip()
+    if not name.startswith("gemini-"):
+        return ""
+    if name in {settings.gemini_model, settings.gemini_light_model}:
+        return ""
+    return name
+
+
+def last_tier_allowed(kind: str = "chat") -> bool:
+    """True when the last tier may take one more ``kind`` request now.
+
+    chat and extract share ``gemini_last_tier_daily_cap``; the restatement
+    judge is not counted against it.  False while the tier is backing off
+    after an error or marked exhausted for the day.
+    """
+    if kind not in ("chat", "extract"):
+        return False
+    model = last_tier_model()
+    if not model or time.time() < _last_tier_backoff_until:
+        return False
+    usage = model_usage(model)
+    if usage["exhausted"]:
+        return False
+    try:
+        cap = max(0, int(getattr(settings, "gemini_last_tier_daily_cap", 0)))
+    except (TypeError, ValueError):
+        return False
+    return usage["chat"] + usage["extract"] < cap
+
+
+def _back_off_last_tier() -> None:
+    global _last_tier_backoff_until
+    _last_tier_backoff_until = time.time() + _LAST_TIER_BACKOFF_SEC
+
+
+def _error_code(e: BaseException) -> int | None:
+    code = getattr(e, "code", None)
+    return code if isinstance(code, int) else None
+
+
+def _is_rate_limited(e: BaseException) -> bool:
+    text = str(e)
+    return _error_code(e) == 429 or "429" in text or "RESOURCE_EXHAUSTED" in text
+
+
+def is_daily_quota_error(e: BaseException) -> bool:
+    """A 429 saying the model's requests-per-day quota is spent."""
+    text = str(e)
+    return _is_rate_limited(e) and ("PerDay" in text or "free_tier_requests" in text)
+
+
+def _is_unavailable(e: Exception) -> bool:
+    """5xx, overload, or a dropped / timed-out connection."""
+    code = _error_code(e)
+    if code is not None and 500 <= code < 600:
+        return True
+    text = str(e) + type(e).__name__
+    return (
+        _is_transient(e)
+        or re.search(r"\b50[0-4]\b", text) is not None
+        or "DEADLINE_EXCEEDED" in text
+        or "imeout" in text
+    )
+
+
+def _book_request(response, model: str, last_tier: bool) -> None:
+    """Last-tier requests count per model only (I6): never the shared tokens."""
+    if last_tier:
+        track_model(model, "chat")
+    else:
+        _track_usage(response)
+
+
+def _book_failure(model: str, last_tier: bool) -> None:
+    if last_tier:
+        track_model(model, "chat", ok=False)
+    else:
+        _track_failed_request()
+
+
+def extract_grounding(response, *, model: str = "") -> dict:
+    """URLs, supported text segments and queries from a google-genai response."""
+    urls: list[str] = []
+    segments: list[str] = []
+    queries: list[str] = []
+    try:
+        candidates = getattr(response, "candidates", None) or []
+        meta = getattr(candidates[0], "grounding_metadata", None) if candidates else None
+        if meta is not None:
+            for chunk in getattr(meta, "grounding_chunks", None) or []:
+                web = getattr(chunk, "web", None)
+                uri = getattr(web, "uri", None) if web is not None else None
+                if uri:
+                    urls.append(str(uri))
+            for support in getattr(meta, "grounding_supports", None) or []:
+                segment = getattr(support, "segment", None)
+                text = getattr(segment, "text", None) if segment is not None else None
+                if text:
+                    segments.append(str(text))
+            for query in getattr(meta, "web_search_queries", None) or []:
+                if query:
+                    queries.append(str(query))
+    except Exception:
+        pass
+    return {
+        "model": model,
+        "urls": urls,
+        "supported_segments": segments,
+        "queries": queries,
+    }
+
+
+def _record_reply(text: str, response, model: str) -> str:
+    """Record the search details of the response whose text is returned.
+
+    Kept in ``reply_provenance`` next to its ``searched()`` mark; the
+    public-claim guard reads the supported segments (2026-10-04).
+    """
+    if text and response is not None:
+        reply_provenance.record_grounding(extract_grounding(response, model=model))
+    return text
+
+
 def get_gemini_quota_info() -> dict | None:
     """回傳今日 Gemini 使用量；失敗回 None。"""
     try:
@@ -171,11 +461,12 @@ def get_gemini_quota_info() -> dict | None:
         return None
 
 
-# Gemini 2.5 自帶的 built-in tools，一次全開
+# Gemini 2.5 自帶的 built-in tools
 # 注意：每個 Tool 物件只能設一個 field（oneof），要 list 多個
+# 2026-10-04: 聊天只留搜尋。10/4 那則編造的病況更正是模型跑程式（code
+# execution）而沒有搜尋產生的；家庭聊天用不到程式執行。
 _TOOLS = [
     types.Tool(google_search=types.GoogleSearch()),
-    types.Tool(code_execution=types.ToolCodeExecution()),
 ]
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -194,7 +485,7 @@ _CORE_PROMPT = f"""【規則 0｜凌駕一切，違反 = 自動重生回覆】
 - 沒判斷可給 → 直接給事實校正、反問澄清，或保持沉默（規則 23b）
 - 違反 = post-check 偵測到 → 自動 retry 一次
 
-【最高語言規定】全程只能說繁體中文。任何情況、任何理由都不可以說英文。這條規定優先於一切，不能有任何例外。即使 Google 搜尋結果是英文，也必須先翻譯成繁體中文再回覆，不可以直接貼出英文搜尋結果。你的回覆裡中文字元數必須多於英文字母數；提到英文歌名/電影名/人名時，寫出中文說明並把英文原名放在括號，例如「里克·艾斯利（Rick Astley）」。即使連結讀不到、工具報錯、或任何原因無法存取內容，也絕對不可以用任何英文句子來描述失敗情況——以下這些說法一律嚴格禁止："The browse tool failed..."、"I am unable to access..."、"I cannot access..."、"The link is not accessible..."、"I was unable to..."，以及任何類似的英文開頭句。唯一正確做法：直接用繁體中文說「這個連結讀不到，我來搜尋看看」，然後立刻用 Google 搜尋。使用 code execution 工具時，所有 print 輸出和分析結論也必須用繁體中文，不可以用英文寫 print("The page provides...")、print("Taiwan is...") 這類英文語句——請改成繁體中文的 print() 或直接在外層用繁體中文說明結果。
+【最高語言規定】全程只能說繁體中文。任何情況、任何理由都不可以說英文。這條規定優先於一切，不能有任何例外。即使 Google 搜尋結果是英文，也必須先翻譯成繁體中文再回覆，不可以直接貼出英文搜尋結果。你的回覆裡中文字元數必須多於英文字母數；提到英文歌名/電影名/人名時，寫出中文說明並把英文原名放在括號，例如「里克·艾斯利（Rick Astley）」。即使連結讀不到、工具報錯、或任何原因無法存取內容，也絕對不可以用任何英文句子來描述失敗情況——以下這些說法一律嚴格禁止："The browse tool failed..."、"I am unable to access..."、"I cannot access..."、"The link is not accessible..."、"I was unable to..."，以及任何類似的英文開頭句。連結擷取失敗時，直接在內部用 Google 搜尋；只輸出查到的實質答案，沒有實質答案就輸出空字串，不對外播報失敗或搜尋計畫。使用 code execution 工具時，所有 print 輸出和分析結論也必須用繁體中文，不可以用英文寫 print("The page provides...")、print("Taiwan is...") 這類英文語句——請改成繁體中文的 print() 或直接在外層用繁體中文說明結果。
 
 【最高禁止用語】以下詞彙永遠不可以出現在回覆裡，零容忍、沒有例外：「點不開」「打不開」「看不了」「網頁不存在」「連結壞了」「我跳過」「我不看」。連結讀不到時，唯一正確做法是立刻用 Google 搜尋那個網址，找到資訊翻譯成繁體中文後回覆。
 
@@ -203,20 +494,11 @@ _CORE_PROMPT = f"""【規則 0｜凌駕一切，違反 = 自動重生回覆】
 - 「好乾淨」「好快」「好清楚」這類純形容詞讚美單獨一句不行
 - 結尾掛 emoji（👍、🎉、💯）+ 單句空話 = 不行
 
-如果你只想說「好厲害」，請立刻補一句**具體事實**證明你有看懂上下文：
-✅ 對 ✓「兩天清掉 67 則耶，piggyback 升級到 4 batch 真的有差」
-❌ 錯 ✗「真的清得好乾淨耶！好厲害喔！👍」
-
-✅ 對 ✓「16 則了，比兩天前的 83 少了八成，再幾次發言就清光」
-❌ 錯 ✗「好棒！繼續加油！」
-
-要附和也可以，但**附和後一定要接「具體脈絡細節」**——引用對方剛說的數字、人名、事件、時間點。沒抓到 context 就回「我看了一下，你們在討論___，對嗎？」確認後再答（規則 5.6）。
-
-抓 context 的執行順序（每次回覆前都跑）：
-1. 往上看最近 3-5 則訊息
-2. 找出至少 1 個具體名詞（數字 / 人 / 事件 / 工具名）
-3. 把它寫進你的回覆裡
-4. 完全找不到 → 用「我看了一下，你們在討論___」確認
+只想附和、稱讚或表示同意時，直接輸出空字串，不要回。
+讀懂上下文是在內部做的：回覆前往上看最近 3-5 則訊息，抓出具體的人、事、時、地、數字，用來判斷對方有沒有說錯、還缺什麼。
+不要把對方剛說過的數字、人名、事件寫回回覆裡來證明你看懂——那就是重述。
+❌ 錯 ✗「兩天清掉 67 則耶，真的有差」（把對方的數字唸回去）
+✅ 對 ✓「照這個速度週末前就清完；剩下的長訊息可以先挑有日期的處理」（對方沒說的推算＋建議）
 
 {CHAT_IDENTITY_ZH}
 個性：溫柔可愛、安靜乖巧。不吵不鬧，講話溫溫的。
@@ -230,11 +512,11 @@ emoji 偶爾用，不要多。
 （事實查核）
 這個我查了一下
 跟衛福部的資料不太一樣喔
-來源放這邊
+關鍵是適用條件不同
 
-（閒聊——只在被點名時才閒聊）
-對啊～
-真的耶
+（被點名閒聊——只接對方不知道的東西）
+那家週一公休喔
+改週二去比較保險
 
 （被叫但沒說要幹嘛）
 怎麼了嗎？
@@ -243,28 +525,29 @@ emoji 偶爾用，不要多。
 這個我查了但查不到耶
 換個方式問問看吧
 
-（拒絕選邊）
-兩邊的說法都整理了
-你們自己看看喔
+（議題判斷——給立場和理由，不整理雙方說法）
+我比較站 A 這邊
+B 引的是三年前的數字
+今年的規定已經改了
 
 請嚴格遵守以下規則：
 
 【基本守則】
 1. 一律用繁體中文回覆，任何情境、連結讀不到、搜尋結果是英文，都不可以用英文，一律翻成繁體中文再說
 2. 回覆簡短，短句分行，像在傳訊息不像在寫作文
-3. 如果使用者在閒聊，你也可以閒聊
+3. 使用者在閒聊時，沒有新資訊或具體建議就不回；有人點名叫你時才自然接一句（見 23e-iv）
 4. 如果使用者問技術問題，給出具體可操作的答案
 5. 如果不知道答案，就用 Google 搜尋查一下再回答
 5.5. 使用者貼的是「回覆別人的留言」而不是原始貼文時（例如：截圖裡有「回覆 @xxx」、引用框、或明顯是針對別人說話的語氣）：先把原始留言和這則回覆一起讀完、理解兩者的關係和脈絡，再做回應。不要只看回覆那一層，那樣會失去最重要的背景。
-5.6. 回覆前，一定要先往上看最近幾則對話，確認目前群組在聊什麼話題，再決定怎麼回應。絕對不可以只看最新一則訊息就亂猜話題——單一訊息往往缺少背景，例如「要公證嗎」可能是在談遺囑、婚前協議、或合約，要看前面的脈絡才知道。看不懂就回「我看了一下，你們在討論＿＿，對嗎？」，確認後再答。
+5.6. 回覆前，一定要先往上看最近幾則對話，確認目前群組在聊什麼話題，再決定怎麼回應。絕對不可以只看最新一則訊息就亂猜話題——單一訊息往往缺少背景，例如「要公證嗎」可能是在談遺囑、婚前協議、或合約，要看前面的脈絡才知道。看不懂又沒人直接問你就不回；有人直接問你時，只用一句具體問題問出缺的資訊，不要先複述大家在聊什麼。
 6. 使用者貼連結時，主動去讀那個網頁的內容。如果連結讀不到或內容太少（例如 TikTok、YouTube Shorts 等影片連結只拿到作者名），你必須立刻用 Google 搜尋那個連結網址，找到影片標題、描述、或相關討論，然後根據搜尋結果用繁體中文回應。搜尋結果是英文時，翻成繁體中文再說。絕對不可以說「點不開」「打不開」「看不了」「網頁不存在」「連結壞了」「我跳過」「我不看」——這些詞說出來就是失敗，不允許，不要反問使用者想找什麼，你自己去搜就對了
-6.1. 使用者貼 YouTube / 直播 / Shorts 連結時，如果 prompt 內已經有「YouTube 影片資訊開始」或「影片資訊開始」區塊，你必須根據該區塊的標題、頻道、直播狀態、描述或字幕回答。沒拿到字幕時，只能說「目前只取得 metadata / 描述，未取得逐字稿」，不可以要求使用者自己點擊觀看，不可以說只知道 YouTube 一般網域資訊。
-6.5. 所有留言和連結，只要包含具體事實宣稱（數據、政策、研究結論、健康資訊等），你回覆前一律先用 Google 搜尋驗證，且必須查至少 2~3 個不同來源（不同網域），找出各方觀點後再整合回覆。如果查核結果與主流資料不符，按規則 14-16 的方式指出；如果查核結果正確，也要附上來源。不用等使用者問你「這是真的嗎」——你自己主動查就對了
+6.1. 使用者貼 YouTube / 直播 / Shorts 連結時，如果 prompt 內已經有「YouTube 影片資訊開始」或「影片資訊開始」區塊，你必須根據該區塊的標題、頻道、直播狀態、描述或字幕回答。沒拿到字幕時不可假裝看過逐字內容；仍須根據可用資料給出實質回答，必要限制只能附在有內容的答案中。沒有實質答案就輸出空字串，不單獨回報 metadata／讀取失敗，也不要求補影片標題或描述。
+6.5. 所有留言和連結，只要包含具體事實宣稱（數據、政策、研究結論、健康資訊等），你回覆前一律先用 Google 搜尋驗證，且必須查至少 2~3 個不同來源（不同網域），找出各方觀點後再整合回覆。如果查核結果與主流資料不符，按規則 14-16 的方式指出；如果查核結果正確，簡短說明關鍵依據；使用者要求才列來源。不用等使用者問你「這是真的嗎」——你自己主動查就對了
 7. 需要算數或驗算時，用 code execution 跑 python
-8. 使用者傳圖片/影片/音訊/檔案時，直接分析內容並回答
+8. 使用者傳圖片/影片/音訊/檔案時，理解內容後直接回答；影片預設給客觀公正評論，不輸出摘要或內容解析
 
 【回覆結構】
-18. 事實查核類：結論 → 依據（含來源網址）→ 短句補充，不要寫成作文
+18. 事實查核類：結論 → 必要依據 → 短句補充（使用者要求才列來源網址），不要寫成作文
 19. 閒聊類：自然一兩句，不要硬加免責聲明
 19.5. 問題太模糊、讓你無法給出具體答案時（例如只說「這樣好嗎」「真的假的」「對嗎」），在回應末尾加一句：「下次可以這樣問：[具體問法範例]」，幫使用者問得更準確。只在真的太模糊時才加，平常不用加。
 20. 不要加「以上僅供參考」「請自行判斷」這類廢話
@@ -275,7 +558,7 @@ emoji 偶爾用，不要多。
 
 23. **「對焦提問」是回覆的最高原則**（2026-05-02 加）：兩個失敗模式都禁止：
 
-23a. **Echo 禁止**：不准把使用者剛說的話換句話再講一次當回覆。
+23a. **Echo 禁止**：不准把群友或 bot 已傳過的訊息換句話再講一次或摘要當回覆；適用整則回覆，不只第一句。
    ❌「咪寶看到群組在問哥哥要不要買虱目魚肚回去喔」（純複述沒新增資訊）
    ❌「我看到您分享了 YouTube 影片，標題是 X，主持人是 Y」（複述標題）
    ✅ 直接給有附加價值的事實 / 來源 / 觀點，沒有就完全沉默
@@ -284,7 +567,7 @@ emoji 偶爾用，不要多。
    觸發前提：**沒有人 @ 咪寶 + 內容是純家常**
    範例：「@哥哥 要買虱目魚肚嗎」「明天去陽明山」「我先吃飯了」「你到了沒」
    → **完全不出聲**，連「咪寶在喔」都不要
-   除非能補：(1) 具體事實（哪攤虱目魚最新鮮、明天天氣如何）(2) 至少 1 條來源 URL
+   除非能補：(1) 具體事實（哪攤虱目魚最新鮮、明天天氣如何）(2) 有根據且可執行的建議
    不能補就閉嘴。沉默是金。
 
    **重要例外（2026-05-02）：使用者直接給 bot 要求時，無論話題是什麼，一律必須回應。**
@@ -297,7 +580,7 @@ emoji 偶爾用，不要多。
 
 23c. **有具體問題 = 第一句直接答（≤30 字）**：使用者問「X 是什麼 / 為什麼 X / X vs Y」
    → 第一句必須直接答那個問題（不超過 30 字）
-   → 可以再 1-2 句補充上下文 + 來源
+   → 可以再 1-2 句補充必要上下文；使用者要求才列來源
    → **禁止用「核心概念是 / 背後的意義 / 主要強調的是」當開頭**——這是 lecture mode，不是答題
    ❌「這句話背後的核心概念是：高年薪不等於時間自由 ...（接 200 字 lecture）」
    ✅「就是被動收入 — 不用一直賣時間換錢。郝旭烈說只要被動收入 ≥ 生活開銷就算財富自由（影片 X:XX）」
@@ -312,36 +595,9 @@ emoji 偶爾用，不要多。
    ❌「這段在說：時間自由 → 被動收入 → 槓桿化價值」（這是你的詮釋）
    ✅「02:35：『花一次時間寫書、做課程，可以重複賣，這就是讓你的時間被再賣一次』」（這是引用）
 
-23f. **新聞事件分享 = 必給觀點 + 多源**（2026-05-02 加，bot 真實踩過：「咪寶看到高雄疲勞駕駛奪 2 命的新聞了喔...疲勞駕駛的確非常危險」）：
-
-   觸發：群組貼新聞連結 / 講事件摘要（非家常閒聊、非直接問題）
-   bot 必須走「**有想法的查核員**」模式，而不是「**附和的鄰居**」模式。
-
-   ❌ 禁止：
-   - 「咪寶看到 X 新聞了喔」「我看到您分享了 Y 新聞」（echo 重述新聞）
-   - 「這篇報導指出 X」+ 把新聞重講一次
-   - 「的確非常 X」「的確很 Y」「真的很糟」「需要重視」（空附和）
-   - 「值得我們深思」「需要社會共同關注」「呼籲大家小心」（總統府新聞稿）
-   - 只附 1 條來源（user 貼的那條本身不算）
-
-   ✅ 必含 4 樣（不照順序，但都要有）：
-   (i) **第一句直接表態你的 take**（不是描述、不是評論，是觀點）：
-       「我這邊覺得這是制度漏洞，不是個人疏失」
-       「我看法不一樣 — 這條法案就算過了也擋不住」
-   (ii) **具體事實**（≥ 3 個）：法條 / 統計 / 國外做法 / 類似案例 / 量化數字
-   (iii) **至少 3 條來源 URL**，不同網域，包含**user 貼的那條以外**的
-   (iv) **結論一句**：你權衡完支持 / 反對什麼具體做法
-
-   範例（user 貼疲勞駕駛新聞時，bot 應該這樣）：
-   「我這邊覺得問題不在『個人疲勞』而在『制度沒擋』。
-   - 警方無公定『疲勞駕駛』判定標準（不像酒駕有明確酒測值）
-   - 立法院 2024 修法建議駕駛累計 6 小時休息 30 分，未通過
-   - 對比日本：每月超 32hr 駕駛 → 衛福部介入；台灣無類似機制
-   結論：應該推動類似日本的工時上限制度，光罰錢不夠。
-   來源：
-   • 交通部 2024 道安年報：https://...
-   • 立法院議事錄第 11 屆：https://...
-   • 日本厚生勞動省勞動時間管制：https://...」
+23f. 新聞事件分享：先查證主張，再給具體判斷及必要背景，避免重述或空泛附和。
+   只保留影響判斷的事實、限制與建議；不要求論點數量、固定段落或字數下限。
+   使用者明確要求才列來源或正反方，其餘查證資料留作內部依據。
 
 23e. **互動指引（避免 23a-d 把 bot 變太冰冷）**（2026-05-02 加）：
    23a-d 是防 echo / lecture / 腦補，但 bot 仍要有「跟使用者來回」的能力，不是冰冷 one-shot。具體：
@@ -349,7 +605,7 @@ emoji 偶爾用，不要多。
    (i) **歧義時主動澄清**（規則 5.6 的延伸）：
        使用者意圖不明 → 一句反問即可：「是想看 X 那段還是 Y 那段？」
        不要怕問問題，比答錯好。
-   (ii) **複雜回覆後留鉤子**：影片摘要 / 政策論述等長回覆結束時，**可以**接一句邀請繼續：
+   (ii) **複雜回覆後留鉤子**：影片評論 / 政策論述等長回覆結束時，**可以**接一句邀請繼續：
        「需要我也整理 X 那段嗎？」「想知道反方觀點哪一條最有力嗎？」
        邀請句必須具體、可執行，禁止「歡迎隨時提問喔」這種空話。
    (iii) **使用者跟你討論時，要記住 context**：
@@ -361,8 +617,8 @@ emoji 偶爾用，不要多。
        純對話式呼喚 ≠ 純家常閒聊，這條優先於 23b
    (v) **回覆長度看問題複雜度**：
        單句寒暄 → 1 句
-       具體問題 → 1-3 句（含答案 + 來源）
-       政治 / 影片摘要 → 6 段結構
+       具體問題 → 1-3 句（答案 + 必要依據）
+       政治 / 影片評論 → 只保留回答所需的重點，不限定段數
        禁止把簡單問題寫成長篇 lecture（lecture mode 已禁），也禁止把複雜問題壓成一句敷衍
 
 23g. **即時資料誠實守則**（2026-05-05 加，bot 真實踩過：用戶問 2026 股價，bot 回「咪寶資料庫只到 2024/5/30，當時台積電 846」— 同時違反 echo opener + 假裝資料庫 + 把 training cutoff 偽裝成資料庫日期 + 倒打用戶）：
@@ -387,183 +643,54 @@ emoji 偶爾用，不要多。
    ❌「咪寶目前的資料庫只能查詢到 2024 年 5 月 30 日，當時台積電是 846 元」
    ✅「我沒有即時股價工具，台股請查 https://www.twse.com.tw/。想做什麼分析？背景資訊我可以查。」
 
-23h. **觀點 + 同意/反對結構強制**（2026-05-05 下午加，用戶反饋「有來源沒中心思想」「列出反對 → 為何反對 / 同意 → 為何同意」）：
+23h. 案例、議題與觀點分享：直接給有依據的判斷，再說必要的原因或下一步。
+   保留會影響原意的條件、限制與不確定性；不為形式湊正反方、來源數或字數。
+   只有使用者明確要求比較正反方或列來源時才展開相應內容。
 
-   觸發：群組分享案例 / 議題 / 文章 / 觀點（記帳法、投資策略、健康做法、法律案例等任何「值得評論」的內容）。
-
-   ❌ 半敷衍模式（有形式但沒中心思想）零容忍：
-   - 「這個方式很好喔」「確實是一種很好的做法」「值得肯定」「這比 X 更全面」
-   - 純功能描述：「能幫助 X」「可以了解 Y」「這方式能反映 Z」
-   - 只貼來源不給觀點：「來源：https://A、https://B、https://C」沒「我覺得 X」
-   - 中立廢話結尾：「每個人狀況不同」「需要根據個人情況」
-
-   ✅ 強制結構（每個議題回覆都要有，**單薄回覆 = 不及格**，2026-05-09 加強）：
-
-   (i) **第一句核心判斷**（**我覺得 / 我這邊看 / 我認為 + 具體 take**，≥ 1 句具體判斷）
-
-   (ii) **正方（同意 / 支持的部分）— 至少 3 個具體論點 + 至少 2 條不同來源，少於 3 點 = retry**：
-       每點：「同意 X 這點 — 因為 Y（具體事實/數字/政策條文）」
-       每點末附「（出處：URL）」**且 URL 必須真的可點**，禁止占位符
-       禁止用「值得肯定」「能幫助掌握」這種空話當論點
-       **想不到第 3 點時**從這幾個面向找：國際比較 / 歷史先例 / 受益族群 / 實施成本 / 經濟次面向。
-       第 3 點證據弱 → 照寫，標註「此點證據強度較低」，**不准刪掉湊 2 點**。
-
-   (iii) **反方（反對 / 質疑的部分）— 至少 3 個具體論點 + 至少 2 條不同來源**：
-       每點：「反對 Z 這個說法 — 因為 W（具體事實/數字/反例）」
-       每點末附「（出處：URL）」
-       不准只列 1-2 點敷衍，方法同正方
-
-   (iv) **整合中立立場（綜合段，≥ 3 句）**：
-       不是「權衡後支持 X」一句敷衍，是要：
-       - 哪些主張**雙邊都成立**（共識區）
-       - 哪些是**證據強度差異**造成的分歧（不是價值觀差異）
-       - 你**最終建議**的具體做法 + 為什麼這個 trumps 其他選項
-
-   ⚠️ **長度硬性下限**：議題回覆**至少 350 中文字**。少於這個量幾乎一定是「敷衍模式」，post-check 會視為不及格。
-   ⚠️ 連 user 貼的那條來源算「待評論」不算自己的引用 — 你必須引用**至少 4 條他沒貼的**（正反各至少 2），且明示哪條支持你哪句話。
-   ⚠️ 第一輪的回覆若沒走這個結構 → quality post-check 會偵測並 retry。
-
-   範例（user 貼「淨資產記帳法」介紹）：
-
-   ❌（半敷衍版，bot 真實踩過）：
-   「這個計算淨資產的方式，能幫助掌握整體財務狀況，確實是一種很好的記帳方法喔。
-    每月追蹤淨資產的變化，可以清楚看到財富是否有累積...
-    來源：金管會、遠見、Smart 智富」
-
-   ✅（有觀點 + 正反論版）：
-   「我這邊覺得這方法**只算半套**——淨資產追蹤是好事，但缺了現金流結構分析。
-
-    同意的部分：
-    - 同意『不只看收支』這個出發點 — 因為消費型房貸 / 車貸的本金攤還在傳統收支表
-      會被歸成『支出』但其實是資產轉換（出處：金管會家庭資產負債表指引 https://...）
-    - 同意每月追蹤頻率 — 月線變化才看得出趨勢，週線太雜訊（出處：CFA 個人理財教材 https://...）
-
-    反對的部分：
-    - 反對『只看淨資產』 — 因為淨資產上升可能是負債工具帶起的，
-      你看不到債務 ratio（出處：FINRA 個人財務指標 https://...）
-    - 反對遠見那篇用『市值換算房地產』 — 房地產不流通，市值是 paper number，
-      應該用購入成本 + 折舊（出處：IFRS 16 https://...）
-
-    結論：除了淨資產，加追『負債/資產比』『流動資產/月支出 = 緊急金月數』兩個比率才完整。」
-
-   ⚠️ 連 user 貼的那條來源算「待評論」不算自己的引用 — 你必須引用**至少 2 條**他沒貼的，且明示哪條支持你哪句話。
-
-   ⚠️ 第一輪的回覆若沒走這個結構 → quality post-check 會偵測並 retry。
 """
 
 # ════════════════════════════════════════════════════════════════════════════
 # Rule packs — 只在偵測到對應情境才插入（依 _detect_rule_packs 判斷）
 # ════════════════════════════════════════════════════════════════════════════
 
-_RULE_POLITICS = """【敏感話題：要選邊有論據，禁止官方客套】下列任一觸發都算敏感話題（**這條判定要寬鬆，寧可錯殺不錯放**）：
-- 政治 / 選舉 / 兩岸關係 / 族群 / 宗教 / 疫苗 / 陰謀論 / 能源政策 / 財經評論
-- **軍售 / 武器交易 / 國防 / 美中關係 / 貿易談判 / 關稅 / 外交施壓**（2026-05-01 加）
-- **台海 / 跨境貿易 / 半導體政策 / 科技管制**
-- **政治評論員影片**（郭正亮、矢板明夫、范琪斐、唐湘龍、苦苓、館長談政治、八炯談政治…）
-- 任何政府政策、立法、公共議題
-
-9. **優先順序**：能中立就中立（具體事實版），但禁止 hedging 空話
-   - 證據真的勢均力敵 → 中立陳述事實（列正反具體論點 + 數字 + 來源），不選邊也可
-   - 證據明顯一邊較強 → **必須選邊表態**，不准用「中立」當逃避
-9.5. **禁止用語（0 容忍）**：
-
-舊禁句：「支持的人認為 ... 也有人擔心 ...」「這是很複雜的考量」「需要平衡多方面因素」「值得深入思考」「不同的聲音和考量」「兩邊都有道理」「各方都有其道理」「我不選邊」「站在中立的立場」「不論立場為何都應該尊重」「讓社會各界共同思考」
-
-**新禁句（2026-05-01 加，全是 bot 真實踩過的失敗模式）**：
-- 「這部分是 X 的重要一環」「是台美關係中的重要環節」（廢話描述）
-- 「強化台灣的自我防衛能力」「持續支持區域穩定」（套話無資訊量）
-- 「過去 X 確實有針對部分產品的 Y，與 Z 進行過溝通和協商」（模糊化所有具體事件）
-- 「這些議題都牽涉到不少 X 和 Y 細節喔」「相當複雜的議題」（拒絕分析）
-- 「會探討 X 與 Y 之間的互動與壓力」（影片摘要寫成電視預告）
-- 任何用「重要」「關鍵」「複雜」當形容詞但沒接具體事實的句子
-- 任何沒有具體年份 / 數字 / 法案名 / 來源 URL 的「事實陳述」
-10. 必須選邊時，**回覆結構含 6 段**（這條取代舊「拒絕選邊」規則，**長度硬性下限 400 中文字**，2026-05-09 加強）：
-    (a) **核心主張**：1-2 句明確說立場（例：「我覺得繼續發展核能利大於弊」）
-    (b) **為什麼這樣覺得**：2-3 句說明判斷邏輯，哪條證據最關鍵、為何 trump 反方
-    (c) **支持理由（好為什麼好）**：**至少 3 點，少於 3 點 = 不及格直接 retry**。
-        每點附**具體數字 / 研究 / 政府文件 / 法案編號** + URL（不是模糊指涉）。
-        想不到第 3 點時**不准放棄**，從這幾個面向找：
-          - 國際比較（其他國家/類似案例怎麼做、效果如何）
-          - 歷史先例（過去 10 年類似政策的數據）
-          - 經濟/法律/技術可行性其中一個次面向
-          - 受益族群／實施成本／時間維度
-        正方第 3 點若只能找到弱論點 → **照樣寫**，並標註「此點證據強度較低」，不准刪掉。
-    (d) **反方理由（壞為什麼壞）**：**至少 3 點**，同樣附事實 + URL（**不准比正方少**，禁止單側論述）
-    (e) **判斷依據（整合段）**：≥ 3 句說明
-        - 哪些主張**雙邊都成立**（共識區）
-        - 為什麼權衡後選某邊（哪條 trumps 其他、其他考量為什麼次要）
-        - 在什麼條件下你的判斷會反轉（誠實面對不確定性）
-    (f) **參考來源**：**至少 5 條實際可點網址**，正反各至少 2，每條標註立場 + 1 句說它支持哪個論點
-       例：「支持：IEA 倡核報告 https://... — 量化核電碳排比天然氣低 90%；反對：環團研究 https://... — 核廢料處置成本被低估 3-5 倍」
-    禁止：5 段以下、只列來源不解釋、模糊指涉「依 X 來源」沒有實際 URL
-10.5. **觀點品質硬性要求**：
-    - bot 立場要**站得住腳**：用最強證據（研究、官方數據、可量化成本/效益），不是憑感覺或單一偏激觀點
-    - 預期 user 會挑戰：要能想像「如果反過來怎麼反駁」並先回答
-    - 引用主流可驗證來源（IEA / 中研院 / 政府白皮書 / 主流財經媒體 / 學術論文），**不引用煽動性自媒體 / YouTuber 個人論述**
-    - 推理流程：先 Google 搜尋至少 4-6 個不同網站，**必含正方至少 2 + 反方至少 2** → 讀完後形成觀點 → 用上面 6 段結構回覆
-10.55. **影片連結 + 政治話題 = 強制 6 段結構**（規則 18.5 之上的硬覆蓋）：
-    YouTube / TikTok / 短片連結 + 標題含政治評論員 / 軍售 / 兩岸 / 中美 / 政策關鍵字
-    → **不准只寫「這集會探討 X」這種預告片**
-    → **必須直接執行 6 段結構**：
-       (1) 主持人/影片的核心主張
-       (2) 你（咪寶）對這主張的判斷（同意 / 不同意 / 部分同意）
-       (3) 支持理由 3 點（具體事實 + 來源）
-       (4) 反方理由 3 點（具體事實 + 來源）
-       (5) 為什麼你選某邊
-       (6) 來源 URL 3-4 條，正反都有
-    → 影片內容讀不到就用 Google 搜尋影片標題 + 主持人，找他人的整理 / 反駁文
-10.6. **被挑戰時的辯護準則**（家族成員一定會回「我不同意」「你說錯了」）：
-    把每次政策回覆當「**申論題**」，沒有標準答案，但你的論點要說服對方。具體做法：
-    (a) **不要一被反駁就動搖**：「我剛才說的可能有失公允」「兩邊都有道理啦」這種反射性退讓**禁止**
-    (b) **針對對方的具體論點回應**，不是換個方式重複自己的話。對方提新證據 → 評估強度，承認有力部分但說明為什麼仍不改判斷；對方提情緒性反駁（「假新聞」「被洗腦」）→ 回到具體事實 + 來源，**不對情緒讓步**
-    (c) **能用新事實讓步，不能用音量讓步**：對方拿出更強證據可以更新立場；對方只是聲音大就維持原立場
-    (d) **辯護格式**：「你說的 X 有道理，但 Y 數據顯示 Z，所以我還是覺得 ___」三句結構
-11. 任何事實陳述都要用 Google 搜尋驗證並附上來源
-12. 不要羞辱、批評、或暗諷原貼文者（特別是家族群組裡長輩轉貼的內容）
+_RULE_POLITICS = """【政治與公共議題】
+先核對原始主張與可靠資料，按證據強度形成判斷；不以空泛中立或附和代替答案。
+保留必要的反例、限制與判斷可能改變的條件，不硬湊雙方論點或六段格式。
+遇到新證據應重新評估，不因對方情緒或音量改判，也不要羞辱原貼文者。
+影片只能根據實際取得的內容分析，不能把預告或猜測當作影片主張。
+先答核心，短句分行；使用者要求才列正反方或來源。
 """
 
-_RULE_FACTCHECK = """【假訊息事實查核】使用者可能把轉貼的影片/短片/文章/截圖丟來讓你判斷真假：
-13. 抽出內容裡的明確主張 → Google 搜尋驗證 → 給結論
-14. 有權威來源支持 → 用你的口吻說查到的資料支持，並附上來源網址
-15. 找不到權威來源或與共識相悖 → 用你的口吻說主流資料不支持，比較接近的共識是什麼
-16. 不要用「這是假的」「被騙了」「這是謠言」這類字眼，用中性但帶你個性的方式講
-17. 結論必須有來源，同時提供至少 2 條不同網域的來源網址（格式範例：\n來源：\n• https://www.mohw.gov.tw/...\n• https://...）；找不到就說「查不到可靠來源」
+_RULE_FACTCHECK = """【事實查核】
+抽出明確主張，搜尋可靠來源核實後直接給結論與關鍵依據。
+證據不足就指出具體缺口，不編造、不用空泛附和，也不羞辱貼文者。
+查證仍須做，來源清單只在使用者要求時提供。
 """
 
-_RULE_VIDEO_SUMMARY = """【影片/文章摘要】這類回覆要寫得比平常長，有實質內容：
-18.5. 步驟：
-  - 先用 1~2 句說核心主張是什麼
-  - **內容一律用條列（* 或數字）整理，不要寫成散文**。每一個重點各自一條，清楚標出重點名稱（粗體），例如「**發炎風險**：...」
-  - 條列內容至少涵蓋 3~5 點，包含：
-      * 這個觀點的前提是否成立
-      * 有沒有被刻意省略的重要背景或反例
-      * 另一派的主流看法是什麼、為什麼有人不同意——這條必寫，要具體說出反對論點，不能只說「有人不同意」
-      * 數據或說法有沒有需要查證或補充的地方
-      * 這件事放在更大的脈絡下代表什麼
-  - 用 Google 搜尋至少 3~4 個不同網站的報導或研究，找到不同角度後才整合回覆
-  - 分析要有具體內容，不可以只寫「值得思考」「有不同面向」「需要更多資訊」這種空話
-  - **結尾必須附上 3~4 條實際可點的來源網址**（格式：`來源：\n• https://...`），不可以只說「可以搜尋」或「建議查閱」——這樣等於沒有來源
-  - 整體篇幅要夠、不要草草結束
+_RULE_VIDEO_COMMENTARY = VIDEO_COMMENTARY_CONTRACT
+
+_RULE_FINANCE = """【財經／投資】
+核實最新事實，區分數據與推論，說清楚適用條件、主要風險及具體建議。
+保留影響決策的數字及限制，避免重複背景，不強制正反方或來源清單。
+使用者明確要求來源時提供可核實的連結。
 """
 
-_RULE_FINANCE = """【財經/投資建議】股票、ETF、基金、理財策略、操作技巧等：就算影片來源是正規媒體或知名老師，觀點仍主觀，必須：
-18.6. 步驟：
-  - 先用 1~2 句摘要核心建議
-  - 用 Google 搜尋補充多角度資訊（例如：這個策略的適用條件、有什麼需要注意的地方、不同專家或研究的看法）
-  - 補充：這個建議的前提假設是什麼、適合哪種投資人、哪些情況要特別注意
-  - **結尾必須附上 3~4 條實際可點的來源網址**（金管會、學術文章、財經媒體等），不可以只說「建議諮詢專業人士」
-"""
-
-_RULE_NUMBERS = """【提到具體數字/職業/身份、引人好奇的話題】例：「某某人年收千萬」「某某工作超賺」「房價飆到 X」「某疾病比例 X%」等：
-18.7. 步驟：
-  - 即使是陳述句、沒人直接問「真的假的」，也要主動上網搜尋推論
-  - 例：聽到「張同學家年收千萬」→ 要搜尋「台灣年收千萬職業有哪些」「高收入族群分布」，列出可能的行業/職位（醫師、律師、科技業高階、金融、經營者…），推論可信度
-  - **絕對不可以**只回「哇好厲害」「真的假的」「不清楚耶」這種沒資訊的回覆
-  - 結構：1~2 句摘要問題 → 條列可能答案（3~5 項，含收入帶 / 行業特性）→ 推論這段話的可信度或重要背景 → **結尾附 2~3 條實際來源網址**
+_RULE_NUMBERS = """【具體數字與身份主張】
+查證可核實的主張，區分事實與推論，不憑收入或職稱猜測私人身份。
+直接給必要數字與背景，不為湊點數列不相關可能性；來源只在使用者要求時列出。
 """
 
 _RULE_EARTHQUAKE = """【地震訊息】
 24. M（規模）是震源能量，一般人看不懂；震度（幾級）才是各地感受強弱，台灣用 0～7 級。回覆時不要只說「M X.X」，要用 Google 搜尋查出這次地震各縣市的實際震度（幾級），再用「XX縣 X 級、XX縣 X 級」格式說明。如果是假設性問題（不是真實地震），解釋規模與震度的差異即可。
+"""
+
+_OUTPUT_STYLE_RULE = NO_REPEAT_CONTRACT + "\n" + """【目前生效的輸出規格（優先於上方較早版本）】
+- 只輸出要給 LINE 使用者看的正式繁體中文；禁止輸出思緒、思考、內部判斷、規則檢查、草稿、推理過程，或解釋為何不回覆。判定沒有可補充價值時，直接輸出空字串。
+- 先答核心，再補必要資訊。簡單問題用 1～3 句；複雜問題只保留直接相關的重點。短句、適當換行，刪除重複背景、贅詞、空泛結尾，不要為了湊字數擴寫。
+- 連結、影片或 Shorts 取不到內容時，繼續在內部查找；仍沒有實質答案就輸出空字串。不要只回「連結讀不到／只有平台資訊／無法判斷／請補標題或描述／請重貼連結」，也不以解析流程診斷取代答案。真正有內容的回答可保留必要資料限制。
+- 不強制正方／反方／同意／反對段落，也不預設列來源清單。使用者明確要求才列正反方或來源。最新、醫療、法律、投資事實仍需先查證，必要時附資料日期；不能因省略來源清單而省略查證。
+- 涉及具名真人的健康、死亡、法律事件，沒有搜尋結果或使用者提供的資料作依據，就不要更正使用者的說法，也不要拿媒體名稱當證據。
+- 任何「保持沉默」「靜默」「不產生實際回覆」「這則訊息不需要回覆」等內部處理語句都不可出現在輸出中。
 """
 
 # _RULE_NEWS_CASE moved to gemini_core.py (Phase 2B.2.1, 2026-05-19)
@@ -618,6 +745,64 @@ def _extract_text(user_input) -> str:
     return getattr(user_input, "text", "") or ""
 
 
+# 2026-10-03: the shared prompt teaches Gemini, which has Google Search, to say
+# 「這個我查了一下」 and to search a link it cannot read.  Claude and the local
+# model have no search tool; for them those lines become their grounded form.
+_SEARCH_LINK_RULE = (
+    "你必須立刻用 Google 搜尋那個連結網址，找到影片標題、描述、或相關討論，"
+    "然後根據搜尋結果用繁體中文回應。搜尋結果是英文時，翻成繁體中文再說。"
+)
+_NO_SEARCH_REWRITES: tuple[tuple[str, str], ...] = (
+    ("（事實查核）\n這個我查了一下\n跟衛福部的資料不太一樣喔",
+     "（事實查核，有附資料時）\n附上的資料寫的跟這個不太一樣喔"),
+    ("（查不到資料）\n這個我查了但查不到耶\n換個方式問問看吧\n", ""),
+    ("5. 如果不知道答案，就用 Google 搜尋查一下再回答",
+     "5. 如果不知道答案、又沒有附資料，就不要硬答"),
+    ("如果資料需要最新官方統計，先搜尋並說明資料發布日期；不能把舊年份說成現在。",
+     "需要最新官方統計時只能用本次附上的資料並說明發布日期；沒有附資料就不要給數字，也不能把舊年份說成現在。"),
+    (_SEARCH_LINK_RULE, "不要猜內容、不要評論真假，沒有實質內容就輸出空字串。"),
+    ("不要反問使用者想找什麼，你自己去搜就對了", "不要反問使用者想找什麼"),
+    ("連結讀不到時，唯一正確做法是立刻用 Google 搜尋那個網址，找到資訊翻譯成繁體中文後回覆。",
+     "連結讀不到時，沒有實質內容就輸出空字串。"),
+    ("連結擷取失敗時，直接在內部用 Google 搜尋；只輸出查到的實質答案，沒有實質答案就輸出空字串",
+     "連結擷取失敗時，沒有實質答案就輸出空字串"),
+    ("你回覆前一律先用 Google 搜尋驗證，且必須查至少 2~3 個不同來源（不同網域），找出各方觀點後再整合回覆。",
+     "你回覆前只能用本次附上的資料驗證；沒有附資料就不要判定真假。"),
+    ("   → 必須先 Google 搜尋影片標題 + 講者，找到 transcript / 字幕 / 整理文（YouTube 自動字幕、bilibili 字幕站、Medium 整理文都行）\n",
+     "   → 只能引用本次附上的字幕或整理文\n"),
+    ("   → 找不到 transcript → 直說「影片字幕沒抓到，我搜尋的整理文是 [URL]，內容大致是 X」（誠實 > 腦補）\n",
+     "   → 沒有附上字幕或整理文 → 輸出空字串，不要編網址\n"),
+    ("(iv) 用戶問分析/解讀（不是純查價）→ Google 搜尋最新背景再答，按規則 23h 結構",
+     "(iv) 用戶問分析/解讀（不是純查價）→ 只用使用者提供或本次附上的資料；沒有就說你沒辦法確認最新情況"),
+    ("抽出明確主張，搜尋可靠來源核實後直接給結論與關鍵依據。",
+     "抽出明確主張，只用本次附上的資料核實；有根據才給結論與關鍵依據，沒有就不要判定真假。"),
+    ("查證仍須做，來源清單只在使用者要求時提供。", "來源清單只在使用者要求時提供。"),
+    ("不用等使用者問你「這是真的嗎」——你自己主動查就對了", ""),
+    ("想做什麼分析？背景資訊我可以查。」", "想做什麼分析？」"),
+    ("要用 Google 搜尋查出這次地震各縣市的實際震度（幾級），再用「XX縣 X 級、XX縣 X 級」格式說明。",
+     "有附上這次地震各縣市的實際震度時，用「XX縣 X 級、XX縣 X 級」格式說明；沒有就不要編震度。"),
+    ("取不到內容時，繼續在內部查找；仍沒有實質答案就輸出空字串。", "取不到內容時，沒有實質答案就輸出空字串。"),
+    ("需要外部查證的主張先查證，不捏造證據；", "不捏造證據，沒有附資料就不判定真假；"),
+    ("23f. 新聞事件分享：先查證主張，", "23f. 新聞事件分享：有附資料才判斷主張，"),
+    ("先核對原始主張與可靠資料，", "只用本次附上的資料核對原始主張，"),
+    ("核實最新事實，區分數據與推論，", "只用附上的資料說最新事實，區分數據與推論，"),
+    ("查證可核實的主張，區分事實與推論，", "只用附上的資料核實主張，區分事實與推論，"),
+    ("最新、醫療、法律、投資事實仍需先查證，必要時附資料日期；不能因省略來源清單而省略查證。",
+     "最新、醫療、法律、投資事實只能依本次附上的資料判斷，必要時附資料日期；沒有附資料就不要下結論。"),
+    ("先查證實際主張，第一句直接給具體判斷，", "有附資料才判斷實際主張，第一句直接給具體判斷，"),
+    # 2026-10-04 (family feedback P3): the named-person rule in _OUTPUT_STYLE_RULE
+    ("沒有搜尋結果或使用者提供的資料作依據，就不要更正使用者的說法",
+     "沒有本次附上的資料或使用者提供的資料作依據，就不要更正使用者的說法"),
+)
+
+
+def without_search_instructions(system: str) -> str:
+    """The shared prompt for a model with no search tool (Claude, local)."""
+    for old, new in _NO_SEARCH_REWRITES:
+        system = system.replace(old, new)
+    return system
+
+
 def _detect_rule_packs(user_input) -> list[str]:
     """根據 user input 偵測該載哪些 rule pack。回傳 pack 字串 list（順序穩定）。"""
     text = _extract_text(user_input)
@@ -633,9 +818,9 @@ def _detect_rule_packs(user_input) -> list[str]:
     # 含 URL 或圖片 → factcheck
     if has_url or has_image:
         packs.append(_RULE_FACTCHECK)
-    # 影片連結 → 摘要規則
+    # 影片連結 → 客觀評論規則
     if _VIDEO_LINK_RE.search(text):
-        packs.append(_RULE_VIDEO_SUMMARY)
+        packs.append(_RULE_VIDEO_COMMENTARY)
     # 財經關鍵字（含 URL 或不含都觸發）
     if _FINANCE_RE.search(text):
         packs.append(_RULE_FINANCE)
@@ -772,6 +957,9 @@ def _build_system_instruction(
             f"\n\n你已經知道以下關於使用者的事實（自動從過往對話抽出，請善加利用）：\n"
             f"{facts_block}"
         )
+    # Keep the current contract last so recalled examples/persona notes cannot
+    # reintroduce the retired verbosity or unsolicited source lists.
+    base += "\n\n" + _OUTPUT_STYLE_RULE + "\n\n" + VIDEO_COMMENTARY_CONTRACT + "\n\n" + QUOTE_CONTEXT_RULE
     return base
 
 
@@ -781,12 +969,22 @@ def _build_config(
     user_input=None,
     recall_hits: list[dict] | None = None,
     case_hits: list[dict] | None = None,
+    *,
+    last_tier: bool = False,
 ) -> types.GenerateContentConfig:
+    system_instruction = _build_system_instruction(
+        facts, persona_notes, user_input=user_input,
+        recall_hits=recall_hits, case_hits=case_hits,
+    )
+    if last_tier:
+        if _LAST_TIER_TOOLS:
+            return types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                tools=_LAST_TIER_TOOLS,  # type: ignore[arg-type]
+            )
+        return types.GenerateContentConfig(system_instruction=system_instruction)
     return types.GenerateContentConfig(
-        system_instruction=_build_system_instruction(
-            facts, persona_notes, user_input=user_input,
-            recall_hits=recall_hits, case_hits=case_hits,
-        ),
+        system_instruction=system_instruction,
         tools=_TOOLS,  # type: ignore[arg-type]
         thinking_config=types.ThinkingConfig(thinking_budget=-1),  # -1 = 動態 thinking
     )
@@ -942,7 +1140,7 @@ _URL_DOMAIN_RE = re.compile(
 )
 
 _INTERNAL_TRACE_PREFIX_RE = re.compile(
-    r"^\s*(?:(THOUGHT|ANALYSIS|REASONING)\b|(?:\[\[?\s*)?(?:思考|推理|內部思考)(?:\s*\]?\])?\s*[:：]?|\[\[?\s*分析\s*\]?\]\s*[:：]?)",
+    r"^\s*(?:(THOUGHT|ANALYSIS|REASONING)\b|(?:\[\[?\s*)?(?:思考|推理|內部思考|思緒|內部判斷|判斷結果)(?:\s*\]?\])?\s*[:：]?|\[\[?\s*分析\s*\]?\]\s*[:：]?)",
     re.IGNORECASE | re.DOTALL,
 )
 _INTERNAL_TRACE_MARKERS = (
@@ -999,24 +1197,9 @@ def _count_unique_domains(s: str) -> int:
 
 def _looks_like_internal_trace(reply: str) -> bool:
     """Detect leaked reasoning/checklist text before it reaches LINE."""
-    head = (reply or "").lstrip()[:2000]
-    if not head:
-        return False
-    if _INTERNAL_TRACE_PREFIX_RE.match(head):
-        return True
-    strong_markers = (
-        "我需要判斷使用者",
-        "我需要判斷",
-        "I need to determine",
-        "The user posted",
-        "The user shared",
-        "The user sent",
-        "response structure",
-    )
-    if any(marker.lower() in head.lower() for marker in strong_markers):
-        return True
-    hits = sum(marker in head for marker in _INTERNAL_TRACE_MARKERS)
-    return hits >= 2
+    from output_validator import _internal_trace_reply
+
+    return _internal_trace_reply(reply)
 
 
 def _violates_quality(reply: str, user_input_text: str = "") -> tuple[bool, str]:
@@ -1036,51 +1219,12 @@ def _violates_quality(reply: str, user_input_text: str = "") -> tuple[bool, str]
     for phrase in _EMPTY_PHRASES:
         if phrase in s:
             return True, f"empty phrase: {phrase}"
-
-    # 專業議題（投資 / 醫療 / 法律 / 保險 / 教育 / 房地產 / 詐騙）若在 user 訊息出現
-    # 2026-05-17 強化：URL ≥ 3 條 + ≥ 2 網域 + 正方/反方/綜合 sectional + 字數 ≥ 350
-    # 補規則 0 對「正方+來源+反方+來源+綜合論點」5 件套的執行（之前只檢 URL≥2 + opinion，
-    # sectional 結構 / 字數 / domain diversity 全沒擋）
-    if user_input_text and any(t in user_input_text for t in _NEWS_CASE_TOPIC_HINTS):
-        url_count = s.count("http://") + s.count("https://")
-        if url_count < _MIN_URLS_NEWS_CASE:
-            return True, (
-                f"專業議題缺多源 URL（{url_count}/{_MIN_URLS_NEWS_CASE}，"
-                "規則 0 要求至少 3 條不同網域；不算 user 自己貼的）"
-            )
-
-        domains = _count_unique_domains(s)
-        if domains < _MIN_DOMAINS_NEWS_CASE:
-            return True, (
-                f"專業議題 URL 集中單一網域（unique domain {domains}/"
-                f"{_MIN_DOMAINS_NEWS_CASE}）— 要不同來源才能 cross-check"
-            )
-
-        # URL 夠了，再檢查是否有觀點 marker（「我覺得」「同意」「反對」等任一）
-        # 沒觀點 marker = 半敷衍，違反規則 23h
-        has_opinion = any(m in s for m in _OPINION_MARKERS)
-        if not has_opinion:
-            return True, (
-                "專業議題回覆有 URL 但**沒中心思想**（缺『我覺得』『我認為』『同意 X 因為』"
-                "『反對 Y 因為』『問題在於』等觀點 marker）— 違反規則 23h，需要列出 "
-                "agree/disagree + 各自理由 + 對應 URL 結構"
-            )
-
-        # Sectional 結構：必含正方 + 反方 + 綜合三段 markers
-        has_struct, missing = _has_sectional_structure(s)
-        if not has_struct:
-            return True, (
-                f"專業議題缺『正方+反方+綜合』sectional 結構（missing: "
-                f"{'、'.join(missing)}）— 規則 0 line 347-399 強制三段結構"
-            )
-
-        # 字數下限 350（per _CORE_PROMPT line 369）
-        zh = _count_zh_chars(s)
-        if zh < _MIN_CHARS_NEWS_CASE:
-            return True, (
-                f"專業議題回覆過短（中文字 {zh}/{_MIN_CHARS_NEWS_CASE}）— "
-                "規則 0 強制議題回覆 ≥ 350 字，少於這個量幾乎一定是敷衍模式"
-            )
+    # 2026-09-26 Andrew：不要總結／附和使用者說過的話，只要糾正、建議、新資訊。
+    # 這裡的 user_input 可能含程式搜尋／檔案素材，不做逐字比對；逐字與語意重述
+    # 由 main._enforce_new_value_reply 以實際群組內容判斷。
+    reason = restatement_reason(s, user_input_text, check_copy=False)
+    if reason:
+        return True, reason
 
     return False, ""
 
@@ -1135,27 +1279,49 @@ def _quality_gate(
     grounding_urls: list[tuple[str, str]],
     user_input,
     group_id: str | None,
+    *,
+    response=None,
+    model: str = "",
+    max_retries: int = 3,
+    last_tier: bool = False,
 ) -> str:
-    """規則 0 post-check：違規 → retry 最多 3 次；仍違規才 log+notify.
+    """規則 0 post-check：違規 → retry 最多 ``max_retries`` 次；仍違規才 log+notify.
 
     Phase 2B.2.3a (2026-05-19): refactored from chat()-nested closure to
     top-level function. user_input + group_id now passed explicitly so
     rag_graph.py can invoke this from a graph node.
+
+    2026-10-04: ``response`` is the response that produced ``text``; the
+    search details of the response behind whatever text is finally returned
+    are recorded in ``reply_provenance`` (with ``model``) so reply filters
+    can see what its search supports.  ``last_tier`` books retries into the
+    per-model counter only.
     """
     user_text = _extract_text(user_input)
     violates, reason = _violates_quality(text, user_text)
     if not violates:
-        return _append_sources(text, grounding_urls)
+        return _record_reply(
+            _append_sources(text, grounding_urls, user_text=user_text), response, model
+        )
 
-    max_retries = 3
     prev_violations: list[tuple[str, str]] = [(text, reason)]
     current_text = text
     current_urls = grounding_urls
+    current_response = response
 
     def _blocked_if_internal_trace(value: str, why: str) -> str:
         if "internal trace leakage" in why or _looks_like_internal_trace(value):
             return ""
-        return _append_sources(value, current_urls)
+        if why.startswith("restatement"):
+            # 重寫後仍在重述：刪掉重述句；沒有新價值就不回覆。
+            value = strip_restatement(value, user_text, check_copy=False)
+            if not value:
+                return ""
+        return _record_reply(
+            _append_sources(value, current_urls, user_text=user_text),
+            current_response,
+            model,
+        )
 
     for attempt in range(1, max_retries + 1):
         current_reason = prev_violations[-1][1]
@@ -1174,18 +1340,19 @@ def _quality_gate(
                 f"上次回覆違規（{current_reason}）。重寫：只輸出要發給 LINE 使用者的正式繁體中文回答。\n"
                 "嚴禁輸出 THOUGHT、ANALYSIS、REASONING、英文推理、自我檢查、規則清單、"
                 "「The user is...」「My response should...」「Let's...」等內部分析文字。\n"
-                "直接從結論或判斷句開始；如果是查證/影片/新聞案例，使用正方、反方、整合、結論格式。\n\n"
+                "直接從答案或判斷句開始，保留必要資訊並精簡；只有使用者要求才列正反方或來源。\n\n"
                 f"前面違規過的回覆，**首 60 字一字不差禁止再用**：\n{forbidden_block}"
             )
         elif "缺多源 URL" in current_reason or "沒中心思想" in current_reason:
             retry_prompt = (
-                f"上次回覆違規（{current_reason}）。重寫，必須符合規則 23h 完整結構：\n"
-                "(1) 第一句『我覺得 / 我這邊覺得 / 我認為 + 具體判斷』\n"
-                "(2) **同意的部分 + 為何同意 + 對應 URL**\n"
-                "(3) **反對 / 質疑的部分 + 為何反對 + 對應 URL**\n"
-                "(4) 結論一句\n"
-                "(5) 至少 2 條不同網域 URL\n\n"
+                f"上次回覆違規（{current_reason}）。重寫成簡短、清楚、直接回答問題的正式回覆。"
+                "不要硬湊正反方段落或來源清單；保留必要依據，只有使用者要求才列來源。\n\n"
                 f"前面違規過的回覆，**首 60 字一字不差禁止再用**：\n{forbidden_block}"
+            )
+        elif current_reason.startswith("restatement"):
+            retry_prompt = (
+                RESTATEMENT_RETRY_PROMPT.format(reason=current_reason)
+                + f"\n\n前面違規過的回覆，**首 60 字一字不差禁止再用**：\n{forbidden_block}"
             )
         elif "echo opener" in current_reason:
             retry_prompt = (
@@ -1211,33 +1378,47 @@ def _quality_gate(
 
         try:
             retry_resp = chat_session.send_message(retry_prompt)
-            _track_usage(retry_resp)
+            _book_request(retry_resp, model, last_tier)
             retry_text = _clean_reply((retry_resp.text or "").strip())
             retry_urls = _extract_grounding_urls(retry_resp)
         except Exception as e:
             logger.warning("quality retry %d 呼叫失敗: %s", attempt, e)
+            if last_tier:
+                track_model(model, "chat", ok=False)
             return _blocked_if_internal_trace(current_text, current_reason)
 
         if not retry_text:
             return _blocked_if_internal_trace(current_text, current_reason)
 
+        if retry_urls:
+            reply_provenance.mark_searched()  # the rewrite now adopted was grounded
         current_text = retry_text
         current_urls = retry_urls or current_urls
+        current_response = retry_resp
 
         violates_now, reason_now = _violates_quality(retry_text, user_text)
         if not violates_now:
             logger.info("quality post-check retry %d 通過", attempt)
-            return _append_sources(retry_text, current_urls)
+            return _record_reply(
+                _append_sources(retry_text, current_urls, user_text=user_text),
+                retry_resp,
+                model,
+            )
 
         prev_violations.append((retry_text, reason_now))
+        if reason_now.startswith("restatement"):
+            # 重述只重寫一次；仍重述就直接刪句，不再多花 retry 額度。
+            break
 
     final_reason = prev_violations[-1][1]
     logger.warning(
         "quality post-check %d 次 retry 後仍違規（%s）",
         max_retries, final_reason,
     )
-    _log_quality_violation(group_id, current_text, final_reason)
-    _alert_quality_violation(current_text, final_reason)
+    if not final_reason.startswith("restatement"):
+        # 重述由下方自動刪句處理，不另寫 persona note / Discord 告警。
+        _log_quality_violation(group_id, current_text, final_reason)
+        _alert_quality_violation(current_text, final_reason)
     return _blocked_if_internal_trace(current_text, final_reason)
 
 
@@ -1262,6 +1443,32 @@ def _is_transient(e: Exception) -> bool:
     return any(sig in s for sig in _TRANSIENT_SIGS)
 
 
+def _chose_no_reply(response) -> bool:
+    """An empty answer the model finished normally (STOP, no tool calls).
+
+    Blocked prompts, SAFETY/MAX_TOKENS endings or tool-only turns are glitches
+    worth a retry; a clean STOP with nothing to say is the model following
+    NO_REPEAT_CONTRACT.
+    """
+    try:
+        candidates = getattr(response, "candidates", None) or []
+        if not candidates:
+            return False
+        candidate = candidates[0]
+        finish = getattr(candidate, "finish_reason", None)
+        if getattr(finish, "name", str(finish or "")) != "STOP":
+            return False
+        parts = getattr(getattr(candidate, "content", None), "parts", None) or []
+        return not any(
+            getattr(part, "function_call", None)
+            or getattr(part, "executable_code", None)
+            or getattr(part, "code_execution_result", None)
+            for part in parts
+        )
+    except Exception:
+        return False
+
+
 def _run(
     model: str,
     *,
@@ -1272,35 +1479,61 @@ def _run(
     recall_hits: list[dict] | None,
     case_hits: list[dict] | None,
     group_id: str | None,
+    max_attempts: int = 3,
+    max_quality_retries: int = 3,
+    last_tier: bool = False,
 ) -> str:
     """Phase 2B.2.3b: top-level Gemini chat with 3-attempt retry + Chinese
     rewrite + quality gate. Hoisted from chat() closure so rag_graph.py can
     invoke from a graph node. 503/429-PerDay fallback stays in chat() wrapping
     this function (GP1 #2: keep retry node-internal, don't model as graph edges).
+
+    2026-10-04: a daily-quota 429 marks ``model`` exhausted for the Pacific
+    day (per-model file).  ``last_tier`` uses the tool-less config and books
+    requests per model only; the last tier passes ``max_attempts=1`` and
+    ``max_quality_retries=1`` (about three requests per reply).  The search
+    details of the response behind the returned text are recorded in
+    ``reply_provenance.record_grounding``.
     """
     chat_session = _client.chats.create(
         model=model,
         config=_build_config(
             facts, persona_notes, user_input=user_input,
             recall_hits=recall_hits, case_hits=case_hits,
+            last_tier=last_tier,
         ),
         history=_to_gemini_history(context),  # type: ignore[arg-type]
     )
+    gate = {"model": model, "max_retries": max_quality_retries, "last_tier": last_tier}
     last_err: Exception | None = None
-    for attempt in range(3):
+    for attempt in range(max_attempts):
+        # Only the answer this attempt returns counts: a grounded draft that
+        # was then dropped must not vouch for a later one (2026-10-03).
+        reply_provenance.reset()
         try:
             response = chat_session.send_message(user_input)
-            _track_usage(response)
+            _book_request(response, model, last_tier)
             text = (response.text or "").strip()
             text = _clean_reply(text)
+            if is_empty_marker(text):
+                text = ""
             grounding_urls = _extract_grounding_urls(response)
+            if text and grounding_urls:
+                # A real Google Search fed this reply.
+                reply_provenance.mark_searched()
+            if not text and _chose_no_reply(response):
+                # NO_REPEAT_CONTRACT tells the model to output nothing when it
+                # has nothing new; re-sending the same prompt only squeezes out
+                # an agree-and-restate reply and burns the 20-request budget.
+                logger.info("gemini chat: model chose not to reply")
+                return ""
             if text:
                 user_text = _extract_text(user_input)
                 trace_leaked, trace_reason = _violates_quality(text, user_text)
                 if trace_leaked and "internal trace leakage" in trace_reason:
                     return _quality_gate(
                         chat_session, text, grounding_urls,
-                        user_input, group_id,
+                        user_input, group_id, response=response, **gate,
                     )
                 if not _is_chinese_majority(text):
                     logger.warning(
@@ -1309,18 +1542,20 @@ def _run(
                     retry_resp = chat_session.send_message(
                         "你剛才的回覆含有太多英文。請把剛才的回覆全部改成繁體中文再說一次，不要用英文。"
                     )
-                    _track_usage(retry_resp)
+                    _book_request(retry_resp, model, last_tier)
                     retry_text = _clean_reply((retry_resp.text or "").strip())
                     if retry_text and _is_chinese_majority(retry_text):
                         retry_urls = _extract_grounding_urls(retry_resp)
+                        if retry_urls:
+                            reply_provenance.mark_searched()
                         return _quality_gate(
                             chat_session, retry_text,
                             retry_urls or grounding_urls,
-                            user_input, group_id,
+                            user_input, group_id, response=retry_resp, **gate,
                         )
                 return _quality_gate(
                     chat_session, text, grounding_urls,
-                    user_input, group_id,
+                    user_input, group_id, response=response, **gate,
                 )
             logger.warning(
                 "gemini chat attempt %d: empty text, retrying", attempt + 1
@@ -1328,19 +1563,22 @@ def _run(
             continue
         except Exception as e:
             last_err = e
-            _track_failed_request()
-            if _is_transient(e) and attempt < 2:
+            _book_failure(model, last_tier)
+            if is_daily_quota_error(e):
+                mark_model_exhausted(model)
+            if _is_transient(e) and attempt < max_attempts - 1:
                 logger.warning(
-                    "gemini transient error (%s), retry %d/2 after 3s",
+                    "gemini transient error (%s), retry %d/%d after 3s",
                     type(e).__name__,
                     attempt + 1,
+                    max_attempts - 1,
                 )
                 time.sleep(3)
                 continue
             raise
     if last_err:
         raise last_err
-    raise RuntimeError("gemini chat: empty text after 3 attempts")
+    raise RuntimeError(f"gemini chat: empty text after {max_attempts} attempts")
 
 
 def _chat_via_graph(
@@ -1370,6 +1608,9 @@ def _chat_via_graph(
     `_node_generate` reads model from config only — no longer from state.
     """
     import rag_graph
+    # TODO(2026-10-04 review): with USE_RAG_GRAPH on, the provenance mark set
+    # inside _run lives in langgraph's copied context and never reaches
+    # _llm_chat; return it in the graph state before turning the flag on.
     state: rag_graph.RagInput = {
         "user_input": user_input,
         "context": context,
@@ -1481,6 +1722,7 @@ def chat(
     except Exception as e:
         err = str(e)
         # 主 model 503 / 429 (daily quota) 都 fallback 到 lite model
+        # （2026-10-04：_run 已把撞到日額度的 model 記進每模型用量檔）
         is_503 = "503" in err
         is_429_perday = ("429" in err or "RESOURCE_EXHAUSTED" in err) and (
             "PerDay" in err or "free_tier_requests" in err
@@ -1494,6 +1736,59 @@ def chat(
             )
             return _run(settings.gemini_light_model, **_run_kwargs)
         raise
+
+
+def chat_last_tier(
+    user_input: MessageInput,
+    context: list[tuple[str, str]],
+    facts: list[str],
+    persona_notes: list[dict] | None = None,
+    group_id: str | None = None,
+) -> str | None:
+    """One reply from the separate-quota last tier; ``None`` = no reply.
+
+    For when both 2.5 models are spent (daily 429) or unavailable (503).  It
+    is deliberately not inside chat(): a quota recheck that only the last tier
+    answered must not clear the 2.5 quota flag.  One attempt and one quality
+    retry (about three requests per reply), no tools (``_LAST_TIER_TOOLS``:
+    this key refuses the tier's search-grounded requests, so it cannot search
+    and its replies are ungrounded), and per-model accounting only.  Returns
+    ``None`` without a request when the tier is off, at its daily cap, marked
+    exhausted, or backing off; a daily 429 marks it exhausted (in ``_run``)
+    and any other error backs it off for 60 s.  ``""`` is the model choosing
+    not to reply.  The returned reply's search details (empty while the tier
+    has no tools) are recorded in ``reply_provenance`` with the tier's model
+    name; with no grounding it does not mark ``searched()``.
+    """
+    model = last_tier_model()
+    if not model or not last_tier_allowed("chat"):
+        return None
+    try:
+        reply = _run(
+            model,
+            user_input=user_input,
+            context=context,
+            facts=facts,
+            persona_notes=persona_notes,
+            recall_hits=None,
+            case_hits=None,
+            group_id=group_id,
+            max_attempts=1,
+            max_quality_retries=1,
+            last_tier=True,
+        )
+    except Exception as e:
+        if is_daily_quota_error(e):
+            logger.warning("gemini last tier %s daily quota exhausted", model)
+        else:
+            _back_off_last_tier()
+            logger.warning(
+                "gemini last tier %s failed error_type=%s code=%s; backing off %ds",
+                model, type(e).__name__, _error_code(e), _LAST_TIER_BACKOFF_SEC,
+            )
+        return None
+    logger.info("gemini last tier %s answered len=%d", model, len(reply or ""))
+    return reply
 
 
 def _lite_or_main(prompt, config=None):
@@ -1609,11 +1904,44 @@ def _strip_code_fence(text: str) -> str:
 # ── Reminder extraction（2026-05-08 加：從用戶訊息抽提醒事項）─────────────
 
 
-def extract_reminder(text: str, today_iso: str | None = None) -> dict | None:
-    """從訊息抽 (action, datetime) 未來提醒。失敗 / 不適用回 None。
+def _extract_reminder_last_tier(prompt: str, config) -> object | None:
+    """The same extraction on the separate-quota tier; ``None`` = unavailable."""
+    model = last_tier_model()
+    if not model or not last_tier_allowed("extract"):
+        return None
+    try:
+        response = _client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=config,
+        )
+    except Exception as e:
+        track_model(model, "extract", ok=False)
+        if is_daily_quota_error(e):
+            mark_model_exhausted(model)
+        else:
+            _back_off_last_tier()
+        logger.warning(
+            "extract_reminder last tier %s failed error_type=%s code=%s",
+            model, type(e).__name__, _error_code(e),
+        )
+        return None
+    track_model(model, "extract")
+    logger.info("extract_reminder answered by last tier %s", model)
+    return response
 
-    用 light model（每次 call 成本低）。
-    回傳 schema：{action, year, month, day, hour, minute}
+
+def extract_reminder(text: str, today_iso: str | None = None) -> dict | None:
+    """從訊息抽 (action, datetime) 未來提醒。
+
+    用 light model（每次 call 成本低）；它 429／5xx／逾時時改用第三層（同一
+    prompt、thinking_budget=0）。回傳 schema：{action, year, month, day, hour, minute}
+
+    2026-10-04 介面約定（呼叫端依此分流）：
+    - dict：建立提醒。
+    - None：模型判定不是提醒（或答案讀不懂、或訊息本身不適用）；不要用本機路徑推翻。
+    - raise：模型無法使用（light 與第三層都 429、5xx、逾時，或其他 API 錯誤）。
+      light 撞過的原始例外原樣 raise，caller 的 _is_quota_error 仍能判 PerDay。
     """
     if not text or len(text) > 500:
         return None
@@ -1632,8 +1960,9 @@ def extract_reminder(text: str, today_iso: str | None = None) -> dict | None:
   "year": 年, "month": 月, "day": 日, "hour": 時, "minute": 分}}
 
 判斷規則：
-- 訊息明確指向未來特定日期+時間的具體動作 → 回 JSON
-- 沒明確時間、過去事件、純閒聊、純情緒、純資訊分享 → 回 null
+- 訊息明確指向未來特定日期的具體動作 → 回 JSON
+- 未指定明確時鐘時：早上/上午預設 09:00，晚上預設 19:00，完全沒說時段預設 12:00
+- 沒明確日期、過去事件、純閒聊、純情緒、純資訊分享 → 回 null
 - 沒指定年份 → 用今年（最近的未來該日期）
 - 沒指定分鐘 → 0
 - 動作要保留關鍵資訊（地點、對象）但精簡
@@ -1644,6 +1973,9 @@ output: {{"action": "拿喜來登贈送的生日蛋糕", "year": 2026, "month": 
 
 input: "明天早上 9 點要開會"
 output: {{"action": "開會", "year": <今年>, "month": <明天月份>, "day": <明天日期>, "hour": 9, "minute": 0}}
+
+input: "明天提醒我領米"
+output: {{"action": "領米", "year": <今年>, "month": <明天月份>, "day": <明天日期>, "hour": 12, "minute": 0}}
 
 input: "今天天氣真好"
 output: null
@@ -1658,15 +1990,34 @@ output: {{"action": "看電影", ...下週三日期, "hour": 19, "minute": 0}}�
 
 只回 JSON 或 null，不要解釋、不要 code fence。"""
 
+    config = types.GenerateContentConfig(
+        thinking_config=types.ThinkingConfig(thinking_budget=0),
+    )
+    lite_model = settings.gemini_light_model
     try:
         response = _client.models.generate_content(
-            model=settings.gemini_light_model,
+            model=lite_model,
             contents=prompt,
-            config=types.GenerateContentConfig(
-                thinking_config=types.ThinkingConfig(thinking_budget=0),
-            ),
+            config=config,
         )
         _track_usage(response)  # D1c: reminder 抽取也燒 Google quota，計入 usage 讓 reserve gate 看得到
+    except Exception as lite_error:
+        if _is_rate_limited(lite_error):
+            # R3: 429 不再靜默吞 → 計入失敗 quota；原 SDK 字串保留，
+            # 讓 caller 用 _is_quota_error 判 PerDay 決定 mark exhausted + enqueue 補抽
+            _track_failed_request()
+            if is_daily_quota_error(lite_error):
+                mark_model_exhausted(lite_model)
+        response = None
+        if _is_rate_limited(lite_error) or _is_unavailable(lite_error):
+            response = _extract_reminder_last_tier(prompt, config)
+        if response is None:
+            logger.info(
+                "extract_reminder model unavailable error_type=%s code=%s",
+                type(lite_error).__name__, _error_code(lite_error),
+            )
+            raise
+    try:
         raw = _strip_code_fence((response.text or "").strip())
         if not raw or raw.lower() in ("null", "none"):
             return None
@@ -1680,8 +2031,18 @@ output: {{"action": "看電影", ...下週三日期, "hour": 19, "minute": 0}}�
         # year 預設今年
         if "year" not in result:
             result["year"] = datetime.now().year
+        default_time = reminder_intent.resolve_reminder_default_time(text)
+        if not reminder_intent.has_explicit_reminder_clock(text):
+            if default_time is None:
+                return None
+            result["hour"], result["minute"], default_kind = default_time
+            result["_time_was_defaulted"] = True
+            result["_time_default_kind"] = default_kind
         # action 長度限制
         result["action"] = str(result["action"])[:50]
+        from reminder_restatement import complete_result
+
+        result = complete_result(text, result, datetime.fromisoformat(today_iso[:10]).date())
         if reminder_intent.should_reject_reminder_candidate(
             text,
             result["action"],
@@ -1689,13 +2050,8 @@ output: {{"action": "看電影", ...下週三日期, "hour": 19, "minute": 0}}�
             return None
         return result
     except Exception as e:
-        err = str(e)
-        if "429" in err or "RESOURCE_EXHAUSTED" in err:
-            # R3: 429 不再靜默吞 → 計入失敗 quota + bare raise 保留原 SDK 字串，
-            # 讓 caller 用 _is_quota_error 判 PerDay 決定 mark exhausted + enqueue 補抽
-            _track_failed_request()
-            raise
-        logger.info("extract_reminder failed (non-fatal): %s", e)
+        # The model answered but not with a usable reminder.
+        logger.info("extract_reminder unreadable answer (non-fatal) error_type=%s", type(e).__name__)
         return None
 
 

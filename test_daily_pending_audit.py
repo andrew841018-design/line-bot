@@ -217,7 +217,7 @@ def test_short_file_name_hashes_and_keeps_extension():
     assert dpa._short_file_name(None) == ""
     short_pdf = dpa._short_file_name("a.pdf")
     assert short_pdf.endswith(".pdf") and len(short_pdf) == len("xxxxxx.pdf")
-    long = dpa._short_file_name("114年度-測試病患甲-非常長的-報表.pdf")
+    long = dpa._short_file_name("114年度-曾美惠-非常長的-報表.pdf")
     assert long.endswith(".pdf")
     # Hash must NOT leak any Chinese / context from the original name
     assert "曾" not in long
@@ -524,3 +524,55 @@ def test_format_message_download_failed_line_rendered():
     msg = dpa.format_message(r)
     assert "2 則 download_failed" in msg
     assert "DL✗" in msg
+
+
+# ---------- dropped reminder extractions (2026-10-04) ----------
+
+def _drop_one_reminder(text: str = "SECRET 合成待處理") -> int:
+    import memory
+
+    pending_id = memory.enqueue_pending_reminder("G1", "U1", text, "m-dropped")
+    claim_token = memory.claim_pending_reminder(pending_id)
+    assert memory.drop_pending_reminder(pending_id, claim_token, "G1", "expired")
+    return pending_id
+
+
+def test_main_appends_dropped_section_and_overrides_ok_suppression(tmp_path, monkeypatch):
+    import pending_store
+
+    pending_id = _drop_one_reminder()
+    fake = tmp_path / "p.json"
+    fake.write_text(json.dumps({}))
+    monkeypatch.setattr(pending_store, "PENDING_PATH", fake)
+    monkeypatch.setattr(pending_store, "LOCK_PATH", tmp_path / ".lock")
+    monkeypatch.setattr(dpa, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(dpa, "STATE_PATH", tmp_path / "state" / "x.json")
+    monkeypatch.setattr(dpa, "SUPPRESS_OK_DM", True)
+    sender = _DummySendDm(ok=True)
+    monkeypatch.setattr(dpa, "_send_discord", sender)
+
+    rc = dpa.main([])
+
+    assert rc == 0
+    assert len(sender.calls) == 1
+    assert "✅" in sender.calls[0]
+    assert f"pid={pending_id}" in sender.calls[0] and "expired" in sender.calls[0]
+    assert "SECRET" not in sender.calls[0]
+
+
+def test_main_dry_run_with_flag_off_reports_dropped_without_sending(tmp_path, monkeypatch):
+    _drop_one_reminder()
+    state_path = tmp_path / "state" / "x.json"
+    monkeypatch.setattr(dpa, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(dpa, "STATE_PATH", state_path)
+    monkeypatch.setattr(dpa, "pending_reply_enabled", lambda: False)
+    sender = _DummySendDm(ok=True)
+    monkeypatch.setattr(dpa, "_send_discord", sender)
+
+    rc = dpa.main(["--dry-run"])
+
+    assert rc == 0
+    assert sender.calls == []
+    state = json.loads(state_path.read_text())
+    assert state["status"] == "dry_run"
+    assert state["summary"]["dropped_reminder_count"] == 1

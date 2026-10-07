@@ -37,10 +37,10 @@ def test_stage1_handlers_count():
 
 
 def test_stage3_handlers_count():
-    """Stage 3 fallback 應該有 3 個 handler。"""
-    assert len(lite_reply._STAGE3_HANDLERS) == 3
+    """Stage 3 fallback 保留天氣與查詢，不再自動送網頁摘要。"""
+    assert len(lite_reply._STAGE3_HANDLERS) == 2
     names = [h.__name__ for h in lite_reply._STAGE3_HANDLERS]
-    expected = {"_try_url_summary", "_try_weather", "_try_google_snippet"}
+    expected = {"_try_weather", "_try_google_snippet"}
     assert set(names) == expected
 
 
@@ -83,6 +83,28 @@ def test_try_local_llm_returns_none_on_runtime_error(monkeypatch):
 
     out = lite_reply._try_local_llm("Anything")
     assert out is None
+
+
+def test_disabled_runtime_skips_opinion_lookup_before_stage3(monkeypatch):
+    """Default-off server policy must not spend time on Stage 2 web research."""
+    fake_module = type(sys)("local_llm")
+    fake_module.runtime_enabled = lambda: False
+    fake_module.chat = lambda *a, **kw: pytest.fail("disabled local LLM must not run")
+    monkeypatch.setitem(sys.modules, "local_llm", fake_module)
+    monkeypatch.setattr(
+        lite_reply,
+        "_collect_opinion_reference_context",
+        lambda *a, **kw: pytest.fail("disabled Stage 2 must not fetch evidence"),
+    )
+    monkeypatch.setattr(lite_reply, "_STAGE1_HANDLERS", ())
+    stage3 = lambda _text: "stage3 deterministic fallback"  # noqa: E731
+    monkeypatch.setattr(lite_reply, "_STAGE3_HANDLERS", (stage3,))
+
+    out = lite_reply.lite_reply(
+        "這支影片分享投資案例但沒有提供足夠證據，你怎麼看"
+    )
+
+    assert out is None  # Video replies cannot degrade to metadata/summary.
 
 
 def test_try_local_llm_returns_none_on_short_response(monkeypatch):
@@ -128,7 +150,7 @@ def test_try_local_llm_passes_context(monkeypatch):
 
 
 def test_try_local_llm_uses_opinion_prompt_for_shared_video(monkeypatch):
-    """議題/影片分享要明確要求 local LLM 產出正方、反方與整合見解。"""
+    """議題/影片分享保留查證素材，但不強迫段落或長度。"""
     fake_module = type(sys)("local_llm")
     captured: dict = {}
 
@@ -162,14 +184,14 @@ def test_try_local_llm_uses_opinion_prompt_for_shared_video(monkeypatch):
     assert captured["context"][-1][0] == "research"
     assert "補充資料（可能可作為論證依據）" in captured["context"][-1][1]
     assert captured["system_prompt"] is not None
-    assert "正方" in captured["system_prompt"]
-    assert "反方" in captured["system_prompt"]
-    assert "整合" in captured["system_prompt"]
+    assert "只有使用者明確要求時" in captured["system_prompt"]
+    assert "簡潔易讀" in captured["system_prompt"]
+    assert "180-320" not in captured["system_prompt"]
     assert captured["max_tokens"] >= 600
 
 
 def test_try_local_llm_uses_opinion_prompt_for_context_only_video(monkeypatch):
-    """短句+影片 context 也要觸發 opinion structure 提示。"""
+    """短句加影片 context 仍先取得素材，再用精簡評論提示。"""
     fake_module = type(sys)("local_llm")
     captured: dict = {}
 
@@ -207,7 +229,7 @@ def test_try_local_llm_uses_opinion_prompt_for_context_only_video(monkeypatch):
     assert out is not None
     assert captured["context"] == context
     assert captured["system_prompt"] is not None
-    assert "正方" in captured["system_prompt"]
+    assert "只有使用者明確要求時" in captured["system_prompt"]
     assert captured["max_tokens"] == 700
 
 
@@ -299,7 +321,7 @@ def test_stage1_time_query_beats_llm(monkeypatch):
 def test_stage2_unavailable_falls_back_to_stage3(monkeypatch):
     """LLM 不可用 + Stage 1 沒命中 → 走 Stage 3 fallback。
 
-    這裡用一個會被 _try_url_summary 命中的 URL 輸入。
+    這裡用天氣查詢驗證仍可取得 Stage 3 的具體答案。
     """
     # 1. 模擬 local_llm 不存在
     real_import = builtins.__import__
@@ -312,20 +334,21 @@ def test_stage2_unavailable_falls_back_to_stage3(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", fake_import)
     monkeypatch.delitem(sys.modules, "local_llm", raising=False)
 
-    # 2. 模擬 _try_url_summary 命中（不真的對外 HTTP）
+    # 2. 模擬天氣命中（不真的對外 HTTP）
     monkeypatch.setattr(
         lite_reply,
-        "_try_url_summary",
-        lambda text: "📰 from stage3 fallback" if "http" in text else None,
+        "_try_weather",
+        lambda text: "天氣 from stage3 fallback" if "天氣" in text else None,
     )
     # 重建 Stage 3 tuple，因為 monkeypatch 動的是模組屬性而非 tuple
     monkeypatch.setattr(
         lite_reply,
         "_STAGE3_HANDLERS",
-        (lite_reply._try_url_summary, lite_reply._try_weather, lite_reply._try_google_snippet),
+        (lite_reply._try_weather, lite_reply._try_google_snippet),
     )
 
-    out = lite_reply.lite_reply("這個連結 https://example.com 是什麼意思啊")
+    monkeypatch.setattr(lite_reply, "_STAGE1_HANDLERS", ())
+    out = lite_reply.lite_reply("台北天氣")
     assert out is not None
     assert "stage3" in out
 
@@ -350,7 +373,7 @@ def test_lite_reply_returns_none_when_nothing_matches(monkeypatch):
     monkeypatch.setattr(
         lite_reply,
         "_STAGE3_HANDLERS",
-        (lite_reply._try_url_summary, lite_reply._try_weather, lite_reply._try_google_snippet),
+        (lite_reply._try_weather, lite_reply._try_google_snippet),
     )
 
     # 給一個既不會被 Stage 1 命中、又沒 URL 的隨意句子
@@ -372,21 +395,11 @@ def test_lite_reply_rejects_too_long():
     assert lite_reply.lite_reply(huge) is None
 
 
-def test_lite_reply_long_youtube_prompt_still_uses_youtube_handler(monkeypatch):
-    class FakeResp:
-        status_code = 200
-
-        def json(self):
-            return {"title": "長 prompt 直播標題", "author_name": "直播頻道"}
-
-    monkeypatch.setattr(lite_reply.requests, "get", lambda *a, **kw: FakeResp())
-
+def test_lite_reply_long_youtube_prompt_uses_commentary(monkeypatch):
+    monkeypatch.setattr(lite_reply, "_try_local_llm", lambda *_a, **_k: "這個案例不能代表整體，因為樣本範圍有限。")
+    monkeypatch.setattr(lite_reply.requests, "get", lambda *_a, **_k: pytest.fail("must not serve metadata"))
     huge = "a" * 600 + " https://www.youtube.com/live/LIVE1234567"
-    out = lite_reply.lite_reply(huge)
-
-    assert out is not None
-    assert "長 prompt 直播標題" in out
-    assert "目前只取得標題與頻道" in out
+    assert lite_reply.lite_reply(huge) == "這個案例不能代表整體，因為樣本範圍有限。"
 
 
 def test_lite_reply_signature_accepts_context():
@@ -496,3 +509,20 @@ def test_try_weather_returns_none_when_no_weather_keyword():
 def test_try_google_snippet_returns_none_when_no_question():
     """沒問句 keyword → 不該 scrape。"""
     assert lite_reply._try_google_snippet("普通陳述句") is None
+
+
+def test_explicit_pro_con_request_reaches_local_model(monkeypatch):
+    request = "這支影片的投資策略，請列正方反方並整合看法"
+    answer = "正方：分散持倉能降低單一公司風險。\n反方：仍有市場風險。\n整合：先確認資金用途。"
+    captured = {}
+
+    def fake_chat(text, **kwargs):
+        captured["text"] = text
+        captured.update(kwargs)
+        return answer
+
+    monkeypatch.setitem(sys.modules, "local_llm", type("FakeLocal", (), {"chat": staticmethod(fake_chat)}))
+    monkeypatch.setattr(lite_reply, "_collect_opinion_reference_context", lambda *_a, **_k: "影片原始主張：分散持倉")
+    assert lite_reply._try_local_llm(request) == answer
+    assert captured["text"] == request
+    assert "只有使用者明確要求時才分正方／反方" in captured["system_prompt"]

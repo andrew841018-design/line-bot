@@ -1,19 +1,66 @@
 """媒體（圖片 / 影片）處理 pipeline — 純本機，零雲端 LLM。
 
 組合：
-  圖片：OCR 抽文字 → 本機 vision LLM → 本機失敗 → OCR-only fallback
+  圖片：OCR 抽文字 → 本機 vision LLM 回應；解析不外顯，無回應則靜默
   影片：抽 keyframes → 本機多圖 vision LLM → 本機失敗 → 沉默
 
 跟 main.py 既有 Gemini Vision (handle image / video event) 平行。
 quota 爆時 main 改 call 這邊。
 """
 from __future__ import annotations
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import logging
 import re
+import threading
+import time
 from pathlib import Path
 from typing import Optional
 
+from image_reply import IMAGE_RESPONSE_CONTRACT, is_image_context_echo, render_image_reply
+from video_reply import VIDEO_COMMENTARY_CONTRACT, VIDEO_CACHE_VERSION
+
 logger = logging.getLogger("media_pipeline")
+
+_IMAGE_ANALYSIS_DEFAULT_TIMEOUT_SEC = 40.0
+_OCR_DEGRADED_REPLY_PREFIX = "⚠️ 文字辨識降級結果"
+_OCR_DEGRADED_REPLY_RESERVE_SEC = 1.0
+_OCR_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="media-ocr")
+_OCR_ADMISSION = threading.BoundedSemaphore(1)
+_LOCAL_LLM_ALERT_LOCK = threading.Lock()
+_local_llm_alert_inflight: int | None = None
+_local_llm_alert_epoch = 0
+_local_llm_alert_dispatch_epochs: set[int] = set()
+
+
+class MediaVisionTimeoutError(TimeoutError):
+    """The caller's absolute image-analysis budget was exhausted."""
+
+
+def _remaining_image_budget(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise MediaVisionTimeoutError("image analysis deadline exhausted")
+    return remaining
+
+
+def _extract_ocr_with_deadline(extract_text, image, timeout_sec: float):
+    """Bound OCR without queuing late work; a hung call can occupy one thread only."""
+    if not _OCR_ADMISSION.acquire(blocking=False):
+        logger.info("OCR worker busy; continue without OCR")
+        return None
+    try:
+        future = _OCR_EXECUTOR.submit(extract_text, image)
+    except BaseException:
+        _OCR_ADMISSION.release()
+        raise
+    future.add_done_callback(lambda _future: _OCR_ADMISSION.release())
+    try:
+        return future.result(timeout=max(0.0, float(timeout_sec)))
+    except FutureTimeoutError as exc:
+        future.cancel()
+        raise MediaVisionTimeoutError("OCR exceeded image deadline") from exc
 
 
 # ── Phase 1 media_cache helpers (byte-exact dedup, group-scoped) ───────────
@@ -30,8 +77,7 @@ logger = logging.getLogger("media_pipeline")
 _MIN_CACHE_BYTES = 1024       # 太小檔不算（preview / corrupted / sticker）
 _MIN_CACHE_REPLY_LEN = 200    # 太短 reply 不 cache（L3 raw desc 通常 < 200 字）
 
-_local_llm_down_alerted = False  # once-per-process 告警 guard；成功生回應時 reset（見 _respond_to_ocr_text）
-
+_local_llm_down_alerted = False  # once-per-outage vision alert; visual success re-arms it
 
 _MARKET_SCREENSHOT_HINT_RE = re.compile(
     r"牛牛|富途|Futu|Futubull|moomoo|Moomoo|道瓊|道琼|那斯達克|納斯達克|"
@@ -53,30 +99,8 @@ _MARKET_ALIAS_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 _PERCENT_RE = re.compile(r"[+\-−]?\d+(?:\.\d+)?\s*%")
 _NUMBER_RE = re.compile(r"[+\-−]?\d{1,3}(?:,\d{3})+(?:\.\d+)?|[+\-−]?\d+(?:\.\d+)?")
-_IMAGE_INTEGRATION_RE = re.compile(r"(?:統一論點|整合論點|整合|綜合判斷)\s*[：:]", re.IGNORECASE)
-_IMAGE_ARGUMENT_SECTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("圖片內容", re.compile(r"圖片內容\s*[：:]", re.IGNORECASE)),
-    ("正方", re.compile(r"正方\s*[：:]", re.IGNORECASE)),
-    ("反方", re.compile(r"反方\s*[：:]", re.IGNORECASE)),
-    ("統一論點", _IMAGE_INTEGRATION_RE),
-)
-
-
-_IMAGE_ARGUMENT_CONTRACT = """請固定用下面四段回答，讓使用者一眼看懂圖片在講什麼，以及正反兩方怎麼看：
-
-圖片內容：先說這張圖/圖中文字主要在講什麼，列出看得到的關鍵文字、數字、人物、事件或商品；看不到就說看不到，不要補腦。
-
-正方：站在支持或認同這張圖主張的一方，整理 2-3 個可成立的理由。若圖片不是爭議議題，就寫「可支持的解讀 / 可用價值」。
-
-反方：站在質疑或保留的一方，整理 2-3 個疑點、限制、風險或缺少的脈絡。不要為了平衡硬編圖片看不到的事。
-
-統一論點：把兩邊合起來，給一個最穩妥的判斷或下一步。要講清楚哪些可以先採信、哪些需要查證、使用者該怎麼處理。
-
-規則：
-- 一律繁體中文，短句分行，像 LINE 訊息。
-- 不要只描述畫面；一定要有正方、反方、統一論點。
-- 不要編造來源、網址、看不到的數字或圖片外的事實。
-- 如果資訊不足，就把「資訊不足」放在反方和統一論點裡說清楚。"""
+_IMAGE_ARGUMENT_CONTRACT = IMAGE_RESPONSE_CONTRACT
+_IMAGE_CACHE_VERSION = b"image-response-only-v2\0"
 
 
 def _build_image_argument_prompt(user_prompt: str = "") -> str:
@@ -85,61 +109,26 @@ def _build_image_argument_prompt(user_prompt: str = "") -> str:
 
 
 def _has_image_argument_structure(reply: str | None) -> bool:
-    text = (reply or "").strip()
-    if not text:
-        return False
-    matches: list[tuple[str, re.Match[str]]] = []
-    for label, pattern in _IMAGE_ARGUMENT_SECTION_PATTERNS:
-        match = pattern.search(text)
-        if not match:
-            return False
-        matches.append((label, match))
-
-    starts = [match.start() for _label, match in matches]
-    if starts != sorted(starts):
-        return False
-
-    for idx, (_label, match) in enumerate(matches):
-        section_start = match.end()
-        section_end = matches[idx + 1][1].start() if idx + 1 < len(matches) else len(text)
-        section = text[section_start:section_end].strip(" \n\t　-：:。")
-        if len(section) < 4:
-            return False
-    return True
-
-
-def _compact_image_basis(*parts: str, limit: int = 420) -> str:
-    merged = "\n".join(str(part or "").strip() for part in parts if str(part or "").strip())
-    merged = re.sub(r"\s+", " ", merged).strip()
-    if not merged:
-        return "可見資訊不足，無法可靠判斷圖片主張。"
-    if len(merged) > limit:
-        return merged[:limit].rstrip() + "..."
-    return merged
+    """Compatibility name: require a usable answer, not a fixed section layout."""
+    rendered = render_image_reply(reply)
+    return bool(rendered and len(rendered) >= 4)
 
 
 def _ensure_image_argument_structure(
-    reply: str | None,
-    *,
-    desc: str = "",
-    ocr_text: str = "",
+    reply: str | None, *, desc: str = "", ocr_text: str = ""
 ) -> str | None:
-    """Guarantee the user-facing image reply has the requested four-part shape."""
-    if not reply or not reply.strip():
+    """Keep the answer without appending internal description or OCR context."""
+    if is_image_context_echo(reply, ocr_text):
         return None
-    if _has_image_argument_structure(reply):
-        return reply.strip()
+    if ocr_text.strip():
+        # Vision applies post_check before returning. Its presentation rewrite
+        # must not turn a verbatim OCR echo into an apparent answer.
+        from vision_common import post_check
 
-    basis = _compact_image_basis(reply, desc, ocr_text)
-    return (
-        f"圖片內容：{basis}\n\n"
-        "正方：如果圖片中的主張或呈現方式成立，它的價值是把重點快速整理出來，"
-        "讓人先抓到可以討論的方向。\n\n"
-        "反方：但只看圖片仍可能缺少來源、時間、完整脈絡或關鍵數字，"
-        "不能把截圖本身當成完整證據。\n\n"
-        "統一論點：先把這張圖當成線索；可見內容可以參考，"
-        "但真正要採取行動前，應回到原始資料、上下文或再補查來源。"
-    )
+        contexts = (ocr_text, ocr_text[:500], ocr_text[:1500])
+        if is_image_context_echo(reply, *contexts, *(post_check(s) for s in contexts)):
+            return None
+    return render_image_reply(reply)
 
 
 def _normalize_num_token(token: str) -> str:
@@ -218,83 +207,167 @@ def _extract_market_screenshot_reply(ocr_text: str) -> Optional[str]:
     if not rows:
         return None
 
-    rows_text: list[str] = ["我只能依附圖 OCR 到的市場數字整理，不補外部報價。"]
-    for idx, (label, level, change, percent) in enumerate(rows, 1):
-        parts = []
-        if level:
-            parts.append(level)
-        if change:
-            parts.append(f"變動 {change}")
-        if percent:
-            parts.append(f"漲跌幅 {percent}")
-        rows_text.append(f"{idx}. {label}：" + "，".join(parts))
-    rows_text.append("如果你說的 6% 是其中某個標的，請直接指定那一列或再傳更清楚截圖。")
-    content = "\n".join(rows_text)
-    return (
-        f"圖片內容：{content}\n\n"
-        "正方：這類截圖適合快速看盤，能先抓到哪些指數或商品正在漲跌，也能避免把不同標的混在一起。\n\n"
-        "反方：它只是某一刻的 OCR 數字，可能有延遲、截圖時間不明或辨識錯字；不能直接當完整報價或交易理由。\n\n"
-        "統一論點：先把它當盤面快照使用；若要下單或判斷趨勢，還要回到券商即時報價、K 線與你實際部位一起看。"
-    )
+    rising, falling, flat = [], [], []
+    for label, _level, _change, percent in rows:
+        if not percent:
+            continue
+        try:
+            movement = float(percent.replace("%", "").replace("−", "-").strip())
+        except ValueError:
+            continue
+        (rising if movement > 0 else falling if movement < 0 else flat).append(label)
+    if not (rising or falling or flat):
+        return None
+    if rising and falling:
+        take = f"{'、'.join(rising)}走強，但{'、'.join(falling)}轉弱，表現有分歧。"
+    elif rising:
+        take = f"{'、'.join(rising)}偏強，但單次漲幅還不足以確認趨勢延續。"
+    elif falling:
+        take = f"{'、'.join(falling)}偏弱，暫時不宜只憑一次跌幅認定已止跌。"
+    else:
+        take = f"{'、'.join(flat)}變化有限，尚缺明確方向。"
+    return take + "\n判斷僅依截圖所示變化；還需確認時間、量價與後續走勢。"
 
 
-def _alert_local_llm_down(reason: str) -> None:
-    """本機模型全載不進來（多半 ~/.cache/huggingface symlink 斷 / 外接碟沒掛）→ 通知 Andrew 一次。
+def _reset_local_llm_alert_guard() -> None:
+    global _local_llm_down_alerted, _local_llm_alert_epoch
+    with _LOCAL_LLM_ALERT_LOCK:
+        _local_llm_alert_epoch += 1
+        _local_llm_down_alerted = False
 
-    fail-soft：絕不拋例外影響回覆；process 內去重避免洗版。
-    reason 一律當不可信字串：strip mention + 截長，避免任何 caller 不慎洩漏內容 / @everyone 轟炸。
-    """
-    global _local_llm_down_alerted
-    if _local_llm_down_alerted:
-        return
-    _local_llm_down_alerted = True
-    safe = str(reason or "").replace("@everyone", "@ everyone").replace("@here", "@ here")[:80]
+
+def _alert_local_llm_down(
+    reason: str, *, expected_epoch: int | None = None
+) -> None:
+    """Send one categorical vision alert without leaking request content."""
+    global _local_llm_down_alerted, _local_llm_alert_inflight
+    with _LOCAL_LLM_ALERT_LOCK:
+        alert_epoch = _local_llm_alert_epoch
+        if expected_epoch is not None and alert_epoch != expected_epoch:
+            return
+        if (
+            _local_llm_down_alerted
+            or _local_llm_alert_inflight == alert_epoch
+        ):
+            return
+        _local_llm_alert_inflight = alert_epoch
+    code = str(reason or "")
+    if code == "snapshot_missing":
+        detail = (
+            "圖片模型的本機快取無法載入。請檢查 WD_BLACK 與 "
+            "~/.cache/huggingface symlink。"
+        )
+    elif code == "model_init_failed":
+        detail = "圖片模型初始化失敗；外接碟與模型快取不一定有問題。"
+    elif code == "cleanup_failed":
+        detail = "圖片模型子程序無法安全回收；系統會維持隔離並嘗試自動恢復。"
+    elif code == "warmup_timeout":
+        detail = "圖片模型預熱逾時；這不代表外接碟或模型快取損壞。"
+    else:
+        detail = "圖片模型子程序目前不可用；這不代表外接碟或模型快取損壞。"
+    delivery_status = "pending_unknown"
     try:
         import notify_discord
-        notify_discord.send_dm(
-            "⚠️ LINE bot 本機 AI 模型載不進來（" + safe + "）。"
-            "圖片目前只能回降級訊息。請檢查外接碟 WD_BLACK 是否沒接 / "
-            "~/.cache/huggingface symlink 是否斷掉。"
+        result = notify_discord.send_dm_result(
+            "⚠️ LINE bot " + detail + " 圖片目前會回降級訊息。"
         )
-    except Exception as e:
-        logger.warning("_alert_local_llm_down: notify failed: %s", e)
+        delivery_status = getattr(result, "status", "pending_unknown")
+    except Exception as exc:
+        logger.warning(
+            "vision alert delivery failed type=%s", type(exc).__name__
+        )
+    finally:
+        with _LOCAL_LLM_ALERT_LOCK:
+            if _local_llm_alert_epoch == alert_epoch:
+                # A definite failure is safe to retry on the next affected
+                # image. Sent and ambiguous delivery are deduped to avoid
+                # double DMs. An older result cannot overwrite real recovery.
+                _local_llm_down_alerted = delivery_status != "definite_failed"
+            if _local_llm_alert_inflight == alert_epoch:
+                _local_llm_alert_inflight = None
 
 
-def _respond_to_ocr_text(ocr_text: str) -> Optional[str]:
+def _dispatch_local_llm_alert(reason: str) -> threading.Thread | None:
+    """Dispatch one epoch-fenced operational alert off the reply-critical path."""
+    global _local_llm_alert_dispatch_epochs
+    with _LOCAL_LLM_ALERT_LOCK:
+        alert_epoch = _local_llm_alert_epoch
+        if (
+            _local_llm_down_alerted
+            or _local_llm_alert_inflight == alert_epoch
+            or alert_epoch in _local_llm_alert_dispatch_epochs
+        ):
+            return None
+        _local_llm_alert_dispatch_epochs.add(alert_epoch)
+
+    def _deliver() -> None:
+        try:
+            _alert_local_llm_down(reason, expected_epoch=alert_epoch)
+        finally:
+            with _LOCAL_LLM_ALERT_LOCK:
+                _local_llm_alert_dispatch_epochs.discard(alert_epoch)
+
+    worker = threading.Thread(
+        target=_deliver,
+        name="vision-alert-delivery",
+        daemon=True,
+    )
+    try:
+        worker.start()
+    except Exception as exc:
+        with _LOCAL_LLM_ALERT_LOCK:
+            _local_llm_alert_dispatch_epochs.discard(alert_epoch)
+        logger.warning(
+            "vision alert dispatch failed type=%s", type(exc).__name__
+        )
+        return None
+    return worker
+
+
+def _respond_to_ocr_text(ocr_text: str, user_prompt: str = "") -> Optional[str]:
     """本機 vision 描述不可用時：把 OCR 文字餵本機 14B，針對『內容』生回應（非 echo / 非裸吐）。
 
     單次快速本機呼叫（無 web search / grounding / critique），塞得進 _handle_image_message
     的 50s reply 視窗。回傳前過 vision_common.post_check 對齊規則 0 / 黑名單。
-    本機 LLM 不可用（模型載不進來）回 None，交給 caller 走降級訊息 + 告警。
+    本機 LLM 不可用（模型載不進來）回 None；解析文字不作降級回應。
     """
-    global _local_llm_down_alerted
     text = (ocr_text or "").strip()
     if not text:
         return None
     try:
-        from local_llm import chat as local_chat
+        import local_llm
     except Exception as e:
         logger.warning("_respond_to_ocr_text: local_llm import failed: %s", e)
         return None
+    runtime_enabled = getattr(local_llm, "runtime_enabled", None)
+    if callable(runtime_enabled) and not runtime_enabled():
+        logger.info("OCR local text fallback skipped: runtime policy disabled")
+        return None
+    local_chat = local_llm.chat
     # 文字模式咪寶 prompt。不用 vision_common.compose_prompt：那是「看圖」取向、且會把內容
     # 塞進 system 又與 user_input 重複（codex NIT-2）。規則 0 / 黑名單對齊改靠回傳後 post_check。
     system = (
         "你是 LINE 群組對話助理咪寶，繁體中文、短句分行、像在群裡聊天。"
         "使用者貼了一張圖，以下是從圖中 OCR 抽到的文字。"
         "請『根據文字的內容』回應，不是描述圖片："
-        "是問題就直接回答、是新聞/觀點就給你的判斷、是單據/文件就摘重點並點出要注意的地方。"
+        "是問題就直接回答、是新聞/觀點就給有依據的判斷、是單據/文件就回答當前問題或指出有依據的問題，不預設摘錄或摘要。"
         "第一句必須是具體判斷或答案，禁止 echo 複述原文，"
         "禁止『這張圖 / 圖中顯示 / 我看到圖片』這種開頭。不確定就說不確定，不要編造數字或來源。"
         "\n\n"
         + _IMAGE_ARGUMENT_CONTRACT
     )
+    model_input = text[:1500]
+    if user_prompt.strip():
+        model_input = f"【使用者要求】\n{user_prompt.strip()}\n\n【OCR（內部參考）】\n{model_input}"
     try:
-        out = local_chat(text[:1500], system_prompt=system, max_tokens=500)
+        out = local_chat(model_input, system_prompt=system, max_tokens=500)
     except Exception as e:
         logger.warning("_respond_to_ocr_text: local_llm.chat failed: %s", e)
         return None
     reply = out.strip() if out and out.strip() else None
     if not reply:
+        return None
+    if is_image_context_echo(reply, text, model_input):
         return None
     try:
         from vision_common import post_check
@@ -303,8 +376,15 @@ def _respond_to_ocr_text(ocr_text: str) -> Optional[str]:
         logger.warning("_respond_to_ocr_text: post_check skipped: %s", e)
     if not reply:
         return None
-    _local_llm_down_alerted = False  # 成功＝本機腦袋活著 → reset，下次真的掛掉能再告警
+    if is_image_context_echo(reply, text, model_input):
+        return None
     return _ensure_image_argument_structure(reply, ocr_text=text)
+
+
+def _build_ocr_degraded_reply(ocr_text: str) -> Optional[str]:
+    """No visible fallback when only parsed text is available."""
+    # An OCR extract is internal context, never an answer on model failure.
+    return None
 
 
 def _to_bytes(media) -> Optional[bytes]:
@@ -327,6 +407,8 @@ def _is_cache_quality_reply(reply) -> bool:
     s = reply.strip()
     if s.startswith("📷 OCR"):           # L4 OCR-only fallback prefix
         return False
+    if s.startswith(_OCR_DEGRADED_REPLY_PREFIX):
+        return False
     if len(s) < _MIN_CACHE_REPLY_LEN:    # L3 raw desc 通常 < 200 字
         return False
     return True
@@ -345,7 +427,10 @@ def _maybe_lookup_media_cache(
         return None
     try:
         import memory
-        sha = memory.compute_sha256(image_bytes)
+        sha = memory.compute_sha256(
+            (_IMAGE_CACHE_VERSION if media_type == "image" else
+             VIDEO_CACHE_VERSION if media_type == "video" else b"") + image_bytes
+        )
         hit = memory.lookup_media_cache(group_id, media_type, sha)
         if hit:
             if media_type == "image" and not _has_image_argument_structure(
@@ -390,7 +475,10 @@ def _maybe_write_media_cache(
         return
     try:
         import memory
-        sha = memory.compute_sha256(image_bytes)
+        sha = memory.compute_sha256(
+            (_IMAGE_CACHE_VERSION if media_type == "image" else
+             VIDEO_CACHE_VERSION if media_type == "video" else b"") + image_bytes
+        )
         memory.insert_media_cache(group_id, media_type, sha, description, reply)
         logger.info(
             "media_cache WRITE group=%s type=%s sha=%s reply_len=%d",
@@ -404,39 +492,74 @@ def analyze_image(
     image: str | Path | bytes,
     user_prompt: str = "",
     group_id: str | None = None,
+    *,
+    timeout_sec: float | None = None,
+) -> Optional[str]:
+    """Return only the answer, including for cached and fallback results."""
+    return render_image_reply(_analyze_image(
+        image, user_prompt=user_prompt, group_id=group_id, timeout_sec=timeout_sec
+    ))
+
+
+def _analyze_image(
+    image: str | Path | bytes,
+    user_prompt: str = "",
+    group_id: str | None = None,
+    *,
+    timeout_sec: float | None = None,
 ) -> Optional[str]:
     """對圖片產生回應。失敗回 None。
 
     流程：
       1. OCR 抽文字（如果有 ocr_helper）
       2. 本機 Vision LLM（mlx-vlm Qwen2.5-VL-7B）看圖 + 用 OCR 文字輔助 prompt
-      3. 本機失敗 → 至少回 OCR 文字（零雲端 fallback）
+      3. 無法產生實質回應時靜默；OCR/解析文字不作降級答案。
 
     Phase 1（media_cache）：caller 傳 group_id 時走 byte-exact cache dedup
     （group-scoped），命中跳過 v4 7-step pipeline。
     """
-    # Phase 1 media_cache lookup
-    cached = _maybe_lookup_media_cache(image, group_id, "image")
+    timeout = (
+        _IMAGE_ANALYSIS_DEFAULT_TIMEOUT_SEC
+        if timeout_sec is None
+        else max(0.0, float(timeout_sec))
+    )
+    deadline = time.monotonic() + timeout
+
+    # Default image answers cannot satisfy or cache a distinct explicit request.
+    use_default_cache = not user_prompt.strip()
+    cached = _maybe_lookup_media_cache(image, group_id, "image") if use_default_cache else None
     if cached:
+        _remaining_image_budget(deadline)
         return cached
 
     # OCR
     ocr_text = None
     try:
         from ocr_helper import extract_text
-        ocr_text = extract_text(image)
+        ocr_text = _extract_ocr_with_deadline(
+            extract_text,
+            image,
+            _remaining_image_budget(deadline),
+        )
         if ocr_text:
             logger.info("OCR 抽到 %d chars", len(ocr_text))
+    except MediaVisionTimeoutError:
+        raise
     except ImportError:
         logger.info("ocr_helper 未建，跳過 OCR")
     except Exception as e:
         logger.warning("OCR failed: %s", e)
 
-    if ocr_text:
+    _remaining_image_budget(deadline)
+
+    if ocr_text and not user_prompt.strip():
         market_reply = _extract_market_screenshot_reply(ocr_text)
         if market_reply:
+            _remaining_image_budget(deadline)
             _maybe_write_media_cache(image, group_id, "image", ocr_text, market_reply)
             return market_reply
+
+    has_ocr = bool(ocr_text and ocr_text.strip())
 
     # 拼 prompt
     prompt = _build_image_argument_prompt(user_prompt)
@@ -445,38 +568,111 @@ def analyze_image(
 
     # Layer 1：本機 vision LLM 抽描述（raw bytes 不離本機）
     desc = None
+    vision_failure_code = ""
+    vision_capacity_errors: tuple[type[BaseException], ...] = ()
+    vision_unavailable_error: type[BaseException] | None = None
+    vision_kwargs = {"prompt": prompt}
+    remaining = _remaining_image_budget(deadline)
+    if (
+        has_ocr
+        and remaining is not None
+        and remaining <= _OCR_DEGRADED_REPLY_RESERVE_SEC
+    ):
+        return None
+    if remaining is not None:
+        vision_kwargs["timeout_sec"] = (
+            remaining - _OCR_DEGRADED_REPLY_RESERVE_SEC
+            if has_ocr
+            else remaining
+        )
     try:
-        from vision_llm import describe_image
-        desc = describe_image(image, prompt=prompt)
+        import vision_llm
+
+        candidate_capacity_errors = (
+            getattr(vision_llm, "VisionBusyError", None),
+            getattr(vision_llm, "VisionTimeoutError", None),
+        )
+        vision_capacity_errors = tuple(
+            error_type
+            for error_type in candidate_capacity_errors
+            if isinstance(error_type, type)
+            and issubclass(error_type, BaseException)
+        )
+        candidate_unavailable_error = getattr(
+            vision_llm, "VisionUnavailableError", None
+        )
+        if (
+            isinstance(candidate_unavailable_error, type)
+            and issubclass(candidate_unavailable_error, BaseException)
+        ):
+            vision_unavailable_error = candidate_unavailable_error
+
+        desc = vision_llm.describe_image(image, **vision_kwargs)
     except ImportError:
         logger.info("vision_llm 未建")
     except Exception as e:
-        logger.warning("vision_llm failed: %s", e)
+        if vision_capacity_errors and isinstance(e, vision_capacity_errors):
+            if has_ocr:
+                return None
+            raise
+        failure_code = getattr(e, "code", "worker_unavailable")
+        is_warmup_timeout = (
+            vision_unavailable_error is not None
+            and isinstance(e, vision_unavailable_error)
+            and failure_code == "warmup_timeout"
+        )
+        if is_warmup_timeout and has_ocr:
+            _dispatch_local_llm_alert("warmup_timeout")
+            return None
+        if failure_code == "local_snapshot_unavailable":
+            vision_failure_code = "snapshot_missing"
+        elif failure_code == "local_model_unavailable":
+            vision_failure_code = "model_init_failed"
+        elif failure_code == "cleanup_failed":
+            vision_failure_code = "cleanup_failed"
+        elif failure_code == "warmup_timeout":
+            vision_failure_code = "warmup_timeout"
+        else:
+            vision_failure_code = "worker_unavailable"
+        logger.warning(
+            "vision_llm failed code=%s error_type=%s",
+            vision_failure_code,
+            type(e).__name__,
+        )
+
+    _remaining_image_budget(deadline)
 
     if not desc or not desc.strip():
+        if vision_failure_code in {
+            "snapshot_missing",
+            "model_init_failed",
+            "cleanup_failed",
+            "warmup_timeout",
+        }:
+            _alert_local_llm_down(vision_failure_code)
         # 沒 vision 描述（多半本機 vision 模型載不進來）。不要只裸吐 OCR
         # （user: 要「根據 OCR 結果回應」，不是只做辨識）：先用本機 LLM 針對 OCR 內容生回應。
         if ocr_text:
-            ocr_reply = _respond_to_ocr_text(ocr_text)
+            ocr_reply = (
+                _respond_to_ocr_text(ocr_text, user_prompt=user_prompt)
+                if user_prompt.strip() else _respond_to_ocr_text(ocr_text)
+            )
             if ocr_reply:
                 ocr_reply = _ensure_image_argument_structure(
                     ocr_reply, ocr_text=ocr_text
                 )
-                _maybe_write_media_cache(image, group_id, "image", ocr_text, ocr_reply)
+                _remaining_image_budget(deadline)
+                if use_default_cache:
+                    _maybe_write_media_cache(image, group_id, "image", ocr_text, ocr_reply)
                 return ocr_reply
-            # 本機 LLM 也載不進來 → 誠實降級 + 一次性告警（不再裸吐 OCR 當答案）。
-            # ⚠️ 此降級訊息「絕不」寫入 media_cache：它是暫時性 model-down 狀態，模型恢復後
-            #    必須能重答；快取它會在恢復後永遠回放這句（stale-cache bug）。勿在此加 cache write。
-            _alert_local_llm_down("vision + 對話模型皆無法載入")
-            # 不附 raw OCR 文字：user 要的是「根據內容回應」，裸吐 OCR 正是要避免的行為。
-            # 本機腦袋掛掉時就誠實說明、別假裝在回答。
-            return (
-                "我有看到圖裡有文字，但我本機的 AI 模型現在載不進來，"
-                "等恢復我再針對內容仔細回你 🙏"
-            )
+            # No answer is available; do not expose OCR or a status receipt.
+            return None
         return None
 
-    # Layer 2：預設純本機四段整理。圖片內容與圖片摘要不外送；若未來需要
+    # A successful visual result re-arms the once-per-outage notification.
+    _reset_local_llm_alert_guard()
+
+    # Layer 2：預設純本機實質回應。圖片內容與圖片摘要不外送；若未來需要
     # web-context 圖片查證，必須明確以 MEDIA_IMAGE_WEB_CONTEXT=1 opt in。
     import os as _os
     if _os.environ.get("MEDIA_IMAGE_WEB_CONTEXT") == "1" and _os.environ.get(
@@ -484,32 +680,37 @@ def analyze_image(
     ) != "1":
         try:
             if _os.environ.get("MEDIA_PIPELINE_V4", "1") != "0":
-                wrapped = _v4_news_style_pipeline(desc, ocr_text or "")
+                wrapped = _v4_news_style_pipeline(desc, ocr_text or "", user_prompt=user_prompt)
             else:
-                wrapped = _wrap_with_gemini_news_style(desc, ocr_text or "")
+                wrapped = _wrap_with_gemini_news_style(desc, ocr_text or "", user_prompt=user_prompt)
             if wrapped:
                 wrapped = _ensure_image_argument_structure(
                     wrapped, desc=desc, ocr_text=ocr_text or ""
                 )
-                _maybe_write_media_cache(image, group_id, "image", desc, wrapped)
+                _remaining_image_budget(deadline)
+                if use_default_cache:
+                    _maybe_write_media_cache(image, group_id, "image", desc, wrapped)
                 return wrapped
         except Exception as e:
             logger.warning("hybrid pipeline failed, fallback to raw desc: %s", e)
 
-    # Layer 3：純 vision_llm 描述 → 四段格式
+    # Layer 3：只回傳依圖片產生的答案。
+    _remaining_image_budget(deadline)
     return _ensure_image_argument_structure(desc, desc=desc, ocr_text=ocr_text or "")
 
 
-def _v4_news_style_pipeline(desc: str, ocr_text: str = "") -> Optional[str]:
+def _v4_news_style_pipeline(
+    desc: str, ocr_text: str = "", user_prompt: str = ""
+) -> Optional[str]:
     """v4 完整 7 步 pipeline — 比 _wrap_with_gemini_news_style 豐富 3-5x。
 
     Step 1: vision_describe + OCR（caller 已給）
     Step 2: query expansion（本機 14B 生 6 個多樣 search query）
     Step 3: multi-source aggregate（DDG/GNews/Wiki × N，權威 domain 排序）
     Step 4: top-5 full text fetch（trafilatura 平行）
-    Step 5: generate rich reply（本機 14B，新 prompt 強制 ≥5 URL）
+    Step 5: generate concise reply（本機 14B，查證材料作為內部依據）
     Step 6: grounding verify（grounding_local 4-signal）
-    Step 7: self-critique refine（找 hallucinate + 補 missing fact）
+    Step 7: self-critique refine（修正矛盾或無依據的主張）
 
     全步驟有 fallback；任一爆 → graceful 退到簡版。
     """
@@ -536,7 +737,7 @@ def _v4_news_style_pipeline(desc: str, ocr_text: str = "") -> Optional[str]:
         )
     except Exception as e:
         logger.warning("v4 step 3 aggregate failed: %s", e)
-        return _wrap_with_gemini_news_style(desc, ocr_text)  # 退舊版
+        return _wrap_with_gemini_news_style(desc, ocr_text, user_prompt=user_prompt)  # 退舊版
 
     # ── Step 4: Top-5 full text fetch ──
     rich_sources = sources
@@ -559,26 +760,16 @@ def _v4_news_style_pipeline(desc: str, ocr_text: str = "") -> Optional[str]:
 
     # ── Step 5: Generate rich reply ──
     user_msg = (
-        f"LINE 群有人貼了一張圖。請寫一段豐富、有具體 fact、引多源的咪寶風回覆。\n\n"
+        f"LINE 群有人貼了一張圖。請用繁體中文簡潔回答，保留必要原因、限制與建議。\n\n"
+        f"【使用者要求】\n{user_prompt.strip() or '請根據圖片直接回應'}\n\n"
         f"【圖片描述】\n{desc}\n"
         f"【OCR 文字】\n{ocr_text or '(無)'}\n\n"
-        f"【相關 sources（{len(rich_sources)} 條，按權威排序，前 5 已 fetch 完整內容）】\n"
-        f"{sources_block or '(沒抓到 sources)'}\n\n"
-        f"=== 固定輸出格式 ===\n"
-        f"圖片內容：先說這張圖在講什麼，含可見的關鍵文字、數字、人物、事件或商品；看不到就說看不到。\n"
-        f"正方：整理支持方/認同方 2-3 個具體論點，引 [n] sources，含人名/機構/日期或數字。\n"
-        f"反方：整理反對方/質疑方 2-3 個具體論點，引 [n] sources，含具體疑點、限制或反例。\n"
-        f"統一論點：把兩邊整合成一個最穩妥判斷，說明哪些可採信、哪些要查證，以及使用者下一步怎麼做。\n"
-        f"來源：若 sources 足夠，列至少 5 條，格式 `機構名 https://URL`，每條一行（從上面 sources 直接複製 URL，不編造、不 short URL）。\n\n"
-        f"=== 硬性規則 ===\n"
-        f"- 必須引用至少 5 個 sources（[1][2]... 對應上面）\n"
-        f"- 來源段必須 5+ 條真實 URL（從上面 sources 區塊原樣複製）\n"
-        f"- 必須含具體：人名、日期、數字、機構（至少 5 個）\n"
-        f"- 必須保留四個標籤：圖片內容、正方、反方、統一論點\n"
-        f"- 不要「希望對您有幫助 / 以上僅供參考」結尾\n"
-        f"- 整體 300-700 字\n"
-        f"- 忠實 follow sources（沒提的不要憑記憶補；矛盾要標出）\n\n"
-        f"直接給回覆，不要前綴。"
+        f"【查證材料】\n{sources_block or '(沒抓到 sources)'}\n\n"
+        f"圖片描述、OCR 與查證材料只供內部理解，不附解析摘錄或內部推理。\n"
+        f"直接給判斷，不湊論點或字數；只有使用者明確要求時才分正方／反方或列來源。\n"
+        f"忠實依據查證材料，沒提的不要憑記憶補；矛盾只說明影響答案的部分。\n"
+        f"若被要求來源，只能使用上面已提供且可核實的 URL，不編造。\n"
+        f"不要流程說明、不回覆的理由或『希望對您有幫助』結尾。"
     )
 
     # 圖片 100% 本機 policy（user 2026-05-09）：跳過 Gemini，直接走本機 14B
@@ -588,12 +779,12 @@ def _v4_news_style_pipeline(desc: str, ocr_text: str = "") -> Optional[str]:
     try:
         from local_llm import chat as local_chat
         meibao_system = (
-            "你是 LINE 群組對話助理咪寶。風格要求：繁體中文、第一句具體判斷、"
-            "固定使用圖片內容/正方/反方/統一論點四段、含具體數字/人名/日期/機構、引用至少 5 個 sources [n]、"
-            "來源段含真實 URL（5+ 條，從上面 sources 區塊原樣複製，不替換、不編造）、整體 400-700 字。"
-            "禁止「希望對您有幫助」結尾。"
+            "你是 LINE 群組對話助理咪寶。繁體中文、短句分行，直接給判斷與必要依據。"
+            "保持簡潔易讀，保留原意，不設字數或論點數量下限。"
+            "圖片解析、OCR 與推理只作內部上下文；不要輸出內部流程或不回覆的理由。"
+            "只有使用者明確要求時才分正方／反方或列已提供且可核實的來源。"
         )
-        reply = local_chat(user_msg, system_prompt=meibao_system, max_tokens=1200)
+        reply = local_chat(user_msg, system_prompt=meibao_system + "\n" + IMAGE_RESPONSE_CONTRACT, max_tokens=1200)
         reply = reply.strip() if reply else None
     except Exception as e:
         logger.warning("v4 step 5 local_llm failed: %s", e)
@@ -629,16 +820,19 @@ def _v4_news_style_pipeline(desc: str, ocr_text: str = "") -> Optional[str]:
             for r in rich_sources[:5]
         ]
         critique = critique_reply(reply, sources_for_critique)
-        n_contradicted = sum(
-            1 for c in critique.get("claims", []) if c.get("verdict") == "contradicted"
+        n_factual_defects = sum(
+            1 for c in critique.get("claims", [])
+            if c.get("verdict") in {"contradicted", "unsupported"}
         )
         n_missing = len(critique.get("missing_facts", []))
         logger.info(
-            "v4 step 7 critique: %d contradicted, %d missing facts",
-            n_contradicted, n_missing,
+            "v4 step 7 critique: %d factual defects, %d missing facts",
+            n_factual_defects, n_missing,
         )
-        if n_contradicted > 0 or n_missing >= 2:
-            refined = refine_reply(reply, critique, sources_for_critique)
+        if n_factual_defects > 0:
+            refined = refine_reply(
+                reply, critique, sources_for_critique, user_prompt=user_prompt
+            )
             if refined and refined.strip():
                 logger.info("v4 step 7 refine applied")
                 return refined.strip()
@@ -653,11 +847,13 @@ def _v4_news_style_pipeline(desc: str, ocr_text: str = "") -> Optional[str]:
     return reply
 
 
-def _wrap_with_gemini_news_style(desc: str, ocr_text: str = "") -> Optional[str]:
+def _wrap_with_gemini_news_style(
+    desc: str, ocr_text: str = "", user_prompt: str = ""
+) -> Optional[str]:
     """Opt-in web-context image wrapper; generation stays local-only."""
     # Step 1: 抽 topic 跑 web search（純本機爬蟲，多來源 8+ 筆）
     sources_block = ""
-    sources_with_url = []  # 給 prompt 強制要求 model 在 reply 帶 URL
+    sources_with_url = []  # 查證依據；需要引用時只用實際取得的 URL
     try:
         from web_scraper import search_duckduckgo, search_google_news, search_wiki_full
         topic = (desc[:80] + " " + ocr_text[:50]).strip()
@@ -713,33 +909,27 @@ def _wrap_with_gemini_news_style(desc: str, ocr_text: str = "") -> Optional[str]
     # Step 2: 寫 reply — 圖片內容/摘要不送 Gemini，固定本機 14B。
     user_msg = (
         f"LINE 群有人貼了一張圖，請用咪寶風回覆。\n\n"
+        f"【使用者要求】\n{user_prompt.strip() or '請根據圖片直接回應'}\n\n"
         f"【圖片描述】\n{desc}\n\n"
         f"【相關 sources（編號跟你引用對應，每條已含 URL）】\n{sources_block or '(沒抓到 sources)'}\n\n"
-        f"固定輸出格式：\n"
-        f"圖片內容：先說圖片在講什麼，含可見文字、數字、人物、事件或商品。\n"
-        f"正方：支持方/認同方的 2-3 個具體論點，可引用 [1][2] sources。\n"
-        f"反方：反對方/質疑方的 2-3 個具體論點，可引用 [3][4] sources。\n"
-        f"統一論點：整合兩邊，給最穩妥判斷與下一步。\n"
-        f"來源：若 sources 足夠，列至少 4 條，格式 `機構名 https://URL`，每條一行。\n\n"
-        f"硬性規則：\n"
-        f"- 必須引用至少 4 個 sources（用 [1][2] 編號對應上面 sources 區塊）\n"
-        f"- 來源段必須含實際 URL（從上面 sources 直接複製，不要編造、不要短化）\n"
-        f"- 必須保留四個標籤：圖片內容、正方、反方、統一論點\n"
-        f"- 不要「希望對您有幫助 / 以上僅供參考」結尾\n"
-        f"- 忠實 follow sources（sources 沒提的不要憑記憶補）\n\n"
-        f"直接給回覆，不要前綴。"
+        f"圖片描述與查證材料只供內部理解，不輸出解析摘錄、內部推理或處理流程。\n"
+        f"直接給判斷與必要原因、限制及建議，簡潔易讀，不湊論點或字數。\n"
+        f"只有使用者明確要求時才分正方／反方或列來源。若列來源，只用上面已提供且可核實的 URL。\n"
+        f"忠實依據查證材料，沒提的不要憑記憶補，不編造。\n"
+        f"不要不回覆的理由或『希望對您有幫助』結尾。"
     )
 
     logger.info("image web-context wrapper uses local 14B only")
     try:
         from local_llm import chat as local_chat
         meibao_system = (
-            "你是 LINE 群組對話助理咪寶。風格：繁體中文、短句分行、機制 + 數字、簡短列來源。"
-            "圖片分析必須固定使用四段：圖片內容、正方、反方、統一論點。"
+            "你是 LINE 群組對話助理咪寶。繁體中文、短句分行，簡潔回答並保留必要意思。"
+            "只有使用者明確要求時才分正方／反方或列已提供且可核實的來源。"
+            "圖片解析只作內部上下文；直接回答，不附解析內容。"
             "禁止「希望對您有幫助」結尾。"
         )
-        out = local_chat(user_msg, system_prompt=meibao_system, max_tokens=800)
-        return out.strip() if out else None
+        out = local_chat(user_msg, system_prompt=meibao_system + "\n" + IMAGE_RESPONSE_CONTRACT, max_tokens=800)
+        return render_image_reply(out)
     except Exception as e:
         logger.warning("local_llm wrap also failed: %s", e)
         return None
@@ -760,7 +950,8 @@ def analyze_video(
     Phase 1（media_cache）：caller 傳 group_id 時走 byte-exact cache dedup。
     """
     # Phase 1 media_cache lookup
-    cached = _maybe_lookup_media_cache(video, group_id, "video")
+    use_default_cache = not user_prompt.strip()
+    cached = _maybe_lookup_media_cache(video, group_id, "video") if use_default_cache else None
     if cached:
         return cached
 
@@ -781,8 +972,9 @@ def analyze_video(
         return None
 
     prompt = (
-        user_prompt
-        or f"以下是一段影片的 {len(frames)} 個關鍵畫面。請用繁體中文摘要影片內容、可能的主題、有什麼可看到的文字。重點清楚、簡短。"
+        VIDEO_COMMENTARY_CONTRACT
+        + f"\n你只有這段影片的 {len(frames)} 個抽樣關鍵畫面，沒有音訊或完整時序；不可推測口白、逐字稿、人物動機或未看到的事件。"
+        + "\n使用者問題：" + (user_prompt or "請客觀、公正評論這段影片的內容。")
     )
 
     out: Optional[str] = None
@@ -807,7 +999,7 @@ def analyze_video(
         except Exception:
             pass
 
-    if out and out.strip():
+    if use_default_cache and out and out.strip():
         _maybe_write_media_cache(video, group_id, "video", None, out)
     return out
 

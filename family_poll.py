@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from config import settings
+from sqlite_security import connect_private_sqlite
 
 _DB_PATH = Path(settings.sqlite_path)
 _ALIASES_PATH = Path(__file__).parent / "user_aliases.json"
@@ -112,7 +113,7 @@ class _ClosingConnection(sqlite3.Connection):
 
 
 def _conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(
+    conn = connect_private_sqlite(
         _DB_PATH,
         isolation_level=None,
         check_same_thread=False,

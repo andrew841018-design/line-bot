@@ -456,6 +456,9 @@ body{background:var(--bg);color:var(--tx);font-family:'Noto Sans TC',sans-serif;
     <div class="tc-body">
       <ul class="task-steps">
         <li>LINE webhook → <code>POST /callback</code> → 驗簽名 → 取出 events</li>
+        <li>2026-09-19 不重複、不摘要：一般回覆不重播群友或 bot 已傳的內容，也不換句話整理成摘要；直接回答當前問題或提供有依據的新資訊、判斷、糾正與建議，沒有實質可補充內容就不回覆。必要依據及操作確認保留；當次明確要求的摘要／引用／翻譯照辦。規則套用生成及 local／媒體提示詞，自動 URL 摘要 fallback 已停用；內部擷取、查證仍保留。這是提示詞規則，不宣稱已能辨識所有語意重複。</li>
+        <li>2026-09-19 引用回覆契約：以同群組 quoted_message_id 精確對應原文，與目前回覆一起傳入生成／查證／重試；合併訊息仍保留各自引用邊界。找不到原文不猜近期聊天，私人引用不送公開搜尋；零回覆成員仍保留引用來源，不產生回覆或分析。</li>
+        <li>2026-09-19 影片回覆契約：預設提供有依據的客觀、公正評論，不輸出摘要、內容解析或逐幕描述。字幕／畫面辨識只作內部素材；按證據強弱判斷、保留必要限制，不硬湊正反兩方。連結、引用、快取及 fallback 適用；無實質評論不送出。明確要求摘要／原文時才依要求提供。</li>
         <li>判斷類型：圖片/影片/貼圖 → 忽略；YouTube URL → yt-dlp 抓字幕；一般文字 → 繼續</li>
         <li>是否 @mention Bot？
           → 是：直接呼叫 <code>_handle_explicit_text()</code>（立即回應）
