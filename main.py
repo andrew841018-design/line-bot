@@ -628,7 +628,7 @@ def _append_bot_turn(group_id: str, text: str, *, source: str = "bot_memory") ->
 
 def _is_market_quote_outbound(text: str) -> bool:
     """Market quotes are reply-only; an expired reply token must not create a push."""
-    return (text or "").lstrip().startswith(("【市場報價", "【即時股價"))
+    return (text or "").lstrip().startswith(("【市場報價", "【即時股價", "FCN 評估"))
 
 
 def _is_market_quote_request(text: str, context: list | None = None) -> bool:
@@ -2930,9 +2930,12 @@ def _handle_event(event) -> None:
     # 2026-10-09 Andrew：「取消妹妹不回覆這個設定，從現在起妹妹的言論要回覆」——
     # 每位家人的訊息都走同一條路由（2026-09-19 的零回覆 gate 與 10/05 的引用例外已移除）。
     if isinstance(msg, TextMessageContent):
+        # FCN 指令不進 recall（2026-10-09）：之後的模型回覆不能把評估改寫成買賣建議。
+        recall_kwargs = {} if _fcn_command_body(msg.text, msg) is None else {"index_for_recall": False}
         memory.log_raw_message(
             group_id, msg.id, sender_user_id, msg.text or "",
             quoted_message_id=getattr(msg, "quoted_message_id", None),
+            **recall_kwargs,
         )
 
     # ── quota 爆時：非文字內容不排 pending reply ────────────────────────
@@ -6617,6 +6620,13 @@ def _handle_text_message(
             group_id=group_id,
             large_menu_card=True,
         )
+        return
+    # FCN 評估（2026-10-09）：「/FCN」開頭的指令放在提醒路徑之前，免得「12個月」這類字
+    # 被當成日期。認出是 FCN 指令後一律在這裡回覆並 return（評估出錯也回固定句），不會
+    # 掉進 burst 讓模型自由回答；也不取消別人正在累積的 burst。
+    fcn_body = _fcn_command_body(text, event.message)
+    if fcn_body is not None:
+        _reply_fcn(event, group_id, text, fcn_body)
         return
     # Cancellation must run before quote-context expansion, one-shot replies,
     # calendar capture, classifiers, and reminder extraction.  Otherwise a
@@ -20040,6 +20050,123 @@ def _handle_classify_command(group_id: str, text: str) -> str | None:
         return None
 
 
+_FCN_COMMAND_RE = re.compile(r"/\s{0,3}fcn(?![a-z])", re.IGNORECASE)
+_FCN_FAILURE_TEXT = "FCN 評估：暫時無法評估，請稍後再試"
+
+
+def _fcn_command_body(text: str | None, message) -> str | None:
+    """「/FCN …」後面的字（可能是空字串）；不是 FCN 指令回 None。
+
+    先 NFKC（全形「／ＦＣＮ」也算）再判斷；開頭是 @咪寶／咪寶 稱呼時看稱呼後的字。
+    不設長度上限（解析的長度上限在 fcn_eval）。偵測本身出錯就當成不是 FCN 指令。
+    """
+    try:
+        import unicodedata
+
+        normalized = unicodedata.normalize("NFKC", text or "").strip()
+        if "fcn" not in normalized.casefold():
+            return None
+        match = _FCN_COMMAND_RE.match(normalized)
+        if match is None:
+            addressed = _extract_gemini_trigger(text or "", message)
+            if not addressed:
+                return None
+            normalized = unicodedata.normalize("NFKC", addressed).strip()
+            match = _FCN_COMMAND_RE.match(normalized)
+            if match is None:
+                return None
+        return normalized[match.end():]
+    except Exception as exc:
+        logger.error("fcn command detection failed error_type=%s", type(exc).__name__)
+        return None
+
+
+def _handle_fcn_command(event, group_id: str, body: str) -> tuple[str | None, dict | None, str | None]:
+    """回 (文字, 卡片, 卡片 altText)；卡片和文字只會有一個。fcn_eval 不能 import 或
+    評估丟例外時回固定句。引用只查同群組的原始訊息，並告訴 fcn_eval 是不是 bot 發的。"""
+    message = event.message
+    quoted_text: str | None = None
+    quoted_is_bot = False
+    quoted_id = getattr(message, "quoted_message_id", None)
+    if quoted_id:
+        try:
+            row = memory.get_raw_message(group_id, quoted_id)
+        except Exception as exc:
+            logger.warning("fcn quoted lookup failed error_type=%s", type(exc).__name__)
+            row = None
+        quoted_text = (row[1] or "") if row else ""
+        quoted_is_bot = bool(row) and row[0] == "__bot__"
+    try:
+        import fcn_eval
+
+        reply = fcn_eval.handle(
+            body,
+            quoted_text=quoted_text,
+            quoted_is_bot=quoted_is_bot,
+            deadline=_media_reply_deadline(event),  # 同一套 reply token 期限（含 webhook 延遲）
+        )
+    except Exception as exc:
+        logger.error("fcn evaluation failed error_type=%s", type(exc).__name__)
+        return _FCN_FAILURE_TEXT, None, None
+    if reply.flex is not None and reply.alt_text:
+        return None, reply.flex, reply.alt_text
+    return reply.text or _FCN_FAILURE_TEXT, None, None
+
+
+def _reply_fcn(event, group_id: str, text: str, body: str) -> None:
+    """FCN 一律只用 reply token、不進 recall、不提及任何人（清掉這則訊息登記的 mention）；
+    卡片不掛選單按鈕，按鈕送來的說明文字會再掛。"""
+    _clear_reply_mention_targets(event.reply_token)
+    reply_text, card, alt_text = _handle_fcn_command(event, group_id, body)
+    if card is not None:
+        _reply(event.reply_token, alt_text, group_id=group_id, flex_card=card, index_for_recall=False)
+        return
+    _reply(
+        event.reply_token,
+        reply_text,
+        group_id=group_id,
+        allow_push_fallback=False,
+        menu_buttons=_is_menu_button_text(text),
+        index_for_recall=False,
+    )
+
+
+_FLEX_CARD_FORBIDDEN_KEYS = frozenset({"uri", "url", "data", "altUri"})
+
+
+def _flex_card_texts(node) -> list[str]:
+    """FCN 卡片的結構白名單：action 只能是 message、不能有網址或 postback；回傳所有要驗的字。"""
+    texts: list[str] = []
+    if isinstance(node, dict):
+        if _FLEX_CARD_FORBIDDEN_KEYS & set(node):
+            raise ValueError("flex card contains a forbidden key")
+        action = node.get("action")
+        if action is not None:
+            if not isinstance(action, dict) or action.get("type") != "message":
+                raise ValueError("flex card action must be a message action")
+            texts += [str(action.get("label") or ""), str(action.get("text") or "")]
+        if node.get("type") == "text":
+            texts.append(str(node.get("text") or ""))
+        for key, value in node.items():
+            if key != "action":
+                texts += _flex_card_texts(value)
+    elif isinstance(node, list):
+        for item in node:
+            texts += _flex_card_texts(item)
+    return texts
+
+
+def _validated_flex_card_message(alt_text: str, contents: dict):
+    """altText 與卡片上每個字都要原樣通過 outbound validator，否則丟例外（不送）。"""
+    from linebot.v3.messaging import FlexContainer, FlexMessage  # type: ignore[import-untyped]
+
+    for value in [alt_text, *_flex_card_texts(contents)]:
+        result = output_validator.validate_outbound_text(value)
+        if not result.ok or result.text != value:
+            raise ValueError("flex card text rejected by outbound validator")
+    return FlexMessage(alt_text=alt_text, contents=FlexContainer.from_dict(contents))
+
+
 def _handle_finance_view_command(group_id: str, text: str) -> str | None:
     """處理 /觀點 [可選: 家人名 | 標的]。純 SQL 聚合，不過 Gemini。
 
@@ -20588,6 +20715,12 @@ _HELP_TEXT = (
     "  /待辦                   列出待辦與提醒事項\n"
     "  /行事曆                 列出未來 30 天的家族活動\n"
     "  /取消活動 <關鍵字>      取消含關鍵字的活動\n"
+    "【投資】\n"
+    "  /FCN                    FCN 評估怎麼用（選單「🧾 FCN評估」也可以）\n"
+    "  /FCN 股票… 年利率X%     評估銀行 FCN 的 CP值，例：/FCN NVDA AMD TSLA 年利率18%\n"
+    "                          1–4 檔，代號或中文名都可以；期限沒寫當 6 個月，\n"
+    "                          可加「12個月」「KO95%」「KI60%」\n"
+    "                          引用理專那則訊息再打 /FCN：先回「我讀到的條件」，點按鈕才評估\n"
     "【其他】\n"
     "  /group_id               顯示本群 ID\n"
     "  /help                   看這張說明"
@@ -21339,6 +21472,8 @@ def _reply(
     menu_card: bool = False,
     large_menu_card: bool = False,
     menu_buttons: bool = False,
+    flex_card: dict | None = None,
+    index_for_recall: bool = True,
 ) -> bool:
     """
     回覆 LINE 訊息。若帶 group_id,成功後會把 bot 的回覆也存進 raw_messages,
@@ -21370,7 +21505,19 @@ def _reply(
 
     ``menu_buttons``（按了選單按鈕的回覆）：選單的 Quick Reply 再掛到這次回覆的
     最後一則上，連續點下一顆不用重打「選單」；搭車的提醒照送（2026-10-07）。
+
+    ``flex_card``（FCN 評估卡，2026-10-09）：主訊息是這張 Flex 卡，``text`` 傳 altText。
+    規則同大字選單（不搭到期提醒、不 push fallback、組卡失敗不送並結案），另外 altText
+    與卡片上每個字都要原樣通過 outbound validator、action 只能是 message。全程式只有
+    FCN 一個呼叫點；不能和 menu_card／large_menu_card 一起用。
+
+    ``index_for_recall``：False 時 bot 的這則回覆存檔但不進 recall 索引（FCN 用）。
     """
+    if flex_card is not None and (menu_card or large_menu_card):
+        logger.error("flex_card cannot be combined with menu cards group=%s", group_id)
+        return False
+    archive_kwargs: dict = {} if index_for_recall else {"index_for_recall": False}
+    original_text = text
     if not text or not text.strip():
         if reply_provenance.dropped():
             # The generated reply claimed a search nobody ran: intentionally silent.
@@ -21412,20 +21559,31 @@ def _reply(
     # legacy pending branch 僅在 _PENDING_REPLY_ENABLED=True 的測試/rollback 場景會啟用。
     reply_targets = _consume_reply_mention_targets(reply_token)
     primary_message = None
-    if menu_card or large_menu_card:
+    if menu_card or large_menu_card or flex_card is not None:
         include_auxiliary = False
         allow_push_fallback = False
         if not primary_suppressed:
             try:
-                import flex_menu
+                if flex_card is not None:
+                    if text != original_text:
+                        raise ValueError("flex card altText was rewritten")
+                    primary_message = _validated_flex_card_message(original_text, flex_card)
+                else:
+                    import flex_menu
 
-                primary_message = (
-                    flex_menu.large_menu_message()
-                    if large_menu_card
-                    else flex_menu.menu_message()
-                )
-            except Exception:
-                logger.exception("flex menu card build failed group=%s", group_id)
+                    primary_message = (
+                        flex_menu.large_menu_message()
+                        if large_menu_card
+                        else flex_menu.menu_message()
+                    )
+            except Exception as exc:
+                if flex_card is not None:
+                    # FCN 卡片只記錯誤種類：例外訊息裡可能有卡片文字。
+                    logger.error(
+                        "flex card build failed group=%s error_type=%s", group_id, type(exc).__name__
+                    )
+                else:
+                    logger.exception("flex menu card build failed group=%s", group_id)
                 text = ""
                 primary_suppressed = True
     elif not primary_suppressed:
@@ -21983,7 +22141,9 @@ def _reply(
                         sent_text = text
                         if idx < len(messages_to_send):
                             sent_text = getattr(messages_to_send[idx], "text", text)
-                        memory.log_raw_message(group_id, sm_id, "__bot__", sent_text)
+                        # 只有主訊息（FCN）不進 recall；搭車的到期提醒照常索引。
+                        primary_kwargs = archive_kwargs if idx == 0 and not primary_suppressed else {}
+                        memory.log_raw_message(group_id, sm_id, "__bot__", sent_text, **primary_kwargs)
                         reference = (
                             message_reminder_refs[idx]
                             if idx < len(message_reminder_refs)

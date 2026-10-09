@@ -53,6 +53,8 @@ SHIPPED_BUTTON_TEXTS = (
     "/民調",
     "/看記憶",
     "/規則",
+    # 2026-10-09：FCN 評估（路由測試在 test_fcn_routing.py）。
+    "/FCN",
 )
 
 # 指令型按鈕 → 應該接手的既有處理函式。/help 與晚餐推薦另有專門測試。
@@ -139,12 +141,12 @@ def test_every_button_text_is_recorded_as_shipped():
 
 
 def test_every_shipped_text_has_a_routing_test():
-    assert set(SHIPPED_BUTTON_TEXTS) == set(_COMMAND_ROUTES) | {"/help", "今晚吃什麼？"}
+    assert set(SHIPPED_BUTTON_TEXTS) == set(_COMMAND_ROUTES) | {"/help", "今晚吃什麼？", "/FCN"}
 
 
 def test_menu_respects_line_quick_reply_limits():
     items = flex_menu.menu_message().to_dict()["quickReply"]["items"]
-    assert len(items) == len(flex_menu.BUTTONS) == 11
+    assert len(items) == len(flex_menu.BUTTONS) == 12
     assert len(items) <= QUICK_REPLY_MAX_ITEMS
     for item in items:
         action = item["action"]
@@ -282,6 +284,16 @@ def test_long_text_mentioning_menu_skips_detection():
         main._handle_text_message(event, "G_TEST")
 
     extract.assert_not_called()
+
+
+def test_fcn_button_has_text_and_is_in_both_menus():
+    """Andrew：「FCN部分不能只有圖示，要有文字」；一般選單與大字卡片要同步。"""
+    quick = [item["action"] for item in flex_menu.menu_message().to_dict()["quickReply"]["items"]]
+    assert {"type": "message", "label": "🧾 FCN評估", "text": "/FCN"} in quick
+    large = json.dumps(flex_menu.build_large_menu(), ensure_ascii=False)
+    assert '"label": "🧾 FCN評估"' in large and '"text": "/FCN"' in large
+    labels = [label for label, _text in flex_menu.BUTTONS]
+    assert labels.index("🧾 FCN評估") == labels.index("💬 財經觀點") + 1
 
 
 def test_menu_card_has_exactly_one_call_site():
