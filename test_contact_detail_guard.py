@@ -1,15 +1,20 @@
 """模型寫的地址、電話要有依據，否則整則不送（Andrew 2026-10-09）。
 
 「任何資訊必須驗證再驗證，他得是真的」：依據只能是使用者給的內容、引用原文、預讀
-素材、程式取得的搜尋結果或查證過的晚餐清單。內容全是合成的。
+素材、程式取得的搜尋結果或查證過的晚餐清單。內容全是合成的；晚餐清單那幾則
+用 dinner_places.json 裡的公開店家。
 """
 
 from __future__ import annotations
 
+import dataclasses
+import random
 import time
+from datetime import timedelta
 
 import pytest
 
+import dinner_places
 import main
 import reply_policy
 import reply_provenance
@@ -124,6 +129,115 @@ def test_a_verified_address_counts_only_beside_its_own_name():
     assert reply_policy.unbacked_contact_details("某披薩屋，地址在測試市中正區甲路一段1號", [], places)
 
 
+# 2026-10-10 review：清單地址要配「最近的已知店名」，附近有任一個對應店名不算數。
+# 這三筆照 dinner_places.json（2026-10-09 查證版）抄寫，不讀檔，清單更新不影響。
+_LISTED = [
+    ("93蕃茄牛肉麵", "台北市中正區青島東路3之2號"),
+    ("基隆麵食館", "台北市中正區青島東路7之3號"),
+    ("巷貓 Alleycat's Pizza 華山店", "台北市中正區八德路一段1號（華山1914文創園區）"),
+]
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        # 審查員實測（拿坡里披薩不在清單）：別家店那行配上 93蕃茄牛肉麵 的地址
+        "1. 93蕃茄牛肉麵｜青島東路3之2號\n2. 拿坡里披薩｜青島東路3之2號",
+        "推薦拿坡里披薩（青島東路3之2號），隔壁就是93蕃茄牛肉麵",
+        # 同樣的錯配，兩家都在清單裡
+        "1. 93蕃茄牛肉麵｜青島東路3之2號\n2. 基隆麵食館｜青島東路3之2號",
+        "推薦基隆麵食館（青島東路3之2號），隔壁就是93蕃茄牛肉麵",
+        "93蕃茄牛肉麵\n🍽 基隆麵食館\n📍 青島東路3之2號",
+        # 括號裡的地址屬於括號前面那家
+        "拿坡里披薩（青島東路3之2號）就在93蕃茄牛肉麵隔壁",
+        # 新項目那行可以算，但不能越過它往上找
+        "1. 93蕃茄牛肉麵\n2. 拿坡里披薩\n📍 青島東路3之2號",
+        "🍽 93蕃茄牛肉麵\n- 拿坡里披薩 青島東路3之2號",
+    ],
+)
+def test_a_listed_address_needs_its_own_name_nearest(reply):
+    assert reply_policy.unbacked_contact_details(reply, [], _LISTED)
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "93蕃茄牛肉麵（青島東路3之2號）",
+        "青島東路3之2號的93蕃茄牛肉麵",
+        "青島東路3之2號（善導寺站附近）的93蕃茄牛肉麵",
+        "我們約在老地方（青島東路3之2號的93蕃茄牛肉麵）",
+        "🍽 93蕃茄牛肉麵\n📍 青島東路3之2號",
+        "🍽 93蕃茄牛肉麵\n📍 青島東路3之2號，隔壁是基隆麵食館",
+        "1. 93蕃茄牛肉麵｜青島東路3之2號\n2. 基隆麵食館｜青島東路7之3號",
+        "1. 93蕃茄牛肉麵\n地址：青島東路3之2號",
+        "1️⃣ 93蕃茄牛肉麵\n🍜 番茄湯頭\n📍 青島東路3之2號",
+        "**93蕃茄牛肉麵**\n**地址**：青島東路3之2號",
+        "🍽\ufe0f 巷貓 Alleycat's Pizza 華山店\n📍 台北市中正區八德路一段1號（華山1914文創園區）",
+    ],
+)
+def test_a_listed_address_beside_its_own_name_is_backed(reply):
+    assert reply_policy.unbacked_contact_details(reply, [], _LISTED) == []
+
+
+def test_backing_still_covers_a_listed_address_beside_another_name():
+    reply = "1. 93蕃茄牛肉麵｜青島東路3之2號\n2. 拿坡里披薩｜青島東路3之2號"
+    assert reply_policy.unbacked_contact_details(reply, ["拿坡里披薩在青島東路3之2號"], _LISTED) == []
+
+
+def _list_days():
+    """正式清單最新查證日起連續七天（每個星期都有，公休的店換一天會出現）。"""
+    places, max_age = dinner_places.load()
+    assert places, "dinner_places.json 讀不到"
+    latest = max(p.verified_on for p in places)
+    return [latest + timedelta(days=k) for k in range(min(7, max_age + 1))]
+
+
+def test_every_place_the_list_can_recommend_passes_the_guard():
+    places, max_age = dinner_places.load()
+    shown: set[str] = set()
+    expected: set[str] = set()
+    for day in _list_days():
+        text = dinner_places.recommend("今晚吃什麼？", today=day, rng=random.Random(day.toordinal()), count=len(places))
+        assert reply_policy.unbacked_contact_details(text, [], dinner_places.known_places(today=day)) == [], text
+        shown |= {line.removeprefix(dinner_places.NAME_MARK) for line in text.splitlines() if line.startswith(dinner_places.NAME_MARK)}
+        expected |= {p.name for p in dinner_places.open_tonight(dinner_places.fresh(places, day, max_age), day)}
+    assert expected and shown == expected
+
+
+@pytest.mark.parametrize("asked", ["今晚吃什麼？", "想吃日式", "便宜一點", "預算300", "想吃火鍋"])
+def test_recommendations_from_the_list_pass_the_guard(asked):
+    for day in _list_days():
+        places = dinner_places.known_places(today=day)
+        for seed in range(5):
+            text = dinner_places.recommend(asked, today=day, rng=random.Random(seed))
+            assert dinner_places.ADDRESS_MARK in text
+            assert reply_policy.unbacked_contact_details(text, [], places) == [], text
+
+
+def test_a_listed_name_with_another_listed_address_is_unbacked():
+    """10/7 的錯，用推薦本身的格式：清單每一家的店名都配上下一家的地址。"""
+    day = _list_days()[0]
+    places, max_age = dinner_places.load()
+    fresh = dinner_places.fresh(places, day, max_age)
+    known = dinner_places.known_places(today=day)
+    for place, other in zip(fresh, fresh[1:] + fresh[:1]):
+        if reply_policy._address_keys(place.address) == reply_policy._address_keys(other.address):
+            continue
+        text = dinner_places.render_block(dataclasses.replace(place, address=other.address))
+        assert reply_policy.unbacked_contact_details(text, [], known), text
+
+
+@pytest.mark.parametrize(
+    "unit",
+    ["93蕃茄牛肉麵", "青島東路3之2號", "93蕃茄牛肉麵青島東路3之2號", "青島東路3之2號，93蕃茄牛肉麵", "1. 青島東路3之2號\n"],
+)
+def test_scan_with_listed_places_is_linear(unit):
+    text = (unit * 20000)[:20000]
+    start = time.perf_counter()
+    reply_policy.unbacked_contact_details(text, [], _LISTED)
+    assert time.perf_counter() - start < 1.0
+
+
 @pytest.mark.parametrize(
     "reply",
     ["📍 青島東路 3 之 2 號", "台北市中正區忠孝東路 2 段 33 號", "林森南路 61 巷 19 號", "中山一路5號", "撥 0800-000-000"],
@@ -139,13 +253,47 @@ def test_a_remembered_address_is_backing():
     assert out
 
 
-def test_a_mixed_burst_marks_the_member_without_a_name():
-    import burst_filter
+_TWO = [("93蕃茄牛肉麵", "台北市中正區青島東路3之2號"), ("基隆麵食館", "台北市中正區青島東路7之3號")]
 
-    pending = [("m1", "我下個月搬去台中", "U_A", 0.0), ("m2", "我在台北上班", "U_B", 0.0)]
-    labels = {"U_A": "成員甲"}
-    text = burst_filter._combine(pending, group_id="G", label_of=lambda _g, uid: labels.get(uid, ""))
-    assert text == "成員甲：我下個月搬去台中\n（不確定是誰）：我在台北上班"
-    # one unknown person alone needs no marker
-    solo = burst_filter._combine(pending[1:], group_id="G", label_of=lambda _g, uid: "")
-    assert solo == "我在台北上班"
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "1. 基隆麵食館（93蕃茄牛肉麵隔壁）｜青島東路3之2號",
+        "基隆麵食館就在93蕃茄牛肉麵旁邊，地址是青島東路3之2號",
+        "🍽 基隆麵食館\n就在93蕃茄牛肉麵隔壁\n📍 青島東路3之2號",
+        "**基隆麵食館**（93蕃茄牛肉麵對面）\n**地址**：青島東路3之2號",
+        "📍 青島東路3之2號（93蕃茄牛肉麵樓上的基隆麵食館）",
+        "93蕃茄牛肉麵、基隆麵食館：青島東路7之3號",
+        "基隆麵食館隔壁的93蕃茄牛肉麵在青島東路7之3號",
+        "93蕃茄牛肉麵\n基隆麵食館在青島東路7之3號，二店在青島東路3之2號",
+        "推薦93蕃茄牛肉麵\n基隆麵食館：青島東路7之3號，分店：青島東路3之2號",
+    ],
+)
+def test_every_listed_name_around_an_address_must_own_it(reply):
+    # 2026-10-10 review（第三輪）：只看最近的一家會被「A 店（B 店隔壁）｜B 店地址」繞過。
+    assert reply_policy.unbacked_contact_details(reply, [], _TWO)
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "93蕃茄牛肉麵很好吃，地址是青島東路3之2號",
+        "基隆麵食館很讚\n93蕃茄牛肉麵在青島東路3之2號",
+        "推薦青島東路3之2號的93蕃茄牛肉麵，還有青島東路7之3號的基隆麵食館",
+        "善導寺附近可以試試：\n1. 93蕃茄牛肉麵\n   - 地址：台北市中正區青島東路3之2號\n   - 特色：番茄湯頭\n"
+        "2. 基隆麵食館\n   - 地址：台北市中正區青島東路7之3號",
+        "1. **93蕃茄牛肉麵**\n   - 📍 台北市中正區青島東路3之2號",
+        "🍽 93蕃茄牛肉麵\n- 地址：台北市中正區青島東路3之2號",
+        "93蕃茄牛肉麵\n• 地址：台北市中正區青島東路3之2號",
+        "• 93蕃茄牛肉麵\n  • 青島東路3之2號",
+        "93蕃茄牛肉麵在青島東路3之2號，基隆麵食館在青島東路7之3號",
+        "93蕃茄牛肉麵（青島東路3之2號）、基隆麵食館（青島東路7之3號）",
+        "推薦93蕃茄牛肉麵，地址青島東路3之2號。基隆麵食館也不錯，地址青島東路7之3號。",
+        "比起基隆麵食館，93蕃茄牛肉麵（青島東路3之2號）湯頭更濃",
+    ],
+)
+def test_sub_bullets_and_two_shops_on_one_line_are_backed(reply):
+    # 2026-10-10 review（第三輪）：上一版把「- 地址：…」當成新項目，正確的配對被擋。
+    assert reply_policy.unbacked_contact_details(reply, [], _TWO) == []
+

@@ -637,6 +637,10 @@ def append_turn(group_id: str, role: str, text: str) -> None:
         )
 
 
+# 2026-10-10 review：對話紀錄裡的「誰說的」只能由程式寫（寫法見 speaker_turns）。
+from speaker_turns import CONTINUATION_INDENT, UNKNOWN_SPEAKER, one_line, speaker_turn  # noqa: E402,F401
+
+
 def get_context(group_id: str) -> list[tuple[str, str]]:
     """回傳 [(role, text), ...]，舊→新。"""
     with _conn() as c:
@@ -651,8 +655,12 @@ def get_context(group_id: str) -> list[tuple[str, str]]:
 
 
 def add_fact(group_id: str, fact: str, user_id: str = "") -> bool:
-    """回傳是否真的新增（False 代表重複或空字串）。user_id='' 代表群組層級。"""
-    fact = fact.strip()
+    """回傳是否真的新增（False 代表重複或空字串）。user_id='' 代表群組層級。
+
+    2026-10-10 review：存成一行（speaker_turns.one_line），多行 /記住 不能在提示的
+    事實區塊裡偽造別的行。
+    """
+    fact = one_line(fact)
     if not fact:
         return False
     with _lock, _conn() as c:
@@ -688,9 +696,10 @@ def remove_fact(group_id: str, fact_substring: str) -> int:
         ).fetchall()
         # Only facts kept under a person start with their 「稱呼：」; older group
         # facts such as 「某某生日：1/2」 are matched whole.
+        needle = needle.casefold()
         doomed = [
             rowid for rowid, user_id, fact in rows
-            if needle in (fact_body(fact) if user_id else fact)
+            if needle in (fact_body(fact) if user_id else fact).casefold()
         ]
         for start in range(0, len(doomed), 500):
             chunk = doomed[start:start + 500]

@@ -555,8 +555,6 @@ def test_extract_office_text():
 def test_handle_dinner_recommendation():
     """2026-10-09：晚餐推薦只從查證清單挑店，不呼叫任何模型。"""
     print("\n── Test G: _handle_dinner_recommendation ──")
-    import dinner_places
-
     msg = _make_text_msg("今晚吃什麼")
     evt = _make_message_event(msg)
     listed = "🍽 測試店\n📍 測試路1號\n🍴 麵食"
@@ -579,7 +577,7 @@ def test_handle_dinner_recommendation():
         main._handle_dinner_recommendation(evt, "GRP001")
     check(
         "dinner 比對不過 → 不送店家資訊",
-        mock_reply_bad.call_args[0][1] == dinner_places.NO_FRESH_TEXT,
+        mock_reply_bad.call_args[0][1] == main._DINNER_ERROR_TEXT,
     )
 
     with (
@@ -589,7 +587,7 @@ def test_handle_dinner_recommendation():
         main._handle_dinner_recommendation(evt, "GRP001")
     check(
         "dinner 例外 → 不送店家資訊",
-        mock_reply_err.call_args[0][1] == dinner_places.NO_FRESH_TEXT,
+        mock_reply_err.call_args[0][1] == main._DINNER_ERROR_TEXT,
     )
 
 
@@ -936,15 +934,25 @@ def test_small_helpers():
         main._try_save_correction("GRP001", "以後不要這樣回")
     check("有糾正關鍵字 → record correction", mock_add3.called)
 
-    # _maybe_extract_facts - bump returns True
+    # _maybe_extract_facts - bump returns True (2026-10-10: the stub returns
+    # (稱呼, 事實) pairs like the real extract_facts, and the fact is stored)
     with (
+        patch("main._gemini_side_task_allowed", return_value=True),
         patch("main.memory.bump_and_should_extract", return_value=True),
-        patch("main.gemini_client.extract_facts", return_value=["新事實"]),
-        patch("main.memory.add_fact", return_value=True),
-        patch("main.memory.list_facts", return_value=["新事實"]),
+        patch("main.memory.get_context", return_value=[("user", "成員甲：我住台中")]),
+        patch("main._known_member_labels", return_value={"成員甲": "U_FACT"}),
+        patch("main.gemini_client.extract_facts", return_value=[("成員甲", "住在台中")]) as mock_extract,
+        patch("main.memory.add_fact", return_value=True) as mock_add_fact,
+        patch("main.memory.list_facts", return_value=["成員甲：住在台中"]),
     ):
-        main._maybe_extract_facts("GRP001")  # should not raise
-    check("_maybe_extract_facts bump=True → 不爆", True)
+        main._maybe_extract_facts("GRP001")
+    check("_maybe_extract_facts bump=True → extract", mock_extract.called)
+    check(
+        "_maybe_extract_facts → 存成「稱呼：事實」＋user_id",
+        mock_add_fact.call_args is not None
+        and mock_add_fact.call_args.args == ("GRP001", "成員甲：住在台中")
+        and mock_add_fact.call_args.kwargs.get("user_id") == "U_FACT",
+    )
 
     # _maybe_extract_facts - bump returns False → skip
     with (

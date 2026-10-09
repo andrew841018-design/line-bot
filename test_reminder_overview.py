@@ -32,6 +32,8 @@ def _synthetic_aliases(tmp_path, monkeypatch):
     )
     monkeypatch.setenv("LINE_USER_ALIASES_PATH", str(aliases))
     monkeypatch.setenv("LINE_FAMILY_ROLE_ALIASES_PATH", str(tmp_path / "no_roles.json"))
+    # 2026-10-10 review：主詞判斷也讀顯示名稱，不能讀到正式的 state/
+    monkeypatch.setenv("LINE_MEMBER_DISPLAY_NAMES_PATH", str(tmp_path / "display_names.json"))
 
 
 def _day(offset: int):
@@ -391,6 +393,13 @@ def test_todo_query_reply_pings_nobody_named_in_the_list(monkeypatch):
 ])
 def test_subject_first(text, people, expected):
     assert ro.subject_first(text, people) == expected
+
+
+def test_person_words_cover_every_kinship_word():
+    """2026-10-10 review：_PERSON_WORDS 讀 reminder_intent 的私有稱謂表；那邊改名時
+    這裡會悄悄退回只有 6 個稱謂的備用表，這個契約測試會先擋下來。"""
+    assert hasattr(ri, "_SAME_EVENT_KIN")
+    assert [word for word in ri._SAME_EVENT_KIN if word not in ro._PERSON_WORDS] == []
 
 
 def test_a_companion_already_in_the_wording_is_not_moved_up():

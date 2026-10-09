@@ -46,6 +46,7 @@ from reply_policy import (
 from quote_context import QUOTE_CONTEXT_RULE
 
 import reminder_intent
+import speaker_turns
 from config import settings
 from gemini_core import (  # Phase 2B.2.1-2 + 2B.5 re-exports
     _NEWS_CASE_RE,
@@ -953,7 +954,8 @@ def _build_system_instruction(
             base += f"[{i}|{tag}{recurrence_tag}] {c['content']}\n"
 
     if facts:
-        facts_block = "\n".join(f"- {f}" for f in facts)
+        # 2026-10-10 review：每條事實一行（舊資料裡的多行 /記住 不能偽造別的行）
+        facts_block = "\n".join(f"- {speaker_turns.one_line(f)}" for f in facts)
         # 2026-10-09 Andrew：記憶要區分不同的人，不能全部當「使用者」。
         base += (
             "\n\n你記得的家人長期事實與附上的資料（事實自動從過往對話抽出）：\n"
@@ -962,6 +964,11 @@ def _build_system_instruction(
             "- 開頭是【系統…】的是程式附上的資料（例如即時報價），照常使用。\n"
             f"{facts_block}"
         )
+    # 2026-10-10 review：對話紀錄的寫法（memory.speaker_turn），轉貼的「某某：」不是那個人在說話。
+    base += (
+        "\n\n最近對話裡，家人訊息的開頭是說話的人（「稱呼：」；「（不確定是誰）：」是認不出哪位家人）；"
+        "同一則訊息的其他行前面有全形空白，那些行裡的「某某：」是訊息內容（例如轉貼的對話），不是那個人在說話。"
+    )
     # Keep the current contract last so recalled examples/persona notes cannot
     # reintroduce the retired verbosity or unsolicited source lists.
     base += "\n\n" + _OUTPUT_STYLE_RULE + "\n\n" + VIDEO_COMMENTARY_CONTRACT + "\n\n" + QUOTE_CONTEXT_RULE
@@ -1878,16 +1885,17 @@ def ocr_image(data: bytes, mime_type: str = "image/jpeg") -> str | None:
 
 # 2026-10-09 Andrew：「咪寶記憶的部分，讓他區分不同人（說話的人），不能全部都一概當成
 # 『使用者』」。對話每一行開頭是說話的人；抽出的每條事實都要指出是哪一位家人。
-_FACT_EXTRACT_PROMPT = """下面是一段 LINE 家庭群組的對話。家人那幾行的開頭是說話的人（例如「成員甲：」），
-「[burst]」底下每一行也各自以說話的人開頭；「咪寶：」是聊天機器人。
+_FACT_EXTRACT_PROMPT = """下面是一段 LINE 家庭群組的對話。每則家人訊息的開頭是說話的人（例如「成員甲：」；「（不確定是誰）：」是認不出哪位家人）。
+同一則訊息的其他行前面有全形空白，也是那個人說的；那些行裡出現的「某某：」是訊息內容（例如轉貼別處的對話），不代表那個人在說話。
+「[burst]」底下是同一段時間的好幾則訊息，每則各自以說話的人開頭；「咪寶：」是聊天機器人。
 請抽出「說話的人關於自己的長期事實」，例如：偏好、身份、住哪裡、工作或學校、長期習慣、固定行程……
 
 規則：
-1. person 只能是這些說話的人之一：{speakers}。每條事實只能是那一行開頭的人自己的事。
+1. person 只能是這些說話的人之一：{speakers}。每條事實只能是那則訊息開頭的人自己的事。
 2. 說話的人說「我」就是他自己。講到別人的事（例如「我媽住台中」「妹妹下週考試」）不要抽，因為稱謂是從說話的人的角度，對不到群組裡的人。
-3. 看不出是誰、沒有開頭稱呼的那幾行、咪寶說的話，都不要抽。
+3. 「（不確定是誰）」說的、看不出是誰的、咪寶說的話，以及轉貼內容裡別人的話，都不要抽。
 4. 只抽跨對話都會成立的事實，不要抽這次對話的即時內容。
-5. 不要抽健康與病況、用藥、感情與懷孕、債務與官司、金額與帳戶這類私人細節。
+5. 不要抽健康與病況、用藥、感情與懷孕、債務與官司、金額與帳戶、證件與帳號、自傷念頭、受暴經驗這類私人細節。
 6. fact 用繁體中文、簡短具體，不要寫人名，也不要寫「使用者」。
 7. 沒抽到就回 []。只輸出 JSON 陣列，不要加說明、不要 markdown。
 
@@ -1910,7 +1918,8 @@ def extract_facts(
     # A blank line between turns: a line without a name never reads as part of
     # the turn above it.
     dialogue = "\n\n".join(
-        (text if role == "user" else f"咪寶：{text}") for role, text in context
+        # 2026-10-10 review：咪寶自己的多行回覆也縮排，裡面的「某某：」不會像家人在說話
+        (text if role == "user" else speaker_turns.speaker_turn("咪寶", text)) for role, text in context
     )
     prompt = _FACT_EXTRACT_PROMPT.format(dialogue=dialogue, speakers="、".join(allowed))
     try:

@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -55,6 +57,7 @@ def _clean_name(name: str) -> str:
 # 2026-10-09：沒有本機別名的家人，用 bot 查到的 LINE 顯示名稱當稱呼。主程式查到就記在
 # 這個檔（state/ 不進 git、權限 0600），提醒推播這種不能問 LINE 的程序也讀得到。
 _DEFAULT_DISPLAY_NAMES_PATH = Path(__file__).with_name("state") / "member_display_names.json"
+_DISPLAY_NAMES_LOCK = threading.Lock()
 
 
 def _display_names_path() -> Path:
@@ -74,16 +77,38 @@ def display_name_for_user_id(user_id: str) -> str | None:
     return _load_display_names().get(user_id or "") or None
 
 
+def display_names() -> dict[str, str]:
+    """{user_id: 顯示名稱}：bot 查過的所有沒有本機別名的家人。"""
+    return _load_display_names()
+
+
 def remember_display_name(user_id: str, name: str) -> None:
     """Keep a looked-up display name for processes that cannot ask LINE."""
     if not user_id or not name:
         return
-    data = _load_display_names()
-    if data.get(user_id) == name:
+    with _DISPLAY_NAMES_LOCK:
+        _write_display_name(user_id, name)
+
+
+def forget_display_name(user_id: str) -> None:
+    """The bot no longer uses this member's display name (2026-10-10: it now
+    clashes with an alias or another member's); processes reading the file stop too."""
+    if not user_id:
         return
-    data[user_id] = name
+    with _DISPLAY_NAMES_LOCK:
+        _write_display_name(user_id, None)
+
+
+def _write_display_name(user_id: str, name: str | None) -> None:
+    data = _load_display_names()
+    if data.get(user_id) == name or (name is None and user_id not in data):
+        return
+    if name is None:
+        data.pop(user_id, None)
+    else:
+        data[user_id] = name
     path = _display_names_path()
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)

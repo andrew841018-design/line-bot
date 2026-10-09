@@ -312,3 +312,80 @@ def test_an_owner_without_an_alias_goes_first_by_display_name(tmp_path):
     line_mentions.remember_display_name("U_X", "小明")
     assert _push_text(rid).splitlines()[1] == "2099-10-23 12:00 小明 去青森一日遊"
     assert oct(__import__("os").stat(tmp_path / "display_names.json").st_mode & 0o777) == "0o600"
+
+
+# ── 2026-10-10 review：主人的顯示名稱 ────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("display_name", "line"),
+    [
+        ("[1]", "2099-10-23 12:00 [1] 繳電話費"),
+        # 名字不當 JSON 解析，不會變成另一位家人
+        ('["成員乙"]', '2099-10-23 12:00 ["成員乙"] 繳電話費'),
+    ],
+)
+def test_an_owner_display_name_is_shown_as_written(display_name, line):
+    import line_mentions
+
+    line_mentions.remember_display_name("U_X", display_name)
+    rid = _seed_owned("U_X", "繳電話費", "2099-10-23 12:00")
+    assert _push_text(rid).splitlines()[1] == line
+
+
+@pytest.mark.parametrize(
+    "display_name", ["ALL", "all", "All", "全家", "大家", "所有人", "everyone", "全部"]
+)
+def test_an_owner_display_name_meaning_everyone_is_not_the_subject(display_name):
+    """「全家 繳電話費」 would read as the whole family's errand; it is one member's."""
+    import line_mentions
+
+    line_mentions.remember_display_name("U_X", display_name)
+    rid = _seed_owned("U_X", "繳電話費", "2099-10-23 12:00")
+    assert _push_text(rid).splitlines()[1] == "2099-10-23 12:00 繳電話費"
+
+
+@pytest.mark.parametrize(
+    ("display_name", "action"), [("小陳", "去小陳家"), ("健康", "繳健康保險費"), ("平安", "去平安宮拜拜")]
+)
+def test_another_members_display_name_does_not_hide_the_owner(display_name, action):
+    # 2026-10-10 review（第三輪）：顯示名稱常是一般用字，不拿來判斷事項有沒有寫到人。
+    import line_mentions
+
+    line_mentions.remember_display_name("U_X", display_name)
+    rid = _seed_owned("U_A", action, "2099-10-24 12:00")
+    assert _push_text(rid).splitlines()[1] == f"2099-10-24 12:00 成員甲 {action}"
+
+
+@pytest.mark.parametrize("display_name", ["家人", "我們", "全家人", "所有人🙂"])
+def test_an_owner_named_like_the_whole_family_is_not_the_subject(display_name):
+    import line_mentions
+
+    line_mentions.remember_display_name("U_X", display_name)
+    rid = _seed_owned("U_X", "繳電話費", "2099-10-23 12:00")
+    assert _push_text(rid).splitlines()[1] == "2099-10-23 12:00 繳電話費"
+
+
+@pytest.mark.parametrize(
+    ("display_name", "action"),
+    [
+        ("陳", "陳列櫃清理"),  # 一個字的顯示名稱太容易撞到一般用字
+        ("all", "買all-in-one印表機"),  # 代表全體的顯示名稱當作沒有名字
+    ],
+)
+def test_a_one_letter_or_everyone_display_name_does_not_hide_the_owner(display_name, action):
+    import line_mentions
+
+    line_mentions.remember_display_name("U_X", display_name)
+    rid = _seed_owned("U_A", action, "2099-10-24 12:00")
+    assert _push_text(rid).splitlines()[1] == f"2099-10-24 12:00 成員甲 {action}"
+
+
+def test_an_owner_display_name_that_is_someone_elses_alias_is_not_used():
+    # 2026-10-10 review（第三輪）：10/9 檔裡的「成員乙」（別人的別名）不能讓提醒讀起來像成員乙的事。
+    import line_mentions
+
+    line_mentions.remember_display_name("U_X", "成員乙")
+    rid = _seed_owned("U_X", "繳電話費", "2099-10-23 12:00")
+    assert _push_text(rid).splitlines()[1] == "2099-10-23 12:00 繳電話費"
+

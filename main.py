@@ -35,6 +35,7 @@ import re
 import sqlite3
 import threading
 import time
+import unicodedata
 import uuid as _uuid
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta
@@ -96,6 +97,7 @@ import feedback_collector
 import gemini_client
 import line_mentions
 import memory
+import speaker_turns
 import mibao_identity
 import output_validator
 import reminder_intent
@@ -785,6 +787,9 @@ def _enforce_new_value_reply(
     the user said or shared.  This runs after the search-claim check and the
     operation-claim guard, before the restatement check.
     ``trusted_grounded`` is a fact-cache replay stored as searched.
+    ``facts`` (what the bot remembers) backs addresses／phone numbers, like
+    the family's own words: a reply with any detail nothing backs is dropped
+    whole and ``outcome["contact_details_dropped"]`` is set (2026-10-09).
     ``outcome``, when given, receives ``recorded`` (a Gemini answer recorded
     its search details), ``grounded`` (``searched``, a trusted replay,
     supported segments or research evidence; the burst fact cache keeps only
@@ -922,6 +927,8 @@ def _guard_generated_reply(reply, user_input=None, *, context=None, facts=None):
     knows what links were read and what was searched (``_caller_checked``).
     「根據這篇報導」 needs an attached file or media to cite.  A dropped reply
     marks ``reply_provenance.dropped()`` so the message is finished, not retried.
+    2026-10-09: an address or phone number nothing backs (``context`` and
+    ``facts`` count, see ``_contact_backing``) drops the reply the same way.
     """
     if not isinstance(reply, str) or not reply.strip() or reply_provenance.caller_checks():
         return reply
@@ -1074,7 +1081,7 @@ def _local_text_llm_fallback(
         logger.warning("local text fallback failed: %s", e)
         return ""
     if out and isinstance(out, str) and len(out.strip()) > 5:
-        return _guard_generated_reply(out.strip(), text)
+        return _guard_generated_reply(out.strip(), text, context=context)
     return ""
 
 
@@ -11306,6 +11313,8 @@ def _reminder_match_terms(keywords: list[str]) -> list[str]:
 
 
 def _reminder_matches_timing_keywords(item: dict, keywords: list[str]) -> bool:
+    # TODO(2026-10-09 deferred): the owner shown first (reminder_overview.shown_people)
+    # is not in the haystack, so filtering the list by that person misses those rows.
     terms = _reminder_match_terms(keywords)
     if not terms:
         return True
@@ -12428,11 +12437,13 @@ def _remember_silent_turn(
     sender_user_id: str | None = None,
     message_id: str = "",
     capture_calendar: bool = True,
+    labelled: bool = False,
 ) -> None:
     """Best-effort memory and extraction after the bot decided not to reply."""
     try:
-        # A burst turn already names each speaker (_labelled_burst_turn).
-        if not turn.startswith("[burst]"):
+        # A burst turn already names each speaker (_labelled_burst_turn); a
+        # family message that merely starts with 「[burst]」 still gets a name.
+        if not labelled:
             turn = _labelled_turn(group_id, turn, user_id=sender_user_id)
         memory.append_turn(group_id, "user", turn)
     except Exception as exc:
@@ -12457,6 +12468,7 @@ def _record_silent_burst(
         _labelled_burst_turn(group_id, combined_text, message_ids),
         combined_text,
         capture_calendar=not _burst_message_owned_by_reminder(group_id, message_ids),
+        labelled=True,
     )
 
 
@@ -12487,6 +12499,8 @@ def _retryable_burst_db_call(operation, *args, **kwargs):
 
 def _finance_speaker_name(group_id: str, user_id: str | None) -> str:
     """The family name of whoever wrote a finance view; '' when unknown."""
+    # TODO(2026-10-09 deferred): use _member_label (cache, timeout, cleaning);
+    # the finance tests then need display lookups while BOT_MUTED.
     if not user_id:
         return ""
     try:
@@ -12511,22 +12525,44 @@ _member_labels: dict[tuple[str, str], tuple[str, float]] = {}
 _member_labels_lock = threading.Lock()
 
 
-_MEMBER_LABEL_STRIP_RE = re.compile(r"[\s：:@＠\u200b-\u200d\u2060\ufeff]+")
+# 2026-10-10 review：稱呼拿掉括號與引號、冒號（含形似字）、@、空白、bidi 與零寬等格式字元、
+# 看不見的韓文填充字：顯示名稱不能冒充「【系統…】」「（現在說話的是…）」，也不能在畫面上看起來
+# 是別人。emoji、符號和其他標點照留（「🌸」「Andy-Lin」「李・大華」）。只看文字和數字比對保留字：
+# 是咪寶、開頭是咪寶／系統／使用者、或含「說話的是」「不確定是誰」的就不用。
+_LABEL_DROP_CHARS = "\u02d0\ua4fd\u05c3\u1804\u205a\u115f\u1160\u3164\uffa0:：﹕︓∶꞉@＠"
+_LABEL_DROP_CATEGORIES = ("Cc", "Cf", "Zs", "Zl", "Zp", "Ps", "Pe", "Pi", "Pf")
+_RESERVED_LABEL_STARTS = ("咪寶", "咪宝", "咪寳", "米寶", "米宝", "米堡", "系統", "系统", "使用者")
+_RESERVED_LABEL_PARTS = ("說話的是", "说话的是", "不確定是誰")
+_RESERVED_LABELS = ("群組成員", "某人")
+_LABEL_LEAD_RE = re.compile(r"^[^\u4e00-\u9fffA-Za-z0-9]+")
 _MEMBER_LABEL_MAX = 20
 _MEMBER_DISPLAY_TIMEOUT_SEC = 3
 _RECENT_SPEAKER_MESSAGES = 300
 
 
 def _clean_member_label(name: str) -> str:
-    """Labels go in front of family turns as 「稱呼：」; no colons, spaces or line
-    breaks, short, and never the bot's own name."""
-    clean = _MEMBER_LABEL_STRIP_RE.sub("", str(name or ""))[:_MEMBER_LABEL_MAX]
-    return "" if clean in ("咪寶", "群組成員", "某人") else clean
+    """Labels go in front of family turns as 「稱呼：」: letters and digits only,
+    short, and never anything containing the bot's name or the program's markers."""
+    text = unicodedata.normalize("NFKC", str(name or ""))
+    clean = "".join(
+        ch for ch in text
+        if ch not in _LABEL_DROP_CHARS and unicodedata.category(ch) not in _LABEL_DROP_CATEGORIES
+    )[:_MEMBER_LABEL_MAX]
+    letters = "".join(ch for ch in clean if unicodedata.category(ch)[0] in "LN")
+    if (
+        _LABEL_LEAD_RE.sub("", letters).startswith(_RESERVED_LABEL_STARTS)  # 「ˉ咪寶」「ー咪寶」
+        or any(part in letters for part in _RESERVED_LABEL_PARTS)
+        or letters in _RESERVED_LABELS
+    ):
+        return ""
+    return clean
 
 
 def _member_label(group_id: str | None, user_id: str | None) -> str:
-    """家人的稱呼：本機別名；沒有別名就用 LINE 顯示名稱（成功或失敗都快取 6 小時）；
-    都沒有回 ""。靜音（BOT_MUTED，測試也是）時不查 LINE。"""
+    """家人的稱呼：本機別名；沒有別名就用 LINE 顯示名稱（查到快取 6 小時，查不到
+    快取 10 分鐘）；都沒有回 ""。顯示名稱和某個別名相同、或和最近說過話的另一位家人
+    先記下的顯示名稱相同時，回 ""（先記下的人保留）：記憶不能掛錯人。靜音（BOT_MUTED，
+    測試也是）時不查 LINE。"""
     if not user_id or user_id == "__bot__":
         return ""
     try:
@@ -12545,12 +12581,40 @@ def _member_label(group_id: str | None, user_id: str | None) -> str:
     label = _clean_member_label(
         _get_member_display_name(group_id, user_id, timeout=_MEMBER_DISPLAY_TIMEOUT_SEC)
     )
+    try:
+        taken = {
+            _clean_member_label(alias)
+            for alias in line_mentions.configured_family_alias_mapping(include_short=True)
+        }
+    except Exception:
+        taken = set()
+    clashes = bool(label) and (label in taken or _display_name_taken(group_id, user_id, label))
+    if clashes:
+        label = ""  # 「媽媽」 or another member's name must never read as that person
     with _member_labels_lock:
         _member_labels[key] = (label, now)
     if label:
         # 提醒推播等不能問 LINE 的程序，也用同一個稱呼（Andrew 2026-10-09）
         line_mentions.remember_display_name(user_id, label)
+    elif clashes:
+        # 2026-10-10 review（第三輪）：10/9 記下的舊名字現在撞名了，推播也不再用它
+        line_mentions.forget_display_name(user_id)
     return label
+
+
+def _display_name_taken(group_id: str, user_id: str, label: str) -> bool:
+    """最近在這個群組說過話的另一位家人，已經用這個顯示名稱（bot 先前查到、記下的）。
+
+    2026-10-10 review（第三輪）：只看最近說過話的人，退群或改了名的人留在檔裡的舊名
+    不會讓新的家人一直沒有稱呼。
+    """
+    try:
+        names = line_mentions.display_names()
+        others = set(memory.recent_raw_senders(group_id, _RECENT_SPEAKER_MESSAGES)) - {user_id}
+    except Exception as exc:
+        logger.debug("display names unreadable: %s", exc)
+        return False
+    return any(_clean_member_label(names.get(other, "")) == label for other in others)
 
 
 def _known_member_labels(group_id: str) -> dict[str, str]:
@@ -12568,22 +12632,35 @@ def _known_member_labels(group_id: str) -> dict[str, str]:
     except Exception as exc:
         logger.debug("recent speakers skipped: %s", exc)
         speakers = []
+    shared: set[str] = set()
     for user_id in speakers:
         label = _member_label(group_id, user_id)
-        if label and label not in labels:
+        if not label:
+            continue
+        if label not in labels:
             labels[label] = user_id
+        elif labels[label] != user_id:
+            shared.add(label)  # 2026-10-10 review: two people, one name → nobody's
+    for label in shared:
+        labels.pop(label, None)
     return labels
 
 
 def _speakers_in_context(
     context: list[tuple[str, str]], labels: dict[str, str]
 ) -> dict[str, str]:
-    """只留這段對話裡真的有開口的家人（行首是「稱呼：」）：事實只掛在說話的人身上。"""
+    """只留這段對話裡真的有開口的家人（行首是「稱呼：」）：事實只掛在說話的人身上。
+
+    稱呼只由程式寫在每則訊息的第一行（memory.speaker_turn）；同一則的其他行前面
+    有全形空白，所以轉貼內容裡的「媽媽：…」不算媽媽開口（2026-10-10 review）。
+    """
     present: dict[str, str] = {}
     for role, text in context or []:
         if role != "user" or not isinstance(text, str):
             continue
         for line in text.splitlines():
+            if not line or line[0].isspace():
+                continue
             label, sep, _rest = line.partition("：")
             if sep and label in labels:
                 present[label] = labels[label]
@@ -12591,7 +12668,9 @@ def _speakers_in_context(
 
 
 def _labelled_turn(group_id: str, text: str, *, event=None, user_id: str | None = None) -> str:
-    """「稱呼：原文」；不知道是誰就照原文。"""
+    """「稱呼：原文」，其他行縮排（memory.speaker_turn）；不知道是誰就寫「（不確定是誰）」。"""
+    if not text:
+        return text
     if user_id is None and event is not None:
         user_id = getattr(getattr(event, "source", None), "user_id", None)
     try:
@@ -12599,18 +12678,18 @@ def _labelled_turn(group_id: str, text: str, *, event=None, user_id: str | None 
     except Exception as exc:
         logger.debug("turn label skipped: %s", exc)
         label = ""
-    return f"{label}：{text}" if label and text else text
+    return memory.speaker_turn(label, text)
 
 
 def _labelled_burst_turn(group_id: str, combined_text: str, message_ids: list | None) -> str:
     """「[burst]」底下每一則都寫是誰說的（burst_filter 交棒前算好，保留引用原文與
-    訊息邊界）；拿不到就照舊不帶名字。"""
+    訊息邊界）；拿不到就整批當成一則「不確定是誰」說的，行首的「某某：」照樣縮排。"""
     try:
         labelled = burst_filter.labelled_text(group_id, message_ids)
     except Exception as exc:
         logger.debug("burst labels skipped: %s", exc)
         labelled = None
-    return f"[burst]\n{labelled or combined_text}"
+    return f"[burst]\n{labelled or memory.speaker_turn('', combined_text)}"
 
 
 def _start_burst_finance_extraction(
@@ -12691,6 +12770,9 @@ def _handle_burst_flush(
     # miss 後接 direct local_llm fallback。
 
     quote_reply_only = _is_market_quote_request(combined_text, context=context)
+    # TODO(2026-10-09 deferred): the model still sees this batch without who said
+    # each message (only the memory turn is labelled); labelling it changes the
+    # restatement checks' source text.
 
     from types import SimpleNamespace
     if not has_quote_context(combined_text) and _requires_public_research(combined_text):
@@ -12710,6 +12792,11 @@ def _handle_burst_flush(
     # afresh instead of going silent for the cache's 7 days (2026-10-04 review).
     if cached and reply_policy.has_unbacked_search_claim(cached, searched=False, has_material=False):
         logger.info("burst flush cached reply needs a search it cannot show; regenerating group=%s", group_id)
+        cached = None
+    # 2026-10-10 review: the same for an address／phone number the cached reply
+    # leaned on (a page read then, turns since scrolled away).
+    if cached and _unbacked_contact_count(cached, _contact_backing(combined_text, context=context, facts=facts)):
+        logger.info("burst flush cached reply has contact details it cannot back; regenerating group=%s", group_id)
         cached = None
     # cache 命中：謠言快取直接回，省 LLM 呼叫
     if cached:
@@ -15798,7 +15885,8 @@ def _weak_correction_signals(
         try:
             from chinese_nlp import tokenize
             now = set(tokenize(t))
-            prev = set(tokenize(prev_user_msg))
+            # 2026-10-10 review：對話紀錄開頭的「稱呼：」不算說的話
+            prev = set(tokenize(speaker_turns.spoken_text(prev_user_msg)))
             if now and prev and len(now & prev) / len(now | prev) > 0.5:
                 signals.append("repeat_question")
         except Exception:
@@ -16008,11 +16096,32 @@ def _friendly_gemini_error(e: Exception, file_name: str | None = None) -> str:
 
 
 # 2026-10-09 review: the extraction prompt asks the model to skip these; this is
-# the deterministic backstop, in the spirit of family_weekly_insight's discard list.
-# Facts are shown per person in the group (/看記憶) and go into prompts.
+# the deterministic backstop.  Facts are shown per person in the group
+# (/看記憶) and go into every prompt, so it errs on dropping: 「在醫院上班」 is
+# lost too.  2026-10-10 review: it missed 高血壓／癌症／月薪五萬／欠朋友錢 and
+# half of family_weekly_insight's discard list; a test keeps it a superset.
 _PRIVATE_FACT_RE = re.compile(
-    r"病|藥|診|醫|手術|住院|開刀|懷孕|孕|流產|分手|吵架|離婚|男友|女友|男朋友|女朋友|"
-    r"交往|外遇|債|欠款|貸款|官司|訴訟|法院|帳戶|存款|密碼|薪水|薪資|收入|保單|理賠"
+    # 健康
+    r"病|藥|診|醫|症|癌|瘤|手術|住院|開刀|化療|放療|洗腎|透析|失智|中風|血壓|血糖|膽固醇|糖尿|"
+    r"心臟|過敏|氣喘|失眠|憂鬱|焦慮|恐慌|自殺|輕生|身心科|精神科|諮商|復健|"
+    r"生理期|月經|經痛|更年期|懷孕|孕|流產|"
+    # 感情與官司
+    r"感情|吵架|冷戰|分手|男友|女友|男朋友|女朋友|交往|曖昧|外遇|劈腿|約會|離婚|告人|官司|訴訟|法院|"
+    # 錢
+    r"債|欠|借錢|貸|帳戶|存款|存了|有存|積蓄|儲蓄|密碼|薪|收入|保單|理賠|財產|資產|遺產|"
+    r"[\d０-９一二兩三四五六七八九十百千]\s*萬|"
+    # 2026-10-10 review 第三輪：審查員實測還會漏的寫法
+    r"痛|炎|骨折|梗塞|心律|結石|胰島素|試管|體重|障|輪椅|戒酒|潰瘍|躁鬱|抑鬱|癲癇|帶原|開過刀|動過?刀|"
+    r"產檢|預產期|坐月子|墮胎|有喜了|健檢|抽血|心理師|自殘|割腕|想不開|不想活|性侵|性騷擾|霸凌|"
+    r"前夫|前妻|前任|出軌|小三|失戀|被甩|相親|分居|家暴|婚|單身|男票|女票|出櫃|"
+    r"律師|被告|傳票|筆錄|判刑|假釋|和解|賠|坐牢|車禍|詐騙|被騙|"
+    r"虧|破產|年終|獎金|退休金|月入|月領|年收|房租|裁員|失業|保險|刷爆|"
+    r"卡號|身分證|身份證|字號|護照|帳號|"
+    r"肝|長照|痔瘡|助聽器|失明|失禁|尿酸|發燒|看牙|洗牙|植牙|偷吃|不合|同志|坐過牢|套牢|勞退|零用錢|存錢|"
+    r"月光|月退|樂透|(?<![A-Za-z])(?:BP|DM)(?![A-Za-z])|"
+    r"[A-Za-z][12]\d{8}|\d{4}[ -]?\d{4}[ -]?\d{4}[ -]?\d{4}|\d+(?:\.\d+)?\s*[kKmM](?![A-Za-z])|"
+    r"(?i:(?<![a-z])(?:cancer|pregnan\w*|depress\w*|anxiety|adhd|ivf|boyfriend|girlfriend|bf|gf|"
+    r"salary|debt|loan|divorce\w*|lawsuit|sued|blood pressure|diabet\w*|insulin|therapy|covid|surgery)(?![a-z]))"
 )
 
 
@@ -19463,9 +19572,9 @@ _DINNER_KEYWORDS = [
     "今天吃什麼",
     # 2026-10-09: more ways to ask, so the verified list answers instead of a
     # model writing shop names from memory.
+    "晚餐吃啥",
     "晚上吃什麼",
     "晚上吃啥",
-    "晚餐吃啥",
     "晚餐推薦",
     "推薦晚餐",
     "善導寺附近吃什麼",
@@ -19473,8 +19582,39 @@ _DINNER_KEYWORDS = [
 ]
 
 
+# 2026-10-10 review：「謝謝咪寶的晚餐推薦」「上次推薦晚餐那家叫什麼」也含這兩個詞，
+# 不是要一份新清單。只看同一個子句：「晚餐推薦一下，謝謝！」「推薦晚餐，不要上次那間」
+# 還是在要推薦。
+_DINNER_REQUEST_ONLY = ("晚餐推薦", "推薦晚餐")
+_DINNER_CLAUSE_RE = re.compile(r"[^，,。！？!?；;～~\n]+")
+_DINNER_THANKS_OR_PAST_RE = re.compile(r"謝|感恩|上次|上回|剛剛|剛才|之前")
+_DINNER_ASKS_ABOUT_ONE_RE = re.compile(r"那家|那間|叫什麼|是哪家|是哪間")
+# 「咪寶的晚餐推薦很讚，謝謝！」是在稱讚上一份；要求的字（一下／嗎／？／麻煩／再…）在才算要新的。
+# 稱讚要接到子句結尾或語助詞：「晚餐推薦好吃的」「晚餐推薦不錯的店」是在要推薦。
+_DINNER_PRAISE_RE = re.compile(
+    r"^[^，,。！？!?]{0,3}(?:很讚|好讚|讚|好吃|很好吃|不錯|超棒|很棒|好用|很好)(?:耶|喔|哦|啦|了|呢|欸|！|!|～|~|\s)*$"
+)
+_DINNER_ASKING_RE = re.compile(r"一下|嗎|[?？]|麻煩|請|再|有沒有|求|給我|來一份|幫|拜託|可以")
+_DINNER_THANKS_RE = re.compile(r"謝|感恩")
+
+
 def _is_dinner_question(text: str) -> bool:
-    return any(kw in text for kw in _DINNER_KEYWORDS)
+    text = text or ""
+    if any(kw in text for kw in _DINNER_KEYWORDS if kw not in _DINNER_REQUEST_ONLY):
+        return True
+    for clause in _DINNER_CLAUSE_RE.findall(text):
+        for kw in _DINNER_REQUEST_ONLY:
+            at = clause.find(kw)
+            if at == -1:
+                continue
+            if _DINNER_THANKS_OR_PAST_RE.search(clause[:at]) or _DINNER_ASKS_ABOUT_ONE_RE.search(clause[at:]):
+                continue
+            if _DINNER_PRAISE_RE.search(clause[at + len(kw):]):
+                continue
+            if _DINNER_THANKS_RE.search(text) and not _DINNER_ASKING_RE.search(text):
+                continue
+            return True
+    return False
 
 
 _WEB_RESEARCH_QUESTION_HINTS = (
@@ -19978,7 +20118,11 @@ def _finish_research_without_reply(event, group_id: str, text: str) -> None:
 
 def _research_turn(group_id: str, text: str, event) -> str:
     """A burst sent here brings its own labelled turn; one person's question is labelled here."""
-    return getattr(event, "memory_turn", None) or _labelled_turn(group_id, text, event=event)
+    turn = getattr(event, "memory_turn", None)
+    return turn if isinstance(turn, str) and turn else _labelled_turn(group_id, text, event=event)
+
+
+_DINNER_ERROR_TEXT = "晚餐推薦暫時出錯，等一下再問我一次。"
 
 
 def _handle_dinner_recommendation(event: MessageEvent, group_id: str) -> None:
@@ -19986,8 +20130,8 @@ def _handle_dinner_recommendation(event: MessageEvent, group_id: str) -> None:
 
     Andrew：「任何資訊必須驗證再驗證，他得是真的（加入測試環節）」——10/7 模型
     憑記憶寫的推薦把一家店配上別家店的地址。現在完全不經過模型：dinner_places
-    從查證清單挑店，送出前 verify_reply 再逐塊比對一次；比對不過（程式錯誤）
-    就只送「目前沒有查證過的推薦」，不送任何店家資訊。
+    從查證清單挑店，送出前 verify_reply 再逐塊比對一次；比對不過或出錯（程式錯誤）
+    就只送一句出錯了，不送任何店家資訊（不說「清單過期」，那不是真的）。
     """
     import dinner_places
 
@@ -19997,10 +20141,10 @@ def _handle_dinner_recommendation(event: MessageEvent, group_id: str) -> None:
         reply_text = dinner_places.recommend(asked)
         if not dinner_places.verify_reply(reply_text):
             logger.error("dinner reply failed the verified-list check; no places sent")
-            reply_text = dinner_places.NO_FRESH_TEXT
+            reply_text = _DINNER_ERROR_TEXT
     except Exception as exc:
         logger.warning("dinner recommendation failed error_type=%s", type(exc).__name__)
-        reply_text = dinner_places.NO_FRESH_TEXT
+        reply_text = _DINNER_ERROR_TEXT
     _reply(event.reply_token, reply_text, group_id=group_id, menu_buttons=menu_buttons)
 
 
@@ -20450,6 +20594,8 @@ def _format_memory_list(group_id: str) -> str:
     for user_id, fact in rows:
         label = _member_label(group_id, user_id) if user_id else ""
         body = fact.removeprefix(f"{label}：") if label else fact
+        if label:  # saved while the name could not be looked up
+            body = body.removeprefix(f"{memory.UNKNOWN_SPEAKER}：")
         groups.setdefault(label or "其他", []).append(body)
     lines = ["目前的記憶："]
     used = len(lines[0])
@@ -20527,7 +20673,7 @@ def _handle_command(
         # 2026-10-09：記成「誰說的：內容」，記憶才分得出是哪位家人。不知道是誰也
         # 要有前綴：開頭是【系統…】的行在提示裡代表程式附上的資料，不能被冒用。
         label = _member_label(group_id, user_id)
-        stored = f"{label or burst_filter.UNKNOWN_SPEAKER}：{fact}"
+        stored = f"{label or memory.UNKNOWN_SPEAKER}：{fact}"
         whose = f"{label}的" if label else ""
         if memory.add_fact(group_id, stored, user_id=user_id or ""):
             return f"好，記進{whose}記憶了：{fact}"

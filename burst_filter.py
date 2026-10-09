@@ -145,7 +145,7 @@ def _schedule_locked(group_id: str, delay: float, force_respond: bool) -> int:
 
 
 def register_speaker_label(callback: Callable[[str, str | None], str] | None) -> None:
-    """main.py 注入家人稱呼查詢（2026-10-09）；None 代表不加稱呼。"""
+    """main.py 注入家人稱呼查詢（2026-10-09）；None 時記憶照樣逐則寫「（不確定是誰）：」。"""
     global _speaker_label
     _speaker_label = callback
 
@@ -217,8 +217,7 @@ def _remember_cancelled(
     if not text or _heuristic_decision(text) == "skip":
         return
     try:
-        labelled = _combine(pending, group_id=group_id, label_of=_speaker_label)
-        memory.append_turn(group_id, "user", f"[burst]\n{labelled or text}")
+        memory.append_turn(group_id, "user", f"[burst]\n{_memory_text(group_id, pending) or text}")
     except Exception as exc:
         logger.warning(
             "cancelled burst not remembered group=%s error_type=%s",
@@ -432,19 +431,19 @@ def _combine(
 ) -> str:
     """The burst as one text; quoted messages keep their own boundaries.
 
-    ``label_of`` (group_id, user_id) → who said it: each message then starts
-    with 「稱呼：」 (2026-10-09, for the conversation memory only).  When some
-    writers have a name and another has none, that one's message says
-    「（不確定是誰）：」 so it is never read as the previous speaker's.
+    ``label_of`` (group_id, user_id) → who said it, for the conversation memory
+    only (2026-10-09): each message is stored as ``memory.speaker_turn`` —
+    「稱呼：」 in front, its other lines indented, 「（不確定是誰）：」 when the
+    writer has no name (2026-10-10 review: a forwarded 「媽媽：…」 line or an
+    unnamed writer's 「咪寶：…」 never reads as that speaker).
     """
     names: dict[str | None, str] = {}
     if label_of is not None:
         for _, text, user_id, _ in pending:
             if text and user_id not in names:
                 names[user_id] = _label(group_id, user_id, label_of)
-    unknown = UNKNOWN_SPEAKER if any(names.values()) and not all(names.values()) else ""
     texts = [
-        _with_name(text, names.get(user_id, "") or unknown) if label_of is not None else text
+        memory.speaker_turn(names.get(user_id, ""), text) if label_of is not None else text
         for _, text, user_id, _ in pending
         if text
     ]
@@ -458,9 +457,6 @@ def _combine(
     return combined_text.strip()
 
 
-UNKNOWN_SPEAKER = "（不確定是誰）"
-
-
 def _label(group_id: str, user_id: str | None, label_of: Callable[[str, str | None], str]) -> str:
     try:
         return (label_of(group_id, user_id) or "").strip()
@@ -468,8 +464,9 @@ def _label(group_id: str, user_id: str | None, label_of: Callable[[str, str | No
         return ""
 
 
-def _with_name(text: str, name: str) -> str:
-    return f"{name}：{text}" if name else text
+def _memory_text(group_id: str, pending: list[tuple[str, str, str | None, float]]) -> str:
+    """這批存進對話紀錄的寫法：每則都寫是誰說的（main 沒注入稱呼時一律「不確定是誰」）。"""
+    return _combine(pending, group_id=group_id, label_of=_speaker_label or (lambda _g, _u: ""))
 
 
 # 2026-10-09：main 把這批存進對話紀錄時要逐則寫是誰說的。交給 main 前先算好加了
@@ -482,9 +479,9 @@ _LABELLED_KEEP = 32
 def _stash_labelled(
     group_id: str, message_ids: list[str], pending: list[tuple[str, str, str | None, float]]
 ) -> None:
-    if _speaker_label is None or not message_ids:
+    if not message_ids:
         return
-    text = _combine(pending, group_id=group_id, label_of=_speaker_label)
+    text = _memory_text(group_id, pending)
     key = (group_id, tuple(str(m) for m in message_ids))
     with _labelled_lock:
         _labelled_texts.pop(key, None)
@@ -494,7 +491,7 @@ def _stash_labelled(
 
 
 def labelled_text(group_id: str, message_ids: list[str] | None) -> str | None:
-    """這批訊息加了稱呼的合併文字；沒有（未注入稱呼、太舊）回 None。"""
+    """這批訊息存進記憶的寫法（每則都有說話的人）；沒有存過或太舊（只留 32 批）回 None。"""
     key = (group_id, tuple(str(m) for m in message_ids or ()))
     with _labelled_lock:
         return _labelled_texts.get(key)

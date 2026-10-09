@@ -23,6 +23,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+import speaker_turns
 from config import settings
 from reply_policy import is_empty_marker
 
@@ -247,7 +248,8 @@ def _merge_history(context: list[tuple[str, str]] | None) -> list[dict[str, Any]
             continue
         normalized = "assistant" if role in _BOT_ROLES else "user"
         if messages and messages[-1]["role"] == normalized:
-            messages[-1]["content"] += "\n" + text
+            # A blank line, as in the CLI history: one turn never runs into the next.
+            messages[-1]["content"] += "\n\n" + text
         elif messages or normalized == "user":
             # The Messages API wants the first turn from the user; a bot turn
             # left at the head of a trimmed history is dropped.
@@ -343,10 +345,10 @@ def _build_cli_prompt(
     for role, text in (context or []):
         if not isinstance(text, str) or not text.strip():
             continue
-        history_lines.append(f"咪寶：{text}" if role in _BOT_ROLES else text)
+        # 2026-10-10 review：咪寶自己的多行回覆也縮排（裡面的「某某：」不像家人在說話）
+        history_lines.append(speaker_turns.speaker_turn("咪寶", text) if role in _BOT_ROLES else text)
     # A blank line between turns: a multi-line bot reply never runs into the
-    # next family turn (older turns, or ones whose speaker is unknown, carry no
-    # 「稱呼：」 of their own).
+    # next family turn (turns stored before 2026-10-09 carry no 「稱呼：」).
     history_block = "\n\n".join(history_lines) or "（沒有先前對話）"
     user_prompt = (
         f"【最近對話】\n{history_block}\n\n"

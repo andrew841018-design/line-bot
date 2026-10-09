@@ -3,7 +3,8 @@
 10/7 的推薦是模型憑記憶寫的，把一家店配上另一家店的地址。Andrew：「任何資訊必須
 驗證再驗證，他得是真的（加入測試環節）」。
 
-- 清單在 ``dinner_places.json``。每一筆的店名＋地址都有兩個彼此獨立的來源，
+- 清單在 ``dinner_places.json``。每一筆的店名＋地址都有兩個彼此獨立的來源
+  （按網站算，同一個網站的不同網址只算一個），
   另一輪查證再獨立重查一次，兩輪都對才收；``verified_on`` 超過 ``max_age_days``
   的店不推，等每日維護重新查證。
 - 推薦文字完全由程式從清單組成，不經過模型。
@@ -20,6 +21,7 @@ import re
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
@@ -47,19 +49,138 @@ _TAG_WORDS: dict[str, tuple[str, ...]] = {
     "西式": ("西式", "義式", "義大利", "披薩", "pizza", "義大利麵", "排餐", "牛排", "漢堡"),
     "東南亞": ("東南亞", "泰式", "泰國菜", "越南", "河粉", "南洋", "海南雞", "新加坡"),
 }
-# 同一個子句裡：口味前面有不／別／沒／除了（不太想吃日式、別再吃日式、除了日式），
-# 或後面接以外／吃膩（日式以外、日式吃膩了），或整句以不要／算了結尾（日式不要），
-# 就是不要這個口味；「要不要吃」「吃不吃」是在問。
-_ASKING_RE = re.compile(r"(要|想|吃)不\1")
-_CLAUSE_RE = re.compile(r"[^，,。！？!?；;、\s]+")
-_NEG_BEFORE_RE = re.compile(r"不|別|沒|除了")
-_NEG_AFTER_RE = re.compile(r"^(?:以外|之外|吃膩|膩)|^(?:不要|不想吃?|不吃|免了|算了)了?$")
+# 2026-10-10 review（第三輪）：判斷不了就不縮小範圍。把剛說不要的口味當成想吃，清單就只剩
+# 那一種（「不要又吃火鍋」只推了火鍋那一家）；把想吃的當成不要，只是少幾個選項。所以：
+# 1. 先換掉不是否定的說法：要不要／想不想（A不A 問句）、有沒有、不錯、不知道、不然、不如、
+#    不管、沒吃過、好久沒（吃）、怎麼不…、「不要太貴／不要排隊」這種條件，以及沒有
+#    「過／才／剛／已經」的「不是…嗎」反問（「不是要吃日式嗎」）；
+# 2. 否定詞緊貼在口味前面（中間只有「想／要／又／每次／推薦／那家…」）→ 不想吃；
+# 3. 口味後面緊接否定、一直到子句結尾（日式不要、日式就算了、日式我不想吃啦、對日式沒興趣），
+#    或接「以外／吃膩／又來」→ 不想吃；
+# 4. 否定問句（不吃火鍋嗎）、子句裡離口味比較遠的否定（今天不用加班想吃火鍋）→ 不確定：
+#    不推也不排除；
+# 5. 都沒有 → 想吃。
+# 用「和／跟／、」連在一起的口味一起判斷（「日式、韓式都不要」「不要日式和韓式」）；否定詞夾在
+# 兩串口味中間（「想吃韓式不要日式」）算後面那串的，前面那串只算不確定。
+# 子句用「，。！？；」、空白和「但／可是／不過」切開（「不想煮飯 想吃火鍋」）；只有否定詞的
+# 片段（「日式 不要」「不要 日式」）併回旁邊有口味的那段。「、」不切（「日式、韓式都不要」）。
+_ASKING_RE = re.compile(r"(要|想|吃|是|會|去|用|愛|能|喜|可|考|好|行|對)不\1")
+_RHETORICAL_RE = re.compile(r"不是(?=說?[要想][^，,。！？!?；;]*嗎)")
+_DONE_RE = re.compile(r"過|才|剛|已經")
+_NOT_NEGATION_RE = re.compile(
+    r"有沒有|(?:要)?不然|不如|不管|不論|無論|不挑|不忌口|沒差|沒關係|沒問題|不知道|不曉得|不錯的?|要不(?=吃)|"
+    r"沒吃過|(?:好|很)久(?:都)?沒有?吃|最近都沒有?吃|(?:怎麼|為什麼|為何|何)不(?=去?吃)|"
+    r"(?:不會|不用|不要|不必|沒那麼|不能|別)太?"
+    r"(?:貴|遠|辣|油|鹹|甜|久|晚|麻煩|擠|難等|排隊|等|連鎖店?|生的|冷|熱|吵)"
+)
+_CLAUSE_RE = re.compile(r"[^，,。！？!?；;]+")
+_SPACE_RE = re.compile(r"[\s\u3000]+")
+_CONTRAST_RE = re.compile(r"但是?|可是|不過")
+_NEG_WORD = r"(?:不|別|沒|除了|跳過|排除)"
+_NEG_MARK_RE = re.compile(rf"{_NEG_WORD}|(?<![a-z])pass(?![a-z])")
+# 否定詞和口味之間（或口味後面的否定詞之後）允許的字
+_FILLER = (
+    r"(?:太|再|想|要|吃|用|有|是|很|會|去|愛|能|大|喜歡|可以|考慮|怎麼|那麼|又|每次|都|一直|老是|點|"
+    r"推薦|推|給|選|找|必|需要|打算|敢|那家|那間|那種|這種|什麼|胃口|心情|興趣|同一家|一次|今天|今晚|我|"
+    r"特別|真的)"
+)
+_PARTICLE = r"(?:了|啦|喔|哦|吧|耶|啊|呢|欸|嘛|囉|～|~|!|！|…|\.|\s|[\U0001F000-\U0001FAFF☀-➿])"
+_NEG_BEFORE_RE = re.compile(rf"{_NEG_WORD}(?:{_FILLER}|\s){{0,8}}$")
+_NEG_AFTER_RE = re.compile(
+    rf"(?:就|也|都|先|這次|今天|今晚|我們|我|你|妳|他|她|\s)*{_NEG_WORD}(?:{_FILLER}|{_PARTICLE}|免|算)*$"
+    rf"|(?:就|也|都|先|這次|\s)*(?:免了|算了){_PARTICLE}*$"
+)
+_EXCEPT_AFTER_RE = re.compile(
+    r"[\s\u3000]*(?:以外|之外|吃膩|膩|吃到膩|又來|吃過了|❌|(?<![a-z])(?:ng|pass)(?![a-z]))"
+)
+_JUST_ATE_RE = re.compile(r"(?:才|剛|剛剛|已經|昨天|中午|昨晚)吃過")
+_LATER_DAY_RE = re.compile(r"膩|改天|下次再")
+_NEG_ONLY_RE = re.compile(rf"(?:{_NEG_WORD}(?:{_FILLER}|{_PARTICLE})*|免了|算了)")
+_QUESTION_END_RE = re.compile(r"[嗎呢][\s\u3000～~]*$")
+
+
+def _not_negations(text: str) -> str:
+    text = _ASKING_RE.sub(r"\1", text)
+    text = _NOT_NEGATION_RE.sub(lambda m: "有" if m.group(0) == "有沒有" else "", text)
+    return text
+
+
+def _clauses(text: str) -> list[str]:
+    parts: list[str] = []
+    for clause in _CLAUSE_RE.findall(text):
+        if not _DONE_RE.search(clause):
+            clause = _RHETORICAL_RE.sub("是", clause)
+        for piece in _CONTRAST_RE.split(clause):
+            parts.extend(chunk for chunk in _SPACE_RE.split(piece) if chunk)
+    merged: list[str] = []
+    pending = ""  # 只有否定詞、前面又沒有口味的片段，接到下一段前面（「不要 日式」）
+    for part in parts:
+        if _NEG_ONLY_RE.fullmatch(part) or _NEG_AFTER_RE.fullmatch(part):
+            if merged and _mentions(merged[-1]):
+                merged[-1] += " " + part  # 「日式 不要」
+            else:
+                pending += part + " "
+            continue
+        merged.append(pending + part)
+        pending = ""
+    if pending:
+        merged.append(pending.strip())
+    return merged
+
+
+_JOIN_RE = re.compile(r"[\s\u3000、]*(?:和|跟|與|及|或|或是|或者|還有|以及)?[\s\u3000、]*")
+
+
+def _stance(prefix: str, suffix: str, clause: str, more_after: bool) -> str:
+    """一串口味的態度：'wanted' / 'unwanted' / 'unsure'。"""
+    asking = bool(_QUESTION_END_RE.search(clause))
+    if _JUST_ATE_RE.search(prefix) or _LATER_DAY_RE.search(suffix):
+        return "unwanted"  # 「昨天才吃過火鍋」「火鍋吃到都膩了」「火鍋改天吧」
+    if _NEG_BEFORE_RE.search(prefix):
+        if prefix.rstrip().endswith("沒有") and not _NEG_MARK_RE.search(prefix.rstrip()[:-2]):
+            return "unsure"  # 「附近沒有日式嗎」是在問有沒有
+        return "unsure" if asking else "unwanted"
+    if _NEG_MARK_RE.search(prefix):
+        return "unsure"  # 離口味比較遠的否定：「今天不用加班想吃火鍋」「沒人想吃火鍋」
+    if more_after and _NEG_MARK_RE.search(suffix):
+        return "unsure"  # 否定詞在下一串口味前面：「想吃韓式不要日式」
+    if _EXCEPT_AFTER_RE.match(suffix) or _NEG_AFTER_RE.match(suffix):
+        return "unsure" if asking else "unwanted"
+    if _NEG_MARK_RE.search(suffix):
+        return "unsure"
+    return "wanted"
+
+
+def _mentions(clause: str) -> list[tuple[int, int, set[str]]]:
+    """子句裡提到的口味（起點、終點、tags），重疊的併成一個，依位置排好。"""
+    found: list[tuple[int, int, str]] = []
+    for tag, words in _TAG_WORDS.items():
+        for word in words:
+            word = word.lower()
+            start = clause.find(word)
+            while start != -1:
+                end = start + len(word)
+                if not (word.endswith("麵") and clause[end:end + 1] == "包"):  # 麵包 is bread
+                    found.append((start, end, tag))
+                start = clause.find(word, start + 1)
+    merged: list[tuple[int, int, set[str]]] = []
+    for start, end, tag in sorted(found):
+        if merged and start < merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(end, merged[-1][1]), merged[-1][2] | {tag})
+        else:
+            merged.append((start, end, {tag}))
+    return merged
+
+
 _CHEAP_WORDS = ("便宜", "平價", "銅板", "省錢", "不要太貴")
 _CHEAP_LIMIT = 250
-_AMOUNT = r"(\d{2,5}|[一二兩三四五六七八九][千百](?:[一二兩三四五六七八九][百十]?)?)"
+# 2026-10-10 review：數字可以有千分位逗號（預算1,000、每人1,200）。
+_AMOUNT = r"(\d{1,2}(?:,\d{3})+|\d{2,5}|[一二兩三四五六七八九][千百](?:[一二兩三四五六七八九][百十]?)?)"
 _BUDGET_RE = re.compile(
-    rf"(?:預算|每人|每個人|一人|一個人|人均)\s*(?:約|大概|大約)?\s*{_AMOUNT}"
-    rf"|{_AMOUNT}\s*(?:元|塊)?\s*(?:以內|以下|內|左右)"
+    # 2026-10-10 review：「我一個人18:30到」的 18 是時刻；數字後面接數字／冒號／點就不是預算
+    rf"(?:預算|每人|每個人|一人|一個人|人均)\s*(?:約|大概|大約)?\s*{_AMOUNT}(?![\d:：]|\s*點)"
+    # 2026-10-10 review：「晚上18:30左右」「下午3:30以內」「6點30左右」的 30 是時刻，不是預算
+    rf"|(?<![\d:：.])(?<!\d點){_AMOUNT}\s*(?:元|塊)?\s*(?:以內|以下|內|左右)"
 )
 _CN_AMOUNT = {"一": 1, "二": 2, "兩": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
 
@@ -81,6 +202,33 @@ def _today() -> date:
     return datetime.now(_TW).date()
 
 
+_SECOND_LEVEL = {"com", "org", "net", "gov", "edu", "co", "ac", "or", "ne", "idv", "go"}
+
+
+def _source_sites(urls: tuple[str, ...] | list[str]) -> set[str]:
+    """來源網址各自的網站（主網域，例如 tvbs.com.tw、pixnet.net）。
+
+    2026-10-10 review：「兩個獨立來源」原本比對網址字串，同一個網站放兩個連結
+    （www／沒有 www、只差大小寫或 query）也算兩個；現在按網站算。
+    """
+    sites: set[str] = set()
+    for url in urls:
+        try:
+            parts = urlsplit(str(url).strip())
+            host = parts.hostname or ""
+        except ValueError:
+            continue
+        if parts.scheme not in ("http", "https"):
+            continue
+        labels = [label for label in host.rstrip(".").split(".") if label]
+        # 2026-10-10 review（第三輪）：同一家媒體的子網域（supertaste.tvbs.com.tw 和
+        # news.tvbs.com.tw、m.facebook.com）算同一個網站。
+        keep = 3 if len(labels) >= 3 and len(labels[-1]) == 2 and labels[-2] in _SECOND_LEVEL else 2
+        if len(labels) >= 2:
+            sites.add(".".join(labels[-keep:]))
+    return sites
+
+
 def _parse_place(raw: object) -> Place | None:
     if not isinstance(raw, dict):
         return None
@@ -94,7 +242,7 @@ def _parse_place(raw: object) -> Place | None:
         verified_on = date.fromisoformat(str(raw.get("verified_on") or ""))
     except ValueError:
         return None
-    if not name or not address or not cuisine or len(set(sources)) < MIN_SOURCES:
+    if not name or not address or not cuisine or len(_source_sites(sources)) < MIN_SOURCES:
         return None
     if "\n" in name or "\n" in address:
         return None
@@ -169,39 +317,62 @@ def open_tonight(places: list[Place], today: date) -> list[Place]:
 
 
 def _tag_mentions(asked: str) -> tuple[set[str], set[str]]:
-    """(想吃的口味, 不想吃的口味)，逐子句判斷。"""
-    text = _ASKING_RE.sub(r"\1", (asked or "").lower())
+    """(想吃的口味, 不想吃的口味)，逐子句判斷；判斷不了的口味兩邊都不放。"""
+    text = _not_negations((asked or "").lower())
     wanted: set[str] = set()
     unwanted: set[str] = set()
-    for clause in _CLAUSE_RE.findall(text):
-        for tag, words in _TAG_WORDS.items():
-            for word in words:
-                word = word.lower()
-                start = clause.find(word)
-                while start != -1:
-                    end = start + len(word)
-                    if not (word.endswith("麵") and clause[end:end + 1] == "包"):  # 麵包 is bread
-                        negated = _NEG_BEFORE_RE.search(clause[:start]) or _NEG_AFTER_RE.search(clause[end:])
-                        (unwanted if negated else wanted).add(tag)
-                    start = clause.find(word, start + 1)
-    return wanted - unwanted, unwanted
+    unsure: set[str] = set()
+    for clause in _clauses(text):
+        mentions = _mentions(clause)
+        groups: list[list[tuple[int, int, set[str]]]] = []
+        for mention in mentions:
+            if groups and _JOIN_RE.fullmatch(clause[groups[-1][-1][1]:mention[0]]):
+                groups[-1].append(mention)
+            else:
+                groups.append([mention])
+        previous_end = 0
+        for index, group in enumerate(groups):
+            start, end = group[0][0], group[-1][1]
+            next_start = groups[index + 1][0][0] if index + 1 < len(groups) else len(clause)
+            stance = _stance(
+                clause[previous_end:start], clause[end:next_start], clause, index + 1 < len(groups)
+            )
+            tags = set().union(*(m[2] for m in group))
+            {"wanted": wanted, "unwanted": unwanted, "unsure": unsure}[stance].update(tags)
+            previous_end = end
+    return wanted - unwanted - unsure, unwanted
+
+
+_UNITS = {"千": 1000, "百": 100, "十": 10}
 
 
 def _amount(token: str) -> int | None:
+    """「三百五」→350、「兩千五」→2500、「一千二」→1200、「五百」→500、「1,200」→1200。"""
+    token = token.replace(",", "")
     if token.isdigit():
         return int(token)
     total = 0
+    last_unit = 0
     for digit, unit in re.findall(r"([一二兩三四五六七八九])([千百十]?)", token):
-        total += _CN_AMOUNT[digit] * {"千": 1000, "百": 100, "十": 10, "": 1}[unit]
+        value = _UNITS.get(unit) or (last_unit // 10 if last_unit else 1)
+        total += _CN_AMOUNT[digit] * value
+        last_unit = _UNITS.get(unit, 0)
     return total or None
+
+
+# 2026-10-10 review（第三輪）：清單最便宜的店每人上限是 200 元；低於 100 的數字幾乎都是
+# 時刻或日期（七點30左右、10/15左右、15 分鐘內），不當預算，免得顯示「每人 30 元內」。
+_MIN_BUDGET = 100
+_NOT_CHEAP_RE = re.compile(r"(?:不要太|不用|不要|別|不必|不想)(?:那麼|太)?(?:便宜|平價|銅板|省錢)")
 
 
 def budget_limit(asked: str) -> int | None:
     text = asked or ""
     match = _BUDGET_RE.search(text)
     if match:
-        return _amount(match.group(1) or match.group(2))
-    if any(word in text for word in _CHEAP_WORDS):
+        amount = _amount(match.group(1) or match.group(2))
+        return amount if amount is not None and amount >= _MIN_BUDGET else None
+    if any(word in _NOT_CHEAP_RE.sub("", text) for word in _CHEAP_WORDS):
         return _CHEAP_LIMIT
     return None
 

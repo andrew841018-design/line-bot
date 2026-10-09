@@ -1103,7 +1103,7 @@ def test_retraction_is_remembered_only_after_the_reply_went_out(monkeypatch):
         monkeypatch, "根本沒有這回事，錯誤百出", quoted=_quote(FABRICATED, PRE_DEPLOY),
     )
     assert [c[0] for c in run.order.mock_calls] == ["reply", "append_turn", "append_bot"]
-    assert run.append_turn.call_args.args == ("GRP001", "user", "根本沒有這回事，錯誤百出")
+    assert run.append_turn.call_args.args == ("GRP001", "user", "（不確定是誰）：根本沒有這回事，錯誤百出")
     assert run.append_bot.call_args.args == ("GRP001", main._DISPUTED_CLAIM_RETRACTION)
 
 

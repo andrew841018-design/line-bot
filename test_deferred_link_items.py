@@ -373,7 +373,7 @@ def test_cancelled_burst_is_remembered_and_returned():
     absorbed = burst_filter.cancel_burst("GRP_R")
     assert [item[1] for item in absorbed] == ["合成閒聊", NEWS]
     stored = [text for role, text in main.memory.get_context("GRP_R") if role == "user"]
-    assert stored == [f"[burst]\n合成閒聊\n{NEWS}"]
+    assert stored == [f"[burst]\n（不確定是誰）：合成閒聊\n（不確定是誰）：{NEWS}"]
     assert burst_filter.cancel_burst("GRP_R") == []
 
 
@@ -603,14 +603,22 @@ def test_page_never_reaches_memory_facts_or_search(monkeypatch, path):
     if path == "burst":
         monkeypatch.setattr(main.memory, "check_fact_cache", lambda *_a: None)
         monkeypatch.setattr(main.memory, "store_fact_cache", lambda *_a: None)
+        # 2026-10-10 review: the memory turn must name a known speaker, or fact
+        # extraction ends before it reads anything and this test checks nothing.
+        monkeypatch.setattr(
+            main.burst_filter, "labelled_text",
+            lambda _gid, _ids: main.memory.speaker_turn("成員甲", f"看看這個補助 {NEWS}"),
+        )
         assert main.memory.begin_inbound_event("GRP_M", "MSG_M") == "new"
-        main._handle_burst_flush("GRP_M", f"合成群友：看看這個補助 {NEWS}", "TOKEN_M", ["MSG_M"])
+        main._handle_burst_flush("GRP_M", f"看看這個補助 {NEWS}", "TOKEN_M", ["MSG_M"])
     else:
         event = SimpleNamespace(source=SimpleNamespace(user_id="U_TEST"), reply_token="TOKEN_M", message=None)
         main._handle_web_research_question(event, "GRP_M", f"補助是真的嗎 {NEWS}")
     assert sent  # a reply went out
     stored = " ".join(text for _role, text in main.memory.get_context("GRP_M"))
     assert marker not in stored
+    if path == "burst":  # the research path does not extract facts at all
+        assert extracted
     assert all(marker not in str(ctx) for ctx in extracted)
     assert all(marker not in q for q in searched)
 
@@ -663,7 +671,7 @@ def test_research_writes_the_older_burst_first(monkeypatch):
     monkeypatch.setattr(main, "_reply", lambda *_a, **_k: True)
     assert main._handle_web_research_question(event, "GRP_O", "今年榴槤比較便宜嗎", cancel_pending_burst=True)
     users = [text for role, text in main.memory.get_context("GRP_O") if role == "user"]
-    assert users == ["[burst]\n合成較早的訊息：台積電 2330 今天多少", "今年榴槤比較便宜嗎"]
+    assert users == ["[burst]\n（不確定是誰）：合成較早的訊息：台積電 2330 今天多少", "（不確定是誰）：今年榴槤比較便宜嗎"]
 
 
 def test_research_without_the_flag_leaves_the_burst_alone(monkeypatch):
@@ -701,7 +709,7 @@ def test_batch_taken_by_the_flush_before_a_cancel_is_remembered(monkeypatch):
         burst_filter._cancelled_generations["GRP_S"] = 5
     pending = [("P1", NEWS, "U1", 1.0)]
     burst_filter._invoke_flush("GRP_S", NEWS, "T1", pending, generation=5)
-    assert [t for r, t in main.memory.get_context("GRP_S") if r == "user"] == [f"[burst]\n{NEWS}"]
+    assert [t for r, t in main.memory.get_context("GRP_S") if r == "user"] == [f"[burst]\n（不確定是誰）：{NEWS}"]
 
 
 def test_busy_link_readers_answer_from_the_search(monkeypatch, research):

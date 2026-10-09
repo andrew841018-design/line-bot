@@ -1653,35 +1653,178 @@ def _phone_keys(text: str) -> set[str]:
     return keys
 
 
+# 2026-10-10 review：清單地址只認「離它最近的已知店名」。舊規則是同一行或前兩行有任一個
+# 對應店名就過，「1. 甲店｜甲的地址\n2. 乙店｜甲的地址」的第二行也會過。
+# 新項目的開頭擋住往上找：1. 2、 3) （4） 一、 ① 1️⃣ • ・ ● - * 🍽；
+# 「📍 地址」那行和粗體標籤「**地址**：」不是新項目。
+_NEW_ITEM_RE = re.compile(
+    r"[ \t\u3000]*(?:\*\*)?(?:"
+    r"[0-9０-９]{1,3}[ \t\u3000]?[.．、)）](?![0-9０-９])|[(（][0-9０-９]{1,3}[)）]|[一二三四五六七八九十]{1,3}、"
+    r"|[①-⑳❶-❿]|[0-9#*]\ufe0f?\u20e3|[•・●▪\-－＊]|\*(?!\*)|🍽"
+    r")"
+)
+# 項目符號（不是編號）後面只有欄位名稱、接著就是地址：那是上一項的細項。
+_BULLET_RE = re.compile(r"[ \t\u3000]*(?:\*\*)?(?:[•・●▪\-－＊]|\*(?!\*))")
+_FIELD_LABEL_RE = re.compile(
+    r"[ \t\u3000*]*(?:地址|住址|地點|位置|📍|🏠)?[ \t\u3000*]*[：:]?[ \t\u3000*]*"
+)
+# 地址比對常從區名中間開始（「台北市中正區青島東路」從「中」開始），細項判斷時把縣市和
+# 區名的頭一起當成地址的一部分；剩下三個字以上就是店名（「- 拿坡里披薩 青島東路…」）。
+_CITY_PREFIX_RE = re.compile(
+    r"(?:(?:台|臺)北|新北|基隆|桃園|(?:台|臺)中|(?:台|臺)南|高雄|新竹|嘉義|宜蘭|花蓮|(?:台|臺)東|屏東|"
+    r"苗栗|彰化|南投|雲林|澎湖|金門|連江)[市縣]?"
+)
+_DISTRICT_HEAD_RE = re.compile(r"[\u4e00-\u9fff]{0,2}")
+
+
+def _only_field_label(text: str) -> bool:
+    """項目符號和地址中間只有欄位名稱（和地址開頭的縣市、區名）。"""
+    rest = text[_FIELD_LABEL_RE.match(text).end():]
+    city = _CITY_PREFIX_RE.match(rest)
+    if city:
+        rest = rest[city.end():]
+    return _DISTRICT_HEAD_RE.fullmatch(rest) is not None
+# 地址後面的店名要在同一個子句裡才算（「青島東路3之2號的93蕃茄牛肉麵」）。子句在地址後的
+# 「，。；！？」結束；地址寫在括號裡時，右括號也算：「拿坡里披薩（青島東路3之2號）就在
+# 93蕃茄牛肉麵隔壁」的地址是拿坡里披薩的，「八德路一段1號（華山1914文創園區）的巷貓」照常算。
+_CLAUSE_END_RE = re.compile(r"[，,。；;！!？?]")
+
+
+def _first_from(positions: list[int], at: int) -> float:
+    k = bisect.bisect_left(positions, at)
+    return positions[k] if k < len(positions) else float("inf")
+
+
+class _PlaceNames:
+    """The verified shop names on each line of a reply, found once per line.
+
+    Each line keeps its names left to right (where names overlap only the
+    longest stays), its clause ends and its brackets, so every address finds
+    the names around it with bisect and a long line with many addresses stays
+    linear.
+    """
+
+    def __init__(self, lines: list[str], names) -> None:
+        self.lines = lines
+        self.names = tuple(names)
+        self._found: dict[int, tuple[list[int], list[str], list[int], list[int], list[int]]] = {}
+
+    def on(self, index: int) -> tuple[list[int], list[str], list[int], list[int], list[int]]:
+        """(店名起點, 店名, 子句結尾, 左括號, 右括號) 的位置。"""
+        if index not in self._found:
+            line = self.lines[index]
+            spans = []
+            for name in self.names:
+                start = line.find(name)
+                while start != -1:
+                    spans.append((start, start + len(name), name))
+                    start = line.find(name, start + 1)
+            kept: list[tuple[int, int, str]] = []
+            for span in sorted(spans, key=lambda s: (s[0], s[0] - s[1])):
+                if kept and span[0] < kept[-1][1]:
+                    if span[1] - span[0] > kept[-1][1] - kept[-1][0]:
+                        kept[-1] = span
+                    continue
+                kept.append(span)
+            self._found[index] = (
+                [start for start, _end, _name in kept],
+                [name for _start, _end, name in kept],
+                [m.start() for m in _CLAUSE_END_RE.finditer(line)],
+                [i for i, ch in enumerate(line) if ch in "（("],
+                [i for i, ch in enumerate(line) if ch in "）)"],
+            )
+        return self._found[index]
+
+    def starts_item(self, index: int, match: re.Match | None = None) -> bool:
+        """這行是新項目的開頭。項目符號後面只有欄位名稱就接地址（「   - 地址：…」
+        「• 青島東路…」）是上一項的細項，不算新項目（2026-10-10 review）。"""
+        line = self.lines[index]
+        item = _NEW_ITEM_RE.match(line)
+        if not item:
+            return False
+        if match is not None and _BULLET_RE.fullmatch(item.group(0)):
+            return not _only_field_label(line[item.end():match.start()])
+        return True
+
+    def scope(self, index: int, match: re.Match, previous_end: int = 0) -> list[str]:
+        """這個地址旁邊的已知店名；每一家都要真的在這個地址才算有依據。
+
+        2026-10-10 review（第三輪）：只看最近的一家會被「A 店（B 店隔壁）｜B 店地址」
+        繞過，所以範圍裡的每一家都要對。範圍只到同一行上一個地址之後（``previous_end``），
+        「A 在 A 地址，B 在 B 地址」才不會互相牽連：
+        1. 地址所在子句裡、地址前面的店名（全部）；
+        2. 沒有的話，同一子句地址後面的店名（「…還有青島東路7之3號的基隆麵食館」）；地址寫在
+           括號裡時，右括號也算子句結束；
+        3. 再沒有：同一行往前最近一個有店名的子句（「93蕃茄牛肉麵很好吃，地址是…」）；
+        4. 這一行地址前面都沒有店名：往上最多兩行的店名全部算。地址那行本身是新項目就不往上；
+           往上遇到新項目那行要算，但不再往更上面。前面有店名但都在上一個地址之前：範圍是空的，
+           算沒有依據。
+        """
+        starts, names, clause_ends, opens, closes = self.on(index)
+        before = bisect.bisect_left(starts, match.start())
+        first = bisect.bisect_left(starts, previous_end)
+        k = bisect.bisect_left(clause_ends, match.start())
+        clause_start = max(clause_ends[k - 1] if k else -1, previous_end - 1)
+        in_clause = [names[i] for i in range(first, before) if starts[i] > clause_start]
+        if in_clause:
+            return in_clause
+        stop = _first_from(clause_ends, match.end())
+        o = bisect.bisect_left(opens, match.start())
+        c = bisect.bisect_left(closes, match.start())
+        if o and (not c or closes[c - 1] < opens[o - 1]):  # 地址寫在括號裡
+            stop = min(stop, _first_from(closes, match.end()))
+        after = [name for start, name in zip(starts, names) if match.end() <= start < stop]
+        if after:
+            return after
+        if before > first:
+            last_clause = bisect.bisect_left(clause_ends, starts[before - 1])
+            clause_from = clause_ends[last_clause - 1] if last_clause else -1
+            return [names[i] for i in range(first, before) if starts[i] > clause_from]
+        found: list[str] = []
+        if before or self.starts_item(index, match):
+            return found  # 這行前面寫的是別家：不往上找（「A\nB 在 B 地址，二店在 A 地址」）
+        for above in range(index - 1, max(index - 3, -1), -1):
+            found = found + self.on(above)[1]
+            if self.starts_item(above):
+                break
+        return found
+
+
 def unbacked_contact_details(reply: str | None, backing=(), places=()) -> list[str]:
     """Addresses and phone numbers in ``reply`` that no ``backing`` text contains.
 
     ``backing`` is every text the reply may rely on (what the users wrote or
     quoted, pre-read pages, search results the program fetched, the facts the
     bot remembers).  ``places`` are verified (name, address) pairs: such an
-    address counts only when its own name is on the same line or the two lines
-    before it, so a made-up shop with a real neighbour's address is still
-    unbacked (the 2026-10-07 dinner mistake).  Returns the comparison keys of
-    the unbacked details, which callers log as a count only.
+    address counts only when every listed name around it is that address's
+    shop (:meth:`_PlaceNames.scope`), so a made-up shop with a real
+    neighbour's address is still unbacked (the 2026-10-07 dinner mistake), and
+    so is another listed shop's line next to it.  Returns the comparison keys
+    of the unbacked details, which callers log as a count only.
     """
     if not (reply or "").strip():
         return []
     backing_text = "\n".join(t for t in backing if isinstance(t, str) and t)
     known_addresses = _address_keys(backing_text)
     known_phones = _phone_keys(backing_text)
-    place_names: dict[str, set[str]] = {}
+    place_keys: dict[str, set[str]] = {}
     for name, address in places or ():
-        for key in _address_keys(address or ""):
-            place_names.setdefault(key, set()).add(name)
+        if isinstance(name, str) and name.strip():
+            place_keys.setdefault(name.strip(), set()).update(_address_keys(address or ""))
+    listed = set().union(*place_keys.values())
     lines = reply.splitlines()
+    names = _PlaceNames(lines, place_keys)
     found: list[str] = []
     for index, line in enumerate(lines):
-        nearby = "\n".join(lines[max(0, index - 2):index + 1])
-        for _match, key in _address_matches(line):
+        previous_end = 0
+        for match, key in _address_matches(line):
+            line_start, previous_end = previous_end, match.end()
             if key in known_addresses:
                 continue
-            if any(name and name in nearby for name in place_names.get(key, ())):
-                continue
+            if key in listed:
+                around = names.scope(index, match, line_start)
+                if around and all(key in place_keys[name] for name in around):
+                    continue
             if key not in found:
                 found.append(key)
     found += [key for key in sorted(_phone_keys(reply)) if key not in known_phones]

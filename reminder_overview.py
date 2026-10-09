@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -83,6 +84,11 @@ def _hhmm(remind_at: int) -> str:
 
 
 def _names(raw: object) -> tuple[str, ...]:
+    """A people field as plain names, without @ or repeats.
+
+    A string is a database field (JSON text such as mention_aliases); one
+    person's name goes in as ``[name]``, never parsed (2026-10-10 review).
+    """
     if isinstance(raw, str):
         # a row read straight from SQLite keeps mention_aliases as JSON text
         text = raw.strip()
@@ -106,18 +112,25 @@ def _with_people(text: str, names: tuple[str, ...]) -> str:
     return f"{' '.join(missing)} {text}".strip() if missing else text
 
 
-def people_names(raw: object) -> tuple[str, ...]:
-    """Mention aliases as plain names, without @ or repeats."""
-    return _names(raw)
+# 2026-10-10 review（第三輪）：顯示名稱是「家人」「我們」「所有人🙂」這種的，也讀起來像全家。
+_EVERYONE_WORDS = frozenset({"全家", "全家人", "家人", "家族", "大家", "所有人", "我們", "全部", "全員", "all", "everyone"})
+
+
+def _is_everyone(name: str) -> bool:
+    """all／大家／所有人… : the whole family, which :func:`subject_prefix` writes as 「全家」."""
+    import line_mentions
+
+    letters = "".join(
+        ch for ch in unicodedata.normalize("NFKC", str(name or "")) if unicodedata.category(ch)[0] in "LN"
+    ).lower()
+    return name in _EVERYONE or letters in _EVERYONE_WORDS or line_mentions.is_all_participants([name])
 
 
 def subject_prefix(text: str, people: object) -> list[str]:
     """The names :func:`subject_first` puts in front of ``text``."""
-    import line_mentions
-
     names = [name for name in _names(people) if name not in text]
     # all／大家／所有人… are the whole family: one 「全家」, as pushes say it
-    if any(name in _EVERYONE or line_mentions.is_all_participants([name]) for name in names):
+    if any(_is_everyone(name) for name in names):
         return [] if "全家" in text else ["全家"]
     return names
 
@@ -136,16 +149,18 @@ def _names_someone(text: str) -> bool:
     import line_mentions
 
     try:
-        names = line_mentions.configured_family_alias_mapping(include_short=True)
+        names = list(line_mentions.configured_family_alias_mapping(include_short=True))
     except Exception:
-        return False
+        names = []
+    # 2026-10-10 review（第三輪）：不看 LINE 顯示名稱——那是家人自己取的，「健康」「平安」
+    # 這種一般用字會讓「繳健康保險費」少了主詞；「成員甲 去小陳家」多一個主詞無妨。
     return any(name and name in text for name in names)
 
 
 def owner_subject(row: Mapping, text: str | None = None) -> tuple[str, ...]:
     """沒有點名對象時放在事項前面的人：設這個提醒的人（推播 @ 的就是他）。
 
-    有點名對象、事項已寫到某位家人或全家、或建立者沒有設定稱呼時回 ()。
+    有點名對象、事項已寫到某位家人或全家、或建立者沒有設定稱呼（或稱呼代表全體）時回 ()。
     """
     if _names(row.get("mention_aliases")):
         return ()
@@ -160,14 +175,21 @@ def owner_subject(row: Mapping, text: str | None = None) -> tuple[str, ...]:
     import line_mentions
 
     try:
-        # 沒有本機別名就用 bot 查到的 LINE 顯示名稱（Andrew 2026-10-09）
-        alias = _names(
-            line_mentions.alias_for_user_id(owner) or line_mentions.display_name_for_user_id(owner) or ""
-        )
+        # 沒有本機別名就用 bot 查到的 LINE 顯示名稱（Andrew 2026-10-09）。
+        # 2026-10-10 review（第三輪）：顯示名稱和某人的別名相同（「媽媽」）時不用，
+        # 免得讀起來像那個人的事（主程式之後也會把它從檔案移掉）。
+        display = line_mentions.display_name_for_user_id(owner) or ""
+        if display and display in line_mentions.configured_family_alias_mapping(include_short=True):
+            display = ""
+        # 2026-10-10 review：名字以 list 傳進 _names，不當 JSON 解析（顯示名稱「[1]」不會變成「1」）。
+        alias = _names([line_mentions.alias_for_user_id(owner) or display])
     except Exception:
         return ()
+    # 2026-10-10 review：代表全體的名字（ALL、全家…）當作沒有名字，不寫成「全家 繳電話費」
+    if not alias or _is_everyone(alias[0]):
+        return ()
     wording = str(row.get("action") or "") if text is None else text
-    if not alias or alias[0] in wording or _names_someone(wording):
+    if alias[0] in wording or _names_someone(wording):
         return ()
     return alias
 

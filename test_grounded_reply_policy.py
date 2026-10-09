@@ -920,6 +920,15 @@ def test_a_cached_reply_that_needs_a_search_is_answered_afresh(monkeypatch):
     assert sent == [advice] and silent == []
 
 
+def test_a_cached_reply_with_an_address_it_cannot_back_is_answered_afresh(monkeypatch):
+    # 2026-10-10 review: what backed the address then (a page, older turns) is
+    # gone; replaying it would end silent for the cache's 7 days.
+    advice = "想確認細節，可以等官方公布的行程表再安排。"
+    cached = "接待地點在測試市中正區青島東路3之2號，記得提早到。"
+    sent, silent = _burst(monkeypatch, advice, cached=cached)
+    assert sent == [advice] and silent == []
+
+
 def test_lite_lookups_count_as_a_search(monkeypatch):
     import lite_reply
 

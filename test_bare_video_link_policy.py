@@ -311,7 +311,7 @@ def test_explicit_bare_video_without_transcript_is_silent(fake_ytdlp, monkeypatc
     assert out.mark_silent.call_count == 1
     assert out.mark_silent.call_args.args[0] == "TOKEN902"
     # Chat memory keeps what the user typed, not the prefetched material.
-    assert [t[2] for t in out.turns if t[1] == "user"] == [url]
+    assert [t[2] for t in out.turns if t[1] == "user"] == [main.memory.speaker_turn("", url)]
 
 
 def test_explicit_video_with_transcript_or_quote_still_asks_the_model(fake_ytdlp, monkeypatch):

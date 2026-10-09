@@ -28,7 +28,20 @@ import json as _json  # noqa: E402
 # ── 1. 每日待辦 ──────────────────────────────────────────────────────────────
 
 
-_BIRTHDAY_RE = re.compile(r"(.*?)生日：(\d{1,2})/(\d{1,2})")
+# 2026-10-10 review：「生日：／生日是／生日在」後面接 M/D、M月D日、M月D號都算
+# （新的記憶抽取寫成「成員甲：生日是3月5日」「成員甲：生日在 3/5」）。
+# 2026-10-10 review（第三輪）：前面可以有年份（1990/3/5、民國79年3月5日），也認「生日為」
+# 「生日是在」。
+_BIRTHDAY_RE = re.compile(
+    r"(.*?)生日(?:[：是為]\s*在?|在|\s+)\s*(?:(?:西元|民國)?\s*\d{2,4}\s*[年/.\-]\s*)?"
+    r"(\d{1,2})\s*(?:[/.\-]\s*(\d{1,2})|月\s*(\d{1,2})\s*[日號]?)"
+)
+# 農曆生日每年的國曆日期不同，不能當成國曆提醒。
+_LUNAR_RE = re.compile(r"農曆|陰曆|舊曆")
+# 「國曆生日是…」「身分證上的生日是…」：這些不是主角，主角是說話的人。
+_NOT_A_PERSON = ("國曆", "陽曆", "西元", "身分證上", "身份證上", "真正", "實際", "每年", "今年", "我")
+# memory.UNKNOWN_SPEAKER：記憶認不出是哪位家人說的
+_UNKNOWN_SPEAKERS = ("（不確定是誰）", "不確定是誰")
 
 
 def birthday_from_fact(fact: str) -> tuple[str, int, int] | None:
@@ -36,17 +49,26 @@ def birthday_from_fact(fact: str) -> tuple[str, int, int] | None:
 
     2026-10-09 起事實開頭可能是「誰說的：」：主角寫在後面就用後面的，
     「誰：生日：3/5」「誰：我生日：3/5」就是說的人自己。
+    2026-10-10 review：「誰：生日是3月5日」「誰：生日在 3/5」也算；說的人是
+    「（不確定是誰）」又沒寫主角時，不知道是誰的生日，回 None。
     """
     speaker, sep, rest = (fact or "").partition("：")
-    if not (sep and 0 < len(speaker) <= 20 and "生日" not in speaker and "生日：" in rest):
+    if not (sep and 0 < len(speaker) <= 20 and "生日" not in speaker and _BIRTHDAY_RE.search(rest)):
         speaker, rest = "", fact or ""
     m = _BIRTHDAY_RE.search(rest)
-    if not m:
+    if not m or _LUNAR_RE.search(rest[:m.end()]):
         return None
-    who = m.group(1).strip()
-    if speaker and who in ("", "我", "我的", "自己", "自己的"):
+    who = m.group(1).strip().removesuffix("的")  # 「媽媽的生日是…」的主角是媽媽
+    if speaker and (who in ("", "自己") or who in _NOT_A_PERSON):
+        if speaker in _UNKNOWN_SPEAKERS:
+            return None
         who = speaker
-    return (who, int(m.group(2)), int(m.group(3))) if who else None
+    elif who.startswith("我") and who not in _NOT_A_PERSON:
+        return None  # 「我媽生日是4/1」：說話的人的媽媽，對不到群組裡的哪一位
+    month, day = int(m.group(2)), int(m.group(3) or m.group(4))
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return None
+    return (who, month, day) if who else None
 
 
 def upcoming_birthdays() -> str:

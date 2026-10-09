@@ -20,6 +20,7 @@ import os
 import importlib
 import pathlib
 import sqlite3
+import shutil
 import tempfile
 import time
 import warnings
@@ -178,7 +179,7 @@ def _restore_sqlite_paths() -> None:
 
 
 @pytest.fixture(autouse=True)
-def reset_main_globals():
+def reset_main_globals(monkeypatch):
     """Reset all mutable globals before AND after each test."""
     tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
     tmp.close()
@@ -199,6 +200,15 @@ def reset_main_globals():
     tmp_app_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     tmp_app_db.close()
     tmp_app_db_path = Path(tmp_app_db.name)
+
+    # 2026-10-10: display names the bot looks up (line_mentions) go to a temp
+    # file, never state/member_display_names.json of the tree running the tests.
+    # monkeypatch restores it after any test's own setenv of the same variable.
+    tmp_display_names = Path(tempfile.mkdtemp()) / "member_display_names.json"
+    monkeypatch.setenv("LINE_MEMBER_DISPLAY_NAMES_PATH", str(tmp_display_names))
+    main._member_labels.clear()
+    with burst_filter._labelled_lock:
+        burst_filter._labelled_texts.clear()
 
     # ── before ────────────────────────────────────────────────────────────
     # 2026-09-27: an 8 s burst timer left by an earlier test (e.g. an event run
@@ -252,6 +262,10 @@ def reset_main_globals():
     main.settings.bot_muted = _ORIG_BOT_MUTED
     main.settings.allowed_group_id = _ORIG_ALLOWED_GROUP_ID
     main.settings.allowed_group_ids_raw = _ORIG_ALLOWED_GROUP_IDS_RAW
+    main._member_labels.clear()
+    with burst_filter._labelled_lock:
+        burst_filter._labelled_texts.clear()
+    shutil.rmtree(tmp_display_names.parent, ignore_errors=True)
 
     for p in (
         tmp_quota_path,

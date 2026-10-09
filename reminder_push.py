@@ -214,13 +214,6 @@ def _stage_label(
     return _STAGE_LABELS.get(stage, "")
 
 
-def _participant_names(r: dict) -> list[str]:
-    names = line_mentions.parse_participants(r.get("mention_aliases") or [])
-    if line_mentions.is_all_participants(names):
-        return ["全家"]
-    return names
-
-
 def _participant_plain_labels(r: dict) -> list[str]:
     names = line_mentions.parse_participants(r.get("mention_aliases") or [])
     if not names:
