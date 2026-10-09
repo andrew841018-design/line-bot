@@ -19586,16 +19586,15 @@ _DINNER_KEYWORDS = [
 # 不是要一份新清單。只看同一個子句：「晚餐推薦一下，謝謝！」「推薦晚餐，不要上次那間」
 # 還是在要推薦。
 _DINNER_REQUEST_ONLY = ("晚餐推薦", "推薦晚餐")
-_DINNER_CLAUSE_RE = re.compile(r"[^，,。！？!?；;～~\n]+")
-_DINNER_THANKS_OR_PAST_RE = re.compile(r"謝|感恩|上次|上回|剛剛|剛才|之前")
+_DINNER_CLAUSE_RE = re.compile(r"[^，,。！？!?；;～~\s]+")
+_DINNER_THANKS_RE = re.compile(r"謝|感恩")
 _DINNER_ASKS_ABOUT_ONE_RE = re.compile(r"那家|那間|叫什麼|是哪家|是哪間")
 # 「咪寶的晚餐推薦很讚，謝謝！」是在稱讚上一份；要求的字（一下／嗎／？／麻煩／再…）在才算要新的。
 # 稱讚要接到子句結尾或語助詞：「晚餐推薦好吃的」「晚餐推薦不錯的店」是在要推薦。
 _DINNER_PRAISE_RE = re.compile(
     r"^[^，,。！？!?]{0,3}(?:很讚|好讚|讚|好吃|很好吃|不錯|超棒|很棒|好用|很好)(?:耶|喔|哦|啦|了|呢|欸|！|!|～|~|\s)*$"
 )
-_DINNER_ASKING_RE = re.compile(r"一下|嗎|[?？]|麻煩|請|再|有沒有|求|給我|來一份|幫|拜託|可以")
-_DINNER_THANKS_RE = re.compile(r"謝|感恩")
+
 
 
 def _is_dinner_question(text: str) -> bool:
@@ -19607,11 +19606,11 @@ def _is_dinner_question(text: str) -> bool:
             at = clause.find(kw)
             if at == -1:
                 continue
-            if _DINNER_THANKS_OR_PAST_RE.search(clause[:at]) or _DINNER_ASKS_ABOUT_ONE_RE.search(clause[at:]):
+            # 回顧上一份（「上次推薦晚餐那家叫什麼」）要同時在問那一家；「像之前那樣推薦晚餐」是新的請求
+            asks_about_one = _DINNER_ASKS_ABOUT_ONE_RE.search(clause[at:])
+            if _DINNER_THANKS_RE.search(clause[:at]) or asks_about_one:
                 continue
             if _DINNER_PRAISE_RE.search(clause[at + len(kw):]):
-                continue
-            if _DINNER_THANKS_RE.search(text) and not _DINNER_ASKING_RE.search(text):
                 continue
             return True
     return False

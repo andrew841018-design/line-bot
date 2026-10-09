@@ -69,6 +69,7 @@ _RHETORICAL_RE = re.compile(r"不是(?=說?[要想][^，,。！？!?；;]*嗎)")
 _DONE_RE = re.compile(r"過|才|剛|已經")
 _NOT_NEGATION_RE = re.compile(
     r"有沒有|(?:要)?不然|不如|不管|不論|無論|不挑|不忌口|沒差|沒關係|沒問題|不知道|不曉得|不錯的?|要不(?=吃)|"
+    r"吃?不膩|不會膩|"
     r"沒吃過|(?:好|很)久(?:都)?沒有?吃|最近都沒有?吃|(?:怎麼|為什麼|為何|何)不(?=去?吃)|"
     r"(?:不會|不用|不要|不必|沒那麼|不能|別)太?"
     r"(?:貴|遠|辣|油|鹹|甜|久|晚|麻煩|擠|難等|排隊|等|連鎖店?|生的|冷|熱|吵)"
@@ -93,8 +94,9 @@ _NEG_AFTER_RE = re.compile(
 _EXCEPT_AFTER_RE = re.compile(
     r"[\s\u3000]*(?:以外|之外|吃膩|膩|吃到膩|又來|吃過了|❌|(?<![a-z])(?:ng|pass)(?![a-z]))"
 )
-_JUST_ATE_RE = re.compile(r"(?:才|剛|剛剛|已經|昨天|中午|昨晚)吃過")
-_LATER_DAY_RE = re.compile(r"膩|改天|下次再")
+# TODO(2026-10-10 deferred, round-5 review): 「昨天才吃過火鍋」「火鍋改天吧」「火鍋下次吧」仍會
+# 只推那個口味（287db8a 也一樣）；整段後文比對「改天／膩」會吃到下一個口味（「今天吃火鍋改天
+# 吃日式」），要改就只看緊接在口味後面的字。
 _NEG_ONLY_RE = re.compile(rf"(?:{_NEG_WORD}(?:{_FILLER}|{_PARTICLE})*|免了|算了)")
 _QUESTION_END_RE = re.compile(r"[嗎呢][\s\u3000～~]*$")
 
@@ -134,8 +136,6 @@ _JOIN_RE = re.compile(r"[\s\u3000、]*(?:和|跟|與|及|或|或是|或者|還�
 def _stance(prefix: str, suffix: str, clause: str, more_after: bool) -> str:
     """一串口味的態度：'wanted' / 'unwanted' / 'unsure'。"""
     asking = bool(_QUESTION_END_RE.search(clause))
-    if _JUST_ATE_RE.search(prefix) or _LATER_DAY_RE.search(suffix):
-        return "unwanted"  # 「昨天才吃過火鍋」「火鍋吃到都膩了」「火鍋改天吧」
     if _NEG_BEFORE_RE.search(prefix):
         if prefix.rstrip().endswith("沒有") and not _NEG_MARK_RE.search(prefix.rstrip()[:-2]):
             return "unsure"  # 「附近沒有日式嗎」是在問有沒有
@@ -178,7 +178,7 @@ _CHEAP_LIMIT = 250
 _AMOUNT = r"(\d{1,2}(?:,\d{3})+|\d{2,5}|[一二兩三四五六七八九][千百](?:[一二兩三四五六七八九][百十]?)?)"
 _BUDGET_RE = re.compile(
     # 2026-10-10 review：「我一個人18:30到」的 18 是時刻；數字後面接數字／冒號／點就不是預算
-    rf"(?:預算|每人|每個人|一人|一個人|人均)\s*(?:約|大概|大約)?\s*{_AMOUNT}(?![\d:：]|\s*點)"
+    rf"(?:預算|每人|每個人|一人|一個人|人均)\s*(?:約|大概|大約)?\s*{_AMOUNT}(?![\d:：]|\s*[點分月號日])"
     # 2026-10-10 review：「晚上18:30左右」「下午3:30以內」「6點30左右」的 30 是時刻，不是預算
     rf"|(?<![\d:：.])(?<!\d點){_AMOUNT}\s*(?:元|塊)?\s*(?:以內|以下|內|左右)"
 )
@@ -360,8 +360,9 @@ def _amount(token: str) -> int | None:
     return total or None
 
 
-# 2026-10-10 review（第三輪）：清單最便宜的店每人上限是 200 元；低於 100 的數字幾乎都是
-# 時刻或日期（七點30左右、10/15左右、15 分鐘內），不當預算，免得顯示「每人 30 元內」。
+# 2026-10-10 review（第三輪）：清單最便宜的店每人上限是 200 元；沒寫「預算／每人」也沒寫
+# 「元／塊」、又低於 100 的數字幾乎都是時刻或日期（七點30左右、10/15左右），不當預算，免得
+# 顯示「每人 30 元內」。寫明了錢的（每人80以內、預算50元）照讀。
 _MIN_BUDGET = 100
 _NOT_CHEAP_RE = re.compile(r"(?:不要太|不用|不要|別|不必|不想)(?:那麼|太)?(?:便宜|平價|銅板|省錢)")
 
@@ -371,7 +372,8 @@ def budget_limit(asked: str) -> int | None:
     match = _BUDGET_RE.search(text)
     if match:
         amount = _amount(match.group(1) or match.group(2))
-        return amount if amount is not None and amount >= _MIN_BUDGET else None
+        said_money = match.group(1) is not None or re.search(r"[元塊]", match.group(0))
+        return amount if amount is not None and (said_money or amount >= _MIN_BUDGET) else None
     if any(word in _NOT_CHEAP_RE.sub("", text) for word in _CHEAP_WORDS):
         return _CHEAP_LIMIT
     return None

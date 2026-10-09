@@ -56,7 +56,7 @@ def birthday_from_fact(fact: str) -> tuple[str, int, int] | None:
     if not (sep and 0 < len(speaker) <= 20 and "生日" not in speaker and _BIRTHDAY_RE.search(rest)):
         speaker, rest = "", fact or ""
     m = _BIRTHDAY_RE.search(rest)
-    if not m or _LUNAR_RE.search(rest[:m.end()]):
+    if not m or _LUNAR_RE.search(rest):
         return None
     who = m.group(1).strip().removesuffix("的")  # 「媽媽的生日是…」的主角是媽媽
     if speaker and (who in ("", "自己") or who in _NOT_A_PERSON):
