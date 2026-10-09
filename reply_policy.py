@@ -1562,3 +1562,127 @@ _DISPUTE_RE = re.compile(
 def disputes_bot_claim(text: str | None) -> bool:
     """The message says what it quotes (a bot reply) is wrong or made up."""
     return bool(_DISPUTE_RE.search(text or ""))
+
+
+# 2026-10-09 Andrew：晚餐推薦把一家店配上另一家店的地址——「任何資訊必須驗證再驗證，
+# 他得是真的」。模型寫出的台灣地址與電話，一定要在使用者給的內容、引用原文、預讀素材、
+# 程式取得的搜尋結果或查證過的店家清單裡找得到；找不到就是沒有依據，整則不送。
+# 量詞都有上限、沒有巢狀重複，掃描是線性的。
+_CONTACT_DIGITS = str.maketrans("０１２３４５６７８９－（）＋", "0123456789-()+")
+_CN_DIGITS = {"零": 0, "〇": 0, "一": 1, "二": 2, "兩": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+_CONTACT_NUM = r"[0-9０-９零〇一二兩三四五六七八九十百]"
+_SP = r"[ \t\u3000]{0,2}"  # 「青島東路 3 之 2 號」：模型常在數字前後加空白
+_ADDRESS_RE = re.compile(
+    r"(?P<road>[\u4e00-\u9fff]{1,6}?(?:路|街|大道))"
+    rf"(?:{_SP}(?P<section>{_CONTACT_NUM}{{1,3}}{_SP}段))?"
+    rf"(?:{_SP}(?P<lane>{_CONTACT_NUM}{{1,5}}{_SP}巷))?"
+    rf"(?:{_SP}(?P<alley>{_CONTACT_NUM}{{1,5}}{_SP}弄))?"
+    rf"{_SP}(?P<number>{_CONTACT_NUM}{{1,6}}(?:{_SP}[-－之]{_SP}{_CONTACT_NUM}{{1,4}})?{_SP}號)"
+    r"(?![ \t\u3000]{0,2}出口)"  # 「民權西路3號出口」是捷運出口
+)
+_PHONE_RE = re.compile(
+    r"(?<![0-9])(?:(?:\+886|886)[-\s]?|0)(?:9\d{2}[-\s]?\d{3}[-\s]?\d{3}"
+    r"|[2-8]\d?[-\s)]?\s?\d{3,4}[-\s]?\d{4})(?![0-9])"
+    r"|(?<![0-9])\(0[2-8]\d?\)\s?\d{3,4}[-\s]?\d{4}(?![0-9])"
+    r"|(?<![0-9])0800[-\s]?\d{3}[-\s]?\d{3}(?![0-9])"
+)
+# 「走路3號出口」「網路1號」不是地址。
+_NOT_ROADS = ("走路", "網路", "上路", "繞路", "迷路", "帶路", "趕路", "馬路", "順路")
+_NUMBER_TOKEN_RE = re.compile(r"[0-9]+|[零〇一二兩三四五六七八九十百]+")
+
+
+def _cn_number(token: str) -> str:
+    """「二十三」→23、「一百二十三」→123、「十」→10、「一三四」→134、「55」→55。"""
+    if token.isdigit():
+        return str(int(token))
+    total = 0
+    rest = token
+    if "百" in rest:
+        hundreds, _, rest = rest.partition("百")
+        if hundreds not in _CN_DIGITS:
+            return token
+        total += _CN_DIGITS[hundreds] * 100
+        rest = rest.lstrip("零〇")
+    if "十" in rest:
+        tens, _, ones = rest.partition("十")
+        if (tens and tens not in _CN_DIGITS) or (ones and ones not in _CN_DIGITS):
+            return token
+        return str(total + (_CN_DIGITS[tens] if tens else 1) * 10 + (_CN_DIGITS[ones] if ones else 0))
+    if not rest:
+        return str(total)
+    if all(ch in _CN_DIGITS for ch in rest):
+        if total:
+            return str(total + int("".join(str(_CN_DIGITS[ch]) for ch in rest)))
+        return "".join(str(_CN_DIGITS[ch]) for ch in rest)
+    return token
+
+
+def _numeral_key(part: str | None) -> str:
+    """「二段」→「2段」、「五十五號」→「55號」、「3 之 2 號」→「3-2號」：地址數字的比對鍵。"""
+    if not part:
+        return ""
+    text = re.sub(r"[ \t\u3000]", "", part.translate(_CONTACT_DIGITS)).replace("之", "-")
+    return _NUMBER_TOKEN_RE.sub(lambda m: _cn_number(m.group(0)), text)
+
+
+def _address_matches(text: str):
+    for match in _ADDRESS_RE.finditer(text or ""):
+        road = match.group("road")
+        if road.endswith(_NOT_ROADS):
+            continue
+        yield match, (
+            road[-3:]
+            + _numeral_key(match.group("section"))
+            + _numeral_key(match.group("lane"))
+            + _numeral_key(match.group("alley"))
+            + _numeral_key(match.group("number"))
+        )
+
+
+def _address_keys(text: str) -> set[str]:
+    return {key for _match, key in _address_matches(text)}
+
+
+def _phone_keys(text: str) -> set[str]:
+    keys: set[str] = set()
+    for match in _PHONE_RE.finditer((text or "").translate(_CONTACT_DIGITS)):
+        digits = re.sub(r"\D", "", match.group(0))
+        if digits.startswith("886"):
+            digits = "0" + digits[3:]
+        keys.add(digits)
+    return keys
+
+
+def unbacked_contact_details(reply: str | None, backing=(), places=()) -> list[str]:
+    """Addresses and phone numbers in ``reply`` that no ``backing`` text contains.
+
+    ``backing`` is every text the reply may rely on (what the users wrote or
+    quoted, pre-read pages, search results the program fetched, the facts the
+    bot remembers).  ``places`` are verified (name, address) pairs: such an
+    address counts only when its own name is on the same line or the two lines
+    before it, so a made-up shop with a real neighbour's address is still
+    unbacked (the 2026-10-07 dinner mistake).  Returns the comparison keys of
+    the unbacked details, which callers log as a count only.
+    """
+    if not (reply or "").strip():
+        return []
+    backing_text = "\n".join(t for t in backing if isinstance(t, str) and t)
+    known_addresses = _address_keys(backing_text)
+    known_phones = _phone_keys(backing_text)
+    place_names: dict[str, set[str]] = {}
+    for name, address in places or ():
+        for key in _address_keys(address or ""):
+            place_names.setdefault(key, set()).add(name)
+    lines = reply.splitlines()
+    found: list[str] = []
+    for index, line in enumerate(lines):
+        nearby = "\n".join(lines[max(0, index - 2):index + 1])
+        for _match, key in _address_matches(line):
+            if key in known_addresses:
+                continue
+            if any(name and name in nearby for name in place_names.get(key, ())):
+                continue
+            if key not in found:
+                found.append(key)
+    found += [key for key in sorted(_phone_keys(reply)) if key not in known_phones]
+    return found

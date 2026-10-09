@@ -988,7 +988,6 @@ def _route_quietly(monkeypatch) -> None:
     monkeypatch.setattr(main.burst_filter, "add_to_burst", MagicMock())
     monkeypatch.setattr(main.burst_filter, "cancel_burst", MagicMock(return_value=[]))
     monkeypatch.setattr(main, "_gemini_side_task_allowed", lambda *_a, **_k: False)
-    monkeypatch.setattr(main, "_is_silenced_sender", lambda _user_id: False)
     monkeypatch.setattr(
         main, "_handle_explicit_text",
         MagicMock(side_effect=AssertionError("must not reach chat")),
@@ -1795,7 +1794,7 @@ def test_a_fuller_mention_keeps_the_wording_and_the_receipt_shows_its_words(olde
     assert fuller in _detail_actions(first)
     assert _receipt_for(outcome, same, fuller, _at(d, 14)) == (
         f"已更新既有提醒，未重複新增\n時間：{d.isoformat()} 14:00\n"
-        f"事項：{older}\n細節：{fuller}"
+        f"事項：成員甲 {older}\n細節：{fuller}"
     )
 
 
@@ -1811,7 +1810,7 @@ def test_the_receipt_and_the_next_push_show_the_fuller_words(monkeypatch, older,
     receipt = main._maybe_extract_reminder(f"提醒我明天下午兩點{fuller}", G, "U_A", "m-fuller")
 
     assert receipt.startswith("已更新既有提醒")
-    assert f"事項：{older}\n細節：{fuller}" in receipt
+    assert f"事項：成員甲 {older}\n細節：{fuller}" in receipt
     assert receipt.reminder_ids == (rid,) and len(_all_reminder_rows()) == 1
     assert _row(rid)["action"] == older
     assert main._reply(
@@ -1827,7 +1826,7 @@ def test_the_receipt_and_the_next_push_show_the_fuller_words(monkeypatch, older,
     assert len(calls) == 1 and calls[0]["reminder_id"] == rid
     assert "（4 小時後）" in calls[0]["text"]
     assert calls[0]["text"].endswith(
-        f"{tomorrow.isoformat()} 14:00 {older}\n細節：{fuller}")
+        f"{tomorrow.isoformat()} 14:00 成員甲 {older}\n細節：{fuller}")
     assert _row(rid)["action"] == older and _claims() == 0
 
 
@@ -1839,7 +1838,7 @@ def test_a_mention_that_adds_no_words_keeps_todays_receipt():
 
     assert (same, outcome) == (rid, "merged") and "看牙醫" in _detail_actions(rid)
     assert _receipt_for(outcome, rid, "看牙醫", _at(d, 14)) == (
-        f"已更新既有提醒，未重複新增\n時間：{d.isoformat()} 14:00\n事項：看牙醫順便洗牙"
+        f"已更新既有提醒，未重複新增\n時間：{d.isoformat()} 14:00\n事項：成員甲 看牙醫順便洗牙"
     )
 
 
@@ -1853,7 +1852,7 @@ def test_a_repeated_fuller_mention_still_shows_its_words():
 
     assert _receipt_for("duplicate", rid, "繳電費和瓦斯費", _at(d, 14)) == (
         f"提醒已存在，未重複新增\n時間：{d.isoformat()} 14:00\n"
-        "事項：繳電費\n細節：繳電費和瓦斯費"
+        "事項：成員甲 繳電費\n細節：繳電費和瓦斯費"
     )
 
 
@@ -1884,7 +1883,7 @@ def test_a_fuller_rewording_only_the_fold_pairs_gets_its_own_row(monkeypatch):
         "晚宴改成明天晚上6點海景餐廳聚會和慶生", G, "U_A", "m-fuller",
         precomputed_result=_dinner_result("海景餐廳聚會和慶生", tomorrow))
 
-    assert receipt.startswith("已新增提醒") and "事項：海景餐廳聚會和慶生" in receipt
+    assert receipt.startswith("已新增提醒") and "事項：成員甲 海景餐廳聚會和慶生" in receipt
     (fuller,) = receipt.reminder_ids
     assert fuller != older and _status(older) == "pending"
     assert main._reply(
@@ -1906,7 +1905,7 @@ def test_a_fuller_rewording_only_the_fold_pairs_gets_its_own_row(monkeypatch):
     _set_now(monkeypatch, _at(tomorrow, 14, 5))
     assert reminder_push.push_reminders() == 1
     assert len(calls) == 1 and calls[0]["reminder_id"] == fuller
-    assert "18:00 海景餐廳聚會和慶生" in calls[0]["text"] and _claims() == 0
+    assert "18:00 成員甲 海景餐廳聚會和慶生" in calls[0]["text"] and _claims() == 0
 
 
 # What a later mention never does: change the reminder's wording, whatever it
@@ -1935,7 +1934,7 @@ def test_an_even_fuller_mention_is_the_one_detail_shown():
     assert _row(rid)["action"] == "繳電費"
     assert {"繳電費和瓦斯費", "繳電費和瓦斯費及水費"} <= set(_detail_actions(rid))
     assert _receipt_for("merged", rid, "繳電費", _at(d, 14)).endswith(
-        "事項：繳電費\n細節：繳電費和瓦斯費及水費")
+        "事項：成員甲 繳電費\n細節：繳電費和瓦斯費及水費")
 
 
 @pytest.mark.parametrize(
@@ -1998,7 +1997,7 @@ def test_a_fuller_mention_beside_an_all_day_event_is_one_message(monkeypatch):
     texts = _texts(batches[0])
     assert len(texts) == 1, texts
     assert texts[0].startswith("已更新既有提醒")
-    assert "事項：看牙醫\n細節：看牙醫順便洗牙" in texts[0]
+    assert "事項：成員甲 看牙醫\n細節：看牙醫順便洗牙" in texts[0]
     assert not any("🔔" in t for t in texts)
     assert _row(rid)["action"] == "看牙醫"
     with memory._conn() as c:                      # the event's own mirror row aside
@@ -2042,7 +2041,7 @@ def test_a_fuller_mention_keeps_the_mirror_riding_on_the_reminders_push(monkeypa
 
     assert len(calls) == 1 and calls[0]["reminder_id"] == natural
     assert "（1 小時後）" in calls[0]["text"]
-    assert calls[0]["text"].endswith(f"{d.isoformat()} 14:00 看牙醫\n細節：看牙醫順便洗牙")
+    assert calls[0]["text"].endswith(f"{d.isoformat()} 14:00 成員甲 看牙醫\n細節：看牙醫順便洗牙")
     assert _row(natural)["pushed_1hr"] == 1 and _row(mirror)["pushed_1hr"] == 1
     assert _status(mirror) == "pending" and _claims() == 0
     assert _row(natural)["action"] == "看牙醫"
@@ -2065,7 +2064,7 @@ def test_a_fuller_mentions_receipt_keeps_the_mirror_out_of_the_reply(monkeypatch
     assert _texts(batches[0]) == [str(receipt)]
     assert _row(natural)["pushed_1hr"] == 0 and _row(mirror)["pushed_1hr"] == 0
     assert _claims() == 0
-    assert "事項：看牙醫\n細節：看牙醫順便洗牙" in receipt
+    assert "事項：成員甲 看牙醫\n細節：看牙醫順便洗牙" in receipt
 
 
 # GP1 r3 #4: a calendar correction reply is not the corrected event's notice

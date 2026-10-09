@@ -298,7 +298,8 @@ def _format_push_text(r: dict, stage: str, now: int | None = None) -> str:
     )
     # 「媽媽 家長會」: the people lead the action, so no 參加人 line
     # (Andrew 2026-10-07: 主詞放前面).  The @ line above still pings them.
-    action = reminder_overview.subject_first(str(r["action"]), _participant_names(r))
+    # 2026-10-09: no one named → the owner the @ line pings goes first.
+    action = reminder_overview.subject_first(str(r["action"]), reminder_overview.shown_people(r))
     body = f"⏰ 提醒{label}\n{dt.strftime('%Y-%m-%d %H:%M')} {action}"
     details = fuller_detail_line(r.get("action"), r.get("merged_details"))
     if details:

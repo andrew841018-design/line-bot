@@ -52,6 +52,51 @@ def _clean_name(name: str) -> str:
     return str(name or "").strip().lstrip("@").strip()
 
 
+# 2026-10-09：沒有本機別名的家人，用 bot 查到的 LINE 顯示名稱當稱呼。主程式查到就記在
+# 這個檔（state/ 不進 git、權限 0600），提醒推播這種不能問 LINE 的程序也讀得到。
+_DEFAULT_DISPLAY_NAMES_PATH = Path(__file__).with_name("state") / "member_display_names.json"
+
+
+def _display_names_path() -> Path:
+    return Path(os.environ.get("LINE_MEMBER_DISPLAY_NAMES_PATH") or _DEFAULT_DISPLAY_NAMES_PATH)
+
+
+def _load_display_names() -> dict[str, str]:
+    try:
+        data = json.loads(_display_names_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str) and v} if isinstance(data, dict) else {}
+
+
+def display_name_for_user_id(user_id: str) -> str | None:
+    """The LINE display name the bot looked up earlier for this member, if any."""
+    return _load_display_names().get(user_id or "") or None
+
+
+def remember_display_name(user_id: str, name: str) -> None:
+    """Keep a looked-up display name for processes that cannot ask LINE."""
+    if not user_id or not name:
+        return
+    data = _load_display_names()
+    if data.get(user_id) == name:
+        return
+    data[user_id] = name
+    path = _display_names_path()
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def load_user_aliases() -> dict[str, str]:
     path = _alias_path()
     try:

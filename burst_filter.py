@@ -52,6 +52,8 @@ _MAX_RETRY_SAFE_ATTEMPTS = 1
 
 # main.py 在 import 後注入的 callback；簽名包含整個 burst 的 message_ids。
 _on_flush: Callable[[str, str, str, list[str]], None] | None = None
+# main.py 注入：(group_id, user_id) → 家人稱呼（2026-10-09 記憶要分得出是誰說的）。
+_speaker_label: Callable[[str, str | None], str] | None = None
 
 
 class RetryableBurstError(RuntimeError):
@@ -142,6 +144,12 @@ def _schedule_locked(group_id: str, delay: float, force_respond: bool) -> int:
     return generation
 
 
+def register_speaker_label(callback: Callable[[str, str | None], str] | None) -> None:
+    """main.py 注入家人稱呼查詢（2026-10-09）；None 代表不加稱呼。"""
+    global _speaker_label
+    _speaker_label = callback
+
+
 def register_on_flush(fn: Callable[[str, str, str, list[str]], None]) -> None:
     """讓 main.py 在 import filter 時把 flush callback 注入進來。"""
     global _on_flush
@@ -209,7 +217,8 @@ def _remember_cancelled(
     if not text or _heuristic_decision(text) == "skip":
         return
     try:
-        memory.append_turn(group_id, "user", f"[burst]\n{text}")
+        labelled = _combine(pending, group_id=group_id, label_of=_speaker_label)
+        memory.append_turn(group_id, "user", f"[burst]\n{labelled or text}")
     except Exception as exc:
         logger.warning(
             "cancelled burst not remembered group=%s error_type=%s",
@@ -415,9 +424,30 @@ def _classify_and_maybe_respond(
         _complete_without_reply(group_id, pending)
 
 
-def _combine(pending: list[tuple[str, str, str | None, float]]) -> str:
-    """The burst as one text; quoted messages keep their own boundaries."""
-    texts = [text for _, text, _, _ in pending if text]
+def _combine(
+    pending: list[tuple[str, str, str | None, float]],
+    *,
+    group_id: str = "",
+    label_of: Callable[[str, str | None], str] | None = None,
+) -> str:
+    """The burst as one text; quoted messages keep their own boundaries.
+
+    ``label_of`` (group_id, user_id) → who said it: each message then starts
+    with 「稱呼：」 (2026-10-09, for the conversation memory only).  When some
+    writers have a name and another has none, that one's message says
+    「（不確定是誰）：」 so it is never read as the previous speaker's.
+    """
+    names: dict[str | None, str] = {}
+    if label_of is not None:
+        for _, text, user_id, _ in pending:
+            if text and user_id not in names:
+                names[user_id] = _label(group_id, user_id, label_of)
+    unknown = UNKNOWN_SPEAKER if any(names.values()) and not all(names.values()) else ""
+    texts = [
+        _with_name(text, names.get(user_id, "") or unknown) if label_of is not None else text
+        for _, text, user_id, _ in pending
+        if text
+    ]
     if any(has_quote_context(text) for text in texts):
         combined_text = QUOTE_CONTEXT_RULE + "\n" + "\n".join(
             f"--- 群組訊息 {index} 開始 ---\n{text}\n--- 群組訊息 {index} 結束 ---"
@@ -426,6 +456,48 @@ def _combine(pending: list[tuple[str, str, str | None, float]]) -> str:
     else:
         combined_text = "\n".join(texts)
     return combined_text.strip()
+
+
+UNKNOWN_SPEAKER = "（不確定是誰）"
+
+
+def _label(group_id: str, user_id: str | None, label_of: Callable[[str, str | None], str]) -> str:
+    try:
+        return (label_of(group_id, user_id) or "").strip()
+    except Exception:
+        return ""
+
+
+def _with_name(text: str, name: str) -> str:
+    return f"{name}：{text}" if name else text
+
+
+# 2026-10-09：main 把這批存進對話紀錄時要逐則寫是誰說的。交給 main 前先算好加了
+# 稱呼的合併文字，main 用同一批 message_ids 取回；最多留 32 批。
+_labelled_lock = threading.Lock()
+_labelled_texts: dict[tuple[str, tuple[str, ...]], str] = {}
+_LABELLED_KEEP = 32
+
+
+def _stash_labelled(
+    group_id: str, message_ids: list[str], pending: list[tuple[str, str, str | None, float]]
+) -> None:
+    if _speaker_label is None or not message_ids:
+        return
+    text = _combine(pending, group_id=group_id, label_of=_speaker_label)
+    key = (group_id, tuple(str(m) for m in message_ids))
+    with _labelled_lock:
+        _labelled_texts.pop(key, None)
+        _labelled_texts[key] = text
+        while len(_labelled_texts) > _LABELLED_KEEP:
+            _labelled_texts.pop(next(iter(_labelled_texts)))
+
+
+def labelled_text(group_id: str, message_ids: list[str] | None) -> str | None:
+    """這批訊息加了稱呼的合併文字；沒有（未注入稱呼、太舊）回 None。"""
+    key = (group_id, tuple(str(m) for m in message_ids or ()))
+    with _labelled_lock:
+        return _labelled_texts.get(key)
 
 
 def _complete_without_reply(
@@ -487,6 +559,10 @@ def _invoke_flush(
         first_age_s,
         last_age_s,
     )
+    try:
+        _stash_labelled(group_id, message_ids, pending)
+    except Exception as exc:
+        logger.debug("burst labels skipped: %s", exc)
     _on_flush(group_id, combined_text, reply_token, message_ids)
 
 

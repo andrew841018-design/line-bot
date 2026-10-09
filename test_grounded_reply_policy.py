@@ -1047,27 +1047,17 @@ def test_round4_claims_are_still_caught(reply):
     assert reply_policy.has_unbacked_search_claim(reply, searched=False, has_material=False)
 
 
-def test_a_dinner_answer_the_guard_dropped_is_finished_silently(monkeypatch):
+def test_dinner_answers_never_come_from_a_model(monkeypatch):
+    # 2026-10-09: dinner picks come only from the verified list
+    # (test_dinner_places.py); no model reply can be dropped or sent here.
+    import dinner_places
+
     sent = []
-    monkeypatch.setattr(main.memory, "get_context", lambda *_: [])
-    monkeypatch.setattr(main.memory, "top_facts", lambda *a, **k: [])
-    monkeypatch.setattr(main, "_get_persona_notes", lambda *_: [])
-    monkeypatch.setattr(main, "_thinking_indicator", lambda *_: nullcontext())
     monkeypatch.setattr(main, "_reply", lambda _tok, text, **_k: sent.append(text))
-
-    def dropped_chat(*_a, **_k):
-        reply_provenance.mark_dropped()
-        return ""
-
-    monkeypatch.setattr(main, "_llm_chat", dropped_chat)
+    monkeypatch.setattr(main, "_llm_chat", lambda *_a, **_k: pytest.fail("dinner asked a model"))
+    monkeypatch.setattr(dinner_places, "recommend", lambda *_a, **_k: dinner_places.NO_FRESH_TEXT)
     main._handle_dinner_recommendation(SimpleNamespace(reply_token="T_DINNER"), "G_DINNER")
-    assert sent == [""]  # _reply finishes the message without sending anything
-    # a genuine generation failure still gets the friendly message
-    reply_provenance.reset()
-    sent.clear()
-    monkeypatch.setattr(main, "_llm_chat", lambda *_a, **_k: "")
-    main._handle_dinner_recommendation(SimpleNamespace(reply_token="T_DINNER2"), "G_DINNER")
-    assert sent == ["晚餐推薦今天罷工了，等一下再試試"]
+    assert sent == [dinner_places.NO_FRESH_TEXT]
 
 
 # ── 2026-10-05: the checks run on reply text while holding the GIL, so a run of

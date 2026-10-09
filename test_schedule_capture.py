@@ -1510,7 +1510,6 @@ def _capture_setup(monkeypatch):
     monkeypatch.setattr(main, "_reply", lambda _token, text, **_kw: sent.append(text) or True)
     explicit = MagicMock()
     monkeypatch.setattr(main, "_handle_explicit_text", explicit)
-    monkeypatch.setattr(main, "_is_silenced_sender", lambda user_id: user_id == "U_QUIET")
     monkeypatch.setattr(memory, "consume_open_stages", lambda *_a, **_k: None, raising=False)
     return sent, explicit
 
@@ -1548,14 +1547,28 @@ def test_quote_of_non_schedule_text_falls_through_to_explicit(monkeypatch):
     explicit.assert_called_once()
 
 
-@pytest.mark.parametrize("variant", ["bot", "silenced", "old", "media"])
-def test_quote_capture_refuses_bot_silenced_old_or_media_sources(monkeypatch, variant):
+def test_quote_capture_works_for_the_sister_too(monkeypatch):
+    """2026-10-09：取消妹妹零回覆後，引用她的行程＋「咪寶」也照樣幫她記。"""
+    sent, explicit = _capture_setup(monkeypatch)
+    monkeypatch.setattr(main.line_mentions, "user_id_for_family_role", lambda _role: "U_SISTER")
+    _seed_raw(_trip_text(_base_day()), user_id="U_SISTER")
+
+    main._handle_text_message(
+        _text_event("咪寶", message_id="m-cmd", user_id=U_OTHER, quoted="m-src"), G
+    )
+
+    rows = _pending_rows()
+    assert len(rows) == 4 and {row[2] for row in rows} == {"U_SISTER"}
+    assert len(sent) == 1 and sent[0].startswith("已新增 4 筆提醒")
+    explicit.assert_not_called()
+
+
+@pytest.mark.parametrize("variant", ["bot", "old", "media"])
+def test_quote_capture_refuses_bot_old_or_media_sources(monkeypatch, variant):
     sent, explicit = _capture_setup(monkeypatch)
     text = _trip_text(_base_day())
     if variant == "bot":
         _seed_raw(text, user_id="__bot__")
-    elif variant == "silenced":
-        _seed_raw(text, user_id="U_QUIET")
     elif variant == "old":
         _seed_raw(text, age_sec=15 * 86400)
     else:
@@ -1941,7 +1954,6 @@ def test_quoted_capture_receipt_excludes_its_new_reminders(monkeypatch):
     _no_model(monkeypatch)
     _quiet_routing(monkeypatch)
     monkeypatch.setattr(main, "_handle_explicit_text", MagicMock())
-    monkeypatch.setattr(main, "_is_silenced_sender", lambda _user_id: False)
     calls = _ref_capture(monkeypatch)
     _seed_raw(_trip_text(_base_day()))
 

@@ -1,0 +1,373 @@
+{
+  "_note": "晚餐推薦只推這份清單（2026-10-09）。每間的店名＋地址都經兩輪獨立查證；verified_on 超過 max_age_days 不推；closed_weekdays 0=週一…6=週日，當晚公休不推。新增或更新照同一標準，見 agent_rules/line_bot.md 10/09 條。",
+  "max_age_days": 120,
+  "places": [
+    {
+      "name": "93蕃茄牛肉麵",
+      "address": "台北市中正區青島東路3之2號",
+      "cuisine": "牛肉麵",
+      "tags": [
+        "麵食",
+        "台式"
+      ],
+      "price": "每人約 NT$200（愛食記均消）",
+      "price_max": 200,
+      "closed_weekdays": [
+        5,
+        6
+      ],
+      "verified_on": "2026-10-09",
+      "sources": [
+        "https://ifoodie.tw/restaurant/59ff52d22756dd6f04e9d377-93%E7%95%AA%E8%8C%84%E7%89%9B%E8%82%89%E9%BA%B5",
+        "https://en.footinder.app/places/64299437cf989d82dfdc62db",
+        "https://www.openstreetmap.org/node/2755629544",
+        "https://blake.com.tw/blog/post/93-fanjia-niurou-mian-202501",
+        "https://upssmile.com/237932/93fanjia-niurou-mian",
+        "https://niniyeh.com/93-tomato-beef-noodle/"
+      ]
+    },
+    {
+      "name": "勺勺客陝西餐館",
+      "address": "台北市中正區杭州南路一段27號",
+      "cuisine": "陝西菜",
+      "tags": [
+        "中式",
+        "麵食"
+      ],
+      "price": "每人約 NT$600（愛食記均消）",
+      "price_max": 600,
+      "closed_weekdays": [
+        0,
+        1
+      ],
+      "verified_on": "2026-10-09",
+      "sources": [
+        "https://ifoodie.tw/restaurant/559de353c03a103ee86cbb2d-%E5%8B%BA%E5%8B%BA%E5%AE%A2-%E9%99%9C%E8%A5%BF%E9%A4%90%E9%A4%A8",
+        "https://www.mirrormedia.mg/story/20220511food001",
+        "https://www.openstreetmap.org/node/9504555259",
+        "https://orange.udn.com/orange/story/123282/9108481",
+        "https://pekoblog.tw/shaoshaoke/",
+        "https://nash.tw/shaoshaoke2024/"
+      ]
+    },
+    {
+      "name": "御景日本料理",
+      "address": "台北市中正區林森南路2號1樓之4",
+      "cuisine": "日式定食",
+      "tags": [
+        "日式"
+      ],
+      "price": "每人約 NT$400–2,000（另收服務費）",
+      "price_max": 2000,
+      "closed_weekdays": [],
+      "verified_on": "2026-10-09",
+      "sources": [
+        "https://live2makan.com/2023/12/16/mii-japanese-food-%E5%BE%A1%E6%99%AF%E5%92%8C%E9%A2%A8-taipei/",
+        "https://ifoodie.tw/restaurant/55a644dfc03a104df53c9583-%E5%BE%A1%E6%99%AF%E6%97%A5%E6%9C%AC%E6%96%99%E7%90%86",
+        "https://www.openstreetmap.org/node/7836878777",
+        "https://taipeixcity.pixnet.net/blog/posts/7122746562",
+        "https://live2makan.com/2023/12/16/mii-japanese-food-%e5%be%a1%e6%99%af%e5%92%8c%e9%a2%a8-taipei/",
+        "https://mrandmrspiggy.pixnet.net/blog/posts/17343381590"
+      ]
+    },
+    {
+      "name": "GiliGili KOREA 韓國釜山餐酒館",
+      "address": "台北市中山區天津街16號1樓",
+      "cuisine": "韓式",
+      "tags": [
+        "韓式"
+      ],
+      "price": "每人約 NT$390（愛食記均消）",
+      "price_max": 390,
+      "closed_weekdays": [
+        0
+      ],
+      "verified_on": "2026-10-09",
+      "sources": [
+        "https://ifoodie.tw/restaurant/586be9d32756dd757bb8f8e3-GiliGili-KOREA-Bbq-r",
+        "https://www.beauty321.com/post/57125",
+        "https://www.walkerland.com.tw/article/view/422022",
+        "https://ifoodie.tw/restaurant/586be9d32756dd757bb8f8e3-GiliGili-KOREA-Bbq&r"
+      ]
+    },
+    {
+      "name": "忠青商行",
+      "address": "台北市中正區青島東路6之1號1樓",
+      "cuisine": "台式小吃",
+      "tags": [
+        "台式"
+      ],
+      "price": "每人約 NT$250（愛食記均消）",
+      "price_max": 250,
+      "closed_weekdays": [],
+      "verified_on": "2026-10-09",
+      "sources": [
+        "https://ifoodie.tw/restaurant/5e844e4a2261392093b21823-%E5%BF%A0%E9%9D%92%E5%95%86%E8%A1%8C",
+        "https://supertaste.tvbs.com.tw/food/327340",
+        "https://www.nownews.com/news/6454072",
+        "https://travel.yam.com/article/119512",
+        "https://lordcat.net/archives/117528",
+        "https://windiewang.com/2025/08/16/taipei-chungching-store/"
+      ]
+    },
+    {
+      "name": "和園川味小吃",
+      "address": "台北市中正區紹興南街5之2號",
+      "cuisine": "川菜熱炒／便當",
+      "tags": [
+        "中式",
+        "台式"
+      ],
+      "price": "每人約 NT$200（愛食記均消）",
+      "price_max": 200,
+      "closed_weekdays": [
+        6
+      ],
+      "verified_on": "2026-10-09",
+      "sources": [
+        "https://blake.com.tw/blog/post/he-yuan-2609",
+        "https://bunnyann.tw/heyuan/",
+        "https://ifoodie.tw/restaurant/5e6636168c906d1cb08dc56c-%E5%92%8C%E5%9C%92%E5%B7%9D%E5%91%B3%E5%B0%8F%E5%90%83",
+        "https://nash.tw/togoheyuan202603/",
+        "https://lordcat.net/archives/156380"
+      ]
+    },
+    {
+      "name": "青嬌膠原麵館",
+      "address": "台北市中正區濟南路二段9號1樓",
+      "cuisine": "麵食",
+      "tags": [
+        "麵食"
+      ],
+      "price": "每人約 NT$200–390",
+      "price_max": 390,
+      "closed_weekdays": [],
+      "verified_on": "2026-10-09",
+      "sources": [
+        "https://guide.michelin.com/tw/zh_TW/taipei-region/taipei/restaurant/ching-jiao",
+        "https://wantrich.chinatimes.com/news/20260622900053-420101",
+        "https://lordcat.net/archives/158563",
+        "https://playing.ltn.com.tw/article/31063",
+        "https://www.ctee.com.tw/news/20260627700197-439902",
+        "https://supertaste.tvbs.com.tw/food/358188",
+        "https://upssmile.com/274700/chingjiao",
+        "https://venuslin.tw/chingjiao"
+      ]
+    },
+    {
+      "name": "龍門客棧餃子館",
+      "address": "台北市中正區林森南路61巷19號",
+      "cuisine": "水餃／滷味",
+      "tags": [
+        "麵食",
+        "中式"
+      ],
+      "price": "每人約 NT$200–400（愛食記價位區間）",
+      "price_max": 400,
+      "closed_weekdays": [
+        0
+      ],
+      "verified_on": "2026-10-09",
+      "sources": [
+        "https://appletrees.tw/blog/post/longmendumpling",
+        "https://ifoodie.tw/restaurant/559d1df3c03a103ee86c40df-%E9%BE%8D%E9%96%80%E5%AE%A2%E6%A3%A7%E9%A4%83%E5%AD%90%E9%A4%A8",
+        "https://oggi.jp/191276",
+        "https://blake.com.tw/blog/post/longmen-dumpling"
+      ]
+    },
+    {
+      "name": "基隆麵食館",
+      "address": "台北市中正區青島東路7之3號",
+      "cuisine": "麵食",
+      "tags": [
+        "麵食"
+      ],
+      "price": "每人約 NT$200（愛食記均消）",
+      "price_max": 200,
+      "closed_weekdays": [
+        6
+      ],
+      "verified_on": "2026-10-09",
+      "sources": [
+        "https://ifoodie.tw/restaurant/606af464781cc061df55120f-%E9%9D%92%E5%B3%B6%E6%9D%B1%E8%B7%AF-%E5%9F%BA%E9%9A%86%E9%BA%B5%E9%A3%9F%E9%A4%A8",
+        "https://beri.tw/keelung-noodles-tpe/",
+        "https://www.walkerland.com.tw/article/view/360408",
+        "https://travel.line.me/article/T1go2tg2c4",
+        "https://www.popdaily.com.tw/forum/food/1208349"
+      ]
+    },
+    {
+      "name": "蘇杭餐廳 濟南店",
+      "address": "台北市中正區濟南路一段2之1號",
+      "cuisine": "江浙菜",
+      "tags": [
+        "中式"
+      ],
+      "price": "每人約 NT$600（愛食記均消）",
+      "price_max": 600,
+      "closed_weekdays": [],
+      "verified_on": "2026-10-09",
+      "sources": [
+        "https://bunnyann.tw/suhang-restaurant/",
+        "https://ifoodie.tw/restaurant/559de63bc03a103ee86cbd81-%E8%98%87%E6%9D%AD%E9%A4%90%E5%BB%B3",
+        "http://www.suhung.com.tw/branches.php?b=1",
+        "https://bunnyann.tw/?p=162668"
+      ]
+    },
+    {
+      "name": "祥和蔬食 鎮江店",
+      "address": "台北市中正區鎮江街1巷1號",
+      "cuisine": "素食",
+      "tags": [
+        "素食"
+      ],
+      "price": "每人約 NT$600（愛食記均消，另加 10% 服務費）",
+      "price_max": 660,
+      "closed_weekdays": [],
+      "verified_on": "2026-10-09",
+      "sources": [
+        "https://www.serenity.com.tw/pages/zhenjiang",
+        "https://guide.michelin.com/tw/zh_TW/taipei-region/taipei/restaurant/serenity",
+        "https://ifoodie.tw/restaurant/55b958e340b5e303a1d56d0b-%E7%A5%A5%E5%92%8C%E8%94%AC%E9%A3%9F%E7%B2%BE%E7%B7%BB%E6%96%99%E7%90%86",
+        "https://supertaste.tvbs.com.tw/food/355946",
+        "https://dining.inline.app/discover/marketing/2026-bib-gourmand/"
+      ]
+    },
+    {
+      "name": "鮑福記 鮑魚雞湯火鍋",
+      "address": "台北市中正區金山南路一段8號1樓",
+      "cuisine": "火鍋",
+      "tags": [
+        "火鍋",
+        "中式"
+      ],
+      "price": "每人約 NT$560–1,200（內用最低一個小鍋 NT$1,680）",
+      "price_max": 1200,
+      "closed_weekdays": [],
+      "verified_on": "2026-10-09",
+      "sources": [
+        "https://www.ctee.com.tw/news/20260713700320-430901",
+        "https://supertaste.tvbs.com.tw/esg/360510",
+        "https://www.ctee.com.tw/news/20260718700214-439902",
+        "https://supertaste.tvbs.com.tw/food/360510"
+      ]
+    },
+    {
+      "name": "溫咖哩 Wen Curry",
+      "address": "台北市中正區濟南路二段3-8號",
+      "cuisine": "日式咖哩",
+      "tags": [
+        "日式"
+      ],
+      "price": "每人約 NT$500（含服務費）",
+      "price_max": 500,
+      "closed_weekdays": [],
+      "verified_on": "2026-10-09",
+      "sources": [
+        "https://ifoodie.tw/restaurant/6134a970a6272805a3865da9-%E6%BA%AB%E5%92%96%E5%93%A9-Wen-Curry",
+        "https://www.marieclaire.com.tw/lifestyle/taste/60072",
+        "https://today.line.me/tw/v3/article/QwZ1zGl",
+        "https://jeremyfoodie.tw/wen-curry/",
+        "https://tenjo.tw/wencurry/",
+        "https://pfse64289.pixnet.net/blog/posts/15333564133",
+        "https://jeremyfoodie.tw/mrt-shandao-temple/"
+      ]
+    },
+    {
+      "name": "麺屋千雲 Chikumo 光華店",
+      "address": "台北市中正區臨沂街3巷1號",
+      "cuisine": "拉麵",
+      "tags": [
+        "日式",
+        "麵食"
+      ],
+      "price": "每人約 NT$350（愛食記均消）",
+      "price_max": 350,
+      "closed_weekdays": [],
+      "verified_on": "2026-10-09",
+      "sources": [
+        "https://chikumo-ramen.com/zh-tw/location/",
+        "https://www.ifoodie.tw/restaurant/6509bdc03fc274fa4c854d78-%E9%BA%BA%E5%B1%8B-%E5%8D%83%E9%9B%B2-Chikumo-%E5%85%89%E8%8F%AF%E5%BA%97",
+        "https://tingandkao.com/chikumo-ramen/",
+        "https://ifoodie.tw/post/66193f55eb74c41150b0e938",
+        "https://rlaidiary.com/ramen-chikumo/"
+      ]
+    },
+    {
+      "name": "巷貓 Alleycat's Pizza 華山店",
+      "address": "台北市中正區八德路一段1號（華山1914文創園區）",
+      "cuisine": "披薩／義式",
+      "tags": [
+        "西式"
+      ],
+      "price": "每人約 NT$500–700",
+      "price_max": 700,
+      "closed_weekdays": [],
+      "verified_on": "2026-10-09",
+      "sources": [
+        "https://www.alleycatspizza.com/mainssl/modules/MySpace/index.php?sn=alleycats&pg=ZC85505",
+        "https://ifoodie.tw/restaurant/559d6354c03a103ee86c6dbc-Alleycat-s-Pizza-%E5%8F%B0%E5%8C%97%E8%8F%AF",
+        "https://www.huashan1914.com/store/%E5%B7%B7%E8%B2%93%20Alleycat%27s",
+        "https://wanteatfood.com/79088",
+        "https://ningl.tw/%E5%B7%B7%E8%B2%93alleycats-pizza%E8%8F%AF%E5%B1%B1%E5%BA%97%E3%80%82%E8%8F%AF%E5%B1%B1%E4%BA%BA%E6%B0%A3%E7%BE%8E%E9%A3%9F%E6%96%B0%E5%9D%80%E8%A9%A6%E7%87%9F%E9%81%8B%EF%BC%81%E7%AA%AF%E7%83%A4/"
+      ]
+    },
+    {
+      "name": "亞里士餐廳",
+      "address": "台北市中山區長安東路一段27號B1",
+      "cuisine": "牛排西餐",
+      "tags": [
+        "西式"
+      ],
+      "price": "套餐每份約 NT$1,980（另加 10% 服務費）",
+      "price_max": 2200,
+      "closed_weekdays": [],
+      "verified_on": "2026-10-09",
+      "sources": [
+        "https://www.mirrormedia.mg/story/20251015bus001",
+        "https://ifoodie.tw/restaurant/55a532a5c03a10241de650db-%E4%BA%9E%E9%87%8C%E5%A3%AB%E8%A5%BF%E9%A4%90%E5%BB%B3",
+        "https://www.ningl.tw/alicesteakhouse1268/",
+        "https://gzifood.com/aristocratic-steak/",
+        "https://lexie.tw/alice/"
+      ]
+    },
+    {
+      "name": "文慶雞",
+      "address": "台北市中正區忠孝東路二段33號",
+      "cuisine": "新加坡海南雞飯",
+      "tags": [
+        "東南亞"
+      ],
+      "price": "每人約 NT$190–320",
+      "price_max": 320,
+      "closed_weekdays": [
+        5
+      ],
+      "verified_on": "2026-10-09",
+      "sources": [
+        "https://www.marieclaire.com.tw/lifestyle/taste/92859",
+        "https://www.ifoodie.tw/restaurant/559de375c03a103ee86cbb3a-%E6%96%87%E6%85%B6%E9%9B%9E",
+        "https://nanocakl.com/wenqingchicken/",
+        "https://anita.tw/bk-chicken/"
+      ]
+    },
+    {
+      "name": "豆腐村 三創店",
+      "address": "台北市中正區市民大道三段2號B2",
+      "cuisine": "韓式嫩豆腐煲",
+      "tags": [
+        "韓式"
+      ],
+      "price": "套餐每份 NT$358（官網菜單）",
+      "price_max": 358,
+      "closed_weekdays": [],
+      "verified_on": "2026-10-09",
+      "sources": [
+        "https://tofuvillage.com.tw/stronghold",
+        "https://ifoodie.tw/restaurant/56ca95e62756dd11e4819c42-%E8%B1%86%E8%85%90%E6%9D%91-TOFU-Village-%E4%B8%89%E5%89%B5%E5%BA%97",
+        "https://www.syntrend.com.tw/floor.html?id=13",
+        "https://www.tofuvillage.com.tw/stronghold"
+      ]
+    }
+  ]
+}

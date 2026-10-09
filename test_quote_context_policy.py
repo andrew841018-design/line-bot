@@ -85,25 +85,35 @@ def test_exact_source_and_quote_edge_are_group_scoped(isolated):
     assert "未取得" in main._build_quoted_block(SimpleNamespace(quoted_message_id="source"), "group-b")
 
 
-def test_silenced_text_is_still_quotable_without_routing_or_indexing(monkeypatch):
+def test_sister_text_is_quotable_routed_and_indexed(monkeypatch):
+    """2026-10-09：取消妹妹零回覆。設定裡「妹妹」傳的文字照常路由、建回想索引，也照樣能被引用。"""
     from linebot.v3.webhooks import MessageEvent, TextMessageContent, GroupSource
     event = MagicMock(spec=MessageEvent)
     event.source = MagicMock(spec=GroupSource)
-    event.source.group_id, event.source.user_id = "group", "silent-user"
+    event.source.group_id, event.source.user_id = "group", "sister-user"
     event.message = MagicMock(spec=TextMessageContent)
-    event.message.id, event.message.text = "silent-source", "SILENT_SOURCE_TEXT"
+    event.message.id, event.message.text = "sister-source", "SISTER_SOURCE_TEXT"
     event.message.quoted_message_id = "older"
     event.reply_token = "token"
     event.delivery_context = None
     monkeypatch.setattr(main.settings, "allowed_group_ids_raw", "")
     monkeypatch.setattr(main.settings, "allowed_group_id", "")
-    monkeypatch.setattr(main, "_is_silenced_sender", lambda *_a: True)
-    monkeypatch.setattr(main, "_handle_text_message", lambda *_a: pytest.fail("silenced route"))
-    monkeypatch.setattr(memory._EMBED_EXECUTOR, "submit", lambda *_a: pytest.fail("silenced side task"))
+    monkeypatch.setattr(main.line_mentions, "user_id_for_family_role", lambda _role: "sister-user")
+    routed = []
+    monkeypatch.setattr(main, "_handle_text_message", lambda *a: routed.append(a))
+    indexed = []
+
+    def _submit(fn, *_a, **_k):
+        indexed.append(fn)
+        memory._EMBED_INFLIGHT.release()
+
+    monkeypatch.setattr(memory._EMBED_EXECUTOR, "submit", _submit)
     main._handle_event(event)
-    assert memory.get_raw_message("group", "silent-source")[1] == "SILENT_SOURCE_TEXT"
-    assert memory.get_quoted_message_id("group", "silent-source") == "older"
-    assert memory.get_inbound_event_status("group", "silent-source") == "completed_no_reply"
+    assert routed == [(event, "group")]
+    assert len(indexed) == 1
+    assert memory.get_raw_message("group", "sister-source")[1] == "SISTER_SOURCE_TEXT"
+    assert memory.get_quoted_message_id("group", "sister-source") == "older"
+    assert memory.get_inbound_event_status("group", "sister-source") != "completed_no_reply"
 
 
 def test_explicit_retry_keeps_original_even_with_nonempty_current_text(monkeypatch, isolated):

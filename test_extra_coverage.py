@@ -553,82 +553,44 @@ def test_extract_office_text():
 # Test G: _handle_dinner_recommendation
 # ═══════════════════════════════════════════════════════════════════════════════
 def test_handle_dinner_recommendation():
+    """2026-10-09：晚餐推薦只從查證清單挑店，不呼叫任何模型。"""
     print("\n── Test G: _handle_dinner_recommendation ──")
+    import dinner_places
+
     msg = _make_text_msg("今晚吃什麼")
     evt = _make_message_event(msg)
+    listed = "🍽 測試店\n📍 測試路1號\n🍴 麵食"
 
-    # quota exhausted still goes through _llm_chat so local/lite fallback can answer.
-    main._quota_exhausted_until_ts = time.time() + 3600
     with (
-        patch("main.memory.get_context", return_value=[]),
-        patch("main.memory.top_facts", return_value=[]),
-        patch("main._get_persona_notes", return_value=[]),
-        patch("main._llm_chat", return_value="fallback dinner") as mock_llm,
-        patch("main._reply") as mock_reply0,
-    ):
-        main._handle_dinner_recommendation(evt, "GRP001")
-    check("quota 爆 dinner → 仍呼叫 LLM fallback", mock_llm.called)
-    check("quota 爆 dinner → reply fallback 結果", mock_reply0.called)
-    main._quota_exhausted_until_ts = 0.0
-
-    # Quota error during dinner
-    quota_exc = Exception("429 RESOURCE_EXHAUSTED PerDay free_tier_requests")
-    with (
-        patch("main.memory.get_context", return_value=[]),
-        patch("main.memory.top_facts", return_value=[]),
-        patch("main._get_persona_notes", return_value=[]),
-        patch("main._llm_chat", side_effect=quota_exc),
-        patch("main._local_text_llm_fallback", return_value="local dinner") as mock_local,
-        patch("main._mark_quota_exhausted") as mock_mark,
-        patch("main._reply") as mock_reply_quota,
-    ):
-        main._handle_dinner_recommendation(evt, "GRP001")
-    check("dinner quota error → mark exhausted", mock_mark.called)
-    check("dinner quota error → local fallback", mock_local.called)
-    check(
-        "dinner quota error → reply local fallback",
-        mock_reply_quota.call_args[0][1] == "local dinner",
-    )
-
-    # Gemini unavailable during dinner → local fallback
-    unavailable_exc = Exception("503 UNAVAILABLE high demand")
-    with (
-        patch("main.memory.get_context", return_value=[]),
-        patch("main.memory.top_facts", return_value=[]),
-        patch("main._get_persona_notes", return_value=[]),
-        patch("main._llm_chat", side_effect=unavailable_exc),
-        patch("main._local_text_llm_fallback", return_value="local dinner 503") as mock_local503,
-        patch("main._reply") as mock_reply503,
-    ):
-        main._handle_dinner_recommendation(evt, "GRP001")
-    check("dinner 503 → local fallback", mock_local503.called)
-    check(
-        "dinner 503 → reply local fallback",
-        mock_reply503.call_args[0][1] == "local dinner 503",
-    )
-
-    # Non-quota error → reply error
-    other_exc = Exception("500 server error")
-    with (
-        patch("main.memory.get_context", return_value=[]),
-        patch("main.memory.top_facts", return_value=[]),
-        patch("main._get_persona_notes", return_value=[]),
-        patch("main._llm_chat", side_effect=other_exc),
+        patch("main._llm_chat") as mock_llm,
+        patch("dinner_places.recommend", return_value=listed),
+        patch("dinner_places.verify_reply", return_value=True),
         patch("main._reply") as mock_reply,
     ):
         main._handle_dinner_recommendation(evt, "GRP001")
-    check("dinner 500 error → reply error", mock_reply.called)
+    check("dinner → 不呼叫模型", not mock_llm.called)
+    check("dinner → 送清單文字", mock_reply.call_args[0][1] == listed)
 
-    # Success
     with (
-        patch("main.memory.get_context", return_value=[]),
-        patch("main.memory.top_facts", return_value=[]),
-        patch("main._get_persona_notes", return_value=[]),
-        patch("main._llm_chat", return_value="推薦餐廳"),
-        patch("main._reply") as mock_reply2,
+        patch("dinner_places.recommend", return_value=listed),
+        patch("dinner_places.verify_reply", return_value=False),
+        patch("main._reply") as mock_reply_bad,
     ):
         main._handle_dinner_recommendation(evt, "GRP001")
-    check("dinner 成功 → reply", mock_reply2.called)
+    check(
+        "dinner 比對不過 → 不送店家資訊",
+        mock_reply_bad.call_args[0][1] == dinner_places.NO_FRESH_TEXT,
+    )
+
+    with (
+        patch("dinner_places.recommend", side_effect=OSError("synthetic")),
+        patch("main._reply") as mock_reply_err,
+    ):
+        main._handle_dinner_recommendation(evt, "GRP001")
+    check(
+        "dinner 例外 → 不送店家資訊",
+        mock_reply_err.call_args[0][1] == dinner_places.NO_FRESH_TEXT,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

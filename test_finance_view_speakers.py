@@ -129,7 +129,7 @@ def test_without_senders_a_pronoun_is_never_stored(run_inline):
 
     fve.maybe_extract_and_save_async(G, "我覺得 0050 會漲到 180")
 
-    assert [row[0] for row in _stored()] == ["家人"]
+    assert [row[0] for row in _stored()] == [""]  # 2026-10-09: never stored as 「家人」
 
 
 def test_the_prompt_no_longer_offers_self_as_a_speaker():
@@ -158,7 +158,8 @@ def test_an_old_self_row_shows_and_keeps_the_real_name(monkeypatch):
     assert [row[:2] for row in _stored()] == [("成員甲", "U_MOM")]  # saved, not re-guessed
 
 
-def test_an_old_row_nobody_can_place_says_family(monkeypatch):
+def test_an_old_row_nobody_can_place_says_unknown(monkeypatch):
+    # 2026-10-09 Andrew：「把家人通通改成發言的人」；真的查不到才寫「不確定是誰」。
     monkeypatch.setattr(main, "_get_member_display_name", lambda _g, uid: NAMES.get(uid, "群組成員"))
     memory.log_raw_message(G, "m1", "U_MOM", "我覺得 0056 會漲")
     memory.log_raw_message(G, "m2", "U_DAD", "我也覺得")
@@ -166,8 +167,21 @@ def test_an_old_row_nobody_can_place_says_family(monkeypatch):
 
     reply = main._handle_finance_view_command(G, "/觀點")
 
-    assert "家人 0056.TW 看多" in reply
-    assert "自己" not in reply
+    assert "不確定是誰 0056.TW 看多" in reply
+    assert "自己" not in reply and "家人" not in reply
+
+
+def test_the_only_other_speaker_is_not_guessed(monkeypatch):
+    # 2026-10-09 review: the quote has to be found; someone else chatting
+    # nearby is not the speaker, and nothing is saved.
+    monkeypatch.setattr(main, "_get_member_display_name", lambda _g, uid: NAMES.get(uid, "群組成員"))
+    memory.log_raw_message(G, "m2", "U_DAD", "晚餐吃什麼")
+    _legacy_view("家人", "我覺得 0056 年底會漲到五十")
+
+    reply = main._handle_finance_view_command(G, "/觀點")
+
+    assert "不確定是誰 0056.TW 看多" in reply
+    assert [row[:2] for row in _stored()] == [("家人", "")]
 
 
 def test_person_query_accepts_a_family_role(monkeypatch):

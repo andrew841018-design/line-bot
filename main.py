@@ -756,6 +756,7 @@ def _enforce_new_value_reply(
     evidence_text: str = "",
     trusted_grounded: bool = False,
     outcome: dict | None = None,
+    facts: list[str] | None = None,
 ) -> str:
     """Drop sentences that only restate what the group already said.
 
@@ -829,6 +830,15 @@ def _enforce_new_value_reply(
         # TODO(2026-10-03 review): a dropped reply to a direct @咪寶 question means
         # silence; one retry was suggested. Revisit if direct questions go quiet often.
         return ""
+    if _unbacked_contact_count(
+        reply_text,
+        _contact_backing(
+            source_text, request_text, material_text, evidence_text, context=context, facts=facts
+        ),
+    ):
+        outcome["contact_details_dropped"] = True
+        # Asked directly: one honest line instead of silence (2026-10-09 review).
+        return UNVERIFIED_CONTACT_REPLY if addressed else ""
     try:
         reply_text, claims = reply_policy.strip_operation_claims(reply_text)
     except Exception as exc:
@@ -904,7 +914,7 @@ def _carries_material(user_input) -> bool:
     return isinstance(user_input, str) and any(mark in user_input for mark in _MATERIAL_MARKERS)
 
 
-def _guard_generated_reply(reply, user_input=None):
+def _guard_generated_reply(reply, user_input=None, *, context=None, facts=None):
     """Drop a generated reply that claims a search nobody ran (2026-10-03).
 
     Audio, quoted media, files, pending and scheduled replies get this here.
@@ -928,7 +938,69 @@ def _guard_generated_reply(reply, user_input=None):
         logger.info("search-claim guard dropped a generated reply len=%d", len(reply))
         reply_provenance.mark_dropped()
         return ""
+    # A file, audio or quoted media part the model read is backing this guard
+    # cannot see as text, so those replies keep their addresses (2026-10-09 review).
+    if not _has_media_part(user_input) and _unbacked_contact_count(
+        reply, _contact_backing(*_input_texts(user_input), context=context, facts=facts)
+    ):
+        reply_provenance.mark_dropped()
+        return ""
     return reply
+
+
+# 2026-10-09 Andrew：「任何資訊必須驗證再驗證，他得是真的」——晚餐推薦把一家店配上
+# 另一家店的地址。模型寫的地址、電話一定要在使用者給的內容、預讀素材、搜尋結果或
+# 查證過的晚餐清單裡找得到，否則整則不送（和 H1 假裝查過一樣處理）。
+UNVERIFIED_CONTACT_REPLY = "這些地址、電話我沒辦法確認是正確的，先不列出來；出發前請用地圖或店家官網確認。"
+
+
+def _has_media_part(user_input) -> bool:
+    return isinstance(user_input, (list, tuple)) and any(
+        not isinstance(part, str) for part in user_input
+    )
+
+
+def _input_texts(user_input) -> list[str]:
+    if isinstance(user_input, str):
+        return [user_input]
+    if isinstance(user_input, (list, tuple)):
+        return [part for part in user_input if isinstance(part, str)]
+    return []
+
+
+def _contact_backing(
+    *texts: str,
+    context: list[tuple[str, str]] | None = None,
+    facts: list[str] | None = None,
+) -> list[str]:
+    """What a reply's addresses and phone numbers may come from: what the family
+    wrote (now or earlier in the conversation), quoted or shared, the search
+    results the program fetched, and the facts the bot remembers (/記住)."""
+    backing = [text for text in texts if isinstance(text, str) and text]
+    backing.extend(
+        text for role, text in (context or []) if role == "user" and isinstance(text, str)
+    )
+    backing.extend(fact for fact in (facts or []) if isinstance(fact, str))
+    return backing
+
+
+def _unbacked_contact_count(reply: str, backing: list[str]) -> int:
+    """How many addresses／phone numbers in ``reply`` nothing backs (logged as a count)."""
+    try:
+        import dinner_places
+
+        places = dinner_places.known_places()
+    except Exception as exc:
+        logger.debug("dinner list not used as backing: %s", exc)
+        places = []
+    try:
+        found = reply_policy.unbacked_contact_details(reply, backing, places)
+    except Exception as exc:
+        logger.warning("contact-detail guard skipped error_type=%s", type(exc).__name__)
+        return 0
+    if found:
+        logger.info("contact-detail guard dropped a reply unbacked=%d", len(found))
+    return len(found)
 
 
 def _caller_checked(generate, *args, **kwargs):
@@ -1168,8 +1240,10 @@ def _llm_chat(
     # "" = Claude answered and had nothing new to add; asking Gemini again
     # would only produce the agree-and-restate reply the policy forbids.
     if claude_reply is not None:
-        return _guard_generated_reply(claude_reply, user_input)
-    return _guard_generated_reply(_gemini_llm_chat(user_input, context, facts, pnotes), user_input)
+        return _guard_generated_reply(claude_reply, user_input, context=context, facts=facts)
+    return _guard_generated_reply(
+        _gemini_llm_chat(user_input, context, facts, pnotes), user_input, context=context, facts=facts
+    )
 
 
 # ── URL 預抓取（繞過 Gemini url_context 的限制）─────────────────────────────
@@ -2853,50 +2927,13 @@ def _handle_event(event) -> None:
         _register_inbound_reply_token(event.reply_token, group_id, msg_id)
     sender_user_id = getattr(event.source, "user_id", None)
 
-    silenced_sender = _is_silenced_sender(sender_user_id)
-    if silenced_sender and _quotes_bot_message(group_id, msg):
-        # Andrew 2026-10-05：妹妹引用咪寶的留言時，和其他家人一樣照常處理（會回，
-        # 引用提醒的更正／取消等也照常）；她其他的訊息照舊零回覆。
-        silenced_sender = False
-        logger.info("silenced sender quoted a bot message; normal routing")
-    # Zero-reply senders remain addressable as quoted sources; no embedding or
-    # extraction work is scheduled for them.
-    try:
-        if isinstance(msg, TextMessageContent):
-            memory.log_raw_message(
-                group_id, msg.id, sender_user_id, msg.text or "",
-                quoted_message_id=getattr(msg, "quoted_message_id", None),
-                index_for_recall=not silenced_sender,
-            )
-        elif silenced_sender and msg_id:
-            placeholder = next((label for cls, label in (
-                (ImageMessageContent, "[圖片]"), (VideoMessageContent, "[影片]"),
-                (AudioMessageContent, "[音訊]"),
-            ) if isinstance(msg, cls)), f"[{type(msg).__name__}]")
-            memory.log_raw_message(group_id, msg_id, sender_user_id, placeholder, index_for_recall=False)
-    except Exception as exc:
-        # A zero-reply sender's message is still closed below (2026-09-26
-        # review); everyone else keeps the old stop-on-failure behaviour.
-        if not silenced_sender:
-            raise
-        logger.warning("silenced sender raw audit failed error_type=%s", type(exc).__name__)
-
-    # 妹妹的訊息（引用咪寶留言的文字除外，見上方 2026-10-05）仍完成 durable
-    # inbound bookkeeping，但不進任何回覆、提醒
-    # 確認、媒體分析或 fallback 路徑。這個 gate 必須早於所有 message-type
-    # routing，避免 deterministic command 或失敗 fallback 意外送出文字。
-    if silenced_sender:
-        if msg_id:
-            try:
-                memory.mark_inbound_events_completed_no_reply(group_id, [msg_id])
-            except Exception as exc:
-                logger.warning(
-                    "silenced sender terminal bookkeeping failed "
-                    "error_type=%s",
-                    type(exc).__name__,
-                )
-        logger.info("reply suppressed for configured family role sender")
-        return
+    # 2026-10-09 Andrew：「取消妹妹不回覆這個設定，從現在起妹妹的言論要回覆」——
+    # 每位家人的訊息都走同一條路由（2026-09-19 的零回覆 gate 與 10/05 的引用例外已移除）。
+    if isinstance(msg, TextMessageContent):
+        memory.log_raw_message(
+            group_id, msg.id, sender_user_id, msg.text or "",
+            quoted_message_id=getattr(msg, "quoted_message_id", None),
+        )
 
     # ── quota 爆時：非文字內容不排 pending reply ────────────────────────
     # Andrew 2026-06-06 指示取消 pending 回覆機制；File/Audio 在額度爆時
@@ -3061,7 +3098,7 @@ def _handle_audio_message(event: MessageEvent, group_id: str) -> None:
         mime_type="audio/m4a",
         description=reply_text,
     )
-    memory.append_turn(group_id, "user", "[語音留言]")
+    memory.append_turn(group_id, "user", _labelled_turn(group_id, "[語音留言]", event=event))
     _append_bot_turn(group_id, reply_text)
     _maybe_extract_facts(group_id)
     _reply(event.reply_token, reply_text, group_id=group_id)
@@ -3166,7 +3203,7 @@ def _handle_image_message_owned(
         if not _record_media_delivery_tombstone(group_id, msg_id):
             logger.error("image delivered but persistent media fence failed")
         _remove_pending_by_msg_id(group_id, msg_id)
-        memory.append_turn(group_id, "user", "[圖片]")
+        memory.append_turn(group_id, "user", _labelled_turn(group_id, "[圖片]", event=event))
         _append_bot_turn(group_id, reply_text)
     else:
         logger.warning("image reply was not confirmed by LINE")
@@ -3260,7 +3297,7 @@ def _handle_video_message_owned(
         if not _record_media_delivery_tombstone(group_id, msg_id):
             logger.error("video delivered but persistent media fence failed")
         _remove_pending_by_msg_id(group_id, msg_id)
-        memory.append_turn(group_id, "user", "[影片]")
+        memory.append_turn(group_id, "user", _labelled_turn(group_id, "[影片]", event=event))
         _append_bot_turn(group_id, reply_text)
     else:
         logger.warning("video reply was not confirmed by LINE")
@@ -3636,37 +3673,6 @@ def _alias_from_user_id(user_id: str | None) -> str:
     except Exception as e:
         logger.debug("alias lookup skipped: %s", e)
         return ""
-
-
-def _is_silenced_sender(user_id: str | None) -> bool:
-    """Return whether this configured family member is zero-reply.
-
-    2026-10-05: her text messages that quote a bot message are exempted at the
-    `_handle_event` gate (`_quotes_bot_message`); this check itself is unchanged.
-    """
-    if not user_id:
-        return False
-    try:
-        sister_id = line_mentions.user_id_for_family_role("妹妹")
-    except Exception as e:
-        logger.debug("silenced sender lookup skipped: %s", e)
-        return False
-    return bool(sister_id and str(sister_id) == str(user_id))
-
-
-def _quotes_bot_message(group_id: str | None, message) -> bool:
-    """這則文字訊息是否引用了咪寶（__bot__）的留言；查不到或出錯一律回 False。"""
-    if not group_id or not isinstance(message, TextMessageContent):
-        return False
-    quoted_id = getattr(message, "quoted_message_id", None)
-    if not isinstance(quoted_id, str) or not quoted_id:
-        return False
-    try:
-        quoted = memory.get_raw_message(group_id, quoted_id)
-    except Exception as exc:
-        logger.warning("quoted bot message lookup failed error_type=%s", type(exc).__name__)
-        return False
-    return bool(quoted and quoted[0] == "__bot__")
 
 
 def _event_actor_role(event_type: str | None) -> str:
@@ -5236,7 +5242,7 @@ def _try_handle_calendar_correction(
             reply += "\n" + "、".join(details)
 
     burst_filter.cancel_burst(group_id)
-    memory.append_turn(group_id, "user", text)
+    memory.append_turn(group_id, "user", _labelled_turn(group_id, text, event=event))
     _append_bot_turn(group_id, reply)
     # The correction reopens the event's offsets and its mirror's stages:
     # without piggyback, so the corrected event's own 🔔 never rides with
@@ -6072,7 +6078,7 @@ def _try_handle_quoted_schedule_capture(
 
     Anyone may convert anyone's dated schedule message up to 14 days old;
     the reminders belong to (and later @mention) the original sender.  Bot
-    messages, media and zero-reply senders are never captured.  Nothing
+    messages and media are never captured.  Nothing
     parseable → False, and routing continues (a bare 「咪寶」 is then an
     ordinary question to the model).
     """
@@ -6097,8 +6103,6 @@ def _try_handle_quoted_schedule_capture(
         age = time.time() - int(source["created_at"])
         if not 0 <= age <= _QUOTED_SCHEDULE_MAX_AGE_SEC:
             return False
-        if _is_silenced_sender(source_user):
-            return False  # 2026-09-19 zero-reply rule: no extraction for them
         if not reminder_followup.source_is_safe(source_text):
             return False
         source_day = datetime.fromtimestamp(
@@ -6229,7 +6233,9 @@ def _reminder_shown_action(row: dict) -> str:
     """「媽媽 家長會」: a reminder row as messages show it (Andrew 2026-10-07: 主詞放前面)."""
     import reminder_overview
 
-    return reminder_overview.subject_first(str(row.get("action") or ""), row.get("mention_aliases"))
+    return reminder_overview.subject_first(
+        str(row.get("action") or ""), reminder_overview.shown_people(row)
+    )
 
 
 def _loose_reminder_action(value: str) -> str:
@@ -6245,11 +6251,12 @@ def _quote_shows_reminder(
     """A quoted push or receipt shows this reminder: its action as stored, or
     with the people first (Andrew 2026-10-07: 主詞放前面)."""
     import reminder_cancel
+    import reminder_overview
 
     return reminder_cancel.shown_action_matches(
         {_loose_reminder_action(shown)},
         re.sub(r"[*_`]", "", str(row.get("action") or "")),
-        row.get("mention_aliases"),
+        reminder_overview.shown_people(row),
         known,
         require_own=require_own,
     )
@@ -6346,6 +6353,7 @@ def _reschedule_replay_reply(group_id: str, logged: dict) -> tuple[str, dict | N
     already committed, so the reply must never say 「尚未更新」.
     """
     import reminder_reschedule as rr
+    import reminder_overview
 
     old_at, new_at = int(logged["old_remind_at"]), int(logged["new_remind_at"])
     fallback = rr.replay_receipt(old_at, new_at), None
@@ -6357,7 +6365,7 @@ def _reschedule_replay_reply(group_id: str, logged: dict) -> tuple[str, dict | N
             row["remind_at"] == new_at
             and memory.reminder_action_hash(row["action"]) == logged["new_action_hash"]
         ):
-            people = row.get("mention_aliases")
+            people = reminder_overview.shown_people(row)
             if old_at == new_at and logged["old_action_hash"] == logged["new_action_hash"]:
                 reply = rr.unchanged_receipt(new_at, row["action"], people)
             else:
@@ -6368,7 +6376,7 @@ def _reschedule_replay_reply(group_id: str, logged: dict) -> tuple[str, dict | N
                 new_at,
                 current_at=row["remind_at"],
                 current_action=row["action"],
-                people=row.get("mention_aliases"),
+                people=reminder_overview.shown_people(row),
             )
         if not _reschedule_receipt_displayable(reply):
             return fallback
@@ -6448,6 +6456,7 @@ def _apply_quoted_reschedule(
 ) -> tuple[str, str, dict | None]:
     """Return (status, reply, reminder_ref) for a message this handler owns."""
     import reminder_reschedule as rr
+    import reminder_overview
 
     if kind != "generic" or row is None:
         return kind, rr.refusal_text(kind), None
@@ -6466,7 +6475,7 @@ def _apply_quoted_reschedule(
         return status, rr.refusal_text(status), None
     old_at = int(row["remind_at"])
     unchanged = new_at == old_at and new_action == row["action"]
-    people = row.get("mention_aliases")
+    people = reminder_overview.shown_people(row)
     planned = (
         rr.unchanged_receipt(old_at, new_action, people)
         if unchanged
@@ -7018,7 +7027,9 @@ def _handle_image_gen(event: MessageEvent, group_id: str, subject: str) -> None:
                     )
                 )
             _mark_inbound_reply_succeeded(event.reply_token)
-            memory.append_turn(group_id, "user", f"[圖片生成] {subject}")
+            memory.append_turn(
+                group_id, "user", _labelled_turn(group_id, f"[圖片生成] {subject}", event=event)
+            )
             _append_bot_turn(group_id, f"[已傳圖] {img_url}")
         except Exception as e:
             logger.warning("reply ImageMessage failed: %s", e)
@@ -7032,7 +7043,7 @@ def _handle_image_gen(event: MessageEvent, group_id: str, subject: str) -> None:
         f"啟動 cloudflared tunnel 後可直接傳 LINE"
     )
     _reply(event.reply_token, msg, group_id=group_id)
-    memory.append_turn(group_id, "user", f"[圖片生成] {subject}")
+    memory.append_turn(group_id, "user", _labelled_turn(group_id, f"[圖片生成] {subject}", event=event))
     _append_bot_turn(group_id, f"[已生成] {out_path}")
 
 
@@ -11014,7 +11025,7 @@ def _handle_conversation_search_query(
 ) -> None:
     reply = _build_conversation_search_reply(group_id, clean_text)
     _reply(event.reply_token, reply, group_id=group_id)
-    memory.append_turn(group_id, "user", clean_text)
+    memory.append_turn(group_id, "user", _labelled_turn(group_id, clean_text, event=event))
     _append_bot_turn(group_id, reply)
 
 
@@ -11512,7 +11523,7 @@ def _handle_todo_query(
     except Exception as e:
         logger.warning("todo query reply failed: %s", e)
 
-    memory.append_turn(group_id, "user", clean_text)
+    memory.append_turn(group_id, "user", _labelled_turn(group_id, clean_text, event=event))
     _append_bot_turn(group_id, reply)
 
 
@@ -11984,7 +11995,7 @@ def _handle_calendar_query(
     except Exception as e:
         logger.warning("calendar query reply failed: %s", e)
 
-    memory.append_turn(group_id, "user", clean_text)
+    memory.append_turn(group_id, "user", _labelled_turn(group_id, clean_text, event=event))
     _append_bot_turn(group_id, reply)
 
 
@@ -12118,7 +12129,7 @@ def _handle_explicit_text(
             "explicit market quote routed deterministically: text=%r group=%s",
             clean_text[:50], group_id,
         )
-        memory.append_turn(group_id, "user", clean_text)
+        memory.append_turn(group_id, "user", _labelled_turn(group_id, clean_text, event=event))
         _append_bot_turn(group_id, market_quote_reply)
         _reply(
             event.reply_token,
@@ -12148,7 +12159,7 @@ def _handle_explicit_text(
         quote_policy_input,
         context=context,
     )
-    facts = memory.top_facts(group_id, user_id=sender_user_id)
+    facts = _facts_for_speaker(group_id, sender_user_id)
     pnotes = _get_persona_notes(group_id)
     llm_started = time.monotonic()
     try:
@@ -12262,6 +12273,7 @@ def _handle_explicit_text(
         material_text=_prefetched_material(user_input, quote_policy_input),
         searched=reply_provenance.searched(),
         has_material=bool(link_content),
+        facts=facts,
     )
     claims_outcome: dict = {}
     reply_text = _enforce_new_value_reply(reply_text, outcome=claims_outcome, **enforce_kwargs)
@@ -12275,9 +12287,9 @@ def _handle_explicit_text(
 
     # The request and its quote, not the prefetched page: that text is
     # untrusted and would otherwise reach fact extraction (2026-09-27).
-    memory.append_turn(group_id, "user", quote_policy_input)
+    memory.append_turn(group_id, "user", _labelled_turn(group_id, quote_policy_input, event=event))
     _append_bot_turn(group_id, reply_text)
-    _maybe_extract_facts(group_id, user_id=sender_user_id)
+    _maybe_extract_facts(group_id)
     _reply(
         event.reply_token,
         reply_text,
@@ -12363,7 +12375,7 @@ def _retract_disputed_bot_claim(
     if delivered:
         # The disputed claim itself is not written back into the conversation.
         try:
-            memory.append_turn(group_id, "user", clean_text)
+            memory.append_turn(group_id, "user", _labelled_turn(group_id, clean_text, event=event))
             _append_bot_turn(group_id, _DISPUTED_CLAIM_RETRACTION)
         except Exception as exc:
             logger.warning(
@@ -12409,12 +12421,15 @@ def _remember_silent_turn(
 ) -> None:
     """Best-effort memory and extraction after the bot decided not to reply."""
     try:
+        # A burst turn already names each speaker (_labelled_burst_turn).
+        if not turn.startswith("[burst]"):
+            turn = _labelled_turn(group_id, turn, user_id=sender_user_id)
         memory.append_turn(group_id, "user", turn)
     except Exception as exc:
         logger.warning("silent turn not remembered group=%s error_type=%s", group_id, type(exc).__name__)
     else:
         # Facts come from the conversation, which only now contains this turn.
-        _maybe_extract_facts(group_id, user_id=sender_user_id or "")
+        _maybe_extract_facts(group_id)
     if capture_calendar:
         _maybe_capture_calendar_event(
             group_id, calendar_text, sender_user_id or "", message_id
@@ -12429,7 +12444,7 @@ def _record_silent_burst(
     """Keep the conversation and capture side effects when the bot stays quiet."""
     _remember_silent_turn(
         group_id,
-        f"[burst]\n{combined_text}",
+        _labelled_burst_turn(group_id, combined_text, message_ids),
         combined_text,
         capture_calendar=not _burst_message_owned_by_reminder(group_id, message_ids),
     )
@@ -12475,6 +12490,117 @@ def _finance_speaker_name(group_id: str, user_id: str | None) -> str:
         display = _get_member_display_name(group_id, user_id)
         name = "" if display in ("群組成員", "某人") else display
     return name
+
+
+# ── 記憶裡的「誰說的」（2026-10-09）──────────────────────────────────────────
+# Andrew：「咪寶記憶的部分，讓他區分不同人（說話的人），不能全部都一概當成『使用者』」。
+# 對話紀錄的每一則使用者訊息前面加說話的人的稱呼，抽事實時才知道是誰的事。
+_MEMBER_LABEL_TTL_SEC = 6 * 3600
+_MEMBER_LABEL_MISS_TTL_SEC = 10 * 60  # a failed lookup is retried sooner
+_member_labels: dict[tuple[str, str], tuple[str, float]] = {}
+_member_labels_lock = threading.Lock()
+
+
+_MEMBER_LABEL_STRIP_RE = re.compile(r"[\s：:@＠\u200b-\u200d\u2060\ufeff]+")
+_MEMBER_LABEL_MAX = 20
+_MEMBER_DISPLAY_TIMEOUT_SEC = 3
+_RECENT_SPEAKER_MESSAGES = 300
+
+
+def _clean_member_label(name: str) -> str:
+    """Labels go in front of family turns as 「稱呼：」; no colons, spaces or line
+    breaks, short, and never the bot's own name."""
+    clean = _MEMBER_LABEL_STRIP_RE.sub("", str(name or ""))[:_MEMBER_LABEL_MAX]
+    return "" if clean in ("咪寶", "群組成員", "某人") else clean
+
+
+def _member_label(group_id: str | None, user_id: str | None) -> str:
+    """家人的稱呼：本機別名；沒有別名就用 LINE 顯示名稱（成功或失敗都快取 6 小時）；
+    都沒有回 ""。靜音（BOT_MUTED，測試也是）時不查 LINE。"""
+    if not user_id or user_id == "__bot__":
+        return ""
+    try:
+        name = line_mentions.alias_for_user_id(user_id) or ""
+    except Exception:
+        name = ""
+    name = _clean_member_label(name or _alias_from_user_id(user_id))
+    if name or not group_id or settings.bot_muted:
+        return name
+    key = (group_id, user_id)
+    now = time.time()
+    with _member_labels_lock:
+        cached = _member_labels.get(key)
+    if cached and now - cached[1] < (_MEMBER_LABEL_TTL_SEC if cached[0] else _MEMBER_LABEL_MISS_TTL_SEC):
+        return cached[0]
+    label = _clean_member_label(
+        _get_member_display_name(group_id, user_id, timeout=_MEMBER_DISPLAY_TIMEOUT_SEC)
+    )
+    with _member_labels_lock:
+        _member_labels[key] = (label, now)
+    if label:
+        # 提醒推播等不能問 LINE 的程序，也用同一個稱呼（Andrew 2026-10-09）
+        line_mentions.remember_display_name(user_id, label)
+    return label
+
+
+def _known_member_labels(group_id: str) -> dict[str, str]:
+    """{稱呼: user_id}：別名（含角色、短名），加上最近在群組說過話的人的稱呼。"""
+    labels: dict[str, str] = {}
+    try:
+        for label in line_mentions.configured_family_alias_mapping(include_short=True):
+            user_id = line_mentions.user_id_for_alias(label)
+            if user_id:
+                labels[label] = user_id
+    except Exception as exc:
+        logger.debug("member alias map skipped: %s", exc)
+    try:
+        speakers = memory.recent_raw_senders(group_id, _RECENT_SPEAKER_MESSAGES)
+    except Exception as exc:
+        logger.debug("recent speakers skipped: %s", exc)
+        speakers = []
+    for user_id in speakers:
+        label = _member_label(group_id, user_id)
+        if label and label not in labels:
+            labels[label] = user_id
+    return labels
+
+
+def _speakers_in_context(
+    context: list[tuple[str, str]], labels: dict[str, str]
+) -> dict[str, str]:
+    """只留這段對話裡真的有開口的家人（行首是「稱呼：」）：事實只掛在說話的人身上。"""
+    present: dict[str, str] = {}
+    for role, text in context or []:
+        if role != "user" or not isinstance(text, str):
+            continue
+        for line in text.splitlines():
+            label, sep, _rest = line.partition("：")
+            if sep and label in labels:
+                present[label] = labels[label]
+    return present
+
+
+def _labelled_turn(group_id: str, text: str, *, event=None, user_id: str | None = None) -> str:
+    """「稱呼：原文」；不知道是誰就照原文。"""
+    if user_id is None and event is not None:
+        user_id = getattr(getattr(event, "source", None), "user_id", None)
+    try:
+        label = _member_label(group_id, user_id)
+    except Exception as exc:
+        logger.debug("turn label skipped: %s", exc)
+        label = ""
+    return f"{label}：{text}" if label and text else text
+
+
+def _labelled_burst_turn(group_id: str, combined_text: str, message_ids: list | None) -> str:
+    """「[burst]」底下每一則都寫是誰說的（burst_filter 交棒前算好，保留引用原文與
+    訊息邊界）；拿不到就照舊不帶名字。"""
+    try:
+        labelled = burst_filter.labelled_text(group_id, message_ids)
+    except Exception as exc:
+        logger.debug("burst labels skipped: %s", exc)
+        labelled = None
+    return f"[burst]\n{labelled or combined_text}"
 
 
 def _start_burst_finance_extraction(
@@ -12560,7 +12686,12 @@ def _handle_burst_flush(
     if not has_quote_context(combined_text) and _requires_public_research(combined_text):
         _start_burst_finance_extraction(group_id, combined_text, message_ids)
         _handle_web_research_question(
-            SimpleNamespace(source=SimpleNamespace(user_id=""), reply_token=reply_token),
+            SimpleNamespace(
+                source=SimpleNamespace(user_id=""),
+                reply_token=reply_token,
+                # 2026-10-09: the memory keeps who said each message of the burst
+                memory_turn=_labelled_burst_turn(group_id, combined_text, message_ids),
+            ),
             group_id, combined_text, addressed=False,
         )
         return
@@ -12584,6 +12715,7 @@ def _handle_burst_flush(
             context=context,
             addressed=False,
             trusted_grounded=bool(getattr(cached, "grounded", False)),
+            facts=facts,
         )
         if not cached:
             _mark_inbound_reply_completed_no_reply(
@@ -12724,6 +12856,7 @@ def _handle_burst_flush(
         material_text=_prefetched_material(prefetched, combined_text),
         searched=reply_provenance.searched(),
         has_material=bool(link_content),
+        facts=facts,
     )
     claims_outcome: dict = {}
     reply_text = _enforce_new_value_reply(reply_text, outcome=claims_outcome, **enforce_kwargs)
@@ -12743,7 +12876,8 @@ def _handle_burst_flush(
             bool(claims_outcome.get("grounded")),
         )
     _retryable_burst_db_call(
-        memory.append_turn, group_id, "user", f"[burst]\n{combined_text}"
+        memory.append_turn, group_id, "user",
+        _labelled_burst_turn(group_id, combined_text, message_ids),
     )
     _append_bot_turn(group_id, reply_text)
     _start_burst_finance_extraction(group_id, combined_text, message_ids)
@@ -13003,6 +13137,7 @@ def _capture_calendar_event_now(
 
 # 在 module load 時把 callback 注入 burst_filter
 burst_filter.register_on_flush(_handle_burst_flush)
+burst_filter.register_speaker_label(_member_label)
 
 
 # ── 媒體 quote 觸發（唯一會分析圖片/影片/音訊的路徑）──────────────────────
@@ -13295,7 +13430,9 @@ def _media_pipeline_fallback(
         return False
 
     try:
-        memory.append_turn(group_id, "user", f"[{media_name} + 問題]\n{clean_text}")
+        memory.append_turn(
+            group_id, "user", _labelled_turn(group_id, f"[{media_name} + 問題]\n{clean_text}", event=event)
+        )
         memory.log_raw_message_meta(
             group_id,
             quoted_message_id,
@@ -13383,7 +13520,7 @@ def _handle_quoted_media_description_fallback(
             _mark_inbound_reply_completed_no_reply(event.reply_token)
             return True  # intentionally silent
         return False
-    memory.append_turn(group_id, "user", prompt_text)
+    memory.append_turn(group_id, "user", _labelled_turn(group_id, prompt_text, event=event))
     _append_bot_turn(group_id, reply)
     _reply(event.reply_token, reply, group_id=group_id)
     return True
@@ -13439,7 +13576,7 @@ def _audio_asr_fallback(
         if reply_provenance.dropped():
             _mark_inbound_reply_completed_no_reply(event.reply_token)
         return
-    memory.append_turn(group_id, "user", f"[語音轉文字] {text}")
+    memory.append_turn(group_id, "user", _labelled_turn(group_id, f"[語音轉文字] {text}", event=event))
     _append_bot_turn(group_id, reply)
     _reply(event.reply_token, reply, group_id=group_id)
 
@@ -13544,7 +13681,9 @@ def _handle_media_via_quote(
             _reply(event.reply_token, _friendly_gemini_error(e), group_id=group_id)
         return
 
-    memory.append_turn(group_id, "user", f"[{media_name} + 問題]\n{prompt_text}")
+    memory.append_turn(
+        group_id, "user", _labelled_turn(group_id, f"[{media_name} + 問題]\n{prompt_text}", event=event)
+    )
     _append_bot_turn(group_id, reply_text)
     _maybe_extract_facts(group_id)
     _reply(event.reply_token, reply_text, group_id=group_id)
@@ -13593,16 +13732,19 @@ def _pending_text_with_quote(item: dict, group_id: str) -> str:
     return with_current_reply(str(block), text) if block else text
 
 
-def _get_member_display_name(group_id: str, user_id: str | None) -> str:
-    """查群組成員的顯示名稱;失敗就用 fallback。"""
+def _get_member_display_name(
+    group_id: str, user_id: str | None, *, timeout: float | None = None
+) -> str:
+    """查群組成員的顯示名稱;失敗就用 fallback。``timeout``（秒）給要限時的呼叫端。"""
     if user_id is None:
         return "某人"
     if user_id == "__bot__":
         return "我 (bot)"
     try:
         with ApiClient(_get_line_config()) as api_client:
+            extra = {"_request_timeout": timeout} if timeout else {}
             profile = MessagingApi(api_client).get_group_member_profile(
-                group_id, user_id
+                group_id, user_id, **extra
             )
             return getattr(profile, "display_name", None) or "群組成員"
     except Exception as e:
@@ -13739,7 +13881,9 @@ def _handle_file_message(event: MessageEvent, group_id: str) -> None:
                     file_name=file_name,
                     description=reply_text,
                 )
-                memory.append_turn(group_id, "user", f"[file image: {file_name}]")
+                memory.append_turn(
+                    group_id, "user", _labelled_turn(group_id, f"[file image: {file_name}]", event=event)
+                )
                 _append_bot_turn(group_id, reply_text)
                 _maybe_extract_facts(group_id)
                 _reply(event.reply_token, reply_text, group_id=group_id)
@@ -13827,7 +13971,9 @@ def _handle_file_message(event: MessageEvent, group_id: str) -> None:
                     file_name=file_name,
                     description=reply_text,
                 )
-                memory.append_turn(group_id, "user", f"[file: {file_name}]")
+                memory.append_turn(
+                    group_id, "user", _labelled_turn(group_id, f"[file: {file_name}]", event=event)
+                )
                 _append_bot_turn(group_id, reply_text)
                 _maybe_extract_facts(group_id)
                 _reply(event.reply_token, reply_text, group_id=group_id)
@@ -13865,7 +14011,9 @@ def _handle_file_message(event: MessageEvent, group_id: str) -> None:
             file_name=file_name,
             description=reply_text,
         )
-        memory.append_turn(group_id, "user", f"[file: {file_name}]")
+        memory.append_turn(
+            group_id, "user", _labelled_turn(group_id, f"[file: {file_name}]", event=event)
+        )
         _append_bot_turn(group_id, reply_text)
         _maybe_extract_facts(group_id)
         _reply(event.reply_token, reply_text, group_id=group_id)
@@ -13918,7 +14066,9 @@ def _handle_file_message(event: MessageEvent, group_id: str) -> None:
         file_name=file_name,
         description=reply_text,
     )
-    memory.append_turn(group_id, "user", f"[file: {file_name}]")
+    memory.append_turn(
+        group_id, "user", _labelled_turn(group_id, f"[file: {file_name}]", event=event)
+    )
     _append_bot_turn(group_id, reply_text)
     _maybe_extract_facts(group_id)
     _reply(event.reply_token, reply_text, group_id=group_id)
@@ -15847,31 +15997,53 @@ def _friendly_gemini_error(e: Exception, file_name: str | None = None) -> str:
     return f"分析失敗:{type(e).__name__}"
 
 
-def _maybe_extract_facts(group_id: str, user_id: str = "") -> None:
-    """每 N 輪抽一次長期事實，user_id 有值時存為 per-user 事實。失敗不擋主流程。"""
+# 2026-10-09 review: the extraction prompt asks the model to skip these; this is
+# the deterministic backstop, in the spirit of family_weekly_insight's discard list.
+# Facts are shown per person in the group (/看記憶) and go into prompts.
+_PRIVATE_FACT_RE = re.compile(
+    r"病|藥|診|醫|手術|住院|開刀|懷孕|孕|流產|分手|吵架|離婚|男友|女友|男朋友|女朋友|"
+    r"交往|外遇|債|欠款|貸款|官司|訴訟|法院|帳戶|存款|密碼|薪水|薪資|收入|保單|理賠"
+)
+
+
+def _maybe_extract_facts(group_id: str) -> None:
+    """每 N 輪抽一次長期事實，每條掛在說到的那位家人身上。失敗不擋主流程。"""
     try:
-        _extract_facts_now(group_id, user_id)
+        _extract_facts_now(group_id)
     except Exception as exc:
         logger.warning("fact extraction skipped error_type=%s", type(exc).__name__)
 
 
-def _extract_facts_now(group_id: str, user_id: str = "") -> None:
-    """Fact extraction proper; `_maybe_extract_facts` guards it."""
+def _extract_facts_now(group_id: str) -> None:
+    """Fact extraction proper; `_maybe_extract_facts` guards it.
+
+    2026-10-09 Andrew：「咪寶記憶的部分，讓他區分不同人（說話的人），不能全部都
+    一概當成『使用者』」。對話紀錄每一則都寫了是誰說的；模型只能把事實掛在已知的
+    家人稱呼上，存成「稱呼：事實」並記那個人的 user_id。看不出是誰的就不存。
+    """
     if not _gemini_side_task_allowed("fact_extract"):
         return
     if not memory.bump_and_should_extract(group_id):
         return
+    context = memory.get_context(group_id)
+    labels = _speakers_in_context(context, _known_member_labels(group_id))
+    if not labels:
+        return
     try:
-        new_facts = gemini_client.extract_facts(memory.get_context(group_id))
+        new_facts = gemini_client.extract_facts(context, speakers=sorted(labels))
     except Exception as e:
         if _is_quota_error(e):
             _mark_quota_exhausted()
         else:
-            logger.warning("auto fact extract failed: %s", e)
+            logger.warning("auto fact extract failed error_type=%s", type(e).__name__)
         return
     added = 0
-    for f in new_facts:
-        if memory.add_fact(group_id, f, user_id=user_id):
+    for person, fact in new_facts:
+        user_id = labels.get(person)
+        if not user_id or _PRIVATE_FACT_RE.search(fact):
+            continue
+        label = _member_label(group_id, user_id) or person
+        if memory.add_fact(group_id, f"{label}：{fact}", user_id=user_id):
             added += 1
     logger.info(
         "auto-extracted facts: %d new (total=%d)",
@@ -17847,7 +18019,10 @@ def _format_reminder_write_confirmation(
     time_default_kind: str | bool | None = None,
     date_default_kind: str | None = None,
     detail_line: str = "",
+    subject: list[str] | tuple[str, ...] | None = None,
 ) -> str:
+    """``subject``: who 事項 starts with when it is not the mentioned people
+    (2026-10-09: the owner of a reminder that names no one); never pinged."""
     titles = {
         "created": "已新增提醒",
         "duplicate": "提醒已存在，未重複新增",
@@ -17908,7 +18083,7 @@ def _format_reminder_write_confirmation(
     lines = [
         titles.get(outcome, "提醒已處理"),
         time_line,
-        f"事項：{reminder_overview.subject_first(str(action or '').strip(), aliases)}",
+        f"事項：{reminder_overview.subject_first(str(action or '').strip(), aliases or list(subject or []))}",
     ]
     if detail_line:
         lines.append(detail_line)
@@ -17992,7 +18167,19 @@ def _format_persisted_reminder_confirmation(
         and int(persisted["remind_at"]) == int(fallback_dt.timestamp())
         else None,
         detail_line=_persisted_detail_line(persisted),
+        subject=_reminder_owner_subject(persisted),
     )
+
+
+def _reminder_owner_subject(row: dict) -> list[str]:
+    """The owner 事項 starts with when the reminder names no one (2026-10-09)."""
+    try:
+        import reminder_overview
+
+        return list(reminder_overview.owner_subject(row))
+    except Exception as exc:
+        logger.warning("receipt owner subject skipped error_type=%s", type(exc).__name__)
+        return []
 
 
 def _drop_pending_reminder_silently(
@@ -18662,6 +18849,20 @@ def _local_single_schedule_items(text: str, today=None) -> list[dict]:
     return _schedule_items(text, today or _taipei_today(), multi_line=False)
 
 
+def _schedule_entry_shown_action(entry: dict) -> str:
+    """「爸爸 去青森一日遊」：多筆收據每一行也把人放前面（2026-10-09，主詞放前面）。"""
+    action = str(entry.get("action") or "")
+    try:
+        row = memory.get_reminder(int(entry["rid"]))
+    except Exception:
+        row = None
+    if not row:
+        return action
+    import reminder_overview
+
+    return reminder_overview.subject_first(action, reminder_overview.shown_people(row, action))
+
+
 def _format_schedule_receipt(written: list[dict]) -> ReminderReceipt:
     # TODO(GP2 S6, deferred 2026-10-04): sent_reminder_refs binds one message to
     # one reminder, so 「這則取消」 on a multi-item receipt still answers 「多筆」;
@@ -18687,7 +18888,7 @@ def _format_schedule_receipt(written: list[dict]) -> ReminderReceipt:
     else:
         return ReminderReceipt("原提醒已被更正或取消，未重新建立。", ids, named)
     for entry in sorted(written, key=lambda item: (item["remind_dt"], item["rid"])):
-        line = f"{entry['remind_dt']:%Y-%m-%d %H:%M} {entry['action']}"
+        line = f"{entry['remind_dt']:%Y-%m-%d %H:%M} {_schedule_entry_shown_action(entry)}"
         if entry["outcome"] == "created":
             if entry["daypart"] and entry["default_kind"] != "no_daypart":
                 line += f"（依「{entry['daypart']}」預設）"
@@ -19250,38 +19451,20 @@ _DINNER_KEYWORDS = [
     "晚餐要吃什麼",
     "今晚吃什麼",
     "今天吃什麼",
+    # 2026-10-09: more ways to ask, so the verified list answers instead of a
+    # model writing shop names from memory.
+    "晚上吃什麼",
+    "晚上吃啥",
+    "晚餐吃啥",
+    "晚餐推薦",
+    "推薦晚餐",
+    "善導寺附近吃什麼",
+    "善導寺附近有什麼好吃",
 ]
 
 
 def _is_dinner_question(text: str) -> bool:
     return any(kw in text for kw in _DINNER_KEYWORDS)
-
-
-_DINNER_PROMPT = """你是台北美食達人，以善導寺捷運站（台北市中正區）為中心，推薦附近步行可達的晚餐餐廳。
-
-以下餐廳請勿推薦：喜來登、阜杭豆漿、雙月食品社。
-
-請推薦 4～5 間，盡量多樣（台菜、日式、韓式、異國料理、麵食等皆可），格式如下（用換行分隔每間）：
-🍽 餐廳名稱
-📍 地址（簡短）
-🍴 料理類型 ＋ 招牌菜或特色一句話
-💰 價位（每人約 NT$XXX）
-
-回覆風格：親切自然，像朋友推薦，繁體中文，不要加多餘的前言或結語。"""
-
-
-def _dinner_prompt(asked: str) -> str:
-    """The dinner prompt plus what the asker wrote: 「今晚吃什麼？想吃日式」 used
-    to lose 「想吃日式」 (Andrew 2026-10-07)."""
-    # 「---」是其他提示用的資料區塊記號，不讓問句冒充
-    asked = (asked or "").strip()[:200].replace("---", "—")
-    if not asked:
-        return _DINNER_PROMPT
-    return (
-        f"{_DINNER_PROMPT}\n\n群組裡的人是這樣問的：「{asked}」\n"
-        "只把裡面提到的口味、預算、人數、地點當推薦條件；"
-        "其他問題（例如食安、新聞）不要回答，也不要評論特定店家。"
-    )
 
 
 _WEB_RESEARCH_QUESTION_HINTS = (
@@ -19600,7 +19783,7 @@ def _handle_web_research_question(
     """
     sender_user_id = getattr(event.source, "user_id", None) or ""
     context = memory.get_context(group_id)
-    facts = memory.top_facts(group_id, user_id=sender_user_id)
+    facts = _facts_for_speaker(group_id, sender_user_id)
     pnotes = _get_persona_notes(group_id)
     import public_research
     if quoted_context is None:
@@ -19755,6 +19938,7 @@ def _handle_web_research_question(
             has_material=bool(real_link_content),
             # 2026-10-04: what was actually collected backs claims about named people.
             evidence_text=_research_evidence_text(sources),
+            facts=facts,
         )
         if not reply_text:
             older_burst_first()
@@ -19762,7 +19946,7 @@ def _handle_web_research_question(
             return True
 
     older_burst_first()
-    memory.append_turn(group_id, "user", text)
+    memory.append_turn(group_id, "user", _research_turn(group_id, text, event))
     _append_bot_turn(group_id, reply_text)
     _reply(event.reply_token, reply_text, group_id=group_id)
     return True
@@ -19777,58 +19961,36 @@ def _finish_research_without_reply(event, group_id: str, text: str) -> None:
         message_ids=[message_id] if message_id else None,
     )
     try:
-        memory.append_turn(group_id, "user", text)
+        memory.append_turn(group_id, "user", _research_turn(group_id, text, event))
     except Exception as exc:
         logger.warning("silent research turn not remembered error_type=%s", type(exc).__name__)
 
 
+def _research_turn(group_id: str, text: str, event) -> str:
+    """A burst sent here brings its own labelled turn; one person's question is labelled here."""
+    return getattr(event, "memory_turn", None) or _labelled_turn(group_id, text, event=event)
+
+
 def _handle_dinner_recommendation(event: MessageEvent, group_id: str) -> None:
-    # 2026-05-16 改：刪 quota 短路。dinner prompt 是純 text，llm_router.fallback_chat
-    # 4-tier waterfall (local LLM → RAG → lite_reply) 能處理；對齊
-    # feedback_quota_fallback_never_skip.md。注意 file handler 因含 PDF/image bytes、
-    # _extract_text 會丟，仍保留短路 + 友善訊息（known exception）。
-    context = memory.get_context(group_id)
-    facts = memory.top_facts(group_id)
-    pnotes = _get_persona_notes(group_id)
+    """晚餐推薦只推查證過的店（2026-10-09）。
+
+    Andrew：「任何資訊必須驗證再驗證，他得是真的（加入測試環節）」——10/7 模型
+    憑記憶寫的推薦把一家店配上別家店的地址。現在完全不經過模型：dinner_places
+    從查證清單挑店，送出前 verify_reply 再逐塊比對一次；比對不過（程式錯誤）
+    就只送「目前沒有查證過的推薦」，不送任何店家資訊。
+    """
+    import dinner_places
+
     asked = str(getattr(getattr(event, "message", None), "text", "") or "")
     menu_buttons = _is_menu_button_text(asked)
-    prompt = _dinner_prompt(asked)
     try:
-        with _thinking_indicator(group_id):
-            reply_text = _llm_chat(prompt, context, facts, pnotes)
-    except Exception as e:
-        if _is_quota_error(e):
-            _mark_quota_exhausted()
-            logger.warning("dinner recommendation quota exhausted, retry via local")
-            reply_text = _local_text_llm_fallback(prompt, context=context)
-        elif _is_gemini_unavailable_error(e):
-            logger.warning(
-                "dinner recommendation unavailable, retry via local: %s",
-                e,
-            )
-            reply_text = _local_text_llm_fallback(prompt, context=context)
-        else:
-            logger.exception("dinner recommendation failed: %s", e)
-            _reply(
-                event.reply_token,
-                _friendly_gemini_error(e),
-                group_id=group_id,
-                menu_buttons=menu_buttons,
-            )
-            return
-    if not reply_text or not reply_text.strip():
-        if reply_provenance.dropped():
-            # The guard dropped an answer that claimed a search: finish silently (round-4 review).
-            _reply(event.reply_token, "", group_id=group_id)
-            return
-        # fallback_chat 全敗回空 → 給使用者明確訊息（不能送空到 LINE SDK）
-        _reply(
-            event.reply_token,
-            "晚餐推薦今天罷工了，等一下再試試",
-            group_id=group_id,
-            menu_buttons=menu_buttons,
-        )
-        return
+        reply_text = dinner_places.recommend(asked)
+        if not dinner_places.verify_reply(reply_text):
+            logger.error("dinner reply failed the verified-list check; no places sent")
+            reply_text = dinner_places.NO_FRESH_TEXT
+    except Exception as exc:
+        logger.warning("dinner recommendation failed error_type=%s", type(exc).__name__)
+        reply_text = dinner_places.NO_FRESH_TEXT
     _reply(event.reply_token, reply_text, group_id=group_id, menu_buttons=menu_buttons)
 
 
@@ -19985,6 +20147,9 @@ def _format_finance_views(views: list[dict], header: str) -> str:
     return "\n".join(lines)
 
 
+UNKNOWN_FINANCE_SPEAKER = "不確定是誰"
+
+
 def _finance_view_speaker(view: dict, names: dict[str, str]) -> str:
     """Who said a view. Rows stored before 2026-10-07 can say 自己／家人: look the
     sender up again (by user_id, or by the message around that moment) and save it."""
@@ -20010,7 +20175,9 @@ def _finance_view_speaker(view: dict, names: dict[str, str]) -> str:
     except Exception as exc:
         logger.debug("finance view speaker repair skipped: %s", exc)
         name = ""
-    return name or "家人"
+    # 2026-10-09 Andrew：「把家人通通改成發言的人」。真的查不到是誰（舊資料、
+    # 原始訊息已經不在）才寫「不確定是誰」，不再用「家人」帶過。
+    return name or UNKNOWN_FINANCE_SPEAKER
 
 
 def _handle_food_command(group_id: str, text: str) -> str | None:
@@ -20144,6 +20311,48 @@ def _handle_poll_text(event: MessageEvent, group_id: str, text: str) -> str | No
         return None
 
 
+_MEMORY_LIST_MAX_CHARS = 4500
+
+
+def _format_memory_list(group_id: str) -> str:
+    """「/看記憶」依人分組（2026-10-09：記憶要分得出是哪位家人）。"""
+    rows = memory.list_fact_rows(group_id)
+    if not rows:
+        return "目前沒有任何記憶。要讓我記住什麼，用：\n/記住 <內容>"
+    groups: dict[str, list[str]] = {}
+    for user_id, fact in rows:
+        label = _member_label(group_id, user_id) if user_id else ""
+        body = fact.removeprefix(f"{label}：") if label else fact
+        groups.setdefault(label or "其他", []).append(body)
+    lines = ["目前的記憶："]
+    used = len(lines[0])
+    hidden = 0
+    for label, items in groups.items():
+        header = f"【{label}】"
+        if used + len(header) + 1 > _MEMORY_LIST_MAX_CHARS:
+            hidden += len(items)
+            continue
+        lines.append(header)
+        used += len(header) + 1
+        for item in items:
+            line = f"• {item}"
+            if used + len(line) + 1 > _MEMORY_LIST_MAX_CHARS:
+                hidden += 1
+                continue
+            lines.append(line)
+            used += len(line) + 1
+    if hidden:
+        lines.append(f"（另有 {hidden} 條沒列出）")
+    return "\n".join(lines)
+
+
+def _facts_for_speaker(group_id: str, user_id: str | None) -> list[str]:
+    """提示用的家人事實；知道是誰在說話時，第一行先寫「現在說話的是：稱呼」。"""
+    facts = memory.top_facts(group_id, user_id=user_id)
+    label = _member_label(group_id, user_id)
+    return [f"（現在說話的是：{label}）", *facts] if label else facts
+
+
 def _handle_command(
     group_id: str,
     text: str,
@@ -20180,10 +20389,7 @@ def _handle_command(
 
     # ── 長期記憶（facts）──────────────────────────────────────────
     if t == "/看記憶":
-        facts = memory.list_facts(group_id)
-        if not facts:
-            return "目前沒有任何記憶。要讓我記住什麼，用：\n/記住 <內容>"
-        return "目前的記憶：\n" + "\n".join(f"• {f}" for f in facts)
+        return _format_memory_list(group_id)
 
     if t == "/記住":
         return "用法：/記住 <要記住的內容>"
@@ -20191,9 +20397,14 @@ def _handle_command(
         fact = t[len("/記住 ") :].strip()
         if not fact:
             return "用法：/記住 <要記住的內容>"
-        if memory.add_fact(group_id, fact):
-            return f"好，記住了：{fact}"
-        return f"這條已經在記憶裡了：{fact}"
+        # 2026-10-09：記成「誰說的：內容」，記憶才分得出是哪位家人。不知道是誰也
+        # 要有前綴：開頭是【系統…】的行在提示裡代表程式附上的資料，不能被冒用。
+        label = _member_label(group_id, user_id)
+        stored = f"{label or burst_filter.UNKNOWN_SPEAKER}：{fact}"
+        whose = f"{label}的" if label else ""
+        if memory.add_fact(group_id, stored, user_id=user_id or ""):
+            return f"好，記進{whose}記憶了：{fact}"
+        return f"這條已經在{whose}記憶裡了：{fact}"
 
     if t == "/忘記":
         return "用法：/忘記 <關鍵字>"

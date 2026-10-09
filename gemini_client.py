@@ -11,7 +11,7 @@ Gemini client wrapper — google-genai SDK 版。
 
 兩個對外函式：
 1. chat(parts, context, facts) → str
-2. extract_facts(context) → list[str]
+2. extract_facts(context, speakers) → list[(person, fact)]
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ import reply_provenance
 import threading
 import time
 from datetime import datetime
+from collections.abc import Sequence
 from typing import Union
 from zoneinfo import ZoneInfo
 
@@ -953,8 +954,12 @@ def _build_system_instruction(
 
     if facts:
         facts_block = "\n".join(f"- {f}" for f in facts)
+        # 2026-10-09 Andrew：記憶要區分不同的人，不能全部當「使用者」。
         base += (
-            f"\n\n你已經知道以下關於使用者的事實（自動從過往對話抽出，請善加利用）：\n"
+            "\n\n你記得的家人長期事實與附上的資料（事實自動從過往對話抽出）：\n"
+            "- 開頭是「稱呼：」的是那位家人的事實，只用在那個人身上，不要套到正在說話的人或其他家人。\n"
+            "- 「（現在說話的是：…）」是正在跟你說話的家人。\n"
+            "- 開頭是【系統…】的是程式附上的資料（例如即時報價），照常使用。\n"
             f"{facts_block}"
         )
     # Keep the current contract last so recalled examples/persona notes cannot
@@ -1871,29 +1876,43 @@ def ocr_image(data: bytes, mime_type: str = "image/jpeg") -> str | None:
         return None
 
 
-_FACT_EXTRACT_PROMPT = """下面是一段 LINE 群組對話，請從中抽出「關於使用者的長期事實」，
-例如：偏好、身份、正在做的專案、技術棧、個人習慣、稱呼……
+# 2026-10-09 Andrew：「咪寶記憶的部分，讓他區分不同人（說話的人），不能全部都一概當成
+# 『使用者』」。對話每一行開頭是說話的人；抽出的每條事實都要指出是哪一位家人。
+_FACT_EXTRACT_PROMPT = """下面是一段 LINE 家庭群組的對話。家人那幾行的開頭是說話的人（例如「成員甲：」），
+「[burst]」底下每一行也各自以說話的人開頭；「咪寶：」是聊天機器人。
+請抽出「說話的人關於自己的長期事實」，例如：偏好、身份、住哪裡、工作或學校、長期習慣、固定行程……
 
 規則：
-1. 只抽「跨對話都會成立」的事實，不要抽「這次對話的即時內容」
-2. 每條事實一行、繁體中文、盡量簡短具體
-3. 沒抽到就回空陣列 []
-4. 嚴格用 JSON 陣列格式回答，不要加任何說明文字、不要 markdown code block
+1. person 只能是這些說話的人之一：{speakers}。每條事實只能是那一行開頭的人自己的事。
+2. 說話的人說「我」就是他自己。講到別人的事（例如「我媽住台中」「妹妹下週考試」）不要抽，因為稱謂是從說話的人的角度，對不到群組裡的人。
+3. 看不出是誰、沒有開頭稱呼的那幾行、咪寶說的話，都不要抽。
+4. 只抽跨對話都會成立的事實，不要抽這次對話的即時內容。
+5. 不要抽健康與病況、用藥、感情與懷孕、債務與官司、金額與帳戶這類私人細節。
+6. fact 用繁體中文、簡短具體，不要寫人名，也不要寫「使用者」。
+7. 沒抽到就回 []。只輸出 JSON 陣列，不要加說明、不要 markdown。
 
 對話：
 {dialogue}
 
-只輸出 JSON 陣列，例如：["使用者是 data engineer", "使用者偏好簡短回覆"]"""
+只輸出 JSON 陣列，例如：[{{"person": "成員甲", "fact": "住在台中"}}, {{"person": "成員乙", "fact": "不吃牛肉"}}]"""
 
 
-def extract_facts(context: list[tuple[str, str]]) -> list[str]:
-    """從最近對話抽長期事實，失敗就回空 list（不要 raise）。"""
-    if not context:
+def extract_facts(
+    context: list[tuple[str, str]], speakers: Sequence[str] = ()
+) -> list[tuple[str, str]]:
+    """從最近對話抽長期事實，回傳 [(稱呼, 事實)]；失敗或沒有已知稱呼就回 []（不 raise）。
+
+    ``speakers`` 是可以掛事實的家人稱呼；模型給的 person 不在裡面就丟掉。
+    """
+    allowed = [str(s).strip() for s in speakers if str(s or "").strip()]
+    if not context or not allowed:
         return []
-    dialogue = "\n".join(
-        f"{'使用者' if role == 'user' else '助手'}：{text}" for role, text in context
+    # A blank line between turns: a line without a name never reads as part of
+    # the turn above it.
+    dialogue = "\n\n".join(
+        (text if role == "user" else f"咪寶：{text}") for role, text in context
     )
-    prompt = _FACT_EXTRACT_PROMPT.format(dialogue=dialogue)
+    prompt = _FACT_EXTRACT_PROMPT.format(dialogue=dialogue, speakers="、".join(allowed))
     try:
         # 抽 facts 走 flash（頻率低 = 每 10 輪 1 次，吃 20/day 很安全）
         response = _client.models.generate_content(
@@ -1904,13 +1923,22 @@ def extract_facts(context: list[tuple[str, str]]) -> list[str]:
             ),
         )
         text = _strip_code_fence((response.text or "").strip())
-        facts = json.loads(text)
-        if isinstance(facts, list):
-            return [str(f).strip() for f in facts if str(f).strip()]
-        return []
+        items = json.loads(text)
     except Exception as e:
-        logger.warning("extract_facts failed: %s", e)
+        logger.warning("extract_facts failed: %s", type(e).__name__)
         return []
+    if not isinstance(items, list):
+        return []
+    known = set(allowed)
+    facts: list[tuple[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        person = str(item.get("person") or "").strip()
+        fact = str(item.get("fact") or "").strip()
+        if person in known and fact and "使用者" not in fact:
+            facts.append((person, fact))
+    return facts
 
 
 def _strip_code_fence(text: str) -> str:

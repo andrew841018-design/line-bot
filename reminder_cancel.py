@@ -891,7 +891,7 @@ def known_people(candidates: Iterable[Mapping[str, object]]) -> set[str]:
     return {"全家"} | {
         normalize_action(name)
         for candidate in candidates
-        for name in reminder_overview.people_names(candidate.get("mention_aliases"))
+        for name in reminder_overview.shown_people(candidate)
     }
 
 
@@ -974,7 +974,7 @@ def resolve_cancel_request(
                 and shown_action_matches(
                     reference_actions,
                     action,
-                    candidate.get("mention_aliases"),
+                    reminder_overview.shown_people(candidate),
                     known,
                 )
             )

@@ -37,6 +37,7 @@ def _synthetic_aliases(tmp_path, monkeypatch):
     )
     monkeypatch.setenv("LINE_USER_ALIASES_PATH", str(aliases))
     monkeypatch.setenv("LINE_FAMILY_ROLE_ALIASES_PATH", str(tmp_path / "no_roles.json"))
+    monkeypatch.setenv("LINE_MEMBER_DISPLAY_NAMES_PATH", str(tmp_path / "display_names.json"))
 
 
 def _seed(action: str, when: str, people: list[str]) -> int:
@@ -61,7 +62,11 @@ def _push_text(reminder_id: int) -> str:
         ("繳管理費", ["成員甲", "成員乙"], "2099-10-01 12:00 成員甲、成員乙 繳管理費"),
         ("繳管理費", ["all"], "2099-10-01 12:00 全家 繳管理費"),
         ("成員甲回診", ["成員甲"], "2099-10-01 12:00 成員甲回診"),
-        ("繳管理費", [], "2099-10-01 12:00 繳管理費"),
+        # 2026-10-09: nobody named → the owner the @ line pings goes first,
+        # unless the words already name someone.
+        ("繳管理費", [], "2099-10-01 12:00 成員甲 繳管理費"),
+        ("成員乙回診", [], "2099-10-01 12:00 成員乙回診"),
+        ("全家聚餐", [], "2099-10-01 12:00 全家聚餐"),
     ],
 )
 def test_a_push_puts_the_people_first(action, people, line):
@@ -227,3 +232,83 @@ def test_a_pasted_person_first_calendar_push_finds_the_event():
     assert calendar_db.find_active_events_exact(
         G, title="成員乙 家長會", event_date="2099-10-01", event_time="15:00"
     ) == []
+
+
+# ── 2026-10-09: reminders that name no one start with their owner ───────────
+
+
+def _seed_owned(owner: str, action: str, when: str) -> int:
+    reminder_id = memory.add_reminder(G, owner, action, _ts(when), source_text=action, mention_aliases=[])
+    assert reminder_id is not None
+    return int(reminder_id)
+
+
+def test_an_unbound_owner_first_receipt_can_be_rescheduled(replies, fixed_now):
+    rid = _seed_owned("U_A", "繳管理費", "2099-10-01 12:00")
+    receipt = main._format_persisted_reminder_confirmation(
+        "created", rid, "繳管理費", main.datetime(2099, 10, 1, 12, 0)
+    )
+    assert receipt.endswith("事項：成員甲 繳管理費")
+    _archive_bot("own-ack-1", receipt)
+
+    main._handle_text_message(_event("10月8日", quoted="own-ack-1"), G)
+
+    assert _row(rid)["remind_at"] == _ts("2099-10-08 12:00")
+    assert "事項：成員甲 繳管理費" in replies[0][0]
+
+
+def test_an_unbound_owner_first_push_can_be_cancelled(replies, fixed_now):
+    rid = _seed_owned("U_A", "繳管理費", "2099-10-01 12:00")
+    _archive_bot("own-push-1", "@成員甲\n" + _push_text(rid))  # no sent_reminder_refs binding
+
+    main._handle_text_message(_event("這則取消", quoted="own-push-1"), G)
+
+    assert _row(rid)["status"] == "cancelled"
+    assert replies[-1][0].startswith("已取消提醒")
+
+
+def test_the_owner_tells_two_same_time_reminders_apart(replies, fixed_now):
+    import reminder_cancel
+    import reminder_reschedule as rr
+
+    mine = _seed_owned("U_A", "買菜", "2099-10-01 12:00")
+    # add_reminder folds the same words within an hour; older rows can still pair up
+    with memory._conn() as conn:
+        theirs = conn.execute(
+            "INSERT INTO reminders (group_id, user_id, action, remind_at, created_at, status, "
+            "source_text, mention_aliases) SELECT group_id, 'U_B', action, remind_at, created_at, "
+            "status, source_text, mention_aliases FROM reminders WHERE reminder_id = ?",
+            (mine,),
+        ).lastrowid
+    push = "@成員乙\n" + _push_text(theirs)
+    assert push.splitlines()[2] == "2099-10-01 12:00 成員乙 買菜"
+
+    visible = rr.parse_quoted_reminder(push)
+    rows = [_row(mine), _row(theirs)]
+    known = reminder_cancel.known_people(rows)
+    assert [main._quote_shows_reminder(visible.action, row, known) for row in rows] == [False, True]
+
+    # Rescheduling still refuses: the store will not move one of two same-minute
+    # same-words rows (its own guard, unchanged).
+    _archive_bot("own-push-2", push)
+    main._handle_text_message(_event("10月8日", quoted="own-push-2"), G)
+    assert _row(theirs)["remind_at"] == _row(mine)["remind_at"] == _ts("2099-10-01 12:00")
+    assert replies[-1][0].startswith("尚未更新提醒")
+
+
+def test_the_owner_is_not_added_when_the_words_name_someone():
+    rid = _seed_owned("U_A", "成員乙回診", "2099-10-01 12:00")
+    assert _push_text(rid).splitlines()[1] == "2099-10-01 12:00 成員乙回診"
+    rid2 = _seed_owned("U_A", "阿嬤回診", "2099-10-02 12:00")
+    assert _push_text(rid2).splitlines()[1] == "2099-10-02 12:00 阿嬤回診"
+
+
+
+def test_an_owner_without_an_alias_goes_first_by_display_name(tmp_path):
+    import line_mentions
+
+    rid = _seed_owned("U_X", "去青森一日遊", "2099-10-23 12:00")
+    assert _push_text(rid).splitlines()[1] == "2099-10-23 12:00 去青森一日遊"  # nobody known yet
+    line_mentions.remember_display_name("U_X", "小明")
+    assert _push_text(rid).splitlines()[1] == "2099-10-23 12:00 小明 去青森一日遊"
+    assert oct(__import__("os").stat(tmp_path / "display_names.json").st_mode & 0o777) == "0o600"

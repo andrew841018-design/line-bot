@@ -663,14 +663,41 @@ def add_fact(group_id: str, fact: str, user_id: str = "") -> bool:
         return cur.rowcount > 0
 
 
+_FACT_LABEL_MAX = 20
+
+
+def fact_body(fact: str) -> str:
+    """「稱呼：事實」的事實本體（2026-10-09 起事實開頭寫是哪位家人）。"""
+    label, sep, body = (fact or "").partition("：")
+    if sep and label and len(label) <= _FACT_LABEL_MAX and body:
+        return body
+    return fact or ""
+
+
 def remove_fact(group_id: str, fact_substring: str) -> int:
-    """刪除所有「包含該子字串」的事實，回傳刪幾筆。"""
+    """刪除事實本體「包含該子字串」的事實，回傳刪幾筆。
+
+    只比對本體：「/忘記 媽媽」不會因為開頭的稱呼就刪掉媽媽全部的事實。
+    """
+    needle = (fact_substring or "").strip()
+    if not needle:
+        return 0
     with _lock, _conn() as c:
-        cur = c.execute(
-            "DELETE FROM facts WHERE group_id = ? AND fact LIKE ?",
-            (group_id, f"%{fact_substring}%"),
-        )
-        return cur.rowcount
+        rows = c.execute(
+            "SELECT rowid, user_id, fact FROM facts WHERE group_id = ?", (group_id,)
+        ).fetchall()
+        # Only facts kept under a person start with their 「稱呼：」; older group
+        # facts such as 「某某生日：1/2」 are matched whole.
+        doomed = [
+            rowid for rowid, user_id, fact in rows
+            if needle in (fact_body(fact) if user_id else fact)
+        ]
+        for start in range(0, len(doomed), 500):
+            chunk = doomed[start:start + 500]
+            c.execute(
+                f"DELETE FROM facts WHERE rowid IN ({','.join('?' * len(chunk))})", chunk
+            )
+        return len(doomed)
 
 
 def list_facts(group_id: str, user_id: str | None = None) -> list[str]:
@@ -695,9 +722,26 @@ def clear_facts(group_id: str) -> int:
         return cur.rowcount
 
 
+def list_fact_rows(group_id: str) -> list[tuple[str, str]]:
+    """[(user_id, fact)]，舊到新。每條事實開頭是那位家人的稱呼（2026-10-09 起）。"""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT user_id, fact FROM facts WHERE group_id = ? ORDER BY rowid",
+            (group_id,),
+        ).fetchall()
+        return [(r[0] or "", r[1]) for r in rows]
+
+
 def top_facts(group_id: str, user_id: str | None = None) -> list[str]:
-    """給 prompt 注入用，取前 max_facts_in_prompt 條。"""
-    return list_facts(group_id, user_id)[: settings.max_facts_in_prompt]
+    """給 prompt 注入用，最多 max_facts_in_prompt 條。
+
+    2026-10-09：事實各自掛在說到的那位家人身上（開頭寫稱呼）。正在說話的人的
+    事實排前面，其餘新的在前；以前是整個群組依字母序取前幾條。
+    """
+    rows = list(reversed(list_fact_rows(group_id)))
+    own = [fact for uid, fact in rows if user_id and uid == user_id]
+    others = [fact for uid, fact in rows if not (user_id and uid == user_id)]
+    return (own + others)[: settings.max_facts_in_prompt]
 
 
 # ── 謠言快取 ───────────────────────────────────────────────────────────────────
@@ -999,11 +1043,17 @@ def log_raw_message(
 def raw_message_sender_near(
     group_id: str, at_ts: int, quote: str = "", window_sec: int = 180
 ) -> str | None:
-    """The one family member who sent ``quote`` (or, failing that, the only one
-    who wrote anything) in the ``window_sec`` before ``at_ts``; else None.
+    """The one family member who sent ``quote`` in the ``window_sec`` before
+    ``at_ts``; else None.
 
     Repairs finance views stored before 2026-10-07 without their speaker.
+    2026-10-09 review: only the quoted message counts.  The old fallback (the
+    only one who wrote anything) could pin a view on the wrong person for
+    good, and a quote under 8 characters matches too much to be sure.
     """
+    needle = "".join((quote or "").split())
+    if len(needle) < 8:
+        return None
     with _conn() as c:
         rows = c.execute(
             "SELECT user_id, text FROM raw_messages "
@@ -1011,10 +1061,22 @@ def raw_message_sender_near(
             "AND user_id IS NOT NULL AND user_id NOT IN ('', '__bot__')",
             (group_id, int(at_ts) - int(window_sec), int(at_ts) + 5),
         ).fetchall()
-    needle = "".join((quote or "").split())
-    quoted = {uid for uid, text in rows if needle and needle in "".join((text or "").split())}
-    candidates = quoted or {uid for uid, _text in rows}
-    return next(iter(candidates)) if len(candidates) == 1 else None
+    quoted = {uid for uid, text in rows if needle in "".join((text or "").split())}
+    return next(iter(quoted)) if len(quoted) == 1 else None
+
+
+def recent_raw_senders(group_id: str, limit: int = 300) -> list[str]:
+    """最近 ``limit`` 則訊息裡說過話的家人 user_id（不含 bot），新的在前。"""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT user_id FROM ("
+            " SELECT user_id, created_at FROM raw_messages WHERE group_id = ?"
+            " ORDER BY created_at DESC LIMIT ?"
+            ") WHERE user_id IS NOT NULL AND user_id NOT IN ('', '__bot__')"
+            " GROUP BY user_id ORDER BY MAX(created_at) DESC",
+            (group_id, int(limit)),
+        ).fetchall()
+    return [r[0] for r in rows]
 
 
 def get_raw_message(group_id: str, message_id: str) -> tuple[str | None, str] | None:

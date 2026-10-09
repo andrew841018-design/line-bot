@@ -28,6 +28,27 @@ import json as _json  # noqa: E402
 # ── 1. 每日待辦 ──────────────────────────────────────────────────────────────
 
 
+_BIRTHDAY_RE = re.compile(r"(.*?)生日：(\d{1,2})/(\d{1,2})")
+
+
+def birthday_from_fact(fact: str) -> tuple[str, int, int] | None:
+    """「某某生日：M/D」→ (某某, M, D)；不是生日事實回 None。
+
+    2026-10-09 起事實開頭可能是「誰說的：」：主角寫在後面就用後面的，
+    「誰：生日：3/5」「誰：我生日：3/5」就是說的人自己。
+    """
+    speaker, sep, rest = (fact or "").partition("：")
+    if not (sep and 0 < len(speaker) <= 20 and "生日" not in speaker and "生日：" in rest):
+        speaker, rest = "", fact or ""
+    m = _BIRTHDAY_RE.search(rest)
+    if not m:
+        return None
+    who = m.group(1).strip()
+    if speaker and who in ("", "我", "我的", "自己", "自己的"):
+        who = speaker
+    return (who, int(m.group(2)), int(m.group(3))) if who else None
+
+
 def upcoming_birthdays() -> str:
     """檢查 facts 表中的家庭生日，列出 7 天內到的，附剩餘天數。"""
     db_path = LINE_BOT_DIR / "line_bot.db"
@@ -48,10 +69,10 @@ def upcoming_birthdays() -> str:
     today = datetime.now().date()
     upcoming = []
     for (fact,) in rows:
-        m = re.search(r"(.+?)生日：(\d{1,2})/(\d{1,2})", fact)
-        if not m:
+        parsed = birthday_from_fact(fact)
+        if parsed is None:
             continue
-        who, mm, dd = m.group(1), int(m.group(2)), int(m.group(3))
+        who, mm, dd = parsed
         # 算今年生日；過了就算明年
         try:
             this_year_bday = today.replace(month=mm, day=dd)

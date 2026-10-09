@@ -14,8 +14,9 @@ todos are given as row-like dicts (see :func:`todo_item`).
 
 from __future__ import annotations
 
+import json
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -59,6 +60,7 @@ class _Item:
     clock: str | None
     clocks: frozenset[str]  # event clocks it names, to tell 09:00 from 15:00 apart
     names: tuple[str, ...]
+    shown: tuple[str, ...]  # who messages put first: names, or the owner (2026-10-09)
     everyone: bool
     key: str
     match_text: str
@@ -82,7 +84,12 @@ def _hhmm(remind_at: int) -> str:
 
 def _names(raw: object) -> tuple[str, ...]:
     if isinstance(raw, str):
-        raw = [raw]
+        # a row read straight from SQLite keeps mention_aliases as JSON text
+        text = raw.strip()
+        try:
+            raw = json.loads(text) if text.startswith("[") else [raw]
+        except ValueError:
+            raw = [raw]
     names: list[str] = []
     for value in raw or []:
         name = str(value or "").strip().lstrip("@＠")
@@ -113,6 +120,61 @@ def subject_prefix(text: str, people: object) -> list[str]:
     if any(name in _EVERYONE or line_mentions.is_all_participants([name]) for name in names):
         return [] if "全家" in text else ["全家"]
     return names
+
+
+# 2026-10-09：只 @ 建立者的提醒（沒有點名對象）也要有主詞——推播 @ 的就是建立者。
+# 事項已經寫到某位家人或全家時不加，「爸爸 回診」不會變成「媽媽 爸爸 回診」。
+_PERSON_WORDS = (
+    *getattr(reminder_intent, "_SAME_EVENT_KIN", ("爸爸", "媽媽", "姊姊", "哥哥", "弟弟", "妹妹")),
+    "全家", "家族", "家人", "大家", "我們",
+)
+
+
+def _names_someone(text: str) -> bool:
+    if any(word in text for word in _PERSON_WORDS):
+        return True
+    import line_mentions
+
+    try:
+        names = line_mentions.configured_family_alias_mapping(include_short=True)
+    except Exception:
+        return False
+    return any(name and name in text for name in names)
+
+
+def owner_subject(row: Mapping, text: str | None = None) -> tuple[str, ...]:
+    """沒有點名對象時放在事項前面的人：設這個提醒的人（推播 @ 的就是他）。
+
+    有點名對象、事項已寫到某位家人或全家、或建立者沒有設定稱呼時回 ()。
+    """
+    if _names(row.get("mention_aliases")):
+        return ()
+    source_kind = str(row.get("source_kind") or "")
+    if source_kind == "calendar_event" or reminder_stages.is_calendar_mirror(
+        source_kind, row.get("source_ref")
+    ):
+        return ()  # 日曆活動的人寫在活動裡，不是建立者
+    owner = str(row.get("user_id") or "")
+    if not owner or owner == "__bot__":
+        return ()
+    import line_mentions
+
+    try:
+        # 沒有本機別名就用 bot 查到的 LINE 顯示名稱（Andrew 2026-10-09）
+        alias = _names(
+            line_mentions.alias_for_user_id(owner) or line_mentions.display_name_for_user_id(owner) or ""
+        )
+    except Exception:
+        return ()
+    wording = str(row.get("action") or "") if text is None else text
+    if not alias or alias[0] in wording or _names_someone(wording):
+        return ()
+    return alias
+
+
+def shown_people(row: Mapping, text: str | None = None) -> tuple[str, ...]:
+    """推播、清單、收據放在事項前面的人：點名對象；沒有就是建立者（2026-10-09）。"""
+    return _names(row.get("mention_aliases")) or owner_subject(row, text)
 
 
 def subject_first(text: str, people: object) -> str:
@@ -153,6 +215,7 @@ def _make_item(
     clocks: frozenset[str],
     names: tuple[str, ...],
     identity_extra: Sequence[str] = (),
+    shown: tuple[str, ...] | None = None,
 ) -> _Item:
     people = tuple(name for name in names if name not in _EVERYONE)
     match_text = _with_people(action, people)
@@ -167,6 +230,7 @@ def _make_item(
         clock=clock,
         clocks=clocks,
         names=names,
+        shown=names if shown is None else shown,
         everyone=any(name in _EVERYONE for name in names),
         key=re.sub(r"\s+", "", reminder_intent.normalize_text(action)).casefold(),
         match_text=match_text,
@@ -217,6 +281,7 @@ def _reminder_item(row: dict) -> _Item:
             clocks=clocks,
             names=names,
             identity_extra=identity_extra,
+            shown=names or owner_subject(row, action),
         )
     time_kind = str(row.get("time_kind") or "")
     mirror = reminder_stages.is_calendar_mirror(source_kind, row.get("source_ref"))
@@ -237,6 +302,7 @@ def _reminder_item(row: dict) -> _Item:
         clocks=frozenset({hhmm}) if rank == 2 else frozenset(),
         names=names,
         identity_extra=identity_extra,
+        shown=names or owner_subject(row, action),
     )
 
 
@@ -347,9 +413,13 @@ def _entry(items: list[_Item]) -> Entry:
     rows.sort(key=_primary_rank)
     primary = rows[0] if rows else todos[0]
     clock = primary.clock or next((item.clock for item in items if item.clock), None)
+    # Anyone named wins; only when no row names anyone do the owners go first
+    # (2026-10-09), so 「媽媽」 plus another row's owner never reads as two people.
+    ordered = [primary, *items]
+    named = any(item.names for item in ordered)
     people: list[str] = []
-    for item in [primary, *items]:
-        for name in item.names:
+    for item in ordered:
+        for name in (item.names if named else item.shown):
             if name not in people:
                 people.append(name)
     return Entry(

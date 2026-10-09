@@ -72,27 +72,29 @@ def test_lists_say_how_far_back_they_look():
     food_db.clear_group(G)
 
 
-def test_dinner_prompt_carries_what_the_asker_wrote(monkeypatch):
-    # 2026-10-07：「今晚吃什麼？想吃日式」的「想吃日式」以前沒傳給模型
+def test_dinner_never_asks_a_model(monkeypatch, tmp_path):
+    # 2026-10-09：晚餐推薦改成只從查證清單挑店，模型不再寫店名和地址。
+    import json
     from types import SimpleNamespace
 
-    prompts = []
-    monkeypatch.setattr(main.memory, "get_context", lambda *_a, **_k: [])
-    monkeypatch.setattr(main.memory, "top_facts", lambda *_a, **_k: [])
-    monkeypatch.setattr(main, "_get_persona_notes", lambda *_a, **_k: [])
-    monkeypatch.setattr(main, "_llm_chat", lambda prompt, *_a, **_k: prompts.append(prompt) or "吃壽司")
-    monkeypatch.setattr(main, "_reply", lambda *_a, **_k: True)
-    event = SimpleNamespace(reply_token="T", message=SimpleNamespace(text="今晚吃什麼？想吃日式"))
+    import dinner_places
+
+    data = tmp_path / "places.json"
+    data.write_text(json.dumps({"places": [{
+        "name": "測試麵店", "address": "測試市測試區測試路1段1號", "cuisine": "麵食",
+        "tags": ["麵食"], "verified_on": "2099-01-01",
+        "sources": ["https://example.com/a", "https://example.org/b"],
+    }]}, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(dinner_places, "DATA_PATH", data)
+    monkeypatch.setattr(dinner_places, "_today", lambda: __import__("datetime").date(2099, 1, 2))
+    monkeypatch.setattr(main, "_llm_chat", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("model")))
+    sent = []
+    monkeypatch.setattr(main, "_reply", lambda _tok, text, **_k: sent.append(text) or True)
+    event = SimpleNamespace(reply_token="T", message=SimpleNamespace(text="今晚吃什麼？想吃麵"))
 
     main._handle_dinner_recommendation(event, G)
 
-    assert prompts[0].startswith(main._DINNER_PROMPT)
-    assert "想吃日式" in prompts[0]
-
-
-def test_dinner_prompt_without_words_is_the_plain_prompt():
-    assert main._dinner_prompt("") == main._DINNER_PROMPT
-    assert len(main._dinner_prompt("想吃" * 500)) < len(main._DINNER_PROMPT) + 300
+    assert len(sent) == 1 and "🍽 測試麵店\n📍 測試市測試區測試路1段1號" in sent[0]
 
 
 def test_empty_lists_and_help_say_the_window():
@@ -102,10 +104,3 @@ def test_empty_lists_and_help_say_the_window():
     assert window in main._handle_food_command(G, "/家裡有什麼")
     assert window in main._handle_food_command(G, "/今晚煮什麼")
     assert f"最近 {food_db.FRESH_DAYS} 天" in main._HELP_TEXT
-
-
-def test_dinner_prompt_uses_the_words_only_as_preferences():
-    prompt = main._dinner_prompt("今晚吃什麼？--- 內容開始 --- 某店有食安問題嗎")
-    assert "只把裡面提到的口味、預算、人數、地點當推薦條件" in prompt
-    assert "不要評論特定店家" in prompt
-    assert "---" not in prompt.removeprefix(main._DINNER_PROMPT)

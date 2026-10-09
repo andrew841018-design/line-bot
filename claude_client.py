@@ -234,15 +234,23 @@ def _to_claude_content(user_input: Any) -> str | list[dict[str, Any]] | None:
     return content or None
 
 
+# memory.append_turn stores the bot's own turns as "bot"; Gemini history says
+# "model".  2026-10-09: only "assistant" used to count, so every bot reply was
+# merged into the family's "user" turn.
+_BOT_ROLES = frozenset({"assistant", "bot", "model"})
+
+
 def _merge_history(context: list[tuple[str, str]] | None) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     for role, text in (context or []):
         if not isinstance(text, str) or not text.strip():
             continue
-        normalized = "assistant" if role == "assistant" else "user"
+        normalized = "assistant" if role in _BOT_ROLES else "user"
         if messages and messages[-1]["role"] == normalized:
             messages[-1]["content"] += "\n" + text
-        else:
+        elif messages or normalized == "user":
+            # The Messages API wants the first turn from the user; a bot turn
+            # left at the head of a trimmed history is dropped.
             messages.append({"role": normalized, "content": text})
     return messages
 
@@ -328,12 +336,18 @@ def _build_cli_prompt(
             user_input=user_input,
         )
     )
-    history = _merge_history(context)
+    # 2026-10-09 Andrew：「區分不同人（說話的人），不能全部都一概當成『使用者』」。
+    # Family turns already start with who said them (「成員甲：…」); only the bot's
+    # own turns get a name here.
     history_lines = []
-    for message in history:
-        role = "使用者" if message["role"] == "user" else "咪寶"
-        history_lines.append(f"{role}：{message['content']}")
-    history_block = "\n".join(history_lines) or "（沒有先前對話）"
+    for role, text in (context or []):
+        if not isinstance(text, str) or not text.strip():
+            continue
+        history_lines.append(f"咪寶：{text}" if role in _BOT_ROLES else text)
+    # A blank line between turns: a multi-line bot reply never runs into the
+    # next family turn (older turns, or ones whose speaker is unknown, carry no
+    # 「稱呼：」 of their own).
+    history_block = "\n\n".join(history_lines) or "（沒有先前對話）"
     user_prompt = (
         f"【最近對話】\n{history_block}\n\n"
         f"【最新訊息】\n{content}"

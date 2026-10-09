@@ -212,31 +212,20 @@ def _webhook_patches(user_role_id="U_SISTER"):
     ]
 
 
-@pytest.mark.parametrize("kind", ["text", "image"])
-def test_silenced_sender_is_closed_even_when_raw_audit_fails(kind):
+@pytest.mark.parametrize("user_id", ["U_SISTER", "U_SOMEONE_ELSE"])
+def test_text_raw_audit_failure_stops_for_every_sender(user_id):
+    """2026-10-09：妹妹不再零回覆。她的原始紀錄寫入失敗也和其他人一樣往外丟，
+    不再有「靜音成員照樣結案」的例外。"""
     from contextlib import ExitStack
     from unittest.mock import patch
 
     with ExitStack() as stack:
         for item in _webhook_patches():
             stack.enter_context(item)
-        complete = stack.enter_context(patch("main.memory.mark_inbound_events_completed_no_reply"))
         handle_text = stack.enter_context(patch("main._handle_text_message"))
-        main._handle_event(_group_event(_message(kind), user_id="U_SISTER"))
-    handle_text.assert_not_called()
-    complete.assert_called_once_with("G_TEST", ["MSG_TEST"])
-
-
-def test_other_senders_keep_stopping_when_raw_audit_fails():
-    from contextlib import ExitStack
-    from unittest.mock import patch
-
-    with ExitStack() as stack:
-        for item in _webhook_patches():
-            stack.enter_context(item)
-        stack.enter_context(patch("main._handle_text_message"))
         with pytest.raises(OSError):
-            main._handle_event(_group_event(_message("text"), user_id="U_SOMEONE_ELSE"))
+            main._handle_event(_group_event(_message("text"), user_id=user_id))
+    handle_text.assert_not_called()
 
 
 def test_unknown_message_type_is_closed_even_when_raw_audit_fails():

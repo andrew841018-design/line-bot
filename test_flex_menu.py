@@ -559,17 +559,16 @@ def test_a_command_outside_the_menu_does_not_bring_the_buttons(no_network):
 
 @pytest.mark.parametrize("text, expected", [("今晚吃什麼？", True), ("晚餐要吃什麼", False)])
 def test_dinner_button_reply_brings_the_buttons_back(text, expected):
+    # 2026-10-09: the dinner reply comes from the verified list, not a model.
     with (
-        patch("main._llm_chat", return_value="今晚吃火鍋"),
-        patch("main.memory.get_context", return_value=[]),
-        patch("main.memory.top_facts", return_value=[]),
-        patch("main._get_persona_notes", return_value=[]),
+        patch("dinner_places.recommend", return_value="查證清單的推薦"),
+        patch("dinner_places.verify_reply", return_value=True),
         patch("main._reply") as reply,
     ):
         main._handle_dinner_recommendation(_event(_message(text)), "G_TEST")
 
     reply.assert_called_once()
-    assert reply.call_args[0][1] == "今晚吃火鍋"
+    assert reply.call_args[0][1] == "查證清單的推薦"
     assert reply.call_args.kwargs.get("menu_buttons") is expected
 
 
@@ -658,15 +657,14 @@ def test_menu_is_not_sent_when_bot_is_muted():
     api.reply_message.assert_not_called()
 
 
-# ── 靜音成員 ──────────────────────────────────────────────────────────────
+# ── 妹妹和其他家人一樣（2026-10-09 取消零回覆） ─────────────────────────────
 
 
-def _handle_as_silenced(event, *, quotes_bot: bool):
+def _handle_as_sister(event):
     with (
         patch("main.line_mentions.user_id_for_family_role", return_value="U_SISTER"),
         patch("main.memory.begin_inbound_event", return_value="new"),
         patch("main.memory.mark_inbound_events_completed_no_reply") as complete,
-        patch("main._quotes_bot_message", return_value=quotes_bot),
         patch("main._spawn_piggyback_drain"),
         patch("main._reply") as reply,
         patch.object(main.settings, "allowed_group_ids_raw", ""),
@@ -676,19 +674,12 @@ def _handle_as_silenced(event, *, quotes_bot: bool):
     return reply, complete
 
 
-@pytest.mark.parametrize("text", ["選單", "/提醒清單"])
-def test_silenced_member_unquoted_menu_or_button_gets_no_reply(text):
-    event = _event(_message(text), user_id="U_SISTER")
-    reply, complete = _handle_as_silenced(event, quotes_bot=False)
-    reply.assert_not_called()
-    complete.assert_called_once_with("G_TEST", ["MSG_MENU"])
-
-
-def test_silenced_member_quoting_a_bot_message_gets_normal_routing():
+def test_sister_unquoted_menu_gets_the_menu_card():
     event = _event(_message("選單"), user_id="U_SISTER")
-    reply, _complete = _handle_as_silenced(event, quotes_bot=True)
+    reply, complete = _handle_as_sister(event)
     reply.assert_called_once()
     assert reply.call_args.kwargs["menu_card"] is True
+    complete.assert_not_called()
 
 
 # ── 大字選單：不會收起的大字 Flex 卡片（2026-10-07） ─────────────────────────
@@ -868,8 +859,9 @@ def test_large_card_is_not_sent_when_bot_is_muted():
     api.reply_message.assert_not_called()
 
 
-def test_silenced_member_unquoted_large_menu_gets_no_reply():
+def test_sister_unquoted_large_menu_gets_the_large_card():
     event = _event(_message("/大字選單"), user_id="U_SISTER")
-    reply, complete = _handle_as_silenced(event, quotes_bot=False)
-    reply.assert_not_called()
-    complete.assert_called_once_with("G_TEST", ["MSG_MENU"])
+    reply, complete = _handle_as_sister(event)
+    reply.assert_called_once()
+    assert reply.call_args.kwargs["large_menu_card"] is True
+    complete.assert_not_called()

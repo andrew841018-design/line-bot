@@ -289,7 +289,7 @@ def maybe_extract_and_save_async(
     combined_text: str,
     source_msg_id: Optional[str] = None,
     user_id_default: str = "",
-    display_name_default: str = "家人",
+    display_name_default: str = "",
     *,
     speakers: Sequence[Speaker] | None = None,
     resolve_speaker: Callable[[str], str] | None = None,
