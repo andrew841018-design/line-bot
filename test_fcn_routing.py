@@ -183,7 +183,7 @@ def test_full_command_replies_with_evaluation_card_and_creates_nothing():
     assert isinstance(card, dict) and card["type"] == "bubble"
     assert args[1].startswith("FCN 評估：NVDA、AMD｜")
     assert kwargs["index_for_recall"] is False
-    assert "menu_buttons" not in kwargs
+    assert kwargs.get("menu_buttons", False) is False  # 打出來的完整指令不是選單按鈕
     cancel.assert_not_called()
     add.assert_not_called()
     assert _row_counts() == before  # 「12個月」沒有被當成日期建提醒

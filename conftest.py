@@ -329,3 +329,28 @@ def block_external_side_effects(monkeypatch, request):
 
     monkeypatch.setattr(safe_fetch, "_resolve", _no_lookup)
     monkeypatch.setattr(safe_fetch, "is_public_ip", lambda _ip: False)
+
+
+@pytest.fixture(autouse=True)
+def isolate_stock_picks(monkeypatch, tmp_path_factory):
+    """2026-10-10：股票推薦的背景執行緒不能在測試裡起來（有測試會跑 _app_lifespan）；
+    狀態檔一律指到這個測試自己的暫存目錄、不從磁碟載入，不碰正式 state/；stock_picks 的對外
+    請求一律擋掉（需要資料的測試自己換 `_get_json`）；單檔查詢的限流與快取每個測試清掉。"""
+    try:
+        import stock_picks
+    except Exception:  # stock_picks 自己壞了：只讓它的測試失敗，不連帶整套測試在 setup 就失敗
+        return
+
+    monkeypatch.setattr(stock_picks, "_BACKGROUND_ENABLED", False, raising=False)
+    if not hasattr(stock_picks, "WorkerState"):  # 緊急停用版（stock_picks_disabled.py）沒有這些
+        return
+
+    def _no_network(*_args, **_kwargs):
+        raise AssertionError("stock_picks must not touch the network in tests")
+
+    monkeypatch.setattr(stock_picks, "_get_json", _no_network)
+    monkeypatch.setattr(stock_picks, "STATE_DIR", tmp_path_factory.mktemp("stock_picks_state"))
+    monkeypatch.setattr(stock_picks, "_snapshot", None)
+    monkeypatch.setattr(stock_picks, "_worker", stock_picks.WorkerState())
+    monkeypatch.setattr(stock_picks, "_loaded", True)
+    stock_picks.clear_caches()

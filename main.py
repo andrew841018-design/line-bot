@@ -174,6 +174,7 @@ async def _app_lifespan(_app: FastAPI):
         name="local-vision-maintenance",
     )
     _app.state.local_vision_maintenance_task = vision_maintenance_task
+    stock_picks_module = None
     try:
         _app.state.webhook_handler_loop = asyncio.get_running_loop()
         _app.state.webhook_handler_lock = asyncio.Lock()
@@ -206,8 +207,21 @@ async def _app_lifespan(_app: FastAPI):
             )
         _process_pending_on_startup()
         _init_on_startup()
+        # 股票推薦（2026-10-10）：背景執行緒每 30 分鐘看證交所有沒有新的交易日；啟動失敗只記種類。
+        try:
+            import stock_picks as _stock_picks
+
+            stock_picks_module = _stock_picks
+            stock_picks_module.start_background()
+        except Exception as exc:
+            logger.warning("stock picks background start failed error_type=%s", type(exc).__name__)
         yield
     finally:
+        if stock_picks_module is not None:
+            try:
+                stock_picks_module.stop_background(timeout=2.0)
+            except Exception as exc:
+                logger.warning("stock picks background stop failed error_type=%s", type(exc).__name__)
         vision_maintenance_task.cancel()
         try:
             await vision_maintenance_task
@@ -630,7 +644,7 @@ def _append_bot_turn(group_id: str, text: str, *, source: str = "bot_memory") ->
 
 def _is_market_quote_outbound(text: str) -> bool:
     """Market quotes are reply-only; an expired reply token must not create a push."""
-    return (text or "").lstrip().startswith(("【市場報價", "【即時股價", "FCN 評估"))
+    return (text or "").lstrip().startswith(("【市場報價", "【即時股價", "FCN 評估", "股票推薦", "股票評估"))
 
 
 def _is_market_quote_request(text: str, context: list | None = None) -> bool:
@@ -2937,8 +2951,8 @@ def _handle_event(event) -> None:
     # 2026-10-09 Andrew：「取消妹妹不回覆這個設定，從現在起妹妹的言論要回覆」——
     # 每位家人的訊息都走同一條路由（2026-09-19 的零回覆 gate 與 10/05 的引用例外已移除）。
     if isinstance(msg, TextMessageContent):
-        # FCN 指令不進 recall（2026-10-09）：之後的模型回覆不能把評估改寫成買賣建議。
-        recall_kwargs = {} if _fcn_command_body(msg.text, msg) is None else {"index_for_recall": False}
+        # FCN、股票推薦指令不進 recall（2026-10-09／10-10）：之後的模型回覆不能把評估改寫成買賣建議。
+        recall_kwargs = {} if _investment_command(msg.text, msg) is None else {"index_for_recall": False}
         memory.log_raw_message(
             group_id, msg.id, sender_user_id, msg.text or "",
             quoted_message_id=getattr(msg, "quoted_message_id", None),
@@ -6634,6 +6648,17 @@ def _handle_text_message(
     fcn_body = _fcn_command_body(text, event.message)
     if fcn_body is not None:
         _reply_fcn(event, group_id, text, fcn_body)
+        return
+    # 股票推薦（2026-10-10）：「/股票」同 FCN，放在提醒路徑之前、一律在這裡回覆並 return。
+    stock_body = _stock_command_body(text, event.message)
+    if stock_body is not None:
+        _reply_stock_picks(event, group_id, text, stock_body)
+        return
+    # 引用 bot 的投資卡片（股票推薦／股票評估／FCN 評估）又不是指令：回固定句，不讓模型把
+    # 卡片改寫成買賣建議；放在提醒、引用擴展、burst 之前。
+    quoted_investment = _quoted_bot_investment_kind(event, group_id)
+    if quoted_investment is not None:
+        _reply_investment_quote_notice(event, group_id, quoted_investment)
         return
     # Cancellation must run before quote-context expansion, one-shot replies,
     # calendar capture, classifiers, and reminder extraction.  Otherwise a
@@ -20197,31 +20222,44 @@ _FCN_COMMAND_RE = re.compile(r"/\s{0,3}fcn(?![a-z])", re.IGNORECASE)
 _FCN_FAILURE_TEXT = "FCN 評估：暫時無法評估，請稍後再試"
 
 
-def _fcn_command_body(text: str | None, message) -> str | None:
-    """「/FCN …」後面的字（可能是空字串）；不是 FCN 指令回 None。
+def _command_text(text: str | None) -> str:
+    """投資指令偵測用：先刪 Cf 類字元（零寬空白等，NFKC 不會刪），再 NFKC、去頭尾空白。"""
+    visible = "".join(ch for ch in (text or "") if unicodedata.category(ch) != "Cf")
+    return unicodedata.normalize("NFKC", visible).strip()
 
-    先 NFKC（全形「／ＦＣＮ」也算）再判斷；開頭是 @咪寶／咪寶 稱呼時看稱呼後的字。
-    不設長度上限（解析的長度上限在 fcn_eval）。偵測本身出錯就當成不是 FCN 指令。
+
+def _command_body(text: str | None, message, pattern: re.Pattern[str], needle: str, label: str) -> str | None:
+    """投資指令（/FCN、/股票）後面的字（可能是空字串）；不是這個指令回 None。
+
+    先刪零寬字元再 NFKC（全形「／ＦＣＮ」也算）；開頭是 @咪寶／咪寶 稱呼時看稱呼後的字。
+    不設長度上限（各模組自己限）。偵測本身出錯就當成不是指令。
     """
     try:
-        import unicodedata
-
-        normalized = unicodedata.normalize("NFKC", text or "").strip()
-        if "fcn" not in normalized.casefold():
+        normalized = _command_text(text)
+        if needle not in normalized.casefold():
             return None
-        match = _FCN_COMMAND_RE.match(normalized)
-        if match is None:
-            addressed = _extract_gemini_trigger(text or "", message)
+        match = pattern.match(normalized)
+        if match is not None:
+            return normalized[match.end():]
+        # 開頭是稱呼（咪寶、/ai…）：先照原文認，原文認出來的字不是這個指令，再用刪掉零寬字元的版本認
+        # （@提及的位置照原文算，傳哪個版本都一樣）。
+        for source in (text or "", normalized):
+            addressed = _extract_gemini_trigger(source, message)
             if not addressed:
-                return None
-            normalized = unicodedata.normalize("NFKC", addressed).strip()
-            match = _FCN_COMMAND_RE.match(normalized)
-            if match is None:
-                return None
-        return normalized[match.end():]
-    except Exception as exc:
-        logger.error("fcn command detection failed error_type=%s", type(exc).__name__)
+                continue
+            candidate = _command_text(addressed)
+            match = pattern.match(candidate)
+            if match is not None:
+                return candidate[match.end():]
         return None
+    except Exception as exc:
+        logger.error("%s command detection failed error_type=%s", label, type(exc).__name__)
+        return None
+
+
+def _fcn_command_body(text: str | None, message) -> str | None:
+    """「/FCN …」後面的字；解析的長度上限在 fcn_eval。"""
+    return _command_body(text, message, _FCN_COMMAND_RE, "fcn", "fcn")
 
 
 def _handle_fcn_command(event, group_id: str, body: str) -> tuple[str | None, dict | None, str | None]:
@@ -20257,32 +20295,161 @@ def _handle_fcn_command(event, group_id: str, body: str) -> tuple[str | None, di
 
 
 def _reply_fcn(event, group_id: str, text: str, body: str) -> None:
-    """FCN 一律只用 reply token、不進 recall、不提及任何人（清掉這則訊息登記的 mention）；
-    卡片不掛選單按鈕，按鈕送來的說明文字會再掛。"""
-    _clear_reply_mention_targets(event.reply_token)
     reply_text, card, alt_text = _handle_fcn_command(event, group_id, body)
-    if card is not None:
-        _reply(event.reply_token, alt_text, group_id=group_id, flex_card=card, index_for_recall=False)
+    _reply_command_card(
+        event, group_id, text, reply_text=reply_text, card=card, alt_text=alt_text, fallback_text=_FCN_FAILURE_TEXT
+    )
+
+
+_STOCK_COMMAND_RE = re.compile(r"/\s{0,3}股票(?:推薦)?")
+_STOCK_FAILURE_TEXT = "股票推薦：暫時無法回覆，請稍後再試"
+_INVESTMENT_QUOTE_TEXT = (
+    "股票評估：卡片上的燈號和數字是程式用公開資料算的，只供參考，不是買賣建議。想看某一檔請打 /股票 代號"
+)
+_FCN_QUOTE_TEXT = (
+    "FCN 評估：卡片上的數字是程式用公開資料粗估的，只供參考，以銀行條件書為準。"
+    "要重算請照格式打 /FCN 股票… 年利率X%"
+)
+_STOCK_BOT_PREFIXES = ("股票推薦：", "股票評估：")
+_FCN_BOT_PREFIX = "FCN 評估"
+
+
+def _stock_command_body(text: str | None, message) -> str | None:
+    """「/股票 …」「/股票推薦」後面的字；長度上限在 stock_picks。"""
+    return _command_body(text, message, _STOCK_COMMAND_RE, "股票", "stock")
+
+
+def _investment_command(text: str | None, message) -> tuple[str, str] | None:
+    """路由與入站 recall 共用的偵測：("fcn"|"stock", 指令後面的字)，不是投資指令回 None。"""
+    body = _fcn_command_body(text, message)
+    if body is not None:
+        return "fcn", body
+    body = _stock_command_body(text, message)
+    if body is not None:
+        return "stock", body
+    return None
+
+
+def _handle_stock_command(event, body: str) -> tuple[str | None, dict | None, str | None, str]:
+    """回 (文字, 卡片, 卡片 altText, 卡片送不出去時的固定句)；stock_picks 不能 import 或出錯時回固定句。"""
+    try:
+        import stock_picks
+
+        reply = stock_picks.handle(body, deadline=_media_reply_deadline(event))
+    except Exception as exc:
+        logger.error("stock picks failed error_type=%s", type(exc).__name__)
+        return _STOCK_FAILURE_TEXT, None, None, _STOCK_FAILURE_TEXT
+    fallback = reply.fallback_text or _STOCK_FAILURE_TEXT
+    if reply.flex is not None and reply.alt_text:
+        return None, reply.flex, reply.alt_text, fallback
+    return reply.text or _STOCK_FAILURE_TEXT, None, None, fallback
+
+
+def _reply_stock_picks(event, group_id: str, text: str, body: str) -> None:
+    reply_text, card, alt_text, fallback = _handle_stock_command(event, body)
+    _reply_command_card(
+        event, group_id, text, reply_text=reply_text, card=card, alt_text=alt_text, fallback_text=fallback
+    )
+
+
+def _quoted_bot_investment_kind(event, group_id: str) -> str | None:
+    """這則訊息引用的是同群組裡 bot 發的投資卡片或回覆時回 "stock"／"fcn"，否則 None。
+    引用 ID 照 `_build_quoted_block` 的找法（訊息上的，或持久化的引用關係）。查不到就不算。"""
+    message = getattr(event, "message", None)
+    try:
+        quoted_id = getattr(message, "quoted_message_id", None)
+        if not isinstance(quoted_id, str) or not quoted_id:
+            quoted_id = memory.get_quoted_message_id(group_id, getattr(message, "id", None))
+        if not quoted_id:
+            return None
+        row = memory.get_raw_message(group_id, quoted_id)
+    except Exception as exc:
+        logger.warning("investment quote lookup failed error_type=%s", type(exc).__name__)
+        return None
+    if not row or row[0] != "__bot__":
+        return None
+    quoted = str(row[1] or "").lstrip()
+    if quoted.startswith(_STOCK_BOT_PREFIXES):
+        return "stock"
+    if quoted.startswith(_FCN_BOT_PREFIX):
+        return "fcn"
+    return None
+
+
+def _reply_investment_quote_notice(event, group_id: str, kind: str) -> None:
+    _clear_reply_mention_targets(event.reply_token)
+    _reply(
+        event.reply_token,
+        _FCN_QUOTE_TEXT if kind == "fcn" else _INVESTMENT_QUOTE_TEXT,
+        group_id=group_id,
+        allow_push_fallback=False,
+        index_for_recall=False,
+    )
+
+
+def _reply_command_card(
+    event,
+    group_id: str,
+    text: str,
+    *,
+    reply_text: str | None,
+    card: dict | None,
+    alt_text: str | None,
+    fallback_text: str,
+) -> None:
+    """FCN 與股票推薦共用的回覆：只用 reply token、不進 recall、不提及任何人（清掉這則訊息
+    登記的 mention）；按選單按鈕來的（卡片或文字）都再掛選單。
+
+    送卡前先驗 altText 不會被改寫、卡片上每個字都過 outbound validator；驗不過就用同一個
+    token 回固定句（`_reply` 回 False 也可能是 LINE 400 或靜音，不能拿來判斷要不要補句）。
+    """
+    _clear_reply_mention_targets(event.reply_token)
+    menu_buttons = _is_menu_button_text(text)
+    if card is not None and alt_text:
+        try:
+            if _prepare_outbound_text(alt_text, source="reply") != alt_text:
+                raise ValueError("command card altText would be rewritten")
+            _validated_flex_card_message(alt_text, card)
+        except Exception as exc:
+            logger.error(
+                "command card rejected before send group=%s error_type=%s", group_id, type(exc).__name__
+            )
+            card, reply_text = None, fallback_text
+    if card is not None and alt_text:
+        _reply(
+            event.reply_token,
+            alt_text,
+            group_id=group_id,
+            flex_card=card,
+            menu_buttons=menu_buttons,
+            index_for_recall=False,
+        )
         return
     _reply(
         event.reply_token,
-        reply_text,
+        reply_text or fallback_text,
         group_id=group_id,
         allow_push_fallback=False,
-        menu_buttons=_is_menu_button_text(text),
+        menu_buttons=menu_buttons,
         index_for_recall=False,
     )
 
 
 _FLEX_CARD_FORBIDDEN_KEYS = frozenset({"uri", "url", "data", "altUri"})
+_FLEX_CARD_NODE_TYPES = frozenset({"carousel", "bubble", "box", "text", "button", "separator", "filler"})
 
 
 def _flex_card_texts(node) -> list[str]:
-    """FCN 卡片的結構白名單：action 只能是 message、不能有網址或 postback；回傳所有要驗的字。"""
+    """指令卡片（FCN、股票推薦）的結構白名單：節點型別只能是 carousel／bubble／box／text／
+    button／separator／filler（span 等其他型別的字不會被檢查，一律拒絕）；action 只能是
+    message、不能有網址或 postback。回傳所有要驗的字。"""
     texts: list[str] = []
     if isinstance(node, dict):
         if _FLEX_CARD_FORBIDDEN_KEYS & set(node):
             raise ValueError("flex card contains a forbidden key")
+        node_type = node.get("type")
+        if node_type is not None and node_type not in _FLEX_CARD_NODE_TYPES:
+            raise ValueError("flex card contains an unsupported node type")
         action = node.get("action")
         if action is not None:
             if not isinstance(action, dict) or action.get("type") != "message":
@@ -20861,6 +21028,11 @@ _HELP_TEXT = (
     "  /行事曆                 列出未來 30 天的家族活動\n"
     "  /取消活動 <關鍵字>      取消含關鍵字的活動\n"
     "【投資】\n"
+    "  /股票                   台股推薦：點選單「📈 股票推薦」或打 /股票，回一組卡片，\n"
+    "                          往左滑看下一張（推薦最多 3 檔，最後一張是 0050、台積電）\n"
+    "  /股票 代號或名稱        看一檔的燈號和理由，例：/股票 2330、/股票 聯發科\n"
+    "                          常問股卡上的「看…細節」按鈕也一樣；每天自動更新，卡片寫資料日期\n"
+    "                          用公開數字篩選，只供參考，不是買賣指示\n"
     "  /FCN                    FCN 評估怎麼用（選單「🧾 FCN評估」也可以）\n"
     "  /FCN 股票… 年利率X%     評估銀行 FCN 的 CP值，例：/FCN NVDA AMD TSLA 年利率18%\n"
     "                          1–4 檔，代號或中文名都可以；期限沒寫當 6 個月，\n"
@@ -21651,12 +21823,13 @@ def _reply(
     ``menu_buttons``（按了選單按鈕的回覆）：選單的 Quick Reply 再掛到這次回覆的
     最後一則上，連續點下一顆不用重打「選單」；搭車的提醒照送（2026-10-07）。
 
-    ``flex_card``（FCN 評估卡，2026-10-09）：主訊息是這張 Flex 卡，``text`` 傳 altText。
-    規則同大字選單（不搭到期提醒、不 push fallback、組卡失敗不送並結案），另外 altText
-    與卡片上每個字都要原樣通過 outbound validator、action 只能是 message。全程式只有
-    FCN 一個呼叫點；不能和 menu_card／large_menu_card 一起用。
+    ``flex_card``（FCN 評估卡 2026-10-09、股票推薦卡 2026-10-10）：主訊息是這張 Flex 卡，
+    ``text`` 傳 altText。規則同大字選單（不搭到期提醒、不 push fallback、組卡失敗不送並結案），
+    另外 altText 與卡片上每個字都要原樣通過 outbound validator、節點型別與 action 走白名單。
+    全程式只有 `_reply_command_card` 一個呼叫點（FCN 與股票推薦共用，送前先驗、驗不過回固定句）；
+    不能和 menu_card／large_menu_card 一起用。
 
-    ``index_for_recall``：False 時 bot 的這則回覆存檔但不進 recall 索引（FCN 用）。
+    ``index_for_recall``：False 時 bot 的這則回覆存檔但不進 recall 索引（FCN、股票推薦用）。
     """
     if flex_card is not None and (menu_card or large_menu_card):
         logger.error("flex_card cannot be combined with menu cards group=%s", group_id)

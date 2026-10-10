@@ -55,6 +55,8 @@ SHIPPED_BUTTON_TEXTS = (
     "/規則",
     # 2026-10-09：FCN 評估（路由測試在 test_fcn_routing.py）。
     "/FCN",
+    # 2026-10-10：股票推薦（路由測試在 test_stock_routing.py）。
+    "/股票",
 )
 
 # 指令型按鈕 → 應該接手的既有處理函式。/help 與晚餐推薦另有專門測試。
@@ -141,12 +143,12 @@ def test_every_button_text_is_recorded_as_shipped():
 
 
 def test_every_shipped_text_has_a_routing_test():
-    assert set(SHIPPED_BUTTON_TEXTS) == set(_COMMAND_ROUTES) | {"/help", "今晚吃什麼？", "/FCN"}
+    assert set(SHIPPED_BUTTON_TEXTS) == set(_COMMAND_ROUTES) | {"/help", "今晚吃什麼？", "/FCN", "/股票"}
 
 
 def test_menu_respects_line_quick_reply_limits():
     items = flex_menu.menu_message().to_dict()["quickReply"]["items"]
-    assert len(items) == len(flex_menu.BUTTONS) == 12
+    assert len(items) == len(flex_menu.BUTTONS) == 13
     assert len(items) <= QUICK_REPLY_MAX_ITEMS
     for item in items:
         action = item["action"]
@@ -293,7 +295,18 @@ def test_fcn_button_has_text_and_is_in_both_menus():
     large = json.dumps(flex_menu.build_large_menu(), ensure_ascii=False)
     assert '"label": "🧾 FCN評估"' in large and '"text": "/FCN"' in large
     labels = [label for label, _text in flex_menu.BUTTONS]
-    assert labels.index("🧾 FCN評估") == labels.index("💬 財經觀點") + 1
+    assert labels.index("🧾 FCN評估") == labels.index("📈 股票推薦") + 1
+
+
+def test_stock_button_has_text_and_is_in_both_menus():
+    """股票推薦（2026-10-10）：Andrew「命令需要同時同步到大字版和非大字版」。"""
+    quick = [item["action"] for item in flex_menu.menu_message().to_dict()["quickReply"]["items"]]
+    assert {"type": "message", "label": "📈 股票推薦", "text": "/股票"} in quick
+    large = json.dumps(flex_menu.build_large_menu(), ensure_ascii=False)
+    assert '"label": "📈 股票推薦"' in large and '"text": "/股票"' in large
+    labels = [label for label, _text in flex_menu.BUTTONS]
+    assert labels.index("📈 股票推薦") == labels.index("💬 財經觀點") + 1
+    assert "/股票" in main._HELP_TEXT and "📈 股票推薦" in main._HELP_TEXT
 
 
 def test_menu_card_has_exactly_one_call_site():
