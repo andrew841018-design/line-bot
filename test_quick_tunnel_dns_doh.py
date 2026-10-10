@@ -1,7 +1,6 @@
 import base64
 import json
 import subprocess
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest

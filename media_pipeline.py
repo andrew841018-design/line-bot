@@ -52,15 +52,16 @@ def _remaining_image_budget(deadline: float | None) -> float | None:
 
 def _extract_ocr_with_deadline(extract_text, image, timeout_sec: float):
     """Bound OCR without queuing late work; a hung call can occupy one thread only."""
-    if not _OCR_ADMISSION.acquire(blocking=False):
+    sem = _OCR_ADMISSION
+    if not sem.acquire(blocking=False):
         logger.info("OCR worker busy; continue without OCR")
         return None
     try:
         future = _OCR_EXECUTOR.submit(extract_text, image)
     except BaseException:
-        _OCR_ADMISSION.release()
+        sem.release()
         raise
-    future.add_done_callback(lambda _future: _OCR_ADMISSION.release())
+    future.add_done_callback(lambda _future: sem.release())
     try:
         return future.result(timeout=max(0.0, float(timeout_sec)))
     except FutureTimeoutError as exc:
@@ -299,7 +300,6 @@ def _alert_local_llm_down(
 
 def _dispatch_local_llm_alert(reason: str) -> threading.Thread | None:
     """Dispatch one epoch-fenced operational alert off the reply-critical path."""
-    global _local_llm_alert_dispatch_epochs
     with _LOCAL_LLM_ALERT_LOCK:
         alert_epoch = _local_llm_alert_epoch
         if (

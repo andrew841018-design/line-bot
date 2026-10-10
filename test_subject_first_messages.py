@@ -25,6 +25,10 @@ from test_quoted_reminder_reschedule import (  # noqa: F401  (fixtures)
     replies,
 )
 
+# 2026-10-10: fixed_now and replies are pytest fixtures imported for pytest
+# discovery; this reference keeps pyflakes from flagging them as unused.
+_PYTEST_FIXTURE_REEXPORTS = (fixed_now, replies)
+
 G = "G1"
 
 

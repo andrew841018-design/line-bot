@@ -9,7 +9,6 @@ stock_picks 本身的資料、快照、背景工作測試在 test_stock_picks.py
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import re
 import sys

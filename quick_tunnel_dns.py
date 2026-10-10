@@ -224,7 +224,9 @@ def _parse_srv_records(records: Iterable[str]) -> dict[str, list[str]]:
         if len(parts) != 4:
             raise BootstrapError("edge_srv_invalid")
         try:
-            _priority, _weight, port = (int(parts[0]), int(parts[1]), int(parts[2]))
+            int(parts[0])  # priority — unused but validated as int
+            int(parts[1])  # weight — unused but validated as int
+            port = int(parts[2])
         except ValueError as exc:
             raise BootstrapError("edge_srv_invalid") from exc
         target = parts[3].rstrip(".").lower()

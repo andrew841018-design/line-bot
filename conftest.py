@@ -22,8 +22,10 @@ import pathlib
 import sqlite3
 import shutil
 import tempfile
+import threading
 import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -87,6 +89,7 @@ import config  # noqa: E402
 import finance_view_db  # noqa: E402
 import gemini_client  # noqa: E402
 import main  # noqa: E402
+import media_pipeline  # noqa: E402
 import memory  # noqa: E402
 import pending_store  # noqa: E402
 
@@ -206,6 +209,27 @@ def reset_main_globals(monkeypatch):
     # monkeypatch restores it after any test's own setenv of the same variable.
     tmp_display_names = Path(tempfile.mkdtemp()) / "member_display_names.json"
     monkeypatch.setenv("LINE_MEMBER_DISPLAY_NAMES_PATH", str(tmp_display_names))
+    # 2026-10-10: the family's real user_aliases.json / family_roles.local.json
+    # must not leak into tests that expect no @ ping on the receipt (爸爸 媽媽
+    # resolve in the real file). A fixed test alias map keeps real family
+    # names unlisted while giving tests a resolvable alias so helpers that
+    # key off "有 user alias 設定" (e.g. aliases_mentioned_in_text) still work
+    # for "全家" / "測試成員甲"; tests that need their own aliases setenv
+    # their own path to override.
+    import json as _json
+    tmp_alias_dir = Path(tempfile.mkdtemp())
+    tmp_alias_path = tmp_alias_dir / "user_aliases.json"
+    tmp_alias_path.write_text(
+        _json.dumps(
+            {"U_TEST_A": "測試成員甲", "U_TEST_B": "測試成員乙"},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    tmp_role_path = tmp_alias_dir / "family_roles.local.json"
+    tmp_role_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("LINE_USER_ALIASES_PATH", str(tmp_alias_path))
+    monkeypatch.setenv("LINE_FAMILY_ROLE_ALIASES_PATH", str(tmp_role_path))
     main._member_labels.clear()
     with burst_filter._labelled_lock:
         burst_filter._labelled_texts.clear()
@@ -224,6 +248,23 @@ def reset_main_globals(monkeypatch):
     # resting (claude_client's timeout breaker) in the next.
     claude_client._cli_timeout_streak = 0
     claude_client._cli_timeout_breaker_until = 0.0
+    # 2026-10-10: media_pipeline._OCR_ADMISSION is a BoundedSemaphore(1) and
+    # _OCR_EXECUTOR is a single-worker ThreadPoolExecutor. Both leak state
+    # across tests: (a) add_done_callback(release) fires on the executor
+    # thread AFTER future.result() returns on the main thread, so a prior
+    # test can leave the semaphore at 0 for a window; (b) future.cancel()
+    # on a running task does not stop the thread, so a slow_ocr sleep
+    # stays on the executor and blocks the next test's submit. Replace
+    # both at test start; _extract_ocr_with_deadline captures sem locally
+    # so in-flight callbacks safely release the stale instance.
+    try:
+        media_pipeline._OCR_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
+    media_pipeline._OCR_ADMISSION = threading.BoundedSemaphore(1)
+    media_pipeline._OCR_EXECUTOR = ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="media-ocr"
+    )
     _configure_test_sqlite(tmp_app_db_path)
     main._quota_exhausted_until_ts = 0.0
     main._quota_notified_for_ts = 0.0

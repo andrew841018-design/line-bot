@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
@@ -46,8 +46,10 @@ def _seed_original(
     group_id: str = GROUP_ID,
     *,
     enqueue: bool = True,
+    created_at: int | None = None,
 ) -> int | None:
-    created_at = int(datetime(2026, 7, 29, 11, 27, tzinfo=TW).timestamp())
+    if created_at is None:
+        created_at = int(datetime(2026, 7, 29, 11, 27, tzinfo=TW).timestamp())
     with memory._conn() as conn:
         conn.execute(
             "INSERT INTO raw_messages"
@@ -187,7 +189,10 @@ def test_original_auto_capture_defers_to_existing_pending_worker(monkeypatch):
 def test_original_auto_capture_and_reminder_extract_leave_one_calendar_mirror(
     monkeypatch,
 ):
-    _seed_original(enqueue=False)
+    # Anchor at "tomorrow" so 8/18 rolls forward and the mirror lands in the
+    # future, past list_pending_reminders' now-24h floor regardless of today.
+    anchor = int((datetime.now(TW) + timedelta(days=1)).timestamp())
+    _seed_original(enqueue=False, created_at=anchor)
     _patch_sender_alias(monkeypatch)
     monkeypatch.setattr(
         main.gemini_client,

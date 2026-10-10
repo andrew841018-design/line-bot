@@ -21,7 +21,6 @@ import threading
 import time as _time
 import unicodedata
 import uuid
-from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -638,7 +637,11 @@ def append_turn(group_id: str, role: str, text: str) -> None:
 
 
 # 2026-10-10 review：對話紀錄裡的「誰說的」只能由程式寫（寫法見 speaker_turns）。
+# Re-exported for callers (memory.CONTINUATION_INDENT etc.); the tuple keeps
+# pyflakes from flagging them as unused imports in this module.
 from speaker_turns import CONTINUATION_INDENT, UNKNOWN_SPEAKER, one_line, speaker_turn  # noqa: E402,F401
+
+_SPEAKER_TURNS_REEXPORTS = (CONTINUATION_INDENT, UNKNOWN_SPEAKER, one_line, speaker_turn)
 
 
 def get_context(group_id: str) -> list[tuple[str, str]]:

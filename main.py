@@ -3905,6 +3905,13 @@ def _capture_calendar_events_regex_only(
                     return -1
 
         today_tw = datetime.now(ZoneInfo("Asia/Taipei")).date()
+        if message_id:
+            raw_record = memory.get_raw_message_record(group_id, message_id)
+            if raw_record:
+                today_tw = datetime.fromtimestamp(
+                    int(raw_record["created_at"]),
+                    ZoneInfo("Asia/Taipei"),
+                ).date()
         events = calendar_regex.extract_many_regex_only(
             combined_text, today_tw, require_time=True
         )
@@ -4064,7 +4071,11 @@ def _auto_capture_text_if_important(
         return False
     # Reminder-specific no-create/status/meta questions must not bypass the
     # reminder gate through calendar auto-capture and create a mirror row.
-    if _should_suppress_reminder_write(text):
+    # The intent-only mode drops semantic no-write reasons (negation, status
+    # queries, reported context, meta queries) but lets multi-event layouts
+    # ("幫我排入行程：7/5 1600 和 7/12 1800 ...") through to the downstream
+    # regex extractor, which validates each event independently.
+    if _should_suppress_reminder_write(text, intent_only=True):
         return False
     explicit_reminder_creation = _has_explicit_reminder_creation_intent(text)
     if _is_negated_reminder_request(text):
@@ -6162,6 +6173,83 @@ def _try_handle_quoted_schedule_capture(
     return True
 
 
+def _followup_multi_event_receipt(
+    group_id: str, source: dict, today_tw,
+) -> "ReminderReceipt | None":
+    """Two or more dated events in the followup source: write them as a batch."""
+    try:
+        import calendar_regex
+
+        events = calendar_regex.extract_many_regex_only(source["text"], today_tw)
+    except Exception as exc:
+        logger.warning(
+            "followup multi-event parse failed error_type=%s", type(exc).__name__
+        )
+        return None
+    items: list[dict] = []
+    for event in events or []:
+        if event.get("is_cancellation") or not event.get("has_event"):
+            continue
+        date_str = event.get("date")
+        title = (event.get("title") or "").strip()
+        if not date_str or not title:
+            continue
+        items.append({
+            "date": str(date_str),
+            "title": title,
+            "time": event.get("time"),
+            "daypart": None,
+        })
+    if len(items) < 2:
+        return None
+    return _create_schedule_reminders(
+        group_id, source["user_id"], source["message_id"], source["text"], items,
+    )
+
+
+def _followup_fallback_source(
+    group_id: str, user_id: str, current_id: str, quoted_id: str = "",
+    *, max_age: int = 180,
+) -> dict | None:
+    """Nearest prior human line in get_recent_raw_messages, used when the SQL
+    raw_messages table was never populated (callers that mock the memory API).
+
+    An explicit quoted_id is honoured by resolve_source already; its orphan
+    case must not be rescued here or a non-existent quote would silently
+    recover the adjacent human message instead.
+    """
+    if not group_id or not user_id or not current_id or user_id == "__bot__":
+        return None
+    if quoted_id:
+        return None
+    try:
+        recent = memory.get_recent_raw_messages(group_id, limit=10)
+    except Exception:
+        return None
+    cur_idx = next(
+        (i for i in range(len(recent) - 1, -1, -1) if recent[i][0] == current_id),
+        None,
+    )
+    if cur_idx is None or cur_idx == 0:
+        return None
+    cur_ts = int(recent[cur_idx][3])
+    for idx in range(cur_idx - 1, -1, -1):
+        row_id, row_user, row_text, row_ts = recent[idx]
+        if row_user == "__bot__":
+            continue
+        if row_user != user_id or not row_text:
+            return None
+        if not 0 <= cur_ts - int(row_ts) <= max_age:
+            return None
+        return {
+            "message_id": str(row_id),
+            "user_id": str(row_user),
+            "text": str(row_text),
+            "created_at": int(row_ts),
+        }
+    return None
+
+
 def _creation_followup_reply(event: MessageEvent, group_id: str, text: str) -> str | None:
     import reminder_followup
 
@@ -6180,6 +6268,11 @@ def _creation_followup_reply(event: MessageEvent, group_id: str, text: str) -> s
             group_id, user_id, str(event.message.id),
             str(getattr(event.message, "quoted_message_id", "") or ""),
         )
+        if source is None:
+            source = _followup_fallback_source(
+                group_id, user_id, str(event.message.id),
+                str(getattr(event.message, "quoted_message_id", "") or ""),
+            )
         if source and (
             not reminder_followup.source_is_safe(source["text"])
             or _should_suppress_reminder_write(source["text"], allow_weekend_clarification=True)
@@ -6190,6 +6283,12 @@ def _creation_followup_reply(event: MessageEvent, group_id: str, text: str) -> s
             reply = reminder_followup.clarification(source["text"])
             if not reminder_followup.has_weekend(source["text"]):
                 source_dt = datetime.fromtimestamp(source["created_at"], ZoneInfo("Asia/Taipei"))
+                today_tw = datetime.now(ZoneInfo("Asia/Taipei")).date()
+                multi_receipt = _followup_multi_event_receipt(
+                    group_id, source, today_tw
+                )
+                if multi_receipt is not None:
+                    return multi_receipt
                 result = _explicit_single_reminder_result(
                     "提醒我 " + source["text"], source["user_id"], now_tw=source_dt,
                 )
@@ -6753,11 +6852,17 @@ def _handle_text_message(
     # extraction.  Otherwise a question such as「明天有什麼會議」can consume
     # Gemini quota—or, on an extractor false positive, create data and reply
     # with a reminder confirmation instead of answering the query.
-    cmd_reply = _handle_command(
-        group_id,
-        text,
-        sender_user_id,
-        message_id,
+    # A parsed range reminder (「提醒我 7/16 到 7/28 ...」) is a creation
+    # intent, not a query — skip the command gate so the reminder write runs.
+    cmd_reply = (
+        None
+        if range_reminder_result is not None
+        else _handle_command(
+            group_id,
+            text,
+            sender_user_id,
+            message_id,
+        )
     )
     if cmd_reply is not None:
         burst_filter.cancel_burst(group_id)
@@ -12780,10 +12885,16 @@ def _handle_burst_flush(
     # not begun.
     context = _retryable_burst_db_call(memory.get_context, group_id)
     bare_share = _bare_link_share_urls(combined_text)
+    needs_public_research = (
+        not has_quote_context(combined_text)
+        and _requires_public_research(combined_text)
+    )
     cached = (
         None
         # A link summary cached before 2026-09-26 must not be replayed.
-        if has_quote_context(combined_text) or bare_share
+        # A current-events claim re-reads fresh sources; an older cached
+        # answer could repeat a stale price or figure (2026-10-10 review).
+        if has_quote_context(combined_text) or bare_share or needs_public_research
         else _retryable_burst_db_call(
             memory.check_fact_cache, group_id, combined_text
         )
@@ -12800,7 +12911,7 @@ def _handle_burst_flush(
     # restatement checks' source text.
 
     from types import SimpleNamespace
-    if not has_quote_context(combined_text) and _requires_public_research(combined_text):
+    if needs_public_research:
         _start_burst_finance_extraction(group_id, combined_text, message_ids)
         _handle_web_research_question(
             SimpleNamespace(
@@ -16822,8 +16933,28 @@ def _has_unsafe_single_reminder_structure(text: str) -> bool:
         return True
     if len(list(_LOCAL_REMINDER_COMMAND_RE.finditer(structure_text))) > 1:
         return True
-    if len(list(re.finditer(_CALENDAR_ABSOLUTE_DATE_PATTERN, structure_text))) > 1:
-        return True
+    # A complete trigger (absolute date + explicit clock) before the first
+    # reminder command fixes this reminder's schedule; dates after are
+    # content (e.g. "10/21 09:00 提醒我 帶 10/30 的資料"). Without that trigger,
+    # multiple absolute dates still read as competing schedules.
+    date_matches = list(re.finditer(_CALENDAR_ABSOLUTE_DATE_PATTERN, structure_text))
+    if len(date_matches) > 1:
+        command_match = _LOCAL_REMINDER_COMMAND_RE.search(structure_text)
+        prefix_has_complete_trigger = False
+        if command_match is not None:
+            prefix = structure_text[: command_match.end()]
+            prefix_has_complete_trigger = bool(
+                re.search(_CALENDAR_ABSOLUTE_DATE_PATTERN, prefix)
+                and _LOCAL_REMINDER_CLOCK_RE.search(prefix)
+            )
+        if prefix_has_complete_trigger:
+            prefix_dates = [
+                m for m in date_matches if m.end() <= command_match.end()
+            ]
+            if len(prefix_dates) > 1:
+                return True
+        else:
+            return True
     return False
 
 
@@ -18473,8 +18604,10 @@ def _resolve_claimed_pending_from_bound_event(
 
     import calendar_regex
 
+    raw_record = memory.get_raw_message_record(group_id, message_id)
+    base_ts = int(raw_record["created_at"]) if raw_record else int(row["created_at"])
     created_at = datetime.fromtimestamp(
-        int(row["created_at"]),
+        base_ts,
         ZoneInfo("Asia/Taipei"),
     )
     parsed = calendar_regex.extract_many_regex_only(
@@ -18589,9 +18722,15 @@ def _drain_pending_reminders(
             if not page:
                 break
             for row in page:
-                msg_dt = _dt.fromtimestamp(
-                    row["created_at"], ZoneInfo("Asia/Taipei")
+                raw_record = memory.get_raw_message_record(
+                    group_id, str(row.get("message_id") or "")
                 )
+                msg_ts = (
+                    int(raw_record["created_at"])
+                    if raw_record
+                    else int(row["created_at"])
+                )
+                msg_dt = _dt.fromtimestamp(msg_ts, ZoneInfo("Asia/Taipei"))
                 contextual_plan = _contextual_date_reminder_plan(
                     str(row.get("text") or ""),
                     group_id,
@@ -18630,9 +18769,15 @@ def _drain_pending_reminders(
                 break
         rows = local_rows
     for row in rows:
-        msg_dt = _dt.fromtimestamp(
-            row["created_at"], ZoneInfo("Asia/Taipei")
+        raw_record = memory.get_raw_message_record(
+            group_id, str(row.get("message_id") or "")
         )
+        msg_ts = (
+            int(raw_record["created_at"])
+            if raw_record
+            else int(row["created_at"])
+        )
+        msg_dt = _dt.fromtimestamp(msg_ts, ZoneInfo("Asia/Taipei"))
         contextual_plan = row.get("_contextual_plan")
         if contextual_plan is None:
             contextual_plan = _contextual_date_reminder_plan(
@@ -19067,7 +19212,7 @@ def _create_schedule_reminders(
     from datetime import datetime as _dt
 
     tz = ZoneInfo("Asia/Taipei")
-    now_ts = time.time()
+    now_ts = datetime.now(tz).timestamp()
     written: list[dict] = []
     for index, item in enumerate(items):
         try:

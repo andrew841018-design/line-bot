@@ -1691,7 +1691,7 @@ def test_quote_cancels_lead_time_calendar_reminder_by_exact_event_source(
         and row["source_ref"] == event_id
     )
     assert source_row["action"] == "測試成員甲負責預約7/25打羽球場地"
-    assert source_row["remind_at"] == _ts("2030-07-18 18:00")
+    assert source_row["remind_at"] == _ts("2099-07-18 18:00")
 
     _archive_bot_message(
         "lead-time-event-reminder",
@@ -1857,7 +1857,7 @@ def test_later_event_notification_can_tombstone_done_lead_time_source(
     assert memory.mark_reminder_pushed(source_row["reminder_id"], "now")
     assert _status(source_row["reminder_id"]) == "done"
 
-    monkeypatch.setattr(calendar_db, "_today_tw", lambda: date(2030, 7, 22))
+    monkeypatch.setattr(calendar_db, "_today_tw", lambda: date(2099, 7, 22))
     assert [
         event["event_id"]
         for event in calendar_db.list_due_for_reminder("G1", days_ahead=3)
@@ -1935,7 +1935,7 @@ def test_historical_natural_message_id_pivots_to_done_calendar_source(
             (source_row["reminder_id"],),
         )
 
-    monkeypatch.setattr(calendar_db, "_today_tw", lambda: date(2030, 7, 22))
+    monkeypatch.setattr(calendar_db, "_today_tw", lambda: date(2099, 7, 22))
     assert [
         event["event_id"]
         for event in calendar_db.list_due_for_reminder("G1", days_ahead=3)
@@ -1977,7 +1977,7 @@ def test_pasted_done_natural_reminder_tombstones_calendar_source(monkeypatch):
     )
     assert memory.mark_reminder_pushed(source_row["reminder_id"], "now")
     assert _status(source_row["reminder_id"]) == "done"
-    monkeypatch.setattr(calendar_db, "_today_tw", lambda: date(2030, 7, 22))
+    monkeypatch.setattr(calendar_db, "_today_tw", lambda: date(2099, 7, 22))
     assert [
         event["event_id"]
         for event in calendar_db.list_due_for_reminder("G1", days_ahead=3)
