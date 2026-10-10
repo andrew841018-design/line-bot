@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import random
+import unicodedata
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
@@ -254,6 +255,45 @@ def test_shipped_list_loads_every_entry_with_two_sites():
     assert len(places) == len(entries)
     for place in places:
         assert len(dp._source_sites(place.sources)) >= dp.MIN_SOURCES, place.name
+
+
+# 2026-10-10：清單的 avoid 是本清單不收的店名，店名含其中任一詞就不收（分店也算）。這 7 個不能拿掉。
+_NOT_ON_THE_LIST = ("龍門客棧", "和園", "忠青商行", "雙月", "鬍鬚張", "基隆麵食館", "雞肉本家")
+
+
+def _plain(text: str) -> str:
+    """比對店名用：全形半形統一、去掉空白與看不見的字元（格式字元、異體字選擇符）、麺／麪當麵、舘當館、鶏／鷄當雞。"""
+    text = unicodedata.normalize("NFKC", text)
+    text = "".join(ch for ch in text if not ch.isspace() and unicodedata.category(ch) not in ("Cf", "Mn"))
+    for old, new in (("麺", "麵"), ("麪", "麵"), ("舘", "館"), ("鶏", "雞"), ("鷄", "雞")):
+        text = text.replace(old, new)
+    return text
+
+
+def test_shipped_list_has_no_avoided_place():
+    path = Path(dp.__file__).with_name("dinner_places.json")
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    avoid = raw["avoid"]
+    assert set(_NOT_ON_THE_LIST) <= set(avoid)
+    assert all(isinstance(word, str) and _plain(word) for word in avoid)
+    for entry in raw["places"]:
+        assert not [word for word in avoid if _plain(word) in _plain(entry["name"])], entry["name"]
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["基隆麺食館", "基隆麪食舘", "鶏肉本家 二店", "忠青\u200b商行", "和\u3000園小館", "\uf9c4門客棧",
+     "龍\ufe00門客棧"],
+)
+def test_spelling_variants_of_an_avoided_name_still_match(name):
+    assert [word for word in _NOT_ON_THE_LIST if _plain(word) in _plain(name)]
+
+
+def test_shipped_list_tags_are_ones_the_filters_know():
+    # 口味篩選只認 _TAG_WORDS 的 key：寫成「小吃」「便當」的店，「想吃台式」永遠選不到。
+    places, _max_age = dp.load(Path(dp.__file__).with_name("dinner_places.json"))
+    for place in places:
+        assert place.tags and set(place.tags) <= set(dp._TAG_WORDS), (place.name, place.tags)
 
 
 @pytest.mark.parametrize(
