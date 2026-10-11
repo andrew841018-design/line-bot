@@ -263,37 +263,6 @@ def test_the_facts_heading_names_people_not_users():
     assert "只用在那個人身上" in system
 
 
-@pytest.mark.parametrize(
-    ("fact", "parsed"),
-    [
-        ("成員丁生日：02/04（國曆）", ("成員丁", 2, 4)),
-        ("成員甲：成員丁生日：3/5", ("成員丁", 3, 5)),
-        ("成員甲：生日：3/5", ("成員甲", 3, 5)),
-        ("成員甲：我生日：3/5", ("成員甲", 3, 5)),
-        ("成員甲：我的生日：3/5", ("成員甲", 3, 5)),
-        ("成員甲：自己生日：3/5", ("成員甲", 3, 5)),
-        ("使用者生日當月收到餐廳的生日小蛋糕", None),
-        # 2026-10-10 review：不知道是誰的生日就不列；事實寫出主角的照常列
-        ("（不確定是誰）：我生日：3/5", None),
-        ("不確定是誰：我的生日：3/5", None),
-        ("（不確定是誰）：生日是3月5日", None),
-        ("（不確定是誰）：媽媽生日：3/5", ("媽媽", 3, 5)),
-        # 2026-10-10 review：新的記憶抽取寫「生日是／生日在」，日期也可能是「M月D日／M月D號」
-        ("成員甲：生日是3月5日", ("成員甲", 3, 5)),
-        ("成員甲：生日在 3/5", ("成員甲", 3, 5)),
-        ("成員甲：生日是12月25號", ("成員甲", 12, 25)),
-        ("成員甲：生日：3月5日", ("成員甲", 3, 5)),
-        ("成員甲：我的生日是3月5日", ("成員甲", 3, 5)),
-        ("成員甲：成員丁的生日是3月5日", ("成員丁", 3, 5)),
-        ("成員甲：生日在下個月", None),
-    ],
-)
-def test_birthday_briefing_reads_labelled_facts(fact, parsed):
-    import daily_briefing_discord as briefing
-
-    assert briefing.birthday_from_fact(fact) == parsed
-
-
 def test_private_facts_are_never_kept(monkeypatch):
     monkeypatch.setattr(main, "_gemini_side_task_allowed", lambda *_a, **_k: True)
     monkeypatch.setattr(memory, "bump_and_should_extract", lambda _g: True)
@@ -486,25 +455,6 @@ def test_a_research_turn_must_be_text():
 
     event = SimpleNamespace(memory_turn=MagicMock(), source=SimpleNamespace(user_id="U_A"))
     assert main._research_turn(G, "補助是真的嗎", event) == "成員甲：補助是真的嗎"
-
-
-
-@pytest.mark.parametrize(
-    ("fact", "parsed"),
-    [("成員甲：農曆生日是8月15日", None), ("成員甲：國曆生日是3/5", ("成員甲", 3, 5)),
-     ("成員甲：身分證上的生日是3/5", ("成員甲", 3, 5)), ("成員甲：我媽生日是4/1", None),
-     ("成員甲：生日是1990/3/5", ("成員甲", 3, 5)), ("成員甲：生日：民國79年3月5日", ("成員甲", 3, 5)),
-     ("成員甲：生日為3月5日", ("成員甲", 3, 5)), ("成員甲：生日是在3/5", ("成員甲", 3, 5)),
-     ("成員甲：生日是13/40", None), ("成員甲：生日 3/5", ("成員甲", 3, 5)),
-     ("成員甲：生日是8/15(農曆)", None),
-     # 句子裡有「農曆」就不當國曆（「喜歡過農曆新年」也會被略過，寧可少列）
-     ("成員甲：生日是3/5，喜歡過農曆新年", None)],
-)
-def test_birthday_briefing_skips_lunar_and_other_peoples_dates(fact, parsed):
-    # 2026-10-10 review（第三輪）：「農曆」「國曆」「我媽」不是主角；農曆日期不能當國曆提醒。
-    import daily_briefing_discord
-
-    assert daily_briefing_discord.birthday_from_fact(fact) == parsed
 
 
 @pytest.mark.parametrize("sep", ["\r", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"])

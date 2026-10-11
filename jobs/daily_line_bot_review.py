@@ -15,7 +15,6 @@ import re
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -339,7 +338,6 @@ def run_local_checks() -> list[CheckResult]:
     py_compile_targets = [
         "main.py",
         "gemini_client.py",
-        "daily_briefing_discord.py",
         "memory.py",
         "media_pipeline.py",
         "vision_common.py",
@@ -453,44 +451,6 @@ def run_lifecycle_sidecar(timeout_s: int = 180) -> LifecycleResult:
     if completed.returncode != 0 and not sanitized_agents:
         error = _sanitize(completed.stderr or completed.stdout, limit=180)
     return LifecycleResult(True, completed.returncode, sanitized_agents, error)
-
-
-def _extract_suggestion(rendered: str) -> dict[str, str]:
-    text = _sanitize(rendered, limit=600)
-    marker = "LINE bot 每日推薦"
-    if marker not in text:
-        return {"title": "LINE bot 每日推薦", "reason": text[:160]}
-    _, tail = text.split(marker, 1)
-    tail = tail.lstrip("*：: -")
-    if "—" in tail:
-        title, reason = tail.split("—", 1)
-    elif "-" in tail:
-        title, reason = tail.split("-", 1)
-    else:
-        title, reason = tail, ""
-    return {
-        "title": _sanitize(title.strip(" ：:*"), limit=48),
-        "reason": _sanitize(reason.strip(), limit=160),
-    }
-
-
-def build_feature_suggestion(*, record_history: bool = True) -> dict[str, str]:
-    import daily_briefing_discord as dbd
-
-    if record_history:
-        rendered = dbd.line_bot_suggestions(use_ai=False)
-    else:
-        with tempfile.TemporaryDirectory(prefix="daily_line_bot_review_") as tmp:
-            rendered = dbd.line_bot_suggestions(
-                history_path=Path(tmp) / "suggestion_history.json",
-                use_ai=False,
-            )
-    suggestion = _extract_suggestion(rendered)
-    if not suggestion["title"]:
-        suggestion["title"] = "群聊需求雷達"
-    if not suggestion["reason"]:
-        suggestion["reason"] = "根據近期群聊訊號，每天抽一個最值得做的 LINE bot 功能缺口。"
-    return suggestion
 
 
 def _agent_status_line(result: LifecycleResult) -> str:

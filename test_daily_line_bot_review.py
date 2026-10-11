@@ -57,14 +57,6 @@ def _patch_success(monkeypatch):
             ],
         ),
     )
-    monkeypatch.setattr(
-        dlbr,
-        "build_feature_suggestion",
-        lambda record_history=True: {
-            "title": "圖片收據到期提醒",
-            "reason": "近期群聊若貼帳單或收據，bot 可抽出金額、期限與提醒。",
-        },
-    )
 
 
 def test_local_checks_include_bounded_github_privacy_audit(monkeypatch):
@@ -116,11 +108,6 @@ def test_main_dry_run_skips_external_sidecar(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         dlbr,
-        "build_feature_suggestion",
-        lambda record_history=True: {"title": "本地建議", "reason": "dry-run 不外送。"},
-    )
-    monkeypatch.setattr(
-        dlbr,
         "_send_discord",
         lambda msg: (_ for _ in ()).throw(AssertionError("sent")),
     )
@@ -152,11 +139,6 @@ def test_main_sends_discord_in_normal_mode(tmp_path, monkeypatch):
 def test_scheduled_review_never_builds_a_feature_proposal(tmp_path, monkeypatch):
     _patch_state(monkeypatch, tmp_path)
     _patch_success(monkeypatch)
-    monkeypatch.setattr(
-        dlbr,
-        "build_feature_suggestion",
-        lambda **kwargs: (_ for _ in ()).throw(AssertionError("proposal builder ran")),
-    )
     sent = []
     monkeypatch.setattr(dlbr, "_send_discord", lambda msg: sent.append(msg) or True)
 
@@ -180,11 +162,6 @@ def test_attention_delivery_is_successful_execution_with_truthful_outcome(
         dlbr,
         "run_lifecycle_sidecar",
         lambda timeout_s=180: dlbr.LifecycleResult(True, 0, []),
-    )
-    monkeypatch.setattr(
-        dlbr,
-        "build_feature_suggestion",
-        lambda **kwargs: (_ for _ in ()).throw(AssertionError("proposal builder ran")),
     )
     sent = []
     monkeypatch.setattr(dlbr, "_send_discord", lambda msg: sent.append(msg) or True)
@@ -584,14 +561,6 @@ def test_report_output_redacts_raw_chat_and_line_user_ids(tmp_path, monkeypatch,
             agents=[{"name": raw_user, "status": "completed-with-output"}],
         ),
     )
-    monkeypatch.setattr(
-        dlbr,
-        "build_feature_suggestion",
-        lambda record_history=True: {
-            "title": f"{raw_user} 文件整理",
-            "reason": raw_chat * 8,
-        },
-    )
 
     sent = []
     monkeypatch.setattr(dlbr, "_send_discord", lambda msg: sent.append(msg) or True)
@@ -605,23 +574,6 @@ def test_report_output_redacts_raw_chat_and_line_user_ids(tmp_path, monkeypatch,
         assert raw_user not in text
         assert (raw_chat * 2) not in text
     assert dlbr._sanitize("C" + "a" * 32) == "C***"
-
-
-def test_build_feature_suggestion_forces_local_only(monkeypatch):
-    import daily_briefing_discord as dbd
-
-    calls = []
-
-    def fake_line_bot_suggestions(**kwargs):
-        calls.append(kwargs)
-        return "💡 **LINE bot 每日推薦**：本地候選 — 不送近期聊天到外部 AI。"
-
-    monkeypatch.setattr(dbd, "line_bot_suggestions", fake_line_bot_suggestions)
-
-    suggestion = dlbr.build_feature_suggestion(record_history=False)
-
-    assert suggestion["title"] == "本地候選"
-    assert calls and calls[0]["use_ai"] is False
 
 
 def test_sanitize_redacts_common_secret_shapes():

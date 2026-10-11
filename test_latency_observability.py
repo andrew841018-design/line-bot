@@ -94,18 +94,6 @@ def test_health_check_429_grep_still_counts_today_only(tmp_path):
     assert result.stdout.strip() == "1"
 
 
-def test_daily_briefing_still_tells_error_lines_from_info_lines():
-    import daily_briefing_discord as dbd
-
-    fmt = main._DualTZFormatter(_LOG_FORMAT)
-    error_line = fmt.format(_record(_FIXED_TS, 42.0, logging.ERROR, "synthetic failure"))
-    info_line = fmt.format(_record(_FIXED_TS, 42.0, logging.INFO, "synthetic progress"))
-
-    assert " ERROR " in error_line
-    assert dbd._is_real_error(error_line) is True
-    assert dbd._is_real_error(info_line) is False
-
-
 # ── 2. LINE accepted the reply ───────────────────────────────────────────────
 
 def _back_date(token: str, seconds: float) -> None:
