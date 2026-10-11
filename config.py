@@ -184,6 +184,12 @@ class Settings(BaseSettings):
     fact_extract_every: int = 10
     # 最多注入 prompt 的事實數量
     max_facts_in_prompt: int = 20
+    # 2026-10-11 每日記憶：每人最多幾條事實（fact_store，預設 60），以及
+    # LINE_BOT_INLINE_FACT_EXTRACT=0 關掉回覆前的即時抽取（每日 job 成為唯一的寫入者）。
+    # 用的地方先看環境變數（main.py 匯入時已把 .env 載入），沒有才看這裡；改 .env 要重啟
+    # uvicorn。存成字串、用的地方再解析：.env 打錯不會讓整個 bot 起不來。
+    facts_per_person_max_raw: str = Field(default="", validation_alias="LINE_BOT_FACTS_PER_PERSON_MAX")
+    inline_fact_extract_raw: str = Field(default="", validation_alias="LINE_BOT_INLINE_FACT_EXTRACT")
 
     # ── Mute 開關 ─────────────────────────────────────────────────────────────
     # True = 不對 LINE 送出任何回覆（webhook 照收、Gemini 照跑、log 照寫，只是不 push）

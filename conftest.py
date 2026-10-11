@@ -77,6 +77,20 @@ _POST_TEST_SQLITE_PATH = Path(tempfile.gettempdir()) / (
     f"line_bot_pytest_quarantine_{os.getpid()}.db"
 )
 os.environ["SQLITE_PATH"] = str(_POST_TEST_SQLITE_PATH)
+# 2026-10-11 每日記憶：每個測試另有自己的路徑（isolate_daily_memory）；這裡是測試之間、
+# 以及測試結束後還在跑的背景執行緒用的隔離路徑——絕不落回正式 state/ 的 ledger 或 HMAC 金鑰
+# （金鑰指紋記在 DB 裡，隔離的 DB 要配隔離的金鑰）。
+_POST_TEST_DAILY_MEMORY_DIR = Path(tempfile.gettempdir()) / (
+    f"line_bot_pytest_quarantine_{os.getpid()}_daily_memory"
+)
+for _env_name, _leaf in (
+    ("LINE_BOT_FACT_LEDGER_PATH", "fact_ledger.jsonl"),
+    ("LINE_BOT_DAILY_MEMORY_STATE_DIR", "state"),
+    ("LINE_BOT_PRIVACY_TERMS_PATH", "privacy_terms.txt"),
+    ("LINE_BOT_FACT_LOCK_DIR", "locks"),
+    ("LINE_BOT_FACT_HASH_KEY_PATH", "fact_hash.key"),
+):
+    os.environ[_env_name] = str(_POST_TEST_DAILY_MEMORY_DIR / _leaf)
 
 # PySpark needs to know the venv Python (system Python default breaks Java workers)
 import sys as _sys
@@ -370,6 +384,42 @@ def block_external_side_effects(monkeypatch, request):
 
     monkeypatch.setattr(safe_fetch, "_resolve", _no_lookup)
     monkeypatch.setattr(safe_fetch, "is_public_ip", lambda _ip: False)
+
+
+_DAILY_MEMORY_ENV_KNOBS = (
+    "LINE_BOT_DAILY_MEMORY",
+    "LINE_BOT_DAILY_MEMORY_BACKEND",
+    "LINE_BOT_DAILY_MEMORY_MODEL",
+    "LINE_BOT_FACTS_PER_PERSON_MAX",
+    "LINE_BOT_INLINE_FACT_EXTRACT",
+    "LINE_BOT_FACT_DEDUPE_HIGH",
+    "LINE_BOT_FACT_DEDUPE_LOW",
+)
+
+
+@pytest.fixture(autouse=True)
+def isolate_daily_memory(monkeypatch, tmp_path_factory):
+    """2026-10-11 每日記憶：ledger、job 狀態、隱私詞清單（空檔）、鎖、HMAC 金鑰一律指到
+    這個測試自己的暫存目錄——正式 state/fact_ledger.jsonl 不能多出測試的列（回滾會照它刪），
+    也不讀本機真實的隱私詞。fact_store 預設不用嵌入模型（要用的測試自己注入假模型，
+    不載入 MiniLM）。開關與門檻不吃部署環境（.env 或 job 的 load_dotenv）帶進來的值。"""
+    base = tmp_path_factory.mktemp("daily_memory")
+    terms = base / "privacy_terms.txt"
+    terms.write_text("", encoding="utf-8")
+    monkeypatch.setenv("LINE_BOT_FACT_LEDGER_PATH", str(base / "fact_ledger.jsonl"))
+    monkeypatch.setenv("LINE_BOT_DAILY_MEMORY_STATE_DIR", str(base / "state"))
+    monkeypatch.setenv("LINE_BOT_PRIVACY_TERMS_PATH", str(terms))
+    monkeypatch.setenv("LINE_BOT_FACT_LOCK_DIR", str(base / "locks"))
+    monkeypatch.setenv("LINE_BOT_FACT_HASH_KEY_PATH", str(base / "fact_hash.key"))
+    for name in _DAILY_MEMORY_ENV_KNOBS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(config.settings, "facts_per_person_max_raw", "", raising=False)
+    monkeypatch.setattr(config.settings, "inline_fact_extract_raw", "", raising=False)
+    try:
+        import fact_store
+    except Exception:  # fact_store 自己壞了：只讓它的測試失敗
+        return
+    monkeypatch.setattr(fact_store, "loaded_embedder", lambda: None)
 
 
 @pytest.fixture(autouse=True)

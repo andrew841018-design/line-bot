@@ -60,6 +60,21 @@ class ClaudeCliLimitReached(ClaudeQuotaExhausted):
         self.until = until
 
 
+class ClaudeCliTimeout(ClaudeProviderError):
+    """complete_json: the CLI did not finish in time (replies keep their own handling)."""
+
+
+class ClaudeCliFailed(ClaudeProviderError):
+    """complete_json: the CLI exited non-zero for a reason other than a usage limit.
+
+    ``kind`` is auth / model / usage / other (``_cli_failure_kind``), never CLI output.
+    """
+
+    def __init__(self, message: str, *, kind: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
 # claude_usage.json is read-modify-written (the gate keys next to prefer_cli);
 # webhook threads and burst timers share this process.
 _STATE_LOCK = threading.Lock()
@@ -508,6 +523,56 @@ def _record_cli_outcome(started: float, outcome: str) -> None:
             )
 
 
+def _cli_flags(system_prompt_path: str) -> list[str]:
+    """Arguments after the executable for every `claude -p` call.
+
+    2026-09-26: without these flags `claude -p` loaded Andrew's own Claude Code
+    setup — default opus model, hooks, CLAUDE.md, MCP servers — and replies
+    timed out after 60 s.  --safe-mode drops customisations but keeps the
+    account login (--bare would demand an API key); --setting-sources "" skips
+    user/project/local settings.  Chat text goes through stdin and a 0600 file,
+    never argv, and the session is not saved under ~/.claude.
+    """
+    return [
+        "-p",
+        "--system-prompt-file",
+        system_prompt_path,
+        "--model",
+        settings.claude_cli_model,
+        "--effort",
+        "low",
+        "--output-format",
+        "text",
+        "--safe-mode",
+        "--setting-sources",
+        "",
+        "--strict-mcp-config",
+        "--tools",
+        "",
+        "--no-session-persistence",
+    ]
+
+
+def _cli_child_env() -> dict[str, str]:
+    """The CLI child's environment.
+
+    Force account-session auth. An API key in the child environment would
+    make Claude Code charge the API account instead of Settings > Usage; the
+    bot's other credentials (Gemini, LINE, Discord…) are no business of it.
+    """
+    child_env = {
+        name: value
+        for name, value in os.environ.items()
+        if not _CHILD_SECRET_ENV_RE.search(name)
+    }
+    # 2026-10-07: each reply starts a fresh CLI, which needs no update check,
+    # telemetry or error reports on the way.  A value set on purpose (e.g. in
+    # the launchd plist) wins; Andrew's own sessions still update the install.
+    child_env.setdefault("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+    child_env.setdefault("DISABLE_AUTOUPDATER", "1")
+    return child_env
+
+
 def _chat_via_cli(
     user_input: Any,
     context: list[tuple[str, str]],
@@ -521,26 +586,8 @@ def _chat_via_cli(
     if prompt_parts is None:
         return None
     system_prompt, user_prompt = prompt_parts
-    # Force account-session auth. An API key in the child environment would
-    # make Claude Code charge the API account instead of Settings > Usage; the
-    # bot's other credentials (Gemini, LINE, Discord…) are no business of it.
-    child_env = {
-        name: value
-        for name, value in os.environ.items()
-        if not _CHILD_SECRET_ENV_RE.search(name)
-    }
-    # 2026-10-07: each reply starts a fresh CLI, which needs no update check,
-    # telemetry or error reports on the way.  A value set on purpose (e.g. in
-    # the launchd plist) wins; Andrew's own sessions still update the install.
-    child_env.setdefault("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
-    child_env.setdefault("DISABLE_AUTOUPDATER", "1")
+    child_env = _cli_child_env()
     timeout = max(10, int(settings.claude_cli_timeout_sec))
-    # 2026-09-26: without these flags `claude -p` loaded Andrew's own Claude Code
-    # setup — default opus model, hooks, CLAUDE.md, MCP servers — and replies
-    # timed out after 60 s.  --safe-mode drops customisations but keeps the
-    # account login (--bare would demand an API key); --setting-sources "" skips
-    # user/project/local settings.  Chat text goes through stdin and a 0600 file,
-    # never argv, and the session is not saved under ~/.claude.
     _remove_stale_prompt_files()
     system_prompt_path = ""
     started = time.monotonic()
@@ -554,25 +601,7 @@ def _chat_via_cli(
         with handle:
             handle.write(system_prompt)
         completed = subprocess.run(
-            [
-                executable,
-                "-p",
-                "--system-prompt-file",
-                system_prompt_path,
-                "--model",
-                settings.claude_cli_model,
-                "--effort",
-                "low",
-                "--output-format",
-                "text",
-                "--safe-mode",
-                "--setting-sources",
-                "",
-                "--strict-mcp-config",
-                "--tools",
-                "",
-                "--no-session-persistence",
-            ],
+            [executable, *_cli_flags(system_prompt_path)],
             input=user_prompt,
             check=False,
             text=True,
@@ -627,6 +656,88 @@ def _chat_via_cli(
         return ""
     _record_cli_outcome(started, "ok")
     logger.info("primary reply provider=claude-cli")
+    return text
+
+
+def complete_json(system_prompt: str, user_prompt: str, *, timeout_s: float) -> str:
+    """One isolated `claude -p` call for a batch job; returns the printed text.
+
+    2026-10-11 每日記憶 (jobs/daily_memory.py): the same flags and child
+    environment as replies; the system prompt goes through a 0600 file removed
+    afterwards, the material through stdin.  A usage limit raises
+    ClaudeQuotaExhausted and opens the shared cooldown; no CLI raises
+    ClaudeCliUnavailable; a timeout raises ClaudeCliTimeout and any other
+    non-zero exit ClaudeCliFailed (with ``kind``), both ClaudeProviderError.
+    It never touches ``prefer_cli`` or the reply path's timeout breaker, and
+    never logs the prompt or the output.  The CLI has no temperature flag, so
+    a retried batch is not deterministic (2026-10-11: accepted; the job keys
+    its retries by chunk, not by output).
+    """
+    executable = _cli_executable()
+    if not executable:
+        raise ClaudeCliUnavailable("claude CLI not found")
+    timeout = max(10, int(timeout_s))
+    _remove_stale_prompt_files()
+    system_prompt_path = ""
+    started = time.monotonic()
+    try:
+        fd, system_prompt_path = tempfile.mkstemp(prefix=_PROMPT_FILE_PREFIX, suffix=".txt")
+        try:
+            handle = os.fdopen(fd, "w", encoding="utf-8")
+        except BaseException:
+            os.close(fd)
+            raise
+        with handle:
+            handle.write(system_prompt)
+        completed = subprocess.run(
+            [executable, *_cli_flags(system_prompt_path)],
+            input=user_prompt,
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            env=_cli_child_env(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        logger.info("claude cli json secs=%.2f outcome=timeout", time.monotonic() - started)
+        raise ClaudeCliTimeout(f"CLI timeout after {timeout}s") from exc
+    except (OSError, ValueError) as exc:
+        raise ClaudeCliUnavailable(type(exc).__name__) from exc
+    finally:
+        if system_prompt_path:
+            try:
+                os.unlink(system_prompt_path)
+            except OSError as exc:
+                logger.warning("claude prompt file not removed error_type=%s", type(exc).__name__)
+    stdout = completed.stdout or ""
+    stderr = completed.stderr or ""
+    text = stdout.strip()
+    try:
+        if completed.returncode != 0:
+            if _stderr_reports_limit(stderr) or any(
+                _is_limit_notice_line(line) for line in stdout.splitlines()
+            ):
+                raise ClaudeCliLimitReached(
+                    f"CLI usage limit (exit {completed.returncode})",
+                    until=_cli_limit_until(stderr, time.time()),
+                )
+            detail = (stderr or stdout or "CLI failed").strip()
+            if _quota_error(completed.returncode, detail):
+                raise ClaudeQuotaExhausted(f"CLI quota or rate limit (exit {completed.returncode})")
+            kind = _cli_failure_kind(detail)
+            raise ClaudeCliFailed(f"CLI exit {completed.returncode} ({kind})", kind=kind)
+        if _is_limit_notice_line(text):
+            raise ClaudeCliLimitReached(
+                "CLI usage limit (exit 0)", until=_cli_limit_until(stderr, time.time())
+            )
+    except ClaudeQuotaExhausted as exc:
+        logger.info("claude cli json secs=%.2f outcome=limit", time.monotonic() - started)
+        _mark_quota_exhausted(str(exc), until=getattr(exc, "until", None))
+        raise
+    except ClaudeProviderError:
+        logger.info("claude cli json secs=%.2f outcome=error", time.monotonic() - started)
+        raise
+    logger.info("claude cli json secs=%.2f outcome=ok", time.monotonic() - started)
     return text
 
 

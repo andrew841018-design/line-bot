@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -29,6 +30,7 @@ from config import settings
 from sqlite_security import connect_private_sqlite
 
 _DB_PATH = Path(settings.sqlite_path)
+logger = logging.getLogger(__name__)
 
 # sqlite3 在多 thread 寫入時需要 serialize，用一個全域 lock 最單純
 _lock = threading.Lock()
@@ -133,6 +135,17 @@ def _init_db() -> None:
                 group_id TEXT NOT NULL,
                 fact     TEXT NOT NULL,
                 PRIMARY KEY (group_id, fact)
+            );
+            CREATE TABLE IF NOT EXISTS fact_tombstones (
+                group_id   TEXT NOT NULL,
+                user_id    TEXT NOT NULL,
+                body_hash  TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (group_id, user_id, body_hash)
+            );
+            CREATE TABLE IF NOT EXISTS fact_hash_meta (
+                name  TEXT PRIMARY KEY,
+                value TEXT
             );
             CREATE TABLE IF NOT EXISTS counters (
                 group_id  TEXT PRIMARY KEY,
@@ -685,30 +698,120 @@ def fact_body(fact: str) -> str:
     return fact or ""
 
 
+_FACT_HASH_FINGERPRINT = "key_fingerprint"
+
+
+def _stored_key_fingerprint() -> str | None:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT value FROM fact_hash_meta WHERE name = ?", (_FACT_HASH_FINGERPRINT,)
+        ).fetchone()
+    return str(row[0]) if row and row[0] else None
+
+
+def fact_hash_key() -> bytes:
+    """記憶事實 HMAC（ledger、tombstone）的金鑰，和 DB 記下的指紋核對過（2026-10-11）。
+
+    - DB 沒有指紋、也沒有金鑰檔：第一次使用，建金鑰並記下指紋。
+    - DB 沒有指紋、但金鑰檔在（例如 DB 從舊備份還原）：補記指紋。
+    - DB 有指紋卻找不到金鑰檔，或指紋不同：丟 fact_hash.FactHashKeyMismatch，絕不重建——
+      重建後舊的 tombstone 和 ledger 都對不上，/忘記 過的事實會被加回來。
+    """
+    import fact_hash
+
+    stored = _stored_key_fingerprint()
+    secret = fact_hash.read_secret()
+    if secret is None:
+        if stored:
+            raise fact_hash.FactHashKeyMismatch("fact hash key file is missing")
+        secret = fact_hash.create_secret()
+    key = fact_hash.derive_key(secret)
+    current = fact_hash.fingerprint(key)
+    if stored is None:
+        with _lock, _conn() as c:
+            c.execute(
+                "INSERT OR IGNORE INTO fact_hash_meta(name, value) VALUES (?, ?)",
+                (_FACT_HASH_FINGERPRINT, current),
+            )
+        stored = _stored_key_fingerprint()
+    if stored != current:
+        raise fact_hash.FactHashKeyMismatch("fact hash key does not match the database")
+    return key
+
+
+def _tombstone_key() -> bytes | None:
+    """/忘記 tombstone 的 HMAC 金鑰；拿不到（含金鑰被換掉）時照樣刪（使用者要的是忘記），
+    只是不留 tombstone，log 只記類型。"""
+    try:
+        return fact_hash_key()
+    except Exception as exc:
+        logger.warning("fact tombstone key unavailable error_type=%s", type(exc).__name__)
+        return None
+
+
+def _tombstone_body(user_id: str, fact: str) -> str:
+    import fact_hash
+
+    return fact_hash.canonical(fact_body(fact) if user_id else fact)
+
+
+def _write_tombstones_conn(
+    c: sqlite3.Connection, group_id: str, rows: list[tuple[str, str]], key: bytes | None
+) -> None:
+    """2026-10-11 每日記憶：被 /忘記、/清除記憶 刪掉的事實留一筆 keyed hash（不留原文），
+    之後自動抽取不會再把它加回來。"""
+    if key is None or not rows:
+        return
+    import fact_hash
+
+    now = int(_time.time())
+    tombstones = []
+    for user_id, fact in rows:
+        owner = user_id or ""
+        body_hash = fact_hash.fact_hmac(group_id, owner, _tombstone_body(owner, fact), key=key)
+        tombstones.append((group_id, owner, body_hash, now))
+    c.executemany(
+        "INSERT OR IGNORE INTO fact_tombstones(group_id, user_id, body_hash, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        tombstones,
+    )
+
+
 def remove_fact(group_id: str, fact_substring: str) -> int:
     """刪除事實本體「包含該子字串」的事實，回傳刪幾筆。
 
     只比對本體：「/忘記 媽媽」不會因為開頭的稱呼就刪掉媽媽全部的事實。
+    2026-10-11：刪掉的每一條同一個 transaction 裡留 tombstone（只存 hash）。
     """
     needle = (fact_substring or "").strip()
     if not needle:
         return 0
+    key = _tombstone_key()
     with _lock, _conn() as c:
-        rows = c.execute(
-            "SELECT rowid, user_id, fact FROM facts WHERE group_id = ?", (group_id,)
-        ).fetchall()
-        # Only facts kept under a person start with their 「稱呼：」; older group
-        # facts such as 「某某生日：1/2」 are matched whole.
-        needle = needle.casefold()
-        doomed = [
-            rowid for rowid, user_id, fact in rows
-            if needle in (fact_body(fact) if user_id else fact).casefold()
-        ]
-        for start in range(0, len(doomed), 500):
-            chunk = doomed[start:start + 500]
-            c.execute(
-                f"DELETE FROM facts WHERE rowid IN ({','.join('?' * len(chunk))})", chunk
-            )
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            rows = c.execute(
+                "SELECT rowid, user_id, fact FROM facts WHERE group_id = ?", (group_id,)
+            ).fetchall()
+            # Only facts kept under a person start with their 「稱呼：」; older group
+            # facts such as 「某某生日：1/2」 are matched whole.
+            needle = needle.casefold()
+            doomed = [
+                (rowid, user_id, fact) for rowid, user_id, fact in rows
+                if needle in (fact_body(fact) if user_id else fact).casefold()
+            ]
+            _write_tombstones_conn(c, group_id, [(user_id, fact) for _rowid, user_id, fact in doomed], key)
+            rowids = [rowid for rowid, _user_id, _fact in doomed]
+            for start in range(0, len(rowids), 500):
+                chunk = rowids[start:start + 500]
+                c.execute(
+                    f"DELETE FROM facts WHERE rowid IN ({','.join('?' * len(chunk))})", chunk
+                )
+            c.execute("COMMIT")
+        except BaseException:
+            if c.in_transaction:
+                c.execute("ROLLBACK")
+            raise
         return len(doomed)
 
 
@@ -729,9 +832,59 @@ def list_facts(group_id: str, user_id: str | None = None) -> list[str]:
 
 
 def clear_facts(group_id: str) -> int:
+    """/清除記憶：刪光這個群組的事實；2026-10-11 起每一條都留 tombstone（同一個 transaction）。"""
+    key = _tombstone_key()
     with _lock, _conn() as c:
-        cur = c.execute("DELETE FROM facts WHERE group_id = ?", (group_id,))
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            rows = c.execute(
+                "SELECT user_id, fact FROM facts WHERE group_id = ?", (group_id,)
+            ).fetchall()
+            _write_tombstones_conn(c, group_id, [(user_id, fact) for user_id, fact in rows], key)
+            cur = c.execute("DELETE FROM facts WHERE group_id = ?", (group_id,))
+            c.execute("COMMIT")
+        except BaseException:
+            if c.in_transaction:
+                c.execute("ROLLBACK")
+            raise
         return cur.rowcount
+
+
+def is_fact_tombstoned(group_id: str, user_id: str, body: str, *, key: bytes | None = None) -> bool:
+    """這位家人的這條事實（本體）曾被 /忘記 或 /清除記憶 刪掉。
+
+    key 沒給就用 fact_hash_key()；金鑰讀不到或對不上就丟例外（fail closed）。
+    """
+    import fact_hash
+
+    key = key if key is not None else fact_hash_key()
+    body_hash = fact_hash.fact_hmac(group_id, user_id or "", fact_hash.canonical(body), key=key)
+    with _conn() as c:
+        row = c.execute(
+            "SELECT 1 FROM fact_tombstones WHERE group_id = ? AND user_id = ? AND body_hash = ?",
+            (group_id, user_id or "", body_hash),
+        ).fetchone()
+    return row is not None
+
+
+def count_person_facts(group_id: str, user_id: str) -> int:
+    """這位家人在這個群組的事實條數（含 /記住 寫的）。"""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT COUNT(*) FROM facts WHERE group_id = ? AND user_id = ?",
+            (group_id, user_id or ""),
+        ).fetchone()
+    return int(row[0] or 0)
+
+
+def delete_fact_row(group_id: str, user_id: str, fact: str) -> bool:
+    """刪掉剛寫進去的那一列（fact_store 寫 ledger 失敗時回復）；不留 tombstone。"""
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "DELETE FROM facts WHERE group_id = ? AND user_id = ? AND fact = ?",
+            (group_id, user_id or "", fact),
+        )
+        return cur.rowcount > 0
 
 
 def list_fact_rows(group_id: str) -> list[tuple[str, str]]:
@@ -1075,6 +1228,34 @@ def raw_message_sender_near(
         ).fetchall()
     quoted = {uid for uid, text in rows if needle in "".join((text or "").split())}
     return next(iter(quoted)) if len(quoted) == 1 else None
+
+
+def raw_messages_after(
+    group_id: str, after_ts: int, after_mid: str, before_ts: int, limit: int
+) -> list[tuple[int, str, str | None, str]]:
+    """每日記憶 job 的進度之後、``before_ts`` 之前的原始訊息，舊→新（2026-10-11）。
+
+    進度是 (created_at, message_id)：同一秒的好幾則訊息靠 message_id 分先後，
+    比較和排序都用同一個 TEXT 欄位，所以順序是全序。回傳 [(created_at, message_id, user_id, text)]。
+    """
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT created_at, message_id, user_id, text FROM raw_messages "
+            "WHERE group_id = ? AND (created_at > ? OR (created_at = ? AND message_id > ?)) "
+            "AND created_at < ? ORDER BY created_at, message_id LIMIT ?",
+            (group_id, int(after_ts), int(after_ts), str(after_mid or ""), int(before_ts), int(limit)),
+        ).fetchall()
+    return [(int(r[0]), str(r[1]), r[2], str(r[3] or "")) for r in rows]
+
+
+def raw_messages_stats(group_id: str) -> tuple[int, int | None]:
+    """(筆數, 最舊一則的 created_at)：每日記憶 job 用來發現進度之前的訊息已被汰舊。"""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT COUNT(*), MIN(created_at) FROM raw_messages WHERE group_id = ?",
+            (group_id,),
+        ).fetchone()
+    return int(row[0] or 0), (int(row[1]) if row[1] is not None else None)
 
 
 def recent_raw_senders(group_id: str, limit: int = 300) -> list[str]:

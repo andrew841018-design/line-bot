@@ -12655,37 +12655,26 @@ _member_labels: dict[tuple[str, str], tuple[str, float]] = {}
 _member_labels_lock = threading.Lock()
 
 
-# 2026-10-10 review：稱呼拿掉括號與引號、冒號（含形似字）、@、空白、bidi 與零寬等格式字元、
-# 看不見的韓文填充字：顯示名稱不能冒充「【系統…】」「（現在說話的是…）」，也不能在畫面上看起來
-# 是別人。emoji、符號和其他標點照留（「🌸」「Andy-Lin」「李・大華」）。只看文字和數字比對保留字：
-# 是咪寶、開頭是咪寶／系統／使用者、或含「說話的是」「不確定是誰」的就不用。
-_LABEL_DROP_CHARS = "\u02d0\ua4fd\u05c3\u1804\u205a\u115f\u1160\u3164\uffa0:：﹕︓∶꞉@＠"
-_LABEL_DROP_CATEGORIES = ("Cc", "Cf", "Zs", "Zl", "Zp", "Ps", "Pe", "Pi", "Pf")
-_RESERVED_LABEL_STARTS = ("咪寶", "咪宝", "咪寳", "米寶", "米宝", "米堡", "系統", "系统", "使用者")
-_RESERVED_LABEL_PARTS = ("說話的是", "说话的是", "不確定是誰")
-_RESERVED_LABELS = ("群組成員", "某人")
-_LABEL_LEAD_RE = re.compile(r"^[^\u4e00-\u9fffA-Za-z0-9]+")
-_MEMBER_LABEL_MAX = 20
+# 2026-10-11：稱呼的清理規則（顯示名稱不能冒充程式的標記或別人）搬到 member_labels，
+# 每日記憶 job 不能 import main、要用同一套；這裡照舊 re-export（同一個物件）。
+from member_labels import (  # noqa: E402,F401
+    _LABEL_DROP_CATEGORIES,
+    _LABEL_DROP_CHARS,
+    _LABEL_LEAD_RE,
+    _MEMBER_LABEL_MAX,
+    _RESERVED_LABEL_PARTS,
+    _RESERVED_LABEL_STARTS,
+    _RESERVED_LABELS,
+    _clean_member_label,
+)
+
+# The tuple keeps pyflakes from flagging the re-exports as unused imports.
+_MEMBER_LABEL_REEXPORTS = (
+    _LABEL_DROP_CATEGORIES, _LABEL_DROP_CHARS, _LABEL_LEAD_RE, _MEMBER_LABEL_MAX,
+    _RESERVED_LABEL_PARTS, _RESERVED_LABEL_STARTS, _RESERVED_LABELS,
+)
 _MEMBER_DISPLAY_TIMEOUT_SEC = 3
 _RECENT_SPEAKER_MESSAGES = 300
-
-
-def _clean_member_label(name: str) -> str:
-    """Labels go in front of family turns as 「稱呼：」: letters and digits only,
-    short, and never anything containing the bot's name or the program's markers."""
-    text = unicodedata.normalize("NFKC", str(name or ""))
-    clean = "".join(
-        ch for ch in text
-        if ch not in _LABEL_DROP_CHARS and unicodedata.category(ch) not in _LABEL_DROP_CATEGORIES
-    )[:_MEMBER_LABEL_MAX]
-    letters = "".join(ch for ch in clean if unicodedata.category(ch)[0] in "LN")
-    if (
-        _LABEL_LEAD_RE.sub("", letters).startswith(_RESERVED_LABEL_STARTS)  # 「ˉ咪寶」「ー咪寶」
-        or any(part in letters for part in _RESERVED_LABEL_PARTS)
-        or letters in _RESERVED_LABELS
-    ):
-        return ""
-    return clean
 
 
 def _member_label(group_id: str | None, user_id: str | None) -> str:
@@ -16231,34 +16220,25 @@ def _friendly_gemini_error(e: Exception, file_name: str | None = None) -> str:
     return f"分析失敗:{type(e).__name__}"
 
 
-# 2026-10-09 review: the extraction prompt asks the model to skip these; this is
-# the deterministic backstop.  Facts are shown per person in the group
-# (/看記憶) and go into every prompt, so it errs on dropping: 「在醫院上班」 is
-# lost too.  2026-10-10 review: it missed 高血壓／癌症／月薪五萬／欠朋友錢 and
-# half of family_weekly_insight's discard list; a test keeps it a superset.
-_PRIVATE_FACT_RE = re.compile(
-    # 健康
-    r"病|藥|診|醫|症|癌|瘤|手術|住院|開刀|化療|放療|洗腎|透析|失智|中風|血壓|血糖|膽固醇|糖尿|"
-    r"心臟|過敏|氣喘|失眠|憂鬱|焦慮|恐慌|自殺|輕生|身心科|精神科|諮商|復健|"
-    r"生理期|月經|經痛|更年期|懷孕|孕|流產|"
-    # 感情與官司
-    r"感情|吵架|冷戰|分手|男友|女友|男朋友|女朋友|交往|曖昧|外遇|劈腿|約會|離婚|告人|官司|訴訟|法院|"
-    # 錢
-    r"債|欠|借錢|貸|帳戶|存款|存了|有存|積蓄|儲蓄|密碼|薪|收入|保單|理賠|財產|資產|遺產|"
-    r"[\d０-９一二兩三四五六七八九十百千]\s*萬|"
-    # 2026-10-10 review 第三輪：審查員實測還會漏的寫法
-    r"痛|炎|骨折|梗塞|心律|結石|胰島素|試管|體重|障|輪椅|戒酒|潰瘍|躁鬱|抑鬱|癲癇|帶原|開過刀|動過?刀|"
-    r"產檢|預產期|坐月子|墮胎|有喜了|健檢|抽血|心理師|自殘|割腕|想不開|不想活|性侵|性騷擾|霸凌|"
-    r"前夫|前妻|前任|出軌|小三|失戀|被甩|相親|分居|家暴|婚|單身|男票|女票|出櫃|"
-    r"律師|被告|傳票|筆錄|判刑|假釋|和解|賠|坐牢|車禍|詐騙|被騙|"
-    r"虧|破產|年終|獎金|退休金|月入|月領|年收|房租|裁員|失業|保險|刷爆|"
-    r"卡號|身分證|身份證|字號|護照|帳號|"
-    r"肝|長照|痔瘡|助聽器|失明|失禁|尿酸|發燒|看牙|洗牙|植牙|偷吃|不合|同志|坐過牢|套牢|勞退|零用錢|存錢|"
-    r"月光|月退|樂透|(?<![A-Za-z])(?:BP|DM)(?![A-Za-z])|"
-    r"[A-Za-z][12]\d{8}|\d{4}[ -]?\d{4}[ -]?\d{4}[ -]?\d{4}|\d+(?:\.\d+)?\s*[kKmM](?![A-Za-z])|"
-    r"(?i:(?<![a-z])(?:cancer|pregnan\w*|depress\w*|anxiety|adhd|ivf|boyfriend|girlfriend|bf|gf|"
-    r"salary|debt|loan|divorce\w*|lawsuit|sued|blood pressure|diabet\w*|insulin|therapy|covid|surgery)(?![a-z]))"
-)
+# 2026-10-11：私人事實的 regex 搬到 fact_filters（每日記憶 job 共用、不 import main）；
+# 即時抽取和 job 都經過 fact_store 的同一道過濾。這裡照舊 re-export（同一個物件）。
+import fact_store  # noqa: E402
+from fact_filters import PRIVATE_FACT_RE as _PRIVATE_FACT_RE  # noqa: E402,F401
+
+_FACT_FILTER_REEXPORTS = (_PRIVATE_FACT_RE,)  # keeps pyflakes from flagging the re-export
+_INLINE_FACT_EXTRACT_ENV = "LINE_BOT_INLINE_FACT_EXTRACT"
+
+
+def _inline_fact_extract_enabled() -> bool:
+    """LINE_BOT_INLINE_FACT_EXTRACT=0（環境變數或 .env）關掉回覆前的即時抽取，讓每日 job
+    成為唯一的寫入者（GP2 #12，由 Andrew 決定）；沒設就照舊開著。
+
+    .env 在匯入時載入一次，改了要重啟 uvicorn。LINE_BOT_DAILY_MEMORY=0 只停得掉每日 job，
+    停不掉這裡：兩個都要停，兩個開關都要設。"""
+    raw = os.environ.get(_INLINE_FACT_EXTRACT_ENV)
+    if raw is None:
+        raw = getattr(settings, "inline_fact_extract_raw", "")
+    return str(raw or "").strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _maybe_extract_facts(group_id: str) -> None:
@@ -16275,7 +16255,12 @@ def _extract_facts_now(group_id: str) -> None:
     2026-10-09 Andrew：「咪寶記憶的部分，讓他區分不同人（說話的人），不能全部都
     一概當成『使用者』」。對話紀錄每一則都寫了是誰說的；模型只能把事實掛在已知的
     家人稱呼上，存成「稱呼：事實」並記那個人的 user_id。看不出是誰的就不存。
+
+    2026-10-11：寫入改走 fact_store（和每日記憶 job 同一套過濾、tombstone、去重、上限、
+    ledger）；嵌入模型已經載入才用，拿不到鎖就這次不寫，回覆絕不等。
     """
+    if not _inline_fact_extract_enabled():
+        return
     if not _gemini_side_task_allowed("fact_extract"):
         return
     if not memory.bump_and_should_extract(group_id):
@@ -16292,18 +16277,24 @@ def _extract_facts_now(group_id: str) -> None:
         else:
             logger.warning("auto fact extract failed error_type=%s", type(e).__name__)
         return
-    added = 0
+    items = []
     for person, fact in new_facts:
         user_id = labels.get(person)
-        if not user_id or _PRIVATE_FACT_RE.search(fact):
+        if not user_id:
             continue
-        label = _member_label(group_id, user_id) or person
-        if memory.add_fact(group_id, f"{label}：{fact}", user_id=user_id):
-            added += 1
+        items.append((_member_label(group_id, user_id) or person, user_id, fact))
+    report = fact_store.add_person_facts(
+        group_id,
+        items,
+        source="inline",
+        embedder=fact_store.loaded_embedder(),
+        lock_mode="try",
+    )
     logger.info(
-        "auto-extracted facts: %d new (total=%d)",
-        added,
+        "auto-extracted facts: %d new (total=%d) report=%s",
+        report.added,
         len(memory.list_facts(group_id)),
+        _json.dumps(report.counts(), ensure_ascii=False, sort_keys=True),
     )
 
 
