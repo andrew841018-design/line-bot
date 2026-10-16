@@ -88,7 +88,21 @@ def test_hearsay_outside_the_safe_categories_is_refused(body, category):
 
 def test_a_fact_in_no_allowed_frame_is_refused():
     assert h.scope_reason("很會煮菜") == "scope:frame"
+    assert h.scope_reason("討厭公司") == "scope:frame"  # 框架要在開頭，「公司」出現在哪裡都算是錯的
     assert h.scope_reason("喜歡吃其他口味") == ""  # 「其他」的「他」不是代名詞
+    assert h.scope_reason("在學吉他") == ""  # 「吉他」的「他」也不是
+
+
+@pytest.mark.parametrize(
+    ("body", "category"),
+    [("喜歡同性", "sensitive"), ("喜歡女生", "sensitive"), ("住在監獄", "sensitive"), ("住在療養院", "health"),
+     ("三高", "health"), ("約砲", "sensitive"), ("被公司資遣", "sensitive"),
+     ("一個人住", "health"), ("耳背", "health"), ("眼睛花", "health"), ("住在養老院", "health"),
+     ("在學戒癮", "health"), ("喜歡男生", "sensitive"), ("喜歡去教會", "sensitive"), ("支持某黨", "sensitive"),
+     ("喜歡喝高粱", "sensitive"), ("喜歡抽雪茄", "sensitive"), ("喜歡看A片", "sensitive"), ("愛去夜店", "sensitive")],
+)
+def test_bodies_the_post_implementation_review_got_through_are_refused(body, category):
+    assert h.scope_reason(body) == f"scope:{category}"
 
 
 # ── 名單 ─────────────────────────────────────────────────────────────────────
@@ -180,3 +194,62 @@ def test_the_speakers_own_facts_stay_with_the_speaker(fact, about, text):
 )
 def test_a_speakers_fact_that_may_be_about_someone_else_is_dropped(fact, about, text, reason):
     assert judge(fact, about, "成員甲", text) == h.Verdict(False, reason=reason)
+
+
+# ── post-impl 審查（GP2 #1、#2）：原文裡模型改寫看不到的東西 ──────────────────────
+
+
+@pytest.mark.parametrize(
+    ("fact", "about", "speaker", "text", "reason"),
+    [
+        ("搬到台中", "爸爸", "成員甲", "爸爸想搬到台中", "source:wish_past_other"),
+        ("搬到台中", "爸爸", "成員甲", "爸爸下個月要搬到台中", "source:time"),
+        ("住在台中", "爸爸", "成員甲", "爸爸以前住台中，現在住台北", "source:wish_past_other"),
+        ("喜歡爬山", "爸爸", "成員甲", "爸爸不喜歡爬山", "source:negation"),
+        ("在科技公司上班", "爸爸", "成員甲", "爸爸跟他老闆在科技公司上班", "source:pronoun"),
+        ("在科技公司上班", "爸爸", "成員甲", "爸爸被公司資遣", "source:sensitive"),
+        ("住在台中", "爸爸", "成員甲", "聽說，爸爸住台中", "hedged"),
+        ("住在台中", "爸爸", "成員甲", "爸爸住台中，我亂說的", "hedged"),
+        ("住在台中", "爸爸", "成員甲", "爸爸住台中，對嗎？", "hedged"),
+        ("住在台中", "爸爸", "成員甲", "據說爸爸住台中", "hedged"),
+        ("住在台中", "爸爸", "成員甲", "我猜爸爸住台中", "hedged"),
+        ("住在台中", "爸爸", "成員甲", "爸爸住台中才怪", "hedged"),
+        ("住在台中", "爸爸", "成員甲", "爸爸住台中對不對", "hedged"),
+        ("住在台中", "爸爸", "成員甲", "爸爸沒住台中", "source:negation"),
+        ("住在台中", "爸爸", "成員甲", "爸爸一個人住台中", "source:health"),
+        ("住在台中", "媽媽", "成員甲", "媽媽有個朋友住台中", "source:third_party"),
+        ("住在台中", "媽媽", "成員甲", "媽媽說她朋友住台中", "source:pronoun"),
+        ("在學游泳", "爸爸", "成員甲", "爸爸幫孫子在學游泳", "source:wish_past_other"),
+    ],
+)
+def test_the_source_sentence_is_checked_not_just_the_models_rewrite(fact, about, speaker, text, reason):
+    assert judge(fact, about, speaker, text) == h.Verdict(False, reason=reason)
+
+
+def test_a_negative_fact_that_matches_the_source_is_kept():
+    assert judge("不喜歡吃辣", "爸爸", "成員甲", "爸爸不喜歡吃辣") == h.Verdict(True, "爸爸", "成員甲")
+
+
+@pytest.mark.parametrize(
+    ("fact", "about", "speaker", "text", "reason"),
+    [
+        ("住在台中", "我", "成員甲", "我同學住台中", "self_other_people"),
+        ("在科技公司上班", "我", "成員甲", "我老公在科技公司上班", "self_other_people"),
+        ("喜歡爬山", "我", "成員甲", "我的朋友喜歡爬山", "self_other_people"),
+        ("住在台中", "（省略）", "成員甲", "我爸住台中", "self_other_people"),
+        ("住在台中", "媽媽", "媽媽", "媽媽的朋友住台中", "self_possessive"),
+        ("住在台中", "媽媽", "媽媽", "媽媽的媽媽住台中", "self_possessive"),
+    ],
+)
+def test_someone_elses_fact_never_lands_under_the_speaker(fact, about, speaker, text, reason):
+    assert judge(fact, about, speaker, text) == h.Verdict(False, reason=reason)
+
+
+@pytest.mark.parametrize("label", ["他", "朋友", "同學", "大家", "老爸", "爸", "我們", "阿嬤"])
+def test_unsafe_display_labels(label):
+    assert h.unsafe_label(label)
+
+
+@pytest.mark.parametrize("label", ["Amy", "成員甲", "小寶貝"])
+def test_ordinary_display_labels(label):
+    assert not h.unsafe_label(label)

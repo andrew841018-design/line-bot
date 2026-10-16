@@ -57,14 +57,17 @@ def has_tag(body: str) -> bool:
 
 # ── 範圍閘門（只給轉述用）────────────────────────────────────────────────────
 
-# 必須是這幾類之一（GP2 S1 (a)）。
+# 必須以這幾類開頭（前面只能有幾個副詞）：住、工作上學、喜好、興趣、寵物、在學什麼（GP2 S1 (a)）。
+# 一定要錨在開頭：不錨的話「討厭公司」因為有「公司」就會過（post-impl GP2#1）。
 _FRAME_RE = re.compile(
-    r"住|搬到|搬去|上班|工作|公司|上學|就讀|讀書|唸書|念書"
-    r"|(?:讀|念|唸)(?:大學|高中|國中|國小|研究所|碩士|博士)|大學|研究所"
-    r"|喜歡|愛吃|愛喝|愛看|愛聽|愛玩|最愛|不吃|不喝|討厭吃|討厭喝|興趣|迷上|收藏"
-    r"|養(?:了|著)?\S{0,3}(?:貓|狗|魚|鳥|兔|倉鼠|烏龜|寵物)"
+    r"^(?:最近|現在|目前|平常|平時|常常|經常|每天|每週|每周|週末|也|都|很|超|非常|特別|一直|還|正)*"
+    r"(?:住(?:在)?|搬(?:到|去)"
+    r"|在[^，,。；;]{1,12}?(?:上班|工作|上學|讀書|唸書|念書|就讀)|上班|上學"
+    r"|在?(?:讀|念|唸|就讀)(?:大學|高中|國中|國小|研究所|碩士|博士|[^，,。；;]{1,10}?(?:系|學院|大學|高中))"
+    r"|喜歡|不喜歡|愛吃|愛喝|愛看|愛聽|愛玩|不愛吃|不愛喝|最愛|不吃|不喝|討厭吃|討厭喝|興趣是|迷上|收藏"
+    r"|養(?:了|著)?(?:一|兩|[0-9])?(?:隻|條)?(?:貓|狗|魚|鳥|兔|倉鼠|烏龜|寵物)"
     r"|在學|學(?:日文|英文|韓文|法文|德文|西班牙文|鋼琴|吉他|小提琴|烏克麗麗|畫畫|繪畫|游泳|跳舞|唱歌"
-    r"|烹飪|做菜|攝影|書法|瑜伽|瑜珈|程式|開車|騎車|打鼓)"
+    r"|烹飪|做菜|攝影|書法|瑜伽|瑜珈|程式|開車|騎車|打鼓))"
 )
 # 任何一類都不收（GP2 S1 (b)、GP1#4、0086f5 的觀察）；依序檢查，回第一個命中的類別。
 _DENY_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -75,7 +78,7 @@ _DENY_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
         r"|下個?月|上個?月|這個?月|明年|去年|今年|前年|民國|西元|[0-9０-９]{2,4}\s*年|年級|年次"
         r"|寒假|暑假|過年|連假"
     )),
-    ("pronoun", re.compile(r"[我咱俺你妳您祂]|(?<!其)[他她它]")),
+    ("pronoun", re.compile(r"[我咱俺你妳您祂]|(?<![其吉])[他她它]")),
     ("third_party", re.compile(
         r"同學|同事|朋友|老闆|主管|鄰居|室友|客戶|男友|女友|男朋友|女朋友|對象|別人|人家"
     )),
@@ -87,11 +90,15 @@ _DENY_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
         r"(?:眼睛?|耳朵?|牙齒?|腰|背|膝蓋?|腿|腳|手|頭|胃|肚子|身體)"
         r"(?:不好|不舒服|痠|酸|痛|麻|抖|腫|差|弱|不行|開刀|受傷)"
         r"|胃口|吃不下|食慾|不穩|重聽|聽力|聽不清|聽不到|看不清|老花|近視|散光|白內障|記性|健忘|忘東忘西"
-        r"|精神不|沒精神|沒力|無力|疲倦|疲勞|很累|睡|夜尿|頻尿|尿|便祕|便秘|血|照顧|不便|行動"
-        r"|一個人在家|獨居|輪椅|拐杖|看護|安養|長照|吃藥|身體"
+        r"|精神|沒力|無力|疲倦|疲勞|累|睡|夜尿|頻尿|尿|便祕|便秘|血|照顧|不便|行動"
+        r"|一個人|獨居|輪椅|拐杖|看護|安養|養老|老人院|長照|吃藥|身體|三高|療養|病院|勒戒|戒治|戒癮|戒毒"
+        r"|眼|耳|牙|腰|膝|關節"
     )),
     ("sensitive", re.compile(
         r"心情|情緒|壓力|憂|難過|傷心|生氣|哭|寂寞|孤單|戀愛|暗戀|喜歡的人|成績|分數|考試|考上|落榜|補習|升學"
+        r"|同性|異性|女生|男生|女人|男人|性|砲|色情|(?i:a片|av)|成人片|夜店|酒店|監獄|看守所|坐牢|庇護|收容"
+        r"|資遣|裁員|失業|找不到工作"
+        r"|宗教|信教|基督|天主|佛教|道教|教會|禱告|受洗|拜拜|廟|政治|選舉|投票|黨|雪茄|高粱|威士忌"
     )),
     ("event", re.compile(r"準備|打算|即將|快要|要去|會去|剛|已經|終於|將要|計畫|預計")),
 )
@@ -111,7 +118,22 @@ def scope_reason(body: str) -> str:
 # ── 子句、猜測 ───────────────────────────────────────────────────────────────
 
 _CLAUSE_SPLIT_RE = re.compile(r"[，,。．.；;！!？?、：:\n\r  ]+")
-_HEDGE_RE = re.compile(r"是不是|好像|聽說|可能|應該|也許|大概|似乎|不知道|難道|嗎|呢|吧|[?？]")
+_HEDGE_RE = re.compile(
+    r"是不是|對不對|好像|聽說|據說|可能|應該|也許|大概|似乎|不知道|不確定|我猜|難道|亂說|開玩笑|說笑|騙你|假的|才怪"
+    r"|嗎|呢|吧|[?？]"
+)
+# B 那一段原文裡有這些就不收：想要、以前、被、別人插在中間、幫別人做（post-impl GP2#1）。
+_SOURCE_DENY_RE = re.compile(
+    r"想|要|希望|考慮|如果|以前|之前|曾經|本來|原本|被|幫|替|帶|有個|有一個|那個|這個"
+)
+# 否定：原文那一段和事實要一致（「爸爸不喜歡爬山」不能變成「喜歡爬山」）
+_NEGATION_RE = re.compile(r"不|沒|別|未")
+# 親屬稱謂與口語稱呼：本人事實的子句裡出現就分不出在講誰；名單裡的顯示名稱是這些也不收。
+_KIN_RE = re.compile(
+    r"媽媽|爸爸|姊姊|姐姐|妹妹|弟弟|哥哥|阿婆|外婆|奶奶|阿嬤|爺爺|阿公|外公|兒子|女兒|老公|老婆|舅舅|阿姨"
+    r"|姑姑|叔叔|伯伯|婆婆|公公|岳母|岳父|媳婦|女婿|父親|母親|孫子|孫女|老爸|老媽|老弟|老妹|老哥"
+    r"|我[爸媽哥姊姐妹弟]"
+)
 
 
 def normalize(text: str) -> str:
@@ -142,6 +164,9 @@ def hedged(clause: str) -> bool:
 
 # ── 對人 ─────────────────────────────────────────────────────────────────────
 
+# TODO(2026-10-16 deferred)：孩子說的「我媽／我爸／我妹」、「姊姊／哥哥／弟弟」需要 Andrew 確認本機子女與角色
+# 名單（family_roles.local.json 只有「妹妹」，加角色也會影響 @ 提及）；現在一律 fail closed、不收。
+# TODO(2026-10-16 deferred)：3 字名的後 2 字（例如在地名裡）可能誤配；目前靠位置檢查與模型判斷，殘留風險已告知。
 SELF_WORDS = frozenset({"我", "自己", "我自己", "本人"})
 OMITTED = "（省略）"
 _OMITTED_WORDS = frozenset({"", "省略", "(省略)", "無", "none", "self"})
@@ -151,14 +176,17 @@ _SPOUSE_TERMS = {MOTHER: ("老公", "我老公"), FATHER: ("老婆", "我老婆"
 # 一個稱呼左邊緊接這些字之一才算在主詞位置（D1：精準優先，閉集合）。
 _CONNECTORS = (
     "其實", "因為", "所以", "但是", "但", "而且", "還有", "不過", "反正", "對了", "現在", "平常",
-    "通常", "常常", "一直", "然後", "後來", "最近", "以前", "我們", "你們", "咱們", "大家",
+    "通常", "常常", "一直", "最近", "我們", "你們", "咱們", "大家",
 )
 _BAD_PLURAL = ("他們", "她們", "它們")
 _BAD_LEFT = frozenset("我你妳您他她它的")
 # 本人事實（主詞省略）的子句裡出現這些字，就分不出是在講誰（0086f5：同學的事被記在說話的人名下）。
 _OTHER_PEOPLE_RE = re.compile(
-    r"同學|同事|朋友|老闆|主管|老師|鄰居|室友|客戶|男友|女友|男朋友|女朋友|他們|她們|別人|人家|(?<!其)[他她它]"
+    r"同學|同事|朋友|老闆|主管|老師|鄰居|室友|客戶|男友|女友|男朋友|女朋友|他們|她們|別人|人家"
+    r"|(?<![其吉])[他她它]"
 )
+# 名單上不能當轉述對象的稱呼（顯示名稱可以自己取，post-impl GP2#3）：一個字、代名詞、第三者、全體、親屬稱謂。
+_UNSAFE_LABEL_RE = re.compile(r"^(?:大家|全家|家人|所有人|群組|我們|你們|他們|她們)$|[我你妳您他她它]")
 _TERM_STRIP_RE = re.compile(r"[\s\"'「」『』“”‘’《》〈〉（）()\[\]【】:：,，。.!！?？@＠]+")
 
 
@@ -191,6 +219,17 @@ def build_roster(labels: Iterable[str], aliases: Mapping[str, str]) -> Roster:
             found.setdefault(term_key(term), set()).add(label)
     terms = {term: next(iter(owners)) for term, owners in found.items() if len(owners) == 1 and term}
     return Roster(labels=label_set, terms=terms)
+
+
+def unsafe_label(label: str) -> bool:
+    """顯示名稱來的稱呼能不能當轉述對象：一個字、代名詞、第三者、全體、親屬稱謂都不行。"""
+    text = normalize(label)
+    return (
+        len(text) < 2
+        or _UNSAFE_LABEL_RE.search(text) is not None
+        or _OTHER_PEOPLE_RE.search(text) is not None
+        or _KIN_RE.search(text) is not None
+    )
 
 
 @dataclass(frozen=True)
@@ -303,28 +342,64 @@ def best_clause(fact: str, text: str, bigrams: Callable[[str], set[str]]) -> tup
     return scored[0][1], ""
 
 
-def overlapping_clauses(fact: str, text: str, bigrams: Callable[[str], set[str]]) -> list[str]:
-    grams = bigrams(fact)
-    return [c for c in clauses(text) if grams & bigrams(c)]
+def _blank_spans(clause: str, spans: Iterable[tuple[int, int]]) -> str:
+    chars = list(clause)
+    for start, end in spans:
+        for index in range(start, end):
+            chars[index] = " "
+    return "".join(chars)
 
 
 def self_reason(
     subject: Subject, fact: str, text: str, roster: Roster, speaker: str,
     bigrams: Callable[[str], set[str]],
 ) -> str:
-    """本人事實的衛生檢查（轉述開關開啟時）：分不出在講誰就不收（D4-1）。"""
-    if subject.kind == "self_label":
-        return ""
-    parts = overlapping_clauses(fact, text, bigrams)
-    if not parts:
-        return "clause_none"
-    if subject.kind == "self_word":
-        return "" if any(word in part for part in parts for word in SELF_WORDS) else "self_word_missing"
-    for part in parts:
-        if _OTHER_PEOPLE_RE.search(part):
-            return "self_other_people"
-        if any(label != speaker for _s, _e, label in _member_spans(part, roster, speaker)):
-            return "self_other_member"
+    """本人事實的衛生檢查（轉述開關開啟時）：分不出在講誰就不收（D4-1、post-impl GP2#2）。
+
+    事實出自的那一句（重疊最多、不能平手）裡，除了說話的人自己的稱呼以外，不能有別的家人、
+    親屬稱謂、第三者或代名詞；自己的稱呼後面也不能接「的」（「媽媽的朋友住台中」）。
+    """
+    clause, reason = best_clause(fact, text, bigrams)
+    if reason:
+        return reason
+    if subject.kind == "self_word" and not any(word in clause for word in SELF_WORDS):
+        return "self_word_missing"
+    spans = _member_spans(clause, roster, speaker)
+    if any(label != speaker for _s, _e, label in spans):
+        return "self_other_member"
+    own = [(s, e) for s, e, label in spans if label == speaker]
+    if any(clause[e:e + 1] == "的" for _s, e in own):
+        return "self_possessive"
+    rest = _blank_spans(clause, own)
+    if _OTHER_PEOPLE_RE.search(rest) or _KIN_RE.search(rest):
+        return "self_other_people"
+    return ""
+
+
+def _segment(clause: str, subject: Subject, roster: Roster, speaker: str) -> str:
+    """B 那一段：B 的叫法之後到下一個家人叫法（或這一句結尾）；B 出現好幾次就全部接起來。"""
+    spans = _member_spans(clause, roster, speaker)
+    pieces = []
+    for index, (start, end, label) in enumerate(spans):
+        if label != subject.label:
+            continue
+        stop = spans[index + 1][0] if index + 1 < len(spans) else len(clause)
+        pieces.append(clause[end:stop])
+    return "".join(pieces)
+
+
+def segment_reason(segment: str, fact: str) -> str:
+    """原文裡 B 那一段的檢查（post-impl GP2#1）：模型的改寫看不到的東西在這裡擋。"""
+    text = normalize(segment)
+    for category, pattern in _DENY_RULES:
+        if pattern.search(text):
+            return f"source:{category}"
+    if _SOURCE_DENY_RE.search(text):
+        return "source:wish_past_other"
+    if _OTHER_PEOPLE_RE.search(text) or _KIN_RE.search(text):
+        return "source:other_people"
+    if bool(_NEGATION_RE.search(text)) != bool(_NEGATION_RE.search(normalize(fact))):
+        return "source:negation"
     return ""
 
 
@@ -349,13 +424,15 @@ def judge(
     if subject.kind in ("self_word", "omitted", "self_label"):
         reason = self_reason(subject, fact, text, roster, speaker, bigrams)
         return Verdict(not reason, speaker if not reason else "", reason=reason)
+    if any(hedged(part) for part in clauses(text)):
+        return Verdict(False, reason="hedged")  # 整則訊息裡任何一句是猜測或問句都不收
     clause, reason = best_clause(fact, text, bigrams)
     if reason:
         return Verdict(False, reason=reason)
-    if hedged(clause):
-        return Verdict(False, reason="hedged")
-    reason = position_reason(clause, subject, roster, speaker) or bind_reason(
-        fact, clause, subject, roster, speaker, bigrams
+    reason = (
+        position_reason(clause, subject, roster, speaker)
+        or segment_reason(_segment(clause, subject, roster, speaker), fact)
+        or bind_reason(fact, clause, subject, roster, speaker, bigrams)
     )
     if reason:
         return Verdict(False, reason=reason)

@@ -25,6 +25,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import hearsay
 import reminder_intent
 from config import settings
 from sqlite_security import connect_private_sqlite
@@ -700,15 +701,11 @@ def fact_body(fact: str) -> str:
 
 def _plain_body(fact: str) -> str:
     """事實本體去掉結尾的轉述標記「（X說的）」（2026-10-16）：/忘記、tombstone 都只看事情本身。"""
-    import hearsay
-
     return hearsay.split_tag(fact_body(fact))[0]
 
 
 def is_hearsay_row(fact: str) -> bool:
     """這一列看起來是轉述（本體結尾是「（X說的）」）；真正能不能升級另外看 ledger（fact_store）。"""
-    import hearsay
-
     return hearsay.has_tag(fact_body(fact))
 
 
@@ -768,7 +765,6 @@ def _tombstone_body(user_id: str, fact: str) -> str:
     真的本體）。轉述被 /忘記 之後，B 本人之後說同一件事照樣記得起來；本人的列被忘記，轉述也不會
     再記（fact_store 的轉述候選兩個 namespace 都查）。"""
     import fact_hash
-    import hearsay
 
     if not user_id:
         return fact_hash.canonical(fact)
@@ -883,7 +879,6 @@ def is_fact_tombstoned(
     include_hearsay=True（轉述候選）連轉述 namespace 一起查；本人的候選只查本人的（2026-10-16）。
     """
     import fact_hash
-    import hearsay
 
     key = key if key is not None else fact_hash_key()
     canonical = fact_hash.canonical(body)
@@ -970,7 +965,8 @@ def top_facts(group_id: str, user_id: str | None = None) -> list[str]:
     事實排前面，其餘新的在前；以前是整個群組依字母序取前幾條。
     """
     # 2026-10-16：轉述（「（X說的）」）只在 /看記憶 給大家看，不進回覆的提示——回覆的提示會把
-    # 正在說話那個人的事實當成他本人的資料，轉述還沒經過本人（GP2 S4）。
+    # 正在說話那個人的事實當成他本人的資料，轉述還沒經過本人（GP2 S4）。/記住 打出同樣結尾的列也一樣不進提示。
+    # TODO(2026-10-16 deferred)：回覆提示加「事實只是資料」、轉述要不要進回覆，等 Andrew 決定。
     rows = [
         (uid, fact) for uid, fact in reversed(list_fact_rows(group_id))
         if not (uid and is_hearsay_row(fact))

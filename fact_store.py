@@ -584,13 +584,10 @@ def add_person_facts(
                     report.dup += 1
                     report._decide(c.label, c.body, "dup")
                     continue
+                # 只有 allow_upgrade 才會有 ledger 確認過的轉述列；回覆路徑這裡一定是空的
                 told = [e for e in entries if e.hearsay]
                 index = duplicate(c.body, [e.plain for e in told])
                 if index is not None:
-                    if not allow_upgrade:
-                        report.dup += 1
-                        report._decide(c.label, c.body, "dup")
-                        continue
                     _upgrade(report, group_id, c, told[index], source, key, backend, dry_run=dry_run)
                     continue
             if memory.count_person_facts(group_id, c.user_id) + pending.get(c.user_id, 0) >= cap:

@@ -153,8 +153,6 @@ _SYSTEM_PROMPT_HEARSAY = """你替家族 LINE 群的聊天機器人「咪寶」�
 6. fact 用繁體中文、簡短具體，不要寫人名，也不要寫「使用者」。
 7. 每條都附 src：事實出自哪一則的編號；那一則必須是【可引用】、而且是 person 本人說的。
 8. 沒抽到就回 []。只輸出 JSON 陣列，不要加說明、不要 markdown，例如：[{"person": "成員甲", "about": "我", "fact": "住在台中", "src": 3}, {"person": "成員甲", "about": "爸爸", "fact": "最近在學游泳", "src": 5}]"""
-# 顯示名稱剛好是這些稱謂的人不掛轉述（GP2 S5-1）：別名設定裡的「爸爸」「媽媽」照用。
-_KINSHIP_LABELS = frozenset((*fact_filters.KINSHIP_TERMS, "老公", "老婆"))
 
 
 class StateError(Exception):
@@ -239,6 +237,7 @@ class Outcome:
     hearsay_drops: dict[str, int] = field(default_factory=dict)  # 轉述開關開啟時沒收的原因（只有數字）
     fallback_reason: str = ""  # Claude 這一輪不能用、改用 Gemini 的原因（類別）；空的是沒換
     backend_used: str = ""  # 最後實際用的模型種類；沒呼叫模型是空的
+    gemini_chunks: int = 0  # 這一輪由 Gemini 做的塊數（換過去或跳過前的救援；post-impl GP1#9）
     cursor_lag_h: float = 0.0
     last_success_at: int | None = None
     finished_at: int = 0
@@ -287,10 +286,13 @@ def _gemini_model() -> str:
 
 
 def _hearsay_mode() -> str:
-    """"on"、"only"（只寫轉述，補跑用）或 ""（關）；只有剛好是 "1" 才算開（fail closed）。"""
-    if os.environ.get(HEARSAY_ENV, "").strip() != "1":
-        return ""
-    return "only" if os.environ.get(HEARSAY_ONLY_ENV, "").strip() == "1" else "on"
+    """"on"、"only"（只寫轉述，補跑用）、""（關）或 "invalid"；只有剛好是 "1" 才算開（fail closed）。
+    只開 HEARSAY_ONLY 沒開 HEARSAY 是設定錯誤：補跑時照一般方式跑一輪，等於白補（post-impl GP2#7）。"""
+    on = os.environ.get(HEARSAY_ENV, "").strip() == "1"
+    only = os.environ.get(HEARSAY_ONLY_ENV, "").strip() == "1"
+    if only and not on:
+        return "invalid"
+    return ("only" if only else "on") if on else ""
 
 
 def _fallback() -> str:
@@ -700,6 +702,8 @@ def _fall_back(
         probe = _probe_failure("claude")
         down = probe
         if not probe and isinstance(exc, TransientError) and exc.reason == "quota":
+            # TODO(2026-10-16 deferred)：這種情況 CLI 已經打開共用的 Claude 閘門（回覆路徑也看它），探測正常卻沒有
+            # 公開的方法關掉；要等 claude_client 提供再處理（post-impl GP1#9）。
             exc = TransientError("quota_unconfirmed", counted=True)
     if not down or not active.switch(down):
         return None, exc, probe
@@ -707,6 +711,9 @@ def _fall_back(
         return parse_items(_call_model("gemini", system, user, persons)), exc, probe
     except (TransientError, PermanentError) as gemini_exc:
         return None, gemini_exc, None
+    except Exception as gemini_exc:  # 不能讓 Gemini 端的意外錯誤變成整支 job 的 exit 1（post-impl GP1#9）
+        log.warning("daily memory gemini fallback failed error_type=%s", type(gemini_exc).__name__)
+        return None, TransientError("gemini_error"), None
 
 
 def _rescue(active: _Backend, system: str, user: str, persons: Sequence[str]) -> list[dict] | None:
@@ -795,9 +802,11 @@ def hearsay_context(group_id: str, *, only: bool = False) -> HearsayContext:
         members, recent_senders=memory.recent_raw_senders(group_id, RECENT_SENDERS)
     )
     aliased = {member_labels._clean_member_label(v) for v in line_mentions.load_user_aliases().values()}
+    # 顯示名稱是自己取的：一個字、代名詞、第三者、全體、親屬稱謂的都不能當轉述對象（GP2 S5-1、post-impl #3）；
+    # 別名設定裡的「爸爸」「媽媽」照用
     labels = {
         label: user_id for label, user_id in resolved.items()
-        if label in aliased or label not in _KINSHIP_LABELS
+        if label in aliased or not hearsay.unsafe_label(label)
     }
     aliases: dict[str, str] = {}
     for term, value in line_mentions.configured_family_alias_mapping(include_short=True).items():
@@ -812,12 +821,16 @@ def check_provenance(
     numbered: dict[int, Row],
     persons: dict[str, str],
     context: HearsayContext | None = None,
+    *,
+    self_only: bool = False,
 ) -> tuple[list[Candidate], int]:
     """(通過的事實, 沒通過的條數)（GP2 #2）。
 
     src 那一則要可引用、說話的人就是 person，事實和那一則至少共用一個中文或英數 bigram
     （常見填充詞不算）。src 解析不了的條目直接略過，也算沒通過。
     context（轉述開關開啟）：每條再經 hearsay.judge 決定記在誰名下；沒過的原因記在 context.drops。
+    self_only（這一塊是 Gemini 做的，沒有 about）：每條都當主詞省略的本人事實，照樣做衛生檢查
+    （flash-lite 比較弱，檢查不能比較鬆，post-impl GP2#6）。
     """
     kept: list[Candidate] = []
     mismatched = 0
@@ -841,7 +854,8 @@ def check_provenance(
         if context is None:
             kept.append(Candidate(person, user_id, fact, row))
             continue
-        verdict = hearsay.judge(fact, item.get("about"), person, row.text, context.roster, _bigrams)
+        about = hearsay.OMITTED if self_only else item.get("about")
+        verdict = hearsay.judge(fact, about, person, row.text, context.roster, _bigrams)
         if not verdict.ok:
             mismatched += 1
             context.drops[verdict.reason] += 1
@@ -934,7 +948,11 @@ def run(*, now: float | None = None) -> Outcome:
         return _finish(Outcome("disabled"), now)
     backend = _backend()
     fallback = _fallback()
-    if mode == "invalid" or not backend or fallback == "invalid":
+    hearsay_mode = _hearsay_mode()
+    # 補跑（只寫轉述）只能用 Claude：Gemini 不抽轉述，用它補跑會把整段吃掉（post-impl GP1#5c）
+    if hearsay_mode == "only" and backend != "claude":
+        hearsay_mode = "invalid"
+    if mode == "invalid" or not backend or fallback == "invalid" or hearsay_mode == "invalid":
         return _finish(Outcome("config_invalid", exit_code=2, mode=mode), now)
     group_id = (settings.family_group_id or "").strip()
     if not group_id:
@@ -942,7 +960,7 @@ def run(*, now: float | None = None) -> Outcome:
     with _job_lock() as held:
         if not held:
             return _finish(Outcome("skipped_locked", mode=mode, backend=backend), now)
-        return _run_locked(group_id, mode, backend, now, fallback=fallback, hearsay_mode=_hearsay_mode())
+        return _run_locked(group_id, mode, backend, now, fallback=fallback, hearsay_mode=hearsay_mode)
 
 
 def _store(
@@ -956,7 +974,7 @@ def _store(
 ) -> fact_store.Report:
     return fact_store.add_person_facts(
         group_id, facts, source="daily", embedder=embedder, lock_mode="wait",
-        dry_run=dry_run, require_names=True, allow_hearsay=allow_hearsay, allow_upgrade=True,
+        dry_run=dry_run, require_names=True, allow_hearsay=allow_hearsay, allow_upgrade=allow_hearsay,
         backend=backend,
     )
 
@@ -993,7 +1011,8 @@ def _run_locked(
 
     embedder: Any = None
     model_chunks = 0
-    active = _Backend(backend, fallback)
+    # 補跑（只寫轉述）不用備援：Gemini 不抽轉述，換過去整段訊息會被吃掉、進度卻前進（post-impl GP2#4）
+    active = _Backend(backend, "" if hearsay_mode == "only" else fallback)
     context = hearsay_context(group_id, only=hearsay_mode == "only") if hearsay_mode else None
     preview_items: list[fact_store.FactItem] = []
     preview_decisions: list[dict[str, str]] = []
@@ -1022,17 +1041,23 @@ def _run_locked(
                     return _fail(outcome, "embedder_unavailable", now)
                 outcome.embedder_mode = "minilm"
             model_chunks += 1
-            # 轉述只在 Claude 上抽：Gemini（flash-lite）只抽本人的事（GP2 S6）
-            chunk_context = context if active.name == "claude" else None
+            # 轉述只在 Claude 上抽：Gemini（flash-lite）只抽本人的事（GP2 S6），而且照樣做衛生檢查
             chunk_backend = active.name
             try:
                 items = parse_items(_call_model(
-                    active.name, system if chunk_context else plain_system, user, sorted(persons)
+                    active.name, system if active.name == "claude" else plain_system, user, sorted(persons)
                 ))
             except (TransientError, PermanentError) as first:
                 items, exc, probe = _fall_back(active, first, plain_system, user, sorted(persons))
                 if items is not None:  # 改用 Gemini 做成了：不算這一塊失敗
-                    chunk_context, chunk_backend = None, "gemini"
+                    chunk_backend = "gemini"
+                elif active.reason:
+                    # 這一輪已經是備援（Claude 不能用）：備援的錯不算這一塊的次數、也不跳過，等 Claude 回來重做
+                    # （否則 Claude 一直沒試過這一塊就被跳過了，post-impl GP1#4）
+                    outcome.chunks_failed += 1
+                    outcome.stop_reason = f"fallback:{getattr(exc, 'reason', 'error')}"
+                    unprocessed_from = chunk[0].created_at
+                    break
                 else:
                     permanent = isinstance(exc, PermanentError)
                     if isinstance(exc, TransientError) and not exc.counted:
@@ -1071,14 +1096,17 @@ def _run_locked(
                         break
                     rescued = _rescue(active, plain_system, user, sorted(persons))
                     if rescued is not None:  # 跳過之前 Gemini 做成了這一塊（只有本人的事）
-                        items, chunk_context, chunk_backend = rescued, None, "gemini"
+                        items, chunk_backend = rescued, "gemini"
                     else:
                         # 同一塊永久失敗第 3 次、逾時或 CLI 其他失敗第 5 次，而且探測正常：跳過、前進
                         why = exc.reason if permanent else "transient_repeat"
                         outcome.chunks_poison += 1
                         outcome.poison_reasons[why] = outcome.poison_reasons.get(why, 0) + 1
                         items, skipped = [], True
-            candidates, mismatched = check_provenance(items, numbered, persons, chunk_context)
+            outcome.gemini_chunks += chunk_backend == "gemini"
+            candidates, mismatched = check_provenance(
+                items, numbered, persons, context, self_only=chunk_backend == "gemini"
+            )
             outcome.provenance_mismatch += mismatched
             preview_decisions.extend({"decision": "provenance_mismatch"} for _ in range(mismatched))
             candidates, forgotten = drop_forgotten(candidates, forgets, clears)
