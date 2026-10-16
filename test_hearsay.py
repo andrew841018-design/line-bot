@@ -342,3 +342,25 @@ def test_an_english_name_must_match_the_whole_word():
     roster = h.build_roster(["Ed", "成員甲"], {})
     assert judge("住在台中", "Ed", "成員甲", "Edwin住台中", roster).ok is False
     assert judge("住在台中", "Ed", "成員甲", "Ed住台中", roster) == h.Verdict(True, "Ed", "成員甲")
+
+
+
+# ── round 3（回歸審查）──────────────────────────────────────────────────────
+
+
+def test_very_is_not_a_negation():
+    assert judge("喜歡爬山", "爸爸", "成員甲", "爸爸非常喜歡爬山") == h.Verdict(True, "爸爸", "成員甲")
+
+
+@pytest.mark.parametrize("text", ["爸爸住台中或台南", "爸爸住台中蛤", "爸爸住台中ㄇ"])
+def test_more_hedges(text):
+    assert judge("住在台中", "爸爸", "成員甲", text).reason == "hedged"
+
+
+@pytest.mark.parametrize(
+    ("about", "text"),
+    [("（省略）", "阿爸住台中"), ("（省略）", "老伴住台中"), ("（省略）", "爸住台中"), ("我", "我老伴住台中"),
+     ("我", "我家那口子住台中"), ("（省略）", "醫生住台中")],
+)
+def test_more_family_words_keep_a_fact_off_the_speaker(about, text):
+    assert judge("住在台中", about, "成員甲", text) == h.Verdict(False, reason="self_other_people")
