@@ -6393,6 +6393,20 @@ def tmp_calendar_db(tmp_path, monkeypatch):
     return calendar_db
 
 
+@pytest.fixture
+def calendar_model_available(monkeypatch):
+    """2026-10-16: model-backed capture needs the last tier and runs in the
+    background.  These tests fake the model's answer, so open the gate and run
+    the background capture inline."""
+    import calendar_extractor
+    import main
+
+    monkeypatch.setattr(calendar_extractor, "model_call_ready", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        main, "_spawn_calendar_capture", lambda *a: main._capture_calendar_event_logged(*a)
+    )
+
+
 def test_same_group_title_date_allows_distinct_explicit_times(tmp_calendar_db):
     """Same title/date is not a duplicate when both explicit times differ."""
     cd = tmp_calendar_db
@@ -6421,6 +6435,7 @@ def test_same_group_title_date_allows_distinct_explicit_times(tmp_calendar_db):
 def test_calendar_capture_reschedules_only_with_explicit_reschedule_words(
     tmp_calendar_db,
     monkeypatch,
+    calendar_model_available,
 ):
     import calendar_extractor
     import main
@@ -6488,6 +6503,7 @@ def test_calendar_capture_reschedules_only_with_explicit_reschedule_words(
 def test_direct_calendar_capture_respects_reminder_no_write_boundary(
     tmp_calendar_db,
     monkeypatch,
+    calendar_model_available,
     text,
 ):
     import calendar_extractor
@@ -6511,6 +6527,7 @@ def test_direct_calendar_capture_respects_reminder_no_write_boundary(
 def test_calendar_capture_cancellation_selector_mismatch_does_not_reschedule(
     tmp_calendar_db,
     monkeypatch,
+    calendar_model_available,
 ):
     import calendar_extractor
     import main
@@ -6730,7 +6747,7 @@ def test_auto_capture_gate_accepts_weekday_chinese_time_dentist(monkeypatch):
 
 
 def test_medical_event_subjectless_defaults_to_sender_alias(
-    monkeypatch, tmp_calendar_db
+    monkeypatch, tmp_calendar_db, calendar_model_available
 ):
     """Subjectless medical events should still record who via sender alias."""
     import main
@@ -6765,7 +6782,7 @@ def test_medical_event_subjectless_defaults_to_sender_alias(
 
 
 def test_personal_trip_first_person_defaults_to_sender_alias(
-    monkeypatch, tmp_calendar_db
+    monkeypatch, tmp_calendar_db, calendar_model_available
 ):
     """For family shorthand, '我' means the LINE message sender."""
     import main
@@ -6802,7 +6819,7 @@ def test_personal_trip_first_person_defaults_to_sender_alias(
     assert json.loads(events[0]["participants"]) == ["媽媽(旅者)"]
 
 
-def test_donghai_events_default_to_dad(monkeypatch, tmp_calendar_db):
+def test_donghai_events_default_to_dad(monkeypatch, tmp_calendar_db, calendar_model_available):
     """Andrew's family convention: 東海-related events are usually dad's."""
     import main
     import calendar_extractor
@@ -6837,7 +6854,7 @@ def test_donghai_events_default_to_dad(monkeypatch, tmp_calendar_db):
 
 
 def test_donghai_default_does_not_override_explicit_other_actor(
-    monkeypatch, tmp_calendar_db
+    monkeypatch, tmp_calendar_db, calendar_model_available
 ):
     import main
     import calendar_extractor
@@ -6912,7 +6929,7 @@ def test_explicit_calendar_capture_passes_sender_user_id(monkeypatch):
 
 
 def test_calendar_capture_persists_second_event_when_model_returns_first_only(
-    monkeypatch, tmp_calendar_db
+    monkeypatch, tmp_calendar_db, calendar_model_available
 ):
     import main
     import calendar_extractor

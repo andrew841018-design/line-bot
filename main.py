@@ -13198,9 +13198,55 @@ def _maybe_capture_calendar_event(
     # Part of the capture ran outside its own try, so a failure there used to
     # skip the caller's completion mark (2026-09-26 review).
     try:
+        import calendar_extractor
+
+        # 2026-10-16: decided once, here.  A capture that may ask the last tier
+        # runs in the background: callers capture before replying and the
+        # webhook handler holds a global lock.  The inline path never asks a
+        # model (allow_model stays False), even if the tier frees up meanwhile.
+        # TODO(2026-10-16 GP2 A4): one message can reach the model twice (the
+        # every-message capture, then the burst/explicit capture); a
+        # (group_id, message_id) seen-set would save budget.  Awaiting Andrew.
+        if calendar_extractor.model_call_ready(combined_text):
+            try:
+                _spawn_calendar_capture(group_id, combined_text, sender_user_id, message_id)
+                return
+            except Exception as exc:
+                logger.warning(
+                    "calendar capture rules only: reason=spawn_failed error_type=%s",
+                    type(exc).__name__,
+                )
         _capture_calendar_event_now(group_id, combined_text, sender_user_id, message_id)
     except Exception as exc:
         logger.warning("calendar capture skipped error_type=%s", type(exc).__name__)
+
+
+from concurrent.futures import ThreadPoolExecutor as _CalendarCaptureTPE  # noqa: E402
+
+# One worker: model-backed captures run one at a time and each re-checks the
+# side-task budget, so a burst of dated messages cannot fan out requests.
+_CALENDAR_CAPTURE_EXECUTOR = _CalendarCaptureTPE(
+    max_workers=1, thread_name_prefix="calendar-capture"
+)
+
+
+def _capture_calendar_event_logged(
+    group_id: str, combined_text: str, sender_user_id: str, message_id: str
+) -> None:
+    try:
+        _capture_calendar_event_now(
+            group_id, combined_text, sender_user_id, message_id, allow_model=True
+        )
+    except Exception as exc:
+        logger.warning("calendar capture skipped error_type=%s", type(exc).__name__)
+
+
+def _spawn_calendar_capture(
+    group_id: str, combined_text: str, sender_user_id: str, message_id: str
+) -> None:
+    _CALENDAR_CAPTURE_EXECUTOR.submit(
+        _capture_calendar_event_logged, group_id, combined_text, sender_user_id, message_id
+    )
 
 
 def _capture_calendar_event_now(
@@ -13208,8 +13254,13 @@ def _capture_calendar_event_now(
     combined_text: str,
     sender_user_id: str = "",
     message_id: str = "",
+    *,
+    allow_model: bool = False,
 ) -> None:
-    """Calendar capture proper; `_maybe_capture_calendar_event` guards it."""
+    """Calendar capture proper; `_maybe_capture_calendar_event` guards it.
+
+    ``allow_model`` is True only on the background calendar worker.
+    """
     # Every caller, including direct explicit/burst reply paths, must share the
     # same reminder no-write boundary. Otherwise a suppressed reminder phrase
     # can still create a mirror calendar event after the reply is generated.
@@ -13256,9 +13307,13 @@ def _capture_calendar_event_now(
 
         if reminder_intent.is_obvious_noncommittal_source(combined_text):
             return
-        if _gemini_side_task_allowed("calendar_capture"):
+        # 2026-10-16: calendar extraction runs on the last tier's own budget,
+        # not the 2.5 models' 20-request reserve, and only on the background
+        # worker; side_task_last_tier makes the final budget check there.
+        if allow_model:
             data = calendar_extractor.extract(combined_text)
         else:
+            logger.info("calendar capture rules only: reason=inline")
             data = {
                 "has_event": False,
                 "is_cancellation": False,
@@ -13272,7 +13327,19 @@ def _capture_calendar_event_now(
             }
         extracted = calendar_extractor.extract_many(combined_text, primary=data)
         if extracted["is_cancellation"]:
-            kw = extracted.get("cancel_target_keyword")
+            kw = (extracted.get("cancel_target_keyword") or "").strip()
+            # 2026-10-16: only the model produces cancellations, and it now sees
+            # far more messages.  It may only cancel or move an event the
+            # message names: the text must say cancel/move, and the keyword
+            # must be two or more characters found in the text, so a date
+            # alone ("週六我不去了") never selects an event.  Nothing is replied
+            # here, so a wrong cancellation would go unnoticed.
+            if not calendar_extractor.text_says_cancel_or_move(combined_text):
+                logger.info("calendar cancel ignored reason=no_cancel_word group=%s", group_id)
+                return
+            if len(kw) < 2 or kw not in combined_text:
+                logger.info("calendar cancel ignored reason=keyword_not_in_text group=%s", group_id)
+                return
             is_reschedule = bool(
                 kw
                 and extracted.get("date")

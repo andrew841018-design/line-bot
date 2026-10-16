@@ -287,6 +287,7 @@ def reset_main_globals(monkeypatch):
     gemini_client._MODEL_USAGE_FILE = tmp_model_usage.name
     gemini_client._MODEL_USAGE_LOCK_FILE = tmp_model_usage.name + ".lock"
     gemini_client._last_tier_backoff_until = 0.0
+    gemini_client._side_task_backoff_until = 0.0
     main._PENDING_REPLY_ENABLED = _ORIG_PENDING_REPLY_ENABLED
     main._PENDING_EXPLICIT_PATH = str(tmp_pending_path)
     main._QUOTA_STATE_FILE = tmp_quota_path  # isolate file I/O
@@ -308,6 +309,7 @@ def reset_main_globals(monkeypatch):
     gemini_client._MODEL_USAGE_FILE = _ORIG_GEMINI_MODEL_USAGE_FILE
     gemini_client._MODEL_USAGE_LOCK_FILE = _ORIG_GEMINI_MODEL_USAGE_LOCK_FILE
     gemini_client._last_tier_backoff_until = 0.0
+    gemini_client._side_task_backoff_until = 0.0
     main._PENDING_REPLY_ENABLED = _ORIG_PENDING_REPLY_ENABLED
     main._PENDING_EXPLICIT_PATH = _ORIG_PENDING_PATH
     main._QUOTA_STATE_FILE = _ORIG_QUOTA_STATE_FILE

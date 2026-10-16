@@ -31,12 +31,15 @@ from google.genai import types
 
 import gemini_client
 import reminder_intent
-from config import settings
 
 logger = logging.getLogger(__name__)
 _TW = ZoneInfo("Asia/Taipei")
 
 
+# TODO(2026-10-16 GP2 S2): fence {dialogue} and say its text is never an
+# instruction (as restatement_judge does); drop "不去了" from the cancellation
+# examples (main ignores it) and ask for a keyword copied from the text.
+# Needs an old/new replay once the last tier is stable.
 _PROMPT = """你是家族 LINE 群行事曆助手。從下面這段對話判斷有沒有家族活動需要記下。
 
 抓「家族 / 個人重要事件」三類：
@@ -91,6 +94,41 @@ def _strip_code_fence(s: str) -> str:
     return s
 
 
+# 2026-10-16: the model only sees text that could date an event or cancel one;
+# the last tier's side-task budget is too small to spend on chit-chat.  Kept
+# close to main._AUTO_CAPTURE_DATE_HINT_RE (main cannot be imported here).
+_MODEL_DATE_HINT_RE = re.compile(
+    r"明天|後天|大後天|今天|這週末|下週末|下週|本週|下禮拜|下星期|下個月|"
+    r"月底|月初|月中|"
+    r"(?:星期|週|周|禮拜)[一二三四五六日天]|"
+    r"\d+月\d+[日號]|\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}|\d{1,2}\s*號|"
+    r"(?:[01]?\d|2[0-3]):[0-5]\d"
+)
+# Words that cancel or move an event.  main.py also requires one of them before
+# acting on a model cancellation.  "不去了" is left out on purpose: one person
+# not going is not the family event being cancelled (2026-10-16).
+_CANCEL_OR_MOVE_RE = re.compile(
+    r"取消|不辦了|作罷|停辦|延期|改期|改到|改成|改為|改至|改在|延後|延到|挪到|換到"
+)
+_URL_RE = re.compile(r"https?://[!-~]+")
+_MODEL_TIMEOUT_MS = 20_000
+_MODEL_MAX_OUTPUT_TOKENS = 1024
+
+
+def text_says_cancel_or_move(text: str) -> bool:
+    return bool(text) and _CANCEL_OR_MOVE_RE.search(text) is not None
+
+
+def model_call_ready(text: str) -> bool:
+    """True when ``text`` is worth one last-tier extraction request right now."""
+    if not text or not text.strip():
+        return False
+    plain = _URL_RE.sub(" ", text)
+    if not (_MODEL_DATE_HINT_RE.search(plain) or _CANCEL_OR_MOVE_RE.search(plain)):
+        return False
+    return gemini_client.side_task_last_tier_ready()
+
+
 def extract(combined_text: str) -> dict:
     """回 dict（必含 has_event / is_cancellation 兩 key）。失敗回 has_event=false。"""
     fail: dict = {
@@ -112,43 +150,49 @@ def extract(combined_text: str) -> dict:
     today, weekday = _today_tw()
     prompt = _PROMPT.format(today=today, weekday=weekday, dialogue=combined_text[:2000])
 
-    for model_name in (settings.gemini_light_model, "gemini-2.5-flash"):
-        try:
-            resp = gemini_client._client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    thinking_config=types.ThinkingConfig(thinking_budget=0),
-                    temperature=0.1,
-                ),
-            )
-            gemini_client._track_usage(resp)
-        except Exception as e:
-            gemini_client._track_failed_request()
-            err = str(e)
-            logger.warning(
-                "calendar extract failed (%s): %s", model_name, err[:200]
-            )
-            # 兩個 model 都試完才走 regex fallback；不論 429 or 非 429 都 try 下個。
-            continue
+    # 2026-10-16: only the last tier, on its own per-model quota.  The 2.5
+    # models' 20 requests a day belong to replies and reminder extraction.
+    resp = None
+    try:
+        resp = gemini_client.side_task_last_tier(
+            prompt,
+            types.GenerateContentConfig(
+                response_mime_type="application/json",
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+                temperature=0.1,
+                max_output_tokens=_MODEL_MAX_OUTPUT_TOKENS,
+                http_options=types.HttpOptions(timeout=_MODEL_TIMEOUT_MS),
+            ),
+            label="calendar extract",
+        )
+    except Exception as e:
+        logger.warning("calendar extract failed error_type=%s", type(e).__name__)
+    if resp is None:
+        logger.info("calendar extract: no model answer, trying rules")
+    else:
         try:
             text = _strip_code_fence(resp.text or "")
             data = _normalize(json.loads(text))
+            logger.info(
+                "calendar extract result has_event=%s is_cancellation=%s",
+                bool(data.get("has_event")), bool(data.get("is_cancellation")),
+            )
             if data.get("has_event") and reminder_intent.should_reject_reminder_candidate(
                 combined_text,
                 data.get("title"),
             ):
                 return fail
+            # The model resolves dates itself; one before today is history or a
+            # misread, never an upcoming event nor a new date for one (rules
+            # keep their own explicit-past-year handling).
+            if data.get("date") and data["date"] < today:
+                logger.info("calendar extract: model date is before today, ignored")
+                return fail
             return data
         except Exception as e:
-            err = str(e)
-            logger.warning(
-                "calendar extract parse failed (%s): %s", model_name, err[:200]
-            )
-            continue
+            logger.warning("calendar extract parse failed error_type=%s", type(e).__name__)
 
-    # Gemini 兩 model 都 fail → 純 regex fallback（family keyword whitelist 防誤判）
+    # 模型沒回答或答案讀不懂 → 純 regex fallback（family keyword whitelist 防誤判）
     try:
         import calendar_regex
         today_tw_date = datetime.now(_TW).date()
@@ -264,7 +308,7 @@ def _normalize(data: dict) -> dict:
     parts = data.get("participants") or []
     if not isinstance(parts, list):
         parts = []
-    parts = [str(p)[:20] for p in parts if p]
+    parts = [str(p)[:20] for p in parts if p][:8]
 
     def _s(k: str, max_len: int = 80) -> str | None:
         v = data.get(k)
@@ -291,17 +335,22 @@ def _normalize(data: dict) -> dict:
         "cancel_target_keyword": _s("cancel_target_keyword", 40),
         "event_type": et,
     }
-    # date 格式驗證：YYYY-MM-DD；否則 None
+    # date 格式驗證：YYYY-MM-DD；否則 None。補零成標準格式（2026-9-24 →
+    # 2026-09-24），日期在 DB 與比較裡都是字串，沒補零會比錯（2026-10-17）。
     date_val = out["date"]
     if isinstance(date_val, str) and date_val:
         try:
-            datetime.strptime(date_val, "%Y-%m-%d")
+            out["date"] = datetime.strptime(date_val, "%Y-%m-%d").date().isoformat()
         except ValueError:
             out["date"] = None
     # time：HH:MM
     time_val = out["time"]
     if isinstance(time_val, str) and time_val:
-        if not re.fullmatch(r"\d{2}:\d{2}", time_val):
+        try:
+            if not re.fullmatch(r"\d{2}:\d{2}", time_val):
+                raise ValueError(time_val)
+            datetime.strptime(time_val, "%H:%M")
+        except ValueError:
             out["time"] = None
     if reminder_intent.has_internal_prompt_artifact(out["title"]):
         out.update(

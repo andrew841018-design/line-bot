@@ -356,6 +356,145 @@ def _back_off_last_tier() -> None:
     _last_tier_backoff_until = time.time() + _LAST_TIER_BACKOFF_SEC
 
 
+# ── 側任務用第三層（2026-10-16）─────────────────────────────────────────────
+# Calendar extraction runs on the last tier only while it leaves
+# GEMINI_LAST_TIER_SIDE_TASK_RESERVE requests of the daily cap for replies and
+# reminder extraction.  Requests are booked per model only, never in the 2.5
+# models' 20-request counter.  A failure other than a spent daily quota backs
+# off side tasks alone, so a slow calendar call never keeps a family reply off
+# the last tier.
+_LAST_TIER_SIDE_TASK_RESERVE_DEFAULT = 20
+_SIDE_TASK_TRANSIENT_BACKOFF_SEC = 60
+_SIDE_TASK_CLIENT_ERROR_BACKOFF_SEC = 3600
+_side_task_backoff_until = 0.0
+
+
+def _last_tier_cap() -> int | None:
+    try:
+        return max(0, int(getattr(settings, "gemini_last_tier_daily_cap", 0)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _side_task_reserve() -> int | None:
+    """Requests of the daily cap kept for replies; ``None`` = unreadable.
+
+    The env var is also the rollback switch (set it to the cap), so a typo
+    fails closed: side tasks stay off the last tier.  Read at call time; the
+    process sees a new value after a restart.
+    """
+    raw = os.environ.get("GEMINI_LAST_TIER_SIDE_TASK_RESERVE", "").strip()
+    if not raw:
+        return _LAST_TIER_SIDE_TASK_RESERVE_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if value < 0:
+        logger.warning(
+            "GEMINI_LAST_TIER_SIDE_TASK_RESERVE is not a non-negative integer; "
+            "side tasks stay off the last tier"
+        )
+        return None
+    return value
+
+
+def _side_task_limit() -> int | None:
+    """chat + extract must stay below this for a side task to run; ``None`` = off."""
+    cap = _last_tier_cap()
+    reserve = _side_task_reserve()
+    if cap is None or reserve is None:
+        return None
+    return cap - reserve
+
+
+def side_task_last_tier_ready() -> bool:
+    """True when a side task may spend one last-tier request now (sends nothing).
+
+    Shared by every side task: one reserve, one backoff and the per-model
+    ``extract`` count, so log lines must carry the task's label.
+    """
+    model = last_tier_model()
+    if not model or time.time() < _side_task_backoff_until:
+        return False
+    if not last_tier_allowed("extract"):
+        return False
+    limit = _side_task_limit()
+    if limit is None:
+        return False
+    usage = model_usage(model)
+    return usage["chat"] + usage["extract"] < limit
+
+
+def _side_task_back_off(seconds: int) -> None:
+    global _side_task_backoff_until
+    _side_task_backoff_until = time.time() + seconds
+
+
+def _count_failed(entry: dict) -> None:
+    entry["failed"] = int(entry.get("failed") or 0) + 1
+
+
+def _side_task_log_fields(model: str, started: float) -> str:
+    usage = model_usage(model)
+    return (
+        f"elapsed_ms={int((time.monotonic() - started) * 1000)} "
+        f"thread={threading.current_thread().name} chat={usage['chat']} "
+        f"extract={usage['extract']} limit={_side_task_limit()}"
+    )
+
+
+def side_task_last_tier(prompt, config, *, label: str):
+    """Send one side-task request to the last tier; ``None`` = not sent or failed.
+
+    Logs carry only the label, model, error type/code, timing and counts:
+    never the prompt, the answer or the exception text.
+    """
+    if not side_task_last_tier_ready():
+        return None
+    model = last_tier_model()
+    started = time.monotonic()
+    # Booked before the call so a concurrent side task already sees it.
+    # TODO(2026-10-16 GP2 A3): check and book under one usage-file lock; the
+    # one-worker calendar executor keeps the overshoot to a request or two.
+    track_model(model, "extract")
+    try:
+        response = _client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=config,
+        )
+    except Exception as e:
+        _update_model_usage(model, _count_failed)
+        code = _error_code(e)
+        quota = "-"
+        if _is_rate_limited(e):
+            text = str(e)
+            quota = "day" if "PerDay" in text else "minute" if "PerMinute" in text else "other"
+        exhausted = quota == "day"
+        backoff = 0
+        if exhausted:
+            mark_model_exhausted(model)
+        elif code in (400, 401, 403, 404):
+            # Bad request, key or model name: it will not fix itself soon.
+            backoff = _SIDE_TASK_CLIENT_ERROR_BACKOFF_SEC
+        else:
+            # Overload, timeout, cancelled/aborted, per-minute 429, unknown.
+            backoff = _SIDE_TASK_TRANSIENT_BACKOFF_SEC
+        if backoff:
+            _side_task_back_off(backoff)
+        logger.warning(
+            "%s last tier %s failed error_type=%s code=%s quota=%s exhausted=%d backoff_s=%d %s",
+            label, model, type(e).__name__, code, quota, int(exhausted), backoff,
+            _side_task_log_fields(model, started),
+        )
+        return None
+    logger.info(
+        "%s answered by last tier %s %s", label, model, _side_task_log_fields(model, started)
+    )
+    return response
+
+
 def _error_code(e: BaseException) -> int | None:
     code = getattr(e, "code", None)
     return code if isinstance(code, int) else None
@@ -368,6 +507,8 @@ def _is_rate_limited(e: BaseException) -> bool:
 
 def is_daily_quota_error(e: BaseException) -> bool:
     """A 429 saying the model's requests-per-day quota is spent."""
+    # TODO(2026-10-16 GP2 A9): "free_tier_requests" may also appear in a
+    # per-minute 429; side_task_last_tier only trusts "PerDay".
     text = str(e)
     return _is_rate_limited(e) and ("PerDay" in text or "free_tier_requests" in text)
 
