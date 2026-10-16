@@ -806,6 +806,20 @@ def test_a_broken_dedupe_model_reports_embedder_unavailable(monkeypatch, job):
     assert memory.list_fact_rows(G) == [] and _cursor() == (T0, "")
 
 
+def test_parent_health_bot_replies_never_reach_this_jobs_model():
+    rows = dm.build_rows([
+        (T0, "m1", "__bot__", "爸媽健康：本週紀錄已更新"),
+        (T0 + 1, "m2", "__bot__", "  爸媽健康卡：請看卡片"),
+        (T0 + 2, "m3", "__bot__", "早安"),
+        (T0 + 3, "m4", "U_A", "爸媽健康：這行是家人自己打的"),
+        (T0 + 4, "m5", "U_A", "我住台中"),
+    ])
+    assert [row.kept for row in rows] == [False, False, True, True, True]
+    _system, user, _numbered, _persons = dm.build_prompt(rows)
+    assert "本週紀錄" not in user and "請看卡片" not in user
+    assert "早安" in user and "我住台中" in user
+
+
 @pytest.mark.parametrize(("src", "kept"), [(1, True), ("1", True), ("#1", True), (" # 1 ", True), ("²", False), ("abc", False), (1.0, False), (True, False), ("１", False)])
 def test_src_numbers_are_ascii_digits_only(src, kept):
     rows = dm.build_rows([(T0, "m1", "U_A", "我住台中")])

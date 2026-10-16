@@ -335,6 +335,15 @@ def _dropped(text: str) -> bool:
     return bool(fact_filters.LINK_RE.search(stripped)) and not fact_filters.LINK_RE.sub("", stripped).strip()
 
 
+# 爸媽健康功能的 bot 回覆（2026-10-11 和該功能協調）：這個 job 整則不看，連上下文都不給抽取模型。
+# 只管這個 job；即時抽取與回覆的上下文由該功能自己處理。
+_PRIVATE_BOT_PREFIXES = ("爸媽健康：", "爸媽健康卡：", "爸媽健康:", "爸媽健康卡:")
+
+
+def _private_bot_reply(user_id: str, text: str) -> bool:
+    return user_id == member_labels.BOT_USER_ID and text.lstrip().startswith(_PRIVATE_BOT_PREFIXES)
+
+
 def build_rows(
     raw: Sequence[tuple[int, str, str | None, str]], recent_senders: Sequence[str] | None = None
 ) -> list[Row]:
@@ -347,7 +356,7 @@ def build_rows(
     for position, (created_at, message_id, user_id, text) in enumerate(raw):
         user_id = user_id or ""
         text = text or ""
-        if _dropped(text):
+        if _dropped(text) or _private_bot_reply(user_id, text):
             rows.append(Row(position, created_at, message_id, user_id, "", "", kept=False, citable=False))
             continue
         if user_id == member_labels.BOT_USER_ID:
