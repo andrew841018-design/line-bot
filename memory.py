@@ -698,6 +698,20 @@ def fact_body(fact: str) -> str:
     return fact or ""
 
 
+def _plain_body(fact: str) -> str:
+    """事實本體去掉結尾的轉述標記「（X說的）」（2026-10-16）：/忘記、tombstone 都只看事情本身。"""
+    import hearsay
+
+    return hearsay.split_tag(fact_body(fact))[0]
+
+
+def is_hearsay_row(fact: str) -> bool:
+    """這一列看起來是轉述（本體結尾是「（X說的）」）；真正能不能升級另外看 ledger（fact_store）。"""
+    import hearsay
+
+    return hearsay.has_tag(fact_body(fact))
+
+
 _FACT_HASH_FINGERPRINT = "key_fingerprint"
 
 
@@ -750,9 +764,17 @@ def _tombstone_key() -> bytes | None:
 
 
 def _tombstone_body(user_id: str, fact: str) -> str:
+    """2026-10-16：轉述列的 tombstone 另放一個 namespace（"h: " 開頭；canonical 沒有空白，撞不到
+    真的本體）。轉述被 /忘記 之後，B 本人之後說同一件事照樣記得起來；本人的列被忘記，轉述也不會
+    再記（fact_store 的轉述候選兩個 namespace 都查）。"""
     import fact_hash
+    import hearsay
 
-    return fact_hash.canonical(fact_body(fact) if user_id else fact)
+    if not user_id:
+        return fact_hash.canonical(fact)
+    plain, said_by = hearsay.split_tag(fact_body(fact))
+    body = fact_hash.canonical(plain)
+    return hearsay.TOMBSTONE_PREFIX + body if said_by else body
 
 
 def _write_tombstones_conn(
@@ -794,11 +816,13 @@ def remove_fact(group_id: str, fact_substring: str) -> int:
                 "SELECT rowid, user_id, fact FROM facts WHERE group_id = ?", (group_id,)
             ).fetchall()
             # Only facts kept under a person start with their 「稱呼：」; older group
-            # facts such as 「某某生日：1/2」 are matched whole.
+            # facts such as 「某某生日：1/2」 are matched whole.  2026-10-16: a
+            # hearsay row's 「（X說的）」 is not part of the fact either, so
+            # 「/忘記 媽媽」 does not wipe everything 媽媽 ever said about others.
             needle = needle.casefold()
             doomed = [
                 (rowid, user_id, fact) for rowid, user_id, fact in rows
-                if needle in (fact_body(fact) if user_id else fact).casefold()
+                if needle in (_plain_body(fact) if user_id else fact).casefold()
             ]
             _write_tombstones_conn(c, group_id, [(user_id, fact) for _rowid, user_id, fact in doomed], key)
             rowids = [rowid for rowid, _user_id, _fact in doomed]
@@ -850,19 +874,26 @@ def clear_facts(group_id: str) -> int:
         return cur.rowcount
 
 
-def is_fact_tombstoned(group_id: str, user_id: str, body: str, *, key: bytes | None = None) -> bool:
+def is_fact_tombstoned(
+    group_id: str, user_id: str, body: str, *, key: bytes | None = None, include_hearsay: bool = False
+) -> bool:
     """這位家人的這條事實（本體）曾被 /忘記 或 /清除記憶 刪掉。
 
     key 沒給就用 fact_hash_key()；金鑰讀不到或對不上就丟例外（fail closed）。
+    include_hearsay=True（轉述候選）連轉述 namespace 一起查；本人的候選只查本人的（2026-10-16）。
     """
     import fact_hash
+    import hearsay
 
     key = key if key is not None else fact_hash_key()
-    body_hash = fact_hash.fact_hmac(group_id, user_id or "", fact_hash.canonical(body), key=key)
+    canonical = fact_hash.canonical(body)
+    texts = [canonical, hearsay.TOMBSTONE_PREFIX + canonical] if include_hearsay else [canonical]
+    hashes = [fact_hash.fact_hmac(group_id, user_id or "", text, key=key) for text in texts]
     with _conn() as c:
         row = c.execute(
-            "SELECT 1 FROM fact_tombstones WHERE group_id = ? AND user_id = ? AND body_hash = ?",
-            (group_id, user_id or "", body_hash),
+            "SELECT 1 FROM fact_tombstones WHERE group_id = ? AND user_id = ? AND body_hash IN "
+            f"({','.join('?' * len(hashes))})",
+            (group_id, user_id or "", *hashes),
         ).fetchone()
     return row is not None
 
@@ -887,6 +918,41 @@ def delete_fact_row(group_id: str, user_id: str, fact: str) -> bool:
         return cur.rowcount > 0
 
 
+def promote_hearsay_row(group_id: str, user_id: str, old_fact: str, new_fact: str) -> bool:
+    """把一條轉述列改成 B 本人的版本（2026-10-16「B 本人說過的版本優先」；只給 fact_store 的 job 路徑用）。
+
+    old_fact 一定要帶「（X說的）」、new_fact 一定不能帶。那一列已經不在（例如剛被 /忘記）或新文字
+    已經存在（主鍵衝突）就回 False，什麼都不改；同一列原地改，rowid 和順序不變。
+    """
+    if not is_hearsay_row(old_fact) or is_hearsay_row(new_fact):
+        return False
+    new_fact = one_line(new_fact)
+    if not new_fact:
+        return False
+    with _lock, _conn() as c:
+        try:
+            cur = c.execute(
+                "UPDATE facts SET fact = ? WHERE group_id = ? AND user_id = ? AND fact = ?",
+                (new_fact, group_id, user_id or "", old_fact),
+            )
+        except sqlite3.IntegrityError:
+            return False
+        return cur.rowcount > 0
+
+
+def restore_fact_row(group_id: str, user_id: str, current: str, original: str) -> bool:
+    """promote_hearsay_row 之後 ledger 寫不進去：把那一列改回原文（不留 tombstone）。"""
+    with _lock, _conn() as c:
+        try:
+            cur = c.execute(
+                "UPDATE facts SET fact = ? WHERE group_id = ? AND user_id = ? AND fact = ?",
+                (original, group_id, user_id or "", current),
+            )
+        except sqlite3.IntegrityError:
+            return False
+        return cur.rowcount > 0
+
+
 def list_fact_rows(group_id: str) -> list[tuple[str, str]]:
     """[(user_id, fact)]，舊到新。每條事實開頭是那位家人的稱呼（2026-10-09 起）。"""
     with _conn() as c:
@@ -903,7 +969,12 @@ def top_facts(group_id: str, user_id: str | None = None) -> list[str]:
     2026-10-09：事實各自掛在說到的那位家人身上（開頭寫稱呼）。正在說話的人的
     事實排前面，其餘新的在前；以前是整個群組依字母序取前幾條。
     """
-    rows = list(reversed(list_fact_rows(group_id)))
+    # 2026-10-16：轉述（「（X說的）」）只在 /看記憶 給大家看，不進回覆的提示——回覆的提示會把
+    # 正在說話那個人的事實當成他本人的資料，轉述還沒經過本人（GP2 S4）。
+    rows = [
+        (uid, fact) for uid, fact in reversed(list_fact_rows(group_id))
+        if not (uid and is_hearsay_row(fact))
+    ]
     own = [fact for uid, fact in rows if user_id and uid == user_id]
     others = [fact for uid, fact in rows if not (user_id and uid == user_id)]
     return (own + others)[: settings.max_facts_in_prompt]

@@ -11,7 +11,15 @@ source="daily"）都經過這裡：正規化 → 過濾（fact_filters）→ /�
 嵌入模型只在拿鎖之前用，持鎖時絕不呼叫模型。
 
 Report 只有數量（log 與 outcome 不能有事實文字或名字）；dry_run 才附每條的決定給預覽用，
-而且只有 add、dup 的那幾條帶文字（被擋下的健康、聯絡資料不留第二份明文）。
+而且只有 add、dup、upgrade 的那幾條帶文字（被擋下的健康、聯絡資料不留第二份明文）。
+
+2026-10-16 轉述（Andrew：A 講到家人 B 的事記到 B 名下、標「（A說的）」）：只有 job 會給
+FactItem.said_by、開 allow_hearsay／allow_upgrade，回覆路徑照舊只新增本人的事實。
+- 轉述另過 hearsay.scope_reason（只收住、工作上學、喜好、興趣、寵物、在學什麼），標記只由這裡加。
+- 去重、過濾、tombstone 一律看去掉標記的本體；轉述和 B 現有任何一條重複就不加（B 本人的版本優先）。
+- B 後來自己說了同一件事：那條轉述原地改成 B 的說法（只改 ledger 確認過的轉述列，GP2 S2）。
+- 轉述每人最多 HEARSAY_PER_PERSON_MAX 條、同一對（說的人, 對象）最多 HEARSAY_PER_PAIR_MAX 條。
+- ledger 多記 kind（self／hearsay／upgrade）與 backend；source 不變（ROLLBACK 照 source 刪）。
 """
 from __future__ import annotations
 
@@ -28,12 +36,14 @@ import time
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Any, Iterable, Iterator, NamedTuple, Sequence
 
 import fact_filters
 import fact_hash
+import hearsay
 import memory
 from config import settings
+from member_labels import _clean_member_label
 from speaker_turns import UNKNOWN_SPEAKER
 
 logger = logging.getLogger(__name__)
@@ -62,10 +72,23 @@ SUBSTITUTION_MAX_CHARS = 2
 # 沒有模型分不出來，一律當更正（寧可多一條，不吞更正）。
 SUBSTITUTION_SYNONYM_MIN = 0.95
 _EMBED_CACHE_MAX = 2048
+# 轉述的子上限（2026-10-16 審查 GP1#6、GP2）：一位話多的家人不能用轉述把 B 的 60 條填滿。
+HEARSAY_PER_PERSON_MAX = 10
+HEARSAY_PER_PAIR_MAX = 5
 
 
 class EmbedderUnavailable(RuntimeError):
     """job（lock_mode="wait"）的去重模型壞了：整批不寫（fail closed）。"""
+
+
+class FactItem(NamedTuple):
+    """一條要寫的事實：記在 label／user_id 名下；said_by 非空就是轉述（2026-10-16，只有 job 會給）。
+    舊的三元組 (稱呼, user_id, 事實) 照樣收。"""
+
+    label: str
+    user_id: str
+    fact: str
+    said_by: str = ""
 
 
 @dataclass(frozen=True)
@@ -73,6 +96,18 @@ class _Candidate:
     label: str
     user_id: str
     body: str
+    said_by: str = ""
+
+
+@dataclass
+class _Existing:
+    """這個人現有的一列：plain＝去掉標記、正規化後的本體；raw＝資料庫裡的原文；said_by＝標記上的人；
+    hearsay＝ledger 確認過的轉述（只有這種會被升級；/記住 打出來的同樣寫法算本人的列，GP2 S2／D2）。"""
+
+    plain: str
+    raw: str
+    said_by: str = ""
+    hearsay: bool = False
 
 
 @dataclass
@@ -85,6 +120,7 @@ class Report:
     capped: int = 0
     locked: int = 0
     error: int = 0
+    upgraded: int = 0
     rejected: dict[str, int] = field(default_factory=dict)
     decisions: list[dict[str, str]] | None = None
 
@@ -92,6 +128,7 @@ class Report:
         return {
             "added": self.added,
             "dup": self.dup,
+            "upgraded": self.upgraded,
             "tombstoned": self.tombstoned,
             "capped": self.capped,
             "locked": self.locked,
@@ -104,12 +141,16 @@ class Report:
         if self.decisions is not None:
             self.decisions.append({"decision": "rejected", "category": reason})
 
-    def _decide(self, label: str, body: str, decision: str) -> None:
-        """預覽只有 add、dup 帶稱呼和文字；其他決定只記決定本身（2026-10-11 修正第一輪 #6）。"""
+    def _decide(self, label: str, body: str, decision: str, said_by: str = "") -> None:
+        """預覽只有 add、dup、upgrade 帶稱呼和文字（轉述另帶 said_by）；其他決定只記決定本身
+        （2026-10-11 修正第一輪 #6）。"""
         if self.decisions is None:
             return
-        if decision in ("add", "dup"):
-            self.decisions.append({"decision": decision, "person": label, "fact": body})
+        if decision in ("add", "dup", "upgrade"):
+            entry = {"decision": decision, "person": label, "fact": body}
+            if said_by:
+                entry["said_by"] = said_by
+            self.decisions.append(entry)
         else:
             self.decisions.append({"decision": decision})
 
@@ -221,32 +262,44 @@ def _is_duplicate(
     high: float,
     low: float,
 ) -> bool:
+    return _duplicate_index(body, others, vectors, use_model=use_model, high=high, low=low) is not None
+
+
+def _duplicate_index(
+    body: str,
+    others: Iterable[str],
+    vectors: dict[str, tuple[float, ...]],
+    *,
+    use_model: bool,
+    high: float,
+    low: float,
+) -> int | None:
     """同一人的事實本體之間：完全相同；有模型時 cos ≥ high，或 cos ≥ low 且字元包含 ≥ 80%；
     沒有模型（或這一條沒有向量）時只看完全相同和字元包含。只有一邊有否定詞、或是替換
     （_substituted）就不算重複；兩道守門都在相似度之前，兩條路徑都套用。"""
     mine = fact_hash.canonical(body)
-    for other in others:
+    for index, other in enumerate(others):
         theirs = fact_hash.canonical(other)
         if not theirs:
             continue
         if mine == theirs:
-            return True
+            return index
         if _negated(mine) != _negated(theirs):
             continue
         va, vb = vectors.get(mine), vectors.get(theirs)
         cos = _cosine(va, vb) if use_model and va is not None and vb is not None else None
         if _substituted(mine, theirs):
             if cos is not None and cos >= SUBSTITUTION_SYNONYM_MIN:
-                return True  # 同義改寫
+                return index  # 同義改寫
             continue
         contained = _containment(mine, theirs)
         if cos is not None:
             if cos >= high or (cos >= low and contained >= CONTAINMENT_MIN):
-                return True
+                return index
             continue
         if contained >= CONTAINMENT_MIN:
-            return True
-    return False
+            return index
+    return None
 
 
 # 每條事實的向量快取（MiniLM 編過的不再編；回覆前最多 60 條既有事實）。換了模型物件就清掉。
@@ -296,12 +349,51 @@ def _encode(embedder: Any, texts: Iterable[str]) -> dict[str, tuple[float, ...]]
     return found
 
 
+def _plain(fact: str) -> tuple[str, str]:
+    """資料庫原文 → (去掉轉述標記、正規化後的本體, 標記上的人)。標記一定在 NFKC 之前拆（GP1#1）。"""
+    plain, said_by = hearsay.split_tag(memory.fact_body(fact))
+    return fact_hash.normalize_text(plain), said_by
+
+
 def _person_bodies(rows: Iterable[tuple[str, str]], user_ids: set[str]) -> dict[str, list[str]]:
     bodies: dict[str, list[str]] = {}
     for user_id, fact in rows:
         if user_id in user_ids:
-            bodies.setdefault(user_id, []).append(fact_hash.normalize_text(memory.fact_body(fact)))
+            bodies.setdefault(user_id, []).append(_plain(fact)[0])
     return bodies
+
+
+def _person_rows(
+    rows: Iterable[tuple[str, str]], user_ids: set[str], group_id: str, verified: set[str], key: bytes
+) -> dict[str, list[_Existing]]:
+    found: dict[str, list[_Existing]] = {}
+    for user_id, fact in rows:
+        if user_id not in user_ids:
+            continue
+        plain, said_by = _plain(fact)
+        confirmed = bool(said_by) and fact_hash.fact_hmac(group_id, user_id, fact, key=key) in verified
+        found.setdefault(user_id, []).append(_Existing(plain, fact, said_by, confirmed))
+    return found
+
+
+def _ledger_hearsay_hmacs(group_id: str) -> set[str] | None:
+    """ledger 裡記成轉述（kind=hearsay）的列的 HMAC；讀不到回 None——那就一列都不升級（fail closed）。"""
+    path = _ledger_path()
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    except (OSError, UnicodeError):
+        return None
+    found: set[str] = set()
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict) and entry.get("kind") == "hearsay" and entry.get("group_id") == group_id:
+            value = entry.get("fact_hmac")
+            if isinstance(value, str):
+                found.add(value)
+    return found
 
 
 # ── 鎖與 ledger ─────────────────────────────────────────────────────────────
@@ -335,16 +427,33 @@ def _store_lock(mode: str) -> Iterator[bool]:
         os.close(fd)
 
 
-def _append_ledger(source: str, group_id: str, user_id: str, stored: str, key: bytes) -> None:
-    """一行一次 write()、O_APPEND、從建立起就是 0600；只記 HMAC，不記事實原文。"""
+def _append_ledger(
+    source: str,
+    group_id: str,
+    user_id: str,
+    stored: str,
+    key: bytes,
+    *,
+    kind: str = "self",
+    backend: str = "",
+    replaces: str = "",
+) -> None:
+    """一行一次 write()、O_APPEND、從建立起就是 0600；只記 HMAC，不記事實原文。
+
+    2026-10-16：kind（self／hearsay／upgrade）、backend（claude／gemini／空）方便回溯；升級另記
+    被取代那一列的 HMAC（replaces_hmac）。source 照舊，回滾照 source 刪的流程不變。"""
     entry = {
         "ts": int(time.time()),
         "source": source,
+        "kind": kind,
+        "backend": backend,
         "group_id": group_id,
         "user_id": user_id,
         "fact_hmac": fact_hash.fact_hmac(group_id, user_id, stored, key=key),
         "db_path": str(memory._DB_PATH),
     }
+    if replaces:
+        entry["replaces_hmac"] = replaces
     line = (json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
     path = _ledger_path()
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -361,15 +470,18 @@ def _append_ledger(source: str, group_id: str, user_id: str, stored: str, key: b
 
 def add_person_facts(
     group_id: str,
-    items: Iterable[tuple[str, str, str]],
+    items: Iterable[Sequence[str]],
     *,
     source: str,
     embedder: Any,
     lock_mode: str,
     dry_run: bool = False,
     require_names: bool = False,
+    allow_hearsay: bool = False,
+    allow_upgrade: bool = False,
+    backend: str = "",
 ) -> Report:
-    """依序處理 [(稱呼, user_id, 事實)]，回傳 Report（只有數量）。
+    """依序處理 [(稱呼, user_id, 事實[, 誰說的])]（FactItem 或三元組），回傳 Report（只有數量）。
 
     embedder=None 只做完全相同與字元包含（短句同義靠這個抓）；有 embedder 時也比 MiniLM
     cos。require_names=True（job）時本機名單讀不到就丟 fact_filters.NameSourceUnavailable，
@@ -377,17 +489,21 @@ def add_person_facts(
     寫入一律透過 memory.add_fact（測試 mock 得到）。HMAC 金鑰由 memory.fact_hash_key()
     給，金鑰檔不見或被換掉時丟 fact_hash.FactHashKeyMismatch，整批不寫；job 的去重模型壞掉
     丟 EmbedderUnavailable。
+
+    2026-10-16：allow_hearsay（job 才開）才收帶「誰說的」的轉述；allow_upgrade（job 才開）才會把
+    ledger 確認過的轉述列改成本人的說法。回覆路徑兩個都不開：照舊只新增。
     """
     if lock_mode not in ("try", "wait"):
         raise ValueError(f"unknown lock mode {lock_mode!r}")
     report = Report(decisions=[] if dry_run else None)
-    items = list(items)
+    items = [FactItem(*item) for item in items]
     if not items:
         return report
     names = fact_filters.load_name_terms(require_names=require_names)
     candidates: list[_Candidate] = []
-    for label, user_id, fact in items:
+    for label, user_id, fact, said_by in items:
         label, user_id = str(label or "").strip(), str(user_id or "").strip()
+        said_by = str(said_by or "").strip()
         body = normalize_fact(fact, label)
         if not label or not user_id or user_id == "__bot__":
             report._reject("speaker")
@@ -396,11 +512,24 @@ def add_person_facts(
             # 存的是「稱呼：事實」整行，回覆的聯絡資料關卡也看整行：顯示名稱帶電話或地址就不存
             report._reject("label_contact")
             continue
+        if said_by:
+            if not allow_hearsay:
+                report._reject("hearsay_off")
+                continue
+            if _clean_member_label(said_by) != said_by or said_by == label or fact_filters.has_contact(said_by):
+                report._reject("said_by")
+                continue
+        if hearsay.has_tag(body):
+            # 「（X說的）」只能由這裡加：模型給的本體自己帶這種結尾就不收（NFKC 後只會是半形）
+            report._reject("said_tag")
+            continue
         reason = fact_filters.reject_reason(body, names=names)
+        if not reason and said_by:
+            reason = hearsay.scope_reason(body)
         if reason:
             report._reject(reason)
             continue
-        candidates.append(_Candidate(label, user_id, body))
+        candidates.append(_Candidate(label, user_id, body, said_by))
     if not candidates:
         return report
 
@@ -422,6 +551,10 @@ def add_person_facts(
     high = _threshold(DEDUPE_HIGH_ENV, FACT_DEDUPE_HIGH)
     low = _threshold(DEDUPE_LOW_ENV, FACT_DEDUPE_LOW)
     cap = per_person_max()
+    use_model = embedder is not None
+
+    def duplicate(body: str, others: list[str]) -> int | None:
+        return _duplicate_index(body, others, vectors, use_model=use_model, high=high, low=low)
 
     with _store_lock(lock_mode) as held:
         if not held:
@@ -429,34 +562,63 @@ def add_person_facts(
             for c in candidates:
                 report._decide(c.label, c.body, "locked")
             return report
-        existing = _person_bodies(memory.list_fact_rows(group_id), users)
+        rows = memory.list_fact_rows(group_id)
+        tagged = allow_upgrade and any(uid in users and memory.is_hearsay_row(fact) for uid, fact in rows)
+        verified = (_ledger_hearsay_hmacs(group_id) or set()) if tagged else set()
+        existing = _person_rows(rows, users, group_id, verified, key)
         pending: dict[str, int] = {}
         for c in candidates:
-            if memory.is_fact_tombstoned(group_id, c.user_id, c.body, key=key):
+            if memory.is_fact_tombstoned(group_id, c.user_id, c.body, key=key, include_hearsay=bool(c.said_by)):
                 report.tombstoned += 1
                 report._decide(c.label, c.body, "tombstoned")
                 continue
-            others = existing.setdefault(c.user_id, [])
-            if _is_duplicate(c.body, others, vectors, use_model=embedder is not None, high=high, low=low):
-                report.dup += 1
-                report._decide(c.label, c.body, "dup")
-                continue
+            entries = existing.setdefault(c.user_id, [])
+            if c.said_by:
+                # 轉述：和 B 現有任何一條（本人的或別的轉述）重複就不加——B 本人的版本優先
+                if duplicate(c.body, [e.plain for e in entries]) is not None:
+                    report.dup += 1
+                    report._decide(c.label, c.body, "dup", c.said_by)
+                    continue
+            else:
+                if duplicate(c.body, [e.plain for e in entries if not e.hearsay]) is not None:
+                    report.dup += 1
+                    report._decide(c.label, c.body, "dup")
+                    continue
+                told = [e for e in entries if e.hearsay]
+                index = duplicate(c.body, [e.plain for e in told])
+                if index is not None:
+                    if not allow_upgrade:
+                        report.dup += 1
+                        report._decide(c.label, c.body, "dup")
+                        continue
+                    _upgrade(report, group_id, c, told[index], source, key, backend, dry_run=dry_run)
+                    continue
             if memory.count_person_facts(group_id, c.user_id) + pending.get(c.user_id, 0) >= cap:
+                report.capped += 1
+                report._decide(c.label, c.body, "capped")
+                continue
+            if c.said_by and (
+                sum(1 for e in entries if e.said_by) >= HEARSAY_PER_PERSON_MAX
+                or sum(1 for e in entries if e.said_by == c.said_by) >= HEARSAY_PER_PAIR_MAX
+            ):
                 report.capped += 1
                 report._decide(c.label, c.body, "capped")
                 continue
             if dry_run:
                 pending[c.user_id] = pending.get(c.user_id, 0) + 1
-                others.append(c.body)
+                entries.append(_Existing(c.body, "", c.said_by, bool(c.said_by)))
                 report.added += 1
-                report._decide(c.label, c.body, "add")
+                report._decide(c.label, c.body, "add", c.said_by)
                 continue
-            stored = memory.one_line(f"{c.label}：{c.body}")
+            stored = memory.one_line(f"{c.label}：{c.body}{hearsay.tag(c.said_by) if c.said_by else ''}")
             if not memory.add_fact(group_id, stored, user_id=c.user_id):
                 report.dup += 1
                 continue
             try:
-                _append_ledger(source, group_id, c.user_id, stored, key)
+                _append_ledger(
+                    source, group_id, c.user_id, stored, key,
+                    kind="hearsay" if c.said_by else "self", backend=backend,
+                )
             except Exception as exc:
                 # 每一條自動加的事實都要在 ledger 裡（回滾靠它）：寫不進去就把剛寫的那列刪掉。
                 logger.warning("fact ledger append failed error_type=%s", type(exc).__name__)
@@ -466,6 +628,48 @@ def add_person_facts(
                     logger.error("fact ledger rollback failed error_type=%s", type(undo_exc).__name__)
                 report.error += 1
                 continue
-            others.append(c.body)
+            entries.append(_Existing(c.body, stored, c.said_by, bool(c.said_by)))
             report.added += 1
     return report
+
+
+def _upgrade(
+    report: Report,
+    group_id: str,
+    c: _Candidate,
+    target: _Existing,
+    source: str,
+    key: bytes,
+    backend: str,
+    *,
+    dry_run: bool,
+) -> None:
+    """B 自己說了一條 ledger 確認過的轉述：那一列原地改成 B 的說法（「B 本人說過的版本優先」）。
+
+    那一列剛被 /忘記（rowcount 0）或新文字已存在（主鍵衝突）都算 dup：不寫 ledger，也不改成新增——
+    新增會把剛忘記的事加回來（GP1#3）。ledger 寫不進去就改回原文。
+    """
+    if dry_run:
+        target.plain, target.raw, target.said_by, target.hearsay = c.body, "", "", False
+        report.upgraded += 1
+        report._decide(c.label, c.body, "upgrade")
+        return
+    stored = memory.one_line(f"{c.label}：{c.body}")
+    if not memory.promote_hearsay_row(group_id, c.user_id, target.raw, stored):
+        report.dup += 1
+        return
+    try:
+        _append_ledger(
+            source, group_id, c.user_id, stored, key, kind="upgrade", backend=backend,
+            replaces=fact_hash.fact_hmac(group_id, c.user_id, target.raw, key=key),
+        )
+    except Exception as exc:
+        logger.warning("fact ledger append failed error_type=%s", type(exc).__name__)
+        try:
+            memory.restore_fact_row(group_id, c.user_id, stored, target.raw)
+        except Exception as undo_exc:
+            logger.error("fact ledger rollback failed error_type=%s", type(undo_exc).__name__)
+        report.error += 1
+        return
+    target.plain, target.raw, target.said_by, target.hearsay = c.body, stored, "", False
+    report.upgraded += 1

@@ -56,9 +56,11 @@ class FakeModel:
         self.errors = dict(errors or {})  # 第幾次呼叫（從 1 起）→ 例外
         self.reply = reply
         self.prompts: list[tuple[str, str, list[str]]] = []
+        self.backends: list[str] = []
 
     def __call__(self, backend, system, user, persons):
         self.prompts.append((system, user, list(persons)))
+        self.backends.append(backend)
         error = self.errors.get(len(self.prompts))
         if error is not None:
             raise error
@@ -79,6 +81,8 @@ def job(tmp_path, monkeypatch):
     monkeypatch.setenv("LINE_FAMILY_ROLE_ALIASES_PATH", str(tmp_path / "no_roles.json"))
     monkeypatch.setattr(member_labels, "_food_alias", lambda _uid: "")
     monkeypatch.setenv("LINE_BOT_DAILY_MEMORY", "1")
+    # 2026-10-16 起備援預設開著；這些測試守的是只用一個模型時的規則，備援另有測試
+    monkeypatch.setenv("LINE_BOT_DAILY_MEMORY_FALLBACK", "0")
     monkeypatch.setattr(dm.settings, "family_group_id", G)
     monkeypatch.setattr(dm, "_gate", lambda _backend: "")
     monkeypatch.setattr(dm, "_load_embedder", FakeEmbedder)
@@ -366,10 +370,12 @@ def test_the_outcome_has_counts_only(job):
     assert outcome["status"] == "ok" and outcome["added"] == 1 and outcome["rejected"] == {"private": 1}
     assert outcome["last_success_at"] == NOW and outcome["people_near_cap"] == 0
     for key, value in outcome.items():
-        if key in ("rejected", "poison_reasons"):
+        if key in ("rejected", "poison_reasons", "hearsay_drops"):
             assert all(isinstance(v, int) for v in value.values())
         elif isinstance(value, str):
-            assert key in {"status", "mode", "backend", "stop_reason", "embedder_mode"}
+            assert key in {
+                "status", "mode", "backend", "stop_reason", "embedder_mode", "fallback_reason", "backend_used",
+            }
 
 
 def test_a_failed_run_keeps_the_last_success_time(monkeypatch, job):
@@ -1022,3 +1028,231 @@ def test_the_job_labels_a_new_member_whose_name_an_old_member_once_used(job):
     outcome = dm.run(now=NOW)
     assert outcome.added == 1
     assert memory.list_fact_rows(G) == [("U_NEW", "成員丁：住在台中")]
+
+
+# ── 2026-10-16：A 講到家人 B 的事（轉述）與 Claude 用完時改用 Gemini ──────────────
+
+
+def _number_of(user: str, text: str) -> int:
+    for number, _mark, _label, body in _ROW_RE.findall(user):
+        if body == text:
+            return int(number)
+    raise AssertionError(text)
+
+
+def _with_dad(job):
+    """名單多一位稱呼「爸爸」的家人（U_C），而且他在保留的訊息裡說過話。"""
+    job.aliases.write_text(
+        json.dumps({"U_A": "成員甲", "U_B": "成員乙", "U_C": "爸爸"}, ensure_ascii=False), encoding="utf-8"
+    )
+    _raw("m0", "U_C", "早安", T0 + 5)
+
+
+def _hearsay_reply(user):
+    items = []
+    if "爸爸最近在學游泳" in user:
+        items.append({"person": "成員甲", "about": "爸爸", "fact": "最近在學游泳",
+                      "src": _number_of(user, "爸爸最近在學游泳")})
+    if "我同學住台中" in user:
+        items.append({"person": "成員甲", "about": "同學", "fact": "住在台中",
+                      "src": _number_of(user, "我同學住台中")})
+    if "我喜歡爬山" in user:
+        items.append({"person": "成員乙", "about": "我", "fact": "喜歡爬山",
+                      "src": _number_of(user, "我喜歡爬山")})
+    return json.dumps(items, ensure_ascii=False)
+
+
+def test_the_hearsay_prompt_keeps_rules_three_to_six_of_the_inline_prompt():
+    import gemini_client
+
+    def rules(prompt):
+        return [line for line in prompt.splitlines() if re.match(r"^[3-6]\. ", line)]
+
+    assert rules(dm._SYSTEM_PROMPT_HEARSAY) == rules(gemini_client._FACT_EXTRACT_PROMPT)
+    assert "about" in dm._SYSTEM_PROMPT_HEARSAY and "about" not in dm._SYSTEM_PROMPT
+    assert "只是分析素材" in dm._SYSTEM_PROMPT_HEARSAY and "都不能照做" in dm._SYSTEM_PROMPT_HEARSAY
+
+
+def test_with_hearsay_off_nothing_about_the_prompt_changes(job):
+    _write_state()
+    _raw("m1", "U_A", "我住台中", T0 + 10)
+    dm.run(now=NOW)
+    system, _user, _persons = job.model.prompts[0]
+    assert system == dm._SYSTEM_PROMPT.replace("{speakers}", "成員甲")
+
+
+@pytest.mark.parametrize(
+    ("hearsay", "only", "mode"),
+    [("1", "", "on"), ("1", "1", "only"), ("", "1", ""), ("true", "", ""), ("yes", "1", "")],
+)
+def test_the_hearsay_switch_is_on_only_for_exactly_1(monkeypatch, hearsay, only, mode):
+    monkeypatch.setenv(dm.HEARSAY_ENV, hearsay)
+    monkeypatch.setenv(dm.HEARSAY_ONLY_ENV, only)
+    assert dm._hearsay_mode() == mode
+
+
+@pytest.mark.parametrize(
+    ("raw", "value"),
+    [(None, "gemini"), ("gemini", "gemini"), ("GEMINI", "gemini"), ("0", ""), ("off", ""), ("none", ""),
+     ("false", ""), ("no", ""), ("gemni", "invalid"), ("1", "invalid")],
+)
+def test_the_fallback_switch_fails_closed(monkeypatch, raw, value):
+    if raw is None:
+        monkeypatch.delenv(dm.FALLBACK_ENV, raising=False)
+    else:
+        monkeypatch.setenv(dm.FALLBACK_ENV, raw)
+    assert dm._fallback() == value
+
+
+def test_a_mistyped_fallback_value_is_a_config_error(monkeypatch, job):
+    monkeypatch.setenv(dm.FALLBACK_ENV, "gemni")
+    _write_state()
+    _raw("m1", "U_A", "我住台中", T0 + 10)
+    outcome = dm.run(now=NOW)
+    assert (outcome.status, outcome.exit_code) == ("config_invalid", 2) and job.model.prompts == []
+
+
+def test_what_one_member_says_about_another_is_filed_under_that_member(monkeypatch, job):
+    monkeypatch.setenv(dm.HEARSAY_ENV, "1")
+    _with_dad(job)
+    _write_state()
+    _raw("m1", "U_A", "爸爸最近在學游泳", T0 + 10)
+    _raw("m2", "U_A", "我同學住台中", T0 + 11)
+    _raw("m3", "U_B", "我喜歡爬山", T0 + 12)
+    job.model.reply = _hearsay_reply
+    outcome = dm.run(now=NOW)
+    assert sorted(memory.list_fact_rows(G)) == [
+        ("U_B", "成員乙：喜歡爬山"),
+        ("U_C", "爸爸：最近在學游泳（成員甲說的）"),
+    ]
+    assert (outcome.hearsay, outcome.provenance_mismatch) == (1, 1)
+    assert outcome.hearsay_drops == {"unresolved": 1}  # 同學不是家人：不記，也不會掛在說的人名下
+    system, _user, persons = job.model.prompts[0]
+    # 提示只是範本加上這一塊的說話的人：名單、別名、角色都不送模型（D4、GP2 S7-3）
+    assert system == dm._SYSTEM_PROMPT_HEARSAY.replace("{speakers}", "、".join(persons))
+
+
+def test_the_backfill_mode_writes_hearsay_only(monkeypatch, job):
+    monkeypatch.setenv(dm.HEARSAY_ENV, "1")
+    monkeypatch.setenv(dm.HEARSAY_ONLY_ENV, "1")
+    _with_dad(job)
+    _write_state()
+    _raw("m1", "U_A", "爸爸最近在學游泳", T0 + 10)
+    _raw("m3", "U_B", "我喜歡爬山", T0 + 12)
+    job.model.reply = _hearsay_reply
+    dm.run(now=NOW)
+    assert memory.list_fact_rows(G) == [("U_C", "爸爸：最近在學游泳（成員甲說的）")]
+
+
+def _fallback_on(monkeypatch):
+    monkeypatch.delenv(dm.FALLBACK_ENV, raising=False)
+
+
+def test_when_claudes_gate_is_closed_the_run_uses_gemini_for_own_facts_only(monkeypatch, job):
+    _fallback_on(monkeypatch)
+    monkeypatch.setenv(dm.HEARSAY_ENV, "1")
+    monkeypatch.setattr(dm, "_gate", lambda backend: "quota" if backend == "claude" else "")
+    _write_state()
+    _raw("m1", "U_A", "我住台中", T0 + 10)
+    outcome = dm.run(now=NOW)
+    assert job.model.backends == ["gemini"]
+    assert "about" not in job.model.prompts[0][0]  # Gemini 不抽轉述
+    assert memory.list_fact_rows(G) == [("U_A", "成員甲：住在台中")] and _cursor() == (T0 + 10, "m1")
+    assert (outcome.status, outcome.fallback_reason, outcome.backend_used) == ("ok", "quota", "gemini")
+    assert _ledger_backends() == ["gemini"]
+
+
+def _ledger_backends():
+    path = fact_store._ledger_path()
+    return [json.loads(line)["backend"] for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+@pytest.mark.parametrize("reason", ["backend_auth", "backend_unavailable", "quota"])
+def test_a_claude_outage_mid_run_retries_the_same_chunk_on_gemini(monkeypatch, job, reason):
+    _fallback_on(monkeypatch)
+    monkeypatch.setattr(dm, "_probe_failure", lambda backend: "quota" if reason == "quota" else "backend_down")
+    job.model.errors = {1: dm.TransientError(reason)}
+    _write_state()
+    _raw("m1", "U_A", "我住台中", T0 + 10)
+    outcome = dm.run(now=NOW)
+    assert job.model.backends == ["claude", "gemini"]
+    assert (outcome.status, outcome.chunks_failed, outcome.chunks_ok) == ("ok", 0, 1)
+    assert outcome.fallback_reason == reason and _state().get("transient", {}) == {}
+    assert memory.list_fact_rows(G) == [("U_A", "成員甲：住在台中")]
+
+
+def test_a_counted_failure_with_claude_down_switches_without_counting(monkeypatch, job):
+    _fallback_on(monkeypatch)
+    probes = []
+    monkeypatch.setattr(dm, "_probe_failure", lambda backend: probes.append(backend) or "backend_down")
+    job.model.errors = {1: dm.TransientError("timeout", counted=True)}
+    _write_state()
+    _raw("m1", "U_A", "我住台中", T0 + 10)
+    outcome = dm.run(now=NOW)
+    assert probes == ["claude"] and job.model.backends == ["claude", "gemini"]
+    assert outcome.fallback_reason == "backend_down" and _state().get("transient", {}) == {}
+
+
+def test_a_chunk_specific_claude_failure_still_counts(monkeypatch, job):
+    _fallback_on(monkeypatch)
+    monkeypatch.setattr(dm, "_probe_failure", lambda backend: "")
+    job.model.errors = {1: dm.TransientError("timeout", counted=True)}
+    _write_state()
+    _raw("m1", "U_A", "我住台中", T0 + 10)
+    outcome = dm.run(now=NOW)
+    assert job.model.backends == ["claude"]
+    assert (outcome.status, outcome.stop_reason) == ("stopped", "timeout")
+    assert _state()["transient"] == {f"{T0 + 10}:m1": 1}
+
+
+def test_a_quota_notice_that_the_probe_does_not_confirm_counts_against_the_chunk(monkeypatch, job):
+    _fallback_on(monkeypatch)
+    monkeypatch.setattr(dm, "_probe_failure", lambda backend: "")
+    job.model.errors = {1: dm.TransientError("quota")}
+    _write_state()
+    _raw("m1", "U_A", "我住台中", T0 + 10)
+    outcome = dm.run(now=NOW)
+    assert outcome.stop_reason == "quota_unconfirmed" and _state()["transient"] == {f"{T0 + 10}:m1": 1}
+
+
+def test_before_a_chunk_is_skipped_gemini_gets_one_try(monkeypatch, job):
+    _fallback_on(monkeypatch)
+    probes = []
+    monkeypatch.setattr(dm, "_probe_failure", lambda backend: probes.append(backend) or "")
+    key = f"{T0 + 10}:m1"
+    path = dm._state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({G: {"cursor": {"created_at": T0, "message_id": ""}, "poison": {},
+                                    "transient": {key: dm.TRANSIENT_SKIP_AFTER - 1}}}), encoding="utf-8")
+    _raw("m1", "U_A", "我住台中", T0 + 10)
+    job.model.errors = {1: dm.TransientError("timeout", counted=True)}
+    outcome = dm.run(now=NOW)
+    assert probes == ["claude"]  # 同一次失敗只探測一次，到門檻時沿用
+    assert job.model.backends == ["claude", "gemini"]
+    assert (outcome.chunks_poison, outcome.chunks_ok) == (0, 1) and _state()["transient"] == {}
+    assert memory.list_fact_rows(G) == [("U_A", "成員甲：住在台中")]
+
+
+def test_when_gemini_cannot_take_over_the_run_stops_with_claudes_reason(monkeypatch, job):
+    _fallback_on(monkeypatch)
+    monkeypatch.setattr(dm, "_gate", lambda backend: "quota")
+    _write_state()
+    _raw("m1", "U_A", "我住台中", T0 + 10)
+    outcome = dm.run(now=NOW)
+    assert (outcome.status, outcome.stop_reason, outcome.fallback_reason) == ("stopped", "quota", "")
+    assert job.model.prompts == [] and outcome.backend_used == ""
+
+
+def test_a_broken_gemini_setup_never_crashes_the_job(monkeypatch, job):
+    _fallback_on(monkeypatch)
+
+    def gate(backend):
+        if backend == "gemini":
+            raise RuntimeError("no gemini")
+        return "quota"
+
+    monkeypatch.setattr(dm, "_gate", gate)
+    _write_state()
+    _raw("m1", "U_A", "我住台中", T0 + 10)
+    outcome = dm.run(now=NOW)
+    assert (outcome.status, outcome.stop_reason, outcome.exit_code) == ("stopped", "quota", 0)

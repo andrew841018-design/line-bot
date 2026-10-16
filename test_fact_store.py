@@ -144,7 +144,7 @@ def test_filtered_facts_are_counted_by_category_only():
         ("成員甲", "U_A", "喜歡爬山"),
     ])
     assert report.counts() == {
-        "added": 1, "dup": 0, "tombstoned": 0, "capped": 0, "locked": 0, "error": 0,
+        "added": 1, "dup": 0, "upgraded": 0, "tombstoned": 0, "capped": 0, "locked": 0, "error": 0,
         "rejected": {"contact": 1, "name": 1, "private": 1, "speaker": 3},
     }
     assert report.decisions is None
@@ -335,8 +335,9 @@ def test_the_ledger_is_0600_and_holds_an_hmac_not_the_fact():
     text = path.read_text(encoding="utf-8")
     assert "台中" not in text and "成員甲" not in text
     (entry,) = _ledger_lines()
-    assert set(entry) == {"ts", "source", "group_id", "user_id", "fact_hmac", "db_path"}
+    assert set(entry) == {"ts", "source", "kind", "backend", "group_id", "user_id", "fact_hmac", "db_path"}
     assert entry["source"] == "daily" and entry["group_id"] == G and entry["user_id"] == "U_A"
+    assert (entry["kind"], entry["backend"]) == ("self", "")
     assert entry["fact_hmac"] == fact_hash.fact_hmac(G, "U_A", "成員甲：住在台中", key=memory.fact_hash_key())
     assert entry["db_path"] == str(memory._DB_PATH)
 
