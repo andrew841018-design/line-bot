@@ -364,3 +364,14 @@ def test_more_hedges(text):
 )
 def test_more_family_words_keep_a_fact_off_the_speaker(about, text):
     assert judge("住在台中", about, "成員甲", text) == h.Verdict(False, reason="self_other_people")
+
+
+
+def test_a_negated_source_cannot_become_a_positive_fact_through_a_negation_word_in_a_name():
+    assert judge("喜歡吃無花果", "爸爸", "成員甲", "爸爸不喜歡吃無花果").reason == "source:negation"
+    assert judge("不喜歡吃無花果", "爸爸", "成員甲", "爸爸不喜歡吃無花果") == h.Verdict(True, "爸爸", "成員甲")
+
+
+@pytest.mark.parametrize("text", ["同學住台中。我去台中玩", "爸爸住台中。我去台中玩"])
+def test_a_fact_from_another_sentence_is_not_the_speakers(text):
+    assert judge("住在台中", "我", "成員甲", text).ok is False

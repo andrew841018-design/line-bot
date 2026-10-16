@@ -439,6 +439,9 @@ def self_reason(
     for _score, clause in (item for item in scored if item[0] == best):
         if _quoted(text, clause):
             return "self_quoted"
+        if subject.kind == "self_word" and coverage_reason(fact, clause):
+            # 事實的內容其實在別的句子（「同學住台中。我去台中玩」）：不是說話的人自己的事（R3 GP2 回歸 2）
+            return "self_fabricated"
         spans = _member_spans(clause, roster, speaker)
         if any(label != speaker for _s, _e, label in spans):
             return "self_other_member"
@@ -489,7 +492,8 @@ def segment_reason(segment: str, fact: str) -> str:
         return "source:wish_past_other"
     if _OTHER_PEOPLE_RE.search(text) or _OTHER_KIN_RE.search(text):
         return "source:other_people"
-    if bool(_NEGATION_RE.search(text)) != bool(_NEGATION_RE.search(normalize(fact))):
+    # 否定要一樣多：只看有沒有的話，「不喜歡吃無花果」和「喜歡吃無花果」都含否定字（R3 GP2 回歸 1）
+    if collections.Counter(_NEGATION_RE.findall(text)) != collections.Counter(_NEGATION_RE.findall(normalize(fact))):
         return "source:negation"
     return ""
 
