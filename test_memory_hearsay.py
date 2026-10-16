@@ -239,3 +239,10 @@ def test_hearsay_shows_in_the_memory_list_but_not_in_reply_prompts():
     assert "【成員乙】" in text and "• 住在台中（成員甲說的）" in text and "• 喜歡爬山" in text
     assert memory.top_facts(G, user_id="U_B") == ["成員乙：喜歡爬山"]
     assert memory.top_facts(G) == ["成員乙：喜歡爬山"]
+
+
+
+def test_without_upgrades_a_hearsay_row_from_the_same_batch_is_not_rewritten():
+    report = _add([_told(), ("成員乙", "U_B", "住在台中")], allow_upgrade=False)
+    assert (report.added, report.upgraded, report.dup) == (1, 0, 1)
+    assert memory.list_fact_rows(G) == [("U_B", "成員乙：住在台中（成員甲說的）")]

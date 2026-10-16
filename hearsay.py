@@ -92,13 +92,15 @@ _DENY_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
         r"|胃口|吃不下|食慾|不穩|重聽|聽力|聽不清|聽不到|看不清|老花|近視|散光|白內障|記性|健忘|忘東忘西"
         r"|精神|沒力|無力|疲倦|疲勞|累|睡|夜尿|頻尿|尿|便祕|便秘|血|照顧|不便|行動"
         r"|一個人|獨居|輪椅|拐杖|看護|安養|養老|老人院|長照|吃藥|身體|三高|療養|病院|勒戒|戒治|戒癮|戒毒"
+        r"|護理之家|養護|日照|榮民之家|觀護|殯儀"
         r"|眼|耳|牙|腰|膝|關節"
     )),
     ("sensitive", re.compile(
         r"心情|情緒|壓力|憂|難過|傷心|生氣|哭|寂寞|孤單|戀愛|暗戀|喜歡的人|成績|分數|考試|考上|落榜|補習|升學"
         r"|同性|異性|女生|男生|女人|男人|性|砲|色情|(?i:a片|av)|成人片|夜店|酒店|監獄|看守所|坐牢|庇護|收容"
         r"|資遣|裁員|失業|找不到工作"
-        r"|宗教|信教|基督|天主|佛教|道教|教會|禱告|受洗|拜拜|廟|政治|選舉|投票|黨|雪茄|高粱|威士忌"
+        r"|宗教|信教|基督|天主|佛教|道教|教會|教堂|禱告|受洗|拜拜|廟|念經|吃齋|政治|政論|選舉|投票|黨"
+        r"|雪茄|高粱|威士忌|麻將|彩券|樂透|股票|成人影片"
     )),
     ("event", re.compile(r"準備|打算|即將|快要|要去|會去|剛|已經|終於|將要|計畫|預計")),
 )
@@ -120,19 +122,27 @@ def scope_reason(body: str) -> str:
 _CLAUSE_SPLIT_RE = re.compile(r"[，,。．.；;！!？?、：:\n\r  ]+")
 _HEDGE_RE = re.compile(
     r"是不是|對不對|好像|聽說|據說|可能|應該|也許|大概|似乎|不知道|不確定|我猜|難道|亂說|開玩笑|說笑|騙你|假的|才怪"
+    r"|還是|或是|或者|不對|記錯|搞錯|說錯|更正|隨便說"
     r"|嗎|呢|吧|[?？]"
 )
 # B 那一段原文裡有這些就不收：想要、以前、被、別人插在中間、幫別人做（post-impl GP2#1）。
 _SOURCE_DENY_RE = re.compile(
     r"想|要|希望|考慮|如果|以前|之前|曾經|本來|原本|被|幫|替|帶|有個|有一個|那個|這個"
+    r"|會|將|快|以後|之後|小時候|年輕時|從前|當年|曾|退休|過幾天|過"
 )
 # 否定：原文那一段和事實要一致（「爸爸不喜歡爬山」不能變成「喜歡爬山」）
-_NEGATION_RE = re.compile(r"不|沒|別|未")
+_NEGATION_RE = re.compile(r"不|沒|未|無|非|哪有|(?<!特)別")
 # 親屬稱謂與口語稱呼：本人事實的子句裡出現就分不出在講誰；名單裡的顯示名稱是這些也不收。
 _KIN_RE = re.compile(
     r"媽媽|爸爸|姊姊|姐姐|妹妹|弟弟|哥哥|阿婆|外婆|奶奶|阿嬤|爺爺|阿公|外公|兒子|女兒|老公|老婆|舅舅|阿姨"
     r"|姑姑|叔叔|伯伯|婆婆|公公|岳母|岳父|媳婦|女婿|父親|母親|孫子|孫女|老爸|老媽|老弟|老妹|老哥"
     r"|我[爸媽哥姊姐妹弟]"
+)
+# 本人事實的子句、B 那一段用的更寬清單（顯示名稱不用這個：「王先生」不該因此不能當對象，post-impl R2 GP1 F3）
+_OTHER_KIN_RE = re.compile(
+    _KIN_RE.pattern
+    + r"|爸媽|父母|雙親|家人|先生|太太|小孩|孩子|姪|甥|表[哥姐姊弟妹兄]|堂[哥姐姊弟妹兄]"
+    r"|學[長姐姊弟妹]|房東|親戚|親家|公婆|岳|娘家|婆家|乾[爸媽]|繼[父母]"
 )
 
 
@@ -178,6 +188,7 @@ _CONNECTORS = (
     "其實", "因為", "所以", "但是", "但", "而且", "還有", "不過", "反正", "對了", "現在", "平常",
     "通常", "常常", "一直", "最近", "我們", "你們", "咱們", "大家",
 )
+_CONNECTORS_LONGEST_FIRST = tuple(sorted(_CONNECTORS, key=len, reverse=True))
 _BAD_PLURAL = ("他們", "她們", "它們")
 _BAD_LEFT = frozenset("我你妳您他她它的")
 # 本人事實（主詞省略）的子句裡出現這些字，就分不出是在講誰（0086f5：同學的事被記在說話的人名下）。
@@ -290,7 +301,16 @@ def _left_ok(clause: str, start: int) -> bool:
         return True
     if before.endswith(_BAD_PLURAL) or prev in _BAD_LEFT:
         return False
-    return before.endswith(_CONNECTORS)
+    # 只看緊鄰的字不夠（「他說其實爸爸…」）：從右邊一直剝掉連接詞，剩下的一定要是開頭、空白或標點
+    rest, peeled = before, False
+    while True:
+        word = next((w for w in _CONNECTORS_LONGEST_FIRST if rest.endswith(w)), "")
+        if not word:
+            break
+        rest, peeled = rest[: -len(word)], True
+    if not peeled:
+        return False
+    return not rest or rest[-1].isspace() or unicodedata.category(rest[-1])[0] in "PZ" or rest[-1] in "@＠"
 
 
 def position_reason(clause: str, subject: Subject, roster: Roster, speaker: str) -> str:
@@ -354,30 +374,39 @@ def self_reason(
     subject: Subject, fact: str, text: str, roster: Roster, speaker: str,
     bigrams: Callable[[str], set[str]],
 ) -> str:
-    """本人事實的衛生檢查（轉述開關開啟時）：分不出在講誰就不收（D4-1、post-impl GP2#2）。
+    """本人事實的衛生檢查（轉述開關開啟時）：分不出在講誰就不收（D4-1、post-impl GP2#2、R2 GP1 F3）。
 
-    事實出自的那一句（重疊最多、不能平手）裡，除了說話的人自己的稱呼以外，不能有別的家人、
-    親屬稱謂、第三者或代名詞；自己的稱呼後面也不能接「的」（「媽媽的朋友住台中」）。
+    事實出自的句子：和事實重疊最多的那幾句（平手就每一句都要過）；about 是「我」時只看有「我／自己」
+    的句子。那些句子裡，除了說話的人自己的稱呼以外，不能有別的家人、親屬稱謂、第三者或代名詞；
+    自己的稱呼要在主詞位置（「我媽媽」「我的媽媽」是說話的人的媽媽）、後面也不能接「的」。
     """
-    clause, reason = best_clause(fact, text, bigrams)
-    if reason:
-        return reason
-    if subject.kind == "self_word" and not any(word in clause for word in SELF_WORDS):
-        return "self_word_missing"
-    spans = _member_spans(clause, roster, speaker)
-    if any(label != speaker for _s, _e, label in spans):
-        return "self_other_member"
-    own = [(s, e) for s, e, label in spans if label == speaker]
-    if any(clause[e:e + 1] == "的" for _s, e in own):
-        return "self_possessive"
-    rest = _blank_spans(clause, own)
-    if _OTHER_PEOPLE_RE.search(rest) or _KIN_RE.search(rest):
-        return "self_other_people"
+    grams = bigrams(fact)
+    scored = [(len(grams & bigrams(part)), part) for part in clauses(text)]
+    scored = [(score, part) for score, part in scored if score]
+    if subject.kind == "self_word":
+        scored = [(score, part) for score, part in scored if any(word in part for word in SELF_WORDS)]
+        if not scored:
+            return "self_word_missing"
+    if not scored:
+        return "clause_none"
+    best = max(score for score, _part in scored)
+    for _score, clause in (item for item in scored if item[0] == best):
+        spans = _member_spans(clause, roster, speaker)
+        if any(label != speaker for _s, _e, label in spans):
+            return "self_other_member"
+        own = [(s, e) for s, e, label in spans if label == speaker]
+        if any(clause[e:e + 1] == "的" for _s, e in own):
+            return "self_possessive"
+        if any(not _left_ok(clause, s) for s, _e in own):
+            return "self_position"
+        rest = _blank_spans(clause, own)
+        if _OTHER_PEOPLE_RE.search(rest) or _OTHER_KIN_RE.search(rest):
+            return "self_other_people"
     return ""
 
 
-def _segment(clause: str, subject: Subject, roster: Roster, speaker: str) -> str:
-    """B 那一段：B 的叫法之後到下一個家人叫法（或這一句結尾）；B 出現好幾次就全部接起來。"""
+def _segment_pieces(clause: str, subject: Subject, roster: Roster, speaker: str) -> list[str]:
+    """B 每一次出現之後到下一個家人叫法（或這一句結尾）的那一段。"""
     spans = _member_spans(clause, roster, speaker)
     pieces = []
     for index, (start, end, label) in enumerate(spans):
@@ -385,7 +414,21 @@ def _segment(clause: str, subject: Subject, roster: Roster, speaker: str) -> str
             continue
         stop = spans[index + 1][0] if index + 1 < len(spans) else len(clause)
         pieces.append(clause[end:stop])
-    return "".join(pieces)
+    return pieces
+
+
+def frame_reason(pieces: Iterable[str]) -> str:
+    """B 的每一段都要一開頭就是允許的句型（前面只准幾個副詞）：「爸爸說小明住台中」「爸爸陪小明在學游泳」
+    這種事情其實是別人的，模型改寫成「住在台中」也看不出來（post-impl R2 GP1 F1）。"""
+    for piece in pieces:
+        if not _FRAME_RE.search(normalize(piece).strip()):
+            return "source:frame"
+    return ""
+
+
+def _segment(clause: str, subject: Subject, roster: Roster, speaker: str) -> str:
+    """B 那一段：B 的叫法之後到下一個家人叫法（或這一句結尾）；B 出現好幾次就全部接起來。"""
+    return "".join(_segment_pieces(clause, subject, roster, speaker))
 
 
 def segment_reason(segment: str, fact: str) -> str:
@@ -396,7 +439,7 @@ def segment_reason(segment: str, fact: str) -> str:
             return f"source:{category}"
     if _SOURCE_DENY_RE.search(text):
         return "source:wish_past_other"
-    if _OTHER_PEOPLE_RE.search(text) or _KIN_RE.search(text):
+    if _OTHER_PEOPLE_RE.search(text) or _OTHER_KIN_RE.search(text):
         return "source:other_people"
     if bool(_NEGATION_RE.search(text)) != bool(_NEGATION_RE.search(normalize(fact))):
         return "source:negation"
@@ -432,6 +475,7 @@ def judge(
     reason = (
         position_reason(clause, subject, roster, speaker)
         or segment_reason(_segment(clause, subject, roster, speaker), fact)
+        or frame_reason(_segment_pieces(clause, subject, roster, speaker))
         or bind_reason(fact, clause, subject, roster, speaker, bigrams)
     )
     if reason:

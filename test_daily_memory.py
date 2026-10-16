@@ -1366,3 +1366,18 @@ def test_the_hearsay_roster_uses_roles_and_short_names_from_local_config(monkeyp
     _raw("m1", "U_B", "早安", T0 + 6)
     roster = dm.hearsay_context(G).roster
     assert roster.terms["妹妹"] == "成員乙" and roster.terms["員甲"] == "成員甲"
+
+
+
+def test_gemini_cannot_file_hearsay_even_if_it_returns_about(monkeypatch, job):
+    _fallback_on(monkeypatch)
+    monkeypatch.setenv(dm.HEARSAY_ENV, "1")
+    monkeypatch.setattr(dm, "_gate", lambda backend: "quota" if backend == "claude" else "")
+    _with_dad(job)
+    _write_state()
+    _raw("m1", "U_A", "爸爸最近在學游泳", T0 + 10)
+    job.model.reply = _hearsay_reply  # 帶 about="爸爸"
+    outcome = dm.run(now=NOW)
+    assert job.model.backends == ["gemini"]
+    assert memory.list_fact_rows(G) == [] and outcome.hearsay == 0
+    assert outcome.hearsay_drops == {"self_other_member": 1}  # 當成說話的人自己的事，又提到別的家人：不收

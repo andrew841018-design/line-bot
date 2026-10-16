@@ -584,8 +584,8 @@ def add_person_facts(
                     report.dup += 1
                     report._decide(c.label, c.body, "dup")
                     continue
-                # 只有 allow_upgrade 才會有 ledger 確認過的轉述列；回覆路徑這裡一定是空的
-                told = [e for e in entries if e.hearsay]
+                # 只有 allow_upgrade 才看 ledger 確認過的轉述列（這一批剛加的轉述也一樣，R2 GP1 N3）
+                told = [e for e in entries if e.hearsay] if allow_upgrade else []
                 index = duplicate(c.body, [e.plain for e in told])
                 if index is not None:
                     _upgrade(report, group_id, c, told[index], source, key, backend, dry_run=dry_run)
@@ -603,7 +603,7 @@ def add_person_facts(
                 continue
             if dry_run:
                 pending[c.user_id] = pending.get(c.user_id, 0) + 1
-                entries.append(_Existing(c.body, "", c.said_by, bool(c.said_by)))
+                entries.append(_Existing(c.body, "", c.said_by, bool(c.said_by) and allow_upgrade))
                 report.added += 1
                 report._decide(c.label, c.body, "add", c.said_by)
                 continue
@@ -625,7 +625,7 @@ def add_person_facts(
                     logger.error("fact ledger rollback failed error_type=%s", type(undo_exc).__name__)
                 report.error += 1
                 continue
-            entries.append(_Existing(c.body, stored, c.said_by, bool(c.said_by)))
+            entries.append(_Existing(c.body, stored, c.said_by, bool(c.said_by) and allow_upgrade))
             report.added += 1
     return report
 

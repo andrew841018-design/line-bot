@@ -99,7 +99,8 @@ def test_a_fact_in_no_allowed_frame_is_refused():
      ("三高", "health"), ("約砲", "sensitive"), ("被公司資遣", "sensitive"),
      ("一個人住", "health"), ("耳背", "health"), ("眼睛花", "health"), ("住在養老院", "health"),
      ("在學戒癮", "health"), ("喜歡男生", "sensitive"), ("喜歡去教會", "sensitive"), ("支持某黨", "sensitive"),
-     ("喜歡喝高粱", "sensitive"), ("喜歡抽雪茄", "sensitive"), ("喜歡看A片", "sensitive"), ("愛去夜店", "sensitive")],
+     ("喜歡喝高粱", "sensitive"), ("喜歡抽雪茄", "sensitive"), ("喜歡看A片", "sensitive"), ("愛去夜店", "sensitive"),
+     ("住在護理之家", "health"), ("喜歡打麻將", "sensitive"), ("喜歡玩股票", "sensitive"), ("喜歡去教堂", "sensitive")],
 )
 def test_bodies_the_post_implementation_review_got_through_are_refused(body, category):
     assert h.scope_reason(body) == f"scope:{category}"
@@ -253,3 +254,44 @@ def test_unsafe_display_labels(label):
 @pytest.mark.parametrize("label", ["Amy", "成員甲", "小寶貝"])
 def test_ordinary_display_labels(label):
     assert not h.unsafe_label(label)
+
+
+# ── post-impl 審查第二輪（R2 GP1 F1–F3、N1、N2）──────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["爸爸說小明住台中", "爸爸教小明住台中", "爸爸陪小明住台中", "爸爸羨慕老張住台中",  # F1：B 後面接的是別人的事
+     "爸爸會搬到台中", "爸爸住過台中", "爸爸小時候住台中", "爸爸住台中，不對，住台南", "爸爸住台中還是台南",  # F2
+     "他說其實爸爸住台中", "去年其實爸爸住台中", "爸爸哪有住台中"],
+)
+def test_more_ways_the_fact_is_not_really_about_the_member(text):
+    fact = "搬到台中" if "搬到" in text else "住在台中"
+    verdict = judge(fact, "爸爸", "成員甲", text)
+    assert not verdict.ok and verdict.reason.startswith(("source:", "hedged", "position"))
+
+
+def test_an_allowed_adverb_is_not_a_negation():
+    assert judge("喜歡爬山", "爸爸", "成員甲", "爸爸特別喜歡爬山") == h.Verdict(True, "爸爸", "成員甲")
+
+
+@pytest.mark.parametrize(
+    ("about", "speaker", "text", "reason"),
+    [
+        ("媽媽", "媽媽", "我媽媽住台中", "self_position"),  # 說話的人的媽媽，不是她自己
+        ("我", "媽媽", "我媽媽住台中", "self_position"),
+        ("我", "媽媽", "我的媽媽住台中", "self_position"),
+        ("（省略）", "成員甲", "爸媽住台中", "self_other_people"),
+        ("我", "媽媽", "我先生住台中", "self_other_people"),
+    ],
+)
+def test_family_words_the_member_list_does_not_cover_still_block_a_speakers_fact(about, speaker, text, reason):
+    assert judge("住在台中", about, speaker, text) == h.Verdict(False, reason=reason)
+
+
+@pytest.mark.parametrize(
+    ("fact", "text"),
+    [("喜歡爬山", "我喜歡爬山，爸爸也喜歡爬山"), ("住在新竹", "我住新竹，上班也在新竹")],
+)
+def test_the_speakers_own_sentence_is_the_one_with_me_in_it(fact, text):
+    assert judge(fact, "我", "成員甲", text) == h.Verdict(True, "成員甲", "")
