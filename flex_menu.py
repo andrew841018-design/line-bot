@@ -35,7 +35,7 @@ BUTTONS: tuple[tuple[str, str], ...] = (
     ("📋 提醒清單", "/提醒清單"),
     ("📅 行事曆", "/行事曆"),
     ("🍽️ 外食推薦", "今晚吃什麼？"),
-    ("🍳 今晚煮什麼", "/今晚煮什麼"),
+    ("🩺 爸媽健康", "/健康"),  # 2026-10-11；取代「🍳 今晚煮什麼」（/今晚煮什麼 打字照用）
     ("🛒 該買什麼", "/該買什麼"),
     ("🧊 家裡有什麼", "/家裡有什麼"),
     ("📊 民調結果", "/民調"),
@@ -61,7 +61,12 @@ def _normalize(text: str | None) -> str:
     return unicodedata.normalize("NFKC", text or "").strip().rstrip("?!").strip()
 
 
-_BUTTON_TEXTS = frozenset(_normalize(text) for _label, text in BUTTONS)
+# 從選單拿掉、但舊的大字卡片上還點得到的按鈕：點了照樣算「按了選單按鈕」，回覆會把選單掛回去。
+_RETIRED_BUTTON_TEXTS = ("/今晚煮什麼",)  # 2026-10-11 換成「🩺 爸媽健康」
+
+_BUTTON_TEXTS = frozenset(
+    _normalize(text) for text in (*(text for _label, text in BUTTONS), *_RETIRED_BUTTON_TEXTS)
+)
 
 
 def might_be_menu_request(text: str) -> bool:

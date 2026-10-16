@@ -48,6 +48,8 @@ _SUMMARY_REQUEST = (
 )
 _SUMMARY_PREFIX = "📋 本週咪寶摘要"
 _FAMILY_PREFIX = "👨‍👩‍👧‍👦 家族熱話週報"
+# 爸媽健康（2026-10-11）的回覆開頭（＝parent_health.BOT_PREFIXES，測試確認一致）：不進 📋 摘要的模型輸入。
+_HEALTH_PREFIXES = ("爸媽健康：", "爸媽健康卡：")
 
 # 所有可能卡住的工作（📋 摘要、新聞、家人小建議、財經驗證）都在背景跑，
 # 推播前最多等到啟動後 120 秒（留時間給兩次推播與存檔）；財經驗證最多等到
@@ -61,10 +63,11 @@ _workers: dict = {}
 _run_started = _STARTED
 
 
-def _push(text: str) -> bool:
+def _push(text: str, archive_text: str | None = None) -> bool:
     """推一則文字；送出成功就記成 __bot__ 訊息，家人引用週報回應時才找得到。
 
     先過推播驗證：沒過就不推（否則群組會收到「送出前被擋下」的訊息）。
+    ``archive_text``：存檔改存這段（爸媽健康段落只推不存，引用週報或之後的 job 都讀不到）。
     """
     if not output_validator.validate_outbound_text(text).ok:
         print("ERR 週報未通過推播驗證，不推")
@@ -80,7 +83,13 @@ def _push(text: str) -> bool:
         return True
     for message_id in sent_ids[:1]:
         try:
-            memory.log_raw_message(GROUP_ID, message_id, "__bot__", text, index_for_recall=False)
+            memory.log_raw_message(
+                GROUP_ID,
+                message_id,
+                "__bot__",
+                text if archive_text is None else archive_text,
+                index_for_recall=False,
+            )
         except Exception as exc:
             print(f"ERR 週報訊息存檔失敗（不影響推播）: {type(exc).__name__}")
     return True
@@ -232,7 +241,7 @@ def main() -> int:
     # 只取 bot 的回應；上週的週報本身不算
     bot_replies = [
         text for _, uid, text, _ in all_msgs
-        if uid == "__bot__" and not str(text).startswith((_SUMMARY_PREFIX, _FAMILY_PREFIX))
+        if uid == "__bot__" and not str(text).startswith((_SUMMARY_PREFIX, _FAMILY_PREFIX, *_HEALTH_PREFIXES))
     ]
 
     if not bot_replies:
@@ -275,7 +284,12 @@ def main() -> int:
             print("ERR 家族熱話未通過推播驗證，這週不推")
             family_text = ""
         if family_text:
-            if _push(family_text[:4900]):
+            pushed_text = _with_parent_health(GROUP_ID, family_text)
+            if pushed_text == family_text:
+                pushed = _push(family_text[:4900])
+            else:
+                pushed = _push(pushed_text, archive_text=family_text)
+            if pushed:
                 print(f"家族熱話週報已推播（{len(family_text)} 字，小建議 {len(insights)} 人）")
             else:
                 push_failed = True
@@ -290,6 +304,26 @@ def main() -> int:
     if finance_ok and n_validated:
         print(f"finance_view validator updated {n_validated} views")
     return 1 if push_failed else 0
+
+
+def _with_parent_health(group_id: str, family_text: str) -> str:
+    """家族熱話後面接「🩺 爸媽這週」（2026-10-11 爸媽健康）：同一則推播、不多用額度。
+
+    段落出錯、沒過推播驗證、或合併後超過 4900 字，就照原本的家族熱話推（逐字不變）。
+    """
+    try:
+        import parent_health
+
+        section = parent_health.weekly_section(group_id)
+        if not section or not output_validator.validate_outbound_text(section).ok:
+            return family_text
+        combined = f"{family_text}\n\n{section}"
+        if len(combined) > 4900 or not output_validator.validate_outbound_text(combined).ok:
+            return family_text
+        return combined
+    except Exception as exc:
+        print(f"ERR 爸媽健康段落（週報照舊）: {type(exc).__name__}")
+        return family_text
 
 
 def _workers_still_running() -> bool:

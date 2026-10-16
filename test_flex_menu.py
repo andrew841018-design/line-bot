@@ -57,6 +57,8 @@ SHIPPED_BUTTON_TEXTS = (
     "/FCN",
     # 2026-10-10：股票推薦（路由測試在 test_stock_routing.py）。
     "/股票",
+    # 2026-10-11：爸媽健康取代「🍳 今晚煮什麼」（路由測試在 test_health_routing.py；/今晚煮什麼 仍在上面、照樣接得到）。
+    "/健康",
 )
 
 # 指令型按鈕 → 應該接手的既有處理函式。/help 與晚餐推薦另有專門測試。
@@ -143,7 +145,7 @@ def test_every_button_text_is_recorded_as_shipped():
 
 
 def test_every_shipped_text_has_a_routing_test():
-    assert set(SHIPPED_BUTTON_TEXTS) == set(_COMMAND_ROUTES) | {"/help", "今晚吃什麼？", "/FCN", "/股票"}
+    assert set(SHIPPED_BUTTON_TEXTS) == set(_COMMAND_ROUTES) | {"/help", "今晚吃什麼？", "/FCN", "/股票", "/健康"}
 
 
 def test_menu_respects_line_quick_reply_limits():

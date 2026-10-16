@@ -138,6 +138,9 @@ _SQLITE_MODULE_NAMES = (
     "knowledge_graph",
     "message_classifier",
 )
+# 2026-10-11 爸媽健康：這個模組本身不存在時（還沒部署）跳過，不讓整套測試在 setup 就失敗；
+# 它 import 別的東西失敗時照樣報錯，不會默默寫到錯的 DB。
+_OPTIONAL_SQLITE_MODULE_NAMES = ("parent_health_db",)
 
 
 def _sqlite_sidecar_paths(db_path: Path) -> tuple[str, str, str]:
@@ -183,6 +186,12 @@ def _configure_test_sqlite(db_path: Path) -> None:
     main.settings.sqlite_path = str(db_path)
     for module_name in _SQLITE_MODULE_NAMES:
         _configure_sqlite_module(module_name, db_path)
+    for module_name in _OPTIONAL_SQLITE_MODULE_NAMES:
+        try:
+            _configure_sqlite_module(module_name, db_path)
+        except ModuleNotFoundError as exc:
+            if exc.name != module_name:
+                raise
 
 
 def _restore_sqlite_paths() -> None:
@@ -422,6 +431,17 @@ def isolate_daily_memory(monkeypatch, tmp_path_factory):
     except Exception:  # fact_store 自己壞了：只讓它的測試失敗
         return
     monkeypatch.setattr(fact_store, "loaded_embedder", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def isolate_parent_health(monkeypatch):
+    """2026-10-11：爸媽健康的背景工作（抽取 executor、每日檢查執行緒）不能在測試裡起來；要測抽取就
+    直接呼叫 observe_message。模組不存在或換成緊急停用版時也不影響其他測試。"""
+    try:
+        import parent_health
+    except Exception:
+        return
+    monkeypatch.setattr(parent_health, "_BACKGROUND_ENABLED", False, raising=False)
 
 
 @pytest.fixture(autouse=True)

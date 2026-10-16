@@ -88,6 +88,7 @@ from linebot.v3.webhooks import (  # type: ignore[import-untyped]
     MemberLeftEvent,
     MessageEvent,
     TextMessageContent,
+    UnsendEvent,
     VideoMessageContent,
 )
 
@@ -114,7 +115,7 @@ logging.basicConfig(
 # log 時間戳用 PT（Gemini quota 以這個為準）+ TW（使用者看這個）雙時區，
 # 避免「現在才 0800 為什麼 quota 就爆了」的誤判 — Gemini 的「一天」是 PT 的一天。
 # PT 帶毫秒，回覆延遲才量得出來；開頭的 "MM-DD " 不能動：health_check.sh 用
-# "^$PT_TODAY .*429" 數當天 429，daily_briefing_discord 用 " ERROR " 找錯誤行。
+# "^$PT_TODAY .*429" 數當天 429。
 class _DualTZFormatter(logging.Formatter):
     _PT = ZoneInfo("America/Los_Angeles")
     _TW = ZoneInfo("Asia/Taipei")
@@ -175,6 +176,7 @@ async def _app_lifespan(_app: FastAPI):
     )
     _app.state.local_vision_maintenance_task = vision_maintenance_task
     stock_picks_module = None
+    parent_health_module = None
     try:
         _app.state.webhook_handler_loop = asyncio.get_running_loop()
         _app.state.webhook_handler_lock = asyncio.Lock()
@@ -215,8 +217,21 @@ async def _app_lifespan(_app: FastAPI):
             stock_picks_module.start_background()
         except Exception as exc:
             logger.warning("stock picks background start failed error_type=%s", type(exc).__name__)
+        # 爸媽健康（2026-10-11）：每天 21:00 後檢查一次異常、私訊 Andrew；啟動失敗只記種類。
+        try:
+            import parent_health as _parent_health
+
+            parent_health_module = _parent_health
+            parent_health_module.start_background()
+        except Exception as exc:
+            logger.warning("parent health background start failed error_type=%s", type(exc).__name__)
         yield
     finally:
+        if parent_health_module is not None:
+            try:
+                parent_health_module.stop_background(timeout=2.0)
+            except Exception as exc:
+                logger.warning("parent health background stop failed error_type=%s", type(exc).__name__)
         if stock_picks_module is not None:
             try:
                 stock_picks_module.stop_background(timeout=2.0)
@@ -2893,6 +2908,11 @@ def _handle_event(event) -> None:
                 pass
         return
 
+    # 收回訊息（2026-10-11 爸媽健康）：刪掉那則留言記下的健康紀錄；其他資料照舊。
+    if isinstance(event, UnsendEvent):
+        _forget_unsent_health_records(event)
+        return
+
     # 只處理群組裡的 message
     if not isinstance(event, MessageEvent):
         return
@@ -2951,13 +2971,17 @@ def _handle_event(event) -> None:
     # 2026-10-09 Andrew：「取消妹妹不回覆這個設定，從現在起妹妹的言論要回覆」——
     # 每位家人的訊息都走同一條路由（2026-09-19 的零回覆 gate 與 10/05 的引用例外已移除）。
     if isinstance(msg, TextMessageContent):
-        # FCN、股票推薦指令不進 recall（2026-10-09／10-10）：之後的模型回覆不能把評估改寫成買賣建議。
-        recall_kwargs = {} if _investment_command(msg.text, msg) is None else {"index_for_recall": False}
+        # FCN、股票推薦、爸媽健康指令不進 recall（2026-10-09／10-10／10-11）：之後的模型回覆不能把
+        # 評估改寫成買賣建議，也不會把健康指令當成聊天素材。
+        no_recall = _investment_command(msg.text, msg) is not None or _health_command_body(msg.text, msg) is not None
+        recall_kwargs = {"index_for_recall": False} if no_recall else {}
         memory.log_raw_message(
             group_id, msg.id, sender_user_id, msg.text or "",
             quoted_message_id=getattr(msg, "quoted_message_id", None),
             **recall_kwargs,
         )
+        # 爸媽健康（2026-10-11）：每則文字都交給背景抽取；只有同意過的家長會被記，重送靠 UNIQUE 冪等。
+        _observe_parent_health(event, group_id, msg, sender_user_id)
 
     # ── quota 爆時：非文字內容不排 pending reply ────────────────────────
     # Andrew 2026-06-06 指示取消 pending 回覆機制；File/Audio 在額度爆時
@@ -6753,11 +6777,26 @@ def _handle_text_message(
     if stock_body is not None:
         _reply_stock_picks(event, group_id, text, stock_body)
         return
+    # 爸媽健康（2026-10-11）：「/健康」同 FCN／股票，放在提醒路徑之前（「/健康 130/85」不會被當成日期），
+    # 一律在這裡回覆並 return；也不取消別人正在累積的 burst。
+    health_body = _health_command_body(text, event.message)
+    if health_body is not None:
+        _reply_health(event, group_id, text, health_body)
+        return
+    # 爸媽健康的緊急字詞（2026-10-11，Andrew 選 4A）：同意過的家長提到胸痛、跌倒這類，立刻回就醫／119 提醒，
+    # 同時私訊 Andrew。回了就不再往下走；沒回（舊訊息、未來句、30 分鐘內回過）照常路由。
+    # 放在引用卡片的固定句之前：引用卡片再說「我剛剛跌倒了」也要先回 119。
+    if _maybe_reply_parent_red_flag(event, group_id, text):
+        return
     # 引用 bot 的投資卡片（股票推薦／股票評估／FCN 評估）又不是指令：回固定句，不讓模型把
     # 卡片改寫成買賣建議；放在提醒、引用擴展、burst 之前。
     quoted_investment = _quoted_bot_investment_kind(event, group_id)
     if quoted_investment is not None:
         _reply_investment_quote_notice(event, group_id, quoted_investment)
+        return
+    # 引用 bot 的爸媽健康卡又不是指令：回固定句，不讓模型判讀紀錄（卡片存檔只有 altText，也沒有資料）。
+    if _quoted_bot_health_card(event, group_id):
+        _reply_health_quote_notice(event, group_id)
         return
     # Cancellation must run before quote-context expansion, one-shot replies,
     # calendar capture, classifiers, and reminder extraction.  Otherwise a
@@ -20590,6 +20629,205 @@ def _reply_investment_quote_notice(event, group_id: str, kind: str) -> None:
     )
 
 
+# 「/健康」後面要嘛空白、結尾，要嘛直接接已知的子指令（「/健康同意」「/健康暫停爸爸」）；「/健康管理」「/今日健康」不算。
+_HEALTH_COMMAND_RE = re.compile(r"/\s{0,3}(?:爸媽)?健康(?=\s|$|爸爸|媽媽|同意|暫停|吃藥了|有運動|刪除|說明)")
+_HEALTH_FAILURE_TEXT = "爸媽健康：暫時無法回覆，請稍後再試"
+_HEALTH_CARD_PREFIX = "爸媽健康卡："  # parent_health.CARD_PREFIX；模組載不進來時引用檢查照樣有效
+
+
+def _health_command_body(text: str | None, message) -> str | None:
+    """「/健康 …」「/爸媽健康 …」後面的字（去頭尾空白，可能是空字串）；不是這個指令回 None。"""
+    body = _command_body(text, message, _HEALTH_COMMAND_RE, "健康", "health")
+    return None if body is None else body.strip()
+
+
+def _quoted_message_id(event, group_id: str) -> str | None:
+    """這則訊息引用的同群組訊息 ID（訊息上的，或持久化的引用關係）；查不到回 None。"""
+    message = getattr(event, "message", None)
+    try:
+        quoted_id = getattr(message, "quoted_message_id", None)
+        if not isinstance(quoted_id, str) or not quoted_id:
+            quoted_id = memory.get_quoted_message_id(group_id, getattr(message, "id", None))
+    except Exception as exc:
+        logger.warning("quoted message lookup failed error_type=%s", type(exc).__name__)
+        return None
+    return quoted_id if isinstance(quoted_id, str) and quoted_id else None
+
+
+def _reply_health(event, group_id: str, text: str, body: str) -> None:
+    """爸媽健康指令：parent_health 回卡片或文字，一律經 `_reply_command_card`（只用 reply token、不進 recall）。
+    模組載不進來或出錯時回固定句，不會掉進一般路由交給模型。"""
+    message = event.message
+    reply_text, card, alt_text, fallback = _HEALTH_FAILURE_TEXT, None, None, _HEALTH_FAILURE_TEXT
+    try:
+        import parent_health
+
+        reply = parent_health.handle_command(
+            group_id,
+            getattr(event.source, "user_id", None),
+            body,
+            message_id=str(getattr(message, "id", "") or ""),
+            quoted_message_id=_quoted_message_id(event, group_id),
+        )
+        fallback = reply.fallback_text or _HEALTH_FAILURE_TEXT
+        if reply.card is not None and reply.alt_text:
+            reply_text, card, alt_text = None, reply.card, reply.alt_text
+        else:
+            reply_text = reply.text or fallback
+    except Exception as exc:
+        logger.error("parent health command failed error_type=%s", type(exc).__name__)
+    _reply_command_card(
+        event, group_id, text, reply_text=reply_text, card=card, alt_text=alt_text, fallback_text=fallback
+    )
+
+
+def _quoted_bot_health_card(event, group_id: str) -> bool:
+    """引用的是同群組裡 bot 發的爸媽健康卡（altText 以「爸媽健康卡：」開頭）。查不到就不算。"""
+    quoted_id = _quoted_message_id(event, group_id)
+    if not quoted_id:
+        return False
+    try:
+        row = memory.get_raw_message(group_id, quoted_id)
+    except Exception as exc:
+        logger.warning("health quote lookup failed error_type=%s", type(exc).__name__)
+        return False
+    if not row or row[0] != "__bot__":
+        return False
+    return str(row[1] or "").lstrip().startswith(_HEALTH_CARD_PREFIX)
+
+
+def _reply_health_quote_notice(event, group_id: str) -> None:
+    notice = "爸媽健康：卡片上是從群組留言整理的紀錄，咪寶不會判讀或診斷。"
+    try:
+        import parent_health
+
+        notice = parent_health.QUOTE_NOTICE
+    except Exception as exc:
+        logger.warning("parent health import failed error_type=%s", type(exc).__name__)
+    _clear_reply_mention_targets(event.reply_token)
+    _reply(event.reply_token, notice, group_id=group_id, allow_push_fallback=False, index_for_recall=False)
+
+
+def _maybe_reply_parent_red_flag(event, group_id: str, text: str) -> bool:
+    """同意過的家長提到緊急狀況時回固定的就醫／119 提醒；回 True＝這則已處理、不再往下走。
+
+    判斷（regex＋讀同意表，不叫模型、不連網）在 webhook 鎖裡跑。提醒只用這則的 reply token、
+    不搭到期提醒；送出結果（含靜音、失敗）交給 parent_health 記去重並私訊 Andrew。"""
+    # 指令（含先點名咪寶再打的「咪寶 /記住 …」）走原本的路由，不當成在講身體狀況。
+    if _is_bot_command(text, event.message):
+        return False
+    try:
+        import parent_health
+    except Exception as exc:
+        logger.warning("parent health import failed error_type=%s", type(exc).__name__)
+        return False
+    message_id = str(getattr(event.message, "id", "") or "")
+    try:
+        decision = parent_health.red_flag_decision(
+            group_id,
+            getattr(event.source, "user_id", None),
+            text,
+            message_id=message_id,
+            event_ts_ms=getattr(event, "timestamp", None),
+        )
+    except Exception as exc:
+        logger.warning("parent health red flag check failed error_type=%s", type(exc).__name__)
+        return False
+    if decision is None:
+        return False
+    sent = suppressed = False
+    if decision.reply:
+        _clear_reply_mention_targets(event.reply_token)
+        delivery: dict = {}
+        try:
+            sent = bool(
+                _reply(
+                    event.reply_token,
+                    parent_health.SAFETY_TEXT,
+                    group_id=group_id,
+                    allow_push_fallback=decision.allow_push,
+                    include_auxiliary=False,
+                    primary_delivery=delivery,
+                    index_for_recall=False,
+                )
+            )
+        except Exception as exc:
+            logger.error("parent health safety reply failed error_type=%s", type(exc).__name__)
+        suppressed = bool(delivery.get("suppressed"))
+    try:
+        parent_health.red_flag_outcome(
+            group_id,
+            decision,
+            message_id=message_id,
+            sent=sent,
+            suppressed=suppressed,
+            muted=bool(settings.bot_muted),
+        )
+    except Exception as exc:
+        logger.warning("parent health red flag outcome failed error_type=%s", type(exc).__name__)
+    if not decision.reply:
+        return False
+    # 這則不再走後面的路由；/今日健康 用的分類照樣補上。
+    try:
+        import message_classifier
+
+        category = message_classifier.classify_rule(text)
+        if category is not None:
+            message_classifier.update_category(group_id, message_id, category)
+    except Exception as exc:
+        logger.debug("message classify after safety reply skipped error_type=%s", type(exc).__name__)
+    return True
+
+
+def _is_bot_command(text: str | None, message) -> bool:
+    """「/」開頭的指令，或先點名咪寶再打的指令（「咪寶 /記住 …」「@咪寶 /健康」）。爸媽健康的緊急字詞與
+    抽取都只看這一個判斷（parent_health 自己只認「/」開頭，不會比這裡寬）。一般訊息沒有「/」，不用多跑
+    一次稱呼解析（test_flex_menu 守住這個）。"""
+    normalized = _command_text(text)
+    if normalized.startswith("/"):
+        return True
+    if "/" not in normalized:
+        return False
+    try:
+        addressed = _extract_gemini_trigger(text or "", message) or ""
+    except Exception:
+        return False
+    return _command_text(addressed).startswith("/")
+
+
+def _observe_parent_health(event, group_id: str, msg, sender_user_id: str | None) -> None:
+    if _is_bot_command(msg.text, msg):  # 指令不抽取（和 119 用同一個判斷）
+        return
+    try:
+        import parent_health
+
+        parent_health.observe_async(
+            group_id, msg.id, sender_user_id, msg.text or "", event_ts_ms=getattr(event, "timestamp", None)
+        )
+    except Exception as exc:
+        logger.warning("parent health observe failed error_type=%s", type(exc).__name__)
+
+
+def _forget_unsent_health_records(event) -> None:
+    """收回訊息：刪掉那則留言記下的爸媽健康紀錄（群組白名單照舊）。"""
+    source = getattr(event, "source", None)
+    unsend = getattr(event, "unsend", None)
+    if not isinstance(source, GroupSource) or unsend is None:
+        return
+    group_id = source.group_id
+    if settings.allowed_group_ids and group_id not in settings.allowed_group_ids:
+        return
+    message_id = getattr(unsend, "message_id", None)
+    if not message_id:
+        return
+    try:
+        import parent_health
+
+        parent_health.forget_message(group_id, str(message_id))
+    except Exception as exc:
+        logger.warning("parent health unsend cleanup failed error_type=%s", type(exc).__name__)
+
+
 def _reply_command_card(
     event,
     group_id: str,
@@ -21210,6 +21448,12 @@ _HELP_TEXT = (
     "  /今晚煮什麼             用家裡現有食材推薦菜色\n"
     "  /該買什麼               待買食材清單（最近 14 天）\n"
     "  /家裡有什麼             最近 14 天記錄到的食材\n"
+    "【爸媽健康】\n"
+    "  /健康                   爸媽健康卡：近 7 天用藥、看診、運動、睡眠、飲食、身體\n"
+    "  /健康 爸爸、/健康 媽媽  看近 14 天的細節\n"
+    "  /健康 同意              爸爸或媽媽本人按，開始記錄自己的健康留言\n"
+    "  /健康 暫停              爸爸或媽媽本人按，停止記錄（別人可打 /健康 暫停 爸爸）\n"
+    "                          記錯了：引用那則留言再打 /健康 刪除\n"
     "【民調】\n"
     "  /民調 <問題>            開一個群組民調，會通知全體\n"
     "  /民調                   看目前民調統計\n"

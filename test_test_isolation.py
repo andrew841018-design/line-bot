@@ -297,3 +297,41 @@ def test_sqlite_teardown_uses_quarantine_not_production():
     assert embedding_recall._DB_PATH == expected
     assert message_classifier._DB_PATH == expected
     assert expected.name.startswith("line_bot_pytest_quarantine_")
+
+
+def test_parent_health_async_passes_spawn_time_db_path(monkeypatch, tmp_path):
+    # 2026-10-11 爸媽健康：背景抽取在送出時就抓 DB 路徑，測試結束換回去之後才跑也不會寫錯 DB。
+    import parent_health
+    import parent_health_db
+
+    spawn_db = tmp_path / "spawn.db"
+    restored_db = tmp_path / "restored.db"
+    targets = []
+    calls = []
+
+    class FakeExecutor:
+        def submit(self, target):
+            targets.append(target)
+
+    def fake_observe_message(group_id, message_id, user_id, text, *, event_ts_ms, db_path=None, now=None):
+        calls.append(db_path)
+        return 0
+
+    monkeypatch.setattr(parent_health, "_BACKGROUND_ENABLED", True)
+    monkeypatch.setattr(parent_health, "_EXECUTOR", FakeExecutor())
+    monkeypatch.setattr(parent_health, "observe_message", fake_observe_message)
+    monkeypatch.setattr(parent_health_db, "_DB_PATH", spawn_db)
+
+    parent_health.observe_async("G1", "M1", "U1", "我剛吃完藥了", event_ts_ms=1_791_700_000_000)
+    assert len(targets) == 1
+
+    monkeypatch.setattr(parent_health_db, "_DB_PATH", restored_db)
+    targets[0]()
+
+    assert calls == [spawn_db]
+
+
+def test_parent_health_async_is_off_while_tests_run():
+    import parent_health
+
+    assert parent_health._BACKGROUND_ENABLED is False
