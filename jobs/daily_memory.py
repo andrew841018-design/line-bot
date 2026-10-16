@@ -213,6 +213,7 @@ class Outcome:
     exit_code: int = 0
     mode: str = ""
     backend: str = ""
+    hearsay_mode: str = ""  # on／only／空（R2 GP2 B3：忘了關補跑模式時看得出來）
     stop_reason: str = ""
     chunks_ok: int = 0
     chunks_failed: int = 0
@@ -288,8 +289,11 @@ def _gemini_model() -> str:
 def _hearsay_mode() -> str:
     """"on"、"only"（只寫轉述，補跑用）、""（關）或 "invalid"；只有剛好是 "1" 才算開（fail closed）。
     只開 HEARSAY_ONLY 沒開 HEARSAY 是設定錯誤：補跑時照一般方式跑一輪，等於白補（post-impl GP2#7）。"""
-    on = os.environ.get(HEARSAY_ENV, "").strip() == "1"
-    only = os.environ.get(HEARSAY_ONLY_ENV, "").strip() == "1"
+    raw_on = os.environ.get(HEARSAY_ENV, "").strip()
+    raw_only = os.environ.get(HEARSAY_ONLY_ENV, "").strip()
+    if raw_on not in ("", "0", "1") or raw_only not in ("", "0", "1"):
+        return "invalid"  # true／yes／on 這種不猜：補跑時猜錯會變成一般的一輪（R2 GP2 B3）
+    on, only = raw_on == "1", raw_only == "1"
     if only and not on:
         return "invalid"
     return ("only" if only else "on") if on else ""
@@ -899,10 +903,10 @@ def _finish(outcome: Outcome, now: float) -> Outcome:
     except OSError as exc:
         log.warning("daily memory outcome not written error_type=%s", type(exc).__name__)
     log.info(
-        "daily memory status=%s mode=%s stop=%s chunks_ok=%d failed=%d poison=%d pending=%d "
+        "daily memory status=%s mode=%s hearsay_mode=%s stop=%s chunks_ok=%d failed=%d poison=%d pending=%d "
         "added=%d dup=%d tombstoned=%d capped=%d forgotten=%d provenance_mismatch=%d gap=%s "
         "hearsay=%d upgraded=%d fallback=%s",
-        outcome.status, outcome.mode, outcome.stop_reason or "-", outcome.chunks_ok,
+        outcome.status, outcome.mode, outcome.hearsay_mode or "-", outcome.stop_reason or "-", outcome.chunks_ok,
         outcome.chunks_failed, outcome.chunks_poison, outcome.chunks_pending, outcome.added,
         outcome.dup, outcome.tombstoned, outcome.capped, outcome.forgotten,
         outcome.provenance_mismatch, outcome.gap_detected, outcome.hearsay, outcome.upgraded,
@@ -982,7 +986,7 @@ def _store(
 def _run_locked(
     group_id: str, mode: str, backend: str, now: float, *, fallback: str = "", hearsay_mode: str = ""
 ) -> Outcome:
-    outcome = Outcome("ok", mode=mode, backend=backend)
+    outcome = Outcome("ok", mode=mode, backend=backend, hearsay_mode=hearsay_mode)
     dry_run = mode == "dry_run"
     try:
         state, cursor, poison, transient = load_state(group_id)

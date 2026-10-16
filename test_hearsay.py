@@ -204,8 +204,8 @@ def test_a_speakers_fact_that_may_be_about_someone_else_is_dropped(fact, about, 
     ("fact", "about", "speaker", "text", "reason"),
     [
         ("搬到台中", "爸爸", "成員甲", "爸爸想搬到台中", "source:wish_past_other"),
-        ("搬到台中", "爸爸", "成員甲", "爸爸下個月要搬到台中", "source:time"),
-        ("住在台中", "爸爸", "成員甲", "爸爸以前住台中，現在住台北", "source:wish_past_other"),
+        ("搬到台中", "爸爸", "成員甲", "爸爸下個月要搬到台中", "message:time_or_retraction"),
+        ("住在台中", "爸爸", "成員甲", "爸爸以前住台中，現在住台北", "message:time_or_retraction"),
         ("喜歡爬山", "爸爸", "成員甲", "爸爸不喜歡爬山", "source:negation"),
         ("在科技公司上班", "爸爸", "成員甲", "爸爸跟他老闆在科技公司上班", "source:pronoun"),
         ("在科技公司上班", "爸爸", "成員甲", "爸爸被公司資遣", "source:sensitive"),
@@ -268,7 +268,7 @@ def test_ordinary_display_labels(label):
 def test_more_ways_the_fact_is_not_really_about_the_member(text):
     fact = "搬到台中" if "搬到" in text else "住在台中"
     verdict = judge(fact, "爸爸", "成員甲", text)
-    assert not verdict.ok and verdict.reason.startswith(("source:", "hedged", "position"))
+    assert not verdict.ok and verdict.reason.startswith(("source:", "hedged", "position", "message:"))
 
 
 def test_an_allowed_adverb_is_not_a_negation():
@@ -295,3 +295,50 @@ def test_family_words_the_member_list_does_not_cover_still_block_a_speakers_fact
 )
 def test_the_speakers_own_sentence_is_the_one_with_me_in_it(fact, text):
     assert judge(fact, "我", "成員甲", text) == h.Verdict(True, "成員甲", "")
+
+
+
+# ── post-impl 審查第二輪（R2 GP2 B1、B2、N1、N2、ASCII 名字）──────────────────
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["以前，爸爸住台中", "爸爸住台中，不是啦", "去年，爸爸在科技公司上班", "爸爸住台中，我是說台北",
+     "爸爸住台中，已經不是了", "爸爸住台中，現在搬走了", "爸爸住台中的話很方便"],
+)
+def test_time_past_and_retractions_anywhere_in_the_message_drop_hearsay(text):
+    fact = "在科技公司上班" if "上班" in text else "住在台中"
+    assert judge(fact, "爸爸", "成員甲", text) == h.Verdict(False, reason="message:time_or_retraction")
+
+
+@pytest.mark.parametrize(
+    ("fact", "text"),
+    [("住在台中，養了兩隻貓", "爸爸住台中"), ("在科技公司上班，快退休了", "爸爸在科技公司上班")],
+)
+def test_the_model_cannot_add_what_the_member_never_said(fact, text):
+    assert judge(fact, "爸爸", "成員甲", text) == h.Verdict(False, reason="source:fabricated")
+
+
+@pytest.mark.parametrize(("about", "text"), [("我", "媽媽：我住台中"), ("我", "同學說：我住台中")])
+def test_a_quoted_first_person_is_someone_else(about, text):
+    assert judge("住在台中", about, "成員甲", text) == h.Verdict(False, reason="self_quoted")
+
+
+def test_hearsay_relayed_from_a_third_party_is_dropped():
+    assert judge("住在台中", "爸爸", "成員甲", "同學說：爸爸住台中").reason in ("quoted", "source:frame")
+
+
+@pytest.mark.parametrize("body", ["喜歡帥哥", "喜歡韓國瑜", "喜歡李小姐", "迷上某個人"])
+def test_preferences_must_be_an_activity_or_a_listed_hobby(body):
+    assert h.scope_reason(body) != ""
+
+
+@pytest.mark.parametrize("body", ["喜歡爬山", "最愛吃火鍋", "興趣是攝影", "迷上攝影", "不喜歡吃辣", "喜歡去爬山"])
+def test_activity_preferences_still_pass(body):
+    assert h.scope_reason(body) == ""
+
+
+def test_an_english_name_must_match_the_whole_word():
+    roster = h.build_roster(["Ed", "成員甲"], {})
+    assert judge("住在台中", "Ed", "成員甲", "Edwin住台中", roster).ok is False
+    assert judge("住在台中", "Ed", "成員甲", "Ed住台中", roster) == h.Verdict(True, "Ed", "成員甲")

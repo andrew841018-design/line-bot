@@ -17,6 +17,7 @@ repo 是 public，這裡只有通用稱謂，沒有任何家人的名字。
 """
 from __future__ import annotations
 
+import collections
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -57,6 +58,14 @@ def has_tag(body: str) -> bool:
 
 # ── 範圍閘門（只給轉述用）────────────────────────────────────────────────────
 
+# 喜好只收「喜歡＋動作」與固定的興趣名詞（R2 GP2 N2：「喜歡＋人或東西」的敏感尾巴列不完，改用允許清單）
+_HOBBY_VERBS = (
+    r"吃|喝|看|聽|玩|去|打|學|爬|騎|游|跑|唱|畫|拍|煮|做|彈|逛|釣|種|寫|讀|跳|散步|運動|旅行|旅遊|露營|健身"
+)
+_HOBBY_NOUNS = (
+    r"攝影|園藝|閱讀|烹飪|爬山|登山|游泳|跑步|騎車|釣魚|旅行|旅遊|露營|畫畫|書法|音樂|唱歌|跳舞|下棋|健身"
+    r"|瑜伽|瑜珈|網球|羽球|桌球|籃球|棒球|高爾夫|看書|看電影|追劇|咖啡|甜點|手作|編織|模型|拼圖|單車|自行車"
+)
 # 必須以這幾類開頭（前面只能有幾個副詞）：住、工作上學、喜好、興趣、寵物、在學什麼（GP2 S1 (a)）。
 # 一定要錨在開頭：不錨的話「討厭公司」因為有「公司」就會過（post-impl GP2#1）。
 _FRAME_RE = re.compile(
@@ -64,7 +73,8 @@ _FRAME_RE = re.compile(
     r"(?:住(?:在)?|搬(?:到|去)"
     r"|在[^，,。；;]{1,12}?(?:上班|工作|上學|讀書|唸書|念書|就讀)|上班|上學"
     r"|在?(?:讀|念|唸|就讀)(?:大學|高中|國中|國小|研究所|碩士|博士|[^，,。；;]{1,10}?(?:系|學院|大學|高中))"
-    r"|喜歡|不喜歡|愛吃|愛喝|愛看|愛聽|愛玩|不愛吃|不愛喝|最愛|不吃|不喝|討厭吃|討厭喝|興趣是|迷上|收藏"
+    r"|(?:不?喜歡|最愛|迷上)(?:" + _HOBBY_VERBS + r")|興趣是(?:" + _HOBBY_VERBS + "|" + _HOBBY_NOUNS + r")"
+    r"|迷上(?:" + _HOBBY_NOUNS + r")|愛吃|愛喝|愛看|愛聽|愛玩|不愛吃|不愛喝|不吃|不喝|討厭吃|討厭喝|收藏"
     r"|養(?:了|著)?(?:一|兩|[0-9])?(?:隻|條)?(?:貓|狗|魚|鳥|兔|倉鼠|烏龜|寵物)"
     r"|在學|學(?:日文|英文|韓文|法文|德文|西班牙文|鋼琴|吉他|小提琴|烏克麗麗|畫畫|繪畫|游泳|跳舞|唱歌"
     r"|烹飪|做菜|攝影|書法|瑜伽|瑜珈|程式|開車|騎車|打鼓))"
@@ -130,6 +140,14 @@ _SOURCE_DENY_RE = re.compile(
     r"想|要|希望|考慮|如果|以前|之前|曾經|本來|原本|被|幫|替|帶|有個|有一個|那個|這個"
     r"|會|將|快|以後|之後|小時候|年輕時|從前|當年|曾|退休|過幾天|過"
 )
+# 整則訊息裡有這些就不收轉述（R2 GP2 B1）：時間、過去、假設、更正，寫在別的句子也一樣。
+_MESSAGE_DENY_RE = re.compile(
+    r"以前|之前|曾|本來|原本|從前|過去|當年|當時|那時|小時候|年輕時|年輕的時候|退休|離職|搬走|搬家|已經不是|不再"
+    r"|如果|假如|若是|要是|希望|考慮|的話"
+    r"|沒有啦|不是啦|沒啦|不對|搞錯|記錯|講錯|說錯|寫錯|打錯|更正|我是說|錯了|錯啦|才不是|其實是|唬爛|唬你"
+)
+# 引述別人的話（「同學說：我住台中」）：事實出自的那一句前面是冒號或「說／講／問…」就不收（R2 GP2 N1）
+_SPEECH_END_RE = re.compile(r"(?:說|講|問|回|寫|傳|貼|轉貼|表示|提到|留言)[\s,]*$")
 # 否定：原文那一段和事實要一致（「爸爸不喜歡爬山」不能變成「喜歡爬山」）
 _NEGATION_RE = re.compile(r"不|沒|未|無|非|哪有|(?<!特)別")
 # 親屬稱謂與口語稱呼：本人事實的子句裡出現就分不出在講誰；名單裡的顯示名稱是這些也不收。
@@ -284,6 +302,12 @@ def _member_spans(clause: str, roster: Roster, speaker: str) -> list[tuple[int, 
         start = clause.find(key)
         while start != -1:
             end = start + len(key)
+            if key.isascii() and (  # 英文名字要整個字：Ed 不能對到 Edwin（R2 GP2）
+                (start and clause[start - 1].isascii() and clause[start - 1].isalnum())
+                or (end < len(clause) and clause[end].isascii() and clause[end].isalnum())
+            ):
+                start = clause.find(key, start + 1)
+                continue
             if not any(taken[start:end]):
                 spans.append((start, end, label))
                 for i in range(start, end):
@@ -370,6 +394,27 @@ def _blank_spans(clause: str, spans: Iterable[tuple[int, int]]) -> str:
     return "".join(chars)
 
 
+def _quoted(text: str, clause: str) -> bool:
+    """事實出自的那一句前面是冒號或「說／講／問…」：句子裡的「我」是別人。"""
+    norm = normalize(text)
+    at = norm.find(clause)
+    prefix = norm[:at] if at > 0 else ""
+    return ":" in prefix or _SPEECH_END_RE.search(prefix) is not None
+
+
+_FILLER_CHARS = str.maketrans("", "", " ，,。.；;！!？?、：:\n\r\t「」『』()（）[]【】在了著的是有也都很")
+
+
+def coverage_reason(fact: str, segment: str) -> str:
+    """模型不能自己補內容（R2 GP2 B2）：事實的實字至少八成要出現在原文 B 那一段。"""
+    wanted = normalize(fact).translate(_FILLER_CHARS)
+    have = collections.Counter(normalize(segment).translate(_FILLER_CHARS))
+    if not wanted:
+        return "source:fabricated"
+    found = sum((collections.Counter(wanted) & have).values())
+    return "" if found / len(wanted) >= 0.8 else "source:fabricated"
+
+
 def self_reason(
     subject: Subject, fact: str, text: str, roster: Roster, speaker: str,
     bigrams: Callable[[str], set[str]],
@@ -391,6 +436,8 @@ def self_reason(
         return "clause_none"
     best = max(score for score, _part in scored)
     for _score, clause in (item for item in scored if item[0] == best):
+        if _quoted(text, clause):
+            return "self_quoted"
         spans = _member_spans(clause, roster, speaker)
         if any(label != speaker for _s, _e, label in spans):
             return "self_other_member"
@@ -469,14 +516,21 @@ def judge(
         return Verdict(not reason, speaker if not reason else "", reason=reason)
     if any(hedged(part) for part in clauses(text)):
         return Verdict(False, reason="hedged")  # 整則訊息裡任何一句是猜測或問句都不收
+    message = normalize(text)
+    if _DENY_RULES[0][1].search(message) or _MESSAGE_DENY_RE.search(message):
+        return Verdict(False, reason="message:time_or_retraction")  # 時間、過去、更正寫在別句也不收
     clause, reason = best_clause(fact, text, bigrams)
     if reason:
         return Verdict(False, reason=reason)
+    if _quoted(text, clause):
+        return Verdict(False, reason="quoted")
+    segment = _segment(clause, subject, roster, speaker)
     reason = (
         position_reason(clause, subject, roster, speaker)
-        or segment_reason(_segment(clause, subject, roster, speaker), fact)
+        or segment_reason(segment, fact)
         or frame_reason(_segment_pieces(clause, subject, roster, speaker))
         or bind_reason(fact, clause, subject, roster, speaker, bigrams)
+        or coverage_reason(fact, segment)
     )
     if reason:
         return Verdict(False, reason=reason)

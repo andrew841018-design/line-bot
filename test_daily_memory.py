@@ -374,7 +374,8 @@ def test_the_outcome_has_counts_only(job):
             assert all(isinstance(v, int) for v in value.values())
         elif isinstance(value, str):
             assert key in {
-                "status", "mode", "backend", "stop_reason", "embedder_mode", "fallback_reason", "backend_used",
+                "status", "mode", "backend", "hearsay_mode", "stop_reason", "embedder_mode", "fallback_reason",
+                "backend_used",
             }
 
 
@@ -1083,7 +1084,8 @@ def test_with_hearsay_off_nothing_about_the_prompt_changes(job):
 
 @pytest.mark.parametrize(
     ("hearsay", "only", "mode"),
-    [("1", "", "on"), ("1", "1", "only"), ("", "", ""), ("true", "", ""), ("", "1", "invalid"), ("yes", "1", "invalid")],
+    [("1", "", "on"), ("1", "1", "only"), ("", "", ""), ("0", "0", ""), ("true", "", "invalid"), ("on", "", "invalid"),
+     ("1", "yes", "invalid"), ("", "1", "invalid"), ("yes", "1", "invalid")],
 )
 def test_the_hearsay_switch_is_on_only_for_exactly_1(monkeypatch, hearsay, only, mode):
     monkeypatch.setenv(dm.HEARSAY_ENV, hearsay)
@@ -1381,3 +1383,12 @@ def test_gemini_cannot_file_hearsay_even_if_it_returns_about(monkeypatch, job):
     assert job.model.backends == ["gemini"]
     assert memory.list_fact_rows(G) == [] and outcome.hearsay == 0
     assert outcome.hearsay_drops == {"self_other_member": 1}  # 當成說話的人自己的事，又提到別的家人：不收
+
+
+
+def test_the_outcome_says_which_hearsay_mode_ran(monkeypatch, job):
+    monkeypatch.setenv(dm.HEARSAY_ENV, "1")
+    monkeypatch.setenv(dm.HEARSAY_ONLY_ENV, "1")
+    _write_state()
+    _raw("m1", "U_A", "我住台中", T0 + 10)
+    assert dm.run(now=NOW).hearsay_mode == "only"
