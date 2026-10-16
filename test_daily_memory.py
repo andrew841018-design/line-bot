@@ -28,6 +28,7 @@ G = "G_DAILY_MEMORY"
 T0 = 1_800_000_000  # 合成的時間起點
 NOW = T0 + 86_400
 ORIGINAL_GATE = dm._gate  # 下面的 fixture 會換掉它
+ORIGINAL_CALL_MODEL = dm._call_model
 _ROW_RE = re.compile(r"^#(\d+)【(可引用|不可引用)】\n([^\n]*?)：([^\n]*)", re.M)
 
 
@@ -297,6 +298,7 @@ def test_a_chunk_that_keeps_failing_is_skipped_after_three_runs(monkeypatch, job
     assert (outcome.status, outcome.chunks_poison, outcome.chunks_ok) == ("ok", 1, 1)
     assert _state()["poison"] == {} and _cursor() == (T0 + 11, "m2")
     assert memory.list_fact_rows(G) == [("U_B", "成員乙：喜歡爬山")]
+    assert [p[1] for p in job.model.prompts].count(dm._PROBE_USER) == 1  # 跳過之前先探測過、探測正常
 
 
 def test_facts_must_come_from_the_persons_own_citable_message(job):
@@ -474,6 +476,36 @@ def test_the_claude_gate_reads_the_shared_cooldown(monkeypatch):
     assert ORIGINAL_GATE("claude") == "quota"
     monkeypatch.setattr(claude_client, "quota_exhausted", lambda: False)
     assert ORIGINAL_GATE("claude") == ""
+
+
+def test_a_limit_notice_on_stdout_stops_without_counting_against_the_chunk(monkeypatch, tmp_path, job):
+    """2026-10-16：每週上限那 5 晚，CLI 在 stdout 印的新句型被當成「其他失敗」累積，第 5 晚把一塊當 poison 跳過。"""
+    import claude_client
+
+    monkeypatch.setattr(claude_client, "_STATE_FILE", tmp_path / "claude_usage.json")
+    monkeypatch.setattr(claude_client, "_cli_executable", lambda: "/usr/local/bin/claude-fake")
+    monkeypatch.setattr(claude_client.tempfile, "tempdir", str(tmp_path))
+    runs = []
+
+    def fake_run(args, **_kwargs):
+        runs.append(list(args))
+        notice = "You've hit your weekly limit · resets Oct 16 at 6pm (Asia/Taipei)\n"
+        return subprocess.CompletedProcess(args, 1, stdout=notice, stderr="")
+
+    monkeypatch.setattr(claude_client.subprocess, "run", fake_run)
+    monkeypatch.setattr(dm, "_call_model", ORIGINAL_CALL_MODEL)
+    monkeypatch.setattr(dm, "_gate", ORIGINAL_GATE)
+    _write_state()
+    _raw("m1", "U_A", "我住台中", T0 + 10)
+
+    outcome = dm.run(now=NOW)
+    assert (outcome.status, outcome.stop_reason, outcome.chunks_failed) == ("stopped", "quota", 1)
+    assert _state().get("transient", {}) == {} and _cursor() == (T0, "")
+    assert claude_client.quota_exhausted() and len(runs) == 1
+
+    outcome = dm.run(now=NOW)  # 冷卻期間在 _gate 就停，不再呼叫 CLI
+    assert (outcome.status, outcome.stop_reason) == ("stopped", "quota")
+    assert len(runs) == 1 and _state().get("transient", {}) == {}
 
 
 class _GeminiError(Exception):
@@ -721,6 +753,126 @@ def test_a_chunk_that_times_out_five_times_is_skipped(monkeypatch, job):
     assert (outcome.status, outcome.chunks_poison, outcome.poison_reasons) == ("ok", 1, {"transient_repeat": 1})
     assert _state()["transient"] == {} and _cursor() == (T0 + 11, "m2")
     assert memory.list_fact_rows(G) == [("U_B", "成員乙：喜歡爬山")]
+
+
+def test_a_chunk_is_not_skipped_while_the_backend_itself_is_down(monkeypatch, job):
+    """2026-10-16：第 5 次失敗時探測也失敗 → backend_down，不跳過、不加次數；探測正常才跳過。"""
+    _write_state()
+    _raw("m1", "U_A", "我住台中", T0 + 10)
+    job.model.reply = lambda _user: (_ for _ in ()).throw(dm.TransientError("backend_error", counted=True))
+    key = f"{T0 + 10}:m1"
+    for expected in range(1, dm.TRANSIENT_SKIP_AFTER):
+        assert dm.run(now=NOW).stop_reason == "backend_error"
+        assert _state()["transient"] == {key: expected}
+    outcome = dm.run(now=NOW)  # 第 5 次：探測也失敗 → 後端的問題，不跳過、次數歸零
+    assert (outcome.status, outcome.stop_reason, outcome.chunks_poison) == ("stopped", "backend_down", 0)
+    assert outcome.chunks_failed == 1 and outcome.cursor_lag_h > 0
+    assert _state()["transient"] == {} and _cursor() == (T0, "")
+    for expected in range(1, 3):  # 歸零後重新累積，不會再一次就跳過
+        assert dm.run(now=NOW).stop_reason == "backend_error"
+        assert _state()["transient"] == {key: expected} and _cursor() == (T0, "")
+    probes = [p for p in job.model.prompts if p[1] == dm._PROBE_USER]
+    assert len(probes) == 1 and probes[0][2] == ["成員甲"] and "我住台中" not in probes[0][1]
+
+
+def test_a_probe_that_hits_the_usage_limit_reports_quota(job):
+    _write_state(poison=None)
+    _raw("m1", "U_A", "我住台中", T0 + 10)
+    key = f"{T0 + 10}:m1"
+
+    def reply(user):
+        if user == dm._PROBE_USER:
+            raise dm.TransientError("quota")
+        raise dm.TransientError("timeout", counted=True)
+
+    job.model.reply = reply
+    for _ in range(dm.TRANSIENT_SKIP_AFTER - 1):
+        dm.run(now=NOW)
+    assert _state()["transient"] == {key: dm.TRANSIENT_SKIP_AFTER - 1}
+    outcome = dm.run(now=NOW)
+    assert (outcome.stop_reason, outcome.chunks_poison) == ("quota", 0)
+    assert _state()["transient"] == {} and _cursor() == (T0, "")
+
+
+@pytest.mark.parametrize("probe_error", [
+    dm.PermanentError("empty_response"),      # gemini：安全機制擋下或沒有候選
+    dm.PermanentError("request_rejected"),    # gemini 400
+])
+def test_a_probe_that_fails_permanently_is_still_backend_down(job, probe_error):
+    _write_state()
+    _raw("m1", "U_A", "我住台中", T0 + 10)
+
+    def reply(user):
+        if user == dm._PROBE_USER:
+            raise probe_error
+        raise dm.TransientError("timeout", counted=True)
+
+    job.model.reply = reply
+    for _ in range(dm.TRANSIENT_SKIP_AFTER - 1):
+        dm.run(now=NOW)
+    outcome = dm.run(now=NOW)
+    assert (outcome.status, outcome.stop_reason, outcome.chunks_poison) == ("stopped", "backend_down", 0)
+    assert _state()["transient"] == {} and _cursor() == (T0, "")
+
+
+def test_an_unknown_notice_printed_at_exit_0_never_skips_the_chunk(monkeypatch, tmp_path, job):
+    """認不得的通知用 exit 0 印出來：每一塊都解析不了；第 3 次時探測一樣解析不了 → backend_down，不跳過。"""
+    import claude_client
+
+    monkeypatch.setattr(claude_client, "_STATE_FILE", tmp_path / "claude_usage.json")
+    monkeypatch.setattr(claude_client, "_cli_executable", lambda: "/usr/local/bin/claude-fake")
+    monkeypatch.setattr(claude_client.tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(
+        claude_client.subprocess, "run",
+        lambda args, **_k: subprocess.CompletedProcess(args, 0, stdout="Some new notice wording\n", stderr=""),
+    )
+    monkeypatch.setattr(dm, "_call_model", ORIGINAL_CALL_MODEL)
+    monkeypatch.setattr(dm, "_gate", ORIGINAL_GATE)
+    _write_state()
+    _raw("m1", "U_A", "我住台中", T0 + 10)
+    reasons = [dm.run(now=NOW).stop_reason for _ in range(6)]
+    assert reasons == ["permanent:unparsable", "permanent:unparsable", "backend_down"] * 2
+    assert _cursor() == (T0, "") and _state().get("poison", {}) == {}
+
+
+def test_dry_run_never_writes_the_counter_when_the_backend_is_down(monkeypatch, job):
+    _write_state()
+    _raw("m1", "U_A", "我住台中", T0 + 10)
+    job.model.reply = lambda _user: (_ for _ in ()).throw(dm.TransientError("backend_error", counted=True))
+    key = f"{T0 + 10}:m1"
+    for expected in range(1, dm.TRANSIENT_SKIP_AFTER):
+        dm.run(now=NOW)
+    before = dm._state_path().read_bytes()
+    monkeypatch.setenv("LINE_BOT_DAILY_MEMORY", "dry_run")
+    assert dm.run(now=NOW).stop_reason == "backend_down"
+    assert dm._state_path().read_bytes() == before and _state()["transient"] == {key: dm.TRANSIENT_SKIP_AFTER - 1}
+
+
+def test_the_incident_replayed_through_the_real_cli_never_skips_the_chunk(monkeypatch, tmp_path, job):
+    """2026-10-16 的情境：認不出的失敗（exit 1、other）連 7 晚，探測同樣失敗 → 一塊都不跳過。"""
+    import claude_client
+
+    monkeypatch.setattr(claude_client, "_STATE_FILE", tmp_path / "claude_usage.json")
+    monkeypatch.setattr(claude_client, "_cli_executable", lambda: "/usr/local/bin/claude-fake")
+    monkeypatch.setattr(claude_client.tempfile, "tempdir", str(tmp_path))
+    runs = []
+
+    def fake_run(args, **kwargs):
+        runs.append(kwargs.get("input"))
+        return subprocess.CompletedProcess(args, 1, stdout="Some future wording we do not know\n", stderr="")
+
+    monkeypatch.setattr(claude_client.subprocess, "run", fake_run)
+    monkeypatch.setattr(dm, "_call_model", ORIGINAL_CALL_MODEL)
+    monkeypatch.setattr(dm, "_gate", ORIGINAL_GATE)
+    _write_state()
+    _raw("m1", "U_A", "我住台中", T0 + 10)
+    reasons = []
+    for _ in range(12):
+        outcome = dm.run(now=NOW)
+        reasons.append(outcome.stop_reason)
+        assert outcome.chunks_poison == 0 and _cursor() == (T0, "")
+    assert reasons == (["backend_error"] * 4 + ["backend_down"]) * 2 + ["backend_error"] * 2
+    assert runs.count(dm._PROBE_USER) == 2  # 第 5、10 晚各探測一次，都失敗，一塊都沒跳過
 
 
 @pytest.mark.parametrize("reason", ["quota", "backend_unavailable", "backend_auth", "rate_limited"])

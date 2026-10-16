@@ -25,6 +25,17 @@ LIMIT_NOTICES = [
     "5-hour limit reached ∙ resets 3pm",
     "Weekly limit reached ∙ resets Oct 9, 3pm",
     "You've hit your limit · resets 11pm (Asia/Taipei)",
+    # 2026-10-16: the 10/11–10/16 weekly limit printed these on stdout and was
+    # classified "exit 1 (other)" again.
+    "You've hit your session limit · resets 8:10pm (Asia/Taipei)",
+    "You've hit your weekly limit · resets Oct 16 at 6pm (Asia/Taipei)",
+    "You’ve hit your weekly limit · resets Oct 16 at 6pm (Asia/Taipei)",
+    "You've hit your Opus weekly limit · resets Oct 23 at 6pm (Asia/Taipei)",
+    "You've hit your session limit · resets 8:10pm (Asia/Taipei) (error type rate_limit, HTTP 429)",
+    "Opus weekly limit reached ∙ resets Oct 23, 6pm",
+    "Claude usage limit reached. Your limit will reset at 3pm (Asia/Taipei).",
+    "You've hit your weekly limit.",
+    "You've hit your extra usage limit · /upgrade to keep going",
 ]
 
 
@@ -111,6 +122,42 @@ def test_epoch_echoed_on_stdout_is_not_trusted(cli):
     assert time.time() + 1700 < until < time.time() + 1900  # default cooldown, not the echoed epoch
 
 
+@pytest.mark.parametrize("line", [
+    "You've hit your weekly goal · keep going",
+    "合成回覆：你已經 You've hit your weekly limit 了嗎",
+    "Context window limit reached",
+    "Prompt is too long",
+    "You've hit your context limit · resets 3pm",
+    "You've hit your image limit",
+    "You've hit your daily sugar limit, switch to english",
+])
+def test_lines_that_only_look_like_a_limit_notice_are_ordinary_failures(cli, line):
+    """2026-10-16：放寬只限「You've hit your … limit」與已知的幾種「… limit reached」。"""
+    cli(1, stdout=line + "\n", stderr="")
+
+    assert cc.chat("x", [], []) is None
+
+    assert "quota_exhausted_until" not in _state()
+    assert not cc._is_limit_notice_line(line)
+
+
+@pytest.mark.parametrize("sep", ["\n", "\r", "\u2028"])
+def test_a_real_two_line_answer_starting_like_a_notice_is_still_sent(cli, sep):
+    """exit 0 時整段回覆都交給 _is_limit_notice_line：第二行（任何換行字元）表示是真的回覆。"""
+    answer = f"Claude usage limit reached{sep}合成回覆的第二行"
+    cli(0, stdout=answer + "\n")
+
+    assert cc.chat("x", [], []) == answer
+    assert "quota_exhausted_until" not in _state()
+
+
+def test_a_rate_limit_line_is_not_a_notice_line_but_still_a_quota_error():
+    """「Rate limit reached」不靠這條放寬：stdout 這行不算上限通知，但 _quota_error 本來就認得。"""
+    line = "Rate limit reached for this conversation"
+    assert not cc._is_limit_notice_line(line)
+    assert cc._quota_error(1, line)
+
+
 def test_limit_words_inside_ordinary_output_are_not_a_usage_limit(cli):
     cli(1, stdout="合成回覆：上次說的 5-hour limit reached 那段，resets 之後再看。\n", stderr="")
 
@@ -121,8 +168,9 @@ def test_limit_words_inside_ordinary_output_are_not_a_usage_limit(cli):
     assert state["prefer_cli"] is True
 
 
-def test_limit_notice_as_the_whole_answer_is_never_sent(cli):
-    runs = cli(0, stdout="You've hit your limit · resets 11pm (Asia/Taipei)\n")
+@pytest.mark.parametrize("notice", [n for n in LIMIT_NOTICES if n.startswith(("You've hit your", "You’ve hit your"))])
+def test_limit_notice_as_the_whole_answer_is_never_sent(cli, notice):
+    runs = cli(0, stdout=notice + "\n")
 
     assert cc.chat("x", [], []) is None
     assert _state()["quota_exhausted_until"] > time.time()

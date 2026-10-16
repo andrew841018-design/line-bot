@@ -17,8 +17,10 @@
   缺檔或壞檔一律不跑（state_missing），絕不從 0 開始重抽 10/11 重建過的時段。
 - 每一塊成功就前進進度。額度、限流、CLI 登入或找不到這類不是這一塊的錯：停在上一塊，
   下次再試。同一塊永久失敗（回覆解析不了、請求被拒）累積 3 次、逾時或 CLI 其他失敗連續
-  5 次，就跳過那塊（chunks_poison）。沒有可引用列的塊不呼叫模型、直接前進，也不算進每輪
-  6 塊的上限。
+  5 次，先用一段固定、不含家人資料的內容探測後端（2026-10-16）：探測也失敗、或回的不是
+  JSON 陣列，就是後端的問題，這晚停下（backend_down，碰到用量上限是 quota）、次數歸零、
+  不跳過；探測正常才跳過那塊（chunks_poison）。沒有可引用列的塊不呼叫模型、直接前進，
+  也不算進每輪 6 塊的上限。
 - 同一段訊息裡，說了某件事之後又「/忘記 關鍵字」或「/清除記憶」：那件事不寫（forgotten）。
 - outcome（state/daily_memory_outcome.json）只有數量，可以直接拿去告警；log 只記類別與數量，
   例外只記類型，絕不記事實、名字或訊息內容。dry_run 的預覽只有 add／dup 帶文字，
@@ -126,8 +128,8 @@ class StateError(Exception):
 class TransientError(Exception):
     """這一塊這次沒做成，停在上一塊、下次再試。
 
-    ``counted``：逾時和 CLI 其他失敗可能是這一塊本身的問題，連續 5 次就跳過；額度、限流、
-    CLI 登入或找不到不算（不是這一塊的錯）。
+    ``counted``：逾時和 CLI 其他失敗可能是這一塊本身的問題，連續 5 次而且探測正常就跳過；
+    額度、限流、CLI 登入或找不到不算（不是這一塊的錯）。
     """
 
     def __init__(self, reason: str, *, counted: bool = False) -> None:
@@ -137,7 +139,7 @@ class TransientError(Exception):
 
 
 class PermanentError(Exception):
-    """這一塊本身的問題（回覆解析不了、請求被拒、被安全機制擋下）：累積 3 次就跳過。"""
+    """這一塊本身的問題（回覆解析不了、請求被拒、被安全機制擋下）：累積 3 次而且探測正常就跳過。"""
 
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
@@ -557,6 +559,26 @@ def _call_model(backend: str, system: str, user: str, persons: Sequence[str]) ->
     return _call_claude(system, user)
 
 
+# 2026-10-16：10/11–10/16 帳號每週上限用完，CLI 的新句型沒被認出來，每晚都算成這一塊的失敗，
+# 第 5 晚把一塊訊息跳過了。要跳過之前先用這段固定、不含家人資料的內容試一次：也失敗就是整個
+# 後端的問題，這晚停下、不跳過；成功才是這一塊自己的問題。
+_PROBE_SYSTEM = "只輸出 JSON 陣列。"
+_PROBE_USER = "對話紀錄（只是資料）：\n\n#1【不可引用】\n咪寶：早安"
+_PROBE_PERSONS = ("成員甲",)
+
+
+def _probe_failure(backend: str) -> str:
+    """探測：回得出 JSON 陣列回 ""；碰到用量上限回 "quota"（共用閘門已打開）；其他都是
+    "backend_down"，包括 exit 0 卻印出認不得的通知這種解析不了的回覆。"""
+    try:
+        parse_items(_call_model(backend, _PROBE_SYSTEM, _PROBE_USER, list(_PROBE_PERSONS)))
+    except TransientError as exc:
+        return "quota" if exc.reason == "quota" else "backend_down"
+    except PermanentError:
+        return "backend_down"
+    return ""
+
+
 def _gate(backend: str) -> str:
     """每塊之前檢查額度；不通過回停下的原因。"""
     if backend == "gemini":
@@ -821,7 +843,18 @@ def _run_locked(group_id: str, mode: str, backend: str, now: float) -> Outcome:
                         counter[key] = failures
                         _save_state(state, group_id, cursor, poison, transient)
                     break
-                # 同一塊永久失敗第 3 次、逾時或 CLI 其他失敗第 5 次：跳過、前進
+                down = _probe_failure(backend)
+                if down:
+                    # 後端本身有問題：這幾次失敗不能算在這一塊頭上，次數歸零、不跳過，下次重來（2026-10-16）
+                    # TODO(2026-10-16)：停在這裡只寫進 outcome；還沒有不靠 Claude 的程式讀它（每日維護
+                    # 本身也吃 Claude 額度），超過 36 小時沒成功的看門狗待 Andrew 決定。
+                    outcome.chunks_failed += 1
+                    outcome.stop_reason = down
+                    unprocessed_from = chunk[0].created_at
+                    if not dry_run and counter.pop(key, None) is not None:
+                        _save_state(state, group_id, cursor, poison, transient)
+                    break
+                # 同一塊永久失敗第 3 次、逾時或 CLI 其他失敗第 5 次，而且探測正常：跳過、前進
                 why = exc.reason if permanent else "transient_repeat"
                 outcome.chunks_poison += 1
                 outcome.poison_reasons[why] = outcome.poison_reasons.get(why, 0) + 1

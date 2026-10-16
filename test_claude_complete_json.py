@@ -82,7 +82,12 @@ def test_a_short_timeout_is_raised_to_the_cli_minimum(cli):
 
 @pytest.mark.parametrize(
     "result",
-    [(1, "", "rate limit reached"), (1, "", "Claude AI usage limit reached|9999999999"), (0, "5-hour limit reached ∙ resets 3pm", "")],
+    [
+        (1, "", "rate limit reached"),
+        (1, "", "Claude AI usage limit reached|9999999999"),
+        (0, "5-hour limit reached ∙ resets 3pm", ""),
+        (1, "You've hit your weekly limit · resets Oct 16 at 6pm (Asia/Taipei)\n", ""),  # 2026-10-16
+    ],
 )
 def test_a_usage_limit_opens_the_shared_cooldown(cli, tmp_path, result):
     cli(result)

@@ -426,15 +426,24 @@ def _remove_stale_prompt_files() -> None:
 # or model text, so it only counts as a short line that is nothing but such a
 # notice, and a reset epoch is read from stderr alone (a 7-day cooldown from
 # echoed text would silence Claude for a week).
+# 2026-10-16: the same again for 10/11–10/16 with "You've hit your weekly limit ·
+# resets Oct 16 at 6pm (Asia/Taipei)" and "You've hit your session limit · …"
+# on stdout; the nightly memory job counted them against one chunk and skipped
+# it.  Both stdout forms now take up to two known kinds of limit ("Opus weekly")
+# and nothing else: a chunk-specific error read as a usage limit is never counted
+# against the chunk, so it would stall the job, while an unknown wording is
+# still caught by the job's backend probe.
+_CLI_LIMIT_KINDS = r"(?:5-hour|weekly|session|opus|sonnet|daily|monthly|extra|usage)"
+# stderr is the CLI's own diagnostics (it never echoes chat), so a phrase anywhere counts there.
 _CLI_LIMIT_RE = re.compile(
-    r"usage limit|limit reached|hit your limit|(?:5-hour|weekly|session|opus) limit|/upgrade",
+    rf"usage limit|limit reached|hit your limit|{_CLI_LIMIT_KINDS} limit|/upgrade",
     re.IGNORECASE,
 )
 _CLI_LIMIT_RESETS_RE = re.compile(r"\bresets?\b", re.IGNORECASE)
 _CLI_LIMIT_LINE_RE = re.compile(
-    r"(?:claude ai )?usage limit reached(?:\s*\|\s*\d{9,11})?"
-    r"|(?:5-hour|weekly|session|opus|sonnet)(?: usage)? limit reached\b.{0,80}"
-    r"|you(?:'|’)ve hit your (?:usage )?limit\b.{0,80}",
+    r"(?:claude(?: ai)? )?usage limit reached(?:\s*\|\s*\d{9,11})?(?:[^\w|].{0,120})?"
+    rf"|(?:{_CLI_LIMIT_KINDS} ){{1,2}}limit reached\b.{{0,120}}"
+    rf"|you(?:'|’)ve hit your (?:{_CLI_LIMIT_KINDS} ){{0,2}}limit\b.{{0,120}}",
     re.IGNORECASE,
 )
 _CLI_LIMIT_LINE_MAX_CHARS = 160
@@ -451,9 +460,12 @@ def _stderr_reports_limit(stderr: str) -> bool:
 
 
 def _is_limit_notice_line(line: str) -> bool:
+    """One short line that is nothing but a notice; exit 0 passes the whole answer here, so a
+    second line (\n, \r, U+2028 …) means it is a real reply (2026-10-16)."""
     line = (line or "").strip()
     return (
         0 < len(line) <= _CLI_LIMIT_LINE_MAX_CHARS
+        and len(line.splitlines()) == 1
         and _CLI_LIMIT_LINE_RE.fullmatch(line) is not None
     )
 
