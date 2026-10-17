@@ -13369,23 +13369,29 @@ def _capture_calendar_event_now(
             kw = (extracted.get("cancel_target_keyword") or "").strip()
             # 2026-10-16: only the model produces cancellations, and it now sees
             # far more messages.  It may only cancel or move an event the
-            # message names: the text must say cancel/move, and the keyword
-            # must be two or more characters found in the text, so a date
-            # alone ("週六我不去了") never selects an event.  Nothing is replied
-            # here, so a wrong cancellation would go unnoticed.
-            if not calendar_extractor.text_says_cancel_or_move(combined_text):
-                logger.info("calendar cancel ignored reason=no_cancel_word group=%s", group_id)
-                return
+            # message names: the keyword must be two or more characters found
+            # in the text, so a date alone ("週六我不去了") never selects an
+            # event; 2026-10-17: a cancel/move word must sit next to it on the
+            # same line, not negated and not in a quoted message.  Nothing is
+            # replied here, so a wrong cancellation would go unnoticed.
             if len(kw) < 2 or kw not in combined_text:
                 logger.info("calendar cancel ignored reason=keyword_not_in_text group=%s", group_id)
                 return
-            is_reschedule = bool(
-                kw
-                and extracted.get("date")
-                and re.search(
-                    r"(?:改期|改到|改成|改為|改至|改在|延後|延期|延到|挪到|換到)",
-                    combined_text,
+            if calendar_extractor.keyword_is_date_word(kw):
+                logger.info("calendar cancel ignored reason=keyword_is_date group=%s", group_id)
+                return
+            found, why, gap = calendar_extractor.cancel_word_check(combined_text, kw)
+            if not found:
+                logger.info(
+                    "calendar cancel ignored reason=cancel_word_not_near_keyword why=%s gap=%s group=%s",
+                    why, gap, group_id,
                 )
+                return
+            # A move word next to the same keyword makes it a reschedule; one
+            # elsewhere in the burst belongs to another message (2026-10-17).
+            is_reschedule = bool(
+                extracted.get("date")
+                and calendar_extractor.move_word_near_keyword(combined_text, kw)
             )
             if is_reschedule:
                 target = calendar_db.find_active_event(group_id, keyword=kw)

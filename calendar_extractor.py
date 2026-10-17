@@ -31,6 +31,7 @@ from google.genai import types
 
 import gemini_client
 import reminder_intent
+from quote_context import QUOTE_CONTEXT_RULE
 
 logger = logging.getLogger(__name__)
 _TW = ZoneInfo("Asia/Taipei")
@@ -104,19 +105,89 @@ _MODEL_DATE_HINT_RE = re.compile(
     r"\d+月\d+[日號]|\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}|\d{1,2}\s*號|"
     r"(?:[01]?\d|2[0-3]):[0-5]\d"
 )
-# Words that cancel or move an event.  main.py also requires one of them before
-# acting on a model cancellation.  "不去了" is left out on purpose: one person
-# not going is not the family event being cancelled (2026-10-16).
-_CANCEL_OR_MOVE_RE = re.compile(
-    r"取消|不辦了|作罷|停辦|延期|改期|改到|改成|改為|改至|改在|延後|延到|挪到|換到"
-)
+# Words that cancel or move an event.  main.py also requires one of them next
+# to the event's keyword before acting on a model cancellation.  "不去了" is
+# left out on purpose: one person not going is not the family event being
+# cancelled (Andrew confirmed 2026-10-17).
+_MOVE_RE = re.compile(r"改期|改到|改成|改為|改至|改在|延後|延期|延到|挪到|換到")
+_CANCEL_OR_MOVE_RE = re.compile(r"取消|不辦了|作罷|停辦|" + _MOVE_RE.pattern)
 _URL_RE = re.compile(r"https?://[!-~]+")
 _MODEL_TIMEOUT_MS = 20_000
 _MODEL_MAX_OUTPUT_TOKENS = 1024
+_MODEL_TEXT_CHARS = 2000
+# A quoted earlier message is context, not this message cancelling anything
+# (a block cut off at the 2000 characters is dropped too).
+_QUOTED_BLOCK_RE = re.compile(r"--- 原始訊息 開始 ---.*?(?:--- 原始訊息 結束 ---|\Z)", re.S)
+_NEGATION_BEFORE_RE = re.compile(
+    r"(?:沒有|沒|不會|不要|不用|不必|別|並未|未|還沒|不)"
+    r"(?:再|要|想|打算|需要|能|可以|會|辦法)?\s*$"
+)
+_DOUBLE_NEGATION_RE = re.compile(r"(?:不得不|不能不)\s*$")  # 不得不取消 = cancelled
+_NEGATION_AFTER_RE = re.compile(r"^(?:不了|不成|了?嗎)")  # 取消不了／取消了嗎
+_CANCEL_NEAR_KEYWORD_CHARS = 15
 
 
-def text_says_cancel_or_move(text: str) -> bool:
-    return bool(text) and _CANCEL_OR_MOVE_RE.search(text) is not None
+def _negated(line: str, word: re.Match) -> bool:
+    before = line[max(0, word.start() - 6):word.start()]
+    if _DOUBLE_NEGATION_RE.search(before):
+        return False
+    after = line[word.end():word.end() + 3]
+    return bool(_NEGATION_BEFORE_RE.search(before) or _NEGATION_AFTER_RE.match(after))
+
+
+def _word_near_keyword(text: str, keyword: str, words: re.Pattern) -> tuple[bool, str, int]:
+    """(found, why, nearest gap); why is ok|no_word|other_line|too_far|negated."""
+    if not text or not keyword:
+        return False, "no_word", -1
+    plain = text[:_MODEL_TEXT_CHARS].replace(QUOTE_CONTEXT_RULE, "\n")
+    plain = _QUOTED_BLOCK_RE.sub("\n", plain)
+    if not words.search(plain):
+        return False, "no_word", -1
+    why, nearest = "other_line", -1
+    for line in plain.splitlines():
+        hits = list(words.finditer(line))
+        start = line.find(keyword)
+        while start != -1 and hits:
+            end = start + len(keyword)
+            for word in hits:
+                gap = max(word.start() - end, start - word.end(), 0)
+                if nearest < 0 or gap < nearest:
+                    nearest = gap
+                if gap > _CANCEL_NEAR_KEYWORD_CHARS:
+                    if why == "other_line":
+                        why = "too_far"
+                    continue
+                if _negated(line, word):
+                    why = "negated"
+                    continue
+                return True, "ok", gap
+            start = line.find(keyword, start + 1)
+    return False, why, nearest
+
+
+def cancel_word_check(text: str, keyword: str) -> tuple[bool, str, int]:
+    """Whether this message itself cancels or moves ``keyword``'s event.
+
+    A cancel/move word must sit on the same line as the keyword, within 15
+    characters of it, and not be negated ("沒有取消", "不能延期", "取消了嗎").
+    Only the text the model saw counts, without quoted earlier messages.
+    Returns (found, why, nearest gap) for the log (2026-10-17).
+    """
+    return _word_near_keyword(text, keyword, _CANCEL_OR_MOVE_RE)
+
+
+def cancel_word_near_keyword(text: str, keyword: str) -> bool:
+    return cancel_word_check(text, keyword)[0]
+
+
+def move_word_near_keyword(text: str, keyword: str) -> bool:
+    """A move word (改到／延期…) next to ``keyword``: reschedule, not cancel."""
+    return _word_near_keyword(text, keyword, _MOVE_RE)[0]
+
+
+def keyword_is_date_word(keyword: str) -> bool:
+    """"週六"／"明天" names a day, not an event, so it cannot pick one."""
+    return bool(keyword) and _MODEL_DATE_HINT_RE.fullmatch(keyword) is not None
 
 
 def model_call_ready(text: str) -> bool:
@@ -148,7 +219,7 @@ def extract(combined_text: str) -> dict:
         return fail
 
     today, weekday = _today_tw()
-    prompt = _PROMPT.format(today=today, weekday=weekday, dialogue=combined_text[:2000])
+    prompt = _PROMPT.format(today=today, weekday=weekday, dialogue=combined_text[:_MODEL_TEXT_CHARS])
 
     # 2026-10-16: only the last tier, on its own per-model quota.  The 2.5
     # models' 20 requests a day belong to replies and reminder extraction.

@@ -549,3 +549,119 @@ def test_negative_reserve_keeps_calendar_off_the_tier(tier, monkeypatch):
 def test_url_does_not_swallow_the_date_after_it(tier):
     tier(event_answer("2099-01-01"))
     assert calendar_extractor.model_call_ready("看 https://example.com/a明天聚餐") is True
+
+
+# ── 9. 取消字要緊貼點名的活動（Andrew 2026-10-17 採用 POST_GP2 I2 (a)） ─────────
+
+from quote_context import original_block, with_current_reply  # noqa: E402
+
+
+@pytest.mark.parametrize(("text", "kw", "expected"), [
+    ("週六的全家聚餐取消了", "全家聚餐", True),
+    ("全家聚餐，因為颱風我們決定取消", "全家聚餐", True),
+    ("週六聚餐改到週日", "聚餐", True),
+    ("週六聚餐我不去了\n健身課取消了", "聚餐", False),      # cancel word is another message
+    ("週六的聚餐沒有取消喔", "聚餐", False),               # negated
+    ("週六的聚餐不會延期", "聚餐", False),                 # negated move
+    ("全家聚餐的餐廳我們再看看大家什麼時候有空再說還有健身課也取消了", "全家聚餐", False),  # too far
+    ("取消週六的全家聚餐", "全家聚餐", True),               # cancel word before the keyword
+    ("沒有取消週六的聚餐", "聚餐", False),
+    ("取消了啦大家記得下次再約那個什麼時候的全家聚餐", "全家聚餐", False),  # before, too far
+    ("週六的聚餐我不去了", "聚餐", False),                  # one person not going (Andrew 10/17)
+    ("週六聚餐不能取消", "聚餐", False),
+    ("週六聚餐沒辦法延期", "聚餐", False),
+    ("週六聚餐取消了嗎", "聚餐", False),                    # a question
+    ("週六聚餐不得不取消", "聚餐", True),                   # double negation still cancels
+    ("聚餐的地點大家都說要再看看喔然後下次的聚餐取消", "聚餐", True),  # second occurrence
+    ("啊" * 2000 + "週六聚餐取消了", "聚餐", False),         # beyond what the model saw
+    ("--- 原始訊息 開始 ---\n[群友]: 週六的全家聚餐取消了", "全家聚餐", False),  # cut-off quote
+])
+def test_cancel_word_must_sit_next_to_the_named_event(text, kw, expected):
+    assert calendar_extractor.cancel_word_near_keyword(text, kw) is expected
+
+
+def test_cancel_word_inside_a_quoted_message_does_not_count():
+    text = with_current_reply(original_block("週六的全家聚餐取消了", "群友"), "好的收到")
+    assert calendar_extractor.cancel_word_near_keyword(text, "全家聚餐") is False
+
+
+def test_another_message_in_the_burst_cannot_cancel_the_family_event(tier, cal_db, monkeypatch, caplog):
+    # A quoted message never reaches the model on this path (earlier filters);
+    # the quote rule is covered by the helper test above.
+    calendar_db, db_file = cal_db
+    text = "週六聚餐我不去了\n健身課取消了"
+    day = future_day(calendar_db, 8)
+    event_id = calendar_db.insert_event(group_id="G1", title="全家聚餐", event_date=day, event_time="18:00")
+    fake = tier(_cancel_answer(day, "聚餐"))
+    inline_spawn(monkeypatch)
+    monkeypatch.setattr(calendar_extractor, "model_call_ready", lambda *_a, **_k: True)
+
+    with caplog_ctx(caplog):
+        main._maybe_capture_calendar_event("G1", text)
+
+    assert fake.generated == [TIER]
+    assert _event_status(db_file, event_id) == "active"
+    assert any("reason=cancel_word_not_near_keyword why=other_line" in r.getMessage() for r in caplog.records)
+
+
+def caplog_ctx(caplog):
+    return caplog.at_level("INFO")
+
+
+@pytest.mark.parametrize(("text", "kw", "why"), [
+    ("週六聚餐我不去了\n健身課取消了", "聚餐", "other_line"),
+    ("全家聚餐的餐廳我們再看看大家什麼時候有空再說還有健身課也取消了", "全家聚餐", "too_far"),
+    ("週六的聚餐沒有取消喔", "聚餐", "negated"),
+    ("週六的聚餐我不去了", "聚餐", "no_word"),
+])
+def test_cancel_check_names_why_it_did_not_count(text, kw, why):
+    found, reason, _gap = calendar_extractor.cancel_word_check(text, kw)
+    assert (found, reason) == (False, why)
+
+
+@pytest.mark.parametrize(("text", "kw", "expected"), [
+    ("週六的全家聚餐取消了\n媽媽的回診改到下週三", "全家聚餐", False),  # move word is another message
+    ("週六的聚餐不延期了，直接取消", "聚餐", False),                   # the move word is negated
+    ("原本週六的聚餐，改到週日", "聚餐", True),
+])
+def test_move_word_must_sit_next_to_the_named_event(text, kw, expected):
+    assert calendar_extractor.move_word_near_keyword(text, kw) is expected
+
+
+@pytest.mark.parametrize(("text", "kw"), [
+    ("週六的全家聚餐取消了\n媽媽的回診改到下週三", "全家聚餐"),
+    ("週六的聚餐不延期了，直接取消", "聚餐"),
+])
+def test_cancellation_is_not_turned_into_a_reschedule_by_another_move_word(tier, cal_db, monkeypatch, text, kw):
+    calendar_db, db_file = cal_db
+    day = future_day(calendar_db, 8)
+    event_id = calendar_db.insert_event(group_id="G1", title="全家聚餐", event_date=day, event_time="18:00")
+    fake = tier(_cancel_answer(day, kw))
+    inline_spawn(monkeypatch)
+
+    main._maybe_capture_calendar_event("G1", text)
+
+    assert fake.generated == [TIER]
+    assert _event_status(db_file, event_id) != "active"
+    with sqlite3.connect(db_file) as con:
+        assert con.execute("SELECT event_date FROM events WHERE event_id = ?", (event_id,)).fetchone()[0] == day
+
+
+def test_a_date_word_keyword_cannot_pick_an_event(tier, cal_db, monkeypatch):
+    calendar_db, db_file = cal_db
+    day = future_day(calendar_db, 8)
+    event_id = calendar_db.insert_event(group_id="G1", title="週六家庭日", event_date=day, event_time="10:00")
+    fake = tier(_cancel_answer(day, "週六"))
+    inline_spawn(monkeypatch)
+
+    main._maybe_capture_calendar_event("G1", "週六的健身課取消了")
+
+    assert fake.generated == [TIER]
+    assert _event_status(db_file, event_id) == "active"
+
+
+def test_known_gap_two_topics_on_one_line_still_count():
+    """Known residual (FOLLOW_GP I3): another topic's cancel word on the same
+    line, comma-separated, still counts.  Tracked by the S2 prompt TODO; change
+    this test on purpose when that lands."""
+    assert calendar_extractor.cancel_word_near_keyword("週六聚餐我不去了，健身課取消了", "聚餐") is True
