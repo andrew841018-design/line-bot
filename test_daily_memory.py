@@ -1415,7 +1415,9 @@ def _with_mom(job):
     ("content", "status"),
     [(None, "missing"), ("{not json", "invalid"), ('{"roles": {}, "roles": {}}', "invalid"),
      ({"roles": {"阿姨": "U_B"}}, "invalid"), ({"roles": {"姊姊": "U_A", "姐姐": "U_B"}}, "invalid"),
-     ({"children": ["U_A", "U_A"]}, "invalid"), ({"roles": {"姊姊": "U_B"}, "children": ["U_A", "U_B"]}, "ok")],
+     ({"children": ["U_A", "U_A"]}, "invalid"), ({"roles": {"姊姊": ["U_B"]}}, "invalid"),
+     ({"roles": {"姊姊": {"id": "U_B"}}}, "invalid"), ({"children": [["U_A"]]}, "invalid"),
+     ({"roles": {"姊姊": "U_B"}, "children": ["U_A", "U_B"]}, "ok")],
 )
 def test_the_kinship_file_is_read_leniently(monkeypatch, job, tmp_path, content, status):
     monkeypatch.setenv(dm.HEARSAY_ENV, "1")
@@ -1441,9 +1443,10 @@ def test_a_childs_my_mom_is_filed_under_mom(monkeypatch, job, tmp_path):
 
 
 def _private_rows():
+    # 私密列放前面：Gemini 那一份的編號才會和 Claude 那份不同，出處檢查用錯份就會記錯（審查 v3 GP1#2）
     _write_state()
-    _raw("m1", "U_A", "我住台中", T0 + 10)
-    _raw("m2", "U_B", "我最近在吃藥", T0 + 11)
+    _raw("m1", "U_B", "我最近在吃藥", T0 + 10)
+    _raw("m2", "U_A", "我住台中", T0 + 11)
 
 
 def _gemini_users(job):
@@ -1464,7 +1467,7 @@ def test_private_rows_never_reach_gemini(monkeypatch, job, flow):
         job.model.errors = {1: dm.TransientError("backend_auth")}
     else:
         monkeypatch.setattr(dm, "_probe_failure", lambda backend: "")
-        key = f"{T0 + 10}:m1"
+        key = f"{T0 + 10}:m1"  # 這一塊從 m1（私密列）開始
         path = dm._state_path()
         path.write_text(json.dumps({G: {"cursor": {"created_at": T0, "message_id": ""}, "poison": {},
                                         "transient": {key: dm.TRANSIENT_SKIP_AFTER - 1}}}), encoding="utf-8")
@@ -1490,3 +1493,30 @@ def test_claude_still_sees_the_whole_chunk(job):
     _private_rows()
     dm.run(now=NOW)
     assert job.model.backends == ["claude"] and "吃藥" in job.model.prompts[0][1]
+
+
+
+def test_after_a_switch_a_chunk_with_only_private_rows_is_done_without_calling_gemini(monkeypatch, job):
+    _fallback_on(monkeypatch)
+    monkeypatch.setattr(dm, "_probe_failure", lambda backend: "backend_down")
+    job.model.errors = {1: dm.TransientError("backend_auth")}
+    _write_state()
+    _raw("m1", "U_B", "我最近在吃藥", T0 + 10)
+    outcome = dm.run(now=NOW)
+    assert job.model.backends == ["claude"] and outcome.chunks_ok == 1 and _cursor() == (T0 + 10, "m1")
+    assert outcome.withheld_empty_chunks == 1
+
+
+def test_a_rescue_with_nothing_to_send_still_skips_the_chunk(monkeypatch, job):
+    _fallback_on(monkeypatch)
+    monkeypatch.setattr(dm, "_probe_failure", lambda backend: "")
+    key = f"{T0 + 10}:m1"
+    path = dm._state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({G: {"cursor": {"created_at": T0, "message_id": ""}, "poison": {},
+                                    "transient": {key: dm.TRANSIENT_SKIP_AFTER - 1}}}), encoding="utf-8")
+    _raw("m1", "U_B", "我最近在吃藥", T0 + 10)
+    job.model.errors = {1: dm.TransientError("timeout", counted=True)}
+    outcome = dm.run(now=NOW)
+    assert job.model.backends == ["claude"]  # 沒東西給 Gemini：不呼叫、不當成功，照原規則跳過
+    assert (outcome.chunks_poison, outcome.gemini_chunks) == (1, 0)

@@ -257,7 +257,8 @@ def test_the_public_contact_check_matches_the_reply_guard():
 @pytest.mark.parametrize(
     "text",
     ["成員甲：我最近在吃藥", "成員甲：今天頭暈", "成員甲：這個月花了3萬元", "成員甲：我去銀行辦信用卡",
-     "成員甲：我家在台北市中正區忠孝西路一段100號", "成員甲：寄到 someone@example.com"],
+     "成員甲：我家在台北市中正區忠孝西路一段100號", "成員甲：寄到 someone@example.com",
+     "成員甲：我支持民進黨", "成員甲：我今年35歲", "成員甲：我每天吃魚油"],
 )
 def test_private_text_is_withheld_from_gemini(text):
     assert fact_filters.private_text(text)

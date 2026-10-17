@@ -193,8 +193,8 @@ def hedged(clause: str) -> bool:
 
 # ── 對人 ─────────────────────────────────────────────────────────────────────
 
-# TODO(2026-10-16 deferred)：孩子說的「我媽／我爸／我妹」、「姊姊／哥哥／弟弟」需要 Andrew 確認本機子女與角色
-# 名單（family_roles.local.json 只有「妹妹」，加角色也會影響 @ 提及）；現在一律 fail closed、不收。
+# 2026-10-17：子女的「我媽／我爸」、家裡共用的「姊姊」由本機角色檔（family_kinship.local.json）提供。
+# TODO(deferred)：兄弟姊妹的「我姊／我哥／我弟／我妹」和「哥哥／弟弟」要等 Andrew 提供出生順序；現在不收。
 # TODO(2026-10-16 deferred)：3 字名的後 2 字（例如在地名裡）可能誤配；目前靠位置檢查與模型判斷，殘留風險已告知。
 SELF_WORDS = frozenset({"我", "自己", "我自己", "本人"})
 OMITTED = "（省略）"
@@ -253,7 +253,10 @@ class Roster:
 
     def terms_for(self, speaker: str) -> dict[str, str]:
         """這位說話的人可以用的叫法 → 稱呼（角色叫法只給子女和爸媽）。"""
-        allowed = {t: l for t, l in self.terms.items() if t not in self.role_terms or self.family_speaker(speaker)}
+        allowed = {
+            term: label for term, label in self.terms.items()
+            if term not in self.role_terms or self.family_speaker(speaker)
+        }
         if speaker in self.children:
             for term, label in _CHILD_TERMS.items():
                 if label in self.labels:
@@ -304,10 +307,13 @@ def parse_kinship(raw: object, labels_by_user: Mapping[str, str]) -> tuple[dict[
     roles_raw, kids_raw = raw.get("roles", {}), raw.get("children", [])
     if not isinstance(roles_raw, dict) or not isinstance(kids_raw, list):
         raise ValueError("kinship: unexpected structure")
+    # 型別先檢查：值是 list 或 dict 時 set() 會丟 TypeError，不能讓手改打錯變成整支 job 掛掉（審查 v3 GP2#1）
+    if not all(isinstance(v, str) and v for v in (*roles_raw.values(), *kids_raw)):
+        raise ValueError("kinship: bad user ids")
     if set(roles_raw) - KINSHIP_ROLE_KEYS or len(set(roles_raw.values())) > 1:
         raise ValueError("kinship: unknown role or roles disagree")
-    if not all(isinstance(v, str) and v for v in (*roles_raw.values(), *kids_raw)) or len(set(kids_raw)) != len(kids_raw):
-        raise ValueError("kinship: bad user ids")
+    if len(set(kids_raw)) != len(kids_raw):
+        raise ValueError("kinship: duplicate children")
     applied = ignored = 0
     roles: dict[str, str] = {}
     for term, user_id in roles_raw.items():

@@ -252,9 +252,8 @@ def private_text(text: str) -> bool:
         return True
     if has_contact(raw):
         return True
-    return any(
-        pattern.search(norm) for category, pattern, _exempt in _STRICT_RULES if category in ("body", "money", "banking")
-    )
+    withheld = ("body", "money", "banking", "politics", "age", "job_seeking", "supplement", "household")
+    return any(pattern.search(norm) for category, pattern, _exempt in _STRICT_RULES if category in withheld)
 
 
 def reject_reason(

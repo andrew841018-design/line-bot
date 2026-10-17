@@ -414,10 +414,11 @@ def test_family_words_from_children_and_parents(about, speaker, text, label):
 
 @pytest.mark.parametrize(
     ("about", "speaker", "text"),
-    [("我媽", "媽媽", "我媽住台中"),  # 媽媽的媽媽：不是群組裡的人
+    [("我媽", "爸爸", "我媽住台中"),  # 爸爸的媽媽：不是群組裡的人（爸媽說的「我X」不認）
      ("我妹", "成員甲", "我妹住台中"),  # 兄弟姊妹的「我＋稱謂」要出生順序，還不認
      ("姊姊", "外人", "姊姊住台中"),  # 不是子女也不是爸媽：她自己的姊姊
-     ("我媽", "成員甲", "我媽的同事住台中")],
+     ("我媽", "成員甲", "我媽的同事住台中"),
+     ("我媽", "成員甲", "我爸媽住台中")],  # 兩個人一起：不是只講媽媽
 )
 def test_unclear_family_words_are_dropped(about, speaker, text):
     roster = h.build_roster([*KIN.labels, "外人"], {"乙丙": "成員乙丙", "妹妹": "成員乙丙"},
@@ -431,3 +432,15 @@ def test_a_childs_my_mom_keeps_the_fact_off_the_speaker():
 
 def test_the_role_holder_talking_about_herself_by_role_is_her_own_fact():
     assert judge("在學游泳", "姊姊", "長女", "姊姊在學游泳", KIN) == h.Verdict(True, "長女", "")
+
+
+
+def test_a_my_mom_that_would_point_at_the_speaker_is_treated_as_someone_else():
+    roster = h.Roster(labels=KIN.labels, terms=KIN.terms, children=frozenset({"媽媽", "成員甲"}),
+                      role_terms=KIN.role_terms)
+    assert judge("住在台中", "（省略）", "媽媽", "我媽住台中", roster).ok is False
+
+
+def test_a_role_word_that_collides_with_an_alias_belongs_to_nobody():
+    roster = h.build_roster(["成員甲", "長女"], {"姊姊": "成員甲"}, roles={"姊姊": "長女"}, children=["成員甲"])
+    assert "姊姊" not in roster.terms and "姊姊" not in roster.role_terms

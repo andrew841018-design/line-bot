@@ -32,6 +32,9 @@
   能不能收由 hearsay.py 決定（模型只回訊息裡的原字，名單和別名不送模型）；只在 Claude 上抽。沒開時提示、
   schema、出處檢查和以前逐字相同。LINE_BOT_DAILY_MEMORY_HEARSAY_ONLY=1（要和上面一起開）只寫轉述，
   給補跑已經抽過本人事實的舊訊息用。
+- 2026-10-17：本機角色檔 family_kinship.local.json（LINE_FAMILY_KINSHIP_PATH 可覆寫；不進 git）讓子女的
+  「我媽／我爸」、家裡共用的「姊姊」對到人；讀不到或格式錯就當作沒有。送 Gemini 的提示一律拿掉含私密字的列
+  （fact_filters.private_text），outcome 記 withheld_rows。
 - LINE_BOT_DAILY_MEMORY_FALLBACK：沒設或 gemini＝設定的模型是 claude、而 Claude 這一輪不能用（額度用完、
   CLI 找不到或登入失效、探測失敗）時整輪改用 Gemini，只抽本人的事；同一塊要跳過之前也先用 Gemini 試一次。
   0／off／none／false／no 關；其他值 config_invalid（不讓打錯字把訊息送去 Google）。
@@ -877,12 +880,12 @@ def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
 def _load_kinship(labels_by_user: dict[str, str]) -> tuple[dict[str, str], frozenset[str], str, int, int]:
     """本機角色檔（2026-10-17）：讀不到或格式錯就當作沒有（只少了這些叫法），log 只記錯誤類型。"""
     path = _kinship_path()
-    if not path.is_file() or path.is_symlink():
-        return {}, frozenset(), "missing", 0, 0
     try:
+        if not path.is_file() or path.is_symlink():
+            return {}, frozenset(), "missing", 0, 0
         raw = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_no_duplicate_keys)
         roles, children, applied, ignored = hearsay.parse_kinship(raw, labels_by_user)
-    except (OSError, UnicodeError, ValueError) as exc:
+    except Exception as exc:  # 任何錯（權限、型別、格式）都只讓這些叫法消失，不讓整支 job 停下（審查 v3 GP2#1）
         log.warning("daily memory kinship config invalid error_type=%s", type(exc).__name__)
         return {}, frozenset(), "invalid", 0, 0
     return roles, children, "ok", applied, ignored
@@ -1117,6 +1120,8 @@ def _run_locked(
             chunk_backend = active.name
             view: _GeminiView | None = gemini_view(chunk) if active.name == "gemini" else None
             items: list[dict] | None = [] if view is not None and not view.persons else None
+            # view 是這一塊實際送 Gemini 的那一份；換過去（_fall_back）或跳過前救援（_rescue）時換成它們建的那份，
+            # 下面出處檢查用同一份的編號
             try:
                 if items is None:
                     model_chunks += 1
