@@ -2997,7 +2997,7 @@ def _handle_event(event) -> None:
             quoted_message_id=getattr(msg, "quoted_message_id", None),
             **recall_kwargs,
         )
-        # 爸媽健康（2026-10-11）：每則文字都交給背景抽取；只有同意過的家長會被記，重送靠 UNIQUE 冪等。
+        # 爸媽健康（2026-10-11）：每則文字都交給背景抽取；家族主群的爸媽預設會被記（10/17），暫停的不記，重送靠 UNIQUE 冪等。
         _observe_parent_health(event, group_id, msg, sender_user_id)
 
     # ── quota 爆時：非文字內容不排 pending reply ────────────────────────
@@ -6800,7 +6800,7 @@ def _handle_text_message(
     if health_body is not None:
         _reply_health(event, group_id, text, health_body)
         return
-    # 爸媽健康的緊急字詞（2026-10-11，Andrew 選 4A）：同意過的家長提到胸痛、跌倒這類，立刻回就醫／119 提醒，
+    # 爸媽健康的緊急字詞（2026-10-11，Andrew 選 4A）：記錄中的家長（家族主群預設，10/17）提到胸痛、跌倒這類，立刻回就醫／119 提醒，
     # 同時私訊 Andrew。回了就不再往下走；沒回（舊訊息、未來句、30 分鐘內回過）照常路由。
     # 放在引用卡片的固定句之前：引用卡片再說「我剛剛跌倒了」也要先回 119。
     if _maybe_reply_parent_red_flag(event, group_id, text):
@@ -20653,8 +20653,8 @@ def _reply_investment_quote_notice(event, group_id: str, kind: str) -> None:
     )
 
 
-# 「/健康」後面要嘛空白、結尾，要嘛直接接已知的子指令（「/健康同意」「/健康暫停爸爸」）；「/健康管理」「/今日健康」不算。
-_HEALTH_COMMAND_RE = re.compile(r"/\s{0,3}(?:爸媽)?健康(?=\s|$|爸爸|媽媽|同意|暫停|吃藥了|有運動|刪除|說明)")
+# 「/健康」後面要嘛空白、結尾，要嘛直接接已知的子指令（「/健康恢復」「/健康暫停爸爸」）；「/健康管理」「/今日健康」不算。
+_HEALTH_COMMAND_RE = re.compile(r"/\s{0,3}(?:爸媽)?健康(?=\s|$|爸爸|媽媽|同意|恢復|暫停|吃藥了|有運動|刪除|說明)")
 _HEALTH_FAILURE_TEXT = "爸媽健康：暫時無法回覆，請稍後再試"
 _HEALTH_CARD_PREFIX = "爸媽健康卡："  # parent_health.CARD_PREFIX；模組載不進來時引用檢查照樣有效
 
@@ -20733,7 +20733,7 @@ def _reply_health_quote_notice(event, group_id: str) -> None:
 
 
 def _maybe_reply_parent_red_flag(event, group_id: str, text: str) -> bool:
-    """同意過的家長提到緊急狀況時回固定的就醫／119 提醒；回 True＝這則已處理、不再往下走。
+    """記錄中的家長提到緊急狀況時回固定的就醫／119 提醒；回 True＝這則已處理、不再往下走。
 
     判斷（regex＋讀同意表，不叫模型、不連網）在 webhook 鎖裡跑。提醒只用這則的 reply token、
     不搭到期提醒；送出結果（含靜音、失敗）交給 parent_health 記去重並私訊 Andrew。"""
@@ -21527,8 +21527,8 @@ _HELP_TEXT = (
     "【爸媽健康】\n"
     "  /健康                   爸媽健康卡：近 7 天用藥、看診、運動、睡眠、飲食、身體\n"
     "  /健康 爸爸、/健康 媽媽  看近 14 天的細節\n"
-    "  /健康 同意              爸爸或媽媽本人按，開始記錄自己的健康留言\n"
     "  /健康 暫停              爸爸或媽媽本人按，停止記錄（別人可打 /健康 暫停 爸爸）\n"
+    "  /健康 恢復              暫停之後，爸爸或媽媽本人按這個恢復記錄\n"
     "                          記錯了：引用那則留言再打 /健康 刪除\n"
     "【民調】\n"
     "  /民調 <問題>            開一個群組民調，會通知全體\n"

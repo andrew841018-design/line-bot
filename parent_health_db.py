@@ -249,6 +249,39 @@ def set_consent(
     )
 
 
+def ensure_default_consent(
+    group_id: str,
+    accounts: dict[str, str],
+    *,
+    now: float,
+    on_since: float | None = None,
+    db_path: Path | str | None = None,
+) -> int:
+    """預設同意紀錄（Andrew 2026-10-17「健康預設同意紀錄」）：家長還沒有同意列 → 寫一列 on
+    （on_since＝on_since 或 now、changed_by='default'）；on 但帳號換人 → 只改 user_id／changed_by／
+    updated_at，on_since 照舊（暫時改別名不會把之前的天數歸零）。暫停的列不動。呼叫端要先確認是家族群組。
+    回改到的列數。"""
+    if not group_id:
+        return 0
+    stamp = int(now)
+    start = int(now if on_since is None else on_since)
+    changed = 0
+    for role, user_id in accounts.items():
+        if role not in ROLES or not user_id:
+            continue
+        changed += _write(
+            db_path,
+            "INSERT INTO parent_health_consent "
+            "(group_id, role, status, on_since, user_id, changed_by, updated_at) "
+            "VALUES (?, ?, 'on', ?, ?, 'default', ?) "
+            "ON CONFLICT(group_id, role) DO UPDATE SET user_id = excluded.user_id, "
+            "changed_by = excluded.changed_by, updated_at = excluded.updated_at "
+            "WHERE parent_health_consent.status = 'on' AND parent_health_consent.user_id <> excluded.user_id",
+            (group_id, role, start, user_id, stamp),
+        )
+    return changed
+
+
 def groups_with_consent(*, db_path: Path | str | None = None) -> list[str]:
     """至少有一位家長目前是 on 的群組。"""
     rows = _read(

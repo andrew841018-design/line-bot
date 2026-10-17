@@ -543,35 +543,36 @@ def test_ambiguous_roles_are_not_set_up(family, caplog):
 # ── 同意、暫停、刪除（指令） ────────────────────────────────────────────────
 
 
-def test_parent_consents_and_pressing_again_keeps_on_since():
-    reply = cmd("同意", "U_DAD", now=NOW - 86400 * 3)
+def test_resume_starts_recording_outside_the_family_group_and_pressing_again_keeps_on_since():
+    # 測試群組不是 FAMILY_GROUP_ID（預設不記錄）：本人打 /健康 恢復 才開始
+    reply = cmd("恢復", "U_DAD", now=NOW - 86400 * 3)
     assert_text_ok(reply.text)
-    assert reply.text.startswith("爸媽健康：爸爸已同意記錄。")
+    assert reply.text.startswith("爸媽健康：已恢復記錄爸爸的健康留言。")
     for words in ("用藥", "看診", "運動", "睡眠", "飲食", "身體狀況", "血壓血糖", "全家看", "週日週報",
                   "私訊 Andrew", "119", "暫停只停止", "已記的紀錄會保留", "/健康 刪除", "刪除我的紀錄",
                   "一般聊天功能照舊"):
         assert words in reply.text
     on_since = db.consent_states(G)["爸爸"]["on_since"]
-    again = cmd("同意", "U_DAD")
+    again = cmd("同意", "U_DAD")  # 10/17 前舊卡片上的按鈕：現在等於恢復
     assert_text_ok(again.text)
-    assert "已經同意過了" in again.text
+    assert "正在記錄，不用按" in again.text
     assert db.consent_states(G)["爸爸"]["on_since"] == on_since
 
 
-def test_only_the_parent_can_consent_and_names_are_never_consent():
-    reply = cmd("同意", "U_KID")
+def test_only_the_parent_can_resume_and_names_are_never_resume():
+    reply = cmd("恢復", "U_KID")
     assert_text_ok(reply.text)
-    assert reply.text == "爸媽健康：要爸爸或媽媽本人按「我同意記錄」才算"
-    for body, user in (("同意 爸爸", "U_KID"), ("同意 爸爸", "U_DAD"), ("同意媽媽", "U_MOM")):
+    assert reply.text == "爸媽健康：要爸爸、媽媽本人打 /健康 恢復 才會記錄"
+    for body, user in (("恢復 爸爸", "U_KID"), ("恢復 爸爸", "U_DAD"), ("恢復媽媽", "U_MOM"), ("同意 爸爸", "U_KID")):
         assert cmd(body, user).text == ph._HELP_TEXT
     assert db.consent_states(G) == {}
 
 
-def test_consent_when_account_not_set_up(family, caplog):
+def test_resume_when_account_not_set_up(family, caplog):
     family({"U_KID": "成員甲", "U_MOM": "媽媽"})
-    reply = cmd("同意", "U_KID")
+    reply = cmd("恢復", "U_KID")
     assert_text_ok(reply.text)
-    assert reply.text == "爸媽健康：還沒設定爸爸是哪個 LINE 帳號，設定好之後要本人按「我同意記錄」才算"
+    assert reply.text == "爸媽健康：還沒設定爸爸是哪個 LINE 帳號，設定好才能記錄"
     assert "role not configured roles=father" in caplog.text and "U_KID" not in caplog.text
     assert db.consent_states(G) == {}
 
@@ -618,13 +619,13 @@ def test_needs_reconsent_when_account_mapping_changes(family, extract_mod, monke
     consent("爸爸", "U_DAD")
     family({"U_DAD2": "爸爸", "U_MOM": "媽媽", "U_KID": "成員甲"})
     card = assert_card_ok(cmd(""))
-    assert "需要重新同意（爸爸本人按「我同意記錄」）" in body_lines(card)
+    assert "還沒開始記錄（要爸爸本人打 /健康 恢復）" in body_lines(card)
     monkeypatch.setattr(extract_mod, "extract", lambda text, speaker, **kw: [F("爸爸", "med", "吃藥")])
     assert ph.observe_message(G, "m", "U_DAD2", "我吃藥了", event_ts_ms=NOW * 1000, now=NOW) == 0
     detail = assert_card_ok(cmd("爸爸"))
-    assert body_lines(detail) == ["需要重新同意（爸爸本人按「我同意記錄」）"]
-    reply = cmd("同意", "U_DAD2")
-    assert reply.text.startswith("爸媽健康：爸爸已同意記錄")
+    assert body_lines(detail) == ["還沒開始記錄（要爸爸本人打 /健康 恢復）"]
+    reply = cmd("恢復", "U_DAD2")
+    assert reply.text.startswith("爸媽健康：已恢復記錄爸爸的健康留言")
     assert db.consent_states(G)["爸爸"]["user_id"] == "U_DAD2"
 
 
@@ -641,7 +642,7 @@ def test_one_tap_records_only_for_the_consented_parent_self():
     assert cmd("吃藥了", "U_DAD", msg="tap1").text == "爸媽健康：這一筆已經記過了"
     for body, user, expected in (
         ("吃藥了", "U_KID", "爸媽健康：這個按鈕只記按的人自己，要爸爸或媽媽本人按"),
-        ("吃藥了", "U_MOM", "爸媽健康：媽媽還沒同意記錄，要先按「我同意記錄」"),
+        ("吃藥了", "U_MOM", "爸媽健康：媽媽還沒開始記錄，要媽媽本人打 /健康 恢復"),
     ):
         reply = cmd(body, user)
         assert_text_ok(reply.text)
@@ -649,7 +650,7 @@ def test_one_tap_records_only_for_the_consented_parent_self():
     cmd("暫停", "U_DAD")
     reply = cmd("有運動", "U_DAD")
     assert_text_ok(reply.text)
-    assert reply.text == "爸媽健康：爸爸的紀錄暫停中，要恢復請按「我同意記錄」"
+    assert reply.text == "爸媽健康：爸爸的紀錄暫停中，要恢復請爸爸本人打 /健康 恢復"
     assert len(db.list_events(G, "爸爸", since_day="2026-10-11", until_day="2026-10-11")) == 2
 
 
@@ -670,9 +671,9 @@ def test_delete_quoted_message_and_delete_mine():
     texts.append(cmd("刪除我的紀錄", "U_KID").text)
     assert texts[-1] == "爸媽健康：只有爸爸或媽媽本人能刪自己的全部紀錄"
     texts.append(cmd("刪除我的紀錄", "U_DAD").text)
-    assert texts[-1] == "爸媽健康：已刪掉爸爸的 1 筆紀錄"
+    assert texts[-1] == "爸媽健康：已刪掉爸爸的 1 筆紀錄；之後的留言還會繼續記錄，要停請打 /健康 暫停"
     texts.append(cmd("刪除我的紀錄", "U_DAD").text)
-    assert texts[-1] == "爸媽健康：爸爸目前沒有紀錄"
+    assert texts[-1] == "爸媽健康：爸爸目前沒有紀錄；之後的留言還會繼續記錄，要停請打 /健康 暫停"
     for text in texts:
         assert_text_ok(text)
     assert len(db.list_events(G, "媽媽", since_day="2026-01-01", until_day="2026-12-31")) == 1
@@ -683,7 +684,8 @@ def test_help_and_unknown_subcommands():
         reply = cmd(body)
         assert reply.text == ph._HELP_TEXT and reply.card is None
     assert_text_ok(ph._HELP_TEXT)
-    assert "/健康 刪除我的紀錄" in ph._HELP_TEXT and ph._CONSENT_EXPLANATION in ph._HELP_TEXT
+    assert "/健康 刪除我的紀錄" in ph._HELP_TEXT and ph._RECORDING_EXPLANATION in ph._HELP_TEXT
+    assert "/健康 恢復" in ph._HELP_TEXT and "同意" not in ph._HELP_TEXT
 
 
 def test_body_normalization_full_width_and_spacing():
@@ -736,23 +738,23 @@ def test_overview_card_with_data(reminders):
     ]
     assert lines[7:] == [
         "媽媽",
-        "還沒開始記錄（要媽媽本人按「我同意記錄」）",
+        "還沒開始記錄（要媽媽本人打 /健康 恢復）",
         "💡 爸爸 10/11 提到胸痛胸悶，可以問問他現在的狀況",
     ]
     assert "大醫院" not in json.dumps(card, ensure_ascii=False)  # 提醒內容不上卡
     buttons = [node["action"]["label"] for node in card["footer"]["contents"] if "action" in node]
-    assert buttons == ["看爸爸細節", "💊 我吃藥了", "🚶 我有運動", "✅ 我同意記錄", "📖 怎麼用"]
+    assert buttons == ["看爸爸細節", "💊 我吃藥了", "🚶 我有運動", "▶️ 恢復記錄", "📖 怎麼用"]
     assert card["footer"]["contents"][-1]["text"] == "從群組留言整理，只記錄、不診斷"
     assert card["footer"]["contents"][0]["contents"][0]["size"] == "xl"  # 大字按鈕
 
 
 def test_overview_card_every_state_passes_checks(family, reminders):
-    # 都沒同意
+    # 非家族群組、都還沒開始
     card = assert_card_ok(cmd(""))
     assert body_lines(card) == [
-        "爸爸", "還沒開始記錄（要爸爸本人按「我同意記錄」）", "媽媽", "還沒開始記錄（要媽媽本人按「我同意記錄」）",
+        "爸爸", "還沒開始記錄（要爸爸本人打 /健康 恢復）", "媽媽", "還沒開始記錄（要媽媽本人打 /健康 恢復）",
     ]
-    assert [n["action"]["text"] for n in card["footer"]["contents"] if "action" in n] == ["/健康 同意", "/健康 說明"]
+    assert [n["action"]["text"] for n in card["footer"]["contents"] if "action" in n] == ["/健康 恢復", "/健康 說明"]
     # 同意了但沒有紀錄
     consent("媽媽", "U_MOM", at=NOW - 3600)
     card = assert_card_ok(cmd(""))
@@ -763,7 +765,7 @@ def test_overview_card_every_state_passes_checks(family, reminders):
     # 暫停
     cmd("暫停", "U_MOM")
     card = assert_card_ok(cmd(""))
-    assert "已暫停記錄（要恢復：媽媽本人按「我同意記錄」）" in body_lines(card)
+    assert "已暫停記錄（要恢復：媽媽本人打 /健康 恢復）" in body_lines(card)
     # 帳號沒設定
     family({"U_KID": "成員甲"})
     card = assert_card_ok(cmd(""))
@@ -824,11 +826,11 @@ def test_detail_card_lines_and_reporter_labels(monkeypatch, tmp_path):
 
 def test_detail_card_states_and_empty():
     card = assert_card_ok(cmd("媽媽"))
-    assert body_lines(card) == ["還沒開始記錄（要媽媽本人按「我同意記錄」）"]
+    assert body_lines(card) == ["還沒開始記錄（要媽媽本人打 /健康 恢復）"]
     consent("媽媽", "U_MOM")
     assert body_lines(assert_card_ok(cmd("媽媽"))) == ["近 14 天沒有紀錄"]
     cmd("暫停", "U_MOM")
-    assert body_lines(assert_card_ok(cmd("媽媽"))) == ["已暫停記錄（要恢復：媽媽本人按「我同意記錄」）"]
+    assert body_lines(assert_card_ok(cmd("媽媽"))) == ["已暫停記錄（要恢復：媽媽本人打 /健康 恢復）"]
 
 
 def test_rows_outside_the_vocabulary_are_never_rendered():
@@ -1029,12 +1031,17 @@ def decide(text="我胸口好悶", user="U_DAD", *, msg="r1", event=NOW, now=NOW
 def test_red_flag_precheck_miss_touches_nothing(monkeypatch, extract_mod):
     _red(monkeypatch, extract_mod, [RF("爸爸", "胸痛胸悶")], hit=False)
 
+    calls: list[str] = []  # 被測函式會吞例外：只看「有沒有被叫到」
+
     def forbidden(*_a, **_kw):
+        calls.append("called")
         raise AssertionError("must not read files or DB before the pre-check hits")
 
     monkeypatch.setattr(db, "consent_states", forbidden)
     monkeypatch.setattr(ph, "_resolve_roles", forbidden)
     assert decide("今天天氣很好") is None
+    assert calls == []
+
 
 
 def test_red_flag_decision_send_and_conditions(monkeypatch, extract_mod):
@@ -1322,21 +1329,31 @@ def test_parent_health_only_skips_leading_slash_commands(text, is_command):
 
 
 def test_observe_skips_extraction_when_nobody_consented(monkeypatch, extract_mod):
+    calls: list[str] = []  # 被測函式會吞例外：只看「有沒有被叫到」
+
     def forbidden(*_a, **_kw):
+        calls.append("called")
         raise AssertionError("no consent: nothing to extract")
 
     monkeypatch.setattr(extract_mod, "extract", forbidden)
     monkeypatch.setattr(ph, "_resolve_roles", forbidden)
     assert ph.observe_message(G, "o1", "U_DAD", "我吃藥了", event_ts_ms=int(NOW * 1000), now=NOW) == 0
+    assert calls == []
+
 
 
 def test_observe_skips_commands_before_any_io(monkeypatch, extract_mod):
+    calls: list[str] = []  # 被測函式會吞例外：只看「有沒有被叫到」
+
     def forbidden(*_a, **_kw):
+        calls.append("called")
         raise AssertionError("commands are never extracted")
 
     monkeypatch.setattr(db, "consent_states", forbidden)
     monkeypatch.setattr(extract_mod, "extract", forbidden)
     assert ph.observe_message(G, "o1", "U_DAD", "／記住 爸爸今天吃藥了", event_ts_ms=None, now=NOW) == 0
+    assert calls == []
+
 
 
 def test_observe_without_event_timestamp_uses_now(monkeypatch, extract_mod):
@@ -1820,7 +1837,10 @@ def test_push_cap_counts_one_reply_about_both_parents_once(monkeypatch, extract_
     ["/記住 爸爸剛剛跌倒了", "／記住 爸爸剛剛跌倒了", "  /健康 我剛剛跌倒了"],
 )
 def test_slash_commands_are_never_extracted_or_answered(monkeypatch, extract_mod, text):
+    calls: list[str] = []  # 被測函式會吞例外：只看「有沒有被叫到」
+
     def forbidden(*_a, **_kw):
+        calls.append("called")
         raise AssertionError("an addressed command must be skipped before any I/O")
 
     monkeypatch.setattr(extract_mod, "might_have_red_flag", lambda text: True)
@@ -1830,6 +1850,8 @@ def test_slash_commands_are_never_extracted_or_answered(monkeypatch, extract_mod
     assert ph._is_command_text(text)
     assert ph.red_flag_decision(G, "U_KID", text, message_id="m", event_ts_ms=int(NOW * 1000), now=NOW) is None
     assert ph.observe_message(G, "m", "U_KID", text, event_ts_ms=int(NOW * 1000), now=NOW) == 0
+    assert calls == []
+
 
 
 def test_addressing_the_bot_without_a_command_is_still_checked(monkeypatch, extract_mod):
@@ -1842,9 +1864,10 @@ def test_addressing_the_bot_without_a_command_is_still_checked(monkeypatch, extr
 
 @pytest.mark.parametrize(
     ("body", "command"),
-    [("同意", "consent"), ("爸爸", "detail"), ("媽媽", "detail"), ("暫停", "pause_self"), ("暫停爸爸", "pause"),
-     ("暫停媽媽", "pause"), ("暫停 爸爸", "pause"), ("吃藥了", "record"), ("有運動", "record"),
-     ("刪除", "delete_quoted"), ("刪除我的紀錄", "delete_mine"), ("說明", "help"), ("同意爸爸", "help")],
+    [("恢復", "resume"), ("同意", "resume"), ("爸爸", "detail"), ("媽媽", "detail"), ("暫停", "pause_self"),
+     ("暫停爸爸", "pause"), ("暫停媽媽", "pause"), ("暫停 爸爸", "pause"), ("吃藥了", "record"), ("有運動", "record"),
+     ("刪除", "delete_quoted"), ("刪除我的紀錄", "delete_mine"), ("說明", "help"), ("同意爸爸", "help"),
+     ("恢復爸爸", "help")],
 )
 def test_subcommands_are_recognized_with_or_without_a_space(body, command):
     assert ph._parse_command(body)[0] == command
@@ -1856,7 +1879,7 @@ def test_no_space_pause_from_a_family_member_pauses_and_dms(dms):
     assert_text_ok(reply.text)
     assert reply.text.startswith("爸媽健康：已暫停媽媽的健康紀錄") and "119 提醒也一起停" in reply.text
     assert db.consent_states(G)["媽媽"]["status"] == "paused" and len(dms) == 1
-    assert cmd("爸爸", "U_KID").card is not None and cmd("同意", "U_MOM").text.startswith("爸媽健康：媽媽已同意記錄")
+    assert cmd("爸爸", "U_KID").card is not None and cmd("恢復", "U_MOM").text.startswith("爸媽健康：已恢復記錄媽媽的健康留言")
 
 
 def test_visit_titles_win_over_an_all_family_mention(reminders):
@@ -1962,3 +1985,205 @@ def test_a_role_file_nickname_for_a_parent_is_substituted(family):
     consent("爸爸", "U_DAD")
     decision = decide("爸鼻剛剛跌倒了", user="U_KID")
     assert decision is not None and decision.role == "爸爸"
+
+
+# ── 2026-10-17 家族主群預設記錄（Andrew：「健康預設同意紀錄，不需要再有我同意紀錄的設計」）──
+@pytest.fixture
+def family_group(monkeypatch):
+    """把測試群組設成 FAMILY_GROUP_ID（正式的 .env 有設，測試環境沒有，所以上面的測試都是「其他群組」）。"""
+    monkeypatch.setattr(db.settings, "family_group_id", G)
+    return G
+
+
+def _spy_default(monkeypatch):
+    calls: list[tuple] = []
+    real = db.ensure_default_consent
+
+    def spy(group_id, accounts, **kw):
+        calls.append((group_id, dict(accounts)))
+        return real(group_id, accounts, **kw)
+
+    monkeypatch.setattr(db, "ensure_default_consent", spy)
+    return calls
+
+
+def test_family_group_records_by_default_from_the_first_message(family_group, extract_mod, monkeypatch):
+    calls = _spy_default(monkeypatch)
+    monkeypatch.setattr(extract_mod, "extract", lambda text, speaker, **kw: [F("爸爸", "med", "吃藥")])
+    # 背景抽取比 webhook 晚 2 秒才跑：on_since 用留言時間，這則不會被 on_since 擋掉
+    assert ph.observe_message(G, "d1", "U_DAD", "我吃藥了", event_ts_ms=int((NOW - 2) * 1000), now=NOW) == 1
+    rows = db.consent_states(G)
+    assert {role: (row["status"], row["user_id"], row["changed_by"]) for role, row in rows.items()} == {
+        "爸爸": ("on", "U_DAD", "default"), "媽媽": ("on", "U_MOM", "default"),
+    }
+    assert rows["爸爸"]["on_since"] == int(NOW - 2 - ph._EVENT_MAX_AGE_S)  # 往前抓 10 分鐘給晚到的留言
+    assert len(calls) == 1
+    # 之後的留言只讀，不再寫同意表
+    assert ph.observe_message(G, "d2", "U_DAD", "我吃藥了", event_ts_ms=int((NOW + 60) * 1000), now=NOW + 60) == 1
+    assert len(calls) == 1
+
+
+def test_family_group_red_flag_before_any_row_replies_without_writing(family_group, extract_mod, monkeypatch):
+    _red(monkeypatch, extract_mod, [RF("爸爸", "跌倒")])
+    decision = decide("我剛剛跌倒了", event=NOW - 2)
+    assert decision is not None and decision.reply
+    assert db.consent_states(G) == {}  # webhook 鎖裡只讀
+
+
+def test_red_flag_after_the_background_wrote_the_default_row(family_group, extract_mod, monkeypatch):
+    monkeypatch.setattr(extract_mod, "extract", lambda text, speaker, **kw: [F("爸爸", "med", "吃藥")])
+    ph.observe_message(G, "r9", "U_DAD", "我剛剛跌倒了", event_ts_ms=int((NOW - 2) * 1000), now=NOW)
+    assert db.consent_states(G)["爸爸"]["on_since"] == int(NOW - 2 - ph._EVENT_MAX_AGE_S)
+    _red(monkeypatch, extract_mod, [RF("爸爸", "跌倒")])
+    decision = decide("我剛剛跌倒了", msg="r9", event=NOW - 2, now=NOW)
+    assert decision is not None and decision.reply
+
+
+def test_other_groups_stay_off_without_rows(family_group, extract_mod, monkeypatch):
+    calls = _spy_default(monkeypatch)
+    monkeypatch.setattr(extract_mod, "extract", lambda text, speaker, **kw: [F("爸爸", "med", "吃藥")])
+    _red(monkeypatch, extract_mod, [RF("爸爸", "跌倒")])
+    assert ph.observe_message(G2, "o1", "U_DAD", "我吃藥了", event_ts_ms=int(NOW * 1000), now=NOW) == 0
+    assert ph.red_flag_decision(G2, "U_DAD", "我剛剛跌倒了", message_id="o2", event_ts_ms=int(NOW * 1000), now=NOW) is None
+    card = assert_card_ok(ph.handle_command(G2, "U_KID", "", message_id="o3", now=NOW))
+    assert "還沒開始記錄（要爸爸本人打 /健康 恢復）" in body_lines(card)
+    assert db.consent_states(G2) == {} and calls == []
+
+
+def test_default_on_fails_closed_without_family_group_id(monkeypatch, extract_mod):
+    monkeypatch.setattr(db.settings, "family_group_id", "")
+    monkeypatch.setattr(extract_mod, "extract", lambda text, speaker, **kw: [F("爸爸", "med", "吃藥")])
+    assert ph.observe_message(G, "f1", "U_DAD", "我吃藥了", event_ts_ms=int(NOW * 1000), now=NOW) == 0
+    assert db.consent_states(G) == {}
+
+
+def test_default_row_never_overrides_a_pause_and_keeps_on_since_on_account_change(
+    family_group, family, extract_mod, monkeypatch
+):
+    monkeypatch.setattr(
+        extract_mod, "extract", lambda text, speaker, **kw: [F("爸爸", "med", "吃藥"), F("媽媽", "med", "吃藥")]
+    )
+    ph.observe_message(G, "p1", "U_KID", "爸媽都吃藥了", event_ts_ms=int((NOW - 600) * 1000), now=NOW - 600)
+    first = db.consent_states(G)
+    cmd("暫停", "U_DAD")
+    ph.observe_message(G, "p2", "U_KID", "爸媽都吃藥了", event_ts_ms=int(NOW * 1000), now=NOW)
+    assert db.consent_states(G)["爸爸"]["status"] == "paused"
+    family({"U_DAD": "爸爸", "U_MOM2": "媽媽", "U_KID": "成員甲"})  # 媽媽換了帳號
+    ph.observe_message(G, "p3", "U_MOM2", "我吃藥了", event_ts_ms=int((NOW + 60) * 1000), now=NOW + 60)
+    rows = db.consent_states(G)
+    assert rows["爸爸"]["status"] == "paused"
+    assert (rows["媽媽"]["status"], rows["媽媽"]["user_id"], rows["媽媽"]["changed_by"]) == ("on", "U_MOM2", "default")
+    assert rows["媽媽"]["on_since"] == first["媽媽"]["on_since"]  # 換帳號不把之前的天數歸零
+
+
+def test_family_group_card_and_commands_need_no_consent(family_group, dms):
+    card = assert_card_ok(cmd("", "U_KID"))
+    lines = body_lines(card)
+    assert "爸爸" in lines and "媽媽" in lines and not any("還沒開始記錄" in line for line in lines)
+    assert not any("恢復" in n["action"]["label"] for n in card["footer"]["contents"] if "action" in n)
+    assert {row["changed_by"] for row in db.consent_states(G).values()} == {"default"}
+    assert cmd("吃藥了", "U_DAD", msg="t1").text == "爸媽健康：記下了"
+    assert cmd("同意", "U_DAD").text.startswith("爸媽健康：爸爸的健康紀錄正在記錄，不用按")
+    assert cmd("恢復", "U_KID").text == "爸媽健康：爸爸、媽媽的健康紀錄都在記錄中，不用按"
+    cmd("暫停", "U_DAD")
+    assert cmd("恢復", "U_KID").text == "爸媽健康：要爸爸本人打 /健康 恢復 才會記錄"
+    assert cmd("恢復", "U_DAD").text.startswith("爸媽健康：已恢復記錄爸爸的健康留言")
+    assert db.consent_states(G)["爸爸"]["status"] == "on"
+
+
+def test_cards_still_render_and_pause_still_works_when_the_default_write_fails(family_group, extract_mod, monkeypatch):
+    def broken(*_a, **_kw):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(db, "ensure_default_consent", broken)
+    card = assert_card_ok(cmd("", "U_KID"))
+    assert db.consent_states(G) == {}
+    assert "還沒開始記錄（要爸爸本人打 /健康 恢復）" in body_lines(card)
+    reply = cmd("暫停", "U_DAD")
+    assert reply.text.startswith("爸媽健康：已暫停爸爸的健康紀錄")
+    assert db.consent_states(G)["爸爸"]["status"] == "paused"
+    monkeypatch.setattr(extract_mod, "extract", lambda text, speaker, **kw: [F("爸爸", "med", "吃藥")])
+    assert ph.observe_message(G, "b1", "U_DAD", "我吃藥了", event_ts_ms=int(NOW * 1000), now=NOW) == 0
+
+
+def test_weekly_and_status_never_write_default_rows(family_group, monkeypatch):
+    calls = _spy_default(monkeypatch)
+    ph.weekly_section(G, NOW)
+    ph.status_summary(NOW)
+    assert calls == [] and db.consent_states(G) == {}
+
+
+def test_daily_check_never_writes_default_rows(family_group, monkeypatch, dms):
+    consent("爸爸", "U_DAD")  # 有 on 列，每日檢查才會跑到這個群組；媽媽沒有列，寫了就看得出來
+    calls = _spy_default(monkeypatch)
+    ph.run_daily_check(NOW)
+    assert calls == [] and "媽媽" not in db.consent_states(G)
+
+
+def test_family_group_pause_silences_119(family_group, extract_mod, monkeypatch):
+    cmd("暫停", "U_DAD")  # 家族主群：先補預設列再暫停
+    assert db.consent_states(G)["爸爸"]["status"] == "paused"
+    _red(monkeypatch, extract_mod, [RF("爸爸", "跌倒")])
+    assert decide("我剛剛跌倒了", event=NOW + 60, now=NOW + 60) is None
+
+
+def test_family_group_unset_parent_gets_no_119(family_group, family, extract_mod, monkeypatch):
+    family({"U_MOM": "媽媽", "U_KID": "成員甲"})  # 爸爸帳號沒設定
+    _red(monkeypatch, extract_mod, [RF("爸爸", "跌倒")])
+    assert decide("爸爸剛剛跌倒了", user="U_KID", event=NOW - 2) is None
+
+
+def test_paused_row_without_account_takes_no_write(family_group, extract_mod, monkeypatch):
+    db.set_consent(G, "爸爸", "paused", user_id="", changed_by="U_KID", now=NOW - 100)
+    db.set_consent(G, "媽媽", "on", user_id="U_MOM", changed_by="default", now=NOW - 100)
+    calls = _spy_default(monkeypatch)
+    monkeypatch.setattr(extract_mod, "extract", lambda text, speaker, **kw: [])
+    ph.observe_message(G, "q1", "U_KID", "今天天氣很好", event_ts_ms=int(NOW * 1000), now=NOW)
+    assert calls == []
+
+
+# 第一次寫預設列時的先後（GP2 事後審查 #1）：比列早一點、晚一點才處理的留言都不能被 on_since 擋掉
+def test_card_before_the_background_observe_keeps_the_first_record(family_group, extract_mod, monkeypatch):
+    _red(monkeypatch, extract_mod, [RF("爸爸", "跌倒")])
+    d = decide("我剛剛跌倒了", event=NOW - 0.4, now=NOW - 0.3)
+    assert d is not None and d.reply
+    cmd("", "U_KID", now=NOW + 1)  # /健康 卡片在 webhook 先寫了預設列
+    monkeypatch.setattr(extract_mod, "extract", lambda text, speaker, **kw: [F("爸爸", "med", "吃藥")])
+    assert ph.observe_message(G, "a1", "U_DAD", "我吃藥了", event_ts_ms=int((NOW - 0.4) * 1000), now=NOW + 1.1) == 1
+
+
+def test_card_first_then_an_earlier_red_flag_still_replies(family_group, extract_mod, monkeypatch):
+    cmd("", "U_KID", now=NOW + 1)
+    _red(monkeypatch, extract_mod, [RF("爸爸", "跌倒")])
+    d = decide("我剛剛跌倒了", msg="late1", event=NOW - 0.4, now=NOW + 1.1)
+    assert d is not None and d.reply
+
+
+def test_another_message_first_then_an_earlier_red_flag_still_replies(family_group, extract_mod, monkeypatch):
+    monkeypatch.setattr(extract_mod, "extract", lambda text, speaker, **kw: [])
+    ph.observe_message(G, "k1", "U_KID", "今天天氣很好", event_ts_ms=int((NOW + 0.2) * 1000), now=NOW + 0.21)
+    assert db.consent_states(G)["爸爸"]["changed_by"] == "default"
+    _red(monkeypatch, extract_mod, [RF("爸爸", "跌倒")])
+    d = decide("我剛剛跌倒了", msg="late2", event=NOW - 0.4, now=NOW + 0.5)
+    assert d is not None and d.reply
+
+
+def test_delete_mine_says_recording_continues_in_the_family_group(family_group):
+    reply = cmd("刪除我的紀錄", "U_DAD")
+    assert_text_ok(reply.text)
+    assert reply.text == "爸媽健康：爸爸目前沒有紀錄；之後的留言還會繼續記錄，要停請打 /健康 暫停"
+
+
+def test_ensure_default_consent_db_rules():
+    # DB 這層自己也守住：暫停的列一個欄位都不改；on 換帳號只改帳號、on_since 照舊；不認的角色、空帳號跳過
+    db.set_consent(G, "爸爸", "paused", user_id="", changed_by="U_KID", now=NOW - 100)
+    db.set_consent(G, "媽媽", "on", user_id="U_MOM", changed_by="U_MOM", now=NOW - 100)
+    assert db.ensure_default_consent(G, {"爸爸": "U_DAD", "媽媽": "U_MOM"}, now=NOW) == 0
+    rows = db.consent_states(G)
+    assert (rows["爸爸"]["status"], rows["爸爸"]["user_id"], rows["爸爸"]["changed_by"]) == ("paused", "", "U_KID")
+    assert (rows["媽媽"]["user_id"], rows["媽媽"]["changed_by"], rows["媽媽"]["on_since"]) == ("U_MOM", "U_MOM", int(NOW - 100))
+    assert db.ensure_default_consent(G, {"媽媽": "U_MOM2"}, now=NOW + 5) == 1
+    mom = db.consent_states(G)["媽媽"]
+    assert (mom["status"], mom["user_id"], mom["changed_by"], mom["on_since"]) == ("on", "U_MOM2", "default", int(NOW - 100))
+    assert db.ensure_default_consent(G2, {"爸爸": "U_DAD", "其他": "U_X", "媽媽": ""}, now=NOW) == 1
+    assert set(db.consent_states(G2)) == {"爸爸"}

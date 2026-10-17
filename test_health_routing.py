@@ -165,8 +165,10 @@ def _routed(text: str, *, quoted: str | None = None, raw_row=None, reply_return=
         ("/健康 130/85", "130/85"),  # 不會被提醒路徑當成日期
         ("/健康 明天回診", "明天回診"),
         ("/健康 同意", "同意"),
+        ("/健康 恢復", "恢復"),
         # GP1 post-review：子指令前面沒打空格也要接得到（不然會掉進一般路由交給模型）。
         ("/健康同意", "同意"),
+        ("/健康恢復", "恢復"),
         ("/健康爸爸", "爸爸"),
         ("/健康暫停爸爸", "暫停爸爸"),
         ("/健康吃藥了", "吃藥了"),
@@ -393,7 +395,8 @@ def test_menu_button_replaced_and_old_card_button_still_brings_the_menu_back():
 def test_help_lists_the_health_commands_without_mentions():
     text = main._HELP_TEXT
     assert "【爸媽健康】" in text
-    assert "/健康 同意" in text and "/健康 暫停" in text and "/健康 刪除" in text
+    assert "/健康 恢復" in text and "/健康 暫停" in text and "/健康 刪除" in text
+    assert "/健康 同意" not in text  # 2026-10-17 起家族主群預設記錄，說明不再叫人按同意
     assert "/今晚煮什麼" in text
     assert "@" not in text and "＠" not in text
 
@@ -538,7 +541,7 @@ def test_disabled_stub_answers_old_buttons_with_a_fixed_line(monkeypatch):
     import parent_health_disabled
 
     monkeypatch.setitem(sys.modules, "parent_health", parent_health_disabled)
-    for text in ("/健康", "/健康 同意", "/健康 吃藥了"):
+    for text in ("/健康", "/健康 同意", "/健康 恢復", "/健康 吃藥了"):
         reply, _cancel, add = _routed(text)
         assert reply.call_args.args[1] == "爸媽健康：暫停使用中"
         add.assert_not_called()

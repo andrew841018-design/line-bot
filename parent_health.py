@@ -1,13 +1,16 @@
-"""爸媽健康（/健康，2026-10-11）：爸媽本人同意後，從群組留言整理用藥、看診、運動、睡眠、飲食、身體狀況。
+"""爸媽健康（/健康，2026-10-11）：從群組留言整理爸媽的用藥、看診、運動、睡眠、飲食、身體狀況。
 
-Andrew 2026-10-11 選全 A：爸媽本人按同意才記錄（誰都能叫出卡片，誰都能幫忙暫停，恢復只能本人按）；
+Andrew 2026-10-11 選全 A；2026-10-17 改成「健康預設同意紀錄，不需要再有我同意紀錄的設計」：
+家族主群（FAMILY_GROUP_ID）預設就記錄爸媽（第一次看到時自動寫 on 同意列，changed_by='default'），
+其他群組照舊要本人打 /健康 恢復。誰都能叫出卡片、誰都能幫忙暫停，恢復只能本人；
 來源是爸媽自己說的、兄弟姊妹提到爸媽的（標明誰說的）、卡片上的一鍵記錄（只記按的人自己）；
-健康卡＋週日週報一段＋異常私訊 Andrew；同意過的家長提到胸痛、跌倒這類緊急狀況，群組回就醫／119
+健康卡＋週日週報一段＋異常私訊 Andrew；記錄中的家長提到胸痛、跌倒這類緊急狀況，群組回就醫／119
 提醒並私訊 Andrew。
 
 - 全部規則式（parent_health_extract），不送模型或外部服務；Discord 只帶角色、類別、標籤、天數／時間。
 - 卡片與文字只由固定詞表、數字、日期組成，沒有留言原文；卡片 altText 固定、不含資料（存檔只留 altText）。
-- 角色只認本機別名檔與角色檔（不用 LINE 顯示名稱）；同意只在「現在解析到的帳號＝同意時的帳號」時有效。
+- 角色只認本機別名檔與角色檔（不用 LINE 顯示名稱）；同意列只在「現在解析到的帳號＝列上的帳號」時有效
+  （家族主群的預設列在帳號換人時自動改成新帳號，on_since 照舊）。
 - main／weekly_summary 只 import 這個模組；公開函式都不丟例外（出錯回安全值，log 只記 error_type）。
 - import 時不建表、不起執行緒或 executor、不讀檔；背景工作第一次用到才建，conftest 會把
   _BACKGROUND_ENABLED 關掉。
@@ -85,7 +88,8 @@ SHIPPED_HEALTH_BUTTON_TEXTS: tuple[str, ...] = (
     "/健康",
     "/健康 爸爸",
     "/健康 媽媽",
-    "/健康 同意",
+    "/健康 同意",  # 舊卡片上的按鈕（2026-10-17 前）；現在等於 /健康 恢復
+    "/健康 恢復",
     "/健康 吃藥了",
     "/健康 有運動",
     "/健康 說明",
@@ -103,8 +107,8 @@ _OVERVIEW_ALT = "爸媽健康卡：點開看爸媽近 7 天的整理"
 _DETAIL_ALT = "爸媽健康卡：點開看近 14 天的細節"
 _EMPTY = "沒有紀錄"  # 「-」「（無）」「（空）」會被 outbound validator 當成空白佔位擋掉
 
-_CONSENT_EXPLANATION = (
-    "同意後，咪寶會從群組留言整理你的用藥、看診、運動、睡眠、飲食和身體狀況（含血壓血糖讀數、不舒服），"
+_RECORDING_EXPLANATION = (
+    "咪寶會從群組留言整理爸爸、媽媽的用藥、看診、運動、睡眠、飲食和身體狀況（含血壓血糖讀數、不舒服），"
     "在「爸媽健康」卡片給全家看、週日週報有一段、異常會私訊 Andrew；留言提到胸痛、跌倒這類緊急狀況，"
     "咪寶會在群組提醒就醫或打 119。暫停只停止健康紀錄、卡片、週報段落、私訊和 119 提醒；"
     "已記的紀錄會保留（記錯的那則，誰都可以引用它再打 /健康 刪除；本人可以打 /健康 刪除我的紀錄 全部刪掉）；"
@@ -114,12 +118,12 @@ _HELP_TEXT = (
     "爸媽健康：怎麼用\n"
     "看爸媽近 7 天的整理卡：打 /健康\n"
     "看近 14 天的細節：打 /健康 爸爸 或 /健康 媽媽\n"
-    "開始記錄：爸爸或媽媽本人打 /健康 同意\n"
     "暫停記錄：本人打 /健康 暫停（家人也可以打 /健康 暫停 爸爸、/健康 暫停 媽媽）\n"
+    "恢復記錄：本人打 /健康 恢復\n"
     "記一筆今天：本人打 /健康 吃藥了 或 /健康 有運動\n"
     "記錯了：長按那則留言→回覆→打 /健康 刪除\n"
     "刪掉自己的全部紀錄：本人打 /健康 刪除我的紀錄\n"
-    f"{_CONSENT_EXPLANATION}\n"
+    f"{_RECORDING_EXPLANATION}\n"
     "咪寶只記錄、不診斷。"
 )
 _CARD_NOTE = "從群組留言整理，只記錄、不診斷"
@@ -374,6 +378,42 @@ def role_of(user_id: str | None) -> str:
         return FAMILY
 
 
+def _default_on(group_id: str) -> bool:
+    """預設同意紀錄只用在家族主群（FAMILY_GROUP_ID；沒明示時 config 會拿舊的 ALLOWED_GROUP_ID 補上），
+    兩個都沒設定就不預設（Andrew 2026-10-17）。"""
+    try:
+        family = str(getattr(parent_health_db.settings, "family_group_id", "") or "")
+    except Exception:
+        return False
+    return bool(family) and group_id == family
+
+
+def _ensure_default(group_id: str, roles: dict, consents: dict, *, now: float, db_path=None) -> bool:
+    """家族主群裡、帳號已設定、還沒有同意列（或 on 但帳號換人）的家長補上預設的 on 列；有寫才回 True。
+    先讀再寫：平常每則留言只讀、不拿寫入鎖；暫停的列不碰。失敗只記 error_type，卡片與指令照常。
+    on_since 往前抓 _EVENT_MAX_AGE_S：比第一次寫列早一點、晚一點才處理的留言（webhook 先後、上線重啟後的
+    重送）照樣記錄、照樣判 119，不會被 on_since 擋掉；分母和 17 天門檻只差這 10 分鐘。"""
+    if not _default_on(group_id):
+        return False
+    accounts: dict[str, str] = {}
+    for role in PARENTS:
+        uid = roles.get(role)
+        row = consents.get(role)
+        if not uid:
+            continue
+        if row is None or (row.get("status") == "on" and row.get("user_id") != uid):
+            accounts[role] = uid
+    if not accounts:
+        return False
+    try:
+        return parent_health_db.ensure_default_consent(
+            group_id, accounts, now=now, on_since=now - _EVENT_MAX_AGE_S, db_path=db_path
+        ) > 0
+    except Exception as exc:
+        _err("default consent", exc)
+        return False
+
+
 def _states(roles: dict[str, str | None], consents: dict[str, dict]) -> dict[str, str]:
     """每位家長：on（有效同意）／paused／none（沒同意過）／reconsent（同意時的帳號已不是現在
     解析到的帳號）／unset（帳號沒設定）。"""
@@ -405,20 +445,21 @@ class _Ctx:
     db_path: object = None
 
 
-def _context(group_id: str, now: float, db_path=None) -> _Ctx:
+def _context(group_id: str, now: float, db_path=None, *, ensure_default: bool = False) -> _Ctx:
+    """ensure_default 只給指令用（webhook 本來就會寫）；週報、每日檢查、status_summary 不寫。"""
     roles = _resolve_roles()
     consents = parent_health_db.consent_states(group_id, db_path=db_path)
+    if ensure_default and _ensure_default(group_id, roles, consents, now=now, db_path=db_path):
+        consents = parent_health_db.consent_states(group_id, db_path=db_path)
     return _Ctx(group_id, now, _today(now), roles, consents, _states(roles, consents), db_path)
 
 
 def _state_line(role: str, state: str) -> str:
     if state == _PAUSED:
-        return f"已暫停記錄（要恢復：{role}本人按「我同意記錄」）"
-    if state == _RECONSENT:
-        return f"需要重新同意（{role}本人按「我同意記錄」）"
+        return f"已暫停記錄（要恢復：{role}本人打 /健康 恢復）"
     if state == _UNSET:
         return "還沒設定帳號"
-    return f"還沒開始記錄（要{role}本人按「我同意記錄」）"
+    return f"還沒開始記錄（要{role}本人打 /健康 恢復）"
 
 
 # ── 紀錄整理 ────────────────────────────────────────────────────────────────
@@ -978,7 +1019,7 @@ def _overview(ctx: _Ctx) -> CommandReply:
     if on_roles:
         footer += [_button("💊 我吃藥了", "/健康 吃藥了"), _button("🚶 我有運動", "/健康 有運動")]
     if any(ctx.states[role] in (_NONE, _PAUSED, _RECONSENT) for role in PARENTS):
-        footer.append(_button("✅ 我同意記錄", "/健康 同意"))
+        footer.append(_button("▶️ 恢復記錄", "/健康 恢復"))
     footer += [_button("📖 怎麼用", "/健康 說明"), _text(_CARD_NOTE, size="md", color=_GRAY)]
     subtitle = f"近 7 天（{_md(ctx.today - timedelta(days=6))}–{_md(ctx.today)}）"
     return _card_reply(_OVERVIEW_ALT, _bubble("爸媽健康", subtitle, body, footer))
@@ -1057,8 +1098,8 @@ def _parse_command(body: str) -> tuple[str, str | None]:
         return "overview", None
     if compact in PARENTS:
         return "detail", compact
-    if compact == "同意":
-        return "consent", None
+    if compact in ("恢復", "同意"):  # 「同意」是 10/17 前舊卡片上的按鈕
+        return "resume", None
     if compact == "暫停":
         return "pause_self", None
     if compact.startswith("暫停") and compact[2:] in PARENTS:
@@ -1069,54 +1110,60 @@ def _parse_command(body: str) -> tuple[str, str | None]:
         return "delete_quoted", None
     if compact == "刪除我的紀錄":
         return "delete_mine", None
-    return "help", None  # 說明、「同意 爸爸」（不能替別人同意）、其他
+    return "help", None  # 說明、「恢復 爸爸」（不能替別人恢復）、其他
 
 
 def _reply(text: str) -> CommandReply:
     return CommandReply(text=text)
 
 
-def _consent(ctx: _Ctx, user_id: str | None) -> CommandReply:
+def _resume(ctx: _Ctx, user_id: str | None) -> CommandReply:
+    """「/健康 恢復」（舊卡片的「/健康 同意」也走這裡）：本人恢復自己的紀錄。家族主群預設就在記錄，
+    只有暫停過的才要恢復；其他群組要本人打這個才開始記錄。"""
     role = _role_from(ctx.roles, user_id)
     if role == FAMILY:
         unset = [r for r in PARENTS if ctx.roles.get(r) is None]
         if unset:
             logger.warning(
-                "parent health consent attempted with role not configured roles=%s",
+                "parent health resume attempted with role not configured roles=%s",
                 ",".join(_ROLE_LOG[r] for r in unset),
             )
             names = "、".join(unset)
-            return _reply(f"爸媽健康：還沒設定{names}是哪個 LINE 帳號，設定好之後要本人按「我同意記錄」才算")
-        return _reply("爸媽健康：要爸爸或媽媽本人按「我同意記錄」才算")
+            return _reply(f"爸媽健康：還沒設定{names}是哪個 LINE 帳號，設定好才能記錄")
+        stopped = [r for r in PARENTS if ctx.states[r] != _ON]
+        if stopped:
+            return _reply(f"爸媽健康：要{'、'.join(stopped)}本人打 /健康 恢復 才會記錄")
+        return _reply("爸媽健康：爸爸、媽媽的健康紀錄都在記錄中，不用按")
     if ctx.states[role] == _ON:  # 重按不重設開始時間（分母、17 天門檻照舊）
-        return _reply(f"爸媽健康：{role}已經同意過了，正在記錄。要暫停打 /健康 暫停")
+        return _reply(f"爸媽健康：{role}的健康紀錄正在記錄，不用按。要暫停打 /健康 暫停")
     parent_health_db.set_consent(
         ctx.group_id, role, "on", user_id=user_id, changed_by=user_id, now=ctx.now, db_path=ctx.db_path
     )
     return _reply(
-        f"爸媽健康：{role}已同意記錄。\n{_CONSENT_EXPLANATION}\n"
+        f"爸媽健康：已恢復記錄{role}的健康留言。\n{_RECORDING_EXPLANATION}\n"
         "要暫停：打 /健康 暫停；要刪掉自己的全部紀錄：打 /健康 刪除我的紀錄"
     )
 
 
 def _pause(ctx: _Ctx, role: str, user_id: str | None) -> CommandReply:
     row = ctx.consents.get(role)
-    if row is None:
+    # 家族主群預設在記錄：還沒有同意列（例如預設列寫失敗）也直接寫成暫停
+    if row is None and not _default_on(ctx.group_id):
         return _reply(f"爸媽健康：{role}還沒開始記錄，不用暫停")
-    if row.get("status") != "on":
+    if row is not None and row.get("status") != "on":
         return _reply(f"爸媽健康：{role}的健康紀錄已經暫停了")
     parent_health_db.set_consent(
-        ctx.group_id, role, "paused", user_id=row.get("user_id") or "", changed_by=user_id or "",
+        ctx.group_id, role, "paused", user_id=(row or {}).get("user_id") or "", changed_by=user_id or "",
         now=ctx.now, db_path=ctx.db_path,
     )
     if _role_from(ctx.roles, user_id) != role:  # 別人幫忙暫停：119 提醒也停了，私訊 Andrew
         _send_dm_background(
             f"🩺 爸媽健康：{role}的健康紀錄被家人暫停了（{_hhmm(ctx.now)}），群組 119 提醒也一起停；"
-            f"要恢復要{role}本人按同意。"
+            f"要恢復要{role}本人打 /健康 恢復。"
         )
     return _reply(
         f"爸媽健康：已暫停{role}的健康紀錄，卡片、週報段落、私訊和 119 提醒也一起停；已記的紀錄保留。"
-        f"要恢復，請{role}本人打 /健康 同意"
+        f"要恢復，請{role}本人打 /健康 恢復"
     )
 
 
@@ -1126,11 +1173,9 @@ def _record(ctx: _Ctx, user_id: str | None, key: str, message_id: str) -> Comman
         return _reply("爸媽健康：這個按鈕只記按的人自己，要爸爸或媽媽本人按")
     state = ctx.states[role]
     if state == _PAUSED:
-        return _reply(f"爸媽健康：{role}的紀錄暫停中，要恢復請按「我同意記錄」")
-    if state == _RECONSENT:
-        return _reply(f"爸媽健康：{role}需要重新同意，請按「我同意記錄」")
+        return _reply(f"爸媽健康：{role}的紀錄暫停中，要恢復請{role}本人打 /健康 恢復")
     if state != _ON:
-        return _reply(f"爸媽健康：{role}還沒同意記錄，要先按「我同意記錄」")
+        return _reply(f"爸媽健康：{role}還沒開始記錄，要{role}本人打 /健康 恢復")
     category, item = _BUTTON_RECORDS[key]
     if not parent_health_db.is_allowed(category, item):
         logger.error("parent health button item not in vocabulary")
@@ -1162,9 +1207,11 @@ def _delete_mine(ctx: _Ctx, user_id: str | None) -> CommandReply:
     if role == FAMILY:
         return _reply("爸媽健康：只有爸爸或媽媽本人能刪自己的全部紀錄")
     deleted = parent_health_db.delete_role_events(ctx.group_id, role, db_path=ctx.db_path)
+    # 家族主群預設在記錄：刪完之後的留言還會繼續記，講清楚怎麼停
+    still = "；之後的留言還會繼續記錄，要停請打 /健康 暫停" if ctx.states.get(role) == _ON else ""
     if deleted:
-        return _reply(f"爸媽健康：已刪掉{role}的 {deleted} 筆紀錄")
-    return _reply(f"爸媽健康：{role}目前沒有紀錄")
+        return _reply(f"爸媽健康：已刪掉{role}的 {deleted} 筆紀錄{still}")
+    return _reply(f"爸媽健康：{role}目前沒有紀錄{still}")
 
 
 def handle_command(
@@ -1184,13 +1231,13 @@ def handle_command(
         command, arg = _parse_command(body)
         if command == "help":
             return _reply(_HELP_TEXT)
-        ctx = _context(group_id, _now(now))
+        ctx = _context(group_id, _now(now), ensure_default=True)
         if command == "overview":
             return _overview(ctx)
         if command == "detail":
             return _detail(ctx, arg)
-        if command == "consent":
-            return _consent(ctx, user_id)
+        if command == "resume":
+            return _resume(ctx, user_id)
         if command == "pause_self":
             role = _role_from(ctx.roles, user_id)
             if role == FAMILY:
@@ -1236,7 +1283,7 @@ def red_flag_decision(
     event_ts_ms,
     now: float | None = None,
 ) -> RedFlagDecision | None:
-    """同意過的家長提到緊急狀況時回決定；其他回 None。
+    """記錄中的家長（家族主群預設）提到緊急狀況時回決定；其他回 None。
 
     在 webhook 鎖裡跑：先做純子字串預檢，沒命中就不碰別名檔與 DB；DB 只讀、不拿寫入鎖；不寫、不連網。
     - 先看未來句再看已在處理：未來句裡的急診／住院／送醫／救護車（排好的看診、住院）整筆丟掉，不私訊；
@@ -1253,12 +1300,16 @@ def red_flag_decision(
         if _is_command_text(text):
             return None
         consents = parent_health_db.consent_states(group_id)
-        if not any(row.get("status") == "on" for row in consents.values()):
+        default_on = _default_on(group_id)
+        if not default_on and not any(row.get("status") == "on" for row in consents.values()):
             return None
         now_f = _now(now)
         event_ts = _event_ts(event_ts_ms, now_f)
         roles = _resolve_roles()
         states = _states(roles, consents)
+        if default_on:
+            # 家族主群預設在記錄：預設列還沒寫（或帳號剛換人）的家長也算；這裡只讀不寫
+            states = {role: (_ON if state in (_NONE, _RECONSENT) else state) for role, state in states.items()}
         in_care_labels = set(getattr(extract, "IN_CARE_LABELS", ()))
         allowed_labels = set(getattr(extract, "RED_FLAG_LABELS", ())) | in_care_labels
         hits: list[tuple[str, str, str]] = []  # (家長, 標籤, reply／in_care／future)
@@ -1269,7 +1320,7 @@ def red_flag_decision(
             role, label = getattr(flag, "role", None), getattr(flag, "label", None)
             if role not in PARENTS or label not in allowed_labels or not getattr(flag, "urgent", False):
                 continue
-            if states.get(role) != _ON or event_ts < consents[role]["on_since"]:
+            if states.get(role) != _ON or event_ts < consents.get(role, {}).get("on_since", 0):
                 continue
             if getattr(flag, "future", False):
                 if label in in_care_labels:
@@ -1473,20 +1524,26 @@ def observe_message(
     db_path=None,
     now: float | None = None,
 ) -> int:
-    """抽取一則留言，只記「同意者的帳號仍是現在解析到的帳號」的家長；回寫入筆數。"""
+    """抽取一則留言，只記記錄中、而且列上帳號仍是現在解析到的帳號的家長；回寫入筆數。"""
     try:
         if not group_id or not message_id or not isinstance(text, str) or not text.strip():
             return 0
         if _is_command_text(text):  # 指令（/健康、/記住、「咪寶 /記住 …」）整則略過
             return 0
         consents = parent_health_db.consent_states(group_id, db_path=db_path)
-        if not any(row.get("status") == "on" for row in consents.values()):
+        default_on = _default_on(group_id)
+        if not default_on and not any(row.get("status") == "on" for row in consents.values()):
             return 0
         roles = _resolve_roles()
+        now_f = _now(now)
+        event_ts = _event_ts(event_ts_ms, now_f)
+        # 家族主群第一次看到這位家長就補預設 on 列；on_since 用這則留言的時間（背景比 webhook 晚，
+        # 用現在的話這則和它的 119 判斷都會被 on_since 擋掉）
+        if default_on and _ensure_default(group_id, roles, consents, now=min(now_f, event_ts), db_path=db_path):
+            consents = parent_health_db.consent_states(group_id, db_path=db_path)
         states = _states(roles, consents)
         if _ON not in states.values():
             return 0
-        now_f = _now(now)
         names = _name_table(roles)
         extracted = _extract().extract(
             _with_parent_titles(text, names), _role_from(roles, user_id), other_names=_other_names(names)
@@ -1499,7 +1556,7 @@ def observe_message(
             findings,
             message_id=str(message_id),
             reporter_user_id=user_id or "",
-            event_ts=_event_ts(event_ts_ms, now_f),
+            event_ts=event_ts,
             source="chat",
             now=now_f,
             db_path=db_path,
@@ -1552,7 +1609,7 @@ def _weekly_line(s: _Summary) -> str:
 
 
 def weekly_section(group_id: str, now: float | None = None) -> str:
-    """週日週報（家族熱話那則）後面接的段落：只有已同意、沒暫停的家長；沒有就回 ""。
+    """週日週報（家族熱話那則）後面接的段落：只有記錄中（沒暫停）的家長；沒有就回 ""。
     段落本身要原樣通過 outbound validator，不然回 ""（週報照舊）。"""
     try:
         ctx = _context(group_id, _now(now))
@@ -1599,11 +1656,11 @@ class _Anomaly:
 
 
 def _anomalies(ctx: _Ctx) -> list[_Anomaly]:
-    """D＝今天（台北）。只看已同意、沒暫停的家長；同一項 7 天內私訊過就不列。只有角色、類別、標籤、天數。
-    - 用藥中斷：同意開始 ≤ D-17 的 00:00、D-17..D-4 有 ≥ 5 天說吃藥、D-3..D（到現在）都沒有。
+    """D＝今天（台北）。只看記錄中（沒暫停）的家長；同一項 7 天內私訊過就不列。只有角色、類別、標籤、天數。
+    - 用藥中斷：開始記錄 ≤ D-17 的 00:00、D-17..D-4 有 ≥ 5 天說吃藥、D-3..D（到現在）都沒有。
     - 忘了吃藥：過去 24 小時有說。
     - 同一症狀 D-6..D ≥ 3 天（緊急字詞不算症狀）；睡不好 D-6..D ≥ 4 天。
-    只算這次同意以來（event_ts ≥ on_since）的紀錄：暫停又恢復時，之前那段不會一恢復就觸發。"""
+    只算這次開始記錄以來（event_ts ≥ on_since）的紀錄：暫停又恢復時，之前那段不會一恢復就觸發。"""
     found: list[_Anomaly] = []
     today = ctx.today
     for role in PARENTS:
@@ -1661,7 +1718,7 @@ def anomaly_lines(group_id: str, now: float | None = None) -> list[str]:
 
 
 def run_daily_check(now: float | None = None) -> int:
-    """每天台北 21:00 之後一次：每個有同意紀錄的群組先搶 daily_check:<日期>（重啟、雙程序都不重送），
+    """每天台北 21:00 之後一次：每個有記錄中家長的群組先搶 daily_check:<日期>（重啟、雙程序都不重送），
     每項異常也先搶再送；send_dm 結果不明也不重送。回送出的私訊數。"""
     try:
         now_f = _now(now)
