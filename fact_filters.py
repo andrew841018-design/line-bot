@@ -239,6 +239,24 @@ def load_name_terms(*, require_names: bool = False) -> tuple[str, ...]:
     return _normalize_terms(raw)
 
 
+def private_text(text: str) -> bool:
+    """這段原文送去 Gemini 之前要不要先拿掉（2026-10-17 每日記憶 Gemini 備援）。
+
+    健康與私人細節（PRIVATE_FACT_RE）、身體症狀、金額、銀行與卡、地址電話 email——這些事實本來就不會存，
+    原文也就不必送去 Gemini 免費版。只是減少送出，不是保證：沒列到的寫法照樣會送。
+    """
+    raw = str(text or "")
+    visible = strip_format(raw)
+    norm = unicodedata.normalize("NFKC", visible)
+    if any(PRIVATE_FACT_RE.search(form) for form in (raw, visible, norm)):
+        return True
+    if has_contact(raw):
+        return True
+    return any(
+        pattern.search(norm) for category, pattern, _exempt in _STRICT_RULES if category in ("body", "money", "banking")
+    )
+
+
 def reject_reason(
     fact: str, *, require_names: bool = False, names: Sequence[str] | None = None
 ) -> str:

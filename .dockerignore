@@ -63,3 +63,4 @@ finetune/adapters/
 finetune/eval_results/
 
 review_summary.md
+family_kinship.local.json

@@ -52,7 +52,7 @@ import sys
 import time
 import unicodedata
 from collections import Counter
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
@@ -83,6 +83,7 @@ STATE_DIR_ENV = "LINE_BOT_DAILY_MEMORY_STATE_DIR"
 HEARSAY_ENV = "LINE_BOT_DAILY_MEMORY_HEARSAY"
 HEARSAY_ONLY_ENV = "LINE_BOT_DAILY_MEMORY_HEARSAY_ONLY"
 FALLBACK_ENV = "LINE_BOT_DAILY_MEMORY_FALLBACK"
+KINSHIP_PATH_ENV = "LINE_FAMILY_KINSHIP_PATH"  # 本機角色檔（不進 git）；測試一律指到不存在的暫存路徑
 
 # 部署時寫進進度檔的初值：2026-10-10 23:59:59（台北）＝匯出檔最後一則，10/10 以前由重建涵蓋。
 INITIAL_CURSOR_TS = 1791647999
@@ -146,7 +147,7 @@ _SYSTEM_PROMPT_HEARSAY = """你替家族 LINE 群的聊天機器人「咪寶」�
 
 規則：
 1. person 只能是這些說話的人之一：{speakers}。person 一律填那則訊息開頭的人（說話的人）。
-2. 每條都要填 about：這件事是誰的。說話的人自己的事：訊息裡寫了「我」就填「我」，主詞省略就填「（省略）」。說話的人講到另一個人的事：about 照抄訊息裡對那個人的叫法原字（例如「爸爸」「妹妹」「老公」「同學」），不要改寫、不要換成名字；講到另一個人時只抽這幾類：住哪裡、在哪裡工作或上學、喜歡或不吃的東西、興趣、養的寵物、正在學的東西，fact 只寫那個人的事、不寫他的稱呼。用疑問或猜測說的（是不是、好像、聽說）不要抽。
+2. 每條都要填 about：這件事是誰的。說話的人自己的事：訊息裡寫了「我」就填「我」，主詞省略就填「（省略）」。說話的人講到另一個人的事：about 照抄訊息裡對那個人的叫法原字（例如「爸爸」「妹妹」「老公」「我媽」「同學」），不要改寫、不要換成名字；講到另一個人時只抽這幾類：住哪裡、在哪裡工作或上學、喜歡或不吃的東西、興趣、養的寵物、正在學的東西，fact 只寫那個人的事、不寫他的稱呼。用疑問或猜測說的（是不是、好像、聽說）不要抽。
 3. 「（不確定是誰）」說的、看不出是誰的、咪寶說的話，以及轉貼內容裡別人的話，都不要抽。
 4. 只抽跨對話都會成立的事實，不要抽這次對話的即時內容。
 5. 不要抽健康與病況、用藥、感情與懷孕、債務與官司、金額與帳戶、證件與帳號、自傷念頭、受暴經驗這類私人細節。
@@ -239,6 +240,11 @@ class Outcome:
     fallback_reason: str = ""  # Claude 這一輪不能用、改用 Gemini 的原因（類別）；空的是沒換
     backend_used: str = ""  # 最後實際用的模型種類；沒呼叫模型是空的
     gemini_chunks: int = 0  # 這一輪由 Gemini 做的塊數（換過去或跳過前的救援；post-impl GP1#9）
+    withheld_rows: int = 0  # 送 Gemini 前拿掉的私密列（2026-10-17；每塊只算一次）
+    withheld_empty_chunks: int = 0  # 拿掉之後沒有可引用的列、所以沒呼叫 Gemini 的塊數
+    kinship_config: str = ""  # 本機角色檔：ok／missing／invalid；轉述沒開時是空的
+    kinship_applied: int = 0
+    kinship_ignored: int = 0
     cursor_lag_h: float = 0.0
     last_success_at: int | None = None
     finished_at: int = 0
@@ -661,6 +667,31 @@ def _gate(backend: str) -> str:
     return "quota" if claude_client.quota_exhausted() else ""
 
 
+@dataclass(frozen=True)
+class _GeminiView:
+    """送 Gemini 的那一份提示與它自己的編號（出處檢查要用這一份，不能用 Claude 那份）。"""
+
+    system: str
+    user: str
+    numbered: dict[int, Row]
+    persons: dict[str, str]
+    withheld: int
+
+
+def gemini_view(chunk: Sequence[Row]) -> _GeminiView:
+    """2026-10-17（Andrew 照建議做）：含私密字的列不送 Gemini 免費版（fact_filters.private_text 看 row.turn，
+    就是實際會送出的那一行）。這種事實本來就不會存；拿掉的列照樣讓進度前進。只是減少送出，不是保證。"""
+    hidden = [row.kept and fact_filters.private_text(row.turn) for row in chunk]
+    rows = [replace(row, kept=False, citable=False) if hide else row for row, hide in zip(chunk, hidden)]
+    system, user, numbered, persons = build_prompt(rows)
+    return _GeminiView(system, user, numbered, persons, sum(hidden))
+
+
+def _ask_gemini(view: _GeminiView) -> list[dict]:
+    """job 裡呼叫 Gemini 抽事實的唯一入口（探測的固定內容另外走 _probe_failure）。"""
+    return parse_items(_call_model("gemini", view.system, view.user, sorted(view.persons)))
+
+
 @dataclass
 class _Backend:
     """這一輪用的模型（2026-10-16）：設定是 claude、備援開著，Claude 不能用時整輪換成 Gemini，只換一次。"""
@@ -687,18 +718,18 @@ class _Backend:
 
 
 def _fall_back(
-    active: _Backend, exc: Exception, system: str, user: str, persons: Sequence[str]
-) -> tuple[list[dict] | None, Exception, str | None]:
+    active: _Backend, exc: Exception, chunk: Sequence[Row]
+) -> tuple[list[dict] | None, Exception, str | None, _GeminiView | None]:
     """Claude 做這一塊失敗之後（備援開著才有）：先分清楚是 Claude 整個不能用，還是這一塊的問題。
 
     - CLI 找不到、登入失效這類不算次數的錯：不用探測，直接換。
     - 用量上限和算次數的錯：先用不含家人資料的探測確認（GP2 S7-6）。探測也失敗就換；探測正常而錯是
       「上限」，那是這一塊的內容讓 CLI 看起來像上限，照這一塊的暫時失敗算次數。
-    換了就用 Gemini（只抽本人事實的提示）重做這一塊。回傳 (items 或 None, 要照原規則處理的錯, 探測結果)；
-    探測結果 None＝沒探測，""＝Claude 正常，其他＝不能用的原因（到門檻時沿用，不再探測第二次）。
+    換了就用 Gemini（只抽本人事實、拿掉私密列的那一份）重做這一塊。回傳 (items 或 None, 要照原規則處理的錯,
+    探測結果, Gemini 那一份)；探測結果 None＝沒探測，""＝Claude 正常，其他＝不能用的原因（到門檻時沿用）。
     """
     if not active.can_switch():
-        return None, exc, None
+        return None, exc, None, None
     probe: str | None = None
     if isinstance(exc, TransientError) and not exc.counted and exc.reason != "quota":
         down = exc.reason
@@ -710,29 +741,36 @@ def _fall_back(
             # 公開的方法關掉；要等 claude_client 提供再處理（post-impl GP1#9）。
             exc = TransientError("quota_unconfirmed", counted=True)
     if not down or not active.switch(down):
-        return None, exc, probe
+        return None, exc, probe, None
+    view = gemini_view(chunk)
+    if not view.persons:
+        return [], exc, probe, view  # 拿掉私密列之後沒有可引用的：不呼叫，這一塊照樣前進
     try:
-        return parse_items(_call_model("gemini", system, user, persons)), exc, probe
+        return _ask_gemini(view), exc, probe, view
     except (TransientError, PermanentError) as gemini_exc:
-        return None, gemini_exc, None
+        return None, gemini_exc, None, view
     except Exception as gemini_exc:  # 不能讓 Gemini 端的意外錯誤變成整支 job 的 exit 1（post-impl GP1#9）
         log.warning("daily memory gemini fallback failed error_type=%s", type(gemini_exc).__name__)
-        return None, TransientError("gemini_error"), None
+        return None, TransientError("gemini_error"), None, view
 
 
-def _rescue(active: _Backend, system: str, user: str, persons: Sequence[str]) -> list[dict] | None:
-    """這一塊要被跳過之前（探測說 Claude 正常，是這一塊一直失敗）：備援開著就用 Gemini 試一次（GP1#7e）。"""
+def _rescue(active: _Backend, chunk: Sequence[Row]) -> tuple[list[dict] | None, _GeminiView | None]:
+    """這一塊要被跳過之前（探測說 Claude 正常，是這一塊一直失敗）：備援開著就用 Gemini 試一次（GP1#7e）。
+    拿掉私密列之後沒有可引用的就回 None：不能把一直失敗的塊記成成功（2026-10-17 審查）。"""
     if not active.can_switch():
-        return None
+        return None, None
+    view = gemini_view(chunk)
+    if not view.persons:
+        return None, view
     try:
         if _gate("gemini"):
-            return None
-        return parse_items(_call_model("gemini", system, user, persons))
+            return None, view
+        return _ask_gemini(view), view
     except (TransientError, PermanentError):
-        return None
+        return None, view
     except Exception as exc:
         log.warning("daily memory gemini rescue failed error_type=%s", type(exc).__name__)
-        return None
+        return None, view
 
 
 def _fact_array(value: object) -> list[dict] | None:
@@ -796,6 +834,9 @@ class HearsayContext:
     user_ids: dict[str, str]
     only: bool = False
     drops: Counter = field(default_factory=Counter)
+    kinship: str = ""
+    kinship_applied: int = 0
+    kinship_ignored: int = 0
 
 
 def hearsay_context(group_id: str, *, only: bool = False) -> HearsayContext:
@@ -817,7 +858,34 @@ def hearsay_context(group_id: str, *, only: bool = False) -> HearsayContext:
         label = member_labels._clean_member_label(value)
         if label in labels:
             aliases[term] = label
-    return HearsayContext(hearsay.build_roster(labels, aliases), labels, only)
+    roles, children, status, applied, ignored = _load_kinship({uid: label for label, uid in labels.items()})
+    roster = hearsay.build_roster(labels, aliases, roles=roles, children=children)
+    return HearsayContext(roster, labels, only, kinship=status, kinship_applied=applied, kinship_ignored=ignored)
+
+
+def _kinship_path() -> Path:
+    return Path(os.environ.get(KINSHIP_PATH_ENV) or BASE / "family_kinship.local.json")
+
+
+def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+    keys = [key for key, _value in pairs]
+    if len(keys) != len(set(keys)):
+        raise ValueError("kinship: duplicate key")
+    return dict(pairs)
+
+
+def _load_kinship(labels_by_user: dict[str, str]) -> tuple[dict[str, str], frozenset[str], str, int, int]:
+    """本機角色檔（2026-10-17）：讀不到或格式錯就當作沒有（只少了這些叫法），log 只記錯誤類型。"""
+    path = _kinship_path()
+    if not path.is_file() or path.is_symlink():
+        return {}, frozenset(), "missing", 0, 0
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_no_duplicate_keys)
+        roles, children, applied, ignored = hearsay.parse_kinship(raw, labels_by_user)
+    except (OSError, UnicodeError, ValueError) as exc:
+        log.warning("daily memory kinship config invalid error_type=%s", type(exc).__name__)
+        return {}, frozenset(), "invalid", 0, 0
+    return roles, children, "ok", applied, ignored
 
 
 def check_provenance(
@@ -905,12 +973,13 @@ def _finish(outcome: Outcome, now: float) -> Outcome:
     log.info(
         "daily memory status=%s mode=%s hearsay_mode=%s stop=%s chunks_ok=%d failed=%d poison=%d pending=%d "
         "added=%d dup=%d tombstoned=%d capped=%d forgotten=%d provenance_mismatch=%d gap=%s "
-        "hearsay=%d upgraded=%d fallback=%s",
+        "hearsay=%d upgraded=%d fallback=%s gemini_chunks=%d withheld=%d withheld_empty=%d",
         outcome.status, outcome.mode, outcome.hearsay_mode or "-", outcome.stop_reason or "-", outcome.chunks_ok,
         outcome.chunks_failed, outcome.chunks_poison, outcome.chunks_pending, outcome.added,
         outcome.dup, outcome.tombstoned, outcome.capped, outcome.forgotten,
         outcome.provenance_mismatch, outcome.gap_detected, outcome.hearsay, outcome.upgraded,
-        outcome.fallback_reason or "-",
+        outcome.fallback_reason or "-", outcome.gemini_chunks, outcome.withheld_rows,
+        outcome.withheld_empty_chunks,
     )
     return outcome
 
@@ -1024,7 +1093,6 @@ def _run_locked(
     for chunk in chunks:
         key = chunk_key(chunk)
         system, user, numbered, persons = build_prompt(chunk, hearsay_on=context is not None)
-        plain_system = build_prompt(chunk)[0] if context is not None else system
         candidates: list[Candidate] = []
         skipped = False
         chunk_backend = active.name
@@ -1044,15 +1112,20 @@ def _run_locked(
                 if embedder is None:
                     return _fail(outcome, "embedder_unavailable", now)
                 outcome.embedder_mode = "minilm"
-            model_chunks += 1
-            # 轉述只在 Claude 上抽：Gemini（flash-lite）只抽本人的事（GP2 S6），而且照樣做衛生檢查
+            # 轉述只在 Claude 上抽：Gemini（flash-lite）只抽本人的事（GP2 S6），而且照樣做衛生檢查；
+            # Gemini 一律看拿掉私密列的那一份（gemini_view／_ask_gemini，2026-10-17）
             chunk_backend = active.name
+            view: _GeminiView | None = gemini_view(chunk) if active.name == "gemini" else None
+            items: list[dict] | None = [] if view is not None and not view.persons else None
             try:
-                items = parse_items(_call_model(
-                    active.name, system if active.name == "claude" else plain_system, user, sorted(persons)
-                ))
+                if items is None:
+                    model_chunks += 1
+                    items = _ask_gemini(view) if view is not None else parse_items(
+                        _call_model(active.name, system, user, sorted(persons))
+                    )
             except (TransientError, PermanentError) as first:
-                items, exc, probe = _fall_back(active, first, plain_system, user, sorted(persons))
+                items, exc, probe, fallback_view = _fall_back(active, first, chunk)
+                view = fallback_view or view
                 if items is not None:  # 改用 Gemini 做成了：不算這一塊失敗
                     chunk_backend = "gemini"
                 elif active.reason:
@@ -1098,7 +1171,8 @@ def _run_locked(
                         if not dry_run and counter.pop(key, None) is not None:
                             _save_state(state, group_id, cursor, poison, transient)
                         break
-                    rescued = _rescue(active, plain_system, user, sorted(persons))
+                    rescued, rescue_view = _rescue(active, chunk)
+                    view = rescue_view or view
                     if rescued is not None:  # 跳過之前 Gemini 做成了這一塊（只有本人的事）
                         items, chunk_backend = rescued, "gemini"
                     else:
@@ -1107,9 +1181,17 @@ def _run_locked(
                         outcome.chunks_poison += 1
                         outcome.poison_reasons[why] = outcome.poison_reasons.get(why, 0) + 1
                         items, skipped = [], True
-            outcome.gemini_chunks += chunk_backend == "gemini"
+            if view is not None:  # 每一塊只算一次
+                outcome.withheld_rows += view.withheld
+                outcome.withheld_empty_chunks += not view.persons
+            gemini_used = chunk_backend == "gemini" and view is not None
+            outcome.gemini_chunks += gemini_used and bool(view.persons)
             candidates, mismatched = check_provenance(
-                items, numbered, persons, context, self_only=chunk_backend == "gemini"
+                items,
+                view.numbered if gemini_used else numbered,
+                view.persons if gemini_used else persons,
+                context,
+                self_only=chunk_backend == "gemini",
             )
             outcome.provenance_mismatch += mismatched
             preview_decisions.extend({"decision": "provenance_mismatch"} for _ in range(mismatched))
@@ -1155,6 +1237,8 @@ def _run_locked(
     outcome.backend_used = active.name if model_chunks else ""
     if context is not None:
         outcome.hearsay_drops = dict(context.drops)
+        outcome.kinship_config = context.kinship
+        outcome.kinship_applied, outcome.kinship_ignored = context.kinship_applied, context.kinship_ignored
     if dry_run:
         try:
             report = _store(

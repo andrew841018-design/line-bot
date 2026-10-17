@@ -63,3 +63,4 @@ pending_media/
 .pending_media_state/
 
 finetune/data/
+family_kinship.local.json

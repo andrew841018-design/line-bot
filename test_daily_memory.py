@@ -375,7 +375,7 @@ def test_the_outcome_has_counts_only(job):
         elif isinstance(value, str):
             assert key in {
                 "status", "mode", "backend", "hearsay_mode", "stop_reason", "embedder_mode", "fallback_reason",
-                "backend_used",
+                "backend_used", "kinship_config",
             }
 
 
@@ -1392,3 +1392,101 @@ def test_the_outcome_says_which_hearsay_mode_ran(monkeypatch, job):
     _write_state()
     _raw("m1", "U_A", "我住台中", T0 + 10)
     assert dm.run(now=NOW).hearsay_mode == "only"
+
+
+
+# ── 2026-10-17：角色檔（子女的我媽／我爸、姊姊）與送 Gemini 前拿掉私密列 ──────────────
+
+
+def _kinship_file(monkeypatch, tmp_path, content):
+    path = tmp_path / "kinship.json"
+    path.write_text(content if isinstance(content, str) else json.dumps(content, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setenv(dm.KINSHIP_PATH_ENV, str(path))
+
+
+def _with_mom(job):
+    job.aliases.write_text(
+        json.dumps({"U_A": "成員甲", "U_B": "成員乙", "U_M": "媽媽"}, ensure_ascii=False), encoding="utf-8"
+    )
+    _raw("m0", "U_M", "早安", T0 + 5)
+
+
+@pytest.mark.parametrize(
+    ("content", "status"),
+    [(None, "missing"), ("{not json", "invalid"), ('{"roles": {}, "roles": {}}', "invalid"),
+     ({"roles": {"阿姨": "U_B"}}, "invalid"), ({"roles": {"姊姊": "U_A", "姐姐": "U_B"}}, "invalid"),
+     ({"children": ["U_A", "U_A"]}, "invalid"), ({"roles": {"姊姊": "U_B"}, "children": ["U_A", "U_B"]}, "ok")],
+)
+def test_the_kinship_file_is_read_leniently(monkeypatch, job, tmp_path, content, status):
+    monkeypatch.setenv(dm.HEARSAY_ENV, "1")
+    if content is not None:
+        _kinship_file(monkeypatch, tmp_path, content)
+    _write_state()
+    _raw("m1", "U_A", "我住台中", T0 + 10)
+    outcome = dm.run(now=NOW)
+    assert outcome.status == "ok" and outcome.kinship_config == status  # 格式錯也不會讓整支 job 停下
+
+
+def test_a_childs_my_mom_is_filed_under_mom(monkeypatch, job, tmp_path):
+    monkeypatch.setenv(dm.HEARSAY_ENV, "1")
+    _with_mom(job)
+    _kinship_file(monkeypatch, tmp_path, {"children": ["U_A"]})
+    _write_state()
+    _raw("m1", "U_A", "我媽最近在學游泳", T0 + 10)
+    job.model.reply = lambda user: json.dumps([{"person": "成員甲", "about": "我媽", "fact": "最近在學游泳",
+                                                "src": _number_of(user, "我媽最近在學游泳")}], ensure_ascii=False)
+    outcome = dm.run(now=NOW)
+    assert memory.list_fact_rows(G) == [("U_M", "媽媽：最近在學游泳（成員甲說的）")]
+    assert (outcome.kinship_config, outcome.kinship_applied) == ("ok", 1)
+
+
+def _private_rows():
+    _write_state()
+    _raw("m1", "U_A", "我住台中", T0 + 10)
+    _raw("m2", "U_B", "我最近在吃藥", T0 + 11)
+
+
+def _gemini_users(job):
+    return [user for (_system, user, _persons), backend in zip(job.model.prompts, job.model.backends)
+            if backend == "gemini"]
+
+
+@pytest.mark.parametrize("flow", ["gate", "backend", "fallback", "rescue"])
+def test_private_rows_never_reach_gemini(monkeypatch, job, flow):
+    _fallback_on(monkeypatch)
+    _private_rows()
+    if flow == "gate":
+        monkeypatch.setattr(dm, "_gate", lambda backend: "quota" if backend == "claude" else "")
+    elif flow == "backend":
+        monkeypatch.setenv(dm.BACKEND_ENV, "gemini")
+    elif flow == "fallback":
+        monkeypatch.setattr(dm, "_probe_failure", lambda backend: "backend_down")
+        job.model.errors = {1: dm.TransientError("backend_auth")}
+    else:
+        monkeypatch.setattr(dm, "_probe_failure", lambda backend: "")
+        key = f"{T0 + 10}:m1"
+        path = dm._state_path()
+        path.write_text(json.dumps({G: {"cursor": {"created_at": T0, "message_id": ""}, "poison": {},
+                                        "transient": {key: dm.TRANSIENT_SKIP_AFTER - 1}}}), encoding="utf-8")
+        job.model.errors = {1: dm.TransientError("timeout", counted=True)}
+    outcome = dm.run(now=NOW)
+    users = _gemini_users(job)
+    assert users and all("吃藥" not in user for user in users)
+    assert outcome.withheld_rows == 1
+    assert memory.list_fact_rows(G) == [("U_A", "成員甲：住在台中")]  # 編號用 Gemini 那一份，事實記對人
+
+
+def test_a_chunk_with_only_private_rows_skips_gemini(monkeypatch, job):
+    _fallback_on(monkeypatch)
+    monkeypatch.setattr(dm, "_gate", lambda backend: "quota" if backend == "claude" else "")
+    _write_state()
+    _raw("m1", "U_B", "我最近在吃藥", T0 + 10)
+    outcome = dm.run(now=NOW)
+    assert job.model.prompts == [] and (outcome.withheld_rows, outcome.withheld_empty_chunks) == (1, 1)
+    assert outcome.gemini_chunks == 0 and _cursor() == (T0 + 10, "m1")
+
+
+def test_claude_still_sees_the_whole_chunk(job):
+    _private_rows()
+    dm.run(now=NOW)
+    assert job.model.backends == ["claude"] and "吃藥" in job.model.prompts[0][1]

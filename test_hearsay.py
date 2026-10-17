@@ -375,3 +375,59 @@ def test_a_negated_source_cannot_become_a_positive_fact_through_a_negation_word_
 @pytest.mark.parametrize("text", ["同學住台中。我去台中玩", "爸爸住台中。我去台中玩"])
 def test_a_fact_from_another_sentence_is_not_the_speakers(text):
     assert judge("住在台中", "我", "成員甲", text).ok is False
+
+
+
+# ── 2026-10-17：角色檔與子女的我媽／我爸 ──────────────────────────────────────
+
+KIN = h.build_roster(
+    ["爸爸", "媽媽", "成員甲", "成員乙丙", "長女"], {"乙丙": "成員乙丙", "妹妹": "成員乙丙"},
+    roles={"姊姊": "長女", "姐姐": "長女"}, children=["成員甲", "成員乙丙", "長女", "媽媽"],
+)
+
+
+def test_parse_kinship_validates_and_counts():
+    labels = {"U_E": "長女", "U_A": "成員甲", "U_M": "媽媽"}
+    roles, children, applied, ignored = h.parse_kinship(
+        {"roles": {"姊姊": "U_E"}, "children": ["U_A", "U_M", "U_X"]}, labels
+    )
+    assert roles == {"姊姊": "長女"} and children == frozenset({"成員甲"}) and (applied, ignored) == (2, 2)
+    for bad in ({"roles": {"阿姨": "U_E"}}, {"roles": {"姊姊": "U_E", "姐姐": "U_A"}}, {"children": ["U_A", "U_A"]},
+                {"roles": [], "children": []}, {"extra": 1}, ["U_A"]):
+        with pytest.raises(ValueError):
+            h.parse_kinship(bad, labels)
+
+
+def test_parents_are_never_children_and_role_terms_are_tracked():
+    assert "媽媽" not in KIN.children and KIN.role_terms == frozenset({"姊姊", "姐姐"})
+
+
+@pytest.mark.parametrize(
+    ("about", "speaker", "text", "label"),
+    [("我媽", "成員甲", "我媽住台中", "媽媽"), ("我爸爸", "成員乙丙", "我爸爸在學游泳", "爸爸"),
+     ("姊姊", "成員甲", "姊姊住台中", "長女"), ("姐姐", "媽媽", "姐姐住台中", "長女")],
+)
+def test_family_words_from_children_and_parents(about, speaker, text, label):
+    fact = "在學游泳" if "學" in text else "住在台中"
+    assert judge(fact, about, speaker, text, KIN) == h.Verdict(True, label, speaker)
+
+
+@pytest.mark.parametrize(
+    ("about", "speaker", "text"),
+    [("我媽", "媽媽", "我媽住台中"),  # 媽媽的媽媽：不是群組裡的人
+     ("我妹", "成員甲", "我妹住台中"),  # 兄弟姊妹的「我＋稱謂」要出生順序，還不認
+     ("姊姊", "外人", "姊姊住台中"),  # 不是子女也不是爸媽：她自己的姊姊
+     ("我媽", "成員甲", "我媽的同事住台中")],
+)
+def test_unclear_family_words_are_dropped(about, speaker, text):
+    roster = h.build_roster([*KIN.labels, "外人"], {"乙丙": "成員乙丙", "妹妹": "成員乙丙"},
+                            roles={"姊姊": "長女", "姐姐": "長女"}, children=KIN.children)
+    assert judge("住在台中", about, speaker, text, roster).ok is False
+
+
+def test_a_childs_my_mom_keeps_the_fact_off_the_speaker():
+    assert judge("住在台中", "我", "成員甲", "我媽住台中", KIN) == h.Verdict(False, reason="self_other_member")
+
+
+def test_the_role_holder_talking_about_herself_by_role_is_her_own_fact():
+    assert judge("在學游泳", "姊姊", "長女", "姊姊在學游泳", KIN) == h.Verdict(True, "長女", "")

@@ -89,6 +89,7 @@ for _env_name, _leaf in (
     ("LINE_BOT_PRIVACY_TERMS_PATH", "privacy_terms.txt"),
     ("LINE_BOT_FACT_LOCK_DIR", "locks"),
     ("LINE_BOT_FACT_HASH_KEY_PATH", "fact_hash.key"),
+    ("LINE_FAMILY_KINSHIP_PATH", "no_kinship.json"),  # 2026-10-17：不存在的路徑，絕不讀到正式的角色檔
 ):
     os.environ[_env_name] = str(_POST_TEST_DAILY_MEMORY_DIR / _leaf)
 
@@ -425,6 +426,7 @@ def isolate_daily_memory(monkeypatch, tmp_path_factory):
     monkeypatch.setenv("LINE_BOT_PRIVACY_TERMS_PATH", str(terms))
     monkeypatch.setenv("LINE_BOT_FACT_LOCK_DIR", str(base / "locks"))
     monkeypatch.setenv("LINE_BOT_FACT_HASH_KEY_PATH", str(base / "fact_hash.key"))
+    monkeypatch.setenv("LINE_FAMILY_KINSHIP_PATH", str(base / "no_kinship.json"))
     for name in _DAILY_MEMORY_ENV_KNOBS:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(config.settings, "facts_per_person_max_raw", "", raising=False)

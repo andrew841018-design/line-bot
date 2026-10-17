@@ -70,6 +70,7 @@ _GENERIC_FAMILY_TERMS = {
 _FORBIDDEN_EXACT = {
     "user_aliases.json",
     "family_roles.local.json",
+    "family_kinship.local.json",
     "privacy_terms.local.json",
     "privacy_terms.local.txt",
     "pending_dlq.jsonl",

@@ -202,6 +202,10 @@ _OMITTED_WORDS = frozenset({"", "省略", "(省略)", "無", "none", "self"})
 # 配偶：只有這兩個稱呼剛好都在名單裡才用（媽媽說的「老公」是爸爸，爸爸說的「老婆」是媽媽）。
 FATHER, MOTHER = "爸爸", "媽媽"
 _SPOUSE_TERMS = {MOTHER: ("老公", "我老公"), FATHER: ("老婆", "我老婆")}
+# 子女說的「我媽／我爸」（2026-10-17 Andrew 照建議做）。兄弟姊妹的「我姊／我哥…」要看出生順序，還不認。
+_CHILD_TERMS = {"我媽": MOTHER, "我媽媽": MOTHER, "我爸": FATHER, "我爸爸": FATHER}
+# 本機角色檔（family_kinship.local.json）只收這兩個叫法，值是 user_id（顯示名稱是自己取的，不能拿來綁角色）
+KINSHIP_ROLE_KEYS = frozenset({"姊姊", "姐姐"})
 # 一個稱呼左邊緊接這些字之一才算在主詞位置（D1：精準優先，閉集合）。
 _CONNECTORS = (
     "其實", "因為", "所以", "但是", "但", "而且", "還有", "不過", "反正", "對了", "現在", "平常",
@@ -217,20 +221,44 @@ _OTHER_PEOPLE_RE = re.compile(
 )
 # 名單上不能當轉述對象的稱呼（顯示名稱可以自己取，post-impl GP2#3）：一個字、代名詞、第三者、全體、親屬稱謂。
 _UNSAFE_LABEL_RE = re.compile(r"^(?:大家|全家|家人|所有人|群組|我們|你們|他們|她們)$|[我你妳您他她它]")
+_NOT_SPEAKER = "\x00"
 _TERM_STRIP_RE = re.compile(r"[\s\"'「」『』“”‘’《》〈〉（）()\[\]【】:：,，。.!！?？@＠]+")
 
 
 @dataclass(frozen=True)
 class Roster:
-    """轉述用的家人名單：terms＝正規化後的叫法 → 稱呼（一個叫法對到兩個人的已拿掉）。"""
+    """轉述用的家人名單：terms＝正規化後的叫法 → 稱呼（一個叫法對到兩個人的已拿掉）。
+
+    children：子女（說「我媽／我爸」時對到媽媽／爸爸）；role_terms：本機角色檔來的叫法（姊姊／姐姐），
+    只有子女或爸媽說才算（別人說的「姊姊」可能是她自己的姊姊，2026-10-17 審查）。
+    """
 
     labels: frozenset[str]
     terms: Mapping[str, str]
+    children: frozenset[str] = frozenset()
+    role_terms: frozenset[str] = frozenset()
 
     def spouse_of(self, speaker: str, term: str) -> str:
         if term in _SPOUSE_TERMS.get(speaker, ()) and {FATHER, MOTHER} <= self.labels:
             return MOTHER if speaker == FATHER else FATHER
         return ""
+
+    def family_speaker(self, speaker: str) -> bool:
+        return speaker in self.children or (speaker in (FATHER, MOTHER) and speaker in self.labels)
+
+    def child_term(self, speaker: str, term: str) -> str:
+        """子女說的「我媽／我爸」對到誰；不是子女、或名單沒有那位就回 ""。"""
+        label = _CHILD_TERMS.get(term, "") if speaker in self.children else ""
+        return label if label in self.labels else ""
+
+    def terms_for(self, speaker: str) -> dict[str, str]:
+        """這位說話的人可以用的叫法 → 稱呼（角色叫法只給子女和爸媽）。"""
+        allowed = {t: l for t, l in self.terms.items() if t not in self.role_terms or self.family_speaker(speaker)}
+        if speaker in self.children:
+            for term, label in _CHILD_TERMS.items():
+                if label in self.labels:
+                    allowed.setdefault(term, label)
+        return allowed
 
 
 def term_key(term: str) -> str:
@@ -238,8 +266,15 @@ def term_key(term: str) -> str:
     return _TERM_STRIP_RE.sub("", normalize(term))
 
 
-def build_roster(labels: Iterable[str], aliases: Mapping[str, str]) -> Roster:
-    """labels：可以掛轉述的家人稱呼；aliases：叫法 → 稱呼（呼叫的人先清理成同一種寫法）。"""
+def build_roster(
+    labels: Iterable[str],
+    aliases: Mapping[str, str],
+    *,
+    roles: Mapping[str, str] | None = None,
+    children: Iterable[str] = (),
+) -> Roster:
+    """labels：可以掛轉述的家人稱呼；aliases：叫法 → 稱呼（呼叫的人先清理成同一種寫法）；
+    roles：角色檔的叫法 → 稱呼（和別名撞到別人時兩邊都不給）；children：子女的稱呼（爸媽不算）。"""
     label_set = frozenset(label for label in labels if label)
     found: dict[str, set[str]] = {}
     for label in label_set:
@@ -247,8 +282,50 @@ def build_roster(labels: Iterable[str], aliases: Mapping[str, str]) -> Roster:
     for term, label in aliases.items():
         if label in label_set and term_key(term):
             found.setdefault(term_key(term), set()).add(label)
+    role_keys: set[str] = set()
+    for term, label in (roles or {}).items():
+        if label in label_set and term_key(term):
+            found.setdefault(term_key(term), set()).add(label)
+            role_keys.add(term_key(term))
     terms = {term: next(iter(owners)) for term, owners in found.items() if len(owners) == 1 and term}
-    return Roster(labels=label_set, terms=terms)
+    kids = frozenset(c for c in children if c in label_set and c not in (FATHER, MOTHER))
+    return Roster(labels=label_set, terms=terms, children=kids, role_terms=frozenset(role_keys & set(terms)))
+
+
+def parse_kinship(raw: object, labels_by_user: Mapping[str, str]) -> tuple[dict[str, str], frozenset[str], int, int]:
+    """本機角色檔的內容 → (角色叫法 → 稱呼, 子女稱呼, 套用條數, 略過條數)。
+
+    結構只能是 {"roles": {"姊姊"|"姐姐": user_id}, "children": [user_id, …]}；兩種寫法要指同一人、
+    子女不能重複。結構不對丟 ValueError（呼叫的人整個檔當作沒有）。user_id 不在名單上的那一條略過；
+    爸爸、媽媽不能算子女。純函式：不讀檔。
+    """
+    if not isinstance(raw, dict) or set(raw) - {"roles", "children"}:
+        raise ValueError("kinship: unexpected structure")
+    roles_raw, kids_raw = raw.get("roles", {}), raw.get("children", [])
+    if not isinstance(roles_raw, dict) or not isinstance(kids_raw, list):
+        raise ValueError("kinship: unexpected structure")
+    if set(roles_raw) - KINSHIP_ROLE_KEYS or len(set(roles_raw.values())) > 1:
+        raise ValueError("kinship: unknown role or roles disagree")
+    if not all(isinstance(v, str) and v for v in (*roles_raw.values(), *kids_raw)) or len(set(kids_raw)) != len(kids_raw):
+        raise ValueError("kinship: bad user ids")
+    applied = ignored = 0
+    roles: dict[str, str] = {}
+    for term, user_id in roles_raw.items():
+        label = labels_by_user.get(user_id, "")
+        if label:
+            roles[term] = label
+            applied += 1
+        else:
+            ignored += 1
+    children: set[str] = set()
+    for user_id in kids_raw:
+        label = labels_by_user.get(user_id, "")
+        if label and label not in (FATHER, MOTHER):
+            children.add(label)
+            applied += 1
+        else:
+            ignored += 1
+    return roles, frozenset(children), applied, ignored
 
 
 def unsafe_label(label: str) -> bool:
@@ -282,7 +359,10 @@ def resolve(about: object, speaker: str, roster: Roster) -> Subject:
     spouse = roster.spouse_of(speaker, key)
     if spouse:
         return Subject("member", spouse, key)
-    label = roster.terms.get(key, "")
+    child = roster.child_term(speaker, key)
+    if child:
+        return Subject("member", child, key) if child != speaker else Subject("drop", reason="unresolved")
+    label = roster.terms_for(speaker).get(key, "")
     if not label:
         return Subject("drop", reason="unresolved")
     if label == speaker:
@@ -293,13 +373,17 @@ def resolve(about: object, speaker: str, roster: Roster) -> Subject:
 def _member_spans(clause: str, roster: Roster, speaker: str) -> list[tuple[int, int, str]]:
     """子句裡每一個家人叫法的位置（最長比對、不重疊）：[(開始, 結束, 稱呼)]。"""
     spans: list[tuple[int, int, str]] = []
-    keys = sorted(
-        [*roster.terms, *(t for t in _SPOUSE_TERMS.get(speaker, ()) if roster.spouse_of(speaker, t))],
-        key=len, reverse=True,
-    )
+    lookup = roster.terms_for(speaker)
+    for term in _SPOUSE_TERMS.get(speaker, ()):
+        if roster.spouse_of(speaker, term):
+            lookup[term] = roster.spouse_of(speaker, term)
+    for term in _CHILD_TERMS:
+        if term in lookup and lookup[term] == speaker:
+            lookup[term] = _NOT_SPEAKER  # 對到說話的人自己的「我媽」：當成別人，絕不當成本人的稱呼（審查 GP1#2）
+    keys = sorted(lookup, key=len, reverse=True)
     taken = [False] * len(clause)
     for key in keys:
-        label = roster.terms.get(key) or roster.spouse_of(speaker, key)
+        label = lookup[key]
         start = clause.find(key)
         while start != -1:
             end = start + len(key)

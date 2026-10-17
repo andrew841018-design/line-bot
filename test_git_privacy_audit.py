@@ -38,6 +38,7 @@ def test_forbidden_private_artifact_paths_are_rejected():
     for path in (
         "user_aliases.json",
         "family_roles.local.json",
+        "family_kinship.local.json",
         "privacy_terms.local.txt",
         "pending_dlq.jsonl",
         "pending_feedback.json",
