@@ -255,7 +255,7 @@ def assert_card_ok(reply) -> dict:
 
     assert reply.text is None and reply.card is not None, reply
     alt, card = reply.alt_text, reply.card
-    assert alt.startswith(ph.CARD_PREFIX) and alt in (ph._OVERVIEW_ALT, ph._DETAIL_ALT)  # altText 固定、不含資料
+    assert alt.startswith(ph.CARD_PREFIX) and alt in (ph._OVERVIEW_ALT, ph._DETAIL_ALT, ph._ANALYSIS_ALT)  # altText 固定、不含資料
     assert len(alt) <= 1500
     assert main._prepare_outbound_text(alt, source="reply") == alt
     main._validated_flex_card_message(alt, card)  # main 送卡前的同一關（節點白名單、validator）
@@ -305,6 +305,7 @@ def test_import_has_no_side_effects(tmp_path):
         "assert [t.name for t in threading.enumerate()] == ['MainThread'], threading.enumerate()\n"
         "assert 'notify_discord' not in sys.modules and 'memory' not in sys.modules\n"
         "assert 'parent_health_extract' not in sys.modules\n"
+        "assert 'parent_health_analysis' not in sys.modules\n"
         "assert not parent_health_db._INIT_PATHS\n"
     )
     env = {
@@ -361,7 +362,7 @@ def test_constants_match_interfaces():
         "或跌倒後不舒服，請馬上就醫或打 119。"
     )
     assert ph.FAILURE_TEXT == "爸媽健康：暫時無法回覆，請稍後再試"
-    assert ph.QUOTE_NOTICE == "爸媽健康：卡片上是從群組留言整理的紀錄，咪寶不會判讀或診斷。"
+    assert ph.QUOTE_NOTICE == "爸媽健康：卡片上是從群組留言整理的紀錄，分析是依公開衛教的一般建議，不是診斷；身體有疑問請問醫師。"
     assert ph.WEEKLY_MARKER == "\U0001fa7a 爸媽這週"
     for text in (ph.SAFETY_TEXT, ph.FAILURE_TEXT, ph.QUOTE_NOTICE, ph._HELP_TEXT, ph_off._DISABLED_TEXT,
                  ph._AUTO_RECORD_TEXT, ph._RECORDED_TEXT):
@@ -769,7 +770,7 @@ def test_overview_card_with_data(reminders):
     ]
     assert "大醫院" not in json.dumps(card, ensure_ascii=False)  # 提醒內容不上卡
     buttons = [node["action"]["label"] for node in card["footer"]["contents"] if "action" in node]
-    assert buttons == ["看爸爸細節", "📖 怎麼用"]
+    assert buttons == ["看爸爸細節", "📋 健康分析", "📖 怎麼用"]
     assert card["footer"]["contents"][-1]["text"] == "從群組留言整理，只記錄、不診斷"
     assert card["footer"]["contents"][0]["contents"][0]["size"] == "xl"  # 大字按鈕
 
@@ -2217,7 +2218,7 @@ def test_ensure_default_consent_db_rules():
 
 # ── 沒有要爸媽本人按的按鈕（Andrew 2026-10-17：「不要任何本人按鍵的功能…因為他們不會去按」） ──
 
-_ALLOWED_BUTTON_LABELS = {"看爸爸細節", "看媽媽細節", "📖 怎麼用", "回爸媽健康卡"}
+_ALLOWED_BUTTON_LABELS = {"看爸爸細節", "看媽媽細節", "📖 怎麼用", "回爸媽健康卡", "📋 健康分析"}  # 分析：誰都能按的查看鍵
 _SELF_ONLY_TEXTS = {"/健康 吃藥了", "/健康 有運動", "/健康 恢復", "/健康 同意"}
 
 
@@ -2244,7 +2245,7 @@ def _walk_actions(node):
 
 
 def _all_cards():
-    return [assert_card_ok(cmd(body, "U_KID")) for body in ("", "爸爸", "媽媽")]
+    return [assert_card_ok(cmd(body, "U_KID")) for body in ("", "爸爸", "媽媽", "分析")]
 
 
 def test_no_card_ever_shows_a_button_only_a_parent_can_use(family, family_group, reminders):
@@ -2565,3 +2566,282 @@ def test_main_help_teaches_typing_not_tapping():
     assert "/健康 暫停 爸爸" in section and "/健康 恢復 爸爸" in section and "不用按" in section
     for retired in ("/健康 吃藥了", "/健康 有運動", "/健康 同意", "本人按"):
         assert retired not in section
+
+
+# ── 分析卡、每日檢查讀數、週日分析私訊（2026-10-17） ─────────────────────────
+
+
+def _analysis_lines(card) -> list[str]:
+    return [node["text"] for node in card["body"]["contents"] if node.get("type") == "text"]
+
+
+def _days_ago(offset):
+    d = _d(offset)
+    return (d.year, d.month, d.day)
+
+
+def test_analysis_card_lists_alerts_and_notes_with_advice(reminders):
+    consent("爸爸", "U_DAD")
+    consent("媽媽", "U_MOM")
+    for offset in (0, 1, 2, 3):
+        add("媽媽", "sleep", "睡不好", day=_days_ago(offset), reporter="U_MOM")
+    add("爸爸", "body", "跌倒", "", "redflag", day=_days_ago(1))
+    reply = cmd("分析", "U_KID")
+    card = assert_card_ok(reply)
+    assert reply.alt_text == ph._ANALYSIS_ALT == "爸媽健康卡：點開看爸媽近 14 天的分析"
+    assert card["header"]["contents"][0]["text"] == "📋 爸媽健康分析"
+    assert card["header"]["contents"][1]["text"] == "近 14 天（9/28–10/11），只看群組有提到的"
+    assert _analysis_lines(card) == [
+        "爸爸", "⚠️ 10/10 提到跌倒", "→ 可以問問他現在的狀況，也跟醫生說",
+        "媽媽", "📝 7 天有 4 天睡不好", "→ 固定起床時間、午睡 30 分鐘內、下午少喝咖啡和茶；持續的話跟醫生聊",
+    ]
+    assert [n["action"]["text"] for n in card["footer"]["contents"] if "action" in n] == ["/健康 爸爸", "/健康 媽媽", "/健康"]
+    assert [n["text"] for n in card["footer"]["contents"][-2:]] == [
+        "依國健署等公開衛教整理，不是診斷；不舒服請看醫師", "每週日的完整整理會私訊 Andrew",
+    ]
+    assert "119" not in json.dumps(card, ensure_ascii=False)
+
+
+def test_analysis_card_states_empty_and_recording_start(reminders):
+    consent("爸爸", "U_DAD")
+    lines = _analysis_lines(assert_card_ok(cmd("分析", "U_KID")))
+    assert lines[:2] == ["爸爸", "近 14 天沒有紀錄"]
+    assert lines[2] == "媽媽" and "還沒開始記錄" in lines[3]
+    add("爸爸", "exercise", "散步")
+    assert _analysis_lines(assert_card_ok(cmd("分析", "U_KID")))[1] == "依目前的提醒規則，這段時間沒有要提醒的項目"
+    consent("媽媽", "U_MOM", at=ts(2026, 10, 9, 8))
+    lines = _analysis_lines(assert_card_ok(cmd("分析", "U_KID")))
+    assert lines[2:5] == ["媽媽", "從 10/9 開始記錄", "近 14 天沒有紀錄"]
+    cmd("暫停", "U_DAD")
+    assert _analysis_lines(assert_card_ok(cmd("分析", "U_KID")))[1].startswith("已暫停記錄")
+
+
+def test_analysis_card_caps_lines_and_counts_the_rest(reminders):
+    consent("媽媽", "U_MOM")
+    for offset in (0, 1, 2, 3):
+        add("媽媽", "sleep", "睡不好", day=_days_ago(offset), reporter="U_MOM")
+    for offset in (0, 1, 2):
+        add("媽媽", "body", "膝蓋痛", day=_days_ago(offset), reporter="U_MOM")
+    for offset in (1, 2):
+        add("媽媽", "med", "忘了吃藥", day=_days_ago(offset), reporter="U_MOM")
+        add("媽媽", "diet", "沒吃早餐", day=_days_ago(offset), reporter="U_MOM")
+    lines = _analysis_lines(assert_card_ok(cmd("分析", "U_KID")))
+    mom = lines[lines.index("媽媽"):]
+    assert [line for line in mom if line[:1] in "⚠📝👍"] == ["📝 7 天有 3 天提到膝蓋痛", "📝 這週說忘了吃藥 2 天", "📝 7 天有 4 天睡不好"]
+    assert mom[-1] == "另外還有 1 項，完整整理每週日私訊 Andrew"
+
+
+def test_overview_has_the_analysis_button_only_when_someone_is_recording(reminders):
+    assert "/健康 分析" not in action_texts(cmd("", "U_KID").card)
+    consent("媽媽", "U_MOM")
+    assert "/健康 分析" in action_texts(assert_card_ok(cmd("", "U_KID")))
+    assert "/健康 分析" in ph.SHIPPED_HEALTH_BUTTON_TEXTS and "/健康 分析" in ph_off.SHIPPED_HEALTH_BUTTON_TEXTS
+    assert "/健康 分析" in ph._HELP_TEXT and "不是診斷" in ph._HELP_TEXT
+
+
+def test_analysis_module_failure_only_affects_the_analysis_card(monkeypatch, extract_mod, reminders):
+    consent("爸爸", "U_DAD")
+    for offset in (0, 1, 2, 3):
+        add("爸爸", "sleep", "睡不好", day=_days_ago(offset))
+    monkeypatch.setitem(sys.modules, "parent_health_analysis", None)  # import 會丟 ImportError
+    assert cmd("分析", "U_KID").text == ph.FAILURE_TEXT
+    assert_card_ok(cmd("", "U_KID"))
+    assert ph.anomaly_lines(G, NOW) == ["爸爸 7 天內有 4 天睡不好"]
+    assert ph._run_weekly_analysis(NOW) == 0
+    _red(monkeypatch, extract_mod, [RF("爸爸", "胸痛胸悶")])
+    decision = decide()
+    assert decision is not None and decision.reply  # 119 提醒照常
+
+
+def test_health_analysis_command_routing():
+    assert main._health_command_body("/健康分析", None) == "分析"
+    assert main._health_command_body("/健康 分析", None) == "分析"
+    assert ph.handle_command(G, "U_KID", "分析一下這篇", message_id="x", now=NOW).text == ph._HELP_TEXT
+
+
+def test_daily_check_sends_urgent_readings_from_the_last_48_hours(dms):
+    consent("爸爸", "U_DAD")
+    consent("媽媽", "U_MOM")
+    add("爸爸", "body", "血壓", "185/125", day=(2026, 10, 10), hour=8, minute=12)
+    add("爸爸", "body", "血壓", "200/130", day=(2026, 10, 9), hour=21, minute=0)  # 48.5 小時前
+    add("媽媽", "body", "血糖", "62", day=(2026, 10, 11), hour=7, minute=30, reporter="U_MOM")
+    assert ph.anomaly_lines(G, NOW) == [
+        "10/10 08:12 群組提到爸爸的血壓 185/125（高壓超過 180、低壓超過 120）：請他休息 5 分鐘後再量一次；"
+        "還是很高要盡快就醫；有胸痛胸悶、呼吸困難、嘴歪或說話不清、單側手腳無力就打 119",
+        "10/11 07:30 群組提到媽媽的血糖 62（低於 70）：請她現在再量一次；還是低於 70 或有發抖、冒冷汗，"
+        "意識清楚、能吞嚥的話先吃 15 克糖（約 3 顆方糖或 120cc 果汁），15 分鐘後再量，還是很低就送醫；"
+        "意識不清或不能吞嚥不要餵，直接打 119",
+    ]
+    assert ph.run_daily_check(NOW) == 1
+    assert dms[0].startswith("🩺 爸媽健康每日檢查（10/11）\n10/10 08:12 群組提到爸爸的血壓")
+    add("爸爸", "body", "血壓", "190/100", day=(2026, 10, 12), hour=9)
+    assert ph.anomaly_lines(G, ts(2026, 10, 12, 21, 30)) == []  # 同一種 7 天內不再私訊
+
+
+def test_urgent_dm_uses_the_same_symptoms_as_the_119_line():
+    import parent_health_analysis
+
+    text = parent_health_analysis.urgent_dm_text("爸爸", "他", "bp_crisis", "185/125", NOW)
+    symptoms = "胸痛胸悶、呼吸困難、嘴歪或說話不清、單側手腳無力"
+    assert symptoms in text and symptoms in ph.SAFETY_TEXT
+
+
+def test_weekly_analysis_is_sent_once_on_sunday_even_without_anomalies(dms, reminders):
+    consent("爸爸", "U_DAD")
+    for offset in (0, 2, 4):
+        add("爸爸", "exercise", "散步", day=_days_ago(offset))
+    assert ph.run_daily_check(NOW) == 0 and dms == []
+    assert ph._run_weekly_analysis(ts(2026, 10, 11, 20, 59)) == 0
+    assert ph._run_weekly_analysis(ts(2026, 10, 12, 21, 30)) == 0  # 週一
+    assert ph._run_weekly_analysis(NOW) == 1
+    assert dms == [
+        "🩺 爸媽健康週分析（10/5–10/11）\n爸爸（7 天有 3 天有紀錄）\n• 👍 這週 3 天有運動（散步）（上週 0 天）\n"
+        "• 這週沒有讀數\n依公開衛教整理，不是診斷"
+    ]
+    assert ph._run_weekly_analysis(NOW + 600) == 0 and len(dms) == 1
+
+
+def test_weekly_analysis_skips_empty_weeks_and_paused_parents(dms):
+    consent("爸爸", "U_DAD")
+    consent("媽媽", "U_MOM")
+    assert ph._run_weekly_analysis(NOW) == 0 and dms == []
+    assert db.last_alert(G, "", "weekly_analysis") is None  # 沒東西送就不搶
+    add("媽媽", "sleep", "睡不好", reporter="U_MOM")
+    cmd("暫停", "U_MOM")
+    assert ph._run_weekly_analysis(NOW) == 0
+    add("爸爸", "med", "吃藥")
+    assert ph._run_weekly_analysis(NOW) == 1
+    assert "媽媽" not in dms[0] and dms[0].splitlines()[1] == "爸爸（7 天有 1 天有紀錄）"
+
+
+def test_weekly_analysis_lists_this_weeks_daily_check_items_and_readings(dms, reminders):
+    consent("媽媽", "U_MOM", at=ts(2026, 10, 1, 10))
+    for day in ((2026, 10, 2), (2026, 10, 3), (2026, 10, 5)):  # 10/5（週一）的每日檢查：7 天內 3 天
+        add("媽媽", "body", "膝蓋痛", day=day, reporter="U_MOM")
+    add("媽媽", "med", "忘了吃藥", day=(2026, 10, 9), hour=8, reporter="U_MOM")  # 1 天：分析不列，每日檢查會列
+    add("媽媽", "body", "血壓", "135/85", day=(2026, 10, 9), reporter="U_MOM")
+    add("媽媽", "body", "血壓", "137/85", day=(2026, 10, 10), reporter="U_MOM")
+    wrong = add("媽媽", "sleep", "睡不好", day=(2026, 10, 6), msg="m_wrong", reporter="U_MOM")
+    for day in ((2026, 10, 7), (2026, 10, 8), (2026, 10, 9)):
+        add("媽媽", "sleep", "睡不好", day=day, reporter="U_MOM")
+    assert wrong == 1 and db.delete_message_events(G, "m_wrong") == 1  # 刪掉的錯記不會回到週私訊
+    db.claim_alert(G, "媽媽", "sleep_bad", "2026-10-09", now=NOW)  # 去重表有列也不算（只看還在的紀錄）
+    assert ph._run_weekly_analysis(NOW) == 1
+    assert dms == [
+        "🩺 爸媽健康週分析（10/5–10/11）\n媽媽（7 天有 5 天有紀錄）\n• 讀數：血壓 2 次平均 136/85\n"
+        "• 這週有符合每日檢查條件的：膝蓋痛、忘了吃藥\n依公開衛教整理，不是診斷"
+    ]
+
+
+def test_weekly_analysis_marks_a_recording_start_inside_the_week(dms, reminders):
+    consent("媽媽", "U_MOM", at=ts(2026, 10, 8, 10))
+    add("媽媽", "body", "血壓", "135/85", day=(2026, 10, 9), reporter="U_MOM")
+    assert ph._run_weekly_analysis(NOW) == 1
+    assert dms[0].splitlines()[1:3] == ["媽媽（10/8 開始記錄，4 天有 1 天有紀錄）", "• 讀數：血壓 135/85（10/9）"]
+
+
+def test_analysis_errors_reply_failure_not_an_empty_card(monkeypatch, reminders, caplog):
+    import parent_health_analysis
+
+    caplog.set_level("DEBUG")
+
+    consent("爸爸", "U_DAD")
+    add("爸爸", "sleep", "睡不好")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("185/125")
+
+    monkeypatch.setattr(parent_health_analysis, "analyze", boom)
+    assert cmd("分析", "U_KID").text == ph.FAILURE_TEXT
+    assert ph._run_weekly_analysis(NOW) == 0
+    assert "RuntimeError" in caplog.text and "185" not in caplog.text  # log 只記錯誤種類，不記讀數
+
+
+def test_weekly_analysis_is_truncated_but_keeps_the_disclaimer(dms, monkeypatch):
+    consent("爸爸", "U_DAD")
+    for offset in (0, 1, 2, 3):
+        add("爸爸", "sleep", "睡不好", day=_days_ago(offset))
+    monkeypatch.setattr(ph, "_DM_MAX_CHARS", 60)
+    assert ph._run_weekly_analysis(NOW) == 1
+    assert len(dms[0]) <= 60 and dms[0].endswith("\n（太長，後面省略）\n依公開衛教整理，不是診斷")
+
+
+def test_daily_loop_runs_both_jobs_even_if_one_raises(monkeypatch):
+    stop = threading.Event()
+    calls = []
+
+    def daily(now=None):
+        calls.append("daily")
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(ph, "_STARTUP_DELAY_S", 0.0)
+    monkeypatch.setattr(ph, "run_daily_check", daily)
+    monkeypatch.setattr(ph, "_run_weekly_analysis", lambda now=None: calls.append("weekly") or stop.set() or 0)
+    ph._daily_loop(stop)
+    assert calls == ["daily", "weekly"]
+
+
+# GP1 事後審查補的測試（2026-10-18）
+
+
+def test_gp1_resume_hides_records_from_before_the_new_start(dms, reminders):
+    consent("爸爸", "U_DAD")
+    add("爸爸", "body", "跌倒", "", "redflag", day=(2026, 10, 10), hour=7)  # 恢復那天、暫停之前
+    for d in ((2026, 10, 6), (2026, 10, 7), (2026, 10, 8), (2026, 10, 9)):
+        add("爸爸", "sleep", "睡不好", day=d)
+    cmd("暫停", "U_DAD", now=ts(2026, 10, 10, 8))
+    cmd("恢復", "U_DAD", now=ts(2026, 10, 10, 9))
+    add("爸爸", "med", "吃藥", day=(2026, 10, 11))
+    lines = _analysis_lines(assert_card_ok(cmd("分析", "U_KID")))
+    assert lines[:3] == ["爸爸", "從 10/10 開始記錄", "依目前的提醒規則，這段時間沒有要提醒的項目"]
+    assert ph._run_weekly_analysis(NOW) == 1
+    assert "跌倒" not in dms[0] and "睡不好" not in dms[0]
+
+
+def test_gp1_visits_are_per_parent_on_card_and_in_weekly(dms, reminders):
+    consent("爸爸", "U_DAD")
+    consent("媽媽", "U_MOM")
+    for d in ((2026, 10, 9), (2026, 10, 10), (2026, 10, 11)):
+        add("爸爸", "body", "膝蓋痛", day=d)
+    reminders.append(reminder("帶媽媽回診", ts(2026, 10, 14, 10), time_kind="clock"))
+    lines = _analysis_lines(assert_card_ok(cmd("分析", "U_KID")))
+    assert "→ 可以安排看醫生" in lines  # 媽媽的回診不接到爸爸
+    reminders.append(reminder("帶爸爸回診", ts(2026, 10, 16, 10), time_kind="clock"))
+    reminders.append(reminder("帶爸爸看醫生", ts(2026, 10, 27, 10), time_kind="clock"))  # 16 天後：不列
+    lines = _analysis_lines(assert_card_ok(cmd("分析", "U_KID")))
+    assert "→ 10/16（五）回診時提" in lines
+    assert ph._run_weekly_analysis(NOW) == 1
+    dad = dms[0].split("\n媽媽")[0]
+    assert "• 下次看診：10/16（五）10:00 回診\n" in dad + "\n" and "10/14" not in dad and "10/27" not in dad  # privacy-safe-fixture
+
+
+def test_gp1_urgent_readings_stop_at_48_hours(dms):
+    consent("爸爸", "U_DAD")
+    add("爸爸", "body", "血壓", "190/100", day=(2026, 10, 9), hour=20, minute=30)  # 49 小時前
+    assert ph.anomaly_lines(G, NOW) == []
+    add("爸爸", "body", "血壓", "185/100", day=(2026, 10, 9), hour=22, minute=30)  # 47 小時前
+    assert ph.anomaly_lines(G, NOW)[0].startswith("10/9 22:30 群組提到爸爸的血壓 185/100")
+
+
+def test_gp1_paused_parent_urgent_reading_is_not_sent(dms):
+    consent("爸爸", "U_DAD")
+    assert add("爸爸", "body", "血壓", "185/125", day=(2026, 10, 11), hour=8) == 1
+    cmd("暫停 爸爸", "U_KID", now=ts(2026, 10, 11, 10))
+    assert ph.anomaly_lines(G, NOW) == []
+
+
+def test_gp1_weekly_never_writes_default_consent(dms, family_group, reminders):
+    consent("爸爸", "U_DAD")
+    add("爸爸", "med", "吃藥")
+    assert ph._run_weekly_analysis(NOW) == 1
+    assert set(db.consent_states(G)) == {"爸爸"}
+
+
+def test_gp1_weekly_uses_this_week_for_single_events_and_prev_only_when_recording(dms, reminders):
+    consent("爸爸", "U_DAD", at=ts(2026, 9, 29, 9))  # D-13 是 9/28：上週沒整週在記錄
+    add("爸爸", "body", "跌倒", "", "redflag", day=(2026, 10, 2))  # 上週的事：週私訊不再列
+    for d in ((2026, 10, 9), (2026, 10, 10), (2026, 10, 11)):
+        add("爸爸", "body", "膝蓋痛", day=d)
+    assert ph._run_weekly_analysis(NOW) == 1
+    assert "跌倒" not in dms[0]
+    assert "• 7 天有 3 天提到膝蓋痛\n" in dms[0]  # 沒有「（上週 0 天）」

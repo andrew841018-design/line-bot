@@ -20656,7 +20656,7 @@ def _reply_investment_quote_notice(event, group_id: str, kind: str) -> None:
 
 
 # 「/健康」後面要嘛空白、結尾，要嘛直接接已知的子指令（「/健康恢復」「/健康暫停爸爸」）；「/健康管理」「/今日健康」不算。
-_HEALTH_COMMAND_RE = re.compile(r"/\s{0,3}(?:爸媽)?健康(?=\s|$|爸爸|媽媽|同意|恢復|暫停|吃藥了|有運動|刪除|說明)")
+_HEALTH_COMMAND_RE = re.compile(r"/\s{0,3}(?:爸媽)?健康(?=\s|$|爸爸|媽媽|同意|恢復|暫停|吃藥了|有運動|刪除|說明|分析)")
 _HEALTH_FAILURE_TEXT = "爸媽健康：暫時無法回覆，請稍後再試"
 _HEALTH_CARD_PREFIX = "爸媽健康卡："  # parent_health.CARD_PREFIX；模組載不進來時引用檢查照樣有效
 
@@ -20723,7 +20723,7 @@ def _quoted_bot_health_card(event, group_id: str) -> bool:
 
 
 def _reply_health_quote_notice(event, group_id: str) -> None:
-    notice = "爸媽健康：卡片上是從群組留言整理的紀錄，咪寶不會判讀或診斷。"
+    notice = "爸媽健康：卡片上是從群組留言整理的紀錄，分析是依公開衛教的一般建議，不是診斷；身體有疑問請問醫師。"
     try:
         import parent_health
 
@@ -21529,6 +21529,7 @@ _HELP_TEXT = (
     "【爸媽健康】\n"
     "  /健康                   爸媽健康卡：近 7 天用藥、看診、運動、睡眠、飲食、身體\n"
     "  /健康 爸爸、/健康 媽媽  看近 14 天的細節\n"
+    "  /健康 分析              看分析和建議（依公開衛教整理，不是診斷）\n"
     "  /健康 暫停 爸爸         停止記錄爸爸（媽媽同理；爸媽本人打 /健康 暫停 也可以）\n"
     "  /健康 恢復 爸爸         暫停後恢復（爸媽自己暫停的，要本人打 /健康 恢復）\n"
     "                          吃藥、運動不用按，群組裡說了就會自動記\n"

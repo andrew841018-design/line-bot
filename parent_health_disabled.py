@@ -54,7 +54,7 @@ SAFETY_TEXT = (
     "或跌倒後不舒服，請馬上就醫或打 119。"
 )
 FAILURE_TEXT = "爸媽健康：暫時無法回覆，請稍後再試"
-QUOTE_NOTICE = "爸媽健康：卡片上是從群組留言整理的紀錄，咪寶不會判讀或診斷。"
+QUOTE_NOTICE = "爸媽健康：卡片上是從群組留言整理的紀錄，分析是依公開衛教的一般建議，不是診斷；身體有疑問請問醫師。"
 WEEKLY_MARKER = "🩺 爸媽這週"
 SHIPPED_HEALTH_BUTTON_TEXTS: tuple[str, ...] = (
     "/健康",
@@ -65,6 +65,7 @@ SHIPPED_HEALTH_BUTTON_TEXTS: tuple[str, ...] = (
     "/健康 吃藥了",
     "/健康 有運動",
     "/健康 說明",
+    "/健康 分析",
 )
 
 _BACKGROUND_ENABLED = False

@@ -636,6 +636,7 @@ def test_stock_and_fcn_replies_ask_for_the_page(pages, monkeypatch, kind):
         ("FCN 評估：NVDA、TSLA｜偏低", True),
         ("FCN 評估：我讀到 NVDA、4417｜年利率 18%，點按鈕評估", False),  # 確認卡：沒標籤的數字可能是帳號尾碼
         ("爸媽健康卡：近 7 天紀錄（點開看）", False),
+        ("爸媽健康卡：點開看爸媽近 14 天的分析", False),  # 2026-10-17 分析卡
         ("咪寶選單：點開看按鈕", False),
         ("其他卡片", False),
     ],

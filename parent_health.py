@@ -8,8 +8,11 @@ Andrew 2026-10-11 選全 A；2026-10-17 改成「健康預設同意紀錄，不�
 來源是爸媽自己說的、兄弟姊妹提到爸媽的（標明誰說的），舊卡片上的「我吃藥了／我有運動」本人按了照樣記；
 健康卡＋週日週報一段＋異常私訊 Andrew；記錄中的家長提到胸痛、跌倒這類緊急狀況，群組回就醫／119
 提醒並私訊 Andrew。
+2026-10-17 加「/健康 分析」（Andrew 選全 A）：規則與句子在 parent_health_analysis（純函式，用到時才
+import）；分析卡給全家看（不寫 119），週日晚上私訊 Andrew 完整版，很高的血壓、低血糖併進每日檢查。
 
-- 全部規則式（parent_health_extract），不送模型或外部服務；Discord 只帶角色、類別、標籤、天數／時間。
+- 全部規則式（parent_health_extract、parent_health_analysis），不送模型或外部服務。Discord 私訊帶角色、
+  類別、標籤、天數／時間；很高的血壓、低血糖與週日分析另帶讀數（Andrew 看過含數字的範例後選全 A）。
 - 卡片與文字只由固定詞表、數字、日期組成，沒有留言原文；卡片 altText 固定、不含資料（存檔只留 altText）。
 - 角色只認本機別名檔與角色檔（不用 LINE 顯示名稱）；同意列只在「現在解析到的帳號＝列上的帳號」時有效
   （家族主群的預設列在帳號換人時自動改成新帳號，on_since 照舊）。
@@ -84,7 +87,7 @@ SAFETY_TEXT = (
     "或跌倒後不舒服，請馬上就醫或打 119。"
 )
 FAILURE_TEXT = "爸媽健康：暫時無法回覆，請稍後再試"
-QUOTE_NOTICE = "爸媽健康：卡片上是從群組留言整理的紀錄，咪寶不會判讀或診斷。"
+QUOTE_NOTICE = "爸媽健康：卡片上是從群組留言整理的紀錄，分析是依公開衛教的一般建議，不是診斷；身體有疑問請問醫師。"
 WEEKLY_MARKER = "🩺 爸媽這週"
 
 # 卡片按鈕送出的文字（只加不刪：舊卡片永遠點得到）。吃藥了、有運動、恢復、同意 10/17 起新卡片不再出現。
@@ -97,6 +100,7 @@ SHIPPED_HEALTH_BUTTON_TEXTS: tuple[str, ...] = (
     "/健康 吃藥了",
     "/健康 有運動",
     "/健康 說明",
+    "/健康 分析",  # 2026-10-17 分析卡
 )
 
 _BACKGROUND_ENABLED = True  # conftest 會關掉（測試不能起真的背景工作）
@@ -109,13 +113,14 @@ _PRONOUN = {FATHER: "他", MOTHER: "她"}
 # 卡片 altText：固定、不含資料（聊天列表、通知、raw_messages 存檔只看得到這行）。
 _OVERVIEW_ALT = "爸媽健康卡：點開看爸媽近 7 天的整理"
 _DETAIL_ALT = "爸媽健康卡：點開看近 14 天的細節"
+_ANALYSIS_ALT = "爸媽健康卡：點開看爸媽近 14 天的分析"
 _EMPTY = "沒有紀錄"  # 「-」「（無）」「（空）」會被 outbound validator 當成空白佔位擋掉
 
 _RECORDING_EXPLANATION = (
     "咪寶會從群組留言整理爸爸、媽媽的用藥、看診、運動、睡眠、飲食和身體狀況（含血壓血糖讀數、不舒服），"
-    "在「爸媽健康」卡片給全家看、週日週報有一段、異常會私訊 Andrew；留言提到胸痛、跌倒這類緊急狀況，"
+    "在「爸媽健康」卡片給全家看、週日週報有一段、異常和每週日的分析整理會私訊 Andrew；留言提到胸痛、跌倒這類緊急狀況，"
     "咪寶會在群組提醒就醫或打 119。暫停只停止健康紀錄、卡片、週報段落、私訊和 119 提醒；"
-    "已記的紀錄會保留（記錯的那則，誰都可以引用它再打 /健康 刪除；本人可以打 /健康 刪除我的紀錄 全部刪掉）；"
+    "已記的紀錄會保留（記錯的那則，誰都可以引用它再打 /健康 刪除；本人可以打 /健康 刪除我的紀錄 全部刪掉；已經私訊出去的不會收回）；"
     "一般聊天功能照舊（留言還是會像平常一樣被咪寶讀到）。"
 )
 _HELP_TEXT = (
@@ -125,15 +130,18 @@ _HELP_TEXT = (
     "看近 14 天的細節：打 /健康 爸爸 或 /健康 媽媽\n"
     "暫停記錄：打 /健康 暫停 爸爸 或 /健康 暫停 媽媽（爸媽本人打 /健康 暫停 也可以）\n"
     "恢復記錄：打 /健康 恢復 爸爸 或 /健康 恢復 媽媽（爸媽自己暫停的，要本人打 /健康 恢復）\n"
+    "看分析和建議：打 /健康 分析\n"
     "記錯了：長按那則留言→回覆→打 /健康 刪除\n"
     "刪掉自己的全部紀錄：本人打 /健康 刪除我的紀錄\n"
     f"{_RECORDING_EXPLANATION}\n"
-    "咪寶只記錄、不診斷。"
+    "分析是依國健署等公開衛教整理的一般建議，不是診斷。"
 )
 _CARD_NOTE = "從群組留言整理，只記錄、不診斷"
 # 舊卡片上的「我吃藥了／我有運動」（10/17 起新卡片不再有）
 _AUTO_RECORD_TEXT = "爸媽健康：不用按了，爸爸、媽媽在群組說吃藥了、去散步了，或家人說爸爸吃藥了，咪寶就會自動記下"
 _RECORDED_TEXT = "爸媽健康：記下了。以後在群組說吃藥了、去散步了也會自動記，不用按"
+_ANALYSIS_NOTE = "依國健署等公開衛教整理，不是診斷；不舒服請看醫師"
+_ANALYSIS_DM_NOTE = "每週日的完整整理會私訊 Andrew"
 
 # 紀錄標籤（parent_health_extract.ALLOWED_ITEMS 裡的固定詞；測試確認都在詞表裡）
 _MED_TAKEN = "吃藥"
@@ -153,6 +161,7 @@ _DM_WINDOW_S = 1800  # 同一家長同一標籤 30 分鐘內只私訊一次
 _EVENT_MAX_AGE_S = 600  # 超過 10 分鐘的訊息不回群組（只私訊）
 _MAX_PUSH_REPLIES_PER_DAY = 2  # 今天成功送出的 119 回覆滿 2 則後不再 push fallback
 _ALERT_SUPPRESS_S = 7 * 86400  # 每日檢查：同一項 7 天內只私訊一次
+_URGENT_LOOKBACK_S = 2 * 86400  # 每日檢查看 48 小時內的危象血壓、低血糖（檢查時間會飄；7 天抑制防重送）
 _DAILY_HOUR = 21  # 台北 21:00 之後才做每日檢查
 _CHECK_INTERVAL_S = 600.0
 _STARTUP_DELAY_S = 60.0
@@ -1068,6 +1077,8 @@ def _overview(ctx: _Ctx) -> CommandReply:
     on_roles = [role for role in PARENTS if ctx.states[role] == _ON]
     # 沒有要爸媽本人按的按鈕（Andrew 10/17：「他們不會去按」）
     footer = [_button(f"看{role}細節", f"/健康 {role}") for role in on_roles]
+    if on_roles:
+        footer.append(_button("📋 健康分析", "/健康 分析"))
     footer += [_button("📖 怎麼用", "/健康 說明"), _text(_CARD_NOTE, size="md", color=_GRAY)]
     subtitle = f"近 7 天（{_md(ctx.today - timedelta(days=6))}–{_md(ctx.today)}）"
     return _card_reply(_OVERVIEW_ALT, _bubble("爸媽健康", subtitle, body, footer))
@@ -1137,6 +1148,67 @@ def _detail(ctx: _Ctx, role: str) -> CommandReply:
     return _card_reply(_DETAIL_ALT, _bubble(f"{role}近 14 天", "新到舊，一天一行", body, footer))
 
 
+# ── 分析卡（/健康 分析，2026-10-17） ───────────────────────────────────────
+
+
+def _analysis_rows(ctx: _Ctx, role: str) -> list[dict]:
+    """這次開始記錄以來、到現在為止的紀錄；體重規則看 180 天，所以讀到 D-179。"""
+    on_since = ctx.consents[role]["on_since"]
+    on_day = _local(on_since).date()
+    rows = _events(ctx, role, max(ctx.today - timedelta(days=179), on_day), ctx.today)
+    return [row for row in rows if on_since <= row["event_ts"] <= ctx.now]
+
+
+def _role_visits(visits: list[_Visit], role: str) -> list[tuple[date, str]]:
+    return [(visit.day, visit.keyword) for visit in visits if visit.role == role]
+
+
+def _analysis(ctx: _Ctx) -> CommandReply:
+    """近 14 天的分析卡：每位家長最多 3 條（緊急的一律列），建議另起一行；不寫 119（當下怎麼做只在私訊）。"""
+    try:
+        import parent_health_analysis as analysis
+    except Exception as exc:  # 新模組壞了只影響這張卡，/健康 其他功能和 119 照常
+        _err("analysis import", exc)
+        return _reply(FAILURE_TEXT)
+    visits = _safe_upcoming(ctx) if _ON in ctx.states.values() else []
+    start = ctx.today - timedelta(days=13)
+    body: list[dict] = []
+    for index, role in enumerate(PARENTS):
+        if index:
+            body.append(_separator())
+        body.append(_text(role, size="xl", weight="bold"))
+        state = ctx.states[role]
+        if state != _ON:
+            body.append(_text(_state_line(ctx, role), color=_GRAY))
+            continue
+        on_day = _local(ctx.consents[role]["on_since"]).date()
+        if on_day > start:
+            body.append(_text(f"從 {_md(on_day)} 開始記錄", size="md", color=_GRAY))
+        rows = _analysis_rows(ctx, role)
+        shown, hidden = analysis.card_lines(
+            analysis.analyze(rows, today=ctx.today, visits=_role_visits(visits, role), pronoun=_PRONOUN[role])
+        )
+        if not shown:
+            recent = any(row["day"] >= start for row in rows)
+            body.append(_text("依目前的提醒規則，這段時間沒有要提醒的項目" if recent else "近 14 天沒有紀錄"))
+            continue
+        for finding in shown:
+            body.append(_text(f"{analysis.TONE_EMOJI.get(finding.tone, '📝')} {finding.card}"))
+            if finding.advice:
+                body.append(_text(f"→ {finding.advice}", size="md", color=_TIP_COLOR))
+        if hidden:
+            body.append(_text(f"另外還有 {hidden} 項，完整整理每週日私訊 Andrew", size="md", color=_GRAY))
+    on_roles = [role for role in PARENTS if ctx.states[role] == _ON]
+    footer = [_button(f"看{role}細節", f"/健康 {role}") for role in on_roles]
+    footer += [
+        _button("回爸媽健康卡", "/健康"),
+        _text(_ANALYSIS_NOTE, size="md", color=_GRAY),
+        _text(_ANALYSIS_DM_NOTE, size="md", color=_GRAY),
+    ]
+    subtitle = f"近 14 天（{_md(start)}–{_md(ctx.today)}），只看群組有提到的"
+    return _card_reply(_ANALYSIS_ALT, _bubble("📋 爸媽健康分析", subtitle, body, footer))
+
+
 # ── 指令 ────────────────────────────────────────────────────────────────────
 
 
@@ -1146,6 +1218,8 @@ def _parse_command(body: str) -> tuple[str, str | None]:
         return "overview", None
     if compact in PARENTS:
         return "detail", compact
+    if compact == "分析":
+        return "analysis", None
     if compact in ("恢復", "同意"):  # 「同意」是 10/17 前舊卡片上的按鈕
         return "resume", None
     if compact.startswith("恢復") and compact[2:] in PARENTS:  # 家人恢復家人暫停的
@@ -1344,6 +1418,8 @@ def handle_command(
             return _overview(ctx)
         if command == "detail":
             return _detail(ctx, arg)
+        if command == "analysis":
+            return _analysis(ctx)
         if command == "resume":
             return _resume(ctx, user_id, arg)
         if command == "pause_self":
@@ -1763,52 +1839,66 @@ class _Anomaly:
     text: str
 
 
-def _anomalies(ctx: _Ctx) -> list[_Anomaly]:
-    """D＝今天（台北）。只看記錄中（沒暫停）的家長；同一項 7 天內私訊過就不列。只有角色、類別、標籤、天數。
+def _anomaly_candidates(ctx: _Ctx, role: str) -> list[_Anomaly]:
+    """這位家長在 ctx.now 這一刻每日檢查會列的項目（還沒扣 7 天抑制）。D＝ctx.today（台北）。
+    - 2026-10-17：48 小時內提到的危象血壓（>180/120）、低血糖（<70），私訊寫當下怎麼做（parent_health_analysis）。
     - 用藥中斷：開始記錄 ≤ D-17 的 00:00、D-17..D-4 有 ≥ 5 天說吃藥、D-3..D（到現在）都沒有。
     - 忘了吃藥：過去 24 小時有說。
     - 同一症狀 D-6..D ≥ 3 天（緊急字詞不算症狀）；睡不好 D-6..D ≥ 4 天。
     只算這次開始記錄以來（event_ts ≥ on_since）的紀錄：暫停又恢復時，之前那段不會一恢復就觸發。"""
-    found: list[_Anomaly] = []
     today = ctx.today
+    on_since = ctx.consents[role]["on_since"]
+    rows = [
+        row
+        for row in _events(ctx, role, today - timedelta(days=17), today)
+        if on_since <= row["event_ts"] <= ctx.now
+    ]
+    med = [row for row in rows if row["category"] == "med"]
+    candidates: list[_Anomaly] = []
+    try:  # 新模組壞了照送下面原本的幾條
+        import parent_health_analysis as analysis
+
+        for kind, value, event_ts in analysis.urgent_readings(rows, since_ts=ctx.now - _URGENT_LOOKBACK_S):
+            candidates.append(_Anomaly(role, kind, analysis.urgent_dm_text(role, _PRONOUN[role], kind, value, event_ts)))
+    except Exception as exc:
+        _err("urgent readings", exc)
+    if on_since <= _day_start_ts(today - timedelta(days=17)):
+        baseline = {
+            row["day"] for row in med
+            if row["item"] == _MED_TAKEN and today - timedelta(days=17) <= row["day"] <= today - timedelta(days=4)
+        }
+        gap = {row["day"] for row in med if row["item"] == _MED_TAKEN and row["day"] >= today - timedelta(days=3)}
+        if len(baseline) >= 5 and not gap:
+            candidates.append(_Anomaly(role, "med_gap", f"{role} 3 天沒提到吃藥（前兩週有 {len(baseline)} 天會說）"))
+    forgot = [row for row in med if row["item"] == _MED_FORGOT and row["event_ts"] >= ctx.now - 86400]
+    if forgot:
+        latest = max(forgot, key=lambda row: (row["event_ts"], row["event_id"]))
+        candidates.append(_Anomaly(role, "med_forgot", f"{role}說忘了吃藥（{_md(latest['day'])}）"))
+    week = [row for row in rows if row["day"] >= today - timedelta(days=6)]
+    symptoms = _ranked_by_days(
+        [
+            row
+            for row in week
+            if row["category"] == "body" and not row["value"] and row["flag"] != parent_health_db.REDFLAG
+        ]
+    )
+    for item, days in symptoms:
+        if days >= 3:
+            candidates.append(_Anomaly(role, f"symptom:{item}", f"{role} 7 天內有 {days} 天提到{item}"))
+    bad_sleep = len(_distinct_days(week, _SLEEP_BAD, "sleep"))
+    if bad_sleep >= 4:
+        candidates.append(_Anomaly(role, "sleep_bad", f"{role} 7 天內有 {bad_sleep} 天睡不好"))
+    return candidates
+
+
+def _anomalies(ctx: _Ctx) -> list[_Anomaly]:
+    """只看記錄中（沒暫停）的家長；同一項 7 天內私訊過就不列。規則見 _anomaly_candidates。
+    私訊只有角色、類別、標籤、天數；2026-10-17 起危象血壓、低血糖另帶讀數與留言時間。"""
+    found: list[_Anomaly] = []
     for role in PARENTS:
         if ctx.states[role] != _ON:
             continue
-        on_since = ctx.consents[role]["on_since"]
-        rows = [
-            row
-            for row in _events(ctx, role, today - timedelta(days=17), today)
-            if on_since <= row["event_ts"] <= ctx.now
-        ]
-        med = [row for row in rows if row["category"] == "med"]
-        candidates: list[_Anomaly] = []
-        if on_since <= _day_start_ts(today - timedelta(days=17)):
-            baseline = {
-                row["day"] for row in med
-                if row["item"] == _MED_TAKEN and today - timedelta(days=17) <= row["day"] <= today - timedelta(days=4)
-            }
-            gap = {row["day"] for row in med if row["item"] == _MED_TAKEN and row["day"] >= today - timedelta(days=3)}
-            if len(baseline) >= 5 and not gap:
-                candidates.append(_Anomaly(role, "med_gap", f"{role} 3 天沒提到吃藥（前兩週有 {len(baseline)} 天會說）"))
-        forgot = [row for row in med if row["item"] == _MED_FORGOT and row["event_ts"] >= ctx.now - 86400]
-        if forgot:
-            latest = max(forgot, key=lambda row: (row["event_ts"], row["event_id"]))
-            candidates.append(_Anomaly(role, "med_forgot", f"{role}說忘了吃藥（{_md(latest['day'])}）"))
-        week = [row for row in rows if row["day"] >= today - timedelta(days=6)]
-        symptoms = _ranked_by_days(
-            [
-                row
-                for row in week
-                if row["category"] == "body" and not row["value"] and row["flag"] != parent_health_db.REDFLAG
-            ]
-        )
-        for item, days in symptoms:
-            if days >= 3:
-                candidates.append(_Anomaly(role, f"symptom:{item}", f"{role} 7 天內有 {days} 天提到{item}"))
-        bad_sleep = len(_distinct_days(week, _SLEEP_BAD, "sleep"))
-        if bad_sleep >= 4:
-            candidates.append(_Anomaly(role, "sleep_bad", f"{role} 7 天內有 {bad_sleep} 天睡不好"))
-        for anomaly in candidates:
+        for anomaly in _anomaly_candidates(ctx, role):
             last = parent_health_db.last_alert(ctx.group_id, role, anomaly.kind, db_path=ctx.db_path)
             if last is not None and ctx.now - last["sent_at"] < _ALERT_SUPPRESS_S:
                 continue
@@ -1817,7 +1907,7 @@ def _anomalies(ctx: _Ctx) -> list[_Anomaly]:
 
 
 def anomaly_lines(group_id: str, now: float | None = None) -> list[str]:
-    """現在會私訊的異常（已扣掉 7 天內私訊過的）；只讀。"""
+    """現在會私訊的異常（已扣掉 7 天內私訊過的）；只讀。2026-10-17 起可能帶讀數：每日維護不要呼叫或轉述。"""
     try:
         return [anomaly.text for anomaly in _anomalies(_context(group_id, _now(now)))]
     except Exception as exc:
@@ -1861,14 +1951,122 @@ def run_daily_check(now: float | None = None) -> int:
         return 0
 
 
+# ── 週日分析私訊（2026-10-17） ─────────────────────────────────────────────
+
+# 每日檢查的種類 → 週私訊「這週每日檢查的項目」的固定說法（症狀用詞表標籤本身）
+_DAILY_KIND_TEXT = {
+    "bp_crisis": "血壓很高",
+    "glucose_low": "血糖偏低",
+    "med_gap": "3 天沒提到吃藥",
+    "med_forgot": "忘了吃藥",
+    "sleep_bad": "睡不好",
+}
+
+
+def _week_daily_items(ctx: _Ctx, role: str, week_start: date) -> list[str]:
+    """這 7 天每天 21:00 的每日檢查會列的項目：用現在還在的紀錄重算，不讀去重表（刪掉的錯記、暫停前的
+    紀錄都不會回來）。只有固定說法與詞表標籤。"""
+    found: list[str] = []
+    for offset in range((ctx.today - week_start).days + 1):
+        day = week_start + timedelta(days=offset)
+        moment = min(ctx.now, _day_start_ts(day) + _DAILY_HOUR * 3600)
+        for anomaly in _anomaly_candidates(replace(ctx, now=moment, today=day), role):
+            text = _DAILY_KIND_TEXT.get(anomaly.kind)
+            if text is None and anomaly.kind.startswith("symptom:"):
+                text = anomaly.kind[len("symptom:"):]
+            if text and text not in found:
+                found.append(text)
+    return found
+
+
+def _weekly_analysis_text(ctx: _Ctx) -> str | None:
+    """週日私訊 Andrew 的完整版（這 7 天）：記錄中的家長各一段；兩位這週都沒有紀錄就回 None（不送）。"""
+    import parent_health_analysis as analysis
+
+    today = ctx.today
+    week_start = today - timedelta(days=6)
+    visits = _safe_upcoming(ctx)
+    lines: list[str] = []
+    any_records = False
+    for role in PARENTS:
+        if ctx.states[role] != _ON:
+            continue
+        on_since = ctx.consents[role]["on_since"]
+        on_day = _local(on_since).date()
+        rows = _analysis_rows(ctx, role)
+        record_days = len({row["day"] for row in rows if row["day"] >= week_start})
+        any_records = any_records or bool(record_days)
+        daily_items = _week_daily_items(ctx, role, week_start)
+        upcoming = [v for v in visits if v.role == role and v.day <= today + timedelta(days=14)]
+        if record_days:
+            denom = max(1, min(7, (today - on_day).days + 1))
+            started = f"{_md(on_day)} 開始記錄，" if on_day > week_start else ""
+            lines.append(f"{role}（{started}{denom} 天有 {record_days} 天有紀錄）")
+            prev_ok = on_since <= _day_start_ts(today - timedelta(days=13))
+            findings = analysis.analyze(
+                rows, today=today, visits=_role_visits(visits, role), week=True, prev_week_ok=prev_ok,
+                pronoun=_PRONOUN[role],
+            )
+            lines += [f"• {finding.dm}" for finding in findings]
+            lines.append(f"• {analysis.readings_summary(rows, today=today, prev_week_ok=prev_ok)}")
+        else:
+            lines.append(f"{role}：這週沒有紀錄")
+        if daily_items:
+            lines.append(f"• 這週有符合每日檢查條件的：{'、'.join(daily_items)}")
+        if upcoming:
+            lines.append("• 下次看診：" + "、".join(visit.when() for visit in upcoming[:2]))
+    if not any_records:
+        return None
+    footer = "依公開衛教整理，不是診斷"
+    cut = "（太長，後面省略）"
+    text = f"🩺 爸媽健康週分析（{_md(week_start)}–{_md(today)}）"
+    for line in lines:  # 太長就截斷並註明；最後的免責句一定留著
+        if len(text) + len(line) + len(cut) + len(footer) + 3 > _DM_MAX_CHARS:
+            text += "\n" + cut
+            break
+        text += "\n" + line
+    return text + "\n" + footer
+
+
+def _run_weekly_analysis(now: float | None = None) -> int:
+    """台北週日 21:00 之後一次：每個有記錄中家長的群組先組好文字，有內容才搶 weekly_analysis:<日期>
+    再送（重啟、雙程序都不重送；send 結果不明也不重送）。和每日檢查分開搶、分開出錯。回送出的私訊數。"""
+    try:
+        now_f = _now(now)
+        local = _local(now_f)
+        if local.weekday() != 6 or local.hour < _DAILY_HOUR:
+            return 0
+        key = local.date().isoformat()
+        sent = 0
+        for group_id in parent_health_db.groups_with_consent():
+            try:
+                last = parent_health_db.last_alert(group_id, "", "weekly_analysis")
+                if last is not None and last["key"] == key:
+                    continue
+                text = _weekly_analysis_text(_context(group_id, now_f))
+                if not text:
+                    continue
+                if not parent_health_db.claim_alert(group_id, "", "weekly_analysis", key, now=now_f):
+                    continue
+                if _send_dm(text):
+                    sent += 1
+            except Exception as exc:
+                _err("weekly analysis group", exc)
+        return sent
+    except Exception as exc:
+        _err("weekly analysis", exc)
+        return 0
+
+
 def _daily_loop(stop: threading.Event) -> None:
     if stop.wait(_STARTUP_DELAY_S):
         return
     while not stop.is_set():
-        try:
-            run_daily_check()
-        except Exception as exc:  # run_daily_check 不丟例外；這裡再接一次，執行緒不會無聲停掉
-            _err("daily loop", exc)
+        for job in (run_daily_check, _run_weekly_analysis):  # 各自搶、各自出錯
+            try:
+                job()
+            except Exception as exc:  # 兩個都不丟例外；這裡再接一次，執行緒不會無聲停掉
+                _err("daily loop", exc)
         if stop.wait(_CHECK_INTERVAL_S):
             return
 
