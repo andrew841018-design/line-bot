@@ -363,9 +363,10 @@ def test_constants_match_interfaces():
     assert ph.FAILURE_TEXT == "爸媽健康：暫時無法回覆，請稍後再試"
     assert ph.QUOTE_NOTICE == "爸媽健康：卡片上是從群組留言整理的紀錄，咪寶不會判讀或診斷。"
     assert ph.WEEKLY_MARKER == "\U0001fa7a 爸媽這週"
-    for text in (ph.SAFETY_TEXT, ph.FAILURE_TEXT, ph.QUOTE_NOTICE, ph._HELP_TEXT, ph_off._DISABLED_TEXT):
+    for text in (ph.SAFETY_TEXT, ph.FAILURE_TEXT, ph.QUOTE_NOTICE, ph._HELP_TEXT, ph_off._DISABLED_TEXT,
+                 ph._AUTO_RECORD_TEXT, ph._RECORDED_TEXT):
         assert_text_ok(text)
-    for required in ("/健康", "/健康 爸爸", "/健康 媽媽", "/健康 同意", "/健康 吃藥了", "/健康 有運動"):
+    for required in ("/健康", "/健康 爸爸", "/健康 媽媽", "/健康 同意", "/健康 恢復", "/健康 吃藥了", "/健康 有運動"):
         assert required in ph.SHIPPED_HEALTH_BUTTON_TEXTS
     fallback = getattr(main, "_reply_health_quote_notice", None)
     if fallback is not None:  # main 的備用句（模組載不進來時用）要和這裡一字不差
@@ -559,13 +560,23 @@ def test_resume_starts_recording_outside_the_family_group_and_pressing_again_kee
     assert db.consent_states(G)["爸爸"]["on_since"] == on_since
 
 
-def test_only_the_parent_can_resume_and_names_are_never_resume():
+def test_family_cannot_start_recording_for_a_parent_outside_the_family_group():
     reply = cmd("恢復", "U_KID")
     assert_text_ok(reply.text)
     assert reply.text == "爸媽健康：要爸爸、媽媽本人打 /健康 恢復 才會記錄"
-    for body, user in (("恢復 爸爸", "U_KID"), ("恢復 爸爸", "U_DAD"), ("恢復媽媽", "U_MOM"), ("同意 爸爸", "U_KID")):
-        assert cmd(body, user).text == ph._HELP_TEXT
+    for body, user, expected in (
+        ("恢復 爸爸", "U_KID", "爸媽健康：要爸爸本人打 /健康 恢復 才會記錄"),
+        ("恢復媽媽", "U_DAD", "爸媽健康：要媽媽本人打 /健康 恢復 才會記錄"),  # 另一位家長也不能替他同意
+        ("同意 爸爸", "U_KID", ph._HELP_TEXT),
+    ):
+        reply = cmd(body, user)
+        assert_text_ok(reply.text)
+        assert reply.text == expected
     assert db.consent_states(G) == {}
+    # 本人用「/健康 恢復 爸爸」也可以
+    assert cmd("恢復 爸爸", "U_DAD").text.startswith("爸媽健康：已恢復記錄爸爸的健康留言。")
+    row = db.consent_states(G)["爸爸"]
+    assert (row["status"], row["user_id"], row["changed_by"]) == ("on", "U_DAD", "U_DAD")
 
 
 def test_resume_when_account_not_set_up(family, caplog):
@@ -583,12 +594,14 @@ def test_pause_by_self_and_by_others(dms):
     reply = cmd("暫停", "U_DAD")
     assert_text_ok(reply.text)
     assert "已暫停爸爸的健康紀錄" in reply.text and "119 提醒也一起停" in reply.text
+    assert reply.text.endswith("要恢復，請爸爸本人打 /健康 恢復")
     assert db.consent_states(G)["爸爸"]["status"] == "paused" and dms == []
     reply = cmd("暫停 媽媽", "U_KID")
     assert_text_ok(reply.text)
-    assert "119 提醒也一起停" in reply.text
+    assert "119 提醒也一起停" in reply.text and reply.text.endswith("要恢復，請媽媽本人打 /健康 恢復")  # 其他群組只有本人能恢復
     assert db.consent_states(G)["媽媽"]["status"] == "paused"
     assert len(dms) == 1 and "媽媽的健康紀錄被家人暫停了" in dms[0] and "119" in dms[0]
+    assert "要恢復，請媽媽本人打 /健康 恢復" in dms[0]
     assert "U_KID" not in dms[0]
     assert cmd("暫停 媽媽", "U_KID").text == "爸媽健康：媽媽的健康紀錄已經暫停了"
     hint = cmd("暫停", "U_KID")
@@ -629,28 +642,37 @@ def test_needs_reconsent_when_account_mapping_changes(family, extract_mod, monke
     assert db.consent_states(G)["爸爸"]["user_id"] == "U_DAD2"
 
 
-def test_one_tap_records_only_for_the_consented_parent_self():
+def test_old_card_taps_record_only_for_the_parent_self(monkeypatch):
+    # 10/17 起新卡片沒有這兩個按鈕；舊卡片本人按了照樣記（指令不進留言抽取，不記就丟了）
     consent("爸爸", "U_DAD")
     reply = cmd("吃藥了", "U_DAD", msg="tap1")
-    assert reply.text == "爸媽健康：記下了"
+    assert_text_ok(reply.text)
+    assert reply.text == ph._RECORDED_TEXT == "爸媽健康：記下了。以後在群組說吃藥了、去散步了也會自動記，不用按"
     reply = cmd("有運動", "U_DAD", msg="tap2")
-    assert reply.text == "爸媽健康：記下了"
+    assert reply.text == ph._RECORDED_TEXT
     rows = db.list_events(G, "爸爸", since_day="2026-10-11", until_day="2026-10-11")
     assert [(r["category"], r["item"], r["source"], r["reporter_user_id"]) for r in rows] == [
         ("med", "吃藥", "button", "U_DAD"), ("exercise", "運動", "button", "U_DAD"),
     ]
     assert cmd("吃藥了", "U_DAD", msg="tap1").text == "爸媽健康：這一筆已經記過了"
+    writes: list = []
+    real_add = db.add_events
+    monkeypatch.setattr(db, "add_events", lambda *a, **kw: writes.append(a) or real_add(*a, **kw))
+    mom_not_started = f"{ph._AUTO_RECORD_TEXT}。媽媽還沒開始記錄（要媽媽本人打 /健康 恢復）"  # 有人不在記錄中就說一聲
     for body, user, expected in (
-        ("吃藥了", "U_KID", "爸媽健康：這個按鈕只記按的人自己，要爸爸或媽媽本人按"),
-        ("吃藥了", "U_MOM", "爸媽健康：媽媽還沒開始記錄，要媽媽本人打 /健康 恢復"),
+        ("吃藥了", "U_KID", mom_not_started),
+        ("有運動", "U_KID", mom_not_started),
+        ("吃藥了", "U_MOM", "爸媽健康：媽媽還沒開始記錄（要媽媽本人打 /健康 恢復）"),
     ):
         reply = cmd(body, user)
         assert_text_ok(reply.text)
         assert reply.text == expected
+    assert writes == []
     cmd("暫停", "U_DAD")
     reply = cmd("有運動", "U_DAD")
     assert_text_ok(reply.text)
-    assert reply.text == "爸媽健康：爸爸的紀錄暫停中，要恢復請爸爸本人打 /健康 恢復"
+    assert reply.text == "爸媽健康：爸爸已暫停記錄（爸爸自己暫停的，要恢復請爸爸本人打 /健康 恢復）"
+    assert writes == []
     assert len(db.list_events(G, "爸爸", since_day="2026-10-11", until_day="2026-10-11")) == 2
 
 
@@ -686,6 +708,10 @@ def test_help_and_unknown_subcommands():
     assert_text_ok(ph._HELP_TEXT)
     assert "/健康 刪除我的紀錄" in ph._HELP_TEXT and ph._RECORDING_EXPLANATION in ph._HELP_TEXT
     assert "/健康 恢復" in ph._HELP_TEXT and "同意" not in ph._HELP_TEXT
+    # Andrew 10/17：「不要任何本人按鍵的功能」——說明只教在群組直接說，不教一鍵記錄
+    assert "不用按按鈕" in ph._HELP_TEXT and "/健康 恢復 爸爸" in ph._HELP_TEXT and "/健康 暫停 爸爸" in ph._HELP_TEXT
+    for retired in ("/健康 吃藥了", "/健康 有運動", "我吃藥了", "我有運動"):
+        assert retired not in ph._HELP_TEXT
 
 
 def test_body_normalization_full_width_and_spacing():
@@ -743,7 +769,7 @@ def test_overview_card_with_data(reminders):
     ]
     assert "大醫院" not in json.dumps(card, ensure_ascii=False)  # 提醒內容不上卡
     buttons = [node["action"]["label"] for node in card["footer"]["contents"] if "action" in node]
-    assert buttons == ["看爸爸細節", "💊 我吃藥了", "🚶 我有運動", "▶️ 恢復記錄", "📖 怎麼用"]
+    assert buttons == ["看爸爸細節", "📖 怎麼用"]
     assert card["footer"]["contents"][-1]["text"] == "從群組留言整理，只記錄、不診斷"
     assert card["footer"]["contents"][0]["contents"][0]["size"] == "xl"  # 大字按鈕
 
@@ -754,7 +780,7 @@ def test_overview_card_every_state_passes_checks(family, reminders):
     assert body_lines(card) == [
         "爸爸", "還沒開始記錄（要爸爸本人打 /健康 恢復）", "媽媽", "還沒開始記錄（要媽媽本人打 /健康 恢復）",
     ]
-    assert [n["action"]["text"] for n in card["footer"]["contents"] if "action" in n] == ["/健康 恢復", "/健康 說明"]
+    assert [n["action"]["text"] for n in card["footer"]["contents"] if "action" in n] == ["/健康 說明"]
     # 同意了但沒有紀錄
     consent("媽媽", "U_MOM", at=NOW - 3600)
     card = assert_card_ok(cmd(""))
@@ -765,7 +791,7 @@ def test_overview_card_every_state_passes_checks(family, reminders):
     # 暫停
     cmd("暫停", "U_MOM")
     card = assert_card_ok(cmd(""))
-    assert "已暫停記錄（要恢復：媽媽本人打 /健康 恢復）" in body_lines(card)
+    assert "已暫停記錄（媽媽自己暫停的，要恢復請媽媽本人打 /健康 恢復）" in body_lines(card)
     # 帳號沒設定
     family({"U_KID": "成員甲"})
     card = assert_card_ok(cmd(""))
@@ -821,7 +847,7 @@ def test_detail_card_lines_and_reporter_labels(monkeypatch, tmp_path):
         "10/4（日）吃藥",
     ]
     footer = [n.get("text") for n in card["footer"]["contents"] if n.get("type") == "text"]
-    assert footer[:2] == ["記錯了：長按那則留言→回覆→打 /健康 刪除", "要暫停：爸爸本人打 /健康 暫停"]
+    assert footer[:2] == ["記錯了：長按那則留言→回覆→打 /健康 刪除", "要暫停：打 /健康 暫停 爸爸"]
 
 
 def test_detail_card_states_and_empty():
@@ -830,7 +856,7 @@ def test_detail_card_states_and_empty():
     consent("媽媽", "U_MOM")
     assert body_lines(assert_card_ok(cmd("媽媽"))) == ["近 14 天沒有紀錄"]
     cmd("暫停", "U_MOM")
-    assert body_lines(assert_card_ok(cmd("媽媽"))) == ["已暫停記錄（要恢復：媽媽本人打 /健康 恢復）"]
+    assert body_lines(assert_card_ok(cmd("媽媽"))) == ["已暫停記錄（媽媽自己暫停的，要恢復請媽媽本人打 /健康 恢復）"]
 
 
 def test_rows_outside_the_vocabulary_are_never_rendered():
@@ -881,10 +907,10 @@ def test_every_card_button_is_shipped_and_every_shipped_text_is_handled(family, 
     seen |= set(action_texts(cmd("媽媽").card))
     assert seen <= set(ph.SHIPPED_HEALTH_BUTTON_TEXTS)
     body_of = getattr(main, "_health_command_body", None)
-    for text in ph.SHIPPED_HEALTH_BUTTON_TEXTS:
+    for text, user in itertools.product(ph.SHIPPED_HEALTH_BUTTON_TEXTS, ("U_DAD", "U_KID", None)):
         body = body_of(text, None) if body_of else text[len("/健康"):].strip()
         assert body is not None, text
-        reply = ph.handle_command(G, "U_DAD", body, message_id=f"b{next(_ids)}", now=NOW)
+        reply = ph.handle_command(G, user, body, message_id=f"b{next(_ids)}", now=NOW)
         assert reply is not None and (reply.card is not None or reply.text), text
         assert reply.text != ph.FAILURE_TEXT, text
         if reply.card is not None:
@@ -1867,7 +1893,7 @@ def test_addressing_the_bot_without_a_command_is_still_checked(monkeypatch, extr
     [("恢復", "resume"), ("同意", "resume"), ("爸爸", "detail"), ("媽媽", "detail"), ("暫停", "pause_self"),
      ("暫停爸爸", "pause"), ("暫停媽媽", "pause"), ("暫停 爸爸", "pause"), ("吃藥了", "record"), ("有運動", "record"),
      ("刪除", "delete_quoted"), ("刪除我的紀錄", "delete_mine"), ("說明", "help"), ("同意爸爸", "help"),
-     ("恢復爸爸", "help")],
+     ("恢復爸爸", "resume"), ("恢復 媽媽", "resume"), ("恢復哥哥", "help"), ("恢復 爸爸 媽媽", "help")],
 )
 def test_subcommands_are_recognized_with_or_without_a_space(body, command):
     assert ph._parse_command(body)[0] == command
@@ -2082,11 +2108,11 @@ def test_family_group_card_and_commands_need_no_consent(family_group, dms):
     assert "爸爸" in lines and "媽媽" in lines and not any("還沒開始記錄" in line for line in lines)
     assert not any("恢復" in n["action"]["label"] for n in card["footer"]["contents"] if "action" in n)
     assert {row["changed_by"] for row in db.consent_states(G).values()} == {"default"}
-    assert cmd("吃藥了", "U_DAD", msg="t1").text == "爸媽健康：記下了"
+    assert cmd("吃藥了", "U_DAD", msg="t1").text == ph._RECORDED_TEXT
     assert cmd("同意", "U_DAD").text.startswith("爸媽健康：爸爸的健康紀錄正在記錄，不用按")
     assert cmd("恢復", "U_KID").text == "爸媽健康：爸爸、媽媽的健康紀錄都在記錄中，不用按"
     cmd("暫停", "U_DAD")
-    assert cmd("恢復", "U_KID").text == "爸媽健康：要爸爸本人打 /健康 恢復 才會記錄"
+    assert cmd("恢復", "U_KID").text == "爸媽健康：爸爸已暫停記錄（爸爸自己暫停的，要恢復請爸爸本人打 /健康 恢復）"
     assert cmd("恢復", "U_DAD").text.startswith("爸媽健康：已恢復記錄爸爸的健康留言")
     assert db.consent_states(G)["爸爸"]["status"] == "on"
 
@@ -2098,7 +2124,7 @@ def test_cards_still_render_and_pause_still_works_when_the_default_write_fails(f
     monkeypatch.setattr(db, "ensure_default_consent", broken)
     card = assert_card_ok(cmd("", "U_KID"))
     assert db.consent_states(G) == {}
-    assert "還沒開始記錄（要爸爸本人打 /健康 恢復）" in body_lines(card)
+    assert "還沒開始記錄（下一則群組留言就會自動開始）" in body_lines(card)
     reply = cmd("暫停", "U_DAD")
     assert reply.text.startswith("爸媽健康：已暫停爸爸的健康紀錄")
     assert db.consent_states(G)["爸爸"]["status"] == "paused"
@@ -2187,3 +2213,355 @@ def test_ensure_default_consent_db_rules():
     assert (mom["status"], mom["user_id"], mom["changed_by"], mom["on_since"]) == ("on", "U_MOM2", "default", int(NOW - 100))
     assert db.ensure_default_consent(G2, {"爸爸": "U_DAD", "其他": "U_X", "媽媽": ""}, now=NOW) == 1
     assert set(db.consent_states(G2)) == {"爸爸"}
+
+
+# ── 沒有要爸媽本人按的按鈕（Andrew 2026-10-17：「不要任何本人按鍵的功能…因為他們不會去按」） ──
+
+_ALLOWED_BUTTON_LABELS = {"看爸爸細節", "看媽媽細節", "📖 怎麼用", "回爸媽健康卡"}
+_SELF_ONLY_TEXTS = {"/健康 吃藥了", "/健康 有運動", "/健康 恢復", "/健康 同意"}
+
+
+def _assert_no_self_buttons(card):
+    labels = [node["action"]["label"] for node in _walk_actions(card)]
+    texts = [node["action"]["text"] for node in _walk_actions(card)]
+    assert labels  # 每張卡至少有「📖 怎麼用」或「回爸媽健康卡」：卡片結構改了這裡不能空轉
+    assert set(labels) <= _ALLOWED_BUTTON_LABELS, labels
+    assert not set(texts) & _SELF_ONLY_TEXTS, texts
+    assert not any(label.lstrip("💊🚶▶️ ").startswith("我") or "本人" in label for label in labels), labels
+
+
+def _walk_actions(node):
+    found = []
+    if isinstance(node, dict):
+        if "action" in node:
+            found.append(node)
+        for value in node.values():
+            found += _walk_actions(value)
+    elif isinstance(node, list):
+        for value in node:
+            found += _walk_actions(value)
+    return found
+
+
+def _all_cards():
+    return [assert_card_ok(cmd(body, "U_KID")) for body in ("", "爸爸", "媽媽")]
+
+
+def test_no_card_ever_shows_a_button_only_a_parent_can_use(family, family_group, reminders):
+    _seed_dad_week()  # 爸爸有一週紀錄
+    for card in _all_cards():  # 家族主群、兩位都在記錄
+        _assert_no_self_buttons(card)
+    cmd("暫停", "U_DAD")  # 本人暫停
+    cmd("暫停 媽媽", "U_KID")  # 家人暫停
+    for card in _all_cards():
+        _assert_no_self_buttons(card)
+    family({"U_KID": "成員甲"})  # 帳號沒設定
+    for card in _all_cards():
+        _assert_no_self_buttons(card)
+
+
+def test_no_card_ever_shows_a_parent_button_outside_the_family_group(reminders):
+    for card in _all_cards():  # 其他群組、都還沒開始
+        _assert_no_self_buttons(card)
+    consent("媽媽", "U_MOM")
+    for card in _all_cards():
+        _assert_no_self_buttons(card)
+
+
+def test_family_resumes_a_pause_made_by_family(family_group, extract_mod, monkeypatch, dms):
+    monkeypatch.setattr(extract_mod, "extract", lambda text, speaker, **kw: [F("爸爸", "med", "吃藥")])
+    cmd("", "U_KID")  # 卡片寫下預設列
+    paused = cmd("暫停 爸爸", "U_KID")
+    assert paused.text.endswith("要恢復：打 /健康 恢復 爸爸")  # 家人暫停的：回覆和私訊都說家人也能恢復
+    assert len(dms) == 1 and "；要恢復：打 /健康 恢復 爸爸。" in dms[0]
+    assert "已暫停記錄（要恢復：打 /健康 恢復 爸爸）" in body_lines(assert_card_ok(cmd("", "U_KID")))
+    assert ph.observe_message(G, "p1", "U_DAD", "我吃藥了", event_ts_ms=int(NOW * 1000), now=NOW) == 0
+    reply = cmd("恢復 爸爸", "U_KID", now=NOW + 60)
+    assert_text_ok(reply.text)
+    assert reply.text == "爸媽健康：已恢復記錄爸爸的健康留言（從現在開始，暫停期間的留言不補記）。要暫停：打 /健康 暫停 爸爸"
+    row = db.consent_states(G)["爸爸"]
+    assert (row["status"], row["user_id"], row["changed_by"], row["on_since"]) == ("on", "U_DAD", "U_KID", int(NOW + 60))
+    assert len(dms) == 2 and "爸爸的健康紀錄被家人恢復了" in dms[1] and "119" in dms[1]
+    assert "U_" not in dms[1]
+    # 暫停期間說的不補記；恢復後說的照樣記
+    assert ph.observe_message(G, "p1b", "U_DAD", "我吃藥了", event_ts_ms=int((NOW + 30) * 1000), now=NOW + 90) == 0
+    assert ph.observe_message(G, "p2", "U_DAD", "我吃藥了", event_ts_ms=int((NOW + 120) * 1000), now=NOW + 120) == 1
+    again = cmd("恢復 爸爸", "U_KID", now=NOW + 180)
+    assert again.text == "爸媽健康：爸爸的健康紀錄正在記錄，不用打" and len(dms) == 2
+    assert db.consent_states(G)["爸爸"]["on_since"] == int(NOW + 60)
+
+
+def test_family_cannot_resume_a_pause_the_parent_made(family_group, dms):
+    cmd("", "U_KID")
+    for body in ("暫停", "暫停 爸爸"):  # 本人兩種打法都算本人暫停
+        db.set_consent(G, "爸爸", "on", user_id="U_DAD", changed_by="default", now=NOW - 3600)
+        assert cmd(body, "U_DAD").text.startswith("爸媽健康：已暫停爸爸的健康紀錄")
+        for user in ("U_KID", "U_MOM"):
+            reply = cmd("恢復 爸爸", user)
+            assert_text_ok(reply.text)
+            assert reply.text == "爸媽健康：爸爸自己暫停的，要爸爸本人打 /健康 恢復"
+            assert db.consent_states(G)["爸爸"]["status"] == "paused"
+        assert dms == []
+        assert "已暫停記錄（爸爸自己暫停的，要恢復請爸爸本人打 /健康 恢復）" in body_lines(assert_card_ok(cmd("", "U_KID")))
+        # 家人再打一次暫停：不能把本人暫停的變成家人暫停的（GP1 事後審查 I-A）
+        assert cmd("暫停 爸爸", "U_KID").text == "爸媽健康：爸爸的健康紀錄已經暫停了"
+        assert db.consent_states(G)["爸爸"]["changed_by"] == "U_DAD"
+        assert cmd("恢復 爸爸", "U_KID").text == "爸媽健康：爸爸自己暫停的，要爸爸本人打 /健康 恢復"
+        assert dms == []
+    assert cmd("恢復", "U_DAD").text.startswith("爸媽健康：已恢復記錄爸爸的健康留言。")
+    assert db.consent_states(G)["爸爸"]["status"] == "on" and dms == []
+
+
+def test_other_parent_and_the_parent_can_resume_a_family_pause(family_group, dms):
+    cmd("", "U_KID")
+    cmd("暫停 爸爸", "U_KID")
+    reply = cmd("恢復 爸爸", "U_MOM")
+    assert reply.text.startswith("爸媽健康：已恢復記錄爸爸的健康留言（從現在開始")
+    assert db.consent_states(G)["爸爸"]["changed_by"] == "U_MOM" and len(dms) == 2
+    cmd("暫停 爸爸", "U_KID")
+    for body in ("恢復", "恢復 爸爸"):  # 本人恢復：走本人的路，不私訊
+        reply = cmd(body, "U_DAD")
+        assert reply.text.startswith("爸媽健康：已恢復記錄爸爸的健康留言。"), body
+        cmd("暫停 爸爸", "U_KID")
+    assert len(dms) == 5  # 家人暫停 4 次＋另一位家長恢復 1 次；本人恢復不私訊
+
+
+def _spy_consent_writes(monkeypatch):
+    calls: list[tuple] = []
+    real = db.set_consent
+    monkeypatch.setattr(db, "set_consent", lambda *a, **kw: calls.append((a, kw)) or real(*a, **kw))
+    return calls
+
+
+def test_family_resume_never_writes_when_there_is_nothing_to_resume(family_group, family, monkeypatch, dms):
+    cmd("", "U_KID")
+    writes = _spy_consent_writes(monkeypatch)
+    assert cmd("恢復 爸爸", "U_KID").text == "爸媽健康：爸爸的健康紀錄正在記錄，不用打"
+    family({"U_MOM": "媽媽", "U_KID": "成員甲"})
+    assert cmd("恢復 爸爸", "U_KID").text == "爸媽健康：還沒設定爸爸是哪個 LINE 帳號，設定好才能記錄"
+    assert writes == [] and dms == []
+
+
+def test_family_resume_when_the_default_row_is_missing(family_group, monkeypatch, dms):
+    def broken(*_a, **_kw):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(db, "ensure_default_consent", broken)
+    writes = _spy_consent_writes(monkeypatch)
+    reply = cmd("恢復 爸爸", "U_KID")
+    assert_text_ok(reply.text)
+    assert reply.text == "爸媽健康：爸爸的紀錄會從下一則群組留言自動開始"
+    assert cmd("恢復", "U_KID").text == "爸媽健康：爸爸、媽媽的紀錄會從下一則群組留言自動開始"
+    assert writes == [] and dms == [] and db.consent_states(G) == {}
+    # 沒有列時本人暫停：列上的帳號是空的，靠現在的帳號認出是本人暫停
+    cmd("暫停", "U_DAD")
+    assert db.consent_states(G)["爸爸"]["user_id"] == ""
+    assert cmd("恢復 爸爸", "U_KID").text == "爸媽健康：爸爸自己暫停的，要爸爸本人打 /健康 恢復"
+    # 沒有列時家人暫停：家人可以恢復
+    cmd("暫停 媽媽", "U_KID")
+    assert cmd("恢復 媽媽", "U_KID").text.startswith("爸媽健康：已恢復記錄媽媽的健康留言（從現在開始")
+    mom = db.consent_states(G)["媽媽"]
+    assert (mom["status"], mom["user_id"], mom["changed_by"]) == ("on", "U_MOM", "U_KID")
+
+
+def test_family_cannot_resume_outside_the_family_group(family, monkeypatch, dms):
+    # 家族主群以外只有本人的指令會寫 on 列：家人暫停的也要本人恢復
+    consent("爸爸", "U_DAD")
+    cmd("暫停 爸爸", "U_KID")
+    writes = _spy_consent_writes(monkeypatch)
+    reply = cmd("恢復 爸爸", "U_KID")
+    assert_text_ok(reply.text)
+    assert reply.text == "爸媽健康：要爸爸本人打 /健康 恢復 才會記錄"
+    assert writes == [] and db.consent_states(G)["爸爸"]["status"] == "paused" and len(dms) == 1
+    assert "已暫停記錄（要恢復請爸爸本人打 /健康 恢復）" in body_lines(assert_card_ok(cmd("", "U_KID")))
+    family({"U_DAD2": "爸爸", "U_MOM": "媽媽", "U_KID": "成員甲"})  # 換了帳號也一樣
+    assert cmd("恢復 爸爸", "U_KID").text == "爸媽健康：要爸爸本人打 /健康 恢復 才會記錄"
+    assert cmd("恢復", "U_DAD2").text.startswith("爸媽健康：已恢復記錄爸爸的健康留言。")
+    row = db.consent_states(G)["爸爸"]
+    assert (row["status"], row["user_id"], row["changed_by"]) == ("on", "U_DAD2", "U_DAD2")
+
+
+def test_bare_resume_from_family_points_to_the_right_command(family_group, family, dms):
+    cmd("", "U_KID")
+    assert cmd("恢復", "U_KID").text == "爸媽健康：爸爸、媽媽的健康紀錄都在記錄中，不用按"
+
+    def bare():
+        before = db.consent_states(G)
+        reply = cmd("恢復", "U_KID")
+        assert_text_ok(reply.text)
+        assert db.consent_states(G) == before  # 沒指定誰：不替任何人恢復
+        return reply.text
+
+    cmd("暫停", "U_DAD")  # 本人暫停＋另一位記錄中
+    assert bare() == "爸媽健康：爸爸已暫停記錄（爸爸自己暫停的，要恢復請爸爸本人打 /健康 恢復）"
+    cmd("暫停 媽媽", "U_KID")  # 家人暫停＋另一位本人暫停
+    assert bare() == "爸媽健康：要恢復媽媽：打 /健康 恢復 媽媽"
+    cmd("恢復", "U_DAD")
+    cmd("暫停 爸爸", "U_KID")  # 兩位都是家人暫停
+    assert bare() == "爸媽健康：要恢復誰？打 /健康 恢復 爸爸 或 /健康 恢復 媽媽"
+    family({"U_MOM": "媽媽", "U_KID": "成員甲"})  # 爸爸帳號沒設定、媽媽家人暫停：先講能恢復的
+    assert bare() == "爸媽健康：要恢復媽媽：打 /健康 恢復 媽媽"
+    cmd("恢復 媽媽", "U_KID")
+    assert bare() == "爸媽健康：還沒設定爸爸是哪個 LINE 帳號，設定好才能記錄"
+
+
+@pytest.mark.parametrize("group_is_family", [True, False])
+def test_resume_rule_reads_the_row_and_the_current_account(monkeypatch, group_is_family):
+    monkeypatch.setattr(db.settings, "family_group_id", G if group_is_family else "")
+
+    def rule(row, current="U_DAD"):
+        roles = {"爸爸": current, "媽媽": "U_MOM"}
+        consents = {"爸爸": row}
+        return ph._resume_rule(ph._Ctx(G, NOW, ph._today(NOW), roles, consents, ph._states(roles, consents)), "爸爸")
+
+    paused = {"status": "paused", "on_since": 0}
+    assert rule({**paused, "user_id": "U_DAD", "changed_by": "U_DAD"}) == "self"
+    assert rule({**paused, "user_id": "", "changed_by": "U_DAD"}) == "self"  # 沒有列時本人暫停
+    assert rule({**paused, "user_id": "U_DAD", "changed_by": "U_DAD"}, "U_DAD2") == "self"  # 本人暫停後換帳號
+    assert rule({**paused, "user_id": "U_DAD", "changed_by": "U_DAD2"}, "U_DAD2") == "self"
+    # 不是帳號、別名檔裡沒有的：一律只有本人能恢復（白名單，不認得的不放行）
+    for by in ("default", "admin", "Admin", "rollback", "U_STRANGER"):
+        assert rule({**paused, "user_id": "U_DAD", "changed_by": by}) == "parent", by
+    # 認得的家人、另一位家長、沒帶帳號的事件：家族主群裡家人也能恢復；其他群組只有本人
+    expected = "family" if group_is_family else "parent"
+    for by in ("U_KID", "U_MOM", "", None):
+        assert rule({**paused, "user_id": "U_DAD", "changed_by": by}) == expected, by
+    assert rule({**paused, "user_id": "U_DAD", "changed_by": "U_KID"}, "U_DAD2") == expected
+    assert rule({**paused, "user_id": "", "changed_by": "U_KID"}) == expected
+    assert rule({**paused, "user_id": "", "changed_by": ""}) == expected  # 沒有列、沒帶帳號的事件暫停
+
+
+def _sql_pause(group, role, by):
+    """ROLLBACK §4 的暫停 SQL（新程式下 changed_by 寫 'admin'；照舊寫法會留下 'default'）。"""
+    db._write(
+        None,
+        "UPDATE parent_health_consent SET status = 'paused', changed_by = ? WHERE group_id = ? AND role = ?",
+        (by, group, role),
+    )
+
+
+def test_sql_pause_from_the_rollback_note_only_the_parent_can_resume(family_group, monkeypatch, dms):
+    cmd("", "U_KID")
+    writes = _spy_consent_writes(monkeypatch)
+    for by in ("default", "admin", "Admin", "rollback"):
+        db.set_consent(G, "爸爸", "on", user_id="U_DAD", changed_by="default", now=NOW - 3600)
+        _sql_pause(G, "爸爸", by)
+        writes.clear()
+        reply = cmd("恢復 爸爸", "U_KID")
+        assert_text_ok(reply.text)
+        assert reply.text == "爸媽健康：要爸爸本人打 /健康 恢復 才會記錄"
+        assert writes == [] and dms == [] and db.consent_states(G)["爸爸"]["status"] == "paused"
+        assert "已暫停記錄（要恢復請爸爸本人打 /健康 恢復）" in body_lines(assert_card_ok(cmd("", "U_KID")))
+    assert cmd("恢復", "U_DAD").text.startswith("爸媽健康：已恢復記錄爸爸的健康留言。")
+
+
+def test_self_pause_then_new_account_stays_parent_only(family_group, family, dms):
+    cmd("", "U_KID")
+    cmd("暫停", "U_DAD")
+    family({"U_DAD2": "爸爸", "U_MOM": "媽媽", "U_KID": "成員甲"})
+    assert cmd("恢復 爸爸", "U_KID").text == "爸媽健康：爸爸自己暫停的，要爸爸本人打 /健康 恢復"
+    assert db.consent_states(G)["爸爸"]["status"] == "paused" and dms == []
+    assert cmd("恢復", "U_DAD2").text.startswith("爸媽健康：已恢復記錄爸爸的健康留言。")
+    assert db.consent_states(G)["爸爸"]["user_id"] == "U_DAD2"
+
+
+def test_resume_needs_a_known_account(family_group, dms):
+    # 停下來誰都能做；重新開始記錄要認得出是誰
+    cmd("", "U_KID")
+    cmd("暫停 爸爸", "U_KID")
+    reply = ph.handle_command(G, None, "恢復 爸爸", message_id="n1", now=NOW + 5)
+    assert_text_ok(reply.text)
+    assert reply.text == "爸媽健康：看不出是誰打的，請用手機 LINE 再打一次 /健康 恢復 爸爸"
+    reply = cmd("恢復 爸爸", "U_STRANGER")
+    assert_text_ok(reply.text)
+    assert reply.text == "爸媽健康：要爸爸本人或家人打 /健康 恢復 爸爸 才會恢復"
+    assert db.consent_states(G)["爸爸"]["status"] == "paused" and len(dms) == 1
+    # 沒帶帳號的事件可以暫停，認得的家人可以恢復
+    ph.handle_command(G, None, "暫停 媽媽", message_id="n2", now=NOW + 6)
+    assert db.consent_states(G)["媽媽"]["changed_by"] == "" and len(dms) == 2
+    assert cmd("恢復 媽媽", "U_KID").text.startswith("爸媽健康：已恢復記錄媽媽的健康留言（從現在開始")
+
+
+def test_parent_pausing_after_family_makes_it_parent_only(family_group, dms):
+    cmd("", "U_KID")
+    cmd("暫停 爸爸", "U_KID")  # 可能是爸爸口頭請家人代打的
+    assert len(dms) == 1
+    for body in ("暫停", "暫停 爸爸"):
+        reply = cmd(body, "U_DAD")
+        assert_text_ok(reply.text)
+        if body == "暫停":
+            assert reply.text == "爸媽健康：爸爸的健康紀錄已經暫停了；現在改成爸爸自己暫停的，之後只有爸爸本人能恢復"
+        else:
+            assert reply.text == "爸媽健康：爸爸的健康紀錄已經暫停了"  # 已經是本人暫停的
+    assert db.consent_states(G)["爸爸"]["changed_by"] == "U_DAD" and len(dms) == 1
+    assert cmd("恢復 爸爸", "U_KID").text == "爸媽健康：爸爸自己暫停的，要爸爸本人打 /健康 恢復"
+    # 管理者用 SQL 暫停的，本人再打暫停也改成本人暫停的
+    _sql_pause(G, "媽媽", "admin")
+    assert cmd("暫停", "U_MOM").text.endswith("之後只有媽媽本人能恢復")
+    assert db.consent_states(G)["媽媽"]["changed_by"] == "U_MOM" and len(dms) == 1
+
+
+def test_unknown_pauser_is_parent_only(family_group, dms):
+    cmd("", "U_KID")
+    reply = cmd("暫停 爸爸", "U_STRANGER")  # 別名檔裡沒有的帳號也能幫忙暫停（停下來是安全的方向）
+    assert reply.text.endswith("要恢復，請爸爸本人打 /健康 恢復")
+    assert len(dms) == 1 and "要恢復，請爸爸本人打 /健康 恢復" in dms[0]
+    assert "已暫停記錄（要恢復請爸爸本人打 /健康 恢復）" in body_lines(assert_card_ok(cmd("", "U_KID")))
+    assert cmd("恢復 爸爸", "U_KID").text == "爸媽健康：要爸爸本人打 /健康 恢復 才會記錄"
+    assert db.consent_states(G)["爸爸"]["status"] == "paused"
+
+
+def test_on_rows_mark_self_consent_only_when_changed_by_equals_user_id(family_group, family, monkeypatch):
+    """不變式（ROLLBACK §4 靠它）：on 列的 changed_by＝user_id ⇔ 爸媽本人自己同意。"""
+    cmd("", "U_KID")  # 預設列
+    family({"U_DAD": "爸爸", "U_MOM2": "媽媽", "U_KID": "成員甲"})
+    cmd("", "U_KID")  # 換帳號：預設列改成新帳號
+    cmd("暫停 爸爸", "U_KID")
+    cmd("恢復 爸爸", "U_MOM2")  # 另一位家長恢復
+    rows = db.consent_states(G)
+    assert (rows["爸爸"]["changed_by"], rows["媽媽"]["changed_by"]) == ("U_MOM2", "default")
+    cmd("暫停 媽媽", "U_KID")
+    cmd("恢復 媽媽", "U_KID")  # 家人恢復
+    monkeypatch.setattr(db.settings, "family_group_id", "")
+    ph.handle_command(G2, "U_DAD", "恢復", message_id="s1", now=NOW)  # 其他群組：本人同意
+    self_rows = {(g, r) for g in (G, G2) for r, row in db.consent_states(g).items()
+                 if row["status"] == "on" and row["changed_by"] == row["user_id"]}
+    not_self = {(g, r) for g in (G, G2) for r, row in db.consent_states(g).items()
+                if row["status"] == "on" and row["changed_by"] != row["user_id"]}  # ROLLBACK §4 的條件
+    assert self_rows == {(G2, "爸爸")}
+    assert not_self == {(G, "爸爸"), (G, "媽媽")}
+
+
+def test_parent_tapping_old_resume_hears_about_the_other_parent(family_group, dms):
+    cmd("", "U_KID")
+    cmd("暫停 媽媽", "U_KID")
+    reply = cmd("恢復", "U_DAD")  # 舊卡片的 ▶️：爸爸自己在記錄中
+    assert_text_ok(reply.text)
+    assert reply.text == (
+        "爸媽健康：爸爸的健康紀錄正在記錄，不用按。要暫停打 /健康 暫停；媽媽已暫停記錄（要恢復：打 /健康 恢復 媽媽）"
+    )
+    assert db.consent_states(G)["媽媽"]["status"] == "paused"
+
+
+def test_family_tapping_an_old_record_button_hears_who_is_not_recorded(family_group):
+    cmd("", "U_KID")
+    cmd("暫停 爸爸", "U_KID")
+    reply = cmd("吃藥了", "U_KID")
+    assert_text_ok(reply.text)
+    assert reply.text == f"{ph._AUTO_RECORD_TEXT}。爸爸已暫停記錄（要恢復：打 /健康 恢復 爸爸）"
+
+
+def test_pause_by_an_old_account_outside_the_family_group(family, dms):
+    # 其他群組：帳號換過之後舊帳號打「暫停 爸爸」——當成家人通知 Andrew，但列上是本人同意的帳號，只有本人能恢復
+    consent("爸爸", "U_DAD")
+    family({"U_DAD2": "爸爸", "U_MOM": "媽媽", "U_KID": "成員甲"})
+    reply = cmd("暫停 爸爸", "U_DAD")
+    assert reply.text.endswith("要恢復，請爸爸本人打 /健康 恢復") and len(dms) == 1
+    assert cmd("恢復 爸爸", "U_KID").text == "爸媽健康：爸爸自己暫停的，要爸爸本人打 /健康 恢復"
+
+
+def test_main_help_teaches_typing_not_tapping():
+    section = main._HELP_TEXT[main._HELP_TEXT.index("【爸媽健康】"):main._HELP_TEXT.index("【民調】")]
+    assert "/健康 暫停 爸爸" in section and "/健康 恢復 爸爸" in section and "不用按" in section
+    for retired in ("/健康 吃藥了", "/健康 有運動", "/健康 同意", "本人按"):
+        assert retired not in section

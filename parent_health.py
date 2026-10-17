@@ -1,9 +1,11 @@
 """爸媽健康（/健康，2026-10-11）：從群組留言整理爸媽的用藥、看診、運動、睡眠、飲食、身體狀況。
 
-Andrew 2026-10-11 選全 A；2026-10-17 改成「健康預設同意紀錄，不需要再有我同意紀錄的設計」：
+Andrew 2026-10-11 選全 A；2026-10-17 改成「健康預設同意紀錄，不需要再有我同意紀錄的設計」，
+同一天又說「不要任何本人按鍵的功能（ex:我吃藥了，我有運動），因為他們不會去按」：
 家族主群（FAMILY_GROUP_ID）預設就記錄爸媽（第一次看到時自動寫 on 同意列，changed_by='default'），
-其他群組照舊要本人打 /健康 恢復。誰都能叫出卡片、誰都能幫忙暫停，恢復只能本人；
-來源是爸媽自己說的、兄弟姊妹提到爸媽的（標明誰說的）、卡片上的一鍵記錄（只記按的人自己）；
+其他群組照舊要本人打 /健康 恢復。誰都能叫出卡片、誰都能幫忙暫停；家人暫停的家人也能恢復
+（/健康 恢復 爸爸），爸媽自己暫停的只有本人能恢復。卡片上沒有要爸媽本人按的按鈕；
+來源是爸媽自己說的、兄弟姊妹提到爸媽的（標明誰說的），舊卡片上的「我吃藥了／我有運動」本人按了照樣記；
 健康卡＋週日週報一段＋異常私訊 Andrew；記錄中的家長提到胸痛、跌倒這類緊急狀況，群組回就醫／119
 提醒並私訊 Andrew。
 
@@ -11,6 +13,8 @@ Andrew 2026-10-11 選全 A；2026-10-17 改成「健康預設同意紀錄，不�
 - 卡片與文字只由固定詞表、數字、日期組成，沒有留言原文；卡片 altText 固定、不含資料（存檔只留 altText）。
 - 角色只認本機別名檔與角色檔（不用 LINE 顯示名稱）；同意列只在「現在解析到的帳號＝列上的帳號」時有效
   （家族主群的預設列在帳號換人時自動改成新帳號，on_since 照舊）。
+- 不變式：on 列的 changed_by＝user_id ⇔ 爸媽本人自己同意（預設列是 'default'、家人恢復的是家人帳號）；
+  ROLLBACK §4 要改回本人同意時，靠這條選出非本人同意的列。
 - main／weekly_summary 只 import 這個模組；公開函式都不丟例外（出錯回安全值，log 只記 error_type）。
 - import 時不建表、不起執行緒或 executor、不讀檔；背景工作第一次用到才建，conftest 會把
   _BACKGROUND_ENABLED 關掉。
@@ -26,7 +30,7 @@ import threading
 import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -83,7 +87,7 @@ FAILURE_TEXT = "爸媽健康：暫時無法回覆，請稍後再試"
 QUOTE_NOTICE = "爸媽健康：卡片上是從群組留言整理的紀錄，咪寶不會判讀或診斷。"
 WEEKLY_MARKER = "🩺 爸媽這週"
 
-# 卡片按鈕送出的文字（只加不刪：舊卡片永遠點得到）。
+# 卡片按鈕送出的文字（只加不刪：舊卡片永遠點得到）。吃藥了、有運動、恢復、同意 10/17 起新卡片不再出現。
 SHIPPED_HEALTH_BUTTON_TEXTS: tuple[str, ...] = (
     "/健康",
     "/健康 爸爸",
@@ -116,17 +120,20 @@ _RECORDING_EXPLANATION = (
 )
 _HELP_TEXT = (
     "爸媽健康：怎麼用\n"
+    "不用按按鈕：爸爸、媽媽在群組說吃藥了、去散步了、血壓 135/85，咪寶會自動記下\n"
     "看爸媽近 7 天的整理卡：打 /健康\n"
     "看近 14 天的細節：打 /健康 爸爸 或 /健康 媽媽\n"
-    "暫停記錄：本人打 /健康 暫停（家人也可以打 /健康 暫停 爸爸、/健康 暫停 媽媽）\n"
-    "恢復記錄：本人打 /健康 恢復\n"
-    "記一筆今天：本人打 /健康 吃藥了 或 /健康 有運動\n"
+    "暫停記錄：打 /健康 暫停 爸爸 或 /健康 暫停 媽媽（爸媽本人打 /健康 暫停 也可以）\n"
+    "恢復記錄：打 /健康 恢復 爸爸 或 /健康 恢復 媽媽（爸媽自己暫停的，要本人打 /健康 恢復）\n"
     "記錯了：長按那則留言→回覆→打 /健康 刪除\n"
     "刪掉自己的全部紀錄：本人打 /健康 刪除我的紀錄\n"
     f"{_RECORDING_EXPLANATION}\n"
     "咪寶只記錄、不診斷。"
 )
 _CARD_NOTE = "從群組留言整理，只記錄、不診斷"
+# 舊卡片上的「我吃藥了／我有運動」（10/17 起新卡片不再有）
+_AUTO_RECORD_TEXT = "爸媽健康：不用按了，爸爸、媽媽在群組說吃藥了、去散步了，或家人說爸爸吃藥了，咪寶就會自動記下"
+_RECORDED_TEXT = "爸媽健康：記下了。以後在群組說吃藥了、去散步了也會自動記，不用按"
 
 # 紀錄標籤（parent_health_extract.ALLOWED_ITEMS 裡的固定詞；測試確認都在詞表裡）
 _MED_TAKEN = "吃藥"
@@ -179,7 +186,7 @@ class RedFlagDecision:
 
 @dataclass(frozen=True)
 class _Record:
-    """一鍵記錄用（和 parent_health_extract.Finding 欄位相同）。"""
+    """舊卡片的一鍵記錄用（和 parent_health_extract.Finding 欄位相同）。"""
 
     role: str
     category: str
@@ -454,11 +461,55 @@ def _context(group_id: str, now: float, db_path=None, *, ensure_default: bool = 
     return _Ctx(group_id, now, _today(now), roles, consents, _states(roles, consents), db_path)
 
 
-def _state_line(role: str, state: str) -> str:
+_SELF, _PARENT_ONLY, _BY_FAMILY = "self", "parent", "family"
+
+
+def _known_member(user_id: str) -> bool:
+    """本機別名檔裡有的帳號（家人，含爸媽）；讀不到就當成不認得。"""
+    try:
+        import line_mentions
+
+        return bool(user_id) and bool(line_mentions.alias_for_user_id(user_id))
+    except Exception:
+        return False
+
+
+def _resume_rule(ctx: _Ctx, role: str) -> str:
+    """暫停中的 role 誰能恢復（Andrew 10/17「不要任何本人按鍵的功能」：家人暫停的不能只靠爸媽恢復）：
+    - "self"：爸媽自己暫停的（changed_by＝列上的帳號或現在解析到的帳號），只有本人能恢復；
+    - "family"：家族主群裡，認得出的家人（別名檔裡有的帳號，含另一位家長）或沒帶帳號的事件暫停的，
+      認得出的家人也能恢復；
+    - "parent"：其他一律只有本人能恢復——家族主群以外（只有本人的指令會寫 on 列）、管理者用 SQL 暫停的
+      （'admin' 或任何不是帳號的字）、別名檔裡沒有的帳號暫停的。
+    家族主群沒有列時暫停，列上的帳號是空的（set_consent：暫停不等於同意），只能比現在的帳號。"""
+    row = ctx.consents.get(role) or {}
+    by = str(row.get("changed_by") or "")
+    if by and by in {str(row.get("user_id") or ""), str(ctx.roles.get(role) or "")} - {""}:
+        return _SELF
+    if not _default_on(ctx.group_id):
+        return _PARENT_ONLY
+    if not by or _known_member(by):
+        return _BY_FAMILY
+    return _PARENT_ONLY
+
+
+def _resume_hint(ctx: _Ctx, role: str) -> str:
+    rule = _resume_rule(ctx, role)
+    if rule == _SELF:
+        return f"{role}自己暫停的，要恢復請{role}本人打 /健康 恢復"
+    if rule == _PARENT_ONLY:
+        return f"要恢復請{role}本人打 /健康 恢復"
+    return f"要恢復：打 /健康 恢復 {role}"
+
+
+def _state_line(ctx: _Ctx, role: str) -> str:
+    state = ctx.states[role]
     if state == _PAUSED:
-        return f"已暫停記錄（要恢復：{role}本人打 /健康 恢復）"
+        return f"已暫停記錄（{_resume_hint(ctx, role)}）"
     if state == _UNSET:
         return "還沒設定帳號"
+    if _default_on(ctx.group_id):  # 任何人的下一則留言或 /健康 指令都會寫下預設列
+        return "還沒開始記錄（下一則群組留言就會自動開始）"
     return f"還沒開始記錄（要{role}本人打 /健康 恢復）"
 
 
@@ -1007,7 +1058,7 @@ def _overview(ctx: _Ctx) -> CommandReply:
         body.append(_text(role, size="xl", weight="bold"))
         state = ctx.states[role]
         if state != _ON:
-            body.append(_text(_state_line(role, state), color=_GRAY))
+            body.append(_text(_state_line(ctx, role), color=_GRAY))
             continue
         summaries[role] = summary = _summary(ctx, role)
         body += [_text(line) for line in _overview_rows(summary, [v for v in visits if v.role == role])]
@@ -1015,11 +1066,8 @@ def _overview(ctx: _Ctx) -> CommandReply:
     if tip:
         body += [_separator(), _text(tip, weight="bold", color=_TIP_COLOR)]
     on_roles = [role for role in PARENTS if ctx.states[role] == _ON]
+    # 沒有要爸媽本人按的按鈕（Andrew 10/17：「他們不會去按」）
     footer = [_button(f"看{role}細節", f"/健康 {role}") for role in on_roles]
-    if on_roles:
-        footer += [_button("💊 我吃藥了", "/健康 吃藥了"), _button("🚶 我有運動", "/健康 有運動")]
-    if any(ctx.states[role] in (_NONE, _PAUSED, _RECONSENT) for role in PARENTS):
-        footer.append(_button("▶️ 恢復記錄", "/健康 恢復"))
     footer += [_button("📖 怎麼用", "/健康 說明"), _text(_CARD_NOTE, size="md", color=_GRAY)]
     subtitle = f"近 7 天（{_md(ctx.today - timedelta(days=6))}–{_md(ctx.today)}）"
     return _card_reply(_OVERVIEW_ALT, _bubble("爸媽健康", subtitle, body, footer))
@@ -1079,10 +1127,10 @@ def _detail(ctx: _Ctx, role: str) -> CommandReply:
         lines = _detail_lines(rows, ctx.consents[role]["user_id"])
         body = [_text(line) for line in lines] or [_text("近 14 天沒有紀錄")]
     else:
-        body = [_text(_state_line(role, state), color=_GRAY)]
+        body = [_text(_state_line(ctx, role), color=_GRAY)]
     footer = [
         _text("記錯了：長按那則留言→回覆→打 /健康 刪除", size="md", color=_GRAY),
-        _text(f"要暫停：{role}本人打 /健康 暫停", size="md", color=_GRAY),
+        _text(f"要暫停：打 /健康 暫停 {role}", size="md", color=_GRAY),
         _text(_CARD_NOTE, size="md", color=_GRAY),
         _button("回爸媽健康卡", "/健康"),
     ]
@@ -1100,6 +1148,8 @@ def _parse_command(body: str) -> tuple[str, str | None]:
         return "detail", compact
     if compact in ("恢復", "同意"):  # 「同意」是 10/17 前舊卡片上的按鈕
         return "resume", None
+    if compact.startswith("恢復") and compact[2:] in PARENTS:  # 家人恢復家人暫停的
+        return "resume", compact[2:]
     if compact == "暫停":
         return "pause_self", None
     if compact.startswith("暫停") and compact[2:] in PARENTS:
@@ -1110,32 +1160,24 @@ def _parse_command(body: str) -> tuple[str, str | None]:
         return "delete_quoted", None
     if compact == "刪除我的紀錄":
         return "delete_mine", None
-    return "help", None  # 說明、「恢復 爸爸」（不能替別人恢復）、其他
+    return "help", None  # 說明、「同意 爸爸」、其他
 
 
 def _reply(text: str) -> CommandReply:
     return CommandReply(text=text)
 
 
-def _resume(ctx: _Ctx, user_id: str | None) -> CommandReply:
-    """「/健康 恢復」（舊卡片的「/健康 同意」也走這裡）：本人恢復自己的紀錄。家族主群預設就在記錄，
-    只有暫停過的才要恢復；其他群組要本人打這個才開始記錄。"""
+def _resume(ctx: _Ctx, user_id: str | None, target: str | None) -> CommandReply:
+    """「/健康 恢復」（舊卡片的「/健康 同意」也走這裡）：本人恢復自己的紀錄；「/健康 恢復 爸爸」：家人恢復
+    家人暫停的（_resume_rule）。家族主群預設就在記錄，只有暫停過的才要恢復；其他群組要本人打這個才開始記錄。"""
     role = _role_from(ctx.roles, user_id)
+    if target is not None and target != role:
+        return _resume_for(ctx, target, user_id)
     if role == FAMILY:
-        unset = [r for r in PARENTS if ctx.roles.get(r) is None]
-        if unset:
-            logger.warning(
-                "parent health resume attempted with role not configured roles=%s",
-                ",".join(_ROLE_LOG[r] for r in unset),
-            )
-            names = "、".join(unset)
-            return _reply(f"爸媽健康：還沒設定{names}是哪個 LINE 帳號，設定好才能記錄")
-        stopped = [r for r in PARENTS if ctx.states[r] != _ON]
-        if stopped:
-            return _reply(f"爸媽健康：要{'、'.join(stopped)}本人打 /健康 恢復 才會記錄")
-        return _reply("爸媽健康：爸爸、媽媽的健康紀錄都在記錄中，不用按")
+        return _family_resume_hint(ctx)
     if ctx.states[role] == _ON:  # 重按不重設開始時間（分母、17 天門檻照舊）
-        return _reply(f"爸媽健康：{role}的健康紀錄正在記錄，不用按。要暫停打 /健康 暫停")
+        others = "".join(f"；{r}{_state_line(ctx, r)}" for r in PARENTS if r != role and ctx.states[r] == _PAUSED)
+        return _reply(f"爸媽健康：{role}的健康紀錄正在記錄，不用按。要暫停打 /健康 暫停{others}")
     parent_health_db.set_consent(
         ctx.group_id, role, "on", user_id=user_id, changed_by=user_id, now=ctx.now, db_path=ctx.db_path
     )
@@ -1145,37 +1187,103 @@ def _resume(ctx: _Ctx, user_id: str | None) -> CommandReply:
     )
 
 
+def _family_resume_hint(ctx: _Ctx) -> CommandReply:
+    """家人打 /健康 恢復（沒指定誰）：說清楚能恢復誰、怎麼打；不替任何人恢復、不寫入。"""
+    paused = [r for r in PARENTS if ctx.states[r] == _PAUSED]
+    family_ok = [r for r in paused if _resume_rule(ctx, r) == _BY_FAMILY]
+    if len(family_ok) == 1:
+        return _reply(f"爸媽健康：要恢復{family_ok[0]}：打 /健康 恢復 {family_ok[0]}")
+    if family_ok:
+        return _reply("爸媽健康：要恢復誰？打 /健康 恢復 爸爸 或 /健康 恢復 媽媽")
+    if paused:
+        return _reply("爸媽健康：" + "；".join(f"{r}{_state_line(ctx, r)}" for r in paused))
+    unset = [r for r in PARENTS if ctx.roles.get(r) is None]
+    if unset:
+        logger.warning(
+            "parent health resume attempted with role not configured roles=%s",
+            ",".join(_ROLE_LOG[r] for r in unset),
+        )
+        return _reply(f"爸媽健康：還沒設定{'、'.join(unset)}是哪個 LINE 帳號，設定好才能記錄")
+    stopped = [r for r in PARENTS if ctx.states[r] != _ON]
+    if not stopped:
+        return _reply("爸媽健康：爸爸、媽媽的健康紀錄都在記錄中，不用按")
+    if _default_on(ctx.group_id):
+        return _reply(f"爸媽健康：{'、'.join(stopped)}的紀錄會從下一則群組留言自動開始")
+    return _reply(f"爸媽健康：要{'、'.join(stopped)}本人打 /健康 恢復 才會記錄")
+
+
+def _resume_for(ctx: _Ctx, role: str, user_id: str | None) -> CommandReply:
+    """家人（或另一位家長、沒帶帳號的事件）恢復 role：只恢復 _resume_rule＝family 的；其他都不替他做。"""
+    state = ctx.states[role]
+    if state == _ON:
+        return _reply(f"爸媽健康：{role}的健康紀錄正在記錄，不用打")
+    if state == _UNSET:
+        return _reply(f"爸媽健康：還沒設定{role}是哪個 LINE 帳號，設定好才能記錄")
+    if state != _PAUSED:
+        if _default_on(ctx.group_id):
+            return _reply(f"爸媽健康：{role}的紀錄會從下一則群組留言自動開始")
+        return _reply(f"爸媽健康：要{role}本人打 /健康 恢復 才會記錄")
+    rule = _resume_rule(ctx, role)
+    if rule == _SELF:
+        return _reply(f"爸媽健康：{role}自己暫停的，要{role}本人打 /健康 恢復")
+    if rule == _PARENT_ONLY:
+        return _reply(f"爸媽健康：要{role}本人打 /健康 恢復 才會記錄")
+    # 停下來誰都能做；重新開始記錄要認得出是誰（沒帶帳號、別名檔裡沒有的都不行）
+    if not user_id:
+        return _reply(f"爸媽健康：看不出是誰打的，請用手機 LINE 再打一次 /健康 恢復 {role}")
+    if not _known_member(user_id):
+        return _reply(f"爸媽健康：要{role}本人或家人打 /健康 恢復 {role} 才會恢復")
+    parent_health_db.set_consent(
+        ctx.group_id, role, "on", user_id=ctx.roles[role], changed_by=user_id, now=ctx.now, db_path=ctx.db_path
+    )
+    _send_dm_background(f"🩺 爸媽健康：{role}的健康紀錄被家人恢復了（{_hhmm(ctx.now)}），群組 119 提醒也一起恢復。")
+    return _reply(f"爸媽健康：已恢復記錄{role}的健康留言（從現在開始，暫停期間的留言不補記）。要暫停：打 /健康 暫停 {role}")
+
+
 def _pause(ctx: _Ctx, role: str, user_id: str | None) -> CommandReply:
     row = ctx.consents.get(role)
     # 家族主群預設在記錄：還沒有同意列（例如預設列寫失敗）也直接寫成暫停
     if row is None and not _default_on(ctx.group_id):
         return _reply(f"爸媽健康：{role}還沒開始記錄，不用暫停")
     if row is not None and row.get("status") != "on":
+        if _role_from(ctx.roles, user_id) == role and _resume_rule(ctx, role) != _SELF:
+            # 家人先暫停、本人再打暫停：改成本人自己暫停的，之後只有本人能恢復（不私訊：本人的動作）
+            parent_health_db.set_consent(
+                ctx.group_id, role, "paused", user_id=row.get("user_id") or "", changed_by=user_id,
+                now=ctx.now, db_path=ctx.db_path,
+            )
+            return _reply(f"爸媽健康：{role}的健康紀錄已經暫停了；現在改成{role}自己暫停的，之後只有{role}本人能恢復")
         return _reply(f"爸媽健康：{role}的健康紀錄已經暫停了")
     parent_health_db.set_consent(
         ctx.group_id, role, "paused", user_id=(row or {}).get("user_id") or "", changed_by=user_id or "",
         now=ctx.now, db_path=ctx.db_path,
     )
+    # 寫完的暫停列（照 set_consent：帳號、on_since 保留，沒有列時帳號是空的）決定誰能恢復
+    paused_row = {**(row or {"user_id": "", "on_since": 0}), "status": "paused", "changed_by": user_id or ""}
+    consents = {**ctx.consents, role: paused_row}
+    after = replace(ctx, consents=consents, states=_states(ctx.roles, consents))
+    if _resume_rule(after, role) == _BY_FAMILY:
+        how = f"要恢復：打 /健康 恢復 {role}"
+    else:
+        how = f"要恢復，請{role}本人打 /健康 恢復"
     if _role_from(ctx.roles, user_id) != role:  # 別人幫忙暫停：119 提醒也停了，私訊 Andrew
         _send_dm_background(
-            f"🩺 爸媽健康：{role}的健康紀錄被家人暫停了（{_hhmm(ctx.now)}），群組 119 提醒也一起停；"
-            f"要恢復要{role}本人打 /健康 恢復。"
+            f"🩺 爸媽健康：{role}的健康紀錄被家人暫停了（{_hhmm(ctx.now)}），群組 119 提醒也一起停；{how}。"
         )
     return _reply(
-        f"爸媽健康：已暫停{role}的健康紀錄，卡片、週報段落、私訊和 119 提醒也一起停；已記的紀錄保留。"
-        f"要恢復，請{role}本人打 /健康 恢復"
+        f"爸媽健康：已暫停{role}的健康紀錄，卡片、週報段落、私訊和 119 提醒也一起停；已記的紀錄保留。{how}"
     )
 
 
 def _record(ctx: _Ctx, user_id: str | None, key: str, message_id: str) -> CommandReply:
+    """舊卡片上的「我吃藥了／我有運動」（10/17 起新卡片不再有）：爸媽本人按了照樣記一筆（指令不進留言抽取，
+    不記就丟了）；家人按回固定句。"""
     role = _role_from(ctx.roles, user_id)
-    if role == FAMILY:
-        return _reply("爸媽健康：這個按鈕只記按的人自己，要爸爸或媽媽本人按")
-    state = ctx.states[role]
-    if state == _PAUSED:
-        return _reply(f"爸媽健康：{role}的紀錄暫停中，要恢復請{role}本人打 /健康 恢復")
-    if state != _ON:
-        return _reply(f"爸媽健康：{role}還沒開始記錄，要{role}本人打 /健康 恢復")
+    if role == FAMILY:  # 有家長不在記錄中，順便說一聲（不然「就會自動記下」不準）
+        notes = "；".join(f"{r}{_state_line(ctx, r)}" for r in PARENTS if ctx.states[r] != _ON)
+        return _reply(f"{_AUTO_RECORD_TEXT}。{notes}" if notes else _AUTO_RECORD_TEXT)
+    if ctx.states[role] != _ON:
+        return _reply(f"爸媽健康：{role}{_state_line(ctx, role)}")
     category, item = _BUTTON_RECORDS[key]
     if not parent_health_db.is_allowed(category, item):
         logger.error("parent health button item not in vocabulary")
@@ -1190,7 +1298,7 @@ def _record(ctx: _Ctx, user_id: str | None, key: str, message_id: str) -> Comman
         now=ctx.now,
         db_path=ctx.db_path,
     )
-    return _reply("爸媽健康：記下了" if written else "爸媽健康：這一筆已經記過了")
+    return _reply(_RECORDED_TEXT if written else "爸媽健康：這一筆已經記過了")
 
 
 def _delete_quoted(ctx: _Ctx, quoted_message_id: str | None) -> CommandReply:
@@ -1237,7 +1345,7 @@ def handle_command(
         if command == "detail":
             return _detail(ctx, arg)
         if command == "resume":
-            return _resume(ctx, user_id)
+            return _resume(ctx, user_id, arg)
         if command == "pause_self":
             role = _role_from(ctx.roles, user_id)
             if role == FAMILY:
