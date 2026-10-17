@@ -122,6 +122,10 @@ class FakeNet:
             for code in OTC_CODES
         ]
         self.charts.update({f"{code}.TWO": _chart(CAL[:-1], [50.0] * (len(CAL) - 1)) for code in OTC_CODES[:3]})
+        # 證交所大盤（本月每個交易日；預設和 ^TWII 一樣平盤 20000，Yahoo 預設有 T 所以不會抓）
+        self.fmtqik = [
+            {"Date": _roc(d), "TAIEX": "20000.00", "Change": "0.00"} for d in CAL if (d.year, d.month) == (T.year, T.month)
+        ]
         self.overrides: dict = {}
         self.limits: list = []  # (端點, 單次讀取 timeout, 總時間)
 
@@ -153,6 +157,8 @@ class FakeNet:
             return 200, self.t86.get(params["date"], {"stat": "很抱歉，沒有符合條件的資料!"}), None
         if key == "tpex_mainboard_daily_close_quotes":
             return 200, self.otc, None
+        if key == "FMTQIK":
+            return 200, self.fmtqik, None
         raise AssertionError(f"unexpected fetch {host}{path}")
 
     def count(self, name: str) -> int:
@@ -590,7 +596,7 @@ def test_worker_state_round_trip_and_corrupt_file_backs_off():
     (sp.STATE_DIR / sp.WORKER_NAME).write_text("[]")
     before = time.time()
     loaded = sp.load_worker_file()
-    assert loaded.next_try >= before + sp.BACKOFF_S[-1] - 1 and loaded.last_fail == "state_corrupt"
+    assert loaded.next_try >= before + sp.STATE_CORRUPT_BACKOFF_S - 1 and loaded.last_fail == "state_corrupt"
 
 
 # ── T86 請求帳 ─────────────────────────────────────────────────────────────
@@ -611,7 +617,7 @@ def test_t86_budget_is_reserved_before_sending_and_merged_across_processes(net):
     assert len(on_disk.t86_requests) == sp.T86_DAILY_CAP  # 送出前已經記帳（含別的程序那一次）
     with pytest.raises(sp.RoundFailed) as info:
         sp._t86_day(CAL[-2], stop, time.monotonic() + 60)
-    assert info.value.kind == "t86_budget"
+    assert info.value.kind == "t86_budget" and info.value.retry_s == 3600
     assert net.count("T86") == 1
 
 
@@ -648,10 +654,13 @@ def test_refresh_end_to_end(net):
 @pytest.mark.parametrize(
     "breakage, kind",
     [
-        (lambda n: n.pe.__setitem__(0, {**n.pe[0], "Date": _roc(PREV)}), "pe_not_t"),
-        (lambda n: n.charts.__setitem__("^TWII", _chart(CAL[:-1], [1.0] * 299)), "twii_not_t"),
+        (lambda n: n.pe.__setitem__(0, {**n.pe[0], "Date": _roc(PREV)}), "pe_bad"),  # 日期不唯一：真的錯誤
+        (lambda n: setattr(n, "pe", [{**row, "Date": _roc(PREV)} for row in n.pe]), "pe_not_t"),
+        (lambda n: (n.charts.__setitem__("^TWII", _chart(CAL[:-1], [20000.0] * 299)), n.fmtqik.pop()), "index_not_t"),
+        (lambda n: n.charts.__setitem__("^TWII", _chart(CAL[:-1], [1.0] * 299)), "index_mismatch"),
         (lambda n: n.charts.__setitem__("^TWII", _chart(CAL[-100:], [1.0] * 100)), "twii_short"),
-        (lambda n: n.t86.pop(CAL[-3].strftime("%Y%m%d")), "t86_not_yet"),
+        (lambda n: n.t86.pop(CAL[-3].strftime("%Y%m%d")), "t86_gap"),  # 早於 T 的日子缺：不會自己好
+        (lambda n: n.t86.pop(CAL[-1].strftime("%Y%m%d")), "t86_not_yet"),
         (lambda n: n.companies.__setitem__(slice(None), n.companies[:100]), "batch_short"),
         (lambda n: [n.charts.pop(f"{c}.TW") for c in STOCKS[:11]], "too_many_gray"),
         (lambda n: n.overrides.__setitem__("BWIBBU_ALL", sp.FetchError("moved")), "batch_moved"),
@@ -717,7 +726,7 @@ def test_failed_recompute_retries_without_if_modified_since(net, monkeypatch):
 
     def failing(t, rows, stop_event, *, now=None):
         calls.append(t)
-        raise sp.RoundFailed("t86_not_yet")
+        raise sp.RoundFailed("batch_status")
 
     monkeypatch.setattr(sp, "refresh", failing)
     assert sp._tick(stop) == sp.BACKOFF_S[0]
@@ -732,9 +741,9 @@ def test_failed_recompute_retries_without_if_modified_since(net, monkeypatch):
     assert calls == [new_t, new_t]
 
 
-def test_blocked_failures_back_off_two_hours(net):
+def test_twse_blocked_failures_wait_one_hour(net):
     net.overrides["STOCK_DAY_ALL"] = sp.FetchError("blocked")
-    assert sp._tick(threading.Event()) == sp.BLOCKED_BACKOFF_S
+    assert sp._tick(threading.Event()) == sp.TWSE_BLOCKED_RETRY_S == 3600
     assert sp._worker.first_round_failed is True
 
 
@@ -955,11 +964,11 @@ def test_corrupt_ledger_in_running_process_backs_off_and_is_repaired(net):
     assert info.value.kind == "state_corrupt"
     assert net.count("T86") == 0
     repaired = sp.load_worker_file()
-    assert repaired.next_try >= before + sp.BACKOFF_S[-1] - 1 and repaired.last_fail == "state_corrupt"
+    assert repaired.next_try >= before + sp.STATE_CORRUPT_BACKOFF_S - 1 and repaired.last_fail == "state_corrupt"
 
 
 def test_other_process_cooldown_is_respected_but_own_cleared_backoff_is_not_revived(net):
-    other = sp.WorkerState(next_try=time.time() + 7200, last_fail="t86_blocked", writer="other-process")
+    other = sp.WorkerState(next_try=time.time() + 3000, last_fail="t86_blocked", writer="other-process")
     sp.STATE_DIR.mkdir(parents=True)
     sp._write_json_file(sp.STATE_DIR / sp.WORKER_NAME, sp.worker_state_to_json(other))
     with pytest.raises(sp.RoundFailed) as info:
@@ -1010,7 +1019,7 @@ def test_failed_recompute_then_success_clears_failure(net, monkeypatch):
     new_t = T + timedelta(days=1)
     net.day_rows = [{**row, "Date": _roc(new_t)} for row in net.day_rows]
     old = sp._snapshot
-    outcomes = [sp.RoundFailed("t86_not_yet"), sp.Snapshot(**{**old.__dict__, "t": new_t, "calendar": old.calendar[1:] + (new_t,)})]
+    outcomes = [sp.RoundFailed("batch_status"), sp.Snapshot(**{**old.__dict__, "t": new_t, "calendar": old.calendar[1:] + (new_t,)})]
 
     def scripted(*_a, **_k):
         item = outcomes.pop(0)
@@ -1163,10 +1172,13 @@ def test_stop_mid_round_is_not_a_failure(net, monkeypatch):
 def test_up_to_date_check_resets_failures_and_seen_at_only_moves_forward(net):
     stop = threading.Event()
     assert sp._tick(stop) == sp.POLL_S
-    sp._worker.fail_count, sp._worker.last_fail = 3, "day_timeout"
+    sp._worker.last_wait = "pe_not_t"
+    sp._tick(stop)  # 證交所回 T、沒有待重算：追上了，等待一起清
+    assert sp._worker.last_wait == ""
+    sp._worker.fail_count, sp._worker.last_fail, sp._worker.last_wait = 3, "day_timeout", "pe_not_t"
     net.overrides["STOCK_DAY_ALL"] = (304, None, None)
     sp._tick(stop)
-    assert sp._worker.fail_count == 0 and sp._worker.last_fail == ""
+    assert sp._worker.fail_count == 0 and sp._worker.last_fail == "" and sp._worker.last_wait == ""
     del net.overrides["STOCK_DAY_ALL"]
     sp._worker.seen_t, sp._worker.seen_at = T + timedelta(days=1), 123.0
     sp._tick(stop)  # 證交所又回 T（日期回跳）：不重設首次看到新日期的時間
@@ -1249,8 +1261,8 @@ def test_corrupt_ledger_backoff_is_not_shortened_by_the_round_failure(net):
     before = time.time()
     delay = sp._tick(threading.Event())  # 存檔時發現壞檔：修好、退避 1 小時，這輪不開始重算
     assert sp._worker.last_fail == "state_corrupt"
-    assert sp._worker.next_try >= before + sp.BACKOFF_S[-1] - 1  # 一般失敗的 10 分鐘不能把 1 小時縮短
-    assert delay >= sp.BACKOFF_S[-1] - 5
+    assert sp._worker.next_try >= before + sp.STATE_CORRUPT_BACKOFF_S - 1  # 一般失敗的 10 分鐘不能把 1 小時縮短
+    assert delay >= sp.STATE_CORRUPT_BACKOFF_S - 5
     assert sp.load_worker_file().next_try == pytest.approx(sp._worker.next_try)
 
 
@@ -1360,10 +1372,12 @@ def test_pending_recompute_is_not_cleared_by_an_older_node(net):
     assert sp._tick(stop) == sp.POLL_S
     sp._worker.seen_t, sp._worker.seen_at = T + timedelta(days=1), time.time()
     sp._worker.fail_count, sp._worker.last_fail = 3, "t86_not_yet"
+    sp._worker.last_wait = "pe_not_t"
     sp._worker.last_modified = "Sat, 10 Oct 2026 21:20:43 GMT"
     net.overrides["STOCK_DAY_ALL"] = (200, net.day_rows, "Thu, 08 Oct 2026 21:20:43 GMT")  # 舊節點回 T
     sp._tick(stop)
     assert sp._worker.fail_count == 3 and sp._worker.last_fail == "t86_not_yet"
+    assert sp._worker.last_wait == "pe_not_t"  # 還在等新日期：不能被舊節點清掉
     assert sp._worker.last_modified == "Sat, 10 Oct 2026 21:20:43 GMT"
 
 
@@ -1414,12 +1428,12 @@ def test_other_process_cooldown_stops_the_round_before_any_fetch(net):
     assert sp._tick(stop) == sp.POLL_S
     sp.STATE_DIR.mkdir(parents=True, exist_ok=True)
     disk = sp.load_worker_file()
-    disk.next_try, disk.writer = time.time() + 5000, "other-process"
+    disk.next_try, disk.writer = time.time() + 3000, "other-process"
     sp._write_json_file(sp.STATE_DIR / sp.WORKER_NAME, sp.worker_state_to_json(disk))
     _advance_one_trading_day(net)
     net.calls.clear()
     wait = sp._tick(stop)
-    assert 4900 < wait <= 5000
+    assert 2900 < wait <= 3000
     assert net.count("t187ap03_L") == 0 and net.count("T86") == 0  # 沒開始重算
 
 
@@ -1450,3 +1464,335 @@ def test_status_summary_from_another_process_only_reads(net):
 
 def test_no_trade_sentence_names_the_date():
     assert sp.no_trade_text(T) == "股票評估：這一檔 10/08 沒有成交，查不到收盤"
+
+
+# ── 2026-10-17：Yahoo 還沒有 T 時用證交所補 T 收盤；「還沒出來」與真的錯誤分開重試 ─────────────
+def _ramp(days, start=20000.0, step=10.0) -> dict:
+    return {d: start + step * i for i, d in enumerate(days)}
+
+
+def _index_rows(days, closes, prev_close) -> dict:
+    """證交所 FMTQIK 解析後的樣子：{日期: (收盤, 漲跌)}，漲跌＝收盤−前一個交易日收盤。"""
+    rows, prev = {}, prev_close
+    for d in days:
+        rows[d] = (closes[d], round(closes[d] - prev, 2))
+        prev = closes[d]
+    return rows
+
+
+OCT = [d for d in CAL if (d.year, d.month) == (2026, 10)]  # 10/01–10/08（合成日曆只有平日）
+SEPT = [d for d in CAL if d < date(2026, 10, 1)]
+
+
+def test_splice_mid_month_uses_the_twse_close():
+    closes = _ramp(CAL)
+    bars = {d: closes[d] for d in CAL[:-1]}  # Yahoo 還沒有 T
+    rows = _index_rows(OCT, closes, closes[CAL[CAL.index(OCT[0]) - 1]])
+    close, why, detail = sp.splice_t_close(bars, rows, T)
+    assert close == closes[T] and why == "" and "yahoo_prev=" in detail
+
+
+def test_splice_never_splices_at_a_month_start():
+    """月初沒有獨立證據證明 Yahoo 停在前一個交易日：一律等 Yahoo（2026-10-17 審查第 2 輪）。"""
+    sept = [d for d in CAL if d < date(2026, 10, 1)]
+    closes = _ramp(sept + [date(2026, 10, 1)])
+    rows = _index_rows([date(2026, 10, 1)], closes, closes[sept[-1]])
+    bars = {d: closes[d] for d in sept}
+    assert sp.splice_t_close(bars, rows, date(2026, 10, 1))[:2] == (None, "index_month_start")
+    behind = {d: closes[d] for d in sept[:-1]}  # Yahoo 停在前前一天
+    assert sp.splice_t_close(behind, rows, date(2026, 10, 1))[:2] == (None, "index_month_start")
+
+
+def test_splice_month_start_catches_a_flat_missing_day():
+    """Codex 審查的反例：9/29、9/30 收盤一樣，Yahoo 停在 9/29；只比數值會收下。月初一律不補，所以擋得住。"""
+    sept = [d for d in CAL if d < date(2026, 10, 1)]
+    bars = {d: 20000.0 for d in sept[:-1]}  # Yahoo 少了 9/30
+    rows = {date(2026, 10, 1): (20100.0, 100.0)}  # 9/30 也是 20000
+    assert sp.splice_t_close(bars, rows, date(2026, 10, 1))[:2] == (None, "index_month_start")
+
+
+def test_splice_january_and_an_extra_holiday_bar():
+    dec = _business_days(30, date(2026, 12, 31))
+    t = date(2027, 1, 4)  # 1/1 休市
+    closes = _ramp(dec + [t])
+    rows = _index_rows([t], closes, closes[dec[-1]])
+    bars = {d: closes[d] for d in dec}
+    assert sp.splice_t_close(bars, rows, t)[:2] == (None, "index_month_start")
+    with_holiday = {**bars, date(2027, 1, 1): closes[dec[-1]]}  # Yahoo 在休市日多一根（照抄前一天收盤）
+    assert sp.splice_t_close(with_holiday, rows, t)[1] == "index_gap"
+
+
+@pytest.mark.parametrize(
+    "case, reason",
+    [
+        ("missing_t", "index_not_t"),
+        ("yahoo_two_days_behind_flat", "index_gap"),
+        ("yahoo_extra_bar_mid_month", "index_gap"),
+        ("off_by_0_06", "index_mismatch"),
+        ("jump", "index_jump"),
+    ],
+)
+def test_splice_rejects(case, reason):
+    closes = {d: 20000.0 for d in CAL}  # 平盤：只能靠日期擋
+    bars = {d: closes[d] for d in CAL[:-1]}
+    rows = _index_rows(OCT, closes, 20000.0)
+    if case == "missing_t":
+        rows.pop(T)
+    elif case == "yahoo_two_days_behind_flat":
+        bars.pop(CAL[-2])
+    elif case == "yahoo_extra_bar_mid_month":
+        bars[date(2026, 10, 3)] = 20000.0  # 週六
+    elif case == "off_by_0_06":
+        bars[CAL[-2]] = 20000.06
+    elif case == "jump":
+        rows[T] = (20000.0 * 1.13 + 0.0, 20000.0 * 0.13)
+        bars[CAL[-2]] = 20000.0
+    assert sp.splice_t_close(bars, rows, T)[:2] == (None, reason)
+
+
+def test_splice_tolerates_float_noise_and_rows_after_t():
+    closes = {d: 20000.0 for d in CAL}
+    bars = {d: closes[d] for d in CAL[:-1]}
+    bars[CAL[-2]] = 20000.04  # Yahoo 的 float 表示法誤差（實測 ≤ 0.002）
+    rows = _index_rows(OCT, closes, 20000.0)
+    rows[T + timedelta(days=1)] = (20100.0, 100.0)  # 晚於 T 的列不影響
+    assert sp.splice_t_close(bars, rows, T)[0] == 20000.0
+
+
+def test_parse_fmtqik_drops_bad_and_conflicting_rows():
+    rows = [
+        {"Date": "1151001", "TAIEX": "48,353.49", "Change": "413.36"},
+        {"Date": "1151002", "TAIEX": "48475.74", "Change": "+122.25"},
+        {"Date": "1151005", "TAIEX": "49712.04", "Change": "--"},  # 漲跌缺值
+        {"Date": "1151006", "TAIEX": "0", "Change": "1.0"},  # 收盤 ≤ 0
+        {"Date": "115/10/07", "TAIEX": "49806.37", "Change": "-16.18"},  # 日期格式不對
+        {"Date": "1151008", "TAIEX": "49313.44", "Change": "-492.93"},
+        {"Date": "1151008", "TAIEX": "49313.45", "Change": "-492.92"},  # 同一天兩個不同的值 → 那天不收
+        {"Date": "1151012", "TAIEX": "49301.96", "Change": "-11.48"},
+        {"Date": "1151012", "TAIEX": "49301.96", "Change": "-11.48"},  # 一模一樣的重複可以
+        "not a dict",
+    ]
+    parsed = sp.parse_fmtqik(rows)
+    assert parsed == {
+        date(2026, 10, 1): (48353.49, 413.36), date(2026, 10, 2): (48475.74, 122.25),
+        date(2026, 10, 12): (49301.96, -11.48),
+    }
+    assert sp.parse_fmtqik({"not": "a list"}) == {} and sp.parse_fmtqik(None) == {}
+
+
+def test_refresh_without_yahoo_t_uses_the_twse_close(net):
+    net.charts["^TWII"] = _chart(CAL[:-1], [20000.0] * (len(CAL) - 1))
+    net.fmtqik[-1] = {"Date": _roc(T), "TAIEX": "22000.00", "Change": "2000.00"}  # 前收 20000、漲 10%
+    snapshot = sp.refresh(T, _day_rows(net), threading.Event(), now=1.0e9)
+    assert snapshot.calendar[-1] == T and net.count("FMTQIK") == 1
+    assert snapshot.market.level == sp.HOT  # 用的是證交所的 22000，不是 Yahoo
+
+
+def test_refresh_with_yahoo_t_never_asks_twse_for_the_index(net):
+    sp.refresh(T, _day_rows(net), threading.Event(), now=1.0e9)
+    assert net.count("FMTQIK") == 0
+
+
+def _no_yahoo_t(n):
+    n.charts["^TWII"] = _chart(CAL[:-1], [20000.0] * (len(CAL) - 1))
+
+
+@pytest.mark.parametrize(
+    "breakage, kind, not_yet, blocked, retry_s",
+    [
+        (lambda n: (_no_yahoo_t(n), n.fmtqik.pop()), "index_not_t", True, False, None),
+        (lambda n: (_no_yahoo_t(n), n.overrides.__setitem__("FMTQIK", sp.FetchError("timeout"))), "index_timeout", True, False, None),
+        (lambda n: (_no_yahoo_t(n), n.overrides.__setitem__("FMTQIK", sp.FetchError("status"))), "index_status", True, False, None),
+        (lambda n: (_no_yahoo_t(n), n.overrides.__setitem__("FMTQIK", sp.FetchError("blocked"))), "index_blocked", False, True, 3600),
+        (lambda n: (n.charts.__setitem__("^TWII", _chart(SEPT, [20000.0] * len(SEPT))),
+                    setattr(n, "fmtqik", [r for r in n.fmtqik if r["Date"] == _roc(T)])), "index_month_start", True, False, None),
+        (lambda n: n.charts.pop("^TWII"), "twii_unavailable", False, False, None),
+        (lambda n: n.charts.__setitem__("^TWII", _chart([], [])), "twii_bad", False, False, None),
+        (lambda n: setattr(n, "pe", [{**row, "Date": _roc(PREV)} for row in n.pe]), "pe_not_t", True, False, None),
+        (lambda n: n.pe.__setitem__(0, {**n.pe[0], "Date": _roc(PREV)}), "pe_bad", False, False, None),
+        (lambda n: n.overrides.__setitem__("BWIBBU_ALL", sp.FetchError("blocked")), "batch_blocked", False, True, 3600),
+        (lambda n: n.overrides.__setitem__("BWIBBU_ALL", sp.FetchError("status")), "batch_status", False, False, None),
+        (lambda n: n.t86.pop(CAL[-1].strftime("%Y%m%d")), "t86_not_yet", True, False, 3600),
+        (lambda n: n.t86.pop(CAL[-3].strftime("%Y%m%d")), "t86_gap", False, False, 3600),
+        (lambda n: n.overrides.__setitem__("T86", sp.FetchError("timeout")), "t86_timeout", False, False, 3600),
+        (lambda n: n.overrides.__setitem__("T86", sp.FetchError("not_json")), "t86_not_json", False, True, 3600),
+        (lambda n: n.overrides.__setitem__("T86", (200, {"stat": "系統忙碌中"}, None)), "t86_bad", False, False, 3600),
+    ],
+)
+def test_every_raise_site_says_how_to_retry(net, breakage, kind, not_yet, blocked, retry_s):
+    breakage(net)
+    with pytest.raises(sp.RoundFailed) as info:
+        sp.refresh(T, _day_rows(net), threading.Event(), now=1.0e9)
+    assert (info.value.kind, info.value.not_yet, info.value.blocked, info.value.retry_s) == (kind, not_yet, blocked, retry_s)
+
+
+def test_t86_not_yet_texts_are_recognised():
+    future = {"stat": "查詢日期大於可查詢最大日期，請重新查詢!", "total": 0}
+    holiday = {"stat": "很抱歉，沒有符合條件的資料!", "total": 0}
+    assert sp.parse_t86(future, T)[0] == sp.T86_NOT_YET and sp.parse_t86(holiday, T)[0] == sp.T86_NOT_YET
+    assert sp.parse_t86({"stat": "系統忙碌中，請稍後再試"}, T)[0] == sp.T86_BAD
+
+
+def test_round_failed_flags_are_sanitised():
+    assert sp.RoundFailed("x", blocked=True, not_yet=True).not_yet is False  # 都設時當錯誤
+    for bad in (float("nan"), float("inf"), -1, 0, True, "60", 10**400):
+        assert sp.RoundFailed("x", retry_s=bad).retry_s is None
+    assert sp.RoundFailed("x", retry_s=60).retry_s == 60.0
+
+
+def test_not_yet_waits_fifteen_minutes_and_is_not_a_failure(net):
+    stop = threading.Event()
+    assert sp._tick(stop) == sp.POLL_S
+    t2 = _advance_one_trading_day(net)
+    net.charts["^TWII"] = _chart(CAL, [20000.0] * len(CAL))  # Yahoo 還沒有 t2，證交所也還沒有
+    assert sp._tick(stop) == pytest.approx(sp.NOT_YET_RETRY_S, abs=2) and sp.NOT_YET_RETRY_S == 900
+    assert sp._worker.fail_count == 0 and sp._worker.last_fail == "" and sp._worker.last_wait == "index_not_t"
+    assert sp.load_worker_file().last_wait == "index_not_t"
+    summary = sp.status_summary()
+    assert summary["waiting"] == "index_not_t" and summary["fail_count"] == 0
+    sp._worker.next_try = time.time() - 1
+    net.fmtqik.append({"Date": _roc(t2), "TAIEX": "20000.00", "Change": "0.00"})  # 證交所出來了
+    assert sp._tick(stop) == sp.POLL_S and sp._snapshot.t == t2
+    assert sp._worker.last_wait == "" and sp.status_summary()["waiting"] is None
+    assert isinstance(sp.status_summary()["lag_minutes"], int)
+
+
+def test_real_errors_wait_ten_then_twenty_minutes(net):
+    sp._worker.last_wait = "pe_not_t"  # 真的錯誤要清掉「在等」
+    delays = []
+    for _ in range(3):
+        sp._worker.next_try = None
+        delays.append(round(sp._fail("batch_status")))
+    assert delays == [600, 1200, 1200] and sp.BACKOFF_S == (600, 1200)
+    sp._worker.next_try = None
+    assert round(sp._fail("yahoo_rate_limited", blocked=True)) == sp.BLOCKED_BACKOFF_S == 1200
+    sp._worker.next_try = None
+    assert round(sp._fail("t86_timeout", retry_s=sp.T86_RETRY_S)) == sp.T86_RETRY_S == 3600
+    assert sp._worker.last_wait == ""
+
+
+def test_not_yet_never_shortens_a_longer_wait(net):
+    sp._worker.next_try = time.time() + 3000  # 別的程序的冷卻、壞檔的 1 小時
+    assert sp._fail("index_not_t", not_yet=True) == pytest.approx(3000, abs=2)
+    assert sp._worker.fail_count == 0
+
+
+def test_every_wait_fits_under_the_load_clamp():
+    for value in (*sp.BACKOFF_S, sp.BLOCKED_BACKOFF_S, sp.NOT_YET_RETRY_S, sp.T86_RETRY_S, sp.TWSE_BLOCKED_RETRY_S,
+                  sp.STATE_CORRUPT_BACKOFF_S):
+        assert sp._MAX_BACKOFF_S >= value
+
+
+@pytest.mark.parametrize("value", [["x"], "a" * 100, 5, None, "bad\nline"])
+def test_a_strange_last_wait_never_resets_the_t86_ledger(value):
+    state = sp.worker_state_to_json(sp.WorkerState(t86_requests=[time.time() - 60], last_wait="pe_not_t"))
+    state["last_wait"] = value
+    sp.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    sp._write_json_file(sp.STATE_DIR / sp.WORKER_NAME, state)
+    loaded = sp.load_worker_file()
+    assert loaded.last_fail != "state_corrupt" and len(loaded.t86_requests) == 1
+    assert loaded.last_wait == ("a" * 40 if value == "a" * 100 else "")
+
+
+def test_an_old_state_file_without_last_wait_still_loads():
+    state = sp.worker_state_to_json(sp.WorkerState(fail_count=2))
+    del state["last_wait"]
+    sp.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    sp._write_json_file(sp.STATE_DIR / sp.WORKER_NAME, state)
+    assert sp.load_worker_file().fail_count == 2 and sp.load_worker_file().last_wait == ""
+
+
+def test_deeply_nested_json_is_not_json(monkeypatch):
+    deep = b"[" * 100_000 + b"]" * 100_000
+    _fake_get(monkeypatch, response=_Resp(body=deep))
+    with pytest.raises(sp.FetchError) as info:
+        _REAL_GET_JSON("openapi.twse.com.tw", "/x", max_bytes=10_000_000, timeout=5, total_s=5)
+    assert info.value.kind == "not_json"
+
+
+def test_lag_minutes_is_only_for_the_newest_date(net):
+    snap = _fresh_snapshot(net)
+    worker = sp.WorkerState(seen_t=snap.t, seen_at=snap.computed_at - 125)
+    assert sp._lag_minutes(snap, worker) == 2
+    assert sp._lag_minutes(snap, sp.WorkerState(seen_t=snap.t - timedelta(days=1), seen_at=0.0)) is None
+    assert sp._lag_minutes(snap, sp.WorkerState(seen_t=snap.t, seen_at=snap.computed_at + 60)) is None
+    assert sp._lag_minutes(None, worker) is None
+
+
+
+def test_t86_cooldown_and_round_budget_wait_an_hour(net, monkeypatch):
+    sp.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    other = sp.WorkerState(next_try=time.time() + 60, writer="other-process")
+    sp._write_json_file(sp.STATE_DIR / sp.WORKER_NAME, sp.worker_state_to_json(other))
+    with pytest.raises(sp.RoundFailed) as info:
+        sp._reserve_t86_request(threading.Event(), time.monotonic() + 60)
+    assert (info.value.kind, info.value.retry_s) == ("t86_cooldown", 3600)
+    sp._worker.next_try = None
+    (sp.STATE_DIR / sp.WORKER_NAME).unlink()
+    monkeypatch.setattr(sp, "T86_SPACING_S", 5.0)
+    sp._worker.t86_requests = [time.time()]  # 間隔還沒到，整輪又沒時間了
+    with pytest.raises(sp.RoundFailed) as info:
+        sp._reserve_t86_request(threading.Event(), time.monotonic() - 1)
+    assert (info.value.kind, info.value.retry_s) == ("budget_t86", 3600)
+
+
+def test_huge_json_numbers_do_not_crash_the_parsers():
+    assert sp._num(10**400) is None
+    rows = [{"Date": "1151001", "TAIEX": 10**400, "Change": "0"}, {"Date": "1151002", "TAIEX": "48475.74", "Change": 10**400}]
+    assert sp.parse_fmtqik(rows) == {}
+
+
+def test_fail_ignores_a_bad_retry_value(net):
+    for bad in (float("nan"), -5, float("inf")):
+        sp._worker.next_try, sp._worker.fail_count = None, 0
+        assert round(sp._fail("batch_status", retry_s=bad)) == sp.BACKOFF_S[0]
+
+
+def test_fail_reports_the_wait_after_merging_another_process(net):
+    sp.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    other = sp.WorkerState(next_try=time.time() + 3000, writer="other-process")
+    sp._write_json_file(sp.STATE_DIR / sp.WORKER_NAME, sp.worker_state_to_json(other))
+    sp._worker.next_try = None
+    assert sp._fail("index_not_t", not_yet=True) == pytest.approx(3000, abs=5)
+
+
+def test_round_budget_running_out_at_the_t86_stage_waits_an_hour(net, monkeypatch):
+    real = sp.parse_revenue
+
+    def then_out_of_time(rows):  # 批次處理完、進 T86 迴圈前，整輪期限已過
+        monkeypatch.setattr(sp.time, "monotonic", lambda: 1e12)
+        return real(rows)
+
+    monkeypatch.setattr(sp, "parse_revenue", then_out_of_time)
+    with pytest.raises(sp.RoundFailed) as info:
+        sp.refresh(T, _day_rows(net), threading.Event(), now=1.0e9)
+    assert (info.value.kind, info.value.retry_s) == ("budget_t86", 3600)
+
+
+@pytest.mark.parametrize("stamp_huge", [True, False])
+def test_huge_numbers_in_a_yahoo_chart_are_skipped(stamp_huge):
+    payload = _chart([CAL[-3], CAL[-2]], [100.0, 101.0])
+    result = payload["chart"]["result"][0]
+    result["timestamp"].append(10**400 if stamp_huge else _ts(CAL[-1]))  # 一次只讓一個值超大，兩條檢查都測得到
+    result["indicators"]["quote"][0]["close"].append(102.0 if stamp_huge else 10**400)
+    assert sp.parse_chart(payload) == {CAL[-3]: 100.0, CAL[-2]: 101.0}
+
+
+def test_not_yet_without_a_snapshot_is_not_a_failed_first_round(net):
+    sp._snapshot = None
+    sp._fail("index_not_t", not_yet=True)
+    assert sp._worker.first_round_failed is False  # 使用者看到「準備中」，不是「暫時抓不到」
+    sp._fail("batch_status")
+    assert sp._worker.first_round_failed is True
+
+
+def test_a_huge_retry_is_capped_at_the_longest_wait(net):
+    sp._worker.next_try = None
+    assert round(sp._fail("x", retry_s=1e7)) == sp._MAX_BACKOFF_S == 3600
+
+
+def test_month_start_never_asks_twse_for_the_index(net):
+    net.charts["^TWII"] = _chart(SEPT, [20000.0] * len(SEPT))  # Yahoo 在 T 這個月還沒有日線
+    with pytest.raises(sp.RoundFailed) as info:
+        sp.refresh(T, _day_rows(net), threading.Event(), now=1.0e9)
+    assert (info.value.kind, info.value.not_yet) == ("index_month_start", True) and net.count("FMTQIK") == 0

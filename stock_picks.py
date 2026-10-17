@@ -91,7 +91,10 @@ def _num(value) -> Optional[float]:
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        number = float(value)
+        try:
+            number = float(value)
+        except OverflowError:  # JSON 的超大整數（2026-10-17 審查）
+            return None
     elif isinstance(value, str):
         text = value.replace(",", "").strip()
         if text in ("", "--", "-", "N/A", "X"):
@@ -817,18 +820,25 @@ T86_OK, T86_NOT_YET, T86_BAD = "ok", "not_yet", "bad"
 _T86_CODE = "證券代號"
 _T86_FOREIGN = "外陸資買賣超股數(不含外資自營商)"
 _T86_TRUST = "投信買賣超股數"
+# 證交所「這天還沒有資料」的兩種說法（2026-10-17 實測）：查還沒到的日子回「查詢日期大於可查詢最大日期，
+# 請重新查詢!」，查非交易日回「很抱歉，沒有符合條件的資料!」。用子字串比對，標點微調不會變成 BAD。
+_T86_NOT_YET_STATS = ("沒有符合條件", "大於可查詢最大日期")
 
 
 def parse_t86(payload, day: date) -> tuple[str, dict[str, int]]:
     """T86 一天：回 (狀態, {代號: 外資＋投信買賣超股數})。
 
-    stat 不是 OK（例如「很抱歉，沒有符合條件的資料!」）→ T86_NOT_YET：^TWII 說是交易日，
-    所以是還沒發布，整輪失敗重試，不往前補。不是 dict、日期不對、欄位找不到 → T86_BAD。
+    stat 是上面兩種「還沒有資料」的說法 → T86_NOT_YET（只有 day 是 T 才算還沒發布，見 refresh）。
+    其他不是 OK 的 stat、不是 dict、日期不對、欄位找不到 → T86_BAD（stat 原文是遠端文字：只記前 40 字）。
     """
     if not isinstance(payload, dict):
         return T86_BAD, {}
-    if payload.get("stat") != "OK":
-        return T86_NOT_YET, {}
+    stat = payload.get("stat")
+    if stat != "OK":
+        if isinstance(stat, str) and any(word in stat for word in _T86_NOT_YET_STATS):
+            return T86_NOT_YET, {}
+        logger.info("stock picks t86 unexpected stat=%r", str(stat)[:40])
+        return T86_BAD, {}
     if payload.get("date") != day.strftime("%Y%m%d"):
         return T86_BAD, {}
     fields, data = payload.get("fields"), payload.get("data")
@@ -871,16 +881,80 @@ def parse_chart(payload) -> dict[date, float]:
         return {}
     bars: dict[date, float] = {}
     for stamp, close in zip(stamps, closes):
-        if isinstance(stamp, bool) or not isinstance(stamp, (int, float)) or not math.isfinite(stamp):
+        if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
             continue
-        if isinstance(close, bool) or not isinstance(close, (int, float)) or not math.isfinite(close) or close <= 0:
+        if isinstance(close, bool) or not isinstance(close, (int, float)):
             continue
-        try:
+        try:  # 超大整數 math.isfinite 也會丟 OverflowError（2026-10-17 審查）
+            if not math.isfinite(stamp) or not math.isfinite(close) or close <= 0:
+                continue
             day = datetime.fromtimestamp(stamp, _TPE).date()
         except (OverflowError, OSError, ValueError):
             continue
         bars[day] = float(close)
     return dict(sorted(bars.items()))
+
+
+# ── Yahoo 還沒有 T 那根時，用證交所的大盤收盤補（2026-10-17） ───────────────────────
+# 證交所 OpenAPI 每天 05:20–05:25 就有前一個交易日的資料；Yahoo ^TWII 要到隔天 07:50–09:50 才有 T 那根。
+SPLICE_INDEX_TOL = 0.05  # Yahoo 前一根收盤 vs 證交所 T 收盤−漲跌（實測差 ≤ 0.002，是 float 表示法）
+SPLICE_INDEX_MAX_MOVE = 0.12  # 漲跌超過前收 12%（台股漲跌幅上限 10%）就不收
+
+
+def parse_fmtqik(rows) -> dict[date, tuple[float, float]]:
+    """OpenAPI FMTQIK（本月每個交易日一列）→ {日期: (加權指數收盤, 漲跌點數)}。
+
+    日期、數字格式不對的列丟掉；同一天出現兩次而且數字不同 → 那天整個不收（不採最後一筆）。
+    """
+    if not isinstance(rows, list):
+        return {}
+    table: dict[date, tuple[float, float]] = {}
+    conflicts: set[date] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        day, close, change = _roc_date(row.get("Date")), _num(row.get("TAIEX")), _num(row.get("Change"))
+        if day is None or close is None or change is None or close <= 0:
+            continue
+        _keep_unique(table, conflicts, day, (close, change))
+    return {day: value for day, value in table.items() if day not in conflicts}
+
+
+def splice_t_close(
+    bars: dict[date, float], index_days: dict[date, tuple[float, float]], t: date
+) -> tuple[Optional[float], str, str]:
+    """Yahoo 還沒有 T 時，能不能用證交所的 T 收盤補上：回 (T 收盤, "", 細節) 或 (None, 原因, 細節)。
+
+    全部成立才收：
+    - 證交所有 T 那一列（index_not_t）；
+    - Yahoo 在 T 那個月（同年同月）早於 T 的日子和證交所一模一樣，月初兩邊都是空的（index_gap）；
+      近 12 個月實測兩邊的交易日每個月都完全一樣；
+    - 不是月初：證交所本月在 T 之前要有交易日（index_month_start）。月初沒有獨立的證據證明 Yahoo 停在前一個
+      交易日（只靠數值擋不住「連兩天收盤一樣又漏一天」，上一份快照也可能落後），所以月初照舊等 Yahoo；
+    - Yahoo 早於 T 的最後一根收盤 ≈ 證交所 T 收盤−漲跌（差 ≤ SPLICE_INDEX_TOL；index_mismatch）；
+    - |漲跌| ≤ 前收 × SPLICE_INDEX_MAX_MOVE（index_jump）。
+    細節只有日期與公開的指數數字。
+    """
+    row = index_days.get(t)
+    if row is None:
+        return None, "index_not_t", f"t={t.isoformat()}"
+    close, change = row
+    before = [d for d in bars if d < t]
+    yahoo_month = {d for d in before if (d.year, d.month) == (t.year, t.month)}
+    twse_month = {d for d in index_days if d < t and (d.year, d.month) == (t.year, t.month)}
+    if yahoo_month != twse_month:
+        missing = ",".join(d.isoformat() for d in sorted(twse_month - yahoo_month)[:5])
+        extra = ",".join(d.isoformat() for d in sorted(yahoo_month - twse_month)[:5])
+        return None, "index_gap", f"t={t.isoformat()} yahoo_missing={missing or '-'} yahoo_extra={extra or '-'}"
+    if not twse_month:
+        return None, "index_month_start", f"t={t.isoformat()}"
+    prev = bars[max(before)]
+    detail = f"t={t.isoformat()} yahoo_prev={prev:.2f} twse_prev={close - change:.2f}"
+    if abs(prev - (close - change)) > SPLICE_INDEX_TOL:
+        return None, "index_mismatch", detail
+    if abs(change) > prev * SPLICE_INDEX_MAX_MOVE:
+        return None, "index_jump", detail
+    return close, "", detail
 
 
 @dataclass(frozen=True)
@@ -1121,13 +1195,32 @@ class FetchError(Exception):
         self.kind = kind
 
 
-class RoundFailed(Exception):
-    """這一輪重算失敗（保留舊快照、退避）；blocked＝疑似被擋，退避拉長。"""
+def _valid_retry(retry_s) -> Optional[float]:
+    """retry_s 只收有限的正數秒；其他（NaN、負數、布林、字串）當作沒給。RoundFailed 與 _fail 共用。"""
+    if isinstance(retry_s, bool) or not isinstance(retry_s, (int, float)):
+        return None
+    try:
+        value = float(retry_s)
+    except OverflowError:
+        return None
+    return value if math.isfinite(value) and value > 0 else None
 
-    def __init__(self, kind: str, *, blocked: bool = False):
+
+class RoundFailed(Exception):
+    """這一輪重算失敗（保留舊快照）。重試策略在丟出的地方決定（2026-10-17）：
+
+    - not_yet：資料源還沒有 T（不算失敗、fail_count 不加，固定 NOT_YET_RETRY_S 或 retry_s 後再試）；
+    - blocked：疑似被擋（算失敗；Yahoo 429 用 BLOCKED_BACKOFF_S，證交所的另外帶 retry_s）；
+    - retry_s：這種情況固定等多久（T86 一家、證交所被擋），不照 BACKOFF_S 的順序。
+    預設是真的錯誤；blocked 和 not_yet 都設時當錯誤（blocked 勝）；retry_s 不是有限正數就不用。
+    """
+
+    def __init__(self, kind: str, *, blocked: bool = False, not_yet: bool = False, retry_s: Optional[float] = None):
         super().__init__(kind)
         self.kind = kind
         self.blocked = blocked
+        self.not_yet = not_yet and not blocked
+        self.retry_s = _valid_retry(retry_s)
 
 
 def _get_json(
@@ -1189,7 +1282,7 @@ def _get_json(
         raise FetchError("network") from None
     try:
         return 200, json.loads(bytes(buf)), last_modified
-    except ValueError:
+    except (ValueError, RecursionError):  # 巢狀太深的 JSON 會丟 RecursionError（2026-10-17 審查）
         raise FetchError("not_json") from None
 
 
@@ -1520,6 +1613,13 @@ class WorkerState:
     t86: dict = field(default_factory=dict)  # {"YYYY-MM-DD": {代號: 外資＋投信買賣超股數}}，只存 stat=OK 的日子
     t86_requests: list = field(default_factory=list)  # 送出 T86 請求的時間（跨重啟記帳）
     writer: str = ""  # 最後寫這個檔的程序（合併時分得出是不是別的程序的冷卻）
+    # 正在等哪個資料源（「還沒出來」的種類，2026-10-17）；不是失敗，成功、304、追上、真的失敗時清掉。
+    last_wait: str = ""
+
+
+def _lenient_wait(value) -> str:
+    """讀檔時的 last_wait：格式不對就當沒有，絕不丟例外（丟了整個檔案會被當壞檔，T86 請求帳就歸零）。"""
+    return value[:40] if isinstance(value, str) and value.isprintable() else ""
 
 
 def worker_state_to_json(w: WorkerState) -> dict:
@@ -1536,6 +1636,7 @@ def worker_state_to_json(w: WorkerState) -> dict:
         "t86": w.t86,
         "t86_requests": w.t86_requests,
         "writer": w.writer,
+        "last_wait": w.last_wait,
     }
 
 
@@ -1569,6 +1670,7 @@ def worker_state_from_json(obj) -> WorkerState:
         t86=t86,
         t86_requests=[min(x, now) for x in (_v_num(x, 0.0, 1e11) for x in requests_raw)],  # 夾回、不丟（帳不能變少）
         writer=_v_str(obj.get("writer") or "", 64, allow_empty=True),
+        last_wait=_lenient_wait(obj.get("last_wait")),
     )
 
 
@@ -1662,7 +1764,7 @@ def load_worker_file() -> WorkerState:
         return WorkerState() if obj is None else worker_state_from_json(obj)
     except Exception as exc:
         logger.error("stock picks worker state unreadable error_type=%s", type(exc).__name__)
-        return WorkerState(next_try=time.time() + BACKOFF_S[-1], last_fail="state_corrupt")
+        return WorkerState(next_try=time.time() + STATE_CORRUPT_BACKOFF_S, last_fail="state_corrupt")
 
 
 # ── 執行期狀態（記憶體裡的快照是不可變物件，整個換掉） ──────────────────────────
@@ -1717,7 +1819,7 @@ def _merge_worker_from_disk() -> bool:  # 回 True＝磁碟上的檔壞了
         obj = _read_json_file(path)
         disk = None if obj is None else worker_state_from_json(obj)
     except Exception:
-        _worker.next_try = max(_worker.next_try or 0.0, time.time() + BACKOFF_S[-1])
+        _worker.next_try = max(_worker.next_try or 0.0, time.time() + STATE_CORRUPT_BACKOFF_S)
         _worker.last_fail = "state_corrupt"
         return True
     if disk is None:
@@ -1878,10 +1980,10 @@ def _reserve_t86_request(stop: threading.Event, give_up: float) -> None:
                         _write_worker_locked()  # 修好壞檔，1 小時退避一起存
                         raise RoundFailed("state_corrupt")
                     if _worker.next_try is not None and _worker.next_try > now:
-                        raise RoundFailed("t86_cooldown")  # 別的程序還在退避（併進來的期限）
+                        raise RoundFailed("t86_cooldown", retry_s=T86_RETRY_S)  # 別的程序還在退避（併進來的期限）
                     recent = [x for x in _worker.t86_requests if now - x < 86400]
                     if len(recent) >= T86_DAILY_CAP:
-                        raise RoundFailed("t86_budget")
+                        raise RoundFailed("t86_budget", retry_s=T86_RETRY_S)
                     wait = (max(recent) + T86_SPACING_S - now) if recent else 0.0
                     if wait <= 0:
                         _worker.t86_requests = recent + [now]
@@ -1892,13 +1994,16 @@ def _reserve_t86_request(stop: threading.Event, give_up: float) -> None:
             except Exception as exc:
                 raise RoundFailed(f"state_{type(exc).__name__}"[:40]) from None
         if time.monotonic() + wait > give_up:
-            raise RoundFailed("budget_t86")
+            raise RoundFailed("budget_t86", retry_s=T86_RETRY_S)
         if stop.wait(wait):
             raise RoundFailed("stopped")
 
 
 def _t86_day(day: date, stop: threading.Event, give_up: float) -> dict[str, int]:
-    """抓一天 T86（日快取有就用）。被擋（非 JSON、403、429、轉址）→ 整輪停、退避 2 小時。"""
+    """抓一天 T86（日快取有就用）。
+
+    T86 每 24 小時最多 15 次、送出前就記帳，所以不管還沒出來、錯誤還是被擋（非 JSON、403、429、轉址），
+    一律每小時再試（T86_RETRY_S；Andrew 2026-10-17 選「改每小時」）。還沒出來只有 day 是 T 才算，見 refresh。"""
     key = day.isoformat()
     with _lock:
         cached = _worker.t86.get(key)
@@ -1914,11 +2019,13 @@ def _t86_day(day: date, stop: threading.Event, give_up: float) -> dict[str, int]
         )
     except FetchError as exc:
         if exc.kind in ("not_json", "blocked", "rate_limited", "moved"):
-            raise RoundFailed(f"t86_{exc.kind}", blocked=True) from None
-        raise RoundFailed(f"t86_{exc.kind}") from None
+            raise RoundFailed(f"t86_{exc.kind}", blocked=True, retry_s=T86_RETRY_S) from None
+        raise RoundFailed(f"t86_{exc.kind}", retry_s=T86_RETRY_S) from None
     kind, table = parse_t86(payload, day) if status == 200 else (T86_BAD, {})
+    if kind == T86_NOT_YET:
+        raise RoundFailed("t86_not_yet", not_yet=True, retry_s=T86_RETRY_S)
     if kind != T86_OK:
-        raise RoundFailed(f"t86_{kind}")
+        raise RoundFailed(f"t86_{kind}", retry_s=T86_RETRY_S)
     with _lock:
         _worker.t86[key] = table
         for old in sorted(_worker.t86)[:-T86_KEEP_DAYS]:
@@ -1996,25 +2103,65 @@ def _fetch_otc(
     return parsed
 
 
+FMTQIK_MAX_BYTES = 64 * 1024  # 本月每個交易日一列，實際約 2 KB
+FMTQIK_TIMEOUT_S = 10.0
+
+
+def _twse_t_close(bars: dict[date, float], t: date, stop: threading.Event, give_up: float) -> float:
+    """Yahoo ^TWII 還沒有 T 時，用證交所 OpenAPI FMTQIK 的 T 收盤補上（2026-10-17）。
+
+    證交所只是加速：抓不到、資料對不上都算「還沒出來」（照舊等 Yahoo），不能比沒有它更糟；被擋 → 等 1 小時。
+    每次接受、拒絕都記一行 info（只有日期與公開的指數數字），之後查得到加速有沒有作用。"""
+    try:
+        _, rows, _ = _get_json(
+            _OPENAPI, "/v1/exchangeReport/FMTQIK", max_bytes=FMTQIK_MAX_BYTES,
+            timeout=_budget_left(give_up, FMTQIK_TIMEOUT_S), total_s=_budget_left(give_up, FMTQIK_TIMEOUT_S), stop=stop,
+        )
+    except FetchError as exc:
+        if exc.kind == "stopped":
+            raise RoundFailed("stopped") from None
+        if exc.kind in ("blocked", "rate_limited"):
+            raise RoundFailed(f"index_{exc.kind}", blocked=True, retry_s=TWSE_BLOCKED_RETRY_S) from None
+        logger.info("stock picks twse index unavailable kind=%s", exc.kind)
+        raise RoundFailed(f"index_{exc.kind}", not_yet=True) from None
+    close, why, detail = splice_t_close(bars, parse_fmtqik(rows), t)
+    if close is None:
+        logger.info("stock picks twse index not used reason=%s %s", why, detail)
+        raise RoundFailed(why, not_yet=True)
+    logger.info("stock picks used twse index %s", detail)
+    return close
+
+
 def refresh(t: date, day_rows: dict[str, DayRow], stop: threading.Event, *, now: Optional[float] = None) -> Snapshot:
     """用資料日 T 整輪重算；任何來源不齊、超過整輪期限就丟 RoundFailed（保留舊快照）。"""
     give_up = time.monotonic() + REFRESH_BUDGET_S
 
-    def check_budget(stage: str) -> None:
+    def check_budget(stage: str, retry_s: Optional[float] = None) -> None:
         if stop.is_set():
             raise RoundFailed("stopped")
         if time.monotonic() > give_up:
-            raise RoundFailed(f"budget_{stage}")
+            raise RoundFailed(f"budget_{stage}", retry_s=retry_s)
 
     # 1) 交易日曆＝加權指數日線（先截到 ≤ T，最後一根必須是 T）
     try:
         twii = _fetch_chart("^TWII", stop=stop)
     except FetchError as exc:
         raise RoundFailed(f"yahoo_{exc.kind}", blocked=exc.kind == "rate_limited") from None
+    if twii is None:
+        raise RoundFailed("twii_unavailable")  # 兩個主機都失敗：真的錯誤，不是「還沒出來」
     twii_bars = {d: v for d, v in parse_chart(twii).items() if d <= t}
     calendar = sorted(twii_bars)
-    if not calendar or calendar[-1] != t:
-        raise RoundFailed("twii_not_t")
+    if not calendar:
+        raise RoundFailed("twii_bad")
+    if calendar[-1] != t:
+        # Yahoo 還沒有 T 那根（要到隔天 07:50–09:50）：用證交所的 T 收盤補上（2026-10-17；補不了就是「還沒出來」）
+        if not any((d.year, d.month) == (t.year, t.month) for d in twii_bars):
+            # 月初（Yahoo 在 T 這個月還沒有日線）：splice_t_close 一定不收，不用每 15 分鐘去抓 FMTQIK
+            logger.info("stock picks twse index not used reason=index_month_start t=%s", t.isoformat())
+            raise RoundFailed("index_month_start", not_yet=True)
+        check_budget("index")
+        twii_bars[t] = _twse_t_close(twii_bars, t, stop, give_up)
+        calendar.append(t)
     if len(calendar) < YEAR_BARS:
         raise RoundFailed("twii_short")
     # 2) 證交所批次
@@ -2026,20 +2173,31 @@ def refresh(t: date, day_rows: dict[str, DayRow], stop: threading.Event, *, now:
         check_budget("batch")
         _, revenue_rows, _ = _fetch_openapi("/v1/opendata/t187ap05_L", stop=stop, give_up=give_up)
     except FetchError as exc:
-        raise RoundFailed(f"batch_{exc.kind}", blocked=exc.kind in ("blocked", "rate_limited")) from None
+        blocked = exc.kind in ("blocked", "rate_limited")
+        raise RoundFailed(
+            f"batch_{exc.kind}", blocked=blocked, retry_s=TWSE_BLOCKED_RETRY_S if blocked else None
+        ) from None
     companies = parse_companies(company_rows)
     pe_date, pe = parse_pe(pe_rows)
     revenue = parse_revenue(revenue_rows)
     if len(companies) < _MIN_ROWS or len(revenue) < _MIN_ROWS:
         raise RoundFailed("batch_short")
     if pe_date != t:
-        raise RoundFailed("pe_not_t")
+        if pe_date is not None and pe_date < t:
+            raise RoundFailed("pe_not_t", not_yet=True)  # 本益比還停在前一天：還沒出來
+        raise RoundFailed("pe_bad")  # 日期不唯一、或比 T 還新：真的錯誤
     # 3) 外資＋投信：^TWII 日曆上含 T 的最後 10 個交易日，每天都要有；某一檔缺任何一天 → 那檔未知
     inst: dict[str, int] = {}
     days_seen: dict[str, int] = {}
     for day in calendar[-T86_DAYS:]:
-        check_budget("t86")
-        for code, net in _t86_day(day, stop, give_up).items():
+        check_budget("t86", retry_s=T86_RETRY_S)  # T86 階段的失敗一律每小時
+        try:
+            table = _t86_day(day, stop, give_up)
+        except RoundFailed as exc:
+            if exc.not_yet and day != t:  # 早於 T 的日子沒有 T86 不會自己好（多半是日曆多一天）：真的錯誤
+                raise RoundFailed("t86_gap", retry_s=T86_RETRY_S) from None
+            raise
+        for code, net in table.items():
             inst[code] = inst.get(code, 0) + net
             days_seen[code] = days_seen.get(code, 0) + 1
     inst = {code: net for code, net in inst.items() if days_seen[code] == T86_DAYS}
@@ -2084,6 +2242,7 @@ def refresh(t: date, day_rows: dict[str, DayRow], stop: threading.Event, *, now:
         pool[code] = _facts_for(code, row, t, windows, medians, cap=caps.get(code))
     gray = sum(1 for code in universe if pool.get(code) is None or pool[code].trend is None)
     if gray > TOP_N * MAX_GRAY_RATIO:
+        # TODO(2026-10-17 延後)：這類後段的真錯誤每 20 分鐘重試一次，每次會重抓約 51 檔 Yahoo 日線。
         raise RoundFailed("too_many_gray")
     universe_facts = [pool[c] for c in universe if c in pool]
     picks = choose_picks(universe_facts)
@@ -2138,32 +2297,63 @@ def _facts_for(
 # ── 背景工作 ───────────────────────────────────────────────────────────────
 POLL_S = 30 * 60
 STARTUP_DELAY_S = 90.0
-BACKOFF_S = (600, 1200, 2400, 3600)
-BLOCKED_BACKOFF_S = 2 * 3600
-# 讀工作狀態時把 next_try 夾在這個範圍內：新增更長的退避要一起改，不然重啟後會被夾短。
-_MAX_BACKOFF_S = max(max(BACKOFF_S), BLOCKED_BACKOFF_S)
+# 重試的等待（Andrew 2026-10-17：「還沒出來」每 15 分鐘、真的錯誤最長等 20 分鐘；T86 改每小時；證交所擋住等 1 小時）
+NOT_YET_RETRY_S = 15 * 60  # 資料源還沒有 T：不算失敗
+T86_RETRY_S = 60 * 60  # T86 一家（還沒出來、錯誤、被擋、額度用完）：24 小時最多 15 次，送出前就記帳
+TWSE_BLOCKED_RETRY_S = 60 * 60  # 證交所（openapi、www）回 403／429：等 1 小時，一直打只會被擋更久
+BACKOFF_S = (600, 1200)  # 其他真的錯誤：第一次 10 分鐘，之後都 20 分鐘
+BLOCKED_BACKOFF_S = 20 * 60  # Yahoo 429：一輪最多幾個請求，20 分鐘再試
+STATE_CORRUPT_BACKOFF_S = 60 * 60  # 工作狀態檔壞掉：1 小時（T86 請求帳不能因為壞檔就恢復滿額）
+# 讀工作狀態時把 next_try 夾在這個範圍內：新增更長的等待要一起加進來，不然重啟後會被夾短。
+_MAX_BACKOFF_S = max(
+    *BACKOFF_S, BLOCKED_BACKOFF_S, NOT_YET_RETRY_S, T86_RETRY_S, TWSE_BLOCKED_RETRY_S, STATE_CORRUPT_BACKOFF_S
+)
 _CLOCK_SKEW_S = 600  # 允許的時鐘誤差（工作狀態裡比現在晚超過這麼多的時間一律夾回）
+# TODO(2026-10-17 延後)：月初（約 12 天／年）仍要等 Yahoo，08:40 左右可能短暫顯示沒更新；量過再決定要不要放寬。
 NEW_DATE_GRACE_S = 3 * 3600
 CHECK_STALE_S = 36 * 3600
 MIN_WAIT_S = 1.0
+# TODO(2026-10-17 延後)：05:40 就算出快照時櫃買可能還沒有 T（上櫃單檔最多約 2.5 小時查不到）；
+# 10/20 起看 log 有沒有 tpex list not usable，再決定新快照要不要更常補抓（每次 4.8 MB）。
 OTC_RETRY_S = 2 * 3600  # 櫃買清單沒抓到（或日期還不是 T）時，補抓的間隔
 _otc_next_try = 0.0
 
 
-def _fail(kind: str, *, blocked: bool = False) -> float:
+def _fail(kind: str, *, blocked: bool = False, not_yet: bool = False, retry_s: Optional[float] = None) -> float:
+    """記下這一輪沒算成並決定下次什麼時候再試；回傳要等幾秒。
+
+    還沒出來（not_yet）：不算失敗——fail_count、last_fail 不動，記 last_wait，等 retry_s（沒給就 15 分鐘）。
+    真的錯誤：fail_count +1、記 last_fail、清 last_wait，等 retry_s，否則 Yahoo 被擋 20 分鐘，否則照 BACKOFF_S。
+    已經有更晚的期限（壞檔 1 小時、別的程序的冷卻）就留著，不縮短。"""
+    if not_yet and blocked:
+        not_yet = False
+    retry_s = _valid_retry(retry_s)
     now = time.time()
     with _lock:
-        _worker.fail_count += 1
-        delay = BLOCKED_BACKOFF_S if blocked else BACKOFF_S[min(_worker.fail_count - 1, len(BACKOFF_S) - 1)]
-        # 已經有更晚的期限（壞檔退避 1 小時、別的程序的冷卻）就留著，不縮短
+        if not_yet:
+            delay = retry_s or NOT_YET_RETRY_S
+            _worker.last_wait = kind[:40]
+        else:
+            _worker.fail_count += 1
+            if retry_s is not None:
+                delay = retry_s
+            elif blocked:
+                delay = BLOCKED_BACKOFF_S
+            else:
+                delay = BACKOFF_S[min(_worker.fail_count - 1, len(BACKOFF_S) - 1)]
+            _worker.last_fail = kind[:40]
+            _worker.last_wait = ""
+            if _snapshot is None:
+                _worker.first_round_failed = True
+        delay = min(float(delay), float(_MAX_BACKOFF_S))
         _worker.next_try = max(now + delay, _worker.next_try or 0.0)
-        delay = _worker.next_try - now
-        _worker.last_fail = kind[:40]
-        if _snapshot is None:
-            _worker.first_round_failed = True
-        _save_worker()
+        _save_worker()  # 存檔時會併進別的程序更晚的期限：回傳的等待以存完的為準
+        delay = max(0.0, (_worker.next_try or now) - now)
         count = _worker.fail_count
-    logger.warning("stock picks refresh failed kind=%s count=%d", kind, count)
+    if not_yet:
+        logger.info("stock picks waiting for data kind=%s retry_in_s=%d", kind, int(delay))
+    else:
+        logger.warning("stock picks refresh failed kind=%s count=%d", kind, count)
     return float(delay)
 
 
@@ -2195,11 +2385,13 @@ def _tick(stop: threading.Event) -> float:
     except FetchError as exc:
         if exc.kind == "stopped" or stop.is_set():
             return POLL_S
-        return _fail(f"day_{exc.kind}", blocked=exc.kind in ("blocked", "rate_limited"))
+        blocked = exc.kind in ("blocked", "rate_limited")
+        return _fail(f"day_{exc.kind}", blocked=blocked, retry_s=TWSE_BLOCKED_RETRY_S if blocked else None)
     if status == 304:
         with _lock:
             _worker.last_ok_check = now
             _worker.fail_count, _worker.last_fail = 0, ""  # 已經追上：之前檢查失敗的次數不再累計
+            _worker.last_wait = ""
             _save_worker()
         _maybe_fill_otc(stop)
         return POLL_S
@@ -2215,6 +2407,7 @@ def _tick(stop: threading.Event) -> float:
             logger.info("stock picks saw new trading date t=%s", t.isoformat())
         if snapshot is not None and t <= snapshot.t and _worker.seen_t <= snapshot.t:
             _worker.fail_count, _worker.last_fail = 0, ""  # 真的追上了（沒有待重算的日期）才歸零
+            _worker.last_wait = ""
         _save_worker()
     if snapshot is not None and t <= snapshot.t:
         _maybe_fill_otc(stop)
@@ -2228,7 +2421,7 @@ def _tick(stop: threading.Event) -> float:
     except RoundFailed as exc:
         if exc.kind == "stopped" or stop.is_set():
             return POLL_S
-        return _fail(exc.kind, blocked=exc.blocked)
+        return _fail(exc.kind, blocked=exc.blocked, not_yet=exc.not_yet, retry_s=exc.retry_s)
     if stop.is_set():
         return POLL_S
     result = _commit_snapshot(new)
@@ -2237,6 +2430,7 @@ def _tick(stop: threading.Event) -> float:
     with _lock:
         _worker.fail_count, _worker.next_try, _worker.last_fail = 0, None, ""
         _worker.first_round_failed = False
+        _worker.last_wait = ""
         _save_worker()
     if result == COMMIT_WRITTEN:
         _append_history(new)
@@ -2307,6 +2501,14 @@ def _not_updated(snapshot: Snapshot, now: Optional[float] = None, worker: Option
     return now - baseline >= CHECK_STALE_S
 
 
+def _lag_minutes(snapshot: Optional[Snapshot], w: WorkerState) -> Optional[int]:
+    """快照的 T 就是最近看到的新日期時：從看到到算好花了幾分鐘（其他情況 None）。"""
+    if snapshot is None or w.seen_t is None or w.seen_at is None or snapshot.t != w.seen_t:
+        return None
+    lag = snapshot.computed_at - w.seen_at
+    return round(lag / 60) if lag >= 0 else None
+
+
 def status_summary(now: Optional[float] = None) -> dict:
     """給每日維護與部署檢查讀的狀態（不含任何使用者資料）。
 
@@ -2323,6 +2525,10 @@ def status_summary(now: Optional[float] = None) -> dict:
         "last_fail": w.last_fail,
         "hours_since_check": None if w.last_ok_check is None else round((now - w.last_ok_check) / 3600, 1),
         "backoff_minutes": None if w.next_try is None or w.next_try <= now else round((w.next_try - now) / 60),
+        # 在等哪個資料源（不是失敗，2026-10-17）
+        "waiting": w.last_wait or None,
+        # 看到新日期到算好花了幾分鐘：證交所補 T 有作用時通常在半小時內；Yahoo 那條路約 3 小時
+        "lag_minutes": _lag_minutes(snapshot, w),
     }
     if snapshot is None:
         info["status"] = "no_snapshot"
