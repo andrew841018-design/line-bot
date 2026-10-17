@@ -1,7 +1,10 @@
 """HTTP-triggerable job dispatcher.
 
 Security:
-  1. IP allowlist: loopback only unless JOBS_ALLOW_PUBLIC_HTTP=1
+  1. Source check: refuse requests that came through a proxy (Cf-* / X-Forwarded-* /
+     Forwarded / X-Real-IP headers, e.g. the cloudflared quick tunnel), then allow loopback
+     only. Trigger, last-run and discord-alert skip it when JOBS_ALLOW_PUBLIC_HTTP=1
+     (Cloud Run); the job list never does
   2. Origin header reject (browser CSRF defense)
   3. Path regex on {job_name}
   4. Registry lookup -> 404 if unknown
@@ -53,6 +56,13 @@ LOCK_DIR = Path(os.environ.get("LINE_BOT_JOB_LOCK_DIR", str(_HERE / "locks")))
 
 _JOB_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,40}$")
 _ALLOWED_IPS = {"127.0.0.1", "::1", "::ffff:127.0.0.1"}
+# Headers a proxy in front of us adds (cloudflared: X-Forwarded-For, Cf-Connecting-IP, Cf-Ray, ...).
+# Local callers (n8n on 127.0.0.1:8080) never send them. uvicorn's default proxy_headers turns
+# X-Forwarded-For into request.client, so the loopback check alone rejects tunnel traffic today, but
+# only implicitly: --no-proxy-headers, FORWARDED_ALLOW_IPS=* or a second X-Forwarded-For line ending
+# in 127.0.0.1 defeats it. Refuse proxied requests explicitly (2026-10-17).
+_PROXY_HEADER_PREFIXES = ("cf-", "x-forwarded-")
+_PROXY_HEADER_NAMES = frozenset({"forwarded", "x-real-ip"})
 _RATE_LIMIT_SECONDS = 60
 
 _SECRET_PATTERNS = [
@@ -101,6 +111,8 @@ def _env_flag(name: str) -> bool:
 
 
 def _public_http_enabled() -> bool:
+    # TODO(2026-10-17): honour this only on Cloud Run (K_SERVICE set), so a stray
+    # JOBS_ALLOW_PUBLIC_HTTP=1 on the Mac cannot open /jobs to the quick tunnel.
     return _env_flag("JOBS_ALLOW_PUBLIC_HTTP")
 
 
@@ -135,12 +147,20 @@ def _atomic_write(path: Path, data: dict) -> None:
         raise
 
 
+def _came_through_proxy(request: Request) -> bool:
+    # uvicorn lowercases header names already; don't let a different server turn this into fail-open
+    names = (name.lower() for name in request.headers.keys())
+    return any(name.startswith(_PROXY_HEADER_PREFIXES) or name in _PROXY_HEADER_NAMES for name in names)
+
+
 def _check_ip(request: Request, *, allow_public: bool = False) -> None:
     if allow_public and _public_http_enabled():
         return
+    if _came_through_proxy(request):
+        raise HTTPException(403, "forwarded request not allowed")
     host = request.client.host if request.client else ""
     if host not in _ALLOWED_IPS:
-        raise HTTPException(403, f"IP not allowed: {host}")
+        raise HTTPException(403, "IP not allowed")
 
 
 def _check_origin(request: Request) -> None:

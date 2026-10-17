@@ -261,7 +261,9 @@ async def _app_lifespan(_app: FastAPI):
             )
 
 
-app = FastAPI(lifespan=_app_lifespan)
+# 2026-10-17 整個 app 經 quick tunnel 公開，對外只該有 LINE 用得到的路由（/callback、/health、/static/img、/card）：
+# FastAPI 預設的 /docs、/redoc、/openapi.json（連同 /docs/oauth2-redirect）不掛；要看 schema 在 Python 裡用 app.openapi()
+app = FastAPI(lifespan=_app_lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 # 2026-10-16 字卡大字版網頁：GET /card/{token}（card_pages.py）；掛不上也不能讓 bot 起不來（當成沒有這個模組）
 if card_pages is not None:
     try:

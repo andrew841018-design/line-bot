@@ -111,6 +111,141 @@ def test_public_http_flag_does_not_bypass_job_token(client, monkeypatch):
     assert r.status_code == 401
 
 
+# Requests through the cloudflared quick tunnel carry proxy headers; local callers (n8n) never do.
+_FORWARDED_DETAIL = "forwarded request not allowed"
+_PROXY_HEADER_CASES = {
+    "x-forwarded-for": [("X-Forwarded-For", "203.0.113.9")],
+    # uvicorn keeps only the last X-Forwarded-For line, so this one fools the loopback check alone
+    "x-forwarded-for-twice-last-loopback": [
+        ("X-Forwarded-For", "203.0.113.9"),
+        ("X-Forwarded-For", "127.0.0.1"),
+    ],
+    "x-forwarded-proto": [("X-Forwarded-Proto", "https")],
+    "forwarded": [("Forwarded", "for=203.0.113.9")],
+    "x-real-ip": [("X-Real-Ip", "203.0.113.9")],
+    "cf-connecting-ip": [("Cf-Connecting-Ip", "203.0.113.9")],
+    "cf-ray": [("Cf-Ray", "8d1f0000aaaa-TPE")],
+}
+
+
+def _jobs_route_cases() -> list[tuple[str, str]]:
+    import jobs_router as jr
+
+    # getattr, not an APIRoute filter: a websocket route or mount must show up (and fail) too
+    return sorted(
+        (getattr(route, "path", repr(route)), method)
+        for route in jr.router.routes
+        for method in getattr(route, "methods", None) or {"(none)"}
+    )
+
+
+def test_jobs_router_routes_are_the_known_four():
+    # A new /jobs route must be added here on purpose; the proxy test below then covers it too.
+    assert _jobs_route_cases() == [
+        ("/jobs", "GET"),
+        ("/jobs/discord-alert", "POST"),
+        ("/jobs/{job_name}", "POST"),
+        ("/jobs/{job_name}/last-run", "GET"),
+    ]
+
+
+@pytest.mark.parametrize("header_case", sorted(_PROXY_HEADER_CASES))
+@pytest.mark.parametrize("path,method", _jobs_route_cases())
+def test_every_jobs_route_refuses_proxied_requests(client, path, method, header_case):
+    # No token or body: a route that skips _check_ip answers 401/400/2xx instead and fails here.
+    url = path.replace("{job_name}", "daily-briefing-discord")
+    r = client.request(method, url, headers=_PROXY_HEADER_CASES[header_case])
+    assert r.status_code == 403
+    assert r.json()["detail"] == _FORWARDED_DETAIL
+
+
+@pytest.mark.parametrize("job_name", ["no-such-job", "BadName"])
+@pytest.mark.parametrize("path,method", [case for case in _jobs_route_cases() if "{job_name}" in case[0]])
+def test_proxied_requests_cannot_probe_job_names(client, path, method, job_name):
+    # The proxy check runs before the job-name lookup: a tunnel visitor gets 403, never 404/400.
+    r = client.request(method, path.replace("{job_name}", job_name), headers={"Cf-Ray": "8d1f0000aaaa-TPE"})
+    assert r.status_code == 403
+    assert r.json()["detail"] == _FORWARDED_DETAIL
+
+
+def test_proxy_header_names_are_matched_case_insensitively():
+    # TestClient lowercases header names before the app sees them, so build the request by hand.
+    from starlette.requests import Request
+
+    import jobs_router as jr
+
+    assert jr._came_through_proxy(Request({"type": "http", "headers": [(b"Cf-Ray", b"x")]}))
+    assert jr._came_through_proxy(Request({"type": "http", "headers": [(b"X-Forwarded-For", b"203.0.113.9")]}))
+    assert not jr._came_through_proxy(Request({"type": "http", "headers": [(b"X-Job-Token", b"x")]}))
+
+
+def test_proxied_request_with_valid_credentials_is_still_refused(client, monkeypatch):
+    import jobs_router as jr
+
+    runs, alerts = [], []
+    monkeypatch.setattr(jr, "_run_subprocess", lambda job_name, spec: runs.append(job_name))
+    monkeypatch.setattr(jr, "_deliver_discord_alert", lambda msg: alerts.append(msg) or True)
+    proxied = {"Cf-Ray": "8d1f0000aaaa-TPE", "X-Forwarded-For": "203.0.113.9"}
+    job = "daily-briefing-discord"
+
+    responses = [
+        client.post(f"/jobs/{job}", headers={**proxied, "X-Job-Token": _token_for(job)}),
+        client.get(f"/jobs/{job}/last-run", headers={**proxied, "X-Job-Token": _token_for(job)}),
+        client.post(
+            "/jobs/discord-alert",
+            headers={**proxied, "X-Job-Token": _token_for("discord-alert")},
+            json={"content": "n8n failed"},
+        ),
+    ]
+
+    assert [r.status_code for r in responses] == [403, 403, 403]
+    assert all(r.json()["detail"] == _FORWARDED_DETAIL for r in responses)
+    assert runs == [] and alerts == []
+
+
+def test_proxy_check_runs_before_the_ip_check(client, monkeypatch):
+    import jobs_router as jr
+
+    monkeypatch.setattr(jr, "_ALLOWED_IPS", {"127.0.0.1"})
+
+    r = client.get("/jobs", headers={"Cf-Ray": "8d1f0000aaaa-TPE"})
+
+    assert r.status_code == 403
+    assert r.json()["detail"] == _FORWARDED_DETAIL
+
+
+def test_non_loopback_rejection_does_not_echo_the_client_ip(client, monkeypatch):
+    import jobs_router as jr
+
+    monkeypatch.setattr(jr, "_ALLOWED_IPS", {"127.0.0.1"})
+
+    r = client.get("/jobs")
+
+    assert r.status_code == 403
+    assert r.json()["detail"] == "IP not allowed"
+
+
+def test_public_http_flag_still_lets_token_routes_through_a_proxy(client, monkeypatch):
+    # Cloud Run's front end adds X-Forwarded-For too, so the flag skips the proxy check as well;
+    # the per-job token stays the gate, and the job list stays loopback-only.
+    import jobs_router as jr
+
+    monkeypatch.setenv("JOBS_ALLOW_PUBLIC_HTTP", "1")
+    runs = []
+    monkeypatch.setattr(jr, "_run_subprocess", lambda job_name, spec: runs.append(job_name))
+    proxied = {"Cf-Ray": "8d1f0000aaaa-TPE"}
+    job = "daily-briefing-discord"
+
+    assert client.post(f"/jobs/{job}", headers=proxied).status_code == 401
+    assert client.post(f"/jobs/{job}", headers={**proxied, "X-Job-Token": _token_for(job)}).status_code == 202
+    assert runs == [job]
+    last_run = client.get(f"/jobs/{job}/last-run", headers={**proxied, "X-Job-Token": _token_for(job)})
+    assert last_run.status_code == 200
+    listed = client.get("/jobs", headers=proxied)
+    assert listed.status_code == 403
+    assert listed.json()["detail"] == _FORWARDED_DETAIL
+
+
 def test_trigger_wrong_token(client):
     r = client.post(
         "/jobs/daily-briefing-discord",
