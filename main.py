@@ -93,6 +93,14 @@ from linebot.v3.webhooks import (  # type: ignore[import-untyped]
 )
 
 import burst_filter
+
+try:  # 2026-10-16 字卡大字版：模組壞掉也不能讓 bot 起不來；None = 不掛路由、不加按鈕、拒收 uri
+    import card_pages
+except Exception as _card_pages_error:  # noqa: BLE001
+    card_pages = None  # type: ignore[assignment]
+    logging.getLogger("line_bot").error(
+        "card_pages unavailable error_type=%s", type(_card_pages_error).__name__
+    )
 from correction_memory import ORGANIC_CORRECTION_PREFIXES, is_question_like
 import feedback_collector
 import gemini_client
@@ -254,6 +262,15 @@ async def _app_lifespan(_app: FastAPI):
 
 
 app = FastAPI(lifespan=_app_lifespan)
+# 2026-10-16 字卡大字版網頁：GET /card/{token}（card_pages.py）；掛不上也不能讓 bot 起不來（當成沒有這個模組）
+if card_pages is not None:
+    try:
+        app.include_router(card_pages.router)
+    except Exception as _card_router_error:  # noqa: BLE001
+        card_pages = None  # type: ignore[assignment]
+        logging.getLogger("line_bot").error(
+            "card_pages router unavailable error_type=%s", type(_card_router_error).__name__
+        )
 
 # Optional jobs router (n8n / external scheduler trigger surface).
 # Feature flag: JOBS_ROUTES_ENABLED=1 enables /jobs/* endpoints.
@@ -20545,7 +20562,8 @@ def _handle_fcn_command(event, group_id: str, body: str) -> tuple[str | None, di
 def _reply_fcn(event, group_id: str, text: str, body: str) -> None:
     reply_text, card, alt_text = _handle_fcn_command(event, group_id, body)
     _reply_command_card(
-        event, group_id, text, reply_text=reply_text, card=card, alt_text=alt_text, fallback_text=_FCN_FAILURE_TEXT
+        event, group_id, text, reply_text=reply_text, card=card, alt_text=alt_text, fallback_text=_FCN_FAILURE_TEXT,
+        page=True,
     )
 
 
@@ -20596,7 +20614,7 @@ def _handle_stock_command(event, body: str) -> tuple[str | None, dict | None, st
 def _reply_stock_picks(event, group_id: str, text: str, body: str) -> None:
     reply_text, card, alt_text, fallback = _handle_stock_command(event, body)
     _reply_command_card(
-        event, group_id, text, reply_text=reply_text, card=card, alt_text=alt_text, fallback_text=fallback
+        event, group_id, text, reply_text=reply_text, card=card, alt_text=alt_text, fallback_text=fallback, page=True
     )
 
 
@@ -20843,12 +20861,16 @@ def _reply_command_card(
     card: dict | None,
     alt_text: str | None,
     fallback_text: str,
+    page: bool = False,
 ) -> None:
-    """FCN 與股票推薦共用的回覆：只用 reply token、不進 recall、不提及任何人（清掉這則訊息
+    """FCN、股票推薦與爸媽健康共用的回覆：只用 reply token、不進 recall、不提及任何人（清掉這則訊息
     登記的 mention）；按選單按鈕來的（卡片或文字）都再掛選單。
 
     送卡前先驗 altText 不會被改寫、卡片上每個字都過 outbound validator；驗不過就用同一個
     token 回固定句（`_reply` 回 False 也可能是 LINE 400 或靜音，不能拿來判斷要不要補句）。
+
+    ``page``（2026-10-17）：只有股票、FCN 傳 True，才存大字版網頁、加「🔍 看大字版」。預設不加：
+    爸媽健康卡是家人健康紀錄，絕不能變成拿到連結就看得到的網頁。
     """
     _clear_reply_mention_targets(event.reply_token)
     menu_buttons = _is_menu_button_text(text)
@@ -20863,6 +20885,8 @@ def _reply_command_card(
             )
             card, reply_text = None, fallback_text
     if card is not None and alt_text:
+        if page:
+            card = _with_card_page(card, alt_text)
         _reply(
             event.reply_token,
             alt_text,
@@ -20882,14 +20906,53 @@ def _reply_command_card(
     )
 
 
+# 2026-10-17 只有這些 altText 開頭的卡做大字版（正面表列：卡上只有公開數字與名稱）；
+# 就是 stock_picks.PREFIX／EVAL_PREFIX、fcn_eval.PREFIX（test_card_pages 有漂移測試）。
+_CARD_PAGE_ALT_PREFIXES = ("股票推薦：", "股票評估：", "FCN 評估：")
+# FCN 確認卡（fcn_eval.build_confirm_card）不做：它把理專訊息裡沒標籤的 4–6 位數字也當成代號列出，
+# 可能是帳號尾碼，不能放到拿到連結就看得到的網頁。評估卡照做。
+_CARD_PAGE_SKIP_ALT_PREFIX = "FCN 評估：我讀到"
+
+
+def _with_card_page(card: dict, alt_text: str) -> dict:
+    """2026-10-16 字卡大字版：同一張卡存一頁大字版網頁，每張卡加「🔍 看大字版」。
+
+    卡片已經驗過才會到這裡；模組不能用、靜音中（_reply 不會送）、沒有對外網址、存檔失敗、
+    加了按鈕驗不過或任何意外，一律送原卡。altText 不是股票推薦／股票評估／FCN 評估卡（或是 FCN 確認卡）
+    也送原卡：爸媽健康卡就算被誤傳 page=True 也不做網頁（另外明擋，雙保險）。
+    """
+    alt = alt_text.lstrip()
+    if (
+        card_pages is None
+        or settings.bot_muted
+        or alt.startswith(_HEALTH_CARD_PREFIX)
+        or not alt.startswith(_CARD_PAGE_ALT_PREFIXES)
+        or alt.startswith(_CARD_PAGE_SKIP_ALT_PREFIX)
+    ):
+        return card
+    try:
+        url = card_pages.publish(card, alt_text)
+        if not url:
+            return card
+        paged = card_pages.with_page_button(card, url)
+        if not card_pages.fits_line_limits(paged):  # LINE 回 400 整張卡就沒了
+            return card
+        _validated_flex_card_message(alt_text, paged)
+    except Exception as exc:
+        logger.warning("card page skipped error_type=%s", type(exc).__name__)
+        return card
+    return paged
+
+
 _FLEX_CARD_FORBIDDEN_KEYS = frozenset({"uri", "url", "data", "altUri"})
 _FLEX_CARD_NODE_TYPES = frozenset({"carousel", "bubble", "box", "text", "button", "separator", "filler"})
 
 
 def _flex_card_texts(node) -> list[str]:
-    """指令卡片（FCN、股票推薦）的結構白名單：節點型別只能是 carousel／bubble／box／text／
+    """指令卡片（FCN、股票推薦、爸媽健康）的結構白名單：節點型別只能是 carousel／bubble／box／text／
     button／separator／filler（span 等其他型別的字不會被檢查，一律拒絕）；action 只能是
-    message、不能有網址或 postback。回傳所有要驗的字。"""
+    message，或「🔍 看大字版」連到這個程序剛發出的大字版網頁（2026-10-16，card_pages.page_action_ok）；
+    其他網址、postback 一律拒絕。回傳所有要驗的字。"""
     texts: list[str] = []
     if isinstance(node, dict):
         if _FLEX_CARD_FORBIDDEN_KEYS & set(node):
@@ -20899,9 +20962,16 @@ def _flex_card_texts(node) -> list[str]:
             raise ValueError("flex card contains an unsupported node type")
         action = node.get("action")
         if action is not None:
-            if not isinstance(action, dict) or action.get("type") != "message":
+            if not isinstance(action, dict):
                 raise ValueError("flex card action must be a message action")
-            texts += [str(action.get("label") or ""), str(action.get("text") or "")]
+            if action.get("type") == "uri":
+                if card_pages is None or not card_pages.page_action_ok(action):
+                    raise ValueError("flex card uri action must open the card's own page")
+                texts.append(str(action.get("label") or ""))
+            elif action.get("type") != "message":
+                raise ValueError("flex card action must be a message action")
+            else:
+                texts += [str(action.get("label") or ""), str(action.get("text") or "")]
         if node.get("type") == "text":
             texts.append(str(node.get("text") or ""))
         for key, value in node.items():
@@ -21491,6 +21561,8 @@ _HELP_TEXT = (
     "                          1–4 檔，代號或中文名都可以；期限沒寫當 6 個月，\n"
     "                          可加「12個月」「KO95%」「KI60%」\n"
     "                          引用理專那則訊息再打 /FCN：先回「我讀到的條件」，點按鈕才評估\n"
+    "  🔍 看大字版             股票卡、FCN 評估卡最下面的按鈕：點了用網頁看大字\n"
+    "                          網址過幾天會換，打不開就再叫一次卡片\n"
     "【其他】\n"
     "  /group_id               顯示本群 ID\n"
     "  /help                   看這張說明"
@@ -22276,10 +22348,11 @@ def _reply(
     ``menu_buttons``（按了選單按鈕的回覆）：選單的 Quick Reply 再掛到這次回覆的
     最後一則上，連續點下一顆不用重打「選單」；搭車的提醒照送（2026-10-07）。
 
-    ``flex_card``（FCN 評估卡 2026-10-09、股票推薦卡 2026-10-10）：主訊息是這張 Flex 卡，
+    ``flex_card``（FCN 評估卡 2026-10-09、股票推薦卡 2026-10-10、爸媽健康卡 2026-10-17）：主訊息是這張 Flex 卡，
     ``text`` 傳 altText。規則同大字選單（不搭到期提醒、不 push fallback、組卡失敗不送並結案），
-    另外 altText 與卡片上每個字都要原樣通過 outbound validator、節點型別與 action 走白名單。
-    全程式只有 `_reply_command_card` 一個呼叫點（FCN 與股票推薦共用，送前先驗、驗不過回固定句）；
+    另外 altText 與卡片上每個字都要原樣通過 outbound validator、節點型別與 action 走白名單
+    （action 只能是 message，或這張卡自己的「🔍 看大字版」網頁，2026-10-16；只有股票、FCN 評估卡會有）。
+    全程式只有 `_reply_command_card` 一個呼叫點（FCN、股票推薦、爸媽健康共用，送前先驗、驗不過回固定句）；
     不能和 menu_card／large_menu_card 一起用。
 
     ``index_for_recall``：False 時 bot 的這則回覆存檔但不進 recall 索引（FCN、股票推薦用）。

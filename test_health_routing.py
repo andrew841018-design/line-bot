@@ -502,6 +502,16 @@ def test_real_overview_card_goes_out_through_the_validated_card_path():
     add.assert_not_called()
 
 
+def test_health_cards_never_ask_for_a_large_print_page(monkeypatch):
+    """2026-10-17 字卡大字版只給股票、FCN：健康卡是家人健康紀錄，不能變成拿到連結就看得到的網頁。"""
+    page = MagicMock(side_effect=AssertionError("health cards must not become web pages"))
+    monkeypatch.setattr(main, "_with_card_page", page)
+    reply, _cancel, _add = _routed("/健康")
+    args, kwargs = reply.call_args
+    assert args[1].startswith("爸媽健康卡：") and kwargs["flex_card"] is not None
+    page.assert_not_called()
+
+
 def test_every_health_card_button_routes_to_the_health_command():
     import parent_health
 

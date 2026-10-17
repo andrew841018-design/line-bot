@@ -67,6 +67,8 @@ os.environ.setdefault("LINE_CHANNEL_ACCESS_TOKEN", "dummy")
 os.environ.setdefault("GEMINI_API_KEY", "dummy")
 os.environ.setdefault("GROK_API_KEY", "dummy")
 os.environ.setdefault("BOT_MUTED", "true")
+# 2026-10-16 字卡大字版：測試預設不產生網頁、不加按鈕（本機有 tunnel 網址檔），要測的測試自己打開
+os.environ["LINE_BOT_CARD_PAGES"] = "0"  # 直接設：shell 有 export 也不能讓測試讀真的 tunnel 檔、寫進 state/
 # Semantic restatement judge calls Gemini; unit tests enable it explicitly with a fake.
 os.environ.setdefault("LINE_BOT_RESTATEMENT_JUDGE", "0")
 # 2026-10-04: the separate-quota last Gemini tier stays off unless a test
