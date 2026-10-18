@@ -131,7 +131,14 @@ def _save_usage(data: dict) -> None:
                 pass
 
 
-def _track_usage(response) -> None:
+def _track_usage(response, *, count_request: bool = True) -> None:
+    """Add a response's tokens to today's usage, and one request unless
+    ``count_request`` is False (media side tasks book their requests per model).
+
+    TODO(2026-10-17 D2): load/add/save is not locked across threads or
+    processes, so concurrent calls can lose an update (an undercount; the
+    write itself is atomic).
+    """
     try:
         meta = getattr(response, "usage_metadata", None)
         if meta is None:
@@ -141,7 +148,8 @@ def _track_usage(response) -> None:
         data = _load_usage()
         data["tokens"] = data.get("tokens", 0) + tokens
         data["thinking_tokens"] = data.get("thinking_tokens", 0) + thinking
-        data["requests"] = data.get("requests", 0) + 1
+        if count_request:
+            data["requests"] = data.get("requests", 0) + 1
         _save_usage(data)
     except Exception:
         pass
@@ -180,7 +188,7 @@ def mark_quota_exhausted_in_usage() -> None:
 _BOT_DIR = os.path.dirname(os.path.abspath(__file__))
 _MODEL_USAGE_FILE = os.path.join(_BOT_DIR, "gemini_model_usage.json")
 _MODEL_USAGE_LOCK_FILE = os.path.join(_BOT_DIR, "locks", "gemini_model_usage.lock")
-_MODEL_USAGE_KINDS = ("chat", "extract", "judge")
+_MODEL_USAGE_KINDS = ("chat", "extract", "judge", "media")
 _model_usage_lock = threading.Lock()
 # No tools (2026-10-04 live check): on this API key gemini-3.1-flash-lite
 # answers plain requests, but every request carrying google_search was refused
@@ -271,7 +279,7 @@ def _update_model_usage(model: str, change) -> None:
 
 
 def track_model(model: str, kind: str, ok: bool = True) -> None:
-    """Count one ``kind`` request ("chat", "extract", "judge") for ``model`` today.
+    """Count one ``kind`` request ("chat", "extract", "judge", "media") for ``model`` today.
 
     A failed request counts too (Google books it against the quota) and also
     adds to ``failed``.
@@ -297,7 +305,7 @@ def mark_model_exhausted(model: str) -> None:
 
 
 def model_usage(model: str) -> dict:
-    """Today's counts for ``model``: chat, extract, judge, failed, exhausted."""
+    """Today's counts for ``model``: chat, extract, judge, media, failed, exhausted."""
     entry = _load_model_usage()["models"].get(model)
     if not isinstance(entry, dict):
         entry = {}
@@ -470,7 +478,7 @@ def side_task_last_tier(prompt, config, *, label: str):
         quota = "-"
         if _is_rate_limited(e):
             text = str(e)
-            quota = "day" if "PerDay" in text else "minute" if "PerMinute" in text else "other"
+            quota = "day" if _is_per_day_quota(e) else "minute" if "PerMinute" in text else "other"
         exhausted = quota == "day"
         backoff = 0
         if exhausted:
@@ -493,6 +501,115 @@ def side_task_last_tier(prompt, config, *, label: str):
         "%s answered by last tier %s %s", label, model, _side_task_log_fields(model, started)
     )
     return response
+
+
+# ── 媒體側任務（2026-10-17，TikTok 影片／圖文）──────────────────────────────
+# gemini_light_model reads the media: requests are booked per model as
+# "media", never in the 2.5 models' 20-request counter, while their tokens
+# still count toward the flat daily cap.  LINE_BOT_TIKTOK_MEDIA_DAILY_CAP
+# (default 10) is read at call time and doubles as the off switch: 0, or a
+# value that is not a non-negative integer, turns media reading off.
+_MEDIA_DAILY_CAP_DEFAULT = 10
+_MEDIA_TRANSIENT_BACKOFF_SEC = 60
+_MEDIA_CLIENT_ERROR_BACKOFF_SEC = 3600
+_MEDIA_BAD_REQUEST_LIMIT = 3  # a 400 is about that payload; three in a row is about us
+_media_backoff_until = 0.0
+_media_bad_requests = 0
+_media_cap_warned = ""  # the bad value already warned about (once, not on every link)
+
+
+def media_daily_cap() -> int:
+    raw = os.environ.get("LINE_BOT_TIKTOK_MEDIA_DAILY_CAP", "").strip()
+    if not raw:
+        return _MEDIA_DAILY_CAP_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if value < 0:
+        global _media_cap_warned
+        if _media_cap_warned != raw:
+            _media_cap_warned = raw
+            logger.warning(
+                "LINE_BOT_TIKTOK_MEDIA_DAILY_CAP is not a non-negative integer; TikTok media reading is off"
+            )
+        return 0
+    return value
+
+
+def media_model() -> str:
+    """The model that reads media, or "" when it has no quota of its own."""
+    name = str(getattr(settings, "gemini_light_model", "") or "").strip()
+    if not name.startswith("gemini-") or name == settings.gemini_model:
+        return ""
+    return name
+
+
+def media_task_ready() -> bool:
+    """True when one media request may be sent now (sends nothing)."""
+    model = media_model()
+    if not model or time.time() < _media_backoff_until:
+        return False
+    usage = model_usage(model)
+    return not usage["exhausted"] and usage["media"] < media_daily_cap()
+
+
+def media_side_task(contents, config, *, label: str, still_wanted=lambda: True, expired=lambda: False):
+    """Send one media request; ``None`` = not sent, no longer wanted, or failed.
+
+    Booked before the call so a concurrent task sees it; ``still_wanted()``
+    (enough time left to start) is asked again after booking, which can wait
+    on the usage-file lock, so no request starts too late.  A failure while
+    ``expired()`` (the caller cancelled or its deadline passed) came from that
+    deadline and backs nothing off.  Logs carry only the label, model, error
+    type and code: never the media, the prompt or the answer.
+    """
+    global _media_backoff_until, _media_bad_requests
+    if not media_task_ready():
+        return None
+    model = media_model()
+    track_model(model, "media")
+    if not still_wanted():
+        logger.info("%s media request not sent: out of time", label)
+        return None
+    try:
+        response = _client.models.generate_content(model=model, contents=contents, config=config)
+    except Exception as e:
+        _update_model_usage(model, _count_failed)
+        code = _error_code(e)
+        # Only an explicit per-day quota closes the day: "free_tier_requests"
+        # also appears in per-minute 429s (see is_daily_quota_error's TODO).
+        exhausted = _is_per_day_quota(e)
+        backoff = 0
+        if exhausted:
+            mark_model_exhausted(model)
+        elif expired() and code in (None, 504):
+            pass  # a timeout from our own deadline (504: the server honoured it), not Gemini
+        elif code == 400:
+            _media_bad_requests += 1
+            if _media_bad_requests >= _MEDIA_BAD_REQUEST_LIMIT:
+                backoff = _MEDIA_CLIENT_ERROR_BACKOFF_SEC
+                _media_bad_requests = 0
+        elif code in (401, 403, 404):
+            backoff = _MEDIA_CLIENT_ERROR_BACKOFF_SEC
+        else:
+            backoff = _MEDIA_TRANSIENT_BACKOFF_SEC
+        if backoff:
+            _media_backoff_until = time.time() + backoff
+        logger.warning(
+            "%s media %s failed error_type=%s code=%s exhausted=%d backoff_s=%d",
+            label, model, type(e).__name__, code, int(exhausted), backoff,
+        )
+        return None
+    _media_bad_requests = 0
+    _track_usage(response, count_request=False)
+    logger.info("%s answered by media model %s media=%d", label, model, model_usage(model)["media"])
+    return response
+
+
+def _is_per_day_quota(e: BaseException) -> bool:
+    """A 429 that says the per-day quota is spent ("PerDay" only; see is_daily_quota_error)."""
+    return _is_rate_limited(e) and "PerDay" in str(e)
 
 
 def _error_code(e: BaseException) -> int | None:

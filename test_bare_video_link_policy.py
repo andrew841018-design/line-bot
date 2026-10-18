@@ -20,6 +20,7 @@ from video_reply import VIDEO_COMMENTARY_CONTRACT
 SHORTS = "https://youtube.com/shorts/NOSUBS00000?si=SYNTHETIC0"
 YT = "https://youtu.be/NOSUBS00000"
 YT_SUBS = "https://youtu.be/WITHSUBS000"
+TIKTOK_LONG = "https://www.tiktok.com/@demo.user/video/1234567890"
 SUBS = "字幕第一句：這是合成的逐字稿內容。第二句：補助金額是每月三千元。"
 
 
@@ -228,7 +229,7 @@ def burst_env(monkeypatch, tmp_path, fake_ytdlp):
     main.memory._init_db()
     assert main.memory.begin_inbound_event("GRP001", "MSG001") == "new"
     monkeypatch.setattr(main, "_inbound_reply_by_token", {})
-    monkeypatch.setattr(main, "_gemini_side_task_allowed", lambda _name: False)
+    monkeypatch.setattr(main, "_gemini_side_task_allowed", lambda *_a, **_kw: False)
     monkeypatch.setattr(main.memory, "get_context", lambda _gid: [])
     monkeypatch.setattr(main.memory, "top_facts", lambda _gid: [])
     monkeypatch.setattr(main, "_get_persona_notes", lambda _gid: [])
@@ -254,10 +255,21 @@ def test_burst_bare_video_without_transcript_is_silent(monkeypatch, burst_env):
 
 
 def test_burst_bare_tiktok_with_gemini_refusal_is_silent(monkeypatch, burst_env):
+    # 2026-10-17 flow: the share link resolves to a video without subtitles, the
+    # burst reply path lets flash-lite watch it (tiktok_media), and it refuses.
     monkeypatch.setattr(main.memory, "check_fact_cache", lambda *_a: pytest.fail("stale cache must be bypassed"))
-    monkeypatch.setattr(main, "_GEMINI_VIDEO_THIN_THRESHOLD", 100_000)  # always try Gemini
-    monkeypatch.setattr(main, "_fetch_video_gemini", lambda *_a, **_k: _gemini_block("無法辨識影片內容。"))
+    monkeypatch.setenv("LINE_BOT_TIKTOK_MEDIA_DAILY_CAP", "10")
+    monkeypatch.setattr(main, "_resolve_tiktok_url", lambda u, deadline=None: TIKTOK_LONG)
+    monkeypatch.setattr(main, "_gemini_side_task_allowed", lambda *_a, **_kw: True)
+    monkeypatch.setattr(main.gemini_client, "media_task_ready", lambda: True)
+    watched = []
+    monkeypatch.setattr(
+        main.tiktok_media,
+        "read_video",
+        lambda *a: watched.append(a) or (_gemini_block("無法辨識影片內容。"), False),
+    )
     main._handle_burst_flush("GRP001", "https://vt.tiktok.com/ZSDEMO01/", "TOKEN001", ["MSG001"])
+    assert len(watched) == 1  # the reading job really ran
     assert burst_env == []
     assert _status() == "completed_no_reply"
 

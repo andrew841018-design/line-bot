@@ -105,6 +105,7 @@ from correction_memory import ORGANIC_CORRECTION_PREFIXES, is_question_like
 import feedback_collector
 import gemini_client
 import line_mentions
+import tiktok_media
 import memory
 import speaker_turns
 import mibao_identity
@@ -1356,6 +1357,20 @@ _YOUTUBE_HOSTS = ("youtube.com", "youtu.be", "youtube-nocookie.com")
 _TIKTOK_HOSTS = ("tiktok.com",)
 # TikTok 短網址（vt.tiktok.com / vm.tiktok.com）需先 redirect 才能丟 oEmbed
 _TIKTOK_SHORT_HOSTS = frozenset({"vt.tiktok.com", "vm.tiktok.com"})
+# TikTok 影片／圖文（2026-10-17）：tiktok_media.py 讀內容；這裡解析分享連結、
+# 分路、限時。只有回覆路徑（_heavy_link_reads）才讀影片與圖片，同一則訊息
+# 的 TikTok 連結共用一個時限，全程一次只跑一個讀取工作。
+_TIKTOK_VIDEO_PATH_RE = re.compile(r"^/@([\w.-]+)/video/(\d+)/?$", re.ASCII)
+_TIKTOK_PHOTO_PATH_RE = re.compile(r"^/@([\w.-]+)/photo/(\d+)/?$", re.ASCII)
+_TIKTOK_PREFETCH_BUDGET_SEC = 30.0  # from entering _prefetch_urls; the reply token lasts ~1 min
+_TIKTOK_VIDEO_JOB_MIN_SEC = 14.0  # a video job re-extracts, downloads, then needs 8 s for Gemini
+_TIKTOK_PHOTO_JOB_MIN_SEC = 8.0
+_TIKTOK_RESOLVE_DEADLINE = 5.0
+_TIKTOK_EXTRACT_MIN_SEC = 2.0  # yt-dlp metadata/subtitles need at least this much left
+_TIKTOK_META_MIN_SEC = 10.0  # oEmbed's own safe_fetch deadline: it never runs past ours
+_TIKTOK_MEDIA_SLOT = threading.BoundedSemaphore(1)
+_TIKTOK_METADATA_SLOTS = threading.BoundedSemaphore(2)  # abandoned yt-dlp reads cannot pile up
+_heavy_reads_state = threading.local()
 _REDDIT_HOSTS = ("reddit.com", "redd.it")
 _INSTAGRAM_HOSTS = ("instagram.com",)
 # Gemini video fallback 只給短影音平台（YouTube 靠 yt-dlp 字幕，不走 fallback）
@@ -1727,6 +1742,19 @@ def _recording_link_content():
         _link_content_state.found = previous
 
 
+@contextmanager
+def _heavy_link_reads():
+    """Let `_prefetch_urls` in this thread watch TikTok videos and read photo
+    posts (2026-10-17).  Reply paths only: off by default, so research reads,
+    tests and any new caller never start a reading job."""
+    previous = getattr(_heavy_reads_state, "on", False)
+    _heavy_reads_state.on = True
+    try:
+        yield
+    finally:
+        _heavy_reads_state.on = previous
+
+
 def _format_duration_seconds(duration: object) -> str | None:
     try:
         total = int(duration)  # type: ignore[arg-type]
@@ -1755,8 +1783,9 @@ def _youtube_live_status_label(info: dict) -> str | None:
 
 
 def _append_youtube_metadata_lines(lines: list[str], info: dict) -> None:
-    title = (info.get("title") or "").strip()
-    uploader = (info.get("uploader") or info.get("channel") or "").strip()
+    # Uploader text cannot fake a block boundary or hide bidi/zero-width characters (2026-10-17).
+    title = reply_policy.neutralize_material(info.get("title") or "").strip()
+    uploader = reply_policy.neutralize_material(info.get("uploader") or info.get("channel") or "").strip()
     channel_url = (info.get("channel_url") or info.get("uploader_url") or "").strip()
     webpage_url = (info.get("webpage_url") or "").strip()
     duration_text = (
@@ -1764,7 +1793,7 @@ def _append_youtube_metadata_lines(lines: list[str], info: dict) -> None:
     )
     live_label = _youtube_live_status_label(info)
     view_count = info.get("view_count")
-    description = (info.get("description") or "").strip()
+    description = reply_policy.neutralize_material(info.get("description") or "").strip()
 
     if title:
         lines.append(f"標題：{title}")
@@ -1877,6 +1906,50 @@ def _fetch_video_ytdlp(url: str) -> str | None:
         return None
 
 
+def _resolve_tiktok_url(url: str, deadline: float | None = None) -> str | None:
+    """Where a TikTok link points (2026-10-17).
+
+    A share link (vt./vm.tiktok.com) is followed hop by hop through safe_fetch:
+    its TikTok target, or None when it leaves TikTok or safe_fetch refuses it.
+    One that only timed out or lost its connection comes back as it is: yt-dlp
+    follows it as before, and it never gets a reading job.  Other links come
+    back unchanged.  Logs show host and path only: share redirects carry the
+    sharer's ids in the query.
+    """
+    if _url_host(url) not in _TIKTOK_SHORT_HOSTS:
+        return url
+    limit = _TIKTOK_RESOLVE_DEADLINE
+    if deadline is not None:
+        limit = min(limit, deadline - time.monotonic())
+        if limit <= 0:
+            return url
+    try:
+        r = _requests.head(
+            url,
+            timeout=_PREFETCH_TIMEOUT,
+            allow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"},
+            deadline=limit,
+        )
+    except (safe_fetch.FetchTimeout, OSError) as e:  # OSError: requests' ConnectionError / Timeout
+        logger.info("tiktok short url not resolved error_type=%s", type(e).__name__)
+        return url
+    except Exception as e:  # BlockedURL (incl. DNS), TooLarge, Unsupported, bad URL: fail closed
+        logger.info("tiktok short url refused error_type=%s", type(e).__name__)
+        return None
+    target_url = r.url
+    if not _host_in(_url_host(target_url), _TIKTOK_HOSTS):
+        logger.info("tiktok short url left tiktok; skip")
+        return None
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(target_url)
+    # The share redirect's query carries the sharer's ids: keep scheme, host and path only.
+    target_url = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+    logger.info("tiktok short url resolved to %s", parts.path)
+    return target_url
+
+
 def _fetch_tiktok_meta(url: str) -> str | None:
     """
     TikTok 專用 prefetch：走官方 oEmbed API（公開 endpoint，免 token）取 caption / 作者 / 音樂。
@@ -1890,25 +1963,9 @@ def _fetch_tiktok_meta(url: str) -> str | None:
     """
     try:
         # 短網址（vt.tiktok.com / vm.tiktok.com）先 HEAD follow redirect 拿完整 URL
-        target_url = url
-        if _url_host(url) in _TIKTOK_SHORT_HOSTS:
-            try:
-                r = _requests.head(
-                    url,
-                    timeout=_PREFETCH_TIMEOUT,
-                    allow_redirects=True,
-                    headers={
-                        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
-                    },
-                )
-                target_url = r.url
-                logger.info("tiktok short url resolved: %s → %s", url, target_url)
-            except Exception as e:
-                logger.info("tiktok short url resolve failed url=%s: %s", url, e)
-                return None
-            if not _host_in(_url_host(target_url), _TIKTOK_HOSTS):
-                logger.info("tiktok short url left tiktok; skip url=%s", url)
-                return None
+        target_url = _resolve_tiktok_url(url)
+        if target_url is None or _url_host(target_url) in _TIKTOK_SHORT_HOSTS:
+            return None
 
         # 呼叫 oEmbed API
         resp = _requests.get(
@@ -1929,14 +1986,14 @@ def _fetch_tiktok_meta(url: str) -> str | None:
             )
             return None
 
-        title = (data.get("title") or "").strip()
-        author_name = (data.get("author_name") or "").strip()
-        author_id = (data.get("author_unique_id") or "").strip()
+        title = reply_policy.neutralize_material(data.get("title") or "").strip()
+        author_name = reply_policy.neutralize_material(data.get("author_name") or "").strip()
+        author_id = reply_policy.neutralize_material(data.get("author_unique_id") or "").strip()
 
         # 從 html 欄位抽出背景音樂資訊
         html_field = data.get("html") or ""
         music_match = _TIKTOK_MUSIC_RE.search(html_field)
-        music = music_match.group(1).strip() if music_match else ""
+        music = reply_policy.neutralize_material(music_match.group(1)).strip() if music_match else ""
 
         if not title and not author_name:
             logger.info("tiktok oembed empty content url=%s", target_url)
@@ -2601,6 +2658,11 @@ def _fetch_video_gemini(url: str) -> str | None:
 def _maybe_video_fallback(url: str, current_block: str | None) -> str | None:
     """若 current_block 太薄且 URL 是視訊平台，嘗試 Gemini video fallback。
 
+    TODO(2026-10-17 D3): IG/FB/X/Threads still use this length gate (a long
+    metadata block skips Gemini, so the link stays unread), run it on research
+    reads too, and can stack with a TikTok reading job in one message; TikTok
+    itself moved to _prefetch_tiktok / tiktok_media.
+
     回傳：fallback 結果 OR 原 current_block（保持原行為）
     """
     if not _host_in(_url_host(url), _GEMINI_VIDEO_HOSTS):
@@ -2660,13 +2722,181 @@ def _prefetched_material(prefetched: str, original: str) -> str:
     return prefetched[: len(prefetched) - len(original)].strip()
 
 
+def _run_tiktok_media_job(job, deadline: float, label: str, min_sec: float) -> tuple[str, bool] | None:
+    """Run one tiktok_media reader on a daemon thread, waiting until ``deadline``.
+
+    One job at a time in the whole process; too little time left, a closed
+    Gemini budget or a busy slot means no job.  The reader gets the deadline
+    and a cancel event and starts no Gemini request after either.  It returns
+    ``(block, usable)`` and never notes link content itself: the recorder is
+    thread-local, so the caller notes.
+    """
+    if (
+        deadline - time.monotonic() < min_sec
+        or not gemini_client.media_task_ready()
+        or not _gemini_side_task_allowed("tiktok media", uses_flash=False)  # flat token reserve
+    ):
+        return None
+    slot = _TIKTOK_MEDIA_SLOT  # the one this job holds, even if the global is replaced
+    if not slot.acquire(blocking=False):
+        logger.info("tiktok %s: another reading job is running; skip", label)
+        return None
+    cancel = threading.Event()
+    box: dict = {}
+
+    def work() -> None:
+        try:
+            box["result"] = job(deadline, cancel)
+        except Exception as e:  # noqa: BLE001 - a failed job only means nothing was read
+            logger.info("tiktok %s job failed error_type=%s", label, type(e).__name__)
+        finally:
+            slot.release()
+
+    worker = threading.Thread(target=work, name=f"tiktok-{label}", daemon=True)
+    try:
+        worker.start()
+    except RuntimeError:
+        slot.release()
+        return None
+    worker.join(max(0.0, deadline - time.monotonic()))
+    if worker.is_alive():
+        cancel.set()  # it keeps the slot until it really ends
+        logger.info("tiktok %s job over the time budget; giving up", label)
+        return None
+    return box.get("result")
+
+
+def _extract_tiktok_video(fetch_url: str, deadline: float | None) -> tuple[str | None, bool]:
+    """yt-dlp metadata and subtitles for a TikTok video: ``(block, read)``.
+
+    On reply paths it runs on a daemon thread and is given up at ``deadline``
+    (yt-dlp's own socket timeout is 12 s per request); the recorder is
+    thread-local, so whether subtitles were read comes back as ``read``.
+    """
+
+    def extract() -> tuple[str | None, bool]:
+        with _recording_link_content() as found:
+            block = _fetch_video_ytdlp(fetch_url)
+        return block, bool(found)
+
+    if deadline is None:
+        return extract()
+    slots = _TIKTOK_METADATA_SLOTS
+    if not slots.acquire(blocking=False):
+        logger.info("tiktok metadata: earlier reads still running; skip")
+        return None, False
+    box: dict = {}
+
+    def work() -> None:
+        try:
+            box["result"] = extract()
+        except Exception as e:  # noqa: BLE001 - _fetch_video_ytdlp already returns None on errors
+            logger.info("tiktok metadata failed error_type=%s", type(e).__name__)
+        finally:
+            slots.release()
+
+    worker = threading.Thread(target=work, name="tiktok-metadata", daemon=True)
+    try:
+        worker.start()
+    except RuntimeError:
+        slots.release()
+        return None, False
+    worker.join(max(0.0, deadline - time.monotonic()))
+    if worker.is_alive():
+        logger.info("tiktok metadata over the time budget; giving up")
+        return None, False
+    return box.get("result", (None, False))
+
+
+def _prefetch_tiktok(url: str, deadline: float | None) -> str | None:
+    """A TikTok link's prompt block (2026-10-17).
+
+    ``deadline`` is set only on reply paths (`_heavy_link_reads`); then a video
+    without subtitles is watched and a photo post's images are read by
+    gemini_light_model (tiktok_media.py).  Without it, as before: yt-dlp
+    metadata/subtitles or the oEmbed caption, which do not count as read.
+    """
+    from urllib.parse import urlsplit
+
+    def time_left() -> float:
+        return float("inf") if deadline is None else deadline - time.monotonic()
+
+    if time_left() <= 0:
+        logger.info("tiktok: message time budget spent; skip")
+        return None
+    target = _resolve_tiktok_url(url, deadline)
+    if target is None or time_left() <= 0:
+        return None
+    path = urlsplit(target).path or ""
+    reading = deadline is not None and gemini_client.media_daily_cap() > 0
+    photo = _TIKTOK_PHOTO_PATH_RE.match(path)
+    if photo:
+        # yt-dlp has no photo-post extractor: never ask it.
+        result = None
+        if reading:
+            # An earlier read of the same post costs nothing, even past the cap.
+            hit, result = tiktok_media.cached_photo(url, photo.group(2))
+            if not hit:
+                result = _run_tiktok_media_job(
+                    lambda d, c: tiktok_media.read_photo_post(url, photo.group(1), photo.group(2), d, c),
+                    deadline,
+                    "photo",
+                    _TIKTOK_PHOTO_JOB_MIN_SEC,
+                )
+        if result is not None:
+            block, usable = result
+            if usable:
+                _note_link_content()
+            return block
+        return _fetch_tiktok_meta(target) if time_left() > _TIKTOK_META_MIN_SEC else None
+    video = _TIKTOK_VIDEO_PATH_RE.match(path)
+    # TikTokIE wants www.tiktok.com/@user/video/<id>; also drops the share ids.
+    fetch_url = f"https://www.tiktok.com/@{video.group(1)}/video/{video.group(2)}" if video else target
+    unresolved = _url_host(target) in _TIKTOK_SHORT_HOSTS
+    hit, result = (False, None)
+    if video is not None and reading:
+        # An earlier read of the same video costs nothing, even past the cap or the budget.
+        hit, result = tiktok_media.cached_video(url, video.group(2))
+        if result is not None and result[1]:
+            _note_link_content()
+            return result[0]
+    if time_left() <= _TIKTOK_EXTRACT_MIN_SEC:
+        return None
+    # TODO(2026-10-17 D5): a photo post opened through a /video/ URL looks like an
+    # audio-only video here; the strict h264 format then finds nothing (silent).
+    block, read = _extract_tiktok_video(fetch_url, deadline)
+    if block is None and not unresolved and time_left() > _TIKTOK_META_MIN_SEC:
+        block = _fetch_tiktok_meta(target)
+    if read:
+        _note_link_content()  # subtitles: tell the caller's recorder
+        return block
+    if hit:  # read before: unreadable, or an answer without content; no new job
+        return "\n\n".join(part for part in (block, result[0] if result else None) if part) or None
+    if video is None or not reading:
+        return block
+    result = _run_tiktok_media_job(
+        lambda d, c: tiktok_media.read_video(url, fetch_url, video.group(2), d, c),
+        deadline,
+        "video",
+        _TIKTOK_VIDEO_JOB_MIN_SEC,
+    )
+    if result is None:
+        return block
+    analysis, usable = result
+    if usable:
+        _note_link_content()
+    return "\n\n".join(part for part in (block, analysis) if part)
+
+
 def _prefetch_urls(text: str) -> str:
     """
     從文字中抽出 URL（_fetch_urls），經 safe_fetch 預先抓取網頁內容，
     轉成純文字後塞進 prompt。
 
     特殊平台優先走公開 API（oEmbed / .json），比 HTML prefetch 或 Gemini url_context 穩定：
-      - TikTok  → www.tiktok.com/oembed（caption + author + music）
+      - TikTok  → yt-dlp 字幕／metadata，失敗才 www.tiktok.com/oembed（caption + author + music）；
+                  回覆路徑（_heavy_link_reads）上，沒字幕的影片與圖文貼文交給 tiktok_media.py
+                  讀（2026-10-17），同一則訊息共用 _TIKTOK_PREFETCH_BUDGET_SEC
       - YouTube → www.youtube.com/oembed（title + channel）
       - Reddit  → <permalink>.json（title + selftext + top 3 comments）
       - Google Maps 短網址 → 逐跳驗證 redirect 後解析地點查詢文字
@@ -2678,6 +2908,11 @@ def _prefetch_urls(text: str) -> str:
     if not urls:
         return text
 
+    tiktok_deadline = (
+        time.monotonic() + _TIKTOK_PREFETCH_BUDGET_SEC
+        if getattr(_heavy_reads_state, "on", False)
+        else None
+    )
     blocks = []
     for url in urls:
         try:
@@ -2694,11 +2929,10 @@ def _prefetch_urls(text: str) -> str:
                 logger.info("prefetch skip (unsafe url) url=%s", url)
                 continue
 
-            # 1) 影片平台：yt-dlp 優先（支援字幕），失敗才 fallback oEmbed
+            # 1) 影片平台：yt-dlp 優先（支援字幕），失敗才 fallback oEmbed；
+            #    沒字幕的影片、圖文貼文在回覆路徑上由 tiktok_media 讀（見 _prefetch_tiktok）
             if _host_in(host, _TIKTOK_HOSTS):
-                block = _fetch_video_ytdlp(url) or _fetch_tiktok_meta(url)
-                # 內容太薄（< 300 chars）→ Gemini Video Understanding fallback
-                block = _maybe_video_fallback(url, block)
+                block = _prefetch_tiktok(url, tiktok_deadline)
                 if block:
                     blocks.append(block)
                 else:
@@ -12352,7 +12586,7 @@ def _handle_explicit_text(
 
     quote_policy_input = user_input
     # URL 預抓取：先用 Python 抓網頁內容塞進 prompt，繞過 Gemini url_context 的限制
-    with _recording_link_content() as link_content:
+    with _recording_link_content() as link_content, _heavy_link_reads():
         user_input = _prefetch_urls(user_input)
     if bare_share and not link_content:
         # Nothing readable behind the links: anything said would retell a title.
@@ -13012,7 +13246,7 @@ def _handle_burst_flush(
         return
 
     # URL 預抓取：先用 Python 抓網頁內容塞進 prompt，繞過 Gemini url_context 的限制
-    with _recording_link_content() as link_content:
+    with _recording_link_content() as link_content, _heavy_link_reads():
         prefetched = _prefetch_urls(combined_text)
     if bare_share and not link_content:
         # Nothing readable behind the links (only two get fetched, and the model
@@ -15138,7 +15372,8 @@ def _build_group_parts(items: list[dict], group_id: str) -> list:
     combined_text = "\n".join(texts).strip()
     if combined_text:
         # URL 預抓
-        combined_text = _prefetch_urls(combined_text)
+        with _heavy_link_reads():
+            combined_text = _prefetch_urls(combined_text)
         parts.append(combined_text)
     return parts
 

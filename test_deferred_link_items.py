@@ -649,6 +649,8 @@ def test_platform_links_reach_their_branch(monkeypatch, url, branch):
     monkeypatch.setattr(main, "_fetch_reddit_meta", lambda u: seen.append("reddit") or None)
     monkeypatch.setattr(main, "_fetch_instagram_embed", lambda u: seen.append("instagram") or None)
     monkeypatch.setattr(main, "_maybe_video_fallback", lambda u, block: block)
+    # conftest refuses every real resolution; a share link resolves to a video here.
+    monkeypatch.setattr(main, "_resolve_tiktok_url", lambda u, deadline=None: "https://www.tiktok.com/@u/video/1")
     monkeypatch.setattr(main._requests, "get", lambda *_a, **_k: seen.append("generic") or (_ for _ in ()).throw(
         main.safe_fetch.BlockedURL("synthetic")))
     main._prefetch_urls(url)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import bisect
 import re
+import unicodedata
 
 from quote_context import QUOTE_CONTEXT_RULE, QUOTE_ONLY_PLACEHOLDER
 
@@ -67,6 +68,20 @@ _TRANSLATION_REQUEST_RE = re.compile(
 # burst_filter.py, main._prefetch_urls, media prompts) are not requests: "原文"
 # in QUOTE_CONTEXT_RULE used to exempt every quoted burst reply from the check.
 _USER_BLOCK_MARKER_RE = re.compile(r"--- ?(?:目前回覆|群組訊息 \d+) ?(?:開始|結束) ?---")
+_MATERIAL_DASH_RUN_RE = re.compile(r"[-—―─－]{3,}")
+
+
+def neutralize_material(text: object) -> str:
+    """Uploader or model text for a prompt material block (2026-10-17).
+
+    Drops control and format characters (bidi marks, zero-width, soft hyphen,
+    tag characters...) except line breaks and tabs, and breaks ``---`` runs, so
+    the text can neither hide instructions nor open or close a block.
+    """
+    kept = "".join(
+        ch for ch in str(text or "") if ch in "\n\t" or unicodedata.category(ch) not in ("Cc", "Cf")
+    )
+    return _MATERIAL_DASH_RUN_RE.sub("－", kept)
 # Material blocks (原始訊息, 網頁內容, YouTube 影片資訊...): innermost first; a
 # block truncated before its end marker runs to the end of the text.
 _MATERIAL_BLOCK_RE = re.compile(

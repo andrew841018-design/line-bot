@@ -10,8 +10,9 @@ python-dotenv==1.2.2
 requests>=2.31.0
 beautifulsoup4>=4.12.0
 trafilatura==2.0.0
-yt-dlp>=2026.6.9
-curl_cffi>=0.7.0
+yt-dlp>=2026.8.19
+# yt-dlp refuses curl_cffi outside 0.10-0.16 and then cannot solve TikTok's challenge
+curl_cffi>=0.10,<0.17
 openai>=1.0.0
 yfinance>=0.2.0
 futu-api>=10.5.0
