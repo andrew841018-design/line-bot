@@ -826,6 +826,215 @@ CASES = [
     _case("r6-7-walking-park", F, "我去公園散步，剛剛一個人在涼亭昏倒了"),
     _case("r6-7-waiting-bus", M, "我在等公車，剛剛一個人在站牌昏倒了"),
     _case("r6-7-mom-in-park", X, "媽媽在公園散步，好像一個人在涼亭昏倒了"),
+    # ── 10/17 卡片拿掉「我吃藥了／我有運動」（Andrew：「盡量自動化，從他們留言獲取資訊」）：多抓幾種說法 ──
+    _case("more-med-you-chi", F, "藥有吃", [(F, "med", "吃藥")]),
+    _case("more-med-today", M, "今天藥有吃", [(M, "med", "吃藥")]),
+    _case("more-med-dou-you", F, "藥都有吃", [(F, "med", "吃藥")]),
+    _case("more-med-morning", M, "早上的藥有吃了", [(M, "med", "吃藥")]),
+    _case("more-med-on-time", F, "藥有按時吃", [(F, "med", "吃藥")]),
+    _case("more-med-on-time-le", M, "藥按時吃了", [(M, "med", "吃藥")]),
+    _case("more-med-relay", X, "爸爸藥有吃", [(F, "med", "吃藥")]),
+    _case("more-med-only-me", F, "我藥有吃，媽媽還沒", [(F, "med", "吃藥")]),
+    _case("more-med-question", F, "藥有吃嗎"),
+    _case("more-med-relay-question", X, "爸爸藥有吃嗎"),
+    _case("more-med-a-not-a", F, "藥有沒有吃"),
+    _case("more-med-negated", F, "藥沒有吃"),
+    _case("more-med-habit", F, "藥有在吃"),  # 平常在吃，不是今天吃了
+    _case("more-med-remind", F, "記得藥有吃"),
+    _case("more-med-make-sure", F, "要確定藥有吃"),
+    _case("more-med-check", F, "要確認藥有吃"),
+    _case("more-walk-park", F, "去公園走走了", [(F, "exercise", "散步")]),
+    _case("more-walk-yi", M, "出去走一走了", [(M, "exercise", "散步")]),
+    _case("more-walk-back", F, "走走回來", [(F, "exercise", "散步")]),
+    _case("more-walk-le-yi", M, "在公園走了一走", [(M, "exercise", "散步")]),
+    _case("more-walk-relay", X, "媽媽去公園走走了", [(M, "exercise", "散步")]),
+    _case("more-walk-both", X, "爸媽都有出去走走了", [(F, "exercise", "散步"), (M, "exercise", "散步")]),
+    _case("more-walk-plan", F, "等一下出去走走"),
+    _case("more-walk-free", F, "有空出去走走"),
+    _case("more-walk-free-relay", X, "爸爸有空會去走走"),
+    _case("more-walk-traffic", F, "走走停停"),
+    _case("more-walk-try", F, "走走看"),
+    _case("more-walk-lets-go", F, "走走走去吃飯"),
+    _case("more-walk-chant", F, "走走走去吃飯了"),  # 「走走走」是招呼，不是散步（同一個子句裡有「了」）
+    _case("more-walk-stop-go", F, "塞車走走停停了好久"),
+    _case("more-walk-said-will", X, "媽媽說要出去走走"),
+    _case("more-walk-dog", F, "狗出去走走了"),
+    _case("more-qigong", F, "練完氣功", [(F, "exercise", "氣功")]),
+    _case("more-baduanjin", M, "八段錦打完了", [(M, "exercise", "氣功")]),
+    _case("more-qigong-aircon", F, "冷氣功能修好了"),  # 「冷氣功能」不是氣功（GP1 I-3）
+    _case("more-morning-run", F, "晨跑回來", [(F, "exercise", "跑步")]),
+    _case("more-night-run", M, "夜跑完了", [(M, "exercise", "跑步")]),
+    _case("more-run-shoes", F, "買了晨跑鞋"),
+    _case("more-swim-split", F, "游完泳", [(F, "exercise", "游泳")]),
+    _case("more-swim-before", F, "以前游過泳"),  # 「游過泳」多半是講經驗（GP1 N-1）
+    _case("more-morning-exercise-topic", M, "早操做完了", [(M, "exercise", "做操")]),
+    _case("more-morning-exercise-cancelled", F, "早操取消了"),
+    _case("more-morning-exercise-time", M, "晨操時間改了"),
+    # 「有空」不是做完：原本會誤記
+    _case("more-free-walk", F, "有空去散步"),
+    _case("more-free-hike", F, "有空再去爬山"),
+    _case("more-free-then-swam", M, "今天有空，去游泳了", [(M, "exercise", "游泳")]),
+    # ── GP1 事前審查（多抓說法）找到的誤抓與漏記 ──
+    # I-1 否定詞被「出去」擠出視窗
+    _case("gp1m-not-out-for-long", F, "好久沒有出去走走了"),
+    _case("gp1m-too-busy", F, "最近太忙沒空出去走走了"),
+    _case("gp1m-no-time", F, "沒時間出去走走了"),
+    _case("gp1m-dont-want", F, "今天不想出去走走了"),
+    _case("gp1m-rain-cannot", F, "下雨不能出去走走了"),
+    _case("gp1m-rain-no-way", F, "下雨沒辦法出去走走了"),
+    # I-2 半夜、清晨「跑」不是跑步
+    _case("gp1m-night-toilet", F, "昨晚半夜跑了三次廁所"),
+    _case("gp1m-night-toilet-2", F, "我半夜跑了好幾趟廁所"),
+    _case("gp1m-night-er", F, "半夜跑去急診了", [(F, "visit", "急診")], [(F, "急診", True, True, False)]),
+    _case("gp1m-late-store", F, "昨天深夜跑去超商"),
+    _case("gp1m-dawn-park", F, "清晨跑去公園了"),
+    _case("gp1m-morning-market", F, "早晨跑去買菜了"),
+    _case("gp1m-morning-run-step", F, "早晨跑步了", [(F, "exercise", "跑步")]),
+    _case("gp1m-night-run-back", F, "夜跑回來", [(F, "exercise", "跑步")]),
+    _case("gp1m-this-morning-run", F, "今早晨跑完了", [(F, "exercise", "跑步")]),
+    _case("gp1m-early-run", F, "一早晨跑回來", [(F, "exercise", "跑步")]),
+    _case("gp1m-run-went", X, "爸爸晨跑去了", [(F, "exercise", "跑步")]),
+    # I-3 家電的「氣功能」
+    _case("gp1m-aircon-broken", F, "冷氣功能有問題"),
+    _case("gp1m-heater", F, "暖氣功能壞了"),
+    _case("gp1m-steam", F, "烤箱有蒸氣功能"),
+    _case("gp1m-both-air", F, "冷暖氣功能都有"),
+    # I-4 台式問句尾：家人催吃藥不是吃了
+    _case("gp1m-tag-hou", X, "爸爸藥有吃齁"),
+    _case("gp1m-tag-hou-comma", X, "爸爸，藥有吃齁"),
+    _case("gp1m-tag-bopomofo", X, "爸，藥有吃ㄇ"),
+    _case("gp1m-tag-wife-asks", M, "老公，藥有吃齁"),
+    # I-5 叫人確認，中間夾字
+    _case("gp1m-make-sure-dad", X, "要確定爸爸藥有吃"),
+    _case("gp1m-make-sure-mom", X, "你要確定媽媽藥有吃"),
+    _case("gp1m-check-once", F, "要確認一下藥有吃"),
+    _case("gp1m-check-first", F, "要先確定藥有吃"),
+    _case("gp1m-must-check", F, "必須確定藥有吃"),
+    _case("gp1m-i-am-sure", F, "我確定藥有吃了", [(F, "med", "吃藥")]),
+    _case("gp1m-sure", F, "確定藥有吃了", [(F, "med", "吃藥")]),
+    # I-6 「有空腹」照樣是做了
+    _case("gp1m-fasting-med", F, "我有空腹吃藥", [(F, "med", "吃藥")]),
+    _case("gp1m-fasting-blood", F, "今天有空腹去抽血", [(F, "visit", "抽血")]),
+    _case("gp1m-fasting-blood-2", F, "有空腹抽血", [(F, "visit", "抽血")]),
+    # I-7 想、要、可以
+    _case("gp1m-want-out", F, "好想出去走走了"),
+    _case("gp1m-going-out", F, "我要出去走走了"),
+    _case("gp1m-can-out", F, "可以出去走走了"),
+    _case("gp1m-finally-can", F, "終於可以出去走走了"),
+    _case("gp1m-mom-said-will", X, "媽媽說要出去走走了"),
+    # I-8 講距離、「就好」
+    _case("gp1m-distance", F, "從捷運站走一走就到了"),
+    _case("gp1m-distance-2", F, "走走就到了"),
+    _case("gp1m-just-walk", F, "走走就好了"),
+    _case("gp1m-no-taxi", F, "不用叫車，走走就好了"),
+    _case("gp1m-advice", F, "多出去走走就好了"),
+    _case("gp1m-walk-back", F, "走一走就回來了", [(F, "exercise", "散步")]),
+    _case("gp1m-feels-better", F, "腳麻，起來走走就好多了", [(F, "body", "手腳麻"), (F, "exercise", "散步")]),
+    # N-1～N-5
+    _case("gp1m-young-swam", F, "年輕時有游過泳"),
+    _case("gp1m-med-kinds", F, "藥有吃的跟擦的"),
+    _case("gp1m-med-if", F, "藥有吃就好"),
+    _case("gp1m-med-if-relay", X, "爸，藥有吃就好"),
+    _case("gp1m-chance", F, "有機會出去走走"),
+    _case("gp1m-free-tw", F, "有閒出去走走"),
+    _case("gp1m-chance-relay", X, "爸爸有機會會去走走"),
+    _case("gp1m-useful", F, "走走很有用"),
+    _case("gp1m-helps", F, "多走走很有幫助"),
+    _case("gp1m-qigong-works", F, "練氣功很有效"),
+    _case("gp1m-swing-works", F, "平甩功很有用"),
+    # 多抓的說法（GP1 建議）
+    _case("gp1m-stroll", F, "剛散個步回來", [(F, "exercise", "散步")]),
+    _case("gp1m-swim-ge", F, "剛游個泳", [(F, "exercise", "游泳")]),
+    _case("gp1m-swing", F, "平甩做完了", [(F, "exercise", "甩手")]),
+    _case("gp1m-ballroom", F, "跳完國標舞", [(F, "exercise", "跳舞")]),
+    _case("gp1m-social-dance", F, "跳了社交舞", [(F, "exercise", "跳舞")]),
+    _case("gp1m-health-exercise", F, "健康操做完了", [(F, "exercise", "做操")]),
+    _case("gp1m-med-on-time", F, "藥有準時吃", [(F, "med", "吃藥")]),
+    _case("gp1m-med-obedient", F, "藥有乖乖吃", [(F, "med", "吃藥")]),
+    _case("gp1m-med-on-time-le", F, "藥準時吃了", [(F, "med", "吃藥")]),
+    _case("gp1m-med-just", F, "藥剛剛吃了", [(F, "med", "吃藥")]),
+    _case("gp1m-med-just-2", F, "藥剛才吃了", [(F, "med", "吃藥")]),
+    _case("gp1m-stroll-suggest", F, "散個步吧"),
+    _case("gp1m-swim-plan", F, "明天去游個泳"),
+    _case("gp1m-health-exercise-q", F, "健康操做好了沒"),
+    _case("gp1m-ballroom-watch", F, "國標舞比賽看完了"),
+    # 119 不受影響
+    _case("gp1m-walk-fall", F, "去公園走走跌倒了", [(F, "exercise", "散步"), (F, "body", "跌倒", "", R)],
+          [(F, "跌倒", True, False, False)]),
+    _case("gp1m-run-chest", F, "晨跑回來胸口很痛", [(F, "exercise", "跑步"), (F, "body", "胸痛胸悶", "", R)],
+          [(F, "胸痛胸悶", True, False, False)]),
+    _case("gp1m-no-walk-chest", F, "好久沒有出去走走了，胸口很悶", [(F, "body", "胸痛胸悶", "", R)],
+          [(F, "胸痛胸悶", True, False, False)]),
+    # ── GP2 事前審查（多抓說法） ──
+    # G-1 台式問句尾只擋「吃了藥」：忘了吃藥、停藥、拿藥照記（每日檢查的「忘了吃藥」提醒要用）
+    _case("gp2m-forgot-hou", F, "我又忘記吃藥了齁", [(F, "med", "忘了吃藥")]),
+    _case("gp2m-forgot-hou-relay", X, "爸爸又忘記吃藥了齁", [(F, "med", "忘了吃藥")]),
+    _case("gp2m-stop-hou", X, "爸爸停藥了齁", [(F, "med", "停藥")]),
+    _case("gp2m-fetch-hou", F, "我今天去領藥了齁", [(F, "med", "拿藥")]),
+    _case("gp2m-took-hou-self", F, "我藥有吃齁"),
+    # G-2 問句尾被空白或逗號切開
+    _case("gp2m-hou-space", X, "爸爸藥有吃 齁"),
+    _case("gp2m-hou-comma", X, "爸爸藥有吃，齁"),
+    _case("gp2m-hou-comma-q", X, "爸爸藥有吃，齁？"),
+    _case("gp2m-walk-hou-space", X, "爸爸今天有去走走 齁"),
+    _case("gp2m-ma-space", X, "爸爸藥吃了 嗎"),  # 原本會誤記
+    _case("gp2m-right-q", X, "爸爸有吃藥，對嗎？"),  # 原本會誤記
+    _case("gp2m-right-ba", X, "爸爸藥吃了，對吧"),  # 原本會誤記
+    _case("gp2m-headache-hou", F, "我今天頭好痛 齁", [(F, "body", "頭痛")]),  # 症狀不受影響
+    _case("gp2m-and-you", F, "我藥有吃了，你呢", [(F, "med", "吃藥")]),
+    _case("gp2m-mm", F, "我藥有吃了 嗯", [(F, "med", "吃藥")]),
+    # G-4 步數也一樣擋台式問句尾
+    _case("gp2m-steps-hou", X, "爸爸今天走了8000步齁"),
+    # G-5 毛孩是寵物
+    _case("gp2m-fur-kid", F, "毛孩藥有吃了"),
+    # G-7 119 不受台式問句尾影響（不能把 _TAG_QUESTION_TAIL 併進 _QUESTION_TAIL）
+    _case("gp2m-fall-ok-hou", X, "媽媽剛剛跌倒了，現在沒事了齁", [(M, "body", "跌倒")], [(M, "跌倒", False, False, False)]),
+    _case("gp2m-fall-hou", X, "爸爸跌倒了齁", [(F, "body", "跌倒", "", R)], [(F, "跌倒", True, False, False)]),
+    _case("gp2m-fall-hou-space", X, "爸爸跌倒了 齁", [(F, "body", "跌倒", "", R)], [(F, "跌倒", True, False, False)]),
+    _case("gp2m-chest-hou", X, "爸爸胸口好痛齁", [(F, "body", "胸痛胸悶", "", R)], [(F, "胸痛胸悶", True, False, False)]),
+    # ── GP2 事後審查（多抓說法） ──
+    # P-1 隔著句號、問號、驚嘆號的「厚／吼／蛤」是感嘆，不是前一句的問句尾
+    _case("gp2p-tired", F, "我散步回來了。厚，好累", [(F, "exercise", "散步")]),
+    _case("gp2p-what", M, "我剛吃完藥。蛤？你說什麼", [(M, "med", "吃藥")]),
+    _case("gp2p-hot", F, "今天去公園走走了。吼，熱死了", [(F, "exercise", "散步")]),
+    _case("gp2p-bitter", F, "我吃藥了。吼，好苦", [(F, "med", "吃藥")]),
+    # P-2 「好嗎」是回嘴
+    _case("gp2p-retort", F, "我藥吃了，好嗎", [(F, "med", "吃藥")]),
+    _case("gp2p-retort-2", F, "我早就吃藥了，好嗎", [(F, "med", "吃藥")]),
+    _case("gp2p-retort-walk", F, "我今天有去散步了，好嗎！", [(F, "exercise", "散步")]),
+    # P-3 問句尾前面的符號、表情
+    _case("gp2p-tilde-hou", X, "爸爸藥有吃 ～齁"),
+    _case("gp2p-emoji-hou", X, "爸爸藥有吃 😅齁"),
+    _case("gp2p-tilde-ma", X, "爸爸藥吃了 ~嗎"),
+    _case("gp2p-two-clauses", X, "爸爸有吃藥 齁 媽媽也有吃藥了", [(M, "med", "吃藥")]),
+    _case("gp2p-fall-then-wow", X, "爸爸跌倒了。吼，嚇死我了", [(F, "body", "跌倒", "", R)], [(F, "跌倒", True, False, False)]),
+    # ── GP1 事後審查（多抓說法） ──
+    # P-1 「沒好就去／只能去」是去了（看診、運動都不能被新的否定、意願檢查擋掉）
+    _case("gp1p-not-better-then-doctor", F, "感冒一直沒好就去看醫生了", [(F, "body", "感冒"), (F, "visit", "看醫生")]),
+    _case("gp1p-fever-er", F, "燒一直沒退就去急診了", [(F, "visit", "急診")], [(F, "急診", True, True, False)]),
+    _case("gp1p-no-effect-doctor", F, "吃藥沒效就去看醫生了", [(F, "visit", "看醫生")]),
+    _case("gp1p-only-er", F, "痛到只能去急診了", [(F, "visit", "急診")], [(F, "急診", True, True, False)]),
+    _case("gp1p-cant-sleep-walk", F, "睡不著就去散步了", [(F, "exercise", "散步"), (F, "sleep", "睡不好")]),
+    _case("gp1p-only-walk", F, "腳痛只能去散步了", [(F, "body", "腳痛"), (F, "exercise", "散步")]),
+    _case("gp1p-no-time-doctor", F, "沒時間去看醫生了"),
+    _case("gp1p-then-doctor-plan", F, "吃完沒好再去看醫生"),
+    # P-3 「要再確定」「不確定」
+    _case("gp1p-check-again", F, "要再確定一下藥有吃"),
+    _case("gp1p-not-sure", X, "我不確定爸爸藥有吃"),
+    _case("gp1p-very-sure-walk", F, "我很確定今天有去散步", [(F, "exercise", "散步")]),
+    # P-4 跑廁所
+    _case("gp1p-all-night-toilet", F, "昨天一夜跑了三次廁所"),
+    _case("gp1p-morning-toilet", F, "早晨跑了兩趟廁所"),
+    _case("gp1p-night-toilet-3", F, "昨晚夜跑廁所三次"),
+    # P-5 其他問句尾
+    _case("gp1p-is-it", X, "爸爸藥吃了，是嗎"),
+    _case("gp1p-or-not", X, "爸爸有吃藥 沒有？"),
+    _case("gp1p-isnt-it", X, "爸爸藥吃了，沒有嗎"),
+    _case("gp1p-no-rain", F, "我今天有去散步，沒有下雨", [(F, "exercise", "散步")]),
+    _case("gp1p-no-discomfort", F, "我藥吃了 沒有不舒服", [(F, "med", "吃藥")]),
+    # P-7 只剩符號的問句尾、只往前標不往後標
+    _case("gp1p-emoji-q", X, "爸爸藥吃了 😅?"),
+    _case("gp1p-tag-then-statement", F, "我跟你說 齁 我今天藥有吃了", [(F, "med", "吃藥")]),
 ]
 
 
@@ -972,6 +1181,10 @@ def test_allowed_items_cover_every_category_and_red_flag_label():
     assert set(RED_FLAG_LABELS) <= ALLOWED_ITEMS["body"]
     assert {"血壓", "血糖", "體重", "心跳"} <= ALLOWED_ITEMS["body"]
     assert ALLOWED_ITEMS["med"] == {"吃藥", "忘了吃藥", "拿藥", "停藥"}
+    assert "氣功" in ALLOWED_ITEMS["exercise"]  # 10/17 新標籤：卡片、週報、DB 詞表都從這裡拿
+    import parent_health_db
+
+    assert parent_health_db.is_allowed("exercise", "氣功")
     assert ALLOWED_ITEMS["sleep"] == {"睡不好", "睡得好"}
     assert not set(IN_CARE_LABELS) & set(RED_FLAG_LABELS)
 
@@ -1138,6 +1351,7 @@ _SLOW_SHAPES = {
     "沒 run": lambda n: "沒" * n + "胸悶",
     "沒有 run": lambda n: "沒有" * (n // 2) + "頭暈",
     "many med clauses": lambda n: "吃藥了。" * (n // 4),
+    "要確定 then many 藥有吃": lambda n: "要確定" + "藥有吃" * (n // 3),  # 「要確定」只在每個子句找一次
     "many tiny clauses": lambda n: "x。" * (n // 2),
     "separators only": lambda n: "，" * n,
     "spaces then a reading": lambda n: " " * n + "血壓 135/85",

@@ -93,19 +93,22 @@ _VISIT_PATTERNS: tuple[tuple[str, str], ...] = (
 _EXERCISE_PATTERNS: tuple[tuple[str, str], ...] = (
     ("元極舞", r"元極舞"),
     ("外丹功", r"外丹功"),
-    ("散步", r"散步|走路|健走|快走"),
+    ("氣功", r"(?<![冷暖蒸換排空])氣功(?![能率效])|八段錦"),  # 「冷氣功能」「蒸氣功能」不是氣功
+    # 「走走」：不是「走走停停／走走看／走走走」，也不是講距離或「就好」（「走一走就到了」「走走就好了」）
+    ("散步", r"散個?步|走路|健走|快走|(?<!走)走(?:了?一)?走(?![走停看]|就(?:到|好(?!多)))"),
     ("爬山", r"爬山|登山"),
     ("太極", r"太極"),
-    ("游泳", r"游泳"),
+    ("游泳", r"游(?:了|完|個)?泳"),  # 「游過泳」多半是講經驗
     ("騎腳踏車", r"騎(?:了|完)?(?:腳踏車|單車|自行車|[Yy]ou[Bb]ike|[Uu]bike)"),
-    ("跳舞", r"跳(?:了|完)?(?:廣場|土風|排)?舞"),
-    ("做操", r"做(?:了|完)?(?:體|早|健康|晨)?操"),
-    ("甩手", r"甩手"),
+    ("跳舞", r"跳(?:了|完)?(?:廣場|土風|排|國標|社交|交際)?舞"),
+    ("做操", r"做(?:了|完)?(?:體|早|健康|晨)?操|(?:[早晨]|健康)操(?:也|都)?做(?:了|完|好)"),
+    ("甩手", r"甩手|平甩"),
     ("拉筋", r"拉筋"),
     ("瑜伽", r"瑜[伽珈]"),
     ("重訓", r"重訓"),
     ("健身", r"健身"),
-    ("跑步", r"跑步(?!機)|慢跑"),
+    # 「半夜跑了三次廁所」「清晨跑去公園」「晨跑鞋」不是跑步
+    ("跑步", r"跑步(?!機)|慢跑|(?<![清凌])晨跑(?![鞋機]|去(?!了)|.{0,4}廁)|(?<![半深昨整熬一每])夜跑(?![鞋機]|去(?!了)|.{0,4}廁)"),
     ("打球", r"打(?:了|完)?(?:桌球|羽毛球|羽球|網球|籃球|排球|棒球|高爾夫球?|門球|槌球|保齡球|撞球|匹克球|球)"),
     ("運動", r"運動(?![鞋服會員品褲衣場神])"),
 )
@@ -251,7 +254,8 @@ _MED_RE = re.compile(
     r"(?P<forgot>(?:忘了|忘記)要?(?:吃|服|吞)[^藥]{0,6}?藥(?![膳局房妝材酒])|藥(?:也|都|又)?(?:忘了|忘記)(?:吃|服))"
     r"|(?P<took>(?:吃|服|吞)(?:了|過|完)?(?:[一兩二三四五半幾](?:顆|包|粒|錠|片|匙))?"
     r"(?:" + _MED_KIND + r"|[^飯要該得農藥炸火]{0,2})藥(?![膳局房妝材酒行店燉])"
-    r"|藥(?:也|都|已經|已)?(?:吃|服)(?:了|過|完|好))"
+    r"|藥(?:也|都|已經|已|剛剛|剛才)?(?:按時|準時|乖乖)?(?:吃|服)(?:了|過|完|好)"
+    r"|藥(?:也|都|已經|已)?有(?:按時|準時|乖乖)?(?:吃|服)(?!的|就好))"  # 「藥有吃的跟擦的」「藥有吃就好」不算
     r"|(?P<fetch>(?:拿|領)(?:了|完|好)?(?:慢性處方箋|慢箋|藥)(?![膳局房妝材酒]))"
     r"|(?P<stop>停(?:了)?藥)"
 )
@@ -386,13 +390,24 @@ _CUE_RE = re.compile(
 _AGO_CATEGORIES = frozenset({_PAST})
 _A_NOT_A_RE = re.compile(r"([\u4e00-\u9fff])不\1")  # 痛不痛、去不去
 _QUESTION_TAIL = frozenset("嗎呢吧沒没")
+# 台式問句尾（「爸爸藥有吃齁」）：只讓「吃了藥」和運動不記；不放進 _QUESTION_TAIL（會改 119 的主詞與未來判斷）。
+# 這些字也是一般的字（「穿得很厚」「在乎」）：只會漏記，可以接受；「喔」「啦」可問可答，不擋
+_TAG_QUESTION_TAIL = frozenset("齁吼厚乎蛤ㄇ")
+# 問句尾自己成一個子句（「爸爸藥吃了，對吧」）：前一個子句也當成問句
+_TAG_QUESTION_WORDS = frozenset({"對吧", "對嗎", "是吧", "對不對", "是不是", "是嗎", "有嗎", "沒有嗎"})  # 不放「好嗎」：「我藥吃了，好嗎」是回嘴
 
 # 視窗檢查（都只看固定長度的前後文）
 _DONE_RE = re.compile(r"(?<![為除])了(?!解)|(?<!不)過(?![敏來去])|完(?!全)|(?<!而)已|剛(?!好)"
-                      r"|(?<![沒没])有(?![點些沒人時])|回來|回家")
+                      r"|(?<![沒没])有(?![點些沒人時機閒用效益]|空(?!腹)|幫助)|回來|回家")
 _NEG_RE = re.compile(r"[沒没未]|不(?![好舒適錯過])")
 _NEG_MED_RE = re.compile(r"[沒没未忘]|不(?![好舒適錯過])")
-_MUST_BEFORE_RE = re.compile(r"(?:要|該|(?<!覺)得|需要|必須)(?:去|有)?$")
+_MUST_BEFORE_RE = re.compile(r"(?:要|該|(?<!覺)得|需要|必須)(?:去|有|確定|確認)?$")
+# 「要確定爸爸藥有吃」「要先確認一下藥有吃」：叫人確認，中間可以夾字（每個子句只找一次第一個位置）
+_CHECK_BEFORE_RE = re.compile(r"(?:要|該|(?<!覺)得|需要|必須)[先再]?確[定認]|不確[定認]")  # 「我不確定爸爸藥有吃」是擔心
+# 「好久沒有出去走走了」：否定詞被「出去」擠出 3 字視窗，前綴前面再看一次
+_GO_PREFIX_RE = re.compile(r"出?去$")
+# 「好想出去走走了」「可以出去走走了」：想做、能做，不是做了
+_MODAL_BEFORE_RE = re.compile(r"(?:想|要|可以|(?<!只)能)出?去?$")  # 「痛到只能去急診了」是去了
 _RESULT_AFTER_RE = re.compile(r"的?(?:報告|結果)")
 _WALK_CUE_RE = re.compile(r"走|散步|步行")
 _RECOVERED_RE = re.compile(r"好了|好多了|沒事|不痛了|退了|改善|恢復")
@@ -479,7 +494,7 @@ _OTHER_WORDS = frozenset({
     "房東", "股東", "志工", "社工", "義工", "主管", "上司", "下屬", "家屬", "客戶", "住戶", "里長", "鄰長", "家長",
     "院長", "校長", "班長", "組長", "社長", "會長", "學長", "董事長", "女士", "博士", "顧客", "乘客", "遊客", "叔公",
     "舅公", "伯公", "姊夫", "姐夫", "妹夫", "大夫", "嫂子", "男子", "女子",
-    "貓", "貓咪", "寵物", "隔壁", "樓上", "樓下", "對面",
+    "貓", "貓咪", "寵物", "毛孩", "隔壁", "樓上", "樓下", "對面",
     "你老公", "你先生", "你老婆", "你太太", "你老伴", "你丈夫", "你妻子", "你們", "我們", "他們", "她們", "大家",
     "別人", "有人",
     "人家",
@@ -858,8 +873,9 @@ def _speaker_role(speaker: object) -> str:
     return speaker if speaker in PARENTS else FAMILY
 
 
-def _split_clauses(text: str) -> list[tuple[str, bool, bool]]:
-    """切子句，回 [(子句, 問號結尾, 驚嘆號結尾)]。數字旁的空白不切（「血壓 135/85」「走了 8000 步」）。"""
+def _split_clauses(text: str) -> list[tuple[str, bool, bool, bool]]:
+    """切子句，回 [(子句, 問號結尾, 驚嘆號結尾, 後面是逗號或空白)]。數字旁的空白不切（「血壓 135/85」「走了 8000 步」）。
+    最後一欄只給台式問句尾往前標記用：「爸爸藥有吃 齁」算同一句，「我散步回來了。厚，好累」不算。"""
     clauses: list[list] = []
     start, size = 0, len(text)
     for m in _SEP_RE.finditer(text):
@@ -871,13 +887,13 @@ def _split_clauses(text: str) -> list[tuple[str, bool, bool]]:
                 continue
         piece = text[start:m.start()]
         if piece:
-            clauses.append([piece, sep == "?", sep == "!"])
+            clauses.append([piece, sep == "?", sep == "!", sep in "，,、" or (sep[0].isspace() and "\n" not in sep)])
         elif clauses and sep in "?!":
             clauses[-1][1 if sep == "?" else 2] = True  # 「吃藥了 ?」：符號跟著前一個子句
         start = m.end()
     if start < size:
-        clauses.append([text[start:], False, False])
-    return [(piece, asked, exclaimed) for piece, asked, exclaimed in clauses]
+        clauses.append([text[start:], False, False, False])
+    return [(piece, asked, exclaimed, soft) for piece, asked, exclaimed, soft in clauses]
 
 
 def _strip_tail(text: str) -> str:
@@ -893,7 +909,8 @@ class _Clause:
 
     __slots__ = ("text", "cues", "question", "exclaimed", "mentions", "relayed", "relay_out", "quote_out",
                  "mention_starts", "mention_end_set", "subject_ends", "subject_roles", "actor_ends", "actor_roles",
-                 "reading_ends", "reading_roles", "carry_in", "actor_carry_in", "past", "bp")
+                 "reading_ends", "reading_roles", "carry_in", "actor_carry_in", "past", "bp", "tag_question",
+                 "check_end")
 
     def __init__(self, text: str, asked: bool, exclaimed: bool, speaker: str, mention_re: re.Pattern[str],
                  carry_in: tuple[str, ...], relay_in: tuple[str, ...], quote_in: tuple[str, ...]):
@@ -912,6 +929,9 @@ class _Clause:
             asked or _QUESTION in self.cues or bool(_A_NOT_A_RE.search(text))
             or bool(tail and tail[-1] in _QUESTION_TAIL)
         )
+        self.tag_question = bool(tail and tail[-1] in _TAG_QUESTION_TAIL)
+        check = _CHECK_BEFORE_RE.search(text)
+        self.check_end = check.end() if check else -1
         found = _Mentions(text, speaker, mention_re, carry_in, relay_in, quote_in)
         self.mentions = found.items
         self.actor_carry_in = carry_in
@@ -1028,7 +1048,9 @@ def _analyze(norm: str, speaker: str, names: tuple[str, ...]) -> list[_Clause]:
     relay: tuple[str, ...] = ()
     quote: tuple[str, ...] = ()
     past = bp = False
-    for piece, asked, exclaimed in _split_clauses(norm):
+    soft_ends: list[bool] = []
+    for piece, asked, exclaimed, soft in _split_clauses(norm):
+        soft_ends.append(soft)
         clause = _Clause(piece, asked, exclaimed, speaker, mention_re, carry, relay, quote)
         clause.actor_carry_in = actor_carry
         if clause.subject_roles:
@@ -1046,6 +1068,21 @@ def _analyze(norm: str, speaker: str, names: tuple[str, ...]) -> list[_Clause]:
         bp = bool(_BP_CUE_RE.search(piece)) or (bp and not _OTHER_READING_CUE_RE.search(piece))
         clause.bp = bp
         clauses.append(clause)
+    # 「爸爸藥有吃 齁」「爸爸有吃藥，對嗎？」：問句尾被空白或逗號切成自己一個子句時，前一個子句也算台式問句。
+    # 隔著句號、問號、驚嘆號或換行就不算（「我散步回來了。厚，好累」的「厚」是感嘆）。
+    # 只設 tag_question，不動 question：119 不受影響。
+    for prev, cur, soft in zip(clauses, clauses[1:], soft_ends):
+        if not soft:
+            continue
+        core = _strip_tail(cur.text)
+        head = 0
+        while head < len(core) and not core[head].isalnum():  # 「～齁」「😅齁」：開頭的符號、表情也去掉
+            head += 1
+        core = core[head:].strip()
+        if (core and (set(core) <= _TAG_QUESTION_TAIL | _QUESTION_TAIL or core in _TAG_QUESTION_WORDS)) or (
+            cur.question and core in ("", "沒有")  # 「爸爸藥吃了 😅?」「爸爸有吃藥 沒有？」
+        ):
+            prev.tag_question = True
     return clauses
 
 
@@ -1258,7 +1295,10 @@ class _Collector:
 
 def _instructed(clause: _Clause, start: int) -> bool:
     """「提醒爸爸吃藥」「吃完飯要吃藥」：叫人做、還沒做。"""
-    return clause.before(_INSTRUCT, start) or _window_has(_MUST_BEFORE_RE, clause.text, start - 3, start)
+    return (
+        clause.before(_INSTRUCT, start) or _window_has(_MUST_BEFORE_RE, clause.text, start - 3, start)
+        or 0 <= clause.check_end <= start
+    )
 
 
 def _scan_med(index: int, clause: _Clause, out: _Collector) -> None:
@@ -1267,6 +1307,8 @@ def _scan_med(index: int, clause: _Clause, out: _Collector) -> None:
         kind, start, end = m.lastgroup, m.start(), m.end()
         if clause.blocked(start):
             continue
+        if kind == "took" and clause.tag_question:
+            continue  # 「爸爸藥有吃齁」是問句：記了會蓋掉「幾天沒提到吃藥」的提醒（忘了吃藥、停藥、拿藥照記）
         if kind == "took" and text[start - 1:start] == "在":
             continue  # 「有在吃降血壓藥」「在吃中藥」是平常在吃，不是今天吃了
         if kind == "forgot":
@@ -1284,10 +1326,18 @@ def _scan_med(index: int, clause: _Clause, out: _Collector) -> None:
 def _scan_activity(index: int, clause: _Clause, out: _Collector, rx: re.Pattern[str], groups: dict[str, str],
                    category: str) -> None:
     """看診與運動：要有完成標記（或早上／昨天這類時間），沒去、要去、叫人去都不記。"""
+    if category == "exercise" and clause.tag_question:
+        return
     text = clause.text
     for m in rx.finditer(text):
         start, end = m.span()
         if clause.blocked(start) or _instructed(clause, start) or _window_has(_NEG_RE, text, start - 3, start):
+            continue
+        go = _GO_PREFIX_RE.search(text, max(0, start - 2), start)
+        # 「感冒一直沒好就去看醫生了」：否定講的是前面的條件，「就／才去」照樣是去了
+        if go and text[go.start() - 1:go.start()] not in ("就", "才") and _window_has(_NEG_RE, text, go.start() - 3, go.start()):
+            continue
+        if _window_has(_MODAL_BEFORE_RE, text, start - 4, start):
             continue
         if category == "visit" and _RESULT_AFTER_RE.match(text, end):
             continue  # 「健檢報告出來了」不是今天看診
@@ -1313,6 +1363,8 @@ def _steps_value(m: re.Match[str]) -> int:
 
 
 def _scan_steps(index: int, clause: _Clause, out: _Collector) -> None:
+    if clause.tag_question:
+        return  # 和運動一樣：「爸爸今天走了8000步齁」是問句
     text = clause.text
     for m in _STEPS_RE.finditer(text):
         start, end = m.span()
