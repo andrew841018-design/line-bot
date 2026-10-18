@@ -679,7 +679,9 @@ def _append_bot_turn(group_id: str, text: str, *, source: str = "bot_memory") ->
 
 def _is_market_quote_outbound(text: str) -> bool:
     """Market quotes are reply-only; an expired reply token must not create a push."""
-    return (text or "").lstrip().startswith(("【市場報價", "【即時股價", "FCN 評估", "股票推薦", "股票評估"))
+    return (text or "").lstrip().startswith(
+        ("【市場報價", "【即時股價", "FCN 評估", "股票推薦", "股票評估", "盤勢：", "盤勢圖：")
+    )
 
 
 def _is_market_quote_request(text: str, context: list | None = None) -> bool:
@@ -3033,23 +3035,57 @@ def health():
 
 
 _GENIMG_DIR = "/tmp/line_bot_genimg"
-_GENIMG_FILENAME_RE = re.compile(r"^[a-f0-9]{32}\.png$")
+_GENIMG_FILENAME_RE = re.compile(r"[a-f0-9]{32}\.png")
+_GENIMG_MAX_BYTES = 10 * 1024 * 1024  # LINE ImageMessage 上限  # 用 fullmatch（$ 會吃結尾換行）
 
 
 @app.get("/static/img/{filename}")
 def serve_genimg(filename: str):
     """Serve generated images for LINE ImageMessage（public via cloudflared）。
 
-    路徑驗證：filename 必須是 UUID hex（32 字）+ .png，避免 path traversal。
+    路徑驗證：filename 必須整串是 32 個小寫 hex＋.png（fullmatch，避免 path traversal）。
+    2026-10-17（/盤勢 的期權圖也走這裡）：目錄要是自己的 0700（不是 symlink、不服務別人在 /tmp
+    先建的目錄）；開檔用 O_NOFOLLOW、fstat 確認是自己的一般檔，再用同一個 fd 串流回應——檢查與
+    開檔之間檔案被換掉或刪掉都不影響（已開啟的 fd 照樣讀完）。
     """
-    from fastapi.responses import FileResponse
+    import stat as _stat_mod
+
     from fastapi import HTTPException
-    if not _GENIMG_FILENAME_RE.match(filename):
+    from fastapi.responses import Response
+
+    if not _GENIMG_FILENAME_RE.fullmatch(filename):
         raise HTTPException(status_code=400, detail="invalid filename")
-    path = os.path.join(_GENIMG_DIR, filename)
-    if not os.path.isfile(path):
+    try:
+        import market_paths
+
+        dir_ok = market_paths.private_dir_ok(market_paths.Path(_GENIMG_DIR), create=False)
+    except Exception:
+        dir_ok = False
+    if not dir_ok:
         raise HTTPException(status_code=404, detail="not found")
-    return FileResponse(path, media_type="image/png")
+    try:
+        fd = os.open(os.path.join(_GENIMG_DIR, filename), os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        raise HTTPException(status_code=404, detail="not found") from None
+    # 2026-10-18 安全審查 N6：圖都 < 10 MB（LINE 上限），在這裡用同一個 fd 讀完再關，不用串流產生器
+    # （回應在第一次迭代前被取消時，產生器的 finally 不會跑，fd 會漏）
+    try:
+        info = os.fstat(fd)
+        if not _stat_mod.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > _GENIMG_MAX_BYTES:
+            raise HTTPException(status_code=404, detail="not found")
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > _GENIMG_MAX_BYTES:
+                raise HTTPException(status_code=404, detail="not found")
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    return Response(content=b"".join(chunks), media_type="image/png")
 
 
 # ── Webhook ───────────────────────────────────────────────────────────────────
@@ -7030,6 +7066,12 @@ def _handle_text_message(
     if stock_body is not None:
         _reply_stock_picks(event, group_id, text, stock_body)
         return
+    # 市場盤勢（2026-10-17）：「/盤勢」同 /股票，放在提醒路徑之前、一律在這裡回覆並 return；
+    # 也不取消別人正在累積的 burst。
+    market_body = _market_command_body(text, event.message)
+    if market_body is not None:
+        _reply_market(event, group_id, text, market_body)
+        return
     # 爸媽健康（2026-10-11）：「/健康」同 FCN／股票，放在提醒路徑之前（「/健康 130/85」不會被當成日期），
     # 一律在這裡回覆並 return；也不取消別人正在累積的 burst。
     health_body = _health_command_body(text, event.message)
@@ -7433,7 +7475,15 @@ def _handle_image_gen(event: MessageEvent, group_id: str, subject: str) -> None:
         return
     import uuid
     out_dir = _GENIMG_DIR
-    os.makedirs(out_dir, exist_ok=True)
+    try:
+        import market_paths
+
+        dir_ok = market_paths.private_dir_ok(market_paths.Path(out_dir))  # 0700、自己的；別人的目錄不碰
+    except Exception:
+        dir_ok = False
+    if not dir_ok:
+        logger.warning("genimg dir is not a private directory; not saving")
+        return
     fname = f"{uuid.uuid4().hex}.png"
     out_path = os.path.join(out_dir, fname)
     try:
@@ -20815,6 +20865,13 @@ _FCN_QUOTE_TEXT = (
 )
 _STOCK_BOT_PREFIXES = ("股票推薦：", "股票評估：")
 _FCN_BOT_PREFIX = "FCN 評估"
+# 市場盤勢（2026-10-17）：/盤勢 的固定句。卡片與圖的 altText／存檔字串開頭（＝market_dashboard 的
+# ALT_PREFIX／CHART_ALT_PREFIX）；模組載不進來時引用檢查、reply-only 判斷照樣有效。
+_MARKET_COMMAND_RE = re.compile(r"/\s{0,3}盤勢")
+_MARKET_BOT_PREFIXES = ("盤勢：", "盤勢圖：")
+_MARKET_FAILURE_TEXT = "盤勢：暫時無法回覆，請稍後再試"
+_MARKET_CHART_FAILURE_TEXT = "盤勢：圖暫時傳不出來，先看文字卡（/盤勢 期權）"
+_MARKET_QUOTE_TEXT = "盤勢：卡片上的數字是程式用公開資料算的，只描述狀態，不是買賣建議。要看最新的請打 /盤勢"
 
 
 def _stock_command_body(text: str | None, message) -> str | None:
@@ -20822,14 +20879,22 @@ def _stock_command_body(text: str | None, message) -> str | None:
     return _command_body(text, message, _STOCK_COMMAND_RE, "股票", "stock")
 
 
+def _market_command_body(text: str | None, message) -> str | None:
+    """「/盤勢 …」後面的字（可能是空字串）；長度上限在 market_dashboard。"""
+    return _command_body(text, message, _MARKET_COMMAND_RE, "盤勢", "market")
+
+
 def _investment_command(text: str | None, message) -> tuple[str, str] | None:
-    """路由與入站 recall 共用的偵測：("fcn"|"stock", 指令後面的字)，不是投資指令回 None。"""
+    """路由與入站 recall 共用的偵測：("fcn"|"stock"|"market", 指令後面的字)，不是投資指令回 None。"""
     body = _fcn_command_body(text, message)
     if body is not None:
         return "fcn", body
     body = _stock_command_body(text, message)
     if body is not None:
         return "stock", body
+    body = _market_command_body(text, message)
+    if body is not None:
+        return "market", body
     return None
 
 
@@ -20855,6 +20920,149 @@ def _reply_stock_picks(event, group_id: str, text: str, body: str) -> None:
     )
 
 
+def _reply_market(event, group_id: str, text: str, body: str) -> None:
+    """市場盤勢（2026-10-17）：market_dashboard 只讀 job 寫好的快照，回卡片、文字或圖檔名。
+    模組載不進來、出例外或回了不認得的東西，一律回固定句（不會掉進一般路由交給模型）。"""
+    reply = None
+    try:
+        import market_dashboard
+
+        reply = market_dashboard.handle(body)
+    except Exception as exc:
+        logger.error("market dashboard failed error_type=%s", type(exc).__name__)
+    if reply is None:
+        _reply_command_card(
+            event, group_id, text, reply_text=_MARKET_FAILURE_TEXT, card=None, alt_text=None,
+            fallback_text=_MARKET_FAILURE_TEXT,
+        )
+        return
+    fallback = getattr(reply, "fallback_text", None) or _MARKET_FAILURE_TEXT
+    images = getattr(reply, "images", None)
+    if images:
+        _reply_market_chart(
+            event, group_id, list(images), getattr(reply, "image_alt", None) or "盤勢圖：期權分布",
+            fallback_text=_MARKET_CHART_FAILURE_TEXT,
+        )
+        return
+    flex, alt_text = getattr(reply, "flex", None), getattr(reply, "alt_text", None)
+    if flex is not None and alt_text:
+        _reply_command_card(
+            event, group_id, text, reply_text=None, card=flex, alt_text=alt_text, fallback_text=fallback, page=True
+        )
+        return
+    _reply_command_card(
+        event, group_id, text, reply_text=getattr(reply, "text", None) or _MARKET_FAILURE_TEXT, card=None,
+        alt_text=None, fallback_text=fallback,
+    )
+
+
+_MARKET_CHART_NAME_RE = re.compile(r"[a-f0-9]{32}\.png")
+
+
+def _market_chart_urls(files: list) -> list[str] | None:
+    """圖檔名 → 公開網址；網址用 card_pages 審查過的取法（只收自己的 0600 tunnel 檔、
+    https://<小寫>.trycloudflare.com 或設定的固定網域）。任何一張不合格就整組不送。"""
+    import stat as _stat_mod
+
+    try:
+        import card_pages
+
+        base = card_pages.public_base_url()
+    except Exception as exc:
+        logger.warning("market chart base url failed error_type=%s", type(exc).__name__)
+        return None
+    if not base or not files:
+        return None
+    urls = []
+    for name in files[:4]:  # 一個 reply 最多 5 則
+        if not isinstance(name, str) or not _MARKET_CHART_NAME_RE.fullmatch(name):
+            return None
+        try:
+            info = os.lstat(os.path.join(_GENIMG_DIR, name))
+        except OSError:
+            return None
+        if not _stat_mod.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            return None
+        urls.append(f"{base.rstrip('/')}/static/img/{name}")
+    return urls
+
+
+def _mark_market_chart_replied(identity) -> None:
+    """送圖前已把 inbound 標成 completed_no_reply（registry 也被移掉），LINE 接受後用記下的
+    (group_id, message_ids) 逐筆升成 replied；單筆函式沒有狀態條件。記帳失敗只記 log。"""
+    if not identity:
+        return
+    group_id, message_ids = identity
+    for message_id in message_ids:
+        try:
+            memory.mark_inbound_event_replied(group_id, message_id)
+        except Exception as exc:
+            logger.error("market chart accepted but durable mark failed error_type=%s", type(exc).__name__)
+    logger.info("reply accepted group=%s msgs=%d kind=market_chart", group_id, len(message_ids))
+
+
+def _reply_market_chart(event, group_id: str, files: list, image_alt: str, *, fallback_text: str) -> None:
+    """盤勢圖（PLAN §7）：只用 reply token 送 ImageMessage；不搭提醒、不 push、不進 recall。
+    送圖前先把 inbound durable 標成 completed_no_reply（寫不成就不送圖），所以 lease 過期後
+    LINE 重送同一則訊息也不會再送第二次圖；結果不明時寧可少一次，不送兩次。"""
+    token = event.reply_token
+    _clear_reply_mention_targets(token)
+
+    def _send_fixed_text(identity) -> None:
+        sent = _reply(
+            token, fallback_text, group_id=group_id, allow_push_fallback=False, include_auxiliary=False,
+            index_for_recall=False,
+        )
+        if sent and identity:
+            _mark_market_chart_replied(identity)
+        elif not sent and not identity:
+            _mark_inbound_reply_completed_no_reply(token)
+
+    if settings.bot_muted:
+        logger.info("[MUTED] would_reply market chart group=%s files=%d", group_id, len(files))
+        _mark_inbound_reply_completed_no_reply(token)
+        return
+    urls = _market_chart_urls(files)
+    if not urls:
+        _send_fixed_text(None)
+        return
+    with _inbound_reply_lock:
+        registered = _inbound_reply_by_token.get(str(token))
+    identity = (registered[0], tuple(registered[1])) if registered else None
+    if identity is None or not _mark_inbound_reply_completed_no_reply(token):
+        logger.warning("market chart durable pre-mark failed; sending the fixed sentence instead")
+        _send_fixed_text(None)
+        return
+    try:
+        with ApiClient(_get_line_config()) as api_client:
+            response = MessagingApi(api_client).reply_message(
+                ReplyMessageRequest(
+                    reply_token=token,
+                    messages=[ImageMessage(original_content_url=url, preview_image_url=url) for url in urls],
+                )
+            )
+    except Exception as exc:
+        status = getattr(exc, "status", None) or getattr(exc, "status_code", None)
+        try:
+            status = int(status) if status is not None else None
+        except (TypeError, ValueError):
+            status = None
+        logger.warning("market chart reply failed status=%s error_type=%s", status, type(exc).__name__)
+        if status is not None and 400 <= status < 500 and not _is_definite_reply_token_error(exc):
+            # LINE 明確拒絕這組圖（token 沒用掉）：同一個 token 改送固定句。
+            _send_fixed_text(identity)
+        return  # token 失效或結果不明：維持 completed_no_reply，不再送、不 push
+    _mark_market_chart_replied(identity)
+    for sent in getattr(response, "sent_messages", None) or []:
+        sent_id = getattr(sent, "id", None)
+        if not isinstance(sent_id, str) or not sent_id:
+            continue
+        try:
+            memory.log_raw_message(group_id, sent_id, "__bot__", image_alt, index_for_recall=False)
+        except Exception as exc:
+            logger.error("market chart archive failed error_type=%s", type(exc).__name__)
+
+
 def _quoted_bot_investment_kind(event, group_id: str) -> str | None:
     """這則訊息引用的是同群組裡 bot 發的投資卡片或回覆時回 "stock"／"fcn"，否則 None。
     引用 ID 照 `_build_quoted_block` 的找法（訊息上的，或持久化的引用關係）。查不到就不算。"""
@@ -20876,6 +21084,8 @@ def _quoted_bot_investment_kind(event, group_id: str) -> str | None:
         return "stock"
     if quoted.startswith(_FCN_BOT_PREFIX):
         return "fcn"
+    if quoted.startswith(_MARKET_BOT_PREFIXES):
+        return "market"
     return None
 
 
@@ -20883,7 +21093,7 @@ def _reply_investment_quote_notice(event, group_id: str, kind: str) -> None:
     _clear_reply_mention_targets(event.reply_token)
     _reply(
         event.reply_token,
-        _FCN_QUOTE_TEXT if kind == "fcn" else _INVESTMENT_QUOTE_TEXT,
+        {"fcn": _FCN_QUOTE_TEXT, "market": _MARKET_QUOTE_TEXT}.get(kind, _INVESTMENT_QUOTE_TEXT),
         group_id=group_id,
         allow_push_fallback=False,
         index_for_recall=False,
@@ -21145,7 +21355,7 @@ def _reply_command_card(
 
 # 2026-10-17 只有這些 altText 開頭的卡做大字版（正面表列：卡上只有公開數字與名稱）；
 # 就是 stock_picks.PREFIX／EVAL_PREFIX、fcn_eval.PREFIX（test_card_pages 有漂移測試）。
-_CARD_PAGE_ALT_PREFIXES = ("股票推薦：", "股票評估：", "FCN 評估：")
+_CARD_PAGE_ALT_PREFIXES = ("股票推薦：", "股票評估：", "FCN 評估：", "盤勢：")  # 盤勢卡上沒有家人資料（2026-10-17）
 # FCN 確認卡（fcn_eval.build_confirm_card）不做：它把理專訊息裡沒標籤的 4–6 位數字也當成代號列出，
 # 可能是帳號尾碼，不能放到拿到連結就看得到的網頁。評估卡照做。
 _CARD_PAGE_SKIP_ALT_PREFIX = "FCN 評估：我讀到"
@@ -21800,7 +22010,13 @@ _HELP_TEXT = (
     "                          1–4 檔，代號或中文名都可以；期限沒寫當 6 個月，\n"
     "                          可加「12個月」「KO95%」「KI60%」\n"
     "                          引用理專那則訊息再打 /FCN：先回「我讀到的條件」，點按鈕才評估\n"
-    "  🔍 看大字版             股票卡、FCN 評估卡最下面的按鈕：點了用網頁看大字\n"
+    "  /盤勢                   美股、台股盤勢：點選單「🧭 市場盤勢」或打 /盤勢，回 4 張卡\n"
+    "                          （美股、台股、期權與資金、宏觀與事件），往左滑看下一張\n"
+    "  /盤勢 QQQ               單檔細節（VOO、QQQ、SOXX、0050）；也可打 期權、新聞、季節性、選舉\n"
+    "  /盤勢 QQQ 圖            期權未平倉與 gamma（假設部位）的圖（SPY、SOXX、台指 也可以）\n"
+    "  /盤勢 13F QQQ           前十大成分股的機構持股變化（VOO、SOXX 也可以）\n"
+    "                          都是程式用公開資料算的，只描述狀態，不是買賣建議\n"
+    "  🔍 看大字版             股票卡、FCN 評估卡、盤勢卡最下面的按鈕：點了用網頁看大字\n"
     "                          網址過幾天會換，打不開就再叫一次卡片\n"
     "【其他】\n"
     "  /group_id               顯示本群 ID\n"

@@ -488,3 +488,17 @@ def isolate_stock_picks(monkeypatch, tmp_path_factory):
     monkeypatch.setattr(stock_picks, "_worker", stock_picks.WorkerState())
     monkeypatch.setattr(stock_picks, "_loaded", True)
     stock_picks.clear_caches()
+
+
+@pytest.fixture(autouse=True)
+def isolate_market_dashboard(monkeypatch, tmp_path_factory):
+    """2026-10-17：市場盤勢的快照、旗標、歷史庫、圖目錄一律指到這個測試自己的暫存目錄，不碰正式
+    state/ 與 /tmp/line_bot_genimg。對外連線另外由上面的 safe_fetch 守門擋掉（market_http 建在它上面）。"""
+    try:
+        import market_paths
+    except Exception:  # market_paths 自己壞了：只讓它的測試失敗
+        return
+    root = tmp_path_factory.mktemp("market")
+    (root / "state").mkdir(mode=0o700)
+    paths = market_paths.Paths.under(root)
+    monkeypatch.setattr(market_paths.Paths, "default", classmethod(lambda cls: paths))

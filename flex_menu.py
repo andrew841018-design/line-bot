@@ -43,7 +43,7 @@ BUTTONS: tuple[tuple[str, str], ...] = (
     ("📈 股票推薦", "/股票"),  # 2026-10-10；台股推薦＋常問股（第 13 顆＝Quick Reply 上限）
     ("🧾 FCN評估", "/FCN"),  # 2026-10-09；按鈕要有文字，Andrew：「不能只有圖示」
     ("🧠 看記憶", "/看記憶"),
-    ("🚦 過濾規則", "/規則"),
+    ("🧭 市場盤勢", "/盤勢"),  # 2026-10-17；取代「🚦 過濾規則」（/規則 打字照用）
     ("❓ 全部指令", "/help"),
 )
 
@@ -62,7 +62,7 @@ def _normalize(text: str | None) -> str:
 
 
 # 從選單拿掉、但舊的大字卡片上還點得到的按鈕：點了照樣算「按了選單按鈕」，回覆會把選單掛回去。
-_RETIRED_BUTTON_TEXTS = ("/今晚煮什麼",)  # 2026-10-11 換成「🩺 爸媽健康」
+_RETIRED_BUTTON_TEXTS = ("/今晚煮什麼", "/規則")  # 2026-10-11 換成「🩺 爸媽健康」
 
 _BUTTON_TEXTS = frozenset(
     _normalize(text) for text in (*(text for _label, text in BUTTONS), *_RETIRED_BUTTON_TEXTS)

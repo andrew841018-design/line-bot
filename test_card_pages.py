@@ -655,7 +655,7 @@ def test_the_fcn_confirm_card_is_sent_without_a_page(pages):
 
 
 def test_the_page_prefixes_follow_the_card_builders():
-    assert main._CARD_PAGE_ALT_PREFIXES == (stock_picks.PREFIX, stock_picks.EVAL_PREFIX, fcn_eval.PREFIX)
+    assert main._CARD_PAGE_ALT_PREFIXES == (stock_picks.PREFIX, stock_picks.EVAL_PREFIX, fcn_eval.PREFIX, "盤勢：")
     (_eval_card, eval_alt), (_confirm_card, confirm_alt) = _fcn_cards()
     assert eval_alt.startswith(fcn_eval.PREFIX) and not eval_alt.startswith(main._CARD_PAGE_SKIP_ALT_PREFIX)
     assert confirm_alt.startswith(main._CARD_PAGE_SKIP_ALT_PREFIX)

@@ -415,6 +415,8 @@ def _dropped(text: str) -> bool:
 # 爸媽健康功能的 bot 回覆（2026-10-11 和該功能協調）：這個 job 整則不看，連上下文都不給抽取模型。
 # 只管這個 job；即時抽取與回覆的上下文由該功能自己處理。
 _PRIVATE_BOT_PREFIXES = ("爸媽健康：", "爸媽健康卡：", "爸媽健康:", "爸媽健康卡:")
+# 市場盤勢（2026-10-17）的卡片 altText 與圖的存檔字串：一樣整則不給抽取模型（本功能不經模型）。
+_PRIVATE_BOT_PREFIXES += ("盤勢：", "盤勢圖：")
 
 
 def _private_bot_reply(user_id: str, text: str) -> bool:

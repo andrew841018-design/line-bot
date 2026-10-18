@@ -1,0 +1,551 @@
+"""market_pipeline_misc（/盤勢 宏觀、BTC、新聞、川普、選舉的 collect 任務，2026-10-17）的測試：假的 http、
+暫存的 Store、固定的日曆、注入的時間。測的是：Yahoo 每個 D 一次、失敗改代理且每格標來源、≤D、代理沒有 D 那根
+30 分鐘後重抓、BTC 每 2 小時、新聞 36 小時與 503 冷卻、川普依 originalId 累積與「（至少）」、預測市場的間隔。"""
+
+from __future__ import annotations
+
+import json
+from datetime import date, datetime, timedelta, timezone
+from email.utils import format_datetime
+from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
+
+import pytest
+
+import market_calendar
+import market_http
+import market_paths
+import market_pipeline_misc as misc
+import market_pipeline_tw as tw
+import market_store
+import market_tasks
+
+TPE = ZoneInfo("Asia/Taipei")
+NY = ZoneInfo("America/New_York")
+UTC = timezone.utc
+YAHOO = {
+    "DXY": "DX-Y.NYB", "WTI": "CL=F", "BRENT": "BZ=F", "GOLD": "GC=F", "SILVER": "SI=F", "BTC": "BTC-USD",
+    "USDTWD": "TWD=X", "RUT": "^RUT", "DJI": "^DJI", "IXIC": "^IXIC", "MOVE": "^MOVE",
+}
+PROXIES = {"DXY": "UUP", "WTI": "USO", "BRENT": "BNO", "GOLD": "GLD", "SILVER": "SLV", "RUT": "IWM", "DJI": "DIA", "IXIC": "ONEQ"}
+WEEK = [date(2026, 10, 12), date(2026, 10, 13), date(2026, 10, 14), date(2026, 10, 15)]
+D = date(2026, 10, 15)  # 週四；台北週五 07:00＝美東週四 19:00，週四收盤＋30 分鐘已過
+NOW_AFTER_D = datetime(2026, 10, 16, 7, 0, tzinfo=TPE).timestamp()
+
+
+# ── 小工具 ──────────────────────────────────────────────────────────────────────
+def at(y: int, m: int, d: int, hh: int = 0, mm: int = 0) -> float:
+    return datetime(y, m, d, hh, mm, tzinfo=TPE).timestamp()
+
+
+class Clock:
+    def __init__(self, value: float) -> None:
+        self.value = float(value)
+
+    def __call__(self) -> float:
+        return self.value
+
+    def sleep(self, seconds: float) -> None:
+        self.value += float(seconds)
+
+
+class FakeHttp:
+    """照 market_http.fetch 的樣子：先在帳本預扣，再依網址片段回假的內容（dict／list→JSON、str→UTF-8）。"""
+
+    def __init__(self) -> None:
+        self.routes: list[tuple[str, object]] = []
+        self.calls: list[str] = []
+
+    def route(self, needle: str, handler) -> None:
+        self.routes.insert(0, (needle, handler))
+
+    def fetch(self, url, *, max_bytes, timeout=15.0, accept=("json",), headers=None, ledger=None):
+        if ledger is not None:
+            ledger.reserve(urlsplit(url).hostname)
+        self.calls.append(url)
+        for needle, handler in self.routes:
+            if needle in url:
+                result = handler(url) if callable(handler) else handler
+                if isinstance(result, BaseException):
+                    raise result
+                if isinstance(result, str):
+                    body = result.encode("utf-8")
+                elif isinstance(result, bytes):
+                    body = result
+                else:
+                    body = json.dumps(result, ensure_ascii=False).encode()
+                return market_http.Response(200, body, {"content-type": "application/json"}, url)
+        raise market_http.FetchError("status")
+
+    def count(self, needle: str) -> int:
+        return sum(needle in url for url in self.calls)
+
+
+@pytest.fixture
+def env(tmp_path: Path):
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    clock = Clock(at(2026, 10, 1))
+    store = market_store.Store(state / "market_history.sqlite", now_fn=clock)
+    store.put_obs(
+        "tw.holidays.2026",
+        {"year": 2026, "rows": [{"date": "2026-10-09", "name": "國慶日", "note": "補假。", "kind": "closed"}], "unknown": []},
+        data_date=None,
+    )
+    yield SimpleNamespace(store=store, http=FakeHttp(), clock=clock, paths=market_paths.Paths.under(tmp_path))
+    store.close()
+
+
+def make_ctx(env: SimpleNamespace, now: float, *, http=None) -> market_tasks.Context:
+    env.clock.value = max(env.clock.value, now)
+    return market_tasks.Context(
+        store=env.store,
+        http=env.http if http is None else http,
+        ledger=env.store.ledger(now_fn=env.clock, sleep_fn=env.clock.sleep),
+        now=now,
+        paths=env.paths,
+        deadline=1e9,
+        us_cal=market_calendar.us_calendar(env.store),
+        tw_cal=market_calendar.tw_calendar(env.store),
+        clock=lambda: 0.0,
+    )
+
+
+TASKS = {task.name: task for task in misc.tasks()}
+
+
+def run(ctx: market_tasks.Context, name: str) -> str:
+    return market_tasks.run_task(ctx, TASKS[name])
+
+
+def payload(env: SimpleNamespace, obs_id: str) -> dict:
+    return (env.store.get_obs(obs_id) or {}).get("payload")
+
+
+# Yahoo spark：交易所當地 09:30 的時間戳（C 用交易所時區換成日期）
+def spark_entry(symbol: str, bars: list[tuple[date, float]], tz: str = "America/New_York") -> dict:
+    zone = ZoneInfo(tz)
+    stamps = [int(datetime(d.year, d.month, d.day, 9, 30, tzinfo=zone).timestamp()) for d, _ in bars]
+    meta = {"symbol": symbol, "currency": "USD", "exchangeTimezoneName": tz}
+    return {"symbol": symbol, "response": [{"meta": meta, "timestamp": stamps, "indicators": {"quote": [{"close": [c for _, c in bars]}]}}]}
+
+
+def spark(entries: dict[str, list[tuple[date, float]]]) -> dict:
+    return {"spark": {"result": [spark_entry(symbol, bars) for symbol, bars in entries.items()], "error": None}}
+
+
+def full_week(base: float) -> list[tuple[date, float]]:
+    return [(day, round(base + index * 0.5, 4)) for index, day in enumerate(WEEK)]
+
+
+def nasdaq_hist(symbol: str, bars: list[tuple[date, float]]) -> dict:
+    rows = [
+        {"date": d.strftime("%m/%d/%Y"), "close": f"{c:.2f}", "volume": "1,000", "open": f"{c:.2f}",
+         "high": f"{c:.2f}", "low": f"{c:.2f}"}
+        for d, c in sorted(bars, reverse=True)
+    ]
+    return {"data": {"symbol": symbol, "totalRecords": len(rows), "tradesTable": {"asOf": None, "rows": rows}},
+            "message": None, "status": {"rCode": 200, "bCodeMessage": None, "developerMessage": None}}
+
+
+def route_proxies(env: SimpleNamespace, bars_for) -> None:
+    for etf in PROXIES.values():
+        env.http.route(f"/api/quote/{etf}/historical", lambda url, etf=etf: nasdaq_hist(etf, bars_for(etf)))
+
+
+def rfc(moment: datetime) -> str:
+    return format_datetime(moment.astimezone(UTC), usegmt=True)
+
+
+def news_rss(items: list[tuple[str, datetime, str]]) -> str:
+    body = "".join(
+        f"<item><title>{title}</title><link>https://news.google.com/rss/articles/a{i}</link>"
+        f'<guid isPermaLink="false">g{i}</guid><pubDate>{rfc(when)}</pubDate><description>d</description>'
+        f'<source url="https://example.com">{source}</source></item>'
+        for i, (title, when, source) in enumerate(items)
+    )
+    return f'<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>t</title>{body}</channel></rss>'
+
+
+TRUMP_NS = (
+    'xmlns:truth="https://truthsocial.com/ns" xmlns:dc="http://purl.org/dc/elements/1.1/" '
+    'xmlns:archive="https://www.trumpstruth.org/rss-extensions"'
+)
+
+
+def trump_rss(posts: list[tuple[str, datetime, str, bool]]) -> str:
+    items = "".join(
+        "<item><title>Post</title><link>https://www.trumpstruth.org/statuses/1</link>"
+        f"<description><![CDATA[<p>{text}</p>]]></description><dc:creator>Donald J. Trump</dc:creator>"
+        f"<pubDate>{rfc(when)}</pubDate><truth:originalUrl>https://truthsocial.com/@realDonaldTrump/{oid}</truth:originalUrl>"
+        f"<truth:originalId>{oid}</truth:originalId><archive:postType>original</archive:postType>"
+        f"<archive:removed>{'true' if removed else 'false'}</archive:removed></item>"
+        for oid, when, text, removed in posts
+    )
+    return f'<?xml version="1.0" encoding="UTF-8"?><rss version="2.0" {TRUMP_NS}><channel><title>t</title>{items}</channel></rss>'
+
+
+def polymarket_event(*, closed: bool = False, prices: str = '["0.905", "0.095"]') -> list:
+    market = {
+        "id": "562802", "question": "Will the Democratic Party control the House after the 2026 Midterm elections?",
+        "groupItemTitle": "Democratic Party", "outcomes": '["Yes", "No"]', "outcomePrices": prices,
+        "bestBid": 0.9, "bestAsk": 0.91, "lastTradePrice": 0.91, "active": not closed, "closed": closed,
+        "updatedAt": "2026-10-17T02:37:14.573417Z",
+    }
+    return [{"id": "32225", "slug": "which-party-will-win-the-house-in-2026", "markets": [market]}]
+
+
+# ── 登錄 ──────────────────────────────────────────────────────────────────────────
+def test_tasks_and_groups():
+    with market_tasks.isolated_registry():
+        misc.register_all()
+        groups = {task.name: task.group for task in market_tasks.registered()}
+    import market_sources_misc
+
+    elections = {f"election.{market.key}": "medium" for market in market_sources_misc.PREDICTION_MARKETS}
+    assert {"election.polymarket.house", "election.kalshi.house"} <= set(elections)  # 每個固定市場一個任務
+    assert groups == {
+        "news.us": "fast", "news.tw": "fast", "news.iran": "fast", "trump.feed": "fast",
+        "macro.btc": "medium", "macro.yahoo": "core", **elections,
+    }
+
+
+# ── 宏觀：Yahoo 為主 ─────────────────────────────────────────────────────────────────
+def test_yahoo_once_per_d_keeps_rows_up_to_d_with_yahoo_labels(env):
+    entries = {symbol: full_week(10.0 + i) for i, symbol in enumerate(YAHOO.values())}
+    entries["CL=F"] = full_week(80.0) + [(date(2026, 10, 16), 99.0)]  # 期貨 24 小時交易：D 之後那根要丟
+    entries["^RUT"] = [(date(2026, 10, 13), 2400.0), (D, 2450.0)]  # 缺 10/14：前一筆不是前一個交易日
+    env.http.route("finance.yahoo.com", spark(entries))
+    ctx = make_ctx(env, NOW_AFTER_D)
+    assert misc.us_session_d(ctx) == D
+    assert run(ctx, "macro.yahoo") == "ok"
+    assert env.http.count("finance.yahoo.com") == 1 and env.http.count("api.nasdaq.com") == 0
+    dxy = payload(env, "macro.DXY")
+    assert dxy["source"] == "Yahoo" and dxy["symbol"] == "DX-Y.NYB"
+    assert dxy["value"] == 11.5 and dxy["date"] == "2026-10-15" and dxy["prev_date"] == "2026-10-14"
+    assert dxy["chg"] == pytest.approx(0.5) and dxy["chg_pct"] == pytest.approx(0.5 / 11.0 * 100)
+    wti = payload(env, "macro.WTI")
+    assert wti["value"] == 81.5 and wti["date"] == "2026-10-15" and all(day <= "2026-10-15" for day, _ in wti["bars"])
+    rut = payload(env, "macro.RUT")
+    assert rut["value"] == 2450.0 and rut["chg"] is None and rut["prev_date"] is None
+    assert payload(env, "macro.BTC.yahoo")["source"] == "Yahoo"  # Yahoo 的 BTC 只當備援
+    assert env.store.get_obs("macro.BTC") is None  # 主格是 Coinbase 那筆
+    assert env.store.get_obs("macro.DXY")["data_date"] == "2026-10-15"
+    # 同一個 D 不再打；下一個 D（週五收盤後）才再打一次
+    assert run(make_ctx(env, NOW_AFTER_D + 3600), "macro.yahoo") == "not_due"
+    assert misc.macro_plan(make_ctx(env, at(2026, 10, 17, 7, 0)))["yahoo"] is True
+
+
+def test_yahoo_failure_switches_to_proxies_and_labels_each_value(env):
+    env.http.route("finance.yahoo.com", market_http.FetchError("rate_limited"))
+    route_proxies(env, lambda etf: full_week(20.0) + [(date(2026, 10, 16), 30.0)])  # D 之後那根也要丟
+    env.store.put_obs(
+        tw.OBS_FX, {"date": "2026-10-15", "usd_ntd": 32.338, "prev_date": "2026-10-14", "prev_usd_ntd": 32.3},
+        data_date="2026-10-15",
+    )
+    ctx = make_ctx(env, NOW_AFTER_D)
+    assert run(ctx, "macro.yahoo") == "partial"  # MOVE 沒有代理
+    assert env.http.count("api.nasdaq.com") == 8
+    assert env.http.count("coinbase") == 0 and env.http.count("taifex") == 0  # BTC 有自己的 2 小時任務、台幣讀 tw.fx
+    for key, etf in PROXIES.items():
+        item = payload(env, f"macro.{key}")
+        assert item["source"] == f"ETF 代理：{etf}" and item["symbol"] == etf
+        assert item["date"] == "2026-10-15" and item["value"] == 21.5
+    usd = payload(env, "macro.USDTWD")
+    assert usd["source"] == "代理：期交所匯率" and usd["value"] == 32.338  # Yahoo 的 TWD=X 拿不到才用：標成代理
+    import market_dashboard
+
+    assert market_dashboard._macro_label("USDTWD", usd) == "台幣匯率（期交所代理）"
+    assert market_dashboard._macro_label("DXY", payload(env, "macro.DXY")) == "美元（UUP 代理）"
+    assert usd["chg"] == pytest.approx(0.038)  # 10/14 是 10/15 的前一個台股交易日
+    move = env.store.get_obs("macro.MOVE")
+    assert move["payload"] is None and move["error"] == "rate_limited" and move["fail_streak"] == 1
+    assert env.store.get_obs("macro.BTC.yahoo")["error"] == "rate_limited"
+    # 全部代理都拿到 D：同一個 D 不再排
+    assert misc.macro_plan(make_ctx(env, NOW_AFTER_D + 3 * 3600)) is None
+
+
+def test_partial_yahoo_response_sends_only_the_missing_symbols_to_proxies(env):
+    entries = {symbol: full_week(10.0) for symbol in YAHOO.values() if symbol != "^RUT"}
+    env.http.route("finance.yahoo.com", spark(entries))
+    route_proxies(env, lambda etf: full_week(200.0))
+    assert run(make_ctx(env, NOW_AFTER_D), "macro.yahoo") == "ok"
+    assert [urlsplit(url).path for url in env.http.calls if "nasdaq" in url] == ["/api/quote/IWM/historical"]
+    assert payload(env, "macro.RUT")["source"] == "ETF 代理：IWM"
+    assert payload(env, "macro.DJI")["source"] == "Yahoo"
+
+
+def test_proxy_without_the_d_bar_is_fetched_once_more_after_30_minutes(env):
+    env.http.route("finance.yahoo.com", market_http.FetchError("status"))
+    late = {"yes": False}
+    route_proxies(env, lambda etf: full_week(20.0) if etf != "UUP" or late["yes"] else full_week(20.0)[:-1])
+    env.store.put_obs(tw.OBS_FX, {"date": "2026-10-15", "usd_ntd": 32.3}, data_date="2026-10-15")
+    assert run(make_ctx(env, NOW_AFTER_D), "macro.yahoo") == "partial"
+    assert payload(env, "macro.DXY")["date"] == "2026-10-14"  # 先放前一天的值（卡上看資料日）
+    assert misc.macro_plan(make_ctx(env, NOW_AFTER_D + 600)) is None  # 30 分鐘內不重抓
+    plan = misc.macro_plan(make_ctx(env, NOW_AFTER_D + 1800))
+    assert plan == {"d": D, "yahoo": False, "keys": ["DXY"]}
+    late["yes"] = True
+    before = env.http.count("finance.yahoo.com")
+    assert run(make_ctx(env, NOW_AFTER_D + 1800), "macro.yahoo") == "ok"  # 這次只重抓 UUP（MOVE 第一次就記了失敗）
+    assert env.http.count("finance.yahoo.com") == before  # Yahoo 一個 D 只打一次
+    assert payload(env, "macro.DXY")["date"] == "2026-10-15"
+    assert misc.macro_plan(make_ctx(env, NOW_AFTER_D + 7200)) is None
+
+
+def test_proxy_retry_is_limited_to_once(env):
+    env.http.route("finance.yahoo.com", market_http.FetchError("status"))
+    route_proxies(env, lambda etf: full_week(20.0)[:-1] if etf == "UUP" else full_week(20.0))
+    env.store.put_obs(tw.OBS_FX, {"date": "2026-10-15", "usd_ntd": 32.3}, data_date="2026-10-15")
+    run(make_ctx(env, NOW_AFTER_D), "macro.yahoo")
+    run(make_ctx(env, NOW_AFTER_D + 1800), "macro.yahoo")
+    assert env.http.count("/api/quote/UUP/") == 2
+    assert misc.macro_plan(make_ctx(env, NOW_AFTER_D + 3600)) is None
+
+
+def test_usdtwd_proxy_fetches_taifex_once_when_the_tw_pipeline_has_nothing(env):
+    env.http.route("finance.yahoo.com", market_http.FetchError("rate_limited"))
+    route_proxies(env, lambda etf: full_week(20.0))
+    env.http.route("DailyForeignExchangeRates", [
+        {"Date": "20261014", "USD/NTD": "32.300"}, {"Date": "20261015", "USD/NTD": "32.338"},
+        {"Date": "20261016", "USD/NTD": "32.400"},  # D 之後的不收
+    ])
+    run(make_ctx(env, NOW_AFTER_D), "macro.yahoo")
+    assert env.http.count("DailyForeignExchangeRates") == 1
+    usd = payload(env, "macro.USDTWD")
+    # 期交所只給最新一天與前一天：最新那天（10/16）晚於 D 被丟掉，所以用 10/15、沒有前一筆可比
+    assert usd["date"] == "2026-10-15" and usd["value"] == 32.338 and usd["chg"] is None
+
+
+def test_macro_payload_rules():
+    cal = market_calendar.Calendar("us")
+    bars = [(date(2026, 10, 14), 10.0), (D, 11.0), (date(2026, 10, 16), 12.0), (date(2026, 10, 13), float("nan")),
+            ("bad", 1.0), (date(2026, 10, 12), -1.0)]
+    item, day = misc.macro_payload(bars, D, cal, "Yahoo", "X")
+    assert day == D and item["value"] == 11.0 and item["chg"] == pytest.approx(1.0)
+    assert [row[0] for row in item["bars"]] == ["2026-10-14", "2026-10-15"]
+    assert misc.macro_payload([(date(2026, 10, 16), 1.0)], D, cal, "Yahoo", "X") is None
+    item, _ = misc.macro_payload([(date(2026, 10, 9), 10.0), (D, 11.0)], D, cal, "Yahoo", "X")
+    assert item["chg"] is None  # 前一筆不是前一個交易日（10/14）
+
+
+# ── BTC：Coinbase 每 2 小時 ──────────────────────────────────────────────────────────
+def test_coinbase_btc_every_two_hours_and_retry_after_failure(env):
+    answer = {"value": {"data": {"amount": "81471.055", "base": "BTC", "currency": "USD"}}}
+    env.http.route("api.coinbase.com", lambda url: answer["value"])
+    t0 = at(2026, 10, 16, 10, 0)
+    assert run(make_ctx(env, t0), "macro.btc") == "ok"
+    btc = env.store.get_obs("macro.BTC")
+    assert btc["payload"]["value"] == 81471.055 and btc["payload"]["source"] == "Coinbase"
+    assert btc["payload"]["fetched_utc"].startswith("2026-10-16T02:00")
+    assert run(make_ctx(env, t0 + 7199), "macro.btc") == "not_due"
+    answer["value"] = market_http.FetchError("timeout")
+    assert run(make_ctx(env, t0 + 7200), "macro.btc") == "timeout"
+    assert env.store.get_obs("macro.BTC")["payload"]["value"] == 81471.055  # 舊值留著
+    answer["value"] = {"data": {"amount": "82000", "base": "BTC", "currency": "USD"}}
+    assert run(make_ctx(env, t0 + 7200 + 899), "macro.btc") == "backoff"  # 框架退避 15 分鐘
+    assert run(make_ctx(env, t0 + 7200 + 1799), "macro.btc") == "not_due"  # 失敗後自己等 30 分鐘
+    assert run(make_ctx(env, t0 + 7200 + 1800), "macro.btc") == "ok"
+    assert env.store.get_obs("macro.BTC")["payload"]["value"] == 82000.0
+
+
+# ── 新聞 ─────────────────────────────────────────────────────────────────────────
+def test_news_keeps_36_hours_and_cleans_titles(env):
+    now = datetime(2026, 10, 16, 2, 0, tzinfo=UTC)
+    env.http.route("news.google.com", news_rss([
+        ("美股收黑 那指摔逾2% - 甲報", now - timedelta(hours=2), "甲報"),
+        ("x @all y", now - timedelta(hours=3), "乙報"),
+        ("太舊的新聞", now - timedelta(hours=40), "丙報"),
+        ("看這裡 https://evil.example/a", now - timedelta(hours=1), "丁報"),
+    ]))
+    assert run(make_ctx(env, now.timestamp()), "news.us") == "ok"
+    items = payload(env, "news.us")["items"]
+    # 「@」被換掉（來源模組換成全形空白、這裡再洗一次 NFKC 又變回半形空白）：不會變成 LINE 的提及
+    assert [item["title"] for item in items] == ["美股收黑 那指摔逾2%", "x all y"]
+    assert items[0]["source"] == "甲報" and items[0]["published_utc"].startswith("2026-10-16T00:00")
+    assert env.store.get_obs("news.us")["data_date"] == "2026-10-16"
+    assert run(make_ctx(env, now.timestamp() + 1799), "news.us") == "not_due"
+    assert run(make_ctx(env, now.timestamp() + 1800), "news.us") == "ok"
+    # 伊朗一小時一次
+    assert run(make_ctx(env, now.timestamp()), "news.iran") == "ok"
+    assert run(make_ctx(env, now.timestamp() + 1800), "news.iran") == "not_due"
+
+
+def test_news_items_drop_stale_future_and_naive_dates():
+    now = datetime(2026, 10, 16, 2, 0, tzinfo=UTC)
+    items = [
+        SimpleNamespace(title="新", source="甲", published_utc=now - timedelta(hours=1)),
+        SimpleNamespace(title="舊", source="甲", published_utc=now - timedelta(hours=36, seconds=1)),
+        SimpleNamespace(title="未來", source="甲", published_utc=now + timedelta(hours=1)),
+        SimpleNamespace(title="沒時區", source="甲", published_utc=datetime(2026, 10, 16, 1, 0)),
+        SimpleNamespace(title="新", source="甲", published_utc=now - timedelta(hours=2)),  # 同一則
+        SimpleNamespace(title="\u202e", source="甲", published_utc=now),
+    ]
+    assert [item["title"] for item in misc.news_items(items, now)] == ["新"]
+
+
+def test_google_news_503_cools_the_host_down_without_more_requests(env, monkeypatch):
+    import safe_fetch
+
+    status = {"code": 503}
+    hits: list[str] = []
+    rss = news_rss([("台股收紅 - 甲報", datetime(2026, 10, 16, 1, 0, tzinfo=UTC), "甲報")]).encode()
+
+    def fake_fetch(url, **kwargs):
+        hits.append(url)
+        return SimpleNamespace(status_code=status["code"], headers={"Content-Type": "application/rss+xml"}, content=rss)
+
+    monkeypatch.setattr(safe_fetch, "fetch", fake_fetch)
+    t0 = datetime(2026, 10, 16, 2, 0, tzinfo=UTC).timestamp()
+    assert run(make_ctx(env, t0, http=market_http), "news.tw") == "rate_limited"
+    assert env.store.fetch_counts(now=t0)["news.google.com"]["cooldown_until"] == pytest.approx(t0 + 7200)
+    assert env.store.get_obs("news.tw")["error"] == "rate_limited"
+    # 同一主機的其他新聞也不再打：帳本冷卻中，請求根本沒送出
+    status["code"] = 200
+    assert run(make_ctx(env, t0 + 60, http=market_http), "news.us") == "cooldown"
+    assert len(hits) == 1
+    assert misc._news_fns("tw")[0](make_ctx(env, t0 + 1800, http=market_http)) is False
+    # 兩小時後冷卻結束
+    assert run(make_ctx(env, t0 + 7201, http=market_http), "news.tw") == "ok"
+    assert payload(env, "news.tw")["items"][0]["title"] == "台股收紅"
+    assert len(hits) == 2
+
+
+# ── 川普原文：依 originalId 累積、「（至少）」 ──────────────────────────────────────────────
+def test_trump_posts_accumulate_by_original_id_and_flag_gaps(env):
+    t0 = datetime(2026, 10, 16, 12, 0, tzinfo=UTC)
+    a = ("100000000000000001", t0 - timedelta(hours=47), "Iran must stop now", False)
+    b = ("100000000000000002", t0 - timedelta(hours=5), "Big tariffs are coming", False)
+    c = ("100000000000000003", t0 + timedelta(hours=1), "Tariffs on chips work", False)
+    d = ("100000000000000004", t0 + timedelta(hours=2), "Thank you Ohio", False)
+    feed = {"posts": [a, b]}
+    env.http.route("trumpstruth", lambda url: trump_rss(feed["posts"]))
+
+    def summary() -> dict:
+        return payload(env, "trump.summary")
+
+    assert run(make_ctx(env, t0.timestamp()), "trump.feed") == "ok"
+    assert summary()["topics"] == {"iran": 1, "tariff": 1}
+    assert summary()["labels"] == {"iran": "伊朗", "tariff": "關稅"}
+    assert summary()["at_least"] is True  # 剛上線：最舊那則之前不知道
+    # 30 分鐘後只剩最新一則還在 feed（中間被洗掉、沒有交集）→ 有缺口；前面累積的照算
+    feed["posts"] = [c]
+    assert run(make_ctx(env, (t0 + timedelta(hours=2)).timestamp()), "trump.feed") == "ok"
+    assert summary()["topics"] == {"chips": 1, "tariff": 2}  # b 從累積資料來；a 已超過 48 小時
+    assert summary()["at_least"] is True
+    assert {post["id"] for post in env.store.posts("trump", since_utc=t0 - timedelta(days=3))} == {a[0], b[0], c[0]}
+    # b 被移除：之前累積到的也拿掉；沒有主題的貼文只算則數
+    feed["posts"] = [(b[0], b[1], "", True), c, d]
+    assert run(make_ctx(env, (t0 + timedelta(hours=2, minutes=30)).timestamp()), "trump.feed") == "ok"
+    assert summary()["topics"] == {"chips": 1, "tariff": 1}
+    assert summary()["posts"] == 2 and summary()["matched"] == 1
+    details = payload(env, "trump.posts")["items"]
+    assert [item["id"] for item in details] == [c[0]] and details[0]["text"] == "Tariffs on chips work"
+    # 缺口（b 到 c 之間）滑出 48 小時後就不是「至少」
+    later = (t0 + timedelta(hours=1 + 48, minutes=30)).timestamp()
+    feed["posts"] = [c, d]
+    assert run(make_ctx(env, later), "trump.feed") == "ok"
+    assert summary()["at_least"] is False
+    # Mac 睡了 3 天：這輪最舊一則比上輪最新一則還新 → 又是「至少」
+    e = ("100000000000000005", t0 + timedelta(days=4), "Taiwan chips", False)
+    feed["posts"] = [e]
+    assert run(make_ctx(env, (t0 + timedelta(days=4, hours=1)).timestamp()), "trump.feed") == "ok"
+    assert summary()["at_least"] is True and summary()["topics"] == {"chips": 1, "taiwan": 1}
+
+
+def test_coverage_and_at_least_rules():
+    state: dict = {}
+    assert misc.at_least(state, 1000.0) is True  # 從沒成功過
+    misc.update_coverage(state, [], 1000.0)
+    assert state == {}
+    hour = 3600.0
+    misc.update_coverage(state, [10 * hour, 20 * hour], 30 * hour)
+    assert state["gaps"] == [[None, 10 * hour]] and misc.at_least(state, 30 * hour)
+    misc.update_coverage(state, [15 * hour, 25 * hour], 58.5 * hour)  # 有交集：沒有新缺口；舊的滑出 48 小時
+    assert state["gaps"] == [] and misc.at_least(state, 58.5 * hour) is False
+    misc.update_coverage(state, [40 * hour], 60 * hour)
+    assert state["gaps"] == [[25 * hour, 40 * hour]] and misc.at_least(state, 60 * hour)
+
+
+# ── 期中選舉：每 2 小時；結果出來後每天、7 天後停 ───────────────────────────────────────────
+def test_prediction_markets_poll_every_two_hours_then_daily_after_the_result(env):
+    event = {"value": polymarket_event()}
+    env.http.route("gamma-api.polymarket.com", lambda url: event["value"])
+    env.http.route("api.elections.kalshi.com", {"cursor": "", "markets": [{
+        "ticker": "CONTROLH-2026-D", "status": "active", "result": "", "yes_sub_title": "Democratic Party",
+        "title": "Will Democrats win the House in 2026?", "yes_bid_dollars": "0.9010", "yes_ask_dollars": "0.9020",
+        "last_price_dollars": "0.9020",
+    }]})
+    t0 = at(2026, 10, 17, 10, 0)
+    assert run(make_ctx(env, t0), "election.polymarket.house") == "ok"
+    assert run(make_ctx(env, t0), "election.kalshi.house") == "ok"
+    poly = payload(env, "election.polymarket.house")
+    assert poly["mid"] == pytest.approx(0.905) and poly["last"] == 0.91 and poly["outcome"] == "Democratic Party"
+    assert poly["updated_utc"].startswith("2026-10-17T02:37") and poly["result"] is None
+    kalshi = payload(env, "election.kalshi.house")
+    assert kalshi["mid"] == pytest.approx(0.9015) and kalshi["updated_utc"] is None
+    assert run(make_ctx(env, t0 + 7199), "election.polymarket.house") == "not_due"
+    assert run(make_ctx(env, t0 + 7200), "election.polymarket.house") == "ok"
+    assert env.http.count("polymarket") == 2
+    # 投票後結果出來：每天看一次，顯示 7 天後不再抓
+    event["value"] = polymarket_event(closed=True, prices='["1", "0"]')
+    resolved_at = at(2026, 11, 5, 10, 0)
+    assert run(make_ctx(env, resolved_at), "election.polymarket.house") == "ok"
+    assert payload(env, "election.polymarket.house")["result"] == "Yes"
+    assert run(make_ctx(env, resolved_at + 7200), "election.polymarket.house") == "not_due"
+    assert run(make_ctx(env, resolved_at + 86400), "election.polymarket.house") == "ok"
+    assert run(make_ctx(env, resolved_at + 7 * 86400), "election.polymarket.house") == "not_due"
+    assert run(make_ctx(env, resolved_at + 30 * 86400), "election.polymarket.house") == "not_due"
+
+
+def test_every_fixed_market_including_the_senate_gets_its_own_task_and_obs(env):
+    import market_sources_misc
+
+    def poly(url):
+        slug = urlsplit(url).query.split("slug=", 1)[1]
+        market_id = next(m.market_id for m in market_sources_misc.PREDICTION_MARKETS if m.event == slug)
+        event = polymarket_event()
+        event[0]["markets"][0]["id"] = market_id
+        return event
+
+    def kalshi(url):
+        event = urlsplit(url).query.split("event_ticker=", 1)[1]
+        ticker = next(m.market_id for m in market_sources_misc.PREDICTION_MARKETS if m.event == event)
+        return {"cursor": "", "markets": [{"ticker": ticker, "status": "active", "result": "",
+                                           "yes_sub_title": "Democratic Party", "yes_bid_dollars": "0.4000",
+                                           "yes_ask_dollars": "0.4200", "last_price_dollars": "0.4100"}]}
+
+    env.http.route("gamma-api.polymarket.com", poly)
+    env.http.route("api.elections.kalshi.com", kalshi)
+    t0 = at(2026, 10, 17, 10, 0)
+    for market in market_sources_misc.PREDICTION_MARKETS:
+        assert run(make_ctx(env, t0), f"election.{market.key}") == "ok"
+        quote = payload(env, f"election.{market.key}")
+        assert quote["market_id"] == market.market_id and quote["platform"] == market.platform
+    assert env.http.count("polymarket") + env.http.count("kalshi") == len(market_sources_misc.PREDICTION_MARKETS)
+    assert {"polymarket.senate", "kalshi.senate"} <= {m.key for m in market_sources_misc.PREDICTION_MARKETS}
+    assert payload(env, "election.kalshi.senate")["mid"] == pytest.approx(0.41)
+    assert payload(env, "election.polymarket.senate")["market_id"] == "562793"
+
+
+def test_misc_reads_the_tw_fx_obs_without_importing_the_tw_pipeline():
+    import subprocess
+    import sys
+
+    assert misc.OBS_TW_FX == tw.OBS_FX
+    code = "import sys, market_pipeline_misc; print('market_pipeline_tw' in sys.modules)"
+    out = subprocess.run([sys.executable, "-c", code], cwd=Path(misc.__file__).parent, capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "False"
+
+
+def test_schedule_intervals_come_from_the_source_table_not_the_fallback():
+    """接縫（2026-10-18）：_every／_every_or 的預設值只是保險；實際要用 market_sources_misc.ENDPOINTS。"""
+    import market_sources_misc as src
+
+    for name in misc._DEFAULT_EVERY_S:
+        assert misc._every(name) == float(src.ENDPOINTS[name].every_s), name
+    for market in src.PREDICTION_MARKETS:
+        assert misc._every_or(market.key, -1.0) == float(src.ENDPOINTS[market.key].every_s), market.key

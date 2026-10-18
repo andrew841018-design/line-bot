@@ -50,6 +50,8 @@ _SUMMARY_PREFIX = "📋 本週咪寶摘要"
 _FAMILY_PREFIX = "👨‍👩‍👧‍👦 家族熱話週報"
 # 爸媽健康（2026-10-11）的回覆開頭（＝parent_health.BOT_PREFIXES，測試確認一致）：不進 📋 摘要的模型輸入。
 _HEALTH_PREFIXES = ("爸媽健康：", "爸媽健康卡：")
+# 市場盤勢（2026-10-17）的卡片 altText 與圖的存檔字串：不進 📋 摘要的模型輸入（本功能不經模型）。
+_MARKET_PREFIXES = ("盤勢：", "盤勢圖：")
 
 # 所有可能卡住的工作（📋 摘要、新聞、家人小建議、財經驗證）都在背景跑，
 # 推播前最多等到啟動後 120 秒（留時間給兩次推播與存檔）；財經驗證最多等到
@@ -241,7 +243,7 @@ def main() -> int:
     # 只取 bot 的回應；上週的週報本身不算
     bot_replies = [
         text for _, uid, text, _ in all_msgs
-        if uid == "__bot__" and not str(text).startswith((_SUMMARY_PREFIX, _FAMILY_PREFIX, *_HEALTH_PREFIXES))
+        if uid == "__bot__" and not str(text).startswith((_SUMMARY_PREFIX, _FAMILY_PREFIX, *_HEALTH_PREFIXES, *_MARKET_PREFIXES))
     ]
 
     if not bot_replies:
