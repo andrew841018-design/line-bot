@@ -186,7 +186,7 @@ def test_fetch_historical_url_window_and_endpoint():
     call = http.calls[0]
     assert call["url"].startswith("https://api.nasdaq.com/api/quote/AAPL/historical?")
     assert "assetclass=stocks" in call["url"] and "fromdate=2026-10-15" in call["url"]
-    assert "todate=2026-10-16" in call["url"] and "limit=2" in call["url"]
+    assert "todate=2026-10-16" in call["url"] and "limit=9999" in call["url"]  # 小 limit 會觸發 Nasdaq 的 vendor 錯誤（10/18 實測）
     endpoint = src.ENDPOINTS["nasdaq_historical"]
     assert (call["max_bytes"], call["timeout"], call["accept"]) == (endpoint.max_bytes, endpoint.timeout, ("json",))
     assert call["ledger"] is ledger

@@ -1990,7 +1990,9 @@ def fetch_nasdaq_historical(
         "assetclass": "etf" if etf else "stocks",
         "fromdate": start.isoformat(),
         "todate": end.isoformat(),
-        "limit": min((end - start).days + 1, 9999),
+        # 一律 9999（Nasdaq 官網用的值）：2026-10-18 實測 COO／CPRT 帶 limit=366 會回 data:null＋
+        # 「Error while calling vendor」(2001)，同一段日期帶 9999 就正常；回幾列由日期區間決定，不會變多
+        "limit": 9999,
     }
     body = _fetch("nasdaq_historical", _nasdaq_url(f"quote/{path_symbol}/historical", params), http, ledger)
     bars = parse_nasdaq_historical(body, expect_symbol=symbol)
