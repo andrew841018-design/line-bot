@@ -479,17 +479,19 @@ def readings_summary(rows, *, today: date, prev_week_ok: bool = False) -> str:
 # ── 每日檢查：很高的血壓、低血糖（當下怎麼做只在私訊） ─────────────────────────
 
 
-def urgent_readings(rows, *, since_ts: float) -> list[tuple[str, str, float]]:
-    """since_ts 之後提到的危象血壓（>180/120）與低血糖（<70），每種取最新一筆 → [(kind, 讀數, 時間)]。"""
+def urgent_readings(rows, *, since_ts: float) -> list[tuple[str, date, str, float]]:
+    """since_ts 之後提到的危象血壓（>180/120）與低血糖（<70），每一筆都列（同一天同一個數字算一筆，時間取最早
+    那則）→ [(kind, 讀數那天, 讀數, 時間)]。同一種裡最嚴重的在前：血壓收縮壓高的、再舒張壓高的；血糖低的；
+    一樣嚴重取較新的。呼叫端（每日檢查）扣掉已提醒過的讀數後，每種只送第一筆（Andrew 10/18：「同一筆讀數只
+    提醒一次，每天最多一則」）。"""
     rows = [row for row in (rows or ()) if isinstance(row, dict) and _row_day(row) is not None and _row_ts(row) >= since_ts]
-    out = []
     crisis = [r for r in _readings(rows, _BP, earliest=True) if r["parsed"][0] > 180 or r["parsed"][1] > 120]
-    if crisis:
-        out.append(("bp_crisis", crisis[-1]["value"], crisis[-1]["ts"]))
+    crisis.sort(key=lambda r: (-r["parsed"][0], -r["parsed"][1], -r["ts"]))
     low = [r for r in _readings(rows, _GLUCOSE, earliest=True) if r["parsed"] < 700]
-    if low:
-        out.append(("glucose_low", low[-1]["value"], low[-1]["ts"]))
-    return out
+    low.sort(key=lambda r: (r["parsed"], -r["ts"]))
+    return [("bp_crisis", r["day"], r["value"], r["ts"]) for r in crisis] + [
+        ("glucose_low", r["day"], r["value"], r["ts"]) for r in low
+    ]
 
 
 def urgent_dm_text(role: str, pronoun: str, kind: str, value: str, event_ts: float) -> str:

@@ -2674,8 +2674,12 @@ def test_daily_check_sends_urgent_readings_from_the_last_48_hours(dms):
     ]
     assert ph.run_daily_check(NOW) == 1
     assert dms[0].startswith("🩺 爸媽健康每日檢查（10/11）\n10/10 08:12 群組提到爸爸的血壓")
+    # 10/12：媽媽的 62 還在 48 小時內但提醒過了，不再列；爸爸新的一筆照樣列（Andrew 10/18：同一筆只提醒一次）
     add("爸爸", "body", "血壓", "190/100", day=(2026, 10, 12), hour=9)
-    assert ph.anomaly_lines(G, ts(2026, 10, 12, 21, 30)) == []  # 同一種 7 天內不再私訊
+    assert ph.anomaly_lines(G, ts(2026, 10, 12, 21, 30)) == [
+        "10/12 09:00 群組提到爸爸的血壓 190/100（高壓超過 180）：請他休息 5 分鐘後再量一次；"
+        "還是很高要盡快就醫；有胸痛胸悶、呼吸困難、嘴歪或說話不清、單側手腳無力就打 119",
+    ]
 
 
 def test_urgent_dm_uses_the_same_symptoms_as_the_119_line():
@@ -2845,3 +2849,91 @@ def test_gp1_weekly_uses_this_week_for_single_events_and_prev_only_when_recordin
     assert ph._run_weekly_analysis(NOW) == 1
     assert "跌倒" not in dms[0]
     assert "• 7 天有 3 天提到膝蓋痛\n" in dms[0]  # 沒有「（上週 0 天）」
+
+
+
+# 危象血壓、低血糖：同一筆讀數只提醒一次，每天最多一則（Andrew 2026-10-18）
+
+
+def _check(day, hour=21, minute=30):
+    return ph.run_daily_check(ts(2026, 10, day, hour, minute))
+
+
+def test_urgent_same_value_on_another_day_is_a_new_reading(dms):
+    consent("爸爸", "U_DAD")
+    add("爸爸", "body", "血壓", "185/125", day=(2026, 10, 11), hour=8)
+    assert _check(11) == 1
+    add("爸爸", "body", "血壓", "185/125", day=(2026, 10, 12), hour=8)
+    assert _check(12) == 1 and "10/12 08:00 群組提到爸爸的血壓 185/125" in dms[1]
+
+
+def test_urgent_a_newer_higher_reading_is_not_hidden_by_a_retold_one(dms):
+    consent("爸爸", "U_DAD")
+    add("爸爸", "body", "血壓", "185/125", day=(2026, 10, 11), hour=9, reporter="U_KID")
+    assert _check(11) == 1
+    add("爸爸", "body", "血壓", "200/130", day=(2026, 10, 12), hour=8)
+    add("爸爸", "body", "血壓", "185/125", day=(2026, 10, 12), hour=9, reporter="U_KID")  # 有人又轉述一次舊數字
+    assert _check(12) == 1 and "血壓 200/130" in dms[1] and "185/125" not in dms[1]  # 每天一則，最嚴重的先
+    assert _check(13) == 1 and "10/12 09:00 群組提到爸爸的血壓 185/125" in dms[2]  # 還在 48 小時內，隔天補
+    assert _check(14) == 0 and len(dms) == 3
+
+
+def test_urgent_one_reading_retold_later_the_same_day_is_reminded_once(dms):
+    consent("爸爸", "U_DAD")
+    add("爸爸", "body", "血壓", "185/125", day=(2026, 10, 11), hour=9, reporter="U_KID")
+    add("爸爸", "body", "血壓", "185/125", day=(2026, 10, 11), hour=22)  # 當晚檢查之後本人又說一次
+    assert _check(11) == 1
+    assert _check(12) == 0 and _check(13) == 0  # 10/13 時最早那則換成 22:00，同一天同一數字還是同一筆
+    assert len(dms) == 1
+
+
+def test_urgent_both_kinds_for_one_parent_on_one_day(dms):
+    consent("媽媽", "U_MOM")
+    add("媽媽", "body", "血壓", "190/110", day=(2026, 10, 11), hour=8, reporter="U_MOM")
+    add("媽媽", "body", "血糖", "60", day=(2026, 10, 11), hour=9, reporter="U_MOM")
+    lines = ph.anomaly_lines(G, NOW)
+    assert len(lines) == 2 and "血壓 190/110" in lines[0] and "血糖 60" in lines[1]
+
+
+def test_urgent_a_deleted_wrong_reading_does_not_block_a_later_real_one(dms):
+    consent("爸爸", "U_DAD")
+    add("爸爸", "body", "血壓", "185/125", day=(2026, 10, 11), hour=8, msg="m_wrong")
+    assert _check(11) == 1
+    assert db.delete_message_events(G, "m_wrong") == 1
+    add("爸爸", "body", "血壓", "190/125", day=(2026, 10, 12), hour=8)
+    assert _check(12) == 1 and "血壓 190/125" in dms[1]
+
+
+def test_weekly_lists_urgent_readings_among_this_weeks_daily_check_items(dms, reminders):
+    consent("爸爸", "U_DAD")
+    add("爸爸", "body", "血壓", "185/125", day=(2026, 10, 9), hour=8)
+    assert ph._run_weekly_analysis(NOW) == 1
+    assert "• 這週有符合每日檢查條件的：血壓很高\n" in dms[0]
+
+
+def test_two_symptoms_for_one_parent_are_both_listed():
+    consent("媽媽", "U_MOM")
+    for offset in (0, 1, 2):
+        add("媽媽", "body", "膝蓋痛", day=_days_ago(offset), reporter="U_MOM")
+        add("媽媽", "body", "頭暈", day=_days_ago(offset), reporter="U_MOM")
+    lines = ph.anomaly_lines(G, NOW)
+    assert sorted(lines) == ["媽媽 7 天內有 3 天提到膝蓋痛", "媽媽 7 天內有 3 天提到頭暈"]  # 每天一則只限危象、低血糖
+
+
+def test_urgent_readings_failure_keeps_the_other_daily_lines(monkeypatch, dms):
+    import parent_health_analysis
+
+    consent("爸爸", "U_DAD")
+    for offset in (0, 1, 2, 3):
+        add("爸爸", "sleep", "睡不好", day=_days_ago(offset))
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("bad row")
+
+    monkeypatch.setattr(parent_health_analysis, "urgent_readings", boom)
+    assert ph.run_daily_check(NOW) == 1 and dms == ["🩺 爸媽健康每日檢查（10/11）\n爸爸 7 天內有 4 天睡不好"]
+
+
+def test_each_reading_leaves_the_window_long_before_its_suppression_ends():
+    # 「同一筆只提醒一次」靠這個關係：讀數出了 48 小時視窗（加上檢查時間漂移一天）之前，去重列都還有效
+    assert ph._URGENT_LOOKBACK_S + 86400 < ph._ALERT_SUPPRESS_S

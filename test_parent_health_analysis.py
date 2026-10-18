@@ -319,13 +319,15 @@ def test_urgent_readings_since_and_text():
     rows = [bp(3, "200/110"), bp(1, "185/125", hour=8, minute=12), bp(0, "130/80"), row(0, "body", "血糖", "62")]
     since = datetime(2026, 10, 15, 21, 0, tzinfo=TPE).timestamp()
     found = pa.urgent_readings(rows, since_ts=since)
-    assert [(kind, value) for kind, value, _ts in found] == [("bp_crisis", "185/125"), ("glucose_low", "62")]
-    text = pa.urgent_dm_text("爸爸", "他", "bp_crisis", "185/125", found[0][2])
+    assert [(kind, day, value) for kind, day, value, _ts in found] == [
+        ("bp_crisis", date(2026, 10, 16), "185/125"), ("glucose_low", date(2026, 10, 17), "62"),
+    ]
+    text = pa.urgent_dm_text("爸爸", "他", "bp_crisis", "185/125", found[0][3])
     assert text == (
         "10/16 08:12 群組提到爸爸的血壓 185/125（高壓超過 180、低壓超過 120）：請他休息 5 分鐘後再量一次；"
         "還是很高要盡快就醫；有胸痛胸悶、呼吸困難、嘴歪或說話不清、單側手腳無力就打 119"
     )
-    glucose = pa.urgent_dm_text("媽媽", "她", "glucose_low", "62", found[1][2])
+    glucose = pa.urgent_dm_text("媽媽", "她", "glucose_low", "62", found[1][3])
     assert glucose == (
         "10/17 12:00 群組提到媽媽的血糖 62（低於 70）：請她現在再量一次；還是低於 70 或有發抖、冒冷汗，"
         "意識清楚、能吞嚥的話先吃 15 克糖（約 3 顆方糖或 120cc 果汁），15 分鐘後再量，還是很低就送醫；"
@@ -448,7 +450,7 @@ def test_no_praise_for_regular_medicine_when_stopping_was_mentioned():
 
 def test_urgent_reading_time_is_the_first_mention():
     rows = [bp(0, "185/125", hour=8), bp(0, "185/125", hour=12)]  # 爸爸先說，家人後來轉述
-    [(kind, value, when)] = pa.urgent_readings(rows, since_ts=0)
+    [(kind, _day, value, when)] = pa.urgent_readings(rows, since_ts=0)
     assert (kind, value) == ("bp_crisis", "185/125")
     assert datetime.fromtimestamp(when, TPE).hour == 8
 
@@ -456,3 +458,14 @@ def test_urgent_reading_time_is_the_first_mention():
 def test_single_previous_week_reading_is_not_called_an_average():
     rows = [bp(0, "136/84"), bp(2, "134/84"), bp(9, "128/80")]
     assert pa.readings_summary(rows, today=TODAY, prev_week_ok=True) == "讀數：血壓 2 次平均 135/84（上週 128/80）"
+
+
+def test_urgent_readings_lists_every_reading_most_severe_first():
+    rows = [bp(1, "185/100", hour=9), bp(0, "200/110", hour=8), bp(0, "190/125", hour=10), bp(0, "185/100", hour=11),
+            row(1, "body", "血糖", "65"), row(0, "body", "血糖", "60"), row(0, "body", "血糖", "65", hour=15)]
+    found = [(kind, day.day, value) for kind, day, value, _ts in pa.urgent_readings(rows, since_ts=0)]
+    assert found == [
+        ("bp_crisis", 17, "200/110"), ("bp_crisis", 17, "190/125"), ("bp_crisis", 17, "185/100"),
+        ("bp_crisis", 16, "185/100"),  # 同一個數字、不同天：是另一筆
+        ("glucose_low", 17, "60"), ("glucose_low", 17, "65"), ("glucose_low", 16, "65"),
+    ]

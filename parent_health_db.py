@@ -410,7 +410,7 @@ def delete_message_events(
 
 
 def delete_role_events(group_id: str, role: str, *, db_path: Path | str | None = None) -> int:
-    """本人刪掉自己的全部紀錄。由紀錄算出來的私訊去重（種類含標籤）一起刪；119 回覆的
+    """本人刪掉自己的全部紀錄。由紀錄算出來的私訊去重（種類含標籤或讀數）一起刪；119 回覆的
     去重（每天上限、30 分鐘）只有訊息 ID，保留。回刪掉的紀錄筆數。"""
     if not group_id or role not in ROLES:
         return 0

@@ -161,7 +161,8 @@ _DM_WINDOW_S = 1800  # 同一家長同一標籤 30 分鐘內只私訊一次
 _EVENT_MAX_AGE_S = 600  # 超過 10 分鐘的訊息不回群組（只私訊）
 _MAX_PUSH_REPLIES_PER_DAY = 2  # 今天成功送出的 119 回覆滿 2 則後不再 push fallback
 _ALERT_SUPPRESS_S = 7 * 86400  # 每日檢查：同一項 7 天內只私訊一次
-_URGENT_LOOKBACK_S = 2 * 86400  # 每日檢查看 48 小時內的危象血壓、低血糖（檢查時間會飄；7 天抑制防重送）
+_URGENT_LOOKBACK_S = 2 * 86400  # 每日檢查看 48 小時內的危象血壓、低血糖（檢查時間會飄）
+_URGENT_KINDS = ("bp_crisis", "glucose_low")  # 每筆讀數一個去重種類：同一筆只提醒一次，每種每天最多一行
 _DAILY_HOUR = 21  # 台北 21:00 之後才做每日檢查
 _CHECK_INTERVAL_S = 600.0
 _STARTUP_DELAY_S = 60.0
@@ -1842,6 +1843,7 @@ class _Anomaly:
 def _anomaly_candidates(ctx: _Ctx, role: str) -> list[_Anomaly]:
     """這位家長在 ctx.now 這一刻每日檢查會列的項目（還沒扣 7 天抑制）。D＝ctx.today（台北）。
     - 2026-10-17：48 小時內提到的危象血壓（>180/120）、低血糖（<70），私訊寫當下怎麼做（parent_health_analysis）。
+      2026-10-18 起每一筆讀數一個種類（`_urgent_kind`），最嚴重的在前；`_anomalies` 每種只留第一筆還沒提醒過的。
     - 用藥中斷：開始記錄 ≤ D-17 的 00:00、D-17..D-4 有 ≥ 5 天說吃藥、D-3..D（到現在）都沒有。
     - 忘了吃藥：過去 24 小時有說。
     - 同一症狀 D-6..D ≥ 3 天（緊急字詞不算症狀）；睡不好 D-6..D ≥ 4 天。
@@ -1858,8 +1860,10 @@ def _anomaly_candidates(ctx: _Ctx, role: str) -> list[_Anomaly]:
     try:  # 新模組壞了照送下面原本的幾條
         import parent_health_analysis as analysis
 
-        for kind, value, event_ts in analysis.urgent_readings(rows, since_ts=ctx.now - _URGENT_LOOKBACK_S):
-            candidates.append(_Anomaly(role, kind, analysis.urgent_dm_text(role, _PRONOUN[role], kind, value, event_ts)))
+        for kind, day, value, event_ts in analysis.urgent_readings(rows, since_ts=ctx.now - _URGENT_LOOKBACK_S):
+            candidates.append(
+                _Anomaly(role, _urgent_kind(kind, day, value), analysis.urgent_dm_text(role, _PRONOUN[role], kind, value, event_ts))
+            )
     except Exception as exc:
         _err("urgent readings", exc)
     if on_since <= _day_start_ts(today - timedelta(days=17)):
@@ -1891,17 +1895,30 @@ def _anomaly_candidates(ctx: _Ctx, role: str) -> list[_Anomaly]:
     return candidates
 
 
+def _urgent_kind(kind: str, day: date, value: str) -> str:
+    """危象血壓、低血糖的去重種類：一筆讀數（讀數那天＋數字）一個，所以同一筆只會提醒一次，新的一筆照樣提醒。"""
+    return f"{kind}:{day.isoformat()}:{value}"
+
+
 def _anomalies(ctx: _Ctx) -> list[_Anomaly]:
     """只看記錄中（沒暫停）的家長；同一項 7 天內私訊過就不列。規則見 _anomaly_candidates。
+    危象血壓、低血糖（Andrew 10/18：「同一筆讀數只提醒一次，每天最多一則」）：每一筆讀數是自己的種類，
+    提醒過就不再列；每位家長每種只留第一筆還沒提醒過的（候選已照嚴重程度排好），沒輪到的隔天還在 48 小時內就再排。
     私訊只有角色、類別、標籤、天數；2026-10-17 起危象血壓、低血糖另帶讀數與留言時間。"""
     found: list[_Anomaly] = []
     for role in PARENTS:
         if ctx.states[role] != _ON:
             continue
+        taken: set[str] = set()
         for anomaly in _anomaly_candidates(ctx, role):
+            base = anomaly.kind.split(":", 1)[0]
+            if base in _URGENT_KINDS and base in taken:
+                continue
             last = parent_health_db.last_alert(ctx.group_id, role, anomaly.kind, db_path=ctx.db_path)
             if last is not None and ctx.now - last["sent_at"] < _ALERT_SUPPRESS_S:
                 continue
+            if base in _URGENT_KINDS:
+                taken.add(base)
             found.append(anomaly)
     return found
 
@@ -1971,7 +1988,8 @@ def _week_daily_items(ctx: _Ctx, role: str, week_start: date) -> list[str]:
         day = week_start + timedelta(days=offset)
         moment = min(ctx.now, _day_start_ts(day) + _DAILY_HOUR * 3600)
         for anomaly in _anomaly_candidates(replace(ctx, now=moment, today=day), role):
-            text = _DAILY_KIND_TEXT.get(anomaly.kind)
+            base = anomaly.kind.split(":", 1)[0]  # 危象、低血糖的種類帶著讀數（_urgent_kind）
+            text = _DAILY_KIND_TEXT.get(base)
             if text is None and anomaly.kind.startswith("symptom:"):
                 text = anomaly.kind[len("symptom:"):]
             if text and text not in found:
