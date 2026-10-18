@@ -732,3 +732,18 @@ def test_calendar_coverage_for_the_outcome(tmp_path):
     assert out["calendar_until"]["us"] is not None and out["calendar_until"]["tw"] is None
     assert out["calendar_unclassified"] == {"us": 0, "tw": 0}
     assert job.sanitize(out) == out
+
+
+def test_a_task_killed_mid_run_backs_off_next_round(env):
+    """2026-10-18 審查 r6e I1-3：跑到一半被 kill（in_flight 標記還在）→ 下一輪記一次失敗、照退避跳過；跑完會清掉標記。"""
+    seen = []
+    task = _task("t.killed", run=lambda ctx: seen.append(dict(ctx.store.task_state("t.killed"))))
+    env.store.set_task_state("t.killed", {"in_flight": {"since": T0 - 60}})
+    assert market_tasks.run_task(_ctx(env), task) == market_tasks.BACKOFF
+    state = env.store.task_state("t.killed")
+    assert state["fail_streak"] == 1 and state["last_kind"] == market_tasks.KILLED and "in_flight" not in state
+    env.store.set_task_state("t.killed", {**state, "next_try": None})  # 退避時間到了
+    assert market_tasks.run_task(_ctx(env), task) == market_tasks.OK
+    assert "in_flight" in seen[-1]  # 跑的當下有標記
+    state = env.store.task_state("t.killed")
+    assert state["fail_streak"] == 0 and "in_flight" not in state

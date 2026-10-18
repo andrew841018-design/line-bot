@@ -254,6 +254,7 @@ def _first_market(ctx: Context) -> str:
 def _record(ctx: Context, task: Task, kind: str, failed: bool, duration: float) -> None:
     try:
         state = ctx.store.task_state(task.name)  # 重讀：任務可能自己寫了游標
+        state.pop("in_flight", None)  # 跑完了（成功或失敗）：清掉 run_task 先寫的標記
         wall = ctx.wall_time()
         state["last_run"] = wall
         state["last_kind"] = kind
@@ -278,14 +279,28 @@ def _record(ctx: Context, task: Task, kind: str, failed: bool, duration: float) 
         log.warning("market task state not recorded task=%s error_type=%s", task.name, type_name(exc))
 
 
-# TODO(2026-10-18 審查 r6e I1-3，延後)：任務被監督程序 SIGKILL 時 _record 不會跑，下一輪同一個任務又最先跑；目前靠
-# clean_external 先截長擋掉已知的卡死原因。要更保險就在呼叫 task.run 之前先寫 in_flight＋退避的 next_try。
+KILLED = "killed"  # 上一輪跑到一半被監督程序 kill（in_flight 標記還在）
+
+
 def run_task(ctx: Context, task: Task, allow_s: Optional[float] = None) -> str:
-    """跑一個任務（含退避、due、例外與記帳）；回這輪的結果種類。"""
+    """跑一個任務（含退避、due、例外與記帳）；回這輪的結果種類。
+
+    2026-10-18 審查 r6e I1-3：task.run 之前先寫 in_flight 標記，_record 跑完才清掉。被 SIGKILL 的話標記會留著，
+    下一輪看到就記一次失敗、照退避跳過，不會每一輪都由同一個卡死的任務吃光整個群組的時間。"""
     try:
         state = ctx.store.task_state(task.name)
     except Exception as exc:  # noqa: BLE001
         return error_kind(exc)
+    stale = state.get("in_flight")
+    if isinstance(stale, dict):
+        streak = int(_number(state.get("fail_streak")) or 0) + 1
+        since = _number(stale.get("since")) or ctx.wall_time()
+        state.pop("in_flight", None)
+        state.update(fail_streak=streak, last_kind=KILLED, next_try=since + backoff_seconds(streak))
+        try:
+            ctx.store.set_task_state(task.name, state)
+        except Exception as exc:  # noqa: BLE001
+            return error_kind(exc)
     next_try = _number(state.get("next_try"))
     if next_try is not None and ctx.wall_time() < next_try:
         return BACKOFF
@@ -303,6 +318,7 @@ def run_task(ctx: Context, task: Task, allow_s: Optional[float] = None) -> str:
             if not due:
                 return NOT_DUE
             try:
+                ctx.store.set_task_state(task.name, {**state, "in_flight": {"since": ctx.wall_time()}})
                 status = task.run(ctx)
             except Exception as exc:  # noqa: BLE001
                 kind = error_kind(exc)
