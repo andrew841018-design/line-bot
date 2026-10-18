@@ -547,19 +547,20 @@ def _trump_due(ctx: Any) -> bool:
 def _trump_run(ctx: Any) -> Optional[str]:
     misc = _misc()
     now_utc = _now_utc(ctx)
-    posts, status = _fetch_once(
-        ctx, TASK_TRUMP, (OBS_TRUMP_SUMMARY,), misc.fetch_trumpstruth, now_utc, include_removed=True
+    result, status = _fetch_once(
+        ctx, TASK_TRUMP, (OBS_TRUMP_SUMMARY,), misc.fetch_trumpstruth_with_span, now_utc, include_removed=True
     )
     if status is not None:
         return status
+    posts, span = result
     labels = dict(misc.TRUMP_TOPIC_LABELS)
     items = [item for item in (_trump_item(post, labels) for post in posts or []) if item is not None]
     if items:
         ctx.store.upsert_posts(POSTS_TRUMP, items)
     state = _state(ctx.store, TASK_TRUMP)
-    # TODO(2026-10-18 審查 r6c N1，延後)：items 只剩有本人文字的貼文，「只有圖」的貼文會讓缺口誤判、多標「（至少）」；
-    # 方向保守（只會多標）。要修就改用 fetch_trumpstruth_with_span 比整份 feed 的頭尾。
-    update_coverage(state, [item["published_utc"].timestamp() for item in items], float(ctx.now))
+    # 缺口用整份 feed（過濾前）的頭尾判斷：只有圖／影片的貼文也在 feed 裡，用過濾後的 items 會誤判成有漏、
+    # 多標「（至少）」（2026-10-18 審查 r6c N1）
+    update_coverage(state, [span[0].timestamp(), span[1].timestamp()], float(ctx.now))
     _save(ctx.store, TASK_TRUMP, state)
     summary, details = trump_summary(ctx.store, now_utc, state, labels)
     day = now_utc.date().isoformat()

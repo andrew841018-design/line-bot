@@ -549,3 +549,20 @@ def test_schedule_intervals_come_from_the_source_table_not_the_fallback():
         assert misc._every(name) == float(src.ENDPOINTS[name].every_s), name
     for market in src.PREDICTION_MARKETS:
         assert misc._every_or(market.key, -1.0) == float(src.ENDPOINTS[market.key].every_s), market.key
+
+
+def test_trump_coverage_counts_image_only_posts(env):
+    """2026-10-18 審查 r6c N1：只有圖的貼文不進 posts，但還在 feed 裡；有沒有漏要看整份 feed 的頭尾，
+    不然 K0、K1 捲出、只剩只有圖的 M2 時，會誤判成中間有缺口、多標「（至少）」。"""
+    t0 = datetime(2026, 10, 16, 12, 0, tzinfo=UTC)
+    k0 = ("100000000000000010", t0 - timedelta(hours=3), "Iran talks", False)
+    k1 = ("100000000000000011", t0 - timedelta(hours=2), "Tariffs today", False)
+    m2 = ("100000000000000012", t0 - timedelta(hours=1), "", False)  # 只有圖：沒有本人文字
+    k3 = ("100000000000000013", t0 + timedelta(minutes=20), "Fed must cut", False)
+    feed = {"posts": [m2, k1, k0]}
+    env.http.route("trumpstruth", lambda url: trump_rss(feed["posts"]))
+    assert run(make_ctx(env, t0.timestamp()), "trump.feed") == "ok"
+    feed["posts"] = [k3, m2]  # K0、K1 捲出，但 M2 兩輪都在：沒有漏
+    assert run(make_ctx(env, (t0 + timedelta(minutes=31)).timestamp()), "trump.feed") == "ok"
+    gaps = misc._state(env.store, misc.TASK_TRUMP).get("gaps") or []
+    assert [gap for gap in gaps if gap[0] is not None] == []  # 只有剛上線那段「之前不知道」，沒有新缺口
