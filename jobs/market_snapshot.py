@@ -291,6 +291,22 @@ def _calendars(store: market_store.Store) -> tuple[Any, Any, dict[str, str]]:
     return us_cal, tw_cal, problems
 
 
+def _calendar_coverage(store: market_store.Store) -> dict[str, Any]:
+    """日曆涵蓋到哪天、休市表裡認不出的日數（2026-10-18 審查 r6a I1／I2）：明年的休市表沒抓到、或有認不出的列，
+    卡片只會默默變暫缺；寫進 outcome 讓每日維護看得到。只放日期與次數。"""
+    us_cal, tw_cal, problems = _calendars(store)
+    until: dict[str, Any] = {}
+    unclassified: dict[str, int] = {}
+    for name, cal in (("us", us_cal), ("tw", tw_cal)):
+        value = cal.supported_until
+        value = value() if callable(value) else value
+        until[name] = value.isoformat() if value is not None else None
+        days = cal.unclassified
+        days = days() if callable(days) else days
+        unclassified[name] = len(list(days or []))
+    return {"calendar_until": until, "calendar_unclassified": unclassified, "calendar_problems": problems}
+
+
 def _collect_worker(args: argparse.Namespace, paths: market_paths.Paths, wall: Callable[[], float]) -> int:
     deadline = time.monotonic() + max(0.0, float(args.budget_s or 0.0))
     store = market_store.Store(paths.history_db, now_fn=wall)
@@ -624,6 +640,10 @@ class Supervisor:
         check = (store.get_obs(US_CALENDAR_CHECK_OBS) or {}).get("payload")
         mismatches = check.get("mismatches") if isinstance(check, dict) else None
         out["calendar_mismatch"] = sorted({m for m in mismatches if isinstance(m, str)}) if isinstance(mismatches, list) else []
+        try:
+            out.update(_calendar_coverage(store))
+        except Exception as exc:  # noqa: BLE001 - 日曆讀不到不能讓 outcome 寫不出來
+            out["calendar_until"] = {"error": error_kind(exc)}
         sup["task_names"] = [n for n in names if isinstance(n, str)]
         store.set_task_state(SUPERVISOR_STATE, sup)
 

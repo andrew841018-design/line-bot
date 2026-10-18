@@ -717,3 +717,18 @@ def test_worker_refuses_to_run_without_the_supervisor_lock(job_env):
     result = subprocess.run(argv, env=job_env.env, cwd=str(WORK), capture_output=True, timeout=60)
     assert result.returncode == 4
     assert _marks(job_env, "ok_ran") == []
+
+
+def test_calendar_coverage_for_the_outcome(tmp_path):
+    """2026-10-18 審查 r6a I1／I2：outcome 帶日曆涵蓋到哪天與認不出的日數；空資料庫時美股用官方表、台股沒有表。"""
+    import market_store
+    from jobs import market_snapshot as job
+
+    store = market_store.Store(tmp_path / "h.sqlite")
+    try:
+        out = job._calendar_coverage(store)
+    finally:
+        store.close()
+    assert out["calendar_until"]["us"] is not None and out["calendar_until"]["tw"] is None
+    assert out["calendar_unclassified"] == {"us": 0, "tw": 0}
+    assert job.sanitize(out) == out

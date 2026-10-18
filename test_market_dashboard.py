@@ -1480,3 +1480,15 @@ def test_13f_card_and_alt_text_use_the_same_words(md, paths):
     assert "前十大成分股中，3 檔的加碼機構多於減碼機構（1 檔資料暫缺）" in texts(reply.flex)
     assert reply.alt_text == "盤勢：13F 前十大（VOO）｜3 檔的加碼機構多於減碼機構"
     assert "加碼 1,200 家、減碼 1,100 家" in "\n".join(texts(reply.flex))  # 機構一律「家」
+
+
+def test_status_summary_reports_calendar_coverage(md, paths):
+    """2026-10-18 審查 r6a I1／I2：outcome 的 calendar_until／calendar_unclassified 帶進 status_summary（給每日維護）。"""
+    write_snapshot(paths, make_snapshot(NOW))
+    outcome = {"status": "ok", "code": "verified", "collect": {"status": "ok"}, "publish": {"status": "ok"},
+               "calendar_until": {"us": "2027-12-31", "tw": "2026-10-27", "xx": "2026-01-01"},
+               "calendar_unclassified": {"us": 0, "tw": 2}}
+    market_paths.write_private_atomic(paths.outcome, json.dumps(outcome).encode())
+    summary = md.status_summary(now=NOW, paths=paths)["outcome"]
+    assert summary["calendar_days_left"] == {"us": 440, "tw": 10}  # NOW＝台北 10/17
+    assert summary["calendar_unclassified"] == {"us": 0, "tw": 2}

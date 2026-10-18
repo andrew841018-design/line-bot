@@ -2253,6 +2253,19 @@ def _outcome_summary(paths: Any, now: float) -> dict:
     out["lock_held_s"] = _num(data.get("lock_held_s"), 0, 10**7)
     mismatch = data.get("calendar_mismatch")
     out["calendar_mismatch"] = sorted({k for k in _list(mismatch, 50) if _safe_kind(k)})
+    # 日曆還涵蓋幾天、休市表認不出的日數（2026-10-18 審查 r6a I1／I2）：每日維護在 ≤30 天或 >0 時報
+    today = datetime.fromtimestamp(now, _TPE).date()
+    days_left: dict = {}
+    for market, value in _dict(data.get("calendar_until")).items():
+        if market in ("us", "tw"):
+            try:
+                until = date.fromisoformat(value) if isinstance(value, str) and len(value) == 10 else None
+            except ValueError:
+                until = None
+            days_left[market] = (until - today).days if until else None
+    out["calendar_days_left"] = days_left
+    out["calendar_unclassified"] = {m: n for m, n in _dict(data.get("calendar_unclassified")).items()
+                                    if m in ("us", "tw") and _count(n, 10**4) is not None}
     return out
 
 

@@ -195,9 +195,8 @@ class Calendar:
     # ── 查詢 ──
 
     @property
-    # TODO(2026-10-18 審查 r6a I1／I2，延後)：supported_until、table_years、unclassified 還沒有人送進 outcome／每日維護；
-    # 明年的休市表沒抓到（2027-01-01 前）或有認不出的休市列時，卡片會變暫缺卻沒有警示。上線後補：job 寫進 outcome、
-    # status_summary 帶出、維護條目檢查。
+    # supported_until 與 unclassified 由 jobs/market_snapshot._calendar_coverage 寫進 outcome，status_summary 帶出
+    # calendar_days_left／calendar_unclassified，每日維護在 ≤30 天或 >0 時報（2026-10-18 審查 r6a I1／I2）。
     def supported_until(self) -> Optional[date]:
         """官方表涵蓋到哪天（每日維護在這天前 60 天開始提醒更新）。"""
         if not self._years or self._until is None:
