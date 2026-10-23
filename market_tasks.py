@@ -9,7 +9,7 @@ market_pipeline_us／tw／misc（各自在 import 時 register 自己的任務�
   每輪輪流誰先）→ backfill（美、台各最多用「開始補洞時剩餘時間」的一半）→ low（週／月／年）。
 - 每個任務包 except Exception：只記種類（FetchError／ParseError 的 kind，其他 unexpected:<型別名>），
   不記訊息（log 行另印 ParseError 的 detail，只限 [a-z_]{1,20} 的程式列舉字，2026-10-23）；
-  該任務自己累計 fail_streak、退避 15→30→60→120 分鐘，其他任務照跑。
+  該任務自己累計 fail_streak、退避 15→30→60→120 分鐘（跑到一半被殺的至少 60 分鐘），其他任務照跑。
   自己的帳本說額度不夠（FetchError("budget")）不算失敗、不退避。
 - 任務之間檢查這輪該不該停：時間到、父程序換了（監督程序被 kill）、停用旗標出現。
   任務裡面每批之間用 ctx.should_stop()（另外含這個任務自己的時間預算）。
@@ -54,7 +54,7 @@ RUN_STATUSES = frozenset({OK, NOT_YET, PARTIAL})
 # 這輪沒有真的執行的原因（只進 outcome，不改 task_state）
 NOT_DUE, BACKOFF, DEFERRED, STOPPED = "not_due", "backoff", "deferred", "stopped"
 NON_FAILURE_KINDS = frozenset({"budget"})
-FRAMEWORK_KEYS = ("last_success", "last_run", "last_kind", "fail_streak", "next_try", "last_duration_s")
+FRAMEWORK_KEYS = ("last_success", "last_run", "last_kind", "fail_streak", "next_try", "last_duration_s", "in_flight")
 
 _TASK_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}")
 _MODULE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
@@ -293,23 +293,28 @@ def _record(ctx: Context, task: Task, kind: str, failed: bool, duration: float) 
 
 
 KILLED = "killed"  # 上一輪跑到一半被監督程序 kill（in_flight 標記還在）
+KILLED_MIN_BACKOFF_S = 3600.0  # 被殺之後至少隔這麼久再試（2026-10-23 審查 r7b F5）
 
 
 def run_task(ctx: Context, task: Task, allow_s: Optional[float] = None) -> str:
     """跑一個任務（含退避、due、例外與記帳）；回這輪的結果種類。
 
     2026-10-18 審查 r6e I1-3：task.run 之前先寫 in_flight 標記，_record 跑完才清掉。被 SIGKILL 的話標記會留著，
-    下一輪看到就記一次失敗、照退避跳過，不會每一輪都由同一個卡死的任務吃光整個群組的時間。"""
+    下一輪看到就記一次失敗、照退避跳過，不會每一輪都由同一個卡死的任務吃光整個群組的時間。
+
+    2026-10-23 審查 r7b F4／F5：退避從「這輪看到標記的時間」起算、至少一小時。以前從標記的 since 起算：15 分鐘那一格
+    剛好等於排程間隔（since 約是 900 秒前），下一輪照跑、又被殺一次；since 在未來（時鐘異常、DB 被改）還會讓任務
+    無聲停用好幾年。現在 since 只是紀錄、不參與計算。F6：標記寫不進去只記 log、任務照跑（標記只是保險，
+    不能讓任務被跳過、也不算一次失敗）。"""
     try:
         state = ctx.store.task_state(task.name)
     except Exception as exc:  # noqa: BLE001
         return error_kind(exc)
-    stale = state.get("in_flight")
-    if isinstance(stale, dict):
+    if isinstance(state.get("in_flight"), dict):
         streak = int(_number(state.get("fail_streak")) or 0) + 1
-        since = _number(stale.get("since")) or ctx.wall_time()
         state.pop("in_flight", None)
-        state.update(fail_streak=streak, last_kind=KILLED, next_try=since + backoff_seconds(streak))
+        backoff = max(KILLED_MIN_BACKOFF_S, backoff_seconds(streak))
+        state.update(fail_streak=streak, last_kind=KILLED, next_try=ctx.wall_time() + backoff)
         try:
             ctx.store.set_task_state(task.name, state)
         except Exception as exc:  # noqa: BLE001
@@ -334,6 +339,9 @@ def run_task(ctx: Context, task: Task, allow_s: Optional[float] = None) -> str:
                 return NOT_DUE
             try:
                 ctx.store.set_task_state(task.name, {**state, "in_flight": {"since": ctx.wall_time()}})
+            except Exception as exc:  # noqa: BLE001 - 標記只是保險：寫不進去照跑、不算失敗（r7b F6）
+                log.warning("market task marker not written task=%s error_type=%s", task.name, type_name(exc))
+            try:
                 status = task.run(ctx)
             except Exception as exc:  # noqa: BLE001
                 kind = error_kind(exc)

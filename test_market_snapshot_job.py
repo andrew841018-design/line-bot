@@ -16,6 +16,7 @@ import os
 import plistlib
 import re
 import signal
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -771,16 +772,63 @@ def test_calendar_coverage_for_the_outcome(tmp_path):
     assert job.sanitize(out) == out
 
 
-def test_a_task_killed_mid_run_backs_off_next_round(env):
-    """2026-10-18 審查 r6e I1-3：跑到一半被 kill（in_flight 標記還在）→ 下一輪記一次失敗、照退避跳過；跑完會清掉標記。"""
+@pytest.mark.parametrize("since", [T0 - 60, T0 - 900, 1e12])
+def test_a_task_killed_mid_run_backs_off_next_round(env, since):
+    """2026-10-18 審查 r6e I1-3：跑到一半被 kill（in_flight 標記還在）→ 下一輪記一次失敗、照退避跳過；跑完會清掉標記。
+
+    2026-10-23 審查 r7b F4／F5：退避從看到標記的時間起算、至少一小時。T0−900 是真實節奏（每 15 分鐘一輪：以前
+    next_try＝since＋900＝現在，下一輪照跑、又被殺）；since 在未來（時鐘異常）也不能讓任務停用好幾年。"""
     seen = []
     task = _task("t.killed", run=lambda ctx: seen.append(dict(ctx.store.task_state("t.killed"))))
-    env.store.set_task_state("t.killed", {"in_flight": {"since": T0 - 60}})
+    env.store.set_task_state("t.killed", {"in_flight": {"since": since}})
     assert market_tasks.run_task(_ctx(env), task) == market_tasks.BACKOFF
     state = env.store.task_state("t.killed")
     assert state["fail_streak"] == 1 and state["last_kind"] == market_tasks.KILLED and "in_flight" not in state
-    env.store.set_task_state("t.killed", {**state, "next_try": None})  # 退避時間到了
+    assert state["next_try"] == pytest.approx(T0 + 3600)
+    env.mono.advance(3599)
+    assert market_tasks.run_task(_ctx(env), task) == market_tasks.BACKOFF
+    env.mono.advance(2)  # 退避時間到了
     assert market_tasks.run_task(_ctx(env), task) == market_tasks.OK
     assert "in_flight" in seen[-1]  # 跑的當下有標記
     state = env.store.task_state("t.killed")
     assert state["fail_streak"] == 0 and "in_flight" not in state
+
+
+def test_a_task_killed_again_and_again_waits_at_least_an_hour_each_time(env):
+    """2026-10-23 審查 r7b F5：連續被殺時 1、2、3 次都隔一小時，第 4 次起兩小時（BACKOFF_S 的第一格等於排程間隔，
+    對被殺的任務等於沒退避）。"""
+    task = _task("t.hang")
+    waits = []
+    for _ in range(5):
+        env.store.set_task_state("t.hang", {**env.store.task_state("t.hang"), "in_flight": {"since": T0}})  # 又被殺
+        now = _ctx(env).wall_time()
+        assert market_tasks.run_task(_ctx(env), task) == market_tasks.BACKOFF
+        waits.append(round(env.store.task_state("t.hang")["next_try"] - now))
+        env.mono.advance(waits[-1])
+    assert waits == [3600, 3600, 3600, 7200, 7200]
+    assert env.store.task_state("t.hang")["fail_streak"] == 5
+
+
+def test_a_marker_write_failure_still_runs_the_task(env, monkeypatch, caplog):
+    """2026-10-23 審查 r7b F6：in_flight 標記只是保險；寫不進去（例如 DB 暫時鎖住）只記 log、任務照跑，不算失敗。"""
+    ran = []
+    real = env.store.set_task_state
+
+    def locked_for_markers(name, state):
+        if "in_flight" in state:
+            raise sqlite3.OperationalError("database is locked")
+        return real(name, state)
+
+    monkeypatch.setattr(env.store, "set_task_state", locked_for_markers)
+    with caplog.at_level(logging.WARNING, logger="market_tasks"):
+        assert market_tasks.run_task(_ctx(env), _task("t.marker", log=ran)) == market_tasks.OK
+    assert ran == ["t.marker"]
+    state = env.store.task_state("t.marker")
+    assert state["fail_streak"] == 0 and state["last_success"] == pytest.approx(T0) and "in_flight" not in state
+    assert "market task marker not written task=t.marker error_type=OperationalError" in caplog.text
+    assert "database is locked" not in caplog.text
+
+
+def test_framework_keys_list_the_in_flight_marker():
+    """2026-10-23 審查 r7b F8：框架自己會寫 in_flight（run_task 寫、_record 清），說明用的常數要列出來。"""
+    assert "in_flight" in market_tasks.FRAMEWORK_KEYS
