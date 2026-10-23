@@ -104,8 +104,10 @@ HOLIDAY_RETRY_S = 6 * 3600.0
 HOLIDAY_REFRESH_S = 30 * 86400.0  # 今年的表每 30 天重抓一次（證交所可能補公告特別開休市）
 HOLIDAY_NEXT_YEAR_MONTH = 11  # 下一年的表 11 月起每週試抓
 HOLIDAY_NEXT_YEAR_EVERY_S = 7 * 86400.0
-TAIFEX_EARLIEST = time(15, 0)
-TAIFEX_EVERY_S = 3 * 3600.0  # 2026-10-18：期交所常晚一天，30 分鐘一次會在半夜就把每天 6 次用完
+TAIFEX_EARLIEST = time(15, 0)  # 過了這個時間「今天」才算目標日；幾點起才抓看 ENDPOINTS 的 earliest_tpe（07:00）
+# 2026-10-18：期交所常晚一天，30 分鐘一次會在半夜就把每天的次數用完 → 3 小時。2026-10-23：07:00 起才抓（ENDPOINTS），
+# 改 2 小時、每天 9 次：CDN 給 CSV 的那幾個小時過去後當天還有機會（07、09…23 點）
+TAIFEX_EVERY_S = 2 * 3600.0
 DAILY_FROM = time(8, 0)  # 本益比、月營收、MoneyDJ 持股：每天一次的最早時間
 DAILY_RETRY_S = 7200.0
 FINMIND_OVERLAP = 5
@@ -126,11 +128,11 @@ _DEFAULT_RULES: dict[str, tuple[Optional[time], int]] = {
     "twse_holidays": (None, 1),
     "openapi_bwibbu": (None, 2),
     "openapi_revenue": (None, 2),
-    "taifex_futures_inst": (time(15, 0), 6),
-    "taifex_calls_puts_inst": (time(15, 0), 6),
-    "taifex_pcr": (time(15, 0), 6),
-    "taifex_daily_options": (time(15, 0), 6),
-    "taifex_fx": (None, 2),
+    "taifex_futures_inst": (time(7, 0), 9),  # 2026-10-23：期交所約 06:36 才放上前一個交易日，07:00 起才抓
+    "taifex_calls_puts_inst": (time(7, 0), 9),
+    "taifex_pcr": (time(7, 0), 9),
+    "taifex_daily_options": (time(7, 0), 9),
+    "taifex_fx": (time(7, 0), 2),
     "finmind_prices": (None, 60),
     "moneydj_0050": (None, 2),
 }
@@ -1119,7 +1121,7 @@ def _holdings_run(ctx: Any) -> Optional[str]:
     return None
 
 
-# ── 期交所（間隔 3 小時、每天 6 次；資料日以回應為準，常晚一天） ──────────────────────────────
+# ── 期交所（07:00 起、間隔 2 小時、每天 9 次、匯率 2 次；資料日以回應為準，常晚一天） ─────────────────
 @dataclass(frozen=True)
 class TaifexSpec:
     task: str
@@ -1213,14 +1215,20 @@ TAIFEX_SPECS: tuple[TaifexSpec, ...] = (
 
 
 def taifex_due(ctx: Any, spec: TaifexSpec) -> bool:
-    """手上的資料日比目標日舊、離上次 ≥3 小時、今天還有次數。
+    """手上的資料日比目標日舊、過了端點的最早時間、離上次 ≥2 小時、今天還有次數。
 
     目標日＝已過 15:00 的最近一個交易日（target_session）：今天要過 15:00 才算今天，所以平日早上手上已有
     前一個交易日就不打。2026-10-18 拿掉「15:00 前一律不打」：剛部署、Mac 睡著、前一天沒抓到時，早上就補
-    前一個交易日（期交所還沒更新就回 NOT_YET，照樣受每天次數與 3 小時間隔限制）。"""
+    前一個交易日（期交所還沒更新就回 NOT_YET，照樣受每天次數與間隔限制）。
+
+    2026-10-23：端點的最早時間（07:00）前不打。期交所約 06:36 才放上前一個交易日的資料，以前 00／03／06 點那三次
+    一定拿到舊的，剩下的三次又剛好碰上 CDN 給 CSV 的時段就整天沒資料；現在間隔 2 小時、每天最多 9 次
+    （07、09…23 點；匯率每天 2 次：07、09 點）。"""
     now_tpe = _now_tpe(ctx)
     today = now_tpe.date()
-    _, cap = _rule(spec.endpoint)
+    earliest, cap = _rule(spec.endpoint)
+    if earliest is not None and now_tpe.time() < earliest:
+        return False
     state = _sched(ctx.store, spec.task, today)
     if state["count"] >= cap:
         return False

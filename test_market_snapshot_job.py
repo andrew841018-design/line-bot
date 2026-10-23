@@ -11,6 +11,7 @@ from __future__ import annotations
 import fcntl
 import importlib
 import json
+import logging
 import os
 import plistlib
 import re
@@ -26,6 +27,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import market_calc
 import market_calendar
 import market_http
 import market_paths
@@ -324,6 +326,41 @@ def test_error_kind():
     assert market_tasks.error_kind(market_http.FetchError("cooldown")) == "cooldown"
     assert market_tasks.error_kind(ParseError("too_few")) == "too_few"
     assert market_tasks.error_kind(ZeroDivisionError("1/0")) == "unexpected:ZeroDivisionError"
+
+
+class _Detailed(Exception):  # 別的程式庫的例外也可能帶 .detail：一律不印
+    def __init__(self, detail):
+        super().__init__(detail)
+        self.detail = detail
+
+
+def test_the_log_line_shows_a_short_parse_error_detail(env, caplog):
+    """2026-10-23：同一個 format 可能是 CDN 給了 CSV、表頭變了或截斷；log 行加印 ParseError 的 detail（只限
+    [a-z_]{1,20} 的程式列舉字）。沒有 detail 時這行一字不差；其他例外的內容一律不印。"""
+    tasks = [
+        _task("tw.csv", run=_raise(market_calc.ParseError("format", "csv"))),
+        _task("tw.long", run=_raise(market_calc.ParseError("format", "x" * 21))),
+        _task("tw.upper", run=_raise(market_calc.ParseError("empty", "tradesTable"))),
+        _task("tw.newline", run=_raise(market_calc.ParseError("format", "csv\n"))),
+        _task("tw.nodetail", run=_raise(market_calc.ParseError("format"))),
+        _task("us.fetch", run=_raise(market_http.FetchError("rate_limited"))),
+        _task("us.other", run=_raise(_Detailed("leakword"))),
+        _task("us.duebad", due=_raise(market_calc.ParseError("date", "header"))),
+        _task("tw.ok"),
+    ]
+    with caplog.at_level(logging.INFO, logger="market_tasks"):
+        market_tasks.run_collect(_ctx(env), tasks)
+    lines = {}
+    for record in caplog.records:
+        message = record.getMessage()
+        if message.startswith("market task="):
+            lines[message.split()[1].removeprefix("task=")] = message
+    assert lines["tw.csv"].startswith("market task=tw.csv kind=format detail=csv dur=")
+    assert lines["us.duebad"].startswith("market task=us.duebad kind=date detail=header dur=")
+    for name in ("tw.long", "tw.upper", "tw.newline", "tw.nodetail", "us.fetch", "us.other", "tw.ok"):
+        assert "detail=" not in lines[name], name
+    assert lines["tw.nodetail"].startswith("market task=tw.nodetail kind=format dur=")
+    assert "leakword" not in caplog.text and "tradesTable" not in caplog.text
 
 
 def test_ledger_wait_gives_up_when_the_task_must_stop(env):

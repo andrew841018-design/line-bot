@@ -5,7 +5,7 @@ FinMind 接入前的 5 天比對、期交所 15:00 起每 30 分鐘。解析本�
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
@@ -576,7 +576,7 @@ def test_holidays_bootstrap_this_and_previous_year_then_next_year_weekly(bare_en
     assert tw.holiday_year(make_ctx(env, tuesday + 7 * 86400)) == 2027
 
 
-# ── 期交所：目標日（今天要過 15:00 才算）、每 30 分鐘、每天 3 次，資料日以回應為準 ───────────────────
+# ── 期交所：目標日（今天要過 15:00 才算）、07:00 起每 2 小時、每天 9 次（匯率 2 次），資料日以回應為準 ──────
 def test_taifex_polls_every_30_minutes_and_keeps_the_payload_date(env):
     lag = {"day": date(2026, 10, 15)}
     env.http.route("MarketDataOfMajorInstitutionalTradersDetailsOfFuturesContracts", lambda url: futures_rows(lag["day"]))
@@ -587,16 +587,17 @@ def test_taifex_polls_every_30_minutes_and_keeps_the_payload_date(env):
     assert obs["data_date"] == "2026-10-15"  # 期交所晚一天：資料日照回應
     assert obs["payload"]["foreign"]["TX"]["oi_net"] == -97582
     assert obs["payload"]["foreign"]["MTX"]["oi_net"] == -3928 and obs["payload"]["foreign"]["TMF"]["oi_net"] == -12415
-    assert run(make_ctx(env, at(2026, 10, 16, 15, 10)), name) == "not_due"  # 過了 15:00 目標變 10/16，但不到 3 小時
+    assert run(make_ctx(env, at(2026, 10, 16, 15, 10)), name) == "not_due"  # 過了 15:00 目標變 10/16，但不到 2 小時
     assert run(make_ctx(env, at(2026, 10, 16, 18, 0)), name) == "not_yet"  # 還是 10/15：不算失敗
     assert run(make_ctx(env, at(2026, 10, 16, 21, 0)), name) == "not_yet"
-    assert run(make_ctx(env, at(2026, 10, 16, 23, 0)), name) == "not_due"  # 3 小時間隔
-    for hour in (2, 5, 8, 11):  # 隔天（週六）的 6 次：00:00 起每 3 小時，不會在半夜一小時內用完
+    assert run(make_ctx(env, at(2026, 10, 16, 22, 30)), name) == "not_due"  # 2 小時間隔
+    for hour in (0, 3, 6):  # 2026-10-23：07:00 前不打（期交所約 06:36 才放上前一個交易日）
+        assert run(make_ctx(env, at(2026, 10, 17, hour, 0)), name) == "not_due"
+    for hour in (7, 9, 11):  # 隔天（週六）07:00 起每 2 小時
         assert run(make_ctx(env, at(2026, 10, 17, hour, 0)), name) == "not_yet"  # 期交所還沒更新
     assert env.store.get_obs(tw.OBS_FUTURES)["fail_streak"] == 0
-    assert env.store.get_obs(tw.OBS_FUTURES)["fail_streak"] == 0
     lag["day"] = date(2026, 10, 16)
-    assert run(make_ctx(env, at(2026, 10, 17, 15, 0)), name) == "ok"  # 週六：目標仍是週五
+    assert run(make_ctx(env, at(2026, 10, 17, 13, 0)), name) == "ok"  # 週六：目標仍是週五
     obs = env.store.get_obs(tw.OBS_FUTURES)
     assert obs["data_date"] == "2026-10-16" and obs["payload"]["date"] == "2026-10-16"
     # 期交所只回最新一天：自己留前幾天，publish 才算得出外資淨口數的日變化
@@ -618,6 +619,60 @@ def test_taifex_morning_rules(env):
     assert run(make_ctx(env, at(2026, 10, 18, 9, 0)), name) == "ok"  # 週日早上：目標是週五，手上只有週四
     assert env.store.get_obs(tw.OBS_FUTURES)["data_date"] == "2026-10-16"
     assert run(make_ctx(env, at(2026, 10, 19, 9, 0)), name) == "not_due"  # 週一早上：目標仍是週五
+
+
+def test_taifex_tries_start_at_07_00_and_stay_2_hours_apart(env):
+    """2026-10-23：期交所的檔案約 06:36 才放上前一個交易日。以前每 3 小時、每天 6 次：00／03／06 點那三次一定白打，
+    10/23 剩下的 09／12／15 點又碰上 CDN 給 CSV 的時段，要到隔天 00:09 才再試；匯率每天 2 次都燒在 00:11、03:12。
+    現在 07:00 前不打，之後每 2 小時一次、每天最多 9 次（07、09…23 點）；匯率的 2 次在 07、09 點。"""
+    env.http.route("MarketDataOfMajorInstitutionalTradersDetailsOfFuturesContracts",
+                   lambda url: futures_rows(date(2026, 10, 15)))  # 期交所一直沒更新
+    env.http.route("DailyForeignExchangeRates", [{"Date": "20261015", "USD/NTD": "32.300"}])
+    env.store.put_obs(tw.OBS_FUTURES, {"date": "2026-10-15", "foreign": {"TX": {"oi_net": -1}}}, data_date="2026-10-15")
+    env.store.put_obs(tw.OBS_FX, {"date": "2026-10-15", "usd_ntd": 32.3}, data_date="2026-10-15")
+    tried: dict[str, list[str]] = {"tw.taifex.futures": [], "tw.taifex.fx": []}
+    for step in range(24 * 4):  # 週二 10/20 一整天、每 15 分鐘一輪（和 launchd 一樣）
+        now = at(2026, 10, 20) + step * 900
+        for name, seen in tried.items():
+            before = len(env.http.calls)
+            result = run(make_ctx(env, now), name)
+            if len(env.http.calls) > before:
+                assert result == "not_yet", name
+                seen.append(datetime.fromtimestamp(now, TPE).strftime("%H:%M"))
+            else:
+                assert result == "not_due", name
+    assert tried["tw.taifex.futures"] == ["07:00", "09:00", "11:00", "13:00", "15:00", "17:00", "19:00", "21:00", "23:00"]
+    assert tried["tw.taifex.fx"] == ["07:00", "09:00"]
+    for name in tried:  # 隔天：次數歸零、離上次也超過 2 小時，但還沒 07:00 就不打
+        assert run(make_ctx(env, at(2026, 10, 21, 1, 0)), name) == "not_due", name
+        assert run(make_ctx(env, at(2026, 10, 21, 6, 59)), name) == "not_due", name
+        assert run(make_ctx(env, at(2026, 10, 21, 7, 0)), name) == "not_yet", name
+    for spec in tw.TAIFEX_SPECS:  # 五個期交所任務同一套規則
+        assert tw._rule(spec.endpoint) == (time(7, 0), 2 if spec.task == "tw.taifex.fx" else 9), spec.task
+    # 主機合計 4×9＋2＝38 次／天；期交所不在 HOST_RULES 裡，用帳本的預設上限
+    cap = market_store.HOST_RULES.get("openapi.taifex.com.tw", market_store.DEFAULT_HOST_RULE).daily_cap
+    assert sum(tw._rule(spec.endpoint)[1] for spec in tw.TAIFEX_SPECS) == 38 <= cap
+
+
+def test_taifex_txo_csv_body_is_stored_without_backing_off(env):
+    """2026-10-23：CDN 給 DailyMarketReportOpt 的 CSV 時照樣入庫（以前 format、退避，台指選擇權卡停在前一天）。"""
+    header = ("日期,契約,到期月份(週別),履約價,買賣權,開盤價,最高價,最低價,最後成交價,成交量,結算價,未沖銷契約量,"
+              "最後最佳買價,最後最佳賣價,歷史最高價,歷史最低價,是否因訊息面暫停交易,交易時段")
+    lines = [
+        header,
+        "20261015,TXO,202610,54000,買權,-,-,-,-,0,500,9876,-,-,-,-,,一般",
+        "20261015,TXO,202610,46000,賣權,-,-,-,-,0,500,5432,-,-,-,-,,一般",
+        "20261015,TXO,202610,54000,買權,-,-,-,-,0,-,-,-,-,-,-,,盤後",  # 盤後盤不收
+        "20261015,TXO,202610W4,47000,買權,-,-,-,-,0,500,100,-,-,-,-,,一般",  # 週選不併進月選
+    ]
+    env.http.route("DailyMarketReportOpt", ("\ufeff" + "\r\n".join(lines) + "\r\n").encode("utf-8"))
+    assert run(make_ctx(env, at(2026, 10, 16, 15, 0)), "tw.taifex.txo") == "ok"
+    obs = env.store.get_obs(tw.OBS_TXO)
+    assert obs["data_date"] == "2026-10-15" and obs["fail_streak"] == 0
+    assert sorted(map(tuple, obs["payload"]["rows"])) == [("202610", 46000.0, "P", 5432, 500.0),
+                                                          ("202610", 54000.0, "C", 9876, 500.0)]
+    state = env.store.task_state("tw.taifex.txo")
+    assert state["last_kind"] == "ok" and state["fail_streak"] == 0 and state["next_try"] is None
 
 
 # ── FinMind：接入前 5 天比對、停這輪、修訂 ──────────────────────────────────────────────
@@ -883,6 +938,7 @@ def test_endpoint_rules_come_from_the_source_table_not_the_fallback():
     for name in tw._DEFAULT_RULES:
         item = src.ENDPOINTS[name]
         assert tw._rule(name) == (item.earliest_tpe, int(item.daily_max)), name
+        assert tw._DEFAULT_RULES[name] == (item.earliest_tpe, int(item.daily_max)), name  # 備援表也要跟著改
     short, long_range = date(2026, 10, 1), date(2026, 12, 31)
     assert tw._finmind_timeout(short, short) == float(src.ENDPOINTS["finmind_prices"].timeout_s)
     assert tw._finmind_timeout(short, long_range) == float(src.FINMIND_BOOTSTRAP_TIMEOUT_S)
