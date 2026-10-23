@@ -888,11 +888,58 @@ def test_endpoint_rules_come_from_the_source_table_not_the_fallback():
     assert tw._finmind_timeout(short, long_range) == float(src.FINMIND_BOOTSTRAP_TIMEOUT_S)
 
 
+def _taiex_sessions(store, days):
+    """日曆要知道哪幾天開市：休市表以外的日子看加權指數的實際成交日（market_calendar.tw_calendar）。"""
+    store.upsert_closes(tw.MARKET, tw.SYM_TAIEX, [(day, 20000.0, 1) for day in days], tw.SOURCE_TWSE)
+
+
+def test_tw_jump_recompute_is_one_transaction(env, monkeypatch):
+    """2026-10-23 審查 r7 #3：解除與加回在同一個交易；加回失敗時隔離維持原樣，不會變成這檔沒有隔離。"""
+    store = env.store
+    days = [date(2026, 10, 12), date(2026, 10, 13), date(2026, 10, 14), date(2026, 10, 15), date(2026, 10, 16)]
+    _taiex_sessions(store, days)
+    store.add_coverage(tw.COVERAGE_TWT49U, days[0], days[-1])
+    store.upsert_closes(tw.MARKET, "2330", [(d, c, 1) for d, c in zip(days, [100.0, 200.0, 201.0, 402.0, 403.0])],
+                        tw.SOURCE_TWSE)
+    tw.check_tw_jumps(store, ["2330"])
+    before = store.quarantine(tw.MARKET)["2330"]
+    store.upsert_closes(tw.MARKET, "2330", [(days[1], 101.0, 1), (days[2], 102.0, 1)], tw.SOURCE_TWSE)
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(store, "add_quarantine", boom)
+    with pytest.raises(RuntimeError):
+        tw.check_tw_jumps(store, ["2330"])
+    assert store.quarantine(tw.MARKET)["2330"] == before
+
+
+def test_tw_jumps_only_compare_adjacent_sessions(env):
+    """2026-10-23 審查 r7a N2：中間缺一天時，兩天各自正常的漲跌（+8%、+6.5%）加起來超過 10.5%，不能當跳空；
+    補齊後也不能留下假隔離。除權息事件在缺的那天時也一樣。"""
+    store = env.store
+    fri, mon, tue = date(2026, 10, 16), date(2026, 10, 19), date(2026, 10, 20)
+    _taiex_sessions(store, [fri, mon, tue])
+    store.add_coverage(tw.COVERAGE_TWT49U, fri, tue)
+    store.upsert_closes(tw.MARKET, "2330", [(fri, 100.0, 1), (tue, 115.0, 1)], tw.SOURCE_TWSE)  # 週一還沒存到
+    tw.check_tw_jumps(store, ["2330"])
+    assert store.quarantine(tw.MARKET).get("2330", []) == []
+    store.upsert_closes(tw.MARKET, "2330", [(mon, 108.0, 1)], tw.SOURCE_TWSE)
+    tw.check_tw_jumps(store, ["2330"])
+    assert store.quarantine(tw.MARKET).get("2330", []) == []
+    # 除權息在週一、週一那列還沒存：週五 100 → 週二 89（-11%）不是跳空
+    store.upsert_exrights([(mon, "2317", 100.0, 90.0, "權息")])
+    store.upsert_closes(tw.MARKET, "2317", [(fri, 100.0, 1), (tue, 89.0, 1)], tw.SOURCE_TWSE)
+    tw.check_tw_jumps(store, ["2317"])
+    assert store.quarantine(tw.MARKET).get("2317", []) == []
+
+
 def test_tw_jumps_without_exrights_are_quarantined(env):
     """2026-10-18 審查 r6c I3：漲跌超過 10.5% 又沒有除權息事件（減資／分割，TWT49U 不含）→ 隔離那一段；
     涵蓋不到的日子不判斷；之後補到那天的事件就解除。"""
     store = env.store
     days = [date(2026, 10, 12), date(2026, 10, 13), date(2026, 10, 14), date(2026, 10, 15)]
+    _taiex_sessions(store, days)
     store.upsert_closes(tw.MARKET, "2330", [(days[0], 100.0, 1), (days[1], 101.0, 1), (days[2], 202.0, 1), (days[3], 203.0, 1)],
                         tw.SOURCE_TWSE)
     tw.check_tw_jumps(store, ["2330"])
@@ -911,6 +958,7 @@ def test_tw_jump_quarantine_follows_corrected_prices(env):
     """2026-10-23 審查 r7 #3：來源改正了錯價，跳空已經不在 → 隔離要解除；還在的那段留著。"""
     store = env.store
     days = [date(2026, 10, 12), date(2026, 10, 13), date(2026, 10, 14), date(2026, 10, 15), date(2026, 10, 16)]
+    _taiex_sessions(store, days)
     store.add_coverage(tw.COVERAGE_TWT49U, days[0], days[-1])
     closes = [100.0, 200.0, 201.0, 402.0, 403.0]
     store.upsert_closes(tw.MARKET, "2330", [(d, c, 1) for d, c in zip(days, closes)], tw.SOURCE_TWSE)

@@ -1424,6 +1424,26 @@ def test_truncation_keeps_numbers_whole_even_when_the_whole_title_is_one_run():
             assert all(m.group() in whole for m in mc._NUMBER_RE.finditer(body)), (text, limit, out)
 
 
+def test_truncation_that_ends_in_www_is_dropped_at_once():
+    """2026-10-23 審查 r7a N5：截到「台股 www...」，下一次清洗才因為像網址整則丟掉（不冪等）；截完就要再驗一次。"""
+    assert mc.clean_external("台股 www 上漲 abcdefghij", 9) is None
+    assert mc.clean_external("台股 www 上漲", 40) == "台股 www 上漲"  # 沒截斷、沒有「www.」：照留
+
+
+def test_truncation_edge_cases_from_the_r8_review():
+    """2026-10-23 審查 r8 gp2 N1／N2／N3。"""
+    assert mc.clean_external("Rated AA+ by S&P Global after the review", 12) == "Rated AA+..."  # 「+」不是懸空正負號
+    # 手機號後面緊接非 ASCII 數字：原本退格不認得、切出像手機號的一段
+    assert mc.clean_external("Call me 0900000000\u0669\u0669 tomorrow please thanks", 21) == "Call me..."
+    assert mc.clean_external("營收678http://192.168.0.1/admin 創高", 60) is None  # 數字緊接的網址
+    assert mc.clean_external("Disney+ subscribers rise sharply as ads launch", 14) == "Disney+..."
+    assert mc.clean_external("漲幅 +12.34% 創高", 7) == "漲幅..."  # 切點剛好在正負號後面：正負號跟著數字拿掉
+    assert mc.clean_external("-" * 50, 20) is None  # 切完只剩標點：整則丟掉
+    assert mc.clean_external("ab12", 3) == "ab"  # max_len ≤ 3 也不切數字
+    # 非 ASCII 數字也是數字（r8 Codex）：預期值直接寫死，不靠 _NUMBER_RE
+    assert mc.clean_external("上升 \u0661\u066234567890% 後續新聞", 10) == "上升..."
+
+
 def test_number_safe_cut():
     assert mc.number_safe_cut("漲 +12.34% 收", 6) == 2  # 切在數字中間：退到正負號前面
     assert mc.number_safe_cut("漲 +12.34% 收", 9) == 9  # 剛好在數字後面：不動
@@ -1447,6 +1467,10 @@ def test_etf_technicals_and_volume_skip_windows_that_touch_quarantine():
     tech = mc.technicals(closes, sessions, sessions[-1], older)
     assert tech.chg_pct is not None and tech.ma[20] is not None and tech.rsi14 is not None
     assert tech.ma[60] is None and tech.ma[240] is None and tech.dd240_pct is None
+    day_after = mc.technicals(closes, sessions, sessions[-1], [(sessions[-3], sessions[-2])])
+    assert day_after.chg_pct is None  # 區間兩端都算：隔離結束的隔天日變化也不算（和 breadth 同一個規則）
+    still_open = mc.technicals(closes, sessions, sessions[-1], [(sessions[-10], None)])  # 還沒解除的區間
+    assert still_open.chg_pct is None and still_open.ma[20] is None
     volume = mc.volume_state(volumes, sessions[-1], calendar=sessions, quarantine=older)
     assert volume.ratio == pytest.approx(1.0) and volume.pct250 is None  # 20 日窗口沒碰到、250 日碰到
     assert mc.volume_state(volumes, sessions[-1], calendar=sessions, quarantine=jump).ratio is None

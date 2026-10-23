@@ -40,7 +40,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 import market_calc
 import market_calendar
@@ -691,7 +691,7 @@ def _etf_parts(
     rows: list[Any],
     cal: market_calc.TradingCalendar,
     day: date,
-    quarantine: Optional[list[tuple[date, date]]] = None,
+    quarantine: Optional[Sequence[tuple[date, Optional[date]]]] = None,
 ) -> tuple[market_calc.Technicals, market_calc.VolumeState]:
     """ETF 自己的技術面與量能；quarantine＝這檔的隔離區間，碰到的窗口不算（2026-10-23 審查 r7 #5）。"""
     closes = {row[0]: row[1] for row in rows}
@@ -1559,7 +1559,8 @@ def _macro_spy_dd(ctx: _Ctx, row_id: str) -> RowResult:
     if not rows:
         raise _Unavailable("missing")
     day = rows[-1][0]
-    tech = market_calc.technicals({row[0]: row[1] for row in rows}, cal, day)
+    # 和 us.etf.SPY 同一份隔離：分割沒對上時兩列不能一列暫缺、一列寫 -50%（2026-10-23 審查 r8 gp2 C1）
+    tech = market_calc.technicals({row[0]: row[1] for row in rows}, cal, day, ctx.quarantine(US).get("SPY"))
     if tech.dd240_pct is None:
         raise _Unavailable("missing")
     values = {"value": tech.dd240_pct, "chg": None, "chg_pct": None, "source": "SPY 價格代理"}

@@ -532,6 +532,18 @@ def test_xlsx_guard_checks_renamed_and_padded_xml_members():
     assert guard_reason(src.parse_ssga_spy_xlsx, wide, min_rows=1) == ("format", "xml_encoding")
 
 
+def test_xlsx_guard_rejects_utf16be_after_a_leading_newline():
+    """2026-10-23 審查 r7a N1：沒有 BOM 的 UTF-16BE 前面加換行（\\x00\\n\\x00<）原本被當二進位略過，實體照樣被展開。"""
+    data = ssga_xlsx(SSGA_ROWS)
+    sheet = zipfile.ZipFile(io.BytesIO(data)).read("xl/worksheets/sheet1.xml")
+    dtd = b'<!DOCTYPE x [<!ENTITY boom "boom">]>'
+    doctype = sheet.replace(b"?>", b"?>" + dtd, 1) if b"?>" in sheet else dtd + sheet
+    wide = ("\n" + doctype.decode("utf-8")).encode("utf-16-be")
+    for name in ("xl/worksheets/sheet1.dat", "xl/worksheets/sheet1.bin"):  # 改成二進位副檔名也一樣擋
+        bad = _with_member(data, "xl/worksheets/sheet1.xml", name, wide)
+        assert guard_reason(src.parse_ssga_spy_xlsx, bad, min_rows=1) == ("format", "xml_encoding"), name
+
+
 def test_xlsx_guard_keeps_real_binary_members():
     """真的 SSGA 檔有 xl/printerSettings/printerSettings1.bin（內含 NUL）：二進位成員不能被當成 XML 擋掉。"""
     data = _with_member(ssga_xlsx(SSGA_ROWS), "", "xl/printerSettings/printerSettings1.bin",

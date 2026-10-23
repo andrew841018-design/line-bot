@@ -460,6 +460,21 @@ def test_every_card_fits_line_limits_with_the_large_text_buttons(md, paths, vari
         assert card_pages.fits_line_limits(paged), (body, size(paged))
 
 
+def test_breadth_line_when_all_three_are_insufficient(md, paths):
+    """2026-10-23 審查 r7a N3：三檔都寫「資料不足」會超寬被切成「SOXX 資…」：全部不足就合寫一次。"""
+    snap = make_snapshot(NOW)
+    for sym, total in (("VOO", 503), ("QQQ", 101), ("SOXX", 30)):
+        snap["rows"][f"us.breadth.{sym}"]["values"] = _breadth(total, total // 2, total // 4, UNIVERSE)
+    write_snapshot(paths, snap)
+    us = texts(md.handle("", now=NOW, paths=paths).flex["contents"][0]["body"])
+    assert "成分股站上月線：資料不足" in us
+    snap["rows"]["us.breadth.VOO"]["values"] = _breadth(503, 500, 310, UNIVERSE)
+    write_snapshot(paths, snap)
+    us = texts(md.handle("", now=NOW, paths=paths).flex["contents"][0]["body"])
+    line = next(text for text in us if "站上月線" in text)
+    assert "VOO 62%" in line and "…" not in line and md.row_width(line) <= 24
+
+
 def test_summary_rows_show_numbers_and_states(md, paths):
     write_snapshot(paths, make_snapshot(NOW))
     card = md.handle("", now=NOW, paths=paths).flex
@@ -1291,6 +1306,7 @@ def test_two_etf_proxies_keep_their_whole_changes(md, paths):
 def test_clip_never_prints_half_a_number(md):
     assert md._clip("名稱" * 10 + " +12.34%!") == "名稱" * 10 + "…"  # 原本是「+12.3…」
     assert md._clip("名稱" * 13) == "名稱" * 11 + "名…"
+    assert md._clip("名稱" * 10 + " 1,234,567!") == "名稱" * 10 + "…"  # 千分位也是同一個數字
 
 
 def test_taifex_fx_proxy_keeps_its_value_and_says_who_it_is(md, paths):

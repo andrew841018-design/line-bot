@@ -1020,10 +1020,8 @@ def parse_nasdaq_econ_calendar(payload: object, day: date, *, require_sentinel: 
     日期對應錯了（例如 Nasdaq 修好了差一天的問題）→ conflict，這一天不收，任務記失敗、每日維護看得到。"""
     data = _nasdaq_data(payload)
     rows = data.get("rows")
-    if rows is None:
-        if require_sentinel:  # 2026-10-23 審查 r7 #4：rows 是 null 也不能繞過週三的檢查
-            raise _err("conflict", "weekday")
-        return []
+    if rows is None:  # null 和 [] 同義：往下走，週三的檢查照樣擋（2026-10-23 審查 r7 #4：原本直接回 []）
+        rows = []
     if not isinstance(rows, list):
         raise _err("format", "rows")
     events: dict[tuple[datetime, str], EconEvent] = {}
@@ -1164,6 +1162,7 @@ XLSX_MAX_UNCOMPRESSED = 50 * MIB
 XLSX_MAX_ROWS = 20000
 _XML_DECL_RE = re.compile(rb"<!\s*(doctype|entity)", re.IGNORECASE)
 _XML_MEMBER_SUFFIXES = (".xml", ".rels", ".vml")
+_BINARY_MEMBER_SUFFIXES = (".bin", ".png", ".jpg", ".jpeg", ".gif", ".emf", ".wmf", ".bmp", ".tif", ".tiff")
 _WIDE_BOMS = (b"\xff\xfe", b"\xfe\xff", b"\x00\x00\xfe\xff")
 
 
@@ -1196,9 +1195,17 @@ def _xlsx_guard(data: object) -> bytes:
             # 2026-10-18 安全審查 I4：不能只看副檔名或開頭是不是「<?xml」——openpyxl 照 rels 找成員，改名成 .dat、
             # 前面加 BOM／空白都照樣會被當 XML 讀。每個成員去掉 BOM 與空白後，以「<」開頭（或像沒有 BOM 的 UTF-16 XML）
             # 就一律檢查；真正的二進位成員（例 SSGA 的 xl/printerSettings/printerSettings1.bin，內含 NUL）才略過。
-            head = content.lstrip(b"\xef\xbb\xbf").lstrip(b" \t\r\n")
-            wide = content.startswith(_WIDE_BOMS) or head[:2] in (b"<\x00", b"\x00<")
-            looks_xml = info.filename.lower().endswith(_XML_MEMBER_SUFFIXES) or head[:1] == b"<" or wide
+            # 2026-10-23 審查 r7a N1：開頭的 NUL 也要剝——沒有 BOM 的 UTF-16BE 前面加一個換行（\x00\n\x00<）原本
+            # 會被當二進位略過、DOCTYPE 照樣被 openpyxl 展開。前 4 個位元組有 NUL 就當寬字元編碼；只有已知的
+            # 二進位副檔名（printerSettings*.bin、圖片）放行。
+            name = info.filename.lower()
+            head = content.lstrip(b"\xef\xbb\xbf\x00 \t\r\n")
+            wide = content.startswith(_WIDE_BOMS) or b"\x00" in content[:4]
+            looks_xml = (
+                name.endswith(_XML_MEMBER_SUFFIXES)
+                or head[:1] == b"<"
+                or (wide and not name.endswith(_BINARY_MEMBER_SUFFIXES))
+            )
             if not looks_xml:
                 continue
             if wide or b"\x00" in content:

@@ -277,8 +277,10 @@ _STRIP_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"})
 # 換行、tab、U+2028／2029 換成空白再刪，免得前後兩個字黏在一起
 _SPACE_LIKE = frozenset("\t\n\r\x0b\x0c\x1c\x1d\x1e\x1f\x85\u2028\u2029")
 _TAG_RE = re.compile(r"</?[A-Za-z!][^<>]*>")
+# 「xxx://」不加前綴限制：「營收678http://192.168.0.1/」的 h 前面是數字，原本被 lookbehind 擋掉沒抓到
+# （2026-10-23 審查 r8 gp2 N3）；lookbehind 只留給 www. 與「網域.tld/」兩種
 _URL_RE = re.compile(
-    r"(?i)(?<![a-z0-9])(?:[a-z][a-z0-9+.\-]*://|www\.|[a-z0-9\-]+(?:\.[a-z0-9\-]+)*\.[a-z]{2,}/)"
+    r"(?i)(?:[a-z][a-z0-9+.\-]*://|(?<![a-z0-9])(?:www\.|[a-z0-9\-]+(?:\.[a-z0-9\-]+)*\.[a-z]{2,}/))"
 )
 # 沒有斜線的裸網域（「AMAZON.COM INC」「請上 example.com」）刻意不擋：持股名稱要留著；Flex 的 text 與
 # card_pages（html.escape、不加連結）都不會把它變成可點的連結（2026-10-18 核對）。
@@ -319,23 +321,35 @@ def clean_external(text: Any, max_len: int) -> str | None:
     cleaned = re.sub(r" {2,}", " ", cleaned).strip()
     if not cleaned:
         return None
-    # 便宜的預檢：網址一定有「/」或「www.」，email 一定有「@」（NFKC 後全形＠已是 @）
-    has_url = ("/" in cleaned or "www." in cleaned.lower()) and _URL_RE.search(cleaned)
-    if has_url or ("@" in cleaned and _EMAIL_RE.search(cleaned)) or _PHONE_RE.search(cleaned):
+    if _blocked(cleaned):
         return None
     cleaned = cleaned.replace("@", _FULLWIDTH_SPACE).replace("＠", _FULLWIDTH_SPACE).strip()
     if len(cleaned) > max_len:
         cleaned = _truncate(cleaned, max_len)
+        # 截完再驗一次：切口可能剛好湊出「www.」（「台股 www 上漲…」→「台股 www...」），下一次清洗才丟就不冪等
+        # （2026-10-23 審查 r7a N5）
+        if _blocked(cleaned):
+            return None
     return cleaned.strip() or None
 
 
+def _blocked(text: str) -> bool:
+    """含網址／email／09 手機號：整則丟掉。便宜的預檢：網址一定有「/」或「www.」，email 一定有「@」
+    （NFKC 後全形＠已是 @）。"""
+    has_url = ("/" in text or "www." in text.lower()) and _URL_RE.search(text)
+    return bool(has_url or ("@" in text and _EMAIL_RE.search(text)) or _PHONE_RE.search(text))
+
+
 _ELLIPSIS = "..."  # ASCII：「…」經 NFKC 會變成「...」，入庫、publish、卡片各洗一次長度會再被切
-_TRAILING_PUNCT = " ,.;:!?、，。；：！？+-−–—|｜"
+_TRAILING_PUNCT = " ,.;:!?、，。；：！？-–—|｜"
 
 
 def _run_char(ch: str) -> bool:
-    """數字、英文、小數點、千分位、%：切在這種字的中間會把「1144點」切成「11」、把名字切一半。"""
-    return ch.isascii() and (ch.isalnum() or ch in ".,%")
+    """數字、英文、小數點、千分位、%：切在這種字的中間會把「1144點」切成「11」、把名字切一半。
+
+    非 ASCII 的數字（阿拉伯-印度數字等）也算：手機號規則的 \\d 認得它們，退格不認得的話會切出像手機號的一段
+    （2026-10-23 審查 r8 gp2 N2）。"""
+    return (ch.isascii() and (ch.isalnum() or ch in ".,%")) or ch.isdecimal()
 
 
 # 一個數字（正負號、千分位、小數、%）：截斷時整個留或整個丟，切一半就變成另一個數字（2026-10-23 審查 r7 #1、#2）。
@@ -358,7 +372,8 @@ def _truncate(text: str, max_len: int) -> str:
 
     切點落在數字／英文的中間就往回退到那一串的前面。整段都是英數、退光了的話，英文可以從中間切，數字不行
     （2026-10-23 審查 r7 #1：原本退光就硬切，「2891」變「28」、長串數字切出像手機號碼的一段，再洗一次就整則不見）。
-    只剩一個切不開的數字 → 回空字串（整則丟掉）。結果長度 ≤ max_len，再洗一次不會變（冪等）。"""
+    最後的切點一律再過 number_safe_cut：數字連前面的正負號整個留或整個丟，不留懸空的「+」，「AA+」「Disney+」
+    的加號照留（r8 審查）。切完只剩標點、或只剩一個切不開的數字 → 回空字串（整則丟掉）；max_len ≤ 3 也不切數字。"""
     if max_len <= len(_ELLIPSIS):
         return text[: number_safe_cut(text, max_len)]
     keep = max_len - len(_ELLIPSIS)
@@ -366,8 +381,7 @@ def _truncate(text: str, max_len: int) -> str:
     if _run_char(text[keep]) and _run_char(text[keep - 1]):
         while cut and _run_char(text[cut - 1]):
             cut -= 1
-        if not cut:
-            cut = number_safe_cut(text, keep)
+    cut = number_safe_cut(text, cut or keep)
     head = text[:cut].rstrip(_TRAILING_PUNCT)
     return head + _ELLIPSIS if head else ""
 
@@ -817,18 +831,18 @@ def technicals(
     if not sessions or sessions[-1] != day or not _pos(closes.get(day)):
         return Technicals(None, None, None, None, dict(empty), dict(empty), dict(empty), None, None)
     series = [closes.get(s) for s in sessions]
+    last = len(series) - 1
 
-    def clean(span: int) -> bool:  # 以 D 結尾、span 個交易日的窗口沒碰到隔離區間
-        return not _touches_quarantine(quarantine, sessions[-span], day)
+    def usable(span: int) -> bool:  # 以 D 結尾的窗口：夠長、每天有收盤、沒碰到隔離區間（和 breadth 同一個判斷）
+        return len(series) >= span and _window_valid(series, sessions, quarantine, last, span)
 
     close = float(series[-1])
-    prev = series[-2] if len(series) >= 2 and _pos(series[-2]) and clean(2) else None
+    prev = series[-2] if usable(2) else None
     chg = close - prev if prev is not None else None
     chg_pct = (close / prev - 1.0) * 100.0 if prev is not None else None
     ma: dict[int, float | None] = {}
     for n in MA_WINDOWS:
-        window = series[-n:]
-        ma[n] = sma(window, n) if len(window) == n and all(_pos(v) for v in window) and clean(n) else None
+        ma[n] = sma(series[-n:], n) if usable(n) else None
     ma_dist = {n: ma_distance_pct(close, ma[n]) for n in MA_WINDOWS}
     above = {n: (None if ma[n] is None else _position(close, ma[n]) > 0) for n in MA_WINDOWS}
     tail: list[float] = []
@@ -845,11 +859,7 @@ def technicals(
         ma=ma,
         ma_dist=ma_dist,
         above=above,
-        dd240_pct=(
-            drawdown_pct(series, DRAWDOWN_WINDOW)
-            if len(series) >= DRAWDOWN_WINDOW and clean(DRAWDOWN_WINDOW)
-            else None
-        ),
+        dd240_pct=drawdown_pct(series, DRAWDOWN_WINDOW) if usable(DRAWDOWN_WINDOW) else None,
         rsi14=rsi_wilder(tail, RSI_PERIOD),
     )
 

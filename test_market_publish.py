@@ -545,6 +545,15 @@ def test_etf_rows_skip_windows_that_touch_their_own_quarantine(world):
     assert us_values["ma_dist"]["60"] is None and us_values["ma_dist"]["240"] is None
 
 
+def test_spy_drawdown_row_honors_the_spy_quarantine(world):
+    """2026-10-23 審查 r8 gp2 C1：us.etf.SPY 已經不算碰到隔離的窗口，macro.SPY_DD 卻照樣發布 240 日回檔。"""
+    world.publish()
+    assert world.snapshot()["rows"]["macro.SPY_DD"]["state"] == "ok"
+    world.store.add_quarantine("us", "SPY", US_DAYS[-40], US_DAYS[-35], "split")
+    world.publish()
+    assert world.snapshot()["rows"]["macro.SPY_DD"]["state"] != "ok"
+
+
 def test_tw_breadth_waits_for_exright_coverage(tmp_path):
     w = World(tmp_path)
     try:

@@ -752,7 +752,12 @@ def _card_us(ctx: _Ctx) -> dict:
     lag = min(days) if days else None
     label = "成分股站上月線" if lag is None or lag == main_day else f"站上月線（{_md(lag)}）"
     joined = "、".join(parts)
-    rows.append((_fit(f"{label}：{joined}", f"站上月線：{joined}"), GRAY))
+    # 三檔都寫「資料不足」會超寬被切成「SOXX 資…」（2026-10-23 審查 r7a N3）：全部不足就合寫一次，否則改短字
+    if all(part.endswith(TEXT_INSUFFICIENT) for part in parts):
+        rows.append((f"{label}：{TEXT_INSUFFICIENT}", GRAY))
+    else:
+        short_joined = joined.replace(TEXT_INSUFFICIENT, "不足")
+        rows.append((_fit(f"{label}：{joined}", f"站上月線：{joined}", f"站上月線：{short_joined}"), GRAY))
 
     words, short_words, flags = [], [], set()
     for sym in US_ETFS:
@@ -1025,16 +1030,13 @@ def _macro_label(key: str, values: dict) -> str:
     return f"{zh}（{en}）"
 
 
-def _proxy_change(values: dict) -> Optional[str]:
-    """ETF 代理的日漲跌幅（「+0.30%」）；沒有就 None。"""
-    change = _num(values.get("chg_pct"), -100, 1000)
-    return _pct(change, 2) if change is not None else None
-
-
-def _macro_value(key: str, values: dict) -> Optional[str]:
+def _macro_value(key: str, values: dict, *, terse: bool = False) -> Optional[str]:
+    """terse＝最短寫法：ETF 代理不寫「單日」（2026-10-23 審查 r7 #2）。"""
     if _etf_proxy(key, values):  # 只寫日漲跌幅；沒有就明說沒有，不拿 ETF 股價頂替
-        change = _proxy_change(values)
-        return f"單日 {change}" if change is not None else TEXT_PROXY_NO_CHANGE
+        change = _num(values.get("chg_pct"), -100, 1000)
+        if change is None:
+            return TEXT_PROXY_NO_CHANGE
+        return _pct(change, 2) if terse else f"單日 {_pct(change, 2)}"
     value = _num(values.get("value"), -1e9, 1e9)
     if value is None:
         return None
@@ -1072,18 +1074,17 @@ def _macro_part(ctx: _Ctx, key: str) -> tuple[str, str, str, str]:
     value = _macro_value(key, view.values) or TEXT_MISSING
     if label == f"{zh}（{en}）":
         return label, f"{zh} ", value, f"{zh} {value}"
-    terse = (_proxy_change(view.values) or TEXT_PROXY_NO_CHANGE) if _etf_proxy(key, view.values) else value
-    return label, f"{zh}（代理）", value, f"{zh}代理 {terse}"
+    return label, f"{zh}（代理）", value, f"{zh}代理 {_macro_value(key, view.values, terse=True) or TEXT_MISSING}"
 
 
 def _macro_pair_line(ctx: _Ctx, first: str, second: str) -> tuple[str, str]:
-    full, short, terse = [], [], []
+    full, short, shortest = [], [], []
     for key in (first, second):
-        label, short_label, value, tiny = _macro_part(ctx, key)
+        label, short_label, value, terse = _macro_part(ctx, key)
         full.append(f"{label}{value}")
         short.append(f"{short_label}{value}")
-        terse.append(tiny)
-    return _fit("、".join(full), "、".join(short), "、".join(terse)), GRAY
+        shortest.append(terse)
+    return _fit("、".join(full), "、".join(short), "、".join(shortest)), GRAY
 
 
 def _yield_line(ctx: _Ctx) -> tuple[str, str]:

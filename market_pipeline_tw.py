@@ -35,6 +35,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Callable, Iterable, Optional
 from zoneinfo import ZoneInfo
 
+import market_calendar
 import market_tasks
 
 TPE = ZoneInfo("Asia/Taipei")
@@ -494,7 +495,7 @@ def _run_allbut(ctx: Any, day: date, mode: str) -> Optional[str]:
             ctx.store.obs_checked(OBS_ALLBUT, error_kind=_kind(exc))
         raise _for_framework(exc) from None
     _note_try(state, iso, ctx.now)
-    store_allbut(ctx.store, daily)
+    store_allbut(ctx.store, daily, ctx.tw_cal)
     closed = state.get("closures") or {}
     if iso in closed:
         ctx.store.set_calendar_override(CAL_MARKET, day, OVERRIDE_REVOKED, REVOKE_EVIDENCE, confirmed=False)
@@ -564,16 +565,22 @@ TW_JUMP_LIMIT = 0.105  # 台股漲跌幅 ±10%（PLAN §18.2）：超過又沒�
 QUARANTINE_JUMP = "jump"
 
 
-def check_tw_jumps(store: Any, codes: Optional[Iterable[str]] = None) -> None:
+def check_tw_jumps(store: Any, codes: Optional[Iterable[str]] = None, cal: Any = None) -> None:
     """長歷史（tw）相鄰兩日收盤 |r−1| > 10.5%，而除權息表涵蓋那天卻沒有事件 → 隔離那一段（publish 把
     store.quarantine("tw") 交給 breadth，只讓碰到的均線窗口無效）。涵蓋不到的日子不判斷（可能是還沒補的大額除息）；
     之後補到那天的事件就解除重算。2026-10-18 審查 r6c I3：PLAN 寫了「台股 ±10% 隔離」，原本沒做。
 
     每次都照現在的收盤重算這檔該隔離的段落、和現有的比：補到事件或來源改正了價格，已經不是跳空的那段就解除
-    （2026-10-23 審查 r7 #3：原本只有補到事件才解除，價格改正後隔離永遠留著、寬度窗口一直排除這檔）。"""
+    （2026-10-23 審查 r7 #3：原本只有補到事件才解除，價格改正後隔離永遠留著、寬度窗口一直排除這檔）。
+
+    只比「相鄰兩個交易日」：中間缺一天（ALLBUT 漏抓、FinMind 還沒補）時，兩天各自正常的漲跌加起來就會超過
+    10.5%，不能當跳空；等補齊再判（2026-10-23 審查 r7a N2）。日曆不知道的日子也不判斷。"""
     spans = _coverage(store)
+    if cal is None:
+        cal = market_calendar.tw_calendar(store)
     current = store.quarantine(MARKET)
-    for code in list(codes) if codes is not None else tracked_codes(store):
+    # 去重：current 是開頭讀的，同一檔第二次會拿舊值再清一次、多留一筆歷史（2026-10-23 審查 r8 Codex nit）
+    for code in dict.fromkeys(codes) if codes is not None else tracked_codes(store):
         if code == SYM_TAIEX or not valid_code(code):
             continue
         events = {row.date for row in store.exrights(code)}
@@ -581,7 +588,11 @@ def check_tw_jumps(store: Any, codes: Optional[Iterable[str]] = None) -> None:
         want = {
             (d0, d1)
             for (d0, c0), (d1, c1) in zip(rows, rows[1:])
-            if c0 > 0 and abs(c1 / c0 - 1.0) > TW_JUMP_LIMIT and d1 not in events and any(a <= d1 <= b for a, b in spans)
+            if c0 > 0
+            and abs(c1 / c0 - 1.0) > TW_JUMP_LIMIT
+            and d1 not in events
+            and any(a <= d1 <= b for a, b in spans)
+            and cal.prev_session(d1) == d0
         }
         have = {(a, b) for a, b, reason in current.get(code, []) if reason == QUARANTINE_JUMP}
         if want == have:
@@ -594,7 +605,7 @@ def check_tw_jumps(store: Any, codes: Optional[Iterable[str]] = None) -> None:
                 store.add_quarantine(MARKET, code, d0, d1, QUARANTINE_JUMP)
 
 
-def store_allbut(store: Any, daily: Any) -> None:
+def store_allbut(store: Any, daily: Any, cal: Any = None) -> None:
     """一天的 ALLBUT0999（一個交易）：全部收盤進 tw_all、追蹤的進 tw、大盤摘要進 obs。"""
     day = daily.date
     tracked = set(tracked_codes(store))
@@ -625,7 +636,7 @@ def store_allbut(store: Any, daily: Any) -> None:
         store.upsert_closes(MARKET, SYM_TAIEX, taiex, SOURCE_TWSE)
         store.prune(MARKET_ALL, KEEP_ALL_SESSIONS)
         _merge_days(store, OBS_ALLBUT, day, summary, KEEP_ALL_SESSIONS)
-    check_tw_jumps(store, sorted(tracked & set(daily.closes)))
+    check_tw_jumps(store, sorted(tracked & set(daily.closes)), cal)
 
 
 def _allbut_due(ctx: Any) -> bool:
@@ -912,7 +923,7 @@ def _run_twt49u(ctx: Any, chunk: tuple[date, date]) -> Optional[str]:
         if rows:
             ctx.store.upsert_exrights(rows)
         ctx.store.add_coverage(COVERAGE_TWT49U, start, end)
-    check_tw_jumps(ctx.store)  # 新涵蓋的日子：判斷跳空、補到事件的解除
+    check_tw_jumps(ctx.store, cal=ctx.tw_cal)  # 新涵蓋的日子：判斷跳空、補到事件的解除
     latest = _merge(_coverage(ctx.store))[-1]
     ctx.store.put_obs(
         OBS_TWT49U,
@@ -1342,7 +1353,7 @@ def finmind_next(ctx: Any, state: dict, *, skip: Optional[set] = None) -> Option
     return None
 
 
-def _write_finmind(store: Any, code: str, bars: list, *, replace: bool) -> None:
+def _write_finmind(store: Any, code: str, bars: list, *, replace: bool, cal: Any = None) -> None:
     """FinMind 寫進長歷史（一個交易）：證交所的列優先，不被 FinMind 蓋掉；replace＝整檔先刪後寫。"""
     with store.transaction():
         existing = _closes_map(store, MARKET, code)
@@ -1364,7 +1375,7 @@ def _write_finmind(store: Any, code: str, bars: list, *, replace: bool) -> None:
         if recent:
             store.upsert_closes(MARKET, code, recent, SOURCE_TWSE)
         store.prune(MARKET, KEEP_TRACKED_SESSIONS)
-    check_tw_jumps(store, [code])
+    check_tw_jumps(store, [code], cal)
 
 
 def _finmind_revised(store: Any, code: str, bars: list) -> bool:
@@ -1489,7 +1500,7 @@ def finmind_accept(ctx: Any, code: str, bars: list, mode: str, info: dict, today
         info.update({"last": "revised", "needs_full": True})  # 只拿到一段：下一次整檔重抓、一次替換
         return info
     replace = mode == "full" or (mode == "bootstrap" and _finmind_revised(ctx.store, code, bars))
-    _write_finmind(ctx.store, code, bars, replace=replace)
+    _write_finmind(ctx.store, code, bars, replace=replace, cal=ctx.tw_cal)
     # 這次請求涵蓋到今天：最後一個 ALLBUT 日以前都查過了。FinMind 也沒有的那天（停牌、「--」無成交）
     # 不能每 15 分鐘再問一次，所以檢查日至少推到那天
     checked = max(bar.date for bar in bars)
