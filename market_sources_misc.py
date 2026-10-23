@@ -160,6 +160,15 @@ class TrumpPost:
 
 
 @dataclass(frozen=True)
+class FeedSpan:
+    """整份 trumpstruth feed（過濾前）的時間範圍；界線和 `_within` 一樣（2026-10-23 審查 r7b F1）。"""
+
+    oldest: datetime  # 視窗內（now − 48 小時 ～ now + FUTURE_SKEW）最舊的一則；視窗內一則都沒有時＝newest
+    newest: datetime  # 沒有晚於 now + FUTURE_SKEW 的最新一則（任何年紀）
+    reaches_back: bool  # feed 裡還有比視窗起點更舊的 item：這一份 feed 自己就涵蓋了整個 48 小時
+
+
+@dataclass(frozen=True)
 class PredictionQuote:
     platform: str  # "polymarket" | "kalshi"
     market_id: str
@@ -806,13 +815,21 @@ def fetch_trumpstruth(
     return parse_trumpstruth_rss(_get("trumpstruth", TRUMPSTRUTH_URL, http, ledger), now, include_removed=include_removed)
 
 
-def trumpstruth_feed_span(xml: Any) -> tuple[datetime, datetime]:
-    """整份 feed（過濾前）最舊與最新一則的 pubDate（UTC）。
+def trumpstruth_feed_span(xml: Any, now: Any) -> FeedSpan:
+    """整份 feed（過濾前）的時間範圍：視窗內最舊一則、最新一則（pubDate，UTC），以及 feed 有沒有比視窗更舊的 item。
 
     PLAN §18.14 要比「這輪最舊一則」和「上輪成功時最新一則」判斷中間有沒有漏（卡上標「（至少）」）；
-    parse_trumpstruth_rss 已經濾掉只有媒體、移除、超過 48 小時的，不能拿它的最舊一則來比。
+    parse_trumpstruth_rss 已經濾掉只有媒體、移除、超過 48 小時的，不能拿它的最舊一則來比，所以這裡看整份 feed。
     只算 originalId 與 pubDate 都有效的 item；一則都沒有就丟 ParseError("format")。
+
+    時間界線和 parse_trumpstruth_rss 的 `_within` 一樣（2026-10-23 審查 r7b F1：f78d5de 改看整份 feed 時把界線也拿掉了）：
+    - 晚於 now + FUTURE_SKEW 的是來源打錯時間，整則不算（不然 job 的 last_newest 被拉到未來、只增不減，
+      之後真的缺口再也標不出來）；每一則都在未來就丟 ParseError("date")。
+    - 比 now − 48 小時舊的不算進 oldest（置頂或被移除的空殼用原始時間，會讓最舊一則看起來比上輪最新還舊、
+      蓋掉真的缺口），只記 reaches_back：feed 比視窗起點還舊，代表這一份自己就涵蓋了整個視窗（剛上線或睡了
+      很久之後，不必標「（至少）」）。視窗內的只有圖的貼文照算，這是 f78d5de 要的。
     """
+    now_utc = _as_utc(now)
     stamps: list[datetime] = []
     for item in _rss_items(xml):
         original_id = _child_text(item, _TAG_ORIGINAL_ID)
@@ -821,7 +838,13 @@ def trumpstruth_feed_span(xml: Any) -> tuple[datetime, datetime]:
             stamps.append(published)
     if not stamps:
         raise ParseError("format")
-    return min(stamps), max(stamps)
+    start = now_utc - timedelta(hours=TRUMP_WINDOW_H)
+    usable = [stamp for stamp in stamps if stamp <= now_utc + FUTURE_SKEW]
+    if not usable:
+        raise ParseError("date")
+    inside = [stamp for stamp in usable if _within(stamp, now_utc, TRUMP_WINDOW_H)]
+    newest = max(usable)
+    return FeedSpan(min(inside) if inside else newest, newest, any(stamp < start for stamp in usable))
 
 
 def fetch_trumpstruth_with_span(
@@ -830,10 +853,10 @@ def fetch_trumpstruth_with_span(
     http: Any = None,
     ledger: Any = None,
     include_removed: bool = False,
-) -> tuple[list[TrumpPost], tuple[datetime, datetime]]:
+) -> tuple[list[TrumpPost], FeedSpan]:
     """一次請求同時回貼文與整份 feed 的時間範圍（給 job 判斷缺口）。"""
     body = _get("trumpstruth", TRUMPSTRUTH_URL, http, ledger)
-    return parse_trumpstruth_rss(body, now, include_removed=include_removed), trumpstruth_feed_span(body)
+    return parse_trumpstruth_rss(body, now, include_removed=include_removed), trumpstruth_feed_span(body, now)
 
 
 # ── 川普貼文主題（PLAN §3.3 片語表） ─────────────────────────────────────────────

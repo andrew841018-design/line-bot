@@ -17,7 +17,8 @@ Andrew 2026-10-17 的要求（DECISIONS.md）：宏觀「有 yahoo 用 yahoo，�
   news.google.com 回 503 也算限流（market_http 會讓該主機冷卻 2 小時），冷卻期間不排。
 - 川普原文：trumpstruth RSS 每 30 分鐘，依 originalId 累積進 Store（移除的也寫回去，之前累積到的那則才
   會被拿掉），從累積資料算近 48 小時的主題則數；這輪最舊一則比上輪最新一則還新（中間有缺口）或剛上線、
-  涵蓋不到 48 小時 → 標「（至少）」（§18.14）。
+  涵蓋不到 48 小時 → 標「（至少）」（§18.14）。最舊與最新一則套和 parse 一樣的時間界線（2026-10-23）：
+  未來的 item 不算、比視窗舊的只當「這份 feed 涵蓋到視窗之前」。
 - 期中選舉：market_sources_misc.PREDICTION_MARKETS 裡固定的市場（Polymarket、Kalshi 的眾院與參院）各一個任務、
   每 2 小時；結果出來後每天看一次、顯示 7 天後不再抓。
 - 外部字串（標題、來源名、川普摘錄、預測市場名稱）存之前一律再過 `market_calc.clean_external`。
@@ -70,6 +71,7 @@ NEWS_MAX_AGE_H = 36.0
 NEWS_FUTURE_SKEW = timedelta(minutes=5)
 NEWS_KEEP = 15
 TRUMP_WINDOW_H = 48.0
+TRUMP_FUTURE_SKEW_S = 300.0  # 和 market_sources_misc.FUTURE_SKEW（5 分鐘）一樣：比這更未來的 last_newest 不可能是真的
 TRUMP_POSTS_KEEP = 20
 TRUMP_GAPS_KEEP = 20
 ELECTION_RESOLVED_EVERY_S = 86400.0
@@ -459,19 +461,29 @@ def _news_fns(topic: str) -> tuple[Callable[[Any], bool], Callable[[Any], Option
 
 
 # ── 川普原文（trumpstruth RSS；依 originalId 累積 48 小時） ─────────────────────────────────
-def update_coverage(state: dict, times: list[float], now: float) -> None:
-    """這輪抓到的貼文時間 → 缺口紀錄。剛上線：最舊那則之前都不知道；之後：這輪最舊比上輪最新還新＝中間有缺口。"""
+def update_coverage(state: dict, times: list[float], now: float, *, reaches_back: bool = False) -> None:
+    """這輪抓到的貼文時間 → 缺口紀錄。times＝整份 feed 在時間界線內的最舊與最新一則（market_sources_misc.FeedSpan）。
+
+    上輪最新一則還在 48 小時視窗內：這輪最舊比它還新＝中間有缺口（reaches_back 不採信：一則置頂的舊 item
+    不能把真的缺口蓋掉）。剛上線、或上輪最新一則已經滑出視窗：前後接不上，這一份 feed 要自己涵蓋整個視窗
+    （reaches_back＝feed 還有比視窗起點更舊的 item）；涵蓋不到，最舊那則之前都不知道。（2026-10-23 審查 r7b F1）
+    """
     if not times:
         return
     oldest, newest = min(times), max(times)
+    horizon = now - TRUMP_WINDOW_H * 3600.0
     gaps = [list(gap) for gap in state.get("gaps") or []]
     last_newest = state.get("last_newest")
-    if not isinstance(last_newest, (int, float)):
-        gaps.append([None, oldest])
-    elif oldest > float(last_newest):
-        gaps.append([float(last_newest), oldest])
-    state["last_newest"] = max(newest, float(last_newest)) if isinstance(last_newest, (int, float)) else newest
-    horizon = now - TRUMP_WINDOW_H * 3600.0
+    if isinstance(last_newest, (int, float)) and last_newest <= now + TRUMP_FUTURE_SKEW_S:
+        last_newest = float(last_newest)
+    else:
+        last_newest = None  # 沒有；或是未來的時間（舊版沒擋時間打錯的 item，max() 又不會讓它退回來）：當作還沒成功過
+    if last_newest is not None and last_newest >= horizon:
+        if oldest > last_newest:
+            gaps.append([last_newest, oldest])
+    elif not reaches_back:
+        gaps.append([last_newest, oldest])
+    state["last_newest"] = max(newest, last_newest) if last_newest is not None else newest
     state["gaps"] = [gap for gap in gaps if gap[1] > horizon][-TRUMP_GAPS_KEEP:]
 
 
@@ -559,8 +571,9 @@ def _trump_run(ctx: Any) -> Optional[str]:
         ctx.store.upsert_posts(POSTS_TRUMP, items)
     state = _state(ctx.store, TASK_TRUMP)
     # 缺口用整份 feed（過濾前）的頭尾判斷：只有圖／影片的貼文也在 feed 裡，用過濾後的 items 會誤判成有漏、
-    # 多標「（至少）」（2026-10-18 審查 r6c N1）
-    update_coverage(state, [span[0].timestamp(), span[1].timestamp()], float(ctx.now))
+    # 多標「（至少）」（2026-10-18 審查 r6c N1）；頭尾套了和 parse 一樣的時間界線（未來的不算、太舊的只記
+    # reaches_back），一則時間打錯或置頂的 item 不能讓真的缺口標不出來（2026-10-23 審查 r7b F1）
+    update_coverage(state, [span.oldest.timestamp(), span.newest.timestamp()], float(ctx.now), reaches_back=span.reaches_back)
     _save(ctx.store, TASK_TRUMP, state)
     summary, details = trump_summary(ctx.store, now_utc, state, labels)
     day = now_utc.date().isoformat()

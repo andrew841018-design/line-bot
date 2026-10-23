@@ -469,6 +469,40 @@ def test_coverage_and_at_least_rules():
     assert state["gaps"] == [[25 * hour, 40 * hour]] and misc.at_least(state, 60 * hour)
 
 
+def test_reaches_back_only_counts_when_there_is_no_anchor_inside_the_window():
+    """2026-10-23 審查 r7b F1：feed 比視窗起點更舊（reaches_back）＝這一份自己就涵蓋了整個 48 小時，但只在沒有
+    可接的錨點（剛上線、或上輪最新一則已滑出視窗）時採信；錨點還在視窗內，一則置頂的舊 item 不能蓋掉真缺口。"""
+    hour = 3600.0
+    # 剛上線，feed 比視窗（52h 起）還舊 → 整個視窗都涵蓋到了，不必標「（至少）」
+    state: dict = {}
+    misc.update_coverage(state, [60 * hour, 99 * hour], 100 * hour, reaches_back=True)
+    assert state["gaps"] == [] and state["last_newest"] == 99 * hour and misc.at_least(state, 100 * hour) is False
+    # 同樣的 feed 沒有更舊的 item → 最舊那則之前都不知道
+    state = {}
+    misc.update_coverage(state, [60 * hour, 99 * hour], 100 * hour)
+    assert state["gaps"] == [[None, 60 * hour]] and misc.at_least(state, 100 * hour)
+    # 錨點（上輪最新 90h）還在視窗內：這輪最舊 95h 比它新＝缺口；reaches_back 不採信
+    state = {"last_newest": 90 * hour, "gaps": []}
+    misc.update_coverage(state, [95 * hour, 99 * hour], 100 * hour, reaches_back=True)
+    assert state["gaps"] == [[90 * hour, 95 * hour]] and misc.at_least(state, 100 * hour)
+    # 錨點已滑出視窗（10h < 52h）：接不上，要靠這份 feed 自己涵蓋——涵蓋到就沒有缺口，涵蓋不到就記缺口
+    state = {"last_newest": 10 * hour, "gaps": []}
+    misc.update_coverage(state, [60 * hour, 99 * hour], 100 * hour, reaches_back=True)
+    assert state["gaps"] == [] and state["last_newest"] == 99 * hour
+    state = {"last_newest": 10 * hour, "gaps": []}
+    misc.update_coverage(state, [60 * hour, 99 * hour], 100 * hour)
+    assert state["gaps"] == [[10 * hour, 60 * hour]] and misc.at_least(state, 100 * hour)
+
+
+def test_a_last_newest_in_the_future_is_discarded_instead_of_hiding_gaps_forever():
+    """舊版沒擋時間打錯的 item，last_newest 可能已被拉到未來；max() 退不回來，缺口就永遠標不出來。"""
+    hour = 3600.0
+    state = {"last_newest": 1000 * hour, "gaps": []}
+    misc.update_coverage(state, [95 * hour, 99 * hour], 100 * hour)
+    assert state["last_newest"] == 99 * hour and state["gaps"] == [[None, 95 * hour]]
+    assert misc.at_least(state, 100 * hour)
+
+
 # ── 期中選舉：每 2 小時；結果出來後每天、7 天後停 ───────────────────────────────────────────
 def test_prediction_markets_poll_every_two_hours_then_daily_after_the_result(env):
     event = {"value": polymarket_event()}
@@ -566,3 +600,102 @@ def test_trump_coverage_counts_image_only_posts(env):
     assert run(make_ctx(env, (t0 + timedelta(minutes=31)).timestamp()), "trump.feed") == "ok"
     gaps = misc._state(env.store, misc.TASK_TRUMP).get("gaps") or []
     assert [gap for gap in gaps if gap[0] is not None] == []  # 只有剛上線那段「之前不知道」，沒有新缺口
+
+
+# ── 川普缺口偵測的界線（2026-10-23 審查 r7b F1 的 T1–T3） ───────────────────────────────────
+T0_TRUMP = datetime(2026, 10, 16, 12, 0, tzinfo=UTC)
+
+
+def trump_post(number: int, when: datetime, text: str = "", removed: bool = False) -> tuple:
+    return (f"1000000000000001{number:02d}", when, text, removed)
+
+
+def trump_state(env) -> dict:
+    return misc._state(env.store, misc.TASK_TRUMP)
+
+
+def trump_feed(env, posts: list) -> dict:
+    feed = {"posts": posts}
+    env.http.route("trumpstruth", lambda url: trump_rss(feed["posts"]))
+    return feed
+
+
+@pytest.mark.parametrize("later_hours", [1, 50])
+def test_trump_feeds_without_overlap_still_mark_the_gap(env, later_hours):
+    """T1：兩輪 feed 沒有交集（K0、K1 捲出，只剩更新的 K3）→ 中間可能漏了，缺口記下來、標「（至少）」。
+    1 小時後上輪最新一則還在視窗內；50 小時後它已滑出視窗、剛上線那段也過期，只剩這個缺口讓 at_least 為真。"""
+    k0, k1 = trump_post(0, T0_TRUMP - timedelta(hours=3), "Iran talks"), trump_post(1, T0_TRUMP - timedelta(hours=2), "Tariffs")
+    k3 = trump_post(3, T0_TRUMP + timedelta(hours=later_hours) - timedelta(minutes=30), "Fed must cut")
+    feed = trump_feed(env, [k1, k0])
+    assert run(make_ctx(env, T0_TRUMP.timestamp()), "trump.feed") == "ok"
+    feed["posts"] = [k3]
+    assert run(make_ctx(env, (T0_TRUMP + timedelta(hours=later_hours)).timestamp()), "trump.feed") == "ok"
+    assert [k1[1].timestamp(), k3[1].timestamp()] in trump_state(env)["gaps"]
+    assert trump_state(env)["last_newest"] == k3[1].timestamp()
+    assert payload(env, "trump.summary")["at_least"] is True
+
+
+def test_trump_future_dated_item_does_not_move_last_newest_or_hide_a_gap(env):
+    """T2：一則時間打成未來（> now + 5 分鐘）的 item 不能把 last_newest 拉過去（max() 退不回來）、讓後面真的缺口標不出來。"""
+    k0, k1 = trump_post(0, T0_TRUMP - timedelta(hours=3), "Iran talks"), trump_post(1, T0_TRUMP - timedelta(hours=2), "Tariffs")
+    typo = trump_post(9, T0_TRUMP + timedelta(days=10), "typo in the year")
+    k3 = trump_post(3, T0_TRUMP + timedelta(hours=49, minutes=30), "Fed must cut")
+    feed = trump_feed(env, [typo, k1, k0])
+    assert run(make_ctx(env, T0_TRUMP.timestamp()), "trump.feed") == "ok"
+    assert trump_state(env)["last_newest"] == k1[1].timestamp()  # 不是未來那則
+    assert payload(env, "trump.summary")["posts"] == 2  # 解析端本來就把它丟掉
+    feed["posts"] = [k3]  # 50 小時後（剛上線那段已過期）：和上輪沒有交集，真的缺口要標得出來
+    assert run(make_ctx(env, (T0_TRUMP + timedelta(hours=50)).timestamp()), "trump.feed") == "ok"
+    assert trump_state(env)["gaps"] == [[k1[1].timestamp(), k3[1].timestamp()]]
+    assert payload(env, "trump.summary")["at_least"] is True
+
+
+def test_trump_very_old_pinned_item_does_not_hide_a_gap(env):
+    """T3a：feed 裡一則很舊的 item（置頂、被移除的空殼用原始時間）不能把「最舊一則」拉到上輪最新之前、蓋掉真缺口。"""
+    k0, k1 = trump_post(0, T0_TRUMP - timedelta(hours=3), "Iran talks"), trump_post(1, T0_TRUMP - timedelta(hours=2), "Tariffs")
+    k3 = trump_post(3, T0_TRUMP + timedelta(minutes=30), "Fed must cut")
+    pinned = trump_post(8, T0_TRUMP - timedelta(days=30), "", True)
+    feed = trump_feed(env, [k1, k0])
+    assert run(make_ctx(env, T0_TRUMP.timestamp()), "trump.feed") == "ok"
+    feed["posts"] = [k3, pinned]  # K1 捲出；沒有交集，只有一則 30 天前的空殼
+    assert run(make_ctx(env, (T0_TRUMP + timedelta(hours=1)).timestamp()), "trump.feed") == "ok"
+    assert [k1[1].timestamp(), k3[1].timestamp()] in trump_state(env)["gaps"]
+    assert payload(env, "trump.summary")["at_least"] is True
+
+
+def test_trump_first_success_with_a_feed_older_than_48_hours_is_not_at_least(env):
+    """T3b：剛上線，feed 最舊的 item 已經超過 48 小時 → 整個視窗都涵蓋到了，不標「（至少）」；
+    48 小時都沒新貼文（feed 整份都比視窗舊）也一樣，之後第一則新貼文進來不會被誤判成有缺口。"""
+    a = trump_post(0, T0_TRUMP - timedelta(hours=60), "Iran talks")
+    b = trump_post(1, T0_TRUMP - timedelta(hours=30), "Tariffs")
+    c = trump_post(2, T0_TRUMP - timedelta(hours=1), "Fed must cut")
+    trump_feed(env, [c, b, a])
+    assert run(make_ctx(env, T0_TRUMP.timestamp()), "trump.feed") == "ok"
+    assert payload(env, "trump.summary")["at_least"] is False and trump_state(env)["gaps"] == []
+    assert payload(env, "trump.summary")["topics"] == {"fed": 1, "tariff": 1}
+
+
+def test_trump_quiet_for_48_hours_does_not_mark_a_gap_when_the_next_post_arrives(env):
+    older, old = trump_post(0, T0_TRUMP - timedelta(hours=90), "Iran talks"), trump_post(1, T0_TRUMP - timedelta(hours=60), "Tariffs")
+    fresh = trump_post(2, T0_TRUMP + timedelta(hours=1), "Fed must cut")
+    feed = trump_feed(env, [old, older])
+    assert run(make_ctx(env, T0_TRUMP.timestamp()), "trump.feed") == "ok"
+    assert payload(env, "trump.summary")["at_least"] is False and payload(env, "trump.summary")["posts"] == 0
+    assert trump_state(env)["last_newest"] == old[1].timestamp()
+    feed["posts"] = [fresh, old, older]  # 舊的 item 還在 feed 裡：前後接得上
+    assert run(make_ctx(env, (T0_TRUMP + timedelta(hours=2)).timestamp()), "trump.feed") == "ok"
+    assert trump_state(env)["gaps"] == [] and payload(env, "trump.summary")["at_least"] is False
+    assert payload(env, "trump.summary")["topics"] == {"fed": 1}
+
+
+def test_trump_feed_of_only_image_posts_still_updates_the_coverage(env):
+    """T3c：整份 feed 都是只有圖的貼文（沒有一則進 posts）時，缺口紀錄照樣更新，下一輪不會誤判成有缺口。"""
+    m1, m2 = trump_post(0, T0_TRUMP - timedelta(hours=2)), trump_post(1, T0_TRUMP - timedelta(hours=1))
+    m3 = trump_post(2, T0_TRUMP + timedelta(minutes=10))
+    feed = trump_feed(env, [m2, m1])
+    assert run(make_ctx(env, T0_TRUMP.timestamp()), "trump.feed") == "ok"
+    assert payload(env, "trump.summary")["posts"] == 0
+    assert trump_state(env)["last_newest"] == m2[1].timestamp() and trump_state(env)["gaps"] == [[None, m1[1].timestamp()]]
+    feed["posts"] = [m3, m2, m1]
+    assert run(make_ctx(env, (T0_TRUMP + timedelta(minutes=30)).timestamp()), "trump.feed") == "ok"
+    assert trump_state(env)["last_newest"] == m3[1].timestamp() and trump_state(env)["gaps"] == [[None, m1[1].timestamp()]]

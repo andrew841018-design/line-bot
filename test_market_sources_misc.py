@@ -698,22 +698,57 @@ def test_fetch_trumpstruth_uses_the_www_feed_and_xml():
     assert all(call["accept"] == ("xml",) for call in http.calls)
 
 
+VIDEO_ONLY = '<p><a href="https://truth-archive.example/v.mp4">View video</a></p>'
+
+
 def test_feed_span_covers_items_the_parser_filters_out():
-    # PLAN §18.14 的缺口判斷要用整份 feed 的最舊一則，不是濾過後剩下的最舊一則
-    oldest = NOW - timedelta(hours=72)
+    # PLAN §18.14 的缺口判斷要用整份 feed 的頭尾，不是濾過後剩下的：只有影片的貼文、被移除的空殼都算
+    oldest = NOW - timedelta(hours=30)
     feed = _feed(
-        _post("200000000000000002", _rfc(oldest), '<p><a href="https://truth-archive.example/v.mp4">View video</a></p>'),
+        _post("200000000000000002", _rfc(oldest), VIDEO_ONLY),
         _post("200000000000000003", _rfc(NOW - timedelta(hours=5)), "<p>Tariffs</p>", removed="true"),
         _post(POST_ID, HOUR_AGO, "<p>Big rally tonight</p>"),
         _post("abc", _rfc(NOW - timedelta(hours=99)), "<p>bad id is not counted</p>"),
         _post("200000000000000004", "not a date", "<p>bad date is not counted</p>"),
     )
     assert [post.original_id for post in msm.parse_trumpstruth_rss(feed, NOW)] == [POST_ID]
-    assert msm.trumpstruth_feed_span(feed) == (oldest, NOW - timedelta(hours=1))
+    assert msm.trumpstruth_feed_span(feed, NOW) == msm.FeedSpan(oldest, NOW - timedelta(hours=1), False)
+    assert msm.trumpstruth_feed_span(feed, NOW.timestamp()) == msm.trumpstruth_feed_span(feed, NOW)  # now 可以是 epoch 秒
     http = FakeHTTP(feed)
     posts, span = msm.fetch_trumpstruth_with_span(NOW, http=http, include_removed=True)
-    assert [post.original_id for post in posts] == [POST_ID, "200000000000000003"] and span[0] == oldest
+    assert [post.original_id for post in posts] == [POST_ID, "200000000000000003"] and span.oldest == oldest
     assert len(http.calls) == 1 and http.calls[0]["url"] == "https://www.trumpstruth.org/feed"
+
+
+def test_feed_span_applies_the_same_time_bounds_as_the_parser():
+    """2026-10-23 審查 r7b F1：f78d5de 改看整份 feed 時把 `_within` 的界線也拿掉了。晚於 now + 5 分鐘的是時間打錯、
+    不算；比 now − 48 小時舊的（置頂、被移除的空殼）不算進 oldest，只記 reaches_back；視窗內只有圖的貼文照算。"""
+    feed = _feed(
+        _post("200000000000000002", _rfc(NOW + timedelta(days=10)), VIDEO_ONLY),  # 來源打錯年份
+        _post("200000000000000003", _rfc(NOW + timedelta(minutes=5, seconds=1)), VIDEO_ONLY),  # 剛好超過上界
+        _post("200000000000000004", _rfc(NOW + timedelta(minutes=5)), VIDEO_ONLY),  # 上界（含）
+        _post("200000000000000005", _rfc(NOW - timedelta(days=30)), "", removed="true"),  # 置頂的舊空殼
+        _post("200000000000000006", _rfc(NOW - timedelta(hours=48, seconds=1)), VIDEO_ONLY),  # 剛好超過視窗
+        _post("200000000000000007", _rfc(NOW - timedelta(hours=48)), VIDEO_ONLY),  # 下界（含）
+        _post(POST_ID, HOUR_AGO, "<p>Big rally tonight</p>"),
+    )
+    assert msm.trumpstruth_feed_span(feed, NOW) == msm.FeedSpan(
+        NOW - timedelta(hours=48), NOW + timedelta(minutes=5), True
+    )
+    # 這份 feed 一則比視窗舊的都沒有 → reaches_back 為假
+    recent = _feed(_post("200000000000000007", _rfc(NOW - timedelta(hours=48)), VIDEO_ONLY), _post(POST_ID, HOUR_AGO, "<p>x</p>"))
+    assert msm.trumpstruth_feed_span(recent, NOW).reaches_back is False
+
+
+def test_feed_span_with_nothing_inside_the_window_uses_the_newest_item():
+    # 川普（或存檔）48 小時沒新貼文：feed 整份都比視窗舊 → 沒有視窗內的最舊一則，oldest＝newest；feed 涵蓋了視窗之前
+    newest = NOW - timedelta(hours=60)
+    feed = _feed(
+        _post("200000000000000002", _rfc(NOW - timedelta(hours=90)), VIDEO_ONLY),
+        _post(POST_ID, _rfc(newest), "<p>old news</p>"),
+        _post("200000000000000003", _rfc(NOW + timedelta(hours=1)), VIDEO_ONLY),  # 未來的照樣不算
+    )
+    assert msm.trumpstruth_feed_span(feed, NOW) == msm.FeedSpan(newest, newest, True)
 
 
 @pytest.mark.parametrize(
@@ -722,11 +757,13 @@ def test_feed_span_covers_items_the_parser_filters_out():
         (_feed(_post("abc", HOUR_AGO, "<p>x</p>"), _post(POST_ID, "bad", "<p>x</p>")), "format"),
         ("<rss><channel></channel></rss>", "empty"),
         (_feed(_post(POST_ID, HOUR_AGO, "<p>x</p>"), head="<!DOCTYPE rss>"), "format"),
+        # 每一則都在未來：來源的時間不能信，不拿來更新缺口紀錄
+        (_feed(_post(POST_ID, _rfc(NOW + timedelta(hours=1)), "<p>x</p>"), _post("200000000000000002", _rfc(NOW + timedelta(days=3)), "<p>y</p>")), "date"),
     ],
 )
 def test_feed_span_errors(xml, kind):
     with pytest.raises(msm.ParseError) as excinfo:
-        msm.trumpstruth_feed_span(xml)
+        msm.trumpstruth_feed_span(xml, NOW)
     assert _kind(excinfo) == kind
 
 
