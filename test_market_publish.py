@@ -526,6 +526,25 @@ def test_quarantine_only_invalidates_the_touched_windows(world):
     assert per_n["60"]["valid"] == 4 and per_n["120"]["valid"] == 4 and per_n["240"]["valid"] == 4
 
 
+def test_etf_rows_skip_windows_that_touch_their_own_quarantine(world):
+    """2026-10-23 審查 r7 #5：0050 被隔離（分割沒對上），自己的技術面原本照樣發布 -50%、月線距離 -48%。"""
+    world.publish()
+    before = world.snapshot()["rows"]
+    assert before["tw.etf.0050"]["values"]["chg_pct"] is not None
+    assert before["us.etf.VOO"]["values"]["ma_dist"]["60"] is not None
+    world.store.add_quarantine("tw", "0050", TW_DAYS[-2], TW_DAYS[-1], "jump")
+    world.store.add_quarantine("us", "VOO", US_DAYS[-40], US_DAYS[-35], "split")
+    world.publish()
+    rows = world.snapshot()["rows"]
+    tw_values = rows["tw.etf.0050"]["values"]
+    assert tw_values["close"] is not None and tw_values["chg_pct"] is None and tw_values["above_ma20"] is None
+    assert all(value is None for value in tw_values["ma_dist"].values())
+    assert tw_values["vol_ratio"] is None and tw_values["rsi14"] is None
+    us_values = rows["us.etf.VOO"]["values"]
+    assert us_values["chg_pct"] is not None and us_values["ma_dist"]["20"] is not None
+    assert us_values["ma_dist"]["60"] is None and us_values["ma_dist"]["240"] is None
+
+
 def test_tw_breadth_waits_for_exright_coverage(tmp_path):
     w = World(tmp_path)
     try:

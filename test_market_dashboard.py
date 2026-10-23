@@ -1278,6 +1278,21 @@ def _macro_rows(md, paths, snap, now=NOW):
     return texts(card["contents"][3]["body"]), texts(news["contents"][2]["body"])
 
 
+def test_two_etf_proxies_keep_their_whole_changes(md, paths):
+    """2026-10-23 審查 r7 #2：兩列都是代理、短寫法還超過 24 字寬 → 原本逐字切成「+12.…」。"""
+    snap = make_snapshot(NOW)
+    snap["rows"]["macro.DXY"]["values"]["chg_pct"] = 0.3
+    snap["rows"]["macro.WTI"]["values"].update(source="ETF 代理：USO", chg_pct=12.34, value=71.2)
+    summary, detail = _macro_rows(md, paths, snap)
+    assert summary[1] == "美元代理 +0.30%、油價代理 +12.34%" and md.row_width(summary[1]) <= 24
+    assert "油價（USO 代理）：單日 +12.34%｜10/16" in detail
+
+
+def test_clip_never_prints_half_a_number(md):
+    assert md._clip("名稱" * 10 + " +12.34%!") == "名稱" * 10 + "…"  # 原本是「+12.3…」
+    assert md._clip("名稱" * 13) == "名稱" * 11 + "名…"
+
+
 def test_taifex_fx_proxy_keeps_its_value_and_says_who_it_is(md, paths):
     snap = make_snapshot(NOW)
     snap["rows"]["macro.USDTWD"]["values"]["source"] = "代理：期交所匯率"  # market_pipeline_misc.SOURCE_FX

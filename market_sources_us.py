@@ -1021,6 +1021,8 @@ def parse_nasdaq_econ_calendar(payload: object, day: date, *, require_sentinel: 
     data = _nasdaq_data(payload)
     rows = data.get("rows")
     if rows is None:
+        if require_sentinel:  # 2026-10-23 審查 r7 #4：rows 是 null 也不能繞過週三的檢查
+            raise _err("conflict", "weekday")
         return []
     if not isinstance(rows, list):
         raise _err("format", "rows")

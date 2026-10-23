@@ -1049,6 +1049,9 @@ def test_econ_calendar_require_sentinel():
     rows = [event("MBA Mortgage Applications", "07:00"), event("CPI")]
     assert [e.name for e in src.parse_nasdaq_econ_calendar(econ(rows), date(2026, 10, 14), require_sentinel=True)] == ["CPI"]
     assert kind_of(src.parse_nasdaq_econ_calendar, econ([event("CPI")]), date(2026, 10, 14), require_sentinel=True) == "conflict"
+    # 2026-10-23 審查 r7 #4：rows 是 null 也不能繞過（原本直接回 []，整批照寫、CPI 早一天）
+    assert kind_of(src.parse_nasdaq_econ_calendar, econ(None), date(2026, 10, 14), require_sentinel=True) == "conflict"
+    assert src.parse_nasdaq_econ_calendar(econ(None), date(2026, 10, 14)) == []  # 一般請求：空日曆照收
 
 
 def test_econ_calendar_empty_and_errors():

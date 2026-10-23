@@ -905,3 +905,20 @@ def test_tw_jumps_without_exrights_are_quarantined(env):
     store.upsert_exrights([(days[2], "2330", 101.0, 202.0, "權息")])  # 補到事件（示意）：解除
     tw.check_tw_jumps(store, ["2330"])
     assert store.quarantine(tw.MARKET).get("2330", []) == []
+
+
+def test_tw_jump_quarantine_follows_corrected_prices(env):
+    """2026-10-23 審查 r7 #3：來源改正了錯價，跳空已經不在 → 隔離要解除；還在的那段留著。"""
+    store = env.store
+    days = [date(2026, 10, 12), date(2026, 10, 13), date(2026, 10, 14), date(2026, 10, 15), date(2026, 10, 16)]
+    store.add_coverage(tw.COVERAGE_TWT49U, days[0], days[-1])
+    closes = [100.0, 200.0, 201.0, 402.0, 403.0]
+    store.upsert_closes(tw.MARKET, "2330", [(d, c, 1) for d, c in zip(days, closes)], tw.SOURCE_TWSE)
+    tw.check_tw_jumps(store, ["2330"])
+    assert [(a, b) for a, b, _r in store.quarantine(tw.MARKET)["2330"]] == [(days[0], days[1]), (days[2], days[3])]
+    store.upsert_closes(tw.MARKET, "2330", [(days[1], 101.0, 1), (days[2], 102.0, 1)], tw.SOURCE_TWSE)  # 來源改正
+    tw.check_tw_jumps(store, ["2330"])
+    assert [(a, b) for a, b, _r in store.quarantine(tw.MARKET)["2330"]] == [(days[2], days[3])]
+    store.upsert_closes(tw.MARKET, "2330", [(days[3], 103.0, 1), (days[4], 104.0, 1)], tw.SOURCE_TWSE)
+    tw.check_tw_jumps(store, ["2330"])
+    assert store.quarantine(tw.MARKET).get("2330", []) == []

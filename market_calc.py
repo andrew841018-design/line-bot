@@ -330,7 +330,7 @@ def clean_external(text: Any, max_len: int) -> str | None:
 
 
 _ELLIPSIS = "..."  # ASCII：「…」經 NFKC 會變成「...」，入庫、publish、卡片各洗一次長度會再被切
-_TRAILING_PUNCT = " ,.;:!?、，。；：！？-–—|｜"
+_TRAILING_PUNCT = " ,.;:!?、，。；：！？+-−–—|｜"
 
 
 def _run_char(ch: str) -> bool:
@@ -338,21 +338,38 @@ def _run_char(ch: str) -> bool:
     return ch.isascii() and (ch.isalnum() or ch in ".,%")
 
 
+# 一個數字（正負號、千分位、小數、%）：截斷時整個留或整個丟，切一半就變成另一個數字（2026-10-23 審查 r7 #1、#2）。
+# 千分位一定是逗號＋3 位數：「1,234,567」是一個數字，「2330,2317」是兩個
+_NUMBER_RE = re.compile(r"[+\-−]?(?:\d{1,3}(?:,\d{3})+(?!\d)|\d+)(?:\.\d+)?%?")
+
+
+def number_safe_cut(text: str, cut: int) -> int:
+    """切點落在某個數字中間就退到那個數字前面；沒切到數字就原樣回傳。"""
+    for match in _NUMBER_RE.finditer(text):
+        if match.start() >= cut:
+            break
+        if cut < match.end():
+            return match.start()
+    return cut
+
+
 def _truncate(text: str, max_len: int) -> str:
     """截到 max_len 以內並補「...」（2026-10-18 審查 r6c C1：硬切會把數字切成另一個數字、沒有標記）。
 
-    切點落在數字／英文的中間就往回退到完整的位置；退光了才硬切。結果長度 ≤ max_len，再洗一次不會變（冪等）。"""
+    切點落在數字／英文的中間就往回退到那一串的前面。整段都是英數、退光了的話，英文可以從中間切，數字不行
+    （2026-10-23 審查 r7 #1：原本退光就硬切，「2891」變「28」、長串數字切出像手機號碼的一段，再洗一次就整則不見）。
+    只剩一個切不開的數字 → 回空字串（整則丟掉）。結果長度 ≤ max_len，再洗一次不會變（冪等）。"""
     if max_len <= len(_ELLIPSIS):
-        return text[:max_len]
+        return text[: number_safe_cut(text, max_len)]
     keep = max_len - len(_ELLIPSIS)
-    cut = text[:keep]
-    if _run_char(text[keep]) and _run_char(cut[-1]):
-        backed = cut
-        while backed and _run_char(backed[-1]):
-            backed = backed[:-1]
-        cut = backed or cut
-    cut = cut.rstrip(_TRAILING_PUNCT) or cut
-    return cut + _ELLIPSIS
+    cut = keep
+    if _run_char(text[keep]) and _run_char(text[keep - 1]):
+        while cut and _run_char(text[cut - 1]):
+            cut -= 1
+        if not cut:
+            cut = number_safe_cut(text, keep)
+    head = text[:cut].rstrip(_TRAILING_PUNCT)
+    return head + _ELLIPSIS if head else ""
 
 
 # ── 交易日曆 ────────────────────────────────────────────────────────────────
@@ -785,26 +802,38 @@ class Technicals:
     rsi14: float | None
 
 
-def technicals(closes: Mapping[date, float], calendar: Any, day: date) -> Technicals:
-    """單一 ETF／指數在 D 的技術面；均線要窗口內每個預期交易日都有收盤，日變化要前一筆＝prev_session(D)。"""
+def technicals(
+    closes: Mapping[date, float],
+    calendar: Any,
+    day: date,
+    quarantine: Sequence[tuple[date, date | None]] | None = None,
+) -> Technicals:
+    """單一 ETF／指數在 D 的技術面；均線要窗口內每個預期交易日都有收盤，日變化要前一筆＝prev_session(D)。
+
+    quarantine＝這檔的隔離區間（分割沒對上、跳空）：碰到的窗口（日變化、均線、240 日回檔、RSI 往回算的那段）
+    一律不算，和成分寬度同一個規則（2026-10-23 審查 r7 #5：0050 被隔離了，技術面照樣發布 -50%）。"""
     sessions = _sessions_upto(calendar, day, DRAWDOWN_WINDOW + 20)
     empty = {n: None for n in MA_WINDOWS}
     if not sessions or sessions[-1] != day or not _pos(closes.get(day)):
         return Technicals(None, None, None, None, dict(empty), dict(empty), dict(empty), None, None)
     series = [closes.get(s) for s in sessions]
+
+    def clean(span: int) -> bool:  # 以 D 結尾、span 個交易日的窗口沒碰到隔離區間
+        return not _touches_quarantine(quarantine, sessions[-span], day)
+
     close = float(series[-1])
-    prev = series[-2] if len(series) >= 2 and _pos(series[-2]) else None
+    prev = series[-2] if len(series) >= 2 and _pos(series[-2]) and clean(2) else None
     chg = close - prev if prev is not None else None
     chg_pct = (close / prev - 1.0) * 100.0 if prev is not None else None
     ma: dict[int, float | None] = {}
     for n in MA_WINDOWS:
         window = series[-n:]
-        ma[n] = sma(window, n) if len(window) == n and all(_pos(v) for v in window) else None
+        ma[n] = sma(window, n) if len(window) == n and all(_pos(v) for v in window) and clean(n) else None
     ma_dist = {n: ma_distance_pct(close, ma[n]) for n in MA_WINDOWS}
     above = {n: (None if ma[n] is None else _position(close, ma[n]) > 0) for n in MA_WINDOWS}
     tail: list[float] = []
-    for value in reversed(series):
-        if not _pos(value):
+    for session, value in zip(reversed(sessions), reversed(series)):
+        if not _pos(value) or _touches_quarantine(quarantine, session, session):
             break
         tail.append(float(value))
     tail.reverse()
@@ -816,7 +845,11 @@ def technicals(closes: Mapping[date, float], calendar: Any, day: date) -> Techni
         ma=ma,
         ma_dist=ma_dist,
         above=above,
-        dd240_pct=drawdown_pct(series, DRAWDOWN_WINDOW) if len(series) >= DRAWDOWN_WINDOW else None,
+        dd240_pct=(
+            drawdown_pct(series, DRAWDOWN_WINDOW)
+            if len(series) >= DRAWDOWN_WINDOW and clean(DRAWDOWN_WINDOW)
+            else None
+        ),
         rsi14=rsi_wilder(tail, RSI_PERIOD),
     )
 
@@ -1077,11 +1110,13 @@ def volume_state(
     closes: Mapping[date, float] | None = None,
     day_flag: str | None = None,
     excluded: Collection[date] = (),
+    quarantine: Sequence[tuple[date, date | None]] | None = None,
 ) -> VolumeState:
     """倍數＝D 量／前 20 個交易日平均（不含 D）；百分位＝近 250 個交易日（含 D）量 ≤ 當天的比例。
 
     calendar 沒給就用 volumes 的日期當交易日；excluded＝來源不同的日子（CBOE 備援量，§18.7）：
     D 本身是 → 不判斷；窗口裡有 → 當缺值。價量組合需要 closes（D 與前一個交易日都要有）。
+    quarantine＝這檔的隔離區間：分割前後的量不同口徑，碰到的窗口不算倍數／百分位（2026-10-23 審查 r7 #5）。
     """
     sessions = _sessions_upto(calendar if calendar is not None else volumes.keys(), D, VOL_PCT_DAYS)
     if not sessions or sessions[-1] != D or not _volume_ok(volumes.get(D)):
@@ -1095,11 +1130,19 @@ def volume_state(
     today = float(volumes[D])
     prior = sessions[-(VOL_AVG_DAYS + 1) : -1]
     ratio = None
-    if len(prior) == VOL_AVG_DAYS and all(usable(day) for day in prior):
+    if (
+        len(prior) == VOL_AVG_DAYS
+        and all(usable(day) for day in prior)
+        and not _touches_quarantine(quarantine, prior[0], D)
+    ):
         average = math.fsum(float(volumes[day]) for day in prior) / VOL_AVG_DAYS
         ratio = today / average if average > 0 else None
     pct250 = None
-    if len(sessions) == VOL_PCT_DAYS and all(usable(day) for day in sessions):
+    if (
+        len(sessions) == VOL_PCT_DAYS
+        and all(usable(day) for day in sessions)
+        and not _touches_quarantine(quarantine, sessions[0], D)
+    ):
         pct250 = 100.0 * sum(1 for day in sessions if float(volumes[day]) <= today) / VOL_PCT_DAYS
     pv_label = None
     if closes is not None and ratio is not None and len(sessions) >= 2:

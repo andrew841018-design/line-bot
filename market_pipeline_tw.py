@@ -567,21 +567,30 @@ QUARANTINE_JUMP = "jump"
 def check_tw_jumps(store: Any, codes: Optional[Iterable[str]] = None) -> None:
     """長歷史（tw）相鄰兩日收盤 |r−1| > 10.5%，而除權息表涵蓋那天卻沒有事件 → 隔離那一段（publish 把
     store.quarantine("tw") 交給 breadth，只讓碰到的均線窗口無效）。涵蓋不到的日子不判斷（可能是還沒補的大額除息）；
-    之後補到那天的事件就解除重算。2026-10-18 審查 r6c I3：PLAN 寫了「台股 ±10% 隔離」，原本沒做。"""
+    之後補到那天的事件就解除重算。2026-10-18 審查 r6c I3：PLAN 寫了「台股 ±10% 隔離」，原本沒做。
+
+    每次都照現在的收盤重算這檔該隔離的段落、和現有的比：補到事件或來源改正了價格，已經不是跳空的那段就解除
+    （2026-10-23 審查 r7 #3：原本只有補到事件才解除，價格改正後隔離永遠留著、寬度窗口一直排除這檔）。"""
     spans = _coverage(store)
+    current = store.quarantine(MARKET)
     for code in list(codes) if codes is not None else tracked_codes(store):
         if code == SYM_TAIEX or not valid_code(code):
             continue
         events = {row.date for row in store.exrights(code)}
         rows = sorted((day, value[0]) for day, value in _closes_map(store, MARKET, code).items())
-        have = {(a, b) for a, b, reason in store.quarantine(MARKET).get(code, []) if reason == QUARANTINE_JUMP}
-        if any(b in events for _a, b in have):  # 補到事件了：這檔的跳空隔離全部解除、下面重新判斷
-            store.clear_quarantine(MARKET, code, QUARANTINE_JUMP)
-            have = set()
-        for (d0, c0), (d1, c1) in zip(rows, rows[1:]):
-            if c0 <= 0 or abs(c1 / c0 - 1.0) <= TW_JUMP_LIMIT or (d0, d1) in have or d1 in events:
-                continue
-            if any(a <= d1 <= b for a, b in spans):
+        want = {
+            (d0, d1)
+            for (d0, c0), (d1, c1) in zip(rows, rows[1:])
+            if c0 > 0 and abs(c1 / c0 - 1.0) > TW_JUMP_LIMIT and d1 not in events and any(a <= d1 <= b for a, b in spans)
+        }
+        have = {(a, b) for a, b, reason in current.get(code, []) if reason == QUARANTINE_JUMP}
+        if want == have:
+            continue
+        with store.transaction():
+            if have - want:  # 有一段已經不成立：這檔的跳空隔離全部解除、再照現在的加回去
+                store.clear_quarantine(MARKET, code, QUARANTINE_JUMP)
+                have = set()
+            for d0, d1 in sorted(want - have):
                 store.add_quarantine(MARKET, code, d0, d1, QUARANTINE_JUMP)
 
 

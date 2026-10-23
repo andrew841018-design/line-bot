@@ -373,17 +373,19 @@ def row_width(text: str) -> float:
 
 
 def _clip(text: str, width: float = MAX_ROW_WIDTH) -> str:
-    """最後的保險：超寬就從尾巴切掉、補「…」（外部名稱特別長時才會用到）。"""
+    """最後的保險：超寬就從尾巴切掉、補「…」（外部名稱特別長時才會用到）。
+
+    切點落在數字中間就整個數字拿掉，不印半個數字（2026-10-23 審查 r7 #2：「+12.34%」被切成「+12.…」）。"""
     if row_width(text) <= width:
         return text
-    out: list[str] = []
+    keep = 0
     used = 0.0
     for ch in text:
         used += row_width(ch)
         if used > width - 1:
             break
-        out.append(ch)
-    return "".join(out) + "…"
+        keep += 1
+    return text[: market_calc.number_safe_cut(text, keep)].rstrip() + "…"
 
 
 def _fit(*variants: Optional[str]) -> str:
@@ -1023,10 +1025,16 @@ def _macro_label(key: str, values: dict) -> str:
     return f"{zh}（{en}）"
 
 
+def _proxy_change(values: dict) -> Optional[str]:
+    """ETF 代理的日漲跌幅（「+0.30%」）；沒有就 None。"""
+    change = _num(values.get("chg_pct"), -100, 1000)
+    return _pct(change, 2) if change is not None else None
+
+
 def _macro_value(key: str, values: dict) -> Optional[str]:
     if _etf_proxy(key, values):  # 只寫日漲跌幅；沒有就明說沒有，不拿 ETF 股價頂替
-        change = _num(values.get("chg_pct"), -100, 1000)
-        return f"單日 {_pct(change, 2)}" if change is not None else TEXT_PROXY_NO_CHANGE
+        change = _proxy_change(values)
+        return f"單日 {change}" if change is not None else TEXT_PROXY_NO_CHANGE
     value = _num(values.get("value"), -1e9, 1e9)
     if value is None:
         return None
@@ -1051,29 +1059,36 @@ def _macro_change(key: str, values: dict, *, spelled: bool = False) -> Optional[
     return f"{_signed(change)} 個百分點" if spelled and key in _YIELDS else _signed(change)
 
 
-def _macro_part(ctx: _Ctx, key: str) -> tuple[str, str, str]:
-    """(完整名稱, 短名稱, 值)：過期或暫缺時值是狀態字。代理的短名稱留著「（代理）」，不讓人當成指數本身。"""
+def _macro_part(ctx: _Ctx, key: str) -> tuple[str, str, str, str]:
+    """(完整名稱, 短名稱, 值, 最短寫法)：過期或暫缺時值是狀態字。代理的短名稱留著「（代理）」，不讓人當成指數本身。
+
+    最短寫法（「油價代理 +12.34%」）給兩列都是代理、短寫法也放不下時用：數字一定完整（2026-10-23 審查 r7 #2）。"""
     zh, en = _MACRO[key]
     view = ctx.row(f"macro.{key}")
     if not view.fresh:
-        return f"{zh}（{en}）", f"{zh} ", ctx.gap(view, short=True)
+        gap = ctx.gap(view, short=True)
+        return f"{zh}（{en}）", f"{zh} ", gap, f"{zh} {gap}"
     label = _macro_label(key, view.values)
-    short = f"{zh} " if label == f"{zh}（{en}）" else f"{zh}（代理）"
-    return label, short, _macro_value(key, view.values) or TEXT_MISSING
+    value = _macro_value(key, view.values) or TEXT_MISSING
+    if label == f"{zh}（{en}）":
+        return label, f"{zh} ", value, f"{zh} {value}"
+    terse = (_proxy_change(view.values) or TEXT_PROXY_NO_CHANGE) if _etf_proxy(key, view.values) else value
+    return label, f"{zh}（代理）", value, f"{zh}代理 {terse}"
 
 
 def _macro_pair_line(ctx: _Ctx, first: str, second: str) -> tuple[str, str]:
-    full, short = [], []
+    full, short, terse = [], [], []
     for key in (first, second):
-        label, short_label, value = _macro_part(ctx, key)
+        label, short_label, value, tiny = _macro_part(ctx, key)
         full.append(f"{label}{value}")
         short.append(f"{short_label}{value}")
-    return _fit("、".join(full), "、".join(short)), GRAY
+        terse.append(tiny)
+    return _fit("、".join(full), "、".join(short), "、".join(terse)), GRAY
 
 
 def _yield_line(ctx: _Ctx) -> tuple[str, str]:
     view = ctx.row("macro.UST10Y")
-    label, _short, value = _macro_part(ctx, "UST10Y")
+    label, _short, value, _terse = _macro_part(ctx, "UST10Y")
     change = _macro_change("UST10Y", view.values) if view.fresh else None
     return _fit(f"{label}{value}（{change}）" if change else f"{label}{value}", f"{label}{value}"), GRAY
 

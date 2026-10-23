@@ -688,16 +688,20 @@ def _usable(counts: Any) -> bool:
 
 
 def _etf_parts(
-    rows: list[Any], cal: market_calc.TradingCalendar, day: date
+    rows: list[Any],
+    cal: market_calc.TradingCalendar,
+    day: date,
+    quarantine: Optional[list[tuple[date, date]]] = None,
 ) -> tuple[market_calc.Technicals, market_calc.VolumeState]:
+    """ETF 自己的技術面與量能；quarantine＝這檔的隔離區間，碰到的窗口不算（2026-10-23 審查 r7 #5）。"""
     closes = {row[0]: row[1] for row in rows}
     volumes = {row[0]: row[2] for row in rows if row[2] is not None}
     # CBOE 備援的量和 Nasdaq 不同口徑（PLAN §18.7）：不參加量能倍數
     provisional = {row[0] for row in rows if len(row) > 4 and row[4]}
-    tech = market_calc.technicals(closes, cal, day)
+    tech = market_calc.technicals(closes, cal, day, quarantine)
     volume = market_calc.volume_state(
         volumes, day, calendar=cal, closes=closes, day_flag=market_calc.volume_day_flag(day, cal),
-        excluded=provisional,
+        excluded=provisional, quarantine=quarantine,
     )
     return tech, volume
 
@@ -710,7 +714,7 @@ def _us_etf(ctx: _Ctx, row_id: str) -> RowResult:
     if not rows:
         raise _Unavailable("missing")
     day = rows[-1][0]
-    tech, volume = _etf_parts(rows, cal, day)
+    tech, volume = _etf_parts(rows, cal, day, ctx.quarantine(US).get(symbol))
     if tech.close is None:
         raise _Unavailable("calendar")
     return RowResult(
@@ -1158,7 +1162,7 @@ def _tw_etf(ctx: _Ctx, row_id: str) -> RowResult:
     if not rows:
         raise _Unavailable("missing")
     day = rows[-1][0]
-    tech, volume = _etf_parts(rows, cal, day)
+    tech, volume = _etf_parts(rows, cal, day, ctx.quarantine(TW).get(code))
     if tech.close is None:
         raise _Unavailable("calendar")
     return RowResult(

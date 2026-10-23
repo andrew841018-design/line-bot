@@ -1399,3 +1399,54 @@ def test_truncation_never_splits_a_number_and_is_marked():
     assert english == "Fed holds rates steady as..." and mc.clean_external(english, 30) == english
     assert mc.clean_external("短標題", 40) == "短標題"  # 沒超過就不動
     assert mc.clean_external("a" * 60, 20) == "a" * 17 + "..."  # 整串都是英數：退光了才硬切
+
+
+def test_truncation_keeps_numbers_whole_even_when_the_whole_title_is_one_run():
+    """2026-10-23 審查 r7 #1：整段都是英數、退光了的時候原本硬切——「2891」變「28」；長串數字切出一段像手機號碼的數字，
+    再洗一次就因為像手機號碼整則不見（不冪等）。英文可以從中間切，數字不行。"""
+    codes = "2330,2317,2454,2308,2382,2881,2882,2891,1216"
+    assert mc.clean_external(codes, 40) == "2330,2317,2454,2308,2382,2881,2882..."
+    product = mc.clean_external("PRODUCTCODE09123456789012345", 24)
+    assert product == "PRODUCTCODE..." and mc.clean_external(product, 24) == product
+    assert mc.clean_external("1" * 60, 20) is None  # 只有一個切不開的數字：整則丟掉
+    assert mc.clean_external("12,345,678,901,234,567,890", 12) is None
+    assert mc.clean_external("漲幅 +12.34% 創高", 8) == "漲幅..."  # 正負號跟著數字一起拿掉
+    samples = [codes, "PRODUCTCODE09123456789012345", "營收 1,234,567 億元創新高", "NASDAQ+12.34%收盤",
+               "ABC-12345678901234567890", "x" * 30 + "12.5%", "0912-345-6789012345", "+12.34%" * 10]
+    for text in samples:
+        whole = {m.group() for m in mc._NUMBER_RE.finditer(text)}
+        for limit in (8, 12, 20, 24, 40):
+            out = mc.clean_external(text, limit)
+            if out is None:
+                continue
+            assert len(out) <= limit and mc.clean_external(out, limit) == out, (text, limit, out)
+            body = out[:-3] if out.endswith("...") else out
+            assert all(m.group() in whole for m in mc._NUMBER_RE.finditer(body)), (text, limit, out)
+
+
+def test_number_safe_cut():
+    assert mc.number_safe_cut("漲 +12.34% 收", 6) == 2  # 切在數字中間：退到正負號前面
+    assert mc.number_safe_cut("漲 +12.34% 收", 9) == 9  # 剛好在數字後面：不動
+    assert mc.number_safe_cut("1,234,567", 4) == 0  # 千分位是同一個數字
+    assert mc.number_safe_cut("2330,2317", 7) == 5  # 逗號後面不是 3 位數：兩個數字
+
+
+def test_etf_technicals_and_volume_skip_windows_that_touch_quarantine():
+    """2026-10-23 審查 r7 #5：0050 自己被隔離（分割沒對上），技術面不能照樣發布 -50%、月線距離 -48%。"""
+    sessions = weekdays(date(2025, 1, 6), 300)
+    closes = {s: 100.0 for s in sessions}
+    closes[sessions[-1]] = 50.0
+    volumes = {s: 1000.0 for s in sessions}
+    plain = mc.technicals(closes, sessions, sessions[-1])
+    assert plain.chg_pct == pytest.approx(-50.0) and plain.ma[20] is not None and plain.dd240_pct is not None
+    jump = [(sessions[-2], sessions[-1])]
+    tech = mc.technicals(closes, sessions, sessions[-1], jump)
+    assert tech.close == 50.0 and tech.chg_pct is None and tech.rsi14 is None and tech.dd240_pct is None
+    assert all(tech.ma[n] is None and tech.above[n] is None for n in mc.MA_WINDOWS)
+    older = [(sessions[-40], sessions[-35])]  # 碰到 60／120／240 日線，碰不到 20 日線與日變化
+    tech = mc.technicals(closes, sessions, sessions[-1], older)
+    assert tech.chg_pct is not None and tech.ma[20] is not None and tech.rsi14 is not None
+    assert tech.ma[60] is None and tech.ma[240] is None and tech.dd240_pct is None
+    volume = mc.volume_state(volumes, sessions[-1], calendar=sessions, quarantine=older)
+    assert volume.ratio == pytest.approx(1.0) and volume.pct250 is None  # 20 日窗口沒碰到、250 日碰到
+    assert mc.volume_state(volumes, sessions[-1], calendar=sessions, quarantine=jump).ratio is None
