@@ -112,10 +112,8 @@ OBS_TW_TXO = "tw.txo"
 OBS_TW_FX = "tw.fx"
 OBS_TW_HOLDINGS = "tw.holdings.0050"
 COVERAGE_TWT49U = "twt49u"
-# market_pipeline_misc（宏觀 Yahoo／代理、BTC、新聞、川普、預測市場）寫這些
+# market_pipeline_misc（宏觀 Yahoo／代理（BTC 也在裡面）、新聞、川普、預測市場）寫這些
 OBS_MACRO = "macro.{}"  # {"value","chg","chg_pct","date","prev_date","source","symbol","bars": [[日期, 收盤], …]}
-OBS_BTC = "macro.BTC"  # Coinbase 每 2 小時：{"value","source","fetched_utc"}
-OBS_BTC_YAHOO = "macro.BTC.yahoo"  # Yahoo 的 BTC 日線（只當備援），格式同其他宏觀
 OBS_NEWS = "news.{}"  # {"items": [{"title","source","published_utc"}], "fetched_utc"}
 OBS_TRUMP_SUMMARY = "trump.summary"  # {"topics","labels","at_least",…}：這裡只拿 at_least（缺口）與主題名
 POSTS_TRUMP = "trump"  # store.upsert_posts 的 kind：{original_id, published_utc, own_text, quoted_author, removed, topics}
@@ -1567,7 +1565,10 @@ def _macro_spy_dd(ctx: _Ctx, row_id: str) -> RowResult:
                      source="SPY 價格代理", basis="離 240 日高點（%）")
 
 
-_MACRO_KEYS = ("DXY", "WTI", "BRENT", "GOLD", "SILVER", "USDTWD", "RUT", "DJI", "IXIC", "MOVE")
+# BTC（2026-10-23）和其他格一樣：Yahoo 的 BTC-USD，沒有就用 IBIT 代理（source 寫「ETF 代理：IBIT」，卡上只寫單日漲跌幅）。
+# 原本 Coinbase 現貨那條（過期＝抓取＋6 小時，§18.9）拿掉了：api.coinbase.com 在台灣被封鎖。舊的 Coinbase payload
+# 沒有 date，`_macro_daily` 會把它當暫缺，不會拿來頂替。
+_MACRO_KEYS = ("DXY", "WTI", "BRENT", "GOLD", "SILVER", "BTC", "USDTWD", "RUT", "DJI", "IXIC", "MOVE")
 
 
 def _macro_daily(ctx: _Ctx, found: dict, latest: date) -> RowResult:
@@ -1595,27 +1596,6 @@ def _macro_misc(ctx: _Ctx, row_id: str) -> RowResult:
     if found is None:
         raise _Unavailable("missing")
     return _macro_daily(ctx, found, ctx.us_day())
-
-
-@_rows("macro.BTC")
-def _macro_btc(ctx: _Ctx, row_id: str) -> RowResult:
-    """BTC：Coinbase 現貨（過期＝抓取＋6 小時，§18.9）；它過期或沒有才用 Yahoo 的日線備援。"""
-    found = ctx.obs(OBS_BTC)
-    if found is not None:
-        payload = found["payload"]
-        fetched = _epoch(payload.get("fetched_utc")) or _num(found.get("last_success_at"))
-        value = _num(payload.get("value"))
-        if fetched is not None and value is not None and value > 0:
-            stale_after = ctx.stale(market_calc.KIND_BTC, fetched)
-            if stale_after >= ctx.now:
-                source = payload.get("source") if isinstance(payload.get("source"), str) else "Coinbase"
-                values = {"value": value, "chg": None, "chg_pct": None, "source": source}
-                return RowResult(values, data_date=datetime.fromtimestamp(fetched, _UTC).date(), stale_after=stale_after,
-                                 source=source, basis="現貨價（美元）")
-    backup = ctx.obs(OBS_BTC_YAHOO)
-    if backup is None:
-        raise _Unavailable("missing")
-    return _macro_daily(ctx, backup, ctx.us_day())
 
 
 # ── 事件、季節性、選舉 ───────────────────────────────────────────────────────
@@ -1751,12 +1731,21 @@ def _quote_entry(ctx: _Ctx, obs_id: str, chamber: str) -> Optional[tuple[dict, O
     return entry, expires
 
 
+def _prediction_blocked(ctx: _Ctx) -> bool:
+    """預測市場的來源在台灣被封鎖（market_sources_misc.PREDICTION_MARKETS_BLOCKED，2026-10-23）：collect 不抓。
+    只有明確設成 False 才當作沒被封鎖（和 collect 端同一個判法）。"""
+    return getattr(ctx.module("market_sources_misc"), "PREDICTION_MARKETS_BLOCKED", True) is not False
+
+
 @_rows("election")
 def _election(ctx: _Ctx, row_id: str) -> RowResult:
     today_et = datetime.fromtimestamp(ctx.now, _ET).date()
+    blocked = _prediction_blocked(ctx)
     quotes: list[dict] = []
     expiries: list[float] = []
-    for chamber, obs_ids in OBS_ELECTION.items():
+    # 封鎖中：不拿封鎖前最後一次抓到的報價頂替（也不會有新的），值裡寫 blocked，bot 才分得出「被封鎖」和「資料暫缺」
+    wanted = {} if blocked else OBS_ELECTION
+    for chamber, obs_ids in wanted.items():
         for obs_id in obs_ids:
             got = _quote_entry(ctx, obs_id, chamber)
             if got is not None:
@@ -1779,7 +1768,8 @@ def _election(ctx: _Ctx, row_id: str) -> RowResult:
     else:
         state = "waiting"
     days_left = (_VOTE_DAY - today_et).days if today_et <= _VOTE_DAY else None
-    values = {"vote_date": _VOTE_DAY.isoformat(), "days_left": days_left, "state": state, "quotes": quotes}
+    values = {"vote_date": _VOTE_DAY.isoformat(), "days_left": days_left, "state": state, "quotes": quotes,
+              "blocked": blocked}
     # 倒數天數到美東午夜就變：publish 停了的話列到那時過期；報價各自 6 小時
     return RowResult(values, data_date=today_et, stale_after=min([_next_midnight(ctx.now, _ET)] + expiries),
                      source="Polymarket、Kalshi", basis=market_calc.TEXT_ELECTION_NOTE)

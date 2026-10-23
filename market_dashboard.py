@@ -110,6 +110,10 @@ TEXT_CARD_FAILED = "盤勢：卡片暫時出不來，請過幾分鐘再按一次
 TEXT_CHART_UNAVAILABLE = "盤勢圖：這張圖還沒畫好或已經過期，請過幾分鐘再按一次"
 TEXT_NO_13F_0050 = "盤勢：0050 是台股 ETF，沒有 13F 資料；台股細節請打 /盤勢 0050"
 TEXT_ELECTION_ENDED = "盤勢：本屆期中選舉已結束"
+# 2026-10-23：Polymarket、Kalshi 被台灣的 ISP 依法院命令封鎖，collect 不抓；快照的選舉列寫 blocked，卡上用固定句說明
+# （不是「暫缺」）。摘要列接在「期中選舉還有 N 天，」後面，放不下全句，用短的
+TEXT_PREDICTION_BLOCKED = "預測市場：台灣已封鎖這些網站，暫不提供"
+TEXT_PREDICTION_BLOCKED_SHORT = "預測市場：台灣已封鎖"
 TEXT_SWIPE = "往左滑還有 3 張"
 TEXT_NEWS_NOTE = "新聞標題是第三方原文，只照錄、不代表程式判斷"
 TEXT_GAMMA_NOTE = "假設部位下的 gamma 是估計：假設造市商持有買權、賣出賣權"
@@ -1233,6 +1237,11 @@ def _quotes(view: _View) -> list[_Quote]:
     return found
 
 
+def _prediction_blocked(view: _View) -> bool:
+    """選舉列有沒有寫 blocked（來源在台灣被封鎖）：列過期或暫缺時不知道，當沒有。"""
+    return view.fresh and _flag(view.values.get("blocked")) is True
+
+
 def _house_result(view: _View) -> Optional[str]:
     """眾院已結算的結果（yes／no）；兩個平台寫的不一樣（結算規則不同）或都沒有 → None。"""
     results = {q.result for q in _quotes(view) if q.chamber == "house" and q.result}
@@ -1259,6 +1268,8 @@ def _election_line(ctx: _Ctx) -> Optional[tuple[str, str]]:
         return "期中選舉：已投票，結果看 /盤勢 選舉", GRAY
     days = _election_days(ctx)
     head = f"期中選舉還有 {days} 天"
+    if _prediction_blocked(view):  # 倒數照寫；後面接固定句，說明是被封鎖、不是資料暫缺
+        return _fit(f"{head}，{TEXT_PREDICTION_BLOCKED_SHORT}", head), GRAY
     house = next((q for q in _quotes(view) if q.platform == "polymarket" and q.chamber == "house"), None)
     if house is None or house.mid is None:
         return _fit(f"{head}，預測市場暫缺"), GRAY
@@ -2089,7 +2100,8 @@ def _election_detail(ctx: _Ctx) -> Reply:
         "result": "已投票，結果以預測市場的結算為準",
     }[phase]
     body = [_text(head, size="xl", weight="bold")]
-    quotes = _quotes(view)
+    blocked = _prediction_blocked(view)
+    quotes = [] if blocked else _quotes(view)
     clock = False  # 有沒有印出「市場更新 …」的時刻（印了 footer 就補「時間為台北時間」）
     for quote in quotes:
         who = f"{_CHAMBERS[quote.chamber]}民主黨（{_PLATFORMS[quote.platform]}）"
@@ -2113,13 +2125,15 @@ def _election_detail(ctx: _Ctx) -> Reply:
             clock = True
         if extra:
             body.append(_text("｜".join(extra), size="md", color=GRAY))
-    if not quotes:
+    if blocked:  # 來源被封鎖：固定句說明，不寫成「暫缺」；沒有報價可印，「兩平台結算規則不同」那句也不放
+        body.append(_text(TEXT_PREDICTION_BLOCKED, color=GRAY))
+    elif not quotes:
         body.append(_text(f"預測市場：{ctx.gap(view)}", color=GRAY))
     body.append(_text(market_calc.TEXT_POLL_NONE, size="md", color=GRAY))
     bubble = _bubble(
         f"美國期中選舉｜{vote} 投票",
         body,
-        notes=(market_calc.TEXT_ELECTION_NOTE, *([TEXT_TAIPEI_TIME] if clock else ())),
+        notes=(*(() if blocked else (market_calc.TEXT_ELECTION_NOTE,)), *([TEXT_TAIPEI_TIME] if clock else ())),
         buttons=(("回摘要", COMMAND),),
     )
     alt = f"{ALT_PREFIX}期中選舉｜" + (f"還有 {_election_days(ctx)} 天" if phase == "before" else "已投票")

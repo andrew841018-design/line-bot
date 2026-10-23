@@ -17,7 +17,7 @@ Andrew 2026-10-17 要 /盤勢 一次看美股／台股的技術面、寬度、�
   證交所收盤可比），所以一個晚上跑不完：
   ① 台北 10/16（五）18:00 起每 15 分鐘一輪：美東週五清晨，D＝10/15、T＝10/16；
   ② Mac 睡過一夜，台北 10/17（六）08:30 起每 15 分鐘一輪：美東週五 20:30，D＝10/16、T＝10/16。
-  每段跑到「除了定時來源（新聞、川普、BTC、預測市場）之外沒有任何請求」為止（上限 MAX_ROUNDS 輪），
+  每段跑到「除了定時來源（新聞、川普）之外沒有任何請求」為止（上限 MAX_ROUNDS 輪），
   每段結束照 job 的做法另開一個 Store 連線跑一次真的 publish（真的畫圖）。
 - 刻意放進來的狀況：一檔 10/16 生效的 1:10 反分割（Nasdaq 收盤後才調整歷史 → 覆寫守門＋整段替換）、一檔
   6 月已調整的 4:1 分割、一檔 10/16 財報跳空 +22%（待確認→兩次一致接受）、一檔 10/14 起停牌（沒有 D 列）、
@@ -80,9 +80,7 @@ MAX_ROUNDS = 16  # 每段的上限；PLAN §9 的「9 輪抓齊」只是估計�
 REQUEST_S = 0.2  # 假的網路延遲：每個請求讓時鐘走這麼多秒
 COLLECT_BUDGET_S = job.COLLECT_TIMEOUT_S - min(job.COLLECT_MARGIN_S, job.COLLECT_TIMEOUT_S * 0.25)
 # 每 15–120 分鐘固定會打的來源：它們有請求不代表 collect 還沒做完
-PERIODIC_HOSTS = frozenset(
-    {"news.google.com", "www.trumpstruth.org", "api.coinbase.com", "gamma-api.polymarket.com", "api.elections.kalshi.com"}
-)
+PERIODIC_HOSTS = frozenset({"news.google.com", "www.trumpstruth.org"})
 D1, D2 = date(2026, 10, 15), date(2026, 10, 16)  # 兩段的美股 D
 T = date(2026, 10, 16)  # 兩段的台股 T
 
@@ -247,7 +245,8 @@ class Walk:
 
 US_ETF_BASE = {
     "SPY": 660.0, "VOO": 606.0, "QQQ": 712.0, "SOXX": 282.0,
-    "UUP": 27.4, "USO": 74.0, "BNO": 30.5, "GLD": 381.0, "SLV": 45.2, "IWM": 246.0, "DIA": 462.0, "ONEQ": 88.0,
+    "UUP": 27.4, "USO": 74.0, "BNO": 30.5, "GLD": 381.0, "SLV": 45.2, "IBIT": 46.0, "IWM": 246.0, "DIA": 462.0,
+    "ONEQ": 88.0,
 }
 
 
@@ -852,45 +851,6 @@ def trump_rss(now: float) -> str:
     return f'<?xml version="1.0" encoding="UTF-8"?><rss version="2.0" {TRUMP_NS}><channel><title>t</title>{items}</channel></rss>'
 
 
-def polymarket_event(slug: str, now: float) -> list:
-    updated = datetime.fromtimestamp(now - 1800, UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-    if slug == "which-party-will-win-the-house-in-2026":
-        event_id, dem, rep, chamber = "32225", ("562802", 0.90, 0.91, 0.91), ("562803", 0.09, 0.10, 0.09), "House"
-    elif slug == "which-party-will-win-the-senate-in-2026":
-        event_id, dem, rep, chamber = "32224", ("562793", 0.64, 0.65, 0.65), ("562794", 0.36, 0.37, 0.37), "Senate"
-    else:
-        raise KeyError(slug)
-
-    def market(ids: tuple, party: str) -> dict:
-        market_id, bid, ask, last = ids
-        mid = round((bid + ask) / 2, 3)
-        return {"id": market_id, "question": f"Will the {party} control the {chamber} after the 2026 Midterm elections?",
-                "groupItemTitle": party, "outcomes": '["Yes", "No"]', "outcomePrices": f'["{mid}", "{1 - mid:.3f}"]',
-                "bestBid": bid, "bestAsk": ask, "lastTradePrice": last, "updatedAt": updated,
-                "active": True, "closed": False}
-
-    placeholder = {"id": "562795", "question": "Will Party A control it?", "groupItemTitle": "Party A",
-                   "outcomes": '["Yes", "No"]', "outcomePrices": None, "bestBid": 0, "bestAsk": 1, "lastTradePrice": 0,
-                   "updatedAt": "2026-09-23T20:24:25.834741Z", "active": False, "closed": False}
-    return [{"id": event_id, "slug": slug, "title": f"Which party will win the {chamber} in 2026?", "active": True,
-             "closed": False, "markets": [market(dem, "Democratic Party"), market(rep, "Republican Party"), placeholder]}]
-
-
-def kalshi_markets(event: str) -> dict:
-    quotes = {"CONTROLH-2026": (("0.9010", "0.9020", "0.9020"), ("0.0980", "0.0990", "0.0990")),
-              "CONTROLS-2026": (("0.6200", "0.6300", "0.6200"), ("0.3800", "0.3900", "0.3900"))}[event]
-    chamber = "House" if event.startswith("CONTROLH") else "Senate"
-
-    def market(suffix: str, party: str, prices: tuple) -> dict:
-        bid, ask, last = prices
-        return {"ticker": f"{event}-{suffix}", "event_ticker": event, "title": f"Will {party}s win the U.S. {chamber}?",
-                "yes_sub_title": f"{party} Party" if party != "Democrat" else "Democratic Party", "status": "active",
-                "result": "", "yes_bid_dollars": bid, "yes_ask_dollars": ask, "last_price_dollars": last,
-                "updated_time": "2026-09-28T17:53:29.962348Z"}
-
-    return {"cursor": "", "markets": [market("D", "Democrat", quotes[0]), market("R", "Republican", quotes[1])]}
-
-
 # ── 台股來源 ──────────────────────────────────────────────────────────────────
 TW_NO_DATA = {"stat": "很抱歉，沒有符合條件的資料!"}
 _UP, _DOWN, _FLAT = "<p style= color:red>+</p>", "<p style= color:green>-</p>", "<p> </p>"
@@ -1113,15 +1073,12 @@ CONTENT_TYPES = {  # 主 Claude 10/17 實測的型別
     "www.finra.org": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "www.federalreserve.gov": "text/html; charset=utf-8",
     "query1.finance.yahoo.com": "application/json;charset=utf-8",
-    "api.coinbase.com": "application/json; charset=utf-8",
     "www.twse.com.tw": "application/json;charset=UTF-8",
     "openapi.twse.com.tw": "application/json; charset=utf-8",
     "openapi.taifex.com.tw": "application/octet-stream",
     "api.finmindtrade.com": "application/json",
     "news.google.com": "application/xml; charset=utf-8",
     "www.trumpstruth.org": "application/rss+xml; charset=UTF-8",
-    "gamma-api.polymarket.com": "application/json; charset=utf-8",
-    "api.elections.kalshi.com": "application/json; charset=utf-8",
 }
 
 
@@ -1274,11 +1231,6 @@ class FakeHttp:
             return 429, b"Too Many Requests"
         return 200, yahoo_spark(q["symbols"].split(","), now)
 
-    def _api_coinbase_com(self, path: str, q: dict, now: float):
-        if path == "/v2/prices/BTC-USD/spot":
-            return 200, {"data": {"amount": "81471.25", "base": "BTC", "currency": "USD"}}
-        return None, None
-
     def _news_google_com(self, path: str, q: dict, now: float):
         if path == "/rss/search" and q.get("q") in NEWS:
             return 200, gnews_rss(q["q"], now)
@@ -1286,12 +1238,6 @@ class FakeHttp:
 
     def _www_trumpstruth_org(self, path: str, q: dict, now: float):
         return (200, trump_rss(now)) if path == "/feed" else (None, None)
-
-    def _gamma_api_polymarket_com(self, path: str, q: dict, now: float):
-        return (200, polymarket_event(q["slug"], now)) if path == "/events" else (None, None)
-
-    def _api_elections_kalshi_com(self, path: str, q: dict, now: float):
-        return (200, kalshi_markets(q["event_ticker"])) if path == "/trade-api/v2/markets" else (None, None)
 
     def _www_twse_com_tw(self, path: str, q: dict, now: float):
         if path == "/rwd/zh/afterTrading/MI_INDEX" and q.get("type") == "ALLBUT0999":
@@ -1620,7 +1566,11 @@ def test_no_task_outcome_is_unexpected_and_calendars_build(world):
     # 每個任務至少真的跑過一次（不是一直 not_due／backoff）。tw.twt49u 是每天 16:00 後的接續段：bootstrap 第一段
     # 已經涵蓋到週五，週六又不是交易日，這個時間窗裡本來就不會到期（下週一 16:00 才會）。
     ran = {name for log in world.rounds for name, kind in log.results.items() if kind in ("ok", "partial", "not_yet")}
-    expected = {task.name for task in TASK_LIST} - {market_pipeline_tw.TASK_TWT49U}
+    # 預測市場在台灣被封鎖（2026-10-23）：election.* 任務留在清單裡但永遠不到期，整個時間線都不該跑
+    elections = {task.name for task in TASK_LIST if task.name.startswith("election.")}
+    assert len(elections) == 4 and not elections & ran, sorted(elections & ran)
+    assert all(kind == "not_due" for log in world.rounds for name, kind in log.results.items() if name in elections)
+    expected = {task.name for task in TASK_LIST} - {market_pipeline_tw.TASK_TWT49U} - elections
     assert expected <= ran, sorted(expected - ran)
 
 
@@ -1730,8 +1680,11 @@ def test_rows_carry_the_scenario_values(world):
     assert values("us.fund.QQQ")["pe_valid"] >= 9 and values("tw.fund.0050")["rev_month"] == "2026-09"
     kinds = {item["kind"] for item in values("events.next")["items"]}
     assert {"fomc", "cpi", "earnings"} <= kinds, kinds
-    chambers = {(quote["platform"], quote["chamber"]) for quote in values("election")["quotes"]}
-    assert chambers == {("polymarket", "house"), ("kalshi", "house"), ("polymarket", "senate"), ("kalshi", "senate")}
+    # 預測市場被封鎖（2026-10-23）：選舉列照樣是 ok、倒數照算，值裡寫 blocked 並且沒有報價
+    assert values("election")["blocked"] is True and values("election")["quotes"] == []
+    assert values("election")["state"] == "before" and values("election")["days_left"] == 18
+    # BTC：Yahoo 第二天 429 → IBIT 代理（只有日漲跌幅可用）
+    assert values("macro.BTC")["source"] == "ETF 代理：IBIT" and values("macro.BTC")["chg_pct"] is not None
     titles = [item["title"] for item in values("news.us")["items"]]
     assert "美股收高 科技股領漲" in titles and "三天前的舊聞" not in titles
     assert not any(_hygiene_problems(title) for title in titles), titles
@@ -1855,14 +1808,27 @@ def test_chart_replies_reach_mains_url_builder(world, text, monkeypatch):
     assert main._prepare_outbound_text(reply.image_alt) == reply.image_alt
 
 
-def test_election_detail_has_house_and_senate_lines(world):
-    reply = _reply(world, "/盤勢 選舉")
-    texts = [s for s in _strings(reply.flex) if "民主黨（" in s]
-    assert any(s.startswith("眾院民主黨（Polymarket）") for s in texts), texts
-    assert any(s.startswith("眾院民主黨（Kalshi）") for s in texts), texts
-    assert any(s.startswith("參院民主黨（Polymarket）") for s in texts), texts
-    assert any(s.startswith("參院民主黨（Kalshi）") for s in texts), texts
-    assert all("暫缺" not in s for s in texts), texts
+def test_election_detail_says_the_prediction_markets_are_blocked(world):
+    """2026-10-23：Polymarket、Kalshi 在台灣被封鎖，collect 不抓：選舉細節卡寫固定句，不是「暫缺」。"""
+    texts = _strings(_reply(world, "/盤勢 選舉").flex)
+    assert "預測市場：台灣已封鎖這些網站，暫不提供" in texts, texts
+    assert any(s.startswith("投票日 11/3（美東），還有") for s in texts), texts
+    assert not any("民主黨（" in s or "暫缺" in s for s in texts), texts
+
+
+def test_summary_card_keeps_the_election_countdown_and_says_why_there_are_no_odds(world):
+    rows = _strings(_reply(world, "/盤勢").flex)
+    line = next(s for s in rows if s.startswith("期中選舉還有"))
+    assert line.endswith("，預測市場：台灣已封鎖") and market_dashboard.row_width(line) <= market_dashboard.MAX_ROW_WIDTH, line
+
+
+def test_btc_row_comes_from_the_ibit_proxy_on_the_second_day(world):
+    macro = _strings(_reply(world, "/盤勢").flex)
+    assert any("比特幣" in s and "代理" in s for s in macro), macro
+    detail = _strings(_reply(world, "/盤勢 新聞").flex)
+    line = next(s for s in detail if s.startswith("比特幣（IBIT 代理）："))
+    etf_close = world.snapshot["rows"]["macro.BTC"]["values"]["value"]
+    assert "單日" in line and market_dashboard._price(etf_close) not in line, line  # 只寫漲跌幅，不印 ETF 股價
 
 
 def test_summary_card_mentions_both_markets_and_their_dates(world):

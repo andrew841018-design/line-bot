@@ -290,12 +290,11 @@ def election_quote(platform: str, bid: float, ask: float, *, fetched: float, res
 
 
 def seed_misc(store: market_store.Store) -> None:
-    """market_pipeline_misc 的格式：宏觀一格一筆、BTC 走 Coinbase、新聞是 obs、川普是累積的貼文＋摘要。"""
+    """market_pipeline_misc 的格式：宏觀一格一筆（BTC 也是，2026-10-23 拿掉 Coinbase）、新聞是 obs、川普是累積的貼文＋摘要。"""
     store.put_obs("macro.DXY", macro_payload(99.4, 0.3, "Yahoo", "DX-Y.NYB"), data_date="2026-10-16")
     store.put_obs("macro.WTI", macro_payload(71.5, -0.5, "ETF 代理：USO", "USO"), data_date="2026-10-16")
     store.put_obs("macro.USDTWD", macro_payload(32.338, 0.138, "代理：期交所匯率", "USD/NTD"), data_date="2026-10-16")
-    store.put_obs("macro.BTC", {"value": 81_471.0, "chg": None, "chg_pct": None, "source": "Coinbase",
-                                "fetched_utc": iso(NOW - 900)}, data_date="2026-10-17")
+    store.put_obs("macro.BTC", macro_payload(81_471.0, 120.0, "Yahoo", "BTC-USD"), data_date="2026-10-16")
     published = NOW - 3600
     for key, title in (("us", "美股收高 科技股領漲"), ("tw", "台股量縮整理"), ("iran", "伊朗局勢")):
         items = [{"title": title, "source": "某報", "published_utc": iso(published)},
@@ -351,7 +350,12 @@ class World:
 
 
 @pytest.fixture
-def world(tmp_path):
+def world(tmp_path, monkeypatch):
+    """預測市場在正式環境是封鎖的（market_sources_misc.PREDICTION_MARKETS_BLOCKED）；這裡預設關掉，才測得到報價怎麼組，
+    封鎖的情形在 test_election_row_says_blocked… 另外測（端對端測試用正式的預設）。"""
+    import market_sources_misc
+
+    monkeypatch.setattr(market_sources_misc, "PREDICTION_MARKETS_BLOCKED", False)
     w = World(tmp_path)
     yield w
     w.close()
@@ -472,7 +476,7 @@ def test_daily_rows_expire_after_four_sessions(world):
     assert rows["us.cftc.nq"]["stale_after"] == at_tpe(2026, 10, 29)  # 報告日 10/13＋16 天
     assert rows["us.margin"]["stale_after"] == at_tpe(2026, 12, 1)  # 9/30（月底）＋62 天
     assert rows["us.13f.QQQ"]["stale_after"] == at_tpe(2026, 12, 2)  # 申報期間眾數 6/30＋155 天
-    assert rows["macro.BTC"]["stale_after"] == NOW - 900 + 6 * 3600  # 抓取＋6 小時
+    assert rows["macro.BTC"]["stale_after"] == at_et(2026, 10, 22, 16, 0)  # 2026-10-23 起和其他宏觀日線一樣（原本 Coinbase 抓取＋6 小時）
     assert rows["season.now"]["stale_after"] == at_tpe(2026, 11, 1)  # 這個月的統計：到月底
     # 倒數到美東午夜才變；報價抓取＋6 小時比較早，取小的
     assert rows["election"]["stale_after"] == min(datetime(2026, 10, 18, tzinfo=ET).timestamp(), NOW - 600 + 6 * 3600)
@@ -877,14 +881,59 @@ def test_stale_prediction_quotes_are_left_out(world):
     assert values["quotes"] == [] and values["state"] == "before"
 
 
-def test_btc_falls_back_to_yahoo_only_when_coinbase_is_stale(world):
-    world.store.put_obs("macro.BTC.yahoo", macro_payload(80_000.0, 500.0, "Yahoo", "BTC-USD"), data_date="2026-10-16")
+def test_btc_is_a_daily_macro_row_from_yahoo_or_the_ibit_proxy(world):
+    """2026-10-23：Coinbase 拿掉，BTC 和其他宏觀格一樣——Yahoo 的 BTC-USD，沒有就是 IBIT 代理（source 寫「ETF 代理：IBIT」）。"""
     world.publish()
-    assert world.snapshot()["rows"]["macro.BTC"]["values"]["source"] == "Coinbase"
-    world.publish(now=NOW + 7 * 3600)  # Coinbase 抓取超過 6 小時
     row = world.snapshot()["rows"]["macro.BTC"]
-    assert row["values"]["source"] == "Yahoo" and row["values"]["value"] == 80_000.0
-    assert row["stale_after"] == at_et(2026, 10, 22, 16, 0)
+    assert row["values"]["source"] == "Yahoo" and row["values"]["value"] == 81_471.0 and row["basis"] == "日收盤"
+    assert row["data_date"] == "2026-10-16" and row["stale_after"] == at_et(2026, 10, 22, 16, 0)
+    world.store.put_obs("macro.BTC", macro_payload(46.06, -1.78, "ETF 代理：IBIT", "IBIT"), data_date="2026-10-16")
+    world.publish()
+    row = world.snapshot()["rows"]["macro.BTC"]
+    assert row["state"] == "ok" and row["values"]["source"] == "ETF 代理：IBIT" and row["source"] == "ETF 代理：IBIT"
+    assert row["values"]["chg_pct"] == pytest.approx(-1.78 / 47.84 * 100)
+    import market_dashboard  # bot 端：代理只寫單日漲跌幅，不把 46.06 印成 BTC 價格
+
+    card = market_dashboard._macro_part(market_dashboard._Ctx(world.snapshot(), NOW), "BTC")
+    assert card[0] == "比特幣（IBIT 代理）" and card[2] == "單日 -3.72%"
+
+
+def test_an_old_coinbase_btc_payload_is_not_shown(world):
+    """舊的 Coinbase 那筆（沒有日線的 date）留在 obs 裡：不拿來頂替，BTC 暫缺，等新的宏觀任務寫進 macro.BTC。"""
+    world.store.put_obs("macro.BTC", {"value": 83_449.385, "chg": None, "chg_pct": None, "source": "Coinbase",
+                                      "fetched_utc": iso(NOW - 900)}, data_date="2026-10-17")
+    world.publish()
+    assert world.snapshot()["rows"]["macro.BTC"]["state"] == "never"
+
+
+def test_election_row_says_blocked_and_lists_no_quotes_while_the_markets_are_blocked(world, monkeypatch):
+    """2026-10-23：Polymarket、Kalshi 在台灣被封鎖。選舉列寫 blocked＝True、不放報價（也不拿封鎖前最後一次的報價頂替），
+    bot 才分得出「被封鎖」和「資料暫缺」；倒數照算。解除封鎖後恢復列報價。"""
+    import market_sources_misc
+
+    monkeypatch.setattr(market_sources_misc, "PREDICTION_MARKETS_BLOCKED", True)
+    world.publish()  # seed 裡四個市場 10 分鐘前才抓過、都還新鮮
+    row = world.snapshot()["rows"]["election"]
+    values = row["values"]
+    assert row["state"] == "ok" and market_calc.row_ok("election", row)
+    assert values["blocked"] is True and values["quotes"] == [] and values["state"] == "before" and values["days_left"] == 17
+    assert row["stale_after"] == datetime(2026, 10, 18, tzinfo=ET).timestamp()  # 倒數到美東午夜才變
+    monkeypatch.setattr(market_sources_misc, "PREDICTION_MARKETS_BLOCKED", False)
+    world.publish()
+    values = world.snapshot()["rows"]["election"]["values"]
+    assert values["blocked"] is False and len(values["quotes"]) == 4
+
+
+def test_a_settled_quote_from_before_the_block_is_not_shown_while_blocked(world, monkeypatch):
+    import market_sources_misc
+
+    monkeypatch.setattr(market_sources_misc, "PREDICTION_MARKETS_BLOCKED", True)
+    first = at_tpe(2026, 11, 10, 12, 0)
+    world.store.put_obs("election.polymarket.house", election_quote("polymarket", 0.99, 0.995, fetched=first - 3600, result="Yes"),
+                        data_date="2026-11-10")
+    world.publish(now=first)
+    values = world.snapshot()["rows"]["election"]["values"]
+    assert values["blocked"] is True and values["quotes"] == [] and values["state"] == "waiting"
 
 
 def test_events_keep_fomc_when_earnings_crowd_the_list(world):
@@ -979,7 +1028,8 @@ def test_misc_keys_match_the_misc_pipeline():
     import market_sources_misc as sources
 
     assert market_publish.OBS_MACRO.format("") == misc.OBS_MACRO_PREFIX
-    assert (market_publish.OBS_BTC, market_publish.OBS_BTC_YAHOO) == (misc.OBS_BTC, misc.OBS_BTC_YAHOO)
+    assert market_publish.OBS_MACRO.format("BTC") == misc._macro_obs("BTC")  # 2026-10-23：BTC 和其他宏觀格同一條路
+    assert not hasattr(market_publish, "OBS_BTC") and not hasattr(misc, "OBS_BTC")
     assert market_publish.OBS_NEWS.format("") == misc.OBS_NEWS_PREFIX
     assert {f"news.{key}" for key in misc.NEWS_TOPICS} == {r for r in market_calc.ROW_IDS if r.startswith("news.")}
     assert (market_publish.OBS_TRUMP_SUMMARY, market_publish.POSTS_TRUMP) == (misc.OBS_TRUMP_SUMMARY, misc.POSTS_TRUMP)

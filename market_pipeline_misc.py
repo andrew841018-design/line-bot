@@ -1,5 +1,5 @@
-"""市場盤勢（/盤勢，2026-10-17）雜項的 collect 任務：宏觀（Yahoo 為主、失敗改代理）、BTC、新聞、川普原文、
-期中選舉預測市場。
+"""市場盤勢（/盤勢，2026-10-17）雜項的 collect 任務：宏觀（Yahoo 為主、失敗改代理，BTC 也在裡面）、新聞、
+川普原文、期中選舉預測市場（2026-10-23 起台灣封鎖，不抓）。
 
 Andrew 2026-10-17 的要求（DECISIONS.md）：宏觀「有 yahoo 用 yahoo，沒有的情況改代理」；川普／伊朗事件、
 季節性、期中選舉「你再試試看，truth social or....，我覺得可以做到」——能程式化的都做進來。這個模組只負責
@@ -7,12 +7,13 @@ Andrew 2026-10-17 的要求（DECISIONS.md）：宏觀「有 yahoo 用 yahoo，�
 
 規則（PLAN §3.1、§3.3、§9、§18.8、§18.9、§18.14、§19.1、§19.2；INTERFACES §3 C、§9）：
 - 宏觀：D＝最近一個美東收盤＋30 分鐘已過的交易日；Yahoo spark 每個 D 只打 1 次（不重打）。Yahoo 失敗、
-  429、冷卻 → 代理：美元 UUP、WTI USO、Brent BNO、金 GLD、銀 SLV、羅素 2000 IWM、道瓊 DIA、Nasdaq 綜合
-  ONEQ（Nasdaq ETF 日線）、台幣＝期交所 USD/NTD（market_pipeline_tw 每天抓的 `tw.fx`，沒有才自己抓；標「代理：期交所匯率」）；
-  MOVE 只有 Yahoo（失敗就記失敗、留著舊值）；BTC 的主來源本來就是 Coinbase 每 2 小時（§18.9），Yahoo 的 BTC
-  只是備援（另存 `macro.BTC.yahoo`）。Yahoo 只少了某幾個代號時，只有那幾個改代理。每格存實際來源字樣
-  （「Yahoo」「ETF 代理：UUP」「期交所匯率」）。所有日線丟掉晚於 D 的列；代理回應沒有 D 那根就 30 分鐘後
-  再抓一次。日變化只在前一筆的日期＝前一個交易日時才算（§18.8）。
+  429、冷卻 → 代理：美元 UUP、WTI USO、Brent BNO、金 GLD、銀 SLV、BTC IBIT（現貨比特幣 ETF）、羅素 2000 IWM、
+  道瓊 DIA、Nasdaq 綜合 ONEQ（Nasdaq ETF 日線）、台幣＝期交所 USD/NTD（market_pipeline_tw 每天抓的 `tw.fx`，
+  沒有才自己抓；標「代理：期交所匯率」）；MOVE 只有 Yahoo（失敗就記失敗、留著舊值）。Yahoo 只少了某幾個代號時，
+  只有那幾個改代理。每格存實際來源字樣（「Yahoo」「ETF 代理：UUP」「期交所匯率」）。所有日線丟掉晚於 D 的列；
+  代理回應沒有 D 那根就 30 分鐘後再抓一次。日變化只在前一筆的日期＝前一個交易日時才算（§18.8）。
+  BTC（2026-10-23）和其他格一樣走這條路、存 `macro.BTC`：原本 Coinbase 每 2 小時那條（§18.9、macro.btc 任務）
+  拿掉了，因為 api.coinbase.com 在台灣被封鎖。
 - 新聞：Google News RSS 美股、台股每 30 分鐘，伊朗每小時；pubDate 超過 36 小時、解析不到或在未來的不列；
   news.google.com 回 503 也算限流（market_http 會讓該主機冷卻 2 小時），冷卻期間不排。
 - 川普原文：trumpstruth RSS 每 30 分鐘，依 originalId 累積進 Store（移除的也寫回去，之前累積到的那則才
@@ -20,7 +21,8 @@ Andrew 2026-10-17 的要求（DECISIONS.md）：宏觀「有 yahoo 用 yahoo，�
   涵蓋不到 48 小時 → 標「（至少）」（§18.14）。最舊與最新一則套和 parse 一樣的時間界線（2026-10-23）：
   未來的 item 不算、比視窗舊的只當「這份 feed 涵蓋到視窗之前」。
 - 期中選舉：market_sources_misc.PREDICTION_MARKETS 裡固定的市場（Polymarket、Kalshi 的眾院與參院）各一個任務、
-  每 2 小時；結果出來後每天看一次、顯示 7 天後不再抓。
+  每 2 小時；結果出來後每天看一次、顯示 7 天後不再抓。2026-10-23 起台灣封鎖這兩個網站：
+  market_sources_misc.PREDICTION_MARKETS_BLOCKED 為真時這些任務永遠不到期（一個請求都不送）。
 - 外部字串（標題、來源名、川普摘錄、預測市場名稱）存之前一律再過 `market_calc.clean_external`。
 
 obs 鍵（market_publish 讀；payload 全是 JSON 值、日期一律 ISO 字串）見下方 `OBS_*` 常數。
@@ -39,10 +41,8 @@ import market_tasks
 UTC = timezone.utc
 
 # ── 存放位置（market_publish 讀這些名字；要改兩邊一起改） ─────────────────────────────────
-OBS_MACRO_PREFIX = "macro."  # ＋DXY／WTI／BRENT／GOLD／SILVER／RUT／DJI／IXIC／MOVE／USDTWD：
+OBS_MACRO_PREFIX = "macro."  # ＋DXY／WTI／BRENT／GOLD／SILVER／BTC／RUT／DJI／IXIC／MOVE／USDTWD：
 #   {"value","chg"|None,"chg_pct"|None,"date","prev_date"|None,"source","symbol","bars": [[iso, 收盤], …]}
-OBS_BTC = "macro.BTC"  # Coinbase 每 2 小時：{"value","source":"Coinbase","fetched_utc"}
-OBS_BTC_YAHOO = "macro.BTC.yahoo"  # Yahoo 的 BTC 日線（只當備援），格式同其他 macro
 OBS_NEWS_PREFIX = "news."  # ＋us／tw／iran：{"items": [{"title","source","published_utc"}],"fetched_utc"}
 OBS_TRUMP_SUMMARY = "trump.summary"  # {"window_h","topics": {代號: 則數},"labels","posts","matched","latest_utc","at_least"}
 OBS_TRUMP_POSTS = "trump.posts"  # {"items": [{"id","published_utc","text","topics","quoted_author"}]}（細節頁）
@@ -51,11 +51,9 @@ POSTS_TRUMP = "trump"  # store.upsert_posts 的 kind
 
 SOURCE_FX = "代理：期交所匯率"  # Yahoo 的 TWD=X 拿不到時的代理（market_dashboard 看到「代理」就標「（代理）」）
 OBS_TW_FX = "tw.fx"  # market_pipeline_tw.OBS_FX（不 import 那個模組：只載入本模組時不該順便登記台股任務）
-MACRO_OBS_KEY = {"BTC": "BTC.yahoo"}  # Yahoo 代號鍵 → obs 鍵（BTC 的主格給 Coinbase）
 
 # ── 任務名稱與排程 ───────────────────────────────────────────────────────────────────
 TASK_MACRO = "macro.yahoo"
-TASK_BTC = "macro.btc"
 TASK_TRUMP = "trump.feed"
 NEWS_TOPICS = ("us", "tw", "iran")
 STATE_PREFIX = "misc.pipe:"
@@ -76,7 +74,7 @@ TRUMP_POSTS_KEEP = 20
 TRUMP_GAPS_KEEP = 20
 ELECTION_RESOLVED_EVERY_S = 86400.0
 ELECTION_SHOW_RESULT_S = 7 * 86400.0
-_DEFAULT_EVERY_S = {"coinbase_spot": 7200, "gnews.us": 1800, "gnews.tw": 1800, "gnews.iran": 3600, "trumpstruth": 1800}
+_DEFAULT_EVERY_S = {"gnews.us": 1800, "gnews.tw": 1800, "gnews.iran": 3600, "trumpstruth": 1800}
 _RATE_LIMIT_KINDS = frozenset({"rate_limited", "blocked"})
 
 
@@ -253,7 +251,7 @@ def macro_payload(bars: Any, d: date, cal: Any, source: str, symbol: str) -> Opt
 
 
 def _macro_obs(key: str) -> str:
-    return OBS_MACRO_PREFIX + MACRO_OBS_KEY.get(key, key)
+    return OBS_MACRO_PREFIX + key
 
 
 def macro_plan(ctx: Any) -> Optional[dict]:
@@ -264,7 +262,13 @@ def macro_plan(ctx: Any) -> Optional[dict]:
     state = _state(ctx.store, TASK_MACRO)
     if state.get("d") != d.isoformat():
         return {"d": d, "yahoo": True, "keys": []}
-    pending = state.get("pending") or {}
+    pending = {key: dict(info) for key, info in (state.get("pending") or {}).items() if isinstance(info, dict)}
+    # 2026-10-23：BTC 以前不走代理（主格是 Coinbase），部署時這個 D 的紀錄裡 BTC 既沒有來源、也不在 pending：
+    # 當成還沒試過，補抓一次（之後每個代理鍵一定是「有來源」或「在 pending」）
+    sources = state.get("sources") or {}
+    for key in _misc().PROXY_ETF:
+        if key not in sources and key not in pending:
+            pending[key] = {"tries": 0}
     ready = [
         key
         for key, info in sorted(pending.items())
@@ -330,11 +334,10 @@ def _run_proxies(ctx: Any, d: date, keys: list[str], state: dict) -> Optional[st
             return PARTIAL
         obs_id = _macro_obs(key)
         record = pending.get(key) or {"tries": 0}
-        if key == "MOVE" or key == "BTC":
-            # MOVE 沒有代理；BTC 的主格是 Coinbase 每 2 小時那筆（macro.BTC），這裡只記 Yahoo 備援失敗
+        if key == "MOVE":  # MOVE 沒有代理：只記 Yahoo 失敗、留著舊值（BTC 有 IBIT 代理，2026-10-23）
             ctx.store.obs_checked(obs_id, error_kind=_obs_kind(yahoo_kind))
             pending.pop(key, None)
-            missing = missing or key == "MOVE"
+            missing = True
             continue
         try:
             if key == "USDTWD":
@@ -398,25 +401,6 @@ def _usdtwd_proxy(ctx: Any, d: date) -> Optional[tuple[dict, date]]:
 
 def _macro_due(ctx: Any) -> bool:
     return macro_plan(ctx) is not None
-
-
-# ── BTC（Coinbase 每 2 小時） ─────────────────────────────────────────────────────────
-def _btc_due(ctx: Any) -> bool:
-    return interval_due(_state(ctx.store, TASK_BTC), float(ctx.now), _every("coinbase_spot"))
-
-
-def _btc_run(ctx: Any) -> Optional[str]:
-    value, status = _fetch_once(ctx, TASK_BTC, (OBS_BTC,), _misc().fetch_coinbase_spot)
-    if status is not None:
-        return status
-    price = _finite_positive(value)
-    if price is None:
-        ctx.store.obs_checked(OBS_BTC, error_kind="format")
-        return PARTIAL
-    now_utc = _now_utc(ctx)
-    payload = {"value": price, "chg": None, "chg_pct": None, "source": _misc().SOURCE_COINBASE, "fetched_utc": now_utc.isoformat()}
-    ctx.store.put_obs(OBS_BTC, payload, data_date=now_utc.date().isoformat())
-    return None
 
 
 # ── 新聞（Google News RSS） ─────────────────────────────────────────────────────────
@@ -593,11 +577,32 @@ def election_due(state: dict, now: float, every: float) -> bool:
     return interval_due(state, now, every)
 
 
+def _prediction_blocked() -> bool:
+    """market_sources_misc.PREDICTION_MARKETS_BLOCKED（2026-10-23：台灣封鎖 Polymarket、Kalshi）。
+    只有明確設成 False 才恢復抓取；設成別的值照樣封鎖，一個請求都不送。"""
+    return getattr(_misc(), "PREDICTION_MARKETS_BLOCKED", True) is not False
+
+
+def _retire_failures(ctx: Any, name: str) -> None:
+    """封鎖中的任務不再執行，框架留在 task_state 的連續失敗次數不會自己歸零，每日維護會天天把它當失敗報：
+    第一次看到封鎖時把失敗次數與退避時間清掉一次（只在有東西可清時才寫；清不掉不能讓這輪 collect 出錯）。"""
+    try:
+        state = dict(ctx.store.task_state(name) or {})
+        if state.get("fail_streak") or state.get("next_try") is not None:
+            state.update(fail_streak=0, next_try=None)
+            ctx.store.set_task_state(name, state)
+    except Exception:  # noqa: BLE001
+        return
+
+
 def _election_fns(market: Any) -> tuple[str, Callable[[Any], bool], Callable[[Any], Optional[str]]]:
     name = f"election.{market.key}"
     obs_id = OBS_ELECTION_PREFIX + market.key
 
     def due(ctx: Any) -> bool:
+        if _prediction_blocked():  # 封鎖中：任務留在清單裡，但永遠不到期（不送請求；主機也不在白名單）
+            _retire_failures(ctx, name)
+            return False
         return election_due(_state(ctx.store, name), float(ctx.now), _every_or(market.key, 7200))
 
     def run(ctx: Any) -> Optional[str]:
@@ -644,7 +649,6 @@ def tasks() -> list[market_tasks.Task]:
         due, run = _news_fns(topic)
         out.append(market_tasks.Task(f"news.{topic}", "fast", due, run, 8.0))
     out.append(market_tasks.Task(TASK_TRUMP, "fast", _trump_due, _trump_run, 10.0))
-    out.append(market_tasks.Task(TASK_BTC, "medium", _btc_due, _btc_run, 10.0))
     for market in _prediction_markets():
         name, due, run = _election_fns(market)
         out.append(market_tasks.Task(name, "medium", due, run, 10.0))

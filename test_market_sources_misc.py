@@ -168,7 +168,7 @@ def test_fetch_yahoo_spark_only_takes_the_fixed_symbols(symbols):
     assert http.calls == []
 
 
-# ── 代理：Nasdaq ETF 日線、Coinbase ─────────────────────────────────────────────
+# ── 代理：Nasdaq ETF 日線 ────────────────────────────────────────────────────────
 
 
 def test_proxy_bars_delegate_to_the_nasdaq_historical_fetcher():
@@ -238,43 +238,33 @@ def test_proxy_bars_validate_their_arguments():
 
 def test_proxy_tables_and_labels():
     assert set(msm.PROXY_ETF) <= set(msm.YAHOO_MACRO)
-    assert "MOVE" not in msm.PROXY_ETF and "BTC" not in msm.PROXY_ETF  # MOVE 沒有代理、BTC 改 Coinbase
+    assert "MOVE" not in msm.PROXY_ETF  # MOVE 沒有代理
     assert msm.proxy_source_label("UUP") == "ETF 代理：UUP"
     with pytest.raises(ValueError):
         msm.proxy_source_label("SPY")
 
 
-def test_parse_coinbase_spot():
-    assert msm.parse_coinbase_spot(b'{"data":{"amount":"81471.055","base":"BTC","currency":"USD"}}') == 81471.055
-    assert msm.parse_coinbase_spot({"data": {"amount": 81000, "base": "BTC", "currency": "USD"}}) == 81000.0
+def test_btc_proxy_is_the_ibit_etf_through_the_nasdaq_etf_endpoint():
+    """2026-10-23：Coinbase 在台灣被封鎖，BTC 沒有 Yahoo 時改用現貨比特幣 ETF 的 IBIT（和 GOLD→GLD 同一條路）。"""
+    assert msm.PROXY_ETF["BTC"] == "IBIT" and msm.YAHOO_MACRO["BTC"] == "BTC-USD"
+    assert msm.proxy_source_label("IBIT") == "ETF 代理：IBIT"
+    calls = []
+
+    def historical(symbol, start, end, **kwargs):
+        calls.append((symbol, kwargs["etf"]))
+        return [SimpleNamespace(date=date(2026, 10, 21), close=47.84), SimpleNamespace(date=date(2026, 10, 22), close=46.06)]
+
+    assert msm.fetch_proxy_bars("IBIT", date(2026, 10, 9), date(2026, 10, 22), historical=historical) == [
+        (date(2026, 10, 21), 47.84), (date(2026, 10, 22), 46.06)]
+    assert calls == [("IBIT", True)]
 
 
-@pytest.mark.parametrize(
-    ("payload", "kind"),
-    [
-        ({"data": {"base": "BTC", "currency": "USD"}}, "missing_field"),
-        ({"data": {"amount": "1", "currency": "USD"}}, "missing_field"),
-        ({"data": {"amount": "2500", "base": "ETH", "currency": "USD"}}, "conflict"),
-        ({"data": {"amount": "75000", "base": "BTC", "currency": "EUR"}}, "conflict"),
-        ({"data": {"amount": "abc", "base": "BTC", "currency": "USD"}}, "format"),
-        ({"data": {"amount": "0", "base": "BTC", "currency": "USD"}}, "format"),
-        ({"data": {"amount": "-5", "base": "BTC", "currency": "USD"}}, "format"),
-        ({"data": {"amount": True, "base": "BTC", "currency": "USD"}}, "format"),
-        ({"data": "81471"}, "format"),
-        ([], "format"),
-    ],
-)
-def test_parse_coinbase_spot_errors(payload, kind):
-    with pytest.raises(msm.ParseError) as excinfo:
-        msm.parse_coinbase_spot(payload)
-    assert _kind(excinfo) == kind
-
-
-def test_fetch_coinbase_spot_request():
-    http = FakeHTTP('{"data":{"amount":"81471.055","base":"BTC","currency":"USD"}}')
-    assert msm.fetch_coinbase_spot(http=http) == 81471.055
-    assert http.calls[0]["url"] == "https://api.coinbase.com/v2/prices/BTC-USD/spot"
-    assert http.calls[0]["accept"] == ("json",)
+def test_coinbase_is_gone_as_a_source():
+    """api.coinbase.com 在台灣被封鎖（2026-10-23）：抓取、解析、端點、網址都拿掉，不留一條會失敗的路。"""
+    for name in ("fetch_coinbase_spot", "parse_coinbase_spot", "COINBASE_SPOT_URL", "SOURCE_COINBASE"):
+        assert not hasattr(msm, name), name
+    assert "coinbase_spot" not in msm.ENDPOINTS
+    assert all("coinbase" not in endpoint.host for endpoint in msm.ENDPOINTS.values())
 
 
 # ── Google News RSS ──────────────────────────────────────────────────────────
@@ -1041,32 +1031,43 @@ def test_prediction_market_table_is_fixed():
     assert all(m.key in msm.ENDPOINTS and m.expect_outcome == "Democratic Party" for m in msm.PREDICTION_MARKETS)
 
 
+def test_prediction_markets_are_blocked_but_parsers_and_tables_stay():
+    """2026-10-23：Polymarket、Kalshi 在台灣被封鎖：job 不抓（PREDICTION_MARKETS_BLOCKED），主機不在白名單；
+    解析函式、固定市場表、端點表都留著，之後換來源或解除封鎖時不用重寫。"""
+    market_http = pytest.importorskip("market_http")
+    assert msm.PREDICTION_MARKETS_BLOCKED is True
+    assert callable(msm.parse_polymarket_event) and callable(msm.parse_kalshi_markets) and callable(msm.fetch_prediction_quote)
+    assert {m.platform for m in msm.PREDICTION_MARKETS} == {"polymarket", "kalshi"}
+    for market in msm.PREDICTION_MARKETS:
+        assert msm.ENDPOINTS[market.key].host not in market_http.ALLOWED_HOSTS, market.key
+
+
 # ── 端點表 ───────────────────────────────────────────────────────────────────
 
 
 def test_endpoint_table_contract():
     market_http = pytest.importorskip("market_http")
+    blocked = {market.key for market in msm.PREDICTION_MARKETS}  # 封鎖中：端點表留著，但主機不在白名單（不繞過封鎖）
     for name, endpoint in msm.ENDPOINTS.items():
-        assert endpoint.host in market_http.ALLOWED_HOSTS, name
+        assert (endpoint.host in market_http.ALLOWED_HOSTS) == (name not in blocked), name
         assert endpoint.max_bytes > 0 and endpoint.per_day >= 1 and endpoint.retry_per_day >= 0
         expected_accept = ("xml",) if name.startswith("gnews.") or name == "trumpstruth" else ("json",)
         assert endpoint.accept == expected_accept, name
     for url, name in [
         (msm.TRUMPSTRUTH_URL, "trumpstruth"),
-        (msm.COINBASE_SPOT_URL, "coinbase_spot"),
         (msm.YAHOO_SPARK_URL, "yahoo_spark"),
         (msm.GOOGLE_NEWS_URL, "gnews.us"),
         (msm.POLYMARKET_EVENT_URL, "polymarket.house"),
         (msm.KALSHI_MARKETS_URL, "kalshi.house"),
     ]:
         assert url.startswith(f"https://{msm.ENDPOINTS[name].host}/"), name
-        assert market_http.host_of(url.replace("{", "").replace("}", "")) == msm.ENDPOINTS[name].host
+        host = market_http.host_of(url.replace("{", "").replace("}", ""))
+        assert host == (None if name in blocked else msm.ENDPOINTS[name].host), name
 
 
 def test_endpoint_daily_budgets_match_the_plan():
     per_day = {name: endpoint.per_day for name, endpoint in msm.ENDPOINTS.items()}
     assert per_day["yahoo_spark"] == 1 and msm.ENDPOINTS["yahoo_spark"].retry_per_day == 0
-    assert per_day["coinbase_spot"] == 12  # PLAN §18.9：每 2 小時
     assert per_day["gnews.us"] + per_day["gnews.tw"] + per_day["gnews.iran"] == 48 + 48 + 24  # §19.2：伊朗一小時
     assert per_day["trumpstruth"] == 48
     assert per_day["polymarket.house"] == per_day["kalshi.house"] == 12
@@ -1161,7 +1162,7 @@ def test_shared_parse_error_and_cleaner():
 
 def test_parse_error_kind_is_an_enum_value():
     with pytest.raises(msm.ParseError) as excinfo:
-        msm.parse_coinbase_spot([])
+        msm.parse_kalshi_markets([], "CONTROLH-2026-D")
     assert isinstance(excinfo.value, ValueError)
     assert excinfo.value.kind in msm.PARSE_ERROR_KINDS
     assert str(excinfo.value) == excinfo.value.kind  # 訊息只有種類，不帶回應內容

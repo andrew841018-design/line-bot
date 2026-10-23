@@ -200,7 +200,7 @@ def make_snapshot(now: float = NOW) -> dict:
                             "taiex": _stats(55.0, 0.5, 0.8, 27), "taiex_q4": _stats(60.0, 2.0, 2.5, 26),
                             "taiex_midterm": _stats(57.0, 0.7, 0.9, 7) if midterm else None,
                             "taiex_pending": False}, now, today),
-        "election": _row({"vote_date": "2026-11-03", "days_left": 17, "state": "upcoming", "quotes": [
+        "election": _row({"vote_date": "2026-11-03", "days_left": 17, "state": "upcoming", "blocked": False, "quotes": [
             {"platform": "polymarket", "chamber": "house", "outcome": "Yes", "mid": 0.905, "last": 0.91,
              "updated_utc": now - 1800, "result": None},  # job 一律寫 result（yes／no／None）
             {"platform": "kalshi", "chamber": "house", "outcome": "Yes", "mid": 0.9015, "last": 0.902,
@@ -1293,6 +1293,28 @@ def test_clip_never_prints_half_a_number(md):
     assert md._clip("名稱" * 13) == "名稱" * 11 + "名…"
 
 
+def test_btc_from_the_ibit_proxy_shows_the_daily_change_only(md, paths):
+    """2026-10-23：Coinbase 被台灣封鎖，BTC 沒有 Yahoo 時用 IBIT 代理（和 GOLD→GLD 同一個寫法）：只寫單日漲跌幅，
+    不把 ETF 股價 46.06 印成比特幣價格。摘要列放不下 ticker 就先拿掉，細節卡有完整的「（IBIT 代理）」。"""
+    snap = make_snapshot(NOW)
+    snap["rows"]["macro.BTC"]["values"] = {"value": 46.06, "chg": -1.78, "chg_pct": -3.7207, "source": "ETF 代理：IBIT"}
+    summary, detail = _macro_rows(md, paths, snap)
+    assert summary[2] == "黃金 2,650、比特幣（代理）單日 -3.72%" and md.row_width(summary[2]) <= 24
+    assert "比特幣（IBIT 代理）：單日 -3.72%｜10/16" in detail
+    for body, reply in render_all(md, paths, NOW).items():
+        assert not any("46.06" in value for value in reply_strings(reply)), body
+    # 黃金也是代理：兩個代理並排放不下全名，短寫法的數字一樣完整
+    snap["rows"]["macro.GOLD"]["values"] = {"value": 378.95, "chg": 1.3, "chg_pct": 0.34, "source": "ETF 代理：GLD"}
+    summary, detail = _macro_rows(md, paths, snap)
+    assert summary[2] == "黃金代理 +0.34%、比特幣代理 -3.72%" and md.row_width(summary[2]) <= 24
+    assert "黃金（GLD 代理）：單日 +0.34%｜10/16" in detail and "比特幣（IBIT 代理）：單日 -3.72%｜10/16" in detail
+    assert_main_gate(md.handle("", now=NOW, paths=paths))
+    # 沒有日漲跌幅就明說沒有
+    snap["rows"]["macro.BTC"]["values"]["chg_pct"] = None
+    summary, detail = _macro_rows(md, paths, snap)
+    assert "比特幣（IBIT 代理）：暫無漲跌幅｜10/16" in detail and not any("46.06" in t for t in summary + detail)
+
+
 def test_taifex_fx_proxy_keeps_its_value_and_says_who_it_is(md, paths):
     snap = make_snapshot(NOW)
     snap["rows"]["macro.USDTWD"]["values"]["source"] = "代理：期交所匯率"  # market_pipeline_misc.SOURCE_FX
@@ -1472,6 +1494,74 @@ def test_election_quote_without_a_mid_still_shows_the_last_trade(md, paths):
     assert "市場更新 11/7 00:50" in found and market_calc.TEXT_KALSHI_TIME in found
     assert not any(t.endswith("：暫缺") for t in found)
     assert "期中選舉：已投票，等待結果" in texts(md.handle("", now=now, paths=paths).flex["contents"][3]["body"])
+
+
+def _blocked_snapshot(now):
+    snap = make_snapshot(now)
+    snap["rows"]["election"]["values"].update(blocked=True, quotes=[])  # market_publish 在封鎖時寫的樣子
+    return snap
+
+
+@pytest.mark.parametrize("day", [(10, 24), (10, 25), (11, 2)])
+def test_election_summary_line_says_the_markets_are_blocked_and_keeps_the_countdown(md, paths, day):
+    """2026-10-23：Polymarket、Kalshi 被台灣封鎖。摘要列照寫「期中選舉還有 N 天」，後面接固定句，不寫成「暫缺」。"""
+    now = datetime(2026, *day, 12, tzinfo=ET).timestamp()
+    write_snapshot(paths, _blocked_snapshot(now))
+    reply = md.handle("", now=now, paths=paths)
+    assert_main_gate(reply)
+    line = texts(reply.flex["contents"][3]["body"])[4]
+    days = (date(2026, 11, 3) - date(2026, *day)).days
+    assert line == f"期中選舉還有 {days} 天，預測市場：台灣已封鎖" and md.row_width(line) <= 24
+    assert "暫缺" not in line
+    assert len(reply.flex["contents"][3]["body"]["contents"]) == 6  # 摘要卡的列數不增加
+
+
+def test_election_detail_says_the_markets_are_blocked_instead_of_missing(md, paths):
+    write_snapshot(paths, _blocked_snapshot(NOW))
+    detail = md.handle(" 選舉", now=NOW, paths=paths)
+    assert_main_gate(detail)
+    found = texts(detail.flex)
+    assert "投票日 11/3（美東），還有 17 天" in found  # 倒數照寫
+    assert "預測市場：台灣已封鎖這些網站，暫不提供" in found and md.TEXT_PREDICTION_BLOCKED in found
+    assert market_calc.TEXT_POLL_NONE in found
+    assert not any("暫缺" in t or "Polymarket" in t or "Kalshi" in t for t in found)
+    assert market_calc.TEXT_ELECTION_NOTE not in found  # 沒有報價可印，「兩平台結算規則不同」那句也不放
+    assert "時間為台北時間" not in found
+
+
+def test_election_after_the_vote_still_says_the_markets_are_blocked(md, paths):
+    now = datetime(2026, 11, 8, 12, tzinfo=ET).timestamp()
+    snap = _blocked_snapshot(now)
+    snap["rows"]["election"]["values"]["state"] = "waiting"
+    write_snapshot(paths, snap)
+    detail = texts(md.handle(" 選舉", now=now, paths=paths).flex)
+    assert "已投票，等待結果" in detail and md.TEXT_PREDICTION_BLOCKED in detail
+
+
+def test_missing_prediction_data_is_missing_unless_the_row_says_blocked(md, paths):
+    """「被封鎖」只在選舉列寫 blocked＝true 時才說；沒寫、寫成別的值、或列過期，都照舊當資料暫缺／過期。"""
+    for extra in ({"blocked": False}, {}, {"blocked": "yes"}, {"blocked": 1}):
+        snap = make_snapshot(NOW)
+        values = snap["rows"]["election"]["values"]
+        values.pop("blocked", None)
+        values.update(quotes=[], **extra)
+        write_snapshot(paths, snap)
+        rows = texts(md.handle("", now=NOW, paths=paths).flex["contents"][3]["body"])
+        assert rows[4] == "期中選舉還有 17 天，預測市場暫缺", extra
+        detail = texts(md.handle(" 選舉", now=NOW, paths=paths).flex)
+        assert "預測市場：暫缺" in detail and md.TEXT_PREDICTION_BLOCKED not in detail, extra
+    snap = _blocked_snapshot(NOW)
+    snap["rows"]["election"]["stale_after"] = NOW - 1  # 列過期：不知道現在有沒有被封鎖
+    write_snapshot(paths, snap)
+    assert texts(md.handle("", now=NOW, paths=paths).flex["contents"][3]["body"])[4] == "期中選舉還有 17 天，預測市場暫缺"
+    assert md.TEXT_PREDICTION_BLOCKED not in texts(md.handle(" 選舉", now=NOW, paths=paths).flex)
+
+
+def test_blocked_sentences_are_fixed_words_that_pass_the_gate(md):
+    for text in (md.TEXT_PREDICTION_BLOCKED, md.TEXT_PREDICTION_BLOCKED_SHORT):
+        assert not md.has_forbidden(text) and not re.search(r"\d", text)
+    assert md.TEXT_PREDICTION_BLOCKED_SHORT in md.TEXT_PREDICTION_BLOCKED
+    assert md.row_width(md.TEXT_PREDICTION_BLOCKED) <= 24
 
 
 def test_pe_rows_say_why_a_company_has_no_pe(md, paths):

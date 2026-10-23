@@ -1,6 +1,6 @@
 """market_pipeline_misc（/盤勢 宏觀、BTC、新聞、川普、選舉的 collect 任務，2026-10-17）的測試：假的 http、
-暫存的 Store、固定的日曆、注入的時間。測的是：Yahoo 每個 D 一次、失敗改代理且每格標來源、≤D、代理沒有 D 那根
-30 分鐘後重抓、BTC 每 2 小時、新聞 36 小時與 503 冷卻、川普依 originalId 累積與「（至少）」、預測市場的間隔。"""
+暫存的 Store、固定的日曆、注入的時間。測的是：Yahoo 每個 D 一次、失敗改代理且每格標來源（BTC 是 IBIT）、≤D、代理沒有 D 那根
+30 分鐘後重抓、新聞 36 小時與 503 冷卻、川普依 originalId 累積與「（至少）」、預測市場的間隔（封鎖中永遠不到期）。"""
 
 from __future__ import annotations
 
@@ -29,7 +29,10 @@ YAHOO = {
     "DXY": "DX-Y.NYB", "WTI": "CL=F", "BRENT": "BZ=F", "GOLD": "GC=F", "SILVER": "SI=F", "BTC": "BTC-USD",
     "USDTWD": "TWD=X", "RUT": "^RUT", "DJI": "^DJI", "IXIC": "^IXIC", "MOVE": "^MOVE",
 }
-PROXIES = {"DXY": "UUP", "WTI": "USO", "BRENT": "BNO", "GOLD": "GLD", "SILVER": "SLV", "RUT": "IWM", "DJI": "DIA", "IXIC": "ONEQ"}
+PROXIES = {
+    "DXY": "UUP", "WTI": "USO", "BRENT": "BNO", "GOLD": "GLD", "SILVER": "SLV", "BTC": "IBIT", "RUT": "IWM", "DJI": "DIA",
+    "IXIC": "ONEQ",
+}
 WEEK = [date(2026, 10, 12), date(2026, 10, 13), date(2026, 10, 14), date(2026, 10, 15)]
 D = date(2026, 10, 15)  # 週四；台北週五 07:00＝美東週四 19:00，週四收盤＋30 分鐘已過
 NOW_AFTER_D = datetime(2026, 10, 16, 7, 0, tzinfo=TPE).timestamp()
@@ -208,8 +211,9 @@ def test_tasks_and_groups():
     assert {"election.polymarket.house", "election.kalshi.house"} <= set(elections)  # 每個固定市場一個任務
     assert groups == {
         "news.us": "fast", "news.tw": "fast", "news.iran": "fast", "trump.feed": "fast",
-        "macro.btc": "medium", "macro.yahoo": "core", **elections,
+        "macro.yahoo": "core", **elections,
     }
+    assert "macro.btc" not in groups  # 2026-10-23：Coinbase 那條拿掉，BTC 走宏觀（Yahoo 或 IBIT 代理）
 
 
 # ── 宏觀：Yahoo 為主 ─────────────────────────────────────────────────────────────────
@@ -230,8 +234,9 @@ def test_yahoo_once_per_d_keeps_rows_up_to_d_with_yahoo_labels(env):
     assert wti["value"] == 81.5 and wti["date"] == "2026-10-15" and all(day <= "2026-10-15" for day, _ in wti["bars"])
     rut = payload(env, "macro.RUT")
     assert rut["value"] == 2450.0 and rut["chg"] is None and rut["prev_date"] is None
-    assert payload(env, "macro.BTC.yahoo")["source"] == "Yahoo"  # Yahoo 的 BTC 只當備援
-    assert env.store.get_obs("macro.BTC") is None  # 主格是 Coinbase 那筆
+    btc = payload(env, "macro.BTC")  # 2026-10-23：BTC 和其他格一樣，Yahoo 的 BTC-USD 就是主格
+    assert btc["source"] == "Yahoo" and btc["symbol"] == "BTC-USD" and btc["value"] == 16.5
+    assert env.store.get_obs("macro.BTC.yahoo") is None  # 舊的備援鍵不再寫
     assert env.store.get_obs("macro.DXY")["data_date"] == "2026-10-15"
     # 同一個 D 不再打；下一個 D（週五收盤後）才再打一次
     assert run(make_ctx(env, NOW_AFTER_D + 3600), "macro.yahoo") == "not_due"
@@ -247,8 +252,8 @@ def test_yahoo_failure_switches_to_proxies_and_labels_each_value(env):
     )
     ctx = make_ctx(env, NOW_AFTER_D)
     assert run(ctx, "macro.yahoo") == "partial"  # MOVE 沒有代理
-    assert env.http.count("api.nasdaq.com") == 8
-    assert env.http.count("coinbase") == 0 and env.http.count("taifex") == 0  # BTC 有自己的 2 小時任務、台幣讀 tw.fx
+    assert env.http.count("api.nasdaq.com") == len(PROXIES) == 9  # 8 個 ETF 代理＋BTC 的 IBIT
+    assert env.http.count("coinbase") == 0 and env.http.count("taifex") == 0  # Coinbase 拿掉了、台幣讀 tw.fx
     for key, etf in PROXIES.items():
         item = payload(env, f"macro.{key}")
         assert item["source"] == f"ETF 代理：{etf}" and item["symbol"] == etf
@@ -262,7 +267,6 @@ def test_yahoo_failure_switches_to_proxies_and_labels_each_value(env):
     assert usd["chg"] == pytest.approx(0.038)  # 10/14 是 10/15 的前一個台股交易日
     move = env.store.get_obs("macro.MOVE")
     assert move["payload"] is None and move["error"] == "rate_limited" and move["fail_streak"] == 1
-    assert env.store.get_obs("macro.BTC.yahoo")["error"] == "rate_limited"
     # 全部代理都拿到 D：同一個 D 不再排
     assert misc.macro_plan(make_ctx(env, NOW_AFTER_D + 3 * 3600)) is None
 
@@ -331,24 +335,45 @@ def test_macro_payload_rules():
     assert item["chg"] is None  # 前一筆不是前一個交易日（10/14）
 
 
-# ── BTC：Coinbase 每 2 小時 ──────────────────────────────────────────────────────────
-def test_coinbase_btc_every_two_hours_and_retry_after_failure(env):
-    answer = {"value": {"data": {"amount": "81471.055", "base": "BTC", "currency": "USD"}}}
-    env.http.route("api.coinbase.com", lambda url: answer["value"])
-    t0 = at(2026, 10, 16, 10, 0)
-    assert run(make_ctx(env, t0), "macro.btc") == "ok"
-    btc = env.store.get_obs("macro.BTC")
-    assert btc["payload"]["value"] == 81471.055 and btc["payload"]["source"] == "Coinbase"
-    assert btc["payload"]["fetched_utc"].startswith("2026-10-16T02:00")
-    assert run(make_ctx(env, t0 + 7199), "macro.btc") == "not_due"
-    answer["value"] = market_http.FetchError("timeout")
-    assert run(make_ctx(env, t0 + 7200), "macro.btc") == "timeout"
-    assert env.store.get_obs("macro.BTC")["payload"]["value"] == 81471.055  # 舊值留著
-    answer["value"] = {"data": {"amount": "82000", "base": "BTC", "currency": "USD"}}
-    assert run(make_ctx(env, t0 + 7200 + 899), "macro.btc") == "backoff"  # 框架退避 15 分鐘
-    assert run(make_ctx(env, t0 + 7200 + 1799), "macro.btc") == "not_due"  # 失敗後自己等 30 分鐘
-    assert run(make_ctx(env, t0 + 7200 + 1800), "macro.btc") == "ok"
-    assert env.store.get_obs("macro.BTC")["payload"]["value"] == 82000.0
+# ── BTC：和其他宏觀格一樣（Yahoo，沒有就用 IBIT 代理；2026-10-23 拿掉 Coinbase） ─────────────────────────────
+def test_btc_uses_the_ibit_proxy_when_yahoo_fails_and_the_card_says_so(env):
+    """Coinbase 在台灣被封鎖，Yahoo 又常回 429：BTC 改用現貨比特幣 ETF 的 IBIT（和 GOLD→GLD 同一條路）。
+    存的值是 ETF 股價，卡上只能寫單日漲跌幅，不能把它印成 BTC 價格。"""
+    env.http.route("finance.yahoo.com", market_http.FetchError("rate_limited"))
+    route_proxies(env, lambda etf: [(date(2026, 10, 14), 47.84), (D, 46.06)] if etf == "IBIT" else full_week(20.0))
+    env.store.put_obs(tw.OBS_FX, {"date": "2026-10-15", "usd_ntd": 32.3}, data_date="2026-10-15")
+    assert run(make_ctx(env, NOW_AFTER_D), "macro.yahoo") == "partial"
+    btc = payload(env, "macro.BTC")
+    assert btc["source"] == "ETF 代理：IBIT" and btc["symbol"] == "IBIT" and btc["date"] == "2026-10-15"
+    assert btc["value"] == 46.06 and btc["chg"] == pytest.approx(-1.78) and btc["chg_pct"] == pytest.approx(-3.7207, abs=1e-3)
+    assert [urlsplit(url).path for url in env.http.calls].count("/api/quote/IBIT/historical") == 1
+    assert env.http.count("coinbase") == 0
+    import market_dashboard
+
+    assert market_dashboard._macro_label("BTC", btc) == "比特幣（IBIT 代理）"
+    value = market_dashboard._macro_value("BTC", btc)
+    assert value == "單日 -3.72%" and "46" not in value  # 只寫漲跌幅，不印 ETF 的股價
+
+
+def test_btc_has_no_task_of_its_own_and_no_coinbase_path():
+    assert "macro.btc" not in TASKS
+    for name in ("TASK_BTC", "OBS_BTC", "OBS_BTC_YAHOO", "MACRO_OBS_KEY", "_btc_run", "_btc_due"):
+        assert not hasattr(misc, name), name
+    assert "coinbase_spot" not in misc._DEFAULT_EVERY_S
+
+
+def test_a_day_recorded_before_the_ibit_proxy_gets_one_catch_up_fetch_for_btc(env):
+    """部署前這個 D 已經跑過宏觀：BTC 以前不走代理，紀錄裡既沒有來源也不在 pending。補抓一次 IBIT，之後不再排。"""
+    route_proxies(env, lambda etf: [(date(2026, 10, 14), 47.84), (D, 46.06)] if etf == "IBIT" else full_week(20.0))
+    legacy = {k: f"ETF 代理：{etf}" for k, etf in PROXIES.items() if k != "BTC"}
+    misc._save(env.store, misc.TASK_MACRO, {"d": D.isoformat(), "yahoo": "rate_limited", "pending": {}, "sources": legacy})
+    ctx = make_ctx(env, NOW_AFTER_D)
+    assert misc.macro_plan(ctx) == {"d": D, "yahoo": False, "keys": ["BTC"]}
+    assert run(ctx, "macro.yahoo") == "ok"
+    assert [urlsplit(url).path for url in env.http.calls if "nasdaq" in url] == ["/api/quote/IBIT/historical"]
+    assert payload(env, "macro.BTC")["source"] == "ETF 代理：IBIT"
+    assert misc._state(env.store, misc.TASK_MACRO)["sources"]["BTC"] == "ETF 代理：IBIT"
+    assert misc.macro_plan(make_ctx(env, NOW_AFTER_D + 3 * 3600)) is None
 
 
 # ── 新聞 ─────────────────────────────────────────────────────────────────────────
@@ -503,8 +528,69 @@ def test_a_last_newest_in_the_future_is_discarded_instead_of_hiding_gaps_forever
     assert misc.at_least(state, 100 * hour)
 
 
-# ── 期中選舉：每 2 小時；結果出來後每天、7 天後停 ───────────────────────────────────────────
-def test_prediction_markets_poll_every_two_hours_then_daily_after_the_result(env):
+# ── 期中選舉：每 2 小時；結果出來後每天、7 天後停（2026-10-23 起台灣封鎖：永遠不到期） ──────────────────────────
+@pytest.fixture
+def unblocked(monkeypatch):
+    """排程與解析的邏輯仍要測：把封鎖旗標關掉（正式環境是 True）。"""
+    import market_sources_misc
+
+    monkeypatch.setattr(market_sources_misc, "PREDICTION_MARKETS_BLOCKED", False)
+
+
+ELECTION_TASKS = [f"election.{key}" for key in ("polymarket.house", "kalshi.house", "polymarket.senate", "kalshi.senate")]
+
+
+def test_election_tasks_are_never_due_while_the_prediction_markets_are_blocked(env):
+    """Polymarket、Kalshi 被台灣的 ISP 依法院命令封鎖（2026-10-21）：任務留在清單裡，但永遠不到期、一個請求都不送。"""
+    import market_sources_misc as src
+
+    assert src.PREDICTION_MARKETS_BLOCKED is True
+    env.http.route("gamma-api.polymarket.com", polymarket_event())
+    env.http.route("api.elections.kalshi.com", {"cursor": "", "markets": []})
+    assert set(ELECTION_TASKS) <= set(TASKS)
+    t0 = at(2026, 10, 24, 10, 0)
+    for offset in (0, 7200, 86400, 40 * 86400):  # 從沒抓過、2 小時後、一天後、投票之後
+        for name in ELECTION_TASKS:
+            assert run(make_ctx(env, t0 + offset), name) == "not_due", (name, offset)
+    # 結果出來後「每天一次」的節奏也不例外
+    for name in ELECTION_TASKS:
+        misc._save(env.store, name, {"resolved_at": t0 - 2 * 86400, "last_ok": t0 - 2 * 86400})
+        assert run(make_ctx(env, t0), name) == "not_due"
+    assert env.http.calls == [] and env.store.get_obs("election.polymarket.house") is None
+
+
+@pytest.mark.parametrize("value", [True, 1, 0, None, "no"])
+def test_only_an_explicit_false_unblocks_the_election_tasks(env, monkeypatch, value):
+    import market_sources_misc as src
+
+    monkeypatch.setattr(src, "PREDICTION_MARKETS_BLOCKED", value)
+    env.http.route("gamma-api.polymarket.com", polymarket_event())
+    assert run(make_ctx(env, at(2026, 10, 24, 10, 0)), "election.polymarket.house") == "not_due"
+    assert env.http.calls == []
+
+
+def test_election_tasks_are_due_again_once_the_flag_is_false(env, unblocked):
+    env.http.route("gamma-api.polymarket.com", polymarket_event())
+    assert run(make_ctx(env, at(2026, 10, 24, 10, 0)), "election.polymarket.house") == "ok"
+    assert env.http.count("polymarket") == 1
+
+
+def test_blocking_clears_the_old_failure_streak_so_maintenance_stops_reporting_it(env):
+    """封鎖前這些任務已經連續失敗（kind=network）：框架留在 task_state 的次數不會自己歸零，每日維護會天天當失敗報。
+    第一次看到封鎖時清掉失敗次數與退避時間（其他欄位不動）；還在退避中就先等退避結束。"""
+    name = "election.polymarket.house"
+    t0 = at(2026, 10, 24, 10, 0)
+    env.store.set_task_state(name, {"fail_streak": 6, "next_try": t0 + 600, "last_kind": "network", "last_success": 123.0})
+    assert run(make_ctx(env, t0), name) == "backoff"
+    assert env.store.task_state(name)["fail_streak"] == 6
+    assert run(make_ctx(env, t0 + 601), name) == "not_due"
+    state = env.store.task_state(name)
+    assert state["fail_streak"] == 0 and state["next_try"] is None
+    assert state["last_kind"] == "network" and state["last_success"] == 123.0
+    assert env.http.calls == []
+
+
+def test_prediction_markets_poll_every_two_hours_then_daily_after_the_result(env, unblocked):
     event = {"value": polymarket_event()}
     env.http.route("gamma-api.polymarket.com", lambda url: event["value"])
     env.http.route("api.elections.kalshi.com", {"cursor": "", "markets": [{
@@ -534,7 +620,7 @@ def test_prediction_markets_poll_every_two_hours_then_daily_after_the_result(env
     assert run(make_ctx(env, resolved_at + 30 * 86400), "election.polymarket.house") == "not_due"
 
 
-def test_every_fixed_market_including_the_senate_gets_its_own_task_and_obs(env):
+def test_every_fixed_market_including_the_senate_gets_its_own_task_and_obs(env, unblocked):
     import market_sources_misc
 
     def poly(url):
