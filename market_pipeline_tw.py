@@ -1199,7 +1199,7 @@ def _holdings_run(ctx: Any) -> Optional[str]:
     return None
 
 
-# ── 期交所（07:00 起、間隔 2 小時、每天 9 次、匯率 2 次；資料日以回應為準，常晚一天） ─────────────────
+# ── 期交所（07:00 起、間隔 2 小時、每天 9 次、匯率 5 次；資料日以回應為準，常晚一天） ─────────────────
 @dataclass(frozen=True)
 class TaifexSpec:
     task: str
@@ -1301,7 +1301,7 @@ def taifex_due(ctx: Any, spec: TaifexSpec) -> bool:
 
     2026-10-23：端點的最早時間（07:00）前不打。期交所約 06:36 才放上前一個交易日的資料，以前 00／03／06 點那三次
     一定拿到舊的，剩下的三次又剛好碰上 CDN 給 CSV 的時段就整天沒資料；現在間隔 2 小時、每天最多 9 次
-    （07、09…23 點；匯率每天 2 次：07、09 點）。"""
+    （07、09…23 點；匯率每天 5 次：07、09…15 點）。"""
     now_tpe = _now_tpe(ctx)
     today = now_tpe.date()
     earliest, cap = _rule(spec.endpoint)

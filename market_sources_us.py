@@ -32,6 +32,7 @@ data_only）。持股名稱（Holding.name）、CFTC 市場名這裡只做正規
 
 from __future__ import annotations
 
+import codecs
 import csv
 import functools
 import io
@@ -114,8 +115,9 @@ class Endpoint:
 ENDPOINTS: dict[str, Endpoint] = {
     # 成分聯集約 520 檔＋VOO／QQQ／SOXX／SPY＋宏觀代理 8 檔；沒有 D 列的 30 分鐘後重排、最多 4 次（§18.5）。
     # 2026-10-23：D 改成只用 SPY 探（前 5 次每 30 分鐘、之後每小時；Nasdaq 晚上甚至隔天清晨才公布 → 每天約 20 次）
-    # ＋SPY 探滿 5 次後 VOO 也探（審查 r9：約 14 次）＋其他 3 檔 ETF＋成分股約 527 檔＋BF.B 這類空殼 5 次＋宏觀代理
-    # 9 檔（含 IBIT；等 SPY 有 D 才抓，每個 D 最多 4 次，平常 9、最壞 36）＋分割重抓與重排約 10 ≈ 最壞 615 → 620
+    # ＋D 換日 2.5 小時後（或 SPY 出錯後）VOO 也探（審查 r9：約 11–14 次）＋其他 3 檔 ETF＋成分股約 527 檔＋BF.B 這類
+    # 空殼 5 次＋宏觀代理 9 檔（含 IBIT；等任一檔 ETF 有 D 才抓，每個 D 最多 4 次，平常 9、最壞 36）＋分割重抓與重排
+    # 約 10 ≈ 最壞 615 → 620
     # （bootstrap 照舊多 40）。這只是規劃值、程式沒拿它擋；真正擋的是帳本 api.nasdaq.com 每天 900 次，扣掉其他 Nasdaq
     # 端點（每週的那幾個剛好同一天時合計 133）還有約 150 次餘裕。
     "nasdaq_historical": Endpoint("api.nasdaq.com", ("json",), 512 * KIB, 15.0, 620, 660, 4, per_run=60),
@@ -1193,6 +1195,19 @@ XLSX_MAX_ROWS = 20000
 _XML_DECL_RE = re.compile(rb"<!\s*(doctype|entity)", re.IGNORECASE)
 _XML_MEMBER_SUFFIXES = (".xml", ".rels", ".vml")
 _WIDE_BOMS = (b"\xff\xfe", b"\xfe\xff", b"\x00\x00\xfe\xff")
+# XML 宣告的 encoding 只准這幾種：UTF-7（「<」寫成 +ADw-）、EBCDIC 之類的位元組掃描看不到 DOCTYPE（2026-10-24 審查 r9b gp2 O2）
+_XML_PROLOG_RE = re.compile(rb"<\?xml\b([^>]{0,256})\?>")
+_XML_ENCODING_RE = re.compile(rb"""encoding\s*=\s*["']([^"']{0,40})["']""", re.IGNORECASE)
+_XML_OK_ENCODINGS = frozenset({b"utf-8", b"utf8", b"us-ascii", b"ascii", b"iso-8859-1", b"latin1", b"latin-1"})
+
+
+def _xml_encoding_ok(head: bytes) -> bool:
+    """去掉 BOM／空白後要以「<」開頭；有 XML 宣告且寫了 encoding 的，只准 _XML_OK_ENCODINGS。"""
+    if head[:1] != b"<":
+        return False
+    prolog = _XML_PROLOG_RE.match(head)
+    found = _XML_ENCODING_RE.search(prolog.group(1)) if prolog else None
+    return found is None or found.group(1).lower() in _XML_OK_ENCODINGS
 
 
 def _wide_xml(content: bytes) -> bool:
@@ -1200,7 +1215,13 @@ def _wide_xml(content: bytes) -> bool:
     字型、圖片、printerSettings 解開不是「<」，不算（2026-10-23 審查 r9：原本前 4 個位元組有 NUL 就算，未知副檔名的
     二進位成員會被擋；改名成 .bin 的寬字元 XML 也靠副檔名清單放行）。"""
     for encoding in ("utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"):
-        if content[:64].decode(encoding, errors="ignore").lstrip("\ufeff \t\r\n\x00").startswith("<"):
+        # 嚴格解碼：解不開就不是這種編碼的文字。errors="ignore" 會丟掉 PNG 簽章與 IHDR，寬 60 的 00 00 00 3C 就成了
+        # 「<」，嵌了圖的 xlsx 整份被拒（2026-10-24 審查 r9b gp2 N1）；final=False 讓切在 64 位元組的半個字元不算錯
+        try:
+            text = codecs.getincrementaldecoder(encoding)(errors="strict").decode(content[:64], final=False)
+        except UnicodeDecodeError:
+            continue
+        if text.lstrip("\ufeff \t\r\n\x00").startswith("<"):
             return True
     return False
 
@@ -1241,7 +1262,7 @@ def _xlsx_guard(data: object) -> bytes:
             looks_xml = info.filename.lower().endswith(_XML_MEMBER_SUFFIXES) or head[:1] == b"<" or wide
             if not looks_xml:
                 continue
-            if wide or b"\x00" in content:
+            if wide or b"\x00" in content or not _xml_encoding_ok(head):
                 raise _err("format", "xml_encoding")
             if _XML_DECL_RE.search(content):
                 raise _err("format", "xml_doctype")

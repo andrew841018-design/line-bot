@@ -8,7 +8,7 @@ market_pipeline_us／tw／misc（各自在 import 時 register 自己的任務�
 - 順序：fast（30 分鐘來源，整組 ≤20 秒）→ medium（2 小時來源）→ core（有新資料日的日資料；美台交錯，
   每輪輪流誰先）→ backfill（美、台各最多用「開始補洞時剩餘時間」的一半）→ low（週／月／年）。
 - 每個任務包 except Exception：只記種類（FetchError／ParseError 的 kind，其他 unexpected:<型別名>），
-  不記訊息（log 行另印 ParseError 的 detail，只限 [a-z_]{1,20} 的程式列舉字，2026-10-23）；
+  不記訊息（log 行另印 ParseError 的 detail，只限 [A-Za-z_]{1,24} 的程式列舉字，2026-10-23）；
   該任務自己累計 fail_streak、退避 15→30→60→120 分鐘（跑到一半被殺的至少 60 分鐘），其他任務照跑。
   自己的帳本說額度不夠（FetchError("budget")）不算失敗、不退避。
 - 任務之間檢查這輪該不該停：時間到、父程序換了（監督程序被 kill）、停用旗標出現。
@@ -213,7 +213,7 @@ def error_kind(exc: BaseException) -> str:
 def error_detail(exc: BaseException) -> Optional[str]:
     """log 行用的 detail（2026-10-23）：同一個 format 可能是 CDN 給了 CSV、表頭變了或回應被截斷，只看 kind 分不出來。
 
-    只收 error_kind 認得的型別（FetchError／ParseError），而且整個字串要符合 [a-z_]{1,20}（程式自己的列舉字，
+    只收 error_kind 認得的型別（FetchError／ParseError），而且整個字串要符合 [A-Za-z_]{1,24}（程式自己的列舉字，
     例 csv、header）；其他例外的任何內容都不印。"""
     if error_kind(exc).startswith("unexpected:"):
         return None

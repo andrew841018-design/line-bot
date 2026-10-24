@@ -265,8 +265,9 @@ def _macro_obs(key: str) -> str:
 
 def _nasdaq_has_d(ctx: Any, d: date) -> bool:
     """Nasdaq 日線端點公布 D 那天的正式收盤了嗎？ETF 代理和 SPY 走同一個端點，D 那列要收盤後好幾個小時才出現
-    （2026-10-23 實測：04:43 打、30 分鐘後放棄，8 列代理整天停在前一個交易日）。看 SPY 在 closes 表有沒有 D 的
-    正式列——CBOE 的 provisional 不算，它不代表 Nasdaq 公布了。有了才去抓代理，不必盲目探測。"""
+    （2026-10-23 實測：04:43 打、30 分鐘後放棄，8 列代理整天停在前一個交易日）。看 GATE_SYMBOLS（和美股閘門同一組
+    ETF）任一檔在 closes 表有沒有 D 的正式列——CBOE 的 provisional 不算，它不代表 Nasdaq 公布了。有了才去抓代理，
+    不必盲目探測。"""
     try:
         return any(row[0] == d and not row[4] for symbol in GATE_SYMBOLS for row in ctx.store.closes("us", symbol, since=d))
     except Exception:  # noqa: BLE001 - 讀不到就當還沒有：這輪不打，下一輪再看

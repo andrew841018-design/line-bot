@@ -70,6 +70,8 @@ STATE_PREFIX = "sched:"  # 本模組自己的排程紀錄（和 market_pipeline_
 ETFS: tuple[str, ...] = ("SPY", "VOO", "QQQ", "SOXX")  # SPY 先抓：交易日曆的「實際成交日」也看它
 OPTION_SYMBOLS: tuple[str, ...] = tuple(src.CBOE_OPTION_SYMBOLS)  # QQQ、SPY、SOXX
 VIX_SYMBOLS: tuple[str, ...] = tuple(src.CBOE_QUOTE_SYMBOLS)  # VIX、VIX3M
+# 歷史收盤約 9–83；範圍外是檔案壞了、不是行情：不存，卡片退回上一筆（2026-10-24 審查 r9b gp2 O1，1e-9 會印成 0.00）
+VIX_RANGE = (5.0, 200.0)
 # 沒有期權鏈的 ETF（VOO）：us.options 那批的最後一項只抓一個小報價，收盤當 D 的 provisional（2026-10-23）
 CLOSE_QUOTE_SYMBOLS: tuple[str, ...] = tuple(src.CBOE_CLOSE_QUOTE_SYMBOLS)
 
@@ -139,12 +141,14 @@ HIST_RETRY_S = 30 * 60.0
 HIST_MAX_RETRIES = 4  # 沒有 D 列：首抓之後最多再排 4 次
 # 2026-10-23：D 有沒有公布只探這一檔（也是交易日曆看實際成交日的那檔）；它的 4 次重排用完後不放棄，改每小時再探
 HIST_PROBE_SYMBOL = "SPY"
-# SPY 探滿 HIST_MAX_RETRIES 次還沒有 D，就每小時也探 VOO：SPY 自己出狀況（廠商錯誤、待確認）時，閘門不能整天跟著關
-# （2026-10-23 審查 r9 gp2 I3）。兩檔都不放棄；D 公布了沒看 ETFS 任一檔有沒有正式列
+# D 換日 2.5 小時後（或這個 D 的 SPY 探針出過錯的下一輪起）也探 VOO：SPY 自己出狀況（廠商錯誤、待確認）時，閘門不能
+# 整天跟著關（2026-10-23 審查 r9 gp2 I3、Codex 席 I1）。兩檔都不放棄；D 公布了沒看 ETFS 任一檔有沒有正式列
 HIST_BACKUP_PROBE = "VOO"
 # 備援探針看時間、不看 SPY 的重排次數：SPY 卡在待確認或回格式錯時根本不會記 miss（2026-10-23 審查 r9 Codex 席 I1）。
 # 2.5 小時＝SPY 前 5 次每 30 分鐘探完的時間
 HIST_BACKUP_AFTER_S = 2.5 * 3600
+# 兩檔閘門開了以後也不放棄 D（每小時一次、不算進 exhausted）：VOO 是摘要卡第一列，晚公布也要等到正式收盤；
+# VOO 單獨缺 D 的日子每天多約 20 個請求，落後看 us_etf_lag_sessions（2026-10-24 審查 r9b gp2 N2：刻意的）
 _HIST_PROBES = (HIST_PROBE_SYMBOL, HIST_BACKUP_PROBE)
 HIST_PROBE_S = 3600.0
 GUARD_DIFF = 0.005
@@ -963,7 +967,9 @@ def _since_d_change(ctx: Any, day: date) -> float:
         close = ctx.us_cal.close_time(day)
     except Exception:  # noqa: BLE001
         return 0.0
-    return float(ctx.now) - (close.timestamp() + 1800.0) if close is not None else 0.0
+    if close is None:
+        return 0.0
+    return float(ctx.now) - (close.timestamp() + market_calendar.US_READY_AFTER.total_seconds())
 
 
 def _d_published(ctx: Any, day: date) -> bool:
@@ -972,7 +978,7 @@ def _d_published(ctx: Any, day: date) -> bool:
 
 
 def _open_gate(hist: dict, day: date) -> None:
-    """SPY 有 D 之後的第一輪：清掉其他 ETF 這個 D 的重排紀錄（2026-10-23）。
+    """任一檔 ETF 有 D 之後的第一輪：清掉其他 ETF 這個 D 的重排紀錄（2026-10-23）。
 
     舊版在 SPY 有 D 之前就 4 檔 ETF 一起探、各 5 次用完，紀錄留到 D 換日；升級那天不清的話 VOO／QQQ／SOXX 整個 D
     都抓不到。新版 SPY 有 D 之前不碰它們，平常這裡是空的；每個 D 只清一次，之後它們缺 D 照一般的 4 次重排。"""
@@ -1023,7 +1029,7 @@ def _due_hist(ctx: Any) -> bool:
 
 
 def _run_hist_core(ctx: Any) -> Optional[str]:
-    """SPY 先探 D；SPY 有 D 之後才抓其他 ETF＋已有歷史的成分股：分割整段重抓、待確認重抓、
+    """SPY（時間到或 SPY 出錯時加 VOO）先探 D；任一檔有 D 之後才抓其他 ETF＋已有歷史的成分股：分割整段重抓、待確認重抓、
     [最後有效−3 交易日, D] 的日更新。"""
     day = current_d(ctx)
     if day is None:
@@ -1034,17 +1040,19 @@ def _run_hist_core(ctx: Any) -> Optional[str]:
     outcomes: Counter = Counter()
     try:
         _record_universe(ctx, members, len(universe) + len(ETFS), day)
-        # D 公布前每輪最多就 SPY 這 1 個請求（2026-10-23）；有 D 了這裡只剩它自己的分割／待確認重抓
+        # D 公布前每輪最多就 SPY（＋VOO 備援）這 1–2 個請求（2026-10-23）；有 D 了這裡只剩它們自己的分割／待確認重抓
         probes = [HIST_PROBE_SYMBOL]
         spy_broke = (hist.get("probe_error") or {}).get("d") == day.isoformat()
         if spy_broke or _since_d_change(ctx, day) >= HIST_BACKUP_AFTER_S:
             probes.append(HIST_BACKUP_PROBE)
         jobs = [_job_for(ctx, symbol, True, day, hist, allow_bootstrap=True) for symbol in probes]
+        probed = {job.symbol for job in jobs if job}
         stopped = _run_jobs(ctx, day, [job for job in jobs if job], hist, tally, outcomes)
         if not stopped and _d_published(ctx, day):
             _open_gate(hist, day)
+            # 這一輪已經探過的不再打：VOO 剛 miss、_open_gate 又清掉它的重排，會同一輪請求兩次（2026-10-24 審查 r9b gp1）
             others = [_job_for(ctx, sym, True, day, hist, allow_bootstrap=True)
-                      for sym in ETFS if sym != HIST_PROBE_SYMBOL]
+                      for sym in ETFS if sym != HIST_PROBE_SYMBOL and sym not in probed]
             stopped = _run_jobs(ctx, day, [job for job in others if job], hist, tally, outcomes)
             if not stopped:
                 jobs = []
@@ -1281,6 +1289,19 @@ def _store_close_quote(ctx: Any, day: date, symbol: str) -> str:
     return "done"
 
 
+def _spot_ok(ctx: Any, symbol: str, day: date, chain: Any) -> bool:
+    """期權鏈的現價（current_price）和這檔最近一筆正式收盤（10 天內）差到跳空門檻就不存（2026-10-24 審查 r9b gp2
+    O1：卡上會印「現價 7.02」，牆距、GEX 也全跟著錯）。分割日 CBOE 已是拆後價：一樣先不存，等 Nasdaq 的歷史更新。
+    還沒有正式收盤可比（剛建庫）時改和同一份檔的 close 比；兩個都沒有就不存。"""
+    spot = _finite(getattr(chain, "spot", None))
+    if spot is None or spot <= 0:
+        return False
+    official = _official(ctx, symbol, since=day - timedelta(days=10))
+    earlier = [official[d] for d in sorted(official) if d <= day]
+    base = earlier[-1] if earlier else _finite(getattr(chain, "close", None))
+    return base is not None and base > 0 and abs(spot / base - 1.0) < JUMP_LIMIT
+
+
 def _store_chain(ctx: Any, day: date, symbol: str, chain: Any) -> str:
     obs_id = OBS_OPTIONS[symbol]
     timestamp = _check_fresh(ctx, getattr(chain, "timestamp_utc", None))
@@ -1290,11 +1311,15 @@ def _store_chain(ctx: Any, day: date, symbol: str, chain: Any) -> str:
     if data_day < day or not _post_close(ctx, data_day, timestamp):
         ctx.store.obs_not_yet(obs_id)
         return "not_yet"
-    if _obs_date(ctx, obs_id) == data_day:
+    stored = _obs_date(ctx, obs_id) == data_day
+    spot_ok = stored or _spot_ok(ctx, symbol, day, chain)
+    if stored:
         ctx.store.obs_not_yet(obs_id)
-    else:
+    elif spot_ok:
         ctx.store.put_obs(obs_id, chain_payload(chain), data_date=data_day.isoformat())
-    _maybe_provisional(ctx, day, chain, last)
+    _maybe_provisional(ctx, day, chain, last)  # 收盤有自己的守門：現價壞了、收盤正常時照寫暫定值
+    if not spot_ok:
+        raise market_calc.ParseError("format", "spot")
     return "done"
 
 
@@ -1356,6 +1381,8 @@ def _store_quote(ctx: Any, day: date, symbol: str, quote: Any) -> str:
     close = _finite(getattr(quote, "close", None))
     if close is None or close <= 0:
         raise market_calc.ParseError("missing_field")
+    if not VIX_RANGE[0] <= close <= VIX_RANGE[1]:
+        raise market_calc.ParseError("format", "range")
     if data_day < day or not _post_close(ctx, data_day, timestamp):
         ctx.store.obs_not_yet(obs_id)
         return "not_yet"

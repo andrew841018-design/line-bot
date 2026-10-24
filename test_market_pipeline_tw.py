@@ -683,7 +683,7 @@ def test_holidays_bootstrap_this_and_previous_year_then_next_year_weekly(bare_en
     assert tw.holiday_year(make_ctx(env, tuesday + 7 * 86400)) == 2027
 
 
-# ── 期交所：目標日（今天要過 15:00 才算）、07:00 起每 2 小時、每天 9 次（匯率 2 次），資料日以回應為準 ──────
+# ── 期交所：目標日（今天要過 15:00 才算）、07:00 起每 2 小時、每天 9 次（匯率 5 次），資料日以回應為準 ──────
 def test_taifex_polls_every_30_minutes_and_keeps_the_payload_date(env):
     lag = {"day": date(2026, 10, 15)}
     env.http.route("MarketDataOfMajorInstitutionalTradersDetailsOfFuturesContracts", lambda url: futures_rows(lag["day"]))

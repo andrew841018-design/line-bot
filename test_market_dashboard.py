@@ -1674,3 +1674,30 @@ def test_status_summary_reports_how_far_us_data_lags(md, paths):
     market_paths.write_private_atomic(paths.outcome, json.dumps(base).encode())  # 舊版 job：沒有這幾個 key
     summary = md.status_summary(now=NOW, paths=paths)["outcome"]
     assert tuple(summary[key] for key in keys) == (None, None, None, None)
+
+
+def test_provisional_line_keeps_its_older_date(md, paths):
+    """2026-10-24 審查 r9b gp1：暫定標籤加進來後 VOO 第一個寫法超寬，_fit 先丟的是日期後綴；Nasdaq 落後超過一個
+    場次時，VOO 前一天的暫定收盤在卡上就看不出是前一天。日期要比漲跌、月線狀態先保住；altText 也要標暫定。"""
+    snap = make_snapshot(NOW)
+    old = date.fromisoformat(snap["rows"]["us.etf.VOO"]["data_date"]) - timedelta(days=1)
+    snap["rows"]["us.etf.VOO"]["data_date"] = old.isoformat()
+    snap["rows"]["us.etf.VOO"]["source"] = md.market_calc.SOURCE_CBOE_FALLBACK
+    write_snapshot(paths, snap)
+    reply = md.handle("", now=NOW, paths=paths)
+    line = next(text for text in texts(reply.flex["contents"][0]["body"]) if text.startswith("標普500（VOO）"))
+    assert "（暫定）" in line and f"（{old.month}/{old.day}）" in line and md.row_width(line) <= 24, line
+    assert "（暫定）" in reply.alt_text
+    assert "（暫定）" in md.handle(" VOO", now=NOW, paths=paths).alt_text
+
+
+def test_older_etf_line_drops_the_change_before_the_date(md, paths):
+    """同一個規則不只暫定列：名稱寬的 QQQ 以前資料日較舊時日期也會先被丟。"""
+    snap = make_snapshot(NOW)
+    old = date.fromisoformat(snap["rows"]["us.etf.QQQ"]["data_date"]) - timedelta(days=1)
+    snap["rows"]["us.etf.QQQ"]["data_date"] = old.isoformat()
+    snap["rows"]["us.etf.QQQ"]["values"]["chg_pct"] = -12.34
+    write_snapshot(paths, snap)
+    line = next(text for text in texts(md.handle("", now=NOW, paths=paths).flex["contents"][0]["body"])
+                if text.startswith("那斯達克100（QQQ）"))
+    assert f"（{old.month}/{old.day}）" in line and md.row_width(line) <= 24, line

@@ -1361,3 +1361,38 @@ def test_import_does_not_load_transport_or_openpyxl():
     result = subprocess.run([sys.executable, "-c", code], cwd=HERE, capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stderr[-2000:]
     assert result.stdout.strip() == "[]"
+
+
+def test_xlsx_guard_keeps_embedded_images_whose_size_decodes_to_a_bracket():
+    """2026-10-24 審查 r9b gp2 N1：寬 60 的 PNG（IHDR 寬度 00 00 00 3C）照 UTF-32-BE「略過錯誤」解開是「<」，嵌了
+    這種圖的 xlsx 整份被拒。"""
+    png = (b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\x0dIHDR" + (60).to_bytes(4, "big") + (60).to_bytes(4, "big")
+           + b"\x08\x02\x00\x00\x00" + bytes(40))
+    data = _with_member(ssga_xlsx(SSGA_ROWS), "", "xl/media/image1.png", png)
+    assert len(src.parse_ssga_spy_xlsx(data, min_rows=3)) == 3
+
+
+def test_xlsx_guard_rejects_xml_in_encodings_the_byte_scan_cannot_read():
+    """2026-10-24 審查 r9b gp2 O2：宣告 encoding="UTF-7" 的成員把「<」寫成 +ADw-，位元組掃描找不到 DOCTYPE，libxml2
+    卻照樣讀；EBCDIC 也一樣。XML 成員只准 UTF-8／ASCII／Latin-1。"""
+    data = ssga_xlsx(SSGA_ROWS)
+    utf7 = (b'<?xml version="1.0" encoding="UTF-7"?>'
+            b"+ADw-!DOCTYPE x +AFs-+ADw-!ENTITY boom +ACI-boom+ACI-+AD4-+AF0-+AD4-+ADw-x/+AD4-")
+    ebcdic = '<?xml version="1.0"?><!DOCTYPE x [<!ENTITY boom "boom">]><x>&boom;</x>'.encode("cp037")
+    for content in (utf7, ebcdic):
+        bad = rewrite_member(data, "xl/workbook.xml", lambda _old, content=content: content)
+        assert guard_reason(src.parse_ssga_spy_xlsx, bad, min_rows=1) == ("format", "xml_encoding"), content[:12]
+
+
+@pytest.mark.parametrize("head, ok", [
+    (b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><x/>', True),
+    (b"<?xml version='1.0' encoding='utf-8'?><x/>", True),
+    (b'<?xml version="1.0"?>\n<a:theme/>', True),
+    (b"<workbook/>", True),
+    (b'<?xml version="1.0" encoding="UTF-7"?>+ADw-x/+AD4-', False),
+    (b'<?xml version="1.0" encoding="EBCDIC-CP-US"?><x/>', False),
+    ("<x/>".encode("cp037"), False),
+    (b"", False),
+])
+def test_xml_member_encoding_allow_list(head, ok):
+    assert src._xml_encoding_ok(head) is ok

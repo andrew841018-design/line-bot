@@ -663,8 +663,12 @@ def _etf_line(ctx: _Ctx, view: _View, name: str, main_day: Optional[date]) -> tu
     status_text = f" {status}" if status else ""
     suffix = _date_suffix(view.data_date, main_day)
     tag = market_calc.TEXT_PROVISIONAL if view.provisional else ""  # 暫定的收盤每個寫法都要標，不能被 _fit 拿掉
+    # 放不下時先拿掉漲跌、再拿掉月線狀態，最後才拿掉日期：這一列比標題舊卻沒寫日期，就看不出落後
+    # （2026-10-24 審查 r9b gp1：加了暫定標籤後 VOO 第一個寫法就超寬，日期總是先被擠掉）
     text = _fit(
         f"{name}{close_text}{change_text}{status_text}{tag}{suffix}",
+        f"{name}{close_text}{status_text}{tag}{suffix}",
+        f"{name}{close_text}{tag}{suffix}",
         f"{name}{close_text}{change_text}{status_text}{tag}",
         f"{name}{close_text}{status_text}{tag}",
     )
@@ -1354,6 +1358,8 @@ def _summary_alt(ctx: _Ctx) -> str:
     if us is None:
         status = _above_word(_flag(voo.values.get("above_ma20"))) if voo.fresh else None
         us = f"美股 VOO {status}" if status else "美股資料" + ("過期" if voo.status == STALE else "暫缺")
+    if any(view.fresh and view.provisional for view in (ctx.row(f"us.etf.{sym}") for sym in ("VOO", "QQQ", "SOXX"))):
+        us += market_calc.TEXT_PROVISIONAL  # 通知預覽也看得出收盤是暫定值（2026-10-24 審查 r9b gp1）
     tw = _oneliner_alt(ctx, "oneliner.tw", _ONELINER_TW_RE)
     if tw is None:
         change = _num(taiex.values.get("chg_pct"), -100, 1000) if taiex.fresh else None
@@ -1517,7 +1523,8 @@ def _etf_alt(sym: str, view: _View) -> str:
     change = _num(view.values.get("chg_pct"), -100, 1000)
     parts = []
     if close is not None:
-        parts.append(f"收盤 {_price(close)}" + (f"（{_pct(change, 2)}）" if change is not None else ""))
+        tag = market_calc.TEXT_PROVISIONAL if view.provisional else ""
+        parts.append(f"收盤 {_price(close)}{tag}" + (f"（{_pct(change, 2)}）" if change is not None else ""))
     status = _above_word(_flag(view.values.get("above_ma20")))
     if status:
         parts.append(status)

@@ -1524,7 +1524,7 @@ def test_full_collect_round_on_a_fresh_store(env, monkeypatch):
     http.ndx = nasdaq({"totalrecords": 100, "limit": 101, "offset": 0, "date": "Oct 16, 2026 12:34 PM",
                        "data": {"asOf": None, "headers": {}, "rows": ndx_rows}})
     http.ssga = ssga_xlsx(SPY_NAMED)
-    etfs_ready(env)
+    etfs_ready(env, price=710.0)  # 和 CBOE 期權鏈的 717.23 差不多：現價離正式收盤太遠的不存（r9b gp2 O1）
     http.prices["AAPL"] = flat(sessions(D, 250), 300.0)
     for symbol in pipe.OPTION_SYMBOLS:
         http.chains[symbol] = cboe_chain(symbol, timestamp="2026-10-16 20:45:00", last_trade="2026-10-16T16:15:00")
@@ -1559,3 +1559,85 @@ def test_full_collect_round_on_a_fresh_store(env, monkeypatch):
     assert len(env.ledger.reserved) == len(http.calls)  # 每一次請求都先在帳本預扣
     again = market_tasks.run_collect(ctx_at(env, NOW + 900), pipe.TASKS)["results"]
     assert again["us.options"] == "not_due" and again["us.13f"] == "not_due"  # 這個期間已經做完
+
+
+@pytest.mark.parametrize("day, now_et", [
+    (date(2026, 11, 2), (2026, 11, 2, 19, 0)),  # 11/1 起冬令：16:00 EST 收盤，19:00 EST＝D 換日後 2.5 小時
+    (date(2026, 10, 30), (2026, 10, 30, 19, 0)),  # 還是夏令
+    (date(2026, 11, 27), (2026, 11, 27, 16, 0)),  # 早收 13:00：D 換日 13:30
+    (date(2026, 12, 24), (2026, 12, 24, 16, 0)),
+    (date(2026, 3, 9), (2026, 3, 9, 19, 0)),
+])
+def test_since_d_change_follows_the_calendar_close(env, day, now_et):
+    """2026-10-24 審查 r9b gp1 nit 4：VOO 備援探針看「D 換日（收盤＋30 分鐘）後多久」，夏令／冬令、早收日都照日曆。"""
+    ctx = ctx_at(env, at(*now_et))
+    assert pipe.current_d(ctx) == day
+    assert pipe._since_d_change(ctx, day) == pytest.approx(2.5 * 3600, abs=1.0)
+
+
+def test_since_d_change_across_the_dst_weekend_and_unknown_days(env):
+    ctx = ctx_at(env, at(2026, 11, 2, 8, 0))  # 週一 08:00 EST，D 還是週五 10/30（EDT）
+    assert pipe.current_d(ctx) == date(2026, 10, 30)
+    assert pipe._since_d_change(ctx, date(2026, 10, 30)) == pytest.approx(
+        at(2026, 11, 2, 8, 0) - at(2026, 10, 30, 16, 30), abs=1.0)
+    assert pipe._since_d_change(ctx, date(2026, 11, 1)) == 0.0  # 不是交易日
+    assert pipe._since_d_change(ctx, date(2030, 1, 2)) == 0.0  # 日曆表外
+
+
+def test_gate_round_requests_the_backup_probe_once(env):
+    """2026-10-24 審查 r9b gp1 nit 1：VOO 在備援探針裡剛 miss，同一輪 SPY 公布了 D；_open_gate 清掉 VOO 的重排後
+    「其他 ETF」又排了它一次＝同一輪打兩次。"""
+    etfs_ready(env, with_d=False)
+    env.http.hist_raw["VOO"] = {"data": None, "message": None, "status": {
+        "rCode": 400, "bCodeMessage": [{"code": 2001, "errorMessage": "Error while calling vendor"}],
+        "developerMessage": None}}
+    rounds = []
+    for step in range(16):  # 17:00 ET 起每 15 分鐘；D 換日 16:30，第 120 分鐘起 VOO 也探
+        if step == 10:  # 第 150 分鐘 SPY／QQQ／SOXX 公布 D
+            for symbol in ("SPY", "QQQ", "SOXX"):
+                env.http.prices[symbol] = flat(HISTORY + [D], 100.0)
+        before = len(env.http.calls)
+        run(env, "us.hist", NOW + step * 900)
+        rounds.append([key for kind, key, _ in env.http.calls[before:] if kind == "hist"])
+    gate = next(keys for keys in rounds if "QQQ" in keys)
+    assert gate.count("VOO") == 1, gate
+    assert D in closes(env, "QQQ") and D in closes(env, "SOXX")
+
+
+def test_options_spot_far_from_the_official_close_is_not_stored(env):
+    """2026-10-24 審查 r9b gp2 O1：期權鏈的 current_price 只要 >0 就收，卡上就印「現價 7.02」「現價 70,200」，牆距和
+    GEX 也全跟著錯。現價和最近一筆正式收盤差到跳空門檻就不存（卡片退回上一份）、記成格式錯；收盤正常的話暫定收盤照寫。"""
+    for symbol in pipe.OPTION_SYMBOLS:
+        seed(env, symbol, flat(HISTORY, 700.0))
+        env.http.chains[symbol] = cboe_chain(symbol, timestamp="2026-10-16 20:45:00", last_trade="2026-10-16T16:15:00",
+                                             close=702.0)
+    env.http.chains["QQQ"]["data"]["current_price"] = 7.02
+    env.http.chains["SOXX"]["data"]["current_price"] = 70200.0
+    assert run(env, "us.options", NOW + 600) == "partial"
+    for symbol in ("QQQ", "SOXX"):
+        got = obs(env, pipe.OBS_OPTIONS[symbol])
+        assert got["payload"] is None and got["error"] == "format", symbol
+        assert closes(env, symbol)[D] == (702.0, "cboe", True), symbol  # 收盤有自己的守門：照寫暫定值
+    spy = pipe.chain_from_payload(obs(env, pipe.OBS_OPTIONS["SPY"])["payload"])
+    assert spy.spot == 702.0
+
+
+def test_options_spot_without_an_official_close_is_checked_against_the_file_close(env):
+    """還沒有正式收盤可比（剛建庫）時和同一份檔的 close 比：一樣擋得住 current_price 單獨壞掉。"""
+    for symbol in pipe.OPTION_SYMBOLS:
+        env.http.chains[symbol] = cboe_chain(symbol, timestamp="2026-10-16 20:45:00", last_trade="2026-10-16T16:15:00")
+    env.http.chains["SPY"]["data"]["current_price"] = 1e-9
+    assert run(env, "us.options") == "partial"
+    assert obs(env, pipe.OBS_OPTIONS["SPY"])["payload"] is None
+    assert obs(env, pipe.OBS_OPTIONS["QQQ"])["payload"] is not None
+
+
+@pytest.mark.parametrize("close", [1e-9, 0.5, 7000.0])
+def test_vix_out_of_range_is_not_stored(env, close):
+    """2026-10-24 審查 r9b gp2 O1：VIX 收盤 1e-9 原本照存，卡上印「恐慌指數（VIX）0.00」。"""
+    for symbol in pipe.VIX_SYMBOLS:
+        env.http.quotes[symbol] = cboe_quote(symbol, timestamp="2026-10-16 21:37:16", last_trade="2026-10-16T16:15:01",
+                                             close=close)
+    run(env, "us.vix", datetime.combine(D, datetime.min.time(), ET).timestamp() + 18 * 3600)
+    got = obs(env, pipe.OBS_QUOTE["VIX"])
+    assert got["payload"] is None and got["error"] == "format"
