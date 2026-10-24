@@ -734,6 +734,64 @@ def test_calendar_coverage_for_the_outcome(tmp_path):
     assert job.sanitize(out) == out
 
 
+def test_us_freshness_counts_sessions_and_seconds_behind_the_latest_session(tmp_path):
+    """2026-10-23（investigations/format_20261023.md §2、freshness_20261023.md §5 第 5 點）：ETF 落後 1 天、成分股停在
+    10/16 時 us.hist 一直是 not_yet，outcome 看不出來。最新場次由 job 的日曆現算；ETF 看最舊的那一列（含 CBOE 備援）；
+    只有整數或 None。"""
+    from datetime import date
+
+    from jobs import market_snapshot as job
+
+    later = datetime(2026, 10, 23, 10, 30, tzinfo=timezone.utc).timestamp()  # 美東 10/23 06:30：最新收完的是 10/22
+    nulls = {"us_etf_lag_sessions": None, "us_etf_lag_s": None, "us_members_lag_sessions": None, "us_hist_vendor": None}
+    store = market_store.Store(tmp_path / "h.sqlite")
+    try:
+        assert job._us_freshness(store, later) == nulls  # 什麼都還沒有
+        for symbol in ("VOO", "QQQ", "SOXX", "SPY"):
+            rows = [(date(2026, 10, 20), 100.0, 1), (date(2026, 10, 21), 100.0, 1)]
+            store.upsert_closes("us", symbol, rows, "nasdaq")
+        store.put_obs("us.hist.status", {"D": "2026-10-21", "members_last": "2026-10-16", "vendor": 3},
+                      data_date="2026-10-21")  # 狀態停在 10/21（us.hist 沒再寫）：落後照樣用現在的場次算
+        out = job._us_freshness(store, later)
+        # ETF 缺 10/22（10/22 16:30 美東收完，到現在 14 小時）；成分股缺 10/19–10/22
+        assert out == {"us_etf_lag_sessions": 1, "us_etf_lag_s": 14 * 3600, "us_members_lag_sessions": 4,
+                       "us_hist_vendor": 3}
+        assert job.sanitize(out) == out
+        for symbol in ("VOO", "QQQ", "SPY"):  # CBOE 備援也算卡上的資料日；SOXX 還沒有 → 看最舊的那列
+            store.upsert_closes("us", symbol, [(date(2026, 10, 22), 101.0, None)], "cboe", provisional=True)
+        assert job._us_freshness(store, later)["us_etf_lag_sessions"] == 1
+        store.upsert_closes("us", "SOXX", [(date(2026, 10, 22), 101.0, 1)], "nasdaq")
+        store.put_obs("us.hist.status", {"members_last": "2026-10-22", "vendor": 0}, data_date="2026-10-22")
+        assert job._us_freshness(store, later) == {"us_etf_lag_sessions": 0, "us_etf_lag_s": 0,
+                                                   "us_members_lag_sessions": 0, "us_hist_vendor": 0}
+        for bad in ({"members_last": "2026-02-30", "vendor": True}, {"members_last": 20261016, "vendor": -1},
+                    {"members_last": "10/16/2026", "vendor": 1.5}):
+            store.put_obs("us.hist.status", bad, data_date="2026-10-22")
+            got = job._us_freshness(store, later)
+            assert (got["us_members_lag_sessions"], got["us_hist_vendor"]) == (None, None), bad
+    finally:
+        store.close()
+
+
+def test_outcome_reports_how_far_us_data_lags(job_env):
+    """2026-10-23：整個 job 跑完，outcome 帶 us_etf_lag_sessions／us_etf_lag_s／us_members_lag_sessions／us_hist_vendor
+    （都是整數），每日維護從 status_summary 讀；日曆欄位照樣在。"""
+    from datetime import date
+
+    with market_store.Store(job_env.paths.history_db) as seed:
+        for symbol in ("VOO", "QQQ", "SOXX", "SPY"):
+            seed.upsert_closes("us", symbol, [(date(2026, 10, 13), 100.0, 1), (date(2026, 10, 14), 100.0, 1)], "nasdaq")
+        seed.put_obs("us.hist.status", {"D": "2026-10-15", "members_last": "2026-10-13", "vendor": 2},
+                     data_date="2026-10-15")
+    assert _finish(_start(job_env)) == 0
+    outcome = _outcome(job_env)
+    # --now＝美東 10/16 06:00 → 最新收完的是 10/15（10/15 16:30 美東收完，到 --now 13.5 小時）
+    assert outcome["us_etf_lag_sessions"] == 1 and 13.5 * 3600 <= outcome["us_etf_lag_s"] < 13.5 * 3600 + 120
+    assert outcome["us_members_lag_sessions"] == 2 and outcome["us_hist_vendor"] == 2
+    assert outcome["calendar_until"]["us"] is not None and outcome["calendar_unclassified"] == {"us": 0, "tw": 0}
+    assert _all_enumerated(outcome)
+
+
 def test_a_task_killed_mid_run_backs_off_next_round(env):
     """2026-10-18 審查 r6e I1-3：跑到一半被 kill（in_flight 標記還在）→ 下一輪記一次失敗、照退避跳過；跑完會清掉標記。"""
     seen = []

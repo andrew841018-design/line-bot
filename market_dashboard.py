@@ -2268,19 +2268,29 @@ def _outcome_summary(paths: Any, now: float) -> dict:
     out["lock_held_s"] = _num(data.get("lock_held_s"), 0, 10**7)
     mismatch = data.get("calendar_mismatch")
     out["calendar_mismatch"] = sorted({k for k in _list(mismatch, 50) if _safe_kind(k)})
-    # 日曆還涵蓋幾天、休市表認不出的日數（2026-10-18 審查 r6a I1／I2）：每日維護在 ≤30 天或 >0 時報
+    # 日曆還涵蓋幾天、休市表認不出的日數（2026-10-18 審查 r6a I1／I2）：每日維護在 ≤30 天或 >0 時報。
+    # 2026-10-23 審查 r7b F7：us／tw 一定有鍵，outcome 缺 key、{"error": …}、舊版 job、壞值都落在 None——以前是 {}，
+    # 維護條目的「或是 null」永遠不會觸發
     today = datetime.fromtimestamp(now, _TPE).date()
+    until_by_market = _dict(data.get("calendar_until"))
     days_left: dict = {}
-    for market, value in _dict(data.get("calendar_until")).items():
-        if market in ("us", "tw"):
-            try:
-                until = date.fromisoformat(value) if isinstance(value, str) and len(value) == 10 else None
-            except ValueError:
-                until = None
-            days_left[market] = (until - today).days if until else None
+    for market in ("us", "tw"):
+        value = until_by_market.get(market)
+        try:
+            until = date.fromisoformat(value) if isinstance(value, str) and len(value) == 10 else None
+        except ValueError:
+            until = None
+        days_left[market] = (until - today).days if until else None
     out["calendar_days_left"] = days_left
-    out["calendar_unclassified"] = {m: n for m, n in _dict(data.get("calendar_unclassified")).items()
-                                    if m in ("us", "tw") and _count(n, 10**4) is not None}
+    unclassified = _dict(data.get("calendar_unclassified"))
+    out["calendar_unclassified"] = {market: _count(unclassified.get(market), 10**4) for market in ("us", "tw")}
+    # 美股資料落後多少（2026-10-23，investigations/format_20261023.md §2、freshness_20261023.md §5 第 5 點、審查 r7b
+    # F2）：us.etf 列最舊的資料日落後最新場次幾個交易日、落後幾秒；成分股中位數落後幾個交易日；這個 D 的 Nasdaq
+    # 廠商錯誤次數。這次落後 5 天時 us.hist 只是 not_yet，failing 看不到；缺值或壞值 → None
+    out["us_etf_lag_sessions"] = _count(data.get("us_etf_lag_sessions"), 10**4)
+    out["us_etf_lag_s"] = _count(data.get("us_etf_lag_s"), 10**9)
+    out["us_members_lag_sessions"] = _count(data.get("us_members_lag_sessions"), 10**4)
+    out["us_hist_vendor"] = _count(data.get("us_hist_vendor"), 10**6)
     return out
 
 

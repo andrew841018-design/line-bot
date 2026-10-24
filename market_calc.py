@@ -198,7 +198,8 @@ VOL_PHRASE = {
 
 
 # ── 共用錯誤 ────────────────────────────────────────────────────────────────
-PARSE_ERROR_KINDS = ("format", "missing_field", "empty", "too_few", "date", "conflict")
+# vendor（2026-10-23 審查 r7b F2）：Nasdaq 回 data: null 而且 status.rCode 不是 200＝來源自己報錯，和「沒有資料」分開記
+PARSE_ERROR_KINDS = ("format", "missing_field", "empty", "too_few", "date", "conflict", "vendor")
 
 
 class ParseError(ValueError):

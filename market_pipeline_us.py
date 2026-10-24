@@ -9,8 +9,12 @@ Andrew 2026-10-17 要一張「目前市場狀況」的盤勢卡（VOO／QQQ／SO
 規則（PLAN §3.1、§9、§18.1–18.3、§18.5–18.9、§18.13、§19.2–19.4；INTERFACES §3 A、§8、§9）：
 - D＝`market_calendar.latest_closed_us_session`（美東收盤＋30 分鐘之後才算當天）。日線只收 ≤D 的列。
 - 日線每檔的抓取區間＝[最後一筆正式（非備援）日期往前 3 個交易日, D]；沒有歷史抓一年；回應沒有 D 列
-  → 30 分鐘後重排，最多再排 4 次。每輪（core＋backfill 合計）最多 60 檔。ETF 先抓：ETF 抓到了卻都沒有 D
-  ＝Nasdaq 還沒更新（或 D 臨時休市），這輪不打成分股。主機被擋（403／429／冷卻）或帳本說不行就整批停。
+  → 30 分鐘後重排，最多再排 4 次。每輪（core＋backfill 合計）最多 60 檔。主機被擋（403／429／冷卻）或帳本
+  說不行就整批停。
+- D 有沒有公布只用 SPY 探（2026-10-23）：前 5 次和其他檔一樣每 30 分鐘，之後每小時再探，直到 SPY 有 D 或 D
+  換日；SPY 有 D 之前不打其他 ETF 與成分股（含還沒有歷史的），有了同一輪就接著抓。Nasdaq 公布 D 列比收盤後
+  2 小時晚（實測 18:46 美東還沒有、隔天 06:22 已有），以前 4 檔 ETF 各 5 次用完就整個 D 不再抓，成分股從
+  10/16 起就沒更新過。
 - 覆寫守門：重抓的收盤和已存的同來源正式值差 >0.5% → 不覆寫；那之後有生效的分割 → 整段重抓、一個
   交易內先刪後寫；沒有分割（例如配息回溯調整）→ 待確認，下一輪整段重抓，兩次同來源一致就整段替換。
   新列相鄰兩日 |r−1| ≥15% 而且沒有分割（財報跳空）→ 一樣待確認、兩次一致就接受，不隔離（§18.2）。
@@ -20,8 +24,9 @@ Andrew 2026-10-17 要一張「目前市場狀況」的盤勢卡（VOO／QQQ／SO
   調整）→ 隔離「分割待調整」、2 小時後再抓；生效日還沒有列 → 不記「做過整段重抓」，稍後再抓（§18.6）。
   比例看不懂的分割照樣記（store 的比例欄不收空值，記成 1:1＝倍數未知），一樣觸發整段重抓。
 - CBOE：抓取時間−timestamp >12 小時不收（記 stale）；資料日＝`last_trade_time` 的美東日期；收盤（＋15 分
-  延遲）之後產生的檔才當那天的資料。Nasdaq 被擋時 SPY／QQQ／SOXX 的收盤改用 CBOE 寫成 provisional
-  （要 last_trade_time 的美東日期＝D、時間 ≥ 收盤），Nasdaq 回來後直接覆蓋（守門只比同一來源，§18.7）。
+  延遲）之後產生的檔才當那天的資料。Nasdaq 日線還沒有 D 列時（被擋或只是晚公布），SPY／QQQ／SOXX 的收盤
+  改用 CBOE 寫成 provisional，VOO 另抓一個小報價（要 last_trade_time 的美東日期＝D、時間在收盤前 60 秒以後：
+  CBOE 寫 15:59:59），Nasdaq 正式列到了直接覆蓋（守門只比同一來源，§18.7；2026-10-23 以前要被擋才寫，從沒觸發）。
 - 臨時休市要有獨立證據才寫暫定覆寫（§18.3）：market-info 說今天不是交易日或 previous／next 跳過某個預期
   交易日；或 D 晚上 20:00（美東）之後 CBOE 的 SPY、QQQ 最後成交日都還是 D 的前一交易日。只有 Nasdaq 缺列不算。
 - 「還沒公布」呼叫 `obs_not_yet`、任務回 "not_yet"（不算失敗）；抓不到、解析不了記 `obs_checked(kind)`，
@@ -65,6 +70,8 @@ STATE_PREFIX = "sched:"  # 本模組自己的排程紀錄（和 market_pipeline_
 ETFS: tuple[str, ...] = ("SPY", "VOO", "QQQ", "SOXX")  # SPY 先抓：交易日曆的「實際成交日」也看它
 OPTION_SYMBOLS: tuple[str, ...] = tuple(src.CBOE_OPTION_SYMBOLS)  # QQQ、SPY、SOXX
 VIX_SYMBOLS: tuple[str, ...] = tuple(src.CBOE_QUOTE_SYMBOLS)  # VIX、VIX3M
+# 沒有期權鏈的 ETF（VOO）：us.options 那批的最後一項只抓一個小報價，收盤當 D 的 provisional（2026-10-23）
+CLOSE_QUOTE_SYMBOLS: tuple[str, ...] = tuple(src.CBOE_CLOSE_QUOTE_SYMBOLS)
 
 # 持股清單：{"source", "as_of", "rows": [[代號, 名稱|None, 權重%|None, 市值美元|None], …], "count",
 #           "dropped_count", "unmapped_weight", "unmapped_count", "covered_weight"}；data_date＝清單日
@@ -75,7 +82,9 @@ OBS_HOLDINGS_QQQ = "us.holdings.QQQ"  # MoneyDJ QQQ（月資料；只給前十�
 # 寬度成分：{"members": {"VOO": [...], "QQQ": [...], "SOXX": [...]}, "lists": {清單 obs: as_of}, "total"}
 OBS_UNIVERSE = "us.universe"
 # 日線進度（卡上「歷史資料補到 X/Y 檔」、每日維護）：{"D", "total", "have_d", "missing_d", "exhausted",
-#   "pending", "quarantined", "blocked", "waiting_for_source", "outcomes": {結果: 次數}}；data_date＝D
+#   "pending", "quarantined", "blocked", "waiting_for_source", "vendor", "members_last", "outcomes": {結果: 次數}}；
+#   data_date＝D。vendor＝這個 D 遇到 Nasdaq 廠商錯誤的次數；members_last＝成分股最後正式日期的中位數（偏舊那個），
+#   jobs/market_snapshot.py 拿它和當下的 D 算「落後幾個交易日」寫進 outcome（2026-10-23）
 OBS_HIST_STATUS = "us.hist.status"
 # 期權鏈（鍵名同 OptionChain 欄位）：{"symbol", "timestamp_utc", "quote_last_trade_et"（美東）, "spot", "close",
 #   "volume", "iv30", "raw_count", "bad_count", "conflict_count", "conflict_oi_known",
@@ -128,6 +137,9 @@ HIST_FULL_DAYS = 400  # 整段重抓：Nasdaq 一次最多回約 284 列（≈13
 HIST_KEEP_SESSIONS = 280  # closes 保留期 ≤ Nasdaq 一次能回的列數（§18.6）
 HIST_RETRY_S = 30 * 60.0
 HIST_MAX_RETRIES = 4  # 沒有 D 列：首抓之後最多再排 4 次
+# 2026-10-23：D 有沒有公布只探這一檔（也是交易日曆看實際成交日的那檔）；它的 4 次重排用完後不放棄，改每小時再探
+HIST_PROBE_SYMBOL = "SPY"
+HIST_PROBE_S = 3600.0
 GUARD_DIFF = 0.005
 JUMP_LIMIT = 0.15
 SAME_CLOSE_REL = 1e-6  # 「兩次一致」：同一來源同一天的收盤要相同（只容許浮點誤差）
@@ -136,6 +148,8 @@ SPLIT_RETRY_S = 2 * 3600.0
 SPLIT_MIN_FACTOR = 1.2  # 倍數太接近 1 的（例 2% 股票股利）看不出有沒有調整，不判斷
 CBOE_MAX_AGE_S = 12 * 3600.0
 CBOE_DELAY_S = 15 * 60.0  # 延遲報價：收盤後 15 分鐘產生的檔才算收盤後快照
+# CBOE 的 last_trade_time 是 15:59:59（10/22 的 SPY／QQQ／SOXX 實測）：收盤前 60 秒內（含）的最後成交也算收盤（2026-10-23）
+CBOE_CLOSE_SLACK_S = 60.0
 CBOE_RETRY_S = 30 * 60.0
 CBOE_MAX_NOT_YET = 10  # 16:30 起每 30 分鐘一次 → 到 21:30；20:00 之後才能當休市證據
 CLOSURE_EVIDENCE_ET = dtime(20, 0)
@@ -152,6 +166,8 @@ EVIDENCE_MAX = 200  # store 的 evidence 欄上限
 _BLOCK_KINDS = frozenset({"blocked", "rate_limited", "cooldown"})
 _STOP_KINDS = _BLOCK_KINDS | {"budget"}
 _NON_FAILURE = frozenset({"budget"})  # 帳本說額度不夠：請求沒有送出（框架也不算失敗）
+# 日線回應沒有列：empty＝Nasdaq 沒有（空殼、區間內沒有列）、vendor＝Nasdaq 自己報錯（2026-10-23）；都當「還沒有 D」重排
+_NO_ROWS_KINDS = frozenset({"empty", "vendor"})
 _SYMBOL_RE = re.compile(r"^[A-Z]{1,5}(\.[A-Z])?$")
 REASON_CONFLICT = "conflict"
 REASON_SPLIT = "split_pending"
@@ -667,16 +683,20 @@ def _pending_info(ctx: Any, findings: _Findings, *, disagree: int = 0, quarantin
     }
 
 
-def _note_d(hist: dict, symbol: str, day: date, now: float, rows: Sequence[Row]) -> str:
-    """有 D 列 → 清掉重排；沒有 → 30 分鐘後再排（同一個 D 最多再排 HIST_MAX_RETRIES 次）。"""
+def _note_d(hist: dict, symbol: str, day: date, now: float, rows: Sequence[Row], *, vendor: bool = False) -> str:
+    """有 D 列 → 清掉重排；沒有 → 30 分鐘後再排（同一個 D 最多再排 HIST_MAX_RETRIES 次；SPY 用完後改每小時探）。
+
+    vendor＝這次是 Nasdaq 的廠商錯誤（2026-10-23 審查 r7b F2）：一樣排重試、算進同一個上限（不然每輪都重打，
+    吃掉每輪 60 檔與帳本額度），只是結果記成 vendor，us.hist.status 才看得到。"""
     retries = hist.setdefault("retry", {})
     if rows and rows[-1][0] == day:
         retries.pop(symbol, None)
         return "ok"
     entry = retries.get(symbol)
     misses = int(entry["n"]) + 1 if entry and entry.get("d") == day.isoformat() else 1
-    retries[symbol] = {"d": day.isoformat(), "n": misses, "at": now + HIST_RETRY_S}
-    return "missing_d"
+    wait = HIST_PROBE_S if symbol == HIST_PROBE_SYMBOL and misses > HIST_MAX_RETRIES else HIST_RETRY_S
+    retries[symbol] = {"d": day.isoformat(), "n": misses, "at": now + wait}
+    return "vendor" if vendor else "missing_d"
 
 
 def _after_replace(ctx: Any, symbol: str, rows: Sequence[Row], day: date, hist: dict) -> str:
@@ -791,14 +811,16 @@ def _apply(ctx: Any, job: _Job, rows: list[Row], official: dict[date, float], da
 def _update(ctx: Any, job: _Job, day: date, hist: dict) -> str:
     assert job.last_valid is not None
     start = _range_start(ctx.us_cal, job.last_valid)
+    vendor = False
     try:
         rows = _fetch_rows(ctx, job, start, day)
     except market_calc.ParseError as exc:
-        if exc.kind != "empty":
+        if exc.kind not in _NO_ROWS_KINDS:
             raise
-        rows = []  # 區間內沒有任何列：當成「還沒有 D」
+        rows = []  # 區間內沒有任何列：當成「還沒有 D」；廠商錯誤一樣排重試，但記成 vendor
+        vendor = exc.kind == "vendor"
     if not rows:
-        return _note_d(hist, job.symbol, day, float(ctx.now), rows)
+        return _note_d(hist, job.symbol, day, float(ctx.now), rows, vendor=vendor)
     lookback = start - timedelta(days=10)  # 多拿幾天：區間第一列和它前一列也要比跳空
     return _apply(ctx, job, rows, _official(ctx, job.symbol, since=lookback), day, hist,
                   splits=_splits(ctx, job.symbol, lookback), bootstrap=False)
@@ -806,14 +828,16 @@ def _update(ctx: Any, job: _Job, day: date, hist: dict) -> str:
 
 def _bootstrap(ctx: Any, job: _Job, day: date, hist: dict) -> str:
     start = day - timedelta(days=HIST_BOOTSTRAP_DAYS)
+    vendor = False
     try:
         rows = _fetch_rows(ctx, job, start, day)
     except market_calc.ParseError as exc:
-        if exc.kind != "empty":
+        if exc.kind not in _NO_ROWS_KINDS:
             raise
-        rows = []
+        rows = []  # BF.B 這種空殼（Nasdaq 沒有這檔）也走這裡：每個 D 最多 5 次、不算失敗
+        vendor = exc.kind == "vendor"
     if not rows:
-        return _note_d(hist, job.symbol, day, float(ctx.now), rows)
+        return _note_d(hist, job.symbol, day, float(ctx.now), rows, vendor=vendor)
     return _apply(ctx, job, rows, {}, day, hist, splits=_splits(ctx, job.symbol, start - timedelta(days=1)),
                   bootstrap=True)
 
@@ -847,8 +871,8 @@ def _retry_allows(hist: dict, symbol: str, day: date, now: float) -> bool:
     entry = hist.get("retry", {}).get(symbol)
     if not entry or entry.get("d") != day.isoformat():
         return True
-    if int(entry.get("n") or 0) > HIST_MAX_RETRIES:
-        return False
+    if int(entry.get("n") or 0) > HIST_MAX_RETRIES and symbol != HIST_PROBE_SYMBOL:
+        return False  # SPY 不放棄：它是 D 有沒有公布的探針，放棄就整個 D 都不會再抓成分股（2026-10-23）
     return float(entry.get("at") or 0.0) <= now
 
 
@@ -884,7 +908,8 @@ def _hist_state(ctx: Any, day: date) -> dict:
 
 
 def nasdaq_blocked(ctx: Any) -> bool:
-    """最近一次打 Nasdaq 日線是不是被擋（403／429／冷卻）。CBOE 備援用它判斷要不要寫 provisional。"""
+    """最近一次打 Nasdaq 日線是不是被擋（403／429／冷卻）：被擋時 backfill 不排。CBOE 備援以前也看它，2026-10-23
+    改成只看「還沒有 D 的正式列」（Nasdaq 只是晚公布時也要寫）。"""
     blocked = _state(ctx, "us.hist").get("blocked")
     if not isinstance(blocked, dict):
         return False
@@ -916,15 +941,40 @@ def _run_jobs(ctx: Any, day: date, jobs: list[_Job], hist: dict, tally: _Tally, 
             continue
         hist.pop("blocked", None)
         outcomes[outcome] += 1
-        if outcome == "missing_d":
+        if outcome in ("missing_d", "vendor"):  # 廠商錯誤和「還沒有 D」一樣不算失敗；次數進 us.hist.status
             tally.not_yet += 1
         else:
             tally.done += 1
     return False
 
 
-def _hist_status(ctx: Any, day: date, universe: list[str], hist: dict, outcomes: Counter, *,
-                 waiting: bool) -> None:
+def _d_published(ctx: Any, day: date) -> bool:
+    """Nasdaq 公布 D 了沒：只看 SPY 有沒有 D 的正式列（2026-10-23）。"""
+    return _has_official_row(ctx, HIST_PROBE_SYMBOL, day)
+
+
+def _open_gate(hist: dict, day: date) -> None:
+    """SPY 有 D 之後的第一輪：清掉其他 ETF 這個 D 的重排紀錄（2026-10-23）。
+
+    舊版在 SPY 有 D 之前就 4 檔 ETF 一起探、各 5 次用完，紀錄留到 D 換日；升級那天不清的話 VOO／QQQ／SOXX 整個 D
+    都抓不到。新版 SPY 有 D 之前不碰它們，平常這裡是空的；每個 D 只清一次，之後它們缺 D 照一般的 4 次重排。"""
+    if hist.get("gate_open") == day.isoformat():
+        return
+    hist["gate_open"] = day.isoformat()
+    for symbol in ETFS:
+        if symbol != HIST_PROBE_SYMBOL:
+            hist["retry"].pop(symbol, None)
+
+
+def _members_last(ctx: Any, universe: list[str]) -> Optional[date]:
+    """成分股最後一筆正式日期的中位數（偶數檔取偏舊那個）；還沒有歷史的不算（2026-10-23）。"""
+    lasts = sorted(last for last in (_last_valid(ctx, symbol) for symbol in universe) if last is not None)
+    return lasts[(len(lasts) - 1) // 2] if lasts else None
+
+
+def _hist_status(ctx: Any, day: date, universe: list[str], hist: dict, outcomes: Counter) -> None:
+    """core 與 backfill 都寫。waiting_for_source 一律看 SPY 有沒有 D（2026-10-23：以前 backfill 寫死 False，
+    閘門鎖住時這個旗標在 backfill 跑完到下一次 core 之間會翻成 false）。"""
     symbols = list(ETFS) + universe
     have = sum(1 for symbol in symbols if _has_official_row(ctx, symbol, day))
     quarantine = ctx.store.quarantine(MARKET) or {}
@@ -936,11 +986,15 @@ def _hist_status(ctx: Any, day: date, universe: list[str], hist: dict, outcomes:
         "total": len(symbols),
         "have_d": have,
         "missing_d": len(symbols) - have,
-        "exhausted": sum(1 for entry in hist.get("retry", {}).values() if int(entry.get("n") or 0) > HIST_MAX_RETRIES),
+        # SPY 不算：它用完 4 次重排後改每小時探，沒有放棄
+        "exhausted": sum(1 for symbol, entry in hist.get("retry", {}).items()
+                         if symbol != HIST_PROBE_SYMBOL and int(entry.get("n") or 0) > HIST_MAX_RETRIES),
         "pending": sum(1 for symbol in symbols if ctx.store.pending_jump(MARKET, symbol)),
         "quarantined": sum(1 for symbol in symbols if quarantine.get(symbol)),
         "blocked": isinstance(hist.get("blocked"), dict),
-        "waiting_for_source": waiting,
+        "waiting_for_source": not _d_published(ctx, day),
+        "vendor": int(merged.get("vendor", 0)),
+        "members_last": _iso(_members_last(ctx, universe)),
         "outcomes": dict(sorted(merged.items())),
     }
     ctx.store.put_obs(OBS_HIST_STATUS, payload, data_date=day.isoformat())
@@ -951,7 +1005,8 @@ def _due_hist(ctx: Any) -> bool:
 
 
 def _run_hist_core(ctx: Any) -> Optional[str]:
-    """ETF（先）＋已有歷史的成分股：分割整段重抓、待確認重抓、[最後有效−3 交易日, D] 的日更新。"""
+    """SPY 先探 D；SPY 有 D 之後才抓其他 ETF＋已有歷史的成分股：分割整段重抓、待確認重抓、
+    [最後有效−3 交易日, D] 的日更新。"""
     day = current_d(ctx)
     if day is None:
         return None
@@ -959,34 +1014,37 @@ def _run_hist_core(ctx: Any) -> Optional[str]:
     universe, members = _universe(ctx)
     tally = _Tally()
     outcomes: Counter = Counter()
-    waiting = False
     try:
         _record_universe(ctx, members, len(universe) + len(ETFS), day)
-        etf_jobs = [job for job in (_job_for(ctx, sym, True, day, hist, allow_bootstrap=True) for sym in ETFS) if job]
-        stopped = _run_jobs(ctx, day, etf_jobs, hist, tally, outcomes)
-        if not any(_has_official_row(ctx, sym, day) for sym in ETFS) and any(sym in hist["retry"] for sym in ETFS):
-            # ETF 抓到了卻都沒有 D：Nasdaq 還沒更新（或 D 臨時休市），這輪不打 520 檔成分股。
-            waiting = True
-        if not stopped and not waiting:
-            jobs = []
-            for symbol in universe:
-                if ctx.should_stop():
-                    tally.stopped_early = True
-                    break
-                job = _job_for(ctx, symbol, False, day, hist, allow_bootstrap=False)
-                if job is not None:
-                    jobs.append(job)
-            priority = {"split": 0, "confirm": 1, "update": 2}
-            jobs.sort(key=lambda job: (priority.get(job.kind, 9), job.last_valid or date.min, job.symbol))
-            _run_jobs(ctx, day, jobs, hist, tally, outcomes)
+        # D 公布前每輪最多就 SPY 這 1 個請求（2026-10-23）；有 D 了這裡只剩它自己的分割／待確認重抓
+        probe = _job_for(ctx, HIST_PROBE_SYMBOL, True, day, hist, allow_bootstrap=True)
+        stopped = _run_jobs(ctx, day, [probe] if probe else [], hist, tally, outcomes)
+        if not stopped and _d_published(ctx, day):
+            _open_gate(hist, day)
+            others = [_job_for(ctx, sym, True, day, hist, allow_bootstrap=True)
+                      for sym in ETFS if sym != HIST_PROBE_SYMBOL]
+            stopped = _run_jobs(ctx, day, [job for job in others if job], hist, tally, outcomes)
+            if not stopped:
+                jobs = []
+                for symbol in universe:
+                    if ctx.should_stop():
+                        tally.stopped_early = True
+                        break
+                    job = _job_for(ctx, symbol, False, day, hist, allow_bootstrap=False)
+                    if job is not None:
+                        jobs.append(job)
+                priority = {"split": 0, "confirm": 1, "update": 2}
+                jobs.sort(key=lambda job: (priority.get(job.kind, 9), job.last_valid or date.min, job.symbol))
+                _run_jobs(ctx, day, jobs, hist, tally, outcomes)
         if hist.get("pruned_for") != day.isoformat():
             ctx.store.prune(MARKET, HIST_KEEP_SESSIONS)
             hist["pruned_for"] = day.isoformat()
     finally:
         _save_state(ctx, "us.hist", hist)
-        _hist_status(ctx, day, universe, hist, outcomes, waiting=waiting)
+        _hist_status(ctx, day, universe, hist, outcomes)
     status = tally.status()
-    return "not_yet" if waiting and status is None else status
+    # SPY 還沒有 D：Nasdaq 還沒公布（或 D 臨時休市），還沒公布不算失敗
+    return "not_yet" if status is None and not _d_published(ctx, day) else status
 
 
 def _bootstrap_candidates(ctx: Any, day: date, hist: dict, universe: list[str]) -> list[str]:
@@ -996,7 +1054,8 @@ def _bootstrap_candidates(ctx: Any, day: date, hist: dict, universe: list[str]) 
 
 def _due_hist_backfill(ctx: Any) -> bool:
     day = current_d(ctx)
-    if day is None or nasdaq_blocked(ctx):
+    # 2026-10-23：還沒有歷史的成分股也等 SPY 有 D——D 公布前只探 SPY；公布前補的一年只到 D−1，公布後還得再抓一次
+    if day is None or nasdaq_blocked(ctx) or not _d_published(ctx, day):
         return False
     hist = _hist_state(ctx, day)
     if int(hist["run"]["used"]) >= HIST_MAX_SYMBOLS_PER_RUN:
@@ -1019,7 +1078,7 @@ def _run_hist_backfill(ctx: Any) -> Optional[str]:
     finally:
         _save_state(ctx, "us.hist", hist)
         if outcomes:
-            _hist_status(ctx, day, universe, hist, outcomes, waiting=False)
+            _hist_status(ctx, day, universe, hist, outcomes)  # 不再帶 waiting：閘門狀態由 SPY 的 D 列決定
     return tally.status()
 
 
@@ -1147,13 +1206,19 @@ def _note_seen(ctx: Any, symbol: str, last: datetime, timestamp: datetime) -> No
 
 
 def _maybe_provisional(ctx: Any, day: date, chain: Any, last: datetime) -> bool:
-    """Nasdaq 被擋時用 CBOE 的收盤當 D 的 provisional（PLAN §18.7）：last_trade_time 的美東日期＝D、時間 ≥ 收盤；
-    已有 Nasdaq 正式列就不寫。量也照寫，但 market_calc 看 provisional／來源，不拿它算 20 日量能倍數。"""
+    """Nasdaq 日線還沒有 D 列時用 CBOE 的收盤當 D 的 provisional（PLAN §18.7）：last_trade_time 的美東日期＝D、
+    時間在收盤前 60 秒以後；已有 Nasdaq 正式列就不寫。量也照寫，但 market_calc 看 provisional／來源，不拿它算
+    20 日量能倍數。chain 也可以是 VOO 的報價（Quote，沒有量）。
+
+    2026-10-23（investigations/freshness_20261023.md §3 第 2 點）：以前還要 Nasdaq 被擋、last_trade_time ≥ 收盤，
+    可是 Nasdaq 只是晚公布時不算被擋、CBOE 又寫 15:59:59，實際上從來沒寫過；現在 ETF 列收盤後約 45 分鐘就是 D。"""
     symbol = getattr(chain, "symbol", None)
-    if symbol not in ETFS or not nasdaq_blocked(ctx) or last.date() != day:
+    if symbol not in ETFS or last.date() != day:
         return False
     close_time = ctx.us_cal.close_time(day)
-    if close_time is None or last < close_time or _has_official_row(ctx, symbol, day):
+    if close_time is None or last < close_time - timedelta(seconds=CBOE_CLOSE_SLACK_S):
+        return False
+    if _has_official_row(ctx, symbol, day):
         return False
     close = _finite(getattr(chain, "close", None)) or _finite(getattr(chain, "spot", None))
     if close is None or close <= 0:
@@ -1161,6 +1226,32 @@ def _maybe_provisional(ctx: Any, day: date, chain: Any, last: datetime) -> bool:
     ctx.store.upsert_closes(MARKET, symbol, [(day, close, _count(getattr(chain, "volume", None)))], SRC_CBOE,
                             provisional=True)
     return True
+
+
+def _close_quotes_wanted(ctx: Any, day: date) -> tuple[str, ...]:
+    """要抓 CBOE 收盤報價的 ETF（VOO）：已經有歷史、Nasdaq 日線還沒有 D 的正式列（2026-10-23）。不需要時不列進
+    這批：不花請求，也不讓「沒事做」算成完成（期權鏈全部失敗時任務照樣記失敗）。"""
+    return tuple(symbol for symbol in CLOSE_QUOTE_SYMBOLS
+                 if _last_valid(ctx, symbol) is not None and not _has_official_row(ctx, symbol, day))
+
+
+def _store_close_quote(ctx: Any, day: date, symbol: str) -> str:
+    """沒有期權鏈的 ETF（VOO）：抓 CBOE 約 1 KB 的報價，收盤寫成 D 的 provisional（2026-10-23）。檔還沒到收盤後
+    （盤前不更新、過舊）→ 等下一次；資料日已經過了 D → 不必再抓。"""
+    if _has_official_row(ctx, symbol, day):
+        return "done"  # 排進這批之後 Nasdaq 正式列剛好到了
+    quote = src.fetch_cboe_etf_quote(symbol, http=ctx.http, ledger=ctx.ledger)
+    timestamp = getattr(quote, "timestamp_utc", None)
+    if not isinstance(timestamp, datetime) or timestamp.tzinfo is None:
+        raise market_calc.ParseError("date")
+    last = _last_trade_et(getattr(quote, "last_trade_et", None))
+    if last.date() > day:
+        return "done"  # 檔已經是下一個場次的：D 的收盤從這裡拿不到了，不再抓
+    stale = (_now_utc(ctx) - timestamp).total_seconds() > CBOE_MAX_AGE_S
+    if stale or last.date() < day or not _post_close(ctx, day, timestamp):
+        return "not_yet"  # 只是備援：ETF 報價檔常常晚更新（實測 VOO 收盤後約 4 小時），不算失敗
+    _maybe_provisional(ctx, day, quote, last)
+    return "done"
 
 
 def _store_chain(ctx: Any, day: date, symbol: str, chain: Any) -> str:
@@ -1202,8 +1293,14 @@ def _closure_evidence(ctx: Any, day: date) -> Optional[str]:
     return evidence
 
 
+def _options_items(ctx: Any, day: Optional[date]) -> tuple[str, ...]:
+    """期權鏈三檔，需要時最後加 VOO 的收盤報價（排最後：期權鏈每檔最多 30 秒，時間不夠時被擠掉的是最不要緊的）。"""
+    return OPTION_SYMBOLS + (_close_quotes_wanted(ctx, day) if day is not None else ())
+
+
 def _due_options(ctx: Any) -> bool:
-    return _batch_due(ctx, "us.options", _iso(current_d(ctx)), OPTION_SYMBOLS, max_not_yet=CBOE_MAX_NOT_YET)
+    day = current_d(ctx)
+    return _batch_due(ctx, "us.options", _iso(day), _options_items(ctx, day), max_not_yet=CBOE_MAX_NOT_YET)
 
 
 def _run_options(ctx: Any) -> Optional[str]:
@@ -1212,11 +1309,13 @@ def _run_options(ctx: Any) -> Optional[str]:
         return None
 
     def one(symbol: str) -> str:
+        if symbol in CLOSE_QUOTE_SYMBOLS:
+            return _store_close_quote(ctx, day, symbol)
         chain = src.fetch_cboe_options(symbol, http=ctx.http, ledger=ctx.ledger)
         return _store_chain(ctx, day, symbol, chain)
 
     try:
-        return _run_batch(ctx, "us.options", day.isoformat(), OPTION_SYMBOLS, one, obs_for=OBS_OPTIONS.get,
+        return _run_batch(ctx, "us.options", day.isoformat(), _options_items(ctx, day), one, obs_for=OBS_OPTIONS.get,
                           max_not_yet=CBOE_MAX_NOT_YET, not_yet_retry_s=CBOE_RETRY_S)
     finally:
         _closure_evidence(ctx, day)
