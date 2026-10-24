@@ -143,6 +143,11 @@ TEXT_STALE = "過期（資料日 {md}）"
 TEXT_MISSING = "暫缺"
 TEXT_UNKNOWN_PERIOD = "期間未標"
 TEXT_INSUFFICIENT = "資料不足"
+# 美股 ETF 列的收盤是 CBOE 的暫定值（Nasdaq 正式日線還沒到；2026-10-23 審查 r9 Codex 席 I2）：publish 寫進列的 source，
+# bot 只拿它和這個常數比、不印快照裡的字
+SOURCE_CBOE_FALLBACK = "CBOE（備援）"
+TEXT_PROVISIONAL = "（暫定）"
+TEXT_PROVISIONAL_CLOSE = "收盤是 CBOE 的暫定值，Nasdaq 正式資料到了會更新"
 TEXT_ACCUMULATING = "資料累積中（{n}/5）"
 TEXT_CALENDAR_PENDING = "日曆待更新"
 TEXT_NOT_UPDATED = "未更新"
@@ -1130,10 +1135,13 @@ def volume_state(
     quarantine＝這檔的隔離區間：分割前後的量不同口徑，碰到的窗口不算倍數／百分位（2026-10-23 審查 r7 #5）。
     """
     sessions = _sessions_upto(calendar if calendar is not None else volumes.keys(), D, VOL_PCT_DAYS)
-    if not sessions or sessions[-1] != D or not _volume_ok(volumes.get(D)):
+    if not sessions or sessions[-1] != D:
         return VolumeState(None, None, None, None, day_flag)
+    # 備援的日子先判：VOO 的 CBOE 報價沒有量，不能變成「暫缺」、和其他三檔的「暫不判斷」兩種寫法（審查 r9 Codex 席）
     if D in excluded:
         return VolumeState(None, None, None, None, day_flag, TEXT_VOL_SOURCE_DIFF)
+    if not _volume_ok(volumes.get(D)):
+        return VolumeState(None, None, None, None, day_flag)
 
     def usable(day: date) -> bool:
         return day not in excluded and _volume_ok(volumes.get(day))

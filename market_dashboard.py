@@ -421,6 +421,7 @@ class _View:
     values: dict
     data_date: Optional[date] = None
     period_unknown: bool = False
+    provisional: bool = False  # 收盤是 CBOE 的暫定值（列的 source＝SOURCE_CBOE_FALLBACK）
 
     @property
     def fresh(self) -> bool:
@@ -450,7 +451,8 @@ class _Ctx:
             return _View(MISSING, {}, day)  # state=never、壞列：暫缺
         if self.now > stale_after:
             return _View(STALE, {}, day)
-        return _View(FRESH, values, day, state == "unknown_period")
+        return _View(FRESH, values, day, state == "unknown_period",
+                     raw.get("source") == market_calc.SOURCE_CBOE_FALLBACK)
 
     def gap(self, view: _View, *, short: bool = False) -> str:
         """不顯示數字時的那格：過期（資料日 X/X）或暫缺。"""
@@ -660,10 +662,11 @@ def _etf_line(ctx: _Ctx, view: _View, name: str, main_day: Optional[date]) -> tu
     change_text = f" {_pct(change, 2)}" if change is not None else ""
     status_text = f" {status}" if status else ""
     suffix = _date_suffix(view.data_date, main_day)
+    tag = market_calc.TEXT_PROVISIONAL if view.provisional else ""  # 暫定的收盤每個寫法都要標，不能被 _fit 拿掉
     text = _fit(
-        f"{name}{close_text}{change_text}{status_text}{suffix}",
-        f"{name}{close_text}{change_text}{status_text}",
-        f"{name}{close_text}{status_text}",
+        f"{name}{close_text}{change_text}{status_text}{tag}{suffix}",
+        f"{name}{close_text}{change_text}{status_text}{tag}",
+        f"{name}{close_text}{status_text}{tag}",
     )
     return text, _above_color(above)
 
@@ -1387,6 +1390,8 @@ def _tech_rows(ctx: _Ctx, view: _View, label: str, *, named: bool = False) -> li
     if change is not None:
         head += f"（{_pct(change, 2)}）"
     rows = [_text(head, size="xl", weight="bold")]
+    if view.provisional:
+        rows.append(_text(market_calc.TEXT_PROVISIONAL_CLOSE, color=GRAY))
     status = _above_word(above)
     if status:
         rows.append(_text(f"{subject}{status}", color=_above_color(above)))
@@ -1411,13 +1416,14 @@ def _tech_rows(ctx: _Ctx, view: _View, label: str, *, named: bool = False) -> li
     word = _vol_word(values)
     flag = _word(values.get("vol_flag"), _VOL_FLAGS)
     if ratio is not None or word:
-        line = "量能："
+        parts = []  # 前面沒有字時不能出現「量能：，暫不判斷」（審查 r9 Codex 席）
         if ratio is not None:
-            line += f"{ratio:.2f} 倍（前 20 日平均）"
+            parts.append(f"{ratio:.2f} 倍（前 20 日平均）")
         if rank is not None:
-            line += f"，近 250 日第 {rank:.0f} 百分位"
+            parts.append(f"近 250 日第 {rank:.0f} 百分位")
         if word:
-            line += f"，{word}"
+            parts.append(word)
+        line = "量能：" + "，".join(parts)
         if flag:
             line += f"（{flag}）"
         rows.append(_text(line))

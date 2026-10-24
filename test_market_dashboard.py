@@ -1293,6 +1293,23 @@ def _macro_rows(md, paths, snap, now=NOW):
     return texts(card["contents"][3]["body"]), texts(news["contents"][2]["body"])
 
 
+def test_provisional_us_close_is_marked_on_the_cards(md, paths):
+    """2026-10-23 審查 r9 Codex 席 I2：ETF 列的收盤是 CBOE 的暫定值時，卡上要看得出來（摘要列「（暫定）」、細節卡一句
+    固定說明）；量能寫「暫不判斷」，前面不能多一個「，」。"""
+    snap = make_snapshot(NOW)
+    snap["rows"]["us.etf.VOO"]["source"] = md.market_calc.SOURCE_CBOE_FALLBACK
+    snap["rows"]["us.etf.VOO"]["values"].update(vol_ratio=None, vol_pct250=None, vol_label=None,
+                                                 vol_note=md.market_calc.TEXT_VOL_SOURCE_DIFF)
+    write_snapshot(paths, snap)
+    us = texts(md.handle("", now=NOW, paths=paths).flex["contents"][0]["body"])
+    line = next(text for text in us if text.startswith("標普500（VOO）"))
+    assert "（暫定）" in line and md.row_width(line) <= 24
+    detail = reply_strings(md.handle(" VOO", now=NOW, paths=paths))
+    assert md.market_calc.TEXT_PROVISIONAL_CLOSE in detail
+    assert not any("量能：，" in text for text in detail)
+    assert not any("（暫定）" in text for text in texts(md.handle("", now=NOW, paths=paths).flex["contents"][1]["body"]))
+
+
 def test_two_etf_proxies_keep_their_whole_changes(md, paths):
     """2026-10-23 審查 r7 #2：兩列都是代理、短寫法還超過 24 字寬 → 原本逐字切成「+12.…」。"""
     snap = make_snapshot(NOW)

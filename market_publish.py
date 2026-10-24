@@ -719,7 +719,7 @@ def _us_etf(ctx: _Ctx, row_id: str) -> RowResult:
         market_calc.etf_values(tech, volume),
         data_date=day,
         stale_after=ctx.stale(market_calc.KIND_US_DAILY, day),
-        source="CBOE（備援）" if rows[-1][4] else "Nasdaq",
+        source=market_calc.SOURCE_CBOE_FALLBACK if rows[-1][4] else "Nasdaq",
         basis=market_calc.TEXT_US_NO_DIVIDEND,
         facts={
             f"{symbol}.chg_pct": tech.chg_pct,

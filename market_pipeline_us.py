@@ -142,6 +142,9 @@ HIST_PROBE_SYMBOL = "SPY"
 # SPY 探滿 HIST_MAX_RETRIES 次還沒有 D，就每小時也探 VOO：SPY 自己出狀況（廠商錯誤、待確認）時，閘門不能整天跟著關
 # （2026-10-23 審查 r9 gp2 I3）。兩檔都不放棄；D 公布了沒看 ETFS 任一檔有沒有正式列
 HIST_BACKUP_PROBE = "VOO"
+# 備援探針看時間、不看 SPY 的重排次數：SPY 卡在待確認或回格式錯時根本不會記 miss（2026-10-23 審查 r9 Codex 席 I1）。
+# 2.5 小時＝SPY 前 5 次每 30 分鐘探完的時間
+HIST_BACKUP_AFTER_S = 2.5 * 3600
 _HIST_PROBES = (HIST_PROBE_SYMBOL, HIST_BACKUP_PROBE)
 HIST_PROBE_S = 3600.0
 GUARD_DIFF = 0.005
@@ -936,6 +939,8 @@ def _run_jobs(ctx: Any, day: date, jobs: list[_Job], hist: dict, tally: _Tally, 
             kind = _kind(exc)
             tally.fail(exc)
             outcomes["error:" + kind] += 1
+            if job.symbol == HIST_PROBE_SYMBOL and kind not in _STOP_KINDS:  # SPY 自己壞了：下一輪起 VOO 一起探
+                hist["probe_error"] = {"d": day.isoformat(), "kind": kind}
             if kind in _BLOCK_KINDS:
                 hist["blocked"] = {"kind": kind, "at": float(ctx.now)}
             if kind in _STOP_KINDS:
@@ -950,6 +955,15 @@ def _run_jobs(ctx: Any, day: date, jobs: list[_Job], hist: dict, tally: _Tally, 
         else:
             tally.done += 1
     return False
+
+
+def _since_d_change(ctx: Any, day: date) -> float:
+    """D 換日（美東收盤＋30 分鐘）到現在幾秒；日曆不知道那天的收盤時間 → 0（不提早探備援）。"""
+    try:
+        close = ctx.us_cal.close_time(day)
+    except Exception:  # noqa: BLE001
+        return 0.0
+    return float(ctx.now) - (close.timestamp() + 1800.0) if close is not None else 0.0
 
 
 def _d_published(ctx: Any, day: date) -> bool:
@@ -1022,8 +1036,8 @@ def _run_hist_core(ctx: Any) -> Optional[str]:
         _record_universe(ctx, members, len(universe) + len(ETFS), day)
         # D 公布前每輪最多就 SPY 這 1 個請求（2026-10-23）；有 D 了這裡只剩它自己的分割／待確認重抓
         probes = [HIST_PROBE_SYMBOL]
-        spy_entry = hist.get("retry", {}).get(HIST_PROBE_SYMBOL) or {}
-        if spy_entry.get("d") == day.isoformat() and int(spy_entry.get("n") or 0) > HIST_MAX_RETRIES:
+        spy_broke = (hist.get("probe_error") or {}).get("d") == day.isoformat()
+        if spy_broke or _since_d_change(ctx, day) >= HIST_BACKUP_AFTER_S:
             probes.append(HIST_BACKUP_PROBE)
         jobs = [_job_for(ctx, symbol, True, day, hist, allow_bootstrap=True) for symbol in probes]
         stopped = _run_jobs(ctx, day, [job for job in jobs if job], hist, tally, outcomes)

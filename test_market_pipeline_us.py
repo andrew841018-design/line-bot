@@ -724,8 +724,8 @@ def test_d_is_probed_with_spy_only_then_hourly_until_published(env):
         assert env.store.task_state("us.hist")["fail_streak"] == 0
         assert kind == ("not_yet" if step < 12 else "ok"), step
     assert [minute for minute, keys in seen.items() if "SPY" in keys] == [0, 30, 60, 90, 120, 180]
-    # SPY 探滿 5 次還沒有 D：VOO 也開始探（審查 r9 gp2 I3）；公布前只有這兩檔
-    assert [minute for minute, keys in seen.items() if "VOO" in keys and minute < 180] == [135, 165]
+    # D 換日（16:30 美東，NOW 是 17:00）滿 2.5 小時，VOO 也開始探（審查 r9 gp2 I3／Codex 席 I1）；公布前只有這兩檔
+    assert [minute for minute, keys in seen.items() if "VOO" in keys and minute < 180] == [120, 150]
     assert all(set(keys) <= {"SPY", "VOO"} for minute, keys in seen.items() if minute < 180)
     assert seen[180] == ["SPY", "VOO", "QQQ", "SOXX", "AAA", "BBB"]
     assert all(keys == [] for minute, keys in seen.items() if minute > 180)
@@ -748,6 +748,22 @@ def test_gate_opens_through_voo_when_spy_alone_keeps_failing(env):
     assert D in closes(env, "VOO") and D in closes(env, "QQQ") and D in closes(env, "AAA")
     assert D not in closes(env, "SPY") and env.store.task_state("us.hist")["fail_streak"] == 0
     assert "ok" in kinds or "partial" in kinds
+
+
+def test_gate_opens_through_voo_when_spy_keeps_giving_bad_data(env):
+    """2026-10-23 審查 r9 Codex 席 I1：SPY 回格式錯（或卡在待確認）時不會記 miss，只看 SPY 重排次數的備援永遠不
+    啟動，其他 ETF、成分股、宏觀代理就凍結好幾天。SPY 壞過一次，下一輪 VOO 就一起探；VOO 有 D 就開閘門。"""
+    etfs_ready(env)
+    env.http.hist_raw["SPY"] = {"data": {"symbol": "QQQ", "totalRecords": 0, "tradesTable": None}, "message": None,
+                                "status": {"rCode": 200, "bCodeMessage": None, "developerMessage": None}}
+    seed_universe(env, ["AAA"])
+    seed(env, "AAA", flat(HISTORY, 50.0))
+    env.http.prices["AAA"] = flat(HISTORY + [D], 50.0)
+    for step in range(4):
+        run(env, "us.hist", NOW + step * 900)
+    assert D in closes(env, "VOO") and D in closes(env, "QQQ") and D in closes(env, "AAA")
+    # SPY 自己的資料壞了照樣記失敗（每日維護看得到），只是不再擋住其他檔
+    assert D not in closes(env, "SPY") and env.store.task_state("us.hist")["fail_streak"] >= 1
 
 
 def test_gate_opens_even_when_the_old_etf_retries_are_used_up(env):
