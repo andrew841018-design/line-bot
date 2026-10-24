@@ -409,9 +409,14 @@ def delete_message_events(
     )
 
 
+# 本人刪掉全部紀錄時保留的去重種類：119 回覆（只有訊息 ID）、運動提醒（2026-10-23：只有日期和時間，不含健康資料；
+# 刪了的話刪完下一句話又會被提醒）
+_KEPT_ON_DELETE = ("reply", "exercise_nudge")
+
+
 def delete_role_events(group_id: str, role: str, *, db_path: Path | str | None = None) -> int:
     """本人刪掉自己的全部紀錄。由紀錄算出來的私訊去重（種類含標籤或讀數）一起刪；119 回覆的
-    去重（每天上限、30 分鐘）只有訊息 ID，保留。回刪掉的紀錄筆數。"""
+    去重（每天上限、30 分鐘）只有訊息 ID、運動提醒的去重只有日期，保留。回刪掉的紀錄筆數。"""
     if not group_id or role not in ROLES:
         return 0
     init_db(db_path)
@@ -423,8 +428,8 @@ def delete_role_events(group_id: str, role: str, *, db_path: Path | str | None =
                 (group_id, role),
             ).rowcount
             c.execute(
-                "DELETE FROM parent_health_alerts WHERE group_id = ? AND role = ? AND kind <> 'reply'",
-                (group_id, role),
+                "DELETE FROM parent_health_alerts WHERE group_id = ? AND role = ? AND kind NOT IN (?, ?)",
+                (group_id, role, *_KEPT_ON_DELETE),
             )
             c.execute("COMMIT")
         except BaseException:
@@ -452,6 +457,27 @@ def claim_alert(
             "INSERT OR IGNORE INTO parent_health_alerts (group_id, role, kind, key, sent_at) "
             "VALUES (?, ?, ?, ?, ?)",
             (group_id, role, kind, key, int(now)),
+        )
+        == 1
+    )
+
+
+def release_alert(
+    group_id: str,
+    role: str,
+    kind: str,
+    key: str,
+    *,
+    sent_at: int,
+    db_path: Path | str | None = None,
+) -> bool:
+    """放掉 claim_alert 搶到的那一列（2026-10-23 運動提醒：LINE 明確說沒送出時）。key 與 sent_at 都要對：
+    只刪自己搶到的那一列，別人後來搶的不會被刪。真的刪到才回 True。"""
+    return (
+        _write(
+            db_path,
+            "DELETE FROM parent_health_alerts WHERE group_id = ? AND role = ? AND kind = ? AND key = ? AND sent_at = ?",
+            (group_id, role, kind, key, int(sent_at)),
         )
         == 1
     )

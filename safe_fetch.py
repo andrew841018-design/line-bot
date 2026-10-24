@@ -12,17 +12,25 @@ fill memory.  So every fetch here
 - follows redirects one hop at a time, checking each target the same way;
 - stops reading at a byte limit and gives up at a wall-clock deadline.
 
+2026-10-23 (PLAN A, GP2 N1): the bot never reads its own large-print card
+pages.  A family member may paste a 「🔍 看大字版」 link back into the chat; a
+health page holds readings, which must not reach a model prompt.  Any quick
+tunnel host (*.trycloudflare.com), the fixed page host in
+LINE_BOT_CARD_PAGES_BASE_URL and any /card/<token> path are refused
+(`is_bot_page`).  No card_pages import: market_http fetches through here too.
+
 main.py reaches the network only through `http.get` / `http.head`.
 """
 
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
 import socket
 import sys
 import threading
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -46,6 +54,11 @@ _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _NAT64 = ipaddress.ip_network("64:ff9b::/96")
 _FORBIDDEN_URL_CHARS = re.compile(r"[\x00-\x20\x7f\\]")
 _FORBIDDEN_HEADERS = frozenset({"authorization", "cookie", "proxy-authorization", "host"})
+# The bot's own pages (card_pages): the quick tunnel's domain, the fixed host
+# named by this variable, and the /card/<22-character token> route.
+_TUNNEL_DOMAIN = "trycloudflare.com"
+_PAGE_BASE_URL_ENV = "LINE_BOT_CARD_PAGES_BASE_URL"
+_CARD_PATH_RE = re.compile(r"/card/[A-Za-z0-9_-]{22}")
 
 
 class FetchRefused(ValueError):
@@ -104,10 +117,40 @@ _resolve = _resolve_impl
 _connect_getaddrinfo = socket.getaddrinfo  # the lookup right before connecting
 
 
+def _page_base_host() -> str:
+    """The host of LINE_BOT_CARD_PAGES_BASE_URL, lower-case; "" when unset or unreadable."""
+    raw = os.environ.get(_PAGE_BASE_URL_ENV, "").strip()
+    if not raw:
+        return ""
+    try:
+        return (urlsplit(raw).hostname or "").rstrip(".").lower()
+    except ValueError:
+        return ""
+
+
+def is_bot_page(url: str) -> bool:
+    """A link to the bot's own pages: any quick tunnel host, the fixed page host,
+    or a /card/<token> path on any host (percent-encoding decoded first, as the
+    web server does before routing).  Syntax only; never raises."""
+    try:
+        parts = urlsplit(url if isinstance(url, str) else "")
+        host = (parts.hostname or "").rstrip(".").lower()
+        path = unquote(parts.path)
+    except ValueError:
+        return False
+    if host == _TUNNEL_DOMAIN or host.endswith("." + _TUNNEL_DOMAIN):
+        return True
+    base_host = _page_base_host()
+    if base_host and host == base_host:
+        return True
+    return _CARD_PATH_RE.search(path) is not None
+
+
 def public_host(url: str) -> str:
     """The host a URL points at, or BlockedURL — syntax only, no DNS.
 
     Also used before handing a link to yt-dlp, which has no connect guard.
+    The bot's own pages are refused too (`is_bot_page`).
     """
     if not isinstance(url, str) or _FORBIDDEN_URL_CHARS.search(url):
         raise BlockedURL("url characters")
@@ -135,6 +178,8 @@ def public_host(url: str) -> str:
     # to 127.0.0.1.  Backslashes are refused above; any other disagreement too.
     if other != ascii_host.lower():
         raise BlockedURL("ambiguous host")
+    if is_bot_page(url):
+        raise BlockedURL("bot page")
     return ascii_host.lower()
 
 

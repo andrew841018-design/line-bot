@@ -69,6 +69,12 @@ os.environ.setdefault("GROK_API_KEY", "dummy")
 os.environ.setdefault("BOT_MUTED", "true")
 # 2026-10-16 字卡大字版：測試預設不產生網頁、不加按鈕（本機有 tunnel 網址檔），要測的測試自己打開
 os.environ["LINE_BOT_CARD_PAGES"] = "0"  # 直接設：shell 有 export 也不能讓測試讀真的 tunnel 檔、寫進 state/
+# 2026-10-23 爸媽健康大字版（N7）：清健康頁不看上面的開關（刪除、暫停、收回訊息都要清），測試之間與
+# 測試結束後的頁面目錄也一律指到隔離路徑，絕不落回正式 state/card_pages；每個測試另有自己的（isolate_card_pages）。
+os.environ["LINE_BOT_CARD_PAGES_DIR"] = str(
+    Path(tempfile.gettempdir()) / f"line_bot_pytest_quarantine_{os.getpid()}_card_pages"
+)
+os.environ.pop("LINE_BOT_EXERCISE_NUDGE", None)  # 2026-10-23 運動提醒：程式預設關，測試不吃 shell 的設定
 # 2026-10-17 TikTok 讀取：預設關閉（0 = 不送 Gemini、不下載），要測的測試用假物件自己打開
 # TODO(2026-10-17 D4): 這只關掉讀影片／圖片；沒有替換 yt-dlp 的既有測試仍可能真的連網抓 metadata。
 os.environ["LINE_BOT_TIKTOK_MEDIA_DAILY_CAP"] = "0"
@@ -467,6 +473,17 @@ def isolate_parent_health(monkeypatch):
     except Exception:
         return
     monkeypatch.setattr(parent_health, "_BACKGROUND_ENABLED", False, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def isolate_card_pages(monkeypatch, tmp_path_factory):
+    """2026-10-23（GP2 N7）：大字版網頁目錄一律指到這個測試自己的暫存目錄。清健康頁不看開關，
+    刪除、暫停、收回訊息的測試會呼叫它：在正式目錄跑 pytest（每日維護、部署前）也不能刪到正式的頁。
+    運動提醒的開關每個測試都從「沒設」開始（程式預設關）。"""
+    monkeypatch.setenv("LINE_BOT_CARD_PAGES_DIR", str(tmp_path_factory.mktemp("card_pages") / "pages"))
+    monkeypatch.delenv("LINE_BOT_EXERCISE_NUDGE", raising=False)
+    monkeypatch.delenv("LINE_BOT_CARD_PAGE_HEALTH", raising=False)
+    monkeypatch.delenv("LINE_BOT_CARD_PAGE_HEALTH_TTL_HOURS", raising=False)
 
 
 @pytest.fixture(autouse=True)
