@@ -158,6 +158,12 @@ def route_proxies(env: SimpleNamespace, bars_for) -> None:
         env.http.route(f"/api/quote/{etf}/historical", lambda url, etf=etf: nasdaq_hist(etf, bars_for(etf)))
 
 
+def nasdaq_published_d(env: SimpleNamespace, *, day: date = D, provisional: bool = False) -> None:
+    """Nasdaq 日線端點已公布 D：SPY（market_pipeline_us 一直在追的那檔）在 closes 表有 D 的正式列。
+    宏觀的 ETF 代理要等到這個才去抓（2026-10-23）；provisional＝CBOE 的備援列，不算公布。"""
+    env.store.upsert_closes("us", "SPY", [(day, 600.0, 1_000)], "cboe" if provisional else "nasdaq", provisional=provisional)
+
+
 def rfc(moment: datetime) -> str:
     return format_datetime(moment.astimezone(UTC), usegmt=True)
 
@@ -246,6 +252,7 @@ def test_yahoo_once_per_d_keeps_rows_up_to_d_with_yahoo_labels(env):
 def test_yahoo_failure_switches_to_proxies_and_labels_each_value(env):
     env.http.route("finance.yahoo.com", market_http.FetchError("rate_limited"))
     route_proxies(env, lambda etf: full_week(20.0) + [(date(2026, 10, 16), 30.0)])  # D 之後那根也要丟
+    nasdaq_published_d(env)
     env.store.put_obs(
         tw.OBS_FX, {"date": "2026-10-15", "usd_ntd": 32.338, "prev_date": "2026-10-14", "prev_usd_ntd": 32.3},
         data_date="2026-10-15",
@@ -275,38 +282,87 @@ def test_partial_yahoo_response_sends_only_the_missing_symbols_to_proxies(env):
     entries = {symbol: full_week(10.0) for symbol in YAHOO.values() if symbol != "^RUT"}
     env.http.route("finance.yahoo.com", spark(entries))
     route_proxies(env, lambda etf: full_week(200.0))
+    nasdaq_published_d(env)
     assert run(make_ctx(env, NOW_AFTER_D), "macro.yahoo") == "ok"
     assert [urlsplit(url).path for url in env.http.calls if "nasdaq" in url] == ["/api/quote/IWM/historical"]
     assert payload(env, "macro.RUT")["source"] == "ETF 代理：IWM"
     assert payload(env, "macro.DJI")["source"] == "Yahoo"
 
 
-def test_proxy_without_the_d_bar_is_fetched_once_more_after_30_minutes(env):
+def test_proxies_wait_until_spy_has_the_official_d_row(env):
+    """2026-10-23：Nasdaq 日線端點要收盤後好幾個小時才公布 D 那列。ETF 代理原本 D 換日（04:43）就開打、30 分鐘後放棄，
+    8 列整天停在前一個交易日。現在等 SPY 在 closes 表有 D 的正式列才去抓：之前一個請求都不送，之後每個代理抓一次。"""
+    env.http.route("finance.yahoo.com", market_http.FetchError("rate_limited"))
+    route_proxies(env, lambda etf: full_week(20.0))
+    env.store.put_obs(tw.OBS_FX, {"date": "2026-10-15", "usd_ntd": 32.3}, data_date="2026-10-15")
+    assert run(make_ctx(env, NOW_AFTER_D), "macro.yahoo") == "partial"
+    assert env.http.count("api.nasdaq.com") == 0  # D 換日那一輪：Nasdaq 還沒公布，不打
+    state = misc._state(env.store, misc.TASK_MACRO)
+    assert state["pending"] == {key: {"tries": 0} for key in PROXIES}  # 等著，這不算一次
+    assert env.store.get_obs("macro.DXY") is None and env.store.get_obs("macro.BTC") is None
+    assert payload(env, "macro.USDTWD")["source"] == "代理：期交所匯率"  # 台幣不走 Nasdaq：當場就有
+    # SPY 沒有 D 的正式列：之後每一輪都不排、不送請求；CBOE 的 provisional 或前一天的正式列都不算
+    nasdaq_published_d(env, provisional=True)
+    nasdaq_published_d(env, day=date(2026, 10, 14))
+    for offset in (60, 1800, 3 * 3600):
+        assert misc.macro_plan(make_ctx(env, NOW_AFTER_D + offset)) is None
+        assert run(make_ctx(env, NOW_AFTER_D + offset), "macro.yahoo") == "not_due"
+    assert env.http.count("api.nasdaq.com") == 0
+    # SPY 有了 D 的正式列：下一輪每個代理抓一次，都拿到 D，之後不再排
+    nasdaq_published_d(env)
+    later = NOW_AFTER_D + 4 * 3600
+    assert misc.macro_plan(make_ctx(env, later)) == {"d": D, "yahoo": False, "keys": sorted(PROXIES)}
+    assert run(make_ctx(env, later), "macro.yahoo") == "ok"
+    assert sorted(urlsplit(url).path for url in env.http.calls if "nasdaq" in url) == sorted(
+        f"/api/quote/{etf}/historical" for etf in PROXIES.values())
+    for key in PROXIES:
+        assert payload(env, f"macro.{key}")["date"] == "2026-10-15", key
+    assert misc.macro_plan(make_ctx(env, later + 3600)) is None
+
+
+def test_proxy_without_the_d_bar_is_fetched_again_every_hour(env):
     env.http.route("finance.yahoo.com", market_http.FetchError("status"))
     late = {"yes": False}
     route_proxies(env, lambda etf: full_week(20.0) if etf != "UUP" or late["yes"] else full_week(20.0)[:-1])
     env.store.put_obs(tw.OBS_FX, {"date": "2026-10-15", "usd_ntd": 32.3}, data_date="2026-10-15")
+    nasdaq_published_d(env)
     assert run(make_ctx(env, NOW_AFTER_D), "macro.yahoo") == "partial"
     assert payload(env, "macro.DXY")["date"] == "2026-10-14"  # 先放前一天的值（卡上看資料日）
-    assert misc.macro_plan(make_ctx(env, NOW_AFTER_D + 600)) is None  # 30 分鐘內不重抓
-    plan = misc.macro_plan(make_ctx(env, NOW_AFTER_D + 1800))
+    assert misc.macro_plan(make_ctx(env, NOW_AFTER_D + 1800)) is None  # 舊的 30 分鐘間隔不再重抓
+    assert misc.macro_plan(make_ctx(env, NOW_AFTER_D + 3599)) is None
+    plan = misc.macro_plan(make_ctx(env, NOW_AFTER_D + 3600))
     assert plan == {"d": D, "yahoo": False, "keys": ["DXY"]}
     late["yes"] = True
     before = env.http.count("finance.yahoo.com")
-    assert run(make_ctx(env, NOW_AFTER_D + 1800), "macro.yahoo") == "ok"  # 這次只重抓 UUP（MOVE 第一次就記了失敗）
+    assert run(make_ctx(env, NOW_AFTER_D + 3600), "macro.yahoo") == "ok"  # 這次只重抓 UUP（MOVE 第一次就記了失敗）
     assert env.http.count("finance.yahoo.com") == before  # Yahoo 一個 D 只打一次
     assert payload(env, "macro.DXY")["date"] == "2026-10-15"
     assert misc.macro_plan(make_ctx(env, NOW_AFTER_D + 7200)) is None
 
 
-def test_proxy_retry_is_limited_to_once(env):
+def test_proxy_retries_are_limited_to_three_per_d_so_the_budget_stays_small(env):
+    """每個代理每個 D：第一次＋最多再 3 次（每小時）。全部代理都抓不到 D 也只有 9×4＝36 個請求；平常第一次就拿到＝9 個。"""
     env.http.route("finance.yahoo.com", market_http.FetchError("status"))
     route_proxies(env, lambda etf: full_week(20.0)[:-1] if etf == "UUP" else full_week(20.0))
     env.store.put_obs(tw.OBS_FX, {"date": "2026-10-15", "usd_ntd": 32.3}, data_date="2026-10-15")
-    run(make_ctx(env, NOW_AFTER_D), "macro.yahoo")
-    run(make_ctx(env, NOW_AFTER_D + 1800), "macro.yahoo")
-    assert env.http.count("/api/quote/UUP/") == 2
-    assert misc.macro_plan(make_ctx(env, NOW_AFTER_D + 3600)) is None
+    nasdaq_published_d(env)
+    for hours in range(0, 8):
+        run(make_ctx(env, NOW_AFTER_D + hours * 3600), "macro.yahoo")
+    assert env.http.count("/api/quote/UUP/") == 4 == misc.PROXY_RETRIES + 1
+    assert all(env.http.count(f"/api/quote/{etf}/") == 1 for key, etf in PROXIES.items() if key != "DXY")
+    assert env.http.count("api.nasdaq.com") == 8 + 4
+    assert misc.macro_plan(make_ctx(env, NOW_AFTER_D + 12 * 3600)) is None
+
+
+def test_even_when_no_proxy_ever_gets_the_d_bar_a_day_costs_at_most_36_requests(env):
+    env.http.route("finance.yahoo.com", market_http.FetchError("status"))
+    route_proxies(env, lambda etf: full_week(20.0)[:-1])  # Nasdaq 一直沒有 D 那根
+    env.store.put_obs(tw.OBS_FX, {"date": "2026-10-15", "usd_ntd": 32.3}, data_date="2026-10-15")
+    nasdaq_published_d(env)
+    for hours in range(0, 10):
+        run(make_ctx(env, NOW_AFTER_D + hours * 3600), "macro.yahoo")
+    assert env.http.count("api.nasdaq.com") == len(PROXIES) * (misc.PROXY_RETRIES + 1) == 36
+    assert misc.macro_plan(make_ctx(env, NOW_AFTER_D + 20 * 3600)) is None  # 放棄之後不再打，直到下一個 D（台北 10/17 04:30）
 
 
 def test_usdtwd_proxy_fetches_taifex_once_when_the_tw_pipeline_has_nothing(env):
@@ -321,6 +377,69 @@ def test_usdtwd_proxy_fetches_taifex_once_when_the_tw_pipeline_has_nothing(env):
     usd = payload(env, "macro.USDTWD")
     # 期交所只給最新一天與前一天：最新那天（10/16）晚於 D 被丟掉，所以用 10/15、沒有前一筆可比
     assert usd["date"] == "2026-10-15" and usd["value"] == 32.338 and usd["chg"] is None
+
+
+def _usdtwd_after_the_d_change(env, *, fx_date: str = "2026-10-14", prev_date: str = "2026-10-13") -> dict:
+    """Yahoo 429、期交所的匯率檔還是前一天（tw.fx＝fx_date）：D 換日那一輪台幣用 tw.fx 的值（標「期交所代理」）。"""
+    env.http.route("finance.yahoo.com", market_http.FetchError("rate_limited"))
+    route_proxies(env, lambda etf: full_week(20.0))
+    nasdaq_published_d(env)
+    env.store.put_obs(tw.OBS_FX, {"date": fx_date, "usd_ntd": 32.3, "prev_date": prev_date, "prev_usd_ntd": 32.2}, data_date=fx_date)
+    assert run(make_ctx(env, NOW_AFTER_D), "macro.yahoo") == "partial"
+    return payload(env, "macro.USDTWD")
+
+
+def test_usdtwd_follows_tw_fx_when_it_advances_later_in_the_day(env):
+    """2026-10-23：期交所的匯率檔台北早上才更新，market_pipeline_tw 隔一陣子才讀到。宏觀任務原本只在 D 換日那一刻讀 tw.fx，
+    之後它前進了卡上的台幣還是前一天；現在 tw.fx 的資料日比 macro.USDTWD 新就重算（只讀 obs，不送請求）。"""
+    usd = _usdtwd_after_the_d_change(env)
+    assert usd["source"] == "代理：期交所匯率" and usd["date"] == "2026-10-14" and usd["value"] == 32.3
+    later = NOW_AFTER_D + 600  # 還沒到 pending 的 1 小時重試
+    assert misc.macro_plan(make_ctx(env, later)) is None  # tw.fx 沒前進：台幣不重算
+    nasdaq_before = env.http.count("api.nasdaq.com")
+    env.store.put_obs(
+        tw.OBS_FX, {"date": "2026-10-15", "usd_ntd": 32.338, "prev_date": "2026-10-14", "prev_usd_ntd": 32.3},
+        data_date="2026-10-15",
+    )
+    assert misc.macro_plan(make_ctx(env, later)) == {"d": D, "yahoo": False, "keys": ["USDTWD"]}
+    assert run(make_ctx(env, later), "macro.yahoo") == "ok"
+    usd = payload(env, "macro.USDTWD")
+    assert usd["date"] == "2026-10-15" and usd["value"] == 32.338 and usd["chg"] == pytest.approx(0.038)
+    assert env.store.get_obs("macro.USDTWD")["data_date"] == "2026-10-15"
+    assert env.http.count("taifex") == 0 and env.http.count("api.nasdaq.com") == nasdaq_before  # 沒有任何請求
+    assert misc.macro_plan(make_ctx(env, later + 60)) is None and misc.macro_plan(make_ctx(env, later + 7200)) is None
+
+
+def test_usdtwd_refresh_stops_at_d_and_does_not_loop_when_tw_fx_is_ahead_of_d(env):
+    usd = _usdtwd_after_the_d_change(env, fx_date="2026-10-16", prev_date="2026-10-15")  # 台股日期已經是 10/16，D 是 10/15
+    assert usd["date"] == "2026-10-15" and usd["value"] == 32.2  # 晚於 D 的那列丟掉（§18.8）
+    for offset in (60, 600, 7200):
+        assert misc.macro_plan(make_ctx(env, NOW_AFTER_D + offset)) is None, offset
+    assert run(make_ctx(env, NOW_AFTER_D + 600), "macro.yahoo") == "not_due"
+
+
+def test_usdtwd_from_yahoo_is_not_replaced_by_tw_fx(env):
+    entries = {symbol: full_week(10.0) for symbol in YAHOO.values()}
+    env.http.route("finance.yahoo.com", spark(entries))
+    env.store.put_obs(tw.OBS_FX, {"date": "2026-10-15", "usd_ntd": 32.338, "prev_date": "2026-10-14", "prev_usd_ntd": 32.3},
+                      data_date="2026-10-15")
+    assert run(make_ctx(env, NOW_AFTER_D), "macro.yahoo") == "ok"
+    assert payload(env, "macro.USDTWD")["source"] == "Yahoo"
+    env.store.put_obs(tw.OBS_FX, {"date": "2026-10-15", "usd_ntd": 33.0}, data_date="2026-10-15")  # 之後 tw.fx 換了值也不理它
+    assert misc.macro_plan(make_ctx(env, NOW_AFTER_D + 600)) is None
+
+
+def test_usdtwd_is_built_when_tw_fx_shows_up_after_the_taifex_fetch_failed(env):
+    env.http.route("finance.yahoo.com", market_http.FetchError("rate_limited"))
+    env.http.route("DailyForeignExchangeRates", market_http.FetchError("timeout"))
+    route_proxies(env, lambda etf: full_week(20.0))
+    nasdaq_published_d(env)
+    assert run(make_ctx(env, NOW_AFTER_D), "macro.yahoo") == "partial"
+    assert env.store.get_obs("macro.USDTWD") is None or payload(env, "macro.USDTWD") is None
+    env.store.put_obs(tw.OBS_FX, {"date": "2026-10-15", "usd_ntd": 32.338}, data_date="2026-10-15")
+    assert misc.macro_plan(make_ctx(env, NOW_AFTER_D + 300)) == {"d": D, "yahoo": False, "keys": ["USDTWD"]}  # 不等 1 小時重試
+    assert run(make_ctx(env, NOW_AFTER_D + 300), "macro.yahoo") == "ok"
+    assert payload(env, "macro.USDTWD")["value"] == 32.338
 
 
 def test_macro_payload_rules():
@@ -342,6 +461,7 @@ def test_btc_uses_the_ibit_proxy_when_yahoo_fails_and_the_card_says_so(env):
     env.http.route("finance.yahoo.com", market_http.FetchError("rate_limited"))
     route_proxies(env, lambda etf: [(date(2026, 10, 14), 47.84), (D, 46.06)] if etf == "IBIT" else full_week(20.0))
     env.store.put_obs(tw.OBS_FX, {"date": "2026-10-15", "usd_ntd": 32.3}, data_date="2026-10-15")
+    nasdaq_published_d(env)
     assert run(make_ctx(env, NOW_AFTER_D), "macro.yahoo") == "partial"
     btc = payload(env, "macro.BTC")
     assert btc["source"] == "ETF 代理：IBIT" and btc["symbol"] == "IBIT" and btc["date"] == "2026-10-15"
@@ -365,6 +485,7 @@ def test_btc_has_no_task_of_its_own_and_no_coinbase_path():
 def test_a_day_recorded_before_the_ibit_proxy_gets_one_catch_up_fetch_for_btc(env):
     """部署前這個 D 已經跑過宏觀：BTC 以前不走代理，紀錄裡既沒有來源也不在 pending。補抓一次 IBIT，之後不再排。"""
     route_proxies(env, lambda etf: [(date(2026, 10, 14), 47.84), (D, 46.06)] if etf == "IBIT" else full_week(20.0))
+    nasdaq_published_d(env)
     legacy = {k: f"ETF 代理：{etf}" for k, etf in PROXIES.items() if k != "BTC"}
     misc._save(env.store, misc.TASK_MACRO, {"d": D.isoformat(), "yahoo": "rate_limited", "pending": {}, "sources": legacy})
     ctx = make_ctx(env, NOW_AFTER_D)

@@ -10,8 +10,12 @@ Andrew 2026-10-17 的要求（DECISIONS.md）：宏觀「有 yahoo 用 yahoo，�
   429、冷卻 → 代理：美元 UUP、WTI USO、Brent BNO、金 GLD、銀 SLV、BTC IBIT（現貨比特幣 ETF）、羅素 2000 IWM、
   道瓊 DIA、Nasdaq 綜合 ONEQ（Nasdaq ETF 日線）、台幣＝期交所 USD/NTD（market_pipeline_tw 每天抓的 `tw.fx`，
   沒有才自己抓；標「代理：期交所匯率」）；MOVE 只有 Yahoo（失敗就記失敗、留著舊值）。Yahoo 只少了某幾個代號時，
-  只有那幾個改代理。每格存實際來源字樣（「Yahoo」「ETF 代理：UUP」「期交所匯率」）。所有日線丟掉晚於 D 的列；
-  代理回應沒有 D 那根就 30 分鐘後再抓一次。日變化只在前一筆的日期＝前一個交易日時才算（§18.8）。
+  只有那幾個改代理。每格存實際來源字樣（「Yahoo」「ETF 代理：UUP」「期交所匯率」）。所有日線丟掉晚於 D 的列。
+  日變化只在前一筆的日期＝前一個交易日時才算（§18.8）。
+  ETF 代理（2026-10-23）要等 Nasdaq 日線端點公布 D 才去抓：SPY 在 closes 表有 D 的正式列（market_pipeline_us
+  一直在追它，不算 CBOE 的 provisional）之後，每個代理抓一次；還沒有 D 那根就每小時再抓，最多再 3 次。原本 D 換日
+  就開打、30 分鐘後放棄，但 Nasdaq 要幾個小時後才公布 D，代理整天落後一天。台幣（期交所匯率）：tw.fx 的資料日比
+  卡上的台幣新時隨時重算，不必等下一個 D。
   BTC（2026-10-23）和其他格一樣走這條路、存 `macro.BTC`：原本 Coinbase 每 2 小時那條（§18.9、macro.btc 任務）
   拿掉了，因為 api.coinbase.com 在台灣被封鎖。
 - 新聞：Google News RSS 美股、台股每 30 分鐘，伊朗每小時；pubDate 超過 36 小時、解析不到或在未來的不列；
@@ -60,8 +64,11 @@ STATE_PREFIX = "misc.pipe:"
 NOT_YET, PARTIAL = market_tasks.NOT_YET, market_tasks.PARTIAL
 
 PROXY_LOOKBACK_DAYS = 45  # 代理日線抓多長：日變化只要前一筆，多抓一點給 publish 看走勢
-PROXY_RETRY_S = 1800.0  # 代理回應沒有 D 那根：30 分鐘後再抓一次
-PROXY_RETRIES = 1
+# 2026-10-23：ETF 代理要等 SPY 有 D 的正式列才抓（見 _nasdaq_has_d），所以第一次就該抓得到；萬一那個代理還是沒有 D 那根，
+# 每小時再抓一次、最多再 3 次（每個代理每個 D 最多 4 個請求）。原本是 30 分鐘、1 次，剛開打就放棄。
+PROXY_RETRY_S = 3600.0
+PROXY_RETRIES = 3
+GATE_SYMBOL = "SPY"  # Nasdaq 日線端點公布 D 了沒，看 market_pipeline_us 一直在追的 SPY
 BARS_KEEP = 25
 RETRY_AFTER_FAIL_S = 1800.0  # 固定間隔的來源失敗後多久再試（帳本冷卻另外算）
 COOLDOWN_S = 7200.0  # 429／403（Google News 另加 503）之後，和 market_http 的冷卻一樣長
@@ -254,28 +261,86 @@ def _macro_obs(key: str) -> str:
     return OBS_MACRO_PREFIX + key
 
 
+def _nasdaq_has_d(ctx: Any, d: date) -> bool:
+    """Nasdaq 日線端點公布 D 那天的正式收盤了嗎？ETF 代理和 SPY 走同一個端點，D 那列要收盤後好幾個小時才出現
+    （2026-10-23 實測：04:43 打、30 分鐘後放棄，8 列代理整天停在前一個交易日）。看 SPY 在 closes 表有沒有 D 的
+    正式列——CBOE 的 provisional 不算，它不代表 Nasdaq 公布了。有了才去抓代理，不必盲目探測。"""
+    try:
+        return any(row[0] == d and not row[4] for row in ctx.store.closes("us", GATE_SYMBOL, since=d))
+    except Exception:  # noqa: BLE001 - 讀不到就當還沒有：這輪不打，下一輪再看
+        return False
+
+
+def _tw_fx_pairs(ctx: Any) -> Optional[list[tuple[date, float]]]:
+    """market_pipeline_tw 存的期交所匯率（tw.fx）→ [(日期, USD/NTD)]；沒有這筆 obs 回 None。"""
+    obs = ctx.store.get_obs(OBS_TW_FX) or {}
+    payload = obs.get("payload") if isinstance(obs.get("payload"), dict) else None
+    if payload is None:
+        return None
+    pairs: list[tuple[date, float]] = []
+    for day_key, value_key in (("prev_date", "prev_usd_ntd"), ("date", "usd_ntd")):
+        day, value = payload.get(day_key), payload.get(value_key)
+        if isinstance(day, str) and isinstance(value, (int, float)) and not isinstance(value, bool):
+            try:
+                pairs.append((date.fromisoformat(day), float(value)))
+            except ValueError:
+                continue
+    return pairs
+
+
+def _usdtwd_behind(ctx: Any, d: date) -> bool:
+    """tw.fx 的資料日（≤D）比卡上 macro.USDTWD 那格新嗎？期交所的匯率檔台北早上才更新、market_pipeline_tw 隔一陣子
+    才讀到，這時宏觀任務早就在 D 換日那一刻讀過舊的 tw.fx 了（2026-10-23：台幣停在前一天）。只重算期交所代理的那格
+    （Yahoo 的 TWD=X 不看 tw.fx）；只讀 obs，不送請求。"""
+    pairs = _tw_fx_pairs(ctx)
+    candidate = macro_payload(pairs, d, ctx.tw_cal, SOURCE_FX, "USD/NTD") if pairs else None
+    if candidate is None:
+        return False
+    current = (ctx.store.get_obs(_macro_obs("USDTWD")) or {}).get("payload")
+    if not isinstance(current, dict):
+        return True  # 卡上還沒有這格，tw.fx 有了就補上
+    if current.get("source") != SOURCE_FX:
+        return False
+    try:
+        current_day = date.fromisoformat(current.get("date"))
+    except (TypeError, ValueError):
+        return True
+    return candidate[1] > current_day
+
+
 def macro_plan(ctx: Any) -> Optional[dict]:
-    """這輪宏觀要做什麼：新的 D → 先打 Yahoo；同一個 D 還有代理在等 D 那根 → 只重抓那幾個。"""
+    """這輪宏觀要做什麼：新的 D → 先打 Yahoo；同一個 D 還有代理在等 → 只抓那幾個（ETF 代理等 Nasdaq 公布 D、
+    沒有 D 那根的每小時再抓）；tw.fx 比卡上的台幣新 → 重算台幣。"""
     d = us_session_d(ctx)
     if d is None:
         return None
     state = _state(ctx.store, TASK_MACRO)
     if state.get("d") != d.isoformat():
         return {"d": d, "yahoo": True, "keys": []}
+    misc = _misc()
     pending = {key: dict(info) for key, info in (state.get("pending") or {}).items() if isinstance(info, dict)}
     # 2026-10-23：BTC 以前不走代理（主格是 Coinbase），部署時這個 D 的紀錄裡 BTC 既沒有來源、也不在 pending：
     # 當成還沒試過，補抓一次（之後每個代理鍵一定是「有來源」或「在 pending」）
     sources = state.get("sources") or {}
-    for key in _misc().PROXY_ETF:
+    for key in misc.PROXY_ETF:
         if key not in sources and key not in pending:
             pending[key] = {"tries": 0}
-    ready = [
-        key
-        for key, info in sorted(pending.items())
-        if int(info.get("tries", 0)) <= PROXY_RETRIES
-        and not (isinstance(info.get("last"), (int, float)) and ctx.now - float(info["last"]) < PROXY_RETRY_S)
-    ]
-    return {"d": d, "yahoo": False, "keys": ready} if ready else None
+    gate: Optional[bool] = None  # 要用到才查（SPY 有沒有 D 的正式列）
+    ready = []
+    for key, info in sorted(pending.items()):
+        last = info.get("last")
+        if int(info.get("tries", 0)) > PROXY_RETRIES or (
+            isinstance(last, (int, float)) and ctx.now - float(last) < PROXY_RETRY_S
+        ):
+            continue
+        if key in misc.PROXY_ETF:
+            gate = _nasdaq_has_d(ctx, d) if gate is None else gate
+            if not gate:
+                continue
+        ready.append(key)
+    if "USDTWD" not in ready and _usdtwd_behind(ctx, d):
+        ready.append("USDTWD")
+    return {"d": d, "yahoo": False, "keys": sorted(ready)} if ready else None
 
 
 def _put_macro(ctx: Any, key: str, result: Optional[tuple[dict, date]]) -> Optional[date]:
@@ -327,6 +392,7 @@ def _run_proxies(ctx: Any, d: date, keys: list[str], state: dict) -> Optional[st
     sources: dict = state.setdefault("sources", {})
     yahoo_kind = str(state.get("yahoo") or "unavailable")
     missing = False
+    gate: Optional[bool] = None  # Nasdaq 公布 D 了沒（只有 ETF 代理要看；台幣不走 Nasdaq）
     for index, key in enumerate(keys):
         if ctx.should_stop():  # 剩下的下一輪再來（不算一次）
             for rest in keys[index:]:
@@ -339,6 +405,12 @@ def _run_proxies(ctx: Any, d: date, keys: list[str], state: dict) -> Optional[st
             pending.pop(key, None)
             missing = True
             continue
+        if key in misc.PROXY_ETF:
+            gate = _nasdaq_has_d(ctx, d) if gate is None else gate
+            if not gate:  # Nasdaq 還沒公布 D：先不打，等 SPY 有 D 的正式列（macro_plan 每輪看），這不算一次
+                pending.setdefault(key, {"tries": 0})
+                missing = True
+                continue
         try:
             if key == "USDTWD":
                 result = _usdtwd_proxy(ctx, d)
@@ -364,7 +436,7 @@ def _run_proxies(ctx: Any, d: date, keys: list[str], state: dict) -> Optional[st
             ctx.store.obs_checked(obs_id, error_kind="empty")
         else:
             sources[key] = label
-        if got is None or got < d:  # 沒有 D 那根：30 分鐘後再抓一次
+        if got is None or got < d:  # 沒有 D 那根：每小時再抓一次（PROXY_RETRY_S、PROXY_RETRIES）
             pending[key] = {"tries": int(record.get("tries", 0)) + 1, "last": float(ctx.now)}
             missing = True
         else:
@@ -378,18 +450,9 @@ def _obs_kind(kind: str) -> str:
 
 def _usdtwd_proxy(ctx: Any, d: date) -> Optional[tuple[dict, date]]:
     """台幣代理：先用 market_pipeline_tw 存的期交所匯率（tw.fx），沒有才自己抓一次。"""
-    obs = ctx.store.get_obs(OBS_TW_FX) or {}
-    payload = obs.get("payload") if isinstance(obs.get("payload"), dict) else None
-    pairs: list[tuple[date, float]] = []
-    if payload is not None:
-        for day_key, value_key in (("prev_date", "prev_usd_ntd"), ("date", "usd_ntd")):
-            day, value = payload.get(day_key), payload.get(value_key)
-            if isinstance(day, str) and isinstance(value, (int, float)) and not isinstance(value, bool):
-                try:
-                    pairs.append((date.fromisoformat(day), float(value)))
-                except ValueError:
-                    continue
-    else:
+    pairs = _tw_fx_pairs(ctx)
+    if pairs is None:
+        pairs = []
         import market_sources_tw  # noqa: PLC0415
 
         row = _call(ctx, market_sources_tw.fetch_taifex_fx)

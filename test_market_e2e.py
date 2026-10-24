@@ -1822,6 +1822,19 @@ def test_summary_card_keeps_the_election_countdown_and_says_why_there_are_no_odd
     assert line.endswith("，預測市場：台灣已封鎖") and market_dashboard.row_width(line) <= market_dashboard.MAX_ROW_WIDTH, line
 
 
+def test_macro_etf_proxies_are_fetched_exactly_once_each_after_nasdaq_published_d(world):
+    """2026-10-23：Yahoo 429 的那天，8 個 ETF 代理加 BTC 的 IBIT 等 SPY 有 D 的正式列才去抓；這裡 Nasdaq 一公布就拿得到 D，
+    所以每個代理在那個 D 剛好一個請求（第一天 Yahoo 正常，一個都沒有）。"""
+    proxies = ("UUP", "USO", "BNO", "GLD", "SLV", "IBIT", "IWM", "DIA", "ONEQ")
+    for etf in proxies:
+        calls = [call for call in world.http.calls if call.host == "api.nasdaq.com" and call.path == f"/api/quote/{etf}/historical"]
+        assert len(calls) == 1, (etf, [call.query for call in calls])
+        assert calls[0].at >= YAHOO_RATE_LIMITED_FROM  # 第二天（Yahoo 429）才用代理
+    rows = world.snapshot["rows"]
+    for key in ("DXY", "WTI", "BRENT", "GOLD", "SILVER", "BTC", "RUT", "DJI", "IXIC"):
+        assert rows[f"macro.{key}"]["data_date"] == D2.isoformat(), key  # 代理列和 ETF 一樣是 D 那天
+
+
 def test_btc_row_comes_from_the_ibit_proxy_on_the_second_day(world):
     macro = _strings(_reply(world, "/盤勢").flex)
     assert any("比特幣" in s and "代理" in s for s in macro), macro
