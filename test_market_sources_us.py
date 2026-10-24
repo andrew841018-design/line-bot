@@ -586,6 +586,18 @@ def test_xlsx_guard_rejects_utf16be_after_a_leading_newline():
         assert guard_reason(src.parse_ssga_spy_xlsx, bad, min_rows=1) == ("format", "xml_encoding"), name
 
 
+def test_xlsx_guard_reads_wide_members_with_binary_names_too():
+    """2026-10-23 審查 r9 gp2：二進位副檔名放行只看名字的話，UTF-16 的 DOCTYPE 改名成 .bin 就躲得過。"""
+    data = ssga_xlsx(SSGA_ROWS)
+    dtd = '<?xml version="1.0"?><!DOCTYPE x [<!ENTITY boom "boom">]><x>&boom;</x>'
+    for name in ("xl/styles.bin", "xl/media/image9.png"):
+        bad = _with_member(data, "", name, dtd.encode("utf-16"))
+        assert guard_reason(src.parse_ssga_spy_xlsx, bad, min_rows=1) == ("format", "xml_encoding"), name
+    # 開頭剛好有 NUL 的真二進位（TrueType 字型）不是 XML：副檔名不在任何清單裡也照過
+    font = _with_member(data, "", "xl/embeddings/font1.ttf", b"\x00\x01\x00\x00" + bytes(64))
+    assert len(src.parse_ssga_spy_xlsx(font, min_rows=3)) == 3
+
+
 def test_xlsx_guard_keeps_real_binary_members():
     """真的 SSGA 檔有 xl/printerSettings/printerSettings1.bin（內含 NUL）：二進位成員不能被當成 XML 擋掉。"""
     data = _with_member(ssga_xlsx(SSGA_ROWS), "", "xl/printerSettings/printerSettings1.bin",

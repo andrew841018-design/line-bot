@@ -16,6 +16,7 @@ import pytest
 
 import market_calendar
 import market_http
+import market_pipeline_us
 import market_paths
 import market_pipeline_misc as misc
 import market_pipeline_tw as tw
@@ -906,3 +907,16 @@ def test_trump_feed_of_only_image_posts_still_updates_the_coverage(env):
     feed["posts"] = [m3, m2, m1]
     assert run(make_ctx(env, (T0_TRUMP + timedelta(minutes=30)).timestamp()), "trump.feed") == "ok"
     assert trump_state(env)["last_newest"] == m3[1].timestamp() and trump_state(env)["gaps"] == [[None, m1[1].timestamp()]]
+
+
+def test_macro_gate_watches_the_same_etfs_as_us_hist():
+    """2026-10-23 審查 r9 gp2：代理等的「Nasdaq 公布 D 了沒」和 market_pipeline_us 追的 ETF 要是同一組，改一邊另一邊不會知道。"""
+    assert misc.GATE_SYMBOLS == market_pipeline_us.ETFS
+
+
+def test_trump_window_and_skew_match_the_source_module():
+    """2026-10-23 審查 r9：川普的 48 小時窗口與 5 分鐘未來容差在 pipeline 與 sources 各有一份，改一邊另一邊不會知道。"""
+    import market_sources_misc
+
+    assert misc.TRUMP_WINDOW_H == market_sources_misc.TRUMP_WINDOW_H
+    assert misc.TRUMP_FUTURE_SKEW_S == market_sources_misc.FUTURE_SKEW.total_seconds()

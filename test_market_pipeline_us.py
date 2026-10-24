@@ -724,12 +724,30 @@ def test_d_is_probed_with_spy_only_then_hourly_until_published(env):
         assert env.store.task_state("us.hist")["fail_streak"] == 0
         assert kind == ("not_yet" if step < 12 else "ok"), step
     assert [minute for minute, keys in seen.items() if "SPY" in keys] == [0, 30, 60, 90, 120, 180]
-    assert all(keys in ([], ["SPY"]) for minute, keys in seen.items() if minute < 180)  # 公布前只有 SPY
+    # SPY 探滿 5 次還沒有 D：VOO 也開始探（審查 r9 gp2 I3）；公布前只有這兩檔
+    assert [minute for minute, keys in seen.items() if "VOO" in keys and minute < 180] == [135, 165]
+    assert all(set(keys) <= {"SPY", "VOO"} for minute, keys in seen.items() if minute < 180)
     assert seen[180] == ["SPY", "VOO", "QQQ", "SOXX", "AAA", "BBB"]
     assert all(keys == [] for minute, keys in seen.items() if minute > 180)
     assert all(D in closes(env, symbol) for symbol in ("SPY", "VOO", "QQQ", "SOXX", "AAA", "BBB"))
     status = obs(env, pipe.OBS_HIST_STATUS)["payload"]
     assert status["waiting_for_source"] is False and status["have_d"] == 6 and status["exhausted"] == 0
+
+
+def test_gate_opens_through_voo_when_spy_alone_keeps_failing(env):
+    """2026-10-23 審查 r9 gp2 I3：只看 SPY 的話，SPY 單獨一直回廠商錯誤（或卡在待確認）時，其他 ETF、成分股、
+    宏觀代理整天都不抓。SPY 探滿 5 次後 VOO 也每輪探；VOO 有 D 就開閘門。"""
+    etfs_ready(env)  # 假的 Nasdaq：其他三檔都有 D
+    env.http.hist_raw["SPY"] = {"data": None, "message": None, "status": {
+        "rCode": 400, "bCodeMessage": [{"code": 2001, "errorMessage": "Error while calling vendor"}],
+        "developerMessage": None}}
+    seed_universe(env, ["AAA"])
+    seed(env, "AAA", flat(HISTORY, 50.0))
+    env.http.prices["AAA"] = flat(HISTORY + [D], 50.0)
+    kinds = [run(env, "us.hist", NOW + step * 900) for step in range(10)]
+    assert D in closes(env, "VOO") and D in closes(env, "QQQ") and D in closes(env, "AAA")
+    assert D not in closes(env, "SPY") and env.store.task_state("us.hist")["fail_streak"] == 0
+    assert "ok" in kinds or "partial" in kinds
 
 
 def test_gate_opens_even_when_the_old_etf_retries_are_used_up(env):
@@ -977,6 +995,8 @@ def test_no_provisional_close_when_nasdaq_has_d_or_the_trade_is_well_before_the_
     """2026-10-23 起不必等 Nasdaq 被擋：只要還沒有 D 的正式列就寫；已經有就不寫。CBOE 寫 15:59:59，收盤前 60 秒內
     （含）的最後成交算收盤，更早的是盤中的檔。"""
     seed(env, "SPY", flat(HISTORY + [D], 700.0))  # Nasdaq 已經有 D
+    for symbol in ("QQQ", "SOXX"):  # 備援要和最近的正式收盤差不多才寫（審查 r9 gp2 C1）
+        seed(env, symbol, flat(HISTORY, 710.0))
     for symbol in pipe.OPTION_SYMBOLS:
         env.http.chains[symbol] = cboe_chain(symbol, timestamp="2026-10-16 20:45:00", last_trade="2026-10-16T15:59:59")
     assert run(env, "us.options") == "ok"
@@ -993,7 +1013,7 @@ def test_cboe_close_is_the_provisional_d_bar_while_nasdaq_is_late(env):
     """2026-10-23（investigations/freshness_20261023.md §3 第 2 點）：Nasdaq 只是晚公布（沒被擋）、CBOE 寫 15:59:59 時，
     以前這條備援從來沒觸發，ETF 列整晚停在 D−1。現在收盤後 CBOE 一到，4 檔 ETF 都有 D 的 provisional；它不算
     Nasdaq 公布了 D（成分股照樣等 SPY 的正式列），正式列到了直接蓋掉。"""
-    etfs_ready(env, with_d=False)
+    etfs_ready(env, with_d=False, price=710.0)  # 和 CBOE 的 717.23／702.3 差不多（離最近正式收盤太遠的不寫，r9 gp2 C1）
     seed_universe(env, ["AAA"])
     seed(env, "AAA", flat(HISTORY, 50.0))
     env.http.prices["AAA"] = flat(HISTORY + [D], 50.0)
@@ -1011,10 +1031,24 @@ def test_cboe_close_is_the_provisional_d_bar_while_nasdaq_is_late(env):
     assert env.http.requested("hist") == ["SPY", "SPY"] and D not in closes(env, "AAA")
     assert obs(env, pipe.OBS_HIST_STATUS)["payload"]["waiting_for_source"] is True
     for symbol in ("SPY", "VOO", "QQQ", "SOXX"):
-        env.http.prices[symbol] = flat(HISTORY + [D], 100.0)  # Nasdaq 公布了
+        env.http.prices[symbol] = flat(HISTORY + [D], 710.0)  # Nasdaq 公布了
     assert run(env, "us.hist", NOW + 3600) == "ok"
-    assert all(closes(env, symbol)[D] == (100.0, "nasdaq", False) for symbol in ("SPY", "VOO", "QQQ", "SOXX"))
+    assert all(closes(env, symbol)[D] == (710.0, "nasdaq", False) for symbol in ("SPY", "VOO", "QQQ", "SOXX"))
     assert closes(env, "AAA")[D][1:] == ("nasdaq", False)
+
+
+def test_cboe_close_far_from_the_last_official_close_is_not_written(env):
+    """2026-10-23 審查 r9 gp2 C1：ETF 分割日 CBOE 已是拆後價、或檔案給了離譜值，以前照寫成 D 的收盤、上卡（「7.02
+    -98.94% 在月線下」，卡上看不出是備援）。和最近一筆正式收盤差到跳空門檻就不寫，等 Nasdaq；沒有正式收盤可比也不寫。"""
+    seed(env, "SPY", flat(HISTORY, 700.0))
+    seed(env, "SOXX", flat(HISTORY, 750.0))
+    ctx = ctx_at(env, NOW)
+    for symbol, close, written in (("SPY", 7.02, False), ("SPY", 70200.0, False), ("SPY", 702.3, True),
+                                   ("SOXX", 250.0, False), ("QQQ", 717.23, False)):  # QQQ 沒有正式收盤可比
+        chain = src.parse_cboe_options(json.dumps(cboe_chain(symbol, timestamp="2026-10-16 20:45:00",
+                                                             last_trade="2026-10-16T15:59:59", close=close)).encode())
+        assert pipe._maybe_provisional(ctx, D, chain, chain.quote_last_trade_et) is written, (symbol, close)
+    assert D not in closes(env, "SOXX") and closes(env, "SPY")[D] == (702.3, "cboe", True)
 
 
 def test_voo_close_quote_is_fetched_only_when_it_helps(env):

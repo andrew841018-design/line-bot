@@ -114,9 +114,10 @@ class Endpoint:
 ENDPOINTS: dict[str, Endpoint] = {
     # 成分聯集約 520 檔＋VOO／QQQ／SOXX／SPY＋宏觀代理 8 檔；沒有 D 列的 30 分鐘後重排、最多 4 次（§18.5）。
     # 2026-10-23：D 改成只用 SPY 探（前 5 次每 30 分鐘、之後每小時；Nasdaq 晚上甚至隔天清晨才公布 → 每天約 20 次）
-    # ＋其他 3 檔 ETF＋成分股約 527 檔＋BF.B 這類空殼 5 次＋宏觀代理 8 檔（Yahoo 失敗時，各最多 2 次）＋分割重抓與
-    # 重排約 10 ≈ 580，560 不夠 → 620（bootstrap 照舊多 40）。這只是規劃值、程式沒拿它擋；真正擋的是帳本
-    # api.nasdaq.com 每天 900 次，扣掉其他 Nasdaq 端點（每週的那幾個剛好同一天時合計 133）還有約 150 次餘裕。
+    # ＋SPY 探滿 5 次後 VOO 也探（審查 r9：約 14 次）＋其他 3 檔 ETF＋成分股約 527 檔＋BF.B 這類空殼 5 次＋宏觀代理
+    # 9 檔（含 IBIT；等 SPY 有 D 才抓，每個 D 最多 4 次，平常 9、最壞 36）＋分割重抓與重排約 10 ≈ 最壞 615 → 620
+    # （bootstrap 照舊多 40）。這只是規劃值、程式沒拿它擋；真正擋的是帳本 api.nasdaq.com 每天 900 次，扣掉其他 Nasdaq
+    # 端點（每週的那幾個剛好同一天時合計 133）還有約 150 次餘裕。
     "nasdaq_historical": Endpoint("api.nasdaq.com", ("json",), 512 * KIB, 15.0, 620, 660, 4, per_run=60),
     "nasdaq_market_info": Endpoint("api.nasdaq.com", ("json",), 64 * KIB, 15.0, 4, 4, 2),
     "nasdaq_splits": Endpoint("api.nasdaq.com", ("json",), 2 * MIB, 15.0, 1, 2, 2),
@@ -1191,8 +1192,17 @@ XLSX_MAX_UNCOMPRESSED = 50 * MIB
 XLSX_MAX_ROWS = 20000
 _XML_DECL_RE = re.compile(rb"<!\s*(doctype|entity)", re.IGNORECASE)
 _XML_MEMBER_SUFFIXES = (".xml", ".rels", ".vml")
-_BINARY_MEMBER_SUFFIXES = (".bin", ".png", ".jpg", ".jpeg", ".gif", ".emf", ".wmf", ".bmp", ".tif", ".tiff")
 _WIDE_BOMS = (b"\xff\xfe", b"\xfe\xff", b"\x00\x00\xfe\xff")
+
+
+def _wide_xml(content: bytes) -> bool:
+    """照 UTF-16／UTF-32（兩種位元組順序）解開開頭，去掉 BOM、空白、NUL 後是「<」＝寬字元的 XML。開頭剛好有 NUL 的
+    字型、圖片、printerSettings 解開不是「<」，不算（2026-10-23 審查 r9：原本前 4 個位元組有 NUL 就算，未知副檔名的
+    二進位成員會被擋；改名成 .bin 的寬字元 XML 也靠副檔名清單放行）。"""
+    for encoding in ("utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"):
+        if content[:64].decode(encoding, errors="ignore").lstrip("\ufeff \t\r\n\x00").startswith("<"):
+            return True
+    return False
 
 
 def _xlsx_guard(data: object) -> bytes:
@@ -1224,17 +1234,11 @@ def _xlsx_guard(data: object) -> bytes:
             # 2026-10-18 安全審查 I4：不能只看副檔名或開頭是不是「<?xml」——openpyxl 照 rels 找成員，改名成 .dat、
             # 前面加 BOM／空白都照樣會被當 XML 讀。每個成員去掉 BOM 與空白後，以「<」開頭（或像沒有 BOM 的 UTF-16 XML）
             # 就一律檢查；真正的二進位成員（例 SSGA 的 xl/printerSettings/printerSettings1.bin，內含 NUL）才略過。
-            # 2026-10-23 審查 r7a N1：開頭的 NUL 也要剝——沒有 BOM 的 UTF-16BE 前面加一個換行（\x00\n\x00<）原本
-            # 會被當二進位略過、DOCTYPE 照樣被 openpyxl 展開。前 4 個位元組有 NUL 就當寬字元編碼；只有已知的
-            # 二進位副檔名（printerSettings*.bin、圖片）放行。
-            name = info.filename.lower()
+            # 2026-10-23 審查 r7a N1／r9：開頭的 NUL 也要剝——沒有 BOM 的 UTF-16BE 前面加一個換行（\x00\n\x00<）原本
+            # 會被當二進位略過、DOCTYPE 照樣被 openpyxl 展開。寬字元 XML 看「解開後是不是 <」（_wide_xml），不看副檔名。
             head = content.lstrip(b"\xef\xbb\xbf\x00 \t\r\n")
-            wide = content.startswith(_WIDE_BOMS) or b"\x00" in content[:4]
-            looks_xml = (
-                name.endswith(_XML_MEMBER_SUFFIXES)
-                or head[:1] == b"<"
-                or (wide and not name.endswith(_BINARY_MEMBER_SUFFIXES))
-            )
+            wide = content.startswith(_WIDE_BOMS) or _wide_xml(content)
+            looks_xml = info.filename.lower().endswith(_XML_MEMBER_SUFFIXES) or head[:1] == b"<" or wide
             if not looks_xml:
                 continue
             if wide or b"\x00" in content:

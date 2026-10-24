@@ -68,7 +68,9 @@ PROXY_LOOKBACK_DAYS = 45  # 代理日線抓多長：日變化只要前一筆，�
 # 每小時再抓一次、最多再 3 次（每個代理每個 D 最多 4 個請求）。原本是 30 分鐘、1 次，剛開打就放棄。
 PROXY_RETRY_S = 3600.0
 PROXY_RETRIES = 3
-GATE_SYMBOL = "SPY"  # Nasdaq 日線端點公布 D 了沒，看 market_pipeline_us 一直在追的 SPY
+# Nasdaq 日線端點公布 D 了沒：看 market_pipeline_us 一直在追的 ETF（＝它的 ETFS，測試鎖住兩邊一樣）任一檔有沒有
+# 正式列；只看 SPY 的話 SPY 單獨出狀況就整天不抓（2026-10-23 審查 r9 gp2 I3）
+GATE_SYMBOLS = ("SPY", "VOO", "QQQ", "SOXX")
 BARS_KEEP = 25
 RETRY_AFTER_FAIL_S = 1800.0  # 固定間隔的來源失敗後多久再試（帳本冷卻另外算）
 COOLDOWN_S = 7200.0  # 429／403（Google News 另加 503）之後，和 market_http 的冷卻一樣長
@@ -266,7 +268,7 @@ def _nasdaq_has_d(ctx: Any, d: date) -> bool:
     （2026-10-23 實測：04:43 打、30 分鐘後放棄，8 列代理整天停在前一個交易日）。看 SPY 在 closes 表有沒有 D 的
     正式列——CBOE 的 provisional 不算，它不代表 Nasdaq 公布了。有了才去抓代理，不必盲目探測。"""
     try:
-        return any(row[0] == d and not row[4] for row in ctx.store.closes("us", GATE_SYMBOL, since=d))
+        return any(row[0] == d and not row[4] for symbol in GATE_SYMBOLS for row in ctx.store.closes("us", symbol, since=d))
     except Exception:  # noqa: BLE001 - 讀不到就當還沒有：這輪不打，下一輪再看
         return False
 

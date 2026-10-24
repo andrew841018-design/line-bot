@@ -139,6 +139,10 @@ HIST_RETRY_S = 30 * 60.0
 HIST_MAX_RETRIES = 4  # 沒有 D 列：首抓之後最多再排 4 次
 # 2026-10-23：D 有沒有公布只探這一檔（也是交易日曆看實際成交日的那檔）；它的 4 次重排用完後不放棄，改每小時再探
 HIST_PROBE_SYMBOL = "SPY"
+# SPY 探滿 HIST_MAX_RETRIES 次還沒有 D，就每小時也探 VOO：SPY 自己出狀況（廠商錯誤、待確認）時，閘門不能整天跟著關
+# （2026-10-23 審查 r9 gp2 I3）。兩檔都不放棄；D 公布了沒看 ETFS 任一檔有沒有正式列
+HIST_BACKUP_PROBE = "VOO"
+_HIST_PROBES = (HIST_PROBE_SYMBOL, HIST_BACKUP_PROBE)
 HIST_PROBE_S = 3600.0
 GUARD_DIFF = 0.005
 JUMP_LIMIT = 0.15
@@ -694,7 +698,7 @@ def _note_d(hist: dict, symbol: str, day: date, now: float, rows: Sequence[Row],
         return "ok"
     entry = retries.get(symbol)
     misses = int(entry["n"]) + 1 if entry and entry.get("d") == day.isoformat() else 1
-    wait = HIST_PROBE_S if symbol == HIST_PROBE_SYMBOL and misses > HIST_MAX_RETRIES else HIST_RETRY_S
+    wait = HIST_PROBE_S if symbol in _HIST_PROBES and misses > HIST_MAX_RETRIES else HIST_RETRY_S
     retries[symbol] = {"d": day.isoformat(), "n": misses, "at": now + wait}
     return "vendor" if vendor else "missing_d"
 
@@ -871,8 +875,8 @@ def _retry_allows(hist: dict, symbol: str, day: date, now: float) -> bool:
     entry = hist.get("retry", {}).get(symbol)
     if not entry or entry.get("d") != day.isoformat():
         return True
-    if int(entry.get("n") or 0) > HIST_MAX_RETRIES and symbol != HIST_PROBE_SYMBOL:
-        return False  # SPY 不放棄：它是 D 有沒有公布的探針，放棄就整個 D 都不會再抓成分股（2026-10-23）
+    if int(entry.get("n") or 0) > HIST_MAX_RETRIES and symbol not in _HIST_PROBES:
+        return False  # 探針不放棄：放棄就整個 D 都不會再抓成分股（2026-10-23）
     return float(entry.get("at") or 0.0) <= now
 
 
@@ -949,8 +953,8 @@ def _run_jobs(ctx: Any, day: date, jobs: list[_Job], hist: dict, tally: _Tally, 
 
 
 def _d_published(ctx: Any, day: date) -> bool:
-    """Nasdaq 公布 D 了沒：只看 SPY 有沒有 D 的正式列（2026-10-23）。"""
-    return _has_official_row(ctx, HIST_PROBE_SYMBOL, day)
+    """Nasdaq 公布 D 了沒：任一檔 ETF 有 D 的正式列（2026-10-23；只看 SPY 的話，SPY 單獨出狀況就整天關著）。"""
+    return any(_has_official_row(ctx, symbol, day) for symbol in ETFS)
 
 
 def _open_gate(hist: dict, day: date) -> None:
@@ -988,7 +992,7 @@ def _hist_status(ctx: Any, day: date, universe: list[str], hist: dict, outcomes:
         "missing_d": len(symbols) - have,
         # SPY 不算：它用完 4 次重排後改每小時探，沒有放棄
         "exhausted": sum(1 for symbol, entry in hist.get("retry", {}).items()
-                         if symbol != HIST_PROBE_SYMBOL and int(entry.get("n") or 0) > HIST_MAX_RETRIES),
+                         if symbol not in _HIST_PROBES and int(entry.get("n") or 0) > HIST_MAX_RETRIES),
         "pending": sum(1 for symbol in symbols if ctx.store.pending_jump(MARKET, symbol)),
         "quarantined": sum(1 for symbol in symbols if quarantine.get(symbol)),
         "blocked": isinstance(hist.get("blocked"), dict),
@@ -1017,8 +1021,12 @@ def _run_hist_core(ctx: Any) -> Optional[str]:
     try:
         _record_universe(ctx, members, len(universe) + len(ETFS), day)
         # D 公布前每輪最多就 SPY 這 1 個請求（2026-10-23）；有 D 了這裡只剩它自己的分割／待確認重抓
-        probe = _job_for(ctx, HIST_PROBE_SYMBOL, True, day, hist, allow_bootstrap=True)
-        stopped = _run_jobs(ctx, day, [probe] if probe else [], hist, tally, outcomes)
+        probes = [HIST_PROBE_SYMBOL]
+        spy_entry = hist.get("retry", {}).get(HIST_PROBE_SYMBOL) or {}
+        if spy_entry.get("d") == day.isoformat() and int(spy_entry.get("n") or 0) > HIST_MAX_RETRIES:
+            probes.append(HIST_BACKUP_PROBE)
+        jobs = [_job_for(ctx, symbol, True, day, hist, allow_bootstrap=True) for symbol in probes]
+        stopped = _run_jobs(ctx, day, [job for job in jobs if job], hist, tally, outcomes)
         if not stopped and _d_published(ctx, day):
             _open_gate(hist, day)
             others = [_job_for(ctx, sym, True, day, hist, allow_bootstrap=True)
@@ -1220,8 +1228,13 @@ def _maybe_provisional(ctx: Any, day: date, chain: Any, last: datetime) -> bool:
         return False
     if _has_official_row(ctx, symbol, day):
         return False
-    close = _finite(getattr(chain, "close", None)) or _finite(getattr(chain, "spot", None))
+    close = _finite(getattr(chain, "close", None))  # 不拿 current_price 頂替：盤前盤後的價不是收盤
     if close is None or close <= 0:
+        return False
+    # 2026-10-23 審查 r9 gp2 C1：和最近一筆正式收盤比，差到跳空門檻（ETF 分割日 CBOE 已是拆後價、檔案給了離譜值）就不寫、
+    # 等 Nasdaq；沒有正式收盤可比也不寫。這條路從這輪起每天都會走，卡上又看不出是備援
+    earlier = [value for d, value in sorted(_official(ctx, symbol, since=day - timedelta(days=10)).items()) if d < day]
+    if not earlier or abs(close / earlier[-1] - 1.0) >= JUMP_LIMIT:
         return False
     ctx.store.upsert_closes(MARKET, symbol, [(day, close, _count(getattr(chain, "volume", None)))], SRC_CBOE,
                             provisional=True)
