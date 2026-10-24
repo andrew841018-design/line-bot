@@ -2987,7 +2987,8 @@ def test_overview_exercise_row_says_when_last_heard_within_180_days(reminders):
     consent("爸爸", "U_DAD")
     add("爸爸", "exercise", "爬山", day=_days_ago(9))  # 7 天外
     lines = body_lines(assert_card_ok(cmd("", "U_KID")))
-    assert "🚶 運動：沒有紀錄，上次 10/2" in lines
+    assert "🚶 運動：近 7 天沒聽到（上次 10/2）" in lines  # 不寫「沒有紀錄，上次 10/2」：大字版念起來自相矛盾
+    assert not any("沒有紀錄，上次" in line for line in lines)
     add("爸爸", "exercise", "散步", day=_days_ago(1))
     assert "🚶 運動：散步 1 天，上次 10/10" in body_lines(assert_card_ok(cmd("", "U_KID")))
 
@@ -3105,8 +3106,8 @@ def test_deleting_pausing_and_unsending_clear_the_health_pages(dms):
     cmd("刪除", "U_KID", quoted="m-del")
     assert not page.exists()
     page = _fake_health_page()
-    cmd("刪除", "U_KID", quoted="m-nothing")  # 使用者要刪：沒刪到也清
-    assert not page.exists()
+    cmd("刪除", "U_KID", quoted="m-nothing")  # 沒刪到任何紀錄：不動還有效的頁（任何家人都能打這個指令；2026-10-25 GP1 #6）
+    assert page.exists()
     page = _fake_health_page()
     cmd("刪除我的紀錄", "U_DAD")
     assert not page.exists()
@@ -3172,6 +3173,7 @@ def test_help_and_pause_mention_pages_and_the_nudge_only_when_on(monkeypatch, tm
 
     assert ph._help_text() == ph._HELP_TEXT and ph._recording_explanation() == ph._RECORDING_EXPLANATION
     monkeypatch.setenv(card_pages.ENABLED_ENV, "1")
+    monkeypatch.setattr(card_pages, "public_base_url", lambda: "https://quiet-river-1234.trycloudflare.com")
     monkeypatch.setenv("LINE_BOT_EXERCISE_NUDGE", "1")
     text = ph._help_text()
     assert_text_ok(text)
@@ -3185,3 +3187,92 @@ def test_help_and_pause_mention_pages_and_the_nudge_only_when_on(monkeypatch, tm
     assert reply.text.endswith("要恢復，請爸爸本人打 /健康 恢復")
     monkeypatch.setenv(card_pages.HEALTH_ENV, "0")  # 健康頁關掉：不說有網頁
     assert "看大字版" not in ph._help_text()
+
+
+# ── 2026-10-25 實作後審查 ──────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def public_url(monkeypatch):
+    """大字版網頁真的會有：開關開著、而且有合格的對外網址（和 card_pages.publish 的條件一致）。"""
+    import card_pages
+
+    monkeypatch.setenv(card_pages.ENABLED_ENV, "1")
+    monkeypatch.setattr(card_pages, "public_base_url", lambda: "https://quiet-river-1234.trycloudflare.com")
+
+
+def test_the_page_sentences_need_a_public_url_too(monkeypatch, dms):
+    """沒有 tunnel 網址就沒有頁、沒有按鈕：說明不能承諾、暫停回覆不能說「清掉了」（GP1 #7）。"""
+    import card_pages
+
+    monkeypatch.setenv(card_pages.ENABLED_ENV, "1")
+    monkeypatch.setattr(card_pages, "public_base_url", lambda: None)
+    assert ph._health_page_hours() == 0
+    assert "看大字版" not in ph._help_text() and ph._recording_explanation() == ph._RECORDING_EXPLANATION
+    consent("爸爸", "U_DAD")
+    assert "大字版網頁" not in cmd("暫停", "U_DAD").text
+    monkeypatch.setattr(card_pages, "public_base_url", lambda: "https://quiet-river-1234.trycloudflare.com")
+    assert ph._health_page_hours() == 24
+    assert "最多保留 24 小時" in ph._help_text()
+
+
+def test_deleting_a_message_that_holds_no_records_keeps_the_pages(dms, public_url):
+    consent("爸爸", "U_DAD")
+    page = _fake_health_page()
+    reply = cmd("刪除", "U_KID", quoted="m-nothing")
+    assert reply.text == "爸媽健康：那則留言沒有記下健康紀錄"
+    assert page.exists()
+
+
+def _boom_purge(monkeypatch):
+    import card_pages
+
+    def boom():
+        raise OSError("synthetic")
+
+    monkeypatch.setattr(card_pages, "purge_health_pages", boom)
+
+
+def test_a_failed_purge_on_delete_says_the_page_expires_by_itself(monkeypatch, dms, public_url):
+    consent("爸爸", "U_DAD")
+    add("爸爸", "med", "吃藥", msg="m-del")
+    _boom_purge(monkeypatch)
+    reply = cmd("刪除", "U_KID", quoted="m-del")
+    assert reply.text == "爸媽健康：已刪掉那則留言記下的 1 筆紀錄；大字版網頁沒能一起清掉，24 小時內會自動失效"
+    assert_text_ok(reply.text)
+    add("爸爸", "med", "吃藥")
+    mine = cmd("刪除我的紀錄", "U_DAD").text
+    assert "已刪掉爸爸的 1 筆紀錄；大字版網頁沒能一起清掉，24 小時內會自動失效" in mine
+    assert_text_ok(mine)
+
+
+def test_a_successful_purge_adds_no_note_and_neither_does_a_missing_page_feature(monkeypatch, dms, public_url):
+    import card_pages
+
+    consent("爸爸", "U_DAD")
+    add("爸爸", "med", "吃藥", msg="m-ok")
+    assert cmd("刪除", "U_KID", quoted="m-ok").text == "爸媽健康：已刪掉那則留言記下的 1 筆紀錄"
+    add("爸爸", "med", "吃藥", msg="m-off")
+    _boom_purge(monkeypatch)
+    monkeypatch.setattr(card_pages, "public_base_url", lambda: None)  # 沒有網頁可言：不用交代
+    assert cmd("刪除", "U_KID", quoted="m-off").text == "爸媽健康：已刪掉那則留言記下的 1 筆紀錄"
+
+
+@pytest.mark.parametrize(
+    "days_ago, wording",
+    [(200, "近半年沒聽到"), (179, "近半年沒聽到"), (178, "還沒聽到"), (120, "還沒聽到")],
+)
+def test_analysis_card_says_half_a_year_only_after_half_a_year_of_recording(reminders, days_ago, wording):
+    """「沒聽到」只代表這段記錄期間（GP1 #4）：開始記錄滿 179 天才寫「近半年沒聽到」，之前寫「還沒聽到」。"""
+    start = _d(days_ago)
+    consent("爸爸", "U_DAD", at=ts(start.year, start.month, start.day, 8))
+    lines = _analysis_lines(assert_card_ok(cmd("分析", "U_KID")))
+    dad = lines[lines.index("爸爸"):lines.index("媽媽")]
+    if wording == "近半年沒聽到":  # 滿半年就不用再說從哪天開始：「近半年」已經是整段
+        assert not any("開始記錄" in line for line in dad)
+    else:
+        assert dad[1] == f"從 {start.month}/{start.day} 開始記錄"
+    never = [line for line in dad if "的紀錄" in line and ("沒聽到" in line)]
+    assert len(never) == 4 and all(f"：{wording}" in line for line in never)
+    other = "還沒聽到" if wording == "近半年沒聽到" else "近半年沒聽到"
+    assert not any(other in line for line in dad)
