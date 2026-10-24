@@ -48,6 +48,29 @@ ensure_uvicorn_service() {
     launchctl bootstrap "$domain" "$UVICORN_PLIST"
 }
 
+# 2026-10-24: a restart kills whatever is being handled right now -- a burst waiting in its 8 s
+# window, a model call, a reply on its way -- and the family gets no answer.  Give those a moment:
+# at most $1 seconds (default 25) of waiting for inbound events started in the last $2 seconds
+# (default 90) to finish.  It never fails the restart: no database, no sqlite3, a locked or
+# unreadable file all mean "go ahead".  rc 0 = nothing in flight (or could not tell);
+# rc 1 = still in flight when the wait ran out.
+wait_for_inflight_messages() {
+    local max_wait="${1:-25}" recent="${2:-90}" db deadline n
+    db="${LINE_BOT_DB:-${BOT_DIR:-.}/line_bot.db}"
+    case "$max_wait$recent" in ''|*[!0-9]*) return 0 ;; esac
+    [ -r "$db" ] || return 0
+    deadline=$((SECONDS + max_wait))
+    while :; do
+        n=$(/usr/bin/sqlite3 -readonly -cmd ".timeout 2000" "$db" \
+            "SELECT COUNT(*) FROM inbound_events WHERE status IN ('processing','media_processing','reply_sending') AND updated_at > CAST(strftime('%s','now') AS INTEGER) - ${recent};" \
+            2>/dev/null) || return 0
+        case "$n" in ''|*[!0-9]*) return 0 ;; esac
+        [ "$n" -eq 0 ] && return 0
+        [ "$SECONDS" -ge "$deadline" ] && return 1
+        sleep 1
+    done
+}
+
 if [ "${MORNING_RESTART_SOURCE_ONLY:-0}" = "1" ]; then
     return 0 2>/dev/null || exit 0
 fi
@@ -69,6 +92,11 @@ if ! ensure_uvicorn_service; then
     say "morning_restart 失敗，uvicorn launchd service 無法載入"
     exit 1
 fi
+# Let the messages being handled right now finish (at most 25 s; never blocks the restart longer).
+inflight_started=$SECONDS
+wait_for_inflight_messages 25 90
+inflight_rc=$?
+say "inflight wait rc=$inflight_rc waited=$((SECONDS - inflight_started))s"
 launchctl kickstart -k "gui/$(id -u)/$UVICORN_LABEL"
 say "kickstarted $UVICORN_LABEL"
 

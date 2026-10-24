@@ -121,6 +121,34 @@ def _add_column(c: sqlite3.Connection, table: str, column: str, ddl: str) -> Non
         raise RuntimeError(f"{table}.{column} migration failed")
 
 
+# 2026-10-24: how many times an inbound event has been started (a lease retry or a restart
+# orphan adds one) and which process instance owns it.  Both have defaults, so INSERTs from
+# the code before this change still work against the new schema (rollback needs no DB restore).
+_INBOUND_NEW_COLUMNS = (
+    ("attempts", "attempts INTEGER NOT NULL DEFAULT 1"),
+    ("owner", "owner TEXT NOT NULL DEFAULT ''"),
+)
+
+
+def _ensure_inbound_event_columns(c: sqlite3.Connection) -> None:
+    """Best effort: a failure here must not stop the bot from starting.
+
+    The deploy applies these two columns beforehand (ops/state/line_bot_fixes_20261023/
+    preapply_inbound_columns.py); this is only the safety net.  Without the columns
+    ``begin_inbound_event`` and ``claim_inbound_reply`` use their legacy statements.
+    """
+    try:
+        have = {row[1] for row in c.execute("PRAGMA table_info(inbound_events)").fetchall()}
+        for name, ddl in _INBOUND_NEW_COLUMNS:
+            if name not in have:
+                _add_column(c, "inbound_events", name, ddl)
+    except Exception as exc:
+        logger.warning(
+            "inbound_events columns not added; legacy lease statements stay in use error_type=%s",
+            type(exc).__name__,
+        )
+
+
 def _init_db() -> None:
     with _lock, _conn() as c:
         c.executescript(
@@ -196,6 +224,8 @@ def _init_db() -> None:
                 status      TEXT NOT NULL,
                 created_at  INTEGER NOT NULL,
                 updated_at  INTEGER NOT NULL,
+                attempts    INTEGER NOT NULL DEFAULT 1,
+                owner       TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (group_id, message_id)
             );
             CREATE INDEX IF NOT EXISTS idx_inbound_events_updated
@@ -449,6 +479,7 @@ def _init_db() -> None:
                 "ALTER TABLE reminder_confirmation_outbox "
                 "ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''"
             )
+        _ensure_inbound_event_columns(c)
         # kg_triples schema migration: ALTER TABLE 自動補 column
         # 2026-05-08 新增：純本機 knowledge graph 萃取
         kg = c.execute(
@@ -1041,13 +1072,57 @@ _RAW_MESSAGE_KEEP = 2000  # 每群組保留最近 N 筆原始訊息（給 quote-
 # raw_messages is written before routing, so it cannot prove that LINE got a
 # reply. Keep a short processing lease for concurrent redeliveries, then allow
 # a later delivery to retry an event that never reached a successful reply.
-_INBOUND_PROCESSING_LEASE_SECONDS = 30
-_INBOUND_MEDIA_PROCESSING_LEASE_SECONDS = 120
+#
+# 2026-10-24: LINE redelivers about every 60 s, and a 30 s lease let every redelivery
+# re-run the whole model flow (10/15: 15 reruns of one message).  With 150 s the first two
+# redeliveries are skipped; at most _INBOUND_MAX_ATTEMPTS starts happen in all.  A row that a
+# *different* process instance started (a restart cut its handler off) is retried at once.
+#
+# status values: processing / media_processing (being handled), reply_sending (a reply or
+# push is on its way, or its outcome is unknown -- never re-run), replied (LINE accepted it),
+# completed_no_reply (closed without a reply).
+_INBOUND_PROCESSING_LEASE_SECONDS = 150
+_INBOUND_MEDIA_PROCESSING_LEASE_SECONDS = 300  # must stay above the processing lease
 _INBOUND_EVENT_RETENTION_SECONDS = 14 * 86400
+_INBOUND_MAX_ATTEMPTS = 3
+_INBOUND_ACTIVE_STATUSES = ("processing", "media_processing")
+# One id per process start: a restart is a new instance, so rows its predecessor left in an
+# active state are known orphans.
+_INSTANCE_ID = f"{os.getpid()}-{uuid.uuid4().hex[:12]}"
+
+
+def _is_missing_column_error(exc: sqlite3.OperationalError) -> bool:
+    return "no such column" in str(exc).lower()
+
+
+def _read_inbound_row(c: sqlite3.Connection, group_id: str, message_id: str):
+    """``(row, extended)``: ``row`` is (status, updated_at, attempts, owner) or None;
+    ``extended`` False means the table still has its old shape (attempts/owner missing)."""
+    try:
+        row = c.execute(
+            "SELECT status, updated_at, attempts, owner FROM inbound_events "
+            "WHERE group_id = ? AND message_id = ?",
+            (group_id, message_id),
+        ).fetchone()
+        return row, True
+    except sqlite3.OperationalError as exc:
+        if not _is_missing_column_error(exc):
+            raise
+    row = c.execute(
+        "SELECT status, updated_at FROM inbound_events "
+        "WHERE group_id = ? AND message_id = ?",
+        (group_id, message_id),
+    ).fetchone()
+    return (None if row is None else (row[0], row[1], 1, "")), False
 
 
 def begin_inbound_event(group_id: str, message_id: str) -> str:
-    """Claim an inbound event: ``new``, ``processing``, ``retry`` or ``replied``."""
+    """Claim an inbound event.
+
+    ``new``; ``processing`` (inside the lease: someone is on it); ``retry`` (the lease ran
+    out or its starter is gone: run it again); ``reply_sending`` (a reply is on its way or its
+    outcome is unknown); ``replied``; ``completed_no_reply``.
+    """
     if not group_id or not message_id:
         return "new"
     now = int(_time.time())
@@ -1056,34 +1131,60 @@ def begin_inbound_event(group_id: str, message_id: str) -> str:
             "DELETE FROM inbound_events WHERE updated_at < ?",
             (now - _INBOUND_EVENT_RETENTION_SECONDS,),
         )
-        row = c.execute(
-            "SELECT status, updated_at FROM inbound_events "
-            "WHERE group_id = ? AND message_id = ?",
-            (group_id, message_id),
-        ).fetchone()
+        row, extended = _read_inbound_row(c, group_id, message_id)
         if row is None:
-            c.execute(
-                "INSERT INTO inbound_events "
-                "(group_id, message_id, status, created_at, updated_at) "
-                "VALUES (?, ?, 'processing', ?, ?)",
-                (group_id, message_id, now, now),
-            )
+            if extended:
+                c.execute(
+                    "INSERT INTO inbound_events "
+                    "(group_id, message_id, status, created_at, updated_at, attempts, owner) "
+                    "VALUES (?, ?, 'processing', ?, ?, 1, ?)",
+                    (group_id, message_id, now, now, _INSTANCE_ID),
+                )
+            else:
+                c.execute(
+                    "INSERT INTO inbound_events "
+                    "(group_id, message_id, status, created_at, updated_at) "
+                    "VALUES (?, ?, 'processing', ?, ?)",
+                    (group_id, message_id, now, now),
+                )
             return "new"
-        status, updated_at = row
-        if status in {"replied", "completed_no_reply"}:
+        status, updated_at, attempts, owner = row
+        if status in {"replied", "completed_no_reply", "reply_sending"}:
             return status
         lease_seconds = (
             _INBOUND_MEDIA_PROCESSING_LEASE_SECONDS
             if status == "media_processing"
             else _INBOUND_PROCESSING_LEASE_SECONDS
         )
-        if now - int(updated_at) < lease_seconds:
-            return "processing"
-        c.execute(
-            "UPDATE inbound_events SET status = 'processing', updated_at = ? "
-            "WHERE group_id = ? AND message_id = ?",
-            (now, group_id, message_id),
+        # Only an extended table says who started the row; the old shape never shortcuts.
+        orphan = (
+            extended
+            and status in _INBOUND_ACTIVE_STATUSES
+            and str(owner or "") != _INSTANCE_ID
         )
+        if not orphan and now - int(updated_at) < lease_seconds:
+            return "processing"
+        if extended and int(attempts or 1) >= _INBOUND_MAX_ATTEMPTS:
+            # Started the allowed number of times and never reached a reply: close it so
+            # LINE's redeliveries stop re-running the models.
+            c.execute(
+                "UPDATE inbound_events SET status = 'completed_no_reply', updated_at = ? "
+                "WHERE group_id = ? AND message_id = ?",
+                (now, group_id, message_id),
+            )
+            return "completed_no_reply"
+        if extended:
+            c.execute(
+                "UPDATE inbound_events SET status = 'processing', updated_at = ?, "
+                "attempts = attempts + 1, owner = ? WHERE group_id = ? AND message_id = ?",
+                (now, _INSTANCE_ID, group_id, message_id),
+            )
+        else:
+            c.execute(
+                "UPDATE inbound_events SET status = 'processing', updated_at = ? "
+                "WHERE group_id = ? AND message_id = ?",
+                (now, group_id, message_id),
+            )
         return "retry"
 
 
@@ -1095,9 +1196,127 @@ def mark_inbound_event_media_processing(group_id: str, message_id: str) -> None:
     with _lock, _conn() as c:
         c.execute(
             "UPDATE inbound_events SET status = 'media_processing', updated_at = ? "
-            "WHERE group_id = ? AND message_id = ? AND status != 'replied'",
+            "WHERE group_id = ? AND message_id = ? "
+            "AND status NOT IN ('replied', 'reply_sending')",
             (now, group_id, message_id),
         )
+
+
+def _read_inbound_rows(c: sqlite3.Connection, group_id: str, ids: list[str]):
+    """``[(message_id, status, attempts)]`` for the ids that have a row; attempts is 1 when
+    the table still has its old shape."""
+    rows: list[tuple[str, str, int]] = []
+    for start in range(0, len(ids), _COMPLETE_BATCH):
+        batch = ids[start:start + _COMPLETE_BATCH]
+        marks = ",".join("?" * len(batch))
+        try:
+            found = c.execute(
+                "SELECT message_id, status, attempts FROM inbound_events "
+                f"WHERE group_id = ? AND message_id IN ({marks})",
+                [group_id, *batch],
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if not _is_missing_column_error(exc):
+                raise
+            found = [
+                (message_id, status, 1)
+                for message_id, status in c.execute(
+                    "SELECT message_id, status FROM inbound_events "
+                    f"WHERE group_id = ? AND message_id IN ({marks})",
+                    [group_id, *batch],
+                ).fetchall()
+            ]
+        rows.extend((str(m), str(s), int(a or 1)) for m, s, a in found)
+    return rows
+
+
+def claim_inbound_reply(group_id: str, message_ids: list[str]) -> tuple[str, bool]:
+    """Fence one outgoing reply (and its fallback push) -- 2026-10-24.
+
+    Called right before ``reply_message``.  The rows being handled move to
+    ``reply_sending`` in one write transaction (cross-process safe), so a re-run of the same
+    event, a redelivery after a restart or a second thread can neither send a second copy
+    nor push after the first one.  The fence lifts only on a definite non-delivery
+    (``release_inbound_reply``) or a terminal mark; an unknown outcome leaves it in place.
+
+    Returns ``(outcome, lease_retry)``:
+
+    * ``claimed``   -- go ahead; ``lease_retry`` says an earlier start of this event existed
+      (attempts > 1), so the caller must not fall back to a push;
+    * ``blocked``   -- a reply for this event is on its way, was accepted, or may have been
+      delivered: do not send;
+    * ``untracked`` -- no row to fence (never registered, or every row already closed
+      silently): send as before.
+    """
+    ids = list(dict.fromkeys(str(m) for m in message_ids if m))
+    if not group_id or not ids:
+        return "untracked", False
+    now = int(_time.time())
+    with _lock, _conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            rows = _read_inbound_rows(c, group_id, ids)
+            statuses = {status for _m, status, _a in rows}
+            if "reply_sending" in statuses or "replied" in statuses:
+                outcome, retry = "blocked", False
+            else:
+                active = [(m, a) for m, status, a in rows if status in _INBOUND_ACTIVE_STATUSES]
+                if not active:
+                    outcome, retry = "untracked", False
+                else:
+                    c.executemany(
+                        "UPDATE inbound_events SET status = 'reply_sending', updated_at = ? "
+                        "WHERE group_id = ? AND message_id = ? "
+                        "AND status IN ('processing', 'media_processing')",
+                        [(now, group_id, m) for m, _a in active],
+                    )
+                    outcome, retry = "claimed", max(a for _m, a in active) > 1
+            c.execute("COMMIT")
+            return outcome, retry
+        except Exception:
+            if c.in_transaction:
+                c.execute("ROLLBACK")
+            raise
+
+
+def settle_inbound_reply(group_id: str, message_ids: list[str]) -> int:
+    """LINE accepted the reply or the push: the rows still in ``reply_sending`` become
+    ``replied``.  One statement per chunk; changes nothing when the rows are already settled."""
+    ids = list(dict.fromkeys(str(m) for m in message_ids if m))
+    if not group_id or not ids:
+        return 0
+    now = int(_time.time())
+    with _lock, _conn() as c:
+        before = c.total_changes
+        for start in range(0, len(ids), _COMPLETE_BATCH):
+            batch = ids[start:start + _COMPLETE_BATCH]
+            c.execute(
+                "UPDATE inbound_events SET status = 'replied', updated_at = ? "
+                "WHERE group_id = ? AND status = 'reply_sending' "
+                f"AND message_id IN ({','.join('?' * len(batch))})",
+                [now, group_id, *batch],
+            )
+        return c.total_changes - before
+
+
+def release_inbound_reply(group_id: str, message_ids: list[str]) -> int:
+    """LINE refused the reply (a definite 4xx, nothing was sent): lift the fence so the event
+    can be handled again.  Only rows still in ``reply_sending`` change."""
+    ids = list(dict.fromkeys(str(m) for m in message_ids if m))
+    if not group_id or not ids:
+        return 0
+    now = int(_time.time())
+    with _lock, _conn() as c:
+        before = c.total_changes
+        for start in range(0, len(ids), _COMPLETE_BATCH):
+            batch = ids[start:start + _COMPLETE_BATCH]
+            c.execute(
+                "UPDATE inbound_events SET status = 'processing', updated_at = ? "
+                "WHERE group_id = ? AND status = 'reply_sending' "
+                f"AND message_id IN ({','.join('?' * len(batch))})",
+                [now, group_id, *batch],
+            )
+        return c.total_changes - before
 
 
 def mark_inbound_event_replied(group_id: str, message_id: str) -> None:

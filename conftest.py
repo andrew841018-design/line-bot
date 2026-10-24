@@ -274,6 +274,10 @@ def reset_main_globals(monkeypatch):
         burst_filter._timers.clear()
         burst_filter._pending.clear()
         burst_filter._last_reply_tokens.clear()
+        burst_filter._inflight.clear()
+    # 2026-10-24: tests reuse reply-token constants; the token -> inbound lookup the send fence
+    # keeps after a reply was accepted must not carry one test's event into the next.
+    main._inbound_ids_by_token.clear()
     # 2026-10-07: CLI timeouts faked by one test must not leave the CLI
     # resting (claude_client's timeout breaker) in the next.
     claude_client._cli_timeout_streak = 0

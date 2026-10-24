@@ -952,7 +952,7 @@ def _fake_line(monkeypatch, *, push_ids):
         def reply_message(self, _request):
             raise _ReplyTokenError("Invalid reply token")
 
-        def push_message(self, _request):
+        def push_message(self, _request, x_line_retry_key=None):
             return SimpleNamespace(sent_messages=[SimpleNamespace(id=i) for i in push_ids])
 
     class _Client:
