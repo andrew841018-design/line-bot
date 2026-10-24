@@ -6,7 +6,8 @@ Andrew 2026-10-17 的要求：台股也要看技術面、成交量（「我要�
 
 每個來源兩個函式（INTERFACES §3）：
 - 純解析：收已解析的 JSON／文字，回 dataclass；壞資料丟 `ParseError(kind)`（kind 只是列舉值、不帶回應內容，
-  outcome 只記列舉值）。
+  outcome 只記列舉值）。回應本身就不是 JSON／CSV 時另帶程式自己的 detail（json、csv、header、columns），
+  log 才分得出是哪一種 format（2026-10-23）。
 - 抓取：組網址 → `http.fetch(...)`（預設 market_http，第一次抓才 import；測試注入假的）→ 自己用 utf-8-sig 嚴格解碼
   → 解析。`FetchError` 原樣往上丟。
 
@@ -20,6 +21,8 @@ Andrew 2026-10-17 的要求：台股也要看技術面、成交量（「我要�
   ＝交易日；看不懂（或同時符合兩類）的標 unknown 交給每日維護，不猜。
 - 期交所：外資台指期分大台（臺股期貨）／小台（小型臺指期貨）／微台（微型臺指期貨），名稱完全相同才算；
   TXO 只收一般盤、預設只收月選（ContractMonth(Week) 原字串保留，週選不會被併進月選）；PCR 是帶 BOM 的 CSV。
+  其他端點同一個網址 CDN 快取到 JSON 就回 JSON、快取到 CSV 就回 CSV（2026-10-23）：DailyMarketReportOpt 照實測的
+  表頭兩種都收；表頭沒實測過的端點不猜對應，CSV 一律 format（`_taifex_body`）。
 - FinMind：同一份 payload 同一天重複且值不同 → `ParseError("conflict")`（這檔這次整檔拒收）；
   msg 不是 success → `FinMindStatusError`（kind＝"status"，job 停這輪補洞）；來源修訂用 `finmind_revised_dates`
   找出來。
@@ -79,10 +82,12 @@ class Endpoint:
 
 
 ENDPOINTS: dict[str, Endpoint] = {
-    # 證交所 www：五個端點每天合計 12 次（Andrew 接受和 /股票 各自限速）
+    # 證交所 www：五個端點每天合計 12 次（Andrew 接受和 /股票 各自限速）。2026-10-23 起各端點上限加起來 13：
+    # TWT49U 1→2（凌晨 00:0x 補昨天那次會用掉當天唯一的名額，16:00 那次從來沒跑過）；第 2 次只在凌晨補過昨天、
+    # 或 16:00 那次要重試時才用到，合計仍由主機帳本擋在 12（擋下＝budget，沒送出、不算失敗）
     "twse_allbut0999": Endpoint("www.twse.com.tw", time(14, 30), 4, 2 * _MIB, 15.0, ("json",)),
     "twse_bfi82u": Endpoint("www.twse.com.tw", time(15, 30), 3, 256 * _KIB, 15.0, ("json",)),
-    "twse_twt49u": Endpoint("www.twse.com.tw", time(16, 0), 1, 4 * _MIB, 15.0, ("json",)),
+    "twse_twt49u": Endpoint("www.twse.com.tw", time(16, 0), 2, 4 * _MIB, 15.0, ("json",)),
     "twse_margin_ms": Endpoint("www.twse.com.tw", time(21, 30), 3, 256 * _KIB, 15.0, ("json",)),
     "twse_holidays": Endpoint("www.twse.com.tw", None, 1, 256 * _KIB, 15.0, ("json",)),
     # 證交所 OpenAPI（另一個主機；資料本來就晚，不設最早時間）
@@ -90,12 +95,16 @@ ENDPOINTS: dict[str, Endpoint] = {
     "openapi_revenue": Endpoint("openapi.twse.com.tw", None, 2, 4 * _MIB, 15.0, ("json",)),
     # 期交所 OpenAPI：常晚一天（實測 10/17 週六上午還是 10/15、10/18 週日中午才有 10/16），以回應裡的資料日為準；
     # 每天 6 次、間隔 3 小時（2026-10-18 審查 r6c I1：30 分鐘一次會在午夜後一小時就把次數用完）。實測（10/17）每個端點都回 application/octet-stream
-    # （內容是 JSON，PutCallRatio 是 CSV），所以收 octet-stream；DailyMarketReportOpt 全量實測 846 KB
-    "taifex_futures_inst": Endpoint("openapi.taifex.com.tw", time(15, 0), 6, 1 * _MIB, 15.0, ("octet-stream", "json")),
-    "taifex_calls_puts_inst": Endpoint("openapi.taifex.com.tw", time(15, 0), 6, 1 * _MIB, 15.0, ("octet-stream", "json")),
-    "taifex_pcr": Endpoint("openapi.taifex.com.tw", time(15, 0), 6, 256 * _KIB, 15.0, ("octet-stream", "csv")),
-    "taifex_daily_options": Endpoint("openapi.taifex.com.tw", time(15, 0), 6, 4 * _MIB, 30.0, ("octet-stream", "json")),
-    "taifex_fx": Endpoint("openapi.taifex.com.tw", None, 2, 256 * _KIB, 15.0, ("octet-stream", "json")),
+    # （內容是 JSON，PutCallRatio 是 CSV），所以收 octet-stream；DailyMarketReportOpt 全量實測 846 KB。
+    # 2026-10-23：期交所的檔案（外資台指期、DailyMarketReportOpt、匯率）都是約 06:36 才放上前一個交易日，00／03／06
+    # 點那幾次一定白打 → 07:00 起才抓、間隔改 2 小時、每天 6→9 次（07、09…23 點；匯率仍每天 2 次：07、09 點）。
+    # 10/23 的 09／12／15 點剛好碰上 CDN 給 CSV 的時段，額度就燒光了，要到隔天 00:09 才再試。
+    # market_pipeline_tw.taifex_due 照這個最早時間擋；主機合計 4×9＋2＝38 次／天，在帳本的預設上限（200）內
+    "taifex_futures_inst": Endpoint("openapi.taifex.com.tw", time(7, 0), 9, 1 * _MIB, 15.0, ("octet-stream", "json")),
+    "taifex_calls_puts_inst": Endpoint("openapi.taifex.com.tw", time(7, 0), 9, 1 * _MIB, 15.0, ("octet-stream", "json")),
+    "taifex_pcr": Endpoint("openapi.taifex.com.tw", time(7, 0), 9, 256 * _KIB, 15.0, ("octet-stream", "csv")),
+    "taifex_daily_options": Endpoint("openapi.taifex.com.tw", time(7, 0), 9, 4 * _MIB, 30.0, ("octet-stream", "json")),
+    "taifex_fx": Endpoint("openapi.taifex.com.tw", time(7, 0), 2, 256 * _KIB, 15.0, ("octet-stream", "json")),
     # FinMind：51 檔＋TAIEX 補洞；一年以上的 bootstrap 用 30 秒（TAIEX 全歷史約 6,900 列、1.5 MB）
     "finmind_prices": Endpoint("api.finmindtrade.com", None, 60, 4 * _MIB, 15.0, ("json",)),
     # 0050 持股實際走 A 的 market_sources_us.fetch_moneydj_holdings（它的 moneydj 端點）；這列給 job 排程用
@@ -492,7 +501,7 @@ def _json_body(body: bytes) -> Any:
     try:
         return json.loads(body.decode("utf-8-sig"))
     except (UnicodeDecodeError, ValueError):
-        raise ParseError("format") from None
+        raise ParseError("format", "json") from None  # 2026-10-23：detail 讓 log 分得出「不是 JSON」和其他 format
 
 
 def _http_module(http: Any) -> Any:
@@ -1017,6 +1026,36 @@ def _taifex_rows(rows: Any) -> tuple[list[dict], date]:
     return rows, days.pop()
 
 
+def _taifex_body(body: bytes, csv_columns: Optional[Sequence[tuple[str, str]]] = None) -> Any:
+    """期交所 OpenAPI 的回應 → JSON 形狀的列（交給原本的 JSON 解析）。
+
+    2026-10-23 實測：期交所前面的 Cloudflare 同一個網址快取到 JSON 就回 JSON、快取到 CSV 就回 CSV，不看 Accept
+    （送 Accept: application/json 也拿到同一份 CSV）；只收 JSON 的話，快取是 CSV 的那幾個小時整個端點都是 format。
+    去掉 BOM 與空白後開頭是 [ 或 { 就照原本當 JSON；其他當 CSV（UTF-8 BOM、中文表頭）：`csv_columns` 是
+    (英文鍵, 中文表頭) 照欄序，表頭要一字不差、順序也相同，才照位置換成英文鍵。沒有實測過 CSV 表頭的端點
+    （`csv_columns` 是 None）不猜對應，CSV 一律 format。detail 只放程式自己的字，log 才看得出是哪一種：
+    json（像 JSON 卻解析不了）、csv（不收 CSV 或讀不了）、header（表頭不是實測那一份）、columns（某列欄數不對，例如截斷）。
+    """
+    head = body[3:] if body.startswith(b"\xef\xbb\xbf") else body
+    if head.lstrip()[:1] in (b"[", b"{"):
+        return _json_body(body)
+    if csv_columns is None:
+        raise ParseError("format", "csv")
+    try:
+        lines = [line for line in csv.reader(io.StringIO(body.decode("utf-8-sig"), newline="")) if line]
+    except (UnicodeDecodeError, csv.Error):
+        raise ParseError("format", "csv") from None
+    if not lines or lines[0] != [name for _, name in csv_columns]:
+        raise ParseError("format", "header")
+    keys = [key for key, _ in csv_columns]
+    rows = []
+    for line in lines[1:]:
+        if len(line) != len(keys):
+            raise ParseError("format", "columns")  # 截斷或欄位錯位：整份拒收，不猜哪幾欄對得上
+        rows.append(dict(zip(keys, line)))
+    return rows
+
+
 def parse_taifex_futures_inst(rows: Any) -> FuturesInst:
     """`MarketDataOfMajorInstitutionalTradersDetailsOfFuturesContractsBytheDate`：外資的大台／小台／微台分開。
 
@@ -1179,6 +1218,28 @@ def parse_taifex_pcr_csv(text: Any) -> list[PcrRow]:
 
 _MONTHLY_RE = re.compile(r"([0-9]{4})([0-9]{2})")
 _CONTRACT_MONTH_RE = re.compile(r"[0-9]{6}[0-9A-Z]{0,4}")
+# 2026-10-23：DailyMarketReportOpt 的 CSV 表頭（10/23 實測整份 11,302 列，UTF-8 BOM、18 欄），和 10/17 的 JSON 樣本
+# 18 個英文鍵一一對應、順序相同；照位置換回英文鍵後原本的解析就能用（期交所改了表頭就 format／header，不猜）
+_DAILY_OPT_CSV = (
+    ("Date", "日期"),
+    ("Contract", "契約"),
+    ("ContractMonth(Week)", "到期月份(週別)"),
+    ("StrikePrice", "履約價"),
+    ("CallPut", "買賣權"),
+    ("Open", "開盤價"),
+    ("High", "最高價"),
+    ("Low", "最低價"),
+    ("Close", "最後成交價"),
+    ("Volume", "成交量"),
+    ("SettlementPrice", "結算價"),
+    ("OpenInterest", "未沖銷契約量"),
+    ("BestBid", "最後最佳買價"),
+    ("BestAsk", "最後最佳賣價"),
+    ("HistoricalHigh", "歷史最高價"),
+    ("HistoricalLow", "歷史最低價"),
+    ("TradingHalt", "是否因訊息面暫停交易"),
+    ("TradingSession", "交易時段"),
+)
 
 
 def parse_taifex_daily_options(rows: Any, contract: str = "TXO", *, monthly_only: bool = True) -> list[TxoRow]:
@@ -1373,14 +1434,16 @@ def fetch_openapi_revenue(*, http: Any = None, ledger: Any = None) -> dict[str, 
     return parse_openapi_revenue(rows)
 
 
+# 2026-10-23：外資台指期、外資選擇權、匯率的 CSV 表頭還沒抓到真樣本，不猜對應：CDN 回 CSV 時 format（detail csv），
+# 只收 JSON；抓到真樣本後再照 DailyMarketReportOpt 的做法加表頭
 def fetch_taifex_futures_inst(*, http: Any = None, ledger: Any = None) -> FuturesInst:
     url = f"{TAIFEX_OPENAPI}/MarketDataOfMajorInstitutionalTradersDetailsOfFuturesContractsBytheDate"
-    return parse_taifex_futures_inst(_json_body(_get(http, ledger, "taifex_futures_inst", url)))
+    return parse_taifex_futures_inst(_taifex_body(_get(http, ledger, "taifex_futures_inst", url)))
 
 
 def fetch_taifex_calls_puts_inst(*, http: Any = None, ledger: Any = None) -> OptionsInst:
     url = f"{TAIFEX_OPENAPI}/MarketDataOfMajorInstitutionalTradersDetailsOfCallsAndPutsBytheDate"
-    return parse_taifex_calls_puts_inst(_json_body(_get(http, ledger, "taifex_calls_puts_inst", url)))
+    return parse_taifex_calls_puts_inst(_taifex_body(_get(http, ledger, "taifex_calls_puts_inst", url)))
 
 
 def fetch_taifex_pcr(*, http: Any = None, ledger: Any = None) -> list[PcrRow]:
@@ -1390,12 +1453,12 @@ def fetch_taifex_pcr(*, http: Any = None, ledger: Any = None) -> list[PcrRow]:
 
 def fetch_taifex_daily_options(contract: str = "TXO", *, http: Any = None, ledger: Any = None) -> list[TxoRow]:
     body = _get(http, ledger, "taifex_daily_options", f"{TAIFEX_OPENAPI}/DailyMarketReportOpt")
-    return parse_taifex_daily_options(_json_body(body), contract)
+    return parse_taifex_daily_options(_taifex_body(body, _DAILY_OPT_CSV), contract)  # JSON 或 CSV（2026-10-23）
 
 
 def fetch_taifex_fx(*, http: Any = None, ledger: Any = None) -> FxRow:
     body = _get(http, ledger, "taifex_fx", f"{TAIFEX_OPENAPI}/DailyForeignExchangeRates")
-    return parse_taifex_fx(_json_body(body))
+    return parse_taifex_fx(_taifex_body(body))
 
 
 def fetch_finmind_prices(code: str, start: date, end: date, *, http: Any = None, ledger: Any = None) -> list[TwBar]:

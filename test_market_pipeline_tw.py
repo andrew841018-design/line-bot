@@ -5,7 +5,7 @@ FinMind 接入前的 5 天比對、期交所 15:00 起每 30 分鐘。解析本�
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
@@ -409,6 +409,56 @@ def test_allbut_keeps_all_common_stocks_short_and_tracked_long(env):
     assert summary["days"][days[-1].isoformat()]["adv_limit"] == 19
 
 
+def test_old_tw_gaps_are_backfilled_one_per_day(env):
+    """2026-10-23（tw_history (a)）：2026-07-10 那種休市表沒寫的臨時休市是 FinMind bootstrap 帶進來的洞，補洞只看最近
+    10 個交易日、永遠輪不到，跨過它的 120／240 日窗口全部無效。歷史窗口裡更早的洞（加權指數沒有收盤）每天補一個：
+    證交所與 FinMind 都沒有 → 暫定休市；證交所有 → 存起來。舊日期看收盤（ALLBUT 摘要只留 10 天），不會整年重抓。"""
+    sessions = sessions_before(date(2026, 10, 17), 100)  # 10/16 往前 100 個預期交易日（新到舊）
+    gap_new, gap_old = sessions[72], sessions[80]  # 72、80 個交易日前，休市表沒寫
+    env.store.upsert_closes(tw.MARKET, tw.SYM_TAIEX, [(day, 47000.0, 1) for day in sessions if day not in (gap_new, gap_old)],
+                            tw.SOURCE_FINMIND)
+    seed_days(env, tw.OBS_ALLBUT, sessions[:10])  # 最近 10 個交易日都有了：近期的補洞沒事做
+    closes = {"0050": "109.00", "2330": "2,420.00"}
+    env.http.route("MI_INDEX", lambda url: allbut_payload(gap_old, closes) if day_of(url) == gap_old else NO_DATA)
+    env.http.route("finmindtrade", {"msg": "success", "status": 200, "data": []})
+    ctx = make_ctx(env, at(2026, 10, 17, 10, 0))  # 週六上午
+    assert ctx.tw_cal.missing_bars(sessions[-1], sessions[10]) == [gap_old, gap_new]  # 前提：只有這兩個洞
+    assert tw.allbut_backfill(ctx) == ("history", gap_new)  # 新的先
+    assert run(ctx, "tw.allbut.backfill") == "not_yet"
+    assert env.http.days("MI_INDEX") == [gap_new] and env.http.count("finmindtrade") == 1  # 這一輪只試一個
+    override = env.store.calendar_overrides("tw")[gap_new]
+    assert override["kind"] == "closed" and override["confirmed"] is False and override["evidence"] == tw.TYPHOON_EVIDENCE
+    assert market_calendar.tw_calendar(env.store).is_session(gap_new) is False
+    for minutes in (15, 60, 300):  # 同一天不再試別的舊洞
+        assert tw.allbut_backfill(make_ctx(env, at(2026, 10, 17, 10, 0) + minutes * 60)) is None
+    assert env.http.count("MI_INDEX") == 1
+    # 隔天輪到更舊的那個：證交所有那天的資料 → 存起來，日曆就看得到那天有開
+    ctx = make_ctx(env, at(2026, 10, 18, 10, 0))
+    assert tw.allbut_backfill(ctx) == ("history", gap_old)
+    assert run(ctx, "tw.allbut.backfill") == "ok"
+    assert gap_old in {row.date for row in env.store.closes(tw.MARKET, tw.SYM_TAIEX)}
+    assert market_calendar.tw_calendar(env.store).missing_bars(sessions[-1], sessions[10]) == []
+    assert tw.allbut_backfill(make_ctx(env, at(2026, 10, 19, 10, 0))) is None  # 沒有洞了
+    assert env.http.days("MI_INDEX") == [gap_new, gap_old]
+
+
+def test_an_old_gap_that_stays_is_left_after_two_tries(env):
+    """證交所沒有、FinMind 卻有那天（來源漏日）：不寫休市；隔天再試一次，試了兩次還在就不再試，留給每日維護
+    （outcome 的 calendar_missing_bars）。舊日期的試過次數另外記：一般的 tries 只留最近 40 個日期。"""
+    sessions = sessions_before(date(2026, 10, 17), 40)
+    gap = sessions[30]
+    env.store.upsert_closes(tw.MARKET, tw.SYM_TAIEX, [(day, 47000.0, 1) for day in sessions if day != gap], tw.SOURCE_FINMIND)
+    seed_days(env, tw.OBS_ALLBUT, sessions[:10])
+    env.http.route("MI_INDEX", NO_DATA)
+    env.http.route("finmindtrade", finmind_payload("TAIEX", [(gap, 47000.0, 1, 2)]))
+    for day in (17, 18):
+        ctx = make_ctx(env, at(2026, 10, day, 10, 0))
+        assert tw.allbut_backfill(ctx) == ("history", gap)
+        assert run(ctx, "tw.allbut.backfill") == "not_yet"
+    assert tw.allbut_backfill(make_ctx(env, at(2026, 10, 19, 10, 0))) is None
+    assert env.http.days("MI_INDEX") == [gap, gap] and env.store.calendar_overrides("tw") == {}
+
+
 def test_ledger_refusal_is_not_counted_as_a_try(env):
     env.http.route("MI_INDEX", lambda url: allbut_payload(day_of(url), {"0050": "109.00", "2330": "2,420.00"}))
     ledger = env.store.ledger(now_fn=env.clock, sleep_fn=env.clock.sleep)
@@ -551,6 +601,25 @@ def test_twt49u_chunks_continue_after_the_mac_was_off(env):
     assert holes == [(date(2026, 10, 1), date(2026, 10, 5)), (date(2026, 3, 1), date(2026, 3, 9))]
 
 
+def test_twt49u_runs_at_16_00_even_after_the_midnight_catch_up(env):
+    """2026-10-23（tw_history (c) Step 1）：次數以台北日期計，凌晨 00:0x 補昨天那次用掉當天唯一的名額，16:00 那次
+    從來沒跑過，0050 細節頁每個交易日都要等到隔天凌晨才換到 T。每天上限 1→2：16:30 照跑、涵蓋到 T；隔天就不必再打。"""
+    env.store.add_coverage(tw.COVERAGE_TWT49U, date(2025, 8, 1), date(2026, 10, 16))  # 涵蓋到上週五
+    env.http.route("TWT49U", NO_DATA)
+    assert run(make_ctx(env, at(2026, 10, 20, 0, 5)), "tw.twt49u") == "ok"  # 週二凌晨補到週一
+    assert env.store.coverage(tw.COVERAGE_TWT49U)[-1][1] == date(2026, 10, 19)
+    assert sched(env, tw.TASK_TWT49U)["count"] == 1
+    assert tw.twt49u_core(make_ctx(env, at(2026, 10, 20, 15, 59))) is None
+    ctx = make_ctx(env, at(2026, 10, 20, 16, 30))
+    assert tw.twt49u_core(ctx) == (date(2026, 10, 19), date(2026, 10, 20))
+    assert run(ctx, "tw.twt49u") == "ok"
+    assert env.store.coverage(tw.COVERAGE_TWT49U)[-1][1] == date(2026, 10, 20)
+    asked = [(query(url)["startDate"], query(url)["endDate"]) for url in env.http.calls if "TWT49U" in url]
+    assert asked == [("20261016", "20261019"), ("20261019", "20261020")]
+    for hh, mm in ((0, 5), (8, 0), (15, 59)):  # 隔天：涵蓋已經到週二，不必再打
+        assert tw.twt49u_core(make_ctx(env, at(2026, 10, 21, hh, mm))) is None
+
+
 # ── 休市表 ────────────────────────────────────────────────────────────────────────
 def test_holidays_bootstrap_this_and_previous_year_then_next_year_weekly(bare_env):
     env = bare_env
@@ -576,7 +645,7 @@ def test_holidays_bootstrap_this_and_previous_year_then_next_year_weekly(bare_en
     assert tw.holiday_year(make_ctx(env, tuesday + 7 * 86400)) == 2027
 
 
-# ── 期交所：目標日（今天要過 15:00 才算）、每 30 分鐘、每天 3 次，資料日以回應為準 ───────────────────
+# ── 期交所：目標日（今天要過 15:00 才算）、07:00 起每 2 小時、每天 9 次（匯率 2 次），資料日以回應為準 ──────
 def test_taifex_polls_every_30_minutes_and_keeps_the_payload_date(env):
     lag = {"day": date(2026, 10, 15)}
     env.http.route("MarketDataOfMajorInstitutionalTradersDetailsOfFuturesContracts", lambda url: futures_rows(lag["day"]))
@@ -587,16 +656,17 @@ def test_taifex_polls_every_30_minutes_and_keeps_the_payload_date(env):
     assert obs["data_date"] == "2026-10-15"  # 期交所晚一天：資料日照回應
     assert obs["payload"]["foreign"]["TX"]["oi_net"] == -97582
     assert obs["payload"]["foreign"]["MTX"]["oi_net"] == -3928 and obs["payload"]["foreign"]["TMF"]["oi_net"] == -12415
-    assert run(make_ctx(env, at(2026, 10, 16, 15, 10)), name) == "not_due"  # 過了 15:00 目標變 10/16，但不到 3 小時
+    assert run(make_ctx(env, at(2026, 10, 16, 15, 10)), name) == "not_due"  # 過了 15:00 目標變 10/16，但不到 2 小時
     assert run(make_ctx(env, at(2026, 10, 16, 18, 0)), name) == "not_yet"  # 還是 10/15：不算失敗
     assert run(make_ctx(env, at(2026, 10, 16, 21, 0)), name) == "not_yet"
-    assert run(make_ctx(env, at(2026, 10, 16, 23, 0)), name) == "not_due"  # 3 小時間隔
-    for hour in (2, 5, 8, 11):  # 隔天（週六）的 6 次：00:00 起每 3 小時，不會在半夜一小時內用完
+    assert run(make_ctx(env, at(2026, 10, 16, 22, 30)), name) == "not_due"  # 2 小時間隔
+    for hour in (0, 3, 6):  # 2026-10-23：07:00 前不打（期交所約 06:36 才放上前一個交易日）
+        assert run(make_ctx(env, at(2026, 10, 17, hour, 0)), name) == "not_due"
+    for hour in (7, 9, 11):  # 隔天（週六）07:00 起每 2 小時
         assert run(make_ctx(env, at(2026, 10, 17, hour, 0)), name) == "not_yet"  # 期交所還沒更新
     assert env.store.get_obs(tw.OBS_FUTURES)["fail_streak"] == 0
-    assert env.store.get_obs(tw.OBS_FUTURES)["fail_streak"] == 0
     lag["day"] = date(2026, 10, 16)
-    assert run(make_ctx(env, at(2026, 10, 17, 15, 0)), name) == "ok"  # 週六：目標仍是週五
+    assert run(make_ctx(env, at(2026, 10, 17, 13, 0)), name) == "ok"  # 週六：目標仍是週五
     obs = env.store.get_obs(tw.OBS_FUTURES)
     assert obs["data_date"] == "2026-10-16" and obs["payload"]["date"] == "2026-10-16"
     # 期交所只回最新一天：自己留前幾天，publish 才算得出外資淨口數的日變化
@@ -618,6 +688,60 @@ def test_taifex_morning_rules(env):
     assert run(make_ctx(env, at(2026, 10, 18, 9, 0)), name) == "ok"  # 週日早上：目標是週五，手上只有週四
     assert env.store.get_obs(tw.OBS_FUTURES)["data_date"] == "2026-10-16"
     assert run(make_ctx(env, at(2026, 10, 19, 9, 0)), name) == "not_due"  # 週一早上：目標仍是週五
+
+
+def test_taifex_tries_start_at_07_00_and_stay_2_hours_apart(env):
+    """2026-10-23：期交所的檔案約 06:36 才放上前一個交易日。以前每 3 小時、每天 6 次：00／03／06 點那三次一定白打，
+    10/23 剩下的 09／12／15 點又碰上 CDN 給 CSV 的時段，要到隔天 00:09 才再試；匯率每天 2 次都燒在 00:11、03:12。
+    現在 07:00 前不打，之後每 2 小時一次、每天最多 9 次（07、09…23 點）；匯率的 2 次在 07、09 點。"""
+    env.http.route("MarketDataOfMajorInstitutionalTradersDetailsOfFuturesContracts",
+                   lambda url: futures_rows(date(2026, 10, 15)))  # 期交所一直沒更新
+    env.http.route("DailyForeignExchangeRates", [{"Date": "20261015", "USD/NTD": "32.300"}])
+    env.store.put_obs(tw.OBS_FUTURES, {"date": "2026-10-15", "foreign": {"TX": {"oi_net": -1}}}, data_date="2026-10-15")
+    env.store.put_obs(tw.OBS_FX, {"date": "2026-10-15", "usd_ntd": 32.3}, data_date="2026-10-15")
+    tried: dict[str, list[str]] = {"tw.taifex.futures": [], "tw.taifex.fx": []}
+    for step in range(24 * 4):  # 週二 10/20 一整天、每 15 分鐘一輪（和 launchd 一樣）
+        now = at(2026, 10, 20) + step * 900
+        for name, seen in tried.items():
+            before = len(env.http.calls)
+            result = run(make_ctx(env, now), name)
+            if len(env.http.calls) > before:
+                assert result == "not_yet", name
+                seen.append(datetime.fromtimestamp(now, TPE).strftime("%H:%M"))
+            else:
+                assert result == "not_due", name
+    assert tried["tw.taifex.futures"] == ["07:00", "09:00", "11:00", "13:00", "15:00", "17:00", "19:00", "21:00", "23:00"]
+    assert tried["tw.taifex.fx"] == ["07:00", "09:00"]
+    for name in tried:  # 隔天：次數歸零、離上次也超過 2 小時，但還沒 07:00 就不打
+        assert run(make_ctx(env, at(2026, 10, 21, 1, 0)), name) == "not_due", name
+        assert run(make_ctx(env, at(2026, 10, 21, 6, 59)), name) == "not_due", name
+        assert run(make_ctx(env, at(2026, 10, 21, 7, 0)), name) == "not_yet", name
+    for spec in tw.TAIFEX_SPECS:  # 五個期交所任務同一套規則
+        assert tw._rule(spec.endpoint) == (time(7, 0), 2 if spec.task == "tw.taifex.fx" else 9), spec.task
+    # 主機合計 4×9＋2＝38 次／天；期交所不在 HOST_RULES 裡，用帳本的預設上限
+    cap = market_store.HOST_RULES.get("openapi.taifex.com.tw", market_store.DEFAULT_HOST_RULE).daily_cap
+    assert sum(tw._rule(spec.endpoint)[1] for spec in tw.TAIFEX_SPECS) == 38 <= cap
+
+
+def test_taifex_txo_csv_body_is_stored_without_backing_off(env):
+    """2026-10-23：CDN 給 DailyMarketReportOpt 的 CSV 時照樣入庫（以前 format、退避，台指選擇權卡停在前一天）。"""
+    header = ("日期,契約,到期月份(週別),履約價,買賣權,開盤價,最高價,最低價,最後成交價,成交量,結算價,未沖銷契約量,"
+              "最後最佳買價,最後最佳賣價,歷史最高價,歷史最低價,是否因訊息面暫停交易,交易時段")
+    lines = [
+        header,
+        "20261015,TXO,202610,54000,買權,-,-,-,-,0,500,9876,-,-,-,-,,一般",
+        "20261015,TXO,202610,46000,賣權,-,-,-,-,0,500,5432,-,-,-,-,,一般",
+        "20261015,TXO,202610,54000,買權,-,-,-,-,0,-,-,-,-,-,-,,盤後",  # 盤後盤不收
+        "20261015,TXO,202610W4,47000,買權,-,-,-,-,0,500,100,-,-,-,-,,一般",  # 週選不併進月選
+    ]
+    env.http.route("DailyMarketReportOpt", ("\ufeff" + "\r\n".join(lines) + "\r\n").encode("utf-8"))
+    assert run(make_ctx(env, at(2026, 10, 16, 15, 0)), "tw.taifex.txo") == "ok"
+    obs = env.store.get_obs(tw.OBS_TXO)
+    assert obs["data_date"] == "2026-10-15" and obs["fail_streak"] == 0
+    assert sorted(map(tuple, obs["payload"]["rows"])) == [("202610", 46000.0, "P", 5432, 500.0),
+                                                          ("202610", 54000.0, "C", 9876, 500.0)]
+    state = env.store.task_state("tw.taifex.txo")
+    assert state["last_kind"] == "ok" and state["fail_streak"] == 0 and state["next_try"] is None
 
 
 # ── FinMind：接入前 5 天比對、停這輪、修訂 ──────────────────────────────────────────────
@@ -883,6 +1007,7 @@ def test_endpoint_rules_come_from_the_source_table_not_the_fallback():
     for name in tw._DEFAULT_RULES:
         item = src.ENDPOINTS[name]
         assert tw._rule(name) == (item.earliest_tpe, int(item.daily_max)), name
+        assert tw._DEFAULT_RULES[name] == (item.earliest_tpe, int(item.daily_max)), name  # 備援表也要跟著改
     short, long_range = date(2026, 10, 1), date(2026, 12, 31)
     assert tw._finmind_timeout(short, short) == float(src.ENDPOINTS["finmind_prices"].timeout_s)
     assert tw._finmind_timeout(short, long_range) == float(src.FINMIND_BOOTSTRAP_TIMEOUT_S)

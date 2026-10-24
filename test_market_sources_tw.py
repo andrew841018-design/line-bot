@@ -1044,6 +1044,84 @@ def test_taifex_fetch_parses_octet_stream_responses():
     assert m.ENDPOINTS["taifex_daily_options"].max_bytes == 4 * 1024 * 1024
 
 
+# 2026-10-23 實測：期交所的 CDN 同一個網址有時回 CSV（UTF-8 BOM、中文表頭、CRLF）。DailyMarketReportOpt 的表頭
+# 照 10/23 抓到的整份 CSV 原樣抄：18 欄，順序和 JSON 的 18 個英文鍵一一對應
+OPT_CSV_HEADER = (
+    "日期,契約,到期月份(週別),履約價,買賣權,開盤價,最高價,最低價,最後成交價,成交量,結算價,未沖銷契約量,"
+    "最後最佳買價,最後最佳賣價,歷史最高價,歷史最低價,是否因訊息面暫停交易,交易時段"
+)
+OPT_JSON_KEYS = (
+    "Date", "Contract", "ContractMonth(Week)", "StrikePrice", "CallPut", "Open", "High", "Low", "Close", "Volume",
+    "SettlementPrice", "OpenInterest", "BestBid", "BestAsk", "HistoricalHigh", "HistoricalLow", "TradingHalt",
+    "TradingSession",
+)
+# 第一列每一欄的值都不一樣：欄位對錯位置（結算價和未平倉對調、整排位移一格）結果一定不同
+OPT_CSV_ROWS = [
+    ("20261022", "TXO", "202611", "46000", "買權", "12", "15", "10", "13", "57", "1234", "10", "11", "14", "400", "9", "", "一般"),
+    ("20261022", "TXO", "202611", "46000", "賣權", "-", "-", "-", "-", "0", "1100", "12", "-", "-", "-", "-", "", "一般"),
+    ("20261022", "TXO", "202611", "46000", "買權", "-", "-", "-", "-", "0", "-", "-", "-", "-", "-", "-", "", "盤後"),  # 盤後不收
+    ("20261022", "TXO", "202610F5", "41600", "買權", "-", "-", "-", "-", "0", "4540", "0", "-", "-", "-", "-", "", "一般"),  # 週五週選
+    ("20261022", "TXO", "202610W4", "41600", "賣權", "28.5", "53", "28.5", "51", "72", "51", "69", "51", "54", "53", "28.5", "",
+     "一般"),  # 週選
+    ("20261022", "TEO", "202611", "1500", "買權", "-", "-", "-", "-", "0", "80", "5", "-", "-", "-", "-", "", "一般"),  # 別的契約
+    ("20261022", "TXO", "202612", "47000", "賣權", "-", "-", "-", "-", "0", "-", "-", "-", "-", "-", "-", "", "一般"),  # 「-」＝沒有值
+]
+
+
+def opt_csv(header: str = OPT_CSV_HEADER, rows=OPT_CSV_ROWS, newline: str = "\r\n") -> bytes:
+    return ("\ufeff" + newline.join([header, *(",".join(row) for row in rows)]) + newline).encode("utf-8")
+
+
+def format_detail(fetch, body: bytes) -> tuple[str, str]:
+    with pytest.raises(m.ParseError) as info:
+        fetch(http=FakeHttp(body))
+    return info.value.kind, info.value.detail
+
+
+def test_daily_options_csv_body_gives_the_same_rows_as_json():
+    """2026-10-23：CDN 給 CSV 時照表頭位置換回英文鍵，結果要和同樣資料的 JSON 一模一樣（以前整個端點 format）。"""
+    rows = m.fetch_taifex_daily_options(http=FakeHttp(opt_csv()))
+    assert [(r.month, r.strike, r.kind, r.oi, r.settle, r.date) for r in rows] == [
+        ("202611", 46000.0, "C", 10, 1234.0, date(2026, 10, 22)),
+        ("202611", 46000.0, "P", 12, 1100.0, date(2026, 10, 22)),
+        ("202612", 47000.0, "P", None, None, date(2026, 10, 22)),
+    ]
+    as_json = json_bytes([dict(zip(OPT_JSON_KEYS, row)) for row in OPT_CSV_ROWS])
+    assert rows == m.fetch_taifex_daily_options(http=FakeHttp(as_json))
+    assert m.fetch_taifex_daily_options(http=FakeHttp(opt_csv(newline="\n"))) == rows
+    teo = m.fetch_taifex_daily_options("TEO", http=FakeHttp(opt_csv()))
+    assert [(r.month, r.strike, r.kind, r.oi, r.settle) for r in teo] == [("202611", 1500.0, "C", 5, 80.0)]
+    assert kind_of(m.fetch_taifex_daily_options, http=FakeHttp(opt_csv(rows=[]))) == "empty"  # 只有表頭＝和 [] 一樣
+
+
+def test_daily_options_csv_errors_are_format_with_a_detail():
+    """表頭要一字不差、順序相同；截斷、HTML 頁、壞掉的 JSON 都是 format，detail 說是哪一種（log 才看得出來）。"""
+    fetch = m.fetch_taifex_daily_options
+    names = OPT_CSV_HEADER.split(",")
+    swapped = ",".join([*names[:10], names[11], names[10], *names[12:]])  # 結算價和未沖銷契約量對調
+    assert format_detail(fetch, opt_csv(swapped)) == ("format", "header")
+    assert format_detail(fetch, opt_csv(OPT_CSV_HEADER + ",備註")) == ("format", "header")
+    assert format_detail(fetch, opt_csv(OPT_CSV_HEADER.replace("結算價", "結算價格"))) == ("format", "header")
+    body = opt_csv()
+    assert format_detail(fetch, body[: body.rindex(b",47000,") + 4]) == ("format", "columns")  # 截斷在最後一列中間
+    assert format_detail(fetch, opt_csv(rows=[*OPT_CSV_ROWS, OPT_CSV_ROWS[0] + ("x",)])) == ("format", "columns")
+    # HTML 頁不是 JSON，當 CSV 讀時第一行不是實測的表頭
+    assert format_detail(fetch, b"<!DOCTYPE html><html><body>busy</body></html>") == ("format", "header")
+    assert format_detail(fetch, b'\xef\xbb\xbf[{"Date": "20261022", "Contract"') == ("format", "json")  # 截斷的 JSON
+    assert format_detail(fetch, opt_csv().replace("盤後".encode("utf-8"), b"\xff\xfe")) == ("format", "csv")  # 不是 UTF-8
+
+
+def test_taifex_csv_without_a_verified_header_is_format_csv():
+    """2026-10-23：外資台指期、外資選擇權、匯率的 CSV 表頭還沒有真樣本，不猜對應：CSV 一律 format／csv；JSON 照舊。"""
+    body = "\ufeff日期,契約名稱,身份別\r\n20261022,臺股期貨,外資及陸資\r\n".encode("utf-8")
+    for fetch in (m.fetch_taifex_futures_inst, m.fetch_taifex_calls_puts_inst, m.fetch_taifex_fx):
+        assert format_detail(fetch, body) == ("format", "csv"), fetch.__name__
+    assert m.fetch_taifex_futures_inst(http=FakeHttp(b"\xef\xbb\xbf" + json_bytes(FUT_ROWS))).foreign["TX"].oi_net == -97582
+    assert format_detail(m.fetch_taifex_futures_inst, b'[{"Date": "20261022"') == ("format", "json")
+    # 只收 JSON 的證交所端點：回 HTML 是 json
+    assert format_detail(lambda http: m.fetch_twse_bfi82u(T, http=http), b"<html>busy</html>") == ("format", "json")
+
+
 def test_fetch_finmind_url_and_bootstrap_timeout():
     rows = [fm_row("2026-10-16", 2420.0)]
     fake = FakeHttp(json_bytes(finmind(rows)))
@@ -1082,13 +1160,15 @@ def test_fetch_error_propagates_unwrapped():
 # ── 預算表與 import ─────────────────────────────────────────────────────────────────
 def test_endpoint_budget_table():
     twse = [e for e in m.ENDPOINTS.values() if e.host == "www.twse.com.tw"]
-    assert sum(e.daily_max for e in twse) <= m.HOST_DAILY_MAX["www.twse.com.tw"] == 12
+    # 2026-10-23：TWT49U 1→2 之後各端點上限加起來 13（第 2 次只在凌晨補過昨天、或 16:00 那次重試時用到）；
+    # 證交所 www 每天合計仍由主機帳本擋在 12，超過的那次是 budget（沒送出、不算失敗）
+    assert sum(e.daily_max for e in twse) == 13 and m.HOST_DAILY_MAX["www.twse.com.tw"] == 12
     assert m.ENDPOINTS["twse_allbut0999"].earliest_tpe == time(14, 30)
     assert m.ENDPOINTS["twse_bfi82u"].earliest_tpe == time(15, 30)
     assert m.ENDPOINTS["twse_twt49u"].earliest_tpe == time(16, 0)
     assert m.ENDPOINTS["twse_margin_ms"].earliest_tpe == time(21, 30)
     assert (m.ENDPOINTS["twse_allbut0999"].daily_max, m.ENDPOINTS["twse_bfi82u"].daily_max) == (4, 3)
-    assert (m.ENDPOINTS["twse_twt49u"].daily_max, m.ENDPOINTS["twse_margin_ms"].daily_max) == (1, 3)
+    assert (m.ENDPOINTS["twse_twt49u"].daily_max, m.ENDPOINTS["twse_margin_ms"].daily_max) == (2, 3)
     assert m.HOST_MIN_INTERVAL_S["www.twse.com.tw"] >= 10 and m.HOST_MIN_INTERVAL_S["api.finmindtrade.com"] >= 3
     assert "octet-stream" in m.ENDPOINTS["taifex_pcr"].accept
     for endpoint in m.ENDPOINTS.values():

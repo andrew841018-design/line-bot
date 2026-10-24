@@ -11,10 +11,12 @@ from __future__ import annotations
 import fcntl
 import importlib
 import json
+import logging
 import os
 import plistlib
 import re
 import signal
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -26,6 +28,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import market_calc
 import market_calendar
 import market_http
 import market_paths
@@ -324,6 +327,41 @@ def test_error_kind():
     assert market_tasks.error_kind(market_http.FetchError("cooldown")) == "cooldown"
     assert market_tasks.error_kind(ParseError("too_few")) == "too_few"
     assert market_tasks.error_kind(ZeroDivisionError("1/0")) == "unexpected:ZeroDivisionError"
+
+
+class _Detailed(Exception):  # 別的程式庫的例外也可能帶 .detail：一律不印
+    def __init__(self, detail):
+        super().__init__(detail)
+        self.detail = detail
+
+
+def test_the_log_line_shows_a_short_parse_error_detail(env, caplog):
+    """2026-10-23：同一個 format 可能是 CDN 給了 CSV、表頭變了或截斷；log 行加印 ParseError 的 detail（只限
+    [a-z_]{1,20} 的程式列舉字）。沒有 detail 時這行一字不差；其他例外的內容一律不印。"""
+    tasks = [
+        _task("tw.csv", run=_raise(market_calc.ParseError("format", "csv"))),
+        _task("tw.long", run=_raise(market_calc.ParseError("format", "x" * 21))),
+        _task("tw.upper", run=_raise(market_calc.ParseError("empty", "tradesTable"))),
+        _task("tw.newline", run=_raise(market_calc.ParseError("format", "csv\n"))),
+        _task("tw.nodetail", run=_raise(market_calc.ParseError("format"))),
+        _task("us.fetch", run=_raise(market_http.FetchError("rate_limited"))),
+        _task("us.other", run=_raise(_Detailed("leakword"))),
+        _task("us.duebad", due=_raise(market_calc.ParseError("date", "header"))),
+        _task("tw.ok"),
+    ]
+    with caplog.at_level(logging.INFO, logger="market_tasks"):
+        market_tasks.run_collect(_ctx(env), tasks)
+    lines = {}
+    for record in caplog.records:
+        message = record.getMessage()
+        if message.startswith("market task="):
+            lines[message.split()[1].removeprefix("task=")] = message
+    assert lines["tw.csv"].startswith("market task=tw.csv kind=format detail=csv dur=")
+    assert lines["us.duebad"].startswith("market task=us.duebad kind=date detail=header dur=")
+    for name in ("tw.long", "tw.upper", "tw.newline", "tw.nodetail", "us.fetch", "us.other", "tw.ok"):
+        assert "detail=" not in lines[name], name
+    assert lines["tw.nodetail"].startswith("market task=tw.nodetail kind=format dur=")
+    assert "leakword" not in caplog.text and "tradesTable" not in caplog.text
 
 
 def test_ledger_wait_gives_up_when_the_task_must_stop(env):
@@ -731,6 +769,7 @@ def test_calendar_coverage_for_the_outcome(tmp_path):
         store.close()
     assert out["calendar_until"]["us"] is not None and out["calendar_until"]["tw"] is None
     assert out["calendar_unclassified"] == {"us": 0, "tw": 0}
+    assert out.get("calendar_missing_bars") == {"us": 0, "tw": 0}  # 沒有任何收盤：沒有洞可數
     assert job.sanitize(out) == out
 
 
@@ -773,6 +812,32 @@ def test_us_freshness_counts_sessions_and_seconds_behind_the_latest_session(tmp_
         store.close()
 
 
+def test_calendar_missing_bars_counts_holes_inside_the_stored_history(tmp_path):
+    """2026-10-23（tw_history (a)）：已存歷史之內表上是交易日、卻沒有收盤的天數進 outcome，像 2026-07-10 那種休市表
+    沒寫的臨時休市，補洞補不了時每日維護才看得到。只數 SPY／加權指數第一筆到最後一筆之間；寫了休市覆寫就不算。"""
+    from datetime import date, timedelta
+
+    import market_store
+    from jobs import market_snapshot as job
+
+    september = [date(2026, 9, 1) + timedelta(days=n) for n in range(30)]
+    weekdays = [day for day in september if day.weekday() < 5]
+    store = market_store.Store(tmp_path / "h.sqlite")
+    try:
+        rows = [{"date": "2026-01-01", "name": "開國紀念日", "note": "依規定放假1日。", "kind": "closed"}]
+        store.put_obs("tw.holidays.2026", {"year": 2026, "rows": rows, "unknown": []}, data_date=None)
+        hole = date(2026, 9, 15)
+        store.upsert_closes("tw", "TAIEX", [(day, 47000.0, 1) for day in weekdays if day != hole], "test")
+        store.upsert_closes("us", "SPY", [(day, 700.0, 1) for day in weekdays if day != date(2026, 9, 7)], "test")  # 勞動節
+        out = job._calendar_coverage(store)
+        assert out.get("calendar_missing_bars") == {"us": 0, "tw": 1}
+        assert job.sanitize(out) == out
+        store.set_calendar_override("tw", hole, "closed", "allbut0999_empty+finmind_empty")
+        assert job._calendar_coverage(store).get("calendar_missing_bars") == {"us": 0, "tw": 0}
+    finally:
+        store.close()
+
+
 def test_outcome_reports_how_far_us_data_lags(job_env):
     """2026-10-23：整個 job 跑完，outcome 帶 us_etf_lag_sessions／us_etf_lag_s／us_members_lag_sessions／us_hist_vendor
     （都是整數），每日維護從 status_summary 讀；日曆欄位照樣在。"""
@@ -792,16 +857,63 @@ def test_outcome_reports_how_far_us_data_lags(job_env):
     assert _all_enumerated(outcome)
 
 
-def test_a_task_killed_mid_run_backs_off_next_round(env):
-    """2026-10-18 審查 r6e I1-3：跑到一半被 kill（in_flight 標記還在）→ 下一輪記一次失敗、照退避跳過；跑完會清掉標記。"""
+@pytest.mark.parametrize("since", [T0 - 60, T0 - 900, 1e12])
+def test_a_task_killed_mid_run_backs_off_next_round(env, since):
+    """2026-10-18 審查 r6e I1-3：跑到一半被 kill（in_flight 標記還在）→ 下一輪記一次失敗、照退避跳過；跑完會清掉標記。
+
+    2026-10-23 審查 r7b F4／F5：退避從看到標記的時間起算、至少一小時。T0−900 是真實節奏（每 15 分鐘一輪：以前
+    next_try＝since＋900＝現在，下一輪照跑、又被殺）；since 在未來（時鐘異常）也不能讓任務停用好幾年。"""
     seen = []
     task = _task("t.killed", run=lambda ctx: seen.append(dict(ctx.store.task_state("t.killed"))))
-    env.store.set_task_state("t.killed", {"in_flight": {"since": T0 - 60}})
+    env.store.set_task_state("t.killed", {"in_flight": {"since": since}})
     assert market_tasks.run_task(_ctx(env), task) == market_tasks.BACKOFF
     state = env.store.task_state("t.killed")
     assert state["fail_streak"] == 1 and state["last_kind"] == market_tasks.KILLED and "in_flight" not in state
-    env.store.set_task_state("t.killed", {**state, "next_try": None})  # 退避時間到了
+    assert state["next_try"] == pytest.approx(T0 + 3600)
+    env.mono.advance(3599)
+    assert market_tasks.run_task(_ctx(env), task) == market_tasks.BACKOFF
+    env.mono.advance(2)  # 退避時間到了
     assert market_tasks.run_task(_ctx(env), task) == market_tasks.OK
     assert "in_flight" in seen[-1]  # 跑的當下有標記
     state = env.store.task_state("t.killed")
     assert state["fail_streak"] == 0 and "in_flight" not in state
+
+
+def test_a_task_killed_again_and_again_waits_at_least_an_hour_each_time(env):
+    """2026-10-23 審查 r7b F5：連續被殺時 1、2、3 次都隔一小時，第 4 次起兩小時（BACKOFF_S 的第一格等於排程間隔，
+    對被殺的任務等於沒退避）。"""
+    task = _task("t.hang")
+    waits = []
+    for _ in range(5):
+        env.store.set_task_state("t.hang", {**env.store.task_state("t.hang"), "in_flight": {"since": T0}})  # 又被殺
+        now = _ctx(env).wall_time()
+        assert market_tasks.run_task(_ctx(env), task) == market_tasks.BACKOFF
+        waits.append(round(env.store.task_state("t.hang")["next_try"] - now))
+        env.mono.advance(waits[-1])
+    assert waits == [3600, 3600, 3600, 7200, 7200]
+    assert env.store.task_state("t.hang")["fail_streak"] == 5
+
+
+def test_a_marker_write_failure_still_runs_the_task(env, monkeypatch, caplog):
+    """2026-10-23 審查 r7b F6：in_flight 標記只是保險；寫不進去（例如 DB 暫時鎖住）只記 log、任務照跑，不算失敗。"""
+    ran = []
+    real = env.store.set_task_state
+
+    def locked_for_markers(name, state):
+        if "in_flight" in state:
+            raise sqlite3.OperationalError("database is locked")
+        return real(name, state)
+
+    monkeypatch.setattr(env.store, "set_task_state", locked_for_markers)
+    with caplog.at_level(logging.WARNING, logger="market_tasks"):
+        assert market_tasks.run_task(_ctx(env), _task("t.marker", log=ran)) == market_tasks.OK
+    assert ran == ["t.marker"]
+    state = env.store.task_state("t.marker")
+    assert state["fail_streak"] == 0 and state["last_success"] == pytest.approx(T0) and "in_flight" not in state
+    assert "market task marker not written task=t.marker error_type=OperationalError" in caplog.text
+    assert "database is locked" not in caplog.text
+
+
+def test_framework_keys_list_the_in_flight_marker():
+    """2026-10-23 審查 r7b F8：框架自己會寫 in_flight（run_task 寫、_record 清），說明用的常數要列出來。"""
+    assert "in_flight" in market_tasks.FRAMEWORK_KEYS

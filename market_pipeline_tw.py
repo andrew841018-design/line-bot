@@ -99,14 +99,16 @@ INST3_WINDOW = 5  # 5 日合計要齊
 EMPTY_GIVE_UP = 2  # 過去的日期回「沒有資料」幾次就不再補（休市表沒寫的特別休市）
 CLOSURE_RECHECK_DAYS = 10  # 暫定休市之後幾天內，每天再看一次有沒有資料（撤銷用）
 TWT49U_CHUNK_DAYS = 120  # 一次請求的區間（實測 6/1–10/16 一次 1,023 筆）
-TWT49U_BOOTSTRAP_PER_DAY = 3  # bootstrap 期間每天最多（正常是 ENDPOINTS 的 1 次）
+TWT49U_BOOTSTRAP_PER_DAY = 3  # bootstrap 期間每天最多（正常是 ENDPOINTS 的 2 次）
 HOLIDAY_BOOTSTRAP_PER_DAY = 2  # 今年＋前一年兩張都還沒有時，當天可以抓兩次
 HOLIDAY_RETRY_S = 6 * 3600.0
 HOLIDAY_REFRESH_S = 30 * 86400.0  # 今年的表每 30 天重抓一次（證交所可能補公告特別開休市）
 HOLIDAY_NEXT_YEAR_MONTH = 11  # 下一年的表 11 月起每週試抓
 HOLIDAY_NEXT_YEAR_EVERY_S = 7 * 86400.0
-TAIFEX_EARLIEST = time(15, 0)
-TAIFEX_EVERY_S = 3 * 3600.0  # 2026-10-18：期交所常晚一天，30 分鐘一次會在半夜就把每天 6 次用完
+TAIFEX_EARLIEST = time(15, 0)  # 過了這個時間「今天」才算目標日；幾點起才抓看 ENDPOINTS 的 earliest_tpe（07:00）
+# 2026-10-18：期交所常晚一天，30 分鐘一次會在半夜就把每天的次數用完 → 3 小時。2026-10-23：07:00 起才抓（ENDPOINTS），
+# 改 2 小時、每天 9 次：CDN 給 CSV 的那幾個小時過去後當天還有機會（07、09…23 點）
+TAIFEX_EVERY_S = 2 * 3600.0
 DAILY_FROM = time(8, 0)  # 本益比、月營收、MoneyDJ 持股：每天一次的最早時間
 DAILY_RETRY_S = 7200.0
 FINMIND_OVERLAP = 5
@@ -122,16 +124,16 @@ _NO_DATA_KINDS = frozenset({"empty", "date"})  # 證交所「沒有符合條件�
 _DEFAULT_RULES: dict[str, tuple[Optional[time], int]] = {
     "twse_allbut0999": (time(14, 30), 4),
     "twse_bfi82u": (time(15, 30), 3),
-    "twse_twt49u": (time(16, 0), 1),
+    "twse_twt49u": (time(16, 0), 2),  # 2026-10-23 1→2：凌晨補昨天那次不再吃掉 16:00 那次
     "twse_margin_ms": (time(21, 30), 3),
     "twse_holidays": (None, 1),
     "openapi_bwibbu": (None, 2),
     "openapi_revenue": (None, 2),
-    "taifex_futures_inst": (time(15, 0), 6),
-    "taifex_calls_puts_inst": (time(15, 0), 6),
-    "taifex_pcr": (time(15, 0), 6),
-    "taifex_daily_options": (time(15, 0), 6),
-    "taifex_fx": (None, 2),
+    "taifex_futures_inst": (time(7, 0), 9),  # 2026-10-23：期交所約 06:36 才放上前一個交易日，07:00 起才抓
+    "taifex_calls_puts_inst": (time(7, 0), 9),
+    "taifex_pcr": (time(7, 0), 9),
+    "taifex_daily_options": (time(7, 0), 9),
+    "taifex_fx": (time(7, 0), 2),
     "finmind_prices": (None, 60),
     "moneydj_0050": (None, 2),
 }
@@ -445,7 +447,8 @@ def allbut_target(ctx: Any) -> Optional[date]:
 
 
 def allbut_backfill(ctx: Any) -> Optional[tuple[str, date]]:
-    """補洞：最近 10 個交易日裡漏掉的（新到舊），再來是暫定休市的撤銷檢查（每天一次）。"""
+    """補洞：最近 10 個交易日裡漏掉的（新到舊），再來是暫定休市的撤銷檢查（每天一次），最後是歷史窗口裡
+    更早的洞（每天一個，`_history_gap`）。"""
     now_tpe = _now_tpe(ctx)
     today = now_tpe.date()
     earliest, cap = _rule("twse_allbut0999")
@@ -457,7 +460,8 @@ def allbut_backfill(ctx: Any) -> Optional[tuple[str, date]]:
         return None
     days = _days(ctx.store, OBS_ALLBUT)
     closed = state.get("closures") or {}
-    for day in recent_sessions(ctx.tw_cal, target, KEEP_ALL_SESSIONS):
+    recent = recent_sessions(ctx.tw_cal, target, KEEP_ALL_SESSIONS)
+    for day in recent:
         iso = day.isoformat()
         if day == target or iso in days or iso in closed:
             continue
@@ -471,7 +475,52 @@ def allbut_backfill(ctx: Any) -> Optional[tuple[str, date]]:
         if (closed[iso] or {}).get("rechecked") == today.isoformat():
             continue
         return ("recheck", day)
+    gap = _history_gap(ctx, state, today, recent)
+    return None if gap is None else ("history", gap)
+
+
+HISTORY_GAPS = "history_gaps"  # ALLBUT 排程紀錄裡的歷史洞紀錄：{"day": 最後一次試的台北日期, "tried": {iso: 次數}}
+
+
+def _history_gap(ctx: Any, state: dict, today: date, recent: list[date]) -> Optional[date]:
+    """歷史窗口裡更早的洞：表上是交易日、tw 的加權指數卻沒有收盤（新到舊），每天最多試一個。
+
+    2026-10-23：2026-07-10 是休市表沒寫的臨時休市（推測颱風），是 FinMind 歷史 bootstrap 帶進來的洞。live 路徑只在
+    T 當天 20:00 後判斷、上面的補洞只看最近 10 個交易日，永遠輪不到它；跨過它的 120／240 日窗口全部無效（0050 半年線、
+    年線暫缺，成分寬度資料不足）。交給 _run_allbut／_allbut_no_data 照原路處理：證交所有資料就存，證交所與 FinMind
+    都沒有就寫暫定休市。舊日期的 ALLBUT 摘要早就不在 obs 裡（只留 10 天），所以看收盤、不看 obs，否則整年都會重抓；
+    只看已存歷史之內（加權指數第一筆之後），更早的是還沒 bootstrap、不是洞。試過 EMPTY_GIVE_UP 次還在就不再試，
+    留給每日維護（outcome 的 calendar_missing_bars）。"""
+    record = state.get(HISTORY_GAPS) or {}
+    if not recent or record.get("day") == today.isoformat():
+        return None
+    rows = ctx.store.closes(MARKET, SYM_TAIEX, since=today - timedelta(days=HISTORY_DAYS))
+    if not rows:
+        return None
+    try:
+        gaps = ctx.tw_cal.missing_bars(rows[0][0], min(recent) - timedelta(days=1))
+    except Exception:  # noqa: BLE001 - 日曆壞掉不能讓台股整組停擺
+        return None
+    tried = record.get("tried") or {}
+    closed = state.get("closures") or {}
+    for day in reversed(gaps):
+        iso = day.isoformat()
+        if iso not in closed and int(tried.get(iso) or 0) < EMPTY_GIVE_UP:
+            return day
     return None
+
+
+def _note_history(state: dict, iso: str, today: date) -> None:
+    """歷史洞真的送出了一次請求：記今天用掉了、這個洞試過幾次。另外記，因為 `tries` 只留最近 40 個日期，
+    舊日期的紀錄一存就被修掉，「試過幾次」永遠是 0。"""
+    start = (today - timedelta(days=HISTORY_DAYS)).isoformat()
+    tried = {
+        key: int(value)
+        for key, value in ((state.get(HISTORY_GAPS) or {}).get("tried") or {}).items()
+        if key >= start and isinstance(value, int)
+    }
+    tried[iso] = tried.get(iso, 0) + 1
+    state[HISTORY_GAPS] = {"day": today.isoformat(), "tried": tried}
 
 
 def _run_allbut(ctx: Any, day: date, mode: str) -> Optional[str]:
@@ -486,6 +535,8 @@ def _run_allbut(ctx: Any, day: date, mode: str) -> Optional[str]:
         if not _is_source_error(exc):
             raise
         _note_try(state, iso, ctx.now)
+        if mode == "history":
+            _note_history(state, iso, today)
         if _is_parse_error(exc) and _kind(exc) in _NO_DATA_KINDS:
             status = _allbut_no_data(ctx, state, day, mode)
             _save(ctx.store, TASK_ALLBUT, state)
@@ -495,6 +546,8 @@ def _run_allbut(ctx: Any, day: date, mode: str) -> Optional[str]:
             ctx.store.obs_checked(OBS_ALLBUT, error_kind=_kind(exc))
         raise _for_framework(exc) from None
     _note_try(state, iso, ctx.now)
+    if mode == "history":
+        _note_history(state, iso, today)
     store_allbut(ctx.store, daily, ctx.tw_cal)
     closed = state.get("closures") or {}
     if iso in closed:
@@ -867,7 +920,11 @@ def twt49u_parts(ctx: Any) -> tuple[Optional[tuple[date, date]], list[tuple[date
 
 
 def twt49u_core(ctx: Any) -> Optional[tuple[date, date]]:
-    """接續段：涵蓋還沒到目標日才打（週末不必再打一次）；正常每天 1 次，還有歷史段時共用 bootstrap 的上限。"""
+    """接續段：涵蓋還沒到目標日才打（週末不必再打一次）；正常每天 1 次，還有歷史段時共用 bootstrap 的上限。
+
+    2026-10-23：每天上限 1→2（ENDPOINTS）。次數以台北日期計，凌晨 00:0x 補昨天的那一次會把當天唯一的名額用掉，
+    16:00 那次從來沒跑過，0050 細節頁與成分寬度每個交易日都要等到隔天凌晨才換到 T。穩態仍是每天 1 次（16:00 那次
+    涵蓋到 T，隔天凌晨就不必再打）；凌晨那次留著當安全網（16:00 沒跑到或失敗時才會到期）。"""
     continuation, historical, target, last_end = twt49u_parts(ctx)
     if continuation is None or target is None or last_end is None or last_end >= target:
         return None
@@ -1130,7 +1187,7 @@ def _holdings_run(ctx: Any) -> Optional[str]:
     return None
 
 
-# ── 期交所（間隔 3 小時、每天 6 次；資料日以回應為準，常晚一天） ──────────────────────────────
+# ── 期交所（07:00 起、間隔 2 小時、每天 9 次、匯率 2 次；資料日以回應為準，常晚一天） ─────────────────
 @dataclass(frozen=True)
 class TaifexSpec:
     task: str
@@ -1224,14 +1281,20 @@ TAIFEX_SPECS: tuple[TaifexSpec, ...] = (
 
 
 def taifex_due(ctx: Any, spec: TaifexSpec) -> bool:
-    """手上的資料日比目標日舊、離上次 ≥3 小時、今天還有次數。
+    """手上的資料日比目標日舊、過了端點的最早時間、離上次 ≥2 小時、今天還有次數。
 
     目標日＝已過 15:00 的最近一個交易日（target_session）：今天要過 15:00 才算今天，所以平日早上手上已有
     前一個交易日就不打。2026-10-18 拿掉「15:00 前一律不打」：剛部署、Mac 睡著、前一天沒抓到時，早上就補
-    前一個交易日（期交所還沒更新就回 NOT_YET，照樣受每天次數與 3 小時間隔限制）。"""
+    前一個交易日（期交所還沒更新就回 NOT_YET，照樣受每天次數與間隔限制）。
+
+    2026-10-23：端點的最早時間（07:00）前不打。期交所約 06:36 才放上前一個交易日的資料，以前 00／03／06 點那三次
+    一定拿到舊的，剩下的三次又剛好碰上 CDN 給 CSV 的時段就整天沒資料；現在間隔 2 小時、每天最多 9 次
+    （07、09…23 點；匯率每天 2 次：07、09 點）。"""
     now_tpe = _now_tpe(ctx)
     today = now_tpe.date()
-    _, cap = _rule(spec.endpoint)
+    earliest, cap = _rule(spec.endpoint)
+    if earliest is not None and now_tpe.time() < earliest:
+        return False
     state = _sched(ctx.store, spec.task, today)
     if state["count"] >= cap:
         return False
