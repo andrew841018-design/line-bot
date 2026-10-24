@@ -1035,6 +1035,102 @@ CASES = [
     # P-7 只剩符號的問句尾、只往前標不往後標
     _case("gp1p-emoji-q", X, "爸爸藥吃了 😅?"),
     _case("gp1p-tag-then-statement", F, "我跟你說 齁 我今天藥有吃了", [(F, "med", "吃藥")]),
+    # ── 準確度：轉貼文章、地點名詞、泛指的人、停藥被記成吃藥 ──
+    # 轉貼文章：整則沒有自稱、家人、時間詞、讀數，又有文章訊號 → 不是在講自己，一般紀錄都不記
+    _case("pc-article-heading", F, "3. 熬夜的影響\n 長期熬夜會讓免疫力下降，容易頭痛、失眠。\n 也有研究發現和心血管疾病有關。"),
+    _case("pc-article-heading-only", F, "2. 姿勢不良\n 長時間低頭滑手機，頸部負擔變大，容易肩頸痠痛、頭痛。"),
+    _case("pc-article-heading-colon", M, "3. 睡眠問題：睡前喝咖啡容易失眠、心悸"),
+    _case("pc-article-cue-after", M, "免疫力下降，常見頭痛、失眠，研究也指出熬夜和多種慢性病有關"),
+    _case("pc-article-expository", F, "熬夜會導致血壓不穩，罹患心血管疾病的風險變高，即使有在運動也一樣"),
+    _case("pc-article-other", M, "5. 其他提醒\n 睡前滑手機會讓大腦興奮，容易失眠、頭痛。"),  # 「其他」的他不是家人
+    _case("pc-article-self-care", F, "6. 自我保健\n 頭痛、失眠、腰痠都要多留意。"),  # 「自我」的我不是自稱
+    # 有自稱、時間詞、讀數，或文章用字只有一種又是轉述醫生的話：照舊記
+    _case("pc-article-own-line", M, "研究說熬夜不好，我今天有去散步了", [(M, "exercise", "散步")]),
+    _case("pc-article-own-no-time", F, "研究指出熬夜不好，我有去散步了", [(F, "exercise", "散步")]),
+    _case("pc-walk-then-news", M, "今天去散步了，看到新聞報導說熬夜很傷", [(M, "exercise", "散步")]),
+    _case("pc-reading-then-news", F, "血壓 128/82，新聞報導說要控制在130以下", [(F, "body", "血壓", "128/82")]),
+    # 文章用字只有一種：多半是自己的話
+    _case("pc-own-doctor-cause", M, "膝蓋痛，醫生說可能是退化導致的", [(M, "body", "膝蓋痛")]),
+    _case("pc-own-doctor-risk", M, "藥吃了，醫生說副作用的風險不大", [(M, "med", "吃藥")]),
+    _case("pc-own-risk", M, "血壓高，中風風險比較高", [(M, "body", "血壓高")]),
+    _case("pc-own-cause", M, "頭痛，熬夜導致的", [(M, "body", "頭痛")]),
+    _case("pc-own-study", F, "腰痠，研究說要多走路", [(F, "body", "腰痛")]),
+    _case("pc-own-news-med", M, "藥吃了，研究說這種藥很安全", [(M, "med", "吃藥")]),
+    _case("pc-long-own-no-pronoun", M, "一早先去公園散步了一個小時，回家吃完早餐，晚上再去游泳了，覺得腰有點痠",
+          [(M, "body", "腰痛"), (M, "exercise", "散步"), (M, "exercise", "游泳")]),
+    # 自己的編號清單（沒有 10 字以上的內文）不是文章
+    _case("pc-own-numbered-list", F, "1)散步完了\n2)藥吃了", [(F, "exercise", "散步"), (F, "med", "吃藥")]),
+    _case("pc-own-numbered-symptoms", M, "1.頭痛\n2.睡不好\n3.胃口不好",
+          [(M, "body", "頭痛"), (M, "diet", "胃口不好"), (M, "sleep", "睡不好")]),
+    # 119 不受影響：文章樣子的訊息裡，緊急字詞照舊回 119、照舊記
+    _case("pc-article-chest", M, "胸口好悶，研究指出這種情況風險很高嗎", [(M, "body", "胸痛胸悶", "", R)],
+          [(M, "胸痛胸悶", True, False, False)]),
+    _case("pc-heading-chest", M, "1. 胸口好悶\n 研究指出冬天要特別小心", [(M, "body", "胸痛胸悶", "", R)],
+          [(M, "胸痛胸悶", True, False, False)]),
+    # 運動後面接「習慣」是講習慣
+    _case("pc-swim-habit", F, "我有游泳的習慣"),
+    _case("pc-walk-habit", M, "我有散步的習慣"),
+    _case("pc-exercise-today", F, "我今天有運動", [(F, "exercise", "運動")]),
+    # 地點名詞：有健身房、運動中心不是運動；去了（去／到／從，中間可隔幾個字）才算，有別的運動就只記那個
+    _case("pc-building-gym", M, "那棟大樓地下室有健身房"),
+    _case("pc-center-cafe", F, "運動中心旁邊開了一家咖啡店"),
+    _case("pc-pool-exists", M, "社區健身中心也有游泳池"),
+    _case("pc-relay-gym-exists", X, "媽媽說社區新蓋了健身房"),
+    _case("pc-wait-at-gym", F, "我在健身房等你"),
+    _case("pc-see-gym", M, "看到健身房了"),
+    _case("pc-went-gym", F, "我今天去健身房了", [(F, "exercise", "健身")]),
+    _case("pc-went-le-gym", M, "我去了健身房", [(M, "exercise", "健身")]),
+    _case("pc-community-gym", F, "去社區健身房了", [(F, "exercise", "健身")]),
+    _case("pc-back-from-gym", M, "剛從健身房回來", [(M, "exercise", "健身")]),
+    _case("pc-two-places", F, "今天去了健身房和游泳池", [(F, "exercise", "健身"), (F, "exercise", "游泳")]),
+    _case("pc-relay-went-gym", X, "媽媽今天去健身房了", [(M, "exercise", "健身")]),
+    _case("pc-center-swim", M, "早上去運動中心游完泳了", [(M, "exercise", "游泳")]),
+    _case("pc-sports-park-walk", F, "去運動公園散步了", [(F, "exercise", "散步")]),
+    _case("pc-at-gym-exercise", M, "我在健身房運動", [(M, "exercise", "運動")]),
+    _case("pc-at-pool-swim", F, "我在游泳池游泳", [(F, "exercise", "游泳")]),
+    _case("pc-not-at-gym", M, "我沒有在健身房運動"),
+    _case("pc-not-want-gym", F, "我不想在健身房運動"),
+    _case("pc-always-at-gym", M, "我都在健身房運動"),
+    _case("pc-often-at-pool", F, "我常常在游泳池游泳"),
+    _case("pc-relay-always-gym", X, "媽媽都在健身房運動"),
+    _case("pc-nearby-gym", F, "今天去了附近的健身房", [(F, "exercise", "健身")]),
+    _case("pc-been-gym-expensive", M, "去過的健身房都很貴"),
+    _case("pc-mention-gym", F, "聊到健身房了"),
+    _case("pc-workout-done", F, "剛剛健身完", [(F, "exercise", "健身")]),
+    # 泛指的人、副作用：不是本人的症狀；單獨的「人」（頭好暈人好累）是自己
+    _case("pc-generic-people", M, "那場講座是給高血壓的人聽的"),
+    _case("pc-generic-people-coord", M, "這套運動是給高血壓和關節不好的人做的"),
+    _case("pc-generic-group", F, "痛風族群要少吃海鮮"),
+    _case("pc-side-effect", M, "說明書寫會有口乾、頭暈等副作用"),
+    _case("pc-patients", F, "痛風患者要少喝酒"),
+    _case("pc-insomnia-people", M, "失眠的人很多"),
+    _case("pc-diet-people", F, "沒吃早餐的人很多"),
+    _case("pc-own-hypertension", M, "我有高血壓", [(M, "body", "血壓高")]),
+    _case("pc-own-bp-high", M, "我血壓有點高", [(M, "body", "血壓高")]),
+    _case("pc-people-then-own", F, "頭痛的人很多，我也頭痛", [(F, "body", "頭痛")]),
+    _case("pc-dizzy-tired", M, "頭好暈人好累", [(M, "body", "頭暈")]),
+    _case("pc-appetite-thin", F, "胃口不好人瘦了", [(F, "diet", "胃口不好")]),
+    _case("pc-insomnia-told-family", M, "失眠跟家裡的人說了", [(M, "sleep", "睡不好")]),
+    _case("pc-headache-told-neighbor", M, "頭痛跟隔壁的人說了", [(M, "body", "頭痛")]),
+    _case("pc-headache-like-family", F, "我頭痛跟家裡的人一樣", [(F, "body", "頭痛")]),
+    _case("pc-own-patient", M, "我是高血壓患者", [(M, "body", "血壓高")]),
+    _case("pc-relay-patient", X, "媽媽是痛風病人", [(M, "body", "痛風")]),
+    _case("pc-own-insomnia-tribe", F, "我也是失眠族", [(F, "sleep", "睡不好")]),
+    _case("pc-own-side-effect", M, "我吃藥後有頭暈的副作用", [(M, "body", "頭暈"), (M, "med", "吃藥")]),
+    _case("pc-friend-patient", F, "我有朋友是高血壓患者"),
+    # 停藥不是吃藥；「吃藥前」是時間點；「了解」的「了」不是完成
+    _case("pc-stop-quit", M, "我已經停止吃那種藥了", [(M, "med", "停藥")]),
+    _case("pc-stop-use", M, "我停用降膽固醇的藥了", [(M, "med", "停藥")]),
+    _case("pc-stop-topic", M, "胃藥已經停了", [(M, "med", "停藥")]),
+    _case("pc-relay-stop", X, "媽媽已經停掉那顆止痛藥了", [(M, "med", "停藥")]),
+    _case("pc-stop-what-if", F, "藥停了會怎樣"),
+    _case("pc-not-stopped", M, "我沒有停吃那種藥"),
+    _case("pc-cannot-stop", F, "藥不能停"),
+    _case("pc-stop-question", X, "媽媽的藥停了嗎"),
+    _case("pc-before-med-read", M, "吃藥前已經看過說明書"),
+    _case("pc-before-med-habit", F, "吃藥前都有量血壓"),
+    _case("pc-walk-understand", F, "散步之前先了解路線"),
+    _case("pc-exercise-understand", M, "去運動之前先了解一下"),
 ]
 
 
@@ -1044,6 +1140,21 @@ def test_sentence_outcomes(speaker, text, findings, flags):
     assert _flag_tuples(detect_red_flags(text, speaker)) == flags
     if flags:
         assert might_have_red_flag(text)  # 預檢是緊急字詞判斷的超集合
+
+
+@pytest.mark.parametrize("forced", [True, False])
+def test_article_rule_never_changes_red_flags(monkeypatch, forced):
+    """轉貼文章的整則判斷只管一般紀錄：強制成立或不成立，緊急字詞（119 判斷與緊急紀錄）都一樣。"""
+    def red(text, speaker):
+        rows = [row for row in _as_tuples(extract(text, speaker)) if row[2] in RED_FLAG_LABELS]
+        return rows, _flag_tuples(detect_red_flags(text, speaker))
+
+    samples = [(param.values[0], param.values[1]) for param in CASES]
+    before = [red(text, speaker) for speaker, text in samples]
+    monkeypatch.setattr(phx, "_impersonal", lambda norm, speaker: forced)
+    monkeypatch.setattr(phx, "_heading_signal", lambda norm: forced)
+    monkeypatch.setattr(phx, "_article_words", lambda norm: forced)
+    assert [red(text, speaker) for speaker, text in samples] == before
 
 
 # ── 第三輪審查的關係名詞掃描：這些都是別人，不能算到爸媽頭上 ──
@@ -1425,6 +1536,7 @@ _SLOW_SHAPES = {
     "listeners before 一個人": lambda n: "告訴我今天" * (n // 5) + "一個人在路上昏倒",
     "一個人 after commas": lambda n: "，一個人" * (n // 4) + "昏倒",
     "companions with surnames": lambda n: "我跟隔壁王" * (n // 5) + "媽媽去散步跌倒",
+    "numbered headings": lambda n: "1. 熬夜\n 長期熬夜會導致免疫力下降研究\n" * (n // 22) + "頭痛",
 }
 
 

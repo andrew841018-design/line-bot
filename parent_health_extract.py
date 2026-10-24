@@ -248,16 +248,18 @@ _SYMPTOM_RE, _SYMPTOM_GROUPS = _combine(_SYMPTOM_PATTERNS)
 _RED_FLAG_RE, _RED_FLAG_GROUPS = _combine(_RED_FLAG_PATTERNS)
 
 # 用藥：(吃|服|吞)＋0–2 字（不含飯要該得）＋藥，或中間是常見的藥名詞（「吃了降血壓藥」「吃降血糖的藥」）；
-# 主題化「藥吃了」；忘了吃藥；拿藥；停藥
+# 主題化「藥吃了」；忘了吃藥；拿藥；停藥（「停止吃那種藥」「停用安眠藥」：停在吃的前面，整段先被停藥吃掉；
+# 主題化「胃藥已經停了」）。「吃藥前／之前」是時間點，不是吃了
 _MED_KIND = r"(?:降血壓|降血糖|降膽固醇|血壓|血糖|糖尿病|心臟|慢性病|感冒|止痛|安眠|助眠|過敏|胃|中|西)的?"
 _MED_RE = re.compile(
     r"(?P<forgot>(?:忘了|忘記)要?(?:吃|服|吞)[^藥]{0,6}?藥(?![膳局房妝材酒])|藥(?:也|都|又)?(?:忘了|忘記)(?:吃|服))"
     r"|(?P<took>(?:吃|服|吞)(?:了|過|完)?(?:[一兩二三四五半幾](?:顆|包|粒|錠|片|匙))?"
-    r"(?:" + _MED_KIND + r"|[^飯要該得農藥炸火]{0,2})藥(?![膳局房妝材酒行店燉])"
+    r"(?:" + _MED_KIND + r"|[^飯要該得農藥炸火]{0,2})藥(?![膳局房妝材酒行店燉前]|[之以]前)"
     r"|藥(?:也|都|已經|已|剛剛|剛才)?(?:按時|準時|乖乖)?(?:吃|服)(?:了|過|完|好)"
     r"|藥(?:也|都|已經|已)?有(?:按時|準時|乖乖)?(?:吃|服)(?!的|就好))"  # 「藥有吃的跟擦的」「藥有吃就好」不算
     r"|(?P<fetch>(?:拿|領)(?:了|完|好)?(?:慢性處方箋|慢箋|藥)(?![膳局房妝材酒]))"
-    r"|(?P<stop>停(?:了)?藥)"
+    r"|(?P<stop>停(?:止|了|掉)?(?:(?:吃|服|用)了?)?(?:這|那|該)?[個種顆款類]?(?:" + _MED_KIND + r")?藥(?![膳局房妝材酒行店燉])"
+    r"|藥(?:也|都|已經|已)?(?:先)?停(?:了|掉|吃了|用了)(?![會怎嗎]))"
 )
 _MED_LABELS = {"forgot": "忘了吃藥", "took": "吃藥", "fetch": "拿藥", "stop": "停藥"}
 
@@ -455,6 +457,24 @@ _INTENSIFIER_RE = re.compile(r"好|很|有點|有一點|一直|突然|超|又|�
 # 轉述：「爸爸剛剛打電話來說她…」「傳訊息說」；「小說」「說明」「講座」「演講」「遺傳」「傳染」不是
 _SPEECH_RE = re.compile(r"(?<!小)說(?![明服])|(?<!演)講(?![座課義])|告訴|打給|打電話|傳(?:訊息|簡訊|LINE|line|Line|話|來)")
 _HABIT_WINDOW = 6  # 習慣詞要在緊急字詞前 6 字內
+
+# 一般紀錄才用、緊急字詞不看的幾條（轉貼文章的判斷在 _impersonal 旁邊）
+# 「散步的習慣」「游泳習慣」是講習慣，不是那天做了
+_HABIT_NOUN_AFTER_RE = re.compile(r"的?習慣")
+# 地點名稱：「大樓地下室有健身房」「運動中心旁邊開了咖啡店」不是運動。前面是去／到／進／從（中間最多隔 4 個字，
+# 不能有「有也還都時候開」，也不能是「去過的」；「看到」「提到」的到不算）才可能算；「在＋地點」後面還有別的運動詞、
+# 而且是正在那裡（_present_at_place）時，那個運動算正在做
+_PLACE_AFTER_RE = re.compile(r"房|中心|館|池|教室|俱樂部|工廠|公園")
+_GO_TO_BEFORE_RE = re.compile(r"(?:去|(?<![看聽遇想找收見提聊說講談碰])到|進|從)(?:了|過)?(?![了過]?的)[^有也還都時候開]{0,4}$")
+# 泛指的人、副作用：「高血壓的人」「痛風患者」「頭暈等副作用」不是本人的症狀；單獨的「人」要有的／等
+# （「頭好暈人好累」的人是自己）；「頭痛跟隔壁的人說了」的人是說話的對象。緊急字詞用的是另一張表 _GENERIC_AFTER_RE，
+# 兩張不共用（119 獨立）
+# 「我是高血壓患者」「我也是失眠族」「我吃藥後有頭暈的副作用」：明講主詞、又是「是／有」接症狀的，是在講自己
+_IDENTITY_BEFORE_RE = re.compile(r"(?:也|都|本身|自己)?(?:是|(?<![會能])有)$")
+_GENERIC_HOLDER_AFTER_RE = re.compile(
+    r"(?:和|跟|與|及|或)(?![家別他她大每有這那])[\u4e00-\u9fff]{1,5}?(?:的|等|之類的?)(?:病人|患者|病友|族群|族|人|副作用)(?![說講聊提問])"
+    r"|(?:的|等|之類的?)(?:病人|患者|病友|族群|族|人|副作用)|(?:病人|患者|病友|族群|族|副作用)"
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1091,8 +1111,12 @@ def _window_has(rx: re.Pattern[str], text: str, start: int, end: int) -> bool:
 
 
 def _done_near(text: str, start: int, end: int) -> bool:
-    """完成標記（了、過、完、已、剛、有、回來）在健康詞前 5 字到後 4 字之間。"""
-    return _window_has(_DONE_RE, text, start - 5, min(len(text), end + 4))
+    """完成標記（了、過、完、已、剛、有、回來）在健康詞前 5 字到後 4 字之間開始。
+    後看（了解、完全、有點、空腹…）可以看到視窗外 2 個字：只搜到視窗結尾的話，「散步之前先了解」的「解」被切掉，
+    「了」就被當成完成。"""
+    lo, hi = max(0, start - 5), min(len(text), end + 4)
+    m = _DONE_RE.search(text, lo, min(len(text), hi + 2))
+    return m is not None and m.start() < hi
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1329,8 +1353,18 @@ def _scan_activity(index: int, clause: _Clause, out: _Collector, rx: re.Pattern[
     if category == "exercise" and clause.tag_question:
         return
     text = clause.text
-    for m in rx.finditer(text):
+    matches = list(rx.finditer(text))
+    places = [category == "exercise" and _PLACE_AFTER_RE.match(text, m.end()) is not None for m in matches]
+    other_activity = not all(places)
+    place_now = False  # 「在健身房運動」：地點前面緊接「在」，後面的運動算正在做
+    for m, place in zip(matches, places, strict=True):
         start, end = m.span()
+        if category == "exercise" and _HABIT_NOUN_AFTER_RE.match(text, end):
+            continue  # 「散步的習慣」
+        if place and other_activity and _present_at_place(clause, start):
+            place_now = True
+        if place and (other_activity or not _window_has(_GO_TO_BEFORE_RE, text, start - 7, start)):
+            continue  # 「大樓地下室有健身房」不是運動；「去運動中心游完泳了」只記游泳
         if clause.blocked(start) or _instructed(clause, start) or _window_has(_NEG_RE, text, start - 3, start):
             continue
         go = _GO_PREFIX_RE.search(text, max(0, start - 2), start)
@@ -1341,9 +1375,18 @@ def _scan_activity(index: int, clause: _Clause, out: _Collector, rx: re.Pattern[
             continue
         if category == "visit" and _RESULT_AFTER_RE.match(text, end):
             continue  # 「健檢報告出來了」不是今天看診
-        if not (_done_near(text, start, end) or clause.has(_ANCHOR) or _now_at(text, start)):
+        if not (_done_near(text, start, end) or clause.has(_ANCHOR) or _now_at(text, start) or place_now):
             continue
         out.add(index, start, clause.subject_at(start), category, groups[m.lastgroup])
+
+
+def _present_at_place(clause: _Clause, start: int) -> bool:
+    """「在健身房運動」的「在」：正在那裡（不是常常、都在），也沒有被否定、想要或叫人去。"""
+    text = clause.text
+    return _now_at(text, start) and not (
+        clause.blocked(start) or _instructed(clause, start)
+        or _window_has(_NEG_RE, text, start - 4, start - 1) or _window_has(_MODAL_BEFORE_RE, text, start - 5, start - 1)
+    )
 
 
 def _now_at(text: str, start: int) -> bool:
@@ -1390,14 +1433,23 @@ def _tendency(text: str, start: int) -> bool:
                                   or _EVENT_RE.search(text, max(0, m.start() - 6), m.start() + 1))
 
 
+def _generic_holder(clause: _Clause, start: int, end: int) -> bool:
+    """症狀、睡眠、飲食後面接泛指的人或副作用（_GENERIC_HOLDER_AFTER_RE）；「我是高血壓患者」這種在講自己的不算。"""
+    text = clause.text
+    if _GENERIC_HOLDER_AFTER_RE.match(text, end) is None:
+        return False
+    own = _window_has(_IDENTITY_BEFORE_RE, text, start - 4, start) and bisect_right(clause.subject_ends, start) > 0
+    return not own
+
+
 def _scan_sleep(index: int, clause: _Clause, out: _Collector) -> None:
     text = clause.text
     for m in _SLEEP_RE.finditer(text):
         start = m.start()
         if clause.blocked(start) or clause.before(_INSTRUCT, start) or clause.before(_HEDGE, start):
             continue
-        if _is_habitual(clause, start):
-            continue
+        if _is_habitual(clause, start) or _generic_holder(clause, start, m.end()):
+            continue  # 「失眠的人很多」
         if _window_has(_NEG_RE, text, start - 4, start):
             continue
         out.add(index, start, clause.subject_at(start), "sleep", _SLEEP_GROUPS[m.lastgroup])
@@ -1410,8 +1462,8 @@ def _scan_diet(index: int, clause: _Clause, out: _Collector) -> None:
         label = _DIET_GROUPS[m.lastgroup]
         if clause.blocked(start) or clause.before(_INSTRUCT, start) or clause.before(_HEDGE, start):
             continue
-        if _is_habitual(clause, start):
-            continue
+        if _is_habitual(clause, start) or _generic_holder(clause, start, end):
+            continue  # 「沒吃早餐的人」
         if label not in _DIET_NEGATIVE and _window_has(_NEG_RE, text, start - 4, start):
             continue
         if label == "喝酒" and not _done_near(text, start, end):
@@ -1461,8 +1513,8 @@ def _scan_symptoms(index: int, clause: _Clause, out: _Collector) -> None:
             continue  # 「頭暈倒」「左手麻」交給緊急字詞判斷
         if clause.blocked(start) or clause.before(_INSTRUCT, start) or clause.before(_HEDGE, start):
             continue
-        if _is_habitual(clause, start):
-            continue
+        if _is_habitual(clause, start) or _generic_holder(clause, start, end):
+            continue  # 「高血壓的人」「痛風患者」
         if _window_has(_NEG_RE, text, start - 4, start) or last_recovery >= end:
             continue  # 沒有頭暈；感冒好多了
         if _window_has(_EMOTION_DEGREE_RE, text, start - 4, start):
@@ -1470,12 +1522,60 @@ def _scan_symptoms(index: int, clause: _Clause, out: _Collector) -> None:
         out.add(index, start, clause.subject_at(start), "body", _SYMPTOM_GROUPS[m.lastgroup])
 
 
+# 轉貼文章（一般紀錄才用，緊急字詞不看）：爸媽轉貼的長文常被拆成好幾則，沒有主詞的段落原本會預設是說話的家長。
+# 整則沒有自稱、家人、個人時間詞、讀數，又有下面任一個文章訊號，就不是在講自己：
+# - 編號標題（1.、2、、一、、(三)），而且另有一行（或標題「：」後面）≥ 10 字的內文：「1)散步完了」這種自己的清單不算；
+# - 文章用字兩種以上：只有一種的多半是爸媽自己的話（「頭痛，熬夜導致的」「膝蓋痛，醫生說可能是退化導致的」）。
+#   這張字表和子句線索的 _ARTICLE（新聞、聽說、症狀…，只管後面的子句）是刻意分開的兩張表。
+_SELF_OR_FAMILY_RE = re.compile(r"(?<!自)我(?!們)|咱|俺|爸|媽|老公|老婆|老伴|太太|丈夫|妻子|(?<![其吉])他(?![們人])|她(?!們)")
+_PERSONAL_TIME_RE = re.compile(r"今天|今日|今早|今晚|早上|上午|中午|下午|傍晚|晚上|半夜|昨天|昨晚|前天|剛剛|剛才|一早|清晨"
+                               r"|這幾天|這兩天|這週|這禮拜|最近|現在")
+_HEADING_LINE_RE = re.compile(r"\s{0,3}(?:[0-9]{1,2}[.、)]|[一二三四五六七八九十]{1,3}、|\(\s{0,2}[0-9一二三四五六七八九十]{1,3}\s{0,2}\))"
+                              r"(?=\s|[\u4e00-\u9fff])")
+_ARTICLE_SIGNAL_RE = re.compile(r"新聞|報導|報道|研究|文章|專家|網路上|導致|罹患|危害|發病率|風險|證實|指出|世界衛生組織|WHO")
+_HEADING_BODY_CHARS = 10
+
+
+def _has_reading(norm: str) -> bool:
+    if _BP_HIGH_LOW_RE.search(norm) or (_BP_CUE_RE.search(norm) and _BP_PAIR_RE.search(norm)):
+        return True
+    return _STEPS_RE.search(norm) is not None or any(rx.search(norm) for _, rx, _, _ in _SINGLE_READINGS)
+
+
+def _heading_signal(norm: str) -> bool:
+    has_heading = body = False
+    for line in norm.split("\n"):
+        if _HEADING_LINE_RE.match(line):
+            has_heading = True
+            _, colon, tail = line.partition(":")  # NFKC 已把「：」換成「:」
+            body = body or (bool(colon) and len(tail.strip()) >= _HEADING_BODY_CHARS)
+        elif len(line.strip()) >= _HEADING_BODY_CHARS:
+            body = True
+    return has_heading and body
+
+
+def _article_words(norm: str) -> bool:
+    return len(set(_ARTICLE_SIGNAL_RE.findall(norm))) >= 2
+
+
+def _impersonal(norm: str, speaker: str) -> bool:
+    """整則像轉貼文章（見上面）：一般紀錄都不記；緊急字詞照舊，不看這裡。"""
+    return (
+        speaker in PARENTS
+        and _SELF_OR_FAMILY_RE.search(norm) is None
+        and _PERSONAL_TIME_RE.search(norm) is None
+        and not _has_reading(norm)
+        and (_heading_signal(norm) or _article_words(norm))
+    )
+
+
 def _extract_core(norm: str, speaker: str, names: tuple[str, ...]) -> list[Finding]:
     """不限長度的抽取（公開函式先擋掉超過 MAX_CHARS 的；測試直接量這個的線性時間）。"""
     clauses = _analyze(norm, speaker, names)
     out = _Collector()
+    general = not _impersonal(norm, speaker)
     for index, clause in enumerate(clauses):
-        if clause.skip_report:
+        if clause.skip_report or not general:
             continue
         _scan_med(index, clause, out)
         _scan_activity(index, clause, out, _VISIT_RE, _VISIT_GROUPS, "visit")
