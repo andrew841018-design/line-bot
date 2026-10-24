@@ -79,6 +79,9 @@ def test_paths_under_keeps_everything_inside(tmp_path):
 @pytest.mark.parametrize("url", [
     "http://api.nasdaq.com/x", "https://evil.example.com/", "https://user:pw" + "@" + "api.nasdaq.com/",
     "https://api.nasdaq.com:8443/", "https://trumpstruth.org/feed", "ftp://api.nasdaq.com/",
+    # 2026-10-23：台灣的 ISP 依法院命令封鎖這三個主機，不在白名單裡（不繞過封鎖）
+    "https://api.coinbase.com/v2/prices/BTC-USD/spot", "https://gamma-api.polymarket.com/events?slug=x",
+    "https://api.elections.kalshi.com/trade-api/v2/markets?event_ticker=x",
 ])
 def test_host_whitelist(url):
     assert market_http.host_of(url) is None
@@ -96,6 +99,18 @@ class _Ledger:
 
     def cooldown(self, host, seconds):
         self.cooled.append((host, seconds))
+
+
+def test_blocked_hosts_are_off_the_whitelist_and_cost_no_request():
+    """被封鎖的主機不能留在白名單裡等著在 TLS 失敗（kind=network）：請求前就以 kind=host 拒絕，帳本也不預扣。"""
+    blocked = ("api.coinbase.com", "gamma-api.polymarket.com", "api.elections.kalshi.com")
+    assert not set(blocked) & market_http.ALLOWED_HOSTS
+    ledger = _Ledger()
+    for host in blocked:
+        with pytest.raises(market_http.FetchError) as err:
+            market_http.fetch(f"https://{host}/", max_bytes=10, ledger=ledger)
+        assert err.value.kind == "host"
+    assert ledger.reserved == []
 
 
 def _fake_fetch(monkeypatch, status, ctype="application/json", body=b"{}"):
@@ -165,7 +180,7 @@ def test_safe_fetch_refusals_map_to_kinds(monkeypatch):
 def test_real_network_is_blocked_in_tests():
     """conftest 讓 safe_fetch 在測試裡連不出去；market_http 建在它上面，所以也連不出去。"""
     with pytest.raises(market_http.FetchError):
-        market_http.fetch("https://api.coinbase.com/v2/prices/BTC-USD/spot", max_bytes=1000)
+        market_http.fetch("https://api.nasdaq.com/api/market-info", max_bytes=1000)
 
 
 # ── /static/img 路由 ─────────────────────────────────────────────────────────

@@ -168,7 +168,7 @@ def test_fetch_yahoo_spark_only_takes_the_fixed_symbols(symbols):
     assert http.calls == []
 
 
-# ── 代理：Nasdaq ETF 日線、Coinbase ─────────────────────────────────────────────
+# ── 代理：Nasdaq ETF 日線 ────────────────────────────────────────────────────────
 
 
 def test_proxy_bars_delegate_to_the_nasdaq_historical_fetcher():
@@ -238,43 +238,33 @@ def test_proxy_bars_validate_their_arguments():
 
 def test_proxy_tables_and_labels():
     assert set(msm.PROXY_ETF) <= set(msm.YAHOO_MACRO)
-    assert "MOVE" not in msm.PROXY_ETF and "BTC" not in msm.PROXY_ETF  # MOVE 沒有代理、BTC 改 Coinbase
+    assert "MOVE" not in msm.PROXY_ETF  # MOVE 沒有代理
     assert msm.proxy_source_label("UUP") == "ETF 代理：UUP"
     with pytest.raises(ValueError):
         msm.proxy_source_label("SPY")
 
 
-def test_parse_coinbase_spot():
-    assert msm.parse_coinbase_spot(b'{"data":{"amount":"81471.055","base":"BTC","currency":"USD"}}') == 81471.055
-    assert msm.parse_coinbase_spot({"data": {"amount": 81000, "base": "BTC", "currency": "USD"}}) == 81000.0
+def test_btc_proxy_is_the_ibit_etf_through_the_nasdaq_etf_endpoint():
+    """2026-10-23：Coinbase 在台灣被封鎖，BTC 沒有 Yahoo 時改用現貨比特幣 ETF 的 IBIT（和 GOLD→GLD 同一條路）。"""
+    assert msm.PROXY_ETF["BTC"] == "IBIT" and msm.YAHOO_MACRO["BTC"] == "BTC-USD"
+    assert msm.proxy_source_label("IBIT") == "ETF 代理：IBIT"
+    calls = []
+
+    def historical(symbol, start, end, **kwargs):
+        calls.append((symbol, kwargs["etf"]))
+        return [SimpleNamespace(date=date(2026, 10, 21), close=47.84), SimpleNamespace(date=date(2026, 10, 22), close=46.06)]
+
+    assert msm.fetch_proxy_bars("IBIT", date(2026, 10, 9), date(2026, 10, 22), historical=historical) == [
+        (date(2026, 10, 21), 47.84), (date(2026, 10, 22), 46.06)]
+    assert calls == [("IBIT", True)]
 
 
-@pytest.mark.parametrize(
-    ("payload", "kind"),
-    [
-        ({"data": {"base": "BTC", "currency": "USD"}}, "missing_field"),
-        ({"data": {"amount": "1", "currency": "USD"}}, "missing_field"),
-        ({"data": {"amount": "2500", "base": "ETH", "currency": "USD"}}, "conflict"),
-        ({"data": {"amount": "75000", "base": "BTC", "currency": "EUR"}}, "conflict"),
-        ({"data": {"amount": "abc", "base": "BTC", "currency": "USD"}}, "format"),
-        ({"data": {"amount": "0", "base": "BTC", "currency": "USD"}}, "format"),
-        ({"data": {"amount": "-5", "base": "BTC", "currency": "USD"}}, "format"),
-        ({"data": {"amount": True, "base": "BTC", "currency": "USD"}}, "format"),
-        ({"data": "81471"}, "format"),
-        ([], "format"),
-    ],
-)
-def test_parse_coinbase_spot_errors(payload, kind):
-    with pytest.raises(msm.ParseError) as excinfo:
-        msm.parse_coinbase_spot(payload)
-    assert _kind(excinfo) == kind
-
-
-def test_fetch_coinbase_spot_request():
-    http = FakeHTTP('{"data":{"amount":"81471.055","base":"BTC","currency":"USD"}}')
-    assert msm.fetch_coinbase_spot(http=http) == 81471.055
-    assert http.calls[0]["url"] == "https://api.coinbase.com/v2/prices/BTC-USD/spot"
-    assert http.calls[0]["accept"] == ("json",)
+def test_coinbase_is_gone_as_a_source():
+    """api.coinbase.com 在台灣被封鎖（2026-10-23）：抓取、解析、端點、網址都拿掉，不留一條會失敗的路。"""
+    for name in ("fetch_coinbase_spot", "parse_coinbase_spot", "COINBASE_SPOT_URL", "SOURCE_COINBASE"):
+        assert not hasattr(msm, name), name
+    assert "coinbase_spot" not in msm.ENDPOINTS
+    assert all("coinbase" not in endpoint.host for endpoint in msm.ENDPOINTS.values())
 
 
 # ── Google News RSS ──────────────────────────────────────────────────────────
@@ -698,22 +688,57 @@ def test_fetch_trumpstruth_uses_the_www_feed_and_xml():
     assert all(call["accept"] == ("xml",) for call in http.calls)
 
 
+VIDEO_ONLY = '<p><a href="https://truth-archive.example/v.mp4">View video</a></p>'
+
+
 def test_feed_span_covers_items_the_parser_filters_out():
-    # PLAN §18.14 的缺口判斷要用整份 feed 的最舊一則，不是濾過後剩下的最舊一則
-    oldest = NOW - timedelta(hours=72)
+    # PLAN §18.14 的缺口判斷要用整份 feed 的頭尾，不是濾過後剩下的：只有影片的貼文、被移除的空殼都算
+    oldest = NOW - timedelta(hours=30)
     feed = _feed(
-        _post("200000000000000002", _rfc(oldest), '<p><a href="https://truth-archive.example/v.mp4">View video</a></p>'),
+        _post("200000000000000002", _rfc(oldest), VIDEO_ONLY),
         _post("200000000000000003", _rfc(NOW - timedelta(hours=5)), "<p>Tariffs</p>", removed="true"),
         _post(POST_ID, HOUR_AGO, "<p>Big rally tonight</p>"),
         _post("abc", _rfc(NOW - timedelta(hours=99)), "<p>bad id is not counted</p>"),
         _post("200000000000000004", "not a date", "<p>bad date is not counted</p>"),
     )
     assert [post.original_id for post in msm.parse_trumpstruth_rss(feed, NOW)] == [POST_ID]
-    assert msm.trumpstruth_feed_span(feed) == (oldest, NOW - timedelta(hours=1))
+    assert msm.trumpstruth_feed_span(feed, NOW) == msm.FeedSpan(oldest, NOW - timedelta(hours=1), False)
+    assert msm.trumpstruth_feed_span(feed, NOW.timestamp()) == msm.trumpstruth_feed_span(feed, NOW)  # now 可以是 epoch 秒
     http = FakeHTTP(feed)
     posts, span = msm.fetch_trumpstruth_with_span(NOW, http=http, include_removed=True)
-    assert [post.original_id for post in posts] == [POST_ID, "200000000000000003"] and span[0] == oldest
+    assert [post.original_id for post in posts] == [POST_ID, "200000000000000003"] and span.oldest == oldest
     assert len(http.calls) == 1 and http.calls[0]["url"] == "https://www.trumpstruth.org/feed"
+
+
+def test_feed_span_applies_the_same_time_bounds_as_the_parser():
+    """2026-10-23 審查 r7b F1：f78d5de 改看整份 feed 時把 `_within` 的界線也拿掉了。晚於 now + 5 分鐘的是時間打錯、
+    不算；比 now − 48 小時舊的（置頂、被移除的空殼）不算進 oldest，只記 reaches_back；視窗內只有圖的貼文照算。"""
+    feed = _feed(
+        _post("200000000000000002", _rfc(NOW + timedelta(days=10)), VIDEO_ONLY),  # 來源打錯年份
+        _post("200000000000000003", _rfc(NOW + timedelta(minutes=5, seconds=1)), VIDEO_ONLY),  # 剛好超過上界
+        _post("200000000000000004", _rfc(NOW + timedelta(minutes=5)), VIDEO_ONLY),  # 上界（含）
+        _post("200000000000000005", _rfc(NOW - timedelta(days=30)), "", removed="true"),  # 置頂的舊空殼
+        _post("200000000000000006", _rfc(NOW - timedelta(hours=48, seconds=1)), VIDEO_ONLY),  # 剛好超過視窗
+        _post("200000000000000007", _rfc(NOW - timedelta(hours=48)), VIDEO_ONLY),  # 下界（含）
+        _post(POST_ID, HOUR_AGO, "<p>Big rally tonight</p>"),
+    )
+    assert msm.trumpstruth_feed_span(feed, NOW) == msm.FeedSpan(
+        NOW - timedelta(hours=48), NOW + timedelta(minutes=5), True
+    )
+    # 這份 feed 一則比視窗舊的都沒有 → reaches_back 為假
+    recent = _feed(_post("200000000000000007", _rfc(NOW - timedelta(hours=48)), VIDEO_ONLY), _post(POST_ID, HOUR_AGO, "<p>x</p>"))
+    assert msm.trumpstruth_feed_span(recent, NOW).reaches_back is False
+
+
+def test_feed_span_with_nothing_inside_the_window_uses_the_newest_item():
+    # 川普（或存檔）48 小時沒新貼文：feed 整份都比視窗舊 → 沒有視窗內的最舊一則，oldest＝newest；feed 涵蓋了視窗之前
+    newest = NOW - timedelta(hours=60)
+    feed = _feed(
+        _post("200000000000000002", _rfc(NOW - timedelta(hours=90)), VIDEO_ONLY),
+        _post(POST_ID, _rfc(newest), "<p>old news</p>"),
+        _post("200000000000000003", _rfc(NOW + timedelta(hours=1)), VIDEO_ONLY),  # 未來的照樣不算
+    )
+    assert msm.trumpstruth_feed_span(feed, NOW) == msm.FeedSpan(newest, newest, True)
 
 
 @pytest.mark.parametrize(
@@ -722,11 +747,13 @@ def test_feed_span_covers_items_the_parser_filters_out():
         (_feed(_post("abc", HOUR_AGO, "<p>x</p>"), _post(POST_ID, "bad", "<p>x</p>")), "format"),
         ("<rss><channel></channel></rss>", "empty"),
         (_feed(_post(POST_ID, HOUR_AGO, "<p>x</p>"), head="<!DOCTYPE rss>"), "format"),
+        # 每一則都在未來：來源的時間不能信，不拿來更新缺口紀錄
+        (_feed(_post(POST_ID, _rfc(NOW + timedelta(hours=1)), "<p>x</p>"), _post("200000000000000002", _rfc(NOW + timedelta(days=3)), "<p>y</p>")), "date"),
     ],
 )
 def test_feed_span_errors(xml, kind):
     with pytest.raises(msm.ParseError) as excinfo:
-        msm.trumpstruth_feed_span(xml)
+        msm.trumpstruth_feed_span(xml, NOW)
     assert _kind(excinfo) == kind
 
 
@@ -1004,32 +1031,43 @@ def test_prediction_market_table_is_fixed():
     assert all(m.key in msm.ENDPOINTS and m.expect_outcome == "Democratic Party" for m in msm.PREDICTION_MARKETS)
 
 
+def test_prediction_markets_are_blocked_but_parsers_and_tables_stay():
+    """2026-10-23：Polymarket、Kalshi 在台灣被封鎖：job 不抓（PREDICTION_MARKETS_BLOCKED），主機不在白名單；
+    解析函式、固定市場表、端點表都留著，之後換來源或解除封鎖時不用重寫。"""
+    market_http = pytest.importorskip("market_http")
+    assert msm.PREDICTION_MARKETS_BLOCKED is True
+    assert callable(msm.parse_polymarket_event) and callable(msm.parse_kalshi_markets) and callable(msm.fetch_prediction_quote)
+    assert {m.platform for m in msm.PREDICTION_MARKETS} == {"polymarket", "kalshi"}
+    for market in msm.PREDICTION_MARKETS:
+        assert msm.ENDPOINTS[market.key].host not in market_http.ALLOWED_HOSTS, market.key
+
+
 # ── 端點表 ───────────────────────────────────────────────────────────────────
 
 
 def test_endpoint_table_contract():
     market_http = pytest.importorskip("market_http")
+    blocked = {market.key for market in msm.PREDICTION_MARKETS}  # 封鎖中：端點表留著，但主機不在白名單（不繞過封鎖）
     for name, endpoint in msm.ENDPOINTS.items():
-        assert endpoint.host in market_http.ALLOWED_HOSTS, name
+        assert (endpoint.host in market_http.ALLOWED_HOSTS) == (name not in blocked), name
         assert endpoint.max_bytes > 0 and endpoint.per_day >= 1 and endpoint.retry_per_day >= 0
         expected_accept = ("xml",) if name.startswith("gnews.") or name == "trumpstruth" else ("json",)
         assert endpoint.accept == expected_accept, name
     for url, name in [
         (msm.TRUMPSTRUTH_URL, "trumpstruth"),
-        (msm.COINBASE_SPOT_URL, "coinbase_spot"),
         (msm.YAHOO_SPARK_URL, "yahoo_spark"),
         (msm.GOOGLE_NEWS_URL, "gnews.us"),
         (msm.POLYMARKET_EVENT_URL, "polymarket.house"),
         (msm.KALSHI_MARKETS_URL, "kalshi.house"),
     ]:
         assert url.startswith(f"https://{msm.ENDPOINTS[name].host}/"), name
-        assert market_http.host_of(url.replace("{", "").replace("}", "")) == msm.ENDPOINTS[name].host
+        host = market_http.host_of(url.replace("{", "").replace("}", ""))
+        assert host == (None if name in blocked else msm.ENDPOINTS[name].host), name
 
 
 def test_endpoint_daily_budgets_match_the_plan():
     per_day = {name: endpoint.per_day for name, endpoint in msm.ENDPOINTS.items()}
     assert per_day["yahoo_spark"] == 1 and msm.ENDPOINTS["yahoo_spark"].retry_per_day == 0
-    assert per_day["coinbase_spot"] == 12  # PLAN §18.9：每 2 小時
     assert per_day["gnews.us"] + per_day["gnews.tw"] + per_day["gnews.iran"] == 48 + 48 + 24  # §19.2：伊朗一小時
     assert per_day["trumpstruth"] == 48
     assert per_day["polymarket.house"] == per_day["kalshi.house"] == 12
@@ -1124,7 +1162,7 @@ def test_shared_parse_error_and_cleaner():
 
 def test_parse_error_kind_is_an_enum_value():
     with pytest.raises(msm.ParseError) as excinfo:
-        msm.parse_coinbase_spot([])
+        msm.parse_kalshi_markets([], "CONTROLH-2026-D")
     assert isinstance(excinfo.value, ValueError)
     assert excinfo.value.kind in msm.PARSE_ERROR_KINDS
     assert str(excinfo.value) == excinfo.value.kind  # 訊息只有種類，不帶回應內容

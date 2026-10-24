@@ -1,6 +1,6 @@
 """market_pipeline_misc（/盤勢 宏觀、BTC、新聞、川普、選舉的 collect 任務，2026-10-17）的測試：假的 http、
-暫存的 Store、固定的日曆、注入的時間。測的是：Yahoo 每個 D 一次、失敗改代理且每格標來源、≤D、代理沒有 D 那根
-30 分鐘後重抓、BTC 每 2 小時、新聞 36 小時與 503 冷卻、川普依 originalId 累積與「（至少）」、預測市場的間隔。"""
+暫存的 Store、固定的日曆、注入的時間。測的是：Yahoo 每個 D 一次、失敗改代理且每格標來源（BTC 是 IBIT）、≤D、代理沒有 D 那根
+30 分鐘後重抓、新聞 36 小時與 503 冷卻、川普依 originalId 累積與「（至少）」、預測市場的間隔（封鎖中永遠不到期）。"""
 
 from __future__ import annotations
 
@@ -29,7 +29,10 @@ YAHOO = {
     "DXY": "DX-Y.NYB", "WTI": "CL=F", "BRENT": "BZ=F", "GOLD": "GC=F", "SILVER": "SI=F", "BTC": "BTC-USD",
     "USDTWD": "TWD=X", "RUT": "^RUT", "DJI": "^DJI", "IXIC": "^IXIC", "MOVE": "^MOVE",
 }
-PROXIES = {"DXY": "UUP", "WTI": "USO", "BRENT": "BNO", "GOLD": "GLD", "SILVER": "SLV", "RUT": "IWM", "DJI": "DIA", "IXIC": "ONEQ"}
+PROXIES = {
+    "DXY": "UUP", "WTI": "USO", "BRENT": "BNO", "GOLD": "GLD", "SILVER": "SLV", "BTC": "IBIT", "RUT": "IWM", "DJI": "DIA",
+    "IXIC": "ONEQ",
+}
 WEEK = [date(2026, 10, 12), date(2026, 10, 13), date(2026, 10, 14), date(2026, 10, 15)]
 D = date(2026, 10, 15)  # 週四；台北週五 07:00＝美東週四 19:00，週四收盤＋30 分鐘已過
 NOW_AFTER_D = datetime(2026, 10, 16, 7, 0, tzinfo=TPE).timestamp()
@@ -155,6 +158,12 @@ def route_proxies(env: SimpleNamespace, bars_for) -> None:
         env.http.route(f"/api/quote/{etf}/historical", lambda url, etf=etf: nasdaq_hist(etf, bars_for(etf)))
 
 
+def nasdaq_published_d(env: SimpleNamespace, *, day: date = D, provisional: bool = False) -> None:
+    """Nasdaq 日線端點已公布 D：SPY（market_pipeline_us 一直在追的那檔）在 closes 表有 D 的正式列。
+    宏觀的 ETF 代理要等到這個才去抓（2026-10-23）；provisional＝CBOE 的備援列，不算公布。"""
+    env.store.upsert_closes("us", "SPY", [(day, 600.0, 1_000)], "cboe" if provisional else "nasdaq", provisional=provisional)
+
+
 def rfc(moment: datetime) -> str:
     return format_datetime(moment.astimezone(UTC), usegmt=True)
 
@@ -208,8 +217,9 @@ def test_tasks_and_groups():
     assert {"election.polymarket.house", "election.kalshi.house"} <= set(elections)  # 每個固定市場一個任務
     assert groups == {
         "news.us": "fast", "news.tw": "fast", "news.iran": "fast", "trump.feed": "fast",
-        "macro.btc": "medium", "macro.yahoo": "core", **elections,
+        "macro.yahoo": "core", **elections,
     }
+    assert "macro.btc" not in groups  # 2026-10-23：Coinbase 那條拿掉，BTC 走宏觀（Yahoo 或 IBIT 代理）
 
 
 # ── 宏觀：Yahoo 為主 ─────────────────────────────────────────────────────────────────
@@ -230,8 +240,9 @@ def test_yahoo_once_per_d_keeps_rows_up_to_d_with_yahoo_labels(env):
     assert wti["value"] == 81.5 and wti["date"] == "2026-10-15" and all(day <= "2026-10-15" for day, _ in wti["bars"])
     rut = payload(env, "macro.RUT")
     assert rut["value"] == 2450.0 and rut["chg"] is None and rut["prev_date"] is None
-    assert payload(env, "macro.BTC.yahoo")["source"] == "Yahoo"  # Yahoo 的 BTC 只當備援
-    assert env.store.get_obs("macro.BTC") is None  # 主格是 Coinbase 那筆
+    btc = payload(env, "macro.BTC")  # 2026-10-23：BTC 和其他格一樣，Yahoo 的 BTC-USD 就是主格
+    assert btc["source"] == "Yahoo" and btc["symbol"] == "BTC-USD" and btc["value"] == 16.5
+    assert env.store.get_obs("macro.BTC.yahoo") is None  # 舊的備援鍵不再寫
     assert env.store.get_obs("macro.DXY")["data_date"] == "2026-10-15"
     # 同一個 D 不再打；下一個 D（週五收盤後）才再打一次
     assert run(make_ctx(env, NOW_AFTER_D + 3600), "macro.yahoo") == "not_due"
@@ -241,14 +252,15 @@ def test_yahoo_once_per_d_keeps_rows_up_to_d_with_yahoo_labels(env):
 def test_yahoo_failure_switches_to_proxies_and_labels_each_value(env):
     env.http.route("finance.yahoo.com", market_http.FetchError("rate_limited"))
     route_proxies(env, lambda etf: full_week(20.0) + [(date(2026, 10, 16), 30.0)])  # D 之後那根也要丟
+    nasdaq_published_d(env)
     env.store.put_obs(
         tw.OBS_FX, {"date": "2026-10-15", "usd_ntd": 32.338, "prev_date": "2026-10-14", "prev_usd_ntd": 32.3},
         data_date="2026-10-15",
     )
     ctx = make_ctx(env, NOW_AFTER_D)
     assert run(ctx, "macro.yahoo") == "partial"  # MOVE 沒有代理
-    assert env.http.count("api.nasdaq.com") == 8
-    assert env.http.count("coinbase") == 0 and env.http.count("taifex") == 0  # BTC 有自己的 2 小時任務、台幣讀 tw.fx
+    assert env.http.count("api.nasdaq.com") == len(PROXIES) == 9  # 8 個 ETF 代理＋BTC 的 IBIT
+    assert env.http.count("coinbase") == 0 and env.http.count("taifex") == 0  # Coinbase 拿掉了、台幣讀 tw.fx
     for key, etf in PROXIES.items():
         item = payload(env, f"macro.{key}")
         assert item["source"] == f"ETF 代理：{etf}" and item["symbol"] == etf
@@ -262,7 +274,6 @@ def test_yahoo_failure_switches_to_proxies_and_labels_each_value(env):
     assert usd["chg"] == pytest.approx(0.038)  # 10/14 是 10/15 的前一個台股交易日
     move = env.store.get_obs("macro.MOVE")
     assert move["payload"] is None and move["error"] == "rate_limited" and move["fail_streak"] == 1
-    assert env.store.get_obs("macro.BTC.yahoo")["error"] == "rate_limited"
     # 全部代理都拿到 D：同一個 D 不再排
     assert misc.macro_plan(make_ctx(env, NOW_AFTER_D + 3 * 3600)) is None
 
@@ -271,38 +282,87 @@ def test_partial_yahoo_response_sends_only_the_missing_symbols_to_proxies(env):
     entries = {symbol: full_week(10.0) for symbol in YAHOO.values() if symbol != "^RUT"}
     env.http.route("finance.yahoo.com", spark(entries))
     route_proxies(env, lambda etf: full_week(200.0))
+    nasdaq_published_d(env)
     assert run(make_ctx(env, NOW_AFTER_D), "macro.yahoo") == "ok"
     assert [urlsplit(url).path for url in env.http.calls if "nasdaq" in url] == ["/api/quote/IWM/historical"]
     assert payload(env, "macro.RUT")["source"] == "ETF 代理：IWM"
     assert payload(env, "macro.DJI")["source"] == "Yahoo"
 
 
-def test_proxy_without_the_d_bar_is_fetched_once_more_after_30_minutes(env):
+def test_proxies_wait_until_spy_has_the_official_d_row(env):
+    """2026-10-23：Nasdaq 日線端點要收盤後好幾個小時才公布 D 那列。ETF 代理原本 D 換日（04:43）就開打、30 分鐘後放棄，
+    8 列整天停在前一個交易日。現在等 SPY 在 closes 表有 D 的正式列才去抓：之前一個請求都不送，之後每個代理抓一次。"""
+    env.http.route("finance.yahoo.com", market_http.FetchError("rate_limited"))
+    route_proxies(env, lambda etf: full_week(20.0))
+    env.store.put_obs(tw.OBS_FX, {"date": "2026-10-15", "usd_ntd": 32.3}, data_date="2026-10-15")
+    assert run(make_ctx(env, NOW_AFTER_D), "macro.yahoo") == "partial"
+    assert env.http.count("api.nasdaq.com") == 0  # D 換日那一輪：Nasdaq 還沒公布，不打
+    state = misc._state(env.store, misc.TASK_MACRO)
+    assert state["pending"] == {key: {"tries": 0} for key in PROXIES}  # 等著，這不算一次
+    assert env.store.get_obs("macro.DXY") is None and env.store.get_obs("macro.BTC") is None
+    assert payload(env, "macro.USDTWD")["source"] == "代理：期交所匯率"  # 台幣不走 Nasdaq：當場就有
+    # SPY 沒有 D 的正式列：之後每一輪都不排、不送請求；CBOE 的 provisional 或前一天的正式列都不算
+    nasdaq_published_d(env, provisional=True)
+    nasdaq_published_d(env, day=date(2026, 10, 14))
+    for offset in (60, 1800, 3 * 3600):
+        assert misc.macro_plan(make_ctx(env, NOW_AFTER_D + offset)) is None
+        assert run(make_ctx(env, NOW_AFTER_D + offset), "macro.yahoo") == "not_due"
+    assert env.http.count("api.nasdaq.com") == 0
+    # SPY 有了 D 的正式列：下一輪每個代理抓一次，都拿到 D，之後不再排
+    nasdaq_published_d(env)
+    later = NOW_AFTER_D + 4 * 3600
+    assert misc.macro_plan(make_ctx(env, later)) == {"d": D, "yahoo": False, "keys": sorted(PROXIES)}
+    assert run(make_ctx(env, later), "macro.yahoo") == "ok"
+    assert sorted(urlsplit(url).path for url in env.http.calls if "nasdaq" in url) == sorted(
+        f"/api/quote/{etf}/historical" for etf in PROXIES.values())
+    for key in PROXIES:
+        assert payload(env, f"macro.{key}")["date"] == "2026-10-15", key
+    assert misc.macro_plan(make_ctx(env, later + 3600)) is None
+
+
+def test_proxy_without_the_d_bar_is_fetched_again_every_hour(env):
     env.http.route("finance.yahoo.com", market_http.FetchError("status"))
     late = {"yes": False}
     route_proxies(env, lambda etf: full_week(20.0) if etf != "UUP" or late["yes"] else full_week(20.0)[:-1])
     env.store.put_obs(tw.OBS_FX, {"date": "2026-10-15", "usd_ntd": 32.3}, data_date="2026-10-15")
+    nasdaq_published_d(env)
     assert run(make_ctx(env, NOW_AFTER_D), "macro.yahoo") == "partial"
     assert payload(env, "macro.DXY")["date"] == "2026-10-14"  # 先放前一天的值（卡上看資料日）
-    assert misc.macro_plan(make_ctx(env, NOW_AFTER_D + 600)) is None  # 30 分鐘內不重抓
-    plan = misc.macro_plan(make_ctx(env, NOW_AFTER_D + 1800))
+    assert misc.macro_plan(make_ctx(env, NOW_AFTER_D + 1800)) is None  # 舊的 30 分鐘間隔不再重抓
+    assert misc.macro_plan(make_ctx(env, NOW_AFTER_D + 3599)) is None
+    plan = misc.macro_plan(make_ctx(env, NOW_AFTER_D + 3600))
     assert plan == {"d": D, "yahoo": False, "keys": ["DXY"]}
     late["yes"] = True
     before = env.http.count("finance.yahoo.com")
-    assert run(make_ctx(env, NOW_AFTER_D + 1800), "macro.yahoo") == "ok"  # 這次只重抓 UUP（MOVE 第一次就記了失敗）
+    assert run(make_ctx(env, NOW_AFTER_D + 3600), "macro.yahoo") == "ok"  # 這次只重抓 UUP（MOVE 第一次就記了失敗）
     assert env.http.count("finance.yahoo.com") == before  # Yahoo 一個 D 只打一次
     assert payload(env, "macro.DXY")["date"] == "2026-10-15"
     assert misc.macro_plan(make_ctx(env, NOW_AFTER_D + 7200)) is None
 
 
-def test_proxy_retry_is_limited_to_once(env):
+def test_proxy_retries_are_limited_to_three_per_d_so_the_budget_stays_small(env):
+    """每個代理每個 D：第一次＋最多再 3 次（每小時）。全部代理都抓不到 D 也只有 9×4＝36 個請求；平常第一次就拿到＝9 個。"""
     env.http.route("finance.yahoo.com", market_http.FetchError("status"))
     route_proxies(env, lambda etf: full_week(20.0)[:-1] if etf == "UUP" else full_week(20.0))
     env.store.put_obs(tw.OBS_FX, {"date": "2026-10-15", "usd_ntd": 32.3}, data_date="2026-10-15")
-    run(make_ctx(env, NOW_AFTER_D), "macro.yahoo")
-    run(make_ctx(env, NOW_AFTER_D + 1800), "macro.yahoo")
-    assert env.http.count("/api/quote/UUP/") == 2
-    assert misc.macro_plan(make_ctx(env, NOW_AFTER_D + 3600)) is None
+    nasdaq_published_d(env)
+    for hours in range(0, 8):
+        run(make_ctx(env, NOW_AFTER_D + hours * 3600), "macro.yahoo")
+    assert env.http.count("/api/quote/UUP/") == 4 == misc.PROXY_RETRIES + 1
+    assert all(env.http.count(f"/api/quote/{etf}/") == 1 for key, etf in PROXIES.items() if key != "DXY")
+    assert env.http.count("api.nasdaq.com") == 8 + 4
+    assert misc.macro_plan(make_ctx(env, NOW_AFTER_D + 12 * 3600)) is None
+
+
+def test_even_when_no_proxy_ever_gets_the_d_bar_a_day_costs_at_most_36_requests(env):
+    env.http.route("finance.yahoo.com", market_http.FetchError("status"))
+    route_proxies(env, lambda etf: full_week(20.0)[:-1])  # Nasdaq 一直沒有 D 那根
+    env.store.put_obs(tw.OBS_FX, {"date": "2026-10-15", "usd_ntd": 32.3}, data_date="2026-10-15")
+    nasdaq_published_d(env)
+    for hours in range(0, 10):
+        run(make_ctx(env, NOW_AFTER_D + hours * 3600), "macro.yahoo")
+    assert env.http.count("api.nasdaq.com") == len(PROXIES) * (misc.PROXY_RETRIES + 1) == 36
+    assert misc.macro_plan(make_ctx(env, NOW_AFTER_D + 20 * 3600)) is None  # 放棄之後不再打，直到下一個 D（台北 10/17 04:30）
 
 
 def test_usdtwd_proxy_fetches_taifex_once_when_the_tw_pipeline_has_nothing(env):
@@ -319,6 +379,69 @@ def test_usdtwd_proxy_fetches_taifex_once_when_the_tw_pipeline_has_nothing(env):
     assert usd["date"] == "2026-10-15" and usd["value"] == 32.338 and usd["chg"] is None
 
 
+def _usdtwd_after_the_d_change(env, *, fx_date: str = "2026-10-14", prev_date: str = "2026-10-13") -> dict:
+    """Yahoo 429、期交所的匯率檔還是前一天（tw.fx＝fx_date）：D 換日那一輪台幣用 tw.fx 的值（標「期交所代理」）。"""
+    env.http.route("finance.yahoo.com", market_http.FetchError("rate_limited"))
+    route_proxies(env, lambda etf: full_week(20.0))
+    nasdaq_published_d(env)
+    env.store.put_obs(tw.OBS_FX, {"date": fx_date, "usd_ntd": 32.3, "prev_date": prev_date, "prev_usd_ntd": 32.2}, data_date=fx_date)
+    assert run(make_ctx(env, NOW_AFTER_D), "macro.yahoo") == "partial"
+    return payload(env, "macro.USDTWD")
+
+
+def test_usdtwd_follows_tw_fx_when_it_advances_later_in_the_day(env):
+    """2026-10-23：期交所的匯率檔台北早上才更新，market_pipeline_tw 隔一陣子才讀到。宏觀任務原本只在 D 換日那一刻讀 tw.fx，
+    之後它前進了卡上的台幣還是前一天；現在 tw.fx 的資料日比 macro.USDTWD 新就重算（只讀 obs，不送請求）。"""
+    usd = _usdtwd_after_the_d_change(env)
+    assert usd["source"] == "代理：期交所匯率" and usd["date"] == "2026-10-14" and usd["value"] == 32.3
+    later = NOW_AFTER_D + 600  # 還沒到 pending 的 1 小時重試
+    assert misc.macro_plan(make_ctx(env, later)) is None  # tw.fx 沒前進：台幣不重算
+    nasdaq_before = env.http.count("api.nasdaq.com")
+    env.store.put_obs(
+        tw.OBS_FX, {"date": "2026-10-15", "usd_ntd": 32.338, "prev_date": "2026-10-14", "prev_usd_ntd": 32.3},
+        data_date="2026-10-15",
+    )
+    assert misc.macro_plan(make_ctx(env, later)) == {"d": D, "yahoo": False, "keys": ["USDTWD"]}
+    assert run(make_ctx(env, later), "macro.yahoo") == "ok"
+    usd = payload(env, "macro.USDTWD")
+    assert usd["date"] == "2026-10-15" and usd["value"] == 32.338 and usd["chg"] == pytest.approx(0.038)
+    assert env.store.get_obs("macro.USDTWD")["data_date"] == "2026-10-15"
+    assert env.http.count("taifex") == 0 and env.http.count("api.nasdaq.com") == nasdaq_before  # 沒有任何請求
+    assert misc.macro_plan(make_ctx(env, later + 60)) is None and misc.macro_plan(make_ctx(env, later + 7200)) is None
+
+
+def test_usdtwd_refresh_stops_at_d_and_does_not_loop_when_tw_fx_is_ahead_of_d(env):
+    usd = _usdtwd_after_the_d_change(env, fx_date="2026-10-16", prev_date="2026-10-15")  # 台股日期已經是 10/16，D 是 10/15
+    assert usd["date"] == "2026-10-15" and usd["value"] == 32.2  # 晚於 D 的那列丟掉（§18.8）
+    for offset in (60, 600, 7200):
+        assert misc.macro_plan(make_ctx(env, NOW_AFTER_D + offset)) is None, offset
+    assert run(make_ctx(env, NOW_AFTER_D + 600), "macro.yahoo") == "not_due"
+
+
+def test_usdtwd_from_yahoo_is_not_replaced_by_tw_fx(env):
+    entries = {symbol: full_week(10.0) for symbol in YAHOO.values()}
+    env.http.route("finance.yahoo.com", spark(entries))
+    env.store.put_obs(tw.OBS_FX, {"date": "2026-10-15", "usd_ntd": 32.338, "prev_date": "2026-10-14", "prev_usd_ntd": 32.3},
+                      data_date="2026-10-15")
+    assert run(make_ctx(env, NOW_AFTER_D), "macro.yahoo") == "ok"
+    assert payload(env, "macro.USDTWD")["source"] == "Yahoo"
+    env.store.put_obs(tw.OBS_FX, {"date": "2026-10-15", "usd_ntd": 33.0}, data_date="2026-10-15")  # 之後 tw.fx 換了值也不理它
+    assert misc.macro_plan(make_ctx(env, NOW_AFTER_D + 600)) is None
+
+
+def test_usdtwd_is_built_when_tw_fx_shows_up_after_the_taifex_fetch_failed(env):
+    env.http.route("finance.yahoo.com", market_http.FetchError("rate_limited"))
+    env.http.route("DailyForeignExchangeRates", market_http.FetchError("timeout"))
+    route_proxies(env, lambda etf: full_week(20.0))
+    nasdaq_published_d(env)
+    assert run(make_ctx(env, NOW_AFTER_D), "macro.yahoo") == "partial"
+    assert env.store.get_obs("macro.USDTWD") is None or payload(env, "macro.USDTWD") is None
+    env.store.put_obs(tw.OBS_FX, {"date": "2026-10-15", "usd_ntd": 32.338}, data_date="2026-10-15")
+    assert misc.macro_plan(make_ctx(env, NOW_AFTER_D + 300)) == {"d": D, "yahoo": False, "keys": ["USDTWD"]}  # 不等 1 小時重試
+    assert run(make_ctx(env, NOW_AFTER_D + 300), "macro.yahoo") == "ok"
+    assert payload(env, "macro.USDTWD")["value"] == 32.338
+
+
 def test_macro_payload_rules():
     cal = market_calendar.Calendar("us")
     bars = [(date(2026, 10, 14), 10.0), (D, 11.0), (date(2026, 10, 16), 12.0), (date(2026, 10, 13), float("nan")),
@@ -331,24 +454,47 @@ def test_macro_payload_rules():
     assert item["chg"] is None  # 前一筆不是前一個交易日（10/14）
 
 
-# ── BTC：Coinbase 每 2 小時 ──────────────────────────────────────────────────────────
-def test_coinbase_btc_every_two_hours_and_retry_after_failure(env):
-    answer = {"value": {"data": {"amount": "81471.055", "base": "BTC", "currency": "USD"}}}
-    env.http.route("api.coinbase.com", lambda url: answer["value"])
-    t0 = at(2026, 10, 16, 10, 0)
-    assert run(make_ctx(env, t0), "macro.btc") == "ok"
-    btc = env.store.get_obs("macro.BTC")
-    assert btc["payload"]["value"] == 81471.055 and btc["payload"]["source"] == "Coinbase"
-    assert btc["payload"]["fetched_utc"].startswith("2026-10-16T02:00")
-    assert run(make_ctx(env, t0 + 7199), "macro.btc") == "not_due"
-    answer["value"] = market_http.FetchError("timeout")
-    assert run(make_ctx(env, t0 + 7200), "macro.btc") == "timeout"
-    assert env.store.get_obs("macro.BTC")["payload"]["value"] == 81471.055  # 舊值留著
-    answer["value"] = {"data": {"amount": "82000", "base": "BTC", "currency": "USD"}}
-    assert run(make_ctx(env, t0 + 7200 + 899), "macro.btc") == "backoff"  # 框架退避 15 分鐘
-    assert run(make_ctx(env, t0 + 7200 + 1799), "macro.btc") == "not_due"  # 失敗後自己等 30 分鐘
-    assert run(make_ctx(env, t0 + 7200 + 1800), "macro.btc") == "ok"
-    assert env.store.get_obs("macro.BTC")["payload"]["value"] == 82000.0
+# ── BTC：和其他宏觀格一樣（Yahoo，沒有就用 IBIT 代理；2026-10-23 拿掉 Coinbase） ─────────────────────────────
+def test_btc_uses_the_ibit_proxy_when_yahoo_fails_and_the_card_says_so(env):
+    """Coinbase 在台灣被封鎖，Yahoo 又常回 429：BTC 改用現貨比特幣 ETF 的 IBIT（和 GOLD→GLD 同一條路）。
+    存的值是 ETF 股價，卡上只能寫單日漲跌幅，不能把它印成 BTC 價格。"""
+    env.http.route("finance.yahoo.com", market_http.FetchError("rate_limited"))
+    route_proxies(env, lambda etf: [(date(2026, 10, 14), 47.84), (D, 46.06)] if etf == "IBIT" else full_week(20.0))
+    env.store.put_obs(tw.OBS_FX, {"date": "2026-10-15", "usd_ntd": 32.3}, data_date="2026-10-15")
+    nasdaq_published_d(env)
+    assert run(make_ctx(env, NOW_AFTER_D), "macro.yahoo") == "partial"
+    btc = payload(env, "macro.BTC")
+    assert btc["source"] == "ETF 代理：IBIT" and btc["symbol"] == "IBIT" and btc["date"] == "2026-10-15"
+    assert btc["value"] == 46.06 and btc["chg"] == pytest.approx(-1.78) and btc["chg_pct"] == pytest.approx(-3.7207, abs=1e-3)
+    assert [urlsplit(url).path for url in env.http.calls].count("/api/quote/IBIT/historical") == 1
+    assert env.http.count("coinbase") == 0
+    import market_dashboard
+
+    assert market_dashboard._macro_label("BTC", btc) == "比特幣（IBIT 代理）"
+    value = market_dashboard._macro_value("BTC", btc)
+    assert value == "單日 -3.72%" and "46" not in value  # 只寫漲跌幅，不印 ETF 的股價
+
+
+def test_btc_has_no_task_of_its_own_and_no_coinbase_path():
+    assert "macro.btc" not in TASKS
+    for name in ("TASK_BTC", "OBS_BTC", "OBS_BTC_YAHOO", "MACRO_OBS_KEY", "_btc_run", "_btc_due"):
+        assert not hasattr(misc, name), name
+    assert "coinbase_spot" not in misc._DEFAULT_EVERY_S
+
+
+def test_a_day_recorded_before_the_ibit_proxy_gets_one_catch_up_fetch_for_btc(env):
+    """部署前這個 D 已經跑過宏觀：BTC 以前不走代理，紀錄裡既沒有來源也不在 pending。補抓一次 IBIT，之後不再排。"""
+    route_proxies(env, lambda etf: [(date(2026, 10, 14), 47.84), (D, 46.06)] if etf == "IBIT" else full_week(20.0))
+    nasdaq_published_d(env)
+    legacy = {k: f"ETF 代理：{etf}" for k, etf in PROXIES.items() if k != "BTC"}
+    misc._save(env.store, misc.TASK_MACRO, {"d": D.isoformat(), "yahoo": "rate_limited", "pending": {}, "sources": legacy})
+    ctx = make_ctx(env, NOW_AFTER_D)
+    assert misc.macro_plan(ctx) == {"d": D, "yahoo": False, "keys": ["BTC"]}
+    assert run(ctx, "macro.yahoo") == "ok"
+    assert [urlsplit(url).path for url in env.http.calls if "nasdaq" in url] == ["/api/quote/IBIT/historical"]
+    assert payload(env, "macro.BTC")["source"] == "ETF 代理：IBIT"
+    assert misc._state(env.store, misc.TASK_MACRO)["sources"]["BTC"] == "ETF 代理：IBIT"
+    assert misc.macro_plan(make_ctx(env, NOW_AFTER_D + 3 * 3600)) is None
 
 
 # ── 新聞 ─────────────────────────────────────────────────────────────────────────
@@ -469,8 +615,103 @@ def test_coverage_and_at_least_rules():
     assert state["gaps"] == [[25 * hour, 40 * hour]] and misc.at_least(state, 60 * hour)
 
 
-# ── 期中選舉：每 2 小時；結果出來後每天、7 天後停 ───────────────────────────────────────────
-def test_prediction_markets_poll_every_two_hours_then_daily_after_the_result(env):
+def test_reaches_back_only_counts_when_there_is_no_anchor_inside_the_window():
+    """2026-10-23 審查 r7b F1：feed 比視窗起點更舊（reaches_back）＝這一份自己就涵蓋了整個 48 小時，但只在沒有
+    可接的錨點（剛上線、或上輪最新一則已滑出視窗）時採信；錨點還在視窗內，一則置頂的舊 item 不能蓋掉真缺口。"""
+    hour = 3600.0
+    # 剛上線，feed 比視窗（52h 起）還舊 → 整個視窗都涵蓋到了，不必標「（至少）」
+    state: dict = {}
+    misc.update_coverage(state, [60 * hour, 99 * hour], 100 * hour, reaches_back=True)
+    assert state["gaps"] == [] and state["last_newest"] == 99 * hour and misc.at_least(state, 100 * hour) is False
+    # 同樣的 feed 沒有更舊的 item → 最舊那則之前都不知道
+    state = {}
+    misc.update_coverage(state, [60 * hour, 99 * hour], 100 * hour)
+    assert state["gaps"] == [[None, 60 * hour]] and misc.at_least(state, 100 * hour)
+    # 錨點（上輪最新 90h）還在視窗內：這輪最舊 95h 比它新＝缺口；reaches_back 不採信
+    state = {"last_newest": 90 * hour, "gaps": []}
+    misc.update_coverage(state, [95 * hour, 99 * hour], 100 * hour, reaches_back=True)
+    assert state["gaps"] == [[90 * hour, 95 * hour]] and misc.at_least(state, 100 * hour)
+    # 錨點已滑出視窗（10h < 52h）：接不上，要靠這份 feed 自己涵蓋——涵蓋到就沒有缺口，涵蓋不到就記缺口
+    state = {"last_newest": 10 * hour, "gaps": []}
+    misc.update_coverage(state, [60 * hour, 99 * hour], 100 * hour, reaches_back=True)
+    assert state["gaps"] == [] and state["last_newest"] == 99 * hour
+    state = {"last_newest": 10 * hour, "gaps": []}
+    misc.update_coverage(state, [60 * hour, 99 * hour], 100 * hour)
+    assert state["gaps"] == [[10 * hour, 60 * hour]] and misc.at_least(state, 100 * hour)
+
+
+def test_a_last_newest_in_the_future_is_discarded_instead_of_hiding_gaps_forever():
+    """舊版沒擋時間打錯的 item，last_newest 可能已被拉到未來；max() 退不回來，缺口就永遠標不出來。"""
+    hour = 3600.0
+    state = {"last_newest": 1000 * hour, "gaps": []}
+    misc.update_coverage(state, [95 * hour, 99 * hour], 100 * hour)
+    assert state["last_newest"] == 99 * hour and state["gaps"] == [[None, 95 * hour]]
+    assert misc.at_least(state, 100 * hour)
+
+
+# ── 期中選舉：每 2 小時；結果出來後每天、7 天後停（2026-10-23 起台灣封鎖：永遠不到期） ──────────────────────────
+@pytest.fixture
+def unblocked(monkeypatch):
+    """排程與解析的邏輯仍要測：把封鎖旗標關掉（正式環境是 True）。"""
+    import market_sources_misc
+
+    monkeypatch.setattr(market_sources_misc, "PREDICTION_MARKETS_BLOCKED", False)
+
+
+ELECTION_TASKS = [f"election.{key}" for key in ("polymarket.house", "kalshi.house", "polymarket.senate", "kalshi.senate")]
+
+
+def test_election_tasks_are_never_due_while_the_prediction_markets_are_blocked(env):
+    """Polymarket、Kalshi 被台灣的 ISP 依法院命令封鎖（2026-10-21）：任務留在清單裡，但永遠不到期、一個請求都不送。"""
+    import market_sources_misc as src
+
+    assert src.PREDICTION_MARKETS_BLOCKED is True
+    env.http.route("gamma-api.polymarket.com", polymarket_event())
+    env.http.route("api.elections.kalshi.com", {"cursor": "", "markets": []})
+    assert set(ELECTION_TASKS) <= set(TASKS)
+    t0 = at(2026, 10, 24, 10, 0)
+    for offset in (0, 7200, 86400, 40 * 86400):  # 從沒抓過、2 小時後、一天後、投票之後
+        for name in ELECTION_TASKS:
+            assert run(make_ctx(env, t0 + offset), name) == "not_due", (name, offset)
+    # 結果出來後「每天一次」的節奏也不例外
+    for name in ELECTION_TASKS:
+        misc._save(env.store, name, {"resolved_at": t0 - 2 * 86400, "last_ok": t0 - 2 * 86400})
+        assert run(make_ctx(env, t0), name) == "not_due"
+    assert env.http.calls == [] and env.store.get_obs("election.polymarket.house") is None
+
+
+@pytest.mark.parametrize("value", [True, 1, 0, None, "no"])
+def test_only_an_explicit_false_unblocks_the_election_tasks(env, monkeypatch, value):
+    import market_sources_misc as src
+
+    monkeypatch.setattr(src, "PREDICTION_MARKETS_BLOCKED", value)
+    env.http.route("gamma-api.polymarket.com", polymarket_event())
+    assert run(make_ctx(env, at(2026, 10, 24, 10, 0)), "election.polymarket.house") == "not_due"
+    assert env.http.calls == []
+
+
+def test_election_tasks_are_due_again_once_the_flag_is_false(env, unblocked):
+    env.http.route("gamma-api.polymarket.com", polymarket_event())
+    assert run(make_ctx(env, at(2026, 10, 24, 10, 0)), "election.polymarket.house") == "ok"
+    assert env.http.count("polymarket") == 1
+
+
+def test_blocking_clears_the_old_failure_streak_so_maintenance_stops_reporting_it(env):
+    """封鎖前這些任務已經連續失敗（kind=network）：框架留在 task_state 的次數不會自己歸零，每日維護會天天當失敗報。
+    第一次看到封鎖時清掉失敗次數與退避時間（其他欄位不動）；還在退避中就先等退避結束。"""
+    name = "election.polymarket.house"
+    t0 = at(2026, 10, 24, 10, 0)
+    env.store.set_task_state(name, {"fail_streak": 6, "next_try": t0 + 600, "last_kind": "network", "last_success": 123.0})
+    assert run(make_ctx(env, t0), name) == "backoff"
+    assert env.store.task_state(name)["fail_streak"] == 6
+    assert run(make_ctx(env, t0 + 601), name) == "not_due"
+    state = env.store.task_state(name)
+    assert state["fail_streak"] == 0 and state["next_try"] is None
+    assert state["last_kind"] == "network" and state["last_success"] == 123.0
+    assert env.http.calls == []
+
+
+def test_prediction_markets_poll_every_two_hours_then_daily_after_the_result(env, unblocked):
     event = {"value": polymarket_event()}
     env.http.route("gamma-api.polymarket.com", lambda url: event["value"])
     env.http.route("api.elections.kalshi.com", {"cursor": "", "markets": [{
@@ -500,7 +741,7 @@ def test_prediction_markets_poll_every_two_hours_then_daily_after_the_result(env
     assert run(make_ctx(env, resolved_at + 30 * 86400), "election.polymarket.house") == "not_due"
 
 
-def test_every_fixed_market_including_the_senate_gets_its_own_task_and_obs(env):
+def test_every_fixed_market_including_the_senate_gets_its_own_task_and_obs(env, unblocked):
     import market_sources_misc
 
     def poly(url):
@@ -566,3 +807,102 @@ def test_trump_coverage_counts_image_only_posts(env):
     assert run(make_ctx(env, (t0 + timedelta(minutes=31)).timestamp()), "trump.feed") == "ok"
     gaps = misc._state(env.store, misc.TASK_TRUMP).get("gaps") or []
     assert [gap for gap in gaps if gap[0] is not None] == []  # 只有剛上線那段「之前不知道」，沒有新缺口
+
+
+# ── 川普缺口偵測的界線（2026-10-23 審查 r7b F1 的 T1–T3） ───────────────────────────────────
+T0_TRUMP = datetime(2026, 10, 16, 12, 0, tzinfo=UTC)
+
+
+def trump_post(number: int, when: datetime, text: str = "", removed: bool = False) -> tuple:
+    return (f"1000000000000001{number:02d}", when, text, removed)
+
+
+def trump_state(env) -> dict:
+    return misc._state(env.store, misc.TASK_TRUMP)
+
+
+def trump_feed(env, posts: list) -> dict:
+    feed = {"posts": posts}
+    env.http.route("trumpstruth", lambda url: trump_rss(feed["posts"]))
+    return feed
+
+
+@pytest.mark.parametrize("later_hours", [1, 50])
+def test_trump_feeds_without_overlap_still_mark_the_gap(env, later_hours):
+    """T1：兩輪 feed 沒有交集（K0、K1 捲出，只剩更新的 K3）→ 中間可能漏了，缺口記下來、標「（至少）」。
+    1 小時後上輪最新一則還在視窗內；50 小時後它已滑出視窗、剛上線那段也過期，只剩這個缺口讓 at_least 為真。"""
+    k0, k1 = trump_post(0, T0_TRUMP - timedelta(hours=3), "Iran talks"), trump_post(1, T0_TRUMP - timedelta(hours=2), "Tariffs")
+    k3 = trump_post(3, T0_TRUMP + timedelta(hours=later_hours) - timedelta(minutes=30), "Fed must cut")
+    feed = trump_feed(env, [k1, k0])
+    assert run(make_ctx(env, T0_TRUMP.timestamp()), "trump.feed") == "ok"
+    feed["posts"] = [k3]
+    assert run(make_ctx(env, (T0_TRUMP + timedelta(hours=later_hours)).timestamp()), "trump.feed") == "ok"
+    assert [k1[1].timestamp(), k3[1].timestamp()] in trump_state(env)["gaps"]
+    assert trump_state(env)["last_newest"] == k3[1].timestamp()
+    assert payload(env, "trump.summary")["at_least"] is True
+
+
+def test_trump_future_dated_item_does_not_move_last_newest_or_hide_a_gap(env):
+    """T2：一則時間打成未來（> now + 5 分鐘）的 item 不能把 last_newest 拉過去（max() 退不回來）、讓後面真的缺口標不出來。"""
+    k0, k1 = trump_post(0, T0_TRUMP - timedelta(hours=3), "Iran talks"), trump_post(1, T0_TRUMP - timedelta(hours=2), "Tariffs")
+    typo = trump_post(9, T0_TRUMP + timedelta(days=10), "typo in the year")
+    k3 = trump_post(3, T0_TRUMP + timedelta(hours=49, minutes=30), "Fed must cut")
+    feed = trump_feed(env, [typo, k1, k0])
+    assert run(make_ctx(env, T0_TRUMP.timestamp()), "trump.feed") == "ok"
+    assert trump_state(env)["last_newest"] == k1[1].timestamp()  # 不是未來那則
+    assert payload(env, "trump.summary")["posts"] == 2  # 解析端本來就把它丟掉
+    feed["posts"] = [k3]  # 50 小時後（剛上線那段已過期）：和上輪沒有交集，真的缺口要標得出來
+    assert run(make_ctx(env, (T0_TRUMP + timedelta(hours=50)).timestamp()), "trump.feed") == "ok"
+    assert trump_state(env)["gaps"] == [[k1[1].timestamp(), k3[1].timestamp()]]
+    assert payload(env, "trump.summary")["at_least"] is True
+
+
+def test_trump_very_old_pinned_item_does_not_hide_a_gap(env):
+    """T3a：feed 裡一則很舊的 item（置頂、被移除的空殼用原始時間）不能把「最舊一則」拉到上輪最新之前、蓋掉真缺口。"""
+    k0, k1 = trump_post(0, T0_TRUMP - timedelta(hours=3), "Iran talks"), trump_post(1, T0_TRUMP - timedelta(hours=2), "Tariffs")
+    k3 = trump_post(3, T0_TRUMP + timedelta(minutes=30), "Fed must cut")
+    pinned = trump_post(8, T0_TRUMP - timedelta(days=30), "", True)
+    feed = trump_feed(env, [k1, k0])
+    assert run(make_ctx(env, T0_TRUMP.timestamp()), "trump.feed") == "ok"
+    feed["posts"] = [k3, pinned]  # K1 捲出；沒有交集，只有一則 30 天前的空殼
+    assert run(make_ctx(env, (T0_TRUMP + timedelta(hours=1)).timestamp()), "trump.feed") == "ok"
+    assert [k1[1].timestamp(), k3[1].timestamp()] in trump_state(env)["gaps"]
+    assert payload(env, "trump.summary")["at_least"] is True
+
+
+def test_trump_first_success_with_a_feed_older_than_48_hours_is_not_at_least(env):
+    """T3b：剛上線，feed 最舊的 item 已經超過 48 小時 → 整個視窗都涵蓋到了，不標「（至少）」；
+    48 小時都沒新貼文（feed 整份都比視窗舊）也一樣，之後第一則新貼文進來不會被誤判成有缺口。"""
+    a = trump_post(0, T0_TRUMP - timedelta(hours=60), "Iran talks")
+    b = trump_post(1, T0_TRUMP - timedelta(hours=30), "Tariffs")
+    c = trump_post(2, T0_TRUMP - timedelta(hours=1), "Fed must cut")
+    trump_feed(env, [c, b, a])
+    assert run(make_ctx(env, T0_TRUMP.timestamp()), "trump.feed") == "ok"
+    assert payload(env, "trump.summary")["at_least"] is False and trump_state(env)["gaps"] == []
+    assert payload(env, "trump.summary")["topics"] == {"fed": 1, "tariff": 1}
+
+
+def test_trump_quiet_for_48_hours_does_not_mark_a_gap_when_the_next_post_arrives(env):
+    older, old = trump_post(0, T0_TRUMP - timedelta(hours=90), "Iran talks"), trump_post(1, T0_TRUMP - timedelta(hours=60), "Tariffs")
+    fresh = trump_post(2, T0_TRUMP + timedelta(hours=1), "Fed must cut")
+    feed = trump_feed(env, [old, older])
+    assert run(make_ctx(env, T0_TRUMP.timestamp()), "trump.feed") == "ok"
+    assert payload(env, "trump.summary")["at_least"] is False and payload(env, "trump.summary")["posts"] == 0
+    assert trump_state(env)["last_newest"] == old[1].timestamp()
+    feed["posts"] = [fresh, old, older]  # 舊的 item 還在 feed 裡：前後接得上
+    assert run(make_ctx(env, (T0_TRUMP + timedelta(hours=2)).timestamp()), "trump.feed") == "ok"
+    assert trump_state(env)["gaps"] == [] and payload(env, "trump.summary")["at_least"] is False
+    assert payload(env, "trump.summary")["topics"] == {"fed": 1}
+
+
+def test_trump_feed_of_only_image_posts_still_updates_the_coverage(env):
+    """T3c：整份 feed 都是只有圖的貼文（沒有一則進 posts）時，缺口紀錄照樣更新，下一輪不會誤判成有缺口。"""
+    m1, m2 = trump_post(0, T0_TRUMP - timedelta(hours=2)), trump_post(1, T0_TRUMP - timedelta(hours=1))
+    m3 = trump_post(2, T0_TRUMP + timedelta(minutes=10))
+    feed = trump_feed(env, [m2, m1])
+    assert run(make_ctx(env, T0_TRUMP.timestamp()), "trump.feed") == "ok"
+    assert payload(env, "trump.summary")["posts"] == 0
+    assert trump_state(env)["last_newest"] == m2[1].timestamp() and trump_state(env)["gaps"] == [[None, m1[1].timestamp()]]
+    feed["posts"] = [m3, m2, m1]
+    assert run(make_ctx(env, (T0_TRUMP + timedelta(minutes=30)).timestamp()), "trump.feed") == "ok"
+    assert trump_state(env)["last_newest"] == m3[1].timestamp() and trump_state(env)["gaps"] == [[None, m1[1].timestamp()]]

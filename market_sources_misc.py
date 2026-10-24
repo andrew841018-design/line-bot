@@ -8,7 +8,8 @@ trumpstruth.org 的 RSS；期中選舉看預測市場（Polymarket、Kalshi）�
 呼叫 `market_http.fetch`、再交給解析）。規則（PLAN §3.1、§3.3、§18.8、§18.14、§19.1、§19.2）：
 - 宏觀：Yahoo spark 每天 1 次（11 個代號、range=1mo）；日期用交易所時區換算，晚於資料日 D 的列丟掉
   （期貨、匯率幾乎 24 小時交易，最後一根可能是下一個交易日還沒收完）。Yahoo 失敗改代理：ETF 走 Nasdaq
-  日線、BTC 走 Coinbase、台幣走期交所匯率（market_sources_tw）；MOVE 沒有代理。
+  日線（BTC 用現貨比特幣 ETF 的 IBIT，Coinbase 在台灣被封鎖，2026-10-23 拿掉）、台幣走期交所匯率
+  （market_sources_tw）；MOVE 沒有代理。
 - 新聞：Google News RSS（zh-TW）；pubDate 超過 36 小時或解析不到不列；標題去掉「 - 來源」、來源另存。
 - 川普原文：只認 namespace URI、不認前綴；貼文 ID／網址取 item 的直接子元素 `truth:originalId`、
   `truth:originalUrl`（`archive:reference` 裡的是被引用的那則）；本人文字＝description 去掉 blockquote、
@@ -16,6 +17,7 @@ trumpstruth.org 的 RSS；期中選舉看預測市場（Polymarket、Kalshi）�
   完整的本人文字（單獨的 deal／market／stock／rate／war 不算）。job 依 originalId 累積 48 小時。
 - 預測市場：只看固定的市場 id／ticker，並核對它還是「民主黨」那一邊；佔位市場（沒結束卻沒有
   outcomePrices、Party A/B）不收；買賣價中間值與最後成交價分開給；Kalshi 沒有成交時間。
+  （2026-10-23 起台灣封鎖這兩個網站，job 不抓：見 PREDICTION_MARKETS_BLOCKED；解析函式留著。）
 - 外部字串（新聞標題、來源名、川普摘錄、預測市場名稱）出這個模組前先清洗，清洗不過整則丟掉。
 - XML 只用標準庫 ElementTree；看到 `<!DOCTYPE`／`<!ENTITY` 直接拒收。
 
@@ -77,14 +79,13 @@ class Endpoint:
 ENDPOINTS: dict[str, Endpoint] = {
     # Andrew：Yahoo 每天 1 次，失敗就改代理、不重打
     "yahoo_spark": Endpoint("query1.finance.yahoo.com", ("json",), 1 << 20, 86_400, 1, 0),
-    # PLAN §18.9：BTC 每 2 小時另抓（stale_after＝抓取＋6 小時）
-    "coinbase_spot": Endpoint("api.coinbase.com", ("json",), 16 << 10, 7_200, 1, 0),
     # PLAN §19.2：美股、台股 30 分鐘，伊朗一小時
     "gnews.us": Endpoint("news.google.com", ("xml",), 2 << 20, 1_800, 1, 0),
     "gnews.tw": Endpoint("news.google.com", ("xml",), 2 << 20, 1_800, 1, 0),
     "gnews.iran": Endpoint("news.google.com", ("xml",), 2 << 20, 3_600, 1, 0),
     "trumpstruth": Endpoint("www.trumpstruth.org", ("xml",), 2 << 20, 1_800, 1, 0),
-    # 預測市場每 2 小時（PLAN §3.3）
+    # 預測市場每 2 小時（PLAN §3.3）。2026-10-23 起封鎖中（PREDICTION_MARKETS_BLOCKED）：這四個不會被呼叫，
+    # 主機也不在 market_http.ALLOWED_HOSTS 裡；表留著，解除封鎖時預算、網址檢查不用重寫
     "polymarket.house": Endpoint("gamma-api.polymarket.com", ("json",), 1 << 20, 7_200, 1, 0),
     "kalshi.house": Endpoint("api.elections.kalshi.com", ("json",), 256 << 10, 7_200, 1, 0),
     "polymarket.senate": Endpoint("gamma-api.polymarket.com", ("json",), 1 << 20, 7_200, 1, 0),
@@ -92,7 +93,6 @@ ENDPOINTS: dict[str, Endpoint] = {
 }
 
 YAHOO_SPARK_URL = "https://query1.finance.yahoo.com/v7/finance/spark?symbols={symbols}&range=1mo&interval=1d"
-COINBASE_SPOT_URL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
 GOOGLE_NEWS_URL = "https://news.google.com/rss/search?q={query}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
 # 不帶 www 的網址會 301 到這裡，market_http 不跟轉址
 TRUMPSTRUTH_URL = "https://www.trumpstruth.org/feed"
@@ -113,20 +113,21 @@ YAHOO_MACRO: dict[str, str] = {
     "IXIC": "^IXIC",
     "MOVE": "^MOVE",
 }
-# BTC 改 Coinbase、台幣改期交所匯率（market_sources_tw）、MOVE 只有 Yahoo；金銀用 GLD／SLV（LBMA 403）
+# 台幣改期交所匯率（market_sources_tw）、MOVE 只有 Yahoo；金銀用 GLD／SLV（LBMA 403）；BTC 用現貨比特幣 ETF 的
+# IBIT（2026-10-23：Coinbase 在台灣被封鎖，Yahoo 的 spark 又常回 429；卡上只寫 IBIT 的單日漲跌幅，不把 ETF 股價當 BTC 價格）
 PROXY_ETF: dict[str, str] = {
     "DXY": "UUP",
     "WTI": "USO",
     "BRENT": "BNO",
     "GOLD": "GLD",
     "SILVER": "SLV",
+    "BTC": "IBIT",
     "RUT": "IWM",
     "DJI": "DIA",
     "IXIC": "ONEQ",
 }
 _PROXY_SYMBOLS = frozenset(PROXY_ETF.values())
 SOURCE_YAHOO = "Yahoo"
-SOURCE_COINBASE = "Coinbase"
 
 NEWS_QUERIES: dict[str, str] = {"us": "美股", "tw": "台股", "iran": "伊朗"}
 
@@ -157,6 +158,15 @@ class TrumpPost:
     post_type: str
     removed: bool
     topics: tuple[str, ...] = ()  # 用完整的本人文字比對（摘錄只有前 100 字，會漏）
+
+
+@dataclass(frozen=True)
+class FeedSpan:
+    """整份 trumpstruth feed（過濾前）的時間範圍；界線和 `_within` 一樣（2026-10-23 審查 r7b F1）。"""
+
+    oldest: datetime  # 視窗內（now − 48 小時 ～ now + FUTURE_SKEW）最舊的一則；視窗內一則都沒有時＝newest
+    newest: datetime  # 沒有晚於 now + FUTURE_SKEW 的最新一則（任何年紀）
+    reaches_back: bool  # feed 裡還有比視窗起點更舊的 item：這一份 feed 自己就涵蓋了整個 48 小時
 
 
 @dataclass(frozen=True)
@@ -198,6 +208,15 @@ PREDICTION_MARKETS: tuple[PredictionMarket, ...] = (
     PredictionMarket("polymarket.senate", "polymarket", "which-party-will-win-the-senate-in-2026", "562793", "Democratic Party"),
     PredictionMarket("kalshi.senate", "kalshi", "CONTROLS-2026", "CONTROLS-2026-D", "Democratic Party"),
 )
+
+# 2026-10-23：台灣的 ISP 從 2026-10-21 晚上起，依法院命令（公職人員選舉罷免法的刑事裁定）封鎖 Polymarket 和
+# Kalshi（還有 Coinbase）：DNS 把主機導到封鎖頁，之後每次抓取都在 TLS 驗證失敗（kind=network），election.* 任務
+# 一直失敗、卡上只剩「暫缺」。不能繞過封鎖（不改 DNS、不寫死 IP、不走 proxy／VPN），所以這兩個來源整個停掉：
+# election.* 任務永遠不到期（market_pipeline_misc）、兩個主機不在 market_http.ALLOWED_HOSTS、卡上固定寫明被封鎖
+# （publish 在選舉列寫 blocked，market_dashboard 顯示固定句）。解析函式、PREDICTION_MARKETS、ENDPOINTS 都留著。
+# TODO(Andrew)：期中選舉這一段要整段拿掉，還是換成合法的來源（例如民調）？決定前維持現狀。
+# 改回 False 之前要先把兩個主機加回 market_http.ALLOWED_HOSTS（只改這個值，任務會以 kind=host 失敗）。
+PREDICTION_MARKETS_BLOCKED = True
 
 # ── 外部字串清洗（PLAN §19.1） ──────────────────────────────────────────────────
 _DROP_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"})
@@ -453,7 +472,7 @@ def fetch_yahoo_spark(
     return parse_yahoo_spark(_get("yahoo_spark", url, http, ledger), through=through)
 
 
-# ── 代理：Nasdaq ETF 日線、Coinbase ─────────────────────────────────────────────
+# ── 代理：Nasdaq ETF 日線 ────────────────────────────────────────────────────────
 def _closes(pairs: list[tuple[date, float]], through: Optional[date]) -> list[tuple[date, float]]:
     by_day: dict[date, float] = {}
     for day, close in pairs:
@@ -505,26 +524,6 @@ def fetch_proxy_bars(
         if isinstance(day, date) and not isinstance(day, datetime) and close is not None and close > 0:
             pairs.append((day, close))
     return _closes(pairs, end)
-
-
-def parse_coinbase_spot(payload: Any) -> float:
-    """Coinbase `/v2/prices/BTC-USD/spot` → 美元價格。"""
-    data = _as_json(payload)
-    body = data.get("data") if isinstance(data, dict) else None
-    if not isinstance(body, dict):
-        raise ParseError("format")
-    if "amount" not in body or "base" not in body or "currency" not in body:
-        raise ParseError("missing_field")
-    if body.get("base") != "BTC" or body.get("currency") != "USD":
-        raise ParseError("conflict")
-    value = _decimal(body.get("amount"))
-    if value is None or value <= 0:
-        raise ParseError("format")
-    return value
-
-
-def fetch_coinbase_spot(*, http: Any = None, ledger: Any = None) -> float:
-    return parse_coinbase_spot(_get("coinbase_spot", COINBASE_SPOT_URL, http, ledger))
 
 
 # ── Google News RSS ──────────────────────────────────────────────────────────
@@ -806,13 +805,21 @@ def fetch_trumpstruth(
     return parse_trumpstruth_rss(_get("trumpstruth", TRUMPSTRUTH_URL, http, ledger), now, include_removed=include_removed)
 
 
-def trumpstruth_feed_span(xml: Any) -> tuple[datetime, datetime]:
-    """整份 feed（過濾前）最舊與最新一則的 pubDate（UTC）。
+def trumpstruth_feed_span(xml: Any, now: Any) -> FeedSpan:
+    """整份 feed（過濾前）的時間範圍：視窗內最舊一則、最新一則（pubDate，UTC），以及 feed 有沒有比視窗更舊的 item。
 
     PLAN §18.14 要比「這輪最舊一則」和「上輪成功時最新一則」判斷中間有沒有漏（卡上標「（至少）」）；
-    parse_trumpstruth_rss 已經濾掉只有媒體、移除、超過 48 小時的，不能拿它的最舊一則來比。
+    parse_trumpstruth_rss 已經濾掉只有媒體、移除、超過 48 小時的，不能拿它的最舊一則來比，所以這裡看整份 feed。
     只算 originalId 與 pubDate 都有效的 item；一則都沒有就丟 ParseError("format")。
+
+    時間界線和 parse_trumpstruth_rss 的 `_within` 一樣（2026-10-23 審查 r7b F1：f78d5de 改看整份 feed 時把界線也拿掉了）：
+    - 晚於 now + FUTURE_SKEW 的是來源打錯時間，整則不算（不然 job 的 last_newest 被拉到未來、只增不減，
+      之後真的缺口再也標不出來）；每一則都在未來就丟 ParseError("date")。
+    - 比 now − 48 小時舊的不算進 oldest（置頂或被移除的空殼用原始時間，會讓最舊一則看起來比上輪最新還舊、
+      蓋掉真的缺口），只記 reaches_back：feed 比視窗起點還舊，代表這一份自己就涵蓋了整個視窗（剛上線或睡了
+      很久之後，不必標「（至少）」）。視窗內的只有圖的貼文照算，這是 f78d5de 要的。
     """
+    now_utc = _as_utc(now)
     stamps: list[datetime] = []
     for item in _rss_items(xml):
         original_id = _child_text(item, _TAG_ORIGINAL_ID)
@@ -821,7 +828,13 @@ def trumpstruth_feed_span(xml: Any) -> tuple[datetime, datetime]:
             stamps.append(published)
     if not stamps:
         raise ParseError("format")
-    return min(stamps), max(stamps)
+    start = now_utc - timedelta(hours=TRUMP_WINDOW_H)
+    usable = [stamp for stamp in stamps if stamp <= now_utc + FUTURE_SKEW]
+    if not usable:
+        raise ParseError("date")
+    inside = [stamp for stamp in usable if _within(stamp, now_utc, TRUMP_WINDOW_H)]
+    newest = max(usable)
+    return FeedSpan(min(inside) if inside else newest, newest, any(stamp < start for stamp in usable))
 
 
 def fetch_trumpstruth_with_span(
@@ -830,10 +843,10 @@ def fetch_trumpstruth_with_span(
     http: Any = None,
     ledger: Any = None,
     include_removed: bool = False,
-) -> tuple[list[TrumpPost], tuple[datetime, datetime]]:
+) -> tuple[list[TrumpPost], FeedSpan]:
     """一次請求同時回貼文與整份 feed 的時間範圍（給 job 判斷缺口）。"""
     body = _get("trumpstruth", TRUMPSTRUTH_URL, http, ledger)
-    return parse_trumpstruth_rss(body, now, include_removed=include_removed), trumpstruth_feed_span(body)
+    return parse_trumpstruth_rss(body, now, include_removed=include_removed), trumpstruth_feed_span(body, now)
 
 
 # ── 川普貼文主題（PLAN §3.3 片語表） ─────────────────────────────────────────────

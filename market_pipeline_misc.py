@@ -1,5 +1,5 @@
-"""市場盤勢（/盤勢，2026-10-17）雜項的 collect 任務：宏觀（Yahoo 為主、失敗改代理）、BTC、新聞、川普原文、
-期中選舉預測市場。
+"""市場盤勢（/盤勢，2026-10-17）雜項的 collect 任務：宏觀（Yahoo 為主、失敗改代理，BTC 也在裡面）、新聞、
+川普原文、期中選舉預測市場（2026-10-23 起台灣封鎖，不抓）。
 
 Andrew 2026-10-17 的要求（DECISIONS.md）：宏觀「有 yahoo 用 yahoo，沒有的情況改代理」；川普／伊朗事件、
 季節性、期中選舉「你再試試看，truth social or....，我覺得可以做到」——能程式化的都做進來。這個模組只負責
@@ -7,19 +7,26 @@ Andrew 2026-10-17 的要求（DECISIONS.md）：宏觀「有 yahoo 用 yahoo，�
 
 規則（PLAN §3.1、§3.3、§9、§18.8、§18.9、§18.14、§19.1、§19.2；INTERFACES §3 C、§9）：
 - 宏觀：D＝最近一個美東收盤＋30 分鐘已過的交易日；Yahoo spark 每個 D 只打 1 次（不重打）。Yahoo 失敗、
-  429、冷卻 → 代理：美元 UUP、WTI USO、Brent BNO、金 GLD、銀 SLV、羅素 2000 IWM、道瓊 DIA、Nasdaq 綜合
-  ONEQ（Nasdaq ETF 日線）、台幣＝期交所 USD/NTD（market_pipeline_tw 每天抓的 `tw.fx`，沒有才自己抓；標「代理：期交所匯率」）；
-  MOVE 只有 Yahoo（失敗就記失敗、留著舊值）；BTC 的主來源本來就是 Coinbase 每 2 小時（§18.9），Yahoo 的 BTC
-  只是備援（另存 `macro.BTC.yahoo`）。Yahoo 只少了某幾個代號時，只有那幾個改代理。每格存實際來源字樣
-  （「Yahoo」「ETF 代理：UUP」「期交所匯率」）。所有日線丟掉晚於 D 的列；代理回應沒有 D 那根就 30 分鐘後
-  再抓一次。日變化只在前一筆的日期＝前一個交易日時才算（§18.8）。
+  429、冷卻 → 代理：美元 UUP、WTI USO、Brent BNO、金 GLD、銀 SLV、BTC IBIT（現貨比特幣 ETF）、羅素 2000 IWM、
+  道瓊 DIA、Nasdaq 綜合 ONEQ（Nasdaq ETF 日線）、台幣＝期交所 USD/NTD（market_pipeline_tw 每天抓的 `tw.fx`，
+  沒有才自己抓；標「代理：期交所匯率」）；MOVE 只有 Yahoo（失敗就記失敗、留著舊值）。Yahoo 只少了某幾個代號時，
+  只有那幾個改代理。每格存實際來源字樣（「Yahoo」「ETF 代理：UUP」「期交所匯率」）。所有日線丟掉晚於 D 的列。
+  日變化只在前一筆的日期＝前一個交易日時才算（§18.8）。
+  ETF 代理（2026-10-23）要等 Nasdaq 日線端點公布 D 才去抓：SPY 在 closes 表有 D 的正式列（market_pipeline_us
+  一直在追它，不算 CBOE 的 provisional）之後，每個代理抓一次；還沒有 D 那根就每小時再抓，最多再 3 次。原本 D 換日
+  就開打、30 分鐘後放棄，但 Nasdaq 要幾個小時後才公布 D，代理整天落後一天。台幣（期交所匯率）：tw.fx 的資料日比
+  卡上的台幣新時隨時重算，不必等下一個 D。
+  BTC（2026-10-23）和其他格一樣走這條路、存 `macro.BTC`：原本 Coinbase 每 2 小時那條（§18.9、macro.btc 任務）
+  拿掉了，因為 api.coinbase.com 在台灣被封鎖。
 - 新聞：Google News RSS 美股、台股每 30 分鐘，伊朗每小時；pubDate 超過 36 小時、解析不到或在未來的不列；
   news.google.com 回 503 也算限流（market_http 會讓該主機冷卻 2 小時），冷卻期間不排。
 - 川普原文：trumpstruth RSS 每 30 分鐘，依 originalId 累積進 Store（移除的也寫回去，之前累積到的那則才
   會被拿掉），從累積資料算近 48 小時的主題則數；這輪最舊一則比上輪最新一則還新（中間有缺口）或剛上線、
-  涵蓋不到 48 小時 → 標「（至少）」（§18.14）。
+  涵蓋不到 48 小時 → 標「（至少）」（§18.14）。最舊與最新一則套和 parse 一樣的時間界線（2026-10-23）：
+  未來的 item 不算、比視窗舊的只當「這份 feed 涵蓋到視窗之前」。
 - 期中選舉：market_sources_misc.PREDICTION_MARKETS 裡固定的市場（Polymarket、Kalshi 的眾院與參院）各一個任務、
-  每 2 小時；結果出來後每天看一次、顯示 7 天後不再抓。
+  每 2 小時；結果出來後每天看一次、顯示 7 天後不再抓。2026-10-23 起台灣封鎖這兩個網站：
+  market_sources_misc.PREDICTION_MARKETS_BLOCKED 為真時這些任務永遠不到期（一個請求都不送）。
 - 外部字串（標題、來源名、川普摘錄、預測市場名稱）存之前一律再過 `market_calc.clean_external`。
 
 obs 鍵（market_publish 讀；payload 全是 JSON 值、日期一律 ISO 字串）見下方 `OBS_*` 常數。
@@ -38,10 +45,8 @@ import market_tasks
 UTC = timezone.utc
 
 # ── 存放位置（market_publish 讀這些名字；要改兩邊一起改） ─────────────────────────────────
-OBS_MACRO_PREFIX = "macro."  # ＋DXY／WTI／BRENT／GOLD／SILVER／RUT／DJI／IXIC／MOVE／USDTWD：
+OBS_MACRO_PREFIX = "macro."  # ＋DXY／WTI／BRENT／GOLD／SILVER／BTC／RUT／DJI／IXIC／MOVE／USDTWD：
 #   {"value","chg"|None,"chg_pct"|None,"date","prev_date"|None,"source","symbol","bars": [[iso, 收盤], …]}
-OBS_BTC = "macro.BTC"  # Coinbase 每 2 小時：{"value","source":"Coinbase","fetched_utc"}
-OBS_BTC_YAHOO = "macro.BTC.yahoo"  # Yahoo 的 BTC 日線（只當備援），格式同其他 macro
 OBS_NEWS_PREFIX = "news."  # ＋us／tw／iran：{"items": [{"title","source","published_utc"}],"fetched_utc"}
 OBS_TRUMP_SUMMARY = "trump.summary"  # {"window_h","topics": {代號: 則數},"labels","posts","matched","latest_utc","at_least"}
 OBS_TRUMP_POSTS = "trump.posts"  # {"items": [{"id","published_utc","text","topics","quoted_author"}]}（細節頁）
@@ -50,19 +55,20 @@ POSTS_TRUMP = "trump"  # store.upsert_posts 的 kind
 
 SOURCE_FX = "代理：期交所匯率"  # Yahoo 的 TWD=X 拿不到時的代理（market_dashboard 看到「代理」就標「（代理）」）
 OBS_TW_FX = "tw.fx"  # market_pipeline_tw.OBS_FX（不 import 那個模組：只載入本模組時不該順便登記台股任務）
-MACRO_OBS_KEY = {"BTC": "BTC.yahoo"}  # Yahoo 代號鍵 → obs 鍵（BTC 的主格給 Coinbase）
 
 # ── 任務名稱與排程 ───────────────────────────────────────────────────────────────────
 TASK_MACRO = "macro.yahoo"
-TASK_BTC = "macro.btc"
 TASK_TRUMP = "trump.feed"
 NEWS_TOPICS = ("us", "tw", "iran")
 STATE_PREFIX = "misc.pipe:"
 NOT_YET, PARTIAL = market_tasks.NOT_YET, market_tasks.PARTIAL
 
 PROXY_LOOKBACK_DAYS = 45  # 代理日線抓多長：日變化只要前一筆，多抓一點給 publish 看走勢
-PROXY_RETRY_S = 1800.0  # 代理回應沒有 D 那根：30 分鐘後再抓一次
-PROXY_RETRIES = 1
+# 2026-10-23：ETF 代理要等 SPY 有 D 的正式列才抓（見 _nasdaq_has_d），所以第一次就該抓得到；萬一那個代理還是沒有 D 那根，
+# 每小時再抓一次、最多再 3 次（每個代理每個 D 最多 4 個請求）。原本是 30 分鐘、1 次，剛開打就放棄。
+PROXY_RETRY_S = 3600.0
+PROXY_RETRIES = 3
+GATE_SYMBOL = "SPY"  # Nasdaq 日線端點公布 D 了沒，看 market_pipeline_us 一直在追的 SPY
 BARS_KEEP = 25
 RETRY_AFTER_FAIL_S = 1800.0  # 固定間隔的來源失敗後多久再試（帳本冷卻另外算）
 COOLDOWN_S = 7200.0  # 429／403（Google News 另加 503）之後，和 market_http 的冷卻一樣長
@@ -70,11 +76,12 @@ NEWS_MAX_AGE_H = 36.0
 NEWS_FUTURE_SKEW = timedelta(minutes=5)
 NEWS_KEEP = 15
 TRUMP_WINDOW_H = 48.0
+TRUMP_FUTURE_SKEW_S = 300.0  # 和 market_sources_misc.FUTURE_SKEW（5 分鐘）一樣：比這更未來的 last_newest 不可能是真的
 TRUMP_POSTS_KEEP = 20
 TRUMP_GAPS_KEEP = 20
 ELECTION_RESOLVED_EVERY_S = 86400.0
 ELECTION_SHOW_RESULT_S = 7 * 86400.0
-_DEFAULT_EVERY_S = {"coinbase_spot": 7200, "gnews.us": 1800, "gnews.tw": 1800, "gnews.iran": 3600, "trumpstruth": 1800}
+_DEFAULT_EVERY_S = {"gnews.us": 1800, "gnews.tw": 1800, "gnews.iran": 3600, "trumpstruth": 1800}
 _RATE_LIMIT_KINDS = frozenset({"rate_limited", "blocked"})
 
 
@@ -251,25 +258,89 @@ def macro_payload(bars: Any, d: date, cal: Any, source: str, symbol: str) -> Opt
 
 
 def _macro_obs(key: str) -> str:
-    return OBS_MACRO_PREFIX + MACRO_OBS_KEY.get(key, key)
+    return OBS_MACRO_PREFIX + key
+
+
+def _nasdaq_has_d(ctx: Any, d: date) -> bool:
+    """Nasdaq 日線端點公布 D 那天的正式收盤了嗎？ETF 代理和 SPY 走同一個端點，D 那列要收盤後好幾個小時才出現
+    （2026-10-23 實測：04:43 打、30 分鐘後放棄，8 列代理整天停在前一個交易日）。看 SPY 在 closes 表有沒有 D 的
+    正式列——CBOE 的 provisional 不算，它不代表 Nasdaq 公布了。有了才去抓代理，不必盲目探測。"""
+    try:
+        return any(row[0] == d and not row[4] for row in ctx.store.closes("us", GATE_SYMBOL, since=d))
+    except Exception:  # noqa: BLE001 - 讀不到就當還沒有：這輪不打，下一輪再看
+        return False
+
+
+def _tw_fx_pairs(ctx: Any) -> Optional[list[tuple[date, float]]]:
+    """market_pipeline_tw 存的期交所匯率（tw.fx）→ [(日期, USD/NTD)]；沒有這筆 obs 回 None。"""
+    obs = ctx.store.get_obs(OBS_TW_FX) or {}
+    payload = obs.get("payload") if isinstance(obs.get("payload"), dict) else None
+    if payload is None:
+        return None
+    pairs: list[tuple[date, float]] = []
+    for day_key, value_key in (("prev_date", "prev_usd_ntd"), ("date", "usd_ntd")):
+        day, value = payload.get(day_key), payload.get(value_key)
+        if isinstance(day, str) and isinstance(value, (int, float)) and not isinstance(value, bool):
+            try:
+                pairs.append((date.fromisoformat(day), float(value)))
+            except ValueError:
+                continue
+    return pairs
+
+
+def _usdtwd_behind(ctx: Any, d: date) -> bool:
+    """tw.fx 的資料日（≤D）比卡上 macro.USDTWD 那格新嗎？期交所的匯率檔台北早上才更新、market_pipeline_tw 隔一陣子
+    才讀到，這時宏觀任務早就在 D 換日那一刻讀過舊的 tw.fx 了（2026-10-23：台幣停在前一天）。只重算期交所代理的那格
+    （Yahoo 的 TWD=X 不看 tw.fx）；只讀 obs，不送請求。"""
+    pairs = _tw_fx_pairs(ctx)
+    candidate = macro_payload(pairs, d, ctx.tw_cal, SOURCE_FX, "USD/NTD") if pairs else None
+    if candidate is None:
+        return False
+    current = (ctx.store.get_obs(_macro_obs("USDTWD")) or {}).get("payload")
+    if not isinstance(current, dict):
+        return True  # 卡上還沒有這格，tw.fx 有了就補上
+    if current.get("source") != SOURCE_FX:
+        return False
+    try:
+        current_day = date.fromisoformat(current.get("date"))
+    except (TypeError, ValueError):
+        return True
+    return candidate[1] > current_day
 
 
 def macro_plan(ctx: Any) -> Optional[dict]:
-    """這輪宏觀要做什麼：新的 D → 先打 Yahoo；同一個 D 還有代理在等 D 那根 → 只重抓那幾個。"""
+    """這輪宏觀要做什麼：新的 D → 先打 Yahoo；同一個 D 還有代理在等 → 只抓那幾個（ETF 代理等 Nasdaq 公布 D、
+    沒有 D 那根的每小時再抓）；tw.fx 比卡上的台幣新 → 重算台幣。"""
     d = us_session_d(ctx)
     if d is None:
         return None
     state = _state(ctx.store, TASK_MACRO)
     if state.get("d") != d.isoformat():
         return {"d": d, "yahoo": True, "keys": []}
-    pending = state.get("pending") or {}
-    ready = [
-        key
-        for key, info in sorted(pending.items())
-        if int(info.get("tries", 0)) <= PROXY_RETRIES
-        and not (isinstance(info.get("last"), (int, float)) and ctx.now - float(info["last"]) < PROXY_RETRY_S)
-    ]
-    return {"d": d, "yahoo": False, "keys": ready} if ready else None
+    misc = _misc()
+    pending = {key: dict(info) for key, info in (state.get("pending") or {}).items() if isinstance(info, dict)}
+    # 2026-10-23：BTC 以前不走代理（主格是 Coinbase），部署時這個 D 的紀錄裡 BTC 既沒有來源、也不在 pending：
+    # 當成還沒試過，補抓一次（之後每個代理鍵一定是「有來源」或「在 pending」）
+    sources = state.get("sources") or {}
+    for key in misc.PROXY_ETF:
+        if key not in sources and key not in pending:
+            pending[key] = {"tries": 0}
+    gate: Optional[bool] = None  # 要用到才查（SPY 有沒有 D 的正式列）
+    ready = []
+    for key, info in sorted(pending.items()):
+        last = info.get("last")
+        if int(info.get("tries", 0)) > PROXY_RETRIES or (
+            isinstance(last, (int, float)) and ctx.now - float(last) < PROXY_RETRY_S
+        ):
+            continue
+        if key in misc.PROXY_ETF:
+            gate = _nasdaq_has_d(ctx, d) if gate is None else gate
+            if not gate:
+                continue
+        ready.append(key)
+    if "USDTWD" not in ready and _usdtwd_behind(ctx, d):
+        ready.append("USDTWD")
+    return {"d": d, "yahoo": False, "keys": sorted(ready)} if ready else None
 
 
 def _put_macro(ctx: Any, key: str, result: Optional[tuple[dict, date]]) -> Optional[date]:
@@ -321,6 +392,7 @@ def _run_proxies(ctx: Any, d: date, keys: list[str], state: dict) -> Optional[st
     sources: dict = state.setdefault("sources", {})
     yahoo_kind = str(state.get("yahoo") or "unavailable")
     missing = False
+    gate: Optional[bool] = None  # Nasdaq 公布 D 了沒（只有 ETF 代理要看；台幣不走 Nasdaq）
     for index, key in enumerate(keys):
         if ctx.should_stop():  # 剩下的下一輪再來（不算一次）
             for rest in keys[index:]:
@@ -328,12 +400,17 @@ def _run_proxies(ctx: Any, d: date, keys: list[str], state: dict) -> Optional[st
             return PARTIAL
         obs_id = _macro_obs(key)
         record = pending.get(key) or {"tries": 0}
-        if key == "MOVE" or key == "BTC":
-            # MOVE 沒有代理；BTC 的主格是 Coinbase 每 2 小時那筆（macro.BTC），這裡只記 Yahoo 備援失敗
+        if key == "MOVE":  # MOVE 沒有代理：只記 Yahoo 失敗、留著舊值（BTC 有 IBIT 代理，2026-10-23）
             ctx.store.obs_checked(obs_id, error_kind=_obs_kind(yahoo_kind))
             pending.pop(key, None)
-            missing = missing or key == "MOVE"
+            missing = True
             continue
+        if key in misc.PROXY_ETF:
+            gate = _nasdaq_has_d(ctx, d) if gate is None else gate
+            if not gate:  # Nasdaq 還沒公布 D：先不打，等 SPY 有 D 的正式列（macro_plan 每輪看），這不算一次
+                pending.setdefault(key, {"tries": 0})
+                missing = True
+                continue
         try:
             if key == "USDTWD":
                 result = _usdtwd_proxy(ctx, d)
@@ -359,7 +436,7 @@ def _run_proxies(ctx: Any, d: date, keys: list[str], state: dict) -> Optional[st
             ctx.store.obs_checked(obs_id, error_kind="empty")
         else:
             sources[key] = label
-        if got is None or got < d:  # 沒有 D 那根：30 分鐘後再抓一次
+        if got is None or got < d:  # 沒有 D 那根：每小時再抓一次（PROXY_RETRY_S、PROXY_RETRIES）
             pending[key] = {"tries": int(record.get("tries", 0)) + 1, "last": float(ctx.now)}
             missing = True
         else:
@@ -373,18 +450,9 @@ def _obs_kind(kind: str) -> str:
 
 def _usdtwd_proxy(ctx: Any, d: date) -> Optional[tuple[dict, date]]:
     """台幣代理：先用 market_pipeline_tw 存的期交所匯率（tw.fx），沒有才自己抓一次。"""
-    obs = ctx.store.get_obs(OBS_TW_FX) or {}
-    payload = obs.get("payload") if isinstance(obs.get("payload"), dict) else None
-    pairs: list[tuple[date, float]] = []
-    if payload is not None:
-        for day_key, value_key in (("prev_date", "prev_usd_ntd"), ("date", "usd_ntd")):
-            day, value = payload.get(day_key), payload.get(value_key)
-            if isinstance(day, str) and isinstance(value, (int, float)) and not isinstance(value, bool):
-                try:
-                    pairs.append((date.fromisoformat(day), float(value)))
-                except ValueError:
-                    continue
-    else:
+    pairs = _tw_fx_pairs(ctx)
+    if pairs is None:
+        pairs = []
         import market_sources_tw  # noqa: PLC0415
 
         row = _call(ctx, market_sources_tw.fetch_taifex_fx)
@@ -396,25 +464,6 @@ def _usdtwd_proxy(ctx: Any, d: date) -> Optional[tuple[dict, date]]:
 
 def _macro_due(ctx: Any) -> bool:
     return macro_plan(ctx) is not None
-
-
-# ── BTC（Coinbase 每 2 小時） ─────────────────────────────────────────────────────────
-def _btc_due(ctx: Any) -> bool:
-    return interval_due(_state(ctx.store, TASK_BTC), float(ctx.now), _every("coinbase_spot"))
-
-
-def _btc_run(ctx: Any) -> Optional[str]:
-    value, status = _fetch_once(ctx, TASK_BTC, (OBS_BTC,), _misc().fetch_coinbase_spot)
-    if status is not None:
-        return status
-    price = _finite_positive(value)
-    if price is None:
-        ctx.store.obs_checked(OBS_BTC, error_kind="format")
-        return PARTIAL
-    now_utc = _now_utc(ctx)
-    payload = {"value": price, "chg": None, "chg_pct": None, "source": _misc().SOURCE_COINBASE, "fetched_utc": now_utc.isoformat()}
-    ctx.store.put_obs(OBS_BTC, payload, data_date=now_utc.date().isoformat())
-    return None
 
 
 # ── 新聞（Google News RSS） ─────────────────────────────────────────────────────────
@@ -459,19 +508,29 @@ def _news_fns(topic: str) -> tuple[Callable[[Any], bool], Callable[[Any], Option
 
 
 # ── 川普原文（trumpstruth RSS；依 originalId 累積 48 小時） ─────────────────────────────────
-def update_coverage(state: dict, times: list[float], now: float) -> None:
-    """這輪抓到的貼文時間 → 缺口紀錄。剛上線：最舊那則之前都不知道；之後：這輪最舊比上輪最新還新＝中間有缺口。"""
+def update_coverage(state: dict, times: list[float], now: float, *, reaches_back: bool = False) -> None:
+    """這輪抓到的貼文時間 → 缺口紀錄。times＝整份 feed 在時間界線內的最舊與最新一則（market_sources_misc.FeedSpan）。
+
+    上輪最新一則還在 48 小時視窗內：這輪最舊比它還新＝中間有缺口（reaches_back 不採信：一則置頂的舊 item
+    不能把真的缺口蓋掉）。剛上線、或上輪最新一則已經滑出視窗：前後接不上，這一份 feed 要自己涵蓋整個視窗
+    （reaches_back＝feed 還有比視窗起點更舊的 item）；涵蓋不到，最舊那則之前都不知道。（2026-10-23 審查 r7b F1）
+    """
     if not times:
         return
     oldest, newest = min(times), max(times)
+    horizon = now - TRUMP_WINDOW_H * 3600.0
     gaps = [list(gap) for gap in state.get("gaps") or []]
     last_newest = state.get("last_newest")
-    if not isinstance(last_newest, (int, float)):
-        gaps.append([None, oldest])
-    elif oldest > float(last_newest):
-        gaps.append([float(last_newest), oldest])
-    state["last_newest"] = max(newest, float(last_newest)) if isinstance(last_newest, (int, float)) else newest
-    horizon = now - TRUMP_WINDOW_H * 3600.0
+    if isinstance(last_newest, (int, float)) and last_newest <= now + TRUMP_FUTURE_SKEW_S:
+        last_newest = float(last_newest)
+    else:
+        last_newest = None  # 沒有；或是未來的時間（舊版沒擋時間打錯的 item，max() 又不會讓它退回來）：當作還沒成功過
+    if last_newest is not None and last_newest >= horizon:
+        if oldest > last_newest:
+            gaps.append([last_newest, oldest])
+    elif not reaches_back:
+        gaps.append([last_newest, oldest])
+    state["last_newest"] = max(newest, last_newest) if last_newest is not None else newest
     state["gaps"] = [gap for gap in gaps if gap[1] > horizon][-TRUMP_GAPS_KEEP:]
 
 
@@ -559,8 +618,9 @@ def _trump_run(ctx: Any) -> Optional[str]:
         ctx.store.upsert_posts(POSTS_TRUMP, items)
     state = _state(ctx.store, TASK_TRUMP)
     # 缺口用整份 feed（過濾前）的頭尾判斷：只有圖／影片的貼文也在 feed 裡，用過濾後的 items 會誤判成有漏、
-    # 多標「（至少）」（2026-10-18 審查 r6c N1）
-    update_coverage(state, [span[0].timestamp(), span[1].timestamp()], float(ctx.now))
+    # 多標「（至少）」（2026-10-18 審查 r6c N1）；頭尾套了和 parse 一樣的時間界線（未來的不算、太舊的只記
+    # reaches_back），一則時間打錯或置頂的 item 不能讓真的缺口標不出來（2026-10-23 審查 r7b F1）
+    update_coverage(state, [span.oldest.timestamp(), span.newest.timestamp()], float(ctx.now), reaches_back=span.reaches_back)
     _save(ctx.store, TASK_TRUMP, state)
     summary, details = trump_summary(ctx.store, now_utc, state, labels)
     day = now_utc.date().isoformat()
@@ -580,11 +640,32 @@ def election_due(state: dict, now: float, every: float) -> bool:
     return interval_due(state, now, every)
 
 
+def _prediction_blocked() -> bool:
+    """market_sources_misc.PREDICTION_MARKETS_BLOCKED（2026-10-23：台灣封鎖 Polymarket、Kalshi）。
+    只有明確設成 False 才恢復抓取；設成別的值照樣封鎖，一個請求都不送。"""
+    return getattr(_misc(), "PREDICTION_MARKETS_BLOCKED", True) is not False
+
+
+def _retire_failures(ctx: Any, name: str) -> None:
+    """封鎖中的任務不再執行，框架留在 task_state 的連續失敗次數不會自己歸零，每日維護會天天把它當失敗報：
+    第一次看到封鎖時把失敗次數與退避時間清掉一次（只在有東西可清時才寫；清不掉不能讓這輪 collect 出錯）。"""
+    try:
+        state = dict(ctx.store.task_state(name) or {})
+        if state.get("fail_streak") or state.get("next_try") is not None:
+            state.update(fail_streak=0, next_try=None)
+            ctx.store.set_task_state(name, state)
+    except Exception:  # noqa: BLE001
+        return
+
+
 def _election_fns(market: Any) -> tuple[str, Callable[[Any], bool], Callable[[Any], Optional[str]]]:
     name = f"election.{market.key}"
     obs_id = OBS_ELECTION_PREFIX + market.key
 
     def due(ctx: Any) -> bool:
+        if _prediction_blocked():  # 封鎖中：任務留在清單裡，但永遠不到期（不送請求；主機也不在白名單）
+            _retire_failures(ctx, name)
+            return False
         return election_due(_state(ctx.store, name), float(ctx.now), _every_or(market.key, 7200))
 
     def run(ctx: Any) -> Optional[str]:
@@ -631,7 +712,6 @@ def tasks() -> list[market_tasks.Task]:
         due, run = _news_fns(topic)
         out.append(market_tasks.Task(f"news.{topic}", "fast", due, run, 8.0))
     out.append(market_tasks.Task(TASK_TRUMP, "fast", _trump_due, _trump_run, 10.0))
-    out.append(market_tasks.Task(TASK_BTC, "medium", _btc_due, _btc_run, 10.0))
     for market in _prediction_markets():
         name, due, run = _election_fns(market)
         out.append(market_tasks.Task(name, "medium", due, run, 10.0))

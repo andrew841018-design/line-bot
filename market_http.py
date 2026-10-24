@@ -33,17 +33,17 @@ ALLOWED_HOSTS = frozenset(
         "www.federalreserve.gov",
         "query1.finance.yahoo.com",
         "query2.finance.yahoo.com",
-        "api.coinbase.com",
         # 台股
         "www.twse.com.tw",
         "openapi.twse.com.tw",
         "openapi.taifex.com.tw",
         "api.finmindtrade.com",
-        # 新聞、選舉、川普原文
+        # 新聞、川普原文
         "news.google.com",
         "www.trumpstruth.org",
-        "gamma-api.polymarket.com",
-        "api.elections.kalshi.com",
+        # 2026-10-23：api.coinbase.com、gamma-api.polymarket.com、api.elections.kalshi.com 拿掉。台灣的 ISP 從
+        # 10/21 晚上起依法院命令封鎖這三個主機（DNS 改寫到封鎖頁，每次都在 TLS 驗證失敗）；不繞過封鎖，
+        # 所以也不能留在白名單裡等著失敗（見 market_sources_misc.PREDICTION_MARKETS_BLOCKED）。
     }
 )
 
