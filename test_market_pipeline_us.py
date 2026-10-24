@@ -107,6 +107,7 @@ class FakeHttp:
         self.calls: list[tuple[str, str, dict]] = []  # (種類, 代號或鍵, 查詢參數)
         self.prices: dict[str, dict[date, float]] = {}
         self.hist_hook: dict[str, Callable[[date, date], dict[date, float]]] = {}
+        self.hist_raw: dict[str, dict] = {}  # 代號 → 整份 historical 回應（空殼、廠商錯誤；2026-10-23）
         self.fail: dict[str, str] = {}  # 鍵（"hist:SPY"、"hist:*"、"cboe:QQQ"…）→ FetchError kind
         self.chains: dict[str, dict] = {}
         self.quotes: dict[str, dict] = {}
@@ -163,6 +164,8 @@ class FakeHttp:
                 symbol = parts[3]
                 self.calls.append(("hist", symbol, query))
                 self._check_fail(host, f"hist:{symbol}", "hist:*")
+                if symbol in self.hist_raw:
+                    return self.hist_raw[symbol]
                 return self._historical(symbol, query)
             if path == "/api/market-info":
                 self.calls.append(("market-info", "", query))
@@ -307,6 +310,13 @@ def cboe_quote(symbol: str, *, timestamp: str, last_trade: str, close: float = 1
     return {"timestamp": timestamp, "symbol": f"_{symbol}",
             "data": {"symbol": f"^{symbol}", "close": close, "price_change": 3.53, "price_change_percent": 17.6588,
                      "prev_day_close": close, "last_trade_time": last_trade}}
+
+
+def cboe_etf_quote(symbol: str, *, timestamp: str, last_trade: str, close: float) -> dict:
+    """ETF 的 …/quotes/{SYM}.json（照 investigations/freshness_20261023.md 附錄 A 的 QQQ 形狀；VOO 同一型）。"""
+    return {"timestamp": timestamp, "symbol": symbol,
+            "data": {"symbol": symbol, "current_price": close, "price_change": -8.42, "close": close,
+                     "prev_day_close": close, "volume": 6123456, "last_trade_time": last_trade}}
 
 
 def cusip(base8: str) -> str:
@@ -684,12 +694,137 @@ def test_when_no_etf_has_d_constituents_are_not_fetched(env):
     seed(env, "AAA", flat(HISTORY, 50.0))
     env.http.prices["AAA"] = flat(HISTORY + [D], 50.0)
     assert run(env, "us.hist") == "not_yet"
-    assert env.http.requested("hist") == list(pipe.ETFS)
+    assert env.http.requested("hist") == ["SPY"]  # 2026-10-23：D 公布前只探 SPY，其他 ETF 也等它
     assert obs(env, pipe.OBS_HIST_STATUS)["payload"]["waiting_for_source"] is True
     assert market_tasks.run_task(ctx_at(env, NOW + 900), TASKS["us.hist"]) == "not_yet"
-    assert env.http.requested("hist") == list(pipe.ETFS)  # 30 分鐘內 ETF 也不重打
+    assert env.http.requested("hist") == ["SPY"]  # 30 分鐘內 SPY 也不重打
     state = env.store.task_state("us.hist")
     assert state["fail_streak"] == 0  # 還沒公布不算失敗
+
+
+def test_d_is_probed_with_spy_only_then_hourly_until_published(env):
+    """2026-10-23（investigations/format_20261023.md §2）：Nasdaq 公布 D 列比收盤後 2 小時晚，以前 4 檔 ETF 各探 5 次
+    就整個 D 不再抓，成分股從 10/16 起沒更新過。現在 D 公布前只探 SPY：前 5 次每 30 分鐘、之後每小時；D 在 NOW＋3
+    小時出現，同一輪就抓其他 ETF 與成分股。"""
+    published = NOW + 3 * 3600
+
+    def source(price: float) -> Callable[[date, date], dict[date, float]]:  # 假的 Nasdaq：NOW＋3 小時起才有 D 列
+        return lambda start, end: flat(HISTORY + ([D] if env.clock.wall >= published else []), price)
+
+    seed_universe(env, ["AAA", "BBB"])
+    for symbol, price in (("SPY", 100.0), ("VOO", 100.0), ("QQQ", 100.0), ("SOXX", 100.0), ("AAA", 50.0),
+                          ("BBB", 50.0)):
+        seed(env, symbol, flat(HISTORY, price))
+        env.http.hist_hook[symbol] = source(price)
+    seen: dict[int, list[str]] = {}
+    for step in range(16):  # 15 分鐘一輪，跑到 NOW＋3 小時 45 分
+        before = len(env.http.calls)
+        kind = run(env, "us.hist", NOW + step * 900)
+        seen[step * 15] = [key for name, key, _ in env.http.calls[before:] if name == "hist"]
+        assert env.store.task_state("us.hist")["fail_streak"] == 0
+        assert kind == ("not_yet" if step < 12 else "ok"), step
+    assert [minute for minute, keys in seen.items() if "SPY" in keys] == [0, 30, 60, 90, 120, 180]
+    assert all(keys in ([], ["SPY"]) for minute, keys in seen.items() if minute < 180)  # 公布前只有 SPY
+    assert seen[180] == ["SPY", "VOO", "QQQ", "SOXX", "AAA", "BBB"]
+    assert all(keys == [] for minute, keys in seen.items() if minute > 180)
+    assert all(D in closes(env, symbol) for symbol in ("SPY", "VOO", "QQQ", "SOXX", "AAA", "BBB"))
+    status = obs(env, pipe.OBS_HIST_STATUS)["payload"]
+    assert status["waiting_for_source"] is False and status["have_d"] == 6 and status["exhausted"] == 0
+
+
+def test_gate_opens_even_when_the_old_etf_retries_are_used_up(env):
+    """2026-10-23：升級那天的狀態——舊版已經把 4 檔 ETF 這個 D 的 5 次都用完（{"d": D, "n": 5}），閘門整個 D 鎖死。
+    現在 SPY 照每小時探；SPY 有 D 之後其他 ETF 的舊紀錄清掉，同一輪連成分股一起抓到 D。"""
+    etfs_ready(env)  # 假的 Nasdaq 已經有 D
+    seed_universe(env, ["AAA"])
+    seed(env, "AAA", flat(HISTORY, 50.0))
+    env.http.prices["AAA"] = flat(HISTORY + [D], 50.0)
+    used_up = {"d": D.isoformat(), "n": 5, "at": NOW - 600}
+    env.store.set_task_state("sched:us.hist", {"retry": {sym: dict(used_up) for sym in ("SPY", "VOO", "QQQ", "SOXX")}})
+    assert run(env, "us.hist") == "ok"
+    assert env.http.requested("hist") == ["SPY", "VOO", "QQQ", "SOXX", "AAA"]
+    assert all(D in closes(env, symbol) for symbol in ("SPY", "VOO", "QQQ", "SOXX", "AAA"))
+    assert pipe._state(ctx_at(env, NOW), "us.hist")["retry"] == {}
+
+
+def test_backfill_member_without_nasdaq_data_is_not_a_failure(env):
+    """2026-10-23（investigations/format_20261023.md §1.1）：Nasdaq 對 BF.B 回空殼。以前判成 format：只剩它一檔時整個
+    backfill 失敗、退避 2 小時（fail_streak 到 44），也不記重排、每次都重打。現在當成「還沒有 D」：不算失敗、
+    每個 D 最多 5 次，另一檔照樣補進來。"""
+    etfs_ready(env)
+    seed_universe(env, ["BF.B", "NEWX"])
+    env.http.prices["NEWX"] = flat(sessions(D, 250), 20.0)
+    env.http.hist_raw["BF.B"] = nasdaq({"symbol": None, "totalRecords": 0, "tradesTable": None})  # 活回應原樣
+    assert run(env, "us.hist") == "ok"  # SPY 有 D：成分股（含還沒有歷史的）可以抓了
+    kinds = [run(env, "us.hist.backfill", NOW + step * 900) for step in range(12)]  # 15 分鐘一輪，2 小時 45 分
+    assert kinds[0] == "partial"  # BF.B 還沒有 D、NEWX 補進來
+    assert set(kinds[1:]) <= {"not_yet", "not_due"} and "not_yet" in kinds[1:]
+    assert env.store.task_state("us.hist.backfill")["fail_streak"] == 0
+    assert max(closes(env, "NEWX")) == D
+    assert len(env.http.query("hist", "BF.B")) == 5  # 首抓＋4 次重排（每 30 分鐘），之後這個 D 不再打
+    assert pipe._state(ctx_at(env, NOW), "us.hist")["retry"]["BF.B"]["n"] == 5
+    outcomes = obs(env, pipe.OBS_HIST_STATUS)["payload"]["outcomes"]
+    assert outcomes["missing_d"] == 5 and not [kind for kind in outcomes if kind.startswith("error:")]
+
+
+def test_vendor_error_is_retried_like_a_missing_d_but_counted(env):
+    """2026-10-23 審查 r7b F2：Nasdaq 廠商錯誤（data: null＋rCode 400；外殼形狀是假設的，見 test_market_sources_us 的
+    VENDOR_ERROR）以前被當成「還沒有 D」吞掉。現在一樣走每個 D 最多 5 次的重排（不會每輪重打、不算失敗），但結果記成
+    vendor，us.hist.status 的 vendor 看得到。"""
+    etfs_ready(env)
+    seed_universe(env, ["AAA", "COO"])
+    for symbol in ("AAA", "COO"):
+        seed(env, symbol, flat(HISTORY, 50.0))
+    env.http.prices["AAA"] = flat(HISTORY + [D], 50.0)
+    env.http.hist_raw["COO"] = {"data": None, "message": None, "status": {
+        "rCode": 400, "bCodeMessage": [{"code": 2001, "errorMessage": "Error while calling vendor"}],
+        "developerMessage": None}}
+    kinds = [run(env, "us.hist", NOW + step * 900) for step in range(12)]
+    assert kinds[0] == "partial" and set(kinds[1:]) <= {"ok", "not_yet"}
+    assert env.store.task_state("us.hist")["fail_streak"] == 0
+    assert len(env.http.query("hist", "COO")) == 5  # 首抓＋4 次重排，之後這個 D 不再打
+    status = obs(env, pipe.OBS_HIST_STATUS)["payload"]
+    assert status["outcomes"]["vendor"] == 5 and "missing_d" not in status["outcomes"]
+    assert status["vendor"] == 5 and status["exhausted"] == 1 and D in closes(env, "AAA")
+
+
+def test_backfill_waits_for_spy_to_have_d(env):
+    """2026-10-23：還沒有歷史的成分股也等 SPY 有 D——D 公布前只探 SPY；公布前補的一年只到 D−1，公布後還得再抓一次。"""
+    etfs_ready(env, with_d=False)
+    seed_universe(env, ["NEWX"])
+    env.http.prices["NEWX"] = flat(sessions(date(2026, 10, 15), 250), 20.0)
+    assert run(env, "us.hist") == "not_yet"
+    assert not TASKS["us.hist.backfill"].due(ctx_at(env, NOW + 60))
+    for symbol in pipe.ETFS:
+        env.http.prices[symbol] = flat(HISTORY + [D], 100.0)  # Nasdaq 公布 D 了
+    assert run(env, "us.hist", NOW + 1800) == "ok"
+    assert TASKS["us.hist.backfill"].due(ctx_at(env, NOW + 1860))
+
+
+def test_backfill_does_not_reset_the_waiting_flag(env):
+    """2026-10-23（investigations/format_20261023.md §3.2 第 3 點）：以前 backfill 跑完就用 waiting=False 覆寫整份
+    us.hist.status，閘門鎖住時「等來源」的旗標在 backfill 到下一次 core 之間會翻成 false。"""
+    etfs_ready(env, with_d=False)
+    seed_universe(env, ["NEWX"])
+    env.http.prices["NEWX"] = flat(sessions(date(2026, 10, 15), 250), 20.0)
+    assert run(env, "us.hist") == "not_yet"
+    assert obs(env, pipe.OBS_HIST_STATUS)["payload"]["waiting_for_source"] is True
+    pipe._run_hist_backfill(ctx_at(env, NOW + 60))  # 直接跑（繞過 due）：它寫的狀態也不能把旗標翻掉
+    status = obs(env, pipe.OBS_HIST_STATUS)["payload"]
+    assert status["outcomes"]["missing_d"] >= 1 and status["waiting_for_source"] is True
+
+
+def test_hist_status_records_the_members_typical_last_date(env):
+    """2026-10-23：成分股最後正式日期的中位數（偶數檔取偏舊那個）進 us.hist.status；jobs/market_snapshot.py 拿它和
+    當下的 D 算「落後幾個交易日」。還沒有歷史的不算。"""
+    etfs_ready(env, with_d=False)
+    seed_universe(env, ["AAA", "BBB", "CCC", "DDD", "NEWX"])
+    for symbol, last in (("AAA", date(2026, 10, 9)), ("BBB", date(2026, 10, 13)), ("CCC", date(2026, 10, 14)),
+                         ("DDD", date(2026, 10, 15))):
+        seed(env, symbol, flat(sessions(last, 20), 10.0))
+    run(env, "us.hist")
+    status = obs(env, pipe.OBS_HIST_STATUS)["payload"]
+    assert status["members_last"] == "2026-10-13" and status["vendor"] == 0
 
 
 # ── 預算、should_stop、每輪 60 檔 ──────────────────────────────────────────
@@ -821,9 +956,11 @@ def test_provisional_cboe_close_when_nasdaq_is_blocked_then_nasdaq_overwrites_wi
     assert env.ledger.cooling == {"api.nasdaq.com"}
     for symbol in pipe.OPTION_SYMBOLS:
         env.http.chains[symbol] = cboe_chain(symbol, timestamp="2026-10-16 20:45:00", last_trade="2026-10-16T16:15:00")
+    env.http.quotes["VOO"] = cboe_etf_quote("VOO", timestamp="2026-10-16 20:45:00", last_trade="2026-10-16T15:59:59",
+                                            close=702.3)
     assert run(env, "us.options", NOW + 600) == "ok"
     assert closes(env, "SPY")[D] == (717.23, "cboe", True)
-    assert D not in closes(env, "VOO")  # CBOE 只有 QQQ／SPY／SOXX 的檔
+    assert closes(env, "VOO")[D] == (702.3, "cboe", True)  # 2026-10-23：VOO 沒有期權鏈，改抓一個小報價
     # Nasdaq 回來：正式列直接蓋掉備援（差 1% 也不經守門，因為不同來源）
     env.http.fail.clear()
     env.ledger.cooling.clear()
@@ -831,21 +968,72 @@ def test_provisional_cboe_close_when_nasdaq_is_blocked_then_nasdaq_overwrites_wi
         env.http.prices[symbol] = {**flat(HISTORY, 700.0), D: 709.80}
     later = NOW + 3 * 3600
     assert run(env, "us.hist", later) == "ok"
-    assert closes(env, "SPY")[D] == (709.80, "nasdaq", False)
+    assert closes(env, "SPY")[D] == (709.80, "nasdaq", False) and closes(env, "VOO")[D] == (709.80, "nasdaq", False)
     assert env.store.pending_jump("us", "SPY") is None
     assert not pipe.nasdaq_blocked(ctx_at(env, later))
 
 
-def test_no_provisional_close_when_nasdaq_is_fine_or_trade_is_before_the_close(env):
+def test_no_provisional_close_when_nasdaq_has_d_or_the_trade_is_well_before_the_close(env):
+    """2026-10-23 起不必等 Nasdaq 被擋：只要還沒有 D 的正式列就寫；已經有就不寫。CBOE 寫 15:59:59，收盤前 60 秒內
+    （含）的最後成交算收盤，更早的是盤中的檔。"""
+    seed(env, "SPY", flat(HISTORY + [D], 700.0))  # Nasdaq 已經有 D
     for symbol in pipe.OPTION_SYMBOLS:
-        env.http.chains[symbol] = cboe_chain(symbol, timestamp="2026-10-16 20:45:00", last_trade="2026-10-16T16:15:00")
-    run(env, "us.options")
-    assert D not in closes(env, "SPY")
+        env.http.chains[symbol] = cboe_chain(symbol, timestamp="2026-10-16 20:45:00", last_trade="2026-10-16T15:59:59")
+    assert run(env, "us.options") == "ok"
+    assert closes(env, "SPY")[D] == (700.0, "nasdaq", False)
+    assert closes(env, "QQQ")[D] == (717.23, "cboe", True)  # QQQ 還沒有 D：照寫備援
     ctx = ctx_at(env, NOW)
-    pipe._save_state(ctx, "us.hist", {"blocked": {"kind": "blocked", "at": NOW}})
-    chain = src.parse_cboe_options(json.dumps(cboe_chain("SPY", timestamp="2026-10-16 20:45:00",
-                                                         last_trade="2026-10-16T15:59:00")).encode())
-    assert not pipe._maybe_provisional(ctx, D, chain, chain.quote_last_trade_et)
+    for last_trade, written in (("2026-10-16T15:58:59", False), ("2026-10-16T15:59:00", True)):
+        chain = src.parse_cboe_options(json.dumps(cboe_chain("SOXX", timestamp="2026-10-16 20:45:00",
+                                                             last_trade=last_trade)).encode())
+        assert pipe._maybe_provisional(ctx, D, chain, chain.quote_last_trade_et) is written, last_trade
+
+
+def test_cboe_close_is_the_provisional_d_bar_while_nasdaq_is_late(env):
+    """2026-10-23（investigations/freshness_20261023.md §3 第 2 點）：Nasdaq 只是晚公布（沒被擋）、CBOE 寫 15:59:59 時，
+    以前這條備援從來沒觸發，ETF 列整晚停在 D−1。現在收盤後 CBOE 一到，4 檔 ETF 都有 D 的 provisional；它不算
+    Nasdaq 公布了 D（成分股照樣等 SPY 的正式列），正式列到了直接蓋掉。"""
+    etfs_ready(env, with_d=False)
+    seed_universe(env, ["AAA"])
+    seed(env, "AAA", flat(HISTORY, 50.0))
+    env.http.prices["AAA"] = flat(HISTORY + [D], 50.0)
+    for symbol in ("QQQ", "SPY", "SOXX"):
+        env.http.chains[symbol] = cboe_chain(symbol, timestamp="2026-10-16 20:45:00", last_trade="2026-10-16T15:59:59")
+    env.http.quotes["VOO"] = cboe_etf_quote("VOO", timestamp="2026-10-16 20:45:00", last_trade="2026-10-16T15:59:59",
+                                            close=702.3)
+    assert run(env, "us.hist") == "not_yet"  # Nasdaq 還沒有 D
+    assert run(env, "us.options", NOW + 60) == "ok"
+    assert {symbol: closes(env, symbol)[D] for symbol in ("SPY", "VOO", "QQQ", "SOXX")} == {
+        "SPY": (717.23, "cboe", True), "VOO": (702.3, "cboe", True), "QQQ": (717.23, "cboe", True),
+        "SOXX": (717.23, "cboe", True)}
+    assert env.http.requested("quote") == ["VOO"]
+    assert run(env, "us.hist", NOW + 1800) == "not_yet"  # 備援不算 Nasdaq 公布了 D：還是只探 SPY
+    assert env.http.requested("hist") == ["SPY", "SPY"] and D not in closes(env, "AAA")
+    assert obs(env, pipe.OBS_HIST_STATUS)["payload"]["waiting_for_source"] is True
+    for symbol in ("SPY", "VOO", "QQQ", "SOXX"):
+        env.http.prices[symbol] = flat(HISTORY + [D], 100.0)  # Nasdaq 公布了
+    assert run(env, "us.hist", NOW + 3600) == "ok"
+    assert all(closes(env, symbol)[D] == (100.0, "nasdaq", False) for symbol in ("SPY", "VOO", "QQQ", "SOXX"))
+    assert closes(env, "AAA")[D][1:] == ("nasdaq", False)
+
+
+def test_voo_close_quote_is_fetched_only_when_it_helps(env):
+    """2026-10-23：VOO 的 CBOE 報價只在「已經有歷史、Nasdaq 還沒有 D 的正式列」時才抓；報價檔還沒到收盤後
+    （ETF 檔常晚更新）→ 不算失敗，30 分鐘後再抓。"""
+    for symbol in ("QQQ", "SPY", "SOXX"):
+        env.http.chains[symbol] = cboe_chain(symbol, timestamp="2026-10-16 20:45:00", last_trade="2026-10-16T15:59:59")
+    env.http.quotes["VOO"] = cboe_etf_quote("VOO", timestamp="2026-10-16 19:30:00", last_trade="2026-10-15T15:59:59",
+                                            close=710.72)  # 還是 D−1 的檔
+    assert run(env, "us.options") == "ok" and env.http.requested("quote") == []  # VOO 還沒有歷史：不抓
+    seed(env, "VOO", flat(HISTORY, 700.0))
+    assert run(env, "us.options", NOW + 60) == "not_yet" and env.http.requested("quote") == ["VOO"]
+    assert D not in closes(env, "VOO") and env.store.task_state("us.options")["fail_streak"] == 0
+    assert not TASKS["us.options"].due(ctx_at(env, NOW + 900))  # 30 分鐘後再看
+    env.http.quotes["VOO"] = cboe_etf_quote("VOO", timestamp="2026-10-16 20:45:00", last_trade="2026-10-16T15:59:59",
+                                            close=702.3)
+    assert run(env, "us.options", NOW + 1860) == "ok"
+    assert closes(env, "VOO")[D] == (702.3, "cboe", True) and env.http.requested("quote") == ["VOO", "VOO"]
+    assert not TASKS["us.options"].due(ctx_at(env, NOW + 3600))  # 做完了
 
 
 def test_cboe_evening_evidence_marks_an_unscheduled_closure(env):
@@ -1134,6 +1322,19 @@ def test_parse_summary_market_cap_errors(payload, expect, kind):
     with pytest.raises(market_calc.ParseError) as caught:
         src.parse_nasdaq_summary_market_cap(json.dumps(payload).encode(), expect_symbol=expect)
     assert caught.value.kind == kind
+
+
+def test_summary_empty_shell_is_empty_not_a_symbol_mismatch():
+    """2026-10-23：和日線同一個順序問題——代號、summaryData 都是 null 的空殼先判 empty（以前是 format）；
+    代號是 null 卻有 summaryData 還是 format（認不出是哪一家）。"""
+    def kind(payload, expect):
+        with pytest.raises(market_calc.ParseError) as caught:
+            src.parse_nasdaq_summary_market_cap(json.dumps(payload).encode(), expect_symbol=expect)
+        return caught.value.kind
+
+    assert kind(nasdaq({"symbol": None, "summaryData": None}), "BF.B") == "empty"
+    assert kind(nasdaq({"symbol": None, "summaryData": {"MarketCap": {"value": "1,000"}}}), "JPM") == "format"
+    assert kind(summary("JPMX", "903,039,014,165"), "JPM") == "format"
 
 
 def test_fetch_summary_market_cap_url_endpoint_and_ledger():

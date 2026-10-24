@@ -1523,3 +1523,37 @@ def test_status_summary_reports_calendar_coverage(md, paths):
     summary = md.status_summary(now=NOW, paths=paths)["outcome"]
     assert summary["calendar_days_left"] == {"us": 440, "tw": 10}  # NOW＝台北 10/17
     assert summary["calendar_unclassified"] == {"us": 0, "tw": 2}
+
+
+@pytest.mark.parametrize("extra", [
+    {},  # 舊版 job、或 Store 開不起來（outcome 只有 store 那個 key）
+    {"calendar_until": {"error": "unexpected:OSError"}},  # 覆蓋率計算出錯（jobs/market_snapshot.py 寫的形狀）
+    {"calendar_until": {"us": 20271231, "tw": "2026-13-01"}, "calendar_unclassified": {"us": -1, "tw": "2"}},
+    {"calendar_until": {"us": "2027-12-31T00:00", "tw": None}, "calendar_unclassified": {"us": True, "tw": 1.5}},
+    {"calendar_until": ["2027-12-31"], "calendar_unclassified": "0"},
+])
+def test_status_summary_calendar_fields_fall_back_to_null(md, paths, extra):
+    """2026-10-23 審查 r7b F7（T9）：outcome 缺 key、{"error": …}、壞值都要給 {"us": None, "tw": None}，不是 {}——
+    每日維護「≤30 或是 null」的條目靠 null 才會報。"""
+    write_snapshot(paths, make_snapshot(NOW))
+    outcome = {"status": "ok", "code": "verified", "collect": {"status": "ok"}, "publish": {"status": "ok"}, **extra}
+    market_paths.write_private_atomic(paths.outcome, json.dumps(outcome).encode())
+    summary = md.status_summary(now=NOW, paths=paths)["outcome"]
+    assert summary["calendar_days_left"] == {"us": None, "tw": None}
+    assert summary["calendar_unclassified"] == {"us": None, "tw": None}
+
+
+def test_status_summary_reports_how_far_us_data_lags(md, paths):
+    """2026-10-23（investigations/format_20261023.md §2、freshness_20261023.md §5 第 5 點、審查 r7b F2）：outcome 的
+    us_etf_lag_sessions／us_etf_lag_s／us_members_lag_sessions／us_hist_vendor 帶進 status_summary；缺值或壞值 → None。"""
+    write_snapshot(paths, make_snapshot(NOW))
+    base = {"status": "ok", "code": "verified", "collect": {"status": "ok"}, "publish": {"status": "ok"}}
+    keys = ("us_etf_lag_sessions", "us_etf_lag_s", "us_members_lag_sessions", "us_hist_vendor")
+    for values, expect in (((1, 50400, 4, 2), (1, 50400, 4, 2)), ((0, 0, 0, 0), (0, 0, 0, 0)),
+                           ((-1, "9", True, 1.5), (None, None, None, None))):
+        market_paths.write_private_atomic(paths.outcome, json.dumps({**base, **dict(zip(keys, values))}).encode())
+        summary = md.status_summary(now=NOW, paths=paths)["outcome"]
+        assert tuple(summary[key] for key in keys) == expect, values
+    market_paths.write_private_atomic(paths.outcome, json.dumps(base).encode())  # 舊版 job：沒有這幾個 key
+    summary = md.status_summary(now=NOW, paths=paths)["outcome"]
+    assert tuple(summary[key] for key in keys) == (None, None, None, None)

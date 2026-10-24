@@ -51,6 +51,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 from xml.sax.saxutils import escape
@@ -83,6 +84,9 @@ OUTCOME_SCHEMA = 1
 
 COLLECT_STATE, PUBLISH_STATE, SUPERVISOR_STATE = "_collect", "_publish", "_supervisor"
 US_CALENDAR_CHECK_OBS = "us.calendar.check"  # 要和 market_pipeline_us.OBS_CALENDAR_CHECK 一樣
+US_HIST_STATUS_OBS = "us.hist.status"  # 要和 market_pipeline_us.OBS_HIST_STATUS 一樣
+US_ETF_ROWS = ("VOO", "QQQ", "SOXX", "SPY")  # 快照的 us.etf.* 列（要和 market_calc.ROW_IDS 一樣）
+US_LAG_MAX_SESSIONS = 300  # 落後天數最多數到這裡（closes 只留 280 個交易日，再多也沒有意義）
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -305,6 +309,50 @@ def _calendar_coverage(store: market_store.Store) -> dict[str, Any]:
         days = days() if callable(days) else days
         unclassified[name] = len(list(days or []))
     return {"calendar_until": until, "calendar_unclassified": unclassified, "calendar_problems": problems}
+
+
+def _us_freshness(store: market_store.Store, now: float) -> dict[str, Any]:
+    """美股資料落後多少（2026-10-23，investigations/format_20261023.md §2、freshness_20261023.md §5 第 5 點、
+    審查 r7b F2）：ETF 列落後 1 天、成分股從 10/16 停住 4 個交易日，us.hist 卻一直是 not_yet、fail_streak 0，
+    outcome 看不出來，5 天沒人知道。只放整數或 None：
+    - us_etf_lag_sessions／us_etf_lag_s：快照 us.etf.* 列（含 CBOE 備援）裡最舊的資料日，落後最新收完的場次幾個
+      交易日、落後了幾秒（從它之後第一個場次收完、D 換日那一刻算起）；沒有落後是 0。
+    - us_members_lag_sessions：成分股最後正式日期的中位數（market_pipeline_us 寫在 us.hist.status）落後幾個交易日。
+    - us_hist_vendor：這個 D 遇到 Nasdaq 廠商錯誤的次數。
+    最新場次用這裡的日曆現算：us.hist 退避、沒寫狀態時落後照樣會長。"""
+    payload = (store.get_obs(US_HIST_STATUS_OBS) or {}).get("payload")
+    payload = payload if isinstance(payload, dict) else {}
+    vendor = payload.get("vendor")
+    out: dict[str, Any] = {
+        "us_etf_lag_sessions": None,
+        "us_etf_lag_s": None,
+        "us_members_lag_sessions": None,
+        "us_hist_vendor": vendor if isinstance(vendor, int) and not isinstance(vendor, bool) and vendor >= 0 else None,
+    }
+    cal = market_calendar.us_calendar(store)
+    day = market_calendar.latest_closed_us_session(cal, now)
+    window = cal.sessions_back(day, US_LAG_MAX_SESSIONS) if day is not None else []
+    if not window:
+        return out  # 日曆不知道最新場次：全部 None（維護條目的「或是 null」會報）
+
+    def missing(last: Optional[date]) -> Optional[list[date]]:
+        return None if last is None else [session for session in window if session > last]
+
+    last = payload.get("members_last")
+    try:
+        members = date.fromisoformat(last) if isinstance(last, str) and len(last) == 10 else None
+    except ValueError:
+        members = None
+    behind = missing(members)
+    if behind is not None:
+        out["us_members_lag_sessions"] = len(behind)
+    etfs = [missing(store.last_date("us", symbol)) for symbol in US_ETF_ROWS]  # 含 CBOE 備援：卡上的資料日也含它
+    if all(item is not None for item in etfs):  # 有一檔完全沒有資料就是 None
+        worst = max(etfs, key=len)
+        out["us_etf_lag_sessions"] = len(worst)
+        since = (cal.close_time(worst[0]) + market_calendar.US_READY_AFTER).timestamp() if worst else now
+        out["us_etf_lag_s"] = int(max(0.0, now - since))
+    return out
 
 
 def _collect_worker(args: argparse.Namespace, paths: market_paths.Paths, wall: Callable[[], float]) -> int:
@@ -644,6 +692,11 @@ class Supervisor:
             out.update(_calendar_coverage(store))
         except Exception as exc:  # noqa: BLE001 - 日曆讀不到不能讓 outcome 寫不出來
             out["calendar_until"] = {"error": error_kind(exc)}
+        try:
+            out.update(_us_freshness(store, self.wall()))
+        except Exception as exc:  # noqa: BLE001 - 一樣不能讓 outcome 寫不出來；值給 None，每日維護的「或是 null」會報
+            out.update(us_etf_lag_sessions=None, us_etf_lag_s=None, us_members_lag_sessions=None, us_hist_vendor=None,
+                       us_freshness_error=error_kind(exc))
         sup["task_names"] = [n for n in names if isinstance(n, str)]
         store.set_task_state(SUPERVISOR_STATE, sup)
 

@@ -7,7 +7,8 @@ squeeze…)/持股跌破20MA,60MA,120MA,240MA的家數/成交量…我要知道�
 
 每個來源兩個函式（INTERFACES §3）：
 - 純解析 `parse_*`：收 bytes／str／已解析的 JSON，回 dataclass；格式不對丟 `ParseError(kind)`，kind 是
-  format、missing_field、empty、too_few、date、conflict 之一（不帶回應內容）。
+  format、missing_field、empty、too_few、date、conflict 之一（不帶回應內容）；Nasdaq 外殼自己報錯（data: null、
+  rCode 不是 200）是 vendor（2026-10-23）。
 - 抓取 `fetch_*`：組網址 → `http.fetch(url, max_bytes=…, timeout=…, accept=(…), ledger=ledger)`（預設
   market_http，測試注入假的）→ 解析。每個端點的大小、時間、Content-Type、每日預算在 `ENDPOINTS`。
 
@@ -81,6 +82,7 @@ MONEYDJ_URL = "https://www.moneydj.com/ETF/X/Basic/Basic0007B.xdjhtm"  # 「全�
 # cdn.cboe.com 會 307 到 cdn-api（PLAN v1 實測），直接打最終主機。
 CBOE_OPTIONS_URL = "https://cdn-api.cboe.com/api/global/delayed_quotes/options/{symbol}.json"
 CBOE_QUOTE_URL = "https://cdn-api.cboe.com/api/global/delayed_quotes/quotes/_{symbol}.json"
+CBOE_ETF_QUOTE_URL = "https://cdn-api.cboe.com/api/global/delayed_quotes/quotes/{symbol}.json"  # ETF 不帶底線
 TREASURY_URL = (
     "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/daily-treasury-rates.csv/all/{ym}"
     "?type=daily_treasury_yield_curve&field_tdr_date_value_month={ym}&page&_format=csv"
@@ -91,6 +93,8 @@ FED_FOMC_URL = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
 
 CBOE_OPTION_SYMBOLS = ("QQQ", "SPY", "SOXX")
 CBOE_QUOTE_SYMBOLS = ("VIX", "VIX3M")
+# 沒有期權鏈的 ETF：只抓一個約 1 KB 的報價，收盤當 Nasdaq 日線還沒公布時的 D provisional（2026-10-23）
+CBOE_CLOSE_QUOTE_SYMBOLS = ("VOO",)
 
 
 @dataclass(frozen=True)
@@ -108,8 +112,12 @@ class Endpoint:
 
 
 ENDPOINTS: dict[str, Endpoint] = {
-    # 成分聯集約 520 檔＋VOO／QQQ／SOXX／SPY＋宏觀代理 8 檔；沒有 D 列的 30 分鐘後重排、最多 4 次（§18.5）
-    "nasdaq_historical": Endpoint("api.nasdaq.com", ("json",), 512 * KIB, 15.0, 560, 600, 4, per_run=60),
+    # 成分聯集約 520 檔＋VOO／QQQ／SOXX／SPY＋宏觀代理 8 檔；沒有 D 列的 30 分鐘後重排、最多 4 次（§18.5）。
+    # 2026-10-23：D 改成只用 SPY 探（前 5 次每 30 分鐘、之後每小時；Nasdaq 晚上甚至隔天清晨才公布 → 每天約 20 次）
+    # ＋其他 3 檔 ETF＋成分股約 527 檔＋BF.B 這類空殼 5 次＋宏觀代理 8 檔（Yahoo 失敗時，各最多 2 次）＋分割重抓與
+    # 重排約 10 ≈ 580，560 不夠 → 620（bootstrap 照舊多 40）。這只是規劃值、程式沒拿它擋；真正擋的是帳本
+    # api.nasdaq.com 每天 900 次，扣掉其他 Nasdaq 端點（每週的那幾個剛好同一天時合計 133）還有約 150 次餘裕。
+    "nasdaq_historical": Endpoint("api.nasdaq.com", ("json",), 512 * KIB, 15.0, 620, 660, 4, per_run=60),
     "nasdaq_market_info": Endpoint("api.nasdaq.com", ("json",), 64 * KIB, 15.0, 4, 4, 2),
     "nasdaq_splits": Endpoint("api.nasdaq.com", ("json",), 2 * MIB, 15.0, 1, 2, 2),
     "nasdaq_nasdaq100": Endpoint("api.nasdaq.com", ("json",), 512 * KIB, 15.0, 1, 1, 2),
@@ -122,7 +130,8 @@ ENDPOINTS: dict[str, Endpoint] = {
     "ssga_spy": Endpoint("www.ssga.com", ("spreadsheet",), 4 * MIB, 30.0, 2, 2, 1),
     "moneydj": Endpoint("www.moneydj.com", ("html",), 2 * MIB, 15.0, 4, 4, 1),  # QQQ、SOXX、VOO、0050
     "cboe_options": Endpoint("cdn-api.cboe.com", ("json",), 16 * MIB, 30.0, 3, 3, 1),  # SPY 實測 5.8 MB
-    "cboe_quote": Endpoint("cdn-api.cboe.com", ("json",), 64 * KIB, 15.0, 4, 4, 1),  # VIX、VIX3M
+    # VIX、VIX3M；2026-10-23 加 VOO 的收盤（Nasdaq 日線還沒有 D 時才抓，每天 1–2 次）。主機預設每天 200 次，現用約 10
+    "cboe_quote": Endpoint("cdn-api.cboe.com", ("json",), 64 * KIB, 15.0, 6, 6, 1),
     "treasury": Endpoint("home.treasury.gov", ("csv",), 1 * MIB, 15.0, 2, 2, 2),  # 本月＋月初時的上個月
     "cftc_tff": Endpoint("www.cftc.gov", ("text/plain",), 2 * MIB, 15.0, 1, 1, 2),
     "finra_margin": Endpoint("www.finra.org", ("spreadsheet",), 4 * MIB, 15.0, 1, 1, 2),
@@ -353,12 +362,21 @@ def _get(obj: object, *keys: str) -> Any:
 
 
 def _nasdaq_data(payload: object) -> dict:
-    """Nasdaq API 外殼 {"data": {...}, "status": {...}}；data 是 null（例：代號不存在）→ empty。"""
+    """Nasdaq API 外殼 {"data": {...}, "status": {...}}；data 是 null（例：代號不存在）→ empty；data 是 null 而且
+    status.rCode 是 200 以外的整數（廠商錯誤）→ vendor。"""
     root = _as_json(payload)
     if not isinstance(root, dict) or "data" not in root:
         raise _err("format", "envelope")
     data = root["data"]
     if data is None:
+        # 2026-10-23 審查 r7b F2：COO／CPRT 的「Error while calling vendor」(2001) 以前也被當成「沒有資料」吞掉，
+        # 不會告警。錯誤外殼是假設的形狀（repo 沒有真實樣本）：{"data":null,"message":null,"status":{"rCode":400,
+        # "bCodeMessage":[{"code":2001,"errorMessage":"Error while calling vendor"}],"developerMessage":null}}；
+        # 只看 rCode 是不是 200 以外的整數，乾淨的 rCode 200（TSM 季報、BF.B）照舊是 empty。
+        # TODO: 抓到真實的錯誤回應後存進 fixtures_raw，換掉這個假設的形狀（測試的 VENDOR_ERROR 一起換）。
+        code = _get(root, "status", "rCode")
+        if isinstance(code, int) and not isinstance(code, bool) and code != 200:
+            raise _err("vendor", "rCode")
         raise _err("empty", "data")
     if not isinstance(data, dict):
         raise _err("format", "data")
@@ -511,7 +529,8 @@ class OptionChain:
 
 @dataclass(frozen=True)
 class Quote:
-    """CBOE 指數報價（VIX、VIX3M）：日變化用 price_change（收盤後 prev_day_close 會等於 close）。"""
+    """CBOE 報價：指數（VIX、VIX3M）與 ETF 收盤備援（VOO，2026-10-23）。日變化用 price_change（收盤後
+    prev_day_close 會等於 close）。"""
 
     close: float
     price_change: Optional[float]
@@ -656,9 +675,16 @@ class EarningsDate:
 def parse_nasdaq_historical(payload: object, *, expect_symbol: Optional[str] = None) -> list[Bar]:
     """/api/quote/{SYM}/historical：個股收盤帶「$」、ETF 不帶，量有千分位；日期 MM/DD/YYYY。由舊到新。"""
     data = _nasdaq_data(payload)
+    table = data.get("tradesTable")
+    total = data.get("totalRecords")
+    # 2026-10-23：Nasdaq 沒有這檔的資料時回空殼 {"symbol":null,"totalRecords":0,"tradesTable":null}（BF.B 實測）。
+    # 以前先比代號，null 對不上就丟 format，us.hist.backfill 連續 44 次失敗、每 2 小時退避；空殼要先判成 empty，
+    # 代號不是 null 卻對不上才是 format。
+    no_rows = table is None or (isinstance(total, int) and not isinstance(total, bool) and total == 0)
+    if _is_blank(data.get("symbol")) and no_rows:
+        raise _err("empty", "tradesTable")
     if expect_symbol is not None and canonical_us_symbol(data.get("symbol"), "nasdaq") != expect_symbol:
         raise _err("format", "symbol")
-    table = data.get("tradesTable")
     if table is None:
         raise _err("empty", "tradesTable")
     if not isinstance(table, dict):
@@ -946,9 +972,12 @@ def parse_nasdaq_summary_market_cap(payload: object, *, expect_symbol: Optional[
     名單一樣：GOOG／GOOGL 各回整家公司的值）。「N/A」、沒有這欄、0 → None（不是 0）；負數、百分比、看不懂
     的字、大到不合理 → format。回應的代號用「/」分股別（請求 BRK.B、回 BRK/B），canonical 之後再和請求的比。"""
     data = _nasdaq_data(payload)
+    summary = data.get("summaryData")
+    # 2026-10-23：和日線同一個順序問題——代號、summaryData 都是 null 的空殼是「沒有資料」，先判 empty 再比代號
+    if _is_blank(data.get("symbol")) and summary is None:
+        raise _err("empty", "summaryData")
     if expect_symbol is not None and canonical_us_symbol(data.get("symbol"), "nasdaq") != expect_symbol:
         raise _err("format", "symbol")
-    summary = data.get("summaryData")
     if summary is None:
         raise _err("empty", "summaryData")
     if not isinstance(summary, dict):
@@ -1684,7 +1713,8 @@ def _index_symbol(value: object) -> str:
 
 
 def parse_cboe_quote(payload: object, *, expect_symbol: Optional[str] = None) -> Quote:
-    """…/quotes/_VIX.json：資料日看 last_trade_time（美東）的日期；日變化用 price_change（PLAN §18.8）。"""
+    """…/quotes/_VIX.json（ETF 是 …/quotes/VOO.json，同一個形狀）：資料日看 last_trade_time（美東）的日期；
+    日變化用 price_change（PLAN §18.8）。"""
     root = _as_json(payload)
     if not isinstance(root, dict):
         raise _err("format", "envelope")
@@ -2076,6 +2106,14 @@ def fetch_cboe_quote(symbol: str, *, http: Any = None, ledger: Any = None) -> Qu
     if symbol not in CBOE_QUOTE_SYMBOLS:
         raise _err("format", "symbol")
     url = CBOE_QUOTE_URL.format(symbol=quote(symbol, safe=""))
+    return parse_cboe_quote(_fetch("cboe_quote", url, http, ledger), expect_symbol=symbol)
+
+
+def fetch_cboe_etf_quote(symbol: str, *, http: Any = None, ledger: Any = None) -> Quote:
+    """沒有期權鏈的 ETF 的延遲報價（目前只有 VOO）：收盤後的 close 當 D 的 provisional（2026-10-23）。"""
+    if symbol not in CBOE_CLOSE_QUOTE_SYMBOLS:
+        raise _err("format", "symbol")
+    url = CBOE_ETF_QUOTE_URL.format(symbol=quote(symbol, safe=""))
     return parse_cboe_quote(_fetch("cboe_quote", url, http, ledger), expect_symbol=symbol)
 
 

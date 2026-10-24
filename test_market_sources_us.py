@@ -177,6 +177,48 @@ def test_historical_rejects_another_symbol():
     assert kind_of(src.parse_nasdaq_historical, hist("AAPL", AAPL_ROWS), expect_symbol="MSFT") == "format"
 
 
+# BF.B 2026-10-23 的活回應原樣（investigations/format_20261023.md §1.1）：Nasdaq 沒有這檔的資料
+BF_B_SHELL = {"data": {"symbol": None, "totalRecords": 0, "tradesTable": None}, "message": None,
+              "status": {"rCode": 200, "bCodeMessage": None, "developerMessage": None}}
+# 廠商錯誤的外殼是假設的形狀（審查 r7b F2；repo 沒有真實樣本，a17f7a9 只記了 COO／CPRT 的「2001」）。
+# TODO: 抓到真實的錯誤回應後存進 fixtures_raw，換成原樣。
+VENDOR_ERROR = {"data": None, "message": None,
+                "status": {"rCode": 400, "bCodeMessage": [{"code": 2001, "errorMessage": "Error while calling vendor"}],
+                           "developerMessage": None}}
+
+
+def test_historical_empty_shell_is_empty_not_a_symbol_mismatch():
+    """2026-10-23：空殼要先判成 empty——以前先比代號，null 對不上就是 format，us.hist.backfill 連續 44 次失敗。
+    代號不是 null 卻對不上才是 format。"""
+    assert kind_of(src.parse_nasdaq_historical, as_bytes(BF_B_SHELL), expect_symbol="BF.B") == "empty"
+    rows_null = nasdaq({"symbol": None, "totalRecords": 0, "tradesTable": {"asOf": None, "headers": {}, "rows": None}})
+    assert kind_of(src.parse_nasdaq_historical, rows_null, expect_symbol="BF.B") == "empty"
+    blank = nasdaq({"symbol": " ", "tradesTable": None})
+    assert kind_of(src.parse_nasdaq_historical, blank, expect_symbol="BF.B") == "empty"
+    assert kind_of(src.parse_nasdaq_historical, hist("AAPL", AAPL_ROWS), expect_symbol="MSFT") == "format"
+    # 代號是 null 卻有列：認不出是哪一檔，照樣 format；totalRecords 是 False 不能當成 0
+    assert kind_of(src.parse_nasdaq_historical, hist(None, AAPL_ROWS), expect_symbol="AAPL") == "format"
+    no_count = nasdaq(dict(hist(None, AAPL_ROWS)["data"], totalRecords=False))
+    assert kind_of(src.parse_nasdaq_historical, no_count, expect_symbol="AAPL") == "format"
+    # 真的抓取路徑（帶 expect_symbol）也一樣
+    http = FakeHttp(as_bytes(BF_B_SHELL))
+    assert kind_of(src.fetch_nasdaq_historical, "BF.B", date(2025, 10, 22), date(2026, 10, 22), http=http) == "empty"
+
+
+def test_nasdaq_vendor_error_is_its_own_kind():
+    """2026-10-23 審查 r7b F2：data: null 而且 rCode 是 200 以外的整數＝廠商錯誤（vendor），不再和「沒有資料」混在一起
+    被吞掉；rCode 200（TSM 季報、BF.B 的空殼）照舊是 empty。"""
+    for parse in (src.parse_nasdaq_historical, src.parse_nasdaq_financials, src.parse_nasdaq_splits):
+        assert kind_of(parse, as_bytes(VENDOR_ERROR)) == "vendor"
+        assert kind_of(parse, nasdaq(None)) == "empty"
+    assert kind_of(src.parse_nasdaq_historical, as_bytes(VENDOR_ERROR), expect_symbol="COO") == "vendor"
+    for code in (200, "400", True, None):  # 只認整數的非 200；200 帶了 bCodeMessage 也不算
+        shell = dict(VENDOR_ERROR, status=dict(VENDOR_ERROR["status"], rCode=code))
+        assert kind_of(src.parse_nasdaq_historical, as_bytes(shell)) == "empty"
+    http = FakeHttp(as_bytes(VENDOR_ERROR))
+    assert kind_of(src.fetch_nasdaq_historical, "COO", date(2025, 10, 22), date(2026, 10, 22), http=http) == "vendor"
+
+
 def test_fetch_historical_url_window_and_endpoint():
     rows = [{"date": "10/19/2026", "close": "$1.00", "volume": "1", "open": "$1", "high": "$1", "low": "$1"}] + AAPL_ROWS
     http = FakeHttp(as_bytes(hist("AAPL", rows)))
@@ -868,6 +910,29 @@ def test_fetch_cboe_quote_url():
     assert src.fetch_cboe_quote("VIX3M", http=http).symbol == "VIX3M"
     assert http.calls[0]["url"] == "https://cdn-api.cboe.com/api/global/delayed_quotes/quotes/_VIX3M.json"
     assert kind_of(src.fetch_cboe_quote, "SPX", http=http) == "format"
+
+
+# ETF 報價（investigations/freshness_20261023.md 附錄 A 的 QQQ 形狀；VOO 同一型，ETF 網址不帶底線）
+VOO_QUOTE = {"timestamp": "2026-10-23 00:04:23", "symbol": "VOO",
+             "data": {"symbol": "VOO", "current_price": 702.3, "price_change": -8.42, "close": 702.3,
+                      "prev_day_close": 710.72, "volume": 6123456, "last_trade_time": "2026-10-22T15:59:59"}}
+
+
+def test_fetch_cboe_etf_quote_for_the_voo_close():
+    """2026-10-23：VOO 沒有期權鏈，Nasdaq 日線還沒有 D 時用這個約 1 KB 的報價當收盤備援。"""
+    http = FakeHttp(as_bytes(VOO_QUOTE))
+    ledger = object()
+    quote = src.fetch_cboe_etf_quote("VOO", http=http, ledger=ledger)
+    assert (quote.symbol, quote.close) == ("VOO", 702.3)
+    assert quote.last_trade_et == datetime(2026, 10, 22, 15, 59, 59, tzinfo=ET)
+    assert quote.timestamp_utc == datetime(2026, 10, 23, 0, 4, 23, tzinfo=UTC)
+    call = http.calls[0]
+    assert call["url"] == "https://cdn-api.cboe.com/api/global/delayed_quotes/quotes/VOO.json"
+    endpoint = src.ENDPOINTS["cboe_quote"]
+    assert (call["max_bytes"], call["ledger"]) == (endpoint.max_bytes, ledger)
+    assert kind_of(src.fetch_cboe_etf_quote, "QQQ", http=http) == "format"  # 有期權鏈的不走這裡
+    assert len(http.calls) == 1
+    assert kind_of(src.parse_cboe_quote, VOO_QUOTE, expect_symbol="QQQ") == "format"
 
 
 # ── 美債 ─────────────────────────────────────────────────────────────────
