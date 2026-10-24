@@ -293,10 +293,15 @@ def _calendars(store: market_store.Store) -> tuple[Any, Any, dict[str, str]]:
 
 def _calendar_coverage(store: market_store.Store) -> dict[str, Any]:
     """日曆涵蓋到哪天、休市表裡認不出的日數（2026-10-18 審查 r6a I1／I2）：明年的休市表沒抓到、或有認不出的列，
-    卡片只會默默變暫缺；寫進 outcome 讓每日維護看得到。只放日期與次數。"""
+    卡片只會默默變暫缺；寫進 outcome 讓每日維護看得到。只放日期與次數。
+
+    2026-10-23：calendar_missing_bars＝已存歷史之內（日曆用的 SPY／加權指數第一筆到最後一筆）表上是交易日、卻沒有
+    收盤的天數。休市表沒寫的臨時休市（例 2026-07-10）會讓跨過它的 120／240 日窗口全部無效；台股補洞每天補一個，
+    補不了的（試了兩次還在）要靠每日維護看到。數不出來是 None，不拖累其他欄位。"""
     us_cal, tw_cal, problems = _calendars(store)
     until: dict[str, Any] = {}
     unclassified: dict[str, int] = {}
+    missing: dict[str, Any] = {}
     for name, cal in (("us", us_cal), ("tw", tw_cal)):
         value = cal.supported_until
         value = value() if callable(value) else value
@@ -304,7 +309,18 @@ def _calendar_coverage(store: market_store.Store) -> dict[str, Any]:
         days = cal.unclassified
         days = days() if callable(days) else days
         unclassified[name] = len(list(days or []))
-    return {"calendar_until": until, "calendar_unclassified": unclassified, "calendar_problems": problems}
+        symbol = market_calendar.US_OBSERVED_SYMBOL if name == "us" else market_calendar.TW_OBSERVED_SYMBOL
+        try:
+            rows = store.closes(name, symbol)
+            missing[name] = len(cal.missing_bars(rows[0][0], rows[-1][0])) if rows else 0
+        except Exception:  # noqa: BLE001 - 這一項數不出來不能讓整個日曆區塊變 error
+            missing[name] = None
+    return {
+        "calendar_until": until,
+        "calendar_unclassified": unclassified,
+        "calendar_missing_bars": missing,
+        "calendar_problems": problems,
+    }
 
 
 def _collect_worker(args: argparse.Namespace, paths: market_paths.Paths, wall: Callable[[], float]) -> int:

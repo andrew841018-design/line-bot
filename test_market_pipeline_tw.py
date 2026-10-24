@@ -409,6 +409,56 @@ def test_allbut_keeps_all_common_stocks_short_and_tracked_long(env):
     assert summary["days"][days[-1].isoformat()]["adv_limit"] == 19
 
 
+def test_old_tw_gaps_are_backfilled_one_per_day(env):
+    """2026-10-23（tw_history (a)）：2026-07-10 那種休市表沒寫的臨時休市是 FinMind bootstrap 帶進來的洞，補洞只看最近
+    10 個交易日、永遠輪不到，跨過它的 120／240 日窗口全部無效。歷史窗口裡更早的洞（加權指數沒有收盤）每天補一個：
+    證交所與 FinMind 都沒有 → 暫定休市；證交所有 → 存起來。舊日期看收盤（ALLBUT 摘要只留 10 天），不會整年重抓。"""
+    sessions = sessions_before(date(2026, 10, 17), 100)  # 10/16 往前 100 個預期交易日（新到舊）
+    gap_new, gap_old = sessions[72], sessions[80]  # 72、80 個交易日前，休市表沒寫
+    env.store.upsert_closes(tw.MARKET, tw.SYM_TAIEX, [(day, 47000.0, 1) for day in sessions if day not in (gap_new, gap_old)],
+                            tw.SOURCE_FINMIND)
+    seed_days(env, tw.OBS_ALLBUT, sessions[:10])  # 最近 10 個交易日都有了：近期的補洞沒事做
+    closes = {"0050": "109.00", "2330": "2,420.00"}
+    env.http.route("MI_INDEX", lambda url: allbut_payload(gap_old, closes) if day_of(url) == gap_old else NO_DATA)
+    env.http.route("finmindtrade", {"msg": "success", "status": 200, "data": []})
+    ctx = make_ctx(env, at(2026, 10, 17, 10, 0))  # 週六上午
+    assert ctx.tw_cal.missing_bars(sessions[-1], sessions[10]) == [gap_old, gap_new]  # 前提：只有這兩個洞
+    assert tw.allbut_backfill(ctx) == ("history", gap_new)  # 新的先
+    assert run(ctx, "tw.allbut.backfill") == "not_yet"
+    assert env.http.days("MI_INDEX") == [gap_new] and env.http.count("finmindtrade") == 1  # 這一輪只試一個
+    override = env.store.calendar_overrides("tw")[gap_new]
+    assert override["kind"] == "closed" and override["confirmed"] is False and override["evidence"] == tw.TYPHOON_EVIDENCE
+    assert market_calendar.tw_calendar(env.store).is_session(gap_new) is False
+    for minutes in (15, 60, 300):  # 同一天不再試別的舊洞
+        assert tw.allbut_backfill(make_ctx(env, at(2026, 10, 17, 10, 0) + minutes * 60)) is None
+    assert env.http.count("MI_INDEX") == 1
+    # 隔天輪到更舊的那個：證交所有那天的資料 → 存起來，日曆就看得到那天有開
+    ctx = make_ctx(env, at(2026, 10, 18, 10, 0))
+    assert tw.allbut_backfill(ctx) == ("history", gap_old)
+    assert run(ctx, "tw.allbut.backfill") == "ok"
+    assert gap_old in {row.date for row in env.store.closes(tw.MARKET, tw.SYM_TAIEX)}
+    assert market_calendar.tw_calendar(env.store).missing_bars(sessions[-1], sessions[10]) == []
+    assert tw.allbut_backfill(make_ctx(env, at(2026, 10, 19, 10, 0))) is None  # 沒有洞了
+    assert env.http.days("MI_INDEX") == [gap_new, gap_old]
+
+
+def test_an_old_gap_that_stays_is_left_after_two_tries(env):
+    """證交所沒有、FinMind 卻有那天（來源漏日）：不寫休市；隔天再試一次，試了兩次還在就不再試，留給每日維護
+    （outcome 的 calendar_missing_bars）。舊日期的試過次數另外記：一般的 tries 只留最近 40 個日期。"""
+    sessions = sessions_before(date(2026, 10, 17), 40)
+    gap = sessions[30]
+    env.store.upsert_closes(tw.MARKET, tw.SYM_TAIEX, [(day, 47000.0, 1) for day in sessions if day != gap], tw.SOURCE_FINMIND)
+    seed_days(env, tw.OBS_ALLBUT, sessions[:10])
+    env.http.route("MI_INDEX", NO_DATA)
+    env.http.route("finmindtrade", finmind_payload("TAIEX", [(gap, 47000.0, 1, 2)]))
+    for day in (17, 18):
+        ctx = make_ctx(env, at(2026, 10, day, 10, 0))
+        assert tw.allbut_backfill(ctx) == ("history", gap)
+        assert run(ctx, "tw.allbut.backfill") == "not_yet"
+    assert tw.allbut_backfill(make_ctx(env, at(2026, 10, 19, 10, 0))) is None
+    assert env.http.days("MI_INDEX") == [gap, gap] and env.store.calendar_overrides("tw") == {}
+
+
 def test_ledger_refusal_is_not_counted_as_a_try(env):
     env.http.route("MI_INDEX", lambda url: allbut_payload(day_of(url), {"0050": "109.00", "2330": "2,420.00"}))
     ledger = env.store.ledger(now_fn=env.clock, sleep_fn=env.clock.sleep)
@@ -549,6 +599,25 @@ def test_twt49u_chunks_continue_after_the_mac_was_off(env):
     holes = tw.twt49u_chunks([(date(2026, 1, 1), date(2026, 3, 1)), (date(2026, 3, 10), date(2026, 10, 1))],
                              date(2026, 1, 1), date(2026, 10, 5))
     assert holes == [(date(2026, 10, 1), date(2026, 10, 5)), (date(2026, 3, 1), date(2026, 3, 9))]
+
+
+def test_twt49u_runs_at_16_00_even_after_the_midnight_catch_up(env):
+    """2026-10-23（tw_history (c) Step 1）：次數以台北日期計，凌晨 00:0x 補昨天那次用掉當天唯一的名額，16:00 那次
+    從來沒跑過，0050 細節頁每個交易日都要等到隔天凌晨才換到 T。每天上限 1→2：16:30 照跑、涵蓋到 T；隔天就不必再打。"""
+    env.store.add_coverage(tw.COVERAGE_TWT49U, date(2025, 8, 1), date(2026, 10, 16))  # 涵蓋到上週五
+    env.http.route("TWT49U", NO_DATA)
+    assert run(make_ctx(env, at(2026, 10, 20, 0, 5)), "tw.twt49u") == "ok"  # 週二凌晨補到週一
+    assert env.store.coverage(tw.COVERAGE_TWT49U)[-1][1] == date(2026, 10, 19)
+    assert sched(env, tw.TASK_TWT49U)["count"] == 1
+    assert tw.twt49u_core(make_ctx(env, at(2026, 10, 20, 15, 59))) is None
+    ctx = make_ctx(env, at(2026, 10, 20, 16, 30))
+    assert tw.twt49u_core(ctx) == (date(2026, 10, 19), date(2026, 10, 20))
+    assert run(ctx, "tw.twt49u") == "ok"
+    assert env.store.coverage(tw.COVERAGE_TWT49U)[-1][1] == date(2026, 10, 20)
+    asked = [(query(url)["startDate"], query(url)["endDate"]) for url in env.http.calls if "TWT49U" in url]
+    assert asked == [("20261016", "20261019"), ("20261019", "20261020")]
+    for hh, mm in ((0, 5), (8, 0), (15, 59)):  # 隔天：涵蓋已經到週二，不必再打
+        assert tw.twt49u_core(make_ctx(env, at(2026, 10, 21, hh, mm))) is None
 
 
 # ── 休市表 ────────────────────────────────────────────────────────────────────────

@@ -1160,13 +1160,15 @@ def test_fetch_error_propagates_unwrapped():
 # ── 預算表與 import ─────────────────────────────────────────────────────────────────
 def test_endpoint_budget_table():
     twse = [e for e in m.ENDPOINTS.values() if e.host == "www.twse.com.tw"]
-    assert sum(e.daily_max for e in twse) <= m.HOST_DAILY_MAX["www.twse.com.tw"] == 12
+    # 2026-10-23：TWT49U 1→2 之後各端點上限加起來 13（第 2 次只在凌晨補過昨天、或 16:00 那次重試時用到）；
+    # 證交所 www 每天合計仍由主機帳本擋在 12，超過的那次是 budget（沒送出、不算失敗）
+    assert sum(e.daily_max for e in twse) == 13 and m.HOST_DAILY_MAX["www.twse.com.tw"] == 12
     assert m.ENDPOINTS["twse_allbut0999"].earliest_tpe == time(14, 30)
     assert m.ENDPOINTS["twse_bfi82u"].earliest_tpe == time(15, 30)
     assert m.ENDPOINTS["twse_twt49u"].earliest_tpe == time(16, 0)
     assert m.ENDPOINTS["twse_margin_ms"].earliest_tpe == time(21, 30)
     assert (m.ENDPOINTS["twse_allbut0999"].daily_max, m.ENDPOINTS["twse_bfi82u"].daily_max) == (4, 3)
-    assert (m.ENDPOINTS["twse_twt49u"].daily_max, m.ENDPOINTS["twse_margin_ms"].daily_max) == (1, 3)
+    assert (m.ENDPOINTS["twse_twt49u"].daily_max, m.ENDPOINTS["twse_margin_ms"].daily_max) == (2, 3)
     assert m.HOST_MIN_INTERVAL_S["www.twse.com.tw"] >= 10 and m.HOST_MIN_INTERVAL_S["api.finmindtrade.com"] >= 3
     assert "octet-stream" in m.ENDPOINTS["taifex_pcr"].accept
     for endpoint in m.ENDPOINTS.values():

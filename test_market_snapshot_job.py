@@ -769,7 +769,34 @@ def test_calendar_coverage_for_the_outcome(tmp_path):
         store.close()
     assert out["calendar_until"]["us"] is not None and out["calendar_until"]["tw"] is None
     assert out["calendar_unclassified"] == {"us": 0, "tw": 0}
+    assert out.get("calendar_missing_bars") == {"us": 0, "tw": 0}  # 沒有任何收盤：沒有洞可數
     assert job.sanitize(out) == out
+
+
+def test_calendar_missing_bars_counts_holes_inside_the_stored_history(tmp_path):
+    """2026-10-23（tw_history (a)）：已存歷史之內表上是交易日、卻沒有收盤的天數進 outcome，像 2026-07-10 那種休市表
+    沒寫的臨時休市，補洞補不了時每日維護才看得到。只數 SPY／加權指數第一筆到最後一筆之間；寫了休市覆寫就不算。"""
+    from datetime import date, timedelta
+
+    import market_store
+    from jobs import market_snapshot as job
+
+    september = [date(2026, 9, 1) + timedelta(days=n) for n in range(30)]
+    weekdays = [day for day in september if day.weekday() < 5]
+    store = market_store.Store(tmp_path / "h.sqlite")
+    try:
+        rows = [{"date": "2026-01-01", "name": "開國紀念日", "note": "依規定放假1日。", "kind": "closed"}]
+        store.put_obs("tw.holidays.2026", {"year": 2026, "rows": rows, "unknown": []}, data_date=None)
+        hole = date(2026, 9, 15)
+        store.upsert_closes("tw", "TAIEX", [(day, 47000.0, 1) for day in weekdays if day != hole], "test")
+        store.upsert_closes("us", "SPY", [(day, 700.0, 1) for day in weekdays if day != date(2026, 9, 7)], "test")  # 勞動節
+        out = job._calendar_coverage(store)
+        assert out.get("calendar_missing_bars") == {"us": 0, "tw": 1}
+        assert job.sanitize(out) == out
+        store.set_calendar_override("tw", hole, "closed", "allbut0999_empty+finmind_empty")
+        assert job._calendar_coverage(store).get("calendar_missing_bars") == {"us": 0, "tw": 0}
+    finally:
+        store.close()
 
 
 @pytest.mark.parametrize("since", [T0 - 60, T0 - 900, 1e12])

@@ -82,10 +82,12 @@ class Endpoint:
 
 
 ENDPOINTS: dict[str, Endpoint] = {
-    # 證交所 www：五個端點每天合計 12 次（Andrew 接受和 /股票 各自限速）
+    # 證交所 www：五個端點每天合計 12 次（Andrew 接受和 /股票 各自限速）。2026-10-23 起各端點上限加起來 13：
+    # TWT49U 1→2（凌晨 00:0x 補昨天那次會用掉當天唯一的名額，16:00 那次從來沒跑過）；第 2 次只在凌晨補過昨天、
+    # 或 16:00 那次要重試時才用到，合計仍由主機帳本擋在 12（擋下＝budget，沒送出、不算失敗）
     "twse_allbut0999": Endpoint("www.twse.com.tw", time(14, 30), 4, 2 * _MIB, 15.0, ("json",)),
     "twse_bfi82u": Endpoint("www.twse.com.tw", time(15, 30), 3, 256 * _KIB, 15.0, ("json",)),
-    "twse_twt49u": Endpoint("www.twse.com.tw", time(16, 0), 1, 4 * _MIB, 15.0, ("json",)),
+    "twse_twt49u": Endpoint("www.twse.com.tw", time(16, 0), 2, 4 * _MIB, 15.0, ("json",)),
     "twse_margin_ms": Endpoint("www.twse.com.tw", time(21, 30), 3, 256 * _KIB, 15.0, ("json",)),
     "twse_holidays": Endpoint("www.twse.com.tw", None, 1, 256 * _KIB, 15.0, ("json",)),
     # 證交所 OpenAPI（另一個主機；資料本來就晚，不設最早時間）
