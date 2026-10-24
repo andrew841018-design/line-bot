@@ -104,6 +104,7 @@ except Exception as _card_pages_error:  # noqa: BLE001
 from correction_memory import ORGANIC_CORRECTION_PREFIXES, is_question_like
 import feedback_collector
 import gemini_client
+import line_errors
 import line_mentions
 import tiktok_media
 import memory
@@ -358,6 +359,16 @@ _reply_mention_targets_by_token: dict[str, list] = {}
 
 _inbound_reply_lock = threading.Lock()
 _inbound_reply_by_token: dict[str, tuple[str, tuple[str, ...], float]] = {}
+# 2026-10-24: an entry has to outlive the longest processing lease (media: 300 s).  `_reply`
+# finds the inbound event it answers through this registry (the send fence below), and a slow
+# run is exactly the one that reaches the push fallback.
+_INBOUND_REPLY_REGISTRY_TTL_SECONDS = 600
+# Where each reply token led (group, message ids), *kept after the reply was accepted*.  The
+# registry above forgets a token once its reply succeeded; a second run of the same inbound
+# event (the lease ran out while the first was still working) that reaches `_reply` afterwards
+# must still find its way to the event's row and see that it was answered.
+_inbound_ids_by_token: dict[str, tuple[str, tuple[str, ...], float]] = {}
+_INBOUND_IDS_BY_TOKEN_MAX = 1024
 
 
 def _register_inbound_reply_batch(
@@ -378,11 +389,21 @@ def _register_inbound_reply_batch(
         stale = [
             token
             for token, (_, _, seen_at) in _inbound_reply_by_token.items()
-            if now - seen_at > 180
+            if now - seen_at > _INBOUND_REPLY_REGISTRY_TTL_SECONDS
         ]
         for token in stale:
             _inbound_reply_by_token.pop(token, None)
         _inbound_reply_by_token[str(reply_token)] = (group_id, ids, now)
+        _inbound_ids_by_token.pop(str(reply_token), None)
+        _inbound_ids_by_token[str(reply_token)] = (group_id, ids, now)
+        for token in [
+            token
+            for token, (_, _, seen_at) in _inbound_ids_by_token.items()
+            if now - seen_at > _INBOUND_REPLY_REGISTRY_TTL_SECONDS
+        ]:
+            _inbound_ids_by_token.pop(token, None)
+        while len(_inbound_ids_by_token) > _INBOUND_IDS_BY_TOKEN_MAX:
+            _inbound_ids_by_token.pop(next(iter(_inbound_ids_by_token)))
 
 
 def _register_inbound_reply_token(
@@ -493,6 +514,132 @@ def _mark_inbound_reply_completed_no_reply(
                 if _inbound_reply_by_token.get(str(reply_token)) == registered:
                     _inbound_reply_by_token.pop(str(reply_token), None)
     return True
+
+
+class _InboundSendFence(NamedTuple):
+    """The inbound event(s) a reply is fenced for (see `_claim_inbound_send`)."""
+
+    group_id: str
+    message_ids: tuple[str, ...]
+    lease_retry: bool  # an earlier start of this event existed (attempts > 1)
+    seen_at: float = 0.0  # when the token was bound to the event (latency log only)
+
+
+def _claim_inbound_send(reply_token: str | None) -> tuple[str, _InboundSendFence | None]:
+    """Durable send fence (2026-10-24), taken right before `reply_message`.
+
+    The reply token leads to the inbound event(s) through the registry; their rows move to
+    `reply_sending` in one transaction.  From then on a re-run of the same event (LINE
+    redelivered it, a restart orphaned it, the lease ran out), another thread or a restarted
+    process can neither send a second copy nor push after the first one -- including when
+    this send times out and nobody knows whether LINE delivered it.
+
+    Returns ("claimed", fence) | ("blocked", None) -- someone is sending or already sent;
+    do not send | ("untracked", None) -- not an inbound we track; send as before |
+    ("error", None) -- the fence could not be written; do not send (the lease and the
+    attempts cap decide about a re-run).
+    """
+    if not reply_token:
+        return "untracked", None
+    with _inbound_reply_lock:
+        registered = _inbound_reply_by_token.get(str(reply_token))
+        if registered is None:
+            registered = _inbound_ids_by_token.get(str(reply_token))
+    if registered is None:
+        return "untracked", None
+    group_id, message_ids, seen_at = registered
+    try:
+        outcome, lease_retry = memory.claim_inbound_reply(group_id, list(message_ids))
+    except Exception as exc:
+        logger.error(
+            "inbound send fence not written; not sending msgs=%d error_type=%s",
+            len(message_ids),
+            type(exc).__name__,
+        )
+        return "error", None
+    if outcome == "claimed":
+        return outcome, _InboundSendFence(group_id, tuple(message_ids), bool(lease_retry), seen_at)
+    return outcome, None
+
+
+def _release_inbound_send(fence: _InboundSendFence | None) -> None:
+    """LINE refused the reply (a definite 4xx): lift the fence so the event can run again.
+    A failure to lift keeps the fence -- the safe side (no second send)."""
+    if fence is None:
+        return
+    try:
+        memory.release_inbound_reply(fence.group_id, list(fence.message_ids))
+    except Exception as exc:
+        logger.error(
+            "inbound send fence not lifted msgs=%d error_type=%s",
+            len(fence.message_ids),
+            type(exc).__name__,
+        )
+
+
+def _close_inbound_event(
+    reply_token: str | None, fence: _InboundSendFence | None = None
+) -> None:
+    """Nothing more can reach the group for this event (the token is dead and no push may
+    follow, or the push was refused): close it so redeliveries stop re-running the models.
+
+    The registry settles it when it still knows the token; otherwise (another run of the same
+    event already popped the entry) the fence's own identity does."""
+    known = False
+    if reply_token:
+        with _inbound_reply_lock:
+            known = str(reply_token) in _inbound_reply_by_token
+    if known:
+        _mark_inbound_reply_completed_no_reply(reply_token)
+    elif fence is not None:
+        try:
+            memory.mark_inbound_events_completed_no_reply(fence.group_id, list(fence.message_ids))
+        except Exception as exc:
+            logger.error(
+                "inbound event not closed msgs=%d error_type=%s",
+                len(fence.message_ids),
+                type(exc).__name__,
+            )
+
+
+def _settle_inbound_fence_replied(fence: _InboundSendFence | None) -> None:
+    """LINE accepted the send: whatever `_mark_inbound_reply_succeeded` (which goes through the
+    registry) left fenced becomes `replied`, by the fence's own identity.  Normally nothing is
+    left and this is one statement that changes no row."""
+    if fence is None:
+        return
+    try:
+        settled = memory.settle_inbound_reply(fence.group_id, list(fence.message_ids))
+    except Exception as exc:
+        logger.error(
+            "inbound reply accepted but fence not settled msgs=%d error_type=%s",
+            len(fence.message_ids),
+            type(exc).__name__,
+        )
+        return
+    if settled:
+        logger.info(
+            "reply accepted group=%s msgs=%d handler_to_accept_s=%.2f",
+            fence.group_id,
+            len(fence.message_ids),
+            time.time() - (fence.seen_at or time.time()),
+        )
+
+
+def _reply_push_retry_key(
+    group_id: str, fence: _InboundSendFence | None, reply_token: str | None
+) -> str:
+    """Fixed per inbound event, so every run of that event sends the same key: LINE answers
+    409 to the second push and accepts only the first.  The key must not depend on the text
+    (a re-run words the answer differently).  Without a registered event the token stands in."""
+    ids = ",".join(fence.message_ids) if fence is not None else f"token:{reply_token or ''}"
+    return str(_uuid.uuid5(_uuid.NAMESPACE_URL, f"line_bot:reply_push:{group_id}:{ids}"))
+
+
+def _line_error_detail(e: BaseException, *, secrets: tuple[str, ...] = ()) -> str:
+    """Log text for a failed LINE call: status, reason, request id, LINE's message and the
+    refused property -- never the reply token or any chat text (see line_errors)."""
+    return line_errors.error_detail(e, secrets=secrets)
 
 
 def _extract_reply_payload_targets(message: TextMessageContent) -> list:
@@ -3184,6 +3331,14 @@ async def callback(request: Request, x_line_signature: str = Header(None)):
     return {"ok": True}
 
 
+def _burst_owns_message(group_id: str, message_id: str) -> bool:
+    try:
+        return burst_filter.owns_message(group_id, message_id)
+    except Exception as exc:  # a lookup problem must never swallow a message
+        logger.warning("burst ownership lookup failed error_type=%s", type(exc).__name__)
+        return False
+
+
 def _handle_event(event) -> None:
     # MemberJoinedEvent / MemberLeftEvent: 其他成員進出群組
     if isinstance(event, (MemberJoinedEvent, MemberLeftEvent)):
@@ -3237,11 +3392,17 @@ def _handle_event(event) -> None:
         ):
             logger.info("skip redelivered media with confirmed delivery tombstone")
             return
+        if is_redelivery and _burst_owns_message(group_id, msg_id):
+            # 2026-10-24: this process still holds the message (waiting in the burst window or
+            # inside a flush): a second run would only answer it twice.  The lease is not touched.
+            logger.info("skip redelivery state=owned_by_burst msg_id=%s", msg_id)
+            return
         inbound_state = memory.begin_inbound_event(group_id, msg_id)
         if is_redelivery and inbound_state in {
             "replied",
             "completed_no_reply",
             "processing",
+            "reply_sending",  # a reply is on its way or its outcome is unknown: never run it again
         }:
             logger.info(
                 "skip redelivery state=%s msg_id=%s", inbound_state, msg_id
@@ -3848,7 +4009,7 @@ def _try_piggyback_reminders_fast_path(
                 memory.mark_reminder_delivery_claims_uncertain(claims)
             logger.warning(
                 "reminder fast-path reply failed (reminders preserved): %s",
-                str(e)[:200],
+                _line_error_detail(e, secrets=(reply_token,)),
             )
             return False
         try:
@@ -7521,7 +7682,10 @@ def _handle_image_gen(event: MessageEvent, group_id: str, subject: str) -> None:
             )
             _append_bot_turn(group_id, f"[已傳圖] {img_url}")
         except Exception as e:
-            logger.warning("reply ImageMessage failed: %s", e)
+            logger.warning(
+                "reply ImageMessage failed: %s",
+                _line_error_detail(e, secrets=(event.reply_token,)),
+            )
             _reply(event.reply_token, f"圖生成 OK 但傳 LINE 失敗：{e}", group_id=group_id)
         return
 
@@ -12012,7 +12176,10 @@ def _handle_todo_query(
                 )
         logger.info("todo query reply sent group=%s", group_id)
     except Exception as e:
-        logger.warning("todo query reply failed: %s", e)
+        logger.warning(
+            "todo query reply failed: %s",
+            _line_error_detail(e, secrets=(event.reply_token,)),
+        )
 
     memory.append_turn(group_id, "user", _labelled_turn(group_id, clean_text, event=event))
     _append_bot_turn(group_id, reply)
@@ -12484,7 +12651,10 @@ def _handle_calendar_query(
             _archive_sent_texts(group_id, response, [reply_text])
         logger.info("calendar query reply sent group=%s", group_id)
     except Exception as e:
-        logger.warning("calendar query reply failed: %s", e)
+        logger.warning(
+            "calendar query reply failed: %s",
+            _line_error_detail(e, secrets=(event.reply_token,)),
+        )
 
     memory.append_turn(group_id, "user", _labelled_turn(group_id, clean_text, event=event))
     _append_bot_turn(group_id, reply)
@@ -14967,7 +15137,11 @@ def _try_one_shot_reply(event: MessageEvent, group_id: str) -> bool:
         _mark_inbound_reply_succeeded(event.reply_token)
         _archive_sent_texts(group_id, response, [reply_text])
     except Exception as e:
-        logger.warning("one-shot reply failed; preserved group=%s: %s", group_id, str(e)[:300])
+        logger.warning(
+            "one-shot reply failed; preserved group=%s: %s",
+            group_id,
+            _line_error_detail(e, secrets=(event.reply_token,)),
+        )
         return False
     data.pop(group_id, None)
     _save_one_shot_replies(data)
@@ -16015,7 +16189,7 @@ def _drain_pending_for_group(
                 else:
                     logger.warning(
                         "%s pending: push/build failed (%s), kept unprocessed pending for group=%s",
-                        source, str(e)[:120], group_id,
+                        source, _line_error_detail(e), group_id,
                     )
                     if media_delivery_slot is not None:
                         media_delivery_slot.release()
@@ -22413,7 +22587,7 @@ def _try_piggyback_drain_with_reply_token(
         except Exception as e:
             logger.warning(
                 "quota-exhausted piggyback reply failed (pending preserved): %s",
-                str(e)[:200],
+                _line_error_detail(e, secrets=(reply_token,)),
             )
             return
 
@@ -23288,6 +23462,21 @@ def _reply(
         if menu_buttons:
             # LINE shows only the last message's Quick Reply.
             _attach_menu_buttons(messages_to_send[-1], group_id)
+        # Durable send fence (2026-10-24), taken before anything leaves for LINE -- the reply
+        # and the fallback push below.  A re-run of this inbound event (LINE redelivered it, a
+        # restart orphaned it, the lease ran out) that finds the fence, or an accepted reply,
+        # sends nothing.  Returning here, before reminder_delivery_started is set, lets the
+        # `finally` release the reminder claims instead of fencing them as uncertain.
+        send_fence: _InboundSendFence | None = None
+        if group_id:
+            fence_outcome, send_fence = _claim_inbound_send(reply_token)
+            if fence_outcome in ("blocked", "error"):
+                logger.info(
+                    "reply not sent: inbound event is already being answered (%s) group=%s",
+                    fence_outcome,
+                    group_id,
+                )
+                return False
         try:
             reminder_delivery_started = bool(
                 event_delivery_claims or natural_delivery_claims
@@ -23300,6 +23489,7 @@ def _reply(
                     )
                 )
                 _mark_inbound_reply_succeeded(reply_token)
+                _settle_inbound_fence_replied(send_fence)
         except Exception as e:
             delivery_claims = [
                 *event_delivery_claims,
@@ -23311,27 +23501,56 @@ def _reply(
             else:
                 memory.mark_reminder_delivery_claims_uncertain(delivery_claims)
             reminder_delivery_settled = True
-            logger.warning("reply failed: %s", str(e)[:300])
-            if group_id and not definite_reply_failure:
-                logger.warning(
-                    "reply failure ambiguous; skip fallback push to avoid duplicate group=%s",
-                    group_id,
-                )
-                if user_rejected_primary:
+            logger.warning(
+                "reply failed: %s", _line_error_detail(e, secrets=(reply_token,))
+            )
+            if not definite_reply_failure:
+                if line_errors.is_client_error(e):
+                    # LINE refused the request itself (a 4xx that is not about the token):
+                    # nothing was sent, so the fence lifts and the event may be handled again.
+                    _release_inbound_send(send_fence)
+                    if group_id:
+                        logger.warning(
+                            "reply refused by LINE; no fallback push, fence lifted group=%s",
+                            group_id,
+                        )
+                elif group_id:
+                    # Timeout, 5xx, connection error: LINE may have delivered it.  The fence
+                    # stays, so neither a re-run nor a push can send it a second time.
+                    logger.warning(
+                        "reply failure ambiguous; skip fallback push to avoid duplicate group=%s",
+                        group_id,
+                    )
+                if group_id and user_rejected_primary:
                     _mark_inbound_reply_completed_no_reply(reply_token)
                 return False
             # reply_token 明確過期 / invalid / 已用過 → fallback 到 push_message
             if group_id:
-                if primary_suppressed or not allow_push_fallback or _is_market_quote_outbound(text):
+                push_allowed = not (
+                    primary_suppressed
+                    or not allow_push_fallback
+                    or _is_market_quote_outbound(text)
+                )
+                if push_allowed and send_fence is not None and send_fence.lease_retry:
+                    # A run that began as a lease retry never pushes: the first start may have
+                    # delivered something and its outcome is unknown.
+                    logger.info(
+                        "reply token invalid on a lease-retry run; no fallback push group=%s",
+                        group_id,
+                    )
+                    push_allowed = False
+                if not push_allowed:
                     logger.info(
                         "reply token invalid; skip fallback push group=%s quote=%s primary_suppressed=%s",
                         group_id,
                         _is_market_quote_outbound(text),
                         primary_suppressed,
                     )
-                    if user_rejected_primary:
-                        _mark_inbound_reply_completed_no_reply(reply_token)
+                    # The token is dead and no push may follow: nothing more can reach the
+                    # group for this event, so a redelivery would only re-run the models.
+                    _close_inbound_event(reply_token, send_fence)
                     return False
+                push_request_built = False
                 try:
                     _push_text, push_message = _text_message_with_mentions(
                         text,
@@ -23341,15 +23560,20 @@ def _reply(
                         explicit_only=True,
                         reply_targets=reply_targets,
                     )
+                    push_request_built = True
                     with ApiClient(_get_line_config()) as api_client:
                         push_response = MessagingApi(api_client).push_message(
                             PushMessageRequest(
                                 to=group_id,
                                 messages=[push_message],
-                            )
+                            ),
+                            x_line_retry_key=_reply_push_retry_key(
+                                group_id, send_fence, reply_token
+                            ),
                         )
                     logger.info("fallback push_message sent to group=%s", group_id)
                     _mark_inbound_reply_succeeded(reply_token)
+                    _settle_inbound_fence_replied(send_fence)
                     try:
                         archived = False
                         for sent in (
@@ -23393,7 +23617,26 @@ def _reply(
                         )
                     return True
                 except Exception as push_err:
-                    logger.warning("fallback push also failed: %s", str(push_err)[:300])
+                    if _is_line_retry_key_conflict(push_err):
+                        # 409: LINE already accepted a push with this key, so the group has
+                        # this event's answer (an earlier run sent it).  Delivered; the text
+                        # of this run is not archived because it is not what the group saw.
+                        logger.info(
+                            "fallback push: LINE already accepted this retry key group=%s",
+                            group_id,
+                        )
+                        _mark_inbound_reply_succeeded(reply_token)
+                        _settle_inbound_fence_replied(send_fence)
+                        return True
+                    logger.warning(
+                        "fallback push also failed: %s",
+                        _line_error_detail(push_err, secrets=(reply_token,)),
+                    )
+                    if not push_request_built or line_errors.is_client_error(push_err):
+                        # Nothing went out (the request was never built, or LINE refused it)
+                        # and no later run may push: close the event.
+                        _close_inbound_event(reply_token, send_fence)
+                    # else: timeout / 5xx -- the push may have gone out; the fence stays.
             return False
 
         if pending_commit_ids and group_id:

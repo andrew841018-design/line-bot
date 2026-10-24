@@ -49,6 +49,13 @@ _cancelled_generations: dict[str, int] = {}
 _claimed_generations: set[tuple[str, int]] = set()
 _retry_attempts: dict[str, tuple[int, int]] = {}
 _MAX_RETRY_SAFE_ATTEMPTS = 1
+# 2026-10-24: batches a flush thread owns right now -> (group_id, message ids).  Registered in
+# the same lock hold that pops them from _pending, so a message is always either queued or
+# in flight (`owns_message`).  A flush that dies still clears its entry in `finally`; the cap
+# only bounds a leak that should not happen.
+_inflight: dict[int, tuple[str, tuple[str, ...]]] = {}
+_inflight_seq = 0
+_INFLIGHT_MAX = 64
 
 # main.py 在 import 後注入的 callback；簽名包含整個 burst 的 message_ids。
 _on_flush: Callable[[str, str, str, list[str]], None] | None = None
@@ -239,6 +246,11 @@ def _flush_burst(
         pending = _pending.pop(group_id, None)
         _timers.pop(group_id, None)
         reply_token = _last_reply_tokens.pop(group_id, None)
+        inflight_key = (
+            _begin_inflight_locked(group_id, pending)
+            if pending and reply_token is not None
+            else None
+        )
 
     if not pending or reply_token is None:
         with _lock:
@@ -283,6 +295,40 @@ def _flush_burst(
     finally:
         with _lock:
             _claimed_generations.discard((group_id, processing_generation))
+            _inflight.pop(inflight_key, None)
+
+
+def _begin_inflight_locked(
+    group_id: str, pending: list[tuple[str, str, str | None, float]]
+) -> int:
+    """Register a batch a flush thread is taking.  The caller holds ``_lock``."""
+    global _inflight_seq
+    _inflight_seq += 1
+    _inflight[_inflight_seq] = (
+        group_id,
+        tuple(str(message_id) for message_id, *_rest in pending if message_id),
+    )
+    while len(_inflight) > _INFLIGHT_MAX:
+        _inflight.pop(next(iter(_inflight)))
+    return _inflight_seq
+
+
+def owns_message(group_id: str, message_id: str) -> bool:
+    """True while this process still holds the message: queued in the debounce window (or
+    waiting for the one-minute follow-up) or inside a flush thread.
+
+    A LINE redelivery of such a message must be skipped whatever the inbound lease says --
+    a second run would answer it twice (2026-10-24).
+    """
+    if not group_id or not message_id:
+        return False
+    message_id = str(message_id)
+    with _lock:
+        if any(item[0] == message_id for item in _pending.get(group_id, ())):
+            return True
+        return any(
+            gid == group_id and message_id in ids for gid, ids in _inflight.values()
+        )
 
 
 def _classify_and_maybe_respond(
