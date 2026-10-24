@@ -3,6 +3,8 @@
 main.py 的 /健康 分支照常把訊息接走，這裡一律回固定句：舊卡片上的按鈕仍然點得到，但不會掉進
 一般路由交給模型。不抽取、不回 119、不私訊；週報段落與異常檢查空白；背景什麼都不做。收回訊息
 照樣刪掉那則留言的健康紀錄（盡力而為）。介面、常數與正式版相同（測試確認），不 import 正式版。
+2026-10-23：沒有卡片所以沒有大字版網頁；運動提醒一律不提醒（不搶、不放去重列）。換上這個版本重啟時
+（start_background）把健康卡的大字版網頁全部清掉，收回訊息刪到紀錄時也清（盡力而為）。
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ __all__ = [
     "SHIPPED_HEALTH_BUTTON_TEXTS",
     "CommandReply",
     "RedFlagDecision",
+    "ExerciseNudge",
     "parent_user_id",
     "role_of",
     "handle_command",
@@ -39,6 +42,10 @@ __all__ = [
     "start_background",
     "stop_background",
     "status_summary",
+    "exercise_nudge_enabled",
+    "exercise_nudge_candidate",
+    "claim_exercise_nudge",
+    "release_exercise_nudge",
 ]
 
 FATHER = "爸爸"
@@ -78,6 +85,7 @@ class CommandReply:
     card: dict | None = None
     alt_text: str | None = None
     fallback_text: str = FAILURE_TEXT
+    page_card: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -90,6 +98,25 @@ class RedFlagDecision:
     reason: str
     event_ts: float = 0.0
     others: tuple[tuple[str, str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class ExerciseNudge:
+    role: str
+    user_id: str
+    text: str
+    label: str
+    archive_text: str = "爸媽健康：運動提醒"
+
+
+def _purge_health_pages() -> None:
+    """健康卡的大字版網頁全部清掉（盡力而為；card_pages 用到時才 import）。"""
+    try:
+        import card_pages
+
+        card_pages.purge_health_pages()
+    except Exception:
+        pass
 
 
 def parent_user_id(role: str) -> str | None:
@@ -168,13 +195,16 @@ def observe_message(
 
 
 def forget_message(group_id: str, message_id: str, *, db_path=None) -> int:
-    """停用期間收回訊息照樣刪掉那則留言的健康紀錄（使用者要求的刪除不能停）。"""
+    """停用期間收回訊息照樣刪掉那則留言的健康紀錄（使用者要求的刪除不能停）；刪到紀錄時大字版網頁也清掉。"""
     try:
         import parent_health_db
 
-        return parent_health_db.delete_message_events(group_id, str(message_id or ""), db_path=db_path)
+        deleted = parent_health_db.delete_message_events(group_id, str(message_id or ""), db_path=db_path)
     except Exception:
         return 0
+    if deleted:
+        _purge_health_pages()
+    return deleted
 
 
 def weekly_section(group_id: str, now: float | None = None) -> str:
@@ -190,6 +220,8 @@ def run_daily_check(now: float | None = None) -> int:
 
 
 def start_background() -> None:
+    """換上停用版重啟時：健康卡的大字版網頁全部清掉（緊急停用不能留著拿到連結就看得到的頁）。"""
+    _purge_health_pages()
     return None
 
 
@@ -199,3 +231,23 @@ def stop_background(timeout: float = 2.0) -> None:
 
 def status_summary(now: float | None = None) -> dict:
     return {"status": "disabled"}
+
+
+def exercise_nudge_enabled() -> bool:
+    return False
+
+
+def exercise_nudge_candidate(
+    group_id: str, messages: list[tuple[str, str | None]], *, now: float | None = None
+) -> ExerciseNudge | None:
+    return None
+
+
+def claim_exercise_nudge(
+    group_id: str, nudge: ExerciseNudge | None, *, now: float | None = None
+) -> tuple[str, int] | None:
+    return None
+
+
+def release_exercise_nudge(group_id: str, nudge: ExerciseNudge | None, claim: tuple[str, int] | None) -> None:
+    return None

@@ -10,6 +10,14 @@ Andrew 2026-10-11 選全 A；2026-10-17 改成「健康預設同意紀錄，不�
 提醒並私訊 Andrew。
 2026-10-17 加「/健康 分析」（Andrew 選全 A）：規則與句子在 parent_health_analysis（純函式，用到時才
 import）；分析卡給全家看（不寫 119），週日晚上私訊 Andrew 完整版，很高的血壓、低血糖併進每日檢查。
+2026-10-23（PLAN A）：
+- 健康卡也有大字版網頁（Andrew：「健康字卡也新增大字的網頁連結」）：三張卡另外組一份網頁版（page_card：
+  回報人寫「家人回報」、不寫 Andrew），main 只拿它做網頁；刪除紀錄、暫停、收回訊息時清掉所有健康頁。
+- 分析卡一定有內容（Andrew：「健康字卡的分析功能每次點都沒有內容」）：每位家長加「最近聽到的」運動、吃藥、
+  血壓、睡眠（只說上次聽到是哪天，不寫「N 天沒運動」）；總覽卡運動列加「上次 M/D」。
+- 運動提醒（Andrew：「提醒爸爸媽媽多久沒運動….合併到爸媽健康那邊，但附帶提醒功能」，選「開口時順便提醒」）：
+  爸媽在群組說話、咪寶本來就要回那批訊息時，順便提一句；每人最多 72 小時一次，開關 LINE_BOT_EXERCISE_NUDGE
+  預設關。這裡只有資格判斷、句子、搶與放去重列；搭在哪則回覆上由 main 決定。
 
 - 全部規則式（parent_health_extract、parent_health_analysis），不送模型或外部服務。Discord 私訊帶角色、
   類別、標籤、天數／時間；很高的血壓、低血糖與週日分析另帶讀數（Andrew 看過含數字的範例後選全 A）。
@@ -26,8 +34,10 @@ import）；分析卡給全家看（不寫 119），週日晚上私訊 Andrew �
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -56,6 +66,7 @@ __all__ = [
     "SHIPPED_HEALTH_BUTTON_TEXTS",
     "CommandReply",
     "RedFlagDecision",
+    "ExerciseNudge",
     "parent_user_id",
     "role_of",
     "handle_command",
@@ -71,6 +82,10 @@ __all__ = [
     "start_background",
     "stop_background",
     "status_summary",
+    "exercise_nudge_enabled",
+    "exercise_nudge_candidate",
+    "claim_exercise_nudge",
+    "release_exercise_nudge",
 ]
 
 # 和 parent_health_extract 相同（測試確認）；這裡寫死，詞表模組壞掉時卡片、同意、暫停照樣能用。
@@ -116,32 +131,57 @@ _DETAIL_ALT = "爸媽健康卡：點開看近 14 天的細節"
 _ANALYSIS_ALT = "爸媽健康卡：點開看爸媽近 14 天的分析"
 _EMPTY = "沒有紀錄"  # 「-」「（無）」「（空）」會被 outbound validator 當成空白佔位擋掉
 
-_RECORDING_EXPLANATION = (
+_EXPLAIN_HEAD = (
     "咪寶會從群組留言整理爸爸、媽媽的用藥、看診、運動、睡眠、飲食和身體狀況（含血壓血糖讀數、不舒服），"
     "在「爸媽健康」卡片給全家看、週日週報有一段、異常和每週日的分析整理會私訊 Andrew；留言提到胸痛、跌倒這類緊急狀況，"
-    "咪寶會在群組提醒就醫或打 119。暫停只停止健康紀錄、卡片、週報段落、私訊和 119 提醒；"
+    "咪寶會在群組提醒就醫或打 119。"
+)
+_EXPLAIN_TAIL = (
+    "暫停只停止健康紀錄、卡片、週報段落、私訊和 119 提醒；"
     "已記的紀錄會保留（記錯的那則，誰都可以引用它再打 /健康 刪除；本人可以打 /健康 刪除我的紀錄 全部刪掉；已經私訊出去的不會收回）；"
     "一般聊天功能照舊（留言還是會像平常一樣被咪寶讀到）。"
 )
-_HELP_TEXT = (
-    "爸媽健康：怎麼用\n"
-    "不用按按鈕：爸爸、媽媽在群組說吃藥了、去散步了、血壓 135/85，咪寶會自動記下\n"
-    "看爸媽近 7 天的整理卡：打 /健康\n"
-    "看近 14 天的細節：打 /健康 爸爸 或 /健康 媽媽\n"
-    "暫停記錄：打 /健康 暫停 爸爸 或 /健康 暫停 媽媽（爸媽本人打 /健康 暫停 也可以）\n"
-    "恢復記錄：打 /健康 恢復 爸爸 或 /健康 恢復 媽媽（爸媽自己暫停的，要本人打 /健康 恢復）\n"
-    "看分析和建議：打 /健康 分析\n"
-    "記錯了：長按那則留言→回覆→打 /健康 刪除\n"
-    "刪掉自己的全部紀錄：本人打 /健康 刪除我的紀錄\n"
-    f"{_RECORDING_EXPLANATION}\n"
-    "分析是依國健署等公開衛教整理的一般建議，不是診斷。"
-)
+# 大字版網頁、運動提醒都關著時的說明（見 _recording_explanation：開著的功能才補一句，GP2 nit）
+_RECORDING_EXPLANATION = _EXPLAIN_HEAD + _EXPLAIN_TAIL
+
+
+def _help_with(explanation: str) -> str:
+    return (
+        "爸媽健康：怎麼用\n"
+        "不用按按鈕：爸爸、媽媽在群組說吃藥了、去散步了、血壓 135/85，咪寶會自動記下\n"
+        "看爸媽近 7 天的整理卡：打 /健康\n"
+        "看近 14 天的細節：打 /健康 爸爸 或 /健康 媽媽\n"
+        "暫停記錄：打 /健康 暫停 爸爸 或 /健康 暫停 媽媽（爸媽本人打 /健康 暫停 也可以）\n"
+        "恢復記錄：打 /健康 恢復 爸爸 或 /健康 恢復 媽媽（爸媽自己暫停的，要本人打 /健康 恢復）\n"
+        "看分析和建議：打 /健康 分析\n"
+        "記錯了：長按那則留言→回覆→打 /健康 刪除\n"
+        "刪掉自己的全部紀錄：本人打 /健康 刪除我的紀錄\n"
+        f"{explanation}\n"
+        "分析是依國健署等公開衛教整理的一般建議，不是診斷。"
+    )
+
+
+_HELP_TEXT = _help_with(_RECORDING_EXPLANATION)
 _CARD_NOTE = "從群組留言整理，只記錄、不診斷"
 # 舊卡片上的「我吃藥了／我有運動」（10/17 起新卡片不再有）
 _AUTO_RECORD_TEXT = "爸媽健康：不用按了，爸爸、媽媽在群組說吃藥了、去散步了，或家人說爸爸吃藥了，咪寶就會自動記下"
 _RECORDED_TEXT = "爸媽健康：記下了。以後在群組說吃藥了、去散步了也會自動記，不用按"
 _ANALYSIS_NOTE = "依國健署等公開衛教整理，不是診斷；不舒服請看醫師"
-_ANALYSIS_DM_NOTE = "每週日的完整整理會私訊 Andrew"
+_LINE_DM = "私訊 Andrew"  # 分析卡「每週日的完整整理會私訊 Andrew」「另外還有 N 項，完整整理每週日私訊 Andrew」
+# 大字版網頁上不放家人名字（2026-10-23 GP1 #9）：私訊對象寫「管理者」、回報人寫「家人」
+_PAGE_DM = "私訊管理者"
+_PAGE_REPORTER = "家人"
+# 分析卡「最近聽到的」（2026-10-23 A2）：(類別, 只算這些標籤（None＝全部）, 卡片上的開頭, 名稱, 括號裡寫什麼)
+# 括號裡：item＝標籤（散步、睡不好）、value＝讀數、""＝只寫日期（吃藥只有一種）
+_RECAP = (
+    ("exercise", None, "🚶 運動", "運動", "item"),
+    ("med", frozenset({"吃藥"}), "💊 吃藥", "吃藥", ""),
+    ("body", frozenset({"血壓"}), "🩺 血壓", "血壓", "value"),
+    ("sleep", None, "😴 睡眠", "睡眠", "item"),
+)
+_RECAP_TITLE = "最近聽到的"
+_RECAP_NOTE = "只記群組裡有說的，沒聽到不代表沒做"
+_NOTHING_TO_NOTE = "目前沒有需要特別注意的項目"
 
 # 紀錄標籤（parent_health_extract.ALLOWED_ITEMS 裡的固定詞；測試確認都在詞表裡）
 _MED_TAKEN = "吃藥"
@@ -179,6 +219,8 @@ class CommandReply:
     card: dict | None = None
     alt_text: str | None = None
     fallback_text: str = FAILURE_TEXT
+    # 2026-10-23：卡片的大字版網頁版（同樣的 bubble、沒有家人名字）；沒有就不做網頁
+    page_card: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -192,6 +234,18 @@ class RedFlagDecision:
     event_ts: float = 0.0  # 訊息時間（unix 秒；私訊寫幾點說的）
     # 同一則提到的另一位家長 (角色, 標籤, 那位的 reason)：只進私訊，結果照那位自己的寫
     others: tuple[tuple[str, str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class ExerciseNudge:
+    """一則運動提醒（2026-10-23 A3）：text 第一行是「@爸爸」、第二行是句子；main 用 user_id 建 mention
+    （label 當顯示字，不會變成「{p1}\\n@爸爸」）。存檔只存 archive_text（不含日期、項目），不進 recall。"""
+
+    role: str
+    user_id: str
+    text: str
+    label: str
+    archive_text: str = "爸媽健康：運動提醒"
 
 
 @dataclass(frozen=True)
@@ -977,24 +1031,98 @@ def _card_texts(node) -> list[str]:
     return texts
 
 
-def _card_reply(alt_text: str, card: dict) -> CommandReply:
-    """送出前自己驗一次（altText 與每個字原樣通過 outbound validator、按鈕長度、JSON 大小）；
-    沒過就回固定句（log 只記種類）。"""
-    try:
-        import output_validator
+def _check_card(alt_text: str, card: dict) -> None:
+    """altText 與每個字原樣通過 outbound validator、按鈕長度、JSON 大小；不合就丟例外。"""
+    import output_validator
 
-        if not alt_text.startswith(CARD_PREFIX) or len(alt_text) > _ALT_MAX:
-            raise ValueError("card alt text")
-        if len(json.dumps(card, ensure_ascii=False).encode("utf-8")) > _CARD_MAX_BYTES:
-            raise ValueError("card too large")
-        for value in [alt_text, *_card_texts(card)]:
-            result = output_validator.validate_outbound_text(value)
-            if not result.ok or result.text != value:
-                raise ValueError("card text rejected by outbound validator")
+    if not alt_text.startswith(CARD_PREFIX) or len(alt_text) > _ALT_MAX:
+        raise ValueError("card alt text")
+    if len(json.dumps(card, ensure_ascii=False).encode("utf-8")) > _CARD_MAX_BYTES:
+        raise ValueError("card too large")
+    for value in [alt_text, *_card_texts(card)]:
+        result = output_validator.validate_outbound_text(value)
+        if not result.ok or result.text != value:
+            raise ValueError("card text rejected by outbound validator")
+
+
+def _card_reply(alt_text: str, card: dict, page_card=None) -> CommandReply:
+    """送出前自己驗一次；LINE 卡沒過就回固定句（log 只記種類）。網頁版（page_card，2026-10-23）另外驗：
+    沒過、或是組網頁版時就出錯（呼叫端傳 None）只是不做網頁，LINE 卡照送。"""
+    try:
+        _check_card(alt_text, card)
     except Exception as exc:
         _err("card check", exc)
         return CommandReply(text=FAILURE_TEXT)
-    return CommandReply(card=card, alt_text=alt_text)
+    if page_card is not None:
+        try:
+            _check_card(alt_text, page_card)
+        except Exception as exc:
+            _err("page card check", exc)
+            page_card = None
+    return CommandReply(card=card, alt_text=alt_text, page_card=page_card)
+
+
+def _page_twin(build, where: str):
+    """組網頁版的卡（GP2 N3：自己包 try/except）；出錯回 None＝不做網頁，LINE 卡照送。"""
+    try:
+        return build()
+    except Exception as exc:
+        _err(f"page card {where}", exc)
+        return None
+
+
+# ── 大字版網頁（card_pages，用到時才 import：import 這個模組時不能帶進 fastapi） ─────────
+
+
+def _purge_health_pages(where: str) -> bool:
+    """刪除紀錄、暫停、收回訊息之後：健康卡的大字版網頁全部清掉（不看開關）。清完回 True；出錯只記種類。"""
+    try:
+        import card_pages
+
+        card_pages.purge_health_pages()
+        return True
+    except Exception as exc:
+        logger.warning("parent health page purge failed where=%s error_type=%s", where, type(exc).__name__)
+        return False
+
+
+def _prune_health_pages() -> None:
+    """每日檢查的執行緒每 10 分鐘順手清過期的健康頁（健康頁關掉時全部清掉）。"""
+    try:
+        import card_pages
+
+        card_pages.prune_health_pages()
+    except Exception as exc:
+        _err("page prune", exc)
+
+
+def _health_page_hours() -> int:
+    """健康卡現在有大字版網頁的話，網頁最多保留幾小時；沒有（關掉、模組壞了）回 0。"""
+    try:
+        import card_pages
+
+        return card_pages.health_ttl_hours() if card_pages.health_enabled() else 0
+    except Exception:
+        return 0
+
+
+def _recording_explanation() -> str:
+    """/健康 說明與恢復回覆的說明：開著的功能才補一句（大字版網頁、運動提醒；GP2 nit）。都關著就是
+    _RECORDING_EXPLANATION。"""
+    extra = ""
+    hours = _health_page_hours()
+    if hours:
+        extra += (
+            f"健康卡可以點「🔍 看大字版」開大字網頁：拿到連結的人都看得到，最多保留 {hours} 小時，"
+            "刪除紀錄或暫停時會一起清掉。"
+        )
+    if exercise_nudge_enabled():
+        extra += "爸爸、媽媽好幾天沒提到運動時，咪寶回話時會順便提醒（每人最多 3 天一次，暫停時也停）。"
+    return _EXPLAIN_HEAD + extra + _EXPLAIN_TAIL
+
+
+def _help_text() -> str:
+    return _help_with(_recording_explanation())
 
 
 def _med_line(s: _Summary) -> str:
@@ -1029,15 +1157,40 @@ def _body_line(s: _Summary) -> str:
     return "、".join(parts) or _EMPTY
 
 
-def _overview_rows(s: _Summary, visits: list[_Visit]) -> list[str]:
+_UNKNOWN = object()  # 查不到上次聽到的日期（分析模組壞了）：運動列照舊只列 7 天
+
+
+def _exercise_line(s: _Summary, last=_UNKNOWN) -> str:
+    """近 7 天的運動，後面加上次聽到是哪天（2026-10-23 A2：看 180 天、這次開始記錄以來；7 天內沒有也寫得出來）。
+    last：parent_health_analysis.last_heard 的結果（None＝還沒聽到過）。"""
+    recent = _days_list(s.exercise, 2)
+    if last is _UNKNOWN:
+        return recent or _EMPTY
+    if last is None:
+        return recent or "還沒聽到"
+    return f"{recent or _EMPTY}，上次 {_md(last.day)}"
+
+
+def _overview_rows(s: _Summary, visits: list[_Visit], last_exercise=_UNKNOWN) -> list[str]:
     return [
         f"💊 用藥：{_med_line(s)}",
         f"🏥 看診：{_visit_line(s, visits)}",
-        f"🚶 運動：{_days_list(s.exercise, 2) or _EMPTY}",
+        f"🚶 運動：{_exercise_line(s, last_exercise)}",
         f"😴 睡眠：{_days_list(s.sleep, 2) or _EMPTY}",
         f"🍚 飲食：{'、'.join(s.diet[:2]) or _EMPTY}",
         f"🩺 身體：{_body_line(s)}",
     ]
+
+
+def _last_exercise(ctx: _Ctx, role: str):
+    """總覽卡運動列的「上次」：分析模組載不進來或出錯回 _UNKNOWN（卡片照舊）。"""
+    try:
+        import parent_health_analysis as analysis
+
+        return analysis.last_heard(_analysis_rows(ctx, role), "exercise", ctx.today)
+    except Exception as exc:
+        _err("exercise last heard", exc)
+        return _UNKNOWN
 
 
 def _tip(summaries: dict[str, _Summary], visits: list[_Visit], today: date) -> str | None:
@@ -1071,7 +1224,10 @@ def _overview(ctx: _Ctx) -> CommandReply:
             body.append(_text(_state_line(ctx, role), color=_GRAY))
             continue
         summaries[role] = summary = _summary(ctx, role)
-        body += [_text(line) for line in _overview_rows(summary, [v for v in visits if v.role == role])]
+        body += [
+            _text(line)
+            for line in _overview_rows(summary, [v for v in visits if v.role == role], _last_exercise(ctx, role))
+        ]
     tip = _tip(summaries, visits, ctx.today)
     if tip:
         body += [_separator(), _text(tip, weight="bold", color=_TIP_COLOR)]
@@ -1082,7 +1238,9 @@ def _overview(ctx: _Ctx) -> CommandReply:
         footer.append(_button("📋 健康分析", "/健康 分析"))
     footer += [_button("📖 怎麼用", "/健康 說明"), _text(_CARD_NOTE, size="md", color=_GRAY)]
     subtitle = f"近 7 天（{_md(ctx.today - timedelta(days=6))}–{_md(ctx.today)}）"
-    return _card_reply(_OVERVIEW_ALT, _bubble("爸媽健康", subtitle, body, footer))
+    card = _bubble("爸媽健康", subtitle, body, footer)
+    # 總覽卡上沒有回報人、也沒有 Andrew：網頁版就是同一張卡
+    return _card_reply(_OVERVIEW_ALT, card, _page_twin(lambda: copy.deepcopy(card), "overview"))
 
 
 def _reporter_label(user_id: str) -> str:
@@ -1106,8 +1264,9 @@ def _item_text(row: dict) -> str:
     return row["item"]
 
 
-def _detail_lines(rows: list[dict], self_user_id: str) -> list[str]:
-    """一天一行、新到舊：「10/11（六）吃藥、散步、血壓 135/85（家人回報）」；家長本人說的不標。"""
+def _detail_lines(rows: list[dict], self_user_id: str, reporter_label=_reporter_label) -> list[str]:
+    """一天一行、新到舊：「10/11（六）吃藥、散步、血壓 135/85（家人回報）」；家長本人說的不標。
+    reporter_label：回報人的稱呼（LINE 卡用本機別名；大字版網頁一律「家人」，2026-10-23）。"""
     days: dict[date, dict[tuple, dict]] = {}
     for row in sorted(rows, key=lambda row: (row["event_ts"], row["event_id"])):
         key = (row["category"], row["item"], row["value"], row["flag"])
@@ -1125,7 +1284,7 @@ def _detail_lines(rows: list[dict], self_user_id: str) -> list[str]:
             if not entry["self"]:
                 reporter = entry["reporter"]
                 if reporter not in labels:
-                    labels[reporter] = _reporter_label(reporter)
+                    labels[reporter] = reporter_label(reporter)
                 text += f"（{labels[reporter]}回報）"
             parts.append(text)
         lines.append(f"{_md_wd(day)}{'、'.join(parts)}")
@@ -1134,19 +1293,29 @@ def _detail_lines(rows: list[dict], self_user_id: str) -> list[str]:
 
 def _detail(ctx: _Ctx, role: str) -> CommandReply:
     state = ctx.states[role]
-    if state == _ON:
-        rows = _events(ctx, role, ctx.today - timedelta(days=13), ctx.today)
-        lines = _detail_lines(rows, ctx.consents[role]["user_id"])
-        body = [_text(line) for line in lines] or [_text("近 14 天沒有紀錄")]
-    else:
-        body = [_text(_state_line(ctx, role), color=_GRAY)]
-    footer = [
-        _text("記錯了：長按那則留言→回覆→打 /健康 刪除", size="md", color=_GRAY),
-        _text(f"要暫停：打 /健康 暫停 {role}", size="md", color=_GRAY),
-        _text(_CARD_NOTE, size="md", color=_GRAY),
-        _button("回爸媽健康卡", "/健康"),
-    ]
-    return _card_reply(_DETAIL_ALT, _bubble(f"{role}近 14 天", "新到舊，一天一行", body, footer))
+    rows = _events(ctx, role, ctx.today - timedelta(days=13), ctx.today) if state == _ON else []
+
+    def body_for(reporter_label) -> list[dict]:
+        if state != _ON:
+            return [_text(_state_line(ctx, role), color=_GRAY)]
+        lines = _detail_lines(rows, ctx.consents[role]["user_id"], reporter_label)
+        return [_text(line) for line in lines] or [_text("近 14 天沒有紀錄")]
+
+    def footer() -> list[dict]:
+        return [
+            _text("記錯了：長按那則留言→回覆→打 /健康 刪除", size="md", color=_GRAY),
+            _text(f"要暫停：打 /健康 暫停 {role}", size="md", color=_GRAY),
+            _text(_CARD_NOTE, size="md", color=_GRAY),
+            _button("回爸媽健康卡", "/健康"),
+        ]
+
+    title, subtitle = f"{role}近 14 天", "新到舊，一天一行"
+    card = _bubble(title, subtitle, body_for(_reporter_label), footer())
+    # 網頁版：回報人一律寫「家人回報」（網頁拿到連結就看得到，不放家人名字）
+    page_card = _page_twin(
+        lambda: _bubble(title, subtitle, body_for(lambda _user_id: _PAGE_REPORTER), footer()), "detail"
+    )
+    return _card_reply(_DETAIL_ALT, card, page_card)
 
 
 # ── 分析卡（/健康 分析，2026-10-17） ───────────────────────────────────────
@@ -1164,8 +1333,35 @@ def _role_visits(visits: list[_Visit], role: str) -> list[tuple[date, str]]:
     return [(visit.day, visit.keyword) for visit in visits if visit.role == role]
 
 
+def _ago(days: int) -> str:
+    return "今天" if days <= 0 else "昨天" if days == 1 else f" {days} 天前"
+
+
+def _recap_lines(analysis, rows: list[dict], today: date, on_day: date) -> tuple[list[str], bool]:
+    """「最近聽到的」（2026-10-23 A2）：運動、吃藥、血壓、睡眠各一行，回 (行, 有沒有一類還沒聽到過)。
+    只說上次聽到是哪天、近 14 天有幾天；從沒聽到就說還沒聽到，絕不寫「N 天沒運動」（沒提到不代表沒做）。
+    rows 是 _analysis_rows（180 天內、這次開始記錄以來）。"""
+    lines: list[str] = []
+    never = False
+    half_year = on_day <= today - timedelta(days=179)  # 開始記錄超過半年：沒聽到只代表這半年
+    for category, items, head, name, detail in _RECAP:
+        heard = analysis.last_heard(rows, category, today, items=items)
+        if heard is None:
+            never = True
+            lines.append(f"{head}：{'近半年沒聽到' if half_year else '還沒聽到'}{name}的紀錄")
+            continue
+        what = {"item": f" {heard.item}", "value": f" 量 {heard.value}"}.get(detail, "")
+        text = f"{head}：上次聽到是{_ago(heard.days_ago)}（{_md(heard.day)}{what}）"
+        if heard.days_14:
+            text += f"；近 14 天有 {heard.days_14} 天"
+        lines.append(text)
+    return lines, never
+
+
 def _analysis(ctx: _Ctx) -> CommandReply:
-    """近 14 天的分析卡：每位家長最多 3 條（緊急的一律列），建議另起一行；不寫 119（當下怎麼做只在私訊）。"""
+    """近 14 天的分析卡：每位家長最多 3 條（緊急的一律列），建議另起一行；不寫 119（當下怎麼做只在私訊）。
+    2026-10-23（Andrew：「分析功能每次點都沒有內容」）：條目後面一律接「最近聽到的」運動、吃藥、血壓、睡眠，
+    沒有條目時寫「目前沒有需要特別注意的項目」。網頁版另外組一份：私訊對象寫「管理者」。"""
     try:
         import parent_health_analysis as analysis
     except Exception as exc:  # 新模組壞了只影響這張卡，/健康 其他功能和 119 照常
@@ -1173,41 +1369,60 @@ def _analysis(ctx: _Ctx) -> CommandReply:
         return _reply(FAILURE_TEXT)
     visits = _safe_upcoming(ctx) if _ON in ctx.states.values() else []
     start = ctx.today - timedelta(days=13)
-    body: list[dict] = []
-    for index, role in enumerate(PARENTS):
-        if index:
-            body.append(_separator())
-        body.append(_text(role, size="xl", weight="bold"))
-        state = ctx.states[role]
-        if state != _ON:
-            body.append(_text(_state_line(ctx, role), color=_GRAY))
+    # 先把每位家長的資料讀好、規則算好，LINE 卡和網頁版各畫一次（不重讀 DB）
+    sections: dict[str, tuple] = {}
+    for role in PARENTS:
+        if ctx.states[role] != _ON:
             continue
         on_day = _local(ctx.consents[role]["on_since"]).date()
-        if on_day > start:
-            body.append(_text(f"從 {_md(on_day)} 開始記錄", size="md", color=_GRAY))
         rows = _analysis_rows(ctx, role)
         shown, hidden = analysis.card_lines(
             analysis.analyze(rows, today=ctx.today, visits=_role_visits(visits, role), pronoun=_PRONOUN[role])
         )
-        if not shown:
-            recent = any(row["day"] >= start for row in rows)
-            body.append(_text("依目前的提醒規則，這段時間沒有要提醒的項目" if recent else "近 14 天沒有紀錄"))
-            continue
-        for finding in shown:
-            body.append(_text(f"{analysis.TONE_EMOJI.get(finding.tone, '📝')} {finding.card}"))
-            if finding.advice:
-                body.append(_text(f"→ {finding.advice}", size="md", color=_TIP_COLOR))
-        if hidden:
-            body.append(_text(f"另外還有 {hidden} 項，完整整理每週日私訊 Andrew", size="md", color=_GRAY))
-    on_roles = [role for role in PARENTS if ctx.states[role] == _ON]
-    footer = [_button(f"看{role}細節", f"/健康 {role}") for role in on_roles]
-    footer += [
-        _button("回爸媽健康卡", "/健康"),
-        _text(_ANALYSIS_NOTE, size="md", color=_GRAY),
-        _text(_ANALYSIS_DM_NOTE, size="md", color=_GRAY),
-    ]
+        recap, never = _recap_lines(analysis, rows, ctx.today, on_day)
+        recent = any(row["day"] >= start for row in rows)
+        sections[role] = (on_day, shown, hidden, recap, never, recent)
+
+    def body_for(dm: str) -> list[dict]:
+        body: list[dict] = []
+        for index, role in enumerate(PARENTS):
+            if index:
+                body.append(_separator())
+            body.append(_text(role, size="xl", weight="bold"))
+            if role not in sections:
+                body.append(_text(_state_line(ctx, role), color=_GRAY))
+                continue
+            on_day, shown, hidden, recap, never, recent = sections[role]
+            # 記錄的開始日每位家長只寫一次：14 天內才開始，或有一類還沒聽到過（說清楚是從哪天開始聽）
+            if on_day > start or (never and on_day > ctx.today - timedelta(days=179)):
+                body.append(_text(f"從 {_md(on_day)} 開始記錄", size="md", color=_GRAY))
+            for finding in shown:
+                body.append(_text(f"{analysis.TONE_EMOJI.get(finding.tone, '📝')} {finding.card}"))
+                if finding.advice:
+                    body.append(_text(f"→ {finding.advice}", size="md", color=_TIP_COLOR))
+            if hidden:
+                body.append(_text(f"另外還有 {hidden} 項，完整整理每週日{dm}", size="md", color=_GRAY))
+            if not shown:
+                body.append(_text(_NOTHING_TO_NOTE if recent else "近 14 天沒有紀錄"))
+            body.append(_text(_RECAP_TITLE, weight="bold"))
+            body += [_text(line) for line in recap]
+        if sections:
+            body.append(_text(_RECAP_NOTE, size="md", color=_GRAY))
+        return body
+
+    def footer_for(dm: str) -> list[dict]:
+        footer = [_button(f"看{role}細節", f"/健康 {role}") for role in PARENTS if role in sections]
+        return footer + [
+            _button("回爸媽健康卡", "/健康"),
+            _text(_ANALYSIS_NOTE, size="md", color=_GRAY),
+            _text(f"每週日的完整整理會{dm}", size="md", color=_GRAY),
+        ]
+
+    title = "📋 爸媽健康分析"
     subtitle = f"近 14 天（{_md(start)}–{_md(ctx.today)}），只看群組有提到的"
-    return _card_reply(_ANALYSIS_ALT, _bubble("📋 爸媽健康分析", subtitle, body, footer))
+    card = _bubble(title, subtitle, body_for(_LINE_DM), footer_for(_LINE_DM))
+    page_card = _page_twin(lambda: _bubble(title, subtitle, body_for(_PAGE_DM), footer_for(_PAGE_DM)), "analysis")
+    return _card_reply(_ANALYSIS_ALT, card, page_card)
 
 
 # ── 指令 ────────────────────────────────────────────────────────────────────
@@ -1257,7 +1472,7 @@ def _resume(ctx: _Ctx, user_id: str | None, target: str | None) -> CommandReply:
         ctx.group_id, role, "on", user_id=user_id, changed_by=user_id, now=ctx.now, db_path=ctx.db_path
     )
     return _reply(
-        f"爸媽健康：已恢復記錄{role}的健康留言。\n{_RECORDING_EXPLANATION}\n"
+        f"爸媽健康：已恢復記錄{role}的健康留言。\n{_recording_explanation()}\n"
         "要暫停：打 /健康 暫停；要刪掉自己的全部紀錄：打 /健康 刪除我的紀錄"
     )
 
@@ -1333,6 +1548,7 @@ def _pause(ctx: _Ctx, role: str, user_id: str | None) -> CommandReply:
         ctx.group_id, role, "paused", user_id=(row or {}).get("user_id") or "", changed_by=user_id or "",
         now=ctx.now, db_path=ctx.db_path,
     )
+    pages_purged = _purge_health_pages("pause")  # 暫停後健康卡的大字版網頁全部清掉（2026-10-23）
     # 寫完的暫停列（照 set_consent：帳號、on_since 保留，沒有列時帳號是空的）決定誰能恢復
     paused_row = {**(row or {"user_id": "", "on_since": 0}), "status": "paused", "changed_by": user_id or ""}
     consents = {**ctx.consents, role: paused_row}
@@ -1345,9 +1561,10 @@ def _pause(ctx: _Ctx, role: str, user_id: str | None) -> CommandReply:
         _send_dm_background(
             f"🩺 爸媽健康：{role}的健康紀錄被家人暫停了（{_hhmm(ctx.now)}），群組 119 提醒也一起停；{how}。"
         )
-    return _reply(
-        f"爸媽健康：已暫停{role}的健康紀錄，卡片、週報段落、私訊和 119 提醒也一起停；已記的紀錄保留。{how}"
-    )
+    # 開著的功能才寫（GP2 nit）：運動提醒（開關開了才有）、大字版網頁（清掉了）
+    stops = "卡片、週報段落、私訊、運動提醒和 119 提醒" if exercise_nudge_enabled() else "卡片、週報段落、私訊和 119 提醒"
+    pages = "，大字版網頁也清掉了" if pages_purged and _health_page_hours() else ""
+    return _reply(f"爸媽健康：已暫停{role}的健康紀錄，{stops}也一起停{pages}；已記的紀錄保留。{how}")
 
 
 def _record(ctx: _Ctx, user_id: str | None, key: str, message_id: str) -> CommandReply:
@@ -1380,6 +1597,7 @@ def _delete_quoted(ctx: _Ctx, quoted_message_id: str | None) -> CommandReply:
     if not quoted_message_id:
         return _reply("爸媽健康：要先長按那則留言→回覆，再打 /健康 刪除")
     deleted = parent_health_db.delete_message_events(ctx.group_id, quoted_message_id, db_path=ctx.db_path)
+    _purge_health_pages("delete")  # 使用者要刪：大字版網頁上的舊紀錄也一起清掉（2026-10-23）
     if deleted:
         return _reply(f"爸媽健康：已刪掉那則留言記下的 {deleted} 筆紀錄")
     return _reply("爸媽健康：那則留言沒有記下健康紀錄")
@@ -1390,6 +1608,7 @@ def _delete_mine(ctx: _Ctx, user_id: str | None) -> CommandReply:
     if role == FAMILY:
         return _reply("爸媽健康：只有爸爸或媽媽本人能刪自己的全部紀錄")
     deleted = parent_health_db.delete_role_events(ctx.group_id, role, db_path=ctx.db_path)
+    _purge_health_pages("delete_mine")
     # 家族主群預設在記錄：刪完之後的留言還會繼續記，講清楚怎麼停
     still = "；之後的留言還會繼續記錄，要停請打 /健康 暫停" if ctx.states.get(role) == _ON else ""
     if deleted:
@@ -1413,7 +1632,7 @@ def handle_command(
             return _reply(FAILURE_TEXT)
         command, arg = _parse_command(body)
         if command == "help":
-            return _reply(_HELP_TEXT)
+            return _reply(_help_text())
         ctx = _context(group_id, _now(now), ensure_default=True)
         if command == "overview":
             return _overview(ctx)
@@ -1436,7 +1655,7 @@ def handle_command(
             return _delete_quoted(ctx, quoted_message_id)
         if command == "delete_mine":
             return _delete_mine(ctx, user_id)
-        return _reply(_HELP_TEXT)
+        return _reply(_help_text())
     except Exception as exc:
         _err("command", exc)
         return _reply(FAILURE_TEXT)
@@ -1626,6 +1845,221 @@ def red_flag_outcome(
         _err("red flag outcome", exc)
 
 
+# ── 運動提醒（2026-10-23，PLAN A A3） ──────────────────────────────────────
+# Andrew：「提醒爸爸媽媽多久沒運動….合併到爸媽健康那邊，但附帶提醒功能」，10/23 選「開口時順便提醒」：
+# 爸爸或媽媽在群組說話、咪寶本來就要回那批訊息時，在回覆最後順便說一句（只用 reply token、不扣推播額度）。
+# 這是「不從沒聽到推論」的明確例外：句子只說「沒聽到」「上次聽到」，絕不寫「N 天沒運動」、不提病名、不說教。
+# 開關預設關：等抽取修正上線、Andrew 看過預覽才開。
+
+_NUDGE_ENV = "LINE_BOT_EXERCISE_NUDGE"  # 1／true／yes／on＝開；沒設或其他值＝關
+_NUDGE_ON = frozenset({"1", "true", "yes", "on"})
+_NUDGE_KIND = "exercise_nudge"  # 去重列：key＝台北日期（同時 flush 的兩批由 PK 仲裁），sent_at 算 72 小時
+_NUDGE_HOURS = (8, 20)  # 台北 08:00 ≤ 現在 < 20:00
+_NUDGE_GAP_DAYS = 3  # 最近一次運動紀錄（沒有就用開始記錄那天）距今天 ≥ 3 個日曆日
+_NUDGE_CAP_S = 72 * 3600  # 同一位家長 72 小時內最多一次（GP1 #3：不能靠 claim_alert 的日期 key）
+_NUDGE_CARE_S = 7 * 86400  # 7 天內有症狀、緊急字詞、看診紀錄就不提醒（GP2 N8）
+_NUDGE_URGENT_S = 14 * 86400  # 14 天內有危象血壓、低血糖就不提醒（GP2 N8）
+_NUDGE_MAX_TEXT = 2000  # 一批送進抽取的總字數上限；超過就看不完，不提醒
+_NUDGE_BLOCK_CATEGORIES = frozenset({"exercise", "body", "visit"})  # 這批提到這些就不提醒
+_NUDGE_URL_RE = re.compile(r"https?://|www\.", re.IGNORECASE)  # 抽取看到網址整則略過：這裡當成看不出來
+# 每個運動標籤的動詞片語（「上次聽到你{…}是 10/20」）；表外的標籤（抽取那邊之後新增的）用「做{標籤}」
+_NUDGE_VERBS = {
+    "散步": "去散步",
+    "爬山": "去爬山",
+    "游泳": "去游泳",
+    "騎腳踏車": "騎腳踏車",
+    "跳舞": "去跳舞",
+    "元極舞": "跳元極舞",
+    "外丹功": "練外丹功",
+    "氣功": "做氣功",
+    "太極": "打太極",
+    "做操": "做操",
+    "甩手": "甩手",
+    "拉筋": "拉筋",
+    "瑜伽": "做瑜伽",
+    "重訓": "做重訓",
+    "健身": "去健身",
+    "跑步": "去跑步",
+    "打球": "去打球",
+    "運動": "去運動",
+}
+# 輪替的句子（依日期與家長輪，同一天同一位家長句子固定：送出前重算要對得上）
+_NUDGE_SEEN = (
+    "上次聽到你{verb}是 {day}，這幾天有空的話出去走走吧～",
+    "上次聽到你{verb}是 {day}，天氣好的話再出去動一動吧～",
+    "記得上次聽到你{verb}是 {day}，最近有空也出去走走吧～",
+)
+_NUDGE_UNSEEN = (
+    "這幾天沒聽到你說去運動，有空的話出去走走吧～",
+    "最近沒聽到你說去運動，天氣好的話出去動一動吧～",
+)
+
+
+def exercise_nudge_enabled() -> bool:
+    """運動提醒的開關（LINE_BOT_EXERCISE_NUDGE；沒設＝關）。每次都重讀環境變數。"""
+    return os.environ.get(_NUDGE_ENV, "").strip().lower() in _NUDGE_ON
+
+
+def _nudge_hour_ok(now: float) -> bool:
+    return _NUDGE_HOURS[0] <= _local(now).hour < _NUDGE_HOURS[1]
+
+
+def _nudge_line(role: str, latest: dict | None, today: date) -> str:
+    """第二行的句子：有運動紀錄就說上次聽到的是哪天、做了什麼（取最後一筆），沒有就說這幾天沒聽到。"""
+    index = today.toordinal() + PARENTS.index(role)
+    if latest is None:
+        return _NUDGE_UNSEEN[index % len(_NUDGE_UNSEEN)]
+    item = str(latest["item"])
+    verb = _NUDGE_VERBS.get(item, f"做{item}")
+    return _NUDGE_SEEN[index % len(_NUDGE_SEEN)].format(verb=verb, day=_md(latest["day"]))
+
+
+def _nudge_needs_care(rows: list[dict], now: float) -> bool:
+    """7 天內有症狀（不是讀數的身體紀錄，含已經好了的緊急字詞）、緊急字詞、看診，或 14 天內有危象血壓、
+    低血糖：這時叫人出去走走不恰當，不提醒（GP2 N8）。"""
+    for row in rows:
+        if row["event_ts"] < now - _NUDGE_CARE_S:
+            continue
+        if row["category"] == "visit":
+            return True
+        if row["category"] == "body" and (row["flag"] or not row["value"]):
+            return True
+    import parent_health_analysis as analysis
+
+    return bool(analysis.urgent_readings(rows, since_ts=now - _NUDGE_URGENT_S))
+
+
+def _nudge_for(ctx: _Ctx, role: str) -> tuple[ExerciseNudge, int] | None:
+    """這位家長現在合不合格（不看這批訊息）：記錄中、72 小時內沒提醒過、沒有要照顧的紀錄、最近一次運動
+    （沒有就用開始記錄那天）距今天 ≥ 3 個日曆日。合格回 (提醒, 上次提醒的時間；沒提醒過是 -1)。
+    句子要原樣通過 outbound validator（GP2 N5：送出前先驗，log 只記原因）。"""
+    user_id = ctx.roles.get(role)
+    if ctx.states.get(role) != _ON or not user_id:
+        return None
+    last = parent_health_db.last_alert(ctx.group_id, role, _NUDGE_KIND, db_path=ctx.db_path)
+    if last is not None and ctx.now - last["sent_at"] < _NUDGE_CAP_S:
+        return None
+    rows = _analysis_rows(ctx, role)  # 180 天內、這次開始記錄以來
+    if _nudge_needs_care(rows, ctx.now):
+        return None
+    exercise = [row for row in rows if row["category"] == "exercise" and not row["flag"]]
+    latest = max(exercise, key=lambda row: (row["event_ts"], row["event_id"])) if exercise else None
+    since = latest["day"] if latest else _local(ctx.consents[role]["on_since"]).date()
+    if (ctx.today - since).days < _NUDGE_GAP_DAYS:
+        return None
+    text = f"@{role}\n{_nudge_line(role, latest, ctx.today)}"
+    import output_validator
+
+    result = output_validator.validate_outbound_text(text)
+    if not result.ok or result.text != text:
+        logger.error("parent health exercise nudge rejected reason=%s", getattr(result, "reason", ""))
+        return None
+    nudge = ExerciseNudge(role=role, user_id=user_id, text=text, label=f"@{role}")
+    return nudge, (-1 if last is None else int(last["sent_at"]))
+
+
+def _batch_blocks_nudge(messages: list[tuple[str, str]], roles: dict[str, str | None]) -> bool:
+    """這批訊息（誰說的都算，GP1 #7）提到運動、身體狀況、看診，或可能有緊急字詞：不提醒。
+    每則用說話者自己的角色、換好稱謂再抽取（和 observe_message 一樣；只呼叫、不改抽取模組）。
+    抽取看不了的（一則超過 MAX_CHARS、有網址、是指令，或整批超過 2000 字）當成「看不出來」，也不提醒：
+    抽取遇到這些會回空的，不能當成沒提到。"""
+    extract = _extract()
+    names = _name_table(roles)
+    others = _other_names(names)
+    limit = int(getattr(extract, "MAX_CHARS", 200))
+    total = 0
+    for user_id, text in messages:
+        norm = _normalize(text).strip()
+        if not norm:
+            continue
+        total += len(norm)
+        if total > _NUDGE_MAX_TEXT or len(norm) > limit or norm.startswith("/") or _NUDGE_URL_RE.search(norm):
+            return True
+        if extract.might_have_red_flag(text):
+            return True
+        findings = extract.extract(
+            _with_parent_titles(text, names), _role_from(roles, user_id), other_names=others
+        )
+        if any(getattr(finding, "category", None) in _NUDGE_BLOCK_CATEGORIES for finding in findings):
+            return True
+    return False
+
+
+def exercise_nudge_candidate(
+    group_id: str, messages: list[tuple[str, str | None]], *, now: float | None = None
+) -> ExerciseNudge | None:
+    """main 在 burst flush（咪寶要回這批訊息）時呼叫：這批有爸爸或媽媽本人的留言、而且合格，就回一則提醒
+    （main 以 reply token 登記，送出時搭在回覆最後）；不合格、開關關著、出錯都回 None。
+
+    messages：這批每則 (說話者 user_id, 文字)；有一則讀不到文字（None）就不提醒（看不出這批說了什麼）。
+    只讀：不寫 DB、不搶去重列（送出前才在 claim_exercise_nudge 搶）。全部條件：
+    - 開關開著、家族主群、台北 08:00 ≤ 現在 < 20:00；
+    - 這批有說話的家長（只認本人的帳號）：記錄中、72 小時內沒提醒過、最近一次運動（沒有就用開始記錄那天）
+      ≥ 3 個日曆日前、7 天內沒有症狀／緊急字詞／看診、14 天內沒有危象血壓／低血糖（_nudge_for）；
+    - 整批沒有提到運動、身體狀況、看診，也沒有可能的緊急字詞（_batch_blocks_nudge）；
+    - 爸媽都合格時只回一則：先輪最久沒被提醒的（沒提醒過的最先，再來是爸爸）。"""
+    try:
+        if not exercise_nudge_enabled() or not group_id or not _default_on(group_id):
+            return None
+        now_f = _now(now)
+        if not _nudge_hour_ok(now_f):
+            return None
+        batch = [(str(user_id or ""), text) for user_id, text in messages or ()]
+        if not batch or any(not isinstance(text, str) for _user_id, text in batch):
+            return None
+        roles = _resolve_roles()
+        speakers = [role for role in PARENTS if roles.get(role) and any(uid == roles[role] for uid, _ in batch)]
+        if not speakers or _batch_blocks_nudge(batch, roles):
+            return None
+        ctx = _context(group_id, now_f)  # 只讀（不補預設列）
+        ready = [found for role in speakers if (found := _nudge_for(ctx, role)) is not None]
+        if not ready:
+            return None
+        return min(ready, key=lambda found: (found[1], PARENTS.index(found[0].role)))[0]
+    except Exception as exc:
+        _err("exercise nudge", exc)
+        return None
+
+
+def claim_exercise_nudge(
+    group_id: str, nudge: ExerciseNudge | None, *, now: float | None = None
+) -> tuple[str, int] | None:
+    """送出前（_reply 裡、靜音檢查之後）呼叫（GP2 N4：flush 時的判斷只是預篩，中間可能隔了好幾秒的模型呼叫）：
+    重算一次這位家長的提醒——開關還開著、還在記錄中（沒暫停）、帳號沒換、72 小時內沒提醒過、紀錄沒變
+    （刪掉紀錄、新的運動、看診都會讓句子不一樣或不合格）——完全一樣才搶今天的去重列（同時 flush 的兩批由 PK
+    仲裁，只有一批搶得到）。搶到回 (key, sent_at)，交給 release_exercise_nudge；其他一律回 None＝丟掉提醒、
+    主回覆照送。"""
+    try:
+        if not isinstance(nudge, ExerciseNudge) or nudge.role not in PARENTS or not exercise_nudge_enabled():
+            return None
+        now_f = _now(now)
+        if not group_id or not _default_on(group_id) or not _nudge_hour_ok(now_f):
+            return None
+        ctx = _context(group_id, now_f)
+        fresh = _nudge_for(ctx, nudge.role)
+        if fresh is None or fresh[0] != nudge:
+            return None
+        key, stamp = ctx.today.isoformat(), int(now_f)
+        if not parent_health_db.claim_alert(group_id, nudge.role, _NUDGE_KIND, key, now=stamp):
+            return None
+        return key, stamp
+    except Exception as exc:
+        _err("exercise nudge claim", exc)
+        return None
+
+
+def release_exercise_nudge(group_id: str, nudge: ExerciseNudge | None, claim: tuple[str, int] | None) -> None:
+    """放掉 claim_exercise_nudge 搶到的那一列：LINE 明確說沒送出（token 錯誤），或搶了卻沒送（組訊息失敗、
+    finally 時還沒送）。只刪這次搶到的列（key 與 sent_at 都要對）；含糊的失敗不要呼叫（寧可少提醒）。"""
+    try:
+        if not isinstance(nudge, ExerciseNudge) or nudge.role not in PARENTS or not claim:
+            return
+        key, sent_at = claim
+        parent_health_db.release_alert(group_id, nudge.role, _NUDGE_KIND, str(key), sent_at=int(sent_at))
+    except Exception as exc:
+        _err("exercise nudge release", exc)
+
+
 # ── Discord 私訊 ────────────────────────────────────────────────────────────
 
 
@@ -1753,19 +2187,23 @@ def observe_message(
 
 def forget_message(group_id: str, message_id: str, *, db_path=None) -> int:
     """收回訊息：刪掉那則留言記下的健康紀錄，回刪除筆數。那則留言的背景抽取若還排在後面，
-    再排一次同樣的刪除（同一個單執行緒 executor、冪等），抽取寫完之後也會被刪掉。"""
+    再排一次同樣的刪除（同一個單執行緒 executor、冪等），抽取寫完之後也會被刪掉。
+    真的刪到紀錄（兩次都算）才清健康卡的大字版網頁（2026-10-23；每則收回都清會讓別人正在看的頁消失）。"""
     message_id = str(message_id or "")
     try:
         deleted = parent_health_db.delete_message_events(group_id, message_id, db_path=db_path)
     except Exception as exc:
         _err("forget", exc)
         deleted = 0
+    if deleted:
+        _purge_health_pages("unsend")
     if _BACKGROUND_ENABLED and db_path is None and group_id and message_id:
         later_db = parent_health_db._DB_PATH
 
         def again() -> None:
             try:
-                parent_health_db.delete_message_events(group_id, message_id, db_path=later_db)
+                if parent_health_db.delete_message_events(group_id, message_id, db_path=later_db):
+                    _purge_health_pages("unsend_queued")
             except Exception as exc:
                 _err("forget queued", exc)
 
@@ -2080,7 +2518,8 @@ def _daily_loop(stop: threading.Event) -> None:
     if stop.wait(_STARTUP_DELAY_S):
         return
     while not stop.is_set():
-        for job in (run_daily_check, _run_weekly_analysis):  # 各自搶、各自出錯
+        # 各自搶、各自出錯；健康卡的大字版網頁（2026-10-23 GP2 N6）過期的也在這裡順手清
+        for job in (run_daily_check, _run_weekly_analysis, _prune_health_pages):
             try:
                 job()
             except Exception as exc:  # 兩個都不丟例外；這裡再接一次，執行緒不會無聲停掉

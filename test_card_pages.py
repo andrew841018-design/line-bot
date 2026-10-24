@@ -1,20 +1,27 @@
 """字卡大字版網頁（2026-10-16）：card_pages.py 與 main 的接線。
 
-2026-10-17：只有股票、FCN 傳 page=True；爸媽健康卡（同樣走 _reply_command_card）不做網頁。
+2026-10-17：只有股票、FCN 傳 page=True。2026-10-23（PLAN A）：爸媽健康卡也做網頁，但只用 parent_health
+組的網頁版（page_card），存在 health/ 子目錄（檔名 sha256(token)、小時 TTL、刪除時清掉）；咪寶不讀自己的
+大字版網頁（safe_fetch、_fetch_urls），log 不記 token。
 卡片一律是合成的；對外網址用暫存的假 tunnel 檔（和 cloudflared wrapper 一樣結尾有換行）；
 頁面寫進每個測試自己的暫存目錄。conftest 預設關掉這個功能，這裡的 fixture 才打開。
 """
 
 from __future__ import annotations
 
+import hashlib
 import html
 import json
+import logging
 import os
 import re
 import stat
+import subprocess
+import sys
 import time
 from collections import OrderedDict
 from datetime import date
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -26,6 +33,8 @@ from linebot.v3.messaging import FlexContainer, FlexMessage  # type: ignore[impo
 import card_pages
 import fcn_eval
 import main
+import parent_health
+import safe_fetch
 import stock_picks
 
 BASE = "https://quiet-river-1234.trycloudflare.com"
@@ -49,8 +58,10 @@ def pages(tmp_path, monkeypatch):
     monkeypatch.setenv(card_pages.DIR_ENV, str(tmp_path / "card_pages"))
     monkeypatch.delenv(card_pages.BASE_URL_ENV, raising=False)
     monkeypatch.delenv(card_pages.TTL_ENV, raising=False)
+    monkeypatch.delenv(card_pages.HEALTH_ENV, raising=False)
+    monkeypatch.delenv(card_pages.HEALTH_TTL_ENV, raising=False)
     monkeypatch.setattr(main.settings, "bot_muted", False)
-    return SimpleNamespace(dir=tmp_path / "card_pages", tunnel=tunnel)
+    return SimpleNamespace(dir=tmp_path / "card_pages", tunnel=tunnel, health=tmp_path / "card_pages" / "health")
 
 
 # ── 合成卡片 ──────────────────────────────────────────────────────────────────
@@ -585,17 +596,28 @@ def test_an_oversized_card_is_sent_without_the_button(pages, monkeypatch):
 # ── 送卡接線 ──────────────────────────────────────────────────────────────────
 
 
-def _send(card, alt, *, page=True):
+def _send(card, alt, *, page=True, page_card=None):
     event = SimpleNamespace(reply_token="TOKEN_CARD_PAGE")
     with patch("main._reply") as reply, patch("main._clear_reply_mention_targets"):
         main._reply_command_card(
-            event, "G_TEST", "/股票", reply_text=None, card=card, alt_text=alt, fallback_text="固定句", page=page
+            event, "G_TEST", "/股票", reply_text=None, card=card, alt_text=alt, fallback_text="固定句", page=page,
+            page_card=page_card,
         )
     reply.assert_called_once()
     return reply.call_args
 
 
-# ── 只有股票、FCN 加按鈕（2026-10-17）：爸媽健康卡也走 _reply_command_card，但絕不做網頁 ──────────
+# ── 只有表列的卡加按鈕；爸媽健康卡（2026-10-23）只用它自己的網頁版 ─────────────────────────────
+
+
+HEALTH_ALT = "爸媽健康卡：點開看近 14 天的細節"
+
+
+def _health_cards():
+    """合成的健康卡（LINE 卡寫回報人的別名）和它的網頁版（寫「家人回報」）。"""
+    card = _bubble(title="爸爸近 14 天", lines=("10/11（六）散步（測試成員甲回報）",), footer=False)
+    twin = _bubble(title="爸爸近 14 天", lines=("10/11（六）散步（家人回報）",), footer=False)
+    return card, twin
 
 
 def test_the_page_is_added_only_when_the_caller_asks(pages):
@@ -604,13 +626,53 @@ def test_the_page_is_added_only_when_the_caller_asks(pages):
     assert not pages.dir.exists()
 
 
-def test_a_health_card_never_gets_a_page_even_if_asked(pages):
-    card = _bubble(title="爸媽健康", lines=("近 7 天的紀錄",), footer=False)
-    alt = "爸媽健康卡：近 7 天紀錄（點開看）"
-    assert main._with_card_page(card, alt) is card
-    sent = _send(card, alt, page=True).kwargs["flex_card"]
+def test_a_health_card_without_its_page_version_never_gets_a_page(pages):
+    """GP2 N3：網頁版是 None（假 reply、停用版、組網頁版出錯）就不做網頁，絕不拿 LINE 卡本身去做。"""
+    card, _twin = _health_cards()
+    assert main._with_card_page(card, HEALTH_ALT) is card
+    sent = _send(card, HEALTH_ALT, page=True).kwargs["flex_card"]
     assert sent == card and _page_links(sent) == [[]]
+    nameless = _bubble(title="爸媽健康", lines=("近 7 天的紀錄",), footer=False)  # 就算卡上剛好沒有名字也一樣
+    assert main._with_card_page(nameless, HEALTH_ALT) is nameless
+    assert main._with_card_page(nameless, HEALTH_ALT, page_card=None) is nameless
     assert not pages.dir.exists()
+
+
+def test_a_health_card_gets_a_private_page_made_from_its_page_version(pages):
+    card, twin = _health_cards()
+    sent = _send(card, HEALTH_ALT, page_card=twin).kwargs["flex_card"]
+    [[action]] = _page_links(sent)
+    token = _token(action["uri"])
+    assert not list(pages.dir.glob("*.html"))  # 一般頁的目錄裡沒有健康頁
+    path = pages.health / (hashlib.sha256(token.encode()).hexdigest() + ".html")  # 檔名不是 token
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600 and stat.S_IMODE(pages.health.stat().st_mode) == 0o700
+    response = TestClient(main.app).get(f"/card/{token}")
+    assert response.status_code == 200 and response.headers["cache-control"] == "no-store"
+    assert "家人回報" in response.text and "測試成員甲" not in response.text
+    assert "最多保留 24 小時" in response.text
+    main._validated_flex_card_message(HEALTH_ALT, sent)
+
+
+def test_a_health_page_version_needs_the_same_bubbles_and_the_validator(pages):
+    card, twin = _health_cards()
+    two = {"type": "carousel", "contents": [twin, twin]}
+    assert _send(card, HEALTH_ALT, page_card=two).kwargs["flex_card"] == card  # #bN 對不上
+    bad = _bubble(lines=("x",), footer=False)
+    bad["body"]["contents"].append({"type": "image", "url": "https://example.com/x.png"})
+    assert _send(card, HEALTH_ALT, page_card=bad).kwargs["flex_card"] == card
+    assert not pages.dir.exists() or not any(pages.dir.rglob("*.html"))
+
+
+@pytest.mark.parametrize("line", ["10/11 散步（測試成員甲回報）", "完整整理每週日私訊 Andrew", "andrew"])
+def test_a_health_page_with_a_family_name_or_andrew_is_never_written(pages, line):
+    page = _bubble(lines=(line,), footer=False)
+    assert card_pages.publish(page, HEALTH_ALT, kind=card_pages.HEALTH) is None
+    assert not pages.health.exists() or not list(pages.health.iterdir())
+    assert card_pages.publish(_bubble(lines=("散步（家人回報）",), footer=False), HEALTH_ALT, kind="health")
+
+
+def test_unknown_page_kinds_are_refused(pages):
+    assert card_pages.publish(_bubble(), "t", kind="other") is None and not pages.dir.exists()
 
 
 @pytest.mark.parametrize("kind", ["stock", "fcn"])
@@ -634,18 +696,30 @@ def test_stock_and_fcn_replies_ask_for_the_page(pages, monkeypatch, kind):
         ("股票推薦：只供參考｜華邦電 2344｜資料到 10/08", True),
         ("股票評估：只供參考｜台積電 2330｜✅ 符合 5 條", True),
         ("FCN 評估：NVDA、TSLA｜偏低", True),
+        ("盤勢：美股｜示意", True),
         ("FCN 評估：我讀到 NVDA、4417｜年利率 18%，點按鈕評估", False),  # 確認卡：沒標籤的數字可能是帳號尾碼
-        ("爸媽健康卡：近 7 天紀錄（點開看）", False),
-        ("爸媽健康卡：點開看爸媽近 14 天的分析", False),  # 2026-10-17 分析卡
+        ("爸媽健康卡：近 7 天紀錄（點開看）", False),  # 沒給網頁版（下一個測試給了才有）
+        ("爸媽健康卡：點開看爸媽近 14 天的分析", False),
         ("咪寶選單：點開看按鈕", False),
         ("其他卡片", False),
     ],
 )
-def test_only_stock_and_fcn_evaluation_cards_get_a_page(pages, alt, gets_page):
+def test_only_listed_cards_get_a_page(pages, alt, gets_page):
     card = _bubble(footer=False)
     sent = main._with_card_page(card, alt)
     assert (sent is not card) is gets_page
     assert pages.dir.exists() is gets_page
+
+
+@pytest.mark.parametrize(
+    "alt", ["爸媽健康卡：點開看爸媽近 7 天的整理", "爸媽健康卡：點開看近 14 天的細節", "爸媽健康卡：點開看爸媽近 14 天的分析"]
+)
+def test_every_health_card_gets_a_page_from_its_page_version(pages, alt):
+    """2026-10-23 反轉 10/17 的排除（Andrew：「健康字卡也新增大字的網頁連結」）：三張健康卡都有網頁。"""
+    card = _bubble(footer=False)
+    sent = main._with_card_page(card, alt, page_card=_bubble(lines=("網頁版",), footer=False))
+    assert sent is not card and [len(x) for x in _page_links(sent)] == [1]
+    assert len(list(pages.health.glob("*.html"))) == 1 and not list(pages.dir.glob("*.html"))
 
 
 def test_the_fcn_confirm_card_is_sent_without_a_page(pages):
@@ -655,7 +729,12 @@ def test_the_fcn_confirm_card_is_sent_without_a_page(pages):
 
 
 def test_the_page_prefixes_follow_the_card_builders():
-    assert main._CARD_PAGE_ALT_PREFIXES == (stock_picks.PREFIX, stock_picks.EVAL_PREFIX, fcn_eval.PREFIX, "盤勢：")
+    assert main._CARD_PAGE_ALT_PREFIXES == (
+        stock_picks.PREFIX, stock_picks.EVAL_PREFIX, fcn_eval.PREFIX, "盤勢：", parent_health.CARD_PREFIX
+    )
+    assert all(alt.startswith(parent_health.CARD_PREFIX) for alt in (
+        parent_health._OVERVIEW_ALT, parent_health._DETAIL_ALT, parent_health._ANALYSIS_ALT
+    ))
     (_eval_card, eval_alt), (_confirm_card, confirm_alt) = _fcn_cards()
     assert eval_alt.startswith(fcn_eval.PREFIX) and not eval_alt.startswith(main._CARD_PAGE_SKIP_ALT_PREFIX)
     assert confirm_alt.startswith(main._CARD_PAGE_SKIP_ALT_PREFIX)
@@ -732,3 +811,284 @@ def test_the_real_reply_sends_the_card_with_the_button(pages):
     sent = api.reply_message.call_args[0][0].messages
     assert len(sent) == 1 and isinstance(sent[0], FlexMessage)
     assert sent[0].contents.to_dict()["contents"][0]["footer"]["contents"][-1]["action"]["type"] == "uri"
+
+
+# ── 健康頁：小時 TTL、開關、各清各的、清光（2026-10-23 PLAN A A1、GP2 N6／N7） ──────────────────
+
+
+def _health_page(pages, char="h"):
+    url = card_pages.publish(_bubble(lines=(f"健康{char}",), footer=False), HEALTH_ALT, kind=card_pages.HEALTH)
+    token = _token(url)
+    return token, pages.health / (hashlib.sha256(token.encode()).hexdigest() + ".html")
+
+
+@pytest.mark.parametrize("value, hours", [("", 24), ("abc", 24), ("nan", 24), ("0", 1), ("99", 72), ("6", 6)])
+def test_the_health_ttl_is_in_hours_parsed_leniently_and_clamped(monkeypatch, value, hours):
+    monkeypatch.setenv(card_pages.HEALTH_TTL_ENV, value)
+    assert card_pages.health_ttl_seconds() == hours * 3600 and card_pages.health_ttl_hours() == hours
+
+
+def test_the_health_note_says_hours_and_that_deleting_clears_it(monkeypatch):
+    monkeypatch.setenv(card_pages.HEALTH_TTL_ENV, "1.5")
+    page = card_pages.render_html(_bubble(), "t", now=1792146600, kind=card_pages.HEALTH)
+    assert "10/16 18:30 產生" in page and "最多保留 2 小時" in page and "刪除紀錄或暫停記錄時會一起清掉" in page
+    assert "最多保留 7 天" in card_pages.render_html(_bubble(), "t")  # 一般頁照舊寫天數
+
+
+def test_the_gone_page_no_longer_names_a_stock_card():
+    response = TestClient(main.app).get("/card/" + "q" * 22)
+    assert response.status_code == 404 and "已經失效" in response.text and "請在群組再叫一次卡片" in response.text
+    assert "股票" not in response.text
+
+
+def test_an_expired_health_page_is_404_and_removed_by_the_route(pages, monkeypatch):
+    token, path = _health_page(pages)
+    client = TestClient(main.app)
+    assert client.get(f"/card/{token}").status_code == 200
+    _age(path, 25 * 3600)  # 一般頁的 7 天還沒到，但健康頁 24 小時過了
+    assert client.get(f"/card/{token}").status_code == 404
+    assert not path.exists()
+
+
+def test_a_health_token_in_another_case_is_404(pages):
+    token, _path = _health_page(pages)
+    swapped = token.swapcase()
+    if swapped != token:  # 這台 Mac 磁碟不分大小寫：檔名是雜湊，大小寫不同就對不到
+        assert TestClient(main.app).get(f"/card/{swapped}").status_code == 404
+
+
+def test_the_health_switch_turns_off_only_health_pages(pages, monkeypatch):
+    token, path = _health_page(pages)
+    stock_token = _token(card_pages.publish(_bubble(), "股票推薦：t"))
+    monkeypatch.setenv(card_pages.HEALTH_ENV, "0")
+    client = TestClient(main.app)
+    assert client.get(f"/card/{token}").status_code == 404 and path.exists()
+    assert client.get(f"/card/{stock_token}").status_code == 200
+    assert card_pages.publish(_bubble(), HEALTH_ALT, kind=card_pages.HEALTH) is None
+    card, twin = _health_cards()
+    assert main._with_card_page(card, HEALTH_ALT, page_card=twin) is card
+    card_pages.prune_health_pages()  # 背景清理：健康頁關掉時全部清掉
+    assert not path.exists() and (pages.dir / f"{stock_token}.html").exists()
+
+
+def test_health_and_stock_pages_are_pruned_by_their_own_rules(pages, monkeypatch):
+    monkeypatch.setattr(card_pages, "HEALTH_MAX_PAGES", 2)
+    monkeypatch.setattr(card_pages, "MAX_PAGES", 2)
+    _old_token, old = _health_page(pages, "0")
+    _age(old, 25 * 3600)
+    stock_paths = [pages.dir / f"{_token(card_pages.publish(_bubble(), 't'))}.html" for _ in range(3)]
+    assert old.exists()  # 清一般頁不會動到 health 子目錄
+    assert [p.exists() for p in stock_paths] == [False, True, True]
+    healthy = [_health_page(pages, str(i))[1] for i in range(1, 4)]
+    assert not old.exists() and [p.exists() for p in healthy] == [False, True, True]
+    assert all(p.exists() for p in stock_paths[1:])  # 存健康頁也不會動到一般頁
+    for path in healthy[1:]:
+        _age(path, 30 * 3600)
+    card_pages.prune_health_pages()  # 每天的健康背景執行緒：過期的清掉
+    assert not any(p.exists() for p in healthy)
+
+
+def test_purging_removes_only_health_pages_even_when_pages_are_off(pages, monkeypatch, tmp_path):
+    _token_a, page = _health_page(pages, "a")
+    stock = pages.dir / f"{_token(card_pages.publish(_bubble(), 't'))}.html"
+    stranger = pages.health / "notes.html"
+    stranger.write_text("keep", encoding="utf-8")
+    outside = tmp_path / "outside.html"
+    outside.write_text("outside", encoding="utf-8")
+    link = pages.health / ("b" * 64 + ".html")
+    link.symlink_to(outside)
+    folder = pages.health / ("c" * 64 + ".html")
+    folder.mkdir()
+    monkeypatch.setenv(card_pages.ENABLED_ENV, "0")  # 關掉之後留下的頁也要清（GP1 #10）
+    assert card_pages.purge_health_pages() == 1
+    assert not page.exists() and stock.exists() and stranger.exists()
+    assert link.is_symlink() and outside.exists() and folder.is_dir()
+
+
+def test_purging_never_follows_a_symlinked_folder(pages, tmp_path):
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir(mode=0o700)
+    victim = elsewhere / ("d" * 64 + ".html")
+    victim.write_text("x", encoding="utf-8")
+    pages.dir.mkdir(mode=0o700)
+    pages.health.symlink_to(elsewhere)
+    assert card_pages.purge_health_pages() == 0 and victim.exists()
+    pages.health.unlink()
+    real = tmp_path / "real_pages"
+    real.mkdir(mode=0o700)
+    (real / "health").mkdir(mode=0o700)
+    kept = real / "health" / ("e" * 64 + ".html")
+    kept.write_text("x", encoding="utf-8")
+    pages.dir.rmdir()
+    pages.dir.symlink_to(real)  # 頁面目錄本身是 symlink
+    assert card_pages.purge_health_pages() == 0 and kept.exists()
+
+
+def test_purging_without_any_folder_is_a_no_op(pages):
+    assert card_pages.purge_health_pages() == 0 and not pages.dir.exists()
+    card_pages.prune_health_pages()
+    assert not pages.dir.exists()
+
+
+@pytest.mark.parametrize("why", ["too_big", "rejected"])
+def test_a_page_whose_button_cannot_be_sent_is_deleted(pages, monkeypatch, why):
+    """GP1 nit：存了頁、加按鈕之後才發現不能送：刪掉剛存的頁（一般頁、健康頁都一樣）。"""
+    if why == "too_big":
+        monkeypatch.setattr(card_pages, "fits_line_limits", lambda _card: False)
+    else:
+        real = main._validated_flex_card_message
+
+        def picky(alt, card):
+            if card_pages._page_buttons(card):
+                raise ValueError("synthetic")
+            return real(alt, card)
+
+        monkeypatch.setattr(main, "_validated_flex_card_message", picky)
+    card, alt = _picks_card()
+    assert _send(card, alt).kwargs["flex_card"] == card
+    health_card, twin = _health_cards()
+    assert _send(health_card, HEALTH_ALT, page_card=twin).kwargs["flex_card"] == health_card
+    assert not list(pages.dir.rglob("*.html"))
+
+
+def test_discard_only_touches_pages_this_process_made(pages):
+    token, path = _health_page(pages)
+    stock_url = card_pages.publish(_bubble(), "t")
+    card_pages.discard(BASE + "/card/" + "z" * 22)  # 格式對，但不是這個程序發的
+    card_pages.discard("https://evil.example.com/card/" + token)
+    assert path.exists() and (pages.dir / f"{_token(stock_url)}.html").exists()
+    card_pages.discard(stock_url + "#b2")
+    card_pages.discard(BASE + "/card/" + token)
+    assert not path.exists() and not (pages.dir / f"{_token(stock_url)}.html").exists()
+    assert not card_pages.page_action_ok({"type": "uri", "label": card_pages.BUTTON_LABEL, "uri": stock_url})
+
+
+# ── log 不記 token（2026-10-23 A1 #4、GP2 N5） ───────────────────────────────────────────
+
+
+def _access_record(path, args=None):
+    return logging.LogRecord(
+        "uvicorn.access", logging.INFO, __file__, 1, '%s - "%s %s HTTP/%s" %d',
+        args if args is not None else ("127.0.0.1:5000", "GET", path, "1.1", 200), None,
+    )
+
+
+@pytest.mark.parametrize(
+    "path, expected",
+    [
+        ("/card/" + "a" * 22, "/card/<redacted>"),
+        ("/card/" + "a" * 22 + "?x=1", "/card/<redacted>?x=1"),
+        ("/card/abc%sdef", "/card/<redacted>"),  # 路徑裡的 %s 只是值，不會被當成格式（百分比編碼的也遮）
+        ("/callback", "/callback"),
+        ("/static/img/" + "a" * 32 + ".png", "/static/img/" + "a" * 32 + ".png"),
+    ],
+)
+def test_the_access_log_filter_hides_only_the_card_token(path, expected):
+    record = _access_record(path)
+    assert main._CardTokenAccessLogFilter().filter(record) is True
+    assert record.args[2] == expected and record.args[:2] == ("127.0.0.1:5000", "GET") and record.args[3:] == ("1.1", 200)
+    assert record.msg == '%s - "%s %s HTTP/%s" %d'
+    record.getMessage()  # 照樣格式化得出來
+
+
+@pytest.mark.parametrize(
+    "args",
+    [None, ("only", "three", "/card/" + "a" * 22), ["127.0.0.1", "GET", "/card/" + "a" * 22, "1.1", 200], ("a", "b", 3, "d", 5)],
+)
+def test_records_the_filter_does_not_understand_pass_untouched(args):
+    record = _access_record("", args=args) if args is not None else logging.LogRecord(
+        "uvicorn.access", logging.INFO, __file__, 1, "plain message", None, None
+    )
+    before = record.args
+    assert main._CardTokenAccessLogFilter().filter(record) is True and record.args == before
+
+
+def test_the_filter_is_installed_once_and_survives_uvicorn_logging_setup(tmp_path):
+    """uvicorn 啟動時的 dictConfig 會換掉整個程序的 log handler：在子程序裡測（import main、裝兩次、
+    dictConfig、用 uvicorn 的 AccessFormatter 格式化），不動到 pytest 自己的 log 擷取。"""
+    code = (
+        "import logging, logging.config\n"
+        "import uvicorn.config, uvicorn.logging\n"
+        "import main\n"
+        "access = logging.getLogger('uvicorn.access')\n"
+        "main._install_card_token_log_filter()\n"
+        "marker = main._CardTokenAccessLogFilter.marker\n"
+        "assert [getattr(f, 'marker', None) for f in access.filters].count(marker) == 1, access.filters\n"
+        "logging.config.dictConfig(uvicorn.config.LOGGING_CONFIG)\n"
+        "assert [getattr(f, 'marker', None) for f in access.filters].count(marker) == 1, access.filters\n"
+        "record = logging.LogRecord('uvicorn.access', logging.INFO, 'x', 1, '%s - \"%s %s HTTP/%s\" %d',\n"
+        "                           ('127.0.0.1:5000', 'GET', '/card/' + 'k' * 22, '1.1', 200), None)\n"
+        "assert access.filter(record)\n"
+        "formatter = uvicorn.logging.AccessFormatter('%(client_addr)s - \"%(request_line)s\" %(status_code)s')\n"
+        "text = formatter.format(record)\n"
+        "assert 'k' * 22 not in text and 'GET /card/<redacted> HTTP/1.1' in text, text\n"
+    )
+    env = {
+        **os.environ,
+        "SQLITE_PATH": str(tmp_path / "subprocess.db"),
+        "LINE_BOT_CARD_PAGES_DIR": str(tmp_path / "pages"),
+        "PYTHONPATH": str(Path(main.__file__).parent),
+    }
+    proc = subprocess.run(  # cwd 在暫存目錄
+        [sys.executable, "-c", code], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=300,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+
+
+def test_a_blocked_reply_preview_never_logs_a_card_token(monkeypatch, caplog):
+    monkeypatch.setattr(
+        main.output_validator, "validate_outbound_text",
+        lambda text: SimpleNamespace(ok=False, text="", reason="synthetic"),
+    )
+    text = f"看這個 {BASE}/card/{'t' * 22} 很清楚"
+    assert main._prepare_outbound_text(text) == ""
+    assert "t" * 22 not in caplog.text and "/card/<redacted>" in caplog.text
+
+
+# ── 咪寶不讀自己的大字版網頁（2026-10-23 GP2 N1） ───────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        BASE + "/card/" + "a" * 22,
+        BASE + "/",  # 自己的 tunnel 上什麼都不讀
+        "https://other-name-99.trycloudflare.com/card/" + "a" * 22,  # 換過網址的舊連結
+        "https://QUIET-river-1234.trycloudflare.com./x",
+        "https://example.com/card/" + "a" * 22,  # 別的主機轉到這條路徑也不讀
+        "https://example.com/card/" + "%61" * 22,  # 百分比編碼（伺服器先解碼再找路由）
+    ],
+)
+def test_the_bot_never_reads_its_own_pages(url):
+    assert safe_fetch.is_bot_page(url)
+    with pytest.raises(safe_fetch.BlockedURL):
+        safe_fetch.public_host(url)
+
+
+def test_the_fixed_page_host_is_also_refused(monkeypatch):
+    monkeypatch.setenv(card_pages.BASE_URL_ENV, "https://bot.example.org:8443")
+    assert safe_fetch.is_bot_page("https://bot.example.org/anything")
+    monkeypatch.delenv(card_pages.BASE_URL_ENV)
+    assert not safe_fetch.is_bot_page("https://bot.example.org/anything")
+
+
+@pytest.mark.parametrize(
+    "url", ["https://example.com/", "https://example.com/card/short", "https://www.youtube.com/watch?v=abc",
+            "https://example.com/blog/cards/" + "a" * 22],
+)
+def test_other_links_are_not_bot_pages(url):
+    assert not safe_fetch.is_bot_page(url)
+    assert safe_fetch.public_host(url)
+
+
+def test_a_pasted_page_link_is_never_fetched_into_a_prompt(monkeypatch, caplog):
+    token = "p" * 22
+    text = f"爸爸的紀錄 {BASE}/card/{token}#b1 和 https://example.com/news"
+    assert main._fetch_urls(text) == ["https://example.com/news"]
+    get = MagicMock(side_effect=AssertionError("must not fetch"))
+    monkeypatch.setattr(main._requests, "get", get)
+    only_page = f"爸爸的紀錄 {BASE}/card/{token}"
+    with caplog.at_level(logging.DEBUG):
+        assert main._prefetch_urls(only_page) == only_page  # 沒有任何網頁內容進 prompt
+    get.assert_not_called()
+    assert token not in caplog.text and "prefetch skip bot page count=1" in caplog.text

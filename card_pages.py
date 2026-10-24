@@ -11,15 +11,21 @@ Andrew：「把字卡（股票/FCN…）部分做微調，由於字實在太小�
   裡的清單，不讀檔），送卡前和 _reply 裡兩次驗證的結果一定相同。
 - 頁面網址帶 22 字隨機 token（secrets.token_urlsafe(16)；這台 Mac 的磁碟不分大小寫，實際約 107 位元以上，
   一樣猜不到）；檔案 0600，超過 TTL 天數就 404；沒有 JavaScript、不載任何外部資源、不給搜尋引擎收錄。
-  TODO(2026-10-17 審查延後)：檔名就是 token；要讓大小寫也算數、檔名不等於憑證，改存 sha256(token) 當檔名。
+  TODO(2026-10-17 審查延後)：一般頁的檔名就是 token；健康頁（下面）已改存 sha256(token)，一般頁還沒改。
 - 不 import main（main 會 import 這裡；import 失敗時 main 不掛路由、不加按鈕、拒收 uri）。
-- 只有股票卡、FCN 評估卡做網頁（2026-10-17，main._reply_command_card 的 page=True 加 altText 正面表列）；
-  爸媽健康卡、FCN 確認卡不做。
+- 只有股票卡、FCN 評估卡、盤勢卡、爸媽健康卡做網頁（main._reply_command_card 的 page=True 加 altText 正面表列）；
+  FCN 確認卡不做。
+- 爸媽健康卡（2026-10-23，Andrew：「健康字卡也新增大字的網頁連結」，推翻 10/17 的排除）：
+  publish(kind="health") 另存 health/ 子目錄，檔名是 sha256(token)（大小寫也算數、檔名不等於憑證），
+  預設 24 小時過期（LINE_BOT_CARD_PAGE_HEALTH_TTL_HOURS，1–72）、最多 100 頁；LINE_BOT_CARD_PAGE_HEALTH=0
+  只關健康頁（股票、FCN 照舊）。頁面不放家人名字：存檔前再檢查一次，有別名或「Andrew」就不存。
+  刪除紀錄、暫停、收回訊息時 purge_health_pages() 全部清掉；過期的由每天的健康背景執行緒順手清（prune_health_pages）。
 """
 
 from __future__ import annotations
 
 import copy
+import hashlib
 import html
 import json
 import logging
@@ -45,9 +51,15 @@ ENABLED_ENV = "LINE_BOT_CARD_PAGES"  # 0／false／no／off = 不產生、不加
 TTL_ENV = "LINE_BOT_CARD_PAGE_TTL_DAYS"
 DIR_ENV = "LINE_BOT_CARD_PAGES_DIR"  # 測試隔離用
 BASE_URL_ENV = "LINE_BOT_CARD_PAGES_BASE_URL"  # 有固定網域時用；平常不設，讀 tunnel 檔
+HEALTH_ENV = "LINE_BOT_CARD_PAGE_HEALTH"  # 0／false／no／off = 爸媽健康卡不做網頁、舊的健康頁一律 404（股票、FCN 照舊）
+HEALTH_TTL_ENV = "LINE_BOT_CARD_PAGE_HEALTH_TTL_HOURS"
 TUNNEL_URL_FILE = "/tmp/cloudflared_line_bot_url.txt"
+DEFAULT = "default"
+HEALTH = "health"  # publish(kind=…) 與子目錄名
 DEFAULT_TTL_DAYS = 7
+DEFAULT_HEALTH_TTL_HOURS = 24
 MAX_PAGES = 500
+HEALTH_MAX_PAGES = 100
 TMP_MAX_AGE_SEC = 3600
 MAX_PAGE_BYTES = 1_000_000
 BUTTON_LABEL = "🔍 看大字版"
@@ -59,6 +71,9 @@ MAX_CARD_BYTES = 30 * 1024
 _OFF = frozenset({"0", "false", "no", "off"})
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{22}")
 _PAGE_NAME_RE = re.compile(r"[A-Za-z0-9_-]{22}\.html")
+_HEALTH_NAME_RE = re.compile(r"[0-9a-f]{64}\.html")  # sha256(token)
+# 健康頁上可以出現的稱謂（其他家人的別名一律不行）
+_HEALTH_PAGE_TITLES = frozenset({"爸爸", "媽媽", "爸媽", "家人"})
 _TMP_PREFIX = ".card-"
 _TMP_NAME_RE = re.compile(r"\.card-[a-z0-9_]{8}\.tmp")  # tempfile.mkstemp 的亂數檔名
 # tunnel 主機：和 health_check.sh、preflight_check.py 一樣排除 api.trycloudflare.com；只收小寫
@@ -97,6 +112,11 @@ def enabled() -> bool:
     return os.environ.get(ENABLED_ENV, "1").strip().lower() not in _OFF
 
 
+def health_enabled() -> bool:
+    """爸媽健康頁的開關（2026-10-23 GP2 N6）：整個功能關掉時也算關；關掉時不存、舊頁 404、背景清理全部刪掉。"""
+    return enabled() and os.environ.get(HEALTH_ENV, "1").strip().lower() not in _OFF
+
+
 def ttl_seconds() -> int:
     try:
         days = float(os.environ.get(TTL_ENV, "").strip() or DEFAULT_TTL_DAYS)
@@ -107,11 +127,32 @@ def ttl_seconds() -> int:
     return int(min(max(days, 1.0), 30.0) * 86400)
 
 
+def health_ttl_seconds() -> int:
+    """健康頁的 TTL：小時，預設 24、夾在 1–72（寫錯、NaN 都當預設）。"""
+    try:
+        hours = float(os.environ.get(HEALTH_TTL_ENV, "").strip() or DEFAULT_HEALTH_TTL_HOURS)
+    except ValueError:
+        hours = DEFAULT_HEALTH_TTL_HOURS
+    if hours != hours:  # NaN
+        hours = DEFAULT_HEALTH_TTL_HOURS
+    return int(min(max(hours, 1.0), 72.0) * 3600)
+
+
+def health_ttl_hours() -> int:
+    """頁尾和 /健康 說明寫的小時數（無條件進位：寫的是「最多保留」）。"""
+    return -(-health_ttl_seconds() // 3600)
+
+
 def pages_dir() -> Path:
     raw = os.environ.get(DIR_ENV, "").strip()
     if raw:  # 轉成絕對路徑但不解 symlink：目錄本身是 symlink 就要被 _dir_ok 擋下
         return Path(os.path.abspath(os.path.expanduser(raw)))
     return Path(__file__).resolve().with_name("state") / "card_pages"
+
+
+def _health_name(token: str) -> str:
+    """健康頁的檔名：sha256(token)。檔名不再等於憑證，大小寫不同的 token 也對不到同一頁。"""
+    return hashlib.sha256(token.encode("ascii")).hexdigest() + ".html"
 
 
 def _private_owned(info: os.stat_result, *, max_mode: int) -> bool:
@@ -210,6 +251,11 @@ def _bubbles(card: Any) -> list[dict]:
     return [b for b in contents if isinstance(b, dict) and b.get("type") == "bubble"] if isinstance(contents, list) else []
 
 
+def bubble_count(card: Any) -> int:
+    """卡片有幾張 bubble（健康卡的網頁版要和 LINE 卡一樣多，錨點才對得上）。"""
+    return len(_bubbles(card))
+
+
 def _page_buttons(card: Any) -> list[dict]:
     found = []
     for bubble in _bubbles(card):
@@ -297,8 +343,9 @@ hr {{ border: 0; border-top: 2px solid #dddddd; margin: 10px 0; width: 100%; }}
 """
 
 
-def render_html(card: dict, title: str, *, now: float | None = None) -> str:
-    """整張卡（bubble 或 carousel）→ 一頁大字版；carousel 每張一段，錨點 #b1、#b2…。"""
+def render_html(card: dict, title: str, *, now: float | None = None, kind: str = DEFAULT) -> str:
+    """整張卡（bubble 或 carousel）→ 一頁大字版；carousel 每張一段，錨點 #b1、#b2…。
+    頁尾寫產生時間和最多保留多久：一般頁寫天數，健康頁（kind="health"）寫小時數、刪除紀錄或暫停時會清掉。"""
     many = isinstance(card, dict) and card.get("type") == "carousel"
     out: list[str] = []
     for index, bubble in enumerate(_bubbles(card), 1):
@@ -312,8 +359,11 @@ def render_html(card: dict, title: str, *, now: float | None = None) -> str:
                 out.append("</div>")
         out.append("</section>")
     made = datetime.fromtimestamp(time.time() if now is None else now, _TZ).strftime("%m/%d %H:%M")
-    days = -(-ttl_seconds() // 86400)  # 無條件進位：頁尾寫的是「最多保留」
-    note = f"咪寶卡片大字版｜{made} 產生｜連結最多保留 {days} 天，咪寶重新連線後可能提早失效，打不開就在群組重叫一次卡片"
+    if kind == HEALTH:
+        keep = f"連結最多保留 {health_ttl_hours()} 小時，刪除紀錄或暫停記錄時會一起清掉"
+    else:
+        keep = f"連結最多保留 {-(-ttl_seconds() // 86400)} 天"  # 無條件進位：頁尾寫的是「最多保留」
+    note = f"咪寶卡片大字版｜{made} 產生｜{keep}，咪寶重新連線後可能提早失效，打不開就在群組重叫一次卡片"
     return _PAGE.format(
         title=html.escape(title or "咪寶卡片", quote=True),
         cards="\n".join(out),
@@ -346,14 +396,24 @@ def _unlink(path: str) -> None:
         pass
 
 
-def _prune(directory: Path, now: float, keep: str) -> None:
-    """只動這個模組自己的檔：過期的頁、超過 MAX_PAGES 的最舊頁、放超過一小時的暫存檔。
+def _prune(
+    directory: Path,
+    now: float,
+    keep: str,
+    *,
+    ttl: int | None = None,
+    max_pages: int | None = None,
+    name_re: re.Pattern[str] = _PAGE_NAME_RE,
+) -> None:
+    """只動這個模組自己的檔：過期的頁、超過上限的最舊頁、放超過一小時的暫存檔。
+    ttl／max_pages／name_re 不給就是一般頁（TTL 天數、MAX_PAGES、22 字檔名）；健康頁另給自己的。
 
-    symlink、目錄、檔名不符的一律不碰；剛寫好的那一頁（keep）不刪。
-    TODO(2026-10-16 審查延後)：啟動時（lifespan）也清一次。現在只在 publish 時清，功能關掉或很久沒人叫卡片時
-    過期頁會留在磁碟上（路由照樣回 404）。
+    symlink、目錄、檔名不符的一律不碰（health 子目錄是目錄，清一般頁時不會被動到）；剛寫好的那一頁（keep）不刪。
+    TODO(2026-10-16 審查延後)：一般頁在啟動時（lifespan）也清一次。現在只在 publish 時清，功能關掉或很久沒人叫卡片時
+    過期頁會留在磁碟上（路由照樣回 404）。健康頁另外由每天的健康背景執行緒清（prune_health_pages）。
     """
-    cutoff = now - ttl_seconds()
+    cutoff = now - (ttl_seconds() if ttl is None else ttl)
+    limit = MAX_PAGES if max_pages is None else max_pages
     pages: list[tuple[float, str]] = []
     with os.scandir(directory) as entries:
         for entry in entries:
@@ -366,26 +426,71 @@ def _prune(directory: Path, now: float, keep: str) -> None:
             if _TMP_NAME_RE.fullmatch(entry.name):
                 if mtime < now - TMP_MAX_AGE_SEC:
                     _unlink(entry.path)
-            elif _PAGE_NAME_RE.fullmatch(entry.name) and entry.name != keep:
+            elif name_re.fullmatch(entry.name) and entry.name != keep:
                 if mtime < cutoff:
                     _unlink(entry.path)
                 else:
                     pages.append((mtime, entry.path))
     pages.sort()
-    for _mtime, path in pages[: max(0, len(pages) - (MAX_PAGES - 1))]:
+    room = limit - 1 if keep else limit  # 剛寫好的那頁也算一頁
+    for _mtime, path in pages[: max(0, len(pages) - room)]:
         _unlink(path)
 
 
-def publish(card: dict, title: str) -> str | None:
-    """存一頁大字版，回頁面網址；關掉、沒有合格的對外網址或目錄、寫檔出錯都回 None（卡片照送、不加按鈕）。"""
-    if not enabled():
+def _family_names() -> set[str]:
+    """本機別名檔與角色檔裡的家人名字（含三字名的短名）；爸爸、媽媽這類稱謂不算。讀不到就丟例外（不存頁）。"""
+    import line_mentions
+
+    names = {str(label or "").strip().lstrip("@").strip() for label in line_mentions.load_user_aliases().values()}
+    names |= set(line_mentions.configured_family_alias_mapping(include_short=True))
+    return {name for name in names if len(name) >= 2 and name not in _HEALTH_PAGE_TITLES}
+
+
+def _card_strings(node: Any, depth: int = 0) -> list[str]:
+    """卡片上所有的字（text 節點、按鈕的 label／text）；只看字，不看 HTML 的樣式（字型名稱不算）。"""
+    found: list[str] = []
+    if depth > _MAX_DEPTH:
+        return found
+    if isinstance(node, dict):
+        if node.get("type") == "text" and isinstance(node.get("text"), str):
+            found.append(node["text"])
+        action = node.get("action")
+        if isinstance(action, dict):
+            found += [value for key in ("label", "text") if isinstance(value := action.get(key), str)]
+        for key, value in node.items():
+            if key != "action":
+                found += _card_strings(value, depth + 1)
+    elif isinstance(node, list):
+        for item in node:
+            found += _card_strings(item, depth + 1)
+    return found
+
+
+def _names_family(card: Any, title: str) -> bool:
+    """健康頁的最後一關（GP2 N3）：卡片上的字（含標題）有家人的別名或「Andrew」。網頁版卡片本來就只寫
+    「家人回報」「私訊管理者」；這裡是怕之後改卡片時漏掉。讀不到別名檔就丟例外（呼叫端當成不存頁）。"""
+    shown = [title or "", *_card_strings(card)]
+    names = _family_names()
+    return any("andrew" in text.casefold() or any(name in text for name in names) for text in shown)
+
+
+def publish(card: dict, title: str, *, kind: str = DEFAULT) -> str | None:
+    """存一頁大字版，回頁面網址；關掉、沒有合格的對外網址或目錄、寫檔出錯都回 None（卡片照送、不加按鈕）。
+
+    kind="health"（爸媽健康卡，2026-10-23）：健康頁開關也要開著；頁面上有家人別名或「Andrew」就不存；
+    存在 health/ 子目錄、檔名 sha256(token)，用健康頁自己的 TTL 與上限清理。"""
+    health = kind == HEALTH
+    if kind not in (DEFAULT, HEALTH) or not enabled() or (health and not health_enabled()):
         return None
     base = public_base_url()
     if base is None:
         logger.info("card page skipped reason=no_public_url")
         return None
     try:
-        page = render_html(card, title)
+        if health and _names_family(card, title):
+            logger.warning("card page skipped reason=family_name kind=health")
+            return None
+        page = render_html(card, title, kind=kind)
         token = secrets.token_urlsafe(16)
         directory = pages_dir()
         try:
@@ -395,17 +500,108 @@ def publish(card: dict, title: str) -> str | None:
         if not _dir_ok(directory):
             logger.warning("card page skipped reason=unsafe_dir")
             return None
-        _write_private(directory / f"{token}.html", page)
+        name = f"{token}.html"
+        if health:
+            directory = directory / HEALTH
+            try:
+                directory.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+            if not _dir_ok(directory):
+                logger.warning("card page skipped reason=unsafe_dir kind=health")
+                return None
+            name = _health_name(token)
+        _write_private(directory / name, page)
     except Exception as exc:
         logger.warning("card page not published error_type=%s", type(exc).__name__)
         return None
     url = f"{base}/card/{token}"
     _remember(url)
     try:
-        _prune(directory, time.time(), keep=f"{token}.html")
+        if health:
+            _prune(directory, time.time(), name, ttl=health_ttl_seconds(), max_pages=HEALTH_MAX_PAGES,
+                   name_re=_HEALTH_NAME_RE)
+        else:
+            _prune(directory, time.time(), keep=name)
     except Exception as exc:  # 清不掉舊頁不影響這一頁
         logger.warning("card page prune failed error_type=%s", type(exc).__name__)
     return url
+
+
+def discard(url: str) -> None:
+    """剛存好、卻沒有送出去的頁（加了按鈕超過 LINE 限制或驗不過）：刪掉，不留一頁沒人點得到、卻拿到網址就看得到的頁。
+    只認這個程序剛發出的網址；不在清單裡的什麼都不做。"""
+    try:
+        match = _PAGE_URI_RE.fullmatch(url or "")
+        if match is None:
+            return
+        page_url = match.group(1)
+        with _MINTED_LOCK:
+            if _MINTED.pop(page_url, False) is False:
+                return
+        token = page_url.rsplit("/", 1)[1]
+        directory = pages_dir()
+        if not _dir_ok(directory):
+            return
+        _unlink(str(directory / f"{token}.html"))
+        if _dir_ok(directory / HEALTH):
+            _unlink(str(directory / HEALTH / _health_name(token)))
+    except Exception as exc:
+        logger.warning("card page discard failed error_type=%s", type(exc).__name__)
+
+
+def purge_health_pages() -> int:
+    """刪掉所有爸媽健康頁，回刪掉幾頁（刪除紀錄、暫停、收回訊息、緊急停用時呼叫）。
+
+    不看開關（GP1 #10）：功能關掉之後留在磁碟上的頁也要清。只刪 health 子目錄裡檔名合規則的一般檔（和暫存檔）：
+    不建目錄、不 rmtree、不跟 symlink（頁面目錄或 health 本身是 symlink、不是自己的都不碰）。失敗只記 warning。"""
+    removed = 0
+    try:
+        parent = os.open(pages_dir(), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return 0  # 沒有頁面目錄＝沒有頁
+    try:
+        try:
+            fd = os.open(HEALTH, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        except OSError:
+            return 0
+        try:
+            if os.fstat(fd).st_uid != os.geteuid():
+                return 0
+            with os.scandir(fd) as entries:
+                for entry in entries:
+                    page = _HEALTH_NAME_RE.fullmatch(entry.name) is not None
+                    if not page and not _TMP_NAME_RE.fullmatch(entry.name):
+                        continue
+                    try:
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                        os.unlink(entry.name, dir_fd=fd)
+                    except OSError:
+                        continue
+                    removed += page
+        finally:
+            os.close(fd)
+    except Exception as exc:
+        logger.warning("health card pages purge failed error_type=%s", type(exc).__name__)
+    finally:
+        os.close(parent)
+    return removed
+
+
+def prune_health_pages(now: float | None = None) -> None:
+    """每天的健康背景執行緒（每 10 分鐘）呼叫（GP2 N6）：過期與超量的健康頁清掉；健康頁關掉時全部清掉。"""
+    try:
+        if not health_enabled():
+            purge_health_pages()
+            return
+        directory = pages_dir() / HEALTH
+        if not _dir_ok(pages_dir()) or not _dir_ok(directory):
+            return  # 還沒有健康頁（或目錄不安全：publish 也不會寫）
+        _prune(directory, time.time() if now is None else now, "", ttl=health_ttl_seconds(),
+               max_pages=HEALTH_MAX_PAGES, name_re=_HEALTH_NAME_RE)
+    except Exception as exc:
+        logger.warning("health card pages prune failed error_type=%s", type(exc).__name__)
 
 
 def page_button(uri: str) -> dict:
@@ -440,17 +636,17 @@ def with_page_button(card: dict, url: str) -> dict:
 
 # ── 路由 ───────────────────────────────────────────────────────────────────────
 
-# TODO(2026-10-16 審查延後)：uvicorn 的 access log（stdout 的 log 檔，0644）會記下 /card/<token>。風險低：
-# 內容本來就公開，token 過 TTL 就失效；要遮的話加一個 logging.Filter。
+# uvicorn 的 access log 會記下 /card/<token>：main 在 import 時給 uvicorn.access 加 filter 遮掉（2026-10-23 A1 #4）。
 router = APIRouter()
 
+# 一般頁和健康頁共用（2026-10-23：不再舉股票的例子）
 _GONE_PAGE = """<!doctype html>
 <html lang="zh-Hant"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex,nofollow"><title>連結已失效</title>
 <style>body{margin:0;padding:32px 20px;font-family:-apple-system,"PingFang TC","Noto Sans TC",sans-serif;
 font-size:24px;line-height:1.6;color:#111111;background:#f2f2f2}</style></head>
-<body><p>這個大字版連結已經失效。請在群組再叫一次卡片（例如再按一次「📈 股票推薦」）。</p></body></html>
+<body><p>這個大字版連結已經失效。請在群組再叫一次卡片。</p></body></html>
 """
 
 
@@ -458,29 +654,41 @@ def _gone() -> HTMLResponse:
     return HTMLResponse(_GONE_PAGE, status_code=404, headers=_HEADERS)
 
 
+def _read_page(path: Path, ttl: int, *, unlink_expired: bool = False) -> str | None:
+    """讀一頁：不是一般檔、太大、過期、讀不了都回 None。unlink_expired：過期的順手刪掉（健康頁，GP1 nit）。"""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    expired = False
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_PAGE_BYTES:
+            return None
+        if time.time() - info.st_mtime > ttl:
+            expired = True
+            return None
+        return os.read(fd, MAX_PAGE_BYTES + 1).decode("utf-8")
+    except (OSError, UnicodeError):
+        return None
+    finally:
+        os.close(fd)
+        if expired and unlink_expired:
+            _unlink(str(path))
+
+
 @router.get("/card/{token}", include_in_schema=False)
 def card_page(token: str) -> HTMLResponse:
-    """大字版頁面：token 格式不對、找不到、過期、不是一般檔、目錄不安全、功能關掉，都回同一個 404。"""
+    """大字版頁面：token 格式不對、找不到、過期、不是一般檔、目錄不安全、功能關掉，都回同一個 404。
+    先找一般頁，再找健康頁（health/sha256(token).html，健康頁開關要開著）；各用各的 TTL。"""
     if not enabled() or not _TOKEN_RE.fullmatch(token or ""):
         return _gone()
     directory = pages_dir()
     if not _dir_ok(directory):
         return _gone()
-    try:
-        fd = os.open(directory / f"{token}.html", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except OSError:
+    body = _read_page(directory / f"{token}.html", ttl_seconds())
+    if body is None and health_enabled() and _dir_ok(directory / HEALTH):
+        body = _read_page(directory / HEALTH / _health_name(token), health_ttl_seconds(), unlink_expired=True)
+    if body is None:
         return _gone()
-    try:
-        info = os.fstat(fd)
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or info.st_size > MAX_PAGE_BYTES
-            or time.time() - info.st_mtime > ttl_seconds()
-        ):
-            return _gone()
-        body = os.read(fd, MAX_PAGE_BYTES + 1).decode("utf-8")
-    except (OSError, UnicodeError):
-        return _gone()
-    finally:
-        os.close(fd)
     return HTMLResponse(body, headers=_HEADERS)

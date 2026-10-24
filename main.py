@@ -275,6 +275,43 @@ if card_pages is not None:
             "card_pages router unavailable error_type=%s", type(_card_router_error).__name__
         )
 
+# 2026-10-23（PLAN A A1 #4、GP2 N5）：大字版網址的 token 拿到就看得到頁面（健康頁有讀數），不進 log。
+# 遮掉 /card/ 後面那一段（被截斷的半個 token、百分比編碼的也遮）；只用一種字元類，線性。
+_CARD_PATH_LOG_RE = re.compile(r"/card/[A-Za-z0-9_%-]+")
+
+
+def _redact_card_paths(text: str) -> str:
+    return _CARD_PATH_LOG_RE.sub("/card/<redacted>", text) if "/card/" in text else text
+
+
+class _CardTokenAccessLogFilter(logging.Filter):
+    """uvicorn.access 的 filter：只改路徑那一個參數（uvicorn 0.32 的 AccessFormatter 固定拆 5 個 args），
+    不改 msg；看不懂的 record 一律原樣放行。舊 log 不動。"""
+
+    marker = "line_bot_card_token_redactor"  # 重複 import（測試、reload）認得出已經裝過
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            args = record.args
+            if isinstance(args, tuple) and len(args) == 5 and isinstance(args[2], str) and "/card/" in args[2]:
+                record.args = (*args[:2], _redact_card_paths(args[2]), *args[3:])
+        except Exception:  # noqa: BLE001 - log 一定要放行
+            pass
+        return True
+
+
+def _install_card_token_log_filter() -> None:
+    """main import 時呼叫一次；已經裝過（同一個 logger 上有同標記的 filter）就不再加。失敗只是沒遮。"""
+    try:
+        access = logging.getLogger("uvicorn.access")
+        if not any(getattr(f, "marker", None) == _CardTokenAccessLogFilter.marker for f in access.filters):
+            access.addFilter(_CardTokenAccessLogFilter())
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger("line_bot").warning("card token log filter not installed error_type=%s", type(exc).__name__)
+
+
+_install_card_token_log_filter()
+
 # Optional jobs router (n8n / external scheduler trigger surface).
 # Feature flag: JOBS_ROUTES_ENABLED=1 enables /jobs/* endpoints.
 if os.getenv("JOBS_ROUTES_ENABLED") == "1":
@@ -390,6 +427,96 @@ def _register_inbound_reply_token(
 ) -> None:
     """Keep the inbound-event identity available to burst reply threads."""
     _register_inbound_reply_batch(reply_token, group_id, [message_id])
+
+
+# ── 爸媽運動提醒（2026-10-23，PLAN A A3）：flush 時決定、以 reply token 登記，送出時才搭上回覆 ─────────
+# Andrew 選「開口時順便提醒」：只搭在咪寶對那批訊息本來就要送的回覆上（不單獨送、不 push、不搶 token）。
+# 被取消的 burst 不會走到 flush，自然沒有候選；搶 token 的訊息（step 7a）不進 burst＝不提醒。
+# 開關 LINE_BOT_EXERCISE_NUDGE 預設關：關著時 flush 不讀 DB、不 import parent_health。
+_EXERCISE_NUDGE_ENV = "LINE_BOT_EXERCISE_NUDGE"  # 和 parent_health 同一個開關（test_exercise_nudge 確認）
+_EXERCISE_NUDGE_TTL_S = 180  # 同 _inbound_reply_by_token：候選只給同一個 token、過了就丟
+_exercise_nudge_lock = threading.Lock()
+_exercise_nudge_by_token: dict[str, tuple[str, object, float]] = {}
+
+
+def _exercise_nudge_on() -> bool:
+    """開關（只讀環境變數，不 import）；parent_health.exercise_nudge_enabled 是同一個判斷。"""
+    return os.environ.get(_EXERCISE_NUDGE_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _register_exercise_nudge(
+    reply_token: str | None, group_id: str, message_ids: list[str] | tuple[str, ...] | None
+) -> None:
+    """burst flush 時：這批有爸爸或媽媽本人的留言而且合格（parent_health.exercise_nudge_candidate），就以 reply
+    token 登記一則運動提醒，等送出時 `_take_exercise_nudge` 拿走。任何錯誤只記種類、不影響回覆（也不會讓
+    burst 走重試）。"""
+    if not _exercise_nudge_on() or not reply_token or not group_id or not message_ids:
+        return
+    try:
+        messages = []
+        for message_id in dict.fromkeys(str(m) for m in message_ids if m):
+            record = memory.get_raw_message_record(group_id, message_id)
+            # 讀不到的那則當成看不出說了什麼（parent_health 收到 None 就不提醒）
+            messages.append((record["user_id"], record["text"]) if record else ("", None))
+        import parent_health
+
+        nudge = parent_health.exercise_nudge_candidate(group_id, messages)
+        now = time.time()
+        with _exercise_nudge_lock:
+            for token in [t for t, (_g, _n, seen) in _exercise_nudge_by_token.items() if now - seen > _EXERCISE_NUDGE_TTL_S]:
+                _exercise_nudge_by_token.pop(token, None)
+            if nudge is None:
+                _exercise_nudge_by_token.pop(str(reply_token), None)
+            else:
+                _exercise_nudge_by_token[str(reply_token)] = (group_id, nudge, now)
+        if nudge is not None:
+            logger.info("exercise nudge candidate registered group=%s", group_id)
+    except Exception as exc:
+        logger.warning("exercise nudge check skipped error_type=%s", type(exc).__name__)
+
+
+def _take_exercise_nudge(reply_token: str | None, group_id: str | None):
+    """`_reply` 用（PLAN A phase 2）：拿走這個 token 登記的運動提醒（只能拿一次）；別的群組、過期、沒有都回 None。
+    關著時不碰任何東西。"""
+    if not reply_token:
+        return None
+    with _exercise_nudge_lock:
+        entry = _exercise_nudge_by_token.pop(str(reply_token), None)
+    if entry is None:
+        return None
+    registered_group, nudge, seen = entry
+    if registered_group != group_id or time.time() - seen > _EXERCISE_NUDGE_TTL_S:
+        return None
+    return nudge
+
+
+def _exercise_nudge_message(nudge):
+    """把運動提醒組成要送的 SDK 訊息（PLAN A phase 2 在 `_reply` 裡用）：第一行用說話者的 user_id 建 mention
+    （GP1 nit：不會變成「{p1}\\n@爸爸」），整則照一般回覆的規則驗過；組不出來或驗不過回 None（丟掉提醒、
+    主回覆照送）。只記錯誤種類。"""
+    try:
+        text = str(getattr(nudge, "text", "") or "")
+        user_id = str(getattr(nudge, "user_id", "") or "")
+        label = str(getattr(nudge, "label", "") or "")
+        if not text or not user_id or not label.startswith("@") or not text.startswith(label + "\n"):
+            return None
+        if _prepare_outbound_text(text, source="exercise_nudge") != text:
+            return None
+        target = line_mentions.MentionTarget(key="p1", kind="user", user_id=user_id, label=label)
+        sent_text, message = _text_message_with_mentions(
+            text,
+            validation_source="exercise_nudge",
+            prepared=True,
+            limit=5000,
+            explicit_only=True,
+            reply_targets=[target],
+        )
+        if sent_text != text:
+            return None
+        return message
+    except Exception as exc:
+        logger.warning("exercise nudge message skipped error_type=%s", type(exc).__name__)
+        return None
 
 
 def _mark_inbound_reply_succeeded(reply_token: str | None) -> None:
@@ -664,7 +791,7 @@ def _prepare_outbound_text(text: str, *, source: str = "reply") -> str:
             "outbound validation blocked source=%s reason=%s preview=%r",
             source,
             result.reason,
-            prepared[:160],
+            _redact_card_paths(prepared[:160]),  # 2026-10-23 GP2 N5：大字版網址的 token 不進 log
         )
         return result.text
     return result.text
@@ -1708,13 +1835,23 @@ def _fetch_urls(text: str) -> list[str]:
 
     Separate from _extract_prefetch_urls, which routing uses: that one has
     already lost a closing 「）」 that belongs to the link (/wiki/台灣（地區）).
+
+    2026-10-23 (GP2 N1): links to the bot's own pages (a pasted 「🔍 看大字版」,
+    which may hold health readings) are dropped here, before any fetcher or
+    log line sees them: never read, never in a prompt, the token never logged.
     """
     urls: list[str] = []
+    own_pages = 0
     for raw in reply_policy.link_urls(text):
         url = raw if re.match(r"https?://", raw, re.IGNORECASE) else f"https://{raw}"
         url = _trim_link(url)
+        if url and safe_fetch.is_bot_page(url):
+            own_pages += 1
+            continue
         if url and url not in urls:
             urls.append(url)
+    if own_pages:
+        logger.info("prefetch skip bot page count=%d", own_pages)
     youtube = [url for url in urls if _is_youtube_url(url)]
     return (youtube + [url for url in urls if url not in youtube])[:_PREFETCH_MAX_URLS]
 
@@ -13210,6 +13347,8 @@ def _handle_burst_flush(
     )
     if message_ids:
         _register_inbound_reply_batch(reply_token, group_id, message_ids)
+        # 2026-10-23 爸媽運動提醒：這批有爸媽本人的留言才評估；開關關著時什麼都不做（不讀 DB、不 import）
+        _register_exercise_nudge(reply_token, group_id, message_ids)
 
     # Finish all database reads before starting asynchronous side work. A known
     # database-open failure is safe to retry only while outbound delivery has
@@ -21127,9 +21266,14 @@ def _quoted_message_id(event, group_id: str) -> str | None:
 
 def _reply_health(event, group_id: str, text: str, body: str) -> None:
     """爸媽健康指令：parent_health 回卡片或文字，一律經 `_reply_command_card`（只用 reply token、不進 recall）。
-    模組載不進來或出錯時回固定句，不會掉進一般路由交給模型。"""
+    模組載不進來或出錯時回固定句，不會掉進一般路由交給模型。
+
+    2026-10-23（Andrew：「健康字卡也新增大字的網頁連結」）：卡片也做大字版網頁，但網頁只用 parent_health
+    另外組好的網頁版（`page_card`：回報人寫「家人回報」、不寫 Andrew）；沒有網頁版就不做網頁（假 reply、
+    停用版沒有這一欄，用 getattr）。"""
     message = event.message
     reply_text, card, alt_text, fallback = _HEALTH_FAILURE_TEXT, None, None, _HEALTH_FAILURE_TEXT
+    page_card = None
     try:
         import parent_health
 
@@ -21143,12 +21287,14 @@ def _reply_health(event, group_id: str, text: str, body: str) -> None:
         fallback = reply.fallback_text or _HEALTH_FAILURE_TEXT
         if reply.card is not None and reply.alt_text:
             reply_text, card, alt_text = None, reply.card, reply.alt_text
+            page_card = getattr(reply, "page_card", None)
         else:
             reply_text = reply.text or fallback
     except Exception as exc:
         logger.error("parent health command failed error_type=%s", type(exc).__name__)
     _reply_command_card(
-        event, group_id, text, reply_text=reply_text, card=card, alt_text=alt_text, fallback_text=fallback
+        event, group_id, text, reply_text=reply_text, card=card, alt_text=alt_text, fallback_text=fallback,
+        page=True, page_card=page_card,
     )
 
 
@@ -21309,6 +21455,7 @@ def _reply_command_card(
     alt_text: str | None,
     fallback_text: str,
     page: bool = False,
+    page_card: dict | None = None,
 ) -> None:
     """FCN、股票推薦與爸媽健康共用的回覆：只用 reply token、不進 recall、不提及任何人（清掉這則訊息
     登記的 mention）；按選單按鈕來的（卡片或文字）都再掛選單。
@@ -21316,8 +21463,8 @@ def _reply_command_card(
     送卡前先驗 altText 不會被改寫、卡片上每個字都過 outbound validator；驗不過就用同一個
     token 回固定句（`_reply` 回 False 也可能是 LINE 400 或靜音，不能拿來判斷要不要補句）。
 
-    ``page``（2026-10-17）：只有股票、FCN 傳 True，才存大字版網頁、加「🔍 看大字版」。預設不加：
-    爸媽健康卡是家人健康紀錄，絕不能變成拿到連結就看得到的網頁。
+    ``page``（2026-10-17）：股票、FCN、盤勢、爸媽健康（2026-10-23）傳 True，才存大字版網頁、加「🔍 看大字版」。
+    ``page_card``：爸媽健康卡的網頁版（沒有家人名字）；健康卡只用它做網頁，沒有就不做（見 `_with_card_page`）。
     """
     _clear_reply_mention_targets(event.reply_token)
     menu_buttons = _is_menu_button_text(text)
@@ -21333,7 +21480,7 @@ def _reply_command_card(
             card, reply_text = None, fallback_text
     if card is not None and alt_text:
         if page:
-            card = _with_card_page(card, alt_text)
+            card = _with_card_page(card, alt_text, page_card=page_card)
         _reply(
             event.reply_token,
             alt_text,
@@ -21353,40 +21500,58 @@ def _reply_command_card(
     )
 
 
-# 2026-10-17 只有這些 altText 開頭的卡做大字版（正面表列：卡上只有公開數字與名稱）；
-# 就是 stock_picks.PREFIX／EVAL_PREFIX、fcn_eval.PREFIX（test_card_pages 有漂移測試）。
-_CARD_PAGE_ALT_PREFIXES = ("股票推薦：", "股票評估：", "FCN 評估：", "盤勢：")  # 盤勢卡上沒有家人資料（2026-10-17）
+# 這些 altText 開頭的卡做大字版（正面表列）；就是 stock_picks.PREFIX／EVAL_PREFIX、fcn_eval.PREFIX、
+# 盤勢卡、parent_health.CARD_PREFIX（test_card_pages 有漂移測試）。
+# 2026-10-23 爸媽健康卡加進來（Andrew：「健康字卡也新增大字的網頁連結」，推翻 10/17 的排除）：
+# 只用 parent_health 組好的網頁版（沒有家人名字），存在健康頁專用的子目錄、24 小時過期，見 `_with_card_page`。
+_CARD_PAGE_ALT_PREFIXES = ("股票推薦：", "股票評估：", "FCN 評估：", "盤勢：", _HEALTH_CARD_PREFIX)
 # FCN 確認卡（fcn_eval.build_confirm_card）不做：它把理專訊息裡沒標籤的 4–6 位數字也當成代號列出，
 # 可能是帳號尾碼，不能放到拿到連結就看得到的網頁。評估卡照做。
 _CARD_PAGE_SKIP_ALT_PREFIX = "FCN 評估：我讀到"
 
 
-def _with_card_page(card: dict, alt_text: str) -> dict:
+def _with_card_page(card: dict, alt_text: str, *, page_card: dict | None = None) -> dict:
     """2026-10-16 字卡大字版：同一張卡存一頁大字版網頁，每張卡加「🔍 看大字版」。
 
     卡片已經驗過才會到這裡；模組不能用、靜音中（_reply 不會送）、沒有對外網址、存檔失敗、
-    加了按鈕驗不過或任何意外，一律送原卡。altText 不是股票推薦／股票評估／FCN 評估卡（或是 FCN 確認卡）
-    也送原卡：爸媽健康卡就算被誤傳 page=True 也不做網頁（另外明擋，雙保險）。
+    加了按鈕驗不過或任何意外，一律送原卡。altText 不在表列（或是 FCN 確認卡）也送原卡。
+    存了頁、加按鈕之後才發現不能送（超過 LINE 限制、驗不過）：刪掉剛存的那頁（不留沒人點得到的頁）。
+
+    爸媽健康卡（2026-10-23，GP2 N3）：網頁只用 ``page_card``（parent_health 組的網頁版，回報人寫「家人回報」、
+    不寫 Andrew），它也要過同一關驗證、bubble 數量和 LINE 卡一樣（#bN 錨點）；沒有網頁版就不做網頁，
+    絕不拿 LINE 卡本身去做。存在健康頁專用的子目錄（card_pages kind="health"）。
     """
     alt = alt_text.lstrip()
     if (
         card_pages is None
         or settings.bot_muted
-        or alt.startswith(_HEALTH_CARD_PREFIX)
         or not alt.startswith(_CARD_PAGE_ALT_PREFIXES)
         or alt.startswith(_CARD_PAGE_SKIP_ALT_PREFIX)
     ):
         return card
+    health = alt.startswith(_HEALTH_CARD_PREFIX)
+    url = None
     try:
-        url = card_pages.publish(card, alt_text)
+        if health:
+            if not isinstance(page_card, dict):
+                return card
+            if card_pages.bubble_count(page_card) != card_pages.bubble_count(card):
+                return card
+            _validated_flex_card_message(alt_text, page_card)  # 網頁上的字也要是驗過的字
+            url = card_pages.publish(page_card, alt_text, kind=card_pages.HEALTH)
+        else:
+            url = card_pages.publish(card, alt_text)
         if not url:
             return card
         paged = card_pages.with_page_button(card, url)
         if not card_pages.fits_line_limits(paged):  # LINE 回 400 整張卡就沒了
+            card_pages.discard(url)
             return card
         _validated_flex_card_message(alt_text, paged)
     except Exception as exc:
         logger.warning("card page skipped error_type=%s", type(exc).__name__)
+        if url:
+            card_pages.discard(url)
         return card
     return paged
 
@@ -21788,7 +21953,7 @@ def _handle_command(
         return f"本群 group_id：\n{group_id}"
 
     if t == "/help" or t == "/指令":
-        return _HELP_TEXT
+        return _help_text()
 
     # ── 長期記憶（facts）──────────────────────────────────────────
     if t == "/看記憶":
@@ -22016,12 +22181,22 @@ _HELP_TEXT = (
     "  /盤勢 QQQ 圖            期權未平倉與 gamma（假設部位）的圖（SPY、SOXX、台指 也可以）\n"
     "  /盤勢 13F QQQ           前十大成分股的機構持股變化（VOO、SOXX 也可以）\n"
     "                          都是程式用公開資料算的，只描述狀態，不是買賣建議\n"
-    "  🔍 看大字版             股票卡、FCN 評估卡、盤勢卡最下面的按鈕：點了用網頁看大字\n"
+    "  🔍 看大字版             股票卡、FCN 評估卡、盤勢卡、爸媽健康卡最下面的按鈕：點了用網頁看大字\n"
     "                          網址過幾天會換，打不開就再叫一次卡片\n"
+    "                          爸媽健康卡的網頁比較快失效，刪除紀錄或暫停時也會清掉\n"
     "【其他】\n"
     "  /group_id               顯示本群 ID\n"
     "  /help                   看這張說明"
 )
+# 2026-10-23 爸媽運動提醒：開關開著才在 /help 的爸媽健康段多這一行（關著時說了也不會發生）
+_HELP_EXERCISE_NUDGE_LINE = "                          爸媽好幾天沒提到運動時，咪寶回話時會順便提醒（每人最多 3 天一次）\n"
+
+
+def _help_text() -> str:
+    if not _exercise_nudge_on():
+        return _HELP_TEXT
+    marker = "【民調】\n"
+    return _HELP_TEXT.replace(marker, _HELP_EXERCISE_NUDGE_LINE + marker, 1)
 
 
 def _handle_layer2_correction(group_id: str, reason: str) -> str:

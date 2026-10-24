@@ -469,3 +469,61 @@ def test_urgent_readings_lists_every_reading_most_severe_first():
         ("bp_crisis", 16, "185/100"),  # 同一個數字、不同天：是另一筆
         ("glucose_low", 17, "60"), ("glucose_low", 17, "65"), ("glucose_low", 16, "65"),
     ]
+
+
+# ── 最近聽到的（last_heard，2026-10-23 PLAN A A2） ──────────────────────────
+
+
+def heard(rows, category, **kw):
+    return pa.last_heard(rows, category, TODAY, **kw)
+
+
+def test_last_heard_counts_days_from_today_and_yesterday():
+    today = heard([row(0, "exercise", "散步")], "exercise")
+    assert (today.day, today.item, today.days_ago, today.days_14) == (TODAY, "散步", 0, 1)
+    yesterday = heard([row(1, "exercise", "爬山")], "exercise")
+    assert (yesterday.days_ago, yesterday.days_14) == (1, 1)
+
+
+def test_last_heard_takes_the_latest_row_and_counts_distinct_days_in_14():
+    rows = [
+        row(13, "exercise", "散步"),  # D-13：14 天內的第一天
+        row(14, "exercise", "散步"),  # D-14：14 天外，只當上次聽到的參考
+        row(3, "exercise", "散步", hour=8),
+        row(3, "exercise", "太極", hour=18),  # 同一天兩筆：最後說的是太極、天數算一天
+    ]
+    found = heard(rows, "exercise")
+    assert (found.day, found.item, found.days_ago, found.days_14) == (TODAY - timedelta(days=3), "太極", 3, 2)
+
+
+def test_last_heard_outside_14_days_still_says_when():
+    found = heard([row(20, "exercise", "散步")], "exercise")
+    assert (found.days_ago, found.days_14) == (20, 0)
+
+
+def test_never_heard_and_future_rows_are_none():
+    assert heard([], "exercise") is None
+    assert heard([row(0, "sleep", "睡不好")], "exercise") is None
+    assert heard([row(-1, "exercise", "散步")], "exercise") is None  # 今天以後的列不算
+    assert heard(["not a row", None, {"category": "exercise", "item": "散步"}], "exercise") is None  # 沒有 day
+
+
+def test_forgetting_or_stopping_medicine_is_not_taking_it():
+    rows = [row(0, "med", "忘了吃藥"), row(1, "med", "停藥"), row(2, "med", "拿藥")]
+    assert heard(rows, "med", items={"吃藥"}) is None
+    found = heard(rows + [row(5, "med", "吃藥")], "med", items={"吃藥"})
+    assert (found.item, found.days_ago) == ("吃藥", 5)
+
+
+def test_blood_pressure_only_counts_rows_with_a_reading_and_never_red_flags():
+    rows = [
+        row(0, "body", "跌倒", flag="redflag"),  # 紅旗列
+        row(0, "body", "血壓高"),  # 症狀，不是讀數
+        bp(0, "abc"), bp(1, "80/130"),  # 讀數不合格
+        row(1, "body", "血壓", ""),  # 沒有數字
+        bp(4, "135/85"),
+    ]
+    found = heard(rows, "body", items={"血壓"})
+    assert (found.value, found.days_ago, found.days_14) == ("135/85", 4, 1)
+    assert heard([row(0, "body", "跌倒", flag="redflag")], "body") is None
+    assert heard([bp(0, "190/120", flag="redflag")], "body", items={"血壓"}) is None
