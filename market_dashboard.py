@@ -1355,10 +1355,13 @@ def _summary_alt(ctx: _Ctx) -> str:
     """altText：開頭直接寫狀態（只有固定句型、程式算的數字與日期）。"""
     voo, taiex = ctx.row("us.etf.VOO"), ctx.row("tw.taiex")
     us = _oneliner_alt(ctx, "oneliner.us", _ONELINER_US_RE)
-    if us is None:
+    if us is not None:
+        used = [ctx.row(f"us.etf.{sym}") for sym in ("VOO", "QQQ", "SOXX")]
+    else:
         status = _above_word(_flag(voo.values.get("above_ma20"))) if voo.fresh else None
+        used = [voo] if status else []  # 「美股資料過期／暫缺」不接暫定標籤（2026-10-24 審查 r9c gp1 nit 1）
         us = f"美股 VOO {status}" if status else "美股資料" + ("過期" if voo.status == STALE else "暫缺")
-    if any(view.fresh and view.provisional for view in (ctx.row(f"us.etf.{sym}") for sym in ("VOO", "QQQ", "SOXX"))):
+    if any(view.fresh and view.provisional for view in used):
         us += market_calc.TEXT_PROVISIONAL  # 通知預覽也看得出收盤是暫定值（2026-10-24 審查 r9b gp1）
     tw = _oneliner_alt(ctx, "oneliner.tw", _ONELINER_TW_RE)
     if tw is None:

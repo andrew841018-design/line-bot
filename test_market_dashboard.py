@@ -1701,3 +1701,14 @@ def test_older_etf_line_drops_the_change_before_the_date(md, paths):
     line = next(text for text in texts(md.handle("", now=NOW, paths=paths).flex["contents"][0]["body"])
                 if text.startswith("那斯達克100（QQQ）"))
     assert f"（{old.month}/{old.day}）" in line and md.row_width(line) <= 24, line
+
+
+def test_summary_alt_tags_provisional_only_on_sentences_built_from_those_rows(md, paths):
+    """2026-10-24 審查 r9c gp1 nit 1：VOO 過期、QQQ 暫定時原本寫成「美股資料過期（暫定）」。"""
+    snap = make_snapshot(NOW)
+    snap["rows"]["oneliner.us"]["values"]["text"] = ""  # 沒有一句話：退回 VOO 的寫法
+    snap["rows"]["us.etf.VOO"]["stale_after"] = NOW - 60
+    snap["rows"]["us.etf.QQQ"]["source"] = md.market_calc.SOURCE_CBOE_FALLBACK
+    write_snapshot(paths, snap)
+    alt = md.handle("", now=NOW, paths=paths).alt_text
+    assert "美股資料過期" in alt and "（暫定）" not in alt, alt

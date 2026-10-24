@@ -1392,7 +1392,22 @@ def test_xlsx_guard_rejects_xml_in_encodings_the_byte_scan_cannot_read():
     (b'<?xml version="1.0" encoding="UTF-7"?>+ADw-x/+AD4-', False),
     (b'<?xml version="1.0" encoding="EBCDIC-CP-US"?><x/>', False),
     ("<x/>".encode("cp037"), False),
-    (b"", False),
+    (b"", True),  # 空的成員沒有內容（審查 r9c gp2 P4）
+    (b'<?xml version="1.0"' + b" " * 300 + b'encoding="UTF-7"?>+ADw-x/+AD4-', False),  # 宣告很長（審查 r9c）
+    (b'<?xml version="1.0" encoding="UTF-8"', False),  # 宣告沒有結尾
 ])
 def test_xml_member_encoding_allow_list(head, ok):
     assert src._xml_encoding_ok(head) is ok
+
+
+def test_xlsx_guard_rejects_a_long_utf7_declaration_and_ebcdic_under_any_name():
+    """2026-10-24 審查 r9c gp1／gp2：宣告裡塞 300 個空白，只看前 256 個字元的檢查就找不到 encoding="UTF-7"，openpyxl
+    照讀、實體照展開；EBCDIC 放在 .dat 成員裡不像 XML 也要檢查。"""
+    data = ssga_xlsx(SSGA_ROWS)
+    utf7 = (b'<?xml version="1.0"' + b" " * 300 + b'encoding="UTF-7"?>'
+            b"+ADw-!DOCTYPE x +AFs-+ADw-!ENTITY boom +ACI-boom+ACI-+AD4-+AF0-+AD4-+ADw-x/+AD4-")
+    bad = rewrite_member(data, "xl/workbook.xml", lambda _old: utf7)
+    assert guard_reason(src.parse_ssga_spy_xlsx, bad, min_rows=1) == ("format", "xml_encoding")
+    ebcdic = '<?xml version="1.0" encoding="EBCDIC-CP-US"?><!DOCTYPE x [<!ENTITY boom "boom">]><x/>'.encode("cp037")
+    bad = _with_member(data, "", "xl/workbook.dat", ebcdic)
+    assert guard_reason(src.parse_ssga_spy_xlsx, bad, min_rows=1) == ("format", "xml_encoding")

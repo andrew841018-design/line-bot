@@ -1196,17 +1196,26 @@ _XML_DECL_RE = re.compile(rb"<!\s*(doctype|entity)", re.IGNORECASE)
 _XML_MEMBER_SUFFIXES = (".xml", ".rels", ".vml")
 _WIDE_BOMS = (b"\xff\xfe", b"\xfe\xff", b"\x00\x00\xfe\xff")
 # XML 宣告的 encoding 只准這幾種：UTF-7（「<」寫成 +ADw-）、EBCDIC 之類的位元組掃描看不到 DOCTYPE（2026-10-24 審查 r9b gp2 O2）
-_XML_PROLOG_RE = re.compile(rb"<\?xml\b([^>]{0,256})\?>")
-_XML_ENCODING_RE = re.compile(rb"""encoding\s*=\s*["']([^"']{0,40})["']""", re.IGNORECASE)
+_XML_ENCODING_RE = re.compile(rb"""encoding\s*=\s*["']([^"']*)["']""", re.IGNORECASE)
 _XML_OK_ENCODINGS = frozenset({b"utf-8", b"utf8", b"us-ascii", b"ascii", b"iso-8859-1", b"latin1", b"latin-1"})
+_EBCDIC_XML = b"\x4c\x6f\xa7\x94"  # EBCDIC 的「<?xm」：不是「<」開頭，副檔名又不像 XML 時也要檢查（審查 r9c gp2 P5）
 
 
 def _xml_encoding_ok(head: bytes) -> bool:
-    """去掉 BOM／空白後要以「<」開頭；有 XML 宣告且寫了 encoding 的，只准 _XML_OK_ENCODINGS。"""
+    """去掉 BOM／空白後要以「<」開頭；有 XML 宣告且寫了 encoding 的，只准 _XML_OK_ENCODINGS。
+
+    宣告不限長度：偽屬性之間可以有任意空白，只看前 256 個字元的話，塞 300 個空白的 UTF-7 宣告就過得去、實體照樣被展開
+    （2026-10-24 審查 r9c gp1 important 1／gp2 P1）。宣告沒有結尾就不放行；空的成員放行（沒有內容，展開不了東西）。"""
+    if not head:
+        return True
     if head[:1] != b"<":
         return False
-    prolog = _XML_PROLOG_RE.match(head)
-    found = _XML_ENCODING_RE.search(prolog.group(1)) if prolog else None
+    if not head.startswith(b"<?xml"):
+        return True
+    end = head.find(b"?>")
+    if end < 0:
+        return False
+    found = _XML_ENCODING_RE.search(head[:end])
     return found is None or found.group(1).lower() in _XML_OK_ENCODINGS
 
 
@@ -1259,7 +1268,8 @@ def _xlsx_guard(data: object) -> bytes:
             # 會被當二進位略過、DOCTYPE 照樣被 openpyxl 展開。寬字元 XML 看「解開後是不是 <」（_wide_xml），不看副檔名。
             head = content.lstrip(b"\xef\xbb\xbf\x00 \t\r\n")
             wide = content.startswith(_WIDE_BOMS) or _wide_xml(content)
-            looks_xml = info.filename.lower().endswith(_XML_MEMBER_SUFFIXES) or head[:1] == b"<" or wide
+            looks_xml = (info.filename.lower().endswith(_XML_MEMBER_SUFFIXES) or head[:1] == b"<" or wide
+                         or content.startswith(_EBCDIC_XML))
             if not looks_xml:
                 continue
             if wide or b"\x00" in content or not _xml_encoding_ok(head):

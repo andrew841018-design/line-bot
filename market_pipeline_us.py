@@ -1291,8 +1291,9 @@ def _store_close_quote(ctx: Any, day: date, symbol: str) -> str:
 
 def _spot_ok(ctx: Any, symbol: str, day: date, chain: Any) -> bool:
     """期權鏈的現價（current_price）和這檔最近一筆正式收盤（10 天內）差到跳空門檻就不存（2026-10-24 審查 r9b gp2
-    O1：卡上會印「現價 7.02」，牆距、GEX 也全跟著錯）。分割日 CBOE 已是拆後價：一樣先不存，等 Nasdaq 的歷史更新。
-    還沒有正式收盤可比（剛建庫）時改和同一份檔的 close 比；兩個都沒有就不存。"""
+    O1：卡上會印「現價 7.02」，牆距、GEX 也全跟著錯）。分割日 CBOE 已是拆後價、大波動日前一個正式收盤也差很多：
+    D 的正式收盤還沒到時 `_store_chain` 先回 not_yet，等 Nasdaq 有 D 再和它比。還沒有正式收盤可比（剛建庫）時改和
+    同一份檔的 close 比（兩個欄位一起壞就擋不住：已知限制）；兩個都沒有就不存。"""
     spot = _finite(getattr(chain, "spot", None))
     if spot is None or spot <= 0:
         return False
@@ -1319,6 +1320,11 @@ def _store_chain(ctx: Any, day: date, symbol: str, chain: Any) -> str:
         ctx.store.put_obs(obs_id, chain_payload(chain), data_date=data_day.isoformat())
     _maybe_provisional(ctx, day, chain, last)  # 收盤有自己的守門：現價壞了、收盤正常時照寫暫定值
     if not spot_ok:
+        if not _has_official_row(ctx, symbol, day):
+            # 還沒有 D 的正式收盤可比：照 not_yet 的間隔再看，不算失敗（2026-10-24 審查 r9c gp2 P2：算失敗的話分割日
+            # 3 次很快用完，Nasdaq 晚上才公布 D，這個 D 就不再試）
+            ctx.store.obs_not_yet(obs_id)
+            return "not_yet"
         raise market_calc.ParseError("format", "spot")
     return "done"
 

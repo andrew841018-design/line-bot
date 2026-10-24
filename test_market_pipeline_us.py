@@ -1606,9 +1606,9 @@ def test_gate_round_requests_the_backup_probe_once(env):
 
 def test_options_spot_far_from_the_official_close_is_not_stored(env):
     """2026-10-24 審查 r9b gp2 O1：期權鏈的 current_price 只要 >0 就收，卡上就印「現價 7.02」「現價 70,200」，牆距和
-    GEX 也全跟著錯。現價和最近一筆正式收盤差到跳空門檻就不存（卡片退回上一份）、記成格式錯；收盤正常的話暫定收盤照寫。"""
+    GEX 也全跟著錯。現價和 D 的正式收盤差到跳空門檻就不存（卡片退回上一份）、記成格式錯。"""
     for symbol in pipe.OPTION_SYMBOLS:
-        seed(env, symbol, flat(HISTORY, 700.0))
+        seed(env, symbol, flat(HISTORY + [D], 700.0))
         env.http.chains[symbol] = cboe_chain(symbol, timestamp="2026-10-16 20:45:00", last_trade="2026-10-16T16:15:00",
                                              close=702.0)
     env.http.chains["QQQ"]["data"]["current_price"] = 7.02
@@ -1617,9 +1617,43 @@ def test_options_spot_far_from_the_official_close_is_not_stored(env):
     for symbol in ("QQQ", "SOXX"):
         got = obs(env, pipe.OBS_OPTIONS[symbol])
         assert got["payload"] is None and got["error"] == "format", symbol
-        assert closes(env, symbol)[D] == (702.0, "cboe", True), symbol  # 收盤有自己的守門：照寫暫定值
     spy = pipe.chain_from_payload(obs(env, pipe.OBS_OPTIONS["SPY"])["payload"])
     assert spy.spot == 702.0
+
+
+def test_options_spot_waits_for_the_official_d_before_failing(env):
+    """2026-10-24 審查 r9c gp2 P2：D 的正式收盤還沒到時，現價對不上先當「還沒公布」：不存、不算失敗，收盤正常的話
+    暫定收盤照寫。算失敗的話分割日 3 次很快用完，Nasdaq 晚上才公布 D，這個 D 就不再試。"""
+    for symbol in pipe.OPTION_SYMBOLS:
+        seed(env, symbol, flat(HISTORY, 700.0))
+        env.http.chains[symbol] = cboe_chain(symbol, timestamp="2026-10-16 20:45:00", last_trade="2026-10-16T16:15:00",
+                                             close=702.0)
+    env.http.chains["QQQ"]["data"]["current_price"] = 7.02
+    assert run(env, "us.options", NOW + 600) == "partial"
+    got = obs(env, pipe.OBS_OPTIONS["QQQ"])
+    assert got["payload"] is None and got["error"] is None and got["fail_streak"] == 0
+    assert closes(env, "QQQ")[D] == (702.0, "cboe", True)  # 收盤有自己的守門：照寫暫定值
+    assert env.store.task_state("us.options")["fail_streak"] == 0
+
+
+def test_options_on_a_split_day_are_stored_once_nasdaq_has_the_d(env):
+    """分割日：CBOE 已是拆後價（233），正式歷史還是拆前（700）。先等；Nasdaq 有 D 的拆後正式收盤後就和它比、存下來。"""
+    for symbol in pipe.OPTION_SYMBOLS:
+        seed(env, symbol, flat(HISTORY, 700.0))
+        env.http.chains[symbol] = cboe_chain(symbol, timestamp="2026-10-16 20:45:00", last_trade="2026-10-16T16:15:00",
+                                             close=233.0)
+    assert run(env, "us.options", NOW + 600) == "not_yet"
+    assert all(obs(env, pipe.OBS_OPTIONS[symbol])["payload"] is None for symbol in pipe.OPTION_SYMBOLS)
+    assert all(D not in closes(env, symbol) for symbol in pipe.OPTION_SYMBOLS)  # 拆後收盤也不寫成暫定值
+    for symbol in pipe.OPTION_SYMBOLS:
+        seed(env, symbol, {D: 233.0})  # Nasdaq 公布 D（拆後）
+    later = NOW + 600 + pipe.CBOE_RETRY_S + 60
+    for symbol in pipe.OPTION_SYMBOLS:
+        env.http.chains[symbol] = cboe_chain(symbol, timestamp="2026-10-16 21:30:00", last_trade="2026-10-16T16:15:00",
+                                             close=233.0)
+    assert run(env, "us.options", later) == "ok"
+    assert all(pipe.chain_from_payload(obs(env, pipe.OBS_OPTIONS[symbol])["payload"]).spot == 233.0
+               for symbol in pipe.OPTION_SYMBOLS)
 
 
 def test_options_spot_without_an_official_close_is_checked_against_the_file_close(env):
