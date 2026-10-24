@@ -68,6 +68,8 @@ def line(monkeypatch):
     messaging.reply_message.return_value = SimpleNamespace(sent_messages=[])
     messaging.push_message.return_value = SimpleNamespace(sent_messages=[])
     monkeypatch.setattr(main, "_inbound_reply_by_token", {})
+    monkeypatch.setattr(main, "_inbound_ids_by_token", {})
+    monkeypatch.setattr(main, "_INBOUND_FENCE_CLAIM_RETRY_SLEEP_SECONDS", (0, 0))
     monkeypatch.setattr(main.settings, "bot_muted", False)
     monkeypatch.setattr(main, "_reminder_reply_piggyback_enabled", lambda: False)
     with (
@@ -770,3 +772,187 @@ def test_a_redelivery_of_a_message_the_burst_buffer_holds_is_skipped_and_leaves_
         with burst_filter._lock:
             burst_filter._pending.clear()
     assert _handle(evt) == [1]  # no longer held: handled (a new row, 'new')
+
+
+# ── invariants the post-implementation review (2026-10-25) found unpinned ─────────────────
+
+
+@pytest.fixture()
+def fresh_registries(monkeypatch):
+    """Both token registries private to the test (`line` resets only one of them)."""
+    monkeypatch.setattr(main, "_inbound_reply_by_token", {})
+    monkeypatch.setattr(main, "_inbound_ids_by_token", {})
+
+
+def _updated_at(message_id, group=GROUP):
+    with memory._lock, memory._conn() as c:
+        return c.execute(
+            "SELECT updated_at FROM inbound_events WHERE group_id = ? AND message_id = ?",
+            (group, message_id),
+        ).fetchone()[0]
+
+
+def test_the_registry_outlives_the_longest_processing_lease(fresh_registries, clock):
+    """A media handler may run 300 s before it reaches `_reply`.  If its token had been
+    forgotten, the claim would say `untracked` and the reply (and its push fallback) would go
+    out unfenced -- the 10/20 duplicate shape.  Entries are pruned only when another token is
+    registered, so the test registers one after the clock moved."""
+    assert main._INBOUND_REPLY_REGISTRY_TTL_SECONDS > memory._INBOUND_MEDIA_PROCESSING_LEASE_SECONDS
+    open_event("SLOW", "TOKEN-SLOW")
+    clock["t"] += 400  # past the media lease, inside the registry's time to live
+    main._register_inbound_reply_token("TOKEN-OTHER", GROUP, "OTHER")  # runs the pruning
+
+    outcome, fence = main._claim_inbound_send("TOKEN-SLOW")
+
+    assert outcome == "claimed"
+    assert fence.message_ids == ("SLOW",)
+
+
+def test_the_registry_forgets_a_token_after_its_time_to_live(fresh_registries, clock):
+    open_event("OLD", "TOKEN-OLD")
+    clock["t"] += main._INBOUND_REPLY_REGISTRY_TTL_SECONDS + 1
+    main._register_inbound_reply_token("TOKEN-NEW", GROUP, "NEW")  # runs the pruning
+
+    assert "TOKEN-OLD" not in main._inbound_reply_by_token
+    assert "TOKEN-OLD" not in main._inbound_ids_by_token
+    assert main._claim_inbound_send("TOKEN-OLD") == ("untracked", None)
+
+
+def test_the_kept_token_registry_is_bounded(fresh_registries):
+    for i in range(main._INBOUND_IDS_BY_TOKEN_MAX + 1):
+        main._register_inbound_reply_token(f"T{i}", GROUP, f"M{i}")
+
+    assert len(main._inbound_ids_by_token) == main._INBOUND_IDS_BY_TOKEN_MAX
+    assert "T0" not in main._inbound_ids_by_token  # the oldest went first
+    assert f"T{main._INBOUND_IDS_BY_TOKEN_MAX}" in main._inbound_ids_by_token
+
+
+def test_the_claim_refreshes_updated_at_so_a_slow_handler_is_not_cut_off_mid_send(clock):
+    """The restart wait only counts rows younger than 90 s: a handler that spent 100 s on its
+    models must look fresh once it is sending, or a restart could cut the send off."""
+    memory.begin_inbound_event(GROUP, "a")
+    clock["t"] += 100
+
+    assert memory.claim_inbound_reply(GROUP, ["a"]) == ("claimed", False)
+
+    assert _updated_at("a") == int(clock["t"])
+
+
+def test_a_batch_is_a_lease_retry_when_any_of_its_messages_is_a_retry(clock):
+    """One burst with a first start and a retried message must not be allowed to push."""
+    memory.begin_inbound_event(GROUP, "a")
+    memory.begin_inbound_event(GROUP, "b")
+    clock["t"] += 200
+    assert memory.begin_inbound_event(GROUP, "b") == "retry"  # attempts: a=1, b=2
+
+    assert memory.claim_inbound_reply(GROUP, ["a", "b"]) == ("claimed", True)
+
+
+# ── the request is built before the fence is taken (review GP1 #2) ────────────────────────
+
+
+@pytest.mark.parametrize("broken", ["request", "config"])
+def test_a_failure_before_any_request_leaves_no_fence(line, monkeypatch, broken):
+    open_event()
+
+    def boom(*_a, **_k):
+        raise ValueError("malformed rider")
+
+    monkeypatch.setattr(main, "ReplyMessageRequest" if broken == "request" else "_get_line_config", boom)
+
+    assert say() is False
+
+    assert status() == "processing"  # not reply_sending: nothing left for LINE, the lease may re-run it
+    line.reply_message.assert_not_called()
+    line.push_message.assert_not_called()
+
+
+def test_a_failure_before_any_request_lets_a_later_run_answer(line, monkeypatch):
+    open_event()
+    real_request = main.ReplyMessageRequest
+    monkeypatch.setattr(main, "ReplyMessageRequest", MagicMock(side_effect=ValueError("malformed rider")))
+    assert say() is False
+
+    monkeypatch.setattr(main, "ReplyMessageRequest", real_request)
+    main._register_inbound_reply_token(TOKEN, GROUP, "M1")
+    assert say("第二次") is True
+    assert status() == "replied"
+
+
+# ── the claim is tried more than once (review GP1 #4) ─────────────────────────────────────
+
+
+def test_a_locked_database_on_the_first_claim_does_not_drop_the_reply(line, monkeypatch):
+    import sqlite3
+
+    open_event()
+    real_claim = memory.claim_inbound_reply
+    calls = []
+
+    def flaky(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real_claim(*args, **kwargs)
+
+    monkeypatch.setattr(memory, "claim_inbound_reply", flaky)
+
+    assert say() is True
+
+    assert len(calls) == 2
+    line.reply_message.assert_called_once()
+    assert status() == "replied"
+
+
+def test_the_claim_gives_up_after_three_attempts(line, monkeypatch):
+    open_event()
+    calls = []
+
+    def broken(*_a, **_k):
+        calls.append(1)
+        raise RuntimeError("disk I/O error")
+
+    monkeypatch.setattr(memory, "claim_inbound_reply", broken)
+
+    assert say() is False
+
+    assert len(calls) == main._INBOUND_FENCE_CLAIM_ATTEMPTS == 3
+    line.reply_message.assert_not_called()
+    line.push_message.assert_not_called()
+    assert status() == "processing"
+
+
+# ── a rejected degraded reply must not overwrite the fence (review GP1 #8) ────────────────
+
+DEGRADED = "這個圖片我這次沒分析成功，請稍後再傳一次🙏"  # one of Andrew's rejected receipts
+
+
+@pytest.fixture()
+def rejected_text(monkeypatch):
+    """The receipt is judged before the quota footer is appended; the status filter judges it
+    afterwards.  With a footer the filter no longer sees the exact shape, the receipt is sent
+    and `user_rejected_primary` is still set -- the only way such a text reaches the fence."""
+    monkeypatch.setattr(main, "_get_quota_footer", lambda: "\n— 小提醒")
+    assert main._is_user_rejected_degraded_outbound(DEGRADED)
+    return DEGRADED
+
+
+def test_an_ambiguous_send_of_a_rejected_text_keeps_the_fence(line, rejected_text):
+    open_event()
+    line.reply_message.side_effect = TimeoutError("read timed out")
+
+    assert say(rejected_text) is False
+
+    line.reply_message.assert_called_once()  # it did reach LINE: the fence was taken first
+    assert status() == "reply_sending"  # not completed_no_reply
+    assert memory.claim_inbound_reply(GROUP, ["M1"]) == ("blocked", False)  # a late second run is stopped
+
+
+def test_a_refused_send_of_a_rejected_text_still_closes_the_event(line, rejected_text):
+    open_event()
+    line.reply_message.side_effect = api_error(400, BAD_PAYLOAD)
+
+    assert say(rejected_text) is False
+
+    line.reply_message.assert_called_once()
+    assert status() == "completed_no_reply"  # nothing was sent and a re-run would only repeat it
