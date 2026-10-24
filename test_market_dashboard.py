@@ -1631,6 +1631,16 @@ def test_status_summary_calendar_fields_fall_back_to_null(md, paths, extra):
     summary = md.status_summary(now=NOW, paths=paths)["outcome"]
     assert summary["calendar_days_left"] == {"us": None, "tw": None}
     assert summary["calendar_unclassified"] == {"us": None, "tw": None}
+    assert summary["calendar_missing_bars"] == {"us": None, "tw": None}
+
+
+def test_status_summary_reports_missing_calendar_bars(md, paths):
+    """2026-10-23 審查 r9 gp1 N2：job 有寫 calendar_missing_bars，status_summary 卻沒帶，每日維護那條看不到。"""
+    write_snapshot(paths, make_snapshot(NOW))
+    outcome = {"status": "ok", "code": "verified", "collect": {"status": "ok"}, "publish": {"status": "ok"},
+               "calendar_missing_bars": {"us": 0, "tw": 1}}
+    market_paths.write_private_atomic(paths.outcome, json.dumps(outcome).encode())
+    assert md.status_summary(now=NOW, paths=paths)["outcome"]["calendar_missing_bars"] == {"us": 0, "tw": 1}
 
 
 def test_status_summary_reports_how_far_us_data_lags(md, paths):

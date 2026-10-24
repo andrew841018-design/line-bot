@@ -337,10 +337,11 @@ class _Detailed(Exception):  # 別的程式庫的例外也可能帶 .detail：�
 
 def test_the_log_line_shows_a_short_parse_error_detail(env, caplog):
     """2026-10-23：同一個 format 可能是 CDN 給了 CSV、表頭變了或截斷；log 行加印 ParseError 的 detail（只限
-    [a-z_]{1,20} 的程式列舉字）。沒有 detail 時這行一字不差；其他例外的內容一律不印。"""
+    [A-Za-z_]{1,24} 的程式列舉字；美股的 detail 有駝峰，例如 tradesTable，審查 r9 gp1）。沒有 detail 時這行一字不差；
+    其他例外的內容一律不印。"""
     tasks = [
         _task("tw.csv", run=_raise(market_calc.ParseError("format", "csv"))),
-        _task("tw.long", run=_raise(market_calc.ParseError("format", "x" * 21))),
+        _task("tw.long", run=_raise(market_calc.ParseError("format", "x" * 25))),
         _task("tw.upper", run=_raise(market_calc.ParseError("empty", "tradesTable"))),
         _task("tw.newline", run=_raise(market_calc.ParseError("format", "csv\n"))),
         _task("tw.nodetail", run=_raise(market_calc.ParseError("format"))),
@@ -358,10 +359,11 @@ def test_the_log_line_shows_a_short_parse_error_detail(env, caplog):
             lines[message.split()[1].removeprefix("task=")] = message
     assert lines["tw.csv"].startswith("market task=tw.csv kind=format detail=csv dur=")
     assert lines["us.duebad"].startswith("market task=us.duebad kind=date detail=header dur=")
-    for name in ("tw.long", "tw.upper", "tw.newline", "tw.nodetail", "us.fetch", "us.other", "tw.ok"):
+    assert lines["tw.upper"].startswith("market task=tw.upper kind=empty detail=tradesTable dur=")
+    for name in ("tw.long", "tw.newline", "tw.nodetail", "us.fetch", "us.other", "tw.ok"):
         assert "detail=" not in lines[name], name
     assert lines["tw.nodetail"].startswith("market task=tw.nodetail kind=format dur=")
-    assert "leakword" not in caplog.text and "tradesTable" not in caplog.text
+    assert "leakword" not in caplog.text and "x" * 25 not in caplog.text
 
 
 def test_ledger_wait_gives_up_when_the_task_must_stop(env):

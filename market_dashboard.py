@@ -2299,6 +2299,9 @@ def _outcome_summary(paths: Any, now: float) -> dict:
     out["calendar_days_left"] = days_left
     unclassified = _dict(data.get("calendar_unclassified"))
     out["calendar_unclassified"] = {market: _count(unclassified.get(market), 10**4) for market in ("us", "tw")}
+    # 休市表上是交易日卻沒有收盤的天數（2026-07-10 那種）；每日維護從這裡讀（2026-10-23 審查 r9 gp1 N2）
+    missing = _dict(data.get("calendar_missing_bars"))
+    out["calendar_missing_bars"] = {market: _count(missing.get(market), 10**4) for market in ("us", "tw")}
     # 美股資料落後多少（2026-10-23，investigations/format_20261023.md §2、freshness_20261023.md §5 第 5 點、審查 r7b
     # F2）：us.etf 列最舊的資料日落後最新場次幾個交易日、落後幾秒；成分股中位數落後幾個交易日；這個 D 的 Nasdaq
     # 廠商錯誤次數。這次落後 5 天時 us.hist 只是 not_yet，failing 看不到；缺值或壞值 → None

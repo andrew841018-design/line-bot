@@ -133,7 +133,7 @@ _DEFAULT_RULES: dict[str, tuple[Optional[time], int]] = {
     "taifex_calls_puts_inst": (time(7, 0), 9),
     "taifex_pcr": (time(7, 0), 9),
     "taifex_daily_options": (time(7, 0), 9),
-    "taifex_fx": (time(7, 0), 2),
+    "taifex_fx": (time(7, 0), 5),
     "finmind_prices": (None, 60),
     "moneydj_0050": (None, 2),
 }
@@ -475,6 +475,9 @@ def allbut_backfill(ctx: Any) -> Optional[tuple[str, date]]:
         if (closed[iso] or {}).get("rechecked") == today.isoformat():
             continue
         return ("recheck", day)
+    # 交易日當天的主要 ALLBUT 還沒存到：歷史洞先讓路，免得用掉 15:00 那次重試的額度（2026-10-23 審查 r9 gp1）
+    if expected_session(ctx.tw_cal, today) and today.isoformat() not in days and today.isoformat() not in closed:
+        return None
     gap = _history_gap(ctx, state, today, recent)
     return None if gap is None else ("history", gap)
 
@@ -510,16 +513,20 @@ def _history_gap(ctx: Any, state: dict, today: date, recent: list[date]) -> Opti
     return None
 
 
-def _note_history(state: dict, iso: str, today: date) -> None:
-    """歷史洞真的送出了一次請求：記今天用掉了、這個洞試過幾次。另外記，因為 `tries` 只留最近 40 個日期，
-    舊日期的紀錄一存就被修掉，「試過幾次」永遠是 0。"""
+def _note_history(state: dict, iso: str, today: date, *, count: bool) -> None:
+    """歷史洞真的送出了一次請求：記今天用掉了（一天最多一次），count＝這次有定論才算「試過」一次。另外記，因為
+    `tries` 只留最近 40 個日期，舊日期的紀錄一存就被修掉，「試過幾次」永遠是 0。
+
+    2026-10-23 審查 r9 gp1 N1：證交所出錯、維護頁、FinMind 問不到都不算——不然連兩天剛好碰到，第 3 天來源好了
+    也不再補，洞就一直留著。"""
     start = (today - timedelta(days=HISTORY_DAYS)).isoformat()
     tried = {
         key: int(value)
         for key, value in ((state.get(HISTORY_GAPS) or {}).get("tried") or {}).items()
         if key >= start and isinstance(value, int)
     }
-    tried[iso] = tried.get(iso, 0) + 1
+    if count:
+        tried[iso] = tried.get(iso, 0) + 1
     state[HISTORY_GAPS] = {"day": today.isoformat(), "tried": tried}
 
 
@@ -536,9 +543,14 @@ def _run_allbut(ctx: Any, day: date, mode: str) -> Optional[str]:
             raise
         _note_try(state, iso, ctx.now)
         if mode == "history":
-            _note_history(state, iso, today)
+            _note_history(state, iso, today, count=False)
         if _is_parse_error(exc) and _kind(exc) in _NO_DATA_KINDS:
+            gap_before = (state.get("source_gaps") or {}).get(iso)
             status = _allbut_no_data(ctx, state, day, mode)
+            if mode == "history" and (
+                iso in (state.get("closures") or {}) or (state.get("source_gaps") or {}).get(iso) != gap_before
+            ):  # 有定論：寫了暫定休市，或 FinMind 說那天有開（證交所漏日）
+                _note_history(state, iso, today, count=True)
             _save(ctx.store, TASK_ALLBUT, state)
             return status
         _save(ctx.store, TASK_ALLBUT, state)
@@ -547,7 +559,7 @@ def _run_allbut(ctx: Any, day: date, mode: str) -> Optional[str]:
         raise _for_framework(exc) from None
     _note_try(state, iso, ctx.now)
     if mode == "history":
-        _note_history(state, iso, today)
+        _note_history(state, iso, today, count=True)
     store_allbut(ctx.store, daily, ctx.tw_cal)
     closed = state.get("closures") or {}
     if iso in closed:

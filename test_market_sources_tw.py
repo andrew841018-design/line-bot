@@ -1106,7 +1106,7 @@ def test_daily_options_csv_errors_are_format_with_a_detail():
     assert format_detail(fetch, body[: body.rindex(b",47000,") + 4]) == ("format", "columns")  # 截斷在最後一列中間
     assert format_detail(fetch, opt_csv(rows=[*OPT_CSV_ROWS, OPT_CSV_ROWS[0] + ("x",)])) == ("format", "columns")
     # HTML 頁不是 JSON，當 CSV 讀時第一行不是實測的表頭
-    assert format_detail(fetch, b"<!DOCTYPE html><html><body>busy</body></html>") == ("format", "header")
+    assert format_detail(fetch, b"<!DOCTYPE html><html><body>busy</body></html>") == ("format", "html")
     assert format_detail(fetch, b'\xef\xbb\xbf[{"Date": "20261022", "Contract"') == ("format", "json")  # 截斷的 JSON
     assert format_detail(fetch, opt_csv().replace("盤後".encode("utf-8"), b"\xff\xfe")) == ("format", "csv")  # 不是 UTF-8
 

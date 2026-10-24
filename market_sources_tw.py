@@ -99,12 +99,15 @@ ENDPOINTS: dict[str, Endpoint] = {
     # 2026-10-23：期交所的檔案（外資台指期、DailyMarketReportOpt、匯率）都是約 06:36 才放上前一個交易日，00／03／06
     # 點那幾次一定白打 → 07:00 起才抓、間隔改 2 小時、每天 6→9 次（07、09…23 點；匯率仍每天 2 次：07、09 點）。
     # 10/23 的 09／12／15 點剛好碰上 CDN 給 CSV 的時段，額度就燒光了，要到隔天 00:09 才再試。
-    # market_pipeline_tw.taifex_due 照這個最早時間擋；主機合計 4×9＋2＝38 次／天，在帳本的預設上限（200）內
+    # market_pipeline_tw.taifex_due 照這個最早時間擋；匯率也是同一個 CDN、同樣會碰到 CSV 的時段，2 次太少，改 5 次
+    # （2026-10-23 審查 r9 gp1）；主機合計 4×9＋5＝41 次／天，在帳本的預設上限（200）內
     "taifex_futures_inst": Endpoint("openapi.taifex.com.tw", time(7, 0), 9, 1 * _MIB, 15.0, ("octet-stream", "json")),
     "taifex_calls_puts_inst": Endpoint("openapi.taifex.com.tw", time(7, 0), 9, 1 * _MIB, 15.0, ("octet-stream", "json")),
     "taifex_pcr": Endpoint("openapi.taifex.com.tw", time(7, 0), 9, 256 * _KIB, 15.0, ("octet-stream", "csv")),
-    "taifex_daily_options": Endpoint("openapi.taifex.com.tw", time(7, 0), 9, 4 * _MIB, 30.0, ("octet-stream", "json")),
-    "taifex_fx": Endpoint("openapi.taifex.com.tw", time(7, 0), 2, 256 * _KIB, 15.0, ("octet-stream", "json")),
+    "taifex_daily_options": Endpoint(
+        "openapi.taifex.com.tw", time(7, 0), 9, 4 * _MIB, 30.0, ("octet-stream", "json", "csv")
+    ),
+    "taifex_fx": Endpoint("openapi.taifex.com.tw", time(7, 0), 5, 256 * _KIB, 15.0, ("octet-stream", "json")),
     # FinMind：51 檔＋TAIEX 補洞；一年以上的 bootstrap 用 30 秒（TAIEX 全歷史約 6,900 列、1.5 MB）
     "finmind_prices": Endpoint("api.finmindtrade.com", None, 60, 4 * _MIB, 15.0, ("json",)),
     # 0050 持股實際走 A 的 market_sources_us.fetch_moneydj_holdings（它的 moneydj 端點）；這列給 job 排程用
@@ -1039,6 +1042,8 @@ def _taifex_body(body: bytes, csv_columns: Optional[Sequence[tuple[str, str]]] =
     head = body[3:] if body.startswith(b"\xef\xbb\xbf") else body
     if head.lstrip()[:1] in (b"[", b"{"):
         return _json_body(body)
+    if head.lstrip()[:1] == b"<":  # 維護頁／錯誤頁：log 上不能像「期交所改了表頭」（2026-10-23 審查 r9 gp1）
+        raise ParseError("format", "html")
     if csv_columns is None:
         raise ParseError("format", "csv")
     try:

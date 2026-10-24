@@ -459,6 +459,44 @@ def test_an_old_gap_that_stays_is_left_after_two_tries(env):
     assert env.http.days("MI_INDEX") == [gap, gap] and env.store.calendar_overrides("tw") == {}
 
 
+def test_an_old_gap_is_not_given_up_on_transient_errors(env):
+    """2026-10-23 審查 r9 gp1 N1：證交所連兩天出錯、或 FinMind 問不到，都不算「試過」——不然來源好了也不再補，
+    7/10 那種洞就一直留著。證交所說沒有資料、而且 FinMind 答得出來（或存到資料）才算一次。"""
+    sessions = sessions_before(date(2026, 10, 17), 40)
+    gap = sessions[30]
+    env.store.upsert_closes(tw.MARKET, tw.SYM_TAIEX, [(day, 47000.0, 1) for day in sessions if day != gap], tw.SOURCE_FINMIND)
+    seed_days(env, tw.OBS_ALLBUT, sessions_before(date(2026, 10, 22), 15))  # 近期都有了（含當天）：只剩歷史洞
+    env.http.route("MI_INDEX", market_http.FetchError("status"))
+    env.http.route("finmindtrade", {"msg": "success", "status": 200, "data": []})
+    for day in (17, 18):  # 證交所連兩天出錯
+        ctx = make_ctx(env, at(2026, 10, day, 10, 0))
+        assert tw.allbut_backfill(ctx) == ("history", gap)
+        run(ctx, "tw.allbut.backfill")
+    env.http.route("MI_INDEX", NO_DATA)
+    env.http.route("finmindtrade", market_http.FetchError("status"))
+    for day in (19, 20):  # 證交所說沒有資料，FinMind 卻問不到
+        ctx = make_ctx(env, at(2026, 10, day, 10, 0))
+        assert tw.allbut_backfill(ctx) == ("history", gap)
+        run(ctx, "tw.allbut.backfill")
+    assert env.store.calendar_overrides("tw") == {}
+    env.http.route("finmindtrade", {"msg": "success", "status": 200, "data": []})
+    ctx = make_ctx(env, at(2026, 10, 21, 10, 0))  # 兩邊都好了：照樣補，寫成暫定休市
+    assert tw.allbut_backfill(ctx) == ("history", gap)
+    run(ctx, "tw.allbut.backfill")
+    assert env.store.calendar_overrides("tw")[gap]["kind"] == "closed"
+
+
+def test_an_old_gap_waits_for_the_days_own_allbut(env):
+    """2026-10-23 審查 r9 gp1：交易日當天的主要 ALLBUT 還沒存，歷史洞不搶額度（15:00 那次重試要留著）。"""
+    sessions = sessions_before(date(2026, 10, 20), 40)
+    gap = sessions[30]
+    env.store.upsert_closes(tw.MARKET, tw.SYM_TAIEX, [(day, 47000.0, 1) for day in sessions if day != gap], tw.SOURCE_FINMIND)
+    seed_days(env, tw.OBS_ALLBUT, sessions[:10])  # 到 10/19 都有了，10/20（週二，當天）還沒
+    assert tw.allbut_backfill(make_ctx(env, at(2026, 10, 20, 10, 0))) is None
+    seed_days(env, tw.OBS_ALLBUT, [date(2026, 10, 20)] + sessions[:10])
+    assert tw.allbut_backfill(make_ctx(env, at(2026, 10, 20, 16, 0))) == ("history", gap)
+
+
 def test_ledger_refusal_is_not_counted_as_a_try(env):
     env.http.route("MI_INDEX", lambda url: allbut_payload(day_of(url), {"0050": "109.00", "2330": "2,420.00"}))
     ledger = env.store.ledger(now_fn=env.clock, sleep_fn=env.clock.sleep)
@@ -693,7 +731,8 @@ def test_taifex_morning_rules(env):
 def test_taifex_tries_start_at_07_00_and_stay_2_hours_apart(env):
     """2026-10-23：期交所的檔案約 06:36 才放上前一個交易日。以前每 3 小時、每天 6 次：00／03／06 點那三次一定白打，
     10/23 剩下的 09／12／15 點又碰上 CDN 給 CSV 的時段，要到隔天 00:09 才再試；匯率每天 2 次都燒在 00:11、03:12。
-    現在 07:00 前不打，之後每 2 小時一次、每天最多 9 次（07、09…23 點）；匯率的 2 次在 07、09 點。"""
+    現在 07:00 前不打，之後每 2 小時一次、每天最多 9 次（07、09…23 點）；匯率 5 次（07、09…15 點；審查 r9 gp1：
+    匯率也會碰到 CSV 的時段，2 次太少）。"""
     env.http.route("MarketDataOfMajorInstitutionalTradersDetailsOfFuturesContracts",
                    lambda url: futures_rows(date(2026, 10, 15)))  # 期交所一直沒更新
     env.http.route("DailyForeignExchangeRates", [{"Date": "20261015", "USD/NTD": "32.300"}])
@@ -711,16 +750,16 @@ def test_taifex_tries_start_at_07_00_and_stay_2_hours_apart(env):
             else:
                 assert result == "not_due", name
     assert tried["tw.taifex.futures"] == ["07:00", "09:00", "11:00", "13:00", "15:00", "17:00", "19:00", "21:00", "23:00"]
-    assert tried["tw.taifex.fx"] == ["07:00", "09:00"]
+    assert tried["tw.taifex.fx"] == ["07:00", "09:00", "11:00", "13:00", "15:00"]  # 匯率 5 次（審查 r9 gp1）
     for name in tried:  # 隔天：次數歸零、離上次也超過 2 小時，但還沒 07:00 就不打
         assert run(make_ctx(env, at(2026, 10, 21, 1, 0)), name) == "not_due", name
         assert run(make_ctx(env, at(2026, 10, 21, 6, 59)), name) == "not_due", name
         assert run(make_ctx(env, at(2026, 10, 21, 7, 0)), name) == "not_yet", name
     for spec in tw.TAIFEX_SPECS:  # 五個期交所任務同一套規則
-        assert tw._rule(spec.endpoint) == (time(7, 0), 2 if spec.task == "tw.taifex.fx" else 9), spec.task
-    # 主機合計 4×9＋2＝38 次／天；期交所不在 HOST_RULES 裡，用帳本的預設上限
+        assert tw._rule(spec.endpoint) == (time(7, 0), 5 if spec.task == "tw.taifex.fx" else 9), spec.task
+    # 主機合計 4×9＋5＝41 次／天；期交所不在 HOST_RULES 裡，用帳本的預設上限
     cap = market_store.HOST_RULES.get("openapi.taifex.com.tw", market_store.DEFAULT_HOST_RULE).daily_cap
-    assert sum(tw._rule(spec.endpoint)[1] for spec in tw.TAIFEX_SPECS) == 38 <= cap
+    assert sum(tw._rule(spec.endpoint)[1] for spec in tw.TAIFEX_SPECS) == 41 <= cap
 
 
 def test_taifex_txo_csv_body_is_stored_without_backing_off(env):

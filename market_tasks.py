@@ -59,7 +59,7 @@ FRAMEWORK_KEYS = ("last_success", "last_run", "last_kind", "fail_streak", "next_
 _TASK_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}")
 _MODULE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
 _KIND_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")
-_DETAIL_RE = re.compile(r"[a-z_]{1,20}")
+_DETAIL_RE = re.compile(r"[A-Za-z_]{1,24}")  # 美股的 detail 有駝峰（tradesTable、summaryData），照樣是 fullmatch 白名單
 
 
 @dataclass
