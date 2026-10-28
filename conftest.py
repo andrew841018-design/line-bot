@@ -281,9 +281,19 @@ def reset_main_globals(monkeypatch):
         burst_filter._pending.clear()
         burst_filter._last_reply_tokens.clear()
         burst_filter._inflight.clear()
+        burst_filter._inflight_batches.clear()
     # 2026-10-24: tests reuse reply-token constants; the token -> inbound lookup the send fence
     # keeps after a reply was accepted must not carry one test's event into the next.
     main._inbound_ids_by_token.clear()
+    # 2026-10-24: a candidate nudge / mention target registered for a reply token by one test (and
+    # not taken) must not wait for the next test that happens to use the same token.
+    with main._exercise_nudge_lock:
+        main._exercise_nudge_by_token.clear()
+    with main._reply_mention_targets_lock:
+        main._reply_mention_targets_by_token.clear()
+    # 2026-10-28: the in-memory refusal counters (a rider refused without being named, a fenced
+    # acknowledgement) must not carry one test's count into the next.
+    main.reply_riders.reset_counters()
     # 2026-10-07: CLI timeouts faked by one test must not leave the CLI
     # resting (claude_client's timeout breaker) in the next.
     claude_client._cli_timeout_streak = 0
