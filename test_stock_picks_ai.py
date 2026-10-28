@@ -698,29 +698,60 @@ def test_switch_off_does_not_even_read_the_ai_file(monkeypatch):
     assert sp.status_summary()["ai_status"] == "disabled"
 
 
-# ── 推薦紀錄：每個交易日一行，帶 rule ───────────────────────────────────────
+# ── 推薦紀錄：每個交易日至少一行（rev=1）、帶 rule；同一個 T 重算而且推薦換了才再追加一行（rev 加 1） ──────────────
 def _history_lines():
     path = sp.STATE_DIR / "stock_picks_tw_ai_history.jsonl"
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
 
 
-def test_history_once_per_day_with_rule_and_never_touches_the_legacy_file():
-    payload = _state([_facts()])
-    sp._append_ai_history(payload)
-    sp._append_ai_history(payload)  # 同一天已經有了：不重寫
-    changed = _state([_facts("1101")])
-    sp._append_ai_history(changed)  # 同一天換了推薦也不改寫第一筆
-    next_day = _state([_facts("1101", data_date=T + timedelta(days=1))], t=T + timedelta(days=1))
-    sp._append_ai_history(next_day)
-    lines = _history_lines()
-    assert [row["t"] for row in lines] == [T.isoformat(), (T + timedelta(days=1)).isoformat()]
-    assert lines[0]["rule"] == "ai_v1" and lines[0]["picks"][0] == {
-        "code": "2330", "name": "股2330", "close": 100.0, "ai_source": "00952", "p60": 0}
-    assert lines[0]["source"] == "00952" and lines[0]["core_version"] == "test-v1"  # 同一天重算（名單、核心換了）時對得上是哪一份
-    assert lines[1]["picks"][0]["code"] == "1101"
+def test_history_first_compute_is_rev_1_with_rule_and_never_touches_the_legacy_file():
+    sp._append_ai_history(_state([_facts()]))
+    (line,) = _history_lines()
+    assert set(line) == {"t", "rev", "rule", "computed_at", "source", "core_version", "picks"}  # 最終欄位
+    assert (line["t"], line["rev"], line["rule"]) == (T.isoformat(), 1, "ai_v1")
+    assert line["picks"] == [{"code": "2330", "name": "股2330", "close": 100.0, "ai_source": "00952", "p60": 0}]
+    assert line["source"] == "00952" and line["core_version"] == "test-v1"  # 同一天重算（名單、核心換了）時對得上是哪一份
     assert not (sp.STATE_DIR / "stock_picks_history.jsonl").exists()
     sp._append_ai_history(_state(t=None))  # 還沒有結果的狀態不記
-    assert len(_history_lines()) == 2
+    next_day = T + timedelta(days=1)
+    sp._append_ai_history(_state([_facts("1101", data_date=next_day)], t=next_day))
+    assert [(row["t"], row["rev"]) for row in _history_lines()] == [(T.isoformat(), 1), (next_day.isoformat(), 1)]  # 新的一天重新從 1 起
+
+
+def test_history_recompute_with_different_picks_adds_the_next_rev():
+    """00952 晚到：同一個 T 先用核心名單算出一份（rev 1），名單到了重算、推薦換了 → 再追加一行（rev 2），前一行不改；
+    只跟最後一行比，換回原本的推薦也算不同。"""
+    sp._append_ai_history(_state([_facts()], source="core_only"))
+    sp._append_ai_history(_state([_facts("1101"), _facts()], source="00952"))
+    sp._append_ai_history(_state([_facts()], source="00952"))  # 又換回第一份的推薦：和最後一行（rev 2）不同
+    lines = _history_lines()
+    assert [(row["t"], row["rev"]) for row in lines] == [(T.isoformat(), n) for n in (1, 2, 3)]
+    assert [[p["code"] for p in row["picks"]] for row in lines] == [["2330"], ["1101", "2330"], ["2330"]]
+    assert [row["source"] for row in lines] == ["core_only", "00952", "00952"]  # 前面的行沒有被改寫
+    assert not (sp.STATE_DIR / "stock_picks_history.jsonl").exists()
+
+
+def test_history_recompute_with_the_same_picks_writes_nothing():
+    payload = _state([_facts()])
+    sp._append_ai_history(payload)
+    sp._append_ai_history(payload)  # 重啟補記同一份
+    sp._append_ai_history(_state([_facts()], source="cached"))  # 重算：名單來源、時間都變了，推薦沒變
+    assert [row["rev"] for row in _history_lines()] == [1]
+    sp._append_ai_history(_state([_facts("1101")]))
+    sp._append_ai_history(_state([_facts("1101")], source="core_only"))  # 和最後一行（rev 2）相同
+    assert [row["rev"] for row in _history_lines()] == [1, 2]
+
+
+def test_history_never_goes_back_a_day_and_a_line_without_rev_counts_as_rev_1():
+    path = sp.STATE_DIR / "stock_picks_tw_ai_history.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    before_rev = {"t": T.isoformat(), "rule": "ai_v1", "computed_at": 1.0, "source": "00952",
+                  "core_version": "test-v1", "picks": []}
+    path.write_text(json.dumps(before_rev) + "\n", encoding="utf-8")  # rev 出現之前寫的行
+    sp._append_ai_history(_state([_facts()]))
+    yesterday = T - timedelta(days=1)
+    sp._append_ai_history(_state([_facts(data_date=yesterday)], t=yesterday))  # 日期只往前
+    assert [(row["t"], row.get("rev")) for row in _history_lines()] == [(T.isoformat(), None), (T.isoformat(), 2)]
 
 
 def test_history_records_a_day_without_picks():
@@ -738,7 +769,21 @@ def test_startup_backfills_a_missing_history_line(monkeypatch):
     monkeypatch.setattr(sp, "STARTUP_DELAY_S", 0)
     monkeypatch.setattr(sp, "_tick", lambda _: stop.set() or 0.0)
     sp._run(stop, threading.Event())
-    assert [row["t"] for row in _history_lines()] == [T.isoformat()]
+    assert [(row["t"], row["rev"]) for row in _history_lines()] == [(T.isoformat(), 1)]
+
+
+def test_startup_backfills_a_missing_second_rev(monkeypatch):
+    sp._append_ai_history(_state([_facts()], source="core_only"))  # rev 1 已經寫了
+    assert sp._commit_ai(_state([_facts("1101")]))  # 00952 晚到、重算的狀態落盤了，第 2 版紀錄還沒寫就重啟
+    assert [row["rev"] for row in _history_lines()] == [1]
+    monkeypatch.setattr(sp, "_loaded", False)
+    monkeypatch.setattr(sp, "_ai_state", None)
+    stop = threading.Event()
+    monkeypatch.setattr(sp, "STARTUP_DELAY_S", 0)
+    monkeypatch.setattr(sp, "_tick", lambda _: stop.set() or 0.0)
+    sp._run(stop, threading.Event())
+    assert [(row["t"], row["rev"], row["picks"][0]["code"]) for row in _history_lines()] == [
+        (T.isoformat(), 1, "2330"), (T.isoformat(), 2, "1101")]
 
 
 # ── status_summary：新欄位，舊欄位不變 ───────────────────────────────────────

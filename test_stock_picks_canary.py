@@ -19,11 +19,19 @@ def net(monkeypatch):
     return fake
 
 
+def _closes_with_a_trade(days, traded):
+    """每天收 100.0，只有 traded 這天收 103.0：那天真的有成交。Yahoo 在休市日補的是照抄前一天的平盤（100.0），
+    不是這種——lines_up_before_t 只放過平盤，所以要測「真的洞」的 2330 日線，日曆沒有的那天一定要用這個。"""
+    return [103.0 if d == traded else 100.0 for d in days]
+
+
 @pytest.mark.parametrize("missing", ["index", "canary"])
 def test_calendar_hole_stops_before_batch_or_bulk(net, missing):
     days = CAL[:-2] + ([T] if missing == "index" else [])
     symbol = "^TWII" if missing == "index" else "2330.TW"
     net.charts[symbol] = _chart(days, [20000.0 if missing == "index" else 100.0] * len(days))
+    if missing == "index":  # 指數少了 CAL[-2]，那天 2330 真的有成交（平盤的話是休市日，見 flat_copies 那組）
+        net.charts["2330.TW"] = _chart(CAL[:-1], _closes_with_a_trade(CAL[:-1], CAL[-2]))
     with pytest.raises(sp.RoundFailed) as caught:
         sp.refresh(T, _day_rows(net), threading.Event())
     assert caught.value.kind == "calendar_hole"
@@ -60,13 +68,45 @@ def test_spliced_calendar_also_checks_canary(net):
     assert net.count("FMTQIK") == net.count("2330.TW") == 1
 
 
+def _closed_days_before_t(net, closed_count, traded=None):
+    """T 前面緊鄰 closed_count 個臨時休市日：日曆（^TWII）沒有，2330 的 Yahoo 日線卻有那幾根——預設是照抄前一個交易日
+    收盤的平盤；traded 指定其中第幾天改成真的有成交（收 103.0）。回 (休市日, 日曆, ^TWII 日線)。"""
+    closed = CAL[-1 - closed_count:-1]
+    calendar = [d for d in CAL if d not in closed]
+    closes = [100.0] * (len(CAL) - 1)
+    if traded is not None:
+        closes[CAL.index(closed[traded])] = 103.0
+    net.charts["2330.TW"] = _chart(CAL[:-1], closes)
+    return closed, calendar, _chart(calendar, [20000.0] * len(calendar))
+
+
+@pytest.mark.parametrize("closed_count", [1, 2])
+def test_flat_copies_on_closed_days_pass_the_canary(net, closed_count):
+    """2026-10-23 臨時休市：^TWII 沒有那天，2330 的 Yahoo 日線卻有一根成交量 0、照抄前一天收盤的平盤——不是日曆的洞。
+    window_closes 放過它；抽查跟著放過，不然休市後第一個交易日每一輪都停在 calendar_hole、T 永遠算不出來。"""
+    closed, calendar, twii = _closed_days_before_t(net, closed_count)
+    chart = sp._calendar_canary(twii, calendar, T, threading.Event())
+    assert chart is net.charts["2330.TW"] and net.count("2330.TW") == 1  # 抽查的日線給主池重用
+    assert set(closed) <= set(sp.parse_chart(chart))  # 平盤那幾根還在日線裡，只是不當成洞
+
+
+@pytest.mark.parametrize("closed_count, traded", [(1, 0), (2, 0), (2, 1)])
+def test_a_traded_bar_on_a_day_the_calendar_lacks_is_still_a_calendar_hole(net, closed_count, traded):
+    """那天 2330 的收盤不是平盤（真的有成交）→ 日曆少了真的交易日：照舊 calendar_hole（還沒出來，不算失敗）。
+    兩個休市日時，只要其中一天不是平盤就算。"""
+    _, calendar, twii = _closed_days_before_t(net, closed_count, traded)
+    with pytest.raises(sp.RoundFailed) as caught:
+        sp._calendar_canary(twii, calendar, T, threading.Event())
+    assert caught.value.kind == "calendar_hole" and caught.value.not_yet and not caught.value.blocked
+
+
 @pytest.mark.parametrize("t", [date(2026, 10, 1), date(2027, 1, 4)])
 def test_t_present_month_and_year_boundary_canary(net, monkeypatch, t):
     days = _business_days(300, t)
     if t.month == 1:
         days.remove(date(2027, 1, 1))  # 合成元旦休市
     net.charts["^TWII"] = _chart(days[:-2] + [t], [20000.0] * (len(days) - 1))
-    net.charts["2330.TW"] = _chart(days[:-1], [100.0] * (len(days) - 1))
+    net.charts["2330.TW"] = _chart(days[:-1], _closes_with_a_trade(days[:-1], days[-2]))  # 指數少的那天 2330 真的有成交
     with pytest.raises(sp.RoundFailed, match="calendar_hole") as caught:
         sp.refresh(t, {}, threading.Event())
     assert caught.value.not_yet
@@ -197,6 +237,21 @@ def test_gray_reasons_follow_the_order_window_closes_checks(kind, expected):
         assert sp._window_unavailable_reason(bars, CAL, T, t_close, prev) == expected
     assert sp._window_unavailable_reason(bars, CAL[-100:], T, t_close, prev) == "calendar_short"
     assert sp._window_unavailable_reason(bars, CAL, T, float("nan"), prev) in ("close_invalid", "calendar_short")
+
+
+def test_gray_reason_looks_past_a_flat_copy_on_a_closed_day():
+    """休市日那根平盤 window_closes 放過了，診斷也不能因為它報 previous_day_missing：AI 段把這個原因當「Yahoo 還沒補」，
+    會把本來就不合格的候選（分割、新上市）擋成 hole 等最多 3 小時。那天真的有成交才是日曆的洞。"""
+    closed = CAL[-2]
+    calendar = [d for d in CAL if d != closed]
+    flat = {d: 100.0 for d in CAL[:-1]}  # closed 那根照抄前一天
+    assert sp.window_closes(flat, calendar, T, 100.0, None) is not None
+    jump = {**flat, **{d: 300.0 for d in CAL[:120]}}  # 窗內有分割式的跳動
+    assert sp.window_closes(jump, calendar, T, 100.0, None) is None
+    assert sp._window_unavailable_reason(jump, calendar, T, 100.0, None) == "price_jump"
+    traded = {**flat, closed: 103.0}
+    assert sp.window_closes(traded, calendar, T, 100.0, None) is None
+    assert sp._window_unavailable_reason(traded, calendar, T, 100.0, None) == "previous_day_missing"
 
 
 @pytest.mark.parametrize("t", [date(2026, 10, 1), date(2027, 1, 4)])

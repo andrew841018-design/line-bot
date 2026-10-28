@@ -154,9 +154,13 @@ def _disk():
     return sp.load_ai_file()
 
 
-def _history_days():
+def _history_rows():
     path = sp.STATE_DIR / "stock_picks_tw_ai_history.jsonl"
-    return [json.loads(line)["t"] for line in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
+
+
+def _history_days():
+    return [row["t"] for row in _history_rows()]
 
 
 # ── 懶抓：照最後排名一檔一檔查，滿 3 檔就停 ─────────────────────────────────
@@ -308,7 +312,8 @@ def test_a_skipped_candidate_is_rechecked_hourly_and_recomputes_once_when_it_res
     rig.run()
     assert rig.picks == ["1101", "1102", "1103"] and sp._ai_state["skipped"] == {}  # 算得出來了：重算一次
     assert rig.yahoo.calls.count("1101.TW") == 11 and rig.yahoo.calls.count("1102.TW") == 1 and sp._ai_state["fail_count"] == 0
-    assert _history_days() == [T.isoformat()]  # 同一天不重寫歷史
+    assert [(row["rev"], [p["code"] for p in row["picks"]]) for row in _history_rows()] == [
+        (1, ["1102", "1103"]), (2, ["1101", "1102", "1103"])]  # 重算後多了 1101：同一天追加第 2 版，第 1 版不改
     clock.advance(sp.AI_SKIP_RECHECK_S * 2)
     rig.run()
     assert len(rig.yahoo.calls) == 13  # 沒有 skipped 了：不再重看（3 檔＋之後 9 輪的 1101＋這次重看的 1101）
@@ -506,7 +511,7 @@ def test_rule_or_core_change_recomputes_the_same_t(monkeypatch, clock):
     _next_round(clock)
     rig.run()
     assert rig.universe_calls == 3 and sp._ai_state["rule"] == sp.AI_RULE
-    assert _history_days() == [T.isoformat()]  # 同一天紀錄只有一行
+    assert [row["rev"] for row in _history_rows()] == [1]  # 名單、規則換了重算兩次，推薦沒變：紀錄還是一行
 
 
 def test_logs_carry_reason_codes_and_counts_only(monkeypatch, clock, caplog):
@@ -871,7 +876,8 @@ def test_missing_00952_today_triggers_one_more_try_later_the_same_day(monkeypatc
     clock.advance(sp.AI_FETCH_RETRY_S * 2)
     sp._maybe_fill_ai(threading.Event())
     assert len(rig.fetches) == 2  # 今天的 00952 到手了：同一個 T 不再重算
-    assert _history_days() == [T.isoformat()]
+    assert [(row["t"], row["rev"], row["source"], [p["code"] for p in row["picks"]]) for row in _history_rows()] == [
+        (T.isoformat(), 1, "core_only", ["1103"]), (T.isoformat(), 2, "00952", ["1101", "1102", "1103"])]  # 00952 晚到：第 2 版
 
 
 def test_blocked_site_does_not_cause_endless_recomputation(monkeypatch, tmp_path, clock):

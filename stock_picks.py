@@ -1041,6 +1041,18 @@ SPLICE_T_GAP = 0.01  # Yahoo 也有 T 那根時和證交所收盤的差
 SPLICE_JUMP = 0.25  # 窗內相鄰兩天（台股漲跌幅上限 10%）
 
 
+def lines_up_before_t(bars: dict[date, float], prev_day: date, t: date) -> bool:
+    """Yahoo 個股日線在 T 前面接得上日曆：要有 T 的前一個交易日（prev_day）那根；夾在 prev_day 和 T 之間的 Yahoo 日子
+    日曆上一定沒有（prev_day 就是日曆裡 T 的前一天），只有「照抄 prev_day 收盤的平盤」可以放過（math.isclose，rel 1e-9）：
+    臨時休市日（2026-10-23）^TWII 那天沒有收盤，個股 Yahoo 卻補了一根成交量 0 的平盤。收盤不一樣＝那天真的有成交，
+    是日曆少了一個真的交易日。window_closes（逐檔窗口）、_window_unavailable_reason（⚪ 診斷）、_calendar_canary
+    （2330 抽查）共用這一條，免得一處放過休市日、另一處又把它當成日曆的洞。"""
+    prev_close = bars.get(prev_day)
+    if prev_close is None:
+        return False
+    return all(math.isclose(value, prev_close, rel_tol=1e-9) for day, value in bars.items() if prev_day < day < t)
+
+
 def window_closes(
     bars: dict[date, float], calendar: Sequence[date], t: date, close: float, prev_reference: Optional[float]
 ) -> Optional[tuple[list[float], list[float]]]:
@@ -1048,8 +1060,9 @@ def window_closes(
     最後接官方（證交所或櫃買）的 T 收盤。接不上、缺太多天 → None（⚪）。
 
     - Yahoo 要有 T 的前一個交易日那根（停牌、缺資料就不接）；夾在它和 T 之間、日曆上沒有的 Yahoo 日子，
-      只有「照抄前一個交易日收盤」可以放過：臨時休市日（2026-10-23）^TWII 那天沒有收盤、不在日曆上，個股 Yahoo
-      卻補了一根成交量 0 的平盤。日曆真的少了一個交易日時，那天個股不會整批平盤 → None（整輪 too_many_gray）。
+      只有「照抄前一個交易日收盤」可以放過（lines_up_before_t）：臨時休市日（2026-10-23）^TWII 那天沒有收盤、
+      不在日曆上，個股 Yahoo 卻補了一根成交量 0 的平盤。日曆真的少了一個交易日時，那天個股不會整批平盤
+      → None（整輪 too_many_gray）。
     - Yahoo 也有 T 而且和官方收盤差 > 1%；官方前一日參考價（收盤−漲跌）和 Yahoo 前一天收盤
       差 > 15%（漲跌缺值就不比，只靠下一條）；窗內相鄰兩根差 > 25%（分割、減資沒對齊）→ None。
     - 不在日曆上的 Yahoo 日子不用；缺的日子不拿更早的補。
@@ -1058,10 +1071,7 @@ def window_closes(
     if len(days) < YEAR_BARS or days[-1] != t or not (math.isfinite(close) and close > 0):
         return None
     prev_day = days[-2]
-    prev_close = bars.get(prev_day)
-    if prev_close is None:
-        return None
-    if any(not math.isclose(value, prev_close, rel_tol=1e-9) for day, value in bars.items() if prev_day < day < t):
+    if not lines_up_before_t(bars, prev_day, t):
         return None
     on_day = bars.get(t)
     if on_day is not None and abs(on_day / close - 1.0) > SPLICE_T_GAP:
@@ -1090,14 +1100,14 @@ def window_closes(
 def _window_unavailable_reason(
     bars: dict[date, float], calendar: Sequence[date], t: date, close: float, prev_reference: Optional[float]
 ) -> str:
-    """只供 ⚪ 診斷，不參與窗口計算或改變 window_closes 的回傳。"""
+    """只供 ⚪ 診斷，不參與窗口計算或改變 window_closes 的回傳。檢查順序照 window_closes；前一個交易日那條用同一個
+    lines_up_before_t（休市日的平盤不算前一天缺——AI 段把 previous_day_missing 當「Yahoo 還沒補」等最多 3 小時）。"""
     days = [d for d in calendar if d <= t][-YEAR_BARS:]
     if len(days) < YEAR_BARS or not days or days[-1] != t:
         return "calendar_short"
     if not math.isfinite(close) or close <= 0:
         return "close_invalid"
-    before = [d for d in bars if d < t]
-    if not before or max(before) != days[-2]:
+    if not lines_up_before_t(bars, days[-2], t):
         return "previous_day_missing"
     if t in bars and abs(bars[t] / close - 1.0) > SPLICE_T_GAP:
         return "close_mismatch"
@@ -1983,11 +1993,11 @@ def _commit_snapshot(new: Snapshot) -> str:
 
 # ── 推薦紀錄（Andrew 2026-10-10：從上線那天開始記，第 3 段算推薦成績用；只存公開數字） ────────
 HISTORY_NAME = "stock_picks_history.jsonl"
-HISTORY_MAX_BYTES = 5 * 1024 * 1024  # 一天一行約 300 字，夠用幾十年
+HISTORY_MAX_BYTES = 5 * 1024 * 1024  # 一天一行約 300 字（AI 紀錄同一天重算換推薦時多幾行），夠用幾十年
 
 
-def _history_tail(path: Path) -> tuple[Optional[str], bool]:
-    """(最後一筆讀得懂的紀錄的 T, 檔尾是不是換行)。只讀最後 4 KB；最後一行寫到一半就往前看；
+def _history_last(path: Path) -> tuple[Optional[dict], bool]:
+    """(最後一筆讀得懂的紀錄, 檔尾是不是換行)。只讀最後 4 KB；最後一行寫到一半就往前看；
     t 要是合法日期（被改壞的 "9999" 不算，免得 `>=` 從此擋住所有寫入）。沒有檔回 (None, True)。"""
     try:
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
@@ -2000,19 +2010,29 @@ def _history_tail(path: Path) -> tuple[Optional[str], bool]:
     ends_with_newline = not tail or tail.endswith(b"\n")
     for raw in reversed(tail.decode("utf-8", "replace").strip().splitlines()):
         try:
-            value = json.loads(raw).get("t")
-            day = date.fromisoformat(value)
+            record = json.loads(raw)
+            day = date.fromisoformat(record.get("t"))
         except (ValueError, AttributeError, TypeError):
             continue
         if day > _taipei_today():  # 被改成未來日期（"9999-12-31"）也不算，免得從此不再記
             continue
-        return value, ends_with_newline
+        return record, ends_with_newline
     return None, ends_with_newline
 
 
-def _append_history(snapshot: Optional[Snapshot], *, name: str = HISTORY_NAME, record: Optional[dict] = None) -> None:
+def _history_rev(record: dict) -> int:
+    """一行紀錄的版次：沒有 rev（rev 出現之前寫的）或不是正整數都算第 1 版。"""
+    rev = record.get("rev")
+    return rev if isinstance(rev, int) and not isinstance(rev, bool) and rev >= 1 else 1
+
+
+def _append_history(
+    snapshot: Optional[Snapshot], *, name: str = HISTORY_NAME, record: Optional[dict] = None, revise: bool = False
+) -> None:
     """一個交易日一行：T、大盤、推薦的代號／名稱／收盤／分數／季線乖離（沒有推薦也記一行）。
     日期只往前：最後一行的 T 已經 ≥ 這個 T 就不寫（重啟、同 T 重寫快照、別的程序先寫了）；
+    revise（只有 AI 推薦紀錄用）：同一個 T 重算（00952 晚到、補上跳過的候選）而且 picks 和該 T 最後一行不同時，
+    再追加一行、rev 加 1（第一行 rev=1，沒有 rev 的舊行算 1）；picks 一樣就不寫。讀取端同一個 t 取 rev 最大的那行。
     寫不進去只記錯誤種類。"""
     path = STATE_DIR / name
     record = record if record is not None else {
@@ -2030,12 +2050,22 @@ def _append_history(snapshot: Optional[Snapshot], *, name: str = HISTORY_NAME, r
         ],
         "computed_at": round(snapshot.computed_at),
     }
-    line = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
     try:
         with _state_file_lock():
-            last_t, ends_with_newline = _history_tail(path)
-            if last_t is not None and last_t >= record["t"]:
+            last, ends_with_newline = _history_last(path)
+            last_t = None if last is None else last["t"]
+            if revise:
+                if last_t is not None and last_t > record["t"]:
+                    return
+                rev = 1
+                if last_t == record["t"]:
+                    if last.get("picks") == json.loads(json.dumps(record["picks"])):  # 和讀回來的同一種型別才比
+                        return
+                    rev = _history_rev(last) + 1
+                record = {"t": record["t"], "rev": rev, **{k: v for k, v in record.items() if k != "t"}}
+            elif last_t is not None and last_t >= record["t"]:
                 return
+            line = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
             try:
                 if os.lstat(path).st_size + len(line) > HISTORY_MAX_BYTES:
                     logger.warning("stock picks history is full; not appended")
@@ -2233,7 +2263,9 @@ def _twse_t_close(bars: dict[date, float], t: date, stop: threading.Event, give_
 
 
 def _calendar_canary(twii: dict, calendar: Sequence[date], t: date, stop: threading.Event) -> dict:
-    """抽查 2330 的日線：T 前最後一根要和日曆的前一個交易日一致（Yahoo 內部日線不一致時，窗口會悄悄少一根）。
+    """抽查 2330 的日線：要接得上日曆的前一個交易日（Yahoo 內部日線不一致時，窗口會悄悄少一根）。規則和逐檔窗口
+    window_closes 同一條（lines_up_before_t）：有前一個交易日那根；夾在它和 T 之間、日曆沒有的日子只能是休市日照抄的
+    平盤（臨時休市後第一個交易日不能卡在這裡），收盤不一樣＝日曆少了真的交易日。
     抽查沒做成（抓不到、429、冷卻、停止）或日曆有洞都是「還沒出來」（not_yet），不算主流程失敗；成功回 2330 的日線，
     主池抓取直接重用。"""
     try:
@@ -2251,14 +2283,15 @@ def _calendar_canary(twii: dict, calendar: Sequence[date], t: date, stop: thread
     if canary is None:
         logger.info("stock picks calendar canary reason=unavailable")
         raise RoundFailed("canary_unavailable", not_yet=True)
-    before = [d for d in parse_chart(canary) if d < t]
-    canary_prev = max(before) if before else None
+    bars = parse_chart(canary)
+    before = [d for d in bars if d < t]
+    canary_prev = max(before) if before else None  # 只進 log：休市日的平盤放過時，這天會比 expected_prev 晚
+    aligned = lines_up_before_t(bars, calendar[-2], t)
     logger.info(
         "stock picks calendar canary index_last=%s expected_prev=%s canary_prev=%s result=%s",
-        max(parse_chart(twii), default=None), calendar[-2], canary_prev,
-        "ok" if canary_prev == calendar[-2] else "calendar_hole",
+        max(parse_chart(twii), default=None), calendar[-2], canary_prev, "ok" if aligned else "calendar_hole",
     )
-    if canary_prev != calendar[-2]:
+    if not aligned:
         raise RoundFailed("calendar_hole", not_yet=True)
     return canary
 
@@ -2909,14 +2942,17 @@ def _commit_ai(payload: dict) -> bool:
 
 
 def _append_ai_history(state: dict) -> None:
-    """每個交易日一行（同日已有就不寫），帶 rule；舊的 stock_picks_history.jsonl 照舊寫、不再顯示。"""
+    """每個交易日至少一行（rev=1），帶 rule；同一個 T 重算（00952 晚到、補上跳過的候選）而且 picks 和該 T 最後一行
+    不同時，再追加一行、rev 加 1，picks 一樣就不寫；讀取端同一個 t 取 rev 最大的那行。
+    欄位：t、rev、rule、computed_at、source、core_version、picks[code, name, close, ai_source, p60]。
+    舊的 stock_picks_history.jsonl 照舊寫（一個 T 一行）、不再顯示。"""
     if state.get("t") is None:
         return
     record = {"t": state["t"], "rule": state["rule"], "computed_at": state["computed_at"],
               "source": state["universe"]["source"], "core_version": state.get("core_version", ""),
               "picks": [{"code": p["c"], "name": p["n"], "close": p["tr"][0],
                          "ai_source": p["ai_source"], "p60": p["tr"][3]} for p in state["picks"]]}
-    _append_history(None, name=AI_HISTORY_NAME, record=record)
+    _append_history(None, name=AI_HISTORY_NAME, record=record, revise=True)
 
 
 def _ai_record(*, failed: bool, reason: str = "exception") -> None:
