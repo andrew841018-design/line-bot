@@ -2860,6 +2860,279 @@ def cpi_poll(now_et: datetime, stored: str | None, last_probe: float | None, *, 
     return CpiPoll(state, spaced(CPI_POLL_EVERY_S if in_window else CPI_PROBE_EVERY_S), expected)
 
 
+# ── 資金輪動（必需消費 XLP／KO 對半導體 SOXX；2026-10-28）──────────────────────────────────────────
+# Andrew 2026-10-28：「新增消費型類股(KO and XLP)的監控，以此預判可能到來的資金輪動（ex:如果KO低位盤整，SOXX高位插針，
+# 可能預判資金即將往消費類股輪動）」；追問後：放在美股卡、不寫死單一組條件、不主動推播、KO 也能觸發（B 案）、研判那一列用描述句。
+# 只看收盤價（不存開高低，插針這一批不做），卡上只描述狀態：這不是資金流向資料，也不是買賣建議。規則（每個交易日各自算）：
+#   趨勢 T＝XLP 與 SOXX 近 ROT_WINDOW 個交易日的報酬（各自先 half-up 到一位小數）相減，≥+5 個百分點是必需消費比較強、≤−5 是
+#     半導體比較強，其他沒有方向；T 只看 XLP 對 SOXX（KO 是個股，不代表整個類股）。
+#   SOXX 偏熱＝RSI≥70，或（離 240 日高點 ≥−3% 而且離季線 ≥+10%）；SOXX 偏冷＝RSI≤30，或離季線 ≤−10%。
+#   必需消費偏弱＝XLP 或 KO 在季線下、或 RSI≤40；必需消費偏熱＝XLP 或 KO 的 RSI≥70（KO 沒有研判日的收盤就是未知）。
+#   X：SOXX 同時偏熱又偏冷 → 沒有；半導體偏熱＋必需消費偏弱 → watch_staples；半導體偏冷＋必需消費偏熱 → watch_semis；
+#     用 Kleene 三值邏輯，未知不當成假。結果：X 是 watch 就用 X；X 未知而且 T 沒有方向 → 資料不足；其他用 T。
+#   顯示的狀態要連續 ROT_CONFIRM_DAYS 個交易日一樣才會換（rot_confirmed；往回最多 ROT_LOOKBACK 天，用同一份收盤重算）。
+# 門檻都是起始值，沿用一般技術分析慣例，沒有回測校準：部署後用正式 DB 重放，只看各狀態出現幾天、改變幾次，再調。
+# 所有門檻都比「顯示精度的 half-up 值」（報酬、乖離一位小數，RSI 整數；和 market_dashboard._half_up 同一個規則），values 存的
+# 就是這個值：判斷和卡上印的字不會分家（沒四捨五入的 69.6 不算偏熱、卡上卻印 RSI 70）。這一列和 SOXX 建倉日報、出場通知無關：
+# 不讀它們，也不改它們。
+ROT_WINDOW = 20  # 報酬看近幾個交易日（窗口是 ROT_WINDOW＋1 個交易日，只看兩端）
+ROT_GAP_PP = Decimal("5.0")  # 兩個 20 日報酬差幾個百分點才算有方向（含等號）
+ROT_RSI_HOT = 70
+ROT_RSI_COLD = 30
+ROT_WEAK_RSI = 40  # 必需消費的 RSI ≤40 算偏弱
+ROT_NEAR_HIGH_PCT = Decimal("-3.0")  # 離 240 日高點 ≥−3%：在高點附近
+ROT_STRETCH_MA60_PCT = Decimal("10.0")  # 離季線 ≥+10% 算拉得很開（偏熱的一條路）、≤−10% 算偏冷
+# 往回算幾天的原始狀態（含研判日）。5 而不是 10：staging 的真實收盤試算，改變次數、只 1 天的段都差不多，但「沿用舊狀態」最長
+# 從 5 天降到 3 天。沿用有上限是刻意的：最多 3 個交易日沒有當天支持，之後回到「沒有明顯方向」
+ROT_LOOKBACK = 5
+ROT_CONFIRM_DAYS = 2  # 狀態要連續幾個交易日一樣才會換（rot_confirmed 照這個寫；TEXT_ROT_NOTE_HELD 的「2」用測試綁住）
+ROT_CLOSE_SYMBOLS = ("XLP", "SOXX", "KO")  # rot_inputs 讀的代號（closes 的鍵）
+ROT_STAPLES, ROT_SEMIS, ROT_WATCH_STAPLES, ROT_WATCH_SEMIS, ROT_NONE, ROT_INSUFFICIENT = (
+    "staples", "semis", "watch_staples", "watch_semis", "none", "insufficient",
+)
+ROT_STATES = (ROT_STAPLES, ROT_SEMIS, ROT_WATCH_STAPLES, ROT_WATCH_SEMIS, ROT_NONE, ROT_INSUFFICIENT)
+_ROT_WATCHES = (ROT_WATCH_STAPLES, ROT_WATCH_SEMIS)
+# 卡片的固定句：列名、兩檔的名稱、狀態句（描述句，不用祈使句、不寫「跡象」）；insufficient 用既有的 TEXT_INSUFFICIENT
+TEXT_ROT_XLP_NAME = "必需消費（XLP）"
+TEXT_ROT_KO_NAME = "可口可樂（KO）"
+TEXT_ROT_LABEL = "資金輪動"
+TEXT_ROT_STAPLES = "必需消費比半導體強"
+TEXT_ROT_SEMIS = "半導體比必需消費強"
+TEXT_ROT_GAP = " {gap} 個百分點"  # 接在 staples／semis 句尾（差距的絕對值，一位小數）
+TEXT_ROT_WATCH_STAPLES = "半導體偏熱、必需消費偏弱"
+TEXT_ROT_WATCH_SEMIS = "半導體偏冷、必需消費偏熱"
+TEXT_ROT_NONE = "沒有明顯方向"
+# footer（不受 24 寬限制）：判斷依據與當天的數字
+TEXT_ROT_NOTE_RETURNS = "資金輪動只看價格：近 20 個交易日 XLP {xlp}、SOXX {soxx}"
+TEXT_ROT_NOTE_WATCH = "資金輪動只看價格：SOXX RSI {soxx_rsi}、離季線 {soxx_ma60}、離 240 日高點 {soxx_dd240}；XLP RSI {xlp_rsi}、{xlp_ma60}"
+TEXT_ROT_NOTE_KO = "；KO RSI {ko_rsi}、{ko_ma60}"  # KO 有值時接在 TEXT_ROT_NOTE_WATCH 後面
+TEXT_ROT_NOTE_HELD = "狀態要連續 2 個交易日都一樣才會換"  # 顯示的狀態是沿用前幾天的（state≠raw）時加
+ROT_STATE_TEXT: dict[str, str] = {
+    ROT_STAPLES: TEXT_ROT_STAPLES,
+    ROT_SEMIS: TEXT_ROT_SEMIS,
+    ROT_WATCH_STAPLES: TEXT_ROT_WATCH_STAPLES,
+    ROT_WATCH_SEMIS: TEXT_ROT_WATCH_SEMIS,
+    ROT_NONE: TEXT_ROT_NONE,
+    ROT_INSUFFICIENT: TEXT_INSUFFICIENT,
+}
+
+
+def _rot_1dp(value: Any) -> float | None:
+    """顯示精度：一位小數、ROUND_HALF_UP（_infl_dec 走 str()，和 market_dashboard._half_up 的 repr 一樣）。
+    算不出 Decimal（None、NaN、無限大）回 None；大到量化不了的壞值原樣回去，讓 rotation_values_ok 的範圍檢查擋下。"""
+    number = _infl_dec(value) if _is_num(value) else None
+    if number is None:
+        return None
+    try:
+        with localcontext(INFL_CONTEXT):
+            return float(_round1(number))
+    except InvalidOperation:
+        return float(number)
+
+
+def _rot_int(value: Any) -> int | None:
+    """RSI 的顯示精度：整數、ROUND_HALF_UP（和 taco_stats 的百分位同一個寫法）。"""
+    number = _infl_dec(value) if _is_num(value) else None
+    if number is None:
+        return None
+    with localcontext(INFL_CONTEXT):
+        return int(number.quantize(Decimal(1), rounding=ROUND_HALF_UP))
+
+
+def _rot_return(series: Mapping[date, Any], intervals: Any, first: date, last: date) -> float | None:
+    """窗口 [first, last] 的報酬（%，未四捨五入）：兩端都要有正的收盤、隔離區間沒碰到窗口；中間缺一根不影響。"""
+    start, end = series.get(first), series.get(last)
+    if not (_pos(start) and _pos(end)) or _touches_quarantine(intervals, first, last):
+        return None
+    return (float(end) / float(start) - 1.0) * 100.0
+
+
+def rot_inputs(closes: Mapping[str, Mapping[date, float]], quarantine: Any, cal: Any, day: date) -> dict:
+    """研判日 day 的指標，都是顯示精度的 half-up 值（報酬、乖離一位小數的 float，RSI 整數）；不修改傳進來的 dict／list。
+
+    closes＝{代號: {日期: 收盤}}（XLP、SOXX、KO；KO 可以沒有）；quarantine＝{代號: 隔離區間}；cal＝TradingCalendar（或排好的
+    預期交易日清單，同 technicals）。
+    - xlp_ret20／soxx_ret20：近 ROT_WINDOW＋1 個交易日要剛好湊滿、最後一天是 day；兩端（第一天、day）都要有正的收盤，而且兩檔
+      的隔離區間都沒碰到 [第一天, day]，否則兩個都是 None。
+    - SOXX、XLP：technicals（RSI14、離季線、離 240 日高點、在不在季線上），和 ETF 列同一個算法與窗口規則。
+    - KO：只有 KO 有 day 這天的收盤才算（ko_rsi、ko_above60），沒有就都是 None（分類裡算未知）。"""
+
+    def series(symbol: str) -> Mapping[date, Any]:
+        found = closes.get(symbol) if isinstance(closes, Mapping) else None
+        return found if isinstance(found, Mapping) else {}
+
+    def intervals(symbol: str) -> Any:
+        return quarantine.get(symbol) if isinstance(quarantine, Mapping) else None
+
+    xlp_ret = soxx_ret = None
+    window = _sessions_upto(cal, day, ROT_WINDOW + 1)
+    if len(window) == ROT_WINDOW + 1 and window[-1] == day:
+        xlp_raw = _rot_return(series("XLP"), intervals("XLP"), window[0], day)
+        soxx_raw = _rot_return(series("SOXX"), intervals("SOXX"), window[0], day)
+        if xlp_raw is not None and soxx_raw is not None:
+            xlp_ret, soxx_ret = _rot_1dp(xlp_raw), _rot_1dp(soxx_raw)
+            if xlp_ret is None or soxx_ret is None:
+                xlp_ret = soxx_ret = None
+    soxx = technicals(series("SOXX"), cal, day, intervals("SOXX"))
+    xlp = technicals(series("XLP"), cal, day, intervals("XLP"))
+    ko_series = series("KO")
+    ko = technicals(ko_series, cal, day, intervals("KO")) if _pos(ko_series.get(day)) else None
+    return {
+        "xlp_ret20": xlp_ret,
+        "soxx_ret20": soxx_ret,
+        "soxx_rsi": _rot_int(soxx.rsi14),
+        "soxx_ma60": _rot_1dp(soxx.ma_dist.get(60)),
+        "soxx_dd240": _rot_1dp(soxx.dd240_pct),
+        "xlp_rsi": _rot_int(xlp.rsi14),
+        "xlp_above60": xlp.above.get(60),
+        "ko_rsi": _rot_int(ko.rsi14) if ko is not None else None,
+        "ko_above60": ko.above.get(60) if ko is not None else None,
+    }
+
+
+def rot_gap(values: Mapping[str, Any]) -> Decimal | None:
+    """兩個已四捨五入的 20 日報酬相減（個百分點，剛好一位小數）；分類和卡上印的差距都用它，列上的差距等於 footer 兩個數字相減。"""
+    xlp, soxx = _infl_dec(values.get("xlp_ret20")), _infl_dec(values.get("soxx_ret20"))
+    if xlp is None or soxx is None:
+        return None
+    with localcontext(INFL_CONTEXT):
+        return xlp - soxx
+
+
+def _k_any(*atoms: bool | None) -> bool | None:
+    """Kleene 的 OR：任一個是 True → True；全部是 False → False；其他未知（None）。"""
+    if any(atom is True for atom in atoms):
+        return True
+    return False if all(atom is False for atom in atoms) else None
+
+
+def _k_all(*atoms: bool | None) -> bool | None:
+    """Kleene 的 AND：任一個是 False → False；全部是 True → True；其他未知（None）。"""
+    if any(atom is False for atom in atoms):
+        return False
+    return True if all(atom is True for atom in atoms) else None
+
+
+def _rot_at_least(value: Any, limit: Any) -> bool | None:
+    number = _infl_dec(value)
+    return None if number is None else number >= limit
+
+
+def _rot_at_most(value: Any, limit: Any) -> bool | None:
+    number = _infl_dec(value)
+    return None if number is None else number <= limit
+
+
+def _rot_below(above: Any) -> bool | None:
+    """「在季線下」：above 是 False → True；True → False；None（算不出來）→ 未知。"""
+    return True if above is False else False if above is True else None
+
+
+def rot_classify(values: Mapping[str, Any]) -> str:
+    """一天的原始狀態（只看傳進來的顯示精度值，不改它）。步驟見本區塊開頭的說明。"""
+    gap = rot_gap(values)
+    if gap is None:
+        return ROT_INSUFFICIENT
+    trend = ROT_STAPLES if gap >= ROT_GAP_PP else ROT_SEMIS if gap <= -ROT_GAP_PP else ROT_NONE
+    soxx_rsi, soxx_ma60 = values.get("soxx_rsi"), values.get("soxx_ma60")
+    xlp_rsi, ko_rsi = values.get("xlp_rsi"), values.get("ko_rsi")
+    hot = _k_any(
+        _rot_at_least(soxx_rsi, ROT_RSI_HOT),
+        _k_all(_rot_at_least(values.get("soxx_dd240"), ROT_NEAR_HIGH_PCT), _rot_at_least(soxx_ma60, ROT_STRETCH_MA60_PCT)),
+    )
+    cold = _k_any(_rot_at_most(soxx_rsi, ROT_RSI_COLD), _rot_at_most(soxx_ma60, -ROT_STRETCH_MA60_PCT))
+    weak = _k_any(
+        _rot_below(values.get("xlp_above60")), _rot_at_most(xlp_rsi, ROT_WEAK_RSI),
+        _rot_below(values.get("ko_above60")), _rot_at_most(ko_rsi, ROT_WEAK_RSI),
+    )
+    staples_hot = _k_any(_rot_at_least(xlp_rsi, ROT_RSI_HOT), _rot_at_least(ko_rsi, ROT_RSI_HOT))
+    rotation: str | None
+    if hot is True and cold is True:
+        rotation = ROT_NONE  # 訊號互相矛盾（急跌後 V 型反彈）
+    else:
+        watch_staples, watch_semis = _k_all(hot, weak), _k_all(cold, staples_hot)
+        if watch_staples is True:
+            rotation = ROT_WATCH_STAPLES
+        elif watch_semis is True:
+            rotation = ROT_WATCH_SEMIS
+        elif watch_staples is False and watch_semis is False:
+            rotation = ROT_NONE
+        else:
+            rotation = None  # 未知
+    if rotation in _ROT_WATCHES:
+        return rotation
+    if rotation is None and trend == ROT_NONE:
+        return ROT_INSUFFICIENT
+    return trend
+
+
+def rot_confirmed(raws: Sequence[str]) -> str:
+    """raws＝最近幾個交易日的原始狀態（舊→新，最後一個是研判日）；回卡上顯示的狀態。
+
+    今天算不出來（或沒有輸入）→ insufficient。否則從新往舊、兩兩比對相鄰的兩天：先碰到算不出來的日子 → none（不把舊方向延續過
+    缺口）；先碰到兩天一樣 → 那個狀態；都沒找到 → none。這就是「連續 2 個交易日（ROT_CONFIRM_DAYS）一樣才會換」：raws 最多
+    ROT_LOOKBACK 天，所以沿用舊狀態最多 3 個交易日。"""
+    if not raws or raws[-1] == ROT_INSUFFICIENT:
+        return ROT_INSUFFICIENT
+    for later, earlier in zip(reversed(raws), reversed(raws[:-1])):
+        if ROT_INSUFFICIENT in (later, earlier):
+            return ROT_NONE
+        if later == earlier:
+            return later
+    return ROT_NONE
+
+
+def rotation_values(closes: Mapping[str, Mapping[date, float]], quarantine: Any, cal: Any, day: date) -> dict:
+    """`us.rot.state` 的 values：研判日 day 的指標（rot_inputs）＋raw（day 當天的原始狀態）＋state（rot_confirmed 之後、卡上顯示的）。
+    往回 ROT_LOOKBACK 個交易日（含 day）用同一份收盤與隔離區間重算，不讀上一份快照，publish 重跑結果一樣；不修改輸入。
+    day 不是交易日時，day 當天算不出來 → insufficient。"""
+    today = rot_inputs(closes, quarantine, cal, day)
+    earlier = [session for session in _sessions_upto(cal, day, ROT_LOOKBACK) if session < day]
+    raws = [rot_classify(rot_inputs(closes, quarantine, cal, session)) for session in earlier]
+    raws.append(rot_classify(today))
+    return {**today, "raw": raws[-1], "state": rot_confirmed(raws)}
+
+
+# values 的欄位（ROW_IDS["us.rot.state"]）：state／raw 是 ROT_STATES 的列舉碼；報酬與乖離是一位小數的 %，RSI 是整數
+ROT_SPEC = {
+    "state": frozenset(ROT_STATES),
+    "raw": frozenset(ROT_STATES),
+    "xlp_ret20": "num?", "soxx_ret20": "num?",
+    "soxx_rsi": "int?", "soxx_ma60": "num?", "soxx_dd240": "num?",
+    "xlp_rsi": "int?", "xlp_above60": "bool?",
+    "ko_rsi": "int?", "ko_above60": "bool?",
+}
+_ROT_RSI_KEYS = ("soxx_rsi", "xlp_rsi", "ko_rsi")
+_ROT_ONE_DECIMAL_KEYS = ("xlp_ret20", "soxx_ret20", "soxx_ma60", "soxx_dd240")
+
+
+def rotation_values_ok(values: Any) -> bool:
+    """us.rot.state 的 values：型別（ROT_SPEC）、範圍、一位小數，再用 rot_classify 從存下來的值重算、必須等於 raw，而且 state 和 raw
+    的「資料不足」要一致。publish 組列時（不合就只讓這一列暫缺）與 bot 讀快照時（不合就當暫缺）共用；不丟例外。"""
+    if not spec_ok(ROT_SPEC, values):
+        return False
+    for key in ("xlp_ret20", "soxx_ret20", "soxx_ma60"):
+        number = values[key]
+        if number is not None and not -100 < number <= 1000:
+            return False
+    for key in _ROT_RSI_KEYS:
+        number = values[key]
+        if number is not None and not 0 <= number <= 100:
+            return False
+    drawdown = values["soxx_dd240"]
+    if drawdown is not None and not -100 <= drawdown <= 0:
+        return False
+    for key in _ROT_ONE_DECIMAL_KEYS:
+        number = _infl_dec(values[key])
+        if number is not None:
+            with localcontext(INFL_CONTEXT):
+                if _round1(number) != number:
+                    return False
+    if rot_classify(values) != values["raw"]:
+        return False
+    return (values["state"] == ROT_INSUFFICIENT) == (values["raw"] == ROT_INSUFFICIENT)
+
+
 # ── 顯示用快照的列 id 與 values 欄位（job 寫、bot 讀，兩端 import 這一份） ────────────
 # 型別：num（int 或 float、有限、不是 bool）、int、str、bool、date（"YYYY-MM-DD"）、any；後綴「?」＝可為 null；
 # dict＝固定鍵（全部要有）、{"*": spec}＝任意鍵、[spec]＝清單；("?", spec)＝可為 null 的巢狀結構；
@@ -2992,6 +3265,8 @@ TACO_SPEC = {
 _ITEMS = "items"
 ROW_IDS: dict[str, dict[str, Any]] = {
     **{f"us.etf.{s}": ETF_SPEC for s in ("VOO", "QQQ", "SOXX", "SPY")},
+    **{f"us.rot.{s}": ETF_SPEC for s in ("XLP", "KO")},
+    "us.rot.state": ROT_SPEC,
     **{f"us.breadth.{s}": BREADTH_SPEC for s in ("VOO", "QQQ", "SOXX")},
     **{f"us.options.{s}": OPTIONS_SPEC for s in ("QQQ", "SPY", "SOXX")},
     **{
