@@ -289,6 +289,9 @@ def test_help_explains_the_steps_without_mentions():
     help_text = main._HELP_TEXT
     for needed in ("/股票", "📈 股票推薦", "往左滑", "/股票 2330", "細節", "資料日期", "只供參考"):
         assert needed in help_text, needed
+    # 2026-10-24（計畫 C）：推薦區是「AI 相關股推薦」，不能再說舊的「台股推薦」或市值前 50 大，也不叫「AI 推薦」
+    assert "AI 相關股推薦" in help_text and "AI 相關＋便宜＋成長＋走勢，最多 3 檔" in help_text
+    assert "台股推薦" not in help_text and "AI 推薦" not in help_text and "市值前 50" not in help_text
     assert "@" not in help_text
 
 

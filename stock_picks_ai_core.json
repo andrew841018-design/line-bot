@@ -1,0 +1,188 @@
+{
+  "schema": 1,
+  "as_of": "2026-10-24",
+  "entries": [
+    {
+      "code": "2330",
+      "name": "台積電",
+      "segment": "AI 晶片代工",
+      "source_url": "https://news.cnyes.com/news/id/6631209",
+      "source_date": "2026-10-15"
+    },
+    {
+      "code": "3711",
+      "name": "日月光投控",
+      "segment": "先進封測",
+      "source_url": "https://technews.tw/?p=1595438",
+      "source_date": "2026-07-30"
+    },
+    {
+      "code": "2449",
+      "name": "京元電子",
+      "segment": "AI 晶片測試",
+      "source_url": "https://www.cna.com.tw/news/afe/202508080190.aspx",
+      "source_date": "2025-08-08"
+    },
+    {
+      "code": "6515",
+      "name": "穎崴",
+      "segment": "AI 晶片測試",
+      "source_url": "https://www.moneyweekly.com.tw/_Article?AID=247499",
+      "source_date": "2026-09-08"
+    },
+    {
+      "code": "3661",
+      "name": "世芯-KY",
+      "segment": "AI ASIC 設計",
+      "source_url": "https://ec.ltn.com.tw/article/breakingnews/5539932",
+      "source_date": "2026-08-14"
+    },
+    {
+      "code": "3443",
+      "name": "創意",
+      "segment": "AI ASIC 設計",
+      "source_url": "https://news.cnyes.com/news/id/6554789",
+      "source_date": "2026-07-31"
+    },
+    {
+      "code": "2454",
+      "name": "聯發科",
+      "segment": "AI ASIC 設計",
+      "source_url": "https://www.storm.mg/article/11153223",
+      "source_date": "2026-07-31"
+    },
+    {
+      "code": "2382",
+      "name": "廣達",
+      "segment": "AI 伺服器",
+      "source_url": "https://news.cnyes.com/news/id/6575714",
+      "source_date": "2026-08-13"
+    },
+    {
+      "code": "3231",
+      "name": "緯創",
+      "segment": "AI 伺服器",
+      "source_url": "https://news.cnyes.com/news/id/6559326",
+      "source_date": "2026-08-04"
+    },
+    {
+      "code": "6669",
+      "name": "緯穎",
+      "segment": "AI 伺服器",
+      "source_url": "https://money.udn.com/money/story/5612/9347081",
+      "source_date": "2026-02-26"
+    },
+    {
+      "code": "2317",
+      "name": "鴻海",
+      "segment": "AI 伺服器",
+      "source_url": "https://money.udn.com/money/story/5612/9503026",
+      "source_date": "2026-05-14"
+    },
+    {
+      "code": "2376",
+      "name": "技嘉",
+      "segment": "AI 伺服器",
+      "source_url": "https://news.cnyes.com/news/id/6460433",
+      "source_date": "2026-05-15"
+    },
+    {
+      "code": "2356",
+      "name": "英業達",
+      "segment": "AI 伺服器",
+      "source_url": "https://ec.ltn.com.tw/article/breakingnews/5242263",
+      "source_date": "2025-11-11"
+    },
+    {
+      "code": "2308",
+      "name": "台達電",
+      "segment": "AI 電源",
+      "source_url": "https://www.ctee.com.tw/news/20260730701786-430201",
+      "source_date": "2026-07-30"
+    },
+    {
+      "code": "2301",
+      "name": "光寶科",
+      "segment": "AI 電源",
+      "source_url": "https://news.cnyes.com/news/id/6528807",
+      "source_date": "2026-07-31"
+    },
+    {
+      "code": "3017",
+      "name": "奇鋐",
+      "segment": "AI 散熱",
+      "source_url": "https://www.ctee.com.tw/news/20260812701734-430201",
+      "source_date": "2026-08-12"
+    },
+    {
+      "code": "3653",
+      "name": "健策",
+      "segment": "AI 散熱",
+      "source_url": "https://money.udn.com/money/story/5710/9612634",
+      "source_date": "2026-07-07"
+    },
+    {
+      "code": "2421",
+      "name": "建準",
+      "segment": "AI 散熱",
+      "source_url": "https://www.moneydj.com/kmdj/news/newsviewer.aspx?a=a778c55a-9e33-4458-8649-738da89dc9bd",
+      "source_date": "2026-05-08"
+    },
+    {
+      "code": "3037",
+      "name": "欣興",
+      "segment": "ABF 載板",
+      "source_url": "https://news.cnyes.com/news/id/6550630",
+      "source_date": "2026-07-29"
+    },
+    {
+      "code": "8046",
+      "name": "南電",
+      "segment": "ABF 載板",
+      "source_url": "https://www.ctee.com.tw/news/20260604700228-439901",
+      "source_date": "2026-06-04"
+    },
+    {
+      "code": "2383",
+      "name": "台光電",
+      "segment": "高速 CCL",
+      "source_url": "https://www.moneydj.com/kmdj/news/newsviewer.aspx?a=3b287054-4202-47ac-a9e2-0b700ccccb5d",
+      "source_date": "2026-04-08"
+    },
+    {
+      "code": "2368",
+      "name": "金像電",
+      "segment": "AI 伺服器 PCB",
+      "source_url": "https://www.ctee.com.tw/news/20250503700126-430502",
+      "source_date": "2025-05-03"
+    },
+    {
+      "code": "2345",
+      "name": "智邦",
+      "segment": "AI 網通",
+      "source_url": "https://news.cnyes.com/news/id/6224418",
+      "source_date": "2025-11-07"
+    },
+    {
+      "code": "2059",
+      "name": "川湖",
+      "segment": "伺服器機構件",
+      "source_url": "https://news.cnyes.com/news/id/6564317",
+      "source_date": "2026-08-07"
+    },
+    {
+      "code": "8210",
+      "name": "勤誠",
+      "segment": "伺服器機構件",
+      "source_url": "https://money.udn.com/money/story/5710/9491196",
+      "source_date": "2026-05-09"
+    },
+    {
+      "code": "3665",
+      "name": "貿聯-KY",
+      "segment": "伺服器連接器／線材",
+      "source_url": "https://www.cna.com.tw/news/afe/202602250285.aspx",
+      "source_date": "2026-02-25"
+    }
+  ]
+}

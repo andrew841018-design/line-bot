@@ -662,7 +662,7 @@ def test_refresh_end_to_end(net):
         (lambda n: n.t86.pop(CAL[-3].strftime("%Y%m%d")), "t86_gap"),  # 早於 T 的日子缺：不會自己好
         (lambda n: n.t86.pop(CAL[-1].strftime("%Y%m%d")), "t86_not_yet"),
         (lambda n: n.companies.__setitem__(slice(None), n.companies[:100]), "batch_short"),
-        (lambda n: [n.charts.pop(f"{c}.TW") for c in STOCKS[:11]], "too_many_gray"),
+        (lambda n: [n.charts.pop(f"{c}.TW") for c in STOCKS[1:12]], "too_many_gray"),  # 留下 2330 抽查，測主池缺資料
         (lambda n: n.overrides.__setitem__("BWIBBU_ALL", sp.FetchError("moved")), "batch_moved"),
     ],
 )
@@ -685,7 +685,7 @@ def test_refresh_ten_gray_is_still_ok(net):
 
 
 def test_refresh_yahoo_rate_limit_is_blocked(net):
-    net.overrides["2330.TW"] = sp.FetchError("rate_limited")
+    net.overrides["1101.TW"] = sp.FetchError("rate_limited")  # 2330 抽查的 429 另測 not_yet
     with pytest.raises(sp.RoundFailed) as info:
         sp.refresh(T, _day_rows(net), threading.Event(), now=1.0e9)
     assert info.value.kind == "yahoo_rate_limited" and info.value.blocked
@@ -843,7 +843,10 @@ def test_handle_without_snapshot_wakes_worker(net):
     assert sp.handle("").text == sp.TEXT_UNAVAILABLE
 
 
-def test_handle_picks_and_detail_from_snapshot(net):
+def test_handle_picks_and_detail_from_snapshot(net, monkeypatch):
+    # 2026-10-24（計畫 C）：預設的推薦區已經是「AI 相關股推薦」（test_stock_picks_ai*.py）；這裡守住
+    # LINE_BOT_STOCK_PICKS_AI=0 退回的舊推薦卡（舊推薦照樣每天算進快照），單檔卡與常問股兩邊都一樣。
+    monkeypatch.setattr(sp, "AI_ENABLED", False)
     snapshot = _fresh_snapshot(net)
     reply = sp.handle("")
     assert reply.flex["type"] == "carousel" and reply.text is None
@@ -856,7 +859,8 @@ def test_handle_picks_and_detail_from_snapshot(net):
     assert net.count("2330.TW") == 1  # 只有重算那一次，單檔卡讀快照
 
 
-def test_handle_not_updated_hides_picks(net):
+def test_handle_not_updated_hides_picks(net, monkeypatch):
+    monkeypatch.setattr(sp, "AI_ENABLED", False)  # 舊推薦卡的「看到新日期 3 小時」規則；AI 推薦改看 7 個日曆日
     _fresh_snapshot(net)
     sp._worker.seen_t, sp._worker.seen_at = T + timedelta(days=1), time.time() - sp.NEW_DATE_GRACE_S - 1
     reply = sp.handle("")
@@ -915,6 +919,21 @@ def test_handle_lookup_failure_is_remembered_briefly(net):
     assert sp.handle(STOCKS[56], deadline=time.monotonic() + 30).text == sp.TEXT_LOOKUP_FAILED
     del net.overrides[f"{STOCKS[56]}.TW"]
     assert sp.handle(STOCKS[56], deadline=time.monotonic() + 30).text == sp.TEXT_LOOKUP_FAILED  # 10 分鐘內不再抓
+
+
+def test_lookup_works_during_an_ai_side_cooldown_and_never_sets_it(net, monkeypatch):
+    """計畫 C 事後審查 GP1 I3／GP2 #3：單檔查詢和 2eb85e1 一樣——AI 段撞到 429 的共用冷卻擋不了它，
+    它自己撞到 429 也不設共用冷卻（背景不必為了爸媽查單檔而多等 20 分鐘）。"""
+    _fresh_snapshot(net)
+    sp._block_yahoo()  # AI 段剛撞到 429：共用冷卻中
+    assert sp._yahoo_blocked()
+    net.calls.clear()
+    reply = sp.handle(STOCKS[55], deadline=time.monotonic() + 30)
+    assert reply.flex is not None and [c[0] for c in net.calls if c[0] in sp._YAHOO] == [sp._YAHOO[0]]  # 照樣查得到
+    monkeypatch.setattr(sp, "_yahoo_blocked_until", 0.0)
+    net.overrides[f"{STOCKS[56]}.TW"] = sp.FetchError("rate_limited")
+    assert sp.handle(STOCKS[56], deadline=time.monotonic() + 30).text == sp.TEXT_LOOKUP_FAILED
+    assert sp._yahoo_blocked_until == 0.0 and not sp._yahoo_blocked() and sp._worker.yahoo_blocked_until is None
 
 
 def test_handle_otc_unavailable_without_tpex(net):
