@@ -291,7 +291,11 @@ def test_help_explains_the_steps_without_mentions():
         assert needed in help_text, needed
     # 2026-10-24（計畫 C）：推薦區是「AI 相關股推薦」，不能再說舊的「台股推薦」或市值前 50 大，也不叫「AI 推薦」
     assert "AI 相關股推薦" in help_text and "AI 相關＋便宜＋成長＋走勢，最多 3 檔" in help_text
-    assert "台股推薦" not in help_text and "AI 推薦" not in help_text and "市值前 50" not in help_text
+    assert "台股推薦" not in help_text and "AI 推薦" not in help_text
+    # 2026-10-28：美股推薦的池是「標普 500 市值前 50 大」，「市值前 50」只能出現在美股那一行
+    assert help_text.count("市值前 50") == help_text.count("標普 500 市值前 50 大") == 1
+    for needed in ("/股票 NVDA", "/股票 美股", "/股票 成績", "只認英文代號", "/股票 美股 GIS"):
+        assert needed in help_text, needed
     assert "@" not in help_text
 
 

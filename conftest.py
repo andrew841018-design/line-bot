@@ -531,6 +531,16 @@ def isolate_stock_picks(monkeypatch, tmp_path_factory):
     # 狀態檢查會讀 .env 裡的 LINE_BOT_STOCK_PICKS_AI：測試一律指到不存在的檔，不讀真的 .env。
     monkeypatch.setattr(stock_picks, "ENV_FILE", tmp_path_factory.mktemp("stock_picks_env") / ".env", raising=False)
     stock_picks.clear_caches()
+    # 美股與推薦成績（2026-10-28）：開關與 DB 路徑不讀真的環境（DB 預設在上面的暫存 STATE_DIR 裡，不存在）；
+    # 記憶體狀態、快取、限流、冷卻每個測試都從全新的開始。
+    monkeypatch.delenv("LINE_BOT_STOCK_PICKS_US", raising=False)
+    monkeypatch.delenv("LINE_BOT_MARKET_DB_PATH", raising=False)
+    try:
+        import stock_picks_us
+
+        stock_picks_us.reset_for_tests()
+    except Exception:  # 美股模組自己壞了（或還沒有）：只讓它的測試失敗，不連帶整套測試在 setup 就失敗
+        pass
 
 
 @pytest.fixture(autouse=True)
