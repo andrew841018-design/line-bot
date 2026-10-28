@@ -51,20 +51,41 @@ ensure_uvicorn_service() {
 # 2026-10-24: a restart kills whatever is being handled right now -- a burst waiting in its 8 s
 # window, a model call, a reply on its way -- and the family gets no answer.  Give those a moment:
 # at most $1 seconds (default 25) of waiting for inbound events started in the last $2 seconds
-# (default 90) to finish.  It never fails the restart: no database, no sqlite3, a locked or
-# unreadable file all mean "go ahead".  rc 0 = nothing in flight (or could not tell);
-# rc 1 = still in flight when the wait ran out.
+# (default 90) to finish.  It never fails the restart.  rc 0 = nothing in flight; rc 1 = still in
+# flight when the wait ran out; rc 2 = could not tell (the reason goes to the log: an error type,
+# never row data or error text).
+# 2026-10-29: the count runs on the bot's own Python.  macOS's /usr/bin/sqlite3 -readonly (and
+# /usr/bin/python3) cannot open the WAL database while no connection holds its -wal/-shm files,
+# which is most of the time, so the old check failed silently and the wait never happened.
 wait_for_inflight_messages() {
-    local max_wait="${1:-25}" recent="${2:-90}" db deadline n
+    local max_wait="${1:-25}" recent="${2:-90}" db py deadline n py_rc
     db="${LINE_BOT_DB:-${BOT_DIR:-.}/line_bot.db}"
-    case "$max_wait$recent" in ''|*[!0-9]*) return 0 ;; esac
-    [ -r "$db" ] || return 0
+    py="${BOT_DIR:-.}/.venv/bin/python"
+    case "$max_wait$recent" in ''|*[!0-9]*) say "inflight check skipped: bad arguments"; return 2 ;; esac
+    if [ ! -r "$db" ]; then say "inflight check skipped: no readable database"; return 2; fi
+    if [ ! -x "$py" ]; then say "inflight check skipped: no bot Python"; return 2; fi
     deadline=$((SECONDS + max_wait))
     while :; do
-        n=$(/usr/bin/sqlite3 -readonly -cmd ".timeout 2000" "$db" \
-            "SELECT COUNT(*) FROM inbound_events WHERE status IN ('processing','media_processing','reply_sending') AND updated_at > CAST(strftime('%s','now') AS INTEGER) - ${recent};" \
-            2>/dev/null) || return 0
-        case "$n" in ''|*[!0-9]*) return 0 ;; esac
+        n=$("$py" -I -S -c '
+try:
+    import pathlib, signal, sqlite3, sys, time
+    signal.signal(signal.SIGALRM, signal.SIG_DFL)  # an inherited "ignore" would disarm the alarm
+    signal.alarm(5)
+    conn = sqlite3.connect(pathlib.Path(sys.argv[1]).absolute().as_uri() + "?mode=ro", uri=True, timeout=2)
+    print(conn.execute(
+        "SELECT COUNT(*) FROM inbound_events WHERE status IN (?, ?, ?) AND updated_at > ?",
+        ("processing", "media_processing", "reply_sending", int(time.time()) - int(sys.argv[2])),
+    ).fetchone()[0])
+except Exception as exc:
+    print("ERR", type(exc).__name__, getattr(exc, "sqlite_errorname", ""))
+' "$db" "$recent" 2>/dev/null)
+        py_rc=$?
+        case "$n" in
+            ''|*[!0-9]*)
+                [ "$py_rc" -eq 142 ] && n="ERR Timeout"  # killed by its own 5 s alarm (128 + SIGALRM)
+                say "inflight check failed: ${n:-no output}"
+                return 2 ;;
+        esac
         [ "$n" -eq 0 ] && return 0
         [ "$SECONDS" -ge "$deadline" ] && return 1
         sleep 1
