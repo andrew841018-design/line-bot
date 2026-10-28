@@ -619,6 +619,21 @@ def test_the_references_of_a_primary_sent_alone_are_not_shifted(line, riding, mo
     assert claims() == [(str(rid), "uncertain")]
 
 
+def test_the_menu_buttons_follow_the_last_message_that_is_finally_sent(line, riding, monkeypatch):
+    """LINE shows only the last message's Quick Reply; after a recovery that is no longer the rider
+    the buttons were first hung on."""
+    due_natural(monkeypatch)
+    open_event()
+    line.script = [bad(1), bad(0)]
+
+    assert say("嗨", menu_buttons=True) is True
+
+    first, second, third = line.replies
+    assert first[-1].quick_reply is not None and first[0].quick_reply is None  # on the rider, as always
+    assert second[-1].quick_reply is not None and len(second) == 1  # the primary alone, as built
+    assert third[-1].quick_reply is not None and kinds(third) == ["TextMessage"]  # the plain text
+
+
 def test_a_named_calendar_reminder_is_fenced_like_any_other_rider(line, riding):
     import calendar_db
 

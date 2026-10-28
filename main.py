@@ -23222,12 +23222,23 @@ class _ReplyRecovery(NamedTuple):
     plain_push: bool  # a push, if one is allowed, carries sanitized plain text
 
 
-def _reply_attempt(reply_token: str, messages: list, send_fence):
+def _reply_attempt(
+    reply_token: str,
+    messages: list,
+    send_fence,
+    *,
+    menu_buttons: bool = False,
+    group_id: str | None = None,
+):
     """One more `reply_message` after LINE refused the first one.  Returns ("accepted", resp) |
     ("rejected", error) -- LINE answered 4xx (or the request could not even be built): nothing
     was sent | ("ambiguous", error) -- timeout, 5xx, connection error: it may have been
-    delivered.  Accepted marks the inbound event(s) replied, as the first attempt would."""
+    delivered.  Accepted marks the inbound event(s) replied, as the first attempt would.
+    ``menu_buttons``: the Quick Reply menu hangs on the last message of what is sent (LINE shows
+    only that one's), which is no longer the rider it was first attached to."""
     try:
+        if menu_buttons and messages:
+            _attach_menu_buttons(messages[-1], group_id)
         request = ReplyMessageRequest(reply_token=reply_token, messages=messages)
         config = _get_line_config()
     except Exception as exc:
@@ -23255,6 +23266,7 @@ def _recover_rejected_reply(
     batch: "reply_riders.Batch",
     error: BaseException,
     send_fence,
+    menu_buttons: bool = False,
 ) -> _ReplyRecovery:
     """LINE refused a *text* reply with a 400 that is not about the token (2026-10-24, B6.3).
 
@@ -23302,7 +23314,9 @@ def _recover_rejected_reply(
 
     if case == "riders":
         # The primary was not named: it goes alone as it was built (mention and all).
-        status, payload = _reply_attempt(reply_token, list(batch.messages), send_fence)
+        status, payload = _reply_attempt(
+            reply_token, list(batch.messages), send_fence, menu_buttons=menu_buttons, group_id=group_id
+        )
         if status == "accepted":
             logger.info("reply accepted without the refused rider(s) group=%s", group_id)
             return _ReplyRecovery("accepted", payload, None, False)
@@ -23315,7 +23329,9 @@ def _recover_rejected_reply(
         # LINE refused the primary after all, without naming it: plain text below.
 
     plain = _sanitized_plain_text_message(text)
-    status, payload = _reply_attempt(reply_token, [plain], send_fence)
+    status, payload = _reply_attempt(
+        reply_token, [plain], send_fence, menu_buttons=menu_buttons, group_id=group_id
+    )
     if status == "rejected":
         return _ReplyRecovery("rejected", None, payload, True)
     batch.messages[:] = [plain]
@@ -24001,6 +24017,7 @@ def _reply(
                     ),
                     error=send_error,
                     send_fence=send_fence,
+                    menu_buttons=menu_buttons,
                 )
             except Exception as recovery_error:
                 # A bug here must never turn a refused reply into a second copy: whatever was
