@@ -104,7 +104,7 @@ def test_without_a_tw_snapshot_only_plain_us_tickers_and_commands_work(monkeypat
     monkeypatch.setattr(sp, "_snapshot", None)
     assert sp.handle("NVDA").text == "US:NVDA"
     assert sp.handle("美股").text == "US-CARDS" and sp.handle("成績").text == "PERF"
-    for body in ("GIS", "gis-ky", "TPK", "台積電", "2330", "NVDA 2330"):
+    for body in ("GIS", "gis-ky", "TPK", "gis?", "GIS嗎", "台積電", "2330", "NVDA 2330"):
         assert sp.handle(body).text == sp.TEXT_NOT_READY, body  # 認不得台股名稱時，純英文的台股簡稱不送美股
     assert seen == [("symbol", "NVDA"), ("us",), ("perf",)]
 
@@ -156,6 +156,8 @@ def test_flag_off_keeps_the_old_behaviour(tw_snapshot, monkeypatch):
     assert sp.handle("NVDA").text == sp.TEXT_US
     assert sp.handle("") is TW_CARDS
     assert sp.handle("美股").text == us.TEXT_PHASE3_OFF and sp.handle("成績").text == us.TEXT_PHASE3_OFF
+    for body in ("AI", "S&P", "美股 AI", "美股 S&P", "brk.b"):  # 關閉時像美股的字一律舊句
+        assert sp.handle(body).text == sp.TEXT_US, body
 
 
 def test_us_worker_starts_even_when_the_tw_thread_is_alive(monkeypatch):
@@ -181,3 +183,7 @@ def test_stop_signals_both_before_joining(monkeypatch):
     monkeypatch.setattr(thread, "join", lambda timeout=None: order.append("tw_join"))
     sp.stop_background(timeout=0.1)
     assert order == ["us_signal", "tw_join", "us_join"] and stop.is_set() and wake.is_set()
+
+
+def test_not_found_text_teaches_the_us_ticker_form(tw_snapshot):
+    assert sp.handle("輝達").text == sp.TEXT_NOT_FOUND and "/股票 NVDA" in sp.TEXT_NOT_FOUND

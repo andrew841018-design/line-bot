@@ -243,6 +243,7 @@ def test_get_json_sends_if_modified_since_and_returns_304(monkeypatch):
         (_Resp(status=301), "moved"),
         (_Resp(status=403), "blocked"),
         (_Resp(status=429), "rate_limited"),
+        (_Resp(status=404), "not_found"),  # 2026-10-28：美股單檔用來分出「認不出代號」
         (_Resp(status=500), "status"),
         (_Resp(ctype="text/html"), "not_json"),
         (_Resp(body=b"<html>"), "not_json"),

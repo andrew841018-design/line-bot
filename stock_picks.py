@@ -3419,7 +3419,7 @@ TEXT_CARD_FAILED = "股票推薦：卡片暫時出不來，請稍後再試"
 TEXT_EVAL_CARD_FAILED = "股票評估：卡片暫時出不來，請稍後再試"
 TEXT_TOO_LONG = "股票評估：請只打一檔的代號或名稱，例如 /股票 2330"
 # 名稱比對刻意收緊（不猜），所以不說「找不到這一檔」（爸媽會以為下市），而是請他只打代號或名稱。
-TEXT_NOT_FOUND = "股票評估：認不出是哪一檔，請只打代號或名稱，例如 /股票 2330、/股票 台積電"
+TEXT_NOT_FOUND = "股票評估：認不出是哪一檔，請只打代號或名稱，例如 /股票 2330、/股票 台積電；美股請打英文代號，例如 /股票 NVDA"
 TEXT_US = "股票評估：美股還不能查，目前只有台股"  # 2026-10-28 起只在美股開關關閉、或美股模組載不進來時用
 TEXT_US_FAILED = "股票評估：美股暫時查不到，請稍後再試"
 TEXT_US_CARDS_FAILED = "股票推薦：美股推薦和推薦成績暫時出不來，請稍後再試"
@@ -3614,6 +3614,8 @@ def _us_command(text: str, deadline: Optional[float]) -> Optional[Reply]:
 
             # 後面的字照原樣交給美股切段（不壓掉空白：「美股 BRK B」不會變成 BRKB）
             symbol = stock_picks_us.find_us_symbol(stripped[len(_US_FORCE_PREFIX):])
+            if symbol is not None and not stock_picks_us.ENABLED:  # 美股開關關閉：一律舊句
+                return Reply(text=TEXT_US)
             if symbol == stock_picks_us.REJECTED:
                 return Reply(text=stock_picks_us.TEXT_US_NOT_FOUND)
             if symbol is not None:  # 強制美股：保留字（AI 等）也照查
@@ -3634,7 +3636,12 @@ def _us_only_symbol(text: str) -> Optional[str]:
     try:
         import stock_picks_us
 
-        return stock_picks_us.find_us_symbol(tokens[0])
+        symbol = stock_picks_us.find_us_symbol(tokens[0])
+        if symbol is not None and symbol.casefold() in _TW_ASCII_NAMES:  # 先解析再比（「gis?」「GIS嗎」也擋）
+            return None
+        return symbol
+    except AssertionError:
+        raise
     except Exception as exc:
         logger.error("stock picks us symbol parse failed error_type=%s", type(exc).__name__)
         return None
@@ -3649,6 +3656,8 @@ def _us_detail(symbol: Optional[str], deadline: Optional[float]) -> Reply:
         return Reply(text=TEXT_US)
     if symbol is None:
         return Reply(text=TEXT_NOT_FOUND)
+    if not stock_picks_us.ENABLED:  # 美股開關關閉：保留字、S&P 這類也一律舊句（ROLLBACK.md §1）
+        return Reply(text=TEXT_US)
     if symbol == stock_picks_us.REJECTED:  # 像美股但不收（S&P、J&J 這類）
         return Reply(text=stock_picks_us.TEXT_US_NOT_FOUND)
     if symbol in stock_picks_us.RESERVED:

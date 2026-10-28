@@ -150,10 +150,10 @@ class FakeYahoo:
 
     def __init__(self, charts=None, funds=None, hook=None):
         self.charts, self.funds, self.hook = dict(charts or {}), dict(funds or {}), hook
-        self.calls: list[tuple[str, str, float]] = []
+        self.calls: list[tuple] = []  # (主機, 路徑, timeout, total_s)
 
     def __call__(self, host, path, *, params=None, max_bytes, timeout, total_s, if_modified_since=None, stop=None):
-        self.calls.append((host, path, timeout))
+        self.calls.append((host, path, timeout, total_s))
         if self.hook is not None:
             self.hook(host, path)
         symbol = unquote(path.rsplit("/", 1)[-1])
@@ -166,7 +166,7 @@ class FakeYahoo:
         return 200, value, None
 
     def fund_calls(self) -> list[str]:
-        return [unquote(p.rsplit("/", 1)[-1]) for _, p, _ in self.calls if "fundamentals" in p]
+        return [unquote(p.rsplit("/", 1)[-1]) for _, p, *_ in self.calls if "fundamentals" in p]
 
 
 def _no_network(*_a, **_k):
@@ -369,7 +369,8 @@ def test_pe_rules():
     assert us.pe_of(_rows([1.0, 1.1, 1.2, 1.3, 1.4], cur="TWD"), _rows([10, 11, 12, 13, 14], cur="TWD"), 300.0, D).kind == us.PE_NOT_USD
     split = _rows([1.0, 1.1, 1.2, 1.3, 0.35])  # 最後一季沒還原 4:1 分割 → 股數跳
     assert us.pe_of(split, ni, 125.9, D).kind == us.PE_NONE
-    assert us.pe_of(_rows([1.0, -3.0, 1.2, -1.0, 0.5]), _rows([10, -30, 12, -10, 5]), 50.0, D).kind == us.PE_NONE  # 正的季不到 3 季
+    assert us.pe_of(_rows([1.0, -3.0, 1.2, -1.0, 0.5]), _rows([10, -30, 12, -10, 5]), 50.0, D).kind == us.PE_LOSS  # 合計虧損先講
+    assert us.pe_of(_rows([1.0, 3.0, -1.0, 1.0, -0.5]), _rows([10, 30, -10, 10, -5]), 50.0, D).kind == us.PE_NONE  # 正的季不到 3 季
     assert us.pe_of(_rows([1.0, 1.0, 1.0, 1.0, -4.0]), _rows([10, 10, 10, 10, -40]), 50.0, D).kind == us.PE_LOSS
     assert us.pe_of(eps, ni, 6000.0, D).kind == us.PE_OVER  # 6000 ÷ 5 ＝ 1200 倍
     assert us.pe_of((), ni, 10.0, D).kind == us.PE_NONE
@@ -482,7 +483,7 @@ def test_pick_card_texts_and_check():
     assert sp.TEXT_LEAD_NOTE in texts and us.TEXT_US_POOL_LEAD in texts
     assert "✅ NVDA（NVIDIA CORP）" in texts
     assert "4 條都符合｜收盤 100.00 美元（10/27 美國時間）" in texts
-    assert "依據：Nasdaq 收盤、Yahoo 財報｜資料到 10/27（美國時間）" in texts
+    assert "依據：收盤（Nasdaq 資料）、財報（Yahoo）｜資料到 10/27（美國時間）" in texts
     assert "美股推薦只從標普 500 市值前 50 大挑；只供參考，不是買賣指示" in texts
     assert stock_card_check.card_ok(card)
     assert sp.TEXT_LEAD_NOTE not in _all_texts(us.us_pick_bubble(_facts(), 2, 3, None))
@@ -527,20 +528,45 @@ def test_detail_card_score_line_and_sources():
     unavailable = _all_texts(us.us_detail_bubble(_facts(_trend(0, below=True), fund=us.FUND_UNAVAILABLE)))
     assert "收盤 100.00 美元（10/27 美國時間）" in unavailable  # 財報抓不到：不補分數
     verified = _all_texts(us.us_detail_bubble(_facts(source="yahoo", verified=True)))
-    assert "依據：Yahoo 收盤、Yahoo 財報｜收盤和 Nasdaq 核對過｜資料到 10/27（美國時間）" in verified
+    assert "依據：Yahoo 收盤、Yahoo 財報｜收盤和 Nasdaq 資料核對過｜資料到 10/27（美國時間）" in verified
     etf = _all_texts(us.us_detail_bubble(_facts(kind=us.ETF, fund=us.FUND_NA, source="yahoo")))
     assert "依據：Yahoo 收盤｜資料到 10/27（美國時間）" in etf
     later = _all_texts(us.us_detail_bubble(_facts(), market=sp.Market(sp.NEUTRAL, 0, 0), market_date=D - timedelta(days=1)))
     assert "美股大盤（SPY）：中性（10/26 美國時間）" in later
 
 
-def test_worst_case_size_fits():
-    """8 張（台股 4＋美股 3＋成績 1）、名稱都最長：≤ 25 KB；加大字版按鈕（每張約 402 B）≤ 30 KB。"""
+def _real_perf(monkeypatch):
+    """真的 stock_picks_perf（autouse 的假模組先拿掉；測試結束會換回來）；載不到回 None。"""
+    monkeypatch.delitem(sys.modules, "stock_picks_perf", raising=False)
+    try:
+        return importlib.import_module("stock_picks_perf")
+    except Exception:
+        return None
+
+
+def full_perf_result(perf) -> dict:
+    """成績模組結果檔的形狀，兩個市場、兩個天數都有成績、有跳過、有 AI 起始日（卡片最長的情況）。"""
+    h = {"n": 30, "r_pm": -123, "b_pm": 567, "wins": 18, "skipped": 3, "pending": 2}
+    market = {"first_t": "2026-10-08", "from": "2026-10-08", "to": "2026-10-28", "ai_from": "2026-10-24",
+              "h": {str(x): dict(h) for x in perf.HORIZONS}}
+    return {"schema": perf.RESULT_SCHEMA, "computed_at": int(NOW), "ledger_rows": 120, "ledger_full": False,
+            "pending": 8, "skipped": 12, "markets": {perf.TW: dict(market), perf.US: dict(market, ai_from=None)}}
+
+
+def test_worst_case_size_fits(monkeypatch):
+    """8 張（台股 4＋美股 3＋成績 1）、名稱都最長：≤ 25 KB；加大字版按鈕（每張約 402 B）≤ 30 KB。
+    成績卡用真的 perf_bubble（完整結果，約 2.5 KB）；成績模組載不到時用同樣大小的假卡（P4 #8）。"""
     long_name = "A" * us.NAME_MAX
     tw = [sp._bubble("股票推薦：第 1 檔（共 3 檔）", "大盤：中性", [sp._text("台" * 40, size="md")] * 12, [sp._text("x")])] * 4
     usc = [us.us_pick_bubble(_facts(name=long_name, symbol="ABCDE.F"), i + 1, 3, sp.Market(sp.HOT, 70, 130),
                              lead_note=i == 0) for i in range(3)]
-    perf = sys.modules["stock_picks_perf"].perf_bubble({})
+    perf_module = _real_perf(monkeypatch)
+    if perf_module is not None:
+        perf = perf_module.perf_bubble(full_perf_result(perf_module))
+        assert "推薦成績計算中" not in json.dumps(perf, ensure_ascii=False)  # 真的是完整的那張
+    else:
+        perf = sp._bubble("股票推薦：推薦成績", None, [sp._text("推" * 40, size="md")] * 16, [sp._text("x" * 60)] * 3)
+    assert us._card_bytes(perf) >= 1800
     assert all(us._card_bytes(card) <= 3500 for card in usc)
     size = us._card_bytes(sp.carousel(tw + usc + [perf]))
     assert size <= us.MAX_CARD_BYTES
@@ -668,7 +694,7 @@ def test_full_round_writes_snapshot_history_and_perf(small_pool, yahoo, fake_per
     assert snap.spy is not None and snap.spy_dates[-1] == D and len(snap.spy_dates) == 260
     assert snap.latest_closes["NVDA"] == (D, pytest.approx(125.9))
     assert sorted(yahoo.fund_calls()) == ["AAPL", "AMZN", "GOOGL", "MSFT", "NVDA"]
-    assert all(host == "query1.finance.yahoo.com" for host, _, _ in yahoo.calls)
+    assert all(host == "query1.finance.yahoo.com" for host, *_ in yahoo.calls)
     lines = history_lines()
     assert len(lines) == 1 and lines[0]["t"] == "2026-10-27" and lines[0]["rule"] == "us_v1"
     assert [p["code"] for p in lines[0]["picks"]] == ["GOOGL", "NVDA", "MSFT"] and lines[0]["picks"][0]["score"] == 4
@@ -1059,7 +1085,7 @@ def test_pool_symbol_is_served_from_snapshot_without_network(small_pool, yahoo, 
     reply = us.handle_symbol("NVDA", deadline=time.monotonic() + 20)
     texts = _all_texts(reply.flex)
     assert texts[0] == "股票評估：NVDA（NVIDIA CORP）" and "✅ 4 條都符合" in texts
-    assert "依據：Nasdaq 收盤、Yahoo 財報｜資料到 10/27（美國時間）" in texts
+    assert "依據：收盤（Nasdaq 資料）、財報（Yahoo）｜資料到 10/27（美國時間）" in texts
     assert reply.alt_text == "股票評估：只供參考｜NVDA（NVIDIA CORP）｜✅ 4 條都符合"
     assert reply.fallback_text == sp.TEXT_EVAL_CARD_FAILED and stock_card_check.card_ok(reply.flex, reply.alt_text)
 
@@ -1072,9 +1098,9 @@ def test_yahoo_path_card_verified_against_nasdaq(small_pool, yahoo, monkeypatch)
     reply = us.handle_symbol("TSLA", deadline=time.monotonic() + 20)
     texts = _all_texts(reply.flex)
     assert texts[0] == "股票評估：TSLA（Tesla, Inc.）"
-    assert "依據：Yahoo 收盤、Yahoo 財報｜收盤和 Nasdaq 核對過｜資料到 10/27（美國時間）" in texts
-    assert [h for h, _, _ in fake.calls] == ["query1.finance.yahoo.com"] * 2  # 只打 query1、依序兩個請求
-    assert all(timeout <= us.LOOKUP_FETCH_S for _, _, timeout in fake.calls)
+    assert "依據：Yahoo 收盤、Yahoo 財報｜收盤和 Nasdaq 資料核對過｜資料到 10/27（美國時間）" in texts
+    assert [h for h, *_ in fake.calls] == ["query1.finance.yahoo.com"] * 2  # 只打 query1、依序兩個請求
+    assert all(max(timeout) <= us.LOOKUP_FETCH_S for _, _, timeout, _ in fake.calls)
 
 
 def test_yahoo_close_mismatch_goes_gray(small_pool, yahoo, monkeypatch):
@@ -1082,8 +1108,11 @@ def test_yahoo_close_mismatch_goes_gray(small_pool, yahoo, monkeypatch):
     full_round()
     lookup_yahoo(monkeypatch, charts={"TSLA": chart_payload("TSLA", bars_of(rising(0.2)))}, funds={})
     reply = us.handle_symbol("TSLA", deadline=time.monotonic() + 20)
-    assert "⚪ 資料不足" in _all_texts(reply.flex)
-    assert not any("收盤 " in t and "美元" in t for t in _all_texts(reply.flex))  # 對不上的數字不上卡
+    texts = _all_texts(reply.flex)
+    assert "⚪ 資料不足" in texts
+    assert not any("收盤 " in t and "美元" in t for t in texts)  # 對不上的數字不上卡
+    assert "⬜ 有在成長：財報暫時抓不到" in texts and "本益比：財報暫時抓不到" in texts  # 財報沒抓：不說「資料不足」
+    assert not any(t in texts for t in ("⬜ 有在成長：營收資料不足", "⬜ 有在賺錢：獲利資料不足", "本益比資料不足"))
 
 
 def test_gray_pool_symbol_uses_live_lookup(small_pool, yahoo, monkeypatch):
@@ -1161,7 +1190,8 @@ def test_deadline_rules(monkeypatch):
     monkeypatch.setattr(us, "LOOKUP_FUND_MIN_S", 100.0)  # 抓完日線後預算不夠抓財報
     reply = us.handle_symbol("TSLA", deadline=time.monotonic() + 5.5)
     assert "⚠️ 走勢可以，財報暫時抓不到" in _all_texts(reply.flex) and len(fake.calls) == 1
-    assert fake.calls[0][2] <= 2.5  # 總預算 min(6, 5.5 − 3)
+    connect, read = fake.calls[0][2]
+    assert fake.calls[0][3] <= 2.5 and connect + 2 * read <= 2.5 + 1e-6  # 總預算 min(6, 5.5 − 3)，一個請求拖不過它
     assert us._lookup_cache["TSLA"][0] == pytest.approx(NOW + us.LOOKUP_FAIL_TTL_S)  # 只快取 10 分鐘
 
 
@@ -1466,3 +1496,243 @@ def test_history_name_matches_perf_module(monkeypatch):
     except Exception as exc:  # 還沒寫好（PERF 子代理同時在做）
         pytest.skip(f"stock_picks_perf not importable yet: {type(exc).__name__}")
     assert perf.US_HISTORY_NAME == us.HISTORY_NAME
+
+
+# ── 審查後的修正（P1／P2／P4，2026-10-28） ─────────────────────────────────────────────────
+COST_Q = [date(2025, 5, 11), date(2025, 8, 31), date(2025, 11, 23), date(2026, 2, 15), date(2026, 5, 10), date(2026, 8, 30)]
+
+
+def test_costco_16_week_quarter_passes_continuity():
+    """Costco 的會計年度是 12／12／12／16 週：16 週那一季 112 天，不能被當成缺季（P1 #1）。"""
+    eps = _rows([4.3, 5.87, 4.5, 4.58, 4.3, 6.75], COST_Q)
+    ni = _rows([v * 443.0 for v in (4.3, 5.87, 4.5, 4.58, 4.3, 6.75)], COST_Q)
+    rev = _rows([62.0, 86.0, 66.0, 69.0, 63.0, 94.0], COST_Q)
+    assert us.profit_of(ni, D) == us.Profit(COST_Q[-1], 0, 0)
+    assert us.pe_of(eps, ni, 900.0, D).kind == us.PE_OK
+    assert us.growth_of(rev, D).yoy == 93  # 2026-08-30 對 2025-08-31（364 天）
+    missing = tuple(r for r in ni if r[0] != date(2026, 5, 10))  # 少一季：差 196 天
+    assert us.profit_of(missing, D) is None
+
+
+def _empty_fund() -> dict:
+    return {"timeseries": {"result": [], "error": None}}
+
+
+def _without(payload: dict, type_name: str) -> dict:
+    out = json.loads(json.dumps(payload))
+    out["timeseries"]["result"] = [r for r in out["timeseries"]["result"] if type_name not in r]
+    return out
+
+
+def test_empty_or_partial_fund_response_keeps_cached_series(small_pool, yahoo):
+    """200 但沒有能用的列＝沒抓到：舊的照留、時間不動；只缺淨利 → 淨利沿用舊的（P1 #2）。"""
+    make_db()
+    full_round()
+    old = dict(us._worker.fund)
+    stale = {s: us.replace(e, at=NOW - 4 * 86400) for s, e in old.items()}
+    stale_worker = us.replace(us._worker, fund=stale)  # 檔案也寫成舊的（不然存檔時會併回比較新的那份）
+    sp._write_json_file(sp.STATE_DIR / us.WORKER_NAME, us.worker_to_json(stale_worker))
+    us._set_worker(stale_worker)
+    yahoo.funds["NVDA"] = _empty_fund()
+    yahoo.funds["MSFT"] = _without(good_fund("MSFT"), "quarterlyNetIncome")
+    us._set_snapshot(None)  # 讓這一輪重算（會去抓到期的財報）
+    later = NOW + 1800
+    full_round(later)
+    fund = us._worker.fund
+    assert fund["NVDA"] == stale["NVDA"] and us._fund_due(fund["NVDA"], later)  # 沒蓋掉、下一輪還會再抓
+    assert fund["MSFT"].ni == old["MSFT"].ni and fund["MSFT"].at == later and fund["MSFT"].complete
+    assert read_worker_file()["fund"]["NVDA"]["at"] == NOW - 4 * 86400
+    assert us._worker.last_fail == ""
+
+
+def test_first_partial_fund_is_retried_sooner():
+    partial = us.FundEntry(at=NOW, rev=_rows([1, 2, 3, 4, 5]), eps=_rows([1, 1, 1, 1, 1]))
+    assert not partial.complete
+    assert not us._fund_due(partial, NOW + 3600)
+    assert us._fund_due(partial, NOW + us.FUND_PARTIAL_RETRY_S)
+    full = us.replace(partial, ni=_rows([1, 1, 1, 1, 1]))
+    assert not us._fund_due(full, NOW + us.FUND_PARTIAL_RETRY_S) and us._fund_due(full, NOW + us.FUND_REFRESH_S)
+    assert us._entry_from_parsed({"rev": (), "ni": (), "eps": ()}, NOW, full) is None
+
+
+def test_lookup_fund_fallback_rules(monkeypatch):
+    """即時抓不到財報（200 但空的、失敗）：背景快取 30 天內的才用，結果只快取 10 分鐘；再舊就當抓不到（P1 #5）。"""
+    us._ensure_loaded()
+    good = us._entry_from_parsed(us.parse_fundamentals(good_fund("TSLA")), NOW - 10 * 86400)
+    chart = chart_payload("TSLA", bars_of(rising(0.2)))
+
+    def ask(fund_entry, fund_payload):
+        with us._lookup_lock:
+            us._lookup_times.clear()
+            us._lookup_cache.clear()
+        us._set_worker(us.replace(us._worker, fund={} if fund_entry is None else {"TSLA": fund_entry}))
+        lookup_yahoo(monkeypatch, charts={"TSLA": chart}, funds={"TSLA": fund_payload})
+        return _all_texts(us.handle_symbol("TSLA", deadline=time.monotonic() + 20).flex)
+
+    assert "✅ 4 條都符合" in ask(good, _empty_fund())
+    assert us._lookup_cache["TSLA"][0] == pytest.approx(NOW + us.LOOKUP_FAIL_TTL_S)
+    assert "✅ 4 條都符合" in ask(good, sp.FetchError("status"))
+    assert us._lookup_cache["TSLA"][0] == pytest.approx(NOW + us.LOOKUP_FAIL_TTL_S)
+    assert "⚠️ 走勢可以，財報暫時抓不到" in ask(us.replace(good, at=NOW - 40 * 86400), _empty_fund())
+    assert "⚠️ 走勢可以，財報暫時抓不到" in ask(None, _empty_fund())
+    # 只缺淨利：用背景快取（30 天內）的淨利補；補過的只快取 10 分鐘
+    assert "✅ 4 條都符合" in ask(good, _without(good_fund("TSLA"), "quarterlyNetIncome"))
+    assert us._lookup_cache["TSLA"][0] == pytest.approx(NOW + us.LOOKUP_FAIL_TTL_S)
+    assert "⬜ 有在賺錢：獲利資料不足" in ask(None, _without(good_fund("TSLA"), "quarterlyNetIncome"))
+
+
+def test_lookup_requests_fit_the_budget(monkeypatch):
+    """每個請求傳 (連線, 讀取)，連線＋兩次讀取 ≤ total_s ≤ 這次查詢剩下的預算（P2 #3）。"""
+    fake = lookup_yahoo(monkeypatch, charts={"TSLA": chart_payload("TSLA", bars_of(rising(0.2)))},
+                        funds={"TSLA": good_fund("TSLA")})
+    assert us.handle_symbol("TSLA", deadline=time.monotonic() + 9.0).flex is not None  # 預算 min(6, 9 − 3)
+    assert len(fake.calls) == 2
+    for _, _, timeout, total_s in fake.calls:
+        connect, read = timeout
+        assert connect <= us.LOOKUP_CONNECT_S and read <= us.LOOKUP_FETCH_S
+        assert connect + 2 * read <= total_s + 1e-6 and total_s <= us.LOOKUP_TOTAL_S + 1e-6
+
+
+def _extreme_fund(ysym: str) -> dict:
+    return ts_payload(ysym, {
+        "quarterlyTotalRevenue": list(zip(QUARTERS, [1e-3, 1.0, 1.0, 1.0, 1e5])),  # 年增約 1 億倍（資料錯）
+        "quarterlyNetIncome": list(zip(QUARTERS, [10.0, 11.0, 12.0, 13.0, 14.0])),
+        "quarterlyDilutedEPS": list(zip(QUARTERS, [1.0, 1.1, 1.2, 1.3, 1.4])),
+    })
+
+
+def test_one_extreme_value_only_affects_that_stock(small_pool, yahoo):
+    """一檔的年增超出快照能存的範圍 → 只有那一檔「營收資料不足」，整份快照照寫（P1 #3）。"""
+    yahoo.funds["AAPL"] = _extreme_fund("AAPL")
+    make_db()
+    full_round()
+    snap = us._snapshot
+    assert snap is not None and us._worker.last_fail == ""
+    assert snap.facts_of("AAPL").growth is None and snap.facts_of("NVDA").growth is not None
+
+
+def test_snapshot_write_read_round_trip_with_edge_values(small_pool, monkeypatch):
+    """寫得進去的一定讀得回來：名稱清一次不定型、收盤低於讀回下限、年增超出範圍（P2 #2）。"""
+    for raw in ("WALT DISNEY CO... /THE", "ABC INC... -", "X... &"):
+        once = us.clean_us_name(raw, pool=True)
+        assert once and us.clean_us_name(once) == once and us.clean_us_name(once, pool=True) == once
+    assert us.clean_us_name("WALT DISNEY CO... /THE", pool=True) == "WALT DISNEY CO"
+    funds = {s: good_fund(s) for s in POOL}
+    funds["AAPL"] = _extreme_fund("AAPL")
+    monkeypatch.setattr(sp, "_get_json", FakeYahoo(funds=funds))
+    make_db(pool={**POOL, "AMZN": ("WALT DISNEY CO... /THE", 15.0)}, extra={"TINY": [1e-7] * 3})
+    full_round()
+    snap = us._snapshot
+    assert snap is not None and us._worker.last_fail == ""
+    assert snap.facts_of("AMZN").name == "WALT DISNEY CO" and "TINY" not in snap.latest_closes
+    disk = us.snapshot_from_json(json.loads((sp.STATE_DIR / us.SNAPSHOT_NAME).read_text()), NOW)
+    assert disk == snap
+
+
+def test_card_rejections_are_persisted_for_other_processes(small_pool, yahoo, monkeypatch):
+    """回覆路徑擋下的卡片數，背景每一輪併進工作狀態檔；每日維護另開的程序讀檔看得到（P2 #1）。"""
+    make_db()
+    full_round()
+    monkeypatch.setattr(stock_card_check, "card_ok", lambda card, alt_text=None: False)
+    assert us.handle_symbol("NVDA", deadline=time.monotonic() + 20).text == sp.TEXT_EVAL_CARD_FAILED
+    assert us.status_summary()["cards_rejected"] == 1
+    full_round(NOW + 1800)
+    worker = read_worker_file()
+    assert worker["cards_rejected"] == 1 and worker["cards_rejected_at"] == NOW
+    full_round(NOW + 3600)  # 不會重複加
+    assert read_worker_file()["cards_rejected"] == 1
+    us.reset_for_tests()  # 像每日維護另開的程序
+    info = us.status_summary(NOW + 7200)
+    assert info["cards_rejected"] == 1 and info["cards_rejected_hours_ago"] == 2.0 and us._loaded is False
+
+
+def test_fund_insufficient_over_gate_keeps_old_snapshot(small_pool, yahoo):
+    """抓到了但算不出成長的超過兩成 → 整輪失敗、保留舊快照、財報快取留著；只有一檔時照算（P4 #1）。"""
+    make_db()
+    full_round()
+    first = us._snapshot
+    nxt = D + timedelta(days=1)
+    for symbol, value in {**{k: v[-1] + 0.1 for k, v in SERIES.items()}, "SPY": 700.0, "VOO": 700.0, "QQQ": 700.0}.items():
+        add_closes(symbol, [(nxt, value, 1)])
+    good = dict(us._worker.fund)
+    broken = {**good, **{s: us.replace(good[s], rev=good[s].rev[1:]) for s in ("NVDA", "MSFT")}}  # 少了去年同季
+    us._set_worker(us.replace(us._worker, fund=broken))
+    later = datetime(2026, 10, 29, 15, 0, tzinfo=TPE).timestamp()
+    full_round(later)
+    assert us._worker.last_fail == "too_many_gray" and us._snapshot == first
+    assert set(read_worker_file()["fund"]) == set(good)
+    us._set_worker(us.replace(us._worker, fund={**broken, "MSFT": good["MSFT"]}))
+    full_round(later + us.POLL_S)
+    snap = us._snapshot
+    assert snap.d == nxt and snap.facts_of("NVDA").growth is None and snap.facts_of("MSFT").growth is not None
+
+
+def test_history_record_matches_snapshot_and_perf_reader(small_pool, yahoo, monkeypatch):
+    """寫入端的契約：紀錄的 close＝快照裡 D 那天的收盤（＝DB 的 Nasdaq 收盤），成績模組讀得到 code／close（P4 #2）。"""
+    make_db()
+    full_round()
+    snap = us._snapshot
+    line = history_lines()[-1]
+    assert line["t"] == D.isoformat() and [p["code"] for p in line["picks"]] == list(snap.picks)
+    for pick in line["picks"]:
+        facts = snap.facts_of(pick["code"])
+        assert pick["close"] == facts.trend.close == SERIES[pick["code"]][-1]
+        assert pick["name"] == facts.name and pick["p60"] == facts.trend.p60
+    perf = _real_perf(monkeypatch)
+    if perf is None:
+        pytest.skip("stock_picks_perf not importable")
+    records = perf.parse_records([line], market=perf.US, default_rule=perf.US_RULE, today="2026-10-28")
+    rec = records[D.isoformat()]
+    assert rec.rule == "us_v1" and [(p.code, p.close) for p in rec.picks] == [(p["code"], p["close"]) for p in line["picks"]]
+
+
+def test_not_updated_snapshot_uses_live_lookup(small_pool, yahoo, monkeypatch):
+    """快照「沒更新」時，池裡的股票也改走即時查，不出舊的收盤（PLAN §5.2 step 2；P4 #3）。"""
+    make_db()
+    full_round()
+    set_clock(monkeypatch, NOW + 40 * 3600)
+    assert us._not_updated(us._snapshot, us._worker, NOW + 40 * 3600)
+    fake = lookup_yahoo(monkeypatch, charts={"NVDA": chart_payload("NVDA", bars_of(rising(0.1)))},
+                        funds={"NVDA": good_fund("NVDA")})
+    texts = _all_texts(us.handle_symbol("NVDA", deadline=time.monotonic() + 20).flex)
+    assert fake.calls and any(t.startswith("依據：Yahoo 收盤") for t in texts)
+
+
+def test_reply_path_never_touches_sqlite(small_pool, yahoo, monkeypatch, fake_perf):
+    """回覆路徑完全不碰 sqlite（v5 #10；P4 #4）：池內、Yahoo 路徑、推薦卡組、/股票 美股、/股票 成績都照常。"""
+    make_db(extra={"TSLA": rising(0.2)})
+    fake_perf.result = {"x": 1}
+    full_round()
+    us.reset_for_tests()  # 連第一次讀狀態檔也走一次
+    touched = []
+
+    def record(*args, **kwargs):
+        touched.append(args[:1])
+        raise AssertionError("reply path touched sqlite")
+
+    lookup_yahoo(monkeypatch, charts={"TSLA": chart_payload("TSLA", bars_of(rising(0.2)))}, funds={"TSLA": good_fund("TSLA")})
+    with monkeypatch.context() as patch:  # 在這個區塊裡換掉；離開就換回（conftest 收尾還要用 sqlite）
+        patch.setattr(stock_db_ro, "rows", record)
+        patch.setattr(sqlite3, "connect", record)
+        assert us.handle_symbol("NVDA", deadline=time.monotonic() + 20).flex is not None  # 池內
+        tsla = us.handle_symbol("TSLA", deadline=time.monotonic() + 20)  # Yahoo 路徑（核對用快照帶的收盤）
+        assert "依據：Yahoo 收盤、Yahoo 財報｜收盤和 Nasdaq 資料核對過｜資料到 10/27（美國時間）" in _all_texts(tsla.flex)
+        assert len(us.extend_picks_reply(tw_reply()).flex["contents"]) == 5
+        assert us.us_reply().flex is not None and us.perf_reply().flex is not None
+        assert us.status_summary()["status"] == "ok"
+    assert touched == []
+
+
+def test_perf_card_dropped_when_rejected(small_pool, yahoo, monkeypatch, fake_perf):
+    """只有成績卡沒過自我檢查 → 美股卡照接、成績卡拿掉、記一次被擋（P4 #6）。"""
+    make_db()
+    fake_perf.result = {"x": 1}
+    full_round()
+    real = stock_card_check.card_ok
+    monkeypatch.setattr(stock_card_check, "card_ok",
+                        lambda card, alt_text=None: "推薦成績" not in json.dumps(card, ensure_ascii=False) and real(card, alt_text))
+    extended = us.extend_picks_reply(tw_reply())
+    titles = [c["header"]["contents"][0]["text"] for c in extended.flex["contents"]]
+    assert titles == ["股票推薦：第 1 檔（共 1 檔）", "股票推薦：美股第 1 檔（共 3 檔）", "股票推薦：美股第 2 檔（共 3 檔）",
+                      "股票推薦：美股第 3 檔（共 3 檔）"]
+    assert us.status_summary()["cards_rejected"] >= 1

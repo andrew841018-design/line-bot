@@ -107,7 +107,10 @@ FUND_MAX_ROWS = 12
 FUND_VALUE_MAX = 1e15
 FUND_MAX_AGE_DAYS = 200  # 最近一季離資料日超過 200 天 → 資料不足
 YOY_LAG_DAYS = (350, 380)  # 去年同季：往前 350–380 天
-QUARTER_GAP_DAYS = (70, 110)  # 相鄰兩季
+# 相鄰兩季：一般 90–92 天；Costco 這種 12／12／12／16 週的會計年度，16 週那一季是 112–119 天。
+# 少一季時至少差 168 天（兩個 12 週），所以上限放到 125 天還是抓得到缺季（P1 #1）。
+QUARTER_GAP_DAYS = (70, 125)
+FUND_PARTIAL_RETRY_S = 6 * 3600  # 三個序列沒有都抓到的那一筆：6 小時後再抓一次（不是 3 天）
 SHARES_MAX_RATIO = 1.3  # 淨利 ÷ EPS 的最大／最小（擋沒還原的分割）
 SHARES_MIN_QUARTERS = 3
 PE_MAX = 1000.0
@@ -128,6 +131,8 @@ LOOKUP_CACHE_MAX = 128
 LOOKUP_BLOCK_S = 20 * 60  # 單檔自己的 429／403 冷卻（不看、也不設計畫 C 的共用冷卻）
 LOOKUP_CLOSE_HOUR = 17  # 美東 17:00 前，今天那根還沒收完
 LOOKUP_STALE_DAYS = 5
+LOOKUP_FUND_FALLBACK_S = 30 * 86400  # 即時抓不到財報時，背景快取 30 天內的才拿來用（再舊就當抓不到）
+LOOKUP_CONNECT_S = 1.5  # 單次請求的連線上限（requests 的 timeout 是連線、等回應各算一次）
 JUMP_RATIO = 1.45  # 只用在 Yahoo 路徑（DB 的列已經過盤勢 job 的 15% 兩次確認＋quarantine）
 VERIFY_TOL = 0.01  # Yahoo 收盤和 Nasdaq 同一天的收盤差 > 1% → ⚪
 _EXCHANGES = frozenset({"NMS", "NGM", "NCM", "NYQ", "ASE", "PCX", "BTS"})
@@ -136,7 +141,14 @@ _INSTRUMENT_KIND = {"EQUITY": STOCK, "ETF": ETF}
 # 卡片
 MAX_CARD_BYTES = 25 * 1024  # 加上美股後整組（大字版按鈕每張約 402 B，card_pages 上限 30 KB）
 MAX_BUBBLES = 12  # LINE carousel 上限
-_MAX_PRICE = 1e6
+# 數值範圍：寫進快照之前（_safe_facts、_latest_closes、_spy_market）和讀回時（snapshot_from_json）用同一組，
+# 寫得進去的一定讀得回來；一檔的怪數字只讓那一檔變 ⚪／資料不足，不會讓整份快照寫不進去（P1 #3、P2 #2）。
+_MIN_PRICE, _MAX_PRICE = 1e-6, 1e6
+_MIN_WEIGHT = 1e-9
+_YOY_LIMIT = 10**7  # 年增千分位（±1,000,000%）
+_P60_LIMIT = 10**6
+_PE_TENTHS_MAX = 10**5
+_MARKET_LIMIT = 10**6
 
 # 條件（順序就是卡片上的順序）
 LONG, MID, GROWTH, PROFIT = "long", "mid", "growth", "profit"
@@ -260,10 +272,11 @@ def _iso_ok(value) -> bool:
 
 
 def _price_ok(value) -> bool:
+    """收盤／均價：有限數、1e-6 ≤ x < 1e6（下限和讀回快照時一樣）。"""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
     try:
-        return math.isfinite(value) and 0 < value < _MAX_PRICE
+        return math.isfinite(value) and _MIN_PRICE <= value < _MAX_PRICE
     except OverflowError:
         return False
 
@@ -406,6 +419,7 @@ def profit_of(ni: Sequence[FundRow], data_date: date) -> Optional[Profit]:
 
 def pe_of(eps: Sequence[FundRow], ni: Sequence[FundRow], close: float, data_date: date) -> Pe:
     """本益比（只列）：EPS 要是美元（Yahoo 的 ADR EPS 是美元就是每一 ADS；TSM 的是台幣、每股普通股 → 不適用）；
+    近四季 EPS 合計 ≤ 0 → 「近四季合計虧損」（先講這個：對爸媽比「資料不足」清楚；P4 #12）；
     股數檢查：淨利 > 0 且 EPS > 0 的季算「淨利 ÷ EPS」，至少 3 季、最大／最小 ≤ 1.3（擋沒還原的分割）。"""
     if not eps:
         return Pe(PE_NONE)
@@ -414,13 +428,13 @@ def pe_of(eps: Sequence[FundRow], ni: Sequence[FundRow], close: float, data_date
     rows = _last_quarters(eps, data_date)
     if rows is None:
         return Pe(PE_NONE)
+    total = math.fsum(e for _, e, _ in rows)
+    if total <= 0:
+        return Pe(PE_LOSS)
     income = {d: (v, c) for d, v, c in ni}
     shares = [income[d][0] / e for d, e, _ in rows if d in income and income[d][1] == "USD" and income[d][0] > 0 and e > 0]
     if len(shares) < SHARES_MIN_QUARTERS or max(shares) / min(shares) > SHARES_MAX_RATIO:
         return Pe(PE_NONE)
-    total = math.fsum(e for _, e, _ in rows)
-    if total <= 0:
-        return Pe(PE_LOSS)
     pe = close / total
     if not math.isfinite(pe) or pe <= 0:
         return Pe(PE_NONE)
@@ -443,9 +457,28 @@ class FundEntry:
         days = [rows[-1][0] for rows in (self.rev, self.ni, self.eps) if rows]
         return max(days) if days else None
 
+    @property
+    def complete(self) -> bool:
+        return bool(self.rev and self.ni and self.eps)
 
-def _entry_from_parsed(parsed: dict, at: float) -> FundEntry:
-    return FundEntry(at=at, rev=parsed["rev"], ni=parsed["ni"], eps=parsed["eps"])
+
+def _entry_from_parsed(parsed: dict, at: float, old: Optional[FundEntry] = None) -> Optional[FundEntry]:
+    """這次抓到的財報 → 快取的一筆（P1 #2）。三個序列都是空的（200 但沒有能用的列）＝這次沒抓到：回 None，
+    舊的照留、也不算新鮮；只缺某個序列 → 那個序列沿用舊的（不完整的回應不能把能用的資料換成空的）。"""
+    if not any(parsed[key] for key, _ in _FUND_TYPES):
+        return None
+
+    def series(key: str) -> tuple:
+        return parsed[key] or (getattr(old, key) if old is not None else ())
+
+    return FundEntry(at=at, rev=series("rev"), ni=series("ni"), eps=series("eps"))
+
+
+def _fund_due(entry: Optional[FundEntry], now: float) -> bool:
+    """要不要再抓：沒有 → 要；完整的 3 天一次；缺序列的 6 小時後再試。"""
+    if entry is None:
+        return True
+    return now - entry.at >= (FUND_REFRESH_S if entry.complete else FUND_PARTIAL_RETRY_S)
 
 
 # ── 一檔的數字、條件、燈號 ────────────────────────────────────────────────────────────
@@ -601,17 +634,26 @@ _NAME_PUNCT = frozenset(" &.,'-()/")
 
 def clean_us_name(value, *, pool: bool = False) -> str:
     """Yahoo longName／shortName 或 SSGA 名稱 → 卡片名稱；不合格回 ""。SSGA 的「+」是「&」、「/THE」去掉、
-    截斷留下的「...」去掉；「*」去掉（同一行兩個會被 main 的 Markdown 轉換吃掉）。"""
+    截斷留下的「...」去掉；「*」去掉（同一行兩個會被 main 的 Markdown 轉換吃掉）。
+    清到不再改變為止（「WALT DISNEY CO... /THE」清一次還剩「...」）：讀回快照時要求 clean_us_name(名稱) == 名稱，
+    清一次不定型的話，一檔的名稱就會讓整份快照寫不進去（P2 #2）。"""
     if not isinstance(value, str):
         return ""
-    name = unicodedata.normalize("NFKC", value[: NAME_MAX * 4]).replace("*", "").strip()
-    if pool:
-        name = name.replace("+", "&")
-        if name.upper().endswith("/THE"):
-            name = name[:-4]
-    while name.endswith("...") or name.endswith("…"):
-        name = (name[:-3] if name.endswith("...") else name[:-1]).rstrip()
-    name = " ".join(name.split()).rstrip(" &,-/")
+    name = unicodedata.normalize("NFKC", value[: NAME_MAX * 4])
+    for _ in range(8):  # 每一輪至少少一個字，幾輪就定型；8 輪是保險
+        before = name
+        name = name.replace("*", "").strip()
+        if pool:
+            name = name.replace("+", "&")
+            if name.upper().endswith("/THE"):
+                name = name[:-4]
+        while name.endswith("...") or name.endswith("…"):
+            name = (name[:-3] if name.endswith("...") else name[:-1]).rstrip()
+        name = " ".join(name.split()).rstrip(" &,-/")
+        if name == before:
+            break
+    else:
+        return ""
     if not (1 <= len(name) <= NAME_MAX) or not all((ch.isascii() and ch.isalnum()) or ch in _NAME_PUNCT for ch in name):
         return ""
     return name
@@ -652,14 +694,17 @@ def _check_line(check: UsCheck) -> str:
 
 
 def _source_line(facts: UsFacts) -> str:
-    price = "Nasdaq 收盤" if facts.source == "db" else "Yahoo 收盤"
-    what = price if facts.kind != STOCK else f"{price}、Yahoo 財報"
-    verified = "｜收盤和 Nasdaq 核對過" if facts.verified else ""
+    # 盤勢 DB 的收盤是從 Nasdaq 網站抓的，NYSE 的股票也是：不寫成「Nasdaq 收盤」，免得以為在 Nasdaq 上市（P4）
+    if facts.source == "db":
+        what = "收盤（Nasdaq 資料）、財報（Yahoo）" if facts.kind == STOCK else "收盤（Nasdaq 資料）"
+    else:
+        what = "Yahoo 收盤、Yahoo 財報" if facts.kind == STOCK else "Yahoo 收盤"
+    verified = "｜收盤和 Nasdaq 資料核對過" if facts.verified else ""
     return f"依據：{what}{verified}｜資料到 {_us_day(facts.data_date)}"
 
 
 def _pool_source_line(day: date) -> str:
-    return f"依據：Nasdaq 收盤、Yahoo 財報｜資料到 {_us_day(day)}"
+    return f"依據：收盤（Nasdaq 資料）、財報（Yahoo）｜資料到 {_us_day(day)}"
 
 
 def _small(text: str) -> dict:
@@ -760,14 +805,19 @@ def us_detail_alt_text(facts: UsFacts) -> str:
     return f"{stock_picks.EVAL_PREFIX}只供參考｜{_label(facts)}｜{light.emoji} {light.text}"
 
 
-_cards_rejected = 0  # 自己驗沒過的卡片數（status_summary 回報；不默默拿掉）
+# 自己驗沒過的卡片（不默默拿掉，status_summary 回報）。回覆路徑只加記憶體裡的數；背景每一輪把新增的數併進
+# 工作狀態檔（累計＋最後一次的時間），每日維護另開的程序讀檔才看得到（P2 #1）。
+_cards_rejected = 0  # 這個程序累計被擋的張數
+_cards_rejected_at: Optional[float] = None  # 這個程序最後一次被擋的時間
+_cards_rejected_saved = 0  # 已經併進工作狀態的張數
 
 
 def _card_ok(card, alt_text: Optional[str] = None) -> bool:
-    global _cards_rejected
+    global _cards_rejected, _cards_rejected_at
     if stock_card_check.card_ok(card, alt_text):
         return True
     _cards_rejected += 1
+    _cards_rejected_at = _wall()
     return False
 
 
@@ -819,7 +869,7 @@ def parse_pool(obj) -> Optional[PoolList]:
         if isinstance(weight, bool) or not isinstance(weight, (int, float)):
             continue
         try:
-            if not math.isfinite(weight) or not 0 < weight <= 100:
+            if not math.isfinite(weight) or not _MIN_WEIGHT <= weight <= 100:
                 continue
         except OverflowError:
             continue
@@ -891,10 +941,32 @@ def pool_member_facts(member: PoolMember, day: date, trend: Optional[UsTrend], g
                    pe=pe_of(entry.eps, entry.ni, trend.close, day))
 
 
+def _safe_facts(facts: UsFacts) -> UsFacts:
+    """寫進快照前，每一檔先用讀回時的同一套範圍檢查（P1 #3）：年增超出範圍 → 那一檔「營收資料不足」；
+    乖離超出範圍 → 那一檔 ⚪；其他讀不回來的 → 那一檔 ⚪（error）。整份快照不會因為一檔寫不進去。"""
+    if facts.growth is not None and not -_YOY_LIMIT <= facts.growth.yoy <= _YOY_LIMIT:
+        facts = replace(facts, growth=None)
+    if facts.pe.kind == PE_OK and not (facts.pe.tenths is not None and 0 <= facts.pe.tenths <= _PE_TENTHS_MAX):
+        facts = replace(facts, pe=Pe(PE_NONE))
+    if facts.trend is not None and not -_P60_LIMIT <= facts.trend.p60 <= _P60_LIMIT:
+        facts = replace(facts, trend=None, gray="error")
+    try:
+        _facts_from(json.loads(json.dumps(_facts_json(facts))), facts.data_date)
+        return facts
+    except (ValueError, TypeError, KeyError, OverflowError):
+        logger.warning("stock picks us facts out of range; marked gray")
+    weight = facts.weight if facts.weight is not None and _MIN_WEIGHT <= facts.weight <= 100 else None
+    return UsFacts(facts.symbol, clean_us_name(facts.name), facts.kind, facts.data_date, None, weight=weight,
+                   gray="error", fund=FUND_UNAVAILABLE)
+
+
 def _spy_market(series: Mapping[str, float], cal_d: Sequence[str], d: str) -> Optional[stock_picks.Market]:
     if not _price_ok(series.get(d)):
         return None
-    return stock_picks.market_of([series[x] for x in cal_d if _price_ok(series.get(x))])
+    market = stock_picks.market_of([series[x] for x in cal_d if _price_ok(series.get(x))])
+    if market is None or not all(-_MARKET_LIMIT <= v <= _MARKET_LIMIT for v in (market.b20, market.b60)):
+        return None
+    return market
 
 
 # ── 快照與工作狀態（state/ 底下兩個 JSON；讀檔一律驗證，不合格當作沒有） ──────────────────────
@@ -949,26 +1021,26 @@ def _facts_from(value, day: date) -> UsFacts:
     if value.get("tr") is not None:
         raw = value["tr"]
         v._require(isinstance(raw, list) and len(raw) == 4)
-        trend = UsTrend(close=v._v_num(raw[0], 1e-6, _MAX_PRICE), ma60=v._v_num(raw[1], 1e-6, _MAX_PRICE),
-                        ma240=v._v_num(raw[2], 1e-6, _MAX_PRICE), p60=v._v_int(raw[3], -10**6, 10**6))
+        trend = UsTrend(close=v._v_num(raw[0], _MIN_PRICE, _MAX_PRICE), ma60=v._v_num(raw[1], _MIN_PRICE, _MAX_PRICE),
+                        ma240=v._v_num(raw[2], _MIN_PRICE, _MAX_PRICE), p60=v._v_int(raw[3], -_P60_LIMIT, _P60_LIMIT))
     growth = profit = None
     if value.get("g") is not None:
         raw = value["g"]
         v._require(isinstance(raw, list) and len(raw) == 2)
-        growth = Growth(q=v._v_date(raw[0]), yoy=v._v_int(raw[1], -10**7, 10**7))
+        growth = Growth(q=v._v_date(raw[0]), yoy=v._v_int(raw[1], -_YOY_LIMIT, _YOY_LIMIT))
     if value.get("p") is not None:
         raw = value["p"]
         v._require(isinstance(raw, list) and len(raw) == 3)
         profit = Profit(q=v._v_date(raw[0]), losses=v._v_int(raw[1], 0, 4), zeros=v._v_int(raw[2], 0, 4))
     pe_raw = value.get("pe")
     v._require(isinstance(pe_raw, list) and len(pe_raw) == 2)
-    pe = Pe(_v_choice(pe_raw[0], _PE_KINDS), v._v_int(pe_raw[1], 0, 10**5, allow_none=True))
+    pe = Pe(_v_choice(pe_raw[0], _PE_KINDS), v._v_int(pe_raw[1], 0, _PE_TENTHS_MAX, allow_none=True))
     v._require((pe.kind == PE_OK) == (pe.tenths is not None))
     gray = v._v_str(value.get("x"), 20, allow_empty=True)
     return UsFacts(
         symbol=_v_symbol(value.get("s")), name=name, kind=_v_choice(value.get("k"), (STOCK, ETF)), data_date=day,
         trend=trend, growth=growth, profit=profit, pe=pe, fund=_v_choice(value.get("f"), _FUND_STATES),
-        weight=v._v_num(value.get("w"), 1e-9, 100.0, allow_none=True), gray=gray if trend is None else "", source="db",
+        weight=v._v_num(value.get("w"), _MIN_WEIGHT, 100.0, allow_none=True), gray=gray if trend is None else "", source="db",
     )
 
 
@@ -999,7 +1071,8 @@ def snapshot_from_json(obj, now: float) -> UsSnapshot:
         raw = obj["spy"]
         v._require(isinstance(raw, dict))
         spy = stock_picks.Market(level=_v_choice(raw.get("level"), (stock_picks.HOT, stock_picks.COLD, stock_picks.NEUTRAL)),
-                                 b20=v._v_int(raw.get("b20"), -10**6, 10**6), b60=v._v_int(raw.get("b60"), -10**6, 10**6))
+                                 b20=v._v_int(raw.get("b20"), -_MARKET_LIMIT, _MARKET_LIMIT),
+                                 b60=v._v_int(raw.get("b60"), -_MARKET_LIMIT, _MARKET_LIMIT))
     dates_raw, pool_raw, picks_raw = obj.get("spy_dates"), obj.get("pool"), obj.get("picks")
     v._require(isinstance(dates_raw, list) and len(dates_raw) <= 400)
     spy_dates = tuple(v._v_date(x) for x in dates_raw)
@@ -1021,7 +1094,7 @@ def snapshot_from_json(obj, now: float) -> UsSnapshot:
     latest = {}
     for sym, pair in latest_raw.items():
         v._require(isinstance(pair, list) and len(pair) == 2)
-        latest[_v_symbol(sym)] = (v._v_date(pair[0]), v._v_num(pair[1], 1e-6, _MAX_PRICE))
+        latest[_v_symbol(sym)] = (v._v_date(pair[0]), v._v_num(pair[1], _MIN_PRICE, _MAX_PRICE))
     as_of = obj.get("universe_as_of")
     return UsSnapshot(
         d=day, rule=v._v_str(obj.get("rule"), 20), covered=v._v_int(obj.get("covered"), 0, 10**4),
@@ -1047,6 +1120,8 @@ class UsWorker:
     fund_day: Optional[str] = None  # 財報請求帳的日期（台北）
     fund_count: int = 0  # 那一天已經記的財報請求數（送出前先記）
     fund: Mapping[str, FundEntry] = field(default_factory=dict)
+    cards_rejected: int = 0  # 累計被自己的檢查擋下的卡片數（跨重啟、跨程序取大的）
+    cards_rejected_at: Optional[float] = None  # 最後一次被擋的時間
     writer: str = ""
 
 
@@ -1077,6 +1152,8 @@ def worker_to_json(w: UsWorker) -> dict:
                   "rev": _fund_rows_json(e.rev), "ni": _fund_rows_json(e.ni), "eps": _fund_rows_json(e.eps)}
             for sym, e in sorted(w.fund.items())
         },
+        "cards_rejected": w.cards_rejected,
+        "cards_rejected_at": w.cards_rejected_at,
         "writer": w.writer,
     }
 
@@ -1141,6 +1218,8 @@ def worker_from_json(obj, now: float) -> UsWorker:
         fund_day=fund_day,
         fund_count=v._v_int(obj.get("fund_count", 0), 0, 10**5),
         fund=fund,
+        cards_rejected=v._v_int(obj.get("cards_rejected", 0), 0, 10**9),
+        cards_rejected_at=stock_picks._at_most(v._v_num(obj.get("cards_rejected_at"), 0.0, 1e11, allow_none=True), soon),
         writer=v._v_str(obj.get("writer") or "", 64, allow_empty=True),
     )
 
@@ -1267,7 +1346,9 @@ def _merge_worker(mem: UsWorker, disk: Optional[UsWorker], now: float) -> UsWork
         day, count = disk.fund_day, disk.fund_count
     else:
         day, count = mem.fund_day, mem.fund_count
-    merged = replace(mem, fund=_trim_fund(fund, keep=set(mem.fund)), fund_day=day, fund_count=count)
+    rejected_at = max((t for t in (mem.cards_rejected_at, disk.cards_rejected_at) if t is not None), default=None)
+    merged = replace(mem, fund=_trim_fund(fund, keep=set(mem.fund)), fund_day=day, fund_count=count,
+                     cards_rejected=max(mem.cards_rejected, disk.cards_rejected), cards_rejected_at=rejected_at)
     if disk.writer and disk.writer != _WRITER_ID:
         if disk.next_try is not None and disk.next_try > now:
             merged = replace(merged, next_try=max(merged.next_try or 0.0, disk.next_try))
@@ -1495,7 +1576,7 @@ def _refresh_fundamentals(wanted: Sequence[str], stop: threading.Event, now: flo
     """照節奏補抓財報（每檔 3 天一次；沒抓過的先、再來最久沒更新的；每輪 25、每天 40；一次一檔、依序）。
     回「這輪抓過但失敗、手上也沒有財報」的代號。429／403 → 共用冷卻＋自己的冷卻、整輪失敗（已抓的留在快取）。"""
     fund = _worker.fund
-    due = [s for s in wanted if s not in fund or now - fund[s].at >= FUND_REFRESH_S]
+    due = [s for s in wanted if _fund_due(fund.get(s), now)]
     due.sort(key=lambda s: (s in fund, fund[s].at if s in fund else 0.0))  # sort 穩定：沒抓過的照池的順序
     if not due or _yahoo_cooling(now):
         return set()
@@ -1522,12 +1603,14 @@ def _refresh_fundamentals(wanted: Sequence[str], stop: threading.Event, now: flo
             _set_worker(replace(_worker, bg_yahoo_until=max(_worker.bg_yahoo_until or 0.0, now + stock_picks.BLOCKED_BACKOFF_S)))
             raise stock_picks.RoundFailed("yahoo_rate_limited", blocked=True) from None
         parsed = parse_fundamentals(payload) if payload is not None else None
-        if parsed is None:
-            if symbol not in _worker.fund:
+        old = _worker.fund.get(symbol)
+        entry = _entry_from_parsed(parsed, now, old) if parsed is not None else None
+        if entry is None:  # 沒抓到（含 200 但三個序列都空）：舊的照留、時間不動，下一輪再抓
+            if old is None:
                 failed.add(symbol)
             continue
         fresh = dict(_worker.fund)
-        fresh[symbol] = _entry_from_parsed(parsed, now)
+        fresh[symbol] = entry
         _set_worker(replace(_worker, fund=_trim_fund(fresh, keep)))
     return failed
 
@@ -1565,8 +1648,8 @@ def _recompute(stop: threading.Event, now: float, pool: PoolList, d: str, covere
     for m in pool.members:
         trend, reason = trends[m.symbol]
         entry = fund.get(m.symbol)
-        try:
-            f = pool_member_facts(m, day, trend, reason, entry)
+        try:  # 算 facts、再用讀回時的範圍檢查（一檔的怪數字只影響那一檔）
+            f = _safe_facts(pool_member_facts(m, day, trend, reason, entry))
         except Exception as exc:
             logger.warning("stock picks us facts failed error_type=%s", type(exc).__name__)
             f = UsFacts(m.symbol, m.name, STOCK, day, None, weight=m.weight, gray="error", fund=FUND_UNAVAILABLE)
@@ -1692,9 +1775,23 @@ def _tick(stop: threading.Event, now: float) -> float:
                 delay = float(stock_picks.BACKOFF_S[-1])
     if stop.is_set():
         return float(POLL_S)
+    _fold_card_rejections(now)
     _check_history()
     _update_perf(now)
     return delay
+
+
+def _fold_card_rejections(now: float) -> None:
+    """回覆路徑擋下的卡片數（只在記憶體）併進工作狀態檔：累計＋最後一次的時間（P2 #1；回覆路徑不寫檔）。"""
+    global _cards_rejected_saved
+    new = _cards_rejected - _cards_rejected_saved
+    if new <= 0:
+        return
+    w = _worker
+    last = max(w.cards_rejected_at or 0.0, _cards_rejected_at or now)
+    _set_worker(replace(w, cards_rejected=w.cards_rejected + new, cards_rejected_at=last))
+    _cards_rejected_saved += new  # 已經在記憶體的工作狀態裡：這次存不進去，下次存檔一起寫（不會重複加）
+    _save_worker(now)
 
 
 # ── 背景執行緒 ─────────────────────────────────────────────────────────────────────
@@ -1817,10 +1914,14 @@ def yahoo_trend(bars: Mapping[date, float], now: float, spy_dates: Sequence[date
     return "ok", data_date, trend, "" if trend is not None else "short"
 
 
-def _yahoo_once(path: str, params: dict, timeout: float):
-    """回覆路徑的一次請求：只打 query1、單次 ≤ 3 秒；只接 FetchError（其他例外往上丟）。"""
+def _yahoo_once(path: str, params: dict, give_up: float):
+    """回覆路徑的一次請求：只打 query1；只接 FetchError（其他例外往上丟）。
+    requests 的 timeout 是連線、等回應、每一段內容各算一次（P2 #3）：傳 (連線, 讀取) 兩個數，各不超過剩下預算的
+    三分之一（讀取另外 ≤ 3 秒），total_s ＝剩下的預算，一個請求就不會拖過整次查詢的期限。"""
+    left = max(0.3, give_up - time.monotonic())
+    read = min(LOOKUP_FETCH_S, left / 3)
     status, data, _ = stock_picks._get_json(_YAHOO_HOSTS[0], path, params=params, max_bytes=_YAHOO_MAX_BYTES,
-                                            timeout=timeout, total_s=timeout)
+                                            timeout=(min(LOOKUP_CONNECT_S, read), read), total_s=left)
     return data if status == 200 else None
 
 
@@ -1835,8 +1936,7 @@ def _lookup_fetch(symbol: str, snapshot: Optional[UsSnapshot], give_up: float, n
     ysym = _yahoo_symbol(symbol)
     try:
         payload = _yahoo_once(f"/v8/finance/chart/{quote(ysym, safe='')}",
-                              {"range": "2y", "interval": "1d", "includePrePost": "false"},
-                              max(0.5, min(LOOKUP_FETCH_S, give_up - time.monotonic())))
+                              {"range": "2y", "interval": "1d", "includePrePost": "false"}, give_up)
     except stock_picks.FetchError as exc:
         if exc.kind in ("rate_limited", "blocked"):
             _lookup_block(now)
@@ -1863,34 +1963,43 @@ def _lookup_fetch(symbol: str, snapshot: Optional[UsSnapshot], give_up: float, n
                 verified = True
     facts = UsFacts(symbol, info["name"], info["kind"], data_date, trend, gray=gray if trend is None else "",
                     source="yahoo", verified=verified, fund=FUND_NA if info["kind"] == ETF else FUND_OK)
-    if facts.kind == ETF or trend is None:
+    if facts.kind == ETF:
         return facts, trend is not None
-    entry = _lookup_fund(symbol, give_up, now)
+    if trend is None:  # ⚪：財報沒抓，卡上寫「財報暫時抓不到」，不寫「營收／獲利／本益比資料不足」（P1 #4）
+        return replace(facts, fund=FUND_UNAVAILABLE), False
+    entry, long_ok = _lookup_fund(symbol, give_up, now)
     if entry is None:
         return replace(facts, fund=FUND_UNAVAILABLE), False  # 只快取 10 分鐘
     return replace(facts, growth=growth_of(entry.rev, data_date), profit=profit_of(entry.ni, data_date),
-                   pe=pe_of(entry.eps, entry.ni, trend.close, data_date)), True
+                   pe=pe_of(entry.eps, entry.ni, trend.close, data_date)), long_ok
 
 
-def _lookup_fund(symbol: str, give_up: float, now: float) -> Optional[FundEntry]:
-    """財報先看背景快取（新鮮就不抓）；剩下的預算 ≥ 1.5 秒才抓；抓不到時有舊的快取就用舊的。不寫進背景的快取。"""
+def _lookup_fund(symbol: str, give_up: float, now: float) -> tuple[Optional[FundEntry], bool]:
+    """→ (財報, 結果可不可以快取到下一個美東 17:00)。不寫進背景的快取。
+    - 背景快取新鮮（< 3 天）而且三個序列都有 → 直接用、不抓；
+    - 否則剩下的預算 ≥ 1.5 秒才抓；抓到的缺某個序列 → 用背景快取（30 天內）的那個序列補；
+    - 抓不到（預算不夠、失敗、200 但沒有能用的列）→ 背景快取 30 天內的才用，再舊就當抓不到（P1 #5、P4 #10）；
+    只有「新鮮又完整」的結果才長快取，其他只快取 10 分鐘。"""
     cached = _worker.fund.get(symbol)
-    if cached is not None and now - cached.at < FUND_REFRESH_S:
-        return cached
-    left = give_up - time.monotonic()
-    if left < LOOKUP_FUND_MIN_S:
-        return cached
+    if cached is not None and now - cached.at < FUND_REFRESH_S and cached.complete:
+        return cached, True
+    usable = cached if cached is not None and now - cached.at <= LOOKUP_FUND_FALLBACK_S else None
+    if give_up - time.monotonic() < LOOKUP_FUND_MIN_S:
+        return usable, False
     ysym = _yahoo_symbol(symbol)
     try:
         payload = _yahoo_once(f"/ws/fundamentals-timeseries/v1/finance/timeseries/{quote(ysym, safe='')}",
-                              _fund_params(ysym, now), min(LOOKUP_FETCH_S, left))
+                              _fund_params(ysym, now), give_up)
     except stock_picks.FetchError as exc:
         if exc.kind in ("rate_limited", "blocked"):
             _lookup_block(now)
         logger.info("stock picks us lookup fund failed kind=%s", exc.kind)
-        return cached
+        return usable, False
     parsed = parse_fundamentals(payload) if payload is not None else None
-    return _entry_from_parsed(parsed, now) if parsed is not None else cached
+    entry = _entry_from_parsed(parsed, now, usable) if parsed is not None else None
+    if entry is None:
+        return usable, False
+    return entry, all(parsed[key] for key, _ in _FUND_TYPES)  # 用舊序列補過的只快取 10 分鐘
 
 
 def _lookup(symbol: str, snapshot: Optional[UsSnapshot], deadline: Optional[float]):
@@ -2059,8 +2168,11 @@ def status_summary(now: Optional[float] = None) -> dict:
     now = _wall() if now is None else now
     if _loaded:
         snapshot, w = _snapshot, _worker
-    else:
+        rejected = w.cards_rejected + max(0, _cards_rejected - _cards_rejected_saved)  # 加上還沒併進檔案的
+        rejected_at = max((t for t in (w.cards_rejected_at, _cards_rejected_at) if t is not None), default=None)
+    else:  # 另開的程序（每日維護）：被擋的數從工作狀態檔讀（背景每一輪併進去）
         snapshot, w = _load_snapshot_file(now), _load_worker_file(now)
+        rejected, rejected_at = w.cards_rejected, w.cards_rejected_at
     if not (ENABLED and enabled_now()):
         status = "disabled"
     elif snapshot is None:
@@ -2088,7 +2200,8 @@ def status_summary(now: Optional[float] = None) -> dict:
         "hours_since_check": None if w.last_ok_check is None else round((now - w.last_ok_check) / 3600, 1),
         "perf_date": perf.get("perf_date") if isinstance(perf, dict) else None,
         "fund_count_today": w.fund_count if w.fund_day == _tw_day(now) else 0,
-        "cards_rejected": _cards_rejected,
+        "cards_rejected": rejected,
+        "cards_rejected_hours_ago": None if rejected_at is None else round(max(0.0, now - rejected_at) / 3600, 1),
         "perf": perf,
     }
 
@@ -2096,13 +2209,13 @@ def status_summary(now: Optional[float] = None) -> dict:
 def reset_for_tests() -> None:
     """conftest 每個測試呼叫：重讀開關、清掉記憶體狀態、快取、限流、冷卻（狀態檔目錄已經是 tmp）。"""
     global ENABLED, _snapshot, _worker, _loaded, _worker_side_ready, _perf_result, _cards_rejected
-    global _thread, _stop, _lookup_yahoo_until
+    global _cards_rejected_at, _cards_rejected_saved, _thread, _stop, _lookup_yahoo_until
     signal_stop()
     ENABLED = stock_picks._ai_flag(os.environ.get(FLAG_ENV))
     with _mem_lock:
         _snapshot, _worker, _loaded, _perf_result = None, UsWorker(), False, None
     _worker_side_ready = False
-    _cards_rejected = 0
+    _cards_rejected, _cards_rejected_at, _cards_rejected_saved = 0, None, 0
     with _thread_lock:
         _thread, _stop = None, None
     with _lookup_lock:
