@@ -283,6 +283,7 @@ def _init_db() -> None:
                 last_seen_at     INTEGER NOT NULL,
                 matcher_version  TEXT NOT NULL DEFAULT 'local-v1',
                 semantic_context TEXT NOT NULL DEFAULT '',
+                origin           TEXT NOT NULL DEFAULT '',
                 UNIQUE(group_id, canonical_key)
             );
             CREATE INDEX IF NOT EXISTS idx_correction_rules_group_recent
@@ -323,6 +324,44 @@ def _init_db() -> None:
             CREATE UNIQUE INDEX IF NOT EXISTS idx_correction_rule_single_undo
                 ON correction_rule_events(group_id, reverts_event_id)
                 WHERE reverts_event_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_correction_rule_events_rule
+                ON correction_rule_events(group_id, rule_id, action);
+            -- 2026-10-24 咪寶自動學習糾正（complaint_learning）：每次判斷只記 id、結果代碼與類別，
+            -- 不記任何留言文字；shadow（試運轉）通過的「會學到的規則」另存一表，也不存家人原話。
+            CREATE TABLE IF NOT EXISTS complaint_judgements (
+                judgement_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id      TEXT NOT NULL,
+                complaint_id  TEXT NOT NULL,
+                complaint_ids TEXT NOT NULL DEFAULT '[]',
+                target_id     TEXT NOT NULL DEFAULT '',
+                kind          TEXT NOT NULL DEFAULT 'complaint',
+                mode          TEXT NOT NULL DEFAULT 'on',
+                actor_key     TEXT NOT NULL DEFAULT '',
+                stage         TEXT NOT NULL DEFAULT '',
+                result        TEXT NOT NULL,
+                category      TEXT NOT NULL DEFAULT '',
+                provider      TEXT NOT NULL DEFAULT '',
+                confidence    REAL,
+                checks        TEXT NOT NULL DEFAULT '',
+                rule_id       INTEGER,
+                judged        INTEGER NOT NULL DEFAULT 0,
+                created_at    INTEGER NOT NULL,
+                UNIQUE(group_id, complaint_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_complaint_judgements_time
+                ON complaint_judgements(group_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_complaint_judgements_target
+                ON complaint_judgements(group_id, target_id);
+            CREATE TABLE IF NOT EXISTS complaint_shadow_rules (
+                group_id        TEXT NOT NULL,
+                complaint_id    TEXT NOT NULL,
+                category        TEXT NOT NULL,
+                core_reason     TEXT NOT NULL,
+                rule            TEXT NOT NULL,
+                same_as_rule_id INTEGER,
+                created_at      INTEGER NOT NULL,
+                PRIMARY KEY (group_id, complaint_id)
+            );
             CREATE TABLE IF NOT EXISTS fact_check_cache (
                 group_id   TEXT NOT NULL,
                 text_hash  TEXT NOT NULL,
@@ -566,6 +605,16 @@ def _init_db() -> None:
                 "ALTER TABLE correction_rules ADD COLUMN semantic_context "
                 "TEXT NOT NULL DEFAULT ''"
             )
+        # 2026-10-24 咪寶自動學習糾正：判斷器學到的規則 origin='learned'，舊的糾正記憶是 ''。
+        # 兩類的提示詞區塊、比對對象與 canonical key 各自分開（學到的規則不會併進家人原話的舊規則）。
+        if "origin" not in rule_cols:
+            _add_column(
+                c, "correction_rules", "origin", "origin TEXT NOT NULL DEFAULT ''"
+            )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_correction_rules_origin "
+            "ON correction_rules(group_id, origin, status, last_seen_at DESC, rule_id DESC)"
+        )
         c.execute(
             "CREATE INDEX IF NOT EXISTS idx_correction_rules_semantic_repair "
             "ON correction_rules(rule_id) "
@@ -2213,13 +2262,16 @@ def _canonical_correction_enabled() -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
-def _correction_rule_rows_conn(c: sqlite3.Connection, group_id: str) -> list[dict]:
+def _correction_rule_rows_conn(
+    c: sqlite3.Connection, group_id: str, *, origin: str = ""
+) -> list[dict]:
+    """啟用中的規則（比對候選）；只看同一類（origin）：學到的規則不和家人原話的舊規則互相合併。"""
     rows = c.execute(
         "SELECT rule_id, canonical_rule, canonical_key, occurrence_count, "
         "first_seen_at, last_seen_at, matcher_version, semantic_context "
-        "FROM correction_rules WHERE group_id=? AND status='active' "
+        "FROM correction_rules WHERE group_id=? AND status='active' AND origin=? "
         "ORDER BY last_seen_at DESC, rule_id DESC",
-        (group_id,),
+        (group_id, origin),
     ).fetchall()
     return [
         {
@@ -2240,19 +2292,22 @@ def _correction_rule_rows_for_prompt_conn(
     c: sqlite3.Connection,
     group_id: str,
 ) -> list[dict]:
-    """Return a bounded union of recent and recurrent active rules."""
+    """Return a bounded union of recent and recurrent active legacy rules.
+
+    2026-10-24：只取舊的糾正記憶（origin=''）；學到的規則在提示詞裡另有一塊。
+    """
     rows = c.execute(
         "WITH selected(rule_id) AS ("
         " SELECT rule_id FROM ("
         "  SELECT rule_id FROM correction_rules "
         "  INDEXED BY idx_correction_rules_group_recent "
-        "  WHERE group_id=? AND status='active' AND occurrence_count>0 "
+        "  WHERE group_id=? AND status='active' AND occurrence_count>0 AND origin='' "
         "  ORDER BY last_seen_at DESC, rule_id DESC LIMIT 10"
         " ) UNION "
         " SELECT rule_id FROM ("
         "  SELECT rule_id FROM correction_rules "
         "  INDEXED BY idx_correction_rules_group_recurrence "
-        "  WHERE group_id=? AND status='active' AND occurrence_count>0 "
+        "  WHERE group_id=? AND status='active' AND occurrence_count>0 AND origin='' "
         "  ORDER BY occurrence_count DESC, last_seen_at DESC, rule_id DESC LIMIT 10"
         " )"
         ") "
@@ -2293,6 +2348,7 @@ def _insert_rule_conn(
     observed_at: int,
     *,
     key_suffix: str = "",
+    origin: str = "",
 ) -> int:
     from correction_memory import semantic_context
 
@@ -2302,8 +2358,8 @@ def _insert_rule_conn(
         c.execute(
             "INSERT INTO correction_rules"
             "(group_id, canonical_key, canonical_rule, status, occurrence_count, "
-            " first_seen_at, last_seen_at, matcher_version, semantic_context) "
-            "VALUES (?, ?, ?, 'active', 0, ?, ?, ?, ?)",
+            " first_seen_at, last_seen_at, matcher_version, semantic_context, origin) "
+            "VALUES (?, ?, ?, 'active', 0, ?, ?, ?, ?, ?)",
             (
                 group_id,
                 key,
@@ -2312,6 +2368,7 @@ def _insert_rule_conn(
                 observed_at,
                 _CORRECTION_MATCHER_VERSION,
                 semantic,
+                origin,
             ),
         )
         return int(c.execute("SELECT last_insert_rowid()").fetchone()[0])
@@ -2324,6 +2381,21 @@ def _insert_rule_conn(
         if row is None:
             raise
         return int(row[0])
+
+
+def _rule_tombstoned_conn(c: sqlite3.Connection, group_id: str, rule_id: int) -> bool:
+    """撤銷過（有一筆沒被還原的 retire 事件）＝tombstone（2026-10-24，GP1 #1）。
+
+    Andrew 撤銷、抱怨被收回、--all-judge、重篩 --apply 都寫 retire 事件；之後同一條規則（同 key）
+    再被家人提到也不會被重算成啟用。60 天沒再出現的自動退休記 expire，不是 tombstone。
+    """
+    return c.execute(
+        "SELECT 1 FROM correction_rule_events e "
+        "WHERE e.group_id=? AND e.rule_id=? AND e.action='retire' "
+        "AND NOT EXISTS (SELECT 1 FROM correction_rule_events u "
+        " WHERE u.group_id=e.group_id AND u.reverts_event_id=e.event_id) LIMIT 1",
+        (group_id, int(rule_id)),
+    ).fetchone() is not None
 
 
 def _recompute_rule_conn(c: sqlite3.Connection, group_id: str, rule_id: int) -> None:
@@ -2349,11 +2421,13 @@ def _recompute_rule_conn(c: sqlite3.Connection, group_id: str, rule_id: int) -> 
         (group_id, rule_id),
     ).fetchall()
     semantic = combine_semantic_contexts(member[0] for member in member_rows) or "none"
+    # 撤銷過的規則照樣重算次數（清單看得到它又被提到幾次），但不再啟用（GP1 #1）。
+    status = "retired" if _rule_tombstoned_conn(c, group_id, rule_id) else "active"
     c.execute(
         "UPDATE correction_rules SET occurrence_count=?, first_seen_at=?, "
-        "last_seen_at=?, status='active', semantic_context=? "
+        "last_seen_at=?, status=?, semantic_context=? "
         "WHERE group_id=? AND rule_id=?",
-        (count, int(row[1]), int(row[2]), semantic, group_id, rule_id),
+        (count, int(row[1]), int(row[2]), status, semantic, group_id, rule_id),
     )
 
 
@@ -2434,6 +2508,9 @@ def _assign_correction_observation_conn(
         if any(r["rule_id"] == rule_id for r in existing):
             decision = "equivalent"
             score = max(score, 1.0)
+        elif _rule_tombstoned_conn(c, group_id, rule_id):
+            # 同 key 的規則被撤銷過：照樣留稽核、記一次出現，但不復活（GP1 #1）。
+            decision = "tombstoned"
     elif decision == "distinct":
         decision = "ambiguous"
 
@@ -2476,7 +2553,8 @@ def _assign_correction_observation_conn(
                 (group_id, rule_id),
             ).fetchone()[0]
         )
-        status = "new" if occurrence == 1 else "recurrent"
+        if decision != "tombstoned":
+            status = "new" if occurrence == 1 else "recurrent"
     _event_conn(
         c,
         group_id,
@@ -2609,7 +2687,7 @@ def list_canonical_organic_corrections(group_id: str) -> list[dict]:
         rows = c.execute(
             "SELECT rule_id, canonical_rule, occurrence_count, first_seen_at, "
             "last_seen_at, matcher_version FROM correction_rules "
-            "WHERE group_id=? AND status='active' AND occurrence_count>0 "
+            "WHERE group_id=? AND status='active' AND occurrence_count>0 AND origin='' "
             "ORDER BY last_seen_at DESC, occurrence_count DESC, rule_id DESC",
             (group_id,),
         ).fetchall()
@@ -2629,9 +2707,19 @@ def list_canonical_organic_corrections(group_id: str) -> list[dict]:
 
 
 def list_persona_notes_for_prompt(group_id: str) -> list[dict]:
-    """Return legacy notes or a deduplicated canonical organic projection."""
+    """Return legacy notes or a deduplicated canonical organic projection.
+
+    2026-10-24：學到的規則（source='learned'）只在 complaint_learning 正式開（mode on）時附在最後，
+    提示詞裡另成一塊；關掉、試運轉（shadow）或狀態檔停用時一條都不給。
+    """
+    learned = _learned_prompt_notes(group_id)
     if not _canonical_correction_enabled():
-        return list_persona_notes(group_id)
+        notes = list_persona_notes(group_id)
+        hidden = _retired_or_learned_note_ids(group_id)
+        if hidden:
+            # 舊的原話路徑也要尊重撤銷，也不能把學到的規則當成原話糾正塞回舊區塊（GP1 #1）。
+            notes = [n for n in notes if n["note_id"] not in hidden]
+        return notes + learned
 
     # Raw notes, canonical rules, and observation links must come from one WAL
     # read snapshot.  Separate connections can straddle a backfill commit and
@@ -2723,7 +2811,378 @@ def list_persona_notes_for_prompt(group_id: str) -> list[dict]:
         if n["kind"] == "correction"
         and n.get("source") == "organic"
     ]
-    return examples + canonical + legacy_organic + nonorganic
+    return examples + canonical + legacy_organic + nonorganic + learned
+
+
+# ── 咪寶自動學習糾正（2026-10-24，complaint_learning）────────────────────────
+# 判斷器學到的規則和舊的糾正記憶共用 correction_rules／correction_observations／persona_notes
+# （稽核與撤銷照舊），但 origin='learned'、canonical key 另一個命名空間：不會和家人原話的舊規則
+# 撞 key、被合併，也不進舊的「規則 0 延伸」區塊。上限、TTL 等數字由 complaint_learning 傳進來。
+LEARNED_ORIGIN = "learned"
+_LEARNED_KEY_SUFFIX = "learned"
+_LEARNED_STATUSES = (
+    "created", "merged", "revived", "tombstoned", "refused_active", "refused_daily",
+    "ambiguous", "conflict", "duplicate",
+)
+
+
+def _learned_prompt_notes(group_id: str) -> list[dict]:
+    """正式開（mode on）時給提示詞的學習規則；關掉、試運轉或任何錯誤都回 []（不擋回覆）。"""
+    try:
+        import complaint_learning
+
+        if not complaint_learning.prompt_rules_enabled():
+            return []
+        limit = int(complaint_learning.LEARNED_PROMPT_CAP)
+        ttl = int(complaint_learning.LEARNED_TTL_SECONDS)
+    except Exception as exc:
+        logger.warning("learned rules prompt switch failed error_type=%s", type(exc).__name__)
+        return []
+    try:
+        cutoff = int(_time.time()) - ttl
+        with _conn() as c:
+            rows = c.execute(
+                "SELECT rule_id, canonical_rule, occurrence_count, last_seen_at "
+                "FROM correction_rules WHERE group_id=? AND origin=? AND status='active' "
+                "AND occurrence_count>0 AND last_seen_at>=? "
+                "ORDER BY last_seen_at DESC, rule_id DESC LIMIT ?",
+                (group_id, LEARNED_ORIGIN, cutoff, limit),
+            ).fetchall()
+    except Exception as exc:
+        logger.warning("learned rules prompt read failed error_type=%s", type(exc).__name__)
+        return []
+    return [
+        {
+            "note_id": int(r[0]),
+            "kind": "correction",
+            "scenario": "學到的回覆做法",
+            "content": str(r[1]),
+            "created_at": int(r[3]),
+            "last_seen_at": int(r[3]),
+            "source": "learned",
+            "canonical_rule_id": int(r[0]),
+            "occurrence_count": int(r[2]),
+        }
+        for r in rows
+    ]
+
+
+def _retired_or_learned_note_ids(group_id: str) -> set[int]:
+    """舊原話路徑（canonical 關閉）要藏起來的 persona note：學到的規則、撤銷過的規則、重篩停用的舊列。"""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT o.note_id FROM correction_observations o "
+            "LEFT JOIN correction_rules r ON r.group_id=o.group_id AND r.rule_id=o.canonical_rule_id "
+            "WHERE o.group_id=? AND ("
+            " o.observation_id LIKE 'judge:%' OR o.observation_id LIKE 'directive:%' "
+            " OR o.decision='retired_legacy' OR r.origin=? "
+            " OR (r.status='retired' AND EXISTS ("
+            "  SELECT 1 FROM correction_rule_events e WHERE e.group_id=r.group_id "
+            "  AND e.rule_id=r.rule_id AND e.action='retire' AND NOT EXISTS ("
+            "   SELECT 1 FROM correction_rule_events u "
+            "   WHERE u.group_id=e.group_id AND u.reverts_event_id=e.event_id))))",
+            (group_id, LEARNED_ORIGIN),
+        ).fetchall()
+    return {int(r[0]) for r in rows}
+
+
+def _expire_learned_conn(c: sqlite3.Connection, group_id: str, *, now: int, ttl_seconds: int) -> list[int]:
+    """60 天（ttl）沒再出現的學習規則自動退休：記 expire（不是 tombstone），之後再出現可以重新學。"""
+    stale = [
+        int(r[0])
+        for r in c.execute(
+            "SELECT rule_id FROM correction_rules WHERE group_id=? AND origin=? "
+            "AND status='active' AND last_seen_at<?",
+            (group_id, LEARNED_ORIGIN, int(now) - int(ttl_seconds)),
+        ).fetchall()
+    ]
+    for rule_id in stale:
+        c.execute(
+            "UPDATE correction_rules SET status='retired' WHERE group_id=? AND rule_id=?",
+            (group_id, rule_id),
+        )
+        _event_conn(c, group_id, "expire", rule_id=rule_id, payload={"ttl_seconds": int(ttl_seconds)}, created_at=now)
+    return stale
+
+
+def _learned_created_since_conn(c: sqlite3.Connection, group_id: str, since: int) -> int:
+    return int(
+        c.execute(
+            "SELECT COUNT(*) FROM correction_rule_events e JOIN correction_rules r "
+            "ON r.group_id=e.group_id AND r.rule_id=e.rule_id "
+            "WHERE e.group_id=? AND r.origin=? AND e.action IN ('create','revive') AND e.created_at>=?",
+            (group_id, LEARNED_ORIGIN, int(since)),
+        ).fetchone()[0]
+    )
+
+
+def record_learned_rule(
+    group_id: str,
+    observation_id: str,
+    *,
+    rule: str,
+    core_reason: str,
+    category: str,
+    source_message_ids: list[str] | tuple[str, ...] = (),
+    actor_key: str = "",
+    same_as_rule_id: int | None = None,
+    observed_at: int | None = None,
+    now: int | None = None,
+    day_start: int,
+    max_active: int,
+    max_new_per_day: int,
+    ttl_seconds: int,
+) -> dict:
+    """寫入一條判斷器學到的規則（同一個交易裡做完 TTL、上限、tombstone 與合併）。
+
+    ``observation_id`` 是 judge:{訊息id} 或 directive:{訊息id}（重送冪等）。persona note 只存
+    「核心原因＋規則＋來源 id」，不存家人原話。回傳 status：
+    created／merged／revived（60 天退休後又出現）／tombstoned（撤銷過，不復活）／
+    refused_active（啟用中已滿 ``max_active`` 條，拒收並在每日維護回報，不淘汰舊的）／
+    refused_daily（今天已學過 ``max_new_per_day`` 條）／ambiguous／conflict／duplicate。
+    合併到既有規則不算新規則，不受上限影響。
+    """
+    from correction_memory import default_adjudicator
+
+    group = (group_id or "").strip()
+    observation = (observation_id or "").strip()
+    rule_text = (rule or "").strip()
+    if not group or not observation or len(observation) > 240 or not rule_text:
+        raise ValueError("group_id, bounded observation_id and rule are required")
+    current = int(now if now is not None else _time.time())
+    when = int(observed_at or current)
+    sources = [str(s) for s in source_message_ids if s][:6]
+    content = (
+        f"核心原因：{(core_reason or '').strip()[:80]}\n"
+        f"規則：{rule_text[:120]}\n"
+        f"來源：{','.join(sources)}"
+    )[:1600]
+    with _lock, _conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            duplicate = c.execute(
+                "SELECT note_id, canonical_rule_id FROM correction_observations "
+                "WHERE group_id=? AND observation_id=?",
+                (group, observation),
+            ).fetchone()
+            if duplicate is not None:
+                c.execute("COMMIT")
+                return {
+                    "status": "duplicate",
+                    "note_id": int(duplicate[0]),
+                    "rule_id": int(duplicate[1]) if duplicate[1] is not None else None,
+                    "occurrence_count": 0,
+                }
+            _expire_learned_conn(c, group, now=current, ttl_seconds=ttl_seconds)
+            existing = _correction_rule_rows_conn(c, group, origin=LEARNED_ORIGIN)
+            existing_ids = {r["rule_id"] for r in existing}
+
+            decision = "distinct"
+            status = ""
+            rule_id: int | None = None
+            revive_id: int | None = None
+            if same_as_rule_id is not None and int(same_as_rule_id) in existing_ids:
+                decision, status, rule_id = "equivalent", "merged", int(same_as_rule_id)
+            else:
+                key_row = c.execute(
+                    "SELECT rule_id, status FROM correction_rules "
+                    "WHERE group_id=? AND canonical_key=?",
+                    (group, _canonical_key(rule_text, suffix=_LEARNED_KEY_SUFFIX)),
+                ).fetchone()
+                if key_row is not None and _rule_tombstoned_conn(c, group, int(key_row[0])):
+                    decision, status, rule_id = "tombstoned", "tombstoned", int(key_row[0])
+                elif key_row is not None and int(key_row[0]) in existing_ids:
+                    decision, status, rule_id = "equivalent", "merged", int(key_row[0])
+                elif key_row is not None:
+                    revive_id = int(key_row[0])  # 60 天退休的同一條：當成新學到的，照上限
+                else:
+                    try:
+                        verdict = default_adjudicator(existing, rule_text)
+                    except Exception:
+                        verdict = {"decision": "ambiguous"}
+                    picked = str((verdict or {}).get("decision", "ambiguous"))
+                    if picked == "equivalent" and (verdict or {}).get("rule_id") in existing_ids:
+                        decision, status, rule_id = "equivalent", "merged", int(verdict["rule_id"])
+                    elif picked in {"ambiguous", "conflict"}:
+                        decision = status = picked
+                    elif picked != "distinct":
+                        decision = status = "ambiguous"
+            if not status:
+                # 新規則（或退休後又出現）：先看上限；到上限拒收、不淘汰舊的（v2.1 #5，GP2 #5）。
+                if len(existing) >= int(max_active):
+                    decision = status = "refused_active"
+                elif _learned_created_since_conn(c, group, day_start) >= int(max_new_per_day):
+                    decision = status = "refused_daily"
+                elif revive_id is not None:
+                    decision, status, rule_id = "distinct", "revived", revive_id
+                else:
+                    rule_id = _insert_rule_conn(
+                        c, group, rule_text, when, key_suffix=_LEARNED_KEY_SUFFIX, origin=LEARNED_ORIGIN
+                    )
+                    decision, status = "distinct", "created"
+
+            c.execute(
+                "INSERT INTO persona_notes"
+                "(group_id, kind, scenario, content, created_at, source, correction_linked) "
+                "VALUES (?, 'correction', ?, ?, ?, 'organic', 1)",
+                (group, f"學到的回覆做法：{category}"[:120], content, when),
+            )
+            note_id = int(c.execute("SELECT last_insert_rowid()").fetchone()[0])
+            c.execute(
+                "INSERT INTO correction_observations"
+                "(group_id, observation_id, note_id, source_message_id, actor_key, "
+                " scenario, content, candidate_rule, decision, canonical_rule_id, "
+                " match_score, matcher_version, observed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    group, observation, note_id, (sources[0] if sources else observation)[:240],
+                    (actor_key or "")[:128], f"學到的回覆做法：{category}"[:120], content, rule_text,
+                    decision, rule_id, 1.0 if rule_id is not None else 0.0,
+                    _CORRECTION_MATCHER_VERSION, when,
+                ),
+            )
+            occurrence = 0
+            if rule_id is not None:
+                _recompute_rule_conn(c, group, rule_id)
+                occurrence = int(
+                    c.execute(
+                        "SELECT occurrence_count FROM correction_rules WHERE group_id=? AND rule_id=?",
+                        (group, rule_id),
+                    ).fetchone()[0]
+                )
+            action = {
+                "created": "create", "merged": "merge", "revived": "revive",
+            }.get(status, status)
+            _event_conn(
+                c, group, action, rule_id=rule_id, observation_id=observation,
+                payload={"origin": LEARNED_ORIGIN, "category": category, "decision": decision},
+                created_at=current,
+            )
+            c.execute("COMMIT")
+        except Exception:
+            if c.in_transaction:
+                c.execute("ROLLBACK")
+            raise
+    return {"status": status, "note_id": note_id, "rule_id": rule_id, "occurrence_count": occurrence}
+
+
+def list_learned_rules(group_id: str, *, include_retired: bool = False) -> list[dict]:
+    """學到的規則（給判斷器：啟用中的可合併、撤銷過的不要再推出；給測試與工具）。"""
+    sql = (
+        "SELECT r.rule_id, r.canonical_rule, r.status, r.occurrence_count, r.first_seen_at, "
+        "r.last_seen_at, EXISTS (SELECT 1 FROM correction_rule_events e WHERE e.group_id=r.group_id "
+        " AND e.rule_id=r.rule_id AND e.action='retire' AND NOT EXISTS ("
+        "  SELECT 1 FROM correction_rule_events u WHERE u.group_id=e.group_id "
+        "  AND u.reverts_event_id=e.event_id)) "
+        "FROM correction_rules r WHERE r.group_id=? AND r.origin=?"
+    )
+    if not include_retired:
+        sql += " AND r.status='active'"
+    sql += " ORDER BY r.last_seen_at DESC, r.rule_id DESC"
+    with _conn() as c:
+        rows = c.execute(sql, (group_id, LEARNED_ORIGIN)).fetchall()
+    return [
+        {
+            "rule_id": int(r[0]),
+            "rule": str(r[1]),
+            "status": str(r[2]),
+            "occurrence_count": int(r[3]),
+            "first_seen_at": int(r[4]),
+            "last_seen_at": int(r[5]),
+            "tombstoned": bool(r[6]),
+        }
+        for r in rows
+    ]
+
+
+def retire_correction_rules(
+    group_id: str, rule_ids: list[int], *, reason: str, now: int | None = None
+) -> list[int]:
+    """撤銷＝tombstone：status retired＋一筆 retire 事件（不刪資料）；回真的撤銷了的 rule_id。
+
+    jobs/learned_rules.py 不 import memory，寫同一組 SQL（測試確認兩邊撤銷的規則都不會復活）。
+    """
+    current = int(now if now is not None else _time.time())
+    with _lock, _conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            done = _retire_rules_conn(c, group_id, rule_ids, reason=reason, now=current)
+            c.execute("COMMIT")
+        except Exception:
+            if c.in_transaction:
+                c.execute("ROLLBACK")
+            raise
+    return done
+
+
+def _retire_rules_conn(
+    c: sqlite3.Connection, group_id: str, rule_ids, *, reason: str, now: int, origin: str | None = None
+) -> list[int]:
+    """交易裡撤銷（tombstone）：已撤銷的跳過；給 origin 時只動那一類。回真的撤銷了的 rule_id。"""
+    done: list[int] = []
+    for rule_id in dict.fromkeys(int(r) for r in rule_ids):
+        row = c.execute(
+            "SELECT origin FROM correction_rules WHERE group_id=? AND rule_id=?",
+            (group_id, rule_id),
+        ).fetchone()
+        if row is None or (origin is not None and row[0] != origin) or _rule_tombstoned_conn(c, group_id, rule_id):
+            continue
+        c.execute(
+            "UPDATE correction_rules SET status='retired' WHERE group_id=? AND rule_id=?",
+            (group_id, rule_id),
+        )
+        _event_conn(c, group_id, "retire", rule_id=rule_id, payload={"reason": reason[:40]}, created_at=now)
+        done.append(rule_id)
+    return done
+
+
+def unlink_unsent_complaint(group_id: str, message_id: str, *, now: int | None = None) -> list[int]:
+    """抱怨被收回（2026-10-28 實作後審查 F5、F6），同一個交易裡做完：
+
+    1. 含這則訊息的判斷列不再連到規則：rule_id 設 NULL；連過規則或試運轉通過的那幾列結果記 unsent
+       （試運轉報告才不會把收回的算成「會學到」）；這幾列的 shadow 紀錄刪掉。
+    2. 原本連著的學習規則，只退休已經沒有任何其他判斷列連著的（tombstone）：別人的抱怨合併進來的規則、
+       或這則只是合併進別人建立的規則時，都不會因為這則被收回就跟著不見。
+    回真的撤銷了的 rule_id。
+    """
+    current = int(now if now is not None else _time.time())
+    match = "group_id=? AND (complaint_id=? OR instr(complaint_ids, ?)>0)"
+    args = (group_id, str(message_id), json.dumps(str(message_id)))
+    with _lock, _conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            linked = [
+                int(r[0])
+                for r in c.execute(
+                    "SELECT DISTINCT rule_id FROM complaint_judgements WHERE rule_id IS NOT NULL AND " + match,
+                    args,
+                ).fetchall()
+            ]
+            c.execute(
+                "DELETE FROM complaint_shadow_rules WHERE group_id=? AND complaint_id IN ("
+                " SELECT complaint_id FROM complaint_judgements WHERE " + match + ")",
+                (group_id, *args),
+            )
+            c.execute(
+                "UPDATE complaint_judgements SET rule_id=NULL, result='unsent' WHERE " + match
+                + " AND (rule_id IS NOT NULL OR result='shadow_pass')",
+                args,
+            )
+            orphans = [
+                rule_id
+                for rule_id in linked
+                if c.execute(
+                    "SELECT 1 FROM complaint_judgements WHERE group_id=? AND rule_id=? LIMIT 1",
+                    (group_id, rule_id),
+                ).fetchone() is None
+            ]
+            done = _retire_rules_conn(c, group_id, orphans, reason="unsend", now=current, origin=LEARNED_ORIGIN)
+            c.execute("COMMIT")
+        except Exception:
+            if c.in_transaction:
+                c.execute("ROLLBACK")
+            raise
+    return done
 
 
 def backfill_organic_corrections(

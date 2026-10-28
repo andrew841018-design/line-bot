@@ -3511,8 +3511,10 @@ def _handle_event(event) -> None:
         return
 
     # 收回訊息（2026-10-11 爸媽健康）：刪掉那則留言記下的健康紀錄；其他資料照舊。
+    # 2026-10-24 自動學習糾正：收回的抱怨學到的規則退休、還在排隊的判斷丟掉。
     if isinstance(event, UnsendEvent):
         _forget_unsent_health_records(event)
+        _forget_unsent_complaint(event)
         return
 
     # 只處理群組裡的 message
@@ -3590,6 +3592,8 @@ def _handle_event(event) -> None:
         )
         # 爸媽健康（2026-10-11）：每則文字都交給背景抽取；家族主群的爸媽預設會被記（10/17），暫停的不記，重送靠 UNIQUE 冪等。
         _observe_parent_health(event, group_id, msg, sender_user_id)
+        # 自動學習糾正（2026-10-24）：關閉時立刻回；開著時只做便宜的過濾與快照，判斷在背景，不擋回覆。
+        _observe_complaint(event, group_id, msg, sender_user_id)
 
     # ── quota 爆時：非文字內容不排 pending reply ────────────────────────
     # Andrew 2026-06-06 指示取消 pending 回覆機制；File/Audio 在額度爆時
@@ -16690,13 +16694,21 @@ def _try_save_correction(
     sender_user_id: str = "",
     message_id: str = "",
 ) -> None:
-    """如果 user_text 看起來像是在糾正 bot 的行為，存成 persona correction。"""
+    """如果 user_text 看起來像是在糾正 bot 的行為，存成 persona correction。
+
+    2026-10-24 自動學習糾正（v2.1）：「以後不要…」這類指示改走 complaint_learning 同一條管線
+    （同樣的判斷、檢查、上限）；LINE_BOT_COMPLAINT_LEARNING=1 時不再把原話存成規則，shadow 時舊的照存。
+    """
     t = user_text.strip()
     if len(t) < 3 or len(t) > 100:
         return
     if _is_question_like_correction(t):
         return
     if _CORRECTION_DIRECTIVE_RE.match(t) or _CORRECTION_DECLARATIVE_RE.match(t):
+        replaced = _complaint_learning_replaces_capture()
+        _route_correction_directive(group_id, t, sender_user_id, message_id)
+        if replaced:
+            return
         try:
             memory.record_organic_correction_observation(
                 group_id=group_id,
@@ -16717,6 +16729,26 @@ def _try_save_correction(
                 "persona correction save failed without blocking reply: %s",
                 exc,
             )
+
+
+def _complaint_learning_replaces_capture() -> bool:
+    """LINE_BOT_COMPLAINT_LEARNING=1：舊的兩個粗糙擷取不再存原話（2026-10-24；只看 .env）。"""
+    try:
+        import complaint_learning
+
+        return complaint_learning.replaces_old_capture()
+    except Exception:
+        return False
+
+
+def _route_correction_directive(group_id: str, text: str, sender_user_id: str, message_id: str) -> None:
+    """指示交給 complaint_learning（關閉時直接回）；絕不丟例外、不擋回覆。"""
+    try:
+        import complaint_learning
+
+        complaint_learning.observe_directive(group_id, text, sender_user_id, message_id)
+    except Exception as exc:
+        logger.warning("complaint learning directive failed error_type=%s", type(exc).__name__)
 
 
 # ── Organic 糾正偵測（2026-05-08 加）────────────────────────────────────────
@@ -16789,7 +16821,11 @@ def _detect_user_correction(
                      score >= 2 → 視為 correction
     寫進 persona_notes（kind='correction', source='organic'）。
     任何步驟例外都吞掉、回 False，主流程不受影響。
+    2026-10-24：LINE_BOT_COMPLAINT_LEARNING=1 時由 complaint_learning 取代（這裡直接回 False，
+    下面記原文的 log 也不會再走到）；0 與 shadow 時照舊。
     """
+    if _complaint_learning_replaces_capture():
+        return False
     try:
         t = (text or "").strip()
         if len(t) < 2 or len(t) > 200:
@@ -21638,6 +21674,40 @@ def _forget_unsent_health_records(event) -> None:
         parent_health.forget_message(group_id, str(message_id))
     except Exception as exc:
         logger.warning("parent health unsend cleanup failed error_type=%s", type(exc).__name__)
+
+
+def _observe_complaint(event, group_id: str, msg, sender_user_id: str | None) -> None:
+    """咪寶自動學習糾正（2026-10-24）：整個流程在 complaint_learning（關閉時第一行就回，不讀檔、不碰 DB）。"""
+    try:
+        import complaint_learning
+
+        complaint_learning.observe(
+            group_id, msg.id, sender_user_id, msg.text or "",
+            quoted_message_id=getattr(msg, "quoted_message_id", None),
+            event_ts_ms=getattr(event, "timestamp", None),
+        )
+    except Exception as exc:
+        logger.warning("complaint learning observe failed error_type=%s", type(exc).__name__)
+
+
+def _forget_unsent_complaint(event) -> None:
+    """收回訊息：那則抱怨學到的規則退休、還在排隊的判斷丟掉（群組白名單照舊）。"""
+    source = getattr(event, "source", None)
+    unsend = getattr(event, "unsend", None)
+    if not isinstance(source, GroupSource) or unsend is None:
+        return
+    group_id = source.group_id
+    if settings.allowed_group_ids and group_id not in settings.allowed_group_ids:
+        return
+    message_id = getattr(unsend, "message_id", None)
+    if not message_id:
+        return
+    try:
+        import complaint_learning
+
+        complaint_learning.forget_message(group_id, str(message_id))
+    except Exception as exc:
+        logger.warning("complaint learning unsend cleanup failed error_type=%s", type(exc).__name__)
 
 
 def _reply_command_card(

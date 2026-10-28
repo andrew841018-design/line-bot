@@ -75,6 +75,9 @@ os.environ["LINE_BOT_CARD_PAGES_DIR"] = str(
     Path(tempfile.gettempdir()) / f"line_bot_pytest_quarantine_{os.getpid()}_card_pages"
 )
 os.environ.pop("LINE_BOT_EXERCISE_NUDGE", None)  # 2026-10-23 運動提醒：程式預設關，測試不吃 shell 的設定
+# 2026-10-24 自動學習糾正：預設關（舊的糾正擷取照舊），要測的測試自己打開；狀態檔指到不存在的隔離路徑
+# （絕不讀到正式 state/ 的開關檔）。判斷器的模型呼叫由下面的 isolate_complaint_learning 換成丟例外。
+os.environ["LINE_BOT_COMPLAINT_LEARNING"] = "0"
 # 2026-10-17 TikTok 讀取：預設關閉（0 = 不送 Gemini、不下載），要測的測試用假物件自己打開
 # TODO(2026-10-17 D4): 這只關掉讀影片／圖片；沒有替換 yt-dlp 的既有測試仍可能真的連網抓 metadata。
 os.environ["LINE_BOT_TIKTOK_MEDIA_DAILY_CAP"] = "0"
@@ -101,6 +104,7 @@ for _env_name, _leaf in (
     ("LINE_BOT_FACT_LOCK_DIR", "locks"),
     ("LINE_BOT_FACT_HASH_KEY_PATH", "fact_hash.key"),
     ("LINE_FAMILY_KINSHIP_PATH", "no_kinship.json"),  # 2026-10-17：不存在的路徑，絕不讀到正式的角色檔
+    ("LINE_BOT_COMPLAINT_LEARNING_SWITCH", "no_complaint_learning_switch.txt"),  # 2026-10-24：不存在＝不限制
 ):
     os.environ[_env_name] = str(_POST_TEST_DAILY_MEMORY_DIR / _leaf)
 
@@ -484,6 +488,33 @@ def isolate_card_pages(monkeypatch, tmp_path_factory):
     monkeypatch.delenv("LINE_BOT_EXERCISE_NUDGE", raising=False)
     monkeypatch.delenv("LINE_BOT_CARD_PAGE_HEALTH", raising=False)
     monkeypatch.delenv("LINE_BOT_CARD_PAGE_HEALTH_TTL_HOURS", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def isolate_complaint_learning(monkeypatch, tmp_path_factory):
+    """2026-10-24 自動學習糾正：背景 worker 不在測試裡起來（要測就直接呼叫 process_due）；判斷器與驗證的
+    Claude CLI／Gemini 呼叫一律丟例外（要測的測試自己換成假的）；開關預設關、狀態檔指到這個測試自己的
+    不存在路徑；佇列、待判與每則留言的事件紀錄每個測試清空。"""
+    monkeypatch.setenv("LINE_BOT_COMPLAINT_LEARNING", "0")
+    monkeypatch.setenv(
+        "LINE_BOT_COMPLAINT_LEARNING_SWITCH",
+        str(tmp_path_factory.mktemp("complaint_learning") / "complaint_learning_switch.txt"),
+    )
+    try:
+        import complaint_learning
+    except Exception:  # 模組自己壞了：只讓它的測試失敗
+        yield
+        return
+
+    def _no_model(*_args, **_kwargs):
+        raise RuntimeError("tests never call the complaint judge model")
+
+    monkeypatch.setattr(complaint_learning, "_BACKGROUND_ENABLED", False, raising=False)
+    monkeypatch.setattr(complaint_learning, "_claude_json", _no_model, raising=False)
+    monkeypatch.setattr(complaint_learning, "_gemini_json", _no_model, raising=False)
+    complaint_learning.reset_for_tests()
+    yield
+    complaint_learning.reset_for_tests()
 
 
 @pytest.fixture(autouse=True)
