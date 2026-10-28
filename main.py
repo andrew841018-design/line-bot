@@ -270,7 +270,7 @@ async def _app_lifespan(_app: FastAPI):
             stock_picks_module.start_background()
         except Exception as exc:
             logger.warning("stock picks background start failed error_type=%s", type(exc).__name__)
-        # 爸媽健康（2026-10-11）：每天 21:00 後檢查一次異常、私訊 Andrew；啟動失敗只記種類。
+        # 爸媽健康（2026-10-11）：每天 21:00 後檢查一次異常並通知（私訊或家族群組，見 parent_health）；啟動失敗只記種類。
         try:
             import parent_health as _parent_health
 
@@ -7711,7 +7711,7 @@ def _handle_text_message(
         _reply_health(event, group_id, text, health_body)
         return
     # 爸媽健康的緊急字詞（2026-10-11，Andrew 選 4A）：記錄中的家長（家族主群預設，10/17）提到胸痛、跌倒這類，立刻回就醫／119 提醒，
-    # 同時私訊 Andrew。回了就不再往下走；沒回（舊訊息、未來句、30 分鐘內回過）照常路由。
+    # 結果交給 parent_health 通知。回了就不再往下走；沒回（舊訊息、未來句、30 分鐘內回過）照常路由。
     # 放在引用卡片的固定句之前：引用卡片再說「我剛剛跌倒了」也要先回 119。
     if _maybe_reply_parent_red_flag(event, group_id, text):
         return
@@ -21993,7 +21993,7 @@ def _maybe_reply_parent_red_flag(event, group_id: str, text: str) -> bool:
     """記錄中的家長提到緊急狀況時回固定的就醫／119 提醒；回 True＝這則已處理、不再往下走。
 
     判斷（regex＋讀同意表，不叫模型、不連網）在 webhook 鎖裡跑。提醒只用這則的 reply token、
-    不搭到期提醒；送出結果（含靜音、失敗）交給 parent_health 記去重並私訊 Andrew。"""
+    不搭到期提醒；送出結果（含靜音、失敗）交給 parent_health 記去重並通知（私訊或家族群組）。"""
     # 指令（含先點名咪寶再打的「咪寶 /記住 …」）走原本的路由，不當成在講身體狀況。
     if _is_bot_command(text, event.message):
         return False

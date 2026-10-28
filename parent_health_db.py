@@ -7,6 +7,8 @@ webhook 鎖裡的讀不會被背景寫入卡住。
 
 紀錄只存 parent_health_extract 固定詞表裡的標籤與數字讀數，不存留言原文；add_events 寫入前
 再驗一次，不合的丟掉並計數。詞表模組載不進來時一筆都不寫（fail closed）。
+
+2026-10-28：去重紀錄定期清除（purge_alerts，每日迴圈一天一次；白名單以外的種類不動）。
 """
 
 from __future__ import annotations
@@ -438,7 +440,7 @@ def delete_role_events(group_id: str, role: str, *, db_path: Path | str | None =
     return max(deleted, 0)
 
 
-# ── 去重（119 回覆、私訊、每日檢查） ─────────────────────────────────────────
+# ── 去重（119 回覆、私訊、群組通知、每日檢查） ───────────────────────────────
 
 
 def claim_alert(
@@ -509,6 +511,69 @@ def count_alerts(
         (group_id, kind, int(since_ts)),
     )
     return int(rows[0][0]) if rows else 0
+
+
+# ── 去重紀錄定期清除（2026-10-28） ───────────────────────────────────────────
+# Andrew 10/18：「去重紀錄裡的讀數…加上定期清除（例如超過 7 天的就清）」。只清白名單裡的種類；種類用 GLOB 或
+# 等號比對，不用 LIKE（`_` 是萬用字元，'bp_crisis:%' 會比到別的種類）。
+# (回傳與 log 用的前綴, 比對方式, 比對值, 保留天數, 每個 (群組, 種類) 最新一列一律保留)
+_PURGE_RULES: tuple[tuple[str, str, str, int, bool], ...] = (
+    ("bp_crisis", "GLOB", "bp_crisis:*", 7, False),
+    ("glucose_low", "GLOB", "glucose_low:*", 7, False),
+    ("symptom", "GLOB", "symptom:*", 7, False),
+    ("dm", "GLOB", "dm:*", 7, False),
+    ("notice", "GLOB", "notice:*", 7, False),
+    ("med_gap", "=", "med_gap", 7, False),
+    ("med_forgot", "=", "med_forgot", 7, False),
+    ("sleep_bad", "=", "sleep_bad", 7, False),
+    ("exercise_nudge", "=", "exercise_nudge", 7, False),
+    # 119 回覆：safety_replies_7d 和每天 2 則的上限都靠它，多留一天
+    ("reply", "=", "reply", 8, False),
+    # 每日檢查、週分析：status_summary 的 last_daily_check、週分析「今天搶過了沒」看最新一列
+    ("daily_check", "=", "daily_check", 8, True),
+    ("weekly_analysis", "=", "weekly_analysis", 8, True),
+)
+_HAS_NEWER_ROW = (
+    " AND EXISTS (SELECT 1 FROM parent_health_alerts AS newer"
+    " WHERE newer.group_id = parent_health_alerts.group_id AND newer.kind = parent_health_alerts.kind"
+    " AND (newer.sent_at > parent_health_alerts.sent_at"
+    " OR (newer.sent_at = parent_health_alerts.sent_at AND newer.rowid > parent_health_alerts.rowid)))"
+)
+
+
+def purge_alerts(
+    now: float, *, dry_run: bool = False, db_path: Path | str | None = None
+) -> dict[str, int]:
+    """清掉超過保留天數的去重紀錄，回 {種類前綴: 筆數}（種類本身帶讀數或標籤：回傳與 log 一律只用前綴）。
+    保留天數見 _PURGE_RULES：sent_at 早於「現在－保留天數」才清，剛好滿的不清；白名單以外的種類不動。
+    dry_run 只算筆數：不刪、不建表、不拿寫入鎖。真的刪時開 secure_delete（刪掉的內容在檔案裡補零）。"""
+    stamp = int(now)
+    plan = [
+        (
+            prefix,
+            f"kind {match} ? AND sent_at < ?" + (_HAS_NEWER_ROW if keep_latest else ""),
+            (pattern, stamp - days * 86400),
+        )
+        for prefix, match, pattern, days, keep_latest in _PURGE_RULES
+    ]
+    counts = {prefix: 0 for prefix, _where, _params in plan}
+    if dry_run:
+        for prefix, where, params in plan:
+            rows = _read(db_path, f"SELECT COUNT(*) FROM parent_health_alerts WHERE {where}", params)
+            counts[prefix] = int(rows[0][0]) if rows else 0
+        return counts
+    init_db(db_path)
+    with _lock, _conn(db_path) as c:
+        c.execute("PRAGMA secure_delete=ON")
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            for prefix, where, params in plan:
+                counts[prefix] = max(c.execute(f"DELETE FROM parent_health_alerts WHERE {where}", params).rowcount, 0)
+            c.execute("COMMIT")
+        except BaseException:
+            c.execute("ROLLBACK")
+            raise
+    return counts
 
 
 def stats(*, now: float | None = None, db_path: Path | str | None = None) -> dict:
