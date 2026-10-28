@@ -18,20 +18,29 @@ import pytest
 
 import main
 
-# 10/17 報告的三句合成句，加上同結構的陳述句、長文、@、混合訊息。
-NOT_QUERIES = [
+# 10/17 報告的三句合成句：基礎判斷式（_is_calendar_query）到現在都還把它們當成查詢，閘門才是擋住它們的。
+REPORT_SENTENCES = [
     "我之前去北海道的時候，把媽媽的舊外套都整理掉了",
     "上次去花蓮我把爸爸的相機借走了",
     "下週二我會回老家拿東西，有多的紙箱嗎？之前買的那幾個還在嗎",
-    # structure of the real misfires: long forwarded text, @other member / @All, narrative
+]
+# 同結構的陳述句（基礎判斷式一樣會誤判，閘門擋）。
+NARRATIVE_STATEMENTS = [
+    "媽媽之前去台中的時候買了一堆太陽餅",
+    "今天上班之前先去醫院看診，下午再回公司開會",
+]
+# 長文、@別人／@All：真實誤判的結構（長度或 @ 就擋掉）。
+LONG_OR_MENTIONED = [
     "這是一篇很長的轉貼文章" + "，內容講的是以前的人怎麼安排旅行" * 8 + "，之前也有人去過台北",
     "@All 我下週三要回台北，之前買的那箱東西還在嗎",
     "@小明 媽媽之前去高雄的時候買了一堆鳳梨酥",
-    "媽媽之前去台中的時候買了一堆太陽餅",
-    "今天上班之前先去醫院看診，下午再回公司開會",
+]
+# 混合訊息（有排定的行程又帶問句）：基礎判斷式本來就不當查詢，閘門只是再守一道。
+MIXED_MESSAGES = [
     "我10/8要去面試和拿證件。10/7晚上回台北，家裡還有雨傘嗎？",
     "爸爸下週三要回台北，家裡的鑰匙放哪裡嗎？",
 ]
+NOT_QUERIES = REPORT_SENTENCES + NARRATIVE_STATEMENTS + LONG_OR_MENTIONED + MIXED_MESSAGES
 
 QUERIES = [
     "明天有什麼行程？",
@@ -47,13 +56,14 @@ QUERIES = [
 ]
 
 
-@pytest.mark.parametrize("text", NOT_QUERIES)
+@pytest.mark.parametrize("text", REPORT_SENTENCES + NARRATIVE_STATEMENTS)
 def test_the_base_predicate_is_unchanged_for_the_statements_the_gate_catches(text):
     # The gate, not _is_calendar_query / _CALENDAR_TIMING_QUERY_RE, is what blocks these:
-    # other callers still see 「之前／上次」 as a question word.
-    if text.startswith("@") or len(text) > main._CAL_PASSIVE_MAX_CHARS:
-        pytest.skip("rejected by the length/@ check before the predicate matters")
+    # other callers still see 「之前／上次」 as a question word, so the regex is left alone.
+    assert len(text) <= main._CAL_PASSIVE_MAX_CHARS and "@" not in text
     assert main._CALENDAR_TIMING_QUERY_RE.search(text)
+    assert main._is_calendar_query(text)
+    assert not main._calendar_query_passive_ok(text)
 
 
 @pytest.mark.parametrize("text", NOT_QUERIES)

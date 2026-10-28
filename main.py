@@ -1016,10 +1016,17 @@ def _get_explicit_market_quote_reply(
     """
     if not text:
         return None
-    is_quote_request = False
+    # 2026-10-24: the 「暫時無法取得」 notice is for an instrument the text (or the thread it follows)
+    # actually named.  A name lookup that found nothing is ordinary chat -- it goes the normal
+    # route instead of being answered with a fixed failure sentence.
+    symbol_detected = False
     try:
         import stock_quote
         is_quote_request = stock_quote.should_try_contextual_quote(
+            text,
+            context=context,
+        )
+        symbol_detected = is_quote_request and stock_quote.has_detected_symbol(
             text,
             context=context,
         )
@@ -1029,7 +1036,7 @@ def _get_explicit_market_quote_reply(
         quote = stock_quote.get_contextual_quotes_text(text, context=context)
         if quote:
             return quote
-        if is_quote_request:
+        if symbol_detected:
             return (
                 "【市場報價｜暫時無法取得】\n"
                 "目前無法在回覆時限內取得可靠報價，沒有交給模型猜價格。"
@@ -1038,7 +1045,7 @@ def _get_explicit_market_quote_reply(
         return None
     except Exception as e:
         logger.info("explicit market quote deterministic path failed: %s", e)
-        if is_quote_request:
+        if symbol_detected:
             return (
                 "【市場報價｜暫時無法取得】\n"
                 "目前無法在回覆時限內取得可靠報價，沒有交給模型猜價格。"

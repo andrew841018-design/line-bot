@@ -293,9 +293,73 @@ _LOOKUP_STRIP_RE = re.compile(
     r"(?:美股|台股|臺股|韓股|日股|港股|韓國|日本|香港)|"
     r"(?:個股|股票|股價|現股|指數|ADR|美國存託憑證|期貨|近月|夜盤)|"
     r"(?:的)?(?:價格|報價|現價|市價|漲跌|漲幅|跌幅)|"
-    r"(?:是多少|多少錢|多少|幾塊|幾元|怎麼樣|如何|呢|嗎)",
+    r"(?:是多少錢|是多少|多少錢|多少|幾塊|幾元|怎麼樣|如何|呢|嗎)",
     re.IGNORECASE,
 )
+
+# 2026-10-24 (PLAN B8): a topic word such as 股票／指數／期貨 is not a request for a price, and what
+# is left of a chat sentence once the polite words are stripped is not an instrument name
+# (「咪寶，股票部分你算很久嗎」 was looked up as 「部分你算很久」 and answered 【市場報價｜暫時無法取得】;
+# every such fragment also went to Yahoo's search).  A name lookup therefore needs ALL of:
+#   1. an explicit price ask somewhere in the text;
+#   2. the name written IN FRONT of the topic word (三星電子股價多少、Samsung Electronics 股價、
+#      日經指數現在多少) and nothing but ask words after it -- 「股價跌了很多」「股價崩了」 name nothing;
+#   3. a name-shaped remainder: one to four latin words, or one run of 2-8 CJK characters that may
+#      carry a single latin word;
+#   4. no chat words, no pronoun/demonstrative start (「他的股價」「這家公司股價」), and no family alias
+#      or kinship term -- those never go to a search provider.
+# Trade-off, on purpose: 「名稱＋股票」 without any price word (「三星電子股票」) is not a quote request.
+# H5 (line_bot.md 2026-10-05): these are plain word lists applied once, none under a repeat.
+_LOOKUP_PRICE_ASK_RE = re.compile(
+    r"股價|報價|價格|現價|市價|即時|漲跌|漲幅|跌幅|多少(?!\s*天)|幾塊|幾元|\bquote\b|\bprice\b",
+    re.IGNORECASE,
+)
+_LOOKUP_SENTENCE_WORD_RE = re.compile(
+    r"部分|的事|怎麼|為什麼|要不要|是不是|會不會|很久|不太|晚點|再說|"
+    # time words and opinion verbs open a remark, not a company name
+    r"最近|近期|昨天|前天|明天|上週|上次|之前|以前|剛剛|剛才|今年|去年|明年|"
+    r"覺得|認為|感覺|知道|聽說|買的|賣的"
+)
+_LOOKUP_NOT_A_NAME_START_RE = re.compile(r"[我你妳他她它咱這哪]|那(?:支|檔|家|間|個|隻|些|幾)|有人|大家")
+_LOOKUP_NAME_SHAPE_RE = re.compile(
+    r"(?:(?:[A-Za-z0-9][A-Za-z0-9&.\-']*|&)(?: (?:[A-Za-z0-9][A-Za-z0-9&.\-']*|&)){0,3}"
+    r"|[\u4e00-\u9fff]{2,8} ?(?:[A-Za-z0-9][A-Za-z0-9&.\-']*)?)"
+)
+# What may trail an ask after the topic word without turning it into chat: sentence-final
+# particles, thanks, and the English twins of 現在／今天／最新／請.
+_LOOKUP_TAIL_FILLER_RE = re.compile(
+    r"[啊喔哦啦吧呀耶囉哈]|謝謝|感謝|拜託|麻煩了|\b(?:now|today|currently|current|latest|please|thanks)\b",
+    re.IGNORECASE,
+)
+# Kinship words only (multi-character on purpose: 公／婆／哥／弟 alone sit inside company names).
+# Family NAMES are never written here (this repo is public): they are read from the local alias
+# configuration when a query is checked.
+_KINSHIP_RE = re.compile(
+    r"爸爸|媽媽|爸比|媽咪|老爸|老媽|阿爸|阿母|阿公|阿嬤|阿媽|阿姨|爺爺|奶奶|外公|外婆|"
+    r"哥哥|姊姊|姐姐|弟弟|妹妹|老公|老婆|兒子|女兒|孫子|孫女|叔叔|伯伯|舅舅|姑姑|嬸嬸|嫂嫂|"
+    r"姊夫|姐夫|妹夫|岳父|岳母|公公|婆婆|家人|親戚|表哥|表姊|表姐|表弟|表妹|堂哥|堂姊|堂姐|堂弟|堂妹|"
+    r"大哥|二哥|大姊|大姐"
+)
+
+
+def _names_a_family_member(query: str) -> bool:
+    """True when ``query`` carries a kinship word or a configured family alias.
+
+    Such text must never reach a search provider.  The aliases come from the local configuration
+    at call time (``line_mentions.configured_family_aliases``); if that cannot be read the answer
+    is True -- privacy matters more than availability for a name lookup nobody has to see fail.
+    """
+    if _KINSHIP_RE.search(query):
+        return True
+    try:
+        import line_mentions
+
+        aliases = line_mentions.configured_family_aliases()
+    except Exception:
+        return True
+    folded = query.casefold()
+    return any(len(alias) >= 2 and alias.casefold() in folded for alias in aliases if isinstance(alias, str))
+
 
 _ALLOWED_LOOKUP_QUOTE_TYPES = {"EQUITY", "ETF", "INDEX", "FUTURE"}
 _INDEX_FUTURE_MAP = {
@@ -684,15 +748,39 @@ def detect_symbols(text: str) -> list[str]:
     return symbols[:limit]
 
 
+def _lookup_words(value: str) -> str:
+    """What is left of ``value`` once the polite and ask words are stripped (single spaces)."""
+    value = _LOOKUP_STRIP_RE.sub(" ", value)
+    value = re.sub(r"[？?！!。；;，,：:（）()\[\]{}]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
 def _extract_lookup_query(text: str) -> str:
-    """Extract a bounded company/instrument name for Yahoo symbol search."""
+    """Extract a bounded company/instrument name for Yahoo symbol search; '' when there is none.
+
+    Only a real price question about a name qualifies (see the rules above ``_LOOKUP_PRICE_ASK_RE``):
+    chat that merely mentions 股票／股價／指數 must not become a search query.
+    """
     text = strip_link_tokens(text)
-    if not text or not _NAME_LOOKUP_CONTEXT_RE.search(text):
+    if not text:
         return ""
-    query = _LOOKUP_STRIP_RE.sub(" ", text)
-    query = re.sub(r"[？?！!。；;，,：:（）()\[\]{}]+", " ", query)
-    query = re.sub(r"\s+", " ", query).strip()
+    topic = _NAME_LOOKUP_CONTEXT_RE.search(text)
+    if topic is None or not _LOOKUP_PRICE_ASK_RE.search(text):
+        return ""
+    # After the topic word only ask words may follow (多少、現在、怎麼樣、呢、嗎 ...).
+    tail = _LOOKUP_TAIL_FILLER_RE.sub(" ", _NAME_LOOKUP_CONTEXT_RE.sub(" ", text[topic.start():]))
+    if _lookup_words(tail):
+        return ""
+    query = _lookup_words(text[:topic.start()])
+    query = re.sub(r"\s*的$", "", query)  # 「星展銀行的股價」: the possessive is not part of the name
     if not query or len(query) > 80 or _LOOKUP_NO_TARGET_RE.fullmatch(query):
+        return ""
+    if (
+        _LOOKUP_SENTENCE_WORD_RE.search(query)
+        or _LOOKUP_NOT_A_NAME_START_RE.match(query)
+        or not _LOOKUP_NAME_SHAPE_RE.fullmatch(query)
+        or _names_a_family_member(query)
+    ):
         return ""
     return query
 
@@ -719,6 +807,8 @@ def _search_yahoo_symbols(
     chain.  Unsupported instruments and malformed symbols fail closed.
     """
     if not query or timeout_s <= 0 or max_symbols <= 0:
+        return []
+    if _names_a_family_member(query):  # 2026-10-24: the one place text leaves for a search provider
         return []
     try:
         result = yf.Search(
@@ -2709,6 +2799,14 @@ def should_try_contextual_quote(text: str, *, context: list | None = None) -> bo
         _contextual_quote_symbols(text or "", context=context)
         or _extract_lookup_query(text or "")
     )
+
+
+def has_detected_symbol(text: str, *, context: list | None = None) -> bool:
+    """True when the text names an instrument (a ticker, a known name, an index) or is a
+    follow-up that inherits one from ``context``.  No network, no name search: a name that
+    only a Yahoo search might resolve does not count -- that is how a failed lookup is told
+    apart from a failed quote (2026-10-24: only the latter earns 「暫時無法取得」)."""
+    return bool(_contextual_quote_symbols(text or "", context=context))
 
 
 def _looks_like_non_quote_countdown(text: str) -> bool:

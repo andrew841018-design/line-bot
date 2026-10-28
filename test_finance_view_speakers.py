@@ -201,6 +201,18 @@ def test_the_dead_display_helpers_are_gone():
         assert not hasattr(main, name), name
 
 
+def test_the_one_off_announcement_script_no_longer_advertises_or_pushes(capsys):
+    # announce_finance_view.py used to push 「家族財經觀點追蹤器上線」 with the /觀點 usage.  Nothing
+    # schedules it, but a manual re-run must not put a dead command in front of the family.
+    import announce_finance_view as announce
+
+    assert not hasattr(announce, "MSG") and not hasattr(announce, "push_text")
+    assert announce.main() == 1
+    out = capsys.readouterr().out
+    assert announce.RETIRED_NOTICE in out
+    assert "/觀點" not in out
+
+
 # ── burst 不再啟動抽取（三個出口）────────────────────────────────────────────
 
 _SHARED = "synthetic burst text"
