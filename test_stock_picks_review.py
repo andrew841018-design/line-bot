@@ -18,6 +18,7 @@ import socket
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -449,6 +450,31 @@ def test_now_is_refused_without_dry_run_or_explicit_test_dirs(monkeypatch, tmp_p
     argv = ["--now", str(fx.NOW)] + [arg.format(**names) for arg in extra]
     assert runner.main(argv) == runner.EXIT_CONFIG
     assert list(tmp_path.iterdir()) == []  # 什麼都沒建
+
+
+@pytest.mark.skipif(not os.path.isdir(str(runner.BASE).upper()), reason="檔案系統分大小寫：換大小寫就是另一個路徑")
+def test_now_guard_is_not_fooled_by_another_spelling_of_the_same_dir(monkeypatch, tmp_path):
+    """macOS 預設大小寫不分：換大小寫的正式路徑一樣要擋（審查 impl round2 N2，用 samefile 比 inode）。"""
+    _forbid_running(monkeypatch)
+    argv = ["--now", str(fx.NOW), "--bot-dir", str(runner.BASE).upper(), "--maintenance-dir", str(tmp_path / "m")]
+    assert runner.main(argv) == runner.EXIT_CONFIG
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_last_run_counts_recent_invalid_spools(ready):
+    """壞 spool 只讓看到它的那一輪失敗；近 7 天移到 done/*.invalid 的檔數放進 last_run，給每日維護看（round2 N1）。"""
+    assert runner.main(["--now", str(fx.NOW), "--bot-dir", str(ready.bot_dir),
+                        "--maintenance-dir", str(ready.maintenance)]) == runner.EXIT_OK
+    assert _last_run(ready)["spool_invalid_7d"] == 0
+    done = ready.bot_dir / "state" / "stock_picks_review" / "spool" / "done"
+    done.mkdir(exist_ok=True)
+    (done / "tw_ai-2026-10-28-1.json.invalid").write_text("{}")
+    old = done / "tw_ai-2026-10-01-1.json.invalid"
+    old.write_text("{}")
+    os.utime(old, (time.time() - 8 * 86400, time.time() - 8 * 86400))
+    assert runner.main(["--now", str(fx.NOW + 1800), "--bot-dir", str(ready.bot_dir),
+                        "--maintenance-dir", str(ready.maintenance)]) == runner.EXIT_OK
+    assert _last_run(ready)["spool_invalid_7d"] == 1
 
 
 def test_now_with_dry_run_or_explicit_test_dirs_runs(ready, capsys):

@@ -1130,8 +1130,9 @@ def import_spools(ctx, conn, committed: dict) -> dict:
     spool 一律當不可信輸入（大小上限、只收自己的一般檔、strict_loads、spool_version）：不合格的移到 done/<名>.invalid。
     一檔一檔各自 try：寫入或搬檔失敗記 errors 與第一個例外類別（error_type）；寫不進 DB 的移到 done/<名>.invalid
     （移不走就留著，下一輪再試），接著處理下一檔，一個壞檔不會卡住整個佇列。有 errors 或 invalid 時 status＝error
-    （pool_stage 再把它升成階段的 error）：hook 的格式和這裡對不上時，每一輪都會有 invalid、連續失敗就發短訊，
-    不會默默一直退回簡版。匯入的留在 done/，保留 30 天。"""
+    （pool_stage 再把它升成階段的 error）。壞檔在那一輪就移走，所以 hook 的格式和這裡對不上時，只會是零星的單輪
+    失敗（AI 一天只 commit 幾次），湊不到連續 3 輪的短訊；看的是 last_run 的 spool_invalid_7d（近 7 天移到
+    done/*.invalid 的檔數）與每日維護，不會默默一直退回簡版。匯入的留在 done/，保留 30 天。"""
     spool = ctx.paths.spool
     counts: dict[str, Any] = {"status": "ok", "dir": spool_dir_state(spool), "new": 0, "replaced": 0, "exists": 0,
                               "unmatched": 0, "invalid": 0, "errors": 0}

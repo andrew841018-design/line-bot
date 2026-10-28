@@ -492,6 +492,25 @@ def _sizes(paths: Paths) -> dict:
     return out
 
 
+SPOOL_INVALID_WINDOW_S = 7 * 86400.0
+
+
+def _spool_invalid_recent(paths: Paths) -> Optional[int]:
+    """近 7 天被移到 spool/done/*.invalid 的檔數（只數檔名與時間，不讀內容）。壞 spool 只讓看到它的那一輪失敗、
+    之後就移走了；hook 的格式漂移時是零星的單輪失敗、湊不到連續 3 輪，所以另外把這個數字放進 last_run 給每日維護看。
+    讀不了回 None。"""
+    done = paths.spool / "done"
+    cutoff = time.time() - SPOOL_INVALID_WINDOW_S  # 檔案年齡看真實時間
+    try:
+        with os.scandir(done) as entries:
+            return sum(1 for e in entries if e.name.endswith(".invalid")
+                       and e.is_file(follow_symlinks=False) and e.stat(follow_symlinks=False).st_mtime >= cutoff)
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        return None
+
+
 def _first_failure(stages: dict) -> tuple[str, str]:
     for name, result in stages.items():
         status = result.get("status") if isinstance(result, dict) else None
@@ -614,6 +633,7 @@ def run_locked(paths: Paths, *, now: float, stages: Sequence[Stage] = DEFAULT_ST
         "last_success_at": previous.get("last_success_at") if failed else now,
         "last_t": pool_result.get("last_t") if isinstance(pool_result.get("last_t"), dict) else previous.get("last_t"),
         "sizes": _sizes(paths),
+        "spool_invalid_7d": _spool_invalid_recent(paths),
     }
     if failed and failures >= NOTE_AFTER_FAILURES:
         stage, error = _first_failure(results)
@@ -796,10 +816,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 
 def _same_dir(a: Path, b: Path) -> bool:
+    """同一個目錄嗎：用 samefile 比 inode（macOS 預設大小寫不分，還有 /System/Volumes/Data 的 firmlink，比字串會被
+    繞過）。其中一邊不存在＝不是同一個；其他判斷不了的情況當作是正式路徑（拒絕）。"""
     try:
-        return a.resolve() == b.resolve()
-    except (OSError, RuntimeError):
-        return True  # 判斷不了就當作是正式路徑（拒絕）
+        return os.path.samefile(a, b)
+    except FileNotFoundError:
+        return False
+    except (OSError, RuntimeError, ValueError):
+        return True
 
 
 def now_allowed(args: argparse.Namespace) -> bool:
