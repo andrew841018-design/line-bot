@@ -27,8 +27,10 @@ from zoneinfo import ZoneInfo
 
 __all__ = [
     "Finding",
+    "Heard",
     "analyze",
     "card_lines",
+    "last_heard",
     "readings_summary",
     "urgent_readings",
     "urgent_dm_text",
@@ -94,6 +96,18 @@ class Finding:
     advice: str
     dm: str
     order: tuple = ()  # 同 rank 時的次序（症狀天數多的在前）
+
+
+@dataclass(frozen=True)
+class Heard:
+    """分析卡「最近聽到的」一類（2026-10-23）：最近一次聽到是哪天、哪個標籤（讀數另帶數字）、距今天幾天、
+    近 14 天（D-13..D）有幾天提到。"""
+
+    day: date
+    item: str
+    value: str
+    days_ago: int
+    days_14: int
 
 
 # ── 小工具 ──────────────────────────────────────────────────────────────────
@@ -423,6 +437,44 @@ def analyze(
         add("good_diet", GOOD, 92, f"有在{label}", "", f"👍 有在{label}")
 
     return sorted(found, key=lambda f: (f.rank, f.order))
+
+
+def _valid_reading(item, value) -> bool:
+    if item == _BP:
+        return _parse_bp(value) is not None
+    bounds = {_GLUCOSE: _GLUCOSE_RANGE, _HEART: _HEART_RANGE, _WEIGHT: _WEIGHT_RANGE}.get(item)
+    return bounds is not None and _parse_tenths(value, bounds) is not None
+
+
+def last_heard(rows, category: str, today: date, *, items=None) -> Heard | None:
+    """最近一次聽到某一類是哪天（2026-10-23，分析卡「最近聽到的」、總覽卡運動列的「上次」）。
+
+    rows：parent_health._analysis_rows（180 天內、這次開始記錄以來；呼叫端決定範圍，不是 _summary 的 7 天）。
+    items：只算這些標籤（吃藥只算「吃藥」，不算忘了吃藥、停藥）；None＝這一類全部。
+    紅旗列（flag 不空）一律不算；讀數標籤（血壓…）只算有合格讀數的列（症狀、緊急字詞不會被當成量了血壓）。
+    今天以後的列不算。沒有回 None。只說「上次聽到」：沒聽到不等於沒做，不從這裡推論沒做。"""
+    wanted = None if items is None else frozenset(items)
+    picked = []
+    for row in rows or ():
+        if not isinstance(row, dict) or row.get("category") != category or row.get("flag"):
+            continue
+        item = row.get("item")
+        if wanted is not None and item not in wanted:
+            continue
+        day = _row_day(row)
+        if day is None or day > today:
+            continue
+        if item in _READING_LABELS and not _valid_reading(item, row.get("value")):
+            continue
+        picked.append(row)
+    latest = _latest(picked)
+    if latest is None:
+        return None
+    day = _row_day(latest)
+    start = today - timedelta(days=13)
+    days_14 = len({_row_day(row) for row in picked if _row_day(row) >= start})
+    value = latest.get("value") if isinstance(latest.get("value"), str) else ""
+    return Heard(day, str(latest.get("item") or ""), value, (today - day).days, days_14)
 
 
 def card_lines(findings, cap: int = 3) -> tuple[list[Finding], int]:

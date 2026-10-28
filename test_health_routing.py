@@ -404,6 +404,31 @@ def test_help_lists_the_health_commands_without_mentions():
     assert "@" not in text and "＠" not in text
 
 
+def test_help_mentions_the_health_large_print_page_only_while_its_switch_is_on(monkeypatch):
+    """爸媽健康卡的大字版網頁關著時沒有按鈕，/help 不能說有（2026-10-25 審查 GP1 #7）；其他卡的說明不受影響。"""
+    import card_pages
+
+    card_line = "盤勢卡、爸媽健康卡最下面的按鈕"
+    page_line = "爸媽健康卡的網頁比較快失效，刪除紀錄或暫停時也會清掉"
+    off = main._help_text()  # 測試環境預設整個網頁功能關著
+    assert card_line not in off and page_line not in off and "盤勢卡最下面的按鈕" in off
+    assert off == main._HELP_TEXT
+    monkeypatch.setenv(card_pages.ENABLED_ENV, "1")
+    on = main._help_text()
+    assert card_line in on and page_line in on
+    assert on.index("網址過幾天會換") < on.index(page_line) < on.index("【其他】")
+    monkeypatch.setenv(card_pages.HEALTH_ENV, "0")  # 只關健康頁
+    only_health_off = main._help_text()
+    assert card_line not in only_health_off and page_line not in only_health_off
+    assert "盤勢卡最下面的按鈕" in only_health_off and "網址過幾天會換" in only_health_off
+    monkeypatch.delenv(card_pages.HEALTH_ENV)
+    monkeypatch.setenv(card_pages.ENABLED_ENV, "0")  # 整個網頁功能關掉
+    assert main._help_text() == off
+    monkeypatch.setattr(main, "card_pages", None)  # 模組壞了：當作關
+    monkeypatch.setenv(card_pages.ENABLED_ENV, "1")
+    assert main._help_text() == off
+
+
 # ── 週報 ─────────────────────────────────────────────────────────────────────
 def test_weekly_section_is_appended_but_not_archived(monkeypatch, fake_health):
     import weekly_summary
@@ -508,14 +533,113 @@ def test_real_overview_card_goes_out_through_the_validated_card_path():
     add.assert_not_called()
 
 
-def test_health_cards_never_ask_for_a_large_print_page(monkeypatch):
-    """2026-10-17 字卡大字版只給股票、FCN：健康卡是家人健康紀錄，不能變成拿到連結就看得到的網頁。"""
-    page = MagicMock(side_effect=AssertionError("health cards must not become web pages"))
+def test_health_cards_ask_for_a_large_print_page_made_from_their_page_version(monkeypatch):
+    """2026-10-23 反轉 10/17 的排除（Andrew：「健康字卡也新增大字的網頁連結」）：健康卡也要網頁，
+    但只交出 parent_health 組的網頁版（page_card），不是 LINE 卡本身。"""
+    page = MagicMock(side_effect=lambda card, alt_text, *, page_card=None: card)
     monkeypatch.setattr(main, "_with_card_page", page)
     reply, _cancel, _add = _routed("/健康")
     args, kwargs = reply.call_args
     assert args[1].startswith("爸媽健康卡：") and kwargs["flex_card"] is not None
-    page.assert_not_called()
+    page.assert_called_once()
+    card, alt = page.call_args.args
+    page_card = page.call_args.kwargs["page_card"]
+    assert alt == args[1] and isinstance(page_card, dict) and page_card is not card
+
+
+def test_a_fake_reply_without_a_page_version_still_sends_its_card(fake_health, health_pages):
+    card = {
+        "type": "bubble",
+        "body": {"type": "box", "layout": "vertical", "contents": [{"type": "text", "text": "爸媽健康"}]},
+    }
+    fake_health.reply = SimpleNamespace(  # 沒有 page_card 這一欄（停用版、舊的假 reply）
+        text=None, card=card, alt_text="爸媽健康卡：近 7 天紀錄（點開看）", fallback_text="爸媽健康：暫時無法回覆，請稍後再試"
+    )
+    reply, _cancel, _add = _routed("/健康")
+    assert reply.call_args.kwargs["flex_card"] == card
+    assert not health_pages.dir.exists() or not list(health_pages.dir.iterdir())
+
+
+@pytest.fixture
+def health_pages(tmp_path, monkeypatch):
+    """真的 parent_health＋大字版網頁打開（假 tunnel 檔、暫存目錄）；家人都是合成別名，爸媽 20 天前開始記錄。"""
+    import json
+    import time
+
+    import card_pages
+    import parent_health_db
+
+    tunnel = tmp_path / "tunnel_url.txt"
+    tunnel.write_text("https://quiet-river-1234.trycloudflare.com\n", encoding="utf-8")
+    tunnel.chmod(0o600)
+    monkeypatch.setattr(card_pages, "TUNNEL_URL_FILE", str(tunnel))
+    monkeypatch.setenv(card_pages.ENABLED_ENV, "1")
+    monkeypatch.setenv(card_pages.DIR_ENV, str(tmp_path / "card_pages"))
+    monkeypatch.setattr(main.settings, "bot_muted", False)
+    aliases = tmp_path / "user_aliases.json"
+    aliases.write_text(json.dumps({"U_DAD": "爸爸", "U_MOM": "媽媽", "U_KID": "成員甲"}, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setenv("LINE_USER_ALIASES_PATH", str(aliases))
+    now = time.time()
+    for role, uid in (("爸爸", "U_DAD"), ("媽媽", "U_MOM")):
+        parent_health_db.set_consent("G_TEST", role, "on", user_id=uid, changed_by=uid, now=now - 20 * 86400)
+    finding = SimpleNamespace(role="爸爸", category="exercise", item="散步", value="", flag="")
+    parent_health_db.add_events(  # 家人回報的：LINE 卡寫「成員甲回報」、網頁寫「家人回報」
+        "G_TEST", [finding], message_id="MSG_WALK", reporter_user_id="U_KID", event_ts=now - 3600, source="chat", now=now
+    )
+    return SimpleNamespace(dir=tmp_path / "card_pages" / "health")
+
+
+def _page_link(card) -> str:
+    links = [node["action"]["uri"] for node in card["footer"]["contents"]
+             if isinstance(node.get("action"), dict) and node["action"].get("type") == "uri"]
+    assert len(links) == 1 and links[0].count("#") == 0  # 單一 bubble：沒有 #bN
+    return links[0]
+
+
+def test_every_health_card_gets_a_large_print_page_without_family_names(health_pages):
+    from fastapi.testclient import TestClient
+
+    client = TestClient(main.app)
+    for text, on_card in (("/健康", "爸爸"), ("/健康 爸爸", "（成員甲回報）"), ("/健康 分析", "私訊 Andrew")):
+        reply, _cancel, add = _routed(text)
+        card = reply.call_args.kwargs["flex_card"]
+        assert on_card in str(card), text  # LINE 卡照舊
+        response = client.get("/card/" + _page_link(card).rsplit("/", 1)[1])
+        assert response.status_code == 200, text
+        assert "成員甲" not in response.text and "Andrew" not in response.text, text
+        assert response.text.count('<section class="card"') == 1  # 和卡片一樣一張 bubble
+        add.assert_not_called()
+    detail = client.get("/card/" + _page_link(_routed("/健康 爸爸")[0].call_args.kwargs["flex_card"]).rsplit("/", 1)[1])
+    assert "（家人回報）" in detail.text
+    assert len(list(health_pages.dir.glob("*.html"))) == 4
+
+
+def test_deleting_pausing_or_unsending_removes_the_health_pages(health_pages):
+    def pages():
+        return list(health_pages.dir.glob("*.html"))
+
+    import time
+    from types import SimpleNamespace
+
+    import parent_health_db
+
+    _routed("/健康")
+    assert pages()
+    _routed("/健康 刪除", quoted="MSG_OTHER", raw_row=("U_KID", "示意"))
+    assert pages()  # 那則留言沒有健康紀錄、沒刪到東西：不動還有效的頁（任何家人都能打這個指令；2026-10-25 審查）
+    walk = SimpleNamespace(role="媽媽", category="exercise", item="散步", value="", flag="")
+    parent_health_db.add_events(
+        "G_TEST", [walk], message_id="MSG_QUOTED", reporter_user_id="U_MOM", event_ts=time.time() - 600,
+        source="chat", now=time.time(),
+    )
+    _routed("/健康 刪除", quoted="MSG_QUOTED", raw_row=("U_KID", "示意"))  # 真的刪到紀錄才清
+    assert pages() == []
+    _routed("/健康")
+    _handle(_unsend_event(message_id="MSG_WALK"))  # 收回那則：刪到紀錄才清
+    assert pages() == []
+    _routed("/健康")
+    _routed("/健康 暫停 爸爸", user_id="U_KID")
+    assert pages() == []
 
 
 def test_every_health_card_button_routes_to_the_health_command():

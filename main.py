@@ -104,6 +104,7 @@ except Exception as _card_pages_error:  # noqa: BLE001
 from correction_memory import ORGANIC_CORRECTION_PREFIXES, is_question_like
 import feedback_collector
 import gemini_client
+import line_errors
 import line_mentions
 import tiktok_media
 import memory
@@ -275,6 +276,43 @@ if card_pages is not None:
             "card_pages router unavailable error_type=%s", type(_card_router_error).__name__
         )
 
+# 2026-10-23（PLAN A A1 #4、GP2 N5）：大字版網址的 token 拿到就看得到頁面（健康頁有讀數），不進 log。
+# 遮掉 /card/ 後面那一段（被截斷的半個 token、百分比編碼的也遮）；只用一種字元類，線性。
+_CARD_PATH_LOG_RE = re.compile(r"/card/[A-Za-z0-9_%-]+")
+
+
+def _redact_card_paths(text: str) -> str:
+    return _CARD_PATH_LOG_RE.sub("/card/<redacted>", text) if "/card/" in text else text
+
+
+class _CardTokenAccessLogFilter(logging.Filter):
+    """uvicorn.access 的 filter：只改路徑那一個參數（uvicorn 0.32 的 AccessFormatter 固定拆 5 個 args），
+    不改 msg；看不懂的 record 一律原樣放行。舊 log 不動。"""
+
+    marker = "line_bot_card_token_redactor"  # 重複 import（測試、reload）認得出已經裝過
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            args = record.args
+            if isinstance(args, tuple) and len(args) == 5 and isinstance(args[2], str) and "/card/" in args[2]:
+                record.args = (*args[:2], _redact_card_paths(args[2]), *args[3:])
+        except Exception:  # noqa: BLE001 - log 一定要放行
+            pass
+        return True
+
+
+def _install_card_token_log_filter() -> None:
+    """main import 時呼叫一次；已經裝過（同一個 logger 上有同標記的 filter）就不再加。失敗只是沒遮。"""
+    try:
+        access = logging.getLogger("uvicorn.access")
+        if not any(getattr(f, "marker", None) == _CardTokenAccessLogFilter.marker for f in access.filters):
+            access.addFilter(_CardTokenAccessLogFilter())
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger("line_bot").warning("card token log filter not installed error_type=%s", type(exc).__name__)
+
+
+_install_card_token_log_filter()
+
 # Optional jobs router (n8n / external scheduler trigger surface).
 # Feature flag: JOBS_ROUTES_ENABLED=1 enables /jobs/* endpoints.
 if os.getenv("JOBS_ROUTES_ENABLED") == "1":
@@ -358,6 +396,16 @@ _reply_mention_targets_by_token: dict[str, list] = {}
 
 _inbound_reply_lock = threading.Lock()
 _inbound_reply_by_token: dict[str, tuple[str, tuple[str, ...], float]] = {}
+# 2026-10-24: an entry has to outlive the longest processing lease (media: 300 s).  `_reply`
+# finds the inbound event it answers through this registry (the send fence below), and a slow
+# run is exactly the one that reaches the push fallback.
+_INBOUND_REPLY_REGISTRY_TTL_SECONDS = 600
+# Where each reply token led (group, message ids), *kept after the reply was accepted*.  The
+# registry above forgets a token once its reply succeeded; a second run of the same inbound
+# event (the lease ran out while the first was still working) that reaches `_reply` afterwards
+# must still find its way to the event's row and see that it was answered.
+_inbound_ids_by_token: dict[str, tuple[str, tuple[str, ...], float]] = {}
+_INBOUND_IDS_BY_TOKEN_MAX = 1024
 
 
 def _register_inbound_reply_batch(
@@ -378,11 +426,21 @@ def _register_inbound_reply_batch(
         stale = [
             token
             for token, (_, _, seen_at) in _inbound_reply_by_token.items()
-            if now - seen_at > 180
+            if now - seen_at > _INBOUND_REPLY_REGISTRY_TTL_SECONDS
         ]
         for token in stale:
             _inbound_reply_by_token.pop(token, None)
         _inbound_reply_by_token[str(reply_token)] = (group_id, ids, now)
+        _inbound_ids_by_token.pop(str(reply_token), None)
+        _inbound_ids_by_token[str(reply_token)] = (group_id, ids, now)
+        for token in [
+            token
+            for token, (_, _, seen_at) in _inbound_ids_by_token.items()
+            if now - seen_at > _INBOUND_REPLY_REGISTRY_TTL_SECONDS
+        ]:
+            _inbound_ids_by_token.pop(token, None)
+        while len(_inbound_ids_by_token) > _INBOUND_IDS_BY_TOKEN_MAX:
+            _inbound_ids_by_token.pop(next(iter(_inbound_ids_by_token)))
 
 
 def _register_inbound_reply_token(
@@ -390,6 +448,96 @@ def _register_inbound_reply_token(
 ) -> None:
     """Keep the inbound-event identity available to burst reply threads."""
     _register_inbound_reply_batch(reply_token, group_id, [message_id])
+
+
+# ── 爸媽運動提醒（2026-10-23，PLAN A A3）：flush 時決定、以 reply token 登記，送出時才搭上回覆 ─────────
+# Andrew 選「開口時順便提醒」：只搭在咪寶對那批訊息本來就要送的回覆上（不單獨送、不 push、不搶 token）。
+# 被取消的 burst 不會走到 flush，自然沒有候選；搶 token 的訊息（step 7a）不進 burst＝不提醒。
+# 開關 LINE_BOT_EXERCISE_NUDGE 預設關：關著時 flush 不讀 DB、不 import parent_health。
+_EXERCISE_NUDGE_ENV = "LINE_BOT_EXERCISE_NUDGE"  # 和 parent_health 同一個開關（test_exercise_nudge 確認）
+_EXERCISE_NUDGE_TTL_S = 180  # 同 _inbound_reply_by_token：候選只給同一個 token、過了就丟
+_exercise_nudge_lock = threading.Lock()
+_exercise_nudge_by_token: dict[str, tuple[str, object, float]] = {}
+
+
+def _exercise_nudge_on() -> bool:
+    """開關（只讀環境變數，不 import）；parent_health.exercise_nudge_enabled 是同一個判斷。"""
+    return os.environ.get(_EXERCISE_NUDGE_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _register_exercise_nudge(
+    reply_token: str | None, group_id: str, message_ids: list[str] | tuple[str, ...] | None
+) -> None:
+    """burst flush 時：這批有爸爸或媽媽本人的留言而且合格（parent_health.exercise_nudge_candidate），就以 reply
+    token 登記一則運動提醒，等送出時 `_take_exercise_nudge` 拿走。任何錯誤只記種類、不影響回覆（也不會讓
+    burst 走重試）。"""
+    if not _exercise_nudge_on() or not reply_token or not group_id or not message_ids:
+        return
+    try:
+        messages = []
+        for message_id in dict.fromkeys(str(m) for m in message_ids if m):
+            record = memory.get_raw_message_record(group_id, message_id)
+            # 讀不到的那則當成看不出說了什麼（parent_health 收到 None 就不提醒）
+            messages.append((record["user_id"], record["text"]) if record else ("", None))
+        import parent_health
+
+        nudge = parent_health.exercise_nudge_candidate(group_id, messages)
+        now = time.time()
+        with _exercise_nudge_lock:
+            for token in [t for t, (_g, _n, seen) in _exercise_nudge_by_token.items() if now - seen > _EXERCISE_NUDGE_TTL_S]:
+                _exercise_nudge_by_token.pop(token, None)
+            if nudge is None:
+                _exercise_nudge_by_token.pop(str(reply_token), None)
+            else:
+                _exercise_nudge_by_token[str(reply_token)] = (group_id, nudge, now)
+        if nudge is not None:
+            logger.info("exercise nudge candidate registered group=%s", group_id)
+    except Exception as exc:
+        logger.warning("exercise nudge check skipped error_type=%s", type(exc).__name__)
+
+
+def _take_exercise_nudge(reply_token: str | None, group_id: str | None):
+    """`_reply` 用（PLAN A phase 2）：拿走這個 token 登記的運動提醒（只能拿一次）；別的群組、過期、沒有都回 None。
+    關著時不碰任何東西。"""
+    if not reply_token:
+        return None
+    with _exercise_nudge_lock:
+        entry = _exercise_nudge_by_token.pop(str(reply_token), None)
+    if entry is None:
+        return None
+    registered_group, nudge, seen = entry
+    if registered_group != group_id or time.time() - seen > _EXERCISE_NUDGE_TTL_S:
+        return None
+    return nudge
+
+
+def _exercise_nudge_message(nudge):
+    """把運動提醒組成要送的 SDK 訊息（PLAN A phase 2 在 `_reply` 裡用）：第一行用說話者的 user_id 建 mention
+    （GP1 nit：不會變成「{p1}\\n@爸爸」），整則照一般回覆的規則驗過；組不出來或驗不過回 None（丟掉提醒、
+    主回覆照送）。只記錯誤種類。"""
+    try:
+        text = str(getattr(nudge, "text", "") or "")
+        user_id = str(getattr(nudge, "user_id", "") or "")
+        label = str(getattr(nudge, "label", "") or "")
+        if not text or not user_id or not label.startswith("@") or not text.startswith(label + "\n"):
+            return None
+        if _prepare_outbound_text(text, source="exercise_nudge") != text:
+            return None
+        target = line_mentions.MentionTarget(key="p1", kind="user", user_id=user_id, label=label)
+        sent_text, message = _text_message_with_mentions(
+            text,
+            validation_source="exercise_nudge",
+            prepared=True,
+            limit=5000,
+            explicit_only=True,
+            reply_targets=[target],
+        )
+        if sent_text != text:
+            return None
+        return message
+    except Exception as exc:
+        logger.warning("exercise nudge message skipped error_type=%s", type(exc).__name__)
+        return None
 
 
 def _mark_inbound_reply_succeeded(reply_token: str | None) -> None:
@@ -493,6 +641,153 @@ def _mark_inbound_reply_completed_no_reply(
                 if _inbound_reply_by_token.get(str(reply_token)) == registered:
                     _inbound_reply_by_token.pop(str(reply_token), None)
     return True
+
+
+class _InboundSendFence(NamedTuple):
+    """The inbound event(s) a reply is fenced for (see `_claim_inbound_send`)."""
+
+    group_id: str
+    message_ids: tuple[str, ...]
+    lease_retry: bool  # an earlier start of this event existed (attempts > 1)
+    seen_at: float = 0.0  # when the token was bound to the event (latency log only)
+
+
+# 2026-10-25 (review GP1 #4): the claim is a database write, and a reply that cannot get a write
+# slot is dropped -- LINE does not redeliver an event it was told is handled, and the next chance
+# is a lease-retry run whose token may be spent.  Try a few times before giving up (every try
+# already waits sqlite's own busy timeout; the reply token lives about a minute).  A failed
+# claim rolls back completely, so trying again is safe.
+_INBOUND_FENCE_CLAIM_ATTEMPTS = 3
+_INBOUND_FENCE_CLAIM_RETRY_SLEEP_SECONDS = (0.2, 0.4)
+
+
+def _claim_inbound_send(reply_token: str | None) -> tuple[str, _InboundSendFence | None]:
+    """Durable send fence (2026-10-24), taken right before `reply_message`.
+
+    The reply token leads to the inbound event(s) through the registry; their rows move to
+    `reply_sending` in one transaction.  From then on a re-run of the same event (LINE
+    redelivered it, a restart orphaned it, the lease ran out), another thread or a restarted
+    process can neither send a second copy nor push after the first one -- including when
+    this send times out and nobody knows whether LINE delivered it.
+
+    Returns ("claimed", fence) | ("blocked", None) -- someone is sending or already sent;
+    do not send | ("untracked", None) -- not an inbound we track; send as before |
+    ("error", None) -- the fence could not be written; do not send (the lease and the
+    attempts cap decide about a re-run).
+    """
+    if not reply_token:
+        return "untracked", None
+    with _inbound_reply_lock:
+        registered = _inbound_reply_by_token.get(str(reply_token))
+        if registered is None:
+            registered = _inbound_ids_by_token.get(str(reply_token))
+    if registered is None:
+        return "untracked", None
+    group_id, message_ids, seen_at = registered
+    outcome = None
+    lease_retry = False
+    error_type = ""
+    for attempt in range(_INBOUND_FENCE_CLAIM_ATTEMPTS):
+        try:
+            outcome, lease_retry = memory.claim_inbound_reply(group_id, list(message_ids))
+            break
+        except Exception as exc:
+            error_type = type(exc).__name__
+            if attempt + 1 < _INBOUND_FENCE_CLAIM_ATTEMPTS:
+                delays = _INBOUND_FENCE_CLAIM_RETRY_SLEEP_SECONDS
+                if delays:
+                    time.sleep(delays[min(attempt, len(delays) - 1)])
+    if outcome is None:
+        logger.error(
+            "inbound send fence not written; not sending msgs=%d attempts=%d error_type=%s",
+            len(message_ids),
+            _INBOUND_FENCE_CLAIM_ATTEMPTS,
+            error_type,
+        )
+        return "error", None
+    if outcome == "claimed":
+        return outcome, _InboundSendFence(group_id, tuple(message_ids), bool(lease_retry), seen_at)
+    return outcome, None
+
+
+def _release_inbound_send(fence: _InboundSendFence | None) -> None:
+    """LINE refused the reply (a definite 4xx): lift the fence so the event can run again.
+    A failure to lift keeps the fence -- the safe side (no second send)."""
+    if fence is None:
+        return
+    try:
+        memory.release_inbound_reply(fence.group_id, list(fence.message_ids))
+    except Exception as exc:
+        logger.error(
+            "inbound send fence not lifted msgs=%d error_type=%s",
+            len(fence.message_ids),
+            type(exc).__name__,
+        )
+
+
+def _close_inbound_event(
+    reply_token: str | None, fence: _InboundSendFence | None = None
+) -> None:
+    """Nothing more can reach the group for this event (the token is dead and no push may
+    follow, or the push was refused): close it so redeliveries stop re-running the models.
+
+    The registry settles it when it still knows the token; otherwise (another run of the same
+    event already popped the entry) the fence's own identity does."""
+    known = False
+    if reply_token:
+        with _inbound_reply_lock:
+            known = str(reply_token) in _inbound_reply_by_token
+    if known:
+        _mark_inbound_reply_completed_no_reply(reply_token)
+    elif fence is not None:
+        try:
+            memory.mark_inbound_events_completed_no_reply(fence.group_id, list(fence.message_ids))
+        except Exception as exc:
+            logger.error(
+                "inbound event not closed msgs=%d error_type=%s",
+                len(fence.message_ids),
+                type(exc).__name__,
+            )
+
+
+def _settle_inbound_fence_replied(fence: _InboundSendFence | None) -> None:
+    """LINE accepted the send: whatever `_mark_inbound_reply_succeeded` (which goes through the
+    registry) left fenced becomes `replied`, by the fence's own identity.  Normally nothing is
+    left and this is one statement that changes no row."""
+    if fence is None:
+        return
+    try:
+        settled = memory.settle_inbound_reply(fence.group_id, list(fence.message_ids))
+    except Exception as exc:
+        logger.error(
+            "inbound reply accepted but fence not settled msgs=%d error_type=%s",
+            len(fence.message_ids),
+            type(exc).__name__,
+        )
+        return
+    if settled:
+        logger.info(
+            "reply accepted group=%s msgs=%d handler_to_accept_s=%.2f",
+            fence.group_id,
+            len(fence.message_ids),
+            time.time() - (fence.seen_at or time.time()),
+        )
+
+
+def _reply_push_retry_key(
+    group_id: str, fence: _InboundSendFence | None, reply_token: str | None
+) -> str:
+    """Fixed per inbound event, so every run of that event sends the same key: LINE answers
+    409 to the second push and accepts only the first.  The key must not depend on the text
+    (a re-run words the answer differently).  Without a registered event the token stands in."""
+    ids = ",".join(fence.message_ids) if fence is not None else f"token:{reply_token or ''}"
+    return str(_uuid.uuid5(_uuid.NAMESPACE_URL, f"line_bot:reply_push:{group_id}:{ids}"))
+
+
+def _line_error_detail(e: BaseException, *, secrets: tuple[str, ...] = ()) -> str:
+    """Log text for a failed LINE call: status, reason, request id, LINE's message and the
+    refused property -- never the reply token or any chat text (see line_errors)."""
+    return line_errors.error_detail(e, secrets=secrets)
 
 
 def _extract_reply_payload_targets(message: TextMessageContent) -> list:
@@ -664,7 +959,7 @@ def _prepare_outbound_text(text: str, *, source: str = "reply") -> str:
             "outbound validation blocked source=%s reason=%s preview=%r",
             source,
             result.reason,
-            prepared[:160],
+            _redact_card_paths(prepared[:160]),  # 2026-10-23 GP2 N5：大字版網址的 token 不進 log
         )
         return result.text
     return result.text
@@ -1708,13 +2003,23 @@ def _fetch_urls(text: str) -> list[str]:
 
     Separate from _extract_prefetch_urls, which routing uses: that one has
     already lost a closing 「）」 that belongs to the link (/wiki/台灣（地區）).
+
+    2026-10-23 (GP2 N1): links to the bot's own pages (a pasted 「🔍 看大字版」,
+    which may hold health readings) are dropped here, before any fetcher or
+    log line sees them: never read, never in a prompt, the token never logged.
     """
     urls: list[str] = []
+    own_pages = 0
     for raw in reply_policy.link_urls(text):
         url = raw if re.match(r"https?://", raw, re.IGNORECASE) else f"https://{raw}"
         url = _trim_link(url)
+        if url and safe_fetch.is_bot_page(url):
+            own_pages += 1
+            continue
         if url and url not in urls:
             urls.append(url)
+    if own_pages:
+        logger.info("prefetch skip bot page count=%d", own_pages)
     youtube = [url for url in urls if _is_youtube_url(url)]
     return (youtube + [url for url in urls if url not in youtube])[:_PREFETCH_MAX_URLS]
 
@@ -3184,6 +3489,14 @@ async def callback(request: Request, x_line_signature: str = Header(None)):
     return {"ok": True}
 
 
+def _burst_owns_message(group_id: str, message_id: str) -> bool:
+    try:
+        return burst_filter.owns_message(group_id, message_id)
+    except Exception as exc:  # a lookup problem must never swallow a message
+        logger.warning("burst ownership lookup failed error_type=%s", type(exc).__name__)
+        return False
+
+
 def _handle_event(event) -> None:
     # MemberJoinedEvent / MemberLeftEvent: 其他成員進出群組
     if isinstance(event, (MemberJoinedEvent, MemberLeftEvent)):
@@ -3237,11 +3550,17 @@ def _handle_event(event) -> None:
         ):
             logger.info("skip redelivered media with confirmed delivery tombstone")
             return
+        if is_redelivery and _burst_owns_message(group_id, msg_id):
+            # 2026-10-24: this process still holds the message (waiting in the burst window or
+            # inside a flush): a second run would only answer it twice.  The lease is not touched.
+            logger.info("skip redelivery state=owned_by_burst msg_id=%s", msg_id)
+            return
         inbound_state = memory.begin_inbound_event(group_id, msg_id)
         if is_redelivery and inbound_state in {
             "replied",
             "completed_no_reply",
             "processing",
+            "reply_sending",  # a reply is on its way or its outcome is unknown: never run it again
         }:
             logger.info(
                 "skip redelivery state=%s msg_id=%s", inbound_state, msg_id
@@ -3848,7 +4167,7 @@ def _try_piggyback_reminders_fast_path(
                 memory.mark_reminder_delivery_claims_uncertain(claims)
             logger.warning(
                 "reminder fast-path reply failed (reminders preserved): %s",
-                str(e)[:200],
+                _line_error_detail(e, secrets=(reply_token,)),
             )
             return False
         try:
@@ -7521,7 +7840,10 @@ def _handle_image_gen(event: MessageEvent, group_id: str, subject: str) -> None:
             )
             _append_bot_turn(group_id, f"[已傳圖] {img_url}")
         except Exception as e:
-            logger.warning("reply ImageMessage failed: %s", e)
+            logger.warning(
+                "reply ImageMessage failed: %s",
+                _line_error_detail(e, secrets=(event.reply_token,)),
+            )
             _reply(event.reply_token, f"圖生成 OK 但傳 LINE 失敗：{e}", group_id=group_id)
         return
 
@@ -12012,7 +12334,10 @@ def _handle_todo_query(
                 )
         logger.info("todo query reply sent group=%s", group_id)
     except Exception as e:
-        logger.warning("todo query reply failed: %s", e)
+        logger.warning(
+            "todo query reply failed: %s",
+            _line_error_detail(e, secrets=(event.reply_token,)),
+        )
 
     memory.append_turn(group_id, "user", _labelled_turn(group_id, clean_text, event=event))
     _append_bot_turn(group_id, reply)
@@ -12484,7 +12809,10 @@ def _handle_calendar_query(
             _archive_sent_texts(group_id, response, [reply_text])
         logger.info("calendar query reply sent group=%s", group_id)
     except Exception as e:
-        logger.warning("calendar query reply failed: %s", e)
+        logger.warning(
+            "calendar query reply failed: %s",
+            _line_error_detail(e, secrets=(event.reply_token,)),
+        )
 
     memory.append_turn(group_id, "user", _labelled_turn(group_id, clean_text, event=event))
     _append_bot_turn(group_id, reply)
@@ -13210,6 +13538,8 @@ def _handle_burst_flush(
     )
     if message_ids:
         _register_inbound_reply_batch(reply_token, group_id, message_ids)
+        # 2026-10-23 爸媽運動提醒：這批有爸媽本人的留言才評估；開關關著時什麼都不做（不讀 DB、不 import）
+        _register_exercise_nudge(reply_token, group_id, message_ids)
 
     # Finish all database reads before starting asynchronous side work. A known
     # database-open failure is safe to retry only while outbound delivery has
@@ -14967,7 +15297,11 @@ def _try_one_shot_reply(event: MessageEvent, group_id: str) -> bool:
         _mark_inbound_reply_succeeded(event.reply_token)
         _archive_sent_texts(group_id, response, [reply_text])
     except Exception as e:
-        logger.warning("one-shot reply failed; preserved group=%s: %s", group_id, str(e)[:300])
+        logger.warning(
+            "one-shot reply failed; preserved group=%s: %s",
+            group_id,
+            _line_error_detail(e, secrets=(event.reply_token,)),
+        )
         return False
     data.pop(group_id, None)
     _save_one_shot_replies(data)
@@ -16015,7 +16349,7 @@ def _drain_pending_for_group(
                 else:
                     logger.warning(
                         "%s pending: push/build failed (%s), kept unprocessed pending for group=%s",
-                        source, str(e)[:120], group_id,
+                        source, _line_error_detail(e), group_id,
                     )
                     if media_delivery_slot is not None:
                         media_delivery_slot.release()
@@ -21326,9 +21660,14 @@ def _quoted_message_id(event, group_id: str) -> str | None:
 
 def _reply_health(event, group_id: str, text: str, body: str) -> None:
     """爸媽健康指令：parent_health 回卡片或文字，一律經 `_reply_command_card`（只用 reply token、不進 recall）。
-    模組載不進來或出錯時回固定句，不會掉進一般路由交給模型。"""
+    模組載不進來或出錯時回固定句，不會掉進一般路由交給模型。
+
+    2026-10-23（Andrew：「健康字卡也新增大字的網頁連結」）：卡片也做大字版網頁，但網頁只用 parent_health
+    另外組好的網頁版（`page_card`：回報人寫「家人回報」、不寫 Andrew）；沒有網頁版就不做網頁（假 reply、
+    停用版沒有這一欄，用 getattr）。"""
     message = event.message
     reply_text, card, alt_text, fallback = _HEALTH_FAILURE_TEXT, None, None, _HEALTH_FAILURE_TEXT
+    page_card = None
     try:
         import parent_health
 
@@ -21342,12 +21681,14 @@ def _reply_health(event, group_id: str, text: str, body: str) -> None:
         fallback = reply.fallback_text or _HEALTH_FAILURE_TEXT
         if reply.card is not None and reply.alt_text:
             reply_text, card, alt_text = None, reply.card, reply.alt_text
+            page_card = getattr(reply, "page_card", None)
         else:
             reply_text = reply.text or fallback
     except Exception as exc:
         logger.error("parent health command failed error_type=%s", type(exc).__name__)
     _reply_command_card(
-        event, group_id, text, reply_text=reply_text, card=card, alt_text=alt_text, fallback_text=fallback
+        event, group_id, text, reply_text=reply_text, card=card, alt_text=alt_text, fallback_text=fallback,
+        page=True, page_card=page_card,
     )
 
 
@@ -21508,6 +21849,7 @@ def _reply_command_card(
     alt_text: str | None,
     fallback_text: str,
     page: bool = False,
+    page_card: dict | None = None,
 ) -> None:
     """FCN、股票推薦與爸媽健康共用的回覆：只用 reply token、不進 recall、不提及任何人（清掉這則訊息
     登記的 mention）；按選單按鈕來的（卡片或文字）都再掛選單。
@@ -21515,8 +21857,8 @@ def _reply_command_card(
     送卡前先驗 altText 不會被改寫、卡片上每個字都過 outbound validator；驗不過就用同一個
     token 回固定句（`_reply` 回 False 也可能是 LINE 400 或靜音，不能拿來判斷要不要補句）。
 
-    ``page``（2026-10-17）：只有股票、FCN 傳 True，才存大字版網頁、加「🔍 看大字版」。預設不加：
-    爸媽健康卡是家人健康紀錄，絕不能變成拿到連結就看得到的網頁。
+    ``page``（2026-10-17）：股票、FCN、盤勢、爸媽健康（2026-10-23）傳 True，才存大字版網頁、加「🔍 看大字版」。
+    ``page_card``：爸媽健康卡的網頁版（沒有家人名字）；健康卡只用它做網頁，沒有就不做（見 `_with_card_page`）。
     """
     _clear_reply_mention_targets(event.reply_token)
     menu_buttons = _is_menu_button_text(text)
@@ -21532,7 +21874,7 @@ def _reply_command_card(
             card, reply_text = None, fallback_text
     if card is not None and alt_text:
         if page:
-            card = _with_card_page(card, alt_text)
+            card = _with_card_page(card, alt_text, page_card=page_card)
         _reply(
             event.reply_token,
             alt_text,
@@ -21552,40 +21894,58 @@ def _reply_command_card(
     )
 
 
-# 2026-10-17 只有這些 altText 開頭的卡做大字版（正面表列：卡上只有公開數字與名稱）；
-# 就是 stock_picks.PREFIX／EVAL_PREFIX、fcn_eval.PREFIX（test_card_pages 有漂移測試）。
-_CARD_PAGE_ALT_PREFIXES = ("股票推薦：", "股票評估：", "FCN 評估：", "盤勢：")  # 盤勢卡上沒有家人資料（2026-10-17）
+# 這些 altText 開頭的卡做大字版（正面表列）；就是 stock_picks.PREFIX／EVAL_PREFIX、fcn_eval.PREFIX、
+# 盤勢卡、parent_health.CARD_PREFIX（test_card_pages 有漂移測試）。
+# 2026-10-23 爸媽健康卡加進來（Andrew：「健康字卡也新增大字的網頁連結」，推翻 10/17 的排除）：
+# 只用 parent_health 組好的網頁版（沒有家人名字），存在健康頁專用的子目錄、24 小時過期，見 `_with_card_page`。
+_CARD_PAGE_ALT_PREFIXES = ("股票推薦：", "股票評估：", "FCN 評估：", "盤勢：", _HEALTH_CARD_PREFIX)
 # FCN 確認卡（fcn_eval.build_confirm_card）不做：它把理專訊息裡沒標籤的 4–6 位數字也當成代號列出，
 # 可能是帳號尾碼，不能放到拿到連結就看得到的網頁。評估卡照做。
 _CARD_PAGE_SKIP_ALT_PREFIX = "FCN 評估：我讀到"
 
 
-def _with_card_page(card: dict, alt_text: str) -> dict:
+def _with_card_page(card: dict, alt_text: str, *, page_card: dict | None = None) -> dict:
     """2026-10-16 字卡大字版：同一張卡存一頁大字版網頁，每張卡加「🔍 看大字版」。
 
     卡片已經驗過才會到這裡；模組不能用、靜音中（_reply 不會送）、沒有對外網址、存檔失敗、
-    加了按鈕驗不過或任何意外，一律送原卡。altText 不是股票推薦／股票評估／FCN 評估卡（或是 FCN 確認卡）
-    也送原卡：爸媽健康卡就算被誤傳 page=True 也不做網頁（另外明擋，雙保險）。
+    加了按鈕驗不過或任何意外，一律送原卡。altText 不在表列（或是 FCN 確認卡）也送原卡。
+    存了頁、加按鈕之後才發現不能送（超過 LINE 限制、驗不過）：刪掉剛存的那頁（不留沒人點得到的頁）。
+
+    爸媽健康卡（2026-10-23，GP2 N3）：網頁只用 ``page_card``（parent_health 組的網頁版，回報人寫「家人回報」、
+    不寫 Andrew），它也要過同一關驗證、bubble 數量和 LINE 卡一樣（#bN 錨點）；沒有網頁版就不做網頁，
+    絕不拿 LINE 卡本身去做。存在健康頁專用的子目錄（card_pages kind="health"）。
     """
     alt = alt_text.lstrip()
     if (
         card_pages is None
         or settings.bot_muted
-        or alt.startswith(_HEALTH_CARD_PREFIX)
         or not alt.startswith(_CARD_PAGE_ALT_PREFIXES)
         or alt.startswith(_CARD_PAGE_SKIP_ALT_PREFIX)
     ):
         return card
+    health = alt.startswith(_HEALTH_CARD_PREFIX)
+    url = None
     try:
-        url = card_pages.publish(card, alt_text)
+        if health:
+            if not isinstance(page_card, dict):
+                return card
+            if card_pages.bubble_count(page_card) != card_pages.bubble_count(card):
+                return card
+            _validated_flex_card_message(alt_text, page_card)  # 網頁上的字也要是驗過的字
+            url = card_pages.publish(page_card, alt_text, kind=card_pages.HEALTH)
+        else:
+            url = card_pages.publish(card, alt_text)
         if not url:
             return card
         paged = card_pages.with_page_button(card, url)
         if not card_pages.fits_line_limits(paged):  # LINE 回 400 整張卡就沒了
+            card_pages.discard(url)
             return card
         _validated_flex_card_message(alt_text, paged)
     except Exception as exc:
         logger.warning("card page skipped error_type=%s", type(exc).__name__)
+        if url:
+            card_pages.discard(url)
         return card
     return paged
 
@@ -21987,7 +22347,7 @@ def _handle_command(
         return f"本群 group_id：\n{group_id}"
 
     if t == "/help" or t == "/指令":
-        return _HELP_TEXT
+        return _help_text()
 
     # ── 長期記憶（facts）──────────────────────────────────────────
     if t == "/看記憶":
@@ -22209,8 +22569,7 @@ _HELP_TEXT = (
     "                          1–4 檔，代號或中文名都可以；期限沒寫當 6 個月，\n"
     "                          可加「12個月」「KO95%」「KI60%」\n"
     "                          引用理專那則訊息再打 /FCN：先回「我讀到的條件」，點按鈕才評估\n"
-    "  /盤勢                   美股、台股盤勢：點選單「🧭 市場盤勢」或打 /盤勢，回 4 張卡\n"
-    "                          （美股、台股、期權與資金、宏觀與事件），往左滑看下一張\n"
+    "  /盤勢                   美股、台股盤勢：點選單「🧭 市場盤勢」或打 /盤勢，回一組摘要卡，往左滑看下一張\n"
     "  /盤勢 QQQ               單檔細節（VOO、QQQ、SOXX、0050）；也可打 期權、新聞、季節性、選舉\n"
     "  /盤勢 QQQ 圖            期權未平倉與 gamma（假設部位）的圖（SPY、SOXX、台指 也可以）\n"
     "  /盤勢 13F QQQ           前十大成分股的機構持股變化（VOO、SOXX 也可以）\n"
@@ -22221,6 +22580,34 @@ _HELP_TEXT = (
     "  /group_id               顯示本群 ID\n"
     "  /help                   看這張說明"
 )
+# 2026-10-23 爸媽運動提醒：開關開著才在 /help 的爸媽健康段多這一行（關著時說了也不會發生）
+_HELP_EXERCISE_NUDGE_LINE = "                          爸媽好幾天沒提到運動時，咪寶回話時會順便提醒（每人最多 3 天一次）\n"
+
+
+# 2026-10-25 爸媽健康卡的大字版網頁：健康頁開關開著才在 /help 提到（關著時按鈕不存在，說了會騙人；
+# 和 /健康 說明的做法一致，見 parent_health._recording_explanation）
+_HELP_HEALTH_PAGE_CARDS = ("盤勢卡最下面的按鈕", "盤勢卡、爸媽健康卡最下面的按鈕")
+_HELP_HEALTH_PAGE_ANCHOR = "網址過幾天會換，打不開就再叫一次卡片\n"
+_HELP_HEALTH_PAGE_LINE = "                          爸媽健康卡的網頁比較快失效，刪除紀錄或暫停時也會清掉\n"
+
+
+def _health_pages_on() -> bool:
+    """爸媽健康卡的大字版網頁開關（整個網頁功能關著也算關）；模組壞了當作關。"""
+    try:
+        return card_pages is not None and bool(card_pages.health_enabled())
+    except Exception:
+        return False
+
+
+def _help_text() -> str:
+    text = _HELP_TEXT
+    if _health_pages_on():
+        text = text.replace(*_HELP_HEALTH_PAGE_CARDS, 1)
+        text = text.replace(_HELP_HEALTH_PAGE_ANCHOR, _HELP_HEALTH_PAGE_ANCHOR + _HELP_HEALTH_PAGE_LINE, 1)
+    if _exercise_nudge_on():
+        marker = "【民調】\n"
+        text = text.replace(marker, _HELP_EXERCISE_NUDGE_LINE + marker, 1)
+    return text
 
 
 def _handle_layer2_correction(group_id: str, reason: str) -> str:
@@ -22612,7 +22999,7 @@ def _try_piggyback_drain_with_reply_token(
         except Exception as e:
             logger.warning(
                 "quota-exhausted piggyback reply failed (pending preserved): %s",
-                str(e)[:200],
+                _line_error_detail(e, secrets=(reply_token,)),
             )
             return
 
@@ -23487,18 +23874,47 @@ def _reply(
         if menu_buttons:
             # LINE shows only the last message's Quick Reply.
             _attach_menu_buttons(messages_to_send[-1], group_id)
+        # Build everything the SDK call needs *before* the fence is taken (review GP1 #2): a
+        # failure here (a malformed rider message, an unreadable config) must not leave a
+        # `reply_sending` row behind for a request that never left.  Returning here, before
+        # reminder_delivery_started is set, lets the `finally` give the reminder claims back;
+        # the event stays `processing`, so the lease decides about a re-run.
+        try:
+            reply_request = ReplyMessageRequest(
+                reply_token=reply_token,
+                messages=messages_to_send,
+            )
+            line_config = _get_line_config()
+        except Exception as exc:
+            logger.warning(
+                "reply request not built; nothing sent group=%s: %s",
+                group_id,
+                _line_error_detail(exc, secrets=(reply_token,)),
+            )
+            return False
+        # Durable send fence (2026-10-24), taken before anything leaves for LINE -- the reply
+        # and the fallback push below.  A re-run of this inbound event (LINE redelivered it, a
+        # restart orphaned it, the lease ran out) that finds the fence, or an accepted reply,
+        # sends nothing.  Returning here, before reminder_delivery_started is set, lets the
+        # `finally` release the reminder claims instead of fencing them as uncertain.
+        send_fence: _InboundSendFence | None = None
+        if group_id:
+            fence_outcome, send_fence = _claim_inbound_send(reply_token)
+            if fence_outcome in ("blocked", "error"):
+                logger.info(
+                    "reply not sent: inbound event is already being answered (%s) group=%s",
+                    fence_outcome,
+                    group_id,
+                )
+                return False
         try:
             reminder_delivery_started = bool(
                 event_delivery_claims or natural_delivery_claims
             )
-            with ApiClient(_get_line_config()) as api_client:
-                resp = MessagingApi(api_client).reply_message(
-                    ReplyMessageRequest(
-                        reply_token=reply_token,
-                        messages=messages_to_send,
-                    )
-                )
+            with ApiClient(line_config) as api_client:
+                resp = MessagingApi(api_client).reply_message(reply_request)
                 _mark_inbound_reply_succeeded(reply_token)
+                _settle_inbound_fence_replied(send_fence)
         except Exception as e:
             delivery_claims = [
                 *event_delivery_claims,
@@ -23510,27 +23926,65 @@ def _reply(
             else:
                 memory.mark_reminder_delivery_claims_uncertain(delivery_claims)
             reminder_delivery_settled = True
-            logger.warning("reply failed: %s", str(e)[:300])
-            if group_id and not definite_reply_failure:
-                logger.warning(
-                    "reply failure ambiguous; skip fallback push to avoid duplicate group=%s",
-                    group_id,
-                )
-                if user_rejected_primary:
+            logger.warning(
+                "reply failed: %s", _line_error_detail(e, secrets=(reply_token,))
+            )
+            if not definite_reply_failure:
+                fence_kept_after_ambiguous_send = False
+                if line_errors.is_client_error(e):
+                    # LINE refused the request itself (a 4xx that is not about the token):
+                    # nothing was sent, so the fence lifts and the event may be handled again.
+                    _release_inbound_send(send_fence)
+                    if group_id:
+                        logger.warning(
+                            "reply refused by LINE; no fallback push, fence lifted group=%s",
+                            group_id,
+                        )
+                elif group_id:
+                    # Timeout, 5xx, connection error: LINE may have delivered it.  The fence
+                    # stays, so neither a re-run nor a push can send it a second time.
+                    fence_kept_after_ambiguous_send = send_fence is not None
+                    logger.warning(
+                        "reply failure ambiguous; skip fallback push to avoid duplicate group=%s",
+                        group_id,
+                    )
+                # A fence that stays after an ambiguous send is the record that "this reply may
+                # have been delivered"; `completed_no_reply` would replace it and a late second
+                # run of the same event would find nothing to block it (review GP1 #8).
+                if (
+                    group_id
+                    and user_rejected_primary
+                    and not fence_kept_after_ambiguous_send
+                ):
                     _mark_inbound_reply_completed_no_reply(reply_token)
                 return False
             # reply_token 明確過期 / invalid / 已用過 → fallback 到 push_message
             if group_id:
-                if primary_suppressed or not allow_push_fallback or _is_market_quote_outbound(text):
+                push_allowed = not (
+                    primary_suppressed
+                    or not allow_push_fallback
+                    or _is_market_quote_outbound(text)
+                )
+                if push_allowed and send_fence is not None and send_fence.lease_retry:
+                    # A run that began as a lease retry never pushes: the first start may have
+                    # delivered something and its outcome is unknown.
+                    logger.info(
+                        "reply token invalid on a lease-retry run; no fallback push group=%s",
+                        group_id,
+                    )
+                    push_allowed = False
+                if not push_allowed:
                     logger.info(
                         "reply token invalid; skip fallback push group=%s quote=%s primary_suppressed=%s",
                         group_id,
                         _is_market_quote_outbound(text),
                         primary_suppressed,
                     )
-                    if user_rejected_primary:
-                        _mark_inbound_reply_completed_no_reply(reply_token)
+                    # The token is dead and no push may follow: nothing more can reach the
+                    # group for this event, so a redelivery would only re-run the models.
+                    _close_inbound_event(reply_token, send_fence)
                     return False
+                push_request_built = False
                 try:
                     _push_text, push_message = _text_message_with_mentions(
                         text,
@@ -23540,15 +23994,20 @@ def _reply(
                         explicit_only=True,
                         reply_targets=reply_targets,
                     )
+                    push_request_built = True
                     with ApiClient(_get_line_config()) as api_client:
                         push_response = MessagingApi(api_client).push_message(
                             PushMessageRequest(
                                 to=group_id,
                                 messages=[push_message],
-                            )
+                            ),
+                            x_line_retry_key=_reply_push_retry_key(
+                                group_id, send_fence, reply_token
+                            ),
                         )
                     logger.info("fallback push_message sent to group=%s", group_id)
                     _mark_inbound_reply_succeeded(reply_token)
+                    _settle_inbound_fence_replied(send_fence)
                     try:
                         archived = False
                         for sent in (
@@ -23592,7 +24051,26 @@ def _reply(
                         )
                     return True
                 except Exception as push_err:
-                    logger.warning("fallback push also failed: %s", str(push_err)[:300])
+                    if _is_line_retry_key_conflict(push_err):
+                        # 409: LINE already accepted a push with this key, so the group has
+                        # this event's answer (an earlier run sent it).  Delivered; the text
+                        # of this run is not archived because it is not what the group saw.
+                        logger.info(
+                            "fallback push: LINE already accepted this retry key group=%s",
+                            group_id,
+                        )
+                        _mark_inbound_reply_succeeded(reply_token)
+                        _settle_inbound_fence_replied(send_fence)
+                        return True
+                    logger.warning(
+                        "fallback push also failed: %s",
+                        _line_error_detail(push_err, secrets=(reply_token,)),
+                    )
+                    if not push_request_built or line_errors.is_client_error(push_err):
+                        # Nothing went out (the request was never built, or LINE refused it)
+                        # and no later run may push: close the event.
+                        _close_inbound_event(reply_token, send_fence)
+                    # else: timeout / 5xx -- the push may have gone out; the fence stays.
             return False
 
         if pending_commit_ids and group_id:

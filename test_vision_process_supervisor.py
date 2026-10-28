@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from collections import deque
 import gc
+import logging
 import multiprocessing
 import os
 from pathlib import Path
+import re
 import stat
 import threading
 import time
@@ -103,6 +105,8 @@ class FakeContext:
         assert callable(target)
         assert daemon is True
         assert name == "vision-mlx-process"
+        # The supervisor must never start a child while an older one lives.
+        assert not any(process.alive for process in self.processes)
         spec = self.specs.popleft()
         process = FakeProcess(
             stays_alive_after_kill=spec.get("stays_alive_after_kill", False)
@@ -866,3 +870,340 @@ def test_public_shutdown_wrapper_is_idempotent(monkeypatch):
     vision_llm.shutdown_background_worker()
     vision_llm.shutdown_background_worker()
     assert calls == ["shutdown", "shutdown"]
+
+
+# --- idle unload (2026-10-25, default 4 h) ------------------------------------
+# Idleness is simulated by moving _last_used back from the real monotonic
+# clock, never by sleeping: the timing must not depend on machine load.
+
+def _idle_supervisor(context, *, idle_unload_sec=60.0, **kwargs):
+    return vision_llm._VisionProcessSupervisor(
+        context=context,
+        terminate_timeout_sec=0.001,
+        kill_timeout_sec=0.001,
+        poll_slice_sec=0.001,
+        idle_unload_sec=idle_unload_sec,
+        **kwargs,
+    )
+
+
+def _ready_specs(n):
+    return [{"ready": True, "on_send": None} for _ in range(n)]
+
+
+def _go_idle(supervisor, seconds=120.0):
+    supervisor._last_used = time.monotonic() - seconds
+
+
+def test_idle_ready_worker_is_parked_and_never_rewarmed_by_maintenance():
+    context = FakeContext(_ready_specs(2))
+    supervisor = _idle_supervisor(context)
+    before = time.monotonic()
+    assert supervisor.start_background() is True
+    assert supervisor._last_used >= before  # the idle clock starts at ready
+    child = context.processes[0]
+    assert supervisor.maintenance_tick() == "ready"
+
+    _go_idle(supervisor)
+    assert supervisor.maintenance_tick() == "parked"
+    assert child.terminate_calls == 1 and not child.alive
+    assert child.close_calls == 1 and context.parents[0].closed
+    assert supervisor._process is None and supervisor._connection is None
+    for _ in range(3):
+        assert supervisor.maintenance_tick() == "parked"
+    assert len(context.processes) == 1
+
+
+def test_a_park_logs_at_info_and_an_abort_after_it_is_a_no_op(caplog):
+    context = FakeContext(_ready_specs(2))
+    supervisor = _idle_supervisor(context)
+    assert supervisor.start_background() is True
+    _go_idle(supervisor)
+    with caplog.at_level(logging.INFO, logger="vision_llm"):
+        assert supervisor.maintenance_tick() == "parked"
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    # The post-deploy check greps this exact line.
+    assert sum(
+        bool(re.fullmatch(
+            r"vision_worker_idle_unloaded idle_sec=12\d state=stopped", r.getMessage()
+        ))
+        for r in caplog.records
+    ) == 1
+    assert supervisor.abort_active_request() is False
+    assert supervisor.maintenance_tick() == "parked"
+    assert len(context.processes) == 1
+
+
+def test_parked_worker_rewarms_on_the_next_request_with_a_fresh_clock(caplog):
+    context = FakeContext(
+        [{"ready": True, "on_send": None}, {"ready": False, "on_send": None}]
+    )
+    supervisor = _idle_supervisor(context)
+    assert supervisor.start_background() is True
+    _go_idle(supervisor)
+    assert supervisor.maintenance_tick() == "parked"
+
+    with caplog.at_level(logging.INFO, logger="vision_llm"):
+        with pytest.raises(vision_llm.VisionBusyError):
+            supervisor.run("describe", {"image": b"x"}, timeout_sec=1.0)
+        with pytest.raises(vision_llm.VisionBusyError):
+            supervisor.run("describe", {"image": b"y"}, timeout_sec=1.0)
+    assert [r.getMessage() for r in caplog.records].count(
+        "vision_worker_rewarm_on_demand"
+    ) == 1  # one per lost first image, not per image during the reload
+    assert len(context.processes) == 2
+    assert supervisor.maintenance_tick() == "warming"
+
+    before = time.monotonic()
+    context.parents[1].push(("ready", supervisor._generation, "fake-model"))
+    assert supervisor.maintenance_tick() == "ready"
+    assert supervisor._last_used >= before
+    assert supervisor.maintenance_tick() == "ready"  # not parked straight away
+    assert context.processes[1].terminate_calls == 0
+    assert len(context.processes) == 2
+
+
+def test_start_background_after_a_park_unparks():
+    context = FakeContext(
+        [{"ready": True, "on_send": None}, {"ready": True, "on_send": None},
+         {"ready": False, "on_send": None}]
+    )
+    supervisor = _idle_supervisor(context)
+    assert supervisor.start_background() is True
+    _go_idle(supervisor)
+    assert supervisor.maintenance_tick() == "parked"
+
+    assert supervisor.start_background() is True
+    assert supervisor._parked is False
+    context.processes[1].alive = False  # an unexpected death is not a park
+    assert supervisor.maintenance_tick() == "warming"
+    assert len(context.processes) == 3
+
+
+def test_a_finished_request_postpones_the_unload():
+    def answer(connection, message):
+        if message[0] == "request":
+            _, generation, request_id, _operation, _payload = message
+            connection.push(("result", generation, request_id, "ok"))
+
+    context = FakeContext([{"ready": True, "on_send": answer}])
+    supervisor = _idle_supervisor(context)
+    assert supervisor.start_background() is True
+    _go_idle(supervisor)
+    assert supervisor.run("describe", {"image": b"x"}, timeout_sec=1.0) == "ok"
+    assert supervisor.maintenance_tick() == "ready"
+    assert context.processes[0].terminate_calls == 0
+
+
+def test_a_busy_worker_is_never_parked():
+    context = FakeContext([{"ready": True, "on_send": None}])
+    supervisor = _idle_supervisor(context)
+    assert supervisor.start_background() is True
+    _go_idle(supervisor)
+    with supervisor._lock:  # the state run() leaves while a request is in flight
+        supervisor._state = "busy"
+        supervisor._active_request = (supervisor._generation, 1)
+    assert supervisor.maintenance_tick() == "busy"
+    assert context.processes[0].terminate_calls == 0
+
+
+def test_zero_keeps_the_model_resident_where_sixty_seconds_parks():
+    for limit, expected in ((0, "ready"), (60.0, "parked")):
+        context = FakeContext(_ready_specs(1))
+        supervisor = _idle_supervisor(context, idle_unload_sec=limit)
+        assert supervisor.start_background() is True
+        _go_idle(supervisor, 120.0)
+        assert supervisor.maintenance_tick() == expected
+
+
+@pytest.mark.parametrize("raw, expected", [
+    (None, 14400.0), ("", 14400.0), ("   ", 14400.0), ("  600  ", 600.0), ("0", 0.0),
+    ("0.0", 0.0), ("off", 0.0), ("False", 0.0), ("no", 0.0), ("none", 0.0),
+    ("disabled", 0.0), ("-5", 0.0), ("1", 300.0), ("299", 300.0),
+    ("300", 300.0), ("301", 301.0), ("7200", 7200.0),
+    ("abc", 0.0), ("4h", 0.0), ("nan", 0.0), ("inf", 0.0),
+])
+def test_idle_unload_env_parsing(monkeypatch, raw, expected):
+    monkeypatch.setattr(vision_llm, "_idle_unload_env_warned", False)
+    if raw is None:
+        monkeypatch.delenv("VISION_IDLE_UNLOAD_SEC", raising=False)
+    else:
+        monkeypatch.setenv("VISION_IDLE_UNLOAD_SEC", raw)
+    assert vision_llm._idle_unload_sec_from_env() == expected
+
+
+@pytest.mark.parametrize("raw", ["off", "OFF", " Off ", "False", "no", "none", "disabled"])
+def test_an_off_word_is_silent(monkeypatch, caplog, raw):
+    monkeypatch.setattr(vision_llm, "_idle_unload_env_warned", False)
+    monkeypatch.setenv("VISION_IDLE_UNLOAD_SEC", raw)
+    with caplog.at_level(logging.WARNING, logger="vision_llm"):
+        assert vision_llm._idle_unload_sec_from_env() == 0.0
+    assert not caplog.records
+
+
+def test_an_unparsable_env_value_warns_once(monkeypatch, caplog):
+    monkeypatch.setattr(vision_llm, "_idle_unload_env_warned", False)
+    monkeypatch.setenv("VISION_IDLE_UNLOAD_SEC", "4h")
+    with caplog.at_level(logging.WARNING, logger="vision_llm"):
+        for _ in range(5):
+            assert vision_llm._idle_unload_sec_from_env() == 0.0
+    assert sum("unparsable" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_env_is_read_at_check_time_and_defaults_to_four_hours(monkeypatch):
+    monkeypatch.delenv("VISION_IDLE_UNLOAD_SEC", raising=False)
+    context = FakeContext(_ready_specs(1))
+    supervisor = _idle_supervisor(context, idle_unload_sec=None)
+    assert supervisor.start_background() is True
+    _go_idle(supervisor, 4 * 3600 - 60)
+    assert supervisor.maintenance_tick() == "ready"
+    monkeypatch.setenv("VISION_IDLE_UNLOAD_SEC", "off")
+    _go_idle(supervisor, 10 * 3600)
+    assert supervisor.maintenance_tick() == "ready"
+    monkeypatch.delenv("VISION_IDLE_UNLOAD_SEC")
+    assert supervisor.maintenance_tick() == "parked"
+
+
+def test_park_whose_child_outlives_kill_gets_the_long_reap_window():
+    context = FakeContext(
+        [{"ready": True, "on_send": None, "stays_alive_after_kill": True},
+         {"ready": True, "on_send": None}]
+    )
+    supervisor = _idle_supervisor(context, cleanup_pending_timeout_sec=10.0)
+    assert supervisor.start_background() is True
+    child = context.processes[0]
+    _go_idle(supervisor)
+
+    assert supervisor.maintenance_tick() == "cleanup_pending"
+    assert supervisor._cleanup_deadline - time.monotonic() > 30.0
+    child.alive = False  # the late exit
+    assert supervisor.maintenance_tick() == "parked"
+    assert supervisor.maintenance_tick() == "parked"
+    assert len(context.processes) == 1
+
+
+def test_an_image_during_a_slow_park_reap_rewarms_after_the_reap():
+    context = FakeContext(
+        [{"ready": True, "on_send": None, "stays_alive_after_kill": True},
+         {"ready": False, "on_send": None}]
+    )
+    supervisor = _idle_supervisor(context, cleanup_pending_timeout_sec=10.0)
+    assert supervisor.start_background() is True
+    child = context.processes[0]
+    _go_idle(supervisor)
+    assert supervisor.maintenance_tick() == "cleanup_pending"
+
+    with pytest.raises(vision_llm.VisionUnavailableError):
+        supervisor.run("describe", {"image": b"x"}, timeout_sec=1.0)
+    assert len(context.processes) == 1  # never overlaps the old child
+    child.alive = False
+    assert supervisor.maintenance_tick() == "warming"
+    assert len(context.processes) == 2
+
+
+def test_a_stuck_park_reap_recovers_to_parked():
+    context = FakeContext(
+        [{"ready": True, "on_send": None, "stays_alive_after_kill": True}]
+    )
+    supervisor = _idle_supervisor(context, cleanup_pending_timeout_sec=10.0)
+    assert supervisor.start_background() is True
+    child = context.processes[0]
+    _go_idle(supervisor)
+    assert supervisor.maintenance_tick() == "cleanup_pending"
+    supervisor._cleanup_deadline = time.monotonic() - 1.0  # the window ran out
+    assert supervisor.maintenance_tick() == "failed"
+    child.alive = False
+    assert supervisor.maintenance_tick() == "parked"
+    assert supervisor._failure_reason == ""
+    assert len(context.processes) == 1
+
+
+def test_a_failed_reload_after_a_park_stays_failed():
+    # Pins today's sticky warm-up failure (deferred review item): changing it
+    # to a cooldown retry should be a deliberate edit of this test.
+    context = FakeContext(
+        [{"ready": True, "on_send": None},
+         {"load_failed": True, "on_send": None}]
+    )
+    supervisor = _idle_supervisor(context)
+    assert supervisor.start_background() is True
+    _go_idle(supervisor)
+    assert supervisor.maintenance_tick() == "parked"
+
+    with pytest.raises(vision_llm.VisionUnavailableError):
+        supervisor.run("describe", {"image": b"x"}, timeout_sec=1.0)
+    for _ in range(3):
+        assert supervisor.maintenance_tick() == "failed"
+    with pytest.raises(vision_llm.VisionUnavailableError):
+        supervisor.run("describe", {"image": b"y"}, timeout_sec=1.0)
+    assert len(context.processes) == 2
+
+
+def test_a_rewarm_that_dies_before_ready_fails_with_the_alerting_code(caplog):
+    context = FakeContext(
+        [{"ready": True, "on_send": None}, {"ready": False, "on_send": None}]
+    )
+    supervisor = _idle_supervisor(context)
+    assert supervisor.start_background() is True
+    _go_idle(supervisor)
+    assert supervisor.maintenance_tick() == "parked"
+    with pytest.raises(vision_llm.VisionBusyError):
+        supervisor.run("describe", {"image": b"x"}, timeout_sec=1.0)
+
+    context.processes[1].alive = False  # e.g. killed for memory while loading
+    with caplog.at_level(logging.WARNING, logger="vision_llm"):
+        assert supervisor.maintenance_tick() == "failed"
+        assert supervisor.maintenance_tick() == "failed"
+    assert [r.getMessage() for r in caplog.records].count(
+        "vision_worker_exited_before_ready exitcode=None"
+    ) == 1
+    with pytest.raises(vision_llm.VisionUnavailableError) as exc_info:
+        supervisor.run("describe", {"image": b"y"}, timeout_sec=1.0)
+    assert exc_info.value.code == "local_model_unavailable"
+    assert len(context.processes) == 2
+
+
+def test_a_first_warm_up_that_dies_fails_with_the_alerting_code():
+    context = FakeContext([{"ready": False, "on_send": None}])
+    supervisor = _idle_supervisor(context)
+    assert supervisor.start_background() is False
+    context.processes[0].alive = False
+    assert supervisor.maintenance_tick() == "failed"
+    with pytest.raises(vision_llm.VisionUnavailableError) as exc_info:
+        supervisor.run("describe", {"image": b"x"}, timeout_sec=1.0)
+    assert exc_info.value.code == "local_model_unavailable"
+    assert len(context.processes) == 1
+
+
+def test_a_load_failure_sent_just_before_exit_keeps_its_code():
+    context = FakeContext([{"ready": False, "on_send": None}])
+    supervisor = _idle_supervisor(context)
+    assert supervisor.start_background() is False
+    child, pipe = context.processes[0], context.parents[0]
+    real_poll = pipe.poll
+
+    def poll_then_fail_and_exit(timeout=0.0):
+        # The child reports and exits between the drain and any later check.
+        pipe.poll = real_poll
+        pipe.push(("load_failed", supervisor._generation,
+                   "local_snapshot_unavailable", "LoadError"))
+        child.alive = False
+        return False
+
+    pipe.poll = poll_then_fail_and_exit
+    assert supervisor.maintenance_tick() == "warming"  # message not read yet
+    assert supervisor.maintenance_tick() == "failed"
+    assert supervisor._failure_code == "local_snapshot_unavailable"
+
+
+def test_stop_after_park_is_clean_and_fenced():
+    context = FakeContext(_ready_specs(2))
+    supervisor = _idle_supervisor(context)
+    assert supervisor.start_background() is True
+    _go_idle(supervisor)
+    assert supervisor.maintenance_tick() == "parked"
+    supervisor.shutdown()
+    with pytest.raises(vision_llm.VisionUnavailableError) as exc_info:
+        supervisor.run("describe", {"image": b"x"}, timeout_sec=1.0)
+    assert exc_info.value.code == "worker_shutdown"
+    assert len(context.processes) == 1

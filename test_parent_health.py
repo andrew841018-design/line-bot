@@ -758,7 +758,7 @@ def test_overview_card_with_data(reminders):
         "爸爸",
         "💊 用藥：有說吃藥 2/7 天、忘了 1 天、拿藥",
         "🏥 看診：下次 10/23（五）09:00 回診；10/9 看牙",  # privacy-safe-fixture
-        "🚶 運動：散步 3 天、爬山 1 天",
+        "🚶 運動：散步 3 天、爬山 1 天，上次 10/11",  # 2026-10-23：加上次聽到的日期
         "😴 睡眠：睡不好 2 天",
         "🍚 飲食：胃口不好、少吃甜",
         "🩺 身體：⚠️ 10/11 提到胸痛胸悶、血壓 135/85（10/11）、頭暈 2 天",
@@ -786,7 +786,7 @@ def test_overview_card_every_state_passes_checks(family, reminders):
     consent("媽媽", "U_MOM", at=NOW - 3600)
     card = assert_card_ok(cmd(""))
     assert body_lines(card)[2:] == [
-        "媽媽", "💊 用藥：沒有紀錄", "🏥 看診：沒有紀錄", "🚶 運動：沒有紀錄", "😴 睡眠：沒有紀錄",
+        "媽媽", "💊 用藥：沒有紀錄", "🏥 看診：沒有紀錄", "🚶 運動：還沒聽到", "😴 睡眠：沒有紀錄",
         "🍚 飲食：沒有紀錄", "🩺 身體：沒有紀錄",
     ]
     # 暫停
@@ -2591,9 +2591,14 @@ def test_analysis_card_lists_alerts_and_notes_with_advice(reminders):
     assert reply.alt_text == ph._ANALYSIS_ALT == "爸媽健康卡：點開看爸媽近 14 天的分析"
     assert card["header"]["contents"][0]["text"] == "📋 爸媽健康分析"
     assert card["header"]["contents"][1]["text"] == "近 14 天（9/28–10/11），只看群組有提到的"
+    never = ["🚶 運動：還沒聽到運動的紀錄", "💊 吃藥：還沒聽到吃藥的紀錄", "🩺 血壓：還沒聽到血壓的紀錄"]
     assert _analysis_lines(card) == [
-        "爸爸", "⚠️ 10/10 提到跌倒", "→ 可以問問他現在的狀況，也跟醫生說",
-        "媽媽", "📝 7 天有 4 天睡不好", "→ 固定起床時間、午睡 30 分鐘內、下午少喝咖啡和茶；持續的話跟醫生聊",
+        "爸爸", "從 8/1 開始記錄", "⚠️ 10/10 提到跌倒", "→ 可以問問他現在的狀況，也跟醫生說",
+        "最近聽到的", *never, "😴 睡眠：還沒聽到睡眠的紀錄",
+        "媽媽", "從 8/1 開始記錄", "📝 7 天有 4 天睡不好",
+        "→ 固定起床時間、午睡 30 分鐘內、下午少喝咖啡和茶；持續的話跟醫生聊",
+        "最近聽到的", *never, "😴 睡眠：上次聽到是今天（10/11 睡不好）；近 14 天有 4 天",
+        "只記群組裡有說的，沒聽到不代表沒做",
     ]
     assert [n["action"]["text"] for n in card["footer"]["contents"] if "action" in n] == ["/健康 爸爸", "/健康 媽媽", "/健康"]
     assert [n["text"] for n in card["footer"]["contents"][-2:]] == [
@@ -2603,15 +2608,22 @@ def test_analysis_card_lists_alerts_and_notes_with_advice(reminders):
 
 
 def test_analysis_card_states_empty_and_recording_start(reminders):
+    never = [f"{head}：還沒聽到{name}的紀錄" for head, name in (
+        ("🚶 運動", "運動"), ("💊 吃藥", "吃藥"), ("🩺 血壓", "血壓"), ("😴 睡眠", "睡眠"))]
     consent("爸爸", "U_DAD")
     lines = _analysis_lines(assert_card_ok(cmd("分析", "U_KID")))
-    assert lines[:2] == ["爸爸", "近 14 天沒有紀錄"]
-    assert lines[2] == "媽媽" and "還沒開始記錄" in lines[3]
+    # 2026-10-23：沒紀錄也一定有內容（還沒聽到的每一類、記錄從哪天開始只寫一次）
+    assert lines[:8] == ["爸爸", "從 8/1 開始記錄", "近 14 天沒有紀錄", "最近聽到的", *never]
+    assert lines[8] == "媽媽" and "還沒開始記錄" in lines[9]
+    assert lines[-1] == "只記群組裡有說的，沒聽到不代表沒做"
     add("爸爸", "exercise", "散步")
-    assert _analysis_lines(assert_card_ok(cmd("分析", "U_KID")))[1] == "依目前的提醒規則，這段時間沒有要提醒的項目"
+    lines = _analysis_lines(assert_card_ok(cmd("分析", "U_KID")))
+    assert lines[:4] == ["爸爸", "從 8/1 開始記錄", "目前沒有需要特別注意的項目", "最近聽到的"]
+    assert lines[4] == "🚶 運動：上次聽到是今天（10/11 散步）；近 14 天有 1 天"
     consent("媽媽", "U_MOM", at=ts(2026, 10, 9, 8))
     lines = _analysis_lines(assert_card_ok(cmd("分析", "U_KID")))
-    assert lines[2:5] == ["媽媽", "從 10/9 開始記錄", "近 14 天沒有紀錄"]
+    mom = lines[lines.index("媽媽"):]
+    assert mom[:8] == ["媽媽", "從 10/9 開始記錄", "近 14 天沒有紀錄", "最近聽到的", *never]
     cmd("暫停", "U_DAD")
     assert _analysis_lines(assert_card_ok(cmd("分析", "U_KID")))[1].startswith("已暫停記錄")
 
@@ -2628,7 +2640,9 @@ def test_analysis_card_caps_lines_and_counts_the_rest(reminders):
     lines = _analysis_lines(assert_card_ok(cmd("分析", "U_KID")))
     mom = lines[lines.index("媽媽"):]
     assert [line for line in mom if line[:1] in "⚠📝👍"] == ["📝 7 天有 3 天提到膝蓋痛", "📝 這週說忘了吃藥 2 天", "📝 7 天有 4 天睡不好"]
-    assert mom[-1] == "另外還有 1 項，完整整理每週日私訊 Andrew"
+    # 2026-10-23：條目照列在前，後面才接「最近聽到的」
+    assert mom[mom.index("最近聽到的") - 1] == "另外還有 1 項，完整整理每週日私訊 Andrew"
+    assert "目前沒有需要特別注意的項目" not in mom
 
 
 def test_overview_has_the_analysis_button_only_when_someone_is_recording(reminders):
@@ -2797,7 +2811,8 @@ def test_gp1_resume_hides_records_from_before_the_new_start(dms, reminders):
     cmd("恢復", "U_DAD", now=ts(2026, 10, 10, 9))
     add("爸爸", "med", "吃藥", day=(2026, 10, 11))
     lines = _analysis_lines(assert_card_ok(cmd("分析", "U_KID")))
-    assert lines[:3] == ["爸爸", "從 10/10 開始記錄", "依目前的提醒規則，這段時間沒有要提醒的項目"]
+    assert lines[:3] == ["爸爸", "從 10/10 開始記錄", "目前沒有需要特別注意的項目"]
+    assert "😴 睡眠：還沒聽到睡眠的紀錄" in lines  # 暫停前的睡不好不算
     assert ph._run_weekly_analysis(NOW) == 1
     assert "跌倒" not in dms[0] and "睡不好" not in dms[0]
 
@@ -2937,3 +2952,327 @@ def test_urgent_readings_failure_keeps_the_other_daily_lines(monkeypatch, dms):
 def test_each_reading_leaves_the_window_long_before_its_suppression_ends():
     # 「同一筆只提醒一次」靠這個關係：讀數出了 48 小時視窗（加上檢查時間漂移一天）之前，去重列都還有效
     assert ph._URGENT_LOOKBACK_S + 86400 < ph._ALERT_SUPPRESS_S
+
+
+# ── 2026-10-23 PLAN A：分析卡「最近聽到的」、總覽卡「上次」、網頁版、清健康頁、說明 ─────────────
+
+
+def _all_texts(card) -> list[str]:
+    return card_texts(card)
+
+
+def test_analysis_card_recap_says_when_each_kind_was_last_heard(reminders):
+    consent("爸爸", "U_DAD")
+    add("爸爸", "exercise", "散步", day=_days_ago(3))
+    add("爸爸", "exercise", "太極", day=_days_ago(10))
+    add("爸爸", "med", "吃藥", day=_days_ago(1))
+    add("爸爸", "med", "忘了吃藥", day=_days_ago(0))  # 忘了吃藥不算「吃藥」
+    add("爸爸", "body", "血壓", "128/82", day=_days_ago(2), reporter="U_KID")
+    add("爸爸", "sleep", "睡得好", day=_days_ago(20))  # 14 天外：只說哪天
+    lines = _analysis_lines(assert_card_ok(cmd("分析", "U_KID")))
+    dad = lines[:lines.index("媽媽")]
+    recap = dad[dad.index("最近聽到的") + 1:]
+    assert recap == [
+        "🚶 運動：上次聽到是 3 天前（10/8 散步）；近 14 天有 2 天",
+        "💊 吃藥：上次聽到是昨天（10/10）；近 14 天有 1 天",
+        "🩺 血壓：上次聽到是 2 天前（10/9 量 128/82）；近 14 天有 1 天",
+        "😴 睡眠：上次聽到是 20 天前（9/21 睡得好）",
+    ]
+    assert "從 8/1 開始記錄" not in dad  # 每類都聽到過、開始記錄在 14 天前：不用寫
+    blob = json.dumps(assert_card_ok(cmd("分析", "U_KID")).get("body"), ensure_ascii=False)
+    assert "天沒運動" not in blob and "沒運動" not in blob
+
+
+def test_overview_exercise_row_says_when_last_heard_within_180_days(reminders):
+    consent("爸爸", "U_DAD")
+    add("爸爸", "exercise", "爬山", day=_days_ago(9))  # 7 天外
+    lines = body_lines(assert_card_ok(cmd("", "U_KID")))
+    assert "🚶 運動：近 7 天沒聽到（上次 10/2）" in lines  # 不寫「沒有紀錄，上次 10/2」：大字版念起來自相矛盾
+    assert not any("沒有紀錄，上次" in line for line in lines)
+    add("爸爸", "exercise", "散步", day=_days_ago(1))
+    assert "🚶 運動：散步 1 天，上次 10/10" in body_lines(assert_card_ok(cmd("", "U_KID")))
+
+
+def test_overview_falls_back_when_the_analysis_module_is_broken(monkeypatch, reminders):
+    consent("爸爸", "U_DAD")
+    add("爸爸", "exercise", "爬山", day=_days_ago(9))
+    monkeypatch.setitem(sys.modules, "parent_health_analysis", None)
+    assert "🚶 運動：沒有紀錄" in body_lines(assert_card_ok(cmd("", "U_KID")))
+
+
+def _assert_page_twin(reply) -> dict:
+    """網頁版：同樣的 bubble、驗得過、沒有家人別名（U_KID＝成員甲）也沒有 Andrew。"""
+    import card_pages
+
+    page = reply.page_card
+    assert page is not None
+    assert card_pages.bubble_count(page) == card_pages.bubble_count(reply.card) == 1
+    assert_card_ok(ph.CommandReply(card=page, alt_text=reply.alt_text))
+    assert not card_pages._names_family(page, reply.alt_text)  # 存頁前那一關也會過
+    assert card_pages._names_family(reply.card, reply.alt_text) is (page != reply.card)  # LINE 卡有名字時才不一樣
+    assert "成員甲" not in json.dumps(page, ensure_ascii=False) and "Andrew" not in json.dumps(page, ensure_ascii=False)
+    return page
+
+
+def test_every_health_card_comes_with_a_page_version_without_family_names(reminders):
+    _seed_dad_week()
+    for offset in (1, 2, 3):  # 讓分析卡有「另外還有 N 項」
+        add("爸爸", "body", "膝蓋痛", day=_days_ago(offset))
+        add("爸爸", "med", "忘了吃藥", day=_days_ago(offset))
+        add("爸爸", "diet", "沒吃早餐", day=_days_ago(offset))
+    overview = cmd("", "U_KID")
+    assert _assert_page_twin(overview) == overview.card  # 總覽卡上本來就沒有名字
+    detail = cmd("爸爸", "U_KID")
+    assert any("（成員甲回報）" in text for text in _all_texts(detail.card))
+    page = _assert_page_twin(detail)
+    assert any("（家人回報）" in text for text in _all_texts(page))
+    assert len(body_lines(page)) == len(body_lines(detail.card))
+    analysis = cmd("分析", "U_KID")
+    assert any("私訊 Andrew" in text for text in _all_texts(analysis.card))
+    page = _assert_page_twin(analysis)
+    texts = _all_texts(page)
+    assert "每週日的完整整理會私訊管理者" in texts
+    assert any(text.startswith("另外還有") and text.endswith("完整整理每週日私訊管理者") for text in texts)
+    assert len(_analysis_lines(page)) == len(_analysis_lines(analysis.card))
+
+
+def test_a_broken_page_version_never_costs_the_card(monkeypatch, reminders, caplog):
+    consent("爸爸", "U_DAD")
+    add("爸爸", "exercise", "散步", reporter="U_KID")
+    original = ph._page_twin
+
+    def boom():
+        raise ValueError("synthetic")
+
+    monkeypatch.setattr(ph, "_page_twin", lambda build, where: original(boom, where))
+    for body in ("", "爸爸", "分析"):
+        reply = cmd(body, "U_KID")
+        assert_card_ok(reply)
+        assert reply.page_card is None
+    assert "page card overview failed error_type=ValueError" in caplog.text
+
+
+def test_a_page_version_that_fails_the_checks_is_dropped(monkeypatch, reminders):
+    consent("爸爸", "U_DAD")
+    real = ph._check_card
+
+    def picky(alt_text, card):
+        if any("家人回報" in text or "管理者" in text for text in card_texts(card)) or card.get("_page"):
+            raise ValueError("synthetic")
+        return real(alt_text, card)
+
+    monkeypatch.setattr(ph, "_check_card", picky)
+    reply = ph._card_reply(ph._OVERVIEW_ALT, ph._bubble("爸媽健康", None, [ph._text("x")], []), {"_page": True})
+    assert reply.card is not None and reply.page_card is None
+
+
+def test_worst_case_analysis_and_overview_cards_fit_line_limits(reminders):
+    import card_pages
+
+    for role, uid in (("爸爸", "U_DAD"), ("媽媽", "U_MOM")):
+        consent(role, uid)
+        for label in RED_LABELS:
+            add(role, "body", label, "", "redflag", day=_days_ago(1), reporter=uid)
+        add(role, "body", "血壓", "195/125", day=_days_ago(0), reporter=uid)
+        add(role, "body", "血糖", "55", day=_days_ago(0), reporter=uid)
+        for offset in range(7):
+            for category, item in (("exercise", "散步"), ("exercise", "爬山"), ("med", "吃藥"), ("med", "忘了吃藥"),
+                                   ("sleep", "睡不好"), ("diet", "沒吃早餐"), ("diet", "胃口不好"),
+                                   ("body", "膝蓋痛"), ("body", "頭暈"), ("visit", "回診")):
+                add(role, category, item, day=_days_ago(offset), reporter=uid)
+            add(role, "body", "血壓", f"1{40 + offset}/9{offset}", day=_days_ago(offset), hour=20, reporter="U_KID")
+    for body in ("分析", "", "爸爸", "媽媽"):
+        reply = cmd(body, "U_KID")
+        card = assert_card_ok(reply)
+        paged = card_pages.with_page_button(card, "https://quiet-river-1234.trycloudflare.com/card/" + "a" * 22)
+        assert card_pages.fits_line_limits(paged), body
+        assert len(json.dumps(reply.page_card, ensure_ascii=False).encode("utf-8")) <= 30 * 1024
+
+
+def _fake_health_page(name="a"):
+    import card_pages
+
+    directory = card_pages.pages_dir() / card_pages.HEALTH
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    page = directory / (name * 64 + ".html")
+    page.write_text("<p>synthetic</p>", encoding="utf-8")
+    return page
+
+
+def test_deleting_pausing_and_unsending_clear_the_health_pages(dms):
+    consent("爸爸", "U_DAD")
+    add("爸爸", "med", "吃藥", msg="m-del")
+    page = _fake_health_page()
+    cmd("刪除", "U_KID", quoted="m-del")
+    assert not page.exists()
+    page = _fake_health_page()
+    cmd("刪除", "U_KID", quoted="m-nothing")  # 沒刪到任何紀錄：不動還有效的頁（任何家人都能打這個指令；2026-10-25 GP1 #6）
+    assert page.exists()
+    page = _fake_health_page()
+    cmd("刪除我的紀錄", "U_DAD")
+    assert not page.exists()
+    page = _fake_health_page()
+    cmd("暫停", "U_DAD")
+    assert not page.exists()
+
+
+def test_unsend_clears_pages_only_when_records_were_deleted():
+    consent("爸爸", "U_DAD")
+    add("爸爸", "med", "吃藥", msg="m-gone")
+    page = _fake_health_page()
+    assert ph.forget_message(G, "m-unrelated") == 0
+    assert page.exists()  # 別人收回一般訊息：不動正在被看的頁
+    assert ph.forget_message(G, "m-gone") == 1
+    assert not page.exists()
+
+
+def test_the_queued_unsend_delete_clears_pages_too(monkeypatch):
+    submitted = []
+
+    class FakeExecutor:
+        def submit(self, fn):
+            submitted.append(fn)
+
+    consent("爸爸", "U_DAD")
+    monkeypatch.setattr(ph, "_BACKGROUND_ENABLED", True)
+    monkeypatch.setattr(ph, "_EXECUTOR", FakeExecutor())
+    ph.forget_message(G, "late")
+    ph.observe_message(G, "late", "U_DAD", "我剛吃完藥了", event_ts_ms=int(NOW * 1000), now=NOW)
+    page = _fake_health_page()
+    submitted[0]()
+    assert not page.exists()
+
+
+def test_disabled_stub_clears_pages_on_start_and_on_unsend():
+    consent("爸爸", "U_DAD")
+    add("爸爸", "med", "吃藥", msg="m-stub-gone")
+    page = _fake_health_page()
+    assert ph_off.forget_message(G, "m-other") == 0 and page.exists()
+    assert ph_off.forget_message(G, "m-stub-gone") == 1 and not page.exists()
+    page = _fake_health_page()
+    assert ph_off.start_background() is None
+    assert not page.exists()
+
+
+def test_a_failing_purge_never_breaks_the_command(monkeypatch, caplog):
+    import card_pages
+
+    consent("爸爸", "U_DAD")
+
+    def boom():
+        raise OSError("synthetic")
+
+    monkeypatch.setattr(card_pages, "purge_health_pages", boom)
+    reply = cmd("暫停", "U_DAD")
+    assert reply.text.startswith("爸媽健康：已暫停爸爸的健康紀錄") and "清掉" not in reply.text
+    assert "page purge failed where=pause error_type=OSError" in caplog.text
+
+
+def test_help_and_pause_mention_pages_and_the_nudge_only_when_on(monkeypatch, tmp_path, dms):
+    import card_pages
+
+    assert ph._help_text() == ph._HELP_TEXT and ph._recording_explanation() == ph._RECORDING_EXPLANATION
+    monkeypatch.setenv(card_pages.ENABLED_ENV, "1")
+    monkeypatch.setattr(card_pages, "public_base_url", lambda: "https://quiet-river-1234.trycloudflare.com")
+    monkeypatch.setenv("LINE_BOT_EXERCISE_NUDGE", "1")
+    text = ph._help_text()
+    assert_text_ok(text)
+    assert "最多保留 24 小時" in text and "刪除紀錄或暫停時會一起清掉" in text
+    assert "好幾天沒提到運動時，咪寶回話時會順便提醒（每人最多 3 天一次" in text
+    assert "天沒運動" not in text
+    consent("爸爸", "U_DAD")
+    reply = cmd("暫停", "U_DAD")
+    assert_text_ok(reply.text)
+    assert "運動提醒和 119 提醒也一起停，大字版網頁也清掉了" in reply.text
+    assert reply.text.endswith("要恢復，請爸爸本人打 /健康 恢復")
+    monkeypatch.setenv(card_pages.HEALTH_ENV, "0")  # 健康頁關掉：不說有網頁
+    assert "看大字版" not in ph._help_text()
+
+
+# ── 2026-10-25 實作後審查 ──────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def public_url(monkeypatch):
+    """大字版網頁真的會有：開關開著、而且有合格的對外網址（和 card_pages.publish 的條件一致）。"""
+    import card_pages
+
+    monkeypatch.setenv(card_pages.ENABLED_ENV, "1")
+    monkeypatch.setattr(card_pages, "public_base_url", lambda: "https://quiet-river-1234.trycloudflare.com")
+
+
+def test_the_page_sentences_need_a_public_url_too(monkeypatch, dms):
+    """沒有 tunnel 網址就沒有頁、沒有按鈕：說明不能承諾、暫停回覆不能說「清掉了」（GP1 #7）。"""
+    import card_pages
+
+    monkeypatch.setenv(card_pages.ENABLED_ENV, "1")
+    monkeypatch.setattr(card_pages, "public_base_url", lambda: None)
+    assert ph._health_page_hours() == 0
+    assert "看大字版" not in ph._help_text() and ph._recording_explanation() == ph._RECORDING_EXPLANATION
+    consent("爸爸", "U_DAD")
+    assert "大字版網頁" not in cmd("暫停", "U_DAD").text
+    monkeypatch.setattr(card_pages, "public_base_url", lambda: "https://quiet-river-1234.trycloudflare.com")
+    assert ph._health_page_hours() == 24
+    assert "最多保留 24 小時" in ph._help_text()
+
+
+def test_deleting_a_message_that_holds_no_records_keeps_the_pages(dms, public_url):
+    consent("爸爸", "U_DAD")
+    page = _fake_health_page()
+    reply = cmd("刪除", "U_KID", quoted="m-nothing")
+    assert reply.text == "爸媽健康：那則留言沒有記下健康紀錄"
+    assert page.exists()
+
+
+def _boom_purge(monkeypatch):
+    import card_pages
+
+    def boom():
+        raise OSError("synthetic")
+
+    monkeypatch.setattr(card_pages, "purge_health_pages", boom)
+
+
+def test_a_failed_purge_on_delete_says_the_page_expires_by_itself(monkeypatch, dms, public_url):
+    consent("爸爸", "U_DAD")
+    add("爸爸", "med", "吃藥", msg="m-del")
+    _boom_purge(monkeypatch)
+    reply = cmd("刪除", "U_KID", quoted="m-del")
+    assert reply.text == "爸媽健康：已刪掉那則留言記下的 1 筆紀錄；大字版網頁沒能一起清掉，24 小時內會自動失效"
+    assert_text_ok(reply.text)
+    add("爸爸", "med", "吃藥")
+    mine = cmd("刪除我的紀錄", "U_DAD").text
+    assert "已刪掉爸爸的 1 筆紀錄；大字版網頁沒能一起清掉，24 小時內會自動失效" in mine
+    assert_text_ok(mine)
+
+
+def test_a_successful_purge_adds_no_note_and_neither_does_a_missing_page_feature(monkeypatch, dms, public_url):
+    import card_pages
+
+    consent("爸爸", "U_DAD")
+    add("爸爸", "med", "吃藥", msg="m-ok")
+    assert cmd("刪除", "U_KID", quoted="m-ok").text == "爸媽健康：已刪掉那則留言記下的 1 筆紀錄"
+    add("爸爸", "med", "吃藥", msg="m-off")
+    _boom_purge(monkeypatch)
+    monkeypatch.setattr(card_pages, "public_base_url", lambda: None)  # 沒有網頁可言：不用交代
+    assert cmd("刪除", "U_KID", quoted="m-off").text == "爸媽健康：已刪掉那則留言記下的 1 筆紀錄"
+
+
+@pytest.mark.parametrize(
+    "days_ago, wording",
+    [(200, "近半年沒聽到"), (179, "近半年沒聽到"), (178, "還沒聽到"), (120, "還沒聽到")],
+)
+def test_analysis_card_says_half_a_year_only_after_half_a_year_of_recording(reminders, days_ago, wording):
+    """「沒聽到」只代表這段記錄期間（GP1 #4）：開始記錄滿 179 天才寫「近半年沒聽到」，之前寫「還沒聽到」。"""
+    start = _d(days_ago)
+    consent("爸爸", "U_DAD", at=ts(start.year, start.month, start.day, 8))
+    lines = _analysis_lines(assert_card_ok(cmd("分析", "U_KID")))
+    dad = lines[lines.index("爸爸"):lines.index("媽媽")]
+    if wording == "近半年沒聽到":  # 滿半年就不用再說從哪天開始：「近半年」已經是整段
+        assert not any("開始記錄" in line for line in dad)
+    else:
+        assert dad[1] == f"從 {start.month}/{start.day} 開始記錄"
+    never = [line for line in dad if "的紀錄" in line and ("沒聽到" in line)]
+    assert len(never) == 4 and all(f"：{wording}" in line for line in never)
+    other = "還沒聽到" if wording == "近半年沒聽到" else "近半年沒聽到"
+    assert not any(other in line for line in dad)
