@@ -673,7 +673,7 @@ def test_no_resend_path_shows_the_plain_text_of_a_reminder(line, riding, monkeyp
     """The plain version of a reminder starts with the label of the person it pings -- the literal
     「@當事人」 when its creator has no local alias.  textV2 shows a real @ there; as plain text the
     family would read 「@當事人」 in the group."""
-    rid = due_natural(monkeypatch, "繳房屋稅", user="U_STRANGER")  # no alias for this creator
+    due_natural(monkeypatch, "繳房屋稅", user="U_STRANGER")  # no alias for this creator
     open_event()
     line.script = list(script)
 
