@@ -21403,6 +21403,7 @@ def _handle_web_research_question(
                 reply_text, answer_searched, plain_note = _plain_question_answer(
                     search_text, reply_policy.strip_link_tokens(text), group_id=group_id,
                     crawl=crawl if search_text else {"reason": "no_search"}, event=event,
+                    context=context,
                 )
         else:
             prompt_text = _build_web_research_prompt(
@@ -21466,6 +21467,7 @@ def _handle_web_research_question(
         return True
 
     if reply_text not in canned:
+        guarded: dict = {}
         # 搜尋素材是 bot 自己查到的新資訊；群友原文／引用和他分享的連結內容才算「已講過」。
         reply_text = _enforce_new_value_reply(
             reply_text,
@@ -21488,7 +21490,16 @@ def _handle_web_research_question(
                 or _guard_check(reply_guards.disputes_quoted_bot, f"{quoted_context}\n{text}")
             ),
             speaker=_speaker_alias(sender_user_id),
+            outcome=guarded,
         )
+        if (plain_question and reply_text and guarded.get("regulation_numbers_dropped")
+                and public_research.asks_for_number(words)
+                and not any(q.kind != "年份" for q in reply_guards.quantities(reply_text))):
+            # The number asked for was dropped (nothing the program gathered backs it); the
+            # sentences left hold no number but a year and cannot answer 「多少／幾天」
+            # (2026-10-28 review).
+            logger.info("plain question answer lost the asked number group=%s", group_id)
+            reply_text = reply_guards.REGULATORY_UNCONFIRMED_REPLY
         if not reply_text and plain_question:
             # 2026-10-28: a plain question gets B, never silence (Andrew: A is not adopted).
             logger.info("plain question answer emptied by the reply guards group=%s", group_id)
@@ -21547,19 +21558,31 @@ _plain_question_searches_lock = threading.Lock()
 _CANNOT_CONFIRM_RE = re.compile(r"沒辦法確認|無法確認|不能確認|無法得知|沒辦法得知")
 # Fixed lines the reply guards return instead of the model's words; the
 # common-knowledge note never follows them.
-# TODO(2026-10-28, merging claude/fix-b-replies and the date guard): add
-# REGULATORY_UNCONFIRMED_REPLY and UNVERIFIED_DATE_REPLY.
-_FIXED_GUARD_REPLIES = (UNVERIFIED_CONTACT_REPLY,)
+_FIXED_GUARD_REPLIES = (
+    UNVERIFIED_CONTACT_REPLY, UNVERIFIED_DATE_REPLY, reply_guards.REGULATORY_UNCONFIRMED_REPLY,
+)
+# reply_guards' kinship words that name nobody in a search question (「日本人」 holds
+# 本人); 爸 and 媽 stay (「媽去日本要簽證嗎」 is one person), with these places masked
+# first.  A configured alias that happens to be one of them still counts.
+# TODO(2026-10-28 review R2): move this rule (this set, _NOT_KINSHIP and the @
+# check in _plain_question_names) into reply_guards as an identifying-only
+# search_deny_terms that regulation_clause shares.
+_NON_IDENTIFYING = frozenset({"本人", "當事人", "對方"})
+_NOT_KINSHIP = re.compile(r"媽祖|媽閣")
+# Nothing went out for these: the common layer does not run either.
+_PLAIN_QUESTION_NOT_SENT = ("late", "named", "names_unavailable")
 
 
 def _plain_question_answer(
     search_text: str, link_free: str, *, group_id: str, crawl: dict, event=None,
+    context: list[tuple[str, str]] | None = None,
 ) -> tuple[str, bool, str]:
     """(reply, searched, note to add after the guards) for a plain question the crawler missed.
 
     Only what research may send out reaches the models here (``search_text``,
     with the public subject put back when search_query cut it off), with no
     chat history, facts or notes: Gemini writes its own search queries from it.
+    No name the bot knows (``context``'s labels included) and no @ may be in it.
     """
     import public_research
 
@@ -21570,6 +21593,8 @@ def _plain_question_answer(
         answer, gemini = "", "no_search"
     elif not question:
         answer, gemini = "", "reduced_unrecoverable"
+    elif named := _plain_question_names(question, context):
+        answer, gemini = "", named
     else:
         seconds_left = _media_reply_deadline(event) - time.monotonic()
         answer, gemini = _plain_question_search_answer(question, crawl, seconds_left=seconds_left)
@@ -21579,7 +21604,9 @@ def _plain_question_answer(
     common = "off"
     # TODO(2026-10-28 review, before switching it on): give this layer the cap
     # and quota checks of the search layer.
-    if _RESEARCH_COMMON_KNOWLEDGE and question and gemini != "late":
+    if _RESEARCH_COMMON_KNOWLEDGE and question and gemini in _PLAIN_QUESTION_NOT_SENT:
+        common = "skipped"
+    elif _RESEARCH_COMMON_KNOWLEDGE and question:
         answer, common = _plain_question_common_answer(question, link_free)
         if answer:
             # Gemini may have searched after all (lite_reply's lookups mark searched too).
@@ -21591,6 +21618,37 @@ def _plain_question_answer(
         crawl.get("reason", "unknown"), crawl.get("rows", 0), gemini, restored, common, group_id,
     )
     return public_research.NO_SOURCE_QUESTION, False, ""
+
+
+def _plain_question_names(question: str, context: list[tuple[str, str]] | None) -> str:
+    """"" when no name the bot knows and no @ is in ``question``; otherwise why it stays home.
+
+    reply_guards.search_deny_terms: aliases, kinship words, display names and the
+    labels of ``context``; unreadable aliases fail closed (``names_unavailable``).
+    """
+    import public_research
+
+    if "@" in unicodedata.normalize("NFKC", question):  # ＠ and ﹫ too
+        return "named"
+    try:
+        configured = set(reply_guards.configured_names(strict=True))
+        names = [
+            name for name in reply_guards.search_deny_terms(context)
+            if name not in _NON_IDENTIFYING or name in configured
+        ]
+    except Exception as exc:
+        logger.warning("plain question names unavailable type=%s", type(exc).__name__)
+        return "names_unavailable"
+    if not names:
+        logger.warning("plain question names unavailable type=empty")
+        return "names_unavailable"
+    # Only the bare 媽 skips 媽祖／媽閣: 「老媽祖先…」 still names 老媽.
+    others = [name for name in names if name != "媽"]
+    if others and public_research.mentions_any(question, others):
+        return "named"
+    if "媽" in names and public_research.mentions_any(_NOT_KINSHIP.sub("", question), ["媽"]):
+        return "named"
+    return ""
 
 
 def _take_plain_question_search() -> bool:
@@ -21614,9 +21672,9 @@ def _plain_question_search_answer(
     """
     import public_research
 
-    # TODO(2026-10-28, merging claude/fix-b-replies): skip this layer (B) when
-    # requires_regulation_research — its number guard ignores Gemini's segments —
-    # and check its search_deny_terms here before anything goes out.
+    # A regulation number in the answer is judged after the call: reply_guards
+    # backs it only with what the program gathered, never this search
+    # (2026-10-28 review: predicting that guard sent answerable questions to B).
     if crawl.get("reason") == "timeout" or seconds_left < _PLAIN_QUESTION_SEARCH_MIN_SEC:
         return "", "late"
     if _quota_exhausted():
@@ -21681,6 +21739,8 @@ def _build_plain_question_search_prompt(text: str) -> str:
         "請直接回答這個問題。程式這次的爬蟲沒有取得可用資料，請先用 Google 搜尋找可靠來源，"
         "只根據搜尋到的內容回答，不要憑記憶補充；搜尋後仍找不到可靠資料，就只輸出空字串。\n"
         "不要寫地址或電話號碼。"
+        "答案有法規的數字（天數、金額、稅率、罰款）時，先用一句寫出主詞的完整句子回答是或否，"
+        "數字另外寫成一句。"
         "不要說『我會搜尋／讓我查一下』，這是本次最終答案。第一句直接回答，補必要的事實或限制，"
         "繁體中文短句，不強制行數。使用者明確要求才列來源。不要輸出思緒或規則檢查。\n\n"
         f"今天台灣日期：{today_tw}\n"

@@ -304,8 +304,8 @@ _NOT_FROM_MEMORY = re.compile(
 def is_plain_question(text: str) -> bool:
     """A short question that carries no claim to check (``text``: links removed)."""
     value = public_query(text)
-    # Merging claude/fix-b-replies: a regulation question stays a plain question
-    # (excluding it would bring NO_EVIDENCE back); main skips the Gemini search for it.
+    # A regulation question stays a plain question (excluding it would bring
+    # NO_EVIDENCE back): reply_guards' number guard judges the Gemini answer.
     return bool(
         value
         and len(value) <= 80
@@ -330,6 +330,28 @@ _SUBJECT_TERMS = re.compile(
 # A listed word counts only where a place or trip starts: at a clause's start,
 # after these verbs, or right after another listed word.  「張嘉義」 is a name.
 _SUBJECT_AFTER = "去到在往飛從回來住"
+# A clause made only of these loses nothing when search_query drops it.
+# One character class for the laughs, not 哈+ inside the outer +: nested repeats
+# backtrack exponentially on a long 哈哈哈… followed by anything else (2026-10-28 review).
+_COURTESY = re.compile(
+    r"(?:(?:請|想)?問(?:一下)?|請教(?:一下)?|謝謝(?:你|您|大家)?|多謝|感謝|感恩|拜託|麻煩了?|不好意思|"
+    r"[哈呵嘿嗯喔哦欸])+"
+)
+
+
+def _bare(text: str) -> str:
+    """Words only: punctuation, spaces and emoji removed."""
+    return re.sub(r"[\W_]+", "", text or "")
+
+
+def _asks(kept: str, value: str) -> bool:
+    """``kept`` still asks: a question word, or a kept clause the message followed with ？."""
+    if _QUESTION_FORM.search(kept):
+        return True
+    return any(
+        part and re.search(re.escape(part) + r"[\s…～~！!]*[？?]", value)
+        for part in re.split(f"[{_CLAUSE_MARKS}]", kept)
+    )
 
 
 def complete_search_query(text: str) -> str:
@@ -338,12 +360,20 @@ def complete_search_query(text: str) -> str:
     search_query keeps only the price/policy clause of 「去日本旅遊，物價高嗎？」:
     「物價高嗎」 is a question about somewhere else.  Countries, places and travel
     words from the rest come back (「日本 旅遊 物價高嗎」); names and anything
-    else said there stay home, as in search_query (2026-10-28).
+    else said there stay home, as in search_query (2026-10-28).  Since claude/fix-b-replies
+    search_query also keeps only the regulation clauses, and drops the 「？」 with the rest:
+    a cut that took only punctuation or courtesy (請問、謝謝、哈哈) took nothing.
     """
     value = public_query(text)
     kept = search_query(text)
-    if not value or not kept or kept == value:
+    if not value or not kept or not _bare(kept):
+        return ""
+    if _bare(kept) == _bare(value):
         return kept
+    left = _bare(kept)
+    dropped = [part for part in map(_bare, re.split(f"[{_CLAUSE_MARKS}]", value)) if part and part not in left]
+    if all(_COURTESY.fullmatch(part) for part in dropped):
+        return kept if _asks(kept, value) else ""
     subjects: list[str] = []
     chained = -1  # where the last listed word ended
     for match in _SUBJECT_TERMS.finditer(value):
@@ -354,7 +384,7 @@ def complete_search_query(text: str) -> str:
         chained = match.end()
         if match.group(0) not in kept:
             subjects.append(match.group(0))
-    if not subjects or not _QUESTION_FORM.search(kept):
+    if not subjects or not _asks(kept, value):
         return ""
     restored = " ".join([*dict.fromkeys(subjects), kept])
     return restored if public_query(restored) else ""
@@ -370,3 +400,19 @@ def answerable_from_memory(text: str) -> bool:
         and not _public_affairs_clause(value)
         and not _NOT_FROM_MEMORY.search(value)
     )
+
+
+def asks_for_number(text: str) -> bool:
+    """The question asks how many, how much or how long: what a regulation number answers."""
+    return bool(_REGULATION_QUANTITY_ASK.search(public_query(text)))
+
+
+def mentions_any(text: str, names) -> bool:
+    """Whether ``text`` holds one of ``names``, compared as regulation_clause does
+    (NFKC, casefolded) and with spaces and symbols ignored (「王 大同」).  An empty
+    list counts as a match: nobody can say whom the text names (fails closed)."""
+    terms = [term for term in (_bare(_fold(name)) for name in names or () if isinstance(name, str)) if term]
+    if not terms:
+        return True
+    folded = _bare(_fold(text))
+    return any(term in folded for term in terms)

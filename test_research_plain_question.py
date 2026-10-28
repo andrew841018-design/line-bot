@@ -18,8 +18,10 @@ from types import SimpleNamespace
 import pytest
 
 import fulltext_fetcher
+import line_mentions
 import main
 import public_research
+import reply_guards
 import reply_provenance
 import source_aggregator
 import web_scraper
@@ -282,6 +284,116 @@ def test_a_question_without_a_public_subject_to_restore_ends_in_b(research_env, 
     assert "gemini=reduced_unrecoverable" in caplog.text
 
 
+# ── names stay home; regulation numbers are judged after the search ──────────
+
+@pytest.mark.parametrize("question, name", [
+    ("測試成員甲推薦的拉麵好吃嗎？", "測試成員甲"),  # an alias (conftest's alias file)
+    ("合成成員甲推薦的拉麵好吃嗎？", "合成成員甲"),  # a label in front of the group's turns
+    ("@小明 台南有什麼好玩的景點？", "小明"),  # anyone tagged
+    ("＠小明 台南有什麼好玩的景點？", "小明"),
+    ("﹫小明 台南有什麼好玩的景點？", "小明"),
+    ("媽去日本要簽證嗎？", "媽去"),  # one person's mother
+    ("老媽祖先是哪裡人？", "老媽"),  # 老媽, though 媽祖 is masked for the bare 媽
+    ("阿媽祖厝在哪裡？", "阿媽"),
+])
+def test_a_question_naming_someone_stays_home(research_env, nothing_crawled, caplog, question, name):
+    assert public_research.is_plain_question(question)
+    with caplog.at_level(logging.INFO, logger="line_bot"):
+        main._handle_web_research_question(research_env.event, "G_PQ", question)
+    assert research_env.sent == [public_research.NO_SOURCE_QUESTION]
+    assert "gemini=named" in caplog.text and name not in caplog.text
+    assert main._plain_question_searches["count"] == 0  # nothing went out, nothing counted
+
+
+@pytest.mark.parametrize("question", [
+    "日本人過年吃什麼？",  # 本人 names nobody
+    "大甲媽祖遶境有什麼好玩的？",  # nor is 媽祖 anyone's mother
+    "澳門媽閣廟有什麼好玩的？",
+    "請問，去日本要簽證嗎？",  # search_query keeps 「去日本要簽證嗎」: only courtesy was cut
+])
+def test_words_that_name_nobody_are_searched(monkeypatch, research_env, nothing_crawled, question):
+    calls = []
+    monkeypatch.setattr(main.gemini_client, "chat", _grounded(calls))
+    main._handle_web_research_question(research_env.event, "G_PQ", question)
+    assert research_env.sent == [ANSWER] and len(calls) == 1
+
+
+@pytest.mark.parametrize("common_on", [False, True])
+def test_unreadable_names_send_nothing(monkeypatch, research_env, nothing_crawled, caplog, tmp_path,
+                                       common_on):
+    monkeypatch.setattr(main, "_RESEARCH_COMMON_KNOWLEDGE", common_on)  # _llm_chat stays _no_model
+    monkeypatch.setenv("LINE_USER_ALIASES_PATH", str(tmp_path / "missing.json"))
+    line_mentions.clear_alias_cache()
+    with caplog.at_level(logging.INFO, logger="line_bot"):
+        main._handle_web_research_question(research_env.event, "G_PQ", QUESTION)
+    _ends_in_b(research_env, caplog, "names_unavailable")
+    assert f"common={'skipped' if common_on else 'off'}" in caplog.text
+    assert main._plain_question_searches["count"] == 0
+
+
+def test_an_alias_that_is_a_common_word_still_counts(monkeypatch, tmp_path):
+    assert main._plain_question_names("對方違規要怎麼檢舉", None) == ""
+    aliases = tmp_path / "user_aliases.json"
+    aliases.write_text('{"U_SYNTH": "對方"}', encoding="utf-8")
+    monkeypatch.setenv("LINE_USER_ALIASES_PATH", str(aliases))
+    line_mentions.clear_alias_cache()
+    assert main._plain_question_names("對方違規要怎麼檢舉", None) == "named"
+
+
+def test_the_common_layer_never_sees_a_named_question(monkeypatch, research_env, nothing_crawled, caplog):
+    monkeypatch.setattr(main, "_RESEARCH_COMMON_KNOWLEDGE", True)  # _llm_chat stays _no_model
+    with caplog.at_level(logging.INFO, logger="line_bot"):
+        main._handle_web_research_question(research_env.event, "G_PQ", "測試成員甲推薦的拉麵好吃嗎？")
+    assert research_env.sent == [public_research.NO_SOURCE_QUESTION]
+    assert "gemini=named" in caplog.text and "common=skipped" in caplog.text
+
+
+VISA_YES = "台灣護照去日本觀光不用辦簽證。"
+VISA_DAYS = "免簽最多可停留90天。"
+
+
+def test_a_regulation_number_nothing_gathered_backs_goes_but_the_answer_stays(monkeypatch, research_env,
+                                                                              nothing_crawled):
+    calls = []
+    monkeypatch.setattr(main.gemini_client, "chat", _grounded(calls, answer=f"{VISA_YES}\n{VISA_DAYS}"))
+    main._handle_web_research_question(research_env.event, "G_PQ", "去日本要簽證嗎？")
+    assert research_env.sent == [VISA_YES]
+    assert "數字另外寫成一句" in calls[0].prompt
+
+
+@pytest.mark.parametrize("question, answer", [
+    # one sentence: nothing is left, and reply_guards answers with its own fixed line
+    ("去日本要簽證嗎？", "台灣護照去日本免簽，最多可停留90天。"),
+    # what is left does not say how long: this path replaces it
+    ("日本免簽可以待幾天？", f"{VISA_YES}\n{VISA_DAYS}"),
+    ("日本免簽可以待幾天？", f"台灣護照自2005年起赴日免簽。\n{VISA_DAYS}"),  # a year is not how long
+])
+def test_an_asked_number_the_guard_drops_gets_the_fixed_line(monkeypatch, research_env, nothing_crawled,
+                                                             question, answer):
+    monkeypatch.setattr(main.gemini_client, "chat", _grounded([], answer=answer))
+    main._handle_web_research_question(research_env.event, "G_PQ", question)
+    assert research_env.sent == [reply_guards.REGULATORY_UNCONFIRMED_REPLY]
+
+
+def test_an_asked_number_that_stays_keeps_the_answer(monkeypatch, research_env, nothing_crawled):
+    # The question itself backs 90天; only the fine nobody asked about is dropped.
+    stays = "是，台灣護照赴日免簽最多可停留90天。"
+    answer = f"{stays}\n逾期停留最高罰款30萬日圓。"
+    monkeypatch.setattr(main.gemini_client, "chat", _grounded([], answer=answer))
+    main._handle_web_research_question(research_env.event, "G_PQ", "免簽最多可以待90天嗎？")
+    assert research_env.sent == [stays]
+
+
+def test_the_fixed_line_swap_is_for_plain_questions_only(monkeypatch, research_env):
+    # The crawler found a usable row: batch 2's own handling of the dropped number stands.
+    monkeypatch.setattr(main, "_collect_web_research_sources", lambda _text: [{
+        "url": "https://example.com/visa", "title": "合成來源",
+        "full_text": "合成的來源內容，談到日本觀光免簽的規定與入境時要準備的文件。"}])
+    monkeypatch.setattr(main, "_llm_chat", lambda *_a: f"{VISA_YES}\n{VISA_DAYS}")
+    main._handle_web_research_question(research_env.event, "G_PQ", "日本免簽可以待幾天？")
+    assert research_env.sent == [VISA_YES]
+
+
 def test_an_answer_the_guards_empty_is_b_not_silence(monkeypatch, research_env, nothing_crawled, caplog):
     monkeypatch.setattr(main.gemini_client, "chat", _grounded([]))
     monkeypatch.setattr(main, "_enforce_new_value_reply", lambda *_a, **_k: "")
@@ -358,13 +470,16 @@ def test_common_knowledge_never_guesses(monkeypatch, research_env, nothing_crawl
     assert research_env.sent == [public_research.NO_SOURCE_QUESTION]
 
 
+@pytest.mark.parametrize("fixed", [
+    main.UNVERIFIED_CONTACT_REPLY, main.UNVERIFIED_DATE_REPLY, reply_guards.REGULATORY_UNCONFIRMED_REPLY,
+])
 def test_the_note_never_follows_a_fixed_guard_line(monkeypatch, research_env, nothing_crawled,
-                                                   gemini_from_memory):
+                                                   gemini_from_memory, fixed):
     monkeypatch.setattr(main, "_RESEARCH_COMMON_KNOWLEDGE", True)
     monkeypatch.setattr(main, "_llm_chat", lambda *_a: reply_provenance.reset() or ANSWER)
-    monkeypatch.setattr(main, "_enforce_new_value_reply", lambda *_a, **_k: main.UNVERIFIED_CONTACT_REPLY)
+    monkeypatch.setattr(main, "_enforce_new_value_reply", lambda *_a, **_k: fixed)
     main._handle_web_research_question(research_env.event, "G_PQ", QUESTION)
-    assert research_env.sent == [main.UNVERIFIED_CONTACT_REPLY]
+    assert research_env.sent == [fixed]
 
 
 # ── the classifiers ──────────────────────────────────────────────────────────
@@ -434,10 +549,39 @@ def test_answerable_from_memory(text, expected):
     ("香港腳很難好，藥膏價格多少？", ""),  # not the city
     ("Gogoro換電方案，月費價格多少？", ""),  # no public subject to bring back
     ("總統訪問日本是為了什麼？", ""),  # cut to keywords: the question itself is gone
+    ("總統訪問日本？", "總統 訪問 日本"),  # only spaces and punctuation differ
     ("我家附近物價高嗎？", ""),  # private: nothing goes out at all
+    # search_query keeps a regulation clause without its 「？」, and drops courtesy around it
+    ("去日本要簽證嗎？", "去日本要簽證嗎"),
+    ("請問，去日本要簽證嗎？", "去日本要簽證嗎"),
+    ("請問一下，去日本要簽證嗎？", "去日本要簽證嗎"),
+    ("不好意思，去日本要簽證嗎？", "去日本要簽證嗎"),
+    ("哈哈，去日本要簽證嗎？😅", "去日本要簽證嗎"),
+    ("去日本要簽證嗎？謝謝！", "去日本要簽證嗎"),
+    ("下個月去日本，需要簽證？", "日本 需要簽證"),  # the 「？」 after the kept clause still asks
+    ("下個月去日本，需要簽證…？", "日本 需要簽證"),
+    ("下個月去日本，需要簽證！？", "日本 需要簽證"),
+    ("去帛琉玩，簽證要辦嗎？", ""),  # not a listed place: the subject cannot go
+    ("？", ""),
 ])
 def test_complete_search_query(text, expected):
     assert public_research.complete_search_query(text) == expected
+
+
+def test_a_long_laugh_is_checked_in_linear_time():
+    # Nested repeats took seconds at 24 哈 and never finished at 60, holding the GIL.
+    started = main.time.monotonic()
+    assert public_research._COURTESY.fullmatch("哈" * 60 + "好") is None
+    assert public_research.complete_search_query("哈" * 60 + "好好笑，去日本要簽證嗎？") == ""
+    assert public_research.complete_search_query("哈" * 60 + "，去日本要簽證嗎？") == "去日本要簽證嗎"
+    assert main.time.monotonic() - started < 1.0
+
+
+def test_names_are_compared_as_the_guards_compare_them():
+    assert public_research.mentions_any("ＡＭＹ想問", ["amy"])  # NFKC, case
+    assert public_research.mentions_any("王 大同推薦的店", ["王大同"])  # spaces ignored
+    assert not public_research.mentions_any("合成的問題", ["王大同"])
+    assert public_research.mentions_any("合成的問題", [])  # no list: nobody can say whom it names
 
 
 def test_collect_reports_why_nothing_came_back():
