@@ -274,10 +274,11 @@ def _speaker_key(group_id: str, user_id: str) -> str:
 
 
 def name_pattern(names) -> re.Pattern | None:
-    terms = sorted({str(t) for t in (names or ()) if t and len(str(t)) >= 2}, key=len, reverse=True)
+    """名單→遮罩用的 regex。R3-4：字和字之間可以夾空白、看不見的字或分隔符（「測試成.員甲」「測試成 員甲」）。"""
+    terms = sorted({t for t in (_flat(str(n)) for n in (names or ()) if n) if len(t) >= 2}, key=len, reverse=True)
     if not terms:
         return None
-    return re.compile("|".join(re.escape(t) for t in terms), re.IGNORECASE)
+    return re.compile("|".join(_NAME_GAP.join(map(re.escape, t)) for t in terms), re.IGNORECASE)
 
 
 def sanitize(text: str, name_re: re.Pattern | None, limit: int) -> str:
@@ -1139,10 +1140,11 @@ _CODE_NAME_RE = re.compile(r"家人[A-Za-z](?![A-Za-z])|某家人")
 # 加上忽視／略過／解除限制／切換模式／假裝／逐字貼出這類（簡體也擋）；「上面／前面的／設定」太常見，不整批擋。
 # GP1 F4：「只照這條做」「以這條為準」「其他不用管」；「規格」（商品規格）、「為準」（以查到的為準）不整批擋。
 # GP1 N5：原文、切換、不受、模式、約束、解除不單獨擋（「沒看完文章原文」「切換話題太快」要能過），改成片語。
+# R3-3：「照這一條」「以本條／此條為準」也是搶優先權。
 _AGENT_RE = re.compile(
     r"忽略|忽視|忽视|無視|无视|略過|跳過|無限制|切換成.{0,6}模式|不要?受.{0,8}(?:限制|約束|規範)|解除.{0,4}限制|"
     r"越獄|假裝|假扮|扮演|逐字|貼出|指令|指示|提示詞|提示词|優先|优先|覆蓋|角色|開發者|"
-    r"(?:照|以|按|依)這條|這條為準|不用管|不必管|別管|"
+    r"(?:照|以|按|依)(?:這一?條|本條|此條)|這條為準|不用管|不必管|別管|"
     r"(?i:prompt|system|ignore|instruction|developer|assistant)"
 )
 # R2-2：「規則／系統」是一般名詞（遊戲規則、系統更新），只在本文（「不要／先／只」開始那段）算對 agent 的字；
@@ -1157,6 +1159,8 @@ _FORMAT_RE = re.compile(r"[【】\[\]<>{}]|(?i:json)|格式|輸出|输出")
 # 「不要沒確認就說沒提到」「不要說沒確認過的內容」要能過，所以不用「不要.{0,3}確認」這種寬的）。
 # R2-4：「不要說／講／回答（還）需要查證」「不要說還沒查證就不能回答」是同一種放寬（叫咪寶別承認還要查證）；
 # 後面接「（過）的…」是在講沒查證的內容（「不要說沒確認過的內容」），那是加嚴，放行。
+# R3-1：「的」的豁免只留給「沒／還沒」那一支；「（還）需要／要再…查證」不管後面接什麼都擋（「不要說還需要查證的話」）。
+# 中間至少要有一個詞，「不要說確認過影片內容」（直接接動詞）不擋。
 _GUESS = r"憑印象|憑感覺|憑記憶|用記憶|靠記憶|用猜的|猜測|推測|直接猜|猜一下"
 _LOOSEN_RE = re.compile(
     r"摘要|總結|重述|複述|重複|複誦|概括|簡述|歸納|濃縮|整理重點|來源清單|正反方|"
@@ -1166,8 +1170,9 @@ _LOOSEN_RE = re.compile(
     r"(?:不用|不必|不需要|不要|別|免)(?:再)?(?:上網)?(?:搜尋|搜索|查詢|檢查)|"
     + _GUESS + r"|但書|最可能|可以猜|編一個|"
     r"(?:不要|別|不必|不用)(?:再)?說(?:查不到|找不到|不知道|無法|沒有資料|不確定)|"
-    r"(?:不要|別|不必|不用)(?:再)?(?:說|講|回答|回覆|提|表示)(?:還沒|還|沒有|沒|需要|要|得|必須|再|先){0,3}"
-    r"(?:查證|確認|核實|求證|依據)(?!過?的)|"
+    r"(?:不要|別|不必|不用)(?:再)?(?:說|講|回答|回覆|提|表示)(?:還)?沒(?:有)?(?:查證|確認|核實|求證|依據)(?!過?的)|"
+    r"(?:不要|別|不必|不用)(?:再)?(?:說|講|回答|回覆|提|表示)(?:說)?"
+    r"(?:還|需要|要|得|必須|再|先|應該|有待|仍需|仍然){1,3}(?:查證|確認|核實|求證|依據)|"
     r"(?:不要|別|不必|不用)(?:再)?(?:更正|糾正|反駁|指出|質疑|否定|爭辯|提醒)"
 )
 # 附和、讓步（F1：規則全文都檢查）。不整批擋「說法／家人的／意見」：「當家人轉傳說法時，先查證來源再回答」要能過；
@@ -1188,10 +1193,11 @@ _ASSERT = (
 _ASSERT_RE = re.compile(_ASSERT)
 # R2-2：前面有「不要／別」的猜測與斷言是加嚴（「不要憑印象說影片沒提到」「不要沒查到就用猜的」「不要說影片一定
 # 沒提到」）：這幾段先拿掉再找放寬、斷言。否定只認緊接的寫法（猜測前只能夾「沒…就／前」這種條件，斷言前要是
-# 說／講這類動詞），「不要怕用猜的」「不要懷疑颱風一定不會來」照擋；同一小句後面有「以外／之外」也不算否定。
+# 說／講這類動詞），「不要怕用猜的」「不要懷疑颱風一定不會來」照擋；同一小句後面有「以外／之外／外」也不算否定
+# （R3-1：「不要用記憶外的資料確認」）。
 _CLAUSE = r"[^，,。！？!?；;]"
 _NEG = r"(?:不要|別|不能|不可以|不可|勿|避免|不該|不應該)(?:再)?"
-_UNLESS_EXCEPT = rf"(?!{_CLAUSE}*(?:以外|之外))"
+_UNLESS_EXCEPT = rf"(?!{_CLAUSE}*(?:以外|之外|外))"
 _NEGATED_GUESS_RE = re.compile(
     _NEG + rf"(?:(?:在|還)?沒{_CLAUSE}{{1,8}}?(?:之前|前|就|時)|只|光|單)?(?:{_GUESS}){_UNLESS_EXCEPT}"
 )
@@ -1213,11 +1219,15 @@ _CONTEXT_BENIGN_RE = re.compile(r"重複(?=(?:提|發)?問)|是不是(?:真的|�
 # R2-2：只擋「限制回答範圍／插話」的寫法，不擋查證類寫法——「只回／只答」後面接查到的、確認過的（「只回答查到的
 # 部分」）放行，「只回答被問的課程」「只回一個字」照擋；「加入」只放行「加入沒查到的…」（「不要加入對話」照擋）；
 # 「沒被問到的…」只放行「扯進／帶進／拉進」這種窄版。R2-4：「就可以了」「其他不提」「別的不要提」也擋。
+# R3-1：查證類的豁免只在同一小句沒有「被問／問的／問到」時才算（「只回答查到的被問內容」照擋），「不給別的」也擋。
+# R3-3：「沒有人問」「沒點到／沒叫到」整句都擋（含情境句）。
 _VERIFIED_FORM = r"(?:有)?(?:查到|查證過|確認過|看過|看完|找到)"
 _UNPROMPTED_RE = re.compile(
-    r"主動|插話|插嘴|搭話|多嘴|沒人問|沒被問(?!到?的[^，,。]{0,10}(?:扯|帶|拉)進)|沒(?:有)?人(?:叫|點名)|沒問你|"
+    r"主動|插話|插嘴|搭話|多嘴|沒(?:有)?人問|沒(?:有)?(?:點|叫)到|沒被問(?!到?的[^，,。]{0,10}(?:扯|帶|拉)進)|"
+    r"沒(?:有)?人(?:叫|點名)|沒問你|"
     r"沉默|加入(?!(?:沒|未|還沒)(?:有)?(?:查到|查證|確認|看過|看完|找到))|參與|被要求|減少|建議|"
-    rf"只(?=回|答)(?!(?:回(?:答|覆|應)?|答){_VERIFIED_FORM})|"
+    rf"只(?=回|答)(?!(?:回(?:答|覆|應)?|答){_VERIFIED_FORM}(?!{_CLAUSE}*(?:被問|問的|問到)))|"
+    rf"(?:被問|問的|問到){_CLAUSE}*只(?=回|答)|不給(?:別的|其他|其它)|"
     r"只(?:針對|談|聊)|只(?:講|說|根據)(?:被問|問題|問的)|(?:問題|被問|問的|問到)的?(?:範圍)?(?:以外|之外)|"
     r"(?:不要|別|不必|不用|少|不需要)(?:再)?(?:多|額外)?(?:補充|延伸)|"
     r"(?:不要|別|不必|不用|少|不需要)(?:再)?(?:多|額外)(?:給|說|講|聊|談|提供)|"
@@ -1255,6 +1265,20 @@ _DEFAULT_IGNORABLE_RE = re.compile(
     "\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufff8\U0001bca0-\U0001bca3\U0001d173-\U0001d17a"
     "\U000e0000-\U000e0fff]"
 )
+# R3-4：看得見的分隔符拆字（「忽.略」「媽、媽」「測試成.員甲」）：關鍵字與名字比對的副本也拿掉這些；名字遮罩允許
+# 字和字之間夾空白、看不見的字或這些分隔符。網址檢查（R3-2）用另一份保留「.」的副本，兩者不混用。
+_SPLIT_MARKS = r".\-_~·‧・/、"
+_SPLIT_MARKS_RE = re.compile(f"[{_SPLIT_MARKS}]")
+_NAME_GAP = rf"(?:\s|{_DEFAULT_IGNORABLE_RE.pattern}|[{_SPLIT_MARKS}])*"
+# R3-2：網址插空白（「evil . com」）或寫成「點com」：在拿掉空白、保留「.」的副本上，用限定頂級網域的寫法再找一次；
+# 「OK. Sure」「A. B. C」「e.g.」「Mr. Smith」「No. 1」不算網址。
+_SPACED_URL_RE = re.compile(
+    r"(?i:(?<![a-z0-9-])[a-z0-9-]+(?:\.[a-z0-9-]+)*\."
+    r"(?:com|net|org|tw|io|co|me|info|app|dev|xyz|cc|tv|ly|gl|be|jp|cn|hk|uk)(?![a-z0-9])"
+    r"|點(?:com|net|org|tw)(?![a-z0-9]))"
+)
+# R3-5：cp950 沒有的常見異體字，檢查前先換成標準字（只在檢查時換，存的文字不改）。
+_CHARSET_VARIANTS = str.maketrans("着却温户爲衆峯", "著卻溫戶為眾峰")
 
 
 def _clean(text) -> str:
@@ -1271,9 +1295,9 @@ def has_invisible(text) -> bool:
 
 def charset_ok(text) -> bool:
     """NFKC 之後能用 cp950（Big5）編碼（R2-10）：簡體字、看不見的組合字（U+034F、U+FE0F、U+3164）、表情符號都不行。
-    只用在規則與核心原因（判斷器寫的字）；家人的舊原話不套這條。"""
+    只用在規則與核心原因（判斷器寫的字）；家人的舊原話不套這條。R3-5：着、却、温這類常見異體字先換成標準字再檢查。"""
     try:
-        unicodedata.normalize("NFKC", str(text or "")).encode("cp950")
+        unicodedata.normalize("NFKC", str(text or "")).translate(_CHARSET_VARIANTS).encode("cp950")
     except UnicodeEncodeError:
         return False
     return True
@@ -1282,6 +1306,11 @@ def charset_ok(text) -> bool:
 def _squeeze(text: str) -> str:
     """關鍵字、名字比對用的副本（R2-10）：拿掉 Default_Ignorable 字元與所有空白。"""
     return "".join(_DEFAULT_IGNORABLE_RE.sub("", str(text or "")).split())
+
+
+def _flat(text: str) -> str:
+    """關鍵字、名字比對用的副本（R2-10、R3-4）：_squeeze 之後再拿掉看得見的分隔符。網址檢查不要用這份（會拿掉「.」）。"""
+    return _SPLIT_MARKS_RE.sub("", _squeeze(text))
 
 
 def _split_rule(text: str) -> tuple[str, str]:
@@ -1322,7 +1351,8 @@ def text_rejection(text: str, *, names, behaviour: bool = True) -> str:
     輸出格式字）每段都檢查；behaviour=True（規則本身）再檢查放寬硬規則、附和、揭露、斷言事實、限制主動發言（v2.2）。
     核心原因只描述家人為什麼不滿（可能就是「沒被問就插話」），不檢查 behaviour（它不進提示詞）。
     關鍵字比對先 NFKC 再去掉看不見的格式字元（F2：零寬字元不能拆開「媽媽」「忽略」「摘要」）；R2-10 起再拿掉
-    Default_Ignorable 與空白（「媽<U+034F>媽」「忽 略」）。
+    Default_Ignorable 與空白（「媽<U+034F>媽」「忽 略」），R3-4 再拿掉看得見的分隔符（「忽.略」「媽、媽」）；
+    網址另外在保留「.」的副本上找（R3-2：「evil . com」「點com」）。
     句型對的規則分成情境句和本文（R2-2、R2-9）：隱私、名字、對 agent 的強字、格式字看整句；一般名詞（規則、系統）
     與 GP2 的優先序／限制發言片語只看本文；放寬、斷言這些看整句，但情境句裡「家人重複問」「問是不是真的」不算，
     緊接否定的猜測與斷言（「不要憑印象」「不要說…一定沒」）也不算。
@@ -1332,8 +1362,12 @@ def text_rejection(text: str, *, names, behaviour: bool = True) -> str:
     raw = str(text or "")
     norm = _clean(raw)
     visible = _DEFAULT_IGNORABLE_RE.sub("", norm)  # 網址、聯絡資料：保留空白（「OK. Sure」拿掉空白會像網址）
-    flat = _squeeze(norm)
-    if fact_filters.LINK_RE.search(norm) or fact_filters.LINK_RE.search(visible):
+    dotted = _squeeze(norm)  # R3-2：拿掉空白、保留「.」，只給限定頂級網域的網址檢查
+    flat = _SPLIT_MARKS_RE.sub("", dotted)  # R3-4：關鍵字與名字再拿掉分隔符；網址不看這份
+    if (
+        fact_filters.LINK_RE.search(norm) or fact_filters.LINK_RE.search(visible)
+        or _SPACED_URL_RE.search(dotted)
+    ):
         return "check:url"
     if fact_filters.has_contact(raw) or fact_filters.has_contact(visible):
         return "check:contact"
@@ -1370,8 +1404,8 @@ def text_rejection(text: str, *, names, behaviour: bool = True) -> str:
 
 
 def _name_in(term: str, folded: str) -> bool:
-    """名單裡的名字（也拿掉空白與 Default_Ignorable，R2-10）有沒有出現在比對用的副本裡。"""
-    squeezed = _squeeze(term)
+    """名單裡的名字（也拿掉空白、Default_Ignorable 與分隔符，R2-10、R3-4）有沒有出現在比對用的副本裡。"""
+    squeezed = _flat(term)
     return bool(squeezed) and squeezed in folded
 
 
