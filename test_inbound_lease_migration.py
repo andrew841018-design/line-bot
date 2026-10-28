@@ -9,7 +9,7 @@ What is pinned here:
 * ``attempts`` / ``owner`` have defaults, readers fall back to the old statements when the
   columns are missing, a failing ALTER never stops the import, and the code before this change
   can still write to the new schema (rollback needs no database restore);
-* the deploy script ``preapply_inbound_columns.py`` is idempotent.
+* the deploy script ``jobs/preapply_inbound_columns.py`` is idempotent and has a deadline.
 """
 
 from __future__ import annotations
@@ -26,10 +26,9 @@ import memory
 
 GROUP = "GRP-LEASE"
 
-PREAPPLY_SCRIPT = Path(
-    "/Users/andrew/Desktop/andrew/Data_engineer/ops/state/line_bot_fixes_20261023/"
-    "preapply_inbound_columns.py"
-)
+HERE = Path(__file__).resolve().parent
+PREAPPLY_SCRIPT = HERE / "jobs" / "preapply_inbound_columns.py"
+DEPLOY_COPY_DIR = "ops/state/line_bot_fixes_20261023"  # the deploy copy lives outside the repo
 
 LEGACY_TABLE = (
     "CREATE TABLE inbound_events (group_id TEXT NOT NULL, message_id TEXT NOT NULL, "
@@ -330,8 +329,7 @@ def test_the_code_before_the_change_still_works_on_the_new_schema(clock):
 
 
 def _load_preapply():
-    if not PREAPPLY_SCRIPT.exists():
-        pytest.skip("deploy script not present")
+    assert PREAPPLY_SCRIPT.exists(), "the pre-apply script is part of the repository"
     spec = importlib.util.spec_from_file_location("preapply_inbound_columns", PREAPPLY_SCRIPT)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -458,3 +456,54 @@ def test_the_new_code_reads_a_database_the_script_prepared(tmp_path, monkeypatch
     memory._init_db()
     assert memory.begin_inbound_event(GROUP, "m") == "new"
     assert _row("m")[1:3] == (1, memory._INSTANCE_ID)
+
+
+def test_preapply_gives_up_at_its_deadline_when_a_writer_never_lets_go(tmp_path, capsys):
+    """It runs inside the restart lock: a stuck writer must end it with exit 1 in seconds, not
+    after minutes of silence, so the deploy aborts before the merge."""
+    script = _load_preapply()
+    db = tmp_path / "locked.db"
+    holder = sqlite3.connect(db, isolation_level=None)
+    holder.execute("PRAGMA journal_mode=WAL")
+    holder.execute(LEGACY_TABLE)
+    holder.execute("BEGIN IMMEDIATE")  # the write lock, never released during the run
+    try:
+        for argv in (["--db", str(db), "--deadline", "1"], ["--db", str(db), "--deadline", "1", "--rollback-fence"]):
+            started = time.monotonic()
+            assert script.main(argv) == 1
+            assert time.monotonic() - started < 4
+            assert capsys.readouterr().out.startswith("FAILED")
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert "attempts" not in _file_columns(db)  # nothing half-applied
+
+
+def test_preapply_deadline_defaults_to_about_twenty_seconds():
+    script = _load_preapply()
+
+    assert 15 <= script.DEADLINE_SECONDS <= 30
+
+
+def test_preapply_turns_any_unexpected_failure_into_a_nonzero_exit(tmp_path, monkeypatch, capsys):
+    script = _load_preapply()
+    db = tmp_path / "prod.db"
+    _legacy_file(db)
+
+    def boom(*_a, **_k):
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(script, "_connect", boom)
+
+    assert script.main(["--db", str(db)]) == 1
+    assert capsys.readouterr().out.strip() == "FAILED error_type=OSError"
+
+
+def test_the_deploy_copy_is_byte_identical_to_the_repository_file():
+    """The deploy copy outside the repository is what runs before the merge and after a revert."""
+    for parent in HERE.parents:
+        copy = parent / DEPLOY_COPY_DIR / "preapply_inbound_columns.py"
+        if copy.exists():
+            assert copy.read_bytes() == PREAPPLY_SCRIPT.read_bytes()
+            return
+    pytest.skip("no deploy copy next to this checkout")

@@ -652,6 +652,15 @@ class _InboundSendFence(NamedTuple):
     seen_at: float = 0.0  # when the token was bound to the event (latency log only)
 
 
+# 2026-10-25 (review GP1 #4): the claim is a database write, and a reply that cannot get a write
+# slot is dropped -- LINE does not redeliver an event it was told is handled, and the next chance
+# is a lease-retry run whose token may be spent.  Try a few times before giving up (every try
+# already waits sqlite's own busy timeout; the reply token lives about a minute).  A failed
+# claim rolls back completely, so trying again is safe.
+_INBOUND_FENCE_CLAIM_ATTEMPTS = 3
+_INBOUND_FENCE_CLAIM_RETRY_SLEEP_SECONDS = (0.2, 0.4)
+
+
 def _claim_inbound_send(reply_token: str | None) -> tuple[str, _InboundSendFence | None]:
     """Durable send fence (2026-10-24), taken right before `reply_message`.
 
@@ -675,13 +684,25 @@ def _claim_inbound_send(reply_token: str | None) -> tuple[str, _InboundSendFence
     if registered is None:
         return "untracked", None
     group_id, message_ids, seen_at = registered
-    try:
-        outcome, lease_retry = memory.claim_inbound_reply(group_id, list(message_ids))
-    except Exception as exc:
+    outcome = None
+    lease_retry = False
+    error_type = ""
+    for attempt in range(_INBOUND_FENCE_CLAIM_ATTEMPTS):
+        try:
+            outcome, lease_retry = memory.claim_inbound_reply(group_id, list(message_ids))
+            break
+        except Exception as exc:
+            error_type = type(exc).__name__
+            if attempt + 1 < _INBOUND_FENCE_CLAIM_ATTEMPTS:
+                delays = _INBOUND_FENCE_CLAIM_RETRY_SLEEP_SECONDS
+                if delays:
+                    time.sleep(delays[min(attempt, len(delays) - 1)])
+    if outcome is None:
         logger.error(
-            "inbound send fence not written; not sending msgs=%d error_type=%s",
+            "inbound send fence not written; not sending msgs=%d attempts=%d error_type=%s",
             len(message_ids),
-            type(exc).__name__,
+            _INBOUND_FENCE_CLAIM_ATTEMPTS,
+            error_type,
         )
         return "error", None
     if outcome == "claimed":
@@ -23637,6 +23658,24 @@ def _reply(
         if menu_buttons:
             # LINE shows only the last message's Quick Reply.
             _attach_menu_buttons(messages_to_send[-1], group_id)
+        # Build everything the SDK call needs *before* the fence is taken (review GP1 #2): a
+        # failure here (a malformed rider message, an unreadable config) must not leave a
+        # `reply_sending` row behind for a request that never left.  Returning here, before
+        # reminder_delivery_started is set, lets the `finally` give the reminder claims back;
+        # the event stays `processing`, so the lease decides about a re-run.
+        try:
+            reply_request = ReplyMessageRequest(
+                reply_token=reply_token,
+                messages=messages_to_send,
+            )
+            line_config = _get_line_config()
+        except Exception as exc:
+            logger.warning(
+                "reply request not built; nothing sent group=%s: %s",
+                group_id,
+                _line_error_detail(exc, secrets=(reply_token,)),
+            )
+            return False
         # Durable send fence (2026-10-24), taken before anything leaves for LINE -- the reply
         # and the fallback push below.  A re-run of this inbound event (LINE redelivered it, a
         # restart orphaned it, the lease ran out) that finds the fence, or an accepted reply,
@@ -23656,13 +23695,8 @@ def _reply(
             reminder_delivery_started = bool(
                 event_delivery_claims or natural_delivery_claims
             )
-            with ApiClient(_get_line_config()) as api_client:
-                resp = MessagingApi(api_client).reply_message(
-                    ReplyMessageRequest(
-                        reply_token=reply_token,
-                        messages=messages_to_send,
-                    )
-                )
+            with ApiClient(line_config) as api_client:
+                resp = MessagingApi(api_client).reply_message(reply_request)
                 _mark_inbound_reply_succeeded(reply_token)
                 _settle_inbound_fence_replied(send_fence)
         except Exception as e:
@@ -23680,6 +23714,7 @@ def _reply(
                 "reply failed: %s", _line_error_detail(e, secrets=(reply_token,))
             )
             if not definite_reply_failure:
+                fence_kept_after_ambiguous_send = False
                 if line_errors.is_client_error(e):
                     # LINE refused the request itself (a 4xx that is not about the token):
                     # nothing was sent, so the fence lifts and the event may be handled again.
@@ -23692,11 +23727,19 @@ def _reply(
                 elif group_id:
                     # Timeout, 5xx, connection error: LINE may have delivered it.  The fence
                     # stays, so neither a re-run nor a push can send it a second time.
+                    fence_kept_after_ambiguous_send = send_fence is not None
                     logger.warning(
                         "reply failure ambiguous; skip fallback push to avoid duplicate group=%s",
                         group_id,
                     )
-                if group_id and user_rejected_primary:
+                # A fence that stays after an ambiguous send is the record that "this reply may
+                # have been delivered"; `completed_no_reply` would replace it and a late second
+                # run of the same event would find nothing to block it (review GP1 #8).
+                if (
+                    group_id
+                    and user_rejected_primary
+                    and not fence_kept_after_ambiguous_send
+                ):
                     _mark_inbound_reply_completed_no_reply(reply_token)
                 return False
             # reply_token 明確過期 / invalid / 已用過 → fallback 到 push_message
