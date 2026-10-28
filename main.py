@@ -13802,7 +13802,7 @@ _MEDIA_ANALYSIS_EXECUTOR = _ThreadPoolExecutor(
     max_workers=1, thread_name_prefix="media-analysis"
 )
 _MEDIA_ANALYSIS_SLOT = threading.BoundedSemaphore(1)
-_MEDIA_REPLY_BUDGET_SEC = 45.0
+_MEDIA_REPLY_BUDGET_SEC = 45.0  # _plain_question_answer's search gate reads it too
 _MEDIA_REPLY_SEND_RESERVE_SEC = 5.0
 _LOCAL_MEDIA_DELIVERY_TTL_SEC = 14 * 86400
 _LOCAL_MEDIA_DELIVERY_MAX = 4096
@@ -20393,10 +20393,11 @@ def _collect_web_research_sources(text: str) -> list[dict]:
         logger.info("web research source aggregation failed: %s", e)
         return []
     if not sources:
+        logger.info("web research sources rows=0")
         return []
     try:
         import fulltext_fetcher
-        return fulltext_fetcher.fetch_top_sources(
+        rows = fulltext_fetcher.fetch_top_sources(
             sources,
             top_n=2,
             max_chars_per=1200,
@@ -20406,6 +20407,14 @@ def _collect_web_research_sources(text: str) -> list[dict]:
     except Exception as e:
         logger.info("web research full-text enrichment skipped: %s", e)
         return sources
+    # Counts only (never the query): which layer came back empty, for the next fix.
+    logger.info(
+        "web research sources rows=%d with_text=%d full_text=%d",
+        len(rows),
+        sum(len(str(r.get("full_text") or r.get("snippet") or "").strip()) >= 20 for r in rows),
+        sum(r.get("evidence_kind") == "full_text" for r in rows),
+    )
+    return rows
 
 
 def _format_web_research_sources(sources: list[dict], limit: int = 5) -> str:
@@ -20581,15 +20590,26 @@ def _handle_web_research_question(
                      "evidence_kind": "linked_context"}] + rows
         return rows
 
-    canned = {public_research.NO_EVIDENCE, public_research.NO_ANSWER}
+    canned = {public_research.NO_EVIDENCE, public_research.NO_ANSWER, public_research.NO_SOURCE_QUESTION}
+    crawl: dict = {}
+    plain_question = False
+    plain_note = ""
     with _thinking_indicator(group_id):
         # `query` (links included) only passes public_query's privacy check here.
-        sources = public_research.collect(collect_with_links, query)
+        sources = public_research.collect(collect_with_links, query, report=crawl)
         # Only rows a search returned count as searched; a read link alone does not.
         searched = any(row.get("evidence_kind") != "linked_context" for row in sources or [])
         answer_searched = False
         if not sources:
             reply_text = "" if link_message else public_research.NO_EVIDENCE
+            if (reply_text and addressed and not quoted_context.strip()
+                    and public_research.is_plain_question(words)):
+                # 2026-10-28: a plain question is not a claim; it searches on (Andrew: 打通).
+                plain_question = True
+                reply_text, answer_searched, plain_note = _plain_question_answer(
+                    search_text, reply_policy.strip_link_tokens(text), group_id=group_id,
+                    crawl=crawl if search_text else {"reason": "no_search"}, event=event,
+                )
         else:
             prompt_text = _build_web_research_prompt(
                 query, sources, quoted_context=quoted_context, searched=searched
@@ -20666,10 +20686,16 @@ def _handle_web_research_question(
             evidence_text=_research_evidence_text(sources),
             facts=facts,
         )
+        if not reply_text and plain_question:
+            # 2026-10-28: a plain question gets B, never silence (Andrew: A is not adopted).
+            logger.info("plain question answer emptied by the reply guards group=%s", group_id)
+            reply_text = public_research.NO_SOURCE_QUESTION
         if not reply_text:
             older_burst_first()
             _finish_research_without_reply(event, group_id, text)
             return True
+        if plain_note and reply_text not in canned and reply_text not in _FIXED_GUARD_REPLIES:
+            reply_text = f"{reply_text}\n{plain_note}"  # only after the model's own words
 
     older_burst_first()
     memory.append_turn(group_id, "user", _research_turn(group_id, text, event))
@@ -20696,6 +20722,179 @@ def _research_turn(group_id: str, text: str, event) -> str:
     """A burst sent here brings its own labelled turn; one person's question is labelled here."""
     turn = getattr(event, "memory_turn", None)
     return turn if isinstance(turn, str) and turn else _labelled_turn(group_id, text, event=event)
+
+
+# 2026-10-28 Andrew（一般問句收到「還無法核實這個說法」）：「你要想辦法處理找到啊！
+# 任何資訊網路上都會有，只是你在技術層面沒打通，那就打通他.....假設萬一萬一真的
+# 沒辦法，選B，但那是下下策」。爬蟲沒有可用資料的一般問句（DuckDuckGo 對 bot 回
+# 202、Google News 只有標題；Bing 會給 bot 無關的結果，不用），先請 Gemini 用 Google
+# 搜尋再查一次（Claude 不能搜尋），只採用帶著搜尋來源的答案；常識層預設關閉（記憶
+# 沒有驗證過，待 Andrew 決定）；都失敗才回 NO_SOURCE_QUESTION，log 記每一層失敗的
+# 原因，不記原文。主張不走這裡，仍是 NO_EVIDENCE。
+_RESEARCH_COMMON_KNOWLEDGE = False
+# Gemini requests are scarce (gemini_client._DAILY_REQUEST_LIMIT, and one chat
+# may use several): this layer gets a few calls per quota day (Pacific), counted
+# in this process.
+_PLAIN_QUESTION_SEARCH_DAILY_CAP = 5
+# A grounded answer can take Gemini half a minute; with less of the reply
+# token's time left (same clock as _media_reply_deadline), give up first.
+_PLAIN_QUESTION_SEARCH_MIN_SEC = 25.0
+_plain_question_searches = {"date": "", "count": 0}
+_plain_question_searches_lock = threading.Lock()
+_CANNOT_CONFIRM_RE = re.compile(r"沒辦法確認|無法確認|不能確認|無法得知|沒辦法得知")
+# Fixed lines the reply guards return instead of the model's words; the
+# common-knowledge note never follows them.
+# TODO(2026-10-28, merging claude/fix-b-replies and the date guard): add
+# REGULATORY_UNCONFIRMED_REPLY and UNVERIFIED_DATE_REPLY.
+_FIXED_GUARD_REPLIES = (UNVERIFIED_CONTACT_REPLY,)
+
+
+def _plain_question_answer(
+    search_text: str, link_free: str, *, group_id: str, crawl: dict, event=None,
+) -> tuple[str, bool, str]:
+    """(reply, searched, note to add after the guards) for a plain question the crawler missed.
+
+    Only what research may send out reaches the models here (``search_text``,
+    with the public subject put back when search_query cut it off), with no
+    chat history, facts or notes: Gemini writes its own search queries from it.
+    """
+    import public_research
+
+    # 2026-10-28 Andrew: a question our own filter cut short is not 「真的沒辦法」.
+    question = public_research.complete_search_query(link_free) if search_text else ""
+    restored = bool(question) and question != search_text
+    if not search_text:
+        answer, gemini = "", "no_search"
+    elif not question:
+        answer, gemini = "", "reduced_unrecoverable"
+    else:
+        seconds_left = _media_reply_deadline(event) - time.monotonic()
+        answer, gemini = _plain_question_search_answer(question, crawl, seconds_left=seconds_left)
+    if answer:
+        logger.info("plain question answered layer=gemini restored=%s group=%s", restored, group_id)
+        return answer, True, ""
+    common = "off"
+    # TODO(2026-10-28 review, before switching it on): give this layer the cap
+    # and quota checks of the search layer.
+    if _RESEARCH_COMMON_KNOWLEDGE and question and gemini != "late":
+        answer, common = _plain_question_common_answer(question, link_free)
+        if answer:
+            # Gemini may have searched after all (lite_reply's lookups mark searched too).
+            searched = reply_provenance.searched() and bool((reply_provenance.grounding() or {}).get("urls"))
+            logger.info("plain question answered layer=common searched=%s group=%s", searched, group_id)
+            return answer, searched, "" if searched else public_research.COMMON_KNOWLEDGE_NOTE
+    logger.info(
+        "plain question research exhausted crawler=%s rows=%s gemini=%s restored=%s common=%s group=%s",
+        crawl.get("reason", "unknown"), crawl.get("rows", 0), gemini, restored, common, group_id,
+    )
+    return public_research.NO_SOURCE_QUESTION, False, ""
+
+
+def _take_plain_question_search() -> bool:
+    today = datetime.now(_PT_TZ).date().isoformat()  # Gemini's quota day
+    with _plain_question_searches_lock:
+        if _plain_question_searches["date"] != today:
+            _plain_question_searches.update(date=today, count=0)
+        if _plain_question_searches["count"] >= _PLAIN_QUESTION_SEARCH_DAILY_CAP:
+            return False
+        _plain_question_searches["count"] += 1
+        return True
+
+
+def _plain_question_search_answer(
+    question: str, crawl: dict, *, seconds_left: float,
+) -> tuple[str, str]:
+    """Gemini's own Google search; ("", why) unless the answer came with search results.
+
+    gemini_client.chat directly, not _gemini_llm_chat: past a 429 that chain ends
+    in tool-less tiers and lite_reply, whose lookups would also count as searched.
+    """
+    import public_research
+
+    # TODO(2026-10-28, merging claude/fix-b-replies): skip this layer (B) when
+    # requires_regulation_research — its number guard ignores Gemini's segments —
+    # and check its search_deny_terms here before anything goes out.
+    if crawl.get("reason") == "timeout" or seconds_left < _PLAIN_QUESTION_SEARCH_MIN_SEC:
+        return "", "late"
+    if _quota_exhausted():
+        return "", "quota"
+    if not _take_plain_question_search():
+        return "", "cap"
+    reply_provenance.reset()
+    try:
+        answer = _caller_checked(
+            gemini_client.chat, _build_plain_question_search_prompt(question), [], [], None,
+        )
+    except Exception as exc:
+        if _is_quota_error(exc):
+            # Only the daily quota: a per-minute 429 must not stop every reply till midnight.
+            if "PerDay" in str(exc):
+                _mark_quota_exhausted()
+            return "", "quota"
+        logger.info("plain question search failed type=%s", type(exc).__name__)
+        return "", "error"
+    answer = answer.strip() if isinstance(answer, str) else ""
+    if not answer or reply_policy.is_empty_marker(answer):
+        why = "empty"
+    elif public_research.has_search_promise(answer):
+        why = "promise"
+    # grounding(), not take_grounding(): the reply guard reads the same record next.
+    elif not reply_provenance.searched() or not (reply_provenance.grounding() or {}).get("urls"):
+        why = "ungrounded"
+    else:
+        return answer, "ok"
+    reply_provenance.reset()  # a refused answer vouches for nothing later
+    return "", why
+
+
+def _plain_question_common_answer(question: str, link_free: str) -> tuple[str, str]:
+    """An answer from memory, only for knowledge that does not change ("", why) otherwise.
+
+    ``question``: the same words the search layer may send (Gemini may still search).
+    """
+    import public_research
+
+    if not public_research.answerable_from_memory(link_free):
+        return "", "changes"
+    try:
+        answer = _caller_checked(_llm_chat, _build_common_knowledge_prompt(question), [], [], None)
+    except Exception as exc:
+        if _is_quota_error(exc) and "PerDay" in str(exc):
+            _mark_quota_exhausted()
+        logger.info("plain question common answer failed type=%s", type(exc).__name__)
+        return "", "error"
+    answer = answer.strip() if isinstance(answer, str) else ""
+    if not answer or reply_policy.is_empty_marker(answer) or public_research.has_search_promise(answer):
+        return "", "empty"
+    # Claude's no-search contract answers 「沒辦法確認…」: that is not an answer either.
+    if _CANNOT_CONFIRM_RE.search(answer):
+        return "", "unsure"
+    return answer, "ok"
+
+
+def _build_plain_question_search_prompt(text: str) -> str:
+    today_tw = datetime.now(ZoneInfo("Asia/Taipei")).date().isoformat()
+    return (
+        "請直接回答這個問題。程式這次的爬蟲沒有取得可用資料，請先用 Google 搜尋找可靠來源，"
+        "只根據搜尋到的內容回答，不要憑記憶補充；搜尋後仍找不到可靠資料，就只輸出空字串。\n"
+        "不要寫地址或電話號碼。"
+        "不要說『我會搜尋／讓我查一下』，這是本次最終答案。第一句直接回答，補必要的事實或限制，"
+        "繁體中文短句，不強制行數。使用者明確要求才列來源。不要輸出思緒或規則檢查。\n\n"
+        f"今天台灣日期：{today_tw}\n"
+        f"問題：{text.strip()}"
+    )
+
+
+def _build_common_knowledge_prompt(text: str) -> str:
+    return (
+        "請直接回答這個一般知識問題。這次沒有取得可用的搜尋資料，只能用長期不變的一般常識回答。\n"
+        "不要說查過、查到或查不到，也不要承諾之後再查；不要引用官網、官方資料、機關或醫院的說明、"
+        "公告、報導、新聞或最新資料。不要給具體金額、費率、補助或法規數字。"
+        "不要寫「因人而異」「視情況而定」「諮詢專業人士」這類沒有具體內容的句子。\n"
+        "如果答案會隨時間改變，或你沒有把握，就只輸出空字串。\n"
+        "第一句直接回答，補必要的重點，繁體中文短句，不強制行數。不要輸出思緒或規則檢查。\n\n"
+        f"問題：{text.strip()}"
+    )
 
 
 _DINNER_ERROR_TEXT = "晚餐推薦暫時出錯，等一下再問我一次。"
