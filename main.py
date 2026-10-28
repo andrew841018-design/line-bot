@@ -22376,9 +22376,8 @@ _HELP_TEXT = (
     "  /盤勢 QQQ 圖            期權未平倉與 gamma（假設部位）的圖（SPY、SOXX、台指 也可以）\n"
     "  /盤勢 13F QQQ           前十大成分股的機構持股變化（VOO、SOXX 也可以）\n"
     "                          都是程式用公開資料算的，只描述狀態，不是買賣建議\n"
-    "  🔍 看大字版             股票卡、FCN 評估卡、盤勢卡、爸媽健康卡最下面的按鈕：點了用網頁看大字\n"
+    "  🔍 看大字版             股票卡、FCN 評估卡、盤勢卡最下面的按鈕：點了用網頁看大字\n"
     "                          網址過幾天會換，打不開就再叫一次卡片\n"
-    "                          爸媽健康卡的網頁比較快失效，刪除紀錄或暫停時也會清掉\n"
     "【其他】\n"
     "  /group_id               顯示本群 ID\n"
     "  /help                   看這張說明"
@@ -22387,11 +22386,30 @@ _HELP_TEXT = (
 _HELP_EXERCISE_NUDGE_LINE = "                          爸媽好幾天沒提到運動時，咪寶回話時會順便提醒（每人最多 3 天一次）\n"
 
 
+# 2026-10-25 爸媽健康卡的大字版網頁：健康頁開關開著才在 /help 提到（關著時按鈕不存在，說了會騙人；
+# 和 /健康 說明的做法一致，見 parent_health._recording_explanation）
+_HELP_HEALTH_PAGE_CARDS = ("盤勢卡最下面的按鈕", "盤勢卡、爸媽健康卡最下面的按鈕")
+_HELP_HEALTH_PAGE_ANCHOR = "網址過幾天會換，打不開就再叫一次卡片\n"
+_HELP_HEALTH_PAGE_LINE = "                          爸媽健康卡的網頁比較快失效，刪除紀錄或暫停時也會清掉\n"
+
+
+def _health_pages_on() -> bool:
+    """爸媽健康卡的大字版網頁開關（整個網頁功能關著也算關）；模組壞了當作關。"""
+    try:
+        return card_pages is not None and bool(card_pages.health_enabled())
+    except Exception:
+        return False
+
+
 def _help_text() -> str:
-    if not _exercise_nudge_on():
-        return _HELP_TEXT
-    marker = "【民調】\n"
-    return _HELP_TEXT.replace(marker, _HELP_EXERCISE_NUDGE_LINE + marker, 1)
+    text = _HELP_TEXT
+    if _health_pages_on():
+        text = text.replace(*_HELP_HEALTH_PAGE_CARDS, 1)
+        text = text.replace(_HELP_HEALTH_PAGE_ANCHOR, _HELP_HEALTH_PAGE_ANCHOR + _HELP_HEALTH_PAGE_LINE, 1)
+    if _exercise_nudge_on():
+        marker = "【民調】\n"
+        text = text.replace(marker, _HELP_EXERCISE_NUDGE_LINE + marker, 1)
+    return text
 
 
 def _handle_layer2_correction(group_id: str, reason: str) -> str:
