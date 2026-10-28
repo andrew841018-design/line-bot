@@ -31,6 +31,8 @@ from collections.abc import Sequence
 from typing import Union
 from zoneinfo import ZoneInfo
 
+import civic_calendar
+
 from google import genai
 from google.genai import types
 
@@ -91,6 +93,8 @@ def _runtime_time_context() -> str:
         "回答任何「現在、目前、今年、去年、最新、尚未公布、完整數據」等時間相關問題時，"
         "必須以這個時間為基準；不可沿用訓練資料、舊對話或舊回答中的年份。\n"
         "如果資料需要最新官方統計，先搜尋並說明資料發布日期；不能把舊年份說成現在。"
+        # 2026-10-28: twice that day a fallback model had the election dates wrong.
+        + civic_calendar.prompt_suffix(now_tw.date())
     )
 
 

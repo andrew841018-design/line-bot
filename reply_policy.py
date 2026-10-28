@@ -6,6 +6,7 @@ import bisect
 import re
 import unicodedata
 
+import civic_calendar
 from quote_context import QUOTE_CONTEXT_RULE, QUOTE_ONLY_PLACEHOLDER
 
 NO_REPEAT_CONTRACT = """【不重複、不摘要：只給新價值】
@@ -1843,4 +1844,821 @@ def unbacked_contact_details(reply: str | None, backing=(), places=()) -> list[s
             if key not in found:
                 found.append(key)
     found += [key for key in sorted(_phone_keys(reply)) if key not in known_phones]
+    return found
+
+
+# ── Dates the bot cannot stand behind (2026-10-28) ───────────────────────────
+# Claude CLI had been logged out for days and Gemini 2.5 flash was out of
+# quota, so a burst reply came from 2.5-flash-lite.  A family member gave the
+# local-election voting day (11/28); the reply said that date was not a voting
+# day and that the "next" presidential election was on 2025-01-11 — a date
+# already past, and never an election.  The prompts already carried today's
+# date and said not to correct dated public facts from memory; the fallback
+# model ignored both, so every generated reply now goes through two checks,
+# and either one drops the reply whole:
+# - past_upcoming: a date before today (Asia/Taipei) scheduled as coming
+#   (「下一次…在2025年」「預計於2025年」「2025年1月11日將舉行」), whatever
+#   was searched.
+# - denied_date: denying what the user or the shared page said a date is for
+#   (「11月28日並非投票日」「投票不是在11月28日」「11月28日投票有誤」) with no
+#   search segment, research evidence or shared page behind the denial.
+# Quotes holding a date or a clause are masked first (「投票日」 stays), as for
+# the other claim guards.  A date's clause ends at ，,；; — not at a label
+# colon.  Each check reads a few characters on either side of a date and
+# caches what it learns per clause, and the patterns are fixed-word
+# alternations with bounded gaps, so a scan stays linear (H5, 2026-10-05).
+_DATE_DIGITS = str.maketrans("０１２３４５６７８９／－．", "0123456789/-.")
+_DATE_ANY_RE = re.compile(
+    r"(?<!\d)(?:民國\s*(?P<roc>\d{2,3})|(?P<y>(?:19|20)\d{2})|(?P<roc2>1[01]\d)(?=\s*年\s*\d{1,2}\s*月))\s*"
+    r"(?:年(?:\s*(?P<m>\d{1,2})\s*月(?:\s*(?P<d>\d{1,2})\s*[日號])?)?"
+    r"|[/.\-](?P<sm>\d{1,2})[/.\-](?P<sd>\d{1,2})(?!\d))"
+    r"|(?<![\d/.\-])(?P<mm>\d{1,2})\s*(?:月\s*(?P<md>\d{1,2})\s*[日號]|/(?P<ms>\d{1,2})(?![\d/]))"
+)
+_DATE_SENTENCE_RE = re.compile(r"[^。！？!?\n]+[。！？!?]*")
+_DATE_CLAUSE_BREAK_RE = re.compile(r"[，,；;]")
+_DATE_WINDOW = 20
+_DATE_QUOTE_KEEP = 8  # a quoted word this short, with no digit or clause, stays readable
+# What the user said, a shared page, research evidence and each search segment
+# are read up to this length (the reply itself is cut by the caller).
+_DATE_BACKING_MAX_CHARS = 20_000
+
+# ── past_upcoming ────────────────────────────────────────────────────────────
+# A coming event (下一次…), or a plan word leading straight into the date
+# (「預計在2025年」, not 「預計會超過2024年的件數」 where 2024 is a comparison).
+_UPCOMING_EVENT_RE = re.compile(
+    r"下一?(?:次|屆|回)|即將|尚未(?:到|舉行|舉辦|開始)|還沒到|upcoming|next", re.IGNORECASE
+)
+_UPCOMING_PLAN_LEAD_RE = re.compile(
+    r"(?:(?:預計|預定|預估|預期)(?:會|將)?(?:在|於|是|為|到|從|自)?|將(?:在|於|從|自))\s*$"
+)
+# What ties an event word to the date: 「下次大選在2025年」「下一次大選：2025年」,
+# not 「下一次投票請帶2024年換發的身分證」.
+_UPCOMING_LINK_RE = re.compile(
+    r"(?:在|於|是|為|訂在|定在|落在|[：:]|\b(?:in|on|is|at))\s*$", re.IGNORECASE
+)
+_OCCURS = r"(?:舉行|舉辦|登場|上路|實施|施行|生效|開始|開幕|開放|營運|啟用|揭曉|公布|發布|到來|完成|上市|開賣|投票)"
+_TAIL_LEAD = r"^(?:(?:[底初中起]|前後?|左右)\s*)?"
+# 「2025年1月11日將舉行」 on its own; a bare 「…舉行」 only after an event word.
+_UPCOMING_TAIL_RE = re.compile(_TAIL_LEAD + r"(?:即將|(?:將|才會|會)" + _OCCURS + ")")
+_OCCURS_TAIL_RE = re.compile(_TAIL_LEAD + r"(?:即將|將|才會|會)?" + _OCCURS)
+# 「下一次大選不可能在2025年」 denies the schedule.
+_UPCOMING_NEGATED_RE = re.compile(r"不可能|不會|不是|並非|並不|沒有|不在")
+# 「原定2025年1月舉行」「當時預計…」 tell an old plan, not a coming date.
+_PAST_FRAME_RE = re.compile(
+    r"原本|原定|原訂|原先|本來|當初|曾經|曾於|曾在|已經|已於|已在|當時|那時|去年|前年|過去|先前"
+)
+# How a correction reads, kept to the date's own clause so 「…預計在2025年舉行，
+# 你說的不對」 is still caught: someone else's claim before the date
+# (「網傳下一次…」「我之前說…」), or the claim called wrong or old right after
+# it (「…2025年1月11日的說法有誤」).  A delay (「預計2025年完工，但已經延到
+# 2027年」) needs a coming date after the delay word.
+_UPCOMING_REPORTED_RE = re.compile(
+    r"你說|您說|妳說|網傳|網路(?:上)?(?:傳|說)|傳說|據說|有人說|謠傳|聽說|新聞說|報導說|影片說|文章說|"
+    r"貼文說|之前說|先前說|剛剛說|剛才說|我說|上一則|前一則"
+)
+_UPCOMING_DISPUTED_RE = re.compile(
+    r"的說法|是錯的|有誤|不對|不正確|是舊(?:的|資訊|消息|資料)|舊資訊|舊消息|過時|是假的|謠言"
+)
+# A date the sentence calls wrong: the verdict right after it (「…2025年1月11日的
+# 說法有誤」), not one later in the clause about something else (review 6).
+_DATE_CALLED_WRONG_RE = re.compile(
+    r"^[^，,。；;]{0,3}?(?:的說法|是錯的|有誤|不對|不正確|是舊(?:的|資訊|消息|資料)|舊資訊|舊消息|過時|是假的|謠言)"
+)
+_UPCOMING_DELAY_RE = re.compile(r"延到|延後|延期|順延|延至|改到|改為|改成|改期|推遲")
+# 「延到」「改為」「從2025年到2027年」, not 「改選」 (review 6).
+_UPCOMING_CHANGE_RE = re.compile(r"延(?:到|至|後|期|長)|改(?:到|為|成|期|至|在)|從[^，,。；;]{0,12}?(?:到|至)")
+# The delay must be the same thing's (「但已經延到2027年」), not a new subject's
+# (「颱風假則延到…」).
+_UPCOMING_DELAY_LEAD_RE = re.compile(r"^[，,；;\s]*(?:但|不過|後來|已經|已|現在|目前|卻|又|並)*\s*$")
+# 「2020年疫情後，下一次…是2022年」 counts from an earlier date; 「環保署在2023年
+# 7月13日預告…將從2025年起」 tells a plan as it was announced then.
+_UPCOMING_ANCHOR_TAIL_RE = re.compile(r"^[^，,。；;]{0,4}?(?:之後|以後|以來|後|起|開始)")
+_UPCOMING_REPORT_ANCHOR_RE = re.compile(
+    r"^[^，,。；;]{0,4}?(?:預告|公告|宣布|表示|指出|提出|發布|通過|規劃|說明|說)"
+)
+
+# ── denied_date ──────────────────────────────────────────────────────────────
+# Kinds of public schedule; a denial only counts for a kind the user (or the
+# shared page) put next to that date.
+_DATE_PUBLIC_EVENT_GROUPS = {
+    "vote": "投票|選舉|大選|開票",
+    "referendum": "公投",
+    "holiday": "假日|放假|連假|補班|補課|國定|紀念日|節日|颱風假|停班|停課|開學",
+    "apply": "截止|報名|登記|申請|開放|領取|發放",
+    "policy": "上路|生效|實施|施行|發布|公布|公告",
+    "event": "舉行|舉辦|開幕",
+    "business": "營業|休市|開盤",
+}
+_DATE_PUBLIC_EVENT = "(?:" + "|".join(_DATE_PUBLIC_EVENT_GROUPS.values()) + ")"
+_DATE_PUBLIC_EVENT_RE = re.compile(_DATE_PUBLIC_EVENT)
+_DATE_EVENT_GROUP = {
+    word: group for group, words in _DATE_PUBLIC_EVENT_GROUPS.items() for word in words.split("|")
+}
+_DATE_NEGATION = (
+    r"(?:並非|並不是|不是|不在|不會是|並沒有|沒有|並無|不屬於|不算|並未|從未|未曾|"
+    r"非(?=" + _DATE_PUBLIC_EVENT + r"))"
+)
+# 「11/28不用投票」 denies; 「11月28日不用請假也能投票」 does not (review 6).
+_DATE_NEED_NEGATION = r"(?:不用|不必|不需要|無須|無需)"
+_DATE_WEEKDAY = (
+    r"(?:\s*(?:[（(]\s*)?(?:星期|禮拜|週|周)[一二三四五六日天](?:\s*[）)])?|\s*[（(]\s*[一二三四五六日天]\s*[）)])"
+)
+# 「11月28日並非投票日」「11月28日（六），並不是投票日」「11月28日那天不是投票日」;
+# 「11月28日不是星期五」 is arithmetic.
+_DENIAL_AFTER_RE = re.compile(
+    rf"^{_DATE_WEEKDAY}?(?:那天|當天|這天|那日|當日)?\s*[，,、：:]?\s*"
+    r"(?:在台灣|在我國|在國內|其實|實際上|根本|確實|也|則)?"
+    rf"(?:{_DATE_NEGATION}[^，,。；;]{{0,6}}?|{_DATE_NEED_NEGATION}){_DATE_PUBLIC_EVENT}"
+)
+_DENIAL_LEAD = r"(?:並非|並不是|不是|不在|不會是)(?:在|於)?\s*$"
+# 「投票日並不是11月28日」「投票不是在11月28日」
+_DENIAL_BEFORE_RE = re.compile(rf"{_DATE_PUBLIC_EVENT}[^，,。；;]{{0,4}}?" + _DENIAL_LEAD)
+# 「九合一不是11月28日投票」
+_DENIAL_LEAD_RE = re.compile(_DENIAL_LEAD)
+_DENIAL_EVENT_NEXT_RE = re.compile(rf"^[^，,。；;]{{0,4}}?{_DATE_PUBLIC_EVENT}")
+# 「是11月28日，而非11月29日」「而不是你說的11月29日」
+_DENIAL_INSTEAD_RE = re.compile(r"(?:而非|而不是)(?:你說的|您說的|妳說的|說的)?\s*$")
+# 「你說的11月28日投票有誤」, not 「11月28日投票不要搞錯了」 or 「沒有錯」.
+_DATE_DONT = r"(?:不要|不會|不用|別|免得|以免|避免|千萬|沒)"
+_DENIAL_DISPUTE_RE = re.compile(
+    rf"^[^，,。；;]{{0,8}}?{_DATE_PUBLIC_EVENT}(?:(?!{_DATE_DONT})[^，,。；;]){{0,6}}?"
+    r"(?<!不要)(?<!不會)(?<!不用)(?<!別)(?<!免得)(?<!以免)(?<!避免)(?<!千萬)(?<!沒)(?<!沒有)"
+    r"(?:有誤|是錯的|錯了|說錯|弄錯|搞錯|記錯|不正確|不對)"
+)
+# 「投票日是11月28日的說法有誤」: the claim about the day, called wrong.
+_DENIAL_CLAIM_WRONG_RE = re.compile(
+    r"^[^，,。；;]{0,3}?的?說法[^，,。；;]{0,4}?"
+    r"(?:有誤|不正確|不對|錯誤|是錯的|不是事實|不符(?:合)?(?:現況|事實)|不太(?:準確|正確|對))"
+)
+# 「…，是九合一地方選舉」「…而是…選舉」 after a denial.
+_ELECTION_TYPE = (
+    r"九合一|地方(?:公職人員)?選舉|縣市長|市長|議員|直轄市|總統|立委|立法委員|公投|罷免|期中選舉|補選|大選"
+)
+_DENIAL_AFFIRM_RE = re.compile(
+    rf"(?:而是|(?:^|[，,。！!；;])\s*(?:當天|那天|這天|其實|應該|而)?\s*是)[^，,。；;]{{0,10}}?(?:{_ELECTION_TYPE})"
+)
+_DATE_RUMOUR_RE = re.compile(r"謠言|謠傳|不實|假消息|假訊息|闢謠|澄清")
+_DATE_HEARSAY_RE = re.compile(r"網傳|網路(?:上)?(?:傳|說)|傳說|據說|謠傳|聽說|傳言")
+# 「11月28日沒有總統選舉」 is true of a local-election day.
+_NATIONAL_TYPE_RE = re.compile(r"總統|副總統|立委|立法委員")
+# A shared page that moved a day itself (「原訂11月1日截止，現延長至11月15日」)
+# backs 「報名不是11月1日截止」 — the day moved away from, not the new one.
+_DATE_OLD_DAY_RE = re.compile(r"(?:原訂|原定|原先|原本(?:訂|定|預計)?|原)\s*(?:於|在|是)?\s*$")
+_DATE_NEW_DAY_RE = re.compile(r"(?:延長|延後|順延|延|改|提前|移)(?:至|到|為|成|在)\s*$")
+_DATE_MOVED_TAIL_RE = re.compile(
+    r"^[^，,。；;]{0,8}?(?:延期|延後|取消|停辦|暫停|改期|順延|提前|延長|延到|延至|改到|改至|改為|改成|改在)"
+)
+_DATE_CHANGE_NEAR = 12
+# Another country's schedule is not Taiwan's calendar (「美國投票日是11月3日」).
+_DATE_FOREIGN_RE = re.compile(
+    r"美國|美方|日本|韓國|南韓|北韓|英國|法國|德國|中國|大陸|香港|澳門|新加坡|菲律賓|越南|泰國|印尼|"
+    r"印度|俄羅斯|烏克蘭|歐洲|歐盟|加拿大|澳洲|紐西蘭|巴西|墨西哥|\bUSA?\b|\bU\.S\."
+)
+# A national election tied to a date: 「總統及立委大選預計在2025年1月11日」
+# 「總統及立法委員選舉已於2025年1月11日」「大選已於2025年1月11日」「2024年總統大選」.
+# Only these names count (「總統任期中間的期中選舉在…」 is another vote), and the
+# date must follow a link word (「總統大選後的就職典禮在…」 is not the vote).
+_NATIONAL_VOTE = (
+    r"(?P<pres>總統(?:、?副總統)?(?:(?:及|和|與|暨|、)(?:立委|立法委員|國會))?的?(?:選舉|大選))|大選"
+)
+_PRESIDENTIAL_LEAD_RE = re.compile(
+    rf"(?:{_NATIONAL_VOTE})(?:已|將|預計|預定|則)?(?:在|於|是|為|訂在|定在|落在|[：:])\s*$"
+)
+_PRESIDENTIAL_TAIL_RE = re.compile(rf"^(?:[^，,。；;\d]{{0,4}}?(?:舉行|舉辦))?了?的?(?:{_NATIONAL_VOTE})")
+# 「上一次總統大選，是2025年1月11日」
+_PRESIDENTIAL_CLAUSE_END_RE = re.compile(rf"(?:{_NATIONAL_VOTE})\s*$")
+_PRESIDENTIAL_LINK_ONLY_RE = re.compile(r"^\s*(?:是|在|於|為)\s*$")
+# Taiwan named outright: only then is the day checked, not just the year (the
+# US also votes for a president in those years, in November).
+_DATE_TAIWAN_RE = re.compile(r"台灣|我國|中華民國|立委|立法委員|中選會|副總統")
+_DATE_US_PEOPLE_RE = re.compile(r"川普|拜登|賀錦麗|歐巴馬|共和黨|民主黨|期中選舉")
+# 「我沒有資料確認11月28日是否投票」 is the honest answer, not a denial.
+_DATE_UNSURE_RE = re.compile(
+    r"是否|有沒有|是不是|會不會|無法確認|沒辦法確認|不能確認|不確定|不清楚|沒有資料|查不到|不知道"
+)
+_DATE_CONDITION_RE = re.compile(r"如果|若|要是|假如|假設|萬一|的話")
+
+# ── election_timing ──────────────────────────────────────────────────────────
+# 15:03 the same day: 「美國和台灣大選已近」 got 「台灣的總統及立法委員選舉已於2025年
+# 1月11日舉行完畢，因此「台灣大選已近」的說法不符現況」 — no date to compare,
+# the same stale belief.  A sentence disputing when an election is drops the
+# reply too, unless a search segment states the same dispute or every date it
+# names is in ``civic_calendar`` (the prompts carry the same list).  Research
+# evidence does not count: an election word in it does not make the dispute true.
+_ELECTION_RE = re.compile(r"選舉|大選|九合一|投票日|投開票|選舉日")
+# 今年／年底 are left out (「今年選舉把民調當開票結果的說法不正確」 is not about
+# when), and 下一次 counts only with a date (「網傳下次選舉改用電子投票」 is not).
+_ELECTION_TIMING_RE = re.compile(
+    r"時點|時間點|已近|將近|接近|快到|即將|已經結束|已結束|舉行完畢|已過|過了|還沒到|尚未舉行"
+)
+_ELECTION_NEXT_RE = re.compile(r"下一?次|下屆")
+_ELECTION_POINTER_RE = re.compile(r"[，,；;\s]*(?:這|此|那)(?:個|種|樣)?(?:說法)?")
+# Only an explicit verdict on a claim counts (「…的說法不符現況」「…時點不準確」
+# 「…不是事實」); 「選舉前政府通常不會…」「今年沒有總統大選」 are not disputes.
+_ELECTION_DISPUTE_RE = re.compile(
+    r"說法[^，,。；;]{0,6}?(?:不符(?:合)?現況|不太?準確|不太?正確|有誤|錯誤|不太?對|是錯的)|"
+    r"時(?:間)?點[^，,。；;]{0,4}?(?:不太?準確|不太?正確|有誤|不太?對)|(?:不是|並非)事實|不符(?:合)?現況"
+)
+_DATE_QUESTION_END_RE = re.compile(r"(?:[?？]|(?:嗎|呢)[。！!]*)\s*$")
+_DATE_CLAUSE_QUESTION_RE = re.compile(r"(?:嗎|呢)\s*$")
+
+
+def _date_parts(match: re.Match) -> tuple[int | None, int | None, int | None] | None:
+    """(year, month, day) of a ``_DATE_ANY_RE`` match, None parts not given;
+    None for an impossible month or day."""
+    if match.group("roc") or match.group("roc2"):
+        year = int(match.group("roc") or match.group("roc2")) + 1911
+    elif match.group("y"):
+        year = int(match.group("y"))
+    else:
+        year = None
+    month = match.group("m") or match.group("sm") or match.group("mm")
+    day = match.group("d") or match.group("sd") or match.group("md") or match.group("ms")
+    month = int(month) if month else None
+    day = int(day) if day else None
+    if (month is not None and not 1 <= month <= 12) or (day is not None and not 1 <= day <= 31):
+        return None
+    return year, month, day
+
+
+def _date_before(parts: tuple[int | None, int | None, int | None], today) -> bool | None:
+    """Before ``today`` at the date's own precision; None without a year."""
+    year, month, day = parts
+    if year is None:
+        return None
+    if month is None:
+        return year < today.year
+    if day is None:
+        return (year, month) < (today.year, today.month)
+    return (year, month, day) < (today.year, today.month, today.day)
+
+
+def _date_key(parts: tuple[int | None, int | None, int | None]) -> tuple[int, int, int]:
+    """Sort key; a missing month or day counts as the start of the period."""
+    year, month, day = parts
+    return (year or 0, month or 0, day or 0)
+
+
+def _dated_text(text: str | None) -> str:
+    return (text or "").translate(_DATE_DIGITS)
+
+
+def _mask_dated_quotes(text: str) -> str:
+    """Blank out quoted claims (「下一次大選在2025年」); a short quoted word with
+    no digit or clause (「投票日」) is the reply's own emphasis and stays."""
+    parts, last = [], 0
+    for start, end in _quoted_spans(text):
+        inner = text[start + 1:end - 1]
+        if len(inner) <= _DATE_QUOTE_KEEP and not re.search(r"[\d，,。；;！？!?]", inner):
+            continue
+        parts += [text[last:start + 1], "〇" * (end - start - 2), text[end - 1]]
+        last = end
+    parts.append(text[last:])
+    return "".join(parts)
+
+
+def _date_mentions(text: str):
+    """(sentence, [(month, day, year, groups, match)]) for each sentence of
+    ``text`` with a dated mention; ``groups`` are the public-schedule kinds
+    written near that date."""
+    for sentence in _DATE_SENTENCE_RE.findall(text):
+        mentions = []
+        for match in _DATE_ANY_RE.finditer(sentence):
+            parts = _date_parts(match)
+            if not parts or parts[1] is None or parts[2] is None:
+                continue
+            near = sentence[max(0, match.start() - 15):match.end() + 15]
+            groups = {_DATE_EVENT_GROUP[m.group(0)] for m in _DATE_PUBLIC_EVENT_RE.finditer(near)}
+            mentions.append((parts[1], parts[2], parts[0], groups, match))
+        if mentions:
+            yield sentence, mentions
+
+
+class _DateClauses:
+    """Clause edges (，；) of one sentence, computed once; per-clause pattern
+    results are cached so many dates in one long clause stay linear."""
+
+    def __init__(self, sentence: str):
+        self.text = sentence
+        self.breaks = [m.start() for m in _DATE_CLAUSE_BREAK_RE.finditer(sentence)]
+        self._hits: dict = {}
+
+    def span(self, start: int, end: int) -> tuple[int, int]:
+        """The clause holding text[start:end]."""
+        i = bisect.bisect_left(self.breaks, start)
+        lo = self.breaks[i - 1] + 1 if i else 0
+        j = bisect.bisect_left(self.breaks, end)
+        hi = self.breaks[j] if j < len(self.breaks) else len(self.text)
+        return lo, hi
+
+    def has(self, span: tuple[int, int], pattern: re.Pattern) -> bool:
+        key = (span, pattern.pattern)
+        if key not in self._hits:
+            self._hits[key] = bool(pattern.search(self.text, span[0], span[1]))
+        return self._hits[key]
+
+    def groups(self, span: tuple[int, int]) -> set:
+        key = (span, "groups")
+        if key not in self._hits:
+            self._hits[key] = {
+                _DATE_EVENT_GROUP[m.group(0)]
+                for m in _DATE_PUBLIC_EVENT_RE.finditer(self.text, span[0], span[1])
+            }
+        return self._hits[key]
+
+    def before(self, start: int, width: int = _DATE_WINDOW) -> str:
+        """Clause text before ``start``."""
+        lo, _ = self.span(start, start)
+        return self.text[max(lo, start - width):start]
+
+    def after(self, end: int, width: int = _DATE_WINDOW) -> str:
+        """Text after ``end``; the patterns that read it decide which comma
+        they may cross (「11月28日，並不是投票日」)."""
+        return self.text[end:end + width]
+
+
+def _clause_hedged(clauses: _DateClauses, span: tuple[int, int]) -> bool:
+    """The clause is a question (「…嗎」, or the last clause of 「…？」), a
+    condition or honest doubt: none of those asserts anything."""
+    whole = (0, len(clauses.text))
+    asked = clauses.has(span, _DATE_CLAUSE_QUESTION_RE) or (
+        span[1] == whole[1] and clauses.has(whole, _DATE_QUESTION_END_RE)
+    )
+    return asked or clauses.has(span, _DATE_UNSURE_RE) or clauses.has(span, _DATE_CONDITION_RE)
+
+
+_DATE_RANGE_JOIN_RE = re.compile(
+    rf"^\s*{_DATE_WEEKDAY}?\s*(?:起)?[^，,。；;\d]{{0,4}}?(?:至|到|～|~|－|—|-)\s*$"
+)
+# 「2026年9月至12月」: a bare month closes the range.
+_DATE_RANGE_MONTH_END_RE = re.compile(
+    rf"\s*{_DATE_WEEKDAY}?\s*(?:起)?[^，,。；;\d]{{0,4}}?(?:至|到|～|~|－|—|-)\s*(?P<m>\d{{1,2}})\s*月(?!\s*\d)"
+)
+
+
+def _range_start_running(index: int, dates: list, clauses: _DateClauses, today) -> bool:
+    """``dates[index]`` opens a range whose end (in the start's year when it
+    gives none) is today or later: 「2026年10月1日至12月31日」 is still running."""
+    match, parts = dates[index]
+    bare = _DATE_RANGE_MONTH_END_RE.match(clauses.text, match.end(), match.end() + 16)
+    if bare and parts[0] is not None:
+        return _date_before((parts[0], int(bare.group("m")), None), today) is False
+    if index + 1 >= len(dates):
+        return False
+    nxt, (year, month, day) = dates[index + 1]
+    if nxt.start() - match.end() > 10 or not _DATE_RANGE_JOIN_RE.search(
+        clauses.text[match.end():nxt.start()]
+    ):
+        return False
+    end = (year if year is not None else parts[0], month, day)
+    return end[0] is not None and _date_before(end, today) is False
+
+
+def _past_upcoming(sentence: str, dates: list, clauses: _DateClauses, today) -> bool:
+    delay = _UPCOMING_DELAY_RE.search(sentence)
+    if delay:
+        lo, _ = clauses.span(delay.start(), delay.end())
+        if _UPCOMING_DELAY_LEAD_RE.search(sentence[lo:delay.start()]) and any(
+            match.start() > delay.start() and _date_before(parts, today) is False
+            for match, parts in dates
+        ):
+            return False
+    # A current or future date in the same clause, with a change word, tells a
+    # change (「預計從2025年延到2027年」), so that clause is not checked;
+    # 「…在2025年1月11日舉行而九合一在2026年11月28日」 is not one.
+    changing = {
+        span
+        for match, parts in dates
+        if _date_before(parts, today) is False
+        and clauses.has(span := clauses.span(match.start(), match.end()), _UPCOMING_CHANGE_RE)
+    }
+    anchor = None  # the earliest starting point told so far (「2020年疫情後」)
+    announced = None  # the earliest announcement told so far (「在2023年7月13日預告」)
+    for index, (match, parts) in enumerate(dates):
+        key = _date_key(parts)
+        anchored = anchor is not None and anchor < key
+        reported_then = announced is not None and announced < key
+        if parts[0] is not None:
+            tail = clauses.after(match.end(), 8)
+            if _UPCOMING_ANCHOR_TAIL_RE.search(tail) and (anchor is None or key < anchor):
+                anchor = key
+            if _UPCOMING_REPORT_ANCHOR_RE.search(tail) and (announced is None or key < announced):
+                announced = key
+        if not _date_before(parts, today):
+            continue
+        lead = clauses.before(match.start())
+        # 「在2023年7月13日預告…將從2025年起」 tells the plan then; 「中選會在2024年1月
+        # 13日宣布當選人，下一次總統大選預計在2025年」 is a claim of its own (review 6).
+        if reported_then and not _UPCOMING_EVENT_RE.search(lead):
+            continue
+        if _range_start_running(index, dates, clauses, today):
+            continue
+        span = clauses.span(match.start(), match.end())
+        # 「…預計在2025年1月11日舉行，對吧？」 still asserts the date (review 6).
+        if span in changing or clauses.has(span, _PAST_FRAME_RE) or _clause_hedged(clauses, span):
+            continue
+        if _UPCOMING_NEGATED_RE.search(lead[-8:]) or _UPCOMING_REPORTED_RE.search(lead):
+            continue
+        if _DATE_CALLED_WRONG_RE.search(clauses.after(match.end(), 8)):
+            continue
+        tail = clauses.after(match.end(), 8)
+        if _UPCOMING_PLAN_LEAD_RE.search(lead) or _UPCOMING_TAIL_RE.search(tail):
+            return True
+        if not anchored and _UPCOMING_EVENT_RE.search(lead) and (
+            _UPCOMING_LINK_RE.search(lead) or _OCCURS_TAIL_RE.search(tail)
+        ):
+            return True
+    return False
+
+
+def _iter_denials(sentence: str, dates: list, clauses: _DateClauses, following: str = ""):
+    """(year, month, day, kinds, instead) for every denial of a dated schedule in
+    ``sentence``; a hedged clause and a change of kind only (「不是總統大選，
+    是九合一地方選舉」) are left out.  Shared by the reply and its backing."""
+    first_event = _DATE_PUBLIC_EVENT_RE.search(sentence)
+    if not first_event:
+        return
+    for match, (year, month, day) in dates:
+        if month is None or day is None:
+            continue
+        span = clauses.span(match.start(), match.end())
+        if _clause_hedged(clauses, span):
+            continue
+        before = clauses.before(match.start())
+        # 「網傳11月28日不是投票日，這是謠言」 tells a rumour, it does not deny the
+        # day; 「你說的11月28日投票有誤」 is the bot's own denial.
+        if _DATE_HEARSAY_RE.search(before) or clauses.has((0, len(sentence)), _DATE_RUMOUR_RE):
+            continue
+        after = clauses.after(match.end())
+        instead = _DENIAL_INSTEAD_RE.search(before) if first_event.start() < match.start() else None
+        lead = _DENIAL_LEAD_RE.search(before)
+        claim_wrong = (
+            _DENIAL_CLAIM_WRONG_RE.search(after) if clauses.groups(span) else None
+        )
+        found = (
+            _DENIAL_AFTER_RE.search(after)
+            or _DENIAL_BEFORE_RE.search(before)
+            or (lead if lead and _DENIAL_EVENT_NEXT_RE.search(after) else None)
+            or instead
+            or _DENIAL_DISPUTE_RE.search(after)
+            or claim_wrong
+        )
+        if not found:
+            continue
+        # The kind may sit in the denial itself (「11月28日（六），並不是投票日」)
+        # or, for 「…，而非11月29日」, earlier in the sentence.
+        kinds = clauses.groups(span) | {
+            _DATE_EVENT_GROUP[m.group(0)] for m in _DATE_PUBLIC_EVENT_RE.finditer(found.group(0))
+        }
+        if found is instead:
+            kinds |= clauses.groups((0, len(sentence)))
+        # 「…，是九合一地方選舉」（or 「。當天是…」 next） keeps the day and changes
+        # the kind; 「…，是11月29日投票」 moves the day and stays a denial.  A
+        # correction to another country's vote is told apart: it excuses no
+        # denial of Taiwan's listed day (round 6).
+        rest = (sentence[match.end():] + following)[:40]
+        local, abroad = set(), set()
+        for affirm in _DENIAL_AFFIRM_RE.finditer(rest):
+            text = affirm.group(0)
+            if _DATE_ANY_RE.search(text):
+                continue
+            target = abroad if _DATE_FOREIGN_RE.search(text) else local
+            target.add("referendum" if text.endswith("公投") else "vote")
+        kinds -= local
+        # 「11月28日沒有總統選舉」 names a national vote: a type, not the day.
+        national = bool(_NATIONAL_TYPE_RE.search(found.group(0)))
+        if kinds:
+            yield year, month, day, kinds, found is instead, abroad, national
+
+
+def _denials_in(text: str, today) -> set:
+    """(month, day, kind) of every denial a backing text states itself; a
+    dated year in the past is another occasion."""
+    found = set()
+    for sentence in _DATE_SENTENCE_RE.findall(text):
+        dates = [(m, parts) for m in _DATE_ANY_RE.finditer(sentence) if (parts := _date_parts(m))]
+        if not dates:
+            continue
+        for year, month, day, kinds, _, abroad, _ in _iter_denials(sentence, dates, _DateClauses(sentence)):
+            if year is None or year >= today.year:
+                found |= {(month, day, kind) for kind in kinds - abroad}
+    return found
+
+
+class _DenialBacking:
+    """What can back a denial, read once per reply and indexed by date."""
+
+    def __init__(
+        self, supported_segments, evidence_text: str, material_text: str, today, user_text: str = "",
+    ):
+        # A search segment or evidence sentence must state the same denial —
+        # same day, same kind — itself: 「11月28日不是補班日，是投票日」 backs no
+        # 「11月28日不是投票日」 (review 6).
+        evidence = _dated_text((evidence_text or "")[:_DATE_BACKING_MAX_CHARS])
+        self.denied = _denials_in(evidence, today)
+        for seg in supported_segments or ():
+            self.denied |= _denials_in(_dated_text(str(seg or "")[:_DATE_BACKING_MAX_CHARS]), today)
+        # Which days the evidence gives each kind.
+        self.days_by_kind: dict = {}
+        for _, mentions in _date_mentions(evidence):
+            for month, day, year, kinds, _ in mentions:
+                if year is None or year >= today.year:
+                    for kind in kinds:
+                        self.days_by_kind.setdefault(kind, set()).add((month, day))
+        # The day a shared page moved away from (「原訂11月1日」「當天暫停營業」),
+        # not the day it moved to (「延長至11月15日」).
+        # The user announcing the change (「原本11/20截止，延長到11/30了」) backs
+        # the bot repeating it, as a shared page does (review 6).
+        self.moved: dict = {}
+        material = _dated_text(
+            ((material_text or "") + "\n" + (user_text or "") + "\n" + (evidence_text or ""))[
+                :3 * _DATE_BACKING_MAX_CHARS
+            ]
+        )
+        for sentence, mentions in _date_mentions(material):
+            for month, day, _, kinds, match in mentions:
+                lead = sentence[max(0, match.start() - _DATE_CHANGE_NEAR):match.start()]
+                tail = sentence[match.end():match.end() + _DATE_CHANGE_NEAR]
+                if _DATE_NEW_DAY_RE.search(lead):
+                    continue
+                starts = tail.lstrip().startswith("起")
+                if _DATE_OLD_DAY_RE.search(lead) or (not starts and _DATE_MOVED_TAIL_RE.search(tail)):
+                    self.moved.setdefault((month, day), set()).update(kinds)
+        # A listed election day is never moved by a page (「網傳中選會宣布投票延期」)
+        # or by evidence about another country's vote.
+        self.listed_votes = {
+            (m, d) for y, m, d in civic_calendar.verified_election_dates(today) if y >= today.year
+        }
+
+    def backs(self, kinds: set, month_day) -> bool:
+        """A search segment or evidence sentence states this denial; the
+        evidence gives this kind another day and never this one; or the shared
+        page moved this day for this kind.  The verified calendar alone backs
+        no denial: it lists Taiwan's elections, not 11/3 in the US or a
+        by-election (review 4 C1)."""
+        month, day = month_day
+        listed = month_day in self.listed_votes
+        # Nothing unmakes a listed vote day: not a search segment saying so
+        # (the grounding may support the wrong sentence itself), not a page.
+        if listed:
+            kinds = kinds - {"vote"}
+        if any((month, day, kind) in self.denied for kind in kinds):
+            return True
+        if kinds & self.moved.get(month_day, set()):
+            return True
+        days = [self.days_by_kind.get(kind, ()) for kind in kinds]
+        here = any(month_day in d for d in days)
+        elsewhere = any(len(d) > (1 if month_day in d else 0) for d in days)
+        return elsewhere and not here
+
+
+def _denied_stated_date(
+    sentence: str, dates: list, clauses: _DateClauses, stated: dict, backing: _DenialBacking,
+    *, following: str = "", stated_abroad: frozenset = frozenset(), today=None,
+    reply_abroad: bool = False,
+) -> bool:
+    names_listed = None
+    for _, month, day, kinds, instead, abroad, national in _iter_denials(
+        sentence, dates, clauses, following,
+    ):
+        # Only what the user said about that day (Taiwan's listed vote days
+        # count as said): 「11月28日不需要登記」 answers someone who only said
+        # they will vote then.
+        kinds = kinds & stated.get((month, day), set())
+        listed = (month, day) in backing.listed_votes
+        if listed:
+            kinds -= set()  # a correction abroad excuses nothing here
+        else:
+            kinds -= abroad
+        if "vote" in kinds and national and civic_calendar.listed_kind(month, day, today) == "local":
+            kinds = kinds - {"vote"}
+        if not kinds or backing.backs(kinds, (month, day)):
+            continue
+        # The calendar backs 「投票日是11月28日，而非11月29日」「11月29日不是投票日，
+        # 投票日是11月28日」 because the sentence names Taiwan's listed day itself;
+        # not when the reply or the user's own mention is about another country
+        # (「11月3日不是投票日，台灣是11月28日投票」 to 「美國11/3期中選舉」).
+        if "vote" in kinds and not listed and (month, day) not in stated_abroad:
+            if names_listed is None:
+                names_listed = not reply_abroad and any(
+                    (m, d) in backing.listed_votes for _, (_, m, d) in dates
+                )
+            if names_listed:
+                continue
+        return True
+    return False
+
+
+def _calendar_date(parts: tuple[int | None, int | None, int | None], today) -> bool:
+    """A date ``civic_calendar`` lists (a bare month-day counts for this year
+    or next; a bare year for a listed election year)."""
+    year, month, day = parts
+    listed = civic_calendar.verified_election_dates(today)
+    next_year = civic_calendar.next_presidential_year(today)
+    if month is None:
+        return year in {y for y, _, _ in listed} or (next_year is not None and year == next_year)
+    if day is None:
+        return (next_year is not None and year == next_year) or any(
+            (y, m) == (year, month) for y, m, _ in listed
+        )
+    if year is None:
+        return any((y, month, day) in listed for y in (today.year, today.year + 1))
+    return (year, month, day) in listed
+
+
+def _quote_commas(text: str) -> str:
+    """``text`` with commas inside quotes turned into 、 (same length)."""
+    parts, last = [], 0
+    for start, end in _quoted_spans(text):
+        parts += [text[last:start], re.sub("[，,]", "、", text[start:end])]
+        last = end
+    parts.append(text[last:])
+    return "".join(parts)
+
+
+def _election_timing_disputed(
+    sentence: str, clauses: _DateClauses, today, segments: str,
+) -> bool:
+    """A clause gives a verdict on when an election is (election word, timing
+    word and verdict in one clause) with nothing behind it.  ``sentence`` is
+    unmasked: the claim under the verdict is usually quoted (review 6)."""
+    if not _ELECTION_RE.search(sentence):
+        return False
+    seen = set()
+    calendar_ok = None
+    for verdict in _ELECTION_DISPUTE_RE.finditer(sentence):
+        span = clauses.span(verdict.start(), verdict.end())
+        if span in seen:
+            continue
+        seen.add(span)
+        claim = span
+        # 「台灣大選已近，這不是事實」: the verdict points back at the clause before.
+        if _ELECTION_POINTER_RE.match(clauses.text, span[0]) and span[0] > 0:
+            claim = (clauses.span(span[0] - 1, span[0] - 1)[0], span[1])
+        timing = clauses.has(claim, _ELECTION_TIMING_RE) or (
+            clauses.has(claim, _ELECTION_NEXT_RE) and clauses.has(claim, _DATE_ANY_RE)
+        )
+        if not (clauses.has(claim, _ELECTION_RE) and timing):
+            continue
+        if _clause_hedged(clauses, span):
+            continue
+        # Backed by the calendar when every date the clause states is listed
+        # and every date it calls wrong (「…在2025年1月11日的說法有誤」) is not;
+        # a stale calendar backs nothing.
+        if civic_calendar.active(today) and calendar_ok is None:
+            # The whole sentence: 「「大選已經結束」的說法不正確，九合一選舉的投票日是
+            # 2026年11月28日」 states the listed day in its next clause (round 6).
+            asserted, disputed = [], []
+            for m in _DATE_ANY_RE.finditer(clauses.text):
+                if parts := _date_parts(m):
+                    wrong = bool(_DATE_CALLED_WRONG_RE.search(clauses.text[m.end():m.end() + 8]))
+                    (disputed if wrong else asserted).append(parts)
+            calendar_ok = bool(asserted or disputed) and all(
+                _calendar_date(p, today) for p in asserted
+            ) and not any(_calendar_date(p, today) for p in disputed)
+        if calendar_ok:
+            continue
+        # A search segment that holds this very claim backs it; 「美國大選已近不是
+        # 事實」 or 「台灣大選已結束不是事實」 does not back 「台灣大選已近不是事實」.
+        if segments and _normalize(clauses.text[claim[0]:claim[1]]) in segments:
+            continue
+        return True
+    return False
+
+
+def _wrong_presidential_date(sentence: str, dates: list, clauses: _DateClauses, today) -> bool:
+    """A national election put on a date none was held (「總統及立委選舉已於
+    2025年1月11日舉行完畢」「大選已於2025年1月11日」).  The year is always
+    checked; the day only when Taiwan is named and no other country is (the US
+    votes for a president in the same years, in November)."""
+    abroad = bool(_DATE_FOREIGN_RE.search(sentence) or _DATE_US_PEOPLE_RE.search(sentence))
+    check_day = not abroad and bool(_DATE_TAIWAN_RE.search(sentence))
+    for match, (year, month, day) in dates:
+        if year is None:
+            continue
+        lead = clauses.before(match.start())
+        tail = clauses.after(match.end(), 12)
+        named = _PRESIDENTIAL_LEAD_RE.search(lead) or _PRESIDENTIAL_TAIL_RE.search(tail)
+        if not named and _PRESIDENTIAL_LINK_ONLY_RE.search(lead):
+            lo, _ = clauses.span(match.start(), match.end())
+            if lo > 0:
+                prev_lo, _ = clauses.span(lo - 1, lo - 1)
+                named = _PRESIDENTIAL_CLAUSE_END_RE.search(clauses.text, prev_lo, lo - 1)
+        if not named:
+            continue
+        span = clauses.span(match.start(), match.end())
+        if (
+            _clause_hedged(clauses, span)
+            or _UPCOMING_NEGATED_RE.search(lead[-8:])  # 「…不可能在2025年1月11日」
+            or _DATE_CALLED_WRONG_RE.search(clauses.after(match.end(), 8))
+            or _UPCOMING_REPORTED_RE.search(lead)
+        ):
+            continue
+        known = civic_calendar.election_date_known(
+            year, month, day, local_too=not named.group("pres"), check_day=check_day,
+        )
+        if known is False:
+            return True
+    return False
+
+
+# TODO(2026-10-28 deferred, reviews 2–6): not caught yet — an undated denial
+# without an explicit verdict (「九合一選舉不是今年」), a pronoun across clauses
+# (「那天不是投票日喔，11月28日只是…」), an implied contradiction (「投票日其實是
+# 11月29日」), a day without its month (28號), and a Gemini segment that
+# supports the wrong sentence itself.  When the bot was asked directly, the
+# whole reply becomes UNVERIFIED_DATE_REPLY even if only one sentence was
+# wrong (dropping just that sentence was left for later).  The broader fix — a
+# fallback tier makes no unsolicited corrections — changes the burst policy
+# and waits for Andrew.
+def date_claim_findings(
+    reply: str | None,
+    *,
+    today,
+    user_text: str = "",
+    material_text: str = "",
+    supported_segments=(),
+    evidence_text: str = "",
+    backed: bool = False,
+) -> list[str]:
+    """Why ``reply`` must not be sent: ``past_upcoming``, ``denied_date``,
+    ``presidential_date``, ``election_timing``.
+
+    ``today`` is the Asia/Taipei date.  ``user_text`` is what the users wrote
+    or quoted, ``material_text`` what a shared link contained; a date they
+    give, with the kind of schedule written next to it, is what a denial is
+    checked against.  A denial is backed by a ``supported_segments`` entry
+    (reply text Gemini's search grounding supports) or an ``evidence_text``
+    sentence (what the research path collected) stating the same denial of
+    that day and kind, by evidence that gives that kind another day and never
+    this one, by a shared page that moved this day away, by the sentence
+    naming Taiwan's listed vote day instead, or by ``backed`` (a fact-cache
+    replay stored as searched, or media the guard cannot read).  An election
+    verdict needs a search segment stating it or only listed dates.  Nothing
+    backs a past date called upcoming or a presidential election put on a day
+    none was held.  An empty list means send.
+    """
+    if not (reply or "").strip():
+        return []
+    plain = _dated_text(reply)
+    masked = _mask_dated_quotes(plain)
+    stated: dict = {}
+    stated_abroad = set()  # days the user or the page gave for another country
+    for text in (user_text, material_text):
+        for spoken, mentions in _date_mentions(_dated_text((text or "")[:_DATE_BACKING_MAX_CHARS])):
+            for month, day, _, kinds, match in mentions:
+                stated.setdefault((month, day), set()).update(kinds)
+                near = spoken[max(0, match.start() - 15):match.end() + 15]
+                if _DATE_FOREIGN_RE.search(near) or _DATE_US_PEOPLE_RE.search(near):
+                    stated_abroad.add((month, day))
+    if backed:
+        # Media the guard cannot read, or a replay stored as searched, backs a
+        # denial — except of Taiwan's listed vote days below (round 6).
+        stated = {}
+    # Denying one of Taiwan's listed vote days is wrong whoever gave the day
+    # (「美國和台灣大選都近了」 names none, review 6).
+    for year, month, day in civic_calendar.verified_election_dates(today):
+        if year >= today.year:
+            stated.setdefault((month, day), set()).add("vote")
+    backing = None
+    reply_abroad = bool(_DATE_FOREIGN_RE.search(masked) or _DATE_US_PEOPLE_RE.search(masked))
+    found: list[str] = []
+    for sentence_match in _DATE_SENTENCE_RE.finditer(masked):
+        sentence = sentence_match.group(0)
+        dates = [(m, parts) for m in _DATE_ANY_RE.finditer(sentence) if (parts := _date_parts(m))]
+        if not dates:
+            continue
+        clauses = _DateClauses(sentence)
+        if "past_upcoming" not in found and _past_upcoming(sentence, dates, clauses, today):
+            found.append("past_upcoming")
+        if "presidential_date" not in found and _wrong_presidential_date(sentence, dates, clauses, today):
+            found.append("presidential_date")
+        if "denied_date" not in found and stated:
+            if backing is None:
+                backing = _DenialBacking(
+                    supported_segments, evidence_text, material_text, today, user_text=user_text,
+                )
+            following = masked[sentence_match.end():sentence_match.end() + 40]
+            if _denied_stated_date(
+                sentence, dates, clauses, stated, backing,
+                following=following, stated_abroad=frozenset(stated_abroad), today=today,
+                reply_abroad=reply_abroad,
+            ):
+                found.append("denied_date")
+    if not backed and _ELECTION_RE.search(plain):
+        # Search segments that speak of an election, with their bigrams, once.
+        # Election segments, compacted and joined once (capped like any backing).
+        segments = "\n".join(
+            _normalize(text)
+            for text in (
+                _dated_text(str(seg or "")[:_DATE_BACKING_MAX_CHARS])
+                for seg in (supported_segments or ())
+            )
+            if _ELECTION_RE.search(text)
+        )[:_DATE_BACKING_MAX_CHARS]
+        for sentence in _DATE_SENTENCE_RE.findall(plain):
+            # Commas inside a quote do not split the claim (「「台灣的大選，已經接近」的說法」).
+            if _election_timing_disputed(sentence, _DateClauses(_quote_commas(sentence)), today, segments):
+                found.append("election_timing")
+                break
     return found

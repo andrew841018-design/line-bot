@@ -24,6 +24,7 @@ import hashlib
 import logging
 from image_reply import has_image_analysis_envelope, is_image_context_echo, render_image_reply
 from video_reply import VIDEO_COMMENTARY_CONTRACT, VIDEO_COMMENTARY_CONTRACT_NO_SEARCH
+import civic_calendar
 import reply_policy
 from reply_policy import NO_REPEAT_CONTRACT
 import reply_provenance
@@ -1063,6 +1064,7 @@ def _runtime_time_context_for_local_llm() -> str:
         f"目前台灣時間 {now_tw.strftime('%Y-%m-%d %H:%M:%S')}（週{weekday}，Asia/Taipei）。"
         f"今天日期是 {now_tw.year}年{now_tw.month}月{now_tw.day}日。"
         "回答現在、目前、今年、去年、最新、完整數據時，以此為準，不要沿用舊年份。"
+        + civic_calendar.prompt_suffix(now_tw.date())
     )
 
 
@@ -1089,6 +1091,30 @@ _DISPUTED_CLAIM_RETRACTION = "我先前那則說法查不到可靠來源支持�
 
 
 _GUARDED_REPLY_MAX_CHARS = 5000
+
+
+def _date_claims_unbacked(reply: str, *, log_drop: bool = True, **backing) -> bool:
+    """A past date called upcoming, an unbacked denial of a date the user gave,
+    a presidential election on a day none was held, or an unbacked verdict on
+    when an election is (``reply_policy.date_claim_findings``); logs the kinds,
+    never the text.
+
+    2026-10-28: with Claude CLI logged out and Gemini 2.5 flash out of quota,
+    2.5-flash-lite told the group that the voting day a family member gave was
+    "not a voting day" and that the "next" presidential election was in 2025.
+    """
+    try:
+        kinds = reply_policy.date_claim_findings(
+            reply[:_GUARDED_REPLY_MAX_CHARS],  # what can be sent; keeps the scan bounded
+            today=datetime.now(ZoneInfo("Asia/Taipei")).date(),
+            **backing,
+        )
+    except Exception as exc:
+        logger.warning("date-claim guard skipped error_type=%s", type(exc).__name__)
+        return False
+    if kinds and log_drop:
+        logger.info("date-claim guard dropped a reply kinds=%s len=%d", ",".join(kinds), len(reply))
+    return bool(kinds)
 
 
 def _enforce_new_value_reply(
@@ -1136,6 +1162,12 @@ def _enforce_new_value_reply(
     ``facts`` (what the bot remembers) backs addresses／phone numbers, like
     the family's own words: a reply with any detail nothing backs is dropped
     whole and ``outcome["contact_details_dropped"]`` is set (2026-10-09).
+    A date claim ``_date_claims_unbacked`` rejects (a past date called
+    upcoming, an unbacked denial of a given date or of when an election is, a
+    presidential election on a wrong day) also drops the reply whole — a
+    direct question gets ``UNVERIFIED_DATE_REPLY`` instead —
+    and sets ``outcome["date_claims_dropped"]`` (2026-10-28;
+    ``_date_claims_unbacked``).
     ``outcome``, when given, receives ``recorded`` (a Gemini answer recorded
     its search details), ``grounded`` (``searched``, a trusted replay,
     supported segments or research evidence; the burst fact cache keeps only
@@ -1181,6 +1213,17 @@ def _enforce_new_value_reply(
         # TODO(2026-10-03 review): a dropped reply to a direct @咪寶 question means
         # silence; one retry was suggested. Revisit if direct questions go quiet often.
         return ""
+    if _date_claims_unbacked(
+        reply_text,
+        user_text="\n".join(p for p in (source_text, request_text) if p),
+        material_text=material_text or "",
+        supported_segments=(grounding or {}).get("supported_segments") or (),
+        evidence_text=evidence_text or "",
+        backed=trusted_grounded,
+    ):
+        outcome["date_claims_dropped"] = True
+        # Asked directly: the honest line the no-search contract asks for.
+        return UNVERIFIED_DATE_REPLY if addressed else ""
     if _unbacked_contact_count(
         reply_text,
         _contact_backing(
@@ -1275,6 +1318,7 @@ def _guard_generated_reply(reply, user_input=None, *, context=None, facts=None):
     marks ``reply_provenance.dropped()`` so the message is finished, not retried.
     2026-10-09: an address or phone number nothing backs (``context`` and
     ``facts`` count, see ``_contact_backing``) drops the reply the same way.
+    2026-10-28: so does a date claim ``_date_claims_unbacked`` rejects.
     """
     if not isinstance(reply, str) or not reply.strip() or reply_provenance.caller_checks():
         return reply
@@ -1291,6 +1335,20 @@ def _guard_generated_reply(reply, user_input=None, *, context=None, facts=None):
         logger.info("search-claim guard dropped a generated reply len=%d", len(reply))
         reply_provenance.mark_dropped()
         return ""
+    # TODO(2026-10-28 deferred, review 4 N4): this exit does not know whether
+    # the bot was asked; once its callers say so (not a default — pending and
+    # scheduled replies were not asked), a direct question should get
+    # UNVERIFIED_DATE_REPLY here too, as in _enforce_new_value_reply.
+    # Media the guard cannot read backs a denial, as for contact details;
+    # a past date called upcoming is checked all the same.
+    if _date_claims_unbacked(
+        reply,
+        user_text="\n".join(_input_texts(user_input)),
+        supported_segments=(reply_provenance.grounding() or {}).get("supported_segments") or (),
+        backed=_has_media_part(user_input),
+    ):
+        reply_provenance.mark_dropped()
+        return ""
     # A file, audio or quoted media part the model read is backing this guard
     # cannot see as text, so those replies keep their addresses (2026-10-09 review).
     if not _has_media_part(user_input) and _unbacked_contact_count(
@@ -1305,6 +1363,8 @@ def _guard_generated_reply(reply, user_input=None, *, context=None, facts=None):
 # 另一家店的地址。模型寫的地址、電話一定要在使用者給的內容、預讀素材、搜尋結果或
 # 查證過的晚餐清單裡找得到，否則整則不送（和 H1 假裝查過一樣處理）。
 UNVERIFIED_CONTACT_REPLY = "這些地址、電話我沒辦法確認是正確的，先不列出來；出發前請用地圖或店家官網確認。"
+# 2026-10-28：日期守門（_date_claims_unbacked）擋下直接問到的回覆時，回這句。
+UNVERIFIED_DATE_REPLY = "這個時間點我現在沒辦法確認最新情況，先不下結論，請以官方公告為準。"
 
 
 def _has_media_part(user_input) -> bool:
@@ -13594,6 +13654,13 @@ def _handle_burst_flush(
     # leaned on (a page read then, turns since scrolled away).
     if cached and _unbacked_contact_count(cached, _contact_backing(combined_text, context=context, facts=facts)):
         logger.info("burst flush cached reply has contact details it cannot back; regenerating group=%s", group_id)
+        cached = None
+    # 2026-10-28: a date the cached reply called coming may have passed since.
+    if cached and _date_claims_unbacked(
+        cached, log_drop=False, user_text=combined_text,
+        backed=bool(getattr(cached, "grounded", False)),
+    ):
+        logger.info("burst flush cached reply has a date claim it cannot stand behind; regenerating group=%s", group_id)
         cached = None
     # cache 命中：謠言快取直接回，省 LLM 呼叫
     if cached:
