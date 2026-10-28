@@ -22,6 +22,7 @@ spool 的格式（SPOOL_SCHEMA 1）。每檔一列，欄位對應回測 job 的 
     schema: 1、family: "tw_ai"
     t: "YYYY-MM-DD"、rule（例如 "ai_v1"）、computed_at（浮點，和 AI 狀態檔、AI 歷史那一行的一樣）、written_at（浮點）
     source: 名單來源 "00952" | "cached" | "core_only"、core_version: 字串
+    market: 主快照的大盤 [level, b20, b60]（和主快照狀態檔的 market 欄位同一種寫法）；主快照沒有大盤是 null
     funnel、picks（入選代號）、skipped：同 AI 狀態
     cooldown_read: null（B2 起：讀到的冷凍檔版本，或 missing／invalid）
     cooldown: null（B2 起：實際拿掉的代號、沒套用的原因 until／25%）
@@ -35,6 +36,8 @@ spool 的格式（SPOOL_SCHEMA 1）。每檔一列，欄位對應回測 job 的 
             "ok"               這個 T 抓到的日線算出來的
             "no:<原因碼>"      這個 T 確定算不出窗口（bot 當不合格）
             "skipped:<原因碼>" 資料拿不到而跳過（同 AI 狀態的 skipped）
+                               原因碼是 bot 的固定字串（小寫英文開頭、小寫英數與底線、最多 32 字），看不懂的寫 "other"
+                               （_REASON_RE：回測 job 的驗證收得下的子集，test_stock_picks_review_hook 的契約測試核對）
             "unknown"          日線有洞（還沒到期或已過期）、這個 T 抓失敗過：不是「不合格」
             "unchecked"        候選，但這一版沒查到它（排在第 3 檔入選者後面）
             null               不是候選、主池也沒有：bot 沒看它的走勢
@@ -67,7 +70,7 @@ SPOOL_MAX_FILES = 200
 FAMILY_AI = "tw_ai"
 MEMBER = "member"
 _ISO_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
-_REASON_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")
+_REASON_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")  # 回測 job 的走勢原因碼驗證收得下的子集（契約測試核對）
 
 
 def spool_dir() -> Path:
@@ -151,7 +154,7 @@ def _trend_of(code: str, snapshot, chart_cache: dict, fail_tries: dict, candidat
 def build_ai_spool(state: dict, snapshot, candidates: Sequence, sources: dict, *, chart_cache: dict,
                    fail_tries: dict) -> dict:
     """spool 的內容（格式見模組說明）。只讀傳進來的東西與主快照，不碰檔案、不改任何狀態。"""
-    universe = state["universe"]
+    universe, market = state["universe"], snapshot.market
     rank = {f.code: i for i, f in enumerate(candidates, start=1)}
     picked = {p["c"] for p in state["picks"]}
     members: list[dict] = []
@@ -182,6 +185,7 @@ def build_ai_spool(state: dict, snapshot, candidates: Sequence, sources: dict, *
         "written_at": time.time(),
         "source": universe.get("source"),
         "core_version": state.get("core_version", ""),
+        "market": None if market is None else [market.level, market.b20, market.b60],
         "funnel": dict(state["funnel"]),
         "picks": [p["c"] for p in state["picks"]],
         "skipped": dict(state.get("skipped") or {}),

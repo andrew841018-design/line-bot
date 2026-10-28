@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import importlib
 import inspect
 import json
 import sqlite3
@@ -734,8 +735,8 @@ def test_cards_and_alt_text_pass_card_ok(case):
 
 # ── 結果檔、summary、介面 ────────────────────────────────────────────────────
 def test_summary_reads_only_the_result_file(world, monkeypatch):
-    assert perf.summary() == {"perf_date": None, "ledger_rows": None, "ledger_full": False, "pending": None,
-                              "skipped": None}
+    assert perf.summary() == {"perf_date": None, "ledger_rows": None, "ledger_full": False, "library_full": False,
+                              "pending": None, "skipped": None}
     days = world.tw()
     world.closes("tw", "2330", {d: 100.0 for d in days})
     world.closes("tw", "2303", {d: 101.0 for d in days})
@@ -749,8 +750,8 @@ def test_summary_reads_only_the_result_file(world, monkeypatch):
     monkeypatch.setattr(stock_db_ro, "rows", boom)
     monkeypatch.setattr(stock_picks, "_write_json_file", boom)
     # pending：11/27 那天的 4 個天數＋10/01 兩檔的 60、240 日
-    assert perf.summary() == {"perf_date": "2026-11-30", "ledger_rows": 4, "ledger_full": False, "pending": 8,
-                              "skipped": 2}
+    assert perf.summary() == {"perf_date": "2026-11-30", "ledger_rows": 4, "ledger_full": False,
+                              "library_full": False, "pending": 8, "skipped": 2}
     assert perf.load_result() == result
 
 
@@ -917,19 +918,57 @@ def test_price_collection_survives_a_failing_query(world):  # P3 #5：休市表 
     assert "2026-10-14" in read_library()["prices"]["6666"]  # 價格照樣收
 
 
-def test_waits_have_an_exit_after_10_sessions(world):  # P3 #10
-    days = world.tw(typhoon_kind="revoked", typhoon_confirmed=False, coverage_to="2026-10-14")
-    world.closes("tw", "2330", {d: 100.0 for d in days})
+def test_waits_have_an_exit_after_10_sessions_and_the_calendar_after_40(world):  # P3 #10；impl r3 #1
+    def extend(last: str) -> None:
+        days = world.tw(last=last, typhoon_kind="revoked", typhoon_confirmed=False, coverage_to="2026-10-14")
+        world.closes("tw", "2330", {d: 100.0 for d in days})
+
+    extend("2026-11-30")
     write_jsonl(stock_picks.HISTORY_NAME,
                 [old_line("2026-10-07", ("2330", 100.0)), old_line("2026-10-16", ("2330", 100.0))])
     result = run(world)
     got = {(r["t"], r["h"]): r["skip"] for r in ledger_rows()}
+    assert got == {("2026-10-07", 5): "exrights"}  # 除權息一直沒涵蓋過 T_5（10/16）：過了 10 個交易日就凍結
+    # 10/23 撤銷了臨時休市、TAIEX 又沒有那天：日曆一直不確定。日曆要等 40 個交易日（10/07 的 T_20＝11/10 之後才 14 個）
+    assert [result["markets"]["tw"]["h"][h]["pending"] for h in ("5", "20")] == [1, 2]
+    extend("2027-01-12")
+    run(world, now=_ts("2027-01-12"))
+    got = {(r["t"], r["h"]): r["skip"] for r in ledger_rows()}
     assert got == {
-        ("2026-10-07", 5): "exrights",  # 除權息一直沒涵蓋過 T_5（10/16）
-        ("2026-10-07", 20): "calendar",  # 10/23 撤銷了臨時休市、TAIEX 又沒有那天：日曆一直不確定
-        ("2026-10-16", 5): "calendar",
-    }  # 10/16 的 T_20 是 11/18，之後才 8 個交易日：還在等
-    assert result["markets"]["tw"]["h"]["20"]["pending"] == 1
+        ("2026-10-07", 5): "exrights",
+        ("2026-10-07", 20): "calendar",  # T_20＝11/10 之後 45 個交易日
+        ("2026-10-16", 5): "calendar",  # T_5＝10/28 之後 54 個
+    }  # 10/16 的 T_20＝11/18 之後才 39 個：還在等
+    extend("2027-01-13")
+    run(world, now=_ts("2027-01-13"))
+    assert {(r["t"], r["h"]): r["skip"] for r in ledger_rows()}[("2026-10-16", 20)] == "calendar"  # 第 40 個
+
+
+def test_calendar_waits_40_sessions_so_a_late_holiday_table_still_counts():  # impl r3 #1：跨年要用下一年的休市表
+    days = _weekdays("2026-11-02", "2027-04-30", ("2027-01-01",))  # 元旦休市
+    t = "2026-12-24"
+    th = days[days.index(t) + 6]  # E＝12/25，T_5 跨過元旦
+    assert th == "2027-01-04"
+
+    def at(after: int, table, coverage_to: str = "2099-12-31") -> tuple:
+        """日曆到 T_5 之後第 after 個交易日；table＝2027 的休市表（None：盤勢 job 還沒取得）。"""
+        cal = tuple(days[:days.index(th) + after + 1])
+        data = perf.MarketData("tw", cal, {"2330": {d: 100.0 for d in cal}, "0050": {d: 50.0 for d in cal}}, {},
+                               closed_by_year={2026: frozenset(), 2027: table},
+                               coverage=(("2020-01-01", coverage_to),))
+        return perf.evaluate(perf.Candidate("tw", "ai_v1", t, 1, "2330", 100.0, 5), data)
+
+    assert at(perf.SETTLE_SESSIONS, None) == (perf.WAIT, "calendar")  # 以前在這裡（約 1/18）就永久凍成 calendar
+    assert at(perf.CALENDAR_SETTLE_SESSIONS - 1, None) == (perf.WAIT, "calendar")
+    kind, row = at(perf.CALENDAR_SETTLE_SESSIONS, None)
+    assert (kind, row["skip"], row["r"]) == (perf.FREEZE, "calendar", None)  # 等也有出口
+    kind, row = at(perf.CALENDAR_SETTLE_SESSIONS - 1, frozenset({"2027-01-01"}))  # 休市表最後一刻才到也照算
+    assert (kind, row["skip"], row["th"], row["r"]) == (perf.FREEZE, None, th, 0.0)
+    # 其他原因照舊 10 個交易日：除權息只涵蓋到 T_5 當天（沒有過 T_5）
+    assert at(perf.SETTLE_SESSIONS - 1, frozenset({"2027-01-01"}), th) == (perf.WAIT, "exrights")
+    kind, row = at(perf.SETTLE_SESSIONS, frozenset({"2027-01-01"}), th)
+    assert (kind, row["skip"]) == (perf.FREEZE, "exrights")
+    assert (perf.SETTLE_SESSIONS, perf.CALENDAR_SETTLE_SESSIONS) == (10, 40)
 
 
 def test_old_ledger_rows_without_inputs_still_load():  # P3 #6
@@ -1135,7 +1174,7 @@ def test_v2_t_must_be_on_the_calendar(market):
     hole = [d for d in days if d != "2026-06-10"]  # t 那天日曆有洞
     _, row = perf.evaluate(perf.Candidate(market, "x_v1", "2026-06-10", 1, "2330", 100.0, 5), data(hole))
     assert row["skip"] == "calendar"
-    recent = [d for d in days if d <= "2026-03-20" and d != "2026-03-02"]  # 還沒過 10 個交易日：先等
+    recent = [d for d in days if d <= "2026-03-20" and d != "2026-03-02"]  # 還沒過 40 個交易日（日曆的出口）：先等
     assert perf.evaluate(perf.Candidate(market, "x_v1", "2026-03-02", 1, "2330", 100.0, 5), data(recent)) == (
         perf.WAIT, "calendar")
 
@@ -1279,6 +1318,14 @@ def test_library_too_large_keeps_the_ledger_and_result_going(world, monkeypatch,
     assert {(r["t"], r["h"]) for r in ledger_rows()} == {("2026-10-01", 5), ("2026-10-01", 20)}
     assert not (stock_picks.STATE_DIR / perf.PRICES_NAME).exists()
     assert "price library too large" in caplog.text
+    assert result["library_full"] is True and perf.summary()["library_full"] is True  # 每日維護看得到（impl r1 #6）
+    _review_db([("tw", "6666", "2026-11-24", 80.0)])
+    got = perf.backfill_prices(now=NOW, db_path=world.path)  # 部署時的回補也寫不進去：不假報 added
+    assert (got["status"], got["added"]) == ("library_full", 0)
+    monkeypatch.setattr(stock_picks, "_write_json_file", real)  # 寫得進去了：下一輪旗標就清掉
+    result = run(world)
+    assert result["library_full"] is False and perf.summary()["library_full"] is False
+    assert read_library()["prices"]["6666"]["2026-11-24"] == 80.0
 
 
 def test_library_worst_case_size_fits_and_codes_wait_for_the_240_day_row():
@@ -1291,17 +1338,19 @@ def test_library_worst_case_size_fits_and_codes_wait_for_the_240_day_row():
     assert perf.needed_prices(only_240, {}) == {"6666": "2026-10-01", "0050": "2026-10-01"}  # 4 個天數都凍結才放掉
 
 
-def _review_db(rows, *, wal=True) -> Path:
+def _review_db(rows) -> Path:
+    """回測 job 自己建的 review.sqlite（WAL）：表用 job 的 open_db 建、不手寫 CREATE TABLE，perf 查的欄位和 job 的
+    schema 對不上時這裡就會失敗（impl r1 #3、r2 #4）。"""
+    rdb = importlib.import_module("jobs.stock_picks_review_db")
     path = stock_picks.STATE_DIR / perf.REVIEW_DB
     path.parent.mkdir(mode=0o700, exist_ok=True)
-    con = sqlite3.connect(path)
-    if wal:
-        con.execute("PRAGMA journal_mode=WAL")
-    con.execute("CREATE TABLE prices (m TEXT, code TEXT, d TEXT, close REAL, src TEXT, seen_at REAL,"
-                " PRIMARY KEY (m, code, d))")
-    con.executemany("INSERT INTO prices VALUES (?, ?, ?, ?, 'tw_all', 0)", rows)
-    con.commit()
-    con.close()
+    con = rdb.open_db(path)
+    try:
+        with rdb.transaction(con):
+            con.executemany("INSERT INTO prices (m, code, d, close, src, seen_at) VALUES (?, ?, ?, ?, 'tw_all', 0)",
+                            rows)
+    finally:
+        con.close()
     return path
 
 
@@ -1352,7 +1401,9 @@ def test_result_schema_2_has_all_horizons_and_v1_results_are_invalid():
     assert res["schema"] == 2 and set(tw["h"]) == {"5", "20", "60", "240"}
     assert (tw["h"]["240"]["r_pm"], tw["h"]["60"]["r_pm"]) == (10640, -950)
     assert (tw["from"], tw["to"]) == (None, None)  # 卡上的「起、算到」只看 5、20 日
-    assert perf._check_result(res) is res
+    assert perf._check_result(res) is res and res["library_full"] is False
+    no_flag = {k: v for k, v in res.items() if k != "library_full"}  # 診斷旗標沒有就當 False：卡片照常
+    assert perf._check_result(no_flag) is no_flag and perf._checked_or_none(dict(res, library_full="yes")) is None
     v1 = dict(res, schema=1)
     assert perf._checked_or_none(v1) is None
     (stock_picks.STATE_DIR / perf.RESULT_NAME).write_text(json.dumps(v1), encoding="utf-8")

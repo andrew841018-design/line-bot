@@ -1,20 +1,24 @@
 """stock_picks_review_hook（回測週報的 AI 池子 spool，2026-10-29 回測 PLAN §5.2）的測試：寫入時機（_commit_ai 回 True 之後
-才寫）、例外不外漏、目錄檢查、檔數上限、100 ms、AI 關著不做事、unknown 和 no 分開記。合成行情、tmp state、不連網。"""
+才寫）、例外不外漏、目錄檢查、檔數上限、100 ms、AI 關著不做事、unknown 和 no 分開記，以及和回測 job 的契約（spool 格式與
+檔名、目錄配置、review.sqlite 的路徑：用 job 真的程式核對）。合成行情、tmp state、不連網。"""
 
 from __future__ import annotations
 
 import ast
+import importlib
 import json
 import os
 import statistics
 import sys
 import time
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 
 import pytest
 
 import stock_picks as sp
+import stock_picks_perf as perf
 import stock_picks_review_hook as hook
 from test_stock_picks_ai import T, TODAY, _facts, _snapshot, _state
 from test_stock_picks_ai_worker import Clock, Rig
@@ -299,6 +303,122 @@ def test_unknown_is_never_recorded_as_no():
     cond = {c: m["checks"]["trend"] for c, m in members.items()}
     assert (cond["1101"], cond["1102"]) == (True, True)
     assert all(cond[c] is None for c in ("1103", "1104", "1105", "1106", "1107", "1108", "1109"))
+
+
+def test_market_comes_from_the_main_snapshot_and_is_null_without_one():  # impl r1 #2：C3 的「大盤偏熱」要每個樣本的大盤
+    state, snapshot, candidates, sources = _inputs()
+
+    def market_of(snap):
+        return hook.build_ai_spool(state, snap, candidates, sources, chart_cache={}, fail_tries={})["market"]
+
+    assert market_of(replace(snapshot, market=sp.Market(sp.HOT, 35, 61))) == [sp.HOT, 35, 61]  # 主快照狀態檔的寫法
+    assert market_of(replace(snapshot, market=None)) is None
+
+
+# ── 和回測 job 的契約（impl r1 #3、r2 #4、r4 #1） ─────────────────────────────────────────────
+# job 不 import 這個葉節點（A 比 B1 先部署），spool 格式與檔名、目錄配置、review.sqlite 的路徑兩邊各寫一份：
+# 任一邊改了，spool 會整批被判 invalid、默默退回簡版（週報只看得到「spool 0 份」）。job 的模組用到時才 import。
+def _job(name: str):
+    return importlib.import_module(f"jobs.{name}")
+
+
+def _job_spool(monkeypatch) -> Path:
+    """job 自己建的目錄（prepare_root：state/stock_picks_review/ 與 spool/），bot 的 STATE_DIR 指到同一個 state/。"""
+    runner = _job("stock_picks_review")
+    paths = runner.resolve_paths()
+    assert paths.bot_dir != runner.BASE and paths.maintenance != runner.DEFAULT_MAINTENANCE  # conftest 指到暫存目錄
+    runner.prepare_root(paths)
+    monkeypatch.setattr(sp, "STATE_DIR", paths.state_dir)
+    assert hook.spool_dir() == paths.spool
+    return paths.spool
+
+
+def _job_accepts(pool, path: Path, state: dict):
+    """job 匯入一個 spool 的步驟：檔名（SPOOL_NAME_RE）→ 讀檔（自己的一般檔、大小上限）→ spool_version
+    （不合格丟 ValueError）。"""
+    match = pool.SPOOL_NAME_RE.fullmatch(path.name)
+    assert match is not None, path.name
+    family, day, computed_at = match.group(1), match.group(2), float(match.group(3))
+    assert (family, day, round(computed_at)) == (hook.FAMILY_AI, state["t"], round(state["computed_at"]))
+    obj = json.loads(pool.read_private_bytes(path, pool.SPOOL_MAX_BYTES))
+    return pool.spool_version(obj, family, day, {"rule": state["rule"], "computed_at": state["computed_at"]})
+
+
+def test_contract_directory_names_and_review_db_match_the_job(monkeypatch):
+    runner = _job("stock_picks_review")
+    paths = runner.Paths(bot_dir=Path("/nonexistent/bot"), maintenance=Path("/nonexistent/maintenance"))
+    assert paths.spool == paths.state_dir / hook.REVIEW_DIR_NAME / hook.SPOOL_DIR_NAME
+    assert paths.db == paths.state_dir / perf.REVIEW_DB  # perf.backfill_prices 唯讀的那個庫
+    monkeypatch.setattr(sp, "STATE_DIR", paths.state_dir)
+    assert hook.spool_dir() == paths.spool
+
+
+def test_contract_a_real_spool_is_found_and_accepted_by_the_job(monkeypatch, clock):
+    pool = _job("stock_picks_review_pool")
+    spool = _job_spool(monkeypatch)
+    assert pool.spool_dir_state(spool) == "ok"  # job 建的目錄 hook 寫得進去，job 也認得
+    rig = Rig(monkeypatch, clock, 10, cum=lambda i: 100.0 - i if i < 9 else 5.0)
+    rig.snapshot.pool["1101"] = _facts("1101")
+    monkeypatch.setattr(sp, "_snapshot", replace(rig.snapshot, market=sp.Market(sp.HOT, 35, 61)))
+    sp._ai_cache_t = rig.snapshot.t
+    sp._ai_chart_cache.update({"1102": (sp._AI_NO, "chart_unavailable"), "1107": (sp._AI_HOLE, clock.mono + 600)})
+    sp._ai_fail_tries["1108"] = 1
+    rig.yahoo.kind("1103", "below")
+    rig.yahoo.kind("1104", "short")
+    state = rig.run()
+    [path] = _spool_files(spool)
+    version = _job_accepts(pool, path, state)  # bot 真的寫出來的位元組，原樣交給 job
+    data = json.loads(path.read_text(encoding="utf-8"))
+    got = [(r.code, r.name, r.c0, r.picked, r.rank, r.status, r.trend["trend"], r.trend["tr"]) for r in version.rows]
+    assert got == [(m["c"], m["n"], m["c0"], m["picked"], m["rank"], m["status"], m["trend"], m["tr"])
+                   for m in data["members"]]  # 每一列、每個欄位都照 hook 寫的讀進去（改名會在這裡失敗）
+    assert len(got) == 10 and {m["trend"] for m in data["members"]} >= {"pool", "ok", "skipped:chart_unavailable",
+                                                                       "no:bars_short", "unknown", "unchecked", None}
+    assert version.market == data["market"] == [sp.HOT, 35, 61]  # impl r1 #2
+
+
+def test_contract_the_largest_spool_is_accepted_by_the_job():
+    pool = _job("stock_picks_review_pool")
+    facts = [_facts(str(1101 + i), name="測試股票名稱十六個字以內好", revenue=sp.Revenue(2026, 8, 10.0, 100.0 - i / 10))
+             for i in range(120)]  # AI 狀態檔允許的最大名單、名稱最長
+    snapshot = _snapshot(facts, pool=False)
+    for f in facts[:50]:
+        snapshot.pool[f.code] = f
+    cache = {f.code: (sp._AI_OK, ([100.0] * 240, [100.0] * 60)) for f in facts[50:100]}
+    state = _state(facts)
+    state["picks"] = state["picks"][:3]
+    payload = hook.build_ai_spool(state, snapshot, facts, {f.code: "AI 伺服器" for f in facts}, chart_cache=cache,
+                                  fail_tries={})
+    data = json.loads(json.dumps(payload, ensure_ascii=False))  # 和 _write_json_file 同一種序列化
+    version = pool.spool_version(data, hook.FAMILY_AI, state["t"], {"rule": state["rule"],
+                                                                    "computed_at": state["computed_at"]})
+    assert len(version.rows) == 120 and all(r.rank for r in version.rows)
+
+
+def test_contract_every_trend_label_the_hook_writes_is_accepted_by_the_job():  # impl r4 #7：兩邊的原因碼規則
+    pool = _job("stock_picks_review_pool")
+    bot_reasons = ["bars_short", "calendar_short", "close_invalid", "close_mismatch", "previous_close_mismatch",
+                   "price_jump", *sorted(sp._AI_SKIP_REASONS)]  # bot 會放進日線快取的原因
+    odd = ["a" * 32, "a" * 33, "1st", "Not A Code!", "", None]  # 最長的、太長的、數字開頭、看不懂的
+    reasons = list(dict.fromkeys(bot_reasons + odd))
+    facts = [_facts(str(1101 + i)) for i in range(len(reasons) + 6)]
+    snapshot = _snapshot(facts, pool=False)
+    snapshot.pool[facts[0].code] = facts[0]  # pool
+    cache = {facts[1].code: (sp._AI_OK, ([100.0] * 240, [100.0] * 60)),  # ok
+             facts[2].code: (sp._AI_HOLE, time.monotonic() + 600)}  # unknown（有洞）
+    cache.update({f.code: (sp._AI_NO, r) for f, r in zip(facts[5:-1], reasons)})  # no:／skipped:
+    state = _state(facts)
+    state["picks"] = state["picks"][:3]
+    # facts[3]：這個 T 抓失敗過（unknown）；facts[4]：候選、沒查到（unchecked）；最後一檔：不是候選（null）
+    payload = hook.build_ai_spool(state, snapshot, facts[:-1], {f.code: "00952" for f in facts}, chart_cache=cache,
+                                  fail_tries={facts[3].code: 1})
+    data = json.loads(json.dumps(payload, ensure_ascii=False))
+    labels = [m["trend"] for m in data["members"]]
+    assert {"pool", "ok", "unknown", "unchecked", None, "no:bars_short", "no:price_jump", "skipped:unknown",
+            "skipped:previous_day_missing", "skipped:chart_unavailable", "no:" + "a" * 32, "no:other"} <= set(labels)
+    version = pool.spool_version(data, hook.FAMILY_AI, state["t"], {"rule": state["rule"],
+                                                                    "computed_at": state["computed_at"]})
+    assert [r.trend["trend"] for r in version.rows] == labels  # 一個都沒被判不合格，原樣收下
 
 
 # ── 結構：呼叫點、沒有鎖／mkdir／連網／模組狀態 ──────────────────────────────────────
