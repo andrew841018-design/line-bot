@@ -700,7 +700,8 @@ def replay_candidates(conn, *, since: int, until: int, group: str | None, aliase
         scanned += 1
         if user_id not in aliases or not cl.prefilter(text):
             continue
-        target, reason = cl.find_target(conn, group_id, quoted, int(created_at))
+        # R2-8：DB 裡已經有咪寶對這則抱怨的回覆（線上判斷時還不存在），只看抱怨當下或之前的咪寶列。
+        target, reason = cl.find_target(conn, group_id, quoted, int(created_at), skew=0)
         if target is None:
             yield {"complaint_id": str(message_id), "group_id": str(group_id), "drop": reason}, None
             continue

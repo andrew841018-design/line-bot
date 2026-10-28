@@ -297,6 +297,17 @@ def test_window_uses_event_time_plus_two_seconds(T):
     assert _target(T) == ("B-EDGE", "")
 
 
+@pytest.mark.parametrize("offset", [1, 2])
+def test_live_default_keeps_the_two_second_skew_and_skew_zero_drops_it(T, offset):
+    """R2-8：線上（預設 skew）照舊收事件時間＋2 秒內的咪寶列；重播用的 skew=0 只看抱怨當下或之前的列。"""
+    put("B-BEFORE", "__bot__", "抱怨之前的回答", T - 40)
+    put("B-AFTER", "__bot__", "抱怨之後才送出的回答", T + offset)
+    with memory._conn() as conn:
+        live, _ = cl.find_target(conn, G, None, T)
+        replay, _ = cl.find_target(conn, G, None, T, skew=0)
+    assert (live.message_id, replay.message_id) == ("B-AFTER", "B-BEFORE")
+
+
 def test_same_second_bot_rows_resolve_by_rowid(T):
     put("B-FIRST", "__bot__", "第一則", T - 10)
     put("B-SECOND", "__bot__", "第二則", T - 10)

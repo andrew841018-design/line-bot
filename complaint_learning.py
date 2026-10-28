@@ -308,11 +308,16 @@ def raw_row(conn, group_id: str, message_id: str) -> RawRow | None:
     return _raw(row) if row else None
 
 
-def find_target(conn, group_id: str, quoted_id: str | None, ts: int) -> tuple[RawRow | None, str]:
+def find_target(
+    conn, group_id: str, quoted_id: str | None, ts: int, *, skew: int = TARGET_SKEW_SECONDS
+) -> tuple[RawRow | None, str]:
     """被抱怨的咪寶回覆（GP1 #2、#4）；回 (列, "") 或 (None, 丟掉的原因)。
 
     引用邊指到咪寶就用它、指到別人就丟（不退回找時間窗）、找不到（被汰舊）也丟。沒引用時看事件時間：
-    created_at ≤ ts＋2 秒、180 秒內最新的一則咪寶列；那則是操作型就丟，不往前找比較舊的。
+    created_at ≤ ts＋skew 秒、180 秒內最新的一則咪寶列；那則是操作型就丟，不往前找比較舊的。
+
+    skew：線上預設 2 秒（main 在咪寶回這則抱怨之前就呼叫，那時對這則的回覆還不存在）。重播（R2-8）傳 0：
+    DB 裡已經有咪寶對這則抱怨的回覆（常在 1～2 秒後），只看抱怨當下或之前的列，才和線上看到的一樣。
     """
     if quoted_id:
         row = raw_row(conn, group_id, quoted_id)
@@ -326,7 +331,7 @@ def find_target(conn, group_id: str, quoted_id: str | None, ts: int) -> tuple[Ra
     found = conn.execute(
         _ROW_COLUMNS + "AND user_id=? AND created_at BETWEEN ? AND ? "
         "ORDER BY created_at DESC, rowid DESC LIMIT 1",
-        (group_id, BOT_USER, int(ts) - TARGET_WINDOW_SECONDS, int(ts) + TARGET_SKEW_SECONDS),
+        (group_id, BOT_USER, int(ts) - TARGET_WINDOW_SECONDS, int(ts) + int(skew)),
     ).fetchone()
     if found is None:
         return None, "no_target"

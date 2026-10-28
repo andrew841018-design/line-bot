@@ -561,6 +561,20 @@ def test_replay_judges_offline_and_writes_nothing_to_any_db(T, tmp_path, models,
     assert "你沒看到最後" not in path.read_text(encoding="utf-8")
 
 
+@pytest.mark.parametrize("offset", [1, 2])
+def test_replay_never_targets_the_bots_reply_to_the_complaint_itself(T, tmp_path, models, offset):
+    """R2-8：重播時 DB 裡已經有咪寶對這則抱怨的回覆（1～2 秒後）；線上判斷時它還不存在，重播也不能選它。"""
+    put("M-BOT", "__bot__", BOT_TEXT, T - 40)
+    put("M-C1", COMPLAINER, "你沒看到最後嗎？影片最後一段有講", T)  # 沒引用：靠時間找
+    put("M-REPLY", "__bot__", "抱歉，我再看一次影片最後一段。", T + offset)
+    copy = copy_db(tmp_path)
+    assert lr.main(["replay", "--db", str(copy), "--days", "3", "--now", str(T + 3600),
+                    "--out-dir", str(tmp_path / "reports")]) == 0
+    path = sorted((tmp_path / "reports").glob("replay_*.json"))[0]
+    item = json.loads(path.read_text(encoding="utf-8"))["items"][0]
+    assert (item["complaint_id"], item["target_id"], item["result"]) == ("M-C1", "M-BOT", "pass")
+
+
 @pytest.mark.parametrize(
     "rule,result,recorded",
     [
