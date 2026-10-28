@@ -152,7 +152,7 @@ def test_every_shipped_text_has_a_routing_test():
 
 def test_menu_respects_line_quick_reply_limits():
     items = flex_menu.menu_message().to_dict()["quickReply"]["items"]
-    assert len(items) == len(flex_menu.BUTTONS) == 13
+    assert len(items) == len(flex_menu.BUTTONS) == 12  # 2026-10-24: 財經觀點 拿掉，13 → 12
     assert len(items) <= QUICK_REPLY_MAX_ITEMS
     for item in items:
         action = item["action"]
@@ -309,8 +309,65 @@ def test_stock_button_has_text_and_is_in_both_menus():
     large = json.dumps(flex_menu.build_large_menu(), ensure_ascii=False)
     assert '"label": "📈 股票推薦"' in large and '"text": "/股票"' in large
     labels = [label for label, _text in flex_menu.BUTTONS]
-    assert labels.index("📈 股票推薦") == labels.index("💬 財經觀點") + 1
+    assert labels.index("📈 股票推薦") == labels.index("📊 民調結果") + 1  # 2026-10-24: 財經觀點 拿掉後緊接民調
     assert "/股票" in main._HELP_TEXT and "📈 股票推薦" in main._HELP_TEXT
+
+
+def test_finance_view_button_is_gone_from_both_menus_but_the_old_card_still_works():
+    """2026-10-24 財經觀點停用：選單沒有按鈕了，舊卡片上的 /觀點 仍算選單按鈕。"""
+    labels = [label for label, _text in flex_menu.BUTTONS]
+    texts = [text for _label, text in flex_menu.BUTTONS]
+    assert "💬 財經觀點" not in labels and "/觀點" not in texts
+    quick = json.dumps(flex_menu.menu_message().to_dict(), ensure_ascii=False)
+    large = json.dumps(flex_menu.build_large_menu(), ensure_ascii=False)
+    assert "財經觀點" not in quick and "財經觀點" not in large
+    assert "/觀點" not in quick and "/觀點" not in large
+    # 舊卡片永遠留在聊天紀錄裡可以點：/觀點 要在 retired 清單、而且仍在只增不減的 shipped 清單。
+    assert "/觀點" in flex_menu._RETIRED_BUTTON_TEXTS
+    assert "/觀點" in SHIPPED_BUTTON_TEXTS
+    assert flex_menu.is_button_text("/觀點")
+    assert flex_menu.is_button_text("／觀點")  # 全形斜線也算
+
+
+def test_tapping_an_old_finance_view_button_answers_with_the_fixed_line_and_brings_the_menu_back(no_network):
+    before = _row_counts()
+    with (
+        patch("main._reply") as reply,
+        patch("finance_view_db.list_recent", side_effect=AssertionError("finance_views is not read any more")),
+        patch("finance_view_db.list_by_ticker", side_effect=AssertionError("finance_views is not read any more")),
+        patch("finance_view_db.list_by_person", side_effect=AssertionError("finance_views is not read any more")),
+    ):
+        _handle_as_member(_event(_message("/觀點")))
+
+    reply.assert_called_once()
+    args, kwargs = reply.call_args
+    assert args[1] == main._FINANCE_VIEW_RETIRED_REPLY
+    assert args[1].startswith("財經觀點已經停用了。")
+    assert "🧭 市場盤勢" in args[1] and "📈 股票推薦" in args[1]
+    # 按鈕回覆是一般文字回覆：選單掛回去、不是選單卡本身、照常可以搭到期提醒。
+    assert kwargs.get("menu_buttons") is True
+    assert kwargs.get("menu_card", False) is False
+    assert _row_counts() == before
+
+
+def test_the_retired_finance_view_line_survives_the_outbound_pipeline():
+    """固定句要真的送得出去：不被改寫、也不被當成系統狀態訊息吃掉（_reply 不會替它通知任何人）。"""
+    line = main._FINANCE_VIEW_RETIRED_REPLY
+    assert main._md_to_line(line) == line
+    assert main._prepare_outbound_text(line, source="reply") == line
+    assert not main._is_system_status_outbound(line)
+    assert not main._is_market_quote_outbound(line)  # 不是報價卡：過期的 reply token 後可以 push
+    assert 0 < len(line) <= TEXT_MAX
+
+
+@pytest.mark.parametrize("text", ["/觀點", "/觀點 媽媽", "/觀點 0050", "  /觀點  "])
+def test_finance_view_command_is_the_same_fixed_line_with_or_without_arguments(text):
+    assert main._handle_finance_view_command("G_TEST", text) == main._FINANCE_VIEW_RETIRED_REPLY
+
+
+@pytest.mark.parametrize("text", ["觀點", "我的 /觀點", "今天的觀點", "", None])
+def test_other_text_is_not_the_finance_view_command(text):
+    assert main._handle_finance_view_command("G_TEST", text) is None
 
 
 def test_menu_card_has_exactly_one_call_site():

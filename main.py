@@ -1017,20 +1017,36 @@ def _get_explicit_market_quote_reply(
     """
     if not text:
         return None
-    is_quote_request = False
+    # 2026-10-24: the 「暫時無法取得」 notice is for an instrument the text (or the thread it follows)
+    # actually named -- detected offline (a ticker, a known name, an index, a follow-up) or resolved
+    # by the name search the quote path itself runs (``resolved``: the symbols it found, reported
+    # before any price is fetched, so there is no second search).  A name lookup that found nothing
+    # is ordinary chat -- it goes the normal route instead of being answered with a fixed failure
+    # sentence; a name that WAS found but could not be priced still gets the notice, because the
+    # model must not guess that price.
+    symbol_detected = False
+    resolved: list[str] = []
     try:
         import stock_quote
         is_quote_request = stock_quote.should_try_contextual_quote(
             text,
             context=context,
         )
+        symbol_detected = is_quote_request and stock_quote.has_detected_symbol(
+            text,
+            context=context,
+        )
         technical = stock_quote.get_taiex_month_line_text(text)
         if technical:
             return technical
-        quote = stock_quote.get_contextual_quotes_text(text, context=context)
+        quote = stock_quote.get_contextual_quotes_text(
+            text,
+            context=context,
+            resolved_symbols=resolved,
+        )
         if quote:
             return quote
-        if is_quote_request:
+        if symbol_detected or resolved:
             return (
                 "【市場報價｜暫時無法取得】\n"
                 "目前無法在回覆時限內取得可靠報價，沒有交給模型猜價格。"
@@ -1039,7 +1055,7 @@ def _get_explicit_market_quote_reply(
         return None
     except Exception as e:
         logger.info("explicit market quote deterministic path failed: %s", e)
-        if is_quote_request:
+        if symbol_detected or resolved:
             return (
                 "【市場報價｜暫時無法取得】\n"
                 "目前無法在回覆時限內取得可靠報價，沒有交給模型猜價格。"
@@ -7700,6 +7716,9 @@ def _handle_text_message(
         and not explicit_reminder_creation
         and not reported_reminder_statement
         and _is_calendar_query(calendar_query_text)
+        # 2026-10-24: nobody addressed the bot -> only a short message that is itself a
+        # calendar question may skip capture and extraction; anything else goes the normal way.
+        and (clean_text is not None or _calendar_query_passive_ok(calendar_query_text))
     ):
         burst_filter.cancel_burst(group_id)
         _handle_calendar_query(event, group_id, calendar_query_text)
@@ -8675,6 +8694,119 @@ def _is_calendar_query(text: str) -> bool:
             return True
         return False
     return False
+
+
+# 2026-10-24: a calendar question nobody addressed to the bot.  10/13–10/17 the router answered six
+# statements and long pastes (25–3,866 characters) with 「沒有家族行程」 because 「之前／上次」 counts
+# as a question word in _CALENDAR_TIMING_QUERY_RE (which other callers use, so it is left alone) and
+# the answer left before capture and extraction ever saw the message.  Addressed questions are
+# not affected; for the unaddressed route only a short message that IS a calendar question
+# may leave early.  Every pattern here is a plain alternation of words, applied to at most
+# _CAL_PASSIVE_MAX_CHARS characters, and none sits under a repeat, so each string splits one way
+# (H5, line_bot.md 2026-10-05).
+_CAL_PASSIVE_MAX_CHARS = 60
+_CAL_PAST_MARKER_RE = re.compile(r"上次|之前|以前|上回")
+_CAL_TIME_QUESTION_RE = re.compile(r"什麼時候|什麼時間|哪一天|哪天|何時|幾點|幾時|幾號|多久|何日")
+_CAL_YESNO_RE = re.compile(
+    r"[？?]|嗎|呢|吧|了沒|是不是|是否|會不會|回不回|對不對|要不要|可不可以|能不能|有沒有"
+)
+_CAL_CLAUSE_SPLIT_RE = re.compile(r"(?<=[，,。！!；;？?\n])")
+_CAL_ACTIVITY_WORD_RE = re.compile(
+    r"行程|安排|計畫|計劃|活動|聚會|會議|聚餐|開會|看診|看醫生|就醫|出門|上班|上課|出發|"
+    r"回來|回家|報到|出差|旅行|拿蛋糕|拿藥|接送|機場|班機|"
+    r"回(?:台北|新北|桃園|台中|台南|高雄|花蓮|宜蘭|新竹|苗栗|嘉義|屏東|台東|老家)"
+)
+_CAL_SCHEDULE_WORD_RE = re.compile(
+    _CALENDAR_QUERY_DATE_PATTERN + "|" + _CAL_ACTIVITY_WORD_RE.pattern
+)
+# What a clause may consist of and still be only a FRAGMENT of a question (「明天，」「媽媽下週三，」
+# 「幾點？」「後天呢」): dates, question words, yes/no particles, pronouns and punctuation.  Family
+# names are cut out first (_calendar_clause_is_fragment).  The time-question words come before the
+# bare 什麼 on purpose: the first alternative that matches wins, and 什麼時候 must go in one piece.
+_CAL_FRAGMENT_FILLER_RE = re.compile(
+    _CALENDAR_QUERY_DATE_PATTERN
+    + "|"
+    + _CAL_TIME_QUESTION_RE.pattern
+    + "|"
+    + _CAL_YESNO_RE.pattern
+    + r"|有什麼|有哪些|什麼|哪些|哪個|哪裡|誰|全家|大家|家人|[我你妳他她咱們]"
+    + r"|[\s，,。！!；;、：:~～…]"
+)
+
+
+def _calendar_clause_is_fragment(clause: str) -> bool:
+    """True when nothing is left of ``clause`` once its dates, family names, question words,
+    particles and punctuation are taken out: 「明天，」「媽媽下週三，」「幾點？」「後天呢」.
+
+    A fragment cannot be a sentence on its own, so it may be completed by its neighbour into one
+    question.  A clause that says anything else -- 「爸爸下週三要開刀，」「什麼時候回家？」「我後天要
+    面試，」 -- is a sentence of its own, whatever words it uses (the activity list is closed;
+    this test is not)."""
+    rest = clause
+    for start, end, _name in reversed(_family_actors_in_text(clause)):
+        rest = rest[:start] + rest[end:]
+    return not _CAL_FRAGMENT_FILLER_RE.sub("", rest)
+
+
+def _calendar_query_passive_ok(text: str) -> bool:
+    """True only when the WHOLE (short) message is a calendar question.
+
+    1. at most _CAL_PASSIVE_MAX_CHARS characters (no forwarded articles or news);
+    2. no @mention (a mention of another family member or @All is not a question to the bot);
+    3. some clause, or two adjacent clauses, is itself a calendar query -- a statement clause
+       cannot borrow a question word from an unrelated clause (and vice versa).  Two neighbours
+       are read as ONE question only when the window is a query and either one of them is a
+       fragment (a bare date or a bare question word: 「明天，有什麼行程？」「爸爸明天要拿蛋糕，
+       幾點？」), or one is a query by itself and the other is a question too (「明天有什麼行程？
+       需要出門嗎」).  A sentence of its own next to a query -- 「後天我要面試，明天有什麼行程？」
+       「爸爸下週三要開刀，什麼時候回家？」 -- stays a separate statement;
+    4. 「之前／上次／以前」 alone is narrative: it needs a time question word or a yes/no particle
+       in the same window;
+    5. every clause that talks about a schedule (a date, 開會, 看診, 回台北 ...) must be part of
+       such a query window -- a message that also STATES a schedule is a mixed message and goes
+       down the normal capture / reminder / burst path instead (the question in it is not
+       answered from the calendar; the bot answers it like any other message).
+    """
+    t = unicodedata.normalize("NFKC", text or "").strip()
+    if not t or len(t) > _CAL_PASSIVE_MAX_CHARS or "@" in t:
+        return False
+    clauses = [c.strip() for c in _CAL_CLAUSE_SPLIT_RE.split(t) if c.strip()]
+    schedule = [bool(_CAL_SCHEDULE_WORD_RE.search(c)) for c in clauses]
+    shaped = [
+        bool(_CAL_TIME_QUESTION_RE.search(c) or _CAL_YESNO_RE.search(c)) for c in clauses
+    ]
+    fragments: dict[int, bool] = {}
+
+    def is_fragment(index: int) -> bool:
+        if index not in fragments:
+            fragments[index] = _calendar_clause_is_fragment(clauses[index])
+        return fragments[index]
+
+    def is_query(window: str) -> bool:
+        if not _is_calendar_query(window):
+            return False
+        return not (
+            _CAL_PAST_MARKER_RE.search(window)
+            and not (_CAL_TIME_QUESTION_RE.search(window) or _CAL_YESNO_RE.search(window))
+        )
+
+    alone = [is_query(c) for c in clauses]
+    covered = list(alone)
+    for i in range(len(clauses) - 1):
+        j = i + 1
+        if alone[i] and alone[j]:
+            continue
+        completes = (
+            is_fragment(i)
+            or is_fragment(j)
+            or (alone[i] and shaped[j])
+            or (alone[j] and shaped[i])
+        )
+        if completes and is_query(clauses[i] + clauses[j]):
+            covered[i] = covered[j] = True
+    if not any(covered):
+        return False
+    return not any(s and not ok for s, ok in zip(schedule, covered))
 
 
 def _strip_conversation_record_words(text: str) -> str:
@@ -13447,25 +13579,6 @@ def _retryable_burst_db_call(operation, *args, **kwargs):
         raise
 
 
-def _finance_speaker_name(group_id: str, user_id: str | None) -> str:
-    """The family name of whoever wrote a finance view; '' when unknown."""
-    # TODO(2026-10-09 deferred): use _member_label (cache, timeout, cleaning);
-    # the finance tests then need display lookups while BOT_MUTED.
-    if not user_id:
-        return ""
-    try:
-        import line_mentions
-
-        name = line_mentions.alias_for_user_id(user_id) or ""
-    except Exception:
-        name = ""
-    name = name or _alias_from_user_id(user_id)
-    if not name:
-        display = _get_member_display_name(group_id, user_id)
-        name = "" if display in ("群組成員", "某人") else display
-    return name
-
-
 # ── 記憶裡的「誰說的」（2026-10-09）──────────────────────────────────────────
 # Andrew：「咪寶記憶的部分，讓他區分不同人（說話的人），不能全部都一概當成『使用者』」。
 # 對話紀錄的每一則使用者訊息前面加說話的人的稱呼，抽事實時才知道是誰的事。
@@ -13634,28 +13747,16 @@ def _labelled_burst_turn(group_id: str, combined_text: str, message_ids: list | 
 def _start_burst_finance_extraction(
     group_id: str, combined_text: str, message_ids: list | None = None
 ) -> None:
-    """Start the best-effort finance side task after retry-safe work is done.
+    """Retired 2026-10-24: the finance-view side task no longer starts.
 
-    Each message's sender goes along, so a view is stored under the name of
-    whoever said it, never 「自己」 (Andrew 2026-10-07).
+    財經觀點 was removed (the side-task gate was almost always shut, so views were
+    rarely stored, and one member used the command).  Nothing calls this any more;
+    the name stays because several tests monkeypatch it.  finance_view_*.py, the
+    finance_views table and the weekly validator are untouched.  To bring the
+    feature back, call this from the burst exits again and run the extraction on
+    quota that is not saturated.
     """
-    try:
-        if _gemini_side_task_allowed("finance_view_extract"):
-            import finance_view_extractor
-
-            speakers = []
-            for message_id in message_ids or []:
-                raw = memory.get_raw_message(group_id, str(message_id))
-                if raw and raw[1]:
-                    speakers.append((str(message_id), raw[0] or "", raw[1]))
-            finance_view_extractor.maybe_extract_and_save_async(
-                group_id,
-                combined_text,
-                speakers=speakers,
-                resolve_speaker=lambda user_id: _finance_speaker_name(group_id, user_id),
-            )
-    except Exception as exc:
-        logger.debug("finance_view extract skipped: %s", exc)
+    logger.info("finance view extraction retired; nothing started")
 
 
 # 2026-10-03: corrections built on stale memory told a family member a widely
@@ -13724,7 +13825,6 @@ def _handle_burst_flush(
 
     from types import SimpleNamespace
     if needs_public_research:
-        _start_burst_finance_extraction(group_id, combined_text, message_ids)
         _handle_web_research_question(
             SimpleNamespace(
                 source=SimpleNamespace(user_id=""),
@@ -13768,7 +13868,6 @@ def _handle_burst_flush(
                 reply_token, group_id=group_id, message_ids=message_ids
             )
             return
-        _start_burst_finance_extraction(group_id, combined_text, message_ids)
         _reply(
             reply_token,
             cached,
@@ -13940,7 +14039,6 @@ def _handle_burst_flush(
         _labelled_burst_turn(group_id, combined_text, message_ids),
     )
     _append_bot_turn(group_id, reply_text)
-    _start_burst_finance_extraction(group_id, combined_text, message_ids)
     _maybe_extract_facts(group_id)
     _burst_capture_calendar_event(group_id, combined_text, message_ids)
     _reply(
@@ -22006,144 +22104,22 @@ def _validated_flex_card_message(alt_text: str, contents: dict):
     return FlexMessage(alt_text=alt_text, contents=FlexContainer.from_dict(contents))
 
 
-def _handle_finance_view_command(group_id: str, text: str) -> str | None:
-    """處理 /觀點 [可選: 家人名 | 標的]。純 SQL 聚合，不過 Gemini。
+# 2026-10-24 財經觀點停用（Andrew：「財經觀點沒更新⇒看你要拿掉，還是要更新」，選拿掉）。
+_FINANCE_VIEW_RETIRED_REPLY = (
+    "財經觀點已經停用了。看行情可以點「🧭 市場盤勢」，看台股推薦可以點「📈 股票推薦」。"
+)
 
-    第一句必須是判斷句（AGENTS.md 的 LINE bot 規則 0）。
+
+def _handle_finance_view_command(group_id: str, text: str) -> str | None:
+    """/觀點（含後面的家人名、標的）一律回固定句，不再查 finance_views。
+
+    函式名與 startswith 判斷保留：舊的選單卡片上「💬 財經觀點」按鈕還點得到（flex_menu 把
+    /觀點 列在 _RETIRED_BUTTON_TEXTS），點了要有回應。
     """
     s = (text or "").strip()
     if not s.startswith("/觀點"):
         return None
-
-    try:
-        import finance_view_db
-        import stock_quote
-    except ImportError as e:
-        logger.warning("finance_view import failed: %s", e)
-        return None
-
-    args = s.replace("/觀點", "", 1).strip()
-
-    if not args:
-        views = finance_view_db.list_recent(group_id, limit=10)
-        if not views:
-            return (
-                "目前家族觀點庫還是空的。\n"
-                "（聊到具體標的 + 方向時會自動記下，例「我覺得 0050 會漲到 180」）"
-            )
-        return _format_finance_views(views, header="📈 家族最近財經觀點")
-
-    tokens = args.split()
-    ticker = None
-    person = None
-    for tok in tokens:
-        try:
-            resolved = stock_quote.detect_symbols(tok)
-        except Exception:
-            resolved = None
-        if resolved:
-            ticker = resolved[0]
-        elif not person:
-            person = tok
-
-    if person:
-        try:
-            import line_mentions
-
-            person = line_mentions.configured_family_alias_mapping().get(person, person)
-        except Exception:
-            pass
-    if ticker:
-        views = finance_view_db.list_by_ticker(group_id, ticker, limit=10)
-        header = f"📈 {ticker} 相關家族觀點"
-    elif person:
-        views = finance_view_db.list_by_person(group_id, person, limit=10)
-        header = f"📈 {person} 的財經觀點"
-    else:
-        return None
-
-    if not views:
-        return f"{header}\n\n沒找到相關觀點記錄。"
-    return _format_finance_views(views, header=header)
-
-
-def _format_finance_views(views: list[dict], header: str) -> str:
-    """純 SQL 聚合輸出。第一句判斷句（規則 0）。"""
-    if not views:
-        return f"{header}\n\n沒有記錄。"
-
-    from datetime import datetime as _dt
-    from zoneinfo import ZoneInfo as _ZI
-
-    tw = _ZI("Asia/Taipei")
-
-    hit = sum(1 for v in views if v.get("validation_result") == "hit")
-    miss = sum(1 for v in views if v.get("validation_result") == "miss")
-    pending = sum(1 for v in views if v.get("validation_result") == "pending")
-    na = sum(1 for v in views if v.get("validation_result") == "na")
-
-    if hit and miss:
-        summary = f"共 {len(views)} 條觀點，已驗證 {hit} 命中 / {miss} 落空，{pending} 仍待驗。"
-    elif hit:
-        summary = f"共 {len(views)} 條觀點，已驗證 {hit} 命中（其餘待驗）。"
-    elif miss:
-        summary = f"共 {len(views)} 條觀點，已驗證 {miss} 落空。"
-    else:
-        summary = f"共 {len(views)} 條觀點，{pending + na} 仍待驗。"
-
-    lines = [header, "", summary, ""]
-    names: dict[str, str] = {}
-    for v in views[:10]:
-        label = v.get("ticker") or v.get("macro_topic") or "?"
-        d = v.get("direction") or ""
-        dir_str = {"bull": "看多", "bear": "看空", "neutral": "持平"}.get(d, "")
-        target = ""
-        if v.get("target_price"):
-            target = f" 目標 {v['target_price']}"
-        elif v.get("target_pct"):
-            target = f" 目標 {v['target_pct']:+.0f}%"
-        result = v.get("validation_result") or ""
-        result_str = {"hit": "✅", "miss": "❌", "pending": "⏳", "na": "—"}.get(result, "")
-        try:
-            created = _dt.fromtimestamp(v["created_at"] / 1000, tz=tw).strftime("%m-%d")
-        except Exception:
-            created = "??"
-        speaker = _finance_view_speaker(v, names)
-        lines.append(f"• {created} {speaker} {label} {dir_str}{target} {result_str}")
-    return "\n".join(lines)
-
-
-UNKNOWN_FINANCE_SPEAKER = "不確定是誰"
-
-
-def _finance_view_speaker(view: dict, names: dict[str, str]) -> str:
-    """Who said a view. Rows stored before 2026-10-07 can say 自己／家人: look the
-    sender up again (by user_id, or by the message around that moment) and save it."""
-    import finance_view_extractor
-
-    speaker = view.get("display_name") or ""
-    if speaker and speaker not in finance_view_extractor.AMBIGUOUS_SPEAKERS:
-        return speaker
-    group_id = view.get("group_id") or ""
-    user_id = view.get("user_id") or ""
-    try:
-        if not user_id and view.get("created_at"):
-            user_id = memory.raw_message_sender_near(
-                group_id, int(view["created_at"]) // 1000, view.get("raw_text") or ""
-            ) or ""
-        if user_id and user_id not in names:
-            names[user_id] = _finance_speaker_name(group_id, user_id)
-        name = names.get(user_id, "") if user_id else ""
-        if name and view.get("view_id"):
-            import finance_view_db
-
-            finance_view_db.set_speaker(view["view_id"], user_id, name)
-    except Exception as exc:
-        logger.debug("finance view speaker repair skipped: %s", exc)
-        name = ""
-    # 2026-10-09 Andrew：「把家人通通改成發言的人」。真的查不到是誰（舊資料、
-    # 原始訊息已經不在）才寫「不確定是誰」，不再用「家人」帶過。
-    return name or UNKNOWN_FINANCE_SPEAKER
+    return _FINANCE_VIEW_RETIRED_REPLY
 
 
 def _handle_food_command(group_id: str, text: str) -> str | None:
@@ -22344,7 +22320,8 @@ def _handle_command(
     if classify_reply is not None:
         return classify_reply
 
-    # 家族財經觀點查詢（2026-05-18 加）
+    # /觀點（2026-05-18 加；2026-10-24 財經觀點停用）：不再查資料，一律回固定的停用說明，
+    # 舊選單卡片上的按鈕點了才有回應。
     fv_reply = _handle_finance_view_command(group_id, t)
     if fv_reply is not None:
         return fv_reply

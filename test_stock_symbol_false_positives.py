@@ -116,9 +116,13 @@ def test_an_earlier_code_ask_still_carries_into_the_follow_up():
     assert stock_quote._resolve_quote_symbols("現在多少？", context=context) == ["2330.TW"]
 
 
-def test_finance_view_command_still_reads_a_bare_code(monkeypatch):
+def test_finance_view_command_no_longer_resolves_a_code(monkeypatch):
+    # 2026-10-24: 財經觀點停用，/觀點 2330 不再把 2330 當代號、也不讀 finance_views，只回固定句。
     import finance_view_db
-    seen = []
-    monkeypatch.setattr(finance_view_db, "list_by_ticker", lambda _g, ticker, limit=10: seen.append(ticker) or [])
-    main._handle_finance_view_command("group", "/觀點 2330")
-    assert seen == ["2330.TW"]
+
+    def boom(*_a, **_k):
+        pytest.fail("the retired /觀點 must not resolve a ticker or read finance_views")
+
+    monkeypatch.setattr(finance_view_db, "list_by_ticker", boom)
+    monkeypatch.setattr(stock_quote, "detect_symbols", boom)
+    assert main._handle_finance_view_command("group", "/觀點 2330") == main._FINANCE_VIEW_RETIRED_REPLY
