@@ -25,7 +25,12 @@ from zoneinfo import ZoneInfo
 import pytest
 
 import market_calc
+import market_publish
 import output_validator
+from test_market_publish import D as PUB_D
+from test_market_publish import NOW as PUB_NOW
+from test_market_publish import US_DAYS, _set_close
+from test_market_publish import world  # noqa: F401  fixture（用名字被 pytest 找到）
 
 TPE = ZoneInfo("Asia/Taipei")
 
@@ -437,3 +442,167 @@ def test_rotation_values_ok_never_raises_on_junk(junk):
     missing = good_values()
     del missing["ko_rsi"]
     assert market_calc.rotation_values_ok(missing) is False
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# publish：us.rot.XLP／us.rot.KO／us.rot.state（test_market_publish 的合成 world：XLP、KO 都有 290 個交易日的收盤）
+# ═════════════════════════════════════════════════════════════════════════════
+ROT_ROWS = ("us.rot.XLP", "us.rot.KO", "us.rot.state")
+
+
+def published(world_):
+    outcome = world_.publish()
+    assert outcome["kind"] == "ok", outcome
+    return outcome, world_.snapshot()["rows"]
+
+
+def sql(world_, statement, *args):
+    with world_.store.transaction() as conn:
+        conn.execute(statement, args)
+
+
+def store_closes(world_, symbols=("XLP", "SOXX", "KO"), upto=PUB_D):
+    """和 publish 同一份輸入：≤ D 的全部列（含 CBOE 暫定列）。"""
+    return {sym: {row[0]: row[1] for row in world_.store.closes("us", sym) if row[0] <= upto} for sym in symbols}
+
+
+def test_the_three_rows_are_ok_and_the_etf_style_rows_match_the_etf_builder(world, monkeypatch):
+    recorded = []
+    original = market_publish._Ctx.record_facts
+
+    def spy(self, facts, data_date, stale_after):
+        recorded.extend(facts)
+        return original(self, facts, data_date, stale_after)
+
+    monkeypatch.setattr(market_publish._Ctx, "record_facts", spy)
+    outcome, rows = published(world)
+    assert "row_errors" not in outcome, outcome
+    for row_id in ROT_ROWS:
+        row = rows[row_id]
+        assert row["state"] == "ok" and market_calc.row_ok(row_id, row), row_id
+        assert row["data_date"] == PUB_D.isoformat() and row["source"] == "Nasdaq", row_id
+        assert row["basis"] == market_calc.TEXT_US_NO_DIVIDEND and row["stale_after"] == rows["us.etf.SOXX"]["stale_after"]
+    assert rows["us.rot.XLP"]["label"] == rows["us.rot.KO"]["label"] == "必需消費類股"
+    assert rows["us.rot.state"]["label"] == "資金輪動"
+    # 和 ETF 列同一個算法（_us_etf 只用列 id 切出代號）：XLP、KO 的 values 一模一樣
+    ctx = market_publish._Ctx(world.store, world.paths, PUB_NOW)
+    for sym in ("XLP", "KO"):
+        assert rows[f"us.rot.{sym}"]["values"] == json.loads(json.dumps(market_publish._us_etf(ctx, f"us.etf.{sym}").values))
+    values = rows["us.rot.state"]["values"]
+    assert market_calc.rotation_values_ok(values) and values["state"] != "insufficient"
+    assert values == market_calc.rotation_values(store_closes(world), {}, ctx.trading("us"), PUB_D)
+    assert not [key for key in recorded if key.split(".")[0] in ("XLP", "KO")]  # 新列都不寫 facts（不進一句話與矛盾）
+
+
+def test_too_little_history_is_an_ok_row_that_says_insufficient(world):
+    sql(world, "DELETE FROM closes WHERE market = 'us' AND symbol = 'XLP' AND date < ?", US_DAYS[-10].isoformat())
+    outcome, rows = published(world)
+    row = rows["us.rot.state"]
+    assert row["state"] == "ok" and row["data_date"] == PUB_D.isoformat() and "row_errors" not in outcome
+    assert row["values"]["state"] == row["values"]["raw"] == "insufficient"
+    assert row["values"]["xlp_ret20"] is None and row["values"]["soxx_ret20"] is None
+    assert rows["us.rot.XLP"]["state"] == "ok"  # 收盤照樣顯示
+
+
+def test_no_official_xlp_or_soxx_close_at_all_is_the_never_case(world):
+    sql(world, "DELETE FROM closes WHERE market = 'us' AND symbol = 'XLP'")
+    outcome, rows = published(world)
+    assert rows["us.rot.state"]["state"] == "never" and rows["us.rot.XLP"]["state"] == "never"
+    assert rows["us.rot.state"]["label"] == "資金輪動" and rows["us.rot.KO"]["state"] == "ok"
+    assert "row_errors" not in outcome and outcome["never_reasons"]["missing"] >= 2
+    root = world.root / "soxx_only_provisional"
+    root.mkdir()
+    other = type(world)(root)
+    try:
+        sql(other, "UPDATE closes SET provisional = 1, source = 'cboe' WHERE market = 'us' AND symbol = 'SOXX'")
+        _outcome, rows = published(other)
+        assert rows["us.rot.state"]["state"] == "never"  # SOXX 只有暫定值：沒有正式收盤
+        assert rows["us.etf.SOXX"]["state"] == "ok" and rows["us.rot.XLP"]["state"] == "ok"
+    finally:
+        other.close()
+
+
+def test_bad_values_only_break_their_own_row(world, monkeypatch):
+    real = market_calc.rotation_values
+
+    def broken(*args):
+        values = real(*args)
+        values["raw"] = "semis" if values["raw"] == "staples" else "staples"  # 和重算的原始狀態對不上
+        return values
+
+    monkeypatch.setattr(market_calc, "rotation_values", broken)
+    outcome, rows = published(world)
+    assert rows["us.rot.state"]["state"] == "never"
+    assert outcome["row_errors"] == {"us.rot.state": "bad:rot_values"}
+    assert all(rows[row_id]["state"] == "ok" for row_id in ("us.rot.XLP", "us.rot.KO", "us.etf.SOXX", "oneliner.us"))
+
+
+def test_a_provisional_soxx_close_moves_the_research_day_back(world):
+    _set_close(world, "SOXX", 255.0, provisional=True)  # D 只有 CBOE 暫定值
+    outcome, rows = published(world)
+    assert rows["us.etf.SOXX"]["data_date"] == PUB_D.isoformat()
+    assert rows["us.etf.SOXX"]["source"] == market_calc.SOURCE_CBOE_FALLBACK
+    state = rows["us.rot.state"]
+    assert state["state"] == "ok" and state["data_date"] == US_DAYS[-2].isoformat()
+    assert rows["us.rot.XLP"]["data_date"] == PUB_D.isoformat()  # XLP 自己那一列照常是 D
+    ctx = market_publish._Ctx(world.store, world.paths, PUB_NOW)
+    assert state["values"] == market_calc.rotation_values(store_closes(world), {}, ctx.trading("us"), US_DAYS[-2])
+
+
+def test_days_before_the_research_day_use_the_same_rows_as_the_soxx_etf_row(world):
+    """R 那天要正式收盤；R 之前的日子和 us.etf.SOXX 同一份列（含 CBOE 暫定列），研判的 SOXX 數字和 SOXX 那一列一致。"""
+    hole = US_DAYS[-4]
+    sql(world, "DELETE FROM closes WHERE market = 'us' AND symbol = 'SOXX' AND date = ?", hole.isoformat())
+    world.store.upsert_closes("us", "SOXX", [(hole, 250.0, 1_000_000)], "cboe", provisional=True)
+    _outcome, rows = published(world)
+    values, etf = rows["us.rot.state"]["values"], rows["us.etf.SOXX"]["values"]
+    assert rows["us.rot.state"]["data_date"] == PUB_D.isoformat()
+    assert values["soxx_rsi"] == int(half_up(etf["rsi14"], 0))
+    assert values["soxx_ma60"] == float(half_up(etf["ma_dist"]["60"], 1))
+    assert values["soxx_dd240"] == float(half_up(etf["dd240_pct"], 1))
+
+
+def test_ko_without_the_research_day_is_unknown_and_its_row_shows_the_older_day(world):
+    sql(world, "DELETE FROM closes WHERE market = 'us' AND symbol = 'KO' AND date = ?", PUB_D.isoformat())
+    _outcome, rows = published(world)
+    assert rows["us.rot.KO"]["state"] == "ok" and rows["us.rot.KO"]["data_date"] == US_DAYS[-2].isoformat()
+    state = rows["us.rot.state"]
+    assert state["data_date"] == PUB_D.isoformat()
+    assert state["values"]["ko_rsi"] is None and state["values"]["ko_above60"] is None
+
+
+def test_the_research_day_must_be_a_session(world):
+    """R 那天日曆覆寫成休市（SPY 沒有那一列）、XLP 與 SOXX 卻有列：往前找下一個是交易日的共同正式日，窗口不錯位。"""
+    closed = US_DAYS[-2]
+    sql(world, "DELETE FROM closes WHERE market = 'us' AND symbol = 'XLP' AND date = ?", PUB_D.isoformat())
+    sql(world, "DELETE FROM closes WHERE market = 'us' AND symbol = 'SPY' AND date = ?", closed.isoformat())
+    world.store.set_calendar_override("us", closed, "closed", "market_info")
+    _outcome, rows = published(world)
+    state = rows["us.rot.state"]
+    assert state["state"] == "ok" and state["data_date"] == US_DAYS[-3].isoformat()
+    ctx = market_publish._Ctx(world.store, world.paths, PUB_NOW)
+    assert ctx.trading("us").sessions_ending(closed, 1) == [US_DAYS[-3]]  # 那天真的不是交易日
+    assert state["values"] == market_calc.rotation_values(store_closes(world), {}, ctx.trading("us"), US_DAYS[-3])
+
+
+def test_the_shared_caches_are_not_modified(world):
+    """us.etf.SOXX、圖、矛盾句都用 ctx.shared 快取裡的同一個 list／dict：組 us.rot.state 不能就地改它們。"""
+    world.store.add_quarantine("us", "SOXX", US_DAYS[5], US_DAYS[6], "split_pending")
+    world.store.add_quarantine("us", "XLP", US_DAYS[8], US_DAYS[9], "conflict")
+    ctx = market_publish._Ctx(world.store, world.paths, PUB_NOW)
+    for row_id in ("us.etf.SOXX", "us.rot.XLP", "us.rot.KO"):
+        assert market_publish._build_row(ctx, row_id)["state"] == "ok", row_id
+    keys = ("closes:us:SOXX", "closes:us:XLP", "closes:us:KO", "quarantine:us")
+    before = {key: copy.deepcopy(ctx._cache[key]) for key in keys}
+    assert ctx._cache["quarantine:us"] and set(ctx._cache["quarantine:us"]) == {"SOXX", "XLP"}
+    row = market_publish._build_row(ctx, "us.rot.state")
+    assert row["state"] == "ok" and not ctx.row_errors
+    assert {key: ctx._cache[key] for key in keys} == before
+
+
+def test_the_labels_put_the_exact_row_before_the_prefix():
+    labels = list(market_publish._LABELS)
+    assert market_publish._label_for("us.rot.state") == "資金輪動"
+    assert market_publish._label_for("us.rot.XLP") == market_publish._label_for("us.rot.KO") == "必需消費類股"
+    # _label_for 照 dict 的順序取第一個符合的：精確的 us.rot.state 要在前綴 us.rot. 前面；兩個都放在 us.etf. 旁邊
+    assert labels[labels.index("us.etf.") + 1:labels.index("us.etf.") + 3] == ["us.rot.state", "us.rot."]

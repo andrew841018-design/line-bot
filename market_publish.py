@@ -145,6 +145,9 @@ _ELECTION_LAST_DAY = date(2027, 2, 1)  # Kalshi 結算上限；過了一律當�
 
 _LABELS = {
     "us.etf.": "美股 ETF",
+    # 資金輪動（2026-10-28）：_label_for 照 dict 的順序取第一個符合的，精確的 us.rot.state 一定要寫在前綴 us.rot. 前面
+    "us.rot.state": "資金輪動",
+    "us.rot.": "必需消費類股",
     "us.breadth.": "成分股寬度",
     "us.options.": "期權",
     "us.cftc.": "CFTC 期貨部位",
@@ -752,6 +755,69 @@ def _us_etf(ctx: _Ctx, row_id: str) -> RowResult:
             f"{symbol}.vol_label": volume.label,
             f"{symbol}.vol_flag": volume.day_flag,
         },
+    )
+
+
+# ── 美股：資金輪動（必需消費 XLP／KO 對半導體 SOXX；2026-10-28） ───────────────────────────────
+# 三列：us.rot.XLP、us.rot.KO（收盤列，和 ETF 列同一個算法）、us.rot.state（研判，market_calc.rotation_values）。
+# 都不寫 facts（不進一句話與矛盾句）。「算不出來」是 ok 列＋state=insufficient；只有 XLP 或 SOXX 根本沒有正式收盤才是 never。
+
+
+@_rows("us.rot.XLP", "us.rot.KO")
+def _us_rot_symbol(ctx: _Ctx, row_id: str) -> RowResult:
+    """必需消費 XLP、可口可樂 KO 的收盤列：做法照 _us_etf（_closes_upto → _etf_parts → etf_values），但不寫 facts、
+    不碰 ctx.provisional_closes（這兩檔沒有 CBOE 暫定列，source 一律 Nasdaq）。"""
+    symbol = row_id.rsplit(".", 1)[1]
+    rows = _closes_upto(ctx.closes(US, symbol), ctx.us_day())
+    if not rows:
+        raise _Unavailable("missing")
+    day = rows[-1][0]
+    tech, volume = _etf_parts(rows, ctx.trading(US), day, ctx.quarantine(US).get(symbol))
+    if tech.close is None:
+        raise _Unavailable("calendar")
+    return RowResult(
+        market_calc.etf_values(tech, volume),
+        data_date=day,
+        stale_after=ctx.stale(market_calc.KIND_US_DAILY, day),
+        source="Nasdaq",
+        basis=market_calc.TEXT_US_NO_DIVIDEND,
+    )
+
+
+def _rot_research_day(rows: Mapping[str, list[Any]], cal: market_calc.TradingCalendar) -> date:
+    """研判日 R：XLP 與 SOXX 在這一天都有正式收盤（第 5 欄 provisional 是假）、而且是日曆上交易日的最新一天（rows 已經
+    ≤ us_day）。XLP 或 SOXX 完全沒有正式收盤 → missing（never）。兩檔都有正式收盤、卻沒有一個共同的交易日（日曆認不得）
+    → calendar（never，同 _us_etf 的 tech.close 是 None）：沒有 R 就算不出新鮮度。"""
+    official = [{row[0] for row in rows[symbol] if not row[4]} for symbol in ("XLP", "SOXX")]
+    if not all(official):
+        raise _Unavailable("missing")
+    for day in sorted(official[0] & official[1], reverse=True):
+        if cal.sessions_ending(day, 1) == [day]:  # 日曆覆寫成休市的日子就算有列也不用（窗口不錯位）
+            return day
+    raise _Unavailable("calendar")
+
+
+@_rows("us.rot.state")
+def _us_rot_state(ctx: _Ctx, row_id: str) -> RowResult:
+    """資金輪動的研判。R 之前的日子用和 _us_etf 同一份列（含 SOXX 的 CBOE 暫定列），只要求 R 那天是正式收盤：SOXX 最新一筆
+    是暫定值時 R 退到前一個共同的正式日（列上會帶日期）。共用快取（ctx.closes、ctx.quarantine）只讀、先複製再處理。
+    values 過不了 market_calc.rotation_values_ok → _BadValue：只有這一列暫缺（row_errors 記 bad:rot_values）。"""
+    cal = ctx.trading(US)
+    upto = ctx.us_day()
+    rows = {symbol: _closes_upto(ctx.closes(US, symbol), upto) for symbol in market_calc.ROT_CLOSE_SYMBOLS}
+    day = _rot_research_day(rows, cal)
+    shared = ctx.quarantine(US)
+    quarantine = {symbol: list(shared[symbol]) for symbol in market_calc.ROT_CLOSE_SYMBOLS if symbol in shared}
+    closes = {symbol: {row[0]: row[1] for row in found} for symbol, found in rows.items()}
+    values = market_calc.rotation_values(closes, quarantine, cal, day)
+    if not market_calc.rotation_values_ok(values):
+        raise _BadValue("rot_values")
+    return RowResult(
+        values,
+        data_date=day,
+        stale_after=ctx.stale(market_calc.KIND_US_DAILY, day),
+        source="Nasdaq",
+        basis=market_calc.TEXT_US_NO_DIVIDEND,
     )
 
 

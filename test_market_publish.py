@@ -171,6 +171,9 @@ def seed_us(store: market_store.Store, *, missing_on_d: tuple[str, ...] = ()) ->
         last = rows[-1]
         rows[-1] = (last[0], last[1], int(last[2] * 1.6))  # D 放量
         store.upsert_closes("us", symbol, rows, "nasdaq")
+    # 資金輪動（2026-10-28）：us.rot 任務抓的必需消費 XLP 與 KO 日線；有了這兩檔，us.rot.* 三列都是 ok（不在 never 清單裡）
+    for symbol, base, phase in (("XLP", 80.0, 2.5), ("KO", 68.0, 3.5)):
+        store.upsert_closes("us", symbol, price_rows(US_DAYS, base, phase=phase), "nasdaq")
     for i, symbol in enumerate(US_MEMBERS):
         rows = price_rows(US_DAYS, 50.0 + 10 * i, phase=0.7 * i)
         if symbol in missing_on_d:
