@@ -443,7 +443,7 @@ def test_incident_replies_are_dropped(reply):
 def test_contract_forbids_limitation_only_video_replies():
     assert "不要只說明沒有字幕" in VIDEO_COMMENTARY_CONTRACT
     assert "無查證能力就保留具體限制" not in VIDEO_COMMENTARY_CONTRACT
-    assert video_reply.VIDEO_CACHE_VERSION == b"video-commentary-v3\0"
+    assert video_reply.VIDEO_CACHE_VERSION == b"video-commentary-v4\0"  # 2026-10-24: contract text changed
 
 
 def test_burst_malformed_link_share_is_silent_not_dropped(monkeypatch, burst_env):

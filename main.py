@@ -24,6 +24,7 @@ import hashlib
 import logging
 from image_reply import has_image_analysis_envelope, is_image_context_echo, render_image_reply
 from video_reply import VIDEO_COMMENTARY_CONTRACT, VIDEO_COMMENTARY_CONTRACT_NO_SEARCH
+import reply_guards
 import reply_policy
 from reply_policy import NO_REPEAT_CONTRACT
 import reply_provenance
@@ -810,6 +811,8 @@ def _enforce_new_value_reply(
     trusted_grounded: bool = False,
     outcome: dict | None = None,
     facts: list[str] | None = None,
+    partial: bool = False,
+    speaker: str = "",
 ) -> str:
     """Drop sentences that only restate what the group already said.
 
@@ -848,6 +851,18 @@ def _enforce_new_value_reply(
     (the reply ended empty after that guard removed something).
     TODO(2026-10-04 deferred, GP1 N10): media／audio／pending replies do not
     pass through here yet.
+
+    2026-10-24 (reply_guards, PLAN B1–B3), after the public-claim guard and
+    before the restatement check: 「沒有提到」 claims about material that was only
+    partly read (``partial``; the fetchers record it), regulation numbers
+    nothing the program gathered backs (also for ``trusted_grounded`` replays;
+    asked directly, an answer that ends up empty because of them becomes the
+    fixed 「數字沒辦法確認」 line, a burst nobody asked about stays silent), and hand-backs／pronoun
+    guesses／chat recaps (``speaker`` is the sender's name; the labels in ``context`` are names
+    too).  A reply that rests on a search alone (``searched``／``trusted_grounded``／``evidence_text``
+    and no ``has_material``) cannot say a text 「都未提及」 something either: that is B2 only,
+    ``partial`` (material read in part) is what also narrows the restatement check.  The counts go
+    to ``outcome``; ``""`` is silence, as for the other guards.
     """
     grounding = reply_provenance.take_grounding()
     report = {
@@ -930,6 +945,44 @@ def _enforce_new_value_reply(
                 outcome["public_claims_emptied"] = True
                 return ""
     try:
+        guards = reply_guards.apply_reply_guards(
+            reply_text,
+            source_text=source_text or "",
+            request_text=request_text or "",
+            material_text=material_text or "",
+            evidence_text=evidence_text or "",
+            context=context,
+            addressed=addressed,
+            partial=partial,
+            # Nothing was read and the reply rests on a search (Gemini grounding, the
+            # research rows, a cached grounded replay): search snippets cannot show that
+            # a text lacks something.  B2 only — the restatement check below keeps its
+            # wider correction markers (「政府並沒有宣布…」 is a correction there).
+            search_only=bool(outcome.get("grounded")) and not has_material,
+            speaker=speaker,
+        )
+    except Exception as exc:
+        logger.warning("reply-quality guards skipped error_type=%s", type(exc).__name__)
+        regulation_dropped = 0
+    else:
+        regulation_dropped = guards.numbers_dropped
+        if guards.negative_dropped or regulation_dropped or guards.nonanswer:
+            # Counts only: these sentences are exactly the ones not to repeat.
+            logger.info(
+                "reply-quality guards negative_coverage=%d regulation_numbers=%d nonanswer=%s "
+                "partial=%s addressed=%s after=%d",
+                guards.negative_dropped, regulation_dropped, guards.nonanswer,
+                partial, addressed, len(guards.text),
+            )
+            outcome["negative_coverage_dropped"] = guards.negative_dropped
+            outcome["regulation_numbers_dropped"] = regulation_dropped
+            outcome["nonanswer_dropped"] = guards.nonanswer
+        if not guards.text:
+            return reply_guards.unconfirmed_regulation_reply(
+                "", addressed=addressed, numbers_dropped=regulation_dropped
+            )
+        reply_text = guards.text
+    try:
         import restatement_judge
 
         shared = "\n\n".join(p for p in (source_text or "", material_text or "") if p)
@@ -938,7 +991,8 @@ def _enforce_new_value_reply(
             (source_text or "") if asked else shared, context
         )
         out = reply_policy.strip_restatement(
-            reply_text, source, user_text=request_text, addressed=addressed
+            reply_text, source, user_text=request_text, addressed=addressed,
+            partial=partial,
         )
         if out:
             out = restatement_judge.filter_restatements(
@@ -955,7 +1009,10 @@ def _enforce_new_value_reply(
         )
     if unbacked and not out:
         outcome["public_claims_emptied"] = True
-    return out
+    # Asked directly, and a regulation number went from an answer that is now empty: say so.
+    return reply_guards.unconfirmed_regulation_reply(
+        out, addressed=addressed, numbers_dropped=regulation_dropped
+    )
 
 
 _MATERIAL_MARKERS = ("--- 內容開始 ---", "--- PDF 內容開始 ---")
@@ -970,7 +1027,9 @@ def _carries_material(user_input) -> bool:
     return isinstance(user_input, str) and any(mark in user_input for mark in _MATERIAL_MARKERS)
 
 
-def _guard_generated_reply(reply, user_input=None, *, context=None, facts=None):
+def _guard_generated_reply(
+    reply, user_input=None, *, context=None, facts=None, addressed=True, speaker="",
+):
     """Drop a generated reply that claims a search nobody ran (2026-10-03).
 
     Audio, quoted media, files, pending and scheduled replies get this here.
@@ -980,6 +1039,10 @@ def _guard_generated_reply(reply, user_input=None, *, context=None, facts=None):
     marks ``reply_provenance.dropped()`` so the message is finished, not retried.
     2026-10-09: an address or phone number nothing backs (``context`` and
     ``facts`` count, see ``_contact_backing``) drops the reply the same way.
+    2026-10-24 (B3): hand-backs 「只有某某知道」「直接問某某最快」 (also pronoun guesses
+    and chat recaps when nobody ``addressed`` the bot, and then only these) are
+    removed; a reply that was nothing else is dropped like the others.
+    ``speaker`` is the sender's name when the caller knows it.
     """
     if not isinstance(reply, str) or not reply.strip() or reply_provenance.caller_checks():
         return reply
@@ -1003,7 +1066,17 @@ def _guard_generated_reply(reply, user_input=None, *, context=None, facts=None):
     ):
         reply_provenance.mark_dropped()
         return ""
-    return reply
+    try:
+        cleaned = reply_guards.strip_nonanswer(reply, addressed=addressed, speaker=speaker, context=context)
+    except Exception as exc:
+        logger.warning("non-answer guard skipped error_type=%s", type(exc).__name__)
+        return reply
+    if cleaned != reply:
+        logger.info("non-answer guard trimmed a generated reply before=%d after=%d", len(reply), len(cleaned))
+        if not cleaned:
+            reply_provenance.mark_dropped()
+            return ""
+    return cleaned
 
 
 # 2026-10-09 Andrew：「任何資訊必須驗證再驗證，他得是真的」——晚餐推薦把一家店配上
@@ -1331,7 +1404,9 @@ _GOOGLE_MAPS_UNSAFE_TEXT_RE = re.compile(
 )
 
 _YTDLP_TIMEOUT = 12  # yt-dlp 單次提取上限（秒）
-_YTDLP_SUBTITLE_MAX_CHARS = 3000
+# 2026-10-24: the transcript windows the model sees (the opening and where the user's
+# words are densest) together stay within this; it used to be the first 3000 characters.
+_YTDLP_SUBTITLE_MAX_CHARS = reply_guards.SUBTITLE_BUDGET
 _YTDLP_SUBTITLE_LANGS = ["zh-TW", "zh-Hant", "zh", "zh-Hans", "en"]
 _YTDLP_DESCRIPTION_MAX_CHARS = 1500
 
@@ -1732,11 +1807,25 @@ def _note_link_content() -> None:
         found.append(True)
 
 
+def _note_partial_material(reason: str) -> None:
+    """The material was read only in part (2026-10-24): set by the fetchers, never
+    guessed from the text of the prompt.  Reply checks then treat 「沒提到」 as unproven."""
+    reply_guards.note_partial(getattr(_link_content_state, "found", None), reason)
+
+
+def _link_read_count() -> int:
+    found = getattr(_link_content_state, "found", None)
+    return len(found) if found is not None else 0
+
+
 @contextmanager
 def _recording_link_content():
-    """Collect whether `_prefetch_urls` in this thread read any real content."""
+    """Collect whether `_prefetch_urls` in this thread read any real content.
+
+    The list also carries ``partial`` (reply_guards.MaterialRecord): why what was
+    read may not be the whole story."""
     previous = getattr(_link_content_state, "found", None)
-    found: list[bool] = []
+    found = reply_guards.MaterialRecord()
     _link_content_state.found = found
     try:
         yield found
@@ -1821,7 +1910,21 @@ def _append_youtube_metadata_lines(lines: list[str], info: dict) -> None:
 
 
 def _extract_subtitles_from_info(info: dict) -> str | None:
-    """從 yt-dlp info dict 拿字幕文字（優先人工字幕 → 自動生成，語言優先順序見常數）。"""
+    """從 yt-dlp info dict 拿字幕文字（優先人工字幕 → 自動生成，語言優先順序見常數）。
+
+    2026-10-24: a long transcript is no longer cut after its first 3000 characters
+    (about the first ten minutes of a 70-minute video).  The model gets the opening
+    and the stretch where the words of the user's message (and quote) are densest,
+    up to about 6000 characters, behind a note of the time ranges covered and the
+    full length; the material is then recorded as partial.  An HLS playlist
+    (#EXTM3U, what some live replays serve) is not a transcript.  Why no transcript
+    came back is logged (never the URL): no track, a download that failed, a playlist.
+    """
+    reasons: list[str] = []
+    try:
+        duration = float(info.get("duration") or 0) or None
+    except (TypeError, ValueError):
+        duration = None
     for subs_dict in (
         info.get("subtitles") or {},
         info.get("automatic_captions") or {},
@@ -1833,17 +1936,31 @@ def _extract_subtitles_from_info(info: dict) -> str | None:
             entry = next((e for e in entries if e.get("ext") == "vtt"), entries[0])
             sub_url = entry.get("url") if entry else None
             if not sub_url:
+                reasons.append("no_url")
                 continue
             try:
                 resp = _requests.get(sub_url, timeout=8, max_bytes=_PREFETCH_MAX_BYTES, truncate=True)
                 resp.raise_for_status()
-                text = _parse_vtt(resp.text)
-                if text and len(text) > 50:
-                    if len(text) > _YTDLP_SUBTITLE_MAX_CHARS:
-                        text = text[:_YTDLP_SUBTITLE_MAX_CHARS] + "…（字幕截斷）"
-                    return text
+                body = resp.text
             except Exception as e:
-                logger.debug("subtitle download failed lang=%s: %s", lang, e)
+                reasons.append("download_failed")
+                logger.info("subtitle download failed lang=%s error_type=%s", lang, type(e).__name__)
+                continue
+            if reply_guards.is_hls_manifest(body):
+                reasons.append("hls_playlist")
+                continue
+            cues = reply_guards.parse_vtt_cues(body)
+            if len("\n".join(text for _t, text in cues)) <= 50:
+                reasons.append("empty_or_short")
+                continue
+            windows = reply_guards.select_subtitle_windows(
+                cues, reply_guards.current_subtitle_hint(), duration,
+                budget=_YTDLP_SUBTITLE_MAX_CHARS,
+            )
+            if not windows.complete:
+                _note_partial_material("subtitle_windows")
+            return windows.text
+    logger.info("subtitles unavailable reason=%s", ",".join(sorted(set(reasons))) or "no_subtitle_tracks")
     return None
 
 
@@ -2917,6 +3034,7 @@ def _prefetch_urls(text: str) -> str:
     )
     blocks = []
     for url in urls:
+        read_before = _link_read_count()
         try:
             # Google Maps 短網址：驗證每一跳 redirect，不下載最終 JS 頁面。
             if _has_google_maps_short_host(url):
@@ -2943,7 +3061,9 @@ def _prefetch_urls(text: str) -> str:
             if _is_youtube_url(url):
                 # YouTube 不走 Gemini video fallback：yt-dlp/oEmbed/HTML metadata
                 # 已能提供可用 context；全失敗時也保留辨識狀態避免 LLM 只看裸網址。
-                blocks.append(_fetch_youtube_context(url))
+                # The transcript windows follow what this message and its quote talk about.
+                with reply_guards.subtitle_hint(text):
+                    blocks.append(_fetch_youtube_context(url))
                 continue
             if _host_in(host, _REDDIT_HOSTS):
                 block = _fetch_reddit_meta(url)
@@ -3006,6 +3126,7 @@ def _prefetch_urls(text: str) -> str:
 
             if len(content) > _PREFETCH_MAX_CHARS:
                 content = content[:_PREFETCH_MAX_CHARS] + "\n…（內容截斷）"
+                _note_partial_material("page_truncated")
             blocks.append(
                 f"（以下是連結 {url} 的網頁內容，已預先擷取）\n"
                 f"--- 網頁內容開始 ---\n{content}\n--- 網頁內容結束 ---"
@@ -3014,6 +3135,11 @@ def _prefetch_urls(text: str) -> str:
             logger.info("prefetch OK url=%s chars=%d", url, len(content))
         except Exception as e:
             logger.info("prefetch failed url=%s: %s", url, e)
+        finally:
+            # Nothing real was read from this link (a title only, a failed read, a
+            # skipped page): what the model has is not the whole story.
+            if _link_read_count() == read_before:
+                _note_partial_material("link_unread")
 
     if blocks:
         return "\n\n".join(blocks) + "\n\n" + text
@@ -4009,6 +4135,25 @@ def _alias_from_user_id(user_id: str | None) -> str:
         return food_extractor.alias_from_user_id(user_id) or ""
     except Exception as e:
         logger.debug("alias lookup skipped: %s", e)
+        return ""
+
+
+def _guard_check(check, *args) -> bool:
+    """A reply_guards yes/no check that can never take the message down (fails to no)."""
+    try:
+        return bool(check(*args))
+    except Exception as exc:
+        logger.warning("reply guard check skipped error_type=%s", type(exc).__name__)
+        return False
+
+
+def _speaker_alias(user_id: str | None) -> str:
+    """The sender's configured family name; local files only, never a LINE lookup."""
+    if not user_id:
+        return ""
+    try:
+        return line_mentions.alias_for_user_id(user_id) or _alias_from_user_id(user_id) or ""
+    except Exception:
         return ""
 
 
@@ -12599,7 +12744,7 @@ def _handle_explicit_text(
     else:
         quoted_block = _build_quoted_block(event.message, group_id)
     context = memory.get_context(group_id)
-    if _requires_public_research(clean_text):
+    if _requires_public_research(clean_text) or _requires_regulation_research(clean_text, context):
         if implicit_quote is not None:
             _handle_web_research_question(event, group_id, clean_text, quoted_context=quoted_block)
         else:
@@ -12650,12 +12795,15 @@ def _handle_explicit_text(
         quote_policy_input,
         context=context,
     )
+    # B2.4: this message disputes a reply of the bot's own that it quotes.
+    dispute = _guard_check(reply_guards.disputes_quoted_bot, quote_policy_input)
+    llm_input = f"{reply_policy.DISPUTE_NOTE}\n\n{user_input}" if dispute else user_input
     facts = _facts_for_speaker(group_id, sender_user_id)
     pnotes = _get_persona_notes(group_id)
     llm_started = time.monotonic()
     try:
         with _thinking_indicator(group_id):
-            reply_text = _caller_checked(_llm_chat, user_input, context, facts, pnotes)
+            reply_text = _caller_checked(_llm_chat, llm_input, context, facts, pnotes)
         # 延遲觀測：只記秒數與長度，不記內容。
         logger.info(
             "explicit llm done secs=%.2f len=%d",
@@ -12672,7 +12820,7 @@ def _handle_explicit_text(
             # 第三層 → deterministic lite_reply → direct local_llm fallback。
             # 不重跑剛失敗的 Claude CLI（2026-10-04）。
             try:
-                reply_text = _caller_checked(_gemini_llm_chat, user_input, context, facts, pnotes)
+                reply_text = _caller_checked(_gemini_llm_chat, llm_input, context, facts, pnotes)
             except Exception as e2:
                 logger.warning("lite_reply retry failed: %s", e2)
                 reply_text = ""
@@ -12702,7 +12850,7 @@ def _handle_explicit_text(
                 "gemini chat (explicit) unavailable, retry via local text fallback: %s",
                 e,
             )
-            reply_text = _caller_checked(_local_text_llm_fallback, user_input, context=context)
+            reply_text = _caller_checked(_local_text_llm_fallback, llm_input, context=context)
             if not reply_text:
                 _reply(
                     event.reply_token,
@@ -12765,12 +12913,14 @@ def _handle_explicit_text(
         searched=reply_provenance.searched(),
         has_material=bool(link_content),
         facts=facts,
+        partial=reply_guards.is_partial(link_content) or dispute,
+        speaker=_speaker_alias(sender_user_id),
     )
     claims_outcome: dict = {}
     reply_text = _enforce_new_value_reply(reply_text, outcome=claims_outcome, **enforce_kwargs)
     if not reply_text:
         reply_text = _retry_unbacked_reply_with_search(
-            claims_outcome, (user_input, context, facts, pnotes), enforce_kwargs,
+            claims_outcome, (llm_input, context, facts, pnotes), enforce_kwargs,
         )
     if not reply_text:
         _finish_explicit_without_reply(event, group_id, quote_policy_input, clean_text, sender_user_id)
@@ -13187,7 +13337,8 @@ _BURST_REPLY_INSTRUCTION = (
     "請根據系統指令中的規則，只針對其中說錯、過時或有爭議的地方給出糾正，"
     "或補充他們不知道的新資訊、具體可行的建議；"
     "糾正必須有本次附上的資料或長期不變的常識作根據；"
-    "近期公開事件、價格、優惠條件，沒有附資料就不要糾正。"
+    "近期公開事件、價格、優惠條件，沒有附資料就不要糾正；"
+    "法規、稅額、免稅額度、罰則、年齡限制的數字，沒有附上的資料就不要寫。"
     "沒有這些內容就輸出空字串，不要附和、不要重述。)"
 )
 
@@ -13280,6 +13431,7 @@ def _handle_burst_flush(
             addressed=False,
             trusted_grounded=bool(getattr(cached, "grounded", False)),
             facts=facts,
+            partial=_guard_check(reply_guards.has_video_link, combined_text),
         )
         if not cached:
             _mark_inbound_reply_completed_no_reply(
@@ -13307,8 +13459,21 @@ def _handle_burst_flush(
         )
         _finish_burst_without_reply(group_id, combined_text, reply_token, message_ids)
         return
+    # B2.4: someone disputes a reply of the bot's own that this batch quotes.  Decided
+    # first: a dispute is answered (or checked as partial), never silenced by the gate below.
+    dispute = _guard_check(reply_guards.disputes_quoted_bot, combined_text)
+    if not dispute and _guard_check(reply_guards.silent_video_comment, combined_text, link_content):
+        # 2026-10-24 (B2.2): a video link in the batch (a family member's quote of one too),
+        # nothing real read of it, no question and no other checkable claim on any line: the
+        # reply could only retell a title (Andrew: 感想不回).
+        logger.info("burst video comment with nothing to read and no question; silent group=%s", group_id)
+        _finish_burst_without_reply(group_id, combined_text, reply_token, message_ids)
+        return
 
-    user_input = f"{_BURST_REPLY_INSTRUCTION}\n\n{prefetched}"
+    user_input = (
+        f"{_BURST_REPLY_INSTRUCTION}\n{reply_policy.DISPUTE_NOTE}\n\n{prefetched}"
+        if dispute else f"{_BURST_REPLY_INSTRUCTION}\n\n{prefetched}"
+    )
     try:
         with _thinking_indicator(group_id):
             reply_text = _caller_checked(_llm_chat, user_input, context, facts, pnotes)
@@ -13421,6 +13586,7 @@ def _handle_burst_flush(
         searched=reply_provenance.searched(),
         has_material=bool(link_content),
         facts=facts,
+        partial=reply_guards.is_partial(link_content) or dispute,
     )
     claims_outcome: dict = {}
     reply_text = _enforce_new_value_reply(reply_text, outcome=claims_outcome, **enforce_kwargs)
@@ -20348,6 +20514,28 @@ def _requires_public_research(text: str) -> bool:
     return True
 
 
+def _requires_regulation_research(text: str, context: list[tuple[str, str]] | None = None) -> bool:
+    """An addressed question about the number in a public regulation (B1.4).
+
+    Only for a message that asked the bot directly (the explicit path calls this;
+    bursts never do).  No family alias, short name, role, kinship word, LINE
+    display name, label of the conversation's turns (``context``) or @name may be in
+    it (compared NFKC and casefolded), and only
+    its domain clause is searched (`public_research.search_query`).  Fails closed:
+    an unreadable or empty alias file means no search (`reply_guards.search_deny_terms`).
+    Residual: a given name nobody configured, inside the domain clause, goes out as written.
+    """
+    import public_research
+
+    try:
+        return public_research.requires_regulation_research(
+            text, lambda: reply_guards.search_deny_terms(context)
+        )
+    except Exception as exc:
+        logger.warning("regulation research check skipped error_type=%s", type(exc).__name__)
+        return False
+
+
 def _build_web_research_queries(text: str) -> list[str]:
     base = re.sub(r"\s+", " ", (text or "").strip(" \t\r\n?？。！!"))
     if not base:
@@ -20417,9 +20605,9 @@ def _format_web_research_sources(sources: list[dict], limit: int = 5) -> str:
         url = str(src.get("url") or "").strip()
         domain = str(src.get("domain") or "").strip()
         body = str(src.get("full_text") or src.get("snippet") or "").strip()
-        # The shared link itself (already capped at 5000 when collected) keeps
-        # its subtitles/article body; search results stay short.
-        limit = 5000 if src.get("evidence_kind") == "linked_context" else 700
+        # The shared link itself (already capped at _LINKED_MATERIAL_MAX_CHARS when
+        # collected) keeps its subtitles/article body; search results stay short.
+        limit = _LINKED_MATERIAL_MAX_CHARS if src.get("evidence_kind") == "linked_context" else 700
         if len(body) > limit:
             body = body[:limit] + "..."
         parts = [f"[{idx}] {title or domain or url}"]
@@ -20484,6 +20672,10 @@ def _build_web_research_prompt(
     )
 
 
+# The shared link's own text in the research prompt.  It was 5000; the transcript windows
+# alone are about 6000 (reply_guards.SUBTITLE_BUDGET) behind the title and description,
+# and a cut would drop the stretch the user's words point at (2026-10-24).
+_LINKED_MATERIAL_MAX_CHARS = 9000
 _RESEARCH_PREFETCH_BUDGET = 12.0  # seconds; public_research.collect gives up at 16
 # A read abandoned after the budget keeps running (yt-dlp, video fallback):
 # at most this many at once, past that the answer comes from the search.
@@ -20534,6 +20726,7 @@ def _handle_web_research_question(
     search_text = public_research.search_query(reply_policy.strip_link_tokens(text))
     linked_material: list[str] = []
     real_link_content: list[bool] = []
+    reader_partial: list[bool] = []  # the shared link was read only in part (2026-10-24)
 
     def collect_with_links(_public_text):
         started = time.monotonic()
@@ -20547,6 +20740,7 @@ def _handle_web_research_question(
                     with _recording_link_content() as found:
                         page = _prefetch_urls(fetch_input)
                     read["content"] = bool(found)
+                    read["partial"] = reply_guards.is_partial(found)
                     read["page"] = page
                 finally:
                     _RESEARCH_READERS.release()
@@ -20572,12 +20766,14 @@ def _handle_web_research_question(
                 page = page.replace(_youtube_unavailable_block(url), "")
         # Something was read only if blocks came back in front of the input;
         # a failed read returns the input unchanged.
+        if read.get("partial"):
+            reader_partial.append(True)
         if _prefetched_material(page, fetch_input):
             page = page.strip()
-            linked_material.append(page[:5000])
+            linked_material.append(page[:_LINKED_MATERIAL_MAX_CHARS])
             if read.get("content"):
                 real_link_content.append(True)
-            rows = [{"url": fetch_urls[0], "full_text": page[:5000],
+            rows = [{"url": fetch_urls[0], "full_text": page[:_LINKED_MATERIAL_MAX_CHARS],
                      "evidence_kind": "linked_context"}] + rows
         return rows
 
@@ -20665,6 +20861,15 @@ def _handle_web_research_question(
             # 2026-10-04: what was actually collected backs claims about named people.
             evidence_text=_research_evidence_text(sources),
             facts=facts,
+            # The shared link counts as read in part when the reader said so, and also when it was
+            # never read (readers busy, no page within the budget, nothing but a title): the
+            # search rows must not stand in for a text that says nothing about the link.
+            partial=(
+                bool(reader_partial)
+                or (bool(fetch_urls) and not real_link_content)
+                or _guard_check(reply_guards.disputes_quoted_bot, f"{quoted_context}\n{text}")
+            ),
+            speaker=_speaker_alias(sender_user_id),
         )
         if not reply_text:
             older_burst_first()
