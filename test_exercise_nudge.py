@@ -77,6 +77,14 @@ def on(monkeypatch):
     monkeypatch.setenv("LINE_BOT_EXERCISE_NUDGE", "1")
 
 
+@pytest.fixture
+def pinned_clock(monkeypatch):
+    """提醒只在台北 08:00–20:00 發，資格判斷讀 parent_health._now；`main._register_exercise_nudge` 呼叫時沒帶
+    now。釘在 NOW（週三上午 10 點），測試在晚上或清晨跑也是同一個答案（2026-10-25 審查：夜間跑會假紅、
+    另兩個測試因為根本沒登記到候選而空過）。"""
+    monkeypatch.setattr(ph, "_now", lambda now=None: NOW if now is None else float(now))
+
+
 def consent(role="爸爸", uid="U_DAD", at=NOW - 20 * DAY):
     db.set_consent(G, role, "on", user_id=uid, changed_by=uid, now=at)
 
@@ -466,7 +474,7 @@ def _records(monkeypatch, rows):
     monkeypatch.setattr(main.memory, "get_raw_message_record", lambda group_id, message_id: rows.get(message_id))
 
 
-def test_flush_registers_a_candidate_for_the_reply_token_only_once(on, monkeypatch):
+def test_flush_registers_a_candidate_for_the_reply_token_only_once(on, pinned_clock, monkeypatch):
     consent()
     _records(monkeypatch, {"M1": {"user_id": "U_KID", "text": "早"}, "M2": {"user_id": "U_DAD", "text": "早安"}})
     main._register_exercise_nudge("TOKEN_C", G, ["M1", "M2"])
@@ -477,10 +485,11 @@ def test_flush_registers_a_candidate_for_the_reply_token_only_once(on, monkeypat
     assert main._take_exercise_nudge("TOKEN_C", G) is None  # 只給一次
 
 
-def test_a_registered_candidate_expires(on, monkeypatch):
+def test_a_registered_candidate_expires(on, pinned_clock, monkeypatch):
     consent()
     _records(monkeypatch, {"M1": {"user_id": "U_DAD", "text": "早安"}})
     main._register_exercise_nudge("TOKEN_D", G, ["M1"])
+    assert "TOKEN_D" in main._exercise_nudge_by_token  # 先確定真的登記到了；不然下面的「過期」是空過
     real_time = main.time.time
     monkeypatch.setattr(main.time, "time", lambda: real_time() + main._EXERCISE_NUDGE_TTL_S + 1)
     assert main._take_exercise_nudge("TOKEN_D", G) is None
@@ -497,8 +506,14 @@ def test_a_missing_message_or_a_failure_registers_nothing(on, monkeypatch, caplo
     assert "exercise nudge check skipped error_type=OSError" in caplog.text
 
 
-def test_a_cancelled_burst_leaves_no_candidate(on, monkeypatch):
+def test_a_cancelled_burst_leaves_no_candidate(on, pinned_clock, monkeypatch):
     import burst_filter
+
+    # 對照：同一批留言如果真的 flush 了，這個環境下一定登記得到候選；所以下面「沒有」是取消造成的
+    consent()
+    _records(monkeypatch, {"M_CANCEL": {"user_id": "U_DAD", "text": "早安"}})
+    main._register_exercise_nudge("TOKEN_CONTROL", G, ["M_CANCEL"])
+    assert main._take_exercise_nudge("TOKEN_CONTROL", G) is not None
 
     registered = []
     monkeypatch.setattr(main, "_register_exercise_nudge", lambda *a: registered.append(a))

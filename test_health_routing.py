@@ -404,6 +404,31 @@ def test_help_lists_the_health_commands_without_mentions():
     assert "@" not in text and "＠" not in text
 
 
+def test_help_mentions_the_health_large_print_page_only_while_its_switch_is_on(monkeypatch):
+    """爸媽健康卡的大字版網頁關著時沒有按鈕，/help 不能說有（2026-10-25 審查 GP1 #7）；其他卡的說明不受影響。"""
+    import card_pages
+
+    card_line = "盤勢卡、爸媽健康卡最下面的按鈕"
+    page_line = "爸媽健康卡的網頁比較快失效，刪除紀錄或暫停時也會清掉"
+    off = main._help_text()  # 測試環境預設整個網頁功能關著
+    assert card_line not in off and page_line not in off and "盤勢卡最下面的按鈕" in off
+    assert off == main._HELP_TEXT
+    monkeypatch.setenv(card_pages.ENABLED_ENV, "1")
+    on = main._help_text()
+    assert card_line in on and page_line in on
+    assert on.index("網址過幾天會換") < on.index(page_line) < on.index("【其他】")
+    monkeypatch.setenv(card_pages.HEALTH_ENV, "0")  # 只關健康頁
+    only_health_off = main._help_text()
+    assert card_line not in only_health_off and page_line not in only_health_off
+    assert "盤勢卡最下面的按鈕" in only_health_off and "網址過幾天會換" in only_health_off
+    monkeypatch.delenv(card_pages.HEALTH_ENV)
+    monkeypatch.setenv(card_pages.ENABLED_ENV, "0")  # 整個網頁功能關掉
+    assert main._help_text() == off
+    monkeypatch.setattr(main, "card_pages", None)  # 模組壞了：當作關
+    monkeypatch.setenv(card_pages.ENABLED_ENV, "1")
+    assert main._help_text() == off
+
+
 # ── 週報 ─────────────────────────────────────────────────────────────────────
 def test_weekly_section_is_appended_but_not_archived(monkeypatch, fake_health):
     import weekly_summary
@@ -593,9 +618,21 @@ def test_deleting_pausing_or_unsending_removes_the_health_pages(health_pages):
     def pages():
         return list(health_pages.dir.glob("*.html"))
 
+    import time
+    from types import SimpleNamespace
+
+    import parent_health_db
+
     _routed("/健康")
     assert pages()
     _routed("/健康 刪除", quoted="MSG_OTHER", raw_row=("U_KID", "示意"))
+    assert pages()  # 那則留言沒有健康紀錄、沒刪到東西：不動還有效的頁（任何家人都能打這個指令；2026-10-25 審查）
+    walk = SimpleNamespace(role="媽媽", category="exercise", item="散步", value="", flag="")
+    parent_health_db.add_events(
+        "G_TEST", [walk], message_id="MSG_QUOTED", reporter_user_id="U_MOM", event_ts=time.time() - 600,
+        source="chat", now=time.time(),
+    )
+    _routed("/健康 刪除", quoted="MSG_QUOTED", raw_row=("U_KID", "示意"))  # 真的刪到紀錄才清
     assert pages() == []
     _routed("/健康")
     _handle(_unsend_event(message_id="MSG_WALK"))  # 收回那則：刪到紀錄才清

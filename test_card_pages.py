@@ -671,6 +671,21 @@ def test_a_health_page_with_a_family_name_or_andrew_is_never_written(pages, line
     assert card_pages.publish(_bubble(lines=("散步（家人回報）",), footer=False), HEALTH_ALT, kind="health")
 
 
+@pytest.mark.parametrize("broken", ["missing", "empty-file", "not-json", "empty-object"])
+def test_a_health_page_is_never_written_when_the_alias_list_cannot_be_read(pages, monkeypatch, tmp_path, broken):
+    """別名檔是名字守門的名單：讀不到或是空的，就是守門失效，不是「沒有人要擋」（2026-10-25 GP2 F3）。"""
+    alias = tmp_path / "aliases.json"
+    if broken != "missing":
+        alias.write_text({"empty-file": "", "not-json": "{oops", "empty-object": "{}"}[broken], encoding="utf-8")
+    monkeypatch.setenv("LINE_USER_ALIASES_PATH", str(alias))
+    page = _bubble(lines=("散步（家人回報）",), footer=False)  # 頁面上沒有名字
+    assert card_pages.publish(page, HEALTH_ALT, kind=card_pages.HEALTH) is None
+    assert not pages.health.exists() or not list(pages.health.iterdir())
+    assert card_pages.publish(_bubble(), "股票推薦：t")  # 一般頁不查名字，不受影響
+    alias.write_text('{"U_TEST_A": "測試成員甲"}', encoding="utf-8")  # 名單讀得到之後，同一頁就存得出來
+    assert card_pages.publish(page, HEALTH_ALT, kind=card_pages.HEALTH)
+
+
 def test_unknown_page_kinds_are_refused(pages):
     assert card_pages.publish(_bubble(), "t", kind="other") is None and not pages.dir.exists()
 
@@ -888,6 +903,41 @@ def test_health_and_stock_pages_are_pruned_by_their_own_rules(pages, monkeypatch
     assert not any(p.exists() for p in healthy)
 
 
+def _seed_health_pages(pages, count):
+    """直接寫進磁碟的 `count` 頁有效健康頁；paths[0] 最舊、最後一個最新（mtime 都在 TTL 內）。"""
+    pages.dir.mkdir(mode=0o700, exist_ok=True)
+    pages.health.mkdir(mode=0o700, exist_ok=True)
+    now = time.time()
+    paths = []
+    for i in range(count):
+        path = pages.health / (hashlib.sha256(f"seed-{i}".encode()).hexdigest() + ".html")
+        path.write_text("x", encoding="utf-8")
+        path.chmod(0o600)
+        os.utime(path, (now - 1000 + i, now - 1000 + i))
+        paths.append(path)
+    return paths
+
+
+def test_the_background_prune_keeps_exactly_the_cap_newest_health_pages(pages):
+    assert card_pages.HEALTH_MAX_PAGES == 100
+    paths = _seed_health_pages(pages, card_pages.HEALTH_MAX_PAGES + 1)
+    card_pages.prune_health_pages()
+    assert not paths[0].exists() and all(p.exists() for p in paths[1:])  # 101 頁→剛好留最新 100 頁
+
+
+def test_a_prune_at_exactly_the_cap_removes_nothing(pages):
+    paths = _seed_health_pages(pages, card_pages.HEALTH_MAX_PAGES)
+    card_pages.prune_health_pages()
+    assert all(p.exists() for p in paths)
+
+
+def test_publishing_into_a_full_folder_keeps_the_cap_including_the_new_page(pages):
+    paths = _seed_health_pages(pages, card_pages.HEALTH_MAX_PAGES)
+    _token_new, new = _health_page(pages, "n")
+    assert new.exists() and not paths[0].exists() and all(p.exists() for p in paths[1:])
+    assert len(list(pages.health.glob("*.html"))) == card_pages.HEALTH_MAX_PAGES
+
+
 def test_purging_removes_only_health_pages_even_when_pages_are_off(pages, monkeypatch, tmp_path):
     _token_a, page = _health_page(pages, "a")
     stock = pages.dir / f"{_token(card_pages.publish(_bubble(), 't'))}.html"
@@ -1079,6 +1129,48 @@ def test_the_fixed_page_host_is_also_refused(monkeypatch):
 def test_other_links_are_not_bot_pages(url):
     assert not safe_fetch.is_bot_page(url)
     assert safe_fetch.public_host(url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com/card/taishin-richart-credit-card-review",  # 一般文章的長網址
+        "https://www.cathaybk.com.tw/cathaybk/card/cube-card-benefits-and-rewards",  # 巢狀路徑
+        "https://example.com/card/" + "a" * 21,
+        "https://example.com/card/" + "a" * 23,
+        "https://example.com/card/" + "a" * 22 + "/extra",  # 路由底下再多一層：不是這條路由
+        "https://example.com/card/" + "a" * 22 + ".html",
+        "https://example.com/x/card/" + "a" * 22,
+    ],
+)
+def test_ordinary_articles_under_a_card_path_are_still_read(url):
+    """路徑規則只擋「整條路徑就是 /card/<22 字元 token>」；別人網站上叫 card 的文章照常讀（2026-10-25 GP1 #2）。"""
+    assert not safe_fetch.is_bot_page(url)
+    assert safe_fetch.public_host(url) == url.split("/")[2]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com//card/" + "a" * 22,  # 多一個斜線：用戶端或代理正規化後就是這條路由
+        "https://example.com/x/../card/" + "a" * 22,
+        "https://example.com/./card/" + "a" * 22,
+        "https://example.com/card/./" + "a" * 22,
+        "https://example.com/card/" + "a" * 22 + "/",
+        "https://example.com/%63ard/" + "a" * 22,
+        "https://example.com/card%2F" + "a" * 22,
+        "https://example.com/card/best-credit-cards-2026",  # 剛好 22 字元的 slug 分不出來：已知的誤擋，維持擋
+    ],
+)
+def test_other_spellings_of_the_page_route_are_still_bot_pages(url):
+    assert safe_fetch.is_bot_page(url)
+    with pytest.raises(safe_fetch.BlockedURL):
+        safe_fetch.public_host(url)
+
+
+def test_a_pasted_article_under_a_card_path_still_reaches_the_prefetcher():
+    article = "https://example.com/card/taishin-richart-credit-card-review"
+    assert main._fetch_urls(f"看這篇 {article} 和 {BASE}/card/{'p' * 22}") == [article]
 
 
 def test_a_pasted_page_link_is_never_fetched_into_a_prompt(monkeypatch, caplog):

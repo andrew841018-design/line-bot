@@ -1131,6 +1131,47 @@ CASES = [
     _case("pc-before-med-habit", F, "吃藥前都有量血壓"),
     _case("pc-walk-understand", F, "散步之前先了解路線"),
     _case("pc-exercise-understand", M, "去運動之前先了解一下"),
+    # ── 119：緊急字詞後面緊接的「人」是說話的人自己（整個人），不是泛指的人 ──
+    _case("rf-chest-person", F, "我胸悶人不舒服", [(F, "body", "胸痛胸悶", "", R)], [(F, "胸痛胸悶", True, False, False)]),
+    _case("rf-fall-person", M, "剛剛跌倒人站不起來", [(M, "body", "跌倒", "", R)], [(M, "跌倒", True, False, False)]),
+    _case("rf-breath-person", F, "喘不過氣人很不舒服", [(F, "body", "呼吸困難", "", R)], [(F, "呼吸困難", True, False, False)]),
+    _case("rf-faint-person", M, "剛剛昏倒人很虛", [(M, "body", "昏倒", "", R)], [(M, "昏倒", True, False, False)]),
+    _case("rf-relay-fall-person", X, "爸爸剛剛跌倒人站不起來", [(F, "body", "跌倒", "", R)], [(F, "跌倒", True, False, False)]),
+    _case("rf-sweat", F, "我胸悶人好多汗", [(F, "body", "胸痛胸悶", "", R)], [(F, "胸痛胸悶", True, False, False)]),
+    # 「人滿頭大汗」「人口吐白沫」「人滿身是血」「人好多血」「人很多地方痛」：整個人的急症，不是人多、人口
+    _case("rf-sweat-head", F, "胸悶人滿頭大汗", [(F, "body", "胸痛胸悶", "", R)], [(F, "胸痛胸悶", True, False, False)]),
+    _case("rf-foam", M, "昏倒人口吐白沫", [(M, "body", "昏倒", "", R)], [(M, "昏倒", True, False, False)]),
+    _case("rf-blood-body", F, "跌倒人滿身是血", [(F, "body", "跌倒", "", R)], [(F, "跌倒", True, False, False)]),
+    _case("rf-blood-much", M, "跌倒人好多血", [(M, "body", "跌倒", "", R)], [(M, "跌倒", True, False, False)]),
+    _case("rf-many-places", F, "剛剛跌倒人很多地方痛", [(F, "body", "跌倒", "", R)], [(F, "跌倒", True, False, False)]),
+    _case("rf-advice-careful", M, "跌倒人要小心"),
+    _case("rf-fall-slurred", M, "跌倒人口齒不清", [(M, "body", "嘴歪或說話不清", "", R), (M, "body", "跌倒", "", R)],
+          [(M, "嘴歪或說話不清", True, False, False), (M, "跌倒", True, False, False)]),
+    # 「人沒事」「人好多了」：已經好了，只記錄
+    _case("rf-fall-person-ok", M, "跌倒人沒事", [(M, "body", "跌倒")], [(M, "跌倒", False, False, False)]),
+    _case("rf-fall-better", F, "跌倒人好多了", [(F, "body", "跌倒")], [(F, "跌倒", False, False, False)]),
+    # 泛指的人、人數、人人、保險、成語照舊不算
+    _case("rf-generic-de-person", F, "跌倒的人很多"),
+    _case("rf-generic-count", M, "跌倒人數增加"),
+    _case("rf-generic-everyone", F, "跌倒人人有責"),
+    _case("rf-generic-insurance", M, "跌倒人壽有賠嗎"),
+    _case("rf-generic-idiom", F, "跌倒人命關天"),
+    _case("rf-generic-patient", M, "中風病人要復健"),
+    # 病名後面的「人」多半是泛指（中風人很難照顧）：照舊不算
+    _case("rf-disease-generic", F, "中風人很難照顧"),
+    _case("rf-disease-young", M, "心肌梗塞人越來越年輕"),
+    _case("rf-more-and-more", F, "跌倒人越來越多"),
+    # 「等人」原本就回 119，照舊回（新的泛指寫法只認「的人」和「人…」，不會讓 119 變少）
+    _case("rf-wait-help", M, "我跌倒等人來扶", [(M, "body", "跌倒", "", R)], [(M, "跌倒", True, False, False)]),
+    # 已在處理的字詞（急診、住院…）後面接「人…」照舊不算：同一則的 119 不會降成只私訊
+    _case("rf-er-crowded", F, "我胸口很痛，急診人超級多不想去", [(F, "body", "胸痛胸悶", "", R)],
+          [(F, "胸痛胸悶", True, False, False)]),
+    _case("rf-er-crowded-de", M, "我胸口很痛，急診的人很多不想去", [(M, "body", "胸痛胸悶", "", R)],
+          [(M, "胸痛胸悶", True, False, False)]),
+    _case("rf-er-squeeze", F, "我胸口很痛，急診人很擠不想去", [(F, "body", "胸痛胸悶", "", R)],
+          [(F, "胸痛胸悶", True, False, False)]),
+    _case("rf-er-crowded-alone", M, "急診人很多"),
+    _case("rf-ward-staff", F, "住院人力不足"),
 ]
 
 
@@ -1155,6 +1196,18 @@ def test_article_rule_never_changes_red_flags(monkeypatch, forced):
     monkeypatch.setattr(phx, "_heading_signal", lambda norm: forced)
     monkeypatch.setattr(phx, "_article_words", lambda norm: forced)
     assert [red(text, speaker) for speaker, text in samples] == before
+
+
+# 緊急字詞後面的泛指「人…」：每一個都要擋住（病名、已在處理的字詞另有寬排除，這裡用跌倒、胸悶測主表）
+_RF_GENERIC_TAILS = ("的人很多", "人人有責", "人的照顧", "人們都怕", "人類最常見", "人性化", "人際關係", "人參可以吃嗎",
+                     "人壽有賠嗎", "人體會怎樣", "人命關天", "人數增加", "人次", "人士", "人群", "人員", "人潮", "人家會笑",
+                     "人生", "人力", "人滿為患", "人口老化", "人身意外險", "人要小心", "人很多", "人越來越多")
+
+
+@pytest.mark.parametrize("head", ["跌倒", "胸悶"])
+@pytest.mark.parametrize("tail", _RF_GENERIC_TAILS)
+def test_red_flag_generic_person_tails(head, tail):
+    assert detect_red_flags(head + tail, FATHER) == []
 
 
 # ── 第三輪審查的關係名詞掃描：這些都是別人，不能算到爸媽頭上 ──

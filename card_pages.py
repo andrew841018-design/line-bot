@@ -438,12 +438,18 @@ def _prune(
 
 
 def _family_names() -> set[str]:
-    """本機別名檔與角色檔裡的家人名字（含三字名的短名）；爸爸、媽媽這類稱謂不算。讀不到就丟例外（不存頁）。"""
+    """本機別名檔與角色檔裡的家人名字（含三字名的短名）；爸爸、媽媽這類稱謂不算。
+
+    讀不到別名、或讀出來是空的就丟例外（呼叫端當成不存頁）：`load_user_aliases()` 自己會把讀檔錯誤吞掉回 {}，
+    沒有名單的守門等於沒有守門（2026-10-25 GP2 F3），所以「沒名字」一律當作失敗，不當作「沒有人要擋」。"""
     import line_mentions
 
     names = {str(label or "").strip().lstrip("@").strip() for label in line_mentions.load_user_aliases().values()}
     names |= set(line_mentions.configured_family_alias_mapping(include_short=True))
-    return {name for name in names if len(name) >= 2 and name not in _HEALTH_PAGE_TITLES}
+    found = {name for name in names if len(name) >= 2 and name not in _HEALTH_PAGE_TITLES}
+    if not found:
+        raise RuntimeError("no family aliases to check the page against")
+    return found
 
 
 def _card_strings(node: Any, depth: int = 0) -> list[str]:
