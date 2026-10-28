@@ -814,9 +814,10 @@ def _collect_tw(needs: dict[str, str], cands: Sequence[Candidate], db_path: Opti
     return long, recent
 
 
-def _load_tw(cands: Sequence[Candidate], calendar: tuple, prices: dict, today: str,
-             db_path: Optional[Path]) -> MarketData:
-    """台股算成績還要的：休市表（一年一年查：明年的表還沒公布，不擋今年的區間）、除權息涵蓋、除權息、隔離。"""
+def load_tw(cands: Sequence[Candidate], calendar: tuple, prices: dict, today: str,
+            db_path: Optional[Path]) -> MarketData:
+    """台股算成績還要的：休市表（一年一年查：明年的表還沒公布，不擋今年的區間）、除權息涵蓋、除權息、隔離。
+    公開給回測週報的 job 用（PLAN 2026-10-29 §5.1）：日曆、價格由呼叫端給，其他都查 DB（唯讀）。"""
     since = min(c.t for c in cands)
     codes = sorted({c.code for c in cands} | {TW_BENCHMARK})
     last_year = int((calendar[-1] if calendar else today)[:4])
@@ -837,10 +838,15 @@ def _load_tw(cands: Sequence[Candidate], calendar: tuple, prices: dict, today: s
     return MarketData(TW, calendar, prices, quarantine, closed_by_year, spans, events)
 
 
-def _load_us(cands: Sequence[Candidate], calendar: tuple, db_path: Optional[Path]) -> MarketData:
+def load_us(cands: Sequence[Candidate], calendar: tuple, db_path: Optional[Path],
+            prices: Optional[dict] = None) -> MarketData:
+    """美股算成績要的：收盤、分割、隔離。prices 沒給（背景每輪）就查 DB 的 us 收盤；回測週報的 job 給自己價格庫的
+    收盤（{代號: {日期: 收盤}}，含 SPY）。分割、隔離一律查 DB（唯讀）。"""
     since = min(c.t for c in cands)
     codes = sorted({c.code for c in cands} | {US_BENCHMARK})
-    prices = _clean_series(stock_db_ro.closes("us", codes, since, path=db_path))
+    if prices is None:
+        prices = stock_db_ro.closes("us", codes, since, path=db_path)
+    prices = _clean_series(prices)
     splits = stock_db_ro.splits_after(codes, since, path=db_path)
     quarantine = stock_db_ro.active_quarantine("us", codes, path=db_path)
     return MarketData(US, calendar, prices, quarantine, splits=splits)
@@ -941,7 +947,7 @@ def _update(ai_enabled: bool, now: float, db_path: Optional[Path]) -> dict:
         prices = {code: {**start.prices.get(code, {}), **recent.get(code, {}), **long.get(code, {})}
                   for code in {c.code for c in tw_cands} | {TW_BENCHMARK}}
         try:
-            data = _load_tw(tw_cands, tw_cal, prices, today, db_path)
+            data = load_tw(tw_cands, tw_cal, prices, today, db_path)
         except (stock_db_ro.DbBusy, stock_db_ro.DbUnavailable) as exc:
             _db_failed("tw", exc, waits)
         else:
@@ -950,7 +956,7 @@ def _update(ai_enabled: bool, now: float, db_path: Optional[Path]) -> dict:
         waits["us:no_data"] += len(us_cands)
     elif us_cands:
         try:
-            data = _load_us(us_cands, us_cal, db_path)
+            data = load_us(us_cands, us_cal, db_path)
         except (stock_db_ro.DbBusy, stock_db_ro.DbUnavailable) as exc:
             _db_failed("us", exc, waits)
         else:
@@ -987,6 +993,13 @@ def load_result() -> Optional[dict]:
     except Exception as exc:
         logger.warning("stock picks perf result unreadable error_type=%s", type(exc).__name__)
         return None
+
+
+def read_ledger_rows() -> list[dict]:
+    """成績帳讀得懂的每一列（同一個鍵只留第一次寫的、壞行跳過：和彙總用的是同一套）；唯讀、不拿鎖、各版本的列都在
+    （用 row["v"] 分）。給回測週報的 job 用：週報數字和家人成績卡同一本帳（PLAN 2026-10-29 §6）。
+    帳讀不了（不是一般檔、太大、權限）就丟例外，不當成空的帳。"""
+    return [dict(row) for row in _read_ledger(stock_picks.STATE_DIR / LEDGER_NAME).rows]
 
 
 def summary() -> dict:

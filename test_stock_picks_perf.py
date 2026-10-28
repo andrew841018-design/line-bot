@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
 import inspect
 import json
 import sqlite3
@@ -930,3 +931,91 @@ def test_reads_a_us_history_row_in_the_exact_stock_picks_us_shape(world):  # P4�
     assert (rows[5]["m"], rows[5]["rule"], rows[5]["rev"], rows[5]["code"]) == ("us", "us_v1", 1, "BRK.B")
     assert (rows[5]["c0"], rows[5]["ch"], rows[5]["cf"], rows[5]["b0"]) == (480.25, 490.0, 1.0, 600.0)
     assert rows[5]["skip"] is None and rows[5]["r"] == pytest.approx(490 / 480.25 - 1, abs=1e-6)
+
+
+# ── 公開介面的契約（回測週報的 job 用；PLAN 2026-10-29 §5.1：改名、不改行為） ─────────────
+def _tw_market(days: list[str], stock: dict, bench: dict, *, code: str = "2330", exrights=None) -> perf.MarketData:
+    """直接組 evaluate 吃的台股 MarketData（不經 DB）：days 都是交易日、沒有休市、除權息涵蓋整段。"""
+    years = {int(d[:4]) for d in days}
+    return perf.MarketData("tw", tuple(days), {code: stock, "0050": bench}, {},
+                           closed_by_year={y: frozenset() for y in years},
+                           coverage=(("2020-01-01", "2099-12-31"),), exrights=exrights or {})
+
+
+def test_contract_candidate_and_market_data_fields():
+    assert [f.name for f in dataclasses.fields(perf.Candidate)] == ["market", "rule", "t", "rev", "code", "close", "h"]
+    assert [f.name for f in dataclasses.fields(perf.MarketData)] == [
+        "market", "calendar", "prices", "quarantine", "closed_by_year", "coverage", "exrights", "splits"]
+    cand = perf.Candidate("tw", "ai_v1", "2026-10-01", 1, "2330", 100.0, 5)
+    assert cand.key == (perf.LEDGER_VERSION, "tw", "ai_v1", "2026-10-01", 1, "2330", 5)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        cand.close = 101.0  # type: ignore[misc]
+    data = perf.MarketData("us", ("2026-10-01",), {}, {})
+    assert (data.closed_by_year, data.coverage, data.exrights, data.splits) == ({}, (), {}, {})
+    assert data.sessions == frozenset({"2026-10-01"})
+
+
+def test_contract_loader_and_evaluate_signatures():
+    assert list(inspect.signature(perf.load_tw).parameters) == ["cands", "calendar", "prices", "today", "db_path"]
+    us = inspect.signature(perf.load_us).parameters
+    assert list(us) == ["cands", "calendar", "db_path", "prices"] and us["prices"].default is None
+    assert list(inspect.signature(perf.evaluate).parameters) == ["c", "data"]
+    assert not inspect.signature(perf.read_ledger_rows).parameters
+    assert not hasattr(perf, "_load_tw") and not hasattr(perf, "_load_us")  # 只有公開的名字（job 不靠私有函式）
+    assert (perf.WAIT, perf.FREEZE) == ("wait", "freeze")
+
+
+def test_contract_evaluate_returns_wait_reason_or_a_ledger_row():
+    days = _weekdays("2026-09-01", "2026-10-30")
+    data = _tw_market(days, {d: 100.0 for d in days}, {d: 50.0 for d in days})
+    kind, row = perf.evaluate(perf.Candidate("tw", "v1", days[0], 1, "2330", 100.0, 5), data)
+    assert kind == perf.FREEZE and isinstance(row, dict)
+    assert set(row) == {"v", "m", "rule", "t", "rev", "code", "h", "th", "r", "b", "skip", *perf.INPUT_KEYS}
+    assert (row["v"], row["m"], row["rule"], row["t"], row["rev"], row["code"], row["h"]) == (
+        perf.LEDGER_VERSION, "tw", "v1", days[0], 1, "2330", 5)
+    assert row["skip"] is None and isinstance(row["r"], float) and isinstance(row["b"], float)
+    assert perf._ledger_row(row) is not None  # 寫進帳的列讀得回來
+    assert perf.evaluate(perf.Candidate("tw", "v1", days[-3], 1, "2330", 100.0, 5), data) == (perf.WAIT, "not_due")
+
+
+def test_contract_load_us_uses_given_prices_or_the_db(world, monkeypatch):
+    days = world.us(last="2026-10-30")
+    world.closes("us", "NVDA", {d: 200.0 for d in days})
+    with world.store() as s:
+        s.upsert_splits([("NVDA", D("2026-10-06"), 4.0, 1.0)], "nasdaq")
+    cands = [perf.Candidate("us", "us_v1", "2026-10-01", 1, "NVDA", 200.0, 5)]
+    from_db = perf.load_us(cands, tuple(days), world.path)
+    assert from_db.prices["NVDA"]["2026-10-01"] == 200.0 and from_db.prices["SPY"]["2026-10-01"] == 600.0
+    assert from_db.splits == {"NVDA": ["2026-10-06"]}
+
+    def no_closes(*_a, **_k):
+        raise AssertionError("prices were given: do not query DB closes")
+
+    monkeypatch.setattr(stock_db_ro, "closes", no_closes)
+    given = {"NVDA": {"2026-10-01": 210.0, "bad": 1.0}, "SPY": {"2026-10-01": 610.0, "2026-10-02": float("nan")}}
+    mine = perf.load_us(cands, tuple(days), world.path, prices=given)
+    assert mine.prices == {"NVDA": {"2026-10-01": 210.0}, "SPY": {"2026-10-01": 610.0}}  # 一樣只收合法的
+    assert mine.splits == {"NVDA": ["2026-10-06"]} and mine.calendar == tuple(days)
+
+
+def test_read_ledger_rows_is_what_aggregate_reads(monkeypatch):
+    assert perf.read_ledger_rows() == []  # 還沒有帳
+    first, again = _row("2026-10-01", 5, 0.1, 0.0), _row("2026-10-01", 5, 0.5, 0.0)
+    other = _row("2026-10-02", 20, None, None, skip="missing", m="us", rule="us_v1", code="NVDA")
+    write_jsonl(perf.LEDGER_NAME, [first, again, {"v": 1, "m": "tw", "skip": "bogus"}, other],
+                raw_tail='{"v":1,"m":"tw","rule"')
+
+    def no_lock(*_a, **_k):
+        raise AssertionError("reading the ledger must not take the state lock")
+
+    monkeypatch.setattr(stock_picks, "_state_file_lock", no_lock)
+    rows = perf.read_ledger_rows()
+    assert rows == perf._read_ledger(stock_picks.STATE_DIR / perf.LEDGER_NAME).rows
+    assert [(r["t"], r["h"], r["r"], r["skip"]) for r in rows] == [("2026-10-01", 5, 0.1, None),
+                                                                 ("2026-10-02", 20, None, "missing")]
+    rows[0]["r"] = 9.9
+    assert perf.read_ledger_rows()[0]["r"] == 0.1  # 每次都是新的 dict
+    (stock_picks.STATE_DIR / perf.LEDGER_NAME).unlink()
+    (stock_picks.STATE_DIR / perf.LEDGER_NAME).mkdir()
+    with pytest.raises((OSError, ValueError)):  # 讀不了不是「空的帳」
+        perf.read_ledger_rows()
