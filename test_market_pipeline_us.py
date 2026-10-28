@@ -480,7 +480,7 @@ def test_d_is_the_latest_closed_session(env, now, expected):
 
 
 D_TASKS = ("us.splits", "us.holdings.spy", "us.holdings.ndx", "us.hist", "us.vix", "us.options", "us.ust",
-           "us.hist.backfill")  # 靠 D 的任務（經濟日曆、週／月任務看美東日期，不靠 D）
+           "us.hist.backfill", "us.rot")  # 靠 D 的任務（經濟日曆、週／月任務看美東日期，不靠 D）；us.rot 是資金輪動（2026-10-28）
 
 
 def test_no_d_means_no_task_runs(env):
@@ -1597,7 +1597,8 @@ def test_full_collect_round_on_a_fresh_store(env, monkeypatch):
                    pipe.OBS_EVENTS_ECON, pipe.OBS_EVENTS_EARNINGS, pipe.OBS_CALENDAR_CHECK):
         assert obs(env, obs_id)["payload"] is not None, obs_id
     assert obs(env, pipe.OBS_13F_PREFIX + "NVDA")["payload"]["own_pct"] == pytest.approx(79.53)
-    assert D in closes(env, "AAPL") and len(http.requested("hist")) <= pipe.HIST_MAX_SYMBOLS_PER_RUN
+    # 每輪 60 檔是 us.hist 的；資金輪動的 us.rot（XLP、KO）用自己的計數，最多再 2 次（2026-10-28）
+    assert D in closes(env, "AAPL") and len(http.requested("hist")) <= pipe.HIST_MAX_SYMBOLS_PER_RUN + len(pipe.ROT_SYMBOLS)
     assert len(env.ledger.reserved) == len(http.calls)  # 每一次請求都先在帳本預扣
     again = market_tasks.run_collect(ctx_at(env, NOW + 900), pipe.TASKS)["results"]
     assert again["us.options"] == "not_due" and again["us.13f"] == "not_due"  # 這個期間已經做完

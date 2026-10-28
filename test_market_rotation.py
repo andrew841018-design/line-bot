@@ -42,6 +42,26 @@ from test_market_dashboard import (  # noqa: F401  md／paths 是 fixture（用�
     worst_snapshot,
     write_snapshot,
 )
+from test_market_pipeline_us import D as PIPE_D
+from test_market_pipeline_us import HISTORY as PIPE_HISTORY
+from test_market_pipeline_us import NOW as PIPE_NOW
+from test_market_pipeline_us import (  # noqa: F401  env 是 fixture
+    TASKS,
+    closes,
+    ctx_at,
+    env,
+    etfs_ready,
+    flat,
+    market_http,
+    market_tasks,
+    obs,
+    pipe,
+    run,
+    seed,
+    seed_universe,
+    sessions,
+    src,
+)
 from test_market_publish import D as PUB_D
 from test_market_publish import NOW as PUB_NOW
 from test_market_publish import US_DAYS, _set_close
@@ -929,3 +949,217 @@ def test_the_worst_us_bubble_and_carousel_stay_within_the_limits(md, paths):
     ]
     assert md.card_bytes(bubble) <= market_dashboard.SUMMARY_BUBBLE_MAX_BYTES == 6656
     assert md.card_bytes(reply.flex) <= market_dashboard.CARD_MAX_BYTES == 28 * 1024
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# pipeline：us.rot 任務（XLP、KO 日線）。test_market_pipeline_us 的假 Nasdaq、真的 Store、真的框架（run_task／run_collect）
+# D＝10/16（週五），NOW＝美東 10/16 17:00
+# ═════════════════════════════════════════════════════════════════════════════
+ROT_DAYS = sessions(PIPE_D, 260)  # 假 Nasdaq 上 XLP、KO 的一年＋D
+
+
+def d_published(env_):
+    """四檔 ETF 到 10/15、SPY 已經有 D 的正式列（Nasdaq 公布了 D）；假 Nasdaq 上 XLP、KO 都有一年＋D。"""
+    etfs_ready(env_)
+    seed(env_, "SPY", {PIPE_D: 100.0})
+    env_.http.prices["XLP"] = flat(ROT_DAYS, 80.0)
+    env_.http.prices["KO"] = flat(ROT_DAYS, 60.0)
+
+
+def pending_jump(day=PIPE_D, close=61.0, *, next_at=PIPE_NOW - 1.0):
+    return {"kind": "jump", "dates": [day.isoformat()], "closes": {day.isoformat(): close},
+            "disputed": [day.isoformat(), day.isoformat()], "seen_at": PIPE_NOW - 900.0, "since": day.isoformat(),
+            "disagree": 0, "quarantined": False, "next_at": next_at}
+
+
+def test_rot_symbols_the_task_slot_and_the_endpoint_note():
+    assert pipe.ROT_SYMBOLS == (("XLP", True), ("KO", False))
+    core = [task.name for task in pipe.TASKS if task.group == "core"]
+    assert core[-2:] == ["us.events.econ", "us.rot"]  # 美股 core 的最後一個：輪動列優先序最低（_interleave 保持先後）
+    task = {task.name: task for task in pipe.TASKS}["us.rot"]
+    assert task.budget_s == 20.0 and task.market == "us" and task in market_tasks.registered()
+    # 規劃值（程式沒拿它擋）：每輪 60 檔是 us.hist 的，us.rot 自己再 2 檔
+    assert src.ENDPOINTS["nasdaq_historical"].per_run == pipe.HIST_MAX_SYMBOLS_PER_RUN + len(pipe.ROT_SYMBOLS) == 62
+
+
+def test_xlp_is_fetched_as_an_etf_and_ko_as_a_stock_even_when_ko_is_a_member(env):
+    d_published(env)
+    seed_universe(env, ["KO", "AAA"])
+    seed(env, "KO", flat(PIPE_HISTORY, 60.0))  # KO 在成分股清單裡、已經有歷史（B 案：us.rot 照樣自己抓）
+    assert run(env, "us.rot") == "ok"
+    xlp, ko = env.http.query("hist", "XLP"), env.http.query("hist", "KO")
+    assert [query["assetclass"] for query in xlp] == ["etf"] and [query["assetclass"] for query in ko] == ["stocks"]
+    assert xlp[0]["fromdate"] == (PIPE_D - timedelta(days=pipe.HIST_BOOTSTRAP_DAYS)).isoformat()  # 第一次補一年
+    assert ko[0]["fromdate"] < PIPE_HISTORY[-1].isoformat()  # KO 是一般更新（最後有效日往前 3 個交易日起）
+    assert PIPE_D in closes(env, "XLP") and PIPE_D in closes(env, "KO")
+    assert env.store.task_state("us.rot")["fail_streak"] == 0
+    assert run(env, "us.rot", PIPE_NOW + 900) == "not_due"  # 兩檔都有 D 了：不白打
+    assert len(env.http.requested("hist")) == 2
+
+
+def test_due_needs_a_published_d_no_block_and_a_symbol_without_d(env):
+    def due(now=PIPE_NOW):
+        return TASKS["us.rot"].due(ctx_at(env, now))
+
+    etfs_ready(env)  # 四檔 ETF 都還沒有 D 的正式列
+    env.http.prices["XLP"] = flat(ROT_DAYS, 80.0)
+    assert not due()  # Nasdaq 還沒公布 D
+    seed(env, "SPY", {PIPE_D: 100.0})
+    assert due()
+    env.store.set_task_state("sched:us.hist", {"blocked": {"kind": "blocked", "at": PIPE_NOW - 60}})
+    assert not due()  # us.hist 撞到 403／429
+    env.store.set_task_state("sched:us.hist", {})
+    env.store.set_task_state("sched:us.rot", {"blocked": {"kind": "rate_limited", "at": PIPE_NOW - 60}})
+    assert not due()  # us.rot 自己撞到（nasdaq_blocked 只看 us.hist）
+    assert due(PIPE_NOW + pipe.NASDAQ_BLOCK_VALID_S + 60)  # 超過 3 小時就不當被擋
+    env.store.set_task_state("sched:us.rot", {})
+    seed(env, "XLP", flat(PIPE_HISTORY + [PIPE_D], 80.0))
+    seed(env, "KO", flat(PIPE_HISTORY + [PIPE_D], 60.0))
+    assert not due()  # XLP 與 KO 都已經是最新
+    assert pipe._run_rot(ctx_at(env, PIPE_NOW)) is None and env.http.requested("hist") == []
+
+
+def test_a_missing_d_waits_in_us_rots_own_retry_and_is_not_a_failure(env):
+    d_published(env)
+    env.http.prices["XLP"] = flat(sessions(date(2026, 10, 15), 260), 80.0)  # XLP 的 D 還沒出來
+    assert run(env, "us.rot") == "partial"  # KO 好了、XLP 還沒有 D
+    assert pipe._state(ctx_at(env, PIPE_NOW), "us.rot")["retry"]["XLP"]["n"] == 1
+    assert "XLP" not in pipe._state(ctx_at(env, PIPE_NOW), "us.hist").get("retry", {})
+    assert env.store.task_state("us.rot")["fail_streak"] == 0
+    assert run(env, "us.rot", PIPE_NOW + 900) == "not_due"  # 30 分鐘內不重打
+    env.http.prices["XLP"] = flat(ROT_DAYS, 80.0)
+    assert run(env, "us.rot", PIPE_NOW + 1800) == "ok"
+    assert len(env.http.query("hist", "XLP")) == 2 and PIPE_D in closes(env, "XLP")
+
+
+def test_us_rot_never_touches_the_us_hist_state(env):
+    """us.hist 的排程紀錄（retry、run、gate_open…）、框架紀錄與 us.hist.status 完全不變；us.rot 只有自己的鍵。"""
+    etfs_ready(env)
+    seed_universe(env, ["FFF"])
+    seed(env, "FFF", flat(PIPE_HISTORY, 30.0))
+    env.http.prices["FFF"] = flat(PIPE_HISTORY, 30.0)  # FFF 還沒有 D：us.hist 記一筆重排
+    env.http.prices["XLP"] = flat(ROT_DAYS, 80.0)
+    env.http.prices["KO"] = flat(ROT_DAYS, 60.0)
+    assert run(env, "us.hist") == "partial"
+    before = (env.store.task_state("sched:us.hist"), env.store.task_state("us.hist"), obs(env, pipe.OBS_HIST_STATUS))
+    assert before[0]["retry"]["FFF"]["n"] == 1 and before[0]["gate_open"] == PIPE_D.isoformat()
+    assert run(env, "us.rot", PIPE_NOW + 60) == "ok"
+    assert (env.store.task_state("sched:us.hist"), env.store.task_state("us.hist"),
+            obs(env, pipe.OBS_HIST_STATUS)) == before
+    own = env.store.task_state("sched:us.rot")
+    assert set(own) <= {"retry", "split_retry", "run", "blocked"} and set(own["retry"]) <= {"XLP", "KO"}
+    assert own["run"]["used"] == 2
+
+
+def test_us_rot_keeps_its_own_two_requests_when_us_hist_used_all_sixty(env):
+    d_published(env)
+    names = [f"S{chr(65 + i // 26)}{chr(65 + i % 26)}" for i in range(70)]
+    seed_universe(env, names)
+    for name in names:
+        seed(env, name, flat(PIPE_HISTORY, 10.0))
+        env.http.prices[name] = flat(PIPE_HISTORY + [PIPE_D], 10.0)
+    ctx = ctx_at(env, PIPE_NOW)  # 同一輪
+    market_tasks.run_task(ctx, TASKS["us.hist"])
+    assert len(env.http.requested("hist")) == pipe.HIST_MAX_SYMBOLS_PER_RUN
+    assert market_tasks.run_task(ctx, TASKS["us.rot"]) == "ok"
+    requested = env.http.requested("hist")
+    assert len(requested) == pipe.HIST_MAX_SYMBOLS_PER_RUN + len(pipe.ROT_SYMBOLS) and requested[-2:] == ["XLP", "KO"]
+    assert pipe._state(ctx, "us.hist")["run"]["used"] == 60 and pipe._state(ctx, "us.rot")["run"]["used"] == 2
+    assert not TASKS["us.hist.backfill"].due(ctx)  # us.hist 那 60 檔的上限不受影響
+
+
+def test_after_us_rot_writes_kos_d_us_hist_does_not_ask_for_ko_again(env):
+    d_published(env)
+    seed_universe(env, ["KO"])
+    seed(env, "XLP", flat(PIPE_HISTORY, 80.0))
+    seed(env, "KO", flat(PIPE_HISTORY, 60.0))
+    ctx = ctx_at(env, PIPE_NOW)
+    assert market_tasks.run_task(ctx, TASKS["us.rot"]) == "ok"
+    assert PIPE_D in closes(env, "KO") and len(env.http.query("hist", "KO")) == 1
+    market_tasks.run_task(ctx, TASKS["us.hist"])  # 同一輪輪到 us.hist
+    market_tasks.run_task(ctx_at(env, PIPE_NOW + 900), TASKS["us.hist"])  # 下一輪
+    assert len(env.http.query("hist", "KO")) == 1  # 都沒有再對 KO 發請求（_job_for 看到 KO 已經有 D）
+    assert set(env.http.requested("hist")) == {"XLP", "KO", "VOO", "QQQ", "SOXX"}
+
+
+@pytest.mark.parametrize("in_universe", [True, False], ids=["ko_member", "ko_not_member"])
+def test_a_due_pending_jump_for_ko_has_one_owner(env, in_universe):
+    """待確認的跳空存在 store、以代號為鍵，兩條管線共用：KO 在 us.hist 的清單裡時由 us.hist 確認，us.rot 不碰。"""
+    d_published(env)
+    seed(env, "XLP", flat(PIPE_HISTORY + [PIPE_D], 80.0))  # XLP 已經是最新：這裡只看 KO
+    seed(env, "KO", flat(PIPE_HISTORY, 60.0))
+    env.http.prices["KO"] = {**flat(sessions(date(2026, 10, 15), 260), 60.0), PIPE_D: 61.0}
+    if in_universe:
+        seed_universe(env, ["KO"])
+    env.store.set_pending_jump("us", "KO", pending_jump())
+    if in_universe:
+        assert run(env, "us.rot") == "not_due" and env.http.query("hist", "KO") == []
+        assert run(env, "us.hist") in ("ok", "partial")  # us.hist 才是這一檔的確認者
+    else:
+        assert run(env, "us.rot") == "ok"
+    (query,) = env.http.query("hist", "KO")
+    assert query["fromdate"] == (PIPE_D - timedelta(days=pipe.HIST_FULL_DAYS)).isoformat()  # 確認＝整段重抓一次
+    assert closes(env, "KO")[PIPE_D][0] == 61.0 and env.store.pending_jump("us", "KO") is None
+
+
+@pytest.mark.parametrize("in_universe", [True, False], ids=["ko_member", "ko_not_member"])
+def test_a_due_split_refetch_for_ko_has_one_owner(env, in_universe):
+    d_published(env)
+    seed(env, "XLP", flat(PIPE_HISTORY + [PIPE_D], 80.0))
+    seed(env, "KO", {date(2025, 1, 2): 120.0, **flat(PIPE_HISTORY, 60.0)})  # 2:1 分割前的舊值還在
+    env.store.upsert_splits([("KO", date(2026, 10, 1), 2.0, 1.0)], "nasdaq")
+    env.http.prices["KO"] = flat(ROT_DAYS, 60.0)  # 來源已經調整
+    if in_universe:
+        seed_universe(env, ["KO"])
+        assert run(env, "us.rot") == "not_due" and env.http.query("hist", "KO") == []
+        assert run(env, "us.hist") in ("ok", "partial")
+    else:
+        assert run(env, "us.rot") == "ok"
+    (query,) = env.http.query("hist", "KO")  # 整段重抓只有一次：不會兩條管線各抓一次
+    assert query["fromdate"] == (PIPE_D - timedelta(days=pipe.HIST_FULL_DAYS)).isoformat()
+    assert env.store.last_full_refetch("us", "KO") == PIPE_D and date(2025, 1, 2) not in closes(env, "KO")
+
+
+def test_a_round_that_runs_out_before_us_rot_is_stopped_not_failed(env):
+    """（a）整輪時間到、us.rot 沒輪到：結果是 STOPPED，框架不呼叫 _record，task_state 原封不動。"""
+    d_published(env)
+    previous = {"fail_streak": 2, "next_try": None, "last_kind": "budget"}
+    env.store.set_task_state("us.rot", dict(previous))
+    ctx = ctx_at(env, PIPE_NOW)
+    ctx.deadline = env.clock() + 30.0
+    env.http.seconds_per_call = 45.0  # us.hist 的第一個請求就把這一輪用完
+    outcome = market_tasks.run_collect(ctx, [TASKS["us.hist"], TASKS["us.rot"]])
+    assert outcome["stopped"] == "deadline" and outcome["results"]["us.rot"] == market_tasks.STOPPED
+    assert env.store.task_state("us.rot") == previous
+    assert env.http.query("hist", "XLP") == [] and env.http.query("hist", "KO") == []
+
+
+def test_us_rot_starting_with_no_time_left_is_budget_not_a_failure(env):
+    """（b）us.rot 到期、開始跑，但第一個 job 之前 should_stop() 就是真的：_Tally.status() 丟 FetchError("budget")，
+    框架記 budget、fail_streak 不變（NON_FAILURE_KINDS）。"""
+    d_published(env)
+    env.store.set_task_state("us.rot", {"fail_streak": 2, "next_try": None})
+    ctx = ctx_at(env, PIPE_NOW)
+    ctx.deadline = env.clock()  # 這一輪剛好用完
+    assert TASKS["us.rot"].due(ctx)
+    with pytest.raises(market_http.FetchError) as caught:
+        pipe._run_rot(ctx)
+    assert caught.value.kind == "budget"
+    assert market_tasks.run_task(ctx, TASKS["us.rot"]) == "budget"
+    state = env.store.task_state("us.rot")
+    assert state["fail_streak"] == 2 and state["last_kind"] == "budget" and state.get("next_try") is None
+    assert env.http.requested("hist") == []
+
+
+def test_the_us_bubble_with_everything_on_stays_within_the_limits(md):
+    """F3-6 的 everything_on（所有標示同時開著；worst＝最長的字）：美股泡泡 ≤6,656 B、整個摘要輪播 ≤28,672 B。"""
+    from test_market_f2_display import everything_on
+
+    for now in ALL_NOWS:
+        for worst in (False, True):
+            reply = md._summary_reply(md._Ctx(everything_on(now, worst=worst), now))
+            assert reply.flex is not None and reply.render_errors == (), (now, worst, reply.render_errors)
+            bubble = summary_bubble(md, reply.flex, "美股")
+            assert len(bubble["body"]["contents"]) == 9
+            assert md.card_bytes(bubble) <= md.SUMMARY_BUBBLE_MAX_BYTES == 6656, md.card_bytes(bubble)
+            assert md.card_bytes(reply.flex) <= md.CARD_MAX_BYTES == 28 * 1024, md.card_bytes(reply.flex)

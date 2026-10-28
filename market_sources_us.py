@@ -123,7 +123,10 @@ ENDPOINTS: dict[str, Endpoint] = {
     # 約 10 ≈ 最壞 615 → 620
     # （bootstrap 照舊多 40）。這只是規劃值、程式沒拿它擋；真正擋的是帳本 api.nasdaq.com 每天 900 次，扣掉其他 Nasdaq
     # 端點（每週的那幾個剛好同一天時合計 133）還有約 150 次餘裕。
-    "nasdaq_historical": Endpoint("api.nasdaq.com", ("json",), 512 * KIB, 15.0, 620, 660, 4, per_run=60),
+    # 2026-10-28 資金輪動（us.rot）：XLP、KO 每輪再 2 次（per_run 60→62；60 檔是 us.hist 的，us.rot 自己計數）。平常每天多
+    # 1–2 次（KO 先由 us.hist 抓到時 0 次；上線第一天 XLP 補一年多 1 次）；最壞是回應格式錯（框架退避，每檔每天約 14 次）、
+    # 等分割調整（每 2 小時整段重抓，12 次）、KO 缺 D 時兩份重排各 5 次，都在上面的餘裕裡、由帳本擋；per_day 不另加。
+    "nasdaq_historical": Endpoint("api.nasdaq.com", ("json",), 512 * KIB, 15.0, 620, 660, 4, per_run=62),
     "nasdaq_market_info": Endpoint("api.nasdaq.com", ("json",), 64 * KIB, 15.0, 4, 4, 2),
     "nasdaq_splits": Endpoint("api.nasdaq.com", ("json",), 2 * MIB, 15.0, 1, 2, 2),
     "nasdaq_nasdaq100": Endpoint("api.nasdaq.com", ("json",), 512 * KIB, 15.0, 1, 1, 2),

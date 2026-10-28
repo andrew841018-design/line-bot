@@ -9,7 +9,8 @@ Andrew 2026-10-17 要一張「目前市場狀況」的盤勢卡（VOO／QQQ／SO
 規則（PLAN §3.1、§9、§18.1–18.3、§18.5–18.9、§18.13、§19.2–19.4；INTERFACES §3 A、§8、§9）：
 - D＝`market_calendar.latest_closed_us_session`（美東收盤＋30 分鐘之後才算當天）。日線只收 ≤D 的列。
 - 日線每檔的抓取區間＝[最後一筆正式（非備援）日期往前 3 個交易日, D]；沒有歷史抓一年；回應沒有 D 列
-  → 30 分鐘後重排，最多再排 4 次。每輪（core＋backfill 合計）最多 60 檔。主機被擋（403／429／冷卻）或帳本
+  → 30 分鐘後重排，最多再排 4 次。每輪（core＋backfill 合計）最多 60 檔（資金輪動的 us.rot：XLP、KO 用自己的
+  計數，另外最多 2 檔，2026-10-28）。主機被擋（403／429／冷卻）或帳本
   說不行就整批停。
 - D 有沒有公布只用 SPY 探（2026-10-23）：前 5 次和其他檔一樣每 30 分鐘，之後每小時再探，直到 SPY 有 D 或 D
   換日；SPY 有 D 之前不打其他 ETF 與成分股（含還沒有歷史的），有了同一輪就接著抓。Nasdaq 公布 D 列比收盤後
@@ -1113,6 +1114,78 @@ def _run_hist_backfill(ctx: Any) -> Optional[str]:
     return tally.status()
 
 
+# ── 資金輪動：必需消費 XLP 與可口可樂 KO 的日線（2026-10-28） ────────────────────────────────
+# /盤勢 美股卡的「資金輪動」三列（market_calc 的資金輪動區塊）要 XLP、KO 的日線。XLP 不在任何成分股清單裡，KO 在不在 us.hist 的
+# 清單裡都照抓（B 案：KO 也能觸發研判，每個 D 都要和 XLP 同一輪到）。us.rot 用自己的排程紀錄（sched:us.rot：retry、
+# split_retry、run、blocked），不碰 us.hist 的紀錄、us.hist.status、成分股清單、閘門與 prune，也不吃 us.hist 每輪 60 檔的額度
+# （每輪日線請求最多 60＋len(ROT_SYMBOLS)）。D 公布後才排（等 SPY 等 ETF 有 D 的正式列），用的是同一套 _job_for／_run_jobs。
+# 修資料的路徑只有一個主人：待確認的跳空、隔離區間、整段重抓的紀錄都存在 store、以（市場, 代號）為鍵，兩條管線共用；代號也在
+# us.hist 的清單（成分股聯集或 ETFS）裡時，us.rot 只接 update、bootstrap，confirm 與 split 交給 us.hist——不然同一輪可能兩次
+# 整段重抓、衝突次數加兩次。KO 的重排紀錄（retry、split_retry）因此分成 us.hist、us.rot 兩份（已知限制，請求量由帳本擋）。
+ROT_SYMBOLS: tuple[tuple[str, bool], ...] = (("XLP", True), ("KO", False))  # (代號, 是不是 ETF)
+_ROT_KEY = "us.rot"
+_ROT_SHARED_KINDS = frozenset({"update", "bootstrap"})  # 代號也在 us.hist 的清單裡時，us.rot 只接這兩種 job
+
+
+def _rot_state(ctx: Any, day: date) -> dict:
+    """us.rot 自己的排程紀錄（形狀照 _hist_state）：重排只留這個 D 的、分割重抓只留還沒到期的；run＝這一輪用了幾次。"""
+    state = _state(ctx, _ROT_KEY)
+    state["retry"] = {sym: entry for sym, entry in (state.get("retry") or {}).items()
+                      if isinstance(entry, dict) and entry.get("d") == day.isoformat()}
+    state["split_retry"] = {sym: at for sym, at in (state.get("split_retry") or {}).items()
+                            if float(at) > float(ctx.now)}
+    marker = [float(ctx.now), float(getattr(ctx, "deadline", 0.0) or 0.0)]
+    if (state.get("run") or {}).get("marker") != marker:
+        state["run"] = {"marker": marker, "used": 0}
+    return state
+
+
+def _rot_blocked(ctx: Any) -> bool:
+    """us.rot 自己最近一次被擋（403／429／冷卻）：nasdaq_blocked 只看 us.hist 的紀錄，這裡補上自己的，有效期一樣。"""
+    blocked = _state(ctx, _ROT_KEY).get("blocked")
+    if not isinstance(blocked, dict):
+        return False
+    return float(ctx.now) - float(blocked.get("at") or 0.0) <= NASDAQ_BLOCK_VALID_S
+
+
+def _rot_jobs(ctx: Any, day: date, state: dict) -> list[_Job]:
+    """XLP、KO 這一輪要做的 job（_job_for 照常判斷：沒有歷史就補一年、缺 D 就更新、分割與待確認）。us.hist 同一輪已經抓到
+    D 的代號，_job_for 會回 None，不會重複打。代號也在 us.hist 的清單裡時只接 update、bootstrap。"""
+    shared = set(_universe(ctx)[0]) | set(ETFS)
+    jobs = []
+    for symbol, etf in ROT_SYMBOLS:
+        job = _job_for(ctx, symbol, etf, day, state, allow_bootstrap=True)
+        if job is None or (symbol in shared and job.kind not in _ROT_SHARED_KINDS):
+            continue
+        jobs.append(job)
+    return jobs
+
+
+def _due_rot(ctx: Any) -> bool:
+    day = current_d(ctx)
+    if day is None or nasdaq_blocked(ctx) or _rot_blocked(ctx) or not _d_published(ctx, day):
+        return False
+    return bool(_rot_jobs(ctx, day, _rot_state(ctx, day)))
+
+
+def _run_rot(ctx: Any) -> Optional[str]:
+    """跑 XLP、KO 的 job；結果照 _Tally（缺 D、廠商錯誤不算失敗；一項都還沒做就到時間 → budget）。不寫 us.hist.status、
+    不記成分股清單、不開閘門、不 prune。"""
+    day = current_d(ctx)
+    if day is None:
+        return None
+    state = _rot_state(ctx, day)
+    tally = _Tally()
+    outcomes: Counter = Counter()
+    try:
+        _run_jobs(ctx, day, _rot_jobs(ctx, day, state), state, tally, outcomes)
+    finally:
+        _save_state(ctx, _ROT_KEY, state)
+    status = tally.status()
+    # 和 _run_hist_core 一樣：Nasdaq 還沒公布 D（沒有任何 ETF 的 D 列）不算失敗
+    return "not_yet" if status is None and not _d_published(ctx, day) else status
+
+
 # ── 分割事件表 ───────────────────────────────────────────────────────────────
 
 
@@ -1864,6 +1937,9 @@ TASK_TABLE: tuple[tuple[str, str, Callable[[Any], bool], Callable[[Any], Optiona
     ("us.options", "core", _due_options, _run_options, 95.0),  # CBOE 三檔各 30 秒上限
     ("us.ust", "core", _due_ust, _run_ust, 35.0),
     ("us.events.econ", "core", _due_econ, _run_econ, 30.0),
+    # 資金輪動（2026-10-28）：美股 core 的最後一個（優先序最低；_interleave 保持先後，同一輪仍在 us.hist 之後）。
+    # 20 秒是軟性預算：should_stop 只在 job 之間檢查，最壞多跑一個請求（單次上限 15 秒）
+    ("us.rot", "core", _due_rot, _run_rot, 20.0),
     ("us.hist.backfill", "backfill", _due_hist_backfill, _run_hist_backfill, 90.0),
     ("us.holdings.soxx", "low", _due_holdings_soxx, _run_holdings_soxx, 20.0),
     ("us.holdings.qqq", "low", _due_holdings_qqq, _run_holdings_qqq, 20.0),
