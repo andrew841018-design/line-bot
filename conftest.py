@@ -585,3 +585,16 @@ def isolate_market_dashboard(monkeypatch, tmp_path_factory):
     (root / "state").mkdir(mode=0o700)
     paths = market_paths.Paths.under(root)
     monkeypatch.setattr(market_paths.Paths, "default", classmethod(lambda cls: paths))
+
+
+@pytest.fixture(autouse=True)
+def isolate_stock_picks_review(monkeypatch, tmp_path_factory):
+    """2026-10-29 股票推薦回測 job（jobs/stock_picks_review.py）：bot 目錄（state/、盤勢 DB、推薦狀態檔）與
+    outbox 所在的維護目錄一律指到這個測試自己的暫存目錄。job 的路徑都在呼叫時才從這兩個環境變數算，
+    所以任何測試跑到 job 的程式都不會碰正式 state/，也不會把週報或短訊放進正式 outbox（relay 會立刻 DM Andrew）。"""
+    root = tmp_path_factory.mktemp("stock_picks_review")
+    (root / "bot" / "state").mkdir(parents=True)
+    (root / "bot" / "state").chmod(0o700)  # 暫存目錄是測試自己的：job 要求 state/ 是 0700
+    (root / "maintenance").mkdir()
+    monkeypatch.setenv("STOCK_PICKS_REVIEW_BOT_DIR", str(root / "bot"))
+    monkeypatch.setenv("STOCK_PICKS_REVIEW_MAINTENANCE_DIR", str(root / "maintenance"))
