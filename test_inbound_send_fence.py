@@ -191,6 +191,39 @@ def test_a_terminal_mark_replaces_the_fence(clock):
     assert status("b") == "replied"
 
 
+def test_the_drains_close_changes_only_the_events_that_are_still_being_handled(clock):
+    """(review R2 GP2 #1) the exit drain must not turn a fence or an accepted reply into
+    `completed_no_reply`: that would record a delivered reply as "no reply" and let a late run of
+    the same event send unfenced."""
+    for message_id in ("active", "media", "fenced", "done", "quiet"):
+        memory.begin_inbound_event(GROUP, message_id)
+    memory.mark_inbound_event_media_processing(GROUP, "media")
+    memory.claim_inbound_reply(GROUP, ["fenced"])
+    memory.mark_inbound_event_replied(GROUP, "done")
+    memory.mark_inbound_events_completed_no_reply(GROUP, ["quiet"])
+    everything = ["active", "media", "fenced", "done", "quiet", "never-seen"]
+
+    assert memory.mark_active_inbound_events_completed_no_reply(GROUP, everything) == 2
+
+    assert [status(m) for m in ("active", "media", "fenced", "done", "quiet")] == [
+        "completed_no_reply", "completed_no_reply", "reply_sending", "replied", "completed_no_reply",
+    ]
+    assert memory.claim_inbound_reply(GROUP, ["fenced"]) == ("blocked", False)  # still fenced
+    assert memory.mark_active_inbound_events_completed_no_reply(GROUP, everything) == 0  # nothing left to change
+    assert memory.mark_active_inbound_events_completed_no_reply("", everything) == 0
+    assert memory.mark_active_inbound_events_completed_no_reply(GROUP, []) == 0
+
+
+def test_the_drains_close_counts_rows_across_chunks(clock):
+    ids = [f"bulk-{n}" for n in range(memory._COMPLETE_BATCH + 7)]
+    for message_id in ids:
+        memory.begin_inbound_event(GROUP, message_id)
+    memory.claim_inbound_reply(GROUP, [ids[3]])
+
+    assert memory.mark_active_inbound_events_completed_no_reply(GROUP, ids) == len(ids) - 1
+    assert status(ids[3]) == "reply_sending" and status(ids[-1]) == "completed_no_reply"
+
+
 def test_only_one_of_many_threads_gets_the_fence(clock):
     memory.begin_inbound_event(GROUP, "race")
     barrier = threading.Barrier(8)
@@ -366,15 +399,32 @@ def test_a_restart_before_the_send_lets_the_new_instance_answer(line, monkeypatc
 
 
 def test_a_payload_rejection_lifts_the_fence_without_pushing(line, clock):
+    """Batch 2 (B6.3) changed this contract for a *text* reply: LINE's 400 is answered by one plain
+    text resend (test_reply_400_recovery.py) and, if that is refused too, by a push where a push
+    is allowed.  What stays: where no push is allowed (reply-only flows), and for cards (always),
+    a refused reply lifts the fence and pushes nothing."""
     open_event()
     line.reply_message.side_effect = api_error(400, BAD_PAYLOAD)
 
-    assert say() is False
+    assert say(allow_push_fallback=False) is False
 
     assert status() == "processing"  # nothing was sent: the event may be handled again
     line.push_message.assert_not_called()
     clock["t"] += 200
     assert memory.begin_inbound_event(GROUP, "M1") == "retry"
+
+
+def test_a_card_payload_rejection_lifts_the_fence_without_pushing(line, clock):
+    """A menu / large-menu / Flex command card is never sent again as plain text and never pushed
+    (its altText is not a message to push, line_bot.md 10/05)."""
+    open_event()
+    line.reply_message.side_effect = api_error(400, BAD_PAYLOAD)
+
+    assert say("選單", large_menu_card=True) is False
+
+    line.reply_message.assert_called_once()  # no second attempt
+    assert status() == "processing"
+    line.push_message.assert_not_called()
 
 
 @pytest.mark.parametrize("code", [401, 403, 404, 413, 429])
@@ -390,7 +440,7 @@ def test_any_other_4xx_also_lifts_the_fence(line, code):
 def test_the_event_can_be_answered_after_the_fence_was_lifted(line):
     open_event()
     line.reply_message.side_effect = api_error(400, BAD_PAYLOAD)
-    assert say() is False
+    assert say(allow_push_fallback=False) is False  # (batch 2: with a push allowed it would push)
     line.reply_message.side_effect = None
     main._register_inbound_reply_token(TOKEN, GROUP, "M1")
 

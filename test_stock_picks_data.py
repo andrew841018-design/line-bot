@@ -512,6 +512,18 @@ def test_window_closes_still_needs_the_previous_trading_day():
     assert sp.window_closes(bars, cal, T, 100.0, None) is None
 
 
+def test_lines_up_before_t_is_the_one_rule_the_window_and_the_canary_share():
+    """window_closes、_window_unavailable_reason、_calendar_canary 都靠它判斷「T 前面接不接得上日曆」。"""
+    cal, bars = _ramp_bars((CAL[-3], CAL[-2]))
+    prev_day, prev_close = cal[-2], bars[cal[-2]]
+    assert sp.lines_up_before_t(bars, prev_day, T)  # 兩個休市日都是照抄前一個交易日收盤的平盤
+    assert sp.lines_up_before_t({d: v for d, v in bars.items() if d <= prev_day}, prev_day, T)  # 沒有夾在中間的日子
+    assert sp.lines_up_before_t({**bars, CAL[-2]: prev_close * (1 + 1e-12)}, prev_day, T)  # float 表示法的誤差
+    assert sp.lines_up_before_t({**bars, T: 999.0, T + timedelta(days=1): 999.0}, prev_day, T)  # T 和之後不算夾在中間
+    assert not sp.lines_up_before_t({**bars, CAL[-3]: prev_close + 0.5}, prev_day, T)  # 任何一天不是平盤＝真的有成交
+    assert not sp.lines_up_before_t({d: v for d, v in bars.items() if d != prev_day}, prev_day, T)  # 缺前一個交易日
+
+
 # ── 查詢 ───────────────────────────────────────────────────────────────────
 INDEX = sp.name_index({"台積電": "2330", "國巨": "2327", "矽力-KY": "6415", "成信實業-創": "1234", "元大台灣50": "0050",
                        "元大MSCI A股": "006205", "IKKA-KY": "2250", "聯發科": "2454"})
@@ -705,7 +717,7 @@ def test_refresh_end_to_end(net):
         (lambda n: n.t86.pop(CAL[-3].strftime("%Y%m%d")), "t86_gap"),  # 早於 T 的日子缺：不會自己好
         (lambda n: n.t86.pop(CAL[-1].strftime("%Y%m%d")), "t86_not_yet"),
         (lambda n: n.companies.__setitem__(slice(None), n.companies[:100]), "batch_short"),
-        (lambda n: [n.charts.pop(f"{c}.TW") for c in STOCKS[:11]], "too_many_gray"),
+        (lambda n: [n.charts.pop(f"{c}.TW") for c in STOCKS[1:12]], "too_many_gray"),  # 留下 2330 抽查，測主池缺資料
         (lambda n: n.overrides.__setitem__("BWIBBU_ALL", sp.FetchError("moved")), "batch_moved"),
     ],
 )
@@ -728,7 +740,7 @@ def test_refresh_ten_gray_is_still_ok(net):
 
 
 def test_refresh_yahoo_rate_limit_is_blocked(net):
-    net.overrides["2330.TW"] = sp.FetchError("rate_limited")
+    net.overrides["1101.TW"] = sp.FetchError("rate_limited")  # 2330 抽查的 429 另測 not_yet
     with pytest.raises(sp.RoundFailed) as info:
         sp.refresh(T, _day_rows(net), threading.Event(), now=1.0e9)
     assert info.value.kind == "yahoo_rate_limited" and info.value.blocked
@@ -886,7 +898,10 @@ def test_handle_without_snapshot_wakes_worker(net):
     assert sp.handle("").text == sp.TEXT_UNAVAILABLE
 
 
-def test_handle_picks_and_detail_from_snapshot(net):
+def test_handle_picks_and_detail_from_snapshot(net, monkeypatch):
+    # 2026-10-24（計畫 C）：預設的推薦區已經是「AI 相關股推薦」（test_stock_picks_ai*.py）；這裡守住
+    # LINE_BOT_STOCK_PICKS_AI=0 退回的舊推薦卡（舊推薦照樣每天算進快照），單檔卡與常問股兩邊都一樣。
+    monkeypatch.setattr(sp, "AI_ENABLED", False)
     snapshot = _fresh_snapshot(net)
     reply = sp.handle("")
     assert reply.flex["type"] == "carousel" and reply.text is None
@@ -899,7 +914,8 @@ def test_handle_picks_and_detail_from_snapshot(net):
     assert net.count("2330.TW") == 1  # 只有重算那一次，單檔卡讀快照
 
 
-def test_handle_not_updated_hides_picks(net):
+def test_handle_not_updated_hides_picks(net, monkeypatch):
+    monkeypatch.setattr(sp, "AI_ENABLED", False)  # 舊推薦卡的「看到新日期 3 小時」規則；AI 推薦改看 7 個日曆日
     _fresh_snapshot(net)
     sp._worker.seen_t, sp._worker.seen_at = T + timedelta(days=1), time.time() - sp.NEW_DATE_GRACE_S - 1
     reply = sp.handle("")
@@ -958,6 +974,21 @@ def test_handle_lookup_failure_is_remembered_briefly(net):
     assert sp.handle(STOCKS[56], deadline=time.monotonic() + 30).text == sp.TEXT_LOOKUP_FAILED
     del net.overrides[f"{STOCKS[56]}.TW"]
     assert sp.handle(STOCKS[56], deadline=time.monotonic() + 30).text == sp.TEXT_LOOKUP_FAILED  # 10 分鐘內不再抓
+
+
+def test_lookup_works_during_an_ai_side_cooldown_and_never_sets_it(net, monkeypatch):
+    """計畫 C 事後審查 GP1 I3／GP2 #3：單檔查詢和 2eb85e1 一樣——AI 段撞到 429 的共用冷卻擋不了它，
+    它自己撞到 429 也不設共用冷卻（背景不必為了爸媽查單檔而多等 20 分鐘）。"""
+    _fresh_snapshot(net)
+    sp._block_yahoo()  # AI 段剛撞到 429：共用冷卻中
+    assert sp._yahoo_blocked()
+    net.calls.clear()
+    reply = sp.handle(STOCKS[55], deadline=time.monotonic() + 30)
+    assert reply.flex is not None and [c[0] for c in net.calls if c[0] in sp._YAHOO] == [sp._YAHOO[0]]  # 照樣查得到
+    monkeypatch.setattr(sp, "_yahoo_blocked_until", 0.0)
+    net.overrides[f"{STOCKS[56]}.TW"] = sp.FetchError("rate_limited")
+    assert sp.handle(STOCKS[56], deadline=time.monotonic() + 30).text == sp.TEXT_LOOKUP_FAILED
+    assert sp._yahoo_blocked_until == 0.0 and not sp._yahoo_blocked() and sp._worker.yahoo_blocked_until is None
 
 
 def test_handle_otc_unavailable_without_tpex(net):
@@ -1660,16 +1691,25 @@ def test_refresh_computes_t_right_after_a_closed_day(net, with_yahoo_t):
     assert all(snapshot.pool[c].trend is not None for c in snapshot.universe)
 
 
-def test_refresh_still_holds_when_the_calendar_skips_a_real_trading_day(net):
-    """同樣的日曆少一天，但那天個股真的有成交（收盤不是平盤）：不能悄悄跳過，整輪 too_many_gray。"""
+@pytest.mark.parametrize("ai_enabled", [True, False])
+def test_refresh_still_holds_when_the_calendar_skips_a_real_trading_day(net, monkeypatch, ai_enabled):
+    """同樣的日曆少一天，但那天個股真的有成交（收盤不是平盤）：不能悄悄跳過，整輪不出快照、推薦不動。
+    日曆抽查開著時 2330 那根就不是平盤，先擋在 calendar_hole（還沒出來）；關著（回到 2eb85e1）時整批個股接不上，
+    擋在 too_many_gray。兩種都不能換快照。"""
+    monkeypatch.setattr(sp, "AI_ENABLED", ai_enabled)
     missing = _closed_day_market(net, with_yahoo_t=True)
     closes = [100.0] * (len(CAL) - 1)
     closes[CAL.index(missing)] = 103.0
     for code in STOCKS + ["0050"]:
         net.charts[f"{code}.TW"] = _chart(CAL[:-1], closes)
+    expected = "calendar_hole" if ai_enabled else "too_many_gray"
     with pytest.raises(sp.RoundFailed) as info:
         sp.refresh(T, _day_rows(net), threading.Event(), now=1.0e9)
-    assert info.value.kind == "too_many_gray"
+    assert info.value.kind == expected
+    sp._tick(threading.Event())  # 同一個市場走真的一輪：失敗（或還沒出來）也不能寫快照、換推薦
+    assert expected in (sp._worker.last_fail, sp._worker.last_wait)
+    assert sp._snapshot is None and sp.load_snapshot_file() is None
+    assert not (sp.STATE_DIR / sp.HISTORY_NAME).exists()  # 也沒有記一筆推薦
 
 
 def _no_yahoo_t(n):

@@ -47,6 +47,7 @@ from reply_policy import (
 )
 from quote_context import QUOTE_CONTEXT_RULE
 
+import reply_guards
 import reminder_intent
 import speaker_turns
 from config import settings
@@ -1949,7 +1950,9 @@ def chat(
     try:
         import stock_quote  # local import 避免循環依賴 + 保持 yfinance 為 optional dep
 
-        _user_text_for_quote = _extract_text(user_input)
+        # 2026-10-24 (B8.2): only what the family typed (and quoted) names a stock; the
+        # title and description of a pre-read video say TV, APP, HTML, AI …
+        _user_text_for_quote = reply_guards.user_typed_text(_extract_text(user_input))
         _quotes = stock_quote.get_contextual_quotes_text(
             _user_text_for_quote,
             context=context,

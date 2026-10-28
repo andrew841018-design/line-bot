@@ -25,6 +25,7 @@ import logging
 from image_reply import has_image_analysis_envelope, is_image_context_echo, render_image_reply
 from video_reply import VIDEO_COMMENTARY_CONTRACT, VIDEO_COMMENTARY_CONTRACT_NO_SEARCH
 import civic_calendar
+import reply_guards
 import reply_policy
 from reply_policy import NO_REPEAT_CONTRACT
 import reply_provenance
@@ -107,6 +108,7 @@ import feedback_collector
 import gemini_client
 import line_errors
 import line_mentions
+import reply_riders
 import tiktok_media
 import memory
 import speaker_turns
@@ -176,6 +178,46 @@ async def _maintain_local_vision_worker() -> None:
                 last_error_type = error_type
 
 
+# How long the lifespan exit lets burst flushes that are still running finish (burst_filter), and
+# how much longer than that it waits for the drain itself (its database writes) before it stops
+# caring and carries on.  launchd ends a process that is still alive about 20 s after SIGTERM, and
+# the exit also gives the parent-health and stock-picks threads 2 s each, so the whole drain is
+# kept to 5 + 3 s at the most (2026-10-28, review R2 GP2 #7: it was 8 + 4).
+_EXIT_DRAIN_SECONDS = 5.0
+_EXIT_DRAIN_MARGIN_SECONDS = 3.0
+
+
+async def _run_exit_drain() -> None:
+    """`burst_filter.drain_for_shutdown` on a daemon thread, waited for at most
+    ``_EXIT_DRAIN_SECONDS + _EXIT_DRAIN_MARGIN_SECONDS`` (2026-10-28, review R2 GP1 #5, GP2 #7).
+
+    `asyncio.wait_for(asyncio.to_thread(...))` only stopped *waiting*: the work ran on an executor
+    thread, and the interpreter joins executor threads when it exits (`asyncio.run` for up to
+    300 s, then without a limit), so a drain stuck on the database delayed the exit until
+    launchd's kill.  A daemon thread is not joined: when the time is up the exit carries on and
+    the process ends with it.  Never raises; the log carries the exception type only.
+    """
+    outcome: dict[str, BaseException] = {}
+
+    def run() -> None:
+        try:
+            burst_filter.drain_for_shutdown(_EXIT_DRAIN_SECONDS)
+        except BaseException as exc:  # noqa: BLE001 - a thread has nobody above it to catch this
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=run, name="burst-exit-drain", daemon=True)
+    try:
+        worker.start()
+        await asyncio.to_thread(worker.join, _EXIT_DRAIN_SECONDS + _EXIT_DRAIN_MARGIN_SECONDS)
+    except Exception as exc:
+        logger.warning("burst drain on exit failed error_type=%s", type(exc).__name__)
+        return
+    if worker.is_alive():
+        logger.warning("burst drain on exit failed error_type=TimeoutError")
+    elif "error" in outcome:
+        logger.warning("burst drain on exit failed error_type=%s", type(outcome["error"]).__name__)
+
+
 @asynccontextmanager
 async def _app_lifespan(_app: FastAPI):
     """Run the same startup hooks previously registered via app.on_event."""
@@ -238,6 +280,13 @@ async def _app_lifespan(_app: FastAPI):
             logger.warning("parent health background start failed error_type=%s", type(exc).__name__)
         yield
     finally:
+        # 2026-10-24 (B7.1): messages still in the 8 s debounce window (and flush threads that
+        # have not finished) would die with the process, unanswered and unremembered.  Queued ones
+        # go to the conversation memory and are closed first, in-flight ones get a short grace
+        # period.  First thing, time-boxed (a daemon thread the exit stops waiting for, so even a
+        # drain stuck on the database cannot hold the process up), and a failure here never blocks
+        # the exit.
+        await _run_exit_drain()
         if parent_health_module is not None:
             try:
                 parent_health_module.stop_background(timeout=2.0)
@@ -535,10 +584,39 @@ def _exercise_nudge_message(nudge):
         )
         if sent_text != text:
             return None
+        # 2026-10-28 (review R2 GP2 #5): `_text_message_with_mentions` falls back to a plain
+        # TextMessage when the textV2 message cannot be built, and that one would say a literal
+        # 「@爸爸」 and ping nobody.  The nudge is a real mention or it is dropped.
+        from linebot.v3.messaging import TextMessageV2  # type: ignore[import-untyped]
+
+        if not isinstance(message, TextMessageV2) or not message.substitution:
+            return None
         return message
     except Exception as exc:
         logger.warning("exercise nudge message skipped error_type=%s", type(exc).__name__)
         return None
+
+
+def _claim_exercise_nudge_for_reply(reply_token: str | None, group_id: str | None):
+    """`_reply` 用（PLAN A phase 2；只在開關開著時呼叫）：拿走這個 token 登記的運動提醒、把訊息組好驗過，
+    最後才搶今天的去重列（claim_exercise_nudge 會重算一次資格：flush 到送出之間可能暫停、刪紀錄）。
+    回 (NudgeSlot, 訊息) 或 (None, None)——任何一步失敗都只丟掉提醒、主回覆照送，只記錯誤種類。"""
+    try:
+        nudge = _take_exercise_nudge(reply_token, group_id)
+        if nudge is None:
+            return None, None
+        message = _exercise_nudge_message(nudge)
+        if message is None:
+            return None, None
+        import parent_health
+
+        claim = parent_health.claim_exercise_nudge(group_id, nudge)
+        if claim is None:
+            return None, None
+        return reply_riders.NudgeSlot(nudge, claim), message
+    except Exception as exc:
+        logger.warning("exercise nudge skipped error_type=%s", type(exc).__name__)
+        return None, None
 
 
 def _mark_inbound_reply_succeeded(reply_token: str | None) -> None:
@@ -806,6 +884,14 @@ def _extract_reply_payload_targets(message: TextMessageContent) -> list:
     targets = []
     seen_user_ids: set[str] = set()
     for mentionee in mentionees:
+        # 2026-10-24 (B6.5): LINE refuses a mention of the bot's own user id in a reply, and the
+        # whole reply goes with it -- an @咪寶 message mentions the bot (`is_self`), so skip it.
+        if (
+            getattr(mentionee, "is_self", None)
+            if not isinstance(mentionee, dict)
+            else (mentionee.get("is_self") or mentionee.get("isSelf"))
+        ) is True:
+            continue
         user_id = (
             getattr(mentionee, "user_id", None)
             if not isinstance(mentionee, dict)
@@ -956,12 +1042,19 @@ def _prepare_outbound_text(text: str, *, source: str = "reply") -> str:
         return ""
     result = output_validator.validate_outbound_text(prepared)
     if not result.ok:
-        logger.warning(
-            "outbound validation blocked source=%s reason=%s preview=%r",
-            source,
-            result.reason,
-            _redact_card_paths(prepared[:160]),  # 2026-10-23 GP2 N5：大字版網址的 token 不進 log
-        )
+        if source == "exercise_nudge":
+            # 2026-10-28 (review R2 GP2 #4): the nudge is health text (a date and an item).  The
+            # log gets the reason code and nothing of the sentence.
+            logger.warning(
+                "outbound validation blocked source=%s reason=%s", source, result.reason
+            )
+        else:
+            logger.warning(
+                "outbound validation blocked source=%s reason=%s preview=%r",
+                source,
+                result.reason,
+                _redact_card_paths(prepared[:160]),  # 2026-10-23 GP2 N5：大字版網址的 token 不進 log
+            )
         return result.text
     return result.text
 
@@ -1017,20 +1110,36 @@ def _get_explicit_market_quote_reply(
     """
     if not text:
         return None
-    is_quote_request = False
+    # 2026-10-24: the 「暫時無法取得」 notice is for an instrument the text (or the thread it follows)
+    # actually named -- detected offline (a ticker, a known name, an index, a follow-up) or resolved
+    # by the name search the quote path itself runs (``resolved``: the symbols it found, reported
+    # before any price is fetched, so there is no second search).  A name lookup that found nothing
+    # is ordinary chat -- it goes the normal route instead of being answered with a fixed failure
+    # sentence; a name that WAS found but could not be priced still gets the notice, because the
+    # model must not guess that price.
+    symbol_detected = False
+    resolved: list[str] = []
     try:
         import stock_quote
         is_quote_request = stock_quote.should_try_contextual_quote(
             text,
             context=context,
         )
+        symbol_detected = is_quote_request and stock_quote.has_detected_symbol(
+            text,
+            context=context,
+        )
         technical = stock_quote.get_taiex_month_line_text(text)
         if technical:
             return technical
-        quote = stock_quote.get_contextual_quotes_text(text, context=context)
+        quote = stock_quote.get_contextual_quotes_text(
+            text,
+            context=context,
+            resolved_symbols=resolved,
+        )
         if quote:
             return quote
-        if is_quote_request:
+        if symbol_detected or resolved:
             return (
                 "【市場報價｜暫時無法取得】\n"
                 "目前無法在回覆時限內取得可靠報價，沒有交給模型猜價格。"
@@ -1039,7 +1148,7 @@ def _get_explicit_market_quote_reply(
         return None
     except Exception as e:
         logger.info("explicit market quote deterministic path failed: %s", e)
-        if is_quote_request:
+        if symbol_detected or resolved:
             return (
                 "【市場報價｜暫時無法取得】\n"
                 "目前無法在回覆時限內取得可靠報價，沒有交給模型猜價格。"
@@ -1131,6 +1240,8 @@ def _enforce_new_value_reply(
     trusted_grounded: bool = False,
     outcome: dict | None = None,
     facts: list[str] | None = None,
+    partial: bool = False,
+    speaker: str = "",
 ) -> str:
     """Drop sentences that only restate what the group already said.
 
@@ -1175,6 +1286,18 @@ def _enforce_new_value_reply(
     (the reply ended empty after that guard removed something).
     TODO(2026-10-04 deferred, GP1 N10): media／audio／pending replies do not
     pass through here yet.
+
+    2026-10-24 (reply_guards, PLAN B1–B3), after the public-claim guard and
+    before the restatement check: 「沒有提到」 claims about material that was only
+    partly read (``partial``; the fetchers record it), regulation numbers
+    nothing the program gathered backs (also for ``trusted_grounded`` replays;
+    asked directly, an answer that ends up empty because of them becomes the
+    fixed 「數字沒辦法確認」 line, a burst nobody asked about stays silent), and hand-backs／pronoun
+    guesses／chat recaps (``speaker`` is the sender's name; the labels in ``context`` are names
+    too).  A reply that rests on a search alone (``searched``／``trusted_grounded``／``evidence_text``
+    and no ``has_material``) cannot say a text 「都未提及」 something either: that is B2 only,
+    ``partial`` (material read in part) is what also narrows the restatement check.  The counts go
+    to ``outcome``; ``""`` is silence, as for the other guards.
     """
     grounding = reply_provenance.take_grounding()
     report = {
@@ -1268,6 +1391,44 @@ def _enforce_new_value_reply(
                 outcome["public_claims_emptied"] = True
                 return ""
     try:
+        guards = reply_guards.apply_reply_guards(
+            reply_text,
+            source_text=source_text or "",
+            request_text=request_text or "",
+            material_text=material_text or "",
+            evidence_text=evidence_text or "",
+            context=context,
+            addressed=addressed,
+            partial=partial,
+            # Nothing was read and the reply rests on a search (Gemini grounding, the
+            # research rows, a cached grounded replay): search snippets cannot show that
+            # a text lacks something.  B2 only — the restatement check below keeps its
+            # wider correction markers (「政府並沒有宣布…」 is a correction there).
+            search_only=bool(outcome.get("grounded")) and not has_material,
+            speaker=speaker,
+        )
+    except Exception as exc:
+        logger.warning("reply-quality guards skipped error_type=%s", type(exc).__name__)
+        regulation_dropped = 0
+    else:
+        regulation_dropped = guards.numbers_dropped
+        if guards.negative_dropped or regulation_dropped or guards.nonanswer:
+            # Counts only: these sentences are exactly the ones not to repeat.
+            logger.info(
+                "reply-quality guards negative_coverage=%d regulation_numbers=%d nonanswer=%s "
+                "partial=%s addressed=%s after=%d",
+                guards.negative_dropped, regulation_dropped, guards.nonanswer,
+                partial, addressed, len(guards.text),
+            )
+            outcome["negative_coverage_dropped"] = guards.negative_dropped
+            outcome["regulation_numbers_dropped"] = regulation_dropped
+            outcome["nonanswer_dropped"] = guards.nonanswer
+        if not guards.text:
+            return reply_guards.unconfirmed_regulation_reply(
+                "", addressed=addressed, numbers_dropped=regulation_dropped
+            )
+        reply_text = guards.text
+    try:
         import restatement_judge
 
         shared = "\n\n".join(p for p in (source_text or "", material_text or "") if p)
@@ -1276,7 +1437,8 @@ def _enforce_new_value_reply(
             (source_text or "") if asked else shared, context
         )
         out = reply_policy.strip_restatement(
-            reply_text, source, user_text=request_text, addressed=addressed
+            reply_text, source, user_text=request_text, addressed=addressed,
+            partial=partial,
         )
         if out:
             out = restatement_judge.filter_restatements(
@@ -1293,7 +1455,10 @@ def _enforce_new_value_reply(
         )
     if unbacked and not out:
         outcome["public_claims_emptied"] = True
-    return out
+    # Asked directly, and a regulation number went from an answer that is now empty: say so.
+    return reply_guards.unconfirmed_regulation_reply(
+        out, addressed=addressed, numbers_dropped=regulation_dropped
+    )
 
 
 _MATERIAL_MARKERS = ("--- 內容開始 ---", "--- PDF 內容開始 ---")
@@ -1308,7 +1473,9 @@ def _carries_material(user_input) -> bool:
     return isinstance(user_input, str) and any(mark in user_input for mark in _MATERIAL_MARKERS)
 
 
-def _guard_generated_reply(reply, user_input=None, *, context=None, facts=None):
+def _guard_generated_reply(
+    reply, user_input=None, *, context=None, facts=None, addressed=True, speaker="",
+):
     """Drop a generated reply that claims a search nobody ran (2026-10-03).
 
     Audio, quoted media, files, pending and scheduled replies get this here.
@@ -1318,7 +1485,11 @@ def _guard_generated_reply(reply, user_input=None, *, context=None, facts=None):
     marks ``reply_provenance.dropped()`` so the message is finished, not retried.
     2026-10-09: an address or phone number nothing backs (``context`` and
     ``facts`` count, see ``_contact_backing``) drops the reply the same way.
-    2026-10-28: so does a date claim ``_date_claims_unbacked`` rejects.
+    2026-10-24 (B3): hand-backs 「只有某某知道」「直接問某某最快」 (also pronoun guesses
+    and chat recaps when nobody ``addressed`` the bot, and then only these) are
+    removed; a reply that was nothing else is dropped like the others.
+    ``speaker`` is the sender's name when the caller knows it.
+    2026-10-28: a date claim ``_date_claims_unbacked`` rejects drops the reply too.
     """
     if not isinstance(reply, str) or not reply.strip() or reply_provenance.caller_checks():
         return reply
@@ -1356,7 +1527,17 @@ def _guard_generated_reply(reply, user_input=None, *, context=None, facts=None):
     ):
         reply_provenance.mark_dropped()
         return ""
-    return reply
+    try:
+        cleaned = reply_guards.strip_nonanswer(reply, addressed=addressed, speaker=speaker, context=context)
+    except Exception as exc:
+        logger.warning("non-answer guard skipped error_type=%s", type(exc).__name__)
+        return reply
+    if cleaned != reply:
+        logger.info("non-answer guard trimmed a generated reply before=%d after=%d", len(reply), len(cleaned))
+        if not cleaned:
+            reply_provenance.mark_dropped()
+            return ""
+    return cleaned
 
 
 # 2026-10-09 Andrew：「任何資訊必須驗證再驗證，他得是真的」——晚餐推薦把一家店配上
@@ -1686,7 +1867,9 @@ _GOOGLE_MAPS_UNSAFE_TEXT_RE = re.compile(
 )
 
 _YTDLP_TIMEOUT = 12  # yt-dlp 單次提取上限（秒）
-_YTDLP_SUBTITLE_MAX_CHARS = 3000
+# 2026-10-24: the transcript windows the model sees (the opening and where the user's
+# words are densest) together stay within this; it used to be the first 3000 characters.
+_YTDLP_SUBTITLE_MAX_CHARS = reply_guards.SUBTITLE_BUDGET
 _YTDLP_SUBTITLE_LANGS = ["zh-TW", "zh-Hant", "zh", "zh-Hans", "en"]
 _YTDLP_DESCRIPTION_MAX_CHARS = 1500
 
@@ -2097,11 +2280,25 @@ def _note_link_content() -> None:
         found.append(True)
 
 
+def _note_partial_material(reason: str) -> None:
+    """The material was read only in part (2026-10-24): set by the fetchers, never
+    guessed from the text of the prompt.  Reply checks then treat 「沒提到」 as unproven."""
+    reply_guards.note_partial(getattr(_link_content_state, "found", None), reason)
+
+
+def _link_read_count() -> int:
+    found = getattr(_link_content_state, "found", None)
+    return len(found) if found is not None else 0
+
+
 @contextmanager
 def _recording_link_content():
-    """Collect whether `_prefetch_urls` in this thread read any real content."""
+    """Collect whether `_prefetch_urls` in this thread read any real content.
+
+    The list also carries ``partial`` (reply_guards.MaterialRecord): why what was
+    read may not be the whole story."""
     previous = getattr(_link_content_state, "found", None)
-    found: list[bool] = []
+    found = reply_guards.MaterialRecord()
     _link_content_state.found = found
     try:
         yield found
@@ -2186,7 +2383,21 @@ def _append_youtube_metadata_lines(lines: list[str], info: dict) -> None:
 
 
 def _extract_subtitles_from_info(info: dict) -> str | None:
-    """從 yt-dlp info dict 拿字幕文字（優先人工字幕 → 自動生成，語言優先順序見常數）。"""
+    """從 yt-dlp info dict 拿字幕文字（優先人工字幕 → 自動生成，語言優先順序見常數）。
+
+    2026-10-24: a long transcript is no longer cut after its first 3000 characters
+    (about the first ten minutes of a 70-minute video).  The model gets the opening
+    and the stretch where the words of the user's message (and quote) are densest,
+    up to about 6000 characters, behind a note of the time ranges covered and the
+    full length; the material is then recorded as partial.  An HLS playlist
+    (#EXTM3U, what some live replays serve) is not a transcript.  Why no transcript
+    came back is logged (never the URL): no track, a download that failed, a playlist.
+    """
+    reasons: list[str] = []
+    try:
+        duration = float(info.get("duration") or 0) or None
+    except (TypeError, ValueError):
+        duration = None
     for subs_dict in (
         info.get("subtitles") or {},
         info.get("automatic_captions") or {},
@@ -2198,17 +2409,31 @@ def _extract_subtitles_from_info(info: dict) -> str | None:
             entry = next((e for e in entries if e.get("ext") == "vtt"), entries[0])
             sub_url = entry.get("url") if entry else None
             if not sub_url:
+                reasons.append("no_url")
                 continue
             try:
                 resp = _requests.get(sub_url, timeout=8, max_bytes=_PREFETCH_MAX_BYTES, truncate=True)
                 resp.raise_for_status()
-                text = _parse_vtt(resp.text)
-                if text and len(text) > 50:
-                    if len(text) > _YTDLP_SUBTITLE_MAX_CHARS:
-                        text = text[:_YTDLP_SUBTITLE_MAX_CHARS] + "…（字幕截斷）"
-                    return text
+                body = resp.text
             except Exception as e:
-                logger.debug("subtitle download failed lang=%s: %s", lang, e)
+                reasons.append("download_failed")
+                logger.info("subtitle download failed lang=%s error_type=%s", lang, type(e).__name__)
+                continue
+            if reply_guards.is_hls_manifest(body):
+                reasons.append("hls_playlist")
+                continue
+            cues = reply_guards.parse_vtt_cues(body)
+            if len("\n".join(text for _t, text in cues)) <= 50:
+                reasons.append("empty_or_short")
+                continue
+            windows = reply_guards.select_subtitle_windows(
+                cues, reply_guards.current_subtitle_hint(), duration,
+                budget=_YTDLP_SUBTITLE_MAX_CHARS,
+            )
+            if not windows.complete:
+                _note_partial_material("subtitle_windows")
+            return windows.text
+    logger.info("subtitles unavailable reason=%s", ",".join(sorted(set(reasons))) or "no_subtitle_tracks")
     return None
 
 
@@ -3282,6 +3507,7 @@ def _prefetch_urls(text: str) -> str:
     )
     blocks = []
     for url in urls:
+        read_before = _link_read_count()
         try:
             # Google Maps 短網址：驗證每一跳 redirect，不下載最終 JS 頁面。
             if _has_google_maps_short_host(url):
@@ -3308,7 +3534,9 @@ def _prefetch_urls(text: str) -> str:
             if _is_youtube_url(url):
                 # YouTube 不走 Gemini video fallback：yt-dlp/oEmbed/HTML metadata
                 # 已能提供可用 context；全失敗時也保留辨識狀態避免 LLM 只看裸網址。
-                blocks.append(_fetch_youtube_context(url))
+                # The transcript windows follow what this message and its quote talk about.
+                with reply_guards.subtitle_hint(text):
+                    blocks.append(_fetch_youtube_context(url))
                 continue
             if _host_in(host, _REDDIT_HOSTS):
                 block = _fetch_reddit_meta(url)
@@ -3371,6 +3599,7 @@ def _prefetch_urls(text: str) -> str:
 
             if len(content) > _PREFETCH_MAX_CHARS:
                 content = content[:_PREFETCH_MAX_CHARS] + "\n…（內容截斷）"
+                _note_partial_material("page_truncated")
             blocks.append(
                 f"（以下是連結 {url} 的網頁內容，已預先擷取）\n"
                 f"--- 網頁內容開始 ---\n{content}\n--- 網頁內容結束 ---"
@@ -3379,6 +3608,11 @@ def _prefetch_urls(text: str) -> str:
             logger.info("prefetch OK url=%s chars=%d", url, len(content))
         except Exception as e:
             logger.info("prefetch failed url=%s: %s", url, e)
+        finally:
+            # Nothing real was read from this link (a title only, a failed read, a
+            # skipped page): what the model has is not the whole story.
+            if _link_read_count() == read_before:
+                _note_partial_material("link_unread")
 
     if blocks:
         return "\n\n".join(blocks) + "\n\n" + text
@@ -4388,6 +4622,25 @@ def _alias_from_user_id(user_id: str | None) -> str:
         return food_extractor.alias_from_user_id(user_id) or ""
     except Exception as e:
         logger.debug("alias lookup skipped: %s", e)
+        return ""
+
+
+def _guard_check(check, *args) -> bool:
+    """A reply_guards yes/no check that can never take the message down (fails to no)."""
+    try:
+        return bool(check(*args))
+    except Exception as exc:
+        logger.warning("reply guard check skipped error_type=%s", type(exc).__name__)
+        return False
+
+
+def _speaker_alias(user_id: str | None) -> str:
+    """The sender's configured family name; local files only, never a LINE lookup."""
+    if not user_id:
+        return ""
+    try:
+        return line_mentions.alias_for_user_id(user_id) or _alias_from_user_id(user_id) or ""
+    except Exception:
         return ""
 
 
@@ -7615,6 +7868,9 @@ def _handle_text_message(
         and not explicit_reminder_creation
         and not reported_reminder_statement
         and _is_calendar_query(calendar_query_text)
+        # 2026-10-24: nobody addressed the bot -> only a short message that is itself a
+        # calendar question may skip capture and extraction; anything else goes the normal way.
+        and (clean_text is not None or _calendar_query_passive_ok(calendar_query_text))
     ):
         burst_filter.cancel_burst(group_id)
         _handle_calendar_query(event, group_id, calendar_query_text)
@@ -8590,6 +8846,119 @@ def _is_calendar_query(text: str) -> bool:
             return True
         return False
     return False
+
+
+# 2026-10-24: a calendar question nobody addressed to the bot.  10/13–10/17 the router answered six
+# statements and long pastes (25–3,866 characters) with 「沒有家族行程」 because 「之前／上次」 counts
+# as a question word in _CALENDAR_TIMING_QUERY_RE (which other callers use, so it is left alone) and
+# the answer left before capture and extraction ever saw the message.  Addressed questions are
+# not affected; for the unaddressed route only a short message that IS a calendar question
+# may leave early.  Every pattern here is a plain alternation of words, applied to at most
+# _CAL_PASSIVE_MAX_CHARS characters, and none sits under a repeat, so each string splits one way
+# (H5, line_bot.md 2026-10-05).
+_CAL_PASSIVE_MAX_CHARS = 60
+_CAL_PAST_MARKER_RE = re.compile(r"上次|之前|以前|上回")
+_CAL_TIME_QUESTION_RE = re.compile(r"什麼時候|什麼時間|哪一天|哪天|何時|幾點|幾時|幾號|多久|何日")
+_CAL_YESNO_RE = re.compile(
+    r"[？?]|嗎|呢|吧|了沒|是不是|是否|會不會|回不回|對不對|要不要|可不可以|能不能|有沒有"
+)
+_CAL_CLAUSE_SPLIT_RE = re.compile(r"(?<=[，,。！!；;？?\n])")
+_CAL_ACTIVITY_WORD_RE = re.compile(
+    r"行程|安排|計畫|計劃|活動|聚會|會議|聚餐|開會|看診|看醫生|就醫|出門|上班|上課|出發|"
+    r"回來|回家|報到|出差|旅行|拿蛋糕|拿藥|接送|機場|班機|"
+    r"回(?:台北|新北|桃園|台中|台南|高雄|花蓮|宜蘭|新竹|苗栗|嘉義|屏東|台東|老家)"
+)
+_CAL_SCHEDULE_WORD_RE = re.compile(
+    _CALENDAR_QUERY_DATE_PATTERN + "|" + _CAL_ACTIVITY_WORD_RE.pattern
+)
+# What a clause may consist of and still be only a FRAGMENT of a question (「明天，」「媽媽下週三，」
+# 「幾點？」「後天呢」): dates, question words, yes/no particles, pronouns and punctuation.  Family
+# names are cut out first (_calendar_clause_is_fragment).  The time-question words come before the
+# bare 什麼 on purpose: the first alternative that matches wins, and 什麼時候 must go in one piece.
+_CAL_FRAGMENT_FILLER_RE = re.compile(
+    _CALENDAR_QUERY_DATE_PATTERN
+    + "|"
+    + _CAL_TIME_QUESTION_RE.pattern
+    + "|"
+    + _CAL_YESNO_RE.pattern
+    + r"|有什麼|有哪些|什麼|哪些|哪個|哪裡|誰|全家|大家|家人|[我你妳他她咱們]"
+    + r"|[\s，,。！!；;、：:~～…]"
+)
+
+
+def _calendar_clause_is_fragment(clause: str) -> bool:
+    """True when nothing is left of ``clause`` once its dates, family names, question words,
+    particles and punctuation are taken out: 「明天，」「媽媽下週三，」「幾點？」「後天呢」.
+
+    A fragment cannot be a sentence on its own, so it may be completed by its neighbour into one
+    question.  A clause that says anything else -- 「爸爸下週三要開刀，」「什麼時候回家？」「我後天要
+    面試，」 -- is a sentence of its own, whatever words it uses (the activity list is closed;
+    this test is not)."""
+    rest = clause
+    for start, end, _name in reversed(_family_actors_in_text(clause)):
+        rest = rest[:start] + rest[end:]
+    return not _CAL_FRAGMENT_FILLER_RE.sub("", rest)
+
+
+def _calendar_query_passive_ok(text: str) -> bool:
+    """True only when the WHOLE (short) message is a calendar question.
+
+    1. at most _CAL_PASSIVE_MAX_CHARS characters (no forwarded articles or news);
+    2. no @mention (a mention of another family member or @All is not a question to the bot);
+    3. some clause, or two adjacent clauses, is itself a calendar query -- a statement clause
+       cannot borrow a question word from an unrelated clause (and vice versa).  Two neighbours
+       are read as ONE question only when the window is a query and either one of them is a
+       fragment (a bare date or a bare question word: 「明天，有什麼行程？」「爸爸明天要拿蛋糕，
+       幾點？」), or one is a query by itself and the other is a question too (「明天有什麼行程？
+       需要出門嗎」).  A sentence of its own next to a query -- 「後天我要面試，明天有什麼行程？」
+       「爸爸下週三要開刀，什麼時候回家？」 -- stays a separate statement;
+    4. 「之前／上次／以前」 alone is narrative: it needs a time question word or a yes/no particle
+       in the same window;
+    5. every clause that talks about a schedule (a date, 開會, 看診, 回台北 ...) must be part of
+       such a query window -- a message that also STATES a schedule is a mixed message and goes
+       down the normal capture / reminder / burst path instead (the question in it is not
+       answered from the calendar; the bot answers it like any other message).
+    """
+    t = unicodedata.normalize("NFKC", text or "").strip()
+    if not t or len(t) > _CAL_PASSIVE_MAX_CHARS or "@" in t:
+        return False
+    clauses = [c.strip() for c in _CAL_CLAUSE_SPLIT_RE.split(t) if c.strip()]
+    schedule = [bool(_CAL_SCHEDULE_WORD_RE.search(c)) for c in clauses]
+    shaped = [
+        bool(_CAL_TIME_QUESTION_RE.search(c) or _CAL_YESNO_RE.search(c)) for c in clauses
+    ]
+    fragments: dict[int, bool] = {}
+
+    def is_fragment(index: int) -> bool:
+        if index not in fragments:
+            fragments[index] = _calendar_clause_is_fragment(clauses[index])
+        return fragments[index]
+
+    def is_query(window: str) -> bool:
+        if not _is_calendar_query(window):
+            return False
+        return not (
+            _CAL_PAST_MARKER_RE.search(window)
+            and not (_CAL_TIME_QUESTION_RE.search(window) or _CAL_YESNO_RE.search(window))
+        )
+
+    alone = [is_query(c) for c in clauses]
+    covered = list(alone)
+    for i in range(len(clauses) - 1):
+        j = i + 1
+        if alone[i] and alone[j]:
+            continue
+        completes = (
+            is_fragment(i)
+            or is_fragment(j)
+            or (alone[i] and shaped[j])
+            or (alone[j] and shaped[i])
+        )
+        if completes and is_query(clauses[i] + clauses[j]):
+            covered[i] = covered[j] = True
+    if not any(covered):
+        return False
+    return not any(s and not ok for s, ok in zip(schedule, covered))
 
 
 def _strip_conversation_record_words(text: str) -> str:
@@ -11962,10 +12331,9 @@ def _text_message_with_mentions(
     reply_text = str(text or "")
     if not prepared:
         reply_text = _prepare_outbound_text(reply_text, source=validation_source)
-    reply_text = reply_text[:limit]
+    # LINE counts text in UTF-16 code units (an emoji is 2), so the limit is applied in those.
+    reply_text = line_mentions.clip_utf16(reply_text, limit)
     try:
-        import line_mentions
-
         if explicit_only:
             aliases = []
             for candidate in re.findall(
@@ -12046,13 +12414,21 @@ def _text_message_with_mentions(
                 # The text opens with its own @ line (a reminder receipt):
                 # ping there instead of adding a second line of the same names.
                 body, plain_labels = rest, [token.replace("＠", "@") for token in tokens]
-            message_dict = line_mentions.text_v2_dict(body, targets, plain_labels)
+            # The template text (prefix + escaped body) is clipped to the limit after escaping.
+            message_dict = line_mentions.text_v2_dict(body, targets, plain_labels, limit=limit)
             return reply_text, line_mentions.sdk_message_from_text_v2_dict(
                 message_dict,
                 quote_token=quote_token,
             )
     except Exception as e:
-        logger.warning("build mention reply failed; fallback text message: %s", str(e)[:200])
+        if validation_source == "exercise_nudge":
+            # 2026-10-28 (review R2 GP2 #4): a pydantic error carries the input it refused, and the
+            # nudge's input is health text.  The exception type is all the log gets.
+            logger.warning(
+                "build mention reply failed; fallback text message error_type=%s", type(e).__name__
+            )
+        else:
+            logger.warning("build mention reply failed; fallback text message: %s", str(e)[:200])
     return reply_text, TextMessage(text=reply_text, quoteToken=quote_token)
 
 
@@ -12987,7 +13363,7 @@ def _handle_explicit_text(
     else:
         quoted_block = _build_quoted_block(event.message, group_id)
     context = memory.get_context(group_id)
-    if _requires_public_research(clean_text):
+    if _requires_public_research(clean_text) or _requires_regulation_research(clean_text, context):
         if implicit_quote is not None:
             _handle_web_research_question(event, group_id, clean_text, quoted_context=quoted_block)
         else:
@@ -13038,12 +13414,15 @@ def _handle_explicit_text(
         quote_policy_input,
         context=context,
     )
+    # B2.4: this message disputes a reply of the bot's own that it quotes.
+    dispute = _guard_check(reply_guards.disputes_quoted_bot, quote_policy_input)
+    llm_input = f"{reply_policy.DISPUTE_NOTE}\n\n{user_input}" if dispute else user_input
     facts = _facts_for_speaker(group_id, sender_user_id)
     pnotes = _get_persona_notes(group_id)
     llm_started = time.monotonic()
     try:
         with _thinking_indicator(group_id):
-            reply_text = _caller_checked(_llm_chat, user_input, context, facts, pnotes)
+            reply_text = _caller_checked(_llm_chat, llm_input, context, facts, pnotes)
         # 延遲觀測：只記秒數與長度，不記內容。
         logger.info(
             "explicit llm done secs=%.2f len=%d",
@@ -13060,7 +13439,7 @@ def _handle_explicit_text(
             # 第三層 → deterministic lite_reply → direct local_llm fallback。
             # 不重跑剛失敗的 Claude CLI（2026-10-04）。
             try:
-                reply_text = _caller_checked(_gemini_llm_chat, user_input, context, facts, pnotes)
+                reply_text = _caller_checked(_gemini_llm_chat, llm_input, context, facts, pnotes)
             except Exception as e2:
                 logger.warning("lite_reply retry failed: %s", e2)
                 reply_text = ""
@@ -13090,7 +13469,7 @@ def _handle_explicit_text(
                 "gemini chat (explicit) unavailable, retry via local text fallback: %s",
                 e,
             )
-            reply_text = _caller_checked(_local_text_llm_fallback, user_input, context=context)
+            reply_text = _caller_checked(_local_text_llm_fallback, llm_input, context=context)
             if not reply_text:
                 _reply(
                     event.reply_token,
@@ -13153,12 +13532,14 @@ def _handle_explicit_text(
         searched=reply_provenance.searched(),
         has_material=bool(link_content),
         facts=facts,
+        partial=reply_guards.is_partial(link_content) or dispute,
+        speaker=_speaker_alias(sender_user_id),
     )
     claims_outcome: dict = {}
     reply_text = _enforce_new_value_reply(reply_text, outcome=claims_outcome, **enforce_kwargs)
     if not reply_text:
         reply_text = _retry_unbacked_reply_with_search(
-            claims_outcome, (user_input, context, facts, pnotes), enforce_kwargs,
+            claims_outcome, (llm_input, context, facts, pnotes), enforce_kwargs,
         )
     if not reply_text:
         _finish_explicit_without_reply(event, group_id, quote_policy_input, clean_text, sender_user_id)
@@ -13357,25 +13738,6 @@ def _retryable_burst_db_call(operation, *args, **kwargs):
         raise
 
 
-def _finance_speaker_name(group_id: str, user_id: str | None) -> str:
-    """The family name of whoever wrote a finance view; '' when unknown."""
-    # TODO(2026-10-09 deferred): use _member_label (cache, timeout, cleaning);
-    # the finance tests then need display lookups while BOT_MUTED.
-    if not user_id:
-        return ""
-    try:
-        import line_mentions
-
-        name = line_mentions.alias_for_user_id(user_id) or ""
-    except Exception:
-        name = ""
-    name = name or _alias_from_user_id(user_id)
-    if not name:
-        display = _get_member_display_name(group_id, user_id)
-        name = "" if display in ("群組成員", "某人") else display
-    return name
-
-
 # ── 記憶裡的「誰說的」（2026-10-09）──────────────────────────────────────────
 # Andrew：「咪寶記憶的部分，讓他區分不同人（說話的人），不能全部都一概當成『使用者』」。
 # 對話紀錄的每一則使用者訊息前面加說話的人的稱呼，抽事實時才知道是誰的事。
@@ -13544,28 +13906,16 @@ def _labelled_burst_turn(group_id: str, combined_text: str, message_ids: list | 
 def _start_burst_finance_extraction(
     group_id: str, combined_text: str, message_ids: list | None = None
 ) -> None:
-    """Start the best-effort finance side task after retry-safe work is done.
+    """Retired 2026-10-24: the finance-view side task no longer starts.
 
-    Each message's sender goes along, so a view is stored under the name of
-    whoever said it, never 「自己」 (Andrew 2026-10-07).
+    財經觀點 was removed (the side-task gate was almost always shut, so views were
+    rarely stored, and one member used the command).  Nothing calls this any more;
+    the name stays because several tests monkeypatch it.  finance_view_*.py, the
+    finance_views table and the weekly validator are untouched.  To bring the
+    feature back, call this from the burst exits again and run the extraction on
+    quota that is not saturated.
     """
-    try:
-        if _gemini_side_task_allowed("finance_view_extract"):
-            import finance_view_extractor
-
-            speakers = []
-            for message_id in message_ids or []:
-                raw = memory.get_raw_message(group_id, str(message_id))
-                if raw and raw[1]:
-                    speakers.append((str(message_id), raw[0] or "", raw[1]))
-            finance_view_extractor.maybe_extract_and_save_async(
-                group_id,
-                combined_text,
-                speakers=speakers,
-                resolve_speaker=lambda user_id: _finance_speaker_name(group_id, user_id),
-            )
-    except Exception as exc:
-        logger.debug("finance_view extract skipped: %s", exc)
+    logger.info("finance view extraction retired; nothing started")
 
 
 # 2026-10-03: corrections built on stale memory told a family member a widely
@@ -13575,7 +13925,8 @@ _BURST_REPLY_INSTRUCTION = (
     "請根據系統指令中的規則，只針對其中說錯、過時或有爭議的地方給出糾正，"
     "或補充他們不知道的新資訊、具體可行的建議；"
     "糾正必須有本次附上的資料或長期不變的常識作根據；"
-    "近期公開事件、價格、優惠條件，沒有附資料就不要糾正。"
+    "近期公開事件、價格、優惠條件，沒有附資料就不要糾正；"
+    "法規、稅額、免稅額度、罰則、年齡限制的數字，沒有附上的資料就不要寫。"
     "沒有這些內容就輸出空字串，不要附和、不要重述。)"
 )
 
@@ -13633,7 +13984,6 @@ def _handle_burst_flush(
 
     from types import SimpleNamespace
     if needs_public_research:
-        _start_burst_finance_extraction(group_id, combined_text, message_ids)
         _handle_web_research_question(
             SimpleNamespace(
                 source=SimpleNamespace(user_id=""),
@@ -13677,13 +14027,13 @@ def _handle_burst_flush(
             addressed=False,
             trusted_grounded=bool(getattr(cached, "grounded", False)),
             facts=facts,
+            partial=_guard_check(reply_guards.has_video_link, combined_text),
         )
         if not cached:
             _mark_inbound_reply_completed_no_reply(
                 reply_token, group_id=group_id, message_ids=message_ids
             )
             return
-        _start_burst_finance_extraction(group_id, combined_text, message_ids)
         _reply(
             reply_token,
             cached,
@@ -13704,8 +14054,21 @@ def _handle_burst_flush(
         )
         _finish_burst_without_reply(group_id, combined_text, reply_token, message_ids)
         return
+    # B2.4: someone disputes a reply of the bot's own that this batch quotes.  Decided
+    # first: a dispute is answered (or checked as partial), never silenced by the gate below.
+    dispute = _guard_check(reply_guards.disputes_quoted_bot, combined_text)
+    if not dispute and _guard_check(reply_guards.silent_video_comment, combined_text, link_content):
+        # 2026-10-24 (B2.2): a video link in the batch (a family member's quote of one too),
+        # nothing real read of it, no question and no other checkable claim on any line: the
+        # reply could only retell a title (Andrew: 感想不回).
+        logger.info("burst video comment with nothing to read and no question; silent group=%s", group_id)
+        _finish_burst_without_reply(group_id, combined_text, reply_token, message_ids)
+        return
 
-    user_input = f"{_BURST_REPLY_INSTRUCTION}\n\n{prefetched}"
+    user_input = (
+        f"{_BURST_REPLY_INSTRUCTION}\n{reply_policy.DISPUTE_NOTE}\n\n{prefetched}"
+        if dispute else f"{_BURST_REPLY_INSTRUCTION}\n\n{prefetched}"
+    )
     try:
         with _thinking_indicator(group_id):
             reply_text = _caller_checked(_llm_chat, user_input, context, facts, pnotes)
@@ -13818,6 +14181,7 @@ def _handle_burst_flush(
         searched=reply_provenance.searched(),
         has_material=bool(link_content),
         facts=facts,
+        partial=reply_guards.is_partial(link_content) or dispute,
     )
     claims_outcome: dict = {}
     reply_text = _enforce_new_value_reply(reply_text, outcome=claims_outcome, **enforce_kwargs)
@@ -13841,7 +14205,6 @@ def _handle_burst_flush(
         _labelled_burst_turn(group_id, combined_text, message_ids),
     )
     _append_bot_turn(group_id, reply_text)
-    _start_burst_finance_extraction(group_id, combined_text, message_ids)
     _maybe_extract_facts(group_id)
     _burst_capture_calendar_event(group_id, combined_text, message_ids)
     _reply(
@@ -20749,6 +21112,28 @@ def _requires_public_research(text: str) -> bool:
     return True
 
 
+def _requires_regulation_research(text: str, context: list[tuple[str, str]] | None = None) -> bool:
+    """An addressed question about the number in a public regulation (B1.4).
+
+    Only for a message that asked the bot directly (the explicit path calls this;
+    bursts never do).  No family alias, short name, role, kinship word, LINE
+    display name, label of the conversation's turns (``context``) or @name may be in
+    it (compared NFKC and casefolded), and only
+    its domain clause is searched (`public_research.search_query`).  Fails closed:
+    an unreadable or empty alias file means no search (`reply_guards.search_deny_terms`).
+    Residual: a given name nobody configured, inside the domain clause, goes out as written.
+    """
+    import public_research
+
+    try:
+        return public_research.requires_regulation_research(
+            text, lambda: reply_guards.search_deny_terms(context)
+        )
+    except Exception as exc:
+        logger.warning("regulation research check skipped error_type=%s", type(exc).__name__)
+        return False
+
+
 def _build_web_research_queries(text: str) -> list[str]:
     base = re.sub(r"\s+", " ", (text or "").strip(" \t\r\n?？。！!"))
     if not base:
@@ -20818,9 +21203,9 @@ def _format_web_research_sources(sources: list[dict], limit: int = 5) -> str:
         url = str(src.get("url") or "").strip()
         domain = str(src.get("domain") or "").strip()
         body = str(src.get("full_text") or src.get("snippet") or "").strip()
-        # The shared link itself (already capped at 5000 when collected) keeps
-        # its subtitles/article body; search results stay short.
-        limit = 5000 if src.get("evidence_kind") == "linked_context" else 700
+        # The shared link itself (already capped at _LINKED_MATERIAL_MAX_CHARS when
+        # collected) keeps its subtitles/article body; search results stay short.
+        limit = _LINKED_MATERIAL_MAX_CHARS if src.get("evidence_kind") == "linked_context" else 700
         if len(body) > limit:
             body = body[:limit] + "..."
         parts = [f"[{idx}] {title or domain or url}"]
@@ -20885,6 +21270,10 @@ def _build_web_research_prompt(
     )
 
 
+# The shared link's own text in the research prompt.  It was 5000; the transcript windows
+# alone are about 6000 (reply_guards.SUBTITLE_BUDGET) behind the title and description,
+# and a cut would drop the stretch the user's words point at (2026-10-24).
+_LINKED_MATERIAL_MAX_CHARS = 9000
 _RESEARCH_PREFETCH_BUDGET = 12.0  # seconds; public_research.collect gives up at 16
 # A read abandoned after the budget keeps running (yt-dlp, video fallback):
 # at most this many at once, past that the answer comes from the search.
@@ -20935,6 +21324,7 @@ def _handle_web_research_question(
     search_text = public_research.search_query(reply_policy.strip_link_tokens(text))
     linked_material: list[str] = []
     real_link_content: list[bool] = []
+    reader_partial: list[bool] = []  # the shared link was read only in part (2026-10-24)
 
     def collect_with_links(_public_text):
         started = time.monotonic()
@@ -20948,6 +21338,7 @@ def _handle_web_research_question(
                     with _recording_link_content() as found:
                         page = _prefetch_urls(fetch_input)
                     read["content"] = bool(found)
+                    read["partial"] = reply_guards.is_partial(found)
                     read["page"] = page
                 finally:
                     _RESEARCH_READERS.release()
@@ -20973,12 +21364,14 @@ def _handle_web_research_question(
                 page = page.replace(_youtube_unavailable_block(url), "")
         # Something was read only if blocks came back in front of the input;
         # a failed read returns the input unchanged.
+        if read.get("partial"):
+            reader_partial.append(True)
         if _prefetched_material(page, fetch_input):
             page = page.strip()
-            linked_material.append(page[:5000])
+            linked_material.append(page[:_LINKED_MATERIAL_MAX_CHARS])
             if read.get("content"):
                 real_link_content.append(True)
-            rows = [{"url": fetch_urls[0], "full_text": page[:5000],
+            rows = [{"url": fetch_urls[0], "full_text": page[:_LINKED_MATERIAL_MAX_CHARS],
                      "evidence_kind": "linked_context"}] + rows
         return rows
 
@@ -21066,6 +21459,15 @@ def _handle_web_research_question(
             # 2026-10-04: what was actually collected backs claims about named people.
             evidence_text=_research_evidence_text(sources),
             facts=facts,
+            # The shared link counts as read in part when the reader said so, and also when it was
+            # never read (readers busy, no page within the budget, nothing but a title): the
+            # search rows must not stand in for a text that says nothing about the link.
+            partial=(
+                bool(reader_partial)
+                or (bool(fetch_urls) and not real_link_content)
+                or _guard_check(reply_guards.disputes_quoted_bot, f"{quoted_context}\n{text}")
+            ),
+            speaker=_speaker_alias(sender_user_id),
         )
         if not reply_text:
             older_burst_first()
@@ -21868,144 +22270,22 @@ def _validated_flex_card_message(alt_text: str, contents: dict):
     return FlexMessage(alt_text=alt_text, contents=FlexContainer.from_dict(contents))
 
 
-def _handle_finance_view_command(group_id: str, text: str) -> str | None:
-    """處理 /觀點 [可選: 家人名 | 標的]。純 SQL 聚合，不過 Gemini。
+# 2026-10-24 財經觀點停用（Andrew：「財經觀點沒更新⇒看你要拿掉，還是要更新」，選拿掉）。
+_FINANCE_VIEW_RETIRED_REPLY = (
+    "財經觀點已經停用了。看行情可以點「🧭 市場盤勢」，看台股推薦可以點「📈 股票推薦」。"
+)
 
-    第一句必須是判斷句（AGENTS.md 的 LINE bot 規則 0）。
+
+def _handle_finance_view_command(group_id: str, text: str) -> str | None:
+    """/觀點（含後面的家人名、標的）一律回固定句，不再查 finance_views。
+
+    函式名與 startswith 判斷保留：舊的選單卡片上「💬 財經觀點」按鈕還點得到（flex_menu 把
+    /觀點 列在 _RETIRED_BUTTON_TEXTS），點了要有回應。
     """
     s = (text or "").strip()
     if not s.startswith("/觀點"):
         return None
-
-    try:
-        import finance_view_db
-        import stock_quote
-    except ImportError as e:
-        logger.warning("finance_view import failed: %s", e)
-        return None
-
-    args = s.replace("/觀點", "", 1).strip()
-
-    if not args:
-        views = finance_view_db.list_recent(group_id, limit=10)
-        if not views:
-            return (
-                "目前家族觀點庫還是空的。\n"
-                "（聊到具體標的 + 方向時會自動記下，例「我覺得 0050 會漲到 180」）"
-            )
-        return _format_finance_views(views, header="📈 家族最近財經觀點")
-
-    tokens = args.split()
-    ticker = None
-    person = None
-    for tok in tokens:
-        try:
-            resolved = stock_quote.detect_symbols(tok)
-        except Exception:
-            resolved = None
-        if resolved:
-            ticker = resolved[0]
-        elif not person:
-            person = tok
-
-    if person:
-        try:
-            import line_mentions
-
-            person = line_mentions.configured_family_alias_mapping().get(person, person)
-        except Exception:
-            pass
-    if ticker:
-        views = finance_view_db.list_by_ticker(group_id, ticker, limit=10)
-        header = f"📈 {ticker} 相關家族觀點"
-    elif person:
-        views = finance_view_db.list_by_person(group_id, person, limit=10)
-        header = f"📈 {person} 的財經觀點"
-    else:
-        return None
-
-    if not views:
-        return f"{header}\n\n沒找到相關觀點記錄。"
-    return _format_finance_views(views, header=header)
-
-
-def _format_finance_views(views: list[dict], header: str) -> str:
-    """純 SQL 聚合輸出。第一句判斷句（規則 0）。"""
-    if not views:
-        return f"{header}\n\n沒有記錄。"
-
-    from datetime import datetime as _dt
-    from zoneinfo import ZoneInfo as _ZI
-
-    tw = _ZI("Asia/Taipei")
-
-    hit = sum(1 for v in views if v.get("validation_result") == "hit")
-    miss = sum(1 for v in views if v.get("validation_result") == "miss")
-    pending = sum(1 for v in views if v.get("validation_result") == "pending")
-    na = sum(1 for v in views if v.get("validation_result") == "na")
-
-    if hit and miss:
-        summary = f"共 {len(views)} 條觀點，已驗證 {hit} 命中 / {miss} 落空，{pending} 仍待驗。"
-    elif hit:
-        summary = f"共 {len(views)} 條觀點，已驗證 {hit} 命中（其餘待驗）。"
-    elif miss:
-        summary = f"共 {len(views)} 條觀點，已驗證 {miss} 落空。"
-    else:
-        summary = f"共 {len(views)} 條觀點，{pending + na} 仍待驗。"
-
-    lines = [header, "", summary, ""]
-    names: dict[str, str] = {}
-    for v in views[:10]:
-        label = v.get("ticker") or v.get("macro_topic") or "?"
-        d = v.get("direction") or ""
-        dir_str = {"bull": "看多", "bear": "看空", "neutral": "持平"}.get(d, "")
-        target = ""
-        if v.get("target_price"):
-            target = f" 目標 {v['target_price']}"
-        elif v.get("target_pct"):
-            target = f" 目標 {v['target_pct']:+.0f}%"
-        result = v.get("validation_result") or ""
-        result_str = {"hit": "✅", "miss": "❌", "pending": "⏳", "na": "—"}.get(result, "")
-        try:
-            created = _dt.fromtimestamp(v["created_at"] / 1000, tz=tw).strftime("%m-%d")
-        except Exception:
-            created = "??"
-        speaker = _finance_view_speaker(v, names)
-        lines.append(f"• {created} {speaker} {label} {dir_str}{target} {result_str}")
-    return "\n".join(lines)
-
-
-UNKNOWN_FINANCE_SPEAKER = "不確定是誰"
-
-
-def _finance_view_speaker(view: dict, names: dict[str, str]) -> str:
-    """Who said a view. Rows stored before 2026-10-07 can say 自己／家人: look the
-    sender up again (by user_id, or by the message around that moment) and save it."""
-    import finance_view_extractor
-
-    speaker = view.get("display_name") or ""
-    if speaker and speaker not in finance_view_extractor.AMBIGUOUS_SPEAKERS:
-        return speaker
-    group_id = view.get("group_id") or ""
-    user_id = view.get("user_id") or ""
-    try:
-        if not user_id and view.get("created_at"):
-            user_id = memory.raw_message_sender_near(
-                group_id, int(view["created_at"]) // 1000, view.get("raw_text") or ""
-            ) or ""
-        if user_id and user_id not in names:
-            names[user_id] = _finance_speaker_name(group_id, user_id)
-        name = names.get(user_id, "") if user_id else ""
-        if name and view.get("view_id"):
-            import finance_view_db
-
-            finance_view_db.set_speaker(view["view_id"], user_id, name)
-    except Exception as exc:
-        logger.debug("finance view speaker repair skipped: %s", exc)
-        name = ""
-    # 2026-10-09 Andrew：「把家人通通改成發言的人」。真的查不到是誰（舊資料、
-    # 原始訊息已經不在）才寫「不確定是誰」，不再用「家人」帶過。
-    return name or UNKNOWN_FINANCE_SPEAKER
+    return _FINANCE_VIEW_RETIRED_REPLY
 
 
 def _handle_food_command(group_id: str, text: str) -> str | None:
@@ -22206,7 +22486,8 @@ def _handle_command(
     if classify_reply is not None:
         return classify_reply
 
-    # 家族財經觀點查詢（2026-05-18 加）
+    # /觀點（2026-05-18 加；2026-10-24 財經觀點停用）：不再查資料，一律回固定的停用說明，
+    # 舊選單卡片上的按鈕點了才有回應。
     fv_reply = _handle_finance_view_command(group_id, t)
     if fv_reply is not None:
         return fv_reply
@@ -22427,8 +22708,8 @@ _HELP_TEXT = (
     "  /行事曆                 列出未來 30 天的家族活動\n"
     "  /取消活動 <關鍵字>      取消含關鍵字的活動\n"
     "【投資】\n"
-    "  /股票                   台股推薦：點選單「📈 股票推薦」或打 /股票，回一組卡片，\n"
-    "                          往左滑看下一張（推薦最多 3 檔，最後一張是 0050、台積電）\n"
+    "  /股票                   AI 相關股推薦：點選單「📈 股票推薦」或打 /股票，回一組卡片，\n"
+    "                          往左滑看下一張（AI 相關＋便宜＋成長＋走勢，最多 3 檔；最後是 0050、台積電）\n"
     "  /股票 代號或名稱        看一檔的燈號和理由，例：/股票 2330、/股票 聯發科\n"
     "                          常問股卡上的「看…細節」按鈕也一樣；每天自動更新，卡片寫資料日期\n"
     "                          用公開數字篩選，只供參考，不是買賣指示\n"
@@ -23211,6 +23492,166 @@ def _attach_menu_buttons(message, group_id: str | None) -> None:
         logger.exception("menu buttons not attached group=%s", group_id)
 
 
+def _archived_text(message, default: str) -> str:
+    """What a sent message is stored as in raw_messages (2026-10-24, B6.5): its text.  A textV2
+    message's text is a template whose literal braces are escaped (`{{`), and the archive is read
+    back by the model as the bot's own words -- so the escapes are undone; the `{p1}` placeholder
+    stays, as it always did.  A brace-free text is stored byte for byte."""
+    text = getattr(message, "text", None)
+    if not isinstance(text, str):
+        return default
+    if type(message).__name__ == "TextMessageV2":
+        return line_mentions.unescape_text_v2(text)
+    return text
+
+
+def _sanitized_plain_text_message(text: str):
+    """One plain v1 TextMessage: no placeholder, mention or quote token LINE could refuse, at most
+    4900 UTF-16 code units (2026-10-24).  What a refused reply is sent again as."""
+    return TextMessage(
+        text=line_mentions.clip_utf16(str(text or ""), reply_riders.PLAIN_TEXT_LIMIT) or "…"
+    )
+
+
+class _ReplyRecovery(NamedTuple):
+    outcome: str  # "accepted" | "ambiguous" | "rejected"
+    resp: object | None  # LINE's answer when accepted
+    error: BaseException | None  # the last failure when it was not
+    plain_push: bool  # a push, if one is allowed, carries sanitized plain text
+
+
+def _reply_attempt(
+    reply_token: str,
+    messages: list,
+    send_fence,
+    *,
+    menu_buttons: bool = False,
+    group_id: str | None = None,
+):
+    """One more `reply_message` after LINE refused the first one.  Returns ("accepted", resp) |
+    ("rejected", error) -- LINE answered 4xx (or the request could not even be built): nothing
+    was sent | ("ambiguous", error) -- timeout, 5xx, connection error: it may have been
+    delivered.  Accepted marks the inbound event(s) replied, as the first attempt would.
+    ``menu_buttons``: the Quick Reply menu hangs on the last message of what is sent (LINE shows
+    only that one's), which is no longer the rider it was first attached to."""
+    try:
+        if menu_buttons and messages:
+            _attach_menu_buttons(messages[-1], group_id)
+        request = ReplyMessageRequest(reply_token=reply_token, messages=messages)
+        config = _get_line_config()
+    except Exception as exc:
+        logger.warning("reply resend not built error_type=%s", type(exc).__name__)
+        return "rejected", exc
+    try:
+        with ApiClient(config) as api_client:
+            resp = MessagingApi(api_client).reply_message(request)
+    except Exception as exc:
+        logger.warning(
+            "reply resend failed: %s", _line_error_detail(exc, secrets=(reply_token,))
+        )
+        return ("rejected" if line_errors.is_client_error(exc) else "ambiguous"), exc
+    _mark_inbound_reply_succeeded(reply_token)
+    _settle_inbound_fence_replied(send_fence)
+    return "accepted", resp
+
+
+def _recover_rejected_reply(
+    *,
+    reply_token: str,
+    group_id: str | None,
+    text: str,
+    primary_suppressed: bool,
+    batch: "reply_riders.Batch",
+    error: BaseException,
+    send_fence,
+    menu_buttons: bool = False,
+) -> _ReplyRecovery:
+    """LINE refused a *text* reply with a 400 that is not about the token (2026-10-24, B6.3).
+
+    Nothing was delivered.  LINE names the refused message(s) in ``details[].property``
+    (``messages[2].text``); what happens depends on which one it is:
+
+    * only riders are named (a reminder, an acknowledgement, the nudge): they are *fenced* -- a
+      reminder's delivery claim becomes `uncertain`, the nudge's dedupe row is kept, an
+      acknowledgement stays claimed until its claim lapses and is given up the third time it is
+      fenced -- so a bad rider does not ride on every later reply; every other rider is released
+      unsent; and the primary goes alone, exactly as it was built (if LINE refuses it after all,
+      once more as plain text);
+    * the primary message is named, or no message could be told: every rider is released (not
+      fenced) and the primary goes alone as one plain TextMessage -- except that a rider which was
+      in such an unnamed refusal on three replies in a row is fenced (it is the likely culprit
+      and would otherwise cost an extra failed call on every later reply).
+
+    A rider is never sent again as plain text: its plain version starts with the label of the
+    person it pings -- the literal 「@當事人」 when the creator has no local alias -- which the
+    group would read as text, where the textV2 placeholder showed a real @; and the refusal may
+    well come from that mention (a person who is not in the group).
+
+    Every outcome that is not an acceptance ends the same way: ``rejected`` -- LINE refused
+    everything it was given, so the caller may push (only where the fence rules allow) --, or
+    ``ambiguous`` -- the last attempt may have been delivered, so the fence stays and nothing is
+    pushed.  At most three `reply_message` calls; the logs carry indexes, kinds and ids, never
+    text.  On acceptance the lists (messages, refs, riders, claims) are already what LINE
+    accepted, so `_reply`'s archive and finalize code runs unchanged.
+    """
+    named = line_errors.rejected_message_indexes(error)
+    case, hits = reply_riders.classify_rejection(named, batch.riders, not primary_suppressed)
+    logger.warning(
+        "reply content refused case=%s msgs=%d indexes=%s riders=%s: %s",
+        case,
+        len(batch.messages),
+        named,
+        [batch.riders[index].label for index in hits],
+        _line_error_detail(error, secrets=(reply_token,)),
+    )
+    every_rider = {index for index, rider in enumerate(batch.riders) if rider is not None}
+    if case == "unknown":
+        # LINE named nothing, so every rider is released -- but one that is in such a refusal on
+        # three replies in a row is the likely culprit and is fenced, so it cannot cost an extra
+        # failed call on every later reply for ever (review R2 GP1 #3; counted in memory).
+        fence = {
+            index
+            for index in sorted(every_rider)
+            if reply_riders.note_unnamed_refusal(batch.group_id, batch.riders[index])
+        }
+    else:
+        # LINE could have named them and did not (or named them along with the primary): the
+        # run of unnamed refusals is over.
+        reply_riders.clear_unnamed_refusals(batch.group_id, batch.riders)
+        fence = set(hits) if case == "riders" else frozenset()
+    batch.remove_riders(every_rider, fence=fence, orphans="release")
+    if primary_suppressed:  # a reply of riders only: nothing is left to send
+        return _ReplyRecovery("rejected", None, error, False)
+
+    if case == "riders":
+        # The primary was not named: it goes alone as it was built (mention and all).
+        status, payload = _reply_attempt(
+            reply_token, list(batch.messages), send_fence, menu_buttons=menu_buttons, group_id=group_id
+        )
+        if status == "accepted":
+            logger.info("reply accepted without the refused rider(s) group=%s", group_id)
+            return _ReplyRecovery("accepted", payload, None, False)
+        if status == "ambiguous":
+            return _ReplyRecovery("ambiguous", None, payload, False)
+        if _is_definite_reply_token_error(payload):
+            # LINE may spend the token on a refusal: the push is all that is left, and the
+            # primary was never accused, so it keeps its usual form.
+            return _ReplyRecovery("rejected", None, payload, False)
+        # LINE refused the primary after all, without naming it: plain text below.
+
+    plain = _sanitized_plain_text_message(text)
+    status, payload = _reply_attempt(
+        reply_token, [plain], send_fence, menu_buttons=menu_buttons, group_id=group_id
+    )
+    if status == "rejected":
+        return _ReplyRecovery("rejected", None, payload, True)
+    batch.messages[:] = [plain]
+    if status == "accepted":
+        logger.info("reply accepted as one plain text message group=%s", group_id)
+        return _ReplyRecovery("accepted", payload, None, False)
+    return _ReplyRecovery("ambiguous", None, payload, False)
+
+
 def _reply(
     reply_token: str,
     text: str,
@@ -23240,6 +23681,12 @@ def _reply(
 
     只有 LINE 明確接受 reply 或 fallback push 時回傳 True；模糊失敗、
     靜音或內容被抑制時回傳 False，讓需要 durable cleanup 的 caller 判斷。
+
+    2026-10-24（B6.3）：文字回覆被 LINE 以 400 拒絕、而且不是 token 的問題時，不再整則放棄——依
+    ``details[].property`` 找出被拒的那一則（`_recover_rejected_reply`）：只點名搭車訊息（提醒、確認、
+    運動提醒）→ 那些圍住、其他搭車的放掉，主訊息照原樣單獨再送；點名主訊息或點名不出來 → 搭車的全部放掉，
+    主訊息改純文字單獨再送一次。搭車訊息絕不改成純文字重送。再被拒才 push（只在批次 1 的圍欄規則允許時）；
+    含糊結果一律留著圍欄、不 push。選單與 Flex 卡片不走這條。
 
     settings.bot_muted=True 時整個函式 short-circuit:
     不 reply、不 push、只把原本要送的 text 寫進 log 方便除錯。
@@ -23283,7 +23730,8 @@ def _reply(
     # LINE 單則訊息上限 5000 字；在截斷前先預留 footer 空間
     footer = _get_quota_footer()
     if not primary_suppressed:
-        text = text[: 4900 - len(footer)] + footer
+        # LINE counts UTF-16 code units, not characters (2026-10-24)
+        text = line_mentions.clip_utf16(text, 4900 - line_mentions.utf16_len(footer)) + footer
     if not primary_suppressed and _is_system_status_outbound(text):
         logger.info(
             "suppressed system-status LINE reply group=%s preview=%r",
@@ -23354,6 +23802,11 @@ def _reply(
     message_reminder_refs: list[dict | None] = (
         [] if primary_suppressed else [primary_reminder_ref]
     )
+    # Aligned with messages_to_send (None for the primary): what each rider holds.  Used to settle
+    # the riders one by one when LINE refuses a text reply with a 400 that names a message
+    # (_recover_rejected_reply); never keyed by id(message), the list is rebuilt by drop_indexes.
+    riders: list[reply_riders.Rider | None] = [] if primary_suppressed else [None]
+    nudge_slot: reply_riders.NudgeSlot | None = None
     pending_commit_ids: list[str] = []
     pending_confirmation_claims: list[tuple[int, str]] = []
     confirmations_committed = False
@@ -23405,6 +23858,11 @@ def _reply(
                             )
                             messages_to_send.append(pig_message)
                             message_reminder_refs.append(None)
+                            riders.append(
+                                reply_riders.Rider(
+                                    "pending", f"pending:{msg_id or ''}", commit_id=msg_id or None
+                                )
+                            )
                             if msg_id:
                                 pending_commit_ids.append(msg_id)
                             logger.info(
@@ -23448,9 +23906,15 @@ def _reply(
                         )
                         messages_to_send.append(confirmation_message)
                         message_reminder_refs.append(None)
+                        riders.append(
+                            reply_riders.Rider(
+                                "confirmation", f"confirmation:{claim[0]}", confirmation=claim
+                            )
+                        )
                 except Exception as e:
                     del messages_to_send[confirmation_start:]
                     del message_reminder_refs[confirmation_start:]
+                    del riders[confirmation_start:]
                     if pending_confirmation_claims:
                         try:
                             memory.release_reminder_confirmations(
@@ -23499,6 +23963,9 @@ def _reply(
                                 continue
                             pending_reminder_indexes.append(len(messages_to_send))
                             messages_to_send.append(reminder_message)
+                            riders.append(
+                                reply_riders.Rider("event", f"event:{e.get('event_id')}")
+                            )
                             message_reminder_refs.append(
                                 {
                                     "source_kind": (
@@ -23563,6 +24030,9 @@ def _reply(
                                     explicit_only=True,
                                 )[1]
                             )
+                            riders.append(
+                                reply_riders.Rider("natural", f"reminder:{int(item['reminder_id'])}")
+                            )
                             message_reminder_refs.append(
                                 {
                                     "reminder_id": int(item["reminder_id"]),
@@ -23619,6 +24089,7 @@ def _reply(
             else:
                 kept_event_reminders.append((event_id, offset))
                 event_delivery_claims.append(claim)
+                riders[idx].event_claims.append(claim)
         kept_natural_reminders: list[dict] = []
         for idx, item in zip(
             pending_reminder_push_indexes, pending_reminder_pushes
@@ -23669,6 +24140,7 @@ def _reply(
             else:
                 kept_natural_reminders.append(item)
                 natural_delivery_claims.append(claim)
+                riders[idx].natural_claims.append(claim)
         # 2026-10-05 (S10 i, fixC12): a calendar-mirror row or a 前一天／當天
         # row and the reminder for the same real-world event go out as one
         # message, the reminder's.  The rider's claim stays, so both are marked
@@ -23694,6 +24166,15 @@ def _reply(
                 riding = {}
             for rider_live in riding:
                 drop_indexes.add(pending_reminder_push_indexes[live[rider_live]])
+                try:
+                    # the dropped message keeps its claim; it is settled with the carrier's message
+                    reply_riders.fold_claims(
+                        riders,
+                        pending_reminder_push_indexes[live[rider_live]],
+                        pending_reminder_push_indexes[live[riding[rider_live]]],
+                    )
+                except Exception as fold_error:
+                    logger.warning("rider claim folding skipped: %s", type(fold_error).__name__)
         # 2026-10-04 (P4 v3 item 6): a calendar item and a reminder item for the
         # same real-world event go out as one message, the reminder's.  The
         # calendar claim stays, so both are marked once LINE accepts the batch
@@ -23721,6 +24202,14 @@ def _reply(
                 event_index = pending_reminder_indexes[event_position]
                 if event_index not in drop_indexes:
                     drop_indexes.add(event_index)
+                try:
+                    reply_riders.fold_claims(
+                        riders,
+                        event_index,
+                        pending_reminder_push_indexes[live[covered[event_position]]],
+                    )
+                except Exception as fold_error:
+                    logger.warning("rider claim folding skipped: %s", type(fold_error).__name__)
         if drop_indexes:
             messages_to_send = [
                 message
@@ -23732,6 +24221,7 @@ def _reply(
                 for idx, reference in enumerate(message_reminder_refs)
                 if idx not in drop_indexes
             ]
+            riders = [rider for idx, rider in enumerate(riders) if idx not in drop_indexes]
             pending_reminders = kept_event_reminders
             pending_reminder_pushes = kept_natural_reminders
         if not messages_to_send:
@@ -23739,6 +24229,24 @@ def _reply(
             if primary_suppressed:
                 _mark_inbound_reply_completed_no_reply(reply_token)
             return False
+        # 爸媽運動提醒（PLAN A phase 2）：只搭在咪寶本來就要送的主回覆上（沒有主訊息、卡片、不帶輔助訊息的
+        # 回覆都不放），排在最後、不擠掉到期提醒（要有空位）。開關關著時連候選都不看：零 DB、零 import。
+        # 訊息先組好驗過，再搶今天的去重列（claim 裡會重算一次資格）；搶到才放進這次的回覆。
+        if (
+            group_id
+            and not primary_suppressed
+            and include_auxiliary
+            and flex_card is None
+            and len(messages_to_send) < 5
+            and _exercise_nudge_on()
+        ):
+            nudge_slot, nudge_message = _claim_exercise_nudge_for_reply(reply_token, group_id)
+            if nudge_slot is not None:
+                messages_to_send.append(nudge_message)
+                message_reminder_refs.append(None)
+                riders.append(
+                    reply_riders.Rider("nudge", "nudge", slot=nudge_slot)
+                )
         if menu_buttons:
             # LINE shows only the last message's Quick Reply.
             _attach_menu_buttons(messages_to_send[-1], group_id)
@@ -23775,6 +24283,7 @@ def _reply(
                     group_id,
                 )
                 return False
+        send_error: BaseException | None = None
         try:
             reminder_delivery_started = bool(
                 event_delivery_claims or natural_delivery_claims
@@ -23783,17 +24292,79 @@ def _reply(
                 resp = MessagingApi(api_client).reply_message(reply_request)
                 _mark_inbound_reply_succeeded(reply_token)
                 _settle_inbound_fence_replied(send_fence)
-        except Exception as e:
+        except Exception as send_exc:
+            send_error = send_exc
+        # 2026-10-24 (B6.3): a *text* reply that LINE refuses with a 400 which is not about the
+        # token is not given up on: the refused rider is told apart and left out, the primary goes
+        # alone -- as it was built, or as plain text (see _recover_rejected_reply).  Menu,
+        # large-menu and Flex command cards never fall back to plain text (an altText is not a
+        # message to push), so they skip this.
+        recovered_rejected = False
+        plain_push = False
+        if (
+            send_error is not None
+            and not (menu_card or large_menu_card or flex_card is not None)
+            # a degraded receipt Andrew rejected is not worth a second delivery path: a refusal
+            # ends it (below), as before
+            and not user_rejected_primary
+            and line_errors.is_bad_request(send_error)
+            and not _is_definite_reply_token_error(send_error)
+        ):
+            try:
+                recovery = _recover_rejected_reply(
+                    reply_token=reply_token,
+                    group_id=group_id,
+                    text=text,
+                    primary_suppressed=primary_suppressed,
+                    batch=reply_riders.Batch(
+                        group_id=group_id or "",
+                        messages=messages_to_send,
+                        refs=message_reminder_refs,
+                        riders=riders,
+                        event_claims=event_delivery_claims,
+                        natural_claims=natural_delivery_claims,
+                        confirmation_claims=pending_confirmation_claims,
+                        commit_ids=pending_commit_ids,
+                    ),
+                    error=send_error,
+                    send_fence=send_fence,
+                    menu_buttons=menu_buttons,
+                )
+            except Exception as recovery_error:
+                # A bug here must never turn a refused reply into a second copy: whatever was
+                # sent is unknown, so it is handled as an ambiguous send (the fence stays).
+                logger.error(
+                    "reply recovery failed error_type=%s", type(recovery_error).__name__
+                )
+                recovery = _ReplyRecovery("ambiguous", None, recovery_error, False)
+            if recovery.outcome == "accepted":
+                resp = recovery.resp
+                send_error = None
+            else:
+                send_error = recovery.error
+                recovered_rejected = recovery.outcome == "rejected"
+                plain_push = recovery.plain_push
+        if send_error is not None:
+            e = send_error
             delivery_claims = [
                 *event_delivery_claims,
                 *natural_delivery_claims,
             ]
-            definite_reply_failure = _is_definite_reply_token_error(e)
+            token_dead = _is_definite_reply_token_error(e)
+            # LINE refused everything it was given (recovery), or the token is dead: nothing was
+            # delivered, a push may follow where the fence rules allow it.
+            definite_reply_failure = token_dead or recovered_rejected
             if definite_reply_failure:
                 memory.release_reminder_delivery_claims(delivery_claims)
             else:
                 memory.mark_reminder_delivery_claims_uncertain(delivery_claims)
             reminder_delivery_settled = True
+            if nudge_slot is not None and not nudge_slot.settled:
+                # Definitely not delivered (token error, a 4xx) -> the dedupe row goes back;
+                # ambiguous -> it stays: better one nudge too few than one too many.
+                if definite_reply_failure or line_errors.is_client_error(e):
+                    reply_riders.release_nudge(group_id or "", nudge_slot)
+                nudge_slot.settled = True
             logger.warning(
                 "reply failed: %s", _line_error_detail(e, secrets=(reply_token,))
             )
@@ -23843,25 +24414,37 @@ def _reply(
                     push_allowed = False
                 if not push_allowed:
                     logger.info(
-                        "reply token invalid; skip fallback push group=%s quote=%s primary_suppressed=%s",
+                        "reply refused; skip fallback push group=%s quote=%s primary_suppressed=%s token_dead=%s",
                         group_id,
                         _is_market_quote_outbound(text),
                         primary_suppressed,
+                        token_dead,
                     )
-                    # The token is dead and no push may follow: nothing more can reach the
-                    # group for this event, so a redelivery would only re-run the models.
-                    _close_inbound_event(reply_token, send_fence)
+                    if token_dead:
+                        # The token is dead and no push may follow: nothing more can reach the
+                        # group for this event, so a redelivery would only re-run the models.
+                        _close_inbound_event(reply_token, send_fence)
+                    else:
+                        # LINE refused the content, also as plain text, and no push may follow:
+                        # nothing was delivered, so the fence lifts; LINE's redelivery brings a
+                        # fresh token and the attempts cap bounds the re-runs.
+                        _release_inbound_send(send_fence)
                     return False
                 push_request_built = False
                 try:
-                    _push_text, push_message = _text_message_with_mentions(
-                        text,
-                        validation_source="reply_push_fallback_mentions",
-                        prepared=True,
-                        limit=5000,
-                        explicit_only=True,
-                        reply_targets=reply_targets,
-                    )
+                    if plain_push:
+                        # LINE refused the content of this reply (also the retry): the push
+                        # carries the answer as one sanitized plain text message.
+                        push_message = _sanitized_plain_text_message(text)
+                    else:
+                        _push_text, push_message = _text_message_with_mentions(
+                            text,
+                            validation_source="reply_push_fallback_mentions",
+                            prepared=True,
+                            limit=5000,
+                            explicit_only=True,
+                            reply_targets=reply_targets,
+                        )
                     push_request_built = True
                     with ApiClient(_get_line_config()) as api_client:
                         push_response = MessagingApi(api_client).push_message(
@@ -23941,6 +24524,14 @@ def _reply(
                     # else: timeout / 5xx -- the push may have gone out; the fence stays.
             return False
 
+        if nudge_slot is not None and not nudge_slot.settled:
+            # LINE accepted the batch with the nudge in it: its dedupe row stays (72 h cap).
+            # Settled first, so nothing below can hand it back.
+            nudge_slot.settled = True
+            logger.info("exercise nudge delivered group=%s", group_id)
+        # What rode on a reply LINE accepted is not suspect any more (review R2 GP1 #3).
+        reply_riders.clear_unnamed_refusals(group_id or "", riders)
+
         if pending_commit_ids and group_id:
             try:
                 removed = _commit_pending_removal(group_id, pending_commit_ids)
@@ -23984,9 +24575,17 @@ def _reply(
                     if sm_id:
                         sent_text = text
                         if idx < len(messages_to_send):
-                            sent_text = getattr(messages_to_send[idx], "text", text)
+                            sent_text = _archived_text(messages_to_send[idx], text)
                         # 只有主訊息（FCN）不進 recall；搭車的到期提醒照常索引。
                         primary_kwargs = archive_kwargs if idx == 0 and not primary_suppressed else {}
+                        rider = riders[idx] if idx < len(riders) else None
+                        if rider is not None and rider.slot is not None:
+                            # 運動提醒：存檔只存固定句（不含日期、項目），而且不進 recall——
+                            # raw_messages 的 bot 列有幾條路徑直接讀進模型輸入（review、月精華、embedding）。
+                            sent_text = str(
+                                getattr(rider.slot.nudge, "archive_text", "") or "爸媽健康：運動提醒"
+                            )
+                            primary_kwargs = {"index_for_recall": False}
                         memory.log_raw_message(group_id, sm_id, "__bot__", sent_text, **primary_kwargs)
                         reference = (
                             message_reminder_refs[idx]
@@ -24050,6 +24649,11 @@ def _reply(
                 )
             except Exception as e:
                 logger.warning("reminder confirmation release failed: %s", e)
+        if nudge_slot is not None and not nudge_slot.settled:
+            # Nothing was sent (fence blocked, nothing built, an exception on the way): the
+            # nudge's dedupe row goes back, so the parent is not skipped for 72 hours for nothing.
+            reply_riders.release_nudge(group_id or "", nudge_slot)
+            nudge_slot.settled = True
         if pending_slot is not None:
             pending_slot.release()
     return True

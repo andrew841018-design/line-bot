@@ -131,7 +131,7 @@ def test_menu_button_is_the_market_command(monkeypatch):
     labels = dict(flex_menu.BUTTONS)
     assert labels.get("🧭 市場盤勢") == "/盤勢"
     assert "🚦 過濾規則" not in labels
-    assert len(flex_menu.BUTTONS) == 13
+    assert len(flex_menu.BUTTONS) == 12  # 2026-10-24: 財經觀點 拿掉，13 → 12
     reply, _cancel, _add, _handle = _routed("/盤勢", monkeypatch)
     assert reply.call_args.kwargs["menu_buttons"] is True
 

@@ -13,11 +13,12 @@ NO_REPEAT_CONTRACT = """【不重複、不摘要：只給新價值】
 回覆裡的每一句都必須至少屬於下列一種，不屬於就刪掉：
 1. 糾正：群友或素材說錯、過時、以偏概全或誤解的地方——直接指出哪裡不對、正確是什麼、依據是什麼。
 2. 建議：對方還沒提到、可以直接照做的具體做法、替代方案或要避開的風險。
-3. 新資訊／新觀點：對方訊息裡沒有的事實、數字、原因、例外或不同角度。
+3. 新資訊／新觀點：對方訊息裡沒有的事實、數字、原因、例外或不同角度；但法規、稅額、免稅額度、罰則、年齡限制的數字，沒有附上的資料就不要寫。
 下筆前先在內部逐項檢查對方的說法有沒有錯；有錯先糾正，不要先附和。
 不要重複群友或 bot 已傳過的訊息，也不要換句話重述、整理或摘要；此規則適用整則回覆，不只開頭。
 禁止用「確實／的確／沒錯／說得對」附和後再複述對方的話，也禁止用「這篇新聞指出／這部影片在討論／這篇文章提到」轉述素材內容。
 不要為了顯得有新資訊而編造，也不能假稱知道未提供的聊天歷史。
+群友互問、沒人點名你時，不知道就輸出空字串；不要寫「只有某某知道」「直接問某某最快」，不要猜「他」指誰，不要複述誰稍早說了什麼。
 糾正要有具體的相反證據；搜尋不到、資料沒提到，或無法查證的個人經驗與轉述，不等於對方說錯，不能據此說對方不對。
 你的記憶可能過時，不能當作近期公開事件、價格、優惠或政策的反證；沒有實際取得的資料，不能說「查到／查不到」。
 回答或糾正所需的最少原文、數字、因果與限制可以保留，但不得用回顧既有內容充當回答。沒有實質可補充內容時輸出空字串，不說明沉默原因。
@@ -34,6 +35,13 @@ NO_SEARCH_CONTRACT = """【這次回覆沒有搜尋工具——優先於上方�
 - 對方堅持、補充日期或來源，而你沒有新附的資料時，同樣不能再用記憶否認。
 - 附了資料時，只說資料寫到的內容。
 """
+
+# 2026-10-24 (B2.4): added to the prompt when someone quotes the bot's own reply and says it was
+# wrong (「明明…就有講」).  One line, opening with "(": _WRAPPER_TEXT_RE keeps it out of the user's words.
+DISPUTE_NOTE = (
+    "(對方在糾正你上一則回覆；沒有新的依據就不要重申原本的說法，可以直接說你剛剛可能說錯了；"
+    "有依據才說明正確的是什麼。)"
+)
 
 RESTATEMENT_RETRY_PROMPT = (
     "上次回覆在附和或重述使用者／素材已經講過的內容（{reason}）。重寫：\n"
@@ -97,6 +105,7 @@ _WRAPPER_TEXT_RE = re.compile(
     r"|\(下面是使用者目前這則回覆；[^\n]*"
     r"|\(下面是群組裡最近累積的訊息[^\n]*"
     r"|\(使用者點名你之前，群組剛貼了下面這則訊息[^\n]*"
+    r"|\(對方在糾正你上一則回覆[^\n]*"
     r"|（以下是連結[^\n]*）"
     r"|原文(?:網址|連結|出處)"
 )
@@ -213,6 +222,13 @@ _CORRECTION_MARKER_RE = re.compile(
     r"並未|並沒有|未提及|沒有提到|沒提到|沒有包含|未包含|查無|不實|假的"
 )
 
+# 2026-10-24 (B2): 「沒有提到」「並未」 said about material that was only partly read
+# (a title and description, a cut transcript, search snippets) is not a correction.
+_CORRECTION_MARKER_PARTIAL_RE = re.compile(
+    r"不對|(?<!沒)(?<!沒有)錯|其實|並非|並不|不是|誤|但|不過|然而|更正|正確|過時|過期|舊的|已經改|已改|"
+    r"不實|假的"
+)
+
 _MATERIAL_NOUN = (
     r"(?:新聞|報導|報道|影片|視頻|短片|文章|貼文|節目|訊息|影音|圖文|內容|懶人包|網頁|連結|直播|podcast)"
 )
@@ -230,6 +246,14 @@ _NARRATION_RES = (
     ),
     re.compile(
         r"^(?:影片|節目|文章|新聞|報導|貼文)(?:中|裡|裏)(?:確實|也|主要)?" + _NARRATION_VERB + r"(?!的)"
+    ),
+    # 2026-10-24: 「影片中某某討論的內容，主要聚焦在…」 (a retelling of what the video is about) — the gap is bounded
+    re.compile(
+        r"^(?:(?:這|該|此|那|本)(?:一)?(?:則|篇|個|支|部|段|份|條|集)?)?"
+        r"(?:影片|節目|文章|新聞|報導|貼文|直播)(?:中|裡|裏)[^，,。！？!?\n]{0,20}?"
+        r"(?:討論|談論|探討|談到|提到|提及|講述|介紹|分享|說明|表示|指出)的(?:內容|部分|重點|主題|議題)"
+        r"[，,]? ?(?:主要|大多|大致|大部分|多半|基本上|則|其實)?"
+        r"(?:聚焦|集中|著重|圍繞|環繞|關於|在講|在談|在說|是在|是關於)(?!的)"
     ),
     re.compile(
         r"^(?:主持人|作者|講者|記者|原po|原PO|樓主|發文者|影片作者|原作者)"
@@ -451,10 +475,14 @@ def _is_sentence(segment: str) -> bool:
     return bool(segment.strip()) and "\n" not in segment
 
 
-def _narration(sentence: str) -> bool:
-    """Retelling shared material; "這篇報導提到的數據是錯的" is a correction."""
+def _narration(sentence: str, partial: bool = False) -> bool:
+    """Retelling shared material; "這篇報導提到的數據是錯的" is a correction.
+
+    ``partial``: the material was only partly read, so 「並未提及」「沒有提到」 do not
+    make a sentence a correction (they only say something about what was not read).
+    """
     s = _LEADING_DECOR_RE.sub("", sentence.strip())
-    if _CORRECTION_MARKER_RE.search(s):
+    if (_CORRECTION_MARKER_PARTIAL_RE if partial else _CORRECTION_MARKER_RE).search(s):
         return False
     if any(p.search(s) for p in _NARRATION_RES):
         return True
@@ -470,11 +498,12 @@ def _cjk_trigrams(text: str) -> set[str]:
     return {s[i:i + 3] for i in range(len(s) - 2)}
 
 
-def _copied(sentence: str, source_grams: set[str]) -> bool:
+def _copied(sentence: str, source_grams: set[str], partial: bool = False) -> bool:
     """Near-verbatim repeat of what the group said (URLs, quotes, ops lines excluded)."""
     if not source_grams or len(_CJK_RE.findall(sentence)) < _COPY_MIN_CHARS:
         return False
-    if _CORRECTION_MARKER_RE.search(sentence) or _COPY_EXEMPT_RE.search(sentence):
+    marker = _CORRECTION_MARKER_PARTIAL_RE if partial else _CORRECTION_MARKER_RE
+    if marker.search(sentence) or _COPY_EXEMPT_RE.search(sentence):
         return False
     grams = _cjk_trigrams(sentence)
     return bool(grams) and len(grams & source_grams) / len(grams) >= _COPY_CONTAINMENT
@@ -487,6 +516,7 @@ def restatement_findings(
     user_text: str | None = None,
     check_copy: bool = True,
     addressed: bool = True,
+    partial: bool = False,
 ) -> list[tuple[int, str]]:
     """Return ``(segment_index, kind)`` for sentences that only restate.
 
@@ -495,7 +525,8 @@ def restatement_findings(
     requested and defaults to ``source_text``.  ``check_copy=False`` skips
     the verbatim-copy check for prompts whose material is the bot's own
     research rather than something the group already said.  ``addressed``
-    is False for group chatter nobody directed at the bot.
+    is False for group chatter nobody directed at the bot.  ``partial``: the
+    material was only partly read (2026-10-24, see ``_narration``).
     """
     if not (reply or "").strip():
         return []
@@ -509,11 +540,11 @@ def restatement_findings(
     for idx, segment in enumerate(_segments(reply)):
         if not _is_sentence(segment):
             continue
-        if _narration(segment):
+        if _narration(segment, partial):
             findings.append((idx, "narration"))
         elif not first_seen and not answers_question and _agreement_opener(segment):
             findings.append((idx, "agreement_opener"))
-        elif _copied(segment, source_grams):
+        elif _copied(segment, source_grams, partial):
             findings.append((idx, "copied"))
         first_seen = True
     return findings
@@ -526,11 +557,12 @@ def restatement_reason(
     user_text: str | None = None,
     check_copy: bool = True,
     addressed: bool = True,
+    partial: bool = False,
 ) -> str:
     """Short machine-readable reason, or ``""`` when the reply adds value."""
     findings = restatement_findings(
         reply, source_text, user_text=user_text, check_copy=check_copy,
-        addressed=addressed,
+        addressed=addressed, partial=partial,
     )
     if not findings:
         return ""
@@ -545,6 +577,7 @@ def strip_restatement(
     user_text: str | None = None,
     check_copy: bool = True,
     addressed: bool = True,
+    partial: bool = False,
 ) -> str:
     """Drop restating sentences; return ``""`` if nothing substantive remains."""
     request = source_text if user_text is None else user_text
@@ -552,7 +585,7 @@ def strip_restatement(
         return reply
     findings = restatement_findings(
         reply, source_text, user_text=user_text, check_copy=check_copy,
-        addressed=addressed,
+        addressed=addressed, partial=partial,
     )
     drop = {idx for idx, _ in findings}
     kept = "".join(seg for idx, seg in enumerate(_segments(reply)) if idx not in drop)
@@ -1571,7 +1604,9 @@ _DISPUTE_RE = re.compile(
     r"(?<!對)不對|不正確|不是這樣|不是這麼|沒有這回事|沒這回事|哪有這(?:回|種)事|根本沒有|"
     r"亂講|亂說|胡說|胡扯|瞎說|瞎扯|造謠|謠言|假的|假新聞|不實|有誤|離譜|誤導|查不到|"
     r"找不到(?:這|相關|任何)?(?:則|篇|個)?(?:新聞|報導|資料|來源)|你確定|確定嗎|哪來的|"
-    r"根據呢|來源呢|出處呢"
+    r"根據呢|來源呢|出處呢|"
+    # 2026-10-24 (B2.4): 「明明…有講」「有沒有看到…」「不是吧」 (telling the bot its own reply was wrong); the gap is bounded
+    r"明明[^，,。！？!?\n]{0,20}?有(?:講|說|提|寫)|有沒有看到|不是吧"
 )
 
 
