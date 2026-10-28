@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -16,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+import line_mentions
 import main
 import output_validator
 import parent_health as ph
@@ -570,13 +572,12 @@ def test_the_disabled_stub_never_nudges(on):
 # 被 LINE 點名拒絕 -> 留著（圍住：不要每次回覆都再試），而且不會改成純文字重送；送出前就結束 -> 放掉。
 # 存檔只存固定句，不含日期、項目。
 
-from test_reply_400_recovery import (  # noqa: E402  (共用的假 LINE 與錯誤本體)
+from test_support_fake_line import (  # noqa: E402  (共用的假 LINE 與錯誤本體；2026-10-28 起不再從別的測試檔 import)
     BAD_TOKEN,
-    FakeLine,
-    _FakeApiClient,
     api_error,
     bad,
     due_natural,
+    install_fake_line,
     kinds,
     raw_bot_texts,
     texts,
@@ -589,15 +590,7 @@ NEEDLES = ("散步", "10/16")  # 提醒句裡的項目與日期：任何存檔�
 
 @pytest.fixture()
 def line(monkeypatch):
-    fake = FakeLine()
-    monkeypatch.setattr(main.settings, "bot_muted", False)
-    monkeypatch.setattr(main, "_pending_reply_enabled", lambda: False)
-    monkeypatch.setattr(main, "_reminder_reply_piggyback_enabled", lambda: False)
-    monkeypatch.setattr(main, "ApiClient", _FakeApiClient)
-    monkeypatch.setattr(main, "MessagingApi", lambda _client: fake)
-    monkeypatch.setattr(main, "_get_line_config", lambda: object())
-    monkeypatch.setattr(main, "_inbound_reply_by_token", {})
-    return fake
+    return install_fake_line(monkeypatch)
 
 
 def arm(token=T):
@@ -898,3 +891,88 @@ def test_the_main_reply_does_not_vanish_when_the_nudge_is_refused_with_the_real_
 
     assert texts(line.replies[-1]) == [SAY] and main.memory.get_inbound_event_status(G, "M1") == "replied"
     assert kept() is not None and not line.pushes
+
+
+# ═══ 審查 R2（2026-10-28）：提醒句不進 log、提醒不能變成純文字 ═════════════════════════════════════
+
+
+def test_a_textv2_that_cannot_be_built_drops_the_nudge_instead_of_sending_a_literal_label(
+    on, pinned_clock, line, monkeypatch, caplog
+):
+    """(R2 GP2 #5) `_text_message_with_mentions` falls back to a plain TextMessage when the textV2
+    message cannot be built; for the nudge that is a literal 「@爸爸」 that pings nobody.  The
+    nudge is a real mention (checked by message type) or it is dropped -- and never claimed."""
+    nudge = arm()
+
+    def cannot_build(*_args, **_kwargs):
+        raise ValueError("textV2 cannot be built: " + nudge.text)
+
+    monkeypatch.setattr(line_mentions, "sdk_message_from_text_v2_dict", cannot_build)
+    caplog.set_level(logging.DEBUG)
+
+    assert main._exercise_nudge_message(nudge) is None  # (the fallback exists: see the next test)
+    assert say() is True
+
+    assert kinds(line.replies[0]) == ["TextMessage"] and texts(line.replies[0]) == [SAY]
+    assert all("@爸爸" not in text for batch in line.replies for text in texts(batch))
+    assert kept() is None  # dropped before anything was claimed
+    no_trace()
+    assert all(needle not in caplog.text for needle in NEEDLES), "the log carried the nudge sentence"
+
+
+def test_the_plain_text_fallback_of_the_helper_is_what_the_type_check_rejects(on, monkeypatch):
+    nudge = ph.ExerciseNudge(role="爸爸", user_id="U_DAD", text="@爸爸\n上次聽到你去散步是 10/16，這幾天有空的話出去走走吧～",
+                             label="@爸爸")
+    target = line_mentions.MentionTarget(key="p1", kind="user", user_id="U_DAD", label="@爸爸")
+    kwargs = dict(validation_source="exercise_nudge", prepared=True, limit=5000, explicit_only=True, reply_targets=[target])
+    _text, real = main._text_message_with_mentions(nudge.text, **kwargs)
+    assert type(real).__name__ == "TextMessageV2" and real.substitution
+
+    def cannot_build(*_args, **_kwargs):
+        raise RuntimeError("textV2 cannot be built")
+
+    monkeypatch.setattr(line_mentions, "text_v2_dict", cannot_build)
+    _text, fallback = main._text_message_with_mentions(nudge.text, **kwargs)
+    assert type(fallback).__name__ == "TextMessage" and fallback.text.startswith("@爸爸")  # the literal label
+    assert main._exercise_nudge_message(nudge) is None
+
+
+def test_the_validator_log_site_never_prints_the_nudge_sentence(on, monkeypatch, caplog):
+    """(R2 GP2 #4, main.py `_prepare_outbound_text`) a blocked sentence is logged with a preview for
+    every message kind but the nudge, whose text is health text: reason code only."""
+    sentence = "@爸爸\n上次聽到你去散步是 10/16，這幾天有空的話出去走走吧～"
+    blocked = output_validator.ValidationResult(ok=False, text="", reason="internal_trace_leak")
+    monkeypatch.setattr(output_validator, "validate_outbound_text", lambda _text: blocked)
+    caplog.set_level(logging.DEBUG)
+
+    assert main._prepare_outbound_text(sentence, source="exercise_nudge") == ""
+
+    assert "source=exercise_nudge reason=internal_trace_leak" in caplog.text
+    assert all(needle not in caplog.text for needle in NEEDLES)
+    caplog.clear()
+    main._prepare_outbound_text(sentence, source="reply")  # the control: other messages keep their preview
+    assert "散步" in caplog.text
+
+
+def test_the_mention_log_site_never_prints_what_the_exception_carries(on, monkeypatch, caplog):
+    """(R2 GP2 #4, main.py `_text_message_with_mentions`) a pydantic error embeds the input it refused."""
+    sentence = "@爸爸\n上次聽到你去散步是 10/16，這幾天有空的話出去走走吧～"
+    target = line_mentions.MentionTarget(key="p1", kind="user", user_id="U_DAD", label="@爸爸")
+
+    def refuses(*_args, **_kwargs):
+        raise ValueError("input_value=" + sentence)
+
+    monkeypatch.setattr(line_mentions, "text_v2_dict", refuses)
+    caplog.set_level(logging.DEBUG)
+
+    main._text_message_with_mentions(
+        sentence, validation_source="exercise_nudge", prepared=True, limit=5000, explicit_only=True, reply_targets=[target]
+    )
+
+    assert "build mention reply failed" in caplog.text and "error_type=ValueError" in caplog.text
+    assert all(needle not in caplog.text for needle in NEEDLES)
+    caplog.clear()
+    main._text_message_with_mentions(  # the control: another message kind keeps the exception text
+        sentence, validation_source="reply_mentions", prepared=True, limit=5000, explicit_only=True, reply_targets=[target]
+    )
+    assert "input_value=" in caplog.text

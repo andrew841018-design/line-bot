@@ -22,12 +22,22 @@ primary message).  It is deliberately not keyed by ``id(message)``: ``drop_index
 message list, a dropped message can be garbage-collected and its id reused by a message built
 later.
 
+Two counters live here, in memory only (a restart starts them again; both only ever make the bot
+*stop* trying, so losing them costs a few more refused calls, never a duplicate):
+
+* a rider that LINE refuses *without naming it* is released and rides again.  When it is in such a
+  refusal on `UNNAMED_REFUSALS_BEFORE_FENCE` replies in a row it is fenced instead, so it cannot
+  cost an extra failed call on every later reply for ever (review R2 GP1 #3);
+* an acknowledgement that is fenced stays claimed and comes back after its claim lapses; the third
+  time LINE refuses it, it is given up (review R2 GP1 #6).
+
 Nothing here touches the network.  Logs carry kinds and ids, never the text of a message.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -38,6 +48,61 @@ logger = logging.getLogger(__name__)
 # What LINE accepts for one plain text message is 5000 UTF-16 units; a little less is kept so a
 # footer or a rider's own prefix never tips it over.
 PLAIN_TEXT_LIMIT = 4900
+
+# A rider in this many refusals in a row that named no message is fenced (the reply that makes the
+# count reach it fences the rider; the ones before it released it).
+UNNAMED_REFUSALS_BEFORE_FENCE = 3
+# A fenced acknowledgement is claimed again after its claim lapses; this many fenced refusals and
+# it is not tried any more.
+FENCED_ACK_ATTEMPTS = 3
+_COUNTER_MAX = 256  # per table; the oldest entry goes first
+
+_counter_lock = threading.Lock()
+_unnamed_streak: dict[tuple[str, str], int] = {}  # (group_id, rider label) -> refusals in a row
+_fenced_acks: dict[tuple[str, int], int] = {}  # (group_id, confirmation_id) -> times fenced
+
+
+def _bump(table: dict, key: tuple) -> int:
+    """Count one more for ``key`` (it moves to the end, so the oldest entry is the first to go)."""
+    with _counter_lock:
+        count = table.pop(key, 0) + 1
+        table[key] = count
+        while len(table) > _COUNTER_MAX:
+            table.pop(next(iter(table)))
+        return count
+
+
+def reset_counters() -> None:
+    """Forget both counters (tests; a process restart does the same)."""
+    with _counter_lock:
+        _unnamed_streak.clear()
+        _fenced_acks.clear()
+
+
+def note_unnamed_refusal(group_id: str, rider: "Rider") -> bool:
+    """``rider`` was in a request LINE refused without naming any message.  True when that has now
+    happened `UNNAMED_REFUSALS_BEFORE_FENCE` times in a row: the caller fences it (and the run is
+    over, so the count starts again)."""
+    key = (group_id, rider.label)
+    if _bump(_unnamed_streak, key) < UNNAMED_REFUSALS_BEFORE_FENCE:
+        return False
+    with _counter_lock:
+        _unnamed_streak.pop(key, None)
+    return True
+
+
+def clear_unnamed_refusals(group_id: str, riders: list) -> None:
+    """These riders were delivered, or in a refusal that did not leave them under suspicion: their
+    run of unnamed refusals is over.  Never raises."""
+    try:
+        with _counter_lock:
+            if not _unnamed_streak:
+                return
+            for rider in riders:
+                if rider is not None:
+                    _unnamed_streak.pop((group_id, rider.label), None)
+    except Exception as exc:
+        logger.warning("rider refusal counts not cleared error_type=%s", type(exc).__name__)
 
 
 @dataclass
@@ -161,23 +226,55 @@ class Batch:
             )
 
     def _settle_rider(self, rider: Rider, *, fence: bool) -> None:
+        if rider.kind == "pending":
+            # A legacy pending text holds a commit id and nothing else: leaving the batch only
+            # means it is not removed from the pending store, so it stays pending.  There is
+            # nothing to fence, and the log must not say there was (review R2 GP1 #6).
+            fence = False
         self._settle_claims(rider.claims(), fence=fence)
-        if rider.confirmation is not None and not fence:
+        given_up = False
+        if rider.confirmation is not None:
             # An acknowledgement has no "uncertain" state.  Released: back to pending.  Fenced:
             # left claimed -- `claim_reminder_confirmations` hands a claim back after 600 s, so a
-            # refused acknowledgement is tried again every ten minutes, not on every reply.
-            try:
-                memory.release_reminder_confirmations(self.group_id, [rider.confirmation])
-            except Exception as exc:
-                logger.warning("confirmation not released error_type=%s", type(exc).__name__)
+            # refused acknowledgement is tried again every ten minutes, not on every reply -- until
+            # it has been fenced `FENCED_ACK_ATTEMPTS` times: then it is given up.
+            if not fence:
+                try:
+                    memory.release_reminder_confirmations(self.group_id, [rider.confirmation])
+                except Exception as exc:
+                    logger.warning("confirmation not released error_type=%s", type(exc).__name__)
+            else:
+                given_up = self._give_up_confirmation_after_attempts(rider)
         if rider.slot is not None:
             if not fence:
                 release_nudge(self.group_id, rider.slot)
             rider.slot.settled = True
-        if fence:
+        if given_up:
+            logger.warning(
+                "reply rider given up after %d refusals kind=%s id=%s",
+                FENCED_ACK_ATTEMPTS,
+                rider.kind,
+                rider.label,
+            )
+        elif fence:
             logger.warning("reply rider fenced after LINE refused it kind=%s id=%s", rider.kind, rider.label)
         else:
             logger.info("reply rider released kind=%s id=%s", rider.kind, rider.label)
+
+    def _give_up_confirmation_after_attempts(self, rider: Rider) -> bool:
+        """Count this fenced refusal of an acknowledgement; the ``FENCED_ACK_ATTEMPTS``-th one ends
+        it (status `failed`, never claimed again).  True when it was given up."""
+        key = (self.group_id, int(rider.confirmation[0]))
+        if _bump(_fenced_acks, key) < FENCED_ACK_ATTEMPTS:
+            return False
+        try:
+            memory.give_up_reminder_confirmations(self.group_id, [rider.confirmation])
+        except Exception as exc:
+            logger.warning("confirmation not given up error_type=%s", type(exc).__name__)
+            return False
+        with _counter_lock:
+            _fenced_acks.pop(key, None)
+        return True
 
     def _forget_claims(self, event: list, natural: list) -> None:
         gone_event = {id(claim) for claim in event}
@@ -201,7 +298,8 @@ class Batch:
     ) -> None:
         """Take riders out of the batch and settle each exactly once: the ones in ``fence`` are
         fenced (delivery claims -> ``uncertain``, the nudge row kept, an acknowledgement left
-        claimed), the rest released.
+        claimed -- and given up the ``FENCED_ACK_ATTEMPTS``-th time), the rest released.  A legacy
+        pending text is never fenced: it just stays pending.
         ``orphans`` says what happens to claims no rider owns: ``"keep"`` (they stay with the
         batch), ``"fence"`` or ``"release"``.  The primary message (``None`` rider) is never
         removed."""

@@ -193,12 +193,10 @@ def add_to_burst(
             _schedule_locked(group_id, SHORT_WINDOW_SECONDS, False)
 
 
-def cancel_burst(group_id: str) -> list[tuple[str, str, str | None, float]]:
-    """取消待處理的 burst（使用者後來直接 @mention，explicit 會接手）。
-
-    2026-09-27: the cancelled messages stay in the conversation and are
-    returned, so an @mention right after a shared link can still see it.
-    """
+def _cancel_queued(group_id: str) -> list[tuple[str, str, str | None, float]] | None:
+    """Take the group's queued batch out of the debounce state (the part of `cancel_burst` that
+    runs under the lock): no timer, retry or waiting flag is left, and a flush that already took
+    an older batch can no longer restore it.  The caller closes and remembers what comes back."""
     with _lock:
         generation = _generations.get(group_id, 0) + 1
         _generations[group_id] = generation
@@ -210,6 +208,16 @@ def cancel_burst(group_id: str) -> list[tuple[str, str, str | None, float]]:
         _last_reply_tokens.pop(group_id, None)
         _waiting_groups.discard(group_id)
         _retry_attempts.pop(group_id, None)
+    return pending
+
+
+def cancel_burst(group_id: str) -> list[tuple[str, str, str | None, float]]:
+    """取消待處理的 burst（使用者後來直接 @mention，explicit 會接手）。
+
+    2026-09-27: the cancelled messages stay in the conversation and are
+    returned, so an @mention right after a shared link can still see it.
+    """
+    pending = _cancel_queued(group_id)
     if pending:
         _complete_without_reply(group_id, pending)
         _remember_cancelled(group_id, pending)
@@ -339,7 +347,48 @@ def owns_message(group_id: str, message_id: str) -> bool:
         )
 
 
-def drain_for_shutdown(wait_seconds: float = 8.0) -> dict:
+def _close_for_drain(
+    group_id: str, batch: list[tuple[str, str, str | None, float]]
+) -> int:
+    """Close one batch the exit drain has taken, and remember it -- but only if it was still
+    unanswered (2026-10-28, review R2 GP2 #1).
+
+    One conditional UPDATE (`memory.mark_active_inbound_events_completed_no_reply`) closes the
+    events that are still `processing` / `media_processing`; a `reply_sending` (a reply is on its
+    way, or may have been delivered) or `replied` event is left as batch 1 wrote it.  The `[burst]`
+    memory turn is written only when at least one row changed, so a batch that was answered, or
+    that another pass of the drain closed a moment ago, is not remembered a second time.  Returns
+    the number of rows that changed; a failure is logged (type only) and counts as none.
+    """
+    message_ids = [message_id for message_id, *_rest in batch if message_id]
+    try:
+        changed = memory.mark_active_inbound_events_completed_no_reply(group_id, message_ids)
+    except Exception as exc:
+        logger.warning("burst drain: close failed error_type=%s", type(exc).__name__)
+        return 0
+    if changed:
+        _remember_cancelled(group_id, batch)
+    return int(changed)
+
+
+def _drain_queued_batches() -> tuple[int, int]:
+    """One pass over the queue: every group waiting in the debounce window (or for its one-minute
+    follow-up) is taken out and closed for the drain.  Returns ``(messages taken, rows closed)``."""
+    with _lock:
+        groups = list(_pending)
+    taken = closed = 0
+    for group_id in groups:
+        try:
+            batch = _cancel_queued(group_id)
+            if batch:
+                taken += len(batch)
+                closed += _close_for_drain(group_id, batch)
+        except Exception as exc:
+            logger.warning("burst drain: cancel failed error_type=%s", type(exc).__name__)
+    return taken, closed
+
+
+def drain_for_shutdown(wait_seconds: float = 5.0) -> dict:
     """Last chance for the messages this process still holds (2026-10-24, B7.1).
 
     The burst state lives in memory only.  A restart (SIGTERM; uvicorn first waits for the
@@ -347,53 +396,67 @@ def drain_for_shutdown(wait_seconds: float = 8.0) -> dict:
     the 8 s debounce window or in a flush thread: unanswered, unremembered, its inbound event
     stuck in `processing` until the monitor's reply-gap alert.
 
-    1. Batches still queued (debounce window, or the one-minute wait) go through `cancel_burst`:
+    1. Batches still queued (debounce window, or the one-minute wait) are taken out of the queue,
        the conversation memory gets the `[burst]` turn and the inbound events close as
-       `completed_no_reply`.  Fast, done first.
-    2. Flush threads that already own a batch get ``wait_seconds`` to finish.
-    3. Whatever is still running is closed the same way, because the process is about to exit.
+       `completed_no_reply`.  Fast, done first -- and again on every look while the flush threads
+       are given ``wait_seconds`` to finish: a flush that fails before delivery, or decides to
+       wait, puts its batch back in the queue, and that batch is drained too (2026-10-28, R2
+       GP1 #2).
+    2. Whatever flush thread is still running when the time is up is closed the same way, because
+       the process is about to exit; a batch that was put back at the last moment is caught by
+       one more look at the queue.
 
-    Remembered and closed, not answered: nobody replies to these messages after the restart.  A
-    flush thread that is still running may yet reply and write its own turn (the `[burst]` turn
-    is then in the memory twice).  Never raises and never blocks longer than ``wait_seconds``
-    plus the database writes; the result and the log carry counts only.
+    Only events that are still being handled are closed (`processing`, `media_processing`), and
+    the `[burst]` turn is written only for batches where a row actually changed: an event whose
+    reply is on its way (`reply_sending`, batch 1's fence) or was accepted is never overwritten
+    (R2 GP2 #1).  Remembered and closed, not answered: nobody replies to these messages after the
+    restart.  A flush thread that is still running may yet reply and write its own turn (the
+    `[burst]` turn is then in the memory twice).  Never raises; the caller runs it on a daemon
+    thread and stops waiting for it after a time limit (`main._run_exit_drain`).  The result and
+    the log carry counts only.
     """
     started = time.monotonic()
-    with _lock:
-        queued_groups = list(_pending)
-    queued = 0
-    for group_id in queued_groups:
-        try:
-            queued += len(cancel_burst(group_id))
-        except Exception as exc:
-            logger.warning("burst drain: cancel failed error_type=%s", type(exc).__name__)
     deadline = started + max(0.0, float(wait_seconds))
+    queued = queued_closed = 0
     while True:
+        taken, closed = _drain_queued_batches()
+        queued += taken
+        queued_closed += closed
         with _lock:
             busy = bool(_inflight)
         if not busy or time.monotonic() >= deadline:
             break
         time.sleep(0.05)
+    # The snapshot comes first and the last look at the queue second: a flush that ends between the
+    # two has put its batch back into the queue (caught by the look), and the snapshot still holds
+    # it as in flight -- closing it again changes no row, so it is not remembered twice.
     with _lock:
         leftovers = [
             (group_id, ids, _inflight_batches.get(key))
             for key, (group_id, ids) in list(_inflight.items())
         ]
-    closed = 0
+    taken, closed = _drain_queued_batches()
+    queued += taken
+    queued_closed += closed
+    inflight_closed = inflight_messages = 0
     for group_id, ids, batch in leftovers:
+        inflight_messages += len(ids)
         try:
             if batch:
-                _complete_without_reply(group_id, batch)
-                _remember_cancelled(group_id, batch)
+                inflight_closed += _close_for_drain(group_id, batch)
             elif ids:
-                memory.mark_inbound_events_completed_no_reply(group_id, list(ids))
-            closed += len(ids)
+                inflight_closed += memory.mark_active_inbound_events_completed_no_reply(
+                    group_id, list(ids)
+                )
         except Exception as exc:
             logger.warning("burst drain: close failed error_type=%s", type(exc).__name__)
     result = {
         "queued_messages": queued,
         "inflight_batches": len(leftovers),
-        "inflight_messages_closed": closed,
+        "inflight_messages_closed": inflight_closed,
+        # messages found in the queue or in flight whose event was no longer being handled
+        # (answered, being answered, closed already): left exactly as they were
+        "left_as_is": (queued - queued_closed) + (inflight_messages - inflight_closed),
         "waited_s": round(time.monotonic() - started, 1),
     }
     logger.warning("burst drain on exit: %s", result)

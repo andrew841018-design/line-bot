@@ -24,10 +24,9 @@ and the archive of a textV2 message.
 from __future__ import annotations
 
 import json
+import logging
 import time
-from datetime import datetime, timedelta
 from types import SimpleNamespace
-from zoneinfo import ZoneInfo
 
 import pytest
 from linebot.v3.messaging.exceptions import ApiException
@@ -37,81 +36,27 @@ import line_mentions
 import main
 import memory
 import reminder_push
+from test_support_fake_line import (
+    BAD_TOKEN,
+    BAD_UNNAMED,
+    GROUP,
+    MONTHLY,
+    _at,
+    _day,
+    _Resp,
+    api_error,
+    bad,
+    claims,
+    due_natural,
+    install_fake_line,
+    kinds,
+    pushed_1hr,
+    raw_bot_texts,
+    refused,
+    texts,
+)
 
-GROUP = "GRP-400"
 TOKEN = "TOKEN-SYNTHETIC-0400"
-TZ = ZoneInfo("Asia/Taipei")
-
-
-# ── fake LINE ───────────────────────────────────────────────────────────────────────────────
-
-
-class _Resp:
-    def __init__(self, status, reason, data, headers):
-        self.status, self.reason, self.data, self._headers = status, reason, data, headers
-
-    def getheaders(self):
-        return self._headers
-
-
-def api_error(status, body=None, reason="Bad Request"):
-    payload = json.dumps(body if body is not None else {"message": "x"}).encode()
-    return ApiException(http_resp=_Resp(status, reason, payload, {"x-line-request-id": "req-400"}))
-
-
-def refused(*indexes, prop="text"):
-    """LINE's 400 body naming the refused message(s)."""
-    return {
-        "message": f"The request body has {len(indexes)} error(s)",
-        "details": [{"message": "Invalid", "property": f"messages[{i}].{prop}"} for i in indexes],
-    }
-
-
-def bad(*indexes, prop="text"):
-    return api_error(400, refused(*indexes, prop=prop))
-
-
-BAD_UNNAMED = api_error(400, {"message": "The request body could not be understood"})
-BAD_TOKEN = api_error(400, {"message": "Invalid reply token"})
-MONTHLY = {"message": "You have reached your monthly limit."}
-
-
-class FakeLine:
-    """reply_message / push_message of a scripted LINE.  ``script`` holds the outcome of each
-    reply_message call in turn (an exception to raise; None accepts); ``push_script`` the same for
-    push_message.  Every call is recorded."""
-
-    def __init__(self):
-        self.script: list = []
-        self.push_script: list = []
-        self.replies: list[list] = []
-        self.pushes: list[tuple[list, str | None]] = []
-        self._ids = iter(range(1, 10**6))
-
-    def reply_message(self, request):
-        self.replies.append(list(request.messages))
-        outcome = self.script.pop(0) if self.script else None
-        if outcome is not None:
-            raise outcome
-        return SimpleNamespace(sent_messages=[SimpleNamespace(id=f"sent-{next(self._ids)}") for _ in request.messages])
-
-    def push_message(self, request, x_line_retry_key=None):
-        self.pushes.append((list(request.messages), x_line_retry_key))
-        outcome = self.push_script.pop(0) if self.push_script else None
-        if outcome is not None:
-            raise outcome
-        return SimpleNamespace(sent_messages=[SimpleNamespace(id=f"push-{next(self._ids)}") for _ in request.messages])
-
-
-class _FakeApiClient:
-    def __init__(self, _config):
-        pass
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_args):
-        return False
 
 
 @pytest.fixture(autouse=True)
@@ -124,15 +69,7 @@ def _synthetic_aliases(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def line(monkeypatch):
-    fake = FakeLine()
-    monkeypatch.setattr(main.settings, "bot_muted", False)
-    monkeypatch.setattr(main, "_pending_reply_enabled", lambda: False)
-    monkeypatch.setattr(main, "_reminder_reply_piggyback_enabled", lambda: False)
-    monkeypatch.setattr(main, "ApiClient", _FakeApiClient)
-    monkeypatch.setattr(main, "MessagingApi", lambda _client: fake)
-    monkeypatch.setattr(main, "_get_line_config", lambda: object())
-    monkeypatch.setattr(main, "_inbound_reply_by_token", {})
-    return fake
+    return install_fake_line(monkeypatch)
 
 
 @pytest.fixture()
@@ -155,55 +92,12 @@ def say(text="好的", *, token=TOKEN, group=GROUP, **kwargs):
     return main._reply(token, text, group_id=group, **kwargs)
 
 
-def kinds(batch):
-    return [type(message).__name__ for message in batch]
-
-
-def texts(batch):
-    return [str(getattr(message, "text", "") or "") for message in batch]
-
-
 # ── reminders, acknowledgements, claims ────────────────────────────────────────────────────
-
-
-def _day(offset):
-    return (datetime.now(TZ) + timedelta(days=offset)).date()
-
-
-def _at(day, hour, minute=0):
-    return int(datetime(day.year, day.month, day.day, hour, minute, tzinfo=TZ).timestamp())
-
-
-def due_natural(monkeypatch, action="繳房屋稅", *, user="U_A", day_offset=3, group=GROUP):
-    """A natural reminder due for its 1 hour notice right now.  Returns its id."""
-    day = _day(day_offset)
-    rid, outcome = memory.add_reminder_with_outcome(
-        group, user, action, _at(day, 14), source_text=f"{day.month}/{day.day} 14:00 {action}", time_kind="clock"
-    )
-    assert outcome == "created"
-    monkeypatch.setattr(reminder_push, "_now_ts", lambda: _at(day, 13))
-    return rid
-
-
-def claims():
-    """(subject_ref, state) of every delivery claim row."""
-    with memory._conn() as c:
-        return sorted(c.execute("SELECT subject_ref, state FROM reminder_delivery_claims").fetchall())
-
-
-def pushed_1hr(rid):
-    with memory._conn() as c:
-        return int(c.execute("SELECT pushed_1hr FROM reminders WHERE reminder_id=?", (rid,)).fetchone()[0])
 
 
 def confirmation_rows():
     with memory._conn() as c:
         return c.execute("SELECT source_ref, status FROM reminder_confirmation_outbox ORDER BY confirmation_id").fetchall()
-
-
-def raw_bot_texts():
-    with memory._conn() as c:
-        return [row[0] for row in c.execute("SELECT text FROM raw_messages WHERE user_id='__bot__' ORDER BY rowid").fetchall()]
 
 
 # ═══ line_errors: which message did LINE refuse? ═════════════════════════════════════════════
@@ -550,6 +444,71 @@ def test_an_ambiguous_resend_keeps_the_fence_and_the_fenced_rider_stays_fenced(l
     assert claims() == [(str(rid), "uncertain")]
 
 
+def test_a_bug_in_the_recovery_is_an_ambiguous_send_and_never_a_second_copy(line, riding, monkeypatch):
+    """(R2 GP1 #1) `_recover_rejected_reply` raises: whatever it already sent is unknown, so the reply
+    is handled as ambiguous -- the fence stays, nothing is pushed, the riders are fenced.  Flipping
+    that outcome to "rejected" would release the claims and push after a possibly-delivered call."""
+    rid = due_natural(monkeypatch)
+    open_event()
+    line.script = [bad(1)]
+
+    def broken(**_kwargs):
+        raise RuntimeError("a bug in the recovery")
+
+    monkeypatch.setattr(main, "_recover_rejected_reply", broken)
+
+    assert say(arm_mention()) is False
+
+    assert len(line.replies) == 1 and not line.pushes  # no resend, no push
+    assert status() == "reply_sending"  # the fence stays
+    assert memory.claim_inbound_reply(GROUP, ["M1"]) == ("blocked", False)
+    assert claims() == [(str(rid), "uncertain")]  # fenced, not released: it must not ride again
+    assert pushed_1hr(rid) == 0
+
+
+def test_a_bug_halfway_through_the_recovery_is_never_followed_by_a_push(line, riding, monkeypatch):
+    """The same promise one level down: the first resend was refused, the next step raises -- what
+    LINE did with the calls so far is not known to the caller, so still no push."""
+    rid = due_natural(monkeypatch)
+    open_event()
+    line.script = [bad(1), bad(0)]
+
+    def boom(_text):
+        raise RuntimeError("a bug after the first resend")
+
+    monkeypatch.setattr(main, "_sanitized_plain_text_message", boom)
+
+    assert say(arm_mention()) is False
+
+    assert len(line.replies) == 2 and not line.pushes and status() == "reply_sending"
+    assert claims() == [(str(rid), "uncertain")]
+
+
+def test_a_resend_that_cannot_even_be_built_sent_nothing_and_ends_in_a_plain_push(line, riding, monkeypatch):
+    """(R2 GP1 #1, `_reply_attempt`) a request that cannot be built never reached LINE, so the step
+    counts as refused -- not as ambiguous: the usual end of "refused everywhere" follows, one plain
+    push where batch 1's fence rules allow it.  Flipping it to "ambiguous" would drop the reply."""
+    rid = due_natural(monkeypatch)
+    open_event()
+    line.script = [bad(1)]
+    real_request = main.ReplyMessageRequest
+    builds = []
+
+    def build(**kwargs):
+        builds.append(1)
+        if len(builds) > 1:  # the first build is `_reply`'s own; every resend fails
+            raise ValueError("cannot build the resend")
+        return real_request(**kwargs)
+
+    monkeypatch.setattr(main, "ReplyMessageRequest", build)
+
+    assert say(arm_mention()) is True
+
+    assert len(line.replies) == 1  # the resends never left
+    assert len(line.pushes) == 1 and kinds(line.pushes[0][0]) == ["TextMessage"]
+    assert claims() == [(str(rid), "uncertain")] and status() == "replied"
+
+
 def test_a_refusal_that_names_no_message_releases_every_rider(line, riding, monkeypatch):
     first = due_natural(monkeypatch, "繳房屋稅", user="U_A")
     second = due_natural(monkeypatch, "拿乾洗衣物", user="U_B")
@@ -561,6 +520,97 @@ def test_a_refusal_that_names_no_message_releases_every_rider(line, riding, monk
     assert kinds(line.replies[1]) == ["TextMessage"] and texts(line.replies[1]) == ["嗨"]
     assert claims() == []  # released, not fenced
     assert pushed_1hr(first) == 0 and pushed_1hr(second) == 0  # both ride again
+
+
+def _refused_unnamed(line, n, text="嗨"):
+    """One more reply on which LINE refuses everything it is given without naming a message; the
+    resend of the primary alone goes through."""
+    open_event(f"M{n}", token=f"TOKEN-{n}")
+    line.script = [BAD_UNNAMED]
+    assert say(text, token=f"TOKEN-{n}") is True
+
+
+def test_a_rider_refused_without_a_name_on_three_replies_in_a_row_is_fenced(line, riding, monkeypatch):
+    """(R2 GP1 #3, decided by the session owner) an unnamed refusal releases the riders, but one that
+    is in such a refusal on three replies in a row is the likely culprit: fenced, so it cannot cost
+    an extra failed call and a lost mention on every later reply for ever."""
+    rid = due_natural(monkeypatch)
+
+    for n in (1, 2):
+        _refused_unnamed(line, n)
+        assert claims() == [] and pushed_1hr(rid) == 0  # released: it rides again
+        assert len(line.replies[-2]) == 2  # (the refused call carried it)
+    _refused_unnamed(line, 3)
+
+    assert claims() == [(str(rid), "uncertain")]  # the third time: fenced
+    line.replies.clear()
+    open_event("M4", token="TOKEN-4")
+    assert say("再一次", token="TOKEN-4") is True
+    assert len(line.replies) == 1 and texts(line.replies[0]) == ["再一次"]  # it does not ride any more
+
+
+def test_the_run_of_unnamed_refusals_is_counted_for_each_rider_on_its_own(line, riding, monkeypatch):
+    first = due_natural(monkeypatch, "繳房屋稅", user="U_A")
+    _refused_unnamed(line, 1)  # first: 1
+    second = due_natural(monkeypatch, "拿乾洗衣物", user="U_B")
+    _refused_unnamed(line, 2)  # first: 2, second: 1
+    _refused_unnamed(line, 3)  # first: 3 -> fenced, second: 2 -> released
+
+    assert claims() == [(str(first), "uncertain")]
+    assert pushed_1hr(second) == 0
+
+
+def test_a_delivered_ride_ends_the_run_of_unnamed_refusals(line, riding, monkeypatch):
+    rid = due_natural(monkeypatch)
+    _refused_unnamed(line, 1)
+    _refused_unnamed(line, 2)
+    open_event("M3", token="TOKEN-3")
+    # this time LINE accepts the batch with the reminder in it
+    assert say("嗨", token="TOKEN-3") is True
+    assert pushed_1hr(rid) == 1  # delivered, not fenced
+    import reply_riders
+
+    assert reply_riders._unnamed_streak == {}
+
+
+@pytest.mark.parametrize("breaker", ["named_with_the_primary", "named_alone"])
+def test_a_refusal_that_is_not_unnamed_ends_the_run(line, riding, monkeypatch, breaker):
+    rid = due_natural(monkeypatch)
+    _refused_unnamed(line, 1)
+    _refused_unnamed(line, 2)
+    open_event("M3", token="TOKEN-3")
+    line.script = [bad(0, 1)] if breaker == "named_with_the_primary" else [bad(0)]
+    assert say("嗨", token="TOKEN-3") is True  # LINE had its say and did not blame the rider alone
+    assert claims() == []
+
+    _refused_unnamed(line, 4)  # a new run: 1, not 3
+
+    assert claims() == [] and pushed_1hr(rid) == 0
+
+
+def test_the_third_unnamed_refusal_of_a_reminder_only_reply_fences_it_too(line, riding, monkeypatch):
+    """A reply of riders only (the primary is suppressed) has nothing else LINE could be refusing."""
+    rid = due_natural(monkeypatch)
+    for n in (1, 2, 3):
+        open_event(f"M{n}", token=f"TOKEN-{n}")
+        line.script = [BAD_UNNAMED]
+        assert say("Gemini 暫時忙不過來", token=f"TOKEN-{n}") is False
+    assert claims() == [(str(rid), "uncertain")]
+
+
+def test_the_streak_counter_is_bounded_and_a_fenced_rider_starts_again():
+    import reply_riders
+
+    reply_riders.reset_counters()
+    for n in range(reply_riders._COUNTER_MAX + 50):
+        assert reply_riders.note_unnamed_refusal(GROUP, reply_riders.Rider("natural", f"reminder:{n}")) is False
+    assert len(reply_riders._unnamed_streak) == reply_riders._COUNTER_MAX  # the oldest entries went first
+
+    rider = reply_riders.Rider("natural", "reminder:7")
+    assert [reply_riders.note_unnamed_refusal(GROUP, rider) for _ in range(3)] == [False, False, True]
+    assert [reply_riders.note_unnamed_refusal(GROUP, rider) for _ in range(3)] == [False, False, True]  # a run is over once it fences
+    reply_riders.clear_unnamed_refusals(GROUP, [None, rider])  # (None is the primary message)
+    assert reply_riders.note_unnamed_refusal(GROUP, rider) is False
 
 
 def test_an_index_that_does_not_exist_is_treated_as_not_named(line, riding, monkeypatch):
@@ -768,6 +818,74 @@ def test_a_sent_acknowledgement_is_still_deleted_when_nothing_is_refused(line):
     assert len(line.replies) == 1 and confirmation_rows() == []
 
 
+def test_an_acknowledgement_that_keeps_being_refused_by_name_is_given_up_the_third_time(line, caplog, monkeypatch):
+    """(R2 GP1 #6) a fenced acknowledgement stays claimed and is claimed again after 600 s, so one
+    that LINE refuses every time cost an extra failed call per ten minutes of chat for ever.  The
+    third fenced refusal ends it (status `failed`: never claimed again, never queued again)."""
+    _ack()
+    clock = {"t": time.time()}
+    monkeypatch.setattr(memory._time, "time", lambda: clock["t"])
+    caplog.set_level(logging.INFO)
+
+    for n in (1, 2, 3):
+        open_event(f"M{n}", token=f"TOKEN-{n}")
+        line.script = [bad(1)]
+        assert say("好的", token=f"TOKEN-{n}") is True
+        assert len(line.replies[-2]) == 2  # the acknowledgement rode on this one, and was refused
+        if n < 3:
+            assert confirmation_rows() == [("pending_reminder:1", "sending")]  # fenced: tried again later
+            clock["t"] += 601  # its claim lapses
+
+    assert confirmation_rows() == [("pending_reminder:1", "failed")]
+    with memory._conn() as c:
+        confirmation_id = c.execute("SELECT confirmation_id FROM reminder_confirmation_outbox").fetchone()[0]
+    given_up = [r.getMessage() for r in caplog.records if "given up" in r.getMessage()]
+    assert given_up == [f"reply rider given up after 3 refusals kind=confirmation id=confirmation:{confirmation_id}"]
+    assert all("繳管理費" not in r.getMessage() for r in caplog.records)  # the id, never the text
+
+    clock["t"] += 601
+    line.replies.clear()
+    open_event("M9", token="TOKEN-9")
+    assert say("再一次", token="TOKEN-9") is True
+    assert len(line.replies) == 1 and texts(line.replies[0]) == ["再一次"]  # nothing rides on it any more
+    assert memory.enqueue_reminder_confirmation(GROUP, "pending_reminder:1", "已新增提醒\n事項：繳管理費") == confirmation_id
+    assert confirmation_rows() == [("pending_reminder:1", "failed")]  # the same acknowledgement is not queued again
+
+
+def test_an_acknowledgement_that_is_delivered_in_between_is_not_given_up(line, monkeypatch):
+    _ack()
+    clock = {"t": time.time()}
+    monkeypatch.setattr(memory._time, "time", lambda: clock["t"])
+    open_event("M1", token="TOKEN-1")
+    line.script = [bad(1)]
+    assert say("好的", token="TOKEN-1") is True
+    clock["t"] += 601
+    open_event("M2", token="TOKEN-2")
+
+    assert say("好的", token="TOKEN-2") is True  # LINE accepts it this time
+
+    assert confirmation_rows() == []  # delivered and deleted
+
+
+def test_a_legacy_pending_rider_is_not_reported_as_fenced(caplog):
+    """(R2 GP1 #6) it holds a commit id and nothing else: leaving the batch leaves it pending, so
+    the log must say released, whatever the caller asked for."""
+    import reply_riders
+
+    rider = reply_riders.Rider("pending", "pending:m1", commit_id="m1")
+    batch = reply_riders.Batch(
+        group_id=GROUP, messages=["primary", "pending"], refs=[None, None], riders=[None, rider],
+        event_claims=[], natural_claims=[], confirmation_claims=[], commit_ids=["m1"],
+    )
+    caplog.set_level(logging.INFO)
+
+    batch.remove_riders({1}, fence={1})
+
+    assert batch.messages == ["primary"] and batch.commit_ids == []
+    assert "reply rider released kind=pending id=pending:m1" in caplog.text
+    assert "fenced" not in caplog.text
+
+
 # ── a reminder folded into another one ─────────────────────────────────────────────────────
 
 
@@ -812,6 +930,37 @@ def test_the_claim_of_a_folded_reminder_is_released_with_its_carrier(line, ridin
     assert say("嗨") is True
 
     assert claims() == [] and pushed_1hr(natural) == 0 and pushed_1hr(mirror) == 0
+
+
+@pytest.mark.parametrize(
+    "script, fenced",
+    [([bad(1)], 1), ([BAD_UNNAMED], 0), ([bad(0)], 0)],
+    ids=["carrier-named", "unnamed", "primary-named"],
+)
+def test_a_claim_no_rider_owns_is_released_when_the_reply_is_recovered(line, riding, monkeypatch, script, fenced):
+    """(R2 GP1 #1) a reminder folded into another one keeps its claim with the carrier; when the fold
+    itself failed ("rider claim folding skipped") the claim belongs to nobody in the batch.  The
+    recovery releases it: left in the batch it would be finalised as delivered once the primary
+    went through alone, and a reminder nobody saw would never be sent."""
+    import reply_riders
+
+    natural, mirror = _natural_and_later_mirror(monkeypatch)
+
+    def failing_fold(*_args, **_kwargs):
+        raise RuntimeError("fold failed")
+
+    monkeypatch.setattr(reply_riders, "fold_claims", failing_fold)
+    open_event()
+    line.script = list(script)
+
+    assert say("嗨") is True
+
+    assert len(line.replies[0]) == 2  # one message for the pair, as before
+    held = claims()
+    # only the carrier's own claim can be fenced (when LINE names it); the orphan's is released
+    assert len(held) == fenced and all(state == "uncertain" for _subject, state in held)
+    assert pushed_1hr(natural) == 0 and pushed_1hr(mirror) == 0  # neither was marked as delivered
+    assert texts(line.replies[-1]) == ["嗨"]
 
 
 def test_the_claim_of_a_calendar_event_covered_by_a_reminder_is_fenced_with_its_carrier(line, riding, monkeypatch):
@@ -904,6 +1053,55 @@ def test_utf16_length_and_clip():
     assert line_mentions.clip_utf16("a😀b", 3) == "a😀"
     assert line_mentions.clip_utf16("a😀b", 2) == "a"  # never half an emoji
     assert line_mentions.clip_utf16("abc", 0) == "" and line_mentions.clip_utf16("abc", 10) == "abc"
+
+
+def test_an_emoji_costs_two_units_when_the_template_is_clipped():
+    """(R2 GP1 #1) `_escape_and_clip` counts UTF-16 units: an emoji is 2, a brace is 2 once escaped."""
+    clip = line_mentions._escape_and_clip
+    assert clip("😀😀😀", 5) == "😀😀" and clip("😀😀😀", 6) == "😀😀😀" and clip("😀😀😀", 3) == "😀"
+    assert clip("😀{😀", 5) == "😀{{" and clip("😀{😀", 6) == "😀{{😀"
+    assert clip("}}", 3) == "}}" and clip("}}", 4) == "}}}}" and clip("😀", 1) == ""
+
+
+def test_a_textv2_full_of_emoji_and_braces_stays_inside_5000_utf16_units():
+    target = line_mentions.MentionTarget(key="p1", kind="user", user_id="U_A", label="@成員甲")
+    source = "😀{字}" * 1700  # 6 UTF-16 units per repeat once the braces are doubled: far over the limit
+
+    data = line_mentions.text_v2_dict(source, [target], limit=5000)
+
+    assert 4990 <= line_mentions.utf16_len(data["text"]) <= 5000
+    body = data["text"][len("{p1}\n"):]
+    assert source.startswith(line_mentions.unescape_text_v2(body))  # a clean prefix: no pair split, no emoji halved
+    reply = main._text_message_with_mentions(
+        "@成員甲\n" + source, prepared=True, limit=5000, explicit_only=True, reply_targets=[target]
+    )[1]
+    assert type(reply).__name__ == "TextMessageV2" and line_mentions.utf16_len(reply.text) <= 5000
+
+
+def test_the_archive_of_an_event_reminder_push_keeps_the_words_not_the_escapes(monkeypatch):
+    """(R2 GP1 #1, event_reminder `_post_result`) a textV2 template escapes literal braces; the
+    archive is read back by the model as the bot's own words.  A plain text message is stored as is."""
+    import event_reminder
+
+    archived = []
+    sent = iter(["sent-a", "sent-b"])
+    monkeypatch.setattr(event_reminder, "GROUP_ID", GROUP)
+    monkeypatch.setattr(event_reminder, "_get_token", lambda: "token")
+    monkeypatch.setattr(
+        event_reminder, "push_messages",
+        lambda *_args, sent_message_ids=None, **_kwargs: sent_message_ids.extend([next(sent), next(sent)]),
+    )
+    monkeypatch.setattr(memory, "log_raw_message", lambda group, message_id, user, text, **kw: archived.append((message_id, text)))
+
+    result = event_reminder._post_result(
+        [
+            {"type": "textV2", "text": '{p1}\n活動 {{"a": 1}} 與 {{x}}', "substitution": {}},
+            {"type": "text", "text": "純文字 {{留著}}"},
+        ]
+    )
+
+    assert result == event_reminder.POST_OK
+    assert archived == [("sent-a", '{p1}\n活動 {"a": 1} 與 {x}'), ("sent-b", "純文字 {{留著}}")]
 
 
 def test_a_reply_with_braces_and_a_mention_is_one_valid_textv2_message(line):

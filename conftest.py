@@ -291,6 +291,9 @@ def reset_main_globals(monkeypatch):
         main._exercise_nudge_by_token.clear()
     with main._reply_mention_targets_lock:
         main._reply_mention_targets_by_token.clear()
+    # 2026-10-28: the in-memory refusal counters (a rider refused without being named, a fenced
+    # acknowledgement) must not carry one test's count into the next.
+    main.reply_riders.reset_counters()
     # 2026-10-07: CLI timeouts faked by one test must not leave the CLI
     # resting (claude_client's timeout breaker) in the next.
     claude_client._cli_timeout_streak = 0

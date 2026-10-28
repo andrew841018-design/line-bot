@@ -191,6 +191,39 @@ def test_a_terminal_mark_replaces_the_fence(clock):
     assert status("b") == "replied"
 
 
+def test_the_drains_close_changes_only_the_events_that_are_still_being_handled(clock):
+    """(review R2 GP2 #1) the exit drain must not turn a fence or an accepted reply into
+    `completed_no_reply`: that would record a delivered reply as "no reply" and let a late run of
+    the same event send unfenced."""
+    for message_id in ("active", "media", "fenced", "done", "quiet"):
+        memory.begin_inbound_event(GROUP, message_id)
+    memory.mark_inbound_event_media_processing(GROUP, "media")
+    memory.claim_inbound_reply(GROUP, ["fenced"])
+    memory.mark_inbound_event_replied(GROUP, "done")
+    memory.mark_inbound_events_completed_no_reply(GROUP, ["quiet"])
+    everything = ["active", "media", "fenced", "done", "quiet", "never-seen"]
+
+    assert memory.mark_active_inbound_events_completed_no_reply(GROUP, everything) == 2
+
+    assert [status(m) for m in ("active", "media", "fenced", "done", "quiet")] == [
+        "completed_no_reply", "completed_no_reply", "reply_sending", "replied", "completed_no_reply",
+    ]
+    assert memory.claim_inbound_reply(GROUP, ["fenced"]) == ("blocked", False)  # still fenced
+    assert memory.mark_active_inbound_events_completed_no_reply(GROUP, everything) == 0  # nothing left to change
+    assert memory.mark_active_inbound_events_completed_no_reply("", everything) == 0
+    assert memory.mark_active_inbound_events_completed_no_reply(GROUP, []) == 0
+
+
+def test_the_drains_close_counts_rows_across_chunks(clock):
+    ids = [f"bulk-{n}" for n in range(memory._COMPLETE_BATCH + 7)]
+    for message_id in ids:
+        memory.begin_inbound_event(GROUP, message_id)
+    memory.claim_inbound_reply(GROUP, [ids[3]])
+
+    assert memory.mark_active_inbound_events_completed_no_reply(GROUP, ids) == len(ids) - 1
+    assert status(ids[3]) == "reply_sending" and status(ids[-1]) == "completed_no_reply"
+
+
 def test_only_one_of_many_threads_gets_the_fence(clock):
     memory.begin_inbound_event(GROUP, "race")
     barrier = threading.Barrier(8)

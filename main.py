@@ -176,11 +176,44 @@ async def _maintain_local_vision_worker() -> None:
                 last_error_type = error_type
 
 
-# How long the lifespan exit waits for burst flushes that are still running (burst_filter), and
-# how much longer than that the exit waits for the drain itself (its database writes) before it
-# stops caring and carries on.
-_EXIT_DRAIN_SECONDS = 8.0
-_EXIT_DRAIN_MARGIN_SECONDS = 4.0
+# How long the lifespan exit lets burst flushes that are still running finish (burst_filter), and
+# how much longer than that it waits for the drain itself (its database writes) before it stops
+# caring and carries on.  launchd ends a process that is still alive about 20 s after SIGTERM, and
+# the exit also gives the parent-health and stock-picks threads 2 s each, so the whole drain is
+# kept to 5 + 3 s at the most (2026-10-28, review R2 GP2 #7: it was 8 + 4).
+_EXIT_DRAIN_SECONDS = 5.0
+_EXIT_DRAIN_MARGIN_SECONDS = 3.0
+
+
+async def _run_exit_drain() -> None:
+    """`burst_filter.drain_for_shutdown` on a daemon thread, waited for at most
+    ``_EXIT_DRAIN_SECONDS + _EXIT_DRAIN_MARGIN_SECONDS`` (2026-10-28, review R2 GP1 #5, GP2 #7).
+
+    `asyncio.wait_for(asyncio.to_thread(...))` only stopped *waiting*: the work ran on an executor
+    thread, and the interpreter joins executor threads when it exits (`asyncio.run` for up to
+    300 s, then without a limit), so a drain stuck on the database delayed the exit until
+    launchd's kill.  A daemon thread is not joined: when the time is up the exit carries on and
+    the process ends with it.  Never raises; the log carries the exception type only.
+    """
+    outcome: dict[str, BaseException] = {}
+
+    def run() -> None:
+        try:
+            burst_filter.drain_for_shutdown(_EXIT_DRAIN_SECONDS)
+        except BaseException as exc:  # noqa: BLE001 - a thread has nobody above it to catch this
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=run, name="burst-exit-drain", daemon=True)
+    try:
+        worker.start()
+        await asyncio.to_thread(worker.join, _EXIT_DRAIN_SECONDS + _EXIT_DRAIN_MARGIN_SECONDS)
+    except Exception as exc:
+        logger.warning("burst drain on exit failed error_type=%s", type(exc).__name__)
+        return
+    if worker.is_alive():
+        logger.warning("burst drain on exit failed error_type=TimeoutError")
+    elif "error" in outcome:
+        logger.warning("burst drain on exit failed error_type=%s", type(outcome["error"]).__name__)
 
 
 @asynccontextmanager
@@ -248,14 +281,10 @@ async def _app_lifespan(_app: FastAPI):
         # 2026-10-24 (B7.1): messages still in the 8 s debounce window (and flush threads that
         # have not finished) would die with the process, unanswered and unremembered.  Queued ones
         # go to the conversation memory and are closed first, in-flight ones get a short grace
-        # period.  First thing, time-boxed, and a failure here never blocks the exit.
-        try:
-            await asyncio.wait_for(
-                asyncio.to_thread(burst_filter.drain_for_shutdown, _EXIT_DRAIN_SECONDS),
-                timeout=_EXIT_DRAIN_SECONDS + _EXIT_DRAIN_MARGIN_SECONDS,
-            )
-        except Exception as exc:
-            logger.warning("burst drain on exit failed error_type=%s", type(exc).__name__)
+        # period.  First thing, time-boxed (a daemon thread the exit stops waiting for, so even a
+        # drain stuck on the database cannot hold the process up), and a failure here never blocks
+        # the exit.
+        await _run_exit_drain()
         if parent_health_module is not None:
             try:
                 parent_health_module.stop_background(timeout=2.0)
@@ -552,6 +581,13 @@ def _exercise_nudge_message(nudge):
             reply_targets=[target],
         )
         if sent_text != text:
+            return None
+        # 2026-10-28 (review R2 GP2 #5): `_text_message_with_mentions` falls back to a plain
+        # TextMessage when the textV2 message cannot be built, and that one would say a literal
+        # 「@爸爸」 and ping nobody.  The nudge is a real mention or it is dropped.
+        from linebot.v3.messaging import TextMessageV2  # type: ignore[import-untyped]
+
+        if not isinstance(message, TextMessageV2) or not message.substitution:
             return None
         return message
     except Exception as exc:
@@ -1004,12 +1040,19 @@ def _prepare_outbound_text(text: str, *, source: str = "reply") -> str:
         return ""
     result = output_validator.validate_outbound_text(prepared)
     if not result.ok:
-        logger.warning(
-            "outbound validation blocked source=%s reason=%s preview=%r",
-            source,
-            result.reason,
-            _redact_card_paths(prepared[:160]),  # 2026-10-23 GP2 N5：大字版網址的 token 不進 log
-        )
+        if source == "exercise_nudge":
+            # 2026-10-28 (review R2 GP2 #4): the nudge is health text (a date and an item).  The
+            # log gets the reason code and nothing of the sentence.
+            logger.warning(
+                "outbound validation blocked source=%s reason=%s", source, result.reason
+            )
+        else:
+            logger.warning(
+                "outbound validation blocked source=%s reason=%s preview=%r",
+                source,
+                result.reason,
+                _redact_card_paths(prepared[:160]),  # 2026-10-23 GP2 N5：大字版網址的 token 不進 log
+            )
         return result.text
     return result.text
 
@@ -12041,7 +12084,14 @@ def _text_message_with_mentions(
                 quote_token=quote_token,
             )
     except Exception as e:
-        logger.warning("build mention reply failed; fallback text message: %s", str(e)[:200])
+        if validation_source == "exercise_nudge":
+            # 2026-10-28 (review R2 GP2 #4): a pydantic error carries the input it refused, and the
+            # nudge's input is health text.  The exception type is all the log gets.
+            logger.warning(
+                "build mention reply failed; fallback text message error_type=%s", type(e).__name__
+            )
+        else:
+            logger.warning("build mention reply failed; fallback text message: %s", str(e)[:200])
     return reply_text, TextMessage(text=reply_text, quoteToken=quote_token)
 
 
@@ -23275,11 +23325,14 @@ def _recover_rejected_reply(
 
     * only riders are named (a reminder, an acknowledgement, the nudge): they are *fenced* -- a
       reminder's delivery claim becomes `uncertain`, the nudge's dedupe row is kept, an
-      acknowledgement stays claimed until its claim lapses -- so a bad rider does not ride on
-      every later reply; every other rider is released unsent; and the primary goes alone,
-      exactly as it was built (if LINE refuses it after all, once more as plain text);
+      acknowledgement stays claimed until its claim lapses and is given up the third time it is
+      fenced -- so a bad rider does not ride on every later reply; every other rider is released
+      unsent; and the primary goes alone, exactly as it was built (if LINE refuses it after all,
+      once more as plain text);
     * the primary message is named, or no message could be told: every rider is released (not
-      fenced) and the primary goes alone as one plain TextMessage.
+      fenced) and the primary goes alone as one plain TextMessage -- except that a rider which was
+      in such an unnamed refusal on three replies in a row is fenced (it is the likely culprit
+      and would otherwise cost an extra failed call on every later reply).
 
     A rider is never sent again as plain text: its plain version starts with the label of the
     person it pings -- the literal 「@當事人」 when the creator has no local alias -- which the
@@ -23304,11 +23357,21 @@ def _recover_rejected_reply(
         _line_error_detail(error, secrets=(reply_token,)),
     )
     every_rider = {index for index, rider in enumerate(batch.riders) if rider is not None}
-    batch.remove_riders(
-        every_rider,
-        fence=set(hits) if case == "riders" else frozenset(),
-        orphans="release",
-    )
+    if case == "unknown":
+        # LINE named nothing, so every rider is released -- but one that is in such a refusal on
+        # three replies in a row is the likely culprit and is fenced, so it cannot cost an extra
+        # failed call on every later reply for ever (review R2 GP1 #3; counted in memory).
+        fence = {
+            index
+            for index in sorted(every_rider)
+            if reply_riders.note_unnamed_refusal(batch.group_id, batch.riders[index])
+        }
+    else:
+        # LINE could have named them and did not (or named them along with the primary): the
+        # run of unnamed refusals is over.
+        reply_riders.clear_unnamed_refusals(batch.group_id, batch.riders)
+        fence = set(hits) if case == "riders" else frozenset()
+    batch.remove_riders(every_rider, fence=fence, orphans="release")
     if primary_suppressed:  # a reply of riders only: nothing is left to send
         return _ReplyRecovery("rejected", None, error, False)
 
@@ -24218,6 +24281,8 @@ def _reply(
             # Settled first, so nothing below can hand it back.
             nudge_slot.settled = True
             logger.info("exercise nudge delivered group=%s", group_id)
+        # What rode on a reply LINE accepted is not suspect any more (review R2 GP1 #3).
+        reply_riders.clear_unnamed_refusals(group_id or "", riders)
 
         if pending_commit_ids and group_id:
             try:
