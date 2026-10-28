@@ -78,6 +78,9 @@ os.environ.pop("LINE_BOT_EXERCISE_NUDGE", None)  # 2026-10-23 運動提醒：程
 # 2026-10-24 自動學習糾正：預設關（舊的糾正擷取照舊），要測的測試自己打開；狀態檔指到不存在的隔離路徑
 # （絕不讀到正式 state/ 的開關檔）。判斷器的模型呼叫由下面的 isolate_complaint_learning 換成丟例外。
 os.environ["LINE_BOT_COMPLAINT_LEARNING"] = "0"
+# 2026-10-28 爸媽健康改推群組的開關：測試預設私訊。設成空字串（＝私訊）而不是刪掉：main、todo、weekly_summary
+# 這類模組 import 時會 load_dotenv(override=False)，刪掉的話，測試中途才 import 的模組會把正式 .env 的開關加回來。
+os.environ["LINE_BOT_PARENT_HEALTH_GROUP_PUSH"] = ""
 # 2026-10-17 TikTok 讀取：預設關閉（0 = 不送 Gemini、不下載），要測的測試用假物件自己打開
 # TODO(2026-10-17 D4): 這只關掉讀影片／圖片；沒有替換 yt-dlp 的既有測試仍可能真的連網抓 metadata。
 os.environ["LINE_BOT_TIKTOK_MEDIA_DAILY_CAP"] = "0"
@@ -437,6 +440,33 @@ def block_external_side_effects(monkeypatch, request):
     monkeypatch.setattr(safe_fetch, "_resolve", _no_lookup)
     monkeypatch.setattr(safe_fetch, "is_public_ip", lambda _ip: False)
 
+    # 2026-10-28 爸媽健康改推群組：LINE 推播一律換成只記錄的替身（不連網、不扣額度）。push_text、try_push_*
+    # 用到時才查這個模組屬性，也會走到替身。呼叫端自己帶 session 的（event_reminder、測試給的假 session）照舊走
+    # 真的：連線本來就由呼叫端決定，而且 event_reminder 用 from-import，第一次在測試裡 import 時綁到的是替身。
+    # 直接測 push_messages 本身的傳輸層測試檔也照舊用真的。
+    if request.path.name not in _REAL_LINE_PUSH_TEST_FILES:
+        import line_push_client
+
+        pushed: list[dict] = []
+        real_push = line_push_client.push_messages
+
+        def _record_push(to, messages, **kwargs):
+            if kwargs.get("session") is not None:
+                return real_push(to, messages, **kwargs)
+            pushed.append({"to": to, "messages": list(messages), **kwargs})
+            return True
+
+        _record_push.calls = pushed
+        monkeypatch.setattr(line_push_client, "push_messages", _record_push)
+    # 改推群組的開關每個測試都從空字串（私訊）開始：不刪掉，測試中途 load_dotenv(override=False) 才不會把正式 .env
+    # 的開關加回來。要測群組模式的測試自己 setenv。conftest 預設靜音（main.settings.bot_muted = True），
+    # 要看到推播的測試也要自己解除靜音。
+    monkeypatch.setenv("LINE_BOT_PARENT_HEALTH_GROUP_PUSH", "")
+
+
+# 直接測 line_push_client.push_messages 的傳輸層測試（自己給假的 session，不能被上面的替身換掉）
+_REAL_LINE_PUSH_TEST_FILES = ("test_line_push_client.py", "test_output_validator.py")
+
 
 _DAILY_MEMORY_ENV_KNOBS = (
     "LINE_BOT_DAILY_MEMORY",
@@ -562,6 +592,16 @@ def isolate_stock_picks(monkeypatch, tmp_path_factory):
     # 狀態檢查會讀 .env 裡的 LINE_BOT_STOCK_PICKS_AI：測試一律指到不存在的檔，不讀真的 .env。
     monkeypatch.setattr(stock_picks, "ENV_FILE", tmp_path_factory.mktemp("stock_picks_env") / ".env", raising=False)
     stock_picks.clear_caches()
+    # 美股與推薦成績（2026-10-28）：開關與 DB 路徑不讀真的環境（DB 預設在上面的暫存 STATE_DIR 裡，不存在）；
+    # 記憶體狀態、快取、限流、冷卻每個測試都從全新的開始。
+    monkeypatch.delenv("LINE_BOT_STOCK_PICKS_US", raising=False)
+    monkeypatch.delenv("LINE_BOT_MARKET_DB_PATH", raising=False)
+    try:
+        import stock_picks_us
+
+        stock_picks_us.reset_for_tests()
+    except Exception:  # 美股模組自己壞了（或還沒有）：只讓它的測試失敗，不連帶整套測試在 setup 就失敗
+        pass
 
 
 @pytest.fixture(autouse=True)

@@ -18,8 +18,12 @@ import）；分析卡給全家看（不寫 119），週日晚上私訊 Andrew �
 - 運動提醒（Andrew：「提醒爸爸媽媽多久沒運動….合併到爸媽健康那邊，但附帶提醒功能」，選「開口時順便提醒」）：
   爸媽在群組說話、咪寶本來就要回那批訊息時，順便提一句；每人最多 72 小時一次，開關 LINE_BOT_EXERCISE_NUDGE
   預設關。這裡只有資格判斷、句子、搶與放去重列；搭在哪則回覆上由 main 決定。
+2026-10-28（私訊改推家族群組，Andrew 10/18 定案「全部改推群組」）：開關 LINE_BOT_PARENT_HEALTH_GROUP_PUSH
+（YYYY-MM-DD＝那天台北 00:00 起；沒設＝照舊私訊）。家族主群開了之後：每日檢查、119 結果（群組沒收到 119 提醒時）
+改推群組，週分析併進週日 20:00 週報（weekly_analysis_text），暫停／恢復不另外通知；推不出去就算了，只有危象血壓、
+低血糖改用 Discord 私訊 Andrew 當備援。其他群組照舊私訊。去重紀錄每天清一次（parent_health_db.purge_alerts）。
 
-- 全部規則式（parent_health_extract、parent_health_analysis），不送模型或外部服務。Discord 私訊帶角色、
+- 全部規則式（parent_health_extract、parent_health_analysis），不送模型或外部服務。Discord 私訊與群組推播帶角色、
   類別、標籤、天數／時間；很高的血壓、低血糖與週日分析另帶讀數（Andrew 看過含數字的範例後選全 A）。
 - 卡片與文字只由固定詞表、數字、日期組成，沒有留言原文；卡片 altText 固定、不含資料（存檔只留 altText）。
 - 角色只認本機別名檔與角色檔（不用 LINE 顯示名稱）；同意列只在「現在解析到的帳號＝列上的帳號」時有效
@@ -42,6 +46,7 @@ import re
 import threading
 import time
 import unicodedata
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
@@ -77,6 +82,7 @@ __all__ = [
     "observe_message",
     "forget_message",
     "weekly_section",
+    "weekly_analysis_text",
     "anomaly_lines",
     "run_daily_check",
     "start_background",
@@ -143,6 +149,17 @@ _EXPLAIN_TAIL = (
 )
 # 大字版網頁、運動提醒都關著時的說明（見 _recording_explanation：開著的功能才補一句，GP2 nit）
 _RECORDING_EXPLANATION = _EXPLAIN_HEAD + _EXPLAIN_TAIL
+# 家族主群改推群組之後（2026-10-28，_group_mode）的說法：沒有私訊，週分析併進週報
+_EXPLAIN_HEAD_GROUP = (
+    "咪寶會從群組留言整理爸爸、媽媽的用藥、看診、運動、睡眠、飲食和身體狀況（含血壓血糖讀數、不舒服），"
+    "在「爸媽健康」卡片給全家看、週日週報有一段（含每週的分析整理）、異常會推到群組；留言提到胸痛、跌倒這類緊急狀況，"
+    "咪寶會在群組提醒就醫或打 119。"
+)
+_EXPLAIN_TAIL_GROUP = (
+    "暫停只停止健康紀錄、卡片、週報段落、群組通知和 119 提醒；"
+    "已記的紀錄會保留（記錯的那則，誰都可以引用它再打 /健康 刪除；本人可以打 /健康 刪除我的紀錄 全部刪掉；已經推到群組的不會收回）；"
+    "一般聊天功能照舊（留言還是會像平常一樣被咪寶讀到）。"
+)
 
 
 def _help_with(explanation: str) -> str:
@@ -170,6 +187,7 @@ _ANALYSIS_NOTE = "依國健署等公開衛教整理，不是診斷；不舒服�
 _LINE_DM = "私訊 Andrew"  # 分析卡「每週日的完整整理會私訊 Andrew」「另外還有 N 項，完整整理每週日私訊 Andrew」
 # 大字版網頁上不放家人名字（2026-10-23 GP1 #9）：私訊對象寫「管理者」、回報人寫「家人」
 _PAGE_DM = "私訊管理者"
+_GROUP_WEEKLY = "放在週報"  # 群組模式（2026-10-28）：完整整理併進週日週報；卡片和網頁同一句（沒有名字）
 _PAGE_REPORTER = "家人"
 # 分析卡「最近聽到的」（2026-10-23 A2）：(類別, 只算這些標籤（None＝全部）, 卡片上的開頭, 名稱, 括號裡寫什麼)
 # 括號裡：item＝標籤（散步、睡不好）、value＝讀數、""＝只寫日期（吃藥只有一種）
@@ -200,6 +218,7 @@ _REPLY_WINDOW_S = 1800  # 同一家長 30 分鐘內只回一次 119 提醒
 _DM_WINDOW_S = 1800  # 同一家長同一標籤 30 分鐘內只私訊一次
 _EVENT_MAX_AGE_S = 600  # 超過 10 分鐘的訊息不回群組（只私訊）
 _MAX_PUSH_REPLIES_PER_DAY = 2  # 今天成功送出的 119 回覆滿 2 則後不再 push fallback
+_NOTICE_WINDOW_S = 1800  # 群組模式：119 結果同一家長同一標籤 30 分鐘只推一次（去重種類 notice:<標籤>；沒有每日上限）
 _ALERT_SUPPRESS_S = 7 * 86400  # 每日檢查：同一項 7 天內只私訊一次
 _URGENT_LOOKBACK_S = 2 * 86400  # 每日檢查看 48 小時內的危象血壓、低血糖（檢查時間會飄）
 _URGENT_KINDS = ("bp_crisis", "glucose_low")  # 每筆讀數一個去重種類：同一筆只提醒一次，每種每天最多一行
@@ -1117,9 +1136,9 @@ def _purge_failed_note(purged: bool) -> str:
     return f"；大字版網頁沒能一起清掉，{hours} 小時內會自動失效" if hours else ""
 
 
-def _recording_explanation() -> str:
+def _recording_explanation(group_mode: bool = False) -> str:
     """/健康 說明與恢復回覆的說明：開著的功能才補一句（大字版網頁、運動提醒；GP2 nit）。都關著就是
-    _RECORDING_EXPLANATION。"""
+    _RECORDING_EXPLANATION。group_mode（家族主群改推群組，2026-10-28）換成群組的說法。"""
     extra = ""
     hours = _health_page_hours()
     if hours:
@@ -1129,11 +1148,13 @@ def _recording_explanation() -> str:
         )
     if exercise_nudge_enabled():
         extra += "爸爸、媽媽好幾天沒提到運動時，咪寶回話時會順便提醒（每人最多 3 天一次，暫停時也停）。"
+    if group_mode:
+        return _EXPLAIN_HEAD_GROUP + extra + _EXPLAIN_TAIL_GROUP
     return _EXPLAIN_HEAD + extra + _EXPLAIN_TAIL
 
 
-def _help_text() -> str:
-    return _help_with(_recording_explanation())
+def _help_text(group_mode: bool = False) -> str:
+    return _help_with(_recording_explanation(group_mode))
 
 
 def _med_line(s: _Summary) -> str:
@@ -1372,7 +1393,7 @@ def _recap_lines(analysis, rows: list[dict], today: date, on_day: date) -> tuple
 
 
 def _analysis(ctx: _Ctx) -> CommandReply:
-    """近 14 天的分析卡：每位家長最多 3 條（緊急的一律列），建議另起一行；不寫 119（當下怎麼做只在私訊）。
+    """近 14 天的分析卡：每位家長最多 3 條（緊急的一律列），建議另起一行；不寫 119（當下怎麼做只在每日檢查）。
     2026-10-23（Andrew：「分析功能每次點都沒有內容」）：條目後面一律接「最近聽到的」運動、吃藥、血壓、睡眠，
     沒有條目時寫「目前沒有需要特別注意的項目」。網頁版另外組一份：私訊對象寫「管理者」。"""
     try:
@@ -1433,8 +1454,10 @@ def _analysis(ctx: _Ctx) -> CommandReply:
 
     title = "📋 爸媽健康分析"
     subtitle = f"近 14 天（{_md(start)}–{_md(ctx.today)}），只看群組有提到的"
-    card = _bubble(title, subtitle, body_for(_LINE_DM), footer_for(_LINE_DM))
-    page_card = _page_twin(lambda: _bubble(title, subtitle, body_for(_PAGE_DM), footer_for(_PAGE_DM)), "analysis")
+    # 完整整理去哪：私訊（網頁版不寫名字）；家族主群改推群組之後是週報（2026-10-28）
+    line_dm, page_dm = (_GROUP_WEEKLY, _GROUP_WEEKLY) if _group_mode(ctx.group_id, ctx.now) else (_LINE_DM, _PAGE_DM)
+    card = _bubble(title, subtitle, body_for(line_dm), footer_for(line_dm))
+    page_card = _page_twin(lambda: _bubble(title, subtitle, body_for(page_dm), footer_for(page_dm)), "analysis")
     return _card_reply(_ANALYSIS_ALT, card, page_card)
 
 
@@ -1485,7 +1508,7 @@ def _resume(ctx: _Ctx, user_id: str | None, target: str | None) -> CommandReply:
         ctx.group_id, role, "on", user_id=user_id, changed_by=user_id, now=ctx.now, db_path=ctx.db_path
     )
     return _reply(
-        f"爸媽健康：已恢復記錄{role}的健康留言。\n{_recording_explanation()}\n"
+        f"爸媽健康：已恢復記錄{role}的健康留言。\n{_recording_explanation(_group_mode(ctx.group_id, ctx.now))}\n"
         "要暫停：打 /健康 暫停；要刪掉自己的全部紀錄：打 /健康 刪除我的紀錄"
     )
 
@@ -1539,7 +1562,8 @@ def _resume_for(ctx: _Ctx, role: str, user_id: str | None) -> CommandReply:
     parent_health_db.set_consent(
         ctx.group_id, role, "on", user_id=ctx.roles[role], changed_by=user_id, now=ctx.now, db_path=ctx.db_path
     )
-    _send_dm_background(f"🩺 爸媽健康：{role}的健康紀錄被家人恢復了（{_hhmm(ctx.now)}），群組 119 提醒也一起恢復。")
+    if not _group_mode(ctx.group_id, ctx.now):  # 改推群組之後不另外通知：群組裡已經有這則回覆（2026-10-28）
+        _send_dm_background(f"🩺 爸媽健康：{role}的健康紀錄被家人恢復了（{_hhmm(ctx.now)}），群組 119 提醒也一起恢復。")
     return _reply(f"爸媽健康：已恢復記錄{role}的健康留言（從現在開始，暫停期間的留言不補記）。要暫停：打 /健康 暫停 {role}")
 
 
@@ -1570,12 +1594,15 @@ def _pause(ctx: _Ctx, role: str, user_id: str | None) -> CommandReply:
         how = f"要恢復：打 /健康 恢復 {role}"
     else:
         how = f"要恢復，請{role}本人打 /健康 恢復"
-    if _role_from(ctx.roles, user_id) != role:  # 別人幫忙暫停：119 提醒也停了，私訊 Andrew
+    group_mode = _group_mode(ctx.group_id, ctx.now)
+    # 別人幫忙暫停：119 提醒也停了，私訊 Andrew；改推群組之後不另外通知（群組裡已經有這則回覆，2026-10-28）
+    if not group_mode and _role_from(ctx.roles, user_id) != role:
         _send_dm_background(
             f"🩺 爸媽健康：{role}的健康紀錄被家人暫停了（{_hhmm(ctx.now)}），群組 119 提醒也一起停；{how}。"
         )
     # 開著的功能才寫（GP2 nit）：運動提醒（開關開了才有）、大字版網頁（清掉了）
-    stops = "卡片、週報段落、私訊、運動提醒和 119 提醒" if exercise_nudge_enabled() else "卡片、週報段落、私訊和 119 提醒"
+    notices = "群組通知" if group_mode else "私訊"
+    stops = f"卡片、週報段落、{notices}、運動提醒和 119 提醒" if exercise_nudge_enabled() else f"卡片、週報段落、{notices}和 119 提醒"
     pages = "，大字版網頁也清掉了" if pages_purged and _health_page_hours() else ""
     return _reply(f"爸媽健康：已暫停{role}的健康紀錄，{stops}也一起停{pages}；已記的紀錄保留。{how}")
 
@@ -1647,8 +1674,8 @@ def handle_command(
         if not group_id:
             return _reply(FAILURE_TEXT)
         command, arg = _parse_command(body)
-        if command == "help":
-            return _reply(_help_text())
+        if command == "help":  # 不讀資料；說法跟著家族主群改推群組了沒（2026-10-28）
+            return _reply(_help_text(_group_mode(group_id, _now(now))))
         ctx = _context(group_id, _now(now), ensure_default=True)
         if command == "overview":
             return _overview(ctx)
@@ -1671,7 +1698,7 @@ def handle_command(
             return _delete_quoted(ctx, quoted_message_id)
         if command == "delete_mine":
             return _delete_mine(ctx, user_id)
-        return _reply(_help_text())
+        return _reply(_help_text(_group_mode(ctx.group_id, ctx.now)))
     except Exception as exc:
         _err("command", exc)
         return _reply(FAILURE_TEXT)
@@ -1813,7 +1840,7 @@ def red_flag_outcome(
 
     回覆真的送出才記 30 分鐘去重（帶 message_id），這則提到、也被這次提醒涵蓋的家長都記；記失敗
     不影響私訊。私訊寫每位家長實際的結果，同一家長同一標籤 30 分鐘一次（先搶再送；DB 出錯時照送），
-    在背景 daemon 執行緒送。"""
+    在背景 daemon 執行緒送。家族主群改推群組之後（2026-10-28）不私訊，改由 _red_flag_notice 推群組。"""
     try:
         if decision is None or decision.role not in PARENTS:
             return
@@ -1830,6 +1857,9 @@ def red_flag_outcome(
                 except Exception as exc:
                     _err("reply dedupe", exc)
         if not decision.dm:
+            return
+        if _group_mode(group_id, now_f):
+            _red_flag_notice(group_id, pairs, key=key, said_ts=decision.event_ts or now_f, muted=muted, now_f=now_f)
             return
         claimed: dict[str, tuple[list[str], str]] = {}
         for role, label, reason in pairs:
@@ -1859,6 +1889,61 @@ def red_flag_outcome(
         _send_dm_background(text)
     except Exception as exc:
         _err("red flag outcome", exc)
+
+
+# 群組模式（2026-10-28）：群組沒收到 119 提醒的這三種才推群組；已回 119（send）、30 分鐘內回過（deduped）不推，
+# 回覆失敗時 main 已試過 push 備援（每天上限 2 則）。括號裡寫為什麼咪寶這次沒回 119。
+_NOTICE_WHY = {
+    "old_event": "訊息超過 10 分鐘",
+    "in_care": "說已經在急診或送醫",
+    "future": "說的是之後的事",
+}
+
+
+def _notice_text(claimed: dict[str, tuple[list[str], str]], said_ts: float) -> str:
+    """推到群組的 119 結果（對全家說）：只有角色、詞表標籤、時間和固定的原因，不帶留言原文。
+    兩位家長原因一樣時合成一句，不一樣時各寫各的。"""
+    said_at = _hhmm(said_ts)
+    order = [role for role in PARENTS if role in claimed]
+    whys = {role: _NOTICE_WHY.get(claimed[role][1], "") for role in order}
+    if len(order) == 1:
+        role = order[0]
+        return (
+            f"🩺 爸媽健康：{role} {said_at} 提到{'、'.join(claimed[role][0])}（咪寶這次沒有回 119 提醒：{whys[role]}），"
+            f"請家人確認{_PRONOUN[role]}現在的狀況"
+        )
+    if len(set(whys.values())) == 1:
+        who = "；".join(f"{role}提到{'、'.join(claimed[role][0])}" for role in order)
+        return (
+            f"🩺 爸媽健康：{said_at} {who}（咪寶這次沒有回 119 提醒：{whys[order[0]]}），請家人確認他們現在的狀況"
+        )
+    each = "；".join(f"{role}提到{'、'.join(claimed[role][0])}（{whys[role]}）" for role in order)
+    return f"🩺 爸媽健康：{said_at} {each}；咪寶這次都沒有回 119 提醒，請家人確認他們現在的狀況"
+
+
+def _red_flag_notice(
+    group_id: str, pairs: list[tuple[str, str, str]], *, key: str, said_ts: float, muted: bool, now_f: float
+) -> None:
+    """家族主群改推群組之後的 119 結果（red_flag_outcome 呼叫；在 webhook 鎖裡）：只推 old_event／in_care／future，
+    靜音時什麼都不做。同一家長同一標籤 30 分鐘一次（notice:<標籤>，先搶再推；DB 出錯時照推）；沒有每日上限
+    （Andrew 10/28：只靠 30 分鐘去重）。兩位家長合成一則，在背景 daemon 執行緒推。"""
+    wanted = [(role, label, reason) for role, label, reason in pairs if reason in _NOTICE_WHY]
+    if muted or not wanted:
+        return
+    claimed: dict[str, tuple[list[str], str]] = {}
+    for role, label, reason in wanted:
+        kind = f"notice:{label}"
+        try:
+            last = parent_health_db.last_alert(group_id, role, kind)
+            if last is not None and now_f - last["sent_at"] < _NOTICE_WINDOW_S:
+                continue
+            if not parent_health_db.claim_alert(group_id, role, kind, key, now=now_f):
+                continue
+        except Exception as exc:
+            _err("notice dedupe", exc)  # 去重壞了寧可多推一次
+        claimed.setdefault(role, ([], reason))[0].append(label)
+    if claimed:
+        _push_group_background(group_id, _notice_text(claimed, said_ts), kind="notice", key=key)
 
 
 # ── 運動提醒（2026-10-23，PLAN A A3） ──────────────────────────────────────
@@ -2101,6 +2186,89 @@ def _send_dm_background(text: str) -> None:
         _err("discord dm start", exc)
 
 
+# ── 家族群組推播（2026-10-28 私訊改推群組） ─────────────────────────────────
+# Andrew 10/18：「私訊我改成推群組」，選全部改推群組、週分析併進週報、推不出去就算了（危象血壓、低血糖例外，
+# 改用 Discord 私訊當備援）。LINE 推播額度 11/1 才重置，所以用開關定開始日期，之前照舊私訊。
+
+_GROUP_PUSH_ENV = "LINE_BOT_PARENT_HEALTH_GROUP_PUSH"  # 只讀 os.environ（不進 config.Settings）
+_GROUP_PUSH_NOW = frozenset({"1", "on", "true", "yes"})
+_GROUP_PUSH_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _group_push_since() -> float | None:
+    """開關（每次重讀環境變數，和 exercise_nudge_enabled 一樣）：從什麼時候起推群組（unix 秒）。
+    YYYY-MM-DD＝那天台北 00:00 起；1／on／true／yes＝立即；沒設、空字串、0／off／false／no 和其他看不懂的值
+    一律回 None＝照舊私訊。"""
+    raw = os.environ.get(_GROUP_PUSH_ENV, "").strip().lower()
+    if raw in _GROUP_PUSH_NOW:
+        return float("-inf")
+    if not _GROUP_PUSH_DATE_RE.fullmatch(raw):
+        return None
+    try:
+        return float(_day_start_ts(date.fromisoformat(raw)))
+    except ValueError:  # 2026-13-01 這種
+        return None
+
+
+def _group_mode(group_id: str, now_f: float) -> bool:
+    """這個群組在 now_f 這一刻要不要改推群組：開關已生效、而且是家族主群（FAMILY_GROUP_ID；沒設定一律不是）。
+    其他群組照舊私訊。只讀環境變數與設定，不讀 DB、不丟例外。"""
+    try:
+        since = _group_push_since()
+        return since is not None and now_f >= since and _default_on(group_id)
+    except Exception as exc:
+        _err("group mode", exc)
+        return False
+
+
+def _push_group(group_id: str, text: str, *, kind: str, key: str) -> bool:
+    """推一則文字到家族主群：真的送出才回 True；靜音、不是家族主群、沒過推播驗證、推送失敗一律回 False，不推替代文字。
+    先自己驗證：line_push_client 擋下時會把前 160 字寫進 log，這裡 log 只記種類與原因。retry_key 由
+    (群組, 種類, key) 算固定的 uuid5，重試不會重複推；LINE 回 409（同一個 retry key 已經收過）也算送出。
+    不存進 raw_messages（和週報健康段落一樣只推不存）。用到時才 import、用模組屬性呼叫（conftest 的替身攔得到）。"""
+    try:
+        if parent_health_db.settings.bot_muted:
+            logger.info("parent health group push skipped kind=%s reason=muted", kind)
+            return False
+        if not _default_on(group_id):  # 只推家族主群（和 _group_mode 同一個判斷）
+            logger.warning("parent health group push skipped kind=%s reason=not_family_group", kind)
+            return False
+        import output_validator
+
+        result = output_validator.validate_outbound_text(text)
+        if not result.ok:
+            logger.error("parent health group push rejected kind=%s reason=%s", kind, result.reason)
+            return False
+        import line_push_client
+
+        retry_key = str(uuid.uuid5(uuid.NAMESPACE_URL, f"parent_health:{group_id}:{kind}:{key}"))
+        return bool(
+            line_push_client.push_messages(
+                group_id, [{"type": "text", "text": text}], retry_key=retry_key, timeout=10, ok_statuses=(200, 409)
+            )
+        )
+    except Exception as exc:
+        _err("group push", exc)
+        return False
+
+
+def _push_group_background(group_id: str, text: str, *, kind: str, key: str) -> None:
+    """背景 daemon 執行緒推（119 結果在 webhook 鎖裡，推播最多會卡 10 秒）；測試關掉背景時直接推，結果看得到。"""
+    try:
+        if not _BACKGROUND_ENABLED:
+            _push_group(group_id, text, kind=kind, key=key)
+            return
+        threading.Thread(
+            target=_push_group,
+            args=(group_id, text),
+            kwargs={"kind": kind, "key": key},
+            daemon=True,
+            name="parent-health-push",
+        ).start()
+    except Exception as exc:
+        _err("group push start", exc)
+
+
 # ── 抽取 ────────────────────────────────────────────────────────────────────
 
 _EXECUTOR: ThreadPoolExecutor | None = None  # 第一次用到才建（測試可以換成假的）
@@ -2284,14 +2452,15 @@ def weekly_section(group_id: str, now: float | None = None) -> str:
         return ""
 
 
-# ── 每日異常檢查（私訊 Andrew） ─────────────────────────────────────────────
+# ── 每日異常檢查（私訊 Andrew；家族主群改推群組之後推群組） ─────────────────
 
 
 @dataclass(frozen=True)
 class _Anomaly:
     role: str
     kind: str
-    text: str
+    text: str  # 私訊 Andrew 的那行（群組推播失敗時危象、低血糖的備援也用這行）
+    group_text: str = ""  # 推到家族群組的那行（2026-10-28，對全家說）；空的＝和 text 一樣
 
 
 def _anomaly_candidates(ctx: _Ctx, role: str) -> list[_Anomaly]:
@@ -2316,7 +2485,12 @@ def _anomaly_candidates(ctx: _Ctx, role: str) -> list[_Anomaly]:
 
         for kind, day, value, event_ts in analysis.urgent_readings(rows, since_ts=ctx.now - _URGENT_LOOKBACK_S):
             candidates.append(
-                _Anomaly(role, _urgent_kind(kind, day, value), analysis.urgent_dm_text(role, _PRONOUN[role], kind, value, event_ts))
+                _Anomaly(
+                    role,
+                    _urgent_kind(kind, day, value),
+                    analysis.urgent_dm_text(role, _PRONOUN[role], kind, value, event_ts),
+                    analysis.urgent_group_text(role, kind, value, event_ts),
+                )
             )
     except Exception as exc:
         _err("urgent readings", exc)
@@ -2388,7 +2562,8 @@ def anomaly_lines(group_id: str, now: float | None = None) -> list[str]:
 
 def run_daily_check(now: float | None = None) -> int:
     """每天台北 21:00 之後一次：每個有記錄中家長的群組先搶 daily_check:<日期>（重啟、雙程序都不重送），
-    每項異常也先搶再送；send_dm 結果不明也不重送。回送出的私訊數。"""
+    每項異常也先搶再送；send_dm 結果不明也不重送。回送出的則數。
+    家族主群改推群組之後（2026-10-28）改推群組，見 _daily_check_group。"""
     try:
         now_f = _now(now)
         local = _local(now_f)
@@ -2399,6 +2574,9 @@ def run_daily_check(now: float | None = None) -> int:
         for group_id in parent_health_db.groups_with_consent():
             try:
                 if not parent_health_db.claim_alert(group_id, "", "daily_check", day.isoformat(), now=now_f):
+                    continue
+                if _group_mode(group_id, now_f):
+                    sent += _daily_check_group(_context(group_id, now_f), day)
                     continue
                 lines = [
                     anomaly.text
@@ -2422,7 +2600,31 @@ def run_daily_check(now: float | None = None) -> int:
         return 0
 
 
-# ── 週日分析私訊（2026-10-17） ─────────────────────────────────────────────
+def _daily_check_group(ctx: _Ctx, day: date) -> int:
+    """每日檢查推到家族群組（2026-10-28；daily_check 已搶到）：逐項排版，先算這一行放不放得下（上限沿用
+    _DM_MAX_CHARS），放得下才搶那一項；放不下的不搶，明天再算。推不出去（靜音、沒過推播驗證、推送失敗）就算了，
+    claim 不放回；只有這次搶到的危象血壓、低血糖改用 Discord 私訊 Andrew，用原本對 Andrew 說的那幾行
+    （Andrew 10/18 的例外）。回送出的則數。"""
+    head = f"🩺 爸媽健康每日檢查（{_md(day)}）"
+    text, taken = head, []
+    for anomaly in _anomalies(ctx):
+        line = anomaly.group_text or anomaly.text
+        if len(text) + 1 + len(line) > _DM_MAX_CHARS:
+            break
+        if parent_health_db.claim_alert(ctx.group_id, anomaly.role, anomaly.kind, day.isoformat(), now=ctx.now):
+            text += "\n" + line
+            taken.append(anomaly)
+    if not taken:
+        return 0
+    if _push_group(ctx.group_id, text, kind="daily_check", key=day.isoformat()):
+        return 1
+    urgent = [anomaly.text for anomaly in taken if anomaly.kind.split(":", 1)[0] in _URGENT_KINDS]
+    if urgent and _send_dm("\n".join([head, *urgent])):
+        return 1
+    return 0
+
+
+# ── 週日分析私訊（2026-10-17；家族主群改推群組之後併進週報） ───────────────
 
 # 每日檢查的種類 → 週私訊「這週每日檢查的項目」的固定說法（症狀用詞表標籤本身）
 _DAILY_KIND_TEXT = {
@@ -2500,9 +2702,24 @@ def _weekly_analysis_text(ctx: _Ctx) -> str | None:
     return text + "\n" + footer
 
 
+def weekly_analysis_text(group_id: str, now: float | None = None) -> str | None:
+    """週日 20:00 週報（weekly_summary）接在「🩺 爸媽這週」後面的週分析（2026-10-28 私訊改推群組：週分析併進
+    週報，同一則推播、不多用額度）。只有家族主群改推群組之後、這週有紀錄才回文字；私訊模式、沒有內容、出錯
+    都回 None，不丟例外（週報照舊）。只讀，不寫預設同意列。"""
+    try:
+        now_f = _now(now)
+        if not _group_mode(group_id, now_f):
+            return None
+        return _weekly_analysis_text(_context(group_id, now_f)) or None
+    except Exception as exc:
+        _err("weekly analysis text", exc)
+        return None
+
+
 def _run_weekly_analysis(now: float | None = None) -> int:
     """台北週日 21:00 之後一次：每個有記錄中家長的群組先組好文字，有內容才搶 weekly_analysis:<日期>
-    再送（重啟、雙程序都不重送；send 結果不明也不重送）。和每日檢查分開搶、分開出錯。回送出的私訊數。"""
+    再送（重啟、雙程序都不重送；send 結果不明也不重送）。和每日檢查分開搶、分開出錯。回送出的私訊數。
+    家族主群改推群組之後（2026-10-28）跳過：週分析已經併進 20:00 的週報（weekly_analysis_text）。"""
     try:
         now_f = _now(now)
         local = _local(now_f)
@@ -2512,6 +2729,8 @@ def _run_weekly_analysis(now: float | None = None) -> int:
         sent = 0
         for group_id in parent_health_db.groups_with_consent():
             try:
+                if _group_mode(group_id, now_f):
+                    continue
                 last = parent_health_db.last_alert(group_id, "", "weekly_analysis")
                 if last is not None and last["key"] == key:
                     continue
@@ -2530,12 +2749,31 @@ def _run_weekly_analysis(now: float | None = None) -> int:
         return 0
 
 
+_purged_day: date | None = None  # 去重紀錄最後一次清是哪一天（只在記憶體；重啟後當天會再清一次，清除本身冪等）
+
+
+def _purge_old_alerts(now: float | None = None) -> None:
+    """每日迴圈裡一天一次（2026-10-28；Andrew 10/18「超過 7 天的就清」）：清掉超過保留天數的去重紀錄
+    （parent_health_db.purge_alerts）。迴圈不帶 now＝真實時鐘。log 只記種類前綴與筆數（種類本身帶讀數）。"""
+    global _purged_day
+    now_f = _now(now)
+    today = _today(now_f)
+    if _purged_day == today:
+        return
+    counts = parent_health_db.purge_alerts(now_f)
+    _purged_day = today
+    removed = " ".join(f"{prefix}={count}" for prefix, count in sorted(counts.items()) if count)
+    if removed:
+        logger.info("parent health alerts purged %s", removed)
+
+
 def _daily_loop(stop: threading.Event) -> None:
     if stop.wait(_STARTUP_DELAY_S):
         return
     while not stop.is_set():
-        # 各自搶、各自出錯；健康卡的大字版網頁（2026-10-23 GP2 N6）過期的也在這裡順手清
-        for job in (run_daily_check, _run_weekly_analysis, _prune_health_pages):
+        # 各自搶、各自出錯；健康卡的大字版網頁（2026-10-23 GP2 N6）過期的也在這裡順手清；
+        # 去重紀錄一天清一次（2026-10-28）
+        for job in (run_daily_check, _run_weekly_analysis, _prune_health_pages, _purge_old_alerts):
             try:
                 job()
             except Exception as exc:  # 兩個都不丟例外；這裡再接一次，執行緒不會無聲停掉

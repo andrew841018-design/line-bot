@@ -44,6 +44,7 @@ import os
 import re
 import stat
 import statistics
+import sys
 import threading
 import time
 import unicodedata
@@ -1196,7 +1197,8 @@ def resolve_query(body: str, index: dict[str, str]) -> tuple[str, Optional[str]]
 
     先看整段（名稱本身可能有空白：「元大MSCI A股」），再依序看每一段（空白或標點分開），只取第一個
     認得的：開頭是代號 → 用它；是認得的名稱（dict 比對，不用名稱組 regex；見 `_match_name`）→ 用它；
-    全是英文字母 1–5 個 → 美股（後面有台股就用台股）。認不得就回 NOT_FOUND，不猜。
+    都不是台股才看美股代號（2026-10-28：`stock_picks_us.find_us_symbol`，回 (US_SYMBOL, "BRK.B") 這種正規寫法；
+    美股的切段只用空白與中文標點，「S&P」不會變成 S）。認不得就回 NOT_FOUND，不猜。
     """
     text = unicodedata.normalize("NFKC", body or "")[:_QUERY_MAX_CHARS].strip()
     hit = _match_name(text.casefold(), index)
@@ -1213,7 +1215,14 @@ def resolve_query(body: str, index: dict[str, str]) -> tuple[str, Optional[str]]
             return "code", hit
         if 1 <= len(token) <= 5 and token.isascii() and token.isalpha():
             saw_us = True
-    return (US_SYMBOL, None) if saw_us else (NOT_FOUND, None)
+    try:
+        import stock_picks_us
+
+        symbol = stock_picks_us.find_us_symbol(text)
+    except Exception as exc:  # 美股模組壞了：照舊只認出「是美股」，handle 回舊句
+        logger.error("stock picks us symbol parse failed error_type=%s", type(exc).__name__)
+        return (US_SYMBOL, None) if saw_us else (NOT_FOUND, None)
+    return (US_SYMBOL, symbol) if symbol is not None else (NOT_FOUND, None)
 
 
 # ── 抓資料（只用 https、固定主機、不轉址、限制解壓後大小、驗 Content-Type、不關 TLS 驗證） ──
@@ -1313,6 +1322,8 @@ def _get_json(
                 raise FetchError("blocked")
             if 300 <= status < 400:
                 raise FetchError("moved")
+            if status == 404:  # 美股單檔用來分出「認不出代號」（2026-10-28）；其他呼叫端照舊當一般失敗
+                raise FetchError("not_found")
             if status != 200:
                 raise FetchError("status")
             if "json" not in str(resp.headers.get("Content-Type") or "").lower():
@@ -2667,6 +2678,12 @@ def start_background() -> None:
     global _thread, _stop, _wake
     if not _BACKGROUND_ENABLED:
         return
+    try:  # 美股與推薦成績（2026-10-28）：放在台股提早 return 之前；起不來只記種類，不影響台股
+        import stock_picks_us
+
+        stock_picks_us.start_background()
+    except Exception as exc:
+        logger.error("stock picks us background start failed error_type=%s", type(exc).__name__)
     with _lock:
         if _thread is not None and _thread.is_alive():
             return
@@ -2676,6 +2693,12 @@ def start_background() -> None:
 
 
 def stop_background(timeout: float = 2.0) -> None:
+    us = sys.modules.get("stock_picks_us")  # 沒載入過就不 import（停止時不該多做事）
+    if us is not None:
+        try:  # 先把兩邊的停止旗標都設好，再各自 join
+            us.signal_stop()
+        except Exception as exc:
+            logger.error("stock picks us background stop failed error_type=%s", type(exc).__name__)
     with _lock:
         thread, stop, wake = _thread, _stop, _wake
     if stop is not None:
@@ -2684,6 +2707,11 @@ def stop_background(timeout: float = 2.0) -> None:
         wake.set()
     if thread is not None:
         thread.join(timeout=timeout)
+    if us is not None:
+        try:
+            us.join_background(timeout=timeout)
+        except Exception as exc:
+            logger.error("stock picks us background join failed error_type=%s", type(exc).__name__)
 
 
 def _wake_worker() -> None:
@@ -3391,8 +3419,10 @@ TEXT_CARD_FAILED = "股票推薦：卡片暫時出不來，請稍後再試"
 TEXT_EVAL_CARD_FAILED = "股票評估：卡片暫時出不來，請稍後再試"
 TEXT_TOO_LONG = "股票評估：請只打一檔的代號或名稱，例如 /股票 2330"
 # 名稱比對刻意收緊（不猜），所以不說「找不到這一檔」（爸媽會以為下市），而是請他只打代號或名稱。
-TEXT_NOT_FOUND = "股票評估：認不出是哪一檔，請只打代號或名稱，例如 /股票 2330、/股票 台積電"
-TEXT_US = "股票評估：美股還不能查，目前只有台股"
+TEXT_NOT_FOUND = "股票評估：認不出是哪一檔，請只打代號或名稱，例如 /股票 2330、/股票 台積電；美股請打英文代號，例如 /股票 NVDA"
+TEXT_US = "股票評估：美股還不能查，目前只有台股"  # 2026-10-28 起只在美股開關關閉、或美股模組載不進來時用
+TEXT_US_FAILED = "股票評估：美股暫時查不到，請稍後再試"
+TEXT_US_CARDS_FAILED = "股票推薦：美股推薦和推薦成績暫時出不來，請稍後再試"
 TEXT_OTC_UNAVAILABLE = "股票評估：上櫃資料暫時抓不到，請稍後再試"
 TEXT_UNSUPPORTED = "股票評估：目前只看普通股和 ETF"
 TEXT_BUSY = "股票評估：查詢有點多，請過幾分鐘再試"
@@ -3527,15 +3557,21 @@ def handle(body: str, *, deadline: Optional[float] = None) -> Reply:
     text = _normalize_body(body)
     if text is None:
         return Reply(text=TEXT_TOO_LONG)
+    us_reply = _us_command(text, deadline)  # 「美股」「成績」「美股 代號」：不需要台股快照
+    if us_reply is not None:
+        return us_reply
     snapshot, first_failed = _snapshot, _worker.first_round_failed
     if snapshot is None:
+        symbol = _us_only_symbol(text)
+        if symbol is not None:
+            return _us_detail(symbol, deadline)
         _wake_worker()
         return Reply(text=TEXT_UNAVAILABLE if first_failed else TEXT_NOT_READY)
     if text.strip(_TRAILING_PUNCT) in _PICKS_WORDS:
-        return _picks_reply(snapshot)
+        return _with_us(_picks_reply(snapshot))
     kind, code = resolve_query(text, snapshot.index)
     if kind == US_SYMBOL:
-        return Reply(text=TEXT_US)
+        return _us_detail(code, deadline)
     if kind == UNSUPPORTED:
         return Reply(text=TEXT_UNSUPPORTED)
     if code is None:
@@ -3548,3 +3584,101 @@ def handle(body: str, *, deadline: Optional[float] = None) -> Reply:
         facts = found
     bubble = detail_bubble(facts, market=snapshot.market)
     return Reply(flex=bubble, alt_text=detail_alt_text(facts), fallback_text=TEXT_EVAL_CARD_FAILED)
+
+
+# ── 美股與推薦成績的轉接（2026-10-28，第 3 段；邏輯都在 stock_picks_us／stock_picks_perf） ─────────
+# 這裡只決定「交給美股」：模組載不進來或出錯，台股照舊，美股回固定句，不讓整個 /股票 掛掉。
+_US_PICKS_WORDS = ("美股", "美股推薦")
+_PERF_WORDS = ("成績", "推薦成績")
+_US_FORCE_PREFIX = "美股"
+# 台股快照還沒有時認不得台股名稱：這幾個純英文的台股簡稱（不分大小寫、去掉 -KY）不當成美股代號（10/22 的名稱索引）。
+_TW_ASCII_NAMES = frozenset({"abc", "aes", "amax", "gis", "iet", "ikka", "jpp", "linepay", "tpk"})
+
+
+def _us_command(text: str, deadline: Optional[float]) -> Optional[Reply]:
+    """「美股」「美股推薦」→ 美股推薦卡＋成績卡；「成績」「推薦成績」→ 成績卡；「美股 代號」→ 強制查美股
+    （台股英文名和美股代號撞名時用，例如 AES、GIS）。都不是回 None。中間有空白也算（「美股 推薦」）。"""
+    compact = "".join(text.split()).strip(_TRAILING_PUNCT)
+    try:
+        if compact in _US_PICKS_WORDS:
+            import stock_picks_us
+
+            return stock_picks_us.us_reply()
+        if compact in _PERF_WORDS:
+            import stock_picks_us
+
+            return stock_picks_us.perf_reply()
+        stripped = text.strip()
+        if stripped.startswith(_US_FORCE_PREFIX) and len(compact) > len(_US_FORCE_PREFIX):
+            import stock_picks_us
+
+            # 後面的字照原樣交給美股切段（不壓掉空白：「美股 BRK B」不會變成 BRKB）
+            symbol = stock_picks_us.find_us_symbol(stripped[len(_US_FORCE_PREFIX):])
+            if symbol is not None and not stock_picks_us.ENABLED:  # 美股開關關閉：一律舊句
+                return Reply(text=TEXT_US)
+            if symbol == stock_picks_us.REJECTED:
+                return Reply(text=stock_picks_us.TEXT_US_NOT_FOUND)
+            if symbol is not None:  # 強制美股：保留字（AI 等）也照查
+                return stock_picks_us.handle_symbol(symbol, deadline=deadline)
+    except AssertionError:  # 測試的擋網守門（conftest）要讓測試失敗，不能被吞成固定句；正式環境由 main 接住
+        raise
+    except Exception as exc:
+        logger.error("stock picks us command failed error_type=%s", type(exc).__name__)
+        return Reply(text=TEXT_US_CARDS_FAILED if compact in _US_PICKS_WORDS + _PERF_WORDS else TEXT_US_FAILED)
+    return None
+
+
+def _us_only_symbol(text: str) -> Optional[str]:
+    """台股快照還沒有時：整段只有一個美股代號、又不是台股的純英文簡稱 → 代號（或 REJECTED）；其他 None（照舊回準備中）。"""
+    tokens = text.split()
+    if len(tokens) != 1 or tokens[0].casefold().removesuffix("-ky") in _TW_ASCII_NAMES:
+        return None
+    try:
+        import stock_picks_us
+
+        symbol = stock_picks_us.find_us_symbol(tokens[0])
+        if symbol is not None and symbol.casefold() in _TW_ASCII_NAMES:  # 先解析再比（「gis?」「GIS嗎」也擋）
+            return None
+        return symbol
+    except AssertionError:
+        raise
+    except Exception as exc:
+        logger.error("stock picks us symbol parse failed error_type=%s", type(exc).__name__)
+        return None
+
+
+def _us_detail(symbol: Optional[str], deadline: Optional[float]) -> Reply:
+    """美股單檔：保留字回提示；模組載不進來回舊句；出錯回固定句。"""
+    try:
+        import stock_picks_us
+    except Exception as exc:
+        logger.error("stock picks us import failed error_type=%s", type(exc).__name__)
+        return Reply(text=TEXT_US)
+    if symbol is None:
+        return Reply(text=TEXT_NOT_FOUND)
+    if not stock_picks_us.ENABLED:  # 美股開關關閉：保留字、S&P 這類也一律舊句（ROLLBACK.md §1）
+        return Reply(text=TEXT_US)
+    if symbol == stock_picks_us.REJECTED:  # 像美股但不收（S&P、J&J 這類）
+        return Reply(text=stock_picks_us.TEXT_US_NOT_FOUND)
+    if symbol in stock_picks_us.RESERVED:
+        return Reply(text=stock_picks_us.TEXT_RESERVED)
+    try:
+        return stock_picks_us.handle_symbol(symbol, deadline=deadline)
+    except AssertionError:  # 測試的擋網守門（conftest）要讓測試失敗，不能被吞成固定句；正式環境由 main 接住
+        raise
+    except Exception as exc:
+        logger.error("stock picks us lookup failed error_type=%s", type(exc).__name__)
+        return Reply(text=TEXT_US_FAILED)
+
+
+def _with_us(reply: Reply) -> Reply:
+    """台股推薦卡組後面接美股推薦卡＋成績卡；美股有任何問題就原樣回台股（extend_picks_reply 自己也不丟例外）。"""
+    try:
+        import stock_picks_us
+
+        return stock_picks_us.extend_picks_reply(reply)
+    except AssertionError:  # 測試的擋網守門（conftest）要讓測試失敗，不能被吞成固定句；正式環境由 main 接住
+        raise
+    except Exception as exc:
+        logger.error("stock picks us cards failed error_type=%s", type(exc).__name__)
+        return reply

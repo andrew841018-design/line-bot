@@ -243,6 +243,7 @@ def test_get_json_sends_if_modified_since_and_returns_304(monkeypatch):
         (_Resp(status=301), "moved"),
         (_Resp(status=403), "blocked"),
         (_Resp(status=429), "rate_limited"),
+        (_Resp(status=404), "not_found"),  # 2026-10-28：美股單檔用來分出「認不出代號」
         (_Resp(status=500), "status"),
         (_Resp(ctype="text/html"), "not_json"),
         (_Resp(body=b"<html>"), "not_json"),
@@ -551,7 +552,10 @@ INDEX = sp.name_index({"台積電": "2330", "國巨": "2327", "矽力-KY": "6415
         ("2881A", (sp.UNSUPPORTED, None)),
         ("12345", (sp.UNSUPPORTED, None)),
         ("12345678", (sp.NOT_FOUND, None)),
-        ("NVDA", (sp.US_SYMBOL, None)),
+        ("NVDA", (sp.US_SYMBOL, "NVDA")),  # 2026-10-28 起回正規代號（美股第 3 段）
+        ("nvda嗎", (sp.US_SYMBOL, "NVDA")),
+        ("brk/b", (sp.US_SYMBOL, "BRK.B")),
+        ("S&P", (sp.US_SYMBOL, "<rejected>")),
         ("NVDA 2330", ("code", "2330")),
         ("不知道", (sp.NOT_FOUND, None)),
         ("", (sp.NOT_FOUND, None)),
@@ -926,7 +930,8 @@ def test_handle_not_updated_hides_picks(net, monkeypatch):
 @pytest.mark.parametrize(
     "body, text",
     [
-        ("NVDA", sp.TEXT_US),
+        ("S&P", "股票評估：認不出這個美股代號，請確認代號，例如 /股票 NVDA"),  # 不查別家公司（2026-10-28）
+        ("AI", "股票評估：美股請打代號，例如 /股票 NVDA；看推薦請打 /股票"),
         ("2881A", sp.TEXT_UNSUPPORTED),
         ("不存在的公司", sp.TEXT_NOT_FOUND),
         ("9999", sp.TEXT_NOT_FOUND),

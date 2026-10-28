@@ -309,21 +309,38 @@ def main() -> int:
     return 1 if push_failed else 0
 
 
+def _health_part(parent_health, name: str, group_id: str, label: str) -> str:
+    """parent_health 的一段（週報段落或週分析）：沒有這個函式、出錯、空的、沒過推播驗證都回 ""。"""
+    try:
+        build = getattr(parent_health, name, None)
+        text = build(group_id) if callable(build) else None
+        if text and output_validator.validate_outbound_text(text).ok:
+            return text
+    except Exception as exc:
+        print(f"ERR {label}（週報照舊）: {type(exc).__name__}")
+    return ""
+
+
 def _with_parent_health(group_id: str, family_text: str) -> str:
     """家族熱話後面接「🩺 爸媽這週」（2026-10-11 爸媽健康）：同一則推播、不多用額度。
 
-    段落出錯、沒過推播驗證、或合併後超過 4900 字，就照原本的家族熱話推（逐字不變）。
+    2026-10-28（爸媽健康私訊改推群組）：家族主群改推群組之後再接週分析（parent_health.weekly_analysis_text；
+    私訊模式它回 None）。段落和週分析各自驗證、各自接上，段落空的也能只接週分析；合併後超過 4900 字或沒過推播
+    驗證，先丟週分析、再丟整段健康，最後照原本的家族熱話推（逐字不變）。週報整則沒推時週分析也不推（不單推）。
     """
     try:
         import parent_health
 
-        section = parent_health.weekly_section(group_id)
-        if not section or not output_validator.validate_outbound_text(section).ok:
-            return family_text
-        combined = f"{family_text}\n\n{section}"
-        if len(combined) > 4900 or not output_validator.validate_outbound_text(combined).ok:
-            return family_text
-        return combined
+        section = _health_part(parent_health, "weekly_section", group_id, "爸媽健康段落")
+        analysis = _health_part(parent_health, "weekly_analysis_text", group_id, "爸媽健康週分析")
+        for parts in ((section, analysis), (section,)):
+            health = "\n\n".join(part for part in parts if part)
+            if not health:
+                continue
+            combined = f"{family_text}\n\n{health}"
+            if len(combined) <= 4900 and output_validator.validate_outbound_text(combined).ok:
+                return combined
+        return family_text
     except Exception as exc:
         print(f"ERR 爸媽健康段落（週報照舊）: {type(exc).__name__}")
         return family_text

@@ -34,6 +34,7 @@ __all__ = [
     "readings_summary",
     "urgent_readings",
     "urgent_dm_text",
+    "urgent_group_text",
     "TONE_EMOJI",
     "STRENGTH_BALANCE",
     "OTHER_EXERCISE",
@@ -528,7 +529,7 @@ def readings_summary(rows, *, today: date, prev_week_ok: bool = False) -> str:
     return "讀數：" + "、".join(parts) if parts else "這週沒有讀數"
 
 
-# ── 每日檢查：很高的血壓、低血糖（當下怎麼做只在私訊） ─────────────────────────
+# ── 每日檢查：很高的血壓、低血糖（當下怎麼做只在每日檢查，不在卡片） ─────────────
 
 
 def urgent_readings(rows, *, since_ts: float) -> list[tuple[str, date, str, float]]:
@@ -546,10 +547,18 @@ def urgent_readings(rows, *, since_ts: float) -> list[tuple[str, date, str, floa
     ]
 
 
-def urgent_dm_text(role: str, pronoun: str, kind: str, value: str, event_ts: float) -> str:
-    """每日檢查私訊 Andrew 的那行。時間是群組裡提到的時間（不一定是量的時間），也可能是家人轉述的。"""
-    when = datetime.fromtimestamp(float(event_ts), _TPE)
-    said = f"{when.month}/{when.day} {when:%H:%M} 群組提到{role}的"
+# 當下怎麼做：私訊 Andrew 和推到家族群組（2026-10-28）共用同一段，接在「請{誰}」後面
+_URGENT_ADVICE = {
+    "bp_crisis": "休息 5 分鐘後再量一次；還是很高要盡快就醫；有胸痛胸悶、呼吸困難、嘴歪或說話不清、單側手腳無力就打 119",
+    "glucose_low": (
+        "現在再量一次；還是低於 70 或有發抖、冒冷汗，意識清楚、能吞嚥的話先吃 15 克糖（約 3 顆方糖或 120cc 果汁），"
+        "15 分鐘後再量，還是很低就送醫；意識不清或不能吞嚥不要餵，直接打 119"
+    ),
+}
+
+
+def _urgent_reading(kind: str, value: str) -> str:
+    """「血壓 185/125（高壓超過 180、低壓超過 120）」「血糖 62（低於 70）」；其他種類丟 ValueError。"""
     if kind == "bp_crisis":
         parsed = _parse_bp(value)
         parts = []
@@ -557,13 +566,25 @@ def urgent_dm_text(role: str, pronoun: str, kind: str, value: str, event_ts: flo
             parts.append("高壓超過 180")
         if parsed and parsed[1] > 120:
             parts.append("低壓超過 120")
-        return (
-            f"{said}血壓 {value}（{'、'.join(parts) or '很高'}）：請{pronoun}休息 5 分鐘後再量一次；還是很高要盡快就醫；"
-            "有胸痛胸悶、呼吸困難、嘴歪或說話不清、單側手腳無力就打 119"
-        )
+        return f"血壓 {value}（{'、'.join(parts) or '很高'}）"
     if kind == "glucose_low":
-        return (
-            f"{said}血糖 {value}（低於 70）：請{pronoun}現在再量一次；還是低於 70 或有發抖、冒冷汗，意識清楚、能吞嚥的話"
-            "先吃 15 克糖（約 3 顆方糖或 120cc 果汁），15 分鐘後再量，還是很低就送醫；意識不清或不能吞嚥不要餵，直接打 119"
-        )
+        return f"血糖 {value}（低於 70）"
     raise ValueError("unknown urgent kind")
+
+
+def _said_at(event_ts: float) -> str:
+    when = datetime.fromtimestamp(float(event_ts), _TPE)
+    return f"{when.month}/{when.day} {when:%H:%M}"
+
+
+def urgent_dm_text(role: str, pronoun: str, kind: str, value: str, event_ts: float) -> str:
+    """每日檢查私訊 Andrew 的那行。時間是群組裡提到的時間（不一定是量的時間），也可能是家人轉述的。"""
+    reading = _urgent_reading(kind, value)
+    return f"{_said_at(event_ts)} 群組提到{role}的{reading}：請{pronoun}{_URGENT_ADVICE[kind]}"
+
+
+def urgent_group_text(role: str, kind: str, value: str, event_ts: float) -> str:
+    """每日檢查推到家族群組的那行（2026-10-28 私訊改推群組）：對全家說。每日檢查在晚上 9 點，讀數可能是早上
+    提到的，所以寫「之後還沒再量過的話」才照做；當下怎麼做和私訊同一段。"""
+    reading = _urgent_reading(kind, value)
+    return f"{_said_at(event_ts)} 提到{role}的{reading}：之後還沒再量過的話，請{role}{_URGENT_ADVICE[kind]}"

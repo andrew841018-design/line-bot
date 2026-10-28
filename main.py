@@ -270,7 +270,7 @@ async def _app_lifespan(_app: FastAPI):
             stock_picks_module.start_background()
         except Exception as exc:
             logger.warning("stock picks background start failed error_type=%s", type(exc).__name__)
-        # 爸媽健康（2026-10-11）：每天 21:00 後檢查一次異常、私訊 Andrew；啟動失敗只記種類。
+        # 爸媽健康（2026-10-11）：每天 21:00 後檢查一次異常並通知（私訊或家族群組，見 parent_health）；啟動失敗只記種類。
         try:
             import parent_health as _parent_health
 
@@ -7715,7 +7715,7 @@ def _handle_text_message(
         _reply_health(event, group_id, text, health_body)
         return
     # 爸媽健康的緊急字詞（2026-10-11，Andrew 選 4A）：記錄中的家長（家族主群預設，10/17）提到胸痛、跌倒這類，立刻回就醫／119 提醒，
-    # 同時私訊 Andrew。回了就不再往下走；沒回（舊訊息、未來句、30 分鐘內回過）照常路由。
+    # 結果交給 parent_health 通知。回了就不再往下走；沒回（舊訊息、未來句、30 分鐘內回過）照常路由。
     # 放在引用卡片的固定句之前：引用卡片再說「我剛剛跌倒了」也要先回 119。
     if _maybe_reply_parent_red_flag(event, group_id, text):
         return
@@ -22029,7 +22029,7 @@ def _maybe_reply_parent_red_flag(event, group_id: str, text: str) -> bool:
     """記錄中的家長提到緊急狀況時回固定的就醫／119 提醒；回 True＝這則已處理、不再往下走。
 
     判斷（regex＋讀同意表，不叫模型、不連網）在 webhook 鎖裡跑。提醒只用這則的 reply token、
-    不搭到期提醒；送出結果（含靜音、失敗）交給 parent_health 記去重並私訊 Andrew。"""
+    不搭到期提醒；送出結果（含靜音、失敗）交給 parent_health 記去重並通知（私訊或家族群組）。"""
     # 指令（含先點名咪寶再打的「咪寶 /記住 …」）走原本的路由，不當成在講身體狀況。
     if _is_bot_command(text, event.message):
         return False
@@ -22779,10 +22779,14 @@ _HELP_TEXT = (
     "  /取消活動 <關鍵字>      取消含關鍵字的活動\n"
     "【投資】\n"
     "  /股票                   AI 相關股推薦：點選單「📈 股票推薦」或打 /股票，回一組卡片，\n"
-    "                          往左滑看下一張（AI 相關＋便宜＋成長＋走勢，最多 3 檔；最後是 0050、台積電）\n"
-    "  /股票 代號或名稱        看一檔的燈號和理由，例：/股票 2330、/股票 聯發科\n"
+    "                          往左滑看下一張（AI 相關＋便宜＋成長＋走勢，最多 3 檔；接著是 0050、台積電；\n"
+    "                          再來是美股推薦最多 3 檔，最後一張是推薦成績）\n"
+    "  /股票 代號或名稱        看一檔的燈號和理由，例：/股票 2330、/股票 聯發科、/股票 NVDA\n"
+    "                          美股只認英文代號（例：AAPL、BRK.B、VOO）；和台股英文名撞名時打 /股票 美股 GIS\n"
     "                          常問股卡上的「看…細節」按鈕也一樣；每天自動更新，卡片寫資料日期\n"
     "                          用公開數字篩選，只供參考，不是買賣指示\n"
+    "  /股票 美股              只看美股推薦（標普 500 市值前 50 大，4 條都符合才推，最多 3 檔）\n"
+    "  /股票 成績              看過去推薦的表現（推薦後 5、20 個交易日，和 0050、SPY 比）\n"
     "  /FCN                    FCN 評估怎麼用（選單「🧾 FCN評估」也可以）\n"
     "  /FCN 股票… 年利率X%     評估銀行 FCN 的 CP值，例：/FCN NVDA AMD TSLA 年利率18%\n"
     "                          1–4 檔，代號或中文名都可以；期限沒寫當 6 個月，\n"

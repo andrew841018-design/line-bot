@@ -1,7 +1,7 @@
 """爸媽健康暫停使用（緊急停用版：在重啟鎖內把這個檔案換成 parent_health.py，見 ROLLBACK.md）。
 
 main.py 的 /健康 分支照常把訊息接走，這裡一律回固定句：舊卡片上的按鈕仍然點得到，但不會掉進
-一般路由交給模型。不抽取、不回 119、不私訊；週報段落與異常檢查空白；背景什麼都不做。收回訊息
+一般路由交給模型。不抽取、不回 119、不私訊、不推群組；週報段落、週分析與異常檢查空白；背景什麼都不做。收回訊息
 照樣刪掉那則留言的健康紀錄（盡力而為）。介面、常數與正式版相同（測試確認），不 import 正式版。
 2026-10-23：沒有卡片所以沒有大字版網頁；運動提醒一律不提醒（不搶、不放去重列）。換上這個版本重啟時
 （start_background）把健康卡的大字版網頁全部清掉，收回訊息刪到紀錄時也清（盡力而為）。
@@ -37,6 +37,7 @@ __all__ = [
     "observe_message",
     "forget_message",
     "weekly_section",
+    "weekly_analysis_text",
     "anomaly_lines",
     "run_daily_check",
     "start_background",
@@ -209,6 +210,10 @@ def forget_message(group_id: str, message_id: str, *, db_path=None) -> int:
 
 def weekly_section(group_id: str, now: float | None = None) -> str:
     return ""
+
+
+def weekly_analysis_text(group_id: str, now: float | None = None) -> str | None:
+    return None
 
 
 def anomaly_lines(group_id: str, now: float | None = None) -> list[str]:
