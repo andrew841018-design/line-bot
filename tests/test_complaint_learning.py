@@ -883,6 +883,21 @@ def test_text_rejection_ignores_spaces_and_default_ignorable_characters(text, re
 
 
 @pytest.mark.parametrize(
+    "text",
+    [
+        "當家人說 OK. Sure 的時候，先講結論",  # 拿掉空白後是「OK.Sure」，像網址
+        "當家人 PO 影片時，不要在沒看完前說影片沒提到",  # 拿掉空白後是「家人PO」，像代號
+    ],
+)
+def test_squeezed_matching_does_not_invent_urls_or_code_names(text):
+    """R2-10 只要求關鍵字與名字用拿掉空白的副本比對：網址、聯絡資料看保留空白（只拿掉 Default_Ignorable）的寫法，
+    代號只認單一字母。"""
+    assert cl.text_rejection(text, names=cl.load_names()) == ""
+    assert cl.text_rejection("當家人問 example\u034f.com 的影片時，不要說影片沒提到", names=cl.load_names()) == "check:url"
+    assert cl.text_rejection("當家人 A 問影片時，不要說影片沒提到", names=cl.load_names()) == "check:name"
+
+
+@pytest.mark.parametrize(
     "change",
     [
         {"rule": "當媽\u034f媽問問題時，先講結論", "category": "clarity"},

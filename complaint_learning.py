@@ -1133,7 +1133,8 @@ def verdict_rejection(verdict: Verdict, provider: str) -> str:
 
 # 「…時，」「…的時候，」都收，「不要／先／只」前面可以加「請」（GP1 N5）；group(1) 是從「不要／先／只」開始的本文。
 _TEMPLATE_RE = re.compile(r"當[^，,。！？!?\n]{2,30}時候?[，,]請?((?:不要|先|只)[^\n]{2,50})")
-_CODE_NAME_RE = re.compile(r"家人[A-Za-z]|某家人")
+# 代號只有單一字母（家人A、家人B）；「家人PO影片」這種拼起來的英文字不算（拿掉空白比對時才不會誤判）。
+_CODE_NAME_RE = re.compile(r"家人[A-Za-z](?![A-Za-z])|某家人")
 # 對 agent 的字（GP2 #7）：規則進提示詞，也會被維護的 Claude session 讀到。2026-10-28 實作後審查 F1：
 # 加上忽視／略過／解除限制／切換模式／假裝／逐字貼出這類（簡體也擋）；「上面／前面的／設定」太常見，不整批擋。
 # GP1 F4：「只照這條做」「以這條為準」「其他不用管」；「規格」（商品規格）、「為準」（以查到的為準）不整批擋。
@@ -1330,10 +1331,11 @@ def text_rejection(text: str, *, names, behaviour: bool = True) -> str:
 
     raw = str(text or "")
     norm = _clean(raw)
+    visible = _DEFAULT_IGNORABLE_RE.sub("", norm)  # 網址、聯絡資料：保留空白（「OK. Sure」拿掉空白會像網址）
     flat = _squeeze(norm)
-    if fact_filters.LINK_RE.search(norm) or fact_filters.LINK_RE.search(flat):
+    if fact_filters.LINK_RE.search(norm) or fact_filters.LINK_RE.search(visible):
         return "check:url"
-    if fact_filters.has_contact(raw) or fact_filters.has_contact(flat):
+    if fact_filters.has_contact(raw) or fact_filters.has_contact(visible):
         return "check:contact"
     if re.search(r"\d{4,}", flat):
         return "check:digits"
