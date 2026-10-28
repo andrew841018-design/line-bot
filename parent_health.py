@@ -1097,13 +1097,24 @@ def _prune_health_pages() -> None:
 
 
 def _health_page_hours() -> int:
-    """健康卡現在有大字版網頁的話，網頁最多保留幾小時；沒有（關掉、模組壞了）回 0。"""
+    """健康卡現在有大字版網頁的話，網頁最多保留幾小時；沒有（關掉、沒有對外網址、模組壞了）回 0。
+    判斷和 card_pages.publish 一致：開關開著、而且現在有合格的對外網址才會真的有頁、有按鈕
+    （2026-10-25 GP1 #7：沒有 tunnel 網址時，說明和暫停回覆不能說有網頁）。"""
     try:
         import card_pages
 
-        return card_pages.health_ttl_hours() if card_pages.health_enabled() else 0
+        if not card_pages.health_enabled() or card_pages.public_base_url() is None:
+            return 0
+        return card_pages.health_ttl_hours()
     except Exception:
         return 0
+
+
+def _purge_failed_note(purged: bool) -> str:
+    """清不掉大字版網頁時要老實說（2026-10-25 GP2 F6）：回覆已說「刪掉了」，網頁最久還會留一個 TTL。
+    沒有網頁可言（開關關著、沒有對外網址）就不用說。"""
+    hours = 0 if purged else _health_page_hours()
+    return f"；大字版網頁沒能一起清掉，{hours} 小時內會自動失效" if hours else ""
 
 
 def _recording_explanation() -> str:
@@ -1168,7 +1179,9 @@ def _exercise_line(s: _Summary, last=_UNKNOWN) -> str:
         return recent or _EMPTY
     if last is None:
         return recent or "還沒聽到"
-    return f"{recent or _EMPTY}，上次 {_md(last.day)}"
+    if not recent:  # 大字版念起來不能像「沒有紀錄，上次 10/2」這種自相矛盾的句子（2026-10-25 GP1 #5）
+        return f"近 7 天沒聽到（上次 {_md(last.day)}）"
+    return f"{recent}，上次 {_md(last.day)}"
 
 
 def _overview_rows(s: _Summary, visits: list[_Visit], last_exercise=_UNKNOWN) -> list[str]:
@@ -1597,9 +1610,11 @@ def _delete_quoted(ctx: _Ctx, quoted_message_id: str | None) -> CommandReply:
     if not quoted_message_id:
         return _reply("爸媽健康：要先長按那則留言→回覆，再打 /健康 刪除")
     deleted = parent_health_db.delete_message_events(ctx.group_id, quoted_message_id, db_path=ctx.db_path)
-    _purge_health_pages("delete")  # 使用者要刪：大字版網頁上的舊紀錄也一起清掉（2026-10-23）
     if deleted:
-        return _reply(f"爸媽健康：已刪掉那則留言記下的 {deleted} 筆紀錄")
+        # 真的刪了紀錄才清大字版網頁上的舊紀錄（2026-10-23）；沒刪到東西不清：不然任何家人引用任一則留言
+        # 打 /健康 刪除，就能讓所有還有效的大字版連結失效（2026-10-25 GP1 #6）
+        purged = _purge_health_pages("delete")
+        return _reply(f"爸媽健康：已刪掉那則留言記下的 {deleted} 筆紀錄{_purge_failed_note(purged)}")
     return _reply("爸媽健康：那則留言沒有記下健康紀錄")
 
 
@@ -1608,12 +1623,13 @@ def _delete_mine(ctx: _Ctx, user_id: str | None) -> CommandReply:
     if role == FAMILY:
         return _reply("爸媽健康：只有爸爸或媽媽本人能刪自己的全部紀錄")
     deleted = parent_health_db.delete_role_events(ctx.group_id, role, db_path=ctx.db_path)
-    _purge_health_pages("delete_mine")
+    purged = _purge_health_pages("delete_mine")
     # 家族主群預設在記錄：刪完之後的留言還會繼續記，講清楚怎麼停
     still = "；之後的留言還會繼續記錄，要停請打 /健康 暫停" if ctx.states.get(role) == _ON else ""
+    note = _purge_failed_note(purged)
     if deleted:
-        return _reply(f"爸媽健康：已刪掉{role}的 {deleted} 筆紀錄{still}")
-    return _reply(f"爸媽健康：{role}目前沒有紀錄{still}")
+        return _reply(f"爸媽健康：已刪掉{role}的 {deleted} 筆紀錄{note}{still}")
+    return _reply(f"爸媽健康：{role}目前沒有紀錄{note}{still}")
 
 
 def handle_command(

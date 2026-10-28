@@ -58,7 +58,10 @@ _FORBIDDEN_HEADERS = frozenset({"authorization", "cookie", "proxy-authorization"
 # named by this variable, and the /card/<22-character token> route.
 _TUNNEL_DOMAIN = "trycloudflare.com"
 _PAGE_BASE_URL_ENV = "LINE_BOT_CARD_PAGES_BASE_URL"
-_CARD_PATH_RE = re.compile(r"/card/[A-Za-z0-9_-]{22}")
+# The whole path must be the route: one segment of exactly 22 token characters (card_pages'
+# `_TOKEN_RE`).  A longer slug or a deeper path (「/card/some-article-slug」, 「/x/card/<22>」) is an
+# ordinary page on somebody else's site (2026-10-25: this used to be a search, which refused those).
+_CARD_PATH_RE = re.compile(r"/card/[A-Za-z0-9_-]{22}/?")
 
 
 class FetchRefused(ValueError):
@@ -128,14 +131,31 @@ def _page_base_host() -> str:
         return ""
 
 
+def _resolved_path(path: str) -> str:
+    """Empty and '.' segments dropped, '..' applied -- what a client or proxy sends once it has
+    normalised the URL, so 「//card/<token>」 and 「/x/../card/<token>」 are judged as the page
+    they reach."""
+    segments: list[str] = []
+    for segment in path.split("/"):
+        if segment in ("", "."):
+            continue
+        if segment == "..":
+            if segments:
+                segments.pop()
+            continue
+        segments.append(segment)
+    return "/" + "/".join(segments)
+
+
 def is_bot_page(url: str) -> bool:
     """A link to the bot's own pages: any quick tunnel host, the fixed page host,
-    or a /card/<token> path on any host (percent-encoding decoded first, as the
-    web server does before routing).  Syntax only; never raises."""
+    or exactly the /card/<22-character token> path on any host (percent-encoding
+    decoded and dot segments resolved first, as the web server and clients do).
+    Syntax only; never raises."""
     try:
         parts = urlsplit(url if isinstance(url, str) else "")
         host = (parts.hostname or "").rstrip(".").lower()
-        path = unquote(parts.path)
+        path = _resolved_path(unquote(parts.path))
     except ValueError:
         return False
     if host == _TUNNEL_DOMAIN or host.endswith("." + _TUNNEL_DOMAIN):
@@ -143,7 +163,7 @@ def is_bot_page(url: str) -> bool:
     base_host = _page_base_host()
     if base_host and host == base_host:
         return True
-    return _CARD_PATH_RE.search(path) is not None
+    return _CARD_PATH_RE.fullmatch(path) is not None
 
 
 def public_host(url: str) -> str:
