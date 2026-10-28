@@ -6,6 +6,10 @@
 
 做法：沒點名的路徑多一道形狀閘門 `_calendar_query_passive_ok`——短（≤60 字）、沒有 @、整句本身
 就是行事曆問句；不合格的訊息走一般的擷取→抽取→burst。點名咪寶的查詢不受影響。
+
+相鄰兩個子句只有在「其中一個只是片段（單純的日期或疑問詞）」或「一個本身就是查詢、另一個也是問句」時才合成
+一個問題；一個自己成句的陳述（「後天我要面試，」「爸爸下週三要開刀，」）貼在問句旁邊仍是陳述，整則走
+擷取→抽取→burst。判斷看子句還剩下什麼，不看活動詞清單（清單是封閉的：開刀、面試、出國都不在裡面）。
 All sentences are synthetic.
 """
 from __future__ import annotations
@@ -40,7 +44,19 @@ MIXED_MESSAGES = [
     "我10/8要去面試和拿證件。10/7晚上回台北，家裡還有雨傘嗎？",
     "爸爸下週三要回台北，家裡的鑰匙放哪裡嗎？",
 ]
-NOT_QUERIES = REPORT_SENTENCES + NARRATIVE_STATEMENTS + LONG_OR_MENTIONED + MIXED_MESSAGES
+# 排好的行程（陳述）貼在問句旁邊。基礎判斷式把它們全當成查詢（問題就在這裡：陳述的行程沒被記下來）；
+# 活動詞（開刀、面試、出國）都不在 _CAL_ACTIVITY_WORD_RE，所以不能靠清單擋，閘門要擋。
+STATEMENT_NEXT_TO_QUESTION = [
+    "爸爸下週三要開刀，什麼時候回家？",
+    "爸爸下週三開刀，什麼時候回家？",
+    "後天我要面試，明天有什麼行程？",
+    "我下週三要出國，明天有什麼行程？",
+    "明天有什麼行程？我後天要去面試",
+    "後天我要面試\n明天有什麼行程？",  # 換行和逗號一樣是子句的分界
+]
+NOT_QUERIES = (
+    REPORT_SENTENCES + NARRATIVE_STATEMENTS + LONG_OR_MENTIONED + MIXED_MESSAGES + STATEMENT_NEXT_TO_QUESTION
+)
 
 QUERIES = [
     "明天有什麼行程？",
@@ -53,6 +69,11 @@ QUERIES = [
     "媽媽明天回台北嗎？",
     "記得明天爸爸要開會嗎？",
     "後天有什麼活動",
+    # 一個問句後面接另一個問句（追問），或一個只有日期／疑問詞的片段湊成一個問題
+    "明天有什麼行程？需要出門嗎",
+    "明天有什麼行程？後天呢",
+    "媽媽下週三，有什麼安排？",
+    "爸爸明天要開會，什麼時候？",
 ]
 
 
@@ -62,6 +83,14 @@ def test_the_base_predicate_is_unchanged_for_the_statements_the_gate_catches(tex
     # other callers still see 「之前／上次」 as a question word, so the regex is left alone.
     assert len(text) <= main._CAL_PASSIVE_MAX_CHARS and "@" not in text
     assert main._CALENDAR_TIMING_QUERY_RE.search(text)
+    assert main._is_calendar_query(text)
+    assert not main._calendar_query_passive_ok(text)
+
+
+@pytest.mark.parametrize("text", STATEMENT_NEXT_TO_QUESTION)
+def test_a_statement_next_to_a_question_is_blocked_by_the_gate_not_by_the_base_predicate(text):
+    # The base predicate says 「query」 for all of these -- that is the bug.  Only the gate sends them
+    # down capture -> extraction -> burst, so the schedule they state is not lost.
     assert main._is_calendar_query(text)
     assert not main._calendar_query_passive_ok(text)
 
@@ -90,6 +119,25 @@ def test_passive_gate_keeps_real_questions(text):
         ("明天，有什麼行程？", True),
         # a question that also STATES a schedule is a mixed message
         ("後天我要看診，明天有什麼行程？", False),
+        # ...whatever the activity is: 開刀／面試／出國 are on no list, and the verdict does not need them
+        ("爸爸下週三要開刀，什麼時候回家？", False),
+        ("後天我要面試，明天有什麼行程？", False),
+        ("我下週三要出國，明天有什麼行程？", False),
+        ("明天有什麼行程？我後天要去面試", False),
+        ("明天有什麼行程？下週三爸爸要開刀", False),
+        # a newline separates clauses just like a comma
+        ("後天我要面試\n明天有什麼行程？", False),
+        ("明天有什麼行程？\n我後天要去面試", False),
+        # a bare date or a bare question word is a fragment: it completes its neighbour
+        ("媽媽下週三，有什麼安排？", True),
+        ("下週三，爸爸幾點回家？", True),
+        ("爸爸明天要開會，什麼時候？", True),
+        ("明天要看診，爸爸幾點？", True),
+        # a query followed by a question of its own is one compound question ...
+        ("明天有什麼行程？需要出門嗎", True),
+        ("明天有什麼行程？後天呢", True),
+        # ... but a statement after it (no question in it) is not
+        ("明天有什麼行程？媽媽要開會", False),
         # length: 60 characters is the limit, after NFKC
         ("明天有什麼行程？", True),
         ("", False),
@@ -102,6 +150,29 @@ def test_passive_gate_keeps_real_questions(text):
 )
 def test_passive_gate_shape_rules(text, ok):
     assert main._calendar_query_passive_ok(text) is ok
+
+
+@pytest.mark.parametrize(
+    ("clause", "fragment"),
+    [
+        # only a date, a family name, a question word or a particle: it needs its neighbour
+        ("明天，", True),
+        ("媽媽下週三，", True),
+        ("幾點？", True),
+        ("什麼時候？", True),
+        ("後天呢", True),
+        ("爸爸，", True),
+        # anything else is a sentence of its own, listed activity or not
+        ("爸爸下週三要開刀，", False),
+        ("我後天要面試，", False),
+        ("什麼時候回家？", False),
+        ("有什麼行程？", False),
+        ("需要出門嗎", False),
+        ("明天要看診，", False),
+    ],
+)
+def test_a_fragment_is_what_is_left_of_a_clause_after_dates_names_and_question_words(clause, fragment):
+    assert main._calendar_clause_is_fragment(clause) is fragment
 
 
 def test_the_length_limit_counts_characters_after_nfkc():
@@ -215,6 +286,7 @@ _NEW_PATTERNS = {
     "_CAL_YESNO_RE": lambda text: main._CAL_YESNO_RE.search(text),
     "_CAL_ACTIVITY_WORD_RE": lambda text: main._CAL_ACTIVITY_WORD_RE.search(text),
     "_CAL_SCHEDULE_WORD_RE": lambda text: main._CAL_SCHEDULE_WORD_RE.search(text),
+    "_CAL_FRAGMENT_FILLER_RE": lambda text: main._CAL_FRAGMENT_FILLER_RE.sub("", text),
     "_CAL_CLAUSE_SPLIT_RE": lambda text: main._CAL_CLAUSE_SPLIT_RE.split(text),
 }
 
@@ -263,6 +335,13 @@ def _seconds(check, text):
             signal.setitimer(signal.ITIMER_REAL, left, outer[1])
 
 
+# 4× the text should take about 4× the time, not 16×.  The floor is generous on purpose: on a loaded
+# machine one scheduling stall is longer than a whole fast check, so a ratio of two tiny numbers
+# flakes.  A real blow-up (a repeated alternation) is caught by the absolute ceilings and by the
+# structural no-repeated-group test below.
+_TIMING_FLOOR_S = 0.05
+
+
 @pytest.mark.parametrize("name", sorted(_NEW_PATTERNS))
 def test_new_calendar_patterns_run_in_linear_time(name):
     check = _NEW_PATTERNS[name]
@@ -270,7 +349,7 @@ def test_new_calendar_patterns_run_in_linear_time(name):
         small = min(_seconds(check, make(5000)) for _ in range(3))
         large = min(_seconds(check, make(20000)) for _ in range(3))
         assert large < 1.0, (name, shape)
-        assert large < 10 * max(small, 0.002), (name, shape, small, large)  # 4× the text, not 16× the time
+        assert large < 10 * max(small, _TIMING_FLOOR_S), (name, shape, small, large)
 
 
 @pytest.mark.parametrize("shape", sorted(_SHAPES))
@@ -279,12 +358,13 @@ def test_the_gate_itself_is_cheap_on_long_text(shape):
     small = min(_seconds(main._calendar_query_passive_ok, make(5000)) for _ in range(3))
     large = min(_seconds(main._calendar_query_passive_ok, make(20000)) for _ in range(3))
     assert large < 0.5, shape
-    assert large < 10 * max(small, 0.002), (shape, small, large)
+    assert large < 10 * max(small, _TIMING_FLOOR_S), (shape, small, large)
     assert main._calendar_query_passive_ok(make(20000)) is False
 
 
 @pytest.mark.parametrize("name", ["_CAL_PAST_MARKER_RE", "_CAL_TIME_QUESTION_RE", "_CAL_YESNO_RE",
-                                  "_CAL_ACTIVITY_WORD_RE", "_CAL_SCHEDULE_WORD_RE", "_CAL_CLAUSE_SPLIT_RE"])
+                                  "_CAL_ACTIVITY_WORD_RE", "_CAL_SCHEDULE_WORD_RE", "_CAL_FRAGMENT_FILLER_RE",
+                                  "_CAL_CLAUSE_SPLIT_RE"])
 def test_new_calendar_patterns_have_no_repeated_group(name):
     # H5 (line_bot.md 2026-10-05): a repeated alternation must split every string one way only.
     # These patterns are plain word lists, so the simplest way to keep that true is to have no

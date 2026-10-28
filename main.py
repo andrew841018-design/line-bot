@@ -1017,9 +1017,14 @@ def _get_explicit_market_quote_reply(
     if not text:
         return None
     # 2026-10-24: the 「暫時無法取得」 notice is for an instrument the text (or the thread it follows)
-    # actually named.  A name lookup that found nothing is ordinary chat -- it goes the normal
-    # route instead of being answered with a fixed failure sentence.
+    # actually named -- detected offline (a ticker, a known name, an index, a follow-up) or resolved
+    # by the name search the quote path itself runs (``resolved``: the symbols it found, reported
+    # before any price is fetched, so there is no second search).  A name lookup that found nothing
+    # is ordinary chat -- it goes the normal route instead of being answered with a fixed failure
+    # sentence; a name that WAS found but could not be priced still gets the notice, because the
+    # model must not guess that price.
     symbol_detected = False
+    resolved: list[str] = []
     try:
         import stock_quote
         is_quote_request = stock_quote.should_try_contextual_quote(
@@ -1033,10 +1038,14 @@ def _get_explicit_market_quote_reply(
         technical = stock_quote.get_taiex_month_line_text(text)
         if technical:
             return technical
-        quote = stock_quote.get_contextual_quotes_text(text, context=context)
+        quote = stock_quote.get_contextual_quotes_text(
+            text,
+            context=context,
+            resolved_symbols=resolved,
+        )
         if quote:
             return quote
-        if symbol_detected:
+        if symbol_detected or resolved:
             return (
                 "【市場報價｜暫時無法取得】\n"
                 "目前無法在回覆時限內取得可靠報價，沒有交給模型猜價格。"
@@ -1045,7 +1054,7 @@ def _get_explicit_market_quote_reply(
         return None
     except Exception as e:
         logger.info("explicit market quote deterministic path failed: %s", e)
-        if symbol_detected:
+        if symbol_detected or resolved:
             return (
                 "【市場報價｜暫時無法取得】\n"
                 "目前無法在回覆時限內取得可靠報價，沒有交給模型猜價格。"
@@ -8565,6 +8574,33 @@ _CAL_ACTIVITY_WORD_RE = re.compile(
 _CAL_SCHEDULE_WORD_RE = re.compile(
     _CALENDAR_QUERY_DATE_PATTERN + "|" + _CAL_ACTIVITY_WORD_RE.pattern
 )
+# What a clause may consist of and still be only a FRAGMENT of a question (「明天，」「媽媽下週三，」
+# 「幾點？」「後天呢」): dates, question words, yes/no particles, pronouns and punctuation.  Family
+# names are cut out first (_calendar_clause_is_fragment).  The time-question words come before the
+# bare 什麼 on purpose: the first alternative that matches wins, and 什麼時候 must go in one piece.
+_CAL_FRAGMENT_FILLER_RE = re.compile(
+    _CALENDAR_QUERY_DATE_PATTERN
+    + "|"
+    + _CAL_TIME_QUESTION_RE.pattern
+    + "|"
+    + _CAL_YESNO_RE.pattern
+    + r"|有什麼|有哪些|什麼|哪些|哪個|哪裡|誰|全家|大家|家人|[我你妳他她咱們]"
+    + r"|[\s，,。！!；;、：:~～…]"
+)
+
+
+def _calendar_clause_is_fragment(clause: str) -> bool:
+    """True when nothing is left of ``clause`` once its dates, family names, question words,
+    particles and punctuation are taken out: 「明天，」「媽媽下週三，」「幾點？」「後天呢」.
+
+    A fragment cannot be a sentence on its own, so it may be completed by its neighbour into one
+    question.  A clause that says anything else -- 「爸爸下週三要開刀，」「什麼時候回家？」「我後天要
+    面試，」 -- is a sentence of its own, whatever words it uses (the activity list is closed;
+    this test is not)."""
+    rest = clause
+    for start, end, _name in reversed(_family_actors_in_text(clause)):
+        rest = rest[:start] + rest[end:]
+    return not _CAL_FRAGMENT_FILLER_RE.sub("", rest)
 
 
 def _calendar_query_passive_ok(text: str) -> bool:
@@ -8573,7 +8609,12 @@ def _calendar_query_passive_ok(text: str) -> bool:
     1. at most _CAL_PASSIVE_MAX_CHARS characters (no forwarded articles or news);
     2. no @mention (a mention of another family member or @All is not a question to the bot);
     3. some clause, or two adjacent clauses, is itself a calendar query -- a statement clause
-       cannot borrow a question word from an unrelated clause (and vice versa);
+       cannot borrow a question word from an unrelated clause (and vice versa).  Two neighbours
+       are read as ONE question only when the window is a query and either one of them is a
+       fragment (a bare date or a bare question word: 「明天，有什麼行程？」「爸爸明天要拿蛋糕，
+       幾點？」), or one is a query by itself and the other is a question too (「明天有什麼行程？
+       需要出門嗎」).  A sentence of its own next to a query -- 「後天我要面試，明天有什麼行程？」
+       「爸爸下週三要開刀，什麼時候回家？」 -- stays a separate statement;
     4. 「之前／上次／以前」 alone is narrative: it needs a time question word or a yes/no particle
        in the same window;
     5. every clause that talks about a schedule (a date, 開會, 看診, 回台北 ...) must be part of
@@ -8586,7 +8627,15 @@ def _calendar_query_passive_ok(text: str) -> bool:
         return False
     clauses = [c.strip() for c in _CAL_CLAUSE_SPLIT_RE.split(t) if c.strip()]
     schedule = [bool(_CAL_SCHEDULE_WORD_RE.search(c)) for c in clauses]
-    activity = [bool(_CAL_ACTIVITY_WORD_RE.search(c)) for c in clauses]
+    shaped = [
+        bool(_CAL_TIME_QUESTION_RE.search(c) or _CAL_YESNO_RE.search(c)) for c in clauses
+    ]
+    fragments: dict[int, bool] = {}
+
+    def is_fragment(index: int) -> bool:
+        if index not in fragments:
+            fragments[index] = _calendar_clause_is_fragment(clauses[index])
+        return fragments[index]
 
     def is_query(window: str) -> bool:
         if not _is_calendar_query(window):
@@ -8596,13 +8645,20 @@ def _calendar_query_passive_ok(text: str) -> bool:
             and not (_CAL_TIME_QUESTION_RE.search(window) or _CAL_YESNO_RE.search(window))
         )
 
-    covered = [is_query(c) for c in clauses]
+    alone = [is_query(c) for c in clauses]
+    covered = list(alone)
     for i in range(len(clauses) - 1):
-        # Two neighbours form one question only when at most one of them names an activity
-        # (「爸爸明天要拿蛋糕，幾點？」、「明天，有什麼行程？」); two clauses that each name an
-        # activity are two separate sentences that merely sit next to each other.
-        if not (activity[i] and activity[i + 1]) and is_query(clauses[i] + clauses[i + 1]):
-            covered[i] = covered[i + 1] = True
+        j = i + 1
+        if alone[i] and alone[j]:
+            continue
+        completes = (
+            is_fragment(i)
+            or is_fragment(j)
+            or (alone[i] and shaped[j])
+            or (alone[j] and shaped[i])
+        )
+        if completes and is_query(clauses[i] + clauses[j]):
+            covered[i] = covered[j] = True
     if not any(covered):
         return False
     return not any(s and not ok for s, ok in zip(schedule, covered))
@@ -22059,7 +22115,8 @@ def _handle_command(
     if classify_reply is not None:
         return classify_reply
 
-    # 家族財經觀點查詢（2026-05-18 加）
+    # /觀點（2026-05-18 加；2026-10-24 財經觀點停用）：不再查資料，一律回固定的停用說明，
+    # 舊選單卡片上的按鈕點了才有回應。
     fv_reply = _handle_finance_view_command(group_id, t)
     if fv_reply is not None:
         return fv_reply

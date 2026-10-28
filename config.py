@@ -159,8 +159,9 @@ class Settings(BaseSettings):
 
     # family_group_id：顯式「家族主群」識別。給 family-only push script 讀
     # （feedback_push / family_interest / weekly_review / monthly_highlight
-    # / process_feedback / announce_finance_view / line_bot_update_push / weekly_summary
-    # / weekly_retro），避免 positional `[0]` anti-pattern。空字串時自動 fall back 到
+    # / process_feedback / line_bot_update_push / weekly_summary
+    # / weekly_retro；announce_finance_view 2026-10-24 停用後不再讀它），避免 positional
+    # `[0]` anti-pattern。空字串時自動 fall back 到
     # legacy `ALLOWED_GROUP_ID`（也不會 fall back 到 allowed_group_ids[0] — reviewer 兩位
     # 都警告 positional fragility）。
     family_group_id: str = ""

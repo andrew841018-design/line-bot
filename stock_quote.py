@@ -32,6 +32,7 @@ import socket
 import sys
 import threading
 import time
+import unicodedata
 from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
@@ -332,33 +333,40 @@ _LOOKUP_TAIL_FILLER_RE = re.compile(
     re.IGNORECASE,
 )
 # Kinship words only (multi-character on purpose: 公／婆／哥／弟 alone sit inside company names).
+# 大哥／二哥／大姊／大姐 are left out: 台灣大哥大 is a listed company.  A family that really calls
+# someone 大哥 has it in its local role aliases, which are read below.
 # Family NAMES are never written here (this repo is public): they are read from the local alias
 # configuration when a query is checked.
 _KINSHIP_RE = re.compile(
     r"爸爸|媽媽|爸比|媽咪|老爸|老媽|阿爸|阿母|阿公|阿嬤|阿媽|阿姨|爺爺|奶奶|外公|外婆|"
     r"哥哥|姊姊|姐姐|弟弟|妹妹|老公|老婆|兒子|女兒|孫子|孫女|叔叔|伯伯|舅舅|姑姑|嬸嬸|嫂嫂|"
-    r"姊夫|姐夫|妹夫|岳父|岳母|公公|婆婆|家人|親戚|表哥|表姊|表姐|表弟|表妹|堂哥|堂姊|堂姐|堂弟|堂妹|"
-    r"大哥|二哥|大姊|大姐"
+    r"姊夫|姐夫|妹夫|岳父|岳母|公公|婆婆|家人|親戚|表哥|表姊|表姐|表弟|表妹|堂哥|堂姊|堂姐|堂弟|堂妹"
 )
 
 
 def _names_a_family_member(query: str) -> bool:
-    """True when ``query`` carries a kinship word or a configured family alias.
+    """True when ``query`` carries a kinship word, a family alias or a LINE display name -- or when
+    those names cannot be read.
 
-    Such text must never reach a search provider.  The aliases come from the local configuration
-    at call time (``line_mentions.configured_family_aliases``); if that cannot be read the answer
-    is True -- privacy matters more than availability for a name lookup nobody has to see fail.
+    Such text must never reach a search provider.  The names come from
+    ``fact_filters.load_name_terms(require_names=True)`` at call time: the alias file, the role
+    and short names, the display names the bot looked up, and the local privacy terms, each
+    normalised with NFKC and casefold, as is ``query`` here (so 「ＰＥＴＥＲ」 matches 「Peter」).
+    It fails closed: a missing, unreadable or empty name list answers True, because privacy
+    matters more than availability for a name lookup nobody has to see fail.
     """
-    if _KINSHIP_RE.search(query):
+    folded = unicodedata.normalize("NFKC", query or "").casefold()
+    if _KINSHIP_RE.search(folded):
         return True
     try:
-        import line_mentions
+        import fact_filters
 
-        aliases = line_mentions.configured_family_aliases()
+        terms = fact_filters.load_name_terms(require_names=True)
     except Exception:
         return True
-    folded = query.casefold()
-    return any(len(alias) >= 2 and alias.casefold() in folded for alias in aliases if isinstance(alias, str))
+    if not terms:
+        return True
+    return any(term in folded for term in terms)
 
 
 _ALLOWED_LOOKUP_QUOTE_TYPES = {"EQUITY", "ETF", "INDEX", "FUTURE"}
@@ -2561,6 +2569,7 @@ def get_contextual_quotes_text(
     now: datetime | None = None,
     max_symbols: int = 3,
     total_timeout_s: float = 5.0,
+    resolved_symbols: list[str] | None = None,
 ) -> Optional[str]:
     """Resolve and fetch a market quote without letting an LLM invent prices.
 
@@ -2568,6 +2577,11 @@ def get_contextual_quotes_text(
     Taipei wall-clock time—decides whether to show the intraday instrument or
     a verified after-close futures/ADR proxy.  Unknown mappings never fall
     back to an unrelated future.
+
+    ``resolved_symbols``: when a list is passed, the symbols the text resolved to (offline, from
+    context, or through the Yahoo name search) are appended to it before any price is fetched.  A
+    caller can then tell "nothing was found" (the list stays empty) from "found, but could not
+    be priced" (symbols and a ``None`` result) without searching a second time.
     """
     if total_timeout_s <= 0:
         return None
@@ -2589,6 +2603,8 @@ def get_contextual_quotes_text(
     )
     if not symbols:
         return None
+    if resolved_symbols is not None:
+        resolved_symbols.extend(symbols)
 
     wants_adr = bool(_ADR_RE.search(text))
     wants_future = bool(_FUTURE_RE.search(text))
@@ -2804,8 +2820,10 @@ def should_try_contextual_quote(text: str, *, context: list | None = None) -> bo
 def has_detected_symbol(text: str, *, context: list | None = None) -> bool:
     """True when the text names an instrument (a ticker, a known name, an index) or is a
     follow-up that inherits one from ``context``.  No network, no name search: a name that
-    only a Yahoo search might resolve does not count -- that is how a failed lookup is told
-    apart from a failed quote (2026-10-24: only the latter earns 「暫時無法取得」)."""
+    only a Yahoo search might resolve does not count here.  That is how a failed lookup is told
+    apart from a failed quote (2026-10-24: only the latter earns 「暫時無法取得」); a name the
+    search DID resolve is reported by ``get_contextual_quotes_text(resolved_symbols=...)``, so the
+    caller does not have to search again to know it."""
     return bool(_contextual_quote_symbols(text or "", context=context))
 
 

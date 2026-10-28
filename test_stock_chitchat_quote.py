@@ -7,10 +7,14 @@
 股價／股票／指數… 前面（後面只能是多少、現在、怎麼樣、呢、嗎這類詢問詞）、剩下的字要像名稱，
 而且家人別名和親屬稱謂一律不送搜尋服務。失敗句「暫時無法取得」只在真的偵測到代號時才回。
 取捨（寫進規則）：只有「名稱＋股票」、沒有價格詞時不抓報價。
-All sentences are synthetic; family aliases come from a monkeypatched configuration, never from code.
+家人名字的來源是 fact_filters.load_name_terms(require_names=True)（別名檔、角色、短名、LINE 顯示名稱、
+隱私詞；NFKC＋casefold）；讀不到或是空的就一律不送搜尋（fail closed）。
+All sentences and names are synthetic; the family names come from temporary alias / display-name
+files that the tests write, never from code.
 """
 from __future__ import annotations
 
+import json
 import re
 import signal
 import time
@@ -18,7 +22,6 @@ from unittest.mock import patch
 
 import pytest
 
-import line_mentions
 import main
 import stock_quote
 
@@ -102,10 +105,28 @@ def no_search(monkeypatch):
     monkeypatch.setattr(stock_quote.yf, "Search", fail)
 
 
+def use_names(monkeypatch, tmp_path, aliases, *, display=None, roles=None):
+    """Point the name sources at synthetic files (the real ones live in local, untracked files).
+
+    ``aliases`` is the user_aliases.json mapping, ``display`` the LINE display names the bot looked
+    up, ``roles`` the family_roles.local.json mapping.  The real loader reads them on every call."""
+    alias_path = tmp_path / "user_aliases.json"
+    alias_path.write_text(json.dumps(aliases, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setenv("LINE_USER_ALIASES_PATH", str(alias_path))
+    if roles is not None:
+        role_path = tmp_path / "family_roles.local.json"
+        role_path.write_text(json.dumps(roles, ensure_ascii=False), encoding="utf-8")
+        monkeypatch.setenv("LINE_FAMILY_ROLE_ALIASES_PATH", str(role_path))
+    if display is not None:
+        display_path = tmp_path / "member_display_names.json"
+        display_path.write_text(json.dumps(display, ensure_ascii=False), encoding="utf-8")
+        monkeypatch.setenv("LINE_MEMBER_DISPLAY_NAMES_PATH", str(display_path))
+
+
 @pytest.fixture
-def family(monkeypatch):
-    """Two synthetic configured aliases (the real ones live in a local, untracked file)."""
-    monkeypatch.setattr(line_mentions, "configured_family_aliases", lambda **_kw: ("成員甲", "小乙"))
+def family(monkeypatch, tmp_path):
+    """Two synthetic family members in the alias file."""
+    use_names(monkeypatch, tmp_path, {"U_ONE": "成員甲", "U_TWO": "小乙"})
 
 
 # ── 閒聊不是名稱查詢 ─────────────────────────────────────────────────────────
@@ -161,7 +182,16 @@ def test_a_link_never_becomes_part_of_a_name(no_search):
     assert named == "MercadoLibre"
 
 
-# ── 家人別名與親屬稱謂不送搜尋服務 ─────────────────────────────────────────────
+# ── 家人別名、親屬稱謂與 LINE 顯示名稱不送搜尋服務 ─────────────────────────────
+
+
+def forbid_search(monkeypatch):
+    """Make the Yahoo search itself fail the test if anything reaches it."""
+
+    def fail(*_a, **_k):
+        pytest.fail("a family query reached the search provider")
+
+    monkeypatch.setattr(stock_quote.yf, "Search", fail)
 
 
 @pytest.mark.parametrize(
@@ -170,6 +200,7 @@ def test_a_link_never_becomes_part_of_a_name(no_search):
         "成員甲股價多少",       # a configured alias on its own
         "小乙的股價多少",        # the possessive form
         "成員甲Samsung股價多少",
+        "員甲股價多少",          # the two-character short form of a three-character alias
         "媽媽的股價多少",        # kinship words need no configuration
         "爸爸股票現在多少",
         "阿嬤的股價多少",
@@ -182,50 +213,129 @@ def test_family_aliases_and_kinship_never_reach_the_name_search(family, no_searc
     assert stock_quote._resolve_quote_symbols(text) == []
 
 
-def test_without_a_configured_alias_the_same_name_is_just_a_name(monkeypatch):
-    # The alias list, not the shape of the text, is what denies 「成員甲」: nothing in the code
-    # names a family member (the repository is public).
-    monkeypatch.setattr(line_mentions, "configured_family_aliases", lambda **_kw: ())
+def test_a_name_that_is_not_on_the_list_is_just_a_name(monkeypatch, tmp_path):
+    # The list, not the shape of the text, is what denies 「成員甲」: nothing in the code names a
+    # family member (the repository is public).
+    use_names(monkeypatch, tmp_path, {"U_TWO": "小乙"})
     assert stock_quote._extract_lookup_query("成員甲股價多少") == "成員甲"
+    assert stock_quote._extract_lookup_query("小乙股價多少") == ""
 
 
-def test_the_alias_list_is_read_when_the_query_is_checked(monkeypatch):
-    aliases: list[str] = []
-    monkeypatch.setattr(line_mentions, "configured_family_aliases", lambda **_kw: tuple(aliases))
+def test_the_name_list_is_read_when_the_query_is_checked(monkeypatch, tmp_path):
+    use_names(monkeypatch, tmp_path, {"U_TWO": "小乙"})
     assert stock_quote._extract_lookup_query("成員甲股價多少") == "成員甲"
-    aliases.append("成員甲")  # a config change takes effect without a restart
+    # a config change takes effect without a restart
+    use_names(monkeypatch, tmp_path, {"U_TWO": "小乙", "U_ONE": "成員甲"})
     assert stock_quote._extract_lookup_query("成員甲股價多少") == ""
 
 
-def test_a_company_name_that_merely_contains_a_kinship_character_is_not_denied(monkeypatch):
-    monkeypatch.setattr(line_mentions, "configured_family_aliases", lambda **_kw: ())
-    for name in ("公司", "哥倫比亞", "和泰汽車", "婆羅洲礦業", "弟兄", "公共電視"):
+def test_a_company_name_that_merely_contains_a_kinship_character_is_not_denied(family):
+    for name in ("公司", "哥倫比亞", "和泰汽車", "婆羅洲礦業", "弟兄", "公共電視", "台灣大哥大"):
         assert not stock_quote._names_a_family_member(name), name
     assert stock_quote._names_a_family_member("媽媽買的")
     assert stock_quote._names_a_family_member("我家的阿嬤")
 
 
-def test_an_unreadable_alias_configuration_denies_the_lookup(monkeypatch):
-    def broken(**_kw):
-        raise OSError("alias file unreadable")
+def test_a_listed_company_that_looks_like_a_kinship_word_is_looked_up(family, monkeypatch):
+    # 大哥／二哥／大姊／大姐 used to be in the kinship list, which refused 台灣大哥大 (Taiwan Mobile).
+    seen = []
 
-    monkeypatch.setattr(line_mentions, "configured_family_aliases", broken)
-    assert stock_quote._extract_lookup_query("三星電子股價多少") == ""
-    assert stock_quote._search_yahoo_symbols("三星電子", timeout_s=1.5, max_symbols=3) == []
+    class FakeSearch:
+        def __init__(self, query, **_kw):
+            seen.append(query)
+            self.quotes = [{"symbol": "3045.TW", "quoteType": "EQUITY"}]
+
+    monkeypatch.setattr(stock_quote.yf, "Search", FakeSearch)
+    assert stock_quote._extract_lookup_query("台灣大哥大股價多少") == "台灣大哥大"
+    assert stock_quote.should_try_contextual_quote("台灣大哥大股價多少")
+    # The search is asked directly: _resolve_quote_symbols answers 「台灣…多少」 with the default Taiwan
+    # package before it looks any name up (_EXPLICIT_TW_DEFAULT_QUOTE_RE) -- a rule that predates this
+    # and has nothing to do with kinship words.
+    assert stock_quote._search_yahoo_symbols("台灣大哥大", timeout_s=1.5, max_symbols=3) == ["3045.TW"]
+    assert seen == ["台灣大哥大"]
+
+
+def test_a_family_that_calls_someone_big_brother_has_it_in_its_role_aliases(monkeypatch, tmp_path):
+    # ...and a household that really says 「大哥」 for a member lists it in family_roles.local.json,
+    # which is a name source: there the same words are refused, by configuration, not by code.
+    use_names(monkeypatch, tmp_path, {"U_ONE": "成員甲"}, roles={"大哥": "成員甲"})
+    assert stock_quote._extract_lookup_query("大哥股價多少") == ""
+    assert stock_quote._extract_lookup_query("台灣大哥大股價多少") == ""
+
+
+@pytest.mark.parametrize(
+    ("content", "why"),
+    [
+        (None, "the alias file does not exist"),
+        ("{not json", "the alias file is corrupt"),
+        ("[]", "the alias file is not a mapping"),
+        ("{}", "the alias file lists nobody"),
+        ('{"U_ONE": ""}', "the alias file has only blank names"),
+    ],
+)
+def test_an_unreadable_or_empty_name_list_refuses_every_lookup(monkeypatch, tmp_path, content, why):
+    # The REAL loader runs (fact_filters.load_name_terms, require_names=True): it raises when the
+    # alias file cannot be read or names nobody.  Nothing may be sent to a search provider when
+    # nobody knows whose names to keep out -- not even an ordinary company name.
+    path = tmp_path / "user_aliases.json"
+    if content is not None:
+        path.write_text(content, encoding="utf-8")
+    monkeypatch.setenv("LINE_USER_ALIASES_PATH", str(path))
+    forbid_search(monkeypatch)
+    text = "MercadoLibre股價多少？"
+    assert stock_quote._names_a_family_member("MercadoLibre"), why
+    assert stock_quote._extract_lookup_query(text) == "", why
+    assert stock_quote._search_yahoo_symbols("MercadoLibre", timeout_s=1.5, max_symbols=3) == [], why
+    assert stock_quote._resolve_quote_symbols(text) == [], why
+
+
+def test_unreadable_privacy_terms_refuse_every_lookup_too(family, monkeypatch, tmp_path):
+    terms = tmp_path / "privacy_terms.json"
+    terms.write_text("{not json", encoding="utf-8")
+    monkeypatch.setenv("LINE_BOT_PRIVACY_TERMS_PATH", str(terms))
+    forbid_search(monkeypatch)
+    assert stock_quote._names_a_family_member("MercadoLibre")
+    assert stock_quote._extract_lookup_query("MercadoLibre股價多少？") == ""
+    assert stock_quote._search_yahoo_symbols("MercadoLibre", timeout_s=1.5, max_symbols=3) == []
+
+
+def test_a_missing_display_name_file_is_normal(family):
+    # Nobody has been looked up yet: the display names only ADD names, the lookup is not refused.
+    assert not stock_quote._names_a_family_member("MercadoLibre")
+    assert stock_quote._extract_lookup_query("MercadoLibre股價多少？") == "MercadoLibre"
+
+
+def test_a_display_name_alone_is_enough_to_deny_the_lookup(monkeypatch, tmp_path):
+    # A member without an alias is known to the bot only by the LINE display name it looked up.
+    use_names(monkeypatch, tmp_path, {"U_ONE": "成員甲"})
+    assert stock_quote._extract_lookup_query("Zeta Quill股價多少") == "Zeta Quill"  # not on any list yet
+    use_names(monkeypatch, tmp_path, {"U_ONE": "成員甲"}, display={"U_NINE": "Zeta Quill"})
+    for text in ("Zeta Quill股價多少", "ZETA QUILL 股價多少", "ZetaQuill股價多少", "zeta quill stock price"):
+        assert stock_quote._extract_lookup_query(text) == "", text
+    forbid_search(monkeypatch)
+    assert stock_quote._search_yahoo_symbols("Zeta Quill", timeout_s=1.5, max_symbols=3) == []
+
+
+def test_names_are_matched_without_regard_to_case_or_width(monkeypatch, tmp_path):
+    # Terms are NFKC + casefold; so is the query.  Dropping either lets 「PETER」 or the full-width
+    # 「ＰＥＴＥＲ」 through when the list says 「Peter」 -- and the egress guard sees raw text,
+    # not what the shape pattern let in.
+    use_names(monkeypatch, tmp_path, {"U_ONE": "成員甲"}, display={"U_NINE": "Zeta Quill"})
+    for query in ("zeta quill", "ZETA QUILL", "Ｚｅｔａ Ｑｕｉｌｌ", "ＺＥＴＡ\u3000ＱＵＩＬＬ"):
+        assert stock_quote._names_a_family_member(query), query
+    forbid_search(monkeypatch)
+    assert stock_quote._search_yahoo_symbols("ＺＥＴＡ ＱＵＩＬＬ", timeout_s=1.5, max_symbols=3) == []
+    assert stock_quote._search_yahoo_symbols("ZETA QUILL", timeout_s=1.5, max_symbols=3) == []
 
 
 def test_the_search_itself_refuses_a_family_query(family, monkeypatch):
     # The egress is guarded as well as the extraction, in case another caller ever passes a query in.
-    def fail(*_a, **_k):
-        pytest.fail("a family query reached the search provider")
-
-    monkeypatch.setattr(stock_quote.yf, "Search", fail)
+    forbid_search(monkeypatch)
     assert stock_quote._search_yahoo_symbols("成員甲", timeout_s=1.5, max_symbols=3) == []
     assert stock_quote._search_yahoo_symbols("我家媽媽", timeout_s=1.5, max_symbols=3) == []
 
 
-def test_an_ordinary_query_still_reaches_the_search(monkeypatch):
-    monkeypatch.setattr(line_mentions, "configured_family_aliases", lambda **_kw: ("成員甲",))
+def test_an_ordinary_query_still_reaches_the_search(family, monkeypatch):
     seen = []
 
     class FakeSearch:
@@ -285,6 +395,64 @@ def test_a_name_lookup_that_finds_nothing_gets_no_failure_notice(monkeypatch):
     assert main._get_explicit_market_quote_reply(text, context=[]) is None  # ordinary routing, no fixed sentence
 
 
+class _FoundSearch:
+    """A Yahoo search that resolves the name to MELI; remembers every query it was asked."""
+
+    queries: list[str] = []
+
+    def __init__(self, query, **_kw):
+        type(self).queries.append(query)
+        self.quotes = [{"symbol": "MELI", "quoteType": "EQUITY"}]
+
+
+@pytest.fixture
+def found_but_unpriced(monkeypatch):
+    """Yahoo resolves 「MercadoLibre」 to MELI, then no price can be fetched."""
+    _FoundSearch.queries = []
+    monkeypatch.setattr(stock_quote.yf, "Search", _FoundSearch)
+    monkeypatch.setattr(stock_quote, "get_taiex_month_line_text", lambda *_a, **_k: None)
+    monkeypatch.setattr(stock_quote, "_fetch_contextual_quotes_with_deadline", lambda *_a, **_k: {})
+    monkeypatch.setattr(stock_quote, "_fetch_completed_daily_quotes_with_deadline", lambda *_a, **_k: {})
+    return _FoundSearch.queries
+
+
+def test_a_name_yahoo_resolved_but_whose_quote_failed_still_gets_the_notice(found_but_unpriced):
+    text = "MercadoLibre股價多少？"
+    assert not stock_quote.has_detected_symbol(text)  # offline it is only a name...
+    out = main._get_explicit_market_quote_reply(text, context=[])
+    # ...but the model must not guess the price of an instrument that WAS found
+    assert out is not None and out.startswith("【市場報價｜暫時無法取得】")
+    assert "沒有交給模型猜價格" in out
+    assert found_but_unpriced == ["MercadoLibre"]  # one search, not a second one to decide on the notice
+
+
+def test_a_resolved_name_whose_fetch_raised_gets_the_retry_notice(found_but_unpriced, monkeypatch):
+    def boom(*_a, **_k):
+        raise RuntimeError("fetch blew up")
+
+    monkeypatch.setattr(stock_quote, "_fetch_contextual_quotes_with_deadline", boom)
+    out = main._get_explicit_market_quote_reply("MercadoLibre股價多少？", context=[])
+    assert out is not None and out.endswith("請稍後再試一次。")
+    assert found_but_unpriced == ["MercadoLibre"]
+
+
+def test_the_quote_path_reports_what_it_resolved_before_it_fetches(found_but_unpriced, monkeypatch):
+    resolved: list[str] = []
+    assert stock_quote.get_contextual_quotes_text("MercadoLibre股價多少？", resolved_symbols=resolved) is None
+    assert resolved == ["MELI"]
+
+    # a text that names nothing leaves the list empty, and the argument stays optional
+    class EmptySearch:
+        def __init__(self, *_a, **_kw):
+            self.quotes = []
+
+    monkeypatch.setattr(stock_quote.yf, "Search", EmptySearch)
+    resolved = []
+    assert stock_quote.get_contextual_quotes_text("FooBarCorp股價多少？", resolved_symbols=resolved) is None
+    assert resolved == []
+    assert stock_quote.get_contextual_quotes_text("FooBarCorp股價多少？") is None
+
+
 def test_an_error_gets_the_retry_notice_only_when_a_symbol_was_detected():
     with (
         patch.object(stock_quote, "get_taiex_month_line_text", return_value=None),
@@ -304,6 +472,7 @@ _PATTERNS = {
     "_LOOKUP_NOT_A_NAME_START_RE.match": lambda text: stock_quote._LOOKUP_NOT_A_NAME_START_RE.match(text),
     "_LOOKUP_NAME_SHAPE_RE.fullmatch": lambda text: stock_quote._LOOKUP_NAME_SHAPE_RE.fullmatch(text),
     "_KINSHIP_RE.search": lambda text: stock_quote._KINSHIP_RE.search(text),
+    "_names_a_family_member": stock_quote._names_a_family_member,
     "_extract_lookup_query": stock_quote._extract_lookup_query,
     "should_try_contextual_quote": stock_quote.should_try_contextual_quote,
 }
@@ -350,19 +519,21 @@ def _seconds(check, text):
             signal.setitimer(signal.ITIMER_REAL, left, outer[1])
 
 
-@pytest.fixture
-def no_aliases(monkeypatch):
-    monkeypatch.setattr(line_mentions, "configured_family_aliases", lambda **_kw: ())
+# 4× the text should take about 4× the time, not 16×.  The floor is generous on purpose: on a loaded
+# machine one scheduling stall is longer than a whole fast check, so a ratio of two tiny numbers
+# flakes.  A real blow-up (a repeated alternation) is caught by the 1 s ceiling and by the
+# structural no-repeated-group tests below.
+_TIMING_FLOOR_S = 0.05
 
 
 @pytest.mark.parametrize("name", sorted(_PATTERNS))
-def test_new_lookup_checks_run_in_linear_time(no_aliases, name):
+def test_new_lookup_checks_run_in_linear_time(name):
     check = _PATTERNS[name]
     for shape, make in _SHAPES.items():
         small = min(_seconds(check, make(5000)) for _ in range(3))
         large = min(_seconds(check, make(20000)) for _ in range(3))
         assert large < 1.0, (name, shape)
-        assert large < 10 * max(small, 0.002), (name, shape, small, large)  # 4× the text, not 16× the time
+        assert large < 10 * max(small, _TIMING_FLOOR_S), (name, shape, small, large)
 
 
 @pytest.mark.parametrize(
