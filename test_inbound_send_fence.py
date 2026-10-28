@@ -366,15 +366,32 @@ def test_a_restart_before_the_send_lets_the_new_instance_answer(line, monkeypatc
 
 
 def test_a_payload_rejection_lifts_the_fence_without_pushing(line, clock):
+    """Batch 2 (B6.3) changed this contract for a *text* reply: LINE's 400 is answered by one plain
+    text resend (test_reply_400_recovery.py) and, if that is refused too, by a push where a push
+    is allowed.  What stays: where no push is allowed (reply-only flows), and for cards (always),
+    a refused reply lifts the fence and pushes nothing."""
     open_event()
     line.reply_message.side_effect = api_error(400, BAD_PAYLOAD)
 
-    assert say() is False
+    assert say(allow_push_fallback=False) is False
 
     assert status() == "processing"  # nothing was sent: the event may be handled again
     line.push_message.assert_not_called()
     clock["t"] += 200
     assert memory.begin_inbound_event(GROUP, "M1") == "retry"
+
+
+def test_a_card_payload_rejection_lifts_the_fence_without_pushing(line, clock):
+    """A menu / large-menu / Flex command card is never sent again as plain text and never pushed
+    (its altText is not a message to push, line_bot.md 10/05)."""
+    open_event()
+    line.reply_message.side_effect = api_error(400, BAD_PAYLOAD)
+
+    assert say("選單", large_menu_card=True) is False
+
+    line.reply_message.assert_called_once()  # no second attempt
+    assert status() == "processing"
+    line.push_message.assert_not_called()
 
 
 @pytest.mark.parametrize("code", [401, 403, 404, 413, 429])
@@ -390,7 +407,7 @@ def test_any_other_4xx_also_lifts_the_fence(line, code):
 def test_the_event_can_be_answered_after_the_fence_was_lifted(line):
     open_event()
     line.reply_message.side_effect = api_error(400, BAD_PAYLOAD)
-    assert say() is False
+    assert say(allow_push_fallback=False) is False  # (batch 2: with a push allowed it would push)
     line.reply_message.side_effect = None
     main._register_inbound_reply_token(TOKEN, GROUP, "M1")
 

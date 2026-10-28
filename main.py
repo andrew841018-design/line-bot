@@ -106,6 +106,7 @@ import feedback_collector
 import gemini_client
 import line_errors
 import line_mentions
+import reply_riders
 import tiktok_media
 import memory
 import speaker_turns
@@ -175,6 +176,13 @@ async def _maintain_local_vision_worker() -> None:
                 last_error_type = error_type
 
 
+# How long the lifespan exit waits for burst flushes that are still running (burst_filter), and
+# how much longer than that the exit waits for the drain itself (its database writes) before it
+# stops caring and carries on.
+_EXIT_DRAIN_SECONDS = 8.0
+_EXIT_DRAIN_MARGIN_SECONDS = 4.0
+
+
 @asynccontextmanager
 async def _app_lifespan(_app: FastAPI):
     """Run the same startup hooks previously registered via app.on_event."""
@@ -237,6 +245,17 @@ async def _app_lifespan(_app: FastAPI):
             logger.warning("parent health background start failed error_type=%s", type(exc).__name__)
         yield
     finally:
+        # 2026-10-24 (B7.1): messages still in the 8 s debounce window (and flush threads that
+        # have not finished) would die with the process, unanswered and unremembered.  Queued ones
+        # go to the conversation memory and are closed first, in-flight ones get a short grace
+        # period.  First thing, time-boxed, and a failure here never blocks the exit.
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(burst_filter.drain_for_shutdown, _EXIT_DRAIN_SECONDS),
+                timeout=_EXIT_DRAIN_SECONDS + _EXIT_DRAIN_MARGIN_SECONDS,
+            )
+        except Exception as exc:
+            logger.warning("burst drain on exit failed error_type=%s", type(exc).__name__)
         if parent_health_module is not None:
             try:
                 parent_health_module.stop_background(timeout=2.0)
@@ -540,6 +559,28 @@ def _exercise_nudge_message(nudge):
         return None
 
 
+def _claim_exercise_nudge_for_reply(reply_token: str | None, group_id: str | None):
+    """`_reply` 用（PLAN A phase 2；只在開關開著時呼叫）：拿走這個 token 登記的運動提醒、把訊息組好驗過，
+    最後才搶今天的去重列（claim_exercise_nudge 會重算一次資格：flush 到送出之間可能暫停、刪紀錄）。
+    回 (NudgeSlot, 訊息) 或 (None, None)——任何一步失敗都只丟掉提醒、主回覆照送，只記錯誤種類。"""
+    try:
+        nudge = _take_exercise_nudge(reply_token, group_id)
+        if nudge is None:
+            return None, None
+        message = _exercise_nudge_message(nudge)
+        if message is None:
+            return None, None
+        import parent_health
+
+        claim = parent_health.claim_exercise_nudge(group_id, nudge)
+        if claim is None:
+            return None, None
+        return reply_riders.NudgeSlot(nudge, claim), message
+    except Exception as exc:
+        logger.warning("exercise nudge skipped error_type=%s", type(exc).__name__)
+        return None, None
+
+
 def _mark_inbound_reply_succeeded(reply_token: str | None) -> None:
     """Persist reply success so future LINE redelivery can be safely skipped."""
     if not reply_token:
@@ -805,6 +846,14 @@ def _extract_reply_payload_targets(message: TextMessageContent) -> list:
     targets = []
     seen_user_ids: set[str] = set()
     for mentionee in mentionees:
+        # 2026-10-24 (B6.5): LINE refuses a mention of the bot's own user id in a reply, and the
+        # whole reply goes with it -- an @咪寶 message mentions the bot (`is_self`), so skip it.
+        if (
+            getattr(mentionee, "is_self", None)
+            if not isinstance(mentionee, dict)
+            else (mentionee.get("is_self") or mentionee.get("isSelf"))
+        ) is True:
+            continue
         user_id = (
             getattr(mentionee, "user_id", None)
             if not isinstance(mentionee, dict)
@@ -11902,10 +11951,9 @@ def _text_message_with_mentions(
     reply_text = str(text or "")
     if not prepared:
         reply_text = _prepare_outbound_text(reply_text, source=validation_source)
-    reply_text = reply_text[:limit]
+    # LINE counts text in UTF-16 code units (an emoji is 2), so the limit is applied in those.
+    reply_text = line_mentions.clip_utf16(reply_text, limit)
     try:
-        import line_mentions
-
         if explicit_only:
             aliases = []
             for candidate in re.findall(
@@ -11986,7 +12034,8 @@ def _text_message_with_mentions(
                 # The text opens with its own @ line (a reminder receipt):
                 # ping there instead of adding a second line of the same names.
                 body, plain_labels = rest, [token.replace("＠", "@") for token in tokens]
-            message_dict = line_mentions.text_v2_dict(body, targets, plain_labels)
+            # The template text (prefix + escaped body) is clipped to the limit after escaping.
+            message_dict = line_mentions.text_v2_dict(body, targets, plain_labels, limit=limit)
             return reply_text, line_mentions.sdk_message_from_text_v2_dict(
                 message_dict,
                 quote_token=quote_token,
@@ -23145,6 +23194,137 @@ def _attach_menu_buttons(message, group_id: str | None) -> None:
         logger.exception("menu buttons not attached group=%s", group_id)
 
 
+def _archived_text(message, default: str) -> str:
+    """What a sent message is stored as in raw_messages (2026-10-24, B6.5): its text.  A textV2
+    message's text is a template whose literal braces are escaped (`{{`), and the archive is read
+    back by the model as the bot's own words -- so the escapes are undone; the `{p1}` placeholder
+    stays, as it always did.  A brace-free text is stored byte for byte."""
+    text = getattr(message, "text", None)
+    if not isinstance(text, str):
+        return default
+    if type(message).__name__ == "TextMessageV2":
+        return line_mentions.unescape_text_v2(text)
+    return text
+
+
+def _sanitized_plain_text_message(text: str):
+    """One plain v1 TextMessage: no placeholder, mention or quote token LINE could refuse, at most
+    4900 UTF-16 code units (2026-10-24).  What a refused reply is sent again as."""
+    return TextMessage(
+        text=line_mentions.clip_utf16(str(text or ""), reply_riders.PLAIN_TEXT_LIMIT) or "…"
+    )
+
+
+class _ReplyRecovery(NamedTuple):
+    outcome: str  # "accepted" | "ambiguous" | "rejected"
+    resp: object | None  # LINE's answer when accepted
+    error: BaseException | None  # the last failure when it was not
+    plain_push: bool  # a push, if one is allowed, carries sanitized plain text
+
+
+def _reply_attempt(reply_token: str, messages: list, send_fence):
+    """One more `reply_message` after LINE refused the first one.  Returns ("accepted", resp) |
+    ("rejected", error) -- LINE answered 4xx (or the request could not even be built): nothing
+    was sent | ("ambiguous", error) -- timeout, 5xx, connection error: it may have been
+    delivered.  Accepted marks the inbound event(s) replied, as the first attempt would."""
+    try:
+        request = ReplyMessageRequest(reply_token=reply_token, messages=messages)
+        config = _get_line_config()
+    except Exception as exc:
+        logger.warning("reply resend not built error_type=%s", type(exc).__name__)
+        return "rejected", exc
+    try:
+        with ApiClient(config) as api_client:
+            resp = MessagingApi(api_client).reply_message(request)
+    except Exception as exc:
+        logger.warning(
+            "reply resend failed: %s", _line_error_detail(exc, secrets=(reply_token,))
+        )
+        return ("rejected" if line_errors.is_client_error(exc) else "ambiguous"), exc
+    _mark_inbound_reply_succeeded(reply_token)
+    _settle_inbound_fence_replied(send_fence)
+    return "accepted", resp
+
+
+def _recover_rejected_reply(
+    *,
+    reply_token: str,
+    group_id: str | None,
+    text: str,
+    primary_suppressed: bool,
+    batch: "reply_riders.Batch",
+    error: BaseException,
+    send_fence,
+) -> _ReplyRecovery:
+    """LINE refused a *text* reply with a 400 that is not about the token (2026-10-24, B6.3).
+
+    Nothing was delivered.  LINE names the refused message(s) in ``details[].property``
+    (``messages[2].text``); what happens depends on which one it is:
+
+    * only riders are named (a reminder, an acknowledgement, the nudge): they are *fenced* -- a
+      reminder's delivery claim becomes `uncertain`, the nudge's dedupe row is kept, an
+      acknowledgement stays claimed until its claim lapses -- so a bad rider does not ride on
+      every later reply; every other rider is released unsent; and the primary goes alone,
+      exactly as it was built (if LINE refuses it after all, once more as plain text);
+    * the primary message is named, or no message could be told: every rider is released (not
+      fenced) and the primary goes alone as one plain TextMessage.
+
+    A rider is never sent again as plain text: its plain version starts with the label of the
+    person it pings -- the literal 「@當事人」 when the creator has no local alias -- which the
+    group would read as text, where the textV2 placeholder showed a real @; and the refusal may
+    well come from that mention (a person who is not in the group).
+
+    Every outcome that is not an acceptance ends the same way: ``rejected`` -- LINE refused
+    everything it was given, so the caller may push (only where the fence rules allow) --, or
+    ``ambiguous`` -- the last attempt may have been delivered, so the fence stays and nothing is
+    pushed.  At most three `reply_message` calls; the logs carry indexes, kinds and ids, never
+    text.  On acceptance the lists (messages, refs, riders, claims) are already what LINE
+    accepted, so `_reply`'s archive and finalize code runs unchanged.
+    """
+    named = line_errors.rejected_message_indexes(error)
+    case, hits = reply_riders.classify_rejection(named, batch.riders, not primary_suppressed)
+    logger.warning(
+        "reply content refused case=%s msgs=%d indexes=%s riders=%s: %s",
+        case,
+        len(batch.messages),
+        named,
+        [batch.riders[index].label for index in hits],
+        _line_error_detail(error, secrets=(reply_token,)),
+    )
+    every_rider = {index for index, rider in enumerate(batch.riders) if rider is not None}
+    batch.remove_riders(
+        every_rider,
+        fence=set(hits) if case == "riders" else frozenset(),
+        orphans="release",
+    )
+    if primary_suppressed:  # a reply of riders only: nothing is left to send
+        return _ReplyRecovery("rejected", None, error, False)
+
+    if case == "riders":
+        # The primary was not named: it goes alone as it was built (mention and all).
+        status, payload = _reply_attempt(reply_token, list(batch.messages), send_fence)
+        if status == "accepted":
+            logger.info("reply accepted without the refused rider(s) group=%s", group_id)
+            return _ReplyRecovery("accepted", payload, None, False)
+        if status == "ambiguous":
+            return _ReplyRecovery("ambiguous", None, payload, False)
+        if _is_definite_reply_token_error(payload):
+            # LINE may spend the token on a refusal: the push is all that is left, and the
+            # primary was never accused, so it keeps its usual form.
+            return _ReplyRecovery("rejected", None, payload, False)
+        # LINE refused the primary after all, without naming it: plain text below.
+
+    plain = _sanitized_plain_text_message(text)
+    status, payload = _reply_attempt(reply_token, [plain], send_fence)
+    if status == "rejected":
+        return _ReplyRecovery("rejected", None, payload, True)
+    batch.messages[:] = [plain]
+    if status == "accepted":
+        logger.info("reply accepted as one plain text message group=%s", group_id)
+        return _ReplyRecovery("accepted", payload, None, False)
+    return _ReplyRecovery("ambiguous", None, payload, False)
+
+
 def _reply(
     reply_token: str,
     text: str,
@@ -23174,6 +23354,12 @@ def _reply(
 
     只有 LINE 明確接受 reply 或 fallback push 時回傳 True；模糊失敗、
     靜音或內容被抑制時回傳 False，讓需要 durable cleanup 的 caller 判斷。
+
+    2026-10-24（B6.3）：文字回覆被 LINE 以 400 拒絕、而且不是 token 的問題時，不再整則放棄——依
+    ``details[].property`` 找出被拒的那一則（`_recover_rejected_reply`）：只點名搭車訊息（提醒、確認、
+    運動提醒）→ 那些圍住、其他搭車的放掉，主訊息照原樣單獨再送；點名主訊息或點名不出來 → 搭車的全部放掉，
+    主訊息改純文字單獨再送一次。搭車訊息絕不改成純文字重送。再被拒才 push（只在批次 1 的圍欄規則允許時）；
+    含糊結果一律留著圍欄、不 push。選單與 Flex 卡片不走這條。
 
     settings.bot_muted=True 時整個函式 short-circuit:
     不 reply、不 push、只把原本要送的 text 寫進 log 方便除錯。
@@ -23217,7 +23403,8 @@ def _reply(
     # LINE 單則訊息上限 5000 字；在截斷前先預留 footer 空間
     footer = _get_quota_footer()
     if not primary_suppressed:
-        text = text[: 4900 - len(footer)] + footer
+        # LINE counts UTF-16 code units, not characters (2026-10-24)
+        text = line_mentions.clip_utf16(text, 4900 - line_mentions.utf16_len(footer)) + footer
     if not primary_suppressed and _is_system_status_outbound(text):
         logger.info(
             "suppressed system-status LINE reply group=%s preview=%r",
@@ -23288,6 +23475,11 @@ def _reply(
     message_reminder_refs: list[dict | None] = (
         [] if primary_suppressed else [primary_reminder_ref]
     )
+    # Aligned with messages_to_send (None for the primary): what each rider holds.  Used to settle
+    # the riders one by one when LINE refuses a text reply with a 400 that names a message
+    # (_recover_rejected_reply); never keyed by id(message), the list is rebuilt by drop_indexes.
+    riders: list[reply_riders.Rider | None] = [] if primary_suppressed else [None]
+    nudge_slot: reply_riders.NudgeSlot | None = None
     pending_commit_ids: list[str] = []
     pending_confirmation_claims: list[tuple[int, str]] = []
     confirmations_committed = False
@@ -23339,6 +23531,11 @@ def _reply(
                             )
                             messages_to_send.append(pig_message)
                             message_reminder_refs.append(None)
+                            riders.append(
+                                reply_riders.Rider(
+                                    "pending", f"pending:{msg_id or ''}", commit_id=msg_id or None
+                                )
+                            )
                             if msg_id:
                                 pending_commit_ids.append(msg_id)
                             logger.info(
@@ -23382,9 +23579,15 @@ def _reply(
                         )
                         messages_to_send.append(confirmation_message)
                         message_reminder_refs.append(None)
+                        riders.append(
+                            reply_riders.Rider(
+                                "confirmation", f"confirmation:{claim[0]}", confirmation=claim
+                            )
+                        )
                 except Exception as e:
                     del messages_to_send[confirmation_start:]
                     del message_reminder_refs[confirmation_start:]
+                    del riders[confirmation_start:]
                     if pending_confirmation_claims:
                         try:
                             memory.release_reminder_confirmations(
@@ -23433,6 +23636,9 @@ def _reply(
                                 continue
                             pending_reminder_indexes.append(len(messages_to_send))
                             messages_to_send.append(reminder_message)
+                            riders.append(
+                                reply_riders.Rider("event", f"event:{e.get('event_id')}")
+                            )
                             message_reminder_refs.append(
                                 {
                                     "source_kind": (
@@ -23497,6 +23703,9 @@ def _reply(
                                     explicit_only=True,
                                 )[1]
                             )
+                            riders.append(
+                                reply_riders.Rider("natural", f"reminder:{int(item['reminder_id'])}")
+                            )
                             message_reminder_refs.append(
                                 {
                                     "reminder_id": int(item["reminder_id"]),
@@ -23553,6 +23762,7 @@ def _reply(
             else:
                 kept_event_reminders.append((event_id, offset))
                 event_delivery_claims.append(claim)
+                riders[idx].event_claims.append(claim)
         kept_natural_reminders: list[dict] = []
         for idx, item in zip(
             pending_reminder_push_indexes, pending_reminder_pushes
@@ -23603,6 +23813,7 @@ def _reply(
             else:
                 kept_natural_reminders.append(item)
                 natural_delivery_claims.append(claim)
+                riders[idx].natural_claims.append(claim)
         # 2026-10-05 (S10 i, fixC12): a calendar-mirror row or a 前一天／當天
         # row and the reminder for the same real-world event go out as one
         # message, the reminder's.  The rider's claim stays, so both are marked
@@ -23628,6 +23839,15 @@ def _reply(
                 riding = {}
             for rider_live in riding:
                 drop_indexes.add(pending_reminder_push_indexes[live[rider_live]])
+                try:
+                    # the dropped message keeps its claim; it is settled with the carrier's message
+                    reply_riders.fold_claims(
+                        riders,
+                        pending_reminder_push_indexes[live[rider_live]],
+                        pending_reminder_push_indexes[live[riding[rider_live]]],
+                    )
+                except Exception as fold_error:
+                    logger.warning("rider claim folding skipped: %s", type(fold_error).__name__)
         # 2026-10-04 (P4 v3 item 6): a calendar item and a reminder item for the
         # same real-world event go out as one message, the reminder's.  The
         # calendar claim stays, so both are marked once LINE accepts the batch
@@ -23655,6 +23875,14 @@ def _reply(
                 event_index = pending_reminder_indexes[event_position]
                 if event_index not in drop_indexes:
                     drop_indexes.add(event_index)
+                try:
+                    reply_riders.fold_claims(
+                        riders,
+                        event_index,
+                        pending_reminder_push_indexes[live[covered[event_position]]],
+                    )
+                except Exception as fold_error:
+                    logger.warning("rider claim folding skipped: %s", type(fold_error).__name__)
         if drop_indexes:
             messages_to_send = [
                 message
@@ -23666,6 +23894,7 @@ def _reply(
                 for idx, reference in enumerate(message_reminder_refs)
                 if idx not in drop_indexes
             ]
+            riders = [rider for idx, rider in enumerate(riders) if idx not in drop_indexes]
             pending_reminders = kept_event_reminders
             pending_reminder_pushes = kept_natural_reminders
         if not messages_to_send:
@@ -23673,6 +23902,24 @@ def _reply(
             if primary_suppressed:
                 _mark_inbound_reply_completed_no_reply(reply_token)
             return False
+        # 爸媽運動提醒（PLAN A phase 2）：只搭在咪寶本來就要送的主回覆上（沒有主訊息、卡片、不帶輔助訊息的
+        # 回覆都不放），排在最後、不擠掉到期提醒（要有空位）。開關關著時連候選都不看：零 DB、零 import。
+        # 訊息先組好驗過，再搶今天的去重列（claim 裡會重算一次資格）；搶到才放進這次的回覆。
+        if (
+            group_id
+            and not primary_suppressed
+            and include_auxiliary
+            and flex_card is None
+            and len(messages_to_send) < 5
+            and _exercise_nudge_on()
+        ):
+            nudge_slot, nudge_message = _claim_exercise_nudge_for_reply(reply_token, group_id)
+            if nudge_slot is not None:
+                messages_to_send.append(nudge_message)
+                message_reminder_refs.append(None)
+                riders.append(
+                    reply_riders.Rider("nudge", "nudge", slot=nudge_slot)
+                )
         if menu_buttons:
             # LINE shows only the last message's Quick Reply.
             _attach_menu_buttons(messages_to_send[-1], group_id)
@@ -23709,6 +23956,7 @@ def _reply(
                     group_id,
                 )
                 return False
+        send_error: BaseException | None = None
         try:
             reminder_delivery_started = bool(
                 event_delivery_claims or natural_delivery_claims
@@ -23717,17 +23965,78 @@ def _reply(
                 resp = MessagingApi(api_client).reply_message(reply_request)
                 _mark_inbound_reply_succeeded(reply_token)
                 _settle_inbound_fence_replied(send_fence)
-        except Exception as e:
+        except Exception as send_exc:
+            send_error = send_exc
+        # 2026-10-24 (B6.3): a *text* reply that LINE refuses with a 400 which is not about the
+        # token is not given up on: the refused rider is told apart and left out, the primary goes
+        # alone -- as it was built, or as plain text (see _recover_rejected_reply).  Menu,
+        # large-menu and Flex command cards never fall back to plain text (an altText is not a
+        # message to push), so they skip this.
+        recovered_rejected = False
+        plain_push = False
+        if (
+            send_error is not None
+            and not (menu_card or large_menu_card or flex_card is not None)
+            # a degraded receipt Andrew rejected is not worth a second delivery path: a refusal
+            # ends it (below), as before
+            and not user_rejected_primary
+            and line_errors.is_bad_request(send_error)
+            and not _is_definite_reply_token_error(send_error)
+        ):
+            try:
+                recovery = _recover_rejected_reply(
+                    reply_token=reply_token,
+                    group_id=group_id,
+                    text=text,
+                    primary_suppressed=primary_suppressed,
+                    batch=reply_riders.Batch(
+                        group_id=group_id or "",
+                        messages=messages_to_send,
+                        refs=message_reminder_refs,
+                        riders=riders,
+                        event_claims=event_delivery_claims,
+                        natural_claims=natural_delivery_claims,
+                        confirmation_claims=pending_confirmation_claims,
+                        commit_ids=pending_commit_ids,
+                    ),
+                    error=send_error,
+                    send_fence=send_fence,
+                )
+            except Exception as recovery_error:
+                # A bug here must never turn a refused reply into a second copy: whatever was
+                # sent is unknown, so it is handled as an ambiguous send (the fence stays).
+                logger.error(
+                    "reply recovery failed error_type=%s", type(recovery_error).__name__
+                )
+                recovery = _ReplyRecovery("ambiguous", None, recovery_error, False)
+            if recovery.outcome == "accepted":
+                resp = recovery.resp
+                send_error = None
+            else:
+                send_error = recovery.error
+                recovered_rejected = recovery.outcome == "rejected"
+                plain_push = recovery.plain_push
+        if send_error is not None:
+            e = send_error
             delivery_claims = [
                 *event_delivery_claims,
                 *natural_delivery_claims,
             ]
-            definite_reply_failure = _is_definite_reply_token_error(e)
+            token_dead = _is_definite_reply_token_error(e)
+            # LINE refused everything it was given (recovery), or the token is dead: nothing was
+            # delivered, a push may follow where the fence rules allow it.
+            definite_reply_failure = token_dead or recovered_rejected
             if definite_reply_failure:
                 memory.release_reminder_delivery_claims(delivery_claims)
             else:
                 memory.mark_reminder_delivery_claims_uncertain(delivery_claims)
             reminder_delivery_settled = True
+            if nudge_slot is not None and not nudge_slot.settled:
+                # Definitely not delivered (token error, a 4xx) -> the dedupe row goes back;
+                # ambiguous -> it stays: better one nudge too few than one too many.
+                if definite_reply_failure or line_errors.is_client_error(e):
+                    reply_riders.release_nudge(group_id or "", nudge_slot)
+                nudge_slot.settled = True
             logger.warning(
                 "reply failed: %s", _line_error_detail(e, secrets=(reply_token,))
             )
@@ -23777,25 +24086,37 @@ def _reply(
                     push_allowed = False
                 if not push_allowed:
                     logger.info(
-                        "reply token invalid; skip fallback push group=%s quote=%s primary_suppressed=%s",
+                        "reply refused; skip fallback push group=%s quote=%s primary_suppressed=%s token_dead=%s",
                         group_id,
                         _is_market_quote_outbound(text),
                         primary_suppressed,
+                        token_dead,
                     )
-                    # The token is dead and no push may follow: nothing more can reach the
-                    # group for this event, so a redelivery would only re-run the models.
-                    _close_inbound_event(reply_token, send_fence)
+                    if token_dead:
+                        # The token is dead and no push may follow: nothing more can reach the
+                        # group for this event, so a redelivery would only re-run the models.
+                        _close_inbound_event(reply_token, send_fence)
+                    else:
+                        # LINE refused the content, also as plain text, and no push may follow:
+                        # nothing was delivered, so the fence lifts; LINE's redelivery brings a
+                        # fresh token and the attempts cap bounds the re-runs.
+                        _release_inbound_send(send_fence)
                     return False
                 push_request_built = False
                 try:
-                    _push_text, push_message = _text_message_with_mentions(
-                        text,
-                        validation_source="reply_push_fallback_mentions",
-                        prepared=True,
-                        limit=5000,
-                        explicit_only=True,
-                        reply_targets=reply_targets,
-                    )
+                    if plain_push:
+                        # LINE refused the content of this reply (also the retry): the push
+                        # carries the answer as one sanitized plain text message.
+                        push_message = _sanitized_plain_text_message(text)
+                    else:
+                        _push_text, push_message = _text_message_with_mentions(
+                            text,
+                            validation_source="reply_push_fallback_mentions",
+                            prepared=True,
+                            limit=5000,
+                            explicit_only=True,
+                            reply_targets=reply_targets,
+                        )
                     push_request_built = True
                     with ApiClient(_get_line_config()) as api_client:
                         push_response = MessagingApi(api_client).push_message(
@@ -23875,6 +24196,12 @@ def _reply(
                     # else: timeout / 5xx -- the push may have gone out; the fence stays.
             return False
 
+        if nudge_slot is not None and not nudge_slot.settled:
+            # LINE accepted the batch with the nudge in it: its dedupe row stays (72 h cap).
+            # Settled first, so nothing below can hand it back.
+            nudge_slot.settled = True
+            logger.info("exercise nudge delivered group=%s", group_id)
+
         if pending_commit_ids and group_id:
             try:
                 removed = _commit_pending_removal(group_id, pending_commit_ids)
@@ -23918,9 +24245,17 @@ def _reply(
                     if sm_id:
                         sent_text = text
                         if idx < len(messages_to_send):
-                            sent_text = getattr(messages_to_send[idx], "text", text)
+                            sent_text = _archived_text(messages_to_send[idx], text)
                         # 只有主訊息（FCN）不進 recall；搭車的到期提醒照常索引。
                         primary_kwargs = archive_kwargs if idx == 0 and not primary_suppressed else {}
+                        rider = riders[idx] if idx < len(riders) else None
+                        if rider is not None and rider.slot is not None:
+                            # 運動提醒：存檔只存固定句（不含日期、項目），而且不進 recall——
+                            # raw_messages 的 bot 列有幾條路徑直接讀進模型輸入（review、月精華、embedding）。
+                            sent_text = str(
+                                getattr(rider.slot.nudge, "archive_text", "") or "爸媽健康：運動提醒"
+                            )
+                            primary_kwargs = {"index_for_recall": False}
                         memory.log_raw_message(group_id, sm_id, "__bot__", sent_text, **primary_kwargs)
                         reference = (
                             message_reminder_refs[idx]
@@ -23984,6 +24319,11 @@ def _reply(
                 )
             except Exception as e:
                 logger.warning("reminder confirmation release failed: %s", e)
+        if nudge_slot is not None and not nudge_slot.settled:
+            # Nothing was sent (fence blocked, nothing built, an exception on the way): the
+            # nudge's dedupe row goes back, so the parent is not skipped for 72 hours for nothing.
+            reply_riders.release_nudge(group_id or "", nudge_slot)
+            nudge_slot.settled = True
         if pending_slot is not None:
             pending_slot.release()
     return True

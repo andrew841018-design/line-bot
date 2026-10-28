@@ -561,3 +561,340 @@ def test_the_disabled_stub_never_nudges(on):
     assert ph_off.claim_exercise_nudge(G, nudge, now=NOW) is None
     assert ph_off.release_exercise_nudge(G, nudge, ("2026-10-21", int(NOW))) is None
     assert db.last_alert(G, "爸爸", ph._NUDGE_KIND) is None
+
+
+# ═══ 第二階段（2026-10-24）：搭在 _reply 上送出 ═══════════════════════════════════════════════
+#
+# 運動提醒是咪寶本來就要送的主回覆的最後一則：訊息先組好驗過、再搶今天的去重列（claim 裡重算資格）、才放進
+# 這次的回覆。結果：LINE 接受 -> 列留著（72 小時上限）；明確沒送出 -> 放掉；含糊 -> 留著（寧可少提醒）；
+# 被 LINE 點名拒絕 -> 留著（圍住：不要每次回覆都再試），而且不會改成純文字重送；送出前就結束 -> 放掉。
+# 存檔只存固定句，不含日期、項目。
+
+from test_reply_400_recovery import (  # noqa: E402  (共用的假 LINE 與錯誤本體)
+    BAD_TOKEN,
+    FakeLine,
+    _FakeApiClient,
+    api_error,
+    bad,
+    due_natural,
+    kinds,
+    raw_bot_texts,
+    texts,
+)
+
+T = "TOKEN_NUDGE"
+SAY = "早安，今天天氣不錯"
+NEEDLES = ("散步", "10/16")  # 提醒句裡的項目與日期：任何存檔列都不可以出現
+
+
+@pytest.fixture()
+def line(monkeypatch):
+    fake = FakeLine()
+    monkeypatch.setattr(main.settings, "bot_muted", False)
+    monkeypatch.setattr(main, "_pending_reply_enabled", lambda: False)
+    monkeypatch.setattr(main, "_reminder_reply_piggyback_enabled", lambda: False)
+    monkeypatch.setattr(main, "ApiClient", _FakeApiClient)
+    monkeypatch.setattr(main, "MessagingApi", lambda _client: fake)
+    monkeypatch.setattr(main, "_get_line_config", lambda: object())
+    monkeypatch.setattr(main, "_inbound_reply_by_token", {})
+    return fake
+
+
+def arm(token=T):
+    """爸爸 5 天沒提到運動、flush 時合格：登記一則候選給這個 reply token。"""
+    consent()
+    add("爸爸", "exercise", "散步", at=NOW - 5 * DAY)
+    nudge = candidate()
+    assert nudge is not None and all(needle in nudge.text for needle in NEEDLES)
+    main._exercise_nudge_by_token[token] = (G, nudge, main.time.time())
+    return nudge
+
+
+def say(text=SAY, token=T, **kwargs):
+    return main._reply(token, text, group_id=G, **kwargs)
+
+
+def open_event(message_id="M1", token=T):
+    assert main.memory.begin_inbound_event(G, message_id) == "new"
+    main._register_inbound_reply_token(token, G, message_id)
+
+
+def kept():
+    """今天的去重列（claim 搶到的那一列）；沒有就是 None。"""
+    return db.last_alert(G, "爸爸", ph._NUDGE_KIND)
+
+
+def no_trace():
+    """不變式：沒有任何 raw_messages 的 bot 列含提醒的日期或項目（review、月精華、embedding 會直接讀）。"""
+    rows = raw_bot_texts()
+    assert all(needle not in row for row in rows for needle in NEEDLES), rows
+
+
+def test_the_nudge_is_the_last_message_of_the_reply_and_its_row_is_kept(on, pinned_clock, line):
+    arm()
+
+    assert say() is True
+
+    batch = line.replies[0]
+    assert kinds(batch) == ["TextMessage", "TextMessageV2"] and texts(batch)[0] == SAY
+    data = batch[1].to_dict()
+    assert data["text"].startswith("{p1}\n") and data["substitution"]["p1"]["mentionee"] == {"type": "user", "userId": "U_DAD"}
+    assert kept() is not None
+    assert main._take_exercise_nudge(T, G) is None  # taken: a candidate is used once
+
+
+def test_the_archive_is_the_fixed_line_and_never_enters_recall(on, pinned_clock, line, monkeypatch):
+    arm()
+    logged = []
+    real = main.memory.log_raw_message
+    monkeypatch.setattr(main.memory, "log_raw_message", lambda *a, **k: logged.append((a[3], k)) or real(*a, **k))
+
+    assert say() is True
+
+    assert logged == [(SAY, {}), ("爸媽健康：運動提醒", {"index_for_recall": False})]
+    no_trace()
+
+
+def test_a_due_reminder_comes_first_and_the_references_stay_aligned(on, pinned_clock, line, monkeypatch):
+    monkeypatch.setattr(main, "_reminder_reply_piggyback_enabled", lambda: True)
+    rid = due_natural(monkeypatch, group=G, user="U_KID")
+    arm()
+
+    assert say() is True
+
+    batch = line.replies[0]
+    assert kinds(batch) == ["TextMessage", "TextMessageV2", "TextMessageV2"]
+    assert "繳房屋稅" in texts(batch)[1] and texts(batch)[2].startswith("{p1}\n")
+    assert main.memory.get_sent_reminder_reference(G, "sent-2")["reminder_id"] == rid
+    assert main.memory.get_sent_reminder_reference(G, "sent-3") is None  # the nudge has no reminder reference
+    no_trace()
+
+
+def test_a_full_reply_leaves_the_nudge_alone(on, pinned_clock, line):
+    for n in range(4):
+        main.memory.enqueue_reminder_confirmation(G, f"pending_reminder:{n}", f"已新增提醒\n事項：事項{n}")
+    arm()
+
+    assert say() is True
+
+    assert len(line.replies[0]) == 5 and not any(t.startswith("{p1}") for t in texts(line.replies[0]))
+    assert kept() is None and T in main._exercise_nudge_by_token  # not claimed, not taken
+
+
+@pytest.mark.parametrize("kwargs", [{"include_auxiliary": False}, {"large_menu_card": True}, {"menu_card": True}])
+def test_replies_without_auxiliary_messages_get_no_nudge(on, pinned_clock, line, kwargs):
+    arm()
+
+    assert say(**kwargs) is True
+
+    assert len(line.replies[0]) == 1 and kept() is None
+
+
+def test_a_flex_card_gets_no_nudge(on, pinned_clock, line, monkeypatch):
+    arm()
+    monkeypatch.setattr(main, "_validated_flex_card_message", lambda alt, card: main.TextMessage(text=alt))
+
+    assert say("爸媽健康卡：總覽", flex_card={"type": "bubble"}) is True
+
+    assert len(line.replies[0]) == 1 and kept() is None
+
+
+def test_a_reply_without_a_group_gets_no_nudge(on, pinned_clock, line):
+    arm()
+
+    assert main._reply(T, SAY) is True
+
+    assert len(line.replies[0]) == 1 and kept() is None
+
+
+def test_a_silent_primary_never_carries_the_nudge_alone(on, pinned_clock, line, monkeypatch):
+    """The 「Gemini 暫時忙不過來」 sink suppresses the primary; due reminders may still ride alone,
+    the nudge must not (it only rides on a reply the bot meant to give)."""
+    monkeypatch.setattr(main, "_reminder_reply_piggyback_enabled", lambda: True)
+    due_natural(monkeypatch, group=G, user="U_KID")
+    arm()
+
+    assert say("Gemini 暫時忙不過來") is True
+
+    assert kinds(line.replies[0]) == ["TextMessageV2"] and "繳房屋稅" in texts(line.replies[0])[0]
+    assert kept() is None
+    arm("TOKEN_OTHER")
+    assert main._reply("TOKEN_OTHER", "Gemini 暫時忙不過來", group_id=G) is False  # nothing at all to send
+    assert kept() is None
+
+
+def test_a_muted_bot_claims_nothing(on, pinned_clock, line, monkeypatch):
+    arm()
+    monkeypatch.setattr(main.settings, "bot_muted", True)
+
+    assert say() is False
+
+    assert not line.replies and kept() is None
+
+
+def test_with_the_switch_off_nothing_is_read_or_imported(pinned_clock, line, monkeypatch):
+    nudge = ph.ExerciseNudge(role="爸爸", user_id="U_DAD", text="@爸爸\n上次聽到你去散步是 10/16，這幾天有空的話出去走走吧～",
+                             label="@爸爸")
+    main._exercise_nudge_by_token[T] = (G, nudge, main.time.time())
+    touched = []
+
+    class Spy:
+        def __getattr__(self, name):
+            touched.append(name)
+            raise AttributeError(name)
+
+    monkeypatch.setitem(sys.modules, "parent_health", Spy())
+    for name in ("_take_exercise_nudge", "_exercise_nudge_message", "_claim_exercise_nudge_for_reply"):
+        monkeypatch.setattr(main, name, lambda *a, _name=name, **k: touched.append(_name))
+
+    assert say() is True
+
+    assert touched == [] and len(line.replies[0]) == 1
+    assert T in main._exercise_nudge_by_token
+
+
+def test_the_message_is_built_and_checked_before_anything_is_claimed(on, pinned_clock, line, monkeypatch):
+    arm()
+    claimed = []
+    monkeypatch.setattr(main, "_exercise_nudge_message", lambda nudge: None)
+    monkeypatch.setattr(ph, "claim_exercise_nudge", lambda *a, **k: claimed.append(a))
+
+    assert say() is True
+
+    assert claimed == [] and len(line.replies[0]) == 1 and kept() is None
+
+
+def test_the_claim_checks_again_and_a_parent_paused_since_the_flush_gets_nothing(on, pinned_clock, line):
+    arm()
+    db.set_consent(G, "爸爸", "paused", user_id="U_DAD", changed_by="U_DAD", now=NOW - 1)
+
+    assert say() is True
+
+    assert len(line.replies[0]) == 1 and kept() is None
+
+
+def test_two_replies_flushed_together_carry_one_nudge(on, pinned_clock, line):
+    nudge = arm("TOKEN_ONE")
+    main._exercise_nudge_by_token["TOKEN_TWO"] = (G, nudge, main.time.time())
+
+    assert say(token="TOKEN_ONE") is True
+    assert say(token="TOKEN_TWO") is True
+
+    assert [len(batch) for batch in line.replies] == [2, 1]
+
+
+# ── 結果：接受／含糊／明確沒送出／被 LINE 拒絕 ─────────────────────────────────────────────
+
+
+def test_an_ambiguous_send_keeps_the_row_and_pushes_nothing(on, pinned_clock, line):
+    arm()
+    line.script = [TimeoutError("read timed out")]
+
+    assert say() is False
+
+    assert not line.pushes and kept() is not None
+    no_trace()
+
+
+def test_a_dead_token_hands_the_row_back_and_the_push_carries_the_primary_only(on, pinned_clock, line):
+    arm()
+    open_event()
+    line.script = [BAD_TOKEN]
+
+    assert say() is True
+
+    assert len(line.pushes) == 1 and texts(line.pushes[0][0]) == [SAY]
+    assert kept() is None  # the nudge was not delivered: the parent is not skipped for 72 hours
+    no_trace()
+
+
+@pytest.mark.parametrize("code", [413, 429])
+def test_a_refusal_that_is_not_a_content_error_hands_the_row_back(on, pinned_clock, line, code):
+    arm()
+    line.script = [api_error(code, {"message": "no"}, "No")]
+
+    assert say() is False
+
+    assert kept() is None
+
+
+def test_nothing_sent_because_the_fence_is_taken_hands_the_row_back(on, pinned_clock, line):
+    arm()
+    open_event()
+    assert main.memory.claim_inbound_reply(G, ["M1"]) == ("claimed", False)  # another run is sending
+
+    assert say() is False
+
+    assert not line.replies and kept() is None
+
+
+def test_nothing_sent_because_the_request_could_not_be_built_hands_the_row_back(on, pinned_clock, line, monkeypatch):
+    arm()
+
+    def boom(**_kwargs):
+        raise ValueError("cannot build")
+
+    monkeypatch.setattr(main, "ReplyMessageRequest", boom)
+
+    assert say() is False
+
+    assert not line.replies and kept() is None
+
+
+def test_a_refused_nudge_is_left_out_never_sent_as_plain_text_and_its_row_is_kept(on, pinned_clock, line):
+    nudge = arm()
+    line.script = [bad(1)]
+
+    assert say() is True
+
+    assert len(line.replies) == 2 and kinds(line.replies[1]) == ["TextMessage"] and texts(line.replies[1]) == [SAY]
+    assert all(nudge.text not in text and "@爸爸" not in text for batch in line.replies[1:] for text in texts(batch))
+    assert kept() is not None  # fenced: the 72 hour cap stops it from coming back on every reply
+    assert raw_bot_texts() == [SAY]
+    no_trace()
+
+
+def test_a_refused_nudge_and_a_refused_primary_still_deliver_the_primary_as_plain_text(on, pinned_clock, line):
+    nudge = arm()
+    line.script = [bad(1), bad(0)]
+
+    assert say() is True
+
+    assert [kinds(batch) for batch in line.replies] == [["TextMessage", "TextMessageV2"], ["TextMessage"], ["TextMessage"]]
+    assert all(nudge.text not in text for batch in line.replies[1:] for text in texts(batch))
+    assert kept() is not None
+    no_trace()
+
+
+def test_a_refused_primary_hands_the_nudge_back_and_goes_alone(on, pinned_clock, line):
+    arm()
+    line.script = [bad(0)]
+
+    assert say() is True
+
+    assert kinds(line.replies[1]) == ["TextMessage"] and texts(line.replies[1]) == [SAY]
+    assert kept() is None
+    no_trace()
+
+
+def test_a_refused_primary_and_a_dead_token_push_the_primary_and_hand_the_nudge_back(on, pinned_clock, line):
+    arm()
+    open_event()
+    line.script = [bad(0), BAD_TOKEN]
+
+    assert say() is True
+
+    assert len(line.pushes) == 1 and texts(line.pushes[0][0]) == [SAY] and kept() is None
+    no_trace()
+
+
+def test_the_main_reply_does_not_vanish_when_the_nudge_is_refused_with_the_real_sdk_model(on, pinned_clock, line):
+    """(review GP1 #5c) one refused message used to fail the whole batch; the primary must survive."""
+    arm()
+    line.script = [bad(1, prop="substitution.p1.mentionee.userId")]
+    open_event()
+
+    assert say() is True
+
+    assert texts(line.replies[-1]) == [SAY] and main.memory.get_inbound_event_status(G, "M1") == "replied"
+    assert kept() is not None and not line.pushes

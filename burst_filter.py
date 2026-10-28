@@ -54,6 +54,10 @@ _MAX_RETRY_SAFE_ATTEMPTS = 1
 # in flight (`owns_message`).  A flush that dies still clears its entry in `finally`; the cap
 # only bounds a leak that should not happen.
 _inflight: dict[int, tuple[str, tuple[str, ...]]] = {}
+# The batches themselves, under the same keys (2026-10-24, B7.1): the exit drain writes what a
+# flush that cannot finish into the conversation memory.  A separate dict, so the shape of
+# `_inflight` that `owns_message` and its tests read stays what it was.
+_inflight_batches: dict[int, list[tuple[str, str, str | None, float]]] = {}
 _inflight_seq = 0
 _INFLIGHT_MAX = 64
 
@@ -296,6 +300,7 @@ def _flush_burst(
         with _lock:
             _claimed_generations.discard((group_id, processing_generation))
             _inflight.pop(inflight_key, None)
+            _inflight_batches.pop(inflight_key, None)
 
 
 def _begin_inflight_locked(
@@ -308,8 +313,11 @@ def _begin_inflight_locked(
         group_id,
         tuple(str(message_id) for message_id, *_rest in pending if message_id),
     )
+    _inflight_batches[_inflight_seq] = list(pending)
     while len(_inflight) > _INFLIGHT_MAX:
-        _inflight.pop(next(iter(_inflight)))
+        oldest = next(iter(_inflight))
+        _inflight.pop(oldest)
+        _inflight_batches.pop(oldest, None)
     return _inflight_seq
 
 
@@ -329,6 +337,67 @@ def owns_message(group_id: str, message_id: str) -> bool:
         return any(
             gid == group_id and message_id in ids for gid, ids in _inflight.values()
         )
+
+
+def drain_for_shutdown(wait_seconds: float = 8.0) -> dict:
+    """Last chance for the messages this process still holds (2026-10-24, B7.1).
+
+    The burst state lives in memory only.  A restart (SIGTERM; uvicorn first waits for the
+    requests in flight, then runs the lifespan exit that calls this) used to lose whatever sat in
+    the 8 s debounce window or in a flush thread: unanswered, unremembered, its inbound event
+    stuck in `processing` until the monitor's reply-gap alert.
+
+    1. Batches still queued (debounce window, or the one-minute wait) go through `cancel_burst`:
+       the conversation memory gets the `[burst]` turn and the inbound events close as
+       `completed_no_reply`.  Fast, done first.
+    2. Flush threads that already own a batch get ``wait_seconds`` to finish.
+    3. Whatever is still running is closed the same way, because the process is about to exit.
+
+    Remembered and closed, not answered: nobody replies to these messages after the restart.  A
+    flush thread that is still running may yet reply and write its own turn (the `[burst]` turn
+    is then in the memory twice).  Never raises and never blocks longer than ``wait_seconds``
+    plus the database writes; the result and the log carry counts only.
+    """
+    started = time.monotonic()
+    with _lock:
+        queued_groups = list(_pending)
+    queued = 0
+    for group_id in queued_groups:
+        try:
+            queued += len(cancel_burst(group_id))
+        except Exception as exc:
+            logger.warning("burst drain: cancel failed error_type=%s", type(exc).__name__)
+    deadline = started + max(0.0, float(wait_seconds))
+    while True:
+        with _lock:
+            busy = bool(_inflight)
+        if not busy or time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
+    with _lock:
+        leftovers = [
+            (group_id, ids, _inflight_batches.get(key))
+            for key, (group_id, ids) in list(_inflight.items())
+        ]
+    closed = 0
+    for group_id, ids, batch in leftovers:
+        try:
+            if batch:
+                _complete_without_reply(group_id, batch)
+                _remember_cancelled(group_id, batch)
+            elif ids:
+                memory.mark_inbound_events_completed_no_reply(group_id, list(ids))
+            closed += len(ids)
+        except Exception as exc:
+            logger.warning("burst drain: close failed error_type=%s", type(exc).__name__)
+    result = {
+        "queued_messages": queued,
+        "inflight_batches": len(leftovers),
+        "inflight_messages_closed": closed,
+        "waited_s": round(time.monotonic() - started, 1),
+    }
+    logger.warning("burst drain on exit: %s", result)
+    return result
 
 
 def _classify_and_maybe_respond(
