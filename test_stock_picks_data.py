@@ -469,6 +469,49 @@ def test_window_closes_missing_days_limits_and_no_borrowing():
     assert sp.window_closes(extra, CAL, T, 100.0, None) is not None  # 日曆外的 Yahoo 日子不用
 
 
+# 2026-10-23 臨時休市（不在證交所假日表，FMTQIK、T86 都沒有那天）：^TWII 那天的收盤是 null（日曆沒有那天），
+# 個股的 Yahoo 日線卻多一根成交量 0、照抄前一天收盤的平盤 → 休市後第一個交易日（10/27）每一檔都接不上。
+def _ramp_bars(closed=()):
+    """合成個股日線：每天收盤都不同；休市日（日曆沒有）那根照抄前一個交易日的收盤，和 Yahoo 的平盤一樣。"""
+    cal = [d for d in CAL if d not in closed]
+    bars = {d: 100.0 + 0.01 * i for i, d in enumerate(CAL[:-1]) if d not in closed}
+    for day in closed:
+        bars[day] = bars[max(d for d in cal if d < day)]
+    return cal, bars
+
+
+@pytest.mark.parametrize("closed", [(CAL[-2],), (CAL[-3], CAL[-2])])
+def test_window_closes_ignores_flat_copies_on_closed_days(closed):
+    cal, bars = _ramp_bars(closed)
+    prev_close = bars[cal[-2]]
+    windows = sp.window_closes(bars, cal, T, prev_close, prev_close)
+    assert windows is not None
+    year, quarter = windows
+    assert len(year) == 240 and len(quarter) == 60 and year[-2] == prev_close
+    # 休市日的平盤不進窗：和那幾根根本不存在時的結果一樣
+    assert windows == sp.window_closes({d: v for d, v in bars.items() if d not in closed}, cal, T, prev_close, prev_close)
+    noisy = {**bars, closed[0]: prev_close * (1 + 1e-12)}  # float 表示法的誤差
+    assert sp.window_closes(noisy, cal, T, prev_close, None) is not None
+
+
+def test_window_closes_rejects_a_real_trading_day_missing_from_the_calendar():
+    """日曆少了真的交易日（那天個股有成交、收盤不平盤）→ 不接，不能悄悄把那天跳過。"""
+    cal, bars = _ramp_bars((CAL[-2],))
+    prev_close = bars[cal[-2]]
+    assert sp.window_closes({**bars, CAL[-2]: prev_close + 0.5}, cal, T, prev_close, None) is None
+    cal2, bars2 = _ramp_bars((CAL[-3], CAL[-2]))  # 兩天空檔：一天平盤、一天有成交，只要有一天不平盤就不接
+    assert sp.window_closes(bars2, cal2, T, bars2[cal2[-2]], None) is not None
+    assert sp.window_closes({**bars2, CAL[-2]: bars2[cal2[-2]] - 0.5}, cal2, T, bars2[cal2[-2]], None) is None
+    assert sp.window_closes({**bars2, CAL[-3]: bars2[cal2[-2]] + 0.5}, cal2, T, bars2[cal2[-2]], None) is None
+
+
+def test_window_closes_still_needs_the_previous_trading_day():
+    cal, bars = _ramp_bars((CAL[-2],))
+    del bars[cal[-2]]  # 前一個交易日那根缺（停牌、缺資料），只剩休市日那根平盤：平盤不能頂替它
+    assert CAL[-2] in bars
+    assert sp.window_closes(bars, cal, T, 100.0, None) is None
+
+
 # ── 查詢 ───────────────────────────────────────────────────────────────────
 INDEX = sp.name_index({"台積電": "2330", "國巨": "2327", "矽力-KY": "6415", "成信實業-創": "1234", "元大台灣50": "0050",
                        "元大MSCI A股": "006205", "IKKA-KY": "2250", "聯發科": "2454"})
@@ -1591,6 +1634,42 @@ def test_refresh_without_yahoo_t_uses_the_twse_close(net):
 def test_refresh_with_yahoo_t_never_asks_twse_for_the_index(net):
     sp.refresh(T, _day_rows(net), threading.Event(), now=1.0e9)
     assert net.count("FMTQIK") == 0
+
+
+def _closed_day_market(net, *, with_yahoo_t: bool) -> date:
+    """2026-10-23 的樣子：CAL[-2] 臨時休市——^TWII、證交所 FMTQIK、T86 都沒有那天，個股的 Yahoo 日線卻有一根
+    照抄前一天收盤的平盤（FakeNet 預設的個股日線本來就是平盤，所以那根就在裡面）。"""
+    closed = CAL[-2]
+    days = [d for d in CAL if d != closed]
+    if not with_yahoo_t:
+        days.remove(T)
+    net.charts["^TWII"] = _chart(days, [20000.0] * len(days))
+    net.fmtqik[:] = [row for row in net.fmtqik if row["Date"] != _roc(closed)]
+    older = CAL[-11].strftime("%Y%m%d")  # 少了休市日，最後 10 個交易日的 T86 要往前多一天
+    net.t86[older] = {**net.t86[T.strftime("%Y%m%d")], "date": older}
+    return closed
+
+
+@pytest.mark.parametrize("with_yahoo_t", [False, True])
+def test_refresh_computes_t_right_after_a_closed_day(net, with_yahoo_t):
+    closed = _closed_day_market(net, with_yahoo_t=with_yahoo_t)
+    snapshot = sp.refresh(T, _day_rows(net), threading.Event(), now=1.0e9)
+    assert snapshot.calendar[-1] == T and closed not in snapshot.calendar and len(snapshot.calendar) == 240
+    assert net.count("FMTQIK") == (0 if with_yahoo_t else 1)  # Yahoo 沒有 T 時照舊用證交所補
+    assert net.count("T86") == 10 and closed.strftime("%Y%m%d") not in [c[2].get("date") for c in net.calls]
+    assert all(snapshot.pool[c].trend is not None for c in snapshot.universe)
+
+
+def test_refresh_still_holds_when_the_calendar_skips_a_real_trading_day(net):
+    """同樣的日曆少一天，但那天個股真的有成交（收盤不是平盤）：不能悄悄跳過，整輪 too_many_gray。"""
+    missing = _closed_day_market(net, with_yahoo_t=True)
+    closes = [100.0] * (len(CAL) - 1)
+    closes[CAL.index(missing)] = 103.0
+    for code in STOCKS + ["0050"]:
+        net.charts[f"{code}.TW"] = _chart(CAL[:-1], closes)
+    with pytest.raises(sp.RoundFailed) as info:
+        sp.refresh(T, _day_rows(net), threading.Event(), now=1.0e9)
+    assert info.value.kind == "too_many_gray"
 
 
 def _no_yahoo_t(n):

@@ -1037,7 +1037,9 @@ def window_closes(
     """年線窗、季線窗的收盤：^TWII 日曆上含 T 的最後 240／60 個交易日裡 Yahoo 有的收盤，
     最後接官方（證交所或櫃買）的 T 收盤。接不上、缺太多天 → None（⚪）。
 
-    - Yahoo 早於 T 的最後一根必須是 T 的前一個交易日（停牌、缺資料就不接）。
+    - Yahoo 要有 T 的前一個交易日那根（停牌、缺資料就不接）；夾在它和 T 之間、日曆上沒有的 Yahoo 日子，
+      只有「照抄前一個交易日收盤」可以放過：臨時休市日（2026-10-23）^TWII 那天沒有收盤、不在日曆上，個股 Yahoo
+      卻補了一根成交量 0 的平盤。日曆真的少了一個交易日時，那天個股不會整批平盤 → None（整輪 too_many_gray）。
     - Yahoo 也有 T 而且和官方收盤差 > 1%；官方前一日參考價（收盤−漲跌）和 Yahoo 前一天收盤
       差 > 15%（漲跌缺值就不比，只靠下一條）；窗內相鄰兩根差 > 25%（分割、減資沒對齊）→ None。
     - 不在日曆上的 Yahoo 日子不用；缺的日子不拿更早的補。
@@ -1046,8 +1048,10 @@ def window_closes(
     if len(days) < YEAR_BARS or days[-1] != t or not (math.isfinite(close) and close > 0):
         return None
     prev_day = days[-2]
-    before = [d for d in bars if d < t]
-    if not before or max(before) != prev_day:
+    prev_close = bars.get(prev_day)
+    if prev_close is None:
+        return None
+    if any(not math.isclose(value, prev_close, rel_tol=1e-9) for day, value in bars.items() if prev_day < day < t):
         return None
     on_day = bars.get(t)
     if on_day is not None and abs(on_day / close - 1.0) > SPLICE_T_GAP:
