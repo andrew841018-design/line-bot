@@ -21563,14 +21563,27 @@ _CANNOT_CONFIRM_RE = re.compile(r"沒辦法確認|無法確認|不能確認|無�
 _FIXED_GUARD_REPLIES = (
     UNVERIFIED_CONTACT_REPLY, UNVERIFIED_DATE_REPLY, reply_guards.REGULATORY_UNCONFIRMED_REPLY,
 )
-# reply_guards' kinship words that name nobody in a search question (「日本人」 holds
-# 本人); 爸 and 媽 stay (「媽去日本要簽證嗎」 is one person), with these places masked
-# first.  A configured alias that happens to be one of them still counts.
-# TODO(2026-10-28 review R2): move this rule (this set, _NOT_KINSHIP and the @
-# check in _plain_question_names) into reply_guards as an identifying-only
-# search_deny_terms that regulation_clause shares.
-_NON_IDENTIFYING = frozenset({"本人", "當事人", "對方"})
-_NOT_KINSHIP = re.compile(r"媽祖|媽閣")
+# reply_guards' kinship words that name nobody in a search question; a configured alias
+# that happens to be one of them still counts.  本人 and 媽 stay deny terms, checked
+# after the words below are masked (2026-10-29 privacy review, REVIEW_gp1_plan_s9.md
+# and REVIEW_gp2_plan_s9.md):
+# - 本人 skips only 日本人, on the NFKC-folded text as written: nothing is stripped for
+#   it, so 「王旭日、本人…」 never joins into 日本人;
+# - 媽 skips 媽祖／媽閣 only as the goddess or her temple, read on the folded text with
+#   what _bare drops taken out (「舅媽祖 厝」 is no 媽祖 before a space) and never after
+#   a kinship prefix (「舅媽祖廟」 is 舅媽's).  「媽去日本要簽證嗎」 is one person.
+# TODO(2026-10-28 review R2): move this rule (_NON_IDENTIFYING, _MASKED_BEFORE,
+# _MASK_VIEW and the @ check in _plain_question_names) into reply_guards as an
+# identifying-only search_deny_terms that regulation_clause shares; the sentences in
+# test_research_plain_question.py's mask test are its contract.
+_NON_IDENTIFYING = frozenset({"當事人", "對方"})
+_MASKED_BEFORE = {
+    "本人": re.compile(r"日本人"),
+    "媽": re.compile(
+        r"(?<![舅姑姨乾契義繼養親奶乳伯岳])(?:媽祖|媽閣)(?=廟|宮|遶境|繞境|進香|誕|信仰|文化|[，,。！？!?]|$)"
+    ),
+}
+_MASK_VIEW = re.compile(r"[^\w，,。！？!?]+|_")  # what _bare drops, less the marks 媽's mask reads
 # Nothing went out for these: the common layer does not run either.
 _PLAIN_QUESTION_NOT_SENT = ("late", "named", "names_unavailable")
 
@@ -21644,12 +21657,16 @@ def _plain_question_names(question: str, context: list[tuple[str, str]] | None) 
     if not names:
         logger.warning("plain question names unavailable type=empty")
         return "names_unavailable"
-    # Only the bare 媽 skips 媽祖／媽閣: 「老媽祖先…」 still names 老媽.
-    others = [name for name in names if name != "媽"]
+    # Only the bare 本人 and 媽 get their masks: 「老媽祖先…」 still names 老媽.
+    masked = [name for name in names if name in _MASKED_BEFORE]
+    others = [name for name in names if name not in _MASKED_BEFORE]
     if others and public_research.mentions_any(question, others):
         return "named"
-    if "媽" in names and public_research.mentions_any(_NOT_KINSHIP.sub("", question), ["媽"]):
-        return "named"
+    folded = unicodedata.normalize("NFKC", question).casefold()
+    for name in masked:
+        seen = _MASK_VIEW.sub("", folded) if name == "媽" else folded
+        if public_research.mentions_any(_MASKED_BEFORE[name].sub("", seen), [name]):
+            return "named"
     return ""
 
 

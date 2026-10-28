@@ -293,7 +293,7 @@ def test_a_question_without_a_public_subject_to_restore_ends_in_b(research_env, 
     ("＠小明 台南有什麼好玩的景點？", "小明"),
     ("﹫小明 台南有什麼好玩的景點？", "小明"),
     ("媽去日本要簽證嗎？", "媽去"),  # one person's mother
-    ("老媽祖先是哪裡人？", "老媽"),  # 老媽, though 媽祖 is masked for the bare 媽
+    ("老媽祖先是哪裡人？", "老媽"),  # 老媽 is a deny term of its own, whatever 媽's mask does
     ("阿媽祖厝在哪裡？", "阿媽"),
 ])
 def test_a_question_naming_someone_stays_home(research_env, nothing_crawled, caplog, question, name):
@@ -306,7 +306,7 @@ def test_a_question_naming_someone_stays_home(research_env, nothing_crawled, cap
 
 
 @pytest.mark.parametrize("question", [
-    "日本人過年吃什麼？",  # 本人 names nobody
+    "日本人過年吃什麼？",  # 日本人 is masked before 本人 is looked for
     "大甲媽祖遶境有什麼好玩的？",  # nor is 媽祖 anyone's mother
     "澳門媽閣廟有什麼好玩的？",
     "請問，去日本要簽證嗎？",  # search_query keeps 「去日本要簽證嗎」: only courtesy was cut
@@ -329,6 +329,57 @@ def test_unreadable_names_send_nothing(monkeypatch, research_env, nothing_crawle
     _ends_in_b(research_env, caplog, "names_unavailable")
     assert f"common={'skipped' if common_on else 'off'}" in caplog.text
     assert main._plain_question_searches["count"] == 0
+
+
+# 2026-10-29 privacy review (REVIEW_gp1_plan_s9.md, REVIEW_gp2_plan_s9.md): the contract for the
+# masks in front of 本人 and 媽.  The shared reply_guards version (TODO R2) must keep every verdict.
+@pytest.mark.parametrize("question, named", [
+    ("舅媽祖厝在哪裡？", True),  # 舅媽's ancestral house: the 媽 stays
+    ("姑媽祖產怎麼分？", True),
+    ("姑媽祖婆的房子過戶要繳多少贈與稅？", True),  # 祖婆 is a great-grandmother, not the goddess
+    ("舅媽祖廟在哪裡？", True),  # after a kinship prefix it is 舅媽's temple
+    ("姨媽祖宮在哪裡？", True),
+    ("乾媽祖廟在哪裡？", True),
+    ("契媽祖廟在哪裡？", True),
+    ("契媽祖廟在哪裡？", True),  # a compatibility 契
+    ("義媽祖廟在哪裡？", True),
+    ("繼媽祖廟在哪裡？", True),
+    ("伯媽祖廟在哪裡？", True),
+    ("岳媽祖廟在哪裡？", True),
+    ("舅媽祖 厝在哪裡？", True),  # a space is no clause end: _bare joins the words again
+    ("舅媽祖，厝在哪裡？", True),
+    ("舅 媽祖廟在哪裡？", True),
+    ("舅​媽祖廟在哪裡？", True),
+    ("舅媽祖　廟在哪裡？", True),
+    ("舅媽祖\xa0厝在哪裡？", True),
+    ("舅媽祖廟在哪裡？", True),  # a compatibility 祖
+    ("舅媽閣樓在哪裡？", True),
+    ("王小明本人入境可以帶幾瓶酒？", True),  # 本人 after a name nobody configured
+    ("王小明本⼈入境可以帶幾瓶酒？", True),  # characters that fold into 人
+    ("王小明本㆟入境可以帶幾瓶酒？", True),
+    ("王旭日、本人入境可以帶幾瓶酒？", True),  # 本人 is read unstripped: 日、本人 is no 日本人
+    ("王旭日「本人」入境可以帶幾瓶酒？", True),
+    ("王旭日 本人入境可以帶幾瓶酒？", True),
+    ("基本人權有哪些？", True),  # the cost of keeping 本人: fails closed
+    ("日本人過年吃什麼？", False),
+    ("大甲媽祖遶境有什麼好玩的？", False),
+    ("大甲媽祖 遶境有什麼好玩的？", False),
+    ("媽祖誕辰是哪一天？", False),
+    ("澳門媽閣廟有什麼好玩的？", False),
+    ("北港媽祖宮怎麼去？", False),
+    ("白沙屯媽祖進香路線？", False),
+    ("大甲媽祖文化節在哪裡？", False),
+    ("大甲媽祖？", False),
+    ("大甲媽祖", False),  # the end of the text
+    ("大甲媽祖︖", False),  # a vertical-form question mark folds into ?
+    ("「大甲媽祖」", False),
+    ("大甲媽祖遶境有什麼好玩的？", False),
+    ("全台最大媽祖廟在哪？", False),  # 大, 小 and 後 are no kinship prefix
+    ("附近有小媽祖廟嗎？", False),
+    ("之後媽祖誕辰怎麼慶祝？", False),
+])
+def test_the_masks_hide_only_the_goddess_and_japanese(question, named):
+    assert main._plain_question_names(question, None) == ("named" if named else "")
 
 
 def test_an_alias_that_is_a_common_word_still_counts(monkeypatch, tmp_path):
