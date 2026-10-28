@@ -1,7 +1,7 @@
 """Public-text research policy and bounded, provider-independent evidence lookup."""
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from datetime import datetime
 import logging
 import re
@@ -217,23 +217,41 @@ def dated_query(text: str) -> str:
     return re.sub(r"今年", f"{year}年", text)
 
 
-def collect(collector, text: str, *, timeout: float = 16.0) -> list[dict]:
-    """Bound caller latency and concurrent abandoned work, without executor join."""
+def collect(
+    collector, text: str, *, timeout: float = 16.0, report: dict | None = None
+) -> list[dict]:
+    """Bound caller latency and concurrent abandoned work, without executor join.
+
+    ``report``, when given, receives why nothing usable came back (``reason``)
+    and how many rows the collector returned (``rows``), for the research log.
+    """
+    report = {} if report is None else report
     query = public_query(text)
-    if not query or not _SLOTS.acquire(blocking=False):
+    if not query:
+        report["reason"] = "no_query"
+        return []
+    if not _SLOTS.acquire(blocking=False):
+        report["reason"] = "busy"
         return []
     try:
         future = _POOL.submit(collector, query)
     except Exception:
         _SLOTS.release()
+        report["reason"] = "error"
         return []
     future.add_done_callback(lambda _: _SLOTS.release())
     try:
         rows = future.result(timeout=timeout)
+    except FutureTimeout:
+        report["reason"] = "timeout"
+        return []
     except Exception:
+        report["reason"] = "error"
         return []
     if not isinstance(rows, list):
+        report["reason"] = "error"
         return []
+    report["rows"] = len(rows)
     usable = []
     for row in (rows or [])[:6]:
         if not isinstance(row, dict):
@@ -243,8 +261,158 @@ def collect(collector, text: str, *, timeout: float = 16.0) -> list[dict]:
         # A title, publisher name, URL or search attempt alone is not evidence.
         if urlparse(url).scheme in {"http", "https"} and len(body) >= 20:
             usable.append(row)
+    if not usable:
+        report["reason"] = "no_usable"
     return usable
 
 
 NO_EVIDENCE = "這次搜尋未取得足夠的可靠資料，還無法核實這個說法。"
 NO_ANSWER = "已取得相關資料，但這次未能產生可靠的查證結論。"
+
+# 2026-10-28: plain questions the search found nothing for were answered with
+# NO_EVIDENCE, as if someone had forwarded a claim.  A plain question carries
+# no claim of its own: it searches on (main._plain_question_answer) and gets
+# NO_SOURCE_QUESTION only when every layer fails.  Claims keep NO_EVIDENCE.
+NO_SOURCE_QUESTION = "這次沒查到可靠的資料，暫時沒辦法回答這個問題。"
+# Appended after the reply guards (「沒查到…資料」 is what the search-claim guard
+# drops, and 「最新資料」 next to any digit is what the outbound validator blocks).
+COMMON_KNOWLEDGE_NOTE = "（以上依一般常識回答，這次沒有找到可引用的來源。）"
+_QUESTION_FORM = re.compile(
+    r"[?？]|嗎|呢|什麼|甚麼|哪|如何|怎麼|怎樣|為什麼|為何|多少|"
+    r"(?<![這那好前過近沒經十百千萬兩一二三四五六七八九\d])幾(?![乎十百千萬])|"  # not 最近幾天, 二十幾度, 幾十年
+    r"有沒有|是不是|會不會|能不能|可不可以|要不要|好不好|"
+    # a request: 「推薦台南好玩的景點」 (not 「這家很推薦」「推薦這家，超好吃」)
+    r"^(?:請|求)?(?:推薦|介紹)(?!(?:這|那)[家間部個本支款位]|大家|你們)"
+)
+# Asking whether something said is so: a claim to check, not a plain question.
+_CLAIM_CHECK = re.compile(
+    r"真的嗎|真的假的|是真的|是假的|真假|假的嗎|謠言|闢謠|假消息|假新聞|聽說|據說|網傳|傳言|轉傳|"
+    r"有人說|可信|能信|屬實|查證|核實|對嗎|是嗎|是這樣嗎|對不對|沒錯吧|有這回事|有這種事|"
+    r"is\s+it\s+true|fake|hoax|rumou?r",
+    re.IGNORECASE,
+)
+# Answers that change with time, place or plans, and health, law and money, where
+# a wrong answer costs too much: never from memory.
+_NOT_FROM_MEMORY = re.compile(
+    r"明天|後天|昨天|今晚|週末|下週|下個月|明年|大家|你們|誰|"
+    r"天氣|票價|多少錢|營業|幾點|股|行情|油價|規定|新制|簽證|餐廳|住宿|"
+    r"病|症|藥|醫|疾|痛|癌|瘤|診|療|健康|身體|血壓|血糖|懷孕|"
+    r"法律|法規|稅|保險|保費|健保|勞保|國保|投資|理財|貸款|利息|基金"
+)
+
+
+def is_plain_question(text: str) -> bool:
+    """A short question that carries no claim to check (``text``: links removed)."""
+    value = public_query(text)
+    # A regulation question stays a plain question (excluding it would bring
+    # NO_EVIDENCE back): reply_guards' number guard judges the Gemini answer.
+    return bool(
+        value
+        and len(value) <= 80
+        and _QUESTION_FORM.search(value)
+        # Before public_query, which drops a leading 「幫我查證」.
+        and not _CLAIM_CHECK.search(text or "")
+        and not requires_current_research(text)
+    )
+
+
+# What a question cut down by search_query may take back from the rest of it:
+# countries, places and travel words, never names or anything else said there.
+_SUBJECT_TERMS = re.compile(
+    rf"{_COUNTRY}|{_PUBLIC_PLACE}|"
+    r"新北|桃園|台中|臺中|台南|臺南|高雄|基隆|新竹|苗栗|彰化|南投|雲林|嘉義|屏東|宜蘭|花蓮|"
+    r"台東|臺東|澎湖|金門|馬祖|墾丁|阿里山|日月潭|太魯閣|"
+    r"大阪|京都|北海道|沖繩|福岡|名古屋|釜山|濟州|香港(?!腳)|澳門|上海|新加坡|曼谷|清邁|峇里島|"
+    r"越南|泰國|菲律賓|馬來西亞|吉隆坡|印尼|紐西蘭|澳洲|雪梨|加拿大|溫哥華|倫敦|巴黎|歐洲|"
+    r"紐約|夏威夷|關島|"
+    r"旅遊|旅行|自由行|跟團|出國|機票|飯店|住宿|民宿|簽證|退稅|換匯|高鐵|台鐵|捷運|門票|租車"
+)
+# A listed word counts only where a place or trip starts: at a clause's start,
+# after these verbs, or right after another listed word.  「張嘉義」 is a name.
+_SUBJECT_AFTER = "去到在往飛從回來住"
+# A clause made only of these loses nothing when search_query drops it.
+# One character class for the laughs, not 哈+ inside the outer +: nested repeats
+# backtrack exponentially on a long 哈哈哈… followed by anything else (2026-10-28 review).
+_COURTESY = re.compile(
+    r"(?:(?:請|想)?問(?:一下)?|請教(?:一下)?|謝謝(?:你|您|大家)?|多謝|感謝|感恩|拜託|麻煩了?|不好意思|"
+    r"[哈呵嘿嗯喔哦欸])+"
+)
+
+
+def _bare(text: str) -> str:
+    """Words only: punctuation, spaces and emoji removed."""
+    return re.sub(r"[\W_]+", "", text or "")
+
+
+def _asks(kept: str, value: str) -> bool:
+    """``kept`` still asks: a question word, or a kept clause the message followed with ？."""
+    if _QUESTION_FORM.search(kept):
+        return True
+    return any(
+        part and re.search(re.escape(part) + r"[\s…～~！!]*[？?]", value)
+        for part in re.split(f"[{_CLAUSE_MARKS}]", kept)
+    )
+
+
+def complete_search_query(text: str) -> str:
+    """What may be searched for the whole of a question; "" when its subject cannot go.
+
+    search_query keeps only the price/policy clause of 「去日本旅遊，物價高嗎？」:
+    「物價高嗎」 is a question about somewhere else.  Countries, places and travel
+    words from the rest come back (「日本 旅遊 物價高嗎」); names and anything
+    else said there stay home, as in search_query (2026-10-28).  Since claude/fix-b-replies
+    search_query also keeps only the regulation clauses, and drops the 「？」 with the rest:
+    a cut that took only punctuation or courtesy (請問、謝謝、哈哈) took nothing.
+    """
+    value = public_query(text)
+    kept = search_query(text)
+    if not value or not kept or not _bare(kept):
+        return ""
+    if _bare(kept) == _bare(value):
+        return kept
+    left = _bare(kept)
+    dropped = [part for part in map(_bare, re.split(f"[{_CLAUSE_MARKS}]", value)) if part and part not in left]
+    if all(_COURTESY.fullmatch(part) for part in dropped):
+        return kept if _asks(kept, value) else ""
+    subjects: list[str] = []
+    chained = -1  # where the last listed word ended
+    for match in _SUBJECT_TERMS.finditer(value):
+        start = match.start()
+        before = value[start - 1] if start else ""
+        if start and start != chained and before not in _CLAUSE_MARKS and before not in _SUBJECT_AFTER:
+            continue
+        chained = match.end()
+        if match.group(0) not in kept:
+            subjects.append(match.group(0))
+    if not subjects or not _asks(kept, value):
+        return ""
+    restored = " ".join([*dict.fromkeys(subjects), kept])
+    return restored if public_query(restored) else ""
+
+
+def answerable_from_memory(text: str) -> bool:
+    """A plain question whose answer does not change with time, place or plans."""
+    value = public_query(text)
+    return bool(
+        is_plain_question(text)
+        and not _CURRENT.search(value)
+        and not _FACT.search(value)
+        and not _public_affairs_clause(value)
+        and not _NOT_FROM_MEMORY.search(value)
+    )
+
+
+def asks_for_number(text: str) -> bool:
+    """The question asks how many, how much or how long: what a regulation number answers."""
+    return bool(_REGULATION_QUANTITY_ASK.search(public_query(text)))
+
+
+def mentions_any(text: str, names) -> bool:
+    """Whether ``text`` holds one of ``names``, compared as regulation_clause does
+    (NFKC, casefolded) and with spaces and symbols ignored (「王 大同」).  An empty
+    list counts as a match: nobody can say whom the text names (fails closed)."""
+    terms = [term for term in (_bare(_fold(name)) for name in names or () if isinstance(name, str)) if term]
+    if not terms:
+        return True
+    folded = _bare(_fold(text))
+    return any(term in folded for term in terms)

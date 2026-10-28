@@ -91,6 +91,8 @@ def search_duckduckgo(query: str, k: int = 5) -> list[dict]:
 
     _polite_sleep()
     if resp.status_code != 200 or not resp.text:
+        # 2026-10-28: DDG had been answering 202 (a bot check) with no trace here.
+        logger.info("DDG search status=%s", resp.status_code)
         return []
 
     soup = BeautifulSoup(resp.text, "html.parser")

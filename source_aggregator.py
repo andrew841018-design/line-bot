@@ -278,6 +278,8 @@ def _domain_authority(url: str) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+# TODO(2026-10-28 review, deferred): these failure logs carry the family's query;
+# log the error type only (main's research logs keep to counts and reasons).
 def _fetch_ddg(query: str, k: int) -> list[dict]:
     try:
         rows = web_scraper.search_duckduckgo(query, k=k) or []
