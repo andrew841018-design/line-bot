@@ -57,13 +57,16 @@ import market_calendar
 import market_dashboard
 import market_http
 import market_paths
+import market_pipeline_infl
 import market_pipeline_misc
+import market_pipeline_taco
 import market_pipeline_tw
 import market_pipeline_us
 import market_publish
 import market_store
 import market_tasks
 from jobs import market_snapshot as job
+from test_market_taco_fixture import HISTORY as TACO_HISTORY, make_bytes as taco_page, make_data as taco_data
 
 TPE = ZoneInfo("Asia/Taipei")
 ET = ZoneInfo("America/New_York")
@@ -694,10 +697,12 @@ def cboe_options(symbol: str, now: float) -> dict:
                      "iv30": 20.8, "last_trade_time": f"{day.isoformat()}T16:14:57", "options": options}}
 
 
+CBOE_QUOTE_BASE = {"VIX": 18.0, "VIX3M": 20.5, "VXTLT": 15.0}  # VXTLT：TLT 選擇權波動，約 15（2026-10-24 第 9 輪 A12）
+
+
 def vix_close(symbol: str, day: date) -> float:
     t = US_INDEX[day]
-    base = 18.0 if symbol == "VIX" else 20.5
-    return round(base + 2.5 * math.sin(2 * math.pi * t / 23.0), 2)
+    return round(CBOE_QUOTE_BASE[symbol] + 2.5 * math.sin(2 * math.pi * t / 23.0), 2)
 
 
 def cboe_quote(symbol: str, now: float) -> dict:
@@ -713,18 +718,38 @@ def cboe_quote(symbol: str, now: float) -> dict:
 TREASURY_HEADER = 'Date,"1 Mo","1.5 Month","2 Mo","3 Mo","4 Mo","6 Mo","1 Yr","2 Yr","3 Yr","5 Yr","7 Yr","10 Yr","20 Yr","30 Yr"'
 
 
-def treasury_csv(ym: str, now: float) -> str:
+TREASURY_REAL_HEADER = 'Date,"5 YR","7 YR","10 YR","20 YR","30 YR"'  # 實質殖利率檔（2026-10-24）：沒有 3 個月／2 年欄
+
+
+def treasury_csv(ym: str, now: float, curve: str = "nominal") -> str:
     year, month = int(ym[:4]), int(ym[4:])
     through = us_closed_through(now, after=(17, 0))
-    lines = [TREASURY_HEADER]
+    lines = [TREASURY_HEADER if curve == "nominal" else TREASURY_REAL_HEADER]
     for day in reversed(US_SESSIONS):
         if (day.year, day.month) != (year, month) or day > through or day in US_BOND_HOLIDAYS:
             continue
         t = US_INDEX[day]
         m3, y10 = 4.20 + 0.05 * math.sin(t / 9.0), 5.05 + 0.08 * math.sin(t / 13.0)
-        values = [m3 + 0.02, m3 + 0.01, m3, m3, m3 - 0.01, m3 - 0.03, m3 - 0.05, 4.0, 4.1, 4.3, 4.6, y10, 5.3, 5.25]
+        if curve == "nominal":
+            values = [m3 + 0.02, m3 + 0.01, m3, m3, m3 - 0.01, m3 - 0.03, m3 - 0.05, 4.0, 4.1, 4.3, 4.6, y10, 5.3, 5.25]
+        else:  # 實質＝名目減約 2.0–2.4（損益兩平約 2.0–2.4%）；5／7／10／20／30 年
+            values = [4.3 - 2.0 - 0.04 * math.sin(t / 7.0), 4.6 - 2.1, y10 - 2.4, 2.9, 3.0]
         lines.append(_mdy(day) + "," + ",".join(f"{value:.2f}" for value in values))
     return "\n".join(lines) + "\n"
+
+
+# BLS CPI（2026-10-24）：合成的四個序列 2024-01…2026-09（每月 +0.28%；2025-10 的 value 是 "-"，和真實回應一樣）
+BLS_BASES = {"CUUR0000SA0": 308.4, "CUSR0000SA0": 309.7, "CUUR0000SA0L1E": 313.6, "CUSR0000SA0L1E": 314.3}
+
+
+def bls_series_body(series_id: str) -> dict:
+    data = []
+    for index in range(32, -1, -1):
+        year, month = 2024 + index // 12, index % 12 + 1
+        value = "-" if (year, month) == (2025, 10) else f"{BLS_BASES[series_id] * 1.0028 ** index:.3f}"
+        data.append({"year": str(year), "period": f"M{month:02d}", "periodName": "x", "value": value, "footnotes": [{}]})
+    return {"status": "REQUEST_SUCCEEDED", "responseTime": 50, "message": [],
+            "Results": {"series": [{"seriesID": series_id, "data": data}]}}
 
 
 # CFTC TFF（無表頭、87 欄）：真實公開的四列，報告日依時間換成「已公布的最近一個週二」
@@ -809,6 +834,12 @@ NEWS = {  # 主題 → [(標題, 來源, 幾小時前)]；有幾則刻意帶網�
     "台股": [("台股站穩月線 電子權值股撐盤", "中央社", 3.0), ("外資連三日調節", "經濟日報", 9.0),
              ("零寬\u200b標題測試", "鉅亨網", 10.0)],
     "伊朗": [("伊朗局勢 油價波動加大", "中央社", 4.0), ("國際能源署更新油市報告", "經濟日報", 20.0)],
+    # 第 9 輪 A17：半導體新聞（Google News「費城半導體」）。第一則和美股那則同標題（卡上只列一次）；其餘有帶網址、@、零寬或太舊的
+    "費城半導體": [
+        ("美股收高 科技股領漲", "經濟日報", 2.0), ("費半指數收高 晶片股領漲", "工商時報", 3.0),
+        ("詳見 https://example.com 的晶片股整理", "鉅亨網", 4.0), ("費半 @all 盤後", "鉅亨網", 5.0),
+        ("晶片\u200b設備股", "中央社", 6.0), ("兩天前的晶片舊聞", "經濟日報", 50.0),
+    ],
 }
 
 
@@ -849,6 +880,14 @@ def trump_rss(now: float) -> str:
         for oid, hours, text, removed, kind in TRUMP_POSTS
     )
     return f'<?xml version="1.0" encoding="UTF-8"?><rss version="2.0" {TRUMP_NS}><channel><title>t</title>{items}</channel></rss>'
+
+
+def ocmacro_trump(now: float) -> bytes:
+    """ocmacro.com /dashboard/trump（川普壓力指數，2026-10-24）：fixture 的合成數列（test_market_taco_fixture.HISTORY）截到
+    站上「已經更新」的最新交易日（美東 20:30 之後才有當天的值）。頁面格式照保存的回應。"""
+    last = us_closed_through(now, (20, 30))
+    rows = tuple(row for row in TACO_HISTORY if row[0] <= last)
+    return taco_page(taco_data(index={"asOfDate": rows[-1][0].isoformat(), "value": rows[-1][1]}, history=rows))
 
 
 # ── 台股來源 ──────────────────────────────────────────────────────────────────
@@ -1069,6 +1108,7 @@ CONTENT_TYPES = {  # 主 Claude 10/17 實測的型別
     "www.moneydj.com": "text/html; charset=utf-8",
     "cdn-api.cboe.com": "application/json",
     "home.treasury.gov": "text/csv; charset=utf-8",
+    "api.bls.gov": "application/json",
     "www.cftc.gov": "text/plain",
     "www.finra.org": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "www.federalreserve.gov": "text/html; charset=utf-8",
@@ -1079,6 +1119,7 @@ CONTENT_TYPES = {  # 主 Claude 10/17 實測的型別
     "api.finmindtrade.com": "application/json",
     "news.google.com": "application/xml; charset=utf-8",
     "www.trumpstruth.org": "application/rss+xml; charset=UTF-8",
+    "ocmacro.com": "text/html; charset=utf-8",
 }
 
 
@@ -1192,6 +1233,12 @@ class FakeHttp:
             return 200, nasdaq_earnings(unquote(parts[3]))
         return None, None
 
+    def _api_bls_gov(self, path: str, q: dict, now: float):
+        prefix = "/publicAPI/v1/timeseries/data/"
+        if path.startswith(prefix) and path[len(prefix):] in BLS_BASES and not q:  # 一個序列一個 GET，沒有查詢參數
+            return 200, bls_series_body(path[len(prefix):])
+        return None, None
+
     def _www_ssga_com(self, path: str, q: dict, now: float):
         if path == "/library-content/products/fund-data/etfs/us/holdings-daily-us-en-spy.xlsx":
             return 200, ssga_xlsx(now)
@@ -1206,13 +1253,14 @@ class FakeHttp:
         name = path.rsplit("/", 1)[-1].removesuffix(".json")
         if path.startswith("/api/global/delayed_quotes/options/") and name in ("QQQ", "SPY", "SOXX"):
             return 200, cboe_options(name, now)
-        if path.startswith("/api/global/delayed_quotes/quotes/_") and name.lstrip("_") in ("VIX", "VIX3M"):
+        if path.startswith("/api/global/delayed_quotes/quotes/_") and name.lstrip("_") in CBOE_QUOTE_BASE:
             return 200, cboe_quote(name.lstrip("_"), now)
         return None, None
 
     def _home_treasury_gov(self, path: str, q: dict, now: float):
-        if path.startswith("/resource-center/data-chart-center/interest-rates/daily-treasury-rates.csv/all/"):
-            return 200, treasury_csv(q["field_tdr_date_value_month"], now)
+        curves = {"daily_treasury_yield_curve": "nominal", "daily_treasury_real_yield_curve": "real"}
+        if path.startswith("/resource-center/data-chart-center/interest-rates/daily-treasury-rates.csv/all/") and q.get("type") in curves:
+            return 200, treasury_csv(q["field_tdr_date_value_month"], now, curves[q["type"]])
         return None, None
 
     def _www_cftc_gov(self, path: str, q: dict, now: float):
@@ -1238,6 +1286,9 @@ class FakeHttp:
 
     def _www_trumpstruth_org(self, path: str, q: dict, now: float):
         return (200, trump_rss(now)) if path == "/feed" else (None, None)
+
+    def _ocmacro_com(self, path: str, q: dict, now: float):
+        return (200, ocmacro_trump(now)) if path == "/dashboard/trump" else (None, None)
 
     def _www_twse_com_tw(self, path: str, q: dict, now: float):
         if path == "/rwd/zh/afterTrading/MI_INDEX" and q.get("type") == "ALLBUT0999":
@@ -1279,10 +1330,14 @@ class FakeHttp:
 
 
 # ── 整個世界：兩段時間線的 collect＋publish（整個檔案共用一份，只跑一次） ──────────────────────
-TASK_LIST = (*market_pipeline_us.TASKS, *market_pipeline_tw.tasks(), *market_pipeline_misc.tasks())
+TASK_LIST = (*market_pipeline_us.TASKS, *market_pipeline_tw.tasks(), *market_pipeline_misc.tasks(),
+             *market_pipeline_taco.tasks(),
+             *market_pipeline_infl.TASKS)  # 通膨排最後：同一個市場依登記順序跑，損益兩平在 us.ust 之後
 WATCHED_FILES = ("market_pipeline_us.py", "market_pipeline_tw.py", "market_pipeline_misc.py", "market_publish.py",
                  "market_dashboard.py", "market_calc.py", "market_sources_us.py", "market_sources_tw.py",
-                 "market_sources_misc.py", "market_store.py", "market_tasks.py", "market_charts.py")
+                 "market_sources_misc.py", "market_store.py", "market_tasks.py", "market_charts.py",
+                 "market_pipeline_infl.py", "market_sources_infl.py", "market_pipeline_taco.py",
+                 "market_sources_taco.py")
 
 
 @dataclass
@@ -1490,6 +1545,16 @@ def _strings(node: Any) -> list[str]:
     return [node] if isinstance(node, str) else []
 
 
+def _text_nodes(node: Any) -> list[dict]:
+    """Flex 卡片裡的 text 節點（依出現順序）。"""
+    if isinstance(node, dict):
+        found = [node] if node.get("type") == "text" else []
+        return found + [n for value in node.values() for n in _text_nodes(value)]
+    if isinstance(node, list):
+        return [n for value in node for n in _text_nodes(value)]
+    return []
+
+
 _BAD_CATEGORIES = frozenset({"Cf", "Zl", "Zp", "Cs", "Co", "Cn"})
 
 
@@ -1607,6 +1672,11 @@ def test_collect_left_the_store_in_the_expected_state(world):
     assert {row.code for row in store.exrights("2330")} == {"2330"}
     macro = store.task_state(market_pipeline_misc.STATE_PREFIX + market_pipeline_misc.TASK_MACRO)
     assert macro["d"] == D2.isoformat() and macro["yahoo"] == "rate_limited", macro
+    # 川普壓力指數（2026-10-24）：每段各抓一次（第二段 D 換日後才到期）；第二次存到 D2
+    taco = store.get_obs(market_pipeline_taco.OBS_TACO)
+    assert taco["data_date"] == D2.isoformat() and taco["fail_streak"] == 0 and taco["error"] is None, taco
+    assert [call.path for call in world.http.calls if call.host == "ocmacro.com"] == ["/dashboard/trump"] * len(PHASES)
+    assert store.task_state(market_pipeline_taco.STATE_NAME)["tries"] == 1  # 第二段的第一次（台北日 10/17）
 
 
 # ── publish 與快照 ──────────────────────────────────────────────────────────────
@@ -1623,6 +1693,10 @@ def test_publish_outcomes_are_clean(world):
         assert fragment.get("snapshot_bytes", 0) < market_publish.SNAPSHOT_MAX_BYTES
     outcome = json.loads(market_paths.read_private_file(world.paths.outcome, 2_000_000)[0])
     assert outcome["status"] == "ok" and not _unexpected(outcome), _unexpected(outcome)
+    # 通膨（2026-10-24）：每日維護看得到 CPI 已存到哪個月、落後幾個月、輪詢狀態
+    assert (outcome["infl_cpi_month"], outcome["infl_cpi_lag_months"], outcome["infl_bls_poll"]) == ("2026-09", 0, "done")
+    assert [call.path.rsplit("/", 1)[1] for call in world.http.calls if call.host == "api.bls.gov"] == list(
+        market_calc.CPI_SERIES)  # 整個時間線只抓一次：先 CUUR0000SA0，再另外三個，各一個 GET
 
 
 def test_snapshot_is_private_and_every_row_passes_row_ok(world):
@@ -1641,7 +1715,7 @@ def test_snapshot_is_private_and_every_row_passes_row_ok(world):
 def test_every_row_we_fed_is_present_and_fresh(world):
     rows = world.snapshot["rows"]
     never = {row_id: _never_reason(world, row_id) for row_id, row in rows.items() if row["state"] == "never"}
-    assert not never, never  # 每一個來源都餵了：沒有一列應該是 never
+    assert not never, never  # 每一個來源都餵了：沒有一列應該是 never（macro.VXTLT 也有值了，2026-10-24 第 9 輪 A12）
     stale = [row_id for row_id, row in rows.items() if world.final_now > row["stale_after"]]
     assert not stale, stale
     assert {row_id for row_id, row in rows.items() if row["state"] == "unknown_period"} == {
@@ -1673,7 +1747,35 @@ def test_rows_carry_the_scenario_values(world):
     assert values("tw.inst3")["days_5d"] == 5 and values("tw.inst3")["foreign_5d_yi"] is not None
     assert values("macro.DXY")["source"] == "ETF 代理：UUP"  # 第二天 Yahoo 429 → 代理
     assert values("macro.MOVE")["source"] == "Yahoo" and rows["macro.MOVE"]["data_date"] == D1.isoformat()
+    # 2026-10-24 第 9 輪批 1 B 軌：VXTLT 和 VIX 同一批抓到，是獨立的一列（約 15；MOVE 的列不被它頂替）
+    assert values("macro.VXTLT")["source"] == "CBOE" and rows["macro.VXTLT"]["data_date"] == D2.isoformat()
+    assert 10.0 < values("macro.VXTLT")["value"] < 20.0 and values("macro.VXTLT")["value"] != values("macro.MOVE")["value"]
+    assert rows["macro.VXTLT"]["stale_after"] == rows["macro.VIX"]["stale_after"]
+    # 牆距用期權鏈自己的收盤（假來源的 close＝現價＝Nasdaq 同日正式收盤，所以三檔都過核對）
+    for symbol in ("QQQ", "SPY", "SOXX"):
+        option = values(f"us.options.{symbol}")
+        assert option["dist_basis"] == "close" and option["ref_close"] == option["spot"] > 0, option
     assert rows["macro.UST10Y"]["data_date"] == D2.isoformat()
+    # 損益兩平（2026-10-24）：名目與實質各自的檔、同一天才算；兩個天期都有 5 日變化（10/12 兩個檔都沒有，照共同日期數）
+    be = values("us.infl.be")
+    assert rows["us.infl.be"]["data_date"] == D2.isoformat() and be["y10"]["date"] == be["y5"]["date"] == D2.isoformat()
+    assert be["y5"]["chg5_bp"] is not None and be["y10"]["move"] in market_calc.BE_MOVE_CODES
+    assert be["spread_bp"] == round((be["y5"]["value"] - be["y10"]["value"]) * 100) and be["spread"] in market_calc.BE_SPREAD_CODES
+    # CPI 與核心 CPI（BLS，2026-10-24）：冷啟動第一輪就抓齊四個序列；月份是 2026-09，各值帶自己的月份，取得日是台北日期
+    cpi_row = rows["us.infl.cpi"]
+    cpi = values("us.infl.cpi")
+    assert cpi_row["data_date"] == "2026-09-30" and cpi_row["period"] == "2026-09" and cpi_row["source"] == "BLS"
+    assert cpi["cpi"]["month"] == cpi["cpi"]["yoy_month"] == cpi["cpi"]["sa_month"] == "2026-09-01" and cpi["aligned"] is True
+    assert cpi["cpi"]["yoy"] is not None and cpi["core"]["mom"] is not None and cpi["gap"] in market_calc.INFL_GAP_CODES
+    assert cpi["retrieved"] == "2026-10-16"  # 第一輪（台北 10/16 18:00）抓的
+    # 川普壓力指數：站上的數列截到 D2，位階用整段歷史算（market_calc.taco_stats）
+    to_d2 = [row for row in TACO_HISTORY if row[0] <= D2]
+    taco = rows["macro.TACO"]
+    assert taco["state"] == "ok" and taco["data_date"] == D2.isoformat() and taco["source"] == "MacroMargin"
+    # chg20：假來源的頁面照 test_market_taco_fixture.make_data 算（現值減倒數第 21 筆）；collect 會拿它和自己的歷史對（2026-10-28 F1-7）
+    assert values("macro.TACO") == {"value": to_d2[-1][1], "chg20": round(to_d2[-1][1] - to_d2[-21][1], 1),
+                                    **market_calc.taco_stats(to_d2),
+                                    "status_key": "high", "method": "v1"}
     assert values("us.cftc.es")["contract"] == "S&P 500 Consolidated" and rows["us.cftc.es"]["data_date"] == "2026-10-13"
     assert values("us.margin")["month"] == "2026-09"
     assert all(len(values(f"us.13f.{etf}")["rows"]) == 10 for etf in ("VOO", "QQQ", "SOXX"))
@@ -1688,8 +1790,76 @@ def test_rows_carry_the_scenario_values(world):
     titles = [item["title"] for item in values("news.us")["items"]]
     assert "美股收高 科技股領漲" in titles and "三天前的舊聞" not in titles
     assert not any(_hygiene_problems(title) for title in titles), titles
+    semi = [item["title"] for item in values("news.semi")["items"]]  # 第 9 輪 A17：網址那則整則丟、@ 被換掉、太舊的不列
+    assert semi[:2] == ["美股收高 科技股領漲", "費半指數收高 晶片股領漲"] and "兩天前的晶片舊聞" not in semi
+    assert not any("example.com" in title or "@" in title for title in semi) and not any(_hygiene_problems(t) for t in semi), semi
     assert {"關稅", "伊朗"} <= set(values("trump.summary")["topics"])
     assert rows["trump.posts"]["values"]["items"] and rows["season.now"]["values"]["midterm_year"] is True
+
+
+def _buttons(node: Any) -> list[tuple[str, str]]:
+    found: list[tuple[str, str]] = []
+    if isinstance(node, dict):
+        action = node.get("action")
+        if isinstance(action, dict):
+            found.append((action["label"], action["text"]))
+        for key, value in node.items():
+            if key != "action":
+                found += _buttons(value)
+    elif isinstance(node, list):
+        for item in node:
+            found += _buttons(item)
+    return found
+
+
+def _expected_earnings_line(world: World, etf: str) -> Optional[str]:
+    """快照裡這檔前十大（us.fund）的財報日 → 財報行應該長的樣子（和 bot 的程式各算一次，不共用）。"""
+    rows, now = world.snapshot["rows"], world.final_now
+    held = {symbol for item in rows[f"us.fund.{etf}"]["values"]["rows"] for symbol in item["symbols"]}
+    found: dict[str, tuple[date, bool]] = {}
+    for item in rows["events.next"]["values"]["items"]:
+        if item["kind"] == "earnings" and item["name"] in held and now < item["at"] <= now + 45 * 86400:
+            found.setdefault(item["name"], (datetime.fromtimestamp(item["at"], ET).date(), item.get("estimated") is True))
+    entries = [f"{name} {day.month}/{day.day}" + ("（預估）" if estimated else "")
+               for name, (day, estimated) in sorted(found.items(), key=lambda kv: (kv[1][0], kv[0]))]
+    return f"{market_calc.TEXT_EARNINGS_HEAD}：" + "、".join(entries) if entries else None
+
+
+def test_batch_1_b_track_cards_come_out_of_the_whole_pipeline(world):
+    """2026-10-24 第 9 輪批 1 B 軌：假來源 → collect → publish → bot 的整條線上，期權摘要列、牆距基準、三檔 ETF 的財報行、
+    CFTC 註腳、VXTLT 都真的出現在卡上（單元測試各自驗過，這裡抓接縫）。"""
+    names = [name for name, _builder in market_dashboard.SUMMARY_CARDS]  # 前面多了「重點摘要」：用卡名找
+    flow = _bubbles(_reply(world, "/盤勢").flex)[names.index("期權與資金")]
+    body = _strings(flow["body"])
+    for symbol in ("QQQ", "SOXX"):
+        line = next(text for text in body if text.startswith(f"{symbol} 買權牆 "))
+        assert "賣權牆" in line and "（+" in line and "…" not in line and market_dashboard.row_width(line) <= 24, line
+    assert not any("那斯達克（QQQ）買權牆" in text or "那斯達克（QQQ）賣權牆" in text for text in body)  # 舊的兩列併掉了
+    assert market_calc.TEXT_WALL_DIST_CLOSE in _strings(flow["footer"])
+    assert _buttons(flow) == [("期權與資金細節", "/盤勢 期權"), ("那斯達克期權圖", "/盤勢 QQQ 圖"),
+                              ("半導體期權圖", "/盤勢 SOXX 圖")]
+    assert {text for _label, text in _buttons(flow)} <= set(market_dashboard.SHIPPED_MARKET_TEXTS)
+
+    options = _bubbles(_reply(world, "/盤勢 期權").flex)
+    us_texts, tw_texts = _strings(options[0]), _strings(options[1])
+    for name in ("那斯達克100（QQQ）", "標普500（SPY）", "半導體（SOXX）"):
+        assert any(text.startswith(f"{name} 收盤 ") for text in us_texts), name  # 「現價」改成牆距同一個基準
+    assert market_calc.TEXT_WALL_DIST_CLOSE in us_texts and not any(text.startswith("牆距以最新價") for text in us_texts)
+    assert market_calc.TEXT_CFTC_NO_SEMI in tw_texts and market_calc.TEXT_CFTC_NOTE in tw_texts
+    move = next(text for text in us_texts if "（MOVE）" in text)
+    vxtlt = next(text for text in us_texts if "（VXTLT）" in text)
+    assert vxtlt.startswith("TLT 選擇權波動（VXTLT）") and "MOVE" not in vxtlt and "VXTLT" not in move
+    assert move != vxtlt and "（" in vxtlt.split("）", 1)[1]  # 數字後面接著日漲跌幅
+
+    macro = _strings(_bubbles(_reply(world, "/盤勢 新聞").flex)[2])
+    assert any(text.startswith("TLT 選擇權波動（VXTLT）：") for text in macro)
+    assert any(text.startswith("美債波動指數（MOVE）：") for text in macro)  # MOVE 的那一行照舊
+
+    for etf in ("VOO", "QQQ", "SOXX"):
+        texts = _strings(_reply(world, f"/盤勢 {etf}").flex)
+        expected = _expected_earnings_line(world, etf)
+        assert expected is not None and expected in texts, (etf, expected)
+        assert [text for text in texts if "日期暫缺" in text] == [market_calc.TEXT_EARNINGS_OTHERS]  # 缺的只用一句固定句，不點名
 
 
 # ── bot 端：每個送出去的指令 ────────────────────────────────────────────────────
@@ -1835,6 +2005,17 @@ def test_macro_etf_proxies_are_fetched_exactly_once_each_after_nasdaq_published_
         assert rows[f"macro.{key}"]["data_date"] == D2.isoformat(), key  # 代理列和 ETF 一樣是 D 那天
 
 
+def test_the_news_card_lists_semiconductor_news_once_per_title(world):
+    detail = _strings(_reply(world, "/盤勢 新聞").flex)
+    assert detail.index("美股新聞") < detail.index("半導體新聞") < detail.index("台股新聞")
+    semi_section = detail[detail.index("半導體新聞") + 1: detail.index("台股新聞")]
+    assert "費半指數收高 晶片股領漲" in semi_section
+    assert detail.count("美股收高 科技股領漲") == 1 and "美股收高 科技股領漲" not in semi_section  # 美股段已經列了
+    assert not any("example.com" in s or "兩天前的晶片舊聞" in s for s in detail)
+    news_calls = [call for call in world.http.calls if call.host == "news.google.com"]
+    assert {call.query["q"] for call in news_calls} == {"美股", "台股", "伊朗", "費城半導體"}
+
+
 def test_btc_row_comes_from_the_ibit_proxy_on_the_second_day(world):
     macro = _strings(_reply(world, "/盤勢").flex)
     assert any("比特幣" in s and "代理" in s for s in macro), macro
@@ -1844,11 +2025,47 @@ def test_btc_row_comes_from_the_ibit_proxy_on_the_second_day(world):
     assert "單日" in line and market_dashboard._price(etf_close) not in line, line  # 只寫漲跌幅，不印 ETF 股價
 
 
+def test_the_macro_summary_card_footer_has_the_trump_pressure_index(world):
+    """頁尾那一行是川普壓力指數的數字與歷史位階（取代「MM 川普壓力指數：抓不到（要登入）」）。"""
+    to_d2 = [row for row in TACO_HISTORY if row[0] <= D2]
+    stats = market_calc.taco_stats(to_d2)
+
+    def footer_texts(text: str, index: int) -> list[str]:
+        return [node["text"] for node in _text_nodes(_bubbles(_reply(world, text).flex)[index]["footer"])]
+
+    footer = footer_texts("/盤勢", [name for name, _builder in market_dashboard.SUMMARY_CARDS].index("宏觀與事件"))
+    assert footer[0] == f"川普壓力指數 {to_d2[-1][1]:+.1f}（高壓，任期內第 {stats['percentile']} 百分位）", footer
+    strings = [text for reply in map(lambda t: _reply(world, t), market_dashboard.SHIPPED_MARKET_TEXTS)
+               for text in (_strings(reply.flex) if reply.flex else [])]
+    assert not any("MM 川普壓力指數" in text for text in strings)
+    news = footer_texts("/盤勢 新聞", 2)
+    assert news[0] == footer[0] and market_calc.TEXT_TACO_SOURCE in news and market_calc.TEXT_TACO_COMPOSITION in news
+
+
 def test_summary_card_mentions_both_markets_and_their_dates(world):
     reply = _reply(world, "/盤勢")
     titles = [bubble["header"]["contents"][0]["text"] for bubble in _bubbles(reply.flex)]
-    assert len(titles) == 4 and titles[0].startswith("美股（1/4）") and titles[1].startswith("台股（2/4）"), titles
-    assert "10/16" in titles[0] and "10/16" in titles[1], titles
+    assert len(titles) == 5 and titles[0].startswith("重點摘要（1/5）"), titles
+    assert titles[1].startswith("美股（2/5）") and titles[2].startswith("台股（3/5）"), titles
+    assert "10/16" in titles[1] and "10/16" in titles[2], titles
+
+
+def test_the_digest_reads_the_real_pipeline_snapshot(world):
+    """重點摘要（輪播第一張）讀的是真的 collect → publish 寫出來的快照，不是合成的：6 列依序是美股、台股、風險、利率、事件、
+    川普，每列都有內容（沒有整排「暫缺」）、不超寬、沒有被切掉；footer 的資料日和快照的日期對得上。"""
+    reply = _reply(world, "/盤勢")
+    assert reply.render_errors == ()
+    bubble = _bubbles(reply.flex)[0]
+    rows = [node["text"] for node in bubble["body"]["contents"]]
+    assert [row[:2] for row in rows] == ["美股", "台股", "風險", "利率", "事件", "川普"], rows
+    assert all(market_dashboard.row_width(row) <= 24 and "…" not in row for row in rows), rows
+    assert not any("暫缺" in row or "過期" in row for row in rows), rows  # 兩個交易日的來源都齊了
+    assert rows[0].startswith("美股：") and rows[1].startswith("台股：")  # 三檔、加權都是最新場次：沒有落後的日期
+    notes = [node["text"] for node in bubble["footer"]["contents"] if node.get("type") == "text"]
+    # 2026-10-28 批 1 審查 F2-1：資料日多了 10 年債和川普壓力指數（真的 pipeline 的兩列都是 10/16，和其他列同一天）
+    assert notes[0] == "資料日：美股 10/16、台股 10/16、VIX 10/16、10 年債 10/16、川普壓力指數 10/16"
+    commands = [node["action"]["text"] for node in bubble["footer"]["contents"] if "action" in node]
+    assert commands == ["/盤勢 期權", "/盤勢 新聞", "/盤勢 0050"]
 
 
 def test_status_summary_for_the_daily_maintenance_is_clean(world):
@@ -1880,7 +2097,8 @@ def test_lines_from_an_older_data_day_carry_their_date(world):
     """期交所常晚一天（PLAN §3.2、§18.13）：台指牆是 10/15 的資料，卡片標題是「10/16 收盤」。
     dashboard 別的列在資料日和標題不同時會加「（M/D）」（_date_suffix），台指這兩處沒有。"""
     assert world.snapshot["rows"]["tw.options"]["data_date"] == D1.isoformat()  # 前提：這一列真的是前一天的
-    card = _bubbles(_reply(world, "/盤勢").flex)[2]
+    names = [name for name, _builder in market_dashboard.SUMMARY_CARDS]  # 前面多了「重點摘要」：用卡名找，不寫死位置
+    card = _bubbles(_reply(world, "/盤勢").flex)[names.index("期權與資金")]
     title = card["header"]["contents"][0]["text"]
     line = next(s for s in _strings(card) if s.startswith("台指選擇權："))
     assert "10/16" in title and "10/15" in line, (title, line)

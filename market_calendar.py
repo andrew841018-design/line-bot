@@ -224,9 +224,9 @@ class Calendar:
             and day.year in self._years
         )
 
-    def _scheduled(self, day: date) -> Optional[bool]:
-        """不看實際成交、只看覆寫與官方表的判斷（is_session 的第 2–5 步）。"""
-        kind = self._overrides.get(day)
+    def _scheduled(self, day: date, *, overrides: bool = True) -> Optional[bool]:
+        """不看實際成交、只看覆寫與官方表的判斷（is_session 的第 2–5 步）；overrides=False＝連覆寫也不看，只看官方表。"""
+        kind = self._overrides.get(day) if overrides else None
         if kind == OVERRIDE_CLOSED:
             return False
         if kind == OVERRIDE_OPEN:
@@ -248,6 +248,13 @@ class Calendar:
         if self.market == "us" and day.weekday() >= 5:
             return False
         return None
+
+    def table_session(self, d: Any) -> Optional[bool]:
+        """官方表怎麼說（不看覆寫、不看實際成交）：True／False；表外、沒抓到的年份、看不懂的說明＝None。
+
+        「預期交易日被覆寫成休市」要先知道那天按表本來是不是交易日（2026-10-24 第 9 輪 A19）：週末、休市表上的日子不是，
+        所以也不會被標成「休市」。"""
+        return self._scheduled(_as_date(d), overrides=False)
 
     def is_session(self, d: Any) -> Optional[bool]:
         """True／False；None＝不知道（表外、沒抓到的年份、看不懂的說明）。"""

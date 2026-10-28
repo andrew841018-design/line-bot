@@ -423,9 +423,11 @@ def test_fetch_google_news_requests():
     http = FakeHTTP(xml)
     assert [n.title for n in msm.fetch_google_news("us", NOW, http=http)] == ["台股收紅"]
     msm.fetch_google_news("iran", NOW, http=http)
+    msm.fetch_google_news("semi", NOW, http=http)  # 2026-10-24 第 9 輪 A17：費城半導體
     assert [call["url"] for call in http.calls] == [
         "https://news.google.com/rss/search?q=%E7%BE%8E%E8%82%A1&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
         "https://news.google.com/rss/search?q=%E4%BC%8A%E6%9C%97&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
+        "https://news.google.com/rss/search?q=%E8%B2%BB%E5%9F%8E%E5%8D%8A%E5%B0%8E%E9%AB%94&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
     ]
     assert all(call["accept"] == ("xml",) for call in http.calls)
     with pytest.raises(ValueError):
@@ -1069,6 +1071,12 @@ def test_endpoint_daily_budgets_match_the_plan():
     per_day = {name: endpoint.per_day for name, endpoint in msm.ENDPOINTS.items()}
     assert per_day["yahoo_spark"] == 1 and msm.ENDPOINTS["yahoo_spark"].retry_per_day == 0
     assert per_day["gnews.us"] + per_day["gnews.tw"] + per_day["gnews.iran"] == 48 + 48 + 24  # §19.2：伊朗一小時
+    # 第 9 輪 A17：半導體新聞一小時一次。news.google.com 四個主題合計每日 144 次，主機額度 200（預設）：留 56 次給失敗重試
+    assert msm.ENDPOINTS["gnews.semi"].every_s == 3_600 and per_day["gnews.semi"] == 24
+    market_store = pytest.importorskip("market_store")
+    on_google = sum(e.per_day for e in msm.ENDPOINTS.values() if e.host == "news.google.com")
+    assert on_google == 48 + 48 + 24 + 24 == 144
+    assert on_google + 50 <= market_store.HOST_RULES.get("news.google.com", market_store.DEFAULT_HOST_RULE).daily_cap
     assert per_day["trumpstruth"] == 48
     assert per_day["polymarket.house"] == per_day["kalshi.house"] == 12
 

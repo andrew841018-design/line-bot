@@ -93,7 +93,10 @@ FINRA_MARGIN_URL = "https://www.finra.org/sites/default/files/2021-03/margin-sta
 FED_FOMC_URL = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
 
 CBOE_OPTION_SYMBOLS = ("QQQ", "SPY", "SOXX")
-CBOE_QUOTE_SYMBOLS = ("VIX", "VIX3M")
+# VXTLT（TLT 選擇權的隱含波動，約 15；2026-10-24 第 9 輪 A12）：同一個主機、網址與形狀照 …/quotes/_VIX.json 假設（研究紀錄
+# 回 200、15.09；沒有保存回應檔，上線第一輪才是真的驗證），排最後——us.vix 那一批每個報價最多 15 秒、整批 35 秒，時間不夠時被
+# 擠掉的是它，不是 VIX3M
+CBOE_QUOTE_SYMBOLS = ("VIX", "VIX3M", "VXTLT")
 # 沒有期權鏈的 ETF：只抓一個約 1 KB 的報價，收盤當 Nasdaq 日線還沒公布時的 D provisional（2026-10-23）
 CBOE_CLOSE_QUOTE_SYMBOLS = ("VOO",)
 
@@ -133,8 +136,9 @@ ENDPOINTS: dict[str, Endpoint] = {
     "ssga_spy": Endpoint("www.ssga.com", ("spreadsheet",), 4 * MIB, 30.0, 2, 2, 1),
     "moneydj": Endpoint("www.moneydj.com", ("html",), 2 * MIB, 15.0, 4, 4, 1),  # QQQ、SOXX、VOO、0050
     "cboe_options": Endpoint("cdn-api.cboe.com", ("json",), 16 * MIB, 30.0, 3, 3, 1),  # SPY 實測 5.8 MB
-    # VIX、VIX3M；2026-10-23 加 VOO 的收盤（Nasdaq 日線還沒有 D 時才抓，每天 1–2 次）。主機預設每天 200 次，現用約 10
-    "cboe_quote": Endpoint("cdn-api.cboe.com", ("json",), 64 * KIB, 15.0, 6, 6, 1),
+    # VIX、VIX3M、VXTLT（2026-10-24 加）；2026-10-23 加 VOO 的收盤（Nasdaq 日線還沒有 D 時才抓，每天 1–2 次）。
+    # 主機預設每天 200 次，現用約 10（規劃值 6→8：三個指數各一次＋VOO 1–2 次＋重試）
+    "cboe_quote": Endpoint("cdn-api.cboe.com", ("json",), 64 * KIB, 15.0, 8, 8, 1),
     "treasury": Endpoint("home.treasury.gov", ("csv",), 1 * MIB, 15.0, 2, 2, 2),  # 本月＋月初時的上個月
     "cftc_tff": Endpoint("www.cftc.gov", ("text/plain",), 2 * MIB, 15.0, 1, 1, 2),
     "finra_margin": Endpoint("www.finra.org", ("spreadsheet",), 4 * MIB, 15.0, 1, 1, 2),
@@ -532,7 +536,7 @@ class OptionChain:
 
 @dataclass(frozen=True)
 class Quote:
-    """CBOE 報價：指數（VIX、VIX3M）與 ETF 收盤備援（VOO，2026-10-23）。日變化用 price_change（收盤後
+    """CBOE 報價：指數（VIX、VIX3M、VXTLT）與 ETF 收盤備援（VOO，2026-10-23）。日變化用 price_change（收盤後
     prev_day_close 會等於 close）。"""
 
     close: float

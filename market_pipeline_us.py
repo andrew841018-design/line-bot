@@ -69,8 +69,9 @@ STATE_PREFIX = "sched:"  # 本模組自己的排程紀錄（和 market_pipeline_
 
 ETFS: tuple[str, ...] = ("SPY", "VOO", "QQQ", "SOXX")  # SPY 先抓：交易日曆的「實際成交日」也看它
 OPTION_SYMBOLS: tuple[str, ...] = tuple(src.CBOE_OPTION_SYMBOLS)  # QQQ、SPY、SOXX
-VIX_SYMBOLS: tuple[str, ...] = tuple(src.CBOE_QUOTE_SYMBOLS)  # VIX、VIX3M
-# 歷史收盤約 9–83；範圍外是檔案壞了、不是行情：不存，卡片退回上一筆（2026-10-24 審查 r9b gp2 O1，1e-9 會印成 0.00）
+VIX_SYMBOLS: tuple[str, ...] = tuple(src.CBOE_QUOTE_SYMBOLS)  # VIX、VIX3M、VXTLT（2026-10-24 第 9 輪 A12；VXTLT 約 15，排最後）
+# VIX 歷史收盤約 9–83（VXTLT 研究紀錄 10/24 是 15.09，同一個範圍；還沒有保存過 _VXTLT.json 的回應，上線第一輪才是真的驗證）；
+# 範圍外是檔案壞了、不是行情：不存，卡片退回上一筆（2026-10-24 審查 r9b gp2 O1，1e-9 會印成 0.00）
 VIX_RANGE = (5.0, 200.0)
 # 沒有期權鏈的 ETF（VOO）：us.options 那批的最後一項只抓一個小報價，收盤當 D 的 provisional（2026-10-23）
 CLOSE_QUOTE_SYMBOLS: tuple[str, ...] = tuple(src.CBOE_CLOSE_QUOTE_SYMBOLS)
@@ -92,7 +93,7 @@ OBS_HIST_STATUS = "us.hist.status"
 #   "volume", "iv30", "raw_count", "bad_count", "conflict_count", "conflict_oi_known",
 #   "fields": CHAIN_FIELDS, "contracts": [[…], …], "conflicts": [[代號, OI|None], …]}；data_date＝最後成交的美東日期
 OBS_OPTIONS = {sym: f"us.options.{sym}" for sym in OPTION_SYMBOLS}
-# VIX／VIX3M：{"close", "price_change", "price_change_pct", "last_trade_et", "timestamp_utc",
+# VIX／VIX3M／VXTLT：{"close", "price_change", "price_change_pct", "last_trade_et", "timestamp_utc",
 #   "history": [[日期, 收盤], …]（自己存的前幾日，核對 price_change 用）}；data_date＝最後成交的美東日期
 OBS_QUOTE = {sym: f"us.quote.{sym}" for sym in VIX_SYMBOLS}
 # 美債：{"rows": [[日期, m3, y2, y10, y30], …]}（舊到新，最近 40 列；日變化用自己序列的前一列）

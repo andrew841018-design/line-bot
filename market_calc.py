@@ -38,6 +38,7 @@ from collections import Counter
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, is_dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
+from decimal import ROUND_HALF_UP, Context, Decimal, InvalidOperation, localcontext
 from functools import cached_property
 from typing import Any, Callable, NamedTuple
 from zoneinfo import ZoneInfo
@@ -51,6 +52,10 @@ MA_WINDOWS = (20, 60, 120, 240)
 BREADTH_EXTRA = 5  # 寬度的窗口＝N+5 個預期交易日（含 5 日前那天的均線）
 COVERAGE_OK = 0.80  # 覆蓋率 ≥80% 才算正常、才比 5 日前
 RSI_PERIOD = 14
+# RSI 往回至少要有幾筆連續的收盤才算（2026-10-28 審查 seat3 I-1）：Wilder 的種子（前 14 個變化的簡單平均）要靠後面的平滑才被洗掉，
+# 缺口後 15–60 筆的 RSI 沒收斂（合成資料實測：完整序列 41.0、缺口後 20 筆算出 56.9，隨機漫步最大誤差 24 點）；80 筆時最大誤差 0.26，
+# 卡上印整數不會變。tail 在缺格或碰到隔離區間處截斷，所以缺口後 80 個預期交易日內都沒有 RSI（寧可暫缺，不印不收斂的值）。
+RSI_MIN_CLOSES = 80
 DRAWDOWN_WINDOW = 240
 HIGHLOW_WINDOW = 240
 VOL_AVG_DAYS = 20
@@ -136,6 +141,8 @@ SNAPSHOT_SCHEMA = 1
 
 # ── 固定句（卡片與 altText 只用這些＋程式算的數字與日期；不寫年份，避開 validator 的年份規則） ─────
 TEXT_DISCLAIMER = "程式用公開資料算的，只描述狀態，不是買賣建議"  # 禁用字檢查的精確例外
+# 摘要輪播的 altText 出錯時退回的固定句（批 1 審查 F2-11）：開頭一樣是「盤勢：」，不放任何數字
+TEXT_SUMMARY_ALT_FALLBACK = "盤勢：摘要卡片，往左滑看全部"
 TEXT_PREPARING = "盤勢：資料準備中，請過幾分鐘再按一次"
 TEXT_BOOTSTRAP = "歷史資料補到 {done}/{total} 檔"
 TEXT_DISABLED = "盤勢：暫停使用"
@@ -143,16 +150,42 @@ TEXT_STALE = "過期（資料日 {md}）"
 TEXT_MISSING = "暫缺"
 TEXT_UNKNOWN_PERIOD = "期間未標"
 TEXT_INSUFFICIENT = "資料不足"
+TEXT_DATE_MISSING = "日期暫缺"  # 0050 細節卡的融資那一列沒有資料日時代替日期（批 1 審查 F2-6；實際上 job 都會寫，這是型別壞掉的退路）
 # 美股 ETF 列的收盤是 CBOE 的暫定值（Nasdaq 正式日線還沒到；2026-10-23 審查 r9 Codex 席 I2）：publish 寫進列的 source，
 # bot 只拿它和這個常數比、不印快照裡的字
 SOURCE_CBOE_FALLBACK = "CBOE（備援）"
 TEXT_PROVISIONAL = "（暫定）"
 TEXT_PROVISIONAL_CLOSE = "收盤是 CBOE 的暫定值，Nasdaq 正式資料到了會更新"
+# 2026-10-24 第 9 輪批 1・A2 軌（RSI、落後／休市標示、0050 日期）：句子由 bot 組，這裡只有固定句（不寫年份，日期用 {md}）
+TEXT_RSI_NOTE = "RSI14：0–100，70 以上偏熱、30 以下偏冷（描述狀態）"  # ETF、0050 細節卡有顯示 RSI 時的註腳
+TEXT_CLOSE_PENDING = "{md} 收盤資料尚未取得"  # 副標題：預期的最新場次已經收完、來源還沒給（{md}＝那一天，例 10/23）
+# 休市標示寫快照產生日的月／日（{md}），不寫「今天」：卡片留在聊天紀錄裡隔天再看，「今天」就變成錯的（2026-10-28 批 1 審查 F2-3）
+TEXT_TW_CLOSED = "{md} 休市"  # 副標題：預期交易日被日曆覆寫成休市，而且覆寫已確認
+TEXT_TW_CLOSED_TENTATIVE = "{md} 休市（暫定）"  # 副標題：覆寫是管線推定的（颱風…），還沒確認
+TEXT_TW_ETF_LAG = "0050／成分資料到 {md}（除權息資料待更新）"  # 除權息資料（TWT49U）還沒涵蓋到最新場次：0050 與成分只能顯示更早一天
 TEXT_ACCUMULATING = "資料累積中（{n}/5）"
 TEXT_CALENDAR_PENDING = "日曆待更新"
 TEXT_NOT_UPDATED = "未更新"
 TEXT_MEMBER_LIST_DATE = "成分清單 {md}"
-TEXT_MM_TRUMP = "MM 川普壓力指數：抓不到（要登入）"
+# 川普壓力指數（TACO 指數；2026-10-24 Andrew 選用 MacroMargin 的公開頁，取代「MM 川普壓力指數：抓不到（要登入）」——MM 的頁面
+# 對程式回 403＋Cloudflare 驗證，不繞過）。卡上只有這些固定句＋程式算的數字與日期；來源網站的任何文字都不存、不印。
+TEXT_TACO_NAME = "川普壓力指數"
+TEXT_TACO_NAME_SHORT = "川普壓力"
+TEXT_TACO_RANK = "任期內第 {p} 百分位"
+TEXT_TACO_RANK_SHORT = "第 {p} 百分位"
+TEXT_TACO_STATUS_HIGH = "高壓"
+TEXT_TACO_CHANGE = "20 個交易日變化：{chg}"
+TEXT_TACO_POSITION = "位階：{since} 起 {n} 個交易日中第 {p} 百分位（最高 {hi}，{hi_md}；最低 {lo}，{lo_md}）"  # n 是交易日筆數，不是日曆天（2026-10-28 批 1 審查 F2-2）
+TEXT_TACO_DATA_DAY = "資料日 {md}"  # 細節卡頁尾：川普壓力指數這一筆是哪一天的（來源常比其他列晚一個場次；批 1 審查 F2-1）
+# 說明句寫出主詞（重點摘要裡它和第 6 列中間最多隔 5 行）、連百分位一起說（最容易被讀錯的是「第 80 百分位＝80% 會退讓」）——
+# 第 2 輪複審 seat4 R2-N2。宏觀 5/5 用一般註記的上限（NOTE_MAX 60），這句 29 字
+TEXT_TACO_MEANING = "川普壓力指數越高代表壓力越大；數值和百分位都不是退讓的機率"
+TEXT_TACO_SOURCE = "來源：MacroMargin（ocmacro.com），不是財經M平方的 MM 指數"
+TEXT_TACO_COMPOSITION = "組成：淨支持率 20%、10 年美債 25%、MOVE 5%、標普500 22.5%、VIX 5%、CPI 即時預測 22.5%"
+TEXT_TACO_METHOD_CHANGED = "方法版本已更新，組成請看來源網站"
+# 來源 index.status.key 的值 → 卡上的詞：只收保存的真實回應裡看得到的鍵（2026-10-22 是 "high"）。頁面圖例另有低壓／中壓兩個區間，
+# 但資料裡沒有它們的鍵與門檻，不猜；不認得的鍵（含 None）不寫狀態詞。
+TACO_STATUS_WORDS: dict[str, str] = {"high": TEXT_TACO_STATUS_HIGH}
 TEXT_US_NO_DIVIDEND = "美股收盤已調整分割、配息不還原"
 TEXT_TW_ADJUSTED = "台股用還原除權息收盤"
 TEXT_VOL_SOURCE_DIFF = "來源不同，暫不判斷"
@@ -160,6 +193,19 @@ TEXT_OI_DATE = "未平倉推定前一交易日結算（來源未標日期）"
 TEXT_CHAIN_RANGE = "收到的有效合約範圍"
 TEXT_WALL_RANGE = "買權牆看現價到 +15%、賣權牆看 −15% 到現價"
 TEXT_WALL_DEF = "牆＝未平倉合約最集中的履約價"
+# 牆距的基準（2026-10-24 第 9 輪批 1 B 軌，審查 r9 seat1 I1；Andrew 對 Q2 照預設＝收盤價）：publish 在「同一份期權鏈自己的
+# close 可用」時把距離對 close 算（dist_basis＝close、ref_close＝那個 close），否則退回現價（spot）；牆的位置與 GEX 一律用現價。
+# 卡上印的價格（「收盤 X」或「最新價 X」）與下面的註記都由 dist_basis 查表，不照快照裡的字組句。
+DIST_CLOSE, DIST_SPOT = "close", "spot"
+DIST_BASES = (DIST_CLOSE, DIST_SPOT)
+TEXT_WALL_DIST_CLOSE = "牆距以收盤價計"
+TEXT_WALL_DIST_SPOT = "牆距以最新價計"
+WALL_DIST_TEXT = {DIST_CLOSE: TEXT_WALL_DIST_CLOSE, DIST_SPOT: TEXT_WALL_DIST_SPOT}
+# 幾檔的基準不同時，兩張卡的寫法不同（審查 r9 B1 的複審：摘要卡的牆那幾列沒有印價格，不能叫人去看「各檔標示的價格」）：
+# 期權細節卡每檔都在標題列印了「收盤 X」或「最新價 X」→ MIXED 指向它們；摘要卡直接點名各檔（NAMED，pairs＝「QQQ 以收盤價、SOXX 以最新價」）
+TEXT_WALL_DIST_MIXED = "牆距以各檔標示的收盤價或最新價計"
+TEXT_WALL_DIST_NAMED = "牆距：{pairs}計"
+WALL_DIST_WORD = {DIST_CLOSE: "收盤價", DIST_SPOT: "最新價"}
 TEXT_MAX_PAIN = "最大痛點＝讓選擇權買方整體虧損最多的結算價（不是目標價）"
 TEXT_RATE_ASSUMED = "假設利率 4%"
 TEXT_GEX_NEGATIVE = "假設部位下，現價附近 gamma 為負（漲跌較容易被放大的組合）"
@@ -168,9 +214,27 @@ TEXT_GEX_NEAR_ZERO = "假設部位下，現價附近 gamma 接近 0、不確定"
 TEXT_GEX_NO_CROSSING = "±15% 內沒有變號"
 TEXT_GEX_CROSSINGS = "變號點（價格由低往高）"
 TEXT_COVERAGE_LOWER = "（下限）"
-TEXT_SEASON_NOTE = "歷史統計，不是今年的預測；S&P 的統計不能直接當 SOXX 的勝率"
+TEXT_SEASON_NOTE = "歷史統計，不是今年的預測；S&P 的統計不能直接套用到 SOXX"
 TEXT_SEASON_SP_BASIS = "月均價口徑"
 TEXT_SEASON_TW_BASIS = "月底收盤口徑"
+# 2026-10-24 第 9 輪 A14：季節性的半導體兩段（SOXX 自身在前、SOX 長歷史在後）。句子不寫年份：樣本起迄從 market_seasonality.json
+# 帶出來（{range}）、月份是 {month}；SOXX 的指數 2021 年換過，註記用「中途換過」不寫年。只寫「上漲比例」，不寫「勝率」。
+TEXT_SEASON_PRICE_BASIS = "月底收盤、價格口徑"
+TEXT_SEASON_SOXX_HEAD = "半導體 ETF（SOXX）{month} 月，" + TEXT_SEASON_PRICE_BASIS
+TEXT_SEASON_SOXX_Q4 = "半導體 ETF（SOXX）第四季（12 月底比 9 月底）"
+TEXT_SEASON_SOXX_MIDTERM = "期中選舉年的 {month} 月（SOXX）"
+TEXT_SEASON_SOXX_MIDTERM_Q4 = "期中選舉年的第四季（SOXX）"
+TEXT_SEASON_SOXX_FEW_MIDTERM = "SOXX 的期中選舉年樣本太少，不列"
+TEXT_SEASON_SOXX_SAMPLE = "SOXX 樣本 {range}"
+TEXT_SEASON_SOXX_DATA = "資料：Nasdaq 收盤價，已調整分割"
+TEXT_SEASON_SOX_HEAD = "費城半導體（SOX）{month} 月，" + TEXT_SEASON_PRICE_BASIS
+TEXT_SEASON_SOX_Q4 = "費城半導體（SOX）第四季（12 月底比 9 月底）"
+TEXT_SEASON_SOX_MIDTERM = "期中選舉年的 {month} 月（SOX）"
+TEXT_SEASON_SOX_MIDTERM_Q4 = "期中選舉年的第四季（SOX）"
+TEXT_SEASON_SOX_SAMPLE = "SOX 樣本 {range}"
+TEXT_SEASON_SOX_DATA = "資料：Nasdaq 費城半導體指數日線收盤"
+TEXT_SEASON_SEMI_NOTE = "SOXX 追蹤的指數中途換過（原追蹤 SOX，後改追蹤 NYSE 半導體指數），兩者每月漲跌略有差異"
+TEXT_SEASON_BASIS_NOTE = "價格口徑是依資料推定，來源沒有明說是否含配息"
 TEXT_ELECTION_NOTE = "兩平台結算規則不同，不是民調、不是保證"
 TEXT_POLL_NONE = "民調：未提供"
 TEXT_KALSHI_TIME = "成交時間未知"
@@ -182,12 +246,19 @@ TEXT_13F_PERIOD = "彙總期間來源未標；前十大持有人申報期間以 
 TEXT_13F_PERIOD_SINGLE = "彙總期間來源未標；前十大持有人申報期間 {md}"
 TEXT_13F_SUMMARY = "前十大成分股中，{more} 檔的加碼機構多於減碼機構（{missing} 檔資料暫缺）"
 TEXT_CFTC_NOTE = "CFTC 是週資料、槓桿基金不是「外資」"
+TEXT_CFTC_NO_SEMI = "CFTC 沒有半導體期貨，期貨部位只看標普與那斯達克"  # 2026-10-24：SOXX 沒有對應的期貨部位，卡上明說
 TEXT_PE_NONPOSITIVE = "近四季淨利合計 ≤0，不計本益比"
 TEXT_PE_MISSING = "近四季資料不齊，不計本益比"
 TEXT_PE_NO_CAP = "市值暫缺，不計本益比"
 TEXT_PE_STALE = "資料過期，不計本益比"
 TEXT_SPY_WEIGHT = "依 S&P 500 權重（SPY 每日持股 {md}）"
 TEXT_NO_US_SYMBOL = "另有 {n} 檔無美國代號（合計 {pct}%）"
+# ETF 細節卡的財報行（2026-10-24 第 9 輪 A16）：這檔自己前十大的財報日（美東日期）；只有 estimated 為真才標預估；日期缺的（來源常常
+# 是空的，也可能本來就不在 45 天內）不點名，只用 OTHERS 這一句；一檔都沒列出時用 NONE（不寫「其他」）
+TEXT_EARNINGS_HEAD = "前十大 45 天內財報（美東日期）"  # 只看這檔 ETF 自己的前十大（批 1 審查 F2-15）
+TEXT_EARNINGS_ESTIMATED = "預估"
+TEXT_EARNINGS_OTHERS = "其他成分股的日期暫缺或不在 45 天內"
+TEXT_EARNINGS_NONE = "成分股的日期暫缺或不在 45 天內"
 
 # 程式自己句子的禁用字（§6）；免責句是精確例外；13F 的「加碼／減碼」描述機構，允許。
 FORBIDDEN_WORDS = ("建議", "進場", "出場", "停損", "抄底", "逢低", "布局", "可以買", "該賣", "該買", "買點", "賣點")
@@ -645,6 +716,7 @@ KIND_EVENT = "event"
 KIND_CFTC = "cftc"
 KIND_FINRA = "finra"
 KIND_TW_MONTHLY = "tw_monthly"  # 月營收（表上沒有，比照 FINRA 以月底為錨）
+KIND_US_CPI = "us_cpi"  # 美國 CPI／核心 CPI（BLS 月資料，2026-10-24）：同樣以月底為錨＋62 天
 KIND_13F = "13f"
 KIND_US_FUND = "us_fund"
 KIND_HOLDINGS_SPY = "holdings_spy"
@@ -666,7 +738,7 @@ _INSTANT_KINDS = {
     KIND_EVENT: EVENT_GRACE,
 }
 _DAY_KINDS = {KIND_CFTC: CFTC_DAYS, KIND_13F: F13_DAYS, KIND_US_FUND: FUND_DAYS, KIND_HOLDINGS_MONEYDJ: MONEYDJ_DAYS}
-_MONTH_END_KINDS = {KIND_FINRA: MONTH_END_DAYS, KIND_TW_MONTHLY: MONTH_END_DAYS}
+_MONTH_END_KINDS = {KIND_FINRA: MONTH_END_DAYS, KIND_TW_MONTHLY: MONTH_END_DAYS, KIND_US_CPI: MONTH_END_DAYS}
 STALE_KINDS = tuple(_SESSION_KINDS) + (KIND_OPTIONS,) + tuple(_INSTANT_KINDS) + tuple(_DAY_KINDS) + tuple(
     _MONTH_END_KINDS
 ) + (KIND_SEASON,)
@@ -866,7 +938,7 @@ def technicals(
         ma_dist=ma_dist,
         above=above,
         dd240_pct=drawdown_pct(series, DRAWDOWN_WINDOW) if usable(DRAWDOWN_WINDOW) else None,
-        rsi14=rsi_wilder(tail, RSI_PERIOD),
+        rsi14=rsi_wilder(tail, RSI_PERIOD) if len(tail) >= RSI_MIN_CLOSES else None,
     )
 
 
@@ -1672,12 +1744,19 @@ def options_values(
     rate: float | None,
     holidays: Any,
     iv30: float | None = None,
+    ref_close: float | None = None,
 ) -> dict:
-    """組 `us.options.<SYM>` 的 values（欄位見 ROW_IDS）；rate=None → 用 4% 並標 rate_assumed。"""
+    """組 `us.options.<SYM>` 的 values（欄位見 ROW_IDS）；rate=None → 用 4% 並標 rate_assumed。
+
+    ref_close（2026-10-24 第 9 輪 I1）：publish 認定可用的「同一份期權鏈自己的收盤」。給了正數 → 牆距對它算
+    （dist_basis＝close、ref_close 照填）；沒給或不是正的有限數 → 對現價算（dist_basis＝spot、ref_close＝None）。
+    牆的位置（以現價為中心找 ±15%）、GEX、其餘欄位都和基準無關。"""
     oi_valid, gamma_valid, stats = option_sets(chain, D, spot=spot)
     rate_assumed = rate is None
     gex = gex_from_sets(oi_valid, gamma_valid, stats, spot, DEFAULT_RATE if rate_assumed else rate)
     wall = walls(oi_valid, spot)
+    close = float(ref_close) if _is_num(ref_close) and ref_close > 0 else None
+    base, basis = (close, DIST_CLOSE) if close is not None else (float(spot), DIST_SPOT)
     expiry = monthly_expiry({leg.expiry for leg in oi_valid}, holidays, after=D)
     monthly = None
     if expiry is not None:
@@ -1695,8 +1774,10 @@ def options_values(
         "spot": float(spot),
         "call_wall": wall.call_wall,
         "put_wall": wall.put_wall,
-        "call_wall_dist_pct": wall.call_wall_dist_pct,
-        "put_wall_dist_pct": wall.put_wall_dist_pct,
+        "call_wall_dist_pct": _dist_pct(wall.call_wall, base),
+        "put_wall_dist_pct": _dist_pct(wall.put_wall, base),
+        "ref_close": close,
+        "dist_basis": basis,
         "wall_status": wall.status,
         "monthly": monthly,
         "pcr_oi": ratio.oi,
@@ -2093,11 +2174,15 @@ def _fmt_yi(value: float) -> str:
 def one_liner(state: Mapping[str, Fact], market: str) -> str:
     """固定句型的一句話（altText 開頭、卡上一列）；只放和主指數同一資料日、狀態正常的面向，缺主指數就回空字串。
 
-    美股：「美股收在月線上、成分股站上月線 41%、量偏少」（VOO 與其 S&P 500 成分）；
+    美股：「標普收在月線上、成分股站上月線 41%、量偏少」（VOO 與其 S&P 500 成分）；
     台股：「台股收在月線下、外資賣超 120 億、量偏多」（加權指數、三大法人、成交金額）。
+
+    美股這句的主詞是「標普」不是「美股」（2026-10-24 第 9 輪 N2，審查 r9 s1-N2）：它只看 VOO，摘要輪播第一張的美股列
+    把三檔分組（標普在月線上，那指、半導體在月線下）之後，「美股收在月線上」會和同一輪播裡的那一列互相矛盾。用「標普」而不是
+    「標普500」：寬度和原本的「美股」一樣（最壞 23.5），不會讓美股卡放不下這一句。
     """
     if market == "us":
-        anchor_key, prefix, extras = "VOO.above_ma20", "美股", ("VOO.breadth20_pct", "VOO.vol_label")
+        anchor_key, prefix, extras = "VOO.above_ma20", "標普", ("VOO.breadth20_pct", "VOO.vol_label")
         flag_subject = "VOO"
     elif market == "tw":
         anchor_key, prefix, extras = "TAIEX.above_ma20", "台股", ("tw.foreign", "TAIEX.vol_label")
@@ -2127,8 +2212,78 @@ def is_midterm_year(year: int) -> bool:
     return year % 4 == 2
 
 
+SEMI_MIN_MIDTERM_YEARS = 5  # 期中選舉年那兩段至少要有這麼多年才放上卡（SOXX 自身只有 2 年，SOX 有 8 年）
+SEMI_MIN_COVERAGE = 0.90  # 有效月份占應有月份的比例：和 jobs/build_market_seasonality 的 MIN_COVERAGE 一樣
+_YEAR_MONTH_RE = re.compile(r"(\d{4})-(\d{2})", re.ASCII)  # re.ASCII：全形、阿拉伯數字不收（第 2 輪複審 gp1 N7）
+
+
+def _year_month(value: Any) -> tuple[int, int] | None:
+    match = _YEAR_MONTH_RE.fullmatch(value) if isinstance(value, str) else None
+    if match is None:
+        return None
+    year, month = int(match.group(1)), int(match.group(2))
+    return (year, month) if 1900 <= year <= 2100 and 1 <= month <= 12 else None
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _semi_years(section: Any) -> int | None:
+    """半導體一段（SOXX／SOX）整體合理才回樣本最多幾年，否則 None（整段當作 pending）：已建完（不是 pending_full_data）、
+    樣本起迄與首末月份合理、有效月份不超過應有月份且至少 90%。market_seasonality.json 是靜態檔，這是擋「重建時
+    拿到殘缺或壞掉的資料」的最後一道。"""
+    if not isinstance(section, Mapping) or section.get("pending_full_data") is not False:
+        return None
+    sample = section.get("sample")
+    if not (isinstance(sample, list) and len(sample) == 2 and all(_is_int(x) for x in sample)):
+        return None
+    first_year, last_year = sample
+    if not 1900 <= first_year <= last_year <= 2100:
+        return None
+    years = last_year - first_year + 1
+    expected, valid = section.get("months_expected"), section.get("months_valid")
+    if not (_is_int(expected) and _is_int(valid) and 12 <= expected <= years * 12
+            and SEMI_MIN_COVERAGE * expected <= valid <= expected):
+        return None
+    first, last = _year_month(section.get("first_month")), _year_month(section.get("last_month"))
+    if first is None or last is None or first > last:
+        return None
+    return years
+
+
+def _semi_stats(stats: Any, years: int, *, min_n: int = 1) -> dict | None:
+    """一格統計（上漲比例、中位數、平均、年數）合理才放：比例 0–100、漲跌幅不低於 −100%、年數在 1 到樣本年數之間。"""
+    if not isinstance(stats, Mapping):
+        return None
+    up, median, mean, n = (stats.get(key) for key in ("up_pct", "median", "mean", "n"))
+    if not (_is_num(up) and 0 <= up <= 100 and _is_num(median) and -100 <= median <= 1000
+            and _is_num(mean) and -100 <= mean <= 1000 and _is_int(n) and max(1, min_n) <= n <= years):
+        return None
+    return {"up_pct": up, "median": median, "mean": mean, "n": n}
+
+
+def _semi_values(section: Any, midterm: bool, month: str) -> dict:
+    """SOXX 或 SOX 在 `season.now` 裡的六個值（月、第四季、期中選舉年的月與第四季、pending、樣本起迄）。"""
+    years = _semi_years(section)
+    if years is None:
+        return {"month": None, "q4": None, "midterm": None, "midterm_q4": None, "pending": True, "range": None}
+    mid = section.get("midterm") if isinstance(section.get("midterm"), Mapping) else {}
+    months = section.get("months") if isinstance(section.get("months"), Mapping) else {}
+    mid_months = mid.get("months") if isinstance(mid.get("months"), Mapping) else {}
+    return {
+        "month": _semi_stats(months.get(month), years),
+        "q4": _semi_stats(section.get("q4"), years),
+        "midterm": _semi_stats(mid_months.get(month), years, min_n=SEMI_MIN_MIDTERM_YEARS) if midterm else None,
+        "midterm_q4": _semi_stats(mid.get("q4"), years, min_n=SEMI_MIN_MIDTERM_YEARS) if midterm else None,
+        "pending": False,
+        "range": {"first": section["first_month"], "last": section["last_month"]},
+    }
+
+
 def season_values(table: Mapping[str, Any], year: int, month: int) -> dict:
-    """`season.now` 的 values：當月 S&P／加權指數的歷史統計；期中選舉年那幾列只在期中選舉年放。"""
+    """`season.now` 的 values：當月 S&P／加權指數／SOXX／SOX 的歷史統計；期中選舉年那幾列只在期中選舉年放
+    （半導體的期中選舉年統計樣本不到 SEMI_MIN_MIDTERM_YEARS 年也不放）。"""
 
     def stats(section: Any, *path: str) -> dict | None:
         node = section
@@ -2143,6 +2298,8 @@ def season_values(table: Mapping[str, Any], year: int, month: int) -> dict:
     tw = table.get("taiex") if isinstance(table, Mapping) else None
     tw_pending = not isinstance(tw, Mapping) or bool(tw.get("pending_full_data"))
     m = str(month)
+    soxx = _semi_values(table.get("soxx") if isinstance(table, Mapping) else None, midterm, m)
+    sox = _semi_values(table.get("sox") if isinstance(table, Mapping) else None, midterm, m)
     return {
         "month": month,
         "midterm_year": midterm,
@@ -2154,14 +2311,465 @@ def season_values(table: Mapping[str, Any], year: int, month: int) -> dict:
         "taiex_q4": None if tw_pending else stats(tw, "q4"),
         "taiex_midterm": None if tw_pending or not midterm else stats(tw, "midterm", "months", m),
         "taiex_pending": tw_pending,
+        "soxx": soxx["month"],
+        "soxx_q4": soxx["q4"],
+        "soxx_midterm": soxx["midterm"],
+        "soxx_midterm_q4": soxx["midterm_q4"],
+        "soxx_pending": soxx["pending"],
+        "soxx_range": soxx["range"],
+        "sox": sox["month"],
+        "sox_q4": sox["q4"],
+        "sox_midterm": sox["midterm"],
+        "sox_midterm_q4": sox["midterm_q4"],
+        "sox_pending": sox["pending"],
+        "sox_range": sox["range"],
     }
+
+
+# ── 通膨：損益兩平（2026-10-24 批 2 C 軌；PLAN_r9_andrew9_v2 A3、A6、A8）──────────────
+# 5 年／10 年損益兩平通膨＝財政部名目殖利率減 TIPS 實質殖利率，名目與實質同一天、同一天期才算。殖利率與損益兩平一律用
+# 整數 bp 算差值與門檻：2 位小數的殖利率用 float 相減，剛好 5 bp 的變化有近一半會掉到「<0.05」（審查 r9 s3-F3）。
+# 分類結果存成列舉碼，句子由 bot 查固定表（比照 contra.* → CONTRA_TEXT）；這裡不寫任何句子。
+BE_CHANGE_DAYS = 5  # 「5 日變化」＝名目與實質的「共同日期」序列往前數 5 個（10/12、11/11 債市休、股市開：兩個檔都沒有那天）
+# 最新與第 −6 個共同日期最多相差幾個日曆天（含）；超過就不算（2026-10-28 審查 seat3 nit2：實質檔缺兩週時「5 日變化」會跨 23 天、標 up）。
+# 自然發生的最長是感恩節那週（週五→下週一，剛好 10 天），所以上限是 10、超過 10 才不算。
+BE_CHANGE_MAX_SPAN_DAYS = 10
+BE_MOVE_BP = 5  # 5 日變化 ≥5 bp（含剛好 5）才寫上升／下降，不到就是持平
+BE_SPREAD_BP = 10  # 5 年減 10 年 ≥10 bp（含剛好 10）才寫「5 年高於 10 年」，≤−10 寫「低於」
+BE_MOVE_CODES = ("up", "flat", "down")
+BE_SPREAD_CODES = ("five_higher", "similar", "five_lower")
+TEXT_BE_BASIS = "名目殖利率減實質殖利率（%）"
+
+
+def _infl_dec(value: Any) -> Decimal | None:
+    """數字（int／float／數字字串）→ Decimal。一律走 str()：Decimal(float) 會把二進位誤差帶進來。bool、NaN、無限大回 None。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str, Decimal)):
+        return None
+    if isinstance(value, str) and not value.isascii():
+        return None  # Decimal() 連阿拉伯數字等 Unicode 數字都收；來源給的字只收 ASCII
+    try:
+        number = Decimal(str(value).strip())
+    except InvalidOperation:
+        return None
+    return number if number.is_finite() else None
+
+
+def yield_bp(value: Any) -> int | None:
+    """殖利率（%，財政部給 2 位小數）→ 整數 bp（4.78 → 478）；不是整數 bp（3 位小數以上）、超過 ±50% 或看不懂回 None。
+    運算放在自己的 Decimal 精度裡（bot 也 import 這個模組，不碰全域的 decimal 設定，也不受它影響）。"""
+    number = _infl_dec(value)
+    if number is None:
+        return None
+    with localcontext(Context(prec=40)):
+        scaled = number * 100
+        if scaled != scaled.to_integral_value() or abs(scaled) > 5000:
+            return None
+        return int(scaled)
+
+
+def _infl_day(value: Any) -> date | None:
+    if isinstance(value, str) and _ISO_DATE_RE.fullmatch(value):
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            return None
+    return None
+
+
+def breakeven_series(rows: Sequence[Any], tenor: int) -> list[tuple[date, int]]:
+    """`us.infl.be` 的列 {"date", "n5", "n10", "r5", "r10"}（日期＋名目與實質殖利率，%；具名鍵，之後加欄不會錯位）→ 該天期每個
+    「名目與實質同一天都有值」的日期與損益兩平（bp），由舊到新。名目領先一天、實質缺格的日子不在裡面；同一天重複以後面的為準。"""
+    if tenor not in (5, 10):
+        raise ValueError("tenor must be 5 or 10")
+    nominal_key, real_key = f"n{tenor}", f"r{tenor}"
+    found: dict[date, int] = {}
+    for row in rows if isinstance(rows, (list, tuple)) else ():
+        if not isinstance(row, Mapping):
+            continue
+        day, nominal, real = _infl_day(row.get("date")), yield_bp(row.get(nominal_key)), yield_bp(row.get(real_key))
+        if day is not None and nominal is not None and real is not None:
+            found[day] = nominal - real
+    return sorted(found.items())
+
+
+def be_move_code(change_bp: int) -> str:
+    """5 日變化（bp）→ up／flat／down；剛好 ±5 bp 算上升／下降。"""
+    return "up" if change_bp >= BE_MOVE_BP else "down" if change_bp <= -BE_MOVE_BP else "flat"
+
+
+def be_spread_code(spread_bp: int) -> str:
+    """5 年減 10 年（bp）→ five_higher／five_lower／similar；剛好 ±10 bp 算高於／低於。"""
+    return "five_higher" if spread_bp >= BE_SPREAD_BP else "five_lower" if spread_bp <= -BE_SPREAD_BP else "similar"
+
+
+@dataclass(frozen=True)
+class BeTenor:
+    date: date  # 這個天期最新的「共同日期」
+    bp: int  # 損益兩平（bp）
+    chg5_bp: int | None  # 和 5 個共同日期前的差（bp）；共同日期不足 6 個是 None
+    move: str | None  # be_move_code(chg5_bp)
+
+
+def breakeven_tenor(series: Sequence[tuple[date, int]]) -> BeTenor | None:
+    if not series:
+        return None
+    day, bp = series[-1]
+    change = None
+    if len(series) > BE_CHANGE_DAYS:
+        base_day, base_bp = series[-1 - BE_CHANGE_DAYS]
+        if (day - base_day).days <= BE_CHANGE_MAX_SPAN_DAYS:
+            change = bp - base_bp
+    return BeTenor(day, bp, change, be_move_code(change) if change is not None else None)
+
+
+def breakeven_values(rows: Sequence[Any]) -> dict | None:
+    """`us.infl.be` 的 values：兩個天期各自用自己的最新共同日期（實質缺格的天期不拖累另一個）；5 年減 10 年只在兩個天期同一天時算。
+    兩個天期都算不出來回 None。"""
+    tenors = {tenor: breakeven_tenor(breakeven_series(rows, tenor)) for tenor in (5, 10)}
+    if tenors[5] is None and tenors[10] is None:
+        return None
+
+    def part(item: BeTenor | None) -> dict | None:
+        if item is None:
+            return None
+        return {"date": item.date.isoformat(), "value": item.bp / 100, "chg5_bp": item.chg5_bp, "move": item.move}
+
+    spread = None
+    if tenors[5] is not None and tenors[10] is not None and tenors[5].date == tenors[10].date:
+        spread = tenors[5].bp - tenors[10].bp
+    return {
+        "y5": part(tenors[5]),
+        "y10": part(tenors[10]),
+        "spread_bp": spread,
+        "spread": be_spread_code(spread) if spread is not None else None,
+    }
+
+
+# ── 通膨：美國 CPI 與核心 CPI（BLS；2026-10-24 批 2 C 軌；PLAN_r9_andrew9_v2 A2–A5、A8） ──────────
+# 年增用未季調指數、月增與近 3 月年化用季調指數（BLS v1 沒有 net／percent change，全部自己算）。年增、月增、近 3 月年化先用
+# Decimal 的 ROUND_HALF_UP 取一位小數（BLS 的公布精度），所有門檻與差值都在這個顯示值上算，卡上印的就是同一個值：
+# 沒四捨五入的 3.531 會判「明顯高於」、卡上卻寫 3.5（審查 r9 s3-F3）。規則（起始值，沒有回測，可調）：
+#   R1 水準＝年增−2：≤0 不高於、≤0.5 略高於、≤1.5 高於、>1.5 明顯高於；R2 動能＝近 3 月年化−年增：≥+0.5 加速、≤−0.5 降溫；
+#   R3 年增月變（和上個月的年增比）；R4 整體 vs 核心的年增差：≥+0.5／≤−0.5 才寫；R8 基期缺值（2025-10 政府停擺）：保留最近一個
+#   算得出年增的月份並帶月份；R9 每個值帶自己的月份。結果存成列舉碼，句子由 bot 查固定表；PCE、密大、台灣 CPI 本版不做。
+CPI_HOST = "api.bls.gov"  # 2026-10-24 Andrew 同意（v1 免註冊、每天 25 次）；通膨的來源、collect、outcome 共用這個名字
+CPI_NSA, CPI_SA, CORE_NSA, CORE_SA = "CUUR0000SA0", "CUSR0000SA0", "CUUR0000SA0L1E", "CUSR0000SA0L1E"
+CPI_SERIES = (CPI_NSA, CPI_SA, CORE_NSA, CORE_SA)  # 全項未季調、全項季調、核心（不含食品能源）未季調、核心季調
+INFL_TARGET = Decimal("2.0")
+INFL_LEVEL_STEPS = (Decimal("0"), Decimal("0.5"), Decimal("1.5"))  # R1：差 ≤0／≤0.5／≤1.5／>1.5
+INFL_MOMENTUM_STEP = Decimal("0.5")  # R2
+INFL_GAP_STEP = Decimal("0.5")  # R4
+INFL_YOY_RANGE = (Decimal("-5"), Decimal("25"))  # R8：年增不在這個範圍就當暫缺
+INFL_MOM_RANGE = (Decimal("-10"), Decimal("10"))  # 月增、近 3 月年化的合理範圍（資料壞掉才會超過）
+INFL_ANN3_RANGE = (Decimal("-50"), Decimal("100"))
+INFL_YOY_LOOKBACK = 24  # 最近一個算得出年增的月份最多往前找幾個月
+INFL_CONTEXT = Context(prec=40, rounding=ROUND_HALF_UP)  # 運算用自己的精度與捨入（bot 也 import 這個模組，不碰全域設定）
+INFL_LEVEL_CODES = ("not_above", "slightly_above", "above", "well_above")
+INFL_MOMENTUM_CODES = ("accelerating", "steady", "cooling")
+INFL_MOVE_CODES = ("up", "flat", "down")
+INFL_GAP_CODES = ("headline_higher", "similar", "headline_lower")
+TEXT_INFL_BASIS = "BLS 指數：年增用未季調，月增與年化用季調，數字由程式計算"
+
+_YM_RE = re.compile(r"(\d{4})-(0[1-9]|1[0-2])", re.ASCII)
+
+
+def month_shift(ym: str, n: int) -> str:
+    """"YYYY-MM" 加減 n 個月（跨年）：month_shift("2026-01", -3) == "2025-10"。"""
+    match = _YM_RE.fullmatch(ym) if isinstance(ym, str) else None
+    if match is None:
+        raise ValueError("bad month")
+    year, month = divmod(int(match.group(1)) * 12 + int(match.group(2)) - 1 + n, 12)
+    return f"{year:04d}-{month + 1:02d}"
+
+
+def _month_index(ym: str) -> int:
+    match = _YM_RE.fullmatch(ym)
+    if match is None:
+        raise ValueError("bad month")
+    return int(match.group(1)) * 12 + int(match.group(2)) - 1
+
+
+def _month_first(ym: str) -> str:
+    return f"{ym}-01"
+
+
+def _index_value(series: Any, ym: str) -> Decimal | None:
+    value = _infl_dec(series.get(ym)) if isinstance(series, Mapping) else None
+    return value if value is not None and value > 0 else None
+
+
+def _round1(value: Decimal) -> Decimal:
+    return value.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+
+
+def _within(value: Decimal, limits: tuple[Decimal, Decimal]) -> Decimal | None:
+    return value if limits[0] <= value <= limits[1] else None
+
+
+def cpi_yoy(nsa: Any, ym: str) -> Decimal | None:
+    """年增（%，未季調，一位小數）：要 ym 和 12 個月前都有值（2025-10 是缺值 → 2026-10 算不出）；不在 −5～25 當暫缺。"""
+    now_value, base = _index_value(nsa, ym), _index_value(nsa, month_shift(ym, -12))
+    if now_value is None or base is None:
+        return None
+    with localcontext(INFL_CONTEXT):
+        return _within(_round1((now_value / base - 1) * 100), INFL_YOY_RANGE)
+
+
+def cpi_mom(sa: Any, ym: str) -> Decimal | None:
+    """月增（%，季調，一位小數）。"""
+    now_value, before = _index_value(sa, ym), _index_value(sa, month_shift(ym, -1))
+    if now_value is None or before is None:
+        return None
+    with localcontext(INFL_CONTEXT):
+        return _within(_round1((now_value / before - 1) * 100), INFL_MOM_RANGE)
+
+
+def cpi_ann3(sa: Any, ym: str) -> Decimal | None:
+    """近 3 月年化（%，季調，一位小數）：(I_t／I_t−3)^4−1，t−3 跨年也照 (年, 月) 算。"""
+    now_value, before = _index_value(sa, ym), _index_value(sa, month_shift(ym, -3))
+    if now_value is None or before is None:
+        return None
+    with localcontext(INFL_CONTEXT):
+        ratio = now_value / before
+        squared = ratio * ratio
+        return _within(_round1((squared * squared - 1) * 100), INFL_ANN3_RANGE)
+
+
+def infl_level(yoy: Decimal) -> str:
+    """R1：年增與 2% 的差（在一位小數的顯示值上算，上緣含等號）。"""
+    with localcontext(INFL_CONTEXT):
+        gap = yoy - INFL_TARGET
+        low, mid, high = INFL_LEVEL_STEPS
+        return "not_above" if gap <= low else "slightly_above" if gap <= mid else "above" if gap <= high else "well_above"
+
+
+def infl_momentum(ann3: Decimal, yoy: Decimal) -> str:
+    """R2：近 3 月年化減年增，剛好 ±0.5 算加速／降溫。"""
+    with localcontext(INFL_CONTEXT):
+        diff = ann3 - yoy
+        return "accelerating" if diff >= INFL_MOMENTUM_STEP else "cooling" if diff <= -INFL_MOMENTUM_STEP else "steady"
+
+
+def infl_move(yoy: Decimal, previous: Decimal) -> tuple[str, Decimal]:
+    """R3：年增和上個月的年增比（一位小數的顯示值，差 0 才算持平）；回 (up／flat／down, 差的絕對值)。"""
+    with localcontext(INFL_CONTEXT):
+        diff = yoy - previous
+        return ("up" if diff > 0 else "down" if diff < 0 else "flat"), abs(diff)
+
+
+def infl_gap(headline: Decimal, core: Decimal) -> tuple[str, Decimal]:
+    """R4：整體年增減核心年增，剛好 ±0.5 才寫；回 (代碼, 有號的差)。"""
+    with localcontext(INFL_CONTEXT):
+        diff = headline - core
+        code = "headline_higher" if diff >= INFL_GAP_STEP else "headline_lower" if diff <= -INFL_GAP_STEP else "similar"
+        return code, diff
+
+
+def _cpi_latest(points: Any) -> str | None:
+    """序列裡最大的 (年, 月)（有數字的月份才算；缺值不算前進）。"""
+    if not isinstance(points, Mapping):
+        return None
+    months = [key for key, value in points.items()
+              if isinstance(key, str) and _YM_RE.fullmatch(key) and _infl_dec(value) is not None]
+    return max(months) if months else None
+
+
+@dataclass(frozen=True)
+class InflMeasure:
+    """CPI 或核心 CPI 一組（月份都是 "YYYY-MM"）：month＝未季調指數的最新月；yoy 是最近一個算得出的年增（基期缺值時月份比 month
+    早，R8）；mom、ann3 是季調最新月 sa_month 的；動能用同一個月（yoy_month）的近 3 月年化和年增相減。"""
+
+    month: str
+    yoy: Decimal | None
+    yoy_month: str | None
+    yoy_prev: Decimal | None
+    sa_month: str | None
+    mom: Decimal | None
+    ann3: Decimal | None
+    level: str | None
+    momentum: str | None
+    yoy_move: str | None
+    yoy_move_pp: Decimal | None
+
+
+def infl_measure(nsa: Any, sa: Any, aligned: bool) -> InflMeasure | None:
+    month = _cpi_latest(nsa)
+    if month is None:
+        return None
+    yoy_month, yoy = None, None
+    cursor = month
+    for _ in range(INFL_YOY_LOOKBACK):
+        found = cpi_yoy(nsa, cursor)
+        if found is not None:
+            yoy_month, yoy = cursor, found
+            break
+        cursor = month_shift(cursor, -1)
+    previous = cpi_yoy(nsa, month_shift(yoy_month, -1)) if yoy_month is not None else None
+    sa_month = _cpi_latest(sa)
+    ann3_then = cpi_ann3(sa, yoy_month) if yoy_month is not None else None
+    move = infl_move(yoy, previous) if yoy is not None and previous is not None else (None, None)
+    return InflMeasure(
+        month=month, yoy=yoy, yoy_month=yoy_month, yoy_prev=previous, sa_month=sa_month,
+        mom=cpi_mom(sa, sa_month) if sa_month is not None else None,
+        ann3=cpi_ann3(sa, sa_month) if sa_month is not None else None,
+        level=infl_level(yoy) if yoy is not None else None,
+        # 動能和整體 vs 核心只在四個序列最新月份一樣時才算（不然會把不同月份相減）
+        momentum=infl_momentum(ann3_then, yoy) if aligned and yoy is not None and ann3_then is not None else None,
+        yoy_move=move[0], yoy_move_pp=move[1],
+    )
+
+
+def _float(value: Decimal | None) -> float | None:
+    return None if value is None else float(value)
+
+
+def _measure_values(item: InflMeasure) -> dict:
+    return {
+        "month": _month_first(item.month),
+        "yoy": _float(item.yoy),
+        "yoy_month": _month_first(item.yoy_month) if item.yoy_month else None,
+        "yoy_prev": _float(item.yoy_prev),
+        "mom": _float(item.mom),
+        "ann3": _float(item.ann3),
+        "sa_month": _month_first(item.sa_month) if item.sa_month else None,
+        "level": item.level,
+        "momentum": item.momentum,
+        "yoy_move": item.yoy_move,
+        "yoy_move_pp": _float(item.yoy_move_pp),
+    }
+
+
+def cpi_values(series: Any, retrieved: date) -> dict | None:
+    """`us.infl.cpi` 的 values。series＝{序列代號: {"YYYY-MM": 指數}}（四個 CPI_SERIES）；retrieved＝取得日（BLS 條款要求註明）。
+    全項未季調沒有資料回 None；四個序列最新月份不一樣時 aligned=False、動能與整體 vs 核心不算。"""
+    if not isinstance(series, Mapping):
+        return None
+    nsa_h, sa_h, nsa_c, sa_c = (series.get(sid) for sid in CPI_SERIES)
+    latest = [_cpi_latest(points) for points in (nsa_h, sa_h, nsa_c, sa_c)]
+    aligned = None not in latest and len(set(latest)) == 1
+    headline = infl_measure(nsa_h, sa_h, aligned)
+    if headline is None:
+        return None
+    core = infl_measure(nsa_c, sa_c, aligned)
+    gap = gap_pp = None
+    if aligned and core is not None and headline.yoy is not None and core.yoy is not None \
+            and headline.yoy_month == core.yoy_month:
+        gap, difference = infl_gap(headline.yoy, core.yoy)
+        gap_pp = float(difference)  # 有號：整體減核心（一位小數）
+    return {
+        "cpi": _measure_values(headline),
+        "core": _measure_values(core) if core is not None else None,
+        "aligned": aligned,
+        "gap": gap,
+        "gap_pp": gap_pp,
+        "retrieved": retrieved.isoformat(),
+    }
+
+
+def cpi_stored_month(series: Any) -> str | None:
+    """已存的四個序列「都有」的最新月份（最舊的那個序列的最新月）；缺任何一個序列或沒有有效月份回 None（當冷啟動）。"""
+    if not isinstance(series, Mapping):
+        return None
+    latest = [_cpi_latest(series.get(sid)) for sid in CPI_SERIES]
+    return None if None in latest else min(latest)
+
+
+# BLS 輪詢（collect 與 job 的 outcome 共用同一份）：期間＝「現在應該已公布的最新一月」（比照 _cftc_expected）。CPI 在每月 10–16 號
+# 美東 08:30 公布，所以每月 8 號起期待上個月的資料、8–20 號每 2 小時問一次直到最新月份前進；只在平日美東 08:30–20:00 問（公布
+# 時刻是 08:30，每天 ≤6 次，加上月份前進後另外 3 個序列也在 HostRule(5.0, 12)（台北日計）之內）。冷啟動（沒資料）或落後超過
+# 一個月不受日期、時段限制，立刻補抓；補抓沒進展時最多每天一次。窗口過了還沒更新（延後公布）也是每個平日一次，不放棄。
+CPI_POLL_FIRST_DAY, CPI_POLL_LAST_DAY = 8, 20
+CPI_POLL_FROM_ET, CPI_POLL_UNTIL_ET = time(8, 30), time(20, 0)
+CPI_POLL_EVERY_S = 2 * 3600.0
+CPI_PROBE_EVERY_S = 24 * 3600.0
+CPI_POLL_STATES = ("disabled", "done", "pending", "exhausted")
+
+
+def cpi_expected_month(day: date) -> str:
+    """美東 `day` 這天應該已公布的最新一月：8 號起是上個月、之前是上上個月。"""
+    return month_shift(f"{day.year:04d}-{day.month:02d}", -1 if day.day >= CPI_POLL_FIRST_DAY else -2)
+
+
+CPI_FUTURE_SLACK_MONTHS = 1  # 比「應已公布的最新月」最多再多 1 個月（BLS 提早公布、日界線附近的容錯）；再晚的月份是來源出狀況
+
+
+def cpi_month_ceiling(expected: str) -> str:
+    """BLS 的資料最晚可能到哪個月：「應已公布的最新月」（cpi_expected_month）再加 CPI_FUTURE_SLACK_MONTHS 個月。
+
+    2026-10-28 審查 gp2 C1：BLS 的某一次 200 回應含 2099-12 這種未來月份，以前照收 → 之後每輪 conflict:regress、CPI 永久凍結，
+    publish 還發出一列要到 2100 年才過期的資料。所以 collect 拒收更晚的月份（ParseError("date", "future")）、已存的更晚月份
+    當成毒化資料洗掉（cpi_trim_future），publish 看到就讓這一列暫缺。"""
+    return month_shift(expected, CPI_FUTURE_SLACK_MONTHS)
+
+
+def cpi_trim_future(series: Any, ceiling: str) -> tuple[dict, bool]:
+    """{序列代號: {"YYYY-MM": 指數}} → (去掉晚於 ceiling 的月份後的複本, 有沒有去掉東西)。
+
+    不改輸入；不是月份的鍵原樣留著（別的程式本來就忽略它們）；不是 Mapping 的序列原樣留著；整個輸入不是 Mapping 回 ({}, False)。"""
+    if not isinstance(series, Mapping):
+        return {}, False
+    trimmed: dict = {}
+    dropped = False
+    for series_id, points in series.items():
+        if isinstance(points, Mapping):
+            keep = {key: value for key, value in points.items()
+                    if not (isinstance(key, str) and _YM_RE.fullmatch(key) and key > ceiling)}
+            dropped = dropped or len(keep) != len(points)
+            trimmed[series_id] = keep
+        else:
+            trimmed[series_id] = points
+    return trimmed, dropped
+
+
+def cpi_lag_months(stored: str | None, expected: str) -> int | None:
+    """已存最新月份落後 expected 幾個月（沒落後或比它新是 0）；沒有資料 None。"""
+    if stored is None:
+        return None
+    return max(0, _month_index(expected) - _month_index(stored))
+
+
+@dataclass(frozen=True)
+class CpiPoll:
+    state: str  # disabled（主機不在白名單）、done（已有期待的月份）、pending（還在等／補抓）、exhausted（窗口過了還沒更新，每個平日問一次）
+    due: bool  # 現在該不該去問 BLS 一次
+    expected: str  # 現在應該已公布的最新一月 "YYYY-MM"
+
+    @property
+    def ceiling(self) -> str:
+        """collect 收得下的最晚月份（見 cpi_month_ceiling）。"""
+        return cpi_month_ceiling(self.expected)
+
+
+def cpi_poll(now_et: datetime, stored: str | None, last_probe: float | None, *, enabled: bool) -> CpiPoll:
+    """now_et＝美東時間（aware）；stored＝cpi_stored_month 的結果；last_probe＝上一次問了沒進展的 epoch 秒（沒有是 None）。"""
+    expected = cpi_expected_month(now_et.date())
+    if not enabled:
+        return CpiPoll("disabled", False, expected)
+    if stored is not None and stored >= expected:
+        return CpiPoll("done", False, expected)
+    now = now_et.timestamp()
+    in_window = CPI_POLL_FIRST_DAY <= now_et.day <= CPI_POLL_LAST_DAY
+    catch_up = stored is None or _month_index(expected) - _month_index(stored) >= 2
+
+    def spaced(gap: float) -> bool:
+        # last_probe 記在未來（寫入時系統時鐘曾往前跳）：當成沒問過，不然會一直 not due 直到時鐘追上（2026-10-28 審查 gp2 N4）
+        return last_probe is None or last_probe > now or now - last_probe >= gap
+
+    state = "pending" if in_window or catch_up else "exhausted"
+    if catch_up and spaced(CPI_PROBE_EVERY_S):
+        return CpiPoll(state, True, expected)
+    if now_et.weekday() >= 5 or not CPI_POLL_FROM_ET <= now_et.time() < CPI_POLL_UNTIL_ET:
+        return CpiPoll(state, False, expected)
+    return CpiPoll(state, spaced(CPI_POLL_EVERY_S if in_window else CPI_PROBE_EVERY_S), expected)
 
 
 # ── 顯示用快照的列 id 與 values 欄位（job 寫、bot 讀，兩端 import 這一份） ────────────
 # 型別：num（int 或 float、有限、不是 bool）、int、str、bool、date（"YYYY-MM-DD"）、any；後綴「?」＝可為 null；
-# dict＝固定鍵（全部要有）、{"*": spec}＝任意鍵、[spec]＝清單；("?", spec)＝可為 null 的巢狀結構。
+# dict＝固定鍵（全部要有）、{"*": spec}＝任意鍵、[spec]＝清單；("?", spec)＝可為 null 的巢狀結構；
+# frozenset＝列舉碼（只收裡面的字串；可為 null 的寫成 ("?", frozenset(…))，2026-10-24 通膨列開始用）。
 MA_DIST_SPEC = {str(n): "num?" for n in MA_WINDOWS}
 STATS_SPEC = {"up_pct": "num", "median": "num", "mean": "num", "n": "int"}
+SEASON_RANGE_SPEC = {"first": "str", "last": "str"}  # 樣本的第一個與最後一個月，"YYYY-MM"（market_seasonality.json 的 first_month／last_month）
 PER_N_SPEC = {
     "above": "int",
     "below": "int",
@@ -2215,6 +2823,10 @@ OPTIONS_SPEC = {
     "put_wall": "num?",
     "call_wall_dist_pct": "num?",
     "put_wall_dist_pct": "num?",
+    # 牆距的基準（2026-10-24 第 9 輪 I1，只增不改）："close"＝距離對 ref_close 算，"spot"＝對現價算（ref_close 此時是 null）。
+    # spec 沒有列舉型別：dist_basis ∈ DIST_BASES、兩個欄位互相對得上，由 market_publish 的 _options_basis_ok 檢查
+    "ref_close": "num?",
+    "dist_basis": "str",
     "wall_status": "str",
     "monthly": ("?", {"expiry": "date", "call_wall": "num?", "put_wall": "num?", "max_pain": "num?", "status": "str"}),
     "pcr_oi": "num?",
@@ -2223,6 +2835,62 @@ OPTIONS_SPEC = {
     "gex": GEX_SPEC,
     "counts": {"raw": "int", "bad": "int", "conflict": "int", "oi_valid": "int", "gamma_valid": "int", "iv_replaced": "int"},
     "oi_date_note": "str",
+}
+# 損益兩平（breakeven_values 的輸出）：兩個天期各自帶自己的日期；move／spread 是列舉碼，句子由 bot 查固定表
+BE_TENOR_SPEC = {"date": "date", "value": "num", "chg5_bp": "int?", "move": ("?", frozenset(BE_MOVE_CODES))}
+BE_SPEC = {
+    "y5": ("?", BE_TENOR_SPEC),
+    "y10": ("?", BE_TENOR_SPEC),
+    "spread_bp": "int?",
+    "spread": ("?", frozenset(BE_SPREAD_CODES)),
+}
+# CPI（cpi_values 的輸出）：月份一律是該月 1 日的 ISO 日期（R9：每個值帶自己的月份）；level／momentum／yoy_move／gap 是列舉碼；
+# retrieved＝資料取得日（BLS 條款要求註明；卡片寫「取得日」）。
+INFL_MEASURE_SPEC = {
+    "month": "date",
+    "yoy": "num?",
+    "yoy_month": "date?",
+    "yoy_prev": "num?",
+    "mom": "num?",
+    "ann3": "num?",
+    "sa_month": "date?",
+    "level": ("?", frozenset(INFL_LEVEL_CODES)),
+    "momentum": ("?", frozenset(INFL_MOMENTUM_CODES)),
+    "yoy_move": ("?", frozenset(INFL_MOVE_CODES)),
+    "yoy_move_pp": "num?",
+}
+INFL_SPEC = {
+    "cpi": INFL_MEASURE_SPEC,
+    "core": ("?", INFL_MEASURE_SPEC),
+    "aligned": "bool",
+    "gap": ("?", frozenset(INFL_GAP_CODES)),
+    "gap_pp": "num?",
+    "retrieved": "date",
+}
+# macro.TACO（2026-10-24）：MacroMargin「川普壓力指數」。value＝來源 index.value；chg20＝來源 index.change20d（20 個交易日前
+# 的指數點數差）；percentile＝歷史裡 ≤ 最後一筆的天數占比（0–100 整數，四捨五入）；n、since＝歷史天數與第一天；
+# max／min 與各自的日期；status_key＝來源 index.status.key（只收 [a-z_]{1,16}）；method＝"v1"（來源的方法版本等於
+# TACO_METHOD_V1）或 "other"。只存數字、日期與兩個短列舉，不存來源的任何文字。
+TACO_METHOD_V1 = "persistent-pressure-new4-v1"
+TACO_MIN_DAYS = 60  # 歷史至少幾天才算位階
+TACO_VALUE_MAX = 100.0  # |指數值| 上限（實際約 −5～+17）；超過代表頁面壞了
+TACO_CHANGE_MAX = 200.0  # |20 日變化| 上限（兩個指數值之差）
+TACO_LAST_ROW_TOLERANCE = 0.01  # 歷史最後一筆與 index.value 最多差多少（來源自己四捨五入）
+TACO_CHANGE_DAYS = 20  # change20d＝現值減 20 個交易日前（歷史倒數第 21 筆）
+TACO_CHANGE_TOLERANCE = 0.1  # change20d 與 (現值 − 歷史倒數第 21 筆) 最多差多少（來源的 change20d 只給一位小數）
+TACO_METHODS = ("v1", "other")
+TACO_SPEC = {
+    "value": "num",
+    "chg20": "num?",
+    "percentile": "int",
+    "n": "int",
+    "since": "date",
+    "max": "num",
+    "max_date": "date",
+    "min": "num",
+    "min_date": "date",
+    "status_key": "str?",
+    "method": "str",
 }
 _ITEMS = "items"
 ROW_IDS: dict[str, dict[str, Any]] = {
@@ -2241,6 +2909,8 @@ ROW_IDS: dict[str, dict[str, Any]] = {
         for s in ("es", "nq")
     },
     "us.margin": {"month": "str", "debit_musd": "num", "yoy_pct": "num?"},
+    "us.infl.be": BE_SPEC,
+    "us.infl.cpi": INFL_SPEC,
     **{
         f"us.13f.{s}": {
             "rows": [
@@ -2270,7 +2940,8 @@ ROW_IDS: dict[str, dict[str, Any]] = {
         }
         for s in ("VOO", "QQQ", "SOXX")
     },
-    "tw.taiex": {"close": "num", "chg": "num?", "chg_pct": "num?", "ma_dist": MA_DIST_SPEC, "above_ma20": "bool?", "dd240_pct": "num?"},
+    # rsi14（2026-10-24 第 9 輪 A18）：一律有這個鍵，窗口有缺口算不出來就是 null；舊快照沒有這個鍵，bot 當沒有
+    "tw.taiex": {"close": "num", "chg": "num?", "chg_pct": "num?", "ma_dist": MA_DIST_SPEC, "above_ma20": "bool?", "dd240_pct": "num?", "rsi14": "num?"},
     "tw.etf.0050": ETF_SPEC,
     "tw.breadth.0050": BREADTH_SPEC,
     "tw.ad": {"adv": "int", "dec": "int", "flat": "int", "adv_limit": "int?", "dec_limit": "int?", "no_compare": "int?"},
@@ -2305,8 +2976,16 @@ ROW_IDS: dict[str, dict[str, Any]] = {
         for s in (
             "VIX", "VIX3M", "UST3M", "UST10Y", "DXY", "WTI", "BRENT", "GOLD", "SILVER", "BTC", "USDTWD",
             "RUT", "DJI", "IXIC", "MOVE", "SPY_DD",
+            # 2026-10-24 第 9 輪（A12，審查 r9 s3-F9／s4-F13）：CBOE 的 VXTLT（TLT 選擇權波動，約 15）是獨立的一列，
+            # 不寫進 MOVE（約 100，量綱差 6–7 倍；MOVE 恢復時兩列並存）。只增不改：既有列的語意、型別、單位都沒變，
+            # 舊 bot 讀新快照時只認得 READ_ROWS，新列直接略過；stale 規則等 collect 時用 KIND_US_DAILY（同 VIX）。
+            "VXTLT",
         )
     },
+    # 2026-10-24 第 9 輪批 1（A27，審查 r9b gp2 N4）：SPY 價格代理的距高點用到 CBOE 暫定收盤時 provisional＝true（一律有這個鍵，
+    # false＝正式收盤）。下面這個鍵蓋掉上面共用的形狀、列的先後順序不變；舊快照沒有這個鍵，bot 當 false。
+    "macro.SPY_DD": {"value": "num", "chg": "num?", "chg_pct": "num?", "source": "str", "provisional": "bool"},
+    "macro.TACO": TACO_SPEC,
     "events.next": {_ITEMS: [{"name": "str", "at": "num", "kind": "str"}]},
     "season.now": {
         "month": "int",
@@ -2319,6 +2998,19 @@ ROW_IDS: dict[str, dict[str, Any]] = {
         "taiex_q4": ("?", STATS_SPEC),
         "taiex_midterm": ("?", STATS_SPEC),
         "taiex_pending": "bool",
+        # 2026-10-24 第 9 輪 A14（只增不改）：SOXX 自身與 SOX 長歷史；舊 bot 讀新快照時略過這些鍵，新 bot 讀舊快照時當 pending
+        "soxx": ("?", STATS_SPEC),
+        "soxx_q4": ("?", STATS_SPEC),
+        "soxx_midterm": ("?", STATS_SPEC),
+        "soxx_midterm_q4": ("?", STATS_SPEC),
+        "soxx_pending": "bool",
+        "soxx_range": ("?", SEASON_RANGE_SPEC),
+        "sox": ("?", STATS_SPEC),
+        "sox_q4": ("?", STATS_SPEC),
+        "sox_midterm": ("?", STATS_SPEC),
+        "sox_midterm_q4": ("?", STATS_SPEC),
+        "sox_pending": "bool",
+        "sox_range": ("?", SEASON_RANGE_SPEC),
     },
     "election": {
         "vote_date": "date",
@@ -2329,15 +3021,15 @@ ROW_IDS: dict[str, dict[str, Any]] = {
         ],
     },
     "trump.summary": {"topics": {"*": "int"}, "latest_utc": "num?", "at_least": "bool"},
-    **{f"news.{s}": {_ITEMS: [{"title": "str", "source": "str?", "published_utc": "num"}]} for s in ("us", "tw", "iran")},
+    **{f"news.{s}": {_ITEMS: [{"title": "str", "source": "str?", "published_utc": "num"}]} for s in ("us", "tw", "iran", "semi")},
     "trump.posts": {_ITEMS: [{"excerpt": "str", "published_utc": "num", "quoted_author": "str?", "topics": ["str"]}]},
     "oneliner.us": {"text": "str?"},
     "oneliner.tw": {"text": "str?"},
-    "contra.us": {"codes": ["str"], "text": "str?"},
+    "contra.us": {"codes": ["str"], "text": "str?", "provisional": "bool"},  # provisional：命中的矛盾用到暫定收盤（A27）
     "contra.tw": {"codes": ["str"], "text": "str?"},
 }
 CHART_KEYS = ("QQQ", "SPY", "SOXX", "TXO")
-_ISO_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_ISO_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}", re.ASCII)  # re.ASCII：\d 預設連阿拉伯數字、全形數字都收（2026-10-28 審查 gp2 N9）
 
 
 def _base_ok(base: str, value: Any) -> bool:
@@ -2370,6 +3062,8 @@ def spec_ok(spec: Any, value: Any) -> bool:
         return _base_ok(spec.rstrip("?"), value)
     if isinstance(spec, tuple) and len(spec) == 2 and spec[0] == "?":
         return value is None or spec_ok(spec[1], value)
+    if isinstance(spec, frozenset):
+        return isinstance(value, str) and value in spec
     if isinstance(spec, list):
         return isinstance(value, list) and all(spec_ok(spec[0], item) for item in value)
     if isinstance(spec, dict):
@@ -2384,6 +3078,62 @@ def spec_ok(spec: Any, value: Any) -> bool:
 def values_ok(row_id: str, values: Any) -> bool:
     spec = ROW_IDS.get(row_id)
     return spec is not None and spec_ok(spec, values)
+
+
+_TACO_STATUS_KEY_RE = re.compile(r"[a-z_]{1,16}")
+
+
+def taco_stats(history: Sequence[tuple[date, float]]) -> dict:
+    """川普壓力指數的歷史位階（2026-10-24）。history＝[(日期, 值), …]，日期嚴格遞增、至少 TACO_MIN_DAYS 筆。
+
+    percentile＝歷史裡「≤ 最後一筆」的天數占比 ×100，四捨五入成整數（Decimal ROUND_HALF_UP：88.07 → 88、x.5 → 進位）；
+    最後一筆自己也算（所以分子至少是 1，目前點是歷史最高時 100）。目前點是歷史最低時分子就是 1：1/n 先四捨五入再取整數，
+    n 超過 200 時 1/n×100 小於 0.5，結果是「第 0 百分位」（例：n＝394 時 0.25 → 0；n＝200 時剛好 0.5 → 1）；2026-10-28 審查
+    seat3 nit3：以前這裡把下限寫成 1/n（未取整），會讓人以為百分位至少是 1。比較用最後一筆（歷史自己的最新點），不用 index.value：
+    兩者最多差 TACO_LAST_ROW_TOLERANCE，用 index.value 比的話最後一筆可能不算進自己的位階。
+    最高／最低同值時取最早那天。"""
+    rows = list(history)
+    if len(rows) < TACO_MIN_DAYS:
+        raise ValueError("history too short")
+    current = rows[-1][1]
+    at_or_below = sum(1 for _day, value in rows if value <= current)
+    percentile = int((Decimal(at_or_below) * 100 / Decimal(len(rows))).quantize(Decimal(1), rounding=ROUND_HALF_UP))
+    high = max(rows, key=lambda row: row[1])  # max／min 遇到同值回第一個＝最早那天
+    low = min(rows, key=lambda row: row[1])
+    return {
+        "percentile": percentile,
+        "n": len(rows),
+        "since": rows[0][0].isoformat(),
+        "max": high[1],
+        "max_date": high[0].isoformat(),
+        "min": low[1],
+        "min_date": low[0].isoformat(),
+    }
+
+
+def taco_values_ok(values: Any) -> bool:
+    """macro.TACO 的 values：型別（TACO_SPEC）加上語意（範圍、百分位 0–100、天數、日期先後、最高最低包得住現值）。
+
+    publish 組列時（不合就只讓這一列暫缺，不擋整份快照）與 bot 讀快照時（不合就當暫缺）共用；ROW_IDS 本身只管型別。"""
+    if not spec_ok(TACO_SPEC, values):
+        return False
+    limit, tol = TACO_VALUE_MAX, TACO_LAST_ROW_TOLERANCE + 1e-9  # 浮點誤差：最高／最低 ±0.01 剛好算在內
+    if not (abs(values["value"]) <= limit and abs(values["max"]) <= limit and abs(values["min"]) <= limit):
+        return False
+    change = values["chg20"]
+    if change is not None and abs(change) > TACO_CHANGE_MAX:
+        return False
+    if not 0 <= values["percentile"] <= 100 or not TACO_MIN_DAYS <= values["n"] <= 20000:
+        return False
+    if not (values["min"] - tol <= values["value"] <= values["max"] + tol) or values["min"] > values["max"]:
+        return False
+    since = date.fromisoformat(values["since"])  # spec_ok 已確認是合法的 YYYY-MM-DD
+    if since > date.fromisoformat(values["max_date"]) or since > date.fromisoformat(values["min_date"]):
+        return False
+    key = values["status_key"]
+    if key is not None and not _TACO_STATUS_KEY_RE.fullmatch(key):
+        return False
+    return values["method"] in TACO_METHODS
 
 
 ROW_ENVELOPE_SPEC = {

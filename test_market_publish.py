@@ -7,6 +7,7 @@ chain_payload 序列化）、宏觀（Yahoo 與 ETF 代理）、事件、新聞�
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import os
@@ -151,6 +152,19 @@ def option_chain(symbol: str, spot: float, *, scale: float = 1.0):
     )
 
 
+def cpi_series() -> dict:
+    """合成的 CPI 四個序列 2025-01…2026-09（每月 +0.2%；2025-10 缺值，和 BLS 停擺那個月一樣）。"""
+    out = {}
+    for series_id, base in zip(market_calc.CPI_SERIES, (300.0, 301.0, 305.0, 306.0)):
+        points = {}
+        for index in range(21):
+            year, month = 2025 + index // 12, index % 12 + 1
+            if (year, month) != (2025, 10):
+                points[f"{year}-{month:02d}"] = round(base * 1.002 ** index, 3)
+        out[series_id] = points
+    return out
+
+
 def seed_us(store: market_store.Store, *, missing_on_d: tuple[str, ...] = ()) -> None:
     for i, (symbol, base) in enumerate(US_ETF_BASE.items()):
         rows = price_rows(US_DAYS, base, phase=i)
@@ -191,13 +205,22 @@ def seed_us(store: market_store.Store, *, missing_on_d: tuple[str, ...] = ()) ->
 
     for symbol, spot in (("QQQ", 700.0), ("SPY", 600.0), ("SOXX", 250.0)):
         store.put_obs(f"us.options.{symbol}", pipe.chain_payload(option_chain(symbol, spot)), data_date="2026-10-16")
-    for symbol, close, change in (("VIX", 19.99, 3.53), ("VIX3M", 21.5, 1.2)):
+    # VXTLT（2026-10-24 第 9 輪 A12）和 VIX、VIX3M 同一個形狀（us.vix 那一批一起抓）：約 15、日變化 −4.67%
+    for symbol, close, change, pct in (("VIX", 19.99, 3.53, 17.66), ("VIX3M", 21.5, 1.2, 17.66), ("VXTLT", 15.09, -0.74, -4.67)):
         store.put_obs(f"us.quote.{symbol}", {
-            "close": close, "price_change": change, "price_change_pct": 17.66, "last_trade_et": "2026-10-16T16:15:01-04:00",
+            "close": close, "price_change": change, "price_change_pct": pct, "last_trade_et": "2026-10-16T16:15:01-04:00",
             "timestamp_utc": "2026-10-17T01:37:16+00:00",
             "history": [["2026-10-15", round(close - change, 2)], ["2026-10-16", close]]}, data_date="2026-10-16")
     store.put_obs("us.ust", {"rows": [["2026-10-14", 4.27, 3.9, 5.07, 5.3], ["2026-10-15", 4.25, 3.9, 5.05, 5.3],
                                       ["2026-10-16", 4.26, 3.91, 5.09, 5.31]]}, data_date="2026-10-16")
+    # 損益兩平（2026-10-24）：名目與實質各 6 個共同日期（10/12 債市休市、沒有那天）
+    store.put_obs("us.infl.be", {"rows": [
+        {"date": day, "n5": n5, "n10": n10, "r5": r5, "r10": r10} for day, n5, n10, r5, r10 in (
+            ("2026-10-08", 4.99, 5.22, 2.62, 2.87), ("2026-10-09", 5.02, 5.24, 2.68, 2.91),
+            ("2026-10-13", 5.00, 5.21, 2.67, 2.88), ("2026-10-14", 5.00, 5.19, 2.64, 2.84),
+            ("2026-10-15", 4.91, 5.10, 2.58, 2.78), ("2026-10-16", 4.89, 5.09, 2.52, 2.74))]}, data_date="2026-10-16")
+    # BLS CPI 與核心 CPI（2026-10-24）：取得日 10/16（台北）
+    store.put_obs("us.infl.cpi", {"series": cpi_series(), "retrieved": "2026-10-16"}, data_date="2026-09-30", period="2026-09")
     for key, lev in (("es", (300_000, 500_000)), ("nq", (90_000, 70_000))):
         store.put_obs(f"us.cftc.{key}", {
             "market": "S&P 500 CONSOLIDATED", "report_date": "2026-10-13", "oi": 2_000_000, "dealer_l": 1, "dealer_s": 1,
@@ -289,14 +312,23 @@ def election_quote(platform: str, bid: float, ask: float, *, fetched: float, res
             "closed": result is not None, "result": result, "fetched_utc": iso(fetched)}
 
 
+def taco_obs(last: date = D, *, days: int = 120, value: float = 9.0005) -> dict:
+    """market_pipeline_taco 存的格式（川普壓力指數，2026-10-24；合成：到 last 為止的美股交易日各一筆）。"""
+    rows = [[day.isoformat(), round(6.0 + 5.0 * math.sin(i / 7.0), 4)] for i, day in enumerate(sessions("us", last, days))]
+    rows[-1][1] = value
+    return {"as_of": last.isoformat(), "value": value, "change20d": -3.6, "status_key": "high",
+            "method": "persistent-pressure-new4-v1", "history": rows}
+
+
 def seed_misc(store: market_store.Store) -> None:
     """market_pipeline_misc 的格式：宏觀一格一筆（BTC 也是，2026-10-23 拿掉 Coinbase）、新聞是 obs、川普是累積的貼文＋摘要。"""
     store.put_obs("macro.DXY", macro_payload(99.4, 0.3, "Yahoo", "DX-Y.NYB"), data_date="2026-10-16")
     store.put_obs("macro.WTI", macro_payload(71.5, -0.5, "ETF 代理：USO", "USO"), data_date="2026-10-16")
     store.put_obs("macro.USDTWD", macro_payload(32.338, 0.138, "代理：期交所匯率", "USD/NTD"), data_date="2026-10-16")
     store.put_obs("macro.BTC", macro_payload(81_471.0, 120.0, "Yahoo", "BTC-USD"), data_date="2026-10-16")
+    store.put_obs("macro.TACO", taco_obs(), data_date="2026-10-16")  # 川普壓力指數（market_pipeline_taco）
     published = NOW - 3600
-    for key, title in (("us", "美股收高 科技股領漲"), ("tw", "台股量縮整理"), ("iran", "伊朗局勢")):
+    for key, title in (("us", "美股收高 科技股領漲"), ("tw", "台股量縮整理"), ("iran", "伊朗局勢"), ("semi", "費半收低 晶片股回檔")):
         items = [{"title": title, "source": "某報", "published_utc": iso(published)},
                  {"title": "很久以前的新聞", "source": "某報", "published_utc": iso(published - 3 * 86400)}]
         store.put_obs(f"news.{key}", {"items": items, "fetched_utc": iso(NOW - 300)}, data_date="2026-10-17")
@@ -381,7 +413,7 @@ def test_publish_writes_all_rows_with_valid_schema(world):
         assert market_calc.row_ok(row_id, row), row_id
     states = {row_id: row["state"] for row_id, row in snap["rows"].items()}
     never = sorted(row_id for row_id, state in states.items() if state == "never")
-    # 合成資料沒有放的：宏觀裡只放了 DXY／WTI／BTC（台幣走期交所代理）
+    # 合成資料沒有放的：宏觀裡只放了 DXY／WTI／BTC（台幣走期交所代理）；VXTLT 有 us.quote.VXTLT（和 VIX 同一批），所以不在裡面
     assert never == sorted(f"macro.{k}" for k in ("BRENT", "GOLD", "SILVER", "RUT", "DJI", "IXIC", "MOVE"))
     assert all(states[f"us.13f.{etf}"] == "unknown_period" for etf in ("VOO", "QQQ", "SOXX"))
     assert outcome["rows"] == {"never": 7, "ok": len(states) - 10, "unknown_period": 3}
@@ -394,6 +426,217 @@ def test_publish_writes_all_rows_with_valid_schema(world):
     assert snap["rows"]["macro.USDTWD"]["values"]["chg"] == pytest.approx(0.138)
     assert set(snap["charts"]) == {"QQQ", "SPY", "SOXX", "TXO"}
     assert len(snap["charts"]["QQQ"]["files"]) == 2 and len(snap["charts"]["TXO"]["files"]) == 1
+
+
+def test_vxtlt_row_is_built_from_its_own_quote_like_vix(world):
+    """2026-10-24 第 9 輪 A12（B 軌，取代骨架的佔位測試）：macro.VXTLT 和 macro.VIX／VIX3M 是同一個 handler，讀
+    us.quote.VXTLT；資料日是 last_trade_time 的美東日期，過期規則照 VIX（KIND_US_DAILY）。macro.MOVE 不動。"""
+    assert market_publish._builder_for("macro.VXTLT") is market_publish._builder_for("macro.VIX")
+    assert market_publish._builder_for("macro.VIX3M") is market_publish._builder_for("macro.VIX")
+    outcome = world.publish()
+    assert outcome["kind"] == "ok" and "row_errors" not in outcome, outcome
+    snap = world.snapshot()
+    rows = snap["rows"]
+    row = rows["macro.VXTLT"]
+    assert row["state"] == "ok" and row["data_date"] == "2026-10-16" and row["source"] == "CBOE"
+    assert row["values"] == {"value": 15.09, "chg": pytest.approx(-0.74), "chg_pct": -4.67, "source": "CBOE"}
+    assert row["stale_after"] == rows["macro.VIX"]["stale_after"] == rows["macro.VIX3M"]["stale_after"]  # 過期規則照 VIX
+    assert market_publish.validate_snapshot(snap) == []
+    assert rows["macro.MOVE"]["state"] == "never" and rows["macro.MOVE"]["values"] == {}  # MOVE 沒被 VXTLT 頂替
+    assert rows["macro.VIX"]["values"]["value"] == 19.99 and rows["macro.VIX3M"]["values"]["value"] == 21.5
+
+
+def test_vxtlt_is_never_a_fact_for_the_one_liners_and_leaves_its_own_row_missing_without_a_quote(world, monkeypatch):
+    seen: list[str] = []
+    real = market_publish._Ctx.record_facts
+
+    def spy(self, facts, data_date, stale_after):
+        seen.extend(facts)
+        return real(self, facts, data_date, stale_after)
+
+    monkeypatch.setattr(market_publish._Ctx, "record_facts", spy)
+    world.publish()
+    assert "VIX" in seen and "VIX3M" in seen and "VXTLT" not in seen  # 一句話與矛盾只看 VIX 與 VIX3M
+    with_quote = world.snapshot()["rows"]
+    world.store._db().execute("DELETE FROM obs WHERE obs_id = 'us.quote.VXTLT'")
+    world.publish()
+    snap = world.snapshot()
+    assert snap["rows"]["macro.VXTLT"]["state"] == "never" and market_publish.validate_snapshot(snap) == []
+    for row_id in ("oneliner.us", "contra.us", "oneliner.tw", "contra.tw", "macro.VIX", "macro.VIX3M", "macro.MOVE"):
+        assert snap["rows"][row_id] == with_quote[row_id], row_id
+
+
+# ── 牆距的基準（2026-10-24 第 9 輪批 1 B 軌，審查 r9 seat1 I1；Andrew 對 Q2 照預設＝收盤價） ──────────────────────────
+
+
+def _put_chain(world, symbol, *, spot, close):
+    import market_pipeline_us as pipe
+
+    chain = dataclasses.replace(option_chain(symbol, spot), close=close)
+    world.store.put_obs(f"us.options.{symbol}", pipe.chain_payload(chain), data_date="2026-10-16")
+
+
+def _set_close(world, symbol, close, *, provisional=False):
+    """D 當天的收盤列：None＝沒有這一列；provisional＝CBOE 的暫定值（Nasdaq 正式列還沒到）。"""
+    world.store._db().execute("DELETE FROM closes WHERE market = 'us' AND symbol = ? AND date = ?",
+                              (symbol, D.isoformat()))
+    if close is not None:
+        world.store.upsert_closes("us", symbol, [(D, close, 1_000_000)], "cboe" if provisional else "nasdaq",
+                                  provisional=provisional)
+
+
+def _options_values(world, symbol="QQQ") -> dict:
+    outcome = world.publish()
+    assert outcome["kind"] == "ok" and "row_errors" not in outcome, outcome
+    row = world.snapshot()["rows"][f"us.options.{symbol}"]
+    assert row["state"] == "ok" and market_calc.row_ok(f"us.options.{symbol}", row)
+    return row["values"]
+
+
+def test_wall_distances_use_the_chains_own_close_when_it_agrees_with_the_official_close(world):
+    _put_chain(world, "QQQ", spot=704.0, close=702.8)  # 盤後的最新價比收盤高一點
+    _set_close(world, "QQQ", 702.8)
+    values = _options_values(world)
+    assert values["spot"] == 704.0 and values["dist_basis"] == "close" and values["ref_close"] == 702.8
+    assert values["call_wall_dist_pct"] == pytest.approx((values["call_wall"] / 702.8 - 1) * 100)
+    assert values["put_wall_dist_pct"] == pytest.approx((values["put_wall"] / 702.8 - 1) * 100)
+    assert values["call_wall_dist_pct"] != pytest.approx((values["call_wall"] / 704.0 - 1) * 100)  # 不是現價的距離
+
+
+@pytest.mark.parametrize(
+    "official, provisional, close, expected",
+    [
+        (702.8, False, 702.8, "close"),  # 一致
+        (701.0, False, 702.8, "close"),  # 差 0.26%
+        (699.4, False, 702.8, "close"),  # 差 0.49%
+        (699.3, False, 702.8, "spot"),  # 差 0.5005%：剛好超過
+        (832.0, False, 700.0, "spot"),  # 差很多（這個合成世界的預設：ETF 約 832、鏈的 close 700）
+        (200.0, False, 201.0, "close"),  # 剛好 0.5% 算一致
+        (200.0, False, 201.02, "spot"),
+        (650.0, True, 702.8, "close"),  # 同一天只有備援列：它就是用這份鏈的 close 寫的，沒有正式列可比
+        (None, False, 702.8, "close"),  # 同一天沒有任何列
+        (702.8, False, None, "spot"),  # 鏈沒有 close
+        (702.8, False, 0.0, "spot"),
+        (702.8, False, -1.0, "spot"),
+    ],
+)
+def test_wall_distance_basis_rules(world, official, provisional, close, expected):
+    spot = close + 1.0 if close and close > 100 else 704.0
+    _put_chain(world, "QQQ", spot=spot, close=close)
+    _set_close(world, "QQQ", official, provisional=provisional)
+    values = _options_values(world)
+    assert values["dist_basis"] == expected, values
+    if expected == "close":
+        assert values["ref_close"] == close
+        assert values["call_wall_dist_pct"] == pytest.approx((values["call_wall"] / close - 1) * 100)
+    else:
+        assert values["ref_close"] is None
+        assert values["call_wall_dist_pct"] == pytest.approx((values["call_wall"] / spot - 1) * 100)
+
+
+def test_only_the_same_days_official_row_is_compared(world):
+    """前一天的正式列差再多也不相干（比的是資料日當天）；資料日當天的正式列差太多才退回現價。"""
+    _put_chain(world, "QQQ", spot=704.0, close=702.8)
+    _set_close(world, "QQQ", None)
+    world.store.upsert_closes("us", "QQQ", [(D - timedelta(days=1), 400.0, 1_000_000)], "nasdaq")
+    assert _options_values(world)["dist_basis"] == "close"
+
+
+def test_each_symbol_picks_its_own_basis(world):
+    _put_chain(world, "QQQ", spot=704.0, close=702.8)
+    _set_close(world, "QQQ", 702.8)
+    world.publish()
+    rows = world.snapshot()["rows"]
+    assert [rows[f"us.options.{s}"]["values"]["dist_basis"] for s in ("QQQ", "SPY", "SOXX")] == ["close", "spot", "spot"]
+    assert rows["us.options.SPY"]["values"]["ref_close"] is None
+
+
+def test_the_untouched_world_falls_back_to_the_spot_and_says_so(world):
+    values = _options_values(world)  # 合成 ETF 收盤約 832、鏈的 close 是 700：差 15% 以上，不能用
+    assert values["dist_basis"] == "spot" and values["ref_close"] is None
+    assert values["call_wall_dist_pct"] == pytest.approx((values["call_wall"] / 700.0 - 1) * 100)
+
+
+def test_walls_and_gamma_do_not_depend_on_the_distance_basis(world):
+    _put_chain(world, "QQQ", spot=704.0, close=702.8)
+    _set_close(world, "QQQ", 702.8)
+    on_close = _options_values(world)
+    _set_close(world, "QQQ", 600.0)  # 正式收盤差很多 → 同一份鏈退回現價
+    on_spot = _options_values(world)
+    assert (on_close["dist_basis"], on_spot["dist_basis"]) == ("close", "spot")
+    assert {key for key in on_close if on_close[key] != on_spot[key]} == {
+        "call_wall_dist_pct", "put_wall_dist_pct", "ref_close", "dist_basis"}
+
+
+def test_a_put_wall_above_the_close_keeps_its_plus_sign(world):
+    _put_chain(world, "QQQ", spot=740.0, close=700.0)
+    _set_close(world, "QQQ", 700.0)
+    values = _options_values(world)
+    assert values["dist_basis"] == "close" and values["put_wall"] > 700.0
+    assert values["put_wall_dist_pct"] > 0
+    assert values["put_wall_dist_pct"] == pytest.approx((values["put_wall"] / 700.0 - 1) * 100)
+
+
+def test_when_the_official_closes_cannot_be_read_the_distances_stay_on_the_spot(world, monkeypatch):
+    """QQQ 的收盤讀不到（共用資料壞了）：核對不了，寧可退回現價；期權列自己照常（它不靠 us.etf 那一列）。
+    （整個 store.closes 壞掉的話日曆也建不起來、所有列都暫缺，所以只讓 QQQ 這一檔的收盤失敗。）"""
+    _put_chain(world, "QQQ", spot=704.0, close=702.8)
+    _set_close(world, "QQQ", 702.8)
+    real = market_publish._Ctx.closes
+
+    def flaky(self, market, symbol):
+        if (market, symbol) == ("us", "QQQ"):
+            raise market_publish._Unavailable("shared")
+        return real(self, market, symbol)
+
+    monkeypatch.setattr(market_publish._Ctx, "closes", flaky)
+    outcome = world.publish()
+    assert outcome["kind"] == "ok"
+    rows = world.snapshot()["rows"]
+    assert rows["us.etf.QQQ"]["state"] == "never"  # 它自己要用收盤
+    values = rows["us.options.QQQ"]["values"]
+    assert rows["us.options.QQQ"]["state"] == "ok" and values["dist_basis"] == "spot" and values["ref_close"] is None
+
+
+def test_validate_snapshot_checks_the_option_basis_keys(world):
+    _put_chain(world, "QQQ", spot=704.0, close=702.8)
+    _set_close(world, "QQQ", 702.8)
+    world.publish()
+    snap = world.snapshot()
+    assert snap["rows"]["us.options.QQQ"]["values"]["dist_basis"] == "close"
+    assert market_publish.validate_snapshot(snap) == []
+
+    def problems(**change) -> list[str]:
+        copy = json.loads(json.dumps(snap))
+        copy["rows"]["us.options.QQQ"]["values"].update(change)
+        return market_publish.validate_snapshot(copy)
+
+    assert problems(dist_basis="spot", ref_close=None) == []
+    assert problems(dist_basis="weird") == ["options_basis:us.options.QQQ"]  # 型別對、但不是 job 寫得出來的詞
+    assert problems(dist_basis="close", ref_close=None) == ["options_basis:us.options.QQQ"]  # 說是收盤卻沒有收盤
+    assert problems(dist_basis="close", ref_close=0.0) == ["options_basis:us.options.QQQ"]
+    assert problems(dist_basis="spot", ref_close=702.8) == ["options_basis:us.options.QQQ"]  # 說是現價卻帶著收盤
+    assert problems(ref_close="702.8") == ["row:us.options.QQQ"]  # 型別錯：整列不合格
+    assert problems(dist_basis=5) == ["row:us.options.QQQ"]
+
+
+def test_an_options_row_whose_basis_keys_disagree_only_breaks_itself(world, monkeypatch):
+    """欄位互相對不上（說是收盤卻沒有收盤價）在組那一列時就擋下：那三列暫缺、記 bad:options_basis，其他列與整份快照照發。"""
+    real = market_calc.options_values
+
+    def wrong(*args, **kwargs):
+        values = real(*args, **kwargs)
+        values["dist_basis"], values["ref_close"] = "close", None
+        return values
+
+    monkeypatch.setattr(market_calc, "options_values", wrong)
+    outcome = world.publish()
+    assert outcome["kind"] == "ok"
+    assert outcome["row_errors"] == {f"us.options.{symbol}": "bad:options_basis" for symbol in ("QQQ", "SPY", "SOXX")}
+    assert snapshot_job_sanitize(outcome) == outcome  # job 的 outcome 白名單認得這個種類
+    rows = world.snapshot()["rows"]
+    assert rows["us.options.QQQ"]["state"] == "never" and rows["us.etf.QQQ"]["state"] == "ok"
+    assert market_publish.validate_snapshot(world.snapshot()) == []
 
 
 def test_futures_day_change_needs_the_previous_session(world):
@@ -457,6 +700,41 @@ def test_values_follow_the_definitions(world):
     assert season["month"] == 10 and season["midterm_year"] is True and season["sp500"]["n"] > 0
 
 
+def test_season_row_carries_the_semiconductor_sections_and_survives_a_bad_table(world):
+    """第 9 輪 A14：season.now 多了 SOXX 自身與 SOX 長歷史；靜態表的半導體段壞掉或沒有（舊表）只讓那段 pending。"""
+    assert world.publish()["kind"] == "ok"
+    row = world.snapshot()["rows"]["season.now"]
+    assert row["state"] == "ok" and row["source"] == "datahub（Shiller）、Nasdaq、FinMind"
+    values = row["values"]
+    assert values["soxx"] == {"up_pct": 66.7, "median": 2.43, "mean": 1.49, "n": 9} and values["soxx_pending"] is False
+    assert values["soxx_midterm"] is None and values["soxx_range"] == {"first": "2016-11", "last": "2025-12"}
+    assert values["sox"]["n"] == 32 and values["sox_midterm"]["n"] == 8 and values["sox_range"]["first"] == "1994-06"
+    table_path = world.root / "market_seasonality.json"
+    table = json.loads(table_path.read_text(encoding="utf-8"))
+    table["sox"]["months_valid"] = 10  # 殘缺的重建：有效月份遠少於應有的
+    del table["soxx"]
+    table_path.write_text(json.dumps(table, ensure_ascii=False), encoding="utf-8")
+    assert world.publish()["kind"] == "ok"
+    broken = world.snapshot()["rows"]["season.now"]
+    assert broken["state"] == "ok" and broken["values"]["sp500"]["n"] == 76
+    assert broken["values"]["sox_pending"] is True and broken["values"]["sox"] is None
+    assert broken["values"]["soxx_pending"] is True and broken["values"]["soxx_range"] is None
+    assert market_publish.validate_snapshot(world.snapshot()) == []
+
+
+def test_semiconductor_news_is_its_own_row_with_the_same_36_hour_rule(world):
+    """第 9 輪 A17：news.semi 走和其他新聞主題同一個 @_rows("news.")；沒有 obs 時是暫缺，不影響別的新聞。"""
+    assert world.publish()["kind"] == "ok"
+    row = world.snapshot()["rows"]["news.semi"]
+    assert row["state"] == "ok" and [item["title"] for item in row["values"]["items"]] == ["費半收低 晶片股回檔"]
+    assert row["source"] == "Google News" and row["stale_after"] == NOW - 300 + market_calc.NEWS_TTL.total_seconds()
+    world.store._db().execute("DELETE FROM obs WHERE obs_id = 'news.semi'")
+    world.store._db().commit()
+    assert world.publish()["kind"] == "ok"
+    rows = world.snapshot()["rows"]
+    assert rows["news.semi"]["state"] == "never" and rows["news.us"]["state"] == "ok"
+
+
 def test_gex_rate_falls_back_to_assumed_when_the_3m_yield_is_stale(world):
     world.store.put_obs("us.ust", {"rows": [["2026-10-01", 4.20, 3.9, 5.0, 5.2]]}, data_date="2026-10-01")
     world.publish()
@@ -517,8 +795,12 @@ def test_breadth_falls_back_to_previous_complete_day(tmp_path):
 def test_progress_counts_members_and_last_complete_days(world):
     world.publish()
     progress = world.snapshot()["progress"]
+    # 2026-10-24 第 9 輪 A19、A20：多了落後／休市標示用的欄位（只增不改；細節見 test_market_lag_rsi）
     assert progress == {"us_members": [len(US_MEMBERS), len(US_MEMBERS)], "us_last_complete_day": "2026-10-16",
-                        "tw_last_complete_day": "2026-10-16"}
+                        "tw_last_complete_day": "2026-10-16",
+                        "us_day": "2026-10-16", "us_expected_day": "2026-10-16", "us_waiting_for_source": False,
+                        "tw_day": "2026-10-16", "tw_expected_day": "2026-10-16", "tw_waiting_for_source": False,
+                        "tw_closed_today": False, "tw_closed_confirmed": None, "tw_exrights_pending": False}
 
 
 def test_quarantine_only_invalidates_the_touched_windows(world):
@@ -839,8 +1121,13 @@ def test_snapshot_round_trips_through_the_dashboard(world):
     assert reply.flex is not None and reply.alt_text.startswith("盤勢：")
     card = json.dumps(reply.flex, ensure_ascii=False)
     assert "資料準備中" not in card and "資料準備中" not in (reply.text or "")
-    for expected in ("美股（1/4）｜10/16 收盤", "台股（2/4）｜10/16 收盤", "外資賣超", "成分股站上月線", "VIX"):
+    for expected in ("美股（2/5）｜10/16 收盤", "台股（3/5）｜10/16 收盤", "外資賣超", "成分股站上月線", "VIX"):
         assert expected in card, expected
+    # 輪播第一張（重點摘要）讀真的 publisher 寫的快照：6 列依序是美股、台股、風險、利率、事件、川普，不超寬、沒有被切掉
+    rows = [node["text"] for node in reply.flex["contents"][0]["body"]["contents"]]
+    assert [row[:2] for row in rows] == ["美股", "台股", "風險", "利率", "事件", "川普"], rows
+    assert all(market_dashboard.row_width(row) <= 24 and "…" not in row for row in rows), rows
+    assert reply.render_errors == ()
     for body in ("QQQ", "0050", "期權", "新聞", "季節性", "選舉", "13F QQQ"):
         detail = market_dashboard.handle(body, now=NOW, paths=world.paths)
         assert detail.flex is not None, body
@@ -945,9 +1232,32 @@ def test_a_settled_quote_from_before_the_block_is_not_shown_while_blocked(world,
     assert values["blocked"] is True and values["quotes"] == [] and values["state"] == "waiting"
 
 
+def _crowd_names(count: int) -> list[str]:
+    return [f"Z{chr(65 + n // 26)}{chr(65 + n % 26)}" for n in range(count)]  # ZAA、ZAB…（三個字母，合法的美股代號）
+
+
+def test_events_keep_24_items_so_the_etf_cards_can_list_every_top_holding(world):
+    """2026-10-24 第 9 輪 A16（B 軌）：EVENTS_KEEP 12→24。三檔 ETF 的前十大聯集最多約 25 檔，財報季集中在同一兩週，
+    只留 12 筆時後面的財報日（財報行要列的）整批消失；FOMC 與 CPI 照樣一定留。"""
+    assert market_publish.EVENTS_KEEP == 24
+    names = _crowd_names(30)
+    world.store.put_obs("us.events.earnings", {"symbols": {
+        name: {"date": f"2026-10-{20 + n % 7}", "estimated": n % 2 == 0} for n, name in enumerate(names)}},
+        data_date="2026-10-17")
+    world.publish()
+    items = world.snapshot()["rows"]["events.next"]["values"]["items"]
+    kinds = [item["kind"] for item in items]
+    assert len(items) == 24 and kinds.count("fomc") == 1 and "cpi" in kinds
+    assert kinds.count("earnings") >= 20  # 以前最多 12 − 必留的幾筆
+    assert [item["at"] for item in items] == sorted(item["at"] for item in items)
+    assert all(isinstance(item.get("estimated"), bool) for item in items if item["kind"] == "earnings")
+    assert market_publish.validate_snapshot(world.snapshot()) == []
+
+
 def test_events_keep_fomc_when_earnings_crowd_the_list(world):
-    """2026-10-18（端對端測試發現）：財報季時前十大的財報日會把 FOMC 擠出 12 筆；FOMC 與 CPI 一定要留。"""
-    names = [f"Z{letter}" for letter in "ABCDEFGHIJKLMN"]
+    """2026-10-18（端對端測試發現）：財報季時前十大的財報日會把 FOMC 擠出清單；FOMC 與 CPI 一定要留。
+    2026-10-24：清單上限 12→24，所以要 30 檔財報日才擠得到。"""
+    names = _crowd_names(30)
     world.store.put_obs("us.events.earnings", {"symbols": {
         name: {"date": f"2026-10-{20 + n % 7}", "estimated": True} for n, name in enumerate(names)}},
         data_date="2026-10-17")
@@ -997,7 +1307,7 @@ def test_one_liner_and_contradictions_use_same_day_inputs(world):
     inputs = [rows[r]["stale_after"] for r in ("tw.taiex", "tw.inst3", "tw.turnover", "tw.margin", "tw.futures",
                                                 "tw.etf.0050", "tw.breadth.0050")]
     assert tw["stale_after"] == min(inputs)
-    assert rows["oneliner.us"]["values"]["text"].startswith("美股收在月線")
+    assert rows["oneliner.us"]["values"]["text"].startswith("標普收在月線")
     assert rows["oneliner.us"]["stale_after"] <= rows["us.etf.VOO"]["stale_after"]
 
 

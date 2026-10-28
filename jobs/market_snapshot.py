@@ -51,10 +51,11 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 from xml.sax.saxutils import escape
+from zoneinfo import ZoneInfo
 
 BASE = Path(__file__).resolve().parent.parent
 if str(BASE) not in sys.path:
@@ -71,7 +72,10 @@ log = logging.getLogger("market_snapshot")
 
 THIS_FILE = Path(__file__).resolve()
 LABEL = "com.andrew.line-bot-market-snapshot"
-PIPELINES = ("market_pipeline_us", "market_pipeline_tw", "market_pipeline_misc")
+# market_pipeline_taco（2026-10-24，川普壓力指數）：和別的 pipeline 沒有互相 import，它 import 壞了只停用自己的任務（load_modules）
+# market_pipeline_infl 排最後：同一個市場的任務依登記順序跑，通膨的損益兩平才會在 us.ust 之後（同一個財政部主機）
+PIPELINES = ("market_pipeline_us", "market_pipeline_tw", "market_pipeline_misc", "market_pipeline_taco",
+             "market_pipeline_infl")
 PUBLISHER = "market_publish"
 COLLECT_TIMEOUT_S = 240.0
 PUBLISH_TIMEOUT_S = 90.0
@@ -85,6 +89,11 @@ OUTCOME_SCHEMA = 1
 COLLECT_STATE, PUBLISH_STATE, SUPERVISOR_STATE = "_collect", "_publish", "_supervisor"
 US_CALENDAR_CHECK_OBS = "us.calendar.check"  # 要和 market_pipeline_us.OBS_CALENDAR_CHECK 一樣
 US_HIST_STATUS_OBS = "us.hist.status"  # 要和 market_pipeline_us.OBS_HIST_STATUS 一樣
+INFL_CPI_OBS = "us.infl.cpi"  # 要和 market_pipeline_infl.OBS_INFL_CPI 一樣
+INFL_CPI_STATE = "sched:us.infl.cpi"  # 要和 market_pipeline_us.STATE_PREFIX＋market_pipeline_infl.CPI_KEY 一樣
+TACO_STATE = "taco.pipe:macro.taco"  # 要和 market_pipeline_taco.STATE_NAME 一樣（監督程序不 import pipeline；test_market_f1_taco 比對）
+TACO_HOST = "ocmacro.com"  # 要和 market_sources_taco.HOST 一樣（監督程序不 import 來源模組；test_market_f3 比對）
+_ET = ZoneInfo("America/New_York")
 US_ETF_ROWS = ("VOO", "QQQ", "SOXX", "SPY")  # 快照的 us.etf.* 列（要和 market_calc.ROW_IDS 一樣）
 US_LAG_MAX_SESSIONS = 300  # 落後天數最多數到這裡（closes 只留 280 個交易日，再多也沒有意義）
 
@@ -148,8 +157,12 @@ def _clean(value: Any) -> Any:
 # ── 程式版本（部署寫的 sha256） ──────────────────────────────────────────────────
 
 
+SEASONALITY_TABLE = "market_seasonality.json"  # 靜態季節性表（publish 讀它算 season.now）：改了它要重簽章，和改程式一樣
+
+
 def code_files(base: Path = BASE) -> list[Path]:
-    files = sorted(path for path in base.glob("market_*.py") if path.is_file())
+    candidates = [*base.glob("market_*.py"), base / SEASONALITY_TABLE]
+    files = sorted(path for path in candidates if path.is_file())
     job = base / "jobs" / "market_snapshot.py"
     if job.is_file():
         files.append(job)
@@ -159,8 +172,8 @@ def code_files(base: Path = BASE) -> list[Path]:
 def code_hash(base: Path = BASE) -> str:
     """部署腳本寫進 state/market_deployed.sha256 的值（64 個小寫十六進位字）。
 
-    格式：market_*.py 與 jobs/market_snapshot.py 依相對路徑排序，每個檔一行
-    「<相對路徑>\\0<該檔內容的 sha256>\\n」，整串再取 sha256。
+    格式：market_*.py 與 market_seasonality.json（依檔名排序；第 9 輪 A14 起季節性表也算程式的一部分）、最後是
+    jobs/market_snapshot.py，每個檔一行「<相對路徑>\\0<該檔內容的 sha256>\\n」，整串再取 sha256。
     """
     outer = hashlib.sha256()
     for path in code_files(base):
@@ -369,6 +382,49 @@ def _us_freshness(store: market_store.Store, now: float) -> dict[str, Any]:
         since = (cal.close_time(worst[0]) + market_calendar.US_READY_AFTER).timestamp() if worst else now
         out["us_etf_lag_s"] = int(max(0.0, now - since))
     return out
+
+
+def _infl_status(store: market_store.Store, now: float) -> dict[str, Any]:
+    """通膨（BLS CPI）的狀態（2026-10-24 審查 r9 s4-F15、F12）：BLS 每個月才抓幾次，outcome.failing 要連續 3 次失敗才列，一個月
+    內永遠到不了，抓不到或落後都沒人知道。只放列舉值與整數：
+    - infl_cpi_month：已存的四個序列都有的最新月份 "YYYY-MM"（沒有資料是 None）；infl_cpi_lag_months：落後現在應該已公布的最新月
+      幾個月（0＝沒落後）。
+    - infl_bls_poll：pending（還在等這個月的 CPI 或在補抓）、done（已有）、exhausted（8–20 號的窗口過了還沒更新，每個平日問一次）、
+      disabled（api.bls.gov 不在 market_http.ALLOWED_HOSTS）。
+    期待的月份與輪詢規則用 market_calc.cpi_poll（collect 的 due 也用同一個函式）。"""
+    import market_calc  # noqa: PLC0415 - 監督程序平常不載入它；這裡壞了只影響這幾個欄位（_fill_from_store 有接住）
+
+    found = store.get_obs(INFL_CPI_OBS) or {}
+    payload = found.get("payload")
+    now_et = datetime.fromtimestamp(now, _ET)
+    # 已存的序列先去掉晚於上限的月份（collect 同一個做法，2026-10-28 審查 gp2 C1）：未來月份不能讓 outcome 報「done」；
+    # 有去掉東西（毒化）時 collect 當成冷啟動重抓，這裡的輪詢狀態也照 pending 報
+    trimmed, poisoned = market_calc.cpi_trim_future(payload.get("series") if isinstance(payload, dict) else None,
+                                                    market_calc.cpi_month_ceiling(market_calc.cpi_expected_month(now_et.date())))
+    stored = market_calc.cpi_stored_month(trimmed)
+    state = store.task_state(INFL_CPI_STATE)
+    probe = state.get("last_probe")
+    probe = float(probe) if isinstance(probe, (int, float)) and not isinstance(probe, bool) and math.isfinite(probe) else None
+    plan = market_calc.cpi_poll(now_et, None if poisoned else stored, probe, enabled=market_calc.CPI_HOST in market_http.ALLOWED_HOSTS)
+    return {
+        "infl_cpi_month": stored,
+        "infl_cpi_lag_months": market_calc.cpi_lag_months(stored, plan.expected),
+        "infl_bls_poll": plan.state,
+    }
+
+
+def _taco_status(store: market_store.Store) -> dict[str, Any]:
+    """川普壓力指數（ocmacro.com）的來源狀態（2026-10-28 審查 gp2 N1）：taco_block_streak＝連續被擋（429／403）的次數，0＝沒被擋。
+    只放一個整數（讀 market_pipeline_taco 存在 task_state 的 block_streak；缺值或壞值當 0）。
+
+    主機不在 market_http.ALLOWED_HOSTS（照 F1-4 停用）時一律 0：停用之後不會再有回應來清掉 block_streak，照實帶出去的話每日維護的
+    「≥ 2」會天天報「連續被擋」，看不出其實是停用（第 2 輪複審 gp2 N2；判斷照 _infl_status 的 BLS 開關，每次呼叫才讀白名單）。"""
+    if TACO_HOST not in market_http.ALLOWED_HOSTS:
+        return {"taco_block_streak": 0}
+    state = store.task_state(TACO_STATE)
+    streak = state.get("block_streak") if isinstance(state, dict) else None
+    ok = isinstance(streak, int) and not isinstance(streak, bool) and 0 <= streak < 10**6
+    return {"taco_block_streak": streak if ok else 0}
 
 
 def _collect_worker(args: argparse.Namespace, paths: market_paths.Paths, wall: Callable[[], float]) -> int:
@@ -713,6 +769,14 @@ class Supervisor:
         except Exception as exc:  # noqa: BLE001 - 一樣不能讓 outcome 寫不出來；值給 None，每日維護的「或是 null」會報
             out.update(us_etf_lag_sessions=None, us_etf_lag_s=None, us_members_lag_sessions=None, us_hist_vendor=None,
                        us_freshness_error=error_kind(exc))
+        try:
+            out.update(_infl_status(store, self.wall()))
+        except Exception as exc:  # noqa: BLE001 - 同上：算不出來不能讓 outcome 寫不出來
+            out.update(infl_cpi_month=None, infl_cpi_lag_months=None, infl_bls_poll=None, infl_status_error=error_kind(exc))
+        try:
+            out.update(_taco_status(store))
+        except Exception as exc:  # noqa: BLE001 - 同上
+            out.update(taco_block_streak=None, taco_status_error=error_kind(exc))
         sup["task_names"] = [n for n in names if isinstance(n, str)]
         store.set_task_state(SUPERVISOR_STATE, sup)
 

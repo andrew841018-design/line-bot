@@ -924,6 +924,26 @@ def test_fetch_cboe_quote_url():
     assert kind_of(src.fetch_cboe_quote, "SPX", http=http) == "format"
 
 
+# VXTLT（TLT 的選擇權波動，約 15）：和 VIX 同一個主機、同一個形狀（2026-10-24 第 9 輪 A12；數字是合成的）
+VXTLT = {"timestamp": "2026-10-17 01:37:16", "symbol": "_VXTLT",
+         "data": {"symbol": "^VXTLT", "security_type": "index", "current_price": 15.09, "price_change": -0.74,
+                  "price_change_percent": -4.67, "close": 15.09, "prev_day_close": 15.09,
+                  "last_trade_time": "2026-10-16T16:15:01"}}
+
+
+def test_vxtlt_is_the_third_cboe_quote_symbol_and_rides_the_vix_requests():
+    # VIX、VIX3M 在前：us.vix 那一批的時間不夠時，被擠掉的是最後一個（35 秒預算、每個報價最多 15 秒）
+    assert src.CBOE_QUOTE_SYMBOLS == ("VIX", "VIX3M", "VXTLT")
+    http = FakeHttp(as_bytes(VXTLT))
+    quote = src.fetch_cboe_quote("VXTLT", http=http)
+    assert (quote.symbol, quote.close, quote.price_change, quote.price_change_pct) == ("VXTLT", 15.09, -0.74, -4.67)
+    assert quote.last_trade_et == datetime(2026, 10, 16, 16, 15, 1, tzinfo=ET)
+    assert http.calls[0]["url"] == "https://cdn-api.cboe.com/api/global/delayed_quotes/quotes/_VXTLT.json"
+    assert http.calls[0]["max_bytes"] == 64 * 1024 and http.calls[0]["timeout"] == 15.0  # 同一個端點設定（cboe_quote）
+    assert kind_of(src.parse_cboe_quote, VXTLT, expect_symbol="VIX") == "format"  # 檔案不是要的那一個就拒收
+    assert kind_of(src.parse_cboe_quote, VIX, expect_symbol="VXTLT") == "format"
+
+
 # ETF 報價（investigations/freshness_20261023.md 附錄 A 的 QQQ 形狀；VOO 同一型，ETF 網址不帶底線）
 VOO_QUOTE = {"timestamp": "2026-10-23 00:04:23", "symbol": "VOO",
              "data": {"symbol": "VOO", "current_price": 702.3, "price_change": -8.42, "close": 702.3,

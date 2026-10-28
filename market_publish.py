@@ -64,7 +64,9 @@ HISTORY_DAYS = 420  # 讀收盤的範圍（日曆天）：寬度 240＋5＋5 個
 CHART_INPUT_VERSION = 1  # 畫圖輸入的格式版本；改畫法時加 1 讓舊圖全部重畫
 OPTION_CHART_DAYS = market_calc.OPTION_WINDOW_DAYS
 EVENT_HORIZON_DAYS = 45  # FOMC、財報列多遠以內的（經濟日曆本來就只抓 7 天）
-EVENTS_KEEP = 12
+# 2026-10-24 第 9 輪 A16：12→24。三檔 ETF 的前十大聯集最多約 25 檔、財報日集中在同一兩週，只留 12 筆時 ETF 細節卡的財報行會少
+# 一大半；FOMC／CPI／非農照樣一定留（keep_events）。bot 讀這份清單的上限是 market_dashboard.EVENTS_SCAN_MAX（48，要 ≥ 這個數字）
+EVENTS_KEEP = 24
 NEWS_KEEP = 10
 TRUMP_KEEP = 10
 POSTS_LOOKBACK_S = 30 * 86400.0  # 讀累積貼文的範圍（只拿來找最近一次抓到的時間）
@@ -78,13 +80,20 @@ US, TW = "us", "tw"
 TAIEX, TW_ETF = "TAIEX", "0050"
 US_ETFS = ("VOO", "QQQ", "SOXX", "SPY")
 BREADTH_ETFS = ("VOO", "QQQ", "SOXX")
+LAG_ETFS = ("VOO", "QQQ", "SOXX")  # bot 美股摘要卡上的三檔：progress.us_day（正式資料最新日）看這三檔
+# 落後／休市標示用的 progress 欄位（2026-10-24 第 9 輪 A19、A20；只增不改，不知道＝null，舊快照沒有這些鍵）
+PROGRESS_DAY_KEYS = ("us_day", "us_expected_day", "tw_day", "tw_expected_day")  # YYYY-MM-DD 或 null
+PROGRESS_FLAG_KEYS = ("us_waiting_for_source", "tw_waiting_for_source", "tw_closed_today", "tw_closed_confirmed",
+                      "tw_exrights_pending")  # bool 或 null
+# 命中這幾條矛盾時，句子用到的是 D 的收盤（月線上下、漲跌）；gamma_pos_vix_inverted 用期權與 VIX，不算
+CLOSE_BASED_CONTRA = frozenset({"above_ma20_weak_breadth", "up_low_volume", "down_high_volume"})
 MA_WINDOWS = market_calc.MA_WINDOWS
 _US_SYMBOL_RE = re.compile(r"[A-Z]{1,5}(?:\.[A-Z])?")
 _TW_CODE_RE = re.compile(r"[0-9A-Z]{4,6}")
 _CHART_NAME_RE = re.compile(r"[0-9a-f]{32}\.png")
 _TMP_NAME_RE = re.compile(r"\.market-[A-Za-z0-9_]+\.tmp")
-_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
-_MONTH_RE = re.compile(r"\d{4}-\d{2}")
+_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}", re.ASCII)  # re.ASCII：\d 預設連阿拉伯數字、全形數字都收（2026-10-28 審查 gp2 N9）
+_MONTH_RE = re.compile(r"\d{4}-\d{2}", re.ASCII)
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 # ── 讀的 obs／貼文鍵（和 market_pipeline_us／_tw 同一份；test_market_publish 有漂移測試） ─────────
@@ -93,10 +102,12 @@ OBS_US_TOP10 = "us.top10.{}"
 OBS_US_13F = "us.13f.sym.{}"
 OBS_US_FUND = "us.fund.sym.{}"
 OBS_US_OPTIONS = "us.options.{}"
-OBS_US_QUOTE = "us.quote.{}"  # VIX、VIX3M
+OBS_US_QUOTE = "us.quote.{}"  # VIX、VIX3M、VXTLT（us.vix 那一批，market_pipeline_us.VIX_SYMBOLS）
 OBS_US_UST = "us.ust"
 OBS_US_CFTC = "us.cftc.{}"
 OBS_US_MARGIN = "us.margin"
+OBS_US_INFL_BE = "us.infl.be"  # 損益兩平（market_pipeline_infl.OBS_INFL_BE；publish 不 import pipeline，test_market_publish_infl 比對）
+OBS_US_INFL_CPI = "us.infl.cpi"  # BLS CPI 與核心 CPI（market_pipeline_infl.OBS_INFL_CPI，同上）
 OBS_US_FOMC = "us.events.fomc"
 OBS_US_ECON = "us.events.econ"
 OBS_US_EARNINGS = "us.events.earnings"
@@ -114,6 +125,9 @@ OBS_TW_HOLDINGS = "tw.holdings.0050"
 COVERAGE_TWT49U = "twt49u"
 # market_pipeline_misc（宏觀 Yahoo／代理（BTC 也在裡面）、新聞、川普、預測市場）寫這些
 OBS_MACRO = "macro.{}"  # {"value","chg","chg_pct","date","prev_date","source","symbol","bars": [[日期, 收盤], …]}
+# market_pipeline_taco（川普壓力指數，MacroMargin，2026-10-24）寫：{"as_of","value","change20d"|None,"status_key"|None,"method",
+# "history": [[日期, 值], …]}；publish 不 import 那個模組（只讀 obs），所以鍵名在這裡再寫一次（test_market_taco_publish 檢查兩邊一致）
+OBS_TACO = "macro.TACO"
 OBS_NEWS = "news.{}"  # {"items": [{"title","source","published_utc"}], "fetched_utc"}
 OBS_TRUMP_SUMMARY = "trump.summary"  # {"topics","labels","at_least",…}：這裡只拿 at_least（缺口）與主題名
 POSTS_TRUMP = "trump"  # store.upsert_posts 的 kind：{original_id, published_utc, own_text, quoted_author, removed, topics}
@@ -135,6 +149,8 @@ _LABELS = {
     "us.options.": "期權",
     "us.cftc.": "CFTC 期貨部位",
     "us.margin": "美股融資（FINRA）",
+    "us.infl.be": "損益兩平通膨",
+    "us.infl.cpi": "美國物價（CPI）",
     "us.13f.": "13F 機構持股",
     "us.fund.": "前十大本益比",
     "tw.taiex": "加權指數",
@@ -243,7 +259,12 @@ class _Ctx:
         self.chart_jobs: dict[str, ChartJob] = {}
         self.facts: dict[str, market_calc.Fact] = {}
         self.fact_stale: dict[str, float] = {}
-        self.progress: dict[str, Any] = {"us_members": None, "us_last_complete_day": None, "tw_last_complete_day": None}
+        self.progress: dict[str, Any] = {
+            "us_members": None, "us_last_complete_day": None, "tw_last_complete_day": None,
+            **{key: None for key in (*PROGRESS_DAY_KEYS, *PROGRESS_FLAG_KEYS)},
+        }
+        # D 的收盤是 CBOE 暫定值的美股 ETF 代號（_us_etf 填；contra.us 的 provisional 要用，衍生列最後才建）
+        self.provisional_closes: set[str] = set()
         self.nan_dropped = 0
         self._cache: dict[str, Any] = {}
 
@@ -519,6 +540,8 @@ def _finish_row(ctx: _Ctx, row_id: str, result: RowResult, label: str) -> dict:
     }
     if not market_calc.row_ok(row_id, row):
         raise _BadValue("row_ids")
+    if row_id.startswith("us.options.") and not _options_basis_ok(row):
+        raise _BadValue("options_basis")  # 基準詞不認得、或和 ref_close 對不上：這一列暫缺，不要讓 validate_snapshot 擋整份
     # 每列先自己試編碼：孤立代理字元、NaN 在這裡就讓這一列失敗，不會拖垮整份快照。
     try:
         json.dumps(row, ensure_ascii=False, allow_nan=False).encode("utf-8")
@@ -715,6 +738,8 @@ def _us_etf(ctx: _Ctx, row_id: str) -> RowResult:
     tech, volume = _etf_parts(rows, cal, day, ctx.quarantine(US).get(symbol))
     if tech.close is None:
         raise _Unavailable("calendar")
+    if rows[-1][4]:
+        ctx.provisional_closes.add(symbol)
     return RowResult(
         market_calc.etf_values(tech, volume),
         data_date=day,
@@ -878,6 +903,33 @@ def _oi_by_strike(legs: Iterable[Any], low: float, high: float) -> tuple[list[fl
     return strikes, [calls.get(k, 0) for k in strikes], [puts.get(k, 0) for k in strikes]
 
 
+OPTION_REF_TOLERANCE = 0.005  # 期權鏈的 close 和同一天的 Nasdaq 正式收盤最多差 0.5%，牆距才用鏈自己的 close
+
+
+def _option_ref_close(ctx: _Ctx, symbol: str, chain: Any, day: date) -> Optional[float]:
+    """牆距的基準價（2026-10-24 第 9 輪 I1，審查 r9 seat1；Andrew 對 Q2 照預設＝收盤價）。
+
+    用「同一份期權鏈自己的 close」：同一個檔案、同一個資料日，不靠 us.etf 那一列（它可能比鏈晚一天：10/23 的卡 QQQ 的 ETF 列是
+    10/21 的 725.2、鏈是 10/22 的 704.5，拿 ETF 列算牆距會把 −0.6% 寫成 −3.5%）。三個條件都成立才用，否則回 None（牆距退回現價）：
+    ① 鏈最後成交的美東日期＝資料日（資料日就是由它來的）；② close 是正的有限數（沒有或 0 都不能除）；③ us.etf 同一天若有
+    「正式」列（Nasdaq 的；CBOE 暫定列就是用這份鏈的 close 寫的，拿來比等於自己比自己），兩者差 ≤0.5%——差更多代表 close 或那一列
+    有一個是壞的，不知道信哪個就用現價。收盤讀不到（共用資料壞了）也算核對不了 → 現價。"""
+    close = _num(getattr(chain, "close", None))
+    last = getattr(chain, "quote_last_trade_et", None)
+    if close is None or close <= 0 or not isinstance(last, datetime) or market_calc.et_date(last) != day:
+        return None
+    try:
+        rows = ctx.closes(US, symbol)
+    except _Unavailable:
+        return None
+    official = [row[1] for row in rows if row[0] == day and not (len(row) > 4 and row[4])]
+    if official:
+        other = _num(official[-1])
+        if other is None or other <= 0 or abs(close - other) > other * OPTION_REF_TOLERANCE * (1 + 1e-9):
+            return None
+    return close
+
+
 @_rows("us.options.")
 def _us_options(ctx: _Ctx, row_id: str) -> RowResult:
     symbol = row_id.rsplit(".", 1)[1]
@@ -890,7 +942,8 @@ def _us_options(ctx: _Ctx, row_id: str) -> RowResult:
     day = market_calc.et_date(last)  # 資料日＝報價最後成交的美東日期（PLAN §18.1）
     cal = ctx.trading(US)
     rate, rate_stale = _us_rate(ctx, day)
-    values = market_calc.options_values(chain, day, spot=spot, rate=rate, holidays=cal, iv30=getattr(chain, "iv30", None))
+    values = market_calc.options_values(chain, day, spot=spot, rate=rate, holidays=cal, iv30=getattr(chain, "iv30", None),
+                                        ref_close=_option_ref_close(ctx, symbol, chain, day))
     # GEX 是衍生值：過期＝期權鏈與 3M 公債（有用到的話）兩者較早的那個（§18.9）
     stale_after = min(value for value in (ctx.stale(market_calc.KIND_OPTIONS, day), rate_stale) if value is not None)
     gex = values.get("gex") or {}
@@ -1004,6 +1057,64 @@ def _us_margin(ctx: _Ctx, row_id: str) -> RowResult:
     # FINRA 以該月月底為錨＋62 天（§18.9）
     return RowResult(values, data_date=month_end, stale_after=ctx.stale(market_calc.KIND_FINRA, month_end),
                      source="FINRA", basis="融資餘額（百萬美元）", period=latest)
+
+
+@_rows("us.infl.be")
+def _us_infl_be(ctx: _Ctx, row_id: str) -> RowResult:
+    """5 年／10 年損益兩平通膨（2026-10-24）：財政部名目減實質殖利率，同一天、同一天期才算；各天期用自己的最新共同日期，
+    5 日變化在「名目與實質共同的日期」上數。資料日可能比 10 年債（macro.UST10Y）晚一天（財政部先放名目），所以有自己的日期。"""
+    latest = ctx.us_day()
+    rows = []
+    for row in ctx.payload(OBS_US_INFL_BE).get("rows") or []:
+        day = _iso_day(row.get("date")) if isinstance(row, dict) else None
+        if day is not None and day <= latest:  # 晚於 D 的列不收（和 macro.UST 一樣）
+            rows.append(row)
+    values = market_calc.breakeven_values(rows)
+    if values is None:
+        raise _Unavailable("missing")
+    day = max(date.fromisoformat(part["date"]) for part in (values["y5"], values["y10"]) if part is not None)
+    return RowResult(values, data_date=day, stale_after=ctx.stale(market_calc.KIND_US_DAILY, day), source="美國財政部",
+                     basis=market_calc.TEXT_BE_BASIS)
+
+
+def _cpi_series(raw: Any) -> dict[str, dict[str, float]]:
+    """obs 的 {序列代號: {"YYYY-MM": 指數}} → 只留認得的序列、嚴格月份鍵、有限的正數（別的整個丟掉）。"""
+    out: dict[str, dict[str, float]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for series_id in market_calc.CPI_SERIES:
+        points = raw.get(series_id)
+        if isinstance(points, dict):
+            clean = {key: value for key, value in ((k, _num(v)) for k, v in points.items())
+                     if isinstance(key, str) and _MONTH_RE.fullmatch(key) and value is not None and value > 0}
+            if clean:
+                out[series_id] = clean
+    return out
+
+
+@_rows("us.infl.cpi")
+def _us_infl_cpi(ctx: _Ctx, row_id: str) -> RowResult:
+    """美國 CPI 與核心 CPI（BLS，2026-10-24）：年增用未季調、月增與近 3 月年化用季調，先取一位小數（BLS 的公布精度）再判規則；
+    values 只有數字、列舉碼與 ISO 日期（句子由 bot 查固定表）。取得日（BLS 條款：應註明取得日期）是 collect 抓的那一天。
+    資料日＝全項未季調最新月份的月底，過期＝月底＋62 天（和 FINRA 同一套）。任何一個序列帶著晚於「應已公布最新月＋1」的月份
+    （market_calc.cpi_month_ceiling；以美東日期算）→ `_BadValue("cpi_future")`，這一列暫缺：不能發出一列要到 2100 年才過期的
+    資料（2026-10-28 審查 gp2 C1；collect 現在不會再存這種月份，這裡擋已經存進去的）。"""
+    payload = ctx.payload(OBS_US_INFL_CPI)
+    retrieved = _iso_day(payload.get("retrieved"))
+    if retrieved is None:
+        raise _Unavailable("missing")  # 沒有取得日就不發布：卡片要能寫
+    series = _cpi_series(payload.get("series"))
+    ceiling = market_calc.cpi_month_ceiling(market_calc.cpi_expected_month(datetime.fromtimestamp(ctx.now, _ET).date()))
+    if market_calc.cpi_trim_future(series, ceiling)[1]:
+        raise _BadValue("cpi_future")
+    values = market_calc.cpi_values(series, retrieved)
+    if values is None:
+        raise _Unavailable("missing")
+    label = str(values["cpi"]["month"])[:7]
+    year, month = int(label[:4]), int(label[5:])
+    month_end = date(year + (month == 12), month % 12 + 1, 1) - timedelta(days=1)
+    return RowResult(values, data_date=month_end, stale_after=ctx.stale(market_calc.KIND_US_CPI, month_end), source="BLS",
+                     basis=market_calc.TEXT_INFL_BASIS, period=label)
 
 
 def _top10(ctx: _Ctx, etf: str) -> tuple[list[dict], dict]:
@@ -1146,6 +1257,7 @@ def _tw_taiex(ctx: _Ctx, row_id: str) -> RowResult:
         "ma_dist": {str(n): tech.ma_dist.get(n) for n in MA_WINDOWS},
         "above_ma20": tech.above.get(20),
         "dd240_pct": tech.dd240_pct,
+        "rsi14": tech.rsi14,  # 和 ETF 同一個 technicals（Wilder RSI14）；往回連續收盤少於 RSI_MIN_CLOSES（80）筆就是 None（缺格或隔離區間截斷，2026-10-28 審查 seat3 I-1）
     }
     return RowResult(values, data_date=day, stale_after=ctx.stale(market_calc.KIND_TW_DAILY, day),
                      source="FinMind" if rows[-1][3] == "finmind" else "證交所", basis="加權指數收盤",
@@ -1497,8 +1609,11 @@ def _series_change(series: list[tuple[date, float]], cal: Optional[market_calc.T
     return value - prev
 
 
-@_rows("macro.VIX", "macro.VIX3M")
+@_rows("macro.VIX", "macro.VIX3M", "macro.VXTLT")
 def _macro_cboe(ctx: _Ctx, row_id: str) -> RowResult:
+    """CBOE 的三個指數報價（us.vix 那一批）。VXTLT（TLT 的選擇權波動，約 15；2026-10-24 第 9 輪 A12）是獨立的一列、同一個
+    handler、同一個過期規則（KIND_US_DAILY）；它不是一句話與矛盾要看的面向（那兩個只看 VIX、VIX3M），所以不記 facts；
+    macro.MOVE（約 100，量綱不同）完全不碰。"""
     key = row_id.rsplit(".", 1)[1]
     payload = ctx.payload(OBS_US_QUOTE.format(key))
     value = _num(payload.get("close"))
@@ -1526,7 +1641,7 @@ def _macro_cboe(ctx: _Ctx, row_id: str) -> RowResult:
         change = stored
     values = {"value": value, "chg": change, "chg_pct": _num(payload.get("price_change_pct")), "source": "CBOE"}
     return RowResult(values, data_date=day, stale_after=ctx.stale(market_calc.KIND_US_DAILY, day), source="CBOE",
-                     basis="收盤", facts={key: value})
+                     basis="收盤", facts={key: value} if key in ("VIX", "VIX3M") else {})
 
 
 @_rows("macro.UST3M", "macro.UST10Y")
@@ -1561,9 +1676,57 @@ def _macro_spy_dd(ctx: _Ctx, row_id: str) -> RowResult:
     tech = market_calc.technicals({row[0]: row[1] for row in rows}, cal, day, ctx.quarantine(US).get("SPY"))
     if tech.dd240_pct is None:
         raise _Unavailable("missing")
-    values = {"value": tech.dd240_pct, "chg": None, "chg_pct": None, "source": "SPY 價格代理"}
+    # D 的收盤是 CBOE 暫定值時，這個距高點也是暫定的（2026-10-24 第 9 輪 A27）；bot 在那一列後面加「（暫定）」
+    values = {"value": tech.dd240_pct, "chg": None, "chg_pct": None, "source": "SPY 價格代理", "provisional": bool(rows[-1][4])}
     return RowResult(values, data_date=day, stale_after=ctx.stale(market_calc.KIND_US_DAILY, day),
                      source="SPY 價格代理", basis="離 240 日高點（%）")
+
+
+@_rows("macro.TACO")
+def _macro_taco(ctx: _Ctx, row_id: str) -> RowResult:
+    """川普壓力指數（TACO 指數，MacroMargin；2026-10-24）：obs 存的完整日資料 → 現值、20 日變化、歷史位階。
+
+    values 欄位照 market_calc.TACO_SPEC；位階等統計是 market_calc.taco_stats（「歷史裡 ≤ 最後一筆的天數占比」，Decimal
+    ROUND_HALF_UP 取整數）。新鮮度照美股日線（KIND_US_DAILY：資料日之後第 4 個預期交易日收盤）。存下來的資料壞了
+    （日期不遞增、最後一筆對不上、範圍、型別）→ `_BadValue`：只有這一列暫缺（row_errors 記 bad:…，不擋整份快照）；
+    還沒抓到 → 暫缺。來源的文字（標籤、方法說明）本來就沒存，這裡也不產生任何來源字串。"""
+    payload = ctx.payload(OBS_TACO)
+    as_of, value = _iso_day(payload.get("as_of")), _num(payload.get("value"))
+    raw_change = payload.get("change20d")
+    change = None if raw_change is None else _num(raw_change)
+    raw_history = payload.get("history")
+    if not isinstance(raw_history, list):
+        raise _BadValue("taco_history")
+    history: list[tuple[date, float]] = []
+    for item in raw_history:
+        day, number = (_iso_day(item[0]), _num(item[1])) if isinstance(item, list) and len(item) == 2 else (None, None)
+        if day is None or number is None or (history and day <= history[-1][0]):
+            raise _BadValue("taco_history")
+        history.append((day, number))
+    if (
+        as_of is None
+        or value is None
+        or (raw_change is not None and change is None)
+        or len(history) < market_calc.TACO_MIN_DAYS
+        or history[-1][0] != as_of
+        or abs(history[-1][1] - value) > market_calc.TACO_LAST_ROW_TOLERANCE + 1e-9
+    ):
+        raise _BadValue("taco")
+    if as_of > ctx.us_day():  # 資料日不能晚於最近一個收完的美股交易日
+        raise _BadValue("taco_future")
+    status_key = payload.get("status_key")
+    values = {
+        "value": value,
+        "chg20": change,
+        **market_calc.taco_stats(history),
+        "status_key": status_key if isinstance(status_key, str) else None,
+        # collect 存 "v1"／"other"（2026-10-28 審查 gp2 N10）；舊的 obs 存的是完整的方法版本字串，兩種都認得
+        "method": "v1" if payload.get("method") in (market_calc.TACO_METHOD_V1, "v1") else "other",
+    }
+    if not market_calc.taco_values_ok(values):  # 範圍、百分位、日期先後…（ROW_IDS 只管型別）
+        raise _BadValue("taco_values")
+    return RowResult(values, data_date=as_of, stale_after=ctx.stale(market_calc.KIND_US_DAILY, as_of),
+                     source="MacroMargin", basis="指數值")
 
 
 # BTC（2026-10-23）和其他格一樣：Yahoo 的 BTC-USD，沒有就用 IBIT 代理（source 寫「ETF 代理：IBIT」，卡上只寫單日漲跌幅）。
@@ -1696,7 +1859,7 @@ def _season(ctx: _Ctx, row_id: str) -> RowResult:
     next_month = date(local.year + (local.month == 12), local.month % 12 + 1, 1)
     month_end = datetime.combine(next_month, time(0, 0), tzinfo=_TPE).timestamp()
     stale_after = min(ctx.stale(market_calc.KIND_SEASON, end_year), month_end)
-    return RowResult(values, data_date=None, stale_after=stale_after, source="datahub（Shiller）、FinMind",
+    return RowResult(values, data_date=None, stale_after=stale_after, source="datahub（Shiller）、Nasdaq、FinMind",
                      basis=market_calc.TEXT_SEASON_SP_BASIS, period=f"{sample[0]}–{end_year}")
 
 
@@ -1904,9 +2067,18 @@ def _oneliner(ctx: _Ctx, row_id: str) -> RowResult:
 def _contra(ctx: _Ctx, row_id: str) -> RowResult:
     market = row_id.rsplit(".", 1)[1]
     keys, day = _derived_inputs(ctx, market)
-    values = market_calc.contra_values(market_calc.contradictions(ctx.facts, market))
+    found = market_calc.contradictions(ctx.facts, market)
+    values = market_calc.contra_values(found)
+    if market == US:  # 命中的矛盾用到的 D 收盤是暫定值 → bot 在句尾加「（暫定）」（2026-10-24 第 9 輪 A27）
+        values["provisional"] = _contra_uses_provisional(found, ctx.provisional_closes)
     return RowResult(values, data_date=day, stale_after=min(ctx.fact_stale[key] for key in keys), source="程式",
                      basis="7 條規則，只比同一資料日")
+
+
+def _contra_uses_provisional(found: Iterable[Any], provisional_symbols: Iterable[str]) -> bool:
+    """命中的矛盾裡有沒有一條是「用暫定收盤算的」：以收盤為基礎的規則，而且主詞那檔 ETF 的 D 收盤是 CBOE 暫定值。"""
+    symbols = set(provisional_symbols)
+    return any(item.code in CLOSE_BASED_CONTRA and item.subject in symbols for item in found)
 
 
 # ── 進度 ────────────────────────────────────────────────────────────────────
@@ -1925,6 +2097,77 @@ def _build_progress(ctx: _Ctx) -> None:
         pass
     except Exception as exc:
         ctx.shared_errors["progress"] = f"unexpected:{type(exc).__name__}"
+    _build_day_progress(ctx)  # 上面那段（成分股）失敗、被略過，下面這幾組照算
+
+
+def _build_day_progress(ctx: _Ctx) -> None:
+    """落後／休市標示用的欄位（2026-10-24 第 9 輪 A19、A20）。每一組各自 try/except：算不出來的那組留 None（＝不知道，
+    bot 不加任何標示），不連累別組，也不連累上面 us_members 那段。"""
+    for name, build in (("us_day", _progress_us_day), ("tw_day", _progress_tw_day),
+                        ("tw_closed", _progress_tw_closed), ("tw_exrights", _progress_tw_exrights)):
+        try:
+            build(ctx)
+        except _Unavailable:
+            pass
+        except Exception as exc:
+            ctx.shared_errors[f"progress_{name}"] = f"unexpected:{type(exc).__name__}"
+
+
+def _progress_us_day(ctx: _Ctx) -> None:
+    """us_expected_day＝D（美東已過收盤＋30 分鐘的最新預期交易日，早收日、夏令冬令都照日曆）；us_day＝VOO／QQQ／SOXX
+    的**正式**（非 CBOE 暫定）收盤裡最新的一天；D 比它新＝來源還沒給（us_waiting_for_source）。三檔裡只要有一檔正式
+    資料到了 D 就不算在等（落後的那兩檔，卡上自己帶日期）。完全沒有正式資料：不下結論（None）。"""
+    expected = ctx.us_day()
+    ctx.progress["us_expected_day"] = expected.isoformat()
+    formal: Optional[date] = None
+    for symbol in LAG_ETFS:
+        for row in reversed(_closes_upto(ctx.closes(US, symbol), expected)):
+            if not row[4]:
+                formal = row[0] if formal is None or row[0] > formal else formal
+                break
+    ctx.progress["us_day"] = formal.isoformat() if formal else None
+    ctx.progress["us_waiting_for_source"] = None if formal is None else formal < expected
+
+
+def _progress_tw_day(ctx: _Ctx) -> None:
+    """tw_expected_day＝T（台北已過 14:30 的最新預期交易日；覆寫成休市的日子不算）；tw_day＝加權指數收盤的最新一天。"""
+    expected = ctx.tw_day()
+    ctx.progress["tw_expected_day"] = expected.isoformat()
+    rows = _closes_upto(ctx.closes(TW, TAIEX), expected)
+    latest = rows[-1][0] if rows else None
+    ctx.progress["tw_day"] = latest.isoformat() if latest else None
+    ctx.progress["tw_waiting_for_source"] = None if latest is None else latest < expected
+
+
+def _progress_tw_closed(ctx: _Ctx) -> None:
+    """tw_closed_today：今天（台北）按證交所休市表是預期交易日、日曆卻有「休市」覆寫、而且那天沒有實際成交。
+    週末、休市表上的假日都不是（table_session 不是 True）；沒有覆寫就沒有證據，不下結論成休市。
+    tw_closed_confirmed：那個覆寫是否已確認（管線推定的颱風休市是 False）；今天沒有休市時是 None。"""
+    today = datetime.fromtimestamp(ctx.now, _TPE).date()
+    cal = ctx.calendar(TW)[0]
+    overrides = ctx.shared("overrides.tw", lambda: ctx.store.calendar_overrides(TW))
+    found = overrides.get(today)
+    closed = (
+        isinstance(found, dict)
+        and found.get("kind") == market_calendar.OVERRIDE_CLOSED
+        and cal.table_session(today) is True
+        and cal.is_session(today) is False
+    )
+    ctx.progress["tw_closed_today"] = closed
+    ctx.progress["tw_closed_confirmed"] = bool(found.get("confirmed")) if closed else None
+
+
+def _progress_tw_exrights(ctx: _Ctx) -> None:
+    """tw_exrights_pending：除權息資料（TWT49U）還沒涵蓋到 T，0050 與成分只能顯示更早的一天（_tw_ready_day 同一套判斷：
+    ready 日比 T 舊；最近 5 個場次都沒涵蓋＝0050 那一列直接暫缺，也是還在等）。bot 只在 0050 比加權舊時才寫原因。"""
+    latest = ctx.tw_day()
+    try:
+        pending = _tw_ready_day(ctx) < latest
+    except _Unavailable as exc:
+        if exc.kind != "exrights":
+            raise
+        pending = True
+    ctx.progress["tw_exrights_pending"] = pending
 
 
 # ── 快照 schema 與編碼 ───────────────────────────────────────────────────────
@@ -1938,6 +2181,28 @@ def encode_snapshot(snapshot: dict) -> bytes:
 
 def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _options_basis_ok(row: Any) -> bool:
+    """牆距基準的兩個欄位要互相對得上（spec 只檢查型別，沒有列舉）：dist_basis 是 market_calc.DIST_BASES 的詞；
+    close 要帶正的 ref_close，spot 的 ref_close 是 null。never 的列沒有 values，不在這裡管（row_ok 管）。"""
+    if not isinstance(row, dict) or row.get("state") == "never" or not isinstance(row.get("values"), dict):
+        return True
+    basis, ref = row["values"].get("dist_basis"), row["values"].get("ref_close")
+    if basis == market_calc.DIST_CLOSE:
+        return _is_number(ref) and ref > 0
+    return basis == market_calc.DIST_SPOT and ref is None
+
+
+def _valid_day_string(value: Any) -> bool:
+    """快照裡的日期：剛好 YYYY-MM-DD 的字串，而且是真的日期（月份 13、多出來的時間字尾都不收）。"""
+    if not (isinstance(value, str) and _DATE_RE.fullmatch(value)):
+        return False
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
 
 
 def validate_snapshot(snapshot: Any) -> list[str]:
@@ -1958,6 +2223,8 @@ def validate_snapshot(snapshot: Any) -> list[str]:
         for row_id, row in rows.items():
             if not market_calc.row_ok(row_id, row):
                 problems.append(f"row:{row_id}")
+            elif row_id.startswith("us.options.") and not _options_basis_ok(row):
+                problems.append(f"options_basis:{row_id}")
     charts = snapshot.get("charts")
     if not isinstance(charts, dict):
         problems.append("charts")
@@ -1989,6 +2256,15 @@ def validate_snapshot(snapshot: Any) -> list[str]:
         for key in ("us_last_complete_day", "tw_last_complete_day"):
             value = progress.get(key)
             if value is not None and not (isinstance(value, str) and _DATE_RE.fullmatch(value)):
+                problems.append(f"progress_{key}")
+        # 第 9 輪批 1 的落後／休市欄位：日期字串（真的日期）或 null；布林或 null。舊形狀沒有這些鍵，照樣合格
+        for key in PROGRESS_DAY_KEYS:
+            value = progress.get(key)
+            if value is not None and not _valid_day_string(value):
+                problems.append(f"progress_{key}")
+        for key in PROGRESS_FLAG_KEYS:
+            value = progress.get(key)
+            if value is not None and not isinstance(value, bool):
                 problems.append(f"progress_{key}")
     try:
         encode_snapshot(snapshot)
