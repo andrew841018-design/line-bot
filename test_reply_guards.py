@@ -1493,7 +1493,11 @@ def test_an_alias_display_name_or_turn_label_spelled_like_them_still_blocks(monk
     assert main._requires_regulation_research(question)                    # the control: nobody is 對方
 
 
-@pytest.mark.parametrize("content", [b"{", b"[]", b"\xff"], ids=["cut_short", "a_list", "not_utf8"])
+@pytest.mark.parametrize(
+    "content",
+    [b"{", b"[]", b"\xff", b'{"U_C": "Zeta", "U_D": 5}'],
+    ids=["cut_short", "a_list", "not_utf8", "a_number_name"],
+)
 def test_a_display_name_file_that_cannot_be_read_means_no_search(monkeypatch, tmp_path, content):
     # 2026-10-29 (follow-up 5, item 4): a missing file is normal (nobody was looked up yet); a
     # file that is there but cannot be read is not "no display names"

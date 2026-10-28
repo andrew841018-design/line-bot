@@ -22,6 +22,7 @@ from unittest.mock import patch
 
 import pytest
 
+import line_mentions
 import main
 import stock_quote
 
@@ -303,6 +304,29 @@ def test_a_missing_display_name_file_is_normal(family):
     # Nobody has been looked up yet: the display names only ADD names, the lookup is not refused.
     assert not stock_quote._names_a_family_member("MercadoLibre")
     assert stock_quote._extract_lookup_query("MercadoLibre股價多少？") == "MercadoLibre"
+
+
+@pytest.mark.parametrize("content", [b"{", b'{"U_NINE": 5}'], ids=["cut_short", "a_number_name"])
+def test_a_display_name_file_that_cannot_be_read_refuses_every_lookup(family, monkeypatch, tmp_path, content):
+    # 2026-10-29 (follow-up 5, item 4): a file that is there but cannot be read is not "nobody was
+    # looked up yet"; whose names it holds is unknown, so nothing goes to a search provider
+    path = tmp_path / "member_display_names.json"
+    path.write_bytes(content)
+    monkeypatch.setenv("LINE_MEMBER_DISPLAY_NAMES_PATH", str(path))
+    forbid_search(monkeypatch)
+    assert stock_quote._names_a_family_member("MercadoLibre")
+    assert stock_quote._extract_lookup_query("MercadoLibre股價多少？") == ""
+    assert stock_quote._search_yahoo_symbols("MercadoLibre", timeout_s=1.5, max_symbols=3) == []
+
+
+def test_display_names_that_fail_to_load_refuse_every_lookup(family, monkeypatch):
+    def broken():
+        raise OSError("display names")
+
+    monkeypatch.setattr(line_mentions, "display_names", broken)
+    forbid_search(monkeypatch)
+    assert stock_quote._names_a_family_member("MercadoLibre")
+    assert stock_quote._extract_lookup_query("MercadoLibre股價多少？") == ""
 
 
 def test_a_display_name_alone_is_enough_to_deny_the_lookup(monkeypatch, tmp_path):

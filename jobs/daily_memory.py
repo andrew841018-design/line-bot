@@ -1068,7 +1068,10 @@ def _run_locked(
         return _fail(outcome, "state_missing", now)
     try:
         fact_filters.load_name_terms(require_names=True)
-    except fact_filters.NameSourceUnavailable:
+    except fact_filters.NameSourceUnavailable as exc:
+        # 2026-10-29（review）：哪一份名單讀不到（別名檔、顯示名稱檔、隱私詞…）進 log 和 outcome。
+        # 例外只帶寫死的字（test_fact_filters 守著），空白換底線，和其他 stop 一樣是一個詞
+        outcome.stop_reason = str(exc).replace(" ", "_")
         return _fail(outcome, "names_unavailable", now)
     try:
         memory.fact_hash_key()  # 金鑰檔不見或被換掉：不抽、不寫，交給人處理

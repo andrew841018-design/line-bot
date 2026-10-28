@@ -3029,8 +3029,14 @@ def _ai_fetch_due(today: date, now: float) -> bool:
 
 def _ai_holdings_usable(h: Optional[dict], today: date) -> bool:
     """這份 00952 持股能不能用：有，而且名單日期不在未來、最多舊 AI_HOLDINGS_MAX_AGE_DAYS 天。
-    _ai_universe 和 _maybe_fill_ai 的「今天的 00952 要不要拿來重算」共用這一條（2026-10-29）。"""
+    _ai_universe 和 _ai_fetched_today 共用這一條（2026-10-29）。"""
     return h is not None and 0 <= (today - date.fromisoformat(h["as_of"])).days <= AI_HOLDINGS_MAX_AGE_DAYS
+
+
+def _ai_fetched_today(today: date) -> bool:
+    """記憶體裡的 00952 是今天抓的、而且照 _ai_holdings_usable 能用：拿它重算，名單來源一定是 00952（2026-10-29）。"""
+    h = _ai_holdings
+    return _ai_holdings_usable(h, today) and h["fetched_day"] == today.isoformat()
 
 
 def _ai_universe(snapshot: Snapshot, give_up: float) -> tuple:
@@ -3215,8 +3221,7 @@ def _maybe_fill_ai(stop: threading.Event) -> None:
     # 重算出來才一定是 00952、寫了就不再進來，不然寫完 _ai_next_try 歸零、每一輪都會重算）；
     # ② 有候選因為「資料拿不到」被跳過，而且這次重看其中一檔算得出來了。
     today = _taipei_today()
-    fetched_today = _ai_holdings_usable(_ai_holdings, today) and _ai_holdings["fetched_day"] == today.isoformat()
-    holdings_due = current and old["universe"]["source"] != "00952" and (_ai_fetch_due(today, now) or fetched_today)
+    holdings_due = current and old["universe"]["source"] != "00952" and (_ai_fetch_due(today, now) or _ai_fetched_today(today))
     if current and not holdings_due and not (old.get("skipped") and _ai_skipped_resolved(snapshot, old, stop)):
         return
     give_up = time.monotonic() + AI_BUDGET_S

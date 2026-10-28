@@ -6,8 +6,10 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
+from pathlib import Path
 
 import pytest
 
@@ -171,9 +173,11 @@ def test_an_unreadable_private_terms_file_fails_closed_only_for_the_job(tmp_path
 
 
 # 2026-10-29（follow-up 5 第 4 項）：顯示名稱檔不在是正常的（還沒查過任何人）；在卻讀不到、
-# 解不開或不是 JSON 物件，就不能當成「沒有顯示名稱」。
+# 解不開、不是 JSON 物件，或有不是字串的名字（bot 只寫字串），就不能當成「沒有顯示名稱」。
 _BROKEN_DISPLAY_FILES = pytest.mark.parametrize(
-    "content", [b"{", b"[]", b"\xff"], ids=["cut_short", "a_list", "not_utf8"]
+    "content",
+    [b"{", b"[]", b"\xff", b'{"U_C": "Zeta", "U_D": 5}'],
+    ids=["cut_short", "a_list", "not_utf8", "a_number_name"],
 )
 
 
@@ -215,6 +219,57 @@ def test_the_writer_leaves_a_display_name_file_it_cannot_read_as_it_is(tmp_path,
     path.write_text("{}", encoding="utf-8")
     line_mentions.remember_display_name("U_NEW", "成員丁")
     assert line_mentions.display_name_for_user_id("U_NEW") == "成員丁"
+
+
+@pytest.mark.parametrize("where", ["file", "folder"])
+def test_a_display_name_file_behind_a_broken_link_fails_closed(tmp_path, monkeypatch, where):
+    # 2026-10-29（review）：連結還在、指的地方不見了（例如外接硬碟沒掛上），不是「還沒查過任何人」
+    gone = tmp_path / "unmounted"
+    if where == "file":
+        link = path = tmp_path / "member_display_names.json"
+        link.symlink_to(gone / "member_display_names.json")
+    else:
+        link = tmp_path / "state"
+        link.symlink_to(gone)
+        path = link / "member_display_names.json"
+    monkeypatch.setenv("LINE_MEMBER_DISPLAY_NAMES_PATH", str(path))
+    with pytest.raises(fact_filters.NameSourceUnavailable):
+        fact_filters.load_name_terms(require_names=True)
+    line_mentions.remember_display_name("U_NEW", "成員丁")
+    assert link.is_symlink() and not gone.exists()  # 寫入也不碰：連結和它指的地方都照舊
+    # 連結指的地方回來了，就照常讀
+    gone.mkdir()
+    (gone / "member_display_names.json").write_text(json.dumps({"U_C": "成員丁"}, ensure_ascii=False), encoding="utf-8")
+    assert "成員丁" in fact_filters.load_name_terms(require_names=True)
+
+
+def test_display_names_that_fail_to_load_fail_closed_only_for_the_job(monkeypatch):
+    # 2026-10-29（review）：檔讀得到、名字卻讀不出來，job 和股價查詢關卡也不能當成沒有顯示名稱
+    def broken():
+        raise OSError("display names")
+
+    monkeypatch.setattr(line_mentions, "display_names", broken)
+    with pytest.raises(fact_filters.NameSourceUnavailable):
+        fact_filters.load_name_terms(require_names=True)
+    assert "成員甲" in fact_filters.load_name_terms()  # 即時抽取照常過濾，只是少擋顯示名稱
+
+
+@pytest.mark.parametrize(
+    ("module", "error"), [(fact_filters, "NameSourceUnavailable"), (line_mentions, "DisplayNamesUnavailable")]
+)
+def test_every_name_source_error_carries_a_fixed_text(module, error):
+    # 2026-10-29（review）：每日 job 把這段文字寫進 log 和 outcome（說是哪一份名單讀不到），寫入顯示
+    # 名稱時也記進 log；所以只能是寫死的字，不能帶名字、路徑或檔案內容
+    tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+    raised = [
+        node.exc for node in ast.walk(tree)
+        if isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call)
+        and isinstance(node.exc.func, ast.Name) and node.exc.func.id == error
+    ]
+    assert raised
+    for call in raised:
+        assert len(call.args) == 1 and not call.keywords, ast.unparse(call)
+        assert isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str), ast.unparse(call)
 
 
 def test_names_given_once_per_batch_are_used_as_is():
