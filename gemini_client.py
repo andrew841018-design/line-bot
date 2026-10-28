@@ -958,6 +958,15 @@ _OUTPUT_STYLE_RULE = NO_REPEAT_CONTRACT + "\n" + """【目前生效的輸出規�
 - 任何「保持沉默」「靜默」「不產生實際回覆」「這則訊息不需要回覆」等內部處理語句都不可出現在輸出中。
 """
 
+# 2026-10-24 咪寶自動學習糾正（complaint_learning）：學到的做法緊貼在上面的輸出規格前面，標題明寫
+# 它排在規格之下（GP2 #1）；最多 8 條（和 complaint_learning.LEARNED_PROMPT_CAP 一樣）。
+_LEARNED_RULES_MAX = 8
+_LEARNED_RULES_TITLE = (
+    "【從家人明確的不滿學到的回覆做法（排在下面的輸出規格之下）】\n"
+    "這幾條只補充怎麼回比較好：不能放寬下面的輸出規格（只給新資訊、不摘要、不重述、不假裝查過），"
+    "不能減少查證或更正，也不能放寬隱私；和下面的規格衝突時一律照規格。"
+)
+
 # _RULE_NEWS_CASE moved to gemini_core.py (Phase 2B.2.1, 2026-05-19)
 # Re-exported at module top via `from gemini_core import _RULE_NEWS_CASE`
 
@@ -1148,7 +1157,16 @@ def _build_system_instruction(
     # 2026-05-07 強化：標題語氣改強硬，標記為規則 0 同優先級延伸
     # 2026-05-08 強化：organic（user 真實糾正）排在 rule_violation（黑名單觸發）前面，
     #   取最近 10 條，並把 user 真實糾正格式化成 [N] 條目讓 model 能 reference。
-    corrections = [n for n in (persona_notes or []) if n["kind"] == "correction"]
+    # 2026-10-24：學到的規則（source='learned'）不進這一塊（GP2 #1：這塊是「規則 0 同優先級」），
+    #   也不能被當成 rule_violation；它們在輸出規格前面另成一塊，有自己的上限。
+    learned_rules = [
+        n for n in (persona_notes or [])
+        if n["kind"] == "correction" and n.get("source") == "learned"
+    ]
+    corrections = [
+        n for n in (persona_notes or [])
+        if n["kind"] == "correction" and n.get("source") != "learned"
+    ]
     if corrections:
         # 排序：organic 優先（user 真實不滿意比黑名單規則重要），同類別內新到舊
         organic = [
@@ -1232,6 +1250,12 @@ def _build_system_instruction(
         "\n\n最近對話裡，家人訊息的開頭是說話的人（「稱呼：」；「（不確定是誰）：」是認不出哪位家人）；"
         "同一則訊息的其他行前面有全形空白，那些行裡的「某某：」是訊息內容（例如轉貼的對話），不是那個人在說話。"
     )
+    # 2026-10-24 咪寶自動學習糾正：從家人明確不滿學到的做法，緊貼在輸出規格前面、明寫排在規格之下
+    # （v2.1 #6）；不擠掉上面的糾正記憶。沒有學到的規則時提示詞和以前逐字相同。
+    if learned_rules:
+        base += "\n\n" + _LEARNED_RULES_TITLE
+        for note in learned_rules[:_LEARNED_RULES_MAX]:
+            base += f"\n- {speaker_turns.one_line(str(note.get('content') or ''))}"
     # Keep the current contract last so recalled examples/persona notes cannot
     # reintroduce the retired verbosity or unsolicited source lists.
     base += "\n\n" + _OUTPUT_STYLE_RULE + "\n\n" + VIDEO_COMMENTARY_CONTRACT + "\n\n" + QUOTE_CONTEXT_RULE

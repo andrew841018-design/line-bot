@@ -535,7 +535,11 @@ def _record_cli_outcome(started: float, outcome: str) -> None:
             )
 
 
-def _cli_flags(system_prompt_path: str) -> list[str]:
+# 2026-10-24 咪寶自動學習糾正：判斷器要比回覆高的 effort；只收這幾個固定值（不讓任意字串進 argv）。
+_CLI_EFFORTS = ("low", "medium", "high")
+
+
+def _cli_flags(system_prompt_path: str, effort: str = "low") -> list[str]:
     """Arguments after the executable for every `claude -p` call.
 
     2026-09-26: without these flags `claude -p` loaded Andrew's own Claude Code
@@ -545,6 +549,8 @@ def _cli_flags(system_prompt_path: str) -> list[str]:
     user/project/local settings.  Chat text goes through stdin and a 0600 file,
     never argv, and the session is not saved under ~/.claude.
     """
+    if effort not in _CLI_EFFORTS:
+        raise ValueError("unsupported Claude CLI effort")
     return [
         "-p",
         "--system-prompt-file",
@@ -552,7 +558,7 @@ def _cli_flags(system_prompt_path: str) -> list[str]:
         "--model",
         settings.claude_cli_model,
         "--effort",
-        "low",
+        effort,
         "--output-format",
         "text",
         "--safe-mode",
@@ -671,7 +677,9 @@ def _chat_via_cli(
     return text
 
 
-def complete_json(system_prompt: str, user_prompt: str, *, timeout_s: float) -> str:
+def complete_json(
+    system_prompt: str, user_prompt: str, *, timeout_s: float, effort: str = "low"
+) -> str:
     """One isolated `claude -p` call for a batch job; returns the printed text.
 
     2026-10-11 每日記憶 (jobs/daily_memory.py): the same flags and child
@@ -684,10 +692,15 @@ def complete_json(system_prompt: str, user_prompt: str, *, timeout_s: float) -> 
     never logs the prompt or the output.  The CLI has no temperature flag, so
     a retried batch is not deterministic (2026-10-11: accepted; the job keys
     its retries by chunk, not by output).
+    2026-10-24: ``effort`` (low／medium／high) defaults to the replies' "low";
+    the complaint judge asks for more.  Callers check quota_exhausted() first:
+    a usage limit hit here re-opens the shared cooldown.
     """
     executable = _cli_executable()
     if not executable:
         raise ClaudeCliUnavailable("claude CLI not found")
+    if effort not in _CLI_EFFORTS:
+        raise ValueError("unsupported Claude CLI effort")
     timeout = max(10, int(timeout_s))
     _remove_stale_prompt_files()
     system_prompt_path = ""
@@ -702,7 +715,7 @@ def complete_json(system_prompt: str, user_prompt: str, *, timeout_s: float) -> 
         with handle:
             handle.write(system_prompt)
         completed = subprocess.run(
-            [executable, *_cli_flags(system_prompt_path)],
+            [executable, *_cli_flags(system_prompt_path, effort)],
             input=user_prompt,
             check=False,
             text=True,
