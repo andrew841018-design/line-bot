@@ -13,6 +13,7 @@ from __future__ import annotations
 import atexit
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import logging
+import math
 import multiprocessing
 import os
 import re
@@ -48,6 +49,49 @@ _VISION_LOAD_FAILURE_CODE = "local_model_unavailable"
 _VISION_SNAPSHOT_FAILURE_CODE = "local_snapshot_unavailable"
 _VISION_DEFAULT_TIMEOUT_SEC = 40.0
 _VISION_WARMUP_TIMEOUT_SEC = 300.0
+# Unload the resident model after this long without a request. Andrew chose
+# 4 h on 2026-10-25: the Mac was swapping and the idle child held ~6 GB, but
+# family images arrive after long gaps and a busy/warming worker's image gets
+# no reply, so a short limit would drop most first images after a quiet spell.
+# The next image re-warms the model (~3 min from the external drive).
+_VISION_IDLE_UNLOAD_DEFAULT_SEC = 4 * 3600.0
+# A mistyped tiny value must not reload the model after every image.
+_VISION_IDLE_UNLOAD_MIN_SEC = 300.0
+# A parked child has no request waiting on it, so a slow SIGKILL reap gets a
+# longer window before the supervisor fails closed than a request kill's
+# cleanup_pending_timeout_sec.
+_VISION_PARK_REAP_SEC = 60.0
+_VISION_IDLE_UNLOAD_OFF_WORDS = frozenset(
+    {"0", "off", "false", "no", "none", "disabled"}
+)
+_idle_unload_env_warned = False
+
+
+def _idle_unload_sec_from_env() -> float:
+    """VISION_IDLE_UNLOAD_SEC: unset -> 4 h; 0/off/false/no -> stay resident.
+
+    An unparsable value also keeps the model resident (the behaviour before
+    idle unload existed) and is logged once, so a mistyped rollback never
+    turns the unload on.
+    """
+    global _idle_unload_env_warned
+    raw = os.environ.get("VISION_IDLE_UNLOAD_SEC", "").strip()
+    if not raw:
+        return _VISION_IDLE_UNLOAD_DEFAULT_SEC
+    if raw.lower() in _VISION_IDLE_UNLOAD_OFF_WORDS:
+        return 0.0
+    try:
+        value = float(raw)
+    except ValueError:
+        value = float("nan")
+    if not math.isfinite(value):
+        if not _idle_unload_env_warned:
+            _idle_unload_env_warned = True
+            logger.warning("vision idle unload off: VISION_IDLE_UNLOAD_SEC unparsable")
+        return 0.0
+    if value <= 0:
+        return 0.0
+    return max(_VISION_IDLE_UNLOAD_MIN_SEC, value)
 
 
 class VisionBusyError(RuntimeError):
@@ -509,6 +553,7 @@ class _VisionProcessSupervisor:
         cleanup_pending_timeout_sec: float = 10.0,
         warmup_timeout_sec: float = _VISION_WARMUP_TIMEOUT_SEC,
         poll_slice_sec: float = 0.05,
+        idle_unload_sec: float | None = None,
     ) -> None:
         self._context = context or multiprocessing.get_context("spawn")
         self._child_target = child_target
@@ -539,6 +584,12 @@ class _VisionProcessSupervisor:
         self._failure_code_after_cleanup = ""
         self._ipc_swept = False
         self._shutdown_started = False
+        # None: read VISION_IDLE_UNLOAD_SEC at check time (this supervisor is
+        # built at import, possibly before .env is loaded; .env itself is
+        # loaded once, so changing the value still needs a restart).
+        self._idle_unload_sec = idle_unload_sec
+        self._last_used: float | None = None
+        self._parked = False
 
     def _close_connection_locked(self) -> None:
         connection, self._connection = self._connection, None
@@ -689,6 +740,10 @@ class _VisionProcessSupervisor:
         self._process = process
         self._connection = parent_connection
         self._state = "warming"
+        self._parked = False
+        # The idle clock starts when this child is ready; if that stamp were
+        # ever lost, the model stays resident instead of re-parking at once.
+        self._last_used = None
         self._warmup_deadline = time.monotonic() + self._warmup_timeout_sec
 
     def _refresh_warming_locked(
@@ -696,6 +751,10 @@ class _VisionProcessSupervisor:
     ) -> None:
         if self._state != "warming" or self._connection is None:
             return
+        # Sample liveness before draining: a child that sends load_failed and
+        # exits just after the drain keeps that message for the next call
+        # instead of being reported as a bare death.
+        exited = self._process is not None and not self._process.is_alive()
         try:
             has_message = self._connection.poll(0)
         except (EOFError, OSError):
@@ -713,6 +772,7 @@ class _VisionProcessSupervisor:
                     if kind == "ready":
                         self._state = "ready"
                         self._warmup_deadline = 0.0
+                        self._last_used = time.monotonic()
                         return
                     if kind == "load_failed":
                         code = self._safe_label(
@@ -745,10 +805,17 @@ class _VisionProcessSupervisor:
                 has_message = self._connection.poll(0)
             except (EOFError, OSError):
                 break
-        if self._process is not None and not self._process.is_alive():
+        if exited:
             self._state = "failed"
             self._failure_reason = "vision worker exited before ready"
-            self._failure_code = "worker_unavailable"
+            # A load that dies (killed for memory, Metal abort) is a model
+            # init failure: this code makes media_pipeline send its one
+            # deduped local-LLM alert instead of failing silently.
+            self._failure_code = _VISION_LOAD_FAILURE_CODE
+            logger.warning(
+                "vision_worker_exited_before_ready exitcode=%s",
+                getattr(self._process, "exitcode", None),
+            )
             self._warmup_deadline = 0.0
             self._close_connection_locked()
             self._close_process_handle_locked(self._process)
@@ -780,7 +847,11 @@ class _VisionProcessSupervisor:
             return self._state == "ready"
 
     def _terminate_locked(
-        self, reason: str, *, preserve_failure_reason: bool = False
+        self,
+        reason: str,
+        *,
+        preserve_failure_reason: bool = False,
+        routine: bool = False,
     ) -> bool:
         process = self._process
         saved_failure = self._failure_reason if preserve_failure_reason else ""
@@ -836,11 +907,49 @@ class _VisionProcessSupervisor:
         self._failure_reason = saved_failure
         self._failure_code = saved_failure_code
         self._state = "failed" if saved_failure else "stopped"
-        logger.warning("vision worker recycled after %s", reason)
+        logger.log(
+            logging.INFO if routine else logging.WARNING,
+            "vision worker recycled after %s",
+            reason,
+        )
         return True
 
+    def _idle_unload_due_locked(self) -> bool:
+        limit = self._idle_unload_sec
+        if limit is None:
+            limit = _idle_unload_sec_from_env()
+        if limit <= 0 or self._last_used is None:
+            return False
+        return time.monotonic() - self._last_used >= limit
+
+    # TODO(2026-10-25 review, deferred): a re-warm that fails after a park
+    # (snapshot missing, warm-up timeout, child dying before ready) stays
+    # failed until the bot restarts, like every warm-up today; parking adds
+    # about one unattended reload per quiet spell. A cooldown that returns
+    # such a failure to "parked" would bound the outage (needs a failed-at
+    # field and an edit of the pinned sticky-reload test).
+    def _park_locked(self) -> None:
+        """Stop an idle ready child to free its memory; the next run() re-warms.
+
+        Same bounded TERM/KILL as any recycle (the child keeps no state worth
+        a graceful exit). While parked, maintenance never respawns it.
+        """
+        idle_sec = int(time.monotonic() - (self._last_used or 0.0))
+        self._parked = True
+        if not self._terminate_locked("idle unload", routine=True):
+            self._cleanup_deadline = time.monotonic() + max(
+                self._cleanup_pending_timeout_sec, _VISION_PARK_REAP_SEC
+            )
+        logger.info(
+            "vision_worker_idle_unloaded idle_sec=%d state=%s", idle_sec, self._state
+        )
+
     def maintenance_tick(self) -> str:
-        """Advance lifecycle state; the lifespan runs this off its event loop."""
+        """Advance lifecycle state; the lifespan runs this off its event loop.
+
+        Returns the state, or "parked" while an idle-unloaded model waits for
+        the next request.
+        """
         with self._lock:
             if self._shutdown_started:
                 if self._cleanup_deadline > 0:
@@ -872,6 +981,10 @@ class _VisionProcessSupervisor:
             if self._state == "ready":
                 process = self._process
                 if process is not None and process.is_alive():
+                    if self._idle_unload_due_locked():
+                        self._park_locked()
+                        if self._state == "stopped":
+                            return "parked"
                     return self._state
                 if process is not None:
                     process.join(0)
@@ -883,6 +996,8 @@ class _VisionProcessSupervisor:
                 self._state = "stopped"
                 logger.warning("vision_worker_idle_exit_reaped")
             if self._state == "stopped":
+                if self._parked:
+                    return "parked"
                 self._start_locked()
                 self._refresh_warming_locked(terminate_failed_child=False)
             return self._state
@@ -900,6 +1015,11 @@ class _VisionProcessSupervisor:
         staged_paths: list[Path] = []
         try:
             with self._lock:
+                # An image is demand: even when this call cannot be served
+                # (a parked child still being reaped), the next tick re-warms.
+                if self._parked:
+                    self._parked = False
+                    logger.info("vision_worker_rewarm_on_demand")
                 self._start_locked()
                 self._refresh_warming_locked()
                 if self._failure_reason:
@@ -999,6 +1119,7 @@ class _VisionProcessSupervisor:
                         continue
                     self._active_request = None
                     self._state = "ready"
+                    self._last_used = time.monotonic()
                 if kind == "result":
                     return value
                 if kind == "error":

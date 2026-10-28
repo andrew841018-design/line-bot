@@ -18,7 +18,8 @@ VIDEO_COMMENTARY_CONTRACT_NO_SEARCH = VIDEO_COMMENTARY_CONTRACT.replace(
 )
 
 # v3 (2026-10-03): commentary cached before the no-search/stale-memory rules must not replay.
-VIDEO_CACHE_VERSION = b"video-commentary-v3\0"
+# v4 (2026-10-24): NO_REPEAT_CONTRACT gained the regulation-number and hand-back rules.
+VIDEO_CACHE_VERSION = b"video-commentary-v4\0"
 
 
 def is_video_context(text: str) -> bool:

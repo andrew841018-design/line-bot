@@ -145,6 +145,9 @@ def _post_result(
                     if isinstance(message, dict)
                     else ""
                 )
+                if text and isinstance(message, dict) and message.get("type") == "textV2":
+                    # a textV2 template escapes literal braces ({{ }}); the archive keeps the words
+                    text = line_mentions.unescape_text_v2(text)
                 if text:
                     memory.log_raw_message(
                         GROUP_ID,

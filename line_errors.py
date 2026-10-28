@@ -13,6 +13,8 @@ Two jobs:
   fields (the reply token in a validation error) or the family's words.
 * ``http_status`` / ``is_client_error`` -- tell "LINE answered with a 4xx" (nothing was
   sent) from a timeout, a 5xx or a connection error (the message may have been delivered).
+* ``is_bad_request`` / ``rejected_message_indexes`` -- a 400 whose ``details[].property``
+  paths (``messages[2].text``) name the message(s) of the request LINE refused (2026-10-24).
 
 Every pattern is a single character class with a plain quantifier, so matching is linear
 (the H5 rule: no pattern that can backtrack).
@@ -30,7 +32,12 @@ _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]+")
 _REQUEST_ID_RE = re.compile(r"[0-9A-Za-z-]{1,64}")
 _NOT_A_NAME_CHAR_RE = re.compile(r"[^A-Za-z0-9_.]+")
 
+# `details[].property` of a refused message: "messages[2].text", "messages[0].substitution..."
+# (one anchored match with a bounded quantifier: linear).
+_MESSAGE_PROPERTY_RE = re.compile(r"messages\[(\d{1,4})\]")
+
 _MAX_BODY_CHARS = 8000
+_MAX_DETAILS_SCANNED = 100
 _MAX_MESSAGE_CHARS = 200
 _MAX_PROPERTY_CHARS = 60
 _MAX_PROPERTIES = 8
@@ -49,6 +56,37 @@ def is_client_error(exc: BaseException) -> bool:
     """LINE answered 4xx: it refused the request and delivered nothing."""
     status = http_status(exc)
     return status is not None and 400 <= status < 500
+
+
+def is_bad_request(exc: BaseException) -> bool:
+    """LINE answered 400: the request (or its reply token) was refused, nothing was sent."""
+    return http_status(exc) == 400
+
+
+def rejected_message_indexes(exc: BaseException) -> list[int]:
+    """Indexes (into the request's ``messages`` array) that a LINE error body names in
+    ``details[].property`` -- ``messages[2].text`` means the third message.  Sorted, without
+    duplicates; empty when the body is not LINE's JSON or names no message (the caller then
+    does not know which message was refused).  Nothing but integers is returned: no text of the
+    body or of the chat reaches a caller or a log."""
+    raw = _body_text(getattr(exc, "body", None))
+    if not raw:
+        return []
+    try:
+        doc = json.loads(raw)
+    except Exception:
+        return []
+    details = doc.get("details") if isinstance(doc, dict) else None
+    if not isinstance(details, list):
+        return []
+    found: set[int] = set()
+    for item in details[:_MAX_DETAILS_SCANNED]:
+        prop = item.get("property") if isinstance(item, dict) else None
+        if isinstance(prop, str):
+            match = _MESSAGE_PROPERTY_RE.match(prop)
+            if match:
+                found.add(int(match.group(1)))
+    return sorted(found)
 
 
 def _clean(value: object, limit: int, secrets: tuple[str, ...] = ()) -> str:
