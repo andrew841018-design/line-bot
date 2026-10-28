@@ -341,22 +341,35 @@ def test_unreadable_names_send_nothing(monkeypatch, research_env, nothing_crawle
     ("姨媽祖宮在哪裡？", True),
     ("乾媽祖廟在哪裡？", True),
     ("契媽祖廟在哪裡？", True),
-    ("契媽祖廟在哪裡？", True),  # a compatibility 契
+    ("\uf909媽祖廟在哪裡？", True),  # a compatibility 契
     ("義媽祖廟在哪裡？", True),
+    ("姑媽祖廟在哪裡？", True),  # every prefix in the lookbehind is pinned (Phase 6)
+    ("養媽祖廟在哪裡？", True),
+    ("親媽祖廟在哪裡？", True),
+    ("奶媽祖廟在哪裡？", True),
+    ("乳媽祖廟在哪裡？", True),
+    ("舅\u0301媽祖廟在哪裡？", True),  # a combining mark
+    ("媽 祖廟在哪裡？", True),  # 媽 apart from 祖: the stripped view must not join them
+    ("媽、祖廟在哪裡？", True),
+    ("媽～祖廟在哪裡？", True),
+    ("媽\u3000祖宮在哪裡？", True),
+    ("王媽 祖廟在哪裡？", True),
+    ("王媽、祖廟在哪裡？", True),
+    ("王小明\U0001f240人入境可以帶幾瓶酒？", True),  # 〔本〕 folds into 本
     ("繼媽祖廟在哪裡？", True),
     ("伯媽祖廟在哪裡？", True),
     ("岳媽祖廟在哪裡？", True),
     ("舅媽祖 厝在哪裡？", True),  # a space is no clause end: _bare joins the words again
     ("舅媽祖，厝在哪裡？", True),
     ("舅 媽祖廟在哪裡？", True),
-    ("舅​媽祖廟在哪裡？", True),
-    ("舅媽祖　廟在哪裡？", True),
+    ("舅\u200b媽祖廟在哪裡？", True),
+    ("舅媽祖\u3000廟在哪裡？", True),
     ("舅媽祖\xa0厝在哪裡？", True),
-    ("舅媽祖廟在哪裡？", True),  # a compatibility 祖
+    ("舅媽\ufa50廟在哪裡？", True),  # a compatibility 祖
     ("舅媽閣樓在哪裡？", True),
     ("王小明本人入境可以帶幾瓶酒？", True),  # 本人 after a name nobody configured
-    ("王小明本⼈入境可以帶幾瓶酒？", True),  # characters that fold into 人
-    ("王小明本㆟入境可以帶幾瓶酒？", True),
+    ("王小明本\u2f08入境可以帶幾瓶酒？", True),  # characters that fold into 人
+    ("王小明本\u319f入境可以帶幾瓶酒？", True),
     ("王旭日、本人入境可以帶幾瓶酒？", True),  # 本人 is read unstripped: 日、本人 is no 日本人
     ("王旭日「本人」入境可以帶幾瓶酒？", True),
     ("王旭日 本人入境可以帶幾瓶酒？", True),
@@ -371,12 +384,17 @@ def test_unreadable_names_send_nothing(monkeypatch, research_env, nothing_crawle
     ("大甲媽祖文化節在哪裡？", False),
     ("大甲媽祖？", False),
     ("大甲媽祖", False),  # the end of the text
-    ("大甲媽祖︖", False),  # a vertical-form question mark folds into ?
+    ("大甲媽祖\ufe16", False),  # a vertical-form question mark folds into ?
     ("「大甲媽祖」", False),
-    ("大甲媽祖遶境有什麼好玩的？", False),
+    ("大甲媽\ufa50遶境有什麼好玩的？", False),
     ("全台最大媽祖廟在哪？", False),  # 大, 小 and 後 are no kinship prefix
     ("附近有小媽祖廟嗎？", False),
     ("之後媽祖誕辰怎麼慶祝？", False),
+    ("大甲媽祖繞境幾天？", False),
+    ("媽祖信仰從哪裡來？", False),
+    ("大甲媽祖，好玩嗎？", False),  # the clause marks after NFKC: , ! 。
+    ("大甲媽祖！", False),
+    ("大甲媽祖。", False),
 ])
 def test_the_masks_hide_only_the_goddess_and_japanese(question, named):
     assert main._plain_question_names(question, None) == ("named" if named else "")

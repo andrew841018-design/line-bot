@@ -21584,6 +21584,9 @@ _MASKED_BEFORE = {
     ),
 }
 _MASK_VIEW = re.compile(r"[^\w，,。！？!?]+|_")  # what _bare drops, less the marks 媽's mask reads
+# 媽 kept apart from 祖／閣 in the folded text (「媽 祖廟」「媽、祖廟」) is no goddess word: the
+# stripped view would join them, so the bare 媽 counts as written (GP2 Phase 6 P6-1).
+_MA_SPLIT = re.compile(r"媽[\W_]+[祖閣]")
 # Nothing went out for these: the common layer does not run either.
 _PLAIN_QUESTION_NOT_SENT = ("late", "named", "names_unavailable")
 
@@ -21664,6 +21667,8 @@ def _plain_question_names(question: str, context: list[tuple[str, str]] | None) 
         return "named"
     folded = unicodedata.normalize("NFKC", question).casefold()
     for name in masked:
+        if name == "媽" and _MA_SPLIT.search(folded):
+            return "named"
         seen = _MASK_VIEW.sub("", folded) if name == "媽" else folded
         if public_research.mentions_any(_MASKED_BEFORE[name].sub("", seen), [name]):
             return "named"
