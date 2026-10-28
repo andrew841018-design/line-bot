@@ -28,6 +28,7 @@ import 時不讀檔、不連 DB、不起執行緒；memory、claude_client、gem
 """
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import logging
@@ -1150,6 +1151,11 @@ _AGENT_RE = re.compile(
 # R2-2：「規則／系統」是一般名詞（遊戲規則、系統更新），只在本文（「不要／先／只」開始那段）算對 agent 的字；
 # 情境句只描述什麼情況（「當家人問遊戲規則時」要能過）。句型不對的文字（核心原因、舊規則）整段都算本文。
 _BODY_AGENT_RE = re.compile(r"規則|规则|系統|系统")
+# R3-8（GP1 第三輪 #2）：情境句裡對 AI 下指令的片語也擋（「當系統規則和這條衝突時」「當…不管其他規則時」「當…就放寬
+# 規則時」）；只擋這幾種，「遊戲規則」「系統更新」「最高溫」照過。
+_CONTEXT_AGENT_RE = re.compile(
+    r"(?:其他|所有|系統|上面|前面|原本|既有|別的)的?(?:規則|規定|設定|限制)|這一?條|放寬|最高原則|最優先"
+)
 # 冒充提示詞的段落標題或輸出格式（F1）：fact_filters._META_RE 也擋事實裡的【】。
 _FORMAT_RE = re.compile(r"[【】\[\]<>{}]|(?i:json)|格式|輸出|输出")
 # 放寬 Andrew 的硬規則（不摘要、不重述、只給新資訊、不假裝查過）或減少查證、更正。摘要／重述這些字
@@ -1161,6 +1167,9 @@ _FORMAT_RE = re.compile(r"[【】\[\]<>{}]|(?i:json)|格式|輸出|输出")
 # 後面接「（過）的…」是在講沒查證的內容（「不要說沒確認過的內容」），那是加嚴，放行。
 # R3-1：「的」的豁免只留給「沒／還沒」那一支；「（還）需要／要再…查證」不管後面接什麼都擋（「不要說還需要查證的話」）。
 # 中間至少要有一個詞，「不要說確認過影片內容」（直接接動詞）不擋。
+_CLAUSE = r"[^，,。！？!?；;]"  # 同一小句裡的字（不跨逗號、句號、問號、驚嘆號、分號）
+# R3-9（GP1 第三輪 #3）：「說」之外的動詞也算——說明、回說、強調、跟…說。
+_SAY = rf"(?:說明|說|講|回答|回覆|回說|提|表示|強調|跟{_CLAUSE}{{0,6}}?說)"
 _GUESS = r"憑印象|憑感覺|憑記憶|用記憶|靠記憶|用猜的|猜測|推測|直接猜|猜一下"
 _LOOSEN_RE = re.compile(
     r"摘要|總結|重述|複述|重複|複誦|概括|簡述|歸納|濃縮|整理重點|來源清單|正反方|"
@@ -1170,8 +1179,8 @@ _LOOSEN_RE = re.compile(
     r"(?:不用|不必|不需要|不要|別|免)(?:再)?(?:上網)?(?:搜尋|搜索|查詢|檢查)|"
     + _GUESS + r"|但書|最可能|可以猜|編一個|"
     r"(?:不要|別|不必|不用)(?:再)?說(?:查不到|找不到|不知道|無法|沒有資料|不確定)|"
-    r"(?:不要|別|不必|不用)(?:再)?(?:說|講|回答|回覆|提|表示)(?:還)?沒(?:有)?(?:查證|確認|核實|求證|依據)(?!過?的)|"
-    r"(?:不要|別|不必|不用)(?:再)?(?:說|講|回答|回覆|提|表示)(?:說)?"
+    r"(?:不要|別|不必|不用)(?:再)?" + _SAY + r"(?:還)?沒(?:有)?(?:查證|確認|核實|求證|依據)(?!過?的)|"
+    r"(?:不要|別|不必|不用)(?:再)?" + _SAY + r"(?:說)?"
     r"(?:還|需要|要|得|必須|再|先|應該|有待|仍需|仍然){1,3}(?:查證|確認|核實|求證|依據)|"
     r"(?:不要|別|不必|不用)(?:再)?(?:更正|糾正|反駁|指出|質疑|否定|爭辯|提醒)"
 )
@@ -1180,7 +1189,8 @@ _LOOSEN_RE = re.compile(
 _AGREE_RE = re.compile(
     r"接受|認同|同意|相信|順從|順著|附和|贊成|道歉|認錯|改口|說得對|說的對|講得對|聽家人的|照家人|"
     r"想聽|討好|奉承|表示理解|安撫|體諒|站在(?:家人|對方)|"
-    r"肯定(?:家人|對方|他|她|使用者)|(?:不要|別)反對|照(?:對方|使用者)(?:說|講)的"
+    r"肯定(?:家人|對方|他|她|使用者)|(?:不要|別)反對|照(?:對方|使用者)(?:說|講)的|"
+    r"只根據家人(?:的)?(?:說法|意見|講的|說的)"  # R3-9：「只根據」是 stay_on_topic 錨點，不能帶著讓步過關
 )
 _DISCLOSE_RE = re.compile(
     r"透露|揭露|洩漏|公開(?:家人|個人|私人|別人|他人|是誰)|說出(?:是)?誰|告訴(?:大家|全家|其他人)|轉告|私訊|"
@@ -1195,7 +1205,6 @@ _ASSERT_RE = re.compile(_ASSERT)
 # 沒提到」）：這幾段先拿掉再找放寬、斷言。否定只認緊接的寫法（猜測前只能夾「沒…就／前」這種條件，斷言前要是
 # 說／講這類動詞），「不要怕用猜的」「不要懷疑颱風一定不會來」照擋；同一小句後面有「以外／之外／外」也不算否定
 # （R3-1：「不要用記憶外的資料確認」）。
-_CLAUSE = r"[^，,。！？!?；;]"
 _NEG = r"(?:不要|別|不能|不可以|不可|勿|避免|不該|不應該)(?:再)?"
 _UNLESS_EXCEPT = rf"(?!{_CLAUSE}*(?:以外|之外|外))"
 _NEGATED_GUESS_RE = re.compile(
@@ -1234,7 +1243,8 @@ _UNPROMPTED_RE = re.compile(
     r"(?:不要|別|不必|不用|少|不需要)(?:再)?(?:給|提供|說|講)?(?:其他|額外|多餘|更多)|"
     r"(?:其他|其它|別的|其餘)(?:的)?(?:事|東西|部分|內容|資訊|問題)?(?:都|就|也)?"
     r"(?:不要|別|不用|不必|不需要|不)(?:再)?(?:提|講|說|談|聊|回|管|理)|"
-    r"就好|而已|就夠|就行|即可|就可以了|就可以(?=$|[，,。！!？?；;])|先聽|"
+    r"就好|而已|就夠|就行|即可|就可以了|就可以(?=$|[，,。！!？?；;])|就(?i:ok)|先聽|"
+    r"其他(?:話題)?(?:先)?不(?:用|要)?提|剩下的不(?:用|要)?提|"  # R3-9
     r"(?:不用|不要|不必|別|不需要)(?:再)?回(?:覆|應|話)?(?=$|[，,。！!？?；;]|了|啦|喔)|"
     r"少回|回(?:覆|應)(?:次數|頻率)|少說|少講|安靜|閉嘴|潛水|"
     r"(?:不要|別)(?:發言|每則|每次|每一則|一直)|"
@@ -1381,7 +1391,7 @@ def text_rejection(text: str, *, names, behaviour: bool = True) -> str:
     if _CODE_NAME_RE.search(flat) or any(_name_in(term, folded) for term in names):
         return "check:name"
     context, body = _split_rule(flat)
-    if _AGENT_RE.search(flat) or _BODY_AGENT_RE.search(body):
+    if _AGENT_RE.search(flat) or _BODY_AGENT_RE.search(body) or _CONTEXT_AGENT_RE.search(context):
         return "check:agent_directed"
     if _FORMAT_RE.search(flat):
         return "check:format"
@@ -1462,6 +1472,7 @@ def check_rule(verdict: Verdict, snapshot: Snapshot, *, names, tombstoned=()) ->
 
 
 TOMBSTONE_NGRAM = 8
+TOMBSTONE_CONTEXT_RATIO = 0.8  # R3-7：本文一樣但不到 8 字時，情境句（_alnum）相似到這個程度也算同一條
 
 
 def _tombstone(item) -> tuple[str, str]:
@@ -1471,11 +1482,16 @@ def _tombstone(item) -> tuple[str, str]:
     return str(item or ""), ""
 
 
-def _body(rule: str) -> str:
-    """規則本文（「不要／先／只」開始那段）；句型不對就整句。"""
+def _parts(rule: str) -> tuple[str, str]:
+    """（情境句, 本文）：本文是「不要／先／只」開始那段；句型不對就（"", 整句）。"""
     text = _clean(rule).strip()
     match = _TEMPLATE_RE.fullmatch(text)
-    return match.group(1) if match else text
+    return (text[: match.start(1)], match.group(1)) if match else ("", text)
+
+
+def _body(rule: str) -> str:
+    """規則本文（「不要／先／只」開始那段）；句型不對就整句。"""
+    return _parts(rule)[1]
 
 
 def similar_to_retired(rule: str, retired: str, *, category: str = "", retired_category: str = "") -> bool:
@@ -1484,6 +1500,9 @@ def similar_to_retired(rule: str, retired: str, *, category: str = "", retired_c
 
     R2-1：片段只比本文（「不要／先／只」開始那段），不比「當…時」情境句——同情境的另一條墓碑不能擋下
     「當家人分享影片時，先講結論」；兩邊都拿得到類別而且不同時不比片段。同一句、只差否定詞照擋，不看類別。
+    R3-7：本文（normalize 後）一模一樣時也不看類別：8 字以上直接擋（換個類別標籤回不來）；不到 8 字時，情境句
+    （_alnum）的 difflib 相似度 ≥ 0.8 才擋（「當回答很長的問題時」對「當回答比較長的問題時」擋，「問天氣」對
+    「問課程」約 0.71 照過）。
     """
     from correction_memory import _polarity_base, normalize_rule
 
@@ -1492,9 +1511,17 @@ def similar_to_retired(rule: str, retired: str, *, category: str = "", retired_c
     base = _polarity_base(rule)
     if base and base == _polarity_base(retired):
         return True
+    (context, body), (old_context, old_body) = _parts(rule), _parts(retired)
+    body_key = normalize_rule(body)
+    if body_key and body_key == normalize_rule(old_body):
+        if len(body_key) >= TOMBSTONE_NGRAM:
+            return True
+        ratio = difflib.SequenceMatcher(None, _alnum(context), _alnum(old_context)).ratio()
+        if ratio >= TOMBSTONE_CONTEXT_RATIO:
+            return True
     if category and retired_category and category != retired_category:
         return False
-    return shares_ngram(_body(rule), _body(retired), TOMBSTONE_NGRAM)
+    return shares_ngram(body, old_body, TOMBSTONE_NGRAM)
 
 
 def rule_problem(rule: str, category: str, *, names=()) -> str:
