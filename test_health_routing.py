@@ -390,7 +390,7 @@ def test_other_slash_commands_are_not_red_flag_checked(fake_health, text):
 def test_menu_button_replaced_and_old_card_button_still_brings_the_menu_back():
     assert ("🩺 爸媽健康", "/健康") in flex_menu.BUTTONS
     assert all(text != "/今晚煮什麼" for _label, text in flex_menu.BUTTONS)
-    assert len(flex_menu.BUTTONS) == 13
+    assert len(flex_menu.BUTTONS) == 12  # 2026-10-24: 財經觀點 拿掉，13 → 12
     assert flex_menu.is_button_text("/今晚煮什麼")
     assert flex_menu.is_button_text("/健康")
 
