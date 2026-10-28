@@ -170,6 +170,25 @@ def test_retire_all_judge_only_touches_learned_rules(T, capsys):
     assert [r["rule_id"] for r in memory.list_canonical_organic_corrections(G)] == [legacy["rule_id"]]
 
 
+def test_retire_all_judge_picks_the_rules_inside_its_transaction(T, monkeypatch, capsys):
+    """R2-12（GP2 #5）：--all-judge 在 BEGIN IMMEDIATE 之後才挑要撤銷哪些；先挑再開交易，中間 bot 剛存的那條會漏掉。"""
+    learn(RULE, oid="judge:M-1", now=T)
+    statements: list[str] = []
+    real_open = lr.open_live
+
+    def traced(db):
+        conn = real_open(db)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(lr, "open_live", traced)
+    assert lr.main(["retire", "--all-judge", "--db", live()]) == 0
+    assert "撤銷：1 條" in capsys.readouterr().out
+    begin = next(i for i, sql in enumerate(statements) if sql.startswith("BEGIN IMMEDIATE"))
+    pick = next(i for i, sql in enumerate(statements) if sql.startswith("SELECT r.rule_id FROM correction_rules r"))
+    assert begin < pick
+
+
 def test_retire_needs_an_id_or_all_judge(capsys):
     assert lr.main(["retire", "--db", live()]) == 2
 
@@ -401,9 +420,16 @@ def _legacy_note(content: str) -> int:
 
 
 def test_rescreen_masks_names_links_and_digits_before_claude_and_gemini(T, tmp_path, models, monkeypatch):
-    """F3：舊列是家人原話，送模型前和線上一樣遮名字、網址、長數字（Claude 失敗改 Gemini 時也一樣）。"""
+    """F3：舊列是家人原話，送模型前和線上一樣遮名字、網址、長數字（Claude 失敗改 Gemini 時也一樣）。
+
+    R2-14（GP2 #7）：舊規則本身（rule_text，不只稽核內容）也放名字和網址，釘住 rule_text 那段也有遮。
+    """
+    legacy = "以後測試成員甲問 https://example.com/r 的時候，不要把無關的商品扯進來"
+    memory.record_organic_correction_observation(
+        group_id=G, observation_id="line:L-7", scenario="使用者糾正", content=legacy, candidate_rule=legacy,
+    )
     _legacy_note("user 原問：測試成員甲問 https://example.com/v 編號 12345678 是什麼\n咪寶當時答：合成回答\n"
-                 "user 糾正：當回答比較長的問題時，先講結論")
+                 "user 糾正：當測試成員甲問 https://example.com/w 時，先講結論")
     sent = []
 
     def claude_down(system, user, effort):
@@ -419,10 +445,13 @@ def test_rescreen_masks_names_links_and_digits_before_claude_and_gemini(T, tmp_p
     monkeypatch.setattr(cl, "_gemini_allowed", lambda: True)
     copy = copy_db(tmp_path)
     assert lr.main(["rescreen", "--db", str(copy), "--out-dir", str(tmp_path / "reports")]) == 0
-    assert [who for who, _user in sent] == ["claude", "gemini"]
+    assert [who for who, _user in sent] == ["claude", "gemini"] * 2  # 舊規則、舊原話列各一次
     for _who, user in sent:
         assert "測試成員甲" not in user and "example.com" not in user and "12345678" not in user
-        assert "某家人" in user and "[連結]" in user and "[數字]" in user
+        assert "某家人" in user and "[連結]" in user
+        rule_part = user.split("稽核內容")[0]
+        assert "某家人" in rule_part and "[連結]" in rule_part
+    assert all("[數字]" in user for _who, user in sent[2:])
 
 
 def test_rescreen_retires_a_note_whose_full_text_is_private_even_if_the_model_keeps_it(T, tmp_path, models):
@@ -530,6 +559,33 @@ def test_replay_judges_offline_and_writes_nothing_to_any_db(T, tmp_path, models,
     assert by_id["M-C3"]["result"] == "quote_not_bot"
     assert "M-C2" not in by_id  # 前置過濾就不收
     assert "你沒看到最後" not in path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "rule,result,recorded",
+    [
+        # 報告裡的寫法和快照一樣（NFKC：全形逗號變半形）
+        ("當家人問影片時，先摘要重點", "check:loosening", "當家人問影片時,先摘要重點"),
+        # 被擋的原因是名字、網址：和快照一樣先遮掉才寫進報告
+        ("當測試成員甲問影片時，不要說影片沒提到", "check:name", "當某家人問影片時,不要說影片沒提到"),
+        ("當家人問 example.com 的影片時，不要說影片沒提到", "check:url", "當家人問 [連結] 的影片時,不要說影片沒提到"),
+    ],
+)
+def test_replay_records_the_rule_a_program_check_blocked(T, tmp_path, models, rule, result, recorded):
+    """R2-7：判斷器寫了規則、被程式檢查（stage=check）擋下時，重播報告也記下規則、核心原因、類別、信心。"""
+    put("M-BOT", "__bot__", BOT_TEXT, T - 40)
+    put("M-C1", COMPLAINER, "你沒看到最後嗎？影片最後一段有講", T, quoted="M-BOT")
+    models["verdict"] = {**VERDICT, "rule": rule}
+    copy = copy_db(tmp_path)
+    assert lr.main(["replay", "--db", str(copy), "--days", "3", "--now", str(T + 3600),
+                    "--out-dir", str(tmp_path / "reports")]) == 0
+    path = sorted((tmp_path / "reports").glob("replay_*.json"))[0]
+    item = json.loads(path.read_text(encoding="utf-8"))["items"][0]
+    assert (item["stage"], item["result"], item["blocked_rule"]) == ("check", result, recorded)
+    assert (item["core_reason"], item["category"], item["confidence"]) == (
+        VERDICT["core_reason"], VERDICT["category"], VERDICT["confidence"])
+    assert "would_learn_rule" not in item
+    assert "測試成員甲" not in path.read_text(encoding="utf-8")
 
 
 def test_replay_refuses_without_the_full_name_list(T, tmp_path, models, monkeypatch, capsys):

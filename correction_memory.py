@@ -333,15 +333,20 @@ def _clean_rule_text(value: Any) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def is_question_like(text: Any) -> bool:
-    """Whether the text is a question rather than a reusable correction."""
+def is_question_like(text: Any, *, a_not_a: bool = True) -> bool:
+    """Whether the text is a question rather than a reusable correction.
+
+    ``a_not_a=False`` skips the A-not-A form (是不是, 好不好 inside a clause); complaint
+    learning uses it for rules already in its fixed "當…時，…" template, where
+    "當不確定是不是完整內容時" is a condition, not a question.
+    """
     cleaned = _clean_rule_text(text)
     return bool(
         cleaned
         and (
             _QUESTION_LIKE_RE.search(cleaned)
             or _CORRECTION_PREFACED_QUESTION_RE.search(cleaned)
-            or _A_NOT_A_RE.search(cleaned)
+            or (a_not_a and _A_NOT_A_RE.search(cleaned))
         )
     )
 
@@ -516,13 +521,16 @@ def normalize_rule(text: Any) -> str:
     return plain
 
 
-def is_ambiguous(text: Any) -> bool:
-    """Whether a correction lacks enough subject/action detail to remember."""
+def is_ambiguous(text: Any, *, a_not_a: bool = True) -> bool:
+    """Whether a correction lacks enough subject/action detail to remember.
+
+    ``a_not_a`` is passed to :func:`is_question_like`.
+    """
 
     cleaned = _clean_rule_text(text)
     if not cleaned:
         return True
-    if is_question_like(cleaned):
+    if is_question_like(cleaned, a_not_a=a_not_a):
         return True
     if _transport_time_semantics(cleaned) is not None:
         return False

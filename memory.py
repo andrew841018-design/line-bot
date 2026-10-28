@@ -3067,13 +3067,18 @@ def record_learned_rule(
 
 
 def list_learned_rules(group_id: str, *, include_retired: bool = False) -> list[dict]:
-    """學到的規則（給判斷器：啟用中的可合併、撤銷過的不要再推出；給測試與工具）。"""
+    """學到的規則（給判斷器：啟用中的可合併、撤銷過的不要再推出；給測試與工具）。
+
+    category 取自建立（或復活）那筆事件；拿不到是空字串（墓碑比對時就不分類別，R2-1）。
+    """
     sql = (
         "SELECT r.rule_id, r.canonical_rule, r.status, r.occurrence_count, r.first_seen_at, "
         "r.last_seen_at, EXISTS (SELECT 1 FROM correction_rule_events e WHERE e.group_id=r.group_id "
         " AND e.rule_id=r.rule_id AND e.action='retire' AND NOT EXISTS ("
         "  SELECT 1 FROM correction_rule_events u WHERE u.group_id=e.group_id "
-        "  AND u.reverts_event_id=e.event_id)) "
+        "  AND u.reverts_event_id=e.event_id)), "
+        "(SELECT c.payload_json FROM correction_rule_events c WHERE c.group_id=r.group_id "
+        " AND c.rule_id=r.rule_id AND c.action IN ('create','revive') ORDER BY c.event_id LIMIT 1) "
         "FROM correction_rules r WHERE r.group_id=? AND r.origin=?"
     )
     if not include_retired:
@@ -3090,9 +3095,18 @@ def list_learned_rules(group_id: str, *, include_retired: bool = False) -> list[
             "first_seen_at": int(r[4]),
             "last_seen_at": int(r[5]),
             "tombstoned": bool(r[6]),
+            "category": _event_category(r[7]),
         }
         for r in rows
     ]
+
+
+def _event_category(payload_json) -> str:
+    try:
+        payload = json.loads(payload_json or "{}")
+    except (TypeError, ValueError):
+        return ""
+    return str(payload.get("category") or "") if isinstance(payload, dict) else ""
 
 
 def retire_correction_rules(
@@ -3139,35 +3153,48 @@ def _retire_rules_conn(
 def unlink_unsent_complaint(group_id: str, message_id: str, *, now: int | None = None) -> list[int]:
     """抱怨被收回（2026-10-28 實作後審查 F5、F6），同一個交易裡做完：
 
-    1. 含這則訊息的判斷列不再連到規則：rule_id 設 NULL；連過規則或試運轉通過的那幾列結果記 unsent
+    1. 判斷列的 complaint_ids 拿掉這則（R2-3）。一列可能是 25 秒內對同一則回覆的幾則抱怨合併的；還有別則
+       沒收回時，那一列照舊連著規則、shadow 紀錄也留著（別人的抱怨還撐著）。
+    2. 這列的抱怨全部收回了才不再連到規則：rule_id 設 NULL；連過規則或試運轉通過的那幾列結果記 unsent
        （試運轉報告才不會把收回的算成「會學到」）；這幾列的 shadow 紀錄刪掉。
-    2. 原本連著的學習規則，只退休已經沒有任何其他判斷列連著的（tombstone）：別人的抱怨合併進來的規則、
+    3. 原本連著的學習規則，只退休已經沒有任何其他判斷列連著的（tombstone）：別人的抱怨合併進來的規則、
        或這則只是合併進別人建立的規則時，都不會因為這則被收回就跟著不見。
     回真的撤銷了的 rule_id。
     """
     current = int(now if now is not None else _time.time())
+    target = str(message_id)
     match = "group_id=? AND (complaint_id=? OR instr(complaint_ids, ?)>0)"
-    args = (group_id, str(message_id), json.dumps(str(message_id)))
+    args = (group_id, target, json.dumps(target))
     with _lock, _conn() as c:
         c.execute("BEGIN IMMEDIATE")
         try:
-            linked = [
-                int(r[0])
-                for r in c.execute(
-                    "SELECT DISTINCT rule_id FROM complaint_judgements WHERE rule_id IS NOT NULL AND " + match,
-                    args,
-                ).fetchall()
-            ]
-            c.execute(
-                "DELETE FROM complaint_shadow_rules WHERE group_id=? AND complaint_id IN ("
-                " SELECT complaint_id FROM complaint_judgements WHERE " + match + ")",
-                (group_id, *args),
-            )
-            c.execute(
-                "UPDATE complaint_judgements SET rule_id=NULL, result='unsent' WHERE " + match
-                + " AND (rule_id IS NOT NULL OR result='shadow_pass')",
+            gone: list[tuple[int, str]] = []
+            linked: list[int] = []
+            for judgement_id, complaint_id, raw_ids, rule_id in c.execute(
+                "SELECT judgement_id, complaint_id, complaint_ids, rule_id FROM complaint_judgements WHERE " + match,
                 args,
-            )
+            ).fetchall():
+                ids = _complaint_id_list(raw_ids, complaint_id)
+                remaining = [cid for cid in ids if cid != target]
+                if remaining:
+                    if len(remaining) != len(ids):
+                        c.execute(
+                            "UPDATE complaint_judgements SET complaint_ids=? WHERE judgement_id=?",
+                            (json.dumps(remaining), judgement_id),
+                        )
+                    continue
+                gone.append((int(judgement_id), str(complaint_id)))
+                if rule_id is not None and int(rule_id) not in linked:
+                    linked.append(int(rule_id))
+            for judgement_id, complaint_id in gone:
+                c.execute(
+                    "DELETE FROM complaint_shadow_rules WHERE group_id=? AND complaint_id=?", (group_id, complaint_id)
+                )
+                c.execute(
+                    "UPDATE complaint_judgements SET rule_id=NULL, result='unsent' WHERE judgement_id=? "
+                    "AND (rule_id IS NOT NULL OR result='shadow_pass')",
+                    (judgement_id,),
+                )
             orphans = [
                 rule_id
                 for rule_id in linked
@@ -3183,6 +3210,17 @@ def unlink_unsent_complaint(group_id: str, message_id: str, *, now: int | None =
                 c.execute("ROLLBACK")
             raise
     return done
+
+
+def _complaint_id_list(raw_ids, complaint_id) -> list[str]:
+    """判斷列的 complaint_ids（JSON 陣列）；讀不懂或是空的就當只有這列自己的 complaint_id。"""
+    try:
+        ids = json.loads(raw_ids or "[]")
+    except (TypeError, ValueError):
+        ids = []
+    if not isinstance(ids, list) or not ids:
+        return [str(complaint_id)]
+    return [str(cid) for cid in ids]
 
 
 def backfill_organic_corrections(

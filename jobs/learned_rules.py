@@ -256,12 +256,24 @@ def cmd_list(args) -> int:
 # ── retire ──────────────────────────────────────────────────────────────────
 
 
-def retire_rules(conn, rule_ids, *, reason: str, now: int | None = None) -> list[int]:
-    """和 memory.retire_correction_rules 同一組寫法（測試確認撤銷後 memory 重算也不會復活）。"""
+def retire_rules(conn, rule_ids=(), *, reason: str, now: int | None = None, all_learned: bool = False) -> list[int]:
+    """和 memory.retire_correction_rules 同一組寫法（測試確認撤銷後 memory 重算也不會復活）。
+
+    all_learned=True（retire --all-judge）：要撤銷哪些在 BEGIN IMMEDIATE 之後才挑（R2-12）：先挑再開交易的話，
+    中間 bot 剛存的一條會漏掉。
+    """
     current = int(time.time() if now is None else now)
     done: list[int] = []
     conn.execute("BEGIN IMMEDIATE")
     try:
+        if all_learned:
+            rule_ids = [
+                int(r[0])
+                for r in conn.execute(
+                    "SELECT r.rule_id FROM correction_rules r WHERE r.origin=? AND NOT " + _tombstoned_sql(),
+                    (LEARNED,),
+                ).fetchall()
+            ]
         for rule_id in dict.fromkeys(int(r) for r in rule_ids):
             row = conn.execute(
                 "SELECT r.group_id, " + _tombstoned_sql() + " FROM correction_rules r WHERE r.rule_id=?",
@@ -293,14 +305,7 @@ def cmd_retire(args) -> int:
             if not _column(conn, "correction_rules", "origin"):
                 print("撤銷：0 條（這個 DB 還沒有學到的規則）")
                 return 0
-            ids = [
-                int(r[0])
-                for r in conn.execute(
-                    "SELECT r.rule_id FROM correction_rules r WHERE r.origin=? AND NOT " + _tombstoned_sql(),
-                    (LEARNED,),
-                ).fetchall()
-            ]
-            done = retire_rules(conn, ids, reason="all_judge")
+            done = retire_rules(conn, reason="all_judge", all_learned=True)
         else:
             done = retire_rules(conn, [args.rule_id], reason="owner")
     finally:
@@ -738,7 +743,9 @@ def cmd_replay(args) -> int:
                 results.append(entry)
                 continue
             active = [r for r in learned if r["group_id"] == snapshot.group_id and r["status"] == "active"]
-            tombstoned = [r["rule"] for r in learned if r["group_id"] == snapshot.group_id and r["tombstoned"]]
+            tombstoned = [
+                (r["rule"], r["category"]) for r in learned if r["group_id"] == snapshot.group_id and r["tombstoned"]
+            ]
             outcome = cl.evaluate(snapshot, active_rules=active, tombstoned_rules=tombstoned, names=names)
             judged += 1 if outcome.judged else 0
             answered += 1 if outcome.stage != "judge" else 0
@@ -749,6 +756,14 @@ def cmd_replay(args) -> int:
             )
             if outcome.stage == "pass" and verdict is not None:
                 entry.update(would_learn_rule=verdict.rule, core_reason=verdict.core_reason)
+            elif outcome.stage == "check" and verdict is not None and verdict.rule:
+                # R2-7：判斷器寫了規則、被程式檢查擋下，也記下來判讀是不是誤擋（報告 0600、只在本機）。
+                # 被擋的原因可能就是名字、網址、長數字，所以和快照一樣先遮掉再寫。
+                name_re = cl.name_pattern(names)
+                entry.update(
+                    blocked_rule=cl.sanitize(verdict.rule, name_re, cl.RULE_MAX_CHARS * 2),
+                    core_reason=cl.sanitize(verdict.core_reason, name_re, cl.CORE_REASON_MAX_CHARS * 2),
+                )
             results.append(entry)
     report = {
         "kind": "learned_rules_replay",

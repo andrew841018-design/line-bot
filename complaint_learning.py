@@ -286,7 +286,8 @@ def sanitize(text: str, name_re: re.Pattern | None, limit: int) -> str:
     收成一行、截斷。名字先遮再截，截斷處不會留下半個名字。"""
     from fact_hash import strip_format
 
-    t = unicodedata.normalize("NFKC", strip_format(str(text or "")))
+    # R2-10：Default_Ignorable（U+034F、U+FE0F、U+3164…）不是 Cf，strip_format 拿不掉，這裡另外拿掉。
+    t = _DEFAULT_IGNORABLE_RE.sub("", unicodedata.normalize("NFKC", strip_format(str(text or ""))))
     if name_re is not None:
         t = name_re.sub("某家人", t)
     t = t[: limit * 4]
@@ -703,6 +704,9 @@ def forget_message(group_id: str, message_id: str) -> None:
     只退休已經沒有別的抱怨連著的規則（F5：別人的抱怨合併進來的規則不會跟著不見）。"""
     try:
         if _env_mode() == MODE_OFF or not group_id or not message_id:
+            # TODO(GP1 #6，延後)：.env 關閉（0）期間收回的抱怨在這裡直接返回，判斷列不解除連結、規則不退休；
+            # 之後重新打開，那條規則會回到提示詞。這和「關閉時什麼都不碰」有取捨，先不改；回滾手冊第 4 節
+            # 要求重新打開前先用 list 看學習規則，必要時 retire。
             return
         key = (group_id, str(message_id))
         with _CAPSULES_LOCK:
@@ -877,7 +881,7 @@ JUDGE_SYSTEM = """你是 LINE 家族群組聊天機器人「咪寶」的回覆�
 4. 不確定就填 is_complaint=false。寧可漏掉，也不要誤收。
 5. 能學的只有三類（category）：
    - only_verified：沒看完、沒查到完整內容時不下結論，不說「沒提到」「沒有」。
-   - stay_on_topic：先回答被問的事，不扯進對方沒提到的東西。
+   - stay_on_topic：先回答被問的事，不扯進對方沒提到的東西。rule 用窄的寫法「不要把沒被問到的〈東西〉扯進來」；不要寫「只回答被問的…」「其他不要提」這種限制回答範圍的寫法（會被擋下）。
    - clarity：用白話、先講結論。
    其他都填 "none"。限制咪寶主動發言、主動給建議、或要它少回覆的（例如「沒人問就不要插話」「少回一點」）一律填 "none"：家人要維持現在的回覆節奏。
 6. rule 固定句型「當<情境>時，<不要|先|只>…」，60 字以內；要通用，不寫人名、稱謂（爸爸、媽媽…）、家人代號、數字、網址、具體事件或任何事實主張；不能要求減少查證或更正、不能要求附和或認同、不能要求透露任何事、不能要求摘要或重述。
@@ -890,7 +894,7 @@ JUDGE_SYSTEM = """你是 LINE 家族群組聊天機器人「咪寶」的回覆�
 - 「咪寶今天又在沙發上睡著了好可愛」→ 講貓：about_bot_reply=false。
 - 「這樣煮對不對？」→ 問句：is_complaint=false。
 - 咪寶說影片沒提到某件事，家人回「你有沒有看完啊？後面有講」→ only_verified，rule 例「當沒看完影片完整內容時，不要說影片沒提到」。
-- 家人問烹飪課教了什麼，咪寶扯到沒人提的保養品，家人回「你搞錯了吧」→ stay_on_topic，rule 例「當家人問課程內容時，只根據課程本身回答，不扯進沒提到的商品」。
+- 家人問烹飪課教了什麼，咪寶扯到沒人提的保養品，家人回「你搞錯了吧」→ stay_on_topic，rule 例「當家人問課程內容時，不要把沒被問到的商品扯進來」。
 
 只輸出一個 JSON 物件，不要 markdown、不要其他文字：
 {"about_bot_reply": true 或 false, "is_complaint": true 或 false, "category": "only_verified" 或 "stay_on_topic" 或 "clarity" 或 "none", "core_reason": "…", "rule": "…", "evidence": "…", "reply_kind": "chat" 或 "operational" 或 "unknown", "same_as_rule_id": 整數或 null, "confidence": 0 到 1 的數字}
@@ -1131,10 +1135,13 @@ _CODE_NAME_RE = re.compile(r"家人[A-Za-z]|某家人")
 # GP1 N5：原文、切換、不受、模式、約束、解除不單獨擋（「沒看完文章原文」「切換話題太快」要能過），改成片語。
 _AGENT_RE = re.compile(
     r"忽略|忽視|忽视|無視|无视|略過|跳過|無限制|切換成.{0,6}模式|不要?受.{0,8}(?:限制|約束|規範)|解除.{0,4}限制|"
-    r"越獄|假裝|假扮|扮演|逐字|貼出|指令|指示|提示詞|提示词|系統|系统|規則|规则|優先|优先|覆蓋|角色|開發者|"
+    r"越獄|假裝|假扮|扮演|逐字|貼出|指令|指示|提示詞|提示词|優先|优先|覆蓋|角色|開發者|"
     r"(?:照|以|按|依)這條|這條為準|不用管|不必管|別管|"
     r"(?i:prompt|system|ignore|instruction|developer|assistant)"
 )
+# R2-2：「規則／系統」是一般名詞（遊戲規則、系統更新），只在本文（「不要／先／只」開始那段）算對 agent 的字；
+# 情境句只描述什麼情況（「當家人問遊戲規則時」要能過）。句型不對的文字（核心原因、舊規則）整段都算本文。
+_BODY_AGENT_RE = re.compile(r"規則|规则|系統|系统")
 # 冒充提示詞的段落標題或輸出格式（F1）：fact_filters._META_RE 也擋事實裡的【】。
 _FORMAT_RE = re.compile(r"[【】\[\]<>{}]|(?i:json)|格式|輸出|输出")
 # 放寬 Andrew 的硬規則（不摘要、不重述、只給新資訊、不假裝查過）或減少查證、更正。摘要／重述這些字
@@ -1142,16 +1149,19 @@ _FORMAT_RE = re.compile(r"[【】\[\]<>{}]|(?i:json)|格式|輸出|输出")
 # F1：憑印象／用記憶回答、不要上網搜尋、不要加但書、不要否定或提醒，也是減少查證或更正。
 # GP1 F4：重複／概括這類重述、列出來源、給「最可能」的答案（猜）、「不要說還需要查證」（GP1 F1 測過的寫法；
 # 「不要沒確認就說沒提到」「不要說沒確認過的內容」要能過，所以不用「不要.{0,3}確認」這種寬的）。
+# R2-4：「不要說／講／回答（還）需要查證」「不要說還沒查證就不能回答」是同一種放寬（叫咪寶別承認還要查證）；
+# 後面接「（過）的…」是在講沒查證的內容（「不要說沒確認過的內容」），那是加嚴，放行。
+_GUESS = r"憑印象|憑感覺|憑記憶|用記憶|靠記憶|用猜的|猜測|推測|直接猜|猜一下"
 _LOOSEN_RE = re.compile(
     r"摘要|總結|重述|複述|重複|複誦|概括|簡述|歸納|濃縮|整理重點|來源清單|正反方|"
     r"(?:列出?|附上?|提供|給)(?:所有|全部|參考|相關|各|每個)?(?:來源|出處)|(?:所有|全部|參考)來源|"
     r"不(?:用|必|需|需要)查|免查|別查|不要查|"
     r"(?:不用|不必|不需要|不要|別|免)(?:再)?(?:核實|確認|驗證|查證|求證)|"
     r"(?:不用|不必|不需要|不要|別|免)(?:再)?(?:上網)?(?:搜尋|搜索|查詢|檢查)|"
-    r"憑印象|憑感覺|憑記憶|用記憶|靠記憶|但書|最可能|推測|猜測|"
-    r"可以猜|用猜的|猜一下|直接猜|編一個|"
+    + _GUESS + r"|但書|最可能|可以猜|編一個|"
     r"(?:不要|別|不必|不用)(?:再)?說(?:查不到|找不到|不知道|無法|沒有資料|不確定)|"
-    r"(?:不要|別|不必|不用)(?:再)?說(?:還|需要|要|得|必須){0,3}(?:查證|確認|核實|求證|依據)|"
+    r"(?:不要|別|不必|不用)(?:再)?(?:說|講|回答|回覆|提|表示)(?:還沒|還|沒有|沒|需要|要|得|必須|再|先){0,3}"
+    r"(?:查證|確認|核實|求證|依據)(?!過?的)|"
     r"(?:不要|別|不必|不用)(?:再)?(?:更正|糾正|反駁|指出|質疑|否定|爭辯|提醒)"
 )
 # 附和、讓步（F1：規則全文都檢查）。不整批擋「說法／家人的／意見」：「當家人轉傳說法時，先查證來源再回答」要能過；
@@ -1165,10 +1175,27 @@ _DISCLOSE_RE = re.compile(
     r"透露|揭露|洩漏|公開(?:家人|個人|私人|別人|他人|是誰)|說出(?:是)?誰|告訴(?:大家|全家|其他人)|轉告|私訊|"
     r"名單|帳號|密碼|近況|個資|記得的|(?:家人|對方|別人|他人|其他人)的?(?:資料|消息|行蹤)"
 )
-_ASSERT_RE = re.compile(
+_ASSERT = (
     r"其實是|事實上|事實是|是真的|是假的|才是正確|才是對的|(?<!不)確定是|一定(?:是|會|不會|沒有?)|已經(?:證實|確認)|"
     r"會漲|會跌"
 )
+_ASSERT_RE = re.compile(_ASSERT)
+# R2-2：前面有「不要／別」的猜測與斷言是加嚴（「不要憑印象說影片沒提到」「不要沒查到就用猜的」「不要說影片一定
+# 沒提到」）：這幾段先拿掉再找放寬、斷言。否定只認緊接的寫法（猜測前只能夾「沒…就／前」這種條件，斷言前要是
+# 說／講這類動詞），「不要怕用猜的」「不要懷疑颱風一定不會來」照擋；同一小句後面有「以外／之外」也不算否定。
+_CLAUSE = r"[^，,。！？!?；;]"
+_NEG = r"(?:不要|別|不能|不可以|不可|勿|避免|不該|不應該)(?:再)?"
+_UNLESS_EXCEPT = rf"(?!{_CLAUSE}*(?:以外|之外))"
+_NEGATED_GUESS_RE = re.compile(
+    _NEG + rf"(?:(?:在|還)?沒{_CLAUSE}{{1,8}}?(?:之前|前|就|時)|只|光|單)?(?:{_GUESS}){_UNLESS_EXCEPT}"
+)
+_NEGATED_ASSERT_RE = re.compile(
+    _NEG + rf"(?:直接|隨便|輕易|馬上|就|先|太早)?(?:說|講|斷定|斷言|認定|宣稱|回答){_CLAUSE}{{0,10}}?"
+    rf"(?:{_ASSERT}){_UNLESS_EXCEPT}"
+)
+# R2-2：情境句（「當…時，」）只描述家人做了什麼：「家人重複問」「問新聞是不是真的」不是咪寶重述或斷言事實。
+# 只遮情境句裡這幾種問法；本文照舊全擋（「先重複問題」「先說新聞不是真的」）。
+_CONTEXT_BENIGN_RE = re.compile(r"重複(?=(?:提|發)?問)|是不是(?:真的|假的)|是真是假|是否(?:為|是)?(?:真的|假的)")
 # v2.2：Andrew「現有的節奏我覺的可以」——限制主動插話、主動給建議、減少回覆次數的一律不收。
 # 「不要回答『沒提到』」是講回答的內容，不算；「不要回」「不用回覆了」「少回一點」才是限制回覆。
 # F1：加上沉默／加入／參與／被要求／減少／只回；規則裡出現「建議」一律不收（「不要給沒被問到的建議」這種寫法
@@ -1177,14 +1204,21 @@ _ASSERT_RE = re.compile(
 # GP1 F4：stay_on_topic 的錨點（被問／回答）不能放行「只回答被問的、別的都不要給」這種大範圍限制，v2.2 優先：
 # 只答／只針對／只談、只講被問的、問題以外、不要補充、不要多給、不要給其他／額外的、就好／而已、先聽、發表意見。
 # 「(只|先)回答被問」不擋：那是 stay_on_topic 的定義（「先回答被問的事」要能過）。
+# R2-2：只擋「限制回答範圍／插話」的寫法，不擋查證類寫法——「只回／只答」後面接查到的、確認過的（「只回答查到的
+# 部分」）放行，「只回答被問的課程」「只回一個字」照擋；「加入」只放行「加入沒查到的…」（「不要加入對話」照擋）；
+# 「沒被問到的…」只放行「扯進／帶進／拉進」這種窄版。R2-4：「就可以了」「其他不提」「別的不要提」也擋。
+_VERIFIED_FORM = r"(?:有)?(?:查到|查證過|確認過|看過|看完|找到)"
 _UNPROMPTED_RE = re.compile(
-    r"主動|插話|插嘴|搭話|多嘴|沒人問|沒被問(?!到?的[^，,。]{0,10}扯)|沒(?:有)?人(?:叫|點名)|沒問你|"
-    r"沉默|加入|參與|被要求|減少|只回|建議|"
-    r"只(?:答|針對|談|聊)|只(?:講|說|根據)(?:被問|問題|問的)|(?:問題|被問|問的|問到)的?(?:範圍)?(?:以外|之外)|"
+    r"主動|插話|插嘴|搭話|多嘴|沒人問|沒被問(?!到?的[^，,。]{0,10}(?:扯|帶|拉)進)|沒(?:有)?人(?:叫|點名)|沒問你|"
+    r"沉默|加入(?!(?:沒|未|還沒)(?:有)?(?:查到|查證|確認|看過|看完|找到))|參與|被要求|減少|建議|"
+    rf"只(?=回|答)(?!(?:回(?:答|覆|應)?|答){_VERIFIED_FORM})|"
+    r"只(?:針對|談|聊)|只(?:講|說|根據)(?:被問|問題|問的)|(?:問題|被問|問的|問到)的?(?:範圍)?(?:以外|之外)|"
     r"(?:不要|別|不必|不用|少|不需要)(?:再)?(?:多|額外)?(?:補充|延伸)|"
     r"(?:不要|別|不必|不用|少|不需要)(?:再)?(?:多|額外)(?:給|說|講|聊|談|提供)|"
     r"(?:不要|別|不必|不用|少|不需要)(?:再)?(?:給|提供|說|講)?(?:其他|額外|多餘|更多)|"
-    r"就好|而已|就夠|就行|即可|先聽|"
+    r"(?:其他|其它|別的|其餘)(?:的)?(?:事|東西|部分|內容|資訊|問題)?(?:都|就|也)?"
+    r"(?:不要|別|不用|不必|不需要|不)(?:再)?(?:提|講|說|談|聊|回|管|理)|"
+    r"就好|而已|就夠|就行|即可|就可以了|就可以(?=$|[，,。！!？?；;])|先聽|"
     r"(?:不用|不要|不必|別|不需要)(?:再)?回(?:覆|應|話)?(?=$|[，,。！!？?；;]|了|啦|喔)|"
     r"少回|回(?:覆|應)(?:次數|頻率)|少說|少講|安靜|閉嘴|潛水|"
     r"(?:不要|別)(?:發言|每則|每次|每一則|一直)|"
@@ -1192,12 +1226,29 @@ _UNPROMPTED_RE = re.compile(
     r"只(?:在|有)[^，,。]{0,12}(?:問|叫|點名|提到|@)[^，,。]{0,6}(?:時|才)|"
     r"(?:問|叫|點名)[^，,。]{0,4}(?:才|再)(?:回|開口|說話|發言)"
 )
+# R2-9（GP2 #2）：只看本文的片語（情境句不看：「當家人問明天最高溫時」要能過）。放寬＝放寬硬規則；不管、最高原則、
+# 最優先、比…重要／優先＝把這條排到其他規則前面；接話、被點到、表達立場＝限制主動發言（v2.2）。
+_BODY_LOOSEN_RE = re.compile(r"放寬")
+_BODY_PRIORITY_RE = re.compile(rf"不管|最高原則|最優先|比{_CLAUSE}{{0,8}}(?:重要|優先)")
+_BODY_UNPROMPTED_RE = re.compile(r"接話|被點到|表達立場")
 # 規則本文（從「不要／先／只」開始）一定要有它那一類的錨點詞（F1）：類別不再只是判斷器填的標籤。
 _CATEGORY_ANCHORS = {
-    "only_verified": re.compile(r"看完|查到|完整內容|確認|沒提到|查證"),  # 「來源」不算（列來源是硬規則禁止的）
-    "stay_on_topic": re.compile(r"被問|回答|提到|扯進|無關|只根據|問題"),
+    # 「來源」不算（列來源是硬規則禁止的）。R2-2：「不要下結論／別急著下定論／不要說沒有」也是 only_verified；
+    # 只認前面有否定的寫法，「先講結論」（clarity）標成 only_verified 照樣不過。
+    "only_verified": re.compile(rf"看完|查到|完整內容|確認|沒提到|查證|(?:不|別|勿){_CLAUSE}{{0,8}}(?:結論|定論|沒有)"),
+    # R2-9：拿掉「回答／問題」（「先回答會上漲」「先順家人的意思回答」都靠它們過關）；R2-2 的窄版加「帶進／拉進」。
+    "stay_on_topic": re.compile(r"被問|提到|扯進|帶進|拉進|無關|只根據"),
     "clarity": re.compile(r"白話|結論|簡短|重點|條列|一句"),
 }
+# R2-11（GP2 #4）：fact_filters 的稱謂表沒有這幾個；那張表別的功能也在用，這裡另外補。
+_EXTRA_KINSHIP_RE = re.compile(r"爸媽|老爸|老媽|媽咪|爹地")
+# R2-10（GP2 #3）：Unicode 的 Default_Ignorable_Code_Point——看不見，但不一定是 Cf（U+034F、U+FE0F、U+3164…），
+# strip_format 拿不掉。sanitize 一律拿掉；關鍵字與名字比對用的副本連空白一起拿掉（「忽 略」「測試成 員甲」）。
+_DEFAULT_IGNORABLE_RE = re.compile(
+    "[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e\u2060-\u206f"
+    "\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufff8\U0001bca0-\U0001bca3\U0001d173-\U0001d17a"
+    "\U000e0000-\U000e0fff]"
+)
 
 
 def _clean(text) -> str:
@@ -1210,6 +1261,29 @@ def _clean(text) -> str:
 def has_invisible(text) -> bool:
     """有看不見的格式字元（Cf）或控制字元（Cc）：規則與核心原因一律不收（F2）。"""
     return any(unicodedata.category(ch) in {"Cf", "Cc"} for ch in str(text or ""))
+
+
+def charset_ok(text) -> bool:
+    """NFKC 之後能用 cp950（Big5）編碼（R2-10）：簡體字、看不見的組合字（U+034F、U+FE0F、U+3164）、表情符號都不行。
+    只用在規則與核心原因（判斷器寫的字）；家人的舊原話不套這條。"""
+    try:
+        unicodedata.normalize("NFKC", str(text or "")).encode("cp950")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _squeeze(text: str) -> str:
+    """關鍵字、名字比對用的副本（R2-10）：拿掉 Default_Ignorable 字元與所有空白。"""
+    return "".join(_DEFAULT_IGNORABLE_RE.sub("", str(text or "")).split())
+
+
+def _split_rule(text: str) -> tuple[str, str]:
+    """（情境句, 本文）：句型對時本文是「不要／先／只」開始那段（R2-2、R2-9）；句型不對（核心原因、舊規則）整段都是本文。"""
+    match = _TEMPLATE_RE.fullmatch(text)
+    if match is None:
+        return "", text
+    return text[: match.start(1)], match.group(1)
 
 
 def anchors_category(rule: str, category: str) -> bool:
@@ -1241,42 +1315,57 @@ def text_rejection(text: str, *, names, behaviour: bool = True) -> str:
     隱私與對 agent 的字（網址、聯絡資料、長數字、私密字、稱謂、名字、忽略／指令…、冒充段落標題的括號與
     輸出格式字）每段都檢查；behaviour=True（規則本身）再檢查放寬硬規則、附和、揭露、斷言事實、限制主動發言（v2.2）。
     核心原因只描述家人為什麼不滿（可能就是「沒被問就插話」），不檢查 behaviour（它不進提示詞）。
-    關鍵字比對先 NFKC 再去掉看不見的格式字元（F2：零寬字元不能拆開「媽媽」「忽略」「摘要」）。
+    關鍵字比對先 NFKC 再去掉看不見的格式字元（F2：零寬字元不能拆開「媽媽」「忽略」「摘要」）；R2-10 起再拿掉
+    Default_Ignorable 與空白（「媽<U+034F>媽」「忽 略」）。
+    句型對的規則分成情境句和本文（R2-2、R2-9）：隱私、名字、對 agent 的強字、格式字看整句；一般名詞（規則、系統）
+    與 GP2 的優先序／限制發言片語只看本文；放寬、斷言這些看整句，但情境句裡「家人重複問」「問是不是真的」不算，
+    緊接否定的猜測與斷言（「不要憑印象」「不要說…一定沒」）也不算。
     """
     import fact_filters
 
     raw = str(text or "")
     norm = _clean(raw)
-    if fact_filters.LINK_RE.search(norm):
+    flat = _squeeze(norm)
+    if fact_filters.LINK_RE.search(norm) or fact_filters.LINK_RE.search(flat):
         return "check:url"
-    if fact_filters.has_contact(raw):
+    if fact_filters.has_contact(raw) or fact_filters.has_contact(flat):
         return "check:contact"
-    if re.search(r"\d{4,}", norm):
+    if re.search(r"\d{4,}", flat):
         return "check:digits"
-    if fact_filters.private_text(raw):
+    if fact_filters.private_text(raw) or fact_filters.private_text(flat):
         return "check:private"
-    if fact_filters._KINSHIP_RE.search(norm):
+    if fact_filters._KINSHIP_RE.search(flat) or _EXTRA_KINSHIP_RE.search(flat):
         return "check:kinship"
-    folded = norm.casefold()
-    if _CODE_NAME_RE.search(norm) or any(term and term in folded for term in names):
+    folded = flat.casefold()
+    if _CODE_NAME_RE.search(flat) or any(_name_in(term, folded) for term in names):
         return "check:name"
-    if _AGENT_RE.search(norm):
+    context, body = _split_rule(flat)
+    if _AGENT_RE.search(flat) or _BODY_AGENT_RE.search(body):
         return "check:agent_directed"
-    if _FORMAT_RE.search(norm):
+    if _FORMAT_RE.search(flat):
         return "check:format"
     if not behaviour:
         return ""
-    if _LOOSEN_RE.search(norm):
+    scoped = _CONTEXT_BENIGN_RE.sub("。", context) + body
+    if _LOOSEN_RE.search(_NEGATED_GUESS_RE.sub("。", scoped)) or _BODY_LOOSEN_RE.search(body):
         return "check:loosening"
-    if _AGREE_RE.search(norm):
+    if _AGREE_RE.search(scoped):
         return "check:agreement"
-    if _DISCLOSE_RE.search(norm):
+    if _DISCLOSE_RE.search(scoped):
         return "check:disclosure"
-    if _ASSERT_RE.search(norm):
+    if _ASSERT_RE.search(_NEGATED_ASSERT_RE.sub("。", scoped)):
         return "check:asserts_fact"
-    if _UNPROMPTED_RE.search(norm):
+    if _UNPROMPTED_RE.search(scoped) or _BODY_UNPROMPTED_RE.search(body):
         return "check:unprompted"
+    if _BODY_PRIORITY_RE.search(body):
+        return "check:agent_directed"
     return ""
+
+
+def _name_in(term: str, folded: str) -> bool:
+    """名單裡的名字（也拿掉空白與 Default_Ignorable，R2-10）有沒有出現在比對用的副本裡。"""
+    squeezed = _squeeze(term)
+    return bool(squeezed) and squeezed in folded
 
 
 def load_names() -> tuple[str, ...] | None:
@@ -1290,7 +1379,10 @@ def load_names() -> tuple[str, ...] | None:
 
 
 def check_rule(verdict: Verdict, snapshot: Snapshot, *, names, tombstoned=()) -> str:
-    """寫入前的程式檢查；回 "" 或 check:<原因>。names 是 load_names() 的結果（None＝讀不到名單）。"""
+    """寫入前的程式檢查；回 "" 或 check:<原因>。names 是 load_names() 的結果（None＝讀不到名單）。
+
+    tombstoned：撤銷過的規則，每項是文字或（文字, 類別）；拿得到類別時，片段比對只比同類別（R2-1）。
+    """
     from correction_memory import is_ambiguous
 
     raw_rule, raw_reason = verdict.rule.strip(), verdict.core_reason.strip()
@@ -1303,6 +1395,8 @@ def check_rule(verdict: Verdict, snapshot: Snapshot, *, names, tombstoned=()) ->
         return "check:core_reason"
     if has_invisible(raw_rule) or has_invisible(raw_reason):
         return "check:invisible"
+    if not charset_ok(raw_rule) or not charset_ok(raw_reason):
+        return "check:charset"
     evidence = _plain(verdict.evidence)
     target_text = next((r.text for r in snapshot.rows if r.role == "target"), "")
     if len(evidence) < 4 or len(verdict.evidence) > EVIDENCE_MAX_CHARS or evidence not in _plain(target_text):
@@ -1315,9 +1409,13 @@ def check_rule(verdict: Verdict, snapshot: Snapshot, *, names, tombstoned=()) ->
         return found
     if not anchors_category(rule, verdict.category):
         return "check:category_anchor"
-    if is_ambiguous(rule):
+    # R2-5：走到這裡句型一定對；「當不確定是不是完整內容時」的「是不是」是條件，不是問句，不跑 A-not-A。
+    if is_ambiguous(rule, a_not_a=False):
         return "check:ambiguous"
-    if any(similar_to_retired(rule, old) for old in tombstoned):
+    if any(
+        similar_to_retired(rule, old, category=verdict.category, retired_category=old_category)
+        for old, old_category in map(_tombstone, tombstoned)
+    ):
         return "check:tombstoned"
     return ""
 
@@ -1325,15 +1423,37 @@ def check_rule(verdict: Verdict, snapshot: Snapshot, *, names, tombstoned=()) ->
 TOMBSTONE_NGRAM = 8
 
 
-def similar_to_retired(rule: str, retired: str) -> bool:
-    """同一群組撤銷過的規則換句話說又被推出來也不收（GP1 N1）：同一句（normalize_rule）、共用 8 字以上片段，
-    或拿掉「不要／應該」這類字之後一樣（correction_memory 判斷同一條規則用的 _polarity_base）。"""
+def _tombstone(item) -> tuple[str, str]:
+    """撤銷過的規則：文字，或（文字, 類別）；拿不到類別時類別是空字串。"""
+    if isinstance(item, (tuple, list)):
+        return str(item[0] or ""), (str(item[1] or "") if len(item) > 1 else "")
+    return str(item or ""), ""
+
+
+def _body(rule: str) -> str:
+    """規則本文（「不要／先／只」開始那段）；句型不對就整句。"""
+    text = _clean(rule).strip()
+    match = _TEMPLATE_RE.fullmatch(text)
+    return match.group(1) if match else text
+
+
+def similar_to_retired(rule: str, retired: str, *, category: str = "", retired_category: str = "") -> bool:
+    """同一群組撤銷過的規則換句話說又被推出來也不收（GP1 N1）：同一句（normalize_rule）、拿掉「不要／應該」
+    這類字之後一樣（correction_memory 判斷同一條規則用的 _polarity_base），或本文共用 8 字以上片段。
+
+    R2-1：片段只比本文（「不要／先／只」開始那段），不比「當…時」情境句——同情境的另一條墓碑不能擋下
+    「當家人分享影片時，先講結論」；兩邊都拿得到類別而且不同時不比片段。同一句、只差否定詞照擋，不看類別。
+    """
     from correction_memory import _polarity_base, normalize_rule
 
-    if normalize_rule(rule) == normalize_rule(retired) or shares_ngram(rule, retired, TOMBSTONE_NGRAM):
+    if normalize_rule(rule) == normalize_rule(retired):
         return True
     base = _polarity_base(rule)
-    return bool(base) and base == _polarity_base(retired)
+    if base and base == _polarity_base(retired):
+        return True
+    if category and retired_category and category != retired_category:
+        return False
+    return shares_ngram(_body(rule), _body(retired), TOMBSTONE_NGRAM)
 
 
 def rule_problem(rule: str, category: str, *, names=()) -> str:
@@ -1348,6 +1468,8 @@ def rule_problem(rule: str, category: str, *, names=()) -> str:
         return "check:template"
     if has_invisible(raw):
         return "check:invisible"
+    if not charset_ok(raw):
+        return "check:charset"
     found = text_rejection(text, names=names)
     if found:
         return found
@@ -1399,7 +1521,7 @@ def judge_prompt(snapshot: Snapshot, active_rules, tombstoned_rules) -> str:
         parts.extend(f"#{int(r['rule_id'])} {r['rule']}" for r in active_rules[:MAX_ACTIVE_RULES])
     if tombstoned_rules:
         parts.append("\n已撤銷的規則（不要再推出來）：")
-        parts.extend(f"- {text}" for text in list(tombstoned_rules)[:20])
+        parts.extend(f"- {_tombstone(item)[0]}" for item in list(tombstoned_rules)[:20])
     return "\n".join(parts)
 
 
@@ -1595,7 +1717,7 @@ def _process(pending: _Pending, now: float) -> str:
         return "cap_group"
     learned = memory.list_learned_rules(snapshot.group_id, include_retired=True)
     active = [r for r in learned if r["status"] == "active"]
-    tombstoned = [r["rule"] for r in learned if r["tombstoned"]]
+    tombstoned = [(r["rule"], r.get("category", "")) for r in learned if r["tombstoned"]]
     outcome = evaluate(snapshot, active_rules=active, tombstoned_rules=tombstoned)
     verdict = outcome.verdict
     detail = dict(
