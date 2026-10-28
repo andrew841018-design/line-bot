@@ -186,6 +186,19 @@ def test_no_family_name_list_means_no_run(job):
     assert job.model.prompts == []
 
 
+def test_a_display_name_file_that_cannot_be_read_means_no_run(tmp_path, monkeypatch, job):
+    # 2026-10-29（follow-up 5 第 4 項）：檔不在是正常的；在卻讀不到，那些人的名字就擋不住（寧可不寫）
+    _write_state()
+    _raw("m1", "U_A", "我住台中", T0 + 10)
+    path = tmp_path / "member_display_names.json"
+    path.write_bytes(b"{")
+    monkeypatch.setenv("LINE_MEMBER_DISPLAY_NAMES_PATH", str(path))
+    outcome = dm.run(now=NOW)
+    assert (outcome.status, outcome.exit_code) == ("names_unavailable", 2)
+    assert job.model.prompts == [] and memory.list_fact_rows(G) == [] and _cursor() == (T0, "")
+    assert path.read_bytes() == b"{"
+
+
 def test_no_embedder_means_no_writes_and_no_progress(monkeypatch, job):
     _write_state()
     _raw("m1", "U_A", "我住台中", T0 + 10)

@@ -892,6 +892,53 @@ def test_blocked_site_does_not_cause_endless_recomputation(monkeypatch, tmp_path
     assert len(rig.fetches) == 1 and sp._ai_state["computed_at"] == computed
 
 
+def test_00952_fetched_in_an_unfinished_round_is_used_next_round_without_refetching(monkeypatch, tmp_path, clock):
+    """後續第 5 項（2026-10-29）：這個 T 已用核心名單寫好，某一輪抓到 00952 卻有候選還沒結果（沒寫）——以前
+    _ai_fetch_due 看到「今天抓過」就不再重算，這個 T 一直停在 core_only；現在下一輪直接用記憶體那份重算、不再抓。"""
+    outcomes = [source.SourceError("fetch_failed"), _holdings()]
+    rig = UniverseRig(monkeypatch, tmp_path, clock,
+                      fetch=lambda **kw: outcomes.pop(0) if outcomes else pytest.fail("今天的 00952 已經到手，不該再抓"))
+    del rig.snapshot.pool["1101"]  # 排名第一的 1101 只在 00952 名單裡，走勢要抓 Yahoo
+    yahoo = Yahoo(rig.snapshot, clock)
+    monkeypatch.setattr(sp, "_snapshot", rig.snapshot)
+    monkeypatch.setattr(sp, "_AI_BACKGROUND_ENABLED", True)
+    monkeypatch.setattr(sp, "_fetch_chart", yahoo)
+    sp._maybe_fill_ai(threading.Event())
+    assert sp._ai_state["universe"]["source"] == "core_only" and len(rig.fetches) == 1 and yahoo.calls == []
+    clock.advance(sp.AI_FETCH_RETRY_S + 1)
+    yahoo.kind("1101", "hole")  # 這一輪抓到 00952，但 1101 前一天那根還沒補：沒算完、不寫
+    sp._maybe_fill_ai(threading.Event())
+    assert len(rig.fetches) == 2 and sp._ai_holdings["fetched_day"] == TODAY.isoformat()
+    assert sp._ai_state["universe"]["source"] == "core_only" and sp._ai_state["fail_count"] == 0
+    assert sp._ai_next_try == pytest.approx(clock.wall + sp.AI_RETRY_S)  # 沒算完照舊 20 分鐘後再試
+    yahoo.kind("1101", "flat")
+    _next_round(clock)
+    sp._maybe_fill_ai(threading.Event())
+    assert sp._ai_state["universe"]["source"] == "00952" and len(rig.fetches) == 2  # 用記憶體那份重算，不再抓
+    assert [p["c"] for p in sp._ai_state["picks"]] == ["1101", "1102", "1103"]
+    computed = sp._ai_state["computed_at"]
+    _next_round(clock, sp.AI_FETCH_RETRY_S * 2)  # 有今天的 00952 了：同一個 T 不再重算
+    sp._maybe_fill_ai(threading.Event())
+    assert sp._ai_state["computed_at"] == computed and yahoo.calls == ["1101.TW"] * 2 and len(rig.fetches) == 2
+    assert [(row["rev"], row["source"]) for row in _history_rows()] == [(1, "core_only"), (2, "00952")]
+
+
+def test_holdings_fetched_today_but_too_old_do_not_recompute_every_round(monkeypatch, tmp_path, clock):
+    """後續第 5 項的另一面（2026-10-29）：今天抓的、名單日期卻超過 45 天（例如重啟讀回來的）不能用，重算也只是
+    core_only——不能因為「今天抓過」就每一輪重算（寫完 _ai_next_try 會歸零）。"""
+    rig = UniverseRig(monkeypatch, tmp_path, clock, fetch=lambda **kw: pytest.fail("今天抓過了"))
+    old = (TODAY - timedelta(days=sp.AI_HOLDINGS_MAX_AGE_DAYS + 1)).isoformat()
+    monkeypatch.setattr(sp, "_ai_holdings", {"codes": HOLDING_CODES, "as_of": old, "fetched_day": TODAY.isoformat()})
+    monkeypatch.setattr(sp, "_snapshot", rig.snapshot)
+    monkeypatch.setattr(sp, "_AI_BACKGROUND_ENABLED", True)
+    sp._maybe_fill_ai(threading.Event())
+    assert sp._ai_state["universe"]["source"] == "core_only" and sp._ai_next_try == 0.0
+    computed = sp._ai_state["computed_at"]
+    clock.advance(60)
+    sp._maybe_fill_ai(threading.Event())
+    assert sp._ai_state["computed_at"] == computed
+
+
 # ── 端到端：合成市場 → 重算快照 → AI 計算 → /股票 卡片 ────────────────────────────
 @pytest.fixture
 def market(monkeypatch, tmp_path):

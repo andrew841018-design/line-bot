@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
@@ -167,6 +168,53 @@ def test_an_unreadable_private_terms_file_fails_closed_only_for_the_job(tmp_path
     with pytest.raises(fact_filters.NameSourceUnavailable):
         fact_filters.load_name_terms(require_names=True)
     assert "成員甲" in fact_filters.load_name_terms()
+
+
+# 2026-10-29（follow-up 5 第 4 項）：顯示名稱檔不在是正常的（還沒查過任何人）；在卻讀不到、
+# 解不開或不是 JSON 物件，就不能當成「沒有顯示名稱」。
+_BROKEN_DISPLAY_FILES = pytest.mark.parametrize(
+    "content", [b"{", b"[]", b"\xff"], ids=["cut_short", "a_list", "not_utf8"]
+)
+
+
+@_BROKEN_DISPLAY_FILES
+def test_a_display_name_file_that_cannot_be_read_fails_closed_only_for_the_job(tmp_path, monkeypatch, content):
+    path = tmp_path / "member_display_names.json"
+    monkeypatch.setenv("LINE_MEMBER_DISPLAY_NAMES_PATH", str(path))
+    assert "成員甲" in fact_filters.load_name_terms(require_names=True)  # 檔不在：照常
+    path.write_bytes(content)
+    with pytest.raises(fact_filters.NameSourceUnavailable):
+        fact_filters.load_name_terms(require_names=True)
+    with pytest.raises(fact_filters.NameSourceUnavailable):
+        fact_filters.reject_reason("住在台中", require_names=True)
+    # 即時抽取照常過濾，只是少擋顯示名稱
+    assert "成員甲" in fact_filters.load_name_terms()
+    assert fact_filters.reject_reason("跟成員乙同校") == "name"
+
+
+@_BROKEN_DISPLAY_FILES
+def test_the_writer_leaves_a_display_name_file_it_cannot_read_as_it_is(tmp_path, monkeypatch, caplog, content):
+    # 換成只有一個名字的檔，讀不到時的「不寫、不查」就變成悄悄少了其他人的名單
+    path = tmp_path / "state" / "member_display_names.json"
+    path.parent.mkdir()
+    path.write_bytes(content)
+    monkeypatch.setenv("LINE_MEMBER_DISPLAY_NAMES_PATH", str(path))
+    with caplog.at_level(logging.WARNING):
+        line_mentions.remember_display_name("U_NEW", "成員丁")
+        line_mentions.forget_display_name("U_OLD")
+    assert path.read_bytes() == content
+    assert list(path.parent.iterdir()) == [path]  # 也沒留下暫存檔
+    warnings = [r.getMessage() for r in caplog.records if r.name == "line_mentions"]
+    assert warnings  # 有記下來，但不帶 user id、名字、路徑和檔案內容
+    shown = content.decode("utf-8", "replace")
+    for text in warnings:
+        assert "U_NEW" not in text and "成員丁" not in text and str(tmp_path) not in text and shown not in text
+    with pytest.raises(fact_filters.NameSourceUnavailable):
+        fact_filters.load_name_terms(require_names=True)
+    # 檔修好（這裡是空的名單）以後照常記
+    path.write_text("{}", encoding="utf-8")
+    line_mentions.remember_display_name("U_NEW", "成員丁")
+    assert line_mentions.display_name_for_user_id("U_NEW") == "成員丁"
 
 
 def test_names_given_once_per_batch_are_used_as_is():

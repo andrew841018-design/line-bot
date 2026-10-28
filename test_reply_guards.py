@@ -1459,6 +1459,70 @@ def test_a_name_source_that_cannot_be_read_means_no_search(monkeypatch, tmp_path
     assert reply_guards.strip_nonanswer("只有爸爸知道。") == ""
 
 
+# 2026-10-29 (follow-up 5, item 1): 當事人 and 對方 name nobody in a question; 本人 often follows a
+# given name nobody configured, so it stays with the rest
+NOBODY_QUESTIONS = ("對方違規停車罰款多少", "當事人酒駕罰款是多少")
+
+
+def test_two_words_that_name_nobody_are_not_search_terms():
+    terms = reply_guards.search_deny_terms()
+    assert "當事人" not in terms and "對方" not in terms
+    for word in ("本人", "他本人", "她本人", "他自己", "她自己", "媽", "爸爸"):
+        assert word in terms, word
+    for question in NOBODY_QUESTIONS:
+        assert main._requires_regulation_research(question), question
+    assert not main._requires_regulation_research("林小禾本人入境酒類免稅額度是多少")
+    # the reply checks still read both as a person
+    assert {"當事人", "對方"} <= set(reply_guards.name_terms())
+
+
+def test_an_alias_display_name_or_turn_label_spelled_like_them_still_blocks(monkeypatch):
+    # they are left out of the kinship words only, so a name 對方 from any source still counts
+    question = NOBODY_QUESTIONS[0]
+    monkeypatch.setattr(line_mentions, "configured_family_aliases", lambda **_k: (*NAMES, "對方"))
+    assert "對方" in reply_guards.search_deny_terms()
+    assert not main._requires_regulation_research(question)
+    monkeypatch.setattr(line_mentions, "configured_family_aliases", lambda **_k: NAMES)
+    monkeypatch.setattr(line_mentions, "display_names", lambda: {"U_DISPLAY": "對方"})
+    assert "對方" in reply_guards.search_deny_terms()
+    assert not main._requires_regulation_research(question)
+    monkeypatch.setattr(line_mentions, "display_names", lambda: {})
+    context = [("user", "對方：今天去哪"), ("assistant", "好")]
+    assert "對方" in reply_guards.search_deny_terms(context)
+    assert not main._requires_regulation_research(question, context)
+    assert main._requires_regulation_research(question)                    # the control: nobody is 對方
+
+
+@pytest.mark.parametrize("content", [b"{", b"[]", b"\xff"], ids=["cut_short", "a_list", "not_utf8"])
+def test_a_display_name_file_that_cannot_be_read_means_no_search(monkeypatch, tmp_path, content):
+    # 2026-10-29 (follow-up 5, item 4): a missing file is normal (nobody was looked up yet); a
+    # file that is there but cannot be read is not "no display names"
+    question = "韓國入境酒類免稅額度是多少"
+    path = tmp_path / "member_display_names.json"
+    monkeypatch.setenv("LINE_MEMBER_DISPLAY_NAMES_PATH", str(path))
+    reply_guards.search_deny_terms()
+    assert main._requires_regulation_research(question)                    # the control: no file
+    path.write_bytes(content)
+    with pytest.raises(reply_guards.NameSourceUnavailable):
+        reply_guards.search_deny_terms()
+    assert not main._requires_regulation_research(question)
+    # the reply checks keep working without it
+    assert "小明" in reply_guards.name_terms()
+    assert reply_guards.strip_nonanswer("只有小明知道。") == ""
+    path.write_text("{}", encoding="utf-8")                                 # an empty list reads fine
+    assert main._requires_regulation_research(question)
+
+
+def test_display_names_that_fail_to_load_mean_no_search(monkeypatch):
+    def broken():
+        raise OSError("display names")
+
+    monkeypatch.setattr(line_mentions, "display_names", broken)
+    with pytest.raises(reply_guards.NameSourceUnavailable):
+        reply_guards.search_deny_terms()
+    assert "小明" in reply_guards.name_terms()                              # the reply side does without
+
+
 # ── B2: search snippets, people, stubs ───────────────────────────────────────
 
 SNIPPETS = "我查了相關報導和搜尋摘要，都未提及魏教授談論巴西的咖啡產業。"
