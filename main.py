@@ -21330,6 +21330,8 @@ def _handle_web_research_question(
     link_message = bool(link_urls or quoted_links) and not public_research.requires_current_research(words)
     # Links are read, never searched: nothing that was part of a shared URL
     # (its ?share= ids included), nor the quoted message, may reach the search provider.
+    # TODO(2026-10-28 deferred, review gp1 N5): names and @ still reach the crawler in
+    # this text; only _requires_regulation_research and _plain_question_names check them.
     search_text = public_research.search_query(reply_policy.strip_link_tokens(text))
     linked_material: list[str] = []
     real_link_content: list[bool] = []
