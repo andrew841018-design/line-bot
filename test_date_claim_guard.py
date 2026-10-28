@@ -417,6 +417,16 @@ _SHAPES = {
     "verdicts_then_question": lambda n: "大選已近2026年11月28日" + "不符現況" * (n // 4) + "？",
     "ranges": lambda n: "將於2026年10月1日至12月31日實施" * (n // 22),
     "breaks_only": lambda n: "，" * n + "下一次在2025年",
+    # round 10
+    "foreign_then_spaces": lambda n: "美國" + " " * n + "大選",
+    "hearsay_in_one_clause": lambda n: "網傳11月28日不是投票日" * (n // 12),
+    "rumours_told_after_the_date": lambda n: "11月28日不是投票日的傳聞" * (n // 13),
+    "presidential_dates_in_one_clause": lambda n: "總統大選在2025年1月11日" * (n // 16),
+    # round 11: hearsay in every clause, the rest of the sentence read once
+    "hearsay_before_every_date": lambda n: "有人說11月28日、" * (n // 9) + "不是投票日",
+    # round 12: one long clause after many dates; hearsay in every clause
+    "dates_then_one_long_clause": lambda n: "有人說11月28日、" * (n // 18) + "，" + "這" * (n // 2),
+    "hearsay_clauses": lambda n: "有人說11月28日不是投票日，" * (n // 15),
 }
 
 
@@ -631,3 +641,184 @@ def test_a_page_starting_something_on_a_day_did_not_move_it():
     assert _findings(
         "11月15日沒有營業。", user_text="11/15營業", material_text="11月15日起延長營業時間",
     ) == ["denied_date"]
+
+
+# ── 8. post-deployment review of 9b3e372 (hotfix) ────────────────────────────
+
+@pytest.mark.parametrize("reply, user, expected", [
+    # voting logistics about the listed day must go out
+    ("11月28日沒有投票通知單也可以投票喔，帶身分證和印章就好。", "", []),
+    ("11月28日沒有不在籍投票，記得提早買車票返鄉。", "", []),
+    ("11月28日不在國內就不能投票喔", "我11/28要去日本玩還能投票嗎", []),
+    ("11月28日不是用健保卡投票，要帶身分證喔。", "", []),
+    ("11月28日沒有投票權，要滿20歲才能投。", "", []),
+    ("投票通知單不是11月28日當天才發", "", []),
+    ("11月28日投票時蓋錯了也不能換票", "", []),
+    ("11月28日其實不用投票通知單", "", []),
+    # naming the presidential election to deny it
+    ("今年不是總統大選，是2026年11月28日的九合一地方選舉；下一次總統大選在2028年。", "", []),
+    ("這次投的不是總統大選，是2026年11月28日的縣市長和議員選舉。", "", []),
+    # incident phrasings
+    ("台灣的總統及立法委員選舉已經於2025年1月11日舉行完畢。", "", ["presidential_date"]),
+    ("上一次總統大選是在2025年1月11日。", "", ["presidential_date"]),
+    ("總統大選早在2025年1月11日就舉行了。", "", ["presidential_date"]),
+    ("需要澄清的是，11月28日並不是投票日。", "", ["denied_date"]),
+    ("11月28日並不是投票日，網路上說要投票是不實訊息。", "", ["denied_date"]),
+    ("聽說11月28日不是投票日，已經延到12月了。", "", ["denied_date"]),
+    # other countries' elections, and Taiwan's own names
+    ("南韓在2025年6月3日舉行總統大選，李在明當選。", "", []),
+    ("巴西總統大選在2026年10月4日舉行", "", []),
+    ("德國大選在2025年2月23日舉行。", "", []),
+    ("川普贏了總統大選，在2025年1月20日就職。", "", []),
+    ("五都大選在2010年11月27日舉行。", "", []),
+    ("11月29日不是投票日，投票日是11月28日，韓國瑜也會回高雄投票。", "11/29投票對吧", []),
+    ("台灣的總統大選在2024年1月14日，韓國瑜參選。", "", ["presidential_date"]),
+    ("11月29日不是投票日喔，投票日是11月28日（六）。", "我們11/29要去日本，11/29可以投票嗎", []),
+    # a date beside the election that is not the vote
+    ("總統大選於2023年11月24日截止登記", "", []),
+])
+def test_round_eight_cases(reply, user, expected):
+    assert sorted(_findings(reply, user_text=user)) == sorted(expected)
+
+
+@pytest.mark.parametrize("reply, user, expected", [
+    # real denials with words between the negation and the vote (review of fdcdb42)
+    ("2026年11月28日並非台灣的九合一投票日。", "", ["denied_date"]),
+    ("11月28日不是投開票日。", "", ["denied_date"]),
+    ("11月28日並非是投票日。", "", ["denied_date"]),
+    ("11月28日不是什麼投票日。", "", ["denied_date"]),
+    ("11月28日那天沒有要投票。", "", ["denied_date"]),
+    ("投票日應該不是11月28日。", "", ["denied_date"]),
+    ("11月28日投票的資訊有誤。", "", ["denied_date"]),
+    ("12月5日不是補助的截止日。", "國旅補助12/5截止對吧", ["denied_date"]),
+    # another country in an earlier clause does not hide Taiwan's wrong date
+    ("美國期中選舉在11月3日，但台灣的總統及立委選舉已於2025年1月11日舉行完畢。", "美國和台灣大選都近了",
+     ["presidential_date"]),
+    ("台灣的總統大選已於2025年1月11日舉行並公布結果。", "", ["presidential_date"]),
+    ("台灣總統大選剛在2025年1月11日舉行完畢。", "", ["presidential_date"]),
+    ("台灣的總統大選日期是2025年1月11日。", "", ["presidential_date"]),
+    # what the denial negates is the kind: an opening, not the vote
+    ("11月28日沒有開放不在籍投票，要回戶籍地投票喔。", "", []),
+    ("11月28日並未開放不在籍投票", "", []),
+    ("11月28日不是公投投票日。", "", []),
+    ("11月28日不是一般的選舉，一次要投好幾張票喔。", "", []),
+    # rumours refuted in other words; travelling is not another country's vote
+    ("網傳11月28日不是投票日，這不是真的，投票日就是11月28日。", "", []),
+    ("網路上說11月28日不是投票日，那是錯的。", "", []),
+    ("11月29日不是投票日喔，投票日是11月28日（六），人在日本沒辦法投票。", "我們11/29要去日本玩還能投票嗎", []),
+    ("美國的期中選舉不是在11月28日，而是11月3日。", "", []),
+])
+def test_round_nine_cases(reply, user, expected):
+    assert sorted(_findings(reply, user_text=user)) == sorted(expected)
+
+
+@pytest.mark.parametrize("reply, user, expected", [
+    # each date is judged by its own election, even with another country in the clause
+    ("美國總統大選在2024年11月5日、台灣總統大選在2025年1月11日都已舉行完畢。", "美國和台灣大選已近",
+     ["presidential_date"]),
+    # results come out that night; a notice is another day
+    ("台灣總統大選於2025年1月11日公布結果，賴清德當選。", "", ["presidential_date"]),
+    ("台灣總統大選於2024年1月13日公布結果，賴清德當選。", "", []),
+    ("總統大選於2023年11月14日公告候選人號次。", "", []),
+    # 選舉活動／期間, 投票時間／時程 are the schedule
+    ("11月28日並沒有選舉活動。", "投票日11月28日", ["denied_date"]),
+    ("11月28日並沒有選舉活動，也不用投票。", "投票日11月28日", ["denied_date"]),
+    ("11月28日並非台灣的選舉期間。", "投票日11月28日", ["denied_date"]),
+    ("11月28日並非投票時間。", "投票日11月28日", ["denied_date"]),
+    ("2026年11月28日並非台灣的投票時程。", "投票日11月28日", ["denied_date"]),
+    ("11月28日並沒有也不會舉行投票。", "投票日11月28日", ["denied_date"]),
+    ("11月28日沒有也不用投票。", "投票日11月28日", ["denied_date"]),
+    # a rumour told and refuted, also in the next sentence
+    ("網傳11月28日不是投票日。這是謠言，請大家照常投票。", "投票日11月28日", []),
+    ("網傳11月28日不是投票日，請大家不要相信，投票日就是11月28日。", "投票日11月28日", []),
+    ("有人說11月28日不是投票日，這是假消息，11月28日確實要投票。", "投票日11月28日", []),
+    ("謠言說11月28日不是投票日，這不正確。", "投票日11月28日", []),
+    ("關於11月28日不是投票日的傳聞，這是不實訊息。", "投票日11月28日", []),
+    ("有長輩群組在傳11月28日不是投票日，這是假訊息喔。", "聽說11/28不用投票了？", []),
+    ("這則訊息說11月28日不是投票日，是不實訊息。", "聽說11/28不用投票了？", []),
+    # ...but not a claim that it is the day, called a rumour, or a rumour confirmed
+    ("11月28日是投票日的說法是錯的。", "投票日11月28日", ["denied_date"]),
+    ("網傳11月28日不是投票日，這不是謠言，已經延期了。", "投票日11月28日", ["denied_date"]),
+])
+def test_round_ten_cases(reply, user, expected):
+    assert sorted(_findings(reply, user_text=user)) == sorted(expected)
+
+
+@pytest.mark.parametrize("reply, user, expected", [
+    # the next sentence refutes the rumour only when it opens with that
+    ("有人說11月28日不是投票日，已經延期了。另外要你提供身分證號碼的訊息不要相信。", "聽說11/28不用投票了？",
+     ["denied_date"]),
+    ("有人說11月28日不用投票了，因為選舉延期。網路上說要帶健保卡投票是假的。", "聽說11/28不用投票了？",
+     ["denied_date"]),
+    ("網傳11月28日不是投票日。這是真的，說照常投票的才是假消息。", "聽說11/28不用投票了？", ["denied_date"]),
+    # refutations in other words
+    ("很多人轉傳說11月28日不是投票日，這是錯誤訊息，投票日還是11月28日。", "聽說11/28不用投票了？", []),
+    ("網傳11月28日不是投票日，其實不是這樣，11月28日照常投票。", "聽說11/28不用投票了？", []),
+    ("網傳11月28日不是投票日，這是假新聞，請照常投票。", "聽說11/28不用投票了？", []),
+    ("網傳11月28日不是投票日，沒這回事，請照常去投票。", "聽說11/28不用投票了？", []),
+    ("關於11月28日不用投票的說法，是錯誤的。", "聽說11/28不用投票了？", ["denied_date"]),
+    # ...and negated ones refute nothing
+    ("網傳11月28日不是投票日，這不是什麼謠言，中選會已經宣布延期。", "聽說11/28不用投票了？", ["denied_date"]),
+    ("網傳11月28日不是投票日，這不算是謠言，已經改期了。", "聽說11/28不用投票了？", ["denied_date"]),
+    ("網傳11月28日不是投票日，這是沒錯的，投票延到12月了。", "聽說11/28不用投票了？", ["denied_date"]),
+    # 不必 still needs the schedule right after it; a change after 沒有／並未 can
+    # hide a move (「並未取消投票，只是改到12月5日舉行」), so it is dropped as before
+    ("11月28日並沒有也不必特別請假去投票，因為是星期六。", "投票日11月28日", []),
+    ("11月28日並沒有延長投票時間，下午4點準時截止。", "投票日11月28日", ["denied_date"]),
+    ("11月28日並沒有也不會停止投票，颱風天也一樣。", "投票日11月28日", ["denied_date"]),
+    ("11月28日並不在選舉期間內，投票已經延到12月5日。", "投票日11月28日", ["denied_date"]),
+    ("日本 的眾議院選舉不是11月28日。", "投票日11月28日", []),
+])
+def test_round_eleven_cases(reply, user, expected):
+    assert sorted(_findings(reply, user_text=user)) == sorted(expected)
+
+
+@pytest.mark.parametrize("reply, user, expected", [
+    # a change of the vote stands only after 沒有-type negations
+    ("11月28日不是延期後的投票日，真正的投票日是12月5日。", "投票日11月28日", ["denied_date"]),
+    ("11月28日不是變更後的投票日，請以12月5日為準。", "投票日11月28日", ["denied_date"]),
+    ("11月28日不是取消投票，而是延到12月5日。", "投票日11月28日", ["denied_date"]),
+    ("11月28日並沒有提前投票，投票日已經改到11月29日。", "投票日11月28日", ["denied_date"]),
+    ("11月28日沒有也不必去投票了，已經延期。", "投票日11月28日", ["denied_date"]),
+    ("香港議會11月28日沒有選舉，台灣這天也不用投票。", "投票日11月28日", ["denied_date"]),
+    # a refutation of something else, or one that introduces a new claim
+    ("有人說11月28日不是投票日，原本公告的日期是錯誤的，已改到12月5日。", "聽說11/28不用投票了？",
+     ["denied_date"]),
+    ("有人說11月28日不是投票日，以前的說法是錯誤的，現在改到12月5日。", "聽說11/28不用投票了？",
+     ["denied_date"]),
+    ("有人說11月28日不用投票了。澄清一下，投票已經延到12月5日。", "聽說11/28不用投票了？", ["denied_date"]),
+    ("有人說11月28日不是投票日。不實的說法很多，但這次是真的延期了。", "聽說11/28不用投票了？",
+     ["denied_date"]),
+    # refutations told in other ways
+    ("網傳11月28日不是投票日，這是沒根據的謠言，請照常投票。", "聽說11/28不用投票了？", []),
+    ("網傳11月28日不是投票日，這不是新的謠言了，請照常投票。", "聽說11/28不用投票了？", []),
+    ("網傳11月28日不是投票日，這是沒查證的假消息。", "聽說11/28不用投票了？", []),
+    ("網傳11月28日不是投票日。中選會已經出面澄清，投票日不變。", "聽說11/28不用投票了？", []),
+    ("網傳11月28日不是投票日。根據中選會公告，這是不實訊息。", "聽說11/28不用投票了？", []),
+    ("網傳11月28日不是投票日。請大家放心，這是假消息。", "聽說11/28不用投票了？", []),
+    ("網傳11月28日不是投票日，沒想到這種謠言也有人信，請照常投票。", "聽說11/28不用投票了？", []),
+])
+def test_round_twelve_cases(reply, user, expected):
+    assert sorted(_findings(reply, user_text=user)) == sorted(expected)
+
+
+@pytest.mark.parametrize("reply, user, expected", [
+    # a change after 沒有／並未 can hide a move of the day
+    ("11月28日並未取消投票，只是改到12月5日舉行。", "投票日11月28日", ["denied_date"]),
+    ("11月28日沒有延期投票，投票日是12月5日。", "投票日11月28日", ["denied_date"]),
+    ("11月28日並沒有延期投票，而是直接取消了。", "投票日11月28日", ["denied_date"]),
+    ("11月28日沒有停止投票，是整個選舉都取消了。", "投票日11月28日", ["denied_date"]),
+    # the same gap as before: a reason in between is not a denial
+    ("11月28日並沒有因為颱風而延後投票，請照常前往。", "投票日11月28日", []),
+    # refuted later in the sentence, or by the authority in the next one
+    ("網傳11月28日不是投票日，中選會表示投票日不變，請大家不要被不實訊息誤導。", "聽說11/28不用投票了？", []),
+    ("網傳11月28日不是投票日，我查了中選會的公告，投票日沒有改變，這則訊息是假的。", "聽說11/28不用投票了？",
+     []),
+    ("網傳11月28日不是投票日，但中選會已經澄清了。", "聽說11/28不用投票了？", []),
+    ("網傳11月28日不是投票日，不過官方已經出面否認。", "聽說11/28不用投票了？", []),
+    ("網傳11月28日不是投票日。中選會今天上午已經出面澄清，投票照常。", "聽說11/28不用投票了？", []),
+    ("網傳11月28日不是投票日，查證後確認是假消息，請照常投票。", "聽說11/28不用投票了？", []),
+    ("網傳11月28日不是投票日，中選會沒有否認，已經延期了。", "聽說11/28不用投票了？", ["denied_date"]),
+])
+def test_round_thirteen_cases(reply, user, expected):
+    assert sorted(_findings(reply, user_text=user)) == sorted(expected)

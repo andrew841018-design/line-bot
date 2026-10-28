@@ -77,6 +77,9 @@ def election_date_known(
     ``check_day`` is off (the US votes in a Taiwan presidential year, in November)."""
     if year >= NEXT_PRESIDENTIAL_YEAR:
         return None
+    # A bare 大選 before the combined local elections: the list does not cover it.
+    if local_too and year < LOCAL[0].year:
+        return None
     days = PRESIDENTIAL + (LOCAL if local_too else ())
     held = [d for d in days if d.year == year]
     if not held:
