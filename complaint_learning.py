@@ -79,6 +79,7 @@ COMPLAINT_MAX_CHARS = 300
 OTHER_MAX_CHARS = 200
 TOTAL_MAX_CHARS = 1800
 RULE_MAX_CHARS = 60
+TEXT_MAX_CHARS = 2000  # R4-1：text_rejection 超過就直接 check:too_long（只有離線的重篩會碰到）
 CORE_REASON_MAX_CHARS = 40
 EVIDENCE_MAX_CHARS = 80
 COPY_NGRAM = 10  # 規則與抱怨共用 ≥10 字片段＝照抄家人原話
@@ -275,11 +276,17 @@ def _speaker_key(group_id: str, user_id: str) -> str:
 
 
 def name_pattern(names) -> re.Pattern | None:
-    """名單→遮罩用的 regex。R3-4：字和字之間可以夾空白、看不見的字或分隔符（「測試成.員甲」「測試成 員甲」）。"""
-    terms = sorted({t for t in (_flat(str(n)) for n in (names or ()) if n) if len(t) >= 2}, key=len, reverse=True)
-    if not terms:
+    """名單→遮罩用的 regex（長的名字先比）。R3-4／R4-3：兩個中日韓字之間可以夾空白、看不見的字或分隔符
+    （「測試成.員甲」「測試成 員甲」），「、」除外；拉丁字母名字要整個字（見 _name_regex）。"""
+    patterns: dict[str, int] = {}
+    for name in names or ():
+        pattern = _name_regex(str(name))
+        if pattern:
+            patterns[pattern] = max(patterns.get(pattern, 0), len(_flat(str(name))))
+    if not patterns:
         return None
-    return re.compile("|".join(_NAME_GAP.join(map(re.escape, t)) for t in terms), re.IGNORECASE)
+    ordered = sorted(patterns, key=lambda p: -patterns[p])
+    return re.compile("|".join(ordered), re.IGNORECASE)
 
 
 def sanitize(text: str, name_re: re.Pattern | None, limit: int) -> str:
@@ -1152,9 +1159,11 @@ _AGENT_RE = re.compile(
 # 情境句只描述什麼情況（「當家人問遊戲規則時」要能過）。句型不對的文字（核心原因、舊規則）整段都算本文。
 _BODY_AGENT_RE = re.compile(r"規則|规则|系統|系统")
 # R3-8（GP1 第三輪 #2）：情境句裡對 AI 下指令的片語也擋（「當系統規則和這條衝突時」「當…不管其他規則時」「當…就放寬
-# 規則時」）；只擋這幾種，「遊戲規則」「系統更新」「最高溫」照過。
+# 規則時」「當這條比其他規則重要時」）。R4-5：只擋這幾種精準寫法——「遊戲規則」「系統更新」「最高溫」「手機系統設定」
+# 「這條新聞」「這條路」「放寬入境限制」「簽證的其他規定」照過。
 _CONTEXT_AGENT_RE = re.compile(
-    r"(?:其他|所有|系統|上面|前面|原本|既有|別的)的?(?:規則|規定|設定|限制)|這一?條|放寬|最高原則|最優先"
+    r"(?:不管|無視|蓋過|凌駕)[^，,。]{0,6}(?:規則|規定|設定|限制)|(?:規則|規定|設定)[^，,。]{0,6}(?:和|跟|與)這一?條|"
+    r"這一?條(?:規則)?(?:比|最|為|優先)|放寬(?:其他|所有|系統|上面的|前面的)?(?:規則|規定)|最高原則"
 )
 # 冒充提示詞的段落標題或輸出格式（F1）：fact_filters._META_RE 也擋事實裡的【】。
 _FORMAT_RE = re.compile(r"[【】\[\]<>{}]|(?i:json)|格式|輸出|输出")
@@ -1206,7 +1215,7 @@ _ASSERT_RE = re.compile(_ASSERT)
 # 說／講這類動詞），「不要怕用猜的」「不要懷疑颱風一定不會來」照擋；同一小句後面有「以外／之外／外」也不算否定
 # （R3-1：「不要用記憶外的資料確認」）。
 _NEG = r"(?:不要|別|不能|不可以|不可|勿|避免|不該|不應該)(?:再)?"
-_UNLESS_EXCEPT = rf"(?!{_CLAUSE}*(?:以外|之外|外))"
+_UNLESS_EXCEPT = rf"(?!{_CLAUSE}{{0,40}}(?:以外|之外|外))"  # R4-7：掃描長度有上限，避免長文字二次方回溯
 _NEGATED_GUESS_RE = re.compile(
     _NEG + rf"(?:(?:在|還)?沒{_CLAUSE}{{1,8}}?(?:之前|前|就|時)|只|光|單)?(?:{_GUESS}){_UNLESS_EXCEPT}"
 )
@@ -1229,14 +1238,14 @@ _CONTEXT_BENIGN_RE = re.compile(r"重複(?=(?:提|發)?問)|是不是(?:真的|�
 # 部分」）放行，「只回答被問的課程」「只回一個字」照擋；「加入」只放行「加入沒查到的…」（「不要加入對話」照擋）；
 # 「沒被問到的…」只放行「扯進／帶進／拉進」這種窄版。R2-4：「就可以了」「其他不提」「別的不要提」也擋。
 # R3-1：查證類的豁免只在同一小句沒有「被問／問的／問到」時才算（「只回答查到的被問內容」照擋），「不給別的」也擋。
-# R3-3：「沒有人問」「沒點到／沒叫到」整句都擋（含情境句）。
+# R3-3：「沒有人問」「沒點到／沒叫到」整句都擋（含情境句）；R4-6：「沒點到重點／要點／核心／關鍵」不算。
 _VERIFIED_FORM = r"(?:有)?(?:查到|查證過|確認過|看過|看完|找到)"
 _UNPROMPTED_RE = re.compile(
-    r"主動|插話|插嘴|搭話|多嘴|沒(?:有)?人問|沒(?:有)?(?:點|叫)到|沒被問(?!到?的[^，,。]{0,10}(?:扯|帶|拉)進)|"
+    r"主動|插話|插嘴|搭話|多嘴|沒(?:有)?人問|沒(?:有)?(?:點|叫)到(?!重點|要點|核心|關鍵)|沒被問(?!到?的[^，,。]{0,10}(?:扯|帶|拉)進)|"
     r"沒(?:有)?人(?:叫|點名)|沒問你|"
     r"沉默|加入(?!(?:沒|未|還沒)(?:有)?(?:查到|查證|確認|看過|看完|找到))|參與|被要求|減少|建議|"
-    rf"只(?=回|答)(?!(?:回(?:答|覆|應)?|答){_VERIFIED_FORM}(?!{_CLAUSE}*(?:被問|問的|問到)))|"
-    rf"(?:被問|問的|問到){_CLAUSE}*只(?=回|答)|不給(?:別的|其他|其它)|"
+    rf"只(?=回|答)(?!(?:回(?:答|覆|應)?|答){_VERIFIED_FORM}(?!{_CLAUSE}{{0,40}}(?:被問|問的|問到)))|"
+    rf"(?:被問|問的|問到){_CLAUSE}{{0,40}}只(?=回|答)|不給(?:別的|其他|其它)|"
     r"只(?:針對|談|聊)|只(?:講|說|根據)(?:被問|問題|問的)|(?:問題|被問|問的|問到)的?(?:範圍)?(?:以外|之外)|"
     r"(?:不要|別|不必|不用|少|不需要)(?:再)?(?:多|額外)?(?:補充|延伸)|"
     r"(?:不要|別|不必|不用|少|不需要)(?:再)?(?:多|額外)(?:給|說|講|聊|談|提供)|"
@@ -1275,15 +1284,21 @@ _DEFAULT_IGNORABLE_RE = re.compile(
     "\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufff8\U0001bca0-\U0001bca3\U0001d173-\U0001d17a"
     "\U000e0000-\U000e0fff]"
 )
-# R3-4：看得見的分隔符拆字（「忽.略」「媽、媽」「測試成.員甲」）：關鍵字與名字比對的副本也拿掉這些；名字遮罩允許
-# 字和字之間夾空白、看不見的字或這些分隔符。網址檢查（R3-2）用另一份保留「.」的副本，兩者不混用。
-_SPLIT_MARKS = r".\-_~·‧・/、"
-_SPLIT_MARKS_RE = re.compile(f"[{_SPLIT_MARKS}]")
-_NAME_GAP = rf"(?:\s|{_DEFAULT_IGNORABLE_RE.pattern}|[{_SPLIT_MARKS}])*"
+# R3-4／R4-2：看得見的分隔符拆字（「忽.略」「媽、媽」「測試成*員甲」）。分隔符＝Unicode 類別 P*、S*、Zs 與
+# Default_Ignorable，扣掉句型斷句用的「，,。！？；」（NFKC 後的半形也算）。關鍵字與名字比對的副本（_flat）整組拿掉；
+# 名字遮罩（_NAME_GAP）用同一組，只再扣掉「、」——R4-3 要「大小、明天見」不被當成「小明」，而「、」在規則檢查裡照樣
+# 拿掉（「媽、媽」照擋）。_NAME_GAP 用 regex 寫：非 \w、非空白控制字元的字（標點、符號，另含少見的組合記號），加上
+# Zs 空白與 Default_Ignorable。網址檢查（R3-2）用另一份保留「.」的副本，兩者不混用。
+_CLAUSE_MARKS = frozenset("，,。！？!?；;")
+_NAME_GAP = (
+    r"(?:[^\w\s，,。！？!?；;、\x00-\x1f\x7f-\x9f]|_|[\u0020\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]|"
+    + _DEFAULT_IGNORABLE_RE.pattern
+    + r")*"
+)
 # R3-2：網址插空白（「evil . com」）或寫成「點com」：在拿掉空白、保留「.」的副本上，用限定頂級網域的寫法再找一次；
 # 「OK. Sure」「A. B. C」「e.g.」「Mr. Smith」「No. 1」不算網址。
-_SPACED_URL_RE = re.compile(
-    r"(?i:(?<![a-z0-9-])[a-z0-9-]+(?:\.[a-z0-9-]+)*\."
+_SPACED_URL_RE = re.compile(  # R4-7：第二個 lookbehind 讓比對只從一串網域的開頭試，長串「a.a.a.」不會二次方
+    r"(?i:(?<![a-z0-9-])(?<![a-z0-9-]\.)[a-z0-9-]+(?:\.[a-z0-9-]+)*\."
     r"(?:com|net|org|tw|io|co|me|info|app|dev|xyz|cc|tv|ly|gl|be|jp|cn|hk|uk)(?![a-z0-9])"
     r"|點(?:com|net|org|tw)(?![a-z0-9]))"
 )
@@ -1318,9 +1333,55 @@ def _squeeze(text: str) -> str:
     return "".join(_DEFAULT_IGNORABLE_RE.sub("", str(text or "")).split())
 
 
+def _is_split_mark(ch: str) -> bool:
+    """分隔符（R4-2）：Unicode 類別 P*、S*、Zs 或 Default_Ignorable，但句型斷句用的「，,。！？；」不算。"""
+    if ch in _CLAUSE_MARKS:
+        return False
+    category = unicodedata.category(ch)
+    return category[0] in "PS" or category == "Zs" or _DEFAULT_IGNORABLE_RE.match(ch) is not None
+
+
+def _drop_marks(text: str) -> str:
+    return "".join(ch for ch in text if not _is_split_mark(ch))
+
+
 def _flat(text: str) -> str:
-    """關鍵字、名字比對用的副本（R2-10、R3-4）：_squeeze 之後再拿掉看得見的分隔符。網址檢查不要用這份（會拿掉「.」）。"""
-    return _SPLIT_MARKS_RE.sub("", _squeeze(text))
+    """關鍵字、名字比對用的副本（R2-10、R3-4、R4-2）：_squeeze 之後再拿掉分隔符。網址檢查不要用這份（會拿掉「.」）。"""
+    return _drop_marks(_squeeze(text))
+
+
+def _is_cjk(ch: str) -> bool:
+    """中日韓字：漢字（含擴充與相容區）、假名、韓文音節。"""
+    code = ord(ch)
+    return (
+        0x3400 <= code <= 0x4DBF or 0x4E00 <= code <= 0x9FFF or 0xF900 <= code <= 0xFAFF
+        or 0x20000 <= code <= 0x3FFFF or 0x3040 <= code <= 0x30FF or 0xAC00 <= code <= 0xD7AF
+    )
+
+
+def _name_regex(term: str) -> str:
+    """一個名字的遮罩 regex（R3-4、R4-2、R4-3）：只在兩個中日韓字之間（或名單本身就有空白、分隔符的地方）允許夾
+    分隔符；拉丁字母開頭／結尾的名字前後不能緊接拉丁字母（名單有 "ed" 時 "barked" 不遮）。"""
+    chars: list[str] = []
+    breaks: set[int] = set()
+    for ch in str(term or ""):
+        if ch.isspace() or _is_split_mark(ch):
+            if chars:
+                breaks.add(len(chars))
+            continue
+        chars.append(ch)
+    if len(chars) < 2:
+        return ""
+    parts = [re.escape(chars[0])]
+    for i in range(1, len(chars)):
+        gap = i in breaks or (_is_cjk(chars[i - 1]) and _is_cjk(chars[i]))
+        parts.append((_NAME_GAP if gap else "") + re.escape(chars[i]))
+    pattern = "".join(parts)
+    if "a" <= chars[0].lower() <= "z":
+        pattern = r"(?<![a-z])" + pattern
+    if "a" <= chars[-1].lower() <= "z":
+        pattern += r"(?![a-z])"
+    return pattern
 
 
 def _split_rule(text: str) -> tuple[str, str]:
@@ -1371,9 +1432,11 @@ def text_rejection(text: str, *, names, behaviour: bool = True) -> str:
 
     raw = str(text or "")
     norm = _clean(raw)
+    if len(norm) > TEXT_MAX_CHARS:  # R4-1：長文字直接不收（fail closed），後面的 regex 不跑
+        return "check:too_long"
     visible = _DEFAULT_IGNORABLE_RE.sub("", norm)  # 網址、聯絡資料：保留空白（「OK. Sure」拿掉空白會像網址）
     dotted = _squeeze(norm)  # R3-2：拿掉空白、保留「.」，只給限定頂級網域的網址檢查
-    flat = _SPLIT_MARKS_RE.sub("", dotted)  # R3-4：關鍵字與名字再拿掉分隔符；網址不看這份
+    flat = _drop_marks(dotted)  # R3-4／R4-2：關鍵字與名字再拿掉分隔符；網址不看這份
     if (
         fact_filters.LINK_RE.search(norm) or fact_filters.LINK_RE.search(visible)
         or _SPACED_URL_RE.search(dotted)
@@ -1393,7 +1456,7 @@ def text_rejection(text: str, *, names, behaviour: bool = True) -> str:
     context, body = _split_rule(flat)
     if _AGENT_RE.search(flat) or _BODY_AGENT_RE.search(body) or _CONTEXT_AGENT_RE.search(context):
         return "check:agent_directed"
-    if _FORMAT_RE.search(flat):
+    if _FORMAT_RE.search(dotted) or _FORMAT_RE.search(flat):  # 括號本身是分隔符，要看保留標點的那份
         return "check:format"
     if not behaviour:
         return ""
@@ -1406,7 +1469,11 @@ def text_rejection(text: str, *, names, behaviour: bool = True) -> str:
         return "check:disclosure"
     if _ASSERT_RE.search(_NEGATED_ASSERT_RE.sub("。", scoped)):
         return "check:asserts_fact"
-    if _UNPROMPTED_RE.search(scoped) or _BODY_UNPROMPTED_RE.search(body):
+    dotted_context, dotted_body = _split_rule(dotted)  # 「被@時才回」的 @ 是分隔符，也看保留標點的那份
+    if (
+        _UNPROMPTED_RE.search(scoped) or _BODY_UNPROMPTED_RE.search(body)
+        or _UNPROMPTED_RE.search(_CONTEXT_BENIGN_RE.sub("。", dotted_context) + dotted_body)
+    ):
         return "check:unprompted"
     if _BODY_PRIORITY_RE.search(body):
         return "check:agent_directed"
@@ -1514,7 +1581,7 @@ def similar_to_retired(rule: str, retired: str, *, category: str = "", retired_c
     (context, body), (old_context, old_body) = _parts(rule), _parts(retired)
     body_key = normalize_rule(body)
     if body_key and body_key == normalize_rule(old_body):
-        if len(body_key) >= TOMBSTONE_NGRAM:
+        if len(_alnum(body)) >= TOMBSTONE_NGRAM:  # R4-4：長度看字本身，不看 normalize key（引號會多出 |values=…）
             return True
         ratio = difflib.SequenceMatcher(None, _alnum(context), _alnum(old_context)).ratio()
         if ratio >= TOMBSTONE_CONTEXT_RATIO:
