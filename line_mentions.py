@@ -395,9 +395,69 @@ def text_with_plain_mentions(
     return f"{prefix}\n{body}" if prefix else body
 
 
+# ── textV2 safety (2026-10-24, B6.5) ─────────────────────────────────────────────────────────
+# In a textV2 message every `{` and `}` of the text is a placeholder delimiter: a literal brace in the
+# body (a reply that quotes JSON, a `{x}` in a pasted sentence) has to be written `{{` / `}}` or LINE
+# answers HTTP 400 for the whole reply.  LINE also counts text length in UTF-16 code units (an emoji
+# is 2), not in Python characters.
+_ESCAPED_BRACE_RE = re.compile(r"\{\{|\}\}")
+
+
+def utf16_len(value: str) -> int:
+    """Length LINE counts for a text: UTF-16 code units."""
+    text = str(value or "")
+    return len(text) + sum(1 for ch in text if ord(ch) > 0xFFFF)
+
+
+def clip_utf16(value: str, limit: int) -> str:
+    """The longest prefix of ``value`` that fits ``limit`` UTF-16 code units (never half a character)."""
+    text = str(value or "")
+    if limit <= 0:
+        return ""
+    if len(text) * 2 <= limit:
+        return text
+    used = 0
+    for index, ch in enumerate(text):
+        used += 2 if ord(ch) > 0xFFFF else 1
+        if used > limit:
+            return text[:index]
+    return text
+
+
+def escape_text_v2(value: str) -> str:
+    """Literal braces of a textV2 body: `{` -> `{{`, `}` -> `}}`."""
+    return str(value or "").replace("{", "{{").replace("}", "}}")
+
+
+def unescape_text_v2(value: str) -> str:
+    """The reverse of `escape_text_v2` for a stored/archived template (`{p1}` placeholders stay)."""
+    return _ESCAPED_BRACE_RE.sub(lambda match: match.group(0)[0], str(value or ""))
+
+
+def _escape_and_clip(body: str, budget: int) -> str:
+    """Escape ``body`` and keep as many whole characters as fit ``budget`` UTF-16 units.  The clip is
+    made on the escaped text and one character at a time, so it never splits a `{{` / `}}` pair."""
+    out: list[str] = []
+    used = 0
+    for ch in str(body or ""):
+        piece = "{{" if ch == "{" else "}}" if ch == "}" else ch
+        width = len(piece) + (1 if ord(ch) > 0xFFFF else 0)
+        if used + width > budget:
+            break
+        out.append(piece)
+        used += width
+    return "".join(out)
+
+
 def text_v2_dict(
-    body: str, targets: list[MentionTarget], plain_labels: list[str] | None = None
+    body: str,
+    targets: list[MentionTarget],
+    plain_labels: list[str] | None = None,
+    *,
+    limit: int | None = None,
 ) -> dict:
+    """The textV2 payload.  ``body`` is escaped (see above); with ``limit`` the whole template text
+    (the `{p1} ...` prefix plus the escaped body) is clipped to ``limit`` UTF-16 units *after* escaping."""
     substitution: dict[str, dict] = {}
     for target in targets:
         if target.kind == "all":
@@ -410,9 +470,15 @@ def text_v2_dict(
             "type": "mention",
             "mentionee": mentionee,
         }
+    labels = None if plain_labels is None else [escape_text_v2(label) for label in plain_labels]
+    if limit is None:
+        escaped = escape_text_v2(body)
+    else:
+        head = text_with_template_mentions("", targets, labels)
+        escaped = _escape_and_clip(body, max(0, int(limit) - utf16_len(head)))
     return {
         "type": "textV2",
-        "text": text_with_template_mentions(body, targets, plain_labels),
+        "text": text_with_template_mentions(escaped, targets, labels),
         "substitution": substitution,
     }
 

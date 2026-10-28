@@ -3,8 +3,10 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from datetime import datetime
+import logging
 import re
 import threading
+import unicodedata
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
@@ -108,6 +110,73 @@ def _public_affairs_clause(value: str) -> str:
     return ""
 
 
+# 2026-10-24 (B1.4): a question about the number in a public regulation (an
+# allowance, a tax rate, a fine, a visa's days) is looked up even without
+# 「今年／現在」, because a reply that states such a number without a source is
+# deleted (reply_guards, B1).  Only public-regulation domains count — 「公司規定」
+# and 「信用卡額度」 do not.
+_REGULATION_DOMAIN = re.compile(
+    r"海關|入境|出境|通關|報關|檢疫|免稅|關稅|稅率|稅額|所得稅|綜所稅|營業稅|房屋稅|地價稅|牌照稅|燃料稅|"
+    r"遺產稅|贈與稅|健保|勞保|勞退|國民年金|簽證|免簽|護照|罰款|罰鍰|罰單|交通規則|基本工資|最低工資|"
+    r"駕照|考照|強制險|違規|特休|加班費|資遣費|退休金"
+)
+# 「免稅額度」 alone asks nothing; 「免稅額度是…」「有多少」「幾天」 do.
+_REGULATION_QUANTITY_ASK = re.compile(
+    r"多少|幾(?!乎)|多久|最多|最少|(?:上限|下限|額度|限額|稅率|費率)(?:是|為|有)"
+)
+
+
+def _regulation_clauses(value: str) -> list[str]:
+    parts = [part.strip() for part in re.split(f"[{_CLAUSE_MARKS}]", value) if part.strip()]
+    return [part for part in parts if _REGULATION_DOMAIN.search(part)]
+
+
+def _fold(text: str) -> str:
+    return unicodedata.normalize("NFKC", text or "").casefold()
+
+
+def regulation_clause(text: str, family_names=()) -> str:
+    """What to search for an addressed question about a regulation's number; ``""`` if it is not one.
+
+    The message must pass the privacy check (`public_query`), name a public-regulation
+    domain and ask for a quantity.  A family alias or kinship word (the caller passes
+    the names, or a function that returns them), an @name or a first-person word
+    anywhere in it means no search:
+    a name must never reach the search provider.  Names are compared NFKC and
+    casefolded (「ＡＭＹ」 and 「amy」 are 「Amy」).  The list of names failing to load, or
+    being empty, means no search at all (2026-10-28: nobody can say whom the question
+    names).  Only the clauses that carry the domain word are returned (v3 #4).
+
+    Residual: a given name nobody configured, inside the domain clause itself, is
+    not recognised and goes out as written.
+    """
+    value = public_query(text)
+    if not value or "@" in value or "＠" in value:
+        return ""
+    clauses = _regulation_clauses(value)
+    if not clauses or not _REGULATION_QUANTITY_ASK.search(value):
+        return ""
+    # ``family_names`` may be a function: the names are read only for a real candidate
+    try:
+        names = family_names() if callable(family_names) else family_names
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "regulation research skipped: name source unavailable error_type=%s", type(exc).__name__
+        )
+        return ""
+    terms = [t for t in (_fold(n) for n in (names or ()) if isinstance(n, str)) if t]
+    if not terms:
+        return ""
+    folded = _fold(value)
+    if any(term in folded for term in terms):
+        return ""
+    return "，".join(clauses)
+
+
+def requires_regulation_research(text: str, family_names=()) -> bool:
+    return bool(regulation_clause(text, family_names))
+
+
 def search_query(text: str) -> str:
     """What a search engine may receive for ``text``.
 
@@ -125,7 +194,8 @@ def search_query(text: str) -> str:
         return value if len(claim) == len(parts) else "，".join(claim)
     clause = _public_affairs_clause(value)
     if not clause:
-        return value
+        # 2026-10-24: a message about a public regulation sends its domain clause only
+        return "，".join(_regulation_clauses(value)) or value
     return " ".join(dict.fromkeys(m.group(0) for m in _PUBLIC_TERMS.finditer(clause)))
 
 

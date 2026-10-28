@@ -260,7 +260,8 @@ def main() -> int:
 
         return finance_view_validator.run()
 
-    # 財經觀點 validator 照跑：main.py 的財經觀點查詢會用到驗證結果。
+    # 財經觀點 validator 照跑（2026-10-24 起維持原樣，資料表與驗證紀錄不動）。main.py 的財經觀點
+    # 查詢已停用（/觀點 只回固定的停用說明），沒有查詢在用驗證結果；留著是為了保留既有紀錄。
     # 「本週家族財經觀點」段落已由 Andrew 於 2026-10-04 取消，不再推播。
     _start_worker("finance", finance_validation)
 

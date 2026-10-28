@@ -400,7 +400,9 @@ def test_detail_bubble_stock_and_pool_note():
     assert texts[0] == "股票評估：廣達 2382"
     assert texts[1] == "✅ 符合 4 條（共 5 條）" and texts[2] == "收盤 300 元（10/08）"  # 分數不重複寫
     assert "⬜ 有人在買：外資和投信近 10 個交易日合計賣超 2,000 張" in texts
-    assert sp.TEXT_POOL_NOTE in texts and not any("沒列進" in t for t in texts)
+    # 2026-10-24（計畫 C）：推薦區改成 AI 相關股，原句「推薦卡只從上市市值前 50 大挑」會變成錯的，單檔卡頁尾跟著改；
+    # 關掉 AI 推薦（LINE_BOT_STOCK_PICKS_AI=0）時舊推薦卡還在，頁尾回到舊句。
+    assert sp.TEXT_AI_POOL_NOTE in texts and sp.TEXT_POOL_NOTE not in texts and not any("沒列進" in t for t in texts)
     assert "依據：證交所、Yahoo｜資料到 10/08" in texts
     picked = sp.detail_bubble(PICK, market=None)
     assert "大盤：資料不足" in _card_texts(picked)
@@ -436,7 +438,7 @@ def test_otc_cards_name_the_right_source():
         texts = _card_texts(bubble)
         assert "依據：櫃買中心、Yahoo｜資料到 10/08" in texts
         assert f"營收、本益比、法人：{words}，不適用" in texts
-        assert sp.TEXT_POOL_NOTE not in texts
+        assert sp.TEXT_POOL_NOTE not in texts and sp.TEXT_AI_POOL_NOTE not in texts
     assert _card_texts(sp.detail_bubble(otc_etf, market=None))[1] == "⏸️ 長期偏弱（在年線之下）"
 
 

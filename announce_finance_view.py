@@ -1,46 +1,23 @@
-"""家族財經觀點追蹤器上線通知 — 一次性 ad-hoc 推播。"""
+"""家族財經觀點追蹤器上線通知（已停用，不再推播）。
+
+這支腳本原本是一次性 ad-hoc 推播，宣傳 /觀點 和每週日的觀點回顧。2026-10-24 財經觀點
+拿掉了（/觀點 只回一句固定句，選單沒有按鈕，週報也早就不推），所以再跑這支腳本只會把
+一則過時、而且指向已停用指令的訊息送進家人群組。
+
+檔案保留只是為了讓舊的引用不會變成死路徑；沒有排程在叫它（launchd、n8n、jobs 都沒有）。
+現在 main() 什麼都不送，也不讀 .env、不連 LINE。
+"""
 
 from __future__ import annotations
 
-import os
 import sys
-from pathlib import Path
 
-from dotenv import load_dotenv
-
-load_dotenv(Path(__file__).parent / ".env")
-sys.path.insert(0, str(Path(__file__).parent))
-
-from line_push_client import LinePushError, line_access_token, push_text  # noqa: E402
-
-GROUP_ID = os.environ.get("LINE_ALLOWED_GROUP_ID") or os.environ.get(
-    "ALLOWED_GROUP_ID", ""
-)
-
-MSG = """📈 家族財經觀點追蹤器上線
-
-從現在起，咪寶會自動記錄大家在群裡聊到的具體標的 + 方向（例「0050 會漲到 180」「Fed 不會升息」），到期後比對 yfinance 驗證對錯。
-
-查詢指令：
-• /觀點 — 看全家最近觀點
-• /觀點 媽媽 — 看特定家人觀點
-• /觀點 0050 — 看特定標的觀點
-
-每週日 20:00 會推一份「家族財經觀點回顧」，統計命中 / 落空 / 待驗。"""
+RETIRED_NOTICE = "announce_finance_view 已停用（2026-10-24 財經觀點拿掉）：沒有推播任何訊息。"
 
 
 def main() -> int:
-    token = line_access_token()
-    if not token or not GROUP_ID:
-        print("ERR: env not set")
-        return 1
-    try:
-        push_text(GROUP_ID, MSG[:5000], timeout=10, fallback_token=token)
-    except LinePushError as e:
-        print(f"{e.status_code or 'ERR'} {e.response_text[:300]}")
-        return 1
-    print("200 OK")
-    return 0
+    print(RETIRED_NOTICE)
+    return 1
 
 
 if __name__ == "__main__":

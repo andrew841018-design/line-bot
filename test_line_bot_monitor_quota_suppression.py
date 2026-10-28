@@ -40,6 +40,10 @@ def _stub_healthy_environment(monkeypatch, monitor, state=None):
     monkeypatch.setattr(monitor, "webhook_endpoint_check", lambda: (True, ""))
     monkeypatch.setattr(monitor, "sqlite_integrity_check", lambda: (True, ""))
     monkeypatch.setattr(monitor, "count_callback_500_non_local", lambda: (0, [], 0))
+    # 2026-10-28: the Claude CLI check reads the real uvicorn log.
+    monkeypatch.setattr(
+        monitor, "claude_cli_outcomes", lambda *_a, **_k: ({}, {}, None), raising=False
+    )
     monkeypatch.setattr(
         monitor,
         "count_recent_activity",

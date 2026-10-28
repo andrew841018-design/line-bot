@@ -1365,14 +1365,9 @@ _TRANSIENT_OPEN_ERROR_RE = re.compile(r"unable to open database file|disk i/o er
 _COMPLETE_BATCH = 500
 
 
-def mark_inbound_events_completed_no_reply(
-    group_id: str, message_ids: list[str]
-) -> int:
-    """Durably close intentionally silent inbound events.
-
-    This is distinct from ``replied``: it prevents redelivery/reply-gap false
-    positives without claiming that LINE accepted an outbound message.
-    """
+def _complete_no_reply(group_id: str, message_ids: list[str], where_status: str) -> int:
+    """The shared UPDATE of the two ``completed_no_reply`` helpers below.  ``where_status`` is one
+    of their two fixed conditions, never caller input."""
     ids = list(
         dict.fromkeys(str(message_id) for message_id in message_ids if message_id)
     )
@@ -1387,7 +1382,7 @@ def mark_inbound_events_completed_no_reply(
                     batch = ids[start:start + _COMPLETE_BATCH]
                     c.execute(
                         "UPDATE inbound_events SET status = 'completed_no_reply', updated_at = ? "
-                        "WHERE group_id = ? AND status != 'replied' "
+                        f"WHERE group_id = ? AND {where_status} "
                         f"AND message_id IN ({','.join('?' * len(batch))})",
                         [now, group_id, *batch],
                     )
@@ -1399,6 +1394,32 @@ def mark_inbound_events_completed_no_reply(
                 raise
             _time.sleep(0.2)
     return 0
+
+
+def mark_inbound_events_completed_no_reply(
+    group_id: str, message_ids: list[str]
+) -> int:
+    """Durably close intentionally silent inbound events.
+
+    This is distinct from ``replied``: it prevents redelivery/reply-gap false
+    positives without claiming that LINE accepted an outbound message.
+    """
+    return _complete_no_reply(group_id, message_ids, "status != 'replied'")
+
+
+def mark_active_inbound_events_completed_no_reply(
+    group_id: str, message_ids: list[str]
+) -> int:
+    """The exit drain's close (2026-10-28, review R2 GP2 #1): only events that are still being
+    handled -- ``processing`` / ``media_processing`` -- become ``completed_no_reply``.
+
+    One conditional UPDATE, so a row that has moved on in the meantime is left exactly as it is:
+    ``reply_sending`` (a reply is on its way, or may have been delivered: batch 1's send fence;
+    overwriting it would record a delivered reply as "no reply" and let a late run of the same
+    event send unfenced), ``replied`` and ``completed_no_reply``.  Returns the number of rows that
+    changed; the caller writes its memory turn only when that is not zero.
+    """
+    return _complete_no_reply(group_id, message_ids, "status IN ('processing', 'media_processing')")
 
 
 def get_inbound_event_status(group_id: str, message_id: str) -> str | None:
@@ -5983,6 +6004,39 @@ def delete_sent_reminder_confirmations(
             )
             deleted += int(cur.rowcount)
     return deleted
+
+
+def give_up_reminder_confirmations(
+    group_id: str,
+    claims: list[tuple[int, str]],
+) -> int:
+    """An acknowledgement LINE keeps refusing is not tried again (2026-10-28, review R2 GP1 #6).
+
+    The claimed row becomes ``failed``: ``claim_reminder_confirmations`` only ever picks up
+    ``pending`` rows (and hands ``sending`` ones back after their claim lapses), so nothing claims
+    it again.  The row itself stays, so ``enqueue_reminder_confirmation`` (INSERT OR IGNORE on
+    ``(group_id, source_ref)``) still sees it and does not queue the same acknowledgement a second
+    time.  Only a row still claimed with this claim token changes.
+    """
+    normalized = [
+        (int(confirmation_id), str(claim_token))
+        for confirmation_id, claim_token in claims
+        if int(confirmation_id) > 0 and str(claim_token)
+    ]
+    if not group_id or not normalized:
+        return 0
+    changed = 0
+    with _lock, _conn() as c:
+        for confirmation_id, claim_token in normalized:
+            cur = c.execute(
+                "UPDATE reminder_confirmation_outbox "
+                "SET status='failed', claim_token='' "
+                "WHERE group_id=? AND status='sending' "
+                "AND confirmation_id=? AND claim_token=?",
+                (group_id, confirmation_id, claim_token),
+            )
+            changed += int(cur.rowcount)
+    return changed
 
 
 # ── Pending reminder extract（quota 爆時入隊、恢復後補抽，2026-05-30 加）──────────

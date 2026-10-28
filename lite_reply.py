@@ -36,6 +36,7 @@ from urllib.parse import quote_plus  # noqa: F401  (used by handlers)
 
 import requests
 
+import reply_guards
 import stock_quote
 from video_reply import VIDEO_COMMENTARY_CONTRACT_NO_SEARCH, is_video_context
 from quote_context import has_quote_context
@@ -705,6 +706,8 @@ def _try_url_summary(text: str) -> str | None:
 
 def _try_stock(text: str, context: list | None = None) -> str | None:
     """股票 ticker / 中文股名 → yfinance 即時。"""
+    # 2026-10-24 (B8.2): pre-read link material (a video's title and description) names no stock
+    text = reply_guards.user_typed_text(text)
     taiex_technical = stock_quote.get_taiex_month_line_text(text)
     if taiex_technical:
         return f"{taiex_technical}\n\n（來源：公開報價/日線）"

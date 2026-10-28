@@ -197,7 +197,12 @@ def test_reply_failure_log_names_the_refused_property_and_nothing_private(line, 
         },
     )
 
-    assert main._reply(TOKEN, "合成回覆內容", group_id=GROUP_ID, include_auxiliary=False) is False
+    # (batch 2, B6.3: a refused text reply is sent again once as plain text and, where a push is
+    # allowed, pushed; a reply-only flow ends False after the plain-text resend is refused too.)
+    assert (
+        main._reply(TOKEN, "合成回覆內容", group_id=GROUP_ID, include_auxiliary=False, allow_push_fallback=False)
+        is False
+    )
 
     (record,) = [r for r in caplog.records if r.getMessage().startswith("reply failed:")]
     message = record.getMessage()
