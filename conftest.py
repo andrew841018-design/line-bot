@@ -496,6 +496,9 @@ def isolate_stock_picks(monkeypatch, tmp_path_factory):
     except Exception:  # stock_picks 自己壞了：只讓它的測試失敗，不連帶整套測試在 setup 就失敗
         return
 
+    monkeypatch.delenv("LINE_BOT_STOCK_PICKS_AI", raising=False)
+    monkeypatch.setattr(stock_picks, "AI_ENABLED", True, raising=False)
+    monkeypatch.setattr(stock_picks, "_AI_BACKGROUND_ENABLED", False, raising=False)
     monkeypatch.setattr(stock_picks, "_BACKGROUND_ENABLED", False, raising=False)
     if not hasattr(stock_picks, "WorkerState"):  # 緊急停用版（stock_picks_disabled.py）沒有這些
         return
@@ -508,6 +511,15 @@ def isolate_stock_picks(monkeypatch, tmp_path_factory):
     monkeypatch.setattr(stock_picks, "_snapshot", None)
     monkeypatch.setattr(stock_picks, "_worker", stock_picks.WorkerState())
     monkeypatch.setattr(stock_picks, "_loaded", True)
+    # AI 段的記憶體狀態每個測試都從全新的開始（dict 每次新建，測試之間不共用；2026-10-24 計畫 C）。
+    for name, fresh in (
+        ("_ai_state", None), ("_ai_next_try", 0.0), ("_ai_cache_t", None), ("_ai_chart_cache", {}),
+        ("_ai_holdings", None), ("_ai_fetch_budget", {}), ("_ai_hole_first", {}), ("_ai_fail_tries", {}),
+        ("_ai_skip_check", {"n": 0, "next": 0.0}), ("_yahoo_blocked_until", 0.0),
+    ):
+        monkeypatch.setattr(stock_picks, name, fresh, raising=False)
+    # 狀態檢查會讀 .env 裡的 LINE_BOT_STOCK_PICKS_AI：測試一律指到不存在的檔，不讀真的 .env。
+    monkeypatch.setattr(stock_picks, "ENV_FILE", tmp_path_factory.mktemp("stock_picks_env") / ".env", raising=False)
     stock_picks.clear_caches()
 
 

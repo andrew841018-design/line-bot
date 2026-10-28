@@ -10,8 +10,16 @@ Andrew 2026-10-09／10-10：「股票部分要新增建議買哪一檔＆建議�
 - 有在成長：最新一個月營收年增 > 0，而且 1 月到那個月的累計年增 > 0。
 - 不算貴：本益比 ≤ 同產業上市公司本益比中位數（至少 5 家）。
 - 有人在買：外資＋投信近 10 個交易日（含資料日）合計買超（10 天要齊）。
-燈號只描述狀態，不寫買、賣、等、停損。推薦只從上市市值前 50 大挑，走勢兩條都要成立、
-總共至少 4 條，最多 3 檔。ETF、上櫃只看走勢，不進推薦。
+燈號只描述狀態，不寫買、賣、等、停損。單檔查詢與常問股用這五條；舊推薦（上市市值前 50 大、走勢兩條都要成立、
+總共至少 4 條）照樣每天算、存進快照當影子紀錄，不再顯示。ETF、上櫃只看走勢，不進推薦。
+
+2026-10-24 起 /股票 的推薦區改成「AI 相關股推薦」（Andrew：「股票推薦，請推，股價相對便宜，成長潛力高，與AI掛勾的
+公司」「取代現在的推薦」）：名單＝00952 凱基台灣AI50 每天公布的持股＋程式裡每檔附公開來源的核心名單
+（stock_picks_ai_core.json，每年 5、11 月檢查），再過「目前上市普通股」資格；AI 相關、營收成長（月增 > 0 且累計 ≥ 15.0%）、
+本益比不高於同產業中位數（≥ 5.0 倍）、走勢（年線之上、比季線高不超過 10.0%）四條都成立才推，最多 3 檔，一樣用卡片上
+顯示的精度判斷。名單解析與核心名單載入在葉節點模組 stock_picks_ai_source.py（缺檔時只有 AI 段失敗，/股票 照常）。
+`LINE_BOT_STOCK_PICKS_AI=0`（模組載入時讀，改了要重啟）退回舊推薦卡、AI 段完全不跑；Yahoo 日曆抽查與主流程／AI 段共用的
+429 冷卻也一起關掉（行為回到 2eb85e1）。單檔查詢任何時候都不看、也不設這個共用冷卻。
 
 資料：證交所 OpenAPI（STOCK_DAY_ALL、BWIBBU_ALL、t187ap03_L、t187ap05_L）、證交所 T86
 （外資、投信買賣超）、櫃買中心 OpenAPI（上櫃每日收盤）、Yahoo 日線（2 年；加權指數 ^TWII 當
@@ -20,13 +28,15 @@ Andrew 2026-10-09／10-10：「股票部分要新增建議買哪一檔＆建議�
 （https、不轉址、限大小、驗 Content-Type）。
 
 不 import main 或 fcn_eval（停用 FCN 不能連帶弄壞 /股票）。卡片上只有固定句型、程式算的數字、
-官方名稱與代號，沒有使用者原文。
+官方名稱與代號，沒有使用者原文；AI 相關股推薦卡的名單來源只有「凱基台灣AI50 持股」或程式內固定清單的核心分類
+（網頁與核心檔裡的其他文字都不上卡片）。
 """
 
 from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import logging
 import math
@@ -616,7 +626,7 @@ def detail_bubble(facts: Facts, *, market: Optional[Market]) -> dict:
         _text(_source_line(facts.data_date, facts.market), size="sm", color="#555555"),
     ]
     if facts.kind == STOCK:
-        footer.append(_text(TEXT_POOL_NOTE, size="sm", color="#555555"))
+        footer.append(_text(TEXT_AI_POOL_NOTE if AI_ENABLED else TEXT_POOL_NOTE, size="sm", color="#555555"))
     footer.append(_text(TEXT_DISCLAIMER, size="sm", color="#555555"))
     return _bubble(f"股票評估：{_label(facts)}", None, body, footer)
 
@@ -1077,6 +1087,31 @@ def window_closes(
     return year, quarter
 
 
+def _window_unavailable_reason(
+    bars: dict[date, float], calendar: Sequence[date], t: date, close: float, prev_reference: Optional[float]
+) -> str:
+    """只供 ⚪ 診斷，不參與窗口計算或改變 window_closes 的回傳。"""
+    days = [d for d in calendar if d <= t][-YEAR_BARS:]
+    if len(days) < YEAR_BARS or not days or days[-1] != t:
+        return "calendar_short"
+    if not math.isfinite(close) or close <= 0:
+        return "close_invalid"
+    before = [d for d in bars if d < t]
+    if not before or max(before) != days[-2]:
+        return "previous_day_missing"
+    if t in bars and abs(bars[t] / close - 1.0) > SPLICE_T_GAP:
+        return "close_mismatch"
+    if prev_reference is not None and prev_reference > 0 and abs(prev_reference / bars[days[-2]] - 1.0) > SPLICE_PREV_GAP:
+        return "previous_close_mismatch"
+    year = [bars[d] for d in days[:-1] if d in bars] + [close]
+    quarter = [bars[d] for d in days[-QUARTER_BARS:-1] if d in bars] + [close]
+    if len(year) < YEAR_BARS - MAX_MISSING_YEAR or len(quarter) < QUARTER_BARS - MAX_MISSING_QUARTER:
+        return "bars_short"
+    if any(abs(b / a - 1.0) > SPLICE_JUMP for a, b in zip(year, year[1:])):
+        return "price_jump"
+    return "unknown"
+
+
 # ── 查詢：代號、官方簡稱、別名 ──────────────────────────────────────────────
 # 官方簡稱以外的常用叫法（官方簡稱都從證交所資料來，不用手抄；「-KY」可以不打）。
 _ALIASES = {"台積": "2330", "台達": "2308", "中華電信": "2412", "日月光": "3711"}
@@ -1321,11 +1356,17 @@ def _fetch_chart(
     hosts: Sequence[str] = _YAHOO,
     timeout: float = YAHOO_TIMEOUT_S,
     stop: Optional[threading.Event] = None,
+    shared_block: bool = True,
 ) -> Optional[dict]:
-    """Yahoo 日線 2 年；代號不在白名單、兩個主機都失敗回 None；429 往上丟（整輪中止）。"""
+    """Yahoo 日線 2 年；代號不在白名單、兩個主機都失敗回 None；429 往上丟（整輪中止）。
+
+    shared_block：主流程與 AI 段共用的 429 冷卻（先看有沒有在冷卻、撞到 429 就設）。單檔查詢（_lookup）傳 False：
+    它和 2eb85e1 一樣不看也不設這個冷卻（AI 段的封鎖不能讓爸媽查不到單檔，單檔的 429 也不該讓背景多等）。"""
     if not _YAHOO_SYMBOL_RE.fullmatch(symbol):
         return None
     for host in hosts:
+        if shared_block and _yahoo_blocked():  # 共用冷卻中（含 AI 段撞到的 429 與重啟前主流程的）：不送請求
+            raise FetchError("cooldown")
         try:
             status, data, _ = _get_json(
                 host,
@@ -1337,6 +1378,8 @@ def _fetch_chart(
                 stop=stop,
             )
         except FetchError as exc:
+            if exc.kind == "rate_limited" and shared_block:
+                _block_yahoo()
             if exc.kind in ("rate_limited", "stopped"):
                 raise
             logger.info("stock picks yahoo fetch failed host=%s kind=%s", host, exc.kind)
@@ -1619,11 +1662,22 @@ class WorkerState:
     writer: str = ""  # 最後寫這個檔的程序（合併時分得出是不是別的程序的冷卻）
     # 正在等哪個資料源（「還沒出來」的種類，2026-10-17）；不是失敗，成功、304、追上、真的失敗時清掉。
     last_wait: str = ""
+    # 主流程撞到 Yahoo 429 的冷卻結束時間（真實時間，2026-10-28 計畫 C）。None＝舊程式寫的檔（沒有這個欄位）。
+    # AI 段的 429 只放記憶體，不寫這裡（AI 失敗不改主 worker）。
+    yahoo_blocked_until: Optional[float] = None
 
 
 def _lenient_wait(value) -> str:
     """讀檔時的 last_wait：格式不對就當沒有，絕不丟例外（丟了整個檔案會被當壞檔，T86 請求帳就歸零）。"""
     return value[:40] if isinstance(value, str) and value.isprintable() else ""
+
+
+def _lenient_until(value, limit: float) -> Optional[float]:
+    """讀檔時的 yahoo_blocked_until：不是有限的非負數字就當沒有（絕不丟例外，理由同上）；
+    比現在晚太多的夾回 limit，不然合併取最大值後會一直黏住。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        return None
+    return min(float(value), limit)
 
 
 def worker_state_to_json(w: WorkerState) -> dict:
@@ -1641,6 +1695,7 @@ def worker_state_to_json(w: WorkerState) -> dict:
         "t86_requests": w.t86_requests,
         "writer": w.writer,
         "last_wait": w.last_wait,
+        "yahoo_blocked_until": w.yahoo_blocked_until,
     }
 
 
@@ -1675,6 +1730,7 @@ def worker_state_from_json(obj) -> WorkerState:
         t86_requests=[min(x, now) for x in (_v_num(x, 0.0, 1e11) for x in requests_raw)],  # 夾回、不丟（帳不能變少）
         writer=_v_str(obj.get("writer") or "", 64, allow_empty=True),
         last_wait=_lenient_wait(obj.get("last_wait")),
+        yahoo_blocked_until=_lenient_until(obj.get("yahoo_blocked_until"), now + BLOCKED_BACKOFF_S + _CLOCK_SKEW_S),
     )
 
 
@@ -1780,11 +1836,42 @@ _thread: Optional[threading.Thread] = None
 _stop: Optional[threading.Event] = None
 _wake: Optional[threading.Event] = None
 _BACKGROUND_ENABLED = True  # conftest 會關掉（測試不能起真的背景工作）
+_yahoo_blocked_until = 0.0  # 真實時間；主流程與 AI 段共用，重啟時也看持久化的工作狀態
+_yahoo_block_lock = threading.Lock()  # 只保護上面這個數字，不和別的鎖或網路請求同時持有（回覆也會走到 429 的路徑）
+
+
+def _yahoo_block_end() -> float:
+    """共用冷卻結束的時間（真實時間）。來源：記憶體（這個程序撞到的 429，含 AI 段）、worker 檔的
+    yahoo_blocked_until（主流程的 429，重啟後還在）。舊程式寫的檔沒有這個欄位（None）：只有「最後失敗是 429、
+    而且現在不是在等資料源」時才用 next_try 推——等資料源（not_yet）也會把 next_try 往後推，不是 429 的冷卻。"""
+    w = _worker
+    end = max(_yahoo_blocked_until, w.yahoo_blocked_until or 0.0)
+    if w.yahoo_blocked_until is None and w.last_fail == "yahoo_rate_limited" and not w.last_wait:
+        end = max(end, w.next_try or 0.0)
+    return end
+
+
+def _yahoo_blocked(now: Optional[float] = None) -> bool:
+    """共用冷卻中嗎。LINE_BOT_STOCK_PICKS_AI=0 時一律否（回到 2eb85e1：沒有共用冷卻）。"""
+    if not AI_ENABLED:
+        return False
+    now = time.time() if now is None else now
+    return _yahoo_block_end() > now
+
+
+def _block_yahoo() -> None:
+    """任何 Yahoo 429（主流程、AI 段）都先封鎖共用入口；AI 失敗不改主 worker 的失敗次數。單檔查詢不呼叫這個。"""
+    global _yahoo_blocked_until
+    if not AI_ENABLED:
+        return
+    until = time.time() + BLOCKED_BACKOFF_S
+    with _yahoo_block_lock:  # 不拿 _lock：單檔查詢的回覆撞到 429 時不能被背景拿著 _lock 等檔案鎖卡住
+        _yahoo_blocked_until = max(_yahoo_blocked_until, until)
 
 
 def _ensure_loaded() -> None:
     """第一次用到時才讀狀態檔。讀過就不再拿鎖：背景拿著鎖等檔案鎖時，回覆不能被卡住。"""
-    global _snapshot, _worker, _loaded
+    global _snapshot, _worker, _loaded, _ai_state, _ai_next_try, _ai_holdings, _ai_fetch_budget
     if _loaded:
         return
     with _lock:
@@ -1792,6 +1879,11 @@ def _ensure_loaded() -> None:
             return
         _snapshot = load_snapshot_file()
         _worker = load_worker_file()
+        _ai_state = load_ai_file() if AI_ENABLED else None
+        if _ai_state:
+            _ai_next_try = _ai_state["last_try"] + AI_RETRY_S if _ai_state["fail_count"] else 0.0
+            _ai_holdings = _ai_state.get("holdings")
+            _ai_fetch_budget = dict(_ai_state.get("fetch_budget", {}))
         if _worker.last_fail == "state_corrupt":
             _save_worker()  # 壞檔順手修好（退避一起存）；不然到期後又讀到壞檔、再退避一次
         _sweep_stale_tmp()
@@ -1836,6 +1928,8 @@ def _merge_worker_from_disk() -> bool:  # 回 True＝磁碟上的檔壞了
     if disk.writer and disk.writer != _WRITER_ID:
         if disk.next_try is not None and disk.next_try > now:
             _worker.next_try = max(_worker.next_try or 0.0, disk.next_try)
+        if disk.yahoo_blocked_until is not None and disk.yahoo_blocked_until > now:
+            _worker.yahoo_blocked_until = max(_worker.yahoo_blocked_until or 0.0, disk.yahoo_blocked_until)
         if disk.last_ok_check is not None:
             _worker.last_ok_check = max(_worker.last_ok_check or 0.0, disk.last_ok_check)
         if disk.seen_t is not None and (_worker.seen_t is None or disk.seen_t > _worker.seen_t):
@@ -1916,12 +2010,12 @@ def _history_tail(path: Path) -> tuple[Optional[str], bool]:
     return None, ends_with_newline
 
 
-def _append_history(snapshot: Snapshot) -> None:
+def _append_history(snapshot: Optional[Snapshot], *, name: str = HISTORY_NAME, record: Optional[dict] = None) -> None:
     """一個交易日一行：T、大盤、推薦的代號／名稱／收盤／分數／季線乖離（沒有推薦也記一行）。
     日期只往前：最後一行的 T 已經 ≥ 這個 T 就不寫（重啟、同 T 重寫快照、別的程序先寫了）；
     寫不進去只記錯誤種類。"""
-    path = STATE_DIR / HISTORY_NAME
-    record = {
+    path = STATE_DIR / name
+    record = record if record is not None else {
         "t": snapshot.t.isoformat(),
         "market": None if snapshot.market is None else snapshot.market.level,
         "picks": [
@@ -2069,7 +2163,9 @@ def _fetch_charts(symbols: Sequence[str], stop: threading.Event, give_up: float)
         worker.join(timeout=max(0.0, give_up - time.monotonic()) + 1.0)
     with guard:
         if errors:
-            raise RoundFailed(f"yahoo_{errors[0]}", blocked=errors[0] == "rate_limited")
+            # 同一批其他執行緒可能先看見冷卻；真正的 429 仍按原本的 20 分鐘退避。旗標關掉時沒有冷卻，照 2eb85e1 取第一個。
+            kind = "rate_limited" if AI_ENABLED and "rate_limited" in errors else errors[0]
+            raise RoundFailed(f"yahoo_{kind}", blocked=kind == "rate_limited", not_yet=kind == "cooldown")
         return dict(results)
 
 
@@ -2136,6 +2232,37 @@ def _twse_t_close(bars: dict[date, float], t: date, stop: threading.Event, give_
     return close
 
 
+def _calendar_canary(twii: dict, calendar: Sequence[date], t: date, stop: threading.Event) -> dict:
+    """抽查 2330 的日線：T 前最後一根要和日曆的前一個交易日一致（Yahoo 內部日線不一致時，窗口會悄悄少一根）。
+    抽查沒做成（抓不到、429、冷卻、停止）或日曆有洞都是「還沒出來」（not_yet），不算主流程失敗；成功回 2330 的日線，
+    主池抓取直接重用。"""
+    try:
+        canary = _fetch_chart("2330.TW", stop=stop)
+    except FetchError as exc:
+        if exc.kind == "stopped":
+            raise RoundFailed("stopped") from None
+        if exc.kind == "rate_limited":
+            _block_yahoo()
+        logger.info("stock picks calendar canary reason=%s", exc.kind)
+        raise RoundFailed(
+            f"canary_{exc.kind}", not_yet=True,
+            retry_s=BLOCKED_BACKOFF_S if exc.kind == "rate_limited" else None,
+        ) from None
+    if canary is None:
+        logger.info("stock picks calendar canary reason=unavailable")
+        raise RoundFailed("canary_unavailable", not_yet=True)
+    before = [d for d in parse_chart(canary) if d < t]
+    canary_prev = max(before) if before else None
+    logger.info(
+        "stock picks calendar canary index_last=%s expected_prev=%s canary_prev=%s result=%s",
+        max(parse_chart(twii), default=None), calendar[-2], canary_prev,
+        "ok" if canary_prev == calendar[-2] else "calendar_hole",
+    )
+    if canary_prev != calendar[-2]:
+        raise RoundFailed("calendar_hole", not_yet=True)
+    return canary
+
+
 def refresh(t: date, day_rows: dict[str, DayRow], stop: threading.Event, *, now: Optional[float] = None) -> Snapshot:
     """用資料日 T 整輪重算；任何來源不齊、超過整輪期限就丟 RoundFailed（保留舊快照）。"""
     give_up = time.monotonic() + REFRESH_BUDGET_S
@@ -2146,11 +2273,15 @@ def refresh(t: date, day_rows: dict[str, DayRow], stop: threading.Event, *, now:
         if time.monotonic() > give_up:
             raise RoundFailed(f"budget_{stage}", retry_s=retry_s)
 
+    if _yahoo_blocked():
+        raise RoundFailed("yahoo_cooldown", not_yet=True)
     # 1) 交易日曆＝加權指數日線（先截到 ≤ T，最後一根必須是 T）
     try:
         twii = _fetch_chart("^TWII", stop=stop)
     except FetchError as exc:
-        raise RoundFailed(f"yahoo_{exc.kind}", blocked=exc.kind == "rate_limited") from None
+        raise RoundFailed(
+            f"yahoo_{exc.kind}", blocked=exc.kind == "rate_limited", not_yet=exc.kind == "cooldown"
+        ) from None
     if twii is None:
         raise RoundFailed("twii_unavailable")  # 兩個主機都失敗：真的錯誤，不是「還沒出來」
     twii_bars = {d: v for d, v in parse_chart(twii).items() if d <= t}
@@ -2168,6 +2299,11 @@ def refresh(t: date, day_rows: dict[str, DayRow], stop: threading.Event, *, now:
         calendar.append(t)
     if len(calendar) < YEAR_BARS:
         raise RoundFailed("twii_short")
+    # Yahoo 內部抽查：只比 T 前最後一根，不加抓 FMTQIK，也不改窗口的接法。LINE_BOT_STOCK_PICKS_AI=0 時整段不做（回到 2eb85e1）。
+    canary = None
+    if AI_ENABLED:
+        check_budget("canary")
+        canary = _calendar_canary(twii, calendar, t, stop)
     # 2) 證交所批次
     try:
         check_budget("batch")
@@ -2213,7 +2349,9 @@ def refresh(t: date, day_rows: dict[str, DayRow], stop: threading.Event, *, now:
     caps = dict(ranked[:TOP_N])
     pool_codes = list(dict.fromkeys(universe + [c for c in FAQ_CODES if c in day_rows]))
     check_budget("yahoo")
-    charts = _fetch_charts([_symbol(c, TWSE) for c in pool_codes], stop, give_up)
+    charts = _fetch_charts([_symbol(c, TWSE) for c in pool_codes if canary is None or c != "2330"], stop, give_up)
+    if canary is not None:
+        charts["2330.TW"] = canary  # 抽查與主池共用同一份，不重抓
     check_budget("yahoo")
     medians = industry_medians(companies, pe)
     listed: dict[str, ListedRow] = {}
@@ -2243,8 +2381,14 @@ def refresh(t: date, day_rows: dict[str, DayRow], stop: threading.Event, *, now:
             continue
         bars = parse_chart(charts.get(_symbol(code, TWSE)))
         windows = window_closes(bars, calendar, t, row.close, _prev_reference(row.close, row.change))
+        if windows is None:
+            logger.info(
+                "stock picks gray code=%s reason=%s", code,
+                _window_unavailable_reason(bars, calendar, t, row.close, _prev_reference(row.close, row.change)),
+            )
         pool[code] = _facts_for(code, row, t, windows, medians, cap=caps.get(code))
     gray = sum(1 for code in universe if pool.get(code) is None or pool[code].trend is None)
+    logger.info("stock picks gray count=%d total=%d", gray, len(universe))
     if gray > TOP_N * MAX_GRAY_RATIO:
         # TODO(2026-10-17 延後)：這類後段的真錯誤每 20 分鐘重試一次，每次會重抓約 51 檔 Yahoo 日線。
         raise RoundFailed("too_many_gray")
@@ -2313,6 +2457,8 @@ _MAX_BACKOFF_S = max(
     *BACKOFF_S, BLOCKED_BACKOFF_S, NOT_YET_RETRY_S, T86_RETRY_S, TWSE_BLOCKED_RETRY_S, STATE_CORRUPT_BACKOFF_S
 )
 _CLOCK_SKEW_S = 600  # 允許的時鐘誤差（工作狀態裡比現在晚超過這麼多的時間一律夾回）
+_YAHOO_429_KINDS = ("yahoo_rate_limited", "canary_rate_limited")  # 主流程自己撞到 429 的失敗／等待種類
+_YAHOO_COOLDOWN_KINDS = ("yahoo_cooldown", "canary_cooldown")  # 別人（AI 段、前一輪）設的共用冷卻還沒過：只等，不算失敗
 # TODO(2026-10-17 延後)：月初（約 12 天／年）仍要等 Yahoo，08:40 左右可能短暫顯示沒更新；量過再決定要不要放寬。
 NEW_DATE_GRACE_S = 3 * 3600
 CHECK_STALE_S = 36 * 3600
@@ -2334,6 +2480,9 @@ def _fail(kind: str, *, blocked: bool = False, not_yet: bool = False, retry_s: O
     retry_s = _valid_retry(retry_s)
     now = time.time()
     with _lock:
+        if AI_ENABLED and kind in _YAHOO_429_KINDS:  # 主流程自己撞到 429：冷卻結束時間跟著 worker 存（重啟後還在）
+            _block_yahoo()
+            _worker.yahoo_blocked_until = max(_worker.yahoo_blocked_until or 0.0, _yahoo_blocked_until)
         if not_yet:
             delay = retry_s or NOT_YET_RETRY_S
             _worker.last_wait = kind[:40]
@@ -2351,6 +2500,8 @@ def _fail(kind: str, *, blocked: bool = False, not_yet: bool = False, retry_s: O
                 _worker.first_round_failed = True
         delay = min(float(delay), float(_MAX_BACKOFF_S))
         _worker.next_try = max(now + delay, _worker.next_try or 0.0)
+        if AI_ENABLED and kind in _YAHOO_429_KINDS + _YAHOO_COOLDOWN_KINDS:  # 等共用冷卻的，不早於冷卻結束
+            _worker.next_try = max(_worker.next_try, _yahoo_block_end())
         _save_worker()  # 存檔時會併進別的程序更晚的期限：回傳的等待以存完的為準
         delay = max(0.0, (_worker.next_try or now) - now)
         count = _worker.fail_count
@@ -2449,16 +2600,32 @@ def _run(stop: threading.Event, wake: threading.Event) -> None:
     wake.clear()  # 啟動期間的叫醒已經由第一輪處理，不要第一輪一結束又多跑一輪
     if _snapshot is not None:
         _append_history(_snapshot)  # 部署時放進去的快照（上線那天）也記一行；同一個 T 不重複
+    if AI_ENABLED and _ai_state:
+        _append_ai_history(_ai_state)
+    main_due = 0.0  # 主流程下次該跑的時間（monotonic，和 wake.wait 的計時同一種時鐘，睡眠或調時間不會影響）；0＝馬上
     while not stop.is_set():
-        try:
-            delay = _tick(stop)
-        except Exception as exc:  # 最外層接住，不讓執行緒無聲停掉；記成失敗並退避（叫醒也要等）
-            logger.error("stock picks tick crashed error_type=%s", type(exc).__name__)
+        if time.monotonic() >= main_due:  # 到期（或被叫醒）才跑 _tick；只是 AI 的 20 分鐘計時器醒來時，只跑 AI 段（不多打證交所）
             try:
-                delay = _fail(f"crash_{type(exc).__name__}"[:40])
-            except Exception:
-                delay = float(BACKOFF_S[-1])
-        wake.wait(max(MIN_WAIT_S, delay))
+                delay = _tick(stop)
+            except Exception as exc:  # 最外層接住，不讓執行緒無聲停掉；記成失敗並退避（叫醒也要等）
+                logger.error("stock picks tick crashed error_type=%s", type(exc).__name__)
+                try:
+                    delay = _fail(f"crash_{type(exc).__name__}"[:40])
+                except Exception:
+                    delay = float(BACKOFF_S[-1])
+            main_due = time.monotonic() + delay
+        else:
+            delay = main_due - time.monotonic()
+        try:  # AI 段的例外只記 AI 自己的失敗與節流，不進 _fail、不動主 worker 的失敗次數與退避
+            _maybe_fill_ai(stop)
+        except Exception as exc:
+            logger.warning("stock picks ai reason=round_failed error_type=%s", type(exc).__name__)
+            with contextlib.suppress(Exception):  # 記失敗本身也不能讓背景執行緒停掉
+                _ai_failure()
+        if AI_ENABLED and _AI_BACKGROUND_ENABLED and _ai_next_try > time.time():
+            delay = min(delay, _ai_next_try - time.time())
+        if wake.wait(max(MIN_WAIT_S, delay)):  # 被叫醒（有人要結果、要停）：主流程也馬上跑一輪
+            main_due = 0.0
         wake.clear()
 
 
@@ -2540,7 +2707,645 @@ def status_summary(now: Optional[float] = None) -> dict:
         info["status"] = "not_updated"
     else:
         info["status"] = "ok"
+    info.update(_ai_status_fields(_ai_state if _loaded else load_ai_file()))
     return info
+
+
+# ── AI 相關股推薦（獨立規則，不改單檔與常問股的五條件） ──────────────────────
+# Andrew 2026-10-23／24：推薦區改成「AI 相關＋便宜＋成長」（外加走勢）：名單＝00952 凱基台灣AI50 每天公布的
+# 持股＋程式裡每檔附公開來源的核心名單（stock_picks_ai_core.json，每年 5、11 月檢查）；卡片與說明一律寫
+# 「AI 相關股推薦」（爸媽可能以為是 AI 模型挑的）。計畫與審查在 ops/state/line_bot_fixes_20261023/PLAN_C。
+# 鎖的規則：不巢狀 _state_file_lock；拿著 _lock 或檔案鎖時不做任何網路請求；回覆（handle）只讀記憶體。
+AI_ENV = "LINE_BOT_STOCK_PICKS_AI"
+_AI_OFF = frozenset({"0", "false", "no", "off"})  # 和 card_pages._OFF 同一組（測試釘住）
+
+
+def _ai_flag(value: Optional[str]) -> bool:
+    """沒設＝開；0／false／no／off＝關（退回舊推薦卡，AI 段完全不跑）。"""
+    return (value if value is not None else "1").strip().lower() not in _AI_OFF
+
+
+AI_ENABLED = _ai_flag(os.environ.get(AI_ENV))  # 載入模組時讀，改了要重啟
+AI_RULE = "ai_v1"
+AI_NAME = "stock_picks_tw_ai.json"  # stock_picks_tw 前綴：暫存檔清理與每日維護的 glob 都涵蓋
+AI_HISTORY_NAME = "stock_picks_tw_ai_history.jsonl"
+AI_RETRY_S = 1200.0  # 沒算完或失敗：AI 自己 20 分鐘後再試（不動主 worker 的退避）
+AI_BUDGET_S = 60.0  # 一輪 AI 最多花的時間（含抓名單）
+AI_FETCH_CAP = 20  # 一輪最多抓幾檔日線
+AI_NEGATIVE_TTL_S = 900.0  # 日線有洞：這段時間內不重抓
+AI_HOLE_GIVE_UP_S = 3 * 3600.0  # 同一檔、同一個 T 的日線一直有洞（前一天那根 Yahoo 還沒補）：從第一次發現算起 3 小時（真實時間）才當作不合格
+AI_FAIL_MAX_TRIES = 3  # 同一檔、同一個 T 回不出日線（例如 404）：Yahoo 當輪有在回資料時，累計 3 次就當作不合格
+AI_SKIP_RECHECK_S = 3600.0  # 因為「資料拿不到」被跳過的候選：同一個 T 每小時再看一次
+AI_SKIP_RECHECK_MAX = 6  # 每個 T 最多重看幾次；其中一檔算得出來了就重算一次
+ENV_FILE = Path(__file__).resolve().parent / ".env"  # main.py 載入的同一個檔；狀態檢查另開的程序沒載入它，所以只為這個旗標另外讀
+AI_FETCH_PER_DAY = 3  # 00952 一天最多抓幾次
+AI_FETCH_RETRY_S = 7200.0  # 抓名單失敗後多久再試
+AI_HOLDINGS_MAX_AGE_DAYS = 45  # 抓不到新的時，沿用上一份持股的期限
+AI_STALE_DAYS = 7  # 上一份推薦最多顯示幾個日曆日（Andrew 10/24：「照樣顯示上一份」）
+TEXT_AI_POOL_NOTE = "推薦卡從 AI 相關股挑，條件和這張卡不同"
+_AI_BACKGROUND_ENABLED = True  # conftest 會關掉（測試不能讓 _run 順手去抓名單）
+_ai_state: Optional[dict] = None  # 記憶體裡驗證過的 AI 狀態；回覆只讀這個
+_ai_next_try = 0.0  # AI 自己的節流（真實時間）；失敗後 20 分鐘
+_ai_cache_t: Optional[date] = None  # 日線快取是哪個 T 的
+_ai_chart_cache: dict = {}  # 代號 → ("ok", 窗口) | ("no", 原因) | ("hole", 到期的 monotonic)
+_ai_hole_first: dict = {}  # 代號 → 這個 T 第一次發現日線有洞的真實時間（超過 AI_HOLE_GIVE_UP_S 就放棄）
+_ai_fail_tries: dict = {}  # 代號 → 這個 T 回不出日線、而且當輪 Yahoo 有在回資料的累計次數
+_ai_skip_check: dict = {"n": 0, "next": 0.0}  # 跳過的候選這個 T 已重看幾次、下次最早什麼時候（真實時間）
+_ai_holdings: Optional[dict] = None  # {"codes", "as_of", "fetched_day"}：最近一份驗證過的 00952 持股
+_ai_fetch_budget: dict = {}  # {"day", "attempts", "next_try"}：今天抓 00952 的帳
+
+_AI_OK, _AI_NO, _AI_HOLE, _AI_FAIL, _AI_LIMIT = "ok", "no", "hole", "fail", "limit"
+# 日線有洞（前一天那根不見）可能只是 Yahoo 還沒補，先當未知；其他算不出窗口的原因（根數不夠、相鄰兩根跳超過
+# 25%、官方收盤對不上）這個 T 不會自己好，直接算不合格。
+_AI_HOLE_REASONS = frozenset({"previous_day_missing", "unknown"})
+# 「資料拿不到」而不是「條件不符」的放棄原因：記進 AI 狀態的 skipped，同一個 T 之後還會重看。
+_AI_SKIP_REASONS = _AI_HOLE_REASONS | {"chart_unavailable"}
+
+
+def ai_checks_of(facts: Facts, ai_source: str = "00952") -> list[Check]:
+    """四條件用顯示精度判斷；來源只能是已驗證的 ETF 標記或核心分類。"""
+    rev, pe, med, tr = facts.revenue, facts.pe, facts.pe_median, facts.trend
+    growth = rev is not None and _num(rev.yoy) is not None and _num(rev.cum_yoy) is not None
+    growth_text = "營收資料不足"
+    if growth:
+        growth_text = f"{rev.month} 月營收比去年同期{_more_less(_tenths(rev.yoy))}"
+        if rev.month >= 2:  # 1 月的累計就是單月，不重複寫
+            growth_text += f"，1–{rev.month} 月累計{_more_less(_tenths(rev.cum_yoy))}"
+    cheap = _num(pe) is not None and pe > 0 and _num(med) is not None and med > 0
+    cheap_text = (f"本益比 {_fmt_tenths(_tenths(pe))} 倍，同產業中位數 {_fmt_tenths(_tenths(med))} 倍"
+                  if cheap else "本益比或同產業資料不足")
+    trend_text = (f"在年線之{'上' if tr.above_year else '下'}，比季線{'高' if tr.p60 >= 0 else '低'} "
+                  f"{_fmt_tenths(tr.p60)}%" if tr else "日線資料不足")
+    return [Check("ai", bool(ai_source) and facts.kind == STOCK and facts.market == TWSE, "AI 相關"),
+            Check(GROWTH, bool(growth and _tenths(rev.yoy) > 0 and _tenths(rev.cum_yoy) >= 150), growth_text),
+            Check(CHEAP, bool(cheap and 50 <= _tenths(pe) <= _tenths(med)), cheap_text),
+            Check("trend", tr is not None and tr.above_year and tr.p60 <= 100, trend_text)]
+
+
+def ai_eligible(facts: Facts, ai_source: str = "00952") -> bool:
+    return all(c.state is True for c in ai_checks_of(facts, ai_source))
+
+
+def ai_sort_key(facts: Facts) -> tuple:
+    """原始累計營收年增／正有限本益比降冪，同分按代號（快照沒有發行股數，不用市值）。"""
+    rev, pe = facts.revenue, _num(facts.pe)
+    ratio = rev.cum_yoy / pe if rev and _num(rev.cum_yoy) is not None and pe and pe > 0 else -math.inf
+    return -ratio, facts.code
+
+
+def ai_candidates(snapshot: Snapshot, codes: Sequence[str], sources: dict) -> tuple[list[Facts], int]:
+    """條件 1–3（AI 相關、營收成長、本益比不高於同業）只靠主快照就算得出來：
+    回 (候選：照排序鍵排好, 營收成長的檔數)。走勢（條件 4）最後才一檔一檔查。"""
+    candidates: list[Facts] = []
+    growth_count = 0
+    for code in codes:
+        row = snapshot.listed.get(code)
+        if row is None:
+            continue
+        f = _facts_for(code, row, snapshot.t, None, snapshot.medians)
+        is_ai, grows, cheap = (c.state is True for c in ai_checks_of(f, sources[code])[:3])
+        if is_ai and grows:
+            growth_count += 1
+            if cheap:
+                candidates.append(f)
+    candidates.sort(key=ai_sort_key)
+    return candidates, growth_count
+
+
+def _empty_ai_state() -> dict:
+    return {"schema": 1, "rule": AI_RULE, "t": None, "universe": {"as_of": None, "source": "core_only",
+            "codes": [], "etf_codes": [], "fetched_day": None}, "picks": [],
+            "funnel": dict.fromkeys(("universe", "growth", "cheap", "trend"), 0), "computed_at": 0.0,
+            "last_try": 0.0, "fail_count": 0, "core_as_of": None, "core_version": ""}
+
+
+def ai_state_from_json(obj) -> dict:
+    """讀取與寫入共用驗證；沒有結果（t=None）和有效的零檔不能混淆。"""
+    from stock_picks_ai_source import SEGMENTS
+    _require(isinstance(obj, dict) and obj.get("schema") == 1)
+    out = dict(obj)
+    today, now = _taipei_today(), time.time()
+    _v_str(obj.get("rule"), 40)
+    t = None if obj.get("t") is None else _v_date(obj["t"])
+    _require(t is None or t <= today)  # 未來的 T 整份不收（不夾回）
+    for key in ("computed_at", "last_try"):
+        out[key] = min(_v_num(obj.get(key), 0, 1e12), now)
+    _v_int(obj.get("fail_count"), 0, 10**6)
+    _v_str(obj.get("core_version", ""), 64, allow_empty=True)
+    if obj.get("core_as_of") is not None:
+        _require(_v_date(obj["core_as_of"]) <= today)
+    u = obj.get("universe")
+    _require(isinstance(u, dict) and u.get("source") in ("00952", "cached", "core_only"))
+    for key, limit in (("codes", 120), ("etf_codes", 60)):
+        codes = u.get(key, [])
+        _require(isinstance(codes, list) and len(codes) <= limit)
+        _require(all(isinstance(c, str) and re.fullmatch(r"[0-9]{4}", c) for c in codes))
+        _require(len(set(codes)) == len(codes))
+    for key in ("as_of", "fetched_day"):
+        if u.get(key) is not None:
+            _require(_v_date(u[key]) <= today)
+    picks, funnel = obj.get("picks"), obj.get("funnel")
+    _require(isinstance(picks, list) and len(picks) <= MAX_PICKS)
+    _require(isinstance(funnel, dict))
+    counts = [_v_int(funnel.get(k), 0, 120) for k in ("universe", "growth", "cheap", "trend")]
+    _require(counts == sorted(counts, reverse=True) and counts[0] == len(u["codes"]))
+    codes = []
+    for raw in picks:
+        _require(isinstance(raw, dict) and raw.get("ai_source") in SEGMENTS | {"00952"})  # 卡上的來源文字只能是固定清單
+        f = _facts_from(raw)
+        # 規則換了（門檻調整）以後，舊檔的入選者是當時合格的，不用新門檻重驗：不然整份舊推薦被丟掉、卡片變成「計算中」。
+        _require(f.data_date == t and f.code in u["codes"] and (obj.get("rule") != AI_RULE or ai_eligible(f, raw["ai_source"])))
+        _require(not f.code.startswith(("00", "91")) and not f.name.endswith(("-DR", "-創")))
+        if raw["ai_source"] == "00952":
+            _require(f.code in u.get("etf_codes", []) and u.get("as_of") is not None)
+        codes.append(f.code)
+    _require(len(set(codes)) == len(codes) and len(picks) == counts[-1])
+    _require(t is not None or (not picks and not any(counts)))
+    skipped = obj.get("skipped", {})  # 因為「資料拿不到」被跳過的候選（舊檔沒有這個鍵）：代號 → 固定原因
+    _require(isinstance(skipped, dict) and len(skipped) <= 60)
+    _require(all(isinstance(c, str) and c in u["codes"] and r in _AI_SKIP_REASONS for c, r in skipped.items()))
+    if obj.get("holdings") is not None:
+        h = obj["holdings"]
+        _require(isinstance(h, dict) and 40 <= len(h.get("codes", [])) <= 60)
+        _require(len(set(h["codes"])) == len(h["codes"]))
+        _require(all(isinstance(c, str) and re.fullmatch(r"[0-9]{4}", c) for c in h["codes"]))
+        _require(_v_date(h["as_of"]) <= today and _v_date(h["fetched_day"]) <= today)
+    if obj.get("fetch_budget"):
+        b = obj["fetch_budget"]
+        _require(isinstance(b, dict) and _v_date(b["day"]) <= today)
+        _v_int(b["attempts"], 0, AI_FETCH_PER_DAY)
+        out["fetch_budget"] = {**b, "next_try": min(_v_num(b["next_try"], 0, 1e12), now + 86400)}
+    return out
+
+
+def load_ai_file() -> Optional[dict]:
+    """壞檔、缺檔、葉節點模組不見都當作沒有（回 None），不丟例外。"""
+    try:
+        obj = _read_json_file(STATE_DIR / AI_NAME)
+        return None if obj is None else ai_state_from_json(obj)
+    except Exception:
+        logger.warning("stock picks ai reason=state_invalid")
+        return None
+
+
+def _commit_ai(payload: dict) -> bool:
+    """寫 AI 狀態再換記憶體。不退回較舊的 T（磁碟上的比較新就改用磁碟上的）；同一個 T 可以覆寫
+    （規則或名單換了、失敗次數更新）。沒有結果的狀態（t=None）不會蓋掉有結果的。"""
+    global _ai_state
+    with _lock:
+        try:
+            new = ai_state_from_json(payload)
+            with _state_file_lock():
+                disk = load_ai_file()
+                if disk and disk.get("t") and (not new.get("t") or disk["t"] > new["t"]):
+                    _ai_state = disk
+                    return False
+                _write_json_file(STATE_DIR / AI_NAME, new)
+            _ai_state = new
+            return True
+        except Exception:
+            logger.warning("stock picks ai reason=state_write")
+            return False
+
+
+def _append_ai_history(state: dict) -> None:
+    """每個交易日一行（同日已有就不寫），帶 rule；舊的 stock_picks_history.jsonl 照舊寫、不再顯示。"""
+    if state.get("t") is None:
+        return
+    record = {"t": state["t"], "rule": state["rule"], "computed_at": state["computed_at"],
+              "source": state["universe"]["source"], "core_version": state.get("core_version", ""),
+              "picks": [{"code": p["c"], "name": p["n"], "close": p["tr"][0],
+                         "ai_source": p["ai_source"], "p60": p["tr"][3]} for p in state["picks"]]}
+    _append_history(None, name=AI_HISTORY_NAME, record=record)
+
+
+def _ai_record(*, failed: bool, reason: str = "exception") -> None:
+    """這輪沒有可寫的結果：保留上一份，記下試過的時間與抓名單的帳，AI 自己 20 分鐘後再試（不動主 worker）。
+    failed：真的失敗（抓不到日線、名單不能用）才加失敗次數；只是還沒查完（額度、時間、Yahoo 冷卻、
+    日線有洞）不加——不然部署當天多跑幾輪就會被當成「暫時算不出來」。reason 只是 log 用的固定原因碼。"""
+    global _ai_next_try
+    now = time.time()
+    _ai_next_try = now + AI_RETRY_S
+    state = dict(_ai_state or _empty_ai_state())
+    state.update(last_try=now, fail_count=min(state["fail_count"] + (1 if failed else 0), 10**6),
+                 holdings=_ai_holdings, fetch_budget=dict(_ai_fetch_budget))
+    _commit_ai(state)
+    (logger.warning if failed else logger.info)(
+        "stock picks ai %s reason=%s fail_count=%d retry_in_s=%d",
+        "failed" if failed else "waiting", reason, state["fail_count"], int(AI_RETRY_S),
+    )
+
+
+def _ai_failure() -> None:
+    _ai_record(failed=True)
+
+
+def _ai_core():
+    """核心檔整份不合法就不用（回 (None, "invalid")）；版本含內容的雜湊，換名單可以同一個 T 重算。"""
+    from stock_picks_ai_source import load_core
+    try:
+        core = load_core(today=_taipei_today())
+    except Exception:
+        logger.warning("stock picks ai reason=core_invalid")
+        return None, "invalid"
+    data = [(code, entry.segment, entry.source_url, str(entry.source_date)) for code, entry in sorted(core.entries.items())]
+    version = hashlib.sha256(json.dumps([str(core.as_of), data], ensure_ascii=False).encode()).hexdigest()
+    return core, version
+
+
+def _ai_fetch_due(today: date, now: float) -> bool:
+    """今天還沒抓到 00952，而且額度（一天 3 次）與間隔（失敗後 2 小時）都允許。"""
+    h, b = _ai_holdings, _ai_fetch_budget
+    if h and h.get("fetched_day") == today.isoformat():
+        return False
+    if b.get("day") != today.isoformat():
+        return True
+    return b["attempts"] < AI_FETCH_PER_DAY and now >= b["next_try"]
+
+
+def _ai_universe(snapshot: Snapshot, give_up: float) -> tuple:
+    """名單＝（00952 持股 ∪ 核心名單）過「目前上市普通股」資格；回 (名單資訊, {代號: 來源}, 核心日期, 核心版本)。
+    00952 一天最多抓 3 次、失敗 2 小時後再試、被擋（403／429／5xx）當天不再抓；抓不到就沿用上一份（45 天內），
+    再不行只用核心名單。網路請求都在鎖外。"""
+    global _ai_holdings, _ai_fetch_budget
+    from stock_picks_ai_source import SourceError, eligible_codes, fetch_holdings
+    today, now = _taipei_today(), time.time()
+    core, version = _ai_core()
+    if _ai_fetch_budget.get("day") != today.isoformat():
+        _ai_fetch_budget = {"day": today.isoformat(), "attempts": 0, "next_try": 0.0}
+    b, h = _ai_fetch_budget, _ai_holdings
+    if _ai_fetch_due(today, now):
+        b["attempts"] += 1
+        b["next_try"] = now + AI_FETCH_RETRY_S
+        try:
+            result = fetch_holdings(today=today, previous_as_of=date.fromisoformat(h["as_of"]) if h else None,
+                                    deadline=min(5.0, max(0.01, give_up - time.monotonic())))
+            h = _ai_holdings = {"codes": [c for c, _ in result.rows], "as_of": result.as_of.isoformat(),
+                                "fetched_day": today.isoformat()}
+        except Exception as exc:
+            status = getattr(exc, "status_code", None)
+            if status in (403, 429) or (isinstance(status, int) and 500 <= status <= 599):
+                b["attempts"] = AI_FETCH_PER_DAY  # 被擋或對方壞了：今天不再打
+            logger.info("stock picks ai holdings unavailable reason=%s", exc.reason if isinstance(exc, SourceError) else "error")
+    usable = h is not None and 0 <= (today - date.fromisoformat(h["as_of"])).days <= AI_HOLDINGS_MAX_AGE_DAYS
+    etf = set(h["codes"]) if usable else set()
+    entries = core.entries if core else {}
+    codes = eligible_codes(etf | set(entries), snapshot.listed)
+    if not codes:
+        raise ValueError("universe_empty")
+    if usable:
+        source = "00952" if h["fetched_day"] == today.isoformat() else "cached"
+    else:
+        source = "core_only"
+        logger.info("stock picks ai reason=core_only")
+    sources = {c: "00952" if c in etf else entries[c].segment for c in codes}
+    u = {"as_of": h["as_of"] if usable else (core.as_of.isoformat() if core else None), "source": source,
+         "codes": list(codes), "etf_codes": sorted(etf), "fetched_day": h["fetched_day"] if usable else None}
+    return u, sources, core.as_of.isoformat() if core else None, version
+
+
+@dataclass
+class _AiRound:
+    """一輪 AI 計算的帳（只在這一輪內用）：fetches＝送出的日線請求數（上限 AI_FETCH_CAP）、served＝有回資料的請求數、
+    unfetched＝回不出資料的代號（單檔壞掉或整個 Yahoo 壞掉，要等這一輪結束時確認 Yahoo 是活的才分得出來）。"""
+
+    fetches: int = 0
+    served: int = 0
+    unfetched: list = field(default_factory=list)
+
+
+def _ai_windows(snapshot: Snapshot, code: str, row: ListedRow, stop: threading.Event, give_up: float,
+                rnd: _AiRound) -> tuple[str, Optional[tuple]]:
+    """主池沒有的候選：查這一檔的年線、季線窗口。回 (結果, 窗口)：
+    ok／no 是有結果（no＝這個 T 確定算不出來，或日線有洞／抓不到拖太久而放棄，當作不合格）；hole／fail 是還沒結果
+    （日線有洞還沒到期限／抓取失敗）；limit 是額度、時間或 Yahoo 冷卻用完，這一輪不能再查。rnd 是這一輪的帳（共用）。"""
+    cached = _ai_chart_cache.get(code)
+    now = time.monotonic()
+    if cached:
+        if cached[0] == _AI_OK:
+            return _AI_OK, cached[1]
+        if cached[0] == _AI_NO:
+            return _AI_NO, None
+        if cached[0] == _AI_HOLE and cached[1] > now:
+            return _AI_HOLE, None
+    if rnd.fetches >= AI_FETCH_CAP or now >= give_up or _yahoo_blocked():
+        return _AI_LIMIT, None
+    rnd.fetches += 1
+    try:
+        data = _fetch_chart(_symbol(code, TWSE), stop=stop, timeout=min(YAHOO_TIMEOUT_S, max(0.01, (give_up - now) / 4)))
+    except FetchError as exc:  # 429 已經由 _fetch_chart 設了共用冷卻
+        if exc.kind in ("cooldown", "stopped"):
+            return _AI_LIMIT, None
+        if exc.kind == "rate_limited":
+            return _AI_FAIL, None  # 429 不算「這一檔回不出日線」
+        data = None  # 其他種類（實際上 _fetch_chart 已經自己吞掉了）當作抓不到
+    if data is None:
+        rnd.unfetched.append(code)
+        return _AI_FAIL, None
+    rnd.served += 1
+    bars = parse_chart(data)
+    prev = _prev_reference(row.close, row.change)
+    windows = window_closes(bars, snapshot.calendar, snapshot.t, row.close, prev)
+    if windows is not None:
+        _ai_chart_cache[code] = (_AI_OK, windows)
+        return _AI_OK, windows
+    reason = _window_unavailable_reason(bars, snapshot.calendar, snapshot.t, row.close, prev)
+    if reason in _AI_HOLE_REASONS:
+        wall = time.time()
+        first = _ai_hole_first.setdefault(code, wall)
+        if wall - first < AI_HOLE_GIVE_UP_S:
+            _ai_chart_cache[code] = (_AI_HOLE, now + AI_NEGATIVE_TTL_S)
+            logger.info("stock picks ai code=%s hole reason=%s waited_s=%d", code, reason, int(wall - first))
+            return _AI_HOLE, None
+        logger.warning("stock picks ai code=%s gave up reason=%s waited_s=%d", code, reason, int(wall - first))
+    _ai_chart_cache[code] = (_AI_NO, reason)
+    logger.info("stock picks ai code=%s not eligible reason=%s", code, reason)
+    return _AI_NO, None
+
+
+def _ai_yahoo_alive(stop: threading.Event, give_up: float) -> bool:
+    """抽查一檔一定有的（2330）：Yahoo 現在有沒有在回日線。額度、時間、冷卻不允許抽查就當作不確定（否）。"""
+    now = time.monotonic()
+    if stop.is_set() or now >= give_up or _yahoo_blocked():
+        return False
+    try:
+        data = _fetch_chart("2330.TW", stop=stop, timeout=min(YAHOO_TIMEOUT_S, max(0.01, (give_up - now) / 4)))
+    except FetchError:
+        return False
+    return data is not None
+
+
+def _ai_settle_chart_failures(rnd: _AiRound, stop: threading.Event, give_up: float) -> None:
+    """這一輪有代號回不出日線：只有「Yahoo 當輪確實有在回資料」才算那一檔自己的失敗，整個 Yahoo 壞掉時不能把排名靠前的
+    候選悄悄換掉。這一輪沒有任何請求成功（例如其他檔的結果都已在快取裡，只剩壞掉的那一檔要抓）就抽查 2330 當證據。
+    累計 AI_FAIL_MAX_TRIES 次就當作這個 T 不合格（chart_unavailable）；之後寫進 skipped，同一個 T 還會重看。"""
+    if rnd.served == 0 and not _ai_yahoo_alive(stop, give_up):
+        logger.info("stock picks ai reason=yahoo_not_confirmed unfetched=%d", len(rnd.unfetched))
+        return
+    for code in rnd.unfetched:
+        tries = _ai_fail_tries[code] = _ai_fail_tries.get(code, 0) + 1
+        if tries >= AI_FAIL_MAX_TRIES:
+            _ai_chart_cache[code] = (_AI_NO, "chart_unavailable")
+            logger.warning("stock picks ai code=%s not eligible reason=chart_unavailable tries=%d", code, tries)
+        else:
+            logger.info("stock picks ai code=%s chart unavailable tries=%d", code, tries)
+
+
+def _ai_skipped_resolved(snapshot: Snapshot, state: dict, stop: threading.Event) -> bool:
+    """同一個 T、已經寫好的推薦裡有候選因為「資料拿不到」被跳過：每小時重看一次、每個 T 最多 6 次。
+    其中一檔算得出窗口就回 True（呼叫端重算一次）；還是不行就維持原本的跳過判定。"""
+    check, now = _ai_skip_check, time.time()
+    if check["n"] >= AI_SKIP_RECHECK_MAX or now < check["next"] or _yahoo_blocked():
+        return False
+    check["n"] += 1
+    check["next"] = now + AI_SKIP_RECHECK_S
+    give_up, rnd, resolved = time.monotonic() + AI_BUDGET_S, _AiRound(), False
+    for code, reason in state["skipped"].items():
+        row = snapshot.listed.get(code)
+        if row is None or stop.is_set():
+            continue
+        saved = _ai_chart_cache.pop(code, None)
+        status, _ = _ai_windows(snapshot, code, row, stop, give_up, rnd)
+        if status == _AI_OK:
+            resolved = True
+        elif status != _AI_NO:  # 還是拿不到（洞、抓不到、額度）：維持原本的跳過
+            _ai_chart_cache[code] = saved or (_AI_NO, reason)
+    logger.info("stock picks ai skipped recheck n=%d resolved=%s", check["n"], resolved)
+    return resolved
+
+
+def _maybe_fill_ai(stop: threading.Event) -> None:
+    """AI 相關股推薦的背景計算；`_run` 在每輪 `_tick` 之後呼叫一次（不管 `_tick` 是否提早返回）。
+
+    條件 1–3 用主快照算完排好，條件 4（走勢）照最後排名一檔一檔查：主池有的直接用，沒有的才抓 Yahoo，
+    滿 3 檔就停。只有「最後一檔入選者之前排名的候選都有結果」才寫；有候選還沒結果就保留上一份、之後再試，
+    不讓排名較後的候選偷偷補位。候選的日線一直拿不到（有洞超過 3 小時、或 Yahoo 在回別檔卻累計 3 次回不出這一檔）
+    才放棄，並記在狀態的 skipped；同一個 T 之後每小時重看，算得出來就重算一次。
+    失敗（例外由 `_run` 接住）只記 AI 自己的失敗與節流，不動主 worker。"""
+    global _ai_cache_t, _ai_next_try
+    if not AI_ENABLED or not _AI_BACKGROUND_ENABLED or stop.is_set():
+        return
+    snapshot = _snapshot
+    now = time.time()
+    if snapshot is None or now < _ai_next_try:
+        return
+    _, version = _ai_core()
+    old, t_iso = _ai_state, snapshot.t.isoformat()
+    if old and old.get("t") and old["t"] > t_iso:
+        return  # 已經比主快照還新（不該發生）：不退回去
+    if _ai_cache_t != snapshot.t:  # 換了一個 T：這一天的日線快取、洞與失敗的帳都重來
+        _ai_chart_cache.clear()
+        _ai_hole_first.clear()
+        _ai_fail_tries.clear()
+        _ai_skip_check.update(n=0, next=0.0)
+        _ai_cache_t = snapshot.t
+    current = bool(old and old.get("t") == t_iso and old["rule"] == AI_RULE and old.get("core_version") == version)
+    # 同一個 T 通常算過就不再算；例外：① 當天沒抓到 00952（用的是上一份或只有核心名單），而且現在又可以抓了；
+    # ② 有候選因為「資料拿不到」被跳過，而且這次重看其中一檔算得出來了。
+    holdings_due = current and old["universe"]["source"] != "00952" and _ai_fetch_due(_taipei_today(), now)
+    if current and not holdings_due and not (old.get("skipped") and _ai_skipped_resolved(snapshot, old, stop)):
+        return
+    give_up = time.monotonic() + AI_BUDGET_S
+    u, sources, core_as_of, version = _ai_universe(snapshot, give_up)
+    if stop.is_set():
+        return
+    candidates, growth_count = ai_candidates(snapshot, u["codes"], sources)
+    picks: list[dict] = []
+    skipped: dict = {}
+    rnd = _AiRound()
+    unresolved, failed, holes = False, False, False
+    for f in candidates:
+        if stop.is_set():
+            return
+        row = snapshot.listed[f.code]
+        pool = snapshot.pool.get(f.code)
+        if pool is not None and pool.trend is not None:
+            f = replace(f, trend=pool.trend)
+        else:
+            status, windows = _ai_windows(snapshot, f.code, row, stop, give_up, rnd)
+            if status == _AI_LIMIT:
+                unresolved = True
+                break
+            if status in (_AI_HOLE, _AI_FAIL):
+                unresolved, failed, holes = True, failed or status == _AI_FAIL, holes or status == _AI_HOLE
+                continue
+            if status == _AI_NO:
+                reason = _ai_chart_cache.get(f.code, (_AI_NO, ""))[1]
+                if reason in _AI_SKIP_REASONS:
+                    skipped[f.code] = reason
+                continue
+            f = _facts_for(f.code, row, snapshot.t, windows, snapshot.medians)
+        if ai_eligible(f, sources[f.code]):
+            picks.append({**_facts_json(f), "ai_source": sources[f.code]})
+            if len(picks) == MAX_PICKS:
+                break
+    if unresolved:
+        if rnd.unfetched:
+            _ai_settle_chart_failures(rnd, stop, give_up)
+        # current＝這個 T 已經有好結果（只是 00952 晚到或跳過的候選要重算）：這次沒算完不能把它標成失敗
+        _ai_record(failed=failed and not current, reason="fetch_failed" if failed else "line_hole" if holes else "limit")
+        return
+    done = time.time()
+    state = {"schema": 1, "rule": AI_RULE, "t": t_iso, "universe": u, "picks": picks,
+             "funnel": {"universe": len(u["codes"]), "growth": growth_count, "cheap": len(candidates), "trend": len(picks)},
+             "computed_at": done, "last_try": done, "fail_count": 0,
+             "core_as_of": core_as_of, "core_version": version, "holdings": _ai_holdings,
+             "fetch_budget": dict(_ai_fetch_budget), "skipped": skipped}
+    if _commit_ai(state):
+        _ai_next_try = 0.0
+        if skipped:  # 剛放棄就馬上重看沒有意義：第一次重看在一小時後
+            _ai_skip_check["next"] = max(_ai_skip_check["next"], done + AI_SKIP_RECHECK_S)
+        _append_ai_history(state)
+        logger.info("stock picks ai computed t=%s source=%s universe=%d growth=%d cheap=%d picks=%d skipped=%d fetched=%d",
+                    t_iso, u["source"], len(u["codes"]), growth_count, len(candidates), len(picks), len(skipped), rnd.fetches)
+    else:
+        _ai_next_try = time.time() + AI_RETRY_S
+
+
+def _ai_stale(state: dict, snapshot: Snapshot, now: Optional[float] = None) -> bool:
+    """上一份推薦還能不能顯示：AI 狀態的 T 距主快照或最近看到的新日期超過 7 個日曆日，
+    或一個星期沒有成功檢查，才改回「資料暫時沒有更新」。"""
+    now = time.time() if now is None else now
+    t = date.fromisoformat(state["t"])
+    latest = max(snapshot.t, _worker.seen_t or snapshot.t)
+    baseline = max(_worker.last_ok_check or 0.0, snapshot.computed_at, state["computed_at"])
+    return (latest - t).days > AI_STALE_DAYS or now - baseline > AI_STALE_DAYS * 86400
+
+
+def _ai_scope_line(universe: dict) -> str:
+    """第一張卡的說明：名單從哪裡來（日期是名單的日期，不是推薦的資料日）。"""
+    as_of = universe.get("as_of")
+    day = f"（名單 {_fmt_date(date.fromisoformat(as_of))}）" if as_of else ""
+    if universe.get("source") == "core_only":
+        return f"從 AI 相關股挑：核心名單{day}，最多 3 檔"
+    return f"從 AI 相關股挑：凱基台灣AI50 持股＋核心名單{day}，最多 3 檔"
+
+
+def ai_pick_bubble(facts: Facts, index: int, total: int, market: Optional[Market], *, ai_source: str = "00952",
+                   as_of: Optional[date] = None, market_date: Optional[date] = None, note: str = "",
+                   lead_note: bool = False, scope: str = "") -> dict:
+    """AI 相關股推薦卡：收盤、名單來源，成長、便宜、走勢三行（專屬句型：只有程式算的數字與固定分類）。
+    note＝推薦資料比主快照舊時的「推薦資料到 M/D」；scope＝第一張卡的名單說明。"""
+    if ai_source == "00952":
+        source = f"凱基台灣AI50 持股（名單 {_fmt_date(as_of)}）" if as_of else "凱基台灣AI50 持股"
+    else:
+        source = f"核心名單（{ai_source}）"
+    body = _lead(lead_note)
+    if lead_note:
+        body.append(_text(scope or "從 AI 相關股挑：凱基台灣AI50 持股＋核心名單，最多 3 檔", size="md"))
+    if note:
+        body.append(_text(note, size="md", weight="bold"))
+    body += [_text(_label(facts), size="xl", weight="bold"), _text("✅ 4 條都符合"), _text(_close_line(facts)),
+             _text(f"AI 相關：{source}", size="md")]
+    labels = {GROWTH: "成長", CHEAP: "便宜", "trend": "走勢"}
+    body += [_text(f"{labels[c.key]}：{c.text}", size="md") for c in ai_checks_of(facts, ai_source)[1:]]
+    subtitle = market_line(market) + (f"（{_fmt_date(market_date)}）" if market_date else "")
+    return _bubble(f"AI 相關股推薦：第 {index} 檔（共 {total} 檔）", subtitle, body,
+                   [_text(_source_line(facts.data_date), size="sm"), _text(TEXT_DISCLAIMER, size="sm")])
+
+
+def _ai_picks_reply(snapshot: Snapshot) -> Reply:
+    """/股票 的推薦區：只讀記憶體裡的 AI 狀態（不讀檔、不抓資料）。大盤那行是主快照的 T；推薦比較舊時
+    第一張卡寫「推薦資料到 M/D」，兩個日期都看得出來。"""
+    state = _ai_state
+    picks: list[Facts] = []
+    note, stale, t = "", False, snapshot.t
+    if state and state.get("t"):
+        t = date.fromisoformat(state["t"])
+        stale = _ai_stale(state, snapshot)
+        if max(snapshot.t, _worker.seen_t or snapshot.t) > t:
+            note = f"推薦資料到 {_fmt_date(t)}"
+            if not state["fail_count"] and not stale:  # 算失敗過就不說「計算中」，免得一直掛著
+                note += "，新資料計算中"
+        if not stale:
+            picks = [_facts_from(p) for p in state["picks"]]
+    if picks:
+        scope = _ai_scope_line(state["universe"])
+        as_of = date.fromisoformat(state["universe"]["as_of"]) if state["universe"]["as_of"] else None
+        bubbles = [
+            ai_pick_bubble(f, i + 1, len(picks), snapshot.market, ai_source=state["picks"][i]["ai_source"], as_of=as_of,
+                           market_date=snapshot.t, note=note if i == 0 else "", lead_note=i == 0, scope=scope)
+            for i, f in enumerate(picks)
+        ]
+        alt = picks_alt_text(picks, t, not_updated=False)
+    else:
+        if not state or not state.get("t"):  # 還沒有結果：和「有結果但零檔」是不同的狀態
+            text = "AI 相關股推薦暫時算不出來" if state and state["fail_count"] >= 3 else "AI 相關股推薦計算中，請稍後再按一次"
+        elif stale:
+            text = TEXT_NOT_UPDATED
+        else:
+            f = state["funnel"]
+            text = (f"AI 名單上市 {f['universe']} 檔 → 營收成長 {f['growth']} 檔 → "
+                    f"本益比不高於同業 {f['cheap']} 檔 → 走勢符合 {f['trend']} 檔")
+        body = _lead(True) + ([_text(note, size="md", weight="bold")] if note else []) + [_text(text)]
+        bubbles = [_bubble("AI 相關股推薦", market_line(snapshot.market) + f"（{_fmt_date(snapshot.t)}）", body,
+                           [_text(_source_line(t), size="sm"), _text(TEXT_DISCLAIMER, size="sm")])]
+        alt = f"{PREFIX}只供參考｜{text}｜資料到 {_fmt_date(t)}"
+    faq = [snapshot.pool[c] for c in FAQ_CODES if c in snapshot.pool]
+    if faq:
+        bubbles.append(faq_bubble(faq, snapshot.t))
+    return Reply(flex=carousel(bubbles), alt_text=alt)
+
+
+def _env_file_value(name: str) -> Optional[str]:
+    """只讀 .env 裡這一個鍵的值（最後一次設定算數；不丟例外：沒有檔、讀不了、太大、不是 UTF-8 都當沒有）。"""
+    try:
+        if ENV_FILE.stat().st_size > 256 * 1024:
+            return None
+        text = ENV_FILE.read_text(encoding="utf-8")
+    except Exception:
+        return None
+    value: Optional[str] = None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, sep, rest = line.partition("=")
+        if not sep or key.strip() != name:
+            continue
+        rest = rest.strip()
+        if rest[:1] in ("'", '"'):  # 有引號：到下一個同樣的引號為止
+            end = rest.find(rest[0], 1)
+            value = rest[1:end] if end > 0 else rest[1:]
+        else:  # 沒引號：空白加 # 之後是註解
+            value = rest.split(" #", 1)[0].strip()
+    return value
+
+
+def _ai_flag_now() -> bool:
+    """狀態用的開關：環境變數（有設就用它，和 main.py 的 load_dotenv(override=False) 一致）→ .env → 預設開。
+    每日維護與部署 smoke 另開的程序沒有載入 .env，只看環境變數的話永遠讀到「開」，狀態不會寫 disabled。"""
+    value = os.environ.get(AI_ENV)
+    return _ai_flag(value if value is not None else _env_file_value(AI_ENV))
+
+
+def _ai_import_ok() -> bool:
+    """葉節點模組（stock_picks_ai_source）在不在：不在時沒有任何狀態寫得進去（連失敗次數都記不了），卡片會一直寫「計算中」。"""
+    try:
+        import stock_picks_ai_source  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _ai_status_fields(state: Optional[dict]) -> dict:
+    """給每日維護讀（舊程式沒有這些欄位，維護文字要容許缺欄位）。只讀記憶體或檔案，不改狀態。
+    ai_status：disabled（旗標關：模組載入時是關的，或環境變數／.env 現在是關的）→ failed（失敗次數 > 0）→ ok／pending。"""
+    u = state["universe"] if state else {}
+    if not (AI_ENABLED and _ai_flag_now()):
+        status = "disabled"
+    elif state and state["fail_count"]:
+        status = "failed"
+    else:
+        status = "ok" if state and state.get("t") else "pending"
+    core_status = None
+    if state and state.get("core_version"):
+        core_status = "invalid" if state["core_version"] == "invalid" else "ok"
+    return {"ai_t": state.get("t") if state else None, "ai_status": status,
+            "ai_fail_count": state["fail_count"] if state else 0,
+            "ai_core_as_of": state.get("core_as_of") if state else None, "ai_core_status": core_status,
+            "ai_universe_source": u.get("source"), "ai_universe_as_of": u.get("as_of"),
+            "ai_skipped": sorted(state.get("skipped", {})) if state else [], "ai_import_ok": _ai_import_ok()}
 
 
 # ── 回覆（main 只呼叫 handle；只讀快照，單檔查詢有限流的即時抓） ──────────────────
@@ -2594,8 +3399,15 @@ def _normalize_body(body: Optional[str]) -> Optional[str]:
 
 def clear_caches() -> None:
     """測試用：清掉單檔查詢的限流與快取、櫃買補抓的計時。"""
-    global _otc_next_try
+    global _otc_next_try, _yahoo_blocked_until, _ai_state, _ai_next_try, _ai_cache_t, _ai_holdings
     _otc_next_try = 0.0
+    _yahoo_blocked_until = 0.0
+    _ai_state, _ai_next_try, _ai_cache_t, _ai_holdings = None, 0.0, None, None
+    _ai_chart_cache.clear()
+    _ai_hole_first.clear()
+    _ai_fail_tries.clear()
+    _ai_skip_check.update(n=0, next=0.0)
+    _ai_fetch_budget.clear()
     with _lookup_lock:
         _lookup_times.clear()
         _lookup_cache.clear()
@@ -2633,7 +3445,8 @@ def _lookup(snapshot: Snapshot, code: str, deadline: Optional[float]):
     row = otc if listed is None else listed
     try:
         data = _fetch_chart(
-            _symbol(code, market), hosts=_YAHOO[:1], timeout=min(YAHOO_TIMEOUT_S, max(1.0, (remaining - 2.0) / 2))
+            _symbol(code, market), hosts=_YAHOO[:1], timeout=min(YAHOO_TIMEOUT_S, max(1.0, (remaining - 2.0) / 2)),
+            shared_block=False,  # 和 2eb85e1 一樣：不看、也不設主流程與 AI 段共用的 429 冷卻
         )
     except FetchError:
         data = None
@@ -2651,6 +3464,8 @@ def _lookup(snapshot: Snapshot, code: str, deadline: Optional[float]):
 
 
 def _picks_reply(snapshot: Snapshot) -> Reply:
+    if AI_ENABLED:
+        return _ai_picks_reply(snapshot)
     not_updated = _not_updated(snapshot)
     picks = [] if not_updated else [snapshot.pool[c] for c in snapshot.picks if c in snapshot.pool]
     if picks:
