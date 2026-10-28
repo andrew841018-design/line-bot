@@ -434,10 +434,19 @@ _RF_NEGATED_RE = re.compile(r"(?:沒有|没有|沒|没|不會|不再|不用|不�
 _DEGREE_RE = re.compile(r"(?:到|得)((?:快要|快|要|差點|幾乎|直接|就|中暑){0,3})$")
 _DEGREE_CAUSES = frozenset("笑哭氣忙累熱嚇跑爬走")
 _DEGREE_HEDGES = ("快", "要", "差點", "幾乎")
+# 泛指：「跌倒的人」「中風人數」「急診人很多」「住院人員」「中風人人都怕」「跌倒風險」。其他單獨一個「人」是那位家長自己
+# （「我胸悶人不舒服」「媽媽剛剛跌倒人站不起來」「胸悶人滿頭大汗」「昏倒人口吐白沫」「跌倒人好多血」的人是整個人），
+# 不算泛指；「人好多了」是好多了。這裡的「人」只認以
+# 「的人」或「人」開頭的寫法。已在處理的字詞和病名（中風、心臟病發）後面接「人」照舊不認，見 _red_flag_excluded。
+# 一般紀錄用另一張表 _GENERIC_HOLDER_AFTER_RE，兩張不共用（119 獨立）
 _GENERIC_AFTER_RE = re.compile(
-    r"的?(?:人|病人|患者|風險|機率|原因|前兆|徵兆|症狀|問題|機會|新聞|案例|影片|文章|後遺症|危險|可能|防|預防"
+    r"的人|人(?:人|的|們|類|性|際|參|壽|體|命|數|次|士|群|員|潮|家|生|力)|人滿為患|人口(?![齒吐渴乾])|人身(?:意外|保險|險)"
+    r"|人要(?:多注意|多小心|小心|注意)"
+    r"|人(?:越來越|愈來愈|超級|非常|這麼|那麼|很|好|超|太|真|最|蠻|滿|特別|變)?多(?![了處汗血]|地方)"
+    r"|的?(?:病人|患者|風險|機率|原因|前兆|徵兆|症狀|問題|機會|新聞|案例|影片|文章|後遺症|危險|可能|防|預防"
     r"|費用|錢|單據|收據|帳單|遺傳|家族史|講座|課程)|(?:很|好|超|太|最)?(?:危險|可怕)"
 )
+_DISEASE_LABELS = frozenset({"中風", "心臟病發"})
 _LONG_AFTER_RE = re.compile(r"後|以後|之後")  # 「中風後一直在復健」：中風是以前的事
 _FORMER_RE = re.compile(r"[\u4e00-\u9fff]{0,2}的")  # 「以前的同事」「以前公司的同事」：以前是修飾人
 _INSURANCE_RE = re.compile(r"保險|理賠|保單|保費")  # 「住院險」「理賠住院」講的是保險
@@ -1152,6 +1161,10 @@ def _red_flag_excluded(clause: _Clause, label: str, start: int, end: int, should
     if label not in IN_CARE_LABELS and _degree_complement(text, start):
         return True  # 「忙到喘不過氣」；「送到急診」的「到」是地點不是程度
     if _GENERIC_AFTER_RE.match(text, end):
+        return True
+    if (label in IN_CARE_LABELS or label in _DISEASE_LABELS) and text.startswith(("人", "的人"), end):
+        # 「急診人很多」「住院人力不足」：已在處理的字詞照舊不認「人…」（認了會把同一則的 119 降成只私訊）；
+        # 「中風人很難照顧」「心肌梗塞人越來越年輕」：病名後面的「人」多半是泛指，也照舊不認
         return True
     if label in IN_CARE_LABELS and insurance:
         return True
