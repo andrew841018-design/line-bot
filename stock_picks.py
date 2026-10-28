@@ -3260,6 +3260,12 @@ def _maybe_fill_ai(stop: threading.Event) -> None:
         if skipped:  # 剛放棄就馬上重看沒有意義：第一次重看在一小時後
             _ai_skip_check["next"] = max(_ai_skip_check["next"], done + AI_SKIP_RECHECK_S)
         _append_ai_history(state)
+        try:  # 回測週報的池子紀錄（2026-10-29 回測 PLAN §5.2）：只寫自己的 spool 檔；任何問題都不能變成 AI 段的失敗
+            import stock_picks_review_hook
+            stock_picks_review_hook.write_ai_spool(state, snapshot, candidates, sources,
+                                                   chart_cache=_ai_chart_cache, fail_tries=_ai_fail_tries)
+        except Exception as exc:
+            logger.warning("stock picks ai review spool failed error_type=%s", type(exc).__name__)
         logger.info("stock picks ai computed t=%s source=%s universe=%d growth=%d cheap=%d picks=%d skipped=%d fetched=%d",
                     t_iso, u["source"], len(u["codes"]), growth_count, len(candidates), len(picks), len(skipped), rnd.fetches)
     else:

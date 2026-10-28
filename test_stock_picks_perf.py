@@ -1,5 +1,6 @@
-"""stock_picks_perf（推薦成績，2026-10-28）的測試：tmp 的盤勢 DB（盤勢 job 自己的 market_store 建，同 schema）
-＋conftest 的 tmp state，不連網。紀錄檔用真實的欄位形狀（line_bot/state/stock_picks_history.jsonl），數字都是編的。"""
+"""stock_picks_perf（推薦成績，2026-10-28；2026-10-29 改 v2：隔天收盤進場、5／20／60／240 日）的測試：tmp 的盤勢 DB
+（盤勢 job 自己的 market_store 建，同 schema）＋conftest 的 tmp state，不連網。紀錄檔用真實的欄位形狀
+（line_bot/state/stock_picks_history.jsonl），數字都是編的。"""
 
 from __future__ import annotations
 
@@ -8,7 +9,7 @@ import dataclasses
 import inspect
 import json
 import sqlite3
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -60,6 +61,11 @@ def us_sessions(last: str = "2026-11-27") -> list[str]:
 
 def nth_after(sessions: list[str], t: str, h: int) -> str:
     return [d for d in sessions if d > t][h - 1]
+
+
+def exit_day(sessions: list[str], t: str, h: int) -> str:
+    """v2 的 T_h：E（t 之後第一個交易日）之後第 h 個交易日。"""
+    return nth_after(sessions, t, h + 1)
 
 
 class World:
@@ -138,6 +144,15 @@ def read_state() -> dict:
     return json.loads((stock_picks.STATE_DIR / perf.STATE_NAME).read_text(encoding="utf-8"))
 
 
+def write_library(*, prices=None, needed=None) -> None:
+    payload = {"schema": 1, "prices": prices or {}, "needed": needed or {}}
+    (stock_picks.STATE_DIR / perf.PRICES_NAME).write_text(json.dumps(payload), encoding="utf-8")
+
+
+def read_library() -> dict:
+    return json.loads((stock_picks.STATE_DIR / perf.PRICES_NAME).read_text(encoding="utf-8"))
+
+
 def run(world: World, *, now: float = NOW, ai: bool = False):
     return perf.update(ai_enabled=ai, now=now, db_path=world.path)
 
@@ -166,9 +181,9 @@ def card_texts(card: dict) -> list[str]:
     return out
 
 
-def _row(t, h, r, b, *, m="tw", rule="v1", rev=1, code="2330", skip=None, th="2026-10-08") -> dict:
-    return {"v": 1, "m": m, "rule": rule, "t": t, "rev": rev, "code": code, "h": h, "th": th, "r": r, "b": b,
-            "skip": skip}
+def _row(t, h, r, b, *, m="tw", rule="v1", rev=1, code="2330", skip=None, th="2026-10-08", v=None) -> dict:
+    return {"v": perf.LEDGER_VERSION if v is None else v, "m": m, "rule": rule, "t": t, "rev": rev, "code": code,
+            "h": h, "th": th, "r": r, "b": b, "skip": skip}
 
 
 def _aggregate(rows, *, lines=None, first_t=None) -> dict:
@@ -179,22 +194,28 @@ def _aggregate(rows, *, lines=None, first_t=None) -> dict:
 # ── 台股：報酬、日曆、除權息 ──────────────────────────────────────────────────
 def test_tw_return_vs_0050_at_5_and_20_sessions():
     world = World(stock_picks.STATE_DIR / "market_history.sqlite")  # 預設路徑（stock_db_ro.db_path）
-    days = world.tw(bench={"2026-10-08": 51.0})
-    assert nth_after(days, "2026-10-01", 5) == "2026-10-08"
-    assert nth_after(days, "2026-10-01", 20) == "2026-11-03"  # 跨過國慶、颱風、光復節
-    ramp = {"2026-10-01": 100.0, "2026-10-02": 101.0, "2026-10-05": 102.0, "2026-10-06": 103.0, "2026-10-07": 104.0}
-    world.closes("tw", "2330", {d: 105.0 for d in days if d >= "2026-10-08"} | ramp)
+    days = world.tw(bench={"2026-10-12": 51.0})
+    assert nth_after(days, "2026-10-01", 1) == "2026-10-02"  # E：隔天收盤進場
+    assert exit_day(days, "2026-10-01", 5) == "2026-10-12"  # E 之後第 5 個交易日（跨過國慶）
+    assert exit_day(days, "2026-10-01", 20) == "2026-11-04"  # 跨過國慶、颱風、光復節
+    ramp = {"2026-10-01": 100.0, "2026-10-02": 104.0, "2026-10-05": 106.0, "2026-10-06": 106.0, "2026-10-07": 106.0,
+            "2026-10-08": 106.0}
+    world.closes("tw", "2330", {d: 109.2 for d in days if d >= "2026-10-12"} | ramp)
     write_jsonl(stock_picks.HISTORY_NAME, [old_line("2026-10-01", ("2330", 100.0))])
     result = perf.update(ai_enabled=False, now=NOW)
     rows = {r["h"]: r for r in ledger_rows()}
-    assert rows[5] == {"v": 1, "m": "tw", "rule": "v1", "t": "2026-10-01", "rev": 1, "code": "2330", "h": 5,
-                       "th": "2026-10-08", "r": 0.05, "b": 0.02, "skip": None,
-                       "c0": 100.0, "ch": 105.0, "cf": 1.0, "b0": 50.0, "bh": 51.0, "bf": 1.0}  # 算式輸入也存（P3 #6）
-    assert (rows[20]["th"], rows[20]["r"], rows[20]["b"]) == ("2026-11-03", 0.05, 0.0)
+    assert set(rows) == {5, 20}  # 60、240 日還沒到期
+    assert rows[5] == {"v": 2, "m": "tw", "rule": "v1", "t": "2026-10-01", "rev": 1, "code": "2330", "h": 5,
+                       "th": "2026-10-12", "r": 0.05, "b": 0.02, "skip": None,  # 109.2 ÷ 104（E）− 1，不是 ÷ 100（t）
+                       "c0": 100.0, "ce": 104.0, "ch": 109.2, "cf": 1.0,
+                       "be": 50.0, "bh": 51.0, "bf": 1.0}  # 算式輸入也存（P3 #6）；c0 只拿來核對紀錄
+    assert (rows[20]["th"], rows[20]["r"], rows[20]["b"]) == ("2026-11-04", 0.05, 0.0)
     tw = result["markets"]["tw"]
     assert tw["h"]["5"] == {"n": 1, "r_pm": 50, "b_pm": 20, "wins": 1, "skipped": 0, "pending": 0}
-    assert (tw["first_t"], tw["from"], tw["to"], tw["ai_from"]) == ("2026-10-01", "2026-10-01", "2026-11-03", None)
-    assert perf.load_result() == result
+    assert tw["h"]["60"] == tw["h"]["240"] == {"n": 0, "r_pm": None, "b_pm": None, "wins": 0, "skipped": 0,
+                                                "pending": 1}
+    assert (tw["first_t"], tw["from"], tw["to"], tw["ai_from"]) == ("2026-10-01", "2026-10-01", "2026-11-04", None)
+    assert result["schema"] == 2 and perf.load_result() == result
     assert stat_mode(stock_picks.STATE_DIR / perf.LEDGER_NAME) == 0o600
 
 
@@ -204,26 +225,29 @@ def stat_mode(path: Path) -> int:
 
 def test_exrights_restored_on_next_session_including_closed_day(world):
     world.tw(bench={d: 49.0 for d in tw_sessions() if d >= "2026-10-13"})
-    with world.store() as s:
+    with world.store() as s:  # t＝10/07、E＝10/08、T_5＝10/16
         s.upsert_exrights([
-            (D("2026-10-09"), "2886", 50.0, 48.0, "息"),  # 國慶休市那天除息 → 算在下一個交易日 10/12
-            (D("2026-10-07"), "1216", 52.0, 50.0, "息"),  # 推薦當天除息：收盤已經是除息後的，不還原
-            (D("2026-10-16"), "1216", 50.0, 45.0, "息"),  # T_5 之後：這一筆不算
+            (D("2026-10-09"), "2886", 50.0, 48.0, "息"),  # E 之後、國慶休市那天除息 → 算在下一個交易日 10/12
+            (D("2026-10-08"), "1216", 52.0, 50.0, "息"),  # E 當天除息：E 的收盤已經是除息後的，不還原
+            (D("2026-10-19"), "1216", 50.0, 45.0, "息"),  # T_5 之後：這一筆不算
             (D("2026-10-13"), "0050", 50.0, 49.0, "息"),  # 基準 0050 同樣還原
         ])
-    after = ("2026-10-08", "2026-10-12", "2026-10-13", "2026-10-14")
+    after = ("2026-10-12", "2026-10-13", "2026-10-14", "2026-10-15")
     world.closes("tw", "2886", {"2026-10-07": 50.0, "2026-10-08": 50.0, "2026-10-12": 48.0, "2026-10-13": 48.0,
-                                "2026-10-14": 48.0, "2026-10-15": 48.6})
-    world.closes("tw", "1216", {"2026-10-07": 50.0, **{d: 50.0 for d in after}, "2026-10-15": 51.0})
-    write_jsonl(stock_picks.HISTORY_NAME, [old_line("2026-10-07", ("2886", 50.0), ("1216", 50.0))])
+                                "2026-10-14": 48.0, "2026-10-15": 48.0, "2026-10-16": 48.6})
+    world.closes("tw", "1216", {"2026-10-07": 52.0, "2026-10-08": 50.0, **{d: 50.0 for d in after},
+                                "2026-10-16": 51.0})
+    write_jsonl(stock_picks.HISTORY_NAME, [old_line("2026-10-07", ("2886", 50.0), ("1216", 52.0))])
     run(world)
     rows = {(r["code"], r["h"]): r for r in ledger_rows()}
-    assert rows[("2886", 5)]["th"] == "2026-10-15"
+    assert rows[("2886", 5)]["th"] == "2026-10-16"
     assert rows[("2886", 5)]["r"] == pytest.approx(48.6 * (50 / 48) / 50 - 1, abs=1e-6)  # +1.25%（不還原是 −2.8%）
     assert rows[("2886", 5)]["b"] == pytest.approx(0.0, abs=1e-6)  # 0050 除息 50→49，還原後持平
     assert (rows[("2886", 5)]["cf"], rows[("2886", 5)]["bf"]) == (pytest.approx(50 / 48), pytest.approx(50 / 49))
-    assert (rows[("2886", 5)]["c0"], rows[("2886", 5)]["ch"], rows[("2886", 5)]["bh"]) == (50.0, 48.6, 49.0)
-    assert rows[("1216", 5)]["r"] == pytest.approx(0.02, abs=1e-6) and rows[("1216", 5)]["cf"] == 1.0
+    assert (rows[("2886", 5)]["c0"], rows[("2886", 5)]["ce"], rows[("2886", 5)]["ch"]) == (50.0, 50.0, 48.6)
+    assert (rows[("2886", 5)]["be"], rows[("2886", 5)]["bh"]) == (50.0, 49.0)
+    assert rows[("1216", 5)]["r"] == pytest.approx(0.02, abs=1e-6) and rows[("1216", 5)]["cf"] == 1.0  # 51 ÷ 50（E）
+    assert rows[("1216", 5)]["c0"] == 52.0  # t 的收盤（除息前）只拿來核對紀錄
     assert rows[("2886", 20)]["skip"] == "missing"  # 之後沒有價格、而且已經過了 10 個交易日
 
 
@@ -244,28 +268,28 @@ def test_waits_until_exrights_cover_t_h(world):  # r3 #1：4552 的收盤 14:44 
 
 
 def test_exrights_coverage_must_pass_t_h(world):  # P3 #4：盤勢 job 下一次會重讀「上次涵蓋的最後一天」
-    world.tw(last="2026-10-14", coverage_to="2026-10-08")  # T_5（10/08）＝涵蓋的最後一天
-    world.closes("tw", "2886", {d: (50.0 if d < "2026-10-08" else 48.5) for d in tw_sessions("2026-10-14")})
+    world.tw(last="2026-10-14", coverage_to="2026-10-12")  # T_5（10/12）＝涵蓋的最後一天
+    world.closes("tw", "2886", {d: (50.0 if d < "2026-10-12" else 48.5) for d in tw_sessions("2026-10-14")})
     write_jsonl(stock_picks.HISTORY_NAME, [old_line("2026-10-01", ("2886", 50.0))])
     run(world, now=_ts("2026-10-14"))
-    assert ledger_rows() == []  # 不能先用「10/08 沒有除息」凍結
-    with world.store() as s:  # 重讀 10/08：補進當天的除息
-        s.upsert_exrights([(D("2026-10-08"), "2886", 50.0, 48.5, "息")])
-        s.add_coverage("twt49u", D("2026-10-08"), D("2026-10-14"))
+    assert ledger_rows() == []  # 不能先用「10/12 沒有除息」凍結
+    with world.store() as s:  # 重讀 10/12：補進當天的除息
+        s.upsert_exrights([(D("2026-10-12"), "2886", 50.0, 48.5, "息")])
+        s.add_coverage("twt49u", D("2026-10-12"), D("2026-10-14"))
     run(world, now=_ts("2026-10-14"))
     assert [(r["h"], r["r"], r["skip"]) for r in ledger_rows()] == [(5, 0.0, None)]
 
 
 def test_provisional_typhoon_closure_waits_until_10_days(world):
     days = world.tw(last="2026-10-30", typhoon_confirmed=False)
-    assert nth_after(days, "2026-10-16", 5) == "2026-10-27"
+    assert exit_day(days, "2026-10-16", 5) == "2026-10-28"
     world.closes("tw", "2330", {d: 100.0 for d in days if d >= "2026-10-16"})
     write_jsonl(stock_picks.HISTORY_NAME, [old_line("2026-10-16", ("2330", 100.0))])
     run(world, now=_ts("2026-10-30"))  # 10/23 暫定休市才 7 天：盤勢 job 還可能撤銷 → 等
     run(world, now=_ts("2026-11-02"))  # 第 10 天：還是等
     assert ledger_rows() == []
     run(world, now=_ts("2026-11-03"))  # 超過 10 天才算確定
-    assert [(r["h"], r["th"], r["r"]) for r in ledger_rows()] == [(5, "2026-10-27", 0.0)]
+    assert [(r["h"], r["th"], r["r"]) for r in ledger_rows()] == [(5, "2026-10-28", 0.0)]
 
 
 @pytest.mark.parametrize("kind, confirmed, now, frozen", [
@@ -282,17 +306,17 @@ def test_confirmed_or_revoked_closure(world, kind, confirmed, now, frozen):
 
 def test_calendar_hole_waits_and_t_h_is_right_after_backfill(world):  # r4 #2：TAIEX 會後面先寫、前面後補
     days = world.tw(last="2026-11-13")
-    assert nth_after(days, "2026-11-02", 5) == "2026-11-09"
+    assert exit_day(days, "2026-11-02", 5) == "2026-11-10"
     world.closes("tw", "2330", {d: 100.0 for d in days})
     write_jsonl(stock_picks.HISTORY_NAME, [old_line("2026-11-02", ("2330", 100.0))])
     with sqlite3.connect(world.path) as con:  # 11/04 的 TAIEX 還沒補進來
         con.execute("DELETE FROM closes WHERE market = 'tw' AND symbol = 'TAIEX' AND date = '2026-11-04'")
     con.close()
     run(world, now=_ts("2026-11-13"))
-    assert ledger_rows() == []  # 不然會把 11/10 當成第 5 個交易日
+    assert ledger_rows() == []  # 不然會把 11/11 當成 E 之後第 5 個交易日
     world.tw(last="2026-11-13")
     run(world, now=_ts("2026-11-13"))
-    assert [(r["h"], r["th"]) for r in ledger_rows()] == [(5, "2026-11-09")]
+    assert [(r["h"], r["th"]) for r in ledger_rows()] == [(5, "2026-11-10")]
 
 
 def test_missing_holiday_table_waits_only_when_needed(world):
@@ -302,7 +326,7 @@ def test_missing_holiday_table_waits_only_when_needed(world):
                 [old_line("2026-10-07", ("2330", 100.0)), old_line("2026-10-12", ("2330", 100.0))])
     run(world, now=_ts("2026-10-22"))
     got = {(r["t"], r["h"]) for r in ledger_rows()}
-    assert got == {("2026-10-12", 5)}  # 10/13–10/19 每天都有 TAIEX：用不到休市表
+    assert got == {("2026-10-12", 5)}  # [10/12, T_5＝10/20] 每天都有 TAIEX：用不到休市表
     # 10/07 跨過國慶（10/09）：休市表讀不到 → 等（T_5 之後才 5 個交易日，還沒到 10 天的出口）
 
 
@@ -349,7 +373,7 @@ def _library_scenario(world: World) -> dict:
     world.closes("tw_all", "6666", {"2026-10-01": 80.0, "2026-10-02": 81.0})
     write_jsonl(stock_picks.HISTORY_NAME, [old_line("2026-10-01", ("6666", 80.0))])
     run(world, now=_ts("2026-10-02"))
-    assert read_state()["prices"] == {"6666": {"2026-10-01": 80.0, "2026-10-02": 81.0}}  # 0050 在 tw 裡：不存
+    assert read_library()["prices"] == {"6666": {"2026-10-01": 80.0, "2026-10-02": 81.0}}  # 0050 在 tw 裡：不存
     days = world.tw(last="2026-10-30")
     world.closes("tw_all", "6666", {d: 84.0 for d in days if d >= "2026-10-05"})
     with world.store() as s:  # tw_all 滾掉 10/01、10/02（盤勢 job 每檔只留最近幾列）
@@ -364,16 +388,18 @@ def _library_scenario(world: World) -> dict:
 def test_price_library_keeps_tw_all_closes_until_frozen(world):
     result = _library_scenario(world)
     [row] = ledger_rows()
-    assert (row["h"], row["r"], row["skip"]) == (5, pytest.approx(84 / 80 - 1, abs=1e-6), None)
-    prices = read_state()["prices"]
-    assert set(prices) == {"6666"} and prices["6666"]["2026-10-01"] == 80.0  # h=20 還沒凍結：價格還留著
+    assert (row["h"], row["r"], row["skip"]) == (5, pytest.approx(84 / 81 - 1, abs=1e-6), None)  # E＝10/02 的 81
+    assert (row["c0"], row["ce"]) == (80.0, 81.0)  # t 的收盤也從價格庫來（核對紀錄）
+    prices = read_library()["prices"]
+    assert set(prices) == {"6666"} and prices["6666"]["2026-10-01"] == 80.0  # h=20、60、240 還沒凍結：價格還留著
     assert result["markets"]["tw"]["h"]["20"]["pending"] == 1
+    assert not (stock_picks.STATE_DIR / perf.STATE_NAME).exists() or read_state()["prices"] == {}  # 不寫進共用狀態檔
 
 
 def test_results_do_not_change_after_library_and_tw_all_are_gone(world):
     before = _library_scenario(world)["markets"]["tw"]
     ledger_before = (stock_picks.STATE_DIR / perf.LEDGER_NAME).read_bytes()
-    (stock_picks.STATE_DIR / perf.STATE_NAME).unlink()
+    (stock_picks.STATE_DIR / perf.PRICES_NAME).unlink()
     with sqlite3.connect(world.path) as con:
         con.execute("DELETE FROM closes WHERE market = 'tw_all'")
     con.close()
@@ -384,7 +410,7 @@ def test_results_do_not_change_after_library_and_tw_all_are_gone(world):
     late = run(world)["markets"]["tw"]
     assert late["h"]["5"] == before["h"]["5"] | {"pending": 0}
     assert late["h"]["20"]["skipped"] == 1
-    assert read_state()["prices"] == {}  # 都凍結了：價格庫清空
+    assert read_library()["prices"] == {}  # 60、240 日還在等，但價格已經哪裡都拿不到：價格庫是空的
 
 
 def test_price_gone_from_tw_all_freezes_as_missing_after_10_sessions(world):
@@ -422,10 +448,12 @@ def test_unreadable_ai_history_skips_tw_this_round(world):  # r4 #1：AI 檔讀�
     world.closes("tw", "2330", {d: 100.0 for d in days})
     write_jsonl(stock_picks.HISTORY_NAME, [old_line("2026-10-01", ("2330", 100.0))])
     (stock_picks.STATE_DIR / stock_picks.AI_HISTORY_NAME).mkdir()  # 不是一般檔：讀不了
-    write_state(prices={"6666": {"2026-10-01": 80.0}})
+    write_state(prices={"6666": {"2026-10-01": 80.0}})  # v1 的價格庫
+    write_library(prices={"6666": {"2026-10-01": 80.0}})
     assert run(world) is not None
     assert ledger_rows() == []
-    assert read_state()["prices"] == {"6666": {"2026-10-01": 80.0}}  # 價格庫原樣留著
+    assert read_library()["prices"] == {"6666": {"2026-10-01": 80.0}}  # 價格庫原樣留著
+    assert read_state()["prices"] == {"6666": {"2026-10-01": 80.0}}
 
 
 # ── 台股紀錄來源（舊規則／AI 相關股） ──────────────────────────────────────────
@@ -551,22 +579,22 @@ def test_full_ledger_is_reported_and_rows_keep_waiting(world, monkeypatch):
     world.closes("tw", "2330", {d: 100.0 for d in days})
     write_jsonl(stock_picks.HISTORY_NAME, [old_line("2026-10-01", ("2330", 100.0))])
     result = run(world)
-    assert ledger_rows() == [] and result["ledger_full"] is True and result["pending"] == 2
+    assert ledger_rows() == [] and result["ledger_full"] is True and result["pending"] == 4  # 5、20 日寫不進去＋60、240 日
     assert perf.summary()["ledger_full"] is True
 
 
 # ── 美股 ─────────────────────────────────────────────────────────────────────
 def test_us_returns_splits_quarantine_mismatch_range_and_no_jump_gate(world):
     days = world.us()
-    t = "2026-10-01"
-    assert (nth_after(days, t, 5), nth_after(days, t, 20)) == ("2026-10-08", "2026-10-29")
-    later = [d for d in days if d > t]
-    world.closes("us", "NVDA", {t: 200.0} | {d: 130.0 for d in later})  # 隔天跌 35%：真的大跌要算進去
+    t, e = "2026-10-01", "2026-10-02"
+    assert (exit_day(days, t, 5), exit_day(days, t, 20)) == ("2026-10-09", "2026-10-30")
+    later = [d for d in days if d > e]
+    world.closes("us", "NVDA", {t: 200.0, e: 200.0} | {d: 130.0 for d in later})  # E 之後跌 35%：真的大跌要算進去
     world.closes("us", "AAPL", {d: 250.0 for d in days})
-    world.closes("us", "MSFT", {t: 200.0} | {d: 210.0 for d in later})  # 11/05 一拆二：DB 已經整段調整過
+    world.closes("us", "MSFT", {t: 200.0, e: 200.0} | {d: 210.0 for d in later})  # 11/05 一拆二：DB 已經整段調整過
     world.closes("us", "AMZN", {d: 180.0 for d in days})
     world.closes("us", "META", {d: 310.0 for d in days})  # 紀錄是 300：對不上
-    world.closes("us", "TSLA", {t: 10.0} | {d: 45.0 for d in later})  # +350%：當資料錯
+    world.closes("us", "TSLA", {t: 10.0, e: 10.0} | {d: 45.0 for d in later})  # +350%：當資料錯
     with world.store() as s:
         s.upsert_splits([("AAPL", D("2026-10-06"), 4.0, 1.0), ("MSFT", D("2026-11-05"), 2.0, 1.0)], "nasdaq")
         s.add_quarantine("us", "AMZN", D("2026-10-05"), D("2026-10-06"), "jump")
@@ -583,24 +611,24 @@ def test_us_returns_splits_quarantine_mismatch_range_and_no_jump_gate(world):
     us = result["markets"]["us"]
     assert us["h"]["5"] == {"n": 2, "r_pm": -150, "b_pm": 0, "wins": 1, "skipped": 4, "pending": 0}
     texts = card_texts(perf.perf_bubble(result))
-    assert "美股推薦（美國時間 10/01 起，算到 10/29）" in texts
+    assert "美股推薦（美國時間 10/01 起，算到 10/30）" in texts
     assert "推薦後 5 個交易日：紀錄還不夠（目前 2 次）" in texts
     assert texts.count("另有 4 次因為資料問題沒有算進去") == 2
 
 
 def test_us_waits_for_4_sessions_after_t_h_and_for_quarantine(world):
-    t = "2026-10-01"  # T_5＝10/08
+    t = "2026-10-01"  # E＝10/02、T_5＝10/09
     world.closes("us", "NVDA", {d: 200.0 for d in us_sessions()})
     world.closes("us", "AMZN", {d: 180.0 for d in us_sessions()})
     with world.store() as s:
         s.add_quarantine("us", "AMZN", D("2026-10-05"), D("2026-10-05"), "jump")
     write_jsonl(perf.US_HISTORY_NAME, [us_line(t, ("NVDA", 200.0), ("AMZN", 180.0))])
-    world.us(last="2026-10-13")  # 10/08 之後只有 3 個交易日：盤勢 job 還會改寫 10/08 的收盤
+    world.us(last="2026-10-14")  # 10/09 之後只有 3 個交易日：盤勢 job 還會改寫 10/09 的收盤
     run(world)
     assert ledger_rows() == []
-    world.us(last="2026-10-14")
+    world.us(last="2026-10-15")
     run(world)
-    assert [(r["code"], r["h"], r["th"]) for r in ledger_rows()] == [("NVDA", 5, "2026-10-08")]  # AMZN 隔離中：等
+    assert [(r["code"], r["h"], r["th"]) for r in ledger_rows()] == [("NVDA", 5, "2026-10-09")]  # AMZN 隔離中：等
     with world.store() as s:
         s.clear_quarantine("us", "AMZN")
     run(world)
@@ -608,15 +636,15 @@ def test_us_waits_for_4_sessions_after_t_h_and_for_quarantine(world):
 
 
 def test_us_waits_until_the_pick_itself_has_the_4th_session(world):
-    # 盤勢 job 照字母分批寫：SPY 已經有 10/14，NVDA 那一批還沒跑 → NVDA 的 10/08 還會再被整段重抓改寫一次
-    days = world.us(last="2026-10-14")
-    world.closes("us", "NVDA", {d: 200.0 for d in days if d <= "2026-10-13"})
+    # 盤勢 job 照字母分批寫：SPY 已經有 10/15，NVDA 那一批還沒跑 → NVDA 的 10/09（T_5）還會再被整段重抓改寫一次
+    days = world.us(last="2026-10-15")
+    world.closes("us", "NVDA", {d: 200.0 for d in days if d <= "2026-10-14"})
     write_jsonl(perf.US_HISTORY_NAME, [us_line("2026-10-01", ("NVDA", 200.0))])
     result = run(world)
     assert ledger_rows() == [] and result["markets"]["us"]["h"]["5"]["pending"] == 1
-    world.closes("us", "NVDA", {"2026-10-14": 200.0})
+    world.closes("us", "NVDA", {"2026-10-15": 200.0})
     run(world)
-    assert [(r["code"], r["h"], r["th"], r["r"]) for r in ledger_rows()] == [("NVDA", 5, "2026-10-08", 0.0)]
+    assert [(r["code"], r["h"], r["th"], r["r"]) for r in ledger_rows()] == [("NVDA", 5, "2026-10-09", 0.0)]
 
 
 # ── 彙總與卡片 ───────────────────────────────────────────────────────────────
@@ -676,7 +704,8 @@ def test_cards_and_alt_text_pass_card_ok(case):
         "invalid": {"schema": 99},
         "empty": _aggregate([]),
         "full": _aggregate(rows, first_t={"tw": "2026-10-01", "us": "2026-10-01"}),
-        "extreme": _aggregate([_row(t, h, 2.999, -0.899) for t in days * 2000 for h in (5, 20)][:20000]),
+        "extreme": _aggregate([_row(t, h, 2.999 if h <= 20 else 48.999, -0.899 if h <= 20 else -0.989)
+                               for t in days * 2000 for h in perf.HORIZONS][:40000]),
     }
     result = results[case]
     card, alt = perf.perf_bubble(result), perf.perf_alt_text(result)
@@ -719,7 +748,8 @@ def test_summary_reads_only_the_result_file(world, monkeypatch):
 
     monkeypatch.setattr(stock_db_ro, "rows", boom)
     monkeypatch.setattr(stock_picks, "_write_json_file", boom)
-    assert perf.summary() == {"perf_date": "2026-11-30", "ledger_rows": 4, "ledger_full": False, "pending": 2,
+    # pending：11/27 那天的 4 個天數＋10/01 兩檔的 60、240 日
+    assert perf.summary() == {"perf_date": "2026-11-30", "ledger_rows": 4, "ledger_full": False, "pending": 8,
                               "skipped": 2}
     assert perf.load_result() == result
 
@@ -746,10 +776,13 @@ def test_borrowed_names_and_interface():
                  "_permille", "_text", "_separator", "_bubble"):
         assert hasattr(stock_picks, name), name
     assert stock_picks.AI_RULE == "ai_v1"
-    assert (perf.US_HISTORY_NAME, perf.RESULT_NAME, perf.LEDGER_NAME, perf.STATE_NAME) == (
+    assert (perf.US_HISTORY_NAME, perf.RESULT_NAME, perf.LEDGER_NAME, perf.STATE_NAME, perf.PRICES_NAME) == (
         "stock_picks_us_history.jsonl", "stock_picks_perf.json", "stock_picks_perf_ledger.jsonl",
-        "stock_picks_perf_state.json")
-    assert (perf.HORIZONS, perf.MIN_N, perf.LEDGER_MAX_BYTES) == ((5, 20), 5, 10 * 1024 * 1024)
+        "stock_picks_perf_state.json", "stock_picks_perf_prices.json")
+    assert (perf.HORIZONS, perf.CARD_HORIZONS, perf.MIN_N, perf.LEDGER_MAX_BYTES) == (
+        (5, 20, 60, 240), (5, 20), 5, 10 * 1024 * 1024)
+    assert (perf.LEDGER_VERSION, perf.STATE_SCHEMA, perf.RESULT_SCHEMA) == (2, 1, 2)
+    assert perf.REVIEW_DB == Path("stock_picks_review") / "review.sqlite"
     params = inspect.signature(perf.update).parameters
     assert list(params) == ["ai_enabled", "now", "db_path"]
     assert all(p.kind is inspect.Parameter.KEYWORD_ONLY for p in params.values())
@@ -768,15 +801,16 @@ def test_does_not_import_the_us_module_or_market_jobs():
 
 
 # ── 實作後審查（P3／P4）補的 ─────────────────────────────────────────────────
-def test_rows_computed_after_the_next_open_do_not_count(world):  # P3 #1：不偷看答案
+def test_rows_computed_after_e_close_do_not_count(world):  # P3 #1：不偷看答案（v2 的界線＝E 收盤 13:30）
     days = world.tw()
-    for code in ("1101", "1102", "1103"):
+    for code in ("1101", "1102", "1103", "1104"):
         world.closes("tw", code, {d: 100.0 for d in days})
     world.closes("tw", "2301", {d: (100.0 if d == "2026-10-01" else 110.0) for d in days})
     write_jsonl(stock_picks.HISTORY_NAME, [
         old_line("2026-10-01", ("1101", 100.0)),  # 10/01 下午算出來：家人當天看到
-        old_line("2026-10-02", ("1102", 100.0), computed_at=_ts("2026-10-05", 9) + 1800),  # 下一個交易日 09:30 才算出來
-        old_line("2026-10-05", ("1103", 100.0), computed_at=_ts("2026-10-06", 8) + 3540),  # 08:59：還在開盤前
+        old_line("2026-10-02", ("1102", 100.0), computed_at=_ts("2026-10-05", 13) + 1800),  # E 13:30 整才算出來：不算
+        old_line("2026-10-05", ("1103", 100.0), computed_at=_ts("2026-10-06", 13) + 1799),  # 13:29:59：還來得及
+        old_line("2026-10-06", ("1104", 100.0), computed_at=_ts("2026-10-07", 9) + 1800),  # 開盤後、收盤前（v1 不算）
     ])
     # 反例 S1：快照卡在 10/01，10/09 才開 AI，AI 對 t＝10/01 算出 2301（這時 2301 已經漲了 10%）
     write_jsonl(stock_picks.AI_HISTORY_NAME,
@@ -784,37 +818,39 @@ def test_rows_computed_after_the_next_open_do_not_count(world):  # P3 #1：不�
     write_state(flags={"2026-10-01": False})
     run(world)
     got = {(r["t"], r["rule"], r["code"]) for r in ledger_rows() if r["h"] == 5}
-    assert got == {("2026-10-01", "v1", "1101"), ("2026-10-05", "v1", "1103")}
+    assert got == {("2026-10-01", "v1", "1101"), ("2026-10-05", "v1", "1103"), ("2026-10-06", "v1", "1104")}
     assert read_state()["ai_first_t"] is None  # 晚算出來的 AI 行也不算「看過的第一個 AI 紀錄」
 
 
-def test_us_rows_must_be_computed_before_the_new_york_open(world):  # P3 #1：美東 09:30，夏令時間照當地
+def test_us_rows_must_be_computed_before_the_new_york_e_close(world):  # 美東 13:00（半日市也收了），夏令時間照當地
     days = world.us()
-    for code in ("NVDA", "AAPL", "MSFT"):
+    for code in ("NVDA", "AAPL", "MSFT", "AMZN"):
         world.closes("us", code, {d: 100.0 for d in days})
     write_jsonl(perf.US_HISTORY_NAME, [
-        us_line("2026-10-01", ("NVDA", 100.0), computed_at=_ts("2026-10-02", 21)),  # 美東 09:00（EDT）：開盤前
-        us_line("2026-10-05", ("AAPL", 100.0), computed_at=_ts("2026-10-06", 22)),  # 美東 10:00（EDT）：開盤後
-        us_line("2026-11-02", ("MSFT", 100.0), computed_at=_ts("2026-11-03", 22)),  # 美東 09:00（EST）：開盤前
+        us_line("2026-10-01", ("NVDA", 100.0), computed_at=_ts("2026-10-03", 0) + 3599),  # E＝10/02 12:59:59（EDT）
+        us_line("2026-10-05", ("AAPL", 100.0), computed_at=_ts("2026-10-07", 1)),  # E＝10/06 13:00（EDT）整：不算
+        us_line("2026-10-30", ("AMZN", 100.0), computed_at=_ts("2026-11-03", 1) + 1800),  # E＝11/02 12:30（EST，夏令剛結束）
+        us_line("2026-11-02", ("MSFT", 100.0), computed_at=_ts("2026-11-04", 1) + 3599),  # E＝11/03 12:59:59（EST）
     ])
     run(world)
-    assert {(r["t"], r["code"]) for r in ledger_rows()} == {("2026-10-01", "NVDA"), ("2026-11-02", "MSFT")}
+    assert {(r["t"], r["code"]) for r in ledger_rows()} == {
+        ("2026-10-01", "NVDA"), ("2026-10-30", "AMZN"), ("2026-11-02", "MSFT")}
 
 
 def test_next_session_unknown_waits_but_prices_are_collected(world):
     world.tw(last="2026-10-02")
     world.closes("tw_all", "6666", {"2026-10-01": 80.0, "2026-10-02": 81.0})
     write_jsonl(stock_picks.HISTORY_NAME, [old_line("2026-10-02", ("6666", 81.0))])
-    result = run(world, now=_ts("2026-10-02"))  # 10/02 之後的交易日還不在日曆上：還判不了這一行算不算
+    result = run(world, now=_ts("2026-10-02"))  # E（10/02 之後的交易日）還不在日曆上：還判不了這一行算不算
     assert result["markets"]["tw"]["h"]["5"]["pending"] == 0
-    state = read_state()
-    assert state["prices"] == {"6666": {"2026-10-02": 81.0}}  # 價格先收（從 t 起）
-    assert state["needed"] == {"0050": "2026-10-02", "6666": "2026-10-02"}
+    library = read_library()
+    assert library["prices"] == {"6666": {"2026-10-02": 81.0}}  # 價格先收（從 t 起）
+    assert library["needed"] == {"0050": "2026-10-02", "6666": "2026-10-02"}
 
 
 def test_pinned_group_is_not_replaced_by_a_later_rev(world):  # P3 #2（反例 S2b）
     world.tw(last="2026-10-14")
-    world.closes("tw", "2301", {d: (100.0 if d == "2026-10-01" else 101.0) for d in tw_sessions()})
+    world.closes("tw", "2301", {d: (100.0 if d <= "2026-10-02" else 101.0) for d in tw_sessions()})
     write_jsonl(stock_picks.AI_HISTORY_NAME, [ai_line("2026-10-01", ("2301", 100.0))])
     run(world, now=_ts("2026-10-14"), ai=True)
     assert [(r["rev"], r["code"], r["h"]) for r in ledger_rows()] == [(1, "2301", 5)]
@@ -836,8 +872,8 @@ def test_quarantine_ending_on_t_counts(world):  # P3 #3（反例 S3）：盤勢 
     with world.store() as s:
         s.add_quarantine("us", "NVDA", D(t), D(t), "conflict")
     write_jsonl(perf.US_HISTORY_NAME, [us_line(t, ("NVDA", 200.0))])
-    world.us(last="2026-10-14")  # T_5 之後 4 個交易日：到期了，但 t 那根還在隔離 → 等
-    run(world, now=_ts("2026-10-15"))
+    world.us(last="2026-10-15")  # T_5（10/09）之後 4 個交易日：到期了，但 t 那根還在隔離 → 等
+    run(world, now=_ts("2026-10-16"))
     assert ledger_rows() == []
     world.us()  # 過了 10 個交易日還沒解除 → 凍結成跳過
     run(world)
@@ -858,12 +894,12 @@ def test_price_collection_survives_an_unreadable_history_file(world):  # P3 #5�
             s.prune("tw_all", 8)  # tw_all 只留最近幾天
         run(world, now=_ts(day))
     assert ledger_rows() == []  # 讀不了的這段時間不凍結
-    prices = read_state()["prices"]["6666"]
+    prices = read_library()["prices"]["6666"]
     assert len(prices) == 13 and min(prices) == "2026-10-01" and max(prices) == "2026-10-20"  # 照上一輪的 needed 收
     ai_path.rmdir()
     run(world, now=_ts("2026-10-20"))
     row = next(r for r in ledger_rows() if r["h"] == 5)
-    assert (row["skip"], row["r"]) == (None, pytest.approx(84 / 80 - 1, abs=1e-6))
+    assert (row["skip"], row["r"]) == (None, pytest.approx(84 / 81 - 1, abs=1e-6))  # E＝10/02 的 81
 
 
 def test_price_collection_survives_a_failing_query(world):  # P3 #5：休市表 JSON 壞掉（bad_json）也照收
@@ -878,7 +914,7 @@ def test_price_collection_survives_a_failing_query(world):  # P3 #5：休市表 
     con.close()
     result = run(world, now=_ts("2026-10-14"))
     assert result is not None and ledger_rows() == []  # 算成績要的查詢壞了：這一輪不凍結
-    assert "2026-10-14" in read_state()["prices"]["6666"]  # 價格照樣收
+    assert "2026-10-14" in read_library()["prices"]["6666"]  # 價格照樣收
 
 
 def test_waits_have_an_exit_after_10_sessions(world):  # P3 #10
@@ -889,10 +925,10 @@ def test_waits_have_an_exit_after_10_sessions(world):  # P3 #10
     result = run(world)
     got = {(r["t"], r["h"]): r["skip"] for r in ledger_rows()}
     assert got == {
-        ("2026-10-07", 5): "exrights",  # 除權息一直沒涵蓋過 T_5（10/15）
+        ("2026-10-07", 5): "exrights",  # 除權息一直沒涵蓋過 T_5（10/16）
         ("2026-10-07", 20): "calendar",  # 10/23 撤銷了臨時休市、TAIEX 又沒有那天：日曆一直不確定
         ("2026-10-16", 5): "calendar",
-    }  # 10/16 的 T_20 是 11/17，之後才 9 個交易日：還在等
+    }  # 10/16 的 T_20 是 11/18，之後才 8 個交易日：還在等
     assert result["markets"]["tw"]["h"]["20"]["pending"] == 1
 
 
@@ -918,7 +954,8 @@ def test_n_boundary_4_and_5():  # P4
 
 def test_reads_a_us_history_row_in_the_exact_stock_picks_us_shape(world):  # P4：讀的這一邊的契約
     days = world.us()
-    world.closes("us", "BRK.B", {d: (480.25 if d == "2026-10-01" else 490.0) for d in days})
+    world.closes("us", "BRK.B", {d: 480.25 if d == "2026-10-01" else 485.0 if d == "2026-10-02" else 490.0
+                                 for d in days})
     line = {"t": "2026-10-01", "market": "neutral",  # stock_picks_us._history_record 寫的欄位，一個不多一個不少
             "picks": [{"code": "BRK.B", "name": "BERKSHIRE HATHAWAY", "close": 480.25, "score": 4, "p60": 12}],
             "computed_at": round(_ts("2026-10-02", 14)), "rule": "us_v1"}
@@ -929,8 +966,9 @@ def test_reads_a_us_history_row_in_the_exact_stock_picks_us_shape(world):  # P4�
     rows = {r["h"]: r for r in ledger_rows()}
     assert set(rows) == {5, 20}
     assert (rows[5]["m"], rows[5]["rule"], rows[5]["rev"], rows[5]["code"]) == ("us", "us_v1", 1, "BRK.B")
-    assert (rows[5]["c0"], rows[5]["ch"], rows[5]["cf"], rows[5]["b0"]) == (480.25, 490.0, 1.0, 600.0)
-    assert rows[5]["skip"] is None and rows[5]["r"] == pytest.approx(490 / 480.25 - 1, abs=1e-6)
+    assert (rows[5]["c0"], rows[5]["ce"], rows[5]["ch"], rows[5]["cf"], rows[5]["be"]) == (480.25, 485.0, 490.0, 1.0,
+                                                                                          600.0)
+    assert rows[5]["skip"] is None and rows[5]["r"] == pytest.approx(490 / 485 - 1, abs=1e-6)
 
 
 # ── 公開介面的契約（回測週報的 job 用；PLAN 2026-10-29 §5.1：改名、不改行為） ─────────────
@@ -1019,3 +1057,317 @@ def test_read_ledger_rows_is_what_aggregate_reads(monkeypatch):
     (stock_picks.STATE_DIR / perf.LEDGER_NAME).mkdir()
     with pytest.raises((OSError, ValueError)):  # 讀不了不是「空的帳」
         perf.read_ledger_rows()
+
+
+# ── v2：隔天收盤進場、5／20／60／240 日（回測 PLAN 2026-10-29 §5.1 commit 2） ─────────────────
+LONG_DAYS = _weekdays("2026-01-05", "2027-06-30")  # 合成的長日曆：每個平日都是交易日
+
+
+def _grow(days: list[str], start: int, base: float, daily: float) -> dict:
+    """days[start] 起每天乘 daily（之前都是 base）：每天的漲跌都在 10% 以內，不會被 11% 防護擋掉。"""
+    return {d: base * daily ** max(0, i - start) for i, d in enumerate(days)}
+
+
+def test_v2_entry_is_the_next_session_close_and_t_h_counts_from_e():
+    days = LONG_DAYS
+    t, e = days[10], days[11]
+    stock = _grow(days, 11, 100.0, 1.001)
+    stock[t] = 90.0  # t → E 漲 11.1%：不在報酬區間裡，不算公司行動
+    data = _tw_market(days, stock, {d: 50.0 for d in days})
+    for h in perf.HORIZONS:
+        kind, row = perf.evaluate(perf.Candidate("tw", "ai_v1", t, 1, "2330", 90.0, h), data)
+        assert kind == perf.FREEZE and row["skip"] is None, h
+        assert row["th"] == days[11 + h]  # T_h＝E 之後第 h 個交易日
+        assert row["r"] == round(1.001 ** h - 1, 6) and row["b"] == 0.0
+        assert (row["c0"], row["ce"], row["be"], row["cf"], row["bf"]) == (90.0, 100.0, 50.0, 1.0, 1.0)
+        assert row["ch"] == pytest.approx(100.0 * 1.001 ** h)
+    assert perf.evaluate(perf.Candidate("tw", "ai_v1", e, 1, "2330", 100.0, 5), data)[1]["th"] == days[17]
+    mismatch = perf.evaluate(perf.Candidate("tw", "ai_v1", t, 1, "2330", 100.0, 5), data)[1]
+    assert mismatch["skip"] == "mismatch" and mismatch["c0"] == 90.0  # 照舊拿 t 的收盤核對家人看到的價格
+
+
+def test_v2_exrights_only_inside_e_to_t_h():
+    days = ["2026-10-06", "2026-10-07", "2026-10-08", *_weekdays("2026-10-12", "2026-10-30")]  # 10/09 休市
+    stock = {d: 50.0 for d in days if d <= "2026-10-08"} | {"2026-10-12": 48.0} | {
+        d: 47.0 for d in days if "2026-10-13" <= d <= "2026-10-19"} | {d: 40.0 for d in days if d >= "2026-10-20"}
+    events = {"2330": [("2026-10-09", 50.0, 49.0),  # 休市日：t＝10/07 時在 (E, T_5] 裡（算在 10/12）；t＝10/08 時在 t 和 E 之間
+                       ("2026-10-12", 49.0, 48.0),  # t＝10/08 的 E 當天：E 的收盤已經除息，不算
+                       ("2026-10-13", 48.0, 47.0),  # 兩個 t 都在區間裡
+                       ("2026-10-20", 47.0, 40.0)]}  # 兩個 T_5 之後：不算
+    data = perf.MarketData("tw", tuple(days), {"2330": stock, "0050": {d: 100.0 for d in days}}, {},
+                           closed_by_year={2026: frozenset({"2026-10-09"})},
+                           coverage=(("2020-01-01", "2099-12-31"),), exrights=events)
+    _, a = perf.evaluate(perf.Candidate("tw", "v1", "2026-10-07", 1, "2330", 50.0, 5), data)
+    assert (a["th"], a["ce"], a["ch"]) == ("2026-10-16", 50.0, 47.0)
+    assert a["cf"] == pytest.approx(50 / 47) and a["r"] == pytest.approx(0.0, abs=1e-6)
+    _, b = perf.evaluate(perf.Candidate("tw", "v1", "2026-10-08", 1, "2330", 50.0, 5), data)
+    assert (b["th"], b["ce"], b["ch"]) == ("2026-10-19", 48.0, 47.0)
+    assert b["cf"] == pytest.approx(48 / 47) and b["r"] == pytest.approx(0.0, abs=1e-6)  # 算進 10/09、10/12 會變 +4.2%
+
+
+def test_v2_us_split_on_e_is_fine_but_inside_the_window_skips():
+    days = _weekdays("2026-09-01", "2026-11-30")
+    t, spy = "2026-10-01", {d: 600.0 for d in days}
+
+    def row(split_day):
+        stock = {d: (400.0 if d < split_day else 100.0) for d in days}  # 一拆四，DB 還沒整段調整
+        data = perf.MarketData("us", tuple(days), {"NVDA": stock, "SPY": spy}, {}, splits={"NVDA": [split_day]})
+        return perf.evaluate(perf.Candidate("us", "us_v1", t, 1, "NVDA", 400.0, 5), data)[1]
+
+    on_e = row("2026-10-02")  # E 當天分割：E、T_h 都是分割後的價格，報酬照算（t 的收盤不比）
+    assert (on_e["skip"], on_e["r"], on_e["c0"], on_e["ce"]) == (None, 0.0, 400.0, 100.0)
+    assert row("2026-10-05")["skip"] == "split"  # (E, T_h] 裡：跳過
+
+
+@pytest.mark.parametrize("market", ["tw", "us"])
+def test_v2_t_must_be_on_the_calendar(market):
+    bench = "0050" if market == "tw" else "SPY"
+    days = _weekdays("2026-03-02", "2026-12-31")
+    prices = {"2330": {d: 100.0 for d in ["2026-02-27", *days]}, bench: {d: 50.0 for d in ["2026-02-27", *days]}}
+
+    def data(calendar):
+        return perf.MarketData(market, tuple(calendar), prices, {}, closed_by_year={2026: frozenset()},
+                               coverage=(("2020-01-01", "2099-12-31"),))
+
+    early = perf.Candidate(market, "x_v1", "2026-02-27", 1, "2330", 100.0, 5)  # 比日曆的起點早（bisect 回 0）
+    _, row = perf.evaluate(early, data(days))
+    assert row["skip"] == "calendar" and row["r"] is None  # 不默默把 E 當成日曆的第一天
+    hole = [d for d in days if d != "2026-06-10"]  # t 那天日曆有洞
+    _, row = perf.evaluate(perf.Candidate(market, "x_v1", "2026-06-10", 1, "2330", 100.0, 5), data(hole))
+    assert row["skip"] == "calendar"
+    recent = [d for d in days if d <= "2026-03-20" and d != "2026-03-02"]  # 還沒過 10 個交易日：先等
+    assert perf.evaluate(perf.Candidate(market, "x_v1", "2026-03-02", 1, "2330", 100.0, 5), data(recent)) == (
+        perf.WAIT, "calendar")
+
+
+def test_v2_range_depends_on_h_and_keeps_real_long_run_winners():
+    days = LONG_DAYS
+    t = days[10]
+    flat = {d: 50.0 for d in days}
+
+    def tw(daily, h):
+        stock = _grow(days, 11, 100.0, daily)
+        return perf.evaluate(perf.Candidate("tw", "ai_v1", t, 1, "2408", 100.0, h),
+                             _tw_market(days, stock, flat, code="2408"))[1]
+
+    assert tw(4.5 ** (1 / 20), 20)["skip"] == "range"  # 20 日 +350%：家人卡片的天數照舊當資料錯
+    assert tw(4.5 ** (1 / 60), 60)["r"] == pytest.approx(3.5, abs=1e-5)  # 60 日 +350%：算數（實測有 +368%）
+    winner = tw(11.64 ** (1 / 240), 240)  # 2408 的真實量級：240 日 +1064%，每天都在 ±10% 內
+    assert winner["skip"] is None and winner["r"] == pytest.approx(10.64, abs=1e-5)
+    assert tw(51.0 ** (1 / 240), 240)["skip"] == "range"  # +5000%：還是當資料錯
+    spy = {d: 600.0 for d in days}
+
+    def us(drop, h):
+        stock = {d: (100.0 if i <= 11 else 100.0 * (1 - drop)) for i, d in enumerate(days)}
+        data = perf.MarketData("us", tuple(days), {"NVDA": stock, "SPY": spy}, {})
+        return perf.evaluate(perf.Candidate("us", "us_v1", t, 1, "NVDA", 100.0, h), data)[1]
+
+    assert us(0.95, 5)["skip"] == "range" and us(0.95, 20)["skip"] == "range"  # ≤ −90%
+    assert us(0.95, 60)["r"] == pytest.approx(-0.95) and us(0.95, 240)["skip"] is None  # 長天數到 −99% 才算錯
+    assert us(0.995, 240)["skip"] == "range"
+    assert perf.r_range(5) == perf.r_range(20) == (-0.9, 3.0)
+    assert perf.r_range(60) == perf.r_range(240) == (-0.99, 49.0)
+
+
+def test_close_deadline_is_e_close_1330_taipei_and_1300_new_york_with_dst():
+    tw_cal = ["2026-10-01", "2026-10-02", "2026-10-05"]
+    assert perf.close_deadline("tw", "2026-10-01", tw_cal) == datetime(2026, 10, 2, 13, 30, tzinfo=TPE).timestamp()
+    assert perf.close_deadline("tw", "2026-10-02", tw_cal) == datetime(2026, 10, 5, 13, 30, tzinfo=TPE).timestamp()
+    assert perf.close_deadline("tw", "2026-10-05", tw_cal) is None  # E 還不在日曆上：先等
+    utc = timezone.utc
+    cases = [("2026-10-01", "2026-10-02", datetime(2026, 10, 2, 17, 0, tzinfo=utc)),  # EDT：13:00＝17:00 UTC
+             ("2026-10-30", "2026-11-02", datetime(2026, 11, 2, 18, 0, tzinfo=utc)),  # 11/01 夏令結束：EST＝18:00 UTC
+             ("2026-03-06", "2026-03-09", datetime(2026, 3, 9, 17, 0, tzinfo=utc)),  # 03/08 夏令開始
+             ("2026-11-25", "2026-11-27", datetime(2026, 11, 27, 18, 0, tzinfo=utc))]  # 感恩節隔天半日市：一樣 13:00
+    for t, e, want in cases:
+        assert perf.close_deadline("us", t, [t, e]) == want.timestamp(), t
+    assert not hasattr(perf, "open_after") and not hasattr(perf, "MARKET_OPEN")  # 只有一個期限函式
+
+
+def test_v2_ignores_v1_rows_and_v1_pins(world):
+    days = world.tw()
+    for code in ("2301", "2302"):
+        world.closes("tw", code, {d: 100.0 for d in days})
+    write_jsonl(stock_picks.AI_HISTORY_NAME, [
+        ai_line("2026-10-01", ("2301", 100.0)),
+        ai_line("2026-10-01", ("2302", 100.0), rev=2, computed_at=_ts("2026-10-02", 10)),  # E 開盤後、收盤前
+    ])
+    write_jsonl(perf.LEDGER_NAME, [_row("2026-10-01", 5, 0.3, 0.0, rule="ai_v1", code="2301", v=1),  # v1 釘住 rev 1
+                                   _row("2026-10-01", 20, 0.3, 0.0, rule="ai_v1", code="2301", v=1)])
+    result = run(world, ai=True)
+    fresh = [r for r in ledger_rows() if r["v"] == 2]
+    assert {(r["rev"], r["code"], r["h"]) for r in fresh} == {(2, "2302", 5), (2, "2302", 20)}
+    h5 = result["markets"]["tw"]["h"]["5"]
+    assert (h5["n"], h5["r_pm"]) == (1, 0)  # v1 的 +30% 不算進 v2 的成績（留在帳裡備查）
+    assert len(perf.read_ledger_rows()) == 4
+
+
+def test_us_v1_and_us_v2_rules_both_count(world):
+    days = world.us()
+    world.closes("us", "NVDA", {d: 100.0 for d in days})
+    write_jsonl(perf.US_HISTORY_NAME, [us_line("2026-10-01", ("NVDA", 100.0)),
+                                       us_line("2026-10-02", ("NVDA", 100.0)) | {"rule": "us_v2"}])
+    result = run(world)
+    assert {(r["t"], r["rule"]) for r in ledger_rows() if r["h"] == 5} == {("2026-10-01", "us_v1"),
+                                                                             ("2026-10-02", "us_v2")}
+    assert result["markets"]["us"]["h"]["5"]["n"] == 2
+
+
+# ── v2 價格庫（獨立的檔）、共用狀態檔、回補 ─────────────────────────────────────────────
+def _v1_state(prices=None, needed=None, flags=None) -> dict:
+    payload = {"schema": 1, "prices": prices or {}, "needed": needed or {}, "ai_flag_by_t": flags or {},
+               "ai_first_t": None}
+    (stock_picks.STATE_DIR / perf.STATE_NAME).write_text(json.dumps(payload), encoding="utf-8")
+    return payload
+
+
+def test_v2_library_is_its_own_file_and_survives_a_v1_style_rebuild(world):
+    world.tw(last="2026-10-02")
+    world.closes("tw_all", "6666", {"2026-10-01": 80.0, "2026-10-02": 81.0})
+    write_jsonl(stock_picks.HISTORY_NAME, [old_line("2026-10-01", ("6666", 80.0))])
+    v1 = _v1_state(prices={"1234": {"2026-09-30": 10.0}}, needed={"1234": "2026-09-30"})
+    run(world, now=_ts("2026-10-02"))
+    assert read_library()["prices"] == {"6666": {"2026-10-01": 80.0, "2026-10-02": 81.0}}
+    state = read_state()
+    assert set(state) == {"schema", "prices", "needed", "ai_flag_by_t", "ai_first_t"} and state["schema"] == 1
+    assert (state["prices"], state["needed"]) == (v1["prices"], v1["needed"])  # v1 的價格庫原樣保留
+    assert state["ai_flag_by_t"] == {"2026-10-01": False}  # 共用的欄位照樣記
+    assert perf._state_from_json(state).flags == {"2026-10-01": False}  # v1 的讀法讀得懂
+    # 回滾或新舊程序重疊：v1 照自己的 needed 重建狀態檔裡的價格庫（沒有 6666），不碰 v2 的檔
+    _v1_state(prices={}, needed={}, flags={"2026-10-01": False})
+    days = world.tw(last="2026-10-30")
+    world.closes("tw_all", "6666", {d: 84.0 for d in days if d >= "2026-10-05"})
+    with world.store() as s:
+        s.prune("tw_all", 17)  # 10/01、10/02 滾掉了
+    run(world, now=_ts("2026-10-30"))
+    [row] = ledger_rows()
+    assert (row["h"], row["skip"], row["c0"], row["ce"]) == (5, None, 80.0, 81.0)
+    assert row["r"] == pytest.approx(84 / 81 - 1, abs=1e-6)
+    assert read_state()["prices"] == {}  # v2 沒有把自己的價格寫進共用狀態檔
+    assert read_library()["prices"]["6666"]["2026-10-01"] == 80.0  # 60、240 日還在等：留著
+    assert stat_mode(stock_picks.STATE_DIR / perf.PRICES_NAME) == 0o600
+
+
+def test_v1_price_library_seeds_v2(world):
+    days = world.tw(last="2026-10-30")
+    world.closes("tw_all", "6666", {d: 84.0 for d in days if d >= "2026-10-05"})  # 10/01、10/02 已經滾掉
+    write_jsonl(stock_picks.HISTORY_NAME, [old_line("2026-10-01", ("6666", 80.0))])
+    _v1_state(prices={"6666": {"2026-10-01": 80.0, "2026-10-02": 81.0}}, needed={"6666": "2026-10-01"})
+    run(world, now=_ts("2026-10-30"))
+    row = next(r for r in ledger_rows() if r["h"] == 5)
+    assert row["skip"] is None and row["r"] == pytest.approx(84 / 81 - 1, abs=1e-6)  # v1 收過的價格照樣用
+    assert read_library()["prices"]["6666"]["2026-10-02"] == 81.0  # 也搬進 v2 自己的價格庫
+    assert read_state()["prices"] == {"6666": {"2026-10-01": 80.0, "2026-10-02": 81.0}}  # v1 的不動
+
+
+def test_library_too_large_keeps_the_ledger_and_result_going(world, monkeypatch, caplog):
+    days = world.tw()
+    world.closes("tw", "2330", {d: 100.0 for d in days})
+    world.closes("tw_all", "6666", {d: 80.0 for d in days if d >= "2026-11-23"})
+    write_jsonl(stock_picks.HISTORY_NAME, [old_line("2026-10-01", ("2330", 100.0)),
+                                           old_line("2026-11-24", ("6666", 80.0))])  # 還沒到期：價格要進價格庫
+    real = stock_picks._write_json_file
+
+    def too_large_for_the_library(path, payload):
+        if path.name == perf.PRICES_NAME:
+            raise ValueError("state payload too large")  # stock_picks._write_json_file 超過 2 MiB 的那個例外
+        return real(path, payload)
+
+    monkeypatch.setattr(stock_picks, "_write_json_file", too_large_for_the_library)
+    result = run(world)
+    assert result is not None and perf.load_result() == result  # 結果檔照寫
+    assert {(r["t"], r["h"]) for r in ledger_rows()} == {("2026-10-01", 5), ("2026-10-01", 20)}
+    assert not (stock_picks.STATE_DIR / perf.PRICES_NAME).exists()
+    assert "price library too large" in caplog.text
+
+
+def test_library_worst_case_size_fits_and_codes_wait_for_the_240_day_row():
+    dates = _weekdays("2026-01-05", "2027-03-31")[:280]
+    library = perf._Library({f"{1100 + i}": {d: 12345.67 for d in dates} for i in range(150)},
+                            {f"{1100 + i}": dates[0] for i in range(150)})
+    data = json.dumps(perf._library_to_json(library), ensure_ascii=False, separators=(",", ":")).encode()
+    assert len(data) < stock_picks.STATE_MAX_BYTES / 2  # 150 檔 × 280 天還不到上限的一半（實際只有幾十檔）
+    only_240 = [perf.Candidate("tw", "ai_v1", "2026-10-01", 1, "6666", 80.0, 240)]
+    assert perf.needed_prices(only_240, {}) == {"6666": "2026-10-01", "0050": "2026-10-01"}  # 4 個天數都凍結才放掉
+
+
+def _review_db(rows, *, wal=True) -> Path:
+    path = stock_picks.STATE_DIR / perf.REVIEW_DB
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    con = sqlite3.connect(path)
+    if wal:
+        con.execute("PRAGMA journal_mode=WAL")
+    con.execute("CREATE TABLE prices (m TEXT, code TEXT, d TEXT, close REAL, src TEXT, seen_at REAL,"
+                " PRIMARY KEY (m, code, d))")
+    con.executemany("INSERT INTO prices VALUES (?, ?, ?, ?, 'tw_all', 0)", rows)
+    con.commit()
+    con.close()
+    return path
+
+
+def test_backfill_fills_rolled_off_closes_from_the_review_db(world):
+    days = world.tw(last="2026-10-30")
+    world.closes("tw_all", "6666", {d: 84.0 for d in days if d >= "2026-10-16"})  # tw_all 只剩 10/16 之後
+    write_jsonl(stock_picks.HISTORY_NAME, [old_line("2026-10-01", ("6666", 80.0))])
+    early = [d for d in days if "2026-10-05" <= d <= "2026-10-15"]
+    _review_db([("tw", "6666", "2026-10-01", 80.0), ("tw", "6666", "2026-10-02", 81.0)]
+               + [("tw", "6666", d, 82.0) for d in early]
+               + [("tw", "6666", "2026-09-30", 1.0),  # t 之前：不要
+                  ("tw", "9999", "2026-10-01", 5.0), ("us", "6666", "2026-10-01", 7.0)])  # 不需要的代號、別的市場
+    write_library(prices={"6666": {"2026-10-05": 82.5}})  # 價格庫已經有的優先
+    got = perf.backfill_prices(now=_ts("2026-10-30"), db_path=world.path)
+    assert got["status"] == "ok" and got["codes"] == 2 and got["added"] > 0  # 6666＋0050
+    prices = read_library()["prices"]
+    assert set(prices) == {"6666"} and min(prices["6666"]) == "2026-10-01"
+    assert (prices["6666"]["2026-10-01"], prices["6666"]["2026-10-05"]) == (80.0, 82.5)
+    assert not (stock_picks.STATE_DIR / perf.STATE_NAME).exists()  # 不記 ai_flag_by_t、不寫共用狀態檔
+    assert ledger_rows() == []  # 只補價格，不凍結
+    run(world, now=_ts("2026-10-30"))
+    row = next(r for r in ledger_rows() if r["h"] == 5)
+    assert row["skip"] is None and row["r"] == pytest.approx(82 / 81 - 1, abs=1e-6)  # 不是 missing
+
+
+def test_backfill_tolerates_a_missing_or_broken_review_db(world):
+    world.tw(last="2026-10-30")
+    write_jsonl(stock_picks.HISTORY_NAME, [old_line("2026-10-01", ("6666", 80.0))])
+    assert perf.backfill_prices(now=_ts("2026-10-30"), db_path=world.path)["status"] == "no_review_db"
+    assert not (stock_picks.STATE_DIR / perf.PRICES_NAME).exists()
+    path = stock_picks.STATE_DIR / perf.REVIEW_DB
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    path.write_bytes(b"not a sqlite file" * 100)
+    assert perf.backfill_prices(now=_ts("2026-10-30"), db_path=world.path)["status"] == "review_unavailable"
+    path.unlink()
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE other (x)")  # 沒有 prices 表
+    con.close()
+    assert perf.backfill_prices(now=_ts("2026-10-30"), db_path=world.path)["status"] == "review_unavailable"
+    (stock_picks.STATE_DIR / stock_picks.HISTORY_NAME).unlink()
+    (stock_picks.STATE_DIR / stock_picks.HISTORY_NAME).mkdir()  # 紀錄讀不了：判不了要補哪些
+    assert perf.backfill_prices(now=_ts("2026-10-30"), db_path=world.path)["status"] == "undecided"
+
+
+def test_result_schema_2_has_all_horizons_and_v1_results_are_invalid():
+    res = _aggregate([_row("2026-10-01", 240, 10.64, 0.2, th="2027-09-20"), _row("2026-10-01", 60, -0.95, 0.1)])
+    tw = res["markets"]["tw"]
+    assert res["schema"] == 2 and set(tw["h"]) == {"5", "20", "60", "240"}
+    assert (tw["h"]["240"]["r_pm"], tw["h"]["60"]["r_pm"]) == (10640, -950)
+    assert (tw["from"], tw["to"]) == (None, None)  # 卡上的「起、算到」只看 5、20 日
+    assert perf._check_result(res) is res
+    v1 = dict(res, schema=1)
+    assert perf._checked_or_none(v1) is None
+    (stock_picks.STATE_DIR / perf.RESULT_NAME).write_text(json.dumps(v1), encoding="utf-8")
+    assert perf.load_result() is None  # 回滾的反方向：v1 的結果檔也當成不合格，下一輪重算
+
+
+def test_card_shows_only_5_and_20_days_with_the_next_day_close_method():
+    assert perf.TEXT_METHOD == "算法：推薦隔天收盤，到之後第 5、20 個交易日的收盤；同一檔連續被推薦會算好幾次"
+    days = ["2026-10-01", "2026-10-02", "2026-10-05", "2026-10-06", "2026-10-07"]
+    rows = [_row(t, h, 0.03 if h <= 20 else 1.5, 0.01) for t in days for h in perf.HORIZONS]
+    res = _aggregate(rows)
+    card, alt = perf.perf_bubble(res), perf.perf_alt_text(res)
+    texts = card_texts(card)
+    assert perf.TEXT_METHOD in texts and stock_card_check.card_ok(card, alt)
+    assert "推薦後 5 個交易日：平均漲 3.0%，0050 同期漲 1.0%" in texts
+    assert "推薦後 20 個交易日：平均漲 3.0%，0050 同期漲 1.0%" in texts
+    assert not any("60 個交易日" in x or "240 個交易日" in x or "150" in x for x in texts + [alt])
+    assert alt.startswith("股票推薦：只供參考｜推薦成績｜台股推薦後 5 個交易日平均漲 3.0%")

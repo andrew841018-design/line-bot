@@ -1,39 +1,48 @@
-"""推薦成績（2026-10-28，/股票 第 3 段）：台股、美股推薦之後第 5、20 個交易日的實際漲跌，和 0050／SPY 比。
+"""推薦成績（2026-10-28 /股票 第 3 段；2026-10-29 改成 v2）：台股、美股推薦「隔天收盤」進場，到之後第 5、20、60、240
+個交易日的實際漲跌，和 0050／SPY 比。
 
-Andrew 10/28 選了「查詢＋推薦＋推薦成績」。爸媽會把成績卡上的數字當成事實看，所以這裡的原則是
-「每個輸入都確定了才算，算了就不改」（PLAN v5 §6）：
+Andrew 10/28 選了「查詢＋推薦＋推薦成績」；同一晚回測的討論定了 v2（回測 PLAN 2026-10-29 §0 第 1、2 題）：持有 5／20／60／240
+個交易日（週／月／季／年）、進場價＝推薦隔天的收盤。家人的成績卡只顯示 5、20 日（CARD_HORIZONS）；60、240 日寫進同一本帳，
+給回測週報用（週報數字和家人成績卡同一本帳）。爸媽會把成績卡上的數字當成事實看，所以這裡的原則是
+「每個輸入都確定了才算，算了就不改」（美股 PLAN v5 §6）：
 
-- 一筆成績＝（市場、規則、推薦日 t、rev、代號、h）。日曆確定、除權息資料涵蓋到、區間內每個交易日都有收盤，
-  才算出來寫進成績帳；還不確定就「等」（不寫帳，下一輪再看）；確定是壞資料（收盤和紀錄對不上、公司行動、分割、
-  隔離一直沒解除、價格已經拿不到、報酬不合理，或日曆／除權息過了 10 個交易日還是不確定）就「凍結成跳過」：
-  寫一行 skip，之後不再算，卡上寫出跳過幾次。帳的每一列也存算式的輸入（c0、ch、除權息因子，基準同樣三個），
-  日後公式改版可以核對、從帳推回來，不必再拿已經滾掉的價格。
+- 一筆成績＝（市場、規則、推薦日 t、rev、代號、h）。E＝t 之後第一個交易日（家人最早能照推薦買進的那一天，用它的收盤當進場價），
+  T_h＝E 之後第 h 個交易日。日曆確定、除權息資料涵蓋到、區間內每個交易日都有收盤，才算出來寫進成績帳；還不確定就「等」
+  （不寫帳，下一輪再看）；確定是壞資料（t 的收盤和紀錄對不上、公司行動、分割、隔離一直沒解除、價格已經拿不到、報酬不合理，
+  或日曆／除權息過了 10 個交易日還是不確定）就「凍結成跳過」：寫一行 skip，之後不再算，卡上寫出跳過幾次。帳的每一列也存
+  算式的輸入（c0＝t 的收盤（只拿來核對）、ce、ch、除權息因子 cf，基準 be、bh、bf），日後公式改版可以核對、從帳推回來。
 - 成績帳 state/stock_picks_perf_ledger.jsonl 只增不改：寫入拿 stock_picks._state_file_lock()，鎖內重讀帳、
   去掉已經有的鍵才 append（部署時新舊程序會短暫重疊）；讀不拿鎖，跳過寫到一半或看不懂的行，同一個鍵只算第一次寫的。
-  彙總與卡片只看帳：價格庫刪掉、紀錄檔被截斷，已經算出來的成績都不變；（市場、t）在帳裡一有列，就釘住那一組
-  （rule、rev），之後紀錄檔才多出來的 rev 不會把已經上卡的成績換掉（P3 #2）。
-- 紀錄要在「t 之後第一個交易日開盤」之前算出來才算數（台股台北 09:00、美股美東 09:30；P3 #1）：晚算出來的
-  那一行，家人看到時已經開盤了，從 t 的收盤算成績等於偷看答案。下一個交易日還不在日曆上就先等。
-- 台股價格要趁還在的時候收：DB 的 tw_all 每檔只留最近 10 個交易日（market_pipeline_tw.KEEP_ALL_SESSIONS），
-  還沒凍結、DB tw（0050 成分，約 300 個交易日的長歷史）又沒有的收盤，存進 state/stock_picks_perf_state.json 的
-  價格庫，凍結後就刪。收集自己查、自己 try（P3 #5）：紀錄檔讀不了、算成績的某個查詢壞了，照樣延長價格庫
-  （沿用上一輪記下的 needed）。除權息不存，算的時候直接查 DB exrights（不刪，還拿得到盤勢 job 事後修正的值）。
-  美股 DB 每檔都有一年多，不存。
+  彙總與卡片只看帳、而且只看目前版本（LEDGER_VERSION＝2）的列：v1（推薦當天收盤進場）的列留著備查。價格庫刪掉、紀錄檔被截斷，
+  已經算出來的成績都不變；（市場、t）在帳裡一有 v2 的列，就釘住那一組（rule、rev），之後紀錄檔才多出來的 rev 不會把已經上卡的
+  成績換掉（P3 #2）。
+- 紀錄要在「E 收盤」之前算出來才算數（台股台北 13:30、美股美東 13:00：半日市 13:00 就收，一律保守用 13:00；
+  close_deadline）：晚算出來的那一行，家人看到時已經過了進場的那一刻，算成績等於偷看答案。E 還不在日曆上就先等。
+- 台股價格要趁還在的時候收：DB 的 tw_all 每檔只留最近 10 個交易日（market_pipeline_tw.KEEP_ALL_SESSIONS），還沒凍結、
+  DB tw（0050 成分，約 300 個交易日的長歷史）又沒有的收盤，存進 v2 自己的價格庫 state/stock_picks_perf_prices.json
+  （v1 的程式不碰它，r3 #6），那一檔 4 個天數都凍結才刪。部署時用 backfill_prices() 從回測 job 的 review.sqlite（唯讀）
+  補一次。收集自己查、自己 try（P3 #5）：紀錄檔讀不了、算成績的某個查詢壞了，照樣延長價格庫（沿用上一輪記下的 needed）。
+  除權息不存，算的時候直接查 DB exrights（不刪，還拿得到盤勢 job 事後修正的值）。美股 DB 每檔都有一年多，不存。
+- 共用的狀態檔 state/stock_picks_perf_state.json 格式不變（STATE_SCHEMA 1）：v2 照樣讀寫 ai_flag_by_t、ai_first_t；
+  裡面 v1 的價格庫（prices、needed）v2 只拿來當補充來源、原樣保留，回滾到 v1 時照樣讀得懂。
 - 台股紀錄有兩份（舊規則 stock_picks_history.jsonl、AI 相關股 stock_picks_tw_ai_history.jsonl）：凍結時才決定
-  每個 t 用哪一份（decide_tw）；家人那天沒看到的「影子推薦」不算。
+  每個 t 用哪一份（decide_tw）；家人那天沒看到的「影子推薦」不算。規則看紀錄自己的 rule 欄位：美股 us_v1、us_v2 都算
+  （冷凍名單上線時美股升 us_v2），台股 AI 看 ai_ 開頭。
 - 美股推薦的 worker（stock_picks_us）每 30 分鐘呼叫一次 update()，美股開關關著也照呼叫（價格收集不能停）；
   這裡不 import stock_picks_us。DB 只透過 stock_db_ro 唯讀；回覆路徑只讀結果檔（load_result），不碰 DB。
 
 算法：
-- 報酬 r＝第 h 個交易日的收盤 ÷ 推薦當天收盤 − 1。台股含股利：每對相鄰交易日 (前一天, 這一天] 之間的除權息
-  （含落在休市日的）用「除權息前收盤 ÷ 參考價」還原在這一天；美股只算股價。基準：台股 0050（同樣還原）、美股 SPY。
-- 日曆：台股 TAIEX 的日期，[t, T_h] 裡每個平日都要是 TAIEX 有收盤的日子或確定休市（證交所休市表、颱風臨時休市
-  confirmed 或已過 10 天），T_h 之後還要有 2 個交易日，除權息資料要涵蓋到 T_h 的隔天以後（盤勢 job 下次會重讀
-  最後一天；P3 #4）；美股 SPY／VOO／QQQ 的日期聯集，T_h 之後還要有 4 個交易日，而且這一檔和 SPY 自己都有第 4 天
-  的收盤（盤勢 job 每次把每檔最近 4 個交易日整段重抓、差 ≤ 0.5% 直接覆蓋：PLAN 的「至少 2 個」之外再等這段改寫
-  結束，T_h 的收盤才是定案）。
+- 報酬 r＝T_h 的收盤 × 除權息因子 ÷ E 的收盤 − 1。台股含股利：(E, T_h] 裡每對相鄰交易日 (前一天, 這一天] 之間的除權息
+  （含落在休市日的）用「除權息前收盤 ÷ 參考價」還原在這一天；E 當天（和 t、E 之間）的除權息不算：E 的收盤已經是除權息後的。
+  美股只算股價。基準：台股 0050（同樣還原）、美股 SPY。
+- r 的合理範圍依 h：5、20 日是 (−90%, +300%)；60、240 日是 (−99%, +4900%)（DB 實測一年真的有 +1064% 的，r1 #4）。
+- 日曆：t 本身要在日曆上（r3 #4：t 比日曆的起點早、或 t 那天有洞時，E、T_h 會默默錯位）；台股 TAIEX 的日期，[t, T_h]
+  裡每個平日都要是 TAIEX 有收盤的日子或確定休市（證交所休市表、颱風臨時休市 confirmed 或已過 10 天），T_h 之後還要有
+  2 個交易日，除權息資料要涵蓋到 T_h 的隔天以後（盤勢 job 下次會重讀最後一天；P3 #4）；美股 SPY／VOO／QQQ 的日期聯集，
+  T_h 之後還要有 4 個交易日，而且這一檔和 SPY 自己都有第 4 天的收盤（盤勢 job 每次把每檔最近 4 個交易日整段重抓、差 ≤ 0.5%
+  直接覆蓋：PLAN 的「至少 2 個」之外再等這段改寫結束，T_h 的收盤才是定案）。
 - 已知限制（規則檔註明）：8% 這種小比例減資擋不住（11% 防護只擋大比例）；同一檔連續被推薦會算好幾次；台股紀錄
-  多半在隔天早上 05:20–09:00 才算出來，09:00 以後才算出來的那一天不算成績。
+  多半在隔天早上 05:20–09:00 才算出來，E 收盤（13:30）以後才算出來的那一天不算成績。
 """
 
 from __future__ import annotations
@@ -66,31 +75,38 @@ _ET = ZoneInfo("America/New_York")
 US_HISTORY_NAME = "stock_picks_us_history.jsonl"  # 美股推薦紀錄（stock_picks_us 寫；檔名以這裡為準）
 RESULT_NAME = "stock_picks_perf.json"  # 彙總結果（小檔；卡片只讀這份）
 LEDGER_NAME = "stock_picks_perf_ledger.jsonl"  # 只增不改的成績帳
-STATE_NAME = "stock_picks_perf_state.json"  # 台股價格庫＋needed＋ai_flag_by_t＋ai_first_t
-LEDGER_VERSION = 1  # 算法版本（帳的 v）：公式改了就升版，彙總只看目前版本，舊列留著備查
-STATE_SCHEMA = 1
-RESULT_SCHEMA = 1
-LEDGER_MAX_BYTES = 10 * 1024 * 1024  # 一天十幾行、一行約 250 字，夠用幾十年；滿了記 error、summary 報
+STATE_NAME = "stock_picks_perf_state.json"  # 共用狀態檔：ai_flag_by_t＋ai_first_t（＋v1 的價格庫與 needed：v2 只讀、原樣保留）
+PRICES_NAME = "stock_picks_perf_prices.json"  # v2 的台股價格庫＋needed（獨立的檔：v1 的程式不碰它；r3 #6）
+REVIEW_DB = Path("stock_picks_review") / "review.sqlite"  # 回測 job 的庫（STATE_DIR 底下）；只有 backfill_prices 唯讀它
+LEDGER_VERSION = 2  # 算法版本（帳的 v）：公式改了就升版，彙總只看目前版本，舊列留著備查（v1＝推薦當天收盤進場、5／20 日）
+STATE_SCHEMA = 1  # 不升：v2 不改狀態檔的格式，回滾到 v1 時照樣讀得懂
+PRICES_SCHEMA = 1
+RESULT_SCHEMA = 2  # v1 讀到 schema 2 會當成不合格、自己重算（反過來 v2 讀到 v1 的結果檔也一樣）
+LEDGER_MAX_BYTES = 10 * 1024 * 1024  # 一天幾十行、一行約 300 字，夠用很多年；滿了記 error、summary 報
 HISTORY_MAX_BYTES = 6 * 1024 * 1024  # 紀錄檔自己的上限是 5 MB（stock_picks.HISTORY_MAX_BYTES）：留一點餘裕
 TMP_MAX_AGE_S = 3600.0  # 當機留下的暫存檔超過 1 小時清掉
 
-# ── 算法（PLAN v5 §6） ──────────────────────────────────────────────────────
-HORIZONS = (5, 20)  # 推薦後第幾個交易日
+# ── 算法（美股 PLAN v5 §6；回測 PLAN 2026-10-29 §5.1 的 v2） ─────────────────────
+HORIZONS = (5, 20, 60, 240)  # 寫進帳的天數：E 之後第幾個交易日（週、月、季、年）
+CARD_HORIZONS = (5, 20)  # 家人的成績卡只顯示這兩個（60、240 日給回測週報）
 MIN_N = 5  # 次數少於這個，卡上寫「紀錄還不夠」
 TW, US = "tw", "us"
 TW_OLD_RULE = "v1"  # 舊規則紀錄沒有 rule 欄位
-US_RULE = "us_v1"
+US_RULE = "us_v1"  # 美股紀錄沒有 rule 欄位時的預設（有就照紀錄的：us_v1、us_v2 都算）
 TW_BENCHMARK, US_BENCHMARK = "0050", "SPY"
-MARKET_OPEN = {TW: (_TPE, 9, 0), US: (_ET, 9, 30)}  # 紀錄要在「t 之後第一個交易日」的這個時間之前算出來才算數
+MARKET_CLOSE = {TW: (_TPE, 13, 30), US: (_ET, 13, 0)}  # 紀錄要在 E（t 之後第一個交易日）的這個時間之前算出來才算數
 C0_TOLERANCE = 0.005  # 推薦當天的 DB 收盤和紀錄上的收盤差 ≤ 0.5%（不然就是對不上：mismatch）
 TW_JUMP_LIMIT = 0.11  # 台股漲跌幅 10%：還原後相鄰兩個交易日漲跌超過 11%＝大比例減資、分割這類公司行動（jump）
 EXRIGHT_RATIO = (1.0, 3.0)  # 除權息前收盤 ÷ 參考價只收 1–3（< 1 的現金增資除權、> 3 都當公司行動：jump）
-R_RANGE = (-0.9, 3.0)  # r ≤ −90% 或 ≥ +300% 當資料錯（range）
+R_RANGE_SHORT = (-0.9, 3.0)  # h ≤ 20：r ≤ −90% 或 ≥ +300% 當資料錯（range；家人卡片上的天數照舊）
+R_RANGE_LONG = (-0.99, 49.0)  # h ≥ 60：一季、一年真的會漲好幾倍（DB 實測 240 日有 +1064%、60 日有 +368%；r1 #4）
 TW_BUFFER_SESSIONS = 2  # T_h 之後日曆上還要有幾個交易日（後面先寫、前面後補的洞多半隔天就補上）
 US_BUFFER_SESSIONS = 4  # 美股：盤勢 job 每天整段重抓最近 4 個交易日（market_pipeline_us 的 3＋1），過了才定案
 SETTLE_SESSIONS = 10  # T_h 之後過了 10 個交易日：價格、隔離、日曆、除權息都不再等，凍結成跳過
 SKIP_REASONS = ("mismatch", "jump", "split", "quarantine", "missing", "range", "calendar", "exrights")
-INPUT_KEYS = ("c0", "ch", "cf", "b0", "bh", "bf")  # 帳裡存的算式輸入：這一檔、基準各（推薦日收盤、T_h 收盤、除權息因子）
+# 帳裡存的算式輸入：t 的收盤（核對用）；這一檔、基準各（E 收盤、T_h 收盤、除權息因子）
+INPUT_KEYS = ("c0", "ce", "ch", "cf", "be", "bh", "bf")
+_LEDGER_INPUT_KEYS = ("c0", "ce", "ch", "cf", "b0", "be", "bh", "bf")  # 讀帳時認得的輸入欄位（含 v1 列的 b0）
 COVERAGE_SOURCE = "twt49u"  # 除權息（證交所 TWT49U）已經查到哪一天：盤勢 job 的 coverage 表
 WAIT, FREEZE = "wait", "freeze"
 SOURCE_WAIT, SOURCE_SKIP = "source_wait", "source_skip"  # decide_*：還判不了／這個 t 不算
@@ -141,6 +157,11 @@ def _code_re(market: str) -> re.Pattern:
     return _TW_CODE_RE if market == TW else _US_SYMBOL_RE
 
 
+def r_range(h: int) -> tuple[float, float]:
+    """報酬（這一檔和基準都是）的合理範圍，開區間：5、20 日 (−90%, +300%)；60、240 日 (−99%, +4900%)。"""
+    return R_RANGE_SHORT if h <= 20 else R_RANGE_LONG
+
+
 # ── 紀錄檔（三份；讀不拿鎖，壞行跳過） ─────────────────────────────────────────
 @dataclass(frozen=True)
 class Pick:
@@ -175,7 +196,7 @@ def _record_from(obj, *, market: str, fixed_rule: Optional[str], default_rule: s
     if t is None or t > today:  # 被改成未來日期的行不算（和 stock_picks._history_tail 一樣）
         return None
     computed_at = _finite(obj.get("computed_at"), 0.0, 1e11)
-    if computed_at is None:  # 不知道什麼時候算出來的：判斷不了家人看到時開盤了沒，不算
+    if computed_at is None:  # 不知道什麼時候算出來的：判斷不了家人看到時過了進場的那一刻沒有，不算
         return None
     rev = obj.get("rev")
     rev = 1 if rev is None else rev  # 計畫 C 之前的行沒有 rev：當 1
@@ -211,24 +232,25 @@ def parse_records(
     objs: Iterable, *, market: str, fixed_rule: Optional[str] = None, default_rule: str, today: str
 ) -> dict[str, Record]:
     """{t: rev 最大的那一行}：只解析、不看算出來的時間（讀的這一邊的契約；test_stock_picks_us 用它核對寫入端的格式）。
-    成績本身用 parse_rows＋decide_*（先排除開盤後才算出來的行）。"""
+    成績本身用 parse_rows＋decide_*（先排除 E 收盤以後才算出來的行）。"""
     rows = parse_rows(objs, market=market, fixed_rule=fixed_rule, default_rule=default_rule, today=today)
     return {t: latest(recs) for t, recs in rows.items()}
 
 
-def open_after(market: str, t: str, calendar: Sequence[str]) -> Optional[float]:
-    """t 之後第一個交易日的開盤時間（epoch 秒；台股台北 09:00、美股美東 09:30，夏令時間照當地）；
-    日曆上還沒有那一天 → None（還判不了，先等）。"""
+def close_deadline(market: str, t: str, calendar: Sequence[str]) -> Optional[float]:
+    """E（t 之後第一個交易日）收盤的時間（epoch 秒；台股台北 13:30、美股美東 13:00，夏令時間照當地）：紀錄要在這之前
+    算出來才算數，家人才來得及照推薦用 E 的收盤買進。美股半日市 13:00 就收，一律用 13:00（寧可少算幾天，不偷看）。
+    日曆上還沒有 E → None（還判不了，先等）。選來源、ai_first_t 都只用這一個期限；回測 job 選版也用它。"""
     i = bisect.bisect_right(calendar, t)
     if i >= len(calendar):
         return None
     day = date.fromisoformat(calendar[i])
-    tz, hour, minute = MARKET_OPEN[market]
+    tz, hour, minute = MARKET_CLOSE[market]
     return datetime(day.year, day.month, day.day, hour, minute, tzinfo=tz).timestamp()
 
 
 def _eligible(rows: Sequence[Record], deadline: Optional[float]) -> list[Record]:
-    """開盤之前就算出來的那幾行（P3 #1：晚算出來的那一行，家人看到時已經開盤，從 t 的收盤算成績就是偷看答案）。"""
+    """E 收盤之前就算出來的那幾行（P3 #1：晚算出來的那一行，家人看到時已經過了進場的那一刻，算成績就是偷看答案）。"""
     return [] if deadline is None else [r for r in rows if r.computed_at < deadline]
 
 
@@ -243,12 +265,12 @@ def latest(rows: Sequence[Record]) -> Optional[Record]:
 
 def decide_tw(t: str, old_rows: Sequence[Record], ai_rows: Sequence[Record], deadline: Optional[float],
               flags: dict[str, bool], ai_first_t: Optional[str]):
-    """凍結前才決定台股的 t 用哪一份紀錄（PLAN v5 §6；r4 #1）。先只留開盤前算出來的行（P3 #1），再：
+    """凍結前才決定台股的 t 用哪一份紀錄（PLAN v5 §6；r4 #1）。先只留 E 收盤前算出來的行（P3 #1），再：
     ① AI 檔有 t → 用它（rev 最大的）；
     ② 記到 t 那天 AI 開著 → 不算：家人看到的是上一份 AI 推薦或「計算中」，舊檔那行是沒人看過的影子推薦；
     ③ 記到關著 → 舊檔；
     ④ 沒記到（本功能上線前、worker 沒在跑的日子）→ t 早於看過的第一個 AI 紀錄（或從來沒有 AI 檔）才用舊檔，否則不猜。
-    回 Record、SOURCE_SKIP（這一輪不算：不凍結，下一輪重判）或 SOURCE_WAIT（t 之後第一個交易日還不在日曆上）。"""
+    回 Record、SOURCE_SKIP（這一輪不算：不凍結，下一輪重判）或 SOURCE_WAIT（E 還不在日曆上）。"""
     if deadline is None:
         return SOURCE_WAIT
     ai = latest(_eligible(ai_rows, deadline))
@@ -264,7 +286,7 @@ def decide_tw(t: str, old_rows: Sequence[Record], ai_rows: Sequence[Record], dea
 
 
 def decide_us(rows: Sequence[Record], deadline: Optional[float]):
-    """美股只有一份紀錄：開盤前算出來的、rev 最大的那一行。"""
+    """美股只有一份紀錄：E 收盤前算出來的、rev 最大的那一行。"""
     if deadline is None:
         return SOURCE_WAIT
     rec = latest(_eligible(rows, deadline))
@@ -354,24 +376,26 @@ def _tw_calendar_certain(t: str, th: str, data: MarketData) -> bool:
 
 
 def _exrights_covered(spans: Sequence, t: str, th: str) -> bool:
-    """除權息資料涵蓋 (t, T_h]，而且一直到 T_h 的隔天以後（r3 #1：收盤和除權息不是同時進 DB；P3 #4：盤勢 job
-    下一次會從「上次涵蓋的最後一天」重讀，最後一天還可能補進事件）。重疊或相鄰的區間盤勢 job 會合併成一段。"""
+    """除權息資料涵蓋 (t, T_h]（比要用的 (E, T_h] 多看 t 到 E 那段，保守），而且一直到 T_h 的隔天以後（r3 #1：收盤和
+    除權息不是同時進 DB；P3 #4：盤勢 job 下一次會從「上次涵蓋的最後一天」重讀，最後一天還可能補進事件）。
+    重疊或相鄰的區間盤勢 job 會合併成一段。"""
     start = (date.fromisoformat(t) + timedelta(days=1)).isoformat()
     return any(a <= start and th < z for a, z in spans)
 
 
 def _c0_ok(c: Candidate, c0: float, data: MarketData) -> bool:
-    """推薦當天的 DB 收盤要和家人看到的一樣（差 ≤ 0.5%）。美股在 t 之後任何時候有分割就不比：
-    盤勢 job 會整段重抓、改成調整後的價格（PLAN v5 #12）；落在 (t, T_h] 的分割前面已經凍結成跳過。"""
+    """推薦當天（t）的 DB 收盤要和家人看到的一樣（差 ≤ 0.5%）。美股在 t 之後任何時候有分割就不比：
+    盤勢 job 會整段重抓、改成調整後的價格（PLAN v5 #12）；落在 (E, T_h] 的分割前面已經凍結成跳過，
+    落在 E 當天的不影響報酬（E、T_h 都是分割後的價格）。"""
     if c.market == US and any(d > c.t for d in data.splits.get(c.code, ())):
         return True
     return c.close is not None and abs(c0 / c.close - 1.0) <= C0_TOLERANCE + 1e-9
 
 
 def _adjust(market: str, series: dict, days: Sequence[str], events: Sequence) -> tuple[Optional[float], bool]:
-    """(除權息因子 Π, 有沒有公司行動)。台股：每對相鄰交易日 (前一天, 這一天] 的除權息（含落在休市日的，r3 #14）
-    還原在這一天；還原後漲跌超過 11%、或比值不在 1–3（因子回 None）→ 公司行動（jump）。
-    美股只算股價、不套跳動閘門（真的大跌要算進去，r3 #3）：因子 1。"""
+    """(除權息因子 Π, 有沒有公司行動)。days＝E 到 T_h 的交易日，所以只看 (E, T_h]：E 當天和更早的除權息不算（E 的收盤
+    已經是除權息後的）。台股：每對相鄰交易日 (前一天, 這一天] 的除權息（含落在休市日的，r3 #14）還原在這一天；還原後漲跌
+    超過 11%、或比值不在 1–3（因子回 None）→ 公司行動（jump）。美股只算股價、不套跳動閘門（真的大跌要算進去，r3 #3）：因子 1。"""
     if market == US:
         return 1.0, False
     factor, jumped = 1.0, False
@@ -390,11 +414,13 @@ def _adjust(market: str, series: dict, days: Sequence[str], events: Sequence) ->
 
 
 def evaluate(c: Candidate, data: MarketData) -> tuple[str, object]:
-    """一筆成績這一輪的結果：(WAIT, 原因) 或 (FREEZE, 帳的一行)。順序：到期 → 日曆 → 除權息涵蓋 → 分割 →
-    隔離 → 缺價 → 收盤對不對得上 → 公司行動 → 報酬範圍。T_h 之後過了 10 個交易日，「等」的都凍結成跳過。"""
+    """一筆成績這一輪的結果：(WAIT, 原因) 或 (FREEZE, 帳的一行)。E＝t 之後第一個交易日，T_h＝E 之後第 h 個交易日；
+    r＝T_h 收盤 × (E, T_h] 的除權息因子 ÷ E 收盤 − 1（基準同算），t 的收盤只拿來核對家人看到的價格。
+    順序：到期 → t 在日曆上 → 日曆 → 除權息涵蓋 → 分割 → 隔離 → 缺價 → 收盤對不對得上 → 公司行動 → 報酬範圍。
+    T_h 之後過了 10 個交易日，「等」的都凍結成跳過。回測週報的 job 也用這個函式算股票池成員的報酬（close＝池子紀錄的 c0）。"""
     cal = data.calendar
-    first = bisect.bisect_right(cal, c.t)
-    last = first + c.h - 1
+    first = bisect.bisect_right(cal, c.t)  # E 的位置
+    last = first + c.h  # T_h 的位置
     buffer = TW_BUFFER_SESSIONS if c.market == TW else US_BUFFER_SESSIONS
     if last + buffer >= len(cal):
         return WAIT, "not_due"
@@ -409,6 +435,9 @@ def evaluate(c: Candidate, data: MarketData) -> tuple[str, object]:
         row.update({k: (inputs or {}).get(k) for k in INPUT_KEYS})
         return FREEZE, row
 
+    # t 本身要在日曆上（r3 #4）：t 比日曆的起點早（bisect 回 0）或 t 那天有洞時，E、T_h 會默默錯位。
+    if not (first > 0 and cal[first - 1] == c.t):
+        return frozen("calendar") if settled else (WAIT, "calendar")
     if c.market == TW:
         if not _tw_calendar_certain(c.t, th, data):  # P3 #10：等也要有出口
             return frozen("calendar") if settled else (WAIT, "calendar")
@@ -418,25 +447,29 @@ def evaluate(c: Candidate, data: MarketData) -> tuple[str, object]:
         # 盤勢 job 照字母分批寫：日曆（SPY）已經有那一天，這一檔的批次可能還沒跑；它跑的那一次會把 T_h 再整段
         # 重抓一次（[前一次有效日 − 3 個交易日, D]），之後才不會再改。過了 10 個交易日就不再看這一條。
         return WAIT, "not_due"
-    if c.market == US and any(c.t < d <= th for code in codes for d in data.splits.get(code, ())):
+    window = cal[first:last + 1]  # E … T_h
+    entry = window[0]
+    # 美股分割：(E, T_h] 裡有就跳過（E 和 T_h 一個調整前、一個調整後）；E 當天或更早的分割不影響 E 到 T_h 的報酬
+    if c.market == US and any(entry < d <= th for code in codes for d in data.splits.get(code, ())):
         return frozen("split")
-    # 隔離區間結尾剛好是 t 也算（P3 #3：盤勢 job 對 t 那根還有爭議時不改 DB，c0 會「對得上」）
+    # 隔離看 [t, T_h]：t 的收盤還要拿來核對（P3 #3：隔離區間結尾剛好是 t 也算，盤勢 job 對 t 那根還有爭議時不改 DB）
     if any(z >= c.t and a <= th for code in codes for a, z in data.quarantine.get(code, ())):
         return frozen("quarantine") if settled else (WAIT, "quarantine")
-    days = (c.t, *cal[first:last + 1])
-    series = [data.prices.get(code, {}) for code in codes]
-    if any(day not in s for s in series for day in days):
+    stock, bench = (data.prices.get(code, {}) for code in codes)
+    if c.t not in stock or any(day not in s for s in (stock, bench) for day in window):
         return frozen("missing") if settled else (WAIT, "price")
-    (c0, ch), (b0, bh) = ((s[days[0]], s[days[-1]]) for s in series)
-    (cf, c_jump), (bf, b_jump) = (_adjust(c.market, s, days, data.exrights.get(code, ()))
-                                  for code, s in zip(codes, series))
-    inputs = {"c0": c0, "ch": ch, "cf": cf, "b0": b0, "bh": bh, "bf": bf}
+    c0 = stock[c.t]
+    (ce, ch), (be, bh) = ((s[entry], s[th]) for s in (stock, bench))
+    (cf, c_jump), (bf, b_jump) = (_adjust(c.market, s, window, data.exrights.get(code, ()))
+                                  for code, s in zip(codes, (stock, bench)))
+    inputs = {"c0": c0, "ce": ce, "ch": ch, "cf": cf, "be": be, "bh": bh, "bf": bf}
     if not _c0_ok(c, c0, data):
         return frozen("mismatch", inputs)
     if c_jump or b_jump:
         return frozen("jump", inputs)
-    r, b = ch * cf / c0 - 1.0, bh * bf / b0 - 1.0
-    if not (R_RANGE[0] < r < R_RANGE[1] and R_RANGE[0] < b < R_RANGE[1]):
+    r, b = ch * cf / ce - 1.0, bh * bf / be - 1.0
+    lo, hi = r_range(c.h)
+    if not (lo < r < hi and lo < b < hi):
         return frozen("range", inputs)
     return frozen(None, inputs, round(r, 6), round(b, 6))
 
@@ -491,9 +524,10 @@ def aggregate(
     ledger_rows: int,
     ledger_full: bool,
 ) -> dict:
-    """帳（已依鍵去重、先寫的算）→ 結果。每個（市場、t）只算帳裡第一次寫的那一組（rule、rev）（P3 #2）；
-    紀錄檔裡還找得到那一行時，只算代號還在那一行裡的列（r3 #5：紀錄被改寫後舊代號的列不算）。
-    這樣不會同一天算兩套，價格庫或紀錄檔不見了、紀錄多出新的 rev，已經算出來的都不會消失或被換掉。"""
+    """帳（已依鍵去重、先寫的算）→ 結果。只看目前版本（LEDGER_VERSION）的列；每個（市場、t）只算帳裡第一次寫的那一組
+    （rule、rev）（P3 #2）；紀錄檔裡還找得到那一行時，只算代號還在那一行裡的列（r3 #5：紀錄被改寫後舊代號的列不算）。
+    這樣不會同一天算兩套，價格庫或紀錄檔不見了、紀錄多出新的 rev，已經算出來的都不會消失或被換掉。
+    4 個天數都有統計（回測週報、每日維護看）；卡上的「起、算到、起含 AI」只看卡片顯示的天數（CARD_HORIZONS）。"""
     pins = pins_of(rows)
     chosen: list[dict] = []
     for row in rows:
@@ -511,7 +545,8 @@ def aggregate(
     for market in (TW, US):
         mine = [r for r in chosen if r["m"] == market]
         counted = [r for r in mine if r["skip"] is None]
-        ai_days = [r["t"] for r in counted if r["rule"].startswith("ai_")]
+        shown = [r for r in counted if r["h"] in CARD_HORIZONS]
+        ai_days = [r["t"] for r in shown if r["rule"].startswith("ai_")]
         by_h: dict[str, dict] = {}
         for h in HORIZONS:
             ok = [r for r in counted if r["h"] == h]
@@ -529,8 +564,8 @@ def aggregate(
             }
         markets[market] = {
             "first_t": first_t.get(market),
-            "from": min((r["t"] for r in counted), default=None),  # 卡上的「起」：實際算進去的最早一筆（r3 #6）
-            "to": max((r["th"] for r in counted), default=None),
+            "from": min((r["t"] for r in shown), default=None),  # 卡上的「起」：實際算進去的最早一筆（r3 #6）
+            "to": max((r["th"] for r in shown), default=None),
             "ai_from": min(ai_days, default=None),  # 算進去的有 AI 相關股推薦：最早那一天（P3 #7）
             "h": by_h,
         }
@@ -624,7 +659,8 @@ class _Ledger:
 
 
 def _ledger_row(obj) -> Optional[dict]:
-    """帳的一行；看不懂回 None。算式輸入（INPUT_KEYS）是後來才加的：沒有這幾個欄位的舊列照樣讀。"""
+    """帳的一行；看不懂回 None。算式輸入是後來才加的：沒有這幾個欄位的舊列照樣讀。v1 列的輸入是 c0、ch、cf、b0、bh、bf，
+    v2 列是 INPUT_KEYS（c0、ce、ch、cf、be、bh、bf）；讀出來的列每個輸入欄位都有（沒有的是 None）。"""
     if not isinstance(obj, dict):
         return None
     m, rule, code, skip = obj.get("m"), obj.get("rule"), obj.get("code"), obj.get("skip")
@@ -646,7 +682,7 @@ def _ledger_row(obj) -> Optional[dict]:
     else:
         return None
     inputs = {}
-    for key in INPUT_KEYS:
+    for key in _LEDGER_INPUT_KEYS:
         value = obj.get(key)
         inputs[key] = None if value is None else _finite(value, 0.0, _MAX_PRICE)
         if value is not None and inputs[key] is None:
@@ -699,22 +735,32 @@ def _append_rows(path: Path, ledger: _Ledger, new_rows: Sequence[dict]) -> tuple
 
 @dataclass(frozen=True)
 class _State:
-    prices: dict  # 台股價格庫 {代號: {日期: 收盤}}
+    """共用狀態檔（v1 的格式，STATE_SCHEMA 1）。v2 讀寫 flags、ai_first_t；prices、needed 是 v1 的價格庫，v2 只讀、原樣寫回。"""
+
+    prices: dict  # v1 的台股價格庫 {代號: {日期: 收盤}}（v2 只拿來當補充來源）
     flags: dict  # ai_flag_by_t {T: 那時 AI 開著沒有}：只在 T 是舊檔最新一行時記，記過不改
-    ai_first_t: Optional[str]  # 看過的（開盤前算出來的）AI 紀錄最小的 t（AI 檔被刪或截斷時，AI 的日子不會被改判成舊規則）
-    needed: dict = field(default_factory=dict)  # 上一輪算出來要收的 {代號: 從哪一天}：這一輪判不了時照這份收（P3 #5）
+    ai_first_t: Optional[str]  # 看過的（E 收盤前算出來的）AI 紀錄最小的 t（AI 檔被刪或截斷時，AI 的日子不會被改判成舊規則）
+    needed: dict = field(default_factory=dict)  # v1 上一輪算出來要收的 {代號: 從哪一天}（v2 原樣保留）
 
 
 _EMPTY_STATE = _State({}, {}, None)
 
 
-def _state_from_json(obj) -> _State:
-    _require(isinstance(obj, dict) and obj.get("schema") == STATE_SCHEMA)
-    raw_prices, raw_flags, first = obj.get("prices"), obj.get("ai_flag_by_t"), obj.get("ai_first_t")
-    raw_needed = obj.get("needed", {})  # 後來才加的欄位：舊狀態檔沒有
-    _require(isinstance(raw_prices, dict) and isinstance(raw_flags, dict) and isinstance(raw_needed, dict))
+@dataclass(frozen=True)
+class _Library:
+    """v2 的台股價格庫（stock_picks_perf_prices.json；v1 的程式不碰這個檔，r3 #6）。"""
+
+    prices: dict  # {代號: {日期: 收盤}}：還沒凍結（4 個天數）、DB tw 又沒有的收盤
+    needed: dict = field(default_factory=dict)  # 上一輪算出來要收的 {代號: 從哪一天}：這一輪判不了時照這份收（P3 #5）
+
+
+_EMPTY_LIBRARY = _Library({}, {})
+
+
+def _prices_from(raw) -> dict[str, dict]:
+    _require(isinstance(raw, dict))
     prices: dict[str, dict] = {}
-    for code, series in raw_prices.items():
+    for code, series in raw.items():
         _require(isinstance(code, str) and _TW_CODE_RE.fullmatch(code) is not None and isinstance(series, dict))
         clean = {}
         for day, close in series.items():
@@ -722,14 +768,32 @@ def _state_from_json(obj) -> _State:
             _require(_iso_day(day) is not None and value is not None)
             clean[day] = value
         prices[code] = clean
+    return prices
+
+
+def _needed_from(raw) -> dict[str, str]:
+    _require(isinstance(raw, dict))
+    needed = {}
+    for code, since in raw.items():
+        _require(isinstance(code, str) and _TW_CODE_RE.fullmatch(code) is not None and _iso_day(since) is not None)
+        needed[code] = since
+    return needed
+
+
+def _prices_json(prices: dict) -> dict:
+    return {code: dict(sorted(series.items())) for code, series in sorted(prices.items())}
+
+
+def _state_from_json(obj) -> _State:
+    _require(isinstance(obj, dict) and obj.get("schema") == STATE_SCHEMA)
+    raw_flags, first = obj.get("ai_flag_by_t"), obj.get("ai_first_t")
+    prices = _prices_from(obj.get("prices"))
+    needed = _needed_from(obj.get("needed", {}))  # 後來才加的欄位：舊狀態檔沒有
+    _require(isinstance(raw_flags, dict))
     flags = {}
     for day, flag in raw_flags.items():
         _require(_iso_day(day) is not None and isinstance(flag, bool))
         flags[day] = flag
-    needed = {}
-    for code, since in raw_needed.items():
-        _require(isinstance(code, str) and _TW_CODE_RE.fullmatch(code) is not None and _iso_day(since) is not None)
-        needed[code] = since
     _require(first is None or _iso_day(first) is not None)
     return _State(prices, flags, first, needed)
 
@@ -737,7 +801,7 @@ def _state_from_json(obj) -> _State:
 def _state_to_json(state: _State) -> dict:
     return {
         "schema": STATE_SCHEMA,
-        "prices": {code: dict(sorted(series.items())) for code, series in sorted(state.prices.items())},
+        "prices": _prices_json(state.prices),
         "needed": dict(sorted(state.needed.items())),
         "ai_flag_by_t": dict(sorted(state.flags.items())),
         "ai_first_t": state.ai_first_t,
@@ -745,7 +809,7 @@ def _state_to_json(state: _State) -> dict:
 
 
 def _load_state(path: Path) -> _State:
-    """壞檔當作空的重來（記 error）：價格庫可以從 tw_all 補回最近 10 天；ai_first_t 另外從帳裡的 AI 列補下限。"""
+    """壞檔當作空的重來（記 error）：ai_first_t 另外從帳裡的 AI 列補下限。"""
     try:
         obj = stock_picks._read_json_file(path)
         return _EMPTY_STATE if obj is None else _state_from_json(obj)
@@ -754,11 +818,45 @@ def _load_state(path: Path) -> _State:
         return _EMPTY_STATE
 
 
-def _fallback_needs(state: _State) -> dict[str, str]:
+def _library_from_json(obj) -> _Library:
+    _require(isinstance(obj, dict) and obj.get("schema") == PRICES_SCHEMA)
+    return _Library(_prices_from(obj.get("prices")), _needed_from(obj.get("needed", {})))
+
+
+def _library_to_json(library: _Library) -> dict:
+    return {"schema": PRICES_SCHEMA, "prices": _prices_json(library.prices),
+            "needed": dict(sorted(library.needed.items()))}
+
+
+def _load_library(path: Path) -> _Library:
+    """壞檔當作空的重來（記 error）：最近 10 天可以從 tw_all 補回，更早的用 backfill_prices 從 review.sqlite 補。"""
+    try:
+        obj = stock_picks._read_json_file(path)
+        return _EMPTY_LIBRARY if obj is None else _library_from_json(obj)
+    except Exception as exc:
+        logger.error("stock picks perf price library unreadable; starting empty error_type=%s", type(exc).__name__)
+        return _EMPTY_LIBRARY
+
+
+def _write_library(path: Path, library: _Library, disk: _Library) -> bool:
+    """內容變了才寫（原子寫入、0600）。超過 2 MiB（stock_picks.STATE_MAX_BYTES）不寫、記 error：價格庫不再長，但帳、
+    結果檔照常更新（不能讓 update() 每輪都失敗）。回 True＝寫了。"""
+    payload = _library_to_json(library)
+    if payload == _library_to_json(disk):
+        return False
+    try:
+        stock_picks._write_json_file(path, payload)
+    except ValueError:
+        logger.error("stock picks perf price library too large; not written codes=%d", len(library.prices))
+        return False
+    return True
+
+
+def _fallback_needs(prices: dict, needed: dict) -> dict[str, str]:
     """這一輪判不了要收哪些（台股紀錄讀不了、日曆查不到）：沿用上一輪記下的；沒有就用價格庫裡已經有的代號。"""
-    if state.needed:
-        return dict(state.needed)
-    return _with_benchmark({code: min(series) for code, series in state.prices.items() if series})
+    if needed:
+        return dict(needed)
+    return _with_benchmark({code: min(series) for code, series in prices.items() if series})
 
 
 def _sweep_stale_tmp(state_dir: Path) -> None:
@@ -863,8 +961,8 @@ def _evaluate_all(cands: Sequence[Candidate], data: MarketData, new_rows: list, 
 
 # ── 對外：背景每輪更新、回覆讀結果 ───────────────────────────────────────────
 def update(*, ai_enabled: bool, now: float, db_path: Optional[Path] = None) -> Optional[dict]:
-    """美股 worker 每輪呼叫（美股開關關著也呼叫）：讀三份紀錄與日曆 → 記 ai_flag_by_t／ai_first_t → 選來源（開盤前
-    算出來的、帳裡已釘住的）→ 收台股價格 → 凍結到期的成績 → append 帳 → 更新價格庫 → 彙總 → 寫結果檔；回結果。
+    """美股 worker 每輪呼叫（美股開關關著也呼叫）：讀三份紀錄與日曆 → 記 ai_flag_by_t／ai_first_t → 選來源（E 收盤前
+    算出來的、帳裡已釘住的）→ 收台股價格 → 凍結到期的成績 → append 帳 → 更新 v2 價格庫 → 彙總 → 寫結果檔；回結果。
     ai_enabled 是 stock_picks.AI_ENABLED（家人此刻看到哪一種台股推薦）。任何失敗只記 log、回 None，不丟例外。"""
     try:
         return _update(bool(ai_enabled), float(now), db_path)
@@ -876,18 +974,46 @@ def update(*, ai_enabled: bool, now: float, db_path: Optional[Path] = None) -> O
         return None
 
 
-def _update(ai_enabled: bool, now: float, db_path: Optional[Path]) -> dict:
+@dataclass
+class _Selection:
+    """這一輪選好的紀錄（_update 與 backfill_prices 共用；只讀檔、查日曆，什麼都不寫）。"""
+
+    today: str
+    ledger: _Ledger
+    state: _State  # 共用狀態檔（開頭讀的）
+    library: _Library  # v2 價格庫（開頭讀的）
+    tw_readable: bool
+    tw_days: list
+    us_days: list
+    tw_cal: Optional[tuple]
+    us_cal: Optional[tuple]
+    flags: dict
+    ai_first: Optional[str]
+    lines: dict  # {(市場, t): 這一輪用的那一行}
+    undecided: dict  # {t: 這個 t 的每一行}：E 還不在日曆上，還判不了用哪一份（價格先收）
+    cands: list  # 還沒凍結的成績
+    waits: Counter
+
+    @property
+    def fresh_needs(self) -> bool:
+        """這一輪判得出台股要收哪些價格（紀錄讀得了、日曆查得到）。"""
+        return self.tw_readable and self.tw_cal is not None
+
+
+def _select(now: float, db_path: Optional[Path], *, ai_enabled: Optional[bool]) -> _Selection:
+    """讀三份紀錄、帳、狀態檔、價格庫與日曆 → 選來源（帳裡已經有 v2 列的 t 釘住那一組；其他的只收 E 收盤前算出來的行，
+    再照 decide_*）→ 還沒凍結的成績。ai_enabled 是 None 時不記 ai_flag_by_t（backfill_prices：部署腳本的環境變數
+    不一定和 bot 一樣）。"""
     state_dir = stock_picks.STATE_DIR
     today = datetime.fromtimestamp(now, _TPE).date().isoformat()
-    _sweep_stale_tmp(state_dir)
     tw_old = _read_rows(state_dir / stock_picks.HISTORY_NAME, TW, fixed_rule=TW_OLD_RULE,
                         default_rule=TW_OLD_RULE, today=today)
     tw_ai = _read_rows(state_dir / stock_picks.AI_HISTORY_NAME, TW, fixed_rule=None,
                        default_rule=stock_picks.AI_RULE, today=today)
     us_hist = _read_rows(state_dir / US_HISTORY_NAME, US, fixed_rule=None, default_rule=US_RULE, today=today)
-    ledger_path, state_path = state_dir / LEDGER_NAME, state_dir / STATE_NAME
-    ledger = _read_ledger(ledger_path)  # 讀不了就丟出去：沒有帳就不能去重，這一輪整個不做
-    start = _load_state(state_path)
+    ledger = _read_ledger(state_dir / LEDGER_NAME)  # 讀不了就丟出去：沒有帳就不能去重，這一輪整個不做
+    start = _load_state(state_dir / STATE_NAME)
+    library = _load_library(state_dir / PRICES_NAME)
     pins = pins_of(ledger.rows)
     waits: Counter = Counter()
     tw_readable = tw_old is not None and tw_ai is not None
@@ -896,16 +1022,15 @@ def _update(ai_enabled: bool, now: float, db_path: Optional[Path]) -> dict:
     tw_cal = _calendar(TW, tw_days[0], db_path, waits) if tw_days else None
     us_cal = _calendar(US, us_days[0], db_path, waits) if us_days else None
 
-    # 1. 選來源（帳裡已經有列的 t 釘住那一組；其他的只收開盤前算出來的行，再照 decide_*）
     flags, ai_first = dict(start.flags), start.ai_first_t
     lines: dict[tuple, Record] = {}
     undecided: dict[str, list[Record]] = {}
     if tw_readable:
-        if tw_old:
+        if tw_old and ai_enabled is not None:
             flags.setdefault(max(tw_old), ai_enabled)  # 只記家人此刻看到的那個 T；晚才看到的舊 T 不補記
         ledger_ai = [r["t"] for r in ledger.rows if r["m"] == TW and r["rule"].startswith("ai_")]
         seen_ai = [] if tw_cal is None else [
-            t for t, rows in tw_ai.items() if _eligible(rows, open_after(TW, t, tw_cal))]
+            t for t, rows in tw_ai.items() if _eligible(rows, close_deadline(TW, t, tw_cal))]
         ai_first = _min_day(ai_first, min(seen_ai, default=None), min(ledger_ai, default=None))
         for t in tw_days:
             old_rows, ai_rows = tw_old.get(t, []), tw_ai.get(t, [])
@@ -915,7 +1040,7 @@ def _update(ai_enabled: bool, now: float, db_path: Optional[Path]) -> dict:
                 if rec is not None:
                     lines[(TW, t)] = rec
             elif tw_cal is not None:
-                got = decide_tw(t, old_rows, ai_rows, open_after(TW, t, tw_cal), flags, ai_first)
+                got = decide_tw(t, old_rows, ai_rows, close_deadline(TW, t, tw_cal), flags, ai_first)
                 if got == SOURCE_WAIT:
                     undecided[t] = old_rows + ai_rows
                 elif isinstance(got, Record):
@@ -927,36 +1052,47 @@ def _update(ai_enabled: bool, now: float, db_path: Optional[Path]) -> dict:
             if rec is not None:
                 lines[(US, t)] = rec
         elif us_cal is not None:
-            got = decide_us(us_hist[t], open_after(US, t, us_cal))
+            got = decide_us(us_hist[t], close_deadline(US, t, us_cal))
             if isinstance(got, Record):
                 lines[(US, t)] = got
     cands = candidates_of(lines, ledger.keys)
+    return _Selection(today, ledger, start, library, tw_readable, tw_days, us_days, tw_cal, us_cal, flags, ai_first,
+                      lines, undecided, cands, waits)
+
+
+def _update(ai_enabled: bool, now: float, db_path: Optional[Path]) -> dict:
+    state_dir = stock_picks.STATE_DIR
+    _sweep_stale_tmp(state_dir)
+    sel = _select(now, db_path, ai_enabled=ai_enabled)
+    ledger_path, state_path, prices_path = state_dir / LEDGER_NAME, state_dir / STATE_NAME, state_dir / PRICES_NAME
+    waits, cands = sel.waits, sel.cands
     tw_cands = [c for c in cands if c.market == TW]
     us_cands = [c for c in cands if c.market == US]
 
     # 2. 台股價格收集（自己的查詢、自己的 try；判不了來源時照上一輪記下的收）
-    fresh_needs = tw_readable and tw_cal is not None
-    needs = needed_prices(tw_cands, undecided) if fresh_needs else _fallback_needs(start)
+    needs = (needed_prices(tw_cands, sel.undecided) if sel.fresh_needs
+             else _fallback_needs(sel.library.prices, sel.library.needed))
     long, recent = _collect_tw(needs, tw_cands, db_path, waits)
+    seed = _merge_prices(sel.state.prices, sel.library.prices)  # v1 的價格庫只當補充來源（v2 優先；v2 不改它）
 
     # 3. 算到期的（DB 查詢都在鎖外）
     new_rows: list[dict] = []
-    if tw_cands and (tw_cal is None or long is None):
+    if tw_cands and (sel.tw_cal is None or long is None):
         waits["tw:no_data"] += len(tw_cands)
     elif tw_cands:
-        prices = {code: {**start.prices.get(code, {}), **recent.get(code, {}), **long.get(code, {})}
+        prices = {code: {**seed.get(code, {}), **recent.get(code, {}), **long.get(code, {})}
                   for code in {c.code for c in tw_cands} | {TW_BENCHMARK}}
         try:
-            data = load_tw(tw_cands, tw_cal, prices, today, db_path)
+            data = load_tw(tw_cands, sel.tw_cal, prices, sel.today, db_path)
         except (stock_db_ro.DbBusy, stock_db_ro.DbUnavailable) as exc:
             _db_failed("tw", exc, waits)
         else:
             _evaluate_all(tw_cands, data, new_rows, waits)
-    if us_cands and us_cal is None:
+    if us_cands and sel.us_cal is None:
         waits["us:no_data"] += len(us_cands)
     elif us_cands:
         try:
-            data = load_us(us_cands, us_cal, db_path)
+            data = load_us(us_cands, sel.us_cal, db_path)
         except (stock_db_ro.DbBusy, stock_db_ro.DbUnavailable) as exc:
             _db_failed("us", exc, waits)
         else:
@@ -969,20 +1105,84 @@ def _update(ai_enabled: bool, now: float, db_path: Optional[Path]) -> dict:
         rows = disk.rows + appended
         frozen = disk.keys | {_row_key(r) for r in appended}
         pending = [c for c in cands if c.key not in frozen]
-        if fresh_needs:  # 剛凍結的就不用再收
-            needs = needed_prices(pending, undecided)
-        disk_state = _load_state(state_path)
-        library = next_library(_merge_prices(start.prices, disk_state.prices), long or {}, recent or {}, needs)
-        merged = _State(library, {**flags, **disk_state.flags}, _min_day(ai_first, disk_state.ai_first_t), needs)
+        if sel.fresh_needs:  # 剛凍結的就不用再收（4 個天數都凍結了才放掉那一檔）
+            needs = needed_prices(pending, sel.undecided)
+        disk_state, disk_lib = _load_state(state_path), _load_library(prices_path)
+        old = _merge_prices(_merge_prices(sel.state.prices, disk_state.prices),  # v1 的（別的程序剛寫的優先）
+                            _merge_prices(sel.library.prices, disk_lib.prices))  # v2 的（優先於 v1）
+        _write_library(prices_path, _Library(next_library(old, long or {}, recent or {}, needs), needs), disk_lib)
+        # 共用狀態檔：v1 的 prices、needed 照磁碟上的原樣寫回（v2 不碰），只合併 ai_flag_by_t、ai_first_t
+        merged = _State(disk_state.prices, {**sel.flags, **disk_state.flags},
+                        _min_day(sel.ai_first, disk_state.ai_first_t), disk_state.needed)
         payload = _state_to_json(merged)
         if payload != _state_to_json(disk_state):  # 內容沒變就不寫
             stock_picks._write_json_file(state_path, payload)
-        first_t = {TW: tw_days[0] if tw_days else None, US: us_days[0] if us_days else None}
-        result = aggregate(rows, lines, pending, first_t, now=now, ledger_rows=len(rows), ledger_full=full)
+        first_t = {TW: sel.tw_days[0] if sel.tw_days else None, US: sel.us_days[0] if sel.us_days else None}
+        result = aggregate(rows, sel.lines, pending, first_t, now=now, ledger_rows=len(rows), ledger_full=full)
         stock_picks._write_json_file(state_dir / RESULT_NAME, result)
     logger.info("stock picks perf updated appended=%d pending=%d waits=%s",
                 len(appended), len(pending), ",".join(f"{k}:{v}" for k, v in sorted(waits.items())) or "-")
     return result
+
+
+def _review_closes(path: Path, needs: dict[str, str]) -> dict[str, dict]:
+    """回測 job 的 review.sqlite（prices 表：m、code、d、close、src、seen_at）裡、needs 要的台股收盤：{代號: {日期: 收盤}}。
+    唯讀（stock_db_ro.rows：mode=ro、query_only、一個 SELECT 就關）；檔案不在丟 DbUnavailable("missing")。"""
+    codes = sorted(needs)
+    since = min(needs.values())
+    out: dict[str, dict] = {}
+    for i in range(0, len(codes), 400):
+        chunk = codes[i:i + 400]
+        for code, day, close in stock_db_ro.rows(
+            f"SELECT code, d, close FROM prices WHERE m = 'tw' AND d >= ? AND code IN ({','.join('?' * len(chunk))})",
+            (since, *chunk), path=path,
+        ):
+            value = _finite(close, 0.0, _MAX_PRICE)
+            if code in needs and _iso_day(day) and day >= needs[code] and value is not None:
+                out.setdefault(code, {})[day] = value
+    return out
+
+
+def backfill_prices(*, now: Optional[float] = None, db_path: Optional[Path] = None,
+                    review_db: Optional[Path] = None) -> dict:
+    """部署 v2 時跑一次（回測 PLAN §10 B1）：v2 還沒凍結的台股成績要用、但 tw_all 已經滾掉的收盤，從回測 job 的 review.sqlite
+    （A 段起每 30 分鐘收全部池子成員的價格；唯讀）補進 v2 價格庫。只補缺的日期（價格庫已經有的不改），之後 update() 照常修剪。
+    回 {"status", "codes", "added"}；status：ok、no_review_db（檔案不在：正常，什麼都不做）、review_unavailable、
+    review_busy、undecided（紀錄讀不了或日曆查不到：判不了要補哪些）、lock_busy、error。不丟例外、不記 ai_flag_by_t。"""
+    try:
+        return _backfill(time.time() if now is None else float(now), db_path, review_db)
+    except TimeoutError:
+        return {"status": "lock_busy", "codes": 0, "added": 0}
+    except Exception as exc:
+        logger.error("stock picks perf backfill failed error_type=%s", type(exc).__name__)
+        return {"status": "error", "codes": 0, "added": 0}
+
+
+def _backfill(now: float, db_path: Optional[Path], review_db: Optional[Path]) -> dict:
+    sel = _select(now, db_path, ai_enabled=None)
+    if not sel.fresh_needs:
+        return {"status": "undecided", "codes": 0, "added": 0}
+    tw_cands = [c for c in sel.cands if c.market == TW]
+    needs = needed_prices(tw_cands, sel.undecided)
+    if not needs:
+        return {"status": "ok", "codes": 0, "added": 0}
+    try:
+        found = _review_closes(review_db or stock_picks.STATE_DIR / REVIEW_DB, needs)
+    except stock_db_ro.DbUnavailable as exc:
+        status = "no_review_db" if exc.kind == "missing" else "review_unavailable"
+        return {"status": status, "codes": len(needs), "added": 0}
+    except stock_db_ro.DbBusy:
+        return {"status": "review_busy", "codes": len(needs), "added": 0}
+    long, recent = _collect_tw(needs, tw_cands, db_path, sel.waits)  # DB tw 有的日期不必存；查不到就先全收
+    prices_path = stock_picks.STATE_DIR / PRICES_NAME
+    with stock_picks._state_file_lock():
+        disk = _load_library(prices_path)
+        mine = _merge_prices(sel.library.prices, disk.prices)
+        library = next_library(_merge_prices(found, mine), long or {}, recent or {}, needs)  # 價格庫已經有的優先
+        added = sum(1 for code, series in library.items() for day in series if day not in disk.prices.get(code, {}))
+        _write_library(prices_path, _Library(library, needs), disk)
+    logger.info("stock picks perf backfill codes=%d added=%d", len(needs), added)
+    return {"status": "ok", "codes": len(needs), "added": added}
 
 
 def load_result() -> Optional[dict]:
@@ -1020,7 +1220,7 @@ def summary() -> dict:
 # ── 卡片（固定句型＋程式算的數字；沒有使用者原文、不寫買賣建議） ───────────────────
 TITLE = f"{stock_picks.PREFIX}推薦成績"
 TEXT_COMPUTING = "推薦成績計算中，請稍後再按一次"
-TEXT_METHOD = (f"算法：推薦當天收盤，到之後第 {'、'.join(str(h) for h in HORIZONS)} 個交易日的收盤；"
+TEXT_METHOD = (f"算法：推薦隔天收盤，到之後第 {'、'.join(str(h) for h in CARD_HORIZONS)} 個交易日的收盤；"
                "同一檔連續被推薦會算好幾次")
 TEXT_BASIS = f"台股含股利（除權息還原）、和 {TW_BENCHMARK} 比；美股只算股價、和 {US_BENCHMARK} 比"
 TEXT_PAST = f"過去的表現不代表以後；{stock_picks.TEXT_DISCLAIMER}"
@@ -1049,7 +1249,7 @@ def _skipped_line(n: int) -> str:
 
 def _market_lines(market: str, info: dict) -> list[dict]:
     name, bench, note = _MARKET_NAME[market], _BENCHMARK[market], _DATE_NOTE[market]
-    stats = [(h, info["h"][str(h)]) for h in HORIZONS]
+    stats = [(h, info["h"][str(h)]) for h in CARD_HORIZONS]
     if info["from"] is not None:
         head = f"{name}推薦（{note}{_md(info['from'])} 起，算到 {_md(info['to'])}）"
     else:
@@ -1089,7 +1289,7 @@ def perf_bubble(result: Optional[dict]) -> dict:
 
 def _alt_part(market: str, info: dict) -> str:
     name, bench = _MARKET_NAME[market], _BENCHMARK[market]
-    h = HORIZONS[0]
+    h = CARD_HORIZONS[0]
     s = info["h"][str(h)]
     if s["n"] >= MIN_N:
         return f"{name}推薦後 {h} 個交易日平均{_move(s['r_pm'])}（{bench} {_move(s['b_pm'])}）"
