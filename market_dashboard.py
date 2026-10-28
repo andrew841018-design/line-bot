@@ -20,7 +20,7 @@ Andrew 2026-10-17：「我想要知道目前市場的狀況」——美股／台
 - Reply.text／alt_text／image_alt 只由固定句型、程式算的數字與日期組成：文字回覆路徑會把「@all」
   「@家人」變成真的提及，_prepare_outbound_text 也可能整則換掉。矛盾列用代碼查 market_calc 的固定句，
   一句話要完全符合固定句型才放進 altText。
-- 版面（PLAN §6）：摘要卡同一個 size、每張 ≤6 列、每列 ≤24 個中文字寬（全形算 1、半形算 0.5）、
+- 版面（PLAN §6）：摘要卡同一個 size、每張 ≤6 列（美股卡另接資金輪動 3 列，2026-10-28）、每列 ≤24 個中文字寬（全形算 1、半形算 0.5）、
   先中文後括號英文、標題帶張數與資料日；按鈕是可點的 box＋xxl 字＋message action；顏色只用藍
   #1E5AA8、橘 #B7791F、灰 #555555／#666666（台股紅漲綠跌，不用紅綠）。只描述狀態，不是買賣建議。
 - 不 import main、card_pages、stock_picks、market_sources_*、numpy、pandas、matplotlib（market_calc
@@ -943,8 +943,10 @@ def _summary_bubble(
     subtitle: Optional[str] = None,
     notes: Sequence[str] = (),
     buttons: Sequence[tuple[str, str]] = (),
+    max_rows: Optional[int] = MAX_SUMMARY_ROWS,
 ) -> dict:
-    body = [_text(text, color=color) for text, color in rows[:MAX_SUMMARY_ROWS]]
+    """max_rows＝最多幾列（None＝不截斷：美股卡多了資金輪動的 3 列，2026-10-28；太大由 _guarded_bubbles 換短卡、看得到）。"""
+    body = [_text(text, color=color) for text, color in rows[:max_rows]]
     return _bubble(title, body, subtitle=subtitle, notes=notes, buttons=buttons)
 
 
@@ -1011,11 +1013,13 @@ def _card_us(ctx: _Ctx, head: str, subtitle: Optional[str] = None) -> dict:
             extra = (tagged, extra[1])
         else:
             notes.append(market_calc.TEXT_PROVISIONAL_CLOSE)
+    rows += _rot_rows(ctx, main_day)  # 資金輪動三列（2026-10-28）：放在一句話／矛盾句前面，那一句仍是最後一列
     if extra:
         rows.append(extra)
     progress = ctx.progress()
     if progress:
         notes.append("美股" + market_calc.TEXT_BOOTSTRAP.format(done=progress[0], total=progress[1]))
+    notes += _rot_notes(ctx)
     return _summary_bubble(
         _title(head, main_day, views=list(etfs.values())),
         rows,
@@ -1023,7 +1027,90 @@ def _card_us(ctx: _Ctx, head: str, subtitle: Optional[str] = None) -> dict:
         subtitle=_with_notice(subtitle, _waiting_notice(ctx, "us", main_day)),
         notes=notes,
         buttons=(("標普500 細節", "/盤勢 VOO"), ("那斯達克 細節", "/盤勢 QQQ"), ("半導體 細節", "/盤勢 SOXX")),
+        max_rows=None,  # 5 列＋資金輪動 3 列＋一句話：一列都不截
     )
+
+
+# ── 美股卡：資金輪動（必需消費 XLP／KO 對半導體 SOXX；2026-10-28） ───────────────────────────────
+# 三列接在量能後面、一句話前面：必需消費（XLP）、可口可樂（KO）兩列照 _etf_line（和上面三檔 ETF 同一套退化順序），再加研判那一列。
+# 研判那一列只放狀態（描述句；watch 用橘色），staples／semis 而且當天的原始狀態也一樣時才在句尾加差距；佐證數字在 footer
+# （不受 24 寬限制）。研判日 R 和標題日不同時，日期放在列名後面（「資金輪動 10/27：」，同 _digest_stamp 的位置），任何寫法都留著。
+# 快照裡這一列的型別或語意不對（market_calc.rotation_values_ok）就當暫缺；舊快照沒有這三列 → 三列都是「暫缺」。
+_ROT_WATCHES = (market_calc.ROT_WATCH_STAPLES, market_calc.ROT_WATCH_SEMIS)
+_ROT_TRENDS = (market_calc.ROT_STAPLES, market_calc.ROT_SEMIS)
+
+
+def _rot_view(ctx: _Ctx) -> tuple[_View, Optional[dict]]:
+    """(列, 可用的 values)：新鮮而且通過 market_calc.rotation_values_ok 才有 values，否則 None（過期、暫缺、壞掉）。"""
+    view = ctx.row("us.rot.state")
+    if not view.fresh:
+        return view, None
+    if not market_calc.rotation_values_ok(view.values):
+        return _View(MISSING, {}, view.data_date), None
+    return view, view.values
+
+
+def _rot_line(ctx: _Ctx, main_day: Optional[date]) -> tuple[str, str]:
+    """研判那一列。寫法由長到短：① 列名（日期）：狀態句＋差距 ② 列名（日期）：狀態句；日期在列名裡，每一段都有。"""
+    view, values = _rot_view(ctx)
+    label = market_calc.TEXT_ROT_LABEL
+    if values is None:
+        return _fit(f"{label}：{ctx.gap(view)}", f"{label}：{ctx.gap(view, short=True)}"), GRAY
+    day = view.data_date
+    head = f"{label} {_md(day)}：" if day is not None and day != main_day else f"{label}："
+    state = values["state"]
+    sentence = f"{head}{market_calc.ROT_STATE_TEXT[state]}"
+    with_gap = None
+    if state in _ROT_TRENDS and state == values["raw"]:  # 狀態是沿用前幾天的：當天的數字不能拿來佐證，不印差距
+        gap = market_calc.rot_gap(values)
+        if gap is not None:
+            with_gap = sentence + market_calc.TEXT_ROT_GAP.format(gap=_round_text(abs(gap), 1))
+    return _fit(with_gap, sentence), ORANGE if state in _ROT_WATCHES else GRAY
+
+
+def _rot_rows(ctx: _Ctx, main_day: Optional[date]) -> list[tuple[str, str]]:
+    return [
+        _etf_line(ctx, ctx.row("us.rot.XLP"), market_calc.TEXT_ROT_XLP_NAME, main_day),
+        _etf_line(ctx, ctx.row("us.rot.KO"), market_calc.TEXT_ROT_KO_NAME, main_day),
+        _rot_line(ctx, main_day),
+    ]
+
+
+def _rot_rsi_text(value: Optional[int]) -> str:
+    return _round_text(value) if value is not None else TEXT_MISSING
+
+
+def _rot_pct_text(value: Optional[float]) -> str:
+    return _pct(value, 1) if value is not None else TEXT_MISSING
+
+
+def _rot_ma60_word(above: Optional[bool]) -> str:
+    return "季線暫缺" if above is None else "在季線上" if above else "在季線下"
+
+
+def _rot_notes(ctx: _Ctx) -> list[str]:
+    """美股卡 footer 的資金輪動註記（數字一律是研判日當天的）：watch 寫 SOXX 的 RSI、離季線、離 240 日高點與 XLP（KO 有值時加
+    KO）的 RSI 和季線位置；其他狀態寫兩檔近 20 個交易日的報酬。狀態是沿用前幾天的（state≠raw）再加一句「連續 2 個交易日」。
+    資料不足、過期、暫缺都不加。"""
+    _view, values = _rot_view(ctx)
+    if values is None or values["state"] == market_calc.ROT_INSUFFICIENT:
+        return []
+    state = values["state"]
+    if state in _ROT_WATCHES:
+        note = market_calc.TEXT_ROT_NOTE_WATCH.format(
+            soxx_rsi=_rot_rsi_text(values["soxx_rsi"]),
+            soxx_ma60=_rot_pct_text(values["soxx_ma60"]),
+            soxx_dd240=_rot_pct_text(values["soxx_dd240"]),
+            xlp_rsi=_rot_rsi_text(values["xlp_rsi"]),
+            xlp_ma60=_rot_ma60_word(values["xlp_above60"]),
+        )
+        if values["ko_rsi"] is not None or values["ko_above60"] is not None:
+            note += market_calc.TEXT_ROT_NOTE_KO.format(ko_rsi=_rot_rsi_text(values["ko_rsi"]),
+                                                       ko_ma60=_rot_ma60_word(values["ko_above60"]))
+    else:
+        note = market_calc.TEXT_ROT_NOTE_RETURNS.format(xlp=_rot_pct_text(values["xlp_ret20"]),
+                                                        soxx=_rot_pct_text(values["soxx_ret20"]))
+    return [note] if state == values["raw"] else [note, market_calc.TEXT_ROT_NOTE_HELD]
 
 
 # ── ② 台股 ──────────────────────────────────────────────────────────────────
@@ -3627,6 +3714,7 @@ def _status_summary(moment: float, paths: Any) -> dict:
 # 這個模組會讀的列（job 依 market_calc.ROW_IDS 寫；test_market_dashboard 檢查兩邊一致）
 READ_ROWS: tuple[str, ...] = (
     *(f"us.etf.{s}" for s in US_ETFS),
+    "us.rot.XLP", "us.rot.KO", "us.rot.state",  # 資金輪動（2026-10-28）
     *(f"us.breadth.{s}" for s in US_ETFS),
     *(f"us.options.{s}" for s in ("QQQ", "SPY", "SOXX")),
     "us.cftc.es", "us.cftc.nq", "us.margin",

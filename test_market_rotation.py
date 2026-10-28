@@ -27,6 +27,21 @@ import pytest
 import market_calc
 import market_publish
 import output_validator
+from test_market_dashboard import ALL_NOWS, DISCLAIMER, ONELINER_US
+from test_market_dashboard import DAY as DASH_DAY
+from test_market_dashboard import NOW as DASH_NOW
+from test_market_dashboard import PREV as DASH_PREV
+from test_market_dashboard import (  # noqa: F401  md／paths 是 fixture（用名字被 pytest 找到）
+    _never,
+    assert_main_gate,
+    make_snapshot,
+    md,
+    paths,
+    summary_bubble,
+    texts,
+    worst_snapshot,
+    write_snapshot,
+)
 from test_market_publish import D as PUB_D
 from test_market_publish import NOW as PUB_NOW
 from test_market_publish import US_DAYS, _set_close
@@ -606,3 +621,311 @@ def test_the_labels_put_the_exact_row_before_the_prefix():
     assert market_publish._label_for("us.rot.XLP") == market_publish._label_for("us.rot.KO") == "必需消費類股"
     # _label_for 照 dict 的順序取第一個符合的：精確的 us.rot.state 要在前綴 us.rot. 前面；兩個都放在 us.etf. 旁邊
     assert labels[labels.index("us.etf.") + 1:labels.index("us.etf.") + 3] == ["us.rot.state", "us.rot."]
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# dashboard：美股卡的三列（XLP、KO、資金輪動）與 footer
+# make_snapshot：標題日 10/16（VOO、QQQ），SOXX 與研判日 10/15；預設研判是「半導體偏熱、必需消費偏弱」
+# ═════════════════════════════════════════════════════════════════════════════
+US_HEAD = "美股（2/5）"
+ROT_XLP_DEFAULT = "必需消費（XLP）80.5 -0.40% 在月線下 RSI 38"
+ROT_KO_DEFAULT = "可口可樂（KO）68.4 +0.10% 在月線上 RSI 55"
+FIRST_FIVE = [
+    ("標普500（VOO）612.34 +0.52% 在月線上 RSI 55", "#1E5AA8"),
+    ("那斯達克100（QQQ）540.12 -0.31% 在月線下 RSI 55", "#B7791F"),
+    ("半導體（SOXX）245.6 +1.20% 在月線上（10/15）", "#1E5AA8"),
+    ("成分股站上月線：VOO 62%、QQQ 55%、SOXX 資料不足", "#555555"),
+    ("量能：VOO 量偏少、QQQ 量偏少、SOXX 量偏少", "#555555"),
+]
+WATCH_NOTE = "資金輪動只看價格：SOXX RSI 74、離季線 +12.3%、離 240 日高點 -2.1%；XLP RSI 38、在季線下；KO RSI 55、在季線上"
+HELD = "狀態要連續 2 個交易日都一樣才會換"
+
+
+def us_bubble(md_, snap, now=DASH_NOW):
+    return md_._card_us(md_._Ctx(snap, now), US_HEAD)
+
+
+def us_body(md_, snap, now=DASH_NOW):
+    return [(node["text"], node.get("color")) for node in us_bubble(md_, snap, now)["body"]["contents"]]
+
+
+def us_notes(md_, snap, now=DASH_NOW):
+    footer = texts(us_bubble(md_, snap, now)["footer"])
+    return footer[:footer.index(DISCLAIMER)]
+
+
+def set_rot(snap, values, *, state=None, day=None):
+    """研判那一列換成這組指標：raw 用 rot_classify 從同一組數字算，state 預設等於 raw（給了就是「沿用前幾天的」）。"""
+    row = snap["rows"]["us.rot.state"]
+    raw = market_calc.rot_classify(values)
+    row["values"] = {**values, "raw": raw, "state": state or raw}
+    if day is not None:
+        row["data_date"] = day.isoformat()
+    return row["values"]
+
+
+def passes_every_gate(text):
+    import market_dashboard
+
+    assert not market_dashboard.has_forbidden(text), text
+    for now in ALL_NOWS:
+        result = output_validator.validate_outbound_text(text, now=datetime.fromtimestamp(now, TPE))
+        assert result.ok and result.text == text, (text, now, result.reason)
+
+
+def test_the_fixtures_carry_valid_rotation_rows(md):
+    """fixture 的研判值一定要過 rotation_values_ok：不然卡上悄悄變成「暫缺」，下面的測試就什麼也沒測到。"""
+    for snap in (make_snapshot(DASH_NOW), worst_snapshot(DASH_NOW)):
+        values = snap["rows"]["us.rot.state"]["values"]
+        assert market_calc.rotation_values_ok(values) and values["raw"] == market_calc.rot_classify(values)
+        assert "暫缺" not in us_body(md, snap)[7][0]
+    worst = worst_snapshot(DASH_NOW)["rows"]["us.rot.state"]["values"]
+    assert worst["state"] == "watch_staples" and worst["raw"] == "semis"  # footer 最長：watch＋KO＋「連續 2 個交易日」
+
+
+def test_the_us_card_shows_every_row_it_builds_and_the_one_liner_stays_last(md, monkeypatch):
+    built = []
+    original = md._summary_bubble
+
+    def spy(title, rows, **kwargs):
+        built.append((list(rows), kwargs.get("max_rows", "default")))
+        return original(title, rows, **kwargs)
+
+    monkeypatch.setattr(md, "_summary_bubble", spy)
+    snap = make_snapshot(DASH_NOW)
+    body = us_body(md, snap)
+    (rows, max_rows), = built
+    assert body == [(text, color) for text, color in rows] and len(body) == 9  # 一列都沒被截掉
+    assert max_rows is None  # 美股卡不截斷；太大由 _guarded_bubbles(max_bytes) 換短卡、看得到
+    assert body[5:] == [(ROT_XLP_DEFAULT, md.ORANGE), (ROT_KO_DEFAULT, md.BLUE),
+                        ("資金輪動 10/15：半導體偏熱、必需消費偏弱", md.ORANGE), (ONELINER_US, md.GRAY)]
+    sentence = market_calc.CONTRA_TEXT["up_low_volume"].format(subject=market_calc.SUBJECT_NAME["VOO"])
+    snap["rows"]["contra.us"]["values"] = {"codes": ["up_low_volume:VOO"], "text": sentence, "provisional": False}
+    body = us_body(md, snap)
+    assert len(body) == 9 and body[-1] == (sentence, md.ORANGE)  # 矛盾句也一樣留在最後一列
+
+
+def test_the_first_five_rows_are_exactly_what_they_were(md):
+    snap = make_snapshot(DASH_NOW)
+    old = copy.deepcopy(snap)
+    for row_id in ROT_ROWS:
+        del old["rows"][row_id]
+    assert us_body(md, snap)[:5] == us_body(md, old)[:5] == FIRST_FIVE
+
+
+def test_summary_bubble_still_cuts_other_cards_at_six(md):
+    rows = [(f"第 {i} 列", md.GRAY) for i in range(10)]
+    assert md.MAX_SUMMARY_ROWS == 6
+    assert len(md._summary_bubble("t", rows)["body"]["contents"]) == 6
+    assert len(md._summary_bubble("t", rows, max_rows=None)["body"]["contents"]) == 10
+
+
+def test_the_bot_reads_the_three_rows_next_to_the_etf_rows(md):
+    rows = list(md.READ_ROWS)
+    first = rows.index("us.etf.SOXX")
+    assert rows[first + 1:first + 4] == list(ROT_ROWS) and set(md.READ_ROWS) <= set(market_calc.ROW_IDS)
+
+
+# 研判那一列：每個狀態 ×（有日期／沒日期）× 一般值與 rotation_values_ok 允許的極限值
+LINE_CASES = [
+    ("staples", {"xlp_ret20": 2.0, "soxx_ret20": -10.4}, None, "資金輪動：必需消費比半導體強 12.4 個百分點"),
+    ("staples", {"xlp_ret20": 2.0, "soxx_ret20": -10.4}, DASH_PREV, "資金輪動 10/15：必需消費比半導體強 12.4 個百分點"),
+    ("staples_gap_99_9", {"xlp_ret20": 49.9, "soxx_ret20": -50.0}, DASH_PREV, "資金輪動 10/15：必需消費比半導體強 99.9 個百分點"),
+    ("staples_gap_100", {"xlp_ret20": 50.0, "soxx_ret20": -50.0}, DASH_PREV, "資金輪動 10/15：必需消費比半導體強"),
+    ("staples_limit", {"xlp_ret20": 1000.0, "soxx_ret20": -99.9}, None, "資金輪動：必需消費比半導體強 1099.9 個百分點"),
+    ("staples_limit", {"xlp_ret20": 1000.0, "soxx_ret20": -99.9}, DASH_PREV, "資金輪動 10/15：必需消費比半導體強"),
+    ("semis", {"xlp_ret20": -10.4, "soxx_ret20": 2.0}, None, "資金輪動：半導體比必需消費強 12.4 個百分點"),
+    ("semis", {"xlp_ret20": -10.4, "soxx_ret20": 2.0}, DASH_PREV, "資金輪動 10/15：半導體比必需消費強 12.4 個百分點"),
+    ("semis_limit", {"xlp_ret20": -99.9, "soxx_ret20": 1000.0}, None, "資金輪動：半導體比必需消費強 1099.9 個百分點"),
+    ("semis_limit", {"xlp_ret20": -99.9, "soxx_ret20": 1000.0}, DASH_PREV, "資金輪動 10/15：半導體比必需消費強"),
+    ("watch_staples", {"soxx_rsi": 74, "xlp_above60": False}, None, "資金輪動：半導體偏熱、必需消費偏弱"),
+    ("watch_staples", {"soxx_rsi": 74, "xlp_above60": False}, DASH_PREV, "資金輪動 10/15：半導體偏熱、必需消費偏弱"),
+    ("watch_staples_limit", {"soxx_rsi": 100, "soxx_ma60": 1000.0, "soxx_dd240": 0.0, "xlp_rsi": 0, "xlp_above60": None,
+                             "ko_rsi": 0, "ko_above60": None, "xlp_ret20": 1000.0, "soxx_ret20": -99.9}, DASH_PREV,
+     "資金輪動 10/15：半導體偏熱、必需消費偏弱"),
+    ("watch_semis", {"soxx_rsi": 25, "xlp_rsi": 72}, None, "資金輪動：半導體偏冷、必需消費偏熱"),
+    ("watch_semis", {"soxx_rsi": 25, "xlp_rsi": 72}, DASH_PREV, "資金輪動 10/15：半導體偏冷、必需消費偏熱"),
+    ("watch_semis_limit", {"soxx_rsi": 0, "soxx_ma60": -99.9, "soxx_dd240": -100.0, "xlp_rsi": 100, "ko_rsi": 100,
+                           "xlp_ret20": -99.9, "soxx_ret20": 1000.0}, DASH_PREV, "資金輪動 10/15：半導體偏冷、必需消費偏熱"),
+    ("none", {}, None, "資金輪動：沒有明顯方向"),
+    ("none", {"xlp_ret20": 4.9, "soxx_ret20": 0.0}, DASH_PREV, "資金輪動 10/15：沒有明顯方向"),
+    ("insufficient", {"xlp_ret20": None, "soxx_ret20": None}, None, "資金輪動：資料不足"),
+    ("insufficient", {"xlp_ret20": None, "soxx_ret20": None}, DASH_PREV, "資金輪動 10/15：資料不足"),
+]
+
+
+@pytest.mark.parametrize("name,over,day,expected", LINE_CASES,
+                         ids=[f"{case[0]}-{'dated' if case[2] else 'undated'}" for case in LINE_CASES])
+def test_the_rotation_row_for_every_state_fits_and_keeps_its_date(md, name, over, day, expected):
+    snap = make_snapshot(DASH_NOW)
+    values = set_rot(snap, neutral(**over), day=day or DASH_DAY)
+    assert values["state"] == name.removesuffix("_limit").split("_gap")[0]
+    text, color = us_body(md, snap)[7]
+    assert text == expected and md.row_width(text) <= 24 and "…" not in text, (text, md.row_width(text))
+    assert color == (md.ORANGE if values["state"].startswith("watch_") else md.GRAY)
+    passes_every_gate(text)
+
+
+def test_the_widths_of_the_fixed_sentences():
+    """列名＋日期（最寬的 12/31）＋狀態句的寬：帶差距最寬 24.0；差距到 100 以上（24.5）退到不帶差距那一段。"""
+    import market_dashboard
+
+    mc, width = market_calc, market_dashboard.row_width
+    head, plain = f"{mc.TEXT_ROT_LABEL} 12/31：", f"{mc.TEXT_ROT_LABEL}："
+    assert (width(head), width(plain)) == (8.0, 5.0)
+    for sentence in (mc.TEXT_ROT_STAPLES, mc.TEXT_ROT_SEMIS):
+        assert width(head + sentence + mc.TEXT_ROT_GAP.format(gap="99.9")) == 24.0
+        assert width(head + sentence + mc.TEXT_ROT_GAP.format(gap="100.0")) == 24.5
+        assert width(plain + sentence + mc.TEXT_ROT_GAP.format(gap="1099.9")) == 22.0
+    assert {width(head + mc.ROT_STATE_TEXT[s]) for s in ("watch_staples", "watch_semis")} == {20.0}
+    assert (width(head + mc.TEXT_ROT_NONE), width(plain + mc.TEXT_ROT_NONE)) == (14.0, 11.0)
+    assert (width(mc.TEXT_ROT_XLP_NAME), width(mc.TEXT_ROT_KO_NAME)) == (7.5, 7.0)  # 比「那斯達克100（QQQ）」9.0 短
+
+
+FOOTER_CASES = [
+    ("watch_with_ko", {"soxx_rsi": 74, "soxx_ma60": 12.3, "soxx_dd240": -2.1, "xlp_rsi": 38, "xlp_above60": False,
+                       "ko_rsi": 55, "ko_above60": True}, None, [WATCH_NOTE]),
+    ("watch_without_ko", {"soxx_rsi": 74, "soxx_ma60": 12.3, "soxx_dd240": -2.1, "xlp_rsi": 38, "xlp_above60": False,
+                          "ko_rsi": None, "ko_above60": None}, None,
+     ["資金輪動只看價格：SOXX RSI 74、離季線 +12.3%、離 240 日高點 -2.1%；XLP RSI 38、在季線下"]),
+    ("watch_missing_numbers", {"soxx_rsi": 74, "soxx_ma60": None, "soxx_dd240": None, "xlp_rsi": None,
+                               "xlp_above60": False, "ko_rsi": None, "ko_above60": False}, None,
+     ["資金輪動只看價格：SOXX RSI 74、離季線 暫缺、離 240 日高點 暫缺；XLP RSI 暫缺、在季線下；KO RSI 暫缺、在季線下"]),
+    ("watch_semis", {"soxx_rsi": 25, "xlp_rsi": 72, "xlp_above60": None}, None,
+     ["資金輪動只看價格：SOXX RSI 25、離季線 0.0%、離 240 日高點 -20.0%；XLP RSI 72、季線暫缺；KO RSI 50、在季線上"]),
+    ("returns", {"xlp_ret20": -1.2, "soxx_ret20": -13.6}, None, ["資金輪動只看價格：近 20 個交易日 XLP -1.2%、SOXX -13.6%"]),
+    ("none", {"xlp_ret20": 4.9, "soxx_ret20": 0.0}, None, ["資金輪動只看價格：近 20 個交易日 XLP +4.9%、SOXX 0.0%"]),
+    ("held_trend", {"xlp_ret20": 2.0, "soxx_ret20": -10.4, "soxx_rsi": 74, "xlp_above60": False}, "staples",
+     ["資金輪動只看價格：近 20 個交易日 XLP +2.0%、SOXX -10.4%", HELD]),
+    ("held_watch", {"xlp_ret20": -10.4, "soxx_ret20": 2.0}, "watch_staples",
+     ["資金輪動只看價格：SOXX RSI 50、離季線 0.0%、離 240 日高點 -20.0%；XLP RSI 50、在季線上；KO RSI 50、在季線上", HELD]),
+    ("insufficient", {"xlp_ret20": None, "soxx_ret20": None}, None, []),
+]
+
+
+@pytest.mark.parametrize("over,state,expected", [case[1:] for case in FOOTER_CASES], ids=[case[0] for case in FOOTER_CASES])
+def test_the_footer_says_what_the_read_is_based_on(md, over, state, expected):
+    snap = make_snapshot(DASH_NOW)
+    values = set_rot(snap, neutral(**over), state=state)
+    assert market_calc.rotation_values_ok(values)
+    assert us_notes(md, snap) == expected
+    for note in expected:
+        passes_every_gate(note)
+
+
+def test_a_held_state_prints_no_gap_and_the_footer_says_why(md):
+    snap = make_snapshot(DASH_NOW)
+    values = set_rot(snap, neutral(xlp_ret20=2.0, soxx_ret20=-10.4, soxx_rsi=74, xlp_above60=False), state="staples",
+                     day=DASH_PREV)
+    assert values["raw"] == "watch_staples" and values["state"] == "staples"  # 當天是 watch，顯示的沿用前幾天的 staples
+    assert us_body(md, snap)[7] == ("資金輪動 10/15：必需消費比半導體強", md.GRAY)  # 當天的數字不能拿來佐證：不印差距
+    assert us_notes(md, snap)[-1] == HELD
+
+
+def test_the_held_sentence_makes_no_promise(md):
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location("bot_promise_scan_for_rotation", Path(__file__).resolve().parent / "jobs" /
+                                                  "bot_promise_scan.py")
+    scan = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = scan
+    try:
+        spec.loader.exec_module(scan)
+        for name in ROT_TEXTS:
+            assert scan.promise_sentences(getattr(market_calc, name)) == [], name
+    finally:
+        sys.modules.pop(spec.name, None)
+
+
+def test_the_provisional_hours_print_these_rows(md):
+    """CBOE 暫定時段：VOO／QQQ／SOXX 是 D（暫定），XLP、KO、研判都還是 D−1。"""
+    snap = make_snapshot(DASH_NOW)
+    rows = snap["rows"]
+    for sym in ("VOO", "QQQ", "SOXX"):
+        rows[f"us.etf.{sym}"]["data_date"] = DASH_DAY.isoformat()
+        rows[f"us.etf.{sym}"]["source"] = market_calc.SOURCE_CBOE_FALLBACK
+    for row_id in ROT_ROWS:
+        rows[row_id]["data_date"] = DASH_PREV.isoformat()
+    body = [text for text, _color in us_body(md, snap)]
+    assert all(market_calc.TEXT_PROVISIONAL in text for text in body[:3])
+    assert body[5:] == [
+        "必需消費（XLP）80.5 -0.40% 在月線下（10/15）",  # 帶日期放不下 RSI：照 _etf_line 既有的退化順序先拿掉 RSI
+        "可口可樂（KO）68.4 +0.10% 在月線上（10/15）",
+        "資金輪動 10/15：半導體偏熱、必需消費偏弱",
+        ONELINER_US,
+    ]
+    assert us_notes(md, snap) == [market_calc.TEXT_PROVISIONAL_CLOSE, WATCH_NOTE]  # 既有的註記在前、資金輪動在後
+
+
+def test_an_old_snapshot_without_the_rows_shows_missing(md, paths):
+    snap = make_snapshot(DASH_NOW)
+    for row_id in ROT_ROWS:
+        del snap["rows"][row_id]
+    write_snapshot(paths, snap)
+    reply = md.handle("", now=DASH_NOW, paths=paths)
+    assert reply.flex is not None and reply.render_errors == ()
+    bubble = summary_bubble(md, reply.flex, "美股")
+    assert texts(bubble["body"])[5:] == ["必需消費（XLP）暫缺", "可口可樂（KO）暫缺", "資金輪動：暫缺", ONELINER_US]
+    assert not any(note.startswith(market_calc.TEXT_ROT_LABEL) for note in texts(bubble["footer"]))
+    assert_main_gate(reply)
+
+
+def test_stale_rows_show_their_data_date(md):
+    snap = make_snapshot(DASH_NOW)
+    for row_id in ROT_ROWS:
+        snap["rows"][row_id]["stale_after"] = DASH_NOW - 1
+    assert [text for text, _color in us_body(md, snap)[5:8]] == [
+        "必需消費（XLP）過期（資料日 10/16）", "可口可樂（KO）過期（資料日 10/16）", "資金輪動：過期（資料日 10/15）"]
+    assert us_notes(md, snap) == []
+
+
+@pytest.mark.parametrize("how", ["raw_mismatch", "rsi_120", "unrounded", "unknown_state", "missing_key", "never",
+                                 "values_list"])
+def test_bad_rotation_values_show_missing_and_nothing_breaks(md, paths, how):
+    snap = make_snapshot(DASH_NOW)
+    row = snap["rows"]["us.rot.state"]
+    values = row["values"]
+    if how == "raw_mismatch":
+        values["raw"] = "staples"
+    elif how == "rsi_120":
+        values["soxx_rsi"] = 120
+    elif how == "unrounded":
+        values["soxx_ma60"] = 12.34
+    elif how == "unknown_state":
+        values["state"] = "rally"
+    elif how == "missing_key":
+        del values["ko_rsi"]
+    elif how == "never":
+        snap["rows"]["us.rot.state"] = _never()
+    else:
+        row["values"] = [1, 2]
+    write_snapshot(paths, snap)
+    reply = md.handle("", now=DASH_NOW, paths=paths)
+    assert reply.flex is not None and reply.render_errors == ()
+    bubble = summary_bubble(md, reply.flex, "美股")
+    body = texts(bubble["body"])
+    assert body[7] == "資金輪動：暫缺" and body[5] == ROT_XLP_DEFAULT and body[-1] == ONELINER_US
+    assert not any(note.startswith(market_calc.TEXT_ROT_LABEL) for note in texts(bubble["footer"]))
+    assert_main_gate(reply)
+
+
+def test_the_worst_us_bubble_and_carousel_stay_within_the_limits(md, paths):
+    import market_dashboard
+
+    write_snapshot(paths, worst_snapshot(DASH_NOW))
+    reply = md.handle("", now=DASH_NOW, paths=paths)
+    assert reply.flex is not None and reply.render_errors == ()
+    bubble = summary_bubble(md, reply.flex, "美股")
+    body = texts(bubble["body"])
+    assert len(body) == 9 and all(md.row_width(text) <= 24 and "…" not in text for text in body), body
+    assert body[5:8] == ["必需消費（XLP）9,999,999 在月線下（10/14）", "可口可樂（KO）9,999,999 在月線下（10/14）",
+                         "資金輪動 10/14：半導體偏熱、必需消費偏弱"]
+    notes = texts(bubble["footer"])
+    assert notes[:notes.index(DISCLAIMER)][-2:] == [
+        "資金輪動只看價格：SOXX RSI 100、離季線 +1,000.0%、離 240 日高點 -100.0%；XLP RSI 100、在季線上；KO RSI 100、在季線上",
+        HELD,
+    ]
+    assert md.card_bytes(bubble) <= market_dashboard.SUMMARY_BUBBLE_MAX_BYTES == 6656
+    assert md.card_bytes(reply.flex) <= market_dashboard.CARD_MAX_BYTES == 28 * 1024

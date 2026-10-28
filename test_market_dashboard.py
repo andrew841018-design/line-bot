@@ -162,6 +162,27 @@ def _stats(up, median, mean, n):
     return {"up_pct": up, "median": median, "mean": mean, "n": n}
 
 
+def _rotation_rows(now, day):
+    """資金輪動三列（2026-10-28）：必需消費 XLP、可口可樂 KO 的收盤列（ETF_SPEC）與研判 us.rot.state（ROT_SPEC）。
+
+    預設是 SOXX 偏熱（RSI 74、離季線 +12.3%）、XLP 在季線下（RSI 38）→「半導體偏熱、必需消費偏弱」，KO 在季線上；研判日跟著
+    SOXX（比 VOO、QQQ 舊一天，列名後面帶日期）。raw／state 用 market_calc.rot_classify 從同一組數字算，一定過
+    market_calc.rotation_values_ok：不然那一列會悄悄變成「暫缺」，卡片的測試就什麼也沒測到。"""
+    values = {"xlp_ret20": -1.2, "soxx_ret20": 8.0, "soxx_rsi": 74, "soxx_ma60": 12.3, "soxx_dd240": -2.1,
+              "xlp_rsi": 38, "xlp_above60": False, "ko_rsi": 55, "ko_above60": True}
+    raw = market_calc.rot_classify(values)
+    return {
+        "us.rot.XLP": _row(dict(_etf(80.5, -0.4, False), rsi14=38.2), now, day),
+        "us.rot.KO": _row(dict(_etf(68.4, 0.1, True), rsi14=55.0), now, day),
+        "us.rot.state": _row({**values, "raw": raw, "state": raw}, now, day - timedelta(days=1)),
+    }
+
+
+def summary_max_rows(md_, title: str) -> int:
+    """摘要卡每張最多 MAX_SUMMARY_ROWS 列；美股卡另外接資金輪動的 3 列（XLP、KO、研判；2026-10-28），不截斷。"""
+    return md_.MAX_SUMMARY_ROWS + (3 if title.startswith("美股") else 0)
+
+
 def make_snapshot(now: float = NOW) -> dict:
     today = datetime.fromtimestamp(now, TPE).date()
     day = today - timedelta(days=1)
@@ -249,6 +270,7 @@ def make_snapshot(now: float = NOW) -> dict:
         "contra.us": _row({"codes": [], "text": None, "provisional": False}, now, day),
         "contra.tw": _row({"codes": ["foreign_sell_trust_buy"], "text": "外資 5 日賣超、投信 5 日買超"}, now, day),
     }
+    rows.update(_rotation_rows(now, day))
     macro = {"VIX": 19.99, "VIX3M": 21.5, "UST3M": 4.26, "UST10Y": 5.09, "DXY": 28.92, "WTI": 72.3, "BRENT": 76.1,
              "GOLD": 2650.0, "SILVER": 31.2, "BTC": 81471.0, "USDTWD": 32.338, "RUT": 2250.0, "DJI": 43000.0,
              "IXIC": 19000.0, "MOVE": 98.5, "SPY_DD": -3.2}
@@ -294,6 +316,16 @@ def worst_snapshot(now: float = NOW) -> dict:
                                                vol_flag="結算日")
         rows[f"us.breadth.{sym}"]["values"].update(universe_label=long_note, coverage_note=long_note, adv=9999,
                                                    dec=9999, flat=9999)
+    # 資金輪動三列（2026-10-28）的最長寫法：XLP、KO 七位數價格、-99.99%、RSI 100、列尾帶日期；研判顯示 watch（footer 最長的
+    # 那一段，含 KO）而當天的原始狀態不一樣（footer 多一句「連續 2 個交易日」），數字都在 rotation_values_ok 允許的極限
+    older = (datetime.fromtimestamp(now, TPE).date() - timedelta(days=3)).isoformat()
+    for row_id in ("us.rot.XLP", "us.rot.KO"):
+        rows[row_id]["values"].update(close=9_999_999.0, chg_pct=-99.99, above_ma20=False, rsi14=100.0)
+        rows[row_id]["data_date"] = older
+    rot = {"xlp_ret20": -99.9, "soxx_ret20": 1000.0, "soxx_rsi": 100, "soxx_ma60": 1000.0, "soxx_dd240": -100.0,
+           "xlp_rsi": 100, "xlp_above60": True, "ko_rsi": 100, "ko_above60": True}
+    rows["us.rot.state"]["values"] = {**rot, "raw": market_calc.rot_classify(rot), "state": "watch_staples"}
+    rows["us.rot.state"]["data_date"] = older
     rows["tw.etf.0050"]["values"].update(close=99999.99, chg_pct=-99.99, above_ma20=False)
     rows["tw.taiex"]["values"].update(close=99999.99, chg_pct=-99.99, above_ma20=False)
     rows["tw.turnover"]["values"].update(value_twd=9_999_900_000_000.0, vol_ratio=999.99, vol_label="明顯量縮",
@@ -493,7 +525,7 @@ def test_summary_rows_limit_width_and_jargon(md, paths, variant):
     card = md.handle("", now=NOW, paths=paths).flex
     for bubble in card["contents"]:
         body = bubble["body"]["contents"]
-        assert 1 <= len(body) <= 6
+        assert 1 <= len(body) <= summary_max_rows(md, bubble["header"]["contents"][0]["text"])  # 美股 9、其他 6
         for node in body:
             assert node["type"] == "text"
             assert md.row_width(node["text"]) <= 24, node["text"]
@@ -627,7 +659,11 @@ def test_summary_rows_show_numbers_and_states(md, paths):
         "半導體（SOXX）245.6 +1.20% 在月線上（10/15）",  # 和標題不同日要寫日期
         "成分股站上月線：VOO 62%、QQQ 55%、SOXX 資料不足",  # SOXX 有效 22/30 <80%
         "量能：VOO 量偏少、QQQ 量偏少、SOXX 量偏少",  # 和一句話同一套字（資料值是「量縮」）
-        ONELINER_US,  # 沒有矛盾時放一句話
+        # 2026-10-28 資金輪動：XLP、KO 兩列和研判（研判日跟著 SOXX，比標題舊一天 → 日期放在列名後面），插在一句話之前
+        "必需消費（XLP）80.5 -0.40% 在月線下 RSI 38",
+        "可口可樂（KO）68.4 +0.10% 在月線上 RSI 55",
+        "資金輪動 10/15：半導體偏熱、必需消費偏弱",
+        ONELINER_US,  # 沒有矛盾時放一句話（仍是最後一列）
     ]
     assert tw == [
         "加權指數 47,111（+0.52%） 在月線上 RSI 62",
@@ -794,7 +830,7 @@ def test_empty_oneliner_is_not_a_dropped_string(md, paths):
     snap["rows"]["news.us"]["values"]["items"][0]["source"] = None
     write_snapshot(paths, snap)
     card = md.handle("", now=NOW, paths=paths).flex
-    assert len(summary_bubble(md, card, "美股")["body"]["contents"]) == 5
+    assert len(summary_bubble(md, card, "美股")["body"]["contents"]) == 8  # 5 列＋資金輪動 3 列，沒有一句話
     assert md.status_summary(now=NOW, paths=paths)["external_dropped"] == 0
 
 
@@ -804,7 +840,7 @@ def test_job_sentences_with_forbidden_words_are_dropped(md, paths):
     write_snapshot(paths, snap)
     card = md.handle("", now=NOW, paths=paths).flex
     assert not any("進場" in t for t in texts(card))
-    assert len(summary_bubble(md, card, "美股")["body"]["contents"]) == 5
+    assert len(summary_bubble(md, card, "美股")["body"]["contents"]) == 8  # 5 列＋資金輪動 3 列，沒有一句話
 
 
 def test_fixed_sentences_make_no_promises(md, paths, monkeypatch):
@@ -963,7 +999,7 @@ def test_corrupted_values_never_crash_and_still_pass_the_gate(md, paths, junk):
                 assert size(reply.flex) <= 28 * 1024
                 if body == "":
                     for bubble in reply.flex["contents"]:
-                        assert len(bubble["body"]["contents"]) <= 6
+                        assert len(bubble["body"]["contents"]) <= summary_max_rows(md, texts(bubble["header"])[0])
                         assert all(md.row_width(t) <= 24 for t in texts(bubble["body"]))
 
 

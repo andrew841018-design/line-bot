@@ -33,6 +33,7 @@ from test_market_dashboard import (  # noqa: F401  md／paths 是 fixture（用�
     render_all,
     reply_strings,
     size,
+    summary_max_rows,
     texts,
     worst_snapshot,
     write_snapshot,
@@ -226,6 +227,8 @@ def test_snapshot_without_rsi_reads_as_before(md, paths):
     snap["rows"]["tw.taiex"]["values"].pop("rsi14", None)
     for row_id in ("us.etf.VOO", "us.etf.QQQ", "tw.etf.0050"):
         snap["rows"][row_id]["values"]["rsi14"] = None
+    for row_id in ("us.rot.XLP", "us.rot.KO", "us.rot.state"):  # 舊快照也沒有資金輪動三列（2026-10-28 才加）
+        del snap["rows"][row_id]
     us, tw = summary_cards(md, paths, snap)[:2]
     assert us[2][:2] == ["標普500（VOO）612.34 +0.52% 在月線上", "那斯達克100（QQQ）540.12 -0.31% 在月線下"]
     assert tw[2][:2] == ["加權指數 47,111（+0.52%） 在月線上", "台灣50（0050）185.3 +0.40% 在月線上"]
@@ -739,8 +742,8 @@ def test_notices_never_touch_the_other_cards_or_the_row_limits(md, paths):
     cards = summary_cards(md, paths, snap)
     assert "尚未取得" in cards[0][1] and cards[1][1] == "10/17 休市"  # 對照：兩張都有
     assert cards[2][1] is None and cards[3][1] is None
-    for _title, _subtitle, body, _footer in cards:
-        assert 1 <= len(body) <= 6 and all(md.row_width(text) <= 24 for text in body)
+    for title, _subtitle, body, _footer in cards:  # 美股卡多了資金輪動 3 列（2026-10-28）：9 列，其他 6 列
+        assert 1 <= len(body) <= summary_max_rows(md, title) and all(md.row_width(text) <= 24 for text in body)
 
 
 def test_notices_are_fixed_sentences_that_pass_every_check():
@@ -995,8 +998,8 @@ def test_every_marker_at_once_stays_within_the_size_and_row_limits(md, paths, va
              if not texts(b["header"])[0].startswith("重點摘要")]  # 第一張是 A1 的重點摘要：這裡從美股開始數
     assert "尚未取得" in cards[0][0][1] and cards[1][0][1] == "10/17 休市（暫定）"  # 標示真的都開著
     assert any("RSI 100" in text for text in cards[0][1] + cards[1][1])
-    for header, body, _footer in cards:
-        assert 1 <= len(body) <= 6 and all(md.row_width(text) <= 24 for text in body)
+    for header, body, _footer in cards:  # 美股卡多了資金輪動 3 列（2026-10-28）：9 列，其他 6 列
+        assert 1 <= len(body) <= summary_max_rows(md, header[0]) and all(md.row_width(text) <= 24 for text in body)
     for _header, body, _footer in cards[:2]:  # 美股、台股兩張（這一軌改的）：最壞值也不能被切成「…」
         assert not any("…" in text for text in body), body
     for body, reply in replies.items():
