@@ -1,6 +1,6 @@
-"""股票推薦回測（計畫 B，2026-10-29）A 段：封存、三族池子紀錄、B1 spool 匯入（格式定案前的佔位）。
+"""股票推薦回測（計畫 B，2026-10-29）A 段：封存、三族池子紀錄；B1 的 AI spool 匯入。
 
-規格：ops/state/line_bot_stock_backtest_20261028/PLAN.md（v5）§4.2、§4.3。
+規格：ops/state/line_bot_stock_backtest_20261028/PLAN.md（v5）§4.2、§4.3、§5.2。
 
 封存（只用標準庫：bot 程式、review.sqlite 壞掉都照樣封存）
 - 三個狀態檔（主快照、AI 狀態、美股快照）每輪只讀一次：O_NOFOLLOW、只收自己的一般檔、有大小上限。
@@ -11,22 +11,39 @@
 - `--import-archive DIR`：一次性匯入手動封存（stock_picks_tw.json.<ts>.gz 這類檔名），進封存，也記池子紀錄。
 
 池子紀錄（review.sqlite 的 pool_days／pool_rows；冪等鍵 (m, rule, t, ver_s, derive_version)，ver_s＝round(computed_at)）
-- tw/v1（舊規則，對照組）：主快照 universe 的 50 檔（pool 多放的常問股 0050 不算成員）；flags＝checks_of、
+三族的名字一律是 tw_v1、tw_ai、us（FAMILY_*；last_run 的 last_t、週報、spool 檔名、背景規則選單都用這三個）。
+各族在 pool_days 裡怎麼找：FAMILY_WHERE（last_t 與週報共用）。
+- tw_v1（舊規則，對照組）：主快照 universe 的 50 檔（pool 多放的常問股 0050 不算成員）；flags＝checks_of、
   values＝_facts_json，走勢就是主池的；c0＝listed 收盤。
-- tw/ai_*（簡版）：成員＝AI 狀態的 universe.codes，配同一個 T 的主快照（computed_at 不晚於 AI 那一版的最新一份；
-  現行的對不上就從封存找）。c0＝listed 收盤（每個成員都有，不靠 tr）；values＝_facts_json(_facts_for(…))，
-  flags＝ai_checks_of（條件 1–3；走勢不知道就是 null）。走勢只記主池有的（pool）與入選的（ok＋picks 的 tr），
-  其他 null，不推論。新的一版先等 10 分鐘寬限（spool 可能還在路上）；那一版已經有 spool 就不記簡版。
+- tw_ai（AI 相關股，rule＝ai_v1…）簡版：成員＝AI 狀態的 universe.codes，配同一個 T 的主快照（computed_at 不晚於 AI
+  那一版的最新一份；現行的對不上就從封存找）。c0＝listed 收盤（每個成員都有，不靠 tr）；走勢只記主池有的（pool）與
+  入選的（ok＋picks 的 tr），其他 null，不推論；知道走勢的先換進 _facts_for(…) 的結果，再算 values＝_facts_json 與
+  flags＝ai_checks_of（和 B1 hook 的 spool 同一種寫法：values 裡的 tr 一致；走勢不知道時 flags 的 trend 是 null）。
+  新的一版先等 10 分鐘寬限（spool 可能還在路上）；那一版有剛寫進來的 spool 就先不記簡版（spool_exists）。
   寬限內就被下一版蓋掉的那一版，之後從封存（最近 7 天）補記。
-- us/us_*：美股快照的 pool；flags＝us_checks_of、values＝美股的 _facts_json；c0＝DB 的 D 收盤，沒有就用快照
-  latest_closes 裡日期等於 D 的那筆。
-- 只有 spool 可以取代同一個鍵的簡版（src='simple'），其他一律不覆寫。tw/v1 與美股在 A 段也記成 simple
-  （PLAN §3 的 src 只有 spool／simple；舊規則永遠不會有 spool，美股 B2 起才有）。
+- us（rule＝us_v1…）：美股快照的 pool；flags＝us_checks_of、values＝美股的 _facts_json；c0＝DB 的 D 收盤，沒有就用
+  快照 latest_closes 裡日期等於 D 的那筆。
+- pool_days.origin：simple（job 從狀態檔推導）｜spool（bot 當下寫的 spool）。只有 spool 可以取代同一個鍵的簡版，
+  其他一律不覆寫；取代時 spool 沒有大盤狀態就沿用簡版的 market_json。tw_v1 與美股都是 simple（舊規則永遠不會有
+  spool，美股的 spool B2 才加）。meta_json 各族的鍵寫在 stock_picks_review_db 的模組說明。
+- 三族各自 try（AI 每一版各自 try）：一族出錯不擋其他族；有錯時整個階段記 error（連續失敗、短訊看得到）。
 - 真的拿不到收盤的成員（理論上不會有）不編數字：c0 留空、status＝excluded:no_close（review.sqlite 的 CHECK 也擋
   「成員卻沒有 c0」）。
 
-bot 的模組（stock_picks、stock_picks_us、stock_db_ro）只在函式裡 import，只呼叫純函式（解析、條件、
-_facts_json／_facts_for）。這個模組 import 時不做任何 I/O。
+spool（B1 起，只有 tw_ai）：格式見 stock_picks_review_hook 的模組說明；這裡（spool_version）當不可信輸入嚴格驗證。
+- 用 computed_at 對回已 commit 的版本：job 看過的 AI 狀態（現行＋封存 7 天），加上 AI 歷史檔
+  stock_picks_tw_ai_history.jsonl 最後一段（_commit_ai 成功才追加；job 沒看到就被蓋掉的版本靠它）。
+- 一檔一檔處理：JSON 不收 NaN／Infinity，值要能照樣寫回 JSON（1e400 這種變成無限大的也不收）；不合格的移到
+  done/<名>.invalid。寫入或搬檔失敗也移到 done/<名>.invalid（移不走就留著、下一輪再試），記 errors，接著處理下一檔：
+  一個壞檔不會卡住整個佇列。
+
+bot 的模組（stock_picks、stock_picks_us、stock_db_ro）只在函式裡 import，只用純函式與常數：
+- 解析：stock_picks.snapshot_from_json、ai_state_from_json，stock_picks_us.snapshot_from_json；
+- 條件與數值：checks_of、ai_checks_of、us_checks_of、_facts_json、_facts_for、美股的 _facts_json；
+- 排序（算 rank）：choose_picks、ai_candidates、choose_us_picks；Trend（把 picks 的 tr 轉回走勢）；
+- stock_db_ro 的唯讀查詢；AI_HISTORY_NAME（檔名）。
+meta_json 裡的 picks_match、funnel_match、pick_mismatch 只是診斷（重算的排序、漏斗和 bot 記下的一不一致），目前沒有人讀。
+這個模組 import 時不做任何 I/O。
 """
 
 from __future__ import annotations
@@ -35,11 +52,13 @@ import gzip
 import hashlib
 import importlib
 import json
+import logging
 import math
 import os
 import re
 import stat
 import time
+import traceback
 import zlib
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
@@ -47,6 +66,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 from zoneinfo import ZoneInfo
 
+log = logging.getLogger("stock_picks_review")
 TPE = ZoneInfo("Asia/Taipei")
 
 DERIVE_VERSION = 1  # 池子紀錄的推導版本：推導方式改了就升，從封存重算時新舊版本並存
@@ -60,14 +80,22 @@ TMP_MAX_AGE_S = 3600.0
 SPOOL_MAX_BYTES = 1024 * 1024
 SPOOL_KEEP_DAYS = 30
 SPOOL_UNMATCHED_GRACE_S = 86400.0  # 對不上任何已 commit 版本的 spool：留一天再移走（部署重疊時的另一份）
-SPOOL_MAX_FILES = 500
+SPOOL_MAX_PER_RUN = 500  # 每輪最多看幾個 spool 檔（hook 自己到 200 檔就不寫）
+SPOOL_MODE = 0o700  # 和 hook 一樣：spool/ 要剛好 0700，hook 才會寫
+AI_HISTORY_TAIL_BYTES = 256 * 1024  # AI 歷史檔只讀最後這一段（一天一兩行，夠涵蓋 AI_LOOKBACK_DAYS）
 
 TW_OLD_RULE = "v1"  # 舊規則沒有 rule 欄位（和 stock_picks_perf.TW_OLD_RULE 同字）
 MEMBER = "member"
 NO_CLOSE = "excluded:no_close"
 NO_FACTS = "excluded:no_facts"
-SIMPLE, SPOOL = "simple", "spool"
-FAMILY_V1, FAMILY_AI, FAMILY_US = "tw/v1", "tw/ai", "us"
+SIMPLE, SPOOL = "simple", "spool"  # pool_days.origin
+FAMILY_V1, FAMILY_AI, FAMILY_US = "tw_v1", "tw_ai", "us"
+# 各族在 pool_days 裡的條件（last_t 與週報共用）
+FAMILY_WHERE = (
+    (FAMILY_V1, "m = 'tw' AND rule = 'v1'"),
+    (FAMILY_AI, "m = 'tw' AND rule LIKE 'ai!_%' ESCAPE '!'"),
+    (FAMILY_US, "m = 'us'"),
+)
 
 
 @dataclass(frozen=True)
@@ -95,9 +123,8 @@ _YEAR_RE = re.compile(r"[0-9]{4}")
 ARCHIVE_NAME_RE = re.compile(
     r"(stock_picks_tw|stock_picks_tw_ai|stock_picks_us)-([0-9]{4}-[0-9]{2}-[0-9]{2})-([0-9a-f]{8})\.json\.gz")
 IMPORT_NAME_RE = re.compile(r"(stock_picks_tw|stock_picks_tw_ai|stock_picks_us)\.json\.([0-9]{8}_[0-9]{6})\.gz")
-SPOOL_NAME_RE = re.compile(r"(tw_ai|us)-([0-9]{4}-[0-9]{2}-[0-9]{2})-([0-9]{1,12}(?:\.[0-9]{1,9})?)\.json")
+SPOOL_NAME_RE = re.compile(r"(tw_ai)-([0-9]{4}-[0-9]{2}-[0-9]{2})-([0-9]{1,12}(?:\.[0-9]{1,9})?)\.json")
 _TW_CODE_RE = re.compile(r"[0-9]{4}")
-_US_SYMBOL_RE = re.compile(r"[A-Z]{1,5}(?:\.[A-Z])?")
 _REASON_RE = re.compile(r"[a-z0-9_]{1,32}")
 _RULE_RE = re.compile(r"[a-z][a-z0-9_]{0,15}")
 
@@ -125,8 +152,18 @@ def _finite(value) -> Optional[float]:
     return number if math.isfinite(number) else None
 
 
-def read_private_bytes(path: Path, max_bytes: int) -> Optional[bytes]:
-    """自己的一般檔（O_NOFOLLOW、owner＝自己、≤ max_bytes）。不存在回 None；其他問題丟 OSError／ValueError。"""
+def _reject_constant(name: str):
+    raise ValueError(f"non-finite number {name}")
+
+
+def strict_loads(data: bytes):
+    """json.loads，但不收 NaN、Infinity、-Infinity（json 預設照收；之後寫回 review.sqlite 時才會出錯）。
+    1e400 這種解出來是無限大的數字這裡擋不到：寫入前再用 _dumps 試一次。"""
+    return json.loads(data, parse_constant=_reject_constant)
+
+
+def _open_private(path: Path) -> Optional[int]:
+    """開自己的一般檔（O_NOFOLLOW、owner＝自己）回 fd；不存在回 None；不是自己的一般檔丟 ValueError。"""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
     except FileNotFoundError:
@@ -135,7 +172,19 @@ def read_private_bytes(path: Path, max_bytes: int) -> Optional[bytes]:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
             raise ValueError("not an own regular file")
-        if info.st_size > max_bytes:
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def read_private_bytes(path: Path, max_bytes: int) -> Optional[bytes]:
+    """自己的一般檔（O_NOFOLLOW、owner＝自己、≤ max_bytes）。不存在回 None；其他問題丟 OSError／ValueError。"""
+    fd = _open_private(path)
+    if fd is None:
+        return None
+    try:
+        if os.fstat(fd).st_size > max_bytes:
             raise ValueError("file too large")
         chunks: list[bytes] = []
         total = 0
@@ -150,6 +199,32 @@ def read_private_bytes(path: Path, max_bytes: int) -> Optional[bytes]:
         return b"".join(chunks)
     finally:
         os.close(fd)
+
+
+def read_private_tail(path: Path, max_bytes: int) -> Optional[bytes]:
+    """自己的一般檔的最後 max_bytes 個位元組（檔案比較小就是整份）；從中間開始讀時，丟掉第一個不完整的行。
+    不存在回 None；不是自己的一般檔丟 ValueError。給只追加的紀錄檔用（不用整份載入）。"""
+    fd = _open_private(path)
+    if fd is None:
+        return None
+    try:
+        start = max(0, os.fstat(fd).st_size - max_bytes)
+        os.lseek(fd, start, os.SEEK_SET)
+        chunks: list[bytes] = []
+        total = 0
+        while total < max_bytes:
+            chunk = os.read(fd, min(1 << 16, max_bytes - total))
+            if not chunk:
+                break
+            total += len(chunk)
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    data = b"".join(chunks)
+    if start > 0:
+        cut = data.find(b"\n")
+        data = data[cut + 1:] if cut >= 0 else b""
+    return data
 
 
 def gunzip_capped(data: bytes, max_bytes: int = ARCHIVE_RAW_MAX_BYTES) -> bytes:
@@ -348,8 +423,7 @@ class Version:
     rule: str
     t: str
     computed_at: float
-    family: str
-    src: str = SIMPLE
+    origin: str = SIMPLE  # pool_days.origin：simple｜spool
     bot_sha: Optional[str] = None
     source: Optional[str] = None
     core_version: Optional[str] = None
@@ -388,34 +462,38 @@ def _check_version(version: Version) -> None:
 
 
 def version_exists(conn, key: tuple) -> Optional[str]:
-    """這個鍵已經記了就回它的 src（simple／spool），沒有回 None。conn 是 None（dry-run 沒有 DB）也回 None。"""
+    """這個鍵已經記了就回它的 origin（simple／spool），沒有回 None。conn 是 None（dry-run 沒有 DB）也回 None。"""
     if conn is None:
         return None
-    found = conn.execute(f"SELECT src FROM pool_days WHERE {_KEY_WHERE}", key).fetchone()
+    found = conn.execute(f"SELECT origin FROM pool_days WHERE {_KEY_WHERE}", key).fetchone()
     return found[0] if found else None
 
 
 def write_version(conn, version: Version, *, now: float) -> str:
-    """回 new｜exists｜replaced。spool 可以取代同一個鍵的簡版；其他已經有的一律不動。"""
+    """回 new｜exists｜replaced。spool 可以取代同一個鍵的簡版（spool 沒有大盤狀態就沿用簡版的 market_json）；
+    其他已經有的一律不動。"""
     from jobs import stock_picks_review_db as rdb
 
     _check_version(version)
+    market_json = _dumps(version.market)
     with rdb.transaction(conn):
-        existing = version_exists(conn, version.key)
+        existing = conn.execute(f"SELECT origin, market_json FROM pool_days WHERE {_KEY_WHERE}", version.key).fetchone()
         result = "new"
         if existing is not None:
-            if not (version.src == SPOOL and existing == SIMPLE):
+            if not (version.origin == SPOOL and existing[0] == SIMPLE):
                 return "exists"
+            if market_json is None:
+                market_json = existing[1]
             conn.execute(f"DELETE FROM pool_rows WHERE {_KEY_WHERE}", version.key)
             conn.execute(f"DELETE FROM pool_days WHERE {_KEY_WHERE}", version.key)
             result = "replaced"
         conn.execute(
-            "INSERT INTO pool_days (m, rule, t, ver_s, derive_version, computed_at, src, bot_sha, n_members, n_picks,"
+            "INSERT INTO pool_days (m, rule, t, ver_s, derive_version, computed_at, origin, bot_sha, n_members, n_picks,"
             " source, core_version, cooldown_read, market_json, meta_json, logged_at)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (*version.key, float(version.computed_at), version.src, version.bot_sha,
+            (*version.key, float(version.computed_at), version.origin, version.bot_sha,
              sum(1 for r in version.rows if r.status == MEMBER), sum(1 for r in version.rows if r.picked),
-             version.source, version.core_version, version.cooldown_read, _dumps(version.market),
+             version.source, version.core_version, version.cooldown_read, market_json,
              _dumps(version.meta), float(now)),
         )
         conn.executemany(
@@ -488,7 +566,7 @@ def derive_tw_v1(sp, snap) -> Version:
     meta = {"pool": len(snap.pool), "listed": len(snap.listed), "candidates": len(candidates),
             "picks_match": candidates[:len(picks)] == picks}  # 重算的排序和 bot 記下的 picks 一致
     return Version(m="tw", rule=TW_OLD_RULE, t=snap.t.isoformat(), computed_at=float(snap.computed_at),
-                   family=FAMILY_V1, market=_market_list(snap.market), meta=meta, rows=rows)
+                   market=_market_list(snap.market), meta=meta, rows=rows)
 
 
 def _pick_trend(sp, raw: dict):
@@ -500,7 +578,8 @@ def _pick_trend(sp, raw: dict):
 
 def derive_tw_ai_simple(sp, state: dict, main, *, main_origin: str) -> Version:
     """AI 簡版：成員＝universe.codes；條件 1–3 用配對主快照的 listed／medians 算；走勢只記 pool／ok，其他 null。
-    rank＝ai_candidates 的排序（條件 1–3 都過的候選，bot 用的同一個純函式；和 B1 spool 的 rank 同義）。"""
+    rank＝ai_candidates 的排序（條件 1–3 都過的候選，bot 用的同一個純函式；和 B1 spool 的 rank 同義）。
+    知道走勢的先換進 facts，再算條件與 values（和 hook 的 build_ai_spool 一樣：values 的 tr 和 spool 一致）。"""
     universe = state["universe"]
     etf = set(universe.get("etf_codes") or [])
     picks = {raw["c"]: raw for raw in state["picks"]}
@@ -533,7 +612,9 @@ def derive_tw_ai_simple(sp, state: dict, main, *, main_origin: str) -> Version:
         elif pick is not None:
             trend = _pick_trend(sp, pick)
             label = "ok" if trend is not None else None
-        checks = sp.ai_checks_of(replace(facts, trend=trend) if trend is not None else facts, source)
+        if trend is not None:
+            facts = replace(facts, trend=trend)
+        checks = sp.ai_checks_of(facts, source)
         flags = {check.key: check.state for check in checks}
         if trend is None:
             flags["trend"] = None  # ai_checks_of 把「沒有走勢」算成 False；這裡是不知道
@@ -555,7 +636,7 @@ def derive_tw_ai_simple(sp, state: dict, main, *, main_origin: str) -> Version:
         "fetched_day": universe.get("fetched_day"),
     }
     return Version(m="tw", rule=state["rule"], t=state["t"], computed_at=float(state["computed_at"]),
-                   family=FAMILY_AI, source=universe.get("source"), core_version=state.get("core_version") or None,
+                   source=universe.get("source"), core_version=state.get("core_version") or None,
                    market=_market_list(main.market), meta=meta, rows=rows)
 
 
@@ -591,7 +672,7 @@ def derive_us(us, snap, db_closes: Optional[dict]) -> Version:
             "picks_match": candidates[:len(picks)] == picks,
             "universe_as_of": None if snap.universe_as_of is None else snap.universe_as_of.isoformat()}
     return Version(m="us", rule=snap.rule, t=snap.d.isoformat(), computed_at=float(snap.computed_at),
-                   family=FAMILY_US, market=spy, meta=meta, rows=rows)
+                   market=spy, meta=meta, rows=rows)
 
 
 # ── 配對主快照（AI 簡版） ────────────────────────────────────────────────────────
@@ -669,7 +750,8 @@ def log_v1(ctx, conn, sp, snap) -> str:
 
 
 def new_ai_counts(status: str = "ok") -> dict:
-    return {"status": status, "new": 0, "exists": 0, "replaced": 0, "waiting": 0, "pair_missing": 0, "spool_pending": 0}
+    return {"status": status, "new": 0, "exists": 0, "replaced": 0, "waiting": 0, "pair_missing": 0, "spool_pending": 0,
+            "error": 0}
 
 
 def log_ai_version(ctx, conn, sp, state: dict, mains: MainCache, counts: dict) -> None:
@@ -677,8 +759,8 @@ def log_ai_version(ctx, conn, sp, state: dict, mains: MainCache, counts: dict) -
     if version_exists(conn, key) is not None:
         counts["exists"] += 1
         return
-    if spool_exists(ctx.paths.spool, "tw_ai", state["t"], key[3]):
-        counts["spool_pending"] += 1  # 這一版有 spool：交給 import_spools，不記簡版
+    if spool_exists(ctx.paths.spool, FAMILY_AI, state["t"], key[3], now=time.time()):
+        counts["spool_pending"] += 1  # 這一版有剛寫進來的 spool：交給 import_spools，先不記簡版
         return
     if ctx.now - float(state["computed_at"]) < AI_GRACE_S:
         counts["waiting"] += 1
@@ -749,37 +831,63 @@ def _dedupe_states(states: Iterable[dict]) -> list[dict]:
     return sorted(out, key=lambda s: (s["t"], s["computed_at"]))
 
 
-def committed_versions(states: Iterable[dict], us_loaded: Optional[Loaded], now: float) -> dict:
-    """spool 要對得上的已 commit 版本：{(族, T, ver_s): {"rule", "computed_at"}}。"""
-    out = {}
-    for state in states:
-        out[("tw_ai", state["t"], round(state["computed_at"]))] = {
-            "rule": state["rule"], "computed_at": float(state["computed_at"])}
-    if us_loaded is not None and us_loaded.status == "ok":
+def read_ai_history(path: Path, since: str) -> list[dict]:
+    """AI 歷史檔（stock_picks_tw_ai_history.jsonl，只追加）最後一段裡 t ≥ since 的 {"t", "rule", "computed_at"}。
+    壞行、寫到一半的最後一行跳過；檔案不在、不是自己的一般檔回空的（spool 照樣對得上 job 看過的 AI 狀態）。"""
+    try:
+        data = read_private_tail(path, AI_HISTORY_TAIL_BYTES)
+    except (OSError, ValueError):
+        return []
+    out = []
+    for line in (data or b"").splitlines():
         try:
-            us = importlib.import_module("stock_picks_us")
-            snap = us.snapshot_from_json(us_loaded.obj, now)
-        except Exception:  # noqa: BLE001
-            snap = None
-        if snap is not None:
-            out[("us", snap.d.isoformat(), round(snap.computed_at))] = {
-                "rule": snap.rule, "computed_at": float(snap.computed_at)}
+            record = strict_loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        t, rule, computed_at = iso_day(record.get("t")), record.get("rule"), _finite(record.get("computed_at"))
+        if t is None or t < since or not (isinstance(rule, str) and _RULE_RE.fullmatch(rule)) \
+                or computed_at is None or computed_at <= 0:
+            continue
+        out.append({"t": t, "rule": rule, "computed_at": computed_at})
+    return out
+
+
+def committed_versions(states: Iterable[dict], history: Iterable[dict] = ()) -> dict:
+    """spool 要對得上的已 commit 版本：{(族, T, ver_s): {"rule", "computed_at"}}。
+    來源：job 看過的 AI 狀態（現行＋封存最近 7 天），加上 AI 歷史檔的紀錄（read_ai_history）。歷史檔只在 _commit_ai
+    成功後才追加，所以停用旗標期間、--import-archive 拿著鎖、ThrottleInterval 內 commit 又被蓋掉、job 沒看到的版本
+    也對得上（限制：同一個 T 只有 picks 變了的版本才多一行）。同一版兩邊都有時用 AI 狀態的。"""
+    out = {}
+    for record in [*history, *states]:
+        out[(FAMILY_AI, record["t"], round(record["computed_at"]))] = {
+            "rule": record["rule"], "computed_at": float(record["computed_at"])}
     return out
 
 
 def last_t(conn) -> dict:
+    """{族: 最後記到的 T}（last_run 用）。"""
     if conn is None:
         return {}
-    out = {}
-    for family, where in ((FAMILY_V1, "m = 'tw' AND rule = 'v1'"),
-                          (FAMILY_AI, "m = 'tw' AND rule LIKE 'ai!_%' ESCAPE '!'"),
-                          (FAMILY_US, "m = 'us'")):
-        out[family] = conn.execute(f"SELECT max(t) FROM pool_days WHERE {where}").fetchone()[0]
-    return out
+    return {family: conn.execute(f"SELECT max(t) FROM pool_days WHERE {where}").fetchone()[0]
+            for family, where in FAMILY_WHERE}
+
+
+def _failure(failed: list, part: str, exc: Exception) -> str:
+    """記下出錯的部分：log 只有例外類別與程式位置（模組:函式:行號），不記訊息；回例外類別。"""
+    frames = traceback.extract_tb(exc.__traceback__)
+    where = f"{Path(frames[-1].filename).stem}:{frames[-1].name}:{frames[-1].lineno}" if frames else None
+    log.error("stock picks review pool part=%s status=error error_type=%s where=%s", part, type(exc).__name__, where)
+    failed.append((part, type(exc).__name__))
+    return type(exc).__name__
 
 
 def pool_stage(ctx) -> dict:
-    """spool 匯入 → 舊規則 → AI（現行＋封存裡最近 7 天沒記到的版本）→ 美股。"""
+    """spool 匯入 → 舊規則 → AI（現行＋封存裡最近 7 天沒記到的版本）→ 美股。
+    各自 try（AI 每一版各自 try）：一族壞掉不擋其他族、AI 一版壞掉不擋其他版。spool 匯入有錯（errors）或任何一族
+    出錯時，整個階段記 status＝error（連續失敗、短訊看得到）：error＝第一個出錯的例外類別，failed＝出錯的部分。
+    JobTimeout 不是 Exception，照樣一路往外。"""
     if ctx.inputs is None:  # 封存階段沒跑成（例外）：自己讀一次
         ctx.inputs = load_inputs(ctx.paths.state_dir)
     inputs = ctx.inputs
@@ -788,21 +896,43 @@ def pool_stage(ctx) -> dict:
     state, ai_status = _parse_ai(sp, inputs.get("tw_ai"))
     states = _dedupe_states(([state] if state else []) + _recent_archived_ai(ctx, sp))
     out: dict[str, Any] = {"status": "ok"}
+    failed: list[tuple[str, str]] = []
+
     try:  # spool 只是 B1 的補充：它出問題不能擋住三族的紀錄（沒 spool 的版本照記簡版）
-        out["spool"] = import_spools(ctx, conn, committed_versions(states, inputs.get("us"), ctx.now))
+        since = (ctx.today - timedelta(days=AI_LOOKBACK_DAYS)).isoformat()
+        history = read_ai_history(ctx.paths.state_dir / sp.AI_HISTORY_NAME, since)
+        out["spool"] = import_spools(ctx, conn, committed_versions(states, history))
+        out["spool"]["history"] = len(history)
     except Exception as exc:  # noqa: BLE001
-        out["spool"] = {"status": "error", "error": type(exc).__name__}
+        out["spool"] = {"status": "error", "error_type": _failure(failed, "spool", exc)}
+    else:
+        if out["spool"]["errors"] or out["spool"]["invalid"]:
+            failed.append(("spool", out["spool"].get("error_type", "InvalidSpool")))
 
     main, out["tw_v1"] = _parse_main(sp, inputs.get("tw"))
     if main is not None:
-        out["tw_v1"] = log_v1(ctx, conn, sp, main)
+        try:
+            out["tw_v1"] = log_v1(ctx, conn, sp, main)
+        except Exception as exc:  # noqa: BLE001
+            out["tw_v1"] = "error:" + _failure(failed, "tw_v1", exc)
     mains = MainCache(sp, ctx.paths.archive, current=main)
     ai_counts = new_ai_counts(ai_status)
     for item in states:
-        log_ai_version(ctx, conn, sp, item, mains, ai_counts)
+        try:
+            log_ai_version(ctx, conn, sp, item, mains, ai_counts)
+        except Exception as exc:  # noqa: BLE001
+            ai_counts["error"] += 1
+            ai_counts.setdefault("error_type", _failure([], "tw_ai", exc))
+    if ai_counts["error"]:
+        failed.append(("tw_ai", ai_counts["error_type"]))
     out["tw_ai"] = ai_counts
-    out["us"] = log_us(ctx, conn, inputs.get("us"))
+    try:
+        out["us"] = log_us(ctx, conn, inputs.get("us"))
+    except Exception as exc:  # noqa: BLE001
+        out["us"] = "error:" + _failure(failed, "us", exc)
     out["last_t"] = last_t(conn)
+    if failed:
+        out.update(status="error", error=failed[0][1], failed=[part for part, _ in failed])
     return out
 
 
@@ -844,7 +974,7 @@ def import_archive_dir(ctx, directory: Path) -> dict:
     return counts
 
 
-# ── spool（B1 起；格式由 B1 定案，這裡先照 PLAN §5.2 的欄位嚴格驗證） ───────────────────────
+# ── spool（B1 起，只有 tw_ai；格式見 stock_picks_review_hook 的模組說明） ──────────────────────────────
 _TREND_FIXED = frozenset({"pool", "ok", "unknown", "unchecked"})
 
 
@@ -863,8 +993,25 @@ def _status_ok(value) -> bool:
     return isinstance(value, str) and value.startswith("excluded:") and bool(_REASON_RE.fullmatch(value[9:]))
 
 
+def _jsonable(value) -> bool:
+    """寫得回 review.sqlite（_dumps：不收 NaN、無限大）。"""
+    try:
+        _dumps(value)
+    except (TypeError, ValueError, RecursionError):
+        return False
+    return True
+
+
+def _market_ok(value) -> bool:
+    """null，或 [大盤狀態, 月線乖離‰, 季線乖離‰]（和主快照的 market 同一種寫法）。"""
+    return value is None or (
+        isinstance(value, list) and len(value) == 3 and isinstance(value[0], str) and bool(_REASON_RE.fullmatch(value[0]))
+        and all(isinstance(v, int) and not isinstance(v, bool) for v in value[1:]))
+
+
 def spool_files(directory: Path) -> list[tuple[str, str, float, Path]]:
-    """spool 目錄裡合格的檔：(族, T, computed_at, 路徑)。暫存檔（. 開頭）、symlink、其他名字都不看。"""
+    """spool 目錄裡合格的檔：(族, T, computed_at, 路徑)，照檔名排、最多 SPOOL_MAX_PER_RUN 個。
+    暫存檔（. 開頭）、symlink、子目錄（done/）、其他名字都不看。"""
     try:
         entries = list(os.scandir(directory))
     except (FileNotFoundError, NotADirectoryError):
@@ -875,40 +1022,50 @@ def spool_files(directory: Path) -> list[tuple[str, str, float, Path]]:
         if not match or not iso_day(match.group(2)) or not entry.is_file(follow_symlinks=False):
             continue
         out.append((match.group(1), match.group(2), float(match.group(3)), Path(entry.path)))
-    return sorted(out, key=lambda item: item[3].name)[:SPOOL_MAX_FILES]
+    return sorted(out, key=lambda item: item[3].name)[:SPOOL_MAX_PER_RUN]
 
 
 def spool_dir_state(spool_dir: Path) -> str:
-    """ok｜missing｜unsafe（不是自己的真目錄、有 group／other 權限、symlink）。只看不建：spool/ 只在第一次建
-    state/stock_picks_review/ 時建一次，之後把它移走就停掉 B1 的 hook（job 不會再建回來）。"""
+    """ok｜missing｜unsafe（不是自己的真目錄、symlink、權限不是剛好 0700：和 hook 的檢查一樣，hook 只寫進這種目錄）。
+    只看不建：spool/ 只在第一次建 state/stock_picks_review/ 時建一次，之後把它移走就停掉 B1 的 hook（job 不會再建回來）。"""
     try:
         info = os.lstat(spool_dir)
     except FileNotFoundError:
         return "missing"
     except OSError:
         return "unsafe"
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != SPOOL_MODE:
         return "unsafe"
     return "ok"
 
 
-def spool_exists(spool_dir: Path, family: str, day: str, ver_s: int) -> bool:
-    """這一版還有沒匯入的 spool（只看 spool/ 本身：匯入過的已經在 DB 裡；review.sqlite 重建時 done/ 裡的不算，
-    不然那一版會一直等一個不會再被匯入的 spool）。"""
+def spool_exists(spool_dir: Path, family: str, day: str, ver_s: int, *, now: float) -> bool:
+    """這一版有剛寫進來、還沒匯入的 spool（mtime 在 AI_GRACE_S 內；now＝真實時間）：交給 import_spools，先不記簡版。
+    超過寬限還留在 spool/ 的（匯入一直失敗、移不走）不再擋：簡版照記，之後 spool 匯入成功時照樣取代簡版。
+    只看 spool/ 本身：匯入過的已經在 DB 裡；review.sqlite 重建時 done/ 裡的不算（不然那一版會一直等）。"""
     if spool_dir_state(spool_dir) != "ok":
         return False
-    return any(fam == family and t == day and round(computed_at) == ver_s
-               for fam, t, computed_at, _path in spool_files(spool_dir))
+    for fam, t, computed_at, path in spool_files(spool_dir):
+        if fam != family or t != day or round(computed_at) != ver_s:
+            continue
+        try:
+            if abs(now - os.lstat(path).st_mtime) < AI_GRACE_S:
+                return True
+        except FileNotFoundError:
+            continue
+    return False
 
 
 def spool_version(obj, family: str, day: str, committed: dict) -> Version:
-    """spool 內容 → Version（src＝spool）；不合格丟 ValueError。committed＝已 commit 的那一版（rule、computed_at）。
-    暫定格式（B1 定案）：{schema:1, family, t, rule, computed_at, source?, core_version?, cooldown_read?, market?,
-    funnel?, members:[{c, n, c0, status, rank, picked, trend, tr, checks, facts, ai_source?}]}"""
+    """spool 內容 → Version（origin＝spool）；不合格丟 ValueError。格式見 stock_picks_review_hook 的模組說明（B1 起
+    只有 family＝tw_ai）。committed＝已 commit 的那一版（rule、computed_at）。
+    值一律驗：代號、狀態、收盤、名次、走勢標籤與 tr、條件、名稱；facts、funnel、market 要寫得回 JSON（不收 NaN、
+    無限大）；market 是 null 或 [大盤狀態, 月線乖離‰, 季線乖離‰]（hook 加上它之前沒有這個鍵，當作 null）。"""
     def need(cond: bool) -> None:
         if not cond:
             raise ValueError("invalid spool")
 
+    need(family == FAMILY_AI)
     need(isinstance(obj, dict) and obj.get("schema") == 1 and obj.get("family") == family and obj.get("t") == day)
     rule = obj.get("rule")
     need(isinstance(rule, str) and bool(_RULE_RE.fullmatch(rule)) and rule == committed["rule"])
@@ -916,12 +1073,11 @@ def spool_version(obj, family: str, day: str, committed: dict) -> Version:
     need(computed_at is not None and abs(computed_at - committed["computed_at"]) <= 1e-3)
     members = obj.get("members")
     need(isinstance(members, list) and 1 <= len(members) <= 200)
-    code_re = _TW_CODE_RE if family == "tw_ai" else _US_SYMBOL_RE
     rows = []
     for item in members:
         need(isinstance(item, dict))
         code, status = item.get("c"), item.get("status", MEMBER)
-        need(isinstance(code, str) and bool(code_re.fullmatch(code)) and _status_ok(status))
+        need(isinstance(code, str) and bool(_TW_CODE_RE.fullmatch(code)) and _status_ok(status))
         c0 = _finite(item.get("c0"))
         need(c0 is None or c0 > 0)
         need(status != MEMBER or c0 is not None)
@@ -941,20 +1097,22 @@ def spool_version(obj, family: str, day: str, committed: dict) -> Version:
         if item.get("ai_source") is not None:
             need(isinstance(item["ai_source"], str) and len(item["ai_source"]) <= 40)
             values["ai_source"] = item["ai_source"]
+        need(_jsonable(values))
         rows.append(Row(code, name, c0, item.get("picked") is True, rank, status,
                         {"trend": item.get("trend"), "tr": tr}, dict(checks), values or None))
     need(len({r.code for r in rows}) == len(rows))
+    funnel = obj.get("funnel")
+    need(funnel is None or (isinstance(funnel, dict) and _jsonable(funnel)))
+    market = obj.get("market")
+    need(_market_ok(market))
 
     def short(key: str, limit: int) -> Optional[str]:
         value = obj.get(key)
         return value if isinstance(value, str) and 0 < len(value) <= limit and value.isprintable() else None
 
-    market = obj.get("market")
-    return Version(m="tw" if family == "tw_ai" else "us", rule=rule, t=day, computed_at=committed["computed_at"],
-                   family=FAMILY_AI if family == "tw_ai" else FAMILY_US, src=SPOOL, source=short("source", 20),
-                   core_version=short("core_version", 64), cooldown_read=short("cooldown_read", 64),
-                   market=market if isinstance(market, (list, dict)) else None,
-                   meta={"funnel": obj.get("funnel") if isinstance(obj.get("funnel"), dict) else None}, rows=rows)
+    return Version(m="tw", rule=rule, t=day, computed_at=committed["computed_at"], origin=SPOOL,
+                   source=short("source", 20), core_version=short("core_version", 64),
+                   cooldown_read=short("cooldown_read", 64), market=market, meta={"funnel": funnel}, rows=rows)
 
 
 def _move_to_done(ctx, path: Path, suffix: str = "") -> None:
@@ -967,41 +1125,64 @@ def _move_to_done(ctx, path: Path, suffix: str = "") -> None:
 
 
 def import_spools(ctx, conn, committed: dict) -> dict:
-    """B1 的 spool 匯入（佔位；格式等 B1 定案）。committed＝{(族, T, ver_s): {"rule", "computed_at"}}：
-    只收對得上已 commit 版本的 spool（部署時新舊程序重疊，同一個 T 可能有兩份）；對不上的只記數字、不寫入，
-    放一天後移到 done/。匯入的留在 done/，保留 30 天。spool 一律當不可信輸入（大小上限、只收自己的一般檔）。"""
+    """B1 的 spool 匯入。committed＝{(族, T, ver_s): {"rule", "computed_at"}}（committed_versions）：只收對得上已 commit
+    版本的 spool（部署時新舊程序重疊，同一個 T 可能有兩份）；對不上的只記數字、不寫入，放一天後移到 done/<名>.unmatched。
+    spool 一律當不可信輸入（大小上限、只收自己的一般檔、strict_loads、spool_version）：不合格的移到 done/<名>.invalid。
+    一檔一檔各自 try：寫入或搬檔失敗記 errors 與第一個例外類別（error_type）；寫不進 DB 的移到 done/<名>.invalid
+    （移不走就留著，下一輪再試），接著處理下一檔，一個壞檔不會卡住整個佇列。有 errors 或 invalid 時 status＝error
+    （pool_stage 再把它升成階段的 error）：hook 的格式和這裡對不上時，每一輪都會有 invalid、連續失敗就發短訊，
+    不會默默一直退回簡版。匯入的留在 done/，保留 30 天。"""
     spool = ctx.paths.spool
-    counts: dict[str, Any] = {"dir": spool_dir_state(spool), "new": 0, "replaced": 0, "exists": 0, "unmatched": 0,
-                              "invalid": 0}
+    counts: dict[str, Any] = {"status": "ok", "dir": spool_dir_state(spool), "new": 0, "replaced": 0, "exists": 0,
+                              "unmatched": 0, "invalid": 0, "errors": 0}
     if counts["dir"] != "ok":
         return counts
     if not ctx.dry_run:  # bot 的 _write_json_file 當機留下的 .<名>.tmp
         counts["tmp_removed"] = _sweep(spool, time.time(), max_age_s=TMP_MAX_AGE_S,
                                        match=lambda n: n.startswith(".") and n.endswith(".tmp"))
     for family, day, computed_at, path in spool_files(spool):
-        info = committed.get((family, day, round(computed_at)))
-        if info is None:
-            counts["unmatched"] += 1
-            try:
-                old = time.time() - path.stat().st_mtime > SPOOL_UNMATCHED_GRACE_S  # 檔案年齡看真實時間
-            except FileNotFoundError:
-                continue
-            if old and not ctx.dry_run:
-                _move_to_done(ctx, path, ".unmatched")
-            continue
+        step = "read"
         try:
-            obj = json.loads(read_private_bytes(path, SPOOL_MAX_BYTES) or b"null")
-            version = spool_version(obj, family, day, info)
-        except (OSError, ValueError, RecursionError):
-            counts["invalid"] += 1
-            if not ctx.dry_run:
-                _move_to_done(ctx, path, ".invalid")
-            continue
-        if ctx.dry_run:
-            counts["exists" if version_exists(conn, version.key) == SPOOL else "new"] += 1
-            continue
-        counts[write_version(conn, version, now=ctx.now)] += 1
-        _move_to_done(ctx, path)
+            info = committed.get((family, day, round(computed_at)))
+            if info is None:
+                counts["unmatched"] += 1
+                try:
+                    old = time.time() - os.lstat(path).st_mtime > SPOOL_UNMATCHED_GRACE_S  # 檔案年齡看真實時間
+                except FileNotFoundError:
+                    continue
+                if old and not ctx.dry_run:
+                    step = "move"
+                    _move_to_done(ctx, path, ".unmatched")
+                continue
+            try:
+                data = read_private_bytes(path, SPOOL_MAX_BYTES)
+                if data is None:  # 剛被移走
+                    continue
+                version = spool_version(strict_loads(data), family, day, info)
+            except (OSError, ValueError, RecursionError):
+                counts["invalid"] += 1
+                if not ctx.dry_run:
+                    step = "move"
+                    _move_to_done(ctx, path, ".invalid")
+                continue
+            if ctx.dry_run:
+                counts["exists" if version_exists(conn, version.key) == SPOOL else "new"] += 1
+                continue
+            step = "write"
+            counts[write_version(conn, version, now=ctx.now)] += 1
+            step = "move"
+            _move_to_done(ctx, path)
+        except Exception as exc:  # noqa: BLE001 - 一檔壞掉（寫不進 DB、搬不動）不能卡住後面的檔
+            counts["errors"] += 1
+            counts.setdefault("error_type", type(exc).__name__)
+            log.error("stock picks review spool step=%s status=error error_type=%s", step, type(exc).__name__)
+            if step == "write" and not ctx.dry_run:  # 寫不進 DB 的不再每輪重試（移不走就留著）
+                try:
+                    _move_to_done(ctx, path, ".invalid")
+                except OSError:
+                    pass
+    if counts["errors"] or counts["invalid"]:
+        counts["status"] = "error"
     if not ctx.dry_run:
         counts["done_removed"] = _sweep(spool / "done", time.time(), max_age_s=SPOOL_KEEP_DAYS * 86400.0,
                                         match=lambda n: True)

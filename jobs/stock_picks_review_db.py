@@ -5,9 +5,29 @@
 review.sqlite（state/stock_picks_review/，只有這支 job 寫；WAL）
 - schema 版本記在 PRAGMA user_version，之後的段只會「新增表」（MIGRATIONS 往後加）。DB 的版本比程式新（例如 C 段
   回滾）照樣跑：A 段用到的表都在就好，不因 schema 比較新就停（審查 r2#6）。
-- A 段的表：prices、pool_days、pool_rows，加一張 job 自己的小帳 job_state（價格同步鍵）。
-  pool_days 比 PLAN 多一欄 meta_json（一版的附帶資訊：漏斗、配對的主快照、c0 來源…），之後不必加欄位。
+- A 段的表：prices、pool_days、pool_rows，加一張 sync_state（只放價格同步鍵 prices_sync；之後的段要記別的狀態就開
+  自己的表、同步更新 PLAN，不要塞進這裡）。
+- pool_days.origin：simple（job 從狀態檔推導）｜spool（bot 當下寫的 spool）。prices.src 是收盤的來源（tw｜tw_all｜us），
+  pool_days.source 是 AI 名單的來源（00952｜cached｜core_only），三個是不同的東西。
+- pool_days 比 PLAN 多一欄 meta_json（一版的附帶資訊），各族的鍵（picks_match、funnel_match、pick_mismatch 只是診斷：
+  重算的排序、漏斗和 bot 記下的一不一致，目前沒有人讀）：
+  - tw_v1（simple）：pool、listed（主快照兩份清單的筆數）、candidates（重算的候選數）、picks_match。
+  - tw_ai，origin＝simple：funnel（AI 狀態的漏斗原樣）、funnel_match、main_ver_s／main_origin（配對的主快照：
+    round(computed_at)、current｜archive｜import）、pick_mismatch（入選卻重算不成立的檔數）、skipped（AI 狀態 skipped
+    的檔數）、universe_as_of、fetched_day。
+  - tw_ai，origin＝spool：funnel（spool 的漏斗原樣）。
+  - us（simple）：covered、c0_db／c0_latest（c0 取自 DB／快照 latest_closes 的檔數）、candidates、picks_match、
+    universe_as_of。
+- pool_days.market_json：台股 [大盤狀態, 月線乖離‰, 季線乖離‰]；美股 {"level", "b20", "b60"}（SPY）。spool 取代簡版時，
+  spool 沒有就沿用簡版的。
 - pool_rows 有 CHECK：status＝member 的列一定有 c0。
+
+為什麼放內建碟、怎麼備份
+- review.sqlite 每 30 分鐘寫一次（WAL），外接的 WD_BLACK 只跑 USB 2.0（約 34 MiB/s，而且和 Time Machine 共用空間），
+  所以留在內建碟的 state/ 底下；內建碟由 Time Machine 備份。
+- 它是超過 10 天的非 0050 成分台股收盤唯一的一份（盤勢 DB 的 tw_all 只留 10 天）；壞掉時，台股收盤可以從封存的主快照
+  （archive/ 裡 stock_picks_tw 的 listed 收盤）重建，美股與 0050／TAIEX 從盤勢 DB 重抓。封存是 AI 狀態唯一的一份，
+  一樣靠 Time Machine。
 
 價格庫（prices）
 - 要收的代號：池子紀錄近 420 天出現過的代號；台股另加 0050、TAIEX，美股另加 SPY、VOO、QQQ。
@@ -17,6 +37,7 @@ review.sqlite（state/stock_picks_review/，只有這支 job 寫；WAL）
 - upsert 帶 `WHERE close IS NOT excluded.close`（沒變的列不重寫）。
 - 同步鍵＝(盤勢 DB 的 mtime, 代號集合的雜湊)：和上次成功時一樣就跳過；代號集合沒變時 25 分鐘內最多同步一次。
   成功後才記鍵（DbBusy 中途失敗時下一輪照樣重來）。DbBusy／hot journal 回 busy，不算失敗。
+- 比對只讀要同步的代號在保留範圍內的列（不把整張 prices 載進記憶體）；過期的列用 SQL 直接數、直接刪。
 
 這個模組 import 時不做任何 I/O；stock_db_ro 在函式裡才 import。
 """
@@ -47,7 +68,7 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         """CREATE TABLE IF NOT EXISTS pool_days (
             m TEXT NOT NULL, rule TEXT NOT NULL, t TEXT NOT NULL, ver_s INTEGER NOT NULL,
             derive_version INTEGER NOT NULL, computed_at REAL NOT NULL,
-            src TEXT NOT NULL CHECK (src IN ('simple', 'spool')),
+            origin TEXT NOT NULL CHECK (origin IN ('simple', 'spool')),
             bot_sha TEXT, n_members INTEGER NOT NULL, n_picks INTEGER NOT NULL, source TEXT, core_version TEXT,
             cooldown_read TEXT, market_json TEXT, meta_json TEXT, logged_at REAL NOT NULL,
             PRIMARY KEY (m, rule, t, ver_s, derive_version))""",
@@ -59,10 +80,11 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
             CHECK (status <> 'member' OR (c0 IS NOT NULL AND c0 > 0)),
             PRIMARY KEY (m, rule, t, ver_s, derive_version, code))""",
         "CREATE INDEX IF NOT EXISTS pool_rows_by_code ON pool_rows (m, code, t)",
-        "CREATE TABLE IF NOT EXISTS job_state (k TEXT PRIMARY KEY, v TEXT NOT NULL, at REAL NOT NULL)",
+        # 只放價格同步鍵（SYNC_KEY）
+        "CREATE TABLE IF NOT EXISTS sync_state (k TEXT PRIMARY KEY, v TEXT NOT NULL, at REAL NOT NULL)",
     ),
 }
-A_TABLES = ("prices", "pool_days", "pool_rows", "job_state")
+A_TABLES = ("prices", "pool_days", "pool_rows", "sync_state")
 
 
 class SchemaError(Exception):
@@ -96,7 +118,8 @@ def open_db(path: Path) -> sqlite3.Connection:
 
 def open_readonly(path: Path) -> Optional[sqlite3.Connection]:
     """--dry-run 用：檔案不在回 None。用 immutable=1：WAL 的庫用 mode=ro 開會建出 -shm／-wal（實測），
-    唯讀目錄還會直接失敗；immutable 什麼都不建（-wal 裡還沒 checkpoint 的最新幾筆看不到，dry-run 可以接受）。"""
+    唯讀目錄還會直接失敗；immutable 什麼都不建。代價（審查 r1#5）：不加鎖、不讀 -wal，-wal 裡還沒 checkpoint 的
+    最新幾筆看不到；job 正好在寫或 checkpoint 時，可能讀到舊資料，甚至回 malformed。只用在診斷輸出，可以接受。"""
     if not path.is_file():
         return None
     conn = sqlite3.connect(f"file:{quote(str(path))}?mode=ro&immutable=1", uri=True, isolation_level=None)
@@ -124,9 +147,10 @@ def ensure_schema(conn: sqlite3.Connection) -> int:
 
 
 def get_state(conn: Optional[sqlite3.Connection], key: str) -> Optional[tuple[dict, float]]:
+    """sync_state 的一筆（目前只有 SYNC_KEY）。"""
     if conn is None:
         return None
-    found = conn.execute("SELECT v, at FROM job_state WHERE k = ?", (key,)).fetchone()
+    found = conn.execute("SELECT v, at FROM sync_state WHERE k = ?", (key,)).fetchone()
     if not found:
         return None
     try:
@@ -138,7 +162,7 @@ def get_state(conn: Optional[sqlite3.Connection], key: str) -> Optional[tuple[di
 
 def set_state(conn: sqlite3.Connection, key: str, value: dict, at: float) -> None:
     conn.execute(
-        "INSERT INTO job_state (k, v, at) VALUES (?, ?, ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v, at = excluded.at",
+        "INSERT INTO sync_state (k, v, at) VALUES (?, ?, ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v, at = excluded.at",
         (key, json.dumps(value, sort_keys=True, separators=(",", ":")), float(at)),
     )
 
@@ -230,6 +254,24 @@ def plan_changes(existing: dict[tuple, float], fetched: dict[str, dict[str, dict
     return upserts, deletes
 
 
+def existing_prices(conn: Optional[sqlite3.Connection], codes: dict[str, list[str]],
+                    keep_from: str) -> dict[tuple, float]:
+    """{(m, code, d): close}：只有要同步的代號、保留範圍內（d ≥ keep_from）的列（plan_changes 只看這些）。
+    一次最多查 500 個代號（SQLite 的參數上限），不把整張 prices 載進記憶體。"""
+    out: dict[tuple, float] = {}
+    if conn is None:
+        return out
+    for market, symbols in codes.items():
+        for start in range(0, len(symbols), 500):
+            chunk = symbols[start:start + 500]
+            marks = ",".join("?" * len(chunk))
+            for m, code, d, close in conn.execute(
+                    f"SELECT m, code, d, close FROM prices WHERE m = ? AND d >= ? AND code IN ({marks})",
+                    (market, keep_from, *chunk)):
+                out[(m, code, d)] = close
+    return out
+
+
 def _is_busy(exc: BaseException) -> bool:
     """DbBusy，或盤勢 job 被殺留下 hot journal（mode=ro 讀不了，等它下一輪收拾）：都不算失敗。"""
     import stock_db_ro
@@ -267,11 +309,9 @@ def prices_stage(ctx) -> dict:
         if _is_busy(exc):
             return {**out, "status": "busy"}
         raise
-    existing = {}
-    if conn is not None:
-        existing = {(m, code, d): close for m, code, d, close in conn.execute("SELECT m, code, d, close FROM prices")}
+    existing = existing_prices(conn, codes, keep_from)
     upserts, deletes = plan_changes(existing, fetched, keep_from)
-    expired = sum(1 for (_m, _code, d) in existing if d < keep_from)
+    expired = 0 if conn is None else conn.execute("SELECT count(*) FROM prices WHERE d < ?", (keep_from,)).fetchone()[0]
     out.update(upserts=len(upserts), deletes=len(deletes), expired=expired)
     if ctx.dry_run:
         return {**out, "status": "dry_run"}

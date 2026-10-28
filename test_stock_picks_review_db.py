@@ -110,7 +110,7 @@ def test_readonly_open_creates_nothing(paths):
     con = rdb.open_readonly(paths.db)
     assert con.execute("SELECT count(*) FROM prices").fetchone()[0] == 0
     with pytest.raises(sqlite3.OperationalError):
-        con.execute("INSERT INTO job_state VALUES ('x', '{}', 0)")
+        con.execute("INSERT INTO sync_state VALUES ('x', '{}', 0)")
     con.close()
     assert sorted(os.listdir(paths.root)) == before
 
@@ -225,6 +225,21 @@ def test_missing_market_db_is_a_failure(paths):
     _log_pools(paths)
     with pytest.raises(stock_db_ro.DbUnavailable):
         _sync(paths)
+
+
+def test_existing_prices_reads_only_synced_codes_inside_the_window(paths):
+    """審查 impl r2#5：比對不把整張 prices 載進記憶體，只讀要同步的代號、保留範圍內的列。"""
+    con = rdb.open_db(paths.db)
+    try:
+        con.executemany("INSERT INTO prices VALUES (?, ?, ?, ?, 'tw', 0)", [
+            ("tw", "2330", "2026-10-27", 1.0), ("tw", "2330", "2024-01-02", 2.0),  # 第二筆在保留範圍外
+            ("tw", "9999", "2026-10-27", 3.0), ("us", "2330", "2026-10-27", 4.0), ("us", "SPY", "2026-10-27", 5.0)])
+        codes = {"tw": ["2330"] + [f"{n:04d}" for n in range(1000, 1700)], "us": ["SPY"]}  # 超過一批 500 個
+        assert rdb.existing_prices(con, codes, "2025-01-01") == {
+            ("tw", "2330", "2026-10-27"): 1.0, ("us", "SPY", "2026-10-27"): 5.0}
+        assert rdb.existing_prices(None, codes, "2025-01-01") == {}
+    finally:
+        con.close()
 
 
 def test_plan_changes_keeps_codes_the_db_no_longer_has():

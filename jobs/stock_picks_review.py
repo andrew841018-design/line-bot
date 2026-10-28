@@ -8,6 +8,7 @@ launchd（com.andrew.stock-picks-review）每 30 分鐘、以及三個狀態檔�
 
   python jobs/stock_picks_review.py                        一輪：封存 → 池子紀錄 → 價格 → 週報
   python jobs/stock_picks_review.py --dry-run              只看不寫：不拿鎖、不建任何檔，review.sqlite 用 immutable 唯讀
+                                                           （不讀 -wal：job 正在寫時可能讀到舊資料或讀不到，只供診斷）
   python jobs/stock_picks_review.py --import-archive DIR   一次性匯入手動封存（stock_picks_tw.json.<ts>.gz 等）
   python jobs/stock_picks_review.py --print-plist          launchd plist 內容
 
@@ -22,8 +23,12 @@ launchd（com.andrew.stock-picks-review）每 30 分鐘、以及三個狀態檔�
   各階段只接 Exception，所以會一路到外層，last_run 記 timeout。
 - 本 job 的其他模組與 bot 的模組都在各階段的 try 裡才 import：部署中途 import 失敗只算那個階段失敗，照樣寫
   last_run、發得出短訊。封存只用標準庫，不受 bot 程式或 review.sqlite 壞掉影響。
-- 只呼叫 bot 的純函式（解析、條件、_facts_json／_facts_for、stock_db_ro）；不碰 _ai_universe、_ensure_loaded、
-  _state_file_lock 或任何寫檔函式。不 import config、不讀 .env；launchd 只給 HOME、PATH。
+- 只呼叫 bot 的純函式：解析、條件（checks_of、ai_checks_of、us_checks_of）、數值（_facts_json／_facts_for、美股的
+  _facts_json）、排序（choose_picks、ai_candidates、choose_us_picks：算 rank）、Trend、stock_db_ro（清單在
+  stock_picks_review_pool 的模組說明）；不碰 _ai_universe、_ensure_loaded、_state_file_lock 或任何寫檔函式。
+  不 import config、不讀 .env；launchd 只給 HOME、PATH。
+- --now（注入時間）只給測試與 staging：會刪過期的價格與封存、會放週報，所以只准和 --dry-run 一起用，或同時明確給
+  --bot-dir 和 --maintenance-dir、而且兩個都不是正式路徑；否則回 EXIT_CONFIG、什麼都不做（審查 impl r2#2）。
 - last_run.json 只放列舉值（階段結果、例外類別、次數、日期、大小；讀回時未來的時間夾回現在）；log 也一樣，
   不寫例外訊息與 traceback（只記例外類別和出事的函式名、行號）。
 - 連續 3 輪失敗：outbox 一天一則短訊（階段＋例外類別）。DbBusy／hot journal 不算失敗。
@@ -54,7 +59,7 @@ import traceback
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Iterator, Optional, Sequence
 from xml.sax.saxutils import escape
 from zoneinfo import ZoneInfo
 
@@ -68,6 +73,7 @@ LABEL = "com.andrew.stock-picks-review"
 BOT_DIR_ENV = "STOCK_PICKS_REVIEW_BOT_DIR"
 MAINTENANCE_ENV = "STOCK_PICKS_REVIEW_MAINTENANCE_DIR"
 DEFAULT_MAINTENANCE = Path("/Users/andrew/Desktop/andrew/Data_engineer/ops/maintenance")
+PRODUCTION_BOT_DIR = Path("/Users/andrew/Desktop/andrew/Data_engineer/line_bot_related/line_bot")  # --now 不准指到這裡
 ALARM_S = 240
 FAULT_S = 250
 NOTE_AFTER_FAILURES = 3
@@ -187,13 +193,28 @@ def ensure_private_dir(path: Path) -> None:
         raise UnsafePath(errno.EPERM, "unsafe directory")
 
 
+ROOT_TMP_PREFIX = ".stock_picks_review.tmp-"  # 不會被 bot 清暫存檔的 .stock_picks_tw*.tmp 撿到
+
+
 def prepare_root(paths: Paths) -> None:
     """state/stock_picks_review/（0700）；第一次建它的時候順便建 spool/（B1 的 hook 只寫進已經存在、自己的 0700 目錄）。
-    之後不再建 spool/：回滾時把它移走就停掉 hook，job 不會建回來（PLAN §5.2）。"""
-    first = not os.path.lexists(paths.root)
+    之後不再建 spool/：回滾時把它移走就停掉 hook，job 不會建回來（PLAN §5.2）。
+    第一次是在 state/ 裡先建好暫存目錄（含 spool/），再整個改名成 stock_picks_review：不會留下「root 建好、spool 沒建」
+    的半成品（那樣 hook 會無聲停用，審查 impl r1#8）。另一個程序先建好了 root 就用它的。"""
+    if not os.path.lexists(paths.root):
+        tmp = Path(tempfile.mkdtemp(prefix=ROOT_TMP_PREFIX, dir=paths.state_dir))  # 0700
+        try:
+            os.mkdir(tmp / paths.spool.name, 0o700)
+            os.rename(tmp, paths.root)
+        except OSError:
+            if not os.path.lexists(paths.root):  # 不是被別人搶先建好：照實丟出去
+                raise
+        finally:
+            with contextlib.suppress(OSError):
+                os.rmdir(tmp / paths.spool.name)
+            with contextlib.suppress(OSError):
+                os.rmdir(tmp)
     ensure_private_dir(paths.root)
-    if first:
-        ensure_private_dir(paths.spool)
 
 
 def write_atomic(path: Path, data: bytes) -> None:
@@ -253,31 +274,23 @@ def queued(prefix: str, maintenance: Path) -> bool:
 
 
 def drop(maintenance: Path, name: str, text: str, drafts: Path) -> Path:
-    """先在自己的 drafts/ 寫完（fsync），再整個搬進 outbox，relay 不會撿到寫一半的檔（同 token_weekly_report._drop）。
-    drafts 和 outbox 不在同一個檔案系統時，改在 outbox 裡用 .md 以外的暫存名寫完再改名（relay 只撿 .md）。"""
+    """先在自己的 drafts/ 寫完（fsync），再整個搬進 outbox，relay 不會撿到寫一半的檔（同 token_weekly_report._drop；
+    drafts 和 outbox 都在內建碟）。"""
     ensure_private_dir(drafts)
-    data = text.encode("utf-8")
     outbox = maintenance / "outbox"
     outbox.mkdir(exist_ok=True)  # 只建 outbox 這一層：maintenance 目錄本身要已經在
     target = outbox / name
     tmp = drafts / f"{name}.{os.getpid()}.tmp"
-    with open(tmp, "wb") as handle:
-        handle.write(data)
-        handle.flush()
-        os.fsync(handle.fileno())
     try:
-        os.replace(tmp, target)
-    except OSError as exc:
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(tmp)
-        if exc.errno != errno.EXDEV:
-            raise
-        side = outbox / f".{name}.{os.getpid()}.tmp"
-        with open(side, "wb") as handle:
-            handle.write(data)
+        with open(tmp, "wb") as handle:
+            handle.write(text.encode("utf-8"))
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(side, target)
+        os.replace(tmp, target)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+        raise
     return target
 
 
@@ -619,40 +632,56 @@ def run_locked(paths: Paths, *, now: float, stages: Sequence[Stage] = DEFAULT_ST
     return out
 
 
-def run(paths: Paths, *, now: Optional[float] = None, guards: Optional[Callable[[], None]] = None,
-        stages: Sequence[Stage] = DEFAULT_STAGES) -> int:
-    """一輪（停用旗標 → umask → 自己的目錄 → 鎖 → 防護 → 各階段）。回結束碼。"""
-    if flag_set(paths.disabled):
-        log.info("stock picks review skipped reason=disabled")
-        return EXIT_OK
+@contextlib.contextmanager
+def _locked(paths: Paths, *, what: str, locked_exit: int, recheck_disabled: bool) -> Iterator[Optional[int]]:
+    """會寫入的指令共用的骨架：umask 077 → state/ 合格 → 自己的目錄 → job.lock（flock 非阻塞）。
+    yield None＝拿到鎖、可以開始做；yield 結束碼＝不能做（呼叫端直接回這個碼）：
+    state/、自己的目錄或鎖檔不安全 → EXIT_CONFIG；有人拿著鎖 → locked_exit；recheck_disabled 時，拿到鎖後停用旗標
+    已經在（部署可能剛好在拿鎖前放了旗標）→ EXIT_OK。離開時放開鎖、還原 umask（測試在同一個程序裡）。"""
     old_umask = os.umask(0o077)
     try:
         if not state_dir_ok(paths.state_dir):
-            log.error("stock picks review skipped reason=state_dir_unsafe")
-            return EXIT_CONFIG
+            log.error("stock picks review %s skipped reason=state_dir_unsafe", what)
+            yield EXIT_CONFIG
+            return
         try:
             prepare_root(paths)
             fd = open_lock(paths.lock)
         except OSError:
-            log.error("stock picks review skipped reason=root_or_lock_unsafe")
-            return EXIT_CONFIG
+            log.error("stock picks review %s skipped reason=root_or_lock_unsafe", what)
+            yield EXIT_CONFIG
+            return
         try:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                log.info("stock picks review skipped reason=locked")
-                return EXIT_OK
-            if flag_set(paths.disabled):  # 部署可能剛好在拿鎖前放了旗標
-                log.info("stock picks review skipped reason=disabled")
-                return EXIT_OK
-            if guards is not None:
-                guards()
-            out = run_locked(paths, now=time.time() if now is None else now, stages=stages)
-            return EXIT_FAILED if out["status"] != "ok" else EXIT_OK
+                log.info("stock picks review %s skipped reason=locked", what)
+                yield locked_exit
+                return
+            if recheck_disabled and flag_set(paths.disabled):
+                log.info("stock picks review %s skipped reason=disabled", what)
+                yield EXIT_OK
+                return
+            yield None
         finally:
             os.close(fd)  # 關掉就放開 flock
     finally:
         os.umask(old_umask)
+
+
+def run(paths: Paths, *, now: Optional[float] = None, guards: Optional[Callable[[], None]] = None,
+        stages: Sequence[Stage] = DEFAULT_STAGES) -> int:
+    """一輪（停用旗標 → umask → 自己的目錄 → 鎖 → 再看一次停用旗標 → 防護 → 各階段）。回結束碼。"""
+    if flag_set(paths.disabled):
+        log.info("stock picks review run skipped reason=disabled")
+        return EXIT_OK
+    with _locked(paths, what="run", locked_exit=EXIT_OK, recheck_disabled=True) as blocked:
+        if blocked is not None:
+            return blocked
+        if guards is not None:
+            guards()
+        out = run_locked(paths, now=time.time() if now is None else now, stages=stages)
+        return EXIT_FAILED if out["status"] != "ok" else EXIT_OK
 
 
 def dry_run(paths: Paths, *, now: Optional[float] = None) -> dict:
@@ -677,39 +706,21 @@ def import_archive(paths: Paths, directory: Path, *, now: Optional[float] = None
     if not from_dir.is_dir():
         log.error("stock picks review import skipped reason=not_a_directory")
         return EXIT_CONFIG
-    old_umask = os.umask(0o077)
-    try:
-        if not state_dir_ok(paths.state_dir):
-            log.error("stock picks review import skipped reason=state_dir_unsafe")
-            return EXIT_CONFIG
+    with _locked(paths, what="import", locked_exit=EXIT_FAILED, recheck_disabled=False) as blocked:
+        if blocked is not None:
+            return blocked
+        if guards is not None:
+            guards()
+        ctx = Context(paths=paths, now=time.time() if now is None else now)
         try:
-            prepare_root(paths)
-            fd = open_lock(paths.lock)
-        except OSError:
-            log.error("stock picks review import skipped reason=root_or_lock_unsafe")
-            return EXIT_CONFIG
-        try:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                log.info("stock picks review import skipped reason=locked")
-                return EXIT_FAILED
-            if guards is not None:
-                guards()
-            ctx = Context(paths=paths, now=time.time() if now is None else now)
-            try:
-                from jobs import stock_picks_review_pool as pool
+            from jobs import stock_picks_review_pool as pool
 
-                result = pool.import_archive_dir(ctx, from_dir)
-            finally:
-                _disarm_alarm()
-                ctx.close()
-            sys.stdout.write(json.dumps(_clean(result), ensure_ascii=False, sort_keys=True) + "\n")
-            return EXIT_OK
+            result = pool.import_archive_dir(ctx, from_dir)
         finally:
-            os.close(fd)
-    finally:
-        os.umask(old_umask)
+            _disarm_alarm()
+            ctx.close()
+        sys.stdout.write(json.dumps(_clean(result), ensure_ascii=False, sort_keys=True) + "\n")
+        return EXIT_OK
 
 
 # ── launchd plist ───────────────────────────────────────────────────────────────
@@ -772,14 +783,35 @@ def render_plist(bot_dir: Optional[Path | str] = None, home: Optional[str] = Non
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="stock_picks_review", description="股票推薦定期回測 job")
     action = parser.add_mutually_exclusive_group()
-    action.add_argument("--dry-run", action="store_true", help="只看不寫")
+    action.add_argument("--dry-run", action="store_true",
+                        help="只看不寫（review.sqlite 用 immutable 唯讀、不讀 -wal：job 正在寫時可能讀到舊資料或讀不到，只供診斷）")
     action.add_argument("--import-archive", metavar="DIR", type=Path, help="一次性匯入手動封存")
     action.add_argument("--print-plist", action="store_true", help="印出 launchd plist")
     # 以下給測試與 staging：正式 launchd 不帶
     parser.add_argument("--bot-dir", type=Path, help=f"bot 目錄（預設：環境變數 {BOT_DIR_ENV}，再來是這支程式的上一層）")
     parser.add_argument("--maintenance-dir", type=Path, help=f"outbox 所在目錄（預設：環境變數 {MAINTENANCE_ENV}）")
-    parser.add_argument("--now", type=float, help="注入現在時間（epoch 秒）")
+    parser.add_argument("--now", type=float, help="注入現在時間（epoch 秒）：只准和 --dry-run 一起用，或同時給"
+                        " --bot-dir、--maintenance-dir 兩個都不是正式路徑的目錄")
     return parser.parse_args(argv)
+
+
+def _same_dir(a: Path, b: Path) -> bool:
+    try:
+        return a.resolve() == b.resolve()
+    except (OSError, RuntimeError):
+        return True  # 判斷不了就當作是正式路徑（拒絕）
+
+
+def now_allowed(args: argparse.Namespace) -> bool:
+    """--now 會讓價格庫、封存依假的「今天」清掉舊資料、讓週報依假的日期送出：只准 --dry-run，或明確給的
+    --bot-dir、--maintenance-dir 都不是正式路徑（環境變數不算明確給）。"""
+    if args.now is None or args.dry_run:
+        return True
+    if args.bot_dir is None or args.maintenance_dir is None:
+        return False
+    if any(_same_dir(args.bot_dir, prod) for prod in (BASE, PRODUCTION_BOT_DIR)):
+        return False
+    return not _same_dir(args.maintenance_dir, DEFAULT_MAINTENANCE)
 
 
 def main(argv: Optional[Sequence[str]] = None, *, install_guards: bool = False) -> int:
@@ -790,6 +822,9 @@ def main(argv: Optional[Sequence[str]] = None, *, install_guards: bool = False) 
     if args.print_plist:
         sys.stdout.write(render_plist(args.bot_dir or os.environ.get(BOT_DIR_ENV) or BASE))
         return EXIT_OK
+    if not now_allowed(args):
+        log.error("stock picks review skipped reason=now_needs_dry_run_or_test_dirs")
+        return EXIT_CONFIG
     guards = _install_guards if install_guards else None
     try:
         if args.dry_run:

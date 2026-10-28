@@ -71,6 +71,12 @@ def _assert_enumerated(value) -> None:
         assert value is None or isinstance(value, (bool, int, float)), value
 
 
+@pytest.fixture
+def settle40(monkeypatch):
+    """休市表期限照 perf 的 CALENDAR_SETTLE_SESSIONS＝40 算（週報當下才讀 perf；測試固定下來，不跟著另一邊的改動變）。"""
+    monkeypatch.setattr(weekly, "calendar_settle_sessions", lambda: 40)
+
+
 def _boom(_ctx):
     raise ValueError("秘密 /Users/someone/private detail")
 
@@ -87,22 +93,32 @@ def test_paths_resolve_to_tmp_under_pytest(paths):
     assert runner.resolve_paths("/x/bot", "/x/m") == runner.Paths(Path("/x/bot"), Path("/x/m"))
 
 
-def test_full_weekly_run_never_touches_the_real_outbox(ready):
+def test_full_weekly_run_never_touches_the_real_outbox(ready, monkeypatch):
     """PLAN §9：跑完整個週報流程，正式 outbox／sent／failed 不會多出這支 job 的檔（relay 會立刻 DM Andrew）。
-    正式目錄別的程序一直在搬檔，只比這支 job 自己的前綴。"""
-    def ours() -> list[str]:
-        found = []
+    - drop 真正寫到哪裡都記下來：一定在暫存的維護目錄底下。
+    - 正式目錄別的程序一直在搬檔（relay 把 outbox 的檔搬到 sent/）：只看測試期間三個目錄合起來「新出現」的檔名。"""
+    def real_names() -> set[str]:
+        found: set[str] = set()
         for sub in ("outbox", "sent", "failed"):
             directory = REAL_MAINTENANCE / sub
             if directory.is_dir():
-                found += [f"{sub}/{name}" for name in os.listdir(directory)
-                          if "stock-picks-weekly" in name or "stock-picks-review" in name]
-        return sorted(found)
+                found.update(os.listdir(directory))
+        return found
 
-    before = ours()
+    targets: list[Path] = []
+    real_drop = runner.drop
+
+    def recording_drop(maintenance, name, text, drafts):
+        targets.append(real_drop(maintenance, name, text, drafts))
+        return targets[-1]
+
+    monkeypatch.setattr(runner, "drop", recording_drop)
+    before = real_names()
     assert runner.run(runner.resolve_paths(), now=SUNDAY_EVENING) == runner.EXIT_OK
-    assert ours() == before
-    assert _outbox(ready) == ["2026-11-01-stock-picks-weekly.md"]  # 真的組出一份週報（放在暫存的 outbox）
+    ours = set(_outbox(ready))
+    assert ours == {"2026-11-01-stock-picks-weekly.md"}  # 真的組出一份週報（放在暫存的 outbox）
+    assert targets and all(ready.maintenance in target.parents for target in targets)
+    assert not (real_names() - before) & ours
 
 
 # ── 一輪 ───────────────────────────────────────────────────────────────────────
@@ -115,7 +131,7 @@ def test_full_run_records_enumerated_last_run(ready):
     assert out["status"] == "ok" and out["consecutive_failures"] == 0 and out["last_success_at"] == fx.NOW
     assert {name: s["status"] for name, s in out["stages"].items()} == {
         "archive": "ok", "pool": "ok", "prices": "ok", "weekly": "skipped:not_due"}
-    assert out["last_t"] == {"tw/v1": "2026-10-27", "tw/ai": "2026-10-27", "us": "2026-10-27"}
+    assert out["last_t"] == {"tw_v1": "2026-10-27", "tw_ai": "2026-10-27", "us": "2026-10-27"}
     assert out["sizes"]["archive_files"] == 3 and out["sizes"]["sqlite_bytes"] > 0
     assert out["finished_at"] >= out["started_at"]
     _assert_enumerated(out)
@@ -212,14 +228,19 @@ def test_spool_dir_is_created_once_and_moving_it_away_stops_the_hook(ready):
     assert "（spool 目錄不在：hook 停著）" in text
 
 
-def test_unsafe_spool_dir_does_not_block_the_families(ready):
+@pytest.mark.parametrize("mode", [0o755, 0o500])
+def test_unsafe_spool_dir_does_not_block_the_families(ready, mode):
+    """spool/ 不是剛好 0700（和 hook 的檢查一樣：0755、0500 hook 都不寫）：週報要說權限不對，不是說正常。"""
     runner.prepare_root(ready)
-    ready.spool.chmod(0o755)
+    ready.spool.chmod(mode)
     assert runner.run(ready, now=fx.NOW) == runner.EXIT_OK
     pool_out = _last_run(ready)["stages"]["pool"]
     assert pool_out["status"] == "ok" and pool_out["spool"]["dir"] == "unsafe"
     assert pool_out["tw_v1"] == "new" and pool_out["tw_ai"]["new"] == 1 and pool_out["us"] == "new"
-    assert (ready.spool.stat().st_mode & 0o777) == 0o755  # 不 chmod
+    assert (ready.spool.stat().st_mode & 0o777) == mode  # 不 chmod
+    runner.run(ready, now=SUNDAY_EVENING)
+    text = (ready.outbox / "2026-11-01-stock-picks-weekly.md").read_text(encoding="utf-8")
+    assert "（spool 目錄權限不對：hook 停著）" in text and "spool 目錄不在" not in text
 
 
 # ── --dry-run ────────────────────────────────────────────────────────────────
@@ -255,7 +276,7 @@ def test_main_in_process_never_installs_guards(ready, capsys):
     (fx.ts(2026, 11, 1, 19, 59), None),
     (fx.ts(2026, 11, 1, 20, 0), "2026-11-01"),
     (fx.ts(2026, 11, 2, 8), "2026-11-01"),
-    (fx.ts(2026, 11, 8, 19, 0), "2026-11-01"),
+    (fx.ts(2026, 11, 8, 19, 0), None),  # 週日 20:00 前不補上週那份（當天晚上就有新的一份）
     (fx.ts(2026, 11, 8, 20, 1), "2026-11-08"),
 ])
 def test_report_sunday(now, expected):
@@ -279,7 +300,15 @@ def test_weekly_once_per_week_and_only_the_latest_sunday(ready):
     assert _outbox(ready) == ["2026-11-15-stock-picks-weekly.md"]
 
 
-def test_weekly_content_reports_collection_status_in_one_message(ready):
+def test_sunday_before_eight_does_not_send_last_weeks_late_report(ready):
+    """Mac 從 11/01 18:00 睡到 11/08 15:00（審查 r3#5）：15:00 不補 11/01 那份，20:00 只送 11/08 這份。"""
+    runner.run(ready, now=fx.ts(2026, 11, 8, 15))
+    assert _outbox(ready) == [] and _last_run(ready)["stages"]["weekly"]["status"] == "skipped:not_due"
+    runner.run(ready, now=fx.ts(2026, 11, 8, 20, 30))
+    assert _outbox(ready) == ["2026-11-08-stock-picks-weekly.md"]
+
+
+def test_weekly_content_reports_collection_status_in_one_message(ready, settle40):
     runner.run(ready, now=fx.NOW)  # 先收一天
     runner.run(ready, now=SUNDAY_EVENING)
     text = (ready.outbox / "2026-11-01-stock-picks-weekly.md").read_text(encoding="utf-8")
@@ -291,7 +320,9 @@ def test_weekly_content_reports_collection_status_in_one_message(ready):
     # 台股 50＋8＋0050＋TAIEX；美股 50＋3 檔 ETF，缺的是兩檔 ⚪（DB 沒有它們的收盤）
     assert "・價格庫：台股 60 檔都有收盤、美股 51 檔有收盤、缺 2 檔，共 " in text
     assert "【推薦成績卡】推薦成績尚未上線" in text
-    assert "【台股休市表】2026 已取得；2027 尚未取得（要在 2/8 前取得，不然跨年的成績會延後）" in text
+    assert ("【台股休市表】2026 已取得；2027 尚未取得（建議 2027/2/23 前取得；"
+            "最晚 2027/2/26 前沒有，跨年那幾天的推薦會永久不算）") in text
+    assert "⚠️" not in text  # 12/1 之前下一年的表還沒取得只寫在休市表那一行
     assert "自動冷凍績效差的股票：尚未啟用" in text and "最早約 2027/5" in text and "2027/1/31" in text
     assert text.rstrip().endswith(weekly.METHOD)
 
@@ -310,13 +341,69 @@ def test_weekly_reads_perf_card_status_read_only(ready):
     assert ready.perf_result.read_bytes() == before
 
 
-def test_weekly_says_us_not_live_without_its_state_file(paths):
+def test_weekly_says_us_not_live_without_its_state_file(paths, settle40):
     fx.write_states(paths.state_dir, main=fx.main_snapshot(), ai=fx.ai_state())
     fx.make_market_db(paths.market_db, fx.standard_market_rows())
     runner.run(paths, now=SUNDAY_EVENING)
     text = (paths.outbox / "2026-11-01-stock-picks-weekly.md").read_text(encoding="utf-8")
     assert "・美股：還沒有紀錄（美股推薦還沒上線）" in text
-    assert "【台股休市表】2026 尚未取得；2027 尚未取得" in text
+    assert "【台股休市表】2026 尚未取得；2027 尚未取得（建議 2027/2/23 前取得" in text
+    # 當年的表不能用：最上面一直警示（最後期限過了，期間有休市日的推薦都算不了）
+    assert text.splitlines()[1] == ("⚠️ 2026 台股休市表尚未取得：已經過了 2026/2/26 的最後期限，"
+                                    "期間有休市日的推薦（含跨年那幾天）都會永久不算")
+
+
+# ── 下一年的台股休市表（審查 r3#1） ─────────────────────────────────────────────────────
+def test_holiday_cutoff_follows_the_deployed_perf(monkeypatch):
+    """最後期限＝下一年第一個交易日再加 S − 1 個交易日，S＝perf 的 CALENDAR_SETTLE_SESSIONS（舊版 perf 沒有這個常數就用
+    SETTLE_SESSIONS；讀不到用 10）。2027：1/1（五）休市，第一個交易日 1/4；S＝10 是 1/15，S＝40 是 2/26。"""
+    import stock_picks_perf as perf
+    from datetime import date
+
+    assert weekly.calendar_settle_sessions() == getattr(perf, "CALENDAR_SETTLE_SESSIONS", perf.SETTLE_SESSIONS)
+    assert weekly.holiday_cutoff(2027, 10) == date(2027, 1, 15)
+    assert weekly.holiday_cutoff(2027, 40) == date(2027, 2, 26)
+    assert weekly.holiday_cutoff(2028, 40) == date(2028, 2, 25)  # 1/1 是週六：1/3 起算
+    # 價格庫日曆已經涵蓋到年初：照日曆（1/5 臨時休市 → 第 10 個交易日往後一天）
+    sessions = ["2026-12-30", "2026-12-31", "2027-01-04"] + fx.weekdays(date(2027, 1, 8), 3)
+    assert weekly.holiday_cutoff(2027, 10, sessions) == date(2027, 1, 18)
+    # 日曆從年中才有（例如價格庫剛建）：不拿年中的日子當年初
+    assert weekly.holiday_cutoff(2026, 10, fx.weekdays(fx.T, 30)) == date(2026, 1, 15)
+    # 建議期限＝最後期限提早 3 天；建議期限過了只寫最後期限
+    assert weekly._deadline_text(date(2027, 2, 26), date(2027, 2, 1)) == (
+        "建議 2027/2/23 前取得；最晚 2027/2/26 前沒有，跨年那幾天的推薦會永久不算")
+    assert weekly._deadline_text(date(2027, 2, 26), date(2027, 2, 24)) == "最晚 2027/2/26 前沒有，跨年那幾天的推薦會永久不算"
+    # 舊版 perf（沒有 CALENDAR_SETTLE_SESSIONS）用 SETTLE_SESSIONS；perf import 不了用 10
+    monkeypatch.delattr(perf, "CALENDAR_SETTLE_SESSIONS", raising=False)
+    assert weekly.calendar_settle_sessions() == perf.SETTLE_SESSIONS == 10
+    monkeypatch.setitem(sys.modules, "stock_picks_perf", None)
+    assert weekly.calendar_settle_sessions() == weekly.DEFAULT_SETTLE_SESSIONS == 10
+
+
+def test_missing_next_year_holidays_become_a_top_warning_from_december(ready, settle40):
+    warning_2027 = "⚠️ 2027 台股休市表尚未取得：建議 2027/2/23 前取得；最晚 2027/2/26 前沒有，跨年那幾天的推薦會永久不算"
+    runner.run(ready, now=fx.ts(2026, 12, 6, 20, 30))
+    lines = (ready.outbox / "2026-12-06-stock-picks-weekly.md").read_text(encoding="utf-8").splitlines()
+    assert lines[0].startswith("📊") and lines[1] == warning_2027
+    # 1 月：2027 變成當年，期限前照樣警示；2028 還早，只寫在休市表那一行
+    runner.run(ready, now=fx.ts(2027, 1, 3, 20, 30))
+    text = (ready.outbox / "2027-01-03-stock-picks-weekly.md").read_text(encoding="utf-8")
+    assert text.splitlines()[1] == warning_2027
+    assert "⚠️ 2028" not in text and "2028 尚未取得（建議 2028/2/22 前取得；最晚 2028/2/25 前沒有" in text
+    # 最後期限過了還沒有：照樣警示，說已經永久不算
+    runner.run(ready, now=fx.ts(2027, 2, 28, 20, 30))
+    text = (ready.outbox / "2027-02-28-stock-picks-weekly.md").read_text(encoding="utf-8")
+    assert text.splitlines()[1] == ("⚠️ 2027 台股休市表尚未取得：已經過了 2027/2/26 的最後期限，"
+                                    "期間有休市日的推薦（含跨年那幾天）都會永久不算")
+
+
+def test_no_holiday_warning_once_next_year_table_is_in(paths):
+    fx.write_states(paths.state_dir, main=fx.main_snapshot(), ai=fx.ai_state(), us=fx.us_snapshot())
+    fx.make_market_db(paths.market_db, fx.standard_market_rows(),
+                      obs={"tw.holidays.2026": {"rows": []}, "tw.holidays.2027": {"rows": []}})
+    runner.run(paths, now=fx.ts(2026, 12, 6, 20, 30))
+    text = (paths.outbox / "2026-12-06-stock-picks-weekly.md").read_text(encoding="utf-8")
+    assert "⚠️" not in text and "【台股休市表】2026 已取得；2027 已取得" in text
 
 
 # ── plist ──────────────────────────────────────────────────────────────────────
@@ -334,6 +421,63 @@ def test_print_plist(capsys):
     assert set(plist["EnvironmentVariables"]) == {"HOME", "PATH"}
     assert plist["StandardOutPath"] == f"{home}/Library/Logs/stock_picks_review_stdout.log"
     assert plist["StandardErrorPath"] == f"{home}/Library/Logs/stock_picks_review_stderr.log"
+
+
+# ── --now 只給測試與 staging（審查 impl r2#2） ──────────────────────────────────────────
+def _forbid_running(monkeypatch) -> None:
+    """守門壞掉時也不能真的跑到正式路徑：run／import／dry-run 一被呼叫就讓測試失敗。"""
+    def boom(*_args, **_kwargs):
+        raise AssertionError("--now guard let the job run")
+
+    for name in ("run", "import_archive", "dry_run"):
+        monkeypatch.setattr(runner, name, boom)
+
+
+@pytest.mark.parametrize("extra", [
+    [],  # 只有環境變數（conftest 的暫存目錄）不算明確給
+    ["--bot-dir", "{tmp}/bot"],
+    ["--maintenance-dir", "{tmp}/m"],
+    ["--bot-dir", "{base}", "--maintenance-dir", "{tmp}/m"],
+    ["--bot-dir", "{prod}", "--maintenance-dir", "{tmp}/m"],
+    ["--bot-dir", "{tmp}/bot", "--maintenance-dir", "{maint}"],
+    ["--import-archive", "{tmp}", "--bot-dir", "{tmp}/bot", "--maintenance-dir", "{maint}"],
+])
+def test_now_is_refused_without_dry_run_or_explicit_test_dirs(monkeypatch, tmp_path, extra):
+    _forbid_running(monkeypatch)
+    names = {"tmp": str(tmp_path), "base": str(runner.BASE), "prod": str(runner.PRODUCTION_BOT_DIR),
+             "maint": str(runner.DEFAULT_MAINTENANCE)}
+    argv = ["--now", str(fx.NOW)] + [arg.format(**names) for arg in extra]
+    assert runner.main(argv) == runner.EXIT_CONFIG
+    assert list(tmp_path.iterdir()) == []  # 什麼都沒建
+
+
+def test_now_with_dry_run_or_explicit_test_dirs_runs(ready, capsys):
+    assert runner.main(["--dry-run", "--now", str(fx.NOW)]) == runner.EXIT_OK
+    capsys.readouterr()
+    assert runner.main(["--now", str(fx.NOW), "--bot-dir", str(ready.bot_dir),
+                        "--maintenance-dir", str(ready.maintenance)]) == runner.EXIT_OK
+    assert _last_run(ready)["started_at"] == fx.NOW
+
+
+# ── 第一次建自己的目錄 ─────────────────────────────────────────────────────────────
+def test_root_and_spool_are_created_together_or_not_at_all(paths, monkeypatch):
+    """spool/ 建失敗時不能留下「root 在、spool 不在」：之後永遠不會再建 spool/，hook 就無聲停用（審查 impl r1#8）。"""
+    real_mkdir = os.mkdir
+
+    def failing_mkdir(path, *args, **kwargs):
+        if Path(path).name == "spool":
+            raise OSError(28, "No space left on device")
+        return real_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "mkdir", failing_mkdir)
+    with pytest.raises(OSError):
+        runner.prepare_root(paths)
+    assert sorted(os.listdir(paths.state_dir)) == []  # 沒有半成品，也沒有留下暫存目錄
+    monkeypatch.undo()
+    runner.prepare_root(paths)
+    assert paths.spool.is_dir() and (paths.spool.stat().st_mode & 0o777) == 0o700
+    assert (paths.root.stat().st_mode & 0o777) == 0o700 and sorted(os.listdir(paths.state_dir)) == ["stock_picks_review"]
+    runner.prepare_root(paths)  # 已經在：照用
 
 
 def test_import_archive_cli_takes_the_lock(ready, tmp_path, capsys):
@@ -427,9 +571,9 @@ def test_launchd_shaped_run_end_to_end(ready, tmp_path):
     驗證腳本當 __main__ 時，`from jobs import …` 拿得到其他模組，防護裝了也能跑完整輪。"""
     env = _env(ready, tmp_path)
     proc = subprocess.run([sys.executable, str(JOB), "--bot-dir", str(ready.bot_dir),
-                           "--maintenance-dir", str(ready.maintenance)],
+                           "--maintenance-dir", str(ready.maintenance), "--now", str(fx.NOW)],
                           env=env, cwd=str(WORK), capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0, proc.stderr
     out = _last_run(ready)
-    assert out["status"] == "ok" and out["stages"]["pool"]["tw_ai"]["new"] == 1
-    assert out["stages"]["prices"]["status"] == "ok"
+    assert out["status"] == "ok" and out["started_at"] == fx.NOW and out["stages"]["pool"]["tw_ai"]["new"] == 1
+    assert out["stages"]["prices"]["status"] == "ok" and out["stages"]["weekly"]["status"] == "skipped:not_due"
