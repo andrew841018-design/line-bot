@@ -33,6 +33,8 @@ ALLOWED_HOSTS = frozenset(
         "www.federalreserve.gov",
         "query1.finance.yahoo.com",
         "query2.finance.yahoo.com",
+        # 通膨（CPI、核心 CPI）：2026-10-24 Andrew 同意新增 api.bls.gov；v1 免註冊、每天 25 次（market_store.HOST_RULES 限每台北日 12 次）
+        "api.bls.gov",
         # 台股
         "www.twse.com.tw",
         "openapi.twse.com.tw",
@@ -41,11 +43,21 @@ ALLOWED_HOSTS = frozenset(
         # 新聞、川普原文
         "news.google.com",
         "www.trumpstruth.org",
+        # 2026-10-24：Andrew 選用 MacroMargin 的「川普壓力指數（TACO 指數）」（財經M平方的 MM 指數對程式回 403＋Cloudflare 驗證，
+        # 不繞過、不登入）。個人網站、找不到使用條款；只抓 robots.txt 明確 Allow 的 /dashboard/trump 那一頁
+        # （Disallow /api/、/data/ 與其他 /dashboard/：不碰，也不碰頁面上的「下載源數據」）。見 market_sources_taco。
+        "ocmacro.com",
         # 2026-10-23：api.coinbase.com、gamma-api.polymarket.com、api.elections.kalshi.com 拿掉。台灣的 ISP 從
         # 10/21 晚上起依法院命令封鎖這三個主機（DNS 改寫到封鎖頁，每次都在 TLS 驗證失敗）；不繞過封鎖，
         # 所以也不能留在白名單裡等著失敗（見 market_sources_misc.PREDICTION_MARKETS_BLOCKED）。
     }
 )
+
+# 同一個主機只准特定路徑（2026-10-28 審查 gp2 N2）：ocmacro.com 的 robots.txt 只 Allow /dashboard/trump（Disallow /api/、/data/、
+# 其他 /dashboard/）；傳輸層只比主機的話，任何呼叫端都能請求同一主機的任何路徑，robots 之後改了也不會被發現。路徑要完全相等
+# （不是前綴：/dashboard/trumpX、/dashboard/trump/../api 都不行），也不准帶查詢字串；不合就當 FetchError("host")、不預扣帳本。
+# 不在這個表裡的主機不限路徑。
+ALLOWED_PATHS: dict[str, tuple[str, ...]] = {"ocmacro.com": ("/dashboard/trump",)}
 
 COOLDOWN_SECONDS = 7200.0
 CONNECT_TIMEOUT_S = 5.0
@@ -83,7 +95,7 @@ class Ledger(Protocol):
 
 
 def host_of(url: str) -> Optional[str]:
-    """合格網址的主機名（小寫）；不是 https:443、帶帳密、或不在白名單就回 None。"""
+    """合格網址的主機名（小寫）；不是 https:443、帶帳密、不在白名單、或（這個主機有路徑限制時）路徑不是 ALLOWED_PATHS 裡的就回 None。"""
     try:
         parts = urlsplit(url)
         port = parts.port
@@ -92,7 +104,12 @@ def host_of(url: str) -> Optional[str]:
     if parts.scheme != "https" or parts.username or parts.password or port not in (None, 443):
         return None
     host = (parts.hostname or "").lower()
-    return host if host in ALLOWED_HOSTS else None
+    if host not in ALLOWED_HOSTS:
+        return None
+    paths = ALLOWED_PATHS.get(host)
+    if paths is not None and (parts.path not in paths or parts.query):
+        return None
+    return host
 
 
 def fetch(

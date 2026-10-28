@@ -982,6 +982,48 @@ def test_vix_uses_last_trade_date_and_keeps_its_own_history(env):
     assert payload["history"] == [["2026-10-15", 16.46], ["2026-10-16", 19.99]] and payload["price_change"] == 3.53
 
 
+def test_vxtlt_rides_the_vix_batch_last_and_keeps_its_own_history(env):
+    """2026-10-24 第 9 輪 A12：VXTLT（TLT 選擇權波動，約 15）和 VIX、VIX3M 同一批、同一個主機、同一個 _store_quote；
+    排最後（us.vix 的時間不夠時被擠掉的是它，不是 VIX3M）。"""
+    assert pipe.VIX_SYMBOLS == ("VIX", "VIX3M", "VXTLT") and pipe.OBS_QUOTE["VXTLT"] == "us.quote.VXTLT"
+    for day, stamp, close in ((date(2026, 10, 15), "2026-10-15T16:15:01", 16.05), (D, "2026-10-16T16:15:01", 15.09)):
+        for symbol in pipe.VIX_SYMBOLS:
+            env.http.quotes[symbol] = cboe_quote(symbol, timestamp=f"{day.isoformat()} 21:37:16", last_trade=stamp,
+                                                 close=close)
+        assert run(env, "us.vix", datetime.combine(day, datetime.min.time(), ET).timestamp() + 18 * 3600) == "ok"
+    assert env.http.requested("quote")[:3] == ["VIX", "VIX3M", "VXTLT"]
+    got = obs(env, pipe.OBS_QUOTE["VXTLT"])
+    assert got["data_date"] == "2026-10-16" and got["payload"]["close"] == 15.09
+    assert got["payload"]["history"] == [["2026-10-15", 16.05], ["2026-10-16", 15.09]]
+    assert obs(env, pipe.OBS_QUOTE["VIX"])["payload"]["close"] == 15.09  # 三個各存各的（這裡三份假檔用同一個收盤）
+
+
+@pytest.mark.parametrize("how", ["out_of_range", "request_fails", "wrong_file"])
+def test_a_bad_vxtlt_leaves_vix_and_vix3m_stored_and_does_not_lock_them_out(env, how):
+    """VXTLT 壞了（範圍外的值、請求失敗、檔案是別的指數）只算它自己一項的失敗：VIX、VIX3M 照存，整批是 partial。"""
+    for symbol in pipe.VIX_SYMBOLS:
+        env.http.quotes[symbol] = cboe_quote(symbol, timestamp="2026-10-16 21:37:16", last_trade="2026-10-16T16:15:01",
+                                             close=19.99)
+    if how == "out_of_range":
+        env.http.quotes["VXTLT"] = cboe_quote("VXTLT", timestamp="2026-10-16 21:37:16", last_trade="2026-10-16T16:15:01",
+                                              close=3.0)  # VIX_RANGE 是 5–200
+    elif how == "request_fails":
+        env.http.fail["quote:VXTLT"] = "status"
+    else:
+        env.http.quotes["VXTLT"] = cboe_quote("VIX", timestamp="2026-10-16 21:37:16", last_trade="2026-10-16T16:15:01",
+                                              close=19.99)
+    at = datetime.combine(D, datetime.min.time(), ET).timestamp() + 18 * 3600
+    assert run(env, "us.vix", at) == "partial"
+    assert obs(env, pipe.OBS_QUOTE["VIX"])["payload"]["close"] == 19.99
+    assert obs(env, pipe.OBS_QUOTE["VIX3M"])["payload"]["close"] == 19.99
+    bad = obs(env, pipe.OBS_QUOTE["VXTLT"])
+    assert bad["payload"] is None and bad["error"] in ("format", "status") and bad["fail_streak"] == 1
+    # 下一輪只再試壞掉的那一項（VIX、VIX3M 已經完成）
+    before = len(env.http.requested("quote"))
+    run(env, "us.vix", at + 1800)
+    assert env.http.requested("quote")[before:] == ["VXTLT"]
+
+
 def test_provisional_cboe_close_when_nasdaq_is_blocked_then_nasdaq_overwrites_without_the_guard(env):
     for symbol in pipe.ETFS:
         seed(env, symbol, flat(HISTORY, 700.0))

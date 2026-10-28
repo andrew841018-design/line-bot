@@ -1,4 +1,4 @@
-"""市場盤勢（/盤勢，2026-10-17）：bot 端只讀「顯示用快照」，組 4 張摘要卡、細節卡與期權圖回覆。
+"""市場盤勢（/盤勢，2026-10-17）：bot 端只讀「顯示用快照」，組摘要卡（張數見 SUMMARY_CARD_COUNT）、細節卡與期權圖回覆。
 
 Andrew 2026-10-17：「我想要知道目前市場的狀況」——美股／台股的技術面、寬度（站上／跌破均線的家數、
 漲跌家數）、量能（「不能只有量，我要知道當前量是多還是少」）、籌碼、期權、13F、槓桿、外資與消息面；
@@ -20,7 +20,7 @@ Andrew 2026-10-17：「我想要知道目前市場的狀況」——美股／台
 - Reply.text／alt_text／image_alt 只由固定句型、程式算的數字與日期組成：文字回覆路徑會把「@all」
   「@家人」變成真的提及，_prepare_outbound_text 也可能整則換掉。矛盾列用代碼查 market_calc 的固定句，
   一句話要完全符合固定句型才放進 altText。
-- 版面（PLAN §6）：摘要 4 張同一個 size、每張 ≤6 列、每列 ≤24 個中文字寬（全形算 1、半形算 0.5）、
+- 版面（PLAN §6）：摘要卡同一個 size、每張 ≤6 列、每列 ≤24 個中文字寬（全形算 1、半形算 0.5）、
   先中文後括號英文、標題帶張數與資料日；按鈕是可點的 box＋xxl 字＋message action；顏色只用藍
   #1E5AA8、橘 #B7791F、灰 #555555／#666666（台股紅漲綠跌，不用紅綠）。只描述狀態，不是買賣建議。
 - 不 import main、card_pages、stock_picks、market_sources_*、numpy、pandas、matplotlib（market_calc
@@ -40,6 +40,7 @@ import time
 import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Callable, Optional, Sequence
 from zoneinfo import ZoneInfo
 
@@ -62,6 +63,12 @@ SUMMARY_BUBBLE_MAX_BYTES = 6656  # 6.5 KB
 # card_pages 對整張卡只給 30 KB、超過就悄悄不加大字版按鈕；每張 🔍 約 0.4–0.6 KB，所以卡片自己 ≤28 KB
 CARD_MAX_BYTES = 28 * 1024
 MAX_SUMMARY_ROWS = 6
+# 每個泡泡最多 3 顆按鈕（卡高）；_bubble 自己擋，不只靠測試（2026-10-24 第 9 輪 N7，審查 r9 s1-N7）
+MAX_BUTTONS = 3
+# 摘要輪播的張數（2026-10-24 第 9 輪 A10／A11）：標題的（i/N）、TEXT_SWIPE 的「還有 N-1 張」、TEXT_USAGE 的「N 張摘要卡」
+# 都由它算出。之後加一張摘要卡＝改這個數字、在 SUMMARY_CARDS 插一行、寫新的 builder；別張的頁碼與第一張的「往左滑」
+# 都照位置算，不用動（test_market_dashboard 有模擬這件事）。
+SUMMARY_CARD_COUNT = 5
 MAX_ROW_WIDTH = 24
 MAX_ALT_CHARS = 400
 MAX_BUBBLES = 12
@@ -82,6 +89,11 @@ NEWS_PER_KIND = 5
 IRAN_NEWS_MAX = 4
 TRUMP_POSTS_MAX = 4
 EVENTS_MAX = 6
+# events.next 的 items 最多讀幾筆（2026-10-24 第 9 輪 A16）：publish 的 EVENTS_KEEP 從 12 加到 24，清單最後面是 keep_events 換進來
+# 的必留事件（FOMC／CPI／非農）與最晚的財報日，只讀前 18 筆（EVENTS_MAX*3）會讀不到它們；留一倍餘裕（test_market_publish 鎖
+# EVENTS_KEEP＝24，test_market_dashboard 鎖這個數字 ≥ 它）。事件列表與 ETF 細節卡的財報行共用
+EVENTS_SCAN_MAX = 48
+EARNINGS_HORIZON_S = 45 * 86400.0  # 財報行的視野（publish 的 EVENT_HORIZON_DAYS）：現在到 45 天後
 HOLDINGS_MAX = 10
 CROSSINGS_MAX = 2
 TOPICS_MAX = 3
@@ -96,17 +108,46 @@ VIX_FEAR_FROM = 30.0
 ELECTION_DAY = date(2026, 11, 3)  # 美東日期
 ELECTION_LAST_DAY = date(2027, 2, 1)  # Kalshi 結算上限；過了一律當本屆結束
 
+# 摘要輪播的順序：(卡名, builder 函式名)。builder 用名字登記、呼叫時才查（所以測試換掉 builder 也抓得到）；builder 收到的
+# 是「卡名＋頁碼」（_page）和副標（只有第一張有「往左滑」），所以插入、調換順序都不用改別張。張數要和 SUMMARY_CARD_COUNT 一致。
+SUMMARY_CARDS: tuple[tuple[str, str], ...] = (
+    ("重點摘要", "_card_digest"),
+    ("美股", "_card_us"),
+    ("台股", "_card_tw"),
+    ("期權與資金", "_card_flow"),
+    ("宏觀與事件", "_card_macro"),
+)
+
 # 固定句：和 job 共用的放在 market_calc；這裡只有 bot 自己用的
 TEXT_NOT_READY = market_calc.TEXT_PREPARING
 TEXT_DISABLED = market_calc.TEXT_DISABLED
 TEXT_DISCLAIMER = market_calc.TEXT_DISCLAIMER
 TEXT_MISSING = market_calc.TEXT_MISSING
+TEXT_DATE_MISSING = market_calc.TEXT_DATE_MISSING  # 融資那一列沒有資料日時代替日期（F2-6）
 TEXT_INSUFFICIENT = market_calc.TEXT_INSUFFICIENT
 TEXT_PERIOD_UNKNOWN = market_calc.TEXT_UNKNOWN_PERIOD
-TEXT_MM = market_calc.TEXT_MM_TRUMP
+# 2026-10-24 第 9 輪批 1 B 軌的固定句（都在 market_calc：FIXED_TEXTS 的禁用字、年份、validator 掃描自動涵蓋；這裡只是別名）
+TEXT_WALL_DIST_CLOSE = market_calc.TEXT_WALL_DIST_CLOSE
+TEXT_WALL_DIST_SPOT = market_calc.TEXT_WALL_DIST_SPOT
+TEXT_WALL_DIST_MIXED = market_calc.TEXT_WALL_DIST_MIXED
+TEXT_WALL_DIST_NAMED = market_calc.TEXT_WALL_DIST_NAMED
+TEXT_CFTC_NO_SEMI = market_calc.TEXT_CFTC_NO_SEMI
+TEXT_EARNINGS_HEAD = market_calc.TEXT_EARNINGS_HEAD
+TEXT_EARNINGS_ESTIMATED = market_calc.TEXT_EARNINGS_ESTIMATED
+TEXT_EARNINGS_OTHERS = market_calc.TEXT_EARNINGS_OTHERS
+TEXT_EARNINGS_NONE = market_calc.TEXT_EARNINGS_NONE
+TEXT_RSI_NOTE = market_calc.TEXT_RSI_NOTE
+TEXT_CLOSE_PENDING = market_calc.TEXT_CLOSE_PENDING  # 美股、台股副標：「{md} 收盤資料尚未取得」
+TEXT_TW_CLOSED = market_calc.TEXT_TW_CLOSED  # 台股副標：「{md} 休市」（覆寫已確認；{md}＝快照產生日，F2-3）
+TEXT_TW_CLOSED_TENTATIVE = market_calc.TEXT_TW_CLOSED_TENTATIVE  # 「{md} 休市（暫定）」（管線推定）
+TEXT_TW_ETF_LAG = market_calc.TEXT_TW_ETF_LAG  # 0050 細節卡註腳：除權息資料還沒到所以 0050 比加權舊一天
 TEXT_US_BASIS = market_calc.TEXT_US_NO_DIVIDEND
 TEXT_TW_BASIS = market_calc.TEXT_TW_ADJUSTED
 TEXT_CARD_FAILED = "盤勢：卡片暫時出不來，請過幾分鐘再按一次"
+TEXT_SUMMARY_ALT_FALLBACK = market_calc.TEXT_SUMMARY_ALT_FALLBACK  # 摘要的 altText 出錯時退回的固定句（F2-11）
+# 輪播裡某一張的 builder 出錯時，那一張換成只有這一句的短卡（2026-10-24 審查 r9 s4-F9-1）；整組卡太大、無法送出時
+# 用的是上面的 TEXT_CARD_FAILED（也是 main 送卡失敗的 fallback），兩句不同、不要合併
+TEXT_BUBBLE_FAILED = "這張卡暫時出不來，其他張照常"
 TEXT_CHART_UNAVAILABLE = "盤勢圖：這張圖還沒畫好或已經過期，請過幾分鐘再按一次"
 TEXT_NO_13F_0050 = "盤勢：0050 是台股 ETF，沒有 13F 資料；台股細節請打 /盤勢 0050"
 TEXT_ELECTION_ENDED = "盤勢：本屆期中選舉已結束"
@@ -114,8 +155,9 @@ TEXT_ELECTION_ENDED = "盤勢：本屆期中選舉已結束"
 # （不是「暫缺」）。摘要列接在「期中選舉還有 N 天，」後面，放不下全句，用短的
 TEXT_PREDICTION_BLOCKED = "預測市場：台灣已封鎖這些網站，暫不提供"
 TEXT_PREDICTION_BLOCKED_SHORT = "預測市場：台灣已封鎖"
-TEXT_SWIPE = "往左滑還有 3 張"
+TEXT_SWIPE = f"往左滑還有 {SUMMARY_CARD_COUNT - 1} 張"
 TEXT_NEWS_NOTE = "新聞標題是第三方原文，只照錄、不代表程式判斷"
+TEXT_NEWS_SAME_AS_US = "與上面的美股新聞相同，不重複列"  # 半導體新聞的標題全都已經列在美股新聞（2026-10-24 第 9 輪 A17）
 TEXT_GAMMA_NOTE = "假設部位下的 gamma 是估計：假設造市商持有買權、賣出賣權"
 TEXT_SHARE_CLASS = "同一公司的不同股別合併成一家（例 GOOGL＋GOOG），權重相加"
 TEXT_FLOW_NOTE = "FINRA 是月資料、落後 3–4 週"
@@ -124,11 +166,18 @@ TEXT_PROXY_NO_CHANGE = "暫無漲跌幅"  # ETF 代理沒有日漲跌幅：不�
 TEXT_MID_MISSING = "買賣價中間值暫缺"
 TEXT_SETTLED_YES = "已結算，民主黨拿下"  # 預測市場的結算（Yes＝民主黨）
 TEXT_SETTLED_NO = "已結算，民主黨未拿下"
-TEXT_SEASON_SOURCE = "來源：datahub（Shiller 月均價）、FinMind（加權指數）"
+TEXT_SEASON_SOURCE = "來源：datahub（Shiller 月均價）、Nasdaq（SOXX、費城半導體指數）、FinMind（加權指數）"
+# 重點摘要（輪播第一張）用的固定字（2026-10-24 第 9 輪 A9）：整句由這些字加上程式算的數字與日期組成，不放快照裡的字
+TEXT_DIGEST_ALL_THREE = "三檔都"  # 第 1 列：三檔同缺（三檔都過期、三檔都暫缺）
+TEXT_DIGEST_EACH = "都"  # 第 1 列：三檔同向時點名三檔、接在最後一檔後面（標普、那指、半導體都在月線上；F2-8）
+TEXT_DIGEST_STALE = "過期"  # 第 1、2 列：這一檔／這一項資料過期
+TEXT_DIGEST_10Y = "10 年債"  # 第 4 列
+TEXT_DIGEST_NEXT_EVENT = "下一個事件"  # 第 5 列：事件名稱放不下時的固定寫法（不跳到下下個事件）
+TEXT_DIGEST_DATES = "資料日"  # footer：資料日：美股 10/23、台股 10/22、VIX 10/23
 TEXT_USAGE = "\n".join(
     (
         "盤勢：指令用法",
-        "/盤勢 → 4 張摘要卡（美股、台股、期權與資金、宏觀與事件）",
+        f"/盤勢 → {SUMMARY_CARD_COUNT} 張摘要卡（{'、'.join(name for name, _builder in SUMMARY_CARDS)}）",
         "/盤勢 VOO、/盤勢 QQQ、/盤勢 SOXX、/盤勢 0050 → 細節",
         "/盤勢 期權 → 期權與資金細節",
         "/盤勢 QQQ 圖（也可以 SPY、SOXX、台指）→ 期權圖",
@@ -154,6 +203,7 @@ CHART_SYMBOLS = ("QQQ", "SPY", "SOXX", "台指")
 CHART_KEYS = {"QQQ": "QQQ", "SPY": "SPY", "SOXX": "SOXX", "台指": "TXO"}
 
 # 卡片按鈕會送出的所有字：舊卡片一直留在聊天紀錄裡可以點，只能加不能刪（test_market_routing 同一份）。
+# 2026-10-24 起新卡片不再有「回摘要」，但聊天紀錄裡舊卡片的「回摘要」仍送 /盤勢，所以 /盤勢 要留著。
 SHIPPED_MARKET_TEXTS: tuple[str, ...] = (
     "/盤勢",
     "/盤勢 VOO",
@@ -215,6 +265,8 @@ class Reply:
     fallback_text: Optional[str] = None
     images: Optional[list[str]] = None  # 圖檔名（32hex.png），main 負責組網址與送出
     image_alt: Optional[str] = None  # 寫進 raw_messages 的「盤勢圖：…」
+    # 輪播裡哪幾張出錯、被換成短卡（「builder 名稱:例外型別名」，不放例外訊息）；main 不看這個，每日維護從 status_summary 讀
+    render_errors: tuple[str, ...] = ()
 
 
 # ── 讀快照 ───────────────────────────────────────────────────────────────────
@@ -261,7 +313,8 @@ def _load_snapshot(paths: Any) -> Optional[dict]:
 
 # ── 值的型別檢查與格式 ────────────────────────────────────────────────────────
 _DAY_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
-_MONTH_RE = re.compile(r"(\d{4})-?(\d{2})")
+# re.ASCII：\d 預設連全形、阿拉伯數字都收，_month_of 的 int() 也收，「２０２６-０９」會變成 9 月（第 2 輪複審 gp1 N7）
+_MONTH_RE = re.compile(r"(\d{4})-?(\d{2})", re.ASCII)
 _SYMBOL_RE = re.compile(r"[A-Z]{1,5}(?:\.[A-Z])?")
 _CHART_NAME_RE = re.compile(r"[0-9a-f]{32}\.png")
 _ROW_ID_RE = re.compile(r"[a-z0-9]+(?:\.[A-Za-z0-9_]+){0,3}")
@@ -347,8 +400,20 @@ def _price(value: float) -> str:
     return f"{value:,.2f}".rstrip("0").rstrip(".")
 
 
+def _half_up(value: float, digits: int) -> Decimal:
+    """顯示用的四捨五入進位（ROUND_HALF_UP，平手往遠離 0 的方向）：62.5 → 63、1.45 → 1.5、-0.85 → -0.9。
+
+    Python 的 round() 與 f"{x:.1f}" 對平手是看二進位表示（1.45 → 1.4、62.5 → 62），和 _digest_bp 的作法、建表時寫進 JSON 的
+    兩位小數都不一致（2026-10-28 批 1 審查 F2-16）。一定要從 repr 轉成 Decimal：Decimal(0.95) 本身是 0.9499…，進位等於沒改。
+    「看顯示值判斷」的地方（摘要第 3 列的『不到 1%』、_signed 的『顯示成 0 就不帶正負號』）也走這一個，判斷與印出來的字不會分家。"""
+    number = float(value)
+    if not math.isfinite(number):  # 呼叫端都先過 _num；真的來了就退回原本的格式化，不丟例外
+        return Decimal(number)
+    return Decimal(repr(number)).quantize(Decimal(1).scaleb(-digits), rounding=ROUND_HALF_UP)
+
+
 def _signed(value: float, digits: int = 2, unit: str = "") -> str:
-    rounded = round(value, digits)
+    rounded = _half_up(value, digits)
     if rounded == 0:
         return f"{0:.{digits}f}{unit}"
     return f"{rounded:+,.{digits}f}{unit}"
@@ -358,8 +423,13 @@ def _pct(value: float, digits: int = 1) -> str:
     return _signed(value, digits, "%")
 
 
+def _round_text(value: float, digits: int = 0) -> str:
+    """四捨五入進位後的數字（不帶單位）：百分位、百分比共用。"""
+    return f"{_half_up(value, digits):.{digits}f}"
+
+
 def _plain_pct(value: float, digits: int = 0) -> str:
-    return f"{value:.{digits}f}%"
+    return f"{_round_text(value, digits)}%"
 
 
 def _amount_yi(yi: float) -> str:
@@ -421,7 +491,9 @@ class _View:
     values: dict
     data_date: Optional[date] = None
     period_unknown: bool = False
-    provisional: bool = False  # 收盤是 CBOE 的暫定值（列的 source＝SOURCE_CBOE_FALLBACK）
+    # 收盤是 CBOE 的暫定值：列的 source＝SOURCE_CBOE_FALLBACK（ETF 列），或 values.provisional 為 true（用暫定收盤算的
+    # macro.SPY_DD、contra.us；2026-10-24 第 9 輪 A27）。舊快照沒有這個鍵就是 False
+    provisional: bool = False
 
     @property
     def fresh(self) -> bool:
@@ -452,7 +524,7 @@ class _Ctx:
         if self.now > stale_after:
             return _View(STALE, {}, day)
         return _View(FRESH, values, day, state == "unknown_period",
-                     raw.get("source") == market_calc.SOURCE_CBOE_FALLBACK)
+                     raw.get("source") == market_calc.SOURCE_CBOE_FALLBACK or values.get("provisional") is True)
 
     def gap(self, view: _View, *, short: bool = False) -> str:
         """不顯示數字時的那格：過期（資料日 X/X）或暫缺。"""
@@ -562,6 +634,10 @@ def _bubble(
     notes: Sequence[str] = (),
     buttons: Sequence[tuple[str, str]] = (),
 ) -> dict:
+    # 明確 raise（不用 assert：-O 會拿掉）。不截斷：悄悄少一顆按鈕比出錯更難發現；在輪播裡會被 _guarded_bubbles 接住，
+    # 換成固定短卡並記進 render_errors，單張回覆則由 handle() 的最外層接住
+    if len(buttons) > MAX_BUTTONS:
+        raise ValueError(f"a bubble carries at most {MAX_BUTTONS} buttons, got {len(buttons)}")
     header = [_text(title, size="xl", weight="bold")]
     if subtitle:
         header.append(_text(subtitle, size="md", color=GRAY))
@@ -586,8 +662,8 @@ def card_bytes(card: dict) -> int:
     return len(json.dumps(card, ensure_ascii=False).encode("utf-8"))
 
 
-def _flex_reply(card: dict, alt_text: str, *, summary: bool = False) -> Reply:
-    """送出前自己再量一次：超過上限就回固定句（LINE 回 400 整張卡就沒了）。"""
+def _flex_reply(card: dict, alt_text: str, *, summary: bool = False, render_errors: tuple[str, ...] = ()) -> Reply:
+    """送出前自己再量一次：超過上限就回固定句（LINE 回 400 整張卡就沒了）。render_errors 兩種結果都帶著，才不會被藏起來。"""
     bubbles = card["contents"] if card.get("type") == "carousel" else [card]
     if (
         card_bytes(card) > CARD_MAX_BYTES
@@ -596,8 +672,54 @@ def _flex_reply(card: dict, alt_text: str, *, summary: bool = False) -> Reply:
         or (summary and any(card_bytes(b) > SUMMARY_BUBBLE_MAX_BYTES for b in bubbles))
     ):
         logger.error("market dashboard card over budget bytes=%d bubbles=%d", card_bytes(card), len(bubbles))
-        return Reply(text=TEXT_CARD_FAILED)
-    return Reply(flex=card, alt_text=alt_text, fallback_text=TEXT_CARD_FAILED)
+        return Reply(text=TEXT_CARD_FAILED, render_errors=render_errors)
+    return Reply(flex=card, alt_text=alt_text, fallback_text=TEXT_CARD_FAILED, render_errors=render_errors)
+
+
+def _page(index: int, total: int = SUMMARY_CARD_COUNT) -> str:
+    """輪播標題上的頁碼：（i/N）；N 預設是摘要輪播的 SUMMARY_CARD_COUNT。"""
+    return f"（{index}/{total}）"
+
+
+def _failed_bubble(head: str, subtitle: Optional[str] = None) -> dict:
+    """輪播裡某一張出錯時換上的固定短卡：標題用那一張的標題開頭，內文只有一句固定句（第一張照舊帶「往左滑」）。"""
+    return _bubble(head, [_text(TEXT_BUBBLE_FAILED, color=GRAY)], subtitle=subtitle)
+
+
+def _guarded_bubbles(
+    ctx: _Ctx,
+    parts: Sequence[tuple[str, Callable[[_Ctx, str, Optional[str]], dict]]],
+    swipe: Optional[str] = None,
+    *,
+    max_bytes: Optional[int] = None,
+) -> tuple[list[dict], tuple[str, ...]]:
+    """逐泡泡隔離（2026-10-24 審查 r9 s4-F9-1）：每個 builder 各自 try/except，壞的那張換成固定短卡，其他張照送。
+
+    parts＝(標題開頭, builder)；builder(ctx, 標題開頭, 副標) 回一張泡泡，副標只有第一張是 swipe（往左滑還有 N 張），
+    其他是 None。回 (泡泡, 出錯的 builder「名稱:例外型別名」)；訊息不進回覆、也不進 log（只記型別）。
+
+    max_bytes（2026-10-28 批 1 審查 F2-12）：給了就也隔離「太大」——某一張泡泡超過它，只把那一張換成固定短卡、記「名稱:TooLarge」，
+    其他張照送（以前是 _flex_reply 發現任何一張超過就整組換成 TEXT_CARD_FAILED）。只有摘要輪播傳（SUMMARY_BUBBLE_MAX_BYTES）：
+    期權、新聞細節從來沒有單張的上限，最壞值的新聞 1/3 已經 6.3 KB，多加一個上限等於多一種失敗方式。呼叫端傳值、這裡不綁預設，
+    所以測試改模組常數看得到。"""
+    bubbles: list[dict] = []
+    errors: list[str] = []
+    for position, (head, build) in enumerate(parts):
+        subtitle = swipe if position == 0 else None
+        name = getattr(build, "__name__", "builder")
+        try:
+            bubble = build(ctx, head, subtitle)
+        except Exception as exc:
+            errors.append(f"{name}:{type(exc).__name__}")
+            logger.error("market dashboard bubble failed builder=%s error_type=%s", name, type(exc).__name__)
+            bubbles.append(_failed_bubble(head, subtitle))
+            continue
+        if max_bytes is not None and card_bytes(bubble) > max_bytes:
+            errors.append(f"{name}:TooLarge")
+            logger.error("market dashboard bubble too large builder=%s bytes=%d", name, card_bytes(bubble))
+            bubble = _failed_bubble(head, subtitle)
+        bubbles.append(bubble)
+    return bubbles, tuple(errors)
 
 
 # ── 共用的列 ─────────────────────────────────────────────────────────────────
@@ -650,6 +772,77 @@ def _latest_day(views: Sequence[_View]) -> Optional[date]:
     return max(days) if days else None
 
 
+def _progress_day(ctx: _Ctx, key: str) -> Optional[date]:
+    """快照 progress 裡的日期；舊快照沒有這個鍵、型別不對都是 None（＝沒有證據，不加標示）。"""
+    return _day(_dict(ctx.snapshot.get("progress")).get(key))
+
+
+def _progress_flag(ctx: _Ctx, key: str) -> Optional[bool]:
+    return _flag(_dict(ctx.snapshot.get("progress")).get(key))
+
+
+def _with_notice(subtitle: Optional[str], notice: Optional[str]) -> Optional[str]:
+    """副標題：骨架傳進來的（第一張的「往左滑還有 N 張」）和落後／休市標示並存、不互相取代（目前美股是第一張，
+    重點摘要插到前面之後美股拿到 None，就只剩標示）。"""
+    found = [part for part in (subtitle, notice) if part]
+    return "｜".join(found) if found else None
+
+
+def _made_today(ctx: _Ctx) -> bool:
+    """快照是不是「今天」（台北）產生的：休市、『尚未取得』都是『現在』的狀態，job 掛了、隔天才看到同一份快照就不能再寫
+    （2026-10-28 批 1 審查 F2-5：以前只有休市標示檢查這個）。"""
+    made = ctx.generated()
+    return made is not None and made.date() == ctx.today
+
+
+def _waiting_notice(ctx: _Ctx, market: str, shown_day: Optional[date]) -> Optional[str]:
+    """「10/23 收盤資料尚未取得」：publish 說預期的最新場次已經收完、來源還沒給（<market>_waiting_for_source 為 true、
+    <market>_expected_day 是那一天），而且卡上顯示的資料日還沒到那一天（暫定收盤也算顯示了）。沒有證據不寫；
+    快照不是今天做的也不寫（F2-5）。"""
+    if _progress_flag(ctx, f"{market}_waiting_for_source") is not True or not _made_today(ctx):
+        return None
+    expected = _progress_day(ctx, f"{market}_expected_day")
+    if expected is None or (shown_day is not None and shown_day >= expected):
+        return None
+    return TEXT_CLOSE_PENDING.format(md=_md(expected))
+
+
+def _tw_closed_notice(ctx: _Ctx) -> Optional[str]:
+    """「10/23 休市（暫定）」／「10/23 休市」：publish 說今天是預期交易日、日曆卻覆寫成休市（週末與休市表上的假日不會是）。
+    日期是快照產生的那一天（不寫「今天」：卡片留在聊天紀錄裡，隔天再看就變成錯的；F2-3）：job 掛了、隔天看到同一份快照就不寫。
+    覆寫沒有確認（管線推定）→ 暫定。"""
+    if _progress_flag(ctx, "tw_closed_today") is not True or not _made_today(ctx):
+        return None
+    made = ctx.generated()
+    template = TEXT_TW_CLOSED if _progress_flag(ctx, "tw_closed_confirmed") is True else TEXT_TW_CLOSED_TENTATIVE
+    return template.format(md=_md(made.date()))
+
+
+def _us_card_day(ctx: _Ctx) -> Optional[date]:
+    """美股卡標題的資料日（三檔 ETF 新鮮的列裡最新的）；重點摘要 footer 的『尚未取得』與美股卡副標用同一個（F2-4）。"""
+    return _latest_day([ctx.row(f"us.etf.{sym}") for sym in US_ETFS])
+
+
+def _tw_card_day(ctx: _Ctx) -> Optional[date]:
+    """台股卡標題的資料日：加權新鮮就用它，否則看 0050。"""
+    taiex = ctx.row("tw.taiex")
+    return taiex.data_date if taiex.fresh and taiex.data_date else _latest_day([ctx.row("tw.etf.0050")])
+
+
+def _us_notice(ctx: _Ctx) -> Optional[str]:
+    return _waiting_notice(ctx, "us", _us_card_day(ctx))
+
+
+def _tw_notice(ctx: _Ctx) -> Optional[str]:
+    """休市（有證據、已確認或暫定）優先於『尚未取得』。"""
+    return _tw_closed_notice(ctx) or _waiting_notice(ctx, "tw", _tw_card_day(ctx))
+
+
+def _rsi_shown(view: _View) -> bool:
+    """細節卡（_tech_rows）有沒有印 RSI14 那一列。"""
+    return view.fresh and _num(view.values.get("rsi14"), 0, 100) is not None
+
+
 def _etf_line(ctx: _Ctx, view: _View, name: str, main_day: Optional[date]) -> tuple[str, str]:
     if not view.fresh:
         return _fit(f"{name}{ctx.gap(view)}", f"{name}{ctx.gap(view, short=True)}"), GRAY
@@ -661,11 +854,14 @@ def _etf_line(ctx: _Ctx, view: _View, name: str, main_day: Optional[date]) -> tu
     close_text = _price(close) if close is not None else "收盤暫缺"
     change_text = f" {_pct(change, 2)}" if change is not None else ""
     status_text = f" {status}" if status else ""
+    rsi = _num(values.get("rsi14"), 0, 100)  # 窗口有缺口算不出來就是 None：不寫
+    rsi_text = f" RSI {rsi:.0f}" if rsi is not None else ""
     suffix = _date_suffix(view.data_date, main_day)
     tag = market_calc.TEXT_PROVISIONAL if view.provisional else ""  # 暫定的收盤每個寫法都要標，不能被 _fit 拿掉
-    # 放不下時先拿掉漲跌、再拿掉月線狀態，最後才拿掉日期：這一列比標題舊卻沒寫日期，就看不出落後
-    # （2026-10-24 審查 r9b gp1：加了暫定標籤後 VOO 第一個寫法就超寬，日期總是先被擠掉）
+    # 放不下時先拿掉 RSI（2026-10-24 第 9 輪 A18：RSI 是第一個被拿掉的）、再拿掉漲跌、再拿掉月線狀態，最後才拿掉日期：
+    # 這一列比標題舊卻沒寫日期，就看不出落後（審查 r9b gp1：加了暫定標籤後 VOO 第一個寫法就超寬，日期總是先被擠掉）
     text = _fit(
+        f"{name}{close_text}{change_text}{status_text}{rsi_text}{tag}{suffix}",
         f"{name}{close_text}{change_text}{status_text}{tag}{suffix}",
         f"{name}{close_text}{status_text}{tag}{suffix}",
         f"{name}{close_text}{tag}{suffix}",
@@ -712,10 +908,15 @@ def _contra_sentences(ctx: _Ctx, row_id: str) -> list[str]:
 
 
 def _note_line(ctx: _Ctx, contra_id: str, oneliner_id: str) -> Optional[tuple[str, str]]:
-    """矛盾優先（橘），否則一句話（灰）；每張卡最多 1 列，太寬或有術語的不放摘要卡。"""
+    """矛盾優先（橘），否則一句話（灰）；每張卡最多 1 列，太寬或有術語的不放摘要卡。
+
+    矛盾句是用暫定收盤算的（矛盾列 values.provisional，2026-10-24 第 9 輪 A27）→ 句尾加「（暫定）」；加了超過 24 字寬就
+    不加，由呼叫端改在 notes 放固定句（TEXT_PROVISIONAL_CLOSE）。一句話（oneliner）不在這裡標：它只看 VOO，標不標、標在句尾還是
+    改放 notes，由美股卡 _card_us 依 VOO 自己的暫定狀態決定（2026-10-28 批 1 審查 F2-9）。"""
+    tag = market_calc.TEXT_PROVISIONAL if ctx.row(contra_id).provisional else ""
     for sentence in _contra_sentences(ctx, contra_id):
         if row_width(sentence) <= MAX_ROW_WIDTH and not any(word in sentence for word in _SUMMARY_JARGON):
-            return sentence, ORANGE
+            return (sentence + tag if row_width(sentence + tag) <= MAX_ROW_WIDTH else sentence), ORANGE
     one = ctx.row(oneliner_id)
     if one.fresh:
         text = ctx.note(one.values.get("text"), 40)
@@ -745,9 +946,10 @@ def _title(name: str, day: Optional[date], suffix: str = "收盤", views: Sequen
 
 
 # ── ① 美股 ──────────────────────────────────────────────────────────────────
-def _card_us(ctx: _Ctx) -> dict:
+def _card_us(ctx: _Ctx, head: str, subtitle: Optional[str] = None) -> dict:
+    """head＝卡名＋頁碼（SUMMARY_CARDS 照位置算好），subtitle＝第一張才有的「往左滑還有 N 張」。"""
     etfs = {sym: ctx.row(f"us.etf.{sym}") for sym in US_ETFS}
-    main_day = _latest_day(list(etfs.values()))
+    main_day = _us_card_day(ctx)
     rows = [_etf_line(ctx, etfs[sym], _US_NAMES[sym], main_day) for sym in US_ETFS]
 
     parts, days = [], []
@@ -787,33 +989,59 @@ def _card_us(ctx: _Ctx) -> dict:
                       f"量能：{short_joined}"), GRAY))
 
     extra = _note_line(ctx, "contra.us", "oneliner.us")
+    notes = []
+    if extra and extra[1] == ORANGE and ctx.row("contra.us").provisional and not extra[0].endswith(market_calc.TEXT_PROVISIONAL):
+        notes.append(market_calc.TEXT_PROVISIONAL_CLOSE)  # 矛盾句放不下「（暫定）」：改用固定句說明
+    elif extra and extra[1] == GRAY and etfs["VOO"].provisional:
+        # 一句話（oneliner.us）只看 VOO：VOO 的收盤是暫定值時它也要標（2026-10-28 批 1 審查 F2-9；以前只有矛盾句會標）。
+        # 句尾放得下「（暫定）」就加，放不下改用 footer 的固定句——和矛盾句同一個作法
+        tagged = extra[0] + market_calc.TEXT_PROVISIONAL
+        if row_width(tagged) <= MAX_ROW_WIDTH:
+            extra = (tagged, extra[1])
+        else:
+            notes.append(market_calc.TEXT_PROVISIONAL_CLOSE)
     if extra:
         rows.append(extra)
-    notes = []
     progress = ctx.progress()
     if progress:
         notes.append("美股" + market_calc.TEXT_BOOTSTRAP.format(done=progress[0], total=progress[1]))
     return _summary_bubble(
-        _title("美股（1/4）", main_day, views=list(etfs.values())),
+        _title(head, main_day, views=list(etfs.values())),
         rows,
-        subtitle=TEXT_SWIPE,
+        # 2026-10-24 第 9 輪 A19：美股預期的最新場次已收完、來源還沒給 → 副標寫「10/23 收盤資料尚未取得」（不塞標題：會換行）
+        subtitle=_with_notice(subtitle, _waiting_notice(ctx, "us", main_day)),
         notes=notes,
         buttons=(("標普500 細節", "/盤勢 VOO"), ("那斯達克 細節", "/盤勢 QQQ"), ("半導體 細節", "/盤勢 SOXX")),
     )
 
 
 # ── ② 台股 ──────────────────────────────────────────────────────────────────
-def _taiex_line(ctx: _Ctx, view: _View) -> tuple[str, str]:
+def _taiex_line(ctx: _Ctx, view: _View, main_day: Optional[date] = None, *, with_rsi: bool = True) -> tuple[str, str]:
+    """加權指數那一列。main_day＝這張卡標題的資料日：和它不同天就在列尾補日期（0050 細節卡的標題是 0050 的資料日，
+    加權比它新時要寫出加權是哪一天；摘要卡的標題就是加權的日期，不傳）。with_rsi＝False：細節卡這一列原本就沒有 RSI。
+
+    放不下時先拿掉 RSI，再拿掉月線狀態，日期最後才拿掉（2026-10-24 第 9 輪 A18、A20）。"""
     name = "加權指數"
     if not view.fresh:
         return f"{name} {ctx.gap(view)}", GRAY
     close = _num(view.values.get("close"), 0)
     change = _num(view.values.get("chg_pct"), -100, 1000)
     above = _flag(view.values.get("above_ma20"))
+    rsi = _num(view.values.get("rsi14"), 0, 100) if with_rsi else None
     close_text = _price(close) if close is not None else "收盤暫缺"
     change_text = f"（{_pct(change, 2)}）" if change is not None else ""
     status = _above_word(above)
-    text = _fit(f"{name} {close_text}{change_text}{' ' + status if status else ''}", f"{name} {close_text}{change_text}")
+    status_text = f" {status}" if status else ""
+    rsi_text = f" RSI {rsi:.0f}" if rsi is not None else ""
+    suffix = _date_suffix(view.data_date, main_day)
+    base = f"{name} {close_text}{change_text}"
+    text = _fit(
+        f"{base}{status_text}{rsi_text}{suffix}",
+        f"{base}{status_text}{suffix}",
+        f"{base}{suffix}",
+        f"{base}{status_text}",
+        base,
+    )
     return text, _above_color(above)
 
 
@@ -851,10 +1079,10 @@ def _inst_line(ctx: _Ctx, view: _View, main_day: Optional[date]) -> str:
     return _fit(base + _date_suffix(view.data_date, main_day), base)
 
 
-def _card_tw(ctx: _Ctx) -> dict:
+def _card_tw(ctx: _Ctx, head: str, subtitle: Optional[str] = None) -> dict:
     taiex = ctx.row("tw.taiex")
     etf = ctx.row("tw.etf.0050")
-    main_day = taiex.data_date if taiex.fresh and taiex.data_date else _latest_day([etf])
+    main_day = _tw_card_day(ctx)
     rows = [_taiex_line(ctx, taiex), _etf_line(ctx, etf, "台灣50（0050）", main_day)]
     breadth = ctx.row("tw.breadth.0050")
     if breadth.fresh:
@@ -876,9 +1104,13 @@ def _card_tw(ctx: _Ctx) -> dict:
     extra = _note_line(ctx, "contra.tw", "oneliner.tw")
     if extra:
         rows.append(extra)
+    # 2026-10-24 第 9 輪 A19：今天是預期交易日卻被覆寫成休市 → 「10/23 休市（暫定）」／「10/23 休市」；否則最新場次已收完、
+    # 加權還沒給 → 「10/23 收盤資料尚未取得」。沒有證據（舊快照、旗標不是 true）什麼都不加
+    notice = _tw_notice(ctx)
     return _summary_bubble(
-        _title("台股（2/4）", main_day, views=[taiex, etf]),
+        _title(head, main_day, views=[taiex, etf]),
         rows,
+        subtitle=_with_notice(subtitle, notice),
         buttons=(("台股細節", "/盤勢 0050"), ("台指期權圖", "/盤勢 台指 圖")),
     )
 
@@ -905,16 +1137,71 @@ def _vix_line(ctx: _Ctx, view: _View) -> tuple[str, str]:
     )
 
 
-def _wall_line(ctx: _Ctx, view: _View, kind: str) -> tuple[str, str]:
-    name = f"那斯達克（QQQ）{'買權牆' if kind == 'call' else '賣權牆'}"
+# 期權牆（摘要列與細節卡共用）。牆距的基準由 job 決定（values 的 dist_basis／ref_close，2026-10-24 第 9 輪 I1）
+_WALL_KINDS = (("call", "買權牆"), ("put", "賣權牆"))
+_WALL_PRICE_WORD = {market_calc.DIST_CLOSE: "收盤", market_calc.DIST_SPOT: "最新價"}
+
+
+def _wall_basis(values: dict) -> tuple[str, Optional[float]]:
+    """牆距的基準與那個價格：job 寫 close 而且 ref_close 是正數 → (close, 收盤)；其他一律 (spot, 現價)——spot、舊快照沒有這
+    兩個欄位（舊 job 的牆距就是對現價算的）、型別不對、說是收盤卻沒有收盤價、不認得的詞。印出來的價格與 footer 的註記都由這裡來，
+    不會出現「價格印收盤、註記寫最新價」。"""
+    ref = _num(values.get("ref_close"), 0)
+    if values.get("dist_basis") == market_calc.DIST_CLOSE and ref is not None and ref > 0:
+        return market_calc.DIST_CLOSE, ref
+    return market_calc.DIST_SPOT, _num(values.get("spot"), 0)
+
+
+def _wall_notes(ctx: _Ctx, symbols: Sequence[str], *, named: bool = False) -> list[str]:
+    """footer 的牆距註記：列出的各檔（新鮮、牆算得出來）基準全是收盤→「牆距以收盤價計」，全是最新價→「牆距以最新價計」；
+    一檔都沒有牆距可看就不寫。基準混著時：期權細節卡（每檔標題列都印了「收盤 X」或「最新價 X」）用合併的一句 MIXED；摘要卡
+    （named＝True，牆那幾列不印價格）直接點名各檔，例「牆距：QQQ 以收盤價、SOXX 以最新價計」。"""
+    bases: dict[str, str] = {}
+    for symbol in symbols:
+        view = ctx.row(f"us.options.{symbol}")
+        if view.fresh and view.values.get("wall_status") == market_calc.STATUS_OK:
+            bases[symbol] = _wall_basis(view.values)[0]
+    kinds = set(bases.values())
+    if len(kinds) > 1:
+        if named:
+            pairs = "、".join(f"{symbol} 以{market_calc.WALL_DIST_WORD[basis]}" for symbol, basis in bases.items())
+            return [market_calc.TEXT_WALL_DIST_NAMED.format(pairs=pairs)]
+        return [TEXT_WALL_DIST_MIXED]
+    return [market_calc.WALL_DIST_TEXT[basis] for basis in kinds]
+
+
+def _walls_line(ctx: _Ctx, view: _View, sym: str, main_day: Optional[date]) -> tuple[str, str]:
+    """一檔的買權牆、賣權牆併成一列（2026-10-24 第 9 輪 A15，審查 r9 s2-N11、s3-F12）：用代號開頭——那斯達克100／半導體的
+    中文名放不下四位數牆價。變體由長到短：完整（牆價＋距離）→ 拿掉距離 → 只留較近的那道牆（不帶距離）；資料日和標題不同就接
+    在後面，只有最後一個變體才拿掉日期。這一列不印基準價，基準寫在 footer（_wall_notes）。"""
+    name = f"{sym} 買權牆、賣權牆"
     if not view.fresh:
         return f"{name}{ctx.gap(view)}", GRAY
-    wall = _num(view.values.get(f"{kind}_wall"), 0)
-    if view.values.get("wall_status") != market_calc.STATUS_OK or wall is None:
+    values = view.values
+    walls = {kind: (_num(values.get(f"{kind}_wall"), 0), _num(values.get(f"{kind}_wall_dist_pct"), -100, 1000))
+             for kind, _word in _WALL_KINDS}
+    if values.get("wall_status") != market_calc.STATUS_OK or all(wall is None for wall, _dist in walls.values()):
         return f"{name}：{TEXT_INSUFFICIENT}", GRAY
-    dist = _num(view.values.get(f"{kind}_wall_dist_pct"), -100, 1000)
-    dist_text = f"（距現價 {_pct(dist)}）" if dist is not None else ""
-    return _fit(f"{name} {_price(wall)}{dist_text}", f"{name} {_price(wall)}"), GRAY
+    words = dict(_WALL_KINDS)
+
+    def part(kind: str, with_dist: bool, spaced: bool = True) -> str:
+        wall, dist = walls[kind]
+        if wall is None:
+            return f"{words[kind]}暫缺"
+        return f"{words[kind]}{' ' if spaced else ''}{_price(wall)}" + (f"（{_pct(dist)}）" if with_dist and dist is not None else "")
+
+    def both(with_dist: bool, spaced: bool = True) -> str:
+        return f"{sym} {part('call', with_dist, spaced)}、{part('put', with_dist, spaced)}"
+
+    # 較近的那道牆：距離（絕對值）小的；沒有距離的排後面；一樣近取買權牆（_WALL_KINDS 的順序）
+    present = [kind for kind, _word in _WALL_KINDS if walls[kind][0] is not None]
+    nearer = min(present, key=lambda kind: abs(walls[kind][1]) if walls[kind][1] is not None else math.inf)
+    only = f"{sym} {part(nearer, False)}"
+    suffix = _date_suffix(view.data_date, main_day)
+    # 新增的第二個變體（2026-10-28 批 1 審查 F2-10）：牆價前面不留空格（「買權牆262.5（+4.9%）」），每道牆省 0.5 個字寬、兩道省 1.0——
+    # SOXX 常見的半美元履約價（262.5／237.5）完整寫法 24.5 放不下、只剩牆價；省掉空格後 23.5 放得下，距離留得住。
+    # 不用「買／賣」縮寫：單獨一個「買 262.5」讀起來像買賣建議
+    return _fit(both(True) + suffix, both(True, False) + suffix, both(False) + suffix, only + suffix, only), GRAY
 
 
 def _txo_line(ctx: _Ctx, view: _View, main_day: Optional[date]) -> tuple[str, str]:
@@ -971,23 +1258,25 @@ def _margin_line(ctx: _Ctx, main_day: Optional[date]) -> tuple[str, str]:
     ), GRAY
 
 
-def _card_flow(ctx: _Ctx) -> dict:
-    vix, qqq = ctx.row("macro.VIX"), ctx.row("us.options.QQQ")
+def _card_flow(ctx: _Ctx, head: str, subtitle: Optional[str] = None) -> dict:
+    vix, qqq, soxx = ctx.row("macro.VIX"), ctx.row("us.options.QQQ"), ctx.row("us.options.SOXX")
     txo, fut = ctx.row("tw.options"), ctx.row("tw.futures")
-    # 美股兩列都沒有日期（過期或暫缺）時，標題改用期交所兩列的日期：每一列都有日期可以對
+    # 美股兩列都沒有日期（過期或暫缺）時，標題改用期交所兩列的日期：每一列都有日期可以對（SOXX 那一列和標題不同天就自己標日期）
     main_day = _latest_day([vix, qqq]) or _latest_day([txo, fut])
     rows = [
         _vix_line(ctx, vix),
-        _wall_line(ctx, qqq, "call"),
-        _wall_line(ctx, qqq, "put"),
+        _walls_line(ctx, qqq, "QQQ", main_day),
+        _walls_line(ctx, soxx, "SOXX", main_day),
         _txo_line(ctx, txo, main_day),
         _futures_line(ctx, fut, main_day),
         _margin_line(ctx, main_day),
     ]
     return _summary_bubble(
-        _title("期權與資金（3/4）", main_day, views=[vix, qqq, txo, fut]),
+        _title(head, main_day, views=[vix, qqq, txo, fut]),
         rows,
-        buttons=(("期權與資金細節", "/盤勢 期權"), ("那斯達克期權圖", "/盤勢 QQQ 圖"), ("台指期權圖", "/盤勢 台指 圖")),
+        subtitle=subtitle,
+        notes=_wall_notes(ctx, ("QQQ", "SOXX"), named=True),
+        buttons=(("期權與資金細節", "/盤勢 期權"), ("那斯達克期權圖", "/盤勢 QQQ 圖"), ("半導體期權圖", "/盤勢 SOXX 圖")),
     )
 
 
@@ -1005,6 +1294,7 @@ _MACRO = {
     "VIX": ("恐慌指數", "VIX"),
     "VIX3M": ("3 個月恐慌指數", "VIX3M"),
     "MOVE": ("美債波動指數", "MOVE"),
+    "VXTLT": ("TLT 選擇權波動", "VXTLT"),  # 獨立的一列，不是 MOVE 的代理（約 15 對約 100，量綱不同）；MOVE 恢復時並列
     "RUT": ("羅素 2000", "RUT"),
     "DJI": ("道瓊", "DJI"),
     "IXIC": ("那斯達克綜合", "IXIC"),
@@ -1052,9 +1342,11 @@ def _macro_value(key: str, values: dict, *, terse: bool = False) -> Optional[str
     if value is None:
         return None
     if key in _YIELDS:
-        return f"{value:.2f}%"
+        return _plain_pct(value, 2)
     if key == "SPY_DD":
         return _pct(value)
+    if key == "VXTLT":  # 一位小數（15.09 → 15.1），和旁邊 MOVE 那一行（98.5）同一種寫法
+        return f"{value:.1f}"
     return _price(value)
 
 
@@ -1142,7 +1434,7 @@ def _events(ctx: _Ctx) -> list[tuple[str, datetime, bool]]:
     if not view.fresh:
         return []
     found = []
-    for item in _list(view.values.get("items"), EVENTS_MAX * 3):
+    for item in _list(view.values.get("items"), EVENTS_SCAN_MAX):
         if not isinstance(item, dict):
             continue
         moment = _moment(item.get("at"))
@@ -1318,7 +1610,7 @@ def _trump_line(ctx: _Ctx) -> tuple[str, str]:
     return _fit(*variants), GRAY
 
 
-def _card_macro(ctx: _Ctx) -> dict:
+def _card_macro(ctx: _Ctx, head: str, subtitle: Optional[str] = None) -> dict:
     rows = [
         _yield_line(ctx),
         _macro_pair_line(ctx, "DXY", "WTI"),
@@ -1330,18 +1622,358 @@ def _card_macro(ctx: _Ctx) -> dict:
         rows.append(election)
     rows.append(_trump_line(ctx))
     made = ctx.generated()
-    title = f"宏觀與事件（4/4）｜{_md(made.date())} {made:%H:%M} 更新" if made else "宏觀與事件（4/4）｜資料暫缺"
+    title = f"{head}｜{_md(made.date())} {made:%H:%M} 更新" if made else f"{head}｜資料暫缺"
     return _summary_bubble(
         title,
         rows,
-        notes=(TEXT_MM,),
+        subtitle=subtitle,
+        notes=_taco_summary_notes(ctx),
         buttons=(("新聞與宏觀", "/盤勢 新聞"), ("季節性", "/盤勢 季節性"), ("期中選舉", "/盤勢 選舉")),
+    )
+
+
+# ── ⓪ 重點摘要（輪播第一張） ────────────────────────────────────────────────────
+# Andrew 2026-10-24：「回摘要＝/盤勢 就拿掉，我希望看到真正的摘要」（第 9 輪 A9；審查 r9 s2-二-A／N2–N4、s3-F7／F15、s4-F14）。
+# 恰好 6 列：美股、台股、風險、利率、事件、川普，每列 ≤24 個中文字寬。只讀其他泡泡已經在用的快照列、不新增資料來源；
+# 每列各自降級（fresh／stale／missing），一列沒資料不影響其他列。每一列是獨立的函式 f(ctx) → (文字, 顏色)：第 4 列
+# 批 2 會換成通膨狀態句（_digest_rate_row）、第 6 列 TACO 軌會在 _digest_trump_row 加優先的變體。
+#
+# 日期：列內只在「這一列的資料日比預期的最新場次舊」時才帶日期（放前面，「美股 10/21：…」），放不下先拿掉次要成分、不丟日期；
+# 第 1、2 列（A9）、第 3、4、6 列（2026-10-28 批 1 審查 F2-1）都是這個規則，用同一個 _digest_stamp。
+# footer 另有一行不受寬度限制的「資料日：…」。bot 不帶交易日曆，所以「預期的最新場次」＝publisher 寫在 progress 的
+# us_day／tw_day（第 9 輪 A19 加的欄位；舊快照沒有就不用），沒有就取同一個市場裡其他列已經有的最新資料日（見
+# _digest_expected_day）。不從星期幾推：每個國定假日都會變成假的落後。
+DIGEST_US_NAMES = (("VOO", "標普"), ("QQQ", "那指"), ("SOXX", "半導體"))  # 摘要列用最短的中文名（細節卡才用全名）
+_UP, _DOWN = "up", "down"  # 第 1 列裡一檔 ETF 在月線上／下（過期、暫缺沿用 STALE、MISSING）
+_DIGEST_MA = {_UP: "月線上", _DOWN: "月線下"}
+# 「預期的最新場次」的證據：同一個市場裡這些列的最新資料日。它們都是收盤後才收進來的（collect 只存已經收盤的場次：
+# VIX 與期權鏈要 data_day ≥ D 而且檔案在收盤＋15 分之後，10 年債不晚於 D），資料日不會是盤中的今天
+_DIGEST_US_EVIDENCE = (
+    *(f"us.etf.{sym}" for sym in US_ETFS),
+    *(f"us.options.{sym}" for sym in ("QQQ", "SPY", "SOXX")),
+    "macro.VIX",
+    "macro.UST10Y",
+)
+_DIGEST_TW_EVIDENCE = ("tw.taiex", "tw.inst3", "tw.etf.0050", "tw.turnover", "tw.ad")
+
+
+def _digest_expected_day(ctx: _Ctx, key: str, rows: Sequence[str]) -> Optional[date]:
+    """預期的最新場次：progress.<key>（us_expected_day／tw_expected_day，A2 寫的；us_day／tw_day 是「目前資料到哪天」，不能拿來比）
+    有合法日期就用它，否則取 rows 裡新鮮的列的最新資料日。
+
+    例：美股 ETF 10/21、VIX 與 10 年債 10/22 → 預期 10/22，ETF 落後一個場次。所有列一樣落後時偵測不到，那種情形只有
+    footer 的「資料日」看得出來。"""
+    stated = _day(_dict(ctx.snapshot.get("progress")).get(key))
+    return stated if stated is not None else _latest_day([ctx.row(row_id) for row_id in rows])
+
+
+def _digest_stamp(days: Sequence[Optional[date]], expected: Optional[date]) -> str:
+    """列內的日期標示 " 10/21"（放在列名後面，沒有就是空字串）：這一列用到的資料裡最舊的那個資料日比預期的最新場次舊才寫。
+    寫舊不寫新（一列裡有新有舊時，讀的人看到的日期不會比最舊的資料更新）；沒有日期、不知道預期場次都不寫。"""
+    known = [day for day in days if day is not None]
+    if not known or expected is None:
+        return ""
+    oldest = min(known)
+    return f" {_md(oldest)}" if oldest < expected else ""
+
+
+def _digest_etf_state(view: _View) -> str:
+    """第 1 列裡一檔 ETF 的狀態：_UP／_DOWN＝收盤在月線上／下，STALE＝過期，MISSING＝沒資料（或有資料但月線狀態缺）。"""
+    if view.status == STALE:
+        return STALE
+    above = _flag(view.values.get("above_ma20")) if view.fresh else None
+    return MISSING if above is None else _UP if above else _DOWN
+
+
+def _digest_us_row(ctx: _Ctx) -> tuple[str, str]:
+    """第 1 列：美股。三檔 ETF 依月線分組——「美股：標普在月線上，那指、半導體在月線下」；三檔同向點名三檔，寫「標普、那指、
+    半導體都在月線上」（F2-8；以前是「三檔都在月線上」）；過期、暫缺的排最後（「…，半導體暫缺」），三檔都過期寫「三檔都過期
+    （資料日 10/16）」、三檔都暫缺寫「三檔都暫缺」。最舊的那檔資料日比預期的最新場次舊時，日期放在「美股」後面。
+
+    寫法的順序（第一個 ≤24 的）：完整 → 「在月線上」縮成「月線上」→ 拿掉過期／暫缺那幾組 → 兩者並用；日期一直留著。
+    列上有月線狀態的那幾檔裡有 CBOE 暫定收盤時，選定的寫法放得下（≤24）就在列名（和日期）後面加「（暫定）」——「美股（暫定）：…」
+    「美股 10/15（暫定）：…」；放不下不加（footer 有固定句）。帶日期時標籤緊貼那個日期，所以只有那天真的有暫定收盤才加。"""
+    views = {sym: ctx.row(f"us.etf.{sym}") for sym in US_ETFS}
+    states = {sym: _digest_etf_state(view) for sym, view in views.items()}
+    days = [views[sym].data_date for sym, state in states.items() if state in _DIGEST_MA and views[sym].data_date]
+    expected = _digest_expected_day(ctx, "us_expected_day", _DIGEST_US_EVIDENCE)
+    stamp = _digest_stamp(days, expected)
+    groups: list[tuple[str, str]] = []
+    for state in (_UP, _DOWN, STALE, MISSING):
+        names = [name for sym, name in DIGEST_US_NAMES if states[sym] == state]
+        if not names:
+            continue
+        if len(names) < len(DIGEST_US_NAMES):
+            who = "、".join(names)
+        elif state in _DIGEST_MA:  # 三檔同向：點名三檔（F2-8；以前寫「三檔都在月線上」，沒說是哪三檔，混合時卻會點名）
+            who = "、".join(names) + TEXT_DIGEST_EACH
+        else:
+            who = TEXT_DIGEST_ALL_THREE
+        groups.append((state, who))
+    # 三檔都過期：寫最舊的資料日（F2-8；其他列過期都有「資料日 M/D」）。只有部分過期時不寫（那一檔的日期在 footer 看不到，
+    # 但寫了會讓這一列太擠；和以前一樣）
+    stale_days = [views[sym].data_date for sym in US_ETFS if states[sym] == STALE and views[sym].data_date]
+    all_stale = all(state == STALE for state in states.values())
+    stale_word = (market_calc.TEXT_STALE.format(md=_md(min(stale_days))) if all_stale and stale_days
+                  else TEXT_DIGEST_STALE)
+
+    def clauses(short: bool, gaps: bool) -> str:
+        parts = []
+        for state, who in groups:
+            if state in _DIGEST_MA:
+                parts.append(f"{who}{'' if short else '在'}{_DIGEST_MA[state]}")
+            elif gaps:
+                parts.append(f"{who}{stale_word if state == STALE else TEXT_MISSING}")
+        return "，".join(parts)
+
+    label = f"美股{stamp}"
+    head = f"{label}："
+    bodies = (clauses(False, True), clauses(True, True), clauses(False, False), clauses(True, False))
+    everyone = set(states.values())
+    color = BLUE if everyone == {_UP} else ORANGE if everyone == {_DOWN} else GRAY
+    text = _fit(*(head + body for body in bodies if body))
+    # 列上有數字（月線狀態）的那幾檔裡有 CBOE 暫定收盤：放得下就把「（暫定）」放在列名（和日期）後面、冒號前面，放不下由 footer
+    # 的固定句說明（F2-8）。結論用到了暫定收盤，所以標整列；以前接在列尾，只有部分暫定時看起來像只屬於最後一組，也可能接在
+    # 「暫缺／過期」後面（第 2 輪複審 seat4 R2-I1、gp1 I-2）。字和接在列尾時一樣，放不放得下的判斷不變。
+    # 帶日期時「（暫定）」緊貼那個日期，讀起來是「那天的收盤是暫定的」：只有那天（最舊的資料日）真的有暫定收盤才加。每個交易日
+    # 收盤後都有一段 VOO 10/15 正式、QQQ／SOXX 10/16 暫定的時間，那時不加，由 footer 的固定句說明（第 3 輪複審 r3-A I-1）
+    provisional_days = {views[sym].data_date for sym in US_ETFS if states[sym] in _DIGEST_MA and views[sym].provisional}
+    if provisional_days and (not stamp or min(days) in provisional_days) and text.startswith(head):
+        tagged = f"{label}{market_calc.TEXT_PROVISIONAL}：{text[len(head):]}"
+        if row_width(tagged) <= MAX_ROW_WIDTH:
+            text = tagged
+    return text, color
+
+
+def _digest_taiex_facts(view: _View) -> tuple[Optional[float], Optional[bool]]:
+    """加權的 (日漲跌幅 %, 收盤在月線上嗎)；過期、暫缺、型別不對都是 None。"""
+    if not view.fresh:
+        return None, None
+    return _num(view.values.get("chg_pct"), -100, 1000), _flag(view.values.get("above_ma20"))
+
+
+def _digest_tw_row(ctx: _Ctx) -> tuple[str, str]:
+    """第 2 列：台股。「台股：加權 -1.81% 月線下，外資賣超 816.6 億」；外資的寫法和金額都用台股卡同一組（_inst_part、
+    _amount_yi：持平、≥1000 億不帶小數）。外資只在它和加權是同一個資料日時才放（不把昨天的外資放在今天的加權後面）；
+    放不下先丟外資、不丟日期。"""
+    taiex, inst = ctx.row("tw.taiex"), ctx.row("tw.inst3")
+    change, above = _digest_taiex_facts(taiex)
+    day = taiex.data_date if taiex.fresh else inst.data_date if inst.fresh else None
+    expected = _digest_expected_day(ctx, "tw_expected_day", _DIGEST_TW_EVIDENCE)
+    stamp = _digest_stamp([day], expected)
+    if taiex.fresh:
+        bits = [_pct(change, 2)] if change is not None else []
+        if above is not None:
+            bits.append(_DIGEST_MA[_UP if above else _DOWN])
+        indexes = [" ".join(("加權", *bits)) if bits else f"加權{TEXT_MISSING}"]
+    else:
+        indexes = [f"加權{ctx.gap(taiex)}", f"加權{ctx.gap(taiex, short=True)}"]
+    foreign: Optional[str] = None
+    if not inst.fresh:
+        foreign = f"外資{ctx.gap(inst, short=True)}"
+    elif not taiex.fresh or inst.data_date == taiex.data_date:
+        foreign = _inst_part("外資", _num(inst.values.get("foreign_yi"), -1e7, 1e7))
+    head = f"台股{stamp}："
+    variants = [f"{head}{index}，{foreign}" for index in indexes] if foreign else []
+    variants += [f"{head}{index}" for index in indexes]
+    return _fit(*variants), _above_color(above)
+
+
+def _digest_vix_value(view: _View) -> Optional[float]:
+    return _num(view.values.get("value"), 0, 1000) if view.fresh else None
+
+
+_DIGEST_WALL_SYMBOLS = ("QQQ", "SOXX")  # 第 3 列的牆：兩檔取較近的一道（F2-7；以前只看 QQQ，SOXX 離牆 0.4% 時摘要看不到）
+
+
+def _digest_wall_part(ctx: _Ctx) -> Optional[tuple[str, str, Optional[date]]]:
+    """(「QQQ 賣權牆距 -0.6%」, 代號, 那一檔期權列的資料日)：QQQ、SOXX 的牆離基準價不到 1% 才寫（太遠的牆不是這一列的事），
+    兩檔四道牆取最近的一道並帶代號。讀期權列已經發布的 *_wall_dist_pct，不自己用牆價和現價重算（距離的基準由 publisher 決定）；
+    「不到 1%」在顯示的一位小數上判（_half_up，和印出來的字同一個進位：0.95 印成 +1.0%，就不算不到 1%）；保留正負，價格已經穿牆時
+    看得出來。一樣近：賣權牆先、QQQ 先。"""
+    near = []
+    for symbol_order, symbol in enumerate(_DIGEST_WALL_SYMBOLS):
+        options = ctx.row(f"us.options.{symbol}")
+        if not options.fresh or options.values.get("wall_status") != market_calc.STATUS_OK:
+            continue
+        for order, (kind, name) in enumerate((("put", "賣權牆"), ("call", "買權牆"))):
+            wall = _num(options.values.get(f"{kind}_wall"), 0)
+            dist = _num(options.values.get(f"{kind}_wall_dist_pct"), -100, 1000)
+            if wall is not None and dist is not None and abs(_half_up(dist, 1)) < 1:
+                near.append((abs(_half_up(dist, 1)), order, symbol_order, f"{symbol} {name}距 {_pct(dist, 1)}", symbol,
+                             options.data_date))
+    if not near:
+        return None
+    _gap, _order, _symbol_order, text, symbol, day = min(near, key=lambda entry: entry[:3])
+    return text, symbol, day
+
+
+def _digest_risk(ctx: _Ctx) -> tuple[str, str, Optional[str]]:
+    """第 3 列的 (文字, 顏色, 寫進這一列的牆的代號或 None)；footer 的『期權 M/D』與牆距基準句靠第三個值知道是哪一檔。"""
+    vix = ctx.row("macro.VIX")
+    wall = _digest_wall_part(ctx)
+    value = _digest_vix_value(vix)
+    color = GRAY
+    if value is not None:
+        vixes = [f"VIX {value:.1f} {_vix_word(value)}"]
+        color = BLUE if value < VIX_CALM_BELOW else ORANGE
+    elif vix.fresh:
+        vixes = [f"VIX {TEXT_MISSING}"]
+    else:
+        vixes = [f"VIX {ctx.gap(vix)}", f"VIX {ctx.gap(vix, short=True)}"]
+    # 日期標示（F2-1）：這個寫法裡有數字的資料（VIX、牆）最舊的資料日比預期的最新場次舊就寫在「風險」後面；先丟的是牆
+    # （次要成分），日期一直留著。過期的 VIX 自己已經寫了資料日，不另外算
+    expected = _digest_expected_day(ctx, "us_expected_day", _DIGEST_US_EVIDENCE)
+    vix_day = vix.data_date if value is not None else None
+    variants = []
+    if wall is not None:
+        stamp = _digest_stamp([vix_day, wall[2]], expected)
+        variants += [f"風險{stamp}：{text}，{wall[0]}" for text in vixes]
+    stamp = _digest_stamp([vix_day], expected)
+    variants += [f"風險{stamp}：{text}" for text in vixes]
+    text = _fit(*variants)
+    return text, color, (wall[1] if wall is not None and wall[0] in text else None)
+
+
+def _digest_risk_row(ctx: _Ctx) -> tuple[str, str]:
+    """第 3 列：風險。「風險：VIX 19.0 平穩，QQQ 賣權牆距 -0.6%」——VIX 一位小數，狀態詞是細節卡同一個 _vix_word（看實際值，
+    所以 19.96 會寫成「VIX 20.0 平穩」，和期權卡的「19.96，平穩」一致）；牆距不到 1% 才接在後面（QQQ、SOXX 取較近的一道，
+    F2-7）。資料日落後時日期放在「風險」後面（「風險 10/26：…」）。"""
+    text, color, _wall = _digest_risk(ctx)
+    return text, color
+
+
+def _digest_bp(change: float) -> int:
+    """百分點 → 整數 bp，四捨五入進位（不用銀行家捨入）。殖利率只有兩位小數，所以正常輸入本來就是整數。"""
+    return int((Decimal(repr(change)) * 100).quantize(Decimal(1), rounding=ROUND_HALF_UP))
+
+
+def _digest_ust_value(view: _View) -> Optional[float]:
+    return _num(view.values.get("value"), -20, 100) if view.fresh else None
+
+
+def _digest_rate_row(ctx: _Ctx) -> tuple[str, str]:
+    """第 4 列：利率。「利率：10 年債 4.96%（+3bp）」。現在只有 10 年債；批 2 會在這裡換成通膨狀態句（缺資料時退回這一句），
+    所以獨立成一個函式、不和別列共用。"""
+    view = ctx.row("macro.UST10Y")
+    if not view.fresh:
+        return _fit(f"利率：{TEXT_DIGEST_10Y}{ctx.gap(view)}", f"利率：{TEXT_DIGEST_10Y}{ctx.gap(view, short=True)}"), GRAY
+    value = _digest_ust_value(view)
+    if value is None:
+        return f"利率：{TEXT_DIGEST_10Y}{TEXT_MISSING}", GRAY
+    change = _num(view.values.get("chg"), -50, 50)
+    move = ""
+    if change is not None:
+        bp = _digest_bp(change)
+        move = "（持平）" if bp == 0 else f"（{bp:+d}bp）"
+    # 資料日比預期的最新場次舊 → 「利率 10/23：…」（F2-1）；放不下先丟變動，日期留著
+    stamp = _digest_stamp([view.data_date], _digest_expected_day(ctx, "us_expected_day", _DIGEST_US_EVIDENCE))
+    yield_text = _plain_pct(value, 2)
+    return _fit(f"利率{stamp}：{TEXT_DIGEST_10Y} {yield_text}{move}", f"利率{stamp}：{TEXT_DIGEST_10Y} {yield_text}"), GRAY
+
+
+def _digest_event_row(ctx: _Ctx) -> tuple[str, str]:
+    """第 5 列：事件。「事件：密大消費者信心，今天 22:00」——下一個事件和時間，名稱與倒數用事件細節同一組（_events、
+    _countdown）；名稱先拿掉括號裡的英文，還是放不下（外部來源的名稱可以到 24 字）就寫「下一個事件」，不跳到下下個事件。"""
+    view = ctx.row("events.next")
+    if not view.fresh:
+        return _fit(f"事件：{ctx.gap(view)}", f"事件：{ctx.gap(view, short=True)}"), GRAY
+    events = _events(ctx)
+    if not events:
+        return "事件：近期沒有列入的事件", GRAY
+    name, moment, time_known = events[0]
+    when = _countdown(ctx, moment, time_known)
+    when_short = when.split("（", 1)[0]  # 「還有 3 天（美東日期）」→「還有 3 天」
+    short = name.split("（", 1)[0] if "（" in name and not name.startswith("財報") else name
+    return _fit(
+        f"事件：{short}，{when}",
+        f"事件：{short}，{when_short}",
+        f"事件：{TEXT_DIGEST_NEXT_EVENT}，{when_short}",
+    ), GRAY
+
+
+def _digest_trump_row(ctx: _Ctx) -> tuple[str, str]:
+    """第 6 列：川普。川普壓力指數（MacroMargin）新鮮可用就放它——數字＋任期內位階，和宏觀卡頁尾同一句；否則退回
+    「川普近 48 小時：…」那一列的寫法（2026-10-28 整合 A1×TACO）。矛盾句不放這裡（矛盾句是美股、台股的句型）。"""
+    _view, values = _taco_view(ctx)
+    if values is not None:
+        return _taco_line(ctx), GRAY
+    return _trump_line(ctx)
+
+
+def _digest_notes(ctx: _Ctx) -> list[str]:
+    """footer 的註記（不受 24 寬限制），由上而下：
+    ① 「資料日：美股 10/23、台股 10/22、VIX 10/23、10 年債 10/23、川普壓力指數 10/22」（只列實際有數字的列，照第 1–6 列的順序；
+       美股三檔日期不同寫「美股 10/22 至 10/23」；牆距寫進第 3 列時加「期權 …」，F2-1）；
+    ② 任一檔 ETF 的收盤是 CBOE 暫定值時一句固定說明（看 _View.provisional：source == SOURCE_CBOE_FALLBACK 的相等比較，不看子字串）；
+    ③ 「美股 10/23 收盤資料尚未取得」、「台股 10/23 休市（暫定）」／「台股 10/23 收盤資料尚未取得」——和美股卡、台股卡副標同一套
+       證據與判斷（_us_notice／_tw_notice；有證據才寫，F2-4）；
+    ④ 第 3 列寫了牆距 → 「牆距以收盤價計」（基準句，_wall_notes；F2-4）；
+    ⑤ 第 6 列是川普壓力指數 → 「不是退讓的機率」和來源兩句（F2-2）；第 6 列退回「川普近 48 小時」→ 川普壓力指數的狀態句
+       （過期／暫缺，F2-14：不然摘要上任何地方都看不出指數不見了）。"""
+    etfs = [ctx.row(f"us.etf.{sym}") for sym in US_ETFS]
+    taiex, vix, ust = ctx.row("tw.taiex"), ctx.row("macro.VIX"), ctx.row("macro.UST10Y")
+    parts = []
+    days = [view.data_date for view in etfs if _digest_etf_state(view) in _DIGEST_MA and view.data_date]
+    if days:
+        low, high = min(days), max(days)
+        parts.append(f"美股 {_md(low)}" if low == high else f"美股 {_md(low)} 至 {_md(high)}")
+    if taiex.data_date and any(fact is not None for fact in _digest_taiex_facts(taiex)):
+        parts.append(f"台股 {_md(taiex.data_date)}")
+    if vix.data_date and _digest_vix_value(vix) is not None:
+        parts.append(f"VIX {_md(vix.data_date)}")
+    _risk, _color, wall_symbol = _digest_risk(ctx)
+    if wall_symbol is not None:
+        wall_day = ctx.row(f"us.options.{wall_symbol}").data_date
+        if wall_day:
+            parts.append(f"期權 {_md(wall_day)}")
+    if ust.data_date and _digest_ust_value(ust) is not None:
+        parts.append(f"{TEXT_DIGEST_10Y} {_md(ust.data_date)}")
+    taco, taco_values = _taco_view(ctx)
+    if taco_values is not None and taco.data_date:
+        parts.append(f"{market_calc.TEXT_TACO_NAME} {_md(taco.data_date)}")
+    notes = [f"{TEXT_DIGEST_DATES}：{'、'.join(parts)}"] if parts else []
+    if any(view.fresh and view.provisional for view in etfs):
+        notes.append(market_calc.TEXT_PROVISIONAL_CLOSE)
+    us_notice, tw_notice = _us_notice(ctx), _tw_notice(ctx)
+    if us_notice:
+        notes.append(f"美股 {us_notice}")
+    if tw_notice:
+        notes.append(f"台股 {tw_notice}")
+    if wall_symbol is not None:
+        notes += _wall_notes(ctx, (wall_symbol,))
+    if taco_values is not None:
+        extra = (market_calc.TEXT_TACO_MEANING, market_calc.TEXT_TACO_SOURCE)
+    else:
+        extra = (_taco_line(ctx),)
+    notes += [text for text in (ctx.note(note, TACO_NOTE_MAX) for note in extra) if text]
+    return notes
+
+
+def _card_digest(ctx: _Ctx, head: str, subtitle: Optional[str] = None) -> dict:
+    """head＝卡名＋頁碼（SUMMARY_CARDS 照位置算好），subtitle＝第一張才有的「往左滑還有 N 張」。"""
+    rows = [
+        _digest_us_row(ctx),
+        _digest_tw_row(ctx),
+        _digest_risk_row(ctx),
+        _digest_rate_row(ctx),
+        _digest_event_row(ctx),
+        _digest_trump_row(ctx),
+    ]
+    made = ctx.generated()
+    title = f"{head}｜{_md(made.date())} {made:%H:%M} 更新" if made else f"{head}｜資料暫缺"
+    return _summary_bubble(
+        title,
+        rows,
+        subtitle=subtitle,
+        notes=_digest_notes(ctx),
+        buttons=(("期權與資金細節", "/盤勢 期權"), ("新聞與宏觀", "/盤勢 新聞"), ("台股細節", "/盤勢 0050")),
     )
 
 
 # 一句話（market_calc.one_liner）只有完全符合固定句型時才放進 altText：altText 只能有固定句與數字
 _VOL_PHRASES = "|".join(re.escape(phrase) for phrase in market_calc.VOL_PHRASE.values())  # 同一份：量明顯偏少…爆量
-_ONELINER_US_RE = re.compile(rf"美股收在月線[上下](?:、成分股站上月線 \d{{1,3}}%)?(?:、(?:{_VOL_PHRASES}))?")
+_ONELINER_US_RE = re.compile(rf"標普收在月線[上下](?:、成分股站上月線 \d{{1,3}}%)?(?:、(?:{_VOL_PHRASES}))?")
 _ONELINER_TW_RE = re.compile(rf"台股收在月線[上下](?:、外資[買賣]超 [0-9,]+(?:\.\d)? 億)?(?:、(?:{_VOL_PHRASES}))?")
 
 
@@ -1379,8 +2011,20 @@ def _summary_alt(ctx: _Ctx) -> str:
 
 
 def _summary_reply(ctx: _Ctx) -> Reply:
-    card = _carousel([_card_us(ctx), _card_tw(ctx), _card_flow(ctx), _card_macro(ctx)])
-    return _flex_reply(card, _summary_alt(ctx), summary=True)
+    """摘要輪播：順序、頁碼、第一張的「往左滑」都來自 SUMMARY_CARDS；每一張各自隔離，壞的換成固定短卡、其他照送。"""
+    parts = [
+        (f"{name}{_page(position)}", globals()[builder]) for position, (name, builder) in enumerate(SUMMARY_CARDS, 1)
+    ]
+    bubbles, errors = _guarded_bubbles(ctx, parts, TEXT_SWIPE, max_bytes=SUMMARY_BUBBLE_MAX_BYTES)
+    # altText 也各自隔離（2026-10-28 批 1 審查 F2-11）：它壞了只退回固定句、記進 render_errors，輪播照送；
+    # 以前它出錯會讓整個 /盤勢 回「資料準備中」，把程式出錯說成資料還沒好
+    try:
+        alt = _summary_alt(ctx)
+    except Exception as exc:
+        errors += (f"_summary_alt:{type(exc).__name__}",)
+        logger.error("market dashboard alt text failed error_type=%s", type(exc).__name__)
+        alt = TEXT_SUMMARY_ALT_FALLBACK
+    return _flex_reply(_carousel(bubbles), alt, summary=True, render_errors=errors)
 
 
 # ── 細節：美股 ETF ───────────────────────────────────────────────────────────
@@ -1429,7 +2073,7 @@ def _tech_rows(ctx: _Ctx, view: _View, label: str, *, named: bool = False) -> li
         if ratio is not None:
             parts.append(f"{ratio:.2f} 倍（前 20 日平均）")
         if rank is not None:
-            parts.append(f"近 250 日第 {rank:.0f} 百分位")
+            parts.append(f"近 250 日第 {_round_text(rank)} 百分位")
         if word:
             parts.append(word)
         line = "量能：" + "，".join(parts)
@@ -1526,8 +2170,11 @@ def _etf_alt(sym: str, view: _View) -> str:
     change = _num(view.values.get("chg_pct"), -100, 1000)
     parts = []
     if close is not None:
-        tag = market_calc.TEXT_PROVISIONAL if view.provisional else ""
-        parts.append(f"收盤 {_price(close)}{tag}" + (f"（{_pct(change, 2)}）" if change is not None else ""))
+        # 暫定與漲跌幅併進同一組括號（「收盤 496.37（暫定，-0.09%）」，不是「（暫定）（-0.09%）」；2026-10-28 批 1 審查 F2-13）
+        inside = [market_calc.TEXT_PROVISIONAL.strip("（）")] if view.provisional else []
+        if change is not None:
+            inside.append(_pct(change, 2))
+        parts.append(f"收盤 {_price(close)}" + (f"（{'，'.join(inside)}）" if inside else ""))
     status = _above_word(_flag(view.values.get("above_ma20")))
     if status:
         parts.append(status)
@@ -1536,7 +2183,53 @@ def _etf_alt(sym: str, view: _View) -> str:
 
 
 def _subject_contras(ctx: _Ctx, row_id: str, subject: str) -> list[dict]:
-    return [_text(sentence, size="md", color=ORANGE) for who, sentence in _contras(ctx, row_id) if who == subject]
+    tag = market_calc.TEXT_PROVISIONAL if ctx.row(row_id).provisional else ""  # 用暫定收盤算的矛盾句（A27）
+    return [_text(sentence + tag, size="md", color=ORANGE) for who, sentence in _contras(ctx, row_id) if who == subject]
+
+
+def _top_symbols(ctx: _Ctx, sym: str) -> Optional[set[str]]:
+    """這檔 ETF 前十大的代號（同一家公司的不同股別都算）：先看 us.fund 的列，那一列不新鮮再看 us.13f 的列；都沒有回 None。"""
+    for row_id in (f"us.fund.{sym}", f"us.13f.{sym}"):
+        view = ctx.row(row_id)
+        if view.fresh:
+            found = {s for item in _list(view.values.get("rows"), HOLDINGS_MAX) if isinstance(item, dict)
+                     for s in _symbols(item)}
+            if found:
+                return found
+    return None
+
+
+def _earnings_rows(ctx: _Ctx, sym: str) -> list[dict]:
+    """「45 天內財報（美東日期）」一行（2026-10-24 第 9 輪 A16，審查 r9 s3-F11、s2-7）：只列這檔 ETF 自己前十大的財報日。
+
+    events.next 是三檔前十大的聯集，沒有標哪檔，所以用這檔前十大的代號篩（自己掃清單，上限 EVENTS_SCAN_MAX，讀得到 publish 留下的
+    第 19–24 筆）。只列「現在之後、45 天以內」的；日期是美東日期（publish 放美東當天 16:00）；只有 estimated 是 True 才標預估
+    （沒有這個欄位的舊快照、1／"yes" 這種都不標）。同一檔出現兩次取最早一筆。日期缺的（來源常是空的，也可能本來就不在 45 天內）
+    不點名，行後面接一句固定句；一檔都沒列出時用另一句固定句（不寫「其他」）。"""
+    head = TEXT_EARNINGS_HEAD
+    events = ctx.row("events.next")
+    if not events.fresh:
+        return [_text(f"{head}：{ctx.gap(events, short=True)}", size="md", color=GRAY)]
+    held = _top_symbols(ctx, sym)
+    if held is None:  # 不知道這檔的前十大是誰：不猜
+        return [_text(f"{head}：{TEXT_MISSING}", size="md", color=GRAY)]
+    found: dict[str, tuple[date, bool]] = {}
+    for item in _list(events.values.get("items"), EVENTS_SCAN_MAX):
+        if not isinstance(item, dict) or item.get("kind") != "earnings":
+            continue
+        name, moment = item.get("name"), _moment(item.get("at"))
+        if not isinstance(name, str) or name not in held or moment is None:
+            continue
+        if not ctx.now < moment.timestamp() <= ctx.now + EARNINGS_HORIZON_S:
+            continue
+        day = moment.astimezone(_ET).date()
+        if name not in found or day < found[name][0]:
+            found[name] = (day, item.get("estimated") is True)
+    entries = [f"{name} {_md(day)}" + (f"（{TEXT_EARNINGS_ESTIMATED}）" if estimated else "")
+               for name, (day, estimated) in sorted(found.items(), key=lambda entry: (entry[1][0], entry[0]))]
+    if not entries:
+        return [_text(f"{head}：{TEXT_EARNINGS_NONE}", size="md", color=GRAY)]
+    return [_text(f"{head}：" + "、".join(entries), size="md"), _text(TEXT_EARNINGS_OTHERS, size="md", color=GRAY)]
 
 
 def _etf_detail(ctx: _Ctx, sym: str) -> Reply:
@@ -1546,18 +2239,21 @@ def _etf_detail(ctx: _Ctx, sym: str) -> Reply:
     body += _breadth_rows(ctx, ctx.row(f"us.breadth.{sym}"), "成分股")
     body.append(_sep())
     body += _fund_rows(ctx, ctx.row(f"us.fund.{sym}"))
+    body += _earnings_rows(ctx, sym)
     chart = _CHART_FOR_ETF[sym]
     bubble = _bubble(
         _title(_US_NAMES[sym], etf.data_date if etf.fresh else None, views=[etf]),
         body,
-        notes=(TEXT_US_BASIS,),
-        buttons=(("機構持股（13F）", f"/盤勢 13F {sym}"), (f"期權圖（{chart}）", f"/盤勢 {chart} 圖"), ("回摘要", COMMAND)),
+        notes=(TEXT_US_BASIS, *([TEXT_RSI_NOTE] if _rsi_shown(etf) else [])),
+        buttons=(("機構持股（13F）", f"/盤勢 13F {sym}"), (f"期權圖（{chart}）", f"/盤勢 {chart} 圖")),
     )
     return _flex_reply(bubble, _etf_alt(sym, etf))
 
 
 # ── 細節：台股 0050 ──────────────────────────────────────────────────────────
-def _tw_flow_rows(ctx: _Ctx) -> list[dict]:
+def _tw_flow_rows(ctx: _Ctx, day: Optional[date] = None) -> list[dict]:
+    """0050 細節卡下半段（漲跌家數、成交金額、三大法人、融資）。day＝這張卡的標題日（0050 的資料日）：這四列的資料日和它不同天
+    （除權息資料還沒到、0050 比加權舊一天）就各自帶日期，不然讀起來都是標題那一天（2026-10-28 批 1 審查 F2-6）。"""
     rows: list[dict] = []
     ad = ctx.row("tw.ad")
     if ad.fresh:
@@ -1569,13 +2265,14 @@ def _tw_flow_rows(ctx: _Ctx) -> list[dict]:
             line += f"、下跌 {dec}" + (f"（跌停 {dec_lim}）" if dec_lim is not None else "")
             if flat is not None:
                 line += f"、平盤 {flat}"
-            rows.append(_text(line, size="md"))
+            rows.append(_text(line + _date_suffix(ad.data_date, day), size="md"))
     else:
         rows.append(_text(f"上市漲跌家數：{ctx.gap(ad)}", size="md", color=GRAY))
     turnover = ctx.row("tw.turnover")
     rank = _num(turnover.values.get("vol_pct250"), 0, 100) if turnover.fresh else None
-    rows.append(_text(_turnover_line(ctx, turnover, None) + (f"，近 250 日第 {rank:.0f} 百分位" if rank is not None else ""),
-                      size="md"))
+    # 日期放句尾（接在百分位後面）：_turnover_line 自己的日期會插在「近 250 日…」前面、變成兩組括號
+    rows.append(_text(_turnover_line(ctx, turnover, None) + (f"，近 250 日第 {_round_text(rank)} 百分位" if rank is not None else "")
+                      + (_date_suffix(turnover.data_date, day) if turnover.fresh else ""), size="md"))
     inst = ctx.row("tw.inst3")
     if inst.fresh:
         v = inst.values
@@ -1583,7 +2280,9 @@ def _tw_flow_rows(ctx: _Ctx) -> list[dict]:
         def yi(key: str) -> Optional[float]:
             return _num(v.get(key), -1e7, 1e7)
 
-        rows.append(_text("三大法人（當天）：" + "、".join(
+        # 「當天」是和下一行「近 5 日合計」對照的那一天，不是「今天」，所以留著；日期不同天時寫在它前面（三大法人（10/16 當天））
+        stamp = f"{_md(inst.data_date)} " if inst.data_date is not None and day is not None and inst.data_date != day else ""
+        rows.append(_text(f"三大法人（{stamp}當天）：" + "、".join(
             [_inst_part("外資", yi("foreign_yi")), _inst_part("投信", yi("trust_yi")), _inst_part("自營", yi("dealer_yi"))]
         ), size="md"))
         days = _count(v.get("days_5d"), 5)
@@ -1602,7 +2301,9 @@ def _tw_flow_rows(ctx: _Ctx) -> list[dict]:
         change = _num(margin.values.get("change_yi"), -1e6, 1e6)
         if balance is not None:
             line = f"融資餘額 {_amount_yi(balance)} 億" + (f"（{_signed(change, 1)} 億）" if change is not None else "")
-            rows.append(_text(line + "，今日（參考）", size="md"))
+            # 以前寫「今日（參考）」：「今日」是相對詞，0050 比加權舊一天時也是錯的（F2-6）；一律改寫資料日
+            when = f"{_md(margin.data_date)}（參考）" if margin.data_date is not None else f"{TEXT_DATE_MISSING}（參考）"
+            rows.append(_text(f"{line}，{when}", size="md"))
     else:
         rows.append(_text(f"融資：{ctx.gap(margin)}", size="md", color=GRAY))
     return rows
@@ -1627,23 +2328,38 @@ def _tw_fund_rows(ctx: _Ctx) -> list[dict]:
     return rows or [_text(f"0050 成分基本面：{TEXT_INSUFFICIENT}", size="md", color=GRAY)]
 
 
+def _tw_lag_reason(ctx: _Ctx, etf: _View, taiex: _View) -> Optional[str]:
+    """0050 比加權舊的原因句（2026-10-24 第 9 輪 A20）：只在快照有證據時寫——publish 說除權息資料（TWT49U）還沒涵蓋到最新
+    場次（progress.tw_exrights_pending 為 true），而且 0050 的資料日真的比加權舊。沒有證據只補日期、不猜原因。"""
+    if (
+        _progress_flag(ctx, "tw_exrights_pending") is True
+        and etf.fresh and taiex.fresh
+        and etf.data_date is not None and taiex.data_date is not None
+        and etf.data_date < taiex.data_date
+    ):
+        return TEXT_TW_ETF_LAG.format(md=_md(etf.data_date))
+    return None
+
+
 def _tw_detail(ctx: _Ctx) -> Reply:
     etf, taiex = ctx.row("tw.etf.0050"), ctx.row("tw.taiex")
-    body = [_text(_taiex_line(ctx, taiex)[0], size="xl", weight="bold")]
+    day = etf.data_date if etf.fresh else taiex.data_date if taiex.fresh else None
+    # 標題是 0050 的資料日：加權和它不同天，加權那一列補自己的日期
+    body = [_text(_taiex_line(ctx, taiex, day, with_rsi=False)[0], size="xl", weight="bold")]
     body += _tech_rows(ctx, etf, "台灣50（0050）", named=True)
     body += [_text(s, size="md", color=ORANGE) for s in _contra_sentences(ctx, "contra.tw")[:2]]
     body.append(_sep())
     body += _breadth_rows(ctx, ctx.row("tw.breadth.0050"), "0050 成分")
     body.append(_sep())
-    body += _tw_flow_rows(ctx)
+    body += _tw_flow_rows(ctx, day)
     body.append(_sep())
     body += _tw_fund_rows(ctx)
-    day = etf.data_date if etf.fresh else taiex.data_date if taiex.fresh else None
+    reason = _tw_lag_reason(ctx, etf, taiex)
     bubble = _bubble(
         _title("台灣50（0050）", day, views=[etf, taiex]),
         body,
-        notes=(TEXT_TW_BASIS,),
-        buttons=(("台指期權圖", "/盤勢 台指 圖"), ("期權與資金細節", "/盤勢 期權"), ("回摘要", COMMAND)),
+        notes=(TEXT_TW_BASIS, *([reason] if reason else []), *([TEXT_RSI_NOTE] if _rsi_shown(etf) else [])),
+        buttons=(("台指期權圖", "/盤勢 台指 圖"), ("期權與資金細節", "/盤勢 期權")),
     )
     return _flex_reply(bubble, _etf_alt("0050", etf))
 
@@ -1683,9 +2399,10 @@ def _option_rows(ctx: _Ctx, sym: str) -> list[dict]:
     if not view.fresh:
         return [_text(f"{_US_NAMES[sym]}期權：{ctx.gap(view)}", color=GRAY)]
     v = view.values
-    spot = _num(v.get("spot"), 0)
+    basis, price = _wall_basis(v)  # 印出來的價格和牆距的基準同一個（「收盤 X」或「最新價 X」），footer 的註記也由它來
     day = f"｜資料 {_md(view.data_date)}" if view.data_date else ""
-    rows = [_text(_US_NAMES[sym] + (f" 現價 {_price(spot)}" if spot is not None else "") + day, size="xl", weight="bold")]
+    rows = [_text(_US_NAMES[sym] + (f" {_WALL_PRICE_WORD[basis]} {_price(price)}" if price is not None else "") + day,
+                  size="xl", weight="bold")]
     if v.get("wall_status") == market_calc.STATUS_OK:
         walls = []
         for kind, name in (("call", "買權牆"), ("put", "賣權牆")):
@@ -1718,7 +2435,7 @@ def _option_rows(ctx: _Ctx, sym: str) -> list[dict]:
     if pcr_vol is not None:
         stats.append(f"賣買權成交量比 {pcr_vol:.2f}")
     if iv30 is not None:
-        stats.append(f"隱含波動率（IV30）{iv30:.1f}%")
+        stats.append(f"隱含波動率（IV30）{_plain_pct(iv30, 1)}")
     if stats:
         rows.append(_text("、".join(stats), size="md"))
     gex = _dict(v.get("gex"))
@@ -1748,9 +2465,19 @@ def _vol_rows(ctx: _Ctx) -> list[dict]:
         if v1 is not None and v3 > 0:
             line += "，短期高於中期" if v1 > v3 else "，短期不高於中期"
     m = _num(move.values.get("value"), 0, 10000) if move.fresh else None
+    # VXTLT（2026-10-24 第 9 輪 A12）：MOVE 的下一行，自己的標籤與數字；MOVE 那一行一個字都不動（沒有就照舊寫暫缺），MOVE 恢復時兩行並列
+    vxtlt = ctx.row("macro.VXTLT")
+    zh, en = _MACRO["VXTLT"]
+    shown = _macro_value("VXTLT", vxtlt.values) if vxtlt.fresh else None
+    if shown is None:
+        vxtlt_line = f"{zh}（{en}）{ctx.gap(vxtlt)}"
+    else:
+        change = _macro_change("VXTLT", vxtlt.values)
+        vxtlt_line = f"{zh}（{en}）{shown}" + (f"（{change}）" if change else "")
     return [
         _text(line),
         _text(f"美債波動指數（MOVE）{m:.1f}" if m is not None else f"美債波動指數（MOVE）{ctx.gap(move)}", size="md"),
+        _text(vxtlt_line, size="md"),
     ]
 
 
@@ -1771,7 +2498,7 @@ def _tw_option_rows(ctx: _Ctx) -> list[dict]:
         rows.append(_text(f"{head}：" + ("、".join(parts) if parts else TEXT_INSUFFICIENT), weight="bold"))
         pcr = _num(v.get("pcr_oi_pct"), 0, 10000)
         if pcr is not None:
-            rows.append(_text(f"賣買權未平倉比（PCR）{pcr:.1f}%（全部台指選擇權，和月選範圍不同）", size="md"))
+            rows.append(_text(f"賣買權未平倉比（PCR）{_plain_pct(pcr, 1)}（全部台指選擇權，和月選範圍不同）", size="md"))
         calls, puts = _signed_int(v.get("foreign_call_net"), 10**8), _signed_int(v.get("foreign_put_net"), 10**8)
         if calls is not None and puts is not None:
             rows.append(_text(f"外資買權淨部位 {calls:+,} 口、賣權淨部位 {puts:+,} 口", size="md"))
@@ -1827,31 +2554,40 @@ def _fund_flow_rows(ctx: _Ctx) -> list[dict]:
     return rows
 
 
-def _options_detail(ctx: _Ctx) -> Reply:
-    us_body: list[dict] = _vol_rows(ctx)
+def _options_us_bubble(ctx: _Ctx, head: str, subtitle: Optional[str]) -> dict:
+    body: list[dict] = _vol_rows(ctx)
     for sym in ("QQQ", "SPY", "SOXX"):
-        us_body.append(_sep())
-        us_body += _option_rows(ctx, sym)
-    first = _bubble(
-        "美股期權（1/2）",
-        us_body,
-        subtitle="往左滑還有 1 張",
-        notes=(market_calc.TEXT_WALL_RANGE, market_calc.TEXT_WALL_DEF, TEXT_GAMMA_NOTE, market_calc.TEXT_OI_DATE,
-               market_calc.TEXT_MAX_PAIN),
+        body.append(_sep())
+        body += _option_rows(ctx, sym)
+    return _bubble(
+        head,
+        body,
+        subtitle=subtitle,
+        notes=(market_calc.TEXT_WALL_RANGE, *_wall_notes(ctx, ("QQQ", "SPY", "SOXX")), market_calc.TEXT_WALL_DEF,
+               TEXT_GAMMA_NOTE, market_calc.TEXT_OI_DATE, market_calc.TEXT_MAX_PAIN),
         buttons=(("那斯達克期權圖", "/盤勢 QQQ 圖"), ("標普期權圖", "/盤勢 SPY 圖"), ("半導體期權圖", "/盤勢 SOXX 圖")),
     )
-    tw_body = _tw_option_rows(ctx)
-    tw_body.append(_sep())
-    tw_body += _fund_flow_rows(ctx)
-    second = _bubble(
-        "台指期權與資金（2/2）",
-        tw_body,
-        notes=(market_calc.TEXT_CFTC_NOTE, TEXT_FLOW_NOTE),
-        buttons=(("台指期權圖", "/盤勢 台指 圖"), ("回摘要", COMMAND)),
+
+
+def _options_tw_bubble(ctx: _Ctx, head: str, subtitle: Optional[str]) -> dict:
+    body = _tw_option_rows(ctx)
+    body.append(_sep())
+    body += _fund_flow_rows(ctx)
+    return _bubble(
+        head,
+        body,
+        subtitle=subtitle,
+        notes=(market_calc.TEXT_CFTC_NOTE, TEXT_CFTC_NO_SEMI, TEXT_FLOW_NOTE),
+        buttons=(("台指期權圖", "/盤勢 台指 圖"),),
     )
+
+
+def _options_detail(ctx: _Ctx) -> Reply:
+    bubbles, errors = _guarded_bubbles(
+        ctx, [("美股期權（1/2）", _options_us_bubble), ("台指期權與資金（2/2）", _options_tw_bubble)], "往左滑還有 1 張")
     day = _latest_day([ctx.row("us.options.QQQ"), ctx.row("macro.VIX")])
     alt = f"{ALT_PREFIX}期權與資金細節" + (f"｜資料 {_md(day)}" if day else "")
-    return _flex_reply(_carousel([first, second]), alt)
+    return _flex_reply(_carousel(bubbles), alt, render_errors=errors)
 
 
 # ── 細節：13F ────────────────────────────────────────────────────────────────
@@ -1868,7 +2604,7 @@ def _holding_rows(ctx: _Ctx, index: int, item: dict) -> list[dict]:
     weight = _num(item.get("weight"), 0, 100)
     head = f"{index}. " + (f"{name}（{'／'.join(symbols)}）" if name else "／".join(symbols))
     if weight is not None:
-        head += f" 權重 {weight:.1f}%"
+        head += f" 權重 {_plain_pct(weight, 1)}"
     inc, dec = _count(item.get("increased")), _count(item.get("decreased"))
     new, sold = _count(item.get("new")), _count(item.get("soldout"))
     own = _num(item.get("own_pct"), 0, 1000)
@@ -1879,7 +2615,7 @@ def _holding_rows(ctx: _Ctx, index: int, item: dict) -> list[dict]:
         if new is not None and sold is not None:
             detail += f"；新建 {new:,}、出清 {sold:,}"
         if own is not None:
-            detail += f"；機構持股 {own:.0f}%"
+            detail += f"；機構持股 {_plain_pct(own)}"
     color = BLUE if inc is not None and dec is not None and inc > dec else GRAY
     return [_text(head, weight="bold"), _text(detail, size="md", color=color)]
 
@@ -1925,7 +2661,7 @@ def _13f_detail(ctx: _Ctx, sym: str) -> Reply:
         body,
         subtitle=basis,
         notes=(market_calc.TEXT_13F_LAG, TEXT_SHARE_CLASS),
-        buttons=((f"回{_US_SHORT[sym]}細節", f"/盤勢 {sym}"), ("回摘要", COMMAND)),
+        buttons=((f"回{_US_SHORT[sym]}細節", f"/盤勢 {sym}"),),
     )
     alt = f"{ALT_PREFIX}13F 前十大（{sym}）｜" + (f"{more} 檔的加碼機構多於減碼機構" if shown else "資料暫缺")
     return _flex_reply(bubble, alt)
@@ -1943,14 +2679,19 @@ def _fresh_items(ctx: _Ctx, view: _View, limit: int, max_age: float) -> list[tup
     return found
 
 
-def _news_rows(ctx: _Ctx, row_id: str, label: str, limit: int) -> tuple[list[dict], int, int]:
-    """(列, 列出幾則, 因為格式不符而沒列出幾則)。"""
+def _news_rows(
+    ctx: _Ctx, row_id: str, label: str, limit: int, *, skip: Sequence[str] = (), listed: Optional[list[str]] = None
+) -> tuple[list[dict], int, int]:
+    """(列, 列出幾則, 因為格式不符而沒列出幾則)。
+
+    skip＝別段已經列出的標題（半導體新聞不重複列美股新聞已經列的；比的是過了清洗的標題，來源不同也算同一則）；listed 不是
+    None 時，這一段列出的標題依序加進去，給後面的段落當 skip。因為重複而略過的不算格式不符、也不占 limit。"""
     view = ctx.row(row_id)
     rows = [_text(label, size="xl", weight="bold")]
     if not view.fresh:
         rows.append(_text(ctx.gap(view), color=GRAY))
         return rows, 0, 0
-    shown = skipped = 0
+    shown = skipped = repeated = 0
     for item, moment in _fresh_items(ctx, view, limit, NEWS_MAX_AGE_S):
         if shown >= limit:
             break
@@ -1958,12 +2699,17 @@ def _news_rows(ctx: _Ctx, row_id: str, label: str, limit: int) -> tuple[list[dic
         if title is None:
             skipped += item.get("title") is not None
             continue
+        if title in skip:
+            repeated += 1
+            continue
         source = ctx.external(item.get("source"), NAME_MAX)
         rows.append(_text(title))
         rows.append(_text(f"{source}｜{_md_hm(moment)}" if source else _md_hm(moment), size="md", color=GRAY))
+        if listed is not None:
+            listed.append(title)
         shown += 1
     if not shown:
-        rows.append(_text("36 小時內沒有列入的標題", color=GRAY))
+        rows.append(_text(TEXT_NEWS_SAME_AS_US if repeated else "36 小時內沒有列入的標題", color=GRAY))
     return rows, shown, skipped
 
 
@@ -1996,6 +2742,100 @@ def _trump_rows(ctx: _Ctx) -> tuple[list[dict], int, int]:
     return rows, shown, skipped
 
 
+# ── 川普壓力指數（TACO 指數，MacroMargin；2026-10-24） ────────────────────────────────────────────
+# 取代「MM 川普壓力指數：抓不到（要登入）」：Andrew 要卡上有數字和歷史位階（DECISIONS.md 2026-10-24：「川普壓力指數要有那個數字啊！
+# 也要有他相對于歷史的位階」→ 改用 MacroMargin 的公開頁）。快照的 macro.TACO 列只有數字、日期和兩個短列舉（status_key、method）；
+# 卡上的字全是 market_calc.TEXT_TACO_* 的固定句＋這裡算的數字與日期，來源網站的任何文字都沒有存、不會出現。
+# 同一行（≤24 字寬）出現在重點摘要（輪播 1/5）的第 6 列和宏觀與事件（5/5）的頁尾；新聞與宏觀（3/3）頁尾的第一行是它不帶日期的寫法。
+# 寫法由長到短，放不下才退下一個（_taco_line）：
+#   ① 川普壓力指數 +9.0（高壓，任期內第 88 百分位）   ② 川普壓力指數 +9.0（任期內第 88 百分位）（沒有狀態詞時從這裡開始）
+#   ③ 川普壓力 +9.0｜第 88 百分位                      ④ 川普壓力指數 +9.0
+# 資料日比預期的最新場次舊時，日期放在名稱後面（「川普壓力指數 10/15 +9.0（任期內第 88 百分位）」），每個寫法都帶、日期不丟
+# （2026-10-28 批 1 審查 F2-1）。帶日期的①通常是 25.5 寬放不下，所以①和②之間多一個寫法：短名稱＋日期＋數字（狀態詞，位階），
+# 「川普壓力 10/15 +9.0（高壓，任期內第 88 百分位）」23.5，來源落後的那幾個小時「高壓」還在；數值兩位數且第 100 百分位、或數值
+# 三位數時是 24.5，才退到②（第 2 輪複審 seat4 R2-N1、gp1 N9）。不帶日期時①最壞 24.0，一定放得下。
+# 宏觀與事件（5/5）的頁尾再接一句說明句「…不是退讓的機率」（F2-2）。
+# 細節卡（新聞與宏觀 3/3）的頁尾放完整說明：第一行是不帶日期的完整寫法（「高壓」永遠在）、這一筆的資料日（TEXT_TACO_DATA_DAY）、
+# 20 個交易日變化、位階（起始日、交易日筆數、最高最低與日期）、固定說明、來源、組成。
+# 過期／暫缺寫「川普壓力指數：過期（資料日 M/D）」「川普壓力指數：暫缺」；快照裡這一列的型別或範圍不對
+# （market_calc.taco_values_ok）也當暫缺；舊快照沒有這一列 → 暫缺。狀態詞只認 market_calc.TACO_STATUS_WORDS 的鍵。
+TACO_NOTE_MAX = 80  # 細節卡的「組成」那句比一般註記（NOTE_MAX）長
+
+
+def _taco_view(ctx: _Ctx) -> tuple[_View, Optional[dict]]:
+    """(列, 可用的 values)：新鮮而且通過 market_calc.taco_values_ok 才有 values，否則 None（過期、暫缺、壞掉）。"""
+    view = ctx.row("macro.TACO")
+    if not view.fresh:
+        return view, None
+    if not market_calc.taco_values_ok(view.values):
+        return _View(MISSING, {}, view.data_date), None
+    return view, view.values
+
+
+def _taco_line(ctx: _Ctx, *, dated: bool = True) -> str:
+    """摘要卡頁尾那一行（重點摘要的第 6 列也是它；細節卡的第一行是 dated=False 的它）。
+
+    資料日比預期的最新場次（progress.us_expected_day，沒有就取美股其他列最新的資料日）舊時，日期放在名稱後面（「川普壓力指數
+    10/22 +9.0（任期內第 88 百分位）」）：來源是個人網站，常比其他列晚一個場次，過期規則又容許落後最多 3 個場次，不標就看不出來
+    （2026-10-28 批 1 審查 F2-1）。寫法由長到短，日期一直留著：① 名稱 日期 數字（狀態詞，位階） ①′ 短名稱 日期 數字（狀態詞，
+    位階）——只在帶日期、有狀態詞時才有（第 2 輪複審 seat4 R2-N1、gp1 N9：以前①放不下就直接退到②，落後的那幾個小時三個地方的
+    「高壓」一起消失） ② 拿掉狀態詞 ③ 短名稱 日期 數字｜位階 ④ 名稱 日期 數字。
+
+    dated=False：一律不帶日期（新聞與宏觀 3/3 用：那裡第二行另寫「資料日 M/D」，第一行寫完整的寫法，「高壓」永遠在）。"""
+    view, values = _taco_view(ctx)
+    name = market_calc.TEXT_TACO_NAME
+    if values is None:
+        return _fit(f"{name}：{ctx.gap(view)}", f"{name}：{ctx.gap(view, short=True)}")
+    number = _signed(values["value"], 1)
+    word = market_calc.TACO_STATUS_WORDS.get(values["status_key"])
+    rank = market_calc.TEXT_TACO_RANK.format(p=values["percentile"])
+    expected = _digest_expected_day(ctx, "us_expected_day", _DIGEST_US_EVIDENCE) if dated else None
+    stamp = _digest_stamp([view.data_date], expected)
+    return _fit(
+        f"{name}{stamp} {number}（{word}，{rank}）" if word else None,
+        f"{market_calc.TEXT_TACO_NAME_SHORT}{stamp} {number}（{word}，{rank}）" if word and stamp else None,
+        f"{name}{stamp} {number}（{rank}）",
+        f"{market_calc.TEXT_TACO_NAME_SHORT}{stamp} {number}｜{market_calc.TEXT_TACO_RANK_SHORT.format(p=values['percentile'])}",
+        f"{name}{stamp} {number}",
+    )
+
+
+def _taco_position(values: dict) -> str:
+    """位階那一行。日期寫完整的年月日：歷史從 2025-03-26 起，只寫月／日的話「3/26 起…最高 3/27」看起來像隔天，
+    其實差一年（2026-10-28 整合時改）。年份來自資料，固定句本身不寫年份。"""
+    return market_calc.TEXT_TACO_POSITION.format(
+        since=date.fromisoformat(values["since"]).isoformat(), n=values["n"], p=values["percentile"],
+        hi=_signed(values["max"], 1), hi_md=date.fromisoformat(values["max_date"]).isoformat(),
+        lo=_signed(values["min"], 1), lo_md=date.fromisoformat(values["min_date"]).isoformat(),
+    )
+
+
+def _taco_summary_notes(ctx: _Ctx) -> list[str]:
+    """宏觀與事件（5/5）的頁尾：那一行；指數有數字時再加一句「不是退讓的機率」（2026-10-28 批 1 審查 F2-2：使用者最容易把百分位
+    讀成機率，以前這句只在新聞與宏觀 3/3 的最底下）。"""
+    _view, values = _taco_view(ctx)
+    notes = [_taco_line(ctx)]
+    if values is not None:
+        notes.append(market_calc.TEXT_TACO_MEANING)
+    return [text for text in (ctx.note(note) for note in notes) if text]
+
+
+def _taco_detail_notes(ctx: _Ctx) -> list[str]:
+    view, values = _taco_view(ctx)
+    # 第一行是不帶日期的完整寫法：這裡沒有和摘要一樣的取捨，「高壓」永遠在；日期只寫在下一行（第 2 輪複審 seat4 R2-N1）
+    notes = [_taco_line(ctx, dated=False)]
+    if values is not None:
+        if view.data_date:  # 這一筆是哪一天的（F2-1）
+            notes.append(market_calc.TEXT_TACO_DATA_DAY.format(md=_md(view.data_date)))
+        change = _num(values.get("chg20"), -market_calc.TACO_CHANGE_MAX, market_calc.TACO_CHANGE_MAX)
+        notes.append(market_calc.TEXT_TACO_CHANGE.format(chg=_signed(change, 1) if change is not None else TEXT_MISSING))
+        notes += [_taco_position(values), market_calc.TEXT_TACO_MEANING]
+    notes.append(market_calc.TEXT_TACO_SOURCE)
+    if values is not None:  # 只有來源的方法版本是我們看過的（method＝v1）才寫組成；版本變了不拿舊的組成冒充
+        notes.append(market_calc.TEXT_TACO_COMPOSITION if values["method"] == "v1" else market_calc.TEXT_TACO_METHOD_CHANGED)
+    return [text for text in (ctx.note(note, TACO_NOTE_MAX) for note in notes) if text]
+
+
 def _macro_rows(ctx: _Ctx) -> list[dict]:
     rows = [_text("宏觀數字", size="xl", weight="bold")]
     for key in _MACRO:
@@ -2011,6 +2851,8 @@ def _macro_rows(ctx: _Ctx) -> list[dict]:
             line += f"（{change}）"
         if view.data_date:
             line += f"｜{_md(view.data_date)}"
+        if view.provisional:  # 用 CBOE 暫定收盤算的（目前只有 SPY 距高點；2026-10-24 第 9 輪 A27）
+            line += market_calc.TEXT_PROVISIONAL
         rows.append(_text(line, size="md"))
     rows.append(_sep())
     rows.append(_text("接下來的事件", size="xl", weight="bold"))
@@ -2033,23 +2875,40 @@ def _skipped_note(count: int) -> list[str]:
 
 
 def _news_detail(ctx: _Ctx) -> Reply:
-    us_rows, us_n, us_skip = _news_rows(ctx, "news.us", "美股新聞", NEWS_PER_KIND)
-    tw_rows, tw_n, tw_skip = _news_rows(ctx, "news.tw", "台股新聞", NEWS_PER_KIND)
-    iran_rows, iran_n, iran_skip = _news_rows(ctx, "news.iran", "伊朗新聞", IRAN_NEWS_MAX)
-    trump_rows, trump_n, trump_skip = _trump_rows(ctx)
-    bubbles = [
-        _bubble("新聞（1/3）", us_rows + [_sep()] + tw_rows, subtitle="往左滑還有 2 張",
-                notes=[TEXT_NEWS_NOTE, *([TEXT_TAIPEI_TIME] if us_n or tw_n else []), *_skipped_note(us_skip + tw_skip)],
-                buttons=(("回摘要", COMMAND),)),
-        _bubble("伊朗新聞與川普原文（2/3）", iran_rows + [_sep()] + trump_rows,
-                notes=[TEXT_NEWS_NOTE, market_calc.TEXT_TRUMP_NOTE, *([TEXT_TAIPEI_TIME] if iran_n else []),
-                       *_skipped_note(iran_skip + trump_skip)],
-                buttons=(("回摘要", COMMAND),)),
-        _bubble("宏觀與事件（3/3）", _macro_rows(ctx), notes=(TEXT_MM,),
-                buttons=(("季節性", "/盤勢 季節性"), ("期中選舉", "/盤勢 選舉"), ("回摘要", COMMAND))),
-    ]
-    alt = f"{ALT_PREFIX}新聞與宏觀｜美股 {us_n} 則、台股 {tw_n} 則、伊朗 {iran_n} 則、川普 {trump_n} 則"
-    return _flex_reply(_carousel(bubbles), alt)
+    shown: dict[str, int] = {}  # 各區列出幾則（altText 用）；有一張出錯就不寫則數，免得把「沒列出」寫成 0 則
+
+    def _news_markets_bubble(ctx: _Ctx, head: str, subtitle: Optional[str]) -> dict:
+        # 美股 → 半導體 → 台股；半導體不重複列美股段已經列出的標題（2026-10-24 第 9 輪 A17）
+        us_titles: list[str] = []
+        us_rows, shown["us"], us_skip = _news_rows(ctx, "news.us", "美股新聞", NEWS_PER_KIND, listed=us_titles)
+        semi_rows, shown["semi"], semi_skip = _news_rows(ctx, "news.semi", "半導體新聞", NEWS_PER_KIND, skip=us_titles)
+        tw_rows, shown["tw"], tw_skip = _news_rows(ctx, "news.tw", "台股新聞", NEWS_PER_KIND)
+        return _bubble(head, us_rows + [_sep()] + semi_rows + [_sep()] + tw_rows, subtitle=subtitle,
+                       notes=[TEXT_NEWS_NOTE, *([TEXT_TAIPEI_TIME] if shown["us"] or shown["semi"] or shown["tw"] else []),
+                              *_skipped_note(us_skip + semi_skip + tw_skip)])
+
+    def _news_iran_trump_bubble(ctx: _Ctx, head: str, subtitle: Optional[str]) -> dict:
+        iran_rows, shown["iran"], iran_skip = _news_rows(ctx, "news.iran", "伊朗新聞", IRAN_NEWS_MAX)
+        trump_rows, shown["trump"], trump_skip = _trump_rows(ctx)
+        return _bubble(head, iran_rows + [_sep()] + trump_rows, subtitle=subtitle,
+                       notes=[TEXT_NEWS_NOTE, market_calc.TEXT_TRUMP_NOTE,
+                              *([TEXT_TAIPEI_TIME] if shown["iran"] else []), *_skipped_note(iran_skip + trump_skip)])
+
+    def _news_macro_bubble(ctx: _Ctx, head: str, subtitle: Optional[str]) -> dict:
+        return _bubble(head, _macro_rows(ctx), subtitle=subtitle, notes=_taco_detail_notes(ctx),
+                       buttons=(("季節性", "/盤勢 季節性"), ("期中選舉", "/盤勢 選舉")))
+
+    bubbles, errors = _guarded_bubbles(
+        ctx,
+        [("新聞（1/3）", _news_markets_bubble), ("伊朗新聞與川普原文（2/3）", _news_iran_trump_bubble),
+         ("宏觀與事件（3/3）", _news_macro_bubble)],
+        "往左滑還有 2 張",
+    )
+    alt = f"{ALT_PREFIX}新聞與宏觀"
+    if not errors:
+        alt += (f"｜美股 {shown['us']} 則、半導體 {shown['semi']} 則、台股 {shown['tw']} 則、"
+                f"伊朗 {shown['iran']} 則、川普 {shown['trump']} 則")
+    return _flex_reply(_carousel(bubbles), alt, render_errors=errors)
 
 
 # ── 細節：季節性 ─────────────────────────────────────────────────────────────
@@ -2060,9 +2919,68 @@ def _season_stat(stats: Any) -> Optional[str]:
     if up is None or not n:
         return None
     text = f"上漲比例 {_plain_pct(up)}（{n} 年）"
-    if median is not None and mean is not None:
-        text += f"，中位數 {_pct(median)}、平均 {_pct(mean)}"
-    return text
+    if median is None or mean is None:
+        return text
+    # 變體順序（2026-10-24 第 9 輪 A14）：全寫 → 拿掉平均 → 只留比例與年數。現有的真實值最寬剛好 24.0（SOXX 的第四季），
+    # 放得下；比例 100% 且漲跌幅到雙位數、或年數三位數才會用到後兩個
+    return _fit(f"{text}，中位數 {_pct(median)}、平均 {_pct(mean)}", f"{text}，中位數 {_pct(median)}", text)
+
+
+_YEAR_MONTH_RE = re.compile(r"(\d{4})-(\d{2})", re.ASCII)  # re.ASCII：全形、阿拉伯數字不收（第 2 輪複審 gp1 N7）
+
+
+def _year_month_text(value: Any) -> Optional[str]:
+    """「2016-11」→「2016-11」；格式不對、月份不在 1–12、年份離譜 → None（卡上只印過了檢查的數字）。"""
+    match = _YEAR_MONTH_RE.fullmatch(value) if isinstance(value, str) else None
+    if match is None:
+        return None
+    year, month = int(match.group(1)), int(match.group(2))
+    return f"{year}-{month:02d}" if 1900 <= year <= 2100 and 1 <= month <= 12 else None
+
+
+def _season_range(value: Any) -> str:
+    """樣本起迄「2016-11 至 2025-12」（年份從 market_seasonality.json 經快照帶出來，固定句不寫年份）；格式不對印「暫缺」。"""
+    node = _dict(value)
+    first, last = _year_month_text(node.get("first")), _year_month_text(node.get("last"))
+    return f"{first} 至 {last}" if first and last and first <= last else TEXT_MISSING
+
+
+def _season_nodes(label: str, stats: Any) -> list[dict]:
+    text = _season_stat(stats)
+    return [_text(label, weight="bold"), _text(text or TEXT_INSUFFICIENT, size="md", color=None if text else GRAY)]
+
+
+def _season_info(sample: str, data: str, value: Any) -> list[dict]:
+    """半導體一段結尾的兩行灰字：樣本起迄、資料來源與調整方式（各自 ≤24 個中文字寬）。"""
+    return [_text(sample.format(range=_season_range(value)), size="md", color=GRAY), _text(data, size="md", color=GRAY)]
+
+
+def _soxx_nodes(v: dict, month: int, midterm: bool) -> list[dict]:
+    """SOXX 自身（Nasdaq 只給最近 10 年的 ETF 日線）：月、第四季；期中選舉年樣本夠大（≥5 年，market_calc 檢查過）才有那兩段，
+    否則一行說明。"""
+    head = market_calc.TEXT_SEASON_SOXX_HEAD.format(month=month)
+    if _flag(v.get("soxx_pending")) is not False:  # 舊快照沒有這個鍵：當作還沒有資料
+        return _season_nodes(head, None)
+    nodes = _season_nodes(head, v.get("soxx")) + _season_nodes(market_calc.TEXT_SEASON_SOXX_Q4, v.get("soxx_q4"))
+    if midterm:
+        if _dict(v.get("soxx_midterm")) or _dict(v.get("soxx_midterm_q4")):
+            nodes += _season_nodes(market_calc.TEXT_SEASON_SOXX_MIDTERM.format(month=month), v.get("soxx_midterm"))
+            nodes += _season_nodes(market_calc.TEXT_SEASON_SOXX_MIDTERM_Q4, v.get("soxx_midterm_q4"))
+        else:
+            nodes.append(_text(market_calc.TEXT_SEASON_SOXX_FEW_MIDTERM, size="md", color=GRAY))
+    return nodes + _season_info(market_calc.TEXT_SEASON_SOXX_SAMPLE, market_calc.TEXT_SEASON_SOXX_DATA, v.get("soxx_range"))
+
+
+def _sox_nodes(v: dict, month: int, midterm: bool) -> list[dict]:
+    """SOX（費城半導體指數）長歷史：月、第四季、期中選舉年的月與第四季。"""
+    head = market_calc.TEXT_SEASON_SOX_HEAD.format(month=month)
+    if _flag(v.get("sox_pending")) is not False:
+        return _season_nodes(head, None)
+    nodes = _season_nodes(head, v.get("sox")) + _season_nodes(market_calc.TEXT_SEASON_SOX_Q4, v.get("sox_q4"))
+    if midterm:
+        nodes += _season_nodes(market_calc.TEXT_SEASON_SOX_MIDTERM.format(month=month), v.get("sox_midterm"))
+        nodes += _season_nodes(market_calc.TEXT_SEASON_SOX_MIDTERM_Q4, v.get("sox_midterm_q4"))
+    return nodes + _season_info(market_calc.TEXT_SEASON_SOX_SAMPLE, market_calc.TEXT_SEASON_SOX_DATA, v.get("sox_range"))
 
 
 def _season_detail(ctx: _Ctx) -> Reply:
@@ -2080,24 +2998,32 @@ def _season_detail(ctx: _Ctx) -> Reply:
         if midterm:
             sections += [(f"期中選舉年的 {month} 月（S&P 500）", v.get("sp500_midterm")),
                          ("期中選舉年的第四季（S&P 500）", v.get("sp500_midterm_q4"))]
+        tw_sections = []
         if _flag(v.get("taiex_pending")):
-            sections.append((f"加權指數 {month} 月", None))
+            tw_sections.append((f"加權指數 {month} 月", None))
         else:
-            sections.append((f"加權指數 {month} 月，{market_calc.TEXT_SEASON_TW_BASIS}", v.get("taiex")))
-            sections.append(("加權指數第四季", v.get("taiex_q4")))
+            tw_sections.append((f"加權指數 {month} 月，{market_calc.TEXT_SEASON_TW_BASIS}", v.get("taiex")))
+            tw_sections.append(("加權指數第四季", v.get("taiex_q4")))
             if midterm:
-                sections.append((f"期中選舉年的 {month} 月（加權指數）", v.get("taiex_midterm")))
-        for label, stats in sections:
-            text = _season_stat(stats)
-            body.append(_text(label, weight="bold"))
-            body.append(_text(text or TEXT_INSUFFICIENT, size="md", color=None if text else GRAY))
+                tw_sections.append((f"期中選舉年的 {month} 月（加權指數）", v.get("taiex_midterm")))
+        # 四組由上而下：SOXX 自身（Andrew 看的標的）、SOX 長歷史、標普500、加權指數；組與組之間一條線
+        groups = [
+            _soxx_nodes(v, month, midterm),
+            _sox_nodes(v, month, midterm),
+            [node for label, stats in sections for node in _season_nodes(label, stats)],
+            [node for label, stats in tw_sections for node in _season_nodes(label, stats)],
+        ]
+        for index, group in enumerate(groups):
+            if index:
+                body.append(_sep())
+            body += group
     else:
         body.append(_text(f"季節性：{ctx.gap(view)}", color=GRAY))
     bubble = _bubble(
         "季節性" + (f"（{month} 月）" if month else "") + "｜歷史統計",
         body,
-        notes=(market_calc.TEXT_SEASON_NOTE, TEXT_SEASON_SOURCE),
-        buttons=(("回摘要", COMMAND),),
+        notes=(market_calc.TEXT_SEASON_NOTE, market_calc.TEXT_SEASON_SEMI_NOTE, market_calc.TEXT_SEASON_BASIS_NOTE,
+               TEXT_SEASON_SOURCE),
     )
     alt = f"{ALT_PREFIX}季節性" + (f"（{month} 月）" if month else "") + "｜歷史統計"
     return _flex_reply(bubble, alt)
@@ -2151,7 +3077,6 @@ def _election_detail(ctx: _Ctx) -> Reply:
         f"美國期中選舉｜{vote} 投票",
         body,
         notes=(*(() if blocked else (market_calc.TEXT_ELECTION_NOTE,)), *([TEXT_TAIPEI_TIME] if clock else ())),
-        buttons=(("回摘要", COMMAND),),
     )
     alt = f"{ALT_PREFIX}期中選舉｜" + (f"還有 {_election_days(ctx)} 天" if phase == "before" else "已投票")
     return _flex_reply(bubble, alt)
@@ -2325,6 +3250,14 @@ def _outcome_summary(paths: Any, now: float) -> dict:
     out["us_etf_lag_s"] = _count(data.get("us_etf_lag_s"), 10**9)
     out["us_members_lag_sessions"] = _count(data.get("us_members_lag_sessions"), 10**4)
     out["us_hist_vendor"] = _count(data.get("us_hist_vendor"), 10**6)
+    # 通膨（BLS CPI；2026-10-24 審查 r9 s4-F15）：BLS 一個月才抓幾次，failing 要連續 3 次失敗才列，一個月內永遠到不了；已存最新月份、
+    # 落後幾個月、輪詢狀態（pending／done／exhausted／disabled）給每日維護看，缺值或壞值 → None
+    month = data.get("infl_cpi_month")
+    out["infl_cpi_month"] = month if isinstance(month, str) and re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", month, re.ASCII) else None
+    out["infl_cpi_lag_months"] = _count(data.get("infl_cpi_lag_months"), 1200)
+    poll = data.get("infl_bls_poll")
+    out["infl_bls_poll"] = poll if isinstance(poll, str) and poll in market_calc.CPI_POLL_STATES else None
+    out["taco_block_streak"] = _count(data.get("taco_block_streak"), 10**6)  # ocmacro.com 連續被擋的次數（2026-10-28 審查 gp2 N1）
     return out
 
 
@@ -2376,12 +3309,20 @@ def _status_summary(moment: float, paths: Any) -> dict:
         stale_after = _num(_dict(charts.get(key)).get("stale_after"))
         if stale_after is None or moment > stale_after:
             summary["charts_stale"].append(key)
+    # render_error 只放程式自己的列舉字串：整個回覆出錯＝「unexpected:例外型別名」；輪播裡某一張出錯（已換成短卡、其他張照送）
+    # ＝「bubble:builder 名稱:例外型別名」，多個用逗號接起來（2026-10-24 審查 r9 s4-F9-1）
+    problems: list[str] = []
+    bubble_errors: set[str] = set()
     try:
         for kind, sym in ((SUMMARY, None), (ETF, "VOO"), (ETF, "QQQ"), (ETF, "SOXX"), (TW, None), (OPTIONS, None),
                           (NEWS, None), (SEASON, None), (ELECTION, None), (F13, "VOO"), (F13, "QQQ"), (F13, "SOXX")):
-            _DETAILS[kind](ctx, sym)
+            bubble_errors.update(_DETAILS[kind](ctx, sym).render_errors)
     except Exception as exc:
-        summary["render_error"] = f"unexpected:{type(exc).__name__}"
+        problems.append(f"unexpected:{type(exc).__name__}")
+    if bubble_errors:
+        problems.append("bubble:" + ",".join(sorted(bubble_errors)))
+    if problems:
+        summary["render_error"] = ";".join(problems)
     summary["external_dropped"] = ctx.dropped
     progress = ctx.progress()
     summary["us_members"] = list(progress) if progress else None
@@ -2401,4 +3342,6 @@ READ_ROWS: tuple[str, ...] = (
     *(f"macro.{k}" for k in _MACRO),
     "events.next", "season.now", "election", "trump.summary", "trump.posts",
     "news.us", "news.tw", "news.iran", "oneliner.us", "oneliner.tw", "contra.us", "contra.tw",
+    "news.semi",
+    "macro.TACO",
 )

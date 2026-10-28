@@ -18,7 +18,8 @@ Andrew 2026-10-17 的要求（DECISIONS.md）：宏觀「有 yahoo 用 yahoo，�
   卡上的台幣新時隨時重算，不必等下一個 D。
   BTC（2026-10-23）和其他格一樣走這條路、存 `macro.BTC`：原本 Coinbase 每 2 小時那條（§18.9、macro.btc 任務）
   拿掉了，因為 api.coinbase.com 在台灣被封鎖。
-- 新聞：Google News RSS 美股、台股每 30 分鐘，伊朗每小時；pubDate 超過 36 小時、解析不到或在未來的不列；
+- 新聞：Google News RSS 美股、台股每 30 分鐘，伊朗、半導體（費城半導體，2026-10-24 第 9 輪 A17）每小時
+  （news.google.com 每日 48＋48＋24＋24＝144 次）；pubDate 超過 36 小時、解析不到或在未來的不列；
   news.google.com 回 503 也算限流（market_http 會讓該主機冷卻 2 小時），冷卻期間不排。
 - 川普原文：trumpstruth RSS 每 30 分鐘，依 originalId 累積進 Store（移除的也寫回去，之前累積到的那則才
   會被拿掉），從累積資料算近 48 小時的主題則數；這輪最舊一則比上輪最新一則還新（中間有缺口）或剛上線、
@@ -47,7 +48,7 @@ UTC = timezone.utc
 # ── 存放位置（market_publish 讀這些名字；要改兩邊一起改） ─────────────────────────────────
 OBS_MACRO_PREFIX = "macro."  # ＋DXY／WTI／BRENT／GOLD／SILVER／BTC／RUT／DJI／IXIC／MOVE／USDTWD：
 #   {"value","chg"|None,"chg_pct"|None,"date","prev_date"|None,"source","symbol","bars": [[iso, 收盤], …]}
-OBS_NEWS_PREFIX = "news."  # ＋us／tw／iran：{"items": [{"title","source","published_utc"}],"fetched_utc"}
+OBS_NEWS_PREFIX = "news."  # ＋us／tw／iran／semi：{"items": [{"title","source","published_utc"}],"fetched_utc"}
 OBS_TRUMP_SUMMARY = "trump.summary"  # {"window_h","topics": {代號: 則數},"labels","posts","matched","latest_utc","at_least"}
 OBS_TRUMP_POSTS = "trump.posts"  # {"items": [{"id","published_utc","text","topics","quoted_author"}]}（細節頁）
 OBS_ELECTION_PREFIX = "election."  # ＋PREDICTION_MARKETS 的 key（polymarket.house、kalshi.senate…）：PredictionQuote 欄位＋mid、fetched_utc
@@ -59,7 +60,7 @@ OBS_TW_FX = "tw.fx"  # market_pipeline_tw.OBS_FX（不 import 那個模組：只
 # ── 任務名稱與排程 ───────────────────────────────────────────────────────────────────
 TASK_MACRO = "macro.yahoo"
 TASK_TRUMP = "trump.feed"
-NEWS_TOPICS = ("us", "tw", "iran")
+NEWS_TOPICS = ("us", "tw", "iran", "semi")  # 新主題接在最後：同一輪裡舊主題先抓（共用 news.google.com 的冷卻）
 STATE_PREFIX = "misc.pipe:"
 NOT_YET, PARTIAL = market_tasks.NOT_YET, market_tasks.PARTIAL
 
@@ -83,7 +84,7 @@ TRUMP_POSTS_KEEP = 20
 TRUMP_GAPS_KEEP = 20
 ELECTION_RESOLVED_EVERY_S = 86400.0
 ELECTION_SHOW_RESULT_S = 7 * 86400.0
-_DEFAULT_EVERY_S = {"gnews.us": 1800, "gnews.tw": 1800, "gnews.iran": 3600, "trumpstruth": 1800}
+_DEFAULT_EVERY_S = {"gnews.us": 1800, "gnews.tw": 1800, "gnews.iran": 3600, "gnews.semi": 3600, "trumpstruth": 1800}
 _RATE_LIMIT_KINDS = frozenset({"rate_limited", "blocked"})
 
 

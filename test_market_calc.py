@@ -942,6 +942,64 @@ class TestGex:
         assert mc.values_ok("us.options.SPY", json.loads(json.dumps(values, allow_nan=False)))
 
 
+class TestOptionDistanceBasis:
+    """2026-10-24 第 9 輪批 1 B 軌（審查 r9 seat1 I1）：牆距改用同一份期權鏈自己的收盤（能不能用由 publish 決定），不用
+    可能掛著盤前盤後價的 current_price；牆的位置、GEX 一律照現價。欄位只增不改（ref_close、dist_basis）。"""
+
+    def values(self, **extra):
+        rows = ladder([D + timedelta(days=3), date(2026, 11, 20)], range(80, 121), call_oi={110: 900}, put_oi={92: 900})
+        return mc.options_values(chain_of(rows), D, spot=100.0, rate=0.0426, holidays=mc.nyse_calendar(), **extra)
+
+    def test_distances_follow_the_close_when_publish_gives_one(self):
+        values = self.values(ref_close=98.0)
+        assert (values["call_wall"], values["put_wall"]) == (110.0, 92.0)  # 牆的位置還是用現價 100 找
+        assert values["dist_basis"] == "close" and values["ref_close"] == 98.0 and values["spot"] == 100.0
+        assert values["call_wall_dist_pct"] == pytest.approx((110 / 98.0 - 1) * 100)
+        assert values["put_wall_dist_pct"] == pytest.approx((92 / 98.0 - 1) * 100)
+        assert mc.values_ok("us.options.QQQ", json.loads(json.dumps(values, allow_nan=False)))
+
+    def test_without_a_usable_close_the_distances_stay_on_the_spot(self):
+        values = self.values()
+        assert values["dist_basis"] == "spot" and values["ref_close"] is None
+        assert values["call_wall_dist_pct"] == pytest.approx(10.0) and values["put_wall_dist_pct"] == pytest.approx(-8.0)
+        for bad in (0, 0.0, -5.0, float("nan"), float("inf"), True, "98"):
+            again = self.values(ref_close=bad)
+            assert again["dist_basis"] == "spot" and again["ref_close"] is None, bad
+            assert again["call_wall_dist_pct"] == pytest.approx(10.0), bad
+
+    def test_walls_gex_and_everything_else_do_not_depend_on_the_basis(self):
+        on_spot, on_close = self.values(), self.values(ref_close=98.0)
+        changed = {key for key in on_spot if on_spot[key] != on_close[key]}
+        assert changed == {"call_wall_dist_pct", "put_wall_dist_pct", "ref_close", "dist_basis"}, changed
+
+    def test_a_wall_between_the_close_and_the_spot_keeps_its_plus_sign(self):
+        values = self.values(ref_close=90.0)  # 現價 100、收盤 90：賣權牆 92 在收盤之上
+        assert values["put_wall"] == 92.0 and values["put_wall_dist_pct"] == pytest.approx((92 / 90.0 - 1) * 100)
+        assert values["put_wall_dist_pct"] > 0
+
+    def test_no_wall_means_no_distance_on_either_basis(self):
+        rows = ladder([D + timedelta(days=3)], range(80, 100))  # 現價以上沒有履約價：牆算不出來
+        values = mc.options_values(chain_of(rows), D, spot=100.0, rate=None, holidays=mc.nyse_calendar(), ref_close=99.0)
+        assert values["wall_status"] == mc.STATUS_INSUFFICIENT
+        assert values["call_wall_dist_pct"] is None and values["put_wall_dist_pct"] is None
+        assert values["dist_basis"] == "close" and values["ref_close"] == 99.0
+
+    def test_the_new_keys_are_in_the_spec_and_type_checked(self):
+        for symbol in ("QQQ", "SPY", "SOXX"):
+            spec = mc.ROW_IDS[f"us.options.{symbol}"]
+            assert spec["ref_close"] == "num?" and spec["dist_basis"] == "str"
+        good = self.values(ref_close=98.0)
+        assert mc.values_ok("us.options.QQQ", good)
+        for key, bad in (("ref_close", "98"), ("ref_close", True), ("dist_basis", 1), ("dist_basis", None)):
+            assert not mc.values_ok("us.options.QQQ", {**good, key: bad}), (key, bad)
+        for key in ("ref_close", "dist_basis"):
+            assert not mc.values_ok("us.options.QQQ", {k: v for k, v in good.items() if k != key}), key
+
+    def test_the_two_basis_words_are_shared_by_job_and_bot(self):
+        assert mc.DIST_BASES == (mc.DIST_CLOSE, mc.DIST_SPOT) == ("close", "spot")
+        assert self.values(ref_close=98.0)["dist_basis"] == mc.DIST_CLOSE and self.values()["dist_basis"] == mc.DIST_SPOT
+
+
 # ── 台指選擇權 ───────────────────────────────────────────────────────────────────
 TxoRow = namedtuple("TxoRow", "month strike kind oi settle")
 
@@ -1187,13 +1245,38 @@ class TestContradictions:
                 assert not sentence[0].isascii(), sentence  # 先中文、括號英文
                 assert width(sentence) <= 24, sentence
 
+    def test_us_one_liner_names_the_sp500_and_fits_a_card_row_in_every_combination(self):
+        """2026-10-24 第 9 輪 N2：美股這句只看 VOO，主詞不能是「美股」（摘要第一張的美股列把三檔分組，會互相矛盾）。
+        用「標普」不用「標普500」：後者在「成分股站上月線 100%、量明顯偏少」這類組合會超過 24 個中文字寬，
+        美股卡的 _note_line 就悄悄把這一列拿掉；前者和原本的「美股」一樣寬。"""
+        import unicodedata
+
+        def width(text):
+            return sum(1.0 if unicodedata.east_asian_width(ch) in ("W", "F") else 0.5 for ch in text)
+
+        worst = 0.0
+        for above in (True, False):
+            for breadth in (None, 0.0, 41.4, 99.6, 100.0):
+                for label in (None, *mc.VOL_LABELS):
+                    state = {"VOO.above_ma20": F(above)}
+                    if breadth is not None:
+                        state["VOO.breadth20_pct"] = F(breadth)
+                    if label is not None:
+                        state["VOO.vol_label"] = F(label)
+                    text = mc.one_liner(state, "us")
+                    assert text.startswith(f"標普收在月線{'上' if above else '下'}"), text
+                    assert "美股" not in text
+                    worst = max(worst, width(text))
+        assert worst <= 23.5  # 和改名前一樣寬
+        assert mc.one_liner({"TAIEX.above_ma20": F(True)}, "tw") == "台股收在月線上"  # 台股那句照舊
+
     def test_one_liner_uses_only_same_date_facts(self):
         state = {"VOO.above_ma20": F(True), "VOO.breadth20_pct": F(41.4), "VOO.vol_label": F("量縮")}
-        assert mc.one_liner(state, "us") == "美股收在月線上、成分股站上月線 41%、量偏少"
+        assert mc.one_liner(state, "us") == "標普收在月線上、成分股站上月線 41%、量偏少"
         state["VOO.breadth20_pct"] = F(41.4, date(2026, 10, 15))
-        assert mc.one_liner(state, "us") == "美股收在月線上、量偏少"
+        assert mc.one_liner(state, "us") == "標普收在月線上、量偏少"
         state["VOO.vol_flag"] = F("結算日")
-        assert mc.one_liner(state, "us") == "美股收在月線上"
+        assert mc.one_liner(state, "us") == "標普收在月線上"
         assert mc.one_liner({"VOO.above_ma20": F(True, ok=False)}, "us") == ""
         assert mc.one_liner({}, "us") == ""
         tw = {"TAIEX.above_ma20": F(False), "tw.foreign": F(-120.4), "TAIEX.vol_label": F("放量")}
@@ -1214,7 +1297,7 @@ REQUIRED_ROWS = (
        "tw.options", "tw.fund.0050"]
     + [f"macro.{s}" for s in ("VIX", "VIX3M", "UST3M", "UST10Y", "DXY", "WTI", "BRENT", "GOLD", "SILVER", "BTC",
                               "USDTWD", "RUT", "DJI", "IXIC", "MOVE", "SPY_DD")]
-    + ["events.next", "season.now", "election", "trump.summary", "news.us", "news.tw", "news.iran", "trump.posts",
+    + ["events.next", "season.now", "election", "trump.summary", "news.us", "news.tw", "news.iran", "news.semi", "trump.posts",
        "oneliner.us", "oneliner.tw", "contra.us", "contra.tw"]
 )
 
@@ -1241,6 +1324,16 @@ class TestRowIds:
         assert {"expiry", "call_wall", "put_wall", "max_pain"} <= set(options["monthly"][1])
         assert {"value", "chg", "source"} <= set(mc.ROW_IDS["macro.BTC"])
 
+    def test_vxtlt_is_its_own_row_and_move_is_left_alone(self):
+        """2026-10-24 第 9 輪（A12，審查 r9 s3-F9／s4-F13）：CBOE 的 VXTLT 約 15、MOVE 約 100，量綱差 6–7 倍，所以 VXTLT 是
+        獨立的一列（append-only），不寫進 macro.MOVE；兩列並存，MOVE 的形狀與意義不變。"""
+        assert "macro.VXTLT" in mc.ROW_IDS and "macro.MOVE" in mc.ROW_IDS
+        assert mc.ROW_IDS["macro.VXTLT"] == mc.ROW_IDS["macro.MOVE"] == mc.ROW_IDS["macro.VIX"]  # 同一種宏觀列的形狀
+        row = {"label": "宏觀", "values": {"value": 15.09, "chg": None, "chg_pct": None, "source": "CBOE"},
+               "data_date": "2026-10-22", "period": None, "source": "CBOE", "basis": "收盤", "stale_after": 1.0e10,
+               "state": "ok"}
+        assert mc.row_ok("macro.VXTLT", row) and not mc.row_ok("macro.VXTLT", {**row, "values": {"value": "15"}})
+
     def test_spec_checker(self):
         assert mc.spec_ok("num", 1) and mc.spec_ok("num", 1.5) and not mc.spec_ok("num", True)
         assert not mc.spec_ok("num", float("nan")) and mc.spec_ok("num?", None) and not mc.spec_ok("num", None)
@@ -1251,6 +1344,10 @@ class TestRowIds:
         assert not mc.values_ok("no.such.row", {})
         assert mc.values_ok("news.us", {"items": [{"title": "美股收高", "source": None, "published_utc": 1.0}]})
         assert not mc.values_ok("news.us", {"items": [{"title": 3, "source": None, "published_utc": 1.0}]})
+        for topic in ("us", "tw", "iran", "semi"):  # 第 9 輪 A17：半導體新聞和其他主題同一種形狀
+            assert mc.ROW_IDS[f"news.{topic}"] == mc.ROW_IDS["news.us"]
+        assert mc.values_ok("news.semi", {"items": [{"title": "費半收高", "source": "某報", "published_utc": 1.0}]})
+        assert not mc.values_ok("news.semi", {"items": [{"title": None, "source": "某報", "published_utc": 1.0}]})
 
     def test_row_envelope(self):
         row = {"label": "QQQ", "values": {}, "data_date": None, "period": None, "source": "CBOE", "basis": None,
@@ -1290,6 +1387,132 @@ class TestRowIds:
             assert october["taiex"] is None and october["taiex_pending"] is True
 
 
+def committed_season_table() -> dict:
+    return json.loads((HERE / "market_seasonality.json").read_text(encoding="utf-8"))
+
+
+class TestSemiconductorSeason:
+    """2026-10-24 第 9 輪 A14：SOXX 自身（Nasdaq 近 9 年）在前，SOX 長歷史在後；數字都來自 market_seasonality.json。"""
+
+    def test_october_2026_from_the_committed_table(self):
+        october = mc.season_values(committed_season_table(), 2026, 10)
+        assert october["soxx"] == {"up_pct": 66.7, "median": 2.43, "mean": 1.49, "n": 9}
+        assert october["soxx_q4"] == {"up_pct": 77.8, "median": 11.08, "mean": 10.23, "n": 9}
+        assert october["soxx_midterm"] is None and october["soxx_midterm_q4"] is None  # 期中選舉年只有 2018、2022 兩年（<5）
+        assert october["soxx_pending"] is False and october["soxx_range"] == {"first": "2016-11", "last": "2025-12"}
+        assert october["sox"] == {"up_pct": 62.5, "median": 3.34, "mean": 2.53, "n": 32}
+        assert october["sox_q4"] == {"up_pct": 78.1, "median": 9.39, "mean": 8.77, "n": 32}
+        assert october["sox_midterm"] == {"up_pct": 87.5, "median": 5.04, "mean": 7.07, "n": 8}
+        assert october["sox_midterm_q4"] == {"up_pct": 87.5, "median": 9.27, "mean": 14.71, "n": 8}
+        assert october["sox_pending"] is False and october["sox_range"] == {"first": "1994-06", "last": "2025-12"}
+        assert mc.values_ok("season.now", october)
+        assert json.loads(json.dumps(october, allow_nan=False)) == october
+
+    def test_other_years_and_months(self):
+        table = committed_season_table()
+        later = mc.season_values(table, 2027, 10)
+        assert later["midterm_year"] is False
+        assert later["sox_midterm"] is None and later["sox_midterm_q4"] is None and later["soxx_midterm"] is None
+        assert later["sox"]["n"] == 32 and later["soxx"]["n"] == 9 and mc.values_ok("season.now", later)
+        november = mc.season_values(table, 2026, 11)
+        assert november["soxx"]["n"] == 10  # 2016-11 就有月變化：11 月比 10 月多一年
+        assert november["sox_midterm"] == {"up_pct": 87.5, "median": 5.85, "mean": 9.83, "n": 8}
+
+    def test_midterm_rows_need_at_least_five_years(self):
+        table = committed_season_table()
+        assert mc.SEMI_MIN_MIDTERM_YEARS == 5
+        table["soxx"]["midterm"]["months"]["10"]["n"] = 5  # 假設 SOXX 之後累積到 5 個期中選舉年
+        table["soxx"]["midterm"]["q4"]["n"] = 5
+        october = mc.season_values(table, 2026, 10)
+        assert october["soxx_midterm"]["n"] == 5 and october["soxx_midterm_q4"]["n"] == 5
+        table["sox"]["midterm"]["months"]["10"]["n"] = 4
+        assert mc.season_values(table, 2026, 10)["sox_midterm"] is None
+        assert mc.season_values(table, 2026, 10)["sox_midterm_q4"]["n"] == 8  # 只有樣本不足的那一格拿掉
+
+    def test_an_older_table_without_the_sections_is_pending_not_an_error(self):
+        table = {key: value for key, value in committed_season_table().items() if key not in ("soxx", "sox")}
+        for bad in (table, {"sp500": table["sp500"], "soxx": "x", "sox": [1]}, {}, None, []):
+            values = mc.season_values(bad, 2026, 10)
+            for name in ("soxx", "sox"):
+                assert values[f"{name}_pending"] is True and values[name] is None and values[f"{name}_q4"] is None
+                assert values[f"{name}_midterm"] is None and values[f"{name}_midterm_q4"] is None
+                assert values[f"{name}_range"] is None
+            assert mc.values_ok("season.now", values)
+
+    @pytest.mark.parametrize(
+        "damage",
+        [
+            lambda s: s.update(pending_full_data=True),
+            lambda s: s.pop("pending_full_data"),
+            lambda s: s.update(sample=[1994]),
+            lambda s: s.update(sample=[2025, 1994]),
+            lambda s: s.update(sample=["1994", "2025"]),
+            lambda s: s.update(sample=[True, 2025]),
+            lambda s: s.update(months_valid=400),  # 比應有的月數還多
+            lambda s: s.update(months_valid=100),  # 不到應有月數的 90%
+            lambda s: s.update(months_expected=5),
+            lambda s: s.update(months_expected="379"),
+            lambda s: s.update(first_month="1994-13"),
+            lambda s: s.update(first_month=None),
+            lambda s: s.update(last_month="<b>"),
+            lambda s: s.update(last_month="1990-01"),  # 比 first_month 早
+        ],
+    )
+    def test_an_implausible_section_is_pending_and_the_other_one_is_unaffected(self, damage):
+        table = committed_season_table()
+        damage(table["sox"])
+        values = mc.season_values(table, 2026, 10)
+        assert values["sox_pending"] is True and values["sox"] is None and values["sox_range"] is None
+        assert values["soxx_pending"] is False and values["soxx"]["n"] == 9
+        assert mc.values_ok("season.now", values)
+
+    @pytest.mark.parametrize(
+        "stats",
+        [
+            {"up_pct": 62.5, "median": 3.34, "mean": 2.53, "n": 0},
+            {"up_pct": 62.5, "median": 3.34, "mean": 2.53, "n": 33},  # 比樣本的 32 年還多
+            {"up_pct": 62.5, "median": 3.34, "mean": 2.53, "n": True},
+            {"up_pct": 62.5, "median": 3.34, "mean": 2.53, "n": 3.5},
+            {"up_pct": 101.0, "median": 3.34, "mean": 2.53, "n": 32},
+            {"up_pct": -1.0, "median": 3.34, "mean": 2.53, "n": 32},
+            {"up_pct": 62.5, "median": -100.5, "mean": 2.53, "n": 32},
+            {"up_pct": 62.5, "median": 3.34, "mean": float("nan"), "n": 32},
+            {"up_pct": 62.5, "median": "3.34", "mean": 2.53, "n": 32},
+            {"up_pct": 62.5, "median": 3.34, "n": 32},
+            [],
+            None,
+        ],
+    )
+    def test_an_implausible_statistic_is_dropped_but_the_section_stays(self, stats):
+        table = committed_season_table()
+        table["sox"]["months"]["10"] = stats
+        values = mc.season_values(table, 2026, 10)
+        assert values["sox"] is None and values["sox_pending"] is False and values["sox_q4"]["n"] == 32
+        assert mc.values_ok("season.now", values)
+
+    def test_new_sentences_are_fixed_texts_without_years_or_the_word_win_rate(self):
+        names = [name for name in dir(mc) if name.startswith("TEXT_SEASON_") and name not in {
+            "TEXT_SEASON_NOTE", "TEXT_SEASON_SP_BASIS", "TEXT_SEASON_TW_BASIS"}]
+        assert set(names) >= {
+            "TEXT_SEASON_PRICE_BASIS", "TEXT_SEASON_SOXX_HEAD", "TEXT_SEASON_SOXX_Q4", "TEXT_SEASON_SOXX_MIDTERM",
+            "TEXT_SEASON_SOXX_MIDTERM_Q4", "TEXT_SEASON_SOXX_FEW_MIDTERM", "TEXT_SEASON_SOXX_SAMPLE",
+            "TEXT_SEASON_SOXX_DATA", "TEXT_SEASON_SOX_HEAD", "TEXT_SEASON_SOX_Q4", "TEXT_SEASON_SOX_MIDTERM",
+            "TEXT_SEASON_SOX_MIDTERM_Q4", "TEXT_SEASON_SOX_SAMPLE", "TEXT_SEASON_SOX_DATA", "TEXT_SEASON_SEMI_NOTE",
+            "TEXT_SEASON_BASIS_NOTE"}
+        for name in names:
+            text = getattr(mc, name)
+            assert text in mc.FIXED_TEXTS, name  # 會過禁用字、validator（2027／2028）、年份的檢查
+            assert "勝率" not in text and not any(str(year) in text for year in range(1990, 2100)), name
+        assert "月底收盤" in mc.TEXT_SEASON_SOXX_HEAD and "價格口徑" in mc.TEXT_SEASON_SOX_HEAD
+        assert "{month}" in mc.TEXT_SEASON_SOXX_HEAD and "{range}" in mc.TEXT_SEASON_SOXX_SAMPLE
+
+    def test_the_note_under_the_card_does_not_say_win_rate_either(self):
+        """卡上的統計只寫「上漲比例」；註記原本寫「S&P 的統計不能直接當 SOXX 的勝率」，改成「…套用到 SOXX」。"""
+        assert "勝率" not in mc.TEXT_SEASON_NOTE and "SOXX" in mc.TEXT_SEASON_NOTE and "S&P" in mc.TEXT_SEASON_NOTE
+        assert mc.TEXT_SEASON_NOTE in mc.FIXED_TEXTS
+        assert committed_season_table()["note"] == mc.TEXT_SEASON_NOTE  # job 建表時寫進 json 的那一句
+
+
 class TestFixedTexts:
     def test_no_forbidden_words_except_the_exact_disclaimer(self):
         for text in mc.FIXED_TEXTS:
@@ -1312,6 +1535,28 @@ class TestFixedTexts:
 
     def test_colors_are_blue_orange_grey_only(self):
         assert set(mc.COLORS) == {"#1E5AA8", "#B7791F", "#555555", "#666666"}
+
+    def test_batch_1_b_track_sentences_are_fixed_texts(self):
+        """2026-10-24 第 9 輪批 1 B 軌：牆距基準、CFTC 沒有半導體期貨、財報行的固定句都在 market_calc 的 TEXT_*，所以
+        FIXED_TEXTS 的三個掃描（禁用字、2027／2028 的 validator、年份與承諾字）自動涵蓋；這裡鎖住精確的字。"""
+        expected = {
+            "TEXT_WALL_DIST_CLOSE": "牆距以收盤價計",
+            "TEXT_WALL_DIST_SPOT": "牆距以最新價計",
+            "TEXT_WALL_DIST_MIXED": "牆距以各檔標示的收盤價或最新價計",  # 期權細節卡：每檔標題列印了「收盤 X」或「最新價 X」
+            "TEXT_WALL_DIST_NAMED": "牆距：{pairs}計",  # 摘要卡：牆那幾列不印價格，基準混著時直接點名各檔
+            "TEXT_CFTC_NO_SEMI": "CFTC 沒有半導體期貨，期貨部位只看標普與那斯達克",
+            "TEXT_EARNINGS_HEAD": "前十大 45 天內財報（美東日期）",  # 2026-10-28 批 1 審查 F2-15：只看這檔 ETF 自己的前十大
+            "TEXT_EARNINGS_ESTIMATED": "預估",
+            "TEXT_EARNINGS_OTHERS": "其他成分股的日期暫缺或不在 45 天內",
+            "TEXT_EARNINGS_NONE": "成分股的日期暫缺或不在 45 天內",
+        }
+        for name, text in expected.items():
+            assert getattr(mc, name) == text and text in mc.FIXED_TEXTS, name
+        assert len(set(expected.values())) == len(expected)  # 九句互不相同
+        # 基準詞 → 句子的對照表只有 job 寫得出來的兩個詞（bot 查表，不照快照裡的字組句）
+        assert mc.WALL_DIST_TEXT == {mc.DIST_CLOSE: mc.TEXT_WALL_DIST_CLOSE, mc.DIST_SPOT: mc.TEXT_WALL_DIST_SPOT}
+        assert mc.WALL_DIST_WORD == {mc.DIST_CLOSE: "收盤價", mc.DIST_SPOT: "最新價"}
+        assert mc.TEXT_WALL_DIST_NAMED.format(pairs="QQQ 以收盤價、SOXX 以最新價") == "牆距：QQQ 以收盤價、SOXX 以最新價計"
 
 
 class TestModuleBoundary:
@@ -1465,8 +1710,12 @@ def test_etf_technicals_and_volume_skip_windows_that_touch_quarantine():
     assert all(tech.ma[n] is None and tech.above[n] is None for n in mc.MA_WINDOWS)
     older = [(sessions[-40], sessions[-35])]  # 碰到 60／120／240 日線，碰不到 20 日線與日變化
     tech = mc.technicals(closes, sessions, sessions[-1], older)
-    assert tech.chg_pct is not None and tech.ma[20] is not None and tech.rsi14 is not None
+    assert tech.chg_pct is not None and tech.ma[20] is not None
+    # RSI 往回算的那段在 sessions[-35] 截斷，只剩 34 筆：不到 RSI_MIN_CLOSES（80）就不算（2026-10-28 審查 seat3 I-1；以前這裡是有值）
+    assert tech.rsi14 is None
     assert tech.ma[60] is None and tech.ma[240] is None and tech.dd240_pct is None
+    far = [(sessions[-100], sessions[-95])]  # 碰到之後還有 94 筆：RSI 照算（80 筆以上才收斂）
+    assert mc.technicals(closes, sessions, sessions[-1], far).rsi14 is not None
     day_after = mc.technicals(closes, sessions, sessions[-1], [(sessions[-3], sessions[-2])])
     assert day_after.chg_pct is None  # 區間兩端都算：隔離結束的隔天日變化也不算（和 breadth 同一個規則）
     still_open = mc.technicals(closes, sessions, sessions[-1], [(sessions[-10], None)])  # 還沒解除的區間

@@ -83,6 +83,9 @@ ENDPOINTS: dict[str, Endpoint] = {
     "gnews.us": Endpoint("news.google.com", ("xml",), 2 << 20, 1_800, 1, 0),
     "gnews.tw": Endpoint("news.google.com", ("xml",), 2 << 20, 1_800, 1, 0),
     "gnews.iran": Endpoint("news.google.com", ("xml",), 2 << 20, 3_600, 1, 0),
+    # 2026-10-24 第 9 輪 A17：半導體新聞（「費城半導體」）一小時一次——news.google.com 每日 48＋48＋24＋24＝144 次，
+    # 主機額度 200（預設），留 56 次給失敗重試；30 分鐘版會是 168，只剩 32 次
+    "gnews.semi": Endpoint("news.google.com", ("xml",), 2 << 20, 3_600, 1, 0),
     "trumpstruth": Endpoint("www.trumpstruth.org", ("xml",), 2 << 20, 1_800, 1, 0),
     # 預測市場每 2 小時（PLAN §3.3）。2026-10-23 起封鎖中（PREDICTION_MARKETS_BLOCKED）：這四個不會被呼叫，
     # 主機也不在 market_http.ALLOWED_HOSTS 裡；表留著，解除封鎖時預算、網址檢查不用重寫
@@ -129,7 +132,8 @@ PROXY_ETF: dict[str, str] = {
 _PROXY_SYMBOLS = frozenset(PROXY_ETF.values())
 SOURCE_YAHOO = "Yahoo"
 
-NEWS_QUERIES: dict[str, str] = {"us": "美股", "tw": "台股", "iran": "伊朗"}
+# semi＝費城半導體：2026-10-23 實抓 36 小時內 55 則，前 5 則全是當天費半重挫（「美股 半導體」約 25 則、較雜）
+NEWS_QUERIES: dict[str, str] = {"us": "美股", "tw": "台股", "iran": "伊朗", "semi": "費城半導體"}
 
 
 def proxy_source_label(etf: str) -> str:
@@ -591,7 +595,7 @@ def parse_google_news_rss(xml: Any, now: Any, *, max_age_hours: float = NEWS_MAX
 
 
 def fetch_google_news(topic: str, now: Any, *, http: Any = None, ledger: Any = None) -> list[NewsItem]:
-    """topic：us（美股）、tw（台股）、iran（伊朗）。"""
+    """topic：us（美股）、tw（台股）、iran（伊朗）、semi（費城半導體）。"""
     query = NEWS_QUERIES.get(topic)
     if query is None:
         raise ValueError("unknown news topic")

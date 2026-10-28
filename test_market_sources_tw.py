@@ -1178,6 +1178,15 @@ def test_endpoint_budget_table():
         assert urlsplit(base).scheme == "https" and urlsplit(base).hostname in market_http.ALLOWED_HOSTS
 
 
+def test_the_taifex_comment_and_the_fx_cap_both_say_five_a_day():
+    """2026-10-24（審查 r9 seat1 N3）：ENDPOINTS 上面的註解還寫「匯率仍每天 2 次：07、09 點」，程式（taifex_fx 5 次）和同一段
+    後面的說明、market_pipeline_tw.taifex_due 的說明早就是 5 次。只改註解，次數不動。"""
+    assert m.ENDPOINTS["taifex_fx"].daily_max == 5 and m.ENDPOINTS["taifex_daily_options"].daily_max == 9
+    source = (Path(__file__).resolve().parent / "market_sources_tw.py").read_text(encoding="utf-8")
+    assert "匯率仍每天 2 次" not in source
+    assert "匯率每天 5 次：07、09…15 點" in source
+
+
 def test_import_has_no_side_effects():
     code = (
         "import sys, market_sources_tw; "

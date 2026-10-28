@@ -217,7 +217,7 @@ def test_tasks_and_groups():
     elections = {f"election.{market.key}": "medium" for market in market_sources_misc.PREDICTION_MARKETS}
     assert {"election.polymarket.house", "election.kalshi.house"} <= set(elections)  # 每個固定市場一個任務
     assert groups == {
-        "news.us": "fast", "news.tw": "fast", "news.iran": "fast", "trump.feed": "fast",
+        "news.us": "fast", "news.tw": "fast", "news.iran": "fast", "news.semi": "fast", "trump.feed": "fast",
         "macro.yahoo": "core", **elections,
     }
     assert "macro.btc" not in groups  # 2026-10-23：Coinbase 那條拿掉，BTC 走宏觀（Yahoo 或 IBIT 代理）
@@ -518,6 +518,58 @@ def test_news_keeps_36_hours_and_cleans_titles(env):
     # 伊朗一小時一次
     assert run(make_ctx(env, now.timestamp()), "news.iran") == "ok"
     assert run(make_ctx(env, now.timestamp() + 1800), "news.iran") == "not_due"
+
+
+def test_semiconductor_news_is_hourly_with_its_own_query_and_the_same_cleaning(env):
+    """第 9 輪 A17：news.semi＝Google News「費城半導體」，一小時一次；標題、來源和其他主題一樣先洗過、36 小時內才留。"""
+    now = datetime(2026, 10, 16, 2, 0, tzinfo=UTC)
+    env.http.route("news.google.com", news_rss([
+        ("費半重挫逾 6% 晶片股全面下跌 - 甲報", now - timedelta(hours=1), "甲報"),
+        ("輝達財測 詳見 https://evil.example/x - 乙報", now - timedelta(hours=2), "乙報"),
+        ("x @all 半導體 - 丙報", now - timedelta(hours=3), "丙報"),
+        ("三天前的半導體新聞 - 丁報", now - timedelta(hours=72), "丁報"),
+    ]))
+    assert run(make_ctx(env, now.timestamp()), "news.semi") == "ok"
+    assert len(env.http.calls) == 1 and urlsplit(env.http.calls[0]).query.startswith(
+        "q=%E8%B2%BB%E5%9F%8E%E5%8D%8A%E5%B0%8E%E9%AB%94&")  # 費城半導體
+    saved = payload(env, "news.semi")
+    assert [item["title"] for item in saved["items"]] == ["費半重挫逾 6% 晶片股全面下跌", "x all 半導體"]  # 網址那則整則丟、@ 被換掉
+    assert [item["source"] for item in saved["items"]] == ["甲報", "丙報"]
+    assert env.store.get_obs("news.semi")["data_date"] == "2026-10-16"
+    assert env.store.get_obs("news.us") is None  # 不寫別的主題
+    # 半導體和伊朗一樣一小時一次（美股、台股是 30 分鐘）
+    assert run(make_ctx(env, now.timestamp() + 1800), "news.semi") == "not_due"
+    assert run(make_ctx(env, now.timestamp() + 3599), "news.semi") == "not_due"
+    assert run(make_ctx(env, now.timestamp() + 3600), "news.semi") == "ok"
+    assert run(make_ctx(env, now.timestamp()), "news.us") == "ok"
+    assert run(make_ctx(env, now.timestamp() + 1799), "news.us") == "not_due"
+    assert run(make_ctx(env, now.timestamp() + 1800), "news.us") == "ok"
+
+
+def test_the_news_topics_use_144_of_the_200_daily_requests_to_news_google_com(env):
+    """24 小時、每 15 分鐘一輪、四個主題都成功：美股、台股各 48 次，伊朗、半導體各 24 次。"""
+    start = datetime(2026, 10, 16, 2, 0, tzinfo=UTC)
+    env.http.route("news.google.com", news_rss([("某則標題 - 甲報", start - timedelta(hours=1), "甲報")]))
+    done = {topic: 0 for topic in misc.NEWS_TOPICS}
+    for step in range(96):
+        ctx = make_ctx(env, start.timestamp() + step * 900)
+        for topic in misc.NEWS_TOPICS:
+            if run(ctx, f"news.{topic}") == "ok":
+                done[topic] += 1
+    assert done == {"us": 48, "tw": 48, "iran": 24, "semi": 24}
+    assert env.http.count("news.google.com") == 144
+    # 帳本的「每日」是台北日：這 24 小時（台北 10:00 起）橫跨兩天，兩天的次數加起來 144、各自離 200 的上限很遠
+    first_day = env.store.fetch_counts(now=start.timestamp())["news.google.com"]
+    second_day = env.store.fetch_counts(now=(start + timedelta(hours=23, minutes=45)).timestamp())["news.google.com"]
+    assert first_day["count"] + second_day["count"] == 144 and first_day["cap"] == second_day["cap"] == 200
+    assert max(first_day["count"], second_day["count"]) <= 96
+
+
+def test_the_semiconductor_task_comes_after_the_older_news_tasks_in_the_fast_group():
+    names = [task.name for task in misc.tasks()]
+    assert names[:5] == ["news.us", "news.tw", "news.iran", "news.semi", "trump.feed"]
+    assert misc.NEWS_TOPICS == ("us", "tw", "iran", "semi")  # 新的放最後：同一輪裡舊主題先抓
+    assert all(task.group == "fast" and task.budget_s == 8.0 for task in misc.tasks() if task.name.startswith("news."))
 
 
 def test_news_items_drop_stale_future_and_naive_dates():

@@ -63,8 +63,14 @@ HOST_RULES: dict[str, HostRule] = {
     "api.nasdaq.com": HostRule(1.0, 900),
     "www.twse.com.tw": HostRule(10.0, 12),
     "api.finmindtrade.com": HostRule(3.0, 60),
+    # BLS API v1：免註冊每天 25 次、日界線沒寫、不一定以 IP 計。每台北日 12 次（一半）：任一 24 小時至多橫跨兩個台北日，也不會超過 25；
+    # 一輪最多 4 個請求隔 5 秒（任務預算 35 秒），公布日 ≤10 次，留 2 次給失敗重試（2026-10-24 審查 r9 s2、s4）
+    "api.bls.gov": HostRule(5.0, 12),
     "query1.finance.yahoo.com": HostRule(5.0, 2, "finance.yahoo.com"),
     "query2.finance.yahoo.com": HostRule(5.0, 2, "finance.yahoo.com"),
+    # 2026-10-24：MacroMargin 的川普壓力指數頁（個人網站）：每個資料日一次、沒更新時每 2 小時再看、每台北日最多 6 次
+    # （market_pipeline_taco）；主機另外留 2 次餘裕，間隔 10 秒
+    "ocmacro.com": HostRule(10.0, 8),
 }
 DEFAULT_HOST_RULE = HostRule(2.0, 200)
 

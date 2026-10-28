@@ -427,6 +427,41 @@ def test_code_hash_and_status(tmp_path: Path):
     assert job.code_status(paths, base) == "unverified"  # 不跟 symlink
 
 
+def test_code_hash_covers_the_seasonality_table(tmp_path: Path):
+    """第 9 輪 A14：market_seasonality.json（publish 讀它算 season.now）也是程式的一部分：改了它就要 rehash。"""
+    job = _load_job()
+    base = tmp_path / "bot"
+    (base / "jobs").mkdir(parents=True)
+    (base / "market_a.py").write_text("A = 1\n")
+    (base / "market_z.py").write_text("Z = 1\n")
+    (base / "jobs" / "market_snapshot.py").write_text("J = 1\n")
+    (base / "other.json").write_text("{}\n")
+    without = job.code_hash(base)  # 沒有這個檔（例：舊的暫存目錄）也照常算
+    assert [path.name for path in job.code_files(base)] == ["market_a.py", "market_z.py", "market_snapshot.py"]
+    (base / "market_seasonality.json").write_text('{"schema": 1}\n')
+    with_table = job.code_hash(base)
+    assert with_table != without and re.fullmatch(r"[0-9a-f]{64}", with_table)
+    assert [path.name for path in job.code_files(base)] == [
+        "market_a.py", "market_seasonality.json", "market_z.py", "market_snapshot.py"]
+    (base / "market_seasonality.json").write_text('{"schema": 1, "sox": {}}\n')
+    assert job.code_hash(base) != with_table  # 內容變了：簽章要重算
+    (base / "market_seasonality.json").write_text('{"schema": 1}\n')
+    (base / "other.json").write_text('{"x": 1}\n')
+    assert job.code_hash(base) == with_table  # 別的 json 不算
+    (tmp_path / "state").mkdir(mode=0o700)
+    paths = market_paths.Paths.under(tmp_path)
+    market_paths.write_private_atomic(paths.deployed_hash, (with_table + "\n").encode())
+    assert job.code_status(paths, base) == "verified"
+    (base / "market_seasonality.json").write_text('{"schema": 1, "soxx": {}}\n')
+    assert job.code_status(paths, base) == "unverified"  # 只改了季節性表、沒重簽 → job 不連網
+
+
+def test_the_real_code_hash_includes_the_committed_seasonality_table():
+    job = _load_job()
+    assert WORK / "market_seasonality.json" in job.code_files()
+    assert re.fullmatch(r"[0-9a-f]{64}", job.code_hash())
+
+
 def test_plist_template():
     job = _load_job()
     plist = plistlib.loads(job.render_plist("/Users/test/bot", "/Users/test").encode())
