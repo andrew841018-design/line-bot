@@ -2863,10 +2863,13 @@ def cpi_poll(now_et: datetime, stored: str | None, last_probe: float | None, *, 
 # ── 資金輪動（必需消費 XLP／KO 對半導體 SOXX；2026-10-28）──────────────────────────────────────────
 # Andrew 2026-10-28：「新增消費型類股(KO and XLP)的監控，以此預判可能到來的資金輪動（ex:如果KO低位盤整，SOXX高位插針，
 # 可能預判資金即將往消費類股輪動）」；追問後：放在美股卡、不寫死單一組條件、不主動推播、KO 也能觸發（B 案）、研判那一列用描述句。
-# 只看收盤價（不存開高低，插針這一批不做），卡上只描述狀態：這不是資金流向資料，也不是買賣建議。規則（每個交易日各自算）：
+# 只看價格：收盤價，SOXX 另外看開高低（插針，2026-10-29 增補 v3.1：collect 順手存 us.ohlc.SOXX、publish 讀它）；卡上只描述
+# 狀態：這不是資金流向資料，也不是買賣建議。規則（每個交易日各自算）：
 #   趨勢 T＝XLP 與 SOXX 近 ROT_WINDOW 個交易日的報酬（各自先 half-up 到一位小數）相減，≥+5 個百分點是必需消費比較強、≤−5 是
 #     半導體比較強，其他沒有方向；T 只看 XLP 對 SOXX（KO 是個股，不代表整個類股）。
-#   SOXX 偏熱＝RSI≥70，或（離 240 日高點 ≥−3% 而且離季線 ≥+10%）；SOXX 偏冷＝RSI≤30，或離季線 ≤−10%。
+#   SOXX 偏熱＝RSI≥70，或（離 240 日高點 ≥−3% 而且離季線 ≥+10%），或高位插針（研判日往回 ROT_WICK_SESSIONS 個交易日內最長的
+#     長上影線 ≥1.5%，而且研判日離 240 日高點 ≥−5%；rot_wick、rot_wick_hot。開高低缺漏或插針不成立時，研判和沒有插針時逐日
+#     相同；成立時和 RSI≥70 那條路一樣走三值邏輯）；SOXX 偏冷＝RSI≤30，或離季線 ≤−10%。
 #   必需消費偏弱＝XLP 或 KO 在季線下、或 RSI≤40；必需消費偏熱＝XLP 或 KO 的 RSI≥70（KO 沒有研判日的收盤就是未知）。
 #   X：SOXX 同時偏熱又偏冷 → 沒有；半導體偏熱＋必需消費偏弱 → watch_staples；半導體偏冷＋必需消費偏熱 → watch_semis；
 #     用 Kleene 三值邏輯，未知不當成假。結果：X 是 watch 就用 X；X 未知而且 T 沒有方向 → 資料不足；其他用 T。
@@ -2887,6 +2890,16 @@ ROT_STRETCH_MA60_PCT = Decimal("10.0")  # 離季線 ≥+10% 算拉得很開（�
 ROT_LOOKBACK = 5
 ROT_CONFIRM_DAYS = 2  # 狀態要連續幾個交易日一樣才會換（rot_confirmed 照這個寫；TEXT_ROT_NOTE_HELD 的「2」用測試綁住）
 ROT_CLOSE_SYMBOLS = ("XLP", "SOXX", "KO")  # rot_inputs 讀的代號（closes 的鍵）
+# 高位插針（SOXX 的長上影線；2026-10-29 增補 v3.1，Andrew 例子原話「SOXX高位插針」）。都是起始值、沒有回測：
+ROT_WICK_SESSIONS = 3  # 研判日往回幾個交易日（含研判日）
+ROT_WICK_BODY_RATIO = Decimal("2")  # 上影線 ≥ 2 × max(實體, 下影線)：下影線也要短（長腳十字是多空拉鋸，不算）
+ROT_WICK_MIN_PCT = Decimal("1.5")  # 上影線 ÷ 那根 K 棒的收盤（一位小數）≥1.5% 才算高位插針
+ROT_WICK_MAX_PCT = Decimal("15.0")  # 超過（還沒四捨五入的值）當壞資料，那一天不算
+# 研判日離 240 日高點 ≥−5% 算高位：比「近高點且拉很開」那條路的 −3% 寬，因為長上影線本身就是轉弱的訊號，不必再要求拉很開；
+# 插針的高比收盤高 1.5% 以上，而且之後沒有收盤站上它（rot_wick 的突破失效），所以等於「插針的高點離 240 日高點 5% 以內」
+ROT_WICK_NEAR_HIGH_PCT = Decimal("-5.0")
+# K 棒收盤和已存的正式收盤差超過這個比例，那根就不算（和 market_pipeline_us.GUARD_DIFF 同一個值，測試綁住；calc 不 import pipeline）
+ROT_OHLC_MATCH = 0.005
 ROT_STAPLES, ROT_SEMIS, ROT_WATCH_STAPLES, ROT_WATCH_SEMIS, ROT_NONE, ROT_INSUFFICIENT = (
     "staples", "semis", "watch_staples", "watch_semis", "none", "insufficient",
 )
@@ -2907,6 +2920,9 @@ TEXT_ROT_NOTE_RETURNS = "資金輪動只看價格：近 20 個交易日 XLP {xlp
 TEXT_ROT_NOTE_WATCH = "資金輪動只看價格：SOXX RSI {soxx_rsi}、離季線 {soxx_ma60}、離 240 日高點 {soxx_dd240}；XLP RSI {xlp_rsi}、{xlp_ma60}"
 TEXT_ROT_NOTE_KO = "；KO RSI {ko_rsi}、{ko_ma60}"  # KO 有值時接在 TEXT_ROT_NOTE_WATCH 後面
 TEXT_ROT_NOTE_HELD = "狀態要連續 2 個交易日都一樣才會換"  # 顯示的狀態是沿用前幾天的（state≠raw）時加
+# 顯示的狀態是 watch_staples 而且插針成立（rot_wick_hot）時，footer 獨立一行，放在 WATCH 句之後、HELD 句之前（2026-10-29 增補）：
+# 「衝高回落」是給家人看的白話，術語放括號、和數字綁在一起；「也算偏熱」接上列上的「半導體偏熱」
+TEXT_ROT_NOTE_WICK = "SOXX {day} 衝高回落（長上影線 {pct}），也算偏熱"
 ROT_STATE_TEXT: dict[str, str] = {
     ROT_STAPLES: TEXT_ROT_STAPLES,
     ROT_SEMIS: TEXT_ROT_SEMIS,
@@ -2947,14 +2963,92 @@ def _rot_return(series: Mapping[date, Any], intervals: Any, first: date, last: d
     return (float(end) / float(start) - 1.0) * 100.0
 
 
-def rot_inputs(closes: Mapping[str, Mapping[date, float]], quarantine: Any, cal: Any, day: date) -> dict:
+def ohlc_bar(values: Any) -> tuple[float, float, float, float] | None:
+    """一根 K 棒 [開, 高, 低, 收]：剛好 4 個值、每個都是 float（`type(v) is float`：int、bool、大整數、字串都不收）、正的有限數，
+    而且高 ≥ max(開, 收)、低 ≤ min(開, 收)；不合格回 None。開高低只有這一份定義：寫入端（market_pipeline_us._note_ohlc）、
+    publish、rot_wick 都用它。任何輸入都不丟例外。"""
+    if not isinstance(values, (list, tuple)) or len(values) != 4:
+        return None
+    if not all(type(value) is float and math.isfinite(value) and value > 0 for value in values):
+        return None
+    open_, high, low, close = values
+    if high < max(open_, close) or low > min(open_, close):
+        return None
+    return (open_, high, low, close)
+
+
+def ohlc_from_payload(payload: Any, *, upto: date | None = None) -> dict[date, tuple[float, float, float, float]]:
+    """us.ohlc.<代號> 的 payload {"bars": {"YYYY-MM-DD": [開, 高, 低, 收]}} → {日期: (開, 高, 低, 收)}。
+    日期鍵要過 spec_ok("date")（嚴格的 ASCII ISO）、值要過 ohlc_bar，不合格的丟掉；有 upto 時丟掉晚於它的日期。
+    任何形狀的輸入都回新的 dict、不修改傳進來的 payload、不丟例外。"""
+    bars = payload.get("bars") if isinstance(payload, dict) else None
+    found: dict[date, tuple[float, float, float, float]] = {}
+    if not isinstance(bars, dict):
+        return found
+    for key, values in bars.items():
+        if not spec_ok("date", key):
+            continue
+        day = date.fromisoformat(key)
+        if upto is not None and day > upto:
+            continue
+        bar = ohlc_bar(values)
+        if bar is not None:
+            found[day] = bar
+    return found
+
+
+def rot_wick(ohlc: Mapping[date, Any], closes: Mapping[date, Any], intervals: Any, cal: Any,
+             day: date) -> tuple[float | None, date | None]:
+    """SOXX 在研判日 day 的長上影線：(百分比，一位小數的 float, 那一天)；沒有 → (None, None)。純函式，不修改輸入、不丟例外。
+
+    ohlc＝{日期: [開, 高, 低, 收]}（ohlc_from_payload 的結果）；closes、intervals 只放 SOXX 一檔（和 rot_inputs 用的同一份收盤、
+    同一份隔離區間）；cal＝TradingCalendar 或排好的交易日清單。
+    窗口＝_sessions_upto(cal, day, ROT_WICK_SESSIONS)，最後一天必須是 day（day 不是交易日 → 沒有）。窗口裡每一天要同時：
+    K 棒合格（ohlc_bar）、那天有正的正式收盤（_pos）而且 K 棒收盤和它差 ≤ROT_OHLC_MATCH（和 _evaluate 同一個 float 公式）、
+    沒碰到隔離區間、之後到 day 為止（只看窗口，≤ day）沒有一天的正式收盤高於那根的高（突破就失效）。
+    再用 Decimal 依序算：上影線＝高 − max(開, 收) 要 >0；上影線 ≥ ROT_WICK_BODY_RATIO × max(實體, 下影線)；上影線 ÷ 那根自己的
+    收盤 ×100（還沒四捨五入）≤ROT_WICK_MAX_PCT，超過當壞資料；最後才 ROUND_HALF_UP 到一位小數。符合的日子取 max((百分比, 日期))：
+    一樣長取最近那天。是不是「高位插針」由 rot_wick_hot 判斷（這裡不比 1.5%）。"""
+    window = _sessions_upto(cal, day, ROT_WICK_SESSIONS)
+    if not window or window[-1] != day:
+        return None, None
+    bars = ohlc if isinstance(ohlc, Mapping) else {}
+    series = closes if isinstance(closes, Mapping) else {}
+    best: tuple[Decimal, date] | None = None
+    for index, session in enumerate(window):
+        bar, official = ohlc_bar(bars.get(session)), series.get(session)
+        if bar is None or not _pos(official) or abs(bar[3] / official - 1.0) > ROT_OHLC_MATCH:
+            continue
+        if _touches_quarantine(intervals, session, session):
+            continue
+        if any(_pos(series.get(later)) and series[later] > bar[1] for later in window[index + 1:]):
+            continue  # 插針之後收盤站上它的高：失效（w3 X1）
+        open_, high, low, close = (_infl_dec(value) for value in bar)
+        with localcontext(INFL_CONTEXT):
+            upper = high - max(open_, close)
+            if upper <= 0 or upper < ROT_WICK_BODY_RATIO * max(abs(close - open_), min(open_, close) - low):
+                continue
+            pct = upper / close * 100
+            if pct > ROT_WICK_MAX_PCT:
+                continue
+            pct = _round1(pct)
+        if best is None or (pct, session) > best:
+            best = (pct, session)
+    if best is None:
+        return None, None
+    return float(best[0]), best[1]
+
+
+def rot_inputs(closes: Mapping[str, Mapping[date, float]], quarantine: Any, cal: Any, day: date, *,
+               ohlc: Mapping[date, Any] | None = None) -> dict:
     """研判日 day 的指標，都是顯示精度的 half-up 值（報酬、乖離一位小數的 float，RSI 整數）；不修改傳進來的 dict／list。
 
     closes＝{代號: {日期: 收盤}}（XLP、SOXX、KO；KO 可以沒有）；quarantine＝{代號: 隔離區間}；cal＝TradingCalendar（或排好的
-    預期交易日清單，同 technicals）。
+    預期交易日清單，同 technicals）；ohlc＝SOXX 的開高低 {日期: [開, 高, 低, 收]}（ohlc_from_payload；沒有就是 None）。
     - xlp_ret20／soxx_ret20：近 ROT_WINDOW＋1 個交易日要剛好湊滿、最後一天是 day；兩端（第一天、day）都要有正的收盤，而且兩檔
       的隔離區間都沒碰到 [第一天, day]，否則兩個都是 None。
     - SOXX、XLP：technicals（RSI14、離季線、離 240 日高點、在不在季線上），和 ETF 列同一個算法與窗口規則。
+    - soxx_wick_pct／soxx_wick_day：rot_wick（SOXX 的收盤與隔離區間），百分比是一位小數的 float、日期是 ISO 字串；沒有都是 None。
     - KO：只有 KO 有 day 這天的收盤才算（ko_rsi、ko_above60），沒有就都是 None（分類裡算未知）。"""
 
     def series(symbol: str) -> Mapping[date, Any]:
@@ -2977,12 +3071,15 @@ def rot_inputs(closes: Mapping[str, Mapping[date, float]], quarantine: Any, cal:
     xlp = technicals(series("XLP"), cal, day, intervals("XLP"))
     ko_series = series("KO")
     ko = technicals(ko_series, cal, day, intervals("KO")) if _pos(ko_series.get(day)) else None
+    wick_pct, wick_day = rot_wick(ohlc, series("SOXX"), intervals("SOXX"), cal, day)
     return {
         "xlp_ret20": xlp_ret,
         "soxx_ret20": soxx_ret,
         "soxx_rsi": _rot_int(soxx.rsi14),
         "soxx_ma60": _rot_1dp(soxx.ma_dist.get(60)),
         "soxx_dd240": _rot_1dp(soxx.dd240_pct),
+        "soxx_wick_pct": wick_pct,
+        "soxx_wick_day": wick_day.isoformat() if wick_day is not None else None,
         "xlp_rsi": _rot_int(xlp.rsi14),
         "xlp_above60": xlp.above.get(60),
         "ko_rsi": _rot_int(ko.rsi14) if ko is not None else None,
@@ -3028,6 +3125,13 @@ def _rot_below(above: Any) -> bool | None:
     return True if above is False else False if above is True else None
 
 
+def rot_wick_hot(values: Mapping[str, Any]) -> bool:
+    """高位插針（SOXX 偏熱的第三條路）：soxx_wick_pct ≥ROT_WICK_MIN_PCT 而且 soxx_dd240 ≥ROT_WICK_NEAR_HIGH_PCT（都比存下來的
+    顯示值）。只回 True／False：任一個缺值、或是沒有這兩個鍵的舊 values 都是 False（不是未知：缺開高低只會漏掉插針）。"""
+    return (_rot_at_least(values.get("soxx_wick_pct"), ROT_WICK_MIN_PCT) is True
+            and _rot_at_least(values.get("soxx_dd240"), ROT_WICK_NEAR_HIGH_PCT) is True)
+
+
 def rot_classify(values: Mapping[str, Any]) -> str:
     """一天的原始狀態（只看傳進來的顯示精度值，不改它）。步驟見本區塊開頭的說明。"""
     gap = rot_gap(values)
@@ -3039,6 +3143,7 @@ def rot_classify(values: Mapping[str, Any]) -> str:
     hot = _k_any(
         _rot_at_least(soxx_rsi, ROT_RSI_HOT),
         _k_all(_rot_at_least(values.get("soxx_dd240"), ROT_NEAR_HIGH_PCT), _rot_at_least(soxx_ma60, ROT_STRETCH_MA60_PCT)),
+        rot_wick_hot(values),
     )
     cold = _k_any(_rot_at_most(soxx_rsi, ROT_RSI_COLD), _rot_at_most(soxx_ma60, -ROT_STRETCH_MA60_PCT))
     weak = _k_any(
@@ -3082,34 +3187,46 @@ def rot_confirmed(raws: Sequence[str]) -> str:
     return ROT_NONE
 
 
-def rotation_values(closes: Mapping[str, Mapping[date, float]], quarantine: Any, cal: Any, day: date) -> dict:
+def rotation_values(closes: Mapping[str, Mapping[date, float]], quarantine: Any, cal: Any, day: date, *,
+                    ohlc: Mapping[date, Any] | None = None) -> dict:
     """`us.rot.state` 的 values：研判日 day 的指標（rot_inputs）＋raw（day 當天的原始狀態）＋state（rot_confirmed 之後、卡上顯示的）。
-    往回 ROT_LOOKBACK 個交易日（含 day）用同一份收盤與隔離區間重算，不讀上一份快照，publish 重跑結果一樣；不修改輸入。
-    day 不是交易日時，day 當天算不出來 → insufficient。"""
-    today = rot_inputs(closes, quarantine, cal, day)
+    往回 ROT_LOOKBACK 個交易日（含 day）用同一份收盤、隔離區間與開高低（ohlc，每一個回看日都傳）重算，不讀上一份快照，publish
+    重跑結果一樣；不修改輸入。day 不是交易日時，day 當天算不出來 → insufficient。"""
+    today = rot_inputs(closes, quarantine, cal, day, ohlc=ohlc)
     earlier = [session for session in _sessions_upto(cal, day, ROT_LOOKBACK) if session < day]
-    raws = [rot_classify(rot_inputs(closes, quarantine, cal, session)) for session in earlier]
+    raws = [rot_classify(rot_inputs(closes, quarantine, cal, session, ohlc=ohlc)) for session in earlier]
     raws.append(rot_classify(today))
     return {**today, "raw": raws[-1], "state": rot_confirmed(raws)}
 
 
-# values 的欄位（ROW_IDS["us.rot.state"]）：state／raw 是 ROT_STATES 的列舉碼；報酬與乖離是一位小數的 %，RSI 是整數
+# values 的欄位（ROW_IDS["us.rot.state"]）：state／raw 是 ROT_STATES 的列舉碼；報酬、乖離與上影線是一位小數的 %，RSI 是整數，
+# soxx_wick_day 是 ISO 日期字串（插針那一天；和 soxx_wick_pct 一起有或一起沒有）
 ROT_SPEC = {
     "state": frozenset(ROT_STATES),
     "raw": frozenset(ROT_STATES),
     "xlp_ret20": "num?", "soxx_ret20": "num?",
     "soxx_rsi": "int?", "soxx_ma60": "num?", "soxx_dd240": "num?",
+    "soxx_wick_pct": "num?", "soxx_wick_day": "date?",
     "xlp_rsi": "int?", "xlp_above60": "bool?",
     "ko_rsi": "int?", "ko_above60": "bool?",
 }
 _ROT_RSI_KEYS = ("soxx_rsi", "xlp_rsi", "ko_rsi")
-_ROT_ONE_DECIMAL_KEYS = ("xlp_ret20", "soxx_ret20", "soxx_ma60", "soxx_dd240")
+_ROT_ONE_DECIMAL_KEYS = ("xlp_ret20", "soxx_ret20", "soxx_ma60", "soxx_dd240", "soxx_wick_pct")
 
 
 def rotation_values_ok(values: Any) -> bool:
     """us.rot.state 的 values：型別（ROT_SPEC）、範圍、一位小數，再用 rot_classify 從存下來的值重算、必須等於 raw，而且 state 和 raw
-    的「資料不足」要一致。publish 組列時（不合就只讓這一列暫缺）與 bot 讀快照時（不合就當暫缺）共用；不丟例外。"""
-    if not spec_ok(ROT_SPEC, values):
+    的「資料不足」要一致。publish 組列時（不合就只讓這一列暫缺）與 bot 讀快照時（不合就當暫缺）共用；任何值都不丟例外（範圍
+    都在一位小數之前比，1e300 不會走到 quantize；超過 float 範圍的大整數讓 _is_num 丟 OverflowError，這裡當成不合格）。"""
+    try:
+        if not spec_ok(ROT_SPEC, values):
+            return False
+    except OverflowError:
+        return False
+    wick = values["soxx_wick_pct"]
+    if (wick is None) != (values["soxx_wick_day"] is None):
+        return False
+    if wick is not None and not 0 <= wick <= 100:
         return False
     for key in ("xlp_ret20", "soxx_ret20", "soxx_ma60"):
         number = values[key]

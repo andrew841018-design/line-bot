@@ -169,6 +169,7 @@ def _rotation_rows(now, day):
     SOXX（比 VOO、QQQ 舊一天，列名後面帶日期）。raw／state 用 market_calc.rot_classify 從同一組數字算，一定過
     market_calc.rotation_values_ok：不然那一列會悄悄變成「暫缺」，卡片的測試就什麼也沒測到。"""
     values = {"xlp_ret20": -1.2, "soxx_ret20": 8.0, "soxx_rsi": 74, "soxx_ma60": 12.3, "soxx_dd240": -2.1,
+              "soxx_wick_pct": None, "soxx_wick_day": None,  # 插針（2026-10-29 增補）：預設沒有開高低
               "xlp_rsi": 38, "xlp_above60": False, "ko_rsi": 55, "ko_above60": True}
     raw = market_calc.rot_classify(values)
     return {
@@ -323,6 +324,7 @@ def worst_snapshot(now: float = NOW) -> dict:
         rows[row_id]["values"].update(close=9_999_999.0, chg_pct=-99.99, above_ma20=False, rsi14=100.0)
         rows[row_id]["data_date"] = older
     rot = {"xlp_ret20": -99.9, "soxx_ret20": 1000.0, "soxx_rsi": 100, "soxx_ma60": 1000.0, "soxx_dd240": -100.0,
+           "soxx_wick_pct": None, "soxx_wick_day": None,
            "xlp_rsi": 100, "xlp_above60": True, "ko_rsi": 100, "ko_above60": True}
     rows["us.rot.state"]["values"] = {**rot, "raw": market_calc.rot_classify(rot), "state": "watch_staples"}
     rows["us.rot.state"]["data_date"] = older

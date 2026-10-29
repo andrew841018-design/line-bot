@@ -9,6 +9,9 @@ Andrew 2026-10-28：新增消費型類股（KO、XLP）的監控，用技術面�
 - dashboard：美股卡的三列與 footer。
 - pipeline：us.rot 任務（XLP、KO 日線）。
 
+2026-10-29 增補 v3.1（SOXX「高位插針」＝長上影線，偏熱的第三條路，B 案）：calc 的 rot_wick／開高低的解析／分類，pipeline 存
+us.ohlc.SOXX，publish 讀它，卡片 footer 多一行。每段一樣先在還沒改產品碼時跑紅。
+
 新的符號一律在測試函式裡才取（parametrize 只放字面值）：舊程式沒有這些名字時，只讓用到的測試紅，不讓整個檔案收集失敗。
 合成資料都是程式產生的收盤序列，不連網、不放家人資料。
 """
@@ -77,8 +80,8 @@ CAL = market_calc.nyse_calendar()
 DAY = date(2027, 3, 31)  # 週三；往回 300 個交易日都在 NYSE 表內（表從 2026-01-01 起）
 SESSIONS = CAL.sessions_ending(DAY, 300)
 STATES = ("staples", "semis", "watch_staples", "watch_semis", "none", "insufficient")
-VALUE_KEYS = ("xlp_ret20", "soxx_ret20", "soxx_rsi", "soxx_ma60", "soxx_dd240", "xlp_rsi", "xlp_above60", "ko_rsi",
-              "ko_above60")
+VALUE_KEYS = ("xlp_ret20", "soxx_ret20", "soxx_rsi", "soxx_ma60", "soxx_dd240", "soxx_wick_pct", "soxx_wick_day", "xlp_rsi",
+              "xlp_above60", "ko_rsi", "ko_above60")
 ROT_TEXTS = {
     "TEXT_ROT_XLP_NAME": "必需消費（XLP）",
     "TEXT_ROT_KO_NAME": "可口可樂（KO）",
@@ -94,6 +97,7 @@ ROT_TEXTS = {
                            "XLP RSI {xlp_rsi}、{xlp_ma60}",
     "TEXT_ROT_NOTE_KO": "；KO RSI {ko_rsi}、{ko_ma60}",
     "TEXT_ROT_NOTE_HELD": "狀態要連續 2 個交易日都一樣才會換",
+    "TEXT_ROT_NOTE_WICK": "SOXX {day} 衝高回落（長上影線 {pct}），也算偏熱",
 }
 VALIDATOR_NOWS = (datetime(2026, 10, 29, 9, 0, tzinfo=TPE), datetime(2027, 1, 15, 9, 0, tzinfo=TPE),
                   datetime(2028, 1, 3, 9, 0, tzinfo=TPE))
@@ -120,9 +124,11 @@ def window(day=DAY):
 
 
 def neutral(**over):
-    """注入的指標（都已經是顯示精度）：預設什麼條件都不成立 → none。"""
+    """注入的指標（都已經是顯示精度）：預設什麼條件都不成立 → none。插針的兩個鍵預設是 None（沒有開高低）：既有的真值表照樣要過，
+    「插針缺值回 None 而不是 False」這種錯也會被那幾個 weak／未知的案例抓到（2026-10-29 增補）。"""
     values = {"xlp_ret20": 0.0, "soxx_ret20": 0.0, "soxx_rsi": 50, "soxx_ma60": 0.0, "soxx_dd240": -20.0,
-              "xlp_rsi": 50, "xlp_above60": True, "ko_rsi": 50, "ko_above60": True}
+              "soxx_wick_pct": None, "soxx_wick_day": None, "xlp_rsi": 50, "xlp_above60": True, "ko_rsi": 50,
+              "ko_above60": True}
     values.update(over)
     return values
 
@@ -172,6 +178,7 @@ def test_the_three_rows_sit_right_after_the_us_etf_rows():
         "state": frozenset(STATES), "raw": frozenset(STATES),
         "xlp_ret20": "num?", "soxx_ret20": "num?",
         "soxx_rsi": "int?", "soxx_ma60": "num?", "soxx_dd240": "num?",
+        "soxx_wick_pct": "num?", "soxx_wick_day": "date?",
         "xlp_rsi": "int?", "xlp_above60": "bool?",
         "ko_rsi": "int?", "ko_above60": "bool?",
     }
@@ -404,17 +411,19 @@ def test_rotation_values_recomputes_the_last_five_sessions(monkeypatch, plan, ex
     states = dict(zip(days, plan))
     seen = []
 
-    def fake_inputs(closes, quarantine, cal, day):
-        seen.append((closes, quarantine, cal, day))
+    def fake_inputs(closes, quarantine, cal, day, *, ohlc=None):
+        seen.append((closes, quarantine, cal, day, ohlc))
         return {"day": day}
 
     monkeypatch.setattr(market_calc, "rot_inputs", fake_inputs)
     monkeypatch.setattr(market_calc, "rot_classify", lambda values: states[values["day"]])
-    closes, quarantine = {"XLP": {}}, {}
-    got = market_calc.rotation_values(closes, quarantine, CAL, DAY)
+    closes, quarantine, ohlc = {"XLP": {}}, {}, {DAY: (250.0, 256.0, 249.9, 250.0)}
+    got = market_calc.rotation_values(closes, quarantine, CAL, DAY, ohlc=ohlc)
     assert got == {"day": DAY, "raw": plan[-1], "state": expected}
     assert sorted({item[3] for item in seen}) == days[-5:]  # 研判日＋往前 4 個交易日，用同一份輸入
     assert all(item[0] is closes and item[1] is quarantine and item[2] is CAL for item in seen)
+    # 開高低也一樣：5 個回看日拿到的是同一個 ohlc 物件（只傳給研判日的話，沿用前幾天的插針就會消失；2026-10-29 增補 C3b）
+    assert len(seen) == 5 and all(item[4] is ohlc for item in seen)
 
 
 def good_values(**over):
@@ -463,6 +472,19 @@ BAD_VALUES = [
     ("above_is_not_bool", {"xlp_above60": 0}),
     ("return_is_a_string", {"xlp_ret20": "1.0"}),
     ("return_is_nan", {"soxx_ret20": float("nan")}),
+    # 插針的兩個鍵（2026-10-29 增補 C6）：範圍 [0, 100] 在一位小數之前比、兩個要一起有或一起沒有、日期是嚴格的 ISO 字串
+    ("wick_pct_1e300", {"soxx_wick_pct": 1e300, "soxx_wick_day": "2027-03-29"}),
+    ("wick_pct_big_int", {"soxx_wick_pct": 10 ** 400, "soxx_wick_day": "2027-03-29"}),
+    ("wick_pct_negative", {"soxx_wick_pct": -0.1, "soxx_wick_day": "2027-03-29"}),
+    ("wick_pct_over_100", {"soxx_wick_pct": 100.1, "soxx_wick_day": "2027-03-29"}),
+    ("wick_pct_not_rounded", {"soxx_wick_pct": 3.14, "soxx_wick_day": "2027-03-29"}),
+    ("wick_pct_is_a_string", {"soxx_wick_pct": "3.1", "soxx_wick_day": "2027-03-29"}),
+    ("wick_pct_without_a_day", {"soxx_wick_pct": 3.1}),
+    ("wick_day_without_a_pct", {"soxx_wick_day": "2027-03-29"}),
+    ("wick_day_is_a_date_object", {"soxx_wick_pct": 3.1, "soxx_wick_day": date(2027, 3, 29)}),
+    ("wick_day_compact", {"soxx_wick_pct": 3.1, "soxx_wick_day": "20271027"}),
+    ("wick_day_iso_week", {"soxx_wick_pct": 3.1, "soxx_wick_day": "2027-W13-3"}),
+    ("wick_day_impossible", {"soxx_wick_pct": 3.1, "soxx_wick_day": "2027-02-30"}),
 ]
 
 
@@ -477,6 +499,387 @@ def test_rotation_values_ok_never_raises_on_junk(junk):
     missing = good_values()
     del missing["ko_rsi"]
     assert market_calc.rotation_values_ok(missing) is False
+
+
+# ── 插針（SOXX 長上影線；2026-10-29 增補 v3.1）：rot_wick、開高低的解析、偏熱的第三條路（B 案） ──────────────────
+# 研判日 DAY＝3/31；往回的交易日是 3/30、3/29、3/25、3/24、3/23（3/26 耶穌受難日休市）：WICK_DAYS[-1 - k] 就是 R−k。
+# 價格一律寫 float（開高低只收 float：寫入端寫的是 float，JSON 讀回來也是 float）。
+WICK_DAYS = CAL.sessions_ending(DAY, 6)
+WICK_BAR = (249.90, 256.00, 249.80, 250.00)  # 上影線 6.00（2.4%）、實體 0.10、下影線 0.10
+PLAIN_BAR = (250.00, 250.10, 249.90, 250.00)  # 上下影線一樣長：不是長上影線
+
+
+def wick_at(k):
+    return WICK_DAYS[-1 - k]
+
+
+def wick_case(bars, official=None, base=250.0):
+    """{k: bar} → (開高低 {R−k: bar}, SOXX 的正式收盤)。bar 那天的正式收盤預設等於它自己的收盤（收盤是 float 時）；
+    official＝{k: 收盤} 覆寫，None＝那天沒有正式收盤。"""
+    ohlc = {wick_at(k): bar for k, bar in bars.items()}
+    closes = {day: base for day in SESSIONS}
+    for day, bar in ohlc.items():
+        if isinstance(bar, tuple) and len(bar) == 4 and type(bar[3]) is float:
+            closes[day] = bar[3]
+    for k, value in (official or {}).items():
+        if value is None:
+            closes.pop(wick_at(k))
+        else:
+            closes[wick_at(k)] = value
+    return ohlc, closes
+
+
+# C1 a–c、j、k＋長腳十字：一根 K 棒（研判日當天、正式收盤＝K 棒收盤）量出來的上影線
+WICK_SHAPES = [
+    # a. 剛好 2 倍（非整數價格：用 float 算會判成不到 2 倍）；1.9 倍不算
+    ("exactly_twice_the_body", (250.02, 250.95, 249.90, 250.33), 0.2),
+    ("1_9_times_the_body", (250.02, 250.92, 249.90, 250.33), None),
+    # b. 1.74 ÷ 120 剛好 1.45%：half-up 是 1.5（float 會算成 1.4499… → 1.4）；121.73 是 1.4
+    ("pct_1_45_rounds_half_up", (119.90, 121.74, 119.80, 120.00), 1.5),
+    ("pct_1_44_rounds_down", (119.90, 121.73, 119.80, 120.00), 1.4),
+    # c. 十字線有上影線就照記；開高低收都一樣（上影線 0）不記
+    ("doji_with_an_upper_wick", (250.00, 251.00, 249.90, 250.00), 0.4),
+    ("flat_bar", (250.00, 250.00, 250.00, 250.00), None),
+    # 長腳十字（主執行緒加）：上影線 3.70、下影線 4.00 → 不算；同一根把低改成 249.90（下影線 0.10）→ 算
+    ("long_legged_doji", (250.00, 254.00, 246.00, 250.30), None),
+    ("same_bar_with_a_short_lower_wick", (250.00, 254.00, 249.90, 250.30), 1.5),
+    # j. 上限：上影線 ÷ 收盤（還沒四捨五入）>15% 當壞資料；剛好 15.0 收、15.04（四捨五入是 15.0）與 15.05 不收
+    ("high_three_times_the_close", (249.90, 750.00, 249.80, 250.00), None),
+    ("high_1e308", (249.90, 1e308, 249.80, 250.00), None),
+    ("cap_exactly_15_0", (199.90, 230.00, 199.80, 200.00), 15.0),
+    ("cap_15_04_is_over", (199.90, 230.08, 199.80, 200.00), None),
+    ("cap_15_05_is_over", (199.90, 230.10, 199.80, 200.00), None),
+    # k. 型別：字串、int、大整數、bool、NaN、inf、少一個值、高比收盤低 → 那一根當缺漏
+    ("strings", ("249.9", "256.0", "249.8", "250.0"), None),
+    ("ints", (250, 256, 249, 250), None),
+    ("big_int", (249.90, 10 ** 400, 249.80, 250.00), None),
+    ("bool", (249.90, True, 249.80, 250.00), None),
+    ("nan", (249.90, float("nan"), 249.80, 250.00), None),
+    ("inf", (249.90, float("inf"), 249.80, 250.00), None),
+    ("three_values", (249.90, 256.00, 250.00), None),
+    ("high_below_the_close", (249.00, 249.50, 248.00, 250.00), None),
+]
+
+
+@pytest.mark.parametrize("bar,expected", [case[1:] for case in WICK_SHAPES], ids=[case[0] for case in WICK_SHAPES])
+def test_rot_wick_measures_the_upper_wick_of_one_bar(bar, expected):
+    ohlc, closes = wick_case({0: bar})
+    got = market_calc.rot_wick(ohlc, closes, None, CAL, DAY)
+    assert got == ((expected, DAY) if expected is not None else (None, None))
+    assert expected is None or type(got[0]) is float
+
+
+# C1 d、e：交叉檢查（和 _evaluate 同一個 float 公式、0.5%）、沒有正式收盤、隔離區間
+WICK_EXCLUSIONS = [
+    ("official_0_6_pct_away", {0: 251.50}, None, None),
+    ("official_0_4_pct_away", {0: 251.00}, None, 2.4),
+    ("no_official_close", {0: None}, None, None),
+    ("official_close_is_zero", {0: 0.0}, None, None),
+    ("quarantine_on_the_day", {}, (0, 0), None),
+    ("quarantine_still_open", {}, (2, None), None),
+    ("quarantine_ends_the_session_before", {}, (3, 1), 2.4),
+]
+
+
+@pytest.mark.parametrize("official,quarantine,expected", [case[1:] for case in WICK_EXCLUSIONS],
+                         ids=[case[0] for case in WICK_EXCLUSIONS])
+def test_rot_wick_needs_a_matching_official_close_and_no_quarantine(official, quarantine, expected):
+    ohlc, closes = wick_case({0: WICK_BAR}, official)
+    intervals = None
+    if quarantine is not None:
+        intervals = [(wick_at(quarantine[0]), None if quarantine[1] is None else wick_at(quarantine[1]))]
+    got = market_calc.rot_wick(ohlc, closes, intervals, CAL, DAY)
+    assert got == ((expected, DAY) if expected is not None else (None, None))
+
+
+# C1 f：窗口＝研判日往回 3 個交易日（含研判日），錨在研判日：研判日沒有開高低時不改錨到最後一根有資料的日子
+WICK_WINDOWS = [
+    ("wick_two_sessions_back_counts", {2: WICK_BAR}, 2),
+    ("wick_three_sessions_back_does_not", {3: WICK_BAR}, None),
+    ("no_bar_on_the_day_and_a_wick_three_back", {4: PLAIN_BAR, 3: WICK_BAR}, None),
+    ("wick_on_the_day", {0: WICK_BAR, 1: PLAIN_BAR}, 0),
+]
+
+
+@pytest.mark.parametrize("bars,expected", [case[1:] for case in WICK_WINDOWS], ids=[case[0] for case in WICK_WINDOWS])
+def test_rot_wick_looks_at_the_last_three_sessions(bars, expected):
+    ohlc, closes = wick_case(bars)
+    got = market_calc.rot_wick(ohlc, closes, None, CAL, DAY)
+    assert got == ((2.4, wick_at(expected)) if expected is not None else (None, None))
+
+
+def test_rot_wick_on_a_day_that_is_not_a_session_and_with_a_list_calendar():
+    """C1 g：研判日不是交易日（週六、休市日）→ (None, None)；日曆給排好的交易日清單時照樣算。"""
+    ohlc, closes = wick_case({0: WICK_BAR, 3: WICK_BAR})
+    # 週六：不檢查「窗口最後一天是研判日」的話，窗口 3/31–4/2 會撿到 3/31 的插針
+    assert market_calc.rot_wick(ohlc, closes, None, CAL, date(2027, 4, 3)) == (None, None)
+    assert market_calc.rot_wick(ohlc, closes, None, CAL, date(2027, 3, 26)) == (None, None)  # 休市（窗口會是 3/23–3/25）
+    listed = list(CAL.sessions_ending(DAY, 10))
+    assert market_calc.rot_wick(ohlc, closes, None, listed, DAY) == (2.4, DAY)
+    assert market_calc.rot_wick(ohlc, closes, None, listed, date(2027, 3, 26)) == (None, None)
+
+
+def test_rot_wick_takes_the_largest_long_wick_and_the_latest_on_a_tie():
+    """C1 h：一樣長取最近那天；只在「長上影線」裡取最大：R−1 上影線 3%，但只有實體的 1.5 倍（不算），R 是 1.6%。"""
+    ohlc, closes = wick_case({1: WICK_BAR, 0: WICK_BAR})
+    assert market_calc.rot_wick(ohlc, closes, None, CAL, DAY) == (2.4, DAY)
+    ohlc, closes = wick_case({1: (102.00, 105.00, 99.90, 100.00), 0: (100.00, 101.80, 99.90, 100.20)}, base=100.0)
+    assert market_calc.rot_wick(ohlc, closes, None, CAL, DAY) == (1.6, DAY)
+
+
+def test_rot_wick_divides_by_the_bars_own_close():
+    """C1 i：K 棒收 100.00、正式收盤 100.40（差 0.4%，過得了交叉檢查）、高 101.45 → 1.45% → 1.5（用正式收盤會是 1.4）。"""
+    ohlc, closes = wick_case({0: (99.95, 101.45, 99.90, 100.00)}, {0: 100.40}, base=100.0)
+    assert market_calc.rot_wick(ohlc, closes, None, CAL, DAY) == (1.5, DAY)
+
+
+def test_a_close_above_the_wick_high_cancels_the_wick():
+    """C1 l（w3 X1）：插針那天之後、到研判日為止（只看 ≤ 研判日）有一天正式收盤高於插針的高，這根就不算。"""
+    bar = (250.00, 256.00, 249.00, 250.50)  # w3 反例 1：上影線 5.50（2.2%）、實體 0.50、下影線 1.00
+    ohlc, closes = wick_case({1: bar})
+    assert market_calc.rot_wick(ohlc, closes, None, CAL, wick_at(1)) == (2.2, wick_at(1))
+    closes[DAY] = 258.40  # 隔天收盤站上 256.00
+    assert market_calc.rot_wick(ohlc, closes, None, CAL, DAY) == (None, None)
+    assert market_calc.rot_wick(ohlc, closes, None, CAL, wick_at(1)) == (2.2, wick_at(1))  # 研判日之後的收盤不影響
+    closes[DAY] = 256.00  # 剛好等於高：沒有突破
+    assert market_calc.rot_wick(ohlc, closes, None, CAL, DAY) == (2.2, wick_at(1))
+    # w3 反例 2：插針那天不在高位，之後兩天的收盤站上插針的高 → 研判日的窗口裡不算
+    ohlc, closes = wick_case({2: (238.60, 244.40, 238.00, 239.20)}, {1: 245.90, 0: 249.60})
+    assert market_calc.rot_wick(ohlc, closes, None, CAL, wick_at(2)) == (2.2, wick_at(2))
+    assert market_calc.rot_wick(ohlc, closes, None, CAL, DAY) == (None, None)
+
+
+def test_rot_wick_does_not_touch_its_inputs_and_never_raises():
+    """C1 m：純函式；壞的輸入（不是 dict、沒有收盤）回 (None, None)，不丟例外。"""
+    ohlc, closes = wick_case({1: WICK_BAR, 0: (250.00, 251.00, 249.90, 250.00)})
+    intervals = [(wick_at(5), wick_at(4))]
+    before = copy.deepcopy((ohlc, closes, intervals))
+    assert market_calc.rot_wick(ohlc, closes, intervals, CAL, DAY) == (2.4, wick_at(1))
+    assert (ohlc, closes, intervals) == before and list(closes) == list(before[1])
+    for junk_ohlc, junk_closes in ((None, closes), ([WICK_BAR], closes), ("x", closes), (ohlc, None), (ohlc, [1.0]),
+                                   ({wick_at(0): None}, closes), ({wick_at(0): "250.0"}, closes)):
+        assert market_calc.rot_wick(junk_ohlc, junk_closes, None, CAL, DAY) == (None, None)
+
+
+# C2：開高低的解析（ohlc_bar 一根、ohlc_from_payload 整份 payload；寫入端、publish、rot_wick 共用這一份定義）
+OHLC_BARS = [
+    ("good", [250.0, 256.0, 249.0, 250.5], (250.0, 256.0, 249.0, 250.5)),
+    ("tuple", (250.0, 256.0, 249.0, 250.5), (250.0, 256.0, 249.0, 250.5)),
+    ("flat", [250.0, 250.0, 250.0, 250.0], (250.0, 250.0, 250.0, 250.0)),
+    ("high_below_the_close", [250.0, 250.4, 249.0, 250.5], None),
+    ("low_above_the_open", [250.0, 256.0, 250.2, 250.5], None),
+    ("zero", [0.0, 256.0, 249.0, 250.5], None),
+    ("negative", [-250.0, 256.0, -249.0, 250.5], None),
+    ("an_int", [250, 256.0, 249.0, 250.5], None),
+    ("big_int", [250.0, 10 ** 400, 249.0, 250.5], None),
+    ("bool", [250.0, True, 249.0, 250.5], None),
+    ("string", ["250.0", 256.0, 249.0, 250.5], None),
+    ("nan", [250.0, float("nan"), 249.0, 250.5], None),
+    ("inf", [250.0, float("inf"), 249.0, 250.5], None),
+    ("three_values", [250.0, 256.0, 249.0], None),
+    ("five_values", [250.0, 256.0, 249.0, 250.5, 1.0], None),
+    ("nested", [[250.0], 256.0, 249.0, 250.5], None),
+    ("a_dict", {"o": 250.0, "h": 256.0, "l": 249.0, "c": 250.5}, None),
+    ("a_string", "250.0,256.0,249.0,250.5", None),
+    ("none", None, None),
+]
+
+
+@pytest.mark.parametrize("values,expected", [case[1:] for case in OHLC_BARS], ids=[case[0] for case in OHLC_BARS])
+def test_ohlc_bar_takes_four_positive_floats_in_order(values, expected):
+    got = market_calc.ohlc_bar(values)
+    assert got == expected
+    assert expected is None or (type(got) is tuple and all(type(value) is float for value in got))
+
+
+_BIG = "1" + "0" * 400
+OHLC_JUNK = [
+    ("null", "null"), ("a_list", "[]"), ("a_string", '"x"'), ("a_number", "1"), ("no_bars", '{"nobars": 1}'),
+    ("bars_is_a_list", '{"bars": []}'), ("bars_is_a_string", '{"bars": "x"}'),
+    ("value_is_a_string", '{"bars": {"2026-10-27": "y"}}'),
+    ("key_is_not_a_date", '{"bars": {"x": [250.0, 256.0, 249.0, 250.5]}}'),
+    ("two_values", '{"bars": {"2026-10-27": [1.0, 2.0]}}'),
+    ("three_values", '{"bars": {"2026-10-27": [250.0, 256.0, 249.0]}}'),
+    ("five_values", '{"bars": {"2026-10-27": [250.0, 256.0, 249.0, 250.5, 1.0]}}'),
+    ("string_values", '{"bars": {"2026-10-27": ["250.0", "256.0", "249.0", "250.5"]}}'),
+    ("bool_value", '{"bars": {"2026-10-27": [250.0, true, 249.0, 250.5]}}'),
+    ("nested_value", '{"bars": {"2026-10-27": [[250.0], 256.0, 249.0, 250.5]}}'),
+    ("dict_value", '{"bars": {"2026-10-27": {"o": 250.0}}}'),
+    ("int_values", '{"bars": {"2026-10-27": [250, 256, 249, 250]}}'),
+    ("nan_token", '{"bars": {"2026-10-27": [250.0, NaN, 249.0, 250.5]}}'),
+    ("inf_1e400", '{"bars": {"2026-10-27": [250.0, 1e400, 249.0, 250.5]}}'),
+    ("big_int_401_digits", '{"bars": {"2026-10-27": [250.0, ' + _BIG + ', 249.0, 250.5]}}'),
+    ("compact_date", '{"bars": {"20261027": [250.0, 256.0, 249.0, 250.5]}}'),
+    ("iso_week_date", '{"bars": {"2026-W44-2": [250.0, 256.0, 249.0, 250.5]}}'),
+    ("full_width_digits", '{"bars": {"２０２６-10-27": [250.0, 256.0, 249.0, 250.5]}}'),
+    ("impossible_date", '{"bars": {"2026-02-30": [250.0, 256.0, 249.0, 250.5]}}'),
+    ("date_with_a_time", '{"bars": {"2026-10-27T00:00:00": [250.0, 256.0, 249.0, 250.5]}}'),
+    ("negative_values", '{"bars": {"2026-10-27": [-250.0, 256.0, -249.0, 250.5]}}'),
+]
+
+
+@pytest.mark.parametrize("text", [case[1] for case in OHLC_JUNK], ids=[case[0] for case in OHLC_JUNK])
+def test_ohlc_payload_junk_is_dropped_without_raising(text):
+    payload = json.loads(text)
+    assert market_calc.ohlc_from_payload(payload) == {}
+    assert market_calc.ohlc_from_payload(payload, upto=date(2026, 10, 30)) == {}
+
+
+def test_ohlc_from_payload_keeps_the_good_bars_drops_later_days_and_round_trips():
+    payload = {"bars": {
+        "2027-03-29": [250.0, 256.0, 249.9, 250.0], "2027-03-31": [250.0, 251.0, 249.9, 250.0],
+        "2027-03-30": [250, 256, 249, 250], "x": [250.0, 256.0, 249.9, 250.0], "2027-04-01": [250.0, 252.0, 249.9, 250.0],
+    }}
+    before = copy.deepcopy(payload)
+    good = {date(2027, 3, 29): (250.0, 256.0, 249.9, 250.0), date(2027, 3, 31): (250.0, 251.0, 249.9, 250.0)}
+    assert market_calc.ohlc_from_payload(payload, upto=DAY) == good
+    assert market_calc.ohlc_from_payload(payload, upto=date(2027, 3, 30)) == {date(2027, 3, 29): good[date(2027, 3, 29)]}
+    everything = market_calc.ohlc_from_payload(payload)
+    assert everything == {**good, date(2027, 4, 1): (250.0, 252.0, 249.9, 250.0)}
+    assert payload == before  # 不修改傳進來的 payload（publish 傳的是共用快取裡的那一份）
+    written = {"bars": {day.isoformat(): list(bar) for day, bar in everything.items()}}  # 寫入端的形狀
+    assert market_calc.ohlc_from_payload(json.loads(json.dumps(written))) == everything
+
+
+# C3：rot_inputs／rotation_values 帶開高低
+def wick_world():
+    """真收盤（C3c）：SOXX 緩漲、一直在 240 日高點附近（RSI 約 50～60、離季線 +1～+2%），XLP 一直在季線下（必需消費偏弱），
+    KO 小波動；20 日報酬差都在 ±5 個百分點內。沒有插針時 5 個回看日都是「沒有明顯方向」。"""
+    def series(base, drift, amp, period):
+        return {day: round(base * (1 + drift * i) * (1 + amp * math.sin(i / period)), 2) for i, day in enumerate(SESSIONS)}
+
+    return {"XLP": series(80.0, -0.0005, 0.005, 3.0), "SOXX": series(250.0, 0.0008, 0.01, 2.0),
+            "KO": series(68.0, 0.0002, 0.01, 4.0)}
+
+
+def test_rot_inputs_adds_the_wick_as_a_rounded_float_and_an_iso_day():
+    """C3a：values 多兩個鍵：soxx_wick_pct 是一位小數的 float、soxx_wick_day 是 ISO 字串；JSON 來回一樣、過 rotation_values_ok。"""
+    closes = rot_closes()
+    c = closes["SOXX"][DAY]
+    bar = (round(c - 0.1, 4), round(c * 1.031, 4), round(c - 0.2, 4), c)
+    plain = market_calc.rot_inputs(closes, {}, CAL, DAY)
+    got = market_calc.rot_inputs(closes, {}, CAL, DAY, ohlc={DAY: bar})
+    expected = float((Decimal(repr(bar[1])) - Decimal(repr(c))) / Decimal(repr(c)) * 100)
+    assert got["soxx_wick_pct"] == float(half_up(expected, 1)) == 3.1 and type(got["soxx_wick_pct"]) is float
+    assert got["soxx_wick_day"] == "2027-03-31"
+    assert plain["soxx_wick_pct"] is None and plain["soxx_wick_day"] is None
+    assert {k: v for k, v in got.items() if not k.startswith("soxx_wick")} == {
+        k: v for k, v in plain.items() if not k.startswith("soxx_wick")}
+    assert json.loads(json.dumps(got)) == got
+    values = market_calc.rotation_values(closes, {}, CAL, DAY, ohlc={DAY: bar})
+    assert values["soxx_wick_pct"] == 3.1 and values["soxx_wick_day"] == "2027-03-31"
+    assert json.loads(json.dumps(values)) == values and market_calc.rotation_values_ok(values)
+
+
+def test_a_wick_three_sessions_back_is_held_on_the_research_day():
+    """C3c（端到端，真收盤）：插針在 R−3、必需消費一直偏弱 → 原始狀態 [none, ws, ws, ws, none]：研判日 raw＝none、
+    state＝watch_staples（沿用）。只把開高低傳給研判日的話，state 會是 none。"""
+    closes = wick_world()
+    wick_day = wick_at(3)
+    close = closes["SOXX"][wick_day]
+    low_open = round(close * 0.998, 2)
+    ohlc = {wick_day: (low_open, round(close * 1.03, 2), round(low_open * 0.999, 2), close)}
+    plain = market_calc.rotation_values(closes, {}, CAL, DAY)
+    assert plain["raw"] == plain["state"] == "none"
+    raws = [market_calc.rot_classify(market_calc.rot_inputs(closes, {}, CAL, day, ohlc=ohlc)) for day in WICK_DAYS[-5:]]
+    assert raws == ["none", "watch_staples", "watch_staples", "watch_staples", "none"]
+    values = market_calc.rotation_values(closes, {}, CAL, DAY, ohlc=ohlc)
+    assert values["raw"] == "none" and values["state"] == "watch_staples"
+    assert values["soxx_wick_pct"] is None and values["soxx_wick_day"] is None  # 研判日的窗口已經沒有 R−3
+    assert market_calc.rotation_values_ok(values)
+    held = market_calc.rot_inputs(closes, {}, CAL, wick_at(1), ohlc=ohlc)
+    assert (held["soxx_wick_pct"], held["soxx_wick_day"]) == (3.0, wick_day.isoformat())
+
+
+# C4：rot_wick_hot（只回 True／False：缺值、舊的 values 都是 False）
+@pytest.mark.parametrize("pct,dd240,expected", [
+    (1.5, -5.0, True), (15.0, 0.0, True), (3.1, -2.0, True),
+    (1.4, -2.0, False), (3.1, -5.1, False), (None, -2.0, False), (3.1, None, False), (None, None, False),
+])
+def test_rot_wick_hot(pct, dd240, expected):
+    values = neutral(soxx_wick_pct=pct, soxx_wick_day=None if pct is None else "2027-03-29", soxx_dd240=dd240)
+    before = dict(values)
+    assert market_calc.rot_wick_hot(values) is expected
+    assert values == before
+
+
+def test_old_values_without_the_wick_keys_are_not_hot_and_classify_like_v2():
+    old = {key: value for key, value in neutral(soxx_dd240=-2.0, xlp_above60=False).items() if not key.startswith("soxx_wick")}
+    assert market_calc.rot_wick_hot(old) is False
+    assert market_calc.rot_classify(old) == "none"
+    assert market_calc.rot_classify({**old, "soxx_rsi": 72}) == "watch_staples"
+
+
+# C5：分類（B 案：插針是 SOXX 偏熱的第三條路，和 RSI≥70 走同一套三值邏輯）
+SWAP_CASES = [case for case in CLASSIFY_CASES if (neutral(**case[1])["soxx_rsi"] or 0) >= 70]
+SWAP_WICK = {"soxx_rsi": 65, "soxx_dd240": -2.0, "soxx_wick_pct": 3.1, "soxx_wick_day": "2027-03-29"}
+
+
+@pytest.mark.parametrize("over,expected", [case[1:] for case in SWAP_CASES], ids=[case[0] for case in SWAP_CASES])
+def test_a_wick_is_hot_exactly_like_rsi_70(over, expected):
+    """C5a 換觸發條件：真值表裡 SOXX RSI≥70 的案例，RSI 換成 65、改由插針（3.1%、離 240 日高點 −2.0）讓 SOXX 偏熱，結果一樣。"""
+    values = neutral(**{**over, **SWAP_WICK})
+    assert market_calc.rot_wick_hot(values) is True
+    assert market_calc.rot_classify(values) == expected
+
+
+def test_the_swap_table_has_all_fifteen_rsi_cases():
+    assert len(SWAP_CASES) == 15  # 有人刪了真值表的案例，這裡會先紅
+
+
+def test_sb_cold_soxx_near_the_high_with_a_wick_has_no_clear_direction():
+    """C5b（w3 Sb）：SOXX RSI 28（偏冷）又在高點 5% 內插針（偏熱）→ 同時偏熱又偏冷 → 照趨勢 T（none）；v2 是 watch_semis。"""
+    values = neutral(soxx_rsi=28, soxx_ma60=-3.0, soxx_dd240=-4.5, soxx_wick_pct=1.8, soxx_wick_day="2027-03-29",
+                     ko_above60=False, ko_rsi=45, xlp_rsi=72)
+    assert market_calc.rot_classify(values) == "none"
+
+
+def test_andrews_example_e0_is_watch_staples_and_a_wick_alone_follows_the_trend():
+    """C5c（E0，Andrew 的例子）：KO 低位盤整（季線下、RSI 45）、SOXX 高位插針（RSI 65、離季線 +6.0、離高點 −2.0、2.4%）
+    → watch_staples（v2 是 none）。插針成立但必需消費不弱 → 照趨勢 T。"""
+    values = neutral(soxx_rsi=65, soxx_ma60=6.0, soxx_dd240=-2.0, soxx_wick_pct=2.4, soxx_wick_day="2027-03-29",
+                     ko_above60=False, ko_rsi=45)
+    assert market_calc.rot_classify(values) == "watch_staples"
+    assert market_calc.rot_classify({**values, "ko_above60": True, "xlp_ret20": 6.0}) == "staples"
+    assert market_calc.rot_classify({**values, "ko_above60": True}) == "none"
+
+
+def test_a_wick_that_is_not_hot_changes_nothing():
+    """C5e（可選）：插針不成立（太短、不在高點附近、沒有）時，整張真值表的結果和不帶插針一樣。"""
+    for name, over, expected in CLASSIFY_CASES:
+        base = neutral(**over)
+        variants = [(None, None), (0.0, "2027-03-29"), (1.4, "2027-03-29")]
+        dd240 = base["soxx_dd240"]
+        if dd240 is None or dd240 < -5.0:
+            variants.append((15.0, "2027-03-29"))  # 離 240 日高點 <−5% 或算不出來：多長都不算偏熱
+        for pct, day in variants:
+            values = {**base, "soxx_wick_pct": pct, "soxx_wick_day": day}
+            assert market_calc.rot_wick_hot(values) is False, (name, pct)
+            assert market_calc.rot_classify(values) == expected, (name, pct)
+
+
+def test_rotation_values_ok_recomputes_the_wick_and_takes_the_range_ends():
+    """C6：插針成立時 raw 要是重算的 watch_staples（寫 none 就不過）；範圍 [0, 100] 的兩端可以；1e300、大整數不丟例外。"""
+    ok = market_calc.rotation_values_ok
+    hot = neutral(soxx_rsi=65, soxx_dd240=-2.0, xlp_above60=False, soxx_wick_pct=3.1, soxx_wick_day="2027-03-29")
+    assert ok({**hot, "raw": "watch_staples", "state": "watch_staples"})
+    assert ok({**hot, "raw": "watch_staples", "state": "none"})  # 狀態沿用前幾天的
+    assert not ok({**hot, "raw": "none", "state": "none"})  # 重算對不上
+    assert ok(good_values(soxx_wick_pct=0.0, soxx_wick_day="2027-03-29"))
+    assert ok(good_values(soxx_wick_pct=100.0, soxx_wick_day="2027-03-29"))
+    for pct in (1e300, -1e300, 10 ** 400, 10 ** 20):
+        assert ok(good_values(soxx_wick_pct=pct, soxx_wick_day="2027-03-29")) is False
+
+
+def test_wick_starting_thresholds_and_the_cross_check_matches_the_pipeline_guard():
+    """C8：起始值，以及 rot_wick 的交叉檢查和 pipeline 的覆寫守門同一個門檻（calc 不能 import pipeline，用測試綁住）。"""
+    mc = market_calc
+    assert (mc.ROT_WICK_SESSIONS, mc.ROT_WICK_BODY_RATIO, mc.ROT_WICK_MIN_PCT, mc.ROT_WICK_MAX_PCT,
+            mc.ROT_WICK_NEAR_HIGH_PCT) == (3, Decimal("2"), Decimal("1.5"), Decimal("15.0"), Decimal("-5.0"))
+    assert all(type(value) is Decimal for value in (mc.ROT_WICK_BODY_RATIO, mc.ROT_WICK_MIN_PCT, mc.ROT_WICK_MAX_PCT,
+                                                     mc.ROT_WICK_NEAR_HIGH_PCT))
+    assert mc.ROT_OHLC_MATCH == pipe.GUARD_DIFF == 0.005
+    assert mc.ROT_WICK_NEAR_HIGH_PCT < mc.ROT_NEAR_HIGH_PCT  # 比「近高點且拉很開」那條路的 −3 寬
 
 
 # ═════════════════════════════════════════════════════════════════════════════
