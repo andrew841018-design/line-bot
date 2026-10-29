@@ -157,11 +157,12 @@ def _regulation_ask_phrase(text: str) -> str:
 
 def _with_regulation_ask(value: str, chosen: list[str]) -> tuple[str, str]:
     """(``chosen``, clauses of ``value``, as the search text; the ask phrase appended to it).
-    When ``value`` asks a public regulation's number and the chosen clauses do not carry
-    the ask, 「，」 and the ask phrase of the dropped clauses follow (2026-10-29, item 2);
-    the phrase is "" when nothing was appended."""
+    When the chosen clauses name a public regulation, ``value`` asks its number and the
+    chosen clauses do not carry the ask, 「，」 and the ask phrase of the dropped clauses
+    follow (2026-10-29, item 2); the phrase is "" when nothing was appended.  A price claim
+    chosen without the regulation clause gets nothing: 「日本物價上漲」 is no 「多少」 question."""
     kept = "，".join(chosen)
-    if (not _regulation_clauses(value) or not _REGULATION_QUANTITY_ASK.search(value)
+    if (not _regulation_clauses(kept) or not _REGULATION_QUANTITY_ASK.search(value)
             or _REGULATION_QUANTITY_ASK.search(kept)):
         return kept, ""
     parts = [part.strip() for part in re.split(f"[{_CLAUSE_MARKS}]", value) if part.strip()]
@@ -474,10 +475,12 @@ def asks_for_number(text: str) -> bool:
 # - 媽 skips 媽祖／媽閣 only as the goddess or her temple, read on the folded text with
 #   what _bare drops taken out (「舅媽祖 厝」 is no 媽祖 before a space) and never after
 #   a kinship prefix (「舅媽祖廟」 is 舅媽's).  「媽去日本要簽證嗎」 is one person.
+#   The prefixes come in their simplified forms too (干 義 繼 養 親 as 干 义 继 养 亲), since a
+#   simplified 妈 now reads as 媽: 「干妈祖廟」 is 乾媽's (2026-10-29 part 2 review).
 _MASKED_BEFORE = {
     "本人": re.compile(r"日本人"),
     "媽": re.compile(
-        r"(?<![舅姑姨乾契義繼養親奶乳伯岳])(?:媽祖|媽閣)(?=廟|宮|遶境|繞境|進香|誕|信仰|文化|[，,。！？!?]|$)"
+        r"(?<![舅姑姨乾干契義义繼继養养親亲奶乳伯岳])(?:媽祖|媽閣)(?=廟|宮|遶境|繞境|進香|誕|信仰|文化|[，,。！？!?]|$)"
     ),
 }
 _MASK_VIEW = re.compile(r"[^\w，,。！？!?]+|_")  # what _bare drops, less the marks 媽's mask reads
@@ -490,7 +493,11 @@ _MA_SPLIT = re.compile(r"媽[\W_]+[祖閣]")
 # letters still in: 媽, U+3164, 祖廟 is no 媽祖, nor is 王旭日, U+200B, 本人 a 日本人.  Only the
 # comparison that blocks drops them (research review, 2026-10-29).
 _SIMPLIFIED_KINSHIP = str.maketrans({"妈": "媽", "爷": "爺", "嬷": "嬤"})
-_INVISIBLE = re.compile(r"[\u115f\u1160\u3164\uffa0\u200b-\u200d\u2060\ufeff]")
+_INVISIBLE_CHARS = r"[\u115f\u1160\u3164\uffa0\u200b-\u200d\u2060\ufeff]"
+_INVISIBLE = re.compile(_INVISIBLE_CHARS)
+# An invisible letter next to 媽 counts like _MA_SPLIT: a Hangul filler is a letter, so it
+# would hide a kinship prefix from the mask's lookbehind (「舅」, U+3164, 「媽祖廟」).
+_MA_BESIDE_INVISIBLE = re.compile(f"{_INVISIBLE_CHARS}媽|媽{_INVISIBLE_CHARS}")
 
 
 def _kin_fold(text: str) -> str:
@@ -504,12 +511,13 @@ def _blocking(text: str) -> str:
 
 
 def mentions_any(text: str, names) -> bool:
-    """Whether ``text`` holds one of ``names``, compared as regulation_clause does
-    (NFKC, casefolded) and with spaces and symbols ignored (「王 大同」).  An empty
-    list counts as a match: nobody can say whom the text names (fails closed).
+    """Whether ``text`` holds one of ``names``, compared NFKC and casefolded, with spaces
+    and symbols ignored (「王 大同」).  An empty list counts as a match: nobody can say whom
+    the text names (fails closed).
 
     2026-10-29 (follow-up 5): the bare 本人 and 媽 are looked for after their masks (日本人;
-    the goddess 媽祖／媽閣), and a 媽 kept apart from 祖／閣 counts at once; simplified
+    the goddess 媽祖／媽閣), and a 媽 kept apart from 祖／閣, or next to an invisible letter,
+    counts at once; simplified
     kinship characters are the traditional ones and invisible letters split no name,
     while the masks read the text with them still in."""
     terms = [term for term in (_blocking(_kin_fold(name)) for name in names or () if isinstance(name, str)) if term]
@@ -519,7 +527,7 @@ def mentions_any(text: str, names) -> bool:
     whole = _blocking(folded)
     for term in terms:
         if term == "媽":
-            if _MA_SPLIT.search(folded):
+            if _MA_SPLIT.search(folded) or _MA_BESIDE_INVISIBLE.search(folded):
                 return True
             seen = _blocking(_MASKED_BEFORE[term].sub("", _MASK_VIEW.sub("", folded)))
         elif term == "本人":

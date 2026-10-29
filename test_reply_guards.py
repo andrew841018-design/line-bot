@@ -1567,6 +1567,7 @@ _ASK_WORDS = re.compile(
     ("簽證可以停留，好幾天了到底多久？", "簽證可以停留，多久"),       # 好幾 is no ask
     ("入境日本，酒可以帶幾個？", "入境日本，酒幾個"),
     ("入境日本，酒可以帶好幾個嗎？", "入境日本，酒"),                 # nor is 好幾個
+    ("日本物價上漲，入境免稅額度，可以帶多少？", "日本物價上漲"),     # a price claim gets no ask
 ])
 def test_a_regulation_question_keeps_its_ask_when_the_clause_is_cut(question, query):
     assert public_research.search_query(question) == query

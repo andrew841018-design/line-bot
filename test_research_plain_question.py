@@ -413,6 +413,16 @@ def test_the_masks_hide_only_the_goddess_and_japanese(question, named):
     "舅妈祖厝在哪裡？",  # a simplified 媽 after a kinship prefix
     "妈去日本要簽證嗎？",
     "老妈祖先是哪裡人？",
+    # review 2026-10-29: a Hangul filler hid the prefix from the mask's lookbehind
+    "舅\u3164媽祖廟有什麼好玩的？",
+    "舅\uffa0媽祖廟有什麼好玩的？",
+    "舅\u1160媽祖廟有什麼好玩的？",
+    "干妈祖廟有什麼好玩的？",  # a simplified prefix before the simplified 媽
+    "干妈祖廟在哪裡？",
+    "义妈祖廟在哪裡？",
+    "继妈祖廟在哪裡？",
+    "养妈祖廟在哪裡？",
+    "亲妈祖廟在哪裡？",
 ])
 def test_invisible_letters_and_simplified_characters_release_no_name(question):
     assert main._plain_question_names(question, None) == "named"
