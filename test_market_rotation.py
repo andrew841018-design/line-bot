@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import math
+import sqlite3
 from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from zoneinfo import ZoneInfo
@@ -50,6 +52,7 @@ from test_market_pipeline_us import HISTORY as PIPE_HISTORY
 from test_market_pipeline_us import NOW as PIPE_NOW
 from test_market_pipeline_us import (  # noqa: F401  env 是 fixture
     TASKS,
+    _num_text,
     closes,
     ctx_at,
     env,
@@ -57,6 +60,7 @@ from test_market_pipeline_us import (  # noqa: F401  env 是 fixture
     flat,
     market_http,
     market_tasks,
+    nasdaq,
     obs,
     pipe,
     run,
@@ -963,8 +967,8 @@ def test_no_official_xlp_or_soxx_close_at_all_is_the_never_case(world):
 def test_bad_values_only_break_their_own_row(world, monkeypatch):
     real = market_calc.rotation_values
 
-    def broken(*args):
-        values = real(*args)
+    def broken(*args, **kwargs):  # publish 會帶 ohlc＝（2026-10-29 增補）
+        values = real(*args, **kwargs)
         values["raw"] = "semis" if values["raw"] == "staples" else "staples"  # 和重算的原始狀態對不上
         return values
 
@@ -1024,13 +1028,18 @@ def test_the_research_day_must_be_a_session(world):
 
 
 def test_the_shared_caches_are_not_modified(world):
-    """us.etf.SOXX、圖、矛盾句都用 ctx.shared 快取裡的同一個 list／dict：組 us.rot.state 不能就地改它們。"""
+    """us.etf.SOXX、圖、矛盾句都用 ctx.shared 快取裡的同一個 list／dict：組 us.rot.state 不能就地改它們。開高低的 obs 也是快取裡
+    的同一份（2026-10-29 增補 B5）：解析不能把壞的鍵洗掉、也不能把 list 換成 tuple。"""
     world.store.add_quarantine("us", "SOXX", US_DAYS[5], US_DAYS[6], "split_pending")
     world.store.add_quarantine("us", "XLP", US_DAYS[8], US_DAYS[9], "conflict")
+    world.store.put_obs("us.ohlc.SOXX", {"bars": {
+        PUB_D.isoformat(): [250.0, 251.0, 249.9, 250.0], US_DAYS[-2].isoformat(): [250, 256, 249, 250], "x": [1.0, 2.0, 1.0, 1.5],
+    }}, data_date=PUB_D.isoformat())
     ctx = market_publish._Ctx(world.store, world.paths, PUB_NOW)
     for row_id in ("us.etf.SOXX", "us.rot.XLP", "us.rot.KO"):
         assert market_publish._build_row(ctx, row_id)["state"] == "ok", row_id
-    keys = ("closes:us:SOXX", "closes:us:XLP", "closes:us:KO", "quarantine:us")
+    assert ctx.obs("us.ohlc.SOXX") is not None  # 先載進共用快取
+    keys = ("closes:us:SOXX", "closes:us:XLP", "closes:us:KO", "quarantine:us", "obs:us.ohlc.SOXX")
     before = {key: copy.deepcopy(ctx._cache[key]) for key in keys}
     assert ctx._cache["quarantine:us"] and set(ctx._cache["quarantine:us"]) == {"SOXX", "XLP"}
     row = market_publish._build_row(ctx, "us.rot.state")
@@ -1044,6 +1053,95 @@ def test_the_labels_put_the_exact_row_before_the_prefix():
     assert market_publish._label_for("us.rot.XLP") == market_publish._label_for("us.rot.KO") == "必需消費類股"
     # _label_for 照 dict 的順序取第一個符合的：精確的 us.rot.state 要在前綴 us.rot. 前面；兩個都放在 us.etf. 旁邊
     assert labels[labels.index("us.etf.") + 1:labels.index("us.etf.") + 3] == ["us.rot.state", "us.rot."]
+
+
+# ── 插針（2026-10-29 增補）：publish 讀 us.ohlc.SOXX，交叉檢查在 rot_wick 裡做、只看 ≤R ──────────────────────────
+# SOXX 的 D 收 294.0（離 240 日高點 −1.8%、RSI 52：v2 的兩條路都不偏熱）、XLP 的 D 收 85.0（跌到季線下）：沒有插針時研判日的
+# 原始狀態是 semis；D 有一根 3.1% 的長上影線時是 watch_staples。
+WICK_SOXX_D, WICK_XLP_D = 294.0, 85.0
+WICK_D_BAR = [293.71, 303.11, 293.42, 294.0]  # 上影線 9.11（3.1%）、實體 0.29、下影線 0.29
+
+
+def wick_world_ready(world_):
+    _set_close(world_, "SOXX", WICK_SOXX_D)
+    _set_close(world_, "XLP", WICK_XLP_D)
+
+
+def test_a_wick_on_the_research_day_reaches_the_values(world):
+    """B1：寫一份 D 那天有插針的 obs、XLP 偏弱 → values 帶 pct 和 day（ISO），raw＝watch_staples；和 calc 直接算的一樣。"""
+    wick_world_ready(world)
+    _outcome, rows = published(world)
+    plain = rows["us.rot.state"]["values"]
+    assert plain["raw"] == "semis" and plain["soxx_wick_pct"] is None and plain["soxx_wick_day"] is None
+    world.store.put_obs("us.ohlc.SOXX", {"bars": {PUB_D.isoformat(): WICK_D_BAR}}, data_date=PUB_D.isoformat())
+    outcome, rows = published(world)
+    row = rows["us.rot.state"]
+    assert row["state"] == "ok" and row["data_date"] == PUB_D.isoformat() and "row_errors" not in outcome
+    values = row["values"]
+    assert (values["soxx_wick_pct"], values["soxx_wick_day"]) == (3.1, PUB_D.isoformat())
+    assert values["raw"] == "watch_staples" and values["state"] == "none"  # 只有 D 一天：還沒連續 2 天
+    ctx = market_publish._Ctx(world.store, world.paths, PUB_NOW)
+    assert values == market_calc.rotation_values(store_closes(world), {}, ctx.trading("us"), PUB_D,
+                                                 ohlc={PUB_D: tuple(WICK_D_BAR)})
+
+
+@pytest.mark.parametrize("payload", [
+    None,
+    {"bars": "x"},
+    {"bars": {"2026-10-16": ["293.71", "303.11", "293.42", "294.0"]}},
+    {"bars": {"2026-10-16": [-293.71, 303.11, 293.42, 294.0]}},
+    {"bars": {"2026-13-45": [293.71, 303.11, 293.42, 294.0]}},
+    {"bars": {"20261016": [293.71, 303.11, 293.42, 294.0]}},
+    {"bars": {"2026-10-16": [293.71, 10 ** 400, 293.42, 294.0]}},
+], ids=["missing", "bars_is_a_string", "strings", "negative", "bad_date", "compact_date", "big_int"])
+def test_a_missing_or_junk_ohlc_obs_leaves_the_row_ok_without_a_wick(world, payload):
+    """B2：obs 不存在或內容是壞的 → 這一列照常 ok、wick 是 None、研判和沒有插針時一樣。"""
+    wick_world_ready(world)
+    if payload is not None:
+        world.store.put_obs("us.ohlc.SOXX", payload, data_date=None)
+    outcome, rows = published(world)
+    row = rows["us.rot.state"]
+    assert row["state"] == "ok" and "row_errors" not in outcome and "shared_errors" not in outcome, outcome
+    assert row["values"]["soxx_wick_pct"] is None and row["values"]["soxx_wick_day"] is None
+    assert row["values"]["raw"] == "semis"
+
+
+def test_a_failing_ohlc_read_leaves_the_row_ok_and_shows_in_shared_errors(world, monkeypatch):
+    """B3：store.get_obs 對這個鍵丟例外 → ctx.obs 變成 _Unavailable（shared_errors 記類別名）→ 接住，這一列照常、沒有插針。"""
+    wick_world_ready(world)
+    world.store.put_obs("us.ohlc.SOXX", {"bars": {PUB_D.isoformat(): WICK_D_BAR}}, data_date=PUB_D.isoformat())
+    real = world.store.get_obs
+
+    def get_obs(obs_id):
+        if obs_id == "us.ohlc.SOXX":
+            raise sqlite3.OperationalError("disk I/O error")
+        return real(obs_id)
+
+    monkeypatch.setattr(world.store, "get_obs", get_obs)
+    outcome, rows = published(world)
+    row = rows["us.rot.state"]
+    assert row["state"] == "ok" and "row_errors" not in outcome
+    assert row["values"]["soxx_wick_pct"] is None and row["values"]["raw"] == "semis"
+    assert outcome["shared_errors"] == {"obs:us.ohlc.SOXX": "unexpected:OperationalError"}
+
+
+def test_a_provisional_close_after_the_research_day_does_not_cancel_its_wick(world):
+    """B4：SOXX 的 D 只有 CBOE 暫定收盤（R 退到 10/15），而且高於 R 那根插針的高 → R 的插針照算：突破失效只看 ≤R。"""
+    day = US_DAYS[-2]
+    close = store_closes(world, ("SOXX",))["SOXX"][day]
+    bar = [round(close - 0.3, 4), round(close * 1.031, 4), round(close - 0.6, 4), close]
+    world.store.put_obs("us.ohlc.SOXX", {"bars": {day.isoformat(): bar}}, data_date=day.isoformat())
+    _set_close(world, "SOXX", round(bar[1] * 1.05, 2), provisional=True)
+    _outcome, rows = published(world)
+    state = rows["us.rot.state"]
+    assert state["state"] == "ok" and state["data_date"] == day.isoformat()
+    assert (state["values"]["soxx_wick_pct"], state["values"]["soxx_wick_day"]) == (3.1, day.isoformat())
+
+
+def test_publish_reads_the_key_the_pipeline_writes():
+    """P12：publish 不 import pipeline，鍵用測試綁住。"""
+    assert market_publish.OBS_US_OHLC.format("SOXX") == pipe.OBS_OHLC["SOXX"] == "us.ohlc.SOXX"
+    assert pipe.OHLC_SYMBOLS == ("SOXX",) and pipe.OHLC_KEEP_SESSIONS == 30
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1103,7 +1201,8 @@ def test_the_fixtures_carry_valid_rotation_rows(md):
         assert market_calc.rotation_values_ok(values) and values["raw"] == market_calc.rot_classify(values)
         assert "暫缺" not in us_body(md, snap)[7][0]
     worst = worst_snapshot(DASH_NOW)["rows"]["us.rot.state"]["values"]
-    assert worst["state"] == "watch_staples" and worst["raw"] == "semis"  # footer 最長：watch＋KO＋「連續 2 個交易日」
+    assert worst["state"] == "watch_staples" and worst["raw"] == "semis"  # footer 最長：watch＋KO＋插針＋「連續 2 個交易日」
+    assert market_calc.rot_wick_hot(worst) and worst["soxx_wick_pct"] == 100.0  # 插針句也在（2026-10-29 增補 D5）
 
 
 def test_the_us_card_shows_every_row_it_builds_and_the_one_liner_stays_last(md, monkeypatch):
@@ -1245,6 +1344,70 @@ def test_a_held_state_prints_no_gap_and_the_footer_says_why(md):
     assert us_notes(md, snap)[-1] == HELD
 
 
+# ── 插針那一行（2026-10-29 增補）：顯示的狀態是 watch_staples 而且插針成立時，WATCH 句之後、HELD 之前獨立一行 ──────────
+WICK_NOTE = "SOXX 10/14 衝高回落（長上影線 3.1%），也算偏熱"
+WICK_HOT = {"soxx_rsi": 65, "soxx_ma60": 6.0, "soxx_dd240": -2.0, "soxx_wick_pct": 3.1, "soxx_wick_day": "2026-10-14"}
+
+
+def test_the_footer_names_the_wick_after_the_watch_sentence(md):
+    """D1：watch_staples＋插針 → [WATCH 句, 插針句]；列上的字不變。"""
+    snap = make_snapshot(DASH_NOW)
+    values = set_rot(snap, neutral(**WICK_HOT, xlp_rsi=38, xlp_above60=False, ko_rsi=55))
+    assert values["raw"] == values["state"] == "watch_staples"
+    notes = us_notes(md, snap)
+    assert notes == ["資金輪動只看價格：SOXX RSI 65、離季線 +6.0%、離 240 日高點 -2.0%；XLP RSI 38、在季線下；KO RSI 55、在季線上",
+                     WICK_NOTE]
+    assert us_body(md, snap)[7] == ("資金輪動 10/15：半導體偏熱、必需消費偏弱", md.ORANGE)
+    for note in notes:
+        passes_every_gate(note)
+
+
+def test_a_held_watch_with_todays_wick_prints_the_wick_and_the_held_sentence(md):
+    """D1（w3 X3-10）：state＝watch_staples 是沿用的、raw＝none（必需消費今天不弱）、插針今天仍在窗口裡 → [WATCH, 插針, HELD]：
+    和 WATCH 句看同一個 state，不看 raw。"""
+    snap = make_snapshot(DASH_NOW)
+    values = set_rot(snap, neutral(**WICK_HOT), state="watch_staples")
+    assert values["raw"] == "none" and values["state"] == "watch_staples"
+    assert us_notes(md, snap) == [
+        "資金輪動只看價格：SOXX RSI 65、離季線 +6.0%、離 240 日高點 -2.0%；XLP RSI 50、在季線上；KO RSI 50、在季線上",
+        WICK_NOTE, HELD]
+
+
+@pytest.mark.parametrize("over", [
+    {"soxx_rsi": 72, "soxx_wick_pct": 1.4, "soxx_wick_day": "2026-10-14", "soxx_dd240": -2.0},
+    {"soxx_rsi": 72, "soxx_wick_pct": 3.1, "soxx_wick_day": "2026-10-14", "soxx_dd240": -6.0},
+], ids=["pct_1_4", "dd240_minus_6"])
+def test_a_wick_that_is_not_hot_is_not_printed(md, over):
+    """D2：插針不成立（太短、或離 240 日高點超過 5%）就不印；用 RSI 72 讓狀態仍是 watch_staples。"""
+    snap = make_snapshot(DASH_NOW)
+    values = set_rot(snap, neutral(**over, xlp_above60=False))
+    assert values["state"] == "watch_staples"
+    notes = us_notes(md, snap)
+    assert len(notes) == 1 and notes[0].startswith(market_calc.TEXT_ROT_LABEL) and "衝高回落" not in notes[0]
+
+
+def test_a_held_watch_semis_does_not_print_todays_wick(md):
+    """D3：顯示的是 watch_semis（沿用）而今天插針成立 → 不印插針句（那一行只接「半導體偏熱」）。"""
+    snap = make_snapshot(DASH_NOW)
+    values = set_rot(snap, neutral(**WICK_HOT), state="watch_semis")
+    assert values["raw"] == "none" and market_calc.rot_wick_hot(values)
+    assert us_notes(md, snap) == [
+        "資金輪動只看價格：SOXX RSI 65、離季線 +6.0%、離 240 日高點 -2.0%；XLP RSI 50、在季線上；KO RSI 50、在季線上", HELD]
+
+
+@pytest.mark.parametrize("day,pct,expected", [
+    ("2026-12-31", 15.0, "SOXX 12/31 衝高回落（長上影線 15.0%），也算偏熱"),
+    ("2027-01-02", 1.5, "SOXX 1/2 衝高回落（長上影線 1.5%），也算偏熱"),
+    ("2028-02-29", 100.0, "SOXX 2/29 衝高回落（長上影線 100.0%），也算偏熱"),
+])
+def test_the_wick_sentence_for_other_days_and_sizes_passes_every_gate(md, day, pct, expected):
+    snap = make_snapshot(DASH_NOW)
+    set_rot(snap, neutral(**{**WICK_HOT, "soxx_wick_pct": pct, "soxx_wick_day": day}, xlp_above60=False))
+    notes = us_notes(md, snap)
+    assert notes[1] == expected and len(notes) == 2
+    passes_every_gate(expected)
+
+
 def test_the_held_sentence_makes_no_promise(md):
     import importlib.util
     import sys
@@ -1305,12 +1468,23 @@ def test_stale_rows_show_their_data_date(md):
 
 
 @pytest.mark.parametrize("how", ["raw_mismatch", "rsi_120", "unrounded", "unknown_state", "missing_key", "never",
-                                 "values_list"])
+                                 "values_list", "wick_day_not_iso", "wick_pct_without_a_day", "wick_day_without_a_pct",
+                                 "wick_pct_1e300", "wick_keys_missing"])
 def test_bad_rotation_values_show_missing_and_nothing_breaks(md, paths, how):
     snap = make_snapshot(DASH_NOW)
     row = snap["rows"]["us.rot.state"]
     values = row["values"]
-    if how == "raw_mismatch":
+    if how.startswith("wick_"):  # 插針的兩個鍵壞掉（2026-10-29 增補 D4）：一樣只讓研判列暫缺
+        values.update({
+            "wick_day_not_iso": {"soxx_wick_pct": 3.1, "soxx_wick_day": "10/14"},
+            "wick_pct_without_a_day": {"soxx_wick_pct": 3.1, "soxx_wick_day": None},
+            "wick_day_without_a_pct": {"soxx_wick_pct": None, "soxx_wick_day": "2026-10-14"},
+            "wick_pct_1e300": {"soxx_wick_pct": 1e300, "soxx_wick_day": "2026-10-14"},
+            "wick_keys_missing": {},
+        }[how])
+        if how == "wick_keys_missing":  # v2 產的舊快照：沒有這兩個鍵
+            del values["soxx_wick_pct"], values["soxx_wick_day"]
+    elif how == "raw_mismatch":
         values["raw"] = "staples"
     elif how == "rsi_120":
         values["soxx_rsi"] = 120
@@ -1331,6 +1505,7 @@ def test_bad_rotation_values_show_missing_and_nothing_breaks(md, paths, how):
     body = texts(bubble["body"])
     assert body[7] == "資金輪動：暫缺" and body[5] == ROT_XLP_DEFAULT and body[-1] == ONELINER_US
     assert not any(note.startswith(market_calc.TEXT_ROT_LABEL) for note in texts(bubble["footer"]))
+    assert not any("衝高回落" in note for note in texts(bubble["footer"]))
     assert_main_gate(reply)
 
 
@@ -1346,8 +1521,9 @@ def test_the_worst_us_bubble_and_carousel_stay_within_the_limits(md, paths):
     assert body[5:8] == ["必需消費（XLP）9,999,999 在月線下（10/14）", "可口可樂（KO）9,999,999 在月線下（10/14）",
                          "資金輪動 10/14：半導體偏熱、必需消費偏弱"]
     notes = texts(bubble["footer"])
-    assert notes[:notes.index(DISCLAIMER)][-2:] == [
-        "資金輪動只看價格：SOXX RSI 100、離季線 +1,000.0%、離 240 日高點 -100.0%；XLP RSI 100、在季線上；KO RSI 100、在季線上",
+    assert notes[:notes.index(DISCLAIMER)][-3:] == [
+        "資金輪動只看價格：SOXX RSI 100、離季線 +1,000.0%、離 240 日高點 -5.0%；XLP RSI 100、在季線上；KO RSI 100、在季線上",
+        "SOXX 10/14 衝高回落（長上影線 100.0%），也算偏熱",
         HELD,
     ]
     assert md.card_bytes(bubble) <= market_dashboard.SUMMARY_BUBBLE_MAX_BYTES == 6656
@@ -1566,3 +1742,239 @@ def test_the_us_bubble_with_everything_on_stays_within_the_limits(md):
             assert len(bubble["body"]["contents"]) == 9
             assert md.card_bytes(bubble) <= md.SUMMARY_BUBBLE_MAX_BYTES == 6656, md.card_bytes(bubble)
             assert md.card_bytes(reply.flex) <= md.CARD_MAX_BYTES == 28 * 1024, md.card_bytes(reply.flex)
+
+
+# ── 插針（2026-10-29 增補）：_fetch_rows 順手存 SOXX 的開高低（us.ohlc.SOXX）。假 Nasdaq 預設的開高低都是 "1"（每一根都不合格），
+# 這裡用 hist_raw 給真的開高低；收盤和已存的一樣（100.0），不會碰到覆寫守門 ──────────────────────────────────────────────
+SOXX_BAR = (99.8, 100.6, 99.7, 100.0)
+UPDATE_DAYS = sessions(PIPE_D, 5)  # SOXX 的一般更新區間：10/12（最後有效日 10/15 往前 3 個交易日）～ D
+
+
+def nasdaq_bars(symbol, bars, *, etf=True):
+    """假 Nasdaq 日線的整份回應（hist_raw 用，不看查詢的日期區間）：bars＝{日期: (開, 高, 低, 收)}，None 寫成 "N/A"。"""
+    money = "" if etf else "$"
+
+    def text(value):
+        return "N/A" if value is None else money + _num_text(value)
+
+    rows = [{"date": day.strftime("%m/%d/%Y"), "close": text(c), "volume": "1,000", "open": text(o), "high": text(h),
+             "low": text(low)} for day, (o, h, low, c) in sorted(bars.items(), reverse=True)]
+    return nasdaq({"symbol": symbol, "totalRecords": len(rows),
+                   "tradesTable": {"asOf": None, "headers": {"date": "Date", "close": "Close/Last"}, "rows": rows}})
+
+
+def soxx_ohlc_ready(env_, days=UPDATE_DAYS, bar=SOXX_BAR):
+    """四檔 ETF 到 10/15（收盤 100）、Nasdaq 有 D；SOXX 這次抓到的每一根都是同一個合格的開高低。"""
+    etfs_ready(env_)
+    env_.http.hist_raw["SOXX"] = nasdaq_bars("SOXX", {day: bar for day in days})
+
+
+def stored_ohlc_json(env_):
+    """store 裡原始的 JSON 字（不經過 get_obs）。"""
+    row = env_.store._db().execute("SELECT json FROM obs WHERE obs_id = 'us.ohlc.SOXX'").fetchone()
+    return None if row is None else row[0]
+
+
+def fetched_bars(days=UPDATE_DAYS, bar=SOXX_BAR):
+    return {"bars": {day.isoformat(): list(bar) for day in days}}
+
+
+def test_a_soxx_update_stores_its_ohlc(env):
+    """P1：只有 ISO 日期鍵和 4 個 float、日期都 ≤D、data_date 是最新那天；收盤路徑不變。"""
+    soxx_ohlc_ready(env)
+    assert run(env, "us.hist") == "ok"
+    assert closes(env, "SOXX")[PIPE_D] == (100.0, "nasdaq", False)
+    found = obs(env, "us.ohlc.SOXX")
+    assert found["data_date"] == PIPE_D.isoformat() and found["payload"] == fetched_bars()
+    raw = json.loads(stored_ohlc_json(env))
+    assert set(raw) == {"bars"} and all(date.fromisoformat(key) <= PIPE_D for key in raw["bars"])
+    assert all(len(bar) == 4 and all(type(value) is float for value in bar) for bar in raw["bars"].values())
+    assert market_calc.ohlc_from_payload(raw) == {day: SOXX_BAR for day in UPDATE_DAYS}
+
+
+def test_this_fetch_wins_for_its_days_and_only_30_sessions_are_kept(env):
+    """P2：先放 30 天舊資料（到 10/14）；這次抓 5 根，10/13 的 open 是 N/A → 那一天的舊 bar 被拿掉；10/12、10/14 用這次的；
+    10/15、D 新加進來；最舊的一天掉出 30 天。"""
+    old_days = sessions(date(2026, 10, 14), 30)
+    env.store.put_obs("us.ohlc.SOXX", {"bars": {day.isoformat(): [99.0, 101.0, 98.9, 99.5] for day in old_days}},
+                      data_date="2026-10-14")
+    bars = {day: SOXX_BAR for day in UPDATE_DAYS}
+    bars[date(2026, 10, 13)] = (None, 100.6, 99.7, 100.0)
+    etfs_ready(env)
+    env.http.hist_raw["SOXX"] = nasdaq_bars("SOXX", bars)
+    assert run(env, "us.hist") == "ok"
+    found = obs(env, "us.ohlc.SOXX")
+    got = found["payload"]["bars"]
+    kept = sorted(set(old_days) - {date(2026, 10, 13)} | {date(2026, 10, 15), PIPE_D})[-30:]
+    assert list(got) == [day.isoformat() for day in kept] and len(got) == 30
+    assert old_days[0].isoformat() not in got and "2026-10-13" not in got
+    assert got["2026-10-12"] == got["2026-10-14"] == got["2026-10-16"] == list(SOXX_BAR)
+    assert got[old_days[1].isoformat()] == [99.0, 101.0, 98.9, 99.5]
+    assert found["data_date"] == PIPE_D.isoformat()
+    assert closes(env, "SOXX")[date(2026, 10, 13)] == (100.0, "nasdaq", False)  # 收盤照樣寫
+
+
+def test_a_soxx_bootstrap_keeps_only_the_newest_30_sessions(env):
+    """P3：沒有歷史的 SOXX 抓一年（約 252 根）→ 只留最新 30 根。"""
+    days = sessions(PIPE_D, 252)
+    soxx_ohlc_ready(env, days)
+    sql(env, "DELETE FROM closes WHERE market = 'us' AND symbol = 'SOXX'")
+    assert run(env, "us.hist") == "ok"
+    (query,) = env.http.query("hist", "SOXX")
+    assert query["fromdate"] == (PIPE_D - timedelta(days=pipe.HIST_BOOTSTRAP_DAYS)).isoformat()
+    assert len(closes(env, "SOXX")) > 200
+    assert obs(env, "us.ohlc.SOXX")["payload"] == fetched_bars(days[-30:])
+
+
+def test_only_soxx_stores_ohlc(env):
+    """P4：XLP（us.rot）、KO、VOO、成分股的回應就算有合格的開高低，也不寫 us.ohlc.*（SOXX 這裡是預設的假資料，不合格）。"""
+    d_published(env)
+    seed_universe(env, ["AAA"])
+    seed(env, "AAA", flat(PIPE_HISTORY, 50.0))
+    for symbol, price, etf, days in (("XLP", 80.0, True, ROT_DAYS), ("KO", 60.0, False, ROT_DAYS),
+                                     ("VOO", 100.0, True, UPDATE_DAYS), ("AAA", 50.0, False, UPDATE_DAYS)):
+        env.http.hist_raw[symbol] = nasdaq_bars(symbol, {day: (price - 0.2, price + 0.6, price - 0.3, price)
+                                                         for day in days}, etf=etf)
+    assert run(env, "us.hist") == "ok"
+    assert run(env, "us.rot") == "ok"
+    assert all(PIPE_D in closes(env, symbol) for symbol in ("XLP", "KO", "VOO", "AAA", "SOXX"))
+    assert env.store.obs_ids("us.ohlc.") == []
+
+
+def test_a_failing_ohlc_write_is_logged_by_type_only_and_the_closes_still_update(env, monkeypatch, caplog):
+    """P5：put_obs 對 us.ohlc.* 丟例外 → 確實呼叫過、SOXX 收盤照常、job 結果和沒有插針時一樣；log 只有類別名、沒有例外訊息。"""
+    soxx_ohlc_ready(env)
+    real = env.store.put_obs
+    calls = []
+
+    def put_obs(obs_id, payload, **kwargs):
+        if obs_id.startswith("us.ohlc."):
+            calls.append(obs_id)
+            raise RuntimeError("SECRET-SOURCE-TEXT")
+        return real(obs_id, payload, **kwargs)
+
+    monkeypatch.setattr(env.store, "put_obs", put_obs)
+    caplog.set_level(logging.INFO, logger="market_pipeline_us")
+    assert run(env, "us.hist") == "ok"
+    assert calls == ["us.ohlc.SOXX"]
+    assert closes(env, "SOXX")[PIPE_D] == (100.0, "nasdaq", False)
+    assert env.store.task_state("us.hist")["fail_streak"] == 0 and obs(env, "us.ohlc.SOXX") is None
+    assert "unexpected:RuntimeError" in caplog.text and "SECRET" not in caplog.text
+    assert not any(record.exc_info for record in caplog.records)
+
+
+def test_a_busy_store_skips_the_ohlc_write_and_the_closes_still_update(env, monkeypatch, caplog):
+    """P6：get_obs 對 us.ohlc.* 丟 sqlite3.OperationalError（資料庫忙）→ 這次不寫，收盤照常。"""
+    soxx_ohlc_ready(env)
+    real_get, real_put = env.store.get_obs, env.store.put_obs
+    asked, written = [], []
+
+    def get_obs(obs_id):
+        if obs_id.startswith("us.ohlc."):
+            asked.append(obs_id)
+            raise sqlite3.OperationalError("database is locked SECRET-SOURCE-TEXT")
+        return real_get(obs_id)
+
+    def put_obs(obs_id, payload, **kwargs):
+        written.append(obs_id)
+        return real_put(obs_id, payload, **kwargs)
+
+    monkeypatch.setattr(env.store, "get_obs", get_obs)
+    monkeypatch.setattr(env.store, "put_obs", put_obs)
+    caplog.set_level(logging.INFO, logger="market_pipeline_us")
+    assert run(env, "us.hist") == "ok"
+    assert asked == ["us.ohlc.SOXX"] and not [obs_id for obs_id in written if obs_id.startswith("us.ohlc.")]
+    assert closes(env, "SOXX")[PIPE_D] == (100.0, "nasdaq", False) and real_get("us.ohlc.SOXX") is None
+    assert "unexpected:OperationalError" in caplog.text and "SECRET" not in caplog.text
+
+
+def test_a_corrupt_stored_payload_is_rebuilt_from_this_fetch(env, caplog):
+    """P7：直接用 SQL 把那一筆的 JSON 寫壞（get_obs 丟 ValueError）→ 當成沒有舊資料，用這次抓到的 bar 重建。"""
+    env.store.put_obs("us.ohlc.SOXX", fetched_bars([date(2026, 10, 9)]), data_date="2026-10-09")
+    sql(env, "UPDATE obs SET json = ? WHERE obs_id = 'us.ohlc.SOXX'", '{"bars": {"2026-10-09": [99.8,')
+    with pytest.raises(ValueError):
+        env.store.get_obs("us.ohlc.SOXX")
+    soxx_ohlc_ready(env)
+    caplog.set_level(logging.INFO, logger="market_pipeline_us")
+    assert run(env, "us.hist") == "ok"
+    assert obs(env, "us.ohlc.SOXX")["payload"] == fetched_bars()
+    assert closes(env, "SOXX")[PIPE_D] == (100.0, "nasdaq", False)
+    assert "unexpected:JSONDecodeError" in caplog.text
+
+
+PIPE_OHLC_JUNK = [  # 舊 payload 是垃圾：日期都 ≤D、不在這次的抓取區間（10/12～D）裡，只能靠驗證丟掉
+    ("null", "null"), ("a_list", "[]"), ("a_string", '"x"'), ("no_bars", '{"nobars": 1}'),
+    ("bars_is_a_list", '{"bars": []}'), ("bars_is_a_string", '{"bars": "x"}'),
+    ("value_is_a_string", '{"bars": {"2026-10-09": "y"}}'),
+    ("key_is_not_a_date", '{"bars": {"x": [99.8, 100.6, 99.7, 100.0]}}'),
+    ("two_values", '{"bars": {"2026-10-09": [1.0, 2.0]}}'),
+    ("five_values", '{"bars": {"2026-10-09": [99.8, 100.6, 99.7, 100.0, 1.0]}}'),
+    ("string_values", '{"bars": {"2026-10-09": ["99.8", "100.6", "99.7", "100.0"]}}'),
+    ("bool_value", '{"bars": {"2026-10-09": [99.8, true, 99.7, 100.0]}}'),
+    ("nested_value", '{"bars": {"2026-10-09": [[99.8], 100.6, 99.7, 100.0]}}'),
+    ("int_values", '{"bars": {"2026-10-09": [99, 101, 98, 100]}}'),
+    ("nan_token", '{"bars": {"2026-10-09": [99.8, NaN, 99.7, 100.0]}}'),
+    ("inf_1e400", '{"bars": {"2026-10-09": [99.8, 1e400, 99.7, 100.0]}}'),
+    ("big_int_401_digits", '{"bars": {"2026-10-09": [99.8, ' + _BIG + ', 99.7, 100.0]}}'),
+    ("compact_date", '{"bars": {"20261009": [99.8, 100.6, 99.7, 100.0]}}'),
+    ("iso_week_date", '{"bars": {"2026-W41-5": [99.8, 100.6, 99.7, 100.0]}}'),
+    ("full_width_digits", '{"bars": {"２０２６-10-09": [99.8, 100.6, 99.7, 100.0]}}'),
+    ("a_day_after_d", '{"bars": {"2026-10-19": [99.8, 100.6, 99.7, 100.0]}}'),
+]
+
+
+@pytest.mark.parametrize("text", [case[1] for case in PIPE_OHLC_JUNK], ids=[case[0] for case in PIPE_OHLC_JUNK])
+def test_a_junk_stored_payload_never_breaks_the_soxx_closes(env, text):
+    """P8：舊 payload 是垃圾 → _fetch_rows 不丟例外、收盤照常，寫回去的只剩這次抓到的合格 bar（ISO 鍵）。"""
+    env.store.put_obs("us.ohlc.SOXX", {"bars": {}}, data_date=None)
+    sql(env, "UPDATE obs SET json = ? WHERE obs_id = 'us.ohlc.SOXX'", text)
+    soxx_ohlc_ready(env)
+    assert run(env, "us.hist") == "ok"
+    assert closes(env, "SOXX")[PIPE_D] == (100.0, "nasdaq", False)
+    assert json.loads(stored_ohlc_json(env)) == fetched_bars()
+
+
+def test_the_same_fetch_again_does_not_rewrite_and_the_default_fake_writes_nothing(env, monkeypatch):
+    """P9：既有的假資料（開高低都是 "1"）又沒有舊資料 → 不寫空的 payload；同樣的資料再跑一輪 → 不再寫。"""
+    etfs_ready(env)
+    assert run(env, "us.hist") == "ok" and obs(env, "us.ohlc.SOXX") is None
+    assert env.store.obs_ids("us.ohlc.") == []
+    env.http.hist_raw["SOXX"] = nasdaq_bars("SOXX", {day: SOXX_BAR for day in UPDATE_DAYS})
+    job = pipe._Job("SOXX", True, "update", date(2026, 10, 15))
+    rows = pipe._fetch_rows(ctx_at(env, PIPE_NOW + 900), job, UPDATE_DAYS[0], PIPE_D)
+    assert [row[0] for row in rows] == UPDATE_DAYS
+    first = obs(env, "us.ohlc.SOXX")
+    assert first["payload"] == fetched_bars()
+    real = env.store.put_obs
+    written = []
+
+    def put_obs(obs_id, payload, **kwargs):
+        written.append(obs_id)
+        return real(obs_id, payload, **kwargs)
+
+    monkeypatch.setattr(env.store, "put_obs", put_obs)
+    assert pipe._fetch_rows(ctx_at(env, PIPE_NOW + 1800), job, UPDATE_DAYS[0], PIPE_D) == rows
+    assert written == [] and obs(env, "us.ohlc.SOXX") == first
+
+
+def test_note_ohlc_takes_only_dated_bars_up_to_d(env):
+    """P10：直接呼叫 _note_ohlc（正式來源已經濾掉 >D，只能這樣測）：>D、datetime、沒有日期的 bar 都不收。"""
+    bars = [src.Bar(PIPE_D, 100.0, 1000, 99.8, 100.6, 99.7), src.Bar(date(2026, 10, 19), 101.0, 1000, 100.8, 101.6, 100.7),
+            src.Bar(datetime(2026, 10, 15, 16, 0), 100.0, 1000, 99.8, 100.6, 99.7), src.Bar(None, 100.0, 1000, 99.8, 100.6, 99.7)]
+    pipe._note_ohlc(ctx_at(env, PIPE_NOW), "SOXX", bars, PIPE_D)
+    found = obs(env, "us.ohlc.SOXX")
+    assert found["payload"] == fetched_bars([PIPE_D]) and found["data_date"] == PIPE_D.isoformat()
+    pipe._note_ohlc(ctx_at(env, PIPE_NOW), "XLP", bars, PIPE_D)  # 不在 OHLC_SYMBOLS：不寫、不丟例外
+    assert env.store.obs_ids("us.ohlc.") == ["us.ohlc.SOXX"]
+
+
+def test_the_confirm_path_also_stores_the_ohlc(env):
+    """P11（nit）：待確認的 SOXX 走 confirm（整段重抓）也會順手存開高低。"""
+    days = sessions(PIPE_D, 260)
+    soxx_ohlc_ready(env, days)
+    env.store.set_pending_jump("us", "SOXX", pending_jump(close=100.0))
+    assert run(env, "us.hist") == "ok"
+    (query,) = env.http.query("hist", "SOXX")
+    assert query["fromdate"] == (PIPE_D - timedelta(days=pipe.HIST_FULL_DAYS)).isoformat()  # 確認＝整段重抓
+    assert env.store.pending_jump("us", "SOXX") is None
+    assert obs(env, "us.ohlc.SOXX")["payload"] == fetched_bars(days[-30:])

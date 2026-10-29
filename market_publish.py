@@ -761,6 +761,9 @@ def _us_etf(ctx: _Ctx, row_id: str) -> RowResult:
 # ── 美股：資金輪動（必需消費 XLP／KO 對半導體 SOXX；2026-10-28） ───────────────────────────────
 # 三列：us.rot.XLP、us.rot.KO（收盤列，和 ETF 列同一個算法）、us.rot.state（研判，market_calc.rotation_values）。
 # 都不寫 facts（不進一句話與矛盾句）。「算不出來」是 ok 列＋state=insufficient；只有 XLP 或 SOXX 根本沒有正式收盤才是 never。
+# 插針（2026-10-29 增補 v3.1）：SOXX 的開高低 obs（market_pipeline_us.OBS_OHLC["SOXX"]；publish 不 import pipeline，
+# test_market_rotation 綁住）。讀不到、壞掉都只是沒有插針，這一列照常；交叉檢查在 market_calc.rot_wick 裡做、只看 ≤R。
+OBS_US_OHLC = "us.ohlc.{}"
 
 
 @_rows("us.rot.XLP", "us.rot.KO")
@@ -800,7 +803,8 @@ def _rot_research_day(rows: Mapping[str, list[Any]], cal: market_calc.TradingCal
 @_rows("us.rot.state")
 def _us_rot_state(ctx: _Ctx, row_id: str) -> RowResult:
     """資金輪動的研判。R 之前的日子用和 _us_etf 同一份列（含 SOXX 的 CBOE 暫定列），只要求 R 那天是正式收盤：SOXX 最新一筆
-    是暫定值時 R 退到前一個共同的正式日（列上會帶日期）。共用快取（ctx.closes、ctx.quarantine）只讀、先複製再處理。
+    是暫定值時 R 退到前一個共同的正式日（列上會帶日期）。共用快取（ctx.closes、ctx.quarantine、ctx.obs）只讀、先複製再處理。
+    SOXX 的開高低（插針）讀 us.ohlc.SOXX：讀取失敗（_Unavailable，shared_errors 記類別名）或內容壞掉都當成沒有，這一列照常。
     values 過不了 market_calc.rotation_values_ok → _BadValue：只有這一列暫缺（row_errors 記 bad:rot_values）。"""
     cal = ctx.trading(US)
     upto = ctx.us_day()
@@ -809,7 +813,12 @@ def _us_rot_state(ctx: _Ctx, row_id: str) -> RowResult:
     shared = ctx.quarantine(US)
     quarantine = {symbol: list(shared[symbol]) for symbol in market_calc.ROT_CLOSE_SYMBOLS if symbol in shared}
     closes = {symbol: {row[0]: row[1] for row in found} for symbol, found in rows.items()}
-    values = market_calc.rotation_values(closes, quarantine, cal, day)
+    try:
+        found = ctx.obs(OBS_US_OHLC.format("SOXX"))
+    except _Unavailable:
+        found = None
+    ohlc = market_calc.ohlc_from_payload(found["payload"] if found else None)
+    values = market_calc.rotation_values(closes, quarantine, cal, day, ohlc=ohlc)
     if not market_calc.rotation_values_ok(values):
         raise _BadValue("rot_values")
     return RowResult(

@@ -37,12 +37,14 @@ Andrew 2026-10-17 要一張「目前市場狀況」的盤勢卡（VOO／QQQ／SO
 - 時間只用 `ctx.now`；只透過 Context／Store 存取資料，不自己開 sqlite、不自己算交易日曆。
 
 obs 鍵與 payload（market_publish 讀；全是 JSON 值，日期一律 ISO 字串）見下方 `OBS_*` 常數的註解；期權鏈用
-`chain_from_payload` 轉回 `market_sources_us.OptionChain` 再交給 market_calc。
+`chain_from_payload` 轉回 `market_sources_us.OptionChain` 再交給 market_calc。SOXX 的開高低（資金輪動的插針，2026-10-29）
+`OBS_OHLC` 放在 `_fetch_rows` 正上方：抓日線時順手存，請求數不變。
 這個模組 import 時只把任務登記進框架的記憶體表，不做任何 I/O。
 """
 
 from __future__ import annotations
 
+import logging
 import math
 import re
 from collections import Counter
@@ -59,6 +61,7 @@ from market_tasks import Task, error_kind, register
 
 _ET = ZoneInfo("America/New_York")
 _UTC = timezone.utc
+log = logging.getLogger("market_pipeline_us")
 
 # ── 市場、來源、obs 鍵（market_publish 依這些鍵讀；要改兩邊一起改） ──────────────────
 
@@ -620,9 +623,58 @@ def _rows_le(bars: Iterable[Any], day: date) -> list[Row]:
     return [rows[key] for key in sorted(rows)]
 
 
+# ── SOXX 的開高低（資金輪動的插針，2026-10-29 增補 v3.1） ────────────────────────────────────────
+# _fetch_rows 抓日線時順手存（請求數不變），market_publish 讀、market_calc.rot_wick 用。盡力而為：存不了只記 log、絕不往外丟例外；
+# 研判缺開高低只會漏掉插針。開高低的驗證只有一份：market_calc.ohlc_bar／ohlc_from_payload（publish 也用它）。
+OHLC_SYMBOLS: tuple[str, ...] = ("SOXX",)
+# {"bars": {"YYYY-MM-DD": [o, h, l, c]}}（開、高、低、收，4 個 float；舊到新，最多 OHLC_KEEP_SESSIONS 天）；data_date＝最新那天
+OBS_OHLC = {sym: f"us.ohlc.{sym}" for sym in OHLC_SYMBOLS}
+OHLC_KEEP_SESSIONS = 30  # 研判只要 7 個交易日（往回 5 天，最早那天的窗口再往前 2 天）；多留的給上線後重放與校準
+
+
+def _note_ohlc(ctx: Any, symbol: str, bars: Iterable[Any], day: date) -> None:
+    """這次抓到的 K 棒（日期是 date、不是 datetime，而且 ≤D；同 _rows_le）併進 us.ohlc.<代號>。
+
+    這次抓到的日期以這次為準：合格就覆蓋，不合格（market_calc.ohlc_bar 是 None）就等於刪掉舊的那天；舊的先過
+    ohlc_from_payload（upto＝D），留最新 OHLC_KEEP_SESSIONS 天。和存著的一樣、或新舊都是空的就不寫。
+    讀到壞掉的 JSON（ValueError）→ 當成沒有舊資料、用這次的重建；讀取的其他錯誤（資料庫忙）→ 這次不寫；寫入失敗只記 log。
+    log 只寫例外的類別名（_kind），不寫例外訊息。這個函式不往外丟例外。"""
+    obs_id = OBS_OHLC.get(symbol)
+    if obs_id is None:
+        return
+    fetched: dict[date, Optional[tuple[float, float, float, float]]] = {}
+    for bar in bars or ():
+        bar_day = getattr(bar, "date", None)
+        if not isinstance(bar_day, date) or isinstance(bar_day, datetime) or bar_day > day:
+            continue
+        fetched[bar_day] = market_calc.ohlc_bar([getattr(bar, name, None) for name in ("open", "high", "low", "close")])
+    try:
+        found = ctx.store.get_obs(obs_id)
+    except ValueError as exc:  # JSON 壞了：每一輪都會一樣壞，跳過就永遠存不進去；用這次抓到的重建
+        log.warning("market ohlc unreadable, rebuilt obs=%s error_type=%s", obs_id, _kind(exc))
+        found = None
+    except Exception as exc:  # 資料庫忙之類：這次不寫，下一次抓 SOXX 再補
+        log.warning("market ohlc not read, skipped obs=%s error_type=%s", obs_id, _kind(exc))
+        return
+    stored = found.get("payload") if isinstance(found, dict) else None
+    old = market_calc.ohlc_from_payload(stored, upto=day)
+    merged = {**old, **fetched}
+    keep = sorted(when for when, bar in merged.items() if bar is not None)[-OHLC_KEEP_SESSIONS:]
+    payload = {"bars": {when.isoformat(): list(merged[when]) for when in keep}}
+    if payload == stored or not (keep or old):
+        return
+    try:
+        ctx.store.put_obs(obs_id, payload, data_date=keep[-1].isoformat() if keep else None)
+    except Exception as exc:
+        log.warning("market ohlc not written obs=%s error_type=%s", obs_id, _kind(exc))
+
+
 def _fetch_rows(ctx: Any, job: _Job, start: date, day: date) -> list[Row]:
     bars = src.fetch_nasdaq_historical(job.symbol, start, day, etf=job.etf, http=ctx.http, ledger=ctx.ledger)
-    return _rows_le(bars, day)
+    rows = _rows_le(bars, day)
+    if job.symbol in OHLC_SYMBOLS:
+        _note_ohlc(ctx, job.symbol, bars, day)  # 會寫 store（SOXX 的開高低，盡力而為、不丟例外）
+    return rows
 
 
 def _split_between(splits: Sequence[Split3], after: date, through: date) -> list[Split3]:

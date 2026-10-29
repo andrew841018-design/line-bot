@@ -318,13 +318,14 @@ def worst_snapshot(now: float = NOW) -> dict:
         rows[f"us.breadth.{sym}"]["values"].update(universe_label=long_note, coverage_note=long_note, adv=9999,
                                                    dec=9999, flat=9999)
     # 資金輪動三列（2026-10-28）的最長寫法：XLP、KO 七位數價格、-99.99%、RSI 100、列尾帶日期；研判顯示 watch（footer 最長的
-    # 那一段，含 KO）而當天的原始狀態不一樣（footer 多一句「連續 2 個交易日」），數字都在 rotation_values_ok 允許的極限
+    # 那一段，含 KO）而當天的原始狀態不一樣（footer 多一句「連續 2 個交易日」），數字都在 rotation_values_ok 允許的極限。
+    # 插針（2026-10-29 增補）：上影線 100.0%（validator 允許的上限）、離 240 日高點 −5.0 → footer 多一行插針句
     older = (datetime.fromtimestamp(now, TPE).date() - timedelta(days=3)).isoformat()
     for row_id in ("us.rot.XLP", "us.rot.KO"):
         rows[row_id]["values"].update(close=9_999_999.0, chg_pct=-99.99, above_ma20=False, rsi14=100.0)
         rows[row_id]["data_date"] = older
-    rot = {"xlp_ret20": -99.9, "soxx_ret20": 1000.0, "soxx_rsi": 100, "soxx_ma60": 1000.0, "soxx_dd240": -100.0,
-           "soxx_wick_pct": None, "soxx_wick_day": None,
+    rot = {"xlp_ret20": -99.9, "soxx_ret20": 1000.0, "soxx_rsi": 100, "soxx_ma60": 1000.0, "soxx_dd240": -5.0,
+           "soxx_wick_pct": 100.0, "soxx_wick_day": older,
            "xlp_rsi": 100, "xlp_above60": True, "ko_rsi": 100, "ko_above60": True}
     rows["us.rot.state"]["values"] = {**rot, "raw": market_calc.rot_classify(rot), "state": "watch_staples"}
     rows["us.rot.state"]["data_date"] = older

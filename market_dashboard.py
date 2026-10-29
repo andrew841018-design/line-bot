@@ -1090,8 +1090,9 @@ def _rot_ma60_word(above: Optional[bool]) -> str:
 
 def _rot_notes(ctx: _Ctx) -> list[str]:
     """美股卡 footer 的資金輪動註記（數字一律是研判日當天的）：watch 寫 SOXX 的 RSI、離季線、離 240 日高點與 XLP（KO 有值時加
-    KO）的 RSI 和季線位置；其他狀態寫兩檔近 20 個交易日的報酬。狀態是沿用前幾天的（state≠raw）再加一句「連續 2 個交易日」。
-    資料不足、過期、暫缺都不加。"""
+    KO）的 RSI 和季線位置；其他狀態寫兩檔近 20 個交易日的報酬。顯示的狀態是 watch_staples 而且插針成立（market_calc.rot_wick_hot）
+    時另起一行插針句（日期、上影線長度；2026-10-29 增補，看 state 不看 raw，watch_semis 不印）。狀態是沿用前幾天的（state≠raw）
+    最後再加一句「連續 2 個交易日」。資料不足、過期、暫缺都不加。"""
     _view, values = _rot_view(ctx)
     if values is None or values["state"] == market_calc.ROT_INSUFFICIENT:
         return []
@@ -1110,7 +1111,14 @@ def _rot_notes(ctx: _Ctx) -> list[str]:
     else:
         note = market_calc.TEXT_ROT_NOTE_RETURNS.format(xlp=_rot_pct_text(values["xlp_ret20"]),
                                                         soxx=_rot_pct_text(values["soxx_ret20"]))
-    return [note] if state == values["raw"] else [note, market_calc.TEXT_ROT_NOTE_HELD]
+    notes = [note]
+    if state == market_calc.ROT_WATCH_STAPLES and market_calc.rot_wick_hot(values):
+        # rotation_values_ok 已保證 soxx_wick_day 和 soxx_wick_pct 一起有、是嚴格的 ISO 字串
+        notes.append(market_calc.TEXT_ROT_NOTE_WICK.format(day=_md(date.fromisoformat(values["soxx_wick_day"])),
+                                                           pct=_plain_pct(values["soxx_wick_pct"], 1)))
+    if state != values["raw"]:
+        notes.append(market_calc.TEXT_ROT_NOTE_HELD)
+    return notes
 
 
 # ── ② 台股 ──────────────────────────────────────────────────────────────────
