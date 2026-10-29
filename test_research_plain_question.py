@@ -400,6 +400,65 @@ def test_the_masks_hide_only_the_goddess_and_japanese(question, named):
     assert main._plain_question_names(question, None) == ("named" if named else "")
 
 
+# 2026-10-29 (follow-up 5, part 2): the masks moved into public_research.mentions_any, which the
+# regulation gate shares.  Masks release text, so they read it with invisible letters still in
+# (nothing they see is joined); only the comparison that blocks drops them.  Simplified kinship
+# characters read as the traditional ones.  Every question here names someone.
+@pytest.mark.parametrize("question", [
+    "媽\u200b祖廟在哪裡？",  # a zero-width space keeps 媽 apart from 祖
+    "媽\u3164祖廟在哪裡？",  # a Hangul filler is a letter: never joined into 媽祖 before the mask
+    "王旭日\u200b本人入境可以帶幾瓶酒？",  # never joined into 日本人 before the mask
+    "測\u3164試成員甲推薦的拉麵好吃嗎？",  # an alias with a filler inside
+    "測\u200b試成員甲推薦的拉麵好吃嗎？",
+    "舅妈祖厝在哪裡？",  # a simplified 媽 after a kinship prefix
+    "妈去日本要簽證嗎？",
+    "老妈祖先是哪裡人？",
+])
+def test_invisible_letters_and_simplified_characters_release_no_name(question):
+    assert main._plain_question_names(question, None) == "named"
+    assert public_research.mentions_any(question, reply_guards.search_deny_terms())
+
+
+def test_simplified_kinship_characters_are_the_traditional_ones():
+    assert public_research.mentions_any("我妈", ["媽"])
+    assert public_research.mentions_any("我媽", ["妈"])  # a name folds the same way
+    assert public_research.mentions_any("爷爷说", ["爺爺"]) and public_research.mentions_any("阿嬷", ["阿嬤"])
+    assert not public_research.mentions_any("大甲妈祖遶境有什麼好玩的？", ["媽"])  # and gets the mask
+
+
+def test_a_display_name_or_turn_label_spelled_like_a_word_that_names_nobody_counts(monkeypatch):
+    # the kinship word 對方 names nobody (reply_guards leaves it out at the source); the same word as
+    # a member's display name, or as the label in front of a turn, is that member
+    question = "對方違規要怎麼檢舉"
+    assert main._plain_question_names(question, None) == ""
+    assert main._plain_question_names(question, [("user", "對方：今天去哪")]) == "named"
+    monkeypatch.setattr(line_mentions, "display_names", lambda: {"U_SYNTH": "對方"})
+    assert main._plain_question_names(question, None) == "named"
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("韓國入境酒類免稅額度，可以帶多少？", "韓國入境酒類免稅額度，多少"),
+    ("去韓國入境，酒可以帶幾瓶？", "去韓國入境，酒幾瓶"),
+    ("入境日本，香菸最多幾條？", "入境日本，香菸最多幾條"),
+    ("韓國入境關稅，小明可以帶多少？", "韓國入境關稅，多少"),
+    ("入境日本，酒可以帶幾個？", "入境日本，酒幾個"),
+])
+def test_a_regulation_question_cut_short_keeps_what_it_asked(text, expected):
+    # 2026-10-29 (follow-up 5, item 2): a dropped clause whose ask came back with the domain
+    # clause took nothing, as a cut of only courtesy takes nothing
+    assert public_research.complete_search_query(text) == expected
+
+
+@pytest.mark.parametrize("text, before_part_2", [
+    ("日本入境免稅額度是多少，台北房租大概多少？", "台北 日本入境免稅額度是多少"),
+    ("韓國入境酒類免稅額度是多少，可以帶多少？", ""),
+])
+def test_an_ask_search_query_did_not_put_back_covers_nothing(text, before_part_2):
+    # only what search_query appended covers a dropped clause: an ask word the kept clause
+    # carries anyway leaves the rest as it was before follow-up 5 part 2 (outputs measured then)
+    assert public_research.complete_search_query(text) == before_part_2
+
+
 def test_an_alias_that_is_a_common_word_still_counts(monkeypatch, tmp_path):
     assert main._plain_question_names("對方違規要怎麼檢舉", None) == ""
     aliases = tmp_path / "user_aliases.json"

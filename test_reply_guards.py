@@ -1527,6 +1527,73 @@ def test_display_names_that_fail_to_load_mean_no_search(monkeypatch):
     assert "小明" in reply_guards.name_terms()                              # the reply side does without
 
 
+# 2026-10-29 (follow-up 5, part 2): the regulation gate reads names as the plain-question path
+# does (public_research.mentions_any: the masks for 日本人 and the goddess 媽祖, simplified
+# kinship characters, invisible letters, spaces), and @ in every form
+@pytest.mark.parametrize("question, searched", [
+    ("日本人入境可以帶多少酒", True),             # 日本人 is no 本人
+    ("大甲媽祖遶境，入境免稅額度是多少", True),     # nor is the goddess anyone's mother
+    ("本人入境可以帶多少酒", False),
+    ("林小禾本人入境酒類免稅額度是多少", False),     # 本人 after a name nobody configured
+    ("媽入境可以帶多少酒", False),
+    ("妈入境可以帶多少酒", False),                   # a simplified 媽
+    ("舅媽祖產繼承要繳多少遺產稅", False),            # 舅媽's estate
+    ("媽 祖廟附近的停車罰款多少", False),             # 媽 kept apart from 祖 is the bare 媽
+    ("＠林小禾 入境酒類免稅額度是多少", False),       # an @ before a name nobody configured
+    ("﹫林小禾 入境酒類免稅額度是多少", False),   # the small commercial at
+    ("小 明入境酒類免稅額度是多少", False),           # an alias with a space in it
+    ("小\u3164明入境酒類免稅額度是多少", False),      # ... or a Hangul filler
+])
+def test_the_regulation_gate_reads_names_as_the_research_path_does(question, searched):
+    assert bool(public_research.regulation_clause(question, reply_guards.search_deny_terms())) is searched
+    assert main._requires_regulation_research(question) is searched
+
+
+# 2026-10-29 (follow-up 5, item 2): a question about a public regulation whose ask stood in a
+# clause the search drops gets the ask back, from fixed words only (the design's lists)
+_ASK_WORDS = re.compile(
+    r"(?:酒類|烈酒|紅酒|啤酒|酒|香菸|菸品|雪茄|電子菸|菸|現金|外幣|美金|台幣|人民幣|日圓|日幣|韓元|肉品|肉類|水果|蔬菜|"
+    r"植物|奶粉|多少|多久|最多|最少|(?:上限|下限|額度|限額|稅率|費率)(?:是|為|有)|"
+    r"幾(?:公升|毫升|公斤|公克|個月|個|瓶|罐|條|包|盒|支|根|升|克|斤|天|日|晚|年|次|件|台|萬|千|百|元|塊))+"
+)
+
+
+@pytest.mark.parametrize("question, query", [
+    ("去韓國入境，酒可以帶幾瓶？", "去韓國入境，酒幾瓶"),
+    ("入境日本，香菸最多幾條？", "入境日本，香菸最多幾條"),
+    ("韓國入境關稅，可以帶多少？", "韓國入境關稅，多少"),           # the _FACT branch
+    ("韓國入境關稅，小明可以帶多少？", "韓國入境關稅，多少"),       # the name never rides along
+    ("韓國入境酒類免稅額度，可以帶多少？", "韓國入境酒類免稅額度，多少"),
+    ("簽證可以停留，好幾天了到底多久？", "簽證可以停留，多久"),       # 好幾 is no ask
+    ("入境日本，酒可以帶幾個？", "入境日本，酒幾個"),
+    ("入境日本，酒可以帶好幾個嗎？", "入境日本，酒"),                 # nor is 好幾個
+])
+def test_a_regulation_question_keeps_its_ask_when_the_clause_is_cut(question, query):
+    assert public_research.search_query(question) == query
+
+
+@pytest.mark.parametrize("question", [
+    "韓國入境關稅，小明可以帶多少？",
+    "入境日本，阿華問香菸和雪茄最多幾條？",
+    "去韓國入境，林小禾想知道酒可以帶幾瓶？",
+    "入境泰國，聽王大同講現金可以帶幾萬？",
+    "入境日本，好幾瓶酒可以嗎？",
+])
+def test_what_comes_back_is_only_the_fixed_ask_words(question):
+    query = public_research.search_query(question)
+    kept, mark, asked = query.rpartition("，")
+    assert mark and _ASK_WORDS.fullmatch(asked), query
+    clauses = [part.strip() for part in re.split("[，？]", question) if part.strip()]
+    assert all(part in clauses for part in kept.split("，")), query
+    for name in ("小明", "阿華", "林小禾", "王大同", "可以", "知道", "問", "聽"):
+        assert name not in query
+
+
+def test_a_question_without_a_regulation_clause_or_an_ask_is_cut_as_before():
+    assert public_research.search_query("今年雞蛋價格，一斤多少？") == "今年雞蛋價格"   # no regulation clause
+    assert public_research.search_query("去韓國入境，酒可以帶嗎？") == "去韓國入境"       # no quantity asked
+
+
 # ── B2: search snippets, people, stubs ───────────────────────────────────────
 
 SNIPPETS = "我查了相關報導和搜尋摘要，都未提及魏教授談論巴西的咖啡產業。"

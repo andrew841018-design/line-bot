@@ -131,6 +131,44 @@ def _regulation_clauses(value: str) -> list[str]:
     return [part for part in parts if _REGULATION_DOMAIN.search(part)]
 
 
+# 2026-10-29 (follow-up 5, item 2): what a clause the search drops asked about, put back after
+# the domain clause from these fixed words only, in message order: never a name or anything
+# else said there (「去韓國入境，酒可以帶幾瓶？」 searches 「去韓國入境，酒幾瓶」).  幾 counts only
+# before a unit (not 好幾, 幾乎).
+_ASK_OBJECTS = (
+    "酒類", "烈酒", "紅酒", "啤酒", "酒", "香菸", "菸品", "雪茄", "電子菸", "菸", "現金", "外幣", "美金", "台幣",
+    "人民幣", "日圓", "日幣", "韓元", "肉品", "肉類", "水果", "蔬菜", "植物", "奶粉",
+)
+_ASK_UNITS = (
+    "瓶", "罐", "條", "包", "盒", "支", "根", "公升", "毫升", "升", "公斤", "公克", "克", "斤", "天", "日", "晚",
+    "個月", "個", "年", "次", "件", "台", "萬", "千", "百", "元", "塊",
+)
+_ASK_WORDS = re.compile(
+    "|".join(re.escape(word) for word in sorted(_ASK_OBJECTS, key=len, reverse=True))
+    + r"|多少|多久|最多|最少|(?:上限|下限|額度|限額|稅率|費率)(?:是|為|有)|(?<!好)幾(?:"
+    + "|".join(re.escape(unit) for unit in sorted(_ASK_UNITS, key=len, reverse=True)) + ")"
+)
+
+
+def _regulation_ask_phrase(text: str) -> str:
+    """The fixed words in ``text`` that say what it asks, in order (「酒可以帶幾瓶」 → 「酒幾瓶」)."""
+    return "".join(match.group(0) for match in _ASK_WORDS.finditer(text or ""))
+
+
+def _with_regulation_ask(value: str, chosen: list[str]) -> tuple[str, str]:
+    """(``chosen``, clauses of ``value``, as the search text; the ask phrase appended to it).
+    When ``value`` asks a public regulation's number and the chosen clauses do not carry
+    the ask, 「，」 and the ask phrase of the dropped clauses follow (2026-10-29, item 2);
+    the phrase is "" when nothing was appended."""
+    kept = "，".join(chosen)
+    if (not _regulation_clauses(value) or not _REGULATION_QUANTITY_ASK.search(value)
+            or _REGULATION_QUANTITY_ASK.search(kept)):
+        return kept, ""
+    parts = [part.strip() for part in re.split(f"[{_CLAUSE_MARKS}]", value) if part.strip()]
+    phrase = "".join(_regulation_ask_phrase(part) for part in parts if part not in chosen)
+    return (f"{kept}，{phrase}", phrase) if phrase else (kept, "")
+
+
 def _fold(text: str) -> str:
     return unicodedata.normalize("NFKC", text or "").casefold()
 
@@ -142,16 +180,18 @@ def regulation_clause(text: str, family_names=()) -> str:
     domain and ask for a quantity.  A family alias or kinship word (the caller passes
     the names, or a function that returns them), an @name or a first-person word
     anywhere in it means no search:
-    a name must never reach the search provider.  Names are compared NFKC and
-    casefolded (「ＡＭＹ」 and 「amy」 are 「Amy」).  The list of names failing to load, or
-    being empty, means no search at all (2026-10-28: nobody can say whom the question
-    names).  Only the clauses that carry the domain word are returned (v3 #4).
+    a name must never reach the search provider.  Names are compared as `mentions_any`
+    compares them (2026-10-29): NFKC and casefolded (「ＡＭＹ」 and 「amy」 are 「Amy」),
+    spaces, symbols and invisible letters ignored, with its masks for 日本人 and the
+    goddess 媽祖; @ is looked for in the NFKC form (＠ and ﹫ too).  The list of names
+    failing to load, or being empty, means no search at all (2026-10-28: nobody can say
+    whom the question names).  Only the clauses that carry the domain word are returned (v3 #4).
 
     Residual: a given name nobody configured, inside the domain clause itself, is
     not recognised and goes out as written.
     """
     value = public_query(text)
-    if not value or "@" in value or "＠" in value:
+    if not value or "@" in _fold(value):
         return ""
     clauses = _regulation_clauses(value)
     if not clauses or not _REGULATION_QUANTITY_ASK.search(value):
@@ -164,11 +204,7 @@ def regulation_clause(text: str, family_names=()) -> str:
             "regulation research skipped: name source unavailable error_type=%s", type(exc).__name__
         )
         return ""
-    terms = [t for t in (_fold(n) for n in (names or ()) if isinstance(n, str)) if t]
-    if not terms:
-        return ""
-    folded = _fold(value)
-    if any(term in folded for term in terms):
+    if mentions_any(value, names):  # an empty list counts as a match: no search
         return ""
     return "，".join(clauses)
 
@@ -183,20 +219,28 @@ def search_query(text: str) -> str:
     A price/policy claim sends the clauses that make it, as written.  A claim
     that is public only because a public-office person did something sends only
     public words from that clause (dates, countries, offices, events, places).
-    Names and anything else in a family member's message stay home.
+    Names and anything else in a family member's message stay home.  A question about a
+    public regulation's number keeps its ask: 「去韓國入境，酒可以帶幾瓶？」 sends
+    「去韓國入境，酒幾瓶」 (`_with_regulation_ask`, 2026-10-29).
     """
+    return _search_query(text)[0]
+
+
+def _search_query(text: str) -> tuple[str, str]:
+    """(search_query's text, the ask phrase `_with_regulation_ask` appended to it, or "")."""
     value = public_query(text)
     if not value:
-        return ""
+        return "", ""
     if _FACT.search(value):
         parts = [part.strip() for part in re.split(f"[{_CLAUSE_MARKS}]", value) if part.strip()]
         claim = [part for part in parts if _FACT.search(part)]
-        return value if len(claim) == len(parts) else "，".join(claim)
+        return (value, "") if len(claim) == len(parts) else _with_regulation_ask(value, claim)
     clause = _public_affairs_clause(value)
     if not clause:
         # 2026-10-24: a message about a public regulation sends its domain clause only
-        return "，".join(_regulation_clauses(value)) or value
-    return " ".join(dict.fromkeys(m.group(0) for m in _PUBLIC_TERMS.finditer(clause)))
+        regulation = _regulation_clauses(value)
+        return _with_regulation_ask(value, regulation) if regulation else (value, "")
+    return " ".join(dict.fromkeys(m.group(0) for m in _PUBLIC_TERMS.finditer(clause))), ""
 
 
 def requires_current_research(text: str) -> bool:
@@ -344,6 +388,13 @@ def _bare(text: str) -> str:
     return re.sub(r"[\W_]+", "", text or "")
 
 
+def _ask_kept(part: str, appended: str) -> bool:
+    """``part`` is a dropped clause whose ask phrase search_query put back: it is in what
+    `_with_regulation_ask` ``appended``, not merely in the kept clauses (2026-10-29 review)."""
+    phrase = _regulation_ask_phrase(part)
+    return bool(phrase) and phrase in appended
+
+
 def _asks(kept: str, value: str) -> bool:
     """``kept`` still asks: a question word, or a kept clause the message followed with ？."""
     if _QUESTION_FORM.search(kept):
@@ -362,17 +413,20 @@ def complete_search_query(text: str) -> str:
     words from the rest come back (「日本 旅遊 物價高嗎」); names and anything
     else said there stay home, as in search_query (2026-10-28).  Since claude/fix-b-replies
     search_query also keeps only the regulation clauses, and drops the 「？」 with the rest:
-    a cut that took only punctuation or courtesy (請問、謝謝、哈哈) took nothing.
+    a cut that took only punctuation or courtesy (請問、謝謝、哈哈) took nothing.  Nor did one
+    whose ask search_query put back (「酒可以帶幾瓶」 as 「酒幾瓶」, 2026-10-29).
     """
     value = public_query(text)
-    kept = search_query(text)
+    kept, appended = _search_query(text)
     if not value or not kept or not _bare(kept):
         return ""
     if _bare(kept) == _bare(value):
         return kept
     left = _bare(kept)
-    dropped = [part for part in map(_bare, re.split(f"[{_CLAUSE_MARKS}]", value)) if part and part not in left]
-    if all(_COURTESY.fullmatch(part) for part in dropped):
+    # each dropped clause as written (its ask phrase is read as search_query read it) and bare
+    dropped = [(part, _bare(part)) for part in re.split(f"[{_CLAUSE_MARKS}]", value)]
+    dropped = [(part, bare) for part, bare in dropped if bare and bare not in left]
+    if all(_COURTESY.fullmatch(bare) or _ask_kept(part, appended) for part, bare in dropped):
         return kept if _asks(kept, value) else ""
     subjects: list[str] = []
     chained = -1  # where the last listed word ended
@@ -407,12 +461,71 @@ def asks_for_number(text: str) -> bool:
     return bool(_REGULATION_QUANTITY_ASK.search(public_query(text)))
 
 
+# Moved here from main._plain_question_names on 2026-10-29 (follow-up 5 part 2, the TODO R2 of
+# the 2026-10-28 review): regulation_clause and the plain-question path share the rule, and
+# the sentences in test_research_plain_question.py's mask test are its contract.  The kinship
+# words that name nobody in a search question (當事人, 對方) are left out at the source
+# (reply_guards._SEARCH_KINSHIP), so a configured alias, display name or turn label that
+# happens to be one of them still counts.  本人 and 媽 stay deny terms, checked
+# after the words below are masked (2026-10-29 privacy review, REVIEW_gp1_plan_s9.md
+# and REVIEW_gp2_plan_s9.md):
+# - 本人 skips only 日本人, on the NFKC-folded text as written: nothing is stripped for
+#   it, so 「王旭日、本人…」 never joins into 日本人;
+# - 媽 skips 媽祖／媽閣 only as the goddess or her temple, read on the folded text with
+#   what _bare drops taken out (「舅媽祖 厝」 is no 媽祖 before a space) and never after
+#   a kinship prefix (「舅媽祖廟」 is 舅媽's).  「媽去日本要簽證嗎」 is one person.
+_MASKED_BEFORE = {
+    "本人": re.compile(r"日本人"),
+    "媽": re.compile(
+        r"(?<![舅姑姨乾契義繼養親奶乳伯岳])(?:媽祖|媽閣)(?=廟|宮|遶境|繞境|進香|誕|信仰|文化|[，,。！？!?]|$)"
+    ),
+}
+_MASK_VIEW = re.compile(r"[^\w，,。！？!?]+|_")  # what _bare drops, less the marks 媽's mask reads
+# 媽 kept apart from 祖／閣 in the folded text (「媽 祖廟」「媽、祖廟」) is no goddess word: the
+# stripped view would join them, so the bare 媽 counts as written (GP2 Phase 6 P6-1).
+_MA_SPLIT = re.compile(r"媽[\W_]+[祖閣]")
+# 2026-10-29 (follow-up 5): simplified kinship characters are the traditional ones (「我妈」 is
+# 媽), and letters that show nothing split no name: the Hangul fillers (which _bare keeps as
+# letters) and the zero-width characters.  The masks release text, so they read it with those
+# letters still in: 媽, U+3164, 祖廟 is no 媽祖, nor is 王旭日, U+200B, 本人 a 日本人.  Only the
+# comparison that blocks drops them (research review, 2026-10-29).
+_SIMPLIFIED_KINSHIP = str.maketrans({"妈": "媽", "爷": "爺", "嬷": "嬤"})
+_INVISIBLE = re.compile(r"[\u115f\u1160\u3164\uffa0\u200b-\u200d\u2060\ufeff]")
+
+
+def _kin_fold(text: str) -> str:
+    """NFKC, casefolded, simplified kinship characters as the traditional ones."""
+    return _fold(text).translate(_SIMPLIFIED_KINSHIP)
+
+
+def _blocking(text: str) -> str:
+    """What a name is looked for in: the invisible letters out, then words only."""
+    return _bare(_INVISIBLE.sub("", text))
+
+
 def mentions_any(text: str, names) -> bool:
     """Whether ``text`` holds one of ``names``, compared as regulation_clause does
     (NFKC, casefolded) and with spaces and symbols ignored (「王 大同」).  An empty
-    list counts as a match: nobody can say whom the text names (fails closed)."""
-    terms = [term for term in (_bare(_fold(name)) for name in names or () if isinstance(name, str)) if term]
+    list counts as a match: nobody can say whom the text names (fails closed).
+
+    2026-10-29 (follow-up 5): the bare 本人 and 媽 are looked for after their masks (日本人;
+    the goddess 媽祖／媽閣), and a 媽 kept apart from 祖／閣 counts at once; simplified
+    kinship characters are the traditional ones and invisible letters split no name,
+    while the masks read the text with them still in."""
+    terms = [term for term in (_blocking(_kin_fold(name)) for name in names or () if isinstance(name, str)) if term]
     if not terms:
         return True
-    folded = _bare(_fold(text))
-    return any(term in folded for term in terms)
+    folded = _kin_fold(text)
+    whole = _blocking(folded)
+    for term in terms:
+        if term == "媽":
+            if _MA_SPLIT.search(folded):
+                return True
+            seen = _blocking(_MASKED_BEFORE[term].sub("", _MASK_VIEW.sub("", folded)))
+        elif term == "本人":
+            seen = _blocking(_MASKED_BEFORE[term].sub("", folded))
+        else:
+            seen = whole
+        if term in seen:
+            return True
+    return False
