@@ -279,6 +279,33 @@ def _preview_path() -> Path:
     return _state_dir() / "daily_memory_preview.json"
 
 
+# 記憶快滿時人工整理（jobs/memory_review.py，2026-10-30）的本機報表含家人記憶原文：forget 只收 24 小時內的；
+# 沒人收的由每晚這支 job 刪掉（一小時以前產生的都刪，正在整理的那份留著）。目錄名的 .noindex 讓 Spotlight 不索引。
+REVIEW_DIR_NAME = "memory_review.noindex"
+REVIEW_REPORT_MAX_AGE_SEC = 24 * 3600
+NIGHTLY_REVIEW_REPORT_MAX_AGE_SEC = 3600
+REVIEW_REPORT_GLOBS = ("report_*.json", "report_*.md", ".report_*.tmp")
+
+
+def review_dir() -> Path:
+    return _state_dir() / REVIEW_DIR_NAME
+
+
+def remove_expired_review_reports(max_age_sec: float = REVIEW_REPORT_MAX_AGE_SEC) -> int:
+    """刪掉 max_age_sec 以前產生的整理報表（看檔案的 mtime，用真的時間），回傳刪了幾個檔；讀不到的跳過。"""
+    cutoff = time.time() - max_age_sec
+    removed = 0
+    for pattern in REVIEW_REPORT_GLOBS:
+        for path in review_dir().glob(pattern):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+                    removed += 1
+            except OSError:
+                continue
+    return removed
+
+
 def _mode() -> str:
     raw = os.environ.get(MODE_ENV, "").strip().lower()
     if raw in ("", "0"):
@@ -1019,6 +1046,13 @@ def _delete_preview() -> None:
 
 def run(*, now: float | None = None) -> Outcome:
     now = time.time() if now is None else now
+    try:
+        expired = remove_expired_review_reports(NIGHTLY_REVIEW_REPORT_MAX_AGE_SEC)
+    except Exception as exc:  # 清不掉不影響每日記憶本身
+        log.warning("expired memory review reports not removed error_type=%s", type(exc).__name__)
+    else:
+        if expired:
+            log.info("expired memory review reports removed files=%d", expired)
     mode = _mode()
     if mode != "dry_run":
         _delete_preview()

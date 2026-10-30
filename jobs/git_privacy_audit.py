@@ -81,7 +81,9 @@ _FORBIDDEN_EXACT = {
     "event_reminder_private.json",
     "jobs/push_pending_drafts.py",
 }
-_FORBIDDEN_PREFIXES = ("logs/", "finetune/data/")
+# state/：執行中的狀態檔，從來沒有進過 git（2026-10-30 記憶快滿時人工整理）。裡面有家人記憶原文的報表、
+# ledger、預覽，還有 fact_hash.key 這種內容規則擋不到的隨機位元組（GP2 F），所以整個目錄用路徑擋。
+_FORBIDDEN_PREFIXES = ("logs/", "finetune/data/", "state/")
 _FORBIDDEN_DB_RE = re.compile(
     r"(?:^|/)[^/]+\.(?:db|sqlite|sqlite3)(?:$|[-.](?:wal|shm|journal)$)",
     re.IGNORECASE,
