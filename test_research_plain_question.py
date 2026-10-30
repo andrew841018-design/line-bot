@@ -13,16 +13,20 @@ Nothing here reaches the network or a real model.
 """
 from contextlib import nullcontext
 import logging
+import time
 from types import SimpleNamespace
 
 import pytest
+import requests
 
 import fulltext_fetcher
+import grounding_evidence
 import line_mentions
 import main
 import public_research
 import reply_guards
 import reply_provenance
+import safe_fetch
 import source_aggregator
 import web_scraper
 
@@ -36,12 +40,18 @@ def _no_model(*_a, **_k):
     pytest.fail("no model may answer here")
 
 
+def _no_page(*_a, **_k):
+    raise safe_fetch.BlockedURL("these tests read no page")
+
+
 @pytest.fixture(autouse=True)
 def no_real_models(monkeypatch):
     """Every model a test needs is stubbed by that test; nothing else may run."""
     monkeypatch.setattr(main.gemini_client, "chat", _no_model)
     monkeypatch.setattr(main, "_gemini_llm_chat", _no_model)
     monkeypatch.setattr(main, "_llm_chat", _no_model)
+    # 2026-10-29 (PLAN §10): a cited page is read only where a test serves one.
+    monkeypatch.setattr(safe_fetch, "fetch", _no_page)
     # raising=False: on the code before 2026-10-28 there is no counter, and the
     # repro below must fail on its assertion there, not here.
     monkeypatch.setattr(main, "_plain_question_searches", {"date": "", "count": 0}, raising=False)
@@ -471,6 +481,192 @@ def test_an_answer_the_guards_empty_is_b_not_silence(monkeypatch, research_env, 
     assert research_env.sent == [public_research.NO_SOURCE_QUESTION]
     assert research_env.finished == []
     assert "plain question answer emptied by the reply guards" in caplog.text
+
+
+# ── 2026-10-29 (PLAN §10): a number the cited pages hold may stay ────────────
+
+SOURCE = "https://example.com/source"  # what _grounded cites by default
+
+
+@pytest.fixture
+def cited(monkeypatch):
+    """safe_fetch.fetch serving synthetic cited pages; every call is recorded."""
+    pages, calls = {}, []
+
+    def fetch(url, **kwargs):
+        calls.append((url, kwargs))
+        page = pages.get(url)
+        if page is None:
+            raise safe_fetch.BlockedURL("not served")
+        return page
+
+    monkeypatch.setattr(safe_fetch, "fetch", fetch)
+    return SimpleNamespace(pages=pages, calls=calls)
+
+
+def _cited_page(text, url="https://pages.example/visa"):
+    resp = requests.Response()
+    resp.status_code = 200
+    resp._content = f"<html><body><p>{text}</p></body></html>".encode("utf-8")
+    resp.headers["Content-Type"] = "text/html; charset=utf-8"
+    resp.url = url
+    return resp
+
+
+def test_a_number_the_cited_page_holds_is_said(monkeypatch, research_env, nothing_crawled, cited, caplog):
+    cited.pages[SOURCE] = _cited_page("外籍旅客免簽入境，停留期間最長90天。")
+    monkeypatch.setattr(main.gemini_client, "chat", _grounded([], answer=f"{VISA_YES}\n{VISA_DAYS}"))
+    with caplog.at_level(logging.INFO, logger="line_bot"):
+        main._handle_web_research_question(research_env.event, "G_PQ", "日本免簽可以待幾天？")
+    assert research_env.sent == [f"{VISA_YES}\n{VISA_DAYS}"]
+    assert [url for url, _kw in cited.calls] == [SOURCE]
+    assert "grounding backing pass2=used" in caplog.text and "kept=1" in caplog.text
+    assert "example.com" not in caplog.text and "停留期間" not in caplog.text  # counts only
+
+
+def test_a_number_no_cited_page_holds_still_gets_the_fixed_line(monkeypatch, research_env, nothing_crawled,
+                                                                cited):
+    cited.pages[SOURCE] = _cited_page("外籍旅客免簽入境，請備妥回程機票。")
+    monkeypatch.setattr(main.gemini_client, "chat", _grounded([], answer=f"{VISA_YES}\n{VISA_DAYS}"))
+    main._handle_web_research_question(research_env.event, "G_PQ", "日本免簽可以待幾天？")
+    assert research_env.sent == [reply_guards.REGULATORY_UNCONFIRMED_REPLY]
+    assert cited.calls  # the page was read and did not hold 90天
+
+
+def test_part_of_the_asked_numbers_backed_is_the_fixed_line(monkeypatch, research_env, nothing_crawled, cited):
+    # REVIEW_gp1_plan_s10 #11: 「幾天」 must not be answered with the 6個月 the page backs.
+    answer = "台灣護照赴日免簽，護照效期需6個月以上。\n免簽最多可停留90天。"
+    cited.pages[SOURCE] = _cited_page("申請人護照效期需6個月以上。")
+    monkeypatch.setattr(main.gemini_client, "chat", _grounded([], answer=answer))
+    main._handle_web_research_question(research_env.event, "G_PQ", "日本免簽可以待幾天？")
+    assert research_env.sent == [reply_guards.REGULATORY_UNCONFIRMED_REPLY]
+    assert cited.calls
+
+
+def test_a_yes_no_answer_keeps_what_the_page_backs(monkeypatch, research_env, nothing_crawled, cited):
+    answer = f"{VISA_YES}\n{VISA_DAYS}\n逾期停留最高罰款30萬日圓。"
+    cited.pages[SOURCE] = _cited_page("外籍旅客免簽入境，停留期間最長90天。")
+    monkeypatch.setattr(main.gemini_client, "chat", _grounded([], answer=answer))
+    main._handle_web_research_question(research_env.event, "G_PQ", "去日本要簽證嗎？")
+    assert research_env.sent == [f"{VISA_YES}\n{VISA_DAYS}"]
+
+
+def test_no_page_is_read_for_an_answer_without_a_dropped_number(monkeypatch, research_env, nothing_crawled,
+                                                                cited):
+    monkeypatch.setattr(main.gemini_client, "chat", _grounded([]))
+    main._handle_web_research_question(research_env.event, "G_PQ", QUESTION)
+    assert research_env.sent == [ANSWER] and cited.calls == []
+
+
+def test_no_page_is_read_late_in_the_reply(monkeypatch, research_env, nothing_crawled, cited, caplog):
+    cited.pages[SOURCE] = _cited_page("停留期間最長90天。")
+    monkeypatch.setattr(main.gemini_client, "chat", _grounded([], answer=f"{VISA_YES}\n{VISA_DAYS}"))
+    monkeypatch.setattr(main, "_PAGE_BACKING_MIN_LEFT_SEC", 1000.0)
+    with caplog.at_level(logging.INFO, logger="line_bot"):
+        main._handle_web_research_question(research_env.event, "G_PQ", "日本免簽可以待幾天？")
+    assert research_env.sent == [reply_guards.REGULATORY_UNCONFIRMED_REPLY] and cited.calls == []
+    assert "grounding pages skipped reason=late" in caplog.text
+
+
+def test_the_kill_switch_reads_no_page(monkeypatch, research_env, nothing_crawled, cited):
+    monkeypatch.setenv("LINE_BOT_GROUNDING_BACKING", "0")
+    cited.pages[SOURCE] = _cited_page("停留期間最長90天。")
+    monkeypatch.setattr(main.gemini_client, "chat", _grounded([], answer=f"{VISA_YES}\n{VISA_DAYS}"))
+    main._handle_web_research_question(research_env.event, "G_PQ", "日本免簽可以待幾天？")
+    assert research_env.sent == [reply_guards.REGULATORY_UNCONFIRMED_REPLY] and cited.calls == []
+
+
+def test_no_page_is_read_off_the_plain_question_path(monkeypatch, research_env, cited):
+    monkeypatch.setattr(main, "_collect_web_research_sources", lambda _text: [{
+        "url": "https://example.com/visa", "title": "合成來源",
+        "full_text": "合成的來源內容，談到日本觀光免簽的規定與入境時要準備的文件。"}])
+    monkeypatch.setattr(main, "_llm_chat", lambda *_a: f"{VISA_YES}\n{VISA_DAYS}")
+    main._handle_web_research_question(research_env.event, "G_PQ", "日本免簽可以待幾天？")
+    assert research_env.sent == [VISA_YES] and cited.calls == []
+
+
+def _rendered(page_text):
+    """A provider that renders what ``page_text`` holds, as the real one does after reading it."""
+    def provide(text):
+        needed = grounding_evidence.needed_quantities(text)
+        found = grounding_evidence._scan(page_text, needed, time.monotonic() + 5)
+        return "\n".join(sorted(grounding_evidence.render(q) for q in found))
+    return provide
+
+
+def _enforce(monkeypatch, reply, request, provider, *, all_or_nothing=False):
+    monkeypatch.setenv("LINE_BOT_RESTATEMENT_JUDGE", "0")
+    return main._enforce_new_value_reply(
+        reply, source_text=request, request_text=request, context=[], addressed=True, searched=True,
+        regulation_page_backing=provider, page_backing_all_or_nothing=all_or_nothing,
+    )
+
+
+def test_a_year_on_the_page_never_drops_a_sentence_kept_today(monkeypatch):
+    # REVIEW_gp1_plan_s10 probe 5: 「民國112年修正」 must not turn on B1's year rule.
+    request = "入境免稅額度還是2萬元嗎？"
+    reply = "是的，2025年起入境旅客免稅額度仍是新臺幣2萬元。菸酒免稅額度是酒類1公升。"
+    today = _enforce(monkeypatch, reply, request, None)
+    paged = _enforce(monkeypatch, reply, request, _rendered("酒類1公升（不限瓶數），捲菸200支（民國112年修正）。"))
+    assert "2025年起" in today and "1公升" not in today
+    assert "2025年起" in paged and "1公升" in paged
+
+
+def test_the_page_backs_numbers_and_nothing_else(monkeypatch):
+    seen = []
+    real_date, real_contact = main._date_claims_unbacked, main._contact_backing
+    real_public = main.reply_policy.strip_unbacked_public_claims
+    monkeypatch.setattr(main, "_date_claims_unbacked",
+                        lambda *a, **k: seen.append(k.get("evidence_text")) or real_date(*a, **k))
+    monkeypatch.setattr(main, "_contact_backing", lambda *a, **k: seen.append(a[3]) or real_contact(*a, **k))
+    monkeypatch.setattr(main.reply_policy, "strip_unbacked_public_claims",
+                        lambda *a, **k: seen.append(k.get("evidence_text")) or real_public(*a, **k))
+    out = _enforce(monkeypatch, f"{VISA_YES}\n{VISA_DAYS}", "日本免簽可以待幾天？",
+                   _rendered("停留期間最長90天。"), all_or_nothing=True)
+    assert VISA_DAYS in out
+    assert len(seen) >= 2 and all("90天" not in (ev or "") for ev in seen)
+
+
+def _first(text="可以。", dropped=1):
+    return reply_guards.GuardResult(text, negative_dropped=0, numbers_dropped=dropped)
+
+
+def _second_pass(first, provider, run_guards, *, all_or_nothing=False):
+    return main._page_backed_guards(
+        first, "可以。免簽停留90天都可以。", provider, run_guards, lambda evidence: [evidence],
+        evidence_text="", partial=False, search_only=True, all_or_nothing=all_or_nothing,
+    )
+
+
+def test_a_second_pass_that_loses_a_short_sentence_is_not_kept(monkeypatch):
+    # REVIEW_gp2_plan_s10 F4: 「可以。」 inside 「…都可以。」 is no kept sentence.
+    results = iter([reply_guards.RegulatoryResult("可以。", 1, 0),
+                    reply_guards.RegulatoryResult("免簽停留90天都可以。", 0, 1)])
+    monkeypatch.setattr(reply_guards, "strip_negative_coverage", lambda text, *_a: (text, 0))
+    monkeypatch.setattr(reply_guards, "strip_unbacked_regulatory_numbers", lambda *_a: next(results))
+    runs = []
+    first = _first()
+    assert _second_pass(first, lambda _t: "90天", runs.append) is first and runs == []
+
+
+def _raise(*_a, **_k):
+    raise RuntimeError("synthetic")
+
+
+def test_errors_in_the_second_pass_keep_the_first(monkeypatch, caplog):
+    first = _first()
+    with caplog.at_level(logging.INFO, logger="line_bot"):
+        assert _second_pass(first, _raise, lambda _e: pytest.fail("no second run")) is first
+        assert _second_pass(first, lambda _t: "90天", _raise) is first
+    assert caplog.text.count("pass2=error error_type=RuntimeError") == 2
+
+
+def test_a_second_pass_that_disagrees_with_its_check_is_not_kept(monkeypatch):
+    results = iter([reply_guards.RegulatoryResult("可以。", 1, 0), reply_guards.RegulatoryResult("可以。", 0, 1)])
+    monkeypatch.setattr(reply_guards, "strip_negative_coverage", lambda text, *_a: (text, 0))
+    monkeypatch.setattr(reply_guards, "strip_unbacked_regulatory_numbers", lambda *_a: next(results))
+    first = _first()
+    assert _second_pass(first, lambda _t: "90天", lambda _e: _first("可以。", dropped=1)) is first
 
 
 # ── claims keep the fact-check wording; other routes are unchanged ───────────
