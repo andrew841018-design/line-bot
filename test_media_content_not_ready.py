@@ -152,13 +152,11 @@ def test_video_handler_reports_content_not_ready(monkeypatch, tmp_path):
     assert reasons == ["content not ready"]
 
 
-def _slow_download(monkeypatch):
+def _downloaded_after_wait(monkeypatch, *, waited=True):
     import main
 
-    monkeypatch.setattr(main, "_MEDIA_CONTENT_POLL_SEC", 0.01)
-
     def download(_message_id):
-        time.sleep(0.02)  # took longer than one poll: the transcoding wait happened
+        main._CONTENT_WAIT_STATE.waited = waited  # runs on the media worker, like the real download
         return b"video"
 
     monkeypatch.setattr(main, "_download_content", download)
@@ -169,7 +167,7 @@ def test_video_gives_up_after_a_wait_when_too_little_time_is_left(monkeypatch, t
     import media_pipeline
 
     event, reasons = _video_handler_setup(monkeypatch, tmp_path)
-    _slow_download(monkeypatch)
+    _downloaded_after_wait(monkeypatch)
     analysed: list[bytes] = []
     monkeypatch.setattr(media_pipeline, "analyze_video", lambda data, **_kw: analysed.append(data))
     # analysis deadline = reply deadline - send reserve ≈ 10 s away, under _VIDEO_MIN_ANALYSIS_SEC
@@ -186,7 +184,7 @@ def test_video_still_analysed_after_a_wait_with_enough_time(monkeypatch, tmp_pat
     import media_pipeline
 
     event, reasons = _video_handler_setup(monkeypatch, tmp_path)
-    _slow_download(monkeypatch)
+    _downloaded_after_wait(monkeypatch)
     analysed: list[bytes] = []
     monkeypatch.setattr(
         media_pipeline, "analyze_video", lambda data, **_kw: analysed.append(data) or None
@@ -197,3 +195,64 @@ def test_video_still_analysed_after_a_wait_with_enough_time(monkeypatch, tmp_pat
 
     assert analysed == [b"video"]
     assert reasons == ["analysis returned empty"]
+
+
+def test_video_without_a_wait_is_analysed_even_with_little_time(monkeypatch, tmp_path):
+    import main
+    import media_pipeline
+
+    event, reasons = _video_handler_setup(monkeypatch, tmp_path)
+    _downloaded_after_wait(monkeypatch, waited=False)  # a plain 200, however long it took
+    analysed: list[bytes] = []
+    monkeypatch.setattr(
+        media_pipeline, "analyze_video", lambda data, **_kw: analysed.append(data) or None
+    )
+    main._handle_video_message_owned(
+        event, "group", deadline_monotonic=time.monotonic() + main._MEDIA_REPLY_SEND_RESERVE_SEC + 10
+    )
+
+    assert analysed == [b"video"]
+    assert reasons == ["analysis returned empty"]
+
+
+def test_download_records_whether_it_waited(monkeypatch):
+    import main
+
+    _install_blob(monkeypatch, [bytearray(b"video")], [])
+    main._download_content("m1")
+    assert main._CONTENT_WAIT_STATE.waited is False
+    _install_blob(monkeypatch, [None, bytearray(b"video")], ["succeeded"])
+    main._download_content("m2")
+    assert main._CONTENT_WAIT_STATE.waited is True
+
+
+def _quoted_video(monkeypatch, error):
+    import main
+    from unittest.mock import MagicMock
+
+    monkeypatch.setattr(main, "_quota_exhausted", lambda: False)
+
+    def download(_message_id):
+        raise error
+
+    monkeypatch.setattr(main, "_download_content", download)
+    monkeypatch.setattr(main, "_handle_quoted_media_description_fallback", lambda *_a, **_k: False)
+    reply = MagicMock()
+    monkeypatch.setattr(main, "_reply", reply)
+    event = SimpleNamespace(reply_token="reply-token", message=SimpleNamespace(id="followup"))
+    main._handle_media_via_quote(event, "group", "這段在說什麼", "quoted-video", "[影片]")
+    reply.assert_called_once()
+    return reply.call_args.args[1]
+
+
+def test_quoted_video_still_transcoding_says_line_is_processing(monkeypatch):
+    import main
+
+    text = _quoted_video(monkeypatch, main._MediaContentNotReadyError("LINE content not ready"))
+    assert "LINE 還在處理" in text
+    assert "過期" not in text
+
+
+def test_quoted_video_other_download_failure_keeps_the_expired_text(monkeypatch):
+    text = _quoted_video(monkeypatch, RuntimeError("404"))
+    assert "可能已經過期" in text

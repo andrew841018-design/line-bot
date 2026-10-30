@@ -4196,7 +4196,7 @@ def _handle_video_message_owned(
         return
 
     def _analyze() -> str | None:
-        started = time.monotonic()
+        _CONTENT_WAIT_STATE.waited = False
         data = _download_content(msg_id)
         if len(data) > _MEDIA_BYTE_LIMIT:
             raise _MediaTooLargeError("video exceeds local byte limit")
@@ -4206,10 +4206,17 @@ def _handle_video_message_owned(
         # _VIDEO_MIN_ANALYSIS_SEC is left: an analysis that overruns the deadline is thrown away but keeps the only
         # media-analysis slot busy for the next photo or video.
         remaining = analysis_deadline - time.monotonic()
-        waited = time.monotonic() - started >= _MEDIA_CONTENT_POLL_SEC
-        if remaining <= 0 or (waited and remaining < _VIDEO_MIN_ANALYSIS_SEC):
+        if remaining <= 0:
             raise _MediaAnalysisTimeoutError("media analysis deadline exhausted")
-        return media_pipeline.analyze_video(bytes(data), group_id=group_id)
+        if getattr(_CONTENT_WAIT_STATE, "waited", False) and remaining < _VIDEO_MIN_ANALYSIS_SEC:
+            raise _MediaAnalysisTimeoutError(
+                f"too little time left after waiting for LINE ({remaining:.0f}s < {_VIDEO_MIN_ANALYSIS_SEC:.0f}s)"
+            )
+        analysis_started = time.monotonic()
+        try:
+            return media_pipeline.analyze_video(bytes(data), group_id=group_id)
+        finally:  # to calibrate _VIDEO_MIN_ANALYSIS_SEC against real durations
+            logger.info("video analysis took %.1fs", time.monotonic() - analysis_started)
 
     try:
         reply_text = _run_media_analysis(_analyze, analysis_deadline)
@@ -25009,6 +25016,9 @@ _VIDEO_MIN_ANALYSIS_SEC = 15.0  # after a transcoding wait, less than this left 
 # seconds; the read limit is per socket read, so a large video still downloads.
 _LINE_CONTENT_TIMEOUT = (5, 30)
 _LINE_TRANSCODING_STATUS_TIMEOUT = (3, 5)
+# Timeouts are per attempt: urllib3's default Retry(3) may retry a timed-out GET, so the worst case is about 4x
+# (content ~2 min, status ~20-30 s). Bounded, which is the point; retries stay shared with push and reply.
+_CONTENT_WAIT_STATE = threading.local()  # .waited: this thread's last _download_content waited for transcoding
 
 
 def _content_wait_allowed() -> bool:
@@ -25024,9 +25034,11 @@ def _download_content(message_id: str) -> bytes:
     """從 LINE 下載 image/video/audio/file 訊息的原始 bytes。
 
     影片／音訊剛傳上來時 LINE 可能還在轉檔：content API 回 202，SDK 只認 200、回 None。
-    這時查轉檔狀態，每 2 秒再抓一次，最多等 _MEDIA_CONTENT_WAIT_SEC 秒；轉檔失敗或
-    等不到就丟 _MediaContentNotReadyError（以前是 bytes(None) 的 TypeError）。
+    只有 media-analysis worker 會等（_content_wait_allowed）：查轉檔狀態，每 2 秒再抓一次，最多等
+    _MEDIA_CONTENT_WAIT_SEC 秒；轉檔失敗或等不到就丟 _MediaContentNotReadyError（以前是 bytes(None) 的
+    TypeError）。其他執行緒（webhook 上的音訊、引用媒體）拿到 None 立刻丟同一個錯。
     """
+    _CONTENT_WAIT_STATE.waited = False
     with ApiClient(_get_line_config()) as api_client:
         blob = MessagingApiBlob(api_client)
         data = blob.get_message_content(message_id, _request_timeout=_LINE_CONTENT_TIMEOUT)
@@ -25034,6 +25046,7 @@ def _download_content(message_id: str) -> bytes:
             raise _MediaContentNotReadyError("LINE content not ready (no wait outside the media worker)")
         give_up_at = time.monotonic() + _MEDIA_CONTENT_WAIT_SEC
         while data is None:
+            _CONTENT_WAIT_STATE.waited = True
             try:
                 status = blob.get_message_content_transcoding_by_message_id(
                     message_id, _request_timeout=_LINE_TRANSCODING_STATUS_TIMEOUT
