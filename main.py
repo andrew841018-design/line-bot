@@ -30,7 +30,7 @@ import reply_policy
 from reply_policy import NO_REPEAT_CONTRACT
 import reply_provenance
 from quote_context import QUOTE_CONTEXT_RULE, QUOTE_ONLY_PLACEHOLDER, has_quote_context, original_block, missing_block, recent_block, with_current_reply
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 import mimetypes
 import os
 import re
@@ -1242,6 +1242,8 @@ def _enforce_new_value_reply(
     facts: list[str] | None = None,
     partial: bool = False,
     speaker: str = "",
+    regulation_page_backing: Callable[[str], str] | None = None,
+    page_backing_all_or_nothing: bool = False,
 ) -> str:
     """Drop sentences that only restate what the group already said.
 
@@ -1298,6 +1300,14 @@ def _enforce_new_value_reply(
     and no ``has_material``) cannot say a text 「都未提及」 something either: that is B2 only,
     ``partial`` (material read in part) is what also narrows the restatement check.  The counts go
     to ``outcome``; ``""`` is silence, as for the other guards.
+
+    2026-10-29 (Andrew, PLAN §10): ``regulation_page_backing``, given only for a plain question's
+    Gemini answer, maps the text the guards read to the quantities its cited pages hold
+    (``grounding_evidence``).  When B1 dropped a number, the guards run once more with those in
+    front of ``evidence_text`` — the only check that reads them — and that second pass is kept
+    only if B1 keeps every sentence it kept before and, with ``page_backing_all_or_nothing`` (the
+    family asked for a number), backs every number; otherwise, and on any error, the first pass
+    stands (``_page_backed_guards``).
     """
     grounding = reply_provenance.take_grounding()
     report = {
@@ -1390,27 +1400,41 @@ def _enforce_new_value_reply(
             if not reply_text:
                 outcome["public_claims_emptied"] = True
                 return ""
-    try:
-        guards = reply_guards.apply_reply_guards(
+    # Nothing was read and the reply rests on a search (Gemini grounding, the
+    # research rows, a cached grounded replay): search snippets cannot show that
+    # a text lacks something.  B2 only — the restatement check below keeps its
+    # wider correction markers (「政府並沒有宣布…」 is a correction there).
+    search_only = bool(outcome.get("grounded")) and not has_material
+
+    def run_guards(evidence: str):
+        return reply_guards.apply_reply_guards(
             reply_text,
             source_text=source_text or "",
             request_text=request_text or "",
             material_text=material_text or "",
-            evidence_text=evidence_text or "",
+            evidence_text=evidence,
             context=context,
             addressed=addressed,
             partial=partial,
-            # Nothing was read and the reply rests on a search (Gemini grounding, the
-            # research rows, a cached grounded replay): search snippets cannot show that
-            # a text lacks something.  B2 only — the restatement check below keeps its
-            # wider correction markers (「政府並沒有宣布…」 is a correction there).
-            search_only=bool(outcome.get("grounded")) and not has_material,
+            search_only=search_only,
             speaker=speaker,
         )
+
+    try:
+        guards = run_guards(evidence_text or "")
     except Exception as exc:
         logger.warning("reply-quality guards skipped error_type=%s", type(exc).__name__)
         regulation_dropped = 0
     else:
+        if guards.numbers_dropped and regulation_page_backing is not None:
+            guards = _page_backed_guards(
+                guards, reply_text, regulation_page_backing, run_guards,
+                lambda evidence: reply_guards.regulation_backing(
+                    source_text or "", request_text or "", material_text or "", evidence, context=context
+                ),
+                evidence_text=evidence_text or "", partial=partial, search_only=search_only,
+                all_or_nothing=page_backing_all_or_nothing,
+            )
         regulation_dropped = guards.numbers_dropped
         if guards.negative_dropped or regulation_dropped or guards.nonanswer:
             # Counts only: these sentences are exactly the ones not to repeat.
@@ -1459,6 +1483,65 @@ def _enforce_new_value_reply(
     return reply_guards.unconfirmed_regulation_reply(
         out, addressed=addressed, numbers_dropped=regulation_dropped
     )
+
+
+_SENTENCE_RE = re.compile(r"[^。！？!?\n]+[。！？!?]*")
+
+
+def _sentences(text: str):
+    """The sentences of ``text``, stripped and counted (a multiset)."""
+    from collections import Counter
+
+    return Counter(part.strip() for part in _SENTENCE_RE.findall(text or "") if part.strip())
+
+
+def _page_backed_guards(first, reply_text, provider, run_guards, backing_for, *, evidence_text,
+                        partial, search_only, all_or_nothing):
+    """The reply guards' second pass, with the quantities a plain answer's cited pages hold (PLAN §10).
+
+    Kept only when B1, given those quantities, keeps every sentence it kept without them (whole
+    sentences, counted: 「可以。」 inside 「…都可以。」 does not count as kept) and, with
+    ``all_or_nothing``, drops no number; else, and on any error, ``first`` — never the unguarded
+    text (REVIEW_gp2_plan_s10 F3).  The comparison reads B1's own output, B2 first as
+    ``apply_reply_guards`` runs them, so B3 can neither trip it nor hide a new drop
+    (REVIEW_gp1_plan_s10, debate D3); if that order ever changes, the counts disagree and the
+    first pass stands.
+    """
+    try:
+        page = provider(reply_text)
+        if not page:
+            return first
+        evidence = f"{page}\n{evidence_text}" if evidence_text else page  # the page first: no cut reaches it
+        b2_text, _negative = reply_guards.strip_negative_coverage(reply_text, partial, search_only)
+        before = reply_guards.strip_unbacked_regulatory_numbers(b2_text, lambda: backing_for(evidence_text))
+        after = reply_guards.strip_unbacked_regulatory_numbers(b2_text, lambda: backing_for(evidence))
+        if before.dropped != first.numbers_dropped:
+            logger.info("grounding backing pass2=kept_pass1 reason=drift")
+            return first
+        if all_or_nothing and after.dropped:
+            logger.info("grounding backing pass2=kept_pass1 reason=partial dropped=%d", after.dropped)
+            return first
+        if _sentences(before.text) - _sentences(after.text):
+            logger.info("grounding backing pass2=kept_pass1 reason=lost_sentence")
+            return first
+        second = run_guards(evidence)
+        if second.numbers_dropped != after.dropped:
+            logger.info("grounding backing pass2=kept_pass1 reason=drift")
+            return first
+        # B3 may still take out what the page rescued: then the first pass's fixed line stands
+        # rather than a B (REVIEW_gp2_plan_s10 Phase 6 P6-2).
+        rescued = {q for q in reply_guards.quantities(after.text) if q.kind != "年份"}
+        if not second.text or (all_or_nothing and rescued - set(reply_guards.quantities(second.text))):
+            logger.info("grounding backing pass2=kept_pass1 reason=emptied")
+            return first
+        logger.info(
+            "grounding backing pass2=used numbers_before=%d after=%d",
+            first.numbers_dropped, second.numbers_dropped,
+        )
+        return second
+    except Exception as exc:
+        logger.warning("grounding backing pass2=error error_type=%s", type(exc).__name__)
+        return first
 
 
 _MATERIAL_MARKERS = ("--- 內容開始 ---", "--- PDF 內容開始 ---")
@@ -21430,6 +21513,7 @@ def _handle_web_research_question(
     crawl: dict = {}
     plain_question = False
     plain_note = ""
+    plain_urls: list[str] = []  # the pages a plain question's Gemini answer cited (PLAN §10)
     with _thinking_indicator(group_id):
         # `query` (links included) only passes public_query's privacy check here.
         sources = public_research.collect(collect_with_links, query, report=crawl)
@@ -21447,6 +21531,9 @@ def _handle_web_research_question(
                     crawl=crawl if search_text else {"reason": "no_search"}, event=event,
                     context=context,
                 )
+                if answer_searched:
+                    # This answer's own citations, read now: the guards take the record later.
+                    plain_urls = list((reply_provenance.grounding() or {}).get("urls") or [])
         else:
             prompt_text = _build_web_research_prompt(
                 query, sources, quoted_context=quoted_context, searched=searched
@@ -21533,6 +21620,12 @@ def _handle_web_research_question(
             ),
             speaker=_speaker_alias(sender_user_id),
             outcome=guarded,
+            # 2026-10-29 Andrew: a number the cited pages really hold may stay (PLAN §10).
+            regulation_page_backing=(
+                _plain_question_page_backing(plain_urls, event=event, group_id=group_id)
+                if plain_question and plain_urls else None
+            ),
+            page_backing_all_or_nothing=plain_question and public_research.asks_for_number(words),
         )
         if (plain_question and reply_text and guarded.get("regulation_numbers_dropped")
                 and public_research.asks_for_number(words)
@@ -21758,6 +21851,38 @@ def _plain_question_common_answer(question: str, link_free: str) -> tuple[str, s
     if _CANNOT_CONFIRM_RE.search(answer):
         return "", "unsure"
     return answer, "ok"
+
+
+# Reading the cited pages (PLAN §10): only with this much of the reply budget left, for at most
+# _PAGE_BACKING_MAX_SEC, keeping _PAGE_BACKING_RESERVE_SEC for the restatement judge (10 s) and
+# the send (5 s).
+_PAGE_BACKING_MIN_LEFT_SEC = 20.0
+_PAGE_BACKING_MAX_SEC = 8.0
+_PAGE_BACKING_RESERVE_SEC = 15.0
+
+
+def _plain_question_page_backing(urls: list[str], *, event, group_id: str) -> Callable[[str], str]:
+    """What ``_enforce_new_value_reply`` asks when B1 dropped a number of a plain question's
+    Gemini answer: the quantities of the text the guards read that the cited ``urls`` hold,
+    rendered for B1 (``grounding_evidence``); ``""`` when off, late, or nothing matched."""
+    def provide(text: str) -> str:
+        import grounding_evidence
+
+        if not grounding_evidence.enabled():
+            return ""
+        needed = grounding_evidence.needed_quantities(text)
+        if not needed:
+            return ""
+        left = _media_reply_deadline(event) - time.monotonic()
+        if left < _PAGE_BACKING_MIN_LEFT_SEC:
+            logger.info("grounding pages skipped reason=late group=%s", group_id)
+            return ""
+        budget = min(_PAGE_BACKING_MAX_SEC, left - _PAGE_BACKING_RESERVE_SEC)
+        backing, stats = grounding_evidence.page_backing(urls, needed, deadline=time.monotonic() + budget)
+        logger.info("grounding pages %s group=%s", grounding_evidence.format_stats(stats), group_id)
+        return backing
+
+    return provide
 
 
 def _build_plain_question_search_prompt(text: str) -> str:
