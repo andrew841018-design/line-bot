@@ -1691,15 +1691,18 @@ def _configure_local_text_llm_runtime() -> None:
 
 
 def _start_local_vision_worker() -> None:
-    """Begin local-only model warm-up without blocking uvicorn startup."""
+    """Warm the local vision model, or leave it for the first image.
+
+    vision_llm decides (VISION_WARM_AT_START).
+    """
     try:
         import vision_llm
 
-        ready = vision_llm.start_background_worker()
+        state = vision_llm.start_background_worker_at_boot()
         logger.info(
             "local vision worker started ready_now=%s state=%s",
-            ready,
-            "ready" if ready else "warming",
+            state == "ready",
+            state,
         )
     except Exception as exc:
         logger.warning(

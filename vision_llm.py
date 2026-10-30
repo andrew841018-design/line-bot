@@ -12,6 +12,7 @@ System prompt / post-check / compose_prompt 抽到 vision_common.py，
 from __future__ import annotations
 import atexit
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from datetime import datetime
 import logging
 import math
 import multiprocessing
@@ -25,6 +26,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Callable, Optional, TypeVar
+from zoneinfo import ZoneInfo
 
 # 規則 0 / 咪寶人設 / 黑名單 post-check 共用模組
 from vision_common import (
@@ -92,6 +94,61 @@ def _idle_unload_sec_from_env() -> float:
     if value <= 0:
         return 0.0
     return max(_VISION_IDLE_UNLOAD_MIN_SEC, value)
+
+
+# Load the model when the bot starts, or wait for the first image (2026-10-29).
+# Each restart re-warmed ~6 GB that stayed resident for 4 h or more, so the
+# overnight Gmail local judge never found memory. 23:00-08:00 Taiwan time is
+# Andrew's chosen night window: "day" warms restarts from 08:00 to 22:59.
+_VISION_WARM_MODES = frozenset({"always", "never", "day"})
+_VISION_WARM_DEFAULT_MODE = "day"
+# The window is [08:00, 23:00) Taiwan time; the end is exclusive. The 08:05
+# morning restart (morning_restart.sh; LaunchAgent Hour 8 Minute 5, and the
+# Mac's local time is Taipei) is the morning warm, and it depends on this 8:
+# raising it, or moving that restart before 08:00, makes the morning restart
+# park, and the day's first image then gets no reply.
+_VISION_WARM_DAY_START_HOUR = 8
+_VISION_WARM_DAY_END_HOUR = 23
+_VISION_WARM_TZ = "Asia/Taipei"
+
+
+def _warm_mode_from_env() -> str:
+    """VISION_WARM_AT_START: unset/blank -> "day"; always, never or day.
+
+    Anything else warms at every start (the behaviour before this setting)
+    and logs a warning without the value. Read once per boot, so no
+    warn-once flag.
+    """
+    raw = os.environ.get("VISION_WARM_AT_START", "").strip().lower()
+    if not raw:
+        return _VISION_WARM_DEFAULT_MODE
+    if raw in _VISION_WARM_MODES:
+        return raw
+    logger.warning("vision warm at start always: VISION_WARM_AT_START unrecognised")
+    return "always"
+
+
+def _warms_at(mode: str, hour: int) -> bool:
+    """Whether a start in this Taiwan-time hour loads the model now.
+
+    always yes, never no, day only 08:00-22:59; unknown modes load.
+    """
+    if mode == "never":
+        return False
+    if mode == "day":
+        return _VISION_WARM_DAY_START_HOUR <= hour < _VISION_WARM_DAY_END_HOUR
+    return True
+
+
+def _taipei_hour(now: datetime | None) -> int:
+    """Hour in Taiwan time (no DST); a naive ``now`` is rejected."""
+    # Per call: a zone failure must not break the import the spawn child shares.
+    tz = ZoneInfo(_VISION_WARM_TZ)
+    if now is None:
+        now = datetime.now(tz)
+    elif now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    return now.astimezone(tz).hour
 
 
 class VisionBusyError(RuntimeError):
@@ -716,9 +773,7 @@ class _VisionProcessSupervisor:
         self._close_connection_locked()
         self._process = None
         self._active_request = None
-        if not self._ipc_swept:
-            self._ipc_store.sweep_orphans()
-            self._ipc_swept = True
+        self._sweep_ipc_once_locked()
         self._generation += 1
         generation = self._generation
         parent_connection, child_connection = self._context.Pipe(duplex=True)
@@ -846,6 +901,34 @@ class _VisionProcessSupervisor:
             self._refresh_warming_locked()
             return self._state == "ready"
 
+    def _sweep_ipc_once_locked(self) -> None:
+        """Delete a dead parent's staged image files, once per process."""
+        if not self._ipc_swept:
+            self._ipc_store.sweep_orphans()
+            self._ipc_swept = True
+
+    def defer_start(self) -> str:
+        """Start parked: no child until the first run(); maintenance never spawns.
+
+        Only a supervisor that has done nothing yet is deferred; otherwise
+        nothing changes and the current state is returned. The dead-parent
+        IPC sweep still runs now; if it fails, the first spawn retries it.
+        """
+        with self._lock:
+            # Every spawn attempt and every recycle bumps _generation, so 0
+            # means no spawn attempt yet.
+            if self._generation or self._shutdown_started:
+                return self._state
+            self._parked = True
+            try:
+                self._sweep_ipc_once_locked()
+            except Exception as exc:
+                logger.warning(
+                    "vision_worker_ipc_sweep_failed error_type=%s",
+                    type(exc).__name__,
+                )
+            return "parked"
+
     def _terminate_locked(
         self,
         reason: str,
@@ -947,8 +1030,8 @@ class _VisionProcessSupervisor:
     def maintenance_tick(self) -> str:
         """Advance lifecycle state; the lifespan runs this off its event loop.
 
-        Returns the state, or "parked" while an idle-unloaded model waits for
-        the next request.
+        Returns the state, or "parked" while no child exists until the next
+        request: after an idle unload, or a start deferred at boot.
         """
         with self._lock:
             if self._shutdown_started:
@@ -1179,6 +1262,24 @@ _PROCESS_SUPERVISOR = _VisionProcessSupervisor()
 def start_background_worker() -> bool:
     """Start the local-only child load without waiting for model readiness."""
     return _PROCESS_SUPERVISOR.start_background()
+
+
+def start_background_worker_at_boot(now: datetime | None = None) -> str:
+    """Warm the model at start-up, or start parked (VISION_WARM_AT_START).
+
+    Returns "ready", "warming" or "parked", or its current state: a supervisor
+    that has already done anything keeps that state. A parked start loads the
+    model on the first image, as after an idle unload. Images that arrive
+    before the model is ready (about 3 min) get no reply; they do not wait.
+    """
+    mode = _warm_mode_from_env()
+    hour = _taipei_hour(now)
+    if _warms_at(mode, hour):
+        return "ready" if start_background_worker() else "warming"
+    state = _PROCESS_SUPERVISOR.defer_start()
+    if state == "parked":
+        logger.info("vision_worker_start_deferred mode=%s hour=%d", mode, hour)
+    return state
 
 
 def abort_active_request() -> bool:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from datetime import datetime, timedelta, timezone, tzinfo
 import gc
 import logging
 import multiprocessing
@@ -10,6 +11,7 @@ import re
 import stat
 import threading
 import time
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -1206,4 +1208,262 @@ def test_stop_after_park_is_clean_and_fenced():
     with pytest.raises(vision_llm.VisionUnavailableError) as exc_info:
         supervisor.run("describe", {"image": b"x"}, timeout_sec=1.0)
     assert exc_info.value.code == "worker_shutdown"
+    assert len(context.processes) == 1
+
+
+# --- deferred start at boot (2026-10-29, VISION_WARM_AT_START) ---------------
+_TW = ZoneInfo("Asia/Taipei")
+
+
+def _private_store(tmp_path):
+    return vision_llm._PrivateIpcStore(root=tmp_path / "ipc")
+
+
+def test_a_deferred_start_spawns_nothing_until_the_first_image(tmp_path, caplog):
+    context = FakeContext([{"ready": False, "on_send": None}])
+    supervisor = _idle_supervisor(context, ipc_store=_private_store(tmp_path))
+    assert supervisor.defer_start() == "parked"
+    for _ in range(50):
+        assert supervisor.maintenance_tick() == "parked"
+    assert context.processes == []
+    assert supervisor.abort_active_request() is False
+    with caplog.at_level(logging.INFO, logger="vision_llm"):
+        with pytest.raises(vision_llm.VisionBusyError, match="warming"):
+            supervisor.run("describe", {"image": b"x"}, timeout_sec=1.0)
+        with pytest.raises(vision_llm.VisionBusyError, match="warming"):
+            supervisor.run("describe", {"image": b"y"}, timeout_sec=1.0)
+    assert [r.getMessage() for r in caplog.records].count(
+        "vision_worker_rewarm_on_demand") == 1
+    assert len(context.processes) == 1
+    assert supervisor.maintenance_tick() == "warming"
+    context.parents[0].push(("ready", supervisor._generation, "fake-model"))
+    assert supervisor.maintenance_tick() == "ready"
+
+
+def test_a_deferred_start_sweeps_dead_parent_files_at_once(tmp_path):
+    store = _private_store(tmp_path)
+    store.ensure_private_root()
+    dead = store.root / "vision-ipc-p999999999-r1-0000000000000001.bin"
+    dead.write_bytes(b"x")
+    dead.chmod(0o600)
+    context = FakeContext([])
+    supervisor = _idle_supervisor(context, ipc_store=store)
+    assert supervisor.defer_start() == "parked"
+    assert not dead.exists() and supervisor._ipc_swept is True
+    assert context.processes == []
+
+
+@pytest.mark.parametrize("error", [
+    vision_llm.VisionUnavailableError("vision IPC sweep failed: OSError"),
+    PermissionError(13, "Permission denied"),
+], ids=["VisionUnavailableError", "PermissionError"])
+def test_a_failed_boot_sweep_keeps_the_deferral_and_retries_at_first_spawn(
+    monkeypatch, tmp_path, caplog, error
+):
+    store = _private_store(tmp_path)
+    calls = []
+
+    def sweep():
+        calls.append(1)
+        if len(calls) == 1:
+            raise error
+
+    monkeypatch.setattr(store, "sweep_orphans", sweep)
+    context = FakeContext([{"ready": False, "on_send": None}])
+    supervisor = _idle_supervisor(context, ipc_store=store)
+    with caplog.at_level(logging.INFO, logger="vision_llm"):
+        assert supervisor.defer_start() == "parked"
+    assert [r.getMessage() for r in caplog.records] == [
+        f"vision_worker_ipc_sweep_failed error_type={type(error).__name__}"
+    ]
+    assert supervisor._ipc_swept is False
+    assert supervisor.maintenance_tick() == "parked" and context.processes == []
+    with pytest.raises(vision_llm.VisionBusyError):
+        supervisor.run("describe", {"image": b"x"}, timeout_sec=1.0)
+    assert len(calls) == 2 and supervisor._ipc_swept is True
+    assert len(context.processes) == 1
+
+
+def test_defer_start_leaves_a_used_supervisor_alone(tmp_path):
+    # live child: refused; a later death respawns as before (no stray park)
+    context = FakeContext(
+        [{"ready": True, "on_send": None}, {"ready": False, "on_send": None}])
+    supervisor = _idle_supervisor(context, ipc_store=_private_store(tmp_path))
+    assert supervisor.start_background() is True
+    assert supervisor.defer_start() == "ready" and supervisor._parked is False
+    context.processes[0].alive = False
+    assert supervisor.maintenance_tick() == "warming"
+    assert len(context.processes) == 2
+    # idle-parked: refused, stays parked, no spawn
+    context = FakeContext(_ready_specs(2))
+    supervisor = _idle_supervisor(context, ipc_store=_private_store(tmp_path))
+    assert supervisor.start_background() is True
+    _go_idle(supervisor)
+    assert supervisor.maintenance_tick() == "parked"
+    assert supervisor.defer_start() == "stopped"
+    assert supervisor.maintenance_tick() == "parked" and len(context.processes) == 1
+    # shut down: refused, not parked
+    context = FakeContext([])
+    supervisor = _idle_supervisor(context, ipc_store=_private_store(tmp_path))
+    supervisor.shutdown()
+    assert supervisor.defer_start() == "stopped" and supervisor._parked is False
+    assert context.processes == []
+
+
+def test_shutdown_while_deferred_is_clean_and_fenced(tmp_path):
+    context = FakeContext([])
+    supervisor = _idle_supervisor(context, ipc_store=_private_store(tmp_path))
+    assert supervisor.defer_start() == "parked"
+    supervisor.shutdown()
+    assert supervisor.maintenance_tick() == "stopped"
+    with pytest.raises(vision_llm.VisionUnavailableError) as exc_info:
+        supervisor.run("describe", {"image": b"x"}, timeout_sec=1.0)
+    assert exc_info.value.code == "worker_shutdown"
+    assert context.processes == []
+
+
+@pytest.mark.parametrize("raw, expected, warns", [
+    (None, "day", 0), ("", "day", 0), ("   ", "day", 0), ("day", "day", 0),
+    (" Day ", "day", 0), ("ALWAYS", "always", 0), ("never", "never", 0),
+    ("Never\t", "never", 0), ("0", "always", 1), ("off", "always", 1),
+    ("false", "always", 1), ("no", "always", 1), ("nightly", "always", 1),
+    ("23-8", "always", 1),
+])
+def test_warm_mode_env_parsing(monkeypatch, caplog, raw, expected, warns):
+    if raw is None:
+        monkeypatch.delenv("VISION_WARM_AT_START", raising=False)
+    else:
+        monkeypatch.setenv("VISION_WARM_AT_START", raw)
+    with caplog.at_level(logging.WARNING, logger="vision_llm"):
+        assert vision_llm._warm_mode_from_env() == expected
+    assert [r.getMessage() for r in caplog.records] == [
+        "vision warm at start always: VISION_WARM_AT_START unrecognised"
+    ] * warns
+
+
+def test_an_unrecognised_mode_warns_on_every_read(monkeypatch, caplog):
+    monkeypatch.setenv("VISION_WARM_AT_START", "nightly")
+    with caplog.at_level(logging.WARNING, logger="vision_llm"):
+        vision_llm._warm_mode_from_env()
+        vision_llm._warm_mode_from_env()
+    assert len(caplog.records) == 2 and "nightly" not in caplog.text
+
+
+@pytest.mark.parametrize("mode, hour, expected", [
+    ("day", 0, False), ("day", 7, False), ("day", 8, True), ("day", 15, True),
+    ("day", 22, True), ("day", 23, False), ("always", 0, True),
+    ("always", 7, True), ("always", 23, True), ("never", 8, False),
+    ("never", 12, False), ("never", 22, False),
+])
+def test_warms_at_hour_table(mode, hour, expected):
+    assert vision_llm._warms_at(mode, hour) is expected
+
+
+def test_taipei_hour_uses_taiwan_time_for_aware_inputs():
+    la = ZoneInfo("America/Los_Angeles")
+    cases = [
+        (datetime(2026, 10, 29, 7, 59, 59, 999999, tzinfo=_TW), 7),
+        (datetime(2026, 10, 29, 8, 0, 0, tzinfo=_TW), 8),
+        (datetime(2026, 10, 29, 22, 59, 59, 999999, tzinfo=_TW), 22),
+        (datetime(2026, 10, 29, 23, 0, 0, tzinfo=_TW), 23),
+        (datetime(2026, 10, 29, 0, 0, tzinfo=timezone.utc), 8),
+        (datetime(2026, 10, 28, 14, 59, 59, tzinfo=timezone.utc), 22),
+        (datetime(2026, 10, 28, 15, 0, tzinfo=timezone.utc), 23),
+        (datetime(2026, 10, 28, 8, 0, tzinfo=la), 23),   # PDT
+        (datetime(2026, 11, 2, 8, 0, tzinfo=la), 0),     # PST
+        (datetime(2026, 10, 29, 9, 0, tzinfo=timezone(timedelta(hours=9))), 8),
+    ]
+    assert [vision_llm._taipei_hour(now) for now, _ in cases] == [h for _, h in cases]
+
+
+def test_taipei_hour_rejects_naive_and_reads_the_clock_in_taiwan(monkeypatch):
+    class NoOffset(tzinfo):
+        def utcoffset(self, dt):
+            return None
+
+    for naive in (datetime(2026, 10, 29, 12), datetime(2026, 10, 29, 12, tzinfo=NoOffset())):
+        with pytest.raises(ValueError):
+            vision_llm._taipei_hour(naive)
+    seen = []
+
+    class FrozenClock:
+        @staticmethod
+        def now(tz=None):
+            seen.append(tz)
+            return datetime(2026, 10, 29, 0, 30, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(vision_llm, "datetime", FrozenClock)
+    assert vision_llm._taipei_hour(None) == 8
+    assert [getattr(tz, "key", None) for tz in seen] == ["Asia/Taipei"]
+
+
+@pytest.mark.parametrize("raw, now, expected, line", [
+    (None, datetime(2026, 10, 29, 7, 59, 59, tzinfo=_TW), "parked", "mode=day hour=7"),
+    (None, datetime(2026, 10, 29, 8, 0, 0, tzinfo=_TW), "warming", None),
+    (None, datetime(2026, 10, 29, 22, 59, 59, tzinfo=_TW), "warming", None),
+    (None, datetime(2026, 10, 29, 23, 0, 0, tzinfo=_TW), "parked", "mode=day hour=23"),
+    (None, datetime(2026, 10, 29, 0, 0, tzinfo=timezone.utc), "warming", None),
+    ("always", datetime(2026, 10, 29, 3, 0, tzinfo=_TW), "warming", None),
+    ("never", datetime(2026, 10, 29, 12, 0, tzinfo=_TW), "parked", "mode=never hour=12"),
+    ("nightly", datetime(2026, 10, 29, 3, 0, tzinfo=_TW), "warming", None),
+])
+def test_boot_entry_by_mode_and_taiwan_time(
+    monkeypatch, caplog, tmp_path, raw, now, expected, line
+):
+    if raw is None:
+        monkeypatch.delenv("VISION_WARM_AT_START", raising=False)
+    else:
+        monkeypatch.setenv("VISION_WARM_AT_START", raw)
+    context = FakeContext([{"ready": False, "on_send": None}])
+    supervisor = _idle_supervisor(context, ipc_store=_private_store(tmp_path))
+    monkeypatch.setattr(vision_llm, "_PROCESS_SUPERVISOR", supervisor)
+    with caplog.at_level(logging.INFO, logger="vision_llm"):
+        assert vision_llm.start_background_worker_at_boot(now) == expected
+    deferred = [r.getMessage() for r in caplog.records
+                if r.getMessage().startswith("vision_worker_start_deferred")]
+    assert deferred == ([f"vision_worker_start_deferred {line}"] if line else [])
+    assert len(context.processes) == (0 if expected == "parked" else 1)
+    assert supervisor.maintenance_tick() == expected
+
+
+def test_boot_entry_never_wakes_a_used_supervisor_at_night(
+    monkeypatch, caplog, tmp_path
+):
+    monkeypatch.setenv("VISION_WARM_AT_START", "never")
+    context = FakeContext(_ready_specs(2))
+    supervisor = _idle_supervisor(context, ipc_store=_private_store(tmp_path))
+    assert supervisor.start_background() is True
+    _go_idle(supervisor)
+    assert supervisor.maintenance_tick() == "parked"
+    monkeypatch.setattr(vision_llm, "_PROCESS_SUPERVISOR", supervisor)
+    with caplog.at_level(logging.INFO, logger="vision_llm"):
+        assert vision_llm.start_background_worker_at_boot(
+            datetime(2026, 10, 29, 3, 0, tzinfo=_TW)) == "stopped"
+    assert "vision_worker_start_deferred" not in caplog.text
+    assert supervisor.maintenance_tick() == "parked" and len(context.processes) == 1
+
+
+@pytest.mark.parametrize("case", ["naive_now", "start_raises"])
+def test_a_failed_boot_entry_parks_nothing_and_the_tick_warms(
+    monkeypatch, tmp_path, case
+):
+    # Fail safe: an error in the boot entry leaves no park behind, so the next
+    # maintenance tick warms the model, as before VISION_WARM_AT_START.
+    monkeypatch.setenv("VISION_WARM_AT_START", "day")
+    context = FakeContext([{"ready": False, "on_send": None}])
+    supervisor = _idle_supervisor(context, ipc_store=_private_store(tmp_path))
+    monkeypatch.setattr(vision_llm, "_PROCESS_SUPERVISOR", supervisor)
+    if case == "naive_now":
+        now, error = datetime(2026, 10, 29, 3, 0), ValueError
+    else:
+        now, error = datetime(2026, 10, 29, 12, 0, tzinfo=_TW), RuntimeError
+
+        def fail():
+            raise RuntimeError("spawn failed")
+
+        monkeypatch.setattr(supervisor, "start_background", fail)
+    with pytest.raises(error):
+        vision_llm.start_background_worker_at_boot(now)
+    assert supervisor._parked is False and context.processes == []
+    assert supervisor.maintenance_tick() == "warming"
     assert len(context.processes) == 1
