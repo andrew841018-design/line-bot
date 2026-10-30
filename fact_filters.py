@@ -213,11 +213,18 @@ def _normalize_terms(raw: Iterable[str]) -> tuple[str, ...]:
 def load_name_terms(*, require_names: bool = False) -> tuple[str, ...]:
     """本機名單（每次重讀、不快取）：隱私詞、別名／角色／短名、bot 記下的顯示名稱。
 
-    require_names=True（job）：別名檔不在、讀不到、沒有名字，或隱私詞檔讀不到，就丟
-    NameSourceUnavailable。require_names=False（即時抽取）：照常過濾，只是少擋名字。
+    require_names=True（job、股價查詢關卡）：別名檔不在、讀不到、沒有名字，顯示名稱檔在卻讀不到、
+    名字讀不出來，或隱私詞檔讀不到，就丟 NameSourceUnavailable（只帶寫死的字：job 會記進 log）。
+    require_names=False（即時抽取）：照常過濾，只是少擋名字。
     """
     if require_names:
         _require_alias_file()
+        # 2026-10-29：顯示名稱檔不在是正常的（還沒查過任何人）；在卻讀不到、解不開、不是 JSON 物件或
+        # 連結斷了，不能當成「沒有顯示名稱」照寫——那些人的名字就擋不住了。
+        try:
+            line_mentions.require_display_names_readable()
+        except Exception:
+            raise NameSourceUnavailable("display name file unavailable") from None
     raw: list[str] = []
     try:
         raw.extend(_privacy_terms())
@@ -235,7 +242,9 @@ def load_name_terms(*, require_names: bool = False) -> tuple[str, ...]:
         for name in line_mentions.display_names().values():
             raw.extend((name, _clean_member_label(name)))
     except Exception:
-        pass  # 顯示名稱檔不在是正常的（沒有查過任何人）
+        # 2026-10-29（review）：檔讀得到、名字卻讀不出來，也不能少了這些人照常往下走
+        if require_names:
+            raise NameSourceUnavailable("display names unreadable") from None
     return _normalize_terms(raw)
 
 

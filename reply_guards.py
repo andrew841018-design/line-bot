@@ -739,6 +739,11 @@ _PERSON_START_RE = re.compile(
     r"^[ ,，]*(?:你們|你|您|妳|我們|我|他們|她們|他|她|"
     + "|".join(re.escape(k) for k in sorted(_KINSHIP, key=len, reverse=True)) + ")"
 )
+# 2026-10-29 (follow-up 5, item 1): the kinship words a search must not contain.  當事人 and
+# 對方 name nobody in a question (「對方違規要怎麼檢舉」); they are left out here, at the
+# source, so an alias, a display name or a turn label 當事人／對方 still blocks.  本人 and the
+# rest stay: 本人 often follows a given name nobody configured (「林小禾本人入境…」).
+_SEARCH_KINSHIP = tuple(k for k in _KINSHIP if k not in ("當事人", "對方"))
 
 
 def _fold(text: str) -> str:
@@ -783,12 +788,23 @@ def configured_names(*, strict: bool = False) -> tuple[str, ...]:
     return names
 
 
-def _display_name_terms() -> list[str]:
+def _display_name_terms(*, strict: bool = False) -> list[str]:
     """LINE display names the bot looked up for members without a local alias (as
-    fact_filters and member_labels use them); a missing file is normal."""
+    fact_filters and member_labels use them); a missing file is normal.
+
+    ``strict`` (2026-10-29, only from ``name_terms(strict=True)``): a file that is there but
+    cannot be read as a JSON object, or names that fail to load, raise
+    ``NameSourceUnavailable`` instead of answering "no display names"."""
+    if strict:
+        try:
+            line_mentions.require_display_names_readable()
+        except Exception:
+            raise NameSourceUnavailable("display name file unavailable") from None
     try:
         names = [n for n in line_mentions.display_names().values() if isinstance(n, str)][:200]
     except Exception:
+        if strict:
+            raise NameSourceUnavailable("display names unreadable") from None
         return []
     terms = list(names)
     try:
@@ -833,14 +849,16 @@ def name_terms(
     context: list[tuple[str, str]] | None = None,
     extra: tuple[str, ...] | list[str] = (),
     strict: bool = False,
+    kinship: tuple[str, ...] = _KINSHIP,
 ) -> tuple[str, ...]:
     """Every name a reply or a search must not use for a person, NFKC and casefolded,
-    longest first: configured aliases (short names, roles), kinship words, ``extra``
+    longest first: configured aliases (short names, roles), the ``kinship`` words, ``extra``
     (the sender), LINE display names and the labels in front of the conversation's turns.
-    ``strict``: raise ``NameSourceUnavailable`` when the alias file is unreadable or empty."""
-    short = [*_KINSHIP, *extra, *configured_names(strict=strict)]
+    ``strict``: raise ``NameSourceUnavailable`` when the alias file is unreadable or empty,
+    or the display-name file is there but cannot be read."""
+    short = [*kinship, *extra, *configured_names(strict=strict)]
     terms = {t for t in (_fold(n).strip() for n in short if isinstance(n, str)) if 1 <= len(t) <= 12}
-    long_ = [*_display_name_terms(), *speaker_labels(context)]
+    long_ = [*_display_name_terms(strict=strict), *speaker_labels(context)]
     terms |= {t for t in (_fold(n).strip() for n in long_ if isinstance(n, str)) if 2 <= len(t) <= 24}
     return tuple(sorted(terms, key=lambda t: (-len(t), t)))
 
@@ -853,13 +871,14 @@ def family_name_list(extra: tuple[str, ...] | list[str] = ()) -> tuple[str, ...]
 def search_deny_terms(context: list[tuple[str, str]] | None = None) -> tuple[str, ...]:
     """What a question must not contain before it is sent to a search provider: the
     names of ``name_terms``, the labels of the conversation's turns included (a label
-    can come from a table the alias file does not hold).
+    can come from a table the alias file does not hold), with the kinship words but
+    當事人 and 對方 (``_SEARCH_KINSHIP``).
 
     Fails closed: ``NameSourceUnavailable`` when the alias file is unreadable or has no
-    name, so no question goes out without knowing whom it must not name.  Residual: a
-    given name nobody configured, standing in the domain clause itself
-    (「林小禾入境酒類免稅額度是多少」), goes out as written."""
-    return name_terms(context=context, strict=True)
+    name, or the display-name file is there but cannot be read, so no question goes out
+    without knowing whom it must not name.  Residual: a given name nobody configured,
+    standing in the domain clause itself (「林小禾入境酒類免稅額度是多少」), goes out as written."""
+    return name_terms(context=context, strict=True, kinship=_SEARCH_KINSHIP)
 
 
 _ASK_VERB = r"(?:問問|問一下|問|詢問|去問|請教|確認|去找|找)"

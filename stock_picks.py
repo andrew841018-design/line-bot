@@ -3027,6 +3027,18 @@ def _ai_fetch_due(today: date, now: float) -> bool:
     return b["attempts"] < AI_FETCH_PER_DAY and now >= b["next_try"]
 
 
+def _ai_holdings_usable(h: Optional[dict], today: date) -> bool:
+    """這份 00952 持股能不能用：有，而且名單日期不在未來、最多舊 AI_HOLDINGS_MAX_AGE_DAYS 天。
+    _ai_universe 和 _ai_fetched_today 共用這一條（2026-10-29）。"""
+    return h is not None and 0 <= (today - date.fromisoformat(h["as_of"])).days <= AI_HOLDINGS_MAX_AGE_DAYS
+
+
+def _ai_fetched_today(today: date) -> bool:
+    """記憶體裡的 00952 是今天抓的、而且照 _ai_holdings_usable 能用：拿它重算，名單來源一定是 00952（2026-10-29）。"""
+    h = _ai_holdings
+    return _ai_holdings_usable(h, today) and h["fetched_day"] == today.isoformat()
+
+
 def _ai_universe(snapshot: Snapshot, give_up: float) -> tuple:
     """名單＝（00952 持股 ∪ 核心名單）過「目前上市普通股」資格；回 (名單資訊, {代號: 來源}, 核心日期, 核心版本)。
     00952 一天最多抓 3 次、失敗 2 小時後再試、被擋（403／429／5xx）當天不再抓；抓不到就沿用上一份（45 天內），
@@ -3051,7 +3063,7 @@ def _ai_universe(snapshot: Snapshot, give_up: float) -> tuple:
             if status in (403, 429) or (isinstance(status, int) and 500 <= status <= 599):
                 b["attempts"] = AI_FETCH_PER_DAY  # 被擋或對方壞了：今天不再打
             logger.info("stock picks ai holdings unavailable reason=%s", exc.reason if isinstance(exc, SourceError) else "error")
-    usable = h is not None and 0 <= (today - date.fromisoformat(h["as_of"])).days <= AI_HOLDINGS_MAX_AGE_DAYS
+    usable = _ai_holdings_usable(h, today)
     etf = set(h["codes"]) if usable else set()
     entries = core.entries if core else {}
     codes = eligible_codes(etf | set(entries), snapshot.listed)
@@ -3204,9 +3216,12 @@ def _maybe_fill_ai(stop: threading.Event) -> None:
         _ai_skip_check.update(n=0, next=0.0)
         _ai_cache_t = snapshot.t
     current = bool(old and old.get("t") == t_iso and old["rule"] == AI_RULE and old.get("core_version") == version)
-    # 同一個 T 通常算過就不再算；例外：① 當天沒抓到 00952（用的是上一份或只有核心名單），而且現在又可以抓了；
+    # 同一個 T 通常算過就不再算；例外：① 當天沒抓到 00952（用的是上一份或只有核心名單），而且現在又可以抓了，
+    # 或今天已經抓到、只是那一輪沒算完（2026-10-29：直接用記憶體那份重算、不再抓；照 _ai_universe 的條件能用才算，
+    # 重算出來才一定是 00952、寫了就不再進來，不然寫完 _ai_next_try 歸零、每一輪都會重算）；
     # ② 有候選因為「資料拿不到」被跳過，而且這次重看其中一檔算得出來了。
-    holdings_due = current and old["universe"]["source"] != "00952" and _ai_fetch_due(_taipei_today(), now)
+    today = _taipei_today()
+    holdings_due = current and old["universe"]["source"] != "00952" and (_ai_fetch_due(today, now) or _ai_fetched_today(today))
     if current and not holdings_due and not (old.get("skipped") and _ai_skipped_resolved(snapshot, old, stop)):
         return
     give_up = time.monotonic() + AI_BUDGET_S
@@ -3260,6 +3275,12 @@ def _maybe_fill_ai(stop: threading.Event) -> None:
         if skipped:  # 剛放棄就馬上重看沒有意義：第一次重看在一小時後
             _ai_skip_check["next"] = max(_ai_skip_check["next"], done + AI_SKIP_RECHECK_S)
         _append_ai_history(state)
+        try:  # 回測週報的池子紀錄（2026-10-29 回測 PLAN §5.2）：只寫自己的 spool 檔；任何問題都不能變成 AI 段的失敗
+            import stock_picks_review_hook
+            stock_picks_review_hook.write_ai_spool(state, snapshot, candidates, sources,
+                                                   chart_cache=_ai_chart_cache, fail_tries=_ai_fail_tries)
+        except Exception as exc:
+            logger.warning("stock picks ai review spool failed error_type=%s", type(exc).__name__)
         logger.info("stock picks ai computed t=%s source=%s universe=%d growth=%d cheap=%d picks=%d skipped=%d fetched=%d",
                     t_iso, u["source"], len(u["codes"]), growth_count, len(candidates), len(picks), len(skipped), rnd.fetches)
     else:

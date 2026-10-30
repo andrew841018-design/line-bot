@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
 import re
 import stat
@@ -184,6 +185,41 @@ def test_no_family_name_list_means_no_run(job):
     outcome = dm.run(now=NOW)
     assert (outcome.status, outcome.exit_code) == ("names_unavailable", 2)
     assert job.model.prompts == []
+
+
+def test_a_display_name_file_that_cannot_be_read_means_no_run(tmp_path, monkeypatch, job):
+    # 2026-10-29（follow-up 5 第 4 項）：檔不在是正常的；在卻讀不到，那些人的名字就擋不住（寧可不寫）
+    _write_state()
+    _raw("m1", "U_A", "我住台中", T0 + 10)
+    path = tmp_path / "member_display_names.json"
+    path.write_bytes(b"{")
+    monkeypatch.setenv("LINE_MEMBER_DISPLAY_NAMES_PATH", str(path))
+    outcome = dm.run(now=NOW)
+    assert (outcome.status, outcome.exit_code) == ("names_unavailable", 2)
+    assert job.model.prompts == [] and memory.list_fact_rows(G) == [] and _cursor() == (T0, "")
+    assert path.read_bytes() == b"{"
+
+
+@pytest.mark.parametrize("source", ["alias_file", "display_name_file", "privacy_terms"])
+def test_the_outcome_says_which_name_source_failed(tmp_path, monkeypatch, caplog, job, source):
+    # 2026-10-29（review）：names_unavailable 時看得出是哪一份名單；只有寫死的字，沒有名字、路徑或內容
+    _write_state()
+    if source == "alias_file":
+        job.aliases.unlink()
+    elif source == "display_name_file":
+        path = tmp_path / "member_display_names.json"
+        path.write_bytes(b"{")
+        monkeypatch.setenv("LINE_MEMBER_DISPLAY_NAMES_PATH", str(path))
+    else:
+        path = tmp_path / "terms.json"
+        path.write_text("{not json", encoding="utf-8")
+        monkeypatch.setenv("LINE_BOT_PRIVACY_TERMS_PATH", str(path))
+    with caplog.at_level(logging.INFO, logger="daily_memory"):
+        outcome = dm.run(now=NOW)
+    assert (outcome.status, outcome.exit_code) == ("names_unavailable", 2)
+    assert source in outcome.stop_reason and _outcome()["stop_reason"] == outcome.stop_reason
+    assert f"stop={outcome.stop_reason} " in caplog.text
+    assert str(tmp_path) not in caplog.text and "成員甲" not in caplog.text
 
 
 def test_no_embedder_means_no_writes_and_no_progress(monkeypatch, job):

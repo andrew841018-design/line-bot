@@ -7,6 +7,7 @@ inside textV2 substitution payloads and should not be logged as message text.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import threading
@@ -15,6 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_ALIAS_PATH = Path(__file__).with_name("user_aliases.json")
 _DEFAULT_ROLE_ALIAS_PATH = Path(__file__).with_name("family_roles.local.json")
@@ -82,6 +85,35 @@ def display_names() -> dict[str, str]:
     return _load_display_names()
 
 
+class DisplayNamesUnavailable(RuntimeError):
+    """The display-name file is there but cannot be read as a JSON object of names."""
+
+
+def require_display_names_readable() -> None:
+    """Raise ``DisplayNamesUnavailable`` when the display-name file is there but cannot be
+    read, decoded or parsed, is not a JSON object, or holds a key or name that is not a
+    string (the writer only writes strings); a missing file is normal (nobody was looked
+    up yet).  ``display_names()`` answers {} or drops entries for all of these, so a gate
+    that must know every name (search, the nightly memory job) asks this first (2026-10-29).
+    Every message is fixed: no name, path or byte of the file."""
+    path = _display_names_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        # a link whose target is gone (an unmounted drive), at the file or at a folder
+        # above it, is not "nobody was looked up yet" (review 2026-10-29)
+        if any(os.path.islink(p) and not os.path.exists(p) for p in (path, *path.parents)):
+            raise DisplayNamesUnavailable("display name file is behind a broken link") from None
+        return
+    except Exception:
+        # never chained: a decode error's text carries the file's bytes
+        raise DisplayNamesUnavailable("display name file unreadable") from None
+    if not isinstance(data, dict):
+        raise DisplayNamesUnavailable("display name file is not a JSON object")
+    if not all(isinstance(k, str) and isinstance(v, str) for k, v in data.items()):
+        raise DisplayNamesUnavailable("display name file has an entry that is not a string")
+
+
 def remember_display_name(user_id: str, name: str) -> None:
     """Keep a looked-up display name for processes that cannot ask LINE."""
     if not user_id or not name:
@@ -100,6 +132,16 @@ def forget_display_name(user_id: str) -> None:
 
 
 def _write_display_name(user_id: str, name: str | None) -> None:
+    # 2026-10-29: a file that is there but cannot be read stays as it is.  The gates that
+    # need every name (search, stock-quote names, the nightly memory job) stop on it;
+    # rewritten with this one name it would let them go on with everyone else missing.
+    # It waits for a repair (a backup, or the drive back for a broken link).  The warning
+    # carries the reason's fixed text only: no id, name, path or content.
+    try:
+        require_display_names_readable()
+    except DisplayNamesUnavailable as exc:
+        logger.warning("%s: left as it is, not rewritten", exc)
+        return
     data = _load_display_names()
     if data.get(user_id) == name or (name is None and user_id not in data):
         return
