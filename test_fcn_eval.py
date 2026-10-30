@@ -11,6 +11,7 @@ _fetch_net_income／_fetch_usd_rf（合成的 Yahoo chart JSON：固定種子的
 
 from __future__ import annotations
 
+import gc
 import itertools
 import json
 import math
@@ -1621,24 +1622,44 @@ class _Deadline(Exception):
     pass
 
 
-def _seconds(check, text) -> float:
-    """``check(text)`` 花多久；卡住的話 5 秒後失敗，不會讓整個測試停住。"""
+_LIMIT = 0.05  # 每個 pattern 在 5000 字上、3 次取最小的 CPU 時間上限
+
+
+def _seconds(check, text, timer=time.perf_counter, deadline=5) -> float:
+    """``check(text)`` 花多久（``timer`` 量，預設牆鐘）；卡住的話 ``deadline`` 秒（牆鐘）後失敗，不會讓整個測試停住。"""
 
     def expire(*_):
         raise _Deadline(repr(text[:12]))
 
     previous = signal.signal(signal.SIGALRM, expire)
-    outer = signal.setitimer(signal.ITIMER_REAL, 5)
-    started = time.perf_counter()
+    outer = signal.setitimer(signal.ITIMER_REAL, deadline)
+    started = time.perf_counter()  # 牆鐘：只用來還原外層計時器
+    begun = timer()
     try:
         check(text)
-        return time.perf_counter() - started
+        return timer() - begun
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous)
         if outer[0]:
             left = max(outer[0] - (time.perf_counter() - started), 0.001)
             signal.setitimer(signal.ITIMER_REAL, left, outer[1])
+
+
+def _cpu_seconds(check, text, deadline=5) -> float:
+    """``check(text)`` 用掉這條執行緒多少 CPU 時間：排隊等 CPU、睡眠都不算（同 timeit：``timer=``＋量的時候關 GC）。
+
+    2026-10-30 負載 68 時，平常約 3 ms 的 pattern 在 deploy gate 量到 65 ms 牆鐘：那是等 CPU，不是回溯。
+    真的回溯照樣花 CPU（5000 字的 ``\\d+%`` 約 60 ms），卡住的照樣 5 秒（牆鐘）失敗。全量時 heap 很大，
+    一次 gen2 回收不該算在 regex 頭上，所以量的時候暫停 GC。
+    """
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        return _seconds(check, text, timer=time.thread_time, deadline=deadline)
+    finally:
+        if gc_was_enabled:
+            gc.enable()
 
 
 def _nfkc(text: str) -> str:
@@ -1704,18 +1725,52 @@ def test_every_pattern_runs_in_linear_time_on_adversarial_text(shape):
     assert len(text) >= 4900
     slow = []
     for name, pattern in _PATTERNS:
-        seconds = min(_seconds(lambda s: list(pattern.finditer(s)), text) for _ in range(3))
-        if seconds >= 0.05:
+        seconds = min(_cpu_seconds(lambda s: list(pattern.finditer(s)), text) for _ in range(3))
+        if seconds >= _LIMIT:
             slow.append((name, round(seconds * 1000, 1)))
     assert slow == []
 
 
+def test_regex_timing_counts_backtracking_but_not_waiting():
+    """量法本身：真的回溯要量得到，等待（高負載時排隊等 CPU、睡眠）不算。
+
+    平方級的 ``\\d+\\s*%`` 在 5000 個數字上約 195 ms CPU（P 核；E 核約 2.6 倍），負載高時牆鐘可能拉長
+    十幾倍，所以期限給 60 秒（參數化那支維持 5 秒，指數級靠它抓）。這裡失敗時，先確認它還是平方級，
+    再看量法或上限。"""
+    quadratic = re.compile(r"\d+\s*%")
+    digits = _SHAPES["digit run"](5000)
+    assert min(_cpu_seconds(lambda s: list(quadratic.finditer(s)), digits, deadline=60) for _ in range(3)) >= _LIMIT
+    assert _cpu_seconds(lambda _: time.sleep(0.2), "x") < _LIMIT
+
+
+def test_regex_timing_counts_only_this_thread():
+    """全量裡別的執行緒（殘留的 daemon thread）在算，也不能算在這次量測頭上（process_time 就會算進去）。"""
+
+    def wait_for_another_thread(_):
+        def burn():
+            end = time.thread_time() + 0.1
+            while time.thread_time() < end:
+                pass
+
+        worker = threading.Thread(target=burn)
+        worker.start()
+        worker.join()
+
+    assert _cpu_seconds(wait_for_another_thread, "x") < _LIMIT
+
+
 @pytest.mark.parametrize("shape", sorted(_SHAPES))
-def test_handle_answers_adversarial_text_quickly(shape, no_evaluation):
+def test_handle_answers_adversarial_text_quickly(shape, no_evaluation, monkeypatch):
+    # 同樣量 CPU 時間（負載高時只量一次的牆鐘會被拉長十幾倍）。no_evaluation 下 handle 全在這條執行緒跑：
+    # _evaluate 是替身，碰不到 _PRICE_POOL／_FIN_POOL；_submit 一呼叫就失敗，這個前提變了這裡會先知道。
+    def _no_pool(*_args, **_kwargs):
+        raise AssertionError("handle submitted work to a thread pool: thread_time would not see it")
+
+    monkeypatch.setattr(fcn_eval, "_submit", _no_pool)
     body, quote = _SHAPES[shape](2000), _SHAPES[shape](3000)
-    assert _seconds(fcn_eval.handle, body) < 0.5
-    assert _seconds(lambda q: fcn_eval.handle("", quoted_text=q), quote) < 0.5
-    assert _seconds(lambda b: fcn_eval.handle(b + " 幫我看", quoted_text=quote), body[:1990]) < 0.5
+    assert _cpu_seconds(fcn_eval.handle, body) < 0.5
+    assert _cpu_seconds(lambda q: fcn_eval.handle("", quoted_text=q), quote) < 0.5
+    assert _cpu_seconds(lambda b: fcn_eval.handle(b + " 幫我看", quoted_text=quote), body[:1990]) < 0.5
 
 
 # ── 10. 契約：fcn_eval 借用 stock_quote 的兩張表 ─────────────────────────────
