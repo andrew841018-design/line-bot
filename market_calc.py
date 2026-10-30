@@ -2348,9 +2348,11 @@ TEXT_BE_BASIS = "名目殖利率減實質殖利率（%）"  # publish 的 basis=
 # 「碼→常數」。5 日變化（move）不顯示（Andrew 10/29 定案），所以沒有它的句子
 TEXT_BE_LINE = "{n} 年損益兩平通膨 {v}%（{md}）"  # 「損益兩平」單獨看會被讀成賺賠打平，標籤帶「通膨」（S1）
 TEXT_BE_STATE = "損益兩平通膨：{state}"  # 過期（ctx.gap 的「過期（資料日 M/D）」）、暫缺
-TEXT_BE_SPREAD_FIVE_HIGHER = "5 年期比 10 年期高 {bp}bp"  # bp 一律取絕對值，方向由碼決定
-TEXT_BE_SPREAD_FIVE_LOWER = "5 年期比 10 年期低 {bp}bp"
-TEXT_BE_SPREAD_SIMILAR = "5 年期和 10 年期差不多"
+# bp 一律取絕對值，方向由碼決定。主詞帶「損益兩平」：只寫「5 年期比 10 年期高」容易被讀成殖利率（倒掛），2026-10-30 事後審查
+# seat2 F3；最寬「5 年期損益兩平比 10 年期低 20000bp」17.0
+TEXT_BE_SPREAD_FIVE_HIGHER = "5 年期損益兩平比 10 年期高 {bp}bp"
+TEXT_BE_SPREAD_FIVE_LOWER = "5 年期損益兩平比 10 年期低 {bp}bp"
+TEXT_BE_SPREAD_SIMILAR = "5 年期和 10 年期損益兩平差不多"
 BE_SPREAD_TEXT = {
     "five_higher": TEXT_BE_SPREAD_FIVE_HIGHER,
     "similar": TEXT_BE_SPREAD_SIMILAR,
@@ -2552,7 +2554,9 @@ TEXT_INFL_PCE = "聯準會的 2% 目標看的是 PCE（另一種物價指標）�
 # BLS 條款（investigations/inflation_20261023.md:249-254；計畫審查 gp2 B1–B7 的定稿）：只把「指數」歸給 BLS，同一個泡泡寫明數字與
 # 判斷由程式計算，附取得日（{md}＝values.retrieved，不用今天補）和英文原句；不放標誌。這幾句直接放進 notes，不經過 ctx.note
 # （英文原句 118 字，會被 NOTE_MAX 丟掉，I6）。每一句各自一個常數、各自 append：要拿掉或改字只動一行
-TEXT_INFL_BLS_DIGEST = ("通膨列的 CPI 指數取自美國勞工統計局（BLS），取得日 {md}；年增與「高於 2%」「加速」等判斷由程式計算，"
+# 摘要那句不舉範例詞（2026-10-30 事後審查 seat2 F5：舉「高於 2%」「加速」時，第 4 列寫「不高於 2%」「降溫」或沒有動能就對不上）；
+# B4 照舊：只有「指數」歸給 BLS、年增和判斷由程式計算、無法擔保涵蓋資料與衍生的數字和分析
+TEXT_INFL_BLS_DIGEST = ("通膨列的 CPI 指數取自美國勞工統計局（BLS），取得日 {md}；年增和通膨列上的判斷由程式計算，"
                         "BLS 無法擔保取得後的資料，以及衍生的數字與分析")
 TEXT_INFL_BLS_CARD = "CPI 指數取自美國勞工統計局（BLS），取得日 {md}；卡上的數字與判斷都由程式計算"
 TEXT_INFL_BLS_VOUCH = "資料自 BLS.gov 取得後，BLS.gov 無法擔保這些資料，也無法擔保由資料衍生的數字與分析"

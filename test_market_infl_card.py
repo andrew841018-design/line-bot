@@ -60,22 +60,25 @@ MOMENTUM_WORDS = ("加速", "持平", "降溫", "比年增快", "和年增差不
 ALT_FORBIDDEN = ("BLS", "高於", "加速", "持平", "降溫", "快", "慢", "差不多", "升", "降")
 # 數字都是正式 2026-09（BLS_YEARS 算出來的）：年增 3.7／核心 2.6、月增 0.6、近 3 月年化 4.6、上月年增 3.4；損益兩平是 make_snapshot 的
 SUMMARY_A = "通膨：CPI 3.7%（9 月）明顯高於 2%，近 3 月加速"
+# 列序（2026-10-30 事後審查 seat2 F1）：整體的年增、目標、月增、年化、年增由…連在一起，核心排在後面、緊接著整體比核心
 CPI_A = [
     "消費者物價（CPI）年增 3.7%（9 月）",
     "明顯高於 2% 目標",
-    "核心 CPI（不含食品能源）年增 2.6%（9 月）",
     "月增 0.6%（季調，9 月）",
     "近 3 月年化 4.6%（季調，9 月），比年增快",
     "年增由 8 月 3.4% 升到 9 月 3.7%",
+    "核心 CPI（不含食品能源）年增 2.6%（9 月）",
     "整體比核心高 1.1 個百分點",
 ]
-BE_A = ["5 年損益兩平通膨 2.45%（10/16）", "10 年損益兩平通膨 2.32%（10/16）", "5 年期比 10 年期高 13bp"]
+ROW_TARGET, ROW_MOM, ROW_ANN3, ROW_R3, ROW_CORE, ROW_R4 = range(1, 7)  # CPI_A 各列的位置：用名字，不用裸索引
+BE_A = ["5 年損益兩平通膨 2.45%（10/16）", "10 年損益兩平通膨 2.32%（10/16）", "5 年期損益兩平比 10 年期高 13bp"]
 DATES_INFL = "資料日：美股 10/16、台股 10/16、VIX 10/16、川普壓力指數 10/16"  # 第 4 列是通膨句：不列 10 年債（I1）
 DATES_RATE = "資料日：美股 10/16、台股 10/16、VIX 10/16、10 年債 10/16、川普壓力指數 10/16"  # 退回：bbef843 的樣子
 
 
 def bls_digest(day: str) -> str:
-    return (f"通膨列的 CPI 指數取自美國勞工統計局（BLS），取得日 {day}；年增與「高於 2%」「加速」等判斷由程式計算，"
+    # 不舉範例詞（事後審查 seat2 F5：舉「高於 2%」「加速」時，第 4 列寫「不高於 2%」「降溫」或沒有動能就對不上）
+    return (f"通膨列的 CPI 指數取自美國勞工統計局（BLS），取得日 {day}；年增和通膨列上的判斷由程式計算，"
             "BLS 無法擔保取得後的資料，以及衍生的數字與分析")
 
 
@@ -220,10 +223,12 @@ def test_case_b_the_base_gap_month_hides_the_momentum_and_labels_october(md, hea
     snap = with_cpi(values, data_date=date(2026, 10, 31))
     rows, notes, _bubble, _ctx = digest(md, snap)
     assert rows[3] == "通膨：CPI 3.7%（9 月）明顯高於 2%"  # 沒有動能半句（C1）
-    assert notes == [DATES_INFL, bls_digest("11/10"), ORIGINAL, "10 月年增算不出來，先列 9 月", *TACO_NOTES]
-    _reply, _title, body, card_notes, _ctx = card(md, snap)
-    assert body == [CPI_A[0], CPI_A[1], CPI_A[2], mom_line, ann3_line, CPI_A[5], CPI_A[6], *BE_A]
-    assert card_notes == [BASIS, bls_card("11/10"), VOUCH, ORIGINAL, PCE, "10 月年增算不出來，先列 9 月", BE_NOTE]
+    # 基期缺值句緊接在資料日、TEXT_INFL_BASIS 之後，BLS 的句子放在它後面（事後審查 seat2 F2：這個狀態會持續約一個月）
+    assert notes == [DATES_INFL, "10 月年增算不出來，先列 9 月", bls_digest("11/10"), ORIGINAL, *TACO_NOTES]
+    reply, _title, body, card_notes, _ctx = card(md, snap)
+    assert body == [*CPI_A[:ROW_MOM], mom_line, ann3_line, *CPI_A[ROW_R3:], *BE_A]
+    assert card_notes == [BASIS, "10 月年增算不出來，先列 9 月", bls_card("11/10"), VOUCH, ORIGINAL, PCE, BE_NOTE]
+    assert reply.alt_text == "盤勢：通膨 CPI 年增 3.7%（9 月）"  # 通知預覽和卡上一樣標年增那個月，不標最新月（seat1 I-2）
     assert not any(word in line for line in [rows[3], *body] for word in MOMENTUM_WORDS)
 
 
@@ -239,7 +244,8 @@ def test_case_c_unaligned_with_a_base_gap(md):
     assert rows[3] == "通膨：CPI 3.7%（9 月）明顯高於 2%"
     assert "10 月年增算不出來，先列 9 月" in notes
     body = card(md, snap)[2]
-    assert body == [CPI_A[0], CPI_A[1], CPI_A[2], "月增 0.6%（季調，9 月）", "近 3 月年化 4.6%（季調，9 月）", CPI_A[5], *BE_A]
+    assert body == [*CPI_A[:ROW_MOM], "月增 0.6%（季調，9 月）", "近 3 月年化 4.6%（季調，9 月）", CPI_A[ROW_R3], CPI_A[ROW_CORE],
+                    *BE_A]
 
 
 def test_case_d_unaligned_core_carries_its_own_month(md):
@@ -254,10 +260,10 @@ def test_case_d_unaligned_core_carries_its_own_month(md):
     assert card(md, snap)[2] == [
         "消費者物價（CPI）年增 4.6%（12 月）",
         "明顯高於 2% 目標",
-        "核心 CPI（不含食品能源）年增 3.1%（11 月）",
         "月增 0.2%（季調，11 月）",
         "近 3 月年化 4.3%（季調，11 月）",
         "年增由 11 月 4.4% 升到 12 月 4.6%",
+        "核心 CPI（不含食品能源）年增 3.1%（11 月）",
         *BE_A,
     ]
 
@@ -272,13 +278,13 @@ def test_case_e_flat_similar_and_zero(md):
     assert card(md, snap)[2] == [
         "消費者物價（CPI）年增 2.0%（9 月）",
         "不高於 2% 目標",
-        "核心 CPI（不含食品能源）年增 2.0%（9 月）",
         "月增 0.0%（季調，9 月）",
         "近 3 月年化 2.0%（季調，9 月），和年增差不多",
         "年增和 8 月一樣，都是 2.0%",
+        "核心 CPI（不含食品能源）年增 2.0%（9 月）",
         "整體和核心差不多",
         *BE_A[:2],
-        "5 年期和 10 年期差不多",
+        "5 年期和 10 年期損益兩平差不多",
     ]
 
 
@@ -292,8 +298,8 @@ def test_case_e2_negative_zero_never_shows(md, paths):
     rows, notes, _bubble, _ctx = digest(md, snap)
     reply, _title, body, card_notes, _ctx = card(md, snap)
     assert rows[3] == "通膨：CPI 0.0%（9 月）不高於 2%，近 3 月加速"
-    assert body[:6] == ["消費者物價（CPI）年增 0.0%（9 月）", "不高於 2% 目標", "核心 CPI（不含食品能源）年增 0.0%（9 月）",
-                        "月增 0.0%（季調，9 月）", "近 3 月年化 0.0%（季調，9 月），比年增快", "年增和 8 月一樣，都是 0.0%"]
+    assert body[:6] == ["消費者物價（CPI）年增 0.0%（9 月）", "不高於 2% 目標", "月增 0.0%（季調，9 月）",
+                        "近 3 月年化 0.0%（季調，9 月），比年增快", "年增和 8 月一樣，都是 0.0%", "核心 CPI（不含食品能源）年增 0.0%（9 月）"]
     assert "5 年損益兩平通膨 0.00%（10/16）" in body and "10 年損益兩平通膨 0.00%（10/16）" in body
     assert reply.alt_text == "盤勢：通膨 CPI 年增 0.0%（9 月）"
     for value in [*rows, *notes, *body, *card_notes, reply.alt_text]:
@@ -308,6 +314,16 @@ def test_g1_a_falling_year_over_year_is_written_by_its_code(md):
     body = card(md, snap)[2]
     assert "年增由 8 月 3.7% 降到 9 月 3.4%" in body and "整體比核心高 0.8 個百分點" in body
     assert digest(md, snap)[0][3] == "通膨：CPI 3.4%（9 月）高於 2%，近 3 月加速"
+
+
+@pytest.mark.parametrize("core_yoy, gap_pp, line", [
+    (4.8, -1.1, "整體比核心低 1.1 個百分點"),  # 能源價格下跌的月份：整體比核心低（publish 存有號的差）
+    (4.2, -0.5, "整體比核心低 0.5 個百分點"),  # 邊界：剛好 −0.5 是 headline_lower（market_calc.infl_gap）
+])
+def test_i1_headline_lower_prints_the_gap_without_its_sign(md, core_yoy, gap_pp, line):
+    """事後審查 seat1 I-1：「低」的那一句數字取絕對值（abs 沒被釘住時會印成「低 -1.1」）。"""
+    snap = with_cpi(changed(core__yoy=core_yoy, gap="headline_lower", gap_pp=gap_pp))
+    assert card(md, snap)[2] == [*CPI_A[:ROW_CORE], f"核心 CPI（不含食品能源）年增 {core_yoy}%（9 月）", line, *BE_A]
 
 
 @pytest.mark.parametrize("yoy, word", [(2.0, "不高於 2%"), (2.5, "略高於 2%"), (3.5, "高於 2%"), (3.6, "明顯高於 2%")])
@@ -331,6 +347,14 @@ def test_g5_january_takes_december_from_the_real_series(md):
     assert rows[3] == "通膨：CPI 4.6%（12 月）明顯高於 2%"  # 季調是 1 月、年增是 12 月：動能不寫
     assert "1 月年增算不出來，先列 12 月" in notes
     assert "年增由 11 月 4.4% 升到 12 月 4.6%" in card(md, snap)[2]
+
+
+def test_i3_a_january_year_over_year_names_december_as_the_month_before(md):
+    """事後審查 seat1 I-3、gp1 nit-e：年增那個月是 1 月（2027 年 2 月公布、算得出年增）時，R3 的「上個月」是 12 月，不是 0 月。"""
+    values = real_values(grow(saved_series(), "2027-01"), date(2027, 2, 12))
+    assert values["cpi"]["yoy_month"] == values["cpi"]["month"] == "2027-01-01"
+    snap = with_cpi(values, data_date=date(2027, 1, 31))
+    assert "年增由 12 月 4.6% 降到 1 月 4.4%" in card(md, snap)[2]
 
 
 @pytest.mark.parametrize("month, yoy_month", [
@@ -367,7 +391,7 @@ def test_an_unusable_cpi_row_falls_back_and_has_no_bls_lines(md, changes):
 def test_g4_the_momentum_needs_both_months_and_the_lines_need_the_seasonal_month(md):
     snap = with_cpi(changed(cpi__sa_month=None))  # 動能碼還在，但季調月份讀不到
     assert digest(md, snap)[0][3] == "通膨：CPI 3.7%（9 月）明顯高於 2%"
-    assert card(md, snap)[2] == [*CPI_A[:3], *CPI_A[5:], *BE_A]  # 月增、年化兩列都不寫
+    assert card(md, snap)[2] == [*without(ROW_MOM, ROW_ANN3), *BE_A]  # 月增、年化兩列都不寫
     snap = with_cpi(changed(cpi__sa_month="2026-08-01"))  # 季調比年增舊一個月：數字照寫、標 8 月，不寫動能
     body = card(md, snap)[2]
     assert "月增 0.6%（季調，8 月）" in body and "近 3 月年化 4.6%（季調，8 月）" in body
@@ -378,15 +402,15 @@ def without(*indexes: int) -> list[str]:
     return [line for index, line in enumerate(CPI_A) if index not in indexes]
 
 
-NO_CORE = [*CPI_A[:2], "核心 CPI：暫缺", *CPI_A[3:6]]  # 核心不可用：寫暫缺，整體比核心也不寫
+NO_CORE = [*CPI_A[:ROW_CORE], "核心 CPI：暫缺"]  # 核心不可用：寫暫缺，整體比核心也不寫
 
 
 @pytest.mark.parametrize("changes, cpi_lines", [
-    ({"cpi__mom": 10.1}, without(3)),  # 讀值給明確範圍（G7）：超過就當缺值，只少那一列
-    ({"cpi__ann3": 100.1}, without(4)),
-    ({"cpi__ann3": -50.1}, without(4)),
-    ({"cpi__yoy_prev": 25.1}, without(5)),
-    ({"gap_pp": 30.1}, without(6)),
+    ({"cpi__mom": 10.1}, without(ROW_MOM)),  # 讀值給明確範圍（G7）：超過就當缺值，只少那一列
+    ({"cpi__ann3": 100.1}, without(ROW_ANN3)),
+    ({"cpi__ann3": -50.1}, without(ROW_ANN3)),
+    ({"cpi__yoy_prev": 25.1}, without(ROW_R3)),
+    ({"gap_pp": 30.1}, without(ROW_R4)),
     ({"core__yoy": 25.1}, NO_CORE),
     ({"core": None}, NO_CORE),
     ({"core__yoy_month": None}, NO_CORE),
@@ -403,19 +427,31 @@ def test_g7_breakeven_values_out_of_range(md):
     assert card(md, snap)[2] == [*CPI_A, BE_A[1]]
 
 
+@pytest.mark.parametrize("cpi_changes, be_changes, expected", [
+    # 事後審查 seat1 N-1：只有被改過的快照才走得到的三個檢查，各自單獨釘住（別的檢查不會先把那一句擋掉）
+    ({"cpi__yoy_move": "down", "cpi__yoy_prev": 25.1}, {}, [*without(ROW_R3), *BE_A]),  # 方向對得上，只有上月超出範圍
+    ({}, {"spread_bp": 20001}, [*CPI_A, *BE_A[:2]]),  # 兩個天期都有效、同一天、碼是高：只有 bp 超出範圍
+    ({"gap": "headline_higher", "gap_pp": 0.04}, {}, [*without(ROW_R4), *BE_A]),  # 進位後是 0.0：「高 0.0 個百分點」不寫
+])
+def test_n1_each_range_check_drops_its_sentence_on_its_own(md, cpi_changes, be_changes, expected):
+    snap = with_cpi(changed(**cpi_changes))
+    snap["rows"]["us.infl.be"]["values"].update(be_changes)
+    assert card(md, snap)[2] == expected
+
+
 @pytest.mark.parametrize("changes, cpi_lines", [
-    ({"cpi__yoy_prev": 3.9}, without(5)),  # 碼是 up，但上月比較高（G8：碼和數字對不上，整句不寫）
-    ({"cpi__yoy_prev": 3.7}, without(5)),  # 碼是 up，兩個數字一樣
-    ({"cpi__yoy_prev": 3.66}, without(5)),  # 顯示成 3.7＝3.7：在印出來的一位小數上比
-    ({"cpi__yoy_move": "flat"}, without(5)),  # flat 但數字不同
-    ({"cpi__yoy_move": "down"}, without(5)),
-    ({"gap_pp": -1.1}, without(6)),  # headline_higher 配負數
-    ({"gap": "headline_lower"}, without(6)),
-    ({"gap_pp": 0.0}, without(6)),
-    ({"aligned": False}, without(6)),  # 沒對齊卻有 gap（版本不一致）
-    ({"aligned": "yes"}, without(6)),
+    ({"cpi__yoy_prev": 3.9}, without(ROW_R3)),  # 碼是 up，但上月比較高（G8：碼和數字對不上，整句不寫）
+    ({"cpi__yoy_prev": 3.7}, without(ROW_R3)),  # 碼是 up，兩個數字一樣
+    ({"cpi__yoy_prev": 3.66}, without(ROW_R3)),  # 顯示成 3.7＝3.7：在印出來的一位小數上比
+    ({"cpi__yoy_move": "flat"}, without(ROW_R3)),  # flat 但數字不同
+    ({"cpi__yoy_move": "down"}, without(ROW_R3)),
+    ({"gap_pp": -1.1}, without(ROW_R4)),  # headline_higher 配負數
+    ({"gap": "headline_lower"}, without(ROW_R4)),
+    ({"gap_pp": 0.0}, without(ROW_R4)),
+    ({"aligned": False}, without(ROW_R4)),  # 沒對齊卻有 gap（版本不一致）
+    ({"aligned": "yes"}, without(ROW_R4)),
     # 核心的年增是 8 月（它自己的基期缺值）：核心照寫並標 8 月，但和整體不是同一個月，整體比核心不寫
-    ({"core__yoy_month": "2026-08-01"}, [*CPI_A[:2], "核心 CPI（不含食品能源）年增 2.6%（8 月）", *CPI_A[3:6]]),
+    ({"core__yoy_month": "2026-08-01"}, [*CPI_A[:ROW_CORE], "核心 CPI（不含食品能源）年增 2.6%（8 月）"]),
 ])
 def test_g8_a_code_that_disagrees_with_the_numbers_drops_the_sentence(md, changes, cpi_lines):
     assert card(md, with_cpi(changed(**changes)))[2] == [*cpi_lines, *BE_A]
@@ -431,17 +467,17 @@ def test_g8_breakeven_spread_code_and_dates(md):
     assert card(md, snap)[2] == [*CPI_A, "5 年損益兩平通膨 2.45%（10/15）", BE_A[1]]
     snap = with_cpi(real_values())
     snap["rows"]["us.infl.be"]["values"].update(spread_bp=-13, spread="five_lower")
-    assert card(md, snap)[2][-1] == "5 年期比 10 年期低 13bp"  # 數字取絕對值、方向由碼決定
+    assert card(md, snap)[2][-1] == "5 年期損益兩平比 10 年期低 13bp"  # 數字取絕對值、方向由碼決定
 
 
 @pytest.mark.parametrize("changes, row, cpi_lines", [
-    ({"cpi__level": "very_high"}, "通膨：CPI 3.7%（9 月）", without(1)),  # R1 不認得：只有數字，不印原始的碼（G12）
-    ({"cpi__level": None}, "通膨：CPI 3.7%（9 月）", without(1)),
+    ({"cpi__level": "very_high"}, "通膨：CPI 3.7%（9 月）", without(ROW_TARGET)),  # R1 不認得：只有數字，不印原始的碼（G12）
+    ({"cpi__level": None}, "通膨：CPI 3.7%（9 月）", without(ROW_TARGET)),
     # 動能碼不認得：摘要用去動能的寫法；細節卡年化的數字照寫，只拿掉比較句
     ({"cpi__momentum": "rising"}, "通膨：CPI 3.7%（9 月）明顯高於 2%",
-     [*CPI_A[:4], "近 3 月年化 4.6%（季調，9 月）", *CPI_A[5:]]),
-    ({"cpi__yoy_move": "rising"}, SUMMARY_A, without(5)),
-    ({"gap": "big"}, SUMMARY_A, without(6)),
+     [*CPI_A[:ROW_ANN3], "近 3 月年化 4.6%（季調，9 月）", *CPI_A[ROW_R3:]]),
+    ({"cpi__yoy_move": "rising"}, SUMMARY_A, without(ROW_R3)),
+    ({"gap": "big"}, SUMMARY_A, without(ROW_R4)),
 ])
 def test_g12_unknown_codes_drop_only_their_part(md, changes, row, cpi_lines):
     snap = with_cpi(changed(**changes))
@@ -453,6 +489,79 @@ def test_a_stale_cpi_row_with_no_data_date(md):
     snap = with_cpi(real_values(), data_date=None)
     snap["rows"]["us.infl.cpi"]["stale_after"] = NOW - 1
     assert card(md, snap)[2][0] == "消費者物價（CPI）：過期"
+
+
+# ── 月份、日期要跟得上最新的資料（2026-10-30 事後審查 gp1 nit-c、seat1 N-3）；超大整數（gp1 nit-d、seat1 N-2） ─────────
+# 卡上只印「9 月」「10/16」不印年份：某個序列停更一整年，印出來和最新的一模一樣。月份差用 年×12＋月 算，±1 個月以內才寫
+# （未季調那個序列抓得慢時，季調會比它新一個月，是正常情形）。
+@pytest.mark.parametrize("sa_month, kept", [
+    ("2026-10-01", True),  # 比整體最新月（9 月）新一個月：照寫、標 10 月
+    ("2026-08-01", True),  # 舊一個月
+    ("2026-07-01", False),  # 舊兩個月
+    ("2026-11-01", False),  # 新兩個月
+    ("2025-09-01", False),  # 舊 12 個月：以前會印成同一個「9 月」
+])
+def test_the_seasonal_month_must_be_within_one_month_of_the_latest_month(md, sa_month, kept):
+    """季調月和整體最新月（cpi.month）差超過一個月：月增、年化都不寫，也沒有動能字。"""
+    snap = with_cpi(changed(cpi__sa_month=sa_month))
+    m = int(sa_month[5:7])
+    seasonal = [f"月增 0.6%（季調，{m} 月）", f"近 3 月年化 4.6%（季調，{m} 月）"] if kept else []
+    assert card(md, snap)[2] == [*CPI_A[:ROW_MOM], *seasonal, *CPI_A[ROW_R3:], *BE_A]
+    assert digest(md, snap)[0][3] == "通膨：CPI 3.7%（9 月）明顯高於 2%"  # 季調月不是年增那個月：沒有動能半句
+
+
+@pytest.mark.parametrize("core_month, kept", [
+    ("2026-10-01", True),
+    ("2026-08-01", True),
+    ("2026-07-01", False),
+    ("2026-11-01", False),
+    ("2025-09-01", False),  # gp1 P7：核心整整落後一年，以前印「核心 … 2.6%（9 月）」，和整體看起來同一個月
+])
+def test_the_core_month_must_be_within_one_month_of_the_latest_month(md, core_month, kept):
+    """核心的最新月和整體最新月差超過一個月：核心寫暫缺；整體比核心本來就要同一個月，也不寫。"""
+    snap = with_cpi(changed(core__month=core_month, core__yoy_month=core_month))
+    m = int(core_month[5:7])
+    core = f"核心 CPI（不含食品能源）年增 2.6%（{m} 月）" if kept else "核心 CPI：暫缺"
+    assert card(md, snap)[2] == [*CPI_A[:ROW_CORE], core, *BE_A]
+
+
+@pytest.mark.parametrize("dates, be_lines", [
+    ({"y5": "2026-10-06"}, ["5 年損益兩平通膨 2.45%（10/6）", BE_A[1]]),  # 比列的資料日（10/16）舊 10 天：照寫；兩天期不同天，沒有利差
+    ({"y5": "2026-10-05"}, [BE_A[1]]),  # 舊 11 天：不寫這個天期
+    ({"y5": "2025-10-16"}, [BE_A[1]]),  # 舊一年：以前會印成同一個「10/16」
+    ({"y5": "2026-10-05", "y10": "2026-10-05"}, ["損益兩平通膨：暫缺"]),  # 兩個都舊：同一天、有利差也不寫
+])
+def test_a_breakeven_tenor_more_than_ten_days_older_than_the_row_is_not_written(md, dates, be_lines):
+    snap = with_cpi(real_values())
+    be = snap["rows"]["us.infl.be"]["values"]
+    for tenor, day in dates.items():
+        be[tenor]["date"] = day
+    reply, _title, body, notes, ctx = card(md, snap)
+    assert body == [*CPI_A, *be_lines]
+    assert (BE_NOTE in notes) == (be_lines != ["損益兩平通膨：暫缺"])  # 損益兩平沒有數字就不放它的說明（S3）
+    assert reply.alt_text == "盤勢：通膨 CPI 年增 3.7%（9 月）" and ctx.dropped == 0
+
+
+@pytest.mark.parametrize("command, where", [
+    (" 通膨", ("us.infl.be", "y5", "value")),
+    (" 通膨", ("us.infl.be", "spread_bp")),
+    (" VOO", ("us.etf.VOO", "close")),  # 既有的卡也一樣：_num 是共用的
+])
+def test_a_huge_integer_is_a_missing_value_not_a_crash(md, paths, command, where):
+    """JSON 可以合法放 400 位數的整數，float() 會丟 OverflowError：當缺值，卡照樣回 Flex、不回「資料準備中」（P8），
+    status_summary 也沒有 render_error。"""
+    snap = make_snapshot(NOW)
+    row_id, *keys = where
+    target = snap["rows"][row_id]["values"]
+    for key in keys[:-1]:
+        target = target[key]
+    target[keys[-1]] = 10**400
+    write_snapshot(paths, snap)
+    reply = md.handle(command, now=NOW, paths=paths)
+    assert reply.text is None and reply.flex is not None and reply.render_errors == (), reply.text
+    assert "render_error" not in md.status_summary(now=NOW, paths=paths)
+    if command == " 通膨":  # 壞的只有那一個值：5 年那一列不寫，或只有利差不寫
+        assert texts(reply.flex["body"]) == [*CPI_A, *([BE_A[1]] if "y5" in keys else BE_A[:2])]
 
 
 # ── 舊快照、狀態表（G3）、一律回 Flex（P8） ──────────────────────────────────────────
@@ -595,6 +704,8 @@ def test_a_crash_while_reading_falls_back_word_for_word_and_is_recorded(md, path
     detail = md.handle(" 通膨", now=NOW, paths=paths)
     assert detail.flex is not None and "_infl_view:RuntimeError" in detail.render_errors
     assert texts(detail.flex["body"]) == ["消費者物價（CPI）：暫缺", *BE_A] and detail.alt_text == "盤勢：通膨，CPI 暫無數字"
+    assert texts(detail.flex["footer"]) == [BE_NOTE, DISCLAIMER]  # 事後審查 gp2 N-7：footer 沒有任何 BLS 句
+    assert not any("BLS" in text for text in texts(detail.flex))
     status = md.status_summary(now=NOW, paths=paths)
     assert "_infl_view:RuntimeError" in status["render_error"] and "secret" not in status["render_error"]
     assert not any("secret" in error or "3.7" in error for error in (*summary.render_errors, *detail.render_errors))
@@ -611,6 +722,44 @@ def test_a_crash_in_the_detail_card_reaches_the_status_summary(md, paths, monkey
     monkeypatch.setattr(md, "_card_infl", boom)
     assert md.status_summary(now=NOW, paths=paths)["render_error"] == "unexpected:RuntimeError"
     assert md.handle(" 通膨", now=NOW, paths=paths).text == md.TEXT_NOT_READY  # 單張細節卡：handle 照舊回固定句
+
+
+def test_the_inflation_card_is_last_so_its_crash_keeps_the_earlier_bubble_errors(md, paths, monkeypatch):
+    """事後審查 gp2 N-6：/盤勢 通膨 在 status_summary 清單的最後。它丟例外時，前面的卡已經跑完、各自的 bubble error 都留著；
+    放到前面的話，迴圈在它那裡就停了，後面那幾張壞掉也看不到。季節性卡沒有逐泡泡的隔離，所以用期權細節（_guarded_bubbles）。"""
+    write_snapshot(paths, make_snapshot(NOW))
+
+    def _options_us_bubble(*_args):  # 名字照原本的 builder：_guarded_bubbles 用 __name__ 記錯
+        raise RuntimeError("secret")
+
+    def boom(_ctx):
+        raise RuntimeError("secret")
+
+    monkeypatch.setattr(md, "_options_us_bubble", _options_us_bubble)
+    monkeypatch.setattr(md, "_card_infl", boom)
+    error = md.status_summary(now=NOW, paths=paths)["render_error"]
+    assert "unexpected:RuntimeError" in error and "_options_us_bubble:RuntimeError" in error, error
+    assert "secret" not in error
+
+
+@pytest.mark.parametrize("name", ["_infl_digest_notes", "_digest_infl_row"])
+def test_b7_a_crash_while_formatting_the_digest_replaces_the_whole_first_bubble(md, paths, monkeypatch, name):
+    """事後審查 gp2 N-7（B7 第 7 種）：通膨格式化在 _infl_view 的 try 外面。丟例外時 _guarded_bubbles 把第 1 張整張換成固定短卡：
+    沒有 CPI、也沒有 BLS（不會有數字而沒有聲明，也不會有聲明而沒有數字）；render_errors 記「_card_digest:型別名」；細節卡不受影響。"""
+    write_snapshot(paths, make_snapshot(NOW))
+
+    def boom(*_args):
+        raise RuntimeError("secret 3.7")
+
+    monkeypatch.setattr(md, name, boom)
+    summary = md.handle("", now=NOW, paths=paths)
+    first = summary.flex["contents"][0]
+    assert md.TEXT_BUBBLE_FAILED in texts(first)
+    assert not any("CPI" in text or "BLS" in text for text in texts(first))
+    assert summary.render_errors == ("_card_digest:RuntimeError",)
+    detail = md.handle(" 通膨", now=NOW, paths=paths)
+    assert texts(detail.flex["body"]) == [*CPI_A, *BE_A] and detail.render_errors == ()
+    assert bls_card("10/16") in texts(detail.flex["footer"])
 
 
 # ── 快照字串不進卡片（P4） ─────────────────────────────────────────────────────────
@@ -746,7 +895,8 @@ def test_worst_case_widths_keep_every_row_whole(md):
     assert "12 月年增算不出來，先列 11 月" in notes
     body = card(md, snap)[2]
     assert "近 3 月年化 100.0%（季調，11 月），和年增差不多" in body and "年增由 10 月 -5.0% 升到 11 月 25.0%" in body
-    assert "10 年損益兩平通膨 -100.00%（12/31）" in body and "5 年期比 10 年期低 20000bp" in body
+    assert "10 年損益兩平通膨 -100.00%（12/31）" in body and "5 年期損益兩平比 10 年期低 20000bp" in body
+    assert md.row_width("5 年期損益兩平比 10 年期低 20000bp") == 17.0  # 利差句加了主詞（事後審查 seat2 F3），最寬 17.0
     assert all(md.row_width(line) <= 24 and "…" not in line for line in body), body
     snap = with_cpi(changed(cpi__month="2026-12-01", cpi__yoy_month="2026-12-01", cpi__sa_month="2026-12-01",
                             cpi__yoy=-5.0, cpi__level="not_above", cpi__momentum="cooling"))
