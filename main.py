@@ -30,7 +30,7 @@ import reply_policy
 from reply_policy import NO_REPEAT_CONTRACT
 import reply_provenance
 from quote_context import QUOTE_CONTEXT_RULE, QUOTE_ONLY_PLACEHOLDER, has_quote_context, original_block, missing_block, recent_block, with_current_reply
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 import mimetypes
 import os
 import re
@@ -1242,6 +1242,8 @@ def _enforce_new_value_reply(
     facts: list[str] | None = None,
     partial: bool = False,
     speaker: str = "",
+    regulation_page_backing: Callable[[str], str] | None = None,
+    page_backing_all_or_nothing: bool = False,
 ) -> str:
     """Drop sentences that only restate what the group already said.
 
@@ -1298,6 +1300,14 @@ def _enforce_new_value_reply(
     and no ``has_material``) cannot say a text 「都未提及」 something either: that is B2 only,
     ``partial`` (material read in part) is what also narrows the restatement check.  The counts go
     to ``outcome``; ``""`` is silence, as for the other guards.
+
+    2026-10-29 (Andrew, PLAN §10): ``regulation_page_backing``, given only for a plain question's
+    Gemini answer, maps the text the guards read to the quantities its cited pages hold
+    (``grounding_evidence``).  When B1 dropped a number, the guards run once more with those in
+    front of ``evidence_text`` — the only check that reads them — and that second pass is kept
+    only if B1 keeps every sentence it kept before and, with ``page_backing_all_or_nothing`` (the
+    family asked for a number), backs every number; otherwise, and on any error, the first pass
+    stands (``_page_backed_guards``).
     """
     grounding = reply_provenance.take_grounding()
     report = {
@@ -1390,27 +1400,41 @@ def _enforce_new_value_reply(
             if not reply_text:
                 outcome["public_claims_emptied"] = True
                 return ""
-    try:
-        guards = reply_guards.apply_reply_guards(
+    # Nothing was read and the reply rests on a search (Gemini grounding, the
+    # research rows, a cached grounded replay): search snippets cannot show that
+    # a text lacks something.  B2 only — the restatement check below keeps its
+    # wider correction markers (「政府並沒有宣布…」 is a correction there).
+    search_only = bool(outcome.get("grounded")) and not has_material
+
+    def run_guards(evidence: str):
+        return reply_guards.apply_reply_guards(
             reply_text,
             source_text=source_text or "",
             request_text=request_text or "",
             material_text=material_text or "",
-            evidence_text=evidence_text or "",
+            evidence_text=evidence,
             context=context,
             addressed=addressed,
             partial=partial,
-            # Nothing was read and the reply rests on a search (Gemini grounding, the
-            # research rows, a cached grounded replay): search snippets cannot show that
-            # a text lacks something.  B2 only — the restatement check below keeps its
-            # wider correction markers (「政府並沒有宣布…」 is a correction there).
-            search_only=bool(outcome.get("grounded")) and not has_material,
+            search_only=search_only,
             speaker=speaker,
         )
+
+    try:
+        guards = run_guards(evidence_text or "")
     except Exception as exc:
         logger.warning("reply-quality guards skipped error_type=%s", type(exc).__name__)
         regulation_dropped = 0
     else:
+        if guards.numbers_dropped and regulation_page_backing is not None:
+            guards = _page_backed_guards(
+                guards, reply_text, regulation_page_backing, run_guards,
+                lambda evidence: reply_guards.regulation_backing(
+                    source_text or "", request_text or "", material_text or "", evidence, context=context
+                ),
+                evidence_text=evidence_text or "", partial=partial, search_only=search_only,
+                all_or_nothing=page_backing_all_or_nothing,
+            )
         regulation_dropped = guards.numbers_dropped
         if guards.negative_dropped or regulation_dropped or guards.nonanswer:
             # Counts only: these sentences are exactly the ones not to repeat.
@@ -1459,6 +1483,65 @@ def _enforce_new_value_reply(
     return reply_guards.unconfirmed_regulation_reply(
         out, addressed=addressed, numbers_dropped=regulation_dropped
     )
+
+
+_SENTENCE_RE = re.compile(r"[^。！？!?\n]+[。！？!?]*")
+
+
+def _sentences(text: str):
+    """The sentences of ``text``, stripped and counted (a multiset)."""
+    from collections import Counter
+
+    return Counter(part.strip() for part in _SENTENCE_RE.findall(text or "") if part.strip())
+
+
+def _page_backed_guards(first, reply_text, provider, run_guards, backing_for, *, evidence_text,
+                        partial, search_only, all_or_nothing):
+    """The reply guards' second pass, with the quantities a plain answer's cited pages hold (PLAN §10).
+
+    Kept only when B1, given those quantities, keeps every sentence it kept without them (whole
+    sentences, counted: 「可以。」 inside 「…都可以。」 does not count as kept) and, with
+    ``all_or_nothing``, drops no number; else, and on any error, ``first`` — never the unguarded
+    text (REVIEW_gp2_plan_s10 F3).  The comparison reads B1's own output, B2 first as
+    ``apply_reply_guards`` runs them, so B3 can neither trip it nor hide a new drop
+    (REVIEW_gp1_plan_s10, debate D3); if that order ever changes, the counts disagree and the
+    first pass stands.
+    """
+    try:
+        page = provider(reply_text)
+        if not page:
+            return first
+        evidence = f"{page}\n{evidence_text}" if evidence_text else page  # the page first: no cut reaches it
+        b2_text, _negative = reply_guards.strip_negative_coverage(reply_text, partial, search_only)
+        before = reply_guards.strip_unbacked_regulatory_numbers(b2_text, lambda: backing_for(evidence_text))
+        after = reply_guards.strip_unbacked_regulatory_numbers(b2_text, lambda: backing_for(evidence))
+        if before.dropped != first.numbers_dropped:
+            logger.info("grounding backing pass2=kept_pass1 reason=drift")
+            return first
+        if all_or_nothing and after.dropped:
+            logger.info("grounding backing pass2=kept_pass1 reason=partial dropped=%d", after.dropped)
+            return first
+        if _sentences(before.text) - _sentences(after.text):
+            logger.info("grounding backing pass2=kept_pass1 reason=lost_sentence")
+            return first
+        second = run_guards(evidence)
+        if second.numbers_dropped != after.dropped:
+            logger.info("grounding backing pass2=kept_pass1 reason=drift")
+            return first
+        # B3 may still take out what the page rescued: then the first pass's fixed line stands
+        # rather than a B (REVIEW_gp2_plan_s10 Phase 6 P6-2).
+        rescued = {q for q in reply_guards.quantities(after.text) if q.kind != "年份"}
+        if not second.text or (all_or_nothing and rescued - set(reply_guards.quantities(second.text))):
+            logger.info("grounding backing pass2=kept_pass1 reason=emptied")
+            return first
+        logger.info(
+            "grounding backing pass2=used numbers_before=%d after=%d",
+            first.numbers_dropped, second.numbers_dropped,
+        )
+        return second
+    except Exception as exc:
+        logger.warning("grounding backing pass2=error error_type=%s", type(exc).__name__)
+        return first
 
 
 _MATERIAL_MARKERS = ("--- 內容開始 ---", "--- PDF 內容開始 ---")
@@ -1691,15 +1774,18 @@ def _configure_local_text_llm_runtime() -> None:
 
 
 def _start_local_vision_worker() -> None:
-    """Begin local-only model warm-up without blocking uvicorn startup."""
+    """Warm the local vision model, or leave it for the first image.
+
+    vision_llm decides (VISION_WARM_AT_START).
+    """
     try:
         import vision_llm
 
-        ready = vision_llm.start_background_worker()
+        state = vision_llm.start_background_worker_at_boot()
         logger.info(
             "local vision worker started ready_now=%s state=%s",
-            ready,
-            "ready" if ready else "warming",
+            state == "ready",
+            state,
         )
     except Exception as exc:
         logger.warning(
@@ -4196,12 +4282,27 @@ def _handle_video_message_owned(
         return
 
     def _analyze() -> str | None:
+        _CONTENT_WAIT_STATE.waited = False
         data = _download_content(msg_id)
         if len(data) > _MEDIA_BYTE_LIMIT:
             raise _MediaTooLargeError("video exceeds local byte limit")
         import media_pipeline
 
-        return media_pipeline.analyze_video(bytes(data), group_id=group_id)
+        # Same check as the image path; and after waiting for LINE to finish transcoding, give up when less than
+        # _VIDEO_MIN_ANALYSIS_SEC is left: an analysis that overruns the deadline is thrown away but keeps the only
+        # media-analysis slot busy for the next photo or video.
+        remaining = analysis_deadline - time.monotonic()
+        if remaining <= 0:
+            raise _MediaAnalysisTimeoutError("media analysis deadline exhausted")
+        if getattr(_CONTENT_WAIT_STATE, "waited", False) and remaining < _VIDEO_MIN_ANALYSIS_SEC:
+            raise _MediaAnalysisTimeoutError(
+                f"too little time left after waiting for LINE ({remaining:.0f}s < {_VIDEO_MIN_ANALYSIS_SEC:.0f}s)"
+            )
+        analysis_started = time.monotonic()
+        try:
+            return media_pipeline.analyze_video(bytes(data), group_id=group_id)
+        finally:  # to calibrate _VIDEO_MIN_ANALYSIS_SEC against real durations
+            logger.info("video analysis took %.1fs", time.monotonic() - analysis_started)
 
     try:
         reply_text = _run_media_analysis(_analyze, analysis_deadline)
@@ -4211,6 +4312,8 @@ def _handle_video_message_owned(
             if isinstance(e, (_MediaAnalysisBusyError, _MediaAnalysisTimeoutError))
             else "too large"
             if isinstance(e, _MediaTooLargeError)
+            else "content not ready"
+            if isinstance(e, _MediaContentNotReadyError)
             else "download or analysis failed"
         )
         logger.warning("video analyze failed (%s): %s", reason, e)
@@ -14562,8 +14665,9 @@ from concurrent.futures import (
 )
 _MEDIA_EXECUTOR = _ThreadPoolExecutor(max_workers=2, thread_name_prefix="media-handler")
 _MEDIA_HANDLER_SLOTS = threading.BoundedSemaphore(2)
+_MEDIA_ANALYSIS_THREAD_PREFIX = "media-analysis"  # _content_wait_allowed() reads it
 _MEDIA_ANALYSIS_EXECUTOR = _ThreadPoolExecutor(
-    max_workers=1, thread_name_prefix="media-analysis"
+    max_workers=1, thread_name_prefix=_MEDIA_ANALYSIS_THREAD_PREFIX
 )
 _MEDIA_ANALYSIS_SLOT = threading.BoundedSemaphore(1)
 _MEDIA_REPLY_BUDGET_SEC = 45.0  # _plain_question_answer's search gate reads it too
@@ -14583,6 +14687,10 @@ class _MediaAnalysisTimeoutError(TimeoutError):
 
 
 class _MediaTooLargeError(ValueError):
+    pass
+
+
+class _MediaContentNotReadyError(RuntimeError):
     pass
 
 
@@ -15037,6 +15145,13 @@ def _handle_media_via_quote(
         if _handle_quoted_media_description_fallback(
             event, group_id, clean_text, quoted_message_id, media_name
         ):
+            return
+        if isinstance(e, _MediaContentNotReadyError):
+            _reply(
+                event.reply_token,
+                f"這則{media_name} LINE 還在處理，等一下再問我一次。",
+                group_id=group_id,
+            )
             return
         _reply(
             event.reply_token,
@@ -21427,6 +21542,7 @@ def _handle_web_research_question(
     crawl: dict = {}
     plain_question = False
     plain_note = ""
+    plain_urls: list[str] = []  # the pages a plain question's Gemini answer cited (PLAN §10)
     with _thinking_indicator(group_id):
         # `query` (links included) only passes public_query's privacy check here.
         sources = public_research.collect(collect_with_links, query, report=crawl)
@@ -21444,6 +21560,9 @@ def _handle_web_research_question(
                     crawl=crawl if search_text else {"reason": "no_search"}, event=event,
                     context=context,
                 )
+                if answer_searched:
+                    # This answer's own citations, read now: the guards take the record later.
+                    plain_urls = list((reply_provenance.grounding() or {}).get("urls") or [])
         else:
             prompt_text = _build_web_research_prompt(
                 query, sources, quoted_context=quoted_context, searched=searched
@@ -21530,6 +21649,12 @@ def _handle_web_research_question(
             ),
             speaker=_speaker_alias(sender_user_id),
             outcome=guarded,
+            # 2026-10-29 Andrew: a number the cited pages really hold may stay (PLAN §10).
+            regulation_page_backing=(
+                _plain_question_page_backing(plain_urls, event=event, group_id=group_id)
+                if plain_question and plain_urls else None
+            ),
+            page_backing_all_or_nothing=plain_question and public_research.asks_for_number(words),
         )
         if (plain_question and reply_text and guarded.get("regulation_numbers_dropped")
                 and public_research.asks_for_number(words)
@@ -21755,6 +21880,38 @@ def _plain_question_common_answer(question: str, link_free: str) -> tuple[str, s
     if _CANNOT_CONFIRM_RE.search(answer):
         return "", "unsure"
     return answer, "ok"
+
+
+# Reading the cited pages (PLAN §10): only with this much of the reply budget left, for at most
+# _PAGE_BACKING_MAX_SEC, keeping _PAGE_BACKING_RESERVE_SEC for the restatement judge (10 s) and
+# the send (5 s).
+_PAGE_BACKING_MIN_LEFT_SEC = 20.0
+_PAGE_BACKING_MAX_SEC = 8.0
+_PAGE_BACKING_RESERVE_SEC = 15.0
+
+
+def _plain_question_page_backing(urls: list[str], *, event, group_id: str) -> Callable[[str], str]:
+    """What ``_enforce_new_value_reply`` asks when B1 dropped a number of a plain question's
+    Gemini answer: the quantities of the text the guards read that the cited ``urls`` hold,
+    rendered for B1 (``grounding_evidence``); ``""`` when off, late, or nothing matched."""
+    def provide(text: str) -> str:
+        import grounding_evidence
+
+        if not grounding_evidence.enabled():
+            return ""
+        needed = grounding_evidence.needed_quantities(text)
+        if not needed:
+            return ""
+        left = _media_reply_deadline(event) - time.monotonic()
+        if left < _PAGE_BACKING_MIN_LEFT_SEC:
+            logger.info("grounding pages skipped reason=late group=%s", group_id)
+            return ""
+        budget = min(_PAGE_BACKING_MAX_SEC, left - _PAGE_BACKING_RESERVE_SEC)
+        backing, stats = grounding_evidence.page_backing(urls, needed, deadline=time.monotonic() + budget)
+        logger.info("grounding pages %s group=%s", grounding_evidence.format_stats(stats), group_id)
+        return backing
+
+    return provide
 
 
 def _build_plain_question_search_prompt(text: str) -> str:
@@ -24980,10 +25137,57 @@ def _reply(
     return True
 
 
+_MEDIA_CONTENT_WAIT_SEC = 20.0
+_MEDIA_CONTENT_POLL_SEC = 2.0
+_VIDEO_MIN_ANALYSIS_SEC = 15.0  # after a transcoding wait, less than this left → give up (see _handle_video_message_owned)
+# The SDK sets no HTTP timeout (a stuck call would hold the media slot or the webhook thread for good): (connect, read)
+# seconds; the read limit is per socket read, so a large video still downloads.
+_LINE_CONTENT_TIMEOUT = (5, 30)
+_LINE_TRANSCODING_STATUS_TIMEOUT = (3, 5)
+# Timeouts are per attempt: urllib3's default Retry(3) may retry a timed-out GET, so the worst case is about 4x
+# (content ~2 min, status ~20-30 s). Bounded, which is the point; retries stay shared with push and reply.
+_CONTENT_WAIT_STATE = threading.local()  # .waited: this thread's last _download_content waited for transcoding
+
+
+def _content_wait_allowed() -> bool:
+    """Only the media-analysis worker may wait for LINE to finish transcoding.
+
+    Audio and quoted media download on the webhook thread, which handles every group one message at a time: a 20 s
+    wait there would hold everyone up and let reply tokens expire into pushes. Those paths fail at once, as before.
+    """
+    return threading.current_thread().name.startswith(_MEDIA_ANALYSIS_THREAD_PREFIX)
+
+
 def _download_content(message_id: str) -> bytes:
-    """從 LINE 下載 image/video/audio/file 訊息的原始 bytes。"""
+    """從 LINE 下載 image/video/audio/file 訊息的原始 bytes。
+
+    影片／音訊剛傳上來時 LINE 可能還在轉檔：content API 回 202，SDK 只認 200、回 None。
+    只有 media-analysis worker 會等（_content_wait_allowed）：查轉檔狀態，每 2 秒再抓一次，最多等
+    _MEDIA_CONTENT_WAIT_SEC 秒；轉檔失敗或等不到就丟 _MediaContentNotReadyError（以前是 bytes(None) 的
+    TypeError）。其他執行緒（webhook 上的音訊、引用媒體）拿到 None 立刻丟同一個錯。
+    """
+    _CONTENT_WAIT_STATE.waited = False
     with ApiClient(_get_line_config()) as api_client:
-        return bytes(MessagingApiBlob(api_client).get_message_content(message_id))
+        blob = MessagingApiBlob(api_client)
+        data = blob.get_message_content(message_id, _request_timeout=_LINE_CONTENT_TIMEOUT)
+        if data is None and not _content_wait_allowed():
+            raise _MediaContentNotReadyError("LINE content not ready (no wait outside the media worker)")
+        give_up_at = time.monotonic() + _MEDIA_CONTENT_WAIT_SEC
+        while data is None:
+            _CONTENT_WAIT_STATE.waited = True
+            try:
+                status = blob.get_message_content_transcoding_by_message_id(
+                    message_id, _request_timeout=_LINE_TRANSCODING_STATUS_TIMEOUT
+                ).status
+            except Exception as exc:  # keep waiting up to the cap; the class name only, never the message
+                status = f"unknown ({type(exc).__name__})"
+            if status == "failed" or time.monotonic() + _MEDIA_CONTENT_POLL_SEC > give_up_at:
+                raise _MediaContentNotReadyError(
+                    f"LINE content not ready (transcoding {status})"
+                )
+            time.sleep(_MEDIA_CONTENT_POLL_SEC)
+            data = blob.get_message_content(message_id, _request_timeout=_LINE_CONTENT_TIMEOUT)
+        return bytes(data)
 
 
 def _guess_mime_type(file_name: str) -> str:
