@@ -180,6 +180,7 @@ TEXT_USAGE = "\n".join(
         f"/盤勢 → {SUMMARY_CARD_COUNT} 張摘要卡（{'、'.join(name for name, _builder in SUMMARY_CARDS)}）",
         "/盤勢 VOO、/盤勢 QQQ、/盤勢 SOXX、/盤勢 0050 → 細節",
         "/盤勢 期權 → 期權與資金細節",
+        "/盤勢 通膨 → 通膨細節（消費者物價、損益兩平通膨）",
         "/盤勢 QQQ 圖（也可以 SPY、SOXX、台指）→ 期權圖",
         "/盤勢 13F QQQ（也可以 VOO、SOXX）→ 前十大的機構持股",
         "/盤勢 新聞、/盤勢 季節性、/盤勢 選舉",
@@ -197,6 +198,7 @@ FORBIDDEN_WORDS = tuple(
 SUMMARY, ETF, TW, OPTIONS, NEWS, SEASON, ELECTION, F13, NO_13F, CHART = (
     "summary", "etf", "tw", "options", "news", "season", "election", "13f", "no_13f", "chart",
 )
+INFL = "infl"  # /盤勢 通膨（2026-10-30 批 2）
 US_ETFS = ("VOO", "QQQ", "SOXX")
 CHART_SYMBOLS = ("QQQ", "SPY", "SOXX", "台指")
 # 指令上的標的 → 快照 charts 的鍵（market_calc.CHART_KEYS）
@@ -221,11 +223,13 @@ SHIPPED_MARKET_TEXTS: tuple[str, ...] = (
     "/盤勢 13F QQQ",
     "/盤勢 13F VOO",
     "/盤勢 13F SOXX",
+    "/盤勢 通膨",  # 2026-10-30 批 2：重點摘要的「通膨細節」按鈕
 )
 
 _BODY_MAX = 40
 _TRAILING = "?？!！。.,，~～ "
-_WORD_COMMANDS = {"期權": OPTIONS, "新聞": NEWS, "季節性": SEASON, "選舉": ELECTION}
+# 通膨只認這一個字（Andrew 10/29 定案：不加 CPI、物價等別名）
+_WORD_COMMANDS = {"期權": OPTIONS, "新聞": NEWS, "季節性": SEASON, "選舉": ELECTION, "通膨": INFL}
 _13F_RE = re.compile(r"13F ?(VOO|QQQ|SOXX|0050)")
 _CHART_RE = re.compile(r"(QQQ|SPY|SOXX|台指) ?圖")
 
@@ -510,6 +514,9 @@ class _Ctx:
         self.now_dt = datetime.fromtimestamp(now, _TPE)
         self.today = self.now_dt.date()
         self.dropped = 0
+        # 卡片自己接住、已經退回的錯（2026-10-30 批 2，計畫審查 gp2 P2）：只放「函式名稱:例外型別名」，不放訊息與數字。
+        # 用到它的回覆（摘要、/盤勢 通膨）併進 Reply.render_errors，每日維護的 status_summary 才看得到
+        self.render_errors: list[str] = []
 
     def row(self, row_id: str) -> _View:
         raw = self.rows.get(row_id)
@@ -1901,7 +1908,7 @@ def _digest_trump_row(ctx: _Ctx) -> tuple[str, str]:
     return _trump_line(ctx)
 
 
-def _digest_notes(ctx: _Ctx) -> list[str]:
+def _digest_notes(ctx: _Ctx, infl: Optional[_InflView] = None) -> list[str]:
     """footer 的註記（不受 24 寬限制），由上而下：
     ① 「資料日：美股 10/23、台股 10/22、VIX 10/23、10 年債 10/23、川普壓力指數 10/22」（只列實際有數字的列，照第 1–6 列的順序；
        美股三檔日期不同寫「美股 10/22 至 10/23」；牆距寫進第 3 列時加「期權 …」，F2-1）；
@@ -1909,7 +1916,9 @@ def _digest_notes(ctx: _Ctx) -> list[str]:
     ③ 「美股 10/23 收盤資料尚未取得」、「台股 10/23 休市（暫定）」／「台股 10/23 收盤資料尚未取得」——和美股卡、台股卡副標同一套
        證據與判斷（_us_notice／_tw_notice；有證據才寫，F2-4）；
     ④ 第 3 列寫了牆距 → 「牆距以收盤價計」（基準句，_wall_notes；F2-4）；
-    ⑤ 第 6 列是川普壓力指數 → 「不是退讓的機率」和來源兩句（F2-2）；第 6 列退回「川普近 48 小時」→ 川普壓力指數的狀態句
+    ⑤ 第 4 列是通膨句（infl 不是 None，2026-10-30 批 2）→ BLS 的取得日與無法擔保、英文原句、基期缺值句（_infl_digest_notes）；
+       這時 ① 不列 10 年債（摘要上沒有它，I1）。infl 是 None（預設；第 4 列退回 10 年債）時和以前逐字相同；
+    ⑥ 第 6 列是川普壓力指數 → 「不是退讓的機率」和來源兩句（F2-2）；第 6 列退回「川普近 48 小時」→ 川普壓力指數的狀態句
        （過期／暫缺，F2-14：不然摘要上任何地方都看不出指數不見了）。"""
     etfs = [ctx.row(f"us.etf.{sym}") for sym in US_ETFS]
     taiex, vix, ust = ctx.row("tw.taiex"), ctx.row("macro.VIX"), ctx.row("macro.UST10Y")
@@ -1927,7 +1936,7 @@ def _digest_notes(ctx: _Ctx) -> list[str]:
         wall_day = ctx.row(f"us.options.{wall_symbol}").data_date
         if wall_day:
             parts.append(f"期權 {_md(wall_day)}")
-    if ust.data_date and _digest_ust_value(ust) is not None:
+    if infl is None and ust.data_date and _digest_ust_value(ust) is not None:
         parts.append(f"{TEXT_DIGEST_10Y} {_md(ust.data_date)}")
     taco, taco_values = _taco_view(ctx)
     if taco_values is not None and taco.data_date:
@@ -1942,6 +1951,8 @@ def _digest_notes(ctx: _Ctx) -> list[str]:
         notes.append(f"台股 {tw_notice}")
     if wall_symbol is not None:
         notes += _wall_notes(ctx, (wall_symbol,))
+    if infl is not None:
+        notes += _infl_digest_notes(infl)
     if taco_values is not None:
         extra = (market_calc.TEXT_TACO_MEANING, market_calc.TEXT_TACO_SOURCE)
     else:
@@ -1951,12 +1962,16 @@ def _digest_notes(ctx: _Ctx) -> list[str]:
 
 
 def _card_digest(ctx: _Ctx, head: str, subtitle: Optional[str] = None) -> dict:
-    """head＝卡名＋頁碼（SUMMARY_CARDS 照位置算好），subtitle＝第一張才有的「往左滑還有 N 張」。"""
+    """head＝卡名＋頁碼（SUMMARY_CARDS 照位置算好），subtitle＝第一張才有的「往左滑還有 N 張」。
+
+    第 4 列與 footer 共用同一個通膨判斷 _infl_view（2026-10-30 批 2，PLAN_b2_v2 §1、§2、B7）：可用 → 通膨句＋BLS 句；None（CPI 過期、
+    暫缺、不可用、讀的時候出錯）→ 10 年債句＋原本的 footer，整張和以前逐字相同，只有按鈕不同（Andrew 10/29 定案：不補狀態句）。"""
+    infl = _infl_view(ctx)
     rows = [
         _digest_us_row(ctx),
         _digest_tw_row(ctx),
         _digest_risk_row(ctx),
-        _digest_rate_row(ctx),
+        _digest_rate_row(ctx) if infl is None else _digest_infl_row(infl),
         _digest_event_row(ctx),
         _digest_trump_row(ctx),
     ]
@@ -1966,8 +1981,9 @@ def _card_digest(ctx: _Ctx, head: str, subtitle: Optional[str] = None) -> dict:
         title,
         rows,
         subtitle=subtitle,
-        notes=_digest_notes(ctx),
-        buttons=(("期權與資金細節", "/盤勢 期權"), ("新聞與宏觀", "/盤勢 新聞"), ("台股細節", "/盤勢 0050")),
+        notes=_digest_notes(ctx, infl),
+        # 2026-10-30 批 2（Q-B2 預設，部署回報時告訴 Andrew）：「台股細節」換成「通膨細節」；台股卡自己還有「台股細節」
+        buttons=(("期權與資金細節", "/盤勢 期權"), ("新聞與宏觀", "/盤勢 新聞"), ("通膨細節", "/盤勢 通膨")),
     )
 
 
@@ -2024,7 +2040,8 @@ def _summary_reply(ctx: _Ctx) -> Reply:
         errors += (f"_summary_alt:{type(exc).__name__}",)
         logger.error("market dashboard alt text failed error_type=%s", type(exc).__name__)
         alt = TEXT_SUMMARY_ALT_FALLBACK
-    return _flex_reply(_carousel(bubbles), alt, summary=True, render_errors=errors)
+    # 卡片自己接住、已經退回的錯（例：第 4 列的 _infl_view，2026-10-30 批 2 P2）也要帶出去：退回時摘要上看不出來
+    return _flex_reply(_carousel(bubbles), alt, summary=True, render_errors=errors + tuple(ctx.render_errors))
 
 
 # ── 細節：美股 ETF ───────────────────────────────────────────────────────────
@@ -2911,6 +2928,254 @@ def _news_detail(ctx: _Ctx) -> Reply:
     return _flex_reply(_carousel(bubbles), alt, render_errors=errors)
 
 
+# ── 通膨：重點摘要第 4 列與 /盤勢 通膨（2026-10-30 批 2；ops/state/line_bot_market_dashboard_20261017/PLAN_b2_v2.md） ──
+# 讀 us.infl.cpi（BLS 的 CPI 與核心 CPI：publish 算好的數字、月份與列舉碼）和 us.infl.be（財政部名目減實質殖利率的損益兩平）。
+# bot 不重算，只讀已存的值並檢查範圍；句子一律查 market_calc 的 TEXT_INFL_*／TEXT_BE_*，碼先過 _word，不讀列上的 source、basis
+# （計畫審查 gp2 P4）。唯一的判斷是 _infl_view：重點摘要第 4 列與它的 footer、細節卡的 CPI 段與 BLS 的句子、細節卡 altText 的數字
+# 都只讀它的結果，不各算各的（gp1 G2、G3，gp2 B7）。
+_INFL_YOY_RANGE = tuple(float(limit) for limit in market_calc.INFL_YOY_RANGE)  # 讀值的範圍和 publish 同一份（G7）；轉成 float，
+_INFL_MOM_RANGE = tuple(float(limit) for limit in market_calc.INFL_MOM_RANGE)  # _num 才不會拿 float 和 Decimal 比
+_INFL_ANN3_RANGE = tuple(float(limit) for limit in market_calc.INFL_ANN3_RANGE)
+_INFL_GAP_LIMIT = _INFL_YOY_RANGE[1] - _INFL_YOY_RANGE[0]  # 整體減核心：兩個年增的差，最多 30 個百分點
+_BE_VALUE_LIMIT = 100.0  # 損益兩平＝名目減實質，兩個殖利率各自最多 ±50%（market_calc.yield_bp）
+_BE_SPREAD_LIMIT_BP = 20000  # 5 年減 10 年（bp）
+
+
+@dataclass(frozen=True)
+class _InflMeasureView:
+    """整體或核心 CPI 一組已讀好、已檢查範圍的值（PLAN_b2_v2 §1.2）。月份是 date（快照存該月 1 日的 ISO 日期），卡上只印月。"""
+
+    yoy: float  # 年增（%）
+    yoy_month: date  # 年增那個月（基期缺值時比 month 早一個月）
+    month: date  # 未季調指數的最新月
+    level: Optional[str]  # R1 碼；不認得是 None
+    momentum: Optional[str]  # R2 碼：認得、而且季調月＝年增那個月才有（§1.3），否則 None
+    sa_month: Optional[date]  # 季調最新月：月增、近 3 月年化標這個月
+    mom: Optional[float]  # 月增（%，季調）
+    ann3: Optional[float]  # 近 3 月年化（%，季調）
+    yoy_prev: Optional[float]  # 年增那個月的上一個月的年增
+    yoy_move: Optional[str]  # R3 碼：認得、而且和 yoy_prev → yoy 的大小關係對得上才有（G8）
+
+
+@dataclass(frozen=True)
+class _InflView:
+    cpi: _InflMeasureView
+    core: Optional[_InflMeasureView]  # 不可用的條件和整體相同，但不影響整體（核心暫缺時整體照寫）
+    gap: Optional[str]  # R4 碼：對齊、核心可用、兩者的年增同一個月、而且和 gap_pp 的正負號對得上才有
+    gap_pp: Optional[float]  # 整體減核心（有號，%）
+    retrieved: date  # 取得日（BLS 條款要求註明；只用快照裡的值，不用今天補，B5）
+
+
+def _month_index(day: date) -> int:
+    """年×12＋月：1 月的上一個月是上一年 12 月（G5；不用 day.replace(month=…)，1 月會丟例外）。"""
+    return day.year * 12 + day.month - 1
+
+
+def _prev_month(day: date) -> int:
+    """上一個月是幾月（1 月 → 12）。"""
+    return 12 if day.month == 1 else day.month - 1
+
+
+def _infl_number(value: float, digits: int) -> str:
+    """通膨卡的數字：四捨五入進位（_half_up）後是 0 就寫 0（−0.04、−0.0 都寫「0.0」，不寫「-0.0」，G6）；真的負數照樣帶負號。"""
+    rounded = _half_up(value, digits)
+    return f"{abs(rounded) if rounded == 0 else rounded:.{digits}f}"
+
+
+def _move_agrees(code: str, yoy: float, previous: float) -> bool:
+    """R3 的碼和兩個數字對得上才寫（G8）：在印出來的一位小數上比（3.66 和 3.7 都印 3.7，配 up 就不寫）。"""
+    now, before = _half_up(yoy, 1), _half_up(previous, 1)
+    return now > before if code == "up" else now < before if code == "down" else now == before
+
+
+def _sign_agrees(code: str, value: float | Decimal, higher: str, lower: str) -> bool:
+    """方向碼和有號的差對得上才寫（G8）：「高」要正、「低」要負；「差不多」不印數字，不看正負號。"""
+    return value > 0 if code == higher else value < 0 if code == lower else True
+
+
+def _infl_measure_view(raw: Any) -> Optional[_InflMeasureView]:
+    """us.infl.cpi 的 cpi／core 一組 → _InflMeasureView。不可用（§1.1）回 None：年增讀不到或不在 −5～25（G7）、月份讀不到（月份是
+    該月 1 日的 ISO 日期，用 _day 讀，N4）、年增那個月不是最新月或它的上一個月（基期缺值只會差一個月；差更多是別的原因，N2、G5）。"""
+    values = _dict(raw)
+    yoy = _num(values.get("yoy"), *_INFL_YOY_RANGE)
+    month, yoy_month = _day(values.get("month")), _day(values.get("yoy_month"))
+    if yoy is None or month is None or yoy_month is None or _month_index(month) - _month_index(yoy_month) not in (0, 1):
+        return None
+    sa_month = _day(values.get("sa_month"))
+    momentum = _word(values.get("momentum"), market_calc.INFL_MOMENTUM_CODES)
+    if sa_month is None or _month_index(sa_month) != _month_index(yoy_month):
+        momentum = None  # 動能碼是年增那個月算的、卡上的年化是季調最新月的：不同月就不寫（C1；基期缺值那個月正是這樣）
+    previous = _num(values.get("yoy_prev"), *_INFL_YOY_RANGE)
+    move = _word(values.get("yoy_move"), market_calc.INFL_MOVE_CODES)
+    if move is not None and (previous is None or not _move_agrees(move, yoy, previous)):
+        move = None
+    return _InflMeasureView(
+        yoy=yoy, yoy_month=yoy_month, month=month, level=_word(values.get("level"), market_calc.INFL_LEVEL_CODES),
+        momentum=momentum, sa_month=sa_month, mom=_num(values.get("mom"), *_INFL_MOM_RANGE),
+        ann3=_num(values.get("ann3"), *_INFL_ANN3_RANGE), yoy_prev=previous, yoy_move=move,
+    )
+
+
+def _infl_read(ctx: _Ctx) -> Optional[_InflView]:
+    """_infl_view 的本體（不接例外）：CPI 列不新鮮、取得日讀不到（N5）、整體不可用 → None。"""
+    view = ctx.row("us.infl.cpi")
+    if not view.fresh:
+        return None
+    values = view.values
+    retrieved = _day(values.get("retrieved"))
+    cpi = _infl_measure_view(values.get("cpi"))
+    if retrieved is None or cpi is None:
+        return None
+    core = _infl_measure_view(values.get("core"))
+    gap = _word(values.get("gap"), market_calc.INFL_GAP_CODES)
+    gap_pp = _num(values.get("gap_pp"), -_INFL_GAP_LIMIT, _INFL_GAP_LIMIT)
+    # R4 只在對齊、而且整體與核心的年增是同一個月時才有（publish 也這樣算，market_calc.cpi_values）；碼和正負號對不上不寫（G8）
+    if (gap is None or gap_pp is None or _flag(values.get("aligned")) is not True or core is None
+            or _month_index(core.yoy_month) != _month_index(cpi.yoy_month)
+            or not _sign_agrees(gap, _half_up(gap_pp, 1), "headline_higher", "headline_lower")):
+        gap = gap_pp = None
+    return _InflView(cpi=cpi, core=core, gap=gap, gap_pp=gap_pp, retrieved=retrieved)
+
+
+def _infl_view(ctx: _Ctx) -> Optional[_InflView]:
+    """通膨的唯一判斷（PLAN_b2_v2 §1、gp2 B7）：同一個結果決定摘要第 4 列寫哪一句、摘要的兩行 BLS 句、細節卡 CPI 段有沒有數字、
+    細節卡的 BLS 句、altText 的數字。讀的時候出錯也回 None（摘要退回 10 年債、細節卡 CPI 段寫暫缺），另記一筆
+    「_infl_view:例外型別名」到 ctx.render_errors（不記訊息、數字；P2：退回時摘要上看不出來，每日維護靠它）。"""
+    try:
+        return _infl_read(ctx)
+    except Exception as exc:
+        ctx.render_errors.append(f"_infl_view:{type(exc).__name__}")
+        logger.error("market dashboard inflation view failed error_type=%s", type(exc).__name__)
+        return None
+
+
+def _infl_base_gap(cpi: _InflMeasureView) -> Optional[str]:
+    """基期缺值句（年增那個月比最新月早，§2）：「10 月年增算不出來，先列 9 月」；不寫年份、原因、「暫時」（N3、G11）。"""
+    if _month_index(cpi.yoy_month) == _month_index(cpi.month):
+        return None
+    return market_calc.TEXT_INFL_BASE_GAP.format(m=cpi.month.month, n=cpi.yoy_month.month)
+
+
+def _digest_infl_row(infl: _InflView) -> tuple[str, str]:
+    """重點摘要第 4 列（infl 可用時）：「通膨：CPI 3.7%（9 月）明顯高於 2%，近 3 月加速」。月份是年增那個月（基期缺值時比最新月早）。
+    寫法由長到短：完整 → 去動能（沒有動能碼，或季調月不是年增那個月，§1.3）→ 只有數字（R1 碼不認得，G12）。最寬剛好 24.0，
+    _fit 用 <=，放得下。顏色和 10 年債那一句一樣是灰（不用顏色表達好壞）。"""
+    cpi = infl.cpi
+    yoy, month = _infl_number(cpi.yoy, 1), cpi.yoy_month.month
+    level = market_calc.INFL_LEVEL_TEXT[cpi.level] if cpi.level else None
+    momentum = market_calc.INFL_MOMENTUM_TEXT[cpi.momentum] if cpi.momentum else None
+    return _fit(
+        market_calc.TEXT_INFL_DIGEST_FULL.format(yoy=yoy, m=month, level=level, momentum=momentum)
+        if level and momentum else None,
+        market_calc.TEXT_INFL_DIGEST_LEVEL.format(yoy=yoy, m=month, level=level) if level else None,
+        market_calc.TEXT_INFL_DIGEST_NUMBER.format(yoy=yoy, m=month),
+    ), GRAY
+
+
+def _infl_digest_notes(infl: _InflView) -> list[str]:
+    """重點摘要第 4 列是通膨句時 footer 加的句子：BLS 的取得日與無法擔保、英文原句（gp2 B1、B2、B4：同一個泡泡要帶），基期缺值時
+    再加一句。固定句直接放進 notes，不經過 ctx.note（英文原句 118 字，會被長度上限丟掉，I6）；每一句各自 append。"""
+    notes = [market_calc.TEXT_INFL_BLS_DIGEST.format(md=_md(infl.retrieved))]
+    notes.append(market_calc.TEXT_INFL_BLS_ORIGINAL)
+    base_gap = _infl_base_gap(infl.cpi)
+    if base_gap:
+        notes.append(base_gap)
+    return notes
+
+
+def _infl_cpi_rows(infl: _InflView) -> list[dict]:
+    """細節卡 CPI 段（infl 可用時，§3.1）：每列一個資料、各自帶月份；每列都包一層 _fit 讓 _clip 兜底（G7），不做變體階梯。
+    方向句的數字取絕對值、方向由碼決定（I3、G1）；碼在 _infl_view 已經和數字對過（G8）。"""
+    cpi, core = infl.cpi, infl.core
+    yoy = _infl_number(cpi.yoy, 1)
+    lines = [market_calc.TEXT_INFL_CPI_LINE.format(yoy=yoy, m=cpi.yoy_month.month)]
+    if cpi.level:
+        lines.append(market_calc.TEXT_INFL_TARGET_LINE.format(level=market_calc.INFL_LEVEL_TEXT[cpi.level]))
+    lines.append(market_calc.TEXT_INFL_CORE_LINE.format(yoy=_infl_number(core.yoy, 1), m=core.yoy_month.month)
+                 if core is not None else market_calc.TEXT_INFL_CORE_MISSING)
+    if cpi.sa_month is not None and cpi.mom is not None:
+        lines.append(market_calc.TEXT_INFL_MOM_LINE.format(mom=_infl_number(cpi.mom, 1), m=cpi.sa_month.month))
+    if cpi.sa_month is not None and cpi.ann3 is not None:
+        ann3 = market_calc.TEXT_INFL_ANN3_LINE.format(ann3=_infl_number(cpi.ann3, 1), m=cpi.sa_month.month)
+        lines.append(ann3 + (market_calc.INFL_ANN3_TEXT[cpi.momentum] if cpi.momentum else ""))  # 比較句（S9）
+    if cpi.yoy_move is not None and cpi.yoy_prev is not None:
+        lines.append(market_calc.INFL_MOVE_TEXT[cpi.yoy_move].format(
+            p=_prev_month(cpi.yoy_month), prev=_infl_number(cpi.yoy_prev, 1), m=cpi.yoy_month.month, yoy=yoy))
+    if infl.gap is not None and infl.gap_pp is not None:
+        lines.append(market_calc.INFL_GAP_TEXT[infl.gap].format(pp=_infl_number(abs(infl.gap_pp), 1)))
+    return [_text(_fit(lines[0]), weight="bold"), *(_text(_fit(line)) for line in lines[1:])]
+
+
+def _infl_cpi_gap_rows(ctx: _Ctx) -> list[dict]:
+    """細節卡 CPI 段（infl 是 None，§3.2）：過期寫「資料到幾月」（月資料不用 ctx.gap 的「資料日 9/30」，S4），暫缺、新鮮但不可用、
+    舊快照都寫暫缺。這時不放 BLS 的句子、TEXT_INFL_BASIS 與基期缺值句（B1）。"""
+    view = ctx.row("us.infl.cpi")
+    if view.status == STALE:
+        text = (market_calc.TEXT_INFL_CPI_STALE_MONTH.format(m=view.data_date.month) if view.data_date
+                else market_calc.TEXT_INFL_CPI_STALE)
+    else:
+        text = market_calc.TEXT_INFL_CPI_MISSING
+    return [_text(_fit(text), color=GRAY)]
+
+
+def _infl_be_rows(ctx: _Ctx) -> tuple[list[dict], bool]:
+    """細節卡損益兩平段（us.infl.be，日資料，§3.3）→ (列, 有沒有數字)。兩個天期各自帶自己的資料日，讀不到的天期不寫那一列；
+    5 年減 10 年只在兩個天期同一天（publish 只在那時算）、碼和正負號對得上（G8）時才寫。5 日變化不寫（Andrew 10/29 定案）。"""
+    view = ctx.row("us.infl.be")
+    if not view.fresh:  # 日資料：過期用 ctx.gap 的「過期（資料日 M/D）」是對的（G3）
+        return [_text(_fit(market_calc.TEXT_BE_STATE.format(state=ctx.gap(view))), color=GRAY)], False
+    tenors: dict[int, tuple[date, float]] = {}
+    for years in (5, 10):
+        part = _dict(view.values.get(f"y{years}"))
+        day, value = _day(part.get("date")), _num(part.get("value"), -_BE_VALUE_LIMIT, _BE_VALUE_LIMIT)
+        if day is not None and value is not None:
+            tenors[years] = (day, value)
+    if not tenors:
+        return [_text(_fit(market_calc.TEXT_BE_STATE.format(state=TEXT_MISSING)), color=GRAY)], False
+    lines = [market_calc.TEXT_BE_LINE.format(n=years, v=_infl_number(value, 2), md=_md(day))
+             for years, (day, value) in tenors.items()]
+    spread = _word(view.values.get("spread"), market_calc.BE_SPREAD_CODES)
+    spread_bp = _signed_int(view.values.get("spread_bp"), _BE_SPREAD_LIMIT_BP)
+    if (spread is not None and spread_bp is not None and len(tenors) == 2 and tenors[5][0] == tenors[10][0]
+            and _sign_agrees(spread, spread_bp, "five_higher", "five_lower")):
+        lines.append(market_calc.BE_SPREAD_TEXT[spread].format(bp=abs(spread_bp)))
+    return [_text(_fit(line)) for line in lines], True
+
+
+def _infl_card_notes(infl: Optional[_InflView], be_numbers: bool) -> list[str]:
+    """細節卡的 notes：只放有數字那一段的說明（S3）。CPI 段有數字 → TEXT_INFL_BASIS（原常數）、BLS 的取得日、無法擔保、英文原句
+    （gp2 B4；各自一句、各自 append）、PCE（S7）、基期缺值；損益兩平有數字 → TEXT_BE_CARD_NOTE（P9）。公布日那句不放（S3、S6）。
+    _bubble 最後再接 TEXT_DISCLAIMER。"""
+    notes: list[str] = []
+    if infl is not None:
+        notes.append(market_calc.TEXT_INFL_BASIS)
+        notes.append(market_calc.TEXT_INFL_BLS_CARD.format(md=_md(infl.retrieved)))
+        notes.append(market_calc.TEXT_INFL_BLS_VOUCH)
+        notes.append(market_calc.TEXT_INFL_BLS_ORIGINAL)
+        notes.append(market_calc.TEXT_INFL_PCE)
+        base_gap = _infl_base_gap(infl.cpi)
+        if base_gap:
+            notes.append(base_gap)
+    if be_numbers:
+        notes.append(market_calc.TEXT_BE_CARD_NOTE)
+    return notes
+
+
+def _card_infl(ctx: _Ctx) -> Reply:
+    """/盤勢 通膨（PLAN_b2_v2 §3）：CPI 段＋損益兩平段。標題固定（不用 _title，S4）、不放按鈕（Andrew 定案）；連兩段都暫缺也回 Flex
+    （P8：回文字 smoke 會判 FAIL）。CPI 段有沒有數字、BLS 的句子、altText 的數字都只讀開頭這一次 _infl_view（B7）。"""
+    infl = _infl_view(ctx)
+    cpi_rows = _infl_cpi_rows(infl) if infl is not None else _infl_cpi_gap_rows(ctx)
+    be_rows, be_numbers = _infl_be_rows(ctx)
+    bubble = _bubble(market_calc.TEXT_INFL_TITLE, [*cpi_rows, _sep(), *be_rows], notes=_infl_card_notes(infl, be_numbers))
+    # altText（§3.5、B3）：只有固定句型＋年增與月份，不帶「BLS」與判斷字
+    if infl is not None:
+        alt = market_calc.TEXT_INFL_ALT.format(yoy=_infl_number(infl.cpi.yoy, 1), m=infl.cpi.yoy_month.month)
+    else:
+        alt = market_calc.TEXT_INFL_ALT_NO_CPI if be_numbers else market_calc.TEXT_INFL_ALT_MISSING
+    return _flex_reply(bubble, alt, render_errors=tuple(ctx.render_errors))
+
+
 # ── 細節：季節性 ─────────────────────────────────────────────────────────────
 def _season_stat(stats: Any) -> Optional[str]:
     stats = _dict(stats)
@@ -3148,6 +3413,7 @@ _DETAILS: dict[str, Callable[[_Ctx, Optional[str]], Reply]] = {
     SEASON: lambda ctx, _sym: _season_detail(ctx),
     ELECTION: lambda ctx, _sym: _election_detail(ctx),
     F13: lambda ctx, sym: _13f_detail(ctx, sym or "QQQ"),
+    INFL: lambda ctx, _sym: _card_infl(ctx),
 }
 
 
@@ -3310,12 +3576,14 @@ def _status_summary(moment: float, paths: Any) -> dict:
         if stale_after is None or moment > stale_after:
             summary["charts_stale"].append(key)
     # render_error 只放程式自己的列舉字串：整個回覆出錯＝「unexpected:例外型別名」；輪播裡某一張出錯（已換成短卡、其他張照送）
-    # ＝「bubble:builder 名稱:例外型別名」，多個用逗號接起來（2026-10-24 審查 r9 s4-F9-1）
+    # ＝「bubble:builder 名稱:例外型別名」，多個用逗號接起來（2026-10-24 審查 r9 s4-F9-1）。/盤勢 通膨（2026-10-30 批 2，P2）放在
+    # 清單最後：它丟例外時前面的都已經跑過；卡片自己接住的錯（_infl_view:…）隨 Reply.render_errors 一起進來
     problems: list[str] = []
     bubble_errors: set[str] = set()
     try:
         for kind, sym in ((SUMMARY, None), (ETF, "VOO"), (ETF, "QQQ"), (ETF, "SOXX"), (TW, None), (OPTIONS, None),
-                          (NEWS, None), (SEASON, None), (ELECTION, None), (F13, "VOO"), (F13, "QQQ"), (F13, "SOXX")):
+                          (NEWS, None), (SEASON, None), (ELECTION, None), (F13, "VOO"), (F13, "QQQ"), (F13, "SOXX"),
+                          (INFL, None)):
             bubble_errors.update(_DETAILS[kind](ctx, sym).render_errors)
     except Exception as exc:
         problems.append(f"unexpected:{type(exc).__name__}")
@@ -3344,4 +3612,5 @@ READ_ROWS: tuple[str, ...] = (
     "news.us", "news.tw", "news.iran", "oneliner.us", "oneliner.tw", "contra.us", "contra.tw",
     "news.semi",
     "macro.TACO",
+    "us.infl.cpi", "us.infl.be",  # 2026-10-30 批 2：重點摘要第 4 列、/盤勢 通膨
 )

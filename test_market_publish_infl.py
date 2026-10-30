@@ -342,10 +342,11 @@ def test_a_cpi_calculation_that_returns_an_unknown_code_makes_only_that_row_neve
     assert rows["us.infl.cpi"]["state"] == "never" and rows["macro.UST10Y"]["state"] == "ok"
 
 
-# ── 版本組合：bot 這一版不讀新列 ──────────────────────────────────────────────────
+# ── 版本組合：bot 讀新列的地方只有重點摘要第 4 列與 /盤勢 通膨（2026-10-30 批 2） ─────────────────────
 
 
-FLEX_BODIES = ("", " VOO", " QQQ", " SOXX", " 0050", " 期權", " 新聞", " 季節性", " 選舉", " 13F QQQ", " 13F VOO", " 13F SOXX")
+FLEX_BODIES = ("", " VOO", " QQQ", " SOXX", " 0050", " 期權", " 新聞", " 季節性", " 選舉", " 13F QQQ", " 13F VOO", " 13F SOXX",
+               " 通膨")
 
 
 def _replies(paths: market_paths.Paths) -> dict:
@@ -353,8 +354,14 @@ def _replies(paths: market_paths.Paths) -> dict:
     return {body: market_dashboard.handle(body, now=NOW, paths=paths) for body in FLEX_BODIES}
 
 
-def test_the_bot_answers_the_same_with_or_without_the_new_rows(world):
-    """舊快照（還沒有新列）與新快照（多了新列）：bot 這一版都不讀，所有指令的回覆一字不差，也不丟例外。"""
+def _texts(node) -> list[str]:
+    return [item["text"] for item in node["contents"] if item.get("type") == "text"]
+
+
+def test_the_new_rows_change_only_the_digest_fourth_row_and_the_inflation_card(world):
+    """新快照（多了新列）：重點摘要第 4 列是通膨句、footer 帶 BLS 的句子，/盤勢 通膨有數字。舊快照（還沒有新列）：第 1–6 列和 footer
+    就是 bbef843 的樣子（第 4 列退回 _digest_rate_row、footer 是 infl 預設 None 的 _digest_notes，兩個都沒改），/盤勢 通膨寫暫缺。
+    其他指令、輪播的其他四張、altText 都一字不差；兩個方向都不丟例外。"""
     world.store.put_obs("us.infl.be", be_payload(), data_date="2026-10-22")
     world.store.put_obs("us.infl.cpi", cpi_payload(), data_date="2026-09-30", period="2026-09")
     _seed_other_data(world.store)
@@ -365,17 +372,35 @@ def test_the_bot_answers_the_same_with_or_without_the_new_rows(world):
     summary = market_dashboard.status_summary(now=NOW, paths=world.paths)
     assert summary["rows_unexpected"] == [] and "render_error" not in summary and summary["snapshot"] == "ok"
     assert new_snapshot["rows"]["us.infl.be"]["state"] == new_snapshot["rows"]["us.infl.cpi"]["state"] == "ok"
+    new_first = with_row[""].flex["contents"][0]
+    assert _texts(new_first["body"])[3].startswith("通膨：CPI ")
+    assert market_calc.TEXT_INFL_BLS_ORIGINAL in _texts(new_first["footer"])
+    assert any(text.startswith("消費者物價（CPI）年增") for text in _texts(with_row[" 通膨"].flex["body"]))
     old_snapshot = json.loads(json.dumps(new_snapshot))
     del old_snapshot["rows"]["us.infl.be"], old_snapshot["rows"]["us.infl.cpi"]
     market_paths.write_private_atomic(world.paths.snapshot, json.dumps(old_snapshot).encode("utf-8"))
     without_row = _replies(world.paths)
-    assert without_row == with_row
+    for body in FLEX_BODIES[1:-1]:
+        assert without_row[body] == with_row[body], body
+    old, new = without_row[""], with_row[""]
+    assert old.alt_text == new.alt_text and old.flex["contents"][1:] == new.flex["contents"][1:]
+    old_first = old.flex["contents"][0]
+    assert old_first["header"] == new_first["header"]
+    ctx = market_dashboard._Ctx(old_snapshot, NOW)
+    old_rows, new_rows = _texts(old_first["body"]), _texts(new_first["body"])
+    assert old_rows[3] == market_dashboard._digest_rate_row(ctx)[0] and old_rows[3].startswith("利率：")
+    assert old_rows[:3] + old_rows[4:] == new_rows[:3] + new_rows[4:]
+    notes = market_dashboard._digest_notes(ctx)
+    assert _texts(old_first["footer"])[: len(notes) + 1] == [*notes, market_calc.TEXT_DISCLAIMER]
+    assert not any("BLS" in text for text in _texts(old_first["footer"]))
+    assert _texts(without_row[" 通膨"].flex["body"]) == ["消費者物價（CPI）：暫缺", "損益兩平通膨：暫缺"]
     summary = market_dashboard.status_summary(now=NOW, paths=world.paths)
     assert summary["snapshot"] == "ok" and "render_error" not in summary and summary["rows_unexpected"] == []
 
 
-def test_the_bot_does_not_read_the_new_rows():
-    assert not {"us.infl.be", "us.infl.cpi"} & set(market_dashboard.READ_ROWS)
+def test_the_bot_reads_the_new_rows():
+    """2026-10-30 批 2 起 bot 讀這兩列（重點摘要第 4 列、/盤勢 通膨）。"""
+    assert {"us.infl.be", "us.infl.cpi"} <= set(market_dashboard.READ_ROWS)
 
 
 def test_the_pipeline_and_the_publisher_agree_on_the_obs_keys():

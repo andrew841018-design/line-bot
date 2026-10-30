@@ -212,6 +212,9 @@ def test_f2_1_nothing_says_what_is_expected_means_no_date(md):
 def test_f2_1_the_digest_footer_lists_ten_year_and_trump_pressure_dates(md):
     snap = lagging_taco(digest_snapshot())
     set_ust(snap, "fresh", 5.09, 0.12, PREV)
+    # 2026-10-30 批 2：CPI 可用時第 4 列是通膨句，摘要上沒有 10 年債，資料日也不列它（I1）
+    assert digest_footer(md, snap)[0] == "資料日：美股 10/16、台股 10/16、VIX 10/16、川普壓力指數 10/15"
+    del snap["rows"]["us.infl.cpi"]  # 沒有 CPI：第 4 列退回 10 年債，資料日照舊列它
     assert digest_footer(md, snap)[0] == "資料日：美股 10/16、台股 10/16、VIX 10/16、10 年債 10/15、川普壓力指數 10/15"
 
 
@@ -452,7 +455,7 @@ def test_f2_7_the_footer_follows_the_symbol_that_was_written(md):
     set_walls(snap, "SOXX", put=-0.4, day=PREV)  # SOXX 的期權資料落後一天；QQQ 的牆遠
     snap["rows"]["us.options.SOXX"]["values"].update(dist_basis="spot", ref_close=None)
     footer = digest_footer(md, snap)
-    assert footer[0].endswith("、期權 10/15、10 年債 10/16、川普壓力指數 10/16")
+    assert footer[0].endswith("、期權 10/15、川普壓力指數 10/16")  # 第 4 列是通膨句：不列 10 年債（2026-10-30 批 2）
     assert market_calc.TEXT_WALL_DIST_SPOT in footer and market_calc.TEXT_WALL_DIST_CLOSE not in footer  # SOXX 是最新價基準
     set_walls(snap, "SOXX", put=-4.0)  # SOXX 的牆也遠：第 3 列沒有牆，footer 也沒有期權日期與基準句
     footer = digest_footer(md, snap)
@@ -831,7 +834,8 @@ def test_f2_16_the_other_percent_and_percentile_displays_round_half_up_too(md, p
     assert "美債 10 年（UST10Y）：5.13%（+0.12 個百分點）｜10/16" in news
     macro = texts(summary_bubble(md, md.handle("", now=NOW, paths=paths).flex, "宏觀與事件")["body"])
     assert "美債 10 年（UST10Y）5.13%（+0.12）" in macro
-    assert digest_texts(md, snap)[3] == "利率：10 年債 5.13%（+12bp）"
+    # 摘要第 4 列在 CPI 可用時是通膨句（2026-10-30 批 2）；10 年債那一句是它的退回句，直接呼叫看進位
+    assert md._digest_rate_row(row_ctx(md, snap))[0] == "利率：10 年債 5.13%（+12bp）"
     holdings = texts(md.handle(" 13F QQQ", now=NOW, paths=paths).flex)
     assert any(" 權重 9.3%" in line for line in holdings) and any("；機構持股 66%" in line for line in holdings)
 
@@ -906,11 +910,13 @@ def test_everything_on_at_once_stays_inside_the_limits_in_every_year(md, worst):
         snap = everything_on(now, worst=worst)
         bubble = md._card_digest(md._Ctx(snap, now), "重點摘要（1/5）", md.TEXT_SWIPE)
         body = [node["text"] for node in bubble["body"]["contents"]]
-        assert [t[:2] for t in body] == ["美股", "台股", "風險", "利率", "事件", "川普"], body
+        assert [t[:2] for t in body] == ["美股", "台股", "風險", "通膨", "事件", "川普"], body  # 第 4 列：通膨句（2026-10-30 批 2）
         assert all(md.row_width(t) <= 24 and "…" not in t for t in body), body
         footer = texts(bubble["footer"])
         notes = notes_before_disclaimer(footer)
-        assert len(notes) == 7, notes  # 資料日、暫定、美股尚未取得、台股休市、牆距基準、意義、來源：一句都沒少、也沒有多的
+        # 資料日、暫定、美股尚未取得、台股休市、牆距基準、BLS 取得日與無法擔保、英文原句、意義、來源：一句都沒少、也沒有多的；
+        # 最壞值另有基期缺值句（worst_snapshot 的通膨最壞值）
+        assert len(notes) == (10 if worst else 9), notes
         assert md.card_bytes(bubble) <= md.SUMMARY_BUBBLE_MAX_BYTES, md.card_bytes(bubble)
         # 整個摘要輪播（5 張）也要在上限內（第 2 輪複審 gp1 的測試缺口，F3-6）。render_errors 也要空：太大的泡泡會被
         # _guarded_bubbles 換成固定短卡，只量總大小會被那張小卡蓋過去
@@ -931,10 +937,25 @@ def test_everything_on_at_once_reads_like_this(md):
     body = [node["text"] for node in md._card_digest(md._Ctx(snap, NOW), "重點摘要（1/5）", md.TEXT_SWIPE)["body"]["contents"]]
     assert body[0] == "美股 10/15（暫定）：標普、那指、半導體都在月線上" and md.row_width(body[0]) == 24.0  # F3-1
     assert body[2] == "風險 10/15：VIX 18.0 平穩，SOXX 賣權牆距 -0.4%"
-    assert body[3] == "利率 10/15：10 年債 5.09%（+12bp）"
+    assert body[3] == "通膨：CPI 3.7%（9 月）明顯高於 2%，近 3 月加速"  # 2026-10-30 批 2：月份就在句子裡，不另標日期
     assert body[5] == "川普壓力 10/15 +9.0（高壓，任期內第 88 百分位）"  # F3-2：落後時換短名稱，「高壓」留著
     footer = texts(md._card_digest(md._Ctx(snap, NOW), "重點摘要（1/5）", md.TEXT_SWIPE)["footer"])
     assert notes_before_disclaimer(footer) == [
+        "資料日：美股 10/15、台股 10/16、VIX 10/15、期權 10/15、川普壓力指數 10/15",  # 第 4 列是通膨句：不列 10 年債（批 2 I1）
+        market_calc.TEXT_PROVISIONAL_CLOSE,
+        "美股 10/16 收盤資料尚未取得",
+        "台股 10/17 休市（暫定）",
+        market_calc.TEXT_WALL_DIST_CLOSE,
+        market_calc.TEXT_INFL_BLS_DIGEST.format(md="10/16"),  # 取得日＝values.retrieved（B5）
+        market_calc.TEXT_INFL_BLS_ORIGINAL,
+        MEANING,
+        SOURCE,
+    ]
+    # 沒有 CPI 時第 4 列退回 10 年債，和以前逐字相同（日期標示 F2-1 照舊）
+    del snap["rows"]["us.infl.cpi"]
+    bubble = md._card_digest(md._Ctx(snap, NOW), "重點摘要（1/5）", md.TEXT_SWIPE)
+    assert [node["text"] for node in bubble["body"]["contents"]][3] == "利率 10/15：10 年債 5.09%（+12bp）"
+    assert notes_before_disclaimer(texts(bubble["footer"])) == [
         "資料日：美股 10/15、台股 10/16、VIX 10/15、期權 10/15、10 年債 10/15、川普壓力指數 10/15",
         market_calc.TEXT_PROVISIONAL_CLOSE,
         "美股 10/16 收盤資料尚未取得",

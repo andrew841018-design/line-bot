@@ -1123,9 +1123,10 @@ def test_snapshot_round_trips_through_the_dashboard(world):
     assert "資料準備中" not in card and "資料準備中" not in (reply.text or "")
     for expected in ("美股（2/5）｜10/16 收盤", "台股（3/5）｜10/16 收盤", "外資賣超", "成分股站上月線", "VIX"):
         assert expected in card, expected
-    # 輪播第一張（重點摘要）讀真的 publisher 寫的快照：6 列依序是美股、台股、風險、利率、事件、川普，不超寬、沒有被切掉
+    # 輪播第一張（重點摘要）讀真的 publisher 寫的快照：6 列依序是美股、台股、風險、通膨、事件、川普，不超寬、沒有被切掉
+    # （批 2：CPI 列可用時第 4 列是通膨句；不可用時退回「利率」，見 test_market_infl_card.py）
     rows = [node["text"] for node in reply.flex["contents"][0]["body"]["contents"]]
-    assert [row[:2] for row in rows] == ["美股", "台股", "風險", "利率", "事件", "川普"], rows
+    assert [row[:2] for row in rows] == ["美股", "台股", "風險", "通膨", "事件", "川普"], rows
     assert all(market_dashboard.row_width(row) <= 24 and "…" not in row for row in rows), rows
     assert reply.render_errors == ()
     for body in ("QQQ", "0050", "期權", "新聞", "季節性", "選舉", "13F QQQ"):

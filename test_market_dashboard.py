@@ -53,7 +53,7 @@ LONG_HOST = ".".join(["a" * 63, "b" * 63, "c" * 63, "d" * 61])
 LONG_PAGE_URL = f"https://{LONG_HOST}:65535/card/{'A' * 22}"
 
 FLEX_BODIES = ("", " VOO", " QQQ", " SOXX", " 0050", " 期權", " 新聞", " 季節性", " 選舉",
-               " 13F QQQ", " 13F VOO", " 13F SOXX")
+               " 13F QQQ", " 13F VOO", " 13F SOXX", " 通膨")  # 通膨：2026-10-30 批 2（G9）
 CHART_BODIES = (" QQQ 圖", " SPY 圖", " SOXX 圖", " 台指 圖")
 CHART_KEY = {" QQQ 圖": "QQQ", " SPY 圖": "SPY", " SOXX 圖": "SOXX", " 台指 圖": "TXO"}
 
@@ -312,6 +312,18 @@ def worst_snapshot(now: float = NOW) -> dict:
     rows["oneliner.tw"]["values"]["text"] = "註" * 30
     for key in ("VIX", "UST10Y", "DXY", "WTI", "GOLD", "BTC"):
         rows[f"macro.{key}"]["values"].update(value=99999.99 if key not in ("VIX", "UST10Y") else 99.99, chg=-99.99)
+    # 2026-10-30 批 2：通膨的最壞值（PLAN_b2_v2 §8 P5：加在最後）。兩位數月份、四到五個字的數字（publish 的上下限）、摘要第 4 列的
+    # 動能半句（季調月＝年增那個月）和 footer 的基期缺值句同時在（年增月比最新月早一個月）——publish 不會同時寫出這兩個，只為量大小與寬度
+    cpi = rows["us.infl.cpi"]["values"]
+    months = {"month": "2026-12-01", "yoy_month": "2026-11-01", "sa_month": "2026-11-01"}
+    cpi["cpi"].update(months, yoy=25.0, yoy_prev=-5.0, yoy_move="up", level="well_above", momentum="steady", mom=-10.0,
+                      ann3=100.0)
+    cpi["core"].update(months, yoy=-5.0, yoy_prev=25.0, yoy_move="down", level="not_above", mom=10.0, ann3=-50.0)
+    cpi.update(gap="headline_higher", gap_pp=30.0, retrieved="2026-12-31")
+    be = rows["us.infl.be"]["values"]
+    for tenor in ("y5", "y10"):
+        be[tenor].update(date="2026-12-31", value=-100.0)
+    be.update(spread_bp=-20000, spread="five_lower")
     return snap
 
 
@@ -604,7 +616,7 @@ def test_summary_rows_show_numbers_and_states(md, paths):
         "美股 10/15：標普、半導體在月線上，那指在月線下",
         "台股：加權 +0.52% 月線上，外資賣超 123.4 億",
         "風險：VIX 20.0 平穩",  # 19.99 的一位小數是 20.0；狀態詞看實際值，和期權卡的「19.99，平穩」一致
-        "利率：10 年債 5.09%（+12bp）",
+        "通膨：CPI 3.7%（9 月）明顯高於 2%，近 3 月加速",  # 第 4 列：CPI 可用時是通膨句（2026-10-30 批 2；缺資料退回 10 年債）
         "事件：Consumer Price Index，還有 3 天",
         "川普壓力指數 +9.0（高壓，任期內第 88 百分位）",  # 第 6 列：川普壓力指數優先（2026-10-28 整合 A1×TACO）
     ]
@@ -2966,10 +2978,12 @@ def test_a_snapshot_written_before_the_rename_still_renders(md, paths):
 DIGEST = "重點摘要"
 DAY, PREV = date(2026, 10, 16), date(2026, 10, 15)  # make_snapshot(NOW) 的最新場次（NOW 是週六台北 16:30）與前一天
 US_SYMS = ("VOO", "QQQ", "SOXX")
-SIX_PREFIXES = ["美股", "台股", "風險", "利率", "事件", "川普"]
+SIX_PREFIXES = ["美股", "台股", "風險", "利率", "事件", "川普"]  # 第 4 列退回 10 年債時（CPI 過期、暫缺、不可用）
+INFL_PREFIXES = ["美股", "台股", "風險", "通膨", "事件", "川普"]  # 第 4 列是通膨句時（2026-10-30 批 2）
 # 重點摘要 footer 最多幾句註記（2026-10-28 批 1 審查 F2-1／F2-2／F2-4／F2-14 之後）：資料日、暫定收盤、美股尚未取得、台股休市／尚未取得、
-# 牆距基準、「不是退讓的機率」、來源（第 6 列退回時這兩句換成川普壓力指數的狀態句，所以最多還是這 7 句）
-MAX_DIGEST_NOTES = 7
+# 牆距基準、「不是退讓的機率」、來源（第 6 列退回時這兩句換成川普壓力指數的狀態句，所以最多還是這 7 句）；2026-10-30 批 2：第 4 列是
+# 通膨句時再加 BLS 的兩句（取得日與無法擔保、英文原句）與基期缺值句，最多 10 句（資料日那句不再列 10 年債）
+MAX_DIGEST_NOTES = 10
 TACO_MEANING_SOURCE = (market_calc.TEXT_TACO_MEANING, market_calc.TEXT_TACO_SOURCE)
 ETF_STATES = ("up", "down", "stale", "missing", "flagless")
 
@@ -3174,16 +3188,20 @@ def test_digest_rows_colors_notes_and_buttons_for_a_normal_snapshot(md):
         "美股：標普、半導體在月線上，那指在月線下",
         "台股：加權 +0.52% 月線上，外資賣超 123.4 億",
         "風險：VIX 18.0 平穩",
-        "利率：10 年債 5.09%（+12bp）",
+        "通膨：CPI 3.7%（9 月）明顯高於 2%，近 3 月加速",  # 2026-10-30 批 2：CPI 可用時第 4 列是通膨句
         "事件：Consumer Price Index，還有 3 天",
         "川普壓力指數 +9.0（高壓，任期內第 88 百分位）",  # 第 6 列：川普壓力指數優先（2026-10-28 整合 A1×TACO）
     ]
     assert [color for _text, color in rows] == [md.GRAY, md.BLUE, md.BLUE, md.GRAY, md.GRAY, md.GRAY]
-    # footer（F2-1／F2-2）：資料日多了 10 年債和川普壓力指數；第 6 列放川普壓力指數，所以接著「不是退讓的機率」和來源兩句
-    assert texts(bubble["footer"])[:4] == [
-        "資料日：美股 10/16、台股 10/16、VIX 10/16、10 年債 10/16、川普壓力指數 10/16", *TACO_MEANING_SOURCE, DISCLAIMER]
+    # footer（F2-1／F2-2）：資料日有川普壓力指數；第 4 列是通膨句時不列 10 年債（批 2 I1），接著 BLS 的兩句（取得日與無法擔保、
+    # 英文原句，B4）；第 6 列放川普壓力指數，所以再接「不是退讓的機率」和來源兩句
+    assert texts(bubble["footer"])[:6] == [
+        "資料日：美股 10/16、台股 10/16、VIX 10/16、川普壓力指數 10/16",
+        market_calc.TEXT_INFL_BLS_DIGEST.format(md="10/16"), market_calc.TEXT_INFL_BLS_ORIGINAL,
+        *TACO_MEANING_SOURCE, DISCLAIMER]
     buttons = [(a["label"], a["text"]) for a in actions(bubble)]
-    assert buttons == [("期權與資金細節", "/盤勢 期權"), ("新聞與宏觀", "/盤勢 新聞"), ("台股細節", "/盤勢 0050")]
+    # 2026-10-30 批 2（Q-B2 預設）：「台股細節」換成「通膨細節」（台股卡自己還有「台股細節」）
+    assert buttons == [("期權與資金細節", "/盤勢 期權"), ("新聞與宏觀", "/盤勢 新聞"), ("通膨細節", "/盤勢 通膨")]
     assert {text for _label, text in buttons} <= set(md.SHIPPED_MARKET_TEXTS)
     assert not any(word in text for text in texts(bubble) for word in SUMMARY_JARGON)
 
@@ -3195,12 +3213,15 @@ def test_the_digest_has_exactly_six_rows_in_order_and_fits_on_every_variant(md, 
     assert reply.render_errors == () and md.TEXT_BUBBLE_FAILED not in texts(reply.flex)
     bubble = summary_bubble(md, reply.flex, DIGEST)
     body = bubble["body"]["contents"]
-    assert [node["text"][:2] for node in body] == SIX_PREFIXES  # _summary_bubble 會靜默丟第 7 列：這裡鎖住恰好 6 列
+    # _summary_bubble 會靜默丟第 7 列：這裡鎖住恰好 6 列。第 4 列：normal、worst 的 CPI 可用 → 通膨句；stale 全部過期、
+    # half_never 的 us.infl.cpi 是 never → 退回 10 年債
+    expected = INFL_PREFIXES if variant in ("normal", "worst") else SIX_PREFIXES
+    assert [node["text"][:2] for node in body] == expected
     for node in body:
         assert node["type"] == "text" and md.row_width(node["text"]) <= 24 and "…" not in node["text"], node["text"]
     assert md.card_bytes(bubble) <= md.SUMMARY_BUBBLE_MAX_BYTES
     assert md.card_bytes(reply.flex) <= 28 * 1024
-    assert len(bubble["footer"]["contents"]) <= MAX_DIGEST_NOTES + 1 + md.MAX_BUTTONS  # 至多 7 句註記、免責句、3 顆按鈕
+    assert len(bubble["footer"]["contents"]) <= MAX_DIGEST_NOTES + 1 + md.MAX_BUTTONS  # 至多 10 句註記、免責句、3 顆按鈕
 
 
 # ── 第 1 列：美股 ────────────────────────────────────────────────────────────────────────
@@ -3572,13 +3593,18 @@ def test_digest_rate_row_when_the_ten_year_is_stale_or_missing(md):
 
 
 def test_the_rate_and_trump_rows_are_separate_replaceable_functions(md, monkeypatch):
-    """批 2 會把第 4 列換成通膨狀態句、TACO 軌會在第 6 列加優先的變體：兩列各自是 f(ctx) → (文字, 顏色)，card 只靠名字呼叫。"""
+    """第 4 列（2026-10-30 批 2：CPI 可用時是通膨句 _digest_infl_row，否則退回 10 年債的 _digest_rate_row）、第 6 列（TACO 軌的優先
+    變體）各自是獨立的函式，card 只靠名字呼叫。"""
     snap = digest_snapshot()
+    monkeypatch.setattr(md, "_digest_infl_row", lambda infl: ("通膨：換掉了", md.ORANGE))
     monkeypatch.setattr(md, "_digest_rate_row", lambda ctx: ("利率：換掉了", md.ORANGE))
     monkeypatch.setattr(md, "_digest_trump_row", lambda ctx: ("川普：換掉了", md.BLUE))
     rows, _bubble = digest_rows(md, snap)
-    assert rows[3] == ("利率：換掉了", md.ORANGE) and rows[5] == ("川普：換掉了", md.BLUE)
+    assert rows[3] == ("通膨：換掉了", md.ORANGE) and rows[5] == ("川普：換掉了", md.BLUE)
     assert [text[:2] for text, _color in rows[:3]] == ["美股", "台股", "風險"] and rows[4][0].startswith("事件：")
+    del snap["rows"]["us.infl.cpi"]  # 沒有 CPI（舊快照）：第 4 列退回 10 年債那一句
+    rows, _bubble = digest_rows(md, snap)
+    assert rows[3] == ("利率：換掉了", md.ORANGE) and rows[5] == ("川普：換掉了", md.BLUE)
 
 
 # ── 第 5 列：事件 ────────────────────────────────────────────────────────────────────────
@@ -3722,17 +3748,23 @@ def test_digest_footer_adds_the_provisional_sentence_by_equality_only(md):
     assert notes() == [base]
     snap["rows"]["macro.VIX"]["source"] = market_calc.SOURCE_CBOE_FALLBACK  # 只有 ETF 的收盤會是暫定值
     assert notes() == [base]
-    # 整張卡：暫定說明、川普壓力指數的兩句 + 免責句 + 3 顆按鈕，仍在大小上限內
+    # 整張卡：暫定說明、BLS 的兩句（第 4 列是通膨句，2026-10-30 批 2；這時資料日不列 10 年債）、川普壓力指數的兩句 + 免責句
+    # + 3 顆按鈕，仍在大小上限內
     snap["rows"]["us.etf.VOO"]["source"] = market_calc.SOURCE_CBOE_FALLBACK
     bubble = digest_bubble(md, snap)
-    assert texts(bubble["footer"])[:5] == [base, market_calc.TEXT_PROVISIONAL_CLOSE, *TACO_MEANING_SOURCE, DISCLAIMER]
+    assert texts(bubble["footer"])[:7] == [
+        base.replace("、10 年債 10/16", ""), market_calc.TEXT_PROVISIONAL_CLOSE,
+        market_calc.TEXT_INFL_BLS_DIGEST.format(md="10/16"), market_calc.TEXT_INFL_BLS_ORIGINAL,
+        *TACO_MEANING_SOURCE, DISCLAIMER]
     assert md.card_bytes(bubble) <= md.SUMMARY_BUBBLE_MAX_BYTES
 
 
 # ── 舊快照、缺的列、壞的值 ───────────────────────────────────────────────────────────────
-# us.options.SOXX：第 3 列的牆 QQQ、SOXX 取較近的一道（2026-10-28 批 1 審查 F2-7），所以 SOXX 的期權列也在摘要讀的列裡
+# us.options.SOXX：第 3 列的牆 QQQ、SOXX 取較近的一道（2026-10-28 批 1 審查 F2-7），所以 SOXX 的期權列也在摘要讀的列裡；
+# us.infl.cpi：第 4 列 CPI 可用時是通膨句（2026-10-30 批 2）
 DIGEST_SOURCE_ROWS = ("us.etf.VOO", "us.etf.QQQ", "us.etf.SOXX", "macro.VIX", "macro.UST10Y", "us.options.QQQ",
-                      "us.options.SOXX", "tw.taiex", "tw.inst3", "events.next", "trump.summary", "macro.TACO")
+                      "us.options.SOXX", "tw.taiex", "tw.inst3", "events.next", "trump.summary", "macro.TACO",
+                      "us.infl.cpi")
 
 
 def test_the_digest_degrades_row_by_row_on_old_and_partial_snapshots(md, paths):
@@ -3754,7 +3786,9 @@ def test_the_digest_degrades_row_by_row_on_old_and_partial_snapshots(md, paths):
         reply = md.handle("", now=NOW, paths=paths)
         assert reply.flex is not None and reply.render_errors == (), (name, reply.text)
         body = summary_bubble(md, reply.flex, DIGEST)["body"]["contents"]
-        assert [node["text"][:2] for node in body] == SIX_PREFIXES, name
+        # progress 拿掉或壞掉時 CPI 列照樣可用（第 4 列是通膨句）；列不見、never、只剩一列時第 4 列退回 10 年債
+        expected = INFL_PREFIXES if name in ("no_progress", "junk_progress") else SIX_PREFIXES
+        assert [node["text"][:2] for node in body] == expected, name
         assert all(md.row_width(node["text"]) <= 24 and "…" not in node["text"] for node in body), name
         if name in ("no_rows", "never_rows"):
             assert [node["text"] for node in body] == [
@@ -3837,7 +3871,7 @@ def test_the_three_shipped_lists_are_identical_and_the_digest_buttons_are_in_the
     if smoke.is_file():
         assert assigned_tuple(smoke, "SHIPPED") == shipped
     sent = [action["text"] for action in actions(digest_bubble(md, make_snapshot(NOW)))]  # 摘要第一張的三顆按鈕
-    assert sent == ["/盤勢 期權", "/盤勢 新聞", "/盤勢 0050"]
+    assert sent == ["/盤勢 期權", "/盤勢 新聞", "/盤勢 通膨"]  # 2026-10-30 批 2：「/盤勢 0050」換成「/盤勢 通膨」（Q-B2）
     for command in sent:
         assert command in shipped and md.parse_command(command[len("/盤勢"):]) is not None
 

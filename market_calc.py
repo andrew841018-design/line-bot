@@ -2338,7 +2338,21 @@ BE_MOVE_BP = 5  # 5 日變化 ≥5 bp（含剛好 5）才寫上升／下降，�
 BE_SPREAD_BP = 10  # 5 年減 10 年 ≥10 bp（含剛好 10）才寫「5 年高於 10 年」，≤−10 寫「低於」
 BE_MOVE_CODES = ("up", "flat", "down")
 BE_SPREAD_CODES = ("five_higher", "similar", "five_lower")
-TEXT_BE_BASIS = "名目殖利率減實質殖利率（%）"
+TEXT_BE_BASIS = "名目殖利率減實質殖利率（%）"  # publish 的 basis=（值不能改，2026-10-29 計畫審查 G13）；卡上用下面的 TEXT_BE_CARD_NOTE
+# /盤勢 通膨 細節卡的損益兩平段（2026-10-30 批 2，PLAN_b2_v2 §3.3、§3.4、P9）：每句一個常數（FIXED_TEXTS 自動收），dict 只做
+# 「碼→常數」。5 日變化（move）不顯示（Andrew 10/29 定案），所以沒有它的句子
+TEXT_BE_LINE = "{n} 年損益兩平通膨 {v}%（{md}）"  # 「損益兩平」單獨看會被讀成賺賠打平，標籤帶「通膨」（S1）
+TEXT_BE_STATE = "損益兩平通膨：{state}"  # 過期（ctx.gap 的「過期（資料日 M/D）」）、暫缺
+TEXT_BE_SPREAD_FIVE_HIGHER = "5 年期比 10 年期高 {bp}bp"  # bp 一律取絕對值，方向由碼決定
+TEXT_BE_SPREAD_FIVE_LOWER = "5 年期比 10 年期低 {bp}bp"
+TEXT_BE_SPREAD_SIMILAR = "5 年期和 10 年期差不多"
+BE_SPREAD_TEXT = {
+    "five_higher": TEXT_BE_SPREAD_FIVE_HIGHER,
+    "similar": TEXT_BE_SPREAD_SIMILAR,
+    "five_lower": TEXT_BE_SPREAD_FIVE_LOWER,
+}
+# 只把殖利率歸給財政部，同一句寫明損益兩平是程式相減的（P9，比照 BLS 那幾句只把指數歸給 BLS）
+TEXT_BE_CARD_NOTE = "損益兩平通膨＝債市隱含的未來平均通膨；名目與實質殖利率取自美國財政部，損益兩平由程式相減"
 
 
 def _infl_dec(value: Any) -> Decimal | None:
@@ -2468,7 +2482,81 @@ INFL_LEVEL_CODES = ("not_above", "slightly_above", "above", "well_above")
 INFL_MOMENTUM_CODES = ("accelerating", "steady", "cooling")
 INFL_MOVE_CODES = ("up", "flat", "down")
 INFL_GAP_CODES = ("headline_higher", "similar", "headline_lower")
-TEXT_INFL_BASIS = "BLS 指數：年增用未季調，月增與年化用季調，數字由程式計算"
+TEXT_INFL_BASIS = "BLS 指數：年增用未季調，月增與年化用季調，數字由程式計算"  # publish 的 basis=（值不能改，G13）
+# 重點摘要第 4 列與 /盤勢 通膨 細節卡的固定句（2026-10-30 批 2，PLAN_b2_v2 §2–§4）。每句一個常數（FIXED_TEXTS 自動收進禁用字、
+# validator、年份的掃描），下面的 dict 只做「碼→常數」；bot 查表前碼一律先過 _word，不認得的碼那半句不寫，不印原始的碼。
+# 數字、月份由 bot 填：月份只寫「9 月」不寫年份；方向句的數字一律取絕對值，方向由碼決定。
+TEXT_INFL_LEVEL_NOT_ABOVE = "不高於 2%"  # R1
+TEXT_INFL_LEVEL_SLIGHTLY_ABOVE = "略高於 2%"
+TEXT_INFL_LEVEL_ABOVE = "高於 2%"
+TEXT_INFL_LEVEL_WELL_ABOVE = "明顯高於 2%"
+INFL_LEVEL_TEXT = {
+    "not_above": TEXT_INFL_LEVEL_NOT_ABOVE,
+    "slightly_above": TEXT_INFL_LEVEL_SLIGHTLY_ABOVE,
+    "above": TEXT_INFL_LEVEL_ABOVE,
+    "well_above": TEXT_INFL_LEVEL_WELL_ABOVE,
+}
+TEXT_INFL_MOMENTUM_ACCELERATING = "加速"  # R2，摘要第 4 列「近 3 月…」
+TEXT_INFL_MOMENTUM_STEADY = "持平"
+TEXT_INFL_MOMENTUM_COOLING = "降溫"
+INFL_MOMENTUM_TEXT = {
+    "accelerating": TEXT_INFL_MOMENTUM_ACCELERATING,
+    "steady": TEXT_INFL_MOMENTUM_STEADY,
+    "cooling": TEXT_INFL_MOMENTUM_COOLING,
+}
+# R2，細節卡年化那一列的後半：讀的人看得到年增與年化兩個數字，寫成比較句（S9；「持平」容易被讀成物價沒變）
+TEXT_INFL_ANN3_FASTER = "，比年增快"
+TEXT_INFL_ANN3_SIMILAR = "，和年增差不多"
+TEXT_INFL_ANN3_SLOWER = "，比年增慢"
+INFL_ANN3_TEXT = {
+    "accelerating": TEXT_INFL_ANN3_FASTER,
+    "steady": TEXT_INFL_ANN3_SIMILAR,
+    "cooling": TEXT_INFL_ANN3_SLOWER,
+}
+# R3：兩端點都標月份（G8；{p}＝年增那個月的上一個月，publish 的 yoy_prev 就是那個月的年增）
+TEXT_INFL_MOVE_UP = "年增由 {p} 月 {prev}% 升到 {m} 月 {yoy}%"
+TEXT_INFL_MOVE_DOWN = "年增由 {p} 月 {prev}% 降到 {m} 月 {yoy}%"
+TEXT_INFL_MOVE_FLAT = "年增和 {p} 月一樣，都是 {yoy}%"
+INFL_MOVE_TEXT = {"up": TEXT_INFL_MOVE_UP, "flat": TEXT_INFL_MOVE_FLAT, "down": TEXT_INFL_MOVE_DOWN}
+TEXT_INFL_GAP_HEADLINE_HIGHER = "整體比核心高 {pp} 個百分點"  # R4
+TEXT_INFL_GAP_HEADLINE_LOWER = "整體比核心低 {pp} 個百分點"
+TEXT_INFL_GAP_SIMILAR = "整體和核心差不多"
+INFL_GAP_TEXT = {
+    "headline_higher": TEXT_INFL_GAP_HEADLINE_HIGHER,
+    "similar": TEXT_INFL_GAP_SIMILAR,
+    "headline_lower": TEXT_INFL_GAP_HEADLINE_LOWER,
+}
+# 摘要第 4 列（由長到短：完整、去動能、只有數字）；{m}＝年增那個月
+TEXT_INFL_DIGEST_FULL = "通膨：CPI {yoy}%（{m} 月）{level}，近 3 月{momentum}"
+TEXT_INFL_DIGEST_LEVEL = "通膨：CPI {yoy}%（{m} 月）{level}"
+TEXT_INFL_DIGEST_NUMBER = "通膨：CPI {yoy}%（{m} 月）"
+# 細節卡 CPI 段（第一次出現 CPI 寫「消費者物價（CPI）」，同 US_EVENT_LABELS）
+TEXT_INFL_TITLE = "通膨｜消費者物價與損益兩平"  # 月資料不用 _title()（會印成「9/30 收盤」，S4）
+TEXT_INFL_CPI_LINE = "消費者物價（CPI）年增 {yoy}%（{m} 月）"
+TEXT_INFL_TARGET_LINE = "{level} 目標"
+TEXT_INFL_CORE_LINE = "核心 CPI（不含食品能源）年增 {yoy}%（{m} 月）"  # 月份用核心自己的（G4）
+TEXT_INFL_CORE_MISSING = "核心 CPI：暫缺"
+TEXT_INFL_MOM_LINE = "月增 {mom}%（季調，{m} 月）"
+TEXT_INFL_ANN3_LINE = "近 3 月年化 {ann3}%（季調，{m} 月）"
+TEXT_INFL_CPI_STALE_MONTH = "消費者物價（CPI）：過期，資料到 {m} 月"  # 月資料不用 ctx.gap 的「資料日 9/30」
+TEXT_INFL_CPI_STALE = "消費者物價（CPI）：過期"
+TEXT_INFL_CPI_MISSING = "消費者物價（CPI）：暫缺"
+# 基期缺值（年增那個月比最新月早一個月）：不寫年份、原因、「暫時」（N3、G11）
+TEXT_INFL_BASE_GAP = "{m} 月年增算不出來，先列 {n} 月"
+TEXT_INFL_PCE = "聯準會的 2% 目標看的是 PCE（另一種物價指標），目前沒有 PCE 資料"
+# BLS 條款（investigations/inflation_20261023.md:249-254；計畫審查 gp2 B1–B7 的定稿）：只把「指數」歸給 BLS，同一個泡泡寫明數字與
+# 判斷由程式計算，附取得日（{md}＝values.retrieved，不用今天補）和英文原句；不放標誌。這幾句直接放進 notes，不經過 ctx.note
+# （英文原句 118 字，會被 NOTE_MAX 丟掉，I6）。每一句各自一個常數、各自 append：要拿掉或改字只動一行
+TEXT_INFL_BLS_DIGEST = ("通膨列的 CPI 指數取自美國勞工統計局（BLS），取得日 {md}；年增與「高於 2%」「加速」等判斷由程式計算，"
+                        "BLS 無法擔保取得後的資料，以及衍生的數字與分析")
+TEXT_INFL_BLS_CARD = "CPI 指數取自美國勞工統計局（BLS），取得日 {md}；卡上的數字與判斷都由程式計算"
+TEXT_INFL_BLS_VOUCH = "資料自 BLS.gov 取得後，BLS.gov 無法擔保這些資料，也無法擔保由資料衍生的數字與分析"
+TEXT_INFL_BLS_ORIGINAL = ("BLS.gov cannot vouch for the data or analyses derived from these data after the data have been "
+                          "retrieved from BLS.gov.")
+# 細節卡 altText：只有固定句型＋年增與月份，不帶「BLS」與判斷字（B3）；開頭「盤勢：」讓 main 的大字版自動套用
+TEXT_INFL_ALT = "盤勢：通膨 CPI 年增 {yoy}%（{m} 月）"
+TEXT_INFL_ALT_NO_CPI = "盤勢：通膨，CPI 暫無數字"
+TEXT_INFL_ALT_MISSING = "盤勢：通膨資料暫缺"
 
 _YM_RE = re.compile(r"(\d{4})-(0[1-9]|1[0-2])", re.ASCII)
 

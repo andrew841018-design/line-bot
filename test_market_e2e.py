@@ -1867,7 +1867,7 @@ def test_batch_1_b_track_cards_come_out_of_the_whole_pipeline(world):
 
 def test_shipped_texts_match_the_routing_test():
     assert market_dashboard.SHIPPED_MARKET_TEXTS == _routing_shipped_texts()
-    assert len(market_dashboard.SHIPPED_MARKET_TEXTS) == 16
+    assert len(market_dashboard.SHIPPED_MARKET_TEXTS) == 17  # 2026-10-30 批 2 加了 /盤勢 通膨（只增不刪）
 
 
 def _reply_problems(world: World, text: str, reply: Any, *, fresh: bool) -> list[str]:
@@ -2051,21 +2051,25 @@ def test_summary_card_mentions_both_markets_and_their_dates(world):
 
 
 def test_the_digest_reads_the_real_pipeline_snapshot(world):
-    """重點摘要（輪播第一張）讀的是真的 collect → publish 寫出來的快照，不是合成的：6 列依序是美股、台股、風險、利率、事件、
+    """重點摘要（輪播第一張）讀的是真的 collect → publish 寫出來的快照，不是合成的：6 列依序是美股、台股、風險、通膨、事件、
     川普，每列都有內容（沒有整排「暫缺」）、不超寬、沒有被切掉；footer 的資料日和快照的日期對得上。"""
     reply = _reply(world, "/盤勢")
     assert reply.render_errors == ()
     bubble = _bubbles(reply.flex)[0]
     rows = [node["text"] for node in bubble["body"]["contents"]]
-    assert [row[:2] for row in rows] == ["美股", "台股", "風險", "利率", "事件", "川普"], rows
+    # 2026-10-30 批 2：真的 pipeline 有 CPI（BLS 合成序列到 2026-09），第 4 列是通膨句
+    assert [row[:2] for row in rows] == ["美股", "台股", "風險", "通膨", "事件", "川普"], rows
+    assert rows[3].startswith("通膨：CPI ") and "（9 月）" in rows[3], rows
     assert all(market_dashboard.row_width(row) <= 24 and "…" not in row for row in rows), rows
     assert not any("暫缺" in row or "過期" in row for row in rows), rows  # 兩個交易日的來源都齊了
     assert rows[0].startswith("美股：") and rows[1].startswith("台股：")  # 三檔、加權都是最新場次：沒有落後的日期
     notes = [node["text"] for node in bubble["footer"]["contents"] if node.get("type") == "text"]
-    # 2026-10-28 批 1 審查 F2-1：資料日多了 10 年債和川普壓力指數（真的 pipeline 的兩列都是 10/16，和其他列同一天）
-    assert notes[0] == "資料日：美股 10/16、台股 10/16、VIX 10/16、10 年債 10/16、川普壓力指數 10/16"
+    # 2026-10-28 批 1 審查 F2-1：資料日有川普壓力指數（真的 pipeline 的那一列是 10/16，和其他列同一天）；第 4 列是通膨句時不列
+    # 10 年債（批 2 I1），接著是 BLS 的取得日與無法擔保、英文原句（gp2 B4）
+    assert notes[0] == "資料日：美股 10/16、台股 10/16、VIX 10/16、川普壓力指數 10/16"
+    assert notes[1].startswith("通膨列的 CPI 指數取自美國勞工統計局（BLS），取得日 ") and notes[2] == market_calc.TEXT_INFL_BLS_ORIGINAL
     commands = [node["action"]["text"] for node in bubble["footer"]["contents"] if "action" in node]
-    assert commands == ["/盤勢 期權", "/盤勢 新聞", "/盤勢 0050"]
+    assert commands == ["/盤勢 期權", "/盤勢 新聞", "/盤勢 通膨"]
 
 
 def test_status_summary_for_the_daily_maintenance_is_clean(world):
@@ -2120,4 +2124,4 @@ def test_card_size_table(world):
         lines.append(f"{text:16s} bubbles={len(sizes)} max_bubble={max(sizes)} card={market_dashboard.card_bytes(reply.flex)}"
                      f" with_page_buttons={paged}")
     print("\n[card sizes]\n" + "\n".join(lines))
-    assert len(lines) == 16
+    assert len(lines) == 17  # 2026-10-30 批 2 加了 /盤勢 通膨
