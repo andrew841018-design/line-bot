@@ -59,8 +59,9 @@ def test_a_tail_shorter_than_the_minimum_gives_no_rsi(tail):
 
 
 @pytest.mark.parametrize("tail", [80, 81, 100, 120, 200])
-def test_a_long_enough_tail_matches_the_full_series_to_the_displayed_integer(tail):
-    """不會剛好相等（Wilder 的種子不同，只是影響被平滑掉了）：誤差要小到卡上的整數不變。對照：原本就會算的情形沒被改壞。"""
+def test_a_long_enough_tail_matches_the_full_series_closely(tail):
+    """不會剛好相等（Wilder 的種子不同，只是影響被平滑掉了）：這組數列卡上的整數不變；一般數列 80 筆約 5% 會差 1
+    （見 market_calc.RSI_MIN_CLOSES 的註解）。對照：原本就會算的情形沒被改壞。"""
     full = mc.technicals(CLOSES, SESSIONS, DAY).rsi14
     got = rsi_with_tail(tail)
     assert full is not None and got is not None

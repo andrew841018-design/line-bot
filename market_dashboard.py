@@ -137,6 +137,7 @@ TEXT_EARNINGS_ESTIMATED = market_calc.TEXT_EARNINGS_ESTIMATED
 TEXT_EARNINGS_OTHERS = market_calc.TEXT_EARNINGS_OTHERS
 TEXT_EARNINGS_NONE = market_calc.TEXT_EARNINGS_NONE
 TEXT_RSI_NOTE = market_calc.TEXT_RSI_NOTE
+TEXT_RSI_INSUFFICIENT = market_calc.TEXT_RSI_INSUFFICIENT  # 細節卡：rsi14 鍵在、值是 null（批 2 R2-N7）
 TEXT_CLOSE_PENDING = market_calc.TEXT_CLOSE_PENDING  # 美股、台股副標：「{md} 收盤資料尚未取得」
 TEXT_TW_CLOSED = market_calc.TEXT_TW_CLOSED  # 台股副標：「{md} 休市」（覆寫已確認；{md}＝快照產生日，F2-3）
 TEXT_TW_CLOSED_TENTATIVE = market_calc.TEXT_TW_CLOSED_TENTATIVE  # 「{md} 休市（暫定）」（管線推定）
@@ -846,7 +847,7 @@ def _tw_notice(ctx: _Ctx) -> Optional[str]:
 
 
 def _rsi_shown(view: _View) -> bool:
-    """細節卡（_tech_rows）有沒有印 RSI14 那一列。"""
+    """細節卡（_tech_rows）有沒有印 RSI14 的數字（註腳只在有數字時放；「RSI14 資料不足」那句沒有數字，不算）。"""
     return view.fresh and _num(view.values.get("rsi14"), 0, 100) is not None
 
 
@@ -2079,6 +2080,10 @@ def _tech_rows(ctx: _Ctx, view: _View, label: str, *, named: bool = False) -> li
         extra.append(f"離 240 日高點 {_pct(dd)}")
     if rsi is not None:
         extra.append(f"RSI14 {rsi:.0f}")
+    elif "rsi14" in values and values["rsi14"] is None:
+        # 鍵在、值是 null＝往回連續收盤不夠算（批 1 的 publish 一律寫這個鍵）：寫出來，不要悄悄消失（批 2 R2-N7）。
+        # 鍵不存在（批 1 以前的快照）、值不是數字、超出 0–100 都不寫：那不是「資料不足」（審查 b2_plan_seat1 I5）
+        extra.append(TEXT_RSI_INSUFFICIENT)
     if extra:
         rows.append(_text("、".join(extra)))
     ratio = _num(values.get("vol_ratio"), 0, 1000)

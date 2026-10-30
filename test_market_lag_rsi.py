@@ -249,7 +249,9 @@ def test_detail_cards_carry_the_fixed_rsi_note_only_when_rsi_is_shown(md, paths)
         broken["rows"][row_id]["values"]["rsi14"] = None
         write_snapshot(paths, broken)
         card = md.handle(body, now=DASH_NOW, paths=paths).flex
-        assert RSI_NOTE not in texts(card) and not any("RSI14" in text for text in texts(card["body"])), body
+        # null：沒有數字、沒有註腳；批 2（R2-N7）起細節卡改寫「RSI14 資料不足」（第八節逐項測）
+        assert RSI_NOTE not in texts(card) and not any(
+            "RSI14" in text and "RSI14 資料不足" not in text for text in texts(card["body"])), body
         broken = make_snapshot(DASH_NOW)
         broken["rows"][row_id]["stale_after"] = DASH_NOW - 1
         write_snapshot(paths, broken)
@@ -1025,3 +1027,172 @@ def test_every_marker_at_once_passes_the_validator_and_the_main_gate(md, paths, 
     assert texts(summary[2]["header"])[1] == f"{today.month}/{today.day} 休市（暫定）"  # 第一張是重點摘要
     detail = texts(md.handle(" 0050", now=now, paths=paths).flex)
     assert any("除權息資料待更新" in text for text in detail) and RSI_NOTE in detail
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 八、細節卡的「RSI14 資料不足」（批 2・R2-N7，審查 b2_plan_seat1 I5）：鍵在、值是 null 才寫
+# ═════════════════════════════════════════════════════════════════════════════
+# 批 1 的 publish 一律寫 rsi14 這個鍵，缺口後 80 個預期交易日算不出來就是 null；以前卡上直接不寫，看起來像悄悄消失。
+# 舊快照（批 1 以前）根本沒有這個鍵：不是資料不足，什麼都不寫。值不是數字、或超出 0–100，也不寫（不能把壞值說成資料不足）。
+# 每個「不該有這句」的測試前面都先放「該有這句」的對照，所以沒實作時這些測試也是紅的（不是空測）。
+RSI_INSUFFICIENT = "RSI14 資料不足"
+ABSENT = object()  # 這個鍵根本不存在（舊快照）
+RSI_DETAIL_CARDS = (("us.etf.VOO", " VOO"), ("us.etf.QQQ", " QQQ"), ("us.etf.SOXX", " SOXX"), ("tw.etf.0050", " 0050"))
+RSI_DETAIL_IDS = [body.strip() for _row_id, body in RSI_DETAIL_CARDS]
+
+
+def rsi_tech_rows(md_, **overrides):
+    """_tech_rows 對一份 fresh 的 values 寫出的每一列字（ctx 只在過期／暫缺那條路用到）；ABSENT＝把那個鍵拿掉。"""
+    values = make_snapshot(DASH_NOW)["rows"]["us.etf.VOO"]["values"]  # 每次都是新的 dict；dd240_pct＝-3.2、rsi14＝55.4
+    for key, value in overrides.items():
+        if value is ABSENT:
+            values.pop(key, None)
+        else:
+            values[key] = value
+    view = md_._View(md_.FRESH, values, date(2026, 10, 16))
+    return [node["text"] for node in md_._tech_rows(None, view, "標普500（VOO）")]
+
+
+def rsi_detail_reply(md_, paths_, row_id, body, rsi14, now=DASH_NOW):
+    """把這一檔的 rsi14 換掉（ABSENT＝拿掉那個鍵）、寫成快照，回那張細節卡的 Reply。"""
+    snap = make_snapshot(now)
+    values = snap["rows"][row_id]["values"]
+    if rsi14 is ABSENT:
+        values.pop("rsi14")
+    else:
+        values["rsi14"] = rsi14
+    write_snapshot(paths_, snap)
+    return md_.handle(body, now=now, paths=paths_)
+
+
+def test_rsi_insufficient_text_is_a_fixed_text_that_passes_every_gate(md):
+    assert market_calc.TEXT_RSI_INSUFFICIENT == RSI_INSUFFICIENT and md.TEXT_RSI_INSUFFICIENT == RSI_INSUFFICIENT
+    assert RSI_INSUFFICIENT in market_calc.FIXED_TEXTS  # 禁用字、年份、validator 的整批掃描自動涵蓋
+    assert not md.has_forbidden(RSI_INSUFFICIENT)
+    for now in ALL_NOWS:  # 2026／2027／2028 都原樣通過
+        result = output_validator.validate_outbound_text(RSI_INSUFFICIENT, now=datetime.fromtimestamp(now, TPE))
+        assert result.ok and result.text == RSI_INSUFFICIENT, (now, result.reason)
+
+
+def test_tech_rows_say_rsi_is_insufficient_when_the_key_is_there_and_null(md):
+    rows = rsi_tech_rows(md, rsi14=55.4)
+    assert "離 240 日高點 -3.2%、RSI14 55" in rows and not any(RSI_INSUFFICIENT in row for row in rows)  # 對照：有值照舊
+    null_rows = rsi_tech_rows(md, rsi14=None)  # 鍵在、值是 null：批 1 的 publish 遇到缺口就是這樣
+    assert "離 240 日高點 -3.2%、RSI14 資料不足" in null_rows
+    assert len(null_rows) == len(rows)  # 接在原本那一列後面，不多出一列
+    assert not any("None" in row or "null" in row for row in null_rows)
+
+
+def test_tech_rows_write_nothing_when_the_rsi14_key_is_missing(md):
+    """舊快照（批 1 以前）沒有 rsi14 這個鍵：不是資料不足，卡上維持原樣（I5）。"""
+    assert any(RSI_INSUFFICIENT in row for row in rsi_tech_rows(md, rsi14=None))  # 對照：同一份、鍵在而且是 null 就寫
+    rows = rsi_tech_rows(md, rsi14=ABSENT)
+    assert "離 240 日高點 -3.2%" in rows
+    assert not any("RSI14" in row for row in rows)
+
+
+@pytest.mark.parametrize("bad", ["55", "資料不足", "null", True, False, [], {}, [55.4], {"v": 55.4}, -1.0, 150.0, 1e300],
+                         ids=repr)
+def test_tech_rows_write_nothing_for_a_value_that_is_not_a_valid_rsi(md, bad):
+    assert any(RSI_INSUFFICIENT in row for row in rsi_tech_rows(md, rsi14=None))  # 對照：只有 null 才寫
+    rows = rsi_tech_rows(md, rsi14=bad)
+    assert "離 240 日高點 -3.2%" in rows
+    assert not any("RSI14" in row for row in rows), rows
+
+
+@pytest.mark.parametrize("rsi, shown", [(0.0, "0"), (0, "0"), (53.4, "53"), (99.6, "100"), (100.0, "100"), (100, "100")])
+def test_tech_rows_print_a_valid_number_as_before(md, rsi, shown):
+    assert any(RSI_INSUFFICIENT in row for row in rsi_tech_rows(md, rsi14=None))  # 對照：null 才寫
+    rows = rsi_tech_rows(md, rsi14=rsi)
+    assert f"離 240 日高點 -3.2%、RSI14 {shown}" in rows
+    assert not any(RSI_INSUFFICIENT in row for row in rows)
+
+
+def test_the_insufficient_row_stays_within_the_row_limit(md):
+    text = "離 240 日高點 -100.0%、RSI14 資料不足"
+    assert text in rsi_tech_rows(md, dd240_pct=-100.0, rsi14=None)  # 對照：最壞值有寫
+    assert md.row_width(text) == 18.5  # 量過：dd240_pct 的下限 -100 是最寬的寫法，離 24 還有餘裕
+    for dd in (-100.0, -99.95, -12.34, -0.04, 0.0, 0.0001, None, ABSENT):
+        rows = [row for row in rsi_tech_rows(md, dd240_pct=dd, rsi14=None) if RSI_INSUFFICIENT in row]
+        assert len(rows) == 1 and md.row_width(rows[0]) <= 24, (dd, rows)
+    for dd in (None, ABSENT):  # 離高點那段缺：單獨一列，不留頭尾的「、」
+        assert RSI_INSUFFICIENT in rsi_tech_rows(md, dd240_pct=dd, rsi14=None), dd
+        assert not any("高點" in row for row in rsi_tech_rows(md, dd240_pct=dd, rsi14=None)), dd
+
+
+@pytest.mark.parametrize("row_id, body", RSI_DETAIL_CARDS, ids=RSI_DETAIL_IDS)
+def test_detail_card_says_rsi_is_insufficient_only_for_a_null(md, paths, row_id, body):
+    ok = rsi_detail_reply(md, paths, row_id, body, 55.4)  # 對照：有值照舊（數字、註腳都在，沒有那一句）
+    assert "離 240 日高點 -3.2%、RSI14 55" in texts(ok.flex["body"]) and RSI_NOTE in texts(ok.flex["footer"])
+    assert not any(RSI_INSUFFICIENT in text for text in reply_strings(ok))
+    null = rsi_detail_reply(md, paths, row_id, body, None)
+    assert "離 240 日高點 -3.2%、RSI14 資料不足" in texts(null.flex["body"])
+    assert RSI_NOTE not in texts(null.flex["footer"])  # 沒有數字：RSI 的註腳也不放
+    assert null.render_errors == ()
+    assert_main_gate(null)
+    old = rsi_detail_reply(md, paths, row_id, body, ABSENT)  # 舊快照：沒有這個鍵
+    assert "離 240 日高點 -3.2%" in texts(old.flex["body"])
+    assert not any("RSI14" in text for text in texts(old.flex)) and RSI_NOTE not in texts(old.flex)
+    assert old.render_errors == ()
+
+
+@pytest.mark.parametrize("row_id, body", RSI_DETAIL_CARDS, ids=RSI_DETAIL_IDS)
+def test_a_stale_or_missing_row_never_gets_the_insufficient_sentence(md, paths, row_id, body):
+    assert any(RSI_INSUFFICIENT in text for text in texts(rsi_detail_reply(md, paths, row_id, body, None).flex))  # 對照
+    for change in ({"stale_after": DASH_NOW - 1}, {"state": "never"}):  # 整檔過期、整檔暫缺：細節卡只有那一句缺口說明
+        snap = make_snapshot(DASH_NOW)
+        snap["rows"][row_id]["values"]["rsi14"] = None
+        snap["rows"][row_id].update(change)
+        write_snapshot(paths, snap)
+        card = md.handle(body, now=DASH_NOW, paths=paths).flex
+        assert not any("RSI14" in text for text in texts(card)), (change, texts(card))
+
+
+def test_the_sentence_is_only_on_the_four_detail_cards(md, paths):
+    snap = make_snapshot(DASH_NOW)
+    for row_id, _body in RSI_DETAIL_CARDS:
+        snap["rows"][row_id]["values"]["rsi14"] = None
+    snap["rows"]["tw.taiex"]["values"]["rsi14"] = None
+    write_snapshot(paths, snap)
+    for _row_id, body in RSI_DETAIL_CARDS:  # 對照：這四張有
+        assert any(RSI_INSUFFICIENT in text for text in texts(md.handle(body, now=DASH_NOW, paths=paths).flex)), body
+    for body in ("", " 期權", " 新聞", " 季節性", " 選舉", " 13F QQQ"):  # 摘要列沒有 RSI 時照舊不寫（A18），其他卡不加
+        assert not any("RSI14" in text for text in reply_strings(md.handle(body, now=DASH_NOW, paths=paths))), body
+
+
+@pytest.mark.parametrize("now", ALL_NOWS, ids=["2026-10-17", "2027-01-15", "2028-01-03"])
+def test_the_insufficient_cards_pass_the_validator_and_the_main_gate(md, paths, now):
+    snap = make_snapshot(now)
+    for row_id, _body in RSI_DETAIL_CARDS:
+        snap["rows"][row_id]["values"]["rsi14"] = None
+    write_snapshot(paths, snap)
+    at = datetime.fromtimestamp(now, TPE)
+    for _row_id, body in RSI_DETAIL_CARDS:
+        reply = md.handle(body, now=now, paths=paths)
+        assert reply.flex is not None and reply.render_errors == (), body
+        assert "離 240 日高點 -3.2%、RSI14 資料不足" in texts(reply.flex["body"]), body
+        assert_main_gate(reply)
+        for value in reply_strings(reply):
+            result = output_validator.validate_outbound_text(value, now=at)
+            assert result.ok and result.text == value, (body, value, result.reason)
+        assert size(reply.flex) <= 28 * 1024, body
+        assert card_pages.fits_line_limits(card_pages.with_page_button(reply.flex, LONG_PAGE_URL)), body
+
+
+def test_end_to_end_a_published_gap_reads_as_insufficient_and_an_old_snapshot_reads_as_nothing(tmp_path, md):
+    """真的 publish：0050 往回缺一天收盤 → 列的 rsi14 是 null（鍵還在）→ 細節卡寫「資料不足」；同一份快照把鍵拿掉（批 1 以前）→ 不寫。"""
+    w = World(tmp_path)
+    try:
+        w.store._db().execute("DELETE FROM closes WHERE market = 'tw' AND symbol = '0050' AND date = ?",
+                              (TW_DAYS[-5].isoformat(),))
+        assert w.publish()["kind"] == "ok"
+        snap = w.snapshot()
+        values = snap["rows"]["tw.etf.0050"]["values"]
+        assert "rsi14" in values and values["rsi14"] is None  # publish 的契約：鍵一定在，算不出來就是 null
+        assert any(RSI_INSUFFICIENT in text for text in texts(md.handle(" 0050", now=PUB_NOW, paths=w.paths).flex["body"]))
+        del values["rsi14"]
+        write_snapshot(w.paths, snap)
+        old = texts(md.handle(" 0050", now=PUB_NOW, paths=w.paths).flex)
+        assert not any("RSI14" in text for text in old) and RSI_NOTE not in old
+    finally:
+        w.close()
