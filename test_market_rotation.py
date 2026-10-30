@@ -97,10 +97,11 @@ ROT_TEXTS = {
     "TEXT_ROT_WATCH_SEMIS": "半導體偏冷、必需消費偏熱",
     "TEXT_ROT_NONE": "沒有明顯方向",
     "TEXT_ROT_NOTE_RETURNS": "資金輪動只看價格：近 20 個交易日 XLP {xlp}、SOXX {soxx}",
-    "TEXT_ROT_NOTE_WATCH": "資金輪動只看價格：SOXX RSI {soxx_rsi}、離季線 {soxx_ma60}、離 240 日高點 {soxx_dd240}；"
-                           "XLP RSI {xlp_rsi}、{xlp_ma60}",
+    "TEXT_ROT_NOTE_WATCH": "資金輪動只看價格：SOXX RSI {soxx_rsi}、{soxx_ma60}、{soxx_dd240}；XLP RSI {xlp_rsi}、{xlp_ma60}",
+    "TEXT_ROT_NOTE_MA60": "離季線",
+    "TEXT_ROT_NOTE_DD240": "離 240 日高點",
     "TEXT_ROT_NOTE_KO": "；KO RSI {ko_rsi}、{ko_ma60}",
-    "TEXT_ROT_NOTE_HELD": "狀態要連續 2 個交易日都一樣才會換",
+    "TEXT_ROT_NOTE_HELD": "資金輪動沿用前幾天的狀態：要連續 2 個交易日都一樣才會換；上面的數字是最新一天的",
     "TEXT_ROT_NOTE_WICK": "SOXX {day} 衝高回落（長上影線 {pct}），也算偏熱",
 }
 VALIDATOR_NOWS = (datetime(2026, 10, 29, 9, 0, tzinfo=TPE), datetime(2027, 1, 15, 9, 0, tzinfo=TPE),
@@ -152,6 +153,7 @@ def test_state_codes_and_their_sentences():
     assert (mc.ROT_STAPLES, mc.ROT_SEMIS, mc.ROT_WATCH_STAPLES, mc.ROT_WATCH_SEMIS, mc.ROT_NONE,
             mc.ROT_INSUFFICIENT) == STATES
     assert mc.ROT_STATES == STATES
+    assert mc.ROT_WATCHES == ("watch_staples", "watch_semis")  # market_dashboard 也用這一份（橘色、WATCH 句）
     assert mc.ROT_STATE_TEXT == {
         "staples": mc.TEXT_ROT_STAPLES, "semis": mc.TEXT_ROT_SEMIS, "watch_staples": mc.TEXT_ROT_WATCH_STAPLES,
         "watch_semis": mc.TEXT_ROT_WATCH_SEMIS, "none": mc.TEXT_ROT_NONE, "insufficient": mc.TEXT_INSUFFICIENT,
@@ -352,6 +354,19 @@ def test_a_quarantine_counts_only_when_it_touches_the_window(sym):
     assert touched["xlp_ret20"] is None and touched["soxx_ret20"] is None
     open_ended = market_calc.rot_inputs(closes, {sym: [(DAY, None)]}, CAL, DAY)  # 還沒解除的隔離
     assert open_ended["xlp_ret20"] is None and open_ended["soxx_ret20"] is None
+
+
+def test_rot_inputs_passes_each_symbols_quarantine_to_its_technicals():
+    """R2：隔離在 R−30（報酬窗口外、季線／RSI／240 日窗口內）只讓那一檔的技術面變成 None，兩個報酬照算。"""
+    closes = rot_closes()
+    back = SESSIONS[-31]
+    for sym, keys in (("SOXX", ("soxx_rsi", "soxx_ma60", "soxx_dd240")), ("XLP", ("xlp_rsi", "xlp_above60")),
+                      ("KO", ("ko_rsi", "ko_above60"))):
+        got = market_calc.rot_inputs(closes, {sym: [(back, back)]}, CAL, DAY)
+        assert all(got[key] is None for key in keys), (sym, {key: got[key] for key in keys})
+        assert got["xlp_ret20"] is not None and got["soxx_ret20"] is not None
+        others = [key for key in ("soxx_rsi", "xlp_rsi", "ko_rsi") if key not in keys]
+        assert all(got[key] is not None for key in others), sym
 
 
 def test_ko_counts_only_when_it_has_the_day_itself():
@@ -1047,6 +1062,17 @@ def test_the_shared_caches_are_not_modified(world):
     assert {key: ctx._cache[key] for key in keys} == before
 
 
+def test_publish_passes_the_quarantine_into_the_read(world):
+    """R1：窗口內的 split_pending 隔離要傳進 rotation_values（不然沒調整的收盤會讀成必需消費領先 60 幾個百分點）。"""
+    world.store.add_quarantine("us", "SOXX", US_DAYS[-12], US_DAYS[-11], "split_pending")
+    _outcome, rows = published(world)
+    values = rows["us.rot.state"]["values"]
+    assert rows["us.rot.state"]["state"] == "ok"
+    assert values["soxx_ret20"] is None and values["xlp_ret20"] is None
+    assert values["soxx_ma60"] is None and values["soxx_rsi"] is None and values["soxx_dd240"] is None
+    assert values["raw"] == values["state"] == "insufficient"
+
+
 def test_the_labels_put_the_exact_row_before_the_prefix():
     labels = list(market_publish._LABELS)
     assert market_publish._label_for("us.rot.state") == "資金輪動"
@@ -1159,7 +1185,7 @@ FIRST_FIVE = [
     ("量能：VOO 量偏少、QQQ 量偏少、SOXX 量偏少", "#555555"),
 ]
 WATCH_NOTE = "資金輪動只看價格：SOXX RSI 74、離季線 +12.3%、離 240 日高點 -2.1%；XLP RSI 38、在季線下；KO RSI 55、在季線上"
-HELD = "狀態要連續 2 個交易日都一樣才會換"
+HELD = "資金輪動沿用前幾天的狀態：要連續 2 個交易日都一樣才會換；上面的數字是最新一天的"
 
 
 def us_bubble(md_, snap, now=DASH_NOW):
@@ -1312,7 +1338,7 @@ FOOTER_CASES = [
      ["資金輪動只看價格：SOXX RSI 74、離季線 +12.3%、離 240 日高點 -2.1%；XLP RSI 38、在季線下"]),
     ("watch_missing_numbers", {"soxx_rsi": 74, "soxx_ma60": None, "soxx_dd240": None, "xlp_rsi": None,
                                "xlp_above60": False, "ko_rsi": None, "ko_above60": False}, None,
-     ["資金輪動只看價格：SOXX RSI 74、離季線 暫缺、離 240 日高點 暫缺；XLP RSI 暫缺、在季線下；KO RSI 暫缺、在季線下"]),
+     ["資金輪動只看價格：SOXX RSI 74、離季線暫缺、離 240 日高點暫缺；XLP RSI 暫缺、在季線下；KO RSI 暫缺、在季線下"]),
     ("watch_semis", {"soxx_rsi": 25, "xlp_rsi": 72, "xlp_above60": None}, None,
      ["資金輪動只看價格：SOXX RSI 25、離季線 0.0%、離 240 日高點 -20.0%；XLP RSI 72、季線暫缺；KO RSI 50、在季線上"]),
     ("returns", {"xlp_ret20": -1.2, "soxx_ret20": -13.6}, None, ["資金輪動只看價格：近 20 個交易日 XLP -1.2%、SOXX -13.6%"]),
@@ -1342,6 +1368,21 @@ def test_a_held_state_prints_no_gap_and_the_footer_says_why(md):
     assert values["raw"] == "watch_staples" and values["state"] == "staples"  # 當天是 watch，顯示的沿用前幾天的 staples
     assert us_body(md, snap)[7] == ("資金輪動 10/15：必需消費比半導體強", md.GRAY)  # 當天的數字不能拿來佐證：不印差距
     assert us_notes(md, snap)[-1] == HELD
+
+
+def test_a_held_staples_against_todays_returns_still_says_it_is_held(md):
+    """反向（p3 I2）：顯示的 staples 是沿用的（前兩天 staples、今天 semis），footer 當天的報酬是 SOXX 比較強 → 列上照樣只寫
+    沿用的狀態、不印差距；footer 照印當天的報酬，最後一句說明研判那一列是沿用的、上面的數字是最新一天的。逐字比對。"""
+    assert market_calc.rot_confirmed(["staples", "staples", "semis"]) == "staples"  # 真的會出現的組合
+    snap = make_snapshot(DASH_NOW)
+    values = set_rot(snap, neutral(xlp_ret20=-10.4, soxx_ret20=2.0), state="staples", day=DASH_PREV)
+    assert values["raw"] == "semis" and values["state"] == "staples" and market_calc.rotation_values_ok(values)
+    assert us_body(md, snap)[7] == ("資金輪動 10/15：必需消費比半導體強", md.GRAY)
+    notes = us_notes(md, snap)
+    assert notes == ["資金輪動只看價格：近 20 個交易日 XLP -10.4%、SOXX +2.0%",
+                     "資金輪動沿用前幾天的狀態：要連續 2 個交易日都一樣才會換；上面的數字是最新一天的"]
+    for note in notes:
+        passes_every_gate(note)
 
 
 # ── 插針那一行（2026-10-29 增補）：顯示的狀態是 watch_staples 而且插針成立時，WATCH 句之後、HELD 之前獨立一行 ──────────
@@ -1408,21 +1449,23 @@ def test_the_wick_sentence_for_other_days_and_sizes_passes_every_gate(md, day, p
     passes_every_gate(expected)
 
 
-def test_the_held_sentence_makes_no_promise(md):
+def test_the_rotation_sentences_make_no_promises(monkeypatch):
+    """ROT_TEXTS 的每一句：過 bot_promise_scan 的承諾掃描，也沒有「下次會／之後會／我會」（同 test_market_dashboard 的
+    test_fixed_sentences_make_no_promises）。"""
     import importlib.util
+    import re
     import sys
     from pathlib import Path
 
     spec = importlib.util.spec_from_file_location("bot_promise_scan_for_rotation", Path(__file__).resolve().parent / "jobs" /
                                                   "bot_promise_scan.py")
     scan = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = scan
-    try:
-        spec.loader.exec_module(scan)
-        for name in ROT_TEXTS:
-            assert scan.promise_sentences(getattr(market_calc, name)) == [], name
-    finally:
-        sys.modules.pop(spec.name, None)
+    monkeypatch.setitem(sys.modules, spec.name, scan)  # 它的 dataclass 要在 sys.modules 找得到自己
+    spec.loader.exec_module(scan)
+    for name in ROT_TEXTS:
+        text = getattr(market_calc, name)
+        assert scan.promise_sentences(text) == [], name
+        assert not re.search(r"下次會|之後會|我會", text), name
 
 
 def test_the_provisional_hours_print_these_rows(md):
@@ -1814,6 +1857,16 @@ def test_this_fetch_wins_for_its_days_and_only_30_sessions_are_kept(env):
     assert closes(env, "SOXX")[date(2026, 10, 13)] == (100.0, "nasdaq", False)  # 收盤照樣寫
 
 
+def test_a_fetch_that_makes_every_stored_bar_invalid_clears_them(env):
+    """R3：已存的 bar 剛好是這次抓的那幾天，新的全部是 N/A → obs 改寫成空的（PLAN_v3 §2 第 4 步）。"""
+    env.store.put_obs("us.ohlc.SOXX", fetched_bars(), data_date=UPDATE_DAYS[-1].isoformat())
+    etfs_ready(env)
+    env.http.hist_raw["SOXX"] = nasdaq_bars("SOXX", {day: (None, None, None, 100.0) for day in UPDATE_DAYS})
+    assert run(env, "us.hist") == "ok"
+    found = obs(env, "us.ohlc.SOXX")
+    assert found["payload"] == {"bars": {}} and found["data_date"] is None
+
+
 def test_a_soxx_bootstrap_keeps_only_the_newest_30_sessions(env):
     """P3：沒有歷史的 SOXX 抓一年（約 252 根）→ 只留最新 30 根。"""
     days = sessions(PIPE_D, 252)
@@ -1959,8 +2012,10 @@ def test_the_same_fetch_again_does_not_rewrite_and_the_default_fake_writes_nothi
 
 def test_note_ohlc_takes_only_dated_bars_up_to_d(env):
     """P10：直接呼叫 _note_ohlc（正式來源已經濾掉 >D，只能這樣測）：>D、datetime、沒有日期的 bar 都不收。"""
-    bars = [src.Bar(PIPE_D, 100.0, 1000, 99.8, 100.6, 99.7), src.Bar(date(2026, 10, 19), 101.0, 1000, 100.8, 101.6, 100.7),
-            src.Bar(datetime(2026, 10, 15, 16, 0), 100.0, 1000, 99.8, 100.6, 99.7), src.Bar(None, 100.0, 1000, 99.8, 100.6, 99.7)]
+    bars = [src.Bar(PIPE_D, 100.0, 1000, open=99.8, high=100.6, low=99.7),
+            src.Bar(date(2026, 10, 19), 101.0, 1000, open=100.8, high=101.6, low=100.7),
+            src.Bar(datetime(2026, 10, 15, 16, 0), 100.0, 1000, open=99.8, high=100.6, low=99.7),
+            src.Bar(None, 100.0, 1000, open=99.8, high=100.6, low=99.7)]
     pipe._note_ohlc(ctx_at(env, PIPE_NOW), "SOXX", bars, PIPE_D)
     found = obs(env, "us.ohlc.SOXX")
     assert found["payload"] == fetched_bars([PIPE_D]) and found["data_date"] == PIPE_D.isoformat()

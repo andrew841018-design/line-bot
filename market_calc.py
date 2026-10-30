@@ -2873,7 +2873,7 @@ def cpi_poll(now_et: datetime, stored: str | None, last_probe: float | None, *, 
 #   必需消費偏弱＝XLP 或 KO 在季線下、或 RSI≤40；必需消費偏熱＝XLP 或 KO 的 RSI≥70（KO 沒有研判日的收盤就是未知）。
 #   X：SOXX 同時偏熱又偏冷 → 沒有；半導體偏熱＋必需消費偏弱 → watch_staples；半導體偏冷＋必需消費偏熱 → watch_semis；
 #     用 Kleene 三值邏輯，未知不當成假。結果：X 是 watch 就用 X；X 未知而且 T 沒有方向 → 資料不足；其他用 T。
-#   顯示的狀態要連續 ROT_CONFIRM_DAYS 個交易日一樣才會換（rot_confirmed；往回最多 ROT_LOOKBACK 天，用同一份收盤重算）。
+#   顯示的狀態要連續 ROT_CONFIRM_DAYS 個交易日一樣才會換（rot_confirmed；往回最多 ROT_LOOKBACK 天，用同一份收盤與開高低重算）。
 # 門檻都是起始值，沿用一般技術分析慣例，沒有回測校準：部署後用正式 DB 重放，只看各狀態出現幾天、改變幾次，再調。
 # 所有門檻都比「顯示精度的 half-up 值」（報酬、乖離一位小數，RSI 整數；和 market_dashboard._half_up 同一個規則），values 存的
 # 就是這個值：判斷和卡上印的字不會分家（沒四捨五入的 69.6 不算偏熱、卡上卻印 RSI 70）。這一列和 SOXX 建倉日報、出場通知無關：
@@ -2888,15 +2888,16 @@ ROT_STRETCH_MA60_PCT = Decimal("10.0")  # 離季線 ≥+10% 算拉得很開（�
 # 往回算幾天的原始狀態（含研判日）。5 而不是 10：staging 的真實收盤試算，改變次數、只 1 天的段都差不多，但「沿用舊狀態」最長
 # 從 5 天降到 3 天。沿用有上限是刻意的：最多 3 個交易日沒有當天支持，之後回到「沒有明顯方向」
 ROT_LOOKBACK = 5
-ROT_CONFIRM_DAYS = 2  # 狀態要連續幾個交易日一樣才會換（rot_confirmed 照這個寫；TEXT_ROT_NOTE_HELD 的「2」用測試綁住）
+ROT_CONFIRM_DAYS = 2  # 狀態要連續幾個交易日一樣才會換（rot_confirmed 寫死相鄰兩天；這個常數由測試和 TEXT_ROT_NOTE_HELD 的「2」綁住）
 ROT_CLOSE_SYMBOLS = ("XLP", "SOXX", "KO")  # rot_inputs 讀的代號（closes 的鍵）
 # 高位插針（SOXX 的長上影線；2026-10-29 增補 v3.1，Andrew 例子原話「SOXX高位插針」）。都是起始值、沒有回測：
 ROT_WICK_SESSIONS = 3  # 研判日往回幾個交易日（含研判日）
 ROT_WICK_BODY_RATIO = Decimal("2")  # 上影線 ≥ 2 × max(實體, 下影線)：下影線也要短（長腳十字是多空拉鋸，不算）
 ROT_WICK_MIN_PCT = Decimal("1.5")  # 上影線 ÷ 那根 K 棒的收盤（一位小數）≥1.5% 才算高位插針
 ROT_WICK_MAX_PCT = Decimal("15.0")  # 超過（還沒四捨五入的值）當壞資料，那一天不算
-# 研判日離 240 日高點 ≥−5% 算高位：比「近高點且拉很開」那條路的 −3% 寬，因為長上影線本身就是轉弱的訊號，不必再要求拉很開；
-# 插針的高比收盤高 1.5% 以上，而且之後沒有收盤站上它（rot_wick 的突破失效），所以等於「插針的高點離 240 日高點 5% 以內」
+# 研判日離 240 日高點 ≥−5% 算高位：比「近高點且拉很開」那條路的 −3% 寬，因為長上影線本身就是轉弱的訊號，不必再要求拉很開。
+# 插針之後沒有收盤站上它的高（rot_wick 的突破失效），所以插針的高點一定不低於 240 日高點的 95%；反過來不一定：插針後收盤跌超過
+# 5% 就不算
 ROT_WICK_NEAR_HIGH_PCT = Decimal("-5.0")
 # K 棒收盤和已存的正式收盤差超過這個比例，那根就不算（和 market_pipeline_us.GUARD_DIFF 同一個值，測試綁住；calc 不 import pipeline）
 ROT_OHLC_MATCH = 0.005
@@ -2904,7 +2905,7 @@ ROT_STAPLES, ROT_SEMIS, ROT_WATCH_STAPLES, ROT_WATCH_SEMIS, ROT_NONE, ROT_INSUFF
     "staples", "semis", "watch_staples", "watch_semis", "none", "insufficient",
 )
 ROT_STATES = (ROT_STAPLES, ROT_SEMIS, ROT_WATCH_STAPLES, ROT_WATCH_SEMIS, ROT_NONE, ROT_INSUFFICIENT)
-_ROT_WATCHES = (ROT_WATCH_STAPLES, ROT_WATCH_SEMIS)
+ROT_WATCHES = (ROT_WATCH_STAPLES, ROT_WATCH_SEMIS)  # 兩個 watch 狀態（market_dashboard 也用這一份：橘色、footer 寫 WATCH 句）
 # 卡片的固定句：列名、兩檔的名稱、狀態句（描述句，不用祈使句、不寫「跡象」）；insufficient 用既有的 TEXT_INSUFFICIENT
 TEXT_ROT_XLP_NAME = "必需消費（XLP）"
 TEXT_ROT_KO_NAME = "可口可樂（KO）"
@@ -2917,9 +2918,13 @@ TEXT_ROT_WATCH_SEMIS = "半導體偏冷、必需消費偏熱"
 TEXT_ROT_NONE = "沒有明顯方向"
 # footer（不受 24 寬限制）：判斷依據與當天的數字
 TEXT_ROT_NOTE_RETURNS = "資金輪動只看價格：近 20 個交易日 XLP {xlp}、SOXX {soxx}"
-TEXT_ROT_NOTE_WATCH = "資金輪動只看價格：SOXX RSI {soxx_rsi}、離季線 {soxx_ma60}、離 240 日高點 {soxx_dd240}；XLP RSI {xlp_rsi}、{xlp_ma60}"
+TEXT_ROT_NOTE_WATCH = "資金輪動只看價格：SOXX RSI {soxx_rsi}、{soxx_ma60}、{soxx_dd240}；XLP RSI {xlp_rsi}、{xlp_ma60}"
+# WATCH 句的 {soxx_ma60}、{soxx_dd240} 放整段：下面的名稱＋空格＋數字（「離季線 +12.3%」）；缺值時名稱直接接「暫缺」
+# （「離季線暫缺」，和細節卡 market_dashboard._tech_rows 一樣不留空格）
+TEXT_ROT_NOTE_MA60 = "離季線"
+TEXT_ROT_NOTE_DD240 = "離 240 日高點"
 TEXT_ROT_NOTE_KO = "；KO RSI {ko_rsi}、{ko_ma60}"  # KO 有值時接在 TEXT_ROT_NOTE_WATCH 後面
-TEXT_ROT_NOTE_HELD = "狀態要連續 2 個交易日都一樣才會換"  # 顯示的狀態是沿用前幾天的（state≠raw）時加
+TEXT_ROT_NOTE_HELD = "資金輪動沿用前幾天的狀態：要連續 2 個交易日都一樣才會換；上面的數字是最新一天的"  # 顯示的狀態是沿用前幾天的（state≠raw）時加
 # 顯示的狀態是 watch_staples 而且插針成立（rot_wick_hot）時，footer 獨立一行，放在 WATCH 句之後、HELD 句之前（2026-10-29 增補）：
 # 「衝高回落」是給家人看的白話，術語放括號、和數字綁在一起；「也算偏熱」接上列上的「半導體偏熱」
 TEXT_ROT_NOTE_WICK = "SOXX {day} 衝高回落（長上影線 {pct}），也算偏熱"
@@ -3002,10 +3007,10 @@ def rot_wick(ohlc: Mapping[date, Any], closes: Mapping[date, Any], intervals: An
     """SOXX 在研判日 day 的長上影線：(百分比，一位小數的 float, 那一天)；沒有 → (None, None)。純函式，不修改輸入、不丟例外。
 
     ohlc＝{日期: [開, 高, 低, 收]}（ohlc_from_payload 的結果）；closes、intervals 只放 SOXX 一檔（和 rot_inputs 用的同一份收盤、
-    同一份隔離區間）；cal＝TradingCalendar 或排好的交易日清單。
+    同一份隔離區間；publish 的研判日 R 本身一定是正式收盤，R 之前的日子可能是 CBOE 暫定列）；cal＝TradingCalendar 或排好的交易日清單。
     窗口＝_sessions_upto(cal, day, ROT_WICK_SESSIONS)，最後一天必須是 day（day 不是交易日 → 沒有）。窗口裡每一天要同時：
-    K 棒合格（ohlc_bar）、那天有正的正式收盤（_pos）而且 K 棒收盤和它差 ≤ROT_OHLC_MATCH（和 _evaluate 同一個 float 公式）、
-    沒碰到隔離區間、之後到 day 為止（只看窗口，≤ day）沒有一天的正式收盤高於那根的高（突破就失效）。
+    K 棒合格（ohlc_bar）、那天在同一份收盤裡有正的收盤（_pos）而且 K 棒收盤和它差 ≤ROT_OHLC_MATCH（和 _evaluate 同一個 float 公式）、
+    沒碰到隔離區間、之後到 day 為止（只看窗口，≤ day）沒有一天的收盤高於那根的高（突破就失效）。
     再用 Decimal 依序算：上影線＝高 − max(開, 收) 要 >0；上影線 ≥ ROT_WICK_BODY_RATIO × max(實體, 下影線)；上影線 ÷ 那根自己的
     收盤 ×100（還沒四捨五入）≤ROT_WICK_MAX_PCT，超過當壞資料；最後才 ROUND_HALF_UP 到一位小數。符合的日子取 max((百分比, 日期))：
     一樣長取最近那天。是不是「高位插針」由 rot_wick_hot 判斷（這裡不比 1.5%）。"""
@@ -3028,10 +3033,10 @@ def rot_wick(ohlc: Mapping[date, Any], closes: Mapping[date, Any], intervals: An
             upper = high - max(open_, close)
             if upper <= 0 or upper < ROT_WICK_BODY_RATIO * max(abs(close - open_), min(open_, close) - low):
                 continue
-            pct = upper / close * 100
-            if pct > ROT_WICK_MAX_PCT:
+            raw_pct = upper / close * 100
+            if raw_pct > ROT_WICK_MAX_PCT:  # 上限比的是還沒四捨五入的值
                 continue
-            pct = _round1(pct)
+            pct = _round1(raw_pct)
         if best is None or (pct, session) > best:
             best = (pct, session)
     if best is None:
@@ -3164,7 +3169,7 @@ def rot_classify(values: Mapping[str, Any]) -> str:
             rotation = ROT_NONE
         else:
             rotation = None  # 未知
-    if rotation in _ROT_WATCHES:
+    if rotation in ROT_WATCHES:
         return rotation
     if rotation is None and trend == ROT_NONE:
         return ROT_INSUFFICIENT

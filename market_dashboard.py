@@ -1036,7 +1036,6 @@ def _card_us(ctx: _Ctx, head: str, subtitle: Optional[str] = None) -> dict:
 # 研判那一列只放狀態（描述句；watch 用橘色），staples／semis 而且當天的原始狀態也一樣時才在句尾加差距；佐證數字在 footer
 # （不受 24 寬限制）。研判日 R 和標題日不同時，日期放在列名後面（「資金輪動 10/27：」，同 _digest_stamp 的位置），任何寫法都留著。
 # 快照裡這一列的型別或語意不對（market_calc.rotation_values_ok）就當暫缺；舊快照沒有這三列 → 三列都是「暫缺」。
-_ROT_WATCHES = (market_calc.ROT_WATCH_STAPLES, market_calc.ROT_WATCH_SEMIS)
 _ROT_TRENDS = (market_calc.ROT_STAPLES, market_calc.ROT_SEMIS)
 
 
@@ -1065,7 +1064,7 @@ def _rot_line(ctx: _Ctx, main_day: Optional[date]) -> tuple[str, str]:
         gap = market_calc.rot_gap(values)
         if gap is not None:
             with_gap = sentence + market_calc.TEXT_ROT_GAP.format(gap=_round_text(abs(gap), 1))
-    return _fit(with_gap, sentence), ORANGE if state in _ROT_WATCHES else GRAY
+    return _fit(with_gap, sentence), ORANGE if state in market_calc.ROT_WATCHES else GRAY
 
 
 def _rot_rows(ctx: _Ctx, main_day: Optional[date]) -> list[tuple[str, str]]:
@@ -1084,6 +1083,11 @@ def _rot_pct_text(value: Optional[float]) -> str:
     return _pct(value, 1) if value is not None else TEXT_MISSING
 
 
+def _rot_dist_text(name: str, value: Optional[float]) -> str:
+    """WATCH 句的「離季線 +12.3%」「離 240 日高點 -2.1%」整段；缺值寫「離季線暫缺」（和 _tech_rows 一樣不留空格）。"""
+    return f"{name} {_pct(value, 1)}" if value is not None else f"{name}{TEXT_MISSING}"
+
+
 def _rot_ma60_word(above: Optional[bool]) -> str:
     return "季線暫缺" if above is None else "在季線上" if above else "在季線下"
 
@@ -1092,16 +1096,16 @@ def _rot_notes(ctx: _Ctx) -> list[str]:
     """美股卡 footer 的資金輪動註記（數字一律是研判日當天的）：watch 寫 SOXX 的 RSI、離季線、離 240 日高點與 XLP（KO 有值時加
     KO）的 RSI 和季線位置；其他狀態寫兩檔近 20 個交易日的報酬。顯示的狀態是 watch_staples 而且插針成立（market_calc.rot_wick_hot）
     時另起一行插針句（日期、上影線長度；2026-10-29 增補，看 state 不看 raw，watch_semis 不印）。狀態是沿用前幾天的（state≠raw）
-    最後再加一句「連續 2 個交易日」。資料不足、過期、暫缺都不加。"""
+    最後再加 TEXT_ROT_NOTE_HELD（研判那一列是沿用的、上面的數字是最新一天的）。資料不足、過期、暫缺都不加。"""
     _view, values = _rot_view(ctx)
     if values is None or values["state"] == market_calc.ROT_INSUFFICIENT:
         return []
     state = values["state"]
-    if state in _ROT_WATCHES:
+    if state in market_calc.ROT_WATCHES:
         note = market_calc.TEXT_ROT_NOTE_WATCH.format(
             soxx_rsi=_rot_rsi_text(values["soxx_rsi"]),
-            soxx_ma60=_rot_pct_text(values["soxx_ma60"]),
-            soxx_dd240=_rot_pct_text(values["soxx_dd240"]),
+            soxx_ma60=_rot_dist_text(market_calc.TEXT_ROT_NOTE_MA60, values["soxx_ma60"]),
+            soxx_dd240=_rot_dist_text(market_calc.TEXT_ROT_NOTE_DD240, values["soxx_dd240"]),
             xlp_rsi=_rot_rsi_text(values["xlp_rsi"]),
             xlp_ma60=_rot_ma60_word(values["xlp_above60"]),
         )
