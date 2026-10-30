@@ -4211,6 +4211,8 @@ def _handle_video_message_owned(
             if isinstance(e, (_MediaAnalysisBusyError, _MediaAnalysisTimeoutError))
             else "too large"
             if isinstance(e, _MediaTooLargeError)
+            else "content not ready"
+            if isinstance(e, _MediaContentNotReadyError)
             else "download or analysis failed"
         )
         logger.warning("video analyze failed (%s): %s", reason, e)
@@ -14583,6 +14585,10 @@ class _MediaAnalysisTimeoutError(TimeoutError):
 
 
 class _MediaTooLargeError(ValueError):
+    pass
+
+
+class _MediaContentNotReadyError(RuntimeError):
     pass
 
 
@@ -24980,10 +24986,35 @@ def _reply(
     return True
 
 
+_MEDIA_CONTENT_WAIT_SEC = 20.0
+_MEDIA_CONTENT_POLL_SEC = 2.0
+
+
 def _download_content(message_id: str) -> bytes:
-    """從 LINE 下載 image/video/audio/file 訊息的原始 bytes。"""
+    """從 LINE 下載 image/video/audio/file 訊息的原始 bytes。
+
+    影片／音訊剛傳上來時 LINE 可能還在轉檔：content API 回 202，SDK 只認 200、回 None。
+    這時查轉檔狀態，每 2 秒再抓一次，最多等 _MEDIA_CONTENT_WAIT_SEC 秒；轉檔失敗或
+    等不到就丟 _MediaContentNotReadyError（以前是 bytes(None) 的 TypeError）。
+    """
     with ApiClient(_get_line_config()) as api_client:
-        return bytes(MessagingApiBlob(api_client).get_message_content(message_id))
+        blob = MessagingApiBlob(api_client)
+        data = blob.get_message_content(message_id)
+        give_up_at = time.monotonic() + _MEDIA_CONTENT_WAIT_SEC
+        while data is None:
+            try:
+                status = blob.get_message_content_transcoding_by_message_id(
+                    message_id
+                ).status
+            except Exception:
+                status = "unknown"
+            if status == "failed" or time.monotonic() + _MEDIA_CONTENT_POLL_SEC > give_up_at:
+                raise _MediaContentNotReadyError(
+                    f"LINE content not ready (transcoding {status})"
+                )
+            time.sleep(_MEDIA_CONTENT_POLL_SEC)
+            data = blob.get_message_content(message_id)
+        return bytes(data)
 
 
 def _guess_mime_type(file_name: str) -> str:
