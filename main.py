@@ -1528,6 +1528,12 @@ def _page_backed_guards(first, reply_text, provider, run_guards, backing_for, *,
         if second.numbers_dropped != after.dropped:
             logger.info("grounding backing pass2=kept_pass1 reason=drift")
             return first
+        # B3 may still take out what the page rescued: then the first pass's fixed line stands
+        # rather than a B (REVIEW_gp2_plan_s10 Phase 6 P6-2).
+        rescued = {q for q in reply_guards.quantities(after.text) if q.kind != "年份"}
+        if not second.text or (all_or_nothing and rescued - set(reply_guards.quantities(second.text))):
+            logger.info("grounding backing pass2=kept_pass1 reason=emptied")
+            return first
         logger.info(
             "grounding backing pass2=used numbers_before=%d after=%d",
             first.numbers_dropped, second.numbers_dropped,

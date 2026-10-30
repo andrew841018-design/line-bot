@@ -590,7 +590,8 @@ def test_a_number_the_cited_page_holds_is_said(monkeypatch, research_env, nothin
     assert research_env.sent == [f"{VISA_YES}\n{VISA_DAYS}"]
     assert [url for url, _kw in cited.calls] == [SOURCE]
     assert "grounding backing pass2=used" in caplog.text and "kept=1" in caplog.text
-    assert "example.com" not in caplog.text and "停留期間" not in caplog.text  # counts only
+    for secret in ("example.com", "pages.example", "vertexaisearch", "停留期間"):  # counts only
+        assert secret not in caplog.text
 
 
 def test_a_number_no_cited_page_holds_still_gets_the_fixed_line(monkeypatch, research_env, nothing_crawled,
@@ -682,18 +683,40 @@ def test_a_year_on_the_page_never_drops_a_sentence_kept_today(monkeypatch):
 
 
 def test_the_page_backs_numbers_and_nothing_else(monkeypatch):
-    seen = []
+    seen = {}
     real_date, real_contact = main._date_claims_unbacked, main._contact_backing
     real_public = main.reply_policy.strip_unbacked_public_claims
     monkeypatch.setattr(main, "_date_claims_unbacked",
-                        lambda *a, **k: seen.append(k.get("evidence_text")) or real_date(*a, **k))
-    monkeypatch.setattr(main, "_contact_backing", lambda *a, **k: seen.append(a[3]) or real_contact(*a, **k))
+                        lambda *a, **k: seen.setdefault("date", k.get("evidence_text")) and None
+                        or real_date(*a, **k))
+    monkeypatch.setattr(main, "_contact_backing",
+                        lambda *a, **k: seen.setdefault("contact", a[3]) and None or real_contact(*a, **k))
     monkeypatch.setattr(main.reply_policy, "strip_unbacked_public_claims",
-                        lambda *a, **k: seen.append(k.get("evidence_text")) or real_public(*a, **k))
+                        lambda *a, **k: seen.setdefault("public", k.get("evidence_text")) and None
+                        or real_public(*a, **k))
     out = _enforce(monkeypatch, f"{VISA_YES}\n{VISA_DAYS}", "日本免簽可以待幾天？",
                    _rendered("停留期間最長90天。"), all_or_nothing=True)
     assert VISA_DAYS in out
-    assert len(seen) >= 2 and all("90天" not in (ev or "") for ev in seen)
+    assert set(seen) == {"date", "contact", "public"}
+    assert all("90天" not in (evidence or "") for evidence in seen.values())
+
+
+def test_a_reply_pass_one_empties_is_rescued_by_the_page(monkeypatch, research_env, nothing_crawled, cited):
+    # Pass 2 runs before the empty-text return (REVIEW_gp2_plan_s10 F3).
+    answer = "台灣護照去日本免簽，最多可停留90天。"
+    cited.pages[SOURCE] = _cited_page("外籍旅客免簽入境，停留期間最長90天。")
+    monkeypatch.setattr(main.gemini_client, "chat", _grounded([], answer=answer))
+    main._handle_web_research_question(research_env.event, "G_PQ", "去日本要簽證嗎？")
+    assert research_env.sent == [answer]
+
+
+def test_no_page_is_read_when_an_earlier_guard_ended_the_reply(monkeypatch, research_env, nothing_crawled,
+                                                              cited):
+    answer = f"請撥打02-2345-6789詢問。\n{VISA_DAYS}"
+    cited.pages[SOURCE] = _cited_page("停留期間最長90天。")
+    monkeypatch.setattr(main.gemini_client, "chat", _grounded([], answer=answer))
+    main._handle_web_research_question(research_env.event, "G_PQ", "日本免簽可以待幾天？")
+    assert research_env.sent == [main.UNVERIFIED_CONTACT_REPLY] and cited.calls == []
 
 
 def _first(text="可以。", dropped=1):
@@ -728,6 +751,16 @@ def test_errors_in_the_second_pass_keep_the_first(monkeypatch, caplog):
         assert _second_pass(first, _raise, lambda _e: pytest.fail("no second run")) is first
         assert _second_pass(first, lambda _t: "90天", _raise) is first
     assert caplog.text.count("pass2=error error_type=RuntimeError") == 2
+
+
+def test_a_second_pass_b3_empties_keeps_the_first(monkeypatch):
+    # REVIEW_gp2_plan_s10 Phase 6 P6-2: the first pass's fixed line, not a B.
+    results = iter([reply_guards.RegulatoryResult("", 1, 0),
+                    reply_guards.RegulatoryResult("免簽停留90天都可以。", 0, 1)])
+    monkeypatch.setattr(reply_guards, "strip_negative_coverage", lambda text, *_a: (text, 0))
+    monkeypatch.setattr(reply_guards, "strip_unbacked_regulatory_numbers", lambda *_a: next(results))
+    first = _first("", dropped=1)
+    assert _second_pass(first, lambda _t: "90天", lambda _e: _first("", dropped=0)) is first
 
 
 def test_a_second_pass_that_disagrees_with_its_check_is_not_kept(monkeypatch):

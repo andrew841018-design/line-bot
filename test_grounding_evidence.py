@@ -110,6 +110,32 @@ def test_a_number_at_the_40k_cut_of_a_long_line_is_not_made_up(served):
     assert backing == "20000元"
 
 
+def test_a_comma_inside_a_number_is_no_place_to_cut(served):
+    # REVIEW_gp1_plan_s10 Phase 6: the window's end must not hide 「1,|000元」's digits.
+    pages, _calls = served
+    pages[URL] = _page("合" * 29998 + "1,000元", content_type="text/plain; charset=utf-8")
+    backing, _stats = _backing([URL], {_q("元", "0"), _q("元", "1000")})
+    assert "0元" not in backing.split("\n")
+
+
+def test_the_scan_budget_never_cuts_a_number(served):
+    pages, _calls = served
+    pages[URL] = _page("。" * 299_996 + "NT$20000", content_type="text/plain; charset=utf-8")
+    backing, _stats = _backing([URL], {_q("元", "2"), _q("元", "20000")})
+    assert "2元" not in backing.split("\n")
+
+
+@pytest.mark.parametrize("html", [
+    "<p>酒類<!-- 註解 -->90天</p>",
+    "<!--StartFragment--><p>停留90天</p><!--EndFragment-->",
+    "<p>停留<?php echo 1; ?>90天</p>",
+])
+def test_text_after_a_comment_or_instruction_is_read(served, html):
+    pages, _calls = served
+    pages[URL] = _page(html)
+    assert _backing([URL], {_q("天", "90")})[0] == "90天"
+
+
 def test_a_long_line_with_no_safe_cut_backs_nothing(served):
     pages, _calls = served
     pages[URL] = _page("合" * 35000 + "90天", content_type="text/plain; charset=utf-8")
@@ -156,6 +182,61 @@ def test_pages_are_decoded_here(served, content_type, body):
     assert _backing([URL], {_q("天", "90")})[0] == "90天"
 
 
+@pytest.mark.parametrize("content_type, body", [
+    # a declared charset holds past one bad byte (REVIEW_gp1_plan_s10 Phase 6 P6-2)
+    ("text/html; charset=utf-8", "<p>停留90天</p>".encode() + "停".encode()[:2]),  # the 1 MB cut
+    ("text/html; charset=big5", "<p>碁停留90天</p>".encode("cp950")),  # a cp950-only character
+    ("text/html; charset=utf-8", b"<p>\xff" + "停留90天".encode() + b"</p>"),  # one stray byte
+    ("text/html", "<p>停留90天</p>".encode() + "停".encode()[:2]),  # no charset, cut at the end
+])
+def test_one_bad_byte_does_not_lose_the_page(served, content_type, body):
+    pages, _calls = served
+    pages[URL] = _page(body, content_type=content_type)
+    assert _backing([URL], {_q("天", "90")})[0] == "90天"
+
+
+def test_only_web_encodings_are_used(served):
+    # REVIEW_gp2_plan_s10 Phase 6 P6-1: a declared punycode decodes in quadratic time.
+    assert ge._codec("punycode") == "" and ge._codec("utf-7") == ""
+    assert ge._codec("big5") == "cp950" and ge._codec("UTF-8") == "utf-8" and ge._codec("gb2312") == "gbk"
+    pages, _calls = served
+    pages[URL] = _page(("a" * 99 + "\n") * 2000 + "停留90天", content_type="text/plain; charset=punycode")
+    started = time.monotonic()
+    assert _backing([URL], {_q("天", "90")})[0] == "90天"
+    assert time.monotonic() - started < 3
+
+
+def test_a_page_that_breaks_the_reader_is_counted(served, monkeypatch):
+    pages, _calls = served
+    pages[URL] = _page("<p>90天</p>")
+    monkeypatch.setattr(ge, "_decode", lambda *_a: 1 / 0)
+    backing, stats = _backing([URL], {_q("天", "90")})
+    assert backing == "" and stats["error"] == 1
+
+
+def test_b2_runs_before_b1_as_the_second_pass_assumes():
+    # main._page_backed_guards rebuilds B1's own output as apply_reply_guards does: B2, then B1.
+    for reply, evidence in [
+        ("免簽最多可停留90天。", ""),
+        ("免簽最多可停留90天。", "90天"),
+        ("搜尋結果都沒有提到其他限制。入境菸酒免稅額度是酒類1公升。", ""),
+        ("台灣護照赴日免簽，護照效期需6個月以上。\n免簽最多可停留90天。", "6個月"),
+    ]:
+        whole = reply_guards.apply_reply_guards(reply, request_text="幾天？", evidence_text=evidence,
+                                                search_only=True)
+        b2, _negative = reply_guards.strip_negative_coverage(reply, False, True)
+        b1 = reply_guards.strip_unbacked_regulatory_numbers(
+            b2, lambda: reply_guards.regulation_backing("", "幾天？", "", evidence))
+        assert whole.numbers_dropped == b1.dropped, reply
+
+
+@pytest.mark.parametrize("text", ["辦理簽證需90天", "x 90天", "老舊規定90天"])
+def test_plain_text_is_not_taken_for_zlib(served, text):
+    pages, _calls = served
+    pages[URL] = _page(text, content_type="text/plain; charset=utf-8")
+    assert _backing([URL], {_q("天", "90")})[0] == "90天"
+
+
 @pytest.mark.parametrize("page, counter", [
     (_page("<p>90天</p>", status=404), "non200"),
     (safe_fetch.Unsupported("application/pdf"), "unsupported"),
@@ -181,6 +262,8 @@ def test_only_the_cited_urls_go_out_with_two_fixed_headers(served):
     assert backing == "90天"
     assert [url for url, _kw in calls] == [URL, URL2, "http://pages.example/c", "https://pages.example/d"]
     assert stats["tried"] == 4
+    outcomes = sum(stats[key] for key in ge.STATS_KEYS if key not in ("tried", "kept"))
+    assert outcomes <= stats["tried"]
     for _url, kwargs in calls:
         assert set(kwargs["headers"]) == {"User-Agent", "Accept-Language"}
         assert "params" not in kwargs and kwargs.get("method", "GET") == "GET"
