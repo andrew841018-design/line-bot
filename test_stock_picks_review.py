@@ -131,7 +131,10 @@ def test_full_run_records_enumerated_last_run(ready):
     out = _last_run(ready)
     assert out["status"] == "ok" and out["consecutive_failures"] == 0 and out["last_success_at"] == fx.NOW
     assert {name: s["status"] for name, s in out["stages"].items()} == {
-        "archive": "ok", "pool": "ok", "prices": "ok", "weekly": "skipped:not_due"}
+        "archive": "ok", "pool": "ok", "prices": "ok", "returns": "ok", "weekly": "skipped:not_due"}
+    returns = out["stages"]["returns"]  # C1：三族各一版，E（10/28）還不在日曆上 → 先等，什麼都沒評
+    assert (returns["versions"], returns["wait_e"], returns["evaluated"], returns["frozen"]) == (3, 3, 0, 0)
+    assert set(returns["families"]) == {"tw_v1", "tw_ai", "us"}
     assert out["last_t"] == {"tw_v1": "2026-10-27", "tw_ai": "2026-10-27", "us": "2026-10-27"}
     assert out["sizes"]["archive_files"] == 3 and out["sizes"]["sqlite_bytes"] > 0
     assert out["finished_at"] >= out["started_at"]

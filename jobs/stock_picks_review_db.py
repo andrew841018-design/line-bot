@@ -21,6 +21,11 @@ review.sqlite（state/stock_picks_review/，只有這支 job 寫；WAL）
 - pool_days.market_json：台股 [大盤狀態, 月線乖離‰, 季線乖離‰]；美股 {"level", "b20", "b60"}（SPY）。spool 取代簡版時，
   spool 沒有就沿用簡版的。
 - pool_rows 有 CHECK：status＝member 的列一定有 c0。
+- C1 的表（user_version 2）：member_returns(m, family, t, ver_s, derive_version, code, h, ledger_version, r, b, skip,
+  inputs_json, frozen_at)：股票池每個成員、每個 h 用 perf.evaluate 算出來的報酬（stock_picks_review_returns 寫），
+  凍結後不改（ON CONFLICT DO NOTHING）。inputs_json＝{th, c0, ce, ch, cf, be, bh, bf}（和 perf 帳列的算式輸入同名）。
+  p（股票池等權平均）不另存，出報表時才從這張表算。A 段的程式照樣跑得動這個庫（只多一張表；C1 回滾時不刪它）。
+  returns 階段自己檢查這張表在不在（has_tables）：不在只讓那個階段失敗，不讓 open_db 擋住其他階段。
 
 為什麼放內建碟、怎麼備份
 - review.sqlite 每 30 分鐘寫一次（WAL），外接的 WD_BLACK 只跑 USB 2.0（約 34 MiB/s，而且和 Time Machine 共用空間），
@@ -55,7 +60,7 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 from urllib.parse import quote
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 BUSY_TIMEOUT_S = 5.0
 
 # 每個版本只新增表（CREATE … IF NOT EXISTS）；舊版本的表永遠不改、不刪
@@ -83,8 +88,18 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         # 只放價格同步鍵（SYNC_KEY）
         "CREATE TABLE IF NOT EXISTS sync_state (k TEXT PRIMARY KEY, v TEXT NOT NULL, at REAL NOT NULL)",
     ),
+    2: (  # C1：成員報酬（PLAN v5 §3）。r 有值 ⇔ 沒有 skip；有值的列一定有基準 b
+        """CREATE TABLE IF NOT EXISTS member_returns (
+            m TEXT NOT NULL, family TEXT NOT NULL, t TEXT NOT NULL, ver_s INTEGER NOT NULL,
+            derive_version INTEGER NOT NULL, code TEXT NOT NULL, h INTEGER NOT NULL, ledger_version INTEGER NOT NULL,
+            r REAL, b REAL, skip TEXT, inputs_json TEXT, frozen_at REAL NOT NULL,
+            CHECK ((skip IS NULL) = (r IS NOT NULL)),
+            CHECK (skip IS NOT NULL OR b IS NOT NULL),
+            PRIMARY KEY (m, family, t, ver_s, derive_version, code, h, ledger_version)) WITHOUT ROWID""",
+    ),
 }
 A_TABLES = ("prices", "pool_days", "pool_rows", "sync_state")
+C1_TABLES = ("member_returns",)
 
 
 class SchemaError(Exception):
@@ -132,18 +147,26 @@ def user_version(conn: sqlite3.Connection) -> int:
 
 
 def ensure_schema(conn: sqlite3.Connection) -> int:
+    """補到目前版本（只跑還沒跑過的 MIGRATIONS）。A 段的表不在（user_version 說有、表卻不在）就丟 SchemaError、
+    整個交易 rollback，不自己修；升版時也一樣先檢查再改 user_version。"""
     current = user_version(conn)
     if current < SCHEMA_VERSION:
         with transaction(conn):
             for version in range(current + 1, SCHEMA_VERSION + 1):
                 for sql in MIGRATIONS[version]:
                     conn.execute(sql)
+            if not has_tables(conn, A_TABLES):
+                raise SchemaError("missing tables")
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         return SCHEMA_VERSION
-    present = {name for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-    if not set(A_TABLES) <= present:
+    if not has_tables(conn, A_TABLES):  # 只看 A 段的表：C1 的表由 returns 階段自己看（不在只讓那個階段失敗）
         raise SchemaError("missing tables")
     return current  # 比程式新也照跑（之後的段只加表）
+
+
+def has_tables(conn: sqlite3.Connection, names) -> bool:
+    present = {name for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    return set(names) <= present
 
 
 def get_state(conn: Optional[sqlite3.Connection], key: str) -> Optional[tuple[dict, float]]:
@@ -272,13 +295,16 @@ def existing_prices(conn: Optional[sqlite3.Connection], codes: dict[str, list[st
     return out
 
 
-def _is_busy(exc: BaseException) -> bool:
-    """DbBusy，或盤勢 job 被殺留下 hot journal（mode=ro 讀不了，等它下一輪收拾）：都不算失敗。"""
+def is_busy(exc: BaseException) -> bool:
+    """DbBusy，或盤勢 job 被殺留下 hot journal（mode=ro 讀不了，等它下一輪收拾）：都不算失敗（價格、成員報酬共用）。"""
     import stock_db_ro
 
     if isinstance(exc, stock_db_ro.DbBusy):
         return True
     return isinstance(exc, stock_db_ro.DbUnavailable) and str(exc.kind).startswith("sqlite_readonly_rollback")
+
+
+_is_busy = is_busy
 
 
 def prices_stage(ctx) -> dict:

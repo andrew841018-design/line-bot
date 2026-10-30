@@ -6,7 +6,7 @@ Andrew 10/28 要股票推薦「定期回測（週/月/季/年）……每週 dis
 
 launchd（com.andrew.stock-picks-review）每 30 分鐘、以及三個狀態檔一變就叫一次：
 
-  python jobs/stock_picks_review.py                        一輪：封存 → 池子紀錄 → 價格 → 週報
+  python jobs/stock_picks_review.py                        一輪：封存 → 池子紀錄 → 價格 → 成員報酬（C1）→ 週報
   python jobs/stock_picks_review.py --dry-run              只看不寫：不拿鎖、不建任何檔，review.sqlite 用 immutable 唯讀
                                                            （不讀 -wal：job 正在寫時可能讀到舊資料或讀不到，只供診斷）
   python jobs/stock_picks_review.py --import-archive DIR   一次性匯入手動封存（stock_picks_tw.json.<ts>.gz 等）
@@ -85,7 +85,7 @@ TPE = ZoneInfo("Asia/Taipei")
 EXIT_OK = 0
 EXIT_FAILED = 1  # 這一輪有階段失敗或逾時（launchctl list 看得到）
 EXIT_CONFIG = 2  # state/ 或自己的目錄、鎖檔不安全
-STAGE_NAMES = ("archive", "pool", "prices", "weekly")
+STAGE_NAMES = ("archive", "pool", "prices", "returns", "weekly")
 FAILED_STATUSES = ("error", "timeout")
 
 _ENUM_RE = re.compile(r"[A-Za-z0-9_.:/\-]{0,64}")
@@ -567,6 +567,12 @@ def _stage_prices(ctx: Context) -> dict:
     return rdb.prices_stage(ctx)
 
 
+def _stage_returns(ctx: Context) -> dict:
+    from jobs import stock_picks_review_returns as returns
+
+    return returns.returns_stage(ctx)
+
+
 def _stage_weekly(ctx: Context) -> dict:
     from jobs import stock_picks_review_weekly as weekly
 
@@ -575,7 +581,8 @@ def _stage_weekly(ctx: Context) -> dict:
 
 Stage = tuple[str, Callable[[Context], dict]]
 DEFAULT_STAGES: tuple[Stage, ...] = (
-    ("archive", _stage_archive), ("pool", _stage_pool), ("prices", _stage_prices), ("weekly", _stage_weekly),
+    ("archive", _stage_archive), ("pool", _stage_pool), ("prices", _stage_prices), ("returns", _stage_returns),
+    ("weekly", _stage_weekly),
 )
 
 
