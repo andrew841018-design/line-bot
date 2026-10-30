@@ -49,7 +49,8 @@ _BLOCKS = frozenset({
 # Charset labels as browsers read them (WHATWG): Taiwan's big5 pages carry cp950 characters.
 _LABELS = {
     "big5": "cp950", "x-big5": "cp950", "gb2312": "gbk", "gb_2312-80": "gbk", "x-gbk": "gbk",
-    "iso-8859-1": "cp1252", "latin1": "cp1252", "us-ascii": "cp1252", "ascii": "cp1252",
+    "iso-8859-1": "cp1252", "latin1": "cp1252", "latin-1": "cp1252", "us-ascii": "cp1252", "ascii": "cp1252",
+    "iso-8859-9": "cp1254", "latin5": "cp1254",
     "shift_jis": "cp932", "sjis": "cp932", "euc-kr": "cp949", "ks_c_5601-1987": "cp949",
 }
 # Only web encodings: a page may declare any codec Python knows, and some decode in quadratic

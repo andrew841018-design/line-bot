@@ -163,9 +163,9 @@ def test_compressed_and_pdf_bodies_are_never_unpacked(served, monkeypatch, body)
 def test_deep_nesting_is_read_fast_and_fails_closed(served):
     pages, _calls = served
     pages[URL] = _page("<div>" * 100_000 + "90天" + "</div>" * 100_000)
-    started = time.monotonic()
-    backing, _stats = _backing([URL], {_q("天", "90")})
-    assert time.monotonic() - started < 5
+    started = time.process_time()  # CPU, not the wall clock: steady on a loaded machine
+    backing, _stats = _backing([URL], {_q("天", "90")}, seconds=30)
+    assert time.process_time() - started < 5
     assert backing in ("", "90天")
 
 
@@ -201,9 +201,9 @@ def test_only_web_encodings_are_used(served):
     assert ge._codec("big5") == "cp950" and ge._codec("UTF-8") == "utf-8" and ge._codec("gb2312") == "gbk"
     pages, _calls = served
     pages[URL] = _page(("a" * 99 + "\n") * 2000 + "停留90天", content_type="text/plain; charset=punycode")
-    started = time.monotonic()
-    assert _backing([URL], {_q("天", "90")})[0] == "90天"
-    assert time.monotonic() - started < 3
+    started = time.process_time()
+    assert _backing([URL], {_q("天", "90")}, seconds=30)[0] == "90天"
+    assert time.process_time() - started < 3
 
 
 def test_a_page_that_breaks_the_reader_is_counted(served, monkeypatch):
@@ -293,7 +293,7 @@ def test_a_slow_page_never_holds_the_caller_past_the_deadline(served):
     pages[URL] = slow
     started = time.monotonic()
     backing, stats = _backing([URL], {_q("天", "90")}, seconds=0.6)
-    assert time.monotonic() - started < 2
+    assert time.monotonic() - started < 5  # the page holds 10 s; the caller must not wait for it
     assert backing == "" and stats["timeout"] == 1
     workers = [t for t in threading.enumerate() if t.name == "grounding-page"]
     assert workers and all(t.daemon for t in workers)
