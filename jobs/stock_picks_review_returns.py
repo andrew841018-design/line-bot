@@ -170,16 +170,15 @@ def family_of(market: str, rule: str) -> Optional[str]:
     return None
 
 
-def _calendar_symbols(market: str) -> tuple[str, ...]:
-    import stock_db_ro
-
-    return (stock_db_ro.TW_CALENDAR_SYMBOL,) if market == "tw" else tuple(stock_db_ro.US_CALENDAR_SYMBOLS)
+# 交易日的代號：台股看加權指數，美股看三檔 ETF 的聯集。和 stock_db_ro.TW_CALENDAR_SYMBOL／US_CALENDAR_SYMBOLS 同一組
+# （有測試對照）；放常數、不 import stock_db_ro：週報的【資料收集】也用這個日曆，不能因為 stock_db_ro 壞了就組不出來。
+CALENDAR_SYMBOLS = {"tw": ("TAIEX",), "us": ("SPY", "VOO", "QQQ")}
 
 
 def store_calendar(conn, market: str, since: Optional[str] = None) -> list[str]:
-    """價格庫裡的交易日：台股 TAIEX、美股 SPY／VOO／QQQ 任一檔有收盤的日子（和 stock_db_ro 的日曆同一組代號）。
+    """價格庫裡的交易日：台股 TAIEX、美股 SPY／VOO／QQQ 任一檔有收盤的日子（CALENDAR_SYMBOLS）。
     週報（weekly.trading_days，選版用的 E）也用這個。"""
-    symbols = _calendar_symbols(market)
+    symbols = CALENDAR_SYMBOLS[market]
     marks = ",".join("?" * len(symbols))
     sql = f"SELECT DISTINCT d FROM prices WHERE m = ? AND code IN ({marks})"
     params: list[Any] = [market, *symbols]

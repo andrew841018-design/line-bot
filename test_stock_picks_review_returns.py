@@ -1027,3 +1027,9 @@ def test_a_full_run_never_calls_bot_write_functions_or_locks(paths, monkeypatch)
     assert "家人看到的舊五條件（10/1–10/1 推薦，只和 0050 比）" in text  # 真的讀了帳
     assert "這週算不出來" not in text and "成績帳讀不到" not in text and "不在這個 bot 目錄" not in text
     assert calls == []
+
+
+def test_calendar_symbols_match_stock_db_ro():
+    """job 自己的日曆代號（週報也用，所以不 import stock_db_ro）要和盤勢 DB 的日曆同一組。"""
+    assert returns.CALENDAR_SYMBOLS == {"tw": (stock_db_ro.TW_CALENDAR_SYMBOL,),
+                                        "us": tuple(stock_db_ro.US_CALENDAR_SYMBOLS)}
