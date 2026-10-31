@@ -20,7 +20,8 @@ returns 階段（價格之後、週報之前；和其他階段一樣各自 try�
   FREEZE 就寫入（r、b、skip、算式輸入），WAIT 留到下一輪。凍結後不改（ON CONFLICT DO NOTHING）。
 - 一定還沒到期的先略過、不載入（審查 C1 r2#4、r4#4）：T_h 還不在日曆上（_sessions_to > 0）時，evaluate 的第一個檢查
   一定回 not_due。版本層看最快到期的那個 h（not_due_versions 數版本），成員層看自己的 h（not_due_members 數
-  (成員, h)）。waiting＝評了但 perf 還在等的列（價格、除權息、日曆，以及 T_h 已在日曆上、還在緩衝期內的 not_due）。
+  (成員, h)）。waiting＝評了但 perf 還在等的列（價格、除權息、日曆、隔離，以及 not_due：T_h 已在日曆上但還在緩衝
+  期內，或美股那一檔／SPY 當天的批次還沒寫）。
 - c0 是 NULL 的成員（池子紀錄的 excluded:no_close，例如美股 ⚪ 拿不到 D 收盤）：結果一定是 missing（不編數字、不拿
   後來補到的收盤回填，impl r3#6），所以不呼叫 perf.evaluate，T_h 一在日曆上（過了預濾）就直接記 skip＝missing，不等
   settle（r、b、算式輸入都不記；審查 C1 r1#3、第 2 輪 r4#1：美股 ⚪ 連自己的收盤都沒有，perf 會一路回 not_due 到
