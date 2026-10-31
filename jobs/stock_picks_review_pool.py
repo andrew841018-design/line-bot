@@ -12,7 +12,8 @@
 
 池子紀錄（review.sqlite 的 pool_days／pool_rows；冪等鍵 (m, rule, t, ver_s, derive_version)，ver_s＝round(computed_at)）
 三族的名字一律是 tw_v1、tw_ai、us（FAMILY_*；last_run 的 last_t、週報、spool 檔名、背景規則選單都用這三個）。
-各族在 pool_days 裡怎麼找：FAMILY_WHERE（last_t 與週報共用）。
+三族的名稱、順序、市場、基準與在 pool_days 裡怎麼找（where）只有一張表：FAMILIES（週報兩段、returns、last_t 共用；
+FAMILY_WHERE 是從它導出的 (族, 條件)）。
 - tw_v1（舊規則，對照組）：主快照 universe 的 50 檔（pool 多放的常問股 0050 不算成員）；flags＝checks_of、
   values＝_facts_json，走勢就是主池的；c0＝listed 收盤。
 - tw_ai（AI 相關股，rule＝ai_v1…）簡版：成員＝AI 狀態的 universe.codes，配同一個 T 的主快照（computed_at 不晚於 AI
@@ -86,16 +87,29 @@ AI_HISTORY_TAIL_BYTES = 256 * 1024  # AI 歷史檔只讀最後這一段（一天
 
 TW_OLD_RULE = "v1"  # 舊規則沒有 rule 欄位（和 stock_picks_perf.TW_OLD_RULE 同字）
 MEMBER = "member"
+FROZEN = "frozen"  # C2 冷凍的成員（pool_rows.status）：股票池的成員報酬、p 都不算它
 NO_CLOSE = "excluded:no_close"
 NO_FACTS = "excluded:no_facts"
 SIMPLE, SPOOL = "simple", "spool"  # pool_days.origin
 FAMILY_V1, FAMILY_AI, FAMILY_US = "tw_v1", "tw_ai", "us"
-# 各族在 pool_days 裡的條件（last_t 與週報共用）
-FAMILY_WHERE = (
-    (FAMILY_V1, "m = 'tw' AND rule = 'v1'"),
-    (FAMILY_AI, "m = 'tw' AND rule LIKE 'ai!_%' ESCAPE '!'"),
-    (FAMILY_US, "m = 'us'"),
+
+
+@dataclass(frozen=True)
+class Family:
+    key: str  # tw_ai｜us｜tw_v1
+    name: str  # 週報上的名稱（【資料收集】、【推薦成績】同一個）
+    market: str  # tw｜us（日曆、價格用哪個市場）
+    bench: str  # 同期基準（和 stock_picks_perf.TW_BENCHMARK／US_BENCHMARK 同字）
+    where: str  # 這一族在 pool_days／pool_rows 裡的條件
+
+
+# 三族唯一的一張表：週報兩段的名稱與順序、returns 的市場與基準、last_t 都從這裡來
+FAMILIES = (
+    Family(FAMILY_AI, "台股 AI 相關股", "tw", "0050", "m = 'tw' AND rule LIKE 'ai!_%' ESCAPE '!'"),
+    Family(FAMILY_US, "美股", "us", "SPY", "m = 'us'"),
+    Family(FAMILY_V1, "台股舊五條件（對照組）", "tw", "0050", "m = 'tw' AND rule = 'v1'"),
 )
+FAMILY_WHERE = tuple((family.key, family.where) for family in FAMILIES)  # (族, 條件)：既有呼叫端用
 
 
 @dataclass(frozen=True)
@@ -988,7 +1002,7 @@ def _trend_label_ok(value) -> bool:
 
 
 def _status_ok(value) -> bool:
-    if value in (MEMBER, "frozen"):
+    if value in (MEMBER, FROZEN):
         return True
     return isinstance(value, str) and value.startswith("excluded:") and bool(_REASON_RE.fullmatch(value[9:]))
 

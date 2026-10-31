@@ -6,8 +6,10 @@
   （token_weekly_report 的 _queued／_drop 模式；暫存檔寫在 job 自己的 drafts/）。
   週一到週六還沒送的上週那份照樣補送；週日 20:00 前不補（同一天晚上就有新的一份，不然一天收到兩份，審查 r3#5）。
 - 內容是給 Andrew 看的純文字（relay 照行切成每段 1,890 字以內）。整份最多 REPORT_MAX_CHARS 字（三段以內）；
-  A 段的收集狀態加上 C1 的成績（三族 × 4 個天數，固定的行數）平常約兩段。數字全部由程式從 review.sqlite、
-  盤勢 DB、推薦成績檔與成績帳算出來；固定的只有各段的檢查點日期（PLAN §1 的排程）。
+  A 段的收集狀態加上 C1 的成績（三族加上家人看到的舊五條件 × 4 個天數，固定的行數）平常約兩段。數字全部由程式從
+  review.sqlite、盤勢 DB、推薦成績檔與成績帳算出來；固定的只有各段的檢查點日期（PLAN §1 的排程）。
+- 三族的名稱與順序（台股 AI 相關股、美股、台股舊五條件（對照組））和【推薦成績】同一張表：
+  stock_picks_review_pool.FAMILIES。
 - C1 的【推薦成績】由 stock_picks_review_returns.report_lines 組（家人看到的推薦讀 perf 帳、舊五條件的背景日與股票池
   基準讀 member_returns）；它出錯（例如 perf import 不了）只把那一段換成一行說明，週報照送。
 - 推薦成績卡只讀 state/stock_picks_perf.json 的摘要（唯讀，不呼叫 perf 讀檔：檔案路徑由 job 注入（測試指到暫存目錄），
@@ -35,17 +37,8 @@ TPE = ZoneInfo("Asia/Taipei")
 FIRST_SUNDAY = date(2026, 11, 1)
 SEND_HOUR = 20
 NAME_SUFFIX = "stock-picks-weekly"
-MAX_CHARS = 1800  # relay 一則 1,900 字（A 段只有收集狀態時一則就夠）
 REPORT_MAX_CHARS = 5000  # 整份上限：relay 照行切，每段最多 1,890 字，5,000 字一定在三段以內（每行都很短）
 PERF_MAX_BYTES = 1024 * 1024
-
-# (族, 名稱, 日曆用哪個市場)；各族在 pool_days 的條件是 stock_picks_review_pool.FAMILY_WHERE
-FAMILIES = (
-    ("tw_ai", "台股 AI 相關股", "tw"),
-    ("tw_v1", "台股舊規則（對照組）", "tw"),
-    ("us", "美股", "us"),
-)
-CALENDAR_CODES = {"tw": ("TAIEX",), "us": ("SPY", "VOO", "QQQ")}  # 交易日：台股看加權指數，美股看三檔 ETF 的聯集
 
 # 各段的檢查點（PLAN §1；之後的段上線時改這裡的說明）。C1 的成績比較已經上線（週報的【推薦成績】），不再列。
 CHECKPOINTS = (
@@ -87,31 +80,31 @@ def _ymd(day: str) -> str:
 
 # ── 資料（純讀） ──────────────────────────────────────────────────────────────
 def trading_days(conn, market: str) -> list[str]:
-    codes = CALENDAR_CODES[market]
-    marks = ",".join("?" * len(codes))
-    return [d for (d,) in conn.execute(
-        f"SELECT DISTINCT d FROM prices WHERE m = ? AND code IN ({marks}) ORDER BY d", (market, *codes))]
+    """價格庫的交易日（returns.store_calendar：台股 TAIEX、美股 SPY／VOO／QQQ，和 stock_db_ro 的日曆同一組代號）。"""
+    from jobs import stock_picks_review_returns as returns
+
+    return returns.store_calendar(conn, market)
 
 
 def family_status(conn, today: date, calendars: dict[str, list[str]]) -> list[dict]:
     from jobs import stock_picks_review_pool as pool
 
-    where_of = dict(pool.FAMILY_WHERE)
     week_from = (today - timedelta(days=6)).isoformat()
     out = []
-    for key, label, market in FAMILIES:
+    for family in pool.FAMILIES:  # 名稱、順序和【推薦成績】同一張表
         days: set[str] = set()
         by_origin: Counter = Counter()
         for t, origin, n in conn.execute(
-                f"SELECT t, origin, count(*) FROM pool_days WHERE {where_of[key]} GROUP BY t, origin"):
+                f"SELECT t, origin, count(*) FROM pool_days WHERE {family.where} GROUP BY t, origin"):
             days.add(t)
             by_origin[origin] += n
-        info: dict[str, Any] = {"key": key, "label": label, "days": len(days), "simple": by_origin["simple"],
-                                "spool": by_origin["spool"], "first": None, "last": None, "week": 0, "gaps": None}
+        info: dict[str, Any] = {"key": family.key, "label": family.name, "days": len(days),
+                                "simple": by_origin["simple"], "spool": by_origin["spool"], "first": None,
+                                "last": None, "week": 0, "gaps": None}
         if days:
             first, last = min(days), max(days)
             info.update(first=first, last=last, week=sum(1 for d in days if d >= week_from))
-            calendar = calendars[market]
+            calendar = calendars[family.market]
             if calendar and calendar[0] <= first:  # 日曆要涵蓋到第一天才數得出缺漏
                 until = min(last, calendar[-1])
                 info["gaps"] = sum(1 for d in calendar if first <= d <= until and d not in days)
@@ -320,7 +313,7 @@ def performance_lines(ctx, conn, calendars: dict[str, list[str]]) -> list[str]:
 def build_report(ctx, sunday: date) -> str:
     conn = ctx.db()
     today = ctx.today
-    calendars = {market: trading_days(conn, market) for market in CALENDAR_CODES} if conn is not None else {}
+    calendars = {market: trading_days(conn, market) for market in ("tw", "us")} if conn is not None else {}
     families = family_status(conn, today, calendars) if conn is not None else []
     prices = price_status(conn, today) if conn is not None else None
     us_live = (ctx.paths.state_dir / "stock_picks_us.json").exists()

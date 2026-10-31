@@ -76,6 +76,11 @@ def test_schema_is_created_with_user_version_and_wal(paths):
         assert con.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         tables = {name for (name,) in con.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         assert set(rdb.A_TABLES) | set(rdb.C1_TABLES) <= tables
+        # member_returns 的 PK 帶 rule（池子版本的身分）與 calc_version（job 端算法的版本，審查 C1 r2#1、r4#3）
+        info = list(con.execute("PRAGMA table_info(member_returns)"))
+        assert [row[1] for row in sorted(info, key=lambda r: r[5]) if row[5]] == [
+            "m", "family", "rule", "t", "ver_s", "derive_version", "code", "h", "ledger_version", "calc_version"]
+        assert {row[1] for row in info if row[3]} >= {"rule", "calc_version"}  # NOT NULL
     finally:
         con.close()
 

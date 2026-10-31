@@ -31,7 +31,8 @@ launchd（com.andrew.stock-picks-review）每 30 分鐘、以及三個狀態檔�
   --bot-dir 和 --maintenance-dir、而且兩個都不是正式路徑；否則回 EXIT_CONFIG、什麼都不做（審查 impl r2#2）。
 - last_run.json 只放列舉值（階段結果、例外類別、次數、日期、大小；讀回時未來的時間夾回現在）；log 也一樣，
   不寫例外訊息與 traceback（只記例外類別和出事的函式名、行號）。
-- 連續 3 輪失敗：outbox 一天一則短訊（階段＋例外類別）。DbBusy／hot journal 不算失敗。
+- 連續 3 輪失敗：outbox 一天一則短訊（階段＋例外類別）。DbBusy／hot journal 不算失敗；成員報酬（returns）一直 busy
+  也不會連續失敗，所以 last_run 另記 returns_last_ok_at（returns 最後一次 ok 的時間，沒 ok 就沿用上一輪的）。
 - outbox 與 bot 目錄都在呼叫時才算（參數或環境變數 STOCK_PICKS_REVIEW_MAINTENANCE_DIR／
   STOCK_PICKS_REVIEW_BOT_DIR），conftest 一律指到暫存目錄。
 這支程式 import 時不做任何 I/O（只把 bot 目錄放進 sys.path）。
@@ -462,7 +463,7 @@ def read_last_run(path: Path, now: float) -> dict:
         return {}
     if not isinstance(obj, dict):
         return {}
-    for key in ("started_at", "finished_at", "last_success_at"):
+    for key in ("started_at", "finished_at", "last_success_at", "returns_last_ok_at"):
         obj[key] = _clamp(obj.get(key), now)
     failures = obj.get("consecutive_failures")
     valid = isinstance(failures, int) and not isinstance(failures, bool) and failures >= 0
@@ -649,6 +650,9 @@ def run_locked(paths: Paths, *, now: float, stages: Sequence[Stage] = DEFAULT_ST
         except Exception as exc:  # noqa: BLE001 - 短訊發不出去：只記類別
             out["note"] = "error:" + type(exc).__name__
     out["finished_at"] = time.time()
+    # returns 的 busy 不算失敗：一直 busy 時連續失敗數看不出來，每日維護看這個時間超過 1 天沒更新（審查 C1 r2#9）
+    returns_ok = (results.get("returns") or {}).get("status") == "ok"
+    out["returns_last_ok_at"] = out["finished_at"] if returns_ok else previous.get("returns_last_ok_at")
     try:
         data = json.dumps(_clean(out), ensure_ascii=False, sort_keys=True, allow_nan=False).encode("utf-8")
         write_atomic(paths.last_run, data)

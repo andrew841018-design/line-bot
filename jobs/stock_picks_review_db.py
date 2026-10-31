@@ -21,9 +21,14 @@ review.sqlite（state/stock_picks_review/，只有這支 job 寫；WAL）
 - pool_days.market_json：台股 [大盤狀態, 月線乖離‰, 季線乖離‰]；美股 {"level", "b20", "b60"}（SPY）。spool 取代簡版時，
   spool 沒有就沿用簡版的。
 - pool_rows 有 CHECK：status＝member 的列一定有 c0。
-- C1 的表（user_version 2）：member_returns(m, family, t, ver_s, derive_version, code, h, ledger_version, r, b, skip,
-  inputs_json, frozen_at)：股票池每個成員、每個 h 用 perf.evaluate 算出來的報酬（stock_picks_review_returns 寫），
-  凍結後不改（ON CONFLICT DO NOTHING）。inputs_json＝{th, c0, ce, ch, cf, be, bh, bf}（和 perf 帳列的算式輸入同名）。
+- C1 的表（user_version 2）：member_returns(m, family, rule, t, ver_s, derive_version, code, h, ledger_version,
+  calc_version, r, b, skip, inputs_json, frozen_at)：股票池每個成員、每個 h 用 perf.evaluate 算出來的報酬
+  （stock_picks_review_returns 寫），凍結後不改（ON CONFLICT DO NOTHING）。
+  - PK 含 rule（和池子表的版本身分 (m, rule, t, ver_s, derive_version) 一致；family 留給 C2 查詢）、ledger_version
+    （perf 帳的版本）與 calc_version（job 端算法的版本，returns.CALC_VERSION）：任一個升版，舊列留著備查、新版本重算，
+    查詢一律只看目前的版本（審查 C1 r2#1、r4#3）。
+  - inputs_json＝{th, c0, ce, ch, cf, be, bh, bf}（和 perf 帳列的算式輸入同名）；沒有 c0、不等 perf 凍結就直接記
+    missing 的列是 NULL。
   p（股票池等權平均）不另存，出報表時才從這張表算。A 段的程式照樣跑得動這個庫（只多一張表；C1 回滾時不刪它）。
   returns 階段自己檢查這張表在不在（has_tables）：不在只讓那個階段失敗，不讓 open_db 擋住其他階段。
 
@@ -90,12 +95,14 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
     ),
     2: (  # C1：成員報酬（PLAN v5 §3）。r 有值 ⇔ 沒有 skip；有值的列一定有基準 b
         """CREATE TABLE IF NOT EXISTS member_returns (
-            m TEXT NOT NULL, family TEXT NOT NULL, t TEXT NOT NULL, ver_s INTEGER NOT NULL,
+            m TEXT NOT NULL, family TEXT NOT NULL, rule TEXT NOT NULL, t TEXT NOT NULL, ver_s INTEGER NOT NULL,
             derive_version INTEGER NOT NULL, code TEXT NOT NULL, h INTEGER NOT NULL, ledger_version INTEGER NOT NULL,
+            calc_version INTEGER NOT NULL,
             r REAL, b REAL, skip TEXT, inputs_json TEXT, frozen_at REAL NOT NULL,
             CHECK ((skip IS NULL) = (r IS NOT NULL)),
             CHECK (skip IS NOT NULL OR b IS NOT NULL),
-            PRIMARY KEY (m, family, t, ver_s, derive_version, code, h, ledger_version)) WITHOUT ROWID""",
+            PRIMARY KEY (m, family, rule, t, ver_s, derive_version, code, h, ledger_version, calc_version))
+            WITHOUT ROWID""",
     ),
 }
 A_TABLES = ("prices", "pool_days", "pool_rows", "sync_state")
@@ -304,9 +311,6 @@ def is_busy(exc: BaseException) -> bool:
     return isinstance(exc, stock_db_ro.DbUnavailable) and str(exc.kind).startswith("sqlite_readonly_rollback")
 
 
-_is_busy = is_busy
-
-
 def prices_stage(ctx) -> dict:
     """價格庫同步（PLAN §3）。dry-run：照算要改幾筆，不寫、不記鍵。"""
     conn = ctx.db()
@@ -332,7 +336,7 @@ def prices_stage(ctx) -> dict:
     try:
         fetched = fetch_market(ctx.paths.market_db, codes, keep_from)
     except Exception as exc:
-        if _is_busy(exc):
+        if is_busy(exc):
             return {**out, "status": "busy"}
         raise
     existing = existing_prices(conn, codes, keep_from)
