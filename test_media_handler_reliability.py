@@ -640,17 +640,41 @@ def test_outer_media_timeout_does_not_abort_unowned_vision_process(monkeypatch):
     assert aborted == []
 
 
-def test_local_vision_worker_starts_in_background(monkeypatch):
+@pytest.mark.parametrize("state", ["ready", "warming", "parked"])
+def test_local_vision_worker_start_logs_the_boot_state(monkeypatch, caplog, state):
     import main
 
-    started = []
+    calls = []
     fake_vision = types.ModuleType("vision_llm")
-    fake_vision.start_background_worker = lambda: started.append(True) or False
+    fake_vision.start_background_worker_at_boot = lambda: calls.append(True) or state
     monkeypatch.setitem(sys.modules, "vision_llm", fake_vision)
 
-    main._start_local_vision_worker()
+    with caplog.at_level("INFO", logger="line_bot"):
+        main._start_local_vision_worker()
 
-    assert started == [True]
+    assert calls == [True]
+    assert [r.getMessage() for r in caplog.records if r.name == "line_bot"] == [
+        f"local vision worker started ready_now={state == 'ready'} state={state}"
+    ]
+
+
+def test_local_vision_worker_start_failure_logs_the_type_only(monkeypatch, caplog):
+    import main
+
+    def fail():
+        raise RuntimeError("private detail")
+
+    fake_vision = types.ModuleType("vision_llm")
+    fake_vision.start_background_worker_at_boot = fail
+    monkeypatch.setitem(sys.modules, "vision_llm", fake_vision)
+
+    with caplog.at_level("INFO", logger="line_bot"):
+        main._start_local_vision_worker()
+
+    assert [r.getMessage() for r in caplog.records if r.name == "line_bot"] == [
+        "local vision worker start failed type=RuntimeError"
+    ]
+    assert "private detail" not in caplog.text
 
 
 def test_whole_video_pipeline_timeout_keeps_frames_until_background_finishes(

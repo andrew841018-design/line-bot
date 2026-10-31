@@ -49,6 +49,10 @@ def test_forbidden_private_artifact_paths_are_rejected():
         "finetune/data/private.jsonl",
         "runtime/private.sqlite3",
         "runtime/private.db-wal",
+        "state/memory_review.noindex/report_20261030_230000_ab12.md",
+        "state/memory_review.noindex/forget_log.jsonl",
+        "state/fact_hash.key",
+        "state/fact_ledger.jsonl",
     ):
         findings = audit.scan_blob(path, b"safe placeholder")
         assert {finding.category for finding in findings} == {"forbidden_path"}

@@ -725,6 +725,113 @@ def test_an_analysis_the_validator_blocks_drops_only_the_analysis(fake_health):
     assert weekly_summary._with_parent_health(G, FAMILY_TEXT) == f"{FAMILY_TEXT}\n\n🩺 爸媽健康週分析（10/26–11/1）"
 
 
+
+# 2026-10-29：丟掉段落或週分析時各印一行，只有段名、原因、字數（排程檢查從 job 紀錄看得到）
+LONG_ANALYSIS = "🩺 爸媽健康週分析\n" + "爸" * 4880
+LONG_SECTION = "🩺 爸媽這週\n" + "媽" * 4890
+
+
+def test_dropping_the_analysis_prints_one_line_without_the_text(fake_health, capsys):
+    import weekly_summary
+
+    section = fake_health.weekly_section(G)
+    fake_health.weekly_analysis_text = lambda group_id, now=None: LONG_ANALYSIS
+    assert weekly_summary._with_parent_health(G, FAMILY_TEXT) == f"{FAMILY_TEXT}\n\n{section}"
+    total = len(f"{FAMILY_TEXT}\n\n{section}\n\n{LONG_ANALYSIS}")
+    assert capsys.readouterr().out == f"爸媽健康週分析沒接上：合併後超過 4900 字（{total} 字）\n"
+
+
+def test_dropping_both_prints_two_lines_in_order(fake_health, capsys):
+    import weekly_summary
+
+    fake_health.weekly_section = lambda group_id, now=None: LONG_SECTION
+    analysis = fake_health.weekly_analysis_text(G)
+    assert weekly_summary._with_parent_health(G, FAMILY_TEXT) == FAMILY_TEXT
+    both = len(f"{FAMILY_TEXT}\n\n{LONG_SECTION}\n\n{analysis}")
+    alone = len(f"{FAMILY_TEXT}\n\n{LONG_SECTION}")
+    assert capsys.readouterr().out == (
+        f"爸媽健康週分析沒接上：合併後超過 4900 字（{both} 字）\n"
+        f"爸媽健康段落沒接上：合併後超過 4900 字（{alone} 字）\n"
+    )
+
+
+def test_an_analysis_the_validator_blocks_prints_its_size_not_its_text(fake_health, capsys):
+    import weekly_summary
+
+    section = fake_health.weekly_section(G)
+    blocked = "最新數據 3 筆"  # 推播驗證會擋
+    fake_health.weekly_analysis_text = lambda group_id, now=None: blocked
+    assert weekly_summary._with_parent_health(G, FAMILY_TEXT) == f"{FAMILY_TEXT}\n\n{section}"
+    out = capsys.readouterr().out
+    assert out == f"爸媽健康週分析沒接上：沒過推播驗證（{len(blocked)} 字）\n"
+    assert "數據" not in out
+
+
+def test_a_combined_report_the_validator_blocks_says_so(fake_health, monkeypatch, capsys):
+    import weekly_summary
+
+    section, analysis = fake_health.weekly_section(G), fake_health.weekly_analysis_text(G)
+    real = weekly_summary.output_validator.validate_outbound_text
+
+    def blocks_both(text):  # 各自都過、接在一起才擋（假的驗證，只為了走到「合併後沒過推播驗證」）
+        if section in text and analysis in text:
+            return SimpleNamespace(ok=False, text="", reason="synthetic")
+        return real(text)
+
+    monkeypatch.setattr(weekly_summary.output_validator, "validate_outbound_text", blocks_both)
+    assert weekly_summary._with_parent_health(G, FAMILY_TEXT) == f"{FAMILY_TEXT}\n\n{section}"
+    total = len(f"{FAMILY_TEXT}\n\n{section}\n\n{analysis}")
+    assert capsys.readouterr().out == f"爸媽健康週分析沒接上：合併後沒過推播驗證（{total} 字）\n"
+
+
+def test_nothing_dropped_prints_nothing(fake_health, capsys):
+    import weekly_summary
+
+    section, analysis = fake_health.weekly_section(G), fake_health.weekly_analysis_text(G)
+    assert weekly_summary._with_parent_health(G, FAMILY_TEXT) == f"{FAMILY_TEXT}\n\n{section}\n\n{analysis}"
+    assert capsys.readouterr().out == ""
+
+
+def test_only_a_too_long_analysis_prints_one_line(fake_health, capsys):
+    import weekly_summary
+
+    fake_health.weekly_section = lambda group_id, now=None: ""
+    fake_health.weekly_analysis_text = lambda group_id, now=None: LONG_ANALYSIS
+    assert weekly_summary._with_parent_health(G, FAMILY_TEXT) == FAMILY_TEXT
+    total = len(f"{FAMILY_TEXT}\n\n{LONG_ANALYSIS}")
+    assert capsys.readouterr().out == f"爸媽健康週分析沒接上：合併後超過 4900 字（{total} 字）\n"
+
+
+def test_a_too_long_section_in_dm_mode_prints_only_the_section_line(fake_health, capsys):
+    import weekly_summary
+
+    fake_health.weekly_section = lambda group_id, now=None: LONG_SECTION
+    fake_health.weekly_analysis_text = lambda group_id, now=None: None  # 私訊模式沒有週分析
+    assert weekly_summary._with_parent_health(G, FAMILY_TEXT) == FAMILY_TEXT
+    total = len(f"{FAMILY_TEXT}\n\n{LONG_SECTION}")
+    assert capsys.readouterr().out == f"爸媽健康段落沒接上：合併後超過 4900 字（{total} 字）\n"
+
+
+def test_an_empty_week_prints_nothing(fake_health, capsys):
+    import weekly_summary
+
+    fake_health.weekly_section = lambda group_id, now=None: ""
+    fake_health.weekly_analysis_text = lambda group_id, now=None: None
+    assert weekly_summary._with_parent_health(G, FAMILY_TEXT) == FAMILY_TEXT
+    assert capsys.readouterr().out == ""
+
+
+def test_a_builder_that_raises_prints_only_the_err_line(fake_health, capsys):
+    import weekly_summary
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("synthetic")
+
+    section = fake_health.weekly_section(G)
+    fake_health.weekly_analysis_text = boom
+    assert weekly_summary._with_parent_health(G, FAMILY_TEXT) == f"{FAMILY_TEXT}\n\n{section}"
+    assert capsys.readouterr().out == "ERR 爸媽健康週分析（週報照舊）: RuntimeError\n"
+
 def _main_with(weekly_summary, monkeypatch, *, family, bot_rows=(("m1", "__bot__", "一般回覆", 0),)):
     monkeypatch.setattr(weekly_summary, "GROUP_ID", G)
     monkeypatch.setattr(weekly_summary, "line_access_token", lambda: "token")

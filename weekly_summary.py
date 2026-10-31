@@ -310,14 +310,27 @@ def main() -> int:
 
 
 def _health_part(parent_health, name: str, group_id: str, label: str) -> str:
-    """parent_health 的一段（週報段落或週分析）：沒有這個函式、出錯、空的、沒過推播驗證都回 ""。"""
+    """parent_health 的一段（週報段落或週分析）：沒有這個函式、出錯、空的、沒過推播驗證都回 ""。
+
+    2026-10-29：有內容卻沒過推播驗證時印一行（段名和字數，不含內容），排程檢查從 job 紀錄看得到。"""
     try:
         build = getattr(parent_health, name, None)
         text = build(group_id) if callable(build) else None
         if text and output_validator.validate_outbound_text(text).ok:
             return text
+        if text:
+            print(f"{label}沒接上：沒過推播驗證（{len(text)} 字）")
     except Exception as exc:
         print(f"ERR {label}（週報照舊）: {type(exc).__name__}")
+    return ""
+
+
+def _dropped_because(combined: str) -> str:
+    """合併後的週報為什麼不能推：太長、沒過推播驗證；能推回 ""。太長就不驗證，和原本的判斷順序一樣。"""
+    if len(combined) > 4900:
+        return "超過 4900 字"
+    if not output_validator.validate_outbound_text(combined).ok:
+        return "沒過推播驗證"
     return ""
 
 
@@ -327,19 +340,30 @@ def _with_parent_health(group_id: str, family_text: str) -> str:
     2026-10-28（爸媽健康私訊改推群組）：家族主群改推群組之後再接週分析（parent_health.weekly_analysis_text；
     私訊模式它回 None）。段落和週分析各自驗證、各自接上，段落空的也能只接週分析；合併後超過 4900 字或沒過推播
     驗證，先丟週分析、再丟整段健康，最後照原本的家族熱話推（逐字不變）。週報整則沒推時週分析也不推（不單推）。
+
+    2026-10-29：丟掉週分析或段落時各印一行（段名、原因、合併後字數，不含內容），排程檢查從 job 紀錄看得到。
     """
     try:
         import parent_health
 
         section = _health_part(parent_health, "weekly_section", group_id, "爸媽健康段落")
         analysis = _health_part(parent_health, "weekly_analysis_text", group_id, "爸媽健康週分析")
-        for parts in ((section, analysis), (section,)):
-            health = "\n\n".join(part for part in parts if part)
-            if not health:
-                continue
-            combined = f"{family_text}\n\n{health}"
-            if len(combined) <= 4900 and output_validator.validate_outbound_text(combined).ok:
+        health = "\n\n".join(part for part in (section, analysis) if part)
+        if not health:
+            return family_text
+        combined = f"{family_text}\n\n{health}"
+        reason = _dropped_because(combined)
+        if not reason:
+            return combined
+        if analysis:  # 先丟週分析
+            print(f"爸媽健康週分析沒接上：合併後{reason}（{len(combined)} 字）")
+            if not section:
+                return family_text
+            combined = f"{family_text}\n\n{section}"
+            reason = _dropped_because(combined)
+            if not reason:
                 return combined
+        print(f"爸媽健康段落沒接上：合併後{reason}（{len(combined)} 字）")  # 再丟整段健康
         return family_text
     except Exception as exc:
         print(f"ERR 爸媽健康段落（週報照舊）: {type(exc).__name__}")
