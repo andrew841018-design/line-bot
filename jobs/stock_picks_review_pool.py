@@ -110,6 +110,7 @@ FAMILIES = (
     Family(FAMILY_V1, "台股舊五條件（對照組）", "tw", "0050", "m = 'tw' AND rule = 'v1'"),
 )
 FAMILY_WHERE = tuple((family.key, family.where) for family in FAMILIES)  # (族, 條件)：既有呼叫端用
+FAMILY_BY_KEY = {family.key: family for family in FAMILIES}
 
 
 @dataclass(frozen=True)

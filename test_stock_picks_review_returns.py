@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import sqlite3
 import sys
 from collections import Counter
@@ -273,7 +274,8 @@ def test_returns_stage_freezes_due_members_and_skips_what_cannot_be_due(paths):
     assert out["families"] == {"tw_v1": {"evaluated": 5, "frozen": 5, "waiting": 0},
                                "tw_ai": {"evaluated": 0, "frozen": 0, "waiting": 0},
                                "us": {"evaluated": 2, "frozen": 2, "waiting": 0}}
-    assert out["waits"] == {} and (out["capped"], out["out_of_time"], out["unexpected"]) == (False, False, 0)
+    assert out["waits"] == {} and (out["capped"], out["out_of_time"], out["unexpected"], out["eval_errors"]) == (
+        False, False, 0, 0)
     rows = _returns(paths)
     on_time = v["on_time"].ver_s
     assert {k for k in rows if k[0] == "tw_v1"} == {("tw_v1", T, on_time, c, 5) for c in ("2330", "1101", "6666", "9999",
@@ -285,8 +287,8 @@ def test_returns_stage_freezes_due_members_and_skips_what_cannot_be_due(paths):
                                                 "be": 100.0, "bh": 100.0, "bf": 1.0}  # r＝109.2 ÷ 104（E 的收盤）− 1
     assert first["frozen_at"] == NOW
     assert rows[("tw_v1", T, on_time, "6666", 5)]["r"] == 0.0  # DB 沒有的成員：價格庫供價
-    missing = rows[("tw_v1", T, on_time, "9999", 5)]  # 沒有 c0：perf 凍結時（mismatch）一律記 missing，不編數字
-    assert (missing["r"], missing["b"], missing["skip"]) == (None, None, "missing")
+    missing = rows[("tw_v1", T, on_time, "9999", 5)]  # 沒有 c0：T_h 在日曆上就記 missing，不呼叫 perf、不編數字
+    assert (missing["r"], missing["b"], missing["skip"], missing["inputs_json"]) == (None, None, "missing", None)
     assert rows[("tw_v1", T, on_time, "7777", 5)]["skip"] == "mismatch"  # c0 和 DB 的 t 收盤差 > 0.5%（perf 的規則）
     assert not any(k[2] == v["late"].ver_s for k in rows)  # E 收盤那一刻才算出來的版本永遠不算
     assert {(k[0], k[3], k[4]) for k in rows if k[0] == "us"} == {("us", "NVDA", 5), ("us", "AAPL", 5)}
@@ -373,7 +375,8 @@ def test_returns_stage_stops_at_the_time_budget_after_minimum_progress(paths, mo
 
 
 def test_frozen_rows_are_written_as_they_accumulate(paths, monkeypatch):
-    """每滿 INSERT_CHUNK 列就寫一次（審查 C1 r2#5）：評估途中出事（例如 alarm），前面寫好的不白費。"""
+    """每滿 INSERT_CHUNK 列就寫一次（審查 C1 r2#5）：評估途中 alarm 到了（JobTimeout 是 BaseException，逐筆隔離接不到，
+    一路到外層），前面寫好的不白費。"""
     _scenario(paths)
     monkeypatch.setattr(returns, "INSERT_CHUNK", 2)
     real, seen = perf.evaluate, []
@@ -381,13 +384,34 @@ def test_frozen_rows_are_written_as_they_accumulate(paths, monkeypatch):
     def evaluate(cand, data):
         seen.append(cand)
         if len(seen) == 4:
-            raise RuntimeError("stop")
+            raise runner.JobTimeout()
         return real(cand, data)
 
     monkeypatch.setattr(perf, "evaluate", evaluate)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(runner.JobTimeout):
         _stage(paths)
     assert len(_returns(paths)) == 2  # 前兩列已經寫進去；第三列還在記憶體裡、跟著例外丟掉
+
+
+def test_one_candidate_that_breaks_evaluate_does_not_stop_the_rest(paths, monkeypatch):
+    """perf.evaluate 自己丟例外：只跳過那一筆，排在它後面的照評、照寫；階段記 error（那個例外類別），照樣走連續失敗
+    短訊（第 2 輪 r2#G）。"""
+    v = _scenario(paths)
+    real = perf.evaluate
+
+    def evaluate(cand, data):
+        if cand.code == "6666":  # 排在 1101、2330 後面，7777、AAPL、NVDA 前面
+            raise KeyError("boom")
+        return real(cand, data)
+
+    monkeypatch.setattr(perf, "evaluate", evaluate)
+    out = _stage(paths)
+    assert (out["status"], out["error"], out["eval_errors"], out["frozen"]) == ("error", "KeyError", 1, 6)
+    assert out["where"].startswith("test_stock_picks_review_returns:evaluate:")  # 只有程式位置，沒有例外訊息
+    assert out["evaluated"] == out["frozen"] + out["waiting"] + out["unexpected"] + out["eval_errors"] == 7
+    rows = _returns(paths)
+    assert {k[3] for k in rows} == {"1101", "2330", "7777", "9999", "AAPL", "NVDA"}  # 6666 之後的照樣凍結
+    assert ("tw_v1", T, v["on_time"].ver_s, "6666", 5) not in rows
 
 
 def test_returns_stage_skips_other_ledger_versions(paths, monkeypatch):
@@ -453,6 +477,34 @@ def test_unexpected_perf_row_is_skipped_and_fails_the_stage(paths, monkeypatch):
     assert "階段：returns" in note and "類別：UnexpectedPerfRow" in note
 
 
+OLD_MEMBER_RETURNS = """CREATE TABLE member_returns (
+    m TEXT NOT NULL, family TEXT NOT NULL, t TEXT NOT NULL, ver_s INTEGER NOT NULL,
+    derive_version INTEGER NOT NULL, code TEXT NOT NULL, h INTEGER NOT NULL, ledger_version INTEGER NOT NULL,
+    r REAL, b REAL, skip TEXT, inputs_json TEXT, frozen_at REAL NOT NULL,
+    PRIMARY KEY (m, family, t, ver_s, derive_version, code, h, ledger_version)) WITHOUT ROWID"""  # ec5f14a 的結構
+
+
+def test_an_old_shape_member_returns_is_a_schema_error_not_a_query_error(paths):
+    """migration 2 原地改之前建的表（沒有 rule、calc_version）：returns 記 SchemaError、dry-run 回 skipped:schema、
+    週報那一段也是 SchemaError（只換成一行說明），不是查詢丟的籠統 OperationalError（第 2 輪 r2#H）。"""
+    _scenario(paths)
+    con = sqlite3.connect(paths.db)
+    con.execute("DROP TABLE member_returns")
+    con.execute(OLD_MEMBER_RETURNS)
+    con.commit()
+    con.close()
+    with pytest.raises(rdb.SchemaError, match="member_returns columns"):
+        _stage(paths)
+    assert _stage(paths, dry_run=True) == {"status": "skipped:schema"}
+    with pytest.raises(rdb.SchemaError, match="member_returns columns"):
+        _performance(paths)
+    ctx = _ctx(paths, SUNDAY)
+    try:
+        assert weekly.performance_lines(ctx, ctx.db(), {}) == ["【推薦成績】這週算不出來（SchemaError），其他內容照常"]
+    finally:
+        ctx.close()
+
+
 def test_returns_stage_needs_its_table_in_a_real_run(paths):
     rdb.open_db(paths.db).close()
     con = sqlite3.connect(paths.db)
@@ -476,9 +528,9 @@ def test_c0_none_member_is_recorded_missing_even_if_perf_could_value_it():
                            NOW)
 
 
-def test_c0_less_member_is_frozen_missing_once_perf_stops_saying_not_due(paths):
-    """沒有 c0 的成員結果一定是 missing：perf 不再回 not_due（這裡是還沒 settle 的 WAIT price）就直接記，不等 T_h 之後
-    10 個交易日（審查 C1 r1#3）。只有這條路的列沒有算式輸入（inputs_json 是 NULL）。"""
+def test_c0_less_member_is_recorded_missing_as_soon_as_t_h_is_on_the_calendar(paths):
+    """沒有 c0 的成員結果一定是 missing：T_h 一在日曆上（過了預濾）就記，不呼叫 perf、不等 T_h 之後 10 個交易日（審查
+    C1 r1#3、第 2 輪 r4#1）。perf 自己這一輪還在等（台股：WAIT price）；這條路的列沒有算式輸入（inputs_json 是 NULL）。"""
     _market(paths)
     v = _version("tw", "v1", T, ts("2026-10-02", 5, 20), {"2330": 100.0, "5555": None}, picks=("2330",))
     _write(paths, v)
@@ -495,7 +547,35 @@ def test_c0_less_member_is_frozen_missing_once_perf_stops_saying_not_due(paths):
     rows = _returns(paths)
     row = rows[("tw_v1", T, v.ver_s, "5555", 5)]
     assert (row["r"], row["b"], row["skip"], row["inputs_json"]) == (None, None, "missing", None)
-    assert ("tw_v1", T, v.ver_s, "5555", 20) not in rows  # 20 日還沒到期（not_due）：照樣等
+    assert ("tw_v1", T, v.ver_s, "5555", 20) not in rows  # 20 日的 T_h 還不在日曆上：照樣等
+
+
+def test_us_member_without_c0_or_any_close_is_missing_before_settle(paths):
+    """美股 ⚪：沒有 c0、哪裡都沒有收盤。perf 在 settle 前一直回第二種 not_due（那一檔的批次還沒寫，stock_picks_perf
+    的美股分支），舊的「不再回 not_due 才記」永遠等不到；現在 T_h 一在日曆上就記 missing，同一輪其他成員凍結後那一版的
+    p 就算得出來（第 2 輪 r4#1、r1#1、r3#1）。"""
+    _market(paths)
+    market = Market(paths.market_db)
+    market.closes("us", "AMD", {d: 100.0 if d < "2026-10-09" else 110.0 for d in DAYS})  # 5 日 +10%
+    market.closes("us", "MSFT", {d: 300.0 for d in DAYS})
+    members = {"NVDA": 200.0, "AAPL": 150.0, "AMD": 100.0, "MSFT": 300.0, "ZZZZ": None}
+    v = _version("us", "us_v1", T, ts("2026-10-02", 8), members, picks=("NVDA",))
+    _write(paths, v)
+    conn = rdb.open_db(paths.db)
+    try:
+        cal = returns.market_calendar(conn, "us", "2025-01-01", paths.market_db)
+        assert returns._sessions_to(cal, T, 5) <= -perf.US_BUFFER_SESSIONS  # T_5＋緩衝都在日曆上，還沒 settle
+        cand = perf.Candidate("us", "us_v1", T, v.ver_s, "ZZZZ", None, 5)
+        data = returns.us_market_data(perf, conn, [cand], cal, paths.market_db)
+        assert perf.evaluate(cand, data) == (perf.WAIT, "not_due")  # 舊的規則在這裡永遠不會記
+    finally:
+        conn.close()
+    out = _stage(paths)
+    assert (out["frozen"], out["waiting"], out["evaluated"]) == (5, 0, 5)
+    row = _returns(paths)[("us", T, v.ver_s, "ZZZZ", 5)]
+    assert (row["r"], row["b"], row["skip"], row["inputs_json"]) == (None, None, "missing", None)
+    status, p, dv = _version_p(paths, "us", T, 5)  # 4/5 有值＝80%：(0＋0＋0.1＋0)／4
+    assert (status, dv) == ("ok", 1) and p == pytest.approx(0.025)
 
 
 def test_rows_of_another_rule_or_calc_version_do_not_count(paths):
@@ -746,18 +826,15 @@ def _performance(paths: runner.Paths) -> list[str]:
 
 
 def _report_data(paths: runner.Paths) -> returns.Performance:
-    """report_lines 的資料那一半（同樣的步驟），測試直接看 entries。"""
+    """正式的組裝（returns.report_data，日曆和週報一樣用 weekly.trading_days）：測試直接看 entries。"""
     ctx = _ctx(paths, SUNDAY)
     try:
         conn = ctx.db()
-        versions = {family: returns.family_versions(conn, family, where) for family, where in pool.FAMILY_WHERE}
-        ledger, state = returns.load_ledger(perf, sp, paths.state_dir)
-        assert state == "ok"
-        history = returns.history_rows(perf, sp, paths.state_dir, ctx.today.isoformat())
-        calendars = {m: weekly.trading_days(conn, m) for m in ("tw", "us")}
-        return returns.build_performance(perf, conn, versions, ledger, history, calendars, with_returns=True)
+        report, state = returns.report_data(ctx, conn, {m: weekly.trading_days(conn, m) for m in ("tw", "us")})
     finally:
         ctx.close()
+    assert state == "ok"
+    return report
 
 
 def test_report_compares_live_picks_with_the_pool_and_benchmark(paths, monkeypatch):
@@ -773,7 +850,7 @@ def test_report_compares_live_picks_with_the_pool_and_benchmark(paths, monkeypat
     assert us > ai and lines[us + 1] == "・5 日：紀錄還不夠（目前 3 次）"
     control = lines.index("台股舊五條件（對照組）：背景照算的入選股")  # 只有 T1 的背景日（member_returns）
     assert control > us and lines[control + 1] == "・5 日：紀錄還不夠（目前 3 次）"
-    seen = lines.index("家人看到的舊五條件（10/1–10/1 推薦，只和 0050 比）")  # T0 家人看到的 3 次（帳）
+    seen = lines.index("家人看到的舊五條件（10/1 推薦，只和 0050 比）")  # T0 家人看到的 3 次（帳）
     assert seen > control and lines[seen + 1] == "・5 日：紀錄還不夠（目前 3 次）"
     assert "・1 個推薦日（各族分開數）的推薦和池子紀錄的入選對不上（改用推薦隔天收盤前最後一版）" in lines  # AI T2
     assert "・1 個推薦日（各族分開數）找不到推薦隔天收盤前的池子紀錄（股票池不比）" in lines  # 美股 T1
@@ -821,10 +898,46 @@ def test_control_group_never_takes_a_day_the_family_saw_the_old_rule(paths, monk
     _write(paths, seen_day)
     _insert_returns(paths, "tw_v1", seen_day, 5, {c: (0.01, 0.0, None) for c in v})
     report = _report_data(paths)
-    assert {e.t for e in report.entries["tw_v1"]} == {T1} and not any(e.live for e in report.entries["tw_v1"])
-    seen = report.entries[returns.SEEN_V1]
-    assert {e.t for e in seen} == {T0} and all(e.live and e.p_status == returns.NOT_COMPARED for e in seen)
+    control = report.entries["tw_v1"]  # 背景日：族是 tw_v1、有選版（p_status 不是 not_compared）
+    assert {e.t for e in control} == {T1} and all(e.family == "tw_v1" and e.p_status != returns.NOT_COMPARED
+                                                  for e in control)
+    seen = report.entries[returns.SEEN_V1]  # 家人看到的：族是 SEEN_V1、不和股票池比
+    assert {e.t for e in seen} == {T0} and all(e.family == returns.SEEN_V1 and e.p_status == returns.NOT_COMPARED
+                                               for e in seen)
+    assert report.seen_runs == ((T0, T0),)
     assert report.flags == Counter(version_fallback=1, version_missing=1)  # 家人看到的舊五條件不選版：不多出 flag
+
+
+def test_seen_block_splits_its_days_into_runs_on_the_trading_calendar(paths, monkeypatch):
+    """家人看到的舊五條件：日期照台股交易日分成連續的幾段（第 2 輪 r3#3）。家人 10/1（T0）、10/2 看到舊五條件，之後 AI
+    開了幾天（T1、T2），10/8 AI 又關掉：標題寫「10/1–10/2、10/8」，不是跨過 AI 那幾天的「10/1–10/8」。"""
+    _report_world(paths, monkeypatch)
+    v = ["1101", "1102", "1103"]
+    rows = [json.loads(x) for x in (paths.state_dir / perf.LEDGER_NAME).read_text(encoding="utf-8").splitlines()]
+    rows += [_lrow(day, code, 0.01, 0.0, rule="v1") for day in ("2026-10-02", "2026-10-08") for code in v]
+    _jsonl(paths.state_dir / perf.LEDGER_NAME, rows)
+    lines = [json.loads(x) for x in (paths.state_dir / sp.HISTORY_NAME).read_text(encoding="utf-8").splitlines()]
+    lines += [{"t": day, "market": "neutral", "computed_at": round(ts(day, 16)), "picks": [_pick(c, 20.0) for c in v]}
+              for day in ("2026-10-02", "2026-10-08")]
+    _jsonl(paths.state_dir / sp.HISTORY_NAME, lines)
+    assert _report_data(paths).seen_runs == ((T0, "2026-10-02"), ("2026-10-08", "2026-10-08"))
+    text = _performance(paths)
+    seen = text.index("家人看到的舊五條件（10/1–10/2、10/8 推薦，只和 0050 比）")
+    assert text[seen + 1] == "・5 日 9 次：平均 +1.0%，0050 +0.7%"  # (0.04−0.02＋0.01＋6 × 0.01)／9、(3 × 0.02)／9
+    assert returns.trading_runs(["2026-10-02", "2026-10-05"], CAL) == (("2026-10-02", "2026-10-05"),)  # 週五、週一相鄰
+    assert returns.trading_runs(["2026-10-02", "2026-10-03", "2026-10-05"], CAL) == (  # 週六不在日曆上：自己一段
+        ("2026-10-02", "2026-10-02"), ("2026-10-03", "2026-10-03"), ("2026-10-05", "2026-10-05"))
+
+
+def test_seen_block_without_any_counted_record_is_one_line(paths, monkeypatch):
+    """家人看到的舊五條件每個 h 都還沒有次數（例如全是跳過的列）：和三族一樣只寫一行「還沒有成績」。"""
+    _report_world(paths, monkeypatch)
+    rows = [json.loads(x) for x in (paths.state_dir / perf.LEDGER_NAME).read_text(encoding="utf-8").splitlines()]
+    _jsonl(paths.state_dir / perf.LEDGER_NAME, [{**r, "r": None, "b": None, "skip": "range"} if r["rule"] == "v1" else r
+                                                 for r in rows])
+    lines = _performance(paths)
+    assert "・家人看到的舊五條件（10/1 推薦，只和 0050 比）：還沒有成績" in lines
+    assert not any(line.startswith("家人看到的舊五條件") for line in lines)
 
 
 def test_report_does_not_read_a_ledger_from_another_state_dir(paths, monkeypatch):
@@ -847,7 +960,7 @@ def test_report_says_when_the_ledger_cannot_be_read(paths, monkeypatch):
 
 
 def _entry(t: str, r: float, p_status: str, p: Optional[float]) -> returns.Entry:
-    return returns.Entry("tw_ai", "tw", t, "2330", 5, r, 0.004, None, p_status, p, True)
+    return returns.Entry("tw_ai", "tw", t, "2330", 5, r, 0.004, None, p_status, p)
 
 
 def test_pool_comparison_uses_only_the_entries_that_have_p():
@@ -906,16 +1019,18 @@ def test_weekly_report_keeps_phase_a_content_and_fits_three_chunks(paths, monkey
 def test_largest_possible_report_still_fits_three_chunks():
     """三族加上家人看到的舊五條件、4 個天數都有數字、所有說明行都出現（數字取最長的寫法）：整份週報的 C1 這段加上 A 段
     還是三段以內。"""
-    entries = {family: [returns.Entry(family, "tw", "2026-10-01", "2330", h, -0.987654, 12.3456, None, "ok", -0.5, live)
-                        for h in perf.HORIZONS for live in (True, False) for _ in range(500)]
+    entries = {family: [returns.Entry(family, "tw", "2026-10-01", "2330", h, -0.987654, 12.3456, None, "ok", -0.5)
+                        for h in perf.HORIZONS for _ in range(1000)]
                for family in returns.FAMILY_MARKET}
+    seen_days = weekdays("2026-10-08", "2026-10-31")[::2]  # 家人看到的日子斷成 9 段（最長的標題）
     entries[returns.SEEN_V1] = [returns.Entry(returns.SEEN_V1, "tw", day, "2330", h, -0.987654, 12.3456, None,
-                                              returns.NOT_COMPARED, None, True)
-                                for h in perf.HORIZONS for day in ("2026-10-08", "2026-12-31") for _ in range(500)]
-    entries["tw_ai"].append(returns.Entry("tw_ai", "tw", "2026-10-01", "1", 5, 0.1, 0.1, None, "pending", None, True))
-    entries["us"].append(returns.Entry("us", "us", "2026-10-01", "A", 5, 0.1, 0.1, None, "pool_missing", None, True))
+                                              returns.NOT_COMPARED, None)
+                                for h in perf.HORIZONS for day in seen_days for _ in range(120)]
+    entries["tw_ai"].append(returns.Entry("tw_ai", "tw", "2026-10-01", "1", 5, 0.1, 0.1, None, "pending", None))
+    entries["us"].append(returns.Entry("us", "us", "2026-10-01", "A", 5, 0.1, 0.1, None, "pool_missing", None))
     report = returns.Performance(entries, Counter(version_fallback=999, version_missing=999),
-                                 Counter(compared=99999, diff=99999, oneside=99999))
+                                 Counter(compared=99999, diff=99999, oneside=99999),
+                                 seen_runs=returns.trading_runs(seen_days, weekdays("2026-10-01", "2026-11-30")))
     lines = returns.format_lines(report, "error:PermissionError", perf.HORIZONS)
     assert len(lines) == 1 + 3 * 5 + 5 + 4 + 2  # 標題、三族 × (標題＋4 天)、家人看到的那段、4 行說明、帳、自我檢查
     c1 = "\n".join(lines)
@@ -942,7 +1057,7 @@ def test_pct_and_short_records():
         "+2.9%", "-3.1%", "0.0%", "0.0%", "0.0%", "+1.3%", "—"]
     for value in (0.0294, -0.0305, 0.00451, -0.00451, 0.1235):  # 和家人成績卡的千分位同一種四捨五入
         assert returns._permille(value) == sp._permille(value)
-    stats = returns.stats_of([returns.Entry("us", "us", T, "A", 5, 0.1, 0.0, None, "ok", 0.0, True)] * 4, 5)
+    stats = returns.stats_of([returns.Entry("us", "us", T, "A", 5, 0.1, 0.0, None, "ok", 0.0)] * 4, 5)
     assert returns._h_line(5, stats, "SPY") == "・5 日：紀錄還不夠（目前 4 次）"
 
 
@@ -1013,23 +1128,24 @@ def test_a_full_run_never_calls_bot_write_functions_or_locks(paths, monkeypatch)
             raise AssertionError(f"stock_picks_review must not call {name}")
         return boom
 
-    sp_names = sorted(n for n in dir(sp) if n.startswith(("_commit_", "_append_")) and callable(getattr(sp, n)))
-    assert {"_commit_snapshot", "_commit_ai", "_append_history", "_append_ai_history"} <= set(sp_names)  # 改名時不能默默少
-    for name in ("_write_json_file", "_state_file_lock", *sp_names):
-        monkeypatch.setattr(sp, name, guard("stock_picks." + name))
-    for name in ("update", "backfill_prices", "_append_rows", "_write_library"):  # perf 的鎖就是 sp._state_file_lock
-        monkeypatch.setattr(perf, name, guard("stock_picks_perf." + name))
+    # 照名稱樣式換（第 2 輪 r2#F）：寫入、追加、commit、存檔、清檔、更新、回補，以及任何帶 lock 的。lock 也會碰到 sp 的
+    # Yahoo 冷卻（_block_yahoo、_yahoo_blocked…，名字裡有 block）：只在連網的路徑上，job 一樣不該碰，照樣換。
+    risky = re.compile(r"^_?(write|append|commit|save|sweep|update|backfill)")
+    patched: set[str] = set()
+    for module in (sp, perf):
+        for name in sorted(dir(module)):
+            if callable(getattr(module, name)) and (risky.match(name) or "lock" in name.lower()):
+                monkeypatch.setattr(module, name, guard(f"{module.__name__}.{name}"))
+                patched.add(f"{module.__name__}.{name}")
+    assert {"stock_picks._write_json_file", "stock_picks._state_file_lock", "stock_picks_perf.update",  # 改名時不能默默少
+            "stock_picks_perf.backfill_prices", "stock_picks_perf._append_rows", "stock_picks_perf._write_library",
+            "stock_picks_perf._sweep_stale_tmp"} <= patched
     assert runner.run(paths, now=SUNDAY) == runner.EXIT_OK
     out = _last_run(paths)
     assert out["stages"]["returns"]["status"] == "ok" and out["stages"]["returns"]["frozen"] == 7
     assert out["stages"]["weekly"]["status"] == "queued"
     text = (paths.outbox / "2026-11-01-stock-picks-weekly.md").read_text(encoding="utf-8")
-    assert "家人看到的舊五條件（10/1–10/1 推薦，只和 0050 比）" in text  # 真的讀了帳
+    assert "家人看到的舊五條件（10/1 推薦，只和 0050 比）" in text  # 真的讀了帳
     assert "這週算不出來" not in text and "成績帳讀不到" not in text and "不在這個 bot 目錄" not in text
     assert calls == []
 
-
-def test_calendar_symbols_match_stock_db_ro():
-    """job 自己的日曆代號（週報也用，所以不 import stock_db_ro）要和盤勢 DB 的日曆同一組。"""
-    assert returns.CALENDAR_SYMBOLS == {"tw": (stock_db_ro.TW_CALENDAR_SYMBOL,),
-                                        "us": tuple(stock_db_ro.US_CALENDAR_SYMBOLS)}

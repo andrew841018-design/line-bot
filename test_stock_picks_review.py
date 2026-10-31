@@ -331,6 +331,23 @@ def test_weekly_once_per_week_and_only_the_latest_sunday(ready):
     assert _outbox(ready) == ["2026-11-15-stock-picks-weekly.md"]
 
 
+def test_weekly_data_section_does_not_need_the_c1_module(ready, monkeypatch, settle40):
+    """C1 的模組（returns）import 不了時，週報照樣組得出來：【資料收集】的日曆在 db（缺漏數得出來），只有【推薦成績】
+    換成一行說明（第 2 輪 r3#2、r4#5、r1#3）。同一個程序裡要擋 import：拿掉 jobs 套件上的屬性、sys.modules 放 None。"""
+    import jobs
+
+    runner.run(ready, now=fx.NOW)  # 先收一天（價格庫有日曆）
+    monkeypatch.delattr(jobs, "stock_picks_review_returns", raising=False)
+    monkeypatch.setitem(sys.modules, "jobs.stock_picks_review_returns", None)
+    ctx = runner.Context(paths=ready, now=SUNDAY_EVENING)
+    try:
+        text = weekly.build_report(ctx, weekly.report_sunday(SUNDAY_EVENING))
+    finally:
+        ctx.close()
+    assert "・台股 AI 相關股：記到 10/27，共 1 個交易日（本週 +1），沒有缺漏" in text
+    assert "【推薦成績】這週算不出來（ModuleNotFoundError），其他內容照常" in text  # 真的擋到了
+
+
 def test_sunday_before_eight_does_not_send_last_weeks_late_report(ready):
     """Mac 從 11/01 18:00 睡到 11/08 15:00（審查 r3#5）：15:00 不補 11/01 那份，20:00 只送 11/08 這份。"""
     runner.run(ready, now=fx.ts(2026, 11, 8, 15))

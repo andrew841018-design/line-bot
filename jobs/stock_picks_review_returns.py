@@ -20,11 +20,12 @@ returns 階段（價格之後、週報之前；和其他階段一樣各自 try�
   FREEZE 就寫入（r、b、skip、算式輸入），WAIT 留到下一輪。凍結後不改（ON CONFLICT DO NOTHING）。
 - 一定還沒到期的先略過、不載入（審查 C1 r2#4、r4#4）：T_h 還不在日曆上（_sessions_to > 0）時，evaluate 的第一個檢查
   一定回 not_due。版本層看最快到期的那個 h（not_due_versions 數版本），成員層看自己的 h（not_due_members 數
-  (成員, h)）；waiting 只剩真的在等價格、除權息、日曆的列。
-- c0 是 NULL 的成員（池子紀錄的 excluded:no_close，例如美股 ⚪ 拿不到 D 收盤）：照樣交給 evaluate（close＝None），
-  只要它不再回 not_due，就直接記 skip＝missing，不等 settle（r、b、算式輸入都不記，審查 C1 r1#3）；perf 先凍結的也一律記
-  missing（不編數字、不拿後來補到的收盤回填，impl r3#6）。所以它算在 p 的分母裡（有值的成員要 ≥ 80%），不是默默從
-  股票池拿掉。
+  (成員, h)）。waiting＝評了但 perf 還在等的列（價格、除權息、日曆，以及 T_h 已在日曆上、還在緩衝期內的 not_due）。
+- c0 是 NULL 的成員（池子紀錄的 excluded:no_close，例如美股 ⚪ 拿不到 D 收盤）：結果一定是 missing（不編數字、不拿
+  後來補到的收盤回填，impl r3#6），所以不呼叫 perf.evaluate，T_h 一在日曆上（過了預濾）就直接記 skip＝missing，不等
+  settle（r、b、算式輸入都不記；審查 C1 r1#3、第 2 輪 r4#1：美股 ⚪ 連自己的收盤都沒有，perf 會一路回 not_due 到
+  settle）。member_row 遇到沒有 c0 的照樣強制 missing（防呆）。所以它算在 p 的分母裡（有值的成員要 ≥ 80%），不是默默
+  從股票池拿掉。
 - MarketData（有要算的列才讀盤勢 DB）：
   - 台股：perf.load_tw(…, prices, today, db_path)。prices＝job 的價格庫（700 天，DB tw 沒有的成員也在）← DB tw_all
     ← DB tw：同一天以 DB 為準，順序和 perf 自己組的一樣（tw 優先、再來 tw_all、最後才是自己存的）；DB 的收盤照 perf
@@ -34,15 +35,20 @@ returns 階段（價格之後、週報之前；和其他階段一樣各自 try�
   - 基準 0050、SPY 由 load_tw／load_us 自己加進代號。
 - 兩個市場各自隔離（審查 C1 r3#4）：盤勢 DB 忙碌（DbBusy、hot journal）→ 那個市場這一輪不算，markets＝busy（不算
   失敗）；其他讀不到的 → markets＝error:<例外類別>，也只跳過那個市場。另一個市場照算、照寫。
-- perf 回了看不懂的一列（member_row 丟 ValueError）：那一列不寫、記 unexpected，其他列照寫（審查 C1 r1#4）。
-- 階段狀態：dry-run 一律 dry_run；否則 error（error＝第一個出錯的市場的例外類別，沒有才是 UnexpectedPerfRow）> busy
-  > ok。error 照樣算失敗、走連續失敗短訊。
+- 一筆一筆隔離：perf.evaluate 自己丟例外 → 那一筆跳過、記 eval_errors（第 2 輪 r2#G）；perf 回了看不懂的凍結列
+  （member_row 丟 ValueError）→ 那一列不寫、記 unexpected（審查 C1 r1#4）。其他候選照評、照寫，一筆壞的不會讓排在
+  後面的永遠評不到。
+- member_returns 的 PK 欄位不是 rdb.MEMBER_RETURNS_KEY（舊結構的表）：丟 rdb.SchemaError（dry-run 回 skipped:schema），
+  不讓查詢丟籠統的 OperationalError（第 2 輪 r2#H）。
+- 階段狀態：dry-run 一律 dry_run；否則 error（error＝第一個出錯的市場的例外類別，沒有才是 evaluate 的例外類別，再來
+  才是 UnexpectedPerfRow）> busy > ok。error 照樣算失敗、走連續失敗短訊。
 - alarm 預算：這一階段最多用 BUDGET_S 秒（每個版本之間、每評 CHECK_EVERY 筆檢查一次），到了就停（out_of_time）；一輪最多
   載入 MAX_CANDIDATES 筆（記憶體上限，capped；升 calc_version、帳升版要整批重算時才會碰到）。剩下的下一輪再來。
   版本照「最快到期的那個 h 的 T_h 在日曆上的位置」排、成員列照自己的 T_h 排：快到期的先算。凍結的列每滿 INSERT_CHUNK
   就寫一次（alarm 在評估途中觸發，前面算好的也不白費，審查 C1 r2#5）。
-- last_run 只放數字與列舉值：evaluated／frozen／waiting（總數與各族）、各市場 ok｜busy｜error:<類別>、wait 原因的次數、
-  略過與預算的計數。runner 另記 returns 最後一次 ok 的時間（returns_last_ok_at：busy 不算失敗，一直 busy 靠它看得到）。
+- last_run 只放數字與列舉值：evaluated／frozen／waiting（總數與各族；evaluated＝frozen＋waiting＋unexpected＋
+  eval_errors）、各市場 ok｜busy｜error:<類別>、wait 原因的次數、略過與預算的計數。runner 另記 returns 最後一次 ok 的
+  時間（returns_last_ok_at：busy 不算失敗，一直 busy 靠它看得到）。
 
 p（股票池等權平均；出報表時才算、不另存）
 - 對 (m, 族, rule, t, ver_s, h)：取「每個成員都有 member_returns 列」的最大 derive_version（新的 derive_version 重算到
@@ -58,7 +64,8 @@ p（股票池等權平均；出報表時才算、不另存）
 - 台股舊五條件（對照組）只用背景日（PLAN §6，審查 C1 r1#2、r3#2）：家人那天沒看到舊五條件（帳裡那個 t 沒有釘住 v1）、
   而且有 E 收盤前的 v1 池子版本的 t，用最後一版的入選列的 member_returns。
 - 家人看到的舊五條件（帳裡釘住 v1 的 t，10/08–10/27）另成一段，放最後：不選版、沒有 p，只和 0050 比。一個 t 有沒有
-  釘住 v1 二選一，所以和對照組不重疊。
+  釘住 v1 二選一，所以和對照組不重疊。標題的日期照台股交易日分成連續的幾段（例如 10/8–10/22、11/2：中間 AI 開著的
+  日子不會被算成家人看到舊五條件）；每個 h 都還沒有次數時只寫一行「還沒有成績」（第 2 輪 r1#5、r3#3）。
 - 每段每個 h：次數、平均報酬、0050／SPY 同期都算全部次數；和股票池比只用有 p 的那幾次（同一批推薦）：可比的次數、這幾次
   的推薦平均、股票池平均、贏股票池的次數（r > p）。次數 < 5 寫「紀錄還不夠（目前 n 次）」，可比的次數 < 5 寫「股票池
   可比的紀錄還不夠（目前 k 次）」（審查 C1 r1#1、r3#1）。
@@ -76,7 +83,6 @@ import json
 import logging
 import math
 import os
-import re
 import time
 import traceback
 from collections import Counter
@@ -85,6 +91,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
+from jobs import stock_picks_review_db as rdb
 from jobs import stock_picks_review_pool as pool
 
 log = logging.getLogger("stock_picks_review")
@@ -104,8 +111,7 @@ P_NUM, P_DEN = 4, 5  # 有值的成員 ≥ 4/5（80%）才算 p
 SELF_CHECK_TOLERANCE = 0.001  # 0.1 個百分點
 MAX_PRICE = 1e6  # DB 收盤只收 0 < 收盤 < 1e6 的有限數（和 perf 清 DB 收盤的規則一樣）
 MISSING = "missing"
-NOT_DUE = "not_due"  # perf.evaluate 的 WAIT 原因：T_h（加緩衝）還不在日曆上（perf 沒有這個常數）
-FAMILY_MARKET = {family.key: family.market for family in pool.FAMILIES}
+FAMILY_MARKET = {key: family.market for key, family in pool.FAMILY_BY_KEY.items()}
 SEEN_V1 = "tw_v1_seen"  # 家人看到的舊五條件（帳裡釘住 v1 的 t）：週報另成一段，不是池子的族
 NOT_COMPARED = "not_compared"  # SEEN_V1 的 p_status：不選版、不和股票池比
 _CURRENT_MEMBER = f"status <> '{pool.FROZEN}'"  # 目前的成員（C2 的冷凍股不算）：成員報酬、p 的三條查詢共用
@@ -123,20 +129,7 @@ def _finite(value) -> Optional[float]:
     return number if math.isfinite(number) else None
 
 
-_ISO_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
-
-
-def _iso(value) -> bool:
-    """YYYY-MM-DD 的合法日期（同 stock_picks_review_pool.iso_day；這裡每個收盤都要看，不每次 import）。"""
-    if not isinstance(value, str) or not _ISO_RE.fullmatch(value):
-        return False
-    try:
-        date.fromisoformat(value)
-    except ValueError:
-        return False
-    return True
-
-
+# TODO（審查 C1 第 2 輪 r4#4，延後）：runner._where、pool._failure 也是同一種寫法，之後在 db 放一份共用。
 def _where(exc: BaseException) -> Optional[str]:
     """例外最後發生在哪個函式（模組:函式:行號）；只有程式位置，沒有資料（和 runner 的 _where 同一種寫法）。"""
     frames = traceback.extract_tb(exc.__traceback__)
@@ -153,7 +146,7 @@ def clean_series(table: dict) -> dict:
         clean = {}
         for day, value in (series or {}).items():
             number = _finite(value)
-            if number is not None and 0 < number < MAX_PRICE and _iso(day):
+            if number is not None and 0 < number < MAX_PRICE and pool.iso_day(day) is not None:
                 clean[day] = number
         out[code] = clean
     return out
@@ -162,39 +155,22 @@ def clean_series(table: dict) -> dict:
 def family_of(market: str, rule: str) -> Optional[str]:
     """perf 帳的 (m, rule) → 族：v1 → tw_v1、ai_* → tw_ai、us 的任何 rule → us（和 pool.FAMILIES 的 where 一致，有測試）。"""
     if market == "us":
-        return "us"
-    if market == "tw" and rule == "v1":
-        return "tw_v1"
+        return pool.FAMILY_US
+    if market == "tw" and rule == pool.TW_OLD_RULE:
+        return pool.FAMILY_V1
     if market == "tw" and isinstance(rule, str) and rule.startswith("ai_"):
-        return "tw_ai"
+        return pool.FAMILY_AI
     return None
 
 
-# 交易日的代號：台股看加權指數，美股看三檔 ETF 的聯集。和 stock_db_ro.TW_CALENDAR_SYMBOL／US_CALENDAR_SYMBOLS 同一組
-# （有測試對照）；放常數、不 import stock_db_ro：週報的【資料收集】也用這個日曆，不能因為 stock_db_ro 壞了就組不出來。
-CALENDAR_SYMBOLS = {"tw": ("TAIEX",), "us": ("SPY", "VOO", "QQQ")}
-
-
-def store_calendar(conn, market: str, since: Optional[str] = None) -> list[str]:
-    """價格庫裡的交易日：台股 TAIEX、美股 SPY／VOO／QQQ 任一檔有收盤的日子（CALENDAR_SYMBOLS）。
-    週報（weekly.trading_days，選版用的 E）也用這個。"""
-    symbols = CALENDAR_SYMBOLS[market]
-    marks = ",".join("?" * len(symbols))
-    sql = f"SELECT DISTINCT d FROM prices WHERE m = ? AND code IN ({marks})"
-    params: list[Any] = [market, *symbols]
-    if since is not None:
-        sql += " AND d >= ?"
-        params.append(since)
-    return [d for (d,) in conn.execute(sql + " ORDER BY d", params) if _iso(d)]
-
-
 def market_calendar(conn, market: str, since: str, market_db: Path) -> tuple[str, ...]:
-    """DB 的日曆（stock_db_ro.tw_calendar／us_calendar）∪ 價格庫的日曆：DB 只留約 290 根，價格庫留 700 天。"""
+    """DB 的日曆（stock_db_ro.tw_calendar／us_calendar）∪ 價格庫的日曆（rdb.store_calendar）：DB 只留約 290 根，
+    價格庫留 700 天。只留合法日期。"""
     import stock_db_ro
 
     loader = stock_db_ro.tw_calendar if market == "tw" else stock_db_ro.us_calendar
-    days = {d for d in loader(since, path=market_db) if _iso(d)} | set(store_calendar(conn, market, since))
-    return tuple(sorted(days))
+    days = {d for d in loader(since, path=market_db) if pool.iso_day(d) is not None}
+    return tuple(sorted(days | set(rdb.store_calendar(conn, market, since))))
 
 
 def store_prices(conn, market: str, codes: Iterable[str], since: str) -> dict[str, dict]:
@@ -323,7 +299,7 @@ def member_row(perf, family: str, derive_version: int, cand, value: dict, now: f
 
 
 def missing_row(family: str, derive_version: int, cand, now: float) -> tuple:
-    """沒有 c0、evaluate 已經不回 not_due 的成員：結果一定是 missing，不等 settle 就先記（算式輸入不記）。"""
+    """沒有 c0 的成員：結果一定是 missing，T_h 一在日曆上就記，不呼叫 perf.evaluate（算式輸入不記）。"""
     return _row(family, derive_version, cand, None, None, MISSING, None, now)
 
 
@@ -337,9 +313,9 @@ def _sessions_to(calendar: Sequence[str], t: str, h: int) -> int:
 
 
 def _new_counts() -> dict:
-    return {"evaluated": 0, "frozen": 0, "waiting": 0, "unexpected": 0, "versions": 0, "due_versions": 0, "late": 0,
-            "wait_e": 0, "not_due_versions": 0, "not_due_members": 0, "capped": False, "out_of_time": False,
-            "markets": {}, "waits": Counter(),
+    return {"evaluated": 0, "frozen": 0, "waiting": 0, "unexpected": 0, "eval_errors": 0, "versions": 0,
+            "due_versions": 0, "late": 0, "wait_e": 0, "not_due_versions": 0, "not_due_members": 0, "capped": False,
+            "out_of_time": False, "markets": {}, "waits": Counter(),
             "families": {family: {"evaluated": 0, "frozen": 0, "waiting": 0} for family in FAMILY_MARKET}}
 
 
@@ -353,12 +329,14 @@ def returns_stage(ctx) -> dict:
     conn = ctx.db()
     if conn is None:
         return {"status": "skipped:no_db"}
-    from jobs import stock_picks_review_db as rdb
-
     if not rdb.has_tables(conn, rdb.C1_TABLES):
         if ctx.dry_run:  # 唯讀開的舊庫（還沒升到 C1 的 schema）
             return {"status": "skipped:no_table"}
         raise rdb.SchemaError("missing tables")
+    if rdb.member_returns_key(conn) != rdb.MEMBER_RETURNS_KEY:  # 舊結構的表：查詢會丟籠統的 OperationalError
+        if ctx.dry_run:
+            return {"status": "skipped:schema"}
+        raise rdb.SchemaError("member_returns columns")
     started = time.monotonic()
     horizons = tuple(int(h) for h in perf.HORIZONS)
     since = (ctx.today - timedelta(days=rdb.PRICE_KEEP_DAYS)).isoformat()
@@ -447,31 +425,38 @@ def returns_stage(ctx) -> dict:
         counts["markets"][market] = "ok"
 
     rows: list[tuple] = []
+    eval_error: Optional[tuple[str, Optional[str]]] = None  # 第一個 evaluate 丟的例外（類別, 程式位置）
     pending.sort(key=lambda item: (item[0], item[3].t, item[3].code, item[1]))
     for index, (_, family, derive_version, cand) in enumerate(pending):
         md = data.get(cand.market)
-        if md is None:
+        if md is None:  # 這個市場這一輪讀不到（busy／error）：整個市場都不算，沒有 c0 的也一樣
             continue
         if index and index % CHECK_EVERY == 0 and time.monotonic() - started > BUDGET_S:  # 至少評完前 CHECK_EVERY 筆
             counts["out_of_time"] = True
             break
-        kind, value = perf.evaluate(cand, md)
         mine = counts["families"][family]
         counts["evaluated"] += 1
         mine["evaluated"] += 1
-        if kind == perf.FREEZE:
+        if cand.close is None:  # 沒有 c0：過了預濾，T_h 一定在日曆上，結果一定是 missing，不呼叫 perf（第 2 輪 r4#1）
+            rows.append(missing_row(family, derive_version, cand, ctx.now))
+        else:
+            try:
+                kind, value = perf.evaluate(cand, md)
+            except Exception as exc:  # noqa: BLE001 - 一筆壞的不能讓後面的永遠評不到（階段最後記 error）
+                counts["eval_errors"] += 1
+                if eval_error is None:
+                    eval_error = (type(exc).__name__, _where(exc))
+                continue
+            if kind != perf.FREEZE:
+                counts["waiting"] += 1
+                mine["waiting"] += 1
+                counts["waits"][str(value)] += 1
+                continue
             try:
                 rows.append(member_row(perf, family, derive_version, cand, value, ctx.now))
             except ValueError:  # 看不懂的一列：不寫、記下來，其他列照寫（階段最後記 error）
                 counts["unexpected"] += 1
                 continue
-        elif cand.close is None and value != NOT_DUE:  # 沒有 c0：結果一定是 missing，不等 settle（審查 C1 r1#3）
-            rows.append(missing_row(family, derive_version, cand, ctx.now))
-        else:
-            counts["waiting"] += 1
-            mine["waiting"] += 1
-            counts["waits"][str(value)] += 1
-            continue
         counts["frozen"] += 1
         mine["frozen"] += 1
         if len(rows) >= INSERT_CHUNK:
@@ -479,6 +464,10 @@ def returns_stage(ctx) -> dict:
     flush(rows)
 
     counts["waits"] = dict(sorted(counts["waits"].items()))
+    if eval_error is not None:  # 只記類別與程式位置，不記例外訊息
+        log.error("stock picks review returns evaluate errors=%d error_type=%s where=%s", counts["eval_errors"],
+                  *eval_error)
+        failures.append(eval_error)
     if counts["unexpected"]:
         log.error("stock picks review returns unexpected perf rows=%d", counts["unexpected"])
         failures.append(("UnexpectedPerfRow", None))
@@ -568,7 +557,6 @@ class Entry:
     skip: Optional[str]
     p_status: str  # ok｜pool_missing｜pending｜version_missing｜not_compared（SEEN_V1：不和股票池比）
     p: Optional[float]
-    live: bool  # 家人看到的（perf 帳）｜舊五條件的背景日（member_returns）
 
 
 def family_versions(conn, family: str, where: str) -> dict[str, list[PoolVersion]]:
@@ -680,6 +668,20 @@ def chosen_ledger_rows(perf, rows: Sequence[dict], history: dict) -> tuple[list[
     return chosen, pins, lines
 
 
+def trading_runs(days: Iterable[str], calendar: Sequence[str]) -> tuple[tuple[str, str], ...]:
+    """推薦日 → 照交易日曆連續的幾段 ((第一天, 最後一天), …)：相鄰兩天在日曆上也相鄰才算同一段；不在日曆上的日子
+    自己一段。"""
+    index = {day: i for i, day in enumerate(calendar)}
+    runs: list[list[str]] = []
+    for day in sorted(set(days)):
+        last = runs[-1][1] if runs else None
+        if last is not None and day in index and last in index and index[day] == index[last] + 1:
+            runs[-1][1] = day
+        else:
+            runs.append([day, day])
+    return tuple((first, last) for first, last in runs)
+
+
 @dataclass
 class Performance:
     entries: dict  # {族: [Entry…]}：三族＋SEEN_V1
@@ -687,6 +689,7 @@ class Performance:
     check: Counter  # compared、diff、oneside
     missing_ts: frozenset = frozenset()  # version_missing 的那些 t
     first_pool: Optional[str] = None  # 池子紀錄最早的 t（三族合起來）
+    seen_runs: tuple = ()  # 家人看到的舊五條件的推薦日，照台股交易日連續的幾段（trading_runs）
 
 
 def build_performance(perf, conn, versions: dict[str, dict], ledger: Sequence[dict], history: dict,
@@ -695,6 +698,7 @@ def build_performance(perf, conn, versions: dict[str, dict], ledger: Sequence[di
     chosen, pins, lines = chosen_ledger_rows(perf, ledger, history)
     cache: dict[tuple, tuple] = {}
     selected: dict[tuple, tuple] = {}
+    counted: set[tuple] = set()  # flag 已經數過的 (族, m, t)
 
     def returns_of(version: PoolVersion) -> tuple[dict, dict]:
         key = (version.family, version.m, version.rule, version.t, version.ver_s)
@@ -703,8 +707,10 @@ def build_performance(perf, conn, versions: dict[str, dict], ledger: Sequence[di
         return cache[key]
 
     def select(family: str, m: str, t: str, picks: Optional[frozenset]) -> tuple:
-        """(用哪一版, flag)：同一個 (族, m, t) 只選一次。"""
-        key = (family, m, t)
+        """(用哪一版, flag)。快取鍵帶「有沒有給 picks」：給 picks（比對帳釘住那一行）和不給（直接取 E 收盤前最後一版）
+        選出來的不一定是同一版，之後有人用 picks＝None 問台股 AI／美股也不會拿到比對過的那一版。同一個鍵只認第一次的
+        picks（同一個 (m, t) 的帳列都釘住同一行）。"""
+        key = (family, m, t, picks is None)
         if key not in selected:
             deadline = perf.close_deadline(m, t, tuple(calendars.get(m, ())))
             selected[key] = select_version(versions.get(family, {}).get(t, ()), deadline, picks)
@@ -713,8 +719,9 @@ def build_performance(perf, conn, versions: dict[str, dict], ledger: Sequence[di
     def version_p(family: str, m: str, t: str, picks: Optional[frozenset], h: int,
                   code: str) -> tuple[Optional[str], str, Optional[float], Optional[tuple]]:
         """選版 → version_returns → pool_p → pick_return：(flag, p_status, p, 這一檔的 member_returns (r, b, skip)
-        或 None)。家人看到的推薦（picks＝帳釘住那一行）和舊五條件的背景日（picks＝None）走同一條路（C2 加冷凍時只改
-        這一條）。"""
+        或 None)。家人看到的推薦（picks＝帳釘住那一行）和舊五條件的背景日（picks＝None）共用的「選版 → p」路徑。
+        冷凍股的排除點只有 _CURRENT_MEMBER（成員報酬與 p 的成員都用它）：C2 只要讓 pool 寫 status＝frozen 就生效，
+        這裡不用改。"""
         version, flag = select(family, m, t, picks)
         if version is None:
             return flag, ("pending" if flag == "pending" else "version_missing"), None, None
@@ -735,14 +742,15 @@ def build_performance(perf, conn, versions: dict[str, dict], ledger: Sequence[di
             continue
         if family == pool.FAMILY_V1:  # 家人看到的舊五條件：另成一段（不選版、沒有 p、不進自我檢查）
             entries[SEEN_V1].append(Entry(SEEN_V1, row["m"], row["t"], row["code"], row["h"], row["r"], row["b"],
-                                          row["skip"], NOT_COMPARED, None, True))
+                                          row["skip"], NOT_COMPARED, None))
             continue
-        first = (family, row["m"], row["t"]) not in selected
         rec = lines.get((row["m"], row["t"]))
         picks = frozenset(p.code for p in rec.picks) if rec is not None else frozenset(pin_codes[(row["m"], row["t"])])
         flag, p_status, p, mine = version_p(family, row["m"], row["t"], picks, row["h"], row["code"])
-        if first and flag in ("version_fallback", "version_missing"):  # 一個 (族, m, t) 數一次
-            flags[flag] += 1
+        if (family, row["m"], row["t"]) not in counted:  # 一個 (族, m, t) 數一次
+            counted.add((family, row["m"], row["t"]))
+            if flag in ("version_fallback", "version_missing"):
+                flags[flag] += 1
             if flag == "version_missing":
                 missing_ts.add(row["t"])
         if mine is not None:
@@ -752,7 +760,7 @@ def build_performance(perf, conn, versions: dict[str, dict], ledger: Sequence[di
             elif (row["skip"] is None) != (mine[2] is None):
                 check["oneside"] += 1
         entries[family].append(Entry(family, row["m"], row["t"], row["code"], row["h"], row["r"], row["b"], row["skip"],
-                                     p_status, p, True))
+                                     p_status, p))
 
     # 對照組（舊五條件）只用背景日：家人那天沒看到舊五條件（帳裡那個 t 沒有釘住 v1）。帳讀不到（pins 是空的，週報另有
     # 一行寫帳讀不到），或成員報酬比 perf 帳早凍結的那幾十分鐘（帳還沒釘住那一天）時，家人看過的 v1 日也會暫時算進來；
@@ -769,9 +777,10 @@ def build_performance(perf, conn, versions: dict[str, dict], ledger: Sequence[di
                 _, p_status, p, mine = version_p(pool.FAMILY_V1, "tw", t, None, h, code)
                 if mine is not None:  # 還沒凍結的不列
                     entries[pool.FAMILY_V1].append(Entry(pool.FAMILY_V1, "tw", t, code, h, mine[0], mine[1], mine[2],
-                                                         p_status, p, False))
+                                                         p_status, p))
     first_pool = min((t for by_t in versions.values() for t in by_t), default=None)
-    return Performance(entries, flags, check, frozenset(missing_ts), first_pool)
+    seen_runs = trading_runs((e.t for e in entries[SEEN_V1]), calendars.get("tw", ()))
+    return Performance(entries, flags, check, frozenset(missing_ts), first_pool, seen_runs)
 
 
 @dataclass(frozen=True)
@@ -830,6 +839,11 @@ def _md(day: str) -> str:
     return f"{d.month}/{d.day}"
 
 
+def _runs_text(runs: Sequence[tuple[str, str]]) -> str:
+    """((第一天, 最後一天), …) → 「10/8–10/22、11/2」（一天的段只寫那一天）。"""
+    return "、".join(_md(first) if first == last else f"{_md(first)}–{_md(last)}" for first, last in runs)
+
+
 def _h_line(h: int, stats: Stats, bench: str, *, with_pool: bool = True) -> str:
     """一個 h 的一行：平均、基準算全部次數；with_pool 時後半只用可和股票池比的那幾次。"""
     if stats.n < MIN_N:
@@ -857,11 +871,16 @@ def format_lines(report: Performance, ledger_state: str, horizons: Sequence[int]
         lines.append(family.name + (CONTROL_TAIL if family.key == pool.FAMILY_V1 else ""))
         lines += [_h_line(h, stats[h], family.bench) for h in horizons]
     seen = report.entries.get(SEEN_V1, [])
-    if seen:  # 放最後；如果之後又關掉 AI，這段的日期範圍會跨過中間 AI 開著的那段
-        bench = next(family.bench for family in pool.FAMILIES if family.key == pool.FAMILY_V1)
-        days = [e.t for e in seen]
-        lines.append(f"家人看到的舊五條件（{_md(min(days))}–{_md(max(days))} 推薦，只和 {bench} 比）")
-        lines += [_h_line(h, stats_of(seen, h), bench, with_pool=False) for h in horizons]
+    if seen:  # 放最後
+        bench = pool.FAMILY_BY_KEY[pool.FAMILY_V1].bench
+        runs = report.seen_runs or trading_runs((e.t for e in seen), ())  # 沒有日曆（手組的資料）：每天自己一段
+        title = f"家人看到的舊五條件（{_runs_text(runs)} 推薦，只和 {bench} 比）"
+        stats = {h: stats_of(seen, h) for h in horizons}
+        if any(s.n for s in stats.values()):
+            lines.append(title)
+            lines += [_h_line(h, stats[h], bench, with_pool=False) for h in horizons]
+        else:
+            lines.append(f"・{title}：還沒有成績")
     notes = []
     if report.flags["version_fallback"]:
         notes.append(f"{report.flags['version_fallback']} 個推薦日（各族分開數）的推薦和池子紀錄的入選對不上"
@@ -888,20 +907,31 @@ def format_lines(report: Performance, ledger_state: str, horizons: Sequence[int]
     return lines
 
 
+def report_data(ctx, conn, calendars: dict[str, Sequence[str]]) -> tuple[Performance, str]:
+    """週報推薦成績的資料：(Performance, 帳的狀態)。report_lines 與對帳測試共用這一條組裝。呼叫端要先確認 perf 帳的
+    版本是 SUPPORTED_LEDGER_VERSION（report_lines 做）。member_returns 是舊結構時丟 rdb.SchemaError（週報那一段只換成
+    一行說明），不讓查詢丟籠統的 OperationalError。"""
+    perf = importlib.import_module("stock_picks_perf")
+    sp = importlib.import_module("stock_picks")
+    with_returns = rdb.has_tables(conn, rdb.C1_TABLES)
+    if with_returns and rdb.member_returns_key(conn) != rdb.MEMBER_RETURNS_KEY:
+        raise rdb.SchemaError("member_returns columns")
+    versions = {family: family_versions(conn, family, where) for family, where in pool.FAMILY_WHERE}
+    ledger, ledger_state = load_ledger(perf, sp, ctx.paths.state_dir)
+    history = history_rows(perf, sp, ctx.paths.state_dir, ctx.today.isoformat()) if ledger else {}
+    report = build_performance(perf, conn, versions, ledger, history, calendars, with_returns=with_returns)
+    return report, ledger_state
+
+
 def report_lines(ctx, conn, calendars: dict[str, Sequence[str]]) -> list[str]:
     """週報的【推薦成績】一段（週報階段在自己的 try 裡呼叫）。calendars＝{市場: 價格庫的交易日}（選版用的 E）。"""
     perf = importlib.import_module("stock_picks_perf")
     if getattr(perf, "LEDGER_VERSION", None) != SUPPORTED_LEDGER_VERSION:
-        return [HEAD, "・推薦成績帳的版本不是 v2，這週先不比"]
-    sp = importlib.import_module("stock_picks")
-    from jobs import stock_picks_review_db as rdb
-
+        return [HEAD, f"・推薦成績帳的版本不是 v{SUPPORTED_LEDGER_VERSION}，這週先不比"]
     # 選版的 E 用價格庫的日曆（weekly.trading_days），returns 階段用 DB ∪ 價格庫（market_calendar）。
     # TODO（審查 C1 r3#5，延後）：共用一個日曆 helper（DB 保留範圍內只用 DB 的日子，價格庫只補 DB 最早一天之前的），
-    #   週報和 returns 都用它。週報在週日晚上跑，兩個市場都休市，價格庫和 DB 的日曆是同步的，所以先不做。
-    versions = {family: family_versions(conn, family, where) for family, where in pool.FAMILY_WHERE}
-    ledger, ledger_state = load_ledger(perf, sp, ctx.paths.state_dir)
-    history = history_rows(perf, sp, ctx.paths.state_dir, ctx.today.isoformat()) if ledger else {}
-    report = build_performance(perf, conn, versions, ledger, history, calendars,
-                               with_returns=rdb.has_tables(conn, rdb.C1_TABLES))
+    #   週報和 returns 都用它。週報在週日晚上跑，兩個市場都休市，價格庫和 DB 的日曆是同步的。暴露比較大的其實是
+    #   returns 階段的 DB ∪ 價格庫日曆（market_calendar）：它每 30 分鐘跑一次、平日也跑；兩邊只會在價格同步那 25 分鐘的
+    #   窗裡不一致（日曆和同步都只看 provisional＝0 的收盤），機率低，所以先不做（第 2 輪 r3#4）。
+    report, ledger_state = report_data(ctx, conn, calendars)
     return format_lines(report, ledger_state, tuple(perf.HORIZONS))

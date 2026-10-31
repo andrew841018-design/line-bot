@@ -80,10 +80,11 @@ def _ymd(day: str) -> str:
 
 # ── 資料（純讀） ──────────────────────────────────────────────────────────────
 def trading_days(conn, market: str) -> list[str]:
-    """價格庫的交易日（returns.store_calendar：台股 TAIEX、美股 SPY／VOO／QQQ，和 stock_db_ro 的日曆同一組代號）。"""
-    from jobs import stock_picks_review_returns as returns
+    """價格庫的交易日（db.store_calendar：台股 TAIEX、美股 SPY／VOO／QQQ，和 stock_db_ro 的日曆同一組代號）。
+    不 import C1 的模組：returns 壞了，【資料收集】照樣組得出來，只有【推薦成績】那一段換成一行說明。"""
+    from jobs import stock_picks_review_db as rdb
 
-    return returns.store_calendar(conn, market)
+    return rdb.store_calendar(conn, market)
 
 
 def family_status(conn, today: date, calendars: dict[str, list[str]]) -> list[dict]:

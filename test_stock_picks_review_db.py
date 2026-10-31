@@ -85,6 +85,23 @@ def test_schema_is_created_with_user_version_and_wal(paths):
         con.close()
 
 
+def test_member_returns_key_matches_the_migration(paths):
+    """returns 與週報比對的 PK（MEMBER_RETURNS_KEY）就是 migration 2 建出來的那一組。"""
+    con = rdb.open_db(paths.db)
+    try:
+        assert rdb.member_returns_key(con) == rdb.MEMBER_RETURNS_KEY
+    finally:
+        con.close()
+
+
+def test_calendar_symbols_match_stock_db_ro():
+    """job 自己的日曆代號（週報的【資料收集】也用，所以不 import stock_db_ro）要和盤勢 DB 的日曆同一組；價格庫固定要收的
+    代號從它推導，值和順序都不變。"""
+    assert rdb.CALENDAR_SYMBOLS == {"tw": (stock_db_ro.TW_CALENDAR_SYMBOL,),
+                                    "us": tuple(stock_db_ro.US_CALENDAR_SYMBOLS)}
+    assert rdb.TW_EXTRA == ("0050", "TAIEX") and rdb.US_EXTRA == ("SPY", "VOO", "QQQ")
+
+
 def test_newer_schema_from_a_later_phase_still_runs(paths):
     """C 段回滾後，DB 的 user_version 比程式新：只要 A 段的表都在就照跑（審查 r2#6）。"""
     con = rdb.open_db(paths.db)
