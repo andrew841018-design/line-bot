@@ -332,6 +332,12 @@ def _build_payload(
     }
 
 
+# 2026-11-06: the model reads 「＠」 for every "@" on stdin (_to_cli).  Without this line a test call
+# blamed the full-width sign for a link and an address that failed.  It opens the system prompt:
+# the no-search contract stays at the end.
+_CLI_AT_NOTE = "對話內容裡的「＠」一律當「@」看：不要提全形，也不要把全形當成問題的原因。"
+
+
 def _build_cli_prompt(
     user_input: Any,
     context: list[tuple[str, str]],
@@ -369,7 +375,7 @@ def _build_cli_prompt(
         f"【最近對話】\n{history_block}\n\n"
         f"【最新訊息】\n{content}"
     )
-    return system, user_prompt
+    return f"{_CLI_AT_NOTE}\n\n{system}", user_prompt
 
 
 def _quota_error(status: int, body: str) -> bool:
@@ -588,7 +594,57 @@ def _cli_child_env() -> dict[str, str]:
     # the launchd plist) wins; Andrew's own sessions still update the install.
     child_env.setdefault("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
     child_env.setdefault("DISABLE_AUTOUPDATER", "1")
+    # 2026-11-06: unlike the two above, no value set elsewhere may turn this off (see _CLI_AT).
+    child_env["CLAUDE_CODE_DISABLE_ATTACHMENTS"] = "1"
     return child_env
+
+
+# 2026-11-06: `--tools ""` does not stop the CLI itself: an "@" that opens a word, or follows
+# 。、？！, pulled that file into the prompt, relative paths included (canary, CLI 2.1.295).
+# The environment variable above turns that off; stdin without "@" stays safe whatever a later CLI
+# does with the variable.  Only the literal "@" counts: 「＠」 and 「﹫」 on stdin were not read.
+_CLI_AT = "＠"
+
+
+def _to_cli(text: str) -> str:
+    """The last step before the CLI: an NFKC after this would turn 「＠」 back into "@"."""
+    return text.replace("@", _CLI_AT)
+
+
+def _from_cli(text: str) -> str:
+    """The model copies the 「＠」 it read; links and mentions after the CLI need the "@"."""
+    # TODO(2026-11-06 deferred): so a copied 「＠allen」 now hits main's substring test for "@all",
+    # as 「@allen」 always did; that test needs a word boundary.
+    return text.replace(_CLI_AT, "@")
+
+
+def _run_cli(
+    executable: str,
+    system_prompt_path: str,
+    user_prompt: str,
+    *,
+    timeout: int,
+    effort: str = "low",
+) -> subprocess.CompletedProcess[str]:
+    """Every `claude -p` child of this module starts here; exceptions stay with the caller.
+
+    stdout comes back with its "@" again: what reads it matches on the half-width sign.
+    """
+    # TODO(2026-11-06 deferred): nothing here stops a stdin that opens with "/" (a slash command).
+    # Every caller opens it with a fixed label; new complete_json callers must too.
+    # TODO(2026-11-06 deferred): a fixed empty cwd would keep relative paths off the bot's folder.
+    completed = subprocess.run(
+        [executable, *_cli_flags(system_prompt_path, effort)],
+        input=_to_cli(user_prompt),
+        check=False,
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        timeout=timeout,
+        env=_cli_child_env(),
+    )
+    completed.stdout = _from_cli(completed.stdout or "")
+    return completed
 
 
 def _chat_via_cli(
@@ -604,7 +660,6 @@ def _chat_via_cli(
     if prompt_parts is None:
         return None
     system_prompt, user_prompt = prompt_parts
-    child_env = _cli_child_env()
     timeout = max(10, int(settings.claude_cli_timeout_sec))
     _remove_stale_prompt_files()
     system_prompt_path = ""
@@ -618,15 +673,7 @@ def _chat_via_cli(
             raise
         with handle:
             handle.write(system_prompt)
-        completed = subprocess.run(
-            [executable, *_cli_flags(system_prompt_path)],
-            input=user_prompt,
-            check=False,
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-            env=child_env,
-        )
+        completed = _run_cli(executable, system_prompt_path, user_prompt, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         _record_cli_outcome(started, "timeout")
         raise ClaudeProviderError(f"CLI timeout after {timeout}s") from exc
@@ -714,14 +761,8 @@ def complete_json(
             raise
         with handle:
             handle.write(system_prompt)
-        completed = subprocess.run(
-            [executable, *_cli_flags(system_prompt_path, effort)],
-            input=user_prompt,
-            check=False,
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-            env=_cli_child_env(),
+        completed = _run_cli(
+            executable, system_prompt_path, user_prompt, timeout=timeout, effort=effort
         )
     except subprocess.TimeoutExpired as exc:
         logger.info("claude cli json secs=%.2f outcome=timeout", time.monotonic() - started)
