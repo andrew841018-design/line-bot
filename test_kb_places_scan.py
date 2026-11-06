@@ -17,6 +17,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent / "jobs"))
 import kb_places_scan as scan  # noqa: E402
 
+_REAL_COPY_ROOT = scan._copy_root  # 下面的 autouse fixture 會換掉它
+
 GROUP = "C" + "a" * 32
 OTHER = "C" + "b" * 32
 NOW = 1_793_400_000
@@ -404,3 +406,94 @@ def test_from_production_removes_only_old_own_copies(db, monkeypatch, capsys, wo
     assert not old.exists()
     assert fresh.exists() and other.exists() and (root / "kb_scan_file").exists()
     assert link.is_symlink() and (target / "f").exists()
+
+
+@pytest.fixture
+def real_root(tmp_path, monkeypatch):
+    """真的 _copy_root：系統暫存資料夾導到 tmp_path/sys，回傳應該建出來的路徑。"""
+    base = tmp_path / "sys"
+    base.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(base))
+    monkeypatch.setattr(scan, "_copy_root", _REAL_COPY_ROOT)
+    return base / f"{scan.COPY_ROOT_NAME}-{os.getuid()}"
+
+
+def _mode(path: Path) -> int:
+    return stat.S_IMODE(path.lstat().st_mode)
+
+
+def test_copy_root_makes_a_private_folder_and_reuses_it(real_root):
+    assert scan._copy_root() == real_root
+    assert _mode(real_root) == 0o700
+    (real_root / "kept").write_bytes(b"x")
+    assert scan._copy_root() == real_root
+    assert (real_root / "kept").exists()
+
+
+def test_copy_root_tightens_a_loose_folder(real_root):
+    real_root.mkdir()
+    real_root.chmod(0o755)
+    assert scan._copy_root() == real_root
+    assert _mode(real_root) == 0o700
+
+
+def test_copy_root_refuses_a_symlink_and_leaves_its_target_alone(real_root, tmp_path):
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    target.chmod(0o755)
+    real_root.symlink_to(target)
+    with pytest.raises(PermissionError):
+        scan._copy_root()
+    assert real_root.is_symlink()
+    assert _mode(target) == 0o755
+
+
+def test_copy_root_refuses_a_plain_file(real_root):
+    real_root.write_bytes(b"x")
+    with pytest.raises(PermissionError):
+        scan._copy_root()
+    assert real_root.read_bytes() == b"x"
+
+
+def test_copy_root_refuses_a_folder_someone_else_owns(real_root, monkeypatch):
+    # chown 要 root：改成假裝自己是別的 uid，資料夾的擁有者就不是「自己」了
+    fake_uid = os.getuid() + 1
+    theirs = real_root.with_name(f"{scan.COPY_ROOT_NAME}-{fake_uid}")
+    theirs.mkdir()
+    theirs.chmod(0o755)
+    with monkeypatch.context() as patch:
+        patch.setattr(scan.os, "getuid", lambda: fake_uid)
+        with pytest.raises(PermissionError):
+            scan._copy_root()
+    assert _mode(theirs) == 0o755
+
+
+def test_from_production_copies_into_the_private_folder_and_cleans_only_there(db, monkeypatch, real_root):
+    db("甲麵館電話 02-2345-6789")
+    real_root.mkdir(mode=0o700)
+    stale = real_root / "kb_scan_old"
+    outside = real_root.parent / "kb_scan_old"
+    stamp = scan.time.time() - scan.STALE_COPY_SECONDS - 60
+    for path in (stale, outside):
+        path.mkdir()
+        os.utime(path, (stamp, stamp))
+    parents: list[Path] = []
+    opener = scan._open_production_copy
+
+    def spy(src, workdir):
+        parents.append(workdir.parent)
+        return opener(src, workdir)
+
+    monkeypatch.setattr(scan, "_open_production_copy", spy)
+    assert _from_production(db, monkeypatch) == 0
+    assert parents == [real_root]
+    assert not stale.exists()
+    assert outside.exists()
+    assert list(real_root.iterdir()) == []
+
+
+def test_from_production_stops_when_the_private_folder_is_not_ours(db, monkeypatch, capsys, real_root):
+    db("甲麵館電話 02-2345-6789")
+    real_root.write_bytes(b"x")
+    assert _from_production(db, monkeypatch) == 2
+    assert "PermissionError" in capsys.readouterr().err

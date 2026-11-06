@@ -51,6 +51,7 @@ DEFAULT_HOURS = 48.0
 MAX_HOURS = 168.0
 PRODUCTION_DB = Path(__file__).resolve().parents[1] / "line_bot.db"
 COPY_PREFIX = "kb_scan_"
+COPY_ROOT_NAME = "line-bot-kb-scan"
 STALE_COPY_SECONDS = 3600
 _SIDECARS = ("-wal", "-shm")
 
@@ -223,7 +224,23 @@ def _open_production_copy(src: Path, workdir: Path) -> sqlite3.Connection:
 
 
 def _copy_root() -> Path:
-    return Path(tempfile.gettempdir())
+    """副本放在自己的 0700 資料夾：$TMPDIR 可能有幾百萬個項目，不該每次都掃一遍（2026-11-07）。
+
+    照分支 claude/tmpdir-leak 的 private_tmp.private_tmp_dir 寫，行為要一樣。它進 main 後換成
+    private_tmp_dir(COPY_ROOT_NAME)；名字不要改，不然舊資料夾裡沒刪成的副本就沒人清了。
+    private_tmp 在 repo 根目錄：要先把根目錄放進 sys.path，改完在 repo 外實跑一次 --help。
+    """
+    root = Path(tempfile.gettempdir()) / f"{COPY_ROOT_NAME}-{os.getuid()}"
+    try:
+        root.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    info = root.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise PermissionError(f"{COPY_ROOT_NAME}: temp folder failed ownership validation")
+    if stat.S_IMODE(info.st_mode) != 0o700:
+        os.chmod(root, 0o700, follow_symlinks=False)
+    return root
 
 
 def _remove_stale_copies(root: Path, now: float) -> None:
