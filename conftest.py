@@ -86,6 +86,8 @@ os.environ["LINE_BOT_PARENT_HEALTH_GROUP_PUSH"] = ""
 # 2026-10-17 TikTok 讀取：預設關閉（0 = 不送 Gemini、不下載），要測的測試用假物件自己打開
 # TODO(2026-10-17 D4): 這只關掉讀影片／圖片；沒有替換 yt-dlp 的既有測試仍可能真的連網抓 metadata。
 os.environ["LINE_BOT_TIKTOK_MEDIA_DAILY_CAP"] = "0"
+# 2026-11-06 保底以外的額外讀取：預設關，要測的測試自己打開。
+os.environ["LINE_BOT_TIKTOK_MEDIA_QUIET_DAY_MAX"] = "0"
 # Semantic restatement judge calls Gemini; unit tests enable it explicitly with a fake.
 os.environ.setdefault("LINE_BOT_RESTATEMENT_JUDGE", "0")
 # 2026-10-04: the separate-quota last Gemini tier stays off unless a test
@@ -338,6 +340,7 @@ def reset_main_globals(monkeypatch):
     gemini_client._media_backoff_until = 0.0
     gemini_client._media_bad_requests = 0
     gemini_client._media_cap_warned = ""
+    gemini_client._media_quiet_day_max_warned = ""
     tiktok_media.clear_cache()
     main._PENDING_REPLY_ENABLED = _ORIG_PENDING_REPLY_ENABLED
     main._PENDING_EXPLICIT_PATH = str(tmp_pending_path)
@@ -364,6 +367,7 @@ def reset_main_globals(monkeypatch):
     gemini_client._media_backoff_until = 0.0
     gemini_client._media_bad_requests = 0
     gemini_client._media_cap_warned = ""
+    gemini_client._media_quiet_day_max_warned = ""
     tiktok_media.clear_cache()
     main._PENDING_REPLY_ENABLED = _ORIG_PENDING_REPLY_ENABLED
     main._PENDING_EXPLICIT_PATH = _ORIG_PENDING_PATH

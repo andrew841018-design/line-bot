@@ -3383,6 +3383,7 @@ def _fetch_video_gemini(url: str) -> str | None:
                 break
             except Exception as e:
                 last_error = e
+                gemini_client.note_media_rate_limit(model_name, e)
                 err_str = str(e)
                 is_quota = "429" in err_str or "RESOURCE_EXHAUSTED" in err_str
                 if is_quota and model_name != models_to_try[-1]:
