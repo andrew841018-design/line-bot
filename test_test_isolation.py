@@ -1,5 +1,8 @@
 from pathlib import Path
+import os
 import sqlite3
+import subprocess
+import sys
 
 import pytest
 
@@ -335,3 +338,35 @@ def test_parent_health_async_is_off_while_tests_run():
     import parent_health
 
     assert parent_health._BACKGROUND_ENABLED is False
+
+
+def test_probe_for_the_leak_check():
+    """Empty on purpose: the next test runs it alone and looks at what its fixtures left."""
+
+
+def test_fixtures_leave_no_folder_in_the_temp_dir(tmp_path):
+    """2026-11-06: one folder per test stayed behind, and macOS keeps the empty shells.
+
+    A full run is 17,000 tests, so $TMPDIR reached two million entries, and the bot
+    listed them all before every Claude CLI call.  Exit 0 also proves the probe ran:
+    pytest exits 4 or 5 when it finds nothing to run.
+    """
+    env = {key: value for key, value in os.environ.items() if not key.startswith("PYTEST_")}
+    env["TMPDIR"] = str(tmp_path)
+    done = subprocess.run(
+        [
+            sys.executable, "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider",
+            f"{Path(__file__).name}::test_probe_for_the_leak_check",
+        ],
+        cwd=Path(__file__).parent,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    assert done.returncode == 0, done.stdout[-2000:] + done.stderr[-2000:]
+    expected = ("pytest-of-", "line_bot_pytest_quarantine_")
+    left = [path.name for path in tmp_path.iterdir() if path.is_dir() and not path.name.startswith(expected)]
+    assert left == []
