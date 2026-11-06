@@ -21,8 +21,8 @@ Andrew 10/28：「line bot股票查詢部分，新增美股」；範圍＝查詢
 
 規格：ops/state/line_bot_stock_us_20261028/PLAN.md（v5）與 IMPL_SPEC.md。不 import main、fcn_eval、market_*；
 stock_picks 的東西一律在呼叫時用 stock_picks.X（conftest 的擋網、tmp state、關背景才會生效）；
-stock_picks_perf 只在函式裡 import（成績模組壞了，美股照樣能用）。卡片上只有固定句型、程式算的數字、
-代號與交易所登記的公司名，沒有使用者原文。
+stock_picks_perf 只在函式裡 import（成績模組壞了，美股照樣能用）；stock_picks_review_hook（回測的冷凍）也是，
+它出任何問題都照常推薦。卡片上只有固定句型、程式算的數字、代號與交易所登記的公司名，沒有使用者原文。
 """
 
 from __future__ import annotations
@@ -169,6 +169,7 @@ TEXT_US_NO_TRADE = "股票評估：這一檔最近沒有成交"
 TEXT_US_COMPUTING = "美股推薦計算中，請稍後再按一次"
 TEXT_US_STUCK = "美股推薦暫時算不出來，請稍後再按一次"
 TEXT_US_NOT_UPDATED = "美股資料暫時沒有更新，先不推薦"
+TEXT_US_NO_PICK = "這次美股沒有推薦"  # 中性句：有股票被回測冷凍拿掉時用（見 us_no_pick_bubble）
 TEXT_US_POOL_LEAD = "美股從標普 500 市值前 50 大挑，4 條都符合才推，最多 3 檔"
 TEXT_US_POOL_NOTE = "美股推薦只從標普 500 市值前 50 大挑"
 TEXT_US_DETAIL_POOL_NOTE = "美股推薦卡只從標普 500 市值前 50 大挑"
@@ -746,9 +747,12 @@ def us_pick_bubble(facts: UsFacts, index: int, total: int, market: Optional[stoc
                                _pool_footer(facts.data_date))
 
 
-def us_no_pick_bubble(day: date, market: Optional[stock_picks.Market], missed: Optional[tuple[str, int, int]]) -> dict:
-    body = _lead() + [stock_picks._text(f"這次（資料到 {stock_picks._fmt_date(day)} 美國時間）美股沒有 4 條都符合的",
-                                        size="xl", weight="bold")]
+def us_no_pick_bubble(day: date, market: Optional[stock_picks.Market], missed: Optional[tuple[str, int, int]], *,
+                      neutral: bool = False) -> dict:
+    """沒有推薦。neutral（PLAN_B2C2 §2.5）：這一輪有股票被回測冷凍拿掉，候選可能全在裡面，「沒有 4 條都符合的」就不一定
+    是真的（/股票 單檔查詢照樣寫 ✅ 4 條都符合），改用永遠成立的中性句。家人的卡片不提冷凍。"""
+    headline = TEXT_US_NO_PICK if neutral else f"這次（資料到 {stock_picks._fmt_date(day)} 美國時間）美股沒有 4 條都符合的"
+    body = _lead() + [stock_picks._text(headline, size="xl", weight="bold")]
     if missed is not None:
         key, count, total = missed
         body.append(stock_picks._text(f"最常差的條件：{US_CONDITION_NAME[key]}（{total} 檔裡有 {count} 檔沒過）"))
@@ -983,6 +987,8 @@ class UsSnapshot:
     picks: tuple[str, ...]
     missed: Optional[tuple[str, int, int]]
     latest_closes: Mapping[str, tuple[date, float]] = field(default_factory=dict)  # 全部美股最新一根正式收盤（單檔核對）
+    cooldown_read: Optional[str] = None  # 回測冷凍（形狀和 AI 的 spool 一樣）：ok｜missing｜invalid｜error；沒呼叫到 hook 是 None
+    cooldown: Optional[dict] = None  # {"removed": [排序後的代號], "reason": None 或 "over_25pct"}；沒呼叫到 hook 是 None
 
     def facts_of(self, symbol: str) -> Optional[UsFacts]:
         for facts in self.pool:
@@ -1044,6 +1050,26 @@ def _facts_from(value, day: date) -> UsFacts:
     )
 
 
+# 冷凍的兩個欄位走寬鬆讀法：不合格就當 None，不走 _require。_commit_snapshot 寫檔前會用 snapshot_from_json 驗，
+# 欄位壞掉不能讓快照作廢，不然美股推薦會一直停在舊的 D（PLAN_B2C2 §2.4）。舊檔沒有這些鍵照讀。
+# 值只從 _cooldown_of、snapshot_from_json 進 UsSnapshot，這兩處都過 _lenient_*，所以 _us_section、snapshot_to_json 不用再驗。
+_COOLDOWN_READS = ("ok", "missing", "invalid", "error")  # Applied.read；美股不依賴葉節點，測試核對兩邊一致
+_COOLDOWN_REASONS = (None, "over_25pct")
+
+
+def _lenient_cooldown_read(value) -> Optional[str]:
+    return value if value in _COOLDOWN_READS else None
+
+
+def _lenient_cooldown(value) -> Optional[dict]:
+    if not (isinstance(value, dict) and "reason" in value and value["reason"] in _COOLDOWN_REASONS):
+        return None
+    removed = value.get("removed")
+    if not (isinstance(removed, list) and all(isinstance(s, str) and _SYMBOL_RE.fullmatch(s) for s in removed)):
+        return None
+    return {"removed": list(removed), "reason": value["reason"]}
+
+
 def snapshot_to_json(s: UsSnapshot) -> dict:
     return {
         "schema": SNAPSHOT_SCHEMA,
@@ -1058,6 +1084,8 @@ def snapshot_to_json(s: UsSnapshot) -> dict:
         "picks": list(s.picks),
         "missed": None if s.missed is None else list(s.missed),
         "latest_closes": {sym: [d.isoformat(), c] for sym, (d, c) in sorted(s.latest_closes.items())},
+        "cooldown_read": s.cooldown_read,
+        "cooldown": s.cooldown,
     }
 
 
@@ -1100,7 +1128,8 @@ def snapshot_from_json(obj, now: float) -> UsSnapshot:
         d=day, rule=v._v_str(obj.get("rule"), 20), covered=v._v_int(obj.get("covered"), 0, 10**4),
         computed_at=stock_picks._at_most(v._v_num(obj.get("computed_at"), 0.0, 1e11), now + stock_picks._CLOCK_SKEW_S),
         universe_as_of=None if as_of is None else v._v_date(as_of), spy=spy, spy_dates=spy_dates, pool=pool,
-        picks=picks, missed=missed, latest_closes=latest,
+        picks=picks, missed=missed, latest_closes=latest, cooldown_read=_lenient_cooldown_read(obj.get("cooldown_read")),
+        cooldown=_lenient_cooldown(obj.get("cooldown")),
     )
 
 
@@ -1615,9 +1644,22 @@ def _refresh_fundamentals(wanted: Sequence[str], stop: threading.Event, now: flo
     return failed
 
 
+def _cooldown_of(symbols: Sequence[str], d: str) -> tuple[frozenset, Optional[str], Optional[dict]]:
+    """回測冷凍：(要拿掉的代號, cooldown_read, cooldown)。任何問題都照常推薦，不能變成這一輪的失敗（兩個欄位維持 None）。"""
+    try:
+        import stock_picks_review_hook as hook
+        applied = hook.apply_cooldown(hook.FAMILY_US, symbols, d)
+        cooldown = {"removed": sorted(applied.removed), "reason": applied.reason}
+        return applied.removed, _lenient_cooldown_read(applied.read), _lenient_cooldown(cooldown)
+    except Exception as exc:
+        logger.warning("stock picks us cooldown failed error_type=%s", type(exc).__name__)
+        return frozenset(), None, None
+
+
 def _recompute(stop: threading.Event, now: float, pool: PoolList, d: str, covered: int, calendar: Sequence[str],
                latest: Mapping[str, tuple[date, float]], spy_dates: tuple[date, ...]) -> UsSnapshot:
-    """重算一個 D（150 秒為限）：池的收盤（一個 IN 查詢）、quarantine → 走勢 → 財報（照節奏）→ facts → 閘門 → 推薦。"""
+    """重算一個 D（150 秒為限）：池的收盤（一個 IN 查詢）、quarantine → 走勢 → 財報（照節奏）→ facts → 閘門 → 冷凍 → 推薦。
+    冷凍只影響選股：閘門用完整的 facts 算完才過濾，快照的 pool 也留完整的（單檔查詢、回測 job 都要）。"""
     give_up = time.monotonic() + REFRESH_BUDGET_S
     day = date.fromisoformat(d)
     cal_d = [x for x in calendar if x <= d]
@@ -1659,11 +1701,14 @@ def _recompute(stop: threading.Event, now: float, pool: PoolList, d: str, covere
         facts.append(f)
     if bad > limit:
         raise stock_picks.RoundFailed("too_many_gray")
-    picks = choose_us_picks(facts)
+    removed, cooldown_read, cooldown = _cooldown_of(symbols, d)
+    choosable = [f for f in facts if f.symbol not in removed]
+    picks = choose_us_picks(choosable)
     return UsSnapshot(
         d=day, rule=RULE, covered=covered, computed_at=now, universe_as_of=pool.as_of,
         spy=_spy_market(closes.get(SPY, {}), cal_d, d), spy_dates=spy_dates, pool=tuple(facts),
-        picks=tuple(p.symbol for p in picks), missed=None if picks else us_most_missed(facts), latest_closes=dict(latest),
+        picks=tuple(p.symbol for p in picks), missed=None if picks else us_most_missed(choosable), latest_closes=dict(latest),
+        cooldown_read=cooldown_read, cooldown=cooldown,
     )
 
 
@@ -2067,6 +2112,8 @@ def _us_section(now: float) -> tuple[list[dict], str, Optional[date]]:
     if picks:
         bubbles = [us_pick_bubble(f, i + 1, len(picks), snapshot.spy, lead_note=(i == 0)) for i, f in enumerate(picks)]
         return bubbles, "、".join(f.symbol for f in picks), snapshot.d
+    if snapshot.cooldown is not None and snapshot.cooldown["removed"]:
+        return [us_no_pick_bubble(snapshot.d, snapshot.spy, snapshot.missed, neutral=True)], "這次沒有推薦", snapshot.d
     return [us_no_pick_bubble(snapshot.d, snapshot.spy, snapshot.missed)], "這次沒有符合條件的", snapshot.d
 
 

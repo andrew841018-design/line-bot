@@ -1,18 +1,22 @@
 """stock_picks_review_hook（回測週報的 AI 池子 spool，2026-10-29 回測 PLAN §5.2）的測試：寫入時機（_commit_ai 回 True 之後
 才寫）、例外不外漏、目錄檢查、檔數上限、100 ms、AI 關著不做事、unknown 和 no 分開記，以及和回測 job 的契約（spool 格式與
-檔名、目錄配置、review.sqlite 的路徑：用 job 真的程式核對）。合成行情、tmp state、不連網。"""
+檔名、目錄配置、review.sqlite 的路徑：用 job 真的程式核對）。B2 的冷凍（PLAN_B2C2 §2）：effective、read_cooldown、
+apply_cooldown 的邊界，_maybe_fill_ai 的過濾與 spool 的全名單，同一個 T 重算不收回；美股那一半在 test_stock_picks_us.py。
+合成行情、tmp state、不連網。"""
 
 from __future__ import annotations
 
 import ast
+import copy
 import importlib
 import json
 import os
 import statistics
 import sys
+import threading
 import time
 from dataclasses import replace
-from datetime import timedelta
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -20,7 +24,7 @@ import pytest
 import stock_picks as sp
 import stock_picks_perf as perf
 import stock_picks_review_hook as hook
-from test_stock_picks_ai import T, TODAY, _facts, _snapshot, _state
+from test_stock_picks_ai import T, TODAY, _calendar, _facts, _snapshot, _state
 from test_stock_picks_ai_worker import Clock, Rig
 
 
@@ -95,7 +99,7 @@ def test_one_spool_file_after_a_successful_commit_with_every_trend_kind(monkeypa
     assert (data["source"], data["core_version"]) == ("00952", "test-v1")
     assert data["picks"] == ["1101", "1105", "1106"] and data["funnel"] == state["funnel"]
     assert data["skipped"] == {"1102": "chart_unavailable"}
-    assert (data["cooldown_read"], data["cooldown"]) == (None, None)  # B2 才有
+    assert (data["cooldown_read"], data["cooldown"]) == ("missing", {"removed": [], "reason": None})  # 沒有冷凍檔
     members = {m["c"]: m for m in data["members"]}
     assert [m["c"] for m in data["members"]] == [f.code for f in rig.facts]  # 冷凍前的全名單
     assert all(m["c0"] == 100.0 and m["ai_source"] == "00952" and m["status"] == "member" for m in members.values())
@@ -351,6 +355,9 @@ def test_contract_directory_names_and_review_db_match_the_job(monkeypatch):
     assert paths.db == paths.state_dir / perf.REVIEW_DB  # perf.backfill_prices 唯讀的那個庫
     monkeypatch.setattr(sp, "STATE_DIR", paths.state_dir)
     assert hook.spool_dir() == paths.spool
+    assert hook.cooldown_path() == paths.state_dir / "stock_picks_review" / "cooldown.json"  # PLAN_B2C2 §4.4
+    pool = _job("stock_picks_review_pool")
+    assert (hook.FAMILY_AI, hook.FAMILY_US, hook.FROZEN) == (pool.FAMILY_AI, pool.FAMILY_US, pool.FROZEN)
 
 
 def test_contract_a_real_spool_is_found_and_accepted_by_the_job(monkeypatch, clock):
@@ -375,6 +382,7 @@ def test_contract_a_real_spool_is_found_and_accepted_by_the_job(monkeypatch, clo
     assert len(got) == 10 and {m["trend"] for m in data["members"]} >= {"pool", "ok", "skipped:chart_unavailable",
                                                                        "no:bars_short", "unknown", "unchecked", None}
     assert version.market == data["market"] == [sp.HOT, 35, 61]  # impl r1 #2
+    assert version.cooldown_read == "missing"  # C2b 合併前的檢查點：B2 活著
 
 
 def test_contract_the_largest_spool_is_accepted_by_the_job():
@@ -452,8 +460,8 @@ def test_hook_module_takes_no_locks_makes_no_dirs_and_keeps_no_state():
     assert not any(isinstance(n, (ast.Global, ast.Nonlocal)) for n in ast.walk(tree))
     imported = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
     imported |= {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module}
-    assert imported <= {"__future__", "logging", "math", "os", "re", "stat", "time", "dataclasses", "pathlib",
-                        "typing", "stock_picks"}
+    assert imported <= {"__future__", "json", "logging", "math", "os", "re", "stat", "time", "dataclasses", "datetime",
+                        "pathlib", "typing", "stock_picks"}
     writes = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
               and n.func.attr == "_write_json_file"]
     assert len(writes) == 1
@@ -466,3 +474,340 @@ def test_hook_module_takes_no_locks_makes_no_dirs_and_keeps_no_state():
     for name in ("STATE_DIR", "AI_ENABLED", "_write_json_file", "_facts_json", "_facts_for", "ai_checks_of",
                  "trend_of", "_AI_OK", "_AI_NO", "_AI_HOLE", "_AI_SKIP_REASONS", "_ai_chart_cache", "_ai_fail_tries"):
         assert hasattr(sp, name), name
+
+
+# ── 冷凍（B2，PLAN_B2C2 §2）：T 是 10/8 週四，since 是它之前的週日，until 是 since＋105 個日曆天 ─────────────
+SINCE, UNTIL = "2026-10-04", "2027-01-17"  # 10/4＋27＝10/31，＋30＝11/30，＋31＝12/31，＋17＝1/17
+FRIDAY, SUNDAY, MONDAY = date(2026, 10, 9), "2026-10-11", date(2026, 10, 12)
+SUNDAY_UNTIL = "2027-01-24"  # 10/11＋105 天
+MEMBERS = [str(1101 + i) for i in range(8)]  # 8 檔：最多拿掉 ceil(2)＝2 檔
+DAY = T.isoformat()
+
+
+def _frozen(code: str, since: str = SINCE, until: str = UNTIL) -> dict:
+    return {"code": code, "since": since, "until": until}
+
+
+def _cooldown(ai=(), us=()) -> dict:
+    """回測 job 寫的格式（PLAN_B2C2 §4.4）。"""
+    return {"schema": 1, "families": {"tw_ai": {"frozen": list(ai)}, "us": {"frozen": list(us)}}}
+
+
+def _write_cooldown(content) -> Path:
+    """bytes 原樣寫，其他寫成 JSON。"""
+    path = hook.cooldown_path()
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    path.write_bytes(content if isinstance(content, bytes) else json.dumps(content).encode("utf-8"))
+    return path
+
+
+def _spool_data(spool: Path) -> dict:
+    [path] = _spool_files(spool)
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _boom(*_a, **_k):
+    raise RuntimeError("synthetic")
+
+
+@pytest.mark.parametrize("day, removed", [
+    ("2026-10-03", frozenset()),  # since 前一天
+    ("2026-10-04", frozenset({"1101"})),  # since 當天
+    ("2027-01-17", frozenset({"1101"})),  # until 當天
+    ("2027-01-18", frozenset()),  # until 隔天
+])
+def test_effective_only_counts_days_from_since_to_until(day, removed):
+    assert hook.effective(hook.FAMILY_AI, MEMBERS, _cooldown([_frozen("1101")]), day) == (removed, None)
+
+
+def test_effective_keeps_only_members_of_this_family():
+    obj = _cooldown([_frozen("1101"), _frozen("9999")], [_frozen("BRK.B"), _frozen("NVDA")])
+    assert hook.effective(hook.FAMILY_AI, MEMBERS, obj, DAY) == (frozenset({"1101"}), None)
+    symbols = ["BRK.B", "MSFT", "AAPL", "AMZN"]
+    assert hook.effective(hook.FAMILY_US, symbols, obj, DAY) == (frozenset({"BRK.B"}), None)
+
+
+@pytest.mark.parametrize("size, limit", [(1, 1), (4, 1), (5, 2), (8, 2), (9, 3), (26, 7), (50, 13), (54, 14)])
+def test_effective_25pct_boundary(size, limit, caplog):
+    members = [str(1000 + i) for i in range(size)]
+    exact = _cooldown([_frozen(c) for c in members[:limit]])
+    assert hook.effective(hook.FAMILY_AI, members, exact, DAY) == (frozenset(members[:limit]), None)  # 剛好 ceil 不擋
+    assert _hook_warnings(caplog) == []
+    if limit == size:
+        return
+    over = _cooldown([_frozen(c) for c in members[:limit + 1]])
+    assert hook.effective(hook.FAMILY_AI, members, over, DAY) == (frozenset(), "over_25pct")  # 多一檔整份不用
+    assert _hook_warnings(caplog) == [
+        f"stock picks review cooldown not applied reason=over_25pct family=tw_ai removed={limit + 1} members={size}"]
+
+
+def test_effective_25pct_only_counts_what_would_really_be_removed():
+    expired = [_frozen(c, "2026-01-04", "2026-04-19") for c in MEMBERS[2:6]]  # 上一輪的冷凍：已經過期
+    outsiders = [_frozen(c) for c in ("9001", "9002", "9003")]  # 已經不在名單裡
+    obj = _cooldown([_frozen("1101"), _frozen("1102"), *expired, *outsiders])
+    assert hook.effective(hook.FAMILY_AI, MEMBERS, obj, DAY) == (frozenset({"1101", "1102"}), None)
+
+
+def test_read_cooldown_missing_is_normal(caplog):
+    assert hook.read_cooldown() == ("missing", None)  # 上一層也還沒有
+    hook.cooldown_path().parent.mkdir(mode=0o700)
+    assert hook.read_cooldown() == ("missing", None)
+    assert hook.apply_cooldown(hook.FAMILY_AI, MEMBERS, DAY) == hook.Applied("missing", frozenset(), None)
+    assert _hook_warnings(caplog) == [] and not hook.cooldown_path().exists()
+
+
+def test_read_cooldown_accepts_a_good_file(caplog):
+    obj = _cooldown([_frozen("2330"), _frozen("2454", "2026-10-04", "2026-10-04")], [_frozen("BRK.B")])  # 105 天、同一天
+    _write_cooldown(obj)
+    assert hook.read_cooldown() == ("ok", obj)
+    assert _hook_warnings(caplog) == []
+
+
+def test_read_cooldown_on_a_fifo_does_not_block(caplog):
+    path = hook.cooldown_path()
+    path.parent.mkdir(mode=0o700)
+    os.mkfifo(path)
+    got: list = []
+    reader = threading.Thread(target=lambda: got.append(hook.read_cooldown()), daemon=True)
+    reader.start()
+    reader.join(5)
+    stuck = reader.is_alive()
+    if stuck:  # 開一個寫端放走卡住的 open：失敗時也不留執行緒，更不會卡住整套測試
+        os.close(os.open(path, os.O_WRONLY | os.O_NONBLOCK))
+        reader.join(5)
+    assert not stuck and got == [("invalid", None)]
+    assert _hook_warnings(caplog) == ["stock picks review cooldown invalid reason=ValueError"]
+
+
+def test_read_cooldown_refuses_symlinks_and_directories(tmp_path, caplog):
+    elsewhere = tmp_path / "cooldown.json"
+    elsewhere.write_text(json.dumps(_cooldown([_frozen("1101")])), encoding="utf-8")
+    path = hook.cooldown_path()
+    path.parent.mkdir(mode=0o700)
+    path.symlink_to(elsewhere)  # 內容是好的也不跟
+    assert hook.read_cooldown() == ("invalid", None)
+    path.unlink()
+    path.symlink_to(tmp_path / "nowhere")  # 斷掉的 symlink 不是「檔案不存在」
+    assert hook.read_cooldown() == ("invalid", None)
+    path.unlink()
+    path.mkdir()
+    assert hook.read_cooldown() == ("invalid", None)
+    assert len(_hook_warnings(caplog)) == 3
+
+
+def test_read_cooldown_refuses_someone_elses_file():
+    _write_cooldown(_cooldown([_frozen("1101")]))
+    real_uid = os.getuid()
+    with pytest.MonkeyPatch.context() as patch:  # 只在這一次呼叫裡假裝 uid 不同
+        patch.setattr(os, "getuid", lambda: real_uid + 1)
+        assert hook.read_cooldown() == ("invalid", None)
+
+
+def test_read_cooldown_size_limit_is_64_kb():
+    body = json.dumps(_cooldown([_frozen("1101")])).encode("utf-8")
+    _write_cooldown(body + b" " * (64 * 1024 - len(body)))  # 剛好 64 KB
+    assert hook.read_cooldown()[0] == "ok"
+    _write_cooldown(body + b" " * (64 * 1024 - len(body) + 1))  # 多 1 byte
+    assert hook.read_cooldown() == ("invalid", None)
+
+
+@pytest.mark.parametrize("content", [
+    b"", b"{", b"\xff\xfe", b"[" * (64 * 1024), b"[]", b"null", b"1", b'"tw_ai"',
+], ids=["empty", "broken", "not_utf8", "too_deep", "list", "null", "number", "string"])
+def test_read_cooldown_bad_json_is_invalid(content, caplog):
+    _write_cooldown(content)
+    assert hook.read_cooldown() == ("invalid", None)
+    assert len(_hook_warnings(caplog)) == 1
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda o: o.update(schema=2),
+    lambda o: o.pop("schema"),
+    lambda o: o.pop("families"),
+    lambda o: o.update(families=[]),
+    lambda o: o["families"].pop("us"),
+    lambda o: o["families"].update(us=[]),
+    lambda o: o["families"]["us"].pop("frozen"),
+    lambda o: o["families"]["us"].update(frozen={}),
+    lambda o: o["families"]["us"]["frozen"].append("NVDA"),
+    lambda o: o["families"].update(tw_v1={"frozen": 1}),
+    lambda o: o["families"]["us"]["frozen"][0].pop("code"),
+    lambda o: o["families"]["us"]["frozen"][0].update(code=2330),
+    lambda o: o["families"]["us"]["frozen"][0].pop("since"),
+    lambda o: o["families"]["us"]["frozen"][0].pop("until"),
+    lambda o: o["families"]["us"]["frozen"][0].update(since=20261004),
+    lambda o: o["families"]["us"]["frozen"][0].update(since="20261004"),  # fromisoformat 收得下，字串比較會錯：要 _ISO_RE 擋
+    lambda o: o["families"]["us"]["frozen"][0].update(since="2026-10-04T00:00:00"),
+    lambda o: o["families"]["us"]["frozen"][0].update(until="2026-13-01"),
+    lambda o: o["families"]["us"]["frozen"][0].update(until="2026-11-31"),
+    lambda o: o["families"]["us"]["frozen"][0].update(until="2026-10-03"),  # until 在 since 之前
+    lambda o: o["families"]["us"]["frozen"][0].update(until="2027-01-18"),  # 106 天
+])
+def test_any_bad_field_invalidates_the_whole_file(mutate, caplog):
+    obj = _cooldown([_frozen("1101")], [_frozen("NVDA")])
+    mutate(obj)
+    _write_cooldown(obj)
+    assert hook.read_cooldown() == ("invalid", None)
+    assert hook.apply_cooldown(hook.FAMILY_AI, MEMBERS, DAY) == hook.Applied("invalid", frozenset(), None)  # 壞在美股：AI 也不用
+    assert len(_hook_warnings(caplog)) == 2  # 每次一個 warning（原因是 content，日期不存在時是 ValueError）
+
+
+def test_apply_cooldown_reports_what_it_did():
+    _write_cooldown(_cooldown([_frozen("1102"), _frozen("1101")]))
+    assert hook.apply_cooldown(hook.FAMILY_AI, MEMBERS, DAY) == hook.Applied("ok", frozenset({"1101", "1102"}), None)
+    assert hook.apply_cooldown(hook.FAMILY_AI, MEMBERS, "2026-10-03") == hook.Applied("ok", frozenset(), None)
+    _write_cooldown(_cooldown([_frozen(c) for c in MEMBERS[:3]]))
+    assert hook.apply_cooldown(hook.FAMILY_AI, MEMBERS, DAY) == hook.Applied("ok", frozenset(), "over_25pct")
+
+
+@pytest.mark.parametrize("name", ["read_cooldown", "effective", "cooldown_path"])
+def test_apply_cooldown_never_raises(name, monkeypatch, caplog):
+    _write_cooldown(_cooldown([_frozen("1101")]))
+    monkeypatch.setattr(hook, name, _boom)
+    assert hook.apply_cooldown(hook.FAMILY_AI, MEMBERS, DAY) == hook.Applied("error", frozenset(), None)
+    assert _hook_warnings(caplog) == ["stock picks review cooldown failed error_type=RuntimeError"]
+    assert "synthetic" not in caplog.text
+
+
+def test_frozen_codes_leave_the_round_and_stay_in_the_spool(monkeypatch, clock):
+    spool = _make_spool()
+    rig = Rig(monkeypatch, clock, 10)
+    rig.snapshot.pool["1101"] = _facts("1101")  # 主池有走勢：冷凍股的條件值照算
+    _write_cooldown(_cooldown([_frozen("1101"), _frozen("1103")]))  # 10 檔最多 ceil(2.5)＝3 檔
+    state = rig.run()
+    assert rig.picks == ["1102", "1104", "1105"]
+    assert rig.yahoo.calls == ["1102.TW", "1104.TW", "1105.TW"]  # 冷凍股連日線都不抓
+    assert state["funnel"] == {"universe": 8, "growth": 8, "cheap": 8, "trend": 3}
+    codes = ["1102", "1104", "1105", "1106", "1107", "1108", "1109", "1110"]
+    assert state["universe"]["codes"] == codes
+    assert state["universe"]["etf_codes"] == [f.code for f in rig.facts]  # 名單來源的紀錄不動
+    assert sp.load_ai_file()["picks"] == state["picks"]  # ai_state_from_json 收得下，真的寫到磁碟
+    assert sp.ai_state_from_json(json.loads(json.dumps(state)))["universe"]["codes"] == codes
+    data = _spool_data(spool)
+    assert (data["cooldown_read"], data["cooldown"]) == ("ok", {"removed": ["1101", "1103"], "reason": None})
+    assert data["funnel"] == state["funnel"] and data["picks"] == ["1102", "1104", "1105"]
+    assert [m["c"] for m in data["members"]] == [f.code for f in rig.facts]  # 冷凍前的全名單、原本的順序
+    members = {m["c"]: m for m in data["members"]}
+    assert [c for c, m in members.items() if m["status"] == "frozen"] == ["1101", "1103"]
+    assert all(m["status"] == "member" for c, m in members.items() if c not in ("1101", "1103"))
+    assert [members[c]["rank"] for c in codes] == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert [c for c, m in members.items() if m["picked"]] == ["1102", "1104", "1105"]
+    first, third = members["1101"], members["1103"]
+    assert (first["rank"], first["picked"], third["rank"], third["picked"]) == (None, False, None, False)
+    assert (first["n"], first["c0"], first["ai_source"]) == ("股1101", 100.0, "00952")
+    assert first["facts"]["c"] == "1101" and first["trend"] == "pool" and first["tr"] == [100.0, 100.0, 90.0, 0]
+    assert first["checks"] == {"ai": True, "growth": True, "cheap": True, "trend": True}
+    assert third["trend"] is None and third["tr"] is None  # 不是候選、主池也沒有：bot 沒看它的走勢
+    assert third["checks"] == {"ai": True, "growth": True, "cheap": True, "trend": None}
+
+
+def test_frozen_codes_are_not_reported_as_skipped(monkeypatch, clock):  # 每日維護把 ai_skipped 當成「日線拿不到」
+    rig = Rig(monkeypatch, clock, 4)
+    sp._ai_cache_t = rig.snapshot.t
+    sp._ai_chart_cache["1101"] = (sp._AI_NO, "chart_unavailable")
+    _write_cooldown(_cooldown([_frozen("1101")]))
+    assert rig.run()["skipped"] == {}
+
+
+def test_over_25pct_leaves_the_round_alone_and_says_so(monkeypatch, clock):
+    spool = _make_spool()
+    rig = Rig(monkeypatch, clock, 8)
+    _write_cooldown(_cooldown([_frozen(c) for c in ("1101", "1102", "1103")]))  # 8 檔上限 2 檔
+    state = rig.run()
+    assert rig.picks == ["1101", "1102", "1103"]
+    assert state["funnel"] == {"universe": 8, "growth": 8, "cheap": 8, "trend": 3}
+    data = _spool_data(spool)
+    assert (data["cooldown_read"], data["cooldown"]) == ("ok", {"removed": [], "reason": "over_25pct"})
+    assert {m["status"] for m in data["members"]} == {"member"}
+
+
+def test_invalid_file_leaves_the_round_alone_and_says_so(monkeypatch, clock):
+    spool = _make_spool()
+    rig = Rig(monkeypatch, clock, 4)
+    _write_cooldown(b"{")
+    state = rig.run()
+    assert rig.picks == ["1101", "1102", "1103"] and state["fail_count"] == 0
+    assert (_spool_data(spool)["cooldown_read"], _spool_data(spool)["cooldown"]) == (
+        "invalid", {"removed": [], "reason": None})
+
+
+@pytest.mark.parametrize("failure, read, cooldown", [
+    ("apply_cooldown", None, None),  # 呼叫丟例外：applied 是 None，兩個欄位維持 null
+    ("read_cooldown", "error", {"removed": [], "reason": None}),  # apply_cooldown 自己接住
+])
+def test_hook_errors_do_not_change_the_recommendation(failure, read, cooldown, monkeypatch, clock):
+    spool = _make_spool()
+    rig = Rig(monkeypatch, clock, 4)
+    _write_cooldown(_cooldown([_frozen("1101")]))  # 檔案其實要拿掉 1101
+    monkeypatch.setattr(hook, failure, _boom)
+    state = rig.run()
+    assert rig.picks == ["1101", "1102", "1103"] and state["fail_count"] == 0 and sp._ai_next_try == 0.0
+    assert state["funnel"] == {"universe": 4, "growth": 4, "cheap": 4, "trend": 3}
+    data = _spool_data(spool)
+    assert (data["cooldown_read"], data["cooldown"]) == (read, cooldown)
+    assert [m["c"] for m in data["members"]] == ["1101", "1102", "1103", "1104"]
+    assert {m["status"] for m in data["members"]} == {"member"}
+
+
+def test_without_a_cooldown_file_the_round_is_what_it_was_before_b2(monkeypatch, clock):
+    rig = Rig(monkeypatch, clock, 10)
+    state = copy.deepcopy(rig.run())
+    reply = sp._ai_picks_reply(sp._snapshot)
+    assert [p["c"] for p in state["picks"]] == ["1101", "1102", "1103"]
+    assert state["funnel"] == {"universe": 10, "growth": 10, "cheap": 10, "trend": 3}
+    assert state["universe"]["codes"] == [f.code for f in rig.facts]
+    monkeypatch.setitem(sys.modules, "stock_picks_review_hook", None)  # hook 不在＝B2 之前的程式
+    rig.version = "test-v2"  # 名單換版：同一個 T 再算一次
+    before = copy.deepcopy(rig.run())
+    assert before["core_version"] == "test-v2"
+    same = ("t", "rule", "universe", "picks", "funnel", "fail_count", "core_as_of", "skipped")
+    assert {k: before[k] for k in same} == {k: state[k] for k in same}
+    assert sp._ai_picks_reply(sp._snapshot) == reply
+
+
+def _on_day(rig: Rig, monkeypatch, day: date) -> None:
+    """主快照換成 day 這個資料日（Rig 的主快照是 T；走勢都在主池，換日不用多餵日線）。"""
+    rig.snapshot = replace(rig.snapshot, t=day, calendar=_calendar(day))
+    monkeypatch.setattr(sp, "_snapshot", rig.snapshot)
+
+
+def test_a_same_t_recompute_does_not_take_back_what_the_family_saw(monkeypatch, clock):
+    """PLAN_B2C2 §2.1：T＝週五、週日凍結、週一清晨同 T 重算，X 還在；T＝週一才拿掉。"""
+    rig = Rig(monkeypatch, clock, 4, pool=True)  # 4 檔最多 ceil(1)＝1 檔
+    universe = sp._ai_universe
+
+    def no_holdings_today(snapshot, give_up):  # 00952 當天沒抓到：holdings_due 讓同一個 T 一直重算
+        u, sources, core_as_of, version = universe(snapshot, give_up)
+        return {**u, "source": "core_only"}, sources, core_as_of, version
+
+    monkeypatch.setattr(sp, "_ai_universe", no_holdings_today)
+    _on_day(rig, monkeypatch, FRIDAY)
+    rig.run()
+    assert rig.picks == ["1101", "1102", "1103"] and rig.universe_calls == 1  # 週六家人看到的
+    _write_cooldown(_cooldown([_frozen("1101", SUNDAY, SUNDAY_UNTIL)]))  # 週日 20:00 job 凍 1101
+    clock.advance(sp.AI_RETRY_S + 1)
+    rig.run()
+    assert rig.universe_calls == 2 and sp._ai_state["t"] == FRIDAY.isoformat()  # 真的重算了
+    assert rig.picks == ["1101", "1102", "1103"]
+    assert _history_days() == [FRIDAY.isoformat()]  # picks 沒變，推薦紀錄不多一版，成績帳不會改取新的 rev
+    _on_day(rig, monkeypatch, MONDAY)
+    clock.advance(sp.AI_RETRY_S + 1)
+    rig.run()
+    assert sp._ai_state["t"] == MONDAY.isoformat() and rig.picks == ["1102", "1103", "1104"]
+    assert sp._ai_state["funnel"]["universe"] == 3
+    assert _history_days() == [FRIDAY.isoformat(), MONDAY.isoformat()]
+
+
+def test_contract_a_spool_with_frozen_members_is_accepted_by_the_job(monkeypatch, clock):
+    pool = _job("stock_picks_review_pool")
+    spool = _job_spool(monkeypatch)
+    rig = Rig(monkeypatch, clock, 10)
+    _write_cooldown(_cooldown([_frozen("1101"), _frozen("1103")]))
+    state = rig.run()
+    [path] = _spool_files(spool)
+    version = _job_accepts(pool, path, state)  # bot 真的寫出來的位元組，原樣交給 job
+    assert version.cooldown_read == "ok" and version.meta["funnel"]["universe"] == 8
+    assert [r.code for r in version.rows] == [f.code for f in rig.facts]  # 10 檔都在
+    frozen = [r for r in version.rows if r.status == pool.FROZEN]
+    assert [(r.code, r.c0, r.rank, r.picked) for r in frozen] == [("1101", 100.0, None, False), ("1103", 100.0, None, False)]
+    assert [r.code for r in version.rows if r.picked] == ["1102", "1104", "1105"]
