@@ -82,7 +82,7 @@ def test_empty_search_does_not_generate_unverified_answer(monkeypatch, isolated)
     monkeypatch.setattr(main, "_llm_chat", lambda *a: pytest.fail("no evidence"))
     event = SimpleNamespace(source=SimpleNamespace(user_id="U_TEST"), reply_token="T_TEST")
     main._handle_web_research_question(event, "G_TEST", FIXTURE)
-    assert isolated == [research.NO_EVIDENCE]
+    assert isolated == []
 
 
 @pytest.mark.parametrize("text", [
@@ -103,7 +103,6 @@ def test_confidential_mixed_text_never_reaches_collector(text):
     "我可以幫你查近期報導。",
     "我目前沒有最新資料，等我搜尋一下。",
     "我可以幫你查查最新報導。",
-    "", "  \n ",
 ])
 def test_deferred_search_variants_are_retried_then_rejected(monkeypatch, isolated, text):
     attempts = []
@@ -112,7 +111,18 @@ def test_deferred_search_variants_are_retried_then_rejected(monkeypatch, isolate
     event = SimpleNamespace(source=SimpleNamespace(user_id="U_TEST"), reply_token="T_TEST")
     main._handle_web_research_question(event, "G_TEST", FIXTURE)
     assert len(attempts) == 2
-    assert isolated == [research.NO_ANSWER]
+    assert isolated == []
+
+
+@pytest.mark.parametrize("text", ["", "  \n ", "（輸出空字串）"])
+def test_no_answer_from_the_sources_is_final(monkeypatch, isolated, text):
+    attempts = []
+    monkeypatch.setattr(main, "_collect_web_research_sources", lambda _: SOURCES)
+    monkeypatch.setattr(main, "_llm_chat", lambda *a: attempts.append(a) or text)
+    event = SimpleNamespace(source=SimpleNamespace(user_id="U_TEST"), reply_token="T_TEST")
+    main._handle_web_research_question(event, "G_TEST", FIXTURE)
+    assert len(attempts) == 1
+    assert isolated == []
 
 
 @pytest.mark.parametrize("text", [FIXTURE.replace("，", "\n"),
@@ -200,5 +210,5 @@ def test_unavailable_video_status_is_not_evidence(monkeypatch, isolated):
     event = SimpleNamespace(source=SimpleNamespace(user_id="U_TEST"), reply_token="T_TEST")
     main._handle_web_research_question(event, "G_TEST", "這直播在講什麼 https://www.youtube.com/live/DEMO1234567")
     # 2026-09-26: a video-link question with nothing retrieved stays silent
-    # (9/19 link-failure rule) rather than sending NO_EVIDENCE.
+    # (9/19 link-failure rule).
     assert isolated == []

@@ -60,7 +60,6 @@ def test_rejected_nonanswer_is_empty(text):
     "未取得完整逐字稿；根據標題、頻道與描述，這場直播主題是在說央行利率決策。",
     "要設定觀看 YouTube 影片的提醒，請提供影片標題和提醒時間。",
     "目前有兩筆活動，無法判斷要修改哪一筆，請提供日期。",
-    public_research.NO_EVIDENCE,
     # A judgement or advice next to the missing-subtitle note is still an answer.
     "單一個案無法證實影片內容具有普遍療效。",
     "無法查證影片說法時應先比對原始公告再轉傳。",

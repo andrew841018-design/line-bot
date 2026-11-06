@@ -32,7 +32,7 @@ NO_REPEAT_CONTRACT = """【不重複、不摘要：只給新價值】
 NO_SEARCH_CONTRACT = """【這次回覆沒有搜尋工具——優先於上方所有規則】
 你這次不能上網或搜尋，訓練資料也比上方「目前台灣時間」舊。上方任何要你「用 Google 搜尋」「先查證」「查至少幾個來源」「主動查」的規則，這次都做不到，改用下面的做法。只有【最新訊息】裡附上的資料（連結預讀內容、市場報價、程式搜尋結果）算本次取得的資料。
 - 沒有附資料時，不能說「查到／查不到／沒查到／再查一次／目前查到的資料／搜尋結果／根據某某官網或說明」，也不能假裝看過報導。
-- 近期或會變動的公開事實（新聞、外交與政治事件、人物動態、價格與股價、信用卡與優惠條件、政策規定、營業時間），沒有附資料就不能憑記憶判定對方說錯、說事件沒發生或暗示消息可疑，也不能憑記憶補日期、數字或場合；沒有人直接問你時輸出空字串，被直接問到時只說你沒辦法確認最新情況，不下結論。
+- 近期或會變動的公開事實（新聞、外交與政治事件、人物動態、價格與股價、信用卡與優惠條件、政策規定、營業時間），沒有附資料就不能憑記憶判定對方說錯、說事件沒發生或暗示消息可疑，也不能憑記憶補日期、數字或場合；不管有沒有人直接問你，都輸出空字串。
 - 對方堅持、補充日期或來源，而你沒有新附的資料時，同樣不能再用記憶否認。
 - 附了資料時，只說資料寫到的內容。
 """
@@ -2917,3 +2917,72 @@ def date_claim_findings(
                 found.append("election_timing")
                 break
     return found
+
+
+# 2026-11-06 Andrew: 「以後就是去核實，不要講這種空話」.  What a model without search writes
+# about a public fact it cannot check, in the words of its own prompt or close to them.  Link
+# limits (影片、字幕、內文 not read) follow the 9/19 and 9/26 link rules, not this; someone
+# else's inability (「路透社說無法核實」「安檢人員無法確認」) is a fact, so these want the first
+# person or the prompt's own words.
+_MISSING_DATA_RE = re.compile(
+    r"(?:我|目前|這次|說法|^|[，,：:」])\s*(?:沒有|沒|未)(?:本次)?附(?:上)?[^。！？!?\n]{0,12}"
+    r"(?:資料|行情|報價|財報|報導|統計|數據|條文|股價)"
+    r"|我[^。！？!?\n，,]{0,6}(?:沒有|沒拿到|沒查到|拿不到|查不到)[^。！？!?\n，,你妳您他她]{0,10}"
+    r"(?:報價|行情|資料|財報|報導|統計|數據|條文|股價)"
+    r"|我[^。！？!?\n]{0,14}(?:無法|沒辦法|不能)(?:替你|幫你)?(?:核實|核對|查證|驗證)"
+    r"|我[^。！？!?\n]{0,14}(?:無法|沒辦法|不能)確認[^。！？!?\n，,]{0,8}(?:最新|現價|現況|價位|跌幅|漲幅|股價|行情|報價)"
+    r"|^[\s•・\-]*(?:無法|沒辦法)確認最新情況"
+    r"|沒有搜尋工具|未取得足夠的可靠資料|未能產生可靠|還無法核實這個說法"
+    r"|先別當成(?:已確認|確定|事實)"
+)
+# Its own instruction printed back, in words is_empty_marker does not know.  The model chose
+# silence and what stands next to it is its reason (「…沒人點名咪寶就不插手。\n\n（輸出空字串）」,
+# 2026-11-06), so nothing of the reply goes.  Of the last 774 replies 2 mention an empty string,
+# both this; that is why a how-to in a family group loses to it.  Matched on each compacted line;
+# 空白 only in brackets: 「印表機輸出空白頁」.
+_PRINTED_SILENCE_RE = re.compile(
+    rf"(?<![不勿別])(?<!不[要會能可得應該])(?<!不應該)(?<!避免)(?<!禁止)輸出[:：]?{_MARKER_QOPEN}?"
+    rf"(?:{_MARKER_EMPTY}|{_MARKER_QUOTES}|空白(?={_MARKER_CLOSE}))"
+)
+_ASKS_ABOUT_EMPTY_RE = re.compile(r"空(?:白)?字串|空字符串|empty", re.IGNORECASE)
+# Sending the reader off to look, unless where to look is what they asked.
+_SENDS_TO_LOOK_RE = re.compile(
+    r"(?:到|去|上)\s*(?:https?://\S{1,2048}|[A-Za-z][A-Za-z ]{1,16})\s*查"
+    r"|自己(?:再|去|到|上)?[^。！？!?\n]{0,10}?(?<![檢調審])查(?!過|到|了)"
+)
+_ASKS_WHERE_RE = re.compile(r"怎麼查|哪裡查|哪查|哪裡看|在哪看|網址|連結")
+# A URL is part of its sentence: 「?ref=1」 ends nothing.
+_REPLY_SENTENCE_RE = re.compile(r"(?:https?://\S+|[^。！？!?\n])+[。！？!?]*")
+# Less than this left is no reply: a bullet mark, 「另外，」.
+_MIN_REPLY_WORDS = 8
+
+
+def strip_missing_data(text: str | None, request: str = "") -> str:
+    """``text`` without the sentences saying it has no data or sending the reader to look.
+
+    ``""`` when the reply opens with one: all it had to say is that it could not check, and what
+    follows is written around that (2026-10-05: with 「沒辦法確認」 gone, the sentence after it read
+    as a concession).  A note further down goes alone, so advice before it still reaches the family.
+    ``""`` too when it prints its own silence instruction anywhere.
+    ``request``: what was asked; someone asking where to look gets told, and someone asking about
+    empty strings gets the answer.
+    """
+    value = text or ""
+    if (any(_PRINTED_SILENCE_RE.search(_MARKER_IGNORED_RE.sub("", line)) for line in value.splitlines())
+            and not _ASKS_ABOUT_EMPTY_RE.search(_user_words(request))):
+        return ""
+    told_to_look = bool(_ASKS_WHERE_RE.search(request or ""))
+    found = [m for m in _REPLY_SENTENCE_RE.finditer(value) if m.group(0).strip()]
+    bad = [
+        m for m in found
+        if _MISSING_DATA_RE.search(m.group(0))
+        or (not told_to_look and _SENDS_TO_LOOK_RE.search(m.group(0)))
+    ]
+    if not bad:
+        return value
+    if bad[0] is found[0]:
+        return ""
+    for match in reversed(bad):
+        value = value[:match.start()] + value[match.end():]
+    value = re.sub(r"\n{3,}", "\n\n", value).strip()
+    return value if len(re.sub(r"[\W_]+", "", value)) >= _MIN_REPLY_WORDS else ""

@@ -377,7 +377,7 @@ def test_video_question_with_nothing_new_is_silent_without_retry(monkeypatch, re
     assert _research_status() == "completed_no_reply"
 
 
-def test_video_question_retries_after_provider_error_then_stays_silent(monkeypatch, research_env):
+def test_video_question_stays_silent_after_provider_error_without_retry(monkeypatch, research_env):
     monkeypatch.setattr(main, "_collect_web_research_sources", lambda _text: ROWS)
     monkeypatch.setattr(main, "_prefetch_urls", lambda text: text)
     calls = []
@@ -388,7 +388,7 @@ def test_video_question_retries_after_provider_error_then_stays_silent(monkeypat
 
     monkeypatch.setattr(main, "_llm_chat", boom)
     assert main._handle_web_research_question(research_env.event, "G_VID", QUESTION) is True
-    assert len(calls) == 2
+    assert len(calls) == 1
     assert research_env.sent == []
     assert _research_status() == "completed_no_reply"
 
@@ -402,13 +402,13 @@ def test_two_line_video_question_prefetches_the_clean_url(monkeypatch, research_
     assert seen and YT in seen[0] and f"{YT}，" not in seen[0]
 
 
-def test_public_claim_with_video_link_still_gets_no_evidence(monkeypatch, research_env):
+def test_public_claim_with_video_link_says_nothing_without_evidence(monkeypatch, research_env):
     monkeypatch.setattr(main, "_collect_web_research_sources", lambda _text: [])
     monkeypatch.setattr(main, "_prefetch_urls", lambda text: text)
     monkeypatch.setattr(main, "_llm_chat", lambda *_a: pytest.fail("no evidence"))
     main._handle_web_research_question(
         research_env.event, "G_VID", f"今年東南亞榴槤生產過剩，所以比較便宜。 {YT}")
-    assert research_env.sent == [public_research.NO_EVIDENCE]
+    assert research_env.sent == []
 
 
 def test_private_text_with_video_link_is_never_fetched(monkeypatch, research_env):

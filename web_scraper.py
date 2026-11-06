@@ -21,12 +21,13 @@ Helper：
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
 import xml.etree.ElementTree as ET
 from typing import Optional
-from urllib.parse import parse_qs, quote_plus, unquote, urlparse
+from urllib.parse import parse_qs, quote, quote_plus, unquote, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -85,7 +86,7 @@ def search_duckduckgo(query: str, k: int = 5) -> list[dict]:
             timeout=_HTTP_TIMEOUT,
         )
     except Exception as e:
-        logger.info("DDG request failed: %s", e)
+        logger.info("DDG request failed type=%s", type(e).__name__)
         _polite_sleep()
         return []
 
@@ -170,6 +171,57 @@ def _resolve_google_news_url(redirect_url: str) -> str:
     return redirect_url
 
 
+_GNEWS_ARTICLE_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
+_GNEWS_SIGNATURE_RE = re.compile(r'data-n-a-sg="([^"]+)"')
+_GNEWS_TIMESTAMP_RE = re.compile(r'data-n-a-ts="(\d+)"')
+_GNEWS_BATCH_URL = "https://news.google.com/_/DotsSplashUi/data/batchexecute"
+_GNEWS_DECODE_TIMEOUT = 3.0
+
+
+def decode_google_news_url(redirect_url: str, timeout: float = _GNEWS_DECODE_TIMEOUT) -> str:
+    """The article behind a Google News RSS link; "" when it cannot be had in time.
+
+    The same two requests googlenewsdecoder makes, each with a timeout: its own
+    have none, and a stalled one would hold a research worker for good
+    (2026-11-06).  Both stay on news.google.com, never go to anything the link says.
+    """
+    parsed = urlparse(redirect_url or "")
+    article = parsed.path.rsplit("/", 1)[-1]
+    if parsed.hostname != "news.google.com" or not _GNEWS_ARTICLE_ID_RE.fullmatch(article):
+        return ""
+    try:
+        page = requests.get(
+            f"https://news.google.com/rss/articles/{article}",
+            headers=_DEFAULT_HEADERS, timeout=timeout,
+        )
+        page.raise_for_status()
+        if urlparse(page.url).hostname != "news.google.com":  # it redirects to itself, with parameters
+            return ""
+        signature = _GNEWS_SIGNATURE_RE.search(page.text)
+        stamp = _GNEWS_TIMESTAMP_RE.search(page.text)
+        if not signature or not stamp:
+            return ""
+        request = [
+            "Fbv4je",
+            '["garturlreq",[["X","X",["X","X"],null,null,1,1,"US:en",null,1,null,null,null,'
+            'null,null,0,1],"X","X",1,[1,1,1],1,1,null,0,0,null,0],'
+            f'"{article}",{stamp.group(1)},"{signature.group(1)}"]',
+        ]
+        resp = requests.post(
+            _GNEWS_BATCH_URL,
+            headers={**_DEFAULT_HEADERS,
+                     "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"},
+            data=f"f.req={quote(json.dumps([[request]]))}",
+            timeout=timeout, allow_redirects=False,
+        )
+        resp.raise_for_status()
+        decoded = json.loads(json.loads(resp.text.split("\n\n")[1])[0][2])[1]
+    except (requests.RequestException, ValueError, IndexError, TypeError, KeyError) as exc:
+        logger.info("google news decode failed type=%s", type(exc).__name__)
+        return ""
+    return decoded if isinstance(decoded, str) and decoded.startswith(("http://", "https://")) else ""
+
+
 def search_google_news(query: str, k: int = 10, *, resolve_urls: bool = True) -> list[dict]:
     """Google News RSS — 純 HTTP，無 API key。
 
@@ -184,7 +236,7 @@ def search_google_news(query: str, k: int = 10, *, resolve_urls: bool = True) ->
     try:
         resp = requests.get(url, headers=_DEFAULT_HEADERS, timeout=_HTTP_TIMEOUT)
     except Exception as e:
-        logger.info("Google news RSS request failed: %s", e)
+        logger.info("Google news RSS request failed type=%s", type(e).__name__)
         _polite_sleep()
         return []
     _polite_sleep()
@@ -225,12 +277,14 @@ def search_google_news(query: str, k: int = 10, *, resolve_urls: bool = True) ->
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. Full-text fetch + clean (trafilatura primary, BS4 fallback)
 # ─────────────────────────────────────────────────────────────────────────────
-def fetch_full_text(url: str, max_chars: int = 5000) -> Optional[str]:
+def fetch_full_text(url: str, max_chars: int = 5000, *, http_get=None) -> Optional[str]:
     """抽乾淨正文（去 nav / footer / ads）。
 
     主：trafilatura.extract（boilerpipe-like，文章類最準）
     退：BeautifulSoup get_text（html2text 級的退路）
     cap max_chars。
+
+    ``http_get``：換掉 requests.get（`fetch_public_text` 傳 safe_fetch）。
 
     失敗 → None。
     """
@@ -238,7 +292,7 @@ def fetch_full_text(url: str, max_chars: int = 5000) -> Optional[str]:
         return None
 
     try:
-        resp = requests.get(
+        resp = (http_get or requests.get)(
             url, headers=_DEFAULT_HEADERS, timeout=_HTTP_TIMEOUT, allow_redirects=True
         )
     except Exception as e:
@@ -288,6 +342,25 @@ def fetch_full_text(url: str, max_chars: int = 5000) -> Optional[str]:
         return None
 
 
+_PUBLIC_TEXT_MAX_BYTES = 1024 * 1024
+
+
+def fetch_public_text(url: str, max_chars: int = 5000, *, deadline: float = 5.0) -> Optional[str]:
+    """fetch_full_text through safe_fetch, for an address a search result gave us.
+
+    Public addresses only, every redirect checked, at most ``deadline`` seconds for the
+    transfer; a longer page is cut, the article is at its start and parsing takes time.
+    """
+    import safe_fetch
+
+    def get(target, **kwargs):
+        return safe_fetch.http.get(
+            target, deadline=deadline, max_bytes=_PUBLIC_TEXT_MAX_BYTES, truncate=True, **kwargs
+        )
+
+    return fetch_full_text(url, max_chars, http_get=get)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. Wikipedia full summary (含可選 article body)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -305,7 +378,7 @@ def search_wiki_full(
     try:
         resp = requests.get(api_url, headers=_DEFAULT_HEADERS, timeout=_HTTP_TIMEOUT)
     except Exception as e:
-        logger.info("wiki request failed (%s): %s", t, e)
+        logger.info("wiki request failed type=%s", type(e).__name__)
         _polite_sleep()
         return None
     _polite_sleep()
@@ -314,7 +387,7 @@ def search_wiki_full(
     try:
         data = resp.json()
     except Exception as e:
-        logger.info("wiki json decode failed (%s): %s", t, e)
+        logger.info("wiki json decode failed type=%s", type(e).__name__)
         return None
 
     extract = (data.get("extract") or "").strip()
@@ -511,6 +584,8 @@ __all__ = [
     "search_duckduckgo",
     "search_google_news",
     "fetch_full_text",
+    "fetch_public_text",
+    "decode_google_news_url",
     "search_wiki_full",
     "search_arxiv",
     "scrape_taiwan_gov",

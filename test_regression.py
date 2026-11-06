@@ -210,7 +210,8 @@ def test_non_explicit_quoted_url_followup_routes_to_web_research():
     assert research_text == "這個真的假的 https://example.com/a"
     import public_research
     assert public_research.public_query(research_text) == research_text
-    mock_cancel.assert_called_once_with("GRP001")
+    assert mock_web.call_args.kwargs["cancel_pending_burst"] is True  # the handler takes the burst
+    mock_cancel.assert_not_called()
     mock_burst.assert_not_called()
 
 
@@ -952,12 +953,7 @@ def test_web_research_empty_lookup_reports_no_evidence(monkeypatch):
         )
 
     assert handled is True
-    import public_research
-    mock_reply.assert_called_once_with(
-        "TOKEN001",
-        public_research.NO_EVIDENCE,
-        group_id="GRP001",
-    )
+    mock_reply.assert_not_called()
 
 
 def test_lifespan_disables_local_text_runtime_before_pending_drain(monkeypatch):

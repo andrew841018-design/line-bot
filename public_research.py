@@ -12,9 +12,10 @@ from zoneinfo import ZoneInfo
 
 _POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="public-research")
 _SLOTS = threading.BoundedSemaphore(2)
-# TODO(2026-10-03 review): 「昨天總統宣布停火」「9月24日總統在機場迎接元首」 are not
-# researched (no 昨天／M月D日 here); widening this also widens what reaches search.
 _CURRENT = re.compile(r"今年|本月|本週|今天|今日|目前|現在|最近|近期|最新|20\d{2}年")
+# 2026-11-06: 「昨天總統宣布停火」「9月24日總統在機場迎接元首」: these count only with a
+# public-office person doing a public thing, whose search carries _PUBLIC_TERMS alone.
+_RECENT_DAY = r"昨天|昨晚|前天|前晚|剛剛|剛才"
 _FACT = re.compile(
     r"產量|生產|供應|供給|需求|過剩|短缺|價格|便宜|昂貴|漲價|降價|上漲|下跌|"
     r"政策|法規|關稅|出口|進口|物價|通膨|利率|匯率|經濟|新聞|統計|數據|疫情|缺貨"
@@ -37,8 +38,14 @@ _PUBLIC_PLACE = r"白宮|國會|國務院|機場|基地|國宴|峰會|聯合國|
 _COUNTRY = r"美國|中國|大陸|台灣|臺灣|日本|韓國|南韓|北韓|俄羅斯|烏克蘭|以色列|伊朗|英國|法國|德國|印度|兩國|雙方|各國"
 _PUBLIC_DATE = r"20\d{2}年|\d{1,2}月\d{1,2}日"
 # What may stand in front of the actor: when, where, which country, who said so.
+# Each word once: inside this `*` a word listed twice is two readings of the same string, and
+# 峰會, 國宴 and 20xx年 were, so a run of them doubled the work per word (2026-11-06 review).
+_LEAD_WORDS = "|".join(dict.fromkeys(
+    word for words in (_CURRENT.pattern, _RECENT_DAY, _PUBLIC_DATE, _COUNTRY, _PUBLIC_PLACE, _PUBLIC_EVENT)
+    for word in words.split("|")
+))
 _SUBJECT_LEAD = re.compile(
-    rf"(?:{_CURRENT.pattern}|昨天|前天|{_PUBLIC_DATE}|{_COUNTRY}|{_PUBLIC_PLACE}|{_PUBLIC_EVENT}"
+    rf"(?:{_LEAD_WORDS}"
     r"|新聞|報導|聽說|據說|說|指出|前|新任|現任|的|在|於|與|和|及|\s)*"
 )
 # A name written right before the title (賴總統、石破首相) is part of the actor;
@@ -48,7 +55,7 @@ _NOT_A_NAME = re.compile(r"[與和跟及同說在去找見到的被向對替幫�
 # or an illness in the same message must never reach a search engine); the
 # time words keep the search recent.
 _PUBLIC_TERMS = re.compile(
-    rf"{_CURRENT.pattern}|昨天|前天|{_PUBLIC_DATE}|{_COUNTRY}|{_PUBLIC_ACTOR}|{_PUBLIC_EVENT}|{_PUBLIC_PLACE}"
+    rf"{_CURRENT.pattern}|{_RECENT_DAY}|{_PUBLIC_DATE}|{_COUNTRY}|{_PUBLIC_ACTOR}|{_PUBLIC_EVENT}|{_PUBLIC_PLACE}"
 )
 # Family chat separates sentences with spaces, 「…」 and 「～」 too.
 _CLAUSE_MARKS = "，,。；;：:！？!?\n …～~　"
@@ -59,7 +66,7 @@ _PRIVATE = re.compile(
     r"大嫂|二嫂|嫂嫂|嫂子|大哥|二哥|大姊|大姐|姊夫|姐夫|妹夫|弟媳|媳婦|女婿|公公|婆婆|岳父|岳母|"
     r"親戚|鄰居|同事|朋友|男友|女友|男朋友|女朋友|"
     r"回診|看診|看醫生|掛號|住院|出院|開刀|手術|化療|放療|洗腎|復健|吃藥|藥物|診斷|懷孕|"
-    r"癌|腫瘤|中風|失智|憂鬱|焦慮症|糖尿病|高血壓|心臟病|過世|去世|喪禮|離婚|官司|訴訟|欠債|負債|借錢|"
+    r"癌|腫瘤|中風|失智|憂鬱|焦慮症|糖尿病|高血壓|心臟病|過世|去世|喪禮|離婚|官司|訴訟|欠債|欠錢|負債|借錢|"
     r"確診|生病|感冒|發燒|咳嗽|過敏|看病|開藥|急診|醫院|產檢|坐月子|生小孩|"
     r"房貸|車貸|貸款|存款|保單|他的|她的|他們的|她們的|"
     # 「小芳也確診了」「阿明的房貸」: a nickname doing something
@@ -108,6 +115,171 @@ def _public_affairs_clause(value: str) -> str:
         ends = [i for i in (value.find(mark, match.end()) for mark in _CLAUSE_MARKS) if i >= 0]
         return value[start:min(ends) if ends else len(value)]
     return ""
+
+
+# 2026-11-06 Andrew (a family member said a big tech stock had crashed; the reply was 「沒有報價
+# 可以核對」 from a model that cannot search): 「他應該要有能力找到…相關資訊」.  A listed public
+# name and a sharp move in one clause is a public claim, with or without 今天／最近.  The name
+# list, not the verb, keeps 「體重暴跌」 and 「成績大跌」 out; only these fixed words are searched.
+_MARKET_STOCKS = {
+    "Google": ("谷歌", "google", "alphabet", "googl", "goog"),
+    "蘋果": ("蘋果", "apple", "aapl"),
+    "微軟": ("微軟", "microsoft", "msft"),
+    "亞馬遜": ("亞馬遜", "amazon", "amzn"),
+    "特斯拉": ("特斯拉", "tesla", "tsla"),
+    "輝達": ("輝達", "英偉達", "nvidia", "nvda"),
+    "Meta": ("meta", "臉書", "facebook"),
+    "Netflix": ("網飛", "netflix", "nflx"),
+    "超微": ("超微", "amd"),
+    "英特爾": ("英特爾", "intel", "intc"),
+    "美光": ("美光", "micron"),
+    "博通": ("博通", "broadcom", "avgo"),
+    "高通": ("高通", "qualcomm"),
+    "甲骨文": ("甲骨文", "oracle", "orcl"),
+    "三星": ("三星", "samsung"),
+    "SK海力士": ("海力士", "sk hynix"),
+    "軟銀": ("軟銀", "softbank"),
+    "阿里巴巴": ("阿里巴巴", "alibaba"),
+    "騰訊": ("騰訊", "tencent"),
+    "台積電": ("台積電", "台積", "tsmc", "tsm", "2330"),
+    "鴻海": ("鴻海", "2317"),
+    "聯發科": ("聯發科", "2454"),
+    "台達電": ("台達電",),
+    "廣達": ("廣達",),
+    "緯創": ("緯創",),
+    "緯穎": ("緯穎",),
+    "華碩": ("華碩",),
+    "聯電": ("聯電",),
+    "中華電": ("中華電",),
+    "中鋼": ("中鋼",),
+    "台塑": ("台塑",),
+    "台化": ("台化",),
+    "群創": ("群創",),
+    "友達": ("友達",),
+    "長榮": ("長榮",),
+    "陽明海運": ("陽明海運",),
+    "萬海": ("萬海",),
+    "華航": ("華航",),
+    "國泰金": ("國泰金",),
+    "富邦金": ("富邦金",),
+    "玉山金": ("玉山金",),
+    "兆豐金": ("兆豐金",),
+    "0050": ("0050",),
+    "0056": ("0056",),
+    "00878": ("00878",),
+    "006208": ("006208",),
+    "SOXL": ("soxl",),
+    "SOXX": ("soxx",),
+    "TQQQ": ("tqqq",),
+    "QQQ": ("qqq",),
+    "SPY": ("spy",),
+    "VOO": ("voo",),
+}
+_MARKET_WIDE = {
+    "美股": ("美股",),
+    "台股": ("台股", "臺股"),
+    "港股": ("港股",),
+    "日股": ("日股",),
+    "韓股": ("韓股",),
+    "陸股": ("陸股", "a股"),
+    "大盤": ("大盤",),
+    "加權指數": ("加權指數",),
+    "道瓊": ("道瓊", "道指"),
+    "標普500": ("標普", "s&p"),
+    "那斯達克": ("那斯達克", "納斯達克", "那指", "納指"),
+    "費半": ("費半", "費城半導體"),
+    "日經": ("日經",),
+    "恆生": ("恆生",),
+    "半導體股": ("半導體股", "半導體類股"),
+    "科技股": ("科技股",),
+    "AI股": ("ai股", "ai相關股"),
+    "金融股": ("金融股",),
+    "航運股": ("航運股",),
+    "比特幣": ("比特幣",),
+    "黃金": ("黃金", "金價"),
+    "白銀": ("白銀",),
+    "原油": ("原油", "油價"),
+}
+_MARKET_ALIASES = {
+    alias: name for table in (_MARKET_STOCKS, _MARKET_WIDE)
+    for name, aliases in table.items() for alias in aliases
+}
+def _market_alias(alias: str) -> str:
+    """ASCII stands alone: 「metaverse」 is not Meta, 「12330」 not 2330, 「visa股」 not a股."""
+    head = r"(?<![a-z0-9])" if alias[0].isascii() else ""
+    tail = r"(?![a-z0-9])" if alias[-1].isascii() else ""
+    return f"{head}{re.escape(alias)}{tail}"
+
+
+_MARKET_NAME_RE = re.compile("|".join(
+    _market_alias(alias) for alias in sorted(_MARKET_ALIASES, key=len, reverse=True)
+))
+# What only sounds like a listed name.
+_MARKET_FALSE_FRIENDS_RE = re.compile(
+    r"三星蔥|三星鄉|蘋果[汁派醋園樹]|黃金(?:時段|比例|交叉|週|獵犬)|長榮(?:大學|中學|路)"
+)
+_MARKET_MOVE_RE = re.compile(
+    r"暴跌|大跌|重挫|崩跌|崩盤|狂跌|慘跌|急跌|狂瀉|血洗|跳水|跌停|腰斬|跌破(?!眼鏡)|暴雷|"
+    r"暴漲|大漲|狂漲|飆漲|飆升|漲停|創(?:歷史)?新高|創(?:歷史)?新低|"
+    r"(?P<fall>跌[了到超過逾近幅約]{0,3}\s*\d)|(?P<rise>漲[了到超過逾近幅約]{0,3}\s*\d)"
+)
+# 「營收創新高」「銷量暴跌」 are the business, not its stock, unless the clause says 股價.
+_NOT_THE_PRICE_RE = re.compile(r"營收|銷量|銷售|獲利|盈餘|出貨|訂單|業績|用戶|人氣|評價")
+# 「等台積電大跌再買」「萬一美股崩盤」 have not happened; 「2008年美股崩盤」 is history.
+_NOT_NOW_RE = re.compile(r"如果|萬一|要是|假如|假設|以前|當年|那年|去年|前年|等[^,。;!?\n]{0,10}再")
+_YEAR_RE = re.compile(r"(?:19|20)\d{2}(?=年)")
+# Not spaces: 「輝達 暴跌」 is one clause, whatever _CLAUSE_MARKS says about family chat.
+_MARKET_CLAUSE_RE = re.compile(r"[,。;!?\n~]|\.\.\.")
+# 「台積電跌停了嗎」: a price answers that; 「台積電為什麼跌停」: only the news does.
+_ASKS_WHY_RE = re.compile(r"為什麼|為何|原因|因為|怎麼會|怎麼回事|怎麼了")
+
+
+def market_move_terms(text: str) -> str:
+    """The fixed words to search for a claim that a listed market name moved sharply, or "".
+
+    「輝達財報後暴跌13%」 is 「輝達 股價 暴跌」: every word comes from the tables above, so
+    nothing else in the message can reach a search.  Reads ``text`` as it is: the caller
+    has passed it through `public_query`.
+    """
+    folded = _MARKET_FALSE_FRIENDS_RE.sub(" ", _fold(text))
+    this_year = str(datetime.now(ZoneInfo("Asia/Taipei")).year)
+    for clause in _MARKET_CLAUSE_RE.split(folded):
+        move = _MARKET_MOVE_RE.search(clause)
+        if not move or _NOT_NOW_RE.search(clause):
+            continue
+        if any(year != this_year for year in _YEAR_RE.findall(clause)):
+            continue
+        says_price = "股價" in clause
+        if _NOT_THE_PRICE_RE.search(clause) and not says_price:
+            continue
+        # 「輝達財報不如預期，股價暴跌」: the name is in the clause before, and so is 「如果」.
+        where = folded if says_price else clause
+        if _NOT_NOW_RE.search(where):
+            continue
+        names = list(dict.fromkeys(
+            _MARKET_ALIASES[match.group(0)] for match in _MARKET_NAME_RE.finditer(where)
+        ))[:3]
+        if names:
+            word = "下跌" if move.group("fall") else "上漲" if move.group("rise") else move.group(0)
+            stock = ["股價"] if any(name in _MARKET_STOCKS for name in names) else []
+            return " ".join([*names, *stock, word])
+    return ""
+
+
+def is_market_query(query: str) -> bool:
+    """``query`` is what `market_move_terms` returned (「0050 股價 下跌」), not a sentence."""
+    words = (query or "").split()
+    return (len(words) >= 2 and words[0] in {*_MARKET_STOCKS, *_MARKET_WIDE}
+            and (words[-1] in ("下跌", "上漲") or bool(_MARKET_MOVE_RE.fullmatch(words[-1]))))
+
+
+def asks_if_market_moved(text: str) -> bool:
+    """A question whether a listed name moved, with no 「為什麼」: a quote can answer it."""
+    value = public_query(text)
+    return bool(
+        value and market_move_terms(value)
+        and _QUESTION_FORM.search(value) and not _ASKS_WHY_RE.search(value)
+    )
 
 
 # 2026-10-24 (B1.4): a question about the number in a public regulation (an
@@ -232,7 +404,14 @@ def _search_query(text: str) -> tuple[str, str]:
     value = public_query(text)
     if not value:
         return "", ""
-    if _FACT.search(value):
+    terms = market_move_terms(value)
+    if terms:
+        return terms, ""
+    # 「昨天川普宣布關稅，王大明的工廠出口要倒了」 counts for its public-office clause alone:
+    # that clause's public words go, not the one with the factory.
+    dated_event = (not _CURRENT.search(value) and re.search(rf"{_RECENT_DAY}|{_PUBLIC_DATE}", value)
+                   and _public_affairs_clause(value))
+    if _FACT.search(value) and not dated_event:
         parts = [part.strip() for part in re.split(f"[{_CLAUSE_MARKS}]", value) if part.strip()]
         claim = [part for part in parts if _FACT.search(part)]
         return (value, "") if len(claim) == len(parts) else _with_regulation_ask(value, claim)
@@ -246,11 +425,14 @@ def _search_query(text: str) -> tuple[str, str]:
 
 def requires_current_research(text: str) -> bool:
     value = public_query(text)
-    return bool(
-        value
-        and _CURRENT.search(value)
-        and (_FACT.search(value) or _public_affairs_clause(value))
-    )
+    if not value:
+        return False
+    if market_move_terms(value):
+        return True
+    if _CURRENT.search(value) and _FACT.search(value):
+        return True
+    return bool(re.search(rf"{_CURRENT.pattern}|{_RECENT_DAY}|{_PUBLIC_DATE}", value)
+                and _public_affairs_clause(value))
 
 
 def has_search_promise(text: str) -> bool:
@@ -311,14 +493,9 @@ def collect(
     return usable
 
 
-NO_EVIDENCE = "這次搜尋未取得足夠的可靠資料，還無法核實這個說法。"
-NO_ANSWER = "已取得相關資料，但這次未能產生可靠的查證結論。"
-
-# 2026-10-28: plain questions the search found nothing for were answered with
-# NO_EVIDENCE, as if someone had forwarded a claim.  A plain question carries
-# no claim of its own: it searches on (main._plain_question_answer) and gets
-# NO_SOURCE_QUESTION only when every layer fails.  Claims keep NO_EVIDENCE.
-NO_SOURCE_QUESTION = "這次沒查到可靠的資料，暫時沒辦法回答這個問題。"
+# 2026-11-06 Andrew: research has no line of its own for finding nothing.  「這次搜尋未取得足夠
+# 的可靠資料…」: 「我不想看到這句，以後就是去核實，不要講這種空話」; when every layer failed he
+# chose silence over the 2026-10-28 「這次沒查到可靠的資料…」 (test_research_verify_claims.py).
 # Appended after the reply guards (「沒查到…資料」 is what the search-claim guard
 # drops, and 「最新資料」 next to any digit is what the outbound validator blocks).
 COMMON_KNOWLEDGE_NOTE = "（以上依一般常識回答，這次沒有找到可引用的來源。）"
@@ -349,16 +526,26 @@ _NOT_FROM_MEMORY = re.compile(
 def is_plain_question(text: str) -> bool:
     """A short question that carries no claim to check (``text``: links removed)."""
     value = public_query(text)
-    # A regulation question stays a plain question (excluding it would bring
-    # NO_EVIDENCE back): reply_guards' number guard judges the Gemini answer.
+    # A regulation question stays a plain question, for Gemini's search:
+    # reply_guards' number guard judges the answer.
     return bool(
         value
-        and len(value) <= 80
+        and len(value) <= SEARCHABLE_MAX_CHARS
         and _QUESTION_FORM.search(value)
         # Before public_query, which drops a leading 「幫我查證」.
         and not _CLAIM_CHECK.search(text or "")
         and not requires_current_research(text)
     )
+
+
+# The most a chat message may be and still go to a model that searches (2026-10-28, is_plain_question).
+SEARCHABLE_MAX_CHARS = 80
+
+
+def asks_to_check(text: str) -> bool:
+    """A short message asking whether something said is so: 「聽說…」「…是真的嗎」 (``text``: links removed)."""
+    value = public_query(text)
+    return bool(value and len(value) <= SEARCHABLE_MAX_CHARS and _CLAIM_CHECK.search(text or ""))
 
 
 # What a question cut down by search_query may take back from the rest of it:

@@ -847,7 +847,7 @@ def test_plain_web_research_question_bypasses_burst():
 
     # A question is addressed to the bot; a bare statement is not (2026-10-04).
     mock_web.assert_called_once_with(
-        event, "GRP001", "美股最近怎樣", cancel_pending_burst=True, addressed=True
+        event, "GRP001", "美股最近怎樣", cancel_pending_burst=True
     )
     mock_burst.assert_not_called()
 

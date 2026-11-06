@@ -96,7 +96,7 @@ def test_a_due_reminder_still_takes_the_reply_token_first(monkeypatch):
 
 
 def test_restaurant_question_goes_to_research(monkeypatch):
-    assert _route(monkeypatch, "這家餐廳有食安問題嗎") == ["research", "cancel"]
+    assert _route(monkeypatch, "這家餐廳有食安問題嗎") == ["research"]  # it takes the burst itself
 
 
 def test_dinner_question_gets_the_dinner_recommendation(monkeypatch):

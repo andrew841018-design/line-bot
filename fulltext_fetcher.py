@@ -144,6 +144,7 @@ def _fetch_one(
     url: str,
     max_chars: int,
     db_path: Path | str,
+    fetcher=None,
 ) -> Optional[str]:
     """Single-URL fetch：先查 cache，cache miss 才打 web_scraper。
 
@@ -153,8 +154,10 @@ def _fetch_one(
     if not url or not url.strip():
         return None
 
-    # Cache hit first
-    cached = _cache_lookup(db_path, url)
+    # Cache hit first.  A caller with its own fetcher has its own rows: what the plain
+    # fetcher read says nothing about what that one would have let through.
+    key = f"{fetcher.__name__}:{url}" if fetcher else url
+    cached = _cache_lookup(db_path, key)
     if cached:
         # cache 內存的可能是更長版本 — 重新 cap 一次
         if len(cached) > max_chars:
@@ -163,7 +166,7 @@ def _fetch_one(
 
     # Cache miss — call web_scraper
     try:
-        text = web_scraper.fetch_full_text(url, max_chars=max_chars)
+        text = (fetcher or web_scraper.fetch_full_text)(url, max_chars=max_chars)
     except Exception as e:
         # web_scraper 內部已吞例外回 None，但 defense-in-depth 包一層
         logger.info("fetch_full_text raised (%s): %s", url, e)
@@ -172,7 +175,7 @@ def _fetch_one(
     if not text:
         return None
     # Persist to cache（即使後續 caller cap 也存 full version 內 max_chars）
-    _cache_store(db_path, url, text)
+    _cache_store(db_path, key, text)
     return text
 
 
@@ -186,6 +189,8 @@ def fetch_top_sources(
     cache_db: Path | str | None = None,
     timeout_per_task: float = _PER_TASK_TIMEOUT,
     max_workers: int = _MAX_WORKERS,
+    fetcher=None,
+    join: bool = True,
 ) -> list[dict]:
     """Parallel full-text enrichment for the top-N sources.
 
@@ -196,6 +201,8 @@ def fetch_top_sources(
       cache_db: SQLite 檔路徑，default `finetune/data/web_text_cache.db`。
       timeout_per_task: 單條 fetch 的 hard timeout（秒）。
       max_workers: ThreadPoolExecutor pool size。
+      fetcher: 換掉 web_scraper.fetch_full_text，簽名 (url, max_chars=...)。
+      join: False 時 timeout_per_task 是全部共用的期限，到時用已抓到的，不等還在跑的工作。
 
     Returns:
       原 list 的淺 copy（每筆 dict 也是淺 copy），前 top_n 個會多一個
@@ -243,15 +250,19 @@ def fetch_top_sources(
 
     # 啟 thread pool
     results: dict[int, Optional[str]] = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+    ends = time.monotonic() + timeout_per_task
+    pool = ThreadPoolExecutor(max_workers=max_workers)
+    try:
         future_to_idx = {
-            pool.submit(_fetch_one, url, max_chars_per, db_path): idx
+            pool.submit(_fetch_one, url, max_chars_per, db_path, fetcher): idx
             for idx, url in urls
         }
         for fut in list(future_to_idx.keys()):
             idx = future_to_idx[fut]
             try:
-                results[idx] = fut.result(timeout=timeout_per_task)
+                results[idx] = fut.result(
+                    timeout=timeout_per_task if join else max(0.0, ends - time.monotonic())
+                )
             except FutTimeoutError:
                 logger.info("fetch timeout for idx=%d", idx)
                 # 嘗試 cancel（無法 hard-kill 但會 mark）
@@ -260,6 +271,8 @@ def fetch_top_sources(
             except Exception as e:
                 logger.info("fetch worker error idx=%d: %s", idx, e)
                 results[idx] = None
+    finally:
+        pool.shutdown(wait=join, cancel_futures=not join)
 
     # 寫回 head — 失敗 fallback snippet
     for idx, src in enumerate(head):
