@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import speaker_turns
+from private_tmp import private_tmp_dir
 from config import settings
 from reply_policy import (
     CLI_OUTPUT_FORMAT,
@@ -413,6 +414,7 @@ def _api_credit_empty(error_text: str) -> bool:
     )
 
 
+_PROMPT_DIR_NAME = "line-bot-cli-prompts"
 _PROMPT_FILE_PREFIX = "line-bot-claude-"
 _STALE_PROMPT_FILE_SEC = 600
 _CHILD_SECRET_ENV_RE = re.compile(
@@ -420,11 +422,11 @@ _CHILD_SECRET_ENV_RE = re.compile(
 )
 
 
-def _remove_stale_prompt_files() -> None:
+def _remove_stale_prompt_files(folder: Path) -> None:
     """Delete system-prompt files a killed worker left behind (they hold facts)."""
     cutoff = time.time() - _STALE_PROMPT_FILE_SEC
     try:
-        for path in Path(tempfile.gettempdir()).glob(_PROMPT_FILE_PREFIX + "*.txt"):
+        for path in folder.glob(_PROMPT_FILE_PREFIX + "*.txt"):
             try:
                 if path.stat().st_mtime < cutoff:
                     path.unlink()
@@ -432,6 +434,17 @@ def _remove_stale_prompt_files() -> None:
                 continue
     except OSError:
         pass
+
+
+def _new_prompt_file() -> tuple[int, str]:
+    """A 0600 file for the system prompt, in a folder that only holds these files.
+
+    2026-11-06: listing all of $TMPDIR for the stale ones made replies wait seconds
+    once tests had left two million folders there.
+    """
+    folder = private_tmp_dir(_PROMPT_DIR_NAME)
+    _remove_stale_prompt_files(folder)
+    return tempfile.mkstemp(prefix=_PROMPT_FILE_PREFIX, suffix=".txt", dir=str(folder))
 
 
 # 2026-10-04: the account's usage limit (shared with Andrew's own Claude Code)
@@ -669,11 +682,10 @@ def _chat_via_cli(
         return None
     system_prompt, user_prompt = prompt_parts
     timeout = max(10, int(settings.claude_cli_timeout_sec))
-    _remove_stale_prompt_files()
     system_prompt_path = ""
     started = time.monotonic()
     try:
-        fd, system_prompt_path = tempfile.mkstemp(prefix=_PROMPT_FILE_PREFIX, suffix=".txt")
+        fd, system_prompt_path = _new_prompt_file()
         try:
             handle = os.fdopen(fd, "w", encoding="utf-8")
         except BaseException:
@@ -757,11 +769,10 @@ def complete_json(
     if effort not in _CLI_EFFORTS:
         raise ValueError("unsupported Claude CLI effort")
     timeout = max(10, int(timeout_s))
-    _remove_stale_prompt_files()
     system_prompt_path = ""
     started = time.monotonic()
     try:
-        fd, system_prompt_path = tempfile.mkstemp(prefix=_PROMPT_FILE_PREFIX, suffix=".txt")
+        fd, system_prompt_path = _new_prompt_file()
         try:
             handle = os.fdopen(fd, "w", encoding="utf-8")
         except BaseException:

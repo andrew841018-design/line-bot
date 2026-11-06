@@ -2057,4 +2057,4 @@ def test_complete_json_effort_defaults_to_low_and_rejects_other_values(monkeypat
     with pytest.raises(ValueError):
         claude_client.complete_json("S", "U", timeout_s=30, effort="max; rm -rf /")
     assert len(runs) == 2
-    assert not os.listdir(tmp_path) or all(not n.startswith("line-bot-claude-") for n in os.listdir(tmp_path))
+    assert not list(tmp_path.rglob("line-bot-claude-*"))

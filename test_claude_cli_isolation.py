@@ -147,15 +147,36 @@ def test_prompt_file_removal_failure_is_logged_not_fatal(cli, monkeypatch, caplo
 
 
 def test_stale_prompt_files_are_cleaned_up(cli, tmp_path):
-    stale = tmp_path / f"{cc._PROMPT_FILE_PREFIX}old.txt"
+    folder = cc.private_tmp_dir(cc._PROMPT_DIR_NAME)
+    stale = folder / f"{cc._PROMPT_FILE_PREFIX}old.txt"
     stale.write_text("合成舊 facts", encoding="utf-8")
     old = cc.time.time() - cc._STALE_PROMPT_FILE_SEC - 60
     os.utime(stale, (old, old))
-    fresh = tmp_path / f"{cc._PROMPT_FILE_PREFIX}fresh.txt"
+    fresh = folder / f"{cc._PROMPT_FILE_PREFIX}fresh.txt"
     fresh.write_text("另一個還在用的", encoding="utf-8")
+    outside = tmp_path / f"{cc._PROMPT_FILE_PREFIX}outside.txt"  # $TMPDIR itself is not listed any more
+    outside.write_text("合成舊 facts", encoding="utf-8")
+    os.utime(outside, (old, old))
     cli((0, "合成回覆", ""))
     cc._chat_via_cli("x", [], [], None)
-    assert not stale.exists() and fresh.exists()
+    assert not stale.exists() and fresh.exists() and outside.exists()
+
+
+def test_prompt_file_is_in_its_own_folder(cli, tmp_path):
+    runs = cli((0, "合成回覆", ""))
+    cc._chat_via_cli("x", [], [], None)
+    assert os.path.dirname(runs[0]["path"]) == str(tmp_path / f"{cc._PROMPT_DIR_NAME}-{os.getuid()}")
+
+
+def test_a_refused_prompt_folder_means_no_cli_and_no_file(cli, monkeypatch, tmp_path):
+    def refused(_name):
+        raise PermissionError("synthetic")
+
+    cli((0, "不該執行", ""))
+    monkeypatch.setattr(cc, "private_tmp_dir", refused)
+    monkeypatch.setattr(cc.subprocess, "run", lambda *_a, **_k: pytest.fail("no CLI without its prompt"))
+    assert cc.chat("x", [], []) is None
+    assert not list(tmp_path.rglob(cc._PROMPT_FILE_PREFIX + "*"))
 
 
 def test_prompt_file_write_failure_falls_back_and_leaves_nothing(cli, monkeypatch, tmp_path):
@@ -167,7 +188,7 @@ def test_prompt_file_write_failure_falls_back_and_leaves_nothing(cli, monkeypatc
     monkeypatch.setattr(cc.os, "fdopen", broken)
     monkeypatch.setattr(cc.subprocess, "run", lambda *_a, **_k: pytest.fail("no CLI without its prompt"))
     assert cc.chat("x", [], []) is None
-    assert not list(tmp_path.glob(cc._PROMPT_FILE_PREFIX + "*"))
+    assert not list(tmp_path.rglob(cc._PROMPT_FILE_PREFIX + "*"))
 
 
 def test_api_credit_switch_survives_a_prompt_file_failure(cli, monkeypatch):

@@ -32,6 +32,7 @@ from google.genai import types
 import gemini_client
 import reply_policy
 import safe_fetch
+from private_tmp import private_tmp_dir
 
 try:
     import yt_dlp as _yt_dlp  # type: ignore[import-untyped]
@@ -66,6 +67,7 @@ SUMMARY_MAX_CHARS = 600
 CAPTION_MAX_CHARS = 1500
 CACHE_TTL_SEC = 900
 CACHE_MAX_ENTRIES = 64
+TMP_DIR_NAME = "line-bot-tiktok-media"
 TMP_PREFIX = "linebot_tiktok_"
 _TOO_LARGE = "tiktok media too large"
 ORPHAN_AGE_SEC = 3600
@@ -234,8 +236,8 @@ def _sweep_orphans() -> None:
     if _swept:
         return
     _swept = True
-    root = tempfile.gettempdir()
     try:
+        root = str(private_tmp_dir(TMP_DIR_NAME))
         names = os.listdir(root)
     except OSError:
         return
@@ -309,7 +311,7 @@ def _download_video(video_url: str, deadline: float, cancel: threading.Event) ->
         return None, False
     _log_runtime_once()
     _sweep_orphans()
-    tmpdir = tempfile.mkdtemp(prefix=TMP_PREFIX)
+    tmpdir = tempfile.mkdtemp(prefix=TMP_PREFIX, dir=str(private_tmp_dir(TMP_DIR_NAME)))
     path = os.path.join(tmpdir, "video.mp4")
 
     def hook(progress: dict) -> None:
