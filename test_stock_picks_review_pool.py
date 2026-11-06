@@ -584,15 +584,40 @@ def test_one_ai_version_failing_does_not_stop_the_next(paths, market_db, monkeyp
 
 # ── 名字與目錄檢查 ─────────────────────────────────────────────────────────────
 def test_family_names_are_the_same_everywhere():
-    """三族一律 tw_v1、tw_ai、us（last_run、週報、spool 檔名、背景規則選單；審查 impl r4#3）。"""
+    """三族一律 tw_v1、tw_ai、us（last_run、週報、spool 檔名、背景規則選單；審查 impl r4#3）。名稱、順序、市場、基準
+    只有 pool.FAMILIES 一張表（週報兩段、returns 都從它來，審查 C1 r4#2）。"""
+    import stock_picks_perf as perf
+    from jobs import stock_picks_review_returns as returns
     from jobs import stock_picks_review_variants as variants
-    from jobs import stock_picks_review_weekly as weekly
 
-    assert [family for family, _ in pool.FAMILY_WHERE] == ["tw_v1", "tw_ai", "us"]
-    assert {key for key, *_ in weekly.FAMILIES} == {family for family, _ in pool.FAMILY_WHERE}
+    assert [f.key for f in pool.FAMILIES] == ["tw_ai", "us", "tw_v1"]  # 週報兩段的順序
+    assert [f.name for f in pool.FAMILIES] == ["台股 AI 相關股", "美股", "台股舊五條件（對照組）"]
+    assert tuple((f.key, f.where) for f in pool.FAMILIES) == pool.FAMILY_WHERE
+    assert {f.key for f in pool.FAMILIES} == {pool.FAMILY_V1, pool.FAMILY_AI, pool.FAMILY_US}
+    assert returns.FAMILY_MARKET == {"tw_ai": "tw", "us": "us", "tw_v1": "tw"}
+    assert {f.market: f.bench for f in pool.FAMILIES} == {"tw": perf.TW_BENCHMARK, "us": perf.US_BENCHMARK}
     assert {v["family"] for v in variants.VARIANTS} <= {pool.FAMILY_AI, pool.FAMILY_US}
     assert pool.SPOOL_NAME_RE.fullmatch(f"{pool.FAMILY_AI}-2026-10-27-1793212200.json")
     assert not pool.SPOOL_NAME_RE.fullmatch("us-2026-10-27-1793212200.json")  # 美股的 spool B2 才加
+
+
+def test_family_where_matches_family_of():
+    """pool_days 的 (m, rule) 剛好被一族的 where 選到，而且就是 returns.family_of 的那一族；family_of 回 None 的一族
+    都選不到（ai、aix 這種不是 ai_ 開頭的 rule）。"""
+    from jobs import stock_picks_review_returns as returns
+
+    combos = [("tw", "v1"), ("tw", "ai_v1"), ("tw", "ai_v2"), ("tw", "ai"), ("tw", "aix"), ("us", "us_v1"), ("us", "us_v2")]
+    con = sqlite3.connect(":memory:")
+    try:
+        con.execute("CREATE TABLE pool_days (m TEXT NOT NULL, rule TEXT NOT NULL)")
+        con.executemany("INSERT INTO pool_days VALUES (?, ?)", combos)
+        for m, rule in combos:
+            matched = [f.key for f in pool.FAMILIES if con.execute(
+                f"SELECT count(*) FROM pool_days WHERE m = ? AND rule = ? AND ({f.where})", (m, rule)).fetchone()[0]]
+            expected = returns.family_of(m, rule)
+            assert matched == ([expected] if expected else []), (m, rule)
+    finally:
+        con.close()
 
 
 @pytest.mark.parametrize("mode, state", [(0o700, "ok"), (0o750, "unsafe"), (0o755, "unsafe"), (0o500, "unsafe"),

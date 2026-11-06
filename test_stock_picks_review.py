@@ -131,7 +131,10 @@ def test_full_run_records_enumerated_last_run(ready):
     out = _last_run(ready)
     assert out["status"] == "ok" and out["consecutive_failures"] == 0 and out["last_success_at"] == fx.NOW
     assert {name: s["status"] for name, s in out["stages"].items()} == {
-        "archive": "ok", "pool": "ok", "prices": "ok", "weekly": "skipped:not_due"}
+        "archive": "ok", "pool": "ok", "prices": "ok", "returns": "ok", "weekly": "skipped:not_due"}
+    returns = out["stages"]["returns"]  # C1：三族各一版，E（10/28）還不在日曆上 → 先等，什麼都沒評
+    assert (returns["versions"], returns["wait_e"], returns["evaluated"], returns["frozen"]) == (3, 3, 0, 0)
+    assert set(returns["families"]) == {"tw_v1", "tw_ai", "us"}
     assert out["last_t"] == {"tw_v1": "2026-10-27", "tw_ai": "2026-10-27", "us": "2026-10-27"}
     assert out["sizes"]["archive_files"] == 3 and out["sizes"]["sqlite_bytes"] > 0
     assert out["finished_at"] >= out["started_at"]
@@ -200,9 +203,36 @@ def test_three_failures_send_one_short_note_per_day(ready):
 
 def test_last_run_future_timestamps_are_clamped(paths):
     runner.ensure_private_dir(paths.root)
-    paths.last_run.write_text(json.dumps({"last_success_at": fx.NOW + 10**6, "consecutive_failures": "x"}))
+    paths.last_run.write_text(json.dumps({"last_success_at": fx.NOW + 10**6, "consecutive_failures": "x",
+                                          "returns_last_ok_at": fx.NOW + 10**6}))
     prev = runner.read_last_run(paths.last_run, fx.NOW)
     assert prev["last_success_at"] == fx.NOW and prev["consecutive_failures"] == 0
+    assert prev["returns_last_ok_at"] == fx.NOW
+
+
+def test_last_run_keeps_when_returns_was_last_ok(paths):
+    """returns 的 busy 不算失敗：last_run 另記 returns 最後一次 ok 的時間（審查 C1 r2#9）。ok 那輪記完成時間；
+    busy、error 的輪沿用上一輪的；上一輪的值不是有限數就不沿用。"""
+    later = time.time() + 86400  # 比真實時間晚：讀回時不會被夾回 now
+    returned = {"status": "ok"}
+    stages = (("returns", lambda _ctx: dict(returned)),)
+    runner.run(paths, now=later, stages=stages)
+    first = _last_run(paths)
+    assert first["returns_last_ok_at"] == first["finished_at"] is not None
+    for status in ("busy", "error"):
+        returned["status"] = status
+        runner.run(paths, now=later + 1800, stages=stages)
+        assert _last_run(paths)["returns_last_ok_at"] == first["returns_last_ok_at"]
+    runner.run(paths, now=later + 3600, stages=(("archive", _ok),))  # 這一輪沒有 returns：照樣沿用
+    assert _last_run(paths)["returns_last_ok_at"] == first["returns_last_ok_at"]
+    paths.last_run.write_text(json.dumps({"returns_last_ok_at": "x"}))
+    returned["status"] = "busy"
+    runner.run(paths, now=later + 5400, stages=stages)
+    assert _last_run(paths)["returns_last_ok_at"] is None
+    returned["status"] = "ok"
+    runner.run(paths, now=later + 7200, stages=stages)
+    out = _last_run(paths)
+    assert out["returns_last_ok_at"] == out["finished_at"] is not None  # 上一輪是 None：這是這一輪記的
 
 
 def test_timeout_inside_a_stage_is_recorded(ready):
@@ -301,6 +331,23 @@ def test_weekly_once_per_week_and_only_the_latest_sunday(ready):
     assert _outbox(ready) == ["2026-11-15-stock-picks-weekly.md"]
 
 
+def test_weekly_data_section_does_not_need_the_c1_module(ready, monkeypatch, settle40):
+    """C1 的模組（returns）import 不了時，週報照樣組得出來：【資料收集】的日曆在 db（缺漏數得出來），只有【推薦成績】
+    換成一行說明（第 2 輪 r3#2、r4#5、r1#3）。同一個程序裡要擋 import：拿掉 jobs 套件上的屬性、sys.modules 放 None。"""
+    import jobs
+
+    runner.run(ready, now=fx.NOW)  # 先收一天（價格庫有日曆）
+    monkeypatch.delattr(jobs, "stock_picks_review_returns", raising=False)
+    monkeypatch.setitem(sys.modules, "jobs.stock_picks_review_returns", None)
+    ctx = runner.Context(paths=ready, now=SUNDAY_EVENING)
+    try:
+        text = weekly.build_report(ctx, weekly.report_sunday(SUNDAY_EVENING))
+    finally:
+        ctx.close()
+    assert "・台股 AI 相關股：記到 10/27，共 1 個交易日（本週 +1），沒有缺漏" in text
+    assert "【推薦成績】這週算不出來（ModuleNotFoundError），其他內容照常" in text  # 真的擋到了
+
+
 def test_sunday_before_eight_does_not_send_last_weeks_late_report(ready):
     """Mac 從 11/01 18:00 睡到 11/08 15:00（審查 r3#5）：15:00 不補 11/01 那份，20:00 只送 11/08 這份。"""
     runner.run(ready, now=fx.ts(2026, 11, 8, 15))
@@ -313,11 +360,13 @@ def test_weekly_content_reports_collection_status_in_one_message(ready, settle40
     runner.run(ready, now=fx.NOW)  # 先收一天
     runner.run(ready, now=SUNDAY_EVENING)
     text = (ready.outbox / "2026-11-01-stock-picks-weekly.md").read_text(encoding="utf-8")
-    assert len(text) <= weekly.MAX_CHARS < 1900
+    max_chars = 1800  # relay 一則 1,900 字：還沒有成績時（A 段的收集狀態＋成績那一段的說明）一則就夠
+    assert len(text) <= max_chars < 1900
     assert text.startswith("📊 股票推薦回測週報（11/1）")
-    assert "・台股 AI 相關股：記到 10/27，共 1 個交易日（本週 +1），沒有缺漏；簡版 1 份、spool 0 份" in text
-    assert "・台股舊規則（對照組）：記到 10/27，共 1 個交易日" in text
-    assert "・美股：記到 10/27，共 1 個交易日" in text
+    ai = text.index("・台股 AI 相關股：記到 10/27，共 1 個交易日（本週 +1），沒有缺漏；簡版 1 份、spool 0 份")
+    us = text.index("・美股：記到 10/27，共 1 個交易日")
+    v1 = text.index("・台股舊五條件（對照組）：記到 10/27，共 1 個交易日")  # 名稱、順序和【推薦成績】同一張表
+    assert ai < us < v1
     # 台股 50＋8＋0050＋TAIEX；美股 50＋3 檔 ETF，缺的是兩檔 ⚪（DB 沒有它們的收盤）
     assert "・價格庫：台股 60 檔都有收盤、美股 51 檔有收盤、缺 2 檔，共 " in text
     assert "【推薦成績卡】推薦成績尚未上線" in text

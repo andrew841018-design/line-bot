@@ -21,6 +21,18 @@ review.sqlite（state/stock_picks_review/，只有這支 job 寫；WAL）
 - pool_days.market_json：台股 [大盤狀態, 月線乖離‰, 季線乖離‰]；美股 {"level", "b20", "b60"}（SPY）。spool 取代簡版時，
   spool 沒有就沿用簡版的。
 - pool_rows 有 CHECK：status＝member 的列一定有 c0。
+- C1 的表（user_version 2）：member_returns(m, family, rule, t, ver_s, derive_version, code, h, ledger_version,
+  calc_version, r, b, skip, inputs_json, frozen_at)：股票池每個成員、每個 h 用 perf.evaluate 算出來的報酬
+  （stock_picks_review_returns 寫），凍結後不改（ON CONFLICT DO NOTHING）。
+  - PK 含 rule（和池子表的版本身分 (m, rule, t, ver_s, derive_version) 一致；family 留給 C2 查詢）、ledger_version
+    （perf 帳的版本）與 calc_version（job 端算法的版本，returns.CALC_VERSION）：任一個升版，舊列留著備查、新版本重算，
+    查詢一律只看目前的版本（審查 C1 r2#1、r4#3）。
+  - inputs_json＝{th, c0, ce, ch, cf, be, bh, bf}（和 perf 帳列的算式輸入同名）。沒有 c0 的成員 T_h 一在日曆上就直接
+    記 missing、不呼叫 perf，那些列是 NULL：inputs_json 是 NULL ⇔ 沒有 c0。
+  p（股票池等權平均）不另存，出報表時才從這張表算。A 段的程式照樣跑得動這個庫（只多一張表；C1 回滾時不刪它）。
+  returns 階段與週報自己檢查這張表在不在（has_tables）、PK 欄位是不是 MEMBER_RETURNS_KEY（member_returns_key）：
+  不對只讓那個階段（週報只有那一段）失敗、記 SchemaError，不讓 open_db 擋住其他階段。migration 2 部署之後就凍結：
+  表結構要改得另加 migration（審查 C1 第 2 輪 r2#H、#I）。
 
 為什麼放內建碟、怎麼備份
 - review.sqlite 每 30 分鐘寫一次（WAL），外接的 WD_BLACK 只跑 USB 2.0（約 34 MiB/s，而且和 Time Machine 共用空間），
@@ -30,7 +42,10 @@ review.sqlite（state/stock_picks_review/，只有這支 job 寫；WAL）
   一樣靠 Time Machine。
 
 價格庫（prices）
-- 要收的代號：池子紀錄近 420 天出現過的代號；台股另加 0050、TAIEX，美股另加 SPY、VOO、QQQ。
+- 要收的代號：池子紀錄近 420 天出現過的代號；台股另加 0050 與日曆代號（TAIEX），美股另加日曆代號（SPY、VOO、QQQ）。
+  日曆代號只有一份：CALENDAR_SYMBOLS（和 stock_db_ro 的日曆同一組，有測試對照）。
+- store_calendar：價格庫裡的交易日。returns 的日曆（DB ∪ 價格庫）和週報（【資料收集】的缺漏、選版用的 E）都用它；
+  放這裡、不放 C1 的模組：週報的【資料收集】不必 import returns（returns 壞了只少【推薦成績】那一段）。
 - 來源：盤勢 DB 的 tw、tw_all、us（provisional＝0），一律經 stock_db_ro（mode=ro、一個 SELECT 就關），路徑由呼叫端給。
 - DB 保留範圍內以 DB 為準：每個（來源、代號）在 DB 的 [最早, 最晚] 之間，DB 沒有的日子刪掉、收盤不同就覆蓋；
   範圍外（DB 已經滾掉的）留著。同一天 tw 和 tw_all 都有時用 tw。整體只留 700 天。
@@ -39,7 +54,7 @@ review.sqlite（state/stock_picks_review/，只有這支 job 寫；WAL）
   成功後才記鍵（DbBusy 中途失敗時下一輪照樣重來）。DbBusy／hot journal 回 busy，不算失敗。
 - 比對只讀要同步的代號在保留範圍內的列（不把整張 prices 載進記憶體）；過期的列用 SQL 直接數、直接刪。
 
-這個模組 import 時不做任何 I/O；stock_db_ro 在函式裡才 import。
+這個模組 import 時不做任何 I/O；stock_db_ro 與 pool（只用 iso_day 檢查日期）在函式裡才 import。
 """
 
 from __future__ import annotations
@@ -55,7 +70,7 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 from urllib.parse import quote
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 BUSY_TIMEOUT_S = 5.0
 
 # 每個版本只新增表（CREATE … IF NOT EXISTS）；舊版本的表永遠不改、不刪
@@ -83,8 +98,24 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         # 只放價格同步鍵（SYNC_KEY）
         "CREATE TABLE IF NOT EXISTS sync_state (k TEXT PRIMARY KEY, v TEXT NOT NULL, at REAL NOT NULL)",
     ),
+    2: (  # C1：成員報酬（PLAN v5 §3）。r 有值 ⇔ 沒有 skip；有值的列一定有基準 b
+        """CREATE TABLE IF NOT EXISTS member_returns (
+            m TEXT NOT NULL, family TEXT NOT NULL, rule TEXT NOT NULL, t TEXT NOT NULL, ver_s INTEGER NOT NULL,
+            derive_version INTEGER NOT NULL, code TEXT NOT NULL, h INTEGER NOT NULL, ledger_version INTEGER NOT NULL,
+            calc_version INTEGER NOT NULL,
+            r REAL, b REAL, skip TEXT, inputs_json TEXT, frozen_at REAL NOT NULL,
+            CHECK ((skip IS NULL) = (r IS NOT NULL)),
+            CHECK (skip IS NOT NULL OR b IS NOT NULL),
+            PRIMARY KEY (m, family, rule, t, ver_s, derive_version, code, h, ledger_version, calc_version))
+            WITHOUT ROWID""",
+    ),
 }
 A_TABLES = ("prices", "pool_days", "pool_rows", "sync_state")
+C1_TABLES = ("member_returns",)
+# member_returns 的 PK（照順序）：returns 階段與週報開始前比對，舊結構的表（例如原地改 migration 2 之前建的）記
+# SchemaError，不讓查詢丟籠統的 OperationalError
+MEMBER_RETURNS_KEY = ("m", "family", "rule", "t", "ver_s", "derive_version", "code", "h", "ledger_version",
+                      "calc_version")
 
 
 class SchemaError(Exception):
@@ -132,18 +163,32 @@ def user_version(conn: sqlite3.Connection) -> int:
 
 
 def ensure_schema(conn: sqlite3.Connection) -> int:
+    """補到目前版本（只跑還沒跑過的 MIGRATIONS）。A 段的表不在（user_version 說有、表卻不在）就丟 SchemaError、
+    整個交易 rollback，不自己修；升版時也一樣先檢查再改 user_version。"""
     current = user_version(conn)
     if current < SCHEMA_VERSION:
         with transaction(conn):
             for version in range(current + 1, SCHEMA_VERSION + 1):
                 for sql in MIGRATIONS[version]:
                     conn.execute(sql)
+            if not has_tables(conn, A_TABLES):
+                raise SchemaError("missing tables")
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         return SCHEMA_VERSION
-    present = {name for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-    if not set(A_TABLES) <= present:
+    if not has_tables(conn, A_TABLES):  # 只看 A 段的表：C1 的表由 returns 階段自己看（不在只讓那個階段失敗）
         raise SchemaError("missing tables")
     return current  # 比程式新也照跑（之後的段只加表）
+
+
+def has_tables(conn: sqlite3.Connection, names) -> bool:
+    present = {name for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    return set(names) <= present
+
+
+def member_returns_key(conn: sqlite3.Connection) -> tuple[str, ...]:
+    """member_returns 的 PK 欄位（照 PK 的順序）；和 MEMBER_RETURNS_KEY 比。"""
+    info = conn.execute("PRAGMA table_info(member_returns)").fetchall()
+    return tuple(row[1] for row in sorted(info, key=lambda row: row[5]) if row[5])
 
 
 def get_state(conn: Optional[sqlite3.Connection], key: str) -> Optional[tuple[dict, float]]:
@@ -182,8 +227,11 @@ PRICE_KEEP_DAYS = 700
 POOL_LOOKBACK_DAYS = 420
 SYNC_THROTTLE_S = 25 * 60
 SYNC_KEY = "prices_sync"
-TW_EXTRA = ("0050", "TAIEX")
-US_EXTRA = ("SPY", "VOO", "QQQ")
+# 交易日的代號：台股看加權指數，美股看三檔 ETF 的聯集。和 stock_db_ro.TW_CALENDAR_SYMBOL／US_CALENDAR_SYMBOLS 同一組
+# （有測試對照）；放常數、不 import stock_db_ro：週報的【資料收集】也用這個日曆，不能因為 stock_db_ro 壞了就組不出來。
+CALENDAR_SYMBOLS = {"tw": ("TAIEX",), "us": ("SPY", "VOO", "QQQ")}
+TW_EXTRA = ("0050", *CALENDAR_SYMBOLS["tw"])  # 台股固定要收的：基準 0050＋日曆代號
+US_EXTRA = CALENDAR_SYMBOLS["us"]  # 美股固定要收的：日曆代號（基準 SPY 也在裡面）
 SOURCES = {"tw": ("tw", "tw_all"), "us": ("us",)}  # 同一天兩個來源都有時，排前面的優先
 _MAX_PRICE = 1e7
 UPSERT_SQL = (
@@ -202,6 +250,20 @@ def wanted_codes(conn: Optional[sqlite3.Connection], today) -> dict[str, list[st
             if market in out and isinstance(code, str):
                 out[market].add(code)
     return {market: sorted(codes) for market, codes in out.items()}
+
+
+def store_calendar(conn: sqlite3.Connection, market: str, since: Optional[str] = None) -> list[str]:
+    """價格庫裡的交易日：台股 TAIEX、美股 SPY／VOO／QQQ 任一檔有收盤的日子（CALENDAR_SYMBOLS），只留合法日期。"""
+    from jobs import stock_picks_review_pool as pool
+
+    symbols = CALENDAR_SYMBOLS[market]
+    marks = ",".join("?" * len(symbols))
+    sql = f"SELECT DISTINCT d FROM prices WHERE m = ? AND code IN ({marks})"
+    params: list[Any] = [market, *symbols]
+    if since is not None:
+        sql += " AND d >= ?"
+        params.append(since)
+    return [d for (d,) in conn.execute(sql + " ORDER BY d", params) if pool.iso_day(d) is not None]
 
 
 def codes_hash(codes: dict[str, list[str]]) -> str:
@@ -272,8 +334,8 @@ def existing_prices(conn: Optional[sqlite3.Connection], codes: dict[str, list[st
     return out
 
 
-def _is_busy(exc: BaseException) -> bool:
-    """DbBusy，或盤勢 job 被殺留下 hot journal（mode=ro 讀不了，等它下一輪收拾）：都不算失敗。"""
+def is_busy(exc: BaseException) -> bool:
+    """DbBusy，或盤勢 job 被殺留下 hot journal（mode=ro 讀不了，等它下一輪收拾）：都不算失敗（價格、成員報酬共用）。"""
     import stock_db_ro
 
     if isinstance(exc, stock_db_ro.DbBusy):
@@ -306,7 +368,7 @@ def prices_stage(ctx) -> dict:
     try:
         fetched = fetch_market(ctx.paths.market_db, codes, keep_from)
     except Exception as exc:
-        if _is_busy(exc):
+        if is_busy(exc):
             return {**out, "status": "busy"}
         raise
     existing = existing_prices(conn, codes, keep_from)

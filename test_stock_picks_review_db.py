@@ -72,24 +72,46 @@ def _edit_market(paths, sql: str, params=()) -> None:
 def test_schema_is_created_with_user_version_and_wal(paths):
     con = rdb.open_db(paths.db)
     try:
-        assert rdb.user_version(con) == rdb.SCHEMA_VERSION == 1
+        assert rdb.user_version(con) == rdb.SCHEMA_VERSION == 2
         assert con.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         tables = {name for (name,) in con.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-        assert set(rdb.A_TABLES) <= tables
+        assert set(rdb.A_TABLES) | set(rdb.C1_TABLES) <= tables
+        # member_returns 的 PK 帶 rule（池子版本的身分）與 calc_version（job 端算法的版本，審查 C1 r2#1、r4#3）
+        info = list(con.execute("PRAGMA table_info(member_returns)"))
+        assert [row[1] for row in sorted(info, key=lambda r: r[5]) if row[5]] == [
+            "m", "family", "rule", "t", "ver_s", "derive_version", "code", "h", "ledger_version", "calc_version"]
+        assert {row[1] for row in info if row[3]} >= {"rule", "calc_version"}  # NOT NULL
     finally:
         con.close()
 
 
-def test_newer_schema_from_a_later_phase_still_runs(paths):
-    """C 段回滾後，DB 的 user_version 比 A 段的程式新：只要 A 段的表都在就照跑（審查 r2#6）。"""
+def test_member_returns_key_matches_the_migration(paths):
+    """returns 與週報比對的 PK（MEMBER_RETURNS_KEY）就是 migration 2 建出來的那一組。"""
     con = rdb.open_db(paths.db)
-    con.execute("CREATE TABLE member_returns (m TEXT)")
+    try:
+        assert rdb.member_returns_key(con) == rdb.MEMBER_RETURNS_KEY
+    finally:
+        con.close()
+
+
+def test_calendar_symbols_match_stock_db_ro():
+    """job 自己的日曆代號（週報的【資料收集】也用，所以不 import stock_db_ro）要和盤勢 DB 的日曆同一組；價格庫固定要收的
+    代號從它推導，值和順序都不變。"""
+    assert rdb.CALENDAR_SYMBOLS == {"tw": (stock_db_ro.TW_CALENDAR_SYMBOL,),
+                                    "us": tuple(stock_db_ro.US_CALENDAR_SYMBOLS)}
+    assert rdb.TW_EXTRA == ("0050", "TAIEX") and rdb.US_EXTRA == ("SPY", "VOO", "QQQ")
+
+
+def test_newer_schema_from_a_later_phase_still_runs(paths):
+    """C 段回滾後，DB 的 user_version 比程式新：只要 A 段的表都在就照跑（審查 r2#6）。"""
+    con = rdb.open_db(paths.db)
+    con.execute("CREATE TABLE episodes (family TEXT)")
     con.execute("PRAGMA user_version = 4")
     con.close()
     con = rdb.open_db(paths.db)
     try:
         assert rdb.user_version(con) == 4
-        assert {"member_returns", "prices"} <= {n for (n,) in con.execute("SELECT name FROM sqlite_master")}
+        assert {"episodes", "member_returns", "prices"} <= {n for (n,) in con.execute("SELECT name FROM sqlite_master")}
     finally:
         con.close()
 

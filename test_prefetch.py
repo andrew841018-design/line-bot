@@ -5,7 +5,8 @@ QA 測試：URL 處理 + Gemini 回覆品質 + 人設 + 資料庫
 覆蓋今天所有踩過的坑：
   1. JS 渲染網站偵測（TikTok/Dcard/IG/X/Reddit）
   2. Prefetch 垃圾過濾（短內容不塞進 prompt）
-  3. DB 沒有殘留的「忽略 TikTok」規則
+  3. DB 沒有殘留的「忽略 TikTok」規則（2026-10-31 起改由每日維護對 DB 副本跑
+     jobs/tiktok_rule_scan.py，見 test_tiktok_rule_scan.py；測試不讀正式 DB）
   4. 人設正確（溫柔可愛，不是調皮幼稚）
   5. 系統提示詞禁止說「跳過」「不看」
   6. 空回覆重試邏輯
@@ -19,7 +20,6 @@ QA 測試：URL 處理 + Gemini 回覆品質 + 人設 + 資料庫
 import sys
 import os
 import re
-import sqlite3
 import argparse
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -106,34 +106,6 @@ def test_prefetch_no_garbage():
         result = _prefetch_urls(url)
         check(f"{name} 無垃圾 block", garbage_marker not in result)
         check(f"{name} 原始 URL 保留", url in result)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Test 3: DB 狀態
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-def test_db_clean():
-    print("\n── Test 3: DB 無殘留問題規則 ──")
-    db_path = os.path.join(os.path.dirname(__file__), "line_bot.db")
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-
-    # 沒有「忽略 TikTok」的 persona_note
-    cur.execute(
-        "SELECT * FROM persona_notes WHERE content LIKE '%tiktok%' OR content LIKE '%TikTok%' OR content LIKE '%忽略%'"
-    )
-    bad_notes = cur.fetchall()
-    check("無 TikTok 忽略規則", len(bad_notes) == 0, f"found: {bad_notes}")
-
-    # 沒有會 skip TikTok 的 filter_rule
-    cur.execute(
-        "SELECT * FROM filter_rules WHERE pattern LIKE '%tiktok%' OR pattern LIKE '%TikTok%'"
-    )
-    bad_rules = cur.fetchall()
-    check("無 TikTok skip 規則", len(bad_rules) == 0, f"found: {bad_rules}")
-
-    conn.close()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -337,7 +309,6 @@ if __name__ == "__main__":
 
     test_js_domain_detection()
     test_prefetch_no_garbage()
-    test_db_clean()
     test_system_prompt()
     test_persona_review()
     test_empty_reply_handling()

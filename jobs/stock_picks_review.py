@@ -6,7 +6,7 @@ Andrew 10/28 要股票推薦「定期回測（週/月/季/年）……每週 dis
 
 launchd（com.andrew.stock-picks-review）每 30 分鐘、以及三個狀態檔一變就叫一次：
 
-  python jobs/stock_picks_review.py                        一輪：封存 → 池子紀錄 → 價格 → 週報
+  python jobs/stock_picks_review.py                        一輪：封存 → 池子紀錄 → 價格 → 成員報酬（C1）→ 週報
   python jobs/stock_picks_review.py --dry-run              只看不寫：不拿鎖、不建任何檔，review.sqlite 用 immutable 唯讀
                                                            （不讀 -wal：job 正在寫時可能讀到舊資料或讀不到，只供診斷）
   python jobs/stock_picks_review.py --import-archive DIR   一次性匯入手動封存（stock_picks_tw.json.<ts>.gz 等）
@@ -31,7 +31,8 @@ launchd（com.andrew.stock-picks-review）每 30 分鐘、以及三個狀態檔�
   --bot-dir 和 --maintenance-dir、而且兩個都不是正式路徑；否則回 EXIT_CONFIG、什麼都不做（審查 impl r2#2）。
 - last_run.json 只放列舉值（階段結果、例外類別、次數、日期、大小；讀回時未來的時間夾回現在）；log 也一樣，
   不寫例外訊息與 traceback（只記例外類別和出事的函式名、行號）。
-- 連續 3 輪失敗：outbox 一天一則短訊（階段＋例外類別）。DbBusy／hot journal 不算失敗。
+- 連續 3 輪失敗：outbox 一天一則短訊（階段＋例外類別）。DbBusy／hot journal 不算失敗；成員報酬（returns）一直 busy
+  也不會連續失敗，所以 last_run 另記 returns_last_ok_at（returns 最後一次 ok 的時間，沒 ok 就沿用上一輪的）。
 - outbox 與 bot 目錄都在呼叫時才算（參數或環境變數 STOCK_PICKS_REVIEW_MAINTENANCE_DIR／
   STOCK_PICKS_REVIEW_BOT_DIR），conftest 一律指到暫存目錄。
 這支程式 import 時不做任何 I/O（只把 bot 目錄放進 sys.path）。
@@ -85,7 +86,7 @@ TPE = ZoneInfo("Asia/Taipei")
 EXIT_OK = 0
 EXIT_FAILED = 1  # 這一輪有階段失敗或逾時（launchctl list 看得到）
 EXIT_CONFIG = 2  # state/ 或自己的目錄、鎖檔不安全
-STAGE_NAMES = ("archive", "pool", "prices", "weekly")
+STAGE_NAMES = ("archive", "pool", "prices", "returns", "weekly")
 FAILED_STATUSES = ("error", "timeout")
 
 _ENUM_RE = re.compile(r"[A-Za-z0-9_.:/\-]{0,64}")
@@ -462,7 +463,7 @@ def read_last_run(path: Path, now: float) -> dict:
         return {}
     if not isinstance(obj, dict):
         return {}
-    for key in ("started_at", "finished_at", "last_success_at"):
+    for key in ("started_at", "finished_at", "last_success_at", "returns_last_ok_at"):
         obj[key] = _clamp(obj.get(key), now)
     failures = obj.get("consecutive_failures")
     valid = isinstance(failures, int) and not isinstance(failures, bool) and failures >= 0
@@ -567,6 +568,12 @@ def _stage_prices(ctx: Context) -> dict:
     return rdb.prices_stage(ctx)
 
 
+def _stage_returns(ctx: Context) -> dict:
+    from jobs import stock_picks_review_returns as returns
+
+    return returns.returns_stage(ctx)
+
+
 def _stage_weekly(ctx: Context) -> dict:
     from jobs import stock_picks_review_weekly as weekly
 
@@ -575,7 +582,8 @@ def _stage_weekly(ctx: Context) -> dict:
 
 Stage = tuple[str, Callable[[Context], dict]]
 DEFAULT_STAGES: tuple[Stage, ...] = (
-    ("archive", _stage_archive), ("pool", _stage_pool), ("prices", _stage_prices), ("weekly", _stage_weekly),
+    ("archive", _stage_archive), ("pool", _stage_pool), ("prices", _stage_prices), ("returns", _stage_returns),
+    ("weekly", _stage_weekly),
 )
 
 
@@ -642,6 +650,9 @@ def run_locked(paths: Paths, *, now: float, stages: Sequence[Stage] = DEFAULT_ST
         except Exception as exc:  # noqa: BLE001 - 短訊發不出去：只記類別
             out["note"] = "error:" + type(exc).__name__
     out["finished_at"] = time.time()
+    # returns 的 busy 不算失敗：一直 busy 時連續失敗數看不出來，每日維護看這個時間超過 1 天沒更新（審查 C1 r2#9）
+    returns_ok = (results.get("returns") or {}).get("status") == "ok"
+    out["returns_last_ok_at"] = out["finished_at"] if returns_ok else previous.get("returns_last_ok_at")
     try:
         data = json.dumps(_clean(out), ensure_ascii=False, sort_keys=True, allow_nan=False).encode("utf-8")
         write_atomic(paths.last_run, data)
