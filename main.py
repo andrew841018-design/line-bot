@@ -1920,6 +1920,10 @@ def _llm_chat(
     # "" = Claude answered and had nothing new to add; asking Gemini again
     # would only produce the agree-and-restate reply the policy forbids.
     if claude_reply is not None:
+        # TODO(2026-11-06 deferred, review gp4 I3): Gemini choosing silence is not marked yet, so
+        # an audio message it stays silent on is left open.
+        if not claude_reply.strip():
+            reply_provenance.mark_dropped()  # silence by choice: finish the message, no fixed line
         return _guard_generated_reply(claude_reply, user_input, context=context, facts=facts)
     return _guard_generated_reply(
         _gemini_llm_chat(user_input, context, facts, pnotes), user_input, context=context, facts=facts
@@ -24198,7 +24202,7 @@ def _reply(
     original_text = text
     if not text or not text.strip():
         if reply_provenance.dropped():
-            # The generated reply claimed a search nobody ran: intentionally silent.
+            # A guard dropped the reply, or Claude chose not to reply: intentionally silent.
             _mark_inbound_reply_completed_no_reply(reply_token)
         return False
     # Markdown → LINE 純文字，並在 LINE API 呼叫前做最後 factual-safety gate。

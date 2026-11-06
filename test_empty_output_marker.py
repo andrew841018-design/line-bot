@@ -22,7 +22,9 @@ import pytest  # noqa: E402
 
 import output_validator  # noqa: E402
 import reply_policy  # noqa: E402
+import reply_provenance  # noqa: E402
 
+TOOL_CALL = '<invoke name="Bash">\n<parameter name="command">echo ""</parameter>\n</invoke>'
 PLACEHOLDERS = [
     "（輸出空字串）", "(輸出空字串)", "輸出空字串", "輸出空字串。", "【輸出空字串】", "[輸出空字串]",
     " （輸出空字串） ", "（ 輸出空字串 ）", "（輸出空字串)", "（輸出空字串）。", "就輸出空字串", "因此輸出空字串",
@@ -50,6 +52,34 @@ PLACEHOLDERS = [
     "判定沒有可補充價值時，直接輸出空字串。",
     "（輸出空白）這則沒有需要補充的內容。", "（輸出\"\"）這則沒有需要補充的內容。", "（輸出空白）\n這則沒有需要補充的內容。",
     "沒有實質答案就輸出空字串。", "仍沒有實質答案就輸出空字串。", "沒有人直接問你時輸出空字串。",
+    "<br>", "<br/>", "<br />", "</br>", "<BR>", "<br>\n</br>", "<br><br>",
+    "不確定該怎麼回就輸出空字串。", "不知道就輸出空字串。", "不知道要回什麼就輸出空字串。", "如果不確定怎麼回，就輸出空字串。",
+    "沒把握就只輸出空字串。", "（不確定該怎麼回就輸出空字串）",
+    # any bare tag, also longer than _MARKER_MAX_CHARS, and what the printed tool call was running
+    "<p></p>", "<no_reply/>", "<empty/>", 'echo ""', "```bash\necho \"\"\n```", "```shell\necho \"\"\n```", "```sh\necho \"\"\n```", 'echo ""\nies',
+    "<br/>" * 13, "這只是閒聊。\n" + "<br>" * 17,
+    # a bare tag next to the model's reason for silence
+    "<br>\n\n這題不用回，我先不插話。", "這題不用回，我先不插話。\n\n<br>", "</br>\n這只是閒聊。", "<no_reply/>\n這只是閒聊。",
+    # a tool call printed as text (2026-11-04), alone, cut off, or after other words
+    TOOL_CALL, f"{TOOL_CALL}\nies", f"{TOOL_CALL}\niawait", f"{TOOL_CALL}\n</parameter>",
+    f"我來處理。\n{TOOL_CALL}", '<invoke name="WebSearch">', "</invoke>", '<parameter name="query">台北天氣',
+    '<ns:invoke name="Bash">', '<ns1:invoke name="Bash">', "</ns1:invoke>", "<function_calls>", "</function_calls>",
+    "<tool_use>", "<tool_call>", "<tool_calls>", '<INVOKE NAME="Bash">', "我來處理。\n<function_calls>", "我來處理。\n</invoke>",
+    # the model explains its silence, then prints the instruction (2026-11-06)
+    "這題不用回，我先不插話。\n\n（輸出空字串）", "這只是閒聊。\n（輸出空字串）", "只是打招呼。\n（依規則輸出空字串）",
+    "這題不用回。\n\n**（輸出空字串）**", "這題不用回。\n（輸出\"\"）", "這題不用回。\n（輸出空白）。",
+    "這題不用回，我先不插話。（輸出空字串）", "這題不用回，（輸出空字串）。", "這題不用回（輸出空字串）", "這題不用回～（輸出空字串）",
+    "這題不用回。（依規則輸出空字串）", "這題不用回。（輸出空字串。）", "這題不用回。\n（輸出空字串）🙂", "這題不用回（輸出空字串）……",
+    "這題不用回。\n（就輸出空字串）", "這題不用回。\n（輸出：空字串）", "（空字串）\n這只是閒聊。",
+    "這只是閒聊。\n\n\"\"", "這只是閒聊。\n「」", "這只是閒聊。\n輸出空字串。", "這只是閒聊。\n（空字串）",
+    # the instruction next to the model's reason
+    "這只是閒聊。\n（沒有這些內容就輸出空字串）", "這只是閒聊。\n（不確定該怎麼回就輸出空字串）",
+    "這只是閒聊。\n不確定該怎麼回就輸出空字串。", "不確定該怎麼回就輸出空字串。\n這題不是在問我。",
+    "這只是閒聊。不確定該怎麼回就輸出空字串。", "這題不用回，不知道就輸出空字串。",
+    "不確定該不該回就輸出空字串。", "不確定要不要回就輸出空字串。", "不知道怎麼回答就輸出空字串。", "不確定該說什麼就輸出空字串。",
+    "（決定不回）", "（這題不用回）", "（本題不回）", "這題輸出空字串。",
+    # what the CLI is told to print for silence
+    "NO_REPLY", "NO_REPLY。", "`NO_REPLY`", "**NO_REPLY**", "（NO_REPLY）", "NO REPLY", "no_reply", "No Reply", "noreply。",
 ]
 ORDINARY = [
     "週日傍晚往南部的高鐵人多，建議先訂票，別現場買。",
@@ -118,6 +148,41 @@ ORDINARY = [
     "（失敗時回傳空字串）",
     "沒有內容不要輸出空字串。",
     "（空字串：長度為 0 的字串）",
+    "換行可以用 <br> 標籤。",
+    "第一行<br>第二行",
+    "不確定型別就輸出空字串。",
+    "不知道欄位名稱時輸出空字串。",
+    "不確定該怎麼回就先問清楚再回。",
+    "不知道就不要輸出空字串。",
+    "<parameter 設定要改成 3。",
+    "invoke 是呼叫的意思，parameter 是參數。",
+    "網址寫 <invoke> 不會有作用。",
+    "a<b 而且 c>d，所以順序要換。",
+    "<3 愛你",
+    "執行結果會回傳空字串：\n（回傳空字串）",
+    "遇到這種簡訊：\n先截圖\n（不回覆）",
+    "內部指令長這樣：\n「（輸出空字串）」",
+    "請解釋這個輸出：\n（輸出空字串）\n\n這是程式輸出的空值。",
+    "no reply 是沒有回覆的意思。",
+    "他說 no reply，我也沒辦法。",
+    "晚上吃什麼？\nnoreply@example.com 寄來的信不要回。",
+    "事項：改 <tool_use 區塊",
+    "遇到詐騙電話：\n先掛斷\n（保持沉默）",
+    "這題我只能說……\n（沉默）",
+    "欄位說明：\n不確定型別就輸出空字串。",
+    "「<br>" + "x" * 80,
+    "<br>" * 16 + "明天下午三點見",
+    "提醒我 11/13 檢查 NO_REPLY 統計",
+    "寄件人 NO_REPLY@example.com 不是銀行常用網域。",
+    "這類信件常見的寄件人：\n- info\n- noreply",
+    "「無回應」英文可以寫：\nNo reply",
+    "**noreply**\n是系統自動寄信用的地址",
+    "<https://example.com/a>",
+    "<someone@example.com>",
+    "<div>內容</div> 是區塊標籤的範例。",
+    "<br>OK",
+    "Claude API 回傳的 tool_use 區塊要照順序處理。",
+    "echo 是回音的意思。",
 ]
 
 
@@ -144,7 +209,12 @@ def test_printed_placeholder_needs_visible_text():
     assert not reply_policy.is_printed_placeholder("記得帶外套。")
 
 
-@pytest.mark.parametrize("text", [" " * 5000 + "x", "\n" * 5000 + "a", "（ " * 2500 + "輸出", "今天天氣很好，" * 1000])
+@pytest.mark.parametrize("text", [
+    "<" * 200_000, "（" * 200_000, "<a" * 100_000, "</" * 100_000, "<invoke " * 30_000, "<a:" * 60_000,
+    "<" + " " * 200_000, "<" + "a" * 200_000, "<invoke" + " " * 200_000, "<invoke name" + " " * 200_000,
+    "輸出" * 100_000, "noreply" * 30_000, "\n".join(["（輸出空字串"] * 30_000),
+    " " * 5000 + "x", "\n" * 5000 + "a", "（ " * 2500 + "輸出", "今天天氣很好，" * 1000,
+])
 def test_long_replies_are_checked_in_linear_time(text):
     import time
 
@@ -184,13 +254,30 @@ def test_placeholder_is_a_rejected_shape_but_empty_text_is_not():
     assert main._is_system_status_outbound("（輸出空字串）")
 
 
-@pytest.mark.parametrize("reply", ["（輸出空字串）", "（輸出空字串）\n\n這只是家人閒聊，就不多說了。"])
+@pytest.mark.parametrize("reply", [
+    "（輸出空字串）", "（輸出空字串）\n\n這只是家人閒聊，就不多說了。", "<br>", "<br>\n</br>", "不確定該怎麼回就輸出空字串。",
+    TOOL_CALL, f"{TOOL_CALL}\nies", "這題不用回，我先不插話。\n\n（輸出空字串）", "NO_REPLY",
+])
 def test_enforce_new_value_reply_turns_a_placeholder_into_no_reply(reply):
     import main
 
     assert main._enforce_new_value_reply(
         reply, source_text="週末要去露營", request_text="週末要去露營", context=[],
     ) == ""
+
+
+@pytest.mark.parametrize("reply", [
+    "<br>", "</br>", "不確定該怎麼回就輸出空字串。", TOOL_CALL, f"{TOOL_CALL}\nies",
+    "這題不用回，我先不插話。\n\n（輸出空字串）", "NO_REPLY",
+])
+def test_placeholder_is_dropped_without_the_restatement_judge(reply):
+    # None of these may depend on the judge, which fails open and skips short sources.
+    import main
+
+    with patch("restatement_judge.filter_restatements", side_effect=AssertionError):
+        assert main._enforce_new_value_reply(
+            reply, source_text="週末要去露營", request_text="週末要去露營", context=[],
+        ) == ""
 
 
 def test_explicit_placeholder_reply_is_not_sent():
@@ -227,7 +314,10 @@ def test_explicit_placeholder_reply_is_not_sent():
     assert [t[1] for t in turns] == ["user"]
 
 
-def test_burst_placeholder_reply_is_not_sent(monkeypatch):
+@pytest.mark.parametrize("reply", [
+    "（輸出空字串）", "<br>", "不確定該怎麼回就輸出空字串。", TOOL_CALL, "這題不用回，我先不插話。\n\n（輸出空字串）", "NO_REPLY",
+])
+def test_burst_placeholder_reply_is_not_sent(monkeypatch, reply):
     import main
 
     monkeypatch.setattr(main, "_quota_exhausted_until_ts", 0.0)
@@ -237,7 +327,7 @@ def test_burst_placeholder_reply_is_not_sent(monkeypatch):
         patch("main.memory.top_facts", return_value=[]),
         patch("main._get_persona_notes", return_value=[]),
         patch("main._requires_public_research", return_value=False),
-        patch("main._llm_chat", return_value="（輸出空字串）"),
+        patch("main._llm_chat", return_value=reply),
         patch("main.memory.append_turn") as append_turn,
         patch("main._maybe_extract_facts"),
         patch("main._finish_burst_without_reply") as finish,
@@ -284,3 +374,60 @@ def test_claude_cli_printing_the_placeholder_is_a_no_reply_decision(monkeypatch,
     monkeypatch.setattr(cc.subprocess, "run", lambda args, **_k: subprocess.CompletedProcess(
         args, 0, stdout="（輸出空字串）\n", stderr=""))
     assert cc.chat("x", [], []) == ""
+
+
+@pytest.mark.parametrize("reply", [
+    "<br>", "</br>", TOOL_CALL, f"{TOOL_CALL}\nies", f"{TOOL_CALL}\n</parameter>", "不確定該怎麼回就輸出空字串。",
+    "這題不用回，我先不插話。\n\n（輸出空字串）", "NO_REPLY",
+])
+def test_new_shapes_do_not_survive_the_line_formatter(reply):
+    # _md_to_line runs before the validator on everything that reaches LINE.
+    import main
+
+    assert main._prepare_outbound_text(reply) == ""
+
+
+def test_reminder_receipt_is_not_a_placeholder():
+    receipt = "已新增提醒\n時間：11/08（六）15:00\n事項：改 <parameter 設定，帶 <invoke 文件"
+    assert not reply_policy.is_empty_marker(receipt)
+    assert output_validator.validate_outbound_text(receipt).ok
+
+
+def test_llm_chat_marks_a_silent_claude_reply_as_dropped():
+    # The quoted-media, audio and file paths finish the message on dropped(), and send a fixed
+    # line or leave it open otherwise.
+    import main
+
+    with patch("claude_client.chat", return_value=""):
+        assert main._llm_chat("成員甲：晚安", [], [], []) == ""
+
+    assert reply_provenance.dropped()
+
+
+def test_llm_chat_leaves_a_gemini_failure_unmarked():
+    import main
+
+    with patch("claude_client.chat", return_value=None), patch("main._gemini_llm_chat", return_value=""):
+        assert main._llm_chat("成員甲：晚安", [], [], []) == ""
+
+    assert not reply_provenance.dropped()
+
+
+def test_quoted_video_is_finished_quietly_when_claude_stays_silent(monkeypatch):
+    from types import SimpleNamespace
+
+    import main
+
+    closed = []
+    monkeypatch.setattr(main.memory, "get_raw_message_meta", lambda *_a: {"description": "舊影片摘要"})
+    monkeypatch.setattr(main.memory, "get_context", lambda *_a: [])
+    monkeypatch.setattr(main.memory, "top_facts", lambda *_a: [])
+    monkeypatch.setattr(main, "_get_persona_notes", lambda *_a: [])
+    monkeypatch.setattr(main, "_mark_inbound_reply_completed_no_reply", lambda token, **_k: closed.append(token))
+
+    with patch("claude_client.chat", return_value=""):
+        assert main._handle_quoted_media_description_fallback(
+            SimpleNamespace(reply_token="synthetic"), "group", "合理嗎", "quoted", "影片"
+        )
+
+    assert closed == ["synthetic"]

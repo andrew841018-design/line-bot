@@ -25,7 +25,13 @@ from typing import Any
 
 import speaker_turns
 from config import settings
-from reply_policy import is_empty_marker
+from reply_policy import (
+    CLI_OUTPUT_FORMAT,
+    CLI_OUTPUT_FORMAT_ANCHOR,
+    has_silence_token,
+    is_empty_marker,
+    without_system_texts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -352,19 +358,23 @@ def _build_cli_prompt(
         return None
     import gemini_client
 
-    system = _with_no_search_contract(
-        gemini_client._build_system_instruction(
-            facts,
-            persona_notes,
-            user_input=user_input,
-        )
+    instruction = gemini_client._build_system_instruction(
+        facts,
+        persona_notes,
+        user_input=user_input,
     )
+    system = _with_no_search_contract(f"{instruction}\n\n{CLI_OUTPUT_FORMAT_ANCHOR}")
     # 2026-10-09 Andrew：「區分不同人（說話的人），不能全部都一概當成『使用者』」。
     # Family turns already start with who said them (「成員甲：…」); only the bot's
     # own turns get a name here.
     history_lines = []
     for role, text in (context or []):
-        if not isinstance(text, str) or not text.strip():
+        if not isinstance(text, str):
+            continue
+        # 2026-11-06: a placeholder the bot once sent, or a rule stored inside a [burst] turn,
+        # would teach the model to print it again.
+        text = without_system_texts(text)
+        if not text.strip() or (role in _BOT_ROLES and is_empty_marker(text)):
             continue
         # 2026-10-10 review：咪寶自己的多行回覆也縮排（裡面的「某某：」不像家人在說話）
         history_lines.append(speaker_turns.speaker_turn("咪寶", text) if role in _BOT_ROLES else text)
@@ -373,7 +383,7 @@ def _build_cli_prompt(
     history_block = "\n\n".join(history_lines) or "（沒有先前對話）"
     user_prompt = (
         f"【最近對話】\n{history_block}\n\n"
-        f"【最新訊息】\n{content}"
+        f"【最新訊息】\n{content}\n\n{CLI_OUTPUT_FORMAT}"
     )
     return f"{_CLI_AT_NOTE}\n\n{system}", user_prompt
 
@@ -713,11 +723,11 @@ def _chat_via_cli(
         raise ClaudeCliLimitReached(
             "CLI usage limit (exit 0)", until=_cli_limit_until(stderr, time.time())
         )
-    if is_empty_marker(text):
-        # A clean exit with nothing printed is Claude following
-        # NO_REPEAT_CONTRACT ("nothing new → empty string"), not a failure.
+    if is_empty_marker(text) or has_silence_token(text):
+        # A clean exit with nothing, a placeholder or NO_REPLY printed is Claude
+        # following NO_REPEAT_CONTRACT ("nothing new → empty string"), not a failure.
         _record_cli_outcome(started, "empty")
-        logger.info("primary reply provider=claude-cli chose not to reply")
+        logger.info("primary reply provider=claude-cli chose not to reply printed_len=%d", len(text))
         return ""
     _record_cli_outcome(started, "ok")
     logger.info("primary reply provider=claude-cli")
