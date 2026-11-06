@@ -36,6 +36,7 @@ import public_research  # noqa: E402
 import reply_policy  # noqa: E402
 import reply_provenance  # noqa: E402
 import stock_quote  # noqa: E402
+from test_support_timing import cpu_seconds  # noqa: E402
 
 TW = ZoneInfo("Asia/Taipei")
 SHARED = "兩國元首上個月在機場見面，規格很高，令人感慨。"
@@ -1095,32 +1096,6 @@ _SLOW_SHAPES = {
 }
 
 
-class _Deadline(Exception):
-    pass
-
-
-def _seconds(check, text):
-    """How long ``check(text)`` takes; a hang fails after 5 s instead of stalling the run."""
-    import signal
-    import time
-
-    def expire(*_):
-        raise _Deadline(text[:12])
-
-    previous = signal.signal(signal.SIGALRM, expire)
-    outer = signal.setitimer(signal.ITIMER_REAL, 5)
-    started = time.perf_counter()
-    try:
-        check(text)
-        return time.perf_counter() - started
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous)
-        if outer[0]:  # someone else's timer: give back what is left of it
-            left = max(outer[0] - (time.perf_counter() - started), 0.001)
-            signal.setitimer(signal.ITIMER_REAL, left, outer[1])
-
-
 def _search_claim(text):
     return reply_policy.has_unbacked_search_claim(text, searched=False, has_material=False)
 
@@ -1128,14 +1103,14 @@ def _search_claim(text):
 @pytest.mark.parametrize("shape", sorted(_SLOW_SHAPES))
 def test_long_replies_are_checked_in_linear_time(shape):
     make = _SLOW_SHAPES[shape]
-    small = min(_seconds(_search_claim, make(5000)) for _ in range(3))
-    large = min(_seconds(_search_claim, make(20000)) for _ in range(3))
-    assert large < 1.0  # 28 剛 took 1.9 s before, ×4 for every extra 剛; a hang stops at 5 s
+    small = min(cpu_seconds(_search_claim, make(5000)) for _ in range(3))
+    large = min(cpu_seconds(_search_claim, make(20000)) for _ in range(3))
+    assert large < 1.0  # 28 剛 took 1.9 s before, ×4 for every extra 剛; a hang stops at the deadline
     assert large < 10 * max(small, 0.002)  # 4× the text should take about 4× the time, not 16×
 
 
 def test_a_run_of_剛_does_not_stall_the_change_claim_check():
-    assert _seconds(reply_policy.strip_operation_claims, "好，" + "剛" * 20000 + "x") < 0.5
+    assert cpu_seconds(reply_policy.strip_operation_claims, "好，" + "剛" * 20000 + "x") < 0.5
 
 
 @pytest.mark.parametrize("text, masked", [

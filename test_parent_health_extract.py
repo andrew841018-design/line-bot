@@ -28,6 +28,7 @@ from parent_health_extract import (
     extract,
     might_have_red_flag,
 )
+from test_support_timing import cpu_seconds
 
 F, M, X = FATHER, MOTHER, FAMILY
 R = "redflag"
@@ -1479,32 +1480,6 @@ def test_fuzz_uncapped_helpers_stay_on_the_fixed_lists():
 
 # ── 線性時間：webhook 鎖內跑，不能讓一則刁鑽留言卡住 ──
 
-class _Deadline(Exception):
-    pass
-
-
-def _seconds(check, text):
-    """``check(text)`` 花多久；卡住的話 5 秒後失敗，不拖垮整套測試（照 test_grounded_reply_policy）。"""
-    import signal
-    import time
-
-    def expire(*_):
-        raise _Deadline(text[:12])
-
-    previous = signal.signal(signal.SIGALRM, expire)
-    outer = signal.setitimer(signal.ITIMER_REAL, 5)
-    started = time.perf_counter()
-    try:
-        check(text)
-        return time.perf_counter() - started
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous)
-        if outer[0]:
-            left = max(outer[0] - (time.perf_counter() - started), 0.001)
-            signal.setitimer(signal.ITIMER_REAL, left, outer[1])
-
-
 _SLOW_SHAPES = {
     "胸口好好好…痛": lambda n: "胸口" + "好" * n + "痛",
     "many chest hits": lambda n: "胸口好痛" * (n // 4),
@@ -1601,9 +1576,9 @@ def test_uncapped_helpers_run_in_linear_time(shape):
         def run(text, core=core):
             return core(text, FATHER, ("成員甲",))
 
-        small = min(_seconds(run, small_text) for _ in range(3))
-        large = min(_seconds(run, large_text) for _ in range(3))
-        # 50 ms 的上限量在公開函式上（下一個測試）；內部函式 5000 字實測最慢約 25 ms，這裡留空間給並行測試的機器
+        small = min(cpu_seconds(run, small_text) for _ in range(3))
+        large = min(cpu_seconds(run, large_text) for _ in range(3))
+        # 50 ms 的上限量在公開函式上（下一個測試）；內部函式 5000 字的 CPU 時間最慢約 35 ms，高負載 50 ms，全 E 核約 100 ms，別調緊
         assert small < 0.1, (core.__name__, small)
         assert large < 1.0, (core.__name__, large)
         assert large < 8 * max(small, 0.002), (core.__name__, small, large)  # 4 倍長約 4 倍時間
@@ -1614,7 +1589,7 @@ def test_public_functions_are_fast_on_long_and_max_length_input(shape):
     make = _SLOW_SHAPES[shape]
     for text in (make(5000), make(5000)[:MAX_CHARS]):
         for check in (might_have_red_flag, lambda t: extract(t, FATHER), lambda t: detect_red_flags(t, MOTHER)):
-            assert min(_seconds(check, text) for _ in range(3)) < 0.05
-    small = min(_seconds(might_have_red_flag, make(5000)) for _ in range(3))
-    large = min(_seconds(might_have_red_flag, make(20000)) for _ in range(3))
+            assert min(cpu_seconds(check, text) for _ in range(3)) < 0.05
+    small = min(cpu_seconds(might_have_red_flag, make(5000)) for _ in range(3))
+    large = min(cpu_seconds(might_have_red_flag, make(20000)) for _ in range(3))
     assert large < 8 * max(small, 0.002)
