@@ -12459,7 +12459,7 @@ def _text_message_with_mentions(
         targets = []
         seen_user_ids: set[str] = set()
         seen_labels: set[str] = set()
-        if "@all" in reply_text or (not explicit_only and "全家" in reply_text):
+        if line_mentions.has_all_mention(reply_text) or (not explicit_only and "全家" in reply_text):
             targets.append(
                 line_mentions.MentionTarget(key="all", kind="all", label="@all")
             )

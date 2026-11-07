@@ -297,6 +297,11 @@ def aliases_mentioned_in_text(text: str) -> list[str]:
             aliases.append(canonical)
             seen.add(canonical)
 
+    # TODO(2026-11-07 deferred): `_clean_name` already took the "@" off, so the set below stops
+    # nothing and "all" is found inside 「@allen」 and 「@mall」.  calendar_db then stores ['all'] and
+    # the reminder pings the whole group.  Its own task, and this loop alone won't do:
+    # `_raw_text_reminder_aliases` hands in only the @-tokens, without the text around them, plus its
+    # own `"@all" in text`, so has_all_mention has to read the raw text there.
     for alias in all_aliases:
         if alias in {"", "@all"}:
             continue
@@ -307,6 +312,18 @@ def aliases_mentioned_in_text(text: str) -> list[str]:
             seen.add(alias)
 
     return aliases
+
+
+# 2026-11-07: 「@all」 rings every phone in the family, so it has to stand on its own: no word
+# character, "/" (a link's path) or "@" before it, and no word character after it, directly or past
+# one of ". @ / -" (a handle, a domain).  re.ASCII: Chinese is no word character here, so 「大家@all」
+# and 「@all吃飯」 still count.  Half-width and lower case, as it always was.
+_ALL_MENTION_RE = re.compile(r"(?<![\w@/])@all(?![.@/-]?\w)", re.ASCII)
+
+
+def has_all_mention(text: str | None) -> bool:
+    """An @all that stands on its own.  Ask this of the final text: `_md_to_line` still changes what is next to it."""
+    return bool(_ALL_MENTION_RE.search(text or ""))
 
 
 def is_all_participants(names: list[str]) -> bool:

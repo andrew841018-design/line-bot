@@ -623,8 +623,6 @@ def _to_cli(text: str) -> str:
 
 def _from_cli(text: str) -> str:
     """The model copies the 「＠」 it read; links and mentions after the CLI need the "@"."""
-    # TODO(2026-11-06 deferred): so a copied 「＠allen」 now hits main's substring test for "@all",
-    # as 「@allen」 always did; that test needs a word boundary.
     return text.replace(_CLI_AT, "@")
 
 
