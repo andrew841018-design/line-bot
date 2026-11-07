@@ -12448,7 +12448,14 @@ def _text_message_with_mentions(
     quote_token: str | None = None,
     explicit_only: bool = False,
     reply_targets: list | None = None,
+    allow_all_mention: bool = False,
 ) -> tuple[str, object]:
+    """``allow_all_mention``: an @all in this text may ping the whole group.  `_reply` passes it for a
+    `line_mentions.AllowsAllMention`; the callers that send text the program stored pass True, and
+    the two that send a queued model answer pass False.  Without it a literal 「@all」 stays in the
+    words and pings nobody, and a member's @ still pings them.
+    Checked here, on the final text: `_md_to_line` still changes what stands next to an @all, so no
+    earlier filter can tell (2026-11-07)."""
     reply_text = str(text or "")
     if not prepared:
         reply_text = _prepare_outbound_text(reply_text, source=validation_source)
@@ -12469,7 +12476,9 @@ def _text_message_with_mentions(
         targets = []
         seen_user_ids: set[str] = set()
         seen_labels: set[str] = set()
-        if line_mentions.has_all_mention(reply_text) or (not explicit_only and "全家" in reply_text):
+        if allow_all_mention and (
+            line_mentions.has_all_mention(reply_text) or (not explicit_only and "全家" in reply_text)
+        ):
             targets.append(
                 line_mentions.MentionTarget(key="all", kind="all", label="@all")
             )
@@ -15828,6 +15837,8 @@ def _save_one_shot_replies(data: dict[str, str]) -> None:
 
 
 def queue_one_shot_reply(group_id: str, text: str) -> None:
+    """Queue one text for the group's next message.  `_try_one_shot_reply` sends it with
+    allow_all_mention=True (2026-11-07): never queue a model's words here."""
     group_id = (group_id or "").strip()
     text = (text or "").strip()
     if not group_id or not text:
@@ -15866,7 +15877,10 @@ def _try_one_shot_reply(event: MessageEvent, group_id: str) -> bool:
             completed,
         )
         return True
-    reply_text, message = _text_message_with_mentions(prepared_text, prepared=True)
+    # A person wrote this file by hand; nothing queues a model's words into it.
+    reply_text, message = _text_message_with_mentions(
+        prepared_text, prepared=True, allow_all_mention=True
+    )
     if settings.bot_muted:
         logger.info("[MUTED] would one-shot reply group=%s len=%d", group_id, len(reply_text))
         return False
@@ -16904,6 +16918,7 @@ def _drain_pending_for_group(
                     limit=5000,
                     quote_token=str(qt) if qt else None,
                     explicit_only=True,
+                    allow_all_mention=False,  # a queued answer is a model's words
                 )
 
                 with ApiClient(_get_line_config()) as api_client:
@@ -19400,7 +19415,9 @@ def _explicit_range_reminder_result(
     }
 
 
-class ReminderReceipt(str):
+# TODO(2026-11-12 deferred, the reminder-path task): a receipt's 事項 or title can still carry words an
+# extraction model or a pasted message wrote, and an @all there pings everyone (the whole receipt is read).
+class ReminderReceipt(line_mentions.AllowsAllMention):
     """A group receipt that also carries the reminders it announced.
 
     Still a plain ``str`` for every caller.  After LINE accepts it the sender
@@ -19412,6 +19429,9 @@ class ReminderReceipt(str):
     them may ride on the receipt's own reply (Andrew 2026-10-04: one reminder
     never goes out twice at the same moment).  A plain duplicate consumes
     nothing; its open stage still goes out at a later moment.
+
+    It is an `AllowsAllMention`: an @all anywhere in it pings the whole group.
+    Build one only from a receipt formatter's result, never around a model's words.
     """
 
     reminder_ids: tuple[int, ...]
@@ -21751,8 +21771,6 @@ def _handle_web_research_question(
     if plain_note and reply_text not in _FIXED_GUARD_REPLIES:
         reply_text = f"{reply_text}\n{plain_note}"  # only after the model's own words
 
-    # What the answer read came from pages nobody here picked: none gets to ping the whole group.
-    reply_text = line_mentions._ALL_MENTION_RE.sub("all", reply_text)
     memory.append_turn(group_id, "user", _research_turn(group_id, text, event))
     _append_bot_turn(group_id, reply_text)
     _reply(event.reply_token, reply_text, group_id=group_id)
@@ -24274,12 +24292,17 @@ def _reply(
     不能和 menu_card／large_menu_card 一起用。
 
     ``index_for_recall``：False 時 bot 的這則回覆存檔但不進 recall 索引（FCN、股票推薦用）。
+
+    全群提及（Andrew 2026-11-07：模型寫的回覆一律不能）：``text`` 是 `line_mentions.AllowsAllMention`
+    （民調、提醒回條）主訊息和它的 push fallback 才會全群提及，其他字裡的 @all 只是字。看字的型別、不開參數：
+    同一個呼叫點會送民調也會送模型寫的 /檢討（`_handle_command`）。搭車的確認和到期提醒是程式寫的，照響。
     """
     if flex_card is not None and (menu_card or large_menu_card):
         logger.error("flex_card cannot be combined with menu cards group=%s", group_id)
         return False
     archive_kwargs: dict = {} if index_for_recall else {"index_for_recall": False}
     original_text = text
+    allow_all_mention = isinstance(text, line_mentions.AllowsAllMention)  # the checks below give a plain str back
     if not text or not text.strip():
         if reply_provenance.dropped():
             # A guard dropped the reply, or Claude chose not to reply: intentionally silent.
@@ -24357,6 +24380,7 @@ def _reply(
             limit=5000,
             explicit_only=True,
             reply_targets=reply_targets,
+            allow_all_mention=allow_all_mention,
         )
     messages_to_send: list = [] if primary_suppressed else [primary_message]
     # primary_reminder_ref binds the primary message to one reminder, so a
@@ -24417,6 +24441,7 @@ def _reply(
                                 validation_source="reply_piggyback_mentions",
                                 limit=5000,
                                 explicit_only=True,
+                                allow_all_mention=False,  # a queued answer is a model's words
                             )
                             messages_to_send.append(pig_message)
                             message_reminder_refs.append(None)
@@ -24464,6 +24489,7 @@ def _reply(
                                 validation_source="reminder_confirmation_mentions",
                                 limit=5000,
                                 explicit_only=True,
+                                allow_all_mention=True,
                             )
                         )
                         messages_to_send.append(confirmation_message)
@@ -24590,6 +24616,7 @@ def _reply(
                                     validation_source="reminder_push_piggyback_mentions",
                                     limit=5000,
                                     explicit_only=True,
+                                    allow_all_mention=True,
                                 )[1]
                             )
                             riders.append(
@@ -25006,6 +25033,7 @@ def _reply(
                             limit=5000,
                             explicit_only=True,
                             reply_targets=reply_targets,
+                            allow_all_mention=allow_all_mention,
                         )
                     push_request_built = True
                     with ApiClient(_get_line_config()) as api_client:

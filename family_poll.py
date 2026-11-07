@@ -17,6 +17,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import line_mentions
 from config import settings
 from sqlite_security import connect_private_sqlite
 
@@ -518,8 +519,8 @@ def format_summary(poll: dict, *, include_pending: bool = True) -> str:
     return "\n".join(lines)
 
 
-def format_created_reply(poll: dict) -> str:
-    return (
+def format_created_reply(poll: dict) -> line_mentions.AllowsAllMention:
+    return line_mentions.AllowsAllMention(
         f"@all 民調開好了：{poll['question']}\n"
         "請直接回「可以 / 不行 / 不確定」。也可以回「媽媽可以、爸爸不行」。\n\n"
         f"{format_summary(poll)}"
@@ -541,8 +542,8 @@ def format_vote_reply(result: dict) -> str:
     return "\n\n".join(lines)
 
 
-def format_nudge_reply(poll: dict) -> str:
-    return (
+def format_nudge_reply(poll: dict) -> line_mentions.AllowsAllMention:
+    return line_mentions.AllowsAllMention(
         f"@all 民調更新：{poll['question']}\n"
         "還沒回的人請直接回「可以 / 不行 / 不確定」。\n\n"
         f"{format_summary(poll)}"

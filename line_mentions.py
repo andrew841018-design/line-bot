@@ -43,6 +43,17 @@ class MentionTarget:
     label: str = ""
 
 
+class AllowsAllMention(str):
+    """A message one of the program's own formatters put together (a poll, a reminder receipt): an
+    @all in it may ping the whole group (Andrew 2026-11-07).
+
+    A reply the model wrote never may, whatever it printed: a page, a video's text or an article in
+    its prompt can tell it to print 「@all」.  Every `str` method that changes the words hands back a
+    plain `str`, so losing this mark on the way to LINE only makes a message quiet.  Wrap a
+    formatter's result, never a model's reply.
+    """
+
+
 def _alias_path() -> Path:
     return Path(os.environ.get("LINE_USER_ALIASES_PATH") or _DEFAULT_ALIAS_PATH)
 

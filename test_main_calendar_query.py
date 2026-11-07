@@ -6329,7 +6329,7 @@ def test_mention_builder_keeps_all_and_named_mentions(monkeypatch):
         lambda: {"U_DAD": "爸爸", "U_MOM": "媽媽"},
     )
 
-    _text, message = main._text_message_with_mentions("參加人：@all、@爸爸、@媽媽")
+    _text, message = main._text_message_with_mentions("參加人：@all、@爸爸、@媽媽", allow_all_mention=True)
 
     assert message.type == "textV2"
     assert message.text.startswith("{all} {p2} {p3}\n")

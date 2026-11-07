@@ -5,6 +5,9 @@ link with such a handle, and, since the CLI path turns 「＠」 back into "@" (
 in full width.
 This is the reply text only: a family message that makes a reminder is the next task
 (the TODO in line_mentions.aliases_mentioned_in_text).  All text is made up.
+
+These tests ask what counts as an @all, so they build with `allow_all_mention=True`.  Who may ping the
+group at all: test_model_all_mention.py.
 """
 
 from __future__ import annotations
@@ -143,7 +146,7 @@ def _synthetic_aliases(monkeypatch):
 
 
 def _substitution(text: str, **kwargs) -> dict:
-    _sent, message = main._text_message_with_mentions(text, **kwargs)
+    _sent, message = main._text_message_with_mentions(text, allow_all_mention=True, **kwargs)
     return getattr(message, "substitution", None) or {}
 
 
@@ -175,7 +178,9 @@ def test_a_real_all_pings_the_group(text, explicit_only):
 @pytest.mark.parametrize("explicit_only", [True, False])
 @pytest.mark.parametrize("text", NOT_REAL)
 def test_the_rest_goes_out_without_pinging_the_group(text, explicit_only):
-    sent, message = main._text_message_with_mentions(text, explicit_only=explicit_only)
+    sent, message = main._text_message_with_mentions(
+        text, explicit_only=explicit_only, allow_all_mention=True
+    )
 
     assert sent == text  # the answer below is about this text, not one a guard put in its place
     assert "all" not in (getattr(message, "substitution", None) or {})
@@ -230,7 +235,7 @@ def poll(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("formatter", [family_poll.format_created_reply, family_poll.format_nudge_reply])
-def test_a_poll_still_pings_the_group(poll, formatter):
+def test_a_poll_opens_with_an_all_that_counts(poll, formatter):
     text = formatter(poll)
 
     assert text.startswith("@all 民調")
@@ -245,7 +250,7 @@ def test_a_poll_still_pings_the_group(poll, formatter):
         (["成員甲", "all"], "@成員甲 @all", {"all", "p2"}),
     ],
 )
-def test_a_receipt_for_everyone_still_pings_the_group(people, first_line, keys):
+def test_a_receipt_for_everyone_opens_with_an_all_that_counts(people, first_line, keys):
     receipt = main._format_reminder_write_confirmation(
         "created", "繳管理費", main.datetime(2099, 10, 1, 12, 0), people
     )
@@ -254,7 +259,7 @@ def test_a_receipt_for_everyone_still_pings_the_group(people, first_line, keys):
     assert set(_substitution(receipt, explicit_only=True)) == keys
 
 
-def test_a_push_read_back_as_text_still_pings_the_group():
+def test_a_push_read_back_as_text_opens_with_an_all_that_counts():
     # main's fallback for a reminder riding on a reply: `item.get("message") or …(item["text"])`.
     row = {"action": "繳管理費", "remind_at": 1_800_000_000, "user_id": "", "mention_aliases": ["all"]}
 

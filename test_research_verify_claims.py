@@ -501,11 +501,14 @@ def test_a_failed_answer_is_not_tried_twice(monkeypatch, research_env):
     assert len(calls) == 1 and research_env.sent == [] and research_env.finished == [True]
 
 
-def test_an_article_cannot_ping_the_whole_group(monkeypatch, research_env):
+def test_the_answer_reaches_reply_as_a_plain_str(monkeypatch, research_env):
+    # The words go out as they came, in a plain str: `_reply` pings the group only for text the
+    # program wrote itself (2026-11-07; through the real `_reply` in test_model_all_mention.py).
     monkeypatch.setattr(main, "_collect_web_research_sources", lambda text: [dict(ROW)])
     monkeypatch.setattr(main, "_llm_chat", lambda *_a: ANSWER + "\n@all")
     main._handle_web_research_question(research_env.event, "G_V", "輝達暴跌10 %多", addressed=False)
-    assert research_env.sent == [ANSWER + "\nall"]
+    assert research_env.sent == [ANSWER + "\n@all"]
+    assert type(research_env.sent[0]) is str
 
 
 def test_an_address_is_not_a_ping(monkeypatch, research_env):
