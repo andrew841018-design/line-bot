@@ -17,6 +17,8 @@ Andrew 2026-10-17 的要求：台股也要看技術面、成交量（「我要�
   「總計(1~15)」；漲跌家數取「股票」欄，「684(19)」括號內是漲停／跌停家數；「無比價」另計數、不算漲跌；
   收盤收全部普通股（4 碼數字）＋0050（job 保留最近 10 個交易日，新成分不必再打請求）。
 - 三大法人：外資＝「外資及陸資(不含外資自營商)」；外資自營商已含在自營商內，不重複加。
+- T86（2026-10-31 機構動向）：個股的外資＝「外陸資買賣超股數(不含外資自營商)」，和上一條、stock_picks 同口徑；
+  另取投信、自營商（自行買賣）、自營商（避險）三欄買賣超股數，不用「三大法人買賣超股數」欄；只檢查要的代號那幾列。
 - 休市表依「名稱＋說明」分類：放假／補假／休市、市場無交易（僅辦理結算交割）＝非交易日；開始交易日／最後交易日
   ＝交易日；看不懂（或同時符合兩類）的標 unknown 交給每日維護，不猜。
 - 期交所：外資台指期分大台（臺股期貨）／小台（小型臺指期貨）／微台（微型臺指期貨），名稱完全相同才算；
@@ -121,6 +123,13 @@ HOST_MIN_INTERVAL_S = {
     "openapi.twse.com.tw": 2.0,
     "openapi.taifex.com.tw": 2.0,
     "www.moneydj.com": 2.0,
+}
+# 證交所 www 只用剩下額度的端點（2026-10-31 機構動向）：T86 不是主要資料，只在 market_pipeline_tw 的 spare_ok 為真、
+# 而且當天證交所已用次數＋1 ≤ T86_DAY_CEILING（9）時才抓，所以不列進上面的 ENDPOINTS（那張表證交所各端點的上限
+# 合計 13 是主要資料的帳）；主機總量仍是同一本 12 次的帳本。最早 16:30 照 BFI82U 的寫法另訂（T 當天幾點公布還沒量過：
+# /股票 都在 T+1 清晨才抓，等 /股票 回覆後再調）。回應是全部上市證券（ALLBUT0999）一千多列，stock_picks 用 1 MiB，這裡留 2 MiB
+SPARE_ENDPOINTS: dict[str, Endpoint] = {
+    "twse_t86": Endpoint("www.twse.com.tw", time(16, 30), 2, 2 * _MIB, 15.0, ("json",)),
 }
 
 # ── 代號與格式 ───────────────────────────────────────────────────────────────────────
@@ -515,7 +524,7 @@ def _http_module(http: Any) -> Any:
 
 
 def _get(http: Any, ledger: Any, name: str, url: str, *, timeout: Optional[float] = None) -> bytes:
-    endpoint = ENDPOINTS[name]
+    endpoint = ENDPOINTS[name] if name in ENDPOINTS else SPARE_ENDPOINTS[name]
     response = _http_module(http).fetch(
         url,
         max_bytes=endpoint.max_bytes,
@@ -784,6 +793,82 @@ def parse_twse_bfi82u(payload: Any, *, expect_date: Optional[date] = None) -> In
     if total is not None and total != sum(values.values()):
         raise ParseError("conflict")
     return Inst3(day, values["foreign"], values["trust"], values["dealer_self"], values["dealer_hedge"])
+
+
+# ── 證交所 T86（三大法人買賣超日報，個股股數；2026-10-31 機構動向：0050 成分） ───────────────────────
+_T86_FIELDS = (
+    "證券代號",
+    "外陸資買賣超股數(不含外資自營商)",  # 外資：和 BFI82U、stock_picks 同口徑
+    "投信買賣超股數",
+    "自營商買賣超股數(自行買賣)",
+    "自營商買賣超股數(避險)",
+)
+# 證交所「這天還沒有資料」的兩種說法（和 stock_picks._T86_NOT_YET_STATS 一樣，2026-10-17 實測）：查還沒到的日子回
+# 「查詢日期大於可查詢最大日期，請重新查詢!」，查非交易日回「很抱歉，沒有符合條件的資料!」
+_T86_NOT_YET = ("沒有符合條件", "大於可查詢最大日期")
+
+
+class T86Net(NamedTuple):
+    foreign: int  # 外陸資買賣超股數(不含外資自營商)
+    trust: int  # 投信買賣超股數
+    dealer_self: int  # 自營商買賣超股數(自行買賣)
+    dealer_hedge: int  # 自營商買賣超股數(避險)
+
+
+@dataclass(frozen=True)
+class T86Day:
+    date: date
+    rows: dict[str, T86Net]  # 代號 → 四欄買賣超股數（有正負號）
+
+
+def _t86_stat(payload: Any) -> None:
+    """stat：OK（大小寫不拘）才往下；兩種「還沒有資料」→ empty（job 當還沒公布）；其他 → format。"""
+    if not isinstance(payload, dict):
+        raise ParseError("format")
+    stat = payload.get("stat")
+    if not isinstance(stat, str):
+        raise ParseError("format")
+    text = stat.strip()
+    if text.upper() == "OK":
+        return
+    if any(word in text for word in _T86_NOT_YET):
+        raise ParseError("empty")
+    raise ParseError("format")
+
+
+def _t86_int(value: Any) -> int:
+    return _text_int(value) if isinstance(value, str) else _json_int(value)
+
+
+def parse_twse_t86(payload: Any, *, expect_date: Optional[date] = None, codes: Optional[Iterable[str]] = None) -> T86Day:
+    """證交所 `fund/T86?selectType=ALLBUT0999` 的一天：每檔的外資、投信、自營商（自行買賣、避險）買賣超股數。
+
+    表頭依名字找、每個名字要正好一次，對不到 → format（detail header，整份不收）；日期不是 `expect_date` → date；
+    兩種「還沒有資料」→ empty。`codes` 給了就只收（也只檢查）這幾檔的列：別的證券的列壞掉不影響，要的列有一格看不懂
+    → format；同代號兩列不同 → conflict；一列都沒有 → too_few。T86 沒有的代號就不在 rows 裡。
+    """
+    _t86_stat(payload)
+    day = _payload_day(payload, expect_date)
+    _check_title(payload.get("title"), day)
+    fields, data = payload.get("fields"), payload.get("data")
+    if not isinstance(fields, list) or not isinstance(data, list):
+        raise ParseError("format")
+    index = _field_index([_squash(name) for name in fields], _T86_FIELDS)
+    if index is None:
+        raise ParseError("format", "header")
+    wanted = None if codes is None else frozenset(codes)
+    rows: dict[str, T86Net] = {}
+    for row in data:
+        code = _label(row, index["證券代號"])
+        if not _TW_CODE_RE.fullmatch(code) or (wanted is not None and code not in wanted):
+            continue
+        net = T86Net(*(_t86_int(_cell(row, index[name])) for name in _T86_FIELDS[1:]))
+        if code in rows and rows[code] != net:
+            raise ParseError("conflict")
+        rows[code] = net
+    if not rows:
+        raise ParseError("too_few")
+    return T86Day(day, rows)
 
 
 # ── 證交所 MI_MARGN（信用交易統計） ─────────────────────────────────────────────────────
@@ -1404,6 +1489,17 @@ def fetch_twse_bfi82u(day: date, *, http: Any = None, ledger: Any = None) -> Ins
     query = urlencode({"type": "day", "dayDate": _ymd_text(day), "response": "json"})
     body = _get(http, ledger, "twse_bfi82u", f"{TWSE_WWW}/rwd/zh/fund/BFI82U?{query}")
     return parse_twse_bfi82u(_json_body(body), expect_date=day)
+
+
+def t86_url(day: date) -> str:
+    """T86 那天的網址（和 stock_picks 同一個端點與參數；job 把它存進 obs 的 source_url）。"""
+    query = urlencode({"date": _ymd_text(day), "selectType": "ALLBUT0999", "response": "json"})
+    return f"{TWSE_WWW}/rwd/zh/fund/T86?{query}"
+
+
+def fetch_twse_t86(day: date, *, http: Any = None, ledger: Any = None, codes: Optional[Iterable[str]] = None) -> T86Day:
+    body = _get(http, ledger, "twse_t86", t86_url(day))
+    return parse_twse_t86(_json_body(body), expect_date=day, codes=codes)
 
 
 def fetch_twse_margin_ms(day: date, *, http: Any = None, ledger: Any = None) -> MarginTw:

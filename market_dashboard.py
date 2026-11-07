@@ -225,6 +225,7 @@ SHIPPED_MARKET_TEXTS: tuple[str, ...] = (
     "/盤勢 13F VOO",
     "/盤勢 13F SOXX",
     "/盤勢 通膨",  # 2026-10-30 批 2：重點摘要的「通膨細節」按鈕
+    "/盤勢 13F 0050",  # 2026-10-31 機構動向：0050 細節卡的第 3 顆按鈕
 )
 
 _BODY_MAX = 40
@@ -2374,7 +2375,7 @@ def _etf_detail(ctx: _Ctx, sym: str) -> Reply:
         _title(_US_NAMES[sym], etf.data_date if etf.fresh else None, views=[etf]),
         body,
         notes=(TEXT_US_BASIS, *([TEXT_RSI_NOTE] if _rsi_shown(etf) else [])),
-        buttons=(("機構持股（13F）", f"/盤勢 13F {sym}"), (f"期權圖（{chart}）", f"/盤勢 {chart} 圖")),
+        buttons=((_inst_button(ctx, sym), f"/盤勢 13F {sym}"), (f"期權圖（{chart}）", f"/盤勢 {chart} 圖")),
     )
     return _flex_reply(bubble, _etf_alt(sym, etf))
 
@@ -2488,7 +2489,8 @@ def _tw_detail(ctx: _Ctx) -> Reply:
         _title("台灣50（0050）", day, views=[etf, taiex]),
         body,
         notes=(TEXT_TW_BASIS, *([reason] if reason else []), *([TEXT_RSI_NOTE] if _rsi_shown(etf) else [])),
-        buttons=(("台指期權圖", "/盤勢 台指 圖"), ("期權與資金細節", "/盤勢 期權")),
+        buttons=(("台指期權圖", "/盤勢 台指 圖"), ("期權與資金細節", "/盤勢 期權"),
+                 *(((TEXT_INST_BUTTON, "/盤勢 13F 0050"),) if _inst_on(ctx, "tw.inst.0050") else ())),
     )
     return _flex_reply(bubble, _etf_alt("0050", etf))
 
@@ -2761,10 +2763,15 @@ def _13f_summary(view: _View, shown: list[dict]) -> tuple[int, int]:
     return more, missing
 
 
-def _13f_detail(ctx: _Ctx, sym: str) -> Reply:
+def _13f_title(sym: str) -> str:
+    return f"機構持股（13F）｜{_US_NAMES[sym]}前十大"
+
+
+def _13f_bubble(ctx: _Ctx, sym: str, shown: list[dict]) -> tuple[dict, int]:
+    """原本 _13f_detail 組泡泡的那一段（2026-10-31 機構動向：只搬出來給輪播共用，內容沒改）。shown 收列出的前十大；
+    回 (泡泡, 加碼機構多於減碼機構的檔數)。"""
     view = ctx.row(f"us.13f.{sym}")
     body: list[dict] = []
-    shown: list[dict] = []
     more = 0
     if view.fresh:
         for item in _list(view.values.get("rows"), HOLDINGS_MAX):
@@ -2786,14 +2793,293 @@ def _13f_detail(ctx: _Ctx, sym: str) -> Reply:
         body.append(_text(f"機構持股（13F）：{ctx.gap(view)}", color=GRAY))
     basis = (ctx.note(view.values.get("weight_basis")) if view.fresh else None) or _13F_BASIS[sym]
     bubble = _bubble(
-        f"機構持股（13F）｜{_US_NAMES[sym]}前十大",
+        _13f_title(sym),
         body,
         subtitle=basis,
         notes=(market_calc.TEXT_13F_LAG, TEXT_SHARE_CLASS),
         buttons=((f"回{_US_SHORT[sym]}細節", f"/盤勢 {sym}"),),
     )
-    alt = f"{ALT_PREFIX}13F 前十大（{sym}）｜" + (f"{more} 檔的加碼機構多於減碼機構" if shown else "資料暫缺")
-    return _flex_reply(bubble, alt)
+    return bubble, more
+
+
+def _13f_alt(sym: str, shown: list[dict], more: int) -> str:
+    return f"{ALT_PREFIX}13F 前十大（{sym}）｜" + (f"{more} 檔的加碼機構多於減碼機構" if shown else "資料暫缺")
+
+
+def _13f_detail(ctx: _Ctx, sym: str) -> Reply:
+    if not _inst_on(ctx, f"us.inst.{sym}"):  # 機構動向停用，或舊快照還沒有這一列：只回原本的 13F 卡
+        shown: list[dict] = []
+        bubble, more = _13f_bubble(ctx, sym, shown)
+        return _flex_reply(bubble, _13f_alt(sym, shown, more))
+    return _inst_us_detail(ctx, sym)
+
+
+# ── 細節：機構動向（2026-10-31 第一期；IMPL_SPEC_p1 §4、PLAN_v2 §3.3；Phase 6 修正見 reviews/p6_triage.md） ──────────
+# 「/盤勢 13F SOXX|QQQ|VOO」→［機構動向短卡、原本的 13F 卡（_13f_bubble）］，用 _guarded_bubbles：短卡壞了只換成固定短卡，
+# 原卡照送；「/盤勢 13F 0050」→ 0050 機構動向單張（取代 TEXT_NO_13F_0050）。卡上只有 market_calc 的 TEXT_INST_*（FIXED_TEXTS
+# 的禁用字、validator、年份掃描都涵蓋）＋程式算的數字與日期＋證交所代號。快照的每一段用 market_calc 的 inst_flow_ok／
+# inst_13f_ok／inst_t86_ok 判斷（和 job 寫快照時同一份），不合的那一段寫暫缺；每一段用自己的 stale_after、印自己的資料日；
+# 資料比預期舊（behind）時在那一段的日期行加註「最近一筆」，不另起一行、不重印日期。
+# 旗標檔 state/market_inst.disabled（每次都看；看不到也當停用）：13F 只回原卡、ETF 細節卡按鈕字退回「機構持股（13F）」、
+# 0050 回 TEXT_NO_13F_0050、0050 細節卡不加第 3 顆按鈕。舊快照（job 還沒寫這幾列）一樣回原本的卡、句子與按鈕。
+INST_DISABLED_FLAG = "market_inst.disabled"
+INST_STATUS_SOURCES = ("SOXX", "SPY", "0050", "T86")  # status_summary 的 inst_flows；要和 jobs/market_snapshot 的 INST_FLOWS＋INST_T86 一樣
+INST_FLOW_SYMBOLS = market_calc.INST_FLOW_SYMBOLS  # 有每日資金流的美股 ETF（QQQ、VOO 寫「暫不提供」）
+INST_TW_NAME = "台灣50（0050）"
+INST_LOT = 1000  # 1 張＝1,000 股（T86）＝1,000 受益權單位（0050 申贖）
+TEXT_INST_TITLE = market_calc.TEXT_INST_TITLE
+TEXT_INST_SWIPE = market_calc.TEXT_INST_SWIPE
+TEXT_INST_BUTTON = market_calc.TEXT_INST_BUTTON
+TEXT_INST_BACK_TW = market_calc.TEXT_INST_BACK_TW
+TEXT_INST_FLOW_HEAD = market_calc.TEXT_INST_FLOW_HEAD
+TEXT_INST_FLOW_HEAD_TW = market_calc.TEXT_INST_FLOW_HEAD_TW
+TEXT_INST_FLOW_NONE = market_calc.TEXT_INST_FLOW_NONE
+TEXT_INST_CHECK = market_calc.TEXT_INST_CHECK
+TEXT_INST_FLOW_NOTE = market_calc.TEXT_INST_FLOW_NOTE
+TEXT_INST_13F_LABEL = market_calc.TEXT_INST_13F_LABEL
+TEXT_INST_13F_NOTE = market_calc.TEXT_INST_13F_NOTE
+TEXT_INST_T86_LABEL = market_calc.TEXT_INST_T86_LABEL
+TEXT_INST_T86_NOTE = market_calc.TEXT_INST_T86_NOTE
+
+
+def _inst_disabled(paths: Any) -> bool:
+    try:
+        return market_paths.flag_set(paths.state_dir / INST_DISABLED_FLAG)
+    except Exception:  # 連旗標都看不了：當停用（回原本的卡）
+        return True
+
+
+def _inst_off(ctx: _Ctx) -> bool:
+    """handle() 每次把旗標結果放在 ctx 上；status_summary 建的 ctx 沒有這個屬性 → 當開著（每日維護也量得到新卡的錯誤）。"""
+    return getattr(ctx, "inst_disabled", False) is True
+
+
+def _inst_on(ctx: _Ctx, row_id: str) -> bool:
+    """新卡、新按鈕只在旗標不在、而且快照裡已經有那一列時出現（舊快照空窗照舊；Phase 6 R1-5、R3-7）。"""
+    return not _inst_off(ctx) and row_id in ctx.rows
+
+
+def _inst_button(ctx: _Ctx, sym: str) -> str:
+    """ETF 細節卡往 13F 的按鈕字（指令不變）。"""
+    return TEXT_INST_BUTTON if _inst_on(ctx, f"us.inst.{sym}") else "機構持股（13F）"
+
+
+def _inst_values(ctx: _Ctx, row_id: str) -> tuple[Optional[dict], float]:
+    """(values, 列的 stale_after)。state 不是 ok、values 不是 dict、stale_after 壞了 → (None, 0)。
+
+    不用 ctx.row：整列過期時它會丟掉 values，這裡每一段要自己判過期、印自己的資料日（列的 stale_after 是各段的最大值）。"""
+    raw = ctx.rows.get(row_id)
+    if not isinstance(raw, dict) or raw.get("state") != "ok" or not isinstance(raw.get("values"), dict):
+        return None, 0.0
+    stale_after = _num(raw.get("stale_after"))
+    return (raw["values"], stale_after) if stale_after is not None else (None, 0.0)
+
+
+def _inst_spec_part(values: Optional[dict], key: str, check: Callable[[Any], bool]) -> Optional[dict]:
+    """一段的值：market_calc 的共用檢查（型別＋語意）通過才用；不合 → None（那一段暫缺）。"""
+    part = values.get(key) if values is not None else None
+    try:
+        return part if isinstance(part, dict) and check(part) else None
+    except Exception:
+        return None
+
+
+def _inst_signed(value: int, unit: str) -> str:
+    """股數的變化：0 不帶正負號，其他帶正負號與千分位，後面接單位。"""
+    return f"0 {unit}" if value == 0 else f"{value:+,} {unit}"
+
+
+def _inst_lots(shares: int) -> str:
+    """股（單位）→ 張（Decimal ROUND_HALF_UP，平手往遠離 0）；進位後是 0 但原本不是 0 → 「+不到 1 張」（保留正負號）。"""
+    lots = (Decimal(shares) / INST_LOT).quantize(Decimal(1), rounding=ROUND_HALF_UP)
+    if lots == 0:
+        return "0" if shares == 0 else ("+" if shares > 0 else "-") + market_calc.TEXT_INST_UNDER_ONE_LOT
+    return f"{lots:+,}"
+
+
+def _inst_lots_text(units: int) -> str:
+    """0050 申贖：單位 → 「+12,000 張」；不到 1 張時是「+不到 1 張」（本身就帶單位）。"""
+    text = _inst_lots(units)
+    return text if text.endswith(market_calc.TEXT_INST_UNDER_ONE_LOT) else f"{text} {market_calc.TEXT_INST_UNIT_LOTS}"
+
+
+def _inst_round(value: Decimal) -> Decimal:
+    """一位小數；1,000 以上不帶小數（ROUND_HALF_UP）。"""
+    rounded = value.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+    return value.quantize(Decimal(1), rounding=ROUND_HALF_UP) if abs(rounded) >= 1000 else rounded
+
+
+def _inst_amount(flow: float, currency: str) -> str:
+    """估算金額：1 萬以下寫「淨流入／淨流出不到 1 萬」；1 億以下用萬（整數）；1 兆以下用億、以上用兆（一位小數，1,000 以上不帶
+    小數）。一律 Decimal ROUND_HALF_UP；先進位再看要不要換大一級的單位（9,999.5 萬寫「約 +1.0 億」、9,999.96 億寫「約 +1.0 兆」）。"""
+    value = Decimal(repr(float(flow)))
+    wan = (value / 10_000).quantize(Decimal(1), rounding=ROUND_HALF_UP)
+    if wan == 0:
+        small = market_calc.TEXT_INST_AMOUNT_SMALL_IN if value > 0 else market_calc.TEXT_INST_AMOUNT_SMALL_OUT
+        return small.format(currency=currency)
+    if abs(wan) < 10_000:
+        return market_calc.TEXT_INST_AMOUNT_WAN.format(amount=f"{wan:+,}", currency=currency)
+    yi = _inst_round(value / 100_000_000)
+    if abs(yi) < 10_000:
+        return market_calc.TEXT_INST_AMOUNT_YI.format(amount=f"{yi:+,}", currency=currency)
+    return market_calc.TEXT_INST_AMOUNT_ZHAO.format(amount=f"{_inst_round(value / 10**12):+,}", currency=currency)
+
+
+def _inst_flow_rows(ctx: _Ctx, values: Optional[dict], row_stale: float, *, head: str, unit: str, currency: str,
+                    lots: bool = False) -> list[dict]:
+    """資金流那一段。變體順序：暫缺 → 過期 → 待核對 → 正常（日期行；資料比預期舊時日期行加註「最近一筆」）。
+    正常時依序：「起點→資料日：變化」（SOXX 第一筆沒有前一份：「資料日 起開始記錄」）、估算金額（變化不是 0 才印）、
+    「近 5 日（起點 起）：變化」（publish 給了才印）。lots＝0050：單位換成張。"""
+    rows = [_text(head, weight="bold")]
+    part = _inst_spec_part(values, "flows", market_calc.inst_flow_ok)
+    if part is None:
+        return rows + [_text(TEXT_MISSING, size="md", color=GRAY)]
+    as_of, prev = _day(part["as_of"]), _day(part["prev_as_of"]) if part["prev_as_of"] is not None else None
+    if ctx.now > min(part["stale_after"], row_stale):
+        return rows + [_text(market_calc.TEXT_STALE.format(md=_md(as_of)), size="md", color=GRAY)]
+    if part["flag"] == "check":  # 變化大到要核對：不印股數與金額
+        return rows + [_text(TEXT_INST_CHECK, size="md", color=GRAY)]
+
+    def amount_of(change: int) -> str:
+        return _inst_lots_text(change) if lots else _inst_signed(change, unit)
+
+    behind, change = part["behind"], part["change"]
+    if change is None or prev is None:
+        template = market_calc.TEXT_INST_FIRST_RECORD_BEHIND if behind else market_calc.TEXT_INST_FIRST_RECORD
+        rows.append(_text(template.format(md=_md(as_of)), size="md", color=GRAY))
+    else:
+        template = market_calc.TEXT_INST_CHANGE_BEHIND if behind else market_calc.TEXT_INST_CHANGE
+        rows.append(_text(_fit(template.format(start=_md(prev), end=_md(as_of), change=amount_of(change))), size="md"))
+        if change != 0 and part["flow"] is not None:
+            rows.append(_text(_fit(_inst_amount(part["flow"], currency)), size="md"))
+    five = part["change_5d"]
+    if five is not None:
+        rows.append(_text(_fit(market_calc.TEXT_INST_5D.format(start=_md(_day(five["from_as_of"])),
+                                                              change=amount_of(five["change"]))), size="md"))
+    return rows
+
+
+def _inst_13f_rows(ctx: _Ctx, values: Optional[dict], row_stale: float) -> list[dict]:
+    """13F 新一季進度（x/N 筆；名單會變動，x 可能倒退，所以寫「已是 9/30 季報」，不寫「已申報」）。"""
+    part = _inst_spec_part(values, "f13", market_calc.inst_13f_ok)
+    if part is None:
+        return [_text(f"{TEXT_INST_13F_LABEL}：{TEXT_MISSING}", color=GRAY)]
+    if ctx.now > min(part["stale_after"], row_stale):
+        return [_text(f"{TEXT_INST_13F_LABEL}：{TEXT_DIGEST_STALE}", color=GRAY)]
+    qe = _md(_day(part["quarter_end"]))
+    head = (market_calc.TEXT_INST_13F_HEAD.format(qe=qe, deadline=_md(_day(part["deadline"]))) if part["deadline"]
+            else market_calc.TEXT_INST_13F_HEAD_UNKNOWN.format(qe=qe))
+    return [_text(head, weight="bold"),
+            _text(market_calc.TEXT_INST_13F_PROGRESS.format(qe=qe, x=part["updated"], n=part["total"]), size="md"),
+            _text(TEXT_INST_13F_NOTE, size="md", color=GRAY)]
+
+
+def _inst_t86_lines(code: str, values: tuple[Optional[int], ...], *, dealer: bool = True) -> list[dict]:
+    """一檔一列；放不下 24 寬（大數字、「不到 1 張」）就分兩列：外資與投信一列、自營另一列（兩列都帶代號）。
+    dealer＝False（近 5 日合計）只列外資與投信。三個值都是 null（T86 沒有這檔）→「代號 暫缺」。"""
+    if any(value is None for value in values):
+        return [_text(f"{code} {TEXT_MISSING}", size="md", color=GRAY)]
+    foreign, trust, dealer_lots = (_inst_lots(value) for value in values)
+    main = market_calc.TEXT_INST_T86_ROW_MAIN.format(code=code, foreign=foreign, trust=trust)
+    if not dealer:
+        return [_text(_fit(main), size="md")]
+    one = market_calc.TEXT_INST_T86_ROW.format(code=code, foreign=foreign, trust=trust, dealer=dealer_lots)
+    if row_width(one) <= MAX_ROW_WIDTH:
+        return [_text(one, size="md")]
+    return [_text(_fit(main), size="md"),
+            _text(_fit(market_calc.TEXT_INST_T86_ROW_DEALER.format(code=code, dealer=dealer_lots)), size="md")]
+
+
+def _inst_t86_rows(ctx: _Ctx, values: Optional[dict], row_stale: float) -> list[dict]:
+    """0050 前十大的法人買賣超（張）＋近 5 日合計（前 5 檔、外資與投信）。某一檔缺天只跳過那一檔、第 6 檔不遞補；前 5 檔一檔都不齊
+    才是「近 5 日合計：資料累積中（n/5）」。"""
+    part = _inst_spec_part(values, "t86", market_calc.inst_t86_ok)
+    if part is None:
+        return [_text(f"{TEXT_INST_T86_LABEL}：{TEXT_MISSING}", color=GRAY)]
+    day = _md(_day(part["trade_date"]))
+    if ctx.now > min(part["stale_after"], row_stale):
+        return [_text(f"{TEXT_INST_T86_LABEL}：{market_calc.TEXT_STALE.format(md=day)}", color=GRAY)]
+    head = market_calc.TEXT_INST_T86_HEAD_BEHIND if part["behind"] else market_calc.TEXT_INST_T86_HEAD
+    rows = [_text(head.format(md=day), weight="bold")]
+    for item in part["rows"]:
+        rows += _inst_t86_lines(item["code"], (item["foreign"], item["trust"], item["dealer"]))
+    sum5 = part["sum5"]
+    if sum5 is None:
+        return rows
+    if sum5["days"] < market_calc.INST_SUM_DAYS:
+        return rows + [_text(f"{market_calc.TEXT_INST_T86_SUM_LABEL}：{market_calc.TEXT_ACCUMULATING.format(n=sum5['days'])}",
+                             size="md", color=GRAY)]
+    top = {item["code"] for item in part["rows"][: market_calc.INST_SUM_TOP]}  # 權重前 5 檔（前十大本來就照權重排）
+    shown = [item for item in sum5["rows"] if item["code"] in top]
+    if not shown:
+        return rows
+    rows.append(_text(market_calc.TEXT_INST_T86_SUM_HEAD.format(start=_md(_day(sum5["from"])), end=_md(_day(sum5["to"]))),
+                      weight="bold"))
+    for item in shown:
+        rows += _inst_t86_lines(item["code"], (item["foreign"], item["trust"], item["dealer"]), dealer=False)
+    return rows
+
+
+def _inst_alt(ctx: _Ctx, name: str, values: Optional[dict], row_stale: float) -> str:
+    """altText 對上第一張（機構動向）：「盤勢：機構動向（SOXX）｜資料 10/16」；只有 13F 進度時寫「13F 新一季 9/30」。"""
+    alt = f"{ALT_PREFIX}{TEXT_INST_BUTTON}（{name}）"
+    flows = _inst_spec_part(values, "flows", market_calc.inst_flow_ok)
+    if flows is not None and ctx.now <= min(flows["stale_after"], row_stale):
+        return alt + f"｜資料 {_md(_day(flows['as_of']))}"
+    f13 = _inst_spec_part(values, "f13", market_calc.inst_13f_ok)
+    if f13 is not None and ctx.now <= min(f13["stale_after"], row_stale):
+        return alt + f"｜{TEXT_INST_13F_LABEL} {_md(_day(f13['quarter_end']))}"
+    t86 = _inst_spec_part(values, "t86", market_calc.inst_t86_ok)
+    if t86 is not None and ctx.now <= min(t86["stale_after"], row_stale):
+        return alt + f"｜資料 {_md(_day(t86['trade_date']))}"
+    return alt
+
+
+def _inst_us_card(ctx: _Ctx, sym: str, head: str, subtitle: Optional[str]) -> dict:
+    values, row_stale = _inst_values(ctx, f"us.inst.{sym}")
+    if sym in INST_FLOW_SYMBOLS:
+        body = _inst_flow_rows(ctx, values, row_stale, head=TEXT_INST_FLOW_HEAD, unit=market_calc.TEXT_INST_UNIT_SHARES,
+                               currency=market_calc.TEXT_INST_CURRENCY_USD)
+        notes: tuple[str, ...] = (TEXT_INST_FLOW_NOTE,)
+    else:  # QQQ、VOO：中性的「暫不提供」（不拿 SPY 代表 VOO，PLAN_v2 §0；不斷言來源有沒有，Phase 6 R3-8）
+        body, notes = [_text(TEXT_INST_FLOW_NONE, size="md", color=GRAY)], ()
+    body.append(_sep())
+    body += _inst_13f_rows(ctx, values, row_stale)
+    return _bubble(head, body, subtitle=subtitle, notes=notes)
+
+
+def _inst_us_detail(ctx: _Ctx, sym: str) -> Reply:
+    """［機構動向短卡、原本的 13F 卡］；altText 對上第一張（機構動向）。"""
+    shown: list[dict] = []
+
+    def _inst_us_bubble(ctx: _Ctx, head: str, subtitle: Optional[str]) -> dict:
+        return _inst_us_card(ctx, sym, head, subtitle)
+
+    def _13f_holdings_bubble(ctx: _Ctx, head: str, subtitle: Optional[str]) -> dict:
+        return _13f_bubble(ctx, sym, shown)[0]
+
+    bubbles, errors = _guarded_bubbles(
+        ctx, [(TEXT_INST_TITLE.format(name=_US_NAMES[sym]), _inst_us_bubble), (_13f_title(sym), _13f_holdings_bubble)],
+        TEXT_INST_SWIPE,
+    )
+    return _flex_reply(_carousel(bubbles), _inst_alt(ctx, sym, *_inst_values(ctx, f"us.inst.{sym}")), render_errors=errors)
+
+
+# TODO：批 3 合併後把這張卡加進 _status_summary 的巡檢清單
+def _inst_tw_detail(ctx: _Ctx) -> Reply:
+    """0050 機構動向單張：申購贖回（張）＋前十大法人（壞了換成固定短卡，錯誤進 render_errors）。"""
+    values, row_stale = _inst_values(ctx, "tw.inst.0050")
+
+    def _inst_tw_bubble(ctx: _Ctx, head: str, subtitle: Optional[str]) -> dict:
+        body = _inst_flow_rows(ctx, values, row_stale, head=TEXT_INST_FLOW_HEAD_TW, unit=market_calc.TEXT_INST_UNIT_LOTS,
+                               currency=market_calc.TEXT_INST_CURRENCY_TWD, lots=True)
+        body.append(_sep())
+        body += _inst_t86_rows(ctx, values, row_stale)
+        return _bubble(head, body, subtitle=subtitle, notes=(TEXT_INST_FLOW_NOTE, TEXT_INST_T86_NOTE),
+                       buttons=((TEXT_INST_BACK_TW, "/盤勢 0050"),))
+
+    bubbles, errors = _guarded_bubbles(ctx, [(TEXT_INST_TITLE.format(name=INST_TW_NAME), _inst_tw_bubble)])
+    return _flex_reply(bubbles[0], _inst_alt(ctx, "0050", values, row_stale), render_errors=errors)
 
 
 # ── 細節：新聞與宏觀 ─────────────────────────────────────────────────────────
@@ -3541,6 +3827,7 @@ _DETAILS: dict[str, Callable[[_Ctx, Optional[str]], Reply]] = {
     F13: lambda ctx, sym: _13f_detail(ctx, sym or "QQQ"),
     INFL: lambda ctx, _sym: _card_infl(ctx),
 }
+_DETAILS[NO_13F] = lambda ctx, _sym: _inst_tw_detail(ctx)  # 2026-10-31 機構動向：「/盤勢 13F 0050」（停用、舊快照在 handle 先擋）
 
 
 def handle(body: str, *, now: Optional[float] = None, paths: Optional[market_paths.Paths] = None) -> Reply:
@@ -3558,14 +3845,18 @@ def handle(body: str, *, now: Optional[float] = None, paths: Optional[market_pat
         if command is None:
             return Reply(text=TEXT_USAGE)
         kind, sym = command
-        if kind == NO_13F:
+        inst_off = _inst_disabled(paths)  # 機構動向的旗標（2026-10-31）：每次都看；看不到也當停用
+        if kind == NO_13F and inst_off:
             return Reply(text=TEXT_NO_13F_0050)
         snapshot = _load_snapshot(paths)
+        if kind == NO_13F and (snapshot is None or "tw.inst.0050" not in snapshot["rows"]):
+            return Reply(text=TEXT_NO_13F_0050)  # 還沒有快照、或 job 還沒寫機構動向列：照舊回這句
         if snapshot is None:
             return _not_ready(None)
         if kind == CHART:
             return _chart_reply(snapshot, sym or "QQQ", paths, moment)
         ctx = _Ctx(snapshot, moment)
+        ctx.inst_disabled = inst_off
         if not ctx.any_data():
             return _not_ready(ctx)
         reply = _DETAILS[kind](ctx, sym)
@@ -3580,6 +3871,25 @@ def handle(body: str, *, now: Optional[float] = None, paths: Optional[market_pat
 # ── 每日維護 ─────────────────────────────────────────────────────────────────
 def _safe_kind(value: Any) -> Optional[str]:
     return value if isinstance(value, str) and _KIND_RE.fullmatch(value) else None
+
+
+def _inst_status_summary(raw: Any) -> dict:
+    """outcome 的 inst_flows 過白名單（2026-11-06 Phase 6 複審 R2-3-1：以前只進 outcome，每日維護讀的 status_summary 看不到）。
+    只放日期、整數、布林與 check。固定四項、固定鍵：舊版 job、inst_flows 是 null、壞值都落在 None，不是少一個鍵——維護條目的
+    「或是 null」才會觸發（同 calendar_days_left）。"""
+    flows = _dict(raw)
+    out: dict = {}
+    for name in INST_STATUS_SOURCES:
+        info = _dict(flows.get(name))
+        day = info.get("data_date")
+        entry = {"data_date": day if _day(day) else None, "lag_sessions": _count(info.get("lag_sessions"), 10**4),
+                 "fail_streak": _count(info.get("fail_streak"), 10**6),
+                 "last_success_at": _num(info.get("last_success_at"), 0, 10**11), "enabled": _flag(info.get("enabled"))}
+        if name != "T86":  # T86 沒有 NAV，也沒有待核對
+            nav_day = info.get("nav_as_of")
+            entry.update(nav_as_of=nav_day if _day(nav_day) else None, flag="check" if info.get("flag") == "check" else None)
+        out[name] = entry
+    return out
 
 
 def _outcome_summary(paths: Any, now: float) -> dict:
@@ -3650,6 +3960,8 @@ def _outcome_summary(paths: Any, now: float) -> dict:
     poll = data.get("infl_bls_poll")
     out["infl_bls_poll"] = poll if isinstance(poll, str) and poll in market_calc.CPI_POLL_STATES else None
     out["taco_block_streak"] = _count(data.get("taco_block_streak"), 10**6)  # ocmacro.com 連續被擋的次數（2026-10-28 審查 gp2 N1）
+    out["inst_flows"] = _inst_status_summary(data.get("inst_flows"))  # 機構動向每個來源的狀態（2026-11-06 複審 R2-3-1）
+    out["inst_status_error"] = _safe_kind(data.get("inst_status_error"))
     return out
 
 

@@ -10,6 +10,9 @@ Andrew 2026-10-17 要台股的技術面、0050 成分站上／跌破均線的家
 - 證交所 www 每天合計 12 次、間隔 ≥10 秒由 Store 的帳本管（帳本自己等間隔）；各端點的最早時間與每天
   次數照 `market_sources_tw.ENDPOINTS`，以台北日期計。補洞（漏掉的日期、FinMind 比對要的過去幾天）只用
   「當天主要資料（ALLBUT、BFI82U、TWT49U、融資）預留的次數」以外剩下的，晚上 21:30 的融資才不會被補洞吃掉。
+- T86（2026-10-31 機構動向，tw.inst.t86.0050）：0050 成分股的三大法人買賣超股數。整個都只用上面那種剩下的次數
+  （spare_ok，不吃 CORE_RESERVE），而且「當天證交所 www 已用＋主要資料還保留的次數＋1 ≤ T86_DAY_CEILING（9）」才抓
+  （一般日全天合計 ≤ 9）；避開 /股票 打 T86 的時段；403／429／非 JSON／轉址整個停 2 小時；state/market_inst.disabled 在就不抓。
 - 帳本說不行：budget（間隔、每日上限、這輪要停）＝沒送出請求，不算次數、不算失敗；cooldown 照框架記失敗。
   「還沒公布」回 "not_yet"（不算失敗）。
 - ALLBUT0999：全部普通股＋0050 的收盤存 `tw_all`（每檔只留最近 10 列：新成分不必再打請求，FinMind 比對
@@ -30,6 +33,7 @@ obs 鍵（market_publish 讀；payload 全是 JSON 值、日期一律 ISO 字串
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Callable, Iterable, Optional
@@ -38,6 +42,7 @@ from zoneinfo import ZoneInfo
 import market_calendar
 import market_tasks
 
+log = logging.getLogger("market_pipeline_tw")
 TPE = ZoneInfo("Asia/Taipei")
 UTC = timezone.utc
 
@@ -52,6 +57,10 @@ CAL_MARKET = "tw"  # 日曆覆寫的市場鍵
 
 OBS_ALLBUT = "tw.allbut"  # {"days": {iso: 大盤摘要（加權指數、成交金額、漲跌家數…）}, "latest": iso}
 OBS_INST3 = "tw.inst3"  # {"days": {iso: {"foreign","trust","dealer_self","dealer_hedge"}（元）}, "latest": iso}
+# 2026-10-31 機構動向（IMPL_SPEC_p1 §3）：{"v","source","source_url","unit"（股）,"trade_date","constituents_as_of",
+#   "rows": [{code, foreign_net, trust_net, dealer_self_net, dealer_hedge_net, total_net}],
+#   "days": {iso（新的在前、最近 5 個交易日）: {代號: [foreign, trust, dealer_self, dealer_hedge]}}}；data_date＝trade_date
+OBS_T86 = "tw.inst.t86.0050"
 OBS_MARGIN = "tw.margin"  # {"date","margin_balance_k","margin_prev_k","short_units","short_prev_units"}
 OBS_TWT49U = "tw.twt49u"  # {"covered_from","covered_to","pieces"}（事件在 store.exrights、區間在 coverage）
 OBS_PE = "tw.pe"  # {"date", "pe": {代號: 本益比|None}}
@@ -82,8 +91,9 @@ TASK_PE = "tw.pe"
 TASK_REVENUE = "tw.revenue"
 TASK_HOLDINGS = "tw.holdings"
 TASK_FINMIND = "tw.finmind"
+TASK_T86 = "tw.t86"  # 2026-10-31 機構動向：0050 成分股的 T86（只用剩下的額度，見 T86 那一段）
 STATE_PREFIX = "tw.pipe:"
-WWW_TASKS = (TASK_ALLBUT, TASK_BFI, TASK_TWT49U, TASK_MARGIN, TASK_HOLIDAYS)
+WWW_TASKS = (TASK_ALLBUT, TASK_BFI, TASK_TWT49U, TASK_MARGIN, TASK_HOLIDAYS, TASK_T86)
 NOT_YET, PARTIAL = market_tasks.NOT_YET, market_tasks.PARTIAL
 
 # ── 排程常數 ──────────────────────────────────────────────────────────────────────
@@ -411,8 +421,34 @@ def _twt49u_bootstrapping(ctx: Any) -> bool:
     return bool(historical)
 
 
+_WWW_WARNED: set[tuple[str, str]] = set()  # 已經印過 log 的（任務, 台北日期）：collect 每輪是新的子程序，等於每輪每個任務一行
+
+
+def _www_used_up(name: str, today: date, reason: str) -> int:
+    """壞紀錄 → 當成已用滿；留一行 log（只帶任務名與原因，不印紀錄內容），不要安靜地停（2026-10-31 審查 R2-8）。"""
+    key = (name, today.isoformat())
+    if key not in _WWW_WARNED:
+        _WWW_WARNED.add(key)
+        log.warning("market tw www budget treated as used up task=%s reason=%s", name, reason)
+    return WWW_DAILY_CAP
+
+
 def www_used(ctx: Any, today: date) -> int:
-    return sum(int(_sched(ctx.store, name, today)["count"]) for name in WWW_TASKS)
+    """證交所 www 今天已用的次數（WWW_TASKS 各自排程紀錄的加總）。
+
+    2026-10-31（PLAN_v2 §4）：任何一筆紀錄壞掉（讀不出來、不是 ≥0 的整數）就當成已用滿 WWW_DAILY_CAP、不丟例外。
+    ALLBUT、BFI、TWT49U、休市表都經過 spare_ok 呼叫這裡，T86 的計數一壞不能讓它們一起出錯：主要任務不看這裡、照跑，
+    補洞與 T86 停下（壞的是當天的次數時，換日後 _sched 重算就好了）。停下時寫一行 warning（_www_used_up）。"""
+    total = 0
+    for name in WWW_TASKS:
+        try:
+            count = _sched(ctx.store, name, today)["count"]
+        except Exception:  # noqa: BLE001 - 紀錄讀不出來：當成已用滿
+            return _www_used_up(name, today, "unreadable")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            return _www_used_up(name, today, "bad_count")
+        total += count
+    return total
 
 
 def spare_ok(ctx: Any, name: str, state: dict, today: date, cap: int) -> bool:
@@ -813,6 +849,245 @@ def _bfi_backfill_due(ctx: Any) -> bool:
 def _bfi_backfill_run(ctx: Any) -> Optional[str]:
     day = bfi_backfill(ctx)
     return NOT_YET if day is None else _run_bfi(ctx, day, "backfill")
+
+
+# ── T86（2026-10-31 機構動向：0050 成分股的三大法人買賣超股數；整個都只用剩下的額度） ─────────────────
+# IMPL_SPEC_p1 §3、PLAN_v2 §4：和 BFI82U 共用同一本證交所帳本，所以放在這裡；只經過 spare_ok（不吃 CORE_RESERVE），
+# 計數只走 _sched／_note_try／_save。另加協調者 10/31 轉達的 /股票 實測：避開它打 T86 的時段、被擋就停 2 小時。
+T86_ENDPOINT = "twse_t86"
+T86_SOURCE = "TWSE T86"
+# 當天證交所 www 已用＋主要資料還保留的次數＋1 ≤ 9 才抓（含補抓；t86_room）：Andrew 10/24 同意的常態上限，12 只是程式的
+# 硬上限。2026-10-31 協調者：預留也要算進來，一般日（沒有補洞）全天合計才保證 ≤ 9，不能只看抓的當下
+T86_DAY_CEILING = 9
+INST_DISABLED_FLAG = "market_inst.disabled"  # state/ 底下：在就整個機構動向停用（F 軌的資金流、P 軌的卡片讀同一個檔名）
+T86_DAYS = 5  # obs 的 days 只留最近 5 個交易日（5 日合計）；補抓也只看這 5 天
+T86_RETRY_S = 3600.0  # 同一天隔 1 小時才再試（/股票 的 T86 也是每小時）
+T86_KEEP_FOR_TODAY = 1  # 交易日今天的 T 還沒到手前，每天的次數留這麼多給 16:30 後的 T（審查 R1-9：補抓不能吃掉它）
+T86_STOP_S = 7200.0  # 403／429／非 JSON／轉址：T86 整個停 2 小時（＝market_http.COOLDOWN_SECONDS，≥ /股票 要求的 1 小時）
+T86_STOP_KINDS = frozenset({"blocked", "rate_limited", "moved", "content_type", "not_json"})  # market_http.FetchError 的 kind
+# /股票 每個交易日只在 T+1 台北 05:36–06:03 打一次 T86（等 STOCK_DAY_ALL 換日）。兩邊的帳本互相看不到、又打同一個主機，
+# 任一邊太密被擋，另一邊也一起被擋 → 每天 05:30 起、06:15 前不抓；每月第一個交易日 /股票 延到 08:00–10:00 → 那天 10:00 前不抓
+T86_QUIET_FROM, T86_QUIET_UNTIL = time(5, 30), time(6, 15)
+T86_MONTH_FIRST_UNTIL = time(10, 0)
+# market_sources_tw.SPARE_ENDPOINTS 讀不到時的備援（照 _DEFAULT_RULES 的寫法；BFI82U 是 15:30）
+_SPARE_RULES: dict[str, tuple[Optional[time], int]] = {T86_ENDPOINT: (time(16, 30), 2)}
+
+
+def _spare_rule(endpoint: str) -> tuple[Optional[time], int]:
+    """(最早時間, 每天最多次)：以 market_sources_tw.SPARE_ENDPOINTS 為準，沒有就用 _SPARE_RULES。"""
+    try:
+        item = _tw().SPARE_ENDPOINTS[endpoint]
+        return item.earliest_tpe, int(item.daily_max)
+    except (ImportError, AttributeError, KeyError, TypeError, ValueError):
+        return _SPARE_RULES[endpoint]
+
+
+def _first_session_of_month(cal: Any, day: date) -> bool:
+    if not expected_session(cal, day):
+        return False
+    cursor = day.replace(day=1)
+    while cursor < day:
+        if expected_session(cal, cursor):
+            return False
+        cursor += timedelta(days=1)
+    return True
+
+
+def t86_quiet(cal: Any, now_tpe: datetime) -> bool:
+    """/股票 打 T86 的時段：每天 05:30 起、06:15 前；每月第一個交易日 10:00 前。"""
+    clock = now_tpe.time()
+    if T86_QUIET_FROM <= clock < T86_QUIET_UNTIL:
+        return True
+    return clock < T86_MONTH_FIRST_UNTIL and _first_session_of_month(cal, now_tpe.date())
+
+
+def t86_constituents(store: Any) -> tuple[list[str], Optional[str]]:
+    """0050 成分（tw.holdings.0050，權重大的先）與那份持股的 as_of。"""
+    as_of = _payload(store, OBS_HOLDINGS).get("as_of")
+    codes = [code for code in tracked_codes(store) if code not in (SYM_TAIEX, SYM_0050)]
+    return codes, (as_of if isinstance(as_of, str) else None)
+
+
+def _t86_stopped(state: dict, now: float) -> bool:
+    until = state.get("stop_until")
+    return isinstance(until, (int, float)) and not isinstance(until, bool) and now < float(until)
+
+
+def t86_disabled(ctx: Any) -> bool:
+    """旗標檔 state/market_inst.disabled 在（或看不了）＝T86 不抓：整個機構動向可以一次停掉（照 market_paths.flag_set）。"""
+    import market_paths  # noqa: PLC0415 - 只有 T86 用到；market_tasks 早就載入了
+
+    try:
+        return market_paths.flag_set(ctx.paths.state_dir / INST_DISABLED_FLAG)
+    except Exception:  # noqa: BLE001 - 連旗標都看不了：當停用
+        return True
+
+
+def t86_room(ctx: Any, today: date) -> bool:
+    """抓了這一次，當天證交所 www 還能不能留在 T86_DAY_CEILING 以內：已用＋主要資料還保留的次數（reserves，和 spare_ok
+    同一套）＋1 ≤ 9。例：已用 7、融資還沒抓、保留 2 → 7＋2＋1＝10 > 9 → 不抓；融資到手後 7＋0＋1＝8 → 可以抓。
+    已用先單獨看：紀錄壞掉時 www_used 當成已用滿，就不會再去讀預留（reserves 會碰到同樣的壞值）。"""
+    used = www_used(ctx, today)
+    if used + 1 > T86_DAY_CEILING:
+        return False
+    return used + sum(reserves(ctx, today).values()) + 1 <= T86_DAY_CEILING
+
+
+def t86_plan(ctx: Any) -> Optional[tuple[date, str]]:
+    """這一輪抓哪一天：目標日先（"target"，16:30 前是前一個交易日），再補最近 T86_DAYS 個交易日裡漏的（"backfill"，
+    新到舊、跳過休市，照 bfi_backfill）；不抓回 None。目標日與補抓都只用剩下的額度。
+
+    交易日今天的 T 還沒到手時（審查 R1-9）：16:30 起只抓 T、不補別天；16:30 前可以抓前一個交易日與補抓，但每天的
+    次數要留 T86_KEEP_FOR_TODAY 次給 T。T 到手之後、或今天不是交易日，才照常補抓。"""
+    now_tpe = _now_tpe(ctx)
+    today = now_tpe.date()
+    if t86_disabled(ctx) or t86_quiet(ctx.tw_cal, now_tpe):
+        return None
+    if not t86_room(ctx, today):  # 先看這個：紀錄壞掉時 www_used 當成已用滿，下面就碰不到壞值
+        return None
+    earliest, cap = _spare_rule(T86_ENDPOINT)
+    state = _sched(ctx.store, TASK_T86, today)
+    if _t86_stopped(state, ctx.now) or state["count"] >= cap or not spare_ok(ctx, TASK_T86, state, today, cap):
+        return None
+    codes, _ = t86_constituents(ctx.store)
+    target = target_session(ctx.tw_cal, now_tpe, earliest)
+    if not codes or target is None:
+        return None
+    days = _days(ctx.store, OBS_T86)
+    closed = closures(ctx.store)
+    # 2026-10-31 審查 R1-9：補抓不能吃掉今天 T 的機會。今天是交易日、T 還沒到手時：16:30 起只等 T（1 小時內試過就
+    # 這輪不抓，不拿剩下的次數去補別天）；16:30 前可以補，但每天的次數要留 T86_KEEP_FOR_TODAY 次給 16:30 後的 T
+    iso_today = today.isoformat()
+    waiting = expected_session(ctx.tw_cal, today) and iso_today not in closed and iso_today not in days
+    if waiting and target == today:
+        return None if _tried_within(state, iso_today, ctx.now, T86_RETRY_S) else (today, "target")
+    if waiting and int(state["count"]) + T86_KEEP_FOR_TODAY >= cap:
+        return None
+    for day in recent_sessions(ctx.tw_cal, target, T86_DAYS):
+        iso = day.isoformat()
+        if iso in days or iso in closed or _tried_within(state, iso, ctx.now, T86_RETRY_S):
+            continue
+        if day != target and _empty_count(state, iso) >= EMPTY_GIVE_UP:
+            continue
+        return day, ("target" if day == target else "backfill")
+    return None
+
+
+def _iso_day(value: Any) -> Optional[date]:
+    if not isinstance(value, str) or len(value) != 10:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _t86_days(payload: dict) -> dict[str, dict[str, list[int]]]:
+    """已存的 days；看不懂的日期、代號或值整筆丟掉（舊資料壞了不能卡住新的一天）。"""
+    days = payload.get("days")
+    items = days.items() if isinstance(days, dict) else ()
+    out: dict[str, dict[str, list[int]]] = {}
+    for iso, table in items:
+        if _iso_day(iso) is None or not isinstance(table, dict):
+            continue
+        out[iso] = {
+            code: list(values)
+            for code, values in table.items()
+            if valid_code(code)
+            and isinstance(values, list)
+            and len(values) == 4
+            and all(isinstance(value, int) and not isinstance(value, bool) for value in values)
+        }
+    return out
+
+
+def store_t86(ctx: Any, day: date, result: Any, codes: list[str], as_of: Optional[str]) -> None:
+    """存一天：days 合併後只留最近 T86_DAYS 個交易日（從最新那天往回數，新的在前）；rows、trade_date、source_url、
+    constituents_as_of 都描述最新那天（補舊的日子不改它們）。rows 只列 T86 有的成分，順序照持股權重。"""
+    old = _payload(ctx.store, OBS_T86)
+    days = _t86_days(old)
+    iso = day.isoformat()
+    days[iso] = {code: [int(value) for value in result.rows[code]] for code in codes if code in result.rows}
+    window = {session.isoformat() for session in recent_sessions(ctx.tw_cal, date.fromisoformat(max(days)), T86_DAYS)}
+    kept = sorted((key for key in days if key in window), reverse=True)
+    if not kept:
+        return
+    trade_iso = kept[0]
+    if trade_iso == iso:
+        constituents_as_of = as_of
+    else:
+        previous = old.get("constituents_as_of") if old.get("trade_date") == trade_iso else as_of
+        constituents_as_of = previous if isinstance(previous, str) else None
+    rows = [
+        {"code": code, "foreign_net": foreign, "trust_net": trust, "dealer_self_net": dealer_self,
+         "dealer_hedge_net": dealer_hedge, "total_net": foreign + trust + dealer_self + dealer_hedge}
+        for code, (foreign, trust, dealer_self, dealer_hedge) in days[trade_iso].items()
+    ]
+    payload = {
+        "v": 1,
+        "source": T86_SOURCE,
+        "source_url": _tw().t86_url(date.fromisoformat(trade_iso)),
+        "unit": "股",
+        "trade_date": trade_iso,
+        "constituents_as_of": constituents_as_of,
+        "rows": rows,
+        "days": {key: days[key] for key in kept},
+    }
+    ctx.store.put_obs(OBS_T86, payload, data_date=trade_iso)
+
+
+def _t86_stop_kind(exc: BaseException) -> Optional[str]:
+    """403／429／非 JSON／轉址：回要記下的種類（T86 整個停 T86_STOP_S）；其他錯誤回 None（照框架退避、同一天隔 1 小時）。"""
+    kind = getattr(exc, "kind", None)
+    if isinstance(exc, _fetch_error()) and kind in T86_STOP_KINDS:
+        return kind
+    if _is_parse_error(exc) and kind == "format" and getattr(exc, "detail", None) == "json":
+        return "not_json"  # 回應不是 JSON（HTML 錯誤頁、被截斷）
+    return None
+
+
+def _t86_run(ctx: Any) -> Optional[str]:
+    plan = t86_plan(ctx)
+    if plan is None:
+        return NOT_YET
+    day, mode = plan
+    today = _now_tpe(ctx).date()
+    state = _sched(ctx.store, TASK_T86, today)
+    iso = day.isoformat()
+    codes, as_of = t86_constituents(ctx.store)
+    try:
+        result = _call(ctx, _tw().fetch_twse_t86, day, codes=tuple(codes))
+    except _NoRequest as exc:
+        return _skipped(exc)
+    except Exception as exc:
+        # 2026-10-31 審查 R2-3：請求可能已經送出。不管是什麼錯（含很深的巢狀 JSON 的 RecursionError、超過 4,300 位數
+        # 的整數的 ValueError 這種不是 ParseError 的），都先記一次再丟：T86 不能繞過每天的次數帳
+        _note_try(state, iso, ctx.now)
+        if not _is_source_error(exc):
+            _save(ctx.store, TASK_T86, state)
+            raise
+        stop = _t86_stop_kind(exc)
+        if stop is not None:  # 這一輪停手；2 小時內連別天也不補（不逐日一直打）
+            state["stop_until"] = float(ctx.now) + T86_STOP_S
+            state["stop_kind"] = stop
+        if _is_parse_error(exc) and _kind(exc) in _NO_DATA_KINDS:
+            _note_empty(state, iso)
+            _save(ctx.store, TASK_T86, state)
+            if mode == "target":
+                ctx.store.obs_not_yet(OBS_T86)
+            return NOT_YET
+        _save(ctx.store, TASK_T86, state)
+        if mode == "target":
+            ctx.store.obs_checked(OBS_T86, error_kind=_kind(exc))
+        raise _for_framework(exc) from None
+    _note_try(state, iso, ctx.now)
+    _save(ctx.store, TASK_T86, state)
+    store_t86(ctx, day, result, codes, as_of)
+    return None
+
+
+def _t86_due(ctx: Any) -> bool:
+    return t86_plan(ctx) is not None
 
 
 # ── MI_MARGN（融資；21:30 後，只要最新一天） ─────────────────────────────────────────────
@@ -1643,6 +1918,8 @@ def tasks() -> list[market_tasks.Task]:
         market_tasks.Task(TASK_PE, "low", _daily_due_fn(TASK_PE, "openapi_bwibbu"), _pe_run, 25.0),
         market_tasks.Task(TASK_REVENUE, "low", _daily_due_fn(TASK_REVENUE, "openapi_revenue"), _revenue_run, 25.0),
         market_tasks.Task(TASK_HOLDINGS, "low", _daily_due_fn(TASK_HOLDINGS, "moneydj_0050"), _holdings_run, 25.0),
+        # T86 排在台股最後（2026-10-31 機構動向）：同一輪先讓主要資料與它們的補洞用額度，0050 成分（持股）也先抓
+        market_tasks.Task(TASK_T86, "low", _t86_due, _t86_run, 25.0),
     ]
     return out
 

@@ -47,6 +47,10 @@ ALLOWED_HOSTS = frozenset(
         # 不繞過、不登入）。個人網站、找不到使用條款；只抓 robots.txt 明確 Allow 的 /dashboard/trump 那一頁
         # （Disallow /api/、/data/ 與其他 /dashboard/：不碰，也不碰頁面上的「下載源數據」）。見 market_sources_taco。
         "ocmacro.com",
+        # 機構動向第一期（2026-10-31 Andrew 定案，PLAN_v2 §1、§3.1）：SOXX 在外股數（iShares 產品頁）、0050 申購買回清單（元大）。
+        # 各只准一條精確路徑（ALLOWED_PATHS）；SPY 的 NAV 歷史在 www.ssga.com（上面已有）。見 market_sources_inst
+        "www.ishares.com",
+        "www.yuantaetfs.com",
         # 2026-10-23：api.coinbase.com、gamma-api.polymarket.com、api.elections.kalshi.com 拿掉。台灣的 ISP 從
         # 10/21 晚上起依法院命令封鎖這三個主機（DNS 改寫到封鎖頁，每次都在 TLS 驗證失敗）；不繞過封鎖，
         # 所以也不能留在白名單裡等著失敗（見 market_sources_misc.PREDICTION_MARKETS_BLOCKED）。
@@ -57,7 +61,12 @@ ALLOWED_HOSTS = frozenset(
 # 其他 /dashboard/）；傳輸層只比主機的話，任何呼叫端都能請求同一主機的任何路徑，robots 之後改了也不會被發現。路徑要完全相等
 # （不是前綴：/dashboard/trumpX、/dashboard/trump/../api 都不行），也不准帶查詢字串；不合就當 FetchError("host")、不預扣帳本。
 # 不在這個表裡的主機不限路徑。
-ALLOWED_PATHS: dict[str, tuple[str, ...]] = {"ocmacro.com": ("/dashboard/trump",)}
+# 2026-10-31（機構動向第一期）：iShares、元大各只准機構動向用的那一頁（SOXX 產品頁、0050 申購買回清單）；www.ssga.com 不限路徑（維持現狀）。
+ALLOWED_PATHS: dict[str, tuple[str, ...]] = {
+    "ocmacro.com": ("/dashboard/trump",),
+    "www.ishares.com": ("/us/products/239705/ishares-phlx-semiconductor-etf",),
+    "www.yuantaetfs.com": ("/tradeInfo/pcf/0050",),
+}
 
 COOLDOWN_SECONDS = 7200.0
 CONNECT_TIMEOUT_S = 5.0

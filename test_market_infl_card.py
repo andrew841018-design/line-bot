@@ -168,7 +168,7 @@ def test_no_aliases_only_the_one_word(md, paths, body):
 
 
 def test_the_shipped_list_the_usage_text_and_the_rows_it_reads(md):
-    assert md.SHIPPED_MARKET_TEXTS[-1] == "/盤勢 通膨" and md.SHIPPED_MARKET_TEXTS.count("/盤勢 通膨") == 1
+    assert md.SHIPPED_MARKET_TEXTS.count("/盤勢 通膨") == 1
     assert "/盤勢 通膨" in md.TEXT_USAGE and md.TEXT_USAGE.splitlines()[1].startswith("/盤勢 → ")  # 第 2 行照舊
     assert {"us.infl.cpi", "us.infl.be"} <= set(md.READ_ROWS) <= set(market_calc.ROW_IDS)
     assert md._DETAILS[md.INFL] is not None

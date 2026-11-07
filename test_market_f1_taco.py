@@ -79,7 +79,12 @@ class RecordingLedger:
 
 
 def test_allowed_paths_name_exactly_the_one_robots_allowed_page():
-    assert market_http.ALLOWED_PATHS == {"ocmacro.com": ("/dashboard/trump",)}
+    # 2026-10-31 機構動向第一期：iShares、元大也各只准一條精確路徑（SOXX 產品頁、0050 申購買回清單）；整張表仍然逐條相等
+    assert market_http.ALLOWED_PATHS == {
+        "ocmacro.com": ("/dashboard/trump",),
+        "www.ishares.com": ("/us/products/239705/ishares-phlx-semiconductor-etf",),
+        "www.yuantaetfs.com": ("/tradeInfo/pcf/0050",),
+    }
     assert set(market_http.ALLOWED_PATHS) <= market_http.ALLOWED_HOSTS
     assert market_http.host_of(src.URL) == "ocmacro.com"  # 對照：這一條本來就通
     assert market_http.host_of("https://OCMACRO.com/dashboard/trump") == "ocmacro.com"  # 主機不分大小寫，路徑分

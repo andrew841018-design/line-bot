@@ -243,6 +243,12 @@ def seed_us(store: market_store.Store, *, missing_on_d: tuple[str, ...] = ()) ->
         data_date="2026-10-17")
     store.put_obs("us.events.earnings", {"symbols": {"AAA": {"date": "2026-10-29", "estimated": True}}},
                   data_date="2026-10-17")
+    # 機構動向（2026-10-31，IMPL_SPEC_p1 §1）：SOXX 的在外股數（iShares）；欄位照 F 軌的 obs 契約
+    store.put_obs("us.flows.etf.SOXX", {
+        "v": 1, "symbol": "SOXX", "source": "iShares", "source_url": "https://www.example.com/soxx", "unit": "USD",
+        "shares_out": 94_600_000, "shares_out_as_of": "2026-10-16", "prev_shares_out": 94_000_000,
+        "prev_as_of": "2026-10-15", "change": 600_000, "nav": 512.34, "nav_as_of": "2026-10-16", "flow": 307_404_000.0,
+        "method": "Δshares×NAV", "derived": True, "flag": None, "change_5d": None, "days": []}, data_date="2026-10-16")
 
 
 def seed_tw(store: market_store.Store) -> None:
@@ -297,6 +303,19 @@ def seed_tw(store: market_store.Store) -> None:
     store.put_obs("tw.revenue", {"period": "2026-09", "rows": {
         "2330": [2026, 9, 30.5], "2317": [2026, 9, -2.0], "2454": [2026, 9, 10.0], "2308": [2026, 9, 5.0],
         "2382": [2026, 8, 1.0]}}, data_date="2026-09-30", period="2026-09")
+    # 機構動向（2026-10-31，IMPL_SPEC_p1 §1、§3）：0050 已發行單位（元大）與成分股的 T86（證交所）；欄位照 F、T 軌的 obs 契約
+    store.put_obs("tw.flows.etf.0050", {
+        "v": 1, "symbol": "0050", "source": "元大", "source_url": "https://www.example.com/0050", "unit": "TWD",
+        "shares_out": 16_000_000_000, "shares_out_as_of": D.isoformat(), "prev_shares_out": 15_988_000_000,
+        "prev_as_of": "2026-10-15", "change": 12_000_000, "nav": 185.0, "nav_as_of": D.isoformat(), "flow": 2_220_000_000.0,
+        "method": "Δshares×NAV", "derived": True, "flag": None, "change_5d": None, "days": []}, data_date=D.isoformat())
+    store.put_obs("tw.inst.t86.0050", {
+        "v": 1, "source": "TWSE T86", "source_url": "https://www.example.com/t86", "unit": "股", "trade_date": D.isoformat(),
+        "constituents_as_of": "2026-10-16",
+        "rows": [{"code": c, "foreign_net": 1_000_000, "trust_net": -50_000, "dealer_self_net": 1_000,
+                  "dealer_hedge_net": -2_000, "total_net": 949_000} for c in TW_MEMBERS],
+        "days": {d.isoformat(): {c: [1_000_000, -50_000, 1_000, -2_000] for c in TW_MEMBERS} for d in TW_DAYS[-5:]}},
+        data_date=D.isoformat())
 
 
 def iso(epoch: float) -> str:

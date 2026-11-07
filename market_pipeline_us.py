@@ -1809,8 +1809,9 @@ def _top10_picks(ctx: Any) -> list[str]:
 
 
 def _filing_season(day: date) -> bool:
-    """13F 季末後 45 天截止：2／5／8／11 月的 1–20 日每天抓（PLAN §18.9）。"""
-    return day.month in (2, 5, 8, 11) and day.day <= 20
+    """13F 季末後 45 天截止：季末隔天起到截止日後幾天（20 日）每天抓——1/1–2/20、4/1–5/20、7/1–8/20、10/1–11/20（含邊界；
+    機構動向第一期 2026-10-31 加長，PLAN_v2 §3.2；以前只有 2／5／8／11 月的 1–20 日，PLAN §18.9）。其他時間每週一次。"""
+    return day.month in (1, 4, 7, 10) or (day.month in (2, 5, 8, 11) and day.day <= 20)
 
 
 def _13f_period(ctx: Any) -> str:

@@ -282,6 +282,17 @@ def make_snapshot(now: float = NOW) -> dict:
                                      "source": source, **({"provisional": False} if key == "SPY_DD" else {})}, now, day)
     # 2026-10-24 第 9 輪（A12）：VXTLT 是獨立的一列（不寫進 MOVE：量綱差 6–7 倍）；B 軌起 bot 讀它（15.09、−4.67% 是研究紀錄的值；沒有保存 _VXTLT.json 的回應檔）
     rows["macro.VXTLT"] = _row({"value": 15.09, "chg": -0.74, "chg_pct": -4.67, "source": "CBOE"}, now, day)
+    # 機構動向（2026-10-31 第一期）：資金流、13F 新一季進度、0050 前十大法人（欄位照 market_calc.INST_*_SPEC；卡片細節在 test_market_inst_cards）
+    flows = {"as_of": day.isoformat(), "prev_as_of": (day - timedelta(days=1)).isoformat(), "change": 600_000,
+             "flow": 307_404_000.0, "change_5d": None, "flag": None, "latest_as_of": day.isoformat(), "behind": False,
+             "stale_after": now + 86400}
+    f13 = {"quarter_end": "2026-09-30", "deadline": "2026-11-16", "updated": 37, "total": 100, "stale_after": now + 86400}
+    rows["us.inst.SOXX"] = _row({"flows": flows, "f13": f13}, now, day)
+    rows.update({f"us.inst.{s}": _row({"flows": None, "f13": dict(f13)}, now, None) for s in ("QQQ", "VOO")})
+    t86 = [{"code": code, "foreign": 1_234_000, "trust": -56_000, "dealer": -1_000} for code in ("2330", "2317", "2454")]
+    rows["tw.inst.0050"] = _row({"flows": dict(flows, change=12_000_000, flow=2_220_000_000.0),
+                                 "t86": {"trade_date": day.isoformat(), "behind": False, "stale_after": now + 86400,
+                                         "rows": t86, "sum5": None}}, now, day)
     charts = {}
     for index, key in enumerate(market_calc.CHART_KEYS):
         files = [f"{index:x}" * 32 + ".png"] + ([] if key == "TXO" else [f"{index + 8:x}" * 32 + ".png"])
@@ -2799,6 +2810,7 @@ def test_pe_rows_say_why_a_company_has_no_pe(md, paths):
 
 def test_13f_card_and_alt_text_use_the_same_words(md, paths):
     write_snapshot(paths, make_snapshot(NOW))
+    (paths.state_dir / "market_inst.disabled").write_text("")  # 原本的單張 13F 卡（機構動向輪播的 altText 對上第一張，test_market_inst_cards）
     reply = md.handle(" 13F VOO", now=NOW, paths=paths)
     assert "前十大成分股中，3 檔的加碼機構多於減碼機構（1 檔資料暫缺）" in texts(reply.flex)
     assert reply.alt_text == "盤勢：13F 前十大（VOO）｜3 檔的加碼機構多於減碼機構"

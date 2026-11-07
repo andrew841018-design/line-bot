@@ -3522,6 +3522,267 @@ ROW_IDS: dict[str, dict[str, Any]] = {
     "contra.us": {"codes": ["str"], "text": "str?", "provisional": "bool"},  # provisional：命中的矛盾用到暫定收盤（A27）
     "contra.tw": {"codes": ["str"], "text": "str?"},
 }
+
+
+# ── 機構動向（2026-10-31 第一期；IMPL_SPEC_p1 §4、PLAN_v2 §3.2–3.3；Phase 6 修正見 reviews/p6_triage.md） ──────────────
+# 四列接在既有清單最後面（只增不改；舊 bot 讀新快照時不認得這幾列就略過，新 bot 讀舊快照時照原本的回覆）：
+# - us.inst.SOXX：資金流（iShares 在外股數的變化，us.flows.etf.SOXX）＋13F 新一季進度；
+# - us.inst.QQQ、us.inst.VOO：只有 13F 進度（flows 一律 null；卡上寫「資金流：暫不提供」，不拿 SPY 代表 VOO）；
+# - tw.inst.0050：申購贖回（元大已發行單位的變化，tw.flows.etf.0050）＋前十大個股的法人買賣超（證交所 T86）。
+# 每一段帶自己的資料日與 stale_after（「每段印自己的資料日」；列的 stale_after＝各段的最大值，所以一段過期不會蓋掉另一段）。
+# 股數、單位數、金額存 publish 驗過的數字（不轉單位）；股→張、單位→張、兆／億／萬由 bot 用 Decimal ROUND_HALF_UP 換。
+# 語意檢查（日期先後、範圍、x≤N、代號）只有這裡一份：inst_values_ok／inst_flow_ok／inst_13f_ok／inst_t86_ok，publish 組列、
+# validate_snapshot、bot 讀快照都呼叫同一個（比照 taco_values_ok；Phase 6 I-6）。
+INST_US_SYMBOLS = ("SOXX", "QQQ", "VOO")
+INST_FLOW_SYMBOLS = ("SOXX",)  # 有每日資金流來源的美股 ETF（job 與 bot 共用；QQQ、VOO 卡上寫「暫不提供」）
+INST_FLOW_FLAGS = ("check",)  # check＝變化大到要人工核對（卡上不印數字）；F 軌只會寫 null 或 "check"（Phase 6 R4-7 拿掉 not_updated）
+INST_FLOW_CHECK_THRESHOLD = {"SOXX": 0.20, "0050": 0.20}  # 和 market_pipeline_inst.CHECK_THRESHOLD 同值：publish 再擋一層「近 5 日」
+INST_MAX_SHARES = 10**13  # 股數、單位數、股數變化的合理上限：超過代表解析壞了（publish 判待核對，bot 當暫缺）
+INST_MAX_AMOUNT = 1e15  # 估算金額（美元、元）的合理上限
+INST_MAX_HOLDERS = 500  # 13F 進度的 N（前十大成分股各自的前十大持有人，約 100）；卡上那一列最壞值要放得下 24 寬
+INST_TOP_N = 10  # 0050 前十大（tw.holdings.0050 權重前 10）
+INST_SUM_DAYS = 5  # T86「近 5 日合計」：最近 5 個台股交易日都有才算
+INST_SUM_TOP = 5  # 「近 5 日合計」只列前 5 檔（權重最大的 5 檔；0050 卡精簡，Phase 6）；某一檔不齊只跳過，第 6 檔不遞補
+INST_TW_CODE_RE = re.compile(r"[0-9A-Z]{4,6}", re.ASCII)  # 證交所代號（publish 與 bot 同一份）
+INST_FLOW_SPEC = {
+    "as_of": "date",  # 發行商印的資料日（shares_out_as_of）
+    "prev_as_of": "date?",  # 變化的起點：SOXX＝已存的前一份；0050＝官方差異數的起點（前一個台股交易日）。null 時 change 也是 null
+    "change": "int?",  # 股數（0050 是受益權單位）的變化
+    "flow": "num?",  # 估算金額＝變化×同一天的 NAV；NAV 不同天或拿不到是 null
+    "change_5d": ("?", {"from_as_of": "date", "to_as_of": "date", "change": "int"}),  # to_as_of＝as_of；from 是 5 個交易日前
+    "flag": ("?", frozenset(INST_FLOW_FLAGS)),
+    "behind": "bool",  # 資料日比 INST_READY 推的預期資料日舊：卡上那一段的日期行加註「最近一筆」，不猜原因
+    "stale_after": "num",
+}
+INST_13F_SPEC = {
+    "quarter_end": "date",  # 今天（美東）之前最近的季末
+    "deadline": "date?",  # 13F 截止日（靜態表）；表外是 null（卡上寫「截止日未知」）
+    "updated": "int",  # 前十大持有人申報期間已經是 quarter_end 的筆數（x）
+    "total": "int",  # 全部筆數（N）
+    "stale_after": "num",  # 跟著 13F 列（申報期間眾數＋155 天）
+}
+INST_T86_ROW_SPEC = {"code": "str", "foreign": "int?", "trust": "int?", "dealer": "int?"}  # 股；dealer＝自行＋避險
+INST_T86_SPEC = {
+    "trade_date": "date",
+    "behind": "bool",
+    "stale_after": "num",
+    "rows": [INST_T86_ROW_SPEC],  # 前十大（權重由大到小）；T86 沒有的代號三個值都是 null
+    # 近 5 日合計：from–to＝含 trade_date 的 5 個台股交易日（頭尾都算）；days＝前 INST_SUM_TOP 檔裡最齊的那檔有幾天
+    # （<5＝這幾檔一檔都不齊，卡上才寫「資料累積中（n/5）」）；rows＝這幾檔裡 5 天都齊的代號（權重順序；某一檔缺天只跳過那一檔，
+    # 第 6 檔不遞補，Phase 6 複審 R2-3-5）。日曆說不出 5 個交易日時整個 null。
+    "sum5": ("?", {"from": "date", "to": "date", "days": "int", "rows": [INST_T86_ROW_SPEC]}),
+}
+ROW_IDS.update({
+    **{f"us.inst.{s}": {"flows": ("?", INST_FLOW_SPEC), "f13": ("?", INST_13F_SPEC)} for s in INST_US_SYMBOLS},
+    "tw.inst.0050": {"flows": ("?", INST_FLOW_SPEC), "t86": ("?", INST_T86_SPEC)},
+})
+INST_ROW_IDS = tuple(f"us.inst.{s}" for s in INST_US_SYMBOLS) + ("tw.inst.0050",)
+
+
+def inst_5d_over(start: int, end: int, limit: float) -> bool:
+    """「近 5 日」的相對門檻（collector、publish 同一份）：分母用兩筆裡較小的那筆，股數不是正數算超過。只用較舊的那筆當分母時，
+    往上讀錯 +20～25% 的那一天當起點，回程只有 −16.7～−20%，過得了門檻（Phase 6 複審 R2-1-5）。"""
+    low = min(start, end)
+    return low <= 0 or abs(end - start) / low > limit
+
+
+def inst_flow_ok(part: Any) -> bool:
+    """資金流那一段：型別（INST_FLOW_SPEC）＋語意（起點在資料日之前、沒有起點就沒有變化、金額要有變化、範圍、5 日的日期）。"""
+    if not spec_ok(INST_FLOW_SPEC, part):
+        return False
+    as_of, prev, change, flow, five = part["as_of"], part["prev_as_of"], part["change"], part["flow"], part["change_5d"]
+    if (prev is not None and prev >= as_of) or (prev is None and change is not None):  # 日期是驗過的 YYYY-MM-DD：字串比大小即可
+        return False
+    if change is not None and abs(change) > INST_MAX_SHARES:
+        return False
+    if flow is not None and (change is None or abs(flow) > INST_MAX_AMOUNT):
+        return False
+    return five is None or (five["from_as_of"] < five["to_as_of"] == as_of and abs(five["change"]) <= INST_MAX_SHARES)
+
+
+def inst_13f_ok(part: Any) -> bool:
+    """13F 進度那一段：0 ≤ x ≤ N ≤ INST_MAX_HOLDERS、N > 0、截止日晚於季末。"""
+    if not spec_ok(INST_13F_SPEC, part):
+        return False
+    return (0 <= part["updated"] <= part["total"] <= INST_MAX_HOLDERS and part["total"] > 0
+            and (part["deadline"] is None or part["deadline"] > part["quarter_end"]))
+
+
+def _inst_t86_rows_ok(rows: Sequence[Any], *, complete: bool) -> bool:
+    if not 0 < len(rows) <= INST_TOP_N or len({row["code"] for row in rows}) != len(rows):  # 代號不重複
+        return False
+    for row in rows:
+        values = (row["foreign"], row["trust"], row["dealer"])
+        if not INST_TW_CODE_RE.fullmatch(row["code"]):
+            return False
+        if not complete and all(value is None for value in values):  # T86 沒有這檔：三個值都是 null（卡上寫暫缺）
+            continue
+        if any(value is None or abs(value) > INST_MAX_SHARES for value in values):
+            return False
+    return True
+
+
+def inst_t86_ok(part: Any) -> bool:
+    """T86 那一段：前十大最多 10 檔、代號不重複、值要嘛三個都有要嘛三個都 null、至少一檔有值；5 日合計的日期與天數。"""
+    if not spec_ok(INST_T86_SPEC, part) or not _inst_t86_rows_ok(part["rows"], complete=False):
+        return False
+    if all(row["foreign"] is None for row in part["rows"]):
+        return False
+    sum5 = part["sum5"]
+    if sum5 is None:
+        return True
+    if not (sum5["from"] < sum5["to"] == part["trade_date"] and 0 <= sum5["days"] <= INST_SUM_DAYS):
+        return False
+    rows, codes = sum5["rows"], {row["code"] for row in part["rows"]}
+    if not rows:
+        return sum5["days"] < INST_SUM_DAYS  # 5 天都齊就一定有代號
+    return _inst_t86_rows_ok(rows, complete=True) and {row["code"] for row in rows} <= codes
+
+
+def inst_values_ok(row_id: str, values: Any) -> bool:
+    """機構動向一整列的 values（型別照 ROW_IDS，語意照上面三個）；publish 組列時不合就只讓這一列暫缺，validate_snapshot 也用它。"""
+    if row_id not in INST_ROW_IDS or not values_ok(row_id, values):
+        return False
+    flows = values["flows"]
+    if flows is not None and (row_id.rsplit(".", 1)[1] not in (*INST_FLOW_SYMBOLS, "0050") or not inst_flow_ok(flows)):
+        return False
+    if row_id == "tw.inst.0050":
+        return values["t86"] is None or inst_t86_ok(values["t86"])
+    return values["f13"] is None or inst_13f_ok(values["f13"])
+
+
+# 13F 申報截止日（季末＋45 天，遇週末、聯邦假日順延；SEC 公告的日期）：季末 → 截止日。比照 NYSE 表設 supported_until，
+# 之後（表還沒延長）一律「截止日未知」，不自己推算。
+F13_DEADLINES: dict[date, date] = {
+    date(2025, 12, 31): date(2026, 2, 17),
+    date(2026, 3, 31): date(2026, 5, 15),
+    date(2026, 6, 30): date(2026, 8, 14),
+    date(2026, 9, 30): date(2026, 11, 16),
+    date(2026, 12, 31): date(2027, 2, 16),
+    date(2027, 3, 31): date(2027, 5, 17),
+    date(2027, 6, 30): date(2027, 8, 16),
+    date(2027, 9, 30): date(2027, 11, 15),
+}
+F13_DEADLINES_SUPPORTED_UNTIL = date(2027, 12, 31)  # 美東日期；這一天之後的「最近季末」不在表上
+
+
+def latest_quarter_end(day: date) -> date:
+    """day 之前（不含 day）最近的季末：3/31、6/30、9/30、12/31。"""
+    for month, last in ((12, 31), (9, 30), (6, 30), (3, 31)):
+        quarter_end = date(day.year, month, last)
+        if quarter_end < day:
+            return quarter_end
+    return date(day.year - 1, 12, 31)
+
+
+def f13_deadline(quarter_end: date, today: date) -> date | None:
+    """這一季的 13F 截止日；today（美東）超過 supported_until 或不在表上 → None。"""
+    if today > F13_DEADLINES_SUPPORTED_UNTIL:
+        return None
+    return F13_DEADLINES.get(quarter_end)
+
+
+# 機構動向各段的過期規則（IMPL_SPEC_p1 §4）：資金流＝資料日＋2 個交易日（SOXX 用 NYSE、0050 用證交所）；T86＝交易日＋2 個
+# 證交所交易日。不放進 stale_after_info 的類型表（那張表的每一種都有既有測試逐一跑）；13F 進度直接用 KIND_13F。
+KIND_INST_FLOWS_US = "inst_flows_us"
+KIND_INST_FLOWS_TW = "inst_flows_tw"
+KIND_INST_T86 = "inst_t86"
+INST_STALE_SESSIONS = 2
+INST_STALE_CALENDARS = {KIND_INST_FLOWS_US: "nyse", KIND_INST_FLOWS_TW: "twse", KIND_INST_T86: "twse"}
+
+
+def inst_stale_after(kind: str, data_date: Any, calendars: Any) -> float:
+    """資料日之後第 2 個預期交易日的收盤時刻（epoch 秒）；日曆表外：資料日＋6 個日曆日的收盤（同 §18.3 的退路）。"""
+    name = INST_STALE_CALENDARS.get(kind)
+    if name is None:
+        raise ValueError(f"unknown inst stale kind: {kind!r}")
+    cal = _calendar_of(calendars, name)
+    day = _plain_date(data_date)
+    target = cal.add_sessions(day, INST_STALE_SESSIONS)
+    if target is None:
+        return datetime.combine(day + timedelta(days=CALENDAR_FALLBACK_DAYS), cal.close, tzinfo=cal.tz).timestamp()
+    return cal.close_at(target).timestamp()
+
+
+# 就緒時間（Phase 6 I-5）：每個來源當地幾點之後，那個交易日的資料才算「該有了」。publish 用它判斷落後（behind），不再用
+# 盤勢的換日（美股收盤＋30 分鐘、台股 14:30）：那會讓每天下午到來源公布之間都印成落後。美股的 18:00 等 staging 量到 iShares
+# 實際的更新時間再調。tw.flows、tw.t86 任務自己的換日時間要和這張表一致；us.flows 的任務在美東收盤＋30 分鐘就換日，
+# 只要 18:00 時已換到當天（整合輪的漂移測試核對）。
+INST_READY: dict[str, tuple[str, time]] = {
+    "us.flows": ("nyse", time(18, 0)),  # 美東
+    "tw.flows": ("twse", time(17, 0)),  # 台北：元大申購買回清單
+    "tw.t86": ("twse", time(16, 30)),  # 台北：證交所 T86
+}
+
+
+def inst_expected_day(source: str, calendars: Any, now: datetime | float) -> date | None:
+    """這個來源現在應該已經有的最新資料日：當地今天是預期交易日、而且已過就緒時間 → 今天；否則前一個交易日。日曆未知 → None。"""
+    name, ready = INST_READY[source]
+    cal = _calendar_of(calendars, name)
+    local = datetime.fromtimestamp(_epoch(now), tz=cal.tz)
+    state = cal.is_session(local.date())
+    if state is None:
+        return None
+    if state and local.time() >= ready:
+        return local.date()
+    return cal.prev_session(local.date())
+
+
+def inst_lag_sessions(source: str, calendars: Any, now: datetime | float, day: date | None) -> int | None:
+    """資料日 day 落後 inst_expected_day 幾個交易日（每日維護用，Phase 6 複審 R2-3-1）：到了或比預期新是 0；沒有資料日、
+    日曆說不出來 → None（不是 0，不能看起來正常）。"""
+    expected = inst_expected_day(source, calendars, now)
+    if day is None or expected is None:
+        return None
+    if day >= expected:
+        return 0
+    between = _calendar_of(calendars, INST_READY[source][0]).sessions_between(day + timedelta(days=1), expected)
+    return None if between is None else len(between)
+
+
+# 卡上的固定句（都在 FIXED_TEXTS：禁用字、2027／2028 的 validator、年份掃描自動涵蓋）。不寫「最新資料日」：output_validator
+# 會把「最新資料＋數字」當成宣稱最新資料卻沒有來源而擋下；落後時在那一段的日期行加「最近一筆」（不另起一行、不重印日期；
+# 不寫「目前最新」：這句只在落後時出現，讀起來意思反了，Phase 6 複審 R2-3-7）。
+TEXT_INST_TITLE = "機構動向｜{name}"
+TEXT_INST_SWIPE = "往左滑看機構持股（13F）"
+TEXT_INST_BUTTON = "機構動向"
+TEXT_INST_BACK_TW = "回台灣50細節"
+TEXT_INST_FLOW_HEAD = "資金流（在外股數變化）"
+TEXT_INST_FLOW_HEAD_TW = "資金流（已發行單位變化；1 張＝1,000 單位）"
+TEXT_INST_FLOW_NONE = "資金流：暫不提供"  # QQQ、VOO（Phase 6 R3-8：不斷言來源有沒有）
+TEXT_INST_CHANGE = "{start}→{end}：{change}"  # 兩個日期之間（起點是前一份或前一個交易日）
+TEXT_INST_CHANGE_BEHIND = "{start}→{end}（最近一筆）：{change}"  # 資料日比預期舊
+TEXT_INST_FIRST_RECORD = "{md} 起開始記錄"  # SOXX 第一筆：還沒有前一份可以比（0050 有官方差異數，不會用到）
+TEXT_INST_FIRST_RECORD_BEHIND = "{md}（最近一筆）起開始記錄"
+TEXT_INST_AMOUNT_ZHAO = "約 {amount} 兆{currency}（估算）"
+TEXT_INST_AMOUNT_YI = "約 {amount} 億{currency}（估算）"
+TEXT_INST_AMOUNT_WAN = "約 {amount} 萬{currency}（估算）"
+TEXT_INST_AMOUNT_SMALL_IN = "淨流入不到 1 萬{currency}（估算）"
+TEXT_INST_AMOUNT_SMALL_OUT = "淨流出不到 1 萬{currency}（估算）"
+TEXT_INST_5D = "近 5 日（{start} 起）：{change}"  # 起點是 5 個交易日前（不含當天）；和上一行「日期→日期」分開寫
+TEXT_INST_CHECK = "資料待核對"
+TEXT_INST_FLOW_NOTE = "註：申購贖回含全體投資人，不等於機構買賣"
+TEXT_INST_UNIT_SHARES = "股"
+TEXT_INST_UNIT_LOTS = "張"  # 0050 的申贖與法人都用張（1 張＝1,000 單位／股）
+TEXT_INST_CURRENCY_USD = "美元"
+TEXT_INST_CURRENCY_TWD = "元"
+TEXT_INST_13F_LABEL = "13F 新一季"
+TEXT_INST_13F_HEAD = "13F 新一季（{qe}，截止 {deadline}）"
+TEXT_INST_13F_HEAD_UNKNOWN = "13F 新一季（{qe}，截止日未知）"
+TEXT_INST_13F_PROGRESS = "成分股前十大持有人：{x}/{n} 筆已是 {qe} 季報"  # x＝0 也讀得通；不寫「已申報」（Nasdaq 比 EDGAR 晚）
+TEXT_INST_13F_NOTE = "（Nasdaq 資料，名單會變動）"
+TEXT_INST_T86_LABEL = "前十大法人"
+TEXT_INST_T86_HEAD = "前十大法人（{md}，張）"
+TEXT_INST_T86_HEAD_BEHIND = "前十大法人（{md}，最近一筆，張）"
+TEXT_INST_T86_ROW = "{code} 外資 {foreign} 投信 {trust} 自營 {dealer}"
+TEXT_INST_T86_ROW_MAIN = "{code} 外資 {foreign} 投信 {trust}"  # 一列放不下時：先外資、投信一列，自營另一列；5 日合計也用這句
+TEXT_INST_T86_ROW_DEALER = "{code} 自營 {dealer}"
+TEXT_INST_T86_SUM_LABEL = "近 5 日合計"  # 不齊時：「近 5 日合計：資料累積中（n/5）」（TEXT_ACCUMULATING，和 0050 細節卡同一句）
+TEXT_INST_T86_SUM_HEAD = "近 5 日合計（{start}–{end}，前 5 檔，張）"  # 頭尾都算的 5 個交易日（用「–」，和「→」分開）
+TEXT_INST_UNDER_ONE_LOT = "不到 1 張"
+TEXT_INST_T86_NOTE = "外資不含外資自營商；自營＝自行買賣＋避險"
+
+
 CHART_KEYS = ("QQQ", "SPY", "SOXX", "TXO")
 _ISO_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}", re.ASCII)  # re.ASCII：\d 預設連阿拉伯數字、全形數字都收（2026-10-28 審查 gp2 N9）
 

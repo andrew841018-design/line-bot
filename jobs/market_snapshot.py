@@ -74,8 +74,9 @@ THIS_FILE = Path(__file__).resolve()
 LABEL = "com.andrew.line-bot-market-snapshot"
 # market_pipeline_taco（2026-10-24，川普壓力指數）：和別的 pipeline 沒有互相 import，它 import 壞了只停用自己的任務（load_modules）
 # market_pipeline_infl 排最後：同一個市場的任務依登記順序跑，通膨的損益兩平才會在 us.ust 之後（同一個財政部主機）
+# market_pipeline_inst（2026-10-31 機構動向第一期，資金流）：借 market_pipeline_us 的批次工具，它壞了只停用自己的任務
 PIPELINES = ("market_pipeline_us", "market_pipeline_tw", "market_pipeline_misc", "market_pipeline_taco",
-             "market_pipeline_infl")
+             "market_pipeline_inst", "market_pipeline_infl")
 PUBLISHER = "market_publish"
 COLLECT_TIMEOUT_S = 240.0
 PUBLISH_TIMEOUT_S = 90.0
@@ -93,6 +94,19 @@ INFL_CPI_OBS = "us.infl.cpi"  # 要和 market_pipeline_infl.OBS_INFL_CPI 一樣
 INFL_CPI_STATE = "sched:us.infl.cpi"  # 要和 market_pipeline_us.STATE_PREFIX＋market_pipeline_infl.CPI_KEY 一樣
 TACO_STATE = "taco.pipe:macro.taco"  # 要和 market_pipeline_taco.STATE_NAME 一樣（監督程序不 import pipeline；test_market_f1_taco 比對）
 TACO_HOST = "ocmacro.com"  # 要和 market_sources_taco.HOST 一樣（監督程序不 import 來源模組；test_market_f3 比對）
+# 機構動向資金流的來源（2026-10-31 Phase 6 I-4）：(代號, obs, 主機)；要和 market_pipeline_inst.OBS_FLOWS、
+# market_sources_inst.ENDPOINTS 一樣，旗標檔名要和 market_pipeline_inst.DISABLED_FLAG 一樣（監督程序不 import pipeline；
+# test_market_inst_flows 比對）
+INST_FLOWS = (
+    ("SOXX", "us.flows.etf.SOXX", "www.ishares.com"),
+    ("SPY", "us.flows.etf.SPY", "www.ssga.com"),
+    ("0050", "tw.flows.etf.0050", "www.yuantaetfs.com"),
+)
+# T86 一項（2026-11-06 Phase 6 複審 R2-3-2）：要和 market_pipeline_tw.OBS_T86、market_sources_tw 的 T86 主機一樣
+INST_T86 = ("T86", "tw.inst.t86.0050", "www.twse.com.tw")
+INST_READY_KEYS = {"SOXX": "us.flows", "SPY": "us.flows", "0050": "tw.flows", "T86": "tw.t86"}  # market_calc.INST_READY 的鍵
+INST_DISABLED_FLAG = "market_inst.disabled"
+_ISO_DAY_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _ET = ZoneInfo("America/New_York")
 US_ETF_ROWS = ("VOO", "QQQ", "SOXX", "SPY")  # 快照的 us.etf.* 列（要和 market_calc.ROW_IDS 一樣）
 US_LAG_MAX_SESSIONS = 300  # 落後天數最多數到這裡（closes 只留 280 個交易日，再多也沒有意義）
@@ -425,6 +439,65 @@ def _taco_status(store: market_store.Store) -> dict[str, Any]:
     streak = state.get("block_streak") if isinstance(state, dict) else None
     ok = isinstance(streak, int) and not isinstance(streak, bool) and 0 <= streak < 10**6
     return {"taco_block_streak": streak if ok else 0}
+
+
+def _inst_day(value: Any) -> Optional[date]:
+    if not isinstance(value, str) or not _ISO_DAY_RE.fullmatch(value):
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _inst_nav_day(payload: dict) -> Optional[str]:
+    """days（新到舊）裡最近一筆有 NAV 的日期。payload 的 nav_as_of 只會等於資料日或 null，看不出 NAV 停了幾天（複審 R2-1-4）。"""
+    days = payload.get("days")
+    for item in days if isinstance(days, list) else ():
+        if isinstance(item, dict) and item.get("nav") is not None:
+            day = _inst_day(item.get("as_of"))
+            return day.isoformat() if day is not None else None
+    return None
+
+
+def _inst_status(store: market_store.Store, paths: market_paths.Paths, now: float) -> dict[str, Any]:
+    """機構動向每個來源的狀態（2026-10-31 Phase 6 審查 I-4：us.flows 一項失敗、另一項成功時任務是 partial，任務的 fail_streak
+    每輪歸零，outcome.failing 永遠看不到 iShares 壞掉；待核對也只在快照裡）。只放日期、整數、列舉與布林：
+    inst_flows＝{代號: {"data_date"（發行商印的日期｜None）, "lag_sessions"（落後 market_calc.inst_expected_day 幾個交易日；從沒
+    跑過、日曆說不出來是 None，不是 0）, "nav_as_of"（最近一筆有 NAV 的日期｜None）, "fail_streak"（那份 obs 自己的連續失敗次數）,
+    "flag"（None｜"check"）, "last_success_at"（epoch 秒｜None）, "enabled"（主機在白名單、而且沒有 state/market_inst.disabled）}}；
+    "T86"（tw.inst.t86.0050，複審 R2-3-2）同一組，沒有 nav_as_of、flag。market_dashboard.status_summary 過白名單帶出去。
+    每日維護第 12 點：lag_sessions ≥2 或是 null、fail_streak ≥3、flag 是 check、nav_as_of 落後 data_date 或是 null（enabled 是
+    False 的不報）。"""
+    import market_calc  # noqa: PLC0415 - 同 _infl_status：監督程序平常不載入它，壞了 _fill_from_store 接住
+
+    disabled = market_paths.flag_set(paths.state_dir / INST_DISABLED_FLAG)
+    try:
+        calendars: Any = market_calendar.trading_calendars(store)
+    except Exception:  # noqa: BLE001 - 日曆讀不到：lag_sessions 是 null（維護條目會報），其他欄位照給
+        calendars = None
+
+    def source(name: str, found: dict, host: str) -> dict[str, Any]:
+        day, streak, last = _inst_day(found.get("data_date")), found.get("fail_streak"), found.get("last_success_at")
+        return {
+            "data_date": day.isoformat() if day is not None else None,
+            "lag_sessions": (market_calc.inst_lag_sessions(INST_READY_KEYS[name], calendars, now, day)
+                             if calendars is not None else None),
+            "fail_streak": streak if isinstance(streak, int) and not isinstance(streak, bool) and streak >= 0 else 0,
+            "last_success_at": (float(last) if isinstance(last, (int, float)) and not isinstance(last, bool)
+                                and math.isfinite(float(last)) else None),
+            "enabled": not disabled and host in market_http.ALLOWED_HOSTS,
+        }
+
+    out: dict[str, dict] = {}
+    for symbol, obs_id, host in INST_FLOWS:
+        found = store.get_obs(obs_id) or {}
+        payload = found.get("payload") if isinstance(found.get("payload"), dict) else {}
+        out[symbol] = {**source(symbol, found, host), "nav_as_of": _inst_nav_day(payload),
+                       "flag": "check" if payload.get("flag") == "check" else None}
+    name, obs_id, host = INST_T86
+    out[name] = source(name, store.get_obs(obs_id) or {}, host)
+    return {"inst_flows": out}
 
 
 def _collect_worker(args: argparse.Namespace, paths: market_paths.Paths, wall: Callable[[], float]) -> int:
@@ -777,6 +850,10 @@ class Supervisor:
             out.update(_taco_status(store))
         except Exception as exc:  # noqa: BLE001 - 同上
             out.update(taco_block_streak=None, taco_status_error=error_kind(exc))
+        try:
+            out.update(_inst_status(store, self.paths, self.wall()))
+        except Exception as exc:  # noqa: BLE001 - 同上
+            out.update(inst_flows=None, inst_status_error=error_kind(exc))
         sup["task_names"] = [n for n in names if isinstance(n, str)]
         store.set_task_state(SUPERVISOR_STATE, sup)
 

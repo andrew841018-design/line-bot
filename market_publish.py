@@ -1257,6 +1257,252 @@ def _us_13f(ctx: _Ctx, row_id: str) -> RowResult:
                      basis=market_calc.TEXT_13F_LAG, state="unknown_period")
 
 
+# ── 機構動向（2026-10-31 第一期；IMPL_SPEC_p1 §1、§3、§4；Phase 6 修正見 reviews/p6_triage.md） ──────────────────────
+# obs 由 market_pipeline_inst（資金流，F 軌）與 market_pipeline_tw（T86，T 軌）寫；publish 不 import 那兩個模組，鍵名照 §1、§3
+# 的契約在這裡再寫一次。每一段（資金流、13F 進度、T86）各自驗、各自帶資料日與 stale_after；一段算不出來只讓那一段是 null。
+# 語意檢查用 market_calc.inst_values_ok（和 bot 同一份）。落後（behind）用 market_calc.INST_READY 的就緒時間判斷。
+OBS_US_FLOWS = "us.flows.etf.{}"  # SOXX 上卡；SPY 那一份只給戰情室（沒有對應的列，不拿來代表 VOO）
+OBS_TW_FLOWS = "tw.flows.etf.0050"
+OBS_TW_T86 = "tw.inst.t86.0050"
+INST_FLOW_SYMBOLS = market_calc.INST_FLOW_SYMBOLS  # 有每日資金流來源的美股 ETF
+INST_SUM_DAYS = market_calc.INST_SUM_DAYS
+_INST_UNITS = {"SOXX": "USD", TW_ETF: "TWD"}  # payload 的 unit 要對得上才算金額
+_INST_READY = {US: "us.flows", TW: "tw.flows"}  # 資金流的就緒時間（market_calc.INST_READY 的鍵）
+_INST_T86_KEYS = ("foreign_net", "trust_net", "dealer_self_net", "dealer_hedge_net")  # 外資＝外陸資（不含外資自營商）
+_LABELS.update({"us.inst.": "機構動向", "tw.inst.": "機構動向"})  # 接在最後面：「tw.inst3」（三大法人）是完整 id，不會被前綴吃掉
+
+
+def _inst_int(value: Any) -> Optional[int]:
+    """股數、單位數：整數（剛好是整數的 float 也收）、不超過 INST_MAX_SHARES；其他 → None。"""
+    number = _int(value)
+    return number if number is not None and abs(number) <= market_calc.INST_MAX_SHARES else None
+
+
+def _inst_section(build: Callable[[], Optional[dict]]) -> Optional[dict]:
+    """一段算不出來（沒有 obs、日曆未知…）只讓那一段是 null，另一段照常。"""
+    try:
+        return build()
+    except _Unavailable:
+        return None
+
+
+def _inst_calendars(ctx: _Ctx, market: str) -> dict:
+    return {"nyse" if market == US else "twse": ctx.trading(market)}
+
+
+def _inst_behind(ctx: _Ctx, source: str, market: str, day: date) -> bool:
+    """資料日比「這個來源現在該有的最新資料日」（market_calc.INST_READY）舊；日曆說不出來 → 不算落後（不猜）。"""
+    expected = market_calc.inst_expected_day(source, _inst_calendars(ctx, market), ctx.now)
+    return expected is not None and day < expected
+
+
+def _inst_stale(ctx: _Ctx, kind: str, market: str, day: date) -> float:
+    return float(market_calc.inst_stale_after(kind, day, _inst_calendars(ctx, market)))
+
+
+def _inst_start(ctx: _Ctx, payload: dict, as_of: date, market: str) -> Optional[date]:
+    """變化的起點。SOXX：已存的前一份（prev_as_of）。0050：官方差異數的起點（F 軌的 official_prev_session；沒有這個欄位時用
+    台股日曆的前一個交易日，再不行才用前一份）——官方差異數本來就是「與前一個交易日」比，第一天就有（Phase 6 I-2）。"""
+    candidates = [_iso_day(payload.get("prev_as_of"))]
+    if market == TW:
+        calendar_prev = ctx.trading(TW).prev_session(as_of)
+        candidates = [_iso_day(payload.get("official_prev_session")), calendar_prev, *candidates]
+    return next((day for day in candidates if day is not None and day < as_of), None)
+
+
+def _inst_change_5d(ctx: _Ctx, payload: dict, as_of: date, symbol: str, market: str) -> Optional[dict]:
+    """近 5 日（F 軌已經綁 5 個交易日、過門檻；這裡再擋一層，Phase 6 I-1）：起點要正好是 5 個交易日前、終點是 as_of；
+    窗口裡有哪一天自己標了 check、或 |change_5d| 超過門檻（market_calc.inst_5d_over：分母用起點與終點較小的那筆，和 F 軌同一條，
+    複審 R2-1-5）→ null（分割、反分割、抓錯的一天不會漏出來）。"""
+    five = payload.get("change_5d")
+    if not isinstance(five, dict):
+        return None
+    start, end, delta = _iso_day(five.get("from_as_of")), _iso_day(five.get("to_as_of")), _inst_int(five.get("change"))
+    window = ctx.trading(market).sessions_ending(as_of, INST_SUM_DAYS + 1)
+    if delta is None or end != as_of or len(window) != INST_SUM_DAYS + 1 or (start, as_of) != (window[0], window[-1]):
+        return None
+    days = payload.get("days") if isinstance(payload.get("days"), list) else []
+    by_day = {_iso_day(item.get("as_of")): item for item in days if isinstance(item, dict)}
+    base = _inst_int((by_day.get(start) or {}).get("shares_out"))
+    if base is None or market_calc.inst_5d_over(base, base + delta, market_calc.INST_FLOW_CHECK_THRESHOLD[symbol]):
+        return None
+    if any((by_day.get(day) or {}).get("flag") == "check" for day in window[1:]):
+        return None
+    return {"from_as_of": start, "to_as_of": end, "change": delta}
+
+
+def _inst_flows(ctx: _Ctx, obs_id: str, symbol: str, market: str) -> Optional[dict]:
+    """§1 的資金流 obs → 快照的那一段。不認得的版本、別檔的資料 → None；數字不合理 → 待核對或那一項 null。"""
+    found = ctx.obs(obs_id)
+    if found is None:
+        return None
+    payload = found["payload"]
+    if _int(payload.get("v")) != 1 or payload.get("symbol") != symbol:
+        return None
+    as_of = _iso_day(payload.get("shares_out_as_of")) or _iso_day(found.get("data_date"))
+    if as_of is None:
+        return None
+    flag = payload.get("flag")
+    if flag is not None and flag not in market_calc.INST_FLOW_FLAGS:
+        flag = "check"  # 不認得的旗標（含已拿掉的 not_updated）：從嚴，當待核對（卡上不印數字）
+    raw_change = payload.get("change")
+    change = _inst_int(raw_change)
+    if raw_change is not None and change is None:
+        flag = "check"  # 有寫、但不是合理的整數：解析大概壞了
+    raw_prev = _iso_day(payload.get("prev_as_of"))
+    if raw_prev is not None and raw_prev >= as_of:
+        flag = "check"  # 前一份不在資料日之前：資料自相矛盾
+    prev_as_of = _inst_start(ctx, payload, as_of, market)
+    if prev_as_of is None:
+        change = None  # SOXX 第一筆：還沒有前一份可以比
+    if market == US and change is not None:  # SOXX：變化＝在外股數 − 前一份的在外股數（§1）；對不上 → 待核對
+        shares, prev_shares = _inst_int(payload.get("shares_out")), _inst_int(payload.get("prev_shares_out"))
+        if shares is None or prev_shares is None or shares - prev_shares != change:
+            flag = "check"
+    flow = _num(payload.get("flow"))
+    if (flow is None or change is None or abs(flow) > market_calc.INST_MAX_AMOUNT
+            or payload.get("unit") != _INST_UNITS[symbol] or _iso_day(payload.get("nav_as_of")) != as_of):
+        flow = None  # 估算金額只在 NAV 和股數同一天、幣別對得上時才給（日期對不上就只給股數）
+    kind = market_calc.KIND_INST_FLOWS_US if market == US else market_calc.KIND_INST_FLOWS_TW
+    return {"as_of": as_of, "prev_as_of": prev_as_of, "change": change, "flow": flow,
+            "change_5d": _inst_change_5d(ctx, payload, as_of, symbol, market), "flag": flag,
+            "behind": _inst_behind(ctx, _INST_READY[market], market, as_of),
+            "stale_after": _inst_stale(ctx, kind, market, as_of)}
+
+
+def _inst_13f(ctx: _Ctx, etf: str) -> Optional[dict]:
+    """13F 新一季進度（PLAN_v2 §3.2）：前十大成分股各自的前十大持有人（_us_13f 同一批 obs，不多抓），申報期間已經是
+    最近季末的有幾筆（x）、全部幾筆（N）。過期跟著 13F 列（申報期間眾數＋155 天）。"""
+    # TODO：沒有抓取日期，Nasdaq 停抓時 x/N 會凍結，設計取捨見 ops 紀錄
+    items, _found = _top10(ctx, etf)
+    periods: list[date] = []
+    for item in items:
+        found = ctx.obs(OBS_US_13F.format(item["pick"]))
+        raw = (found["payload"] if found else {}).get("holder_periods")
+        periods.extend(day for day in (_iso_day(p) for p in (raw if isinstance(raw, list) else [])) if day is not None)
+    mode, _mixed = market_calc.holder_period_mode(periods)
+    if mode is None or len(periods) > market_calc.INST_MAX_HOLDERS:
+        return None
+    today = ctx.now_utc.astimezone(_ET).date()
+    quarter_end = market_calc.latest_quarter_end(today)
+    return {"quarter_end": quarter_end, "deadline": market_calc.f13_deadline(quarter_end, today),
+            "updated": sum(1 for day in periods if day == quarter_end), "total": len(periods),
+            "stale_after": ctx.stale(market_calc.KIND_13F, mode)}
+
+
+def _inst_tw_top(ctx: _Ctx) -> list[str]:
+    """0050 前十大＝tw.holdings.0050 權重由大到小的前 10 檔（[代號, 名稱, 權重%]；舊格式 {"symbol","weight"} 也收）。"""
+    found = ctx.obs(OBS_TW_HOLDINGS)
+    rows = found["payload"].get("rows") if found is not None else None
+    weights: dict[str, float] = {}
+    for row in rows if isinstance(rows, list) else []:
+        if isinstance(row, list) and len(row) >= 3:
+            code, weight = row[0], _num(row[2])
+        elif isinstance(row, dict):
+            code, weight = row.get("symbol"), _num(row.get("weight"))
+        else:
+            continue
+        if (isinstance(code, str) and market_calc.INST_TW_CODE_RE.fullmatch(code) and code not in (TW_ETF, TAIEX)
+                and weight is not None):
+            weights[code] = max(weight, weights.get(code, weight))
+    ranked = sorted(weights.items(), key=lambda item: (-item[1], item[0]))
+    return [code for code, _weight in ranked[: market_calc.INST_TOP_N]]
+
+
+def _inst_t86_parts(values: Any) -> Optional[tuple[int, int, int]]:
+    """[外資, 投信, 自營（自行買賣）, 自營（避險）]（股）→ (外資, 投信, 自營＝自行＋避險)；有一個不合理 → None。"""
+    if not isinstance(values, (list, tuple)) or len(values) != 4:
+        return None
+    parts = [_inst_int(value) for value in values]
+    if any(part is None for part in parts):
+        return None
+    return parts[0], parts[1], parts[2] + parts[3]
+
+
+def _inst_t86_row(code: str, parts: Optional[tuple[int, int, int]]) -> dict:
+    foreign, trust, dealer = parts if parts is not None else (None, None, None)
+    return {"code": code, "foreign": foreign, "trust": trust, "dealer": dealer}
+
+
+def _inst_t86_sum5(ctx: _Ctx, payload: dict, trade_date: date, top: list[str]) -> Optional[dict]:
+    """近 5 日合計：含 trade_date 的 5 個台股交易日，只看權重前 INST_SUM_TOP 檔（複審 R2-3-5：某一檔缺天，例如停牌，只跳過那一檔，
+    第 6 檔不遞補）。rows＝這幾檔裡 5 天都齊的代號的合計；days＝最齊的那檔有幾天，<5 就是一檔都不齊（卡上才寫「資料累積中」）。
+    日曆說不出 5 個交易日 → None。"""
+    window = ctx.trading(TW).sessions_ending(trade_date, INST_SUM_DAYS)
+    if len(window) != INST_SUM_DAYS or window[-1] != trade_date:
+        return None
+    days = payload.get("days") if isinstance(payload.get("days"), dict) else {}
+    counts: list[int] = []
+    sums: list[dict] = []
+    for code in top[: market_calc.INST_SUM_TOP]:
+        daily = [_inst_t86_parts(entry.get(code) if isinstance(entry, dict) else None)
+                 for entry in (days.get(day.isoformat()) for day in window)]
+        counts.append(sum(1 for parts in daily if parts is not None))
+        if all(parts is not None for parts in daily):
+            total = tuple(sum(parts[i] for parts in daily) for i in range(3))
+            if all(abs(value) <= market_calc.INST_MAX_SHARES for value in total):
+                sums.append(_inst_t86_row(code, total))
+    n = max(counts, default=0)
+    if n == INST_SUM_DAYS and not sums:
+        return None
+    return {"from": window[0], "to": window[-1], "days": n, "rows": sums}
+
+
+def _inst_t86(ctx: _Ctx) -> Optional[dict]:
+    """§3 的 T86 obs → 0050 前十大的外資、投信、自營（股）＋近 5 日合計。"""
+    found = ctx.obs(OBS_TW_T86)
+    if found is None:
+        return None
+    payload = found["payload"]
+    if _int(payload.get("v")) != 1 or payload.get("unit") != "股":
+        return None
+    trade_date = _iso_day(payload.get("trade_date")) or _iso_day(found.get("data_date"))
+    top = _inst_tw_top(ctx)
+    if trade_date is None or not top:
+        return None
+    today: dict[str, tuple[int, int, int]] = {}
+    rows = payload.get("rows")
+    for row in rows if isinstance(rows, list) else []:
+        code = row.get("code") if isinstance(row, dict) else None
+        if isinstance(code, str) and code not in today:
+            parts = _inst_t86_parts([row.get(key) for key in _INST_T86_KEYS])
+            if parts is not None:
+                today[code] = parts
+    if not any(code in today for code in top):
+        return None
+    return {"trade_date": trade_date, "behind": _inst_behind(ctx, "tw.t86", TW, trade_date),
+            "stale_after": _inst_stale(ctx, market_calc.KIND_INST_T86, TW, trade_date),
+            "rows": [_inst_t86_row(code, today.get(code)) for code in top],
+            "sum5": _inst_t86_sum5(ctx, payload, trade_date, top)}
+
+
+@_rows("us.inst.", "tw.inst.0050")
+def _inst(ctx: _Ctx, row_id: str) -> RowResult:
+    """機構動向（IMPL_SPEC_p1 §4）：每一段各自算；兩段都沒有才是 never。列的 stale_after＝各段的最大值（bot 每段自己判過期）。"""
+    sym = row_id.rsplit(".", 1)[1]
+    if row_id == "tw.inst.0050":
+        flows = _inst_section(lambda: _inst_flows(ctx, OBS_TW_FLOWS, TW_ETF, TW))
+        t86 = _inst_section(lambda: _inst_t86(ctx))
+        values, source = {"flows": flows, "t86": t86}, "元大、證交所 T86"
+        days = [day for day in (flows and flows["as_of"], t86 and t86["trade_date"]) if day]
+    elif sym in market_calc.INST_US_SYMBOLS:
+        flows = (_inst_section(lambda: _inst_flows(ctx, OBS_US_FLOWS.format(sym), sym, US))
+                 if sym in INST_FLOW_SYMBOLS else None)
+        f13 = _inst_section(lambda: _inst_13f(ctx, sym))
+        values = {"flows": flows, "f13": f13}
+        source = "iShares、Nasdaq 13F" if sym in INST_FLOW_SYMBOLS else "Nasdaq 13F"
+        days = [flows["as_of"]] if flows is not None else []
+    else:
+        raise _Unavailable("missing")
+    parts = [part for part in values.values() if part is not None]
+    if not parts:
+        raise _Unavailable("missing")
+    if not market_calc.inst_values_ok(row_id, _sanitize(values, [0])):
+        raise _BadValue("inst")  # 自己組錯：只讓這一列暫缺，不讓 validate_snapshot 擋整份快照
+    return RowResult(values, data_date=max(days) if days else None, stale_after=max(part["stale_after"] for part in parts),
+                     source=source, basis="估算金額＝股數變化×同一天的 NAV")
+
+
 @_rows("us.fund.")
 def _us_fund(ctx: _Ctx, row_id: str) -> RowResult:
     etf = row_id.rsplit(".", 1)[1]
@@ -2300,6 +2546,9 @@ def validate_snapshot(snapshot: Any) -> list[str]:
                 problems.append(f"row:{row_id}")
             elif row_id.startswith("us.options.") and not _options_basis_ok(row):
                 problems.append(f"options_basis:{row_id}")
+            elif (row_id in market_calc.INST_ROW_IDS and row.get("state") != "never"
+                  and not market_calc.inst_values_ok(row_id, row.get("values"))):
+                problems.append(f"inst:{row_id}")  # 機構動向（2026-10-31）：日期先後、範圍、x≤N（型別上面 row_ok 已經驗過）
     charts = snapshot.get("charts")
     if not isinstance(charts, dict):
         problems.append("charts")

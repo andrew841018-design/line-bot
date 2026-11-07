@@ -58,6 +58,7 @@ import market_dashboard
 import market_http
 import market_paths
 import market_pipeline_infl
+import market_pipeline_inst
 import market_pipeline_misc
 import market_pipeline_taco
 import market_pipeline_tw
@@ -67,6 +68,9 @@ import market_store
 import market_tasks
 from jobs import market_snapshot as job
 from test_market_taco_fixture import HISTORY as TACO_HISTORY, make_bytes as taco_page, make_data as taco_data
+# 機構動向（2026-10-31）：資金流三個來源的合成骨架（只留解析需要的結構），數字與日期由下面的函式依時間線給
+from test_market_inst_flows import ishares_html as inst_ishares_html, ssga_xlsx as inst_navhist_xlsx, \
+    yuanta_html as inst_yuanta_html
 
 TPE = ZoneInfo("Asia/Taipei")
 ET = ZoneInfo("America/New_York")
@@ -890,6 +894,39 @@ def ocmacro_trump(now: float) -> bytes:
     return taco_page(taco_data(index={"asOfDate": rows[-1][0].isoformat(), "value": rows[-1][1]}, history=rows))
 
 
+# ── 機構動向（2026-10-31 第一期）：iShares SOXX、SSGA SPY navhist、元大 0050 申購買回清單 ───────────────────
+# 頁面骨架用 test_market_inst_flows 的合成 fixture；在外股數＝（代號, 日期）的固定函式，NAV＝同一天的收盤模型
+INST_US_AFTER = (18, 0)  # 發行商在美東 D 的晚上換成 D 的資料（10/28 的樣本：隔天早上已經是 D）
+INST_TW_AFTER = (16, 30)  # 元大約 16:30 上傳當天的申購買回清單（10/28 的樣本上傳時間 16:33）
+INST_SHARES = {"SOXX": (90_000_000, 50_000), "SPY": (1_000_000_000, 500_000), "0050": (23_000_000_000, 5_000_000)}
+
+
+def inst_shares(symbol: str, day: date) -> int:
+    """在外股數（0050 是受益權單位數）：基準 ±20 步，相鄰兩天的變化遠小於 20% 門檻。"""
+    base, step = INST_SHARES[symbol]
+    return base + step * (_h("inst", symbol, day) % 41 - 20)
+
+
+def inst_soxx_html(now: float) -> bytes:
+    day = us_closed_through(now, INST_US_AFTER)
+    return inst_ishares_html(shares=f"{inst_shares('SOXX', day):,}", shares_day=day,
+                             nav=f"{us_close('SOXX', day, now):.2f}")
+
+
+def inst_spy_navhist(now: float) -> bytes:
+    end = US_INDEX[us_closed_through(now, INST_US_AFTER)]
+    days = US_SESSIONS[end - 11:end + 1][::-1]  # 新到舊 12 列
+    return inst_navhist_xlsx([(day, float(us_close("SPY", day, now)), inst_shares("SPY", day)) for day in days])
+
+
+def inst_0050_html(now: float) -> bytes:
+    day = tw_published_through(now, INST_TW_AFTER)
+    units, prev = inst_shares("0050", day), inst_shares("0050", tw_prev(day))
+    shown = f"{day:%Y/%m/%d}"
+    return inst_yuanta_html(units=f"{units:,}", diff=f"{units - prev:,}", nav=f"NTD {tw_close('0050', day):.2f}",
+                            nav_day=shown, trade_day=shown)
+
+
 # ── 台股來源 ──────────────────────────────────────────────────────────────────
 TW_NO_DATA = {"stat": "很抱歉，沒有符合條件的資料!"}
 _UP, _DOWN, _FLAT = "<p style= color:red>+</p>", "<p style= color:green>-</p>", "<p> </p>"
@@ -959,6 +996,35 @@ def twse_bfi82u(day: date, now: float) -> dict:
     rows.append(["合計", f"{total_buy:,}", f"{total_sell:,}", f"{total_buy - total_sell:,}"])
     return {"stat": "OK", "date": _ymd(day), "title": f"{_roc(day)} 三大法人買賣金額統計表",
             "fields": ["單位名稱", "買進金額", "賣出金額", "買賣差額"], "data": rows, "hints": "單位：元"}
+
+
+T86_FIELDS = [  # 2026-10-31 機構動向（T 軌）：證交所 T86 三大法人買賣超日報的表頭
+    "證券代號", "證券名稱",
+    "外陸資買進股數(不含外資自營商)", "外陸資賣出股數(不含外資自營商)", "外陸資買賣超股數(不含外資自營商)",
+    "外資自營商買進股數", "外資自營商賣出股數", "外資自營商買賣超股數",
+    "投信買進股數", "投信賣出股數", "投信買賣超股數",
+    "自營商買賣超股數",
+    "自營商買進股數(自行買賣)", "自營商賣出股數(自行買賣)", "自營商買賣超股數(自行買賣)",
+    "自營商買進股數(避險)", "自營商賣出股數(避險)", "自營商買賣超股數(避險)",
+    "三大法人買賣超股數",
+]
+
+
+def twse_t86(day: date, now: float) -> dict:
+    if day not in TW_INDEX or day > tw_published_through(now, (16, 30)):
+        return TW_NO_DATA
+
+    def trio(net: int) -> list[str]:
+        buy = max(net, 0) + 1_000
+        return [f"{buy:,}", f"{buy - net:,}", f"{net:,}"]
+
+    rows = []
+    for code in [*TW_MEMBERS, *TW_OTHERS[:3]]:
+        nets = [_h("t86", kind, code, day) % 2_000_001 - 1_000_000 for kind in ("foreign", "trust", "self", "hedge")]
+        rows.append([f"{code}  ", "名稱", *trio(nets[0]), *trio(0), *trio(nets[1]), f"{nets[2] + nets[3]:,}",
+                     *trio(nets[2]), *trio(nets[3]), f"{sum(nets):,}"])
+    return {"stat": "OK", "date": _ymd(day), "title": f"{_roc(day)} 三大法人買賣超日報", "fields": T86_FIELDS,
+            "data": rows, "selectType": "ALLBUT0999"}
 
 
 def twse_margin(day: date, now: float) -> dict:
@@ -1120,6 +1186,9 @@ CONTENT_TYPES = {  # 主 Claude 10/17 實測的型別
     "news.google.com": "application/xml; charset=utf-8",
     "www.trumpstruth.org": "application/rss+xml; charset=UTF-8",
     "ocmacro.com": "text/html; charset=utf-8",
+    # 機構動向（2026-10-31）：兩頁都是一般 HTML（10/28 的樣本沒有存回應標頭，型別沒有實測）
+    "www.ishares.com": "text/html;charset=UTF-8",
+    "www.yuantaetfs.com": "text/html; charset=utf-8",
 }
 
 
@@ -1242,6 +1311,8 @@ class FakeHttp:
     def _www_ssga_com(self, path: str, q: dict, now: float):
         if path == "/library-content/products/fund-data/etfs/us/holdings-daily-us-en-spy.xlsx":
             return 200, ssga_xlsx(now)
+        if path == "/library-content/products/fund-data/etfs/us/navhist-us-en-spy.xlsx":  # 機構動向：SPY 的 NAV 歷史
+            return 200, inst_spy_navhist(now)
         return None, None
 
     def _www_moneydj_com(self, path: str, q: dict, now: float):
@@ -1290,6 +1361,12 @@ class FakeHttp:
     def _ocmacro_com(self, path: str, q: dict, now: float):
         return (200, ocmacro_trump(now)) if path == "/dashboard/trump" else (None, None)
 
+    def _www_ishares_com(self, path: str, q: dict, now: float):
+        return (200, inst_soxx_html(now)) if path == "/us/products/239705/ishares-phlx-semiconductor-etf" else (None, None)
+
+    def _www_yuantaetfs_com(self, path: str, q: dict, now: float):
+        return (200, inst_0050_html(now)) if path == "/tradeInfo/pcf/0050" else (None, None)
+
     def _www_twse_com_tw(self, path: str, q: dict, now: float):
         if path == "/rwd/zh/afterTrading/MI_INDEX" and q.get("type") == "ALLBUT0999":
             return 200, twse_allbut(datetime.strptime(q["date"], "%Y%m%d").date(), now)
@@ -1300,6 +1377,8 @@ class FakeHttp:
             return 200, twse_twt49u(start, end)
         if path == "/rwd/zh/marginTrading/MI_MARGN" and q.get("selectType") == "MS":
             return 200, twse_margin(datetime.strptime(q["date"], "%Y%m%d").date(), now)
+        if path == "/rwd/zh/fund/T86" and q.get("selectType") == "ALLBUT0999":
+            return 200, twse_t86(datetime.strptime(q["date"], "%Y%m%d").date(), now)
         if path == "/rwd/zh/holidaySchedule/holidaySchedule":
             return 200, twse_holidays(int(q["date"][:4]))
         return None, None
@@ -1332,12 +1411,13 @@ class FakeHttp:
 # ── 整個世界：兩段時間線的 collect＋publish（整個檔案共用一份，只跑一次） ──────────────────────
 TASK_LIST = (*market_pipeline_us.TASKS, *market_pipeline_tw.tasks(), *market_pipeline_misc.tasks(),
              *market_pipeline_taco.tasks(),
+             *market_pipeline_inst.TASKS,  # 機構動向（2026-10-31）：和 job 的 PIPELINES 同一個位置
              *market_pipeline_infl.TASKS)  # 通膨排最後：同一個市場依登記順序跑，損益兩平在 us.ust 之後
 WATCHED_FILES = ("market_pipeline_us.py", "market_pipeline_tw.py", "market_pipeline_misc.py", "market_publish.py",
                  "market_dashboard.py", "market_calc.py", "market_sources_us.py", "market_sources_tw.py",
                  "market_sources_misc.py", "market_store.py", "market_tasks.py", "market_charts.py",
                  "market_pipeline_infl.py", "market_sources_infl.py", "market_pipeline_taco.py",
-                 "market_sources_taco.py")
+                 "market_sources_taco.py", "market_pipeline_inst.py", "market_sources_inst.py")
 
 
 @dataclass
@@ -1679,6 +1759,31 @@ def test_collect_left_the_store_in_the_expected_state(world):
     assert store.task_state(market_pipeline_taco.STATE_NAME)["tries"] == 1  # 第二段的第一次（台北日 10/17）
 
 
+def test_inst_flows_come_through_the_timeline(world):
+    """機構動向（2026-10-31 第一期）：SOXX、SPY 每段各抓一次就拿到那一段的 D（第二段接在第一段後面、有前一份）；
+    0050 兩段的目標日都是 T，第二段不再抓；publish 把資金流、T86 都放進列裡。"""
+    store = world.store
+    soxx, spy, tw = (store.get_obs(market_pipeline_inst.OBS_FLOWS[symbol]) for symbol in ("SOXX", "SPY", "0050"))
+    assert (soxx["data_date"], soxx["fail_streak"], soxx["error"]) == (D2.isoformat(), 0, None), soxx
+    assert (soxx["payload"]["prev_as_of"], soxx["payload"]["flag"]) == (D1.isoformat(), None)
+    assert soxx["payload"]["change"] == inst_shares("SOXX", D2) - inst_shares("SOXX", D1)
+    assert spy["data_date"] == D2.isoformat() and len(spy["payload"]["days"]) == 10 and spy["payload"]["change_5d"]
+    assert (tw["data_date"], tw["payload"]["prev_as_of"], tw["payload"]["flag"]) == (T.isoformat(), None, None), tw
+    assert tw["payload"]["change"] == inst_shares("0050", T) - inst_shares("0050", tw_prev(T))  # 官方差異數
+    calls = [(call.host, call.path) for call in world.http.calls]
+    assert calls.count(("www.ishares.com", "/us/products/239705/ishares-phlx-semiconductor-etf")) == len(PHASES)
+    assert calls.count(("www.ssga.com", "/library-content/products/fund-data/etfs/us/navhist-us-en-spy.xlsx")) == len(PHASES)
+    assert calls.count(("www.yuantaetfs.com", "/tradeInfo/pcf/0050")) == 1
+    rows = world.snapshot["rows"]
+    soxx_row, tw_row = rows["us.inst.SOXX"]["values"], rows["tw.inst.0050"]["values"]
+    assert soxx_row["flows"]["change"] == soxx["payload"]["change"] and soxx_row["flows"]["flow"] is not None
+    # 0050 只有一份（payload 的 prev_as_of＝null），但元大的官方差異數第一天就有：publish 的起點用 official_prev_session
+    assert tw["payload"]["official_prev_session"] == tw_prev(T).isoformat()
+    assert tw_row["flows"]["as_of"] == T.isoformat() and tw_row["flows"]["prev_as_of"] == tw_prev(T).isoformat()
+    assert tw_row["flows"]["change"] == tw["payload"]["change"]
+    assert tw_row["t86"]["trade_date"] == T.isoformat() and tw_row["t86"]["rows"]
+
+
 # ── publish 與快照 ──────────────────────────────────────────────────────────────
 
 
@@ -1867,7 +1972,7 @@ def test_batch_1_b_track_cards_come_out_of_the_whole_pipeline(world):
 
 def test_shipped_texts_match_the_routing_test():
     assert market_dashboard.SHIPPED_MARKET_TEXTS == _routing_shipped_texts()
-    assert len(market_dashboard.SHIPPED_MARKET_TEXTS) == 17  # 2026-10-30 批 2 加了 /盤勢 通膨（只增不刪）
+    assert len(market_dashboard.SHIPPED_MARKET_TEXTS) == 18  # 批 2 加 /盤勢 通膨、機構動向加 /盤勢 13F 0050（只增不刪）
 
 
 def _reply_problems(world: World, text: str, reply: Any, *, fresh: bool) -> list[str]:
@@ -2079,6 +2184,10 @@ def test_status_summary_for_the_daily_maintenance_is_clean(world):
     assert summary["charts_stale"] == [] and summary["external_dropped"] == 0, summary
     assert summary["outcome"]["state"] == "ok" and summary["outcome"]["failing"] == [], summary["outcome"]
     assert summary["outcome"]["calendar_mismatch"] == [], summary["outcome"]
+    # 機構動向每個來源（複審 R2-3-1）：真的 job、真的日曆，四個來源都到了、沒有失敗
+    flows = summary["outcome"]["inst_flows"]
+    assert summary["outcome"]["inst_status_error"] is None and set(flows) == {"SOXX", "SPY", "0050", "T86"}, summary["outcome"]
+    assert all((item["lag_sessions"], item["fail_streak"], item["enabled"]) == (0, 0, True) for item in flows.values()), flows
 
 
 def _cjk_first(text: str) -> bool:
@@ -2124,4 +2233,4 @@ def test_card_size_table(world):
         lines.append(f"{text:16s} bubbles={len(sizes)} max_bubble={max(sizes)} card={market_dashboard.card_bytes(reply.flex)}"
                      f" with_page_buttons={paged}")
     print("\n[card sizes]\n" + "\n".join(lines))
-    assert len(lines) == 17  # 2026-10-30 批 2 加了 /盤勢 通膨
+    assert len(lines) == 18  # 批 2 加 /盤勢 通膨、機構動向加 /盤勢 13F 0050

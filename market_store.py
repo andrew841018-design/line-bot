@@ -71,6 +71,10 @@ HOST_RULES: dict[str, HostRule] = {
     # 2026-10-24：MacroMargin 的川普壓力指數頁（個人網站）：每個資料日一次、沒更新時每 2 小時再看、每台北日最多 6 次
     # （market_pipeline_taco）；主機另外留 2 次餘裕，間隔 10 秒
     "ocmacro.com": HostRule(10.0, 8),
+    # 2026-10-31 機構動向第一期（market_pipeline_inst）：iShares SOXX 產品頁、元大 0050 申購買回清單，每個期間最多 6 次「還沒」
+    # ＋失敗重試；比照 ocmacro.com 間隔 10 秒、每台北日 8 次
+    "www.ishares.com": HostRule(10.0, 8),
+    "www.yuantaetfs.com": HostRule(10.0, 8),
 }
 DEFAULT_HOST_RULE = HostRule(2.0, 200)
 
