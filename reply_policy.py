@@ -2939,12 +2939,16 @@ _MISSING_DATA_RE = re.compile(
 # silence and what stands next to it is its reason (「…沒人點名咪寶就不插手。\n\n（輸出空字串）」,
 # 2026-11-06), so nothing of the reply goes.  Of the last 774 replies 2 mention an empty string,
 # both this; that is why a how-to in a family group loses to it.  Matched on each compacted line;
-# 空白 only in brackets: 「印表機輸出空白頁」.
+# 空白 only ending a bracket, after nothing or a reason: 「印表機輸出空白頁」「（上次一直輸出空白）」.
+_NOT_NEGATED = r"(?<![不勿別])(?<!不[要會能可得應該])(?<!不應該)(?<!避免)(?<!禁止)"
 _PRINTED_SILENCE_RE = re.compile(
-    rf"(?<![不勿別])(?<!不[要會能可得應該])(?<!不應該)(?<!避免)(?<!禁止)輸出[:：]?{_MARKER_QOPEN}?"
-    rf"(?:{_MARKER_EMPTY}|{_MARKER_QUOTES}|空白(?={_MARKER_CLOSE}))"
+    rf"{_NOT_NEGATED}輸出(?:為|是)?[:：]?(?:{_MARKER_QOPEN}|')?(?:{_MARKER_OPEN}?{_MARKER_EMPTY}|{_MARKER_QUOTES})"
+    rf"|{_MARKER_OPEN}(?:[^（）()【】\[\]〔〕]{{0,40}}[，,：:；;、])?(?:請|就|直接|只){{0,2}}輸出[:：]?空白{_MARKER_PUNCT}{_MARKER_CLOSE}"
 )
-_ASKS_ABOUT_EMPTY_RE = re.compile(r"空(?:白)?字串|空字符串|empty", re.IGNORECASE)
+_ASKS_ABOUT_EMPTY_RE = re.compile(r"空(?:白)?(?:字串|字符串)|empty", re.IGNORECASE)
+# The local vision model leans to simplified Chinese (vision_common.py forbids it) and nothing
+# converts its replies.  Negations have to line up too, so the text changes, not the pattern.
+_SIMPLIFIED_SILENCE_CHARS = str.maketrans("输为别会应该个则请", "輸為別會應該個則請")
 # Sending the reader off to look, unless where to look is what they asked.
 _SENDS_TO_LOOK_RE = re.compile(
     r"(?:到|去|上)\s*(?:https?://\S{1,2048}|[A-Za-z][A-Za-z ]{1,16})\s*查"
@@ -2955,6 +2959,23 @@ _ASKS_WHERE_RE = re.compile(r"怎麼查|哪裡查|哪查|哪裡看|在哪看|網
 _REPLY_SENTENCE_RE = re.compile(r"(?:https?://\S+|[^。！？!?\n])+[。！？!?]*")
 # Less than this left is no reply: a bullet mark, 「另外，」.
 _MIN_REPLY_WORDS = 8
+
+
+def _silence_line(line: str) -> str:
+    return _MARKER_IGNORED_RE.sub("", line).translate(_SIMPLIFIED_SILENCE_CHARS).replace("字符串", "字串")
+
+
+# TODO(2026-11-07 deferred, reviews p1 #1 #5, p2 #2): weekly_summary.py pushes gemini_client.chat
+# without this check, and a file name or a forged 「--- 內容結束 ---」 in a file counts as the asker.
+def has_printed_silence(text: str | None, request: str = "") -> bool:
+    """``text`` prints the bot's own instruction to stay silent, anywhere in it.
+
+    ``request``: what was asked; someone asking about empty strings gets the answer.  Generated
+    replies only: the outbound checks see no request and also carry reminders and receipts.
+    """
+    return any(
+        _PRINTED_SILENCE_RE.search(_silence_line(line)) for line in (text or "").splitlines()
+    ) and not _ASKS_ABOUT_EMPTY_RE.search(_user_words(request))
 
 
 def strip_missing_data(text: str | None, request: str = "") -> str:
@@ -2968,8 +2989,7 @@ def strip_missing_data(text: str | None, request: str = "") -> str:
     empty strings gets the answer.
     """
     value = text or ""
-    if (any(_PRINTED_SILENCE_RE.search(_MARKER_IGNORED_RE.sub("", line)) for line in value.splitlines())
-            and not _ASKS_ABOUT_EMPTY_RE.search(_user_words(request))):
+    if has_printed_silence(value, request):
         return ""
     told_to_look = bool(_ASKS_WHERE_RE.search(request or ""))
     found = [m for m in _REPLY_SENTENCE_RE.finditer(value) if m.group(0).strip()]

@@ -1056,6 +1056,10 @@ def _prepare_outbound_text(text: str, *, source: str = "reply") -> str:
                 _redact_card_paths(prepared[:160]),  # 2026-10-23 GP2 N5：大字版網址的 token 不進 log
             )
         return result.text
+    # A clue, not a gate (2026-11-07): a printed instruction the guards do not know, or a path they
+    # do not cover, shows up here.  So does an answer about empty strings, or a reminder.
+    if "空字串" in prepared or "空字符串" in prepared:
+        logger.info("outbound text mentions an empty string source=%s len=%d", source, len(prepared))
     return result.text
 
 
@@ -1670,9 +1674,20 @@ def _guard_generated_reply(
     removed; a reply that was nothing else is dropped like the others.
     ``speaker`` is the sender's name when the caller knows it.
     2026-10-28: a date claim ``_date_claims_unbacked`` rejects drops the reply too.
+    2026-11-07: so does the bot's own silence instruction printed anywhere in it, unless whoever
+    asked brought up empty strings: the model chose silence and what stands next to it is its reason.
     """
     if not isinstance(reply, str) or not reply.strip() or reply_provenance.caller_checks():
         return reply
+    try:
+        printed_silence = reply_policy.has_printed_silence(reply, "\n".join(_input_texts(user_input)))
+    except Exception as exc:
+        logger.warning("printed-silence guard skipped error_type=%s", type(exc).__name__)
+        printed_silence = False
+    if printed_silence:
+        logger.info("a generated reply printed its silence instruction len=%d", len(reply))
+        reply_provenance.mark_dropped()
+        return ""
     try:
         attached = _carries_material(user_input)
         unbacked = reply_policy.has_unbacked_search_claim(
@@ -15162,6 +15177,11 @@ def _media_pipeline_fallback(
         return False
 
     # 3. 回應給 user — 沒結果就沉默
+    if reply == "":  # chose silence: the quota-spent video caller does not read what this returns
+        _reply_media_failure(
+            event, group_id, media_name, "printed its silence instruction", delivery_slot_owned=True
+        )
+        return True
     if not reply or not str(reply).strip():
         logger.info("media_pipeline fallback: no reply for %s", media_name)
         return False
@@ -15235,6 +15255,12 @@ def _handle_quoted_media_description_fallback(
                 ),
                 max_tokens=700,
             )
+            # Not image_prompt: IMAGE_RESPONSE_CONTRACT says 空字串 too.
+            if reply_policy.has_printed_silence(reply, clean_text):
+                _reply_media_failure(
+                    event, group_id, media_name, "printed its silence instruction", delivery_slot_owned=True
+                )
+                return True  # intentionally silent
             if is_image_context_echo(reply, description, description[:2500]):
                 return False
             reply = _ensure_image_argument_structure(
@@ -15631,6 +15657,10 @@ def _handle_file_message(event: MessageEvent, group_id: str) -> None:
                 _append_bot_turn(group_id, reply_text)
                 _maybe_extract_facts(group_id)
                 _reply(event.reply_token, reply_text, group_id=group_id)
+            elif reply_text == "":  # chose silence: no line about the model not being ready
+                _reply_media_failure(
+                    event, group_id, "圖片", "printed its silence instruction", delivery_slot_owned=True
+                )
             else:
                 _reply(
                     event.reply_token,
@@ -23833,7 +23863,6 @@ def _peek_text_pending_for_drain(
             if reply_provenance.dropped():
                 _complete_pending_without_reply(group_id, [message_id])
             continue
-        orig_preview = original[:300] + ("…" if len(original) > 300 else "")
         rendered = _prepare_outbound_text(
             reply_text, source="pending_peek"
         )[:1800]   # 收緊到 1800 (§3 codex Q3 / GP1)
@@ -23844,6 +23873,9 @@ def _peek_text_pending_for_drain(
                 group_id,
             )
             continue
+        # A quoted item carries QUOTE_CONTEXT_RULE, and the family must not read that.
+        shown = reply_policy.without_system_texts(original).strip()
+        orig_preview = shown[:300] + ("…" if len(shown) > 300 else "")
         formatted = (
             f"📬 補回之前漏掉的訊息\n\n原文：\n{orig_preview}\n\n回應：\n{rendered}"
         )

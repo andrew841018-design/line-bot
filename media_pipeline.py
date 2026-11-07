@@ -22,6 +22,7 @@ from image_reply import (
     render_image_reply,
     unsolicited_image_reply,
 )
+import reply_policy
 from video_reply import VIDEO_COMMENTARY_CONTRACT, VIDEO_CACHE_VERSION
 
 logger = logging.getLogger("media_pipeline")
@@ -421,6 +422,8 @@ def _is_cache_quality_reply(reply) -> bool:
         return False
     if len(s) < _MIN_CACHE_REPLY_LEN:    # L3 raw desc 通常 < 200 字
         return False
+    if reply_policy.has_printed_silence(s):  # 快取沒有期限，存了之後同一張圖重傳都不會再分析
+        return False
     return True
 
 
@@ -498,6 +501,17 @@ def _maybe_write_media_cache(
         logger.warning("media_cache write failed: %s", e)
 
 
+def _unless_printed_silence(reply: Optional[str], user_prompt: str) -> Optional[str]:
+    """``""`` when the model printed its instruction to stay silent (Andrew 2026-11-06: 「我寧可你
+    不回」).  Like Claude's ``""`` this is a choice, where None is a failure, and it is a value
+    because the analysis may run on another thread.
+    """
+    if reply_policy.has_printed_silence(reply, user_prompt):
+        logger.info("model printed its silence instruction len=%d", len(reply or ""))
+        return ""
+    return reply
+
+
 def analyze_image(
     image: str | Path | bytes,
     user_prompt: str = "",
@@ -512,16 +526,17 @@ def analyze_image(
     picture, so only a correction or advice is returned (Andrew 2026-10-07:
     不要說明圖的內容); a reply that only retells the picture becomes None.
     With ``unsolicited=True`` a ``user_prompt`` is context such as a file
-    name, not a question.
+    name, not a question.  ``""``: see ``_unless_printed_silence``.
     """
+    asked = user_prompt
     if unsolicited is None:
         unsolicited = not user_prompt.strip()
     elif unsolicited and user_prompt.strip():
         user_prompt = f"{_UNASKED_IMAGE_TASK}\n\n{user_prompt.strip()}"
-    reply = render_image_reply(_analyze_image(
+    reply = _unless_printed_silence(render_image_reply(_analyze_image(
         image, user_prompt=user_prompt, group_id=group_id, timeout_sec=timeout_sec
-    ))
-    return unsolicited_image_reply(reply) if unsolicited else reply
+    )), asked)
+    return unsolicited_image_reply(reply) if unsolicited and reply else reply
 
 
 def _analyze_image(
@@ -963,7 +978,7 @@ def analyze_video(
     user_prompt: str = "",
     group_id: str | None = None,
 ) -> Optional[str]:
-    """對影片產生回應。失敗回 None。
+    """對影片產生回應。失敗回 None；模型印出不回指令回 ""（見 ``_unless_printed_silence``）。
 
     流程：
       1. 抽 keyframes（max 6）
@@ -976,7 +991,7 @@ def analyze_video(
     use_default_cache = not user_prompt.strip()
     cached = _maybe_lookup_media_cache(video, group_id, "video") if use_default_cache else None
     if cached:
-        return cached
+        return _unless_printed_silence(cached, user_prompt)
 
     # Keyframes
     frames = []
@@ -1024,7 +1039,7 @@ def analyze_video(
 
     if use_default_cache and out and out.strip():
         _maybe_write_media_cache(video, group_id, "video", None, out)
-    return out
+    return _unless_printed_silence(out, user_prompt)
 
 
 if __name__ == "__main__":
