@@ -113,6 +113,7 @@ _TEXT_SUFFIXES = {
     ".yml",
 }
 _MAX_TEXT_BYTES = 2 * 1024 * 1024
+_AUDIT_ERRORS = (OSError, RuntimeError, UnicodeError, ValueError)
 
 
 @dataclass(frozen=True)
@@ -258,22 +259,44 @@ def load_private_terms(repo: Path) -> tuple[str, ...]:
     return _normalize_private_terms(terms)
 
 
-def _scan_tree(repo: Path, treeish: str, *, revision: str) -> list[Finding]:
-    private_terms = load_private_terms(repo)
-    raw_names = _run_git(repo, ["ls-tree", "-r", "-z", "--name-only", treeish])
+def _terms_for_audit(repo: Path) -> tuple[str, ...]:
+    """repo's terms, plus those of the checkout that owns its .git.
+
+    The term files are gitignored, so a linked worktree has none of its own.
+    load_private_terms stays a one-directory read: the running bot calls it
+    through fact_filters, and tests in a worktree must not see real terms.
+    """
+    raw = _run_git(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"])
+    common_dir = Path(raw.decode("utf-8", errors="surrogateescape").rstrip("\n"))
+    terms = load_private_terms(repo)
+    if common_dir.name == ".git":  # a bare repo or a submodule has no checkout to read
+        terms = (*terms, *load_private_terms(common_dir.parent))
+    return _normalize_private_terms(terms)
+
+
+def _has_private_terms(repo: Path) -> bool:
+    """False also for a broken term source: the scans that need it raise on their own."""
+    try:
+        return bool(_terms_for_audit(repo))
+    except _AUDIT_ERRORS:
+        return False
+
+
+def _scan_tree(repo: Path, revision: str, private_terms: tuple[str, ...]) -> list[Finding]:
+    raw_names = _run_git(repo, ["ls-tree", "-r", "-z", "--name-only", revision])
     findings: list[Finding] = []
     for raw_path in raw_names.split(b"\0"):
         if not raw_path:
             continue
         path = raw_path.decode("utf-8", errors="surrogateescape")
-        blob = _run_git(repo, ["show", f"{treeish}:{path}"])
+        blob = _run_git(repo, ["show", f"{revision}:{path}"])
         findings.extend(scan_blob(path, blob, private_terms=private_terms, revision=revision))
     return findings
 
 
 def scan_revision(repo: Path | str, revision: str) -> list[Finding]:
     repo_path = Path(repo).resolve()
-    return _scan_tree(repo_path, revision, revision=revision)
+    return _scan_tree(repo_path, revision, _terms_for_audit(repo_path))
 
 
 def scan_remote_main(repo: Path | str) -> list[Finding]:
@@ -299,7 +322,7 @@ def scan_remote_main(repo: Path | str) -> list[Finding]:
 
 def scan_index(repo: Path | str) -> list[Finding]:
     repo_path = Path(repo).resolve()
-    private_terms = load_private_terms(repo_path)
+    private_terms = _terms_for_audit(repo_path)
     raw_names = _run_git(
         repo_path,
         ["diff", "--cached", "--name-only", "-z", "--diff-filter=ACMR"],
@@ -320,7 +343,7 @@ def scan_index(repo: Path | str) -> list[Finding]:
 
 def scan_worktree(repo: Path | str) -> list[Finding]:
     repo_path = Path(repo).resolve()
-    private_terms = load_private_terms(repo_path)
+    private_terms = _terms_for_audit(repo_path)
     raw_names = _run_git(
         repo_path,
         ["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
@@ -363,12 +386,16 @@ def scan_push_updates(repo: Path | str, update_lines: Iterable[str]) -> list[Fin
         _local_ref, local_oid, _remote_ref, remote_oid = fields
         if _ZERO_OID_RE.fullmatch(local_oid):
             continue
+        # After the deletion check: a deletion must pass even with a broken term file.
+        private_terms = _terms_for_audit(repo_path)
+        if not private_terms:  # any non-deletion can send objects, even with 0 commits
+            findings.append(Finding("private_terms_unavailable", revision="push"))
         rev_args = ["rev-list", local_oid, "--not", "--remotes"]
         if not _ZERO_OID_RE.fullmatch(remote_oid):
             rev_args = ["rev-list", f"{remote_oid}..{local_oid}"]
         revisions = _run_git(repo_path, rev_args).decode("ascii", errors="strict").splitlines()
         for revision in revisions:
-            findings.extend(_scan_tree(repo_path, revision, revision=revision))
+            findings.extend(_scan_tree(repo_path, revision, private_terms))
     return _dedupe(findings)
 
 
@@ -408,9 +435,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 findings.extend(scan_remote_main(repo))
             else:
                 findings.extend(scan_push_updates(repo, sys.stdin.read().splitlines()))
-    except (OSError, RuntimeError, UnicodeError, ValueError):
+    except _AUDIT_ERRORS:
         findings.append(Finding("audit_error"))
     findings = _dedupe(findings)
+    if not findings and not _has_private_terms(repo):
+        # head is CI's scope: CI has no term files.  push: scan_push_updates
+        # already refused every update that can send objects.
+        if set(args.scope) <= {"head", "push"}:
+            print("privacy_audit=patterns_only private_terms=unavailable")
+            return 0
+        findings = [Finding("private_terms_unavailable")]
     print(format_summary(findings))
     return 1 if findings else 0
 
