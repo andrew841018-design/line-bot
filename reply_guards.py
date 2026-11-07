@@ -728,6 +728,195 @@ def strip_negative_coverage(reply: str, partial: bool, search_only: bool = False
     return _finish(out), dropped
 
 
+# ── prices the program fetched (2026-11-07) ─────────────────────────────
+
+# Only two shapes are read: a level (「收 2,135 元」「跌到 2,135」) and a move (「跌 4.69%」「跌了 105 元」),
+# and only where they can be about the quote.  Comparing every number deleted correct sentences,
+# and a reply that loses its sentences is no reply: what this does not read is left to the prompt.
+_LEVEL_END = r"(?=\s*(?:元|塊|美元|點(?!半)|左右|附近|[。！!?？]|$))"
+_PRICE_LEVEL_RE = re.compile(
+    r"(?<![營稅回吸驗接])(?P<word>收盤價?|收在|收|現價|股價|現在|目前|漲到|漲至|跌到|跌至)\s*"
+    r"(?:是|為|在|約|大約|來到|剩|每股)*\s*(?P<num>\d+(?:\.\d+)?)" + _LEVEL_END
+)
+_PRICE_MOVE_RE = re.compile(
+    r"(?P<word>漲(?!跌)|(?<!漲)跌)(?:了|幅|約|大約|超過|逾|近|快|將近)*\s*(?P<num>\d+(?:\.\d+)?)\s*(?P<unit>%|元|塊|美元|點)"
+)
+_TARGET_WORDS = ("漲到", "漲至", "跌到", "跌至")
+_ROUGHLY_RE = re.compile(r"約|超過|逾|近|快|左右|附近|上下|大概|差不多|多")
+_TODAY_RE = re.compile(r"今天|今日|已經|現在|當天|單日")
+_OTHER_DAY_RE = re.compile(r"前一|上一|上個|週[一二三四五六日]|\d{1,2}\s*/\s*\d{1,2}|\d{1,2}\s*月\s*\d{1,2}")
+# Dates and times.  「13 日收 1,455 元」: the 13 is not a price.
+_NOT_A_PRICE_RE = re.compile(
+    r"\d{4}\s*[-/年]\s*\d{1,2}(?:\s*[-/月]\s*\d{1,2}\s*[日號]?)?"
+    r"|\d{1,2}\s*[/月]\s*\d{1,2}\s*[日號]?"
+    r"|\d{1,2}\s*[日號]"
+    r"|\d{1,2}\s*:\s*\d{2}"
+    r"|\d{1,2}\s*點\s*(?:半|\d{1,2}\s*分)"
+    r"|(?<![\d.])\d{1,2}\s*點多?(?!\d)"
+)
+# Another day or span than the quote's, someone else's number, or not a price at all.
+_NOT_THE_QUOTE_RE = re.compile(
+    r"昨|前天|跌前|上週|上周|上月|本週|本周|本月|今年|去年|年初|以來|累計|上次|之前|當時|那時|那波|這波|曾|一度|"
+    r"這週|這周|這禮拜|這星期|這個月|上個月|上禮拜|上星期|"
+    r"盤中|[1-9]\d?\s*月|20\d\d\s*年|月線|季線|年線|目標價|成本|買在|均價|"
+    r"你說|妳說|你講|妳講|聽說|[你妳](?:看|提|問|貼|以為|記)|不是|而非|不等於|不代表|不只|沒|未|從|"
+    r"手續費|配息|股息|股利|本益比|RSI|KD|權重|殖利率|買得到|可以買|定期定額|之間|區間|的股票"
+)
+# A span (「最近跌了 15%」「連跌三天」): its move and where it went are not the day's, so only a plain
+# level is still held to the quote (「近三個月新低，收 2,350 元」).  With 今天 it is the day's.
+# 「接近日內高點」 has no 近日.
+_SPAN_RE = re.compile(
+    r"最近|近期|(?<![接逼靠將])近日|一路|這陣子|這幾天|前幾天|連日|連續|連跌|連漲|"
+    r"(?:(?<![接逼靠將])近|過去)\s*(?:[一兩二三四五六七八九十半幾]|\d+)?\s*個?\s*(?:月|週|周|禮拜|星期|年|季|天)"
+)
+_SPAN_TODAY_RE = re.compile(r"今天|今日|當天|單日")
+# An instrument without a quote only as the cause: 「受美股拖累，收在 2,350 元」 is still about the quote,
+# and so is what follows the cause: 「受費半拖累跌了 8.5%」.
+_CAUSE_BEFORE_RE = re.compile(r"(?:受到?|跟著|跟|隨著|隨|被|因為|因)\s*$")
+_CAUSE_AFTER_RE = re.compile(r"\s*的?(?:拖累|帶動|帶領|影響|牽動)")
+_CAUSE_WORD_RE = re.compile(r"拖累|帶動|帶領|影響|牽動")
+# A code next to a level word or a unit is the price itself: 「台積電收 2330 元」.
+_LEVEL_WORD_BEFORE_RE = re.compile(
+    r"(?:收盤價?|收在|收|現價|股價|現在|目前|漲到|漲至|跌到|跌至)\s*(?:是|為|在|約|大約|來到|剩|每股)*\s*$"
+)
+_UNIT_AFTER_RE = re.compile(r"\s*(?:元|塊|美元|美金|點|%)")
+
+
+def _cause_end(text: str, start: int, end: int) -> int:
+    """Where the cause ends when the name at ``text[start:end]`` is only a cause; 0 when it is not."""
+    after = _CAUSE_AFTER_RE.match(text, end)
+    if after:
+        cut = after.end()
+    elif _CAUSE_BEFORE_RE.search(text[:start]):
+        cut = end
+    else:
+        return 0
+    later = [match.end() for match in _CAUSE_WORD_RE.finditer(text, cut)]  # 「受費半大跌 3% 拖累」
+    return later[-1] if later else cut
+
+
+def _without_code(text: str, code: str) -> str:
+    """``text`` with the instrument's code blanked, unless the digits are its price."""
+    def blank(match: re.Match) -> str:
+        if _LEVEL_WORD_BEFORE_RE.search(text[:match.start()]) or _UNIT_AFTER_RE.match(text, match.end()):
+            return match.group(0)
+        return " " * len(match.group(0))
+
+    return re.sub(rf"(?<!\d){re.escape(code)}(?!\d)", blank, text)
+_PRICE_CLAUSE_RE = re.compile(r"[，；;、]")
+_LEVEL_ROUGHLY = 0.02
+_MOVE_ROUGHLY = 0.25
+_SMALL_COUNT = 10  # 「現在 3 檔」: this small without a decimal is no price
+
+
+def _last_digit(digits: str) -> float:
+    """What rounding or cutting a number off to the digits shown can move it by."""
+    return 10.0 ** -len(digits.partition(".")[2])
+
+
+def _number_matches(match: re.Match, known: float, roughly: float) -> bool:
+    slack = _last_digit(match["num"])
+    if _ROUGHLY_RE.search(match.string[max(0, match.start() - 3):match.end() + 5]):
+        slack = max(slack, abs(known) * roughly)
+    return abs(float(match["num"]) - abs(known)) <= slack + 1e-9
+
+
+def _moved_the_other_way(word: str, quote) -> bool:
+    move = quote.change_pct if quote.change_pct is not None else quote.change
+    return bool(move) and (("漲" in word and move < 0) or ("跌" in word and move > 0))
+
+
+def _quote_claims_hold(
+    clause: str, quote, evidence: list[float], other_day: bool, named: bool, span: bool = False
+) -> bool:
+    def found(match: re.Match) -> bool:
+        return any(abs(float(match["num"]) - value) <= _last_digit(match["num"]) + 1e-9 for value in evidence)
+
+    today = bool(_TODAY_RE.search(clause))
+    for match in _PRICE_LEVEL_RE.finditer(clause):
+        if found(match) or ("." not in match["num"] and float(match["num"]) < _SMALL_COUNT):
+            continue
+        if span and match["word"] in _TARGET_WORDS:
+            continue  # 「最近一路跌到 2,135 元」: where the span went
+        if other_day and quote.change is not None and _number_matches(match, quote.price - quote.change, _LEVEL_ROUGHLY):
+            continue
+        right = _number_matches(match, quote.price, _LEVEL_ROUGHLY)
+        if match["word"] in _TARGET_WORDS and not today and not right:
+            continue  # 「等跌到 2,000 元」: a target
+        if not right or _moved_the_other_way(match["word"], quote):
+            return False
+    if span:
+        return True  # 「最近跌了 15%」: the span's move, not the day's
+    for match in _PRICE_MOVE_RE.finditer(clause):
+        known = quote.change_pct if match["unit"] == "%" else quote.change
+        if known is None or found(match):
+            continue
+        right = _number_matches(match, known, _MOVE_ROUGHLY)
+        if not right and not named and not today and match["unit"] == "%" and "." not in match["num"]:
+            continue  # 「跌 10% 才算修正」: a round figure, no name, no day
+        if not right or _moved_the_other_way(match["word"], quote):
+            return False
+    return True
+
+
+def strip_unbacked_quote_numbers(reply: str, quotes, evidence_text: str = "") -> tuple[str, int]:
+    """Drop sentences that state a level or a move other than the one the program fetched.
+
+    ``quotes`` are stock_quote.ChatQuote.  A clause is held to the instrument it names.  One that
+    names none follows the clause before it, and then any of the quotes will do; with a single quote
+    it is held to that one.  With several, a clause before any name, or one naming two, is not
+    checked.  A clause about an instrument without a quote (「拖累台股跌 1.2%」 with only 2330
+    fetched) is not checked: its numbers are left to the prompt, as before this check; nor are the
+    unnamed clauses after it in the same sentence (「大盤跌了 2%，收 26,512 點」), unless it was only
+    the cause (「受美股拖累」).  Names come from the chat table, longest first, so 「台積電ADR」 is not
+    台積電; the quote's own names count too (「0050 跟著大盤跌」 is about 0050).  ``evidence_text`` is
+    what a search collected: a number found there stands (an older close, another index).
+    Direction counts: the right number with 漲 for a fall goes.  Returns ``(text, dropped)``.
+    """
+    import stock_quote  # the chat table: which instrument a clause is about
+
+    evidence = [float(n) for n in re.findall(r"\d+(?:\.\d+)?", _match_text(evidence_text or ""))]
+    alone = list(quotes) if len(quotes) == 1 else []
+    subject = alone
+    kept: list[str] = []
+    dropped = 0
+    for seg in _segments(reply):
+        backed = True
+        subject = subject or alone  # another instrument holds the subject to the end of its sentence
+        for clause in _PRICE_CLAUSE_RE.split(seg.masked) if seg.sentence else ():
+            folded = _match_text(clause).upper().replace("臺", "台")
+            others = []
+            for start, end, symbol in stock_quote.chat_name_spans(folded):
+                if not any(symbol.upper() in q.names for q in quotes):
+                    others.append((start, end))
+                    folded = folded[:start] + " " * (end - start) + folded[end:]
+            named = [q for q in quotes if any(name in folded for name in q.names)]
+            if others and not named:
+                causes = [_cause_end(folded, start, end) for start, end in others]
+                if not all(causes):  # 「美股拖累大盤」: 大盤 is no cause
+                    subject = []
+                    continue
+                cut = max(causes)
+                folded = " " * cut + folded[cut:]  # what follows the cause is the subject's
+            subject = named or subject
+            for name in (n for q in named for n in q.names):
+                # 「標普 500」, 「（2330）」: no price — but 「收 2330 元」 is one
+                folded = _without_code(folded, name) if name.isdigit() else folded.replace(name, " ")
+            other_day = bool(_OTHER_DAY_RE.search(folded))
+            folded = _NOT_A_PRICE_RE.sub(" ", folded)
+            span = bool(_SPAN_RE.search(folded)) and not _SPAN_TODAY_RE.search(folded)
+            if len(subject) == 1 and not _NOT_THE_QUOTE_RE.search(folded):
+                pool = subject if named or len(quotes) == 1 else quotes
+                backed = backed and any(
+                    _quote_claims_hold(folded, q, evidence, other_day, bool(named), span) for q in pool
+                )
+        if backed:
+            kept.append(seg.text)
+        else:
+            dropped += 1
+    return (_finish(kept), dropped) if dropped else (reply, 0)
+
+
 # ── B3: hand-backs, pronoun guesses and chat recaps ──────────────────────────
 
 _KINSHIP = (

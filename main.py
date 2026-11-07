@@ -1066,6 +1066,9 @@ def _append_bot_turn(group_id: str, text: str, *, source: str = "bot_memory") ->
         memory.append_turn(group_id, "bot", safe_text)
 
 
+_CHAT_PRICE_WAIT_SEC = 3.0
+
+
 def _is_market_quote_outbound(text: str) -> bool:
     """Market quotes are reply-only; an expired reply token must not create a push."""
     return (text or "").lstrip().startswith(
@@ -1081,6 +1084,63 @@ def _is_market_quote_request(text: str, context: list | None = None) -> bool:
     except Exception as e:
         logger.debug("market quote request detection skipped: %s", e)
         return False
+
+
+def _chat_price_symbols(text: str) -> list[str]:
+    """What the family typed says an instrument moved (2026-11-07): offline, never raises.
+
+    ``LINE_BOT_CHAT_QUOTES=0`` turns the prices off.
+    """
+    if os.environ.get("LINE_BOT_CHAT_QUOTES", "1").strip() == "0":
+        return []
+    try:
+        import stock_quote
+
+        return stock_quote.chat_quote_symbols(reply_guards.user_typed_text(text))
+    except Exception as exc:
+        logger.info("chat price detection skipped error_type=%s", type(exc).__name__)
+        return []
+
+
+def _start_chat_prices(symbols: list[str]) -> Callable[[], list]:
+    """Fetch the prices of ``symbols`` now; the returned call gives what came back.
+
+    The call waits out what is left of _CHAT_PRICE_WAIT_SEC, counted from here, so work done in
+    between is free.  ``[]`` when no price came: the reply goes on as if nothing had been asked.
+    """
+    if not symbols:
+        return list
+    import stock_quote
+
+    started = time.monotonic()
+    box: dict = {}
+
+    def work() -> None:
+        try:
+            box["prices"] = stock_quote.get_chat_quotes(symbols)
+        except Exception as exc:
+            logger.info("chat price fetch failed error_type=%s", type(exc).__name__)
+
+    worker = threading.Thread(target=work, name="chat-prices", daemon=True)
+    try:
+        worker.start()
+    except RuntimeError:
+        return list
+
+    def wait() -> list:
+        worker.join(max(0.0, _CHAT_PRICE_WAIT_SEC - (time.monotonic() - started)))
+        return box.get("prices", [])
+
+    return wait
+
+
+def _with_chat_prices(user_input: str, prices: list) -> str:
+    """Inside 【最新訊息】, the only place reply_policy.NO_SEARCH_CONTRACT counts as this reply's data."""
+    if not prices:
+        return user_input
+    import stock_quote
+
+    return f"{user_input}\n\n{stock_quote.chat_quote_block(prices)}"
 
 
 def _archive_sent_texts(group_id: str, response, texts: list[str]) -> None:
@@ -1226,6 +1286,21 @@ def _date_claims_unbacked(reply: str, *, log_drop: bool = True, **backing) -> bo
     return bool(kinds)
 
 
+def _checked_against_prices(reply_text: str, prices: list, evidence_text: str, outcome: dict) -> str:
+    try:
+        checked, dropped = reply_guards.strip_unbacked_quote_numbers(reply_text, prices, evidence_text)
+        if checked and not output_validator.validate_outbound_text(checked).ok:
+            logger.info("price reply would be replaced by the validator; silent")
+            return ""
+    except Exception as exc:  # a broken check must not send an unchecked price
+        logger.warning("price guard failed error_type=%s", type(exc).__name__)
+        return ""
+    if dropped:
+        logger.info("price guard dropped=%d after=%d", dropped, len(checked))
+        outcome["price_numbers_dropped"] = dropped
+    return checked
+
+
 def _enforce_new_value_reply(
     reply_text: str,
     *,
@@ -1244,6 +1319,7 @@ def _enforce_new_value_reply(
     speaker: str = "",
     regulation_page_backing: Callable[[str], str] | None = None,
     page_backing_all_or_nothing: bool = False,
+    prices: list | None = None,
 ) -> str:
     """Drop sentences that only restate what the group already said.
 
@@ -1308,6 +1384,10 @@ def _enforce_new_value_reply(
     only if B1 keeps every sentence it kept before and, with ``page_backing_all_or_nothing`` (the
     family asked for a number), backs every number; otherwise, and on any error, the first pass
     stands (``_page_backed_guards``).
+
+    2026-11-07: ``prices`` are the stock_quote.ChatQuote this reply was given.  A level or move it
+    states must be theirs (``reply_guards.strip_unbacked_quote_numbers``), and a reply the outbound
+    validator would swap for its fixed 「送出前被擋下」 line says nothing instead.
     """
     grounding = reply_provenance.take_grounding()
     report = {
@@ -1346,6 +1426,10 @@ def _enforce_new_value_reply(
         # TODO(2026-10-03 review): a dropped reply to a direct @咪寶 question means
         # silence; one retry was suggested. Revisit if direct questions go quiet often.
         return ""
+    if prices:
+        reply_text = _checked_against_prices(reply_text, prices, evidence_text, outcome)
+        if not reply_text:
+            return ""
     # 2026-11-06 Andrew: 「不要講這種空話」.  The contract no longer asks for it; this is the
     # net under that, and for what older turns in the chat may teach the model.
     try:
@@ -1840,7 +1924,10 @@ def _gemini_quota_fallback(
         import lite_reply
         from gemini_client import _extract_text
         user_text = _extract_text(user_input)
-        out = None if has_quote_context(user_text) else lite_reply.lite_reply(user_text, context=context)
+        # Its handlers read every number: the price block's 「186.64 USD」 became a forex reply.
+        import stock_quote
+        lite_text = stock_quote.without_chat_quote_block(user_text)
+        out = None if has_quote_context(lite_text) else lite_reply.lite_reply(lite_text, context=context)
         if out:
             logger.info(
                 "quota exhausted → lite_reply hit (text_len=%d)", len(user_text)
@@ -13532,6 +13619,7 @@ def _handle_explicit_text(
     user_input = with_current_reply(quoted_block, current_reply) if quoted_block else current_reply
 
     quote_policy_input = user_input
+    chat_prices = _start_chat_prices(_chat_price_symbols(clean_text))  # no quote card came: chat about it
     # URL 預抓取：先用 Python 抓網頁內容塞進 prompt，繞過 Gemini url_context 的限制
     with _recording_link_content() as link_content, _heavy_link_reads():
         user_input = _prefetch_urls(user_input)
@@ -13549,7 +13637,11 @@ def _handle_explicit_text(
     )
     # B2.4: this message disputes a reply of the bot's own that it quotes.
     dispute = _guard_check(reply_guards.disputes_quoted_bot, quote_policy_input)
-    llm_input = f"{reply_policy.DISPUTE_NOTE}\n\n{user_input}" if dispute else user_input
+    prices = chat_prices()
+    quote_reply_only = quote_reply_only or bool(prices)
+    llm_input = _with_chat_prices(
+        f"{reply_policy.DISPUTE_NOTE}\n\n{user_input}" if dispute else user_input, prices
+    )
     facts = _facts_for_speaker(group_id, sender_user_id)
     pnotes = _get_persona_notes(group_id)
     llm_started = time.monotonic()
@@ -13668,6 +13760,7 @@ def _handle_explicit_text(
         facts=facts,
         partial=reply_guards.is_partial(link_content) or dispute,
         speaker=_speaker_alias(sender_user_id),
+        prices=prices,
     )
     claims_outcome: dict = {}
     reply_text = _enforce_new_value_reply(reply_text, outcome=claims_outcome, **enforce_kwargs)
@@ -14110,12 +14203,13 @@ def _handle_burst_flush(
         not has_quote_context(combined_text)
         and _requires_public_research(combined_text)
     )
+    price_symbols = _chat_price_symbols(combined_text)
     cached = (
         None
         # A link summary cached before 2026-09-26 must not be replayed.
         # A current-events claim re-reads fresh sources; an older cached
         # answer could repeat a stale price or figure (2026-10-10 review).
-        if has_quote_context(combined_text) or bare_share or needs_public_research
+        if has_quote_context(combined_text) or bare_share or needs_public_research or price_symbols
         else _retryable_burst_db_call(
             memory.check_fact_cache, group_id, combined_text
         )
@@ -14193,6 +14287,7 @@ def _handle_burst_flush(
         )
         return
 
+    chat_prices = _start_chat_prices(price_symbols)  # 2026-11-07: comes in while the links are read
     # URL 預抓取：先用 Python 抓網頁內容塞進 prompt，繞過 Gemini url_context 的限制
     with _recording_link_content() as link_content, _heavy_link_reads():
         prefetched = _prefetch_urls(combined_text)
@@ -14216,9 +14311,12 @@ def _handle_burst_flush(
         _finish_burst_without_reply(group_id, combined_text, reply_token, message_ids)
         return
 
-    user_input = (
+    prices = chat_prices()
+    quote_reply_only = quote_reply_only or bool(prices)  # a price must not arrive as a late push
+    user_input = _with_chat_prices(
         f"{_BURST_REPLY_INSTRUCTION}\n{reply_policy.DISPUTE_NOTE}\n\n{prefetched}"
-        if dispute else f"{_BURST_REPLY_INSTRUCTION}\n\n{prefetched}"
+        if dispute else f"{_BURST_REPLY_INSTRUCTION}\n\n{prefetched}",
+        prices,
     )
     try:
         with _thinking_indicator(group_id):
@@ -14333,6 +14431,7 @@ def _handle_burst_flush(
         has_material=bool(link_content),
         facts=facts,
         partial=reply_guards.is_partial(link_content) or dispute,
+        prices=prices,
     )
     claims_outcome: dict = {}
     reply_text = _enforce_new_value_reply(reply_text, outcome=claims_outcome, **enforce_kwargs)
@@ -14344,9 +14443,10 @@ def _handle_burst_flush(
         _finish_burst_without_reply(group_id, combined_text, reply_token, message_ids)
         return
 
-    if not has_quote_context(combined_text):
+    if not has_quote_context(combined_text) and not price_symbols:
         # Only a reply a real search fed is kept (2026-10-04, memory.store_fact_cache):
         # reply_provenance.searched() for the answer sent, or its supported segments.
+        # A price is not: replayed a week later it would read as today's.
         _retryable_burst_db_call(
             memory.store_fact_cache, group_id, combined_text, reply_text,
             bool(claims_outcome.get("grounded")),
@@ -21587,6 +21687,7 @@ def _handle_web_research_question(
     fetch_input = f"{text}\n{' '.join(quoted_links)}" if quoted_links else text
     fetch_urls = _fetch_urls(fetch_input)
     words = reply_policy.strip_links(text)
+    chat_prices = _start_chat_prices(_chat_price_symbols(words))  # beside the search, not after it
     public_claim = public_research.requires_current_research(words)
     # 「股價暴跌」 in a shared headline is not a claim of the sharer's: the link rules hold.
     link_message = bool(link_urls or quoted_links) and (
@@ -21659,6 +21760,9 @@ def _handle_web_research_question(
     with _thinking_indicator(group_id):
         # `query` (links included) only passes public_query's privacy check here.
         sources = public_research.collect(collect_with_links, query, report=crawl)
+        # Beside what was found.  Nothing found stays as it was: no reply a family member would
+        # not have got before (the 11/06 proposal: 只在咪寶本來就要回的時候).
+        prices = chat_prices() if sources else []
         # Only rows a search returned count as searched; a read link alone does not.
         searched = any(row.get("evidence_kind") != "linked_context" for row in sources or [])
         answer_searched = False
@@ -21680,8 +21784,9 @@ def _handle_web_research_question(
                     # This answer's own citations, read now: the guards take the record later.
                     plain_urls = list((reply_provenance.grounding() or {}).get("urls") or [])
         else:
+            quote_and_prices = _with_chat_prices(quoted_context, prices)
             prompt_text = _build_web_research_prompt(
-                query, sources, quoted_context=quoted_context, searched=searched
+                query, sources, quoted_context=quote_and_prices, searched=searched
             )
             reply_text = ""
             for attempt in range(2):
@@ -21707,7 +21812,7 @@ def _handle_web_research_question(
                     answer_searched = reply_provenance.searched()
                     break
                 prompt_text = _build_web_research_prompt(
-                    query, sources, quoted_context=quoted_context, searched=searched
+                    query, sources, quoted_context=quote_and_prices, searched=searched
                 ) + (
                     "\n上一輪沒有交付答案。請根據同一份已取得資料直接回答；"
                     "不可再承諾之後搜尋，也不可憑記憶新增事實。"
@@ -21750,6 +21855,7 @@ def _handle_web_research_question(
         ),
         speaker=_speaker_alias(sender_user_id),
         outcome=guarded,
+        prices=prices,
         # 2026-10-29 Andrew: a number the cited pages really hold may stay (PLAN §10).
         regulation_page_backing=(
             _plain_question_page_backing(plain_urls, event=event, group_id=group_id)
@@ -21773,7 +21879,7 @@ def _handle_web_research_question(
 
     memory.append_turn(group_id, "user", _research_turn(group_id, text, event))
     _append_bot_turn(group_id, reply_text)
-    _reply(event.reply_token, reply_text, group_id=group_id)
+    _reply(event.reply_token, reply_text, group_id=group_id, allow_push_fallback=not prices)
     return True
 
 

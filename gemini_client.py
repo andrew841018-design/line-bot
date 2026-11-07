@@ -1977,7 +1977,10 @@ def chat(
         # 2026-10-24 (B8.2): only what the family typed (and quoted) names a stock; the
         # title and description of a pre-read video say TV, APP, HTML, AI …
         _user_text_for_quote = reply_guards.user_typed_text(_extract_text(user_input))
-        _quotes = stock_quote.get_contextual_quotes_text(
+        # 2026-11-07: past a Claude miss the prompt already has its prices, the ones the reply
+        # is checked against.  A family member typing the marker only saves this fetch.
+        _has_prices = stock_quote.CHAT_QUOTE_BLOCK_START in _extract_text(user_input)
+        _quotes = None if _has_prices else stock_quote.get_contextual_quotes_text(
             _user_text_for_quote,
             context=context,
         )

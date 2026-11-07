@@ -68,6 +68,8 @@ os.environ.setdefault("GEMINI_API_KEY", "dummy")
 os.environ.setdefault("GROK_API_KEY", "dummy")
 os.environ.setdefault("BOT_MUTED", "true")
 # 2026-10-16 字卡大字版：測試預設不產生網頁、不加按鈕（本機有 tunnel 網址檔），要測的測試自己打開
+# 2026-11-07 聊行情帶報價：預設關（不連 Yahoo），要測的測試自己打開。
+os.environ["LINE_BOT_CHAT_QUOTES"] = "0"
 os.environ["LINE_BOT_CARD_PAGES"] = "0"  # 直接設：shell 有 export 也不能讓測試讀真的 tunnel 檔、寫進 state/
 # 2026-10-23 爸媽健康大字版（N7）：清健康頁不看上面的開關（刪除、暫停、收回訊息都要清），測試之間與
 # 測試結束後的頁面目錄也一律指到隔離路徑，絕不落回正式 state/card_pages；每個測試另有自己的（isolate_card_pages）。
