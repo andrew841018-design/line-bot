@@ -15609,12 +15609,16 @@ def _handle_file_message(event: MessageEvent, group_id: str) -> None:
 
     # 2026-05-16 改：刪 quota 短路。所有 file 路徑都應該嘗試 local fallback —
     # local LLM / vision / OCR 不受 Gemini quota 限制，能跑就跑。
-    # 對齊 feedback_quota_fallback_never_skip.md (binary input 也不該無聲)
+    # 對齊 feedback_quota_fallback_never_skip.md (額度用完時 binary input 也不該無聲)
     try:
         data = _download_content(msg.id)
     except Exception as e:
         logger.exception("download file failed: %s", e)
-        _reply(event.reply_token, f"下載檔案失敗:{type(e).__name__}", group_id=group_id)
+        # Silent like a pasted picture (Andrew 2026-11-07).
+        if not _mark_inbound_reply_completed_no_reply(
+            event.reply_token, group_id=group_id, message_ids=[str(msg.id)]
+        ):
+            logger.warning("file download failed; silent terminal bookkeeping incomplete")
         return
 
     context = memory.get_context(group_id)
@@ -15657,15 +15661,9 @@ def _handle_file_message(event: MessageEvent, group_id: str) -> None:
                 _append_bot_turn(group_id, reply_text)
                 _maybe_extract_facts(group_id)
                 _reply(event.reply_token, reply_text, group_id=group_id)
-            elif reply_text == "":  # chose silence: no line about the model not being ready
+            else:  # nothing to say or the analysis failed: silent either way, like a pasted picture
                 _reply_media_failure(
-                    event, group_id, "圖片", "printed its silence instruction", delivery_slot_owned=True
-                )
-            else:
-                _reply(
-                    event.reply_token,
-                    "這張圖片我這邊暫時分析不到，可能是本機圖片模型還沒載好。",
-                    group_id=group_id,
+                    event, group_id, "圖片", "analysis returned empty", delivery_slot_owned=True
                 )
             return
 

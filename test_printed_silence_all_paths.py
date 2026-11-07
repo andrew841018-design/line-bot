@@ -4,6 +4,7 @@ Andrew 2026-11-06: 「以後不要傳這種廢話，我寧可你不回」.  veri
 replies in _enforce_new_value_reply.  These are the others: pictures, video, voice, quoted media,
 files and the pending queue.  Each test goes in through the handler with the real _reply and a fake
 LINE API, so what reaches the fake is what the family would see.  All fixtures are synthetic.
+The fixed lines a file used to get when it had nothing to send are here too.
 """
 
 from __future__ import annotations
@@ -50,7 +51,6 @@ PRINTED = [
 ORDINARY = "先核對資料日期，再判斷要不要改建議。"
 HOW_TO = "值是 None 的時候就輸出空字串。"
 ASKS = "空字串要怎麼處理"
-PICTURE_FIXED_LINE = "這張圖片我這邊暫時分析不到"
 
 
 class FakeBot:
@@ -373,19 +373,58 @@ def test_a_file_that_mentions_empty_strings_is_not_the_asker(bot, monkeypatch):
     assert bot.is_finished()
 
 
-# ── a failure is still a failure ─────────────────────────────────────────────
+# ── a file with nothing to send ─────────────────────────────────────────────
+# Andrew 2026-11-07: a picture sent as a file is silent like a pasted one, whether the model had
+# nothing to say or the analysis failed, and no file says that its download failed.
 
 
-def test_a_picture_file_that_could_not_be_read_keeps_its_line(bot, monkeypatch):
-    def fail(*_a, **_k):
-        raise RuntimeError("model not loaded")
+def test_a_picture_file_that_is_only_described_is_finished_without_a_line(bot, monkeypatch):
+    bot.model_says = "圖片顯示了某月某日的數據。數值為 85。"
 
-    monkeypatch.setattr(media_pipeline, "_analyze_image", fail)
+    image_file(bot, monkeypatch)
 
-    main._handle_file_message(bot.event("圖.png"), GROUP)
+    assert bot.sent() == []
+    assert bot.is_finished()
 
-    assert len(bot.sent()) == 1
-    assert PICTURE_FIXED_LINE in bot.sent()[0]
+
+def test_a_picture_file_with_advice_gets_the_advice(bot, monkeypatch):
+    bot.model_says = "圖片顯示了某月某日的數據。建議先核對資料日期再判斷。"
+
+    image_file(bot, monkeypatch)
+
+    assert bot.sent() == ["建議先核對資料日期再判斷。"]
+    assert memory.get_inbound_event_status(GROUP, MESSAGE) == "replied"
+
+
+def _analysis_raises(*_a, **_k):
+    raise RuntimeError("model not loaded")
+
+
+def _analysis_finds_nothing(*_a, **_k):
+    return None
+
+
+@pytest.mark.parametrize("analysis", [_analysis_raises, _analysis_finds_nothing])
+def test_a_picture_file_that_could_not_be_read_is_finished_without_a_line(bot, monkeypatch, analysis):
+    monkeypatch.setattr(media_pipeline, "_analyze_image", analysis)
+
+    image_file(bot, monkeypatch)
+
+    assert bot.sent() == []
+    assert bot.is_finished()
+
+
+@pytest.mark.parametrize("token_known", [True, False])
+@pytest.mark.parametrize("file_name", ["圖.png", "報告.pdf", "紀錄.docx", "筆記.txt"])
+def test_a_file_that_could_not_be_downloaded_is_finished_without_a_line(
+    bot, monkeypatch, file_name, token_known
+):
+    _media_unavailable(monkeypatch)
+
+    main._handle_file_message(bot.event(file_name, token_known=token_known), GROUP)
+
+    assert bot.sent() == []
+    assert bot.is_finished()
 
 
 # ── media_pipeline ───────────────────────────────────────────────────────────
