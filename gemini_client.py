@@ -193,7 +193,7 @@ def mark_quota_exhausted_in_usage() -> None:
 _BOT_DIR = os.path.dirname(os.path.abspath(__file__))
 _MODEL_USAGE_FILE = os.path.join(_BOT_DIR, "gemini_model_usage.json")
 _MODEL_USAGE_LOCK_FILE = os.path.join(_BOT_DIR, "locks", "gemini_model_usage.lock")
-_MODEL_USAGE_KINDS = ("chat", "extract", "judge", "media")
+_MODEL_USAGE_KINDS = ("chat", "extract", "judge", "media", "youtube")
 _model_usage_lock = threading.Lock()
 # No tools (2026-10-04 live check): on this API key gemini-3.1-flash-lite
 # answers plain requests, but every request carrying google_search was refused
@@ -284,7 +284,7 @@ def _update_model_usage(model: str, change) -> None:
 
 
 def track_model(model: str, kind: str, ok: bool = True) -> None:
-    """Count one ``kind`` request ("chat", "extract", "judge", "media") for ``model`` today.
+    """Count one ``kind`` request ("chat", "extract", "judge", "media", "youtube") for ``model`` today.
 
     A failed request counts too (Google books it against the quota) and also
     adds to ``failed``.
@@ -328,9 +328,9 @@ def note_media_rate_limit(model: str, e: BaseException) -> None:
 
 
 def model_usage(model: str) -> dict:
-    """Today's counts for ``model``: chat, extract, judge, media, failed, exhausted.
+    """Today's counts for ``model``: chat, extract, judge, media, youtube, failed, exhausted.
 
-    Plus ``rate_limited``, which only the media model ever sets.
+    Plus ``rate_limited`` and ``youtube_closed``, which only the media model ever sets.
     """
     entry = _load_model_usage()["models"].get(model)
     if not isinstance(entry, dict):
@@ -343,6 +343,7 @@ def model_usage(model: str) -> dict:
             usage[kind] = 0
     usage["exhausted"] = bool(entry.get("exhausted"))
     usage["rate_limited"] = bool(entry.get("rate_limited"))
+    usage["youtube_closed"] = bool(entry.get("youtube_closed"))
     return usage
 
 
@@ -540,6 +541,10 @@ def side_task_last_tier(prompt, config, *, label: str):
 # LINE_BOT_TIKTOK_MEDIA_QUIET_DAY_MAX, run only on a quiet day: the same model is
 # the chat fallback, so they stop once it is marked exhausted, has seen a 429,
 # or its chat + extract + media reach _MEDIA_QUIET_DAY_USAGE_LIMIT.
+# 2026-11-07: YouTube videos without a transcript use the same model on quiet days only, up to
+# LINE_BOT_YOUTUBE_MEDIA_DAILY_CAP (unset, 0 or a typo: off).  They are booked as "youtube": TikTok's
+# floor stays TikTok's, and the quiet-day sum counts both.  Their failures stay theirs: a 429 closes
+# YouTube for the day and nothing else, while trouble anywhere else closes YouTube too.
 _MEDIA_DAILY_CAP_DEFAULT = 10
 _MEDIA_QUIET_DAY_MAX_DEFAULT = 8
 _MEDIA_QUIET_DAY_USAGE_LIMIT = 10
@@ -612,7 +617,24 @@ def media_task_ready() -> bool:
         return True
     if cap == 0 or usage["rate_limited"] or usage["media"] >= media_quiet_day_max():
         return False
-    return usage["chat"] + usage["extract"] + usage["media"] < _MEDIA_QUIET_DAY_USAGE_LIMIT
+    return _quiet_day(usage)
+
+
+def _quiet_day(usage: dict) -> bool:
+    spent = usage["chat"] + usage["extract"] + usage["media"] + usage["youtube"]
+    return spent < _MEDIA_QUIET_DAY_USAGE_LIMIT
+
+
+def youtube_task_ready() -> bool:
+    """True when one YouTube request may be sent now (sends nothing): a quiet day, under its cap."""
+    model = media_model()
+    if not model or time.time() < _media_backoff_until:
+        return False
+    usage = model_usage(model)
+    if usage["exhausted"] or usage["rate_limited"] or usage["youtube_closed"]:
+        return False
+    raw = os.environ.get("LINE_BOT_YOUTUBE_MEDIA_DAILY_CAP", "").strip()
+    return usage["youtube"] < (int(raw) if raw.isdigit() else 0) and _quiet_day(usage)
 
 
 def _track_if_media_model(model: str, kind: str, ok: bool = True) -> None:
@@ -675,6 +697,41 @@ def media_side_task(contents, config, *, label: str, still_wanted=lambda: True, 
     _media_bad_requests = 0
     _track_usage(response, count_request=False)
     logger.info("%s answered by media model %s media=%d", label, model, model_usage(model)["media"])
+    return response
+
+
+def _saw_video(response) -> bool:
+    """The answer was billed video tokens: without them it can only come from the URL."""
+    details = getattr(getattr(response, "usage_metadata", None), "prompt_tokens_details", None) or []
+    return any(detail.modality == "VIDEO" and (detail.token_count or 0) > 0 for detail in details)
+
+
+def youtube_side_task(contents, config, *, label: str, still_wanted=lambda: True, expired=lambda: False):
+    """``media_side_task`` for one YouTube video (``expired`` only keeps the call the same).
+
+    Its own count, and whatever fails stays here: a 400, 403 or 404 is about that video, and a
+    429 only closes YouTube.  An answer without video tokens is no answer.
+    """
+    if not youtube_task_ready():
+        return None
+    model = media_model()
+    track_model(model, "youtube")
+    if not still_wanted():
+        logger.info("%s media request not sent: out of time", label)
+        return None
+    try:
+        response = _client.models.generate_content(model=model, contents=contents, config=config)
+    except Exception as e:
+        _update_model_usage(model, _count_failed)
+        if _is_rate_limited(e):
+            _update_model_usage(model, lambda entry: entry.update(youtube_closed=True))
+        logger.warning("%s media %s failed error_type=%s code=%s", label, model, type(e).__name__, _error_code(e))
+        return None
+    _track_usage(response, count_request=False)
+    if not _saw_video(response):
+        logger.info("%s: answered without video tokens", label)
+        return None
+    logger.info("%s answered by media model %s youtube=%d", label, model, model_usage(model)["youtube"])
     return response
 
 

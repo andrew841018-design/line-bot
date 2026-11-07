@@ -88,6 +88,7 @@ os.environ["LINE_BOT_PARENT_HEALTH_GROUP_PUSH"] = ""
 os.environ["LINE_BOT_TIKTOK_MEDIA_DAILY_CAP"] = "0"
 # 2026-11-06 保底以外的額外讀取：預設關，要測的測試自己打開。
 os.environ["LINE_BOT_TIKTOK_MEDIA_QUIET_DAY_MAX"] = "0"
+os.environ["LINE_BOT_YOUTUBE_MEDIA_DAILY_CAP"] = "0"  # 2026-11-07 同上
 # Semantic restatement judge calls Gemini; unit tests enable it explicitly with a fake.
 os.environ.setdefault("LINE_BOT_RESTATEMENT_JUDGE", "0")
 # 2026-10-04: the separate-quota last Gemini tier stays off unless a test

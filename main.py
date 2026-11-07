@@ -2095,6 +2095,8 @@ _TIKTOK_PHOTO_PATH_RE = re.compile(r"^/@([\w.-]+)/photo/(\d+)/?$", re.ASCII)
 _TIKTOK_PREFETCH_BUDGET_SEC = 30.0  # from entering _prefetch_urls; the reply token lasts ~1 min
 _TIKTOK_VIDEO_JOB_MIN_SEC = 14.0  # a video job re-extracts, downloads, then needs 8 s for Gemini
 _TIKTOK_PHOTO_JOB_MIN_SEC = 8.0
+_YOUTUBE_JOB_MIN_SEC = 12.0  # Gemini fetches the video itself; tiktok_media starts nothing below 10
+_YOUTUBE_WATCH_BUDGET_SEC = 25.0  # 8 s of burst, the model and the judge still fit in the reply token
 _TIKTOK_RESOLVE_DEADLINE = 5.0
 _TIKTOK_EXTRACT_MIN_SEC = 2.0  # yt-dlp metadata/subtitles need at least this much left
 _TIKTOK_META_MIN_SEC = 10.0  # oEmbed's own safe_fetch deadline: it never runs past ours
@@ -2103,7 +2105,7 @@ _TIKTOK_METADATA_SLOTS = threading.BoundedSemaphore(2)  # abandoned yt-dlp reads
 _heavy_reads_state = threading.local()
 _REDDIT_HOSTS = ("reddit.com", "redd.it")
 _INSTAGRAM_HOSTS = ("instagram.com",)
-# Gemini video fallback 只給短影音平台（YouTube 靠 yt-dlp 字幕，不走 fallback）
+# Gemini video fallback 只給短影音平台（YouTube 另走 tiktok_media.read_youtube，不用下載）
 _GEMINI_VIDEO_HOSTS = (
     "tiktok.com", "instagram.com", "threads.net", "facebook.com", "fb.watch", "x.com", "twitter.com",
 )
@@ -2992,14 +2994,94 @@ def _youtube_unavailable_block(url: str) -> str:
     return "\n".join(lines)
 
 
-def _fetch_youtube_context(url: str) -> str:
+def _youtube_watch_length(watch_url: str) -> int | None:
+    """Seconds of a video that is plainly public and finished, else None.
+
+    2026-11-07: an unlisted family video must not go to Gemini, so whatever the watch page does
+    not state is a no.  Read here and not from yt-dlp, which is what YouTube blocks.  The log
+    has the reason, never the video.
+    """
+    try:
+        resp = _requests.get(
+            watch_url,
+            timeout=_PREFETCH_TIMEOUT,
+            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"},
+        )
+        player = _extract_youtube_player_response(resp.text) if resp.status_code == 200 else None
+        if not isinstance(player, dict):
+            logger.info("youtube watch check: no player data")
+            return None
+        details = player.get("videoDetails") or {}
+        micro = (player.get("microformat") or {}).get("playerMicroformatRenderer") or {}
+        live_now = bool((micro.get("liveBroadcastDetails") or {}).get("isLiveNow"))
+        status = (player.get("playabilityStatus") or {}).get("status")
+        length = int(details.get("lengthSeconds") or 0)
+    except Exception as e:  # a page in another shape says nothing
+        logger.info("youtube watch check failed error_type=%s", type(e).__name__)
+        return None
+    if status != "OK":
+        reason = "not_playable"
+    elif micro.get("isUnlisted") is not False or details.get("isPrivate") is not False:
+        reason = "not_public"
+    elif details.get("isLive") or details.get("isUpcoming") or details.get("isPostLiveDvr") or live_now:
+        reason = "live"
+    elif length <= 0:
+        reason = "no_length"
+    else:
+        return length
+    logger.info("youtube watch check: skip reason=%s", reason)
+    return None
+
+
+def _fetch_youtube_context(url: str, deadline: float | None = None) -> str:
+    """A YouTube link's prompt block.
+
+    2026-11-07: ``deadline`` is set on reply paths only (`_heavy_link_reads`); then a video no
+    transcript was read for goes to Gemini (`_watch_youtube`).  What it watched counts as read.
+    """
     canonical_url = _canonical_youtube_url(url)
-    return (
+    read_before = _link_read_count()
+    block = (
         _fetch_video_ytdlp(canonical_url)
         or _fetch_youtube_meta(canonical_url)
         or _fetch_youtube_html_meta(canonical_url)
         or _youtube_unavailable_block(url)
     )
+    # Without a recorder nothing would tell a transcript from none (the pending-media path).
+    recording = getattr(_link_content_state, "found", None) is not None
+    if deadline is None or not recording or _link_read_count() > read_before:
+        return block
+    analysis = _watch_youtube(canonical_url, deadline)
+    return f"{block}\n\n{analysis}" if analysis else block
+
+
+def _watch_youtube(watch_url: str, deadline: float) -> str | None:
+    """The block of what Gemini saw of a public video, noted as read; None when it saw nothing."""
+    video_id = _extract_youtube_video_id(watch_url)
+    if not video_id:
+        return None
+    # An earlier read of the same video costs nothing, even past the cap.
+    hit, result = tiktok_media.cached_youtube(video_id)
+    length = None
+    if not hit:
+        if deadline - time.monotonic() < _YOUTUBE_JOB_MIN_SEC or not gemini_client.youtube_task_ready():
+            return None
+        length = _youtube_watch_length(watch_url)
+        if length is None:
+            return None
+        result = _run_tiktok_media_job(
+            lambda d, c: tiktok_media.read_youtube(video_id, length, d, c),
+            min(deadline, time.monotonic() + _YOUTUBE_WATCH_BUDGET_SEC),
+            "youtube",
+            _YOUTUBE_JOB_MIN_SEC,
+            ready=gemini_client.youtube_task_ready,
+        )
+    if result is None or not result[1]:
+        return None
+    _note_link_content()
+    if length is None or length > tiktok_media.YOUTUBE_CLIP_SEC:
+        _note_partial_material("youtube_clip")
+    return result[0]
 
 
 # Reddit 短網址 pattern：
@@ -3505,18 +3587,18 @@ def _prefetched_material(prefetched: str, original: str) -> str:
     return prefetched[: len(prefetched) - len(original)].strip()
 
 
-def _run_tiktok_media_job(job, deadline: float, label: str, min_sec: float) -> tuple[str, bool] | None:
+def _run_tiktok_media_job(job, deadline: float, label: str, min_sec: float, ready=None) -> tuple[str, bool] | None:
     """Run one tiktok_media reader on a daemon thread, waiting until ``deadline``.
 
     One job at a time in the whole process; too little time left, a closed
     Gemini budget or a busy slot means no job.  The reader gets the deadline
     and a cancel event and starts no Gemini request after either.  It returns
     ``(block, usable)`` and never notes link content itself: the recorder is
-    thread-local, so the caller notes.
+    thread-local, so the caller notes.  ``ready`` replaces the TikTok budget check.
     """
     if (
         deadline - time.monotonic() < min_sec
-        or not gemini_client.media_task_ready()
+        or not (ready or gemini_client.media_task_ready)()
         or not _gemini_side_task_allowed("tiktok media", uses_flash=False)  # flat token reserve
     ):
         return None
@@ -3680,7 +3762,8 @@ def _prefetch_urls(text: str) -> str:
       - TikTok  → yt-dlp 字幕／metadata，失敗才 www.tiktok.com/oembed（caption + author + music）；
                   回覆路徑（_heavy_link_reads）上，沒字幕的影片與圖文貼文交給 tiktok_media.py
                   讀（2026-10-17），同一則訊息共用 _TIKTOK_PREFETCH_BUDGET_SEC
-      - YouTube → www.youtube.com/oembed（title + channel）
+      - YouTube → www.youtube.com/oembed（title + channel）；回覆路徑上沒讀到字幕的公開影片，
+                  交給 Gemini 看前 2 分鐘（_watch_youtube，2026-11）
       - Reddit  → <permalink>.json（title + selftext + top 3 comments）
       - Google Maps 短網址 → 逐跳驗證 redirect 後解析地點查詢文字
 
@@ -3723,11 +3806,11 @@ def _prefetch_urls(text: str) -> str:
                     logger.info("tiktok: ytdlp + oembed + gemini all failed, skip url=%s", url)
                 continue
             if _is_youtube_url(url):
-                # YouTube 不走 Gemini video fallback：yt-dlp/oEmbed/HTML metadata
-                # 已能提供可用 context；全失敗時也保留辨識狀態避免 LLM 只看裸網址。
+                # yt-dlp/oEmbed/HTML metadata 全失敗時也保留辨識狀態避免 LLM 只看裸網址；
+                # 回覆路徑上沒字幕的影片交給 Gemini（見 _fetch_youtube_context）。
                 # The transcript windows follow what this message and its quote talk about.
                 with reply_guards.subtitle_hint(text):
-                    blocks.append(_fetch_youtube_context(url))
+                    blocks.append(_fetch_youtube_context(url, tiktok_deadline))
                 continue
             if _host_in(host, _REDDIT_HOSTS):
                 block = _fetch_reddit_meta(url)

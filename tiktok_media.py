@@ -1,15 +1,18 @@
-"""Read TikTok videos and photo posts for link prefetch (2026-10-17).
+"""Read TikTok videos and photo posts for link prefetch (2026-10-17), and YouTube videos.
 
 A video is downloaded as a small h264 copy and a photo post's images are
 fetched; gemini_light_model reads them inline (``gemini_client.media_side_task``).
 Each reader returns ``(block, usable)``: the prompt block, and whether it holds
 real content, which main.py notes on the caller's thread (the link-content
 recorder is thread-local).  Gemini gets only public media and a fixed prompt:
-never chat text, the link, or who shared it.
+never chat text, the link as shared, or who shared it.
 
 main.py resolves share links, routes video and photo URLs, and runs a reader
 on one daemon thread within the message's time budget; readers check
 ``deadline`` and ``cancel`` themselves and start no request after either.
+
+2026-11-07: a public YouTube video no transcript was read for is not downloaded: Gemini gets the
+bare watch URL built here from the video id, and watches the start of it.
 """
 from __future__ import annotations
 
@@ -50,6 +53,8 @@ VIDEO_FORMAT = (
 VIDEO_FORMAT_SORT = ["+size", "+br"]
 VIDEO_GEMINI_MIN_SEC = 8.0  # no Gemini request starts with less time left
 PHOTO_GEMINI_MIN_SEC = 5.0
+YOUTUBE_CLIP_SEC = 120  # only the start: 2 minutes took 15 s and 12k tokens, 3 minutes over 20 s
+YOUTUBE_GEMINI_MIN_SEC = 10.0
 PHOTO_MAX_IMAGES = 6
 PHOTO_IMAGE_MAX_BYTES = 5 * 1024 * 1024
 PHOTO_MAX_PIXELS = 20_000_000
@@ -68,6 +73,10 @@ _USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
 
 VIDEO_PROMPT = (
     "用繁體中文寫出這支影片的主要內容：口白、畫面上的文字和想傳達的訊息，200 字內。"
+    "看不出內容（沒有口白、沒有文字或畫面看不清楚）就把 has_content 設成 false、summary 留空。"
+)
+YOUTUBE_PROMPT = (
+    "用繁體中文寫出這段影片的主要內容：口白、畫面上的文字和想傳達的訊息，300 字內。"
     "看不出內容（沒有口白、沒有文字或畫面看不清楚）就把 has_content 設成 false、summary 留空。"
 )
 PHOTO_PROMPT = (
@@ -245,7 +254,7 @@ def _sweep_orphans() -> None:
 # ── Gemini ───────────────────────────────────────────────────────────────────
 
 def _ask(contents: list, deadline: float, cancel: threading.Event, *, need: float,
-         low_resolution: bool, label: str) -> tuple[str, bool] | None:
+         low_resolution: bool, label: str, send=None) -> tuple[str, bool] | None:
     """``(summary, usable)`` from one media request, or None when none was answered."""
     if _out_of_time(deadline, cancel, need):
         return None
@@ -259,7 +268,7 @@ def _ask(contents: list, deadline: float, cancel: threading.Event, *, need: floa
         thinking_config=types.ThinkingConfig(thinking_budget=0),
         **extra,
     )
-    response = gemini_client.media_side_task(
+    response = (send or gemini_client.media_side_task)(
         contents,
         config,
         label=label,
@@ -277,7 +286,7 @@ def _ask(contents: list, deadline: float, cancel: threading.Event, *, need: floa
         or not isinstance(answer.get("has_content"), bool)
         or not isinstance(answer.get("summary"), str)
     ):
-        # Malformed or empty: not an answer, so nothing is cached and the next share retries.
+        # Malformed or empty: not an answer, so a TikTok read is not cached and the next share retries.
         logger.info("%s: answer was not the expected JSON", label)
         return None
     raw = reply_policy.neutralize_material(answer.get("summary"))
@@ -371,9 +380,9 @@ def _video_block(url: str, summary: str) -> str:
     )
 
 
-def cached_video(url: str, video_id: str) -> tuple[bool, tuple[str, bool] | None]:
+def cached_video(url: str, video_id: str, kind: str = "video") -> tuple[bool, tuple[str, bool] | None]:
     """``(hit, result)`` from an earlier read of this video, without any work."""
-    hit, cached = _cache_get(("video", video_id))
+    hit, cached = _cache_get((kind, video_id))
     if not hit:
         return False, None
     if cached is None or not cached[0]:
@@ -406,6 +415,39 @@ def read_video(url: str, video_url: str, video_id: str, deadline: float,
     _cache_put(key, answer)
     summary, usable = answer
     return (_video_block(url, summary), usable) if summary else None
+
+
+def _youtube_url(video_id: str) -> str:
+    return f"https://www.youtube.com/watch?v={video_id}"
+
+
+def cached_youtube(video_id: str) -> tuple[bool, tuple[str, bool] | None]:
+    return cached_video(_youtube_url(video_id), video_id, "youtube")
+
+
+def read_youtube(video_id: str, length_sec: int, deadline: float,
+                 cancel: threading.Event) -> tuple[str, bool] | None:
+    """The start of a YouTube video watched by Gemini: ``(block, usable)`` or None."""
+    hit, result = cached_youtube(video_id)
+    if hit:
+        return result
+    video = types.Part(
+        file_data=types.FileData(file_uri=_youtube_url(video_id)),
+        # A short video goes whole: an end past its real length (60.6 s, listed as 61) may be refused.
+        video_metadata=(
+            types.VideoMetadata(start_offset="0s", end_offset=f"{YOUTUBE_CLIP_SEC}s")
+            if length_sec > YOUTUBE_CLIP_SEC else None
+        ),
+    )
+    answer = _ask(
+        [video, YOUTUBE_PROMPT], deadline, cancel, need=YOUTUBE_GEMINI_MIN_SEC, low_resolution=True,
+        label="youtube video", send=gemini_client.youtube_side_task,
+    )
+    # Whatever came of it, not again for this video for a while: most requests that fail are paid for.
+    _cache_put(("youtube", video_id), answer)
+    if answer is None or not answer[0]:
+        return None
+    return _video_block(_youtube_url(video_id), answer[0]), answer[1]
 
 
 # ── photo posts ──────────────────────────────────────────────────────────────
