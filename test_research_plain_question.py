@@ -29,6 +29,7 @@ import reply_provenance
 import safe_fetch
 import source_aggregator
 import web_scraper
+from test_support_timing import cpu_seconds, forbid_other_threads
 
 QUESTION = "電動機車和油車的保養有什麼不同？"
 ANSWER = "電動機車不用換機油和火星塞，平常多注意電池、煞車和輪胎；油車要定期換機油、齒輪油和空氣濾網。"
@@ -929,13 +930,16 @@ def test_complete_search_query(text, expected):
     assert public_research.complete_search_query(text) == expected
 
 
-def test_a_long_laugh_is_checked_in_linear_time():
+def test_a_long_laugh_is_checked_in_linear_time(monkeypatch):
     # Nested repeats took seconds at 24 哈 and never finished at 60, holding the GIL.
-    started = main.time.monotonic()
-    assert public_research._COURTESY.fullmatch("哈" * 60 + "好") is None
-    assert public_research.complete_search_query("哈" * 60 + "好好笑，去日本要簽證嗎？") == ""
-    assert public_research.complete_search_query("哈" * 60 + "，去日本要簽證嗎？") == "去日本要簽證嗎"
-    assert main.time.monotonic() - started < 1.0
+    forbid_other_threads(monkeypatch)
+
+    def check(laugh):
+        assert public_research._COURTESY.fullmatch(laugh + "好") is None
+        assert public_research.complete_search_query(laugh + "好好笑，去日本要簽證嗎？") == ""
+        assert public_research.complete_search_query(laugh + "，去日本要簽證嗎？") == "去日本要簽證嗎"
+
+    assert cpu_seconds(check, "哈" * 60) < 1.0
 
 
 def test_names_are_compared_as_the_guards_compare_them():

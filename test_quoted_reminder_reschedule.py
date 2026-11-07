@@ -16,6 +16,7 @@ import memory
 import reminder_cancel
 import reminder_push
 import reminder_reschedule as rr
+from test_support_timing import cpu_seconds
 
 
 TW = rr.TAIPEI
@@ -724,12 +725,11 @@ def test_reference_to_another_groups_reminder_is_refused_without_action(replies,
      "在" + "測試路" * 39, "十" * 120],
 )
 def test_adversarial_input_is_fast(text):
-    import time
+    def check(t):
+        rr.classify_reschedule_text(t)
+        rr.parse_quoted_reminder("已新增提醒\n" + t)
 
-    start = time.perf_counter()
-    rr.classify_reschedule_text(text)
-    rr.parse_quoted_reminder("已新增提醒\n" + text)
-    assert time.perf_counter() - start < 0.5
+    assert cpu_seconds(check, text) < 0.5
 
 
 def test_long_input_is_not_claimed():
@@ -997,11 +997,9 @@ def test_push_fallback_without_sent_ids_binds_nothing(monkeypatch, fixed_now):
 # ── Round-2 reviewer additions ──────────────────────────────────────────────
 
 def test_long_run_of_at_signs_is_fast():
-    import time
-
-    start = time.perf_counter()
-    assert rr.parse_quoted_reminder("已新增提醒\n" + "@" * 1000 + " x").status == rr.QUOTED_NONE
-    assert time.perf_counter() - start < 0.5
+    text = "已新增提醒\n" + "@" * 1000 + " x"
+    assert cpu_seconds(rr.parse_quoted_reminder, text) < 0.5
+    assert rr.parse_quoted_reminder(text).status == rr.QUOTED_NONE
 
 
 def test_every_status_code_has_its_own_refusal_text():

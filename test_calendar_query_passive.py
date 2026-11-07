@@ -15,12 +15,11 @@ All sentences are synthetic.
 from __future__ import annotations
 
 import re
-import signal
-import time
 
 import pytest
 
 import main
+from test_support_timing import cpu_seconds, forbid_other_threads
 
 # 10/17 報告的三句合成句：基礎判斷式（_is_calendar_query）到現在都還把它們當成查詢，閘門才是擋住它們的。
 REPORT_SENTENCES = [
@@ -311,34 +310,10 @@ _SHAPES = {
 }
 
 
-class _Deadline(Exception):
-    pass
-
-
-def _seconds(check, text):
-    """How long ``check(text)`` takes; a hang fails after 5 s instead of stalling the run."""
-
-    def expire(*_):
-        raise _Deadline(text[:12])
-
-    previous = signal.signal(signal.SIGALRM, expire)
-    outer = signal.setitimer(signal.ITIMER_REAL, 5)
-    started = time.perf_counter()
-    try:
-        check(text)
-        return time.perf_counter() - started
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous)
-        if outer[0]:  # someone else's timer: give back what is left of it
-            left = max(outer[0] - (time.perf_counter() - started), 0.001)
-            signal.setitimer(signal.ITIMER_REAL, left, outer[1])
-
-
-# 4× the text should take about 4× the time, not 16×.  The floor is generous on purpose: on a loaded
-# machine one scheduling stall is longer than a whole fast check, so a ratio of two tiny numbers
-# flakes.  A real blow-up (a repeated alternation) is caught by the absolute ceilings and by the
-# structural no-repeated-group test below.
+# 4× the text should take about 4× the time, not 16×.  The floor is generous on purpose: a ratio of
+# two tiny numbers flakes, and CPU time does not end that (an E core runs about 2.6× slower than a
+# P core, so 4× can read as 10×).  A real blow-up (a repeated alternation) is caught by the absolute
+# ceilings and by the structural no-repeated-group test below.
 _TIMING_FLOOR_S = 0.05
 
 
@@ -346,17 +321,18 @@ _TIMING_FLOOR_S = 0.05
 def test_new_calendar_patterns_run_in_linear_time(name):
     check = _NEW_PATTERNS[name]
     for shape, make in _SHAPES.items():
-        small = min(_seconds(check, make(5000)) for _ in range(3))
-        large = min(_seconds(check, make(20000)) for _ in range(3))
+        small = min(cpu_seconds(check, make(5000)) for _ in range(3))
+        large = min(cpu_seconds(check, make(20000)) for _ in range(3))
         assert large < 1.0, (name, shape)
         assert large < 10 * max(small, _TIMING_FLOOR_S), (name, shape, small, large)
 
 
 @pytest.mark.parametrize("shape", sorted(_SHAPES))
-def test_the_gate_itself_is_cheap_on_long_text(shape):
+def test_the_gate_itself_is_cheap_on_long_text(shape, monkeypatch):
+    forbid_other_threads(monkeypatch)
     make = _SHAPES[shape]
-    small = min(_seconds(main._calendar_query_passive_ok, make(5000)) for _ in range(3))
-    large = min(_seconds(main._calendar_query_passive_ok, make(20000)) for _ in range(3))
+    small = min(cpu_seconds(main._calendar_query_passive_ok, make(5000)) for _ in range(3))
+    large = min(cpu_seconds(main._calendar_query_passive_ok, make(20000)) for _ in range(3))
     assert large < 0.5, shape
     assert large < 10 * max(small, _TIMING_FLOOR_S), (shape, small, large)
     assert main._calendar_query_passive_ok(make(20000)) is False

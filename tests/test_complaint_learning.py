@@ -22,6 +22,7 @@ import config
 import gemini_client
 import main
 import memory
+from test_support_timing import cpu_seconds, forbid_other_threads
 
 G = "G_TEST_LEARN"
 ASKER = "U_TEST_A"  # conftest 的別名檔：測試成員甲
@@ -1110,14 +1111,17 @@ def test_round_four_must_block_rules_are_rejected_under_every_category(T, rule):
     assert [category for category in cl.CATEGORIES if not _check(T, rule=rule, category=category)] == []
 
 
-def test_long_text_is_rejected_before_any_regex_runs():
+def test_long_text_is_rejected_before_any_regex_runs(monkeypatch):
     """R4-1：超過 2000 字直接 check:too_long（fail closed，只有離線重篩碰得到）；R4-7：「a.」×10000 遠低於 1 秒
     （之前要 5 秒多）。"""
     names = cl.load_names()
-    started = time.perf_counter()
-    assert cl.text_rejection("a." * 10000, names=names) == "check:too_long"
-    assert cl.text_rejection("a." * 10000, names=names, behaviour=False) == "check:too_long"
-    assert time.perf_counter() - started < 1.0
+    forbid_other_threads(monkeypatch)
+
+    def check(text):
+        assert cl.text_rejection(text, names=names) == "check:too_long"
+        assert cl.text_rejection(text, names=names, behaviour=False) == "check:too_long"
+
+    assert cpu_seconds(check, "a." * 10000) < 1.0
     assert cl.text_rejection("好" * cl.TEXT_MAX_CHARS, names=(), behaviour=False) == ""
     assert cl.text_rejection("好" * (cl.TEXT_MAX_CHARS + 1), names=(), behaviour=False) == "check:too_long"
 

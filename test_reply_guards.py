@@ -17,7 +17,6 @@ import json
 import logging
 import os
 import re
-import signal
 import sys
 import time
 from contextlib import nullcontext
@@ -45,6 +44,7 @@ import reply_provenance  # noqa: E402
 import stock_quote  # noqa: E402
 import video_reply  # noqa: E402
 from quote_context import original_block, with_current_reply  # noqa: E402
+from test_support_timing import cpu_seconds, forbid_other_threads  # noqa: E402
 
 NAMES = ("小明", "阿華", "小美")  # synthetic family names
 _REAL_ALIASES = line_mentions.configured_family_aliases  # before the fixture below replaces it
@@ -1849,29 +1849,6 @@ def test_one_giant_cue_stays_inside_the_budget():
 
 # ═════════════════ time: nothing here may stall the bot (2026-10-05, H5) ═════════
 
-class _Deadline(Exception):
-    pass
-
-
-def _seconds(check, *args):
-    """How long ``check(*args)`` takes; a hang fails after 5 s instead of stalling the run."""
-    def expire(*_):
-        raise _Deadline(str(args[0])[:12])
-
-    previous = signal.signal(signal.SIGALRM, expire)
-    outer = signal.setitimer(signal.ITIMER_REAL, 5)
-    started = time.perf_counter()
-    try:
-        check(*args)
-        return time.perf_counter() - started
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous)
-        if outer[0]:
-            left = max(outer[0] - (time.perf_counter() - started), 0.001)
-            signal.setitimer(signal.ITIMER_REAL, left, outer[1])
-
-
 _SLOW_SHAPES = {
     "digits": lambda n: "1" * n + "公升",
     "digits and commas": lambda n: "1," * (n // 2) + "公升",
@@ -1967,15 +1944,16 @@ CHECKS = {
 
 
 @pytest.mark.parametrize("check", sorted(CHECKS))
-def test_checks_run_in_linear_time(check):
+def test_checks_run_in_linear_time(check, monkeypatch):
     # every shape against every check, in one test per check (a test of its own per pair
     # would pay the suite's per-test setup 500 times); the failing shapes are named
+    forbid_other_threads(monkeypatch)
     run = CHECKS[check]
     slow = []
     for shape, make in sorted(_SLOW_SHAPES.items()):
-        small = min(_seconds(run, make(5000)) for _ in range(3))
-        large = min(_seconds(run, make(20000)) for _ in range(3))
-        # a hang stops at 5 s; 4× the text takes about 4× the time, not 16×
+        small = min(cpu_seconds(run, make(5000)) for _ in range(3))
+        large = min(cpu_seconds(run, make(20000)) for _ in range(3))
+        # a hang stops at the deadline; 4× the text takes about 4× the time, not 16×
         if not (large < 1.0 and large < 10 * max(small, 0.01)):
             slow.append((shape, round(small * 1000, 1), round(large * 1000, 1)))
     assert not slow, slow
@@ -1986,8 +1964,8 @@ def test_a_long_transcript_is_read_in_linear_time():
         cues = [(float(i), f"第{i}句我們來談談巴西的咖啡與運輸產業") for i in range(n)]
         return reply_guards.select_subtitle_windows(cues, "巴西的咖啡產業", float(n))
 
-    small = min(_seconds(run, 5000) for _ in range(3))
-    large = min(_seconds(run, 20000) for _ in range(3))
+    small = min(cpu_seconds(run, 5000) for _ in range(3))
+    large = min(cpu_seconds(run, 20000) for _ in range(3))
     assert large < 2.0
     assert large < 10 * max(small, 0.02)
 
@@ -1996,16 +1974,16 @@ def test_the_vtt_parser_is_linear():
     def run(n):
         return reply_guards.parse_vtt_cues("00:00:01.000 --> 00:00:02.000\n" + "<" * n + "\n\n" * 3)
 
-    assert _seconds(run, 20000) < 1.0
-    assert _seconds(lambda n: reply_guards.parse_vtt_cues("x\n" * n), 20000) < 1.0
-    assert _seconds(lambda n: reply_guards.parse_vtt_cues(("00:00:01.000 --> 00:00:02.000\n字\n\n") * (n // 30)), 20000) < 1.0
+    assert cpu_seconds(run, 20000) < 1.0
+    assert cpu_seconds(lambda n: reply_guards.parse_vtt_cues("x\n" * n), 20000) < 1.0
+    assert cpu_seconds(lambda n: reply_guards.parse_vtt_cues(("00:00:01.000 --> 00:00:02.000\n字\n\n") * (n // 30)), 20000) < 1.0
 
 
 def test_regulation_backing_never_reads_more_than_the_cap():
     huge = "免稅額度1.5公升。" * 100_000      # 900k characters
-    assert _seconds(lambda t: reply_guards.regulation_backing(t), huge) < 1.0
+    assert cpu_seconds(lambda t: reply_guards.regulation_backing(t), huge) < 1.0
     assert sum(len(t) for t in reply_guards.regulation_backing(huge, huge)) <= 2 * reply_guards.BACKING_MAX_CHARS
-    assert _seconds(
+    assert cpu_seconds(
         lambda t: reply_guards.strip_unbacked_regulatory_numbers("免稅額度是 5 公升。", reply_guards.regulation_backing(t, t, t, t)),
         huge,
     ) < 1.0

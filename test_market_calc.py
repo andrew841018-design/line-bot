@@ -22,6 +22,7 @@ import pytest
 
 import market_calc as mc
 from market_calc import ET, TPE, UTC
+from test_support_timing import cpu_seconds
 
 HERE = Path(__file__).resolve().parent
 D = date(2026, 10, 16)  # 週五、10 月的第三個週五（月選結算日）
@@ -1624,12 +1625,8 @@ def test_wording_of_the_13f_title_and_the_option_glossary():
 
 def test_clean_external_is_fast_on_huge_fields():
     """2026-10-18 安全審查 I1：幾十萬字的欄位不能讓 collect 卡住（以前 4 萬字就要 7 秒）。"""
-    import time as _time
-
     for huge in ("a" * 200_000, "a." * 100_000, "a@" * 100_000, "x/" * 100_000, "長" * 200_000):
-        start = _time.perf_counter()
-        mc.clean_external(huge, 100)
-        assert _time.perf_counter() - start < 0.5, huge[:4]
+        assert cpu_seconds(lambda text: mc.clean_external(text, 100), huge) < 0.5, huge[:4]
     assert mc.clean_external("標題 " + "字" * 50_000, 40) == "標題 " + "字" * 34 + "..."
     assert mc.clean_external("看 https://x.example/a " + "字" * 50_000, 40) is None  # 開頭的網址照樣擋
 

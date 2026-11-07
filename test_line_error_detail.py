@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -20,6 +19,7 @@ from linebot.v3.messaging.exceptions import ApiException
 
 import line_errors
 import main
+from test_support_timing import cpu_seconds
 
 TOKEN = "REPLYTOKEN-SYNTHETIC-0123456789abcdef"
 USER_ID = "U" + "a1" * 16
@@ -154,11 +154,13 @@ def test_hostile_input_stays_linear():
         "hex then junk": ("U" + "0" * 32 + "g") * 2500,
         "controls": "\x00\n" * 50000,
     }
-    for name, shape in shapes.items():
-        started = time.perf_counter()
+
+    def read(shape):
         line_errors.error_detail(api_error(400, {"message": shape, "details": [{"property": shape}] * 20}))
         line_errors.error_detail(api_error(400, shape))
-        assert time.perf_counter() - started < 1.0, name
+
+    for name, shape in shapes.items():
+        assert cpu_seconds(read, shape) < 1.0, name
 
 
 def test_the_bot_wrapper_uses_the_same_function():

@@ -216,11 +216,10 @@ def test_printed_placeholder_needs_visible_text():
     " " * 5000 + "x", "\n" * 5000 + "a", "（ " * 2500 + "輸出", "今天天氣很好，" * 1000,
 ])
 def test_long_replies_are_checked_in_linear_time(text):
-    import time
+    from test_support_timing import cpu_seconds
 
-    started = time.perf_counter()
+    assert cpu_seconds(reply_policy.is_empty_marker, text) < 1.0  # the previous regex backtracked for minutes
     assert not reply_policy.is_empty_marker(text)
-    assert time.perf_counter() - started < 1.0  # the previous regex backtracked for minutes
 
 
 @pytest.mark.parametrize("text", PLACEHOLDERS)

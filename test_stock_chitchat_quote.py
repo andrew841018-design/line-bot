@@ -16,8 +16,7 @@ from __future__ import annotations
 
 import json
 import re
-import signal
-import time
+import socket
 from unittest.mock import patch
 
 import pytest
@@ -25,6 +24,7 @@ import pytest
 import line_mentions
 import main
 import stock_quote
+from test_support_timing import cpu_seconds, forbid_other_threads
 
 # 10/24 診斷 agent 的閒聊句，再加上審查（GP1 #11、GP2）列的探測句。
 SMALL_TALK = [
@@ -519,43 +519,32 @@ _SHAPES = {
 }
 
 
-class _Deadline(Exception):
-    pass
-
-
-def _seconds(check, text):
-    """How long ``check(text)`` takes; a hang fails after 5 s instead of stalling the run."""
-
-    def expire(*_):
-        raise _Deadline(text[:12])
-
-    previous = signal.signal(signal.SIGALRM, expire)
-    outer = signal.setitimer(signal.ITIMER_REAL, 5)
-    started = time.perf_counter()
-    try:
-        check(text)
-        return time.perf_counter() - started
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous)
-        if outer[0]:  # someone else's timer: give back what is left of it
-            left = max(outer[0] - (time.perf_counter() - started), 0.001)
-            signal.setitimer(signal.ITIMER_REAL, left, outer[1])
-
-
-# 4× the text should take about 4× the time, not 16×.  The floor is generous on purpose: on a loaded
-# machine one scheduling stall is longer than a whole fast check, so a ratio of two tiny numbers
-# flakes.  A real blow-up (a repeated alternation) is caught by the 1 s ceiling and by the
-# structural no-repeated-group tests below.
+# 4× the text should take about 4× the time, not 16×.  The floor is generous on purpose: a ratio of
+# two tiny numbers flakes, and CPU time does not end that (an E core runs about 2.6× slower than a
+# P core, so 4× can read as 10×).  A real blow-up (a repeated alternation) is caught by the 1 s
+# ceiling and by the structural no-repeated-group tests below.
 _TIMING_FLOOR_S = 0.05
 
 
+def _no_fetch(*_args, **_kwargs):
+    pytest.fail("a lookup check went to the network: thread_time would not see the wait")
+
+
 @pytest.mark.parametrize("name", sorted(_PATTERNS))
-def test_new_lookup_checks_run_in_linear_time(name):
+def test_new_lookup_checks_run_in_linear_time(name, monkeypatch):
+    # The name files are read on every call on purpose: the wait for them does not count here, the
+    # CPU does, and neither depends on the text.  No check may fetch anything or leave this thread.
+    # The fetch paths catch Exception, so _no_fetch uses pytest.fail; yfinance does not go through
+    # Python sockets, so it is patched by name.
+    forbid_other_threads(monkeypatch)
+    monkeypatch.setattr(stock_quote.yf, "Search", _no_fetch)
+    monkeypatch.setattr(stock_quote.yf, "Ticker", _no_fetch)
+    monkeypatch.setattr(socket.socket, "connect", _no_fetch)
+    monkeypatch.setattr(socket, "getaddrinfo", _no_fetch)
     check = _PATTERNS[name]
     for shape, make in _SHAPES.items():
-        small = min(_seconds(check, make(5000)) for _ in range(3))
-        large = min(_seconds(check, make(20000)) for _ in range(3))
+        small = min(cpu_seconds(check, make(5000)) for _ in range(3))
+        large = min(cpu_seconds(check, make(20000)) for _ in range(3))
         assert large < 1.0, (name, shape)
         assert large < 10 * max(small, _TIMING_FLOOR_S), (name, shape, small, large)
 
