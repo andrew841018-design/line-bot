@@ -5049,6 +5049,8 @@ def _infer_medical_actor(text: str, user_id: str | None = None) -> str | None:
         normalized = _normalize_family_actor(term)
         if normalized in companions:
             continue
+        if term == "全家" and not line_mentions.names_the_family(text):
+            continue  # 「去全家拿藥」, 「全家診所回診」: the shop or the clinic, not the family
         if term in text:
             return normalized
     if alias:
@@ -12650,10 +12652,7 @@ def _text_message_with_mentions(
     try:
         if explicit_only:
             aliases = []
-            for candidate in re.findall(
-                r"@([A-Za-z0-9_\u4e00-\u9fff]{1,30})",
-                reply_text.replace("＠", "@"),
-            ):
+            for candidate in line_mentions.mention_names(reply_text):
                 clean = str(candidate or "").strip().lstrip("@")
                 if clean and clean not in aliases:
                     aliases.append(clean)

@@ -128,22 +128,33 @@ def _raw_text_reminder_aliases(text: str) -> list[str]:
     """Only explicit raw mentions should add reminder mention targets.
 
     A family member name in the source text can be the event subject ("爸爸體檢"),
-    not necessarily someone to tag. Keep explicit @mentions and broad family
-    mentions such as "全家".
+    not necessarily someone to tag, and "全部買完" or "大家好" is no call to the
+    family: only an @ counts here.  An event for the whole family says so in its
+    participants or its title (_title_family_aliases).
     """
     if not text:
         return []
-    from line_mentions import aliases_mentioned_in_text
+    explicit_mentions = " ".join(f"@{name}" for name in line_mentions.mention_names(text))
+    return [
+        *line_mentions.aliases_mentioned_in_text(explicit_mentions),
+        *line_mentions.whole_family_mentions(text),
+    ]
 
-    explicit_mentions = " ".join(
-        m.group(0).replace("＠", "@")
-        for m in re.finditer(r"[@＠][A-Za-z0-9_\u4e00-\u9fff]{1,30}", text)
+
+def _title_family_aliases(event: Mapping[str, object]) -> list[str]:
+    """「全家聚餐」 is the whole family; 「去全家買牛奶」 and 「全家便利商店」 are the shop."""
+    return ["全家"] if line_mentions.names_the_family(str(event.get("title") or "")) else []
+
+
+def _mirror_mention_aliases(event: Mapping[str, object], raw_text: str) -> list[str]:
+    """Who an event's reminder tags: its people, an @ in its message, the whole family when its title
+    says so.  A badminton booking that has players tags them only."""
+    participant_aliases = _event_participants(event)
+    if _is_badminton_event(event) and participant_aliases:
+        return participant_aliases
+    return _merge_mention_aliases(
+        participant_aliases, _raw_text_reminder_aliases(raw_text), _title_family_aliases(event)
     )
-    broad_mentions = " ".join(
-        term for term in ("全家", "大家", "所有人", "全部", "全員", "@all", "everyone")
-        if term in text
-    )
-    return aliases_mentioned_in_text(f"{explicit_mentions} {broad_mentions}".strip())
 
 
 def _clean_participant_name(name: str) -> str:
@@ -345,12 +356,7 @@ def _upsert_event_reminder(
         except Exception:
             pass
 
-    participant_aliases = _event_participants(event)
-    raw_aliases = _raw_text_reminder_aliases(raw_text)
-    if _is_badminton_event(event) and participant_aliases:
-        mention_aliases = participant_aliases
-    else:
-        mention_aliases = _merge_mention_aliases(participant_aliases, raw_aliases)
+    mention_aliases = _mirror_mention_aliases(event, raw_text)
 
     _ensure_memory_db_path()
     try:
@@ -821,12 +827,7 @@ def _insert_new_event_reminder_conn(
             reminder_user_id = str(raw[0] or "").strip()
             raw_text = str(raw[1] or "")
 
-    participant_aliases = _event_participants(event)
-    raw_aliases = _raw_text_reminder_aliases(raw_text)
-    if _is_badminton_event(event) and participant_aliases:
-        mention_aliases = participant_aliases
-    else:
-        mention_aliases = _merge_mention_aliases(participant_aliases, raw_aliases)
+    mention_aliases = _mirror_mention_aliases(event, raw_text)
     cursor = c.execute(
         "INSERT INTO reminders("
         "group_id, user_id, action, remind_at, created_at, status, "
@@ -1119,10 +1120,7 @@ def repair_legacy_reminders_as_calendar_events(
                         if raw is not None:
                             raw_user_id = str(raw[0] or "").strip()
                             raw_text = str(raw[1] or "")
-                    expected_aliases = _merge_mention_aliases(
-                        _event_participants(spec),
-                        _raw_text_reminder_aliases(raw_text),
-                    )
+                    expected_aliases = _mirror_mention_aliases(spec, raw_text)
                     if (
                         str(mirror["action"] or "") != expected_action
                         or str(mirror["source_text"] or "") != expected_source
@@ -1680,7 +1678,7 @@ def _resolve_corrected_date(
 
 def _corrected_title_participants(title: str | None) -> list[str]:
     text = str(title or "")
-    if "全家" in text:
+    if line_mentions.names_the_family(text):
         return ["全家"]
     aliases = (
         ("媽媽", "媽媽"),

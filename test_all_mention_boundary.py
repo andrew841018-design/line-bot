@@ -3,8 +3,8 @@
 `"@all" in reply_text` also took 「@allen」, an address at a domain that opens with "all" and a TikTok
 link with such a handle, and, since the CLI path turns 「＠」 back into "@" (e822184), the same words
 in full width.
-This is the reply text only: a family message that makes a reminder is the next task
-(the TODO in line_mentions.aliases_mentioned_in_text).  All text is made up.
+This is the reply text only: a family message that makes a reminder is test_reminder_all_mention.py.
+All text is made up.
 
 These tests ask what counts as an @all, so they build with `allow_all_mention=True`.  Who may ping the
 group at all: test_model_all_mention.py.

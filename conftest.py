@@ -262,7 +262,7 @@ def reset_main_globals(monkeypatch):
     # resolve in the real file). A fixed test alias map keeps real family
     # names unlisted while giving tests a resolvable alias so helpers that
     # key off "有 user alias 設定" (e.g. aliases_mentioned_in_text) still work
-    # for "全家" / "測試成員甲"; tests that need their own aliases setenv
+    # for "測試成員甲"; tests that need their own aliases setenv
     # their own path to override.
     import json as _json
     tmp_alias_dir = Path(tempfile.mkdtemp())
