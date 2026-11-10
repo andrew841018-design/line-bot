@@ -27,6 +27,7 @@ import reply_provenance
 import safe_fetch
 import source_aggregator
 import web_scraper
+from test_support_timing import cpu_seconds, forbid_other_threads
 
 ROOT = Path(__file__).resolve().parent
 NEWS_URL = "https://news.google.com/rss/articles/CBMiSYNTHETIC_id-1"
@@ -381,11 +382,13 @@ def test_the_rest_of_a_dated_claim_stays_home():
 
 
 @pytest.mark.parametrize("word", ["峰會", "國宴", "2026年", "昨天", "美國", "的"])
-def test_a_run_of_lead_words_stays_fast(word):
-    started = time.monotonic()
-    public_research.requires_current_research(word * 30 + "總統宣布停火")
-    public_research.requires_current_research(word * 30 + "張三總統宣布停火")
-    assert time.monotonic() - started < 1
+def test_a_run_of_lead_words_stays_fast(word, monkeypatch):
+    def check(run):
+        public_research.requires_current_research(run + "總統宣布停火")
+        public_research.requires_current_research(run + "張三總統宣布停火")
+
+    forbid_other_threads(monkeypatch)
+    assert cpu_seconds(check, word * 30) < 1
 
 
 @pytest.mark.parametrize("text", ["昨天大嫂去迎接總統", "昨天同學說總統宣布停火", "昨天的便當很好吃"])
@@ -827,10 +830,11 @@ def test_the_guards_own_lines_are_not_it(monkeypatch, line):
 
 
 def test_the_scan_stays_linear_on_degenerate_output():
-    started = time.monotonic()
-    reply_policy.strip_missing_data("我" * 20000 + "沒" * 20000)
-    reply_policy.strip_missing_data("沒有附" * 8000)
-    assert time.monotonic() - started < 2
+    def check(_):
+        reply_policy.strip_missing_data("我" * 20000 + "沒" * 20000)
+        reply_policy.strip_missing_data("沒有附" * 8000)
+
+    assert cpu_seconds(check, "degenerate output") < 2
 
 
 def test_the_reply_pipeline_applies_it(monkeypatch):
