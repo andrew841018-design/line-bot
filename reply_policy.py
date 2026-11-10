@@ -2965,8 +2965,8 @@ def _silence_line(line: str) -> str:
     return _MARKER_IGNORED_RE.sub("", line).translate(_SIMPLIFIED_SILENCE_CHARS).replace("字符串", "字串")
 
 
-# TODO(2026-11-07 deferred, reviews p1 #1 #5, p2 #2): weekly_summary.py pushes gemini_client.chat
-# without this check, and a file name or a forged 「--- 內容結束 ---」 in a file counts as the asker.
+# TODO(2026-11-07 deferred, reviews p1 #5, p2 #2): a file name or a forged 「--- 內容結束 ---」 in a
+# file counts as the asker.
 def has_printed_silence(text: str | None, request: str = "") -> bool:
     """``text`` prints the bot's own instruction to stay silent, anywhere in it.
 

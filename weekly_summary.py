@@ -29,6 +29,7 @@ import gemini_client  # noqa: E402
 from line_push_client import LinePushError, line_access_token, push_text  # noqa: E402
 import memory  # noqa: E402
 import output_validator  # noqa: E402
+import reply_policy  # noqa: E402
 
 GROUP_ID = os.environ.get("LINE_ALLOWED_GROUP_ID") or os.environ.get(
     "ALLOWED_GROUP_ID", ""
@@ -269,7 +270,13 @@ def main() -> int:
     summary_ok, summary = _wait_worker("summary", _WORKER_DEADLINE_S)
     if summary_ok and summary:
         try:
-            if _push(f"{_SUMMARY_PREFIX}\n\n{summary}"):
+            # 模型把不回指令印出來＝選擇不回（Andrew 2026-11-06：「我寧可你不回」）：不推，也不算推播失敗。
+            # 第二個判斷不能省：重問的回覆不跑 is_empty_marker，_push 加了前綴後 validator 又認不出整則
+            # TODO(2026-11-07 deferred, reviews pre-3 #1, pre-4 #1): 正文前後多一行「（不回覆）」「（無）」照推，
+            # 和互動回覆一樣（test_empty_output_marker.py 的 ORDINARY）。有案例時改 is_empty_marker，不要在這裡加判斷
+            if reply_policy.has_printed_silence(summary) or reply_policy.is_printed_placeholder(summary):
+                print(f"週摘要不推：模型印出不回指令（{len(summary)} 字）")
+            elif _push(f"{_SUMMARY_PREFIX}\n\n{summary}"):
                 print(f"週摘要已推播 ({len(bot_replies)} 則回應，取最近 {sampled_count} 則)")
             else:
                 push_failed = True
