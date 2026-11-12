@@ -3707,12 +3707,13 @@ def inst_stale_after(kind: str, data_date: Any, calendars: Any) -> float:
 # 就緒時間（Phase 6 I-5）：每個來源當地幾點之後，那個交易日的資料才算「該有了」。publish 用它判斷落後（behind），不再用
 # 盤勢的換日（美股收盤＋30 分鐘、台股 14:30）：那會讓每天下午到來源公布之間都印成落後。tw.flows、tw.t86 任務自己的換日時間
 # 要和這張表一致；us.flows 的任務在美東收盤＋30 分鐘就換日，只要就緒時間到時已換到當天（整合輪的漂移測試核對）。
-# us.flows 的 23:30（2026-11-12 照 staging 量測校準，複審 R2-1-1）：iShares 最晚在美東 21:30 才換上當天的資料（11/6 在
-# 20:00–21:30 之間，11/9–11/11 在 20:00 前），任務沒抓到時 2 小時後才重試（market_pipeline_inst.NOT_YET_RETRY_S），所以
-# 就緒時間＝最晚的換日＋一次重試間隔：抓到之前的那一輪一定比它早，平常不會每天多一段「最近一筆」。SSGA（SPY）隔天美東
-# 01:00–02:00 才換，但 SPY 不上卡、平常 lag 最多 1，不另設。
+# us.flows 的 23:45（2026-11-12 照 staging 量測校準，複審 R2-1-1；校準審查 I-1）：iShares 最晚在美東 21:30 才換上當天的資料
+# （11/6 在 20:00–21:30 之間，11/9–11/11 在 20:00 前）；任務沒抓到時 2 小時後才重試（market_pipeline_inst.NOT_YET_RETRY_S）；
+# publish 在 collect 跑完才開始，最多晚 jobs/market_snapshot.COLLECT_TIMEOUT_S（240 秒）。所以就緒時間至少要 21:30＋2 小時＋
+# 240 秒，約 23:34：抓到之前的那一輪 collect 早於 23:30、publish 早於約 23:34，平常不會每天多一段「最近一筆」；取 23:45
+# 多留一輪。SSGA（SPY）隔天美東 01:00–02:00 才換，但 SPY 不上卡、平常 lag 最多 1，不另設。
 INST_READY: dict[str, tuple[str, time]] = {
-    "us.flows": ("nyse", time(23, 30)),  # 美東
+    "us.flows": ("nyse", time(23, 45)),  # 美東
     "tw.flows": ("twse", time(17, 0)),  # 台北：元大申購買回清單
     "tw.t86": ("twse", time(16, 30)),  # 台北：證交所 T86
 }

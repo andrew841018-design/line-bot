@@ -72,7 +72,9 @@ HOST_RULES: dict[str, HostRule] = {
     # （market_pipeline_taco）；主機另外留 2 次餘裕，間隔 10 秒
     "ocmacro.com": HostRule(10.0, 8),
     # 2026-10-31 機構動向第一期（market_pipeline_inst）：iShares SOXX 產品頁、元大 0050 申購買回清單，每個期間最多 6 次「還沒」
-    # ＋失敗重試；比照 ocmacro.com 間隔 10 秒、每台北日 8 次
+    # ＋失敗重試（每期最多失敗 us.flows 3 次、tw.flows 5 次，market_pipeline_inst.MAX_FAILS）。元大只有錯誤時每台北日最多 5 次；
+    # 「還沒」和失敗交錯時一期可能超過 8 次，由這裡的 8 次切掉（帳本拒絕＝budget，不算失敗，台北換日後同一期接著試）。
+    # 比照 ocmacro.com 間隔 10 秒、每台北日 8 次
     "www.ishares.com": HostRule(10.0, 8),
     "www.yuantaetfs.com": HostRule(10.0, 8),
 }
