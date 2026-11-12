@@ -212,7 +212,7 @@ def test_reply_only_guard_uses_the_prefix_with_colon():
 
 def test_help_explains_the_market_commands_without_mentions():
     help_text = main._HELP_TEXT
-    for needed in ("/盤勢", "🧭 市場盤勢", "/盤勢 QQQ", "/盤勢 QQQ 圖", "/盤勢 13F QQQ", "不是買賣建議"):
+    for needed in ("/盤勢", "🧭 市場盤勢", "/盤勢 QQQ", "/盤勢 QQQ 圖", "/盤勢 13F QQQ", "不是買賣建議", "季節性、選舉、通膨"):
         assert needed in help_text, needed
     assert "@" not in help_text
 

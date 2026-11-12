@@ -23517,7 +23517,8 @@ _HELP_TEXT = (
     "                          可加「12個月」「KO95%」「KI60%」\n"
     "                          引用理專那則訊息再打 /FCN：先回「我讀到的條件」，點按鈕才評估\n"
     "  /盤勢                   美股、台股盤勢：點選單「🧭 市場盤勢」或打 /盤勢，回一組摘要卡，往左滑看下一張\n"
-    "  /盤勢 QQQ               單檔細節（VOO、QQQ、SOXX、0050）；也可打 期權、新聞、季節性、選舉\n"
+    # TODO(deferred, /help review 11/12): "也可打 X" means "/盤勢 X"; typing 通膨 alone still goes to ordinary chat.
+    "  /盤勢 QQQ               單檔細節（VOO、QQQ、SOXX、0050）；也可打 期權、新聞、季節性、選舉、通膨\n"
     "  /盤勢 QQQ 圖            期權未平倉與 gamma（假設部位）的圖（SPY、SOXX、台指 也可以）\n"
     "  /盤勢 13F QQQ           前十大成分股的機構持股變化（VOO、SOXX 也可以）\n"
     "                          都是程式用公開資料算的，只描述狀態，不是買賣建議\n"
