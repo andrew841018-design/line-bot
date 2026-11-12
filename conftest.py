@@ -639,3 +639,20 @@ def isolate_stock_picks_review(monkeypatch, tmp_path_factory):
     (root / "maintenance").mkdir()
     monkeypatch.setenv("STOCK_PICKS_REVIEW_BOT_DIR", str(root / "bot"))
     monkeypatch.setenv("STOCK_PICKS_REVIEW_MAINTENANCE_DIR", str(root / "maintenance"))
+
+
+# 2026-11-12 自動學習糾正週報（jobs/learned_rules_weekly.py）：outbox 所在的維護目錄、DB、狀態目錄、DB 私人副本的
+# 上層目錄一律指到不存在的隔離路徑，而且不建目錄（審查 GP2 G1：每個測試多一個 numbered mktemp 要掃整個 basetemp）。
+# job 的路徑都在呼叫時才從這四個環境變數算；路徑不存在時它不抄 DB、不放檔（outbox 所在目錄不在就 exit 2，DB 不在就
+# db_missing），所以任何測試跑到 job 都不會讀正式 DB，也不會把週報放進正式 outbox（relay 會立刻 DM Andrew）。
+# 要測的測試（tests/test_learned_rules_weekly.py）自己在 tmp_path 建目錄、用 monkeypatch 指過去。
+_LEARNED_RULES_WEEKLY_ABSENT = Path(tempfile.gettempdir()) / (
+    f"line_bot_pytest_quarantine_{os.getpid()}_learned_rules_weekly_absent"
+)
+for _env_name, _leaf in (
+    ("LEARNED_RULES_WEEKLY_MAINTENANCE_DIR", "maintenance"),
+    ("LEARNED_RULES_WEEKLY_DB", "line_bot.db"),
+    ("LEARNED_RULES_WEEKLY_STATE_DIR", "state"),
+    ("LEARNED_RULES_WEEKLY_COPY_PARENT", "tmp"),
+):
+    os.environ[_env_name] = str(_LEARNED_RULES_WEEKLY_ABSENT / _leaf)
