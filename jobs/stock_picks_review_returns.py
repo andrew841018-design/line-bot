@@ -558,6 +558,7 @@ class Entry:
     skip: Optional[str]
     p_status: str  # ok｜pool_missing｜pending｜version_missing｜not_compared（SEEN_V1：不和股票池比）
     p: Optional[float]
+    th: Optional[str] = None  # 出場日 T_h（帳上的值）；只有家人看到的台股 AI／美股帳列有，C2 的段靠它判斷窗口重疊
 
 
 def family_versions(conn, family: str, where: str) -> dict[str, list[PoolVersion]]:
@@ -597,7 +598,8 @@ def version_returns(conn, family: str, version: PoolVersion, with_returns: bool)
     return {dv: frozenset(codes) for dv, codes in members.items()}, returns
 
 
-# TODO（審查 C1 r2#6 後半，延後到 B2）：B2 動 perf 時給 read_ledger_rows 加 path 參數，這裡就不用 samefile 閘門。
+# TODO（審查 C1 r2#6 後半，延後）：下次動 stock_picks_perf 時給 read_ledger_rows 加 path 參數，這裡就不用 samefile
+#   閘門。原本排在 B2，但 B2 沒有動 perf。
 def _same_dir(a: Path, b: Path) -> bool:
     try:
         return os.path.samefile(a, b)
@@ -646,13 +648,13 @@ def history_rows(perf, sp, state_dir: Path, today: str) -> dict[str, dict]:
     return {"tw": tw, "us": us}
 
 
-# TODO（審查 C1 r4#1 後半，延後到 B2）：B2 下次改 stock_picks_perf 時，在那裡抽出公開的 chosen_rows(rows, lines)，
+# TODO（審查 C1 r4#1 後半，延後）：下次改 stock_picks_perf 時，在那裡抽出公開的 chosen_rows(rows, lines)，
 #   perf.aggregate 和這裡都用它；在那之前靠對帳測試釘住兩邊挑到同樣的列。
 def chosen_ledger_rows(perf, rows: Sequence[dict], history: dict) -> tuple[list[dict], dict, dict]:
     """(算進去的帳列, 釘住的 {(m, t): (rule, rev)}, 那一行 {(m, t): Record 或 None})：和 perf.aggregate 挑列的規則一樣
     （目前版本、HORIZONS、釘住的 (rule, rev)、紀錄檔找得到那一行就只算代號還在裡面的）。skip 的列也在：次數只算
-    skip 是 None 的，自我檢查兩種都比。目前版本＝SUPPORTED_LEDGER_VERSION（report_lines 只在它等於
-    perf.LEDGER_VERSION 時才呼叫，和 aggregate 比的是同一個數）。"""
+    skip 是 None 的，自我檢查兩種都比。目前版本＝SUPPORTED_LEDGER_VERSION（report_lines 和 C2a 的
+    cooldown.report_lines 只在它等於 perf.LEDGER_VERSION 時才呼叫，和 aggregate 比的是同一個數）。"""
     pins = perf.pins_of(rows)
     lines = {key: perf.pinned_line(history.get(key[0], {}).get(key[1], []), pin) for key, pin in pins.items()}
     chosen = []
@@ -761,7 +763,7 @@ def build_performance(perf, conn, versions: dict[str, dict], ledger: Sequence[di
             elif (row["skip"] is None) != (mine[2] is None):
                 check["oneside"] += 1
         entries[family].append(Entry(family, row["m"], row["t"], row["code"], row["h"], row["r"], row["b"], row["skip"],
-                                     p_status, p))
+                                     p_status, p, row.get("th")))
 
     # 對照組（舊五條件）只用背景日：家人那天沒看到舊五條件（帳裡那個 t 沒有釘住 v1）。帳讀不到（pins 是空的，週報另有
     # 一行寫帳讀不到），或成員報酬比 perf 帳早凍結的那幾十分鐘（帳還沒釘住那一天）時，家人看過的 v1 日也會暫時算進來；
@@ -819,6 +821,11 @@ def stats_of(entries: Iterable[Entry], h: int) -> Stats:
 HEAD = "【推薦成績】"  # 算法（隔天收盤進場、和股票池等權平均比）寫在週報最後一行（weekly.METHOD），這裡不重複
 CONTROL_TAIL = "：背景照算的入選股"  # 對照組那一段的標題（接在族名後面）
 _LEDGER_WORDS = {"elsewhere": "成績帳不在這個 bot 目錄（測試或 staging）"}
+
+
+def ledger_reason(ledger_state: str) -> str:
+    """帳的狀態不是 ok 時，週報上的原因（【推薦成績】和 C2a 的【冷凍條件試算】同一套說法）。"""
+    return _LEDGER_WORDS.get(ledger_state) or f"成績帳讀不到（{ledger_state.split(':', 1)[-1]}）"
 
 
 def _permille(ratio: float) -> int:
@@ -897,8 +904,7 @@ def format_lines(report: Performance, ledger_state: str, horizons: Sequence[int]
         notes.append(f"{missing} 筆的股票池有值的成員不到 8 成（不比）")
     lines += [f"・{text}" for text in notes]
     if ledger_state != "ok":
-        reason = _LEDGER_WORDS.get(ledger_state) or f"成績帳讀不到（{ledger_state.split(':', 1)[-1]}）"
-        lines.append(f"・{reason}：家人看到的推薦這週沒有算進來")
+        lines.append(f"・{ledger_reason(ledger_state)}：家人看到的推薦這週沒有算進來")
     check = report.check
     if check["compared"]:
         line = f"・自我檢查：成績帳和股票池算法比對 {check['compared']} 筆，差超過 0.1% 的 {check['diff']} 筆"
@@ -909,9 +915,9 @@ def format_lines(report: Performance, ledger_state: str, horizons: Sequence[int]
 
 
 def report_data(ctx, conn, calendars: dict[str, Sequence[str]]) -> tuple[Performance, str]:
-    """週報推薦成績的資料：(Performance, 帳的狀態)。report_lines 與對帳測試共用這一條組裝。呼叫端要先確認 perf 帳的
-    版本是 SUPPORTED_LEDGER_VERSION（report_lines 做）。member_returns 是舊結構時丟 rdb.SchemaError（週報那一段只換成
-    一行說明），不讓查詢丟籠統的 OperationalError。"""
+    """週報推薦成績的資料：(Performance, 帳的狀態)。report_lines、C2a 的 cooldown.report_lines 與對帳測試共用這一條
+    組裝（週報的兩段各自呼叫一次）。呼叫端要先確認 perf 帳的版本是 SUPPORTED_LEDGER_VERSION（兩個 report_lines 都做）。
+    member_returns 是舊結構時丟 rdb.SchemaError（週報那一段只換成一行說明），不讓查詢丟籠統的 OperationalError。"""
     perf = importlib.import_module("stock_picks_perf")
     sp = importlib.import_module("stock_picks")
     with_returns = rdb.has_tables(conn, rdb.C1_TABLES)

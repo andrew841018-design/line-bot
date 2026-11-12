@@ -26,6 +26,7 @@ import stock_picks as sp
 import stock_picks_perf as perf
 import test_stock_picks_review_fixtures as fx
 from jobs import stock_picks_review as runner
+from jobs import stock_picks_review_cooldown as cooldown
 from jobs import stock_picks_review_db as rdb
 from jobs import stock_picks_review_pool as pool
 from jobs import stock_picks_review_returns as returns
@@ -1010,10 +1011,40 @@ def test_weekly_report_keeps_phase_a_content_and_fits_three_chunks(paths, monkey
         ctx.close()
     assert text.startswith("📊 股票推薦回測週報（11/1）") and "【資料收集】" in text and "【台股休市表】" in text
     assert "【推薦成績】\n台股 AI 相關股\n・5 日 6 次：平均 +2.9%" in text
-    assert "自動冷凍績效差的股票：尚未啟用" in text and "成績比較（持有" not in text  # C1 上線了，不再列成之後的檢查點
+    assert "自動冷凍績效差的股票：試算中（真的拿掉的功能目標 2027/1/10 前上線" in text and "成績比較（持有" not in text
     assert text.index("【推薦成績】") < text.index("【之後的檢查點】") and text.rstrip().endswith(weekly.METHOD)
+    c2a = "\n".join(cooldown.format_lines({}))  # 這個世界沒有能用的 20 日成績（唯一一筆 h＝20 是跳過的）
+    assert c2a in text and text.index("【推薦成績】") < text.index(c2a) < text.index("【之後的檢查點】")
     assert text.count("推薦隔天收盤進場") == 1  # 算法只寫在最後一行（【推薦成績】的標題不重複）
     assert len(text) <= weekly.REPORT_MAX_CHARS and len(_relay_chunks(text)) <= 3
+
+
+def test_live_entries_carry_the_ledger_exit_day_for_the_cooldown_walk(paths, monkeypatch):
+    """C2a 的段靠帳上的 th 判斷窗口重疊：家人看到的台股 AI／美股帳列帶 th，背景照算的舊五條件與家人看到的舊五條件沒有。"""
+    _report_world(paths, monkeypatch)
+    report = _report_data(paths)
+    live = [e for family in ("tw_ai", "us") for e in report.entries[family]]
+    assert live and {e.th for e in live} == {"2026-10-20"}
+    others = report.entries["tw_v1"] + report.entries[returns.SEEN_V1]
+    assert others and {e.th for e in others} == {None}
+
+
+def test_cooldown_error_only_replaces_its_own_section(paths, monkeypatch):
+    _report_world(paths, monkeypatch)
+    fx.write_states(paths.state_dir, main=fx.main_snapshot(), ai=fx.ai_state(), us=fx.us_snapshot())
+
+    def broken(*_args, **_kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(cooldown, "report_lines", broken)
+    ctx = _ctx(paths, SUNDAY)
+    try:
+        text = weekly.build_report(ctx, D("2026-11-01"))
+    finally:
+        ctx.close()
+    assert "\n【冷凍條件試算】這週算不出來（RuntimeError），其他內容照常\n" in text
+    assert "【資料收集】" in text and "【推薦成績】\n台股 AI 相關股\n・5 日 6 次：平均 +2.9%" in text
+    assert text.rstrip().endswith(weekly.METHOD)
 
 
 def test_largest_possible_report_still_fits_three_chunks():
@@ -1038,6 +1069,20 @@ def test_largest_possible_report_still_fits_three_chunks():
     a_part = 1500  # A 段（收集狀態、休市表兩行警示、檢查點、算法）實際約 1,000 字，這裡從寬算
     assert len(c1) + a_part < weekly.REPORT_MAX_CHARS
     assert len(_relay_chunks(("x" * 100 + "\n") * 15 + c1)) <= 2
+    # C2a 的【冷凍條件試算】最長的寫法：兩族都有上百檔達條件、每檔的段數是兩位數、代號取 perf 允許的最長（7 字）、
+    # r − p、本身、股票池、基準的百分比都取最長的寫法、日期都是兩位數的月日（審查 C2a r3#4）
+    first = D("2026-11-10")
+    worst = {family: [returns.Entry(family, "tw", (first + timedelta(days=2 * k)).isoformat(), f"{100000 + i}L", 20,
+                                    -0.987654, 12.3456, None, "ok", 2.912346,
+                                    (first + timedelta(days=2 * k + 1)).isoformat())
+                      for i in range(160) for k in range(15)]
+             for family in cooldown.COOLDOWN_FAMILIES}
+    c2a_lines = cooldown.format_lines(worst)
+    assert len(c2a_lines) == 1 + 2 * (1 + cooldown.MAX_LISTED + 1)  # 標題、兩族 ×（摘要＋上限檔數＋「另外」）
+    assert "15 段平均比股票池 -390.0%（本身 -98.8%、股票池 +291.2%、0050 +1234.6%）" in c2a_lines[2]
+    c2a = "\n".join(c2a_lines)
+    assert len(c1) + len(c2a) + a_part < weekly.REPORT_MAX_CHARS and max(len(line) for line in c2a_lines) < 150
+    assert len(_relay_chunks(("x" * 100 + "\n") * 15 + c1 + "\n\n" + c2a)) <= 3
 
 
 def test_missing_versions_before_pool_logging_say_why():

@@ -26,7 +26,8 @@ FAMILY_WHERE 是從它導出的 (族, 條件)）。
   快照 latest_closes 裡日期等於 D 的那筆。
 - pool_days.origin：simple（job 從狀態檔推導）｜spool（bot 當下寫的 spool）。只有 spool 可以取代同一個鍵的簡版，
   其他一律不覆寫；取代時 spool 沒有大盤狀態就沿用簡版的 market_json。tw_v1 與美股都是 simple（舊規則永遠不會有
-  spool，美股的 spool B2 才加）。meta_json 各族的鍵寫在 stock_picks_review_db 的模組說明。
+  spool；美股不寫 spool，快照本來就有完整名單，B2 只在快照加冷凍欄位）。meta_json 各族的鍵寫在
+  stock_picks_review_db 的模組說明。
 - 三族各自 try（AI 每一版各自 try）：一族出錯不擋其他族；有錯時整個階段記 error（連續失敗、短訊看得到）。
 - 真的拿不到收盤的成員（理論上不會有）不編數字：c0 留空、status＝excluded:no_close（review.sqlite 的 CHECK 也擋
   「成員卻沒有 c0」）。

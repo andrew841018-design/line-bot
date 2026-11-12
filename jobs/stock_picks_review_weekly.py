@@ -1,6 +1,7 @@
-"""股票推薦回測（計畫 B）的每週 Discord 週報：A 段骨架（收集狀態）＋C1 的推薦成績；C2／C3 再往上加冷凍、背景規則。
+"""股票推薦回測（計畫 B）的每週 Discord 週報：A 段骨架（收集狀態）＋C1 的推薦成績＋C2a 的冷凍條件試算；C2b／C3 再往上
+加真的冷凍、背景規則。
 
-規格：ops/state/line_bot_stock_backtest_20261028/PLAN.md（v5）§4.5、§6（C1）。
+規格：ops/state/line_bot_stock_backtest_20261028/PLAN.md（v5）§4.5、§6（C1）；PLAN_B2C2.md §3.3（C2a）。
 - 時間：台北週日 20:00 之後；只處理最近一個週日（最早 2026-11-01 那份：A 段 10/29 上線，不補 10/25）。
   每輪只要 outbox／sent／failed 都還沒有「YYYY-MM-DD-stock-picks-weekly」開頭的檔，就組一份放進 outbox
   （token_weekly_report 的 _queued／_drop 模式；暫存檔寫在 job 自己的 drafts/）。
@@ -12,6 +13,9 @@
   stock_picks_review_pool.FAMILIES。
 - C1 的【推薦成績】由 stock_picks_review_returns.report_lines 組（家人看到的推薦讀 perf 帳、舊五條件的背景日與股票池
   基準讀 member_returns）；它出錯（例如 perf import 不了）只把那一段換成一行說明，週報照送。
+- C2a 的【冷凍條件試算】接在【推薦成績】後面，由 stock_picks_review_cooldown.report_lines 組（只算、只列，不寫任何狀態）；
+  一樣出錯只換成一行。兩段各自呼叫 returns.report_data（每週多讀一次帳，只多幾秒）：各自的 try 讓一段的格式化出錯
+  不拖另一段；report_data 本身壞了就兩段都換成一行。
 - 推薦成績卡只讀 state/stock_picks_perf.json 的摘要（唯讀，不呼叫 perf 讀檔：檔案路徑由 job 注入（測試指到暫存目錄），
   而且 v1、v2 兩版的結果檔都要讀得懂，只取兩版共同的欄位）。
 - 台股休市表：跨年的成績要靠下一年的休市表。最後期限＝下一年第一個交易日再加 S − 1 個交易日，S＝perf 的
@@ -42,7 +46,7 @@ PERF_MAX_BYTES = 1024 * 1024
 
 # 各段的檢查點（PLAN §1；之後的段上線時改這裡的說明）。C1 的成績比較已經上線（週報的【推薦成績】），不再列。
 CHECKPOINTS = (
-    ("自動冷凍績效差的股票", "尚未啟用（目標 11/22 前上線；最早可能觸發是 2027/1/31 那份週報）"),
+    ("自動冷凍績效差的股票", "試算中（真的拿掉的功能目標 2027/1/10 前上線；最早可能觸發是 2027/1/31 那份週報）"),
     ("背景規則（測試修正版規則）", "尚未啟用（目標 12/13 前上線；最早約 2027/5 才有結果）"),
 )
 DEFAULT_SETTLE_SESSIONS = 10  # 讀不到 perf 時用（stock_picks_perf.SETTLE_SESSIONS）
@@ -311,6 +315,19 @@ def performance_lines(ctx, conn, calendars: dict[str, list[str]]) -> list[str]:
         return [f"【推薦成績】這週算不出來（{type(exc).__name__}），其他內容照常"]
 
 
+def cooldown_lines(ctx, conn, calendars: dict[str, list[str]]) -> list[str]:
+    """C2a 的【冷凍條件試算】一段；和 performance_lines 一樣出錯只換成一行。沒有 review.sqlite 就不寫這段。"""
+    if conn is None:
+        return []
+    try:
+        from jobs import stock_picks_review_cooldown as cooldown
+
+        return cooldown.report_lines(ctx, conn, calendars)
+    except Exception as exc:  # noqa: BLE001
+        log.error("stock picks review weekly cooldown error_type=%s", type(exc).__name__)
+        return [f"【冷凍條件試算】這週算不出來（{type(exc).__name__}），其他內容照常"]
+
+
 def build_report(ctx, sunday: date) -> str:
     conn = ctx.db()
     today = ctx.today
@@ -333,6 +350,9 @@ def build_report(ctx, sunday: date) -> str:
     performance = performance_lines(ctx, conn, calendars)
     if performance:
         lines += ["", *performance]
+    cooldown = cooldown_lines(ctx, conn, calendars)
+    if cooldown:
+        lines += ["", *cooldown]
     lines += ["", "【之後的檢查點】"]
     lines += [f"・{name}：{state}" for name, state in CHECKPOINTS]
     lines += ["", METHOD]

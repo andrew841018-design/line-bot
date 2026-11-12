@@ -346,6 +346,7 @@ def test_weekly_data_section_does_not_need_the_c1_module(ready, monkeypatch, set
         ctx.close()
     assert "・台股 AI 相關股：記到 10/27，共 1 個交易日（本週 +1），沒有缺漏" in text
     assert "【推薦成績】這週算不出來（ModuleNotFoundError），其他內容照常" in text  # 真的擋到了
+    assert "【冷凍條件試算】這週算不出來（ModuleNotFoundError），其他內容照常" in text  # C2a 也靠 returns：一樣只換一行
 
 
 def test_sunday_before_eight_does_not_send_last_weeks_late_report(ready):
@@ -373,7 +374,9 @@ def test_weekly_content_reports_collection_status_in_one_message(ready, settle40
     assert ("【台股休市表】2026 已取得；2027 尚未取得（建議 2027/2/23 前取得；"
             "最晚 2027/2/26 前沒有，跨年那幾天的推薦會永久不算）") in text
     assert "⚠️" not in text  # 12/1 之前下一年的表還沒取得只寫在休市表那一行
-    assert "自動冷凍績效差的股票：尚未啟用" in text and "最早約 2027/5" in text and "2027/1/31" in text
+    assert "自動冷凍績效差的股票：試算中" in text and "最早約 2027/5" in text and "2027/1/31" in text
+    # 這個世界的成績帳不在 bot 目錄（elsewhere）：試算不寫「還沒有 20 日成績」，說法和【推薦成績】同一套
+    assert "【冷凍條件試算】只算，還沒有自動拿掉任何股票\n・成績帳不在這個 bot 目錄（測試或 staging）：這週先不算" in text
     assert text.rstrip().endswith(weekly.METHOD)
 
 
