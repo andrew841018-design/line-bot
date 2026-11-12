@@ -1516,6 +1516,70 @@ def test_soxx_turns_behind_at_the_ready_time_when_ishares_never_updates(env):
     assert {lag for _now, lag in rounds} == {0, 1}
 
 
+# 元大轉址的重試（2026-11-12）：staging 量到 11/10 台北 17:00、17:30 元大回 302（轉到維護頁，FetchError "moved"），16:30、
+# 18:00 正常。以前一個期間只試 3 次（框架退避 15、30 分鐘：17:00、17:15、17:45），轉址撐過 17:45 那天就永久缺。
+
+
+def hhmm(times: list[float]) -> list[str]:
+    return [datetime.fromtimestamp(now, TPE).strftime("%H:%M") for now in times]
+
+
+def tw_evening(env: Env, fail_until: Optional[float], end: float, kind: str = "moved") -> list[float]:
+    """11/9 已存；11/10 的元大頁在 fail_until 之前回 kind，之後是 11/10 的資料（官方差異數＝和 11/9 的差）。從台北 17:00 起
+    每 900 秒跑一輪 tw.flows 到 end；回這段時間真的送出元大請求的時刻（帳本說不夠時不算，那時沒有送出）。"""
+    _store_0050(env, "2026/11/09", "24,946,000,000", at(2026, 11, 9, 18, 0, tz=TPE))
+    feed_0050(env, units="25,048,000,000", diff="102,000,000", nav_day="2026/11/10", trade_day="2026/11/10")
+    sent, now = [], at(2026, 11, 10, 17, 0, tz=TPE)
+    while now < end:
+        if now < fail_until:
+            env.http.fail[src.YUANTA_URL] = kind
+        else:
+            env.http.fail.pop(src.YUANTA_URL, None)
+        calls = len(env.http.calls)
+        run(env, "tw.flows", now)
+        if len(env.http.calls) > calls:
+            sent.append(now)
+        now += 900.0
+    return sent
+
+
+def test_0050_a_redirect_until_18_30_is_retried_and_the_day_is_kept(env):
+    """轉址撐到 18:30：17:00、17:15、17:45 轉址（框架退避 15、30、60 分鐘），18:45 抓到 11/10；抓到就停，之後不再打元大。"""
+    sent = tw_evening(env, at(2026, 11, 10, 18, 30, tz=TPE), at(2026, 11, 10, 23, 0, tz=TPE))
+    assert hhmm(sent) == ["17:00", "17:15", "17:45", "18:45"]
+    got = obs(env, "0050")
+    assert (got["data_date"], got["payload"]["flag"], got["fail_streak"]) == ("2026-11-10", None, 0)
+    assert sched(env, "tw.flows")["done"] == ["0050"]
+
+
+@pytest.mark.parametrize("kind", ["moved", "status", "timeout", "network"])  # 3xx、其他非 200（5xx）、逾時、連線錯誤
+def test_0050_an_error_past_21_00_loses_only_that_day(env, kind):
+    """撐過 21:00：17:00、17:15、17:45、18:45、20:45 共 5 次（MAX_FAILS）都失敗，之後這個期間每一輪都不送請求（21:15 已恢復也
+    不再試），11/10 缺。隔天 17:00 第一次就抓到 11/11：起點用官方差異數的前一個交易日 11/10，不標待核對。"""
+    sent = tw_evening(env, at(2026, 11, 10, 21, 15, tz=TPE), at(2026, 11, 11, 16, 45, tz=TPE), kind)
+    assert hhmm(sent) == ["17:00", "17:15", "17:45", "18:45", "20:45"]
+    assert sched(env, "tw.flows")["fails"] == {"0050": pipe.MAX_FAILS[pipe.TW_KEY]} == {"0050": 5}
+    got = obs(env, "0050")
+    assert (got["data_date"], got["error"], got["fail_streak"]) == ("2026-11-09", kind, 5)
+    feed_0050(env, units="25,042,000,000", diff="-6,000,000", nav_day="2026/11/11", trade_day="2026/11/11")
+    assert run(env, "tw.flows", at(2026, 11, 11, 17, 0, tz=TPE)) == "ok"
+    p = payload(env, "0050")
+    assert (p["shares_out_as_of"], p["prev_as_of"], p["official_prev_session"]) == ("2026-11-11", "2026-11-09", "2026-11-10")
+    assert (p["change"], p["flag"]) == (-6_000_000, None)
+
+
+def test_0050_retries_stop_at_the_host_daily_cap(env):
+    """帳本說今天的額度用完（www.yuantaetfs.com 每台北日 8 次）：不送請求、也不算失敗（不吃 5 次）；額度回來（隔天台北日）時
+    還在同一個期間，接著抓到 11/10。"""
+    env.ledger.cap["www.yuantaetfs.com"] = 3  # 11/9 已用 1 次：11/10 只剩 2 次
+    sent = tw_evening(env, at(2026, 11, 10, 17, 30, tz=TPE), at(2026, 11, 10, 23, 45, tz=TPE))
+    assert hhmm(sent) == ["17:00", "17:15"]  # 17:45 起轉址已經結束，但帳本不給：一個請求都沒送
+    assert sched(env, "tw.flows")["fails"] == {"0050": 2} and obs(env, "0050")["data_date"] == "2026-11-09"
+    del env.ledger.cap["www.yuantaetfs.com"]
+    assert run(env, "tw.flows", at(2026, 11, 11, 0, 0, tz=TPE)) == "ok"
+    assert obs(env, "0050")["data_date"] == "2026-11-10"
+
+
 def test_lag_sessions_of_the_tw_sources_use_their_own_ready_times(env):
     """複審 R2-3-1、R2-3-2：0050 看元大（17:00）、T86 看證交所（16:30）；台股日曆不知道時兩個都是 null，不是 0。"""
     from jobs import market_snapshot as job

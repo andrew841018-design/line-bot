@@ -44,7 +44,8 @@ period＝None。payload：
 - 每一項：抓到的日期 ≥ 期間 → 寫（有變才寫）、回 "done"；比期間舊 → 比已存的新（或同一天但數字改了）才寫，回 "not_yet"
   （每 2 小時再試、每期最多 6 次）；比已存的還舊 → 不寫。股數到了、NAV 還沒到 → 照寫股數、回 "not_yet"（在 6 次內等 NAV，
   用完才接受沒有金額；Phase 6 I-3）。日期晚於來源時區的今天 → ParseError("date", "future")，不寫。
-  失敗（格式、日期、HTTP）由 _run_batch 記在該項的 obs、每期最多 3 次；429／403／冷卻／帳本不夠讓這批停下、不算該項的失敗。
+  失敗（格式、日期、HTTP）由 _run_batch 記在該項的 obs、每期最多 MAX_FAILS 次（us.flows 3 次、tw.flows 5 次），間隔照框架
+  的退避；429／403／冷卻／帳本不夠讓這批停下、不算該項的失敗。
 - 開關：來源的主機不在 market_http.ALLOWED_HOSTS 就不抓那一項（兩項都不在＝不到期；比照 TACO）；旗標檔
   `state/market_inst.disabled` 存在時兩個任務都不到期、也不送請求（卡片那邊另外讀同一個旗標檔）。
 
@@ -90,6 +91,10 @@ US_ITEMS = ("SOXX", "SPY")  # 卡片要的 SOXX 先抓
 TW_ITEMS = ("0050",)
 NOT_YET_RETRY_S = 7200.0  # 發行商還沒換到這個期間：2 小時後再看
 MAX_NOT_YET = 6  # 每期最多看幾次「還沒」
+# 每期最多失敗幾次（格式、日期、HTTP；帳本不夠、被擋、冷卻不算），每次之後照框架的退避（15→30→60→120 分鐘）再試。
+# 元大 5 次（2026-11-12）：staging 量到 11/10 台北 17:00、17:30 回 302（維護轉址）；3 次在 17:45 就用完、那天永久缺，
+# 5 次是 17:00、17:15、17:45、18:45、20:45，約試到 21:00（每台北日 8 次的額度由帳本守住）。
+MAX_FAILS = {US_KEY: 3, TW_KEY: 5}
 DISABLED_FLAG = "market_inst.disabled"  # state/ 底下的旗標檔：存在就不抓（卡片那邊也讀同一個名字）
 TW_EARLIEST = time(17, 0)  # 元大的申購買回清單約 16:30 上傳：17:00 之後「今天」才算目標日
 _TW_LOOKBACK_DAYS = 32  # 和 market_pipeline_tw.recent_sessions(…, 1) 一樣往前找 1×2＋30 天
@@ -338,7 +343,8 @@ def _enabled(items: tuple[str, ...]) -> tuple[str, ...]:
 def _due(ctx: Any, key: str, period: Optional[date], items: tuple[str, ...]) -> bool:
     if inst_disabled(ctx):
         return False
-    return us_pipe._batch_due(ctx, key, us_pipe._iso(period), _enabled(items), max_not_yet=MAX_NOT_YET)
+    return us_pipe._batch_due(ctx, key, us_pipe._iso(period), _enabled(items), max_fails=MAX_FAILS[key],
+                              max_not_yet=MAX_NOT_YET)
 
 
 def _run(ctx: Any, key: str, period: Optional[date], items: tuple[str, ...]) -> Optional[str]:
@@ -346,7 +352,8 @@ def _run(ctx: Any, key: str, period: Optional[date], items: tuple[str, ...]) -> 
     if period is None or not enabled or inst_disabled(ctx):
         return NOT_YET  # due 和 run 之間不會變（保險）：什麼請求都不送，不算成功也不算失敗
     return us_pipe._run_batch(ctx, key, period.isoformat(), enabled, lambda symbol: _collect(ctx, symbol, period),
-                              obs_for=OBS_FLOWS.get, max_not_yet=MAX_NOT_YET, not_yet_retry_s=NOT_YET_RETRY_S)
+                              obs_for=OBS_FLOWS.get, max_fails=MAX_FAILS[key], max_not_yet=MAX_NOT_YET,
+                              not_yet_retry_s=NOT_YET_RETRY_S)
 
 
 def _due_us(ctx: Any) -> bool:
