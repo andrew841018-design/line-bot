@@ -1,5 +1,9 @@
 import importlib.util
+import sys
+import types
 from pathlib import Path
+
+import pytest
 
 
 def _repo_root() -> Path:
@@ -9,9 +13,19 @@ def _repo_root() -> Path:
     raise AssertionError("cannot locate repo root with ops/monitors/line_bot.py")
 
 
-def _load_monitor(monkeypatch):
+def _load_monitor(monkeypatch, tmp_path):
     root = _repo_root()
     monkeypatch.setenv("LINE_BOT_DIR", str(Path(__file__).resolve().parent))
+    # 2026-11-12: the monitor fixes these paths when it loads; keep them off the live ones
+    for name, leaf in (
+        ("LINE_BOT_HEALTH_STATE_FILE", "health_state.json"),
+        ("LINE_BOT_MONITOR_LOCK_FILE", "monitor.lock"),
+        ("LINE_BOT_RESTART_LOCK_FILE", "restart.lock"),
+        ("LINE_BOT_CLOUDFLARED_RESTART_LOCK_FILE", "cloudflared_restart.lock"),
+        ("LINE_BOT_HEALTH_WAKE_DIR", "wake"),
+        ("LINE_BOT_HEALTH_WAKE_LOCK_FILE", "wake.lock"),
+    ):
+        monkeypatch.setenv(name, str(tmp_path / leaf))
     spec = importlib.util.spec_from_file_location(
         "line_bot_monitor_for_test",
         root / "ops" / "monitors" / "line_bot.py",
@@ -35,6 +49,12 @@ def _stub_healthy_environment(monkeypatch, monitor, state=None):
     monkeypatch.setattr(monitor, "proc_alive", lambda pattern: True)
     monkeypatch.setattr(monitor, "http_health", lambda: (True, 200))
     monkeypatch.setattr(monitor, "check_main_py_drift", lambda: 0)
+    # 2026-11-12: main() calls this one directly; left live, it reads the running
+    # bot's start time and can restart it.
+    monkeypatch.setattr(monitor, "check_app_code_drift", lambda: 0.0)
+    # The tunnel URL stash is the live one: with no reconciled URL in the state,
+    # main() would re-register the live LINE webhook.
+    monkeypatch.setattr(monitor, "_resolve_cloudflared_url", lambda: None)
     monkeypatch.setattr(monitor, "cloudflared_origin_reachable", lambda: (True, ""))
     monkeypatch.setattr(monitor, "line_token_check", lambda: (True, ""))
     monkeypatch.setattr(monitor, "webhook_endpoint_check", lambda: (True, ""))
@@ -42,7 +62,15 @@ def _stub_healthy_environment(monkeypatch, monitor, state=None):
     monkeypatch.setattr(monitor, "count_callback_500_non_local", lambda: (0, [], 0))
     # 2026-10-28: the Claude CLI check reads the real uvicorn log.
     monkeypatch.setattr(
-        monitor, "claude_cli_outcomes", lambda *_a, **_k: ({}, {}, None), raising=False
+        monitor, "claude_cli_outcomes", lambda *_a, **_k: ({}, {}, None)
+    )
+    # 2026-11-12: so does the unanswered-batch check.
+    monkeypatch.setattr(
+        monitor,
+        "silent_reply_stats",
+        lambda *_a, **_k: {
+            "batches": 0, "direct": 0, "outage": 0, "other": 0, "latest": None, "latest_quota": None,
+        },
     )
     monkeypatch.setattr(
         monitor,
@@ -51,11 +79,23 @@ def _stub_healthy_environment(monkeypatch, monitor, state=None):
     )
     monkeypatch.setattr(monitor, "pending_reply_enabled", lambda: False)
     monkeypatch.setattr(monitor, "read_quota_state", lambda: {})
+
+    def live_action(*_a, **_k):
+        # pytest.fail is a BaseException: no `except Exception` in main() can swallow it
+        pytest.fail("the monitor test reached the live bot, webhook or LINE token", pytrace=False)
+
+    for name in (
+        "restart_uvicorn", "restart_cloudflared", "autofix_webhook_endpoint", "_put_line_webhook_endpoint",
+        "autofix_sqlite", "_stop_uvicorn_for_db_maintenance", "_acknowledge_webhook_wakeup",
+    ):
+        monkeypatch.setattr(monitor, name, live_action)
+    # main() imports this one where it runs, when the token check fails
+    monkeypatch.setitem(sys.modules, "line_token_refresh", types.SimpleNamespace(refresh_token=live_action))
     return saved
 
 
-def test_quota_only_issues_do_not_enter_discord_urgent_list(monkeypatch):
-    monitor = _load_monitor(monkeypatch)
+def test_quota_only_issues_do_not_enter_discord_urgent_list(monkeypatch, tmp_path):
+    monitor = _load_monitor(monkeypatch, tmp_path)
 
     quota_issue = monitor._quota_only_issue("🔴 Gemini lite 爆 quota 自修失敗")
     real_issue = "🔴 對話異常且重啟失敗"
@@ -71,8 +111,8 @@ def test_quota_only_issues_do_not_enter_discord_urgent_list(monkeypatch):
     assert monitor._display_issue(quota_issue) == "🔴 Gemini lite 爆 quota 自修失敗"
 
 
-def test_quota_remediation_failure_enters_discord_urgent_list(monkeypatch):
-    monitor = _load_monitor(monkeypatch)
+def test_quota_remediation_failure_enters_discord_urgent_list(monkeypatch, tmp_path):
+    monitor = _load_monitor(monkeypatch, tmp_path)
 
     quota_pressure = monitor._quota_only_issue("🟡 Gemini lite 爆 quota；等重置")
     remediation_failure = "🔴 Gemini lite 爆 quota 自修失敗 (wait_health_timeout)：quota"
@@ -85,7 +125,7 @@ def test_quota_remediation_failure_enters_discord_urgent_list(monkeypatch):
 
 def test_discord_send_false_does_not_update_alert_cooldown(monkeypatch, tmp_path):
     monkeypatch.setenv("LINE_BOT_MONITOR_LOCK_FILE", str(tmp_path / "monitor.lock"))
-    monitor = _load_monitor(monkeypatch)
+    monitor = _load_monitor(monkeypatch, tmp_path)
     saved = _stub_healthy_environment(
         monkeypatch,
         monitor,
@@ -109,7 +149,7 @@ def test_discord_send_false_does_not_update_alert_cooldown(monkeypatch, tmp_path
 
 def test_discord_send_none_counts_as_success(monkeypatch, tmp_path):
     monkeypatch.setenv("LINE_BOT_MONITOR_LOCK_FILE", str(tmp_path / "monitor.lock"))
-    monitor = _load_monitor(monkeypatch)
+    monitor = _load_monitor(monkeypatch, tmp_path)
     saved = _stub_healthy_environment(
         monkeypatch,
         monitor,
@@ -131,8 +171,8 @@ def test_discord_send_none_counts_as_success(monkeypatch, tmp_path):
     assert saved.get("alert_issue_ts")
 
 
-def test_alert_cooldown_is_per_issue_type(monkeypatch):
-    monitor = _load_monitor(monkeypatch)
+def test_alert_cooldown_is_per_issue_type(monkeypatch, tmp_path):
+    monitor = _load_monitor(monkeypatch, tmp_path)
     now_ts = 10_000.0
     first = "🔴 外部 callback 500 偵測：近 20 行有 1 筆"
     second = "🔴 Webhook 三段式自修全失敗：endpoint_check=fail"
@@ -150,7 +190,7 @@ def test_alert_cooldown_is_per_issue_type(monkeypatch):
 
 def test_quota_exhausted_does_not_probe_or_autofix(monkeypatch, tmp_path):
     monkeypatch.setenv("LINE_BOT_MONITOR_LOCK_FILE", str(tmp_path / "monitor.lock"))
-    monitor = _load_monitor(monkeypatch)
+    monitor = _load_monitor(monkeypatch, tmp_path)
     saved = _stub_healthy_environment(
         monkeypatch,
         monitor,

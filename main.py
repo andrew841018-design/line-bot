@@ -17529,7 +17529,7 @@ def _try_save_correction(
                 source_message_id=message_id,
                 actor_key=_correction_actor_key(group_id, sender_user_id),
             )
-            logger.info("persona correction saved: %s", t[:60])
+            logger.info("persona correction saved: %r", t[:60])
         except Exception as exc:
             logger.warning(
                 "persona correction save failed without blocking reply: %s",

@@ -284,7 +284,7 @@ def _fetch_ddg(query: str, k: int) -> list[dict]:
     try:
         rows = web_scraper.search_duckduckgo(query, k=k) or []
     except Exception as e:  # noqa: BLE001
-        logger.info("DDG search failed (%s): %s", query, e)
+        logger.info("DDG search failed (%r): %r", query, e)
         return []
     out = []
     for r in rows:
@@ -310,7 +310,7 @@ def _fetch_gnews(query: str, k: int, resolve_urls: bool = True) -> list[dict]:
         rows = (web_scraper.search_google_news(query, k=k) if resolve_urls else
                 web_scraper.search_google_news(query, k=k, resolve_urls=False)) or []
     except Exception as e:  # noqa: BLE001
-        logger.info("GoogleNews search failed (%s): %s", query, e)
+        logger.info("GoogleNews search failed (%r): %r", query, e)
         return []
     out = []
     for r in rows:
