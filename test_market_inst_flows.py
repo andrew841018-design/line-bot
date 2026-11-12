@@ -1449,18 +1449,71 @@ def tw_table(env: Env) -> None:
 
 
 @pytest.mark.parametrize("now, lag", [
-    (at(2026, 10, 27, 17, 0), 0),  # 10/27 還沒到就緒時間（美東 18:00）：該有的是 10/26
-    (at(2026, 10, 27, 18, 0), 1),
+    (at(2026, 10, 27, 23, 29), 0),  # 10/27 還沒到就緒時間（美東 23:30）：該有的是 10/26
+    (at(2026, 10, 27, 23, 30), 1),
     (at(2026, 10, 28, 8, 0), 1),
-    (at(2026, 10, 29, 19, 0), 3),
+    (at(2026, 10, 29, 23, 30), 3),
     (at(2026, 10, 31, 12, 0), 4),  # 週六：該有的是週五 10/30
-    (at(2026, 11, 2, 19, 0), 5),
+    (at(2026, 11, 2, 23, 30), 5),
 ])
 def test_lag_sessions_counts_the_sessions_after_the_data_date(env, now, lag):
     from jobs import market_snapshot as job
 
     store_soxx(env, date(2026, 10, 26), "90,000,000")
     assert job._inst_status(env.store, env.paths, now)["inst_flows"]["SOXX"]["lag_sessions"] == lag
+
+
+# 美東就緒時間的校準（2026-11-12，staging 量測 11/6–11/12）：iShares 11/6 的資料在美東 20:00–21:30 之間才換上（台北 11/7
+# 09:00 還是 11/5、10:30 已是 11/6），11/9–11/11 在美東 20:00 前已換。
+ISHARES_LATEST_SEEN = time(21, 30)
+WORST_ROUND_S = 899.0  # 比 launchd 的 900 秒少 1 秒：每次「還沒」之後的重試都要多等一輪（最壞的排程）
+
+
+def soxx_night(env: Env, day: date, first: float, switch: Optional[float]) -> list[tuple[float, Optional[int]]]:
+    """前一個交易日已存；從 first 起每 WORST_ROUND_S 秒跑一輪 us.flows，跑到隔天美東 04:00（6 次「還沒」用完）。iShares 在
+    switch 之後才給 day 的資料（None＝整晚沒換）；SSGA 一直只給到前一天（它隔天凌晨才換）。回每一輪的 (時間, SOXX 的
+    lag_sessions)：lag 是 0 ⇔ 卡上的 behind 是 False（兩邊都用 market_calc.inst_expected_day）。"""
+    from jobs import market_snapshot as job
+
+    prev = us_sessions(day, 2)[1]
+    store_soxx(env, prev, "286,800,000", "130.96")
+    end = at(day.year, day.month, day.day, 4, 0) + 86400
+    rounds, now = [], first
+    while now < end:
+        new = switch is not None and now >= switch
+        feed_soxx(env, shares="286,000,000" if new else "286,800,000", shares_day=day if new else prev,
+                  nav="136.56" if new else "130.96")
+        run(env, "us.flows", now)
+        rounds.append((now, job._inst_status(env.store, env.paths, now)["inst_flows"]["SOXX"]["lag_sessions"]))
+        now += WORST_ROUND_S
+    return rounds
+
+
+def test_soxx_is_never_behind_when_ishares_updates_as_late_as_measured(env):
+    """複審 R2-1-1（2026-11-12 校準）：iShares 最晚在美東 21:30 換日（11/6）。最壞的排程：收盤＋30 分鐘後的第一次抓已晚一輪
+    （16:59:58），之後每次重試再晚一輪，第 3 次在 21:29:40、剛好在換日前，第 4 次（23:44:31）才抓到。就緒時間＝最晚的換日＋
+    一次重試間隔：抓到的前一輪一定早於它，所以整晚每一輪都不落後。18:00 時從 18:14 那輪起（台北早上）天天印「最近一筆」；
+    23:00 也不夠（23:14:33、23:29:32 兩輪落後）。"""
+    day = date(2026, 11, 6)  # 量到 21:30 的那天（週五）
+    rounds = soxx_night(env, day, at(2026, 11, 6, 16, 59) + 58, at(2026, 11, 6, 21, 30))
+    assert [(datetime.fromtimestamp(now, ET).strftime("%H:%M:%S"), lag) for now, lag in rounds if lag != 0] == []
+    got = obs(env, "SOXX")
+    assert got["data_date"] == day.isoformat() and env.http.urls().count(src.ISHARES_URL) == 1 + 4  # 前一天 1 次、這晚 4 次
+    calendar_name, ready = market_calc.INST_READY[pipe.US_KEY]
+    assert got["last_success_at"] > datetime.combine(day, ready, tzinfo=ET).timestamp()  # 真的抓得比就緒時間晚，還是不落後
+    # 就緒時間要 ≥ 最晚的換日＋一次重試間隔（改了 NOT_YET_RETRY_S 或量到更晚的換日，就要重算）
+    assert calendar_name == "nyse"
+    assert datetime.combine(day, ISHARES_LATEST_SEEN) + timedelta(seconds=pipe.NOT_YET_RETRY_S) <= datetime.combine(day, ready)
+
+
+def test_soxx_turns_behind_at_the_ready_time_when_ishares_never_updates(env):
+    """上一條的正對照：iShares 整晚沒換日（壞了或真的晚了）→ 就緒時間之前每一輪 lag 是 0，之後每一輪是 1（卡上印「最近一筆」，
+    隔天美東 04:00 前都還是 1）。"""
+    day = date(2026, 11, 6)
+    ready = datetime.combine(day, market_calc.INST_READY[pipe.US_KEY][1], tzinfo=ET).timestamp()
+    rounds = soxx_night(env, day, at(2026, 11, 6, 16, 59) + 58, None)
+    assert [lag for _now, lag in rounds] == [1 if now >= ready else 0 for now, _lag in rounds]
+    assert {lag for _now, lag in rounds} == {0, 1}
 
 
 def test_lag_sessions_of_the_tw_sources_use_their_own_ready_times(env):
@@ -1544,7 +1597,8 @@ def test_a_failing_source_reaches_the_daily_maintenance_through_status_summary(e
     summary = market_dashboard.status_summary(now=final, paths=env.paths)["outcome"]
     assert summary["state"] == "ok" and summary["inst_status_error"] is None
     soxx, spy = summary["inst_flows"]["SOXX"], summary["inst_flows"]["SPY"]
-    assert (soxx["fail_streak"], soxx["data_date"], soxx["lag_sessions"], soxx["enabled"]) == (15, "2026-10-20", 5, True)
+    # final 是美東 10/27 20:16，還沒到就緒時間（23:30）：該有的是 10/26，10/21–10/26 共落後 4 個交易日
+    assert (soxx["fail_streak"], soxx["data_date"], soxx["lag_sessions"], soxx["enabled"]) == (15, "2026-10-20", 4, True)
     assert (spy["fail_streak"], spy["data_date"], spy["lag_sessions"]) == (0, "2026-10-27", 0)
     never = summary["inst_flows"]["0050"]  # 從沒跑過：是 null，不是看起來正常的 0
     assert (never["data_date"], never["lag_sessions"], never["nav_as_of"]) == (None, None, None)
@@ -1563,7 +1617,8 @@ def test_the_outcome_carries_inst_flows_and_survives_a_broken_status(env, monkey
                                          locked_at=time_module.monotonic())
     assert outcome["inst_flows"]["SOXX"]["data_date"] == "2026-10-26"
     assert outcome["inst_flows"]["SOXX"]["flag"] is None and outcome["inst_flows"]["0050"]["data_date"] is None
-    assert outcome["inst_flows"]["SOXX"]["lag_sessions"] == 1 and outcome["inst_flows"]["T86"]["lag_sessions"] is None
+    # NOW 是美東 10/27 20:00，還沒到就緒時間（23:30）：10/26 就是該有的最新一天
+    assert outcome["inst_flows"]["SOXX"]["lag_sessions"] == 0 and outcome["inst_flows"]["T86"]["lag_sessions"] is None
     assert job._clean(outcome) == outcome  # 只有列舉值、日期、數字：過得了 outcome 的清洗
 
     def broken(*_args: Any) -> dict:

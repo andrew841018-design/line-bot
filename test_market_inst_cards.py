@@ -320,15 +320,17 @@ def _tpe(y, m, d, hh, mm):
 
 
 def test_the_readiness_table():
-    assert market_calc.INST_READY == {"us.flows": ("nyse", time(18, 0)), "tw.flows": ("twse", time(17, 0)),
+    assert market_calc.INST_READY == {"us.flows": ("nyse", time(23, 30)), "tw.flows": ("twse", time(17, 0)),
                                       "tw.t86": ("twse", time(16, 30))}
 
 
 @pytest.mark.parametrize("source, now, expected", [
-    ("us.flows", _et(2026, 10, 16, 17, 59), date(2026, 10, 15)), ("us.flows", _et(2026, 10, 16, 18, 0), date(2026, 10, 16)),
+    ("us.flows", _et(2026, 10, 16, 23, 29), date(2026, 10, 15)), ("us.flows", _et(2026, 10, 16, 23, 30), date(2026, 10, 16)),
+    ("us.flows", _et(2026, 10, 16, 21, 30), date(2026, 10, 15)),  # iShares 最晚 21:30 換日，下一次重試才抓到：還不算落後
     ("us.flows", _et(2026, 10, 17, 9, 0), date(2026, 10, 16)),  # 週六
     ("us.flows", _et(2026, 10, 19, 9, 0), date(2026, 10, 16)),  # 週一早上：還是上週五
-    ("us.flows", _et(2026, 11, 27, 18, 30), date(2026, 11, 27)),  # 早收日一樣看 18:00
+    ("us.flows", _et(2026, 11, 27, 23, 30), date(2026, 11, 27)),  # 早收日一樣看 23:30
+    ("us.flows", _et(2026, 11, 27, 23, 29), date(2026, 11, 25)),  # 11/26 感恩節休市
     ("tw.flows", _tpe(2026, 10, 16, 16, 59), date(2026, 10, 15)), ("tw.flows", _tpe(2026, 10, 16, 17, 0), date(2026, 10, 16)),
     ("tw.flows", _tpe(2026, 10, 16, 14, 45), date(2026, 10, 15)),  # 以前用 14:30 換日：這時已經算落後
     ("tw.t86", _tpe(2026, 10, 16, 16, 29), date(2026, 10, 15)), ("tw.t86", _tpe(2026, 10, 16, 16, 30), date(2026, 10, 16)),
@@ -343,9 +345,9 @@ def test_expected_day_is_unknown_outside_the_calendar():
 
 
 @pytest.mark.parametrize("source, now, day, lag", [
-    ("us.flows", _et(2026, 10, 16, 18, 0), date(2026, 10, 16), 0),
+    ("us.flows", _et(2026, 10, 16, 23, 30), date(2026, 10, 16), 0),
     ("us.flows", _et(2026, 10, 16, 17, 0), date(2026, 10, 16), 0),  # 比預期新（就緒時間還沒到就更新了）：0，不是負數
-    ("us.flows", _et(2026, 10, 19, 18, 30), date(2026, 10, 15), 2),  # 跨週末只數交易日
+    ("us.flows", _et(2026, 10, 19, 23, 30), date(2026, 10, 15), 2),  # 跨週末只數交易日
     ("tw.t86", _tpe(2026, 10, 27, 17, 0), date(2026, 10, 22), 2),  # 10/26 休市（合成表）：只數 10/23、10/27
     ("us.flows", _et(2026, 10, 16, 18, 0), None, None),  # 從沒跑過
     ("tw.flows", _tpe(2027, 3, 1, 18, 0), date(2026, 12, 31), None),  # 日曆說不出預期的資料日
@@ -726,7 +728,7 @@ def test_t86_from_an_older_trade_date_is_behind_only_after_the_ready_time(world,
 
 @pytest.mark.parametrize("market, now, behind", [
     ("tw", _tpe(2026, 10, 16, 16, 45), False), ("tw", _tpe(2026, 10, 16, 17, 5), True),  # 元大 17:00
-    ("us", _et(2026, 10, 16, 17, 0), False), ("us", _et(2026, 10, 16, 18, 30), True),  # iShares 美東 18:00
+    ("us", _et(2026, 10, 16, 21, 30), False), ("us", _et(2026, 10, 16, 23, 30), True),  # iShares 美東 23:30
 ])
 def test_flows_are_behind_only_after_the_ready_time(world, market, now, behind):
     if market == "tw":
