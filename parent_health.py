@@ -1931,6 +1931,8 @@ def _red_flag_notice(
     if muted or not wanted:
         return
     claimed: dict[str, tuple[list[str], str]] = {}
+    dedupe_broken = False
+    first_today = False
     for role, label, reason in wanted:
         kind = f"notice:{label}"
         try:
@@ -1939,11 +1941,28 @@ def _red_flag_notice(
                 continue
             if not parent_health_db.claim_alert(group_id, role, kind, key, now=now_f):
                 continue
+            if last is None or _today(float(last["sent_at"])) != _today(now_f):
+                first_today = True
         except Exception as exc:
             _err("notice dedupe", exc)  # 去重壞了寧可多推一次
+            dedupe_broken = True
         claimed.setdefault(role, ([], reason))[0].append(label)
     if claimed:
-        _push_group_background(group_id, _notice_text(claimed, said_ts), kind="notice", key=key)
+        # 「提到人就真 @」：這則請家人去確認，Andrew 11/12 選「@ 全家」。字全是程式寫的：角色、詞表標籤、時間、
+        # 固定句。建不出來就照舊不 @（不能讓 @ 擋掉這則通知，claim 已經搶了）。去重壞掉時（DB 鎖住、出錯）照推但
+        # 不 @：沒有 30 分鐘去重擋著，每則都 @ 全家就會一直響。
+        # Andrew 11/13 選「同一詞每天只 @ 一次」：同一位家長同一個詞，台北時間當天第一則 @ 全家，之後照推文字
+        # 不 @（推送本身仍照 10/28 的 30 分鐘去重、不設每日上限）。同一則裡只要有一個詞是當天第一次，就 @。
+        everyone: list = []
+        if first_today and not dedupe_broken:
+            try:
+                import line_mentions
+
+                everyone = [line_mentions.MentionTarget(key="all", kind="all", label="@all")]
+            except Exception as exc:
+                _err("notice mention", exc)
+                everyone = []
+        _push_group_background(group_id, _notice_text(claimed, said_ts), kind="notice", key=key, targets=everyone)
 
 
 # ── 運動提醒（2026-10-23，PLAN A A3） ──────────────────────────────────────
@@ -2221,11 +2240,13 @@ def _group_mode(group_id: str, now_f: float) -> bool:
         return False
 
 
-def _push_group(group_id: str, text: str, *, kind: str, key: str) -> bool:
+def _push_group(group_id: str, text: str, *, kind: str, key: str, targets=()) -> bool:
     """推一則文字到家族主群：真的送出才回 True；靜音、不是家族主群、沒過推播驗證、推送失敗一律回 False，不推替代文字。
     先自己驗證：line_push_client 擋下時會把前 160 字寫進 log，這裡 log 只記種類與原因。retry_key 由
     (群組, 種類, key) 算固定的 uuid5，重試不會重複推；LINE 回 409（同一個 retry key 已經收過）也算送出。
-    不存進 raw_messages（和週報健康段落一樣只推不存）。用到時才 import、用模組屬性呼叫（conftest 的替身攔得到）。"""
+    不存進 raw_messages（和週報健康段落一樣只推不存）。用到時才 import、用模組屬性呼叫（conftest 的替身攔得到）。
+    targets（2026-11-12「提到人就真 @」）：第一行 @ 這些人；能不能 @、LINE 不收 @ 時改送純文字，都由
+    line_push_client.push_text_with_mentions 決定，任何情況都不會因為 @ 而少送這則。"""
     try:
         if parent_health_db.settings.bot_muted:
             logger.info("parent health group push skipped kind=%s reason=muted", kind)
@@ -2243,8 +2264,8 @@ def _push_group(group_id: str, text: str, *, kind: str, key: str) -> bool:
 
         retry_key = str(uuid.uuid5(uuid.NAMESPACE_URL, f"parent_health:{group_id}:{kind}:{key}"))
         return bool(
-            line_push_client.push_messages(
-                group_id, [{"type": "text", "text": text}], retry_key=retry_key, timeout=10, ok_statuses=(200, 409)
+            line_push_client.push_text_with_mentions(
+                group_id, text, targets, retry_key=retry_key, timeout=10, source=f"parent_health.{kind}"
             )
         )
     except Exception as exc:
@@ -2252,16 +2273,16 @@ def _push_group(group_id: str, text: str, *, kind: str, key: str) -> bool:
         return False
 
 
-def _push_group_background(group_id: str, text: str, *, kind: str, key: str) -> None:
+def _push_group_background(group_id: str, text: str, *, kind: str, key: str, targets=()) -> None:
     """背景 daemon 執行緒推（119 結果在 webhook 鎖裡，推播最多會卡 10 秒）；測試關掉背景時直接推，結果看得到。"""
     try:
         if not _BACKGROUND_ENABLED:
-            _push_group(group_id, text, kind=kind, key=key)
+            _push_group(group_id, text, kind=kind, key=key, targets=targets)
             return
         threading.Thread(
             target=_push_group,
             args=(group_id, text),
-            kwargs={"kind": kind, "key": key},
+            kwargs={"kind": kind, "key": key, "targets": targets},
             daemon=True,
             name="parent-health-push",
         ).start()
@@ -2600,6 +2621,19 @@ def run_daily_check(now: float | None = None) -> int:
         return 0
 
 
+def _named_parents(ctx: _Ctx, anomalies) -> list:
+    """每日檢查這則提到的家長（「提到人就真 @」，Andrew 11/12）：照 PARENTS 的順序，用這次 ctx 的帳號（同意紀錄
+    對到的那一個，不重新解析）。出錯就當沒有對象：不能讓 @ 擋掉群組推播和危象、低血糖的 Discord 備援。"""
+    try:
+        import line_mentions
+
+        named = {anomaly.role for anomaly in anomalies}
+        return line_mentions.user_mention_targets((ctx.roles.get(role), role) for role in PARENTS if role in named)
+    except Exception as exc:
+        _err("daily check mention", exc)
+        return []
+
+
 def _daily_check_group(ctx: _Ctx, day: date) -> int:
     """每日檢查推到家族群組（2026-10-28；daily_check 已搶到）：逐項排版，先算這一行放不放得下（上限沿用
     _DM_MAX_CHARS），放得下才搶那一項；放不下的不搶，明天再算。推不出去（靜音、沒過推播驗證、推送失敗）就算了，
@@ -2616,7 +2650,7 @@ def _daily_check_group(ctx: _Ctx, day: date) -> int:
             taken.append(anomaly)
     if not taken:
         return 0
-    if _push_group(ctx.group_id, text, kind="daily_check", key=day.isoformat()):
+    if _push_group(ctx.group_id, text, kind="daily_check", key=day.isoformat(), targets=_named_parents(ctx, taken)):
         return 1
     urgent = [anomaly.text for anomaly in taken if anomaly.kind.split(":", 1)[0] in _URGENT_KINDS]
     if urgent and _send_dm("\n".join([head, *urgent])):

@@ -455,6 +455,33 @@ def reminder_actor_targets(
     return targets
 
 
+# 2026-11-12 「提到人就真 @」（Andrew：「以後所有事情，提到人的時候都走B方案」）: a push that names a family
+# member @s them.  The keys are letters only (pa, pb, ...): a digit in the first line can change what
+# output_validator decides about the whole message (a TODO 「查最新資料」 is blocked once `{p1}` gives it a
+# number), so this builder never makes one.  The older builders keep `p<n>`: archived reminders are read
+# back with `{p\d}`.
+_USER_TARGET_KEYS = tuple(f"p{letter}" for letter in "abcdefghijklmnopqrst")
+
+
+def user_mention_targets(pairs) -> list[MentionTarget]:
+    """``(user_id, name)`` pairs, in the order they should appear, to user mentions.
+
+    Empty, repeated (the first one wins) and ``__bot__`` ids are dropped, and so is a pair without a
+    name (the name is what the plain-text fallback prints); at most 20 people."""
+    targets: list[MentionTarget] = []
+    seen: set[str] = set()
+    for user_id, name in pairs or ():
+        uid = str(user_id or "").strip()
+        label = _clean_name(str(name or ""))
+        if not uid or uid == "__bot__" or uid in seen or not label:
+            continue
+        if len(targets) >= len(_USER_TARGET_KEYS):
+            break
+        seen.add(uid)
+        targets.append(MentionTarget(key=_USER_TARGET_KEYS[len(targets)], kind="user", user_id=uid, label=f"@{label}"))
+    return targets
+
+
 def _append_alias_target(
     targets: list[MentionTarget], seen_user_ids: set[str], alias: str
 ) -> None:

@@ -157,7 +157,25 @@ def decide(*, msg="r1", event=NOW, now=NOW, user="U_KID"):
 
 
 def texts(calls) -> list[str]:
-    return [call["messages"][0]["text"] for call in calls]
+    """推出去的正文。2026-11-12「提到人就真 @」：textV2 的第一行只放 @ 的 placeholder（剛好是 substitution
+    的 key），拿掉後比對正文；@ 了誰由 mentioned() 驗。"""
+    out = []
+    for call in calls:
+        message = call["messages"][0]
+        text = message["text"]
+        if message["type"] == "textV2":
+            head, _, text = text.partition("\n")
+            assert head.split(" ") == [f"{{{key}}}" for key in message["substitution"]], head
+        out.append(text)
+    return out
+
+
+def mentioned(calls) -> list[list[str]]:
+    """每則推播 @ 了誰：user id，或 "all"；純文字是空的。"""
+    return [
+        [sub["mentionee"].get("userId") or sub["mentionee"]["type"] for sub in (call["messages"][0].get("substitution") or {}).values()]
+        for call in calls
+    ]
 
 
 def assert_push_ok(text: str) -> None:
@@ -344,6 +362,7 @@ def test_group_mode_pushes_the_outcomes_the_group_did_not_hear_and_sends_no_dm(
     assert decision is not None and not decision.reply
     _outcome(decision)
     assert texts(pushes) == [expected] and dms == []
+    assert mentioned(pushes) == [["all"]]  # Andrew 11/12：這則請家人去確認，@ 全家
     assert pushes[0]["retry_key"] == str(uuid.uuid5(uuid.NAMESPACE_URL, f"parent_health:{G}:notice:r1"))
     assert db.last_alert(G, flag.role, f"notice:{flag.label}")["key"] == "r1"
     assert db.last_alert(G, flag.role, f"dm:{flag.label}") is None
@@ -400,6 +419,7 @@ def test_both_parents_in_one_message_make_one_push(monkeypatch, group_on, pushes
     _red(monkeypatch, flags)
     _outcome(decide(event=event))
     assert texts(pushes) == [expected]
+    assert mentioned(pushes) == [["all"]]
     assert_push_ok(expected)
 
 
@@ -412,6 +432,7 @@ def test_same_parent_and_label_is_pushed_again_after_30_minutes_no_daily_cap(mon
         _outcome(decide(msg=f"n{index}", now=at, event=at - 601), msg=f"n{index}", now=at)
     assert len(pushes) == 4
     assert all(text.startswith("🩺 爸媽健康：爸爸 ") and "提到跌倒（" in text for text in texts(pushes))
+    assert mentioned(pushes) == [["all"], [], [], []]  # Andrew 11/13：同一詞每天只 @ 全家一次
     assert db.last_alert(G, "爸爸", "notice:跌倒")["key"] == "n3"
 
 
@@ -424,6 +445,7 @@ def test_a_broken_notice_dedupe_still_pushes(monkeypatch, group_on, pushes):
     decision = ph.RedFlagDecision("爸爸", ("跌倒",), False, True, True, "old_event", NOW - 601)
     _outcome(decision)
     assert len(pushes) == 1  # 去重壞了寧可多推一次
+    assert mentioned(pushes) == [[]]  # 但不 @ 全家：沒有去重擋著，每則都 @ 會一直響
 
 
 def test_the_notice_push_leaves_the_webhook_lock_on_a_daemon_thread(monkeypatch, group_on):
@@ -434,16 +456,17 @@ def test_the_notice_push_leaves_the_webhook_lock_on_a_daemon_thread(monkeypatch,
     done = threading.Event()
     seen = []
 
-    def push(group_id, text, *, kind, key):
-        seen.append((threading.current_thread(), kind, key))
+    def push(group_id, text, *, kind, key, targets=()):
+        seen.append((threading.current_thread(), kind, key, [target.kind for target in targets]))
         done.set()
         return True
 
     monkeypatch.setattr(ph, "_push_group", push)
     _outcome(decision)
     assert done.wait(5)
-    thread, kind, key = seen[0]
+    thread, kind, key, target_kinds = seen[0]
     assert thread is not threading.main_thread() and thread.daemon and (kind, key) == ("notice", "r1")
+    assert target_kinds == ["all"]  # the thread gets the @ 全家 too
 
 
 def test_dm_mode_in_the_family_group_still_sends_the_same_dm(monkeypatch, pushes, dms):
@@ -485,6 +508,7 @@ def test_group_mode_daily_check_pushes_one_message_and_sends_no_dm(group_on, pus
     assert ph.run_daily_check(NOW) == 1
     assert dms == []
     assert texts(pushes) == [f"{HEAD}\n爸爸 7 天內有 4 天睡不好\n{MOM_BP_GROUP}"]
+    assert mentioned(pushes) == [["U_DAD", "U_MOM"]]  # 提到的家長，照 PARENTS 的順序
     assert pushes[0]["retry_key"] == str(uuid.uuid5(uuid.NAMESPACE_URL, f"parent_health:{G}:daily_check:2026-11-01"))
     assert_push_ok(texts(pushes)[0])
     assert ph.run_daily_check(NOW + 600) == 0 and len(pushes) == 1  # 一天一則
@@ -503,6 +527,7 @@ def test_lines_that_do_not_fit_are_not_claimed_and_go_out_tomorrow(monkeypatch, 
     assert db.last_alert(G, "媽媽", "sleep_bad") is None  # 放不下的不搶
     assert ph.run_daily_check(ts(2026, 11, 2, 21, 30)) == 1
     assert texts(pushes)[1] == "🩺 爸媽健康每日檢查（11/2）\n媽媽 7 天內有 4 天睡不好"
+    assert mentioned(pushes) == [["U_DAD"], ["U_MOM"]]  # 只 @ 這一則有提到的那位
 
 
 @pytest.mark.parametrize("failure", ["muted", "validator", "http"])
@@ -534,6 +559,79 @@ def test_a_failed_group_push_without_urgent_lines_sends_nothing(monkeypatch, gro
     assert ph.run_daily_check(NOW) == 0  # conftest 預設靜音：推不出去
     assert dms == []
     assert db.last_alert(G, "爸爸", "sleep_bad") is not None
+
+
+# ── 提到人就真 @（Andrew 2026-11-12）──────────────────────────────────────────
+
+
+def test_the_daily_check_pings_the_account_its_context_holds():
+    """不重新解析：用這次 ctx 的帳號（同意紀錄對到的那一個），照 PARENTS 的順序，一人一次。"""
+    ctx = SimpleNamespace(roles={"爸爸": "U_CTX_DAD", "媽媽": "U_CTX_MOM"})
+    anomalies = [SimpleNamespace(role="媽媽"), SimpleNamespace(role="爸爸"), SimpleNamespace(role="媽媽")]
+    assert [(t.kind, t.user_id, t.label) for t in ph._named_parents(ctx, anomalies)] == [
+        ("user", "U_CTX_DAD", "@爸爸"),
+        ("user", "U_CTX_MOM", "@媽媽"),
+    ]
+    assert ph._named_parents(SimpleNamespace(roles={"爸爸": None}), [SimpleNamespace(role="爸爸")]) == []
+
+
+def test_a_mention_that_cannot_be_built_never_stops_the_daily_check(monkeypatch, group_on, pushes, dms):
+    import line_mentions
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("broken")
+
+    monkeypatch.setattr(line_mentions, "user_mention_targets", boom)
+    _seed_daily()
+    assert ph.run_daily_check(NOW) == 1
+    assert texts(pushes) == [f"{HEAD}\n爸爸 7 天內有 4 天睡不好\n{MOM_BP_GROUP}"] and mentioned(pushes) == [[]]
+    assert dms == []
+
+
+def test_a_notice_that_cannot_build_its_mention_still_goes_out(monkeypatch, group_on, pushes):
+    import line_mentions
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("broken")
+
+    consent("爸爸", "U_DAD")
+    _red(monkeypatch, [RF("爸爸", "跌倒")])
+    decision = decide(event=NOW - 601)
+    monkeypatch.setattr(line_mentions, "MentionTarget", boom)
+    _outcome(decision)
+    assert len(pushes) == 1 and mentioned(pushes) == [[]]
+
+
+def test_the_switch_sends_the_daily_check_without_the_mention(monkeypatch, group_on, pushes):
+    monkeypatch.setenv("LINE_BOT_PUSH_MENTIONS", "0")
+    _seed_daily()
+    assert ph.run_daily_check(NOW) == 1
+    assert mentioned(pushes) == [[]] and pushes[0]["messages"][0]["type"] == "text"
+
+
+def test_a_refused_mention_resends_the_daily_check_as_plain_text_through_the_real_client(monkeypatch, group_on):
+    import requests
+
+    posts: list[tuple[str, dict]] = []
+    answers = [400, 200]
+
+    def post(url, headers=None, json=None, timeout=None):
+        posts.append((headers["X-Line-Retry-Key"], json["messages"][0]))
+        return SimpleNamespace(status_code=answers.pop(0), text="refused", json=lambda: {})
+
+    monkeypatch.setattr(line_push_client, "push_messages", REAL_PUSH)
+    monkeypatch.setattr(line_push_client, "line_access_token", lambda fallback_token=None: "token")
+    monkeypatch.setattr(requests, "post", post)
+    monkeypatch.setattr(db.settings, "bot_muted", False)
+    consent("爸爸", "U_DAD")
+    sleepless("爸爸")
+    assert ph.run_daily_check(NOW) == 1
+    main_key = str(uuid.uuid5(uuid.NAMESPACE_URL, f"parent_health:{G}:daily_check:2026-11-01"))
+    (first_key, first), (second_key, second) = posts
+    assert first_key == main_key and first["type"] == "textV2"
+    assert first["substitution"] == {"pa": {"type": "mention", "mentionee": {"type": "user", "userId": "U_DAD"}}}
+    assert second_key == str(uuid.uuid5(uuid.NAMESPACE_URL, f"{main_key}:plain"))
+    assert second == {"type": "text", "text": f"@爸爸\n{HEAD}\n爸爸 7 天內有 4 天睡不好"}
 
 
 def test_other_groups_keep_the_dm_in_group_mode(group_on, pushes, dms):
@@ -1054,3 +1152,60 @@ def test_the_daily_loop_purges_once_a_day_with_the_real_clock_and_logs_only_pref
 def test_the_disabled_stub_has_no_weekly_analysis():
     assert ph_off.weekly_analysis_text(G) is None and ph_off.weekly_analysis_text(G, NOW) is None
     assert "weekly_analysis_text" in ph_off.__all__ and ph_off.__all__ == ph.__all__
+
+
+def test_the_first_notice_of_a_new_taipei_day_pings_the_family_again(monkeypatch, group_on, pushes):
+    """Andrew 11/13：同一位家長同一個詞每天只 @ 全家一次；隔天第一則再 @。"""
+    consent("爸爸", "U_DAD")
+    _red(monkeypatch, [RF("爸爸", "跌倒")])
+    for index, at in enumerate((NOW, NOW + 1800, NOW + DAY)):
+        _outcome(decide(msg=f"d{index}", now=at, event=at - 601), msg=f"d{index}", now=at)
+    assert mentioned(pushes) == [["all"], [], ["all"]]
+
+
+def test_a_notice_with_a_word_new_today_pings_even_beside_a_repeat(monkeypatch, group_on, pushes):
+    consent("爸爸", "U_DAD")
+    consent("媽媽", "U_MOM")
+    _red(monkeypatch, [RF("爸爸", "跌倒")])
+    _outcome(decide(msg="x1", event=NOW - 601), msg="x1")
+    _red(monkeypatch, [RF("爸爸", "跌倒"), RF("媽媽", "急診", in_care=True)])
+    later = NOW + 1800
+    _outcome(decide(msg="x2", now=later, event=later - 601), msg="x2", now=later)
+    assert mentioned(pushes) == [["all"], ["all"]]
+
+
+def test_one_broken_dedupe_in_a_two_parent_notice_still_means_no_mention(monkeypatch, group_on, pushes):
+    """爸爸那個詞今天第一次（會 @），但媽媽那個詞的去重壞了：整則照推，不 @ 全家。"""
+    consent("爸爸", "U_DAD")
+    consent("媽媽", "U_MOM")
+    real_last = db.last_alert
+
+    def last_alert(group_id, role, kind, **kwargs):
+        if role == "媽媽":
+            raise sqlite3.OperationalError("database is locked")
+        return real_last(group_id, role, kind, **kwargs)
+
+    monkeypatch.setattr(db, "last_alert", last_alert)
+    _red(monkeypatch, [RF("爸爸", "跌倒"), RF("媽媽", "急診", in_care=True)])
+    _outcome(decide(event=NOW - 601))
+    assert len(pushes) == 1 and mentioned(pushes) == [[]]
+
+
+def test_once_a_day_counts_taipei_days_not_utc_days(monkeypatch, group_on, pushes):
+    """07:30 和 08:30（台北）是同一天，中間跨過 UTC 午夜：第二則照推、不 @。"""
+    consent("爸爸", "U_DAD")
+    _red(monkeypatch, [RF("爸爸", "跌倒")])
+    for index, at in enumerate((ts(2026, 11, 2, 7, 30), ts(2026, 11, 2, 8, 30))):
+        _outcome(decide(msg=f"u{index}", now=at, event=at - 601), msg=f"u{index}", now=at)
+    assert mentioned(pushes) == [["all"], []]
+
+
+def test_a_new_word_listed_before_a_repeat_still_pings(monkeypatch, group_on, pushes):
+    consent("爸爸", "U_DAD")
+    consent("媽媽", "U_MOM")
+    _red(monkeypatch, [RF("媽媽", "急診", in_care=True)])
+    _outcome(decide(msg="y1", event=NOW), msg="y1")
+    _red(monkeypatch, [RF("爸爸", "跌倒"), RF("媽媽", "急診", in_care=True)])
+    later = NOW + 1800
+    _outcome(decide(msg="y2", now=later, event=later - 601), msg="y2", now=later)
+    assert mentioned(pushes) == [["all"], ["all"]]

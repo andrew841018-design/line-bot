@@ -28,7 +28,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from config import settings  # noqa: E402
 from sqlite_security import connect_private_sqlite
-from line_push_client import try_push_text  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -292,36 +291,78 @@ def _get_token() -> str:
     return line_access_token()
 
 
-def _push(group_id: str, text: str) -> bool:
+def _push(group_id: str, text: str, targets=(), *, retry_key: str) -> bool:
     token = _get_token()
     if not token or not group_id:
         logger.error("missing TOKEN or group_id; skip push")
         return False
-    return try_push_text(group_id, text, timeout=10)
+    try:
+        # Looked up when the push runs, not at import: an update that lands halfway must not stop the
+        # 08:00 job before it starts.
+        import line_push_client
+
+        return bool(
+            line_push_client.try_push_text_with_mentions(
+                group_id, text, targets, retry_key=retry_key, timeout=10, source="todo"
+            )
+        )
+    except Exception as exc:
+        logger.warning("todo push failed error_type=%s", type(exc).__name__)
+        return False
 
 
-def _owner_first(todo_row: dict) -> str:
-    """「媽媽 繳學費」: whose todo, by family name, then the task (Andrew
-    2026-10-07: 主詞放前面; the end of a user id told nobody who it was)."""
+def _owner_line(todo_row: dict) -> tuple[str, tuple[str, str] | None]:
+    """「媽媽 繳學費」: whose todo, by family name, then the task (Andrew 2026-10-07: 主詞放前面; the end of a
+    user id told nobody who it was).  Also ``(user_id, name)`` when the line shows the owner's name:
+    2026-11-12 「提到人就真 @」 @s them, decided in the same pass that prints the line.  The name is cleaned
+    the way the printer cleans it (a leading @／＠ dropped)."""
     import line_mentions
     import reminder_overview
 
-    owner = line_mentions.alias_for_user_id(str(todo_row.get("sender_user_id") or "")) or ""
-    return reminder_overview.subject_first(str(todo_row.get("task") or ""), [owner] if owner else [])
+    user_id = str(todo_row.get("sender_user_id") or "")
+    owner = line_mentions.alias_for_user_id(user_id) or ""
+    line = reminder_overview.subject_first(str(todo_row.get("task") or ""), [owner] if owner else [])
+    name = owner.strip().lstrip("@＠").strip()
+    return line, ((user_id, name) if name and name in line else None)
+
+
+def _format_reminder_and_owners(
+    todos_due: list[dict], todos_overdue: list[dict]
+) -> tuple[str, list[tuple[str, str]]]:
+    """The daily reminder text, and the owners it names, in the order they appear."""
+    lines = ["📋 今日 TODO 提醒"]
+    owners: list[tuple[str, str]] = []
+    if todos_due:
+        lines.append("\n🔔 今天到期：")
+        for t in todos_due:
+            line, owner = _owner_line(t)
+            lines.append(f"- {line}")
+            if owner:
+                owners.append(owner)
+    if todos_overdue:
+        lines.append("\n⚠️ 已逾期 (7 天內):")
+        for t in todos_overdue:
+            line, owner = _owner_line(t)
+            lines.append(f"- {line} (due {t['due_date']})")
+            if owner:
+                owners.append(owner)
+    return "\n".join(lines), owners
 
 
 def _format_reminder(todos_due: list[dict], todos_overdue: list[dict]) -> str:
     """Compose daily reminder message."""
-    lines = ["📋 今日 TODO 提醒"]
-    if todos_due:
-        lines.append("\n🔔 今天到期：")
-        for t in todos_due:
-            lines.append(f"- {_owner_first(t)}")
-    if todos_overdue:
-        lines.append("\n⚠️ 已逾期 (7 天內):")
-        for t in todos_overdue:
-            lines.append(f"- {_owner_first(t)} (due {t['due_date']})")
-    return "\n".join(lines)
+    return _format_reminder_and_owners(todos_due, todos_overdue)[0]
+
+
+def _owner_targets(owners) -> list:
+    """「提到人就真 @」：@ 名字有印出來的 owner。出錯就不 @，不能讓 @ 擋掉這則提醒。"""
+    try:
+        import line_mentions
+
+        return line_mentions.user_mention_targets(owners)
+    except Exception as exc:
+        logger.warning("todo mention targets failed error_type=%s", type(exc).__name__)
+        return []
 
 
 def push_daily_reminders(group_id: str) -> int:
@@ -330,8 +371,11 @@ def push_daily_reminders(group_id: str) -> int:
     if not due and not overdue:
         logger.info("no due or overdue todos today, skip push group=%s", group_id)
         return 0
-    text = _format_reminder(due, overdue)
-    if _push(group_id, text):
+    text, owners = _format_reminder_and_owners(due, overdue)
+    # TODO(2026-11-13 deferred): TODO 沒有先搶列的去重。主 key 的 textV2 被拒收、改送純文字之後，同一天重跑會再送
+    # 一次（LINE 沒收過主 key）。現在 TODO 是 0 筆（抽取抓不到資料，見 _sweep_one_group），先接受。
+    retry_key = str(uuid.uuid5(uuid.NAMESPACE_URL, f"todo_daily:{group_id}:{datetime.now(_TW).date().isoformat()}"))
+    if _push(group_id, text, _owner_targets(owners), retry_key=retry_key):
         for t in due + overdue:
             mark_reminded(t["todo_id"])
         logger.info(
@@ -345,6 +389,8 @@ def push_daily_reminders(group_id: str) -> int:
 def _sweep_one_group(group_id: str) -> int:
     """Sweep last 7 days raw_messages of a single group for todo extraction."""
     import memory
+    # TODO(2026-11-13 deferred, Andrew 決定要不要修): raw_messages.created_at 是秒（memory.log_raw_message 寫
+    # strftime('%s')），這裡拿毫秒比，一筆都抓不到。修好之後 08:00 的 TODO 提醒就會開始 @ 人。
     since_ts = int((time.time() - 7 * 24 * 3600) * 1000)
     with memory._conn() as c:
         rows = c.execute(

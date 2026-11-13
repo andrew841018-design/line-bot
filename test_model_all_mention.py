@@ -475,6 +475,11 @@ MAY_PING = {
     "reminder_push._event_audience_covered calls event_mention_targets": 1,  # the same, for an event
     "event_reminder.build_reminder_message_spec calls event_mention_targets": 1,
     "event_reminder.build_reminder_message_spec calls text_v2_dict": 1,
+    # 2026-11-12 「提到人就真 @」 (Andrew): a push that names a family member @s them.  The helper only
+    # sends what its callers built; the whole-group callers are Andrew's 「@ 全家」 choices.
+    "line_push_client.push_text_with_mentions calls text_v2_dict": 1,
+    # every word is the program's: a role, a label from a fixed list, a time, a fixed sentence
+    "parent_health._red_flag_notice makes an all target": 1,
 }
 
 def _called(node) -> str:

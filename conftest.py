@@ -83,6 +83,8 @@ os.environ["LINE_BOT_COMPLAINT_LEARNING"] = "0"
 # 2026-10-28 爸媽健康改推群組的開關：測試預設私訊。設成空字串（＝私訊）而不是刪掉：main、todo、weekly_summary
 # 這類模組 import 時會 load_dotenv(override=False)，刪掉的話，測試中途才 import 的模組會把正式 .env 的開關加回來。
 os.environ["LINE_BOT_PARENT_HEALTH_GROUP_PUSH"] = ""
+# 2026-11-12 「提到人就真 @」的開關：測試照預設（開）。理由同上，設成空字串而不是刪掉；正式 .env 寫了 =0 也不影響測試。
+os.environ["LINE_BOT_PUSH_MENTIONS"] = ""
 # 2026-10-17 TikTok 讀取：預設關閉（0 = 不送 Gemini、不下載），要測的測試用假物件自己打開
 # TODO(2026-10-17 D4): 這只關掉讀影片／圖片；沒有替換 yt-dlp 的既有測試仍可能真的連網抓 metadata。
 os.environ["LINE_BOT_TIKTOK_MEDIA_DAILY_CAP"] = "0"
@@ -472,6 +474,7 @@ def block_external_side_effects(monkeypatch, request):
     # 的開關加回來。要測群組模式的測試自己 setenv。conftest 預設靜音（main.settings.bot_muted = True），
     # 要看到推播的測試也要自己解除靜音。
     monkeypatch.setenv("LINE_BOT_PARENT_HEALTH_GROUP_PUSH", "")
+    monkeypatch.setenv("LINE_BOT_PUSH_MENTIONS", "")  # 「提到人就真 @」照預設（開）
 
 
 # 直接測 line_push_client.push_messages 的傳輸層測試（自己給假的 session，不能被上面的替身換掉）
