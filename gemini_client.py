@@ -2414,6 +2414,40 @@ def _extract_reminder_last_tier(prompt: str, config) -> object | None:
     return response
 
 
+# What extract_reminder takes from the model's answer (2026-11-13): the six keys its prompt asks
+# for.  Every other key (mention_aliases, _trusted_direct_request, _time_*, _date_*) is the
+# program's, and a pasted message could ask the model for one: mention_aliases ["all"] pinged the
+# whole group at every push.  Keep this and the prompt's schema in step.  action is only checked
+# to be text that is not blank, not for its words: an @ or a line break there still reaches the
+# receipt, and every push pings a member it names (the next stage,
+# ops/state/line_bot_reminder_extract_mention_20261113/).
+_REMINDER_MODEL_NUMBER_KEYS = ("year", "month", "day", "hour", "minute")
+_REMINDER_MODEL_KEYS = ("action", *_REMINDER_MODEL_NUMBER_KEYS)
+
+
+def _reminder_model_number(value: object) -> int | None:
+    """A whole number from 0 to 9999: 15, 15.0, "15" or " 15 " (text has at most four digits).
+
+    None for anything else.  The callers' date check then fails only with ValueError, which they
+    handle.  An Infinity or a huge number raised OverflowError there instead: the drain put the row
+    back and asked the model again on every drain.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float):
+        if not value.is_integer():  # False for Infinity and NaN too
+            return None
+        value = int(value)
+    elif isinstance(value, str):
+        value = value.strip()
+        if not (1 <= len(value) <= 4 and value.isdecimal()):
+            return None
+        value = int(value)
+    if not isinstance(value, int) or not 0 <= value <= 9999:
+        return None
+    return value
+
+
 def extract_reminder(text: str, today_iso: str | None = None) -> dict | None:
     """從訊息抽 (action, datetime) 未來提醒。
 
@@ -2511,11 +2545,23 @@ output: {{"action": "看電影", ...下週三日期, "hour": 19, "minute": 0}}�
         # 驗證 schema
         if not isinstance(result, dict):
             return None
+        # Keep only the keys the prompt asks for, before the program adds its own (_time_* below):
+        # done after, a _time_default_kind the model wrote would survive whenever the text names a clock.
+        dropped = len(result.keys() - _REMINDER_MODEL_KEYS)
+        if dropped:
+            # A count only: the key names are the model's words.
+            logger.info("extract_reminder dropped %d key(s) the prompt never asked for", dropped)
+        result = {key: result[key] for key in _REMINDER_MODEL_KEYS if key in result}
         required = ("action", "month", "day", "hour", "minute")
         if not all(k in result for k in required):
             return None
-        # year 預設今年
-        if "year" not in result:
+        if not isinstance(result["action"], str) or not result["action"][:50].strip():
+            # Not words (null, a number, a list), or blank in the 50 characters kept below: str() made
+            # a null into a reminder called 「None」.
+            logger.info("extract_reminder unreadable action type=%s", type(result["action"]).__name__)
+            return None
+        # year 預設今年（沒給或 null）
+        if result.get("year") is None:
             result["year"] = datetime.now().year
         default_time = reminder_intent.resolve_reminder_default_time(text)
         if not reminder_intent.has_explicit_reminder_clock(text):
@@ -2533,6 +2579,24 @@ output: {{"action": "看電影", ...下週三日期, "hour": 19, "minute": 0}}�
             text,
             result["action"],
         ):
+            return None
+        # Last, so the check sees the numbers the callers will use: the program has already replaced
+        # the model's time when the text names no clock, and its date when it names one weekday and
+        # no date.
+        for key in _REMINDER_MODEL_NUMBER_KEYS:
+            value = result[key]
+            number = _reminder_model_number(value)
+            if number is None:
+                # The key is one of ours and the type name Python's: no words of the model's.
+                logger.info("extract_reminder unreadable %s type=%s", key, type(value).__name__)
+                return None
+            result[key] = number
+        try:
+            result["action"].encode("utf-8")
+        except UnicodeEncodeError:
+            # A lone surrogate (JSON "\ud800") cannot be stored: the drain put the row back and asked
+            # the model again on every drain.  Last, as the program may have replaced the action.
+            logger.info("extract_reminder unwritable action (lone surrogate)")
             return None
         return result
     except Exception as e:
