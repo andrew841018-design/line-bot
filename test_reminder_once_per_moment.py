@@ -433,14 +433,21 @@ def test_a_vague_row_between_two_appointments_is_not_guessed(monkeypatch):
     assert {_status(r) for r in (vague, early, late)} == {"pending"}
 
 
-def test_different_activities_at_the_same_place_and_time_stay_separate(monkeypatch):
+def test_different_activities_by_one_person_at_one_clock_fold_into_one(monkeypatch):
+    # 2026-11-12 Andrew (bug C) replaces the 10/04 guard that kept these two
+    # apart: one person's rows at one explicit clock are one push whatever they
+    # say, and the other wording rides along as 細節.
     at = _at(_day(3), 14)
     first = _insert("合成路1號3樓開會", at)
     second = _insert("合成路1號3樓上課", at)
     calls = _record_pushes(monkeypatch)
     _set_now(monkeypatch, at - 3600)
-    assert reminder_push.push_reminders() == 2
-    assert len(calls) == 2 and _status(first) == _status(second) == "pending"
+    assert reminder_push.push_reminders() == 1
+    assert len(calls) == 1
+    assert {_status(first), _status(second)} == {"pending", "cancelled"}
+    survivor, other = (first, "合成路1號3樓上課") if _status(first) == "pending" else (
+        second, "合成路1號3樓開會")
+    assert other in _details(survivor) and other in calls[0]["text"]
 
 
 def test_different_people_never_fold(monkeypatch):

@@ -245,6 +245,12 @@ def fuller_detail_line(action: object, merged_details: object) -> str:
     the fuller one (in its place); never one with no words beyond ``action``
     or a 前一天／當天 label; at most three items and 120 characters, one line.
     """
+    pieces = _detail_pieces(action, merged_details)
+    return "細節：" + _DETAIL_SEPARATOR.join(pieces) if pieces else ""
+
+
+def _detail_pieces(action: object, merged_details: object) -> list[str]:
+    """The wordings :func:`fuller_detail_line` shows, in order."""
     action_core = _wording_core(action)
     chosen: list[tuple[str, str]] = []
     for item in merged_details or []:
@@ -278,7 +284,7 @@ def fuller_detail_line(action: object, merged_details: object) -> str:
             cost = len(wording)
         pieces.append(wording)
         used += cost
-    return "細節：" + _DETAIL_SEPARATOR.join(pieces) if pieces else ""
+    return pieces
 
 
 def _format_push_text(r: dict, stage: str, now: int | None = None) -> str:
@@ -417,6 +423,18 @@ def mark_reminders_pushed(reminders: list[tuple[int, str]]) -> int:
 # folded: a 前一天／當天 pair the user asked for (contextual_date_once), a
 # calendar mirror, an offset-labelled reminder, rows for other people, rows
 # on another date, and times that cannot be one occurrence (09:00 vs 19:00).
+#
+# 2026-11-12 Andrew (bug C, 「同一時刻只推一則」): one person's rows at one
+# explicit clock for the same people are one push whatever their wording (a
+# typo and its fix, two names for one office).  They fold at the first due
+# moment like any pair, and the identity check does not keep them apart.
+# The cost he accepted: two different things at the same minute fold too,
+# and cancelling either afterwards cancels both.  Such a twin rides along
+# only while its words still show on the push (the 細節 line keeps 3 items
+# and 120 characters) and when neither side asked to be reminded less
+# (push_keep_stage); if a twin's own restatement cannot join, or a later
+# twin hides an earlier one, no twin joins.  Otherwise both are pushed as
+# before, never neither.
 
 
 def _foldable(row: dict) -> bool:
@@ -513,10 +531,93 @@ def _identity_conflict(row: dict, identity: list[str], names: tuple[str, ...]) -
     )
 
 
-def _same_event_pair_test():
-    """The fold's pair test: same group, Taipei date and audience, and the
-    same-event matcher reading either row into the other.  Caches audiences."""
+def _same_author_clock_moment(left: dict, right: dict) -> bool:
+    """One person's two rows at one explicit clock (2026-11-12, bug C).
+
+    The same non-empty ``user_id``, both times stored as a clock (``time_kind``
+    'clock'; NULL, 'none' and dayparts never count) and the same ``remind_at``
+    (always whole minutes).  The fold's other conditions (group, Taipei date,
+    audience, foldable kinds) still apply on top of this.
+    """
+    author = str(left.get("user_id") or "")
+    return (
+        bool(author)
+        and author == str(right.get("user_id") or "")
+        and str(left.get("time_kind") or "") == "clock"
+        and str(right.get("time_kind") or "") == "clock"
+        and int(left["remind_at"]) == int(right["remind_at"])
+    )
+
+
+def _details_after_fold(primary: dict, members: list[dict]) -> list[dict]:
+    """The primary's merged_details once ``members`` fold into it: the same
+    fragments, order and limit memory.fold_same_event_reminders writes.
+
+    TODO(2026-11-12, bug C review): move this mirror into a memory helper once
+    the 「只推一次」 change to that fold has landed (pinned by a test); a rider
+    tag there could also keep riders outside the 細節 cap, since a later
+    restatement can still crowd one off after it folded.
+    """
+    fragments = [item for item in primary.get("merged_details") or [] if isinstance(item, dict)]
+    known = {item.get("key") for item in fragments}
+    own = memory.merged_detail_key(
+        str(primary.get("action") or ""), str(primary.get("source_text") or "")
+    )
+    for member in members:
+        for fragment in (
+            memory._merged_detail_fragment(
+                str(member.get("action") or ""), str(member.get("source_text") or "")
+            ),
+            *(member.get("merged_details") or []),
+        ):
+            key = fragment.get("key") if isinstance(fragment, dict) else None
+            if (
+                not key
+                or key == own
+                or key in known
+                or len(fragments) >= memory._MERGED_DETAIL_LIMIT
+            ):
+                continue
+            fragments.append(fragment)
+            known.add(key)
+    return fragments
+
+
+def _twin_visible(primary: dict, pieces: list[str], twin: dict) -> bool:
+    """Whether a twin's words are inside the primary's action or on a shown
+    piece of its 細節 line (as memory stores them)."""
+    core = _wording_core(
+        memory._merged_detail_fragment(
+            str(twin.get("action") or ""), str(twin.get("source_text") or "")
+        )["action"]
+    )
+    if not core:
+        return False  # nothing that could show (an emoji-only errand): keep it apart
+    return core in _wording_core(primary.get("action")) or any(
+        core in _wording_core(piece) for piece in pieces
+    )
+
+
+def _twin_shows(primary: dict, members: list[dict], twin: dict) -> bool:
+    """Whether a twin still shows once ``members`` and then the twin fold.  A
+    twin is another errand: the 3-item / 120-character cap must never drop it."""
+    pieces = _detail_pieces(primary.get("action"), _details_after_fold(primary, [*members, twin]))
+    return _twin_visible(primary, pieces, twin)
+
+
+def _same_event_pair_test(clock_rule: bool = True):
+    """The fold's pair test: same group, Taipei date and audience, and either
+    the same-event matcher reading either row into the other or (unless
+    ``clock_rule`` is off) one person's two rows at one explicit clock.
+    Caches audiences."""
     audience: dict[int, tuple[str, ...]] = {}
+    merges: dict[tuple[int, int], bool] = {}
+
+    def merges_into(incoming: dict, kept: dict) -> bool:
+        key = (int(incoming["reminder_id"]), int(kept["reminder_id"]))
+        if key not in merges:
+            merges[key] = _merges_into(incoming, kept)
+        return merges[key]
 
     def same_audience(left: dict, right: dict) -> bool:
         for row in (left, right):
@@ -530,7 +631,11 @@ def _same_event_pair_test():
             str(left.get("group_id") or "") == str(right.get("group_id") or "")
             and _tw_date(left["remind_at"]) == _tw_date(right["remind_at"])
             and same_audience(left, right)
-            and (_merges_into(left, right) or _merges_into(right, left))
+            and (
+                (clock_rule and _same_author_clock_moment(left, right))
+                or merges_into(left, right)
+                or merges_into(right, left)
+            )
         )
 
     return pair
@@ -542,39 +647,56 @@ def plan_folds(
     """Pure: (primary, rows folded into it) for each event with a due row.
 
     ``keep_ids`` are rows a receipt being sent right now names (fixC12): a
-    connected set of same-event rows holding one is not folded at this moment,
-    so the receipt's own row is never cancelled under it; a later moment folds
-    it as usual.
+    connected set of rows holding one (same-event rows and one person's rows
+    at one clock) is not folded at this moment, so the receipt's own row is
+    never cancelled under it; a later moment folds it as usual.
+
+    The primary's event folds as before (matcher, identity, vague-time
+    checks).  Then riders join (2026-11-12): one person's rows at the clock of
+    a folded row, and rows the matcher reads into a rider (checked against
+    that rider's own errand: the riders the matcher connects), while their
+    words still show on the push, no vague mention could be another
+    occurrence, and nobody asked for fewer notices on either side.  Riders never redefine the
+    event in this pass and are marked ``fold_twin``.  If a rider's own
+    restatement cannot join, a rider ends off the 細節 line, or the rider
+    phase raises, no rider joins and the start row plans exactly as before
+    the rider rule (its matcher-only component and primary).
     """
     eligible = [row for row in rows if _foldable(row)]
     if len(eligible) < 2:
         return []
     keep = {int(rid) for rid in keep_ids}
     pair = _same_event_pair_test()
+    matched = _same_event_pair_test(clock_rule=False)
 
     taken: set[int] = set()
     plans: list[tuple[dict, list[dict]]] = []
-    for row in sorted(eligible, key=lambda r: (int(r["remind_at"]), int(r["reminder_id"]))):
-        if int(row["reminder_id"]) in taken or reminder_stages.open_stage(row, now) is None:
-            continue
-        component = [row]
-        seen = {int(row["reminder_id"])}
-        frontier = [row]
+
+    def rid(row: dict) -> int:
+        return int(row["reminder_id"])
+
+    def component_of(start: dict, link) -> tuple[list[dict], set[int]]:
+        component, seen, frontier = [start], {rid(start)}, [start]
         while frontier:
             current = frontier.pop()
             for other in eligible:
-                other_id = int(other["reminder_id"])
-                if other_id in seen or other_id in taken:
+                if rid(other) in seen or rid(other) in taken:
                     continue
-                if pair(current, other):
-                    seen.add(other_id)
+                if link(current, other):
+                    seen.add(rid(other))
                     component.append(other)
                     frontier.append(other)
-        if seen & keep:
-            taken |= seen
-            continue
-        if len(component) < 2:
-            continue
+        return component, seen
+
+    def fits(left: dict, right: dict) -> bool:
+        return reminder_intent.times_compatible(
+            left.get("time_kind"),
+            _hhmm(left["remind_at"]),
+            right.get("time_kind"),
+            _hhmm(right["remind_at"]),
+        )
+
+    def grow(component: list[dict], allow_riders: bool) -> tuple[dict, list[dict], set[int]]:
         primary = min(component, key=_primary_rank)
         names = tuple(
             dict.fromkeys(
@@ -582,47 +704,223 @@ def plan_folds(
             )
         )
         folded = [primary]
+        riders: set[int] = set()
         identity = _identity_texts(primary)
         remaining = [member for member in component if member is not primary]
 
-        def fits(left: dict, right: dict) -> bool:
-            return reminder_intent.times_compatible(
-                left.get("time_kind"),
-                _hhmm(left["remind_at"]),
-                right.get("time_kind"),
-                _hhmm(right["remind_at"]),
+        def vague(other: dict, link) -> bool:
+            # A vague mention that could also be another occurrence the same
+            # day (12:00 default next to both 14:00 and 17:00) stays:
+            # guessing could silence a real appointment.
+            return any(
+                member is not other
+                and not fits(primary, member)
+                and fits(other, member)
+                and link(other, member)
+                for member in component
             )
 
         grown = True
-        while grown:
+        while grown:  # the event itself, exactly as before
             grown = False
             for other in list(remaining):
                 # Every folded row must fit the primary's time and agree with
                 # everything already folded (an absorbed 第一劑 keeps 第二劑 out).
-                if not fits(primary, other):
+                if not fits(primary, other) or not any(matched(other, m) for m in folded):
                     continue
-                if not any(pair(other, member) for member in folded):
-                    continue
-                if _identity_conflict(other, identity, names):
-                    continue
-                # A vague mention that could also be another occurrence the
-                # same day (12:00 default next to both 14:00 and 17:00) stays:
-                # guessing could silence a real appointment.
-                if any(
-                    member is not other
-                    and not fits(primary, member)
-                    and fits(other, member)
-                    and pair(other, member)
-                    for member in component
-                ):
+                if _identity_conflict(other, identity, names) or vague(other, matched):
                     continue
                 folded.append(other)
                 identity += _identity_texts(other)
                 remaining.remove(other)
                 grown = True
+        if not allow_riders:
+            return primary, folded, riders
+        known_links: dict[frozenset[int], bool] = {}
+
+        def linked(left: dict, right: dict) -> bool:
+            key = frozenset((rid(left), rid(right)))
+            if key not in known_links:
+                known_links[key] = matched(left, right)
+            return known_links[key]
+
+        restated: dict[int, int] = {}  # restatement rider -> the rider it was attached to
+
+        def errands() -> list[list[dict]]:
+            """One errand per group of same-clock riders the matcher connects,
+            with the restatements attached to it.  A restatement never bridges
+            two errands, so a generic wording cannot pull 第1劑 and 第2劑 together."""
+            base = [m for m in folded if rid(m) in riders and rid(m) not in restated]
+            found: list[list[dict]] = []
+            seen_ids: set[int] = set()
+            for start_row in sorted(base, key=rid):
+                if rid(start_row) in seen_ids:
+                    continue
+                group, frontier = [start_row], [start_row]
+                seen_ids.add(rid(start_row))
+                while frontier:
+                    current = frontier.pop()
+                    for other in base:
+                        if rid(other) not in seen_ids and linked(current, other):
+                            seen_ids.add(rid(other))
+                            group.append(other)
+                            frontier.append(other)
+                group_ids = {rid(m) for m in group}
+                attached = True
+                while attached:  # restatements of restatements belong there too
+                    attached = False
+                    for m in folded:
+                        if rid(m) in restated and rid(m) not in group_ids and (
+                            restated[rid(m)] in group_ids
+                        ):
+                            group.append(m)
+                            group_ids.add(rid(m))
+                            attached = True
+                found.append(group)
+            return found
+
+        def candidate_errands(other: dict) -> list[tuple[list[dict], list[str]]]:
+            """Each errand ``other`` restates, with that errand's identity."""
+            return [
+                (group, [text for member in group for text in _identity_texts(member)])
+                for group in errands()
+                if any(linked(other, member) for member in group)
+            ]
+
+        def may_ride(other: dict) -> bool:
+            # 「只推一次」(push_keep_stage) on either side: folding would push
+            # the other errand less, or this one more, than was asked.
+            if any(row.get("push_keep_stage") for row in (other, *folded)):
+                return False
+            # Fold a rider only while its words still show (never neither).
+            return not vague(other, pair) and _twin_shows(primary, folded[1:], other)
+
+        def ride(other: dict) -> None:
+            folded.append(other)
+            riders.add(rid(other))
+            remaining.remove(other)
+
+        grown = True
+        while grown:  # then riders: another errand at the same person's clock
+            grown = False
+            # One person's rows at a folded row's clock join whatever they say,
+            # before any restatement, so the order of the rows never matters.
+            for other in list(remaining):
+                if (
+                    fits(primary, other)
+                    and any(_same_author_clock_moment(m, other) for m in folded)
+                    and may_ride(other)
+                ):
+                    ride(other)
+                    grown = True
+            # A rider's restatement joins the first errand it restates and
+            # agrees with (第1劑 keeps 第2劑 out); other errands do not count.
+            for other in list(remaining):
+                if not fits(primary, other):
+                    continue
+                home = next(
+                    (
+                        group
+                        for group, identity in candidate_errands(other)
+                        if not _identity_conflict(other, identity, names)
+                    ),
+                    None,
+                )
+                if home is not None and may_ride(other):
+                    ride(other)
+                    restated[rid(other)] = rid(
+                        next(m for m in home if linked(other, m))
+                    )
+                    grown = True
+
+        def clashes_within(group: list[dict]) -> bool:
+            # Same-clock riders that contradict each other (the accepted
+            # trade-off, 第1劑 next to 第2劑) cannot judge a restatement as one.
+            return any(
+                _identity_conflict(
+                    member, [t for m in group if m is not member for t in _identity_texts(m)], names
+                )
+                for member in group
+            )
+
+        def split_off(other: dict) -> bool:
+            # A row left out that restates a rider's errand (at any compatible
+            # time) and agrees with it, or with a rider it restates in an errand
+            # that contradicts itself: splitting would push that errand twice.
+            if not fits(primary, other):
+                return False
+            for group, identity in candidate_errands(other):
+                if not _identity_conflict(other, identity, names):
+                    return True
+                if clashes_within(group) and any(
+                    linked(other, m) and not _identity_conflict(other, _identity_texts(m), names)
+                    for m in group
+                ):
+                    return True
+            return False
+
+        def restatement_clashes() -> bool:
+            # A same-clock row that joined later can still contradict a
+            # restatement already in its errand: then plan as before.
+            for group in errands():
+                for member in group:
+                    rest = [t for m in group if m is not member for t in _identity_texts(m)]
+                    if rid(member) in restated and _identity_conflict(member, rest, names):
+                        return True
+            return False
+
+        if riders and any(split_off(other) for other in remaining):
+            # A rider's own restatement (any compatible time, vague ones too)
+            # could not join (push limit, 細節 cap): splitting them would push
+            # that event twice, so the start row plans as before.
+            return primary, [primary], set()
+        if riders and restatement_clashes():
+            return primary, [primary], set()
+        if riders:
+            # A later rider can still crowd an earlier one off the 細節 line.
+            final = _detail_pieces(primary.get("action"), _details_after_fold(primary, folded[1:]))
+            if not all(_twin_visible(primary, final, m) for m in folded[1:] if rid(m) in riders):
+                return primary, [primary], set()
+        return primary, folded, riders
+
+    for row in sorted(eligible, key=lambda r: (int(r["remind_at"]), int(r["reminder_id"]))):
+        if rid(row) in taken or reminder_stages.open_stage(row, now) is None:
+            continue
+        try:
+            component, seen = component_of(row, pair)
+        except Exception as exc:  # the rider rule must never stop the old folds
+            logger.warning(
+                "same-clock riders skipped rid=%d: %s", rid(row), type(exc).__name__
+            )
+            component, seen = component_of(row, matched)
+        if seen & keep:
+            taken |= seen
+            continue
+        if len(component) < 2:
+            continue
+        try:
+            primary, folded, riders = grow(component, allow_riders=True)
+        except Exception as exc:  # the rider rule must never stop the old folds
+            logger.warning(
+                "same-clock riders skipped rid=%d: %s", rid(row), type(exc).__name__
+            )
+            riders = set()
+        if not riders:
+            component, _seen = component_of(row, matched)
+            if len(component) < 2:
+                continue
+            primary, folded, riders = grow(component, allow_riders=False)
         if len(folded) > 1:
-            plans.append((primary, folded[1:]))
-            taken.update(int(member["reminder_id"]) for member in folded)
+            # ``fold_twin`` marks riders (another errand) for the 「只推一次」
+            # change in memory.fold_same_event_reminders: no push_keep_stage
+            # hand-over from them.
+            plans.append(
+                (
+                    primary,
+                    [{**m, "fold_twin": True} if rid(m) in riders else m for m in folded[1:]],
+                )
+            )
+            taken.update(rid(m) for m in folded)
     return plans
 
 
