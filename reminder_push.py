@@ -24,13 +24,15 @@ import logging
 import re
 import time
 import unicodedata
+import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from linebot.v3.messaging import (
-    ApiClient, Configuration, MessagingApi, PushMessageRequest, TextMessage,
+    ApiClient, Configuration, MessagingApi, PushMessageRequest, TextMessage, TextMessageV2,
 )
 
+import line_errors
 import memory
 import line_mentions
 import reminder_intent
@@ -51,6 +53,89 @@ def _line_access_token() -> str:
     return line_access_token()
 
 
+# The cause of a status-less failure is shown only as an exception type name (…Error / …Exception, at
+# most 32 characters): an id or a value a reason string may start with cannot fit that shape.
+_CAUSE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,22}(?:Error|Exception)(?![A-Za-z0-9_])")
+
+
+def _failure_detail(e: BaseException) -> str:
+    """`line_errors.error_detail` (status, reason, request id, LINE's message and property paths; never
+    text or ids), plus the type of the cause when LINE gave no status (a timeout, a dropped connection, an
+    SSL error the SDK wraps as status 0), which that line alone reduces to the exception's type."""
+    detail = line_errors.error_detail(e)
+    if line_errors.http_status(e) is None:
+        reason = getattr(e, "reason", None)
+        if isinstance(reason, BaseException):
+            detail += f" cause={type(reason).__name__}"
+        elif isinstance(reason, str):
+            name = _CAUSE_NAME_RE.match(reason.strip())
+            if name:
+                detail += f" cause={name.group(0)}"
+    return detail
+
+
+def _send_once(
+    cfg: Configuration,
+    group_id: str,
+    message: object,
+    retry_key: str | None,
+    max_retries: int,
+) -> tuple[str, object | None]:
+    """Push one message, retrying what may succeed later.
+
+    Returns ("sent", response) | ("taken", None): the retry key was accepted
+    earlier (409) | ("refused", None): LINE answered a 4xx other than 409/429,
+    so it sent nothing and the same message will not do better | ("failed",
+    None): 429, or a 5xx / timeout / connection error on every try (the
+    message may have gone out, so only this key may carry it again).
+    """
+    for attempt in range(max_retries):
+        try:
+            with ApiClient(cfg) as api_client:
+                request = PushMessageRequest(to=group_id, messages=[message])
+                api = MessagingApi(api_client)
+                response = (
+                    api.push_message(request, x_line_retry_key=retry_key)
+                    if retry_key
+                    else api.push_message(request)
+                )
+            return "sent", response
+        except Exception as e:
+            status = line_errors.http_status(e)
+            if status == 409:
+                # A deterministic X-Line-Retry-Key returning 409 means LINE
+                # accepted the same logical delivery earlier.
+                logger.info(
+                    "LINE push retry key already accepted (group=%s)",
+                    group_id,
+                )
+                return "taken", None
+            # The SDK's str(e) carries LINE's response headers and body, so the
+            # text test is only for a failure that has no status at all.
+            if status == 429 or (status is None and "429" in str(e)):
+                logger.warning("LINE push 429 quota (group=%s) — no retry", group_id)
+                return "failed", None
+            if status is not None and 400 <= status < 500:
+                logger.warning(
+                    "LINE push refused (group=%s): %s", group_id, _failure_detail(e)
+                )
+                return "refused", None
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt
+                logger.info(
+                    "LINE push fail (group=%s, attempt %d/%d), retry in %ds: %s",
+                    group_id, attempt + 1, max_retries, wait, _failure_detail(e),
+                )
+                time.sleep(wait)
+                continue
+            logger.warning(
+                "LINE push failed after %d attempts (group=%s): %s",
+                max_retries, group_id, _failure_detail(e),
+            )
+            return "failed", None
+    return "failed", None
+
+
 def _push_to_group(
     group_id: str,
     text: str,
@@ -66,6 +151,11 @@ def _push_to_group(
     2026-05-29 加 retry 防 transient 5xx（GP2#2）：
       - 429（monthly quota / rate limit）：不重試，立即 False
       - 其他 exception（5xx / network）：exponential backoff (1s/2s/4s) 重試
+    2026-11-13「提到人就真 @」（agent_rules/line_bot.md 2026-11-12）：LINE 拒收
+    （409、429 以外的 4xx）真 @ 的 textV2 時，改送 ``text``（@名字照寫的純文字版）一次，
+    retry key 另算（``<retry_key>:plain`` 的 uuid5）。4xx 重送同一則不會變，所以
+    純文字再被拒收、或本來就是純文字被拒收，都直接結束（下一輪再試）。
+    429、5xx、逾時不改送純文字：textV2 可能已經送到，只能用原本的 key 再送。
     """
     safe_text = validate_push_text(text, source="reminder_push")
     if not safe_text.strip():
@@ -73,91 +163,66 @@ def _push_to_group(
         return False
     if safe_text != text:
         message = TextMessage(text=safe_text[:4900])
+    plain = TextMessage(text=safe_text[:4900])
+    first = message or plain
     cfg = Configuration(access_token=_line_access_token())
-    for attempt in range(max_retries):
-        try:
-            with ApiClient(cfg) as api_client:
-                request = PushMessageRequest(
-                    to=group_id,
-                    messages=[message or TextMessage(text=safe_text[:4900])],
+    outcome, response = _send_once(cfg, group_id, first, retry_key, max_retries)
+    if outcome == "refused" and isinstance(first, TextMessageV2):
+        logger.warning(
+            "LINE refused the reminder's @ message (rid=%s); sending it as plain text once",
+            reminder_id,
+        )
+        plain_key = (
+            str(uuid.uuid5(uuid.NAMESPACE_URL, f"{retry_key}:plain"))
+            if retry_key
+            else None
+        )
+        outcome, response = _send_once(cfg, group_id, plain, plain_key, max_retries)
+    if outcome == "taken":
+        return True
+    if outcome != "sent":
+        return False
+    # LINE 已接受後，archive 失敗不可觸發 retry，否則會重複推播。
+    try:
+        for sent in getattr(response, "sent_messages", None) or []:
+            sent_id = getattr(sent, "id", None)
+            if sent_id:
+                memory.log_raw_message(
+                    group_id,
+                    str(sent_id),
+                    "__bot__",
+                    safe_text,
                 )
-                api = MessagingApi(api_client)
-                response = (
-                    api.push_message(request, x_line_retry_key=retry_key)
-                    if retry_key
-                    else api.push_message(request)
-                )
-            # LINE 已接受後，archive 失敗不可觸發 retry，否則會重複推播。
-            try:
-                for sent in getattr(response, "sent_messages", None) or []:
-                    sent_id = getattr(sent, "id", None)
-                    if sent_id:
-                        memory.log_raw_message(
-                            group_id,
-                            str(sent_id),
-                            "__bot__",
-                            safe_text,
+                if reminder_id is not None or (
+                    source_kind and source_ref
+                ):
+                    reference_kwargs: dict[str, object] = {
+                        "reminder_id": (
+                            int(reminder_id)
+                            if reminder_id is not None
+                            else None
                         )
-                        if reminder_id is not None or (
-                            source_kind and source_ref
-                        ):
-                            reference_kwargs: dict[str, object] = {
-                                "reminder_id": (
-                                    int(reminder_id)
-                                    if reminder_id is not None
-                                    else None
-                                )
+                    }
+                    if source_kind and source_ref:
+                        reference_kwargs.update(
+                            {
+                                "source_kind": source_kind,
+                                "source_ref": source_ref,
                             }
-                            if source_kind and source_ref:
-                                reference_kwargs.update(
-                                    {
-                                        "source_kind": source_kind,
-                                        "source_ref": source_ref,
-                                    }
-                                )
-                            memory.log_sent_reminder_reference(
-                                group_id,
-                                str(sent_id),
-                                **reference_kwargs,
-                            )
-            except Exception as archive_error:
-                logger.error(
-                    "reminder push delivered but sent-message archive failed "
-                    "group=%s: %s",
-                    group_id,
-                    str(archive_error)[:200],
-                )
-            return True
-        except Exception as e:
-            err_str = str(e)
-            status = getattr(e, "status", None)
-            if status is None:
-                status = getattr(e, "status_code", None)
-            if status == 409:
-                # A deterministic X-Line-Retry-Key returning 409 means LINE
-                # accepted the same logical delivery earlier.
-                logger.info(
-                    "LINE push retry key already accepted (group=%s)",
-                    group_id,
-                )
-                return True
-            if status == 429 or "429" in err_str:
-                logger.warning("LINE push 429 quota (group=%s) — no retry", group_id)
-                return False
-            if attempt < max_retries - 1:
-                wait = 2 ** attempt
-                logger.info(
-                    "LINE push fail (group=%s, attempt %d/%d), retry in %ds: %s",
-                    group_id, attempt + 1, max_retries, wait, err_str[:120],
-                )
-                time.sleep(wait)
-                continue
-            logger.warning(
-                "LINE push failed after %d attempts (group=%s): %s",
-                max_retries, group_id, err_str[:120],
-            )
-            return False
-    return False
+                        )
+                    memory.log_sent_reminder_reference(
+                        group_id,
+                        str(sent_id),
+                        **reference_kwargs,
+                    )
+    except Exception as archive_error:
+        logger.error(
+            "reminder push delivered but sent-message archive failed "
+            "group=%s: %s",
+            group_id,
+            str(archive_error)[:200],
+        )
+    return True
 
 
 def _decide_stage(r: dict, now: int) -> str | None:
