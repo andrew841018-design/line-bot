@@ -12,6 +12,7 @@ import signal
 import threading
 import time
 import timeit
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -21,14 +22,19 @@ def cpu_seconds(check, text, deadline=60):
 
     Waiting for a CPU, sleeping and other threads do not count, and ``timeit`` pauses GC (a collection of the full
     run's heap is not ``check``'s cost).  2026-11-06, load about 250: a 30 ms helper measured 0.14 s of wall time, and
-    in a full run a call hit the old 5 s deadline.  Real slowness burns CPU, so the thresholds still catch it.  The
-    deadline only has to stop a hang, and one false failure costs a rerun of more than three hours, so it is generous.
-    A wait added to the timed code is invisible here, so use this on pure computation only (no I/O, locks or pools).
-    It takes over ITIMER_REAL: an outer timer does not survive it.
+    in a full run a call hit the old 5 s deadline.  Real slowness burns CPU on this thread, so the thresholds still
+    catch it.  The deadline only has to stop a hang, and one false failure costs a rerun of more than three hours, so
+    it is generous.  A wait, or work moved to another thread, is invisible here, so use this on pure computation only
+    (no I/O, locks or pools).  Where the code can reach a fetch or a pool, make the test fail on it
+    (``forbid_other_threads`` below, ``_no_fetch`` in test_stock_chitchat_quote.py), and with pytest.fail: the code's
+    own ``except Exception`` eats an AssertionError.
+
+    ``text`` can be any object.  This takes over ITIMER_REAL: an outer timer does not survive it.
     """
+    label = str(text)[:12]  # not in the handler: an Exception there could be eaten, and the timer fires once
 
     def expire(*_):
-        pytest.fail(f"still running after {deadline} s: {text[:12]!r}")
+        pytest.fail(f"still running after {deadline} s: {label!r}")
 
     previous = signal.signal(signal.SIGALRM, expire)
     try:
@@ -37,6 +43,27 @@ def cpu_seconds(check, text, deadline=60):
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous)
+
+
+def forbid_other_threads(monkeypatch):
+    """Fail when the main thread starts a thread or submits to a pool: ``cpu_seconds`` would read that work as free.
+
+    For timed code with threads or pools within reach.  Moving a slow check to a pool with a timeout looks like a fix
+    and is none: a running regex keeps the other threads waiting, and with ``\\d+\\s*%`` on 20000 digits
+    ``result(timeout=0.05)`` came back after 3.1 s (2026-11-07).  Threads left over from earlier tests pass: they are
+    not the timed code.
+    """
+
+    def refuse(real):
+        def guard(self, *args, **kwargs):
+            if threading.current_thread() is threading.main_thread():
+                pytest.fail("the timed code left this thread (thread or thread pool): thread_time would not see it")
+            return real(self, *args, **kwargs)
+
+        return guard
+
+    monkeypatch.setattr(threading.Thread, "start", refuse(threading.Thread.start))
+    monkeypatch.setattr(ThreadPoolExecutor, "submit", refuse(ThreadPoolExecutor.submit))
 
 
 def test_quadratic_work_counts_but_sleeping_does_not():
@@ -76,3 +103,35 @@ def test_gc_pause_and_timer_are_undone_and_a_hang_still_fails():
     with pytest.raises(pytest.fail.Exception):
         cpu_seconds(lambda _: time.sleep(5), "x", deadline=0.05)
     assert gc.isenabled() and signal.getsignal(signal.SIGALRM) is handler
+
+
+def test_a_hang_fails_the_same_way_whatever_the_input_is():
+    """Some tests pass a number or a dict.  An ``Exception`` from the handler could be eaten by the timed code, and the
+    timer fires once, so the hang would have no deadline left."""
+    with pytest.raises(pytest.fail.Exception):
+        cpu_seconds(lambda _: time.sleep(5), 20000, deadline=0.05)
+
+
+def test_forbid_other_threads_stops_the_main_thread_only(monkeypatch):
+    go, ran = threading.Event(), []
+
+    def leftover():
+        go.wait(5)
+        inner = threading.Thread(target=ran.append, args=("thread",))
+        inner.start()
+        inner.join()
+        with ThreadPoolExecutor(1) as pool:
+            pool.submit(ran.append, "pool")
+
+    earlier = threading.Thread(target=leftover)
+    earlier.start()
+    with ThreadPoolExecutor(1) as warm:
+        warm.submit(int).result()  # its worker is up: submit no longer goes through Thread.start
+        forbid_other_threads(monkeypatch)
+        with pytest.raises(pytest.fail.Exception):
+            warm.submit(print)
+    with pytest.raises(pytest.fail.Exception):
+        threading.Thread(target=print).start()
+    go.set()
+    earlier.join()
+    assert ran == ["thread", "pool"]

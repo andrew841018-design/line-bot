@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import dataclasses
 import random
-import time
 from datetime import timedelta
 
 import pytest
@@ -18,6 +17,7 @@ import dinner_places
 import main
 import reply_policy
 import reply_provenance
+from test_support_timing import cpu_seconds
 
 
 @pytest.mark.parametrize(
@@ -54,9 +54,7 @@ def test_unbacked_contact_details(reply, backing, unbacked):
 @pytest.mark.parametrize("unit", ["路", "一", "剛路", "0", "02-", "忠孝東路二段", "巷1號"])
 def test_scan_is_linear(n, unit):
     text = (unit * n)[:n]
-    start = time.perf_counter()
-    reply_policy.unbacked_contact_details(text, [text])
-    assert time.perf_counter() - start < 1.0
+    assert cpu_seconds(lambda t: reply_policy.unbacked_contact_details(t, [t]), text) < 1.0
 
 
 def _enforce(reply, **kwargs):
@@ -233,9 +231,7 @@ def test_a_listed_name_with_another_listed_address_is_unbacked():
 )
 def test_scan_with_listed_places_is_linear(unit):
     text = (unit * 20000)[:20000]
-    start = time.perf_counter()
-    reply_policy.unbacked_contact_details(text, [], _LISTED)
-    assert time.perf_counter() - start < 1.0
+    assert cpu_seconds(lambda t: reply_policy.unbacked_contact_details(t, [], _LISTED), text) < 1.0
 
 
 @pytest.mark.parametrize(

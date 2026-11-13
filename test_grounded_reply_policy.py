@@ -982,9 +982,9 @@ def test_a_claim_nobody_asked_about_gets_an_answer_or_nothing(monkeypatch, resea
     monkeypatch.setattr(main, "_collect_web_research_sources", lambda _text: [])
     assert main._handle_web_research_question(research_env.event, "G_GR", "今天總統宣布停火了", addressed=False)
     assert research_env.sent == [] and finished == [True]
-    # somebody asking still gets told nothing could be confirmed
+    # somebody asking gets the same since 2026-11-06 (Andrew chose silence)
     assert main._handle_web_research_question(research_env.event, "G_GR", "今天總統宣布停火了嗎")
-    assert research_env.sent == [public_research.NO_EVIDENCE]
+    assert research_env.sent == [] and finished == [True, True]
 
 
 def test_an_attached_notice_may_be_cited(monkeypatch):

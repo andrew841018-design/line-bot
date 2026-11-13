@@ -184,16 +184,16 @@ def mark_quota_exhausted_in_usage() -> None:
 # The free tier counts requests per model (429 quotaId
 # GenerateRequestsPerDayPerProjectPerModel-FreeTier): when both 2.5 models are
 # spent, gemini_last_tier_model still has its own quota.  This separate file
-# holds per-model counts (chat / extract / judge / failed) and "exhausted"
-# marks for the Pacific day.  It never feeds the flash-scoped tokens/requests
-# above, which gate the side tasks.  Webhook threads, burst timers and cron
-# processes all write it, so each read-modify-write holds a thread lock plus
-# an fcntl lock on a sentinel file (os.replace alone keeps only the write
-# atomic).
+# holds per-model counts (chat / extract / judge / failed) and "exhausted" /
+# "rate_limited" marks for the Pacific day.  It never feeds the flash-scoped
+# tokens/requests above, which gate the side tasks.  Webhook threads, burst
+# timers and cron processes all write it, so each read-modify-write holds a
+# thread lock plus an fcntl lock on a sentinel file (os.replace alone keeps
+# only the write atomic).
 _BOT_DIR = os.path.dirname(os.path.abspath(__file__))
 _MODEL_USAGE_FILE = os.path.join(_BOT_DIR, "gemini_model_usage.json")
 _MODEL_USAGE_LOCK_FILE = os.path.join(_BOT_DIR, "locks", "gemini_model_usage.lock")
-_MODEL_USAGE_KINDS = ("chat", "extract", "judge", "media")
+_MODEL_USAGE_KINDS = ("chat", "extract", "judge", "media", "youtube")
 _model_usage_lock = threading.Lock()
 # No tools (2026-10-04 live check): on this API key gemini-3.1-flash-lite
 # answers plain requests, but every request carrying google_search was refused
@@ -284,7 +284,7 @@ def _update_model_usage(model: str, change) -> None:
 
 
 def track_model(model: str, kind: str, ok: bool = True) -> None:
-    """Count one ``kind`` request ("chat", "extract", "judge", "media") for ``model`` today.
+    """Count one ``kind`` request ("chat", "extract", "judge", "media", "youtube") for ``model`` today.
 
     A failed request counts too (Google books it against the quota) and also
     adds to ``failed``.
@@ -309,8 +309,29 @@ def mark_model_exhausted(model: str) -> None:
     _update_model_usage(model, change)
 
 
+def note_media_rate_limit(model: str, e: BaseException) -> None:
+    """Remember a 429 on the media model until the Pacific day ends.
+
+    Wider than ``mark_model_exhausted``: per-minute and token 429s count too.
+    It closes only the reads past the daily floor (``media_task_ready``).
+    Other models and other errors change nothing.
+    """
+
+    def change(entry: dict) -> None:
+        entry["rate_limited"] = True
+
+    try:
+        if model == media_model() and _is_rate_limited(e):
+            _update_model_usage(model, change)
+    except Exception as exc:  # called from except blocks: never replace their error
+        logger.warning("gemini rate limit not noted error_type=%s", type(exc).__name__)
+
+
 def model_usage(model: str) -> dict:
-    """Today's counts for ``model``: chat, extract, judge, media, failed, exhausted."""
+    """Today's counts for ``model``: chat, extract, judge, media, youtube, failed, exhausted.
+
+    Plus ``rate_limited`` and ``youtube_closed``, which only the media model ever sets.
+    """
     entry = _load_model_usage()["models"].get(model)
     if not isinstance(entry, dict):
         entry = {}
@@ -321,6 +342,8 @@ def model_usage(model: str) -> dict:
         except (TypeError, ValueError):
             usage[kind] = 0
     usage["exhausted"] = bool(entry.get("exhausted"))
+    usage["rate_limited"] = bool(entry.get("rate_limited"))
+    usage["youtube_closed"] = bool(entry.get("youtube_closed"))
     return usage
 
 
@@ -514,13 +537,24 @@ def side_task_last_tier(prompt, config, *, label: str):
 # still count toward the flat daily cap.  LINE_BOT_TIKTOK_MEDIA_DAILY_CAP
 # (default 10) is read at call time and doubles as the off switch: 0, or a
 # value that is not a non-negative integer, turns media reading off.
+# 2026-11-06: that cap is the day's floor.  Reads past it, up to
+# LINE_BOT_TIKTOK_MEDIA_QUIET_DAY_MAX, run only on a quiet day: the same model is
+# the chat fallback, so they stop once it is marked exhausted, has seen a 429,
+# or its chat + extract + media reach _MEDIA_QUIET_DAY_USAGE_LIMIT.
+# 2026-11-07: YouTube videos without a transcript use the same model on quiet days only, up to
+# LINE_BOT_YOUTUBE_MEDIA_DAILY_CAP (unset, 0 or a typo: off).  They are booked as "youtube": TikTok's
+# floor stays TikTok's, and the quiet-day sum counts both.  Their failures stay theirs: a 429 closes
+# YouTube for the day and nothing else, while trouble anywhere else closes YouTube too.
 _MEDIA_DAILY_CAP_DEFAULT = 10
+_MEDIA_QUIET_DAY_MAX_DEFAULT = 8
+_MEDIA_QUIET_DAY_USAGE_LIMIT = 10
 _MEDIA_TRANSIENT_BACKOFF_SEC = 60
 _MEDIA_CLIENT_ERROR_BACKOFF_SEC = 3600
 _MEDIA_BAD_REQUEST_LIMIT = 3  # a 400 is about that payload; three in a row is about us
 _media_backoff_until = 0.0
 _media_bad_requests = 0
 _media_cap_warned = ""  # the bad value already warned about (once, not on every link)
+_media_quiet_day_max_warned = ""
 
 
 def media_daily_cap() -> int:
@@ -542,6 +576,26 @@ def media_daily_cap() -> int:
     return value
 
 
+def media_quiet_day_max() -> int:
+    """The day's reads on a quiet day, floor included; 0 (or a typo) means none past the floor."""
+    raw = os.environ.get("LINE_BOT_TIKTOK_MEDIA_QUIET_DAY_MAX", "").strip()
+    if not raw:
+        return _MEDIA_QUIET_DAY_MAX_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if value < 0:
+        global _media_quiet_day_max_warned
+        if _media_quiet_day_max_warned != raw:
+            _media_quiet_day_max_warned = raw
+            logger.warning(
+                "LINE_BOT_TIKTOK_MEDIA_QUIET_DAY_MAX is not a non-negative integer; no TikTok reads past the daily cap"
+            )
+        return 0
+    return value
+
+
 def media_model() -> str:
     """The model that reads media, or "" when it has no quota of its own."""
     name = str(getattr(settings, "gemini_light_model", "") or "").strip()
@@ -556,7 +610,40 @@ def media_task_ready() -> bool:
     if not model or time.time() < _media_backoff_until:
         return False
     usage = model_usage(model)
-    return not usage["exhausted"] and usage["media"] < media_daily_cap()
+    if usage["exhausted"]:
+        return False
+    cap = media_daily_cap()
+    if usage["media"] < cap:
+        return True
+    if cap == 0 or usage["rate_limited"] or usage["media"] >= media_quiet_day_max():
+        return False
+    return _quiet_day(usage)
+
+
+def _quiet_day(usage: dict) -> bool:
+    spent = usage["chat"] + usage["extract"] + usage["media"] + usage["youtube"]
+    return spent < _MEDIA_QUIET_DAY_USAGE_LIMIT
+
+
+def youtube_task_ready() -> bool:
+    """True when one YouTube request may be sent now (sends nothing): a quiet day, under its cap."""
+    model = media_model()
+    if not model or time.time() < _media_backoff_until:
+        return False
+    usage = model_usage(model)
+    if usage["exhausted"] or usage["rate_limited"] or usage["youtube_closed"]:
+        return False
+    raw = os.environ.get("LINE_BOT_YOUTUBE_MEDIA_DAILY_CAP", "").strip()
+    return usage["youtube"] < (int(raw) if raw.isdigit() else 0) and _quiet_day(usage)
+
+
+def _track_if_media_model(model: str, kind: str, ok: bool = True) -> None:
+    """Book a 2.5-counter request per model too: ``media_task_ready`` adds them up."""
+    try:
+        if model == media_model():
+            track_model(model, kind, ok)
+    except Exception as exc:  # bookkeeping must never fail a request or hide its error
+        logger.warning("gemini media model usage not booked error_type=%s", type(exc).__name__)
 
 
 def media_side_task(contents, config, *, label: str, still_wanted=lambda: True, expired=lambda: False):
@@ -581,8 +668,9 @@ def media_side_task(contents, config, *, label: str, still_wanted=lambda: True, 
         response = _client.models.generate_content(model=model, contents=contents, config=config)
     except Exception as e:
         _update_model_usage(model, _count_failed)
+        note_media_rate_limit(model, e)
         code = _error_code(e)
-        # Only an explicit per-day quota closes the day: "free_tier_requests"
+        # Only an explicit per-day quota stops the floor too: "free_tier_requests"
         # also appears in per-minute 429s (see is_daily_quota_error's TODO).
         exhausted = _is_per_day_quota(e)
         backoff = 0
@@ -609,6 +697,41 @@ def media_side_task(contents, config, *, label: str, still_wanted=lambda: True, 
     _media_bad_requests = 0
     _track_usage(response, count_request=False)
     logger.info("%s answered by media model %s media=%d", label, model, model_usage(model)["media"])
+    return response
+
+
+def _saw_video(response) -> bool:
+    """The answer was billed video tokens: without them it can only come from the URL."""
+    details = getattr(getattr(response, "usage_metadata", None), "prompt_tokens_details", None) or []
+    return any(detail.modality == "VIDEO" and (detail.token_count or 0) > 0 for detail in details)
+
+
+def youtube_side_task(contents, config, *, label: str, still_wanted=lambda: True, expired=lambda: False):
+    """``media_side_task`` for one YouTube video (``expired`` only keeps the call the same).
+
+    Its own count, and whatever fails stays here: a 400, 403 or 404 is about that video, and a
+    429 only closes YouTube.  An answer without video tokens is no answer.
+    """
+    if not youtube_task_ready():
+        return None
+    model = media_model()
+    track_model(model, "youtube")
+    if not still_wanted():
+        logger.info("%s media request not sent: out of time", label)
+        return None
+    try:
+        response = _client.models.generate_content(model=model, contents=contents, config=config)
+    except Exception as e:
+        _update_model_usage(model, _count_failed)
+        if _is_rate_limited(e):
+            _update_model_usage(model, lambda entry: entry.update(youtube_closed=True))
+        logger.warning("%s media %s failed error_type=%s code=%s", label, model, type(e).__name__, _error_code(e))
+        return None
+    _track_usage(response, count_request=False)
+    if not _saw_video(response):
+        logger.info("%s: answered without video tokens", label)
+        return None
+    logger.info("%s answered by media model %s youtube=%d", label, model, model_usage(model)["youtube"])
     return response
 
 
@@ -655,6 +778,7 @@ def _book_request(response, model: str, last_tier: bool) -> None:
         track_model(model, "chat")
     else:
         _track_usage(response)
+        _track_if_media_model(model, "chat")
 
 
 def _book_failure(model: str, last_tier: bool) -> None:
@@ -662,6 +786,7 @@ def _book_failure(model: str, last_tier: bool) -> None:
         track_model(model, "chat", ok=False)
     else:
         _track_failed_request()
+        _track_if_media_model(model, "chat", ok=False)
 
 
 def extract_grounding(response, *, model: str = "") -> dict:
@@ -1047,7 +1172,7 @@ _NO_SEARCH_REWRITES: tuple[tuple[str, str], ...] = (
     ("   → 找不到 transcript → 直說「影片字幕沒抓到，我搜尋的整理文是 [URL]，內容大致是 X」（誠實 > 腦補）\n",
      "   → 沒有附上字幕或整理文 → 輸出空字串，不要編網址\n"),
     ("(iv) 用戶問分析/解讀（不是純查價）→ Google 搜尋最新背景再答，按規則 23h 結構",
-     "(iv) 用戶問分析/解讀（不是純查價）→ 只用使用者提供或本次附上的資料；沒有就說你沒辦法確認最新情況"),
+     "(iv) 用戶問分析/解讀（不是純查價）→ 只用使用者提供或本次附上的資料；沒有就輸出空字串"),
     ("抽出明確主張，搜尋可靠來源核實後直接給結論與關鍵依據。",
      "抽出明確主張，只用本次附上的資料核實；有根據才給結論與關鍵依據，沒有就不要判定真假。"),
     ("查證仍須做，來源清單只在使用者要求時提供。", "來源清單只在使用者要求時提供。"),
@@ -1682,8 +1807,11 @@ def _quality_gate(
             retry_urls = _extract_grounding_urls(retry_resp)
         except Exception as e:
             logger.warning("quality retry %d 呼叫失敗: %s", attempt, e)
+            note_media_rate_limit(model, e)
             if last_tier:
                 track_model(model, "chat", ok=False)
+            else:
+                _track_if_media_model(model, "chat", ok=False)
             return _blocked_if_internal_trace(current_text, current_reason)
 
         if not retry_text:
@@ -1885,6 +2013,7 @@ def _run(
         except Exception as e:
             last_err = e
             _book_failure(model, last_tier)
+            note_media_rate_limit(model, e)
             if is_daily_quota_error(e):
                 mark_model_exhausted(model)
             if _is_transient(e) and attempt < max_attempts - 1:
@@ -1977,7 +2106,10 @@ def chat(
         # 2026-10-24 (B8.2): only what the family typed (and quoted) names a stock; the
         # title and description of a pre-read video say TV, APP, HTML, AI …
         _user_text_for_quote = reply_guards.user_typed_text(_extract_text(user_input))
-        _quotes = stock_quote.get_contextual_quotes_text(
+        # 2026-11-07: past a Claude miss the prompt already has its prices, the ones the reply
+        # is checked against.  A family member typing the marker only saves this fetch.
+        _has_prices = stock_quote.CHAT_QUOTE_BLOCK_START in _extract_text(user_input)
+        _quotes = None if _has_prices else stock_quote.get_contextual_quotes_text(
             _user_text_for_quote,
             context=context,
         )
@@ -2127,10 +2259,13 @@ def _lite_or_main(prompt, config=None):
             config=config,
         )
         _track_usage(response)
+        _track_if_media_model(settings.gemini_light_model, "extract")
         return response
     except Exception as e:
         err = str(e)
         _track_failed_request()
+        _track_if_media_model(settings.gemini_light_model, "extract", ok=False)
+        note_media_rate_limit(settings.gemini_light_model, e)
         is_429 = "429" in err or "RESOURCE_EXHAUSTED" in err
         if is_429 and settings.gemini_light_model != settings.gemini_model:
             logger.warning(
@@ -2349,7 +2484,10 @@ output: {{"action": "看電影", ...下週三日期, "hour": 19, "minute": 0}}�
             config=config,
         )
         _track_usage(response)  # D1c: reminder 抽取也燒 Google quota，計入 usage 讓 reserve gate 看得到
+        _track_if_media_model(lite_model, "extract")
     except Exception as lite_error:
+        _track_if_media_model(lite_model, "extract", ok=False)
+        note_media_rate_limit(lite_model, lite_error)
         if _is_rate_limited(lite_error):
             # R3: 429 不再靜默吞 → 計入失敗 quota；原 SDK 字串保留，
             # 讓 caller 用 _is_quota_error 判 PerDay 決定 mark exhausted + enqueue 補抽

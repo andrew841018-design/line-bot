@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout, as_completed, wait
 from typing import Optional
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -284,7 +284,7 @@ def _fetch_ddg(query: str, k: int) -> list[dict]:
     try:
         rows = web_scraper.search_duckduckgo(query, k=k) or []
     except Exception as e:  # noqa: BLE001
-        logger.info("DDG search failed (%s): %s", query, e)
+        logger.info("DDG search failed (%r): %r", query, e)
         return []
     out = []
     for r in rows:
@@ -310,7 +310,7 @@ def _fetch_gnews(query: str, k: int, resolve_urls: bool = True) -> list[dict]:
         rows = (web_scraper.search_google_news(query, k=k) if resolve_urls else
                 web_scraper.search_google_news(query, k=k, resolve_urls=False)) or []
     except Exception as e:  # noqa: BLE001
-        logger.info("GoogleNews search failed (%s): %s", query, e)
+        logger.info("GoogleNews search failed (%r): %r", query, e)
         return []
     out = []
     for r in rows:
@@ -360,13 +360,15 @@ def _fetch_wiki(title: str, lang: str) -> Optional[dict]:
 
 
 def aggregate_sources(
-    queries: list[str], total_max: int = 18, *, resolve_news_urls: bool = True
+    queries: list[str], total_max: int = 18, *, resolve_news_urls: bool = True,
+    budget_s: float | None = None,
 ) -> list[dict]:
     """V4 Step 3 entry point.
 
     Args:
         queries: 1..N 個 search query（已被 query expander 擴展過）
         total_max: 最終最多回幾筆（預設 18，>= 15 是合理上限）
+        budget_s: 最多等幾秒，到時用已回來的結果；沒回來的自己跑完（每個請求都有 timeout）
 
     Returns:
         list of dicts，每筆 {
@@ -402,7 +404,8 @@ def aggregate_sources(
 
     # ThreadPool — 多 query × 2 engine + 2 wiki
     max_workers = max(4, min(16, len(tasks) + 2))
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+    ex = ThreadPoolExecutor(max_workers=max_workers)
+    try:
         futures = []
         for kind, arg, k in tasks:
             if kind == "ddg":
@@ -413,7 +416,7 @@ def aggregate_sources(
         futures.append(ex.submit(_fetch_wiki, primary_q, "en"))
         futures.append(ex.submit(_fetch_wiki, primary_q, "zh"))
 
-        for fut in as_completed(futures):
+        for fut in as_completed(futures, timeout=budget_s):
             try:
                 res = fut.result()
             except Exception as e:  # noqa: BLE001
@@ -425,6 +428,10 @@ def aggregate_sources(
                 raw_results.extend(res)
             elif isinstance(res, dict):
                 raw_results.append(res)
+    except FuturesTimeout:
+        logger.info("aggregate sources stopped at the budget rows=%d", len(raw_results))
+    finally:
+        ex.shutdown(wait=budget_s is None, cancel_futures=budget_s is not None)
 
     if not raw_results:
         return []
@@ -458,8 +465,43 @@ def aggregate_sources(
     return deduped
 
 
+def resolve_news_rows(rows: list[dict], *, limit: int = 3, budget_s: float = 4.0) -> list[dict]:
+    """``rows`` with the first ``limit`` Google News links turned into their articles.
+
+    A news.google.com row has nothing to read: its page is Google's, its RSS
+    item only a title (2026-11-06: 13 searches, no text from any).  Whatever is
+    not decoded within ``budget_s`` stays as it was and goes last, so the
+    full-text step spends its few fetches on real articles.  A worker left
+    behind ends by itself: every request it makes has a timeout.
+    """
+    news = [row for row in rows if _domain_of(row.get("url") or "") == "news.google.com"][:limit]
+    decoded = 0
+    if news and budget_s > 0:
+        pool = ThreadPoolExecutor(max_workers=len(news))
+        futures = {pool.submit(web_scraper.decode_google_news_url, row["url"]): row for row in news}
+        done, _late = wait(futures, timeout=budget_s)
+        pool.shutdown(wait=False, cancel_futures=True)
+        for future in done:
+            try:
+                url = _canonical_url(future.result() or "")
+            except Exception as e:  # noqa: BLE001
+                logger.info("news decode task failed type=%s", type(e).__name__)
+                continue
+            if url:
+                row = futures[future]
+                row.update(url=url, domain=_domain_of(url), authority_score=_domain_authority(url))
+                decoded += 1
+    logger.info("web research news decoded tried=%d ok=%d", len(news), decoded)
+    return sorted(
+        rows,
+        key=lambda row: (row.get("domain") != "news.google.com", row.get("authority_score", 0)),
+        reverse=True,
+    )
+
+
 __all__ = [
     "aggregate_sources",
+    "resolve_news_rows",
     "_canonical_url",
     "_domain_authority",
     "_domain_of",

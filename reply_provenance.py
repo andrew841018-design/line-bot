@@ -9,8 +9,8 @@ A ContextVar keeps concurrent burst/webhook threads apart.
 Every generated reply is checked for a search nobody ran.  The burst, direct
 @咪寶 and research paths know more (a shared link was read, the prompt carries
 search results) and check the reply themselves, inside ``checked_by_caller()``.
-When the shared check drops a reply, ``dropped()`` lets the caller finish the
-message as intentionally silent instead of retrying it.
+When the shared check drops a reply, or Claude chooses not to reply, ``dropped()``
+lets the caller finish the message as intentionally silent instead of retrying it.
 
 2026-10-04 (family feedback P3): the Gemini answer that is returned also
 records what its search found (``record_grounding``): the model, the result

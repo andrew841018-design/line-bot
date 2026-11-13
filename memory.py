@@ -570,6 +570,12 @@ def _init_db() -> None:
         ):
             if col not in rcols:
                 _add_column(c, "reminders", col, ddl)
+        # 2026-11-12 家人可要求提醒只推一次：只留的那一段（'' 照原本階梯）。
+        if "push_keep_stage" not in rcols:
+            _add_column(
+                c, "reminders", "push_keep_stage",
+                "push_keep_stage TEXT NOT NULL DEFAULT ''",
+            )
         _ensure_pending_source_unique_index(c)
         # persona_notes schema migration: add source column if missing
         # 2026-05-08：區分 'rule_violation'（既有黑名單觸發）vs 'organic'（user 真實糾正）
@@ -5078,7 +5084,8 @@ def claim_natural_reminder_delivery(
         row = c.execute(
             "SELECT action, remind_at, weekly_count, source_kind, source_ref, "
             "pushed_3d, pushed_1d, pushed_4hr, pushed_2hr, pushed_1hr, "
-            "pushed_now, user_id, source_text, mention_aliases FROM reminders "
+            "pushed_now, user_id, source_text, mention_aliases, last_pushed_at, "
+            "push_keep_stage FROM reminders "
             "WHERE group_id=? AND reminder_id=? AND status='pending'",
             (group_id, reminder_id),
         ).fetchone()
@@ -5120,6 +5127,20 @@ def claim_natural_reminder_delivery(
             }[stage]
             if int(row[flag_index] or 0):
                 return None
+        import reminder_stages
+
+        # 2026-11-12: a push limit is checked again here, so a stage collected
+        # just before the family set it never goes out.
+        if not reminder_stages.keep_allows(
+            {
+                "source_kind": row[3], "source_ref": row[4], "remind_at": row[1],
+                "pushed_3d": row[5], "pushed_1d": row[6], "pushed_4hr": row[7],
+                "pushed_2hr": row[8], "pushed_1hr": row[9], "pushed_now": row[10],
+                "last_pushed_at": row[14], "push_keep_stage": row[15],
+            },
+            stage,
+        ):
+            return None
         duplicate_deliveries = c.execute(
             "SELECT claim.subject_ref, claim.occurrence, peer.action "
             "FROM reminder_delivery_claims AS claim "
@@ -5411,11 +5432,16 @@ def finalize_natural_reminder_delivery(claim: dict) -> bool:
             )
         else:
             column = f"pushed_{stage}"
+            # 2026-11-12: under a push limit the kept stage is the reminder's
+            # last push, so it completes the reminder the way "now" does.
             cursor = c.execute(
-                f"UPDATE reminders SET {column}=1, last_pushed_at=? "
+                f"UPDATE reminders SET {column}=1, last_pushed_at=?, "
+                "status=CASE WHEN status='pending' AND push_keep_stage=? "
+                "AND push_keep_stage IN ('1hr', '2hr', '4hr') "
+                "AND source_kind='' AND source_ref='' THEN 'done' ELSE status END "
                 f"WHERE group_id=? AND reminder_id=? AND action=? AND remind_at=? "
                 f"AND status IN ('pending', 'cancelled')",
-                (now, group_id, reminder_id, action, remind_at),
+                (now, stage, group_id, reminder_id, action, remind_at),
             )
         c.execute(
             f"DELETE FROM reminder_delivery_claims WHERE {where}",
@@ -6146,7 +6172,7 @@ def delete_duplicate_pending_reminders(
                 "created_at, source_kind, source_ref, source_text, "
                 "last_pushed_at, weekly_count, last_weekly_at, pushed_3d, "
                 "pushed_1d, pushed_4hr, pushed_2hr, pushed_1hr, pushed_now, "
-                "mention_aliases, time_kind, merged_details "
+                "mention_aliases, time_kind, merged_details, push_keep_stage "
                 "FROM reminders WHERE status='pending' AND group_id=? "
                 "ORDER BY group_id, action, remind_at, reminder_id",
                 (group_id,),
@@ -6157,7 +6183,7 @@ def delete_duplicate_pending_reminders(
                 "created_at, source_kind, source_ref, source_text, "
                 "last_pushed_at, weekly_count, last_weekly_at, pushed_3d, "
                 "pushed_1d, pushed_4hr, pushed_2hr, pushed_1hr, pushed_now, "
-                "mention_aliases, time_kind, merged_details "
+                "mention_aliases, time_kind, merged_details, push_keep_stage "
                 "FROM reminders WHERE status='pending' "
                 "ORDER BY group_id, action, remind_at, reminder_id",
             ).fetchall()
@@ -6272,6 +6298,14 @@ def delete_duplicate_pending_reminders(
                     "",
                 )
             created_at = min(int(row["created_at"] or 0) for row in cluster)
+            keep_stage = ""
+            if not source_kind and not source_ref:
+                import reminder_stages
+
+                keep_stage = reminder_stages.merged_keep_stage(
+                    keep["push_keep_stage"],
+                    [row["push_keep_stage"] for row in merge_order[1:]],
+                )
             push_values = {
                 col: max(int(row[col] or 0) for row in cluster)
                 for col in _REMINDER_PUSH_FLAG_COLUMNS
@@ -6316,7 +6350,8 @@ def delete_duplicate_pending_reminders(
                 "source_text=?, mention_aliases=?, created_at=?, "
                 "last_pushed_at=?, weekly_count=?, last_weekly_at=?, "
                 "pushed_3d=?, pushed_1d=?, pushed_4hr=?, pushed_2hr=?, "
-                "pushed_1hr=?, pushed_now=?, time_kind=?, merged_details=? "
+                "pushed_1hr=?, pushed_now=?, time_kind=?, merged_details=?, "
+                "push_keep_stage=? "
                 "WHERE reminder_id=?",
                 (
                     user_id,
@@ -6336,6 +6371,7 @@ def delete_duplicate_pending_reminders(
                     push_values["pushed_now"],
                     time_kind,
                     merged_details,
+                    keep_stage,
                     keep_id,
                 ),
             )
@@ -7379,7 +7415,7 @@ def list_pending_reminders_full(
                 "last_pushed_at, weekly_count, "
                 "last_weekly_at, pushed_3d, pushed_1d, "
                 "pushed_4hr, pushed_2hr, pushed_1hr, pushed_now, "
-                "mention_aliases, time_kind, merged_details "
+                "mention_aliases, time_kind, merged_details, push_keep_stage "
                 "FROM reminders WHERE status='pending' AND group_id=? AND remind_at >= ? "
                 "ORDER BY remind_at",
                 (group_id, now - 86400),
@@ -7391,7 +7427,7 @@ def list_pending_reminders_full(
                 "last_pushed_at, weekly_count, "
                 "last_weekly_at, pushed_3d, pushed_1d, "
                 "pushed_4hr, pushed_2hr, pushed_1hr, pushed_now, "
-                "mention_aliases, time_kind, merged_details "
+                "mention_aliases, time_kind, merged_details, push_keep_stage "
                 "FROM reminders WHERE status='pending' AND remind_at >= ? "
                 "ORDER BY remind_at",
                 (now - 86400,),
@@ -7409,6 +7445,7 @@ def list_pending_reminders_full(
             "mention_aliases": _load_mention_aliases(r[18]),
             "time_kind": r[19],
             "merged_details": _load_merged_details(r[20]),
+            "push_keep_stage": str(r[21] or ""),
         }
         for r in rows
     ]
@@ -7475,7 +7512,7 @@ def fold_same_event_reminders(primary: dict, peers: list[dict]) -> list[int]:
         kept = c.execute(
             "SELECT action, remind_at, COALESCE(source_text, ''), "
             "COALESCE(merged_details, '[]'), COALESCE(source_kind, ''), "
-            "COALESCE(source_ref, '') FROM reminders "
+            "COALESCE(source_ref, ''), COALESCE(push_keep_stage, '') FROM reminders "
             "WHERE group_id=? AND reminder_id=? AND status='pending'",
             (group_id, primary_id),
         ).fetchone()
@@ -7492,6 +7529,8 @@ def fold_same_event_reminders(primary: dict, peers: list[dict]) -> list[int]:
         own_key = _merged_detail_fragment(str(kept[0]), str(kept[2]))["key"]
         sent_flags = [0, 0, 0, 0, 0]  # pushed_3d, 1d, 4hr, 2hr, 1hr
         last_weekly_at = 0
+        last_pushed_at = 0
+        peer_keeps: list[str] = []
         for peer in peers:
             peer_id = int(peer["reminder_id"])
             if peer_id == primary_id or peer_id in folded:
@@ -7502,7 +7541,8 @@ def fold_same_event_reminders(primary: dict, peers: list[dict]) -> list[int]:
                 "COALESCE(mention_aliases, '[]'), time_kind, "
                 "COALESCE(source_kind, ''), COALESCE(source_ref, ''), "
                 "pushed_3d, pushed_1d, pushed_4hr, pushed_2hr, pushed_1hr, "
-                "last_weekly_at FROM reminders "
+                "last_weekly_at, last_pushed_at, COALESCE(push_keep_stage, '') "
+                "FROM reminders "
                 "WHERE group_id=? AND reminder_id=? AND status='pending'",
                 (group_id, peer_id),
             ).fetchone()
@@ -7536,16 +7576,32 @@ def fold_same_event_reminders(primary: dict, peers: list[dict]) -> list[int]:
             if int(row[1]) == int(kept[1]):
                 sent_flags = [max(a, int(b or 0)) for a, b in zip(sent_flags, row[9:14])]
                 last_weekly_at = max(last_weekly_at, int(row[14] or 0))
+                last_pushed_at = max(last_pushed_at, int(row[15] or 0))
+            # A twin folded in only by the same-person-same-minute rule
+            # (reminder_push.plan_folds marks it fold_twin) is another event:
+            # its limit is not handed over, so the primary keeps its own ladder
+            # (more pushes rather than fewer).  The same-minute fold already
+            # leaves limited rows out; this is the second line of defence.
+            if not peer.get("fold_twin"):
+                peer_keeps.append(str(row[16] or ""))
             folded.append(peer_id)
         if not folded:
             return []
+        import reminder_stages
+
+        # 2026-11-12: a push limit belongs to the event, so the row that remains keeps it.
+        keep_stage = reminder_stages.merged_keep_stage(kept[6], peer_keeps)
         c.execute(
             "UPDATE reminders SET merged_details=?, "
             "pushed_3d=MAX(pushed_3d, ?), pushed_1d=MAX(pushed_1d, ?), "
             "pushed_4hr=MAX(pushed_4hr, ?), pushed_2hr=MAX(pushed_2hr, ?), "
-            "pushed_1hr=MAX(pushed_1hr, ?), last_weekly_at=MAX(last_weekly_at, ?) "
+            "pushed_1hr=MAX(pushed_1hr, ?), last_weekly_at=MAX(last_weekly_at, ?), "
+            "last_pushed_at=MAX(last_pushed_at, ?), push_keep_stage=? "
             "WHERE reminder_id=? AND status='pending'",
-            (json.dumps(fragments, ensure_ascii=False), *sent_flags, last_weekly_at, primary_id),
+            (
+                json.dumps(fragments, ensure_ascii=False), *sent_flags, last_weekly_at,
+                last_pushed_at, keep_stage, primary_id,
+            ),
         )
         marks = ",".join("?" for _ in folded)
         c.execute(
@@ -7559,6 +7615,169 @@ def fold_same_event_reminders(primary: dict, peers: list[dict]) -> list[int]:
             (primary_id, str(kept[4]), str(kept[5]), group_id, *folded),
         )
     return folded
+
+
+# 2026-11-12 家人可要求提醒只推一次 ──────────────────────────────────────────
+
+
+def _reminder_push_state_conn(
+    c: sqlite3.Connection, group_id: str, reminder_id: int
+) -> dict | None:
+    row = c.execute(
+        "SELECT reminder_id, group_id, user_id, action, remind_at, status, "
+        "source_kind, source_ref, source_text, mention_aliases, time_kind, "
+        "merged_details, last_pushed_at, last_weekly_at, pushed_3d, pushed_1d, "
+        "pushed_4hr, pushed_2hr, pushed_1hr, pushed_now, push_keep_stage "
+        "FROM reminders WHERE group_id=? AND reminder_id=?",
+        (str(group_id), int(reminder_id)),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "reminder_id": int(row[0]),
+        "group_id": str(row[1]),
+        "user_id": str(row[2] or ""),
+        "action": str(row[3]),
+        "remind_at": int(row[4]),
+        "status": str(row[5]),
+        "source_kind": str(row[6] or ""),
+        "source_ref": str(row[7] or ""),
+        "source_text": str(row[8] or ""),
+        "mention_aliases": _load_mention_aliases(row[9]),
+        "time_kind": row[10],
+        "merged_details": _load_merged_details(row[11]),
+        "last_pushed_at": int(row[12] or 0),
+        "last_weekly_at": int(row[13] or 0),
+        "pushed_3d": int(row[14] or 0),
+        "pushed_1d": int(row[15] or 0),
+        "pushed_4hr": int(row[16] or 0),
+        "pushed_2hr": int(row[17] or 0),
+        "pushed_1hr": int(row[18] or 0),
+        "pushed_now": int(row[19] or 0),
+        "push_keep_stage": str(row[20] or ""),
+    }
+
+
+def get_reminder_push_state(group_id: str, reminder_id: int) -> dict | None:
+    """One reminder with everything the push-limit handler reads."""
+
+    if not group_id:
+        return None
+    with _conn() as c:
+        return _reminder_push_state_conn(c, group_id, reminder_id)
+
+
+def set_reminder_push_keep_stage(
+    group_id: str,
+    reminder_id: int,
+    *,
+    keep_stage: str,
+    expected_action: str,
+    expected_remind_at: int,
+    now: int | None = None,
+) -> dict:
+    """Keep only one push stage of a generic pending reminder ('' restores).
+
+    Every decision reads the row inside one immediate transaction:
+    not_found / not_generic / terminal / conflict / busy (a push is being
+    sent right now) / no_clock and offset_row (1/2/4 hours before a default
+    time or an offset reminder would point at the wrong moment) / past (the
+    kept window already closed without a real push) / unchanged / updated.
+    A flag that a receipt or a fold set without a real push is cleared, so
+    the kept stage still goes out.  When the kept stage really went out the
+    reminder is completed at once (``kept_already_sent``).  Exceptions return
+    ``unavailable`` with nothing written.
+    """
+
+    import reminder_stages
+
+    keep_stage = str(keep_stage or "")
+    if keep_stage and keep_stage not in reminder_stages.KEEPABLE_STAGES:
+        return {"status": "invalid"}
+    now = int(_time.time()) if now is None else int(now)
+    try:
+        with _lock, _conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            row = _reminder_push_state_conn(c, group_id, reminder_id)
+            if row is None:
+                return {"status": "not_found"}
+            if row["source_kind"] or row["source_ref"]:
+                return {"status": "not_generic"}
+            if row["status"] != "pending":
+                return {"status": "terminal"}
+            if row["action"] != str(expected_action) or row["remind_at"] != int(
+                expected_remind_at
+            ):
+                return {"status": "conflict"}
+            # A sending claim left by a dead push process goes stale; it must
+            # not answer 「正在推送」 forever.
+            sending = c.execute(
+                "SELECT 1 FROM reminder_delivery_claims WHERE group_id=? "
+                "AND delivery_kind='natural' AND subject_ref=? AND state='sending' "
+                "AND claimed_at>=? LIMIT 1",
+                (
+                    str(group_id),
+                    str(int(reminder_id)),
+                    now - _REMINDER_DELIVERY_STALE_SECONDS,
+                ),
+            ).fetchone()
+            if sending is not None:
+                return {"status": "busy"}
+            current = reminder_stages.keep_stage_of(row)
+            kept_sent = False
+            sets: list[str] = ["push_keep_stage=?"]
+            if not keep_stage:
+                if not current:
+                    return {"status": "unchanged", "row": row}
+            else:
+                if keep_stage != "now":
+                    if row["time_kind"] in ("none", "daypart"):
+                        return {"status": "no_clock"}
+                    if reminder_intent.has_reminder_offset_marker(row["action"]):
+                        return {"status": "offset_row"}
+                    kept_sent = reminder_stages.kept_stage_delivered(row, keep_stage)
+                clear_flag = False
+                if not kept_sent:
+                    window = reminder_stages.keep_window_state(
+                        row["remind_at"], keep_stage, now
+                    )
+                    if window == "passed":
+                        return {"status": "past"}
+                    column = reminder_stages.FLAG_COLUMNS[keep_stage]
+                    clear_flag = keep_stage != "now" and bool(row[column])
+                    if clear_flag:
+                        sets.append(f"{column}=0")
+                if current == keep_stage and not clear_flag and not kept_sent:
+                    return {"status": "unchanged", "row": row}
+                if kept_sent:
+                    sets.append("status='done'")
+            cursor = c.execute(
+                f"UPDATE reminders SET {', '.join(sets)} "
+                "WHERE group_id=? AND reminder_id=? AND status='pending' "
+                "AND action=? AND remind_at=?",
+                (keep_stage, str(group_id), int(reminder_id), row["action"], row["remind_at"]),
+            )
+            if cursor.rowcount != 1:
+                return {"status": "conflict"}
+            row["push_keep_stage"] = keep_stage
+            return {"status": "updated", "row": row, "kept_already_sent": kept_sent}
+    except Exception as exc:
+        logger.warning("set push keep stage failed error_type=%s", type(exc).__name__)
+        return {"status": "unavailable"}
+
+
+def recent_bot_message_texts(group_id: str, since: int, limit: int = 30) -> list[str]:
+    """The bot's own archived messages in a group since ``since``, newest first."""
+
+    if not group_id:
+        return []
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT text FROM raw_messages WHERE group_id=? AND user_id='__bot__' "
+            "AND created_at>=? ORDER BY created_at DESC LIMIT ?",
+            (str(group_id), int(since), int(limit)),
+        ).fetchall()
+    return [str(row[0] or "") for row in rows]
 
 
 # 2026-10-04: a creation receipt already tells the family about the reminder,
@@ -7593,7 +7812,8 @@ def consume_open_stages(reminder_ids, now: int | None = None) -> int:
         rows = c.execute(
             "SELECT reminder_id, remind_at, source_kind, source_ref, source_text, "
             "last_weekly_at, pushed_3d, pushed_1d, pushed_4hr, pushed_2hr, "
-            "pushed_1hr, pushed_now FROM reminders "
+            "pushed_1hr, pushed_now, push_keep_stage "
+            "FROM reminders "
             f"WHERE status='pending' AND reminder_id IN ({placeholders})",
             ids,
         ).fetchall()
@@ -7602,9 +7822,12 @@ def consume_open_stages(reminder_ids, now: int | None = None) -> int:
             stages = reminder_stages.stages_opening_within(
                 row, now, CONSUME_OPEN_STAGE_HORIZON_SECONDS
             )
+            keep = reminder_stages.keep_stage_of(row)
             for stage in stages:
                 if stage not in reminder_stages.CONSUMABLE_STAGES:
                     continue
+                if stage == keep:
+                    continue  # 2026-11-12: the kept stage is the family's only push
                 if stage == "weekly":
                     if not reminder_stages.weekly_owed(row.get("last_weekly_at"), now):
                         continue

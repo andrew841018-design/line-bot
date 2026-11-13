@@ -7,6 +7,7 @@ from __future__ import annotations
 import pytest
 
 import stock_quote
+from test_support_timing import cpu_seconds, forbid_other_threads
 
 
 @pytest.mark.parametrize("text", [
@@ -70,13 +71,13 @@ def test_two_tickers_after_a_link_both_count():
     assert "SPY" in symbols and "QQQ" in symbols
 
 
-def test_long_link_free_text_is_cheap():
-    import time
+def test_long_link_free_text_is_cheap(monkeypatch):
+    def check(_):
+        stock_quote._extract_lookup_query("股價多少 " + "a" * 20000)
+        stock_quote.detect_symbols("b" * 20000)
 
-    start = time.monotonic()
-    stock_quote._extract_lookup_query("股價多少 " + "a" * 20000)
-    stock_quote.detect_symbols("b" * 20000)
-    assert time.monotonic() - start < 1.0
+    forbid_other_threads(monkeypatch)
+    assert cpu_seconds(check, "20000 letters") < 1.0
 
 
 def test_lookup_query_never_carries_a_url():

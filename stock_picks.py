@@ -3197,6 +3197,7 @@ def _maybe_fill_ai(stop: threading.Event) -> None:
     滿 3 檔就停。只有「最後一檔入選者之前排名的候選都有結果」才寫；有候選還沒結果就保留上一份、之後再試，
     不讓排名較後的候選偷偷補位。候選的日線一直拿不到（有洞超過 3 小時、或 Yahoo 在回別檔卻累計 3 次回不出這一檔）
     才放棄，並記在狀態的 skipped；同一個 T 之後每小時重看，算得出來就重算一次。
+    回測冷凍中的股票（stock_picks_review_hook.apply_cooldown）在算候選之前就從名單拿掉，全名單只留給 spool。
     失敗（例外由 `_run` 接住）只記 AI 自己的失敗與節流，不動主 worker。"""
     global _ai_cache_t, _ai_next_try
     if not AI_ENABLED or not _AI_BACKGROUND_ENABLED or stop.is_set():
@@ -3228,6 +3229,14 @@ def _maybe_fill_ai(stop: threading.Event) -> None:
     u, sources, core_as_of, version = _ai_universe(snapshot, give_up)
     if stop.is_set():
         return
+    members, applied = list(u["codes"]), None
+    try:  # 回測冷凍（PLAN_B2C2 §2.2）：候選、funnel、picks 都看過濾後的名單；任何問題都照常推薦，不能變成 AI 段的失敗
+        import stock_picks_review_hook
+        applied = stock_picks_review_hook.apply_cooldown(stock_picks_review_hook.FAMILY_AI, members, t_iso)
+        if applied.removed:
+            u = {**u, "codes": [c for c in members if c not in applied.removed]}
+    except Exception as exc:
+        logger.warning("stock picks ai cooldown failed error_type=%s", type(exc).__name__)
     candidates, growth_count = ai_candidates(snapshot, u["codes"], sources)
     picks: list[dict] = []
     skipped: dict = {}
@@ -3278,7 +3287,8 @@ def _maybe_fill_ai(stop: threading.Event) -> None:
         try:  # 回測週報的池子紀錄（2026-10-29 回測 PLAN §5.2）：只寫自己的 spool 檔；任何問題都不能變成 AI 段的失敗
             import stock_picks_review_hook
             stock_picks_review_hook.write_ai_spool(state, snapshot, candidates, sources,
-                                                   chart_cache=_ai_chart_cache, fail_tries=_ai_fail_tries)
+                                                   chart_cache=_ai_chart_cache, fail_tries=_ai_fail_tries,
+                                                   members=members, cooldown=applied)
         except Exception as exc:
             logger.warning("stock picks ai review spool failed error_type=%s", type(exc).__name__)
         logger.info("stock picks ai computed t=%s source=%s universe=%d growth=%d cheap=%d picks=%d skipped=%d fetched=%d",

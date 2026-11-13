@@ -15,7 +15,6 @@ import logging
 import os
 import sqlite3
 import sys
-import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -31,6 +30,7 @@ import pytest  # noqa: E402
 
 import reply_provenance  # noqa: E402
 import reply_policy  # noqa: E402
+from test_support_timing import cpu_seconds  # noqa: E402
 
 SOURCE = "王大明院長今年6月在家中倒地送醫，目前人還在昏迷中。"
 FABRICATED = (
@@ -300,9 +300,7 @@ def test_a_status_with_its_own_subject_or_after_a_doctor_cited_as_speaker_is_kep
     ("醫師林志明" * 1500 + "倒地送醫", "目前已恢復意識，狀況穩定。"),
 ])
 def test_speaker_and_no_subject_checks_stay_fast(source, reply):
-    start = time.perf_counter()
-    _strip(reply, source_text=source)
-    assert time.perf_counter() - start < 0.05
+    assert cpu_seconds(lambda r: _strip(r, source_text=source), reply) < 0.05
 
 
 @pytest.mark.parametrize("reply", [
@@ -483,16 +481,14 @@ def test_new_promise_forms_drop_only_their_sentence():
     "剛" * 60 + "改成明天。",
 ])
 def test_promise_and_change_checks_stay_fast_on_long_repetitive_sentences(text):
-    start = time.perf_counter()
+    assert cpu_seconds(reply_policy.strip_operation_claims, text) < 0.05
     assert reply_policy.strip_operation_claims(text) == (text, 0)
-    assert time.perf_counter() - start < 0.05
 
 
 def test_a_long_date_list_that_ends_in_a_promise_is_still_dropped_quickly():
     text = " / ".join(["10/23"] * 40) + " 都會提醒你。"
-    start = time.perf_counter()
+    assert cpu_seconds(reply_policy.strip_operation_claims, text) < 0.05
     assert reply_policy.strip_operation_claims(text) == ("", 1)
-    assert time.perf_counter() - start < 0.05
 
 
 # GP1 r4 #4: a relative or vague time (月底, 幾天後, 下個月, 過幾天…) before
@@ -574,10 +570,8 @@ def test_relative_times_with_someone_else_advice_or_questions_are_kept(reply):
     pytest.param("好的，會在" + "月底" * 2400 + "提醒你。", ("", 1), id="hui-zai-promise"),
 ])
 def test_relative_time_promise_check_stays_fast_on_long_repetitive_text(text, expected):
-    start = time.perf_counter()
-    result = reply_policy.strip_operation_claims(text)
-    assert time.perf_counter() - start < 0.05
-    assert result == ((text, 0) if expected is None else expected)
+    assert cpu_seconds(reply_policy.strip_operation_claims, text) < 0.05
+    assert reply_policy.strip_operation_claims(text) == ((text, 0) if expected is None else expected)
 
 
 # ── gemini_client: search only, and the prompt rule ─────────────────────────
@@ -1249,10 +1243,17 @@ def test_enforce_checks_exactly_the_text_that_can_be_sent():
 
     claim = "提醒已更新"
     degenerate = claim * 4000 + "如果"
-    started = _time.perf_counter()
-    out = main._enforce_new_value_reply(
-        degenerate, source_text="", request_text="", context=[], addressed=True,
-    )
-    assert _time.perf_counter() - started < 1.0
-    assert len(out) <= main._GUARDED_REPLY_MAX_CHARS
-    assert claim not in out
+
+    def enforce(text):
+        # Wall clock on purpose: this is the whole guard chain (logging, a first import's file read,
+        # and for other input the judge's model call), so CPU time would hide a wait.  GC is off
+        # while this runs, though: cpu_seconds below pauses it.
+        started = _time.perf_counter()
+        out = main._enforce_new_value_reply(
+            text, source_text="", request_text="", context=[], addressed=True,
+        )
+        assert _time.perf_counter() - started < 1.0
+        assert len(out) <= main._GUARDED_REPLY_MAX_CHARS
+        assert claim not in out
+
+    cpu_seconds(enforce, degenerate)  # for its deadline, not its number: a hang must not stall the full run

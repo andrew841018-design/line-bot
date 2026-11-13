@@ -129,7 +129,7 @@ def test_prefetch_fetches_exactly_the_link(monkeypatch, text, fetched):
 
 def test_words_glued_to_a_video_link_are_not_its_path(monkeypatch):
     seen = []
-    monkeypatch.setattr(main, "_fetch_youtube_context", lambda url: seen.append(url) or "")
+    monkeypatch.setattr(main, "_fetch_youtube_context", lambda url, deadline=None: seen.append(url) or "")
     main._prefetch_urls("https://youtu.be/ABCDEFGHIJK真的假的")
     assert seen == ["https://youtu.be/ABCDEFGHIJK"]
 
@@ -645,7 +645,7 @@ def test_platform_links_reach_their_branch(monkeypatch, url, branch):
     seen = []
     monkeypatch.setattr(main, "_fetch_video_ytdlp", lambda u: seen.append("ytdlp") or None)
     monkeypatch.setattr(main, "_fetch_tiktok_meta", lambda u: seen.append("tiktok") or None)
-    monkeypatch.setattr(main, "_fetch_youtube_context", lambda u: seen.append("youtube") or "")
+    monkeypatch.setattr(main, "_fetch_youtube_context", lambda u, deadline=None: seen.append("youtube") or "")
     monkeypatch.setattr(main, "_fetch_reddit_meta", lambda u: seen.append("reddit") or None)
     monkeypatch.setattr(main, "_fetch_instagram_embed", lambda u: seen.append("instagram") or None)
     monkeypatch.setattr(main, "_maybe_video_fallback", lambda u, block: block)

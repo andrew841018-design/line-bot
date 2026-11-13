@@ -267,7 +267,10 @@ def test_direct_answer_quoting_the_page_is_kept(monkeypatch, research_env):
     assert research_env.sent == [answer]
 
 
-@pytest.mark.parametrize("canned", [public_research.NO_EVIDENCE, public_research.NO_ANSWER])
+@pytest.mark.parametrize("canned", [
+    "這次搜尋未取得足夠的可靠資料，還無法核實這個說法。",
+    "已取得相關資料，但這次未能產生可靠的查證結論。",
+])
 def test_link_question_never_sends_a_canned_sentence(monkeypatch, research_env, canned):
     monkeypatch.setattr(main, "_collect_web_research_sources", lambda _text: [])
     monkeypatch.setattr(main, "_prefetch_urls", lambda text: PAGE_TEXT + "\n\n" + text)
@@ -300,14 +303,14 @@ def test_url_with_cjk_punctuation_is_still_not_a_claim(monkeypatch, research_env
     assert _status() == "completed_no_reply"
 
 
-def test_claim_typed_after_a_link_still_reports_missing_evidence(monkeypatch, research_env):
+def test_claim_typed_after_a_link_is_a_claim_and_says_nothing_without_evidence(monkeypatch, research_env):
     # A later 「#」 is the user's hashtag, not the link going on.
     monkeypatch.setattr(main, "_collect_web_research_sources", lambda _text: [])
     monkeypatch.setattr(main, "_prefetch_urls", lambda text: text)
     monkeypatch.setattr(main, "_llm_chat", lambda *_a: pytest.fail("no evidence"))
     main._handle_web_research_question(
         research_env.event, "G_LINK", "https://example.test/a，今年東南亞榴槤生產過剩，所以比較便宜。#新聞")
-    assert research_env.sent == [public_research.NO_EVIDENCE]
+    assert research_env.sent == []
 
 
 def test_burst_keeps_the_answer_to_a_question_about_a_link(monkeypatch, burst_env):

@@ -479,7 +479,7 @@ def _classify_and_maybe_respond(
     # 等了 1 分鐘 → 直接回，不再問 Gemini
     if force_respond:
         logger.info(
-            "burst force respond after 1-min wait (group=%s, text=%s)",
+            "burst force respond after 1-min wait (group=%s, text=%r)",
             group_id,
             _truncate(combined_text, 80),
         )
@@ -501,7 +501,7 @@ def _classify_and_maybe_respond(
     rule_decision = _match_rules(combined_text, rules)
     if rule_decision == "skip":
         logger.info(
-            "burst skipped by rule (group=%s, text=%s)",
+            "burst skipped by rule (group=%s, text=%r)",
             group_id,
             _truncate(combined_text, 80),
         )
@@ -509,7 +509,7 @@ def _classify_and_maybe_respond(
         return
     if rule_decision == "must_answer":
         logger.info(
-            "burst must_answer by rule (group=%s, text=%s)",
+            "burst must_answer by rule (group=%s, text=%r)",
             group_id,
             _truncate(combined_text, 80),
         )
@@ -522,7 +522,7 @@ def _classify_and_maybe_respond(
     heur = _heuristic_decision(combined_text)
     if heur == "skip":
         logger.info(
-            "burst skipped by heuristic (group=%s, text=%s)",
+            "burst skipped by heuristic (group=%s, text=%r)",
             group_id,
             _truncate(combined_text, 80),
         )
@@ -530,7 +530,7 @@ def _classify_and_maybe_respond(
         return
     if heur == "respond":
         logger.info(
-            "burst respond by heuristic (group=%s, text=%s)",
+            "burst respond by heuristic (group=%s, text=%r)",
             group_id,
             _truncate(combined_text, 80),
         )
@@ -542,7 +542,7 @@ def _classify_and_maybe_respond(
     # Step 3: 交給 Gemini 分類器
     decision, reason = gemini_client.classify_burst(combined_text, rules)
     logger.info(
-        "burst classifier decision=%s reason=%s text=%s",
+        "burst classifier decision=%s reason=%r text=%r",
         decision,
         reason,
         _truncate(combined_text, 80),
@@ -592,7 +592,7 @@ def _classify_and_maybe_respond(
         if superseded:
             return
         logger.info(
-            "burst waiting 1 min (group=%s, reason=%s, text=%s)",
+            "burst waiting 1 min (group=%s, reason=%r, text=%r)",
             group_id,
             reason,
             _truncate(combined_text, 80),
@@ -826,6 +826,8 @@ def _heuristic_decision(text: str) -> str | None:
 
 
 def _truncate(s: str, n: int) -> str:
+    # Callers log the result with %r: a line break in family text must not start a
+    # log line of its own, which could pass for one the bot wrote (2026-11-12).
     if len(s) <= n:
         return s
     return s[: n - 1] + "…"

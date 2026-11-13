@@ -29,6 +29,7 @@ import reply_provenance
 import safe_fetch
 import source_aggregator
 import web_scraper
+from test_support_timing import cpu_seconds, forbid_other_threads
 
 QUESTION = "電動機車和油車的保養有什麼不同？"
 ANSWER = "電動機車不用換機油和火星塞，平常多注意電池、煞車和輪胎；油車要定期換機油、齒輪油和空氣濾網。"
@@ -149,12 +150,11 @@ def nothing_crawled(monkeypatch):
     monkeypatch.setattr(main, "_collect_web_research_sources", lambda _text: [])
 
 
-def _ends_in_b(research_env, caplog, reason):
-    assert research_env.sent == [public_research.NO_SOURCE_QUESTION]
-    assert "說法" not in research_env.sent[0]
+def _ends_in_silence(research_env, caplog, reason):
+    assert research_env.sent == []
     assert f"gemini={reason}" in caplog.text
     assert "電動機車" not in caplog.text  # reasons only, never the question
-    assert research_env.finished == []
+    assert research_env.finished == [True]
 
 
 @pytest.mark.parametrize("chat, reason", [
@@ -163,27 +163,20 @@ def _ends_in_b(research_env, caplog, reason):
     (_grounded([], answer=""), "empty"),
     (_grounded([], answer="我會再搜尋看看最新資料。"), "promise"),
 ])
-def test_b_only_after_every_layer_failed(monkeypatch, research_env, nothing_crawled, caplog, chat, reason):
+def test_silence_after_every_layer_failed(monkeypatch, research_env, nothing_crawled, caplog, chat, reason):
     monkeypatch.setattr(main.gemini_client, "chat", chat)
-    # B is a fixed line: the guard would drop 「沒查到…資料」 as a search nobody ran
     monkeypatch.setattr(main, "_enforce_new_value_reply", _no_model)
     with caplog.at_level(logging.INFO, logger="line_bot"):
         assert main._handle_web_research_question(research_env.event, "G_PQ", QUESTION)
-    _ends_in_b(research_env, caplog, reason)
+    _ends_in_silence(research_env, caplog, reason)
     assert "crawler=no_usable" in caplog.text
-
-
-def test_b_survives_the_outbound_checks():
-    line = public_research.NO_SOURCE_QUESTION
-    assert main._prepare_outbound_text(line) == line
-    assert not main._is_system_status_outbound(line)
 
 
 def test_no_gemini_call_past_the_quota(monkeypatch, research_env, nothing_crawled, caplog):
     monkeypatch.setattr(main, "_quota_exhausted", lambda: True)
     with caplog.at_level(logging.INFO, logger="line_bot"):
         main._handle_web_research_question(research_env.event, "G_PQ", QUESTION)
-    _ends_in_b(research_env, caplog, "quota")
+    _ends_in_silence(research_env, caplog, "quota")
 
 
 def test_a_429_marks_the_quota_and_never_falls_back(monkeypatch, research_env, nothing_crawled, caplog):
@@ -196,7 +189,7 @@ def test_a_429_marks_the_quota_and_never_falls_back(monkeypatch, research_env, n
     monkeypatch.setattr(main, "_mark_quota_exhausted", lambda: marked.append(True))
     with caplog.at_level(logging.INFO, logger="line_bot"):
         main._handle_web_research_question(research_env.event, "G_PQ", QUESTION)
-    _ends_in_b(research_env, caplog, "quota")
+    _ends_in_silence(research_env, caplog, "quota")
     assert marked == [True]
 
 
@@ -210,7 +203,7 @@ def test_a_per_minute_429_does_not_stop_every_reply(monkeypatch, research_env, n
     monkeypatch.setattr(main, "_mark_quota_exhausted", lambda: marked.append(True))
     with caplog.at_level(logging.INFO, logger="line_bot"):
         main._handle_web_research_question(research_env.event, "G_PQ", QUESTION)
-    _ends_in_b(research_env, caplog, "quota")
+    _ends_in_silence(research_env, caplog, "quota")
     assert marked == []
 
 
@@ -220,17 +213,17 @@ def test_no_gemini_search_when_the_reply_token_is_nearly_spent(monkeypatch, rese
     research_env.event.timestamp = int((main.time.time() - 30) * 1000)
     with caplog.at_level(logging.INFO, logger="line_bot"):
         main._handle_web_research_question(research_env.event, "G_PQ", QUESTION)
-    _ends_in_b(research_env, caplog, "late")
+    _ends_in_silence(research_env, caplog, "late")
 
 
-def test_a_failing_gemini_still_ends_in_b(monkeypatch, research_env, nothing_crawled, caplog):
+def test_a_failing_gemini_still_ends_in_silence(monkeypatch, research_env, nothing_crawled, caplog):
     def boom(*_a):
         raise RuntimeError("503 UNAVAILABLE (synthetic)")
 
     monkeypatch.setattr(main.gemini_client, "chat", boom)
     with caplog.at_level(logging.INFO, logger="line_bot"):
         main._handle_web_research_question(research_env.event, "G_PQ", QUESTION)
-    _ends_in_b(research_env, caplog, "error")
+    _ends_in_silence(research_env, caplog, "error")
 
 
 def test_the_daily_share_of_gemini_is_kept(monkeypatch, research_env, nothing_crawled, caplog):
@@ -242,7 +235,7 @@ def test_the_daily_share_of_gemini_is_kept(monkeypatch, research_env, nothing_cr
     with caplog.at_level(logging.INFO, logger="line_bot"):
         main._handle_web_research_question(research_env.event, "G_PQ", QUESTION)
     assert len(calls) == 1
-    _ends_in_b(research_env, caplog, "cap")
+    _ends_in_silence(research_env, caplog, "cap")
 
 
 def test_no_gemini_search_after_the_crawler_timed_out(monkeypatch, research_env, caplog):
@@ -253,7 +246,7 @@ def test_no_gemini_search_after_the_crawler_timed_out(monkeypatch, research_env,
     monkeypatch.setattr(public_research, "collect", timed_out)
     with caplog.at_level(logging.INFO, logger="line_bot"):
         main._handle_web_research_question(research_env.event, "G_PQ", QUESTION)
-    _ends_in_b(research_env, caplog, "late")
+    _ends_in_silence(research_env, caplog, "late")
     assert "crawler=timeout" in caplog.text
 
 
@@ -262,7 +255,7 @@ def test_nothing_research_may_not_search_is_sent_to_gemini(monkeypatch, research
     monkeypatch.setattr(public_research, "search_query", lambda _t: "")
     with caplog.at_level(logging.INFO, logger="line_bot"):
         main._handle_web_research_question(research_env.event, "G_PQ", QUESTION)
-    _ends_in_b(research_env, caplog, "no_search")
+    _ends_in_silence(research_env, caplog, "no_search")
     assert "crawler=no_search" in caplog.text
 
 
@@ -284,13 +277,13 @@ def test_a_question_cut_short_gets_its_public_subject_back(monkeypatch, research
     assert "restored=True" in caplog.text
 
 
-def test_a_question_without_a_public_subject_to_restore_ends_in_b(research_env, nothing_crawled, caplog):
+def test_a_question_without_a_public_subject_to_restore_ends_in_silence(research_env, nothing_crawled, caplog):
     # only 「月費價格多少」 may go out, and nothing public in the rest says what it is about
     question = "Gogoro換電方案，月費價格多少？"
     assert public_research.is_plain_question(question)
     with caplog.at_level(logging.INFO, logger="line_bot"):
         main._handle_web_research_question(research_env.event, "G_PQ", question)
-    assert research_env.sent == [public_research.NO_SOURCE_QUESTION]
+    assert research_env.sent == []
     assert "gemini=reduced_unrecoverable" in caplog.text
 
 
@@ -310,7 +303,7 @@ def test_a_question_naming_someone_stays_home(research_env, nothing_crawled, cap
     assert public_research.is_plain_question(question)
     with caplog.at_level(logging.INFO, logger="line_bot"):
         main._handle_web_research_question(research_env.event, "G_PQ", question)
-    assert research_env.sent == [public_research.NO_SOURCE_QUESTION]
+    assert research_env.sent == []
     assert "gemini=named" in caplog.text and name not in caplog.text
     assert main._plain_question_searches["count"] == 0  # nothing went out, nothing counted
 
@@ -336,7 +329,7 @@ def test_unreadable_names_send_nothing(monkeypatch, research_env, nothing_crawle
     line_mentions.clear_alias_cache()
     with caplog.at_level(logging.INFO, logger="line_bot"):
         main._handle_web_research_question(research_env.event, "G_PQ", QUESTION)
-    _ends_in_b(research_env, caplog, "names_unavailable")
+    _ends_in_silence(research_env, caplog, "names_unavailable")
     assert f"common={'skipped' if common_on else 'off'}" in caplog.text
     assert main._plain_question_searches["count"] == 0
 
@@ -492,7 +485,7 @@ def test_the_common_layer_never_sees_a_named_question(monkeypatch, research_env,
     monkeypatch.setattr(main, "_RESEARCH_COMMON_KNOWLEDGE", True)  # _llm_chat stays _no_model
     with caplog.at_level(logging.INFO, logger="line_bot"):
         main._handle_web_research_question(research_env.event, "G_PQ", "測試成員甲推薦的拉麵好吃嗎？")
-    assert research_env.sent == [public_research.NO_SOURCE_QUESTION]
+    assert research_env.sent == []
     assert "gemini=named" in caplog.text and "common=skipped" in caplog.text
 
 
@@ -542,14 +535,13 @@ def test_the_fixed_line_swap_is_for_plain_questions_only(monkeypatch, research_e
     assert research_env.sent == [VISA_YES]
 
 
-def test_an_answer_the_guards_empty_is_b_not_silence(monkeypatch, research_env, nothing_crawled, caplog):
+def test_an_answer_the_guards_empty_is_silence(monkeypatch, research_env, nothing_crawled, caplog):
     monkeypatch.setattr(main.gemini_client, "chat", _grounded([]))
     monkeypatch.setattr(main, "_enforce_new_value_reply", lambda *_a, **_k: "")
     with caplog.at_level(logging.INFO, logger="line_bot"):
         main._handle_web_research_question(research_env.event, "G_PQ", QUESTION)
-    assert research_env.sent == [public_research.NO_SOURCE_QUESTION]
-    assert research_env.finished == []
-    assert "plain question answer emptied by the reply guards" in caplog.text
+    assert research_env.sent == []
+    assert research_env.finished == [True]
 
 
 # ── 2026-10-29 (PLAN §10): a number the cited pages hold may stay ────────────
@@ -782,18 +774,21 @@ def test_a_second_pass_that_disagrees_with_its_check_is_not_kept(monkeypatch):
     "今天總統宣布停火了嗎",
     "幫我查證這種保養方式有沒有用？",
 ])
-def test_claims_still_get_no_evidence_and_no_model(research_env, nothing_crawled, text):
+def test_claims_search_on_and_say_nothing_when_no_layer_finds_anything(
+        monkeypatch, research_env, nothing_crawled, text):
+    calls = []
+    monkeypatch.setattr(main.gemini_client, "chat", _grounded(calls, answer=""))
     assert main._handle_web_research_question(research_env.event, "G_PQ", text)
-    assert research_env.sent == [public_research.NO_EVIDENCE]
+    assert research_env.sent == [] and research_env.finished == [True]
+    assert len(calls) == 1 and calls[0].context == [] and calls[0].facts == []
 
 
 def test_quoted_and_unaddressed_questions_are_unchanged(research_env, nothing_crawled):
     main._handle_web_research_question(
         research_env.event, "G_PQ", QUESTION, quoted_context="（引用）合成的前一則訊息")
-    assert research_env.sent == [public_research.NO_EVIDENCE]
-    research_env.sent.clear()
-    main._handle_web_research_question(research_env.event, "G_PQ", QUESTION, addressed=False)
     assert research_env.sent == [] and research_env.finished == [True]
+    main._handle_web_research_question(research_env.event, "G_PQ", QUESTION, addressed=False)
+    assert research_env.sent == [] and research_env.finished == [True, True]
 
 
 # ── the common-knowledge layer: off until Andrew decides ─────────────────────
@@ -806,7 +801,7 @@ def gemini_from_memory(monkeypatch):
 def test_common_knowledge_is_off_by_default(research_env, nothing_crawled, gemini_from_memory):
     assert main._RESEARCH_COMMON_KNOWLEDGE is False
     main._handle_web_research_question(research_env.event, "G_PQ", QUESTION)
-    assert research_env.sent == [public_research.NO_SOURCE_QUESTION]
+    assert research_env.sent == []
 
 
 def test_common_knowledge_when_switched_on_is_labelled(monkeypatch, research_env, nothing_crawled,
@@ -834,7 +829,7 @@ def test_common_knowledge_never_guesses(monkeypatch, research_env, nothing_crawl
     monkeypatch.setattr(main, "_RESEARCH_COMMON_KNOWLEDGE", True)
     monkeypatch.setattr(main, "_llm_chat", lambda *_a: memory_reply)
     main._handle_web_research_question(research_env.event, "G_PQ", text)
-    assert research_env.sent == [public_research.NO_SOURCE_QUESTION]
+    assert research_env.sent == []
 
 
 @pytest.mark.parametrize("fixed", [
@@ -935,13 +930,16 @@ def test_complete_search_query(text, expected):
     assert public_research.complete_search_query(text) == expected
 
 
-def test_a_long_laugh_is_checked_in_linear_time():
+def test_a_long_laugh_is_checked_in_linear_time(monkeypatch):
     # Nested repeats took seconds at 24 哈 and never finished at 60, holding the GIL.
-    started = main.time.monotonic()
-    assert public_research._COURTESY.fullmatch("哈" * 60 + "好") is None
-    assert public_research.complete_search_query("哈" * 60 + "好好笑，去日本要簽證嗎？") == ""
-    assert public_research.complete_search_query("哈" * 60 + "，去日本要簽證嗎？") == "去日本要簽證嗎"
-    assert main.time.monotonic() - started < 1.0
+    forbid_other_threads(monkeypatch)
+
+    def check(laugh):
+        assert public_research._COURTESY.fullmatch(laugh + "好") is None
+        assert public_research.complete_search_query(laugh + "好好笑，去日本要簽證嗎？") == ""
+        assert public_research.complete_search_query(laugh + "，去日本要簽證嗎？") == "去日本要簽證嗎"
+
+    assert cpu_seconds(check, "哈" * 60) < 1.0
 
 
 def test_names_are_compared_as_the_guards_compare_them():

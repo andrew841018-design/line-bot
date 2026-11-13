@@ -39,7 +39,7 @@ from concurrent.futures import (
     as_completed,
 )
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import NamedTuple, Optional
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
@@ -2887,6 +2887,308 @@ def get_quotes_text(text: str, max_symbols: int = 5) -> Optional[str]:
     src_label = _SOURCE_LABEL.get(best_src, best_src)
     header = f"【即時股價｜{header_ts}（{src_label}）】"
     return header + "\n" + "\n".join(quotes)
+
+
+# 2026-11-07 聊行情時帶上即時報價 (Andrew approved the 11/06 proposal).  Prices for a chat about the
+# market, as material for the model and never a fixed reply.  Symbols come from the fixed tables
+# below and from four-digit codes that read as one, offline: detect_symbols also takes any capitalised
+# word (a name, the "chen.t" of an email address) and the Yahoo name search takes the family's words,
+# and neither may reach Yahoo from a chat nobody addressed to the bot.  The fetch sends the symbol.
+CHAT_QUOTE_BLOCK_START = "--- 市場報價開始 ---"
+CHAT_QUOTE_BLOCK_END = "--- 市場報價結束 ---"
+CHAT_QUOTE_BUDGET_SEC = 2.7  # the caller stops waiting at 3 s: a partial result gets there first
+_CHAT_QUOTE_MAX_SYMBOLS = 3
+_CHAT_QUOTE_MAX_CHARS = 2000
+_CHAT_QUOTE_LEAD = (
+    "（以下是程式剛取得的市場報價，可能延遲。這次有報價可用，不要說沒有股價工具。"
+    "用到價格或漲跌幅時照這裡的數字並講出時間，已收盤就說是收盤價。"
+    "不要整段貼出，不要說查到或搜尋，不要用「最新資料」「官方數據」這類說法，"
+    "對話沒在談的標的不要提。）"
+)
+# Not 「多少」: 「…飛日本多少錢」 is a fare.  漲價／跌倒／跌了一跤 are not the market.  A number right
+# after 目前／現在 counts: 「台積電目前1455」 says the price without a market word.
+_CHAT_MOVE_RE = re.compile(
+    r"股價|股票|現價|報價|行情|盤中|盤後|收盤|開盤|走勢|漲停|跌停|漲幅|跌幅|漲跌|崩盤|崩了|重挫|"
+    r"回檔|反彈|新高|新低|站上|跌破|買進|賣出|加碼|減碼|套牢|停損|"
+    r"漲(?!價)|跌(?!倒|跤|了一跤|傷)|(?:目前|現在|剩|來到)\s*\d{2,}"
+)
+# Everyday prices that share a line with a listed name (a 帳單 going up is not the stock), and what
+# only sounds like one.
+_CHAT_NOT_MARKET_RE = re.compile(
+    r"油價|電價|水費|電費|帳單|機票|票價|學費|房租|物價|體重|血糖|血壓|薪水|"
+    r"三星(?:蔥|鄉|手機|電視)|陽明(?:山|交大|醫院)|長榮(?:大學|中學|路|桂冠)|東南亞|"
+    r"南亞(?:地區|國家|各國|洲)|[室網好朋]友達|黃金(?:時段|比例|交叉|週|獵犬|地段)|加權平均|台塑牛排"
+)
+# Names the family uses that the quote routes do not know.  Chat material only: a wrong hit costs
+# one fetch, while in those routes it would become a fixed reply.  蘋果 stays out (the fruit).
+_CHAT_NAME_MAP = {
+    "輝達": "NVDA",
+    "英偉達": "NVDA",
+    "NVIDIA": "NVDA",
+    "谷歌": "GOOGL",
+    "GOOGLE": "GOOGL",
+    "ALPHABET": "GOOGL",
+    "APPLE": "AAPL",
+    "特斯拉": "TSLA",
+    "TESLA": "TSLA",
+    "微軟": "MSFT",
+    "MICROSOFT": "MSFT",
+    "亞馬遜": "AMZN",
+    "AMAZON": "AMZN",
+    "博通": "AVGO",
+    "BROADCOM": "AVGO",
+    "超微": "AMD",
+    "美超微": "SMCI",
+    "英特爾": "INTC",
+    "INTEL": "INTC",
+    "高通": "QCOM",
+    "QUALCOMM": "QCOM",
+    "甲骨文": "ORCL",
+    "ORACLE": "ORCL",
+    "ORCL": "ORCL",
+    "網飛": "NFLX",
+    "NETFLIX": "NFLX",
+    "NFLX": "NFLX",
+    "臉書": "META",
+    "FACEBOOK": "META",
+    "廣達": "2382.TW",
+    "緯創": "3231.TW",
+    "緯穎": "6669.TW",
+    "華碩": "2357.TW",
+    "萬海": "2615.TW",
+    # Longer than a name of the table above, and another company.
+    "南亞科": "2408.TW",
+    "長榮航": "2618.TW",
+    "長榮航空": "2618.TW",
+    "長榮航太": "2645.TW",
+    "台積電ADR": "TSM",
+    "台積電 ADR": "TSM",
+    "台積ADR": "TSM",
+    "台積 ADR": "TSM",
+    "TSMC ADR": "TSM",
+    "台積電的ADR": "TSM",
+    "台積電的 ADR": "TSM",
+    "台積的ADR": "TSM",
+    "台積的 ADR": "TSM",
+    "台塑化": "6505.TW",
+    "台塑石化": "6505.TW",
+    "台達化": "1309.TW",
+    "長榮鋼": "2211.TW",
+    "南亞電路板": "8046.TW",
+    "中鋼碳素": "1723.TW",
+    "中鋼構": "2013.TW",
+    "大立光": "3008.TW",
+    "日月光": "3711.TW",
+    "中信金": "2891.TW",
+    "元大金": "2885.TW",
+    "三星": "005930.KS",
+    "SAMSUNG": "005930.KS",
+    "海力士": "000660.KS",
+    "軟銀": "9984.T",
+    "SOFTBANK": "9984.T",
+    "ALIBABA": "9988.HK",
+    "那斯達克": "^IXIC",
+    "那指": "^IXIC",
+    "恆生": "^HSI",
+    "美股": "^GSPC",
+    "大盤": "^TWII",
+    "黃金": _GOLD_QUOTE_SYMBOL,
+    "金價": _GOLD_QUOTE_SYMBOL,
+}
+_CHAT_ALIASES = {
+    alias: target
+    for alias, target in {
+        **{ticker: ticker for ticker in _US_TICKERS if len(ticker) > 1},
+        **{name: f"{code}.TW" for name, code in _TW_NAME_MAP.items()},
+        **_INDEX_MAP,
+        **_EN_NAME_MAP,
+        **_GLOBAL_NAME_MAP,
+        **_CHAT_NAME_MAP,
+    }.items()
+    # Two letters are initials and words as often as tickers (「Andy MU」「曼聯 MU」「跌破月MA」
+    # 「PG 13」), and 「其他 coin」 is a coin.  美光 still names Micron.
+    if not (alias.isascii() and len(alias) <= 2) and alias != "COIN"
+}
+# A bare four-digit code is only one of these: 「保費 3500 漲了」 is no listing.
+_CHAT_KNOWN_TW_CODES = (
+    frozenset(_TW_NAME_MAP.values())
+    | {target.split(".")[0] for target in _CHAT_NAME_MAP.values() if target.endswith(".TW")}
+    | _TW_4DIGIT_ETF_CODES
+)
+
+
+def _chat_alias(alias: str) -> str:
+    """ASCII stands alone (「GOOGLEMAPS」 is not Google); next to CJK it still counts: 「NVDA跌了」."""
+    return rf"(?<![A-Z0-9]){re.escape(alias)}(?![A-Z0-9])" if alias.isascii() else re.escape(alias)
+
+
+_CHAT_ALIAS_RE = re.compile("|".join(_chat_alias(a) for a in sorted(_CHAT_ALIASES, key=len, reverse=True)))
+_CHAT_ETF_CODE_RE = re.compile(r"(?<![\dA-Za-z])(00\d{2,4}[A-Z]?)(?![\dA-Za-z])")
+# A bare code only as the subject of the market word: 「2330 今天跌了」.  「跌至2295」「目前2320」 are prices.
+_CHAT_BARE_CODE_RE = re.compile(
+    r"(?<![\d.,])(\d{4})(?![\d.,])\s*(?:今天|今日|現在|目前|昨天|又|也|都|的|還|一直|繼續)*\s*"
+    r"(?:股價|收盤|開盤|盤中|走勢|報價|行情|漲|跌|大漲|大跌|暴漲|暴跌)"
+)
+# ... and it starts its clause (「，2454 大漲」) or follows holding it (「買了 2317 跌了」).
+# 「車資 2330 漲了」「原本 2330 漲到 2454」 are amounts.
+_CHAT_CODE_LEAD_RE = re.compile(
+    r"(?:^|[，,、；;：:！!？?]|買了?|賣了?|買的|我的|持有|抱著?|那檔|這檔|那個|這個|股票|代號|今天|今日|昨天)\s*$"
+)
+
+
+# Words a name only sits inside: 「今日經濟」 is no Nikkei, 「那指的是」 no Nasdaq, 「浪費半天」 no SOX.
+_CHAT_NAME_INSIDE_RE = re.compile(r"日經濟|那指的|知道指|浪費半|台達化身")
+# For the reply check: an everyday phrase (「黃金交叉」「東南亞」) holds no name either.
+_CHAT_NOT_A_NAME_RE = re.compile(f"{_CHAT_NAME_INSIDE_RE.pattern}|{_CHAT_NOT_MARKET_RE.pattern}")
+
+
+def _chat_name_spans(text: str, skip: re.Pattern) -> list[tuple[int, int, str]]:
+    inside = [match.span() for match in skip.finditer(text)]
+    spans = [(m.start(), m.end(), _CHAT_ALIASES.get(m.group(0))) for m in _CHAT_ALIAS_RE.finditer(text.upper())]
+    return [(s, e, symbol) for s, e, symbol in spans if symbol and not any(a < e and s < b for a, b in inside)]
+
+
+def _chat_aliases_in(line: str) -> list[tuple[int, str]]:
+    """(where, symbol) for each name of the chat table in ``line``, NFKC already applied."""
+    return [(start, symbol) for start, _end, symbol in _chat_name_spans(line, _CHAT_NAME_INSIDE_RE)]
+
+
+# The reply check still knows these: 「MU 收 95 美元」 is about Micron whatever the chat leaves out.
+_REPLY_ONLY_TICKER_RE = re.compile("|".join(
+    rf"(?<![A-Z0-9]){ticker}(?![A-Z0-9])"
+    for ticker in sorted({t for t in _US_TICKERS if len(t) == 2} | {"COIN"})
+))
+
+
+def chat_name_spans(text: str) -> list[tuple[int, int, str]]:
+    """(start, end, symbol) of each name of the chat table in ``text``, folded already, market word
+    or not; one inside an everyday phrase does not count.  No network."""
+    return _chat_name_spans(text, _CHAT_NOT_A_NAME_RE) + [
+        (match.start(), match.end(), match.group(0)) for match in _REPLY_ONLY_TICKER_RE.finditer(text.upper())
+    ]
+
+
+def _chat_line_symbols(line: str) -> list[str]:
+    found = _chat_aliases_in(line)
+    for match in _CHAT_ETF_CODE_RE.finditer(line):
+        code = match.group(1)
+        if (len(code) > 4 or code in _TW_4DIGIT_ETF_CODES) and not _non_code_number(
+            line, match.start(1), match.end(1)
+        ):
+            found.append((match.start(1), f"{code}.TW"))
+    if not found:  # next to a name a bare number is its price
+        for match in _CHAT_BARE_CODE_RE.finditer(line):
+            code = match.group(1)
+            if (
+                code in _CHAT_KNOWN_TW_CODES
+                and not 1900 <= int(code) <= 2100
+                and _tw_code_wanted(line, match.start(1), match.end(1))
+                and _CHAT_CODE_LEAD_RE.search(line[:match.start(1)])
+            ):
+                found.append((match.start(1), f"{code}.TW"))
+    return [symbol for _at, symbol in sorted(found, key=lambda item: item[0])]
+
+
+def chat_quote_symbols(text: str) -> list[str]:
+    """Instruments a chat line says moved: a known name and a market word on the same line.
+
+    No network.  At most ``_CHAT_QUOTE_MAX_SYMBOLS``, in the order they were written.
+    """
+    # The newest words are the last ones.  Links go first: the ? of a query string would end a "line".
+    folded = unicodedata.normalize("NFKC", _without_links((text or "")[-_CHAT_QUOTE_MAX_CHARS:]))
+    folded = folded.replace("臺", "台")
+    symbols: list[str] = []
+    for line in _SENTENCE_END_RE.split(folded):
+        if _CHAT_MOVE_RE.search(line) and not _CHAT_NOT_MARKET_RE.search(line):
+            symbols.extend(_chat_line_symbols(line))
+    return list(dict.fromkeys(symbols))[:_CHAT_QUOTE_MAX_SYMBOLS]
+
+
+class ChatQuote(NamedTuple):
+    """A price for the chat path: the line the model reads, and what its reply is checked against."""
+
+    line: str
+    names: tuple[str, ...]  # upper-cased: how a reply may call this instrument
+    price: float
+    change: Optional[float]
+    change_pct: Optional[float]
+
+
+def _chat_session_label(symbol: str, quote: dict, now: datetime) -> str:
+    """A quote from an earlier day is a close, whatever the session window says (a typhoon day)."""
+    market_date = _quote_market_date(quote)
+    zone = str(quote.get("exchange_timezone") or "")
+    try:
+        if market_date and zone and market_date != now.astimezone(ZoneInfo(zone)).strftime("%Y-%m-%d"):
+            return "，已收盤"
+    except Exception:
+        pass
+    return {"open": "，盤中", "closed": "，已收盤"}.get(_quote_regular_session_state(quote, now, symbol), "")
+
+
+def _chat_quote(symbol: str, quote: dict, now: datetime) -> ChatQuote:
+    spec = _base_quote_spec(symbol)
+    name = spec["label"].removesuffix("現股")
+    currency = {"index": "點"}.get(spec["currency"], spec["currency"])
+    price = float(quote["last_price"])
+    change = _to_float(quote.get("change"))
+    change_pct = _to_float(quote.get("change_pct"))
+    moved = (
+        f"，漲跌 {change:+,.2f}（{change_pct:+.2f}%）"
+        if change is not None and change_pct is not None
+        else ""
+    )
+    when = str(quote.get("timestamp") or quote.get("last_date") or "時間未知")
+    if symbol.endswith(".TW") and "/" not in when:  # _parse_yahoo_tw_html fills in the clock
+        when = "時間未知"
+    names = {alias for alias, target in _CHAT_ALIASES.items() if target == symbol}
+    names.update((symbol.upper(), symbol.split(".")[0].upper(), name.upper()))
+    return ChatQuote(
+        f"{name} {symbol}：{price:,.2f} {currency}{moved}，{when}{_chat_session_label(symbol, quote, now)}".strip(),
+        tuple(sorted(filter(None, names), key=len, reverse=True)),  # an ETF has no label
+        price,
+        change,
+        change_pct,
+    )
+
+
+def get_chat_quotes(
+    symbols: list[str],
+    *,
+    now: datetime | None = None,
+    total_timeout_s: float = CHAT_QUOTE_BUDGET_SEC,
+) -> list[ChatQuote]:
+    """The prices that came back in time, in the order of ``symbols``."""
+    started = time.monotonic()
+    fetched = _fetch_contextual_quotes_with_deadline(list(symbols), total_timeout_s)
+    now = _coerce_taipei_now(now)
+    quotes = [_chat_quote(s, fetched[s], now) for s in symbols if s in fetched]
+    logger.info(
+        "chat quotes symbols=%d priced=%d elapsed_ms=%d",
+        len(symbols), len(quotes), int((time.monotonic() - started) * 1000),
+    )
+    return quotes
+
+
+def chat_quote_block(quotes: list[ChatQuote]) -> str:
+    """The prompt block.  Its label is one `reply_guards.user_typed_text` takes out again."""
+    return "\n".join((
+        _CHAT_QUOTE_LEAD,
+        CHAT_QUOTE_BLOCK_START,
+        *(quote.line for quote in quotes),
+        CHAT_QUOTE_BLOCK_END,
+    ))
+
+
+_CHAT_QUOTE_BLOCK_RE = re.compile(
+    rf"(?:{re.escape(_CHAT_QUOTE_LEAD)}\n)?{re.escape(CHAT_QUOTE_BLOCK_START)}.*?{re.escape(CHAT_QUOTE_BLOCK_END)}",
+    re.S,
+)
+
+
+def without_chat_quote_block(text: str) -> str:
+    """``text`` without the price block: lite_reply's handlers read every number they are given."""
+    return _CHAT_QUOTE_BLOCK_RE.sub("", text or "").rstrip()
 
 
 def _label_for(symbol: str) -> str:

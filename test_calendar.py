@@ -1023,7 +1023,7 @@ def test_event_reminder_merges_mentioned_names_from_raw_text(tmp_calendar_db):
     assert reminder["mention_aliases"] == ["媽媽", "測試成員甲"]
 
 
-def test_event_reminder_treats_raw_text_family_all_as_all(tmp_calendar_db):
+def test_event_reminder_takes_no_family_word_from_raw_text(tmp_calendar_db):
     cd = tmp_calendar_db
     _align_memory_db_with_calendar(cd)
     import memory
@@ -1049,7 +1049,8 @@ def test_event_reminder_treats_raw_text_family_all_as_all(tmp_calendar_db):
     reminders = memory.list_pending_reminders_full("G1")
     reminder = next(r for r in reminders if r["source_ref"] == eid)
 
-    assert reminder["mention_aliases"] == ["全家"]
+    # 2026-11-07, Andrew: only an @ counts.  The model's participants carry a real 全家 (test_reminder_all_mention.py).
+    assert reminder["mention_aliases"] == []
 
 
 def test_event_reminder_skips_cancelled(tmp_calendar_db, monkeypatch):

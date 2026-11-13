@@ -55,6 +55,7 @@ from test_support_fake_line import (
     refused,
     texts,
 )
+from test_support_timing import cpu_seconds
 
 TOKEN = "TOKEN-SYNTHETIC-0400"
 
@@ -136,11 +137,13 @@ def test_hostile_or_oversized_bodies_are_read_quickly_and_name_no_index():
     # (H5) one anchored match with a bounded quantifier per property, at most 100 properties
     hostile = {"message": "x", "details": [{"property": "messages[" * 40}] * 20}
     huge = {"message": "x", "details": [{"property": "messages[3].text"}] + [{"property": "messages[" * 4000}] * 100}
+
+    def read(body):
+        return line_errors.rejected_message_indexes(api_error(400, body))
+
     for body in (hostile, huge):
-        started = time.perf_counter()
-        indexes = line_errors.rejected_message_indexes(api_error(400, body))
-        assert time.perf_counter() - started < 0.5
-        assert indexes == []  # (the huge body is cut at 8000 characters, so it is not even valid JSON)
+        assert cpu_seconds(read, body) < 0.5
+        assert read(body) == []  # (the huge body is cut at 8000 characters, so it is not even valid JSON)
     assert line_errors.rejected_message_indexes(api_error(400, {"message": "x", "details": [{"property": "messages[3].text"}] * 100})) == [3]
 
 

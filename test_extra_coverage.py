@@ -430,7 +430,7 @@ def test_handle_file_message():
     check("quota 爆 file → fallback reply", mock_reply2.called)
     main._quota_exhausted_until_ts = 0.0
 
-    # Download fails → reply error
+    # Download fails → finished without a line
     msg3 = _make_file_msg("test.txt")
     evt3 = _make_message_event(msg3)
     with (
@@ -438,7 +438,7 @@ def test_handle_file_message():
         patch("main._reply") as mock_reply3,
     ):
         main._handle_file_message(evt3, "GRP001")
-    check("download 失敗 → reply error", mock_reply3.called)
+    check("download 失敗 → 不 reply", not mock_reply3.called)
 
     # Text file → LLM → reply
     msg4 = _make_file_msg("test.txt")

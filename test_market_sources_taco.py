@@ -23,6 +23,7 @@ from test_market_taco_fixture import (
     CLOUDFLARE, HEAD, HISTORY, ROWS_AFTER, ROWS_BEFORE, assert_no_source_text, data_row, flight_of, float_edge_case,
     imported_modules, make_bytes, make_data, make_page, page_of, push,
 )
+from test_support_timing import cpu_seconds
 
 HERE = Path(__file__).resolve().parent
 MIB = 1024 * 1024
@@ -172,14 +173,11 @@ def test_too_many_pushes_and_oversized_pages_are_refused():
 
 def test_a_row_with_too_many_json_nodes_is_refused_quickly():
     """找資料時最多走 MAX_NODES 個 JSON 節點（4 MiB 的頁面也不能讓任務跑太久）。"""
-    import time
-
     body = json.dumps({"methodologyVersion": "x", "x": [[1] * 10 for _ in range(taco.MAX_NODES // 10 + 10_000)]})
     page = page_of([("a:" + body + "\n")])
     assert len(page) < taco.MAX_BYTES
-    started = time.perf_counter()
+    assert cpu_seconds(parse_error, page) < 5.0
     assert parse_error(page) == ("format", "too_big_json")
-    assert time.perf_counter() - started < 5.0
 
 
 def test_deeply_nested_json_is_a_format_error_not_a_crash():

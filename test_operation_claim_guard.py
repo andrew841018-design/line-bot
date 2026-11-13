@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import os
 import sys
-import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -25,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pytest  # noqa: E402
 
 import reply_policy  # noqa: E402
+from test_support_timing import cpu_seconds  # noqa: E402
 
 INCIDENT_REPLY = "好的，那聚餐提醒會更新到 11 月 5 日週三，地點在社區活動中心 5 樓。"
 INCIDENT_SOURCE = "11月5日週三可到社區活動中心五樓"
@@ -224,10 +224,8 @@ def test_reminder_time_sentence_goes_with_an_implied_claim():
     pytest.param("建議" + "提醒已更新" * 4000, None, id="op-advice"),
 ])
 def test_claim_scan_takes_under_300_ms_on_a_20k_degenerate_reply(text, expected):
-    start = time.perf_counter()
-    result = reply_policy.strip_operation_claims(text)
-    assert time.perf_counter() - start < 0.3
-    assert result == ((text[:5000], 0) if expected is None else expected)
+    assert cpu_seconds(reply_policy.strip_operation_claims, text) < 0.3
+    assert reply_policy.strip_operation_claims(text) == ((text[:5000], 0) if expected is None else expected)
 
 
 @pytest.mark.parametrize("text", [
@@ -239,9 +237,8 @@ def test_claim_scan_takes_under_300_ms_on_a_20k_degenerate_reply(text, expected)
 ])
 def test_claim_scan_is_fast_on_a_long_clause_with_many_matches(text):
     assert len(text) <= 5000
-    start = time.perf_counter()
+    assert cpu_seconds(reply_policy.strip_operation_claims, text) < 0.05
     assert reply_policy.strip_operation_claims(text) == (text, 0)
-    assert time.perf_counter() - start < 0.05
 
 
 def test_text_past_what_line_can_send_is_left_out():

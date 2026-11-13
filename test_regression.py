@@ -210,7 +210,8 @@ def test_non_explicit_quoted_url_followup_routes_to_web_research():
     assert research_text == "這個真的假的 https://example.com/a"
     import public_research
     assert public_research.public_query(research_text) == research_text
-    mock_cancel.assert_called_once_with("GRP001")
+    assert mock_web.call_args.kwargs["cancel_pending_burst"] is True  # the handler takes the burst
+    mock_cancel.assert_not_called()
     mock_burst.assert_not_called()
 
 
@@ -586,7 +587,7 @@ def test_prefetch_youtube_all_fetchers_fail_still_adds_context(monkeypatch):
 def test_prefetch_accepts_bare_youtube_url(monkeypatch):
     seen: list[str] = []
 
-    def fake_context(url):
+    def fake_context(url, deadline=None):
         seen.append(url)
         return "YOUTUBE_BLOCK"
 
@@ -601,7 +602,7 @@ def test_prefetch_accepts_bare_youtube_url(monkeypatch):
 def test_prefetch_prioritizes_youtube_when_third_url(monkeypatch):
     seen: list[str] = []
 
-    def fake_context(url):
+    def fake_context(url, deadline=None):
         seen.append(url)
         return "YOUTUBE_BLOCK"
 
@@ -635,7 +636,7 @@ def test_web_research_youtube_question_prefetches_before_llm(monkeypatch):
         captured["prompt"] = prompt
         return "這場直播主題可從 metadata 判斷。"
 
-    monkeypatch.setattr(main, "_fetch_youtube_context", lambda _url: "YOUTUBE_CONTEXT_BLOCK")
+    monkeypatch.setattr(main, "_fetch_youtube_context", lambda _url, _deadline=None: "YOUTUBE_CONTEXT_BLOCK")
     monkeypatch.setattr(main, "_collect_web_research_sources", lambda _text: [])
     monkeypatch.setattr(main, "_llm_chat", fake_llm)
     monkeypatch.setattr(main, "_thinking_indicator", lambda _group_id: _noop_cm())
@@ -952,12 +953,7 @@ def test_web_research_empty_lookup_reports_no_evidence(monkeypatch):
         )
 
     assert handled is True
-    import public_research
-    mock_reply.assert_called_once_with(
-        "TOKEN001",
-        public_research.NO_EVIDENCE,
-        group_id="GRP001",
-    )
+    mock_reply.assert_not_called()
 
 
 def test_lifespan_disables_local_text_runtime_before_pending_drain(monkeypatch):

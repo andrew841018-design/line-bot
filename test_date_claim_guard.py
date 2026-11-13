@@ -29,6 +29,7 @@ import gemini_client  # noqa: E402
 import main  # noqa: E402
 import reply_policy  # noqa: E402
 import reply_provenance  # noqa: E402
+from test_support_timing import cpu_seconds  # noqa: E402
 
 TODAY = date(2026, 10, 28)
 USER = "補助到月底，投票日11月28日那週人比較多。"
@@ -431,11 +432,7 @@ _SHAPES = {
 
 
 def _seconds(text):
-    import time
-
-    started = time.perf_counter()
-    _findings(text, user_text=USER)
-    return time.perf_counter() - started
+    return cpu_seconds(lambda t: _findings(t, user_text=USER), text)
 
 
 @pytest.mark.parametrize("shape", sorted(_SHAPES))
@@ -444,7 +441,7 @@ def test_long_replies_are_checked_in_linear_time(shape):
     small = min(_seconds(make(5000)) for _ in range(3))
     large = min(_seconds(make(20000)) for _ in range(3))
     assert large < 1.0
-    assert large < 10 * max(small, 0.002)
+    assert large < 10 * max(small, 0.002)  # a ratio of 10–11.5 can be E cores alone: rerun this test by itself first
 
 
 def test_a_stale_cached_burst_reply_is_regenerated(monkeypatch):
@@ -467,19 +464,15 @@ _BACKING_SHAPES = {
 
 @pytest.mark.parametrize("shape", sorted(_BACKING_SHAPES))
 def test_long_backing_texts_are_read_in_linear_time(shape):
-    import time
-
     reply = "11月28日不是投票日。" * 300
 
-    def run(n):
-        started = time.perf_counter()
+    def check(n):
         _findings(reply, user_text=USER, **_BACKING_SHAPES[shape](n))
-        return time.perf_counter() - started
 
-    small = min(run(5000) for _ in range(3))
-    large = min(run(20000) for _ in range(3))
+    small = min(cpu_seconds(check, 5000) for _ in range(3))
+    large = min(cpu_seconds(check, 20000) for _ in range(3))
     assert large < 1.0
-    assert large < 10 * max(small, 0.002)
+    assert large < 10 * max(small, 0.002)  # a ratio of 10–11.5 can be E cores alone: rerun this test by itself first
 
 
 # ── 6. post-implementation review (round 6) ──────────────────────────────────

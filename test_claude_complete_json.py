@@ -124,6 +124,23 @@ def test_a_launch_failure_is_unavailable(cli):
         cc.complete_json(SYSTEM, USER, timeout_s=30)
 
 
+def test_the_prompt_file_is_in_its_own_folder(cli, tmp_path):
+    runs = cli((0, "[]", ""))
+    cc.complete_json(SYSTEM, USER, timeout_s=30)
+    assert os.path.dirname(runs[0]["path"]) == str(tmp_path / f"{cc._PROMPT_DIR_NAME}-{os.getuid()}")
+
+
+def test_a_refused_prompt_folder_is_unavailable(cli, monkeypatch):
+    def refused(_name):
+        raise PermissionError("synthetic")
+
+    cli((0, "不該執行", ""))
+    monkeypatch.setattr(cc, "private_tmp_dir", refused)
+    monkeypatch.setattr(cc.subprocess, "run", lambda *_a, **_k: pytest.fail("no CLI without its prompt"))
+    with pytest.raises(cc.ClaudeCliUnavailable):
+        cc.complete_json(SYSTEM, USER, timeout_s=30)
+
+
 # 2026-10-11 修正第一輪 #3：job 要分得出逾時、CLI 其他失敗、登入失效，不靠解析訊息文字。
 
 

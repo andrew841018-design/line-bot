@@ -23,6 +23,7 @@ import calendar_regex
 import gemini_client
 import main
 import memory
+from test_support_timing import cpu_seconds, forbid_other_threads
 
 sys.path.insert(0, str(Path(__file__).parent / "jobs"))
 import daily_pending_audit as dpa  # noqa: E402
@@ -1430,11 +1431,10 @@ def test_a_question_to_mibao_keeps_its_routing(monkeypatch, text, route):
         pytest.param("咪寶 提醒我" + "下" * 480 + "呢", id="xia-ne"),
     ],
 )
-def test_the_question_test_stays_fast_on_long_repetitive_text(text):
+def test_the_question_test_stays_fast_on_long_repetitive_text(text, monkeypatch):
     assert len(text) <= 500
-    start = time.perf_counter()
-    main._is_reminder_request_to_bot(text, addressed=True)
-    assert time.perf_counter() - start < 0.05
+    forbid_other_threads(monkeypatch)
+    assert cpu_seconds(lambda t: main._is_reminder_request_to_bot(t, addressed=True), text) < 0.05
 
 
 def test_queued_and_failure_receipt_helpers_are_gone():
@@ -2003,8 +2003,6 @@ def test_later_mention_of_a_listed_trip_day_joins_the_schedule_row():
 def test_unread_date_words_check_stays_fast_on_digit_and_space_runs():
     """GP2 r4: a run of digits then spaces must not make the check crawl."""
     text = "咪寶提醒我" + "1" * 150 + " " * 344
-    started = time.perf_counter()
-    main._REMINDER_UNREAD_DATE_RE.search(text)
-    assert time.perf_counter() - started < 0.05
+    assert cpu_seconds(main._REMINDER_UNREAD_DATE_RE.search, text) < 0.05
     for phrase in ("10分鐘後", "3 個月後", "3個 月後", "兩 個 禮拜 之後", "半小時內"):
         assert main._REMINDER_UNREAD_DATE_RE.search(phrase), phrase

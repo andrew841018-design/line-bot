@@ -43,6 +43,17 @@ class MentionTarget:
     label: str = ""
 
 
+class AllowsAllMention(str):
+    """A message one of the program's own formatters put together (a poll, a reminder receipt): an
+    @all in it may ping the whole group (Andrew 2026-11-07).
+
+    A reply the model wrote never may, whatever it printed: a page, a video's text or an article in
+    its prompt can tell it to print 「@all」.  Every `str` method that changes the words hands back a
+    plain `str`, so losing this mark on the way to LINE only makes a message quiet.  Wrap a
+    formatter's result, never a model's reply.
+    """
+
+
 def _alias_path() -> Path:
     return Path(os.environ.get("LINE_USER_ALIASES_PATH") or _DEFAULT_ALIAS_PATH)
 
@@ -276,7 +287,6 @@ def aliases_mentioned_in_text(text: str) -> list[str]:
 
     normalized = (text or "").replace("＠", "@").strip()
     alias_set = configured_family_alias_mapping(include_short=True)
-    all_aliases = {_clean_name(name) for name in _ALL_PARTICIPANT_NAMES}
 
     seen = set()
     for candidate in _MENTION_TOKEN_RE.findall(normalized):
@@ -297,16 +307,81 @@ def aliases_mentioned_in_text(text: str) -> list[str]:
             aliases.append(canonical)
             seen.add(canonical)
 
-    for alias in all_aliases:
-        if alias in {"", "@all"}:
-            continue
-        if alias in seen:
-            continue
-        if alias in normalized:
-            aliases.append(alias)
-            seen.add(alias)
-
     return aliases
+
+
+# 2026-11-07: 「@all」 rings every phone in the family, so it has to stand on its own: no word
+# character, "/" (a link's path) or "@" before it, and no word character after it, directly or past
+# one of ". @ / -" (a handle, a domain).  re.ASCII: Chinese is no word character here, so 「大家@all」
+# and 「@all吃飯」 still count.  Half-width and lower case, as it always was.
+_ALL_MENTION_RE = re.compile(r"(?<![\w@/])@all(?![.@/-]?\w)", re.ASCII)
+
+
+def has_all_mention(text: str | None) -> bool:
+    """An @all that stands on its own.  Ask this of the final text: `_md_to_line` still changes what is next to it."""
+    return bool(_ALL_MENTION_RE.search(text or ""))
+
+
+# 2026-11-07: a family message asks for the whole family out loud or not at all: 「@全家」 counts, a
+# plain 「全部買完」 or 「大家好」 does not.  It reads the whole message, not the @-tokens alone: cut out of an
+# address at all.example, 「@all」 would look real.  The left edge is _ALL_MENTION_RE's.  「all」 and
+# 「everyone」 take its right edge too (a handle, a domain) and any case, since LINE's own mention menu
+# writes 「@All」 (Andrew, 11/10: family messages only; the bot's own text keeps has_all_mention).  The
+# Chinese words take no right edge: 「@全家8點吃飯」 is no handle.
+_FAMILY_WORDS = sorted(word for word in {_clean_name(name) for name in _ALL_PARTICIPANT_NAMES} if word)
+_ASCII_FAMILY_WORDS = [word for word in _FAMILY_WORDS if word.isascii()]
+_CHINESE_FAMILY_WORDS = [word for word in _FAMILY_WORDS if not word.isascii()]
+if not (_ASCII_FAMILY_WORDS and _CHINESE_FAMILY_WORDS):  # an empty group would make every "@" a family word
+    raise RuntimeError("_ALL_PARTICIPANT_NAMES needs English and Chinese family words")
+_WHOLE_FAMILY_MENTION_RE = re.compile(
+    r"(?<![\w@/])@((?i:"
+    + "|".join(map(re.escape, _ASCII_FAMILY_WORDS))
+    + r")(?![.@/-]?\w)|(?:"
+    + "|".join(map(re.escape, _CHINESE_FAMILY_WORDS))
+    + r"))",
+    re.ASCII,
+)
+
+
+def whole_family_mentions(text: str | None) -> list[str]:
+    """The family words a message @-mentions (「all」, 「全家」…), each once, English in lower case.
+    Full-width 「＠」 counts."""
+    found = _WHOLE_FAMILY_MENTION_RE.findall((text or "").replace("＠", "@"))
+    return list(dict.fromkeys(word.lower() for word in found))
+
+
+# 2026-11-07: an @ inside an address or a link mentions nobody: 「x@成員甲」, 「.com/@成員甲」.  A "/" with no
+# ASCII letter, digit or "_" before it is no link: 「@成員甲/@成員乙」 is two people (so is 「分類/@成員甲」).
+_MENTION_NAME_RE = re.compile(r"(?<![\w@])(?<!\w/)@([A-Za-z0-9_\u4e00-\u9fff]{1,30})", re.ASCII)
+
+
+def mention_names(text: str | None) -> list[str]:
+    """Who a text @-mentions, as written.  Full-width 「＠」 counts."""
+    return _MENTION_NAME_RE.findall((text or "").replace("＠", "@"))
+
+
+# 2026-11-07: 全家 is also FamilyMart, and the name of some clinics and pharmacies.  For the code that
+# reads a bare 全家 as the family: an event's title, the medical actor.  Three ways it is not the family:
+# - a word of the shop's comes next: 便利商店, 取貨, 寄件, and 診所, 藥局 (Andrew, 11/10).  A place next to
+#   it does not count (全家門口, 全家樓下, 全家對面: Andrew, 11/12, they read as the family);
+# - someone goes there: 去全家, 到全家, 去一趟全家.  「過去全家出遊」 and 「輪到全家打疫苗」 go nowhere, and
+#   「去全家人的聚會」, 「回去全家團圓」, 「回去全家一起吃飯」 go to the family;
+# - it is half of another word: 交通安全家長會, 健全家庭, 保全家裡.  Not 「確保全家…」 or 「全家長輩」, where it
+#   is the family again; 周 and 完 are left out for 「這周全家用餐」 and 「吃完全家用餐」.
+# 「全家買牛奶」 stays the family: 「全家買年貨」 has the same shape.
+_FAMILYMART_RE = re.compile(
+    r"全家(?:便利商店|便利超商|便利店|超商|門市|分店|店到店|取貨|取件|寄件|寄貨|領貨|領包裹|寄包裹|取包裹|拿包裹|退貨|繳費|聯合診所|診所|藥局|藥房)"
+    r"|(?<!過去)(?<![輪看想等遇回直得收提說找聽碰感]到)(?:(?<=[去到])|(?<=去趟)|(?<=去一趟)|(?<=去一下))"
+    r"全家(?![人福聚都團]|一起|圍爐|過年)"
+    r"|(?<!確保)(?<=[安保健成齊])全家(?=[居裡庭用具電訪教事園屬政務]|長(?!輩))"
+)
+
+
+def names_the_family(text: str | None) -> bool:
+    """Whether the text has a 全家 that is the family: not the shop, not a clinic or a pharmacy of that
+    name, not half of another word.  Each of those is cut out first, leaving a space so that the letters
+    on either side cannot close up into a 全家 nobody wrote."""
+    return "全家" in _FAMILYMART_RE.sub(" ", text or "")
 
 
 def is_all_participants(names: list[str]) -> bool:

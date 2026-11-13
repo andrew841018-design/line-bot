@@ -34,6 +34,7 @@ import market_store  # noqa: E402
 import stock_card_check  # noqa: E402
 import stock_db_ro  # noqa: E402
 import stock_picks as sp  # noqa: E402
+import stock_picks_review_hook as hook  # noqa: E402
 import stock_picks_us as us  # noqa: E402
 
 NY = ZoneInfo("America/New_York")
@@ -577,7 +578,7 @@ def test_fixed_texts_pass_main_outbound_and_validator():
     import main  # noqa: PLC0415  （重：只在這個測試載入）
 
     for text in (us.TEXT_RESERVED, us.TEXT_US_NOT_FOUND, us.TEXT_PHASE3_OFF, us.TEXT_US_UNSUPPORTED,
-                 us.TEXT_US_EXCHANGE, us.TEXT_US_NO_TRADE):
+                 us.TEXT_US_EXCHANGE, us.TEXT_US_NO_TRADE, us.TEXT_US_NO_PICK):
         assert main._prepare_outbound_text(text) == text
     for card in (us.us_pick_bubble(_facts(), 1, 1, None, lead_note=True), us.us_detail_bubble(_facts())):
         for text in _all_texts(card):
@@ -1736,3 +1737,274 @@ def test_perf_card_dropped_when_rejected(small_pool, yahoo, monkeypatch, fake_pe
     assert titles == ["股票推薦：第 1 檔（共 1 檔）", "股票推薦：美股第 1 檔（共 3 檔）", "股票推薦：美股第 2 檔（共 3 檔）",
                       "股票推薦：美股第 3 檔（共 3 檔）"]
     assert us.status_summary()["cards_rejected"] >= 1
+
+
+# ── 回測冷凍（B2，PLAN_B2C2 §2.4、§2.5）：小池 5 檔，最多拿掉 ceil(1.25)＝2 檔 ─────────────────────────────
+SINCE, UNTIL = "2026-10-25", "2027-02-07"  # D（10/27 週二）之前的週日；10/25＋6＝10/31，＋30、＋31、＋31，＋7＝2/7，共 105 天
+NOTHING = {"removed": [], "reason": None}
+TWO_CANDIDATES = {**SERIES, "MSFT": hot()}  # MSFT 也漲多：候選只剩 GOOGL、NVDA
+OLD_SENTENCE = "這次（資料到 10/27 美國時間）美股沒有 4 條都符合的"
+OLD_ALT = "這次沒有符合條件的"
+NEUTRAL = "這次美股沒有推薦"
+
+
+def write_cooldown(symbols=(), *, since=SINCE, until=UNTIL) -> None:
+    """回測 job 寫的格式（PLAN_B2C2 §4.4）。"""
+    frozen = [{"code": s, "since": since, "until": until} for s in symbols]
+    path = hook.cooldown_path()
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    path.write_text(json.dumps({"schema": 1, "families": {"tw_ai": {"frozen": []}, "us": {"frozen": frozen}}}))
+
+
+def snapshot_file() -> dict:
+    return json.loads((sp.STATE_DIR / us.SNAPSHOT_NAME).read_text())
+
+
+def recompute(now: float = NOW) -> us.UsSnapshot:
+    """_us_round 重算一個 D 的那幾步，不 commit。"""
+    calendar = us._calendar(us._us_today(now))
+    pool, d, covered = us._choose_pool(us._snapshot, calendar, now)
+    spy_dates = tuple(date.fromisoformat(x) for x in calendar[-us.SPY_DATES_KEEP:])
+    return us._recompute(threading.Event(), now, pool, d, covered, calendar, us._latest_closes(), spy_dates)
+
+
+def test_cooldown_only_changes_the_picks(small_pool, yahoo):
+    make_db()
+    write_cooldown(["GOOGL"])
+    full_round()
+    snap = us._snapshot
+    assert snap.picks == ("NVDA", "MSFT") and snap.missed is None
+    assert [f.symbol for f in snap.pool] == ["NVDA", "MSFT", "AAPL", "AMZN", "GOOGL"]  # 快照的 pool 保持完整
+    assert snap.covered == 5 and snap.facts_of("GOOGL").trend is not None  # 單檔查詢照常
+    assert sorted(yahoo.fund_calls()) == ["AAPL", "AMZN", "GOOGL", "MSFT", "NVDA"]  # 財報照抓
+    assert (snap.cooldown_read, snap.cooldown) == ("ok", {"removed": ["GOOGL"], "reason": None})
+    assert [p["code"] for p in history_lines()[0]["picks"]] == ["NVDA", "MSFT"]
+    cards, words, _ = us._us_section(NOW)
+    assert words == "NVDA、MSFT" and len(cards) == 2 and NEUTRAL not in _all_texts(cards)  # 有推薦：中性句不出現
+
+
+def test_missed_is_counted_without_the_frozen_symbols(small_pool, yahoo):
+    make_db(TWO_CANDIDATES)
+    write_cooldown(["GOOGL", "NVDA"])
+    full_round()
+    snap = us._snapshot
+    assert snap.picks == () and len(snap.pool) == 5
+    assert snap.missed == (us.MID, 2, 3)  # 剩 3 檔：MSFT、AAPL 離季線太遠，AMZN 在年線之下但離季線 3.8%
+
+
+def test_over_25pct_is_not_applied(small_pool, yahoo):
+    make_db()
+    write_cooldown(["GOOGL", "NVDA", "MSFT"])  # 3 檔 > 上限 2 檔
+    full_round()
+    snap = us._snapshot
+    assert snap.picks == ("GOOGL", "NVDA", "MSFT")
+    assert (snap.cooldown_read, snap.cooldown) == ("ok", {"removed": [], "reason": "over_25pct"})
+
+
+def test_cooldown_is_compared_with_d_not_with_today(small_pool, yahoo):
+    make_db()
+    write_cooldown(["GOOGL"], since="2026-10-28", until="2027-02-10")  # 今天（美東 10/28）到了 since，D（10/27）還沒
+    full_round()
+    assert us._snapshot.picks == ("GOOGL", "NVDA", "MSFT") and us._snapshot.cooldown == NOTHING
+
+
+def test_a_new_cooldown_file_does_not_recompute_the_same_d(small_pool, yahoo):
+    make_db()
+    full_round()
+    snap = us._snapshot
+    write_cooldown(["GOOGL"])
+    full_round(NOW + 1800)
+    assert us._snapshot.computed_at == snap.computed_at and us._snapshot.picks == ("GOOGL", "NVDA", "MSFT")
+
+
+def test_frozen_symbols_still_count_in_the_gate(small_pool, yahoo):
+    make_db({**SERIES, "MSFT": rising(0.12)[-150:], "AAPL": hot()[-150:]})
+    write_cooldown(["MSFT", "AAPL"])  # 這兩檔都 ⚪：拿掉也不能讓閘門過
+    full_round()
+    assert us._snapshot is None and us._worker.last_fail == "too_many_gray"
+
+
+def test_frozen_symbols_still_count_in_the_second_gate(small_pool, yahoo):
+    make_db()
+    full_round()
+    first = us._snapshot
+    nxt = D + timedelta(days=1)
+    for symbol, value in {**{k: v[-1] + 0.1 for k, v in SERIES.items()}, "SPY": 700.0, "VOO": 700.0, "QQQ": 700.0}.items():
+        add_closes(symbol, [(nxt, value, 1)])
+    good = dict(us._worker.fund)
+    broken = {**good, **{s: us.replace(good[s], rev=good[s].rev[1:]) for s in ("NVDA", "MSFT")}}  # 走勢都有，財報不夠
+    us._set_worker(us.replace(us._worker, fund=broken))
+    write_cooldown(["NVDA", "MSFT"])  # 閘門在過濾之前算完：拿掉也不能讓它過
+    full_round(datetime(2026, 10, 29, 15, 0, tzinfo=TPE).timestamp())
+    assert us._worker.last_fail == "too_many_gray" and us._snapshot == first
+
+
+@pytest.mark.parametrize("failure, read, cooldown", [
+    ("apply_cooldown", None, None),  # 呼叫丟例外：兩個欄位維持 None
+    ("read_cooldown", "error", NOTHING),  # apply_cooldown 自己接住
+])
+def test_hook_errors_do_not_change_the_us_picks(failure, read, cooldown, small_pool, yahoo, monkeypatch):
+    make_db()
+    write_cooldown(["GOOGL"])  # 檔案其實要拿掉 GOOGL
+
+    def boom(*_a, **_k):
+        raise RuntimeError("synthetic")
+
+    monkeypatch.setattr(hook, failure, boom)
+    assert full_round() == us.POLL_S
+    snap = us._snapshot
+    assert snap.picks == ("GOOGL", "NVDA", "MSFT") and us._worker.fail_count == 0
+    assert (snap.cooldown_read, snap.cooldown) == (read, cooldown)
+
+
+def test_an_invalid_cooldown_file_does_not_change_the_us_picks(small_pool, yahoo):
+    make_db()
+    write_cooldown(["GOOGL"])
+    hook.cooldown_path().write_text("{")
+    full_round()
+    assert us._snapshot.picks == ("GOOGL", "NVDA", "MSFT")
+    assert (us._snapshot.cooldown_read, us._snapshot.cooldown) == ("invalid", NOTHING)
+
+
+def test_cooldown_fields_round_trip(small_pool, yahoo):
+    make_db()
+    write_cooldown(["GOOGL"])
+    full_round()
+    payload = snapshot_file()
+    assert (payload["cooldown_read"], payload["cooldown"]) == ("ok", {"removed": ["GOOGL"], "reason": None})
+    assert us.snapshot_from_json(payload, NOW) == us._snapshot
+
+
+def test_old_snapshot_without_the_cooldown_fields_is_read(small_pool, yahoo):
+    make_db()
+    full_round()
+    snap = us._snapshot
+    old = snapshot_file()
+    del old["cooldown_read"], old["cooldown"]
+    loaded = us.snapshot_from_json(old, NOW)
+    assert (loaded.cooldown_read, loaded.cooldown) == (None, None)
+    assert us.replace(loaded, cooldown_read=snap.cooldown_read, cooldown=snap.cooldown) == snap
+
+
+BROKEN_COOLDOWNS = [
+    "broken", ["NVDA"], 7, True, {}, {"removed": "NVDA", "reason": None}, {"removed": ["NVDA"]}, {"reason": None},
+    {"removed": ["nvda"], "reason": None}, {"removed": [1], "reason": None}, {"removed": ["NVDA"], "reason": "because"},
+    {"removed": ["NVDA"], "reason": ["over_25pct"]},
+]
+BROKEN_FIELDS = [("cooldown", value) for value in BROKEN_COOLDOWNS] + [
+    ("cooldown_read", value) for value in (7, True, ["ok"], {"read": "ok"}, "", "v1", "9" * 40)]
+
+
+def test_broken_cooldown_fields_never_cost_the_snapshot(small_pool, yahoo):
+    make_db()
+    write_cooldown(["GOOGL"])
+    full_round()
+    snap = us._snapshot
+    path = sp.STATE_DIR / us.SNAPSHOT_NAME
+    good = snapshot_file()
+    for field_name, value in BROKEN_FIELDS:
+        path.write_text(json.dumps({**good, field_name: value}))  # 磁碟上的檔壞了：照常讀回
+        loaded = us._load_snapshot_file(NOW)
+        assert loaded is not None and getattr(loaded, field_name) is None, (field_name, value)
+        assert us.replace(loaded, **{field_name: getattr(snap, field_name)}) == snap, (field_name, value)
+        written = us._commit_snapshot(us.replace(snap, **{field_name: value}), NOW, refresh_only=True)  # 記憶體裡的壞了：照常 commit
+        assert written == us.COMMIT_WRITTEN, (field_name, value)
+        assert getattr(us._load_snapshot_file(NOW), field_name) is None, (field_name, value)
+
+
+def test_a_bad_value_from_the_hook_still_commits_the_new_d(small_pool, yahoo, monkeypatch):
+    """PLAN_B2C2 r2#1：診斷欄位不能讓快照作廢，不然美股推薦會一直停在舊的 D。"""
+    make_db()
+    monkeypatch.setattr(hook, "apply_cooldown", lambda *_a: hook.Applied("9" * 40, frozenset(), "x" * 100))
+    assert full_round() == us.POLL_S
+    assert us._snapshot.d == D and us._snapshot.picks == ("GOOGL", "NVDA", "MSFT") and us._worker.fail_count == 0
+    disk = snapshot_file()
+    assert disk["d"] == "2026-10-27" and (disk["cooldown_read"], disk["cooldown"]) == (None, None)
+
+
+def test_cooldown_fields_survive_a_restart_and_the_refresh_only_path(small_pool, yahoo):
+    make_db()
+    write_cooldown(["GOOGL"])
+    full_round()
+    computed_at = us._snapshot.computed_at
+    us.reset_for_tests()  # 重啟：記憶體清空，只剩快照檔
+    add_closes("TSLA", [(D, 250.0, 1)])  # 下一輪只換最新收盤（refresh_only）
+    full_round(NOW + 1800)
+    snap = us._snapshot
+    assert snap.latest_closes["TSLA"] == (D, 250.0) and snap.computed_at == computed_at  # 真的走 refresh_only、沒有重算
+    assert (snap.cooldown_read, snap.cooldown) == ("ok", {"removed": ["GOOGL"], "reason": None})
+    disk = snapshot_file()
+    assert disk["latest_closes"]["TSLA"] == ["2026-10-27", 250.0]
+    assert (disk["cooldown_read"], disk["cooldown"]) == ("ok", {"removed": ["GOOGL"], "reason": None})
+
+
+@pytest.mark.parametrize("series, picks, missed", [
+    (SERIES, ("GOOGL", "NVDA", "MSFT"), None),
+    ({**SERIES, "NVDA": hot(), "MSFT": hot(), "GOOGL": hot()}, (), (us.MID, 4, 5)),  # 4 檔離季線太遠，AMZN 在年線之下
+])
+def test_without_a_cooldown_file_nothing_changes(series, picks, missed, small_pool, yahoo, monkeypatch):
+    make_db(series)
+    full_round()
+    snap = us._snapshot
+    assert (snap.picks, snap.missed) == (picks, missed)
+    assert (snap.cooldown_read, snap.cooldown) == ("missing", NOTHING)
+    section = us._us_section(NOW)
+    monkeypatch.setitem(sys.modules, "stock_picks_review_hook", None)  # hook 不在＝B2 之前的程式
+    before = recompute()
+    assert (before.cooldown_read, before.cooldown) == (None, None)
+    assert us.replace(before, cooldown_read="missing", cooldown=NOTHING) == snap
+    us._set_snapshot(before)
+    assert us._us_section(NOW) == section
+
+
+def test_cooldown_values_match_what_the_hook_returns(monkeypatch):
+    members, day = ["NVDA"], D.isoformat()
+    reads = {hook.apply_cooldown(hook.FAMILY_US, members, day).read}  # 檔案不存在
+    write_cooldown()
+    reads.add(hook.apply_cooldown(hook.FAMILY_US, members, day).read)
+    hook.cooldown_path().write_text("{")
+    reads.add(hook.apply_cooldown(hook.FAMILY_US, members, day).read)
+    monkeypatch.setattr(hook, "read_cooldown", None)  # 呼叫時 TypeError
+    reads.add(hook.apply_cooldown(hook.FAMILY_US, members, day).read)
+    assert reads == set(us._COOLDOWN_READS) == {"ok", "missing", "invalid", "error"}
+    assert set(us._COOLDOWN_REASONS) == {None, hook.OVER_25PCT}
+
+
+# ── D6（PLAN_B2C2 §2.5）：有股票被拿掉又沒有推薦時，卡片和 altText 用中性句，不提冷凍 ─────────────────
+def test_neutral_bubble_replaces_only_the_headline():
+    market, missed = sp.Market(sp.HOT, 70, 90), (us.GROWTH, 30, 47)
+    old, neutral = us.us_no_pick_bubble(D, market, missed), us.us_no_pick_bubble(D, market, missed, neutral=True)
+    assert [NEUTRAL if text == OLD_SENTENCE else text for text in _all_texts(old)] == _all_texts(neutral)
+    assert OLD_SENTENCE in _all_texts(old) and stock_card_check.card_ok(neutral)
+
+
+def test_no_pick_after_a_removal_reads_neutral_in_both_replies(small_pool, yahoo):
+    make_db(TWO_CANDIDATES)
+    write_cooldown(["GOOGL", "NVDA"])
+    full_round()
+    assert us._snapshot.picks == () and us._snapshot.cooldown == {"removed": ["GOOGL", "NVDA"], "reason": None}
+    alone, extended = us.us_reply(), us.extend_picks_reply(tw_reply())
+    assert alone.alt_text == f"{sp.PREFIX}只供參考｜美股：這次沒有推薦｜資料到 10/27（美國時間）"
+    assert extended.alt_text == "股票推薦：只供參考｜台積電｜資料到 10/22｜美股：這次沒有推薦"
+    for reply in (alone, extended):
+        texts = _all_texts(reply.flex)
+        assert NEUTRAL in texts and OLD_SENTENCE not in texts and OLD_ALT not in reply.alt_text
+        assert "最常差的條件：靠近季線（3 檔裡有 2 檔沒過）" in texts
+        family_sees = json.dumps(reply.flex, ensure_ascii=False) + reply.alt_text
+        assert not any(word in family_sees for word in ("冷凍", "暫停", "拿掉", "GOOGL", "NVDA"))
+    us.reset_for_tests()  # 重啟之後：欄位從快照檔讀回來，句子不變
+    us._ensure_loaded()
+    assert NEUTRAL in _all_texts(us.us_reply().flex)
+
+
+@pytest.mark.parametrize("cooldown", [None, NOTHING, {"removed": [], "reason": "over_25pct"}])
+def test_no_pick_keeps_the_old_sentence_unless_something_was_removed(cooldown, small_pool, yahoo):
+    make_db()
+    full_round()
+    us._set_snapshot(us.replace(us._snapshot, picks=(), missed=(us.GROWTH, 3, 5), cooldown=cooldown))
+    alone, extended = us.us_reply(), us.extend_picks_reply(tw_reply())
+    assert alone.alt_text == f"{sp.PREFIX}只供參考｜美股：這次沒有符合條件的｜資料到 10/27（美國時間）"
+    assert extended.alt_text.endswith("｜美股：這次沒有符合條件的")
+    for reply in (alone, extended):
+        texts = _all_texts(reply.flex)
+        assert OLD_SENTENCE in texts and NEUTRAL not in texts

@@ -68,6 +68,8 @@ os.environ.setdefault("GEMINI_API_KEY", "dummy")
 os.environ.setdefault("GROK_API_KEY", "dummy")
 os.environ.setdefault("BOT_MUTED", "true")
 # 2026-10-16 字卡大字版：測試預設不產生網頁、不加按鈕（本機有 tunnel 網址檔），要測的測試自己打開
+# 2026-11-07 聊行情帶報價：預設關（不連 Yahoo），要測的測試自己打開。
+os.environ["LINE_BOT_CHAT_QUOTES"] = "0"
 os.environ["LINE_BOT_CARD_PAGES"] = "0"  # 直接設：shell 有 export 也不能讓測試讀真的 tunnel 檔、寫進 state/
 # 2026-10-23 爸媽健康大字版（N7）：清健康頁不看上面的開關（刪除、暫停、收回訊息都要清），測試之間與
 # 測試結束後的頁面目錄也一律指到隔離路徑，絕不落回正式 state/card_pages；每個測試另有自己的（isolate_card_pages）。
@@ -84,6 +86,9 @@ os.environ["LINE_BOT_PARENT_HEALTH_GROUP_PUSH"] = ""
 # 2026-10-17 TikTok 讀取：預設關閉（0 = 不送 Gemini、不下載），要測的測試用假物件自己打開
 # TODO(2026-10-17 D4): 這只關掉讀影片／圖片；沒有替換 yt-dlp 的既有測試仍可能真的連網抓 metadata。
 os.environ["LINE_BOT_TIKTOK_MEDIA_DAILY_CAP"] = "0"
+# 2026-11-06 保底以外的額外讀取：預設關，要測的測試自己打開。
+os.environ["LINE_BOT_TIKTOK_MEDIA_QUIET_DAY_MAX"] = "0"
+os.environ["LINE_BOT_YOUTUBE_MEDIA_DAILY_CAP"] = "0"  # 2026-11-07 同上
 # Semantic restatement judge calls Gemini; unit tests enable it explicitly with a fake.
 os.environ.setdefault("LINE_BOT_RESTATEMENT_JUDGE", "0")
 # 2026-10-04: the separate-quota last Gemini tier stays off unless a test
@@ -257,7 +262,7 @@ def reset_main_globals(monkeypatch):
     # resolve in the real file). A fixed test alias map keeps real family
     # names unlisted while giving tests a resolvable alias so helpers that
     # key off "有 user alias 設定" (e.g. aliases_mentioned_in_text) still work
-    # for "全家" / "測試成員甲"; tests that need their own aliases setenv
+    # for "測試成員甲"; tests that need their own aliases setenv
     # their own path to override.
     import json as _json
     tmp_alias_dir = Path(tempfile.mkdtemp())
@@ -336,6 +341,7 @@ def reset_main_globals(monkeypatch):
     gemini_client._media_backoff_until = 0.0
     gemini_client._media_bad_requests = 0
     gemini_client._media_cap_warned = ""
+    gemini_client._media_quiet_day_max_warned = ""
     tiktok_media.clear_cache()
     main._PENDING_REPLY_ENABLED = _ORIG_PENDING_REPLY_ENABLED
     main._PENDING_EXPLICIT_PATH = str(tmp_pending_path)
@@ -362,6 +368,7 @@ def reset_main_globals(monkeypatch):
     gemini_client._media_backoff_until = 0.0
     gemini_client._media_bad_requests = 0
     gemini_client._media_cap_warned = ""
+    gemini_client._media_quiet_day_max_warned = ""
     tiktok_media.clear_cache()
     main._PENDING_REPLY_ENABLED = _ORIG_PENDING_REPLY_ENABLED
     main._PENDING_EXPLICIT_PATH = _ORIG_PENDING_PATH
@@ -375,7 +382,10 @@ def reset_main_globals(monkeypatch):
     main._member_labels.clear()
     with burst_filter._labelled_lock:
         burst_filter._labelled_texts.clear()
+    # TODO(2026-11-06): an exception earlier in this teardown skips these two and the
+    # folders stay.  Rare, and only the temp dir pays for it.
     shutil.rmtree(tmp_display_names.parent, ignore_errors=True)
+    shutil.rmtree(tmp_alias_dir, ignore_errors=True)
 
     for p in (
         tmp_quota_path,
@@ -629,3 +639,20 @@ def isolate_stock_picks_review(monkeypatch, tmp_path_factory):
     (root / "maintenance").mkdir()
     monkeypatch.setenv("STOCK_PICKS_REVIEW_BOT_DIR", str(root / "bot"))
     monkeypatch.setenv("STOCK_PICKS_REVIEW_MAINTENANCE_DIR", str(root / "maintenance"))
+
+
+# 2026-11-12 自動學習糾正週報（jobs/learned_rules_weekly.py）：outbox 所在的維護目錄、DB、狀態目錄、DB 私人副本的
+# 上層目錄一律指到不存在的隔離路徑，而且不建目錄（審查 GP2 G1：每個測試多一個 numbered mktemp 要掃整個 basetemp）。
+# job 的路徑都在呼叫時才從這四個環境變數算；路徑不存在時它不抄 DB、不放檔（outbox 所在目錄不在就 exit 2，DB 不在就
+# db_missing），所以任何測試跑到 job 都不會讀正式 DB，也不會把週報放進正式 outbox（relay 會立刻 DM Andrew）。
+# 要測的測試（tests/test_learned_rules_weekly.py）自己在 tmp_path 建目錄、用 monkeypatch 指過去。
+_LEARNED_RULES_WEEKLY_ABSENT = Path(tempfile.gettempdir()) / (
+    f"line_bot_pytest_quarantine_{os.getpid()}_learned_rules_weekly_absent"
+)
+for _env_name, _leaf in (
+    ("LEARNED_RULES_WEEKLY_MAINTENANCE_DIR", "maintenance"),
+    ("LEARNED_RULES_WEEKLY_DB", "line_bot.db"),
+    ("LEARNED_RULES_WEEKLY_STATE_DIR", "state"),
+    ("LEARNED_RULES_WEEKLY_COPY_PARENT", "tmp"),
+):
+    os.environ[_env_name] = str(_LEARNED_RULES_WEEKLY_ABSENT / _leaf)

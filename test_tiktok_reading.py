@@ -470,6 +470,35 @@ def test_filtered_video_is_remembered_as_unreadable(video_env, monkeypatch):
     assert len(_FakeYDL.instances) == 1 and video_env.sent == []
 
 
+def test_video_temp_dir_is_made_in_the_private_folder(video_env, monkeypatch, tmp_path):
+    monkeypatch.setattr(tiktok_media.tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(tiktok_media, "_swept", True)
+    tiktok_media.read_video(SHARE, VIDEO, "7000000000000000001", _deadline(), threading.Event())
+    folder = tmp_path / f"{tiktok_media.TMP_DIR_NAME}-{os.getuid()}"
+    assert os.path.dirname(os.path.dirname(_FakeYDL.instances[0].opts["outtmpl"])) == str(folder)
+    assert not list(folder.iterdir())
+
+
+def _orphan(parent, name, age_sec):
+    path = parent / f"{tiktok_media.TMP_PREFIX}{name}"
+    path.mkdir()
+    when = time.time() - age_sec
+    os.utime(path, (when, when))
+    return path
+
+
+def test_orphan_sweep_looks_only_in_the_private_folder(monkeypatch, tmp_path):
+    monkeypatch.setattr(tiktok_media.tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(tiktok_media, "_swept", False)
+    folder = tiktok_media.private_tmp_dir(tiktok_media.TMP_DIR_NAME)
+    old_enough = tiktok_media.ORPHAN_AGE_SEC + 60
+    orphan = _orphan(folder, "old", old_enough)
+    fresh = _orphan(folder, "fresh", 0)
+    outside = _orphan(tmp_path, "outside", old_enough)  # $TMPDIR itself is not listed any more
+    tiktok_media._sweep_orphans()
+    assert not orphan.exists() and fresh.exists() and outside.exists()
+
+
 def test_a_finished_read_is_reused_for_the_same_video(video_env):
     tiktok_media.read_video(SHARE, VIDEO, "7000000000000000001", _deadline(), threading.Event())
     block, usable = tiktok_media.read_video(VIDEO, VIDEO, "7000000000000000001", _deadline(), threading.Event())
