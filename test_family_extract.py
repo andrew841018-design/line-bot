@@ -362,3 +362,133 @@ def test_scrub_keeps_dates_and_hides_long_numbers_and_links():
 
     out = family_extract.scrub("生日 1956-06-04，電話 0900 000 000，網址 https://example.com/x")
     assert "1956-06-04" in out and "0900" not in out and "example.com" not in out
+
+
+# ── 2026-11-13 事後審查修正（POST_1–4） ─────────────────────────────────────────
+
+
+def test_a_locked_database_is_recorded_for_the_daily_report(db, model, monkeypatch):
+    import memory
+
+    now = time.time()
+    _raw("m1", "user-a", "我明天要交報告", now - 3600)
+    _run(db, _feature(db, max_requests=0), now)  # creates the cursor row
+
+    def locked(*a, **k):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(memory, "raw_messages_stats", locked)
+    assert _run(db, _feature(db), now + 60).stopped == "db_busy"
+    with _closing(db)() as c:
+        (last_run,) = c.execute("SELECT last_run FROM extract_cursors").fetchone()
+    assert json.loads(last_run)["stopped"] == "db_busy" and model["prompts"] == []
+
+
+def test_the_run_that_loses_the_race_writes_nothing_and_keeps_no_stale_count(db, model):
+    """The fake write does not dedupe: only the ROLLBACK keeps the loser's row out."""
+    import family_extract
+
+    now = time.time()
+    _raw("m1", "user-a", "我明天要交報告", now - 3600)
+    model["answers"].extend([[{"i": 1, "word": "A"}], [{"i": 1, "word": "B"}]])
+
+    def blind_write(conn, rows, result):
+        for mid, word in rows:
+            conn.execute("INSERT INTO found VALUES (?, ?)", (mid, word))
+            result.new += 1
+
+    inner_prepare = _feature(db).prepare
+
+    def racing_prepare(batch, items, result):
+        family_extract.run(_feature(db, write=blind_write), GROUP, _closing(db), now=now)
+        return inner_prepare(batch, items, result)
+
+    loser = family_extract.run(
+        _feature(db, prepare=racing_prepare, write=blind_write), GROUP, _closing(db), now=now
+    )
+
+    assert loser.stopped == "raced" and loser.new == 0 and len(model["prompts"]) == 2
+    with _closing(db)() as c:
+        assert c.execute("SELECT word FROM found").fetchall() == [("B",)]
+        assert c.execute("SELECT failures, failure_key FROM extract_cursors").fetchone() == (0, "")
+
+
+def test_giving_up_passes_over_only_the_batch_that_failed(db, model):
+    now = time.time()
+    _raw("m1", "user-a", "我要做第一件", now - 3600)
+    _raw("m2", "user-a", "我要做第二件", now - 3500)
+    bad = _answer([], finish="STOP", text="not json")
+    model["answers"].extend([bad, bad, [{"i": 1, "word": "三"}]])
+
+    first = _run(db, _feature(db), now)
+    _raw("m3", "user-a", "我要做第三件", now - 300)  # joins the failing batch before the retry
+    second = _run(db, _feature(db), now + 60)
+    third = _run(db, _feature(db), now + 120)
+
+    assert first.stopped == "bad_answer" and second.skipped.get("given_up") == 2
+    assert second.stopped == "given_up_partial"
+    assert third.requests == 1 and "第三件" in model["prompts"][2] and "第一件" not in model["prompts"][2]
+    assert _found(db) == ["m3"]
+
+
+def test_max_tokens_with_complete_json_is_still_a_bad_answer(db, model):
+    now = time.time()
+    _raw("m1", "user-a", "我明天要交報告", now - 3600)
+    model["answers"].append(_answer([{"i": 1, "word": "交報告"}], finish="MAX_TOKENS"))
+
+    result = _run(db, _feature(db), now)
+
+    assert result.stopped == "bad_answer" and _found(db) == [] and len(model["prompts"]) == 1
+
+
+def test_no_answer_waits_once_and_retries_only_when_ready(db, model, monkeypatch):
+    import family_extract
+
+    slept: list = []
+    monkeypatch.setattr(family_extract.time, "sleep", slept.append)
+    now = time.time()
+    _raw("m1", "user-a", "我明天要交報告", now - 3600)
+    model["answers"].extend([None, [{"i": 1, "word": "交報告"}]])
+    readiness = iter([True, False])
+    monkeypatch.setattr(
+        __import__("gemini_client"), "side_task_last_tier_ready", lambda: next(readiness, True)
+    )
+
+    not_ready = _run(db, _feature(db, retry_wait_s=61), now)
+    assert not_ready.stopped == "no_answer" and slept == [61] and len(model["prompts"]) == 1
+
+    model["answers"].insert(0, None)
+    ready = _run(db, _feature(db, retry_wait_s=61), now + 60)
+    assert ready.new == 1 and len(model["prompts"]) == 3 and slept == [61, 61]
+
+
+def test_a_message_younger_than_the_settle_window_waits(db, model):
+    import family_extract
+
+    now = time.time()
+    _raw("m_old", "user-a", "我明天要交報告", now - family_extract.SETTLE_SEC - 5)
+    _raw("m_new", "user-a", "我後天要去銀行", now - 10)
+
+    _run(db, _feature(db), now)
+
+    assert len(model["prompts"]) == 1
+    assert "交報告" in model["prompts"][0] and "去銀行" not in model["prompts"][0]
+
+
+def test_unsent_records_are_kept_thirty_days(db):
+    import family_extract
+
+    now = time.time()
+    with _closing(db)() as c:
+        family_extract.ensure_tables(c)
+        family_extract.record_unsent(c, GROUP, "m_old", now - family_extract.UNSENT_KEEP_SEC - 60)
+        family_extract.record_unsent(c, GROUP, "m_new", now)
+        assert family_extract.unsent_ids(c, GROUP, ["m_old", "m_new"]) == {"m_new"}
+
+
+def test_the_copied_patterns_match_the_daily_memory_job():
+    import family_extract
+    from jobs import daily_memory
+
+    assert family_extract._PLACEHOLDER_RE.pattern == daily_memory._PLACEHOLDER_RE.pattern
+    assert family_extract._LONG_DIGITS_RE.pattern == daily_memory._LONG_DIGITS_RE.pattern

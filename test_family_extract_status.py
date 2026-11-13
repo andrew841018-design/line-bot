@@ -41,7 +41,7 @@ def _cursor(base, name, *, created_at, updated_at, last_run=None, last_push=None
             "INSERT INTO extract_cursors(name, group_id, created_at, message_id, updated_at, failures, "
             "no_answer_since, last_success_at, last_run, last_push) VALUES (?, ?, ?, 'm', ?, ?, ?, ?, ?, ?)",
             (name, GROUP, int(created_at), int(updated_at), failures, int(no_answer_since), int(updated_at),
-             json.dumps(last_run or {"mode": "on"}), json.dumps(last_push or {})),
+             json.dumps({"mode": "on"} if last_run is None else last_run), json.dumps(last_push or {})),
         )
 
 
@@ -80,7 +80,7 @@ def test_each_trouble_raises_its_code(base):
     codes = set(status.collect(base, now=now)["alerts"])
 
     assert codes >= {
-        "todo_no_answer_36h", "todo_bad_answers", "todo_gap", "todo_behind_48h", "todo_db_busy",
+        "todo_no_answer_2d", "todo_bad_answers", "todo_gap", "todo_behind_48h", "todo_db_busy",
         "todo_not_run_26h", "todo_push_failed", "todo_fold_error", "anniversary_never_ran",
         "anniversary_candidates_pending",
     }
@@ -133,3 +133,120 @@ def test_outside_the_production_folder_it_exits_2(tmp_path, monkeypatch, capsys)
     monkeypatch.setattr(status, "collect", lambda *a, **k: None)
     assert status.main([]) == 2
     assert "not_production_folder" in capsys.readouterr().out
+
+
+# ── 2026-11-13 事後審查修正（POST_1 I-3、POST_3 I5、POST_4 I5／N4） ─────────────────────────
+
+
+def test_the_switch_is_read_the_way_the_jobs_read_it(base):
+    from jobs import family_extract_status as status
+
+    with open(base / ".env", "a", encoding="utf-8") as f:
+        f.write("export LINE_BOT_TODO_MODE=shadow  # 先試跑\nLINE_BOT_ANNIVERSARY_EXTRACT='off' # 停\n")
+
+    assert status.collect(base, now=time.time())["modes"] == {"todo": "shadow", "anniversary": "off"}
+
+
+def test_only_whitelisted_numbers_leave_the_stored_summaries(base):
+    from jobs import family_extract_status as status
+
+    now = time.time()
+    _cursor(
+        base, "todo", created_at=now - 60, updated_at=now - 60,
+        last_run={"mode": "on", "new": 2, "stopped": "", "note": "家人的字", "skipped": {"past": 1, "成員甲": 3}},
+        last_push={"mode": "on", "pushed": 1, "push_ok": True, "date": "2026-11-14", "task": "交報告", "error": "家人"},
+    )
+
+    data = status.collect(base, now=now)
+    text = json.dumps(data, ensure_ascii=False)
+
+    assert data["jobs"]["todo"]["last_run"] == {"mode": "on", "new": 2, "stopped": "", "skipped": {"past": 1}}
+    assert data["jobs"]["todo"]["last_push"] == {"mode": "on", "pushed": 1, "push_ok": True, "date": "2026-11-14"}
+    for word in ("家人", "交報告", "成員甲"):
+        assert word not in text
+
+
+def test_shadow_and_off_raise_no_push_alert(base):
+    from jobs import family_extract_status as status
+
+    now = time.time()
+    with open(base / ".env", "a", encoding="utf-8") as f:
+        f.write("LINE_BOT_TODO_MODE=shadow\n")
+    _cursor(base, "todo", created_at=now - 60, updated_at=now - 60,
+            last_push={"mode": "shadow", "push_ok": False, "fold_error": 1})
+
+    codes = status.collect(base, now=now)["alerts"]
+
+    assert "todo_push_failed" not in codes and "todo_fold_error" not in codes
+
+
+def test_the_anniversary_push_is_counted_and_a_failure_raises_its_code(base):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from jobs import family_extract_status as status
+
+    now = time.time()
+    today = datetime.fromtimestamp(now, ZoneInfo("Asia/Taipei")).date().isoformat()
+    with _db(base) as c:
+        c.execute("CREATE TABLE anniversary_reminders_sent (anniversary_id TEXT, year INTEGER, "
+                  "offset_days INTEGER, sent_at INTEGER)")
+        c.execute("INSERT INTO anniversary_reminders_sent VALUES ('a1', 2026, 0, ?)", (int(now * 1000),))
+        c.execute("INSERT INTO anniversary_reminders_sent VALUES ('a2', 2026, 7, ?)", (int((now - 2 * 86400) * 1000),))
+    # a later run the same day rewrote last_push with 0 pushed: the ledger still says 1
+    _cursor(base, "anniversary", created_at=now - 60, updated_at=now - 60,
+            last_push={"mode": "on", "date": today, "due": 1, "pushed": 0, "push_ok": False})
+
+    data = status.collect(base, now=now)
+
+    assert data["anniversary"]["pushed_today"] == 1 and "anniversary_push_failed" in data["alerts"]
+
+
+def test_a_row_the_push_created_before_any_extraction_still_reads_never_ran(base):
+    from jobs import family_extract_status as status
+
+    now = time.time()
+    _cursor(base, "anniversary", created_at=0, updated_at=now - 60, last_run={},
+            last_push={"mode": "on", "pushed": 0, "push_ok": True})
+
+    assert "anniversary_never_ran" in status.collect(base, now=now)["alerts"]
+
+
+def test_the_report_opens_the_database_read_only(base, monkeypatch):
+    import sqlite3 as real_sqlite3
+
+    from jobs import family_extract_status as status
+
+    seen: list = []
+    real_connect = real_sqlite3.connect
+
+    def connect(target, *args, **kwargs):
+        seen.append((str(target), kwargs.get("uri")))
+        return real_connect(target, *args, **kwargs)
+
+    monkeypatch.setattr(status.sqlite3, "connect", connect)
+    status.collect(base, now=time.time())
+
+    assert seen and all("mode=ro" in target and uri is True for target, uri in seen)
+
+
+def test_the_report_never_imports_the_jobs():
+    import ast
+    from pathlib import Path
+
+    tree = ast.parse(Path("jobs/family_extract_status.py").read_text(encoding="utf-8"))
+    names = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
+    names |= {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module}
+    assert not names & {"todo", "anniversary", "memory", "main"}
+
+
+def test_an_unexpected_error_still_gives_one_line(monkeypatch, capsys):
+    from jobs import family_extract_status as status
+
+    def boom(*a, **k):
+        raise RuntimeError("/Users/someone/secret path")
+
+    monkeypatch.setattr(status, "collect", boom)
+    assert status.main([]) == 1
+    out = capsys.readouterr().out
+    assert "status_failed" in out and "secret" not in out

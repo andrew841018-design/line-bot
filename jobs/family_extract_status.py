@@ -10,6 +10,7 @@ todo／anniversary（它們 import 時會建表），只讀白名單欄位，不
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import sys
 import time
@@ -39,18 +40,15 @@ def _mode(raw: str | None, *, allowed: tuple[str, ...]) -> str:
 
 
 def _env(base: Path) -> dict[str, str] | None:
+    """The jobs' own reading of .env (python-dotenv: comments, quotes and ``export`` handled), only
+    the keys this report needs."""
     path = base / ".env"
     if not path.is_file():
         return None
-    out: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        if key.strip() in _ENV_KEYS:
-            out[key.strip()] = value.strip().strip('"').strip("'")
-    return out
+    from dotenv import dotenv_values
+
+    values = dotenv_values(path)
+    return {k: str(values.get(k) or "").strip() for k in _ENV_KEYS if values.get(k) is not None}
 
 
 def _family_group(env: dict[str, str]) -> str:
@@ -71,6 +69,34 @@ def _count(conn, sql: str, params: tuple = ()) -> int | None:
     except sqlite3.Error:
         return None
     return None if value is None else int(value)
+
+
+_NAME_RE = re.compile(r"^[a-z_]{1,40}$")
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_RUN_KEYS = ("mode", "read", "sent", "requests", "answered", "new", "stopped", "gap_s", "skipped")
+_PUSH_KEYS = (
+    "mode", "date", "due", "expired", "unsent", "fold_structural", "fold_queue", "fold_semantic",
+    "fold_error", "pushed", "lines", "would_push", "would_fold", "push_ok", "mark_error", "error",
+)
+
+
+def _clean(summary: dict, keys: tuple[str, ...]) -> dict:
+    """Numbers, booleans and a few fixed words only: whatever else a summary holds is dropped."""
+    out: dict = {}
+    for key in keys:
+        value = summary.get(key) if isinstance(summary, dict) else None
+        if isinstance(value, (bool, int)):
+            out[key] = value
+        elif key == "skipped" and isinstance(value, dict):
+            out[key] = {
+                k: v for k, v in value.items()
+                if isinstance(k, str) and _NAME_RE.match(k) and isinstance(v, int) and not isinstance(v, bool)
+            }
+        elif key in ("mode", "stopped", "error") and isinstance(value, str) and re.fullmatch(r"[A-Za-z_]{0,60}", value):
+            out[key] = value
+        elif key == "date" and isinstance(value, str) and _DATE_RE.match(value):
+            out[key] = value
+    return out
 
 
 def collect(base: Path = BASE, *, now: float | None = None) -> dict | None:
@@ -106,7 +132,11 @@ def collect(base: Path = BASE, *, now: float | None = None) -> dict | None:
                     "AND (created_at > ? OR (created_at = ? AND message_id > ?))",
                     (group, int(row[0]), int(row[0]), str(row[1])),
                 )
-            jobs[name] = family_extract.status(conn, name, group, now=now, newest_raw=newest, unread=unread)
+            job = family_extract.status(conn, name, group, now=now, newest_raw=newest, unread=unread)
+            if job.get("ran"):
+                job["last_run"] = _clean(job.get("last_run") or {}, _RUN_KEYS)
+                job["last_push"] = _clean(job.get("last_push") or {}, _PUSH_KEYS)
+            jobs[name] = job
         today = datetime.fromtimestamp(now, _TW).date()
         week_ago = (today - timedelta(days=7)).isoformat()
         todo_counts = {
@@ -126,6 +156,11 @@ def collect(base: Path = BASE, *, now: float | None = None) -> dict | None:
             for status in ("pending", "confirmed", "rejected")
         }
         anniversary_counts["anniversaries"] = _count(conn, "SELECT COUNT(*) FROM anniversaries")
+        # From the sent ledger, not last_push: a second run the same day rewrites last_push.
+        day_start_ms = int(datetime(today.year, today.month, today.day, tzinfo=_TW).timestamp() * 1000)
+        anniversary_counts["pushed_today"] = _count(
+            conn, "SELECT COUNT(*) FROM anniversary_reminders_sent WHERE sent_at >= ?", (day_start_ms,)
+        )
     finally:
         conn.close()
     modes = {
@@ -149,13 +184,13 @@ def alerts(jobs: dict, anniversary_counts: dict, modes: dict) -> list[str]:
     for name, job in jobs.items():
         if modes.get(name) == "off":
             continue
-        if not job.get("ran"):
+        if not job.get("ran") or not job.get("last_run"):  # the push may create the row first
             out.append(f"{name}_never_ran")
             continue
         last = job.get("last_run") or {}
         skipped = last.get("skipped") or {}
-        if (job.get("no_answer_h") or 0) >= 36:
-            out.append(f"{name}_no_answer_36h")
+        if (job.get("no_answer_h") or 0) >= 24:  # two daily runs in a row without an answer
+            out.append(f"{name}_no_answer_2d")
         if job.get("failures") or skipped.get("given_up") or skipped.get("blocked"):
             out.append(f"{name}_bad_answers")
         if last.get("gap_s"):
@@ -172,13 +207,22 @@ def alerts(jobs: dict, anniversary_counts: dict, modes: dict) -> list[str]:
             out.append("todo_push_failed")
         if push.get("fold_error"):
             out.append("todo_fold_error")
+        if push.get("mark_error"):
+            out.append("todo_mark_error")
+    anniversary_push = (jobs.get("anniversary") or {}).get("last_push") or {}
+    if anniversary_push.get("push_ok") is False:  # the push runs whatever the extraction switch says
+        out.append("anniversary_push_failed")
     if anniversary_counts.get("pending"):
         out.append("anniversary_candidates_pending")
     return out
 
 
 def main(argv: list[str] | None = None) -> int:
-    data = collect()
+    try:
+        data = collect()
+    except Exception as exc:  # the report still gets one line, never a traceback with paths
+        print(json.dumps({"error": "status_failed", "type": type(exc).__name__}))
+        return 1
     if data is None:
         print(json.dumps({"error": "not_production_folder"}))
         return 2

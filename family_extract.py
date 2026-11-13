@@ -314,6 +314,17 @@ def _load(conn, name: str, group_id: str) -> dict | None:
     return dict(zip(("created_at", "message_id", "failures", "failure_key", "no_answer_since"), conn_row))
 
 
+def _failure_parts(failure_key: str) -> tuple[str, tuple[int, str] | None]:
+    """``first\\tend_created_at\\tend_message_id`` → (first, (created_at, message_id)), or ('', None)."""
+    parts = str(failure_key or "").split("\t")
+    if len(parts) != 3:
+        return "", None
+    try:
+        return parts[0], (int(parts[1]), parts[2])
+    except ValueError:
+        return "", None
+
+
 def save_last_push(conn_factory: Callable, name: str, group_id: str, summary: dict) -> None:
     with conn_factory() as c:
         ensure_tables(c)
@@ -337,6 +348,15 @@ def run(feature: Feature, group_id: str, conn_factory: Callable, *, now: float |
             raise
         result = RunResult(mode=mode, stopped="db_busy")
         logger.warning("%s %s", feature.label, result.log_fields())
+        try:  # the lock may be gone by now; the daily maintenance alert reads this row
+            with conn_factory() as c:
+                c.execute(
+                    "UPDATE extract_cursors SET updated_at=?, last_run=? WHERE name=? AND group_id=?",
+                    (int(time.time() if now is None else now), json.dumps(asdict(result), sort_keys=True),
+                     feature.name, group_id),
+                )
+        except sqlite3.Error as inner:
+            logger.warning("%s db_busy not recorded error_type=%s", feature.label, type(inner).__name__)
         return result
 
 
@@ -363,23 +383,31 @@ def _run(feature: Feature, group_id: str, conn_factory: Callable, *, now: float 
         result.stopped = reason
         quiet = reason in ("no_answer", "not_ready")
         with conn_factory() as c:
-            c.execute(
-                "UPDATE extract_cursors SET updated_at=?, failures=?, failure_key=?, no_answer_since=?, "
-                "last_run=?, last_success_at=CASE WHEN ? THEN ? ELSE last_success_at END "
-                "WHERE name=? AND group_id=?",
-                (
-                    int(now), failures, failure_key,
-                    (no_answer_since or int(now)) if quiet else 0,
-                    json.dumps(asdict(result), sort_keys=True),
-                    0 if reason else 1, int(now), feature.name, group_id,
-                ),
-            )
+            if reason == "raced":
+                # The other run owns the cursor and its failure count now: only this run's summary.
+                c.execute(
+                    "UPDATE extract_cursors SET updated_at=?, last_run=? WHERE name=? AND group_id=?",
+                    (int(now), json.dumps(asdict(result), sort_keys=True), feature.name, group_id),
+                )
+            else:
+                c.execute(
+                    "UPDATE extract_cursors SET updated_at=?, failures=?, failure_key=?, no_answer_since=?, "
+                    "last_run=?, last_success_at=CASE WHEN ? THEN ? ELSE last_success_at END "
+                    "WHERE name=? AND group_id=?",
+                    (
+                        int(now), failures, failure_key,
+                        (no_answer_since or int(now)) if quiet else 0,
+                        json.dumps(asdict(result), sort_keys=True),
+                        0 if reason else 1, int(now), feature.name, group_id,
+                    ),
+                )
         logger.info("%s %s", feature.label, result.log_fields())
         return result
 
     def advance(to: Message, rows: list) -> bool:
         """Write ``rows`` and move the cursor in one transaction; False when another run moved it."""
         nonlocal cursor, failures, failure_key, no_answer_since
+        new_before = result.new
         with conn_factory() as c:
             c.execute("BEGIN IMMEDIATE")
             try:
@@ -394,10 +422,12 @@ def _run(feature: Feature, group_id: str, conn_factory: Callable, *, now: float 
                 )
                 if cur.rowcount != 1:
                     c.execute("ROLLBACK")
+                    result.new = new_before  # rolled back: nothing of this batch was written
                     return False
                 c.execute("COMMIT")
             except BaseException:
                 c.execute("ROLLBACK")
+                result.new = new_before
                 raise
         cursor = (int(to.created_at), str(to.message_id))
         failures, failure_key, no_answer_since = 0, "", 0
@@ -437,22 +467,32 @@ def _run(feature: Feature, group_id: str, conn_factory: Callable, *, now: float 
         if status == "no_answer":
             return finish_run("no_answer")
         prepared: list = []
+        settle_at = batch[-1]
         if status == "bad":
-            key = batch[0].message_id
-            failures = failures + 1 if key == failure_key else 1
-            failure_key = key
+            # The key is the batch's first message plus where that batch ended the first time it
+            # failed: giving up passes over only those messages, never ones that joined it later.
+            first, end = _failure_parts(failure_key)
+            if first != batch[0].message_id or end is None:
+                failures, end = 0, (batch[-1].created_at, batch[-1].message_id)
+            failures += 1
+            failure_key = f"{batch[0].message_id}\t{end[0]}\t{end[1]}"
             if failures < feature.max_failures:
                 result.skip("bad_answer")
                 return finish_run("bad_answer")
-            result.skip("given_up", len(batch))
+            settle_at = next(
+                (m for m in batch if (m.created_at, m.message_id) == end), batch[-1]
+            )
+            result.skip("given_up", batch.index(settle_at) + 1)
         elif status == "blocked":
             result.skip("blocked", len(batch))
         else:
             result.answered += 1
             result.sent += len(batch)
             prepared = feature.prepare(batch, items, result)
-        if not advance(batch[-1], prepared):
+        if not advance(settle_at, prepared):
             return finish_run("raced")
+        if settle_at is not batch[-1]:
+            return finish_run("given_up_partial")  # the rest of this batch goes out next run
     if msgs and (cursor[0], cursor[1]) != (msgs[-1].created_at, msgs[-1].message_id):
         if not advance(msgs[-1], []):
             return finish_run("raced")
