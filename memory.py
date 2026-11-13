@@ -7451,6 +7451,47 @@ def list_pending_reminders_full(
     ]
 
 
+def reminders_between(group_id: str, lo_ts: int, hi_ts: int) -> list[dict]:
+    """One group's reminders with ``lo_ts <= remind_at < hi_ts`` (seconds), whatever their status.
+
+    Read only (2026-11-13, the TODO push): nothing is deduplicated or deleted first, unlike
+    :func:`list_pending_reminders_full`, whose fields these rows have, plus ``status``.  A reminder
+    already sent, cancelled or still pending can each be the event a todo repeats.
+    """
+    if not group_id:
+        return []
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT reminder_id, group_id, user_id, action, remind_at, "
+            "created_at, source_kind, source_ref, source_text, "
+            "last_pushed_at, weekly_count, "
+            "last_weekly_at, pushed_3d, pushed_1d, "
+            "pushed_4hr, pushed_2hr, pushed_1hr, pushed_now, "
+            "mention_aliases, time_kind, merged_details, push_keep_stage, status "
+            "FROM reminders WHERE group_id=? AND remind_at >= ? AND remind_at < ? "
+            "ORDER BY remind_at, reminder_id",
+            (group_id, int(lo_ts), int(hi_ts)),
+        ).fetchall()
+    return [
+        {
+            "reminder_id": r[0], "group_id": r[1], "user_id": r[2],
+            "action": r[3], "remind_at": r[4], "created_at": r[5],
+            "source_kind": r[6] or "", "source_ref": r[7] or "",
+            "source_text": r[8] or "",
+            "last_pushed_at": r[9], "weekly_count": r[10],
+            "last_weekly_at": r[11], "pushed_3d": r[12], "pushed_1d": r[13],
+            "pushed_4hr": r[14], "pushed_2hr": r[15],
+            "pushed_1hr": r[16], "pushed_now": r[17],
+            "mention_aliases": _load_mention_aliases(r[18]),
+            "time_kind": r[19],
+            "merged_details": _load_merged_details(r[20]),
+            "push_keep_stage": str(r[21] or ""),
+            "status": str(r[22] or ""),
+        }
+        for r in rows
+    ]
+
+
 def mark_reminder_pushed(reminder_id: int, stage: str) -> bool:
     """把 reminder 在某 stage push 過的 flag 打開。
 

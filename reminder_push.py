@@ -543,6 +543,10 @@ def _reminder_audience(row: dict) -> tuple[str, ...]:
     return tuple(sorted(keys))
 
 
+# 2026-11-13 TODO push: a todo whose owner a same-event reminder already pings is not pushed again.
+reminder_audience = _reminder_audience
+
+
 def _identity_texts(row: dict) -> list[str]:
     return [
         str(row.get("action") or ""),

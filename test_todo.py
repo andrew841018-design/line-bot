@@ -1,6 +1,11 @@
-"""Feature E tests — TODO extractor + reminder (Andrew 2026-05-25)."""
+"""Feature E tests — TODO store + daily push (Andrew 2026-05-25; extraction rebuilt 2026-11-13).
+
+The extraction itself, the switch, the push's folds and the unsend path are in test_todo_extract.py.
+Here the mode is pinned on and the model can never be reached.
+"""
 
 import os
+import sqlite3
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -12,6 +17,21 @@ import pytest
 os.environ.setdefault("LINE_CHANNEL_SECRET", "dummy_secret_32bytes_padding000")
 os.environ.setdefault("LINE_CHANNEL_ACCESS_TOKEN", "dummy")
 os.environ.setdefault("GEMINI_API_KEY", "dummy")
+
+
+@pytest.fixture(autouse=True)
+def todo_on_without_a_model(monkeypatch):
+    """Mode on whatever todo.DEFAULT_MODE or a .env says; no family group, so no run here extracts; and
+    the model raises if anything reaches it anyway."""
+    import config
+    import gemini_client
+
+    def no_model(*args, **kwargs):
+        raise AssertionError("test_todo never calls the model")
+
+    monkeypatch.setenv("LINE_BOT_TODO_MODE", "on")
+    monkeypatch.setattr(config.settings, "family_group_id", "")
+    monkeypatch.setattr(gemini_client, "side_task_last_tier", no_model)
 
 
 @pytest.fixture
@@ -29,8 +49,13 @@ def temp_todo_db(monkeypatch):
         pass
 
 
+def _row(db_path, todo_id):
+    with sqlite3.connect(db_path) as c:
+        c.row_factory = sqlite3.Row
+        return dict(c.execute("SELECT * FROM todos WHERE todo_id=?", (todo_id,)).fetchone())
+
+
 def test_init_db_creates_table(temp_todo_db):
-    import sqlite3
     with sqlite3.connect(temp_todo_db) as c:
         tables = [
             r[0] for r in c.execute(
@@ -38,6 +63,7 @@ def test_init_db_creates_table(temp_todo_db):
             ).fetchall()
         ]
     assert "todos" in tables
+    assert {"extract_cursors", "extract_unsent"} <= set(tables)
 
 
 def test_insert_and_list_due_today(temp_todo_db):
@@ -55,7 +81,7 @@ def test_insert_and_list_due_today(temp_todo_db):
 def test_list_pending_orders_due_dates_before_undated(temp_todo_db):
     import todo
     todo.insert_todo("GRP", "無日期事項", "U1", None)
-    todo.insert_todo("GRP", "明確日期事項", "U1", "2026-06-25")
+    todo.insert_todo("GRP", "明確日期事項", "U1", "2099-06-25")
 
     pending = todo.list_pending("GRP")
 
@@ -64,10 +90,10 @@ def test_list_pending_orders_due_dates_before_undated(temp_todo_db):
 
 def test_list_pending_can_filter_due_date(temp_todo_db):
     import todo
-    todo.insert_todo("GRP", "6月25事項", "U1", "2026-06-25")
-    todo.insert_todo("GRP", "6月26事項", "U1", "2026-06-26")
+    todo.insert_todo("GRP", "6月25事項", "U1", "2099-06-25")
+    todo.insert_todo("GRP", "6月26事項", "U1", "2099-06-26")
 
-    pending = todo.list_pending("GRP", due_date="2026-06-25")
+    pending = todo.list_pending("GRP", due_date="2099-06-25")
 
     assert len(pending) == 1
     assert pending[0]["task"] == "6月25事項"
@@ -89,44 +115,37 @@ def test_insert_dedup(temp_todo_db):
 
 def test_complete_todo(temp_todo_db):
     import todo
-    tid = todo.insert_todo("GRP", "task", "U1", "2026-06-04")
+    tid = todo.insert_todo("GRP", "task", "U1", "2026-06-04", source_msg_id="m1", source_text="我要做 task")
     assert todo.complete_todo(tid) is True
     # 已 completed 再 complete → False
     assert todo.complete_todo(tid) is False
+    assert _row(temp_todo_db, tid)["source_text"] is None  # an ended row keeps no family words
 
 
 def test_cancel_todo(temp_todo_db):
     import todo
-    tid = todo.insert_todo("GRP", "task", "U1", "2026-06-04")
+    tid = todo.insert_todo("GRP", "task", "U1", "2026-06-04", source_msg_id="m1", source_text="我要做 task")
     assert todo.cancel_todo(tid) is True
     assert todo.cancel_todo(tid) is False
+    assert _row(temp_todo_db, tid)["source_text"] is None
 
 
-def test_list_overdue(temp_todo_db):
+def test_overdue_todos_are_expired_and_never_pushed(temp_todo_db):
+    """2026-11-13: the push no longer repeats overdue todos (「逾期 7 天內」 is gone); they expire."""
     import todo
     today = datetime.now(ZoneInfo("Asia/Taipei")).date()
-    yesterday = (today - timedelta(days=1)).isoformat()
-    future = (today + timedelta(days=1)).isoformat()
-    todo.insert_todo("GRP", "overdue1", "U1", yesterday)
-    todo.insert_todo("GRP", "future1", "U1", future)
-    overdue = todo.list_overdue("GRP")
-    assert len(overdue) == 1
-    assert overdue[0]["task"] == "overdue1"
+    yesterday = todo.insert_todo("GRP", "overdue1", "U1", (today - timedelta(days=1)).isoformat(),
+                                 source_text="我昨天要做 overdue1")
+    very_old = todo.insert_todo("GRP", "very_old", "U1", (today - timedelta(days=14)).isoformat())
+    future = todo.insert_todo("GRP", "future1", "U1", (today + timedelta(days=1)).isoformat())
 
+    with patch.object(todo, "_push") as mock_push:
+        assert todo.push_daily_reminders("GRP") == 0
 
-def test_list_overdue_skips_very_old(temp_todo_db):
-    """Overdue 超過 MAX_OVERDUE_DAYS_TO_REMIND 不再 reminder."""
-    import todo
-    today = datetime.now(ZoneInfo("Asia/Taipei")).date()
-    very_old = (today - timedelta(days=14)).isoformat()
-    todo.insert_todo("GRP", "very_old", "U1", very_old)
-    overdue = todo.list_overdue("GRP")
-    assert not any(t["task"] == "very_old" for t in overdue)
-
-
-def test_extract_from_text_empty():
-    import todo
-    assert todo.extract_from_text("") == []
+    assert not mock_push.called
+    assert [_row(temp_todo_db, t)["status"] for t in (yesterday, very_old, future)] == ["expired", "expired", "pending"]
+    assert _row(temp_todo_db, yesterday)["source_text"] is None
+    assert [p["task"] for p in todo.list_pending("GRP")] == ["future1"]
 
 
 def test_push_daily_reminders_skips_when_no_todos(temp_todo_db):
@@ -191,11 +210,13 @@ def test_the_daily_todo_push_pings_each_named_owner_once(temp_todo_db, named):
     import todo
 
     today = datetime.now(ZoneInfo("Asia/Taipei")).date()
-    todo.insert_todo("GRP", "繳學費", "U_B", today.isoformat())
-    todo.insert_todo("GRP", "買菜", "U_A", today.isoformat())
-    todo.insert_todo("GRP", "倒垃圾", "U_A", today.isoformat())
-    todo.insert_todo("GRP", "修水管", "U_X", today.isoformat())  # no family name: not printed, not pinged
-    expected = todo._format_reminder(todo.list_due_today("GRP"), todo.list_overdue("GRP"))
+    ids = [
+        todo.insert_todo("GRP", "繳學費", "U_B", today.isoformat()),
+        todo.insert_todo("GRP", "買菜", "U_A", today.isoformat()),
+        todo.insert_todo("GRP", "倒垃圾", "U_A", today.isoformat()),
+        todo.insert_todo("GRP", "修水管", "U_X", today.isoformat()),  # no family name: not printed, not pinged
+    ]
+    expected = todo._format_reminder(todo.list_due_today("GRP"), [])
     assert "- 修水管" in expected  # printed without a name
     assert todo.push_daily_reminders("GRP") == 4
     [call] = named
@@ -207,7 +228,8 @@ def test_the_daily_todo_push_pings_each_named_owner_once(temp_todo_db, named):
     users = [sub["mentionee"]["userId"] for sub in message["substitution"].values()]
     assert sorted(users) == ["U_A", "U_B"] and len(users) == 2
     assert "U_X" not in str(message)
-    assert call["retry_key"] == str(uuid.uuid5(uuid.NAMESPACE_URL, f"todo_daily:GRP:{today.isoformat()}"))
+    key = f"todo_daily:GRP:{today.isoformat()}:{','.join(sorted(ids))}"
+    assert call["retry_key"] == str(uuid.uuid5(uuid.NAMESPACE_URL, key))
 
 
 def test_the_daily_todo_text_is_unchanged_and_only_printed_names_are_targets(named):

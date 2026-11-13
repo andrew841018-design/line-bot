@@ -416,6 +416,15 @@ def _same_event(left: _Item, right: _Item) -> bool:
     )
 
 
+def todo_same_event(todo: Mapping, row: Mapping) -> bool:
+    """Whether a reminder row (any status), or a calendar event written as one, is the todo's event.
+
+    ``todo`` is shaped as :func:`todo_item` makes it (the owner's family name and ``user_id``); ``row``
+    as a ``memory`` reminder row.  The same test the list folds with; who the reminder pings is the
+    caller's check (2026-11-13: the TODO push folds a todo the reminder already covers).  Pure."""
+    return _same_event(_todo_item(dict(todo)), _reminder_item(dict(row)))
+
+
 def _primary_rank(item: _Item) -> tuple:
     """A row someone asked for as such first; then the most precise time,
     then the earliest, then the most words."""

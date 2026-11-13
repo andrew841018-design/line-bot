@@ -1466,6 +1466,22 @@ def find_events_by_source_message(
     return [dict(row) for row in rows]
 
 
+def events_on(group_id: str, iso: str) -> list[dict]:
+    """Every event of one group on one date (``YYYY-MM-DD``), whatever its status.  Read only
+    (2026-11-13: the TODO push folds a todo the calendar already holds for that day)."""
+
+    if not group_id or not iso:
+        return []
+    with _lock, _conn() as c:
+        c.row_factory = sqlite3.Row
+        rows = c.execute(
+            "SELECT * FROM events WHERE group_id=? AND event_date=? "
+            "ORDER BY created_at, event_id",
+            (group_id, iso),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def find_unbound_active_events_by_schedule(
     group_id: str,
     *,
