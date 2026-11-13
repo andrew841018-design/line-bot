@@ -480,6 +480,11 @@ MAY_PING = {
     "line_push_client.push_text_with_mentions calls text_v2_dict": 1,
     # every word is the program's: a role, a label from a fixed list, a time, a fixed sentence
     "parent_health._red_flag_notice makes an all target": 1,
+    # family main group only.  The program's words plus a 稱呼 Gemini took from what the family typed (run_sweep
+    # skips the bot's own replies): an accepted exception, the 稱呼 is not checked against the message.
+    # TODO(2026-11-12 deferred): if the anniversary sweeps are fixed (they compare seconds to milliseconds and
+    # add nothing today), keep that filter.
+    "anniversary.push_today_reminders makes an all target": 1,
 }
 
 def _called(node) -> str:

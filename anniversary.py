@@ -29,7 +29,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from config import settings  # noqa: E402
 from sqlite_security import connect_private_sqlite
-from line_push_client import try_push_text  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -253,9 +252,14 @@ def run_sweep(group_id: str, since_days: int = 0) -> int:
     Returns count of new anniversaries inserted.
     """
     import memory
-    where = "group_id = ?"
+    # 2026-11-12: the bot's own replies (archived as __bot__) are not a source of family anniversaries.
+    # A reminder now @s the whole family main group (「提到人就真 @」), so its words have to come from
+    # what the family typed: test_model_all_mention.MAY_PING.
+    where = "group_id = ? AND (user_id IS NULL OR user_id <> '__bot__')"
     params: list = [group_id]
     if since_days > 0:
+        # TODO(2026-11-13 deferred, Andrew 決定要不要修): raw_messages.created_at 是秒（memory.log_raw_message
+        # 寫 strftime('%s')），這裡拿毫秒比，增量抽取一筆都抓不到。修好時保留上面不讀 __bot__ 的條件。
         since_ts = int((time.time() - since_days * 24 * 3600) * 1000)
         where += " AND created_at >= ?"
         params.append(since_ts)
@@ -297,12 +301,24 @@ def _get_token() -> str:
     return line_access_token()
 
 
-def _push(group_id: str, text: str) -> bool:
+def _push(group_id: str, text: str, targets=(), *, retry_key: str) -> bool:
     token = _get_token()
     if not token or not group_id:
         logger.error("missing TOKEN or group_id; skip push")
         return False
-    return try_push_text(group_id, text, timeout=10)
+    try:
+        # Looked up when the push runs, not at import: an update that lands halfway must not stop the
+        # 08:00 job before it starts.
+        import line_push_client
+
+        return bool(
+            line_push_client.try_push_text_with_mentions(
+                group_id, text, targets, retry_key=retry_key, timeout=10, source="anniversary"
+            )
+        )
+    except Exception as exc:
+        logger.warning("anniversary push failed error_type=%s", type(exc).__name__)
+        return False
 
 
 _TYPE_LABEL = {
@@ -328,6 +344,19 @@ def push_today_reminders(group_id: str) -> int:
     today = datetime.now(_TW).date()
     year = today.year
     n_sent = 0
+    # 「提到人就真 @」：紀念日是要其他人準備，Andrew 11/12 選「@ 全家」。只在家族主群 @all、其他群組照舊不 @，
+    # 以及 run_sweep 不讀 bot 自己的回覆，是實作時的決定（IMPL_PLAN v2 第 12 點，隨部署回報 Andrew）。字是程式寫的，加上 Gemini 從家人訊息
+    # 抽出的稱呼：這是 e271707「程式寫的或家人打的」的已知例外，稱呼沒有再對照原文。建不出來就照舊不 @。
+    # TODO(2026-11-13 deferred): 同一天同一群組有多筆（例如同一人兩種稱呼）會各 @all 一次，要不要合併等有資料再看。
+    everyone: list = []
+    try:
+        if group_id and group_id == str(getattr(settings, "family_group_id", "") or ""):
+            import line_mentions
+
+            everyone = [line_mentions.MentionTarget(key="all", kind="all", label="@all")]
+    except Exception as exc:
+        logger.warning("anniversary mention failed error_type=%s", type(exc).__name__)
+        everyone = []
     for offset in REMINDER_OFFSETS:
         from datetime import timedelta
         target = today + timedelta(days=offset)
@@ -336,7 +365,8 @@ def push_today_reminders(group_id: str) -> int:
             if already_reminded(ann["anniversary_id"], year, offset):
                 continue
             text = _format_anniversary(ann, offset)
-            if _push(group_id, text):
+            retry_key = str(uuid.uuid5(uuid.NAMESPACE_URL, f"anniversary:{ann['anniversary_id']}:{year}:{offset}"))
+            if _push(group_id, text, everyone, retry_key=retry_key):
                 mark_reminded(ann["anniversary_id"], year, offset)
                 n_sent += 1
                 logger.info(
