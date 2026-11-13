@@ -352,14 +352,24 @@ def test_ishares_ignores_scripts_styles_json_labels_and_the_nav_change_card():
 
 @pytest.mark.parametrize("extra", [
     "",  # 0 個（下面把 shares 拿掉）
-    '<div><span>Shares Outstanding</span><span>1,000</span><div>as of Oct 27, 2026</div></div>',  # 第 2 個
-    '<div><span>Shares Outstanding</span><span>90,000,000</span><div>as of Oct 27, 2026</div></div>',  # 一樣的也不行
+    '<div><span>Shares Outstanding</span><span>1,000</span><div>as of Oct 27, 2026</div></div>',  # 第 2 個，數字不同
+    '<div><span>Shares Outstanding</span><span>90,000,000</span><div>as of Oct 26, 2026</div></div>',  # 第 2 個，日期不同
 ])
-def test_ishares_shares_outstanding_must_match_exactly_once(extra):
+def test_ishares_shares_outstanding_missing_or_disagreeing_is_format(extra):
     html = ishares_html(shares=None) if not extra else ishares_html(extra=extra)
     with pytest.raises(market_calc.ParseError) as err:
         src.parse_ishares(html)
     assert err.value.kind == "format"
+
+
+def test_ishares_identical_shares_copies_count_as_one():
+    """2026-11-13 上線後實測：真頁面有兩處完全相同的「Shares Outstanding 288,700,000 as of Nov 12, 2026」。
+    幾份完全一致就當一份（和 NAV 同一條規則）；以前「一樣的也不行」讓 SOXX 的資金流每次都 format。"""
+    same = '<div><span>Shares Outstanding</span><span>90,000,000</span><div>as of Oct 27, 2026</div></div>'
+    page = src.parse_ishares(ishares_html(extra=same))
+    single = src.parse_ishares(ishares_html())
+    assert page == single
+    assert page.days[0].shares_out == 90_000_000
 
 
 def test_ishares_nav_from_another_date_is_null():

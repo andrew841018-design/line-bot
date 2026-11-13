@@ -20,7 +20,7 @@ Andrew 2026-10-31 定案（PLAN_v2 §1、§3.1；IMPL_SPEC_p1 §2）：SOXX、00
 解析（嚴格：頁面一改版就該失敗，而不是印出錯的數字）：
 - HTML 一律先用 HTMLParser 取可見文字（script／style 的內容不算，每個標籤邊界當成空白，NFKC 後壓空白），再用固定的正則
   找欄名與數字。來源的任何文字都不存、不回傳：結果只有日期與數字，錯誤只有 kind＋detail（程式自己的列舉字）。
-- iShares：「Shares Outstanding <數字> as of <Mon DD, YYYY>」必須正好對到一個（0 個或 2 個以上＝format）。NAV 卡「NAV as of
+- iShares：「Shares Outstanding <數字> as of <Mon DD, YYYY>」對到的幾份要完全一致（數字和日期都一樣）才收，當成一份；0 個或彼此不一致＝format（2026-11-13：真頁面有兩份相同的）。NAV 卡「NAV as of
   <日期> $ <數字>」（數字前至少一個 $）全部一致才採用（頁面本來就有兩份）；對不到、彼此不一致、或日期和在外股數的日期不同
   → NAV＝None。和前一份 NAV 比的合理性檢查在 market_pipeline_inst。標題要有 SOXX。
 - SSGA：用 market_sources_us._xlsx_rows（先過 zip／XML 的安全檢查）；代號列要是 SPY、表頭四欄各出現一次；取最新一列＋往前
@@ -226,10 +226,12 @@ def parse_ishares(body: bytes) -> FlowPage:
     text, title = _visible(body)
     if not _ISHARES_TITLE_RE.search(title):
         raise ParseError("format", "fund")  # 不是 SOXX 的頁（轉到別的基金、首頁）
-    found = _ISHARES_SHARES_RE.findall(text)
+    # 2026-11-13 上線後實測：頁面有兩處完全相同的「Shares Outstanding … as of …」（不同區塊各一份）。
+    # 和 NAV 一樣，幾份要完全一致才收；數字或日期不同照樣 format。
+    found = set(_ISHARES_SHARES_RE.findall(text))
     if len(found) != 1:
         raise ParseError("format", "shares")
-    raw, mon, day, year = found[0]
+    raw, mon, day, year = found.pop()
     shares = _number(raw, integer=True)
     if shares is None or shares <= 0:
         raise ParseError("format", "shares")
