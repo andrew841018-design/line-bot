@@ -190,6 +190,7 @@ def test_a_failed_anniversary_push_is_not_marked_and_the_next_row_still_goes(tem
 
     monkeypatch.setattr(line_push_client, "line_access_token", lambda fallback_token=None: "token")
     monkeypatch.setattr(anniversary.settings, "family_group_id", "GRP_FAMILY")
+    monkeypatch.setenv("ALLOWED_GROUP_IDS", "GRP_FAMILY")
     first = _today_row(anniversary)
     from datetime import datetime
     from zoneinfo import ZoneInfo
@@ -212,6 +213,19 @@ def test_a_failed_anniversary_push_is_not_marked_and_the_next_row_still_goes(tem
     assert len({key for key, _kind in calls}) == 2
     year = today.year
     assert [anniversary.already_reminded(aid, year, 0) for aid in (first, second)].count(True) == 1
+    # 2026-11-13 (POST_2 N-10): the failure is kept for jobs/family_extract_status.py, counts only.
+    import sqlite3
+
+    c = sqlite3.connect(temp_anniv_db)
+    try:
+        [summary] = c.execute(
+            "SELECT last_push FROM extract_cursors WHERE name='anniversary' AND group_id='GRP_FAMILY'"
+        ).fetchone()
+    finally:
+        c.close()
+    push = json.loads(summary)
+    assert (push["due"], push["pushed"], push["push_ok"]) == (2, 1, False)
+    assert set(push) == {"mode", "date", "due", "pushed", "push_ok"}
 
 
 def test_a_mention_that_cannot_be_built_never_stops_the_anniversary_push(temp_anniv_db, monkeypatch, pushed):

@@ -5,8 +5,9 @@ I2（例外只記型別）、I3（管理指令）、I4（只准管理指令呼�
 
 模型只在一個接縫換掉（gemini_client.side_task_last_tier），每個抽取測試都斷言它被叫了幾次。推播走 conftest
 的記錄器（line_push_client.push_messages）或換掉 anniversary._push，不會送 LINE；now 一律注入（入口測試除外，
-那裡照真的時間算）。人一律寫「成員甲／乙」，id 是 user-a、mid-a1 這類字串。同一行有日期、時刻的加
-privacy-safe-fixture。
+那裡照真的時間算）。人一律寫「成員甲／乙」，id 是 user-a、mid-a1 這類字串。合成資料標記（jobs/git_privacy_audit.py
+的 _SYNTHETIC_SCHEDULE_MARKER）只加在同一行同時有日期、時刻和事件字（同檔的 _PRIVATE_SCHEDULE_TOPIC_RE）的行：
+這個檔沒有這種行，所以一個都不加（POST_3 N8：多加的標記會讓那一行以後永遠不被掃）。
 """
 
 import ast
@@ -41,14 +42,21 @@ def at(y, m, d, hh=8, mm=0) -> float:
     return datetime(y, m, d, hh, mm, tzinfo=TW).timestamp()
 
 
-NOW = at(2026, 11, 14)  # the 08:00 run  # privacy-safe-fixture
-EVENING = at(2026, 11, 13, 20)  # when the family wrote  # privacy-safe-fixture
+NOW = at(2026, 11, 14)  # the 08:00 run
+EVENING = at(2026, 11, 13, 20)  # when the family wrote
 
 # PRE_2 P2-I1 plus PRE_3's additions, copied here on purpose: a word taken out of anniversary.py fails below.
 KEYWORDS = (
     "生日", "壽", "歲", "結婚", "婚", "紀念", "忌日", "冥誕", "週年", "周年", "過世", "逝世",
     "慶生", "生快", "誕", "出生", "忌", "祭", "對年", "滿月", "往生", "去世", "嫁", "娶",
     "birthday", "bday", "hbd", "anniversary",
+)
+# A lunar date in the words (PRE_3 N-b), plus what POST_2 N-6 found missing: a 初X day, 冬月 and a leap month.
+LUNAR_SAYINGS = ("農曆", "陰曆", "舊曆", "正月", "臘月", "冬月", "閏月", "閏四月", "十月初五", "初十")
+# Solar ones that only look lunar: 閏年 is a 2/29, 月初 the start of a month, 當初／最初／起初 not a day at all.
+NOT_LUNAR = (
+    "成員甲生日 2/29，閏年才過", "下個月初幫成員甲慶生", "當初一起幫成員甲慶生", "最初一年的結婚紀念日 6/6",
+    "起初一直忘了成員乙生日 4/6",
 )
 # The eleven ways PRE_3 found the old list missed (synthetic sentences).
 MISSED_BEFORE = (
@@ -193,7 +201,7 @@ def test_the_prompt_has_no_names_or_ids_and_keeps_1500_characters(family, model)
     [prompt] = model["prompts"]
     [line] = _lines(prompt)
     assert line["text"].endswith("成員乙的生日是 3/5")  # past the 500 characters other jobs keep
-    assert (line["i"], line["date"], line["time"]) == (1, "2026-11-13", "20:00")  # privacy-safe-fixture
+    assert (line["i"], line["date"], line["time"]) == (1, "2026-11-13", "20:00")
     for word in ("user-a", "成員甲", GROUP, "mid-long"):
         assert word not in prompt
 
@@ -238,6 +246,46 @@ def test_i_becomes_the_speakers_local_name_only_for_their_own_birthday(family, m
     assert shown["self_substituted"] is True and shown["person_raw"] == "我" and shown["speaker"] == "成員甲"
 
 
+def test_a_birthday_in_someone_elses_quoted_words_is_not_the_speakers(family, model):
+    """POST_2 N-7: 「我生日」 inside quote marks is the quoted person's; only one outside them is substituted."""
+    _raw("mid-a1", "user-a", "媽媽說：「我生日那天想吃火鍋」", EVENING)
+    _raw("mid-a2", "user-a", "我生日 6/4，成員乙說「記得回家」", EVENING + 1)
+    model["answers"].append(lambda p: [_item(_i(p, "火鍋"), "我", 11, 12), _item(_i(p, "回家"), "我", 6, 4)])
+
+    result = _extract(family)
+
+    assert len(model["prompts"]) == 1 and result.skipped.get("self_unclear") == 1
+    [row] = _candidates()
+    assert (row["person"], row["person_raw"], row["self_substituted"], row["month"], row["day"]) == (
+        "成員甲", "我", 1, 6, 4,
+    )
+
+
+@pytest.mark.parametrize("text", [
+    "成員乙說『我的生日是 6/4』", "成員乙說“我生日 6/4”", '成員乙說"我生日 6/4"', "成員乙說＂我生日 6/4＂",
+    "成員乙說〝我生日 6/4〞", "成員乙說‘我生日 6/4’", "「成員乙說『我生日 6/4』才對」",
+    "成員乙說：「我生日 6/4",  # never closed: the quote runs to the end
+])
+def test_every_kind_of_quote_mark_keeps_the_speaker_out(family, model, text):
+    from family_extract import Message, RunResult
+
+    result = RunResult()
+    rows = family._prepare([Message(int(EVENING), "mid-a1", "user-a", text)], [_item(1, "我", 6, 4)], result)
+
+    assert rows == [] and result.skipped == {"self_unclear": 1} and model["prompts"] == []
+
+
+@pytest.mark.parametrize("text", ["我生日 6/4，成員乙說「記得回家」", "「生日快樂」我的生日是 6/4", "我生日 6/4 喔"])
+def test_my_birthday_outside_quote_marks_is_still_the_speakers(family, model, text):
+    from family_extract import Message, RunResult
+
+    result = RunResult()
+    rows = family._prepare([Message(int(EVENING), "mid-a1", "user-a", text)], [_item(1, "我", 6, 4)], result)
+
+    assert [(r["person"], r["person_raw"], r["self_substituted"]) for r in rows] == [("成員甲", "我", 1)]
+    assert result.skipped == {} and model["prompts"] == []
+
+
 def test_a_name_the_message_does_not_have_is_dropped(family, model):
     _raw("mid-a1", "user-a", "他下週生日 3/5，記得", EVENING)
     model["answers"].append(lambda p: [
@@ -256,7 +304,7 @@ def test_a_name_the_message_does_not_have_is_dropped(family, model):
 def test_a_lunar_date_is_never_written(family, model):
     _raw("mid-a1", "user-a", "成員甲生日 8/15", EVENING)  # the model says lunar
     _raw("mid-a2", "user-a", "成員丙生日 9/9", EVENING + 1)  # the model leaves lunar out
-    for n, word in enumerate(("農曆", "陰曆", "舊曆", "正月", "臘月")):
+    for n, word in enumerate(LUNAR_SAYINGS):
         _raw(f"mid-l{n}", "user-b", f"成員乙{word}生日", EVENING + 10 + n)  # never sent
     model["answers"].append(lambda p: [
         _item(_i(p, "成員甲"), "成員甲", 8, 15, lunar=True),
@@ -266,7 +314,31 @@ def test_a_lunar_date_is_never_written(family, model):
     result = _extract(family)
 
     assert len(model["prompts"]) == 1 and "成員乙" not in model["prompts"][0]
-    assert _candidates() == [] and result.skipped.get("lunar") == 7
+    assert _candidates() == [] and result.skipped.get("lunar") == 2 + len(LUNAR_SAYINGS)
+
+
+def test_a_lunar_day_with_no_lunar_word_is_dropped_whatever_the_model_says(family, model):
+    """POST_2 N-6: 「十月初五」 has none of the old words, so only the model's flag guarded it."""
+    from family_extract import Message, RunResult
+
+    _raw("mid-a1", "user-b", "成員丙生日是十月初五，大家記得回來", EVENING)
+
+    result = _extract(family)
+
+    assert model["prompts"] == [] and result.skipped == {"lunar": 1}
+    seen = RunResult()  # an answer pointing at such a message, lunar=false, is dropped too
+    msg = Message(int(EVENING), "mid-a2", "user-b", "成員丙生日是冬月初五")
+    assert family._prepare([msg], [_item(1, "成員丙", 11, 5)], seen) == [] and seen.skipped == {"lunar": 1}
+
+
+def test_words_that_only_look_lunar_still_go_out(family, model):
+    from family_extract import Message, RunResult
+
+    for text in NOT_LUNAR:
+        result = RunResult()
+        assert family._prefilter(Message(1, "mid-a1", "user-a", text), result), text
+        assert result.skipped == {}, text
+    assert model["prompts"] == []
 
 
 def test_impossible_dates_are_dropped_and_feb_29_is_kept(family, model):
@@ -590,12 +662,19 @@ def test_an_id_must_point_at_exactly_one_row(family):
 
 
 @pytest.mark.parametrize("now, month, day, want", [
-    (at(2026, 11, 14, 7), 11, 21, ("2026-11-14", 7, "")),  # before today's 08:00 run  # privacy-safe-fixture
-    (at(2026, 11, 14, 9), 11, 21, ("2026-11-20", 1, "這次一週前那則已經過了，只剩前一天和當天")),  # privacy-safe-fixture
-    (at(2026, 11, 20, 9), 11, 21, ("2026-11-21", 0, "這次只剩當天")),  # privacy-safe-fixture
-    (at(2026, 11, 21, 9), 11, 21, ("2027-11-14", 7, "今年不推")),  # privacy-safe-fixture
-    (at(2026, 12, 30, 9), 1, 4, ("2027-01-03", 1, "這次一週前那則已經過了，只剩前一天和當天；今年不推")),  # privacy-safe-fixture
-    (at(2027, 2, 1, 9), 2, 29, ("2027-02-21", 7, "")),  # privacy-safe-fixture
+    (at(2026, 11, 14, 7), 11, 21, ("2026-11-14", 7, "")),  # before today's 08:00 run
+    (at(2026, 11, 14, 9), 11, 21, ("2026-11-20", 1, "這次一週前那則已經過了，只剩前一天和當天")),
+    (at(2026, 11, 20, 9), 11, 21, ("2026-11-21", 0, "這次只剩當天")),
+    (at(2026, 11, 21, 9), 11, 21, ("2027-11-14", 7, "這次（2026-11-21）的三則都已經過了，不推")),
+    # POST_2 N-8: a push past New Year still belongs to this time (it used to say 「今年不推」)
+    (at(2026, 12, 30, 9), 1, 2, ("2027-01-01", 1, "這次一週前那則已經過了，只剩前一天和當天")),
+    (at(2026, 12, 30, 9), 1, 4, ("2027-01-03", 1, "這次一週前那則已經過了，只剩前一天和當天")),
+    (at(2026, 12, 30, 9), 1, 1, ("2026-12-31", 1, "這次一週前那則已經過了，只剩前一天和當天")),
+    (at(2026, 12, 31, 9), 1, 1, ("2027-01-01", 0, "這次只剩當天")),
+    (at(2027, 1, 1, 9), 1, 1, ("2027-12-25", 7, "這次（2027-01-01）的三則都已經過了，不推")),  # it said nothing
+    (at(2027, 2, 1, 9), 2, 29, ("2027-02-21", 7, "")),
+    (at(2027, 2, 28, 9), 2, 29, ("2028-02-22", 7, "這次（2027-02-28）的三則都已經過了，不推")),
+    (at(2027, 3, 1, 9), 2, 29, ("2028-02-22", 7, "")),
 ])
 def test_confirm_says_when_the_next_push_is(family, now, month, day, want):
     info = family.next_push(month, day, now=now)
@@ -640,6 +719,104 @@ def test_the_08_00_job_pushes_before_it_reads(family, model, monkeypatch):
     assert order == ["push", "model"]
 
 
+def _push_row(group=GROUP):
+    """(created_at, message_id, updated_at, last_push) of the anniversary cursor row, or None."""
+    import anniversary
+
+    with anniversary._conn() as c:
+        try:
+            row = c.execute(
+                "SELECT created_at, message_id, updated_at, last_push FROM extract_cursors WHERE name=? AND group_id=?",
+                (anniversary.EXTRACT_NAME, group),
+            ).fetchone()
+        except sqlite3.OperationalError:  # no table yet
+            return None
+    return None if row is None else (row[0], row[1], row[2], json.loads(row[3]))
+
+
+def test_the_08_00_push_counts_go_into_the_cursor_row_and_the_backfill_still_reads_the_oldest(family, model, pushes):
+    """POST_2 N-10: jobs/family_extract_status.py reads these counts.  The push makes the cursor row when there is
+    none, where the extraction's own first run starts it: that same run still reads a 15-day-old message."""
+    family.add("成員甲", "birthday", 11, 14, now=NOW - 86400)
+    _raw("mid-a1", "user-b", "成員乙生日 4/6", NOW - 15 * 86400)
+    model["answers"].append(_says("成員乙", "成員乙", 4, 6))
+    assert _push_row() is None
+
+    assert family.main_reminder(now=NOW) == 0
+
+    assert len(pushes) == 1 and len(model["prompts"]) == 1
+    assert [(r["person"], r["month"], r["day"]) for r in _candidates()] == [("成員乙", 4, 6)]
+    created_at, message_id, _updated, push = _push_row()
+    assert push == {"mode": "on", "date": "2026-11-14", "due": 1, "pushed": 1, "push_ok": True}
+    assert (created_at, message_id) == (int(NOW - 15 * 86400), "mid-a1")  # the extraction moved on from there
+
+
+def test_with_the_extraction_off_the_push_row_starts_where_the_extraction_will(family, model, monkeypatch):
+    monkeypatch.setenv(family.EXTRACT_SWITCH, "off")
+    _raw("mid-a1", "user-b", "成員乙生日 4/6", NOW - 15 * 86400)
+
+    assert family.main_reminder(now=NOW) == 0
+
+    created_at, message_id, updated_at, push = _push_row()
+    assert (created_at, message_id) == family._feature(GROUP, NOW).initial_cursor(NOW) == (0, "")
+    assert updated_at == int(NOW)  # not 0: the status job reads an extraction that never runs as 26 hours old
+    assert push == {"mode": "off", "date": "2026-11-14", "due": 0, "pushed": 0, "push_ok": True}
+    assert _push_row(OTHER) is None  # only the family main group's row: the one the status job reads
+    assert model["prompts"] == []
+
+    monkeypatch.setenv(family.EXTRACT_SWITCH, "on")
+    model["answers"].append(_says("成員乙", "成員乙", 4, 6))
+    assert _extract(family, now=NOW + 60).read == 1 and len(model["prompts"]) == 1
+
+
+def test_a_push_that_fails_is_counted_and_a_later_run_that_day_sends_it(family, monkeypatch):
+    family.add("成員甲", "birthday", 11, 14, now=NOW - 86400)
+    family.add("成員乙", "birthday", 11, 15, now=NOW - 86400)
+    answers = [False, True, True]  # the day before (成員乙) fails once, today's (成員甲) goes
+    sent: list[str] = []
+    monkeypatch.setattr(family, "_push", lambda g, text, targets=(), *, retry_key: sent.append(text) or answers.pop(0))
+
+    assert family.push_today_reminders(GROUP, now=NOW) == 1
+    assert _push_row()[3] == {"mode": "on", "date": "2026-11-14", "due": 2, "pushed": 1, "push_ok": False}
+
+    assert family.push_today_reminders(GROUP, now=NOW + 600) == 1  # run again that morning
+    assert _push_row()[3] == {"mode": "on", "date": "2026-11-14", "due": 1, "pushed": 1, "push_ok": True}
+    assert len(sent) == 3 and answers == []
+
+
+def test_an_error_in_the_push_leaves_only_its_type_in_the_cursor_row(family, monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG)
+
+    def boom(*_a, **_k):
+        raise ValueError(SECRET)
+
+    monkeypatch.setattr(family, "falling_on", boom)
+
+    with pytest.raises(ValueError):  # main() turns it into exit 1 and the type (test below)
+        family.push_today_reminders(GROUP, now=NOW)
+
+    push = _push_row()[3]
+    assert push == {"mode": "on", "date": "2026-11-14", "due": 0, "pushed": 0, "push_ok": False, "error": "ValueError"}
+    assert SECRET not in caplog.text
+
+
+def test_counts_that_cannot_be_saved_never_stop_the_push(family, monkeypatch, pushes, caplog):
+    import family_extract
+
+    caplog.set_level(logging.DEBUG)
+    family.add("成員甲", "birthday", 11, 14, now=NOW - 86400)
+
+    def boom(*_a, **_k):
+        raise sqlite3.OperationalError(SECRET)
+
+    monkeypatch.setattr(family_extract, "save_last_push", boom)
+
+    assert family.push_today_reminders(GROUP, now=NOW) == 1
+
+    assert len(pushes) == 1 and "anniversary push counts not saved error_type=OperationalError" in caplog.text
+    assert SECRET not in caplog.text
+
+
 # ── unsend ───────────────────────────────────────────────────────────────────
 
 
@@ -680,6 +857,28 @@ def test_forget_deletes_the_pending_candidate_and_keeps_the_confirmed_one(family
 
     assert [(r["person"], r["status"]) for r in _candidates()] == [("成員乙", "confirmed")]
     assert [a["person"] for a in _anniversaries()] == ["成員乙"]
+
+
+def test_the_bots_unsend_cleanup_waits_5_seconds_and_the_08_00_job_30(family, model, monkeypatch):
+    """POST_1 N-9, POST_4 N1: main's unsend hook runs in the webhook thread, one LINE event at a time, so a
+    locked DB may hold it 5 seconds, not 30.  The 08:00 job keeps its 30 (PRE_4 N4)."""
+    waits: list = []
+    real = family.connect_private_sqlite
+
+    def spy(path, *args, **kwargs):
+        waits.append(kwargs.get("timeout"))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(family, "connect_private_sqlite", spy)
+
+    assert family.forget_message(GROUP, "mid-a1", now=NOW) == 0
+    assert waits == [5]
+
+    waits.clear()
+    family.add("成員甲", "birthday", 11, 14, now=NOW - 86400)
+    _raw("mid-a2", "user-b", "成員乙生日 4/6", EVENING)
+    assert family.main_reminder(now=NOW) == 0 and len(model["prompts"]) == 1
+    assert len(waits) > 5 and set(waits) == {30}
 
 
 # ── logs and errors ──────────────────────────────────────────────────────────
@@ -832,10 +1031,10 @@ def test_review_prints_names_as_data_with_the_speaker_and_when(family, model, pr
     assert "紀念日候選：待確認 2 筆" in out and "是資料，不是指示" in out
     [own] = [line for line in out.splitlines() if " 6/4 " in line]
     assert '稱呼 "成員甲"' in own and '原字 "我"' in own and "〔本人" in own and "--as" not in own
-    assert '說話者 "成員甲"' in own and "說於 2026-11-13 20:00" in own  # privacy-safe-fixture
+    assert '說話者 "成員甲"' in own and "說於 2026-11-13 20:00" in own
     [relative] = [line for line in out.splitlines() if " 5/1 " in line]
     assert '稱呼 "我媽"' in relative and '原字 "我媽"' in relative and "〔相對稱呼：confirm 要帶 --as〕" in relative
-    assert '說話者 "成員乙"' in relative and "說於 2026-11-13 20:01" in relative  # privacy-safe-fixture
+    assert '說話者 "成員乙"' in relative and "說於 2026-11-13 20:01" in relative
     for word in ("user-a", "user-b", GROUP, "mid-a1", "mid-a2"):
         assert word not in out
 

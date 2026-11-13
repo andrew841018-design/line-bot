@@ -13,8 +13,11 @@
   - 推播會 @ 全家，所以稱呼只收三種字：家人原文裡的稱呼、說話者說「我生日」時程式換上的本機稱呼、
     Andrew 用 ``--as``／``add`` 打的字（test_model_all_mention.MAY_PING）。農曆的不收。非閏年的 2/29 在
     2/28 推。
-  - 收回的訊息（main 的收回分支轉給 ``forget_message``）不再送模型，它產生的待確認候選刪掉。
+  - 收回的訊息（main 的收回分支轉給 ``forget_message``，在 bot 裡最多等 5 秒）不再送模型，它產生的待確認候選
+    刪掉。
   - 開關 ``LINE_BOT_ANNIVERSARY_EXTRACT``（on／off，打錯字當 off）只擋抽取；已確認的照推，要停推用 remove。
+  - 每次推播的數字（今天該推幾則、推了幾則、有沒有失敗）寫進家族主群抽取游標列的 ``last_push``，給
+    jobs/family_extract_status.py（POST_2 N-10）。
 - 時間單位：候選表、游標、收回表一律是秒；anniversaries.created_at 與 anniversary_reminders_sent.sent_at
   維持毫秒。
 - log 只記數字和 id 前 8 碼，例外只記型別：不記稱呼、原文、群組或 user id。
@@ -94,8 +97,11 @@ ANNIVERSARY_KEYWORDS: tuple[str, ...] = (
 )
 _KEYWORD_RE = re.compile("|".join(re.escape(word) for word in ANNIVERSARY_KEYWORDS), re.IGNORECASE)
 # A lunar date is never written, whatever the model says (PRE_3 N-b): the push only knows solar dates.
-LUNAR_WORDS: tuple[str, ...] = ("農曆", "陰曆", "舊曆", "正月", "臘月")
-_LUNAR_RE = re.compile("|".join(LUNAR_WORDS))
+# POST_2 N-6 added a 初X day (「十月初五」), 冬月 and a leap month (閏月, 閏四月).  閏年 is a solar 2/29, and
+# 當初／最初／起初 are not days.
+LUNAR_WORDS: tuple[str, ...] = ("農曆", "陰曆", "舊曆", "正月", "臘月", "冬月")
+_LUNAR_PATTERNS: tuple[str, ...] = (r"(?<![當最起])初[一二三四五六七八九十]", r"閏[正一二三四五六七八九十冬臘]{0,2}月")
+_LUNAR_RE = re.compile("|".join((*map(re.escape, LUNAR_WORDS), *_LUNAR_PATTERNS)))
 
 # 稱呼 (PRE_3 P2-I5, PRE_4 I3).  The model answers 「我」 for the speaker's own birthday and the program puts
 # the speaker's local alias in its place; nothing else is ever substituted.
@@ -105,6 +111,12 @@ _PRONOUNS = frozenset({
     "人家",
 })
 _SELF_BIRTHDAY_RE = re.compile(r"(?:我(?:自己)?|本人)的?生日")
+# Words in quote marks are someone else's (POST_2 N-7): in 「媽媽說：『我生日那天…』」 the 「我」 is not the
+# speaker.  An opening mark that never closes runs to the end of the message.
+_QUOTED_RE = re.compile(
+    r"「[^」]*(?:」|$)|『[^』]*(?:』|$)|“[^”]*(?:”|$)|‘[^’]*(?:’|$)|\"[^\"]*(?:\"|$)|＂[^＂]*(?:＂|$)"
+    r"|〝[^〞〟]*(?:[〞〟]|$)"
+)
 _KIN_WORDS: tuple[str, ...] = (
     "媽", "爸", "哥", "姊", "姐", "弟", "妹", "老公", "老婆", "兒子", "女兒", "阿公", "阿嬤", "爺爺", "奶奶",
     "外公", "外婆", "太太", "先生", "阿姨", "叔", "伯", "舅", "姑", "嬸", "嫂", "孫", "岳", "公公", "婆婆",
@@ -127,13 +139,20 @@ class _ClosingConnection(sqlite3.Connection):
             self.close()
 
 
-def _conn() -> sqlite3.Connection:
+# main's unsend hook calls forget_message in the webhook thread, one LINE event at a time: a locked DB may hold
+# it this long, not 30 seconds (POST_1 N-9, POST_4 N1).  The exception goes up; main logs its type only.
+_BOT_WAIT_S = 5
+
+
+def _conn(timeout: float = 30) -> sqlite3.Connection:
+    """30 seconds for the jobs and Andrew's review command: the bot writes to the same file, and a lock past this
+    ends the extraction as db_busy (PRE_4 N4).  The bot's own call asks for ``_BOT_WAIT_S``."""
     c = connect_private_sqlite(
         _DB_PATH,
         isolation_level=None,
         check_same_thread=False,
         factory=_ClosingConnection,
-        timeout=30,  # the bot writes to the same file; a lock past this ends the extraction as db_busy (PRE_4 N4)
+        timeout=timeout,
     )
     c.execute("PRAGMA journal_mode=WAL")
     c.execute("PRAGMA synchronous=NORMAL")
@@ -368,6 +387,9 @@ def _valid_month_day(month, day) -> tuple[int, int] | None:
 
 def _prefilter(msg, result) -> bool:
     """Only a message with an anniversary word goes out; one with a lunar word never does."""
+    # TODO(2026-11-13 deferred): a question and its answer in two messages (「成員甲生日哪天？」 then 「3/5」) are
+    # never read together: the answer has no anniversary word and the question no date, so neither gives a
+    # candidate.  Andrew's seed list and ``jobs/anniversary_review.py add`` cover these.
     import family_extract
 
     text = str(msg.text or "")
@@ -401,9 +423,11 @@ def _person_for(raw, msg, anniversary_type: str):
         return "bad_person"
     seen = _seen_text(msg)
     if person in _SELF_WORDS:
-        # Only 「我(的)生日」 with no 「我媽」-like word anywhere: 「我媽生日」 answered as 「我」 would put the
-        # speaker's name on the mother's birthday (PRE_3 P2-I5).
-        if anniversary_type != "birthday" or not _SELF_BIRTHDAY_RE.search(seen) or _SELF_KIN_RE.search(seen):
+        # Only 「我(的)生日」 outside quote marks, with no 「我媽」-like word anywhere: 「我媽生日」 answered as 「我」
+        # would put the speaker's name on the mother's birthday (PRE_3 P2-I5), and quoted words are someone
+        # else's (POST_2 N-7).
+        own = _QUOTED_RE.sub("", seen)
+        if anniversary_type != "birthday" or not _SELF_BIRTHDAY_RE.search(own) or _SELF_KIN_RE.search(seen):
             return "self_unclear"
         alias = _clean_person(_speaker_name(msg.user_id))
         if not _person_ok(alias) or _needs_as(alias):
@@ -484,6 +508,8 @@ def _write(conn, group_id: str, rows: list[dict], result, *, now: float) -> None
         if row["source_msg_id"] in used:
             result.skip("produced_before")
             continue
+        # TODO(2026-11-13 deferred): the key holds the 稱呼 as said, so two members who each say 「我媽 5/1」 about
+        # two different mothers make one candidate: the second is a duplicate, and confirm --as names only one.
         key = (group_id, row["person"], row["anniversary_type"], row["month"], row["day"])
         if conn.execute(
             "SELECT 1 FROM anniversaries WHERE group_id=? AND person=? AND anniversary_type=? AND month=? AND day=?",
@@ -507,6 +533,11 @@ def _write(conn, group_id: str, rows: list[dict], result, *, now: float) -> None
             result.skip("duplicate")
 
 
+# The cursor's first value: the oldest kept message, so the first run is the backfill.  The push makes the same
+# row when it is first (``_save_push_counts``), so the backfill reads the same whoever makes it.
+_BACKFILL_START: tuple[int, str] = (0, "")
+
+
 def _feature(group_id: str, now: float):
     import family_extract
 
@@ -520,7 +551,7 @@ def _feature(group_id: str, now: float):
         prepare=_prepare,
         write=lambda conn, rows, result: _write(conn, group_id, rows, result, now=now),
         produced=_produced,
-        initial_cursor=lambda _now: (0, ""),  # from the oldest kept message: the backfill
+        initial_cursor=lambda _now: _BACKFILL_START,
         max_requests=EXTRACT_MAX_REQUESTS,
         max_failures=EXTRACT_MAX_FAILURES,
         message_max_chars=EXTRACT_MESSAGE_MAX_CHARS,
@@ -559,14 +590,15 @@ def _extract_quietly(*, now: float | None = None) -> None:
 
 def forget_message(group_id: str, message_id: str, *, now: float | None = None) -> int:
     """收回（2026-11-13，main 的收回分支轉來）：記進 extract_unsent，之後不再送模型；這則訊息產生的待確認
-    候選刪掉。已確認、已拒絕的不動（Andrew 確認過的照推，墓碑照擋）。回傳刪掉幾筆；例外往上丟，main 只記型別。"""
+    候選刪掉。已確認、已拒絕的不動（Andrew 確認過的照推，墓碑照擋）。回傳刪掉幾筆；例外往上丟，main 只記型別。
+    在 bot 的 webhook 執行緒裡跑：DB 被鎖住最多等 ``_BOT_WAIT_S`` 秒就放棄。"""
     import family_extract
 
     now = time.time() if now is None else float(now)
     group_id, message_id = str(group_id or ""), str(message_id or "")
     if not group_id or not message_id:
         return 0
-    with _lock, _conn() as c:
+    with _lock, _conn(timeout=_BOT_WAIT_S) as c:
         c.execute("BEGIN IMMEDIATE")
         try:
             family_extract.ensure_tables(c)
@@ -648,12 +680,40 @@ def falling_on(group_id: str, target: date) -> list[dict]:
     return rows
 
 
+def _save_push_counts(group_id: str, summary: dict, now: float) -> None:
+    """The push counts go into the cursor row's ``last_push`` for jobs/family_extract_status.py (POST_2 N-10).
+
+    Only the family main group's row: the one the status job reads, and no row for a group the extraction refuses.
+    A missing row is made where the extraction's first run makes it (``_BACKFILL_START``), so the backfill reads
+    the same; its updated_at is now, so an extraction that never runs after it still shows as not run.  ``mode``
+    is the extraction switch this run reads; the push never stops for it.  Never stops the push: the type only."""
+    try:
+        if not group_id or group_id != _family_group():
+            return
+        import family_extract
+
+        with _lock, _conn() as c:
+            family_extract.ensure_tables(c)
+            c.execute(
+                "INSERT OR IGNORE INTO extract_cursors(name, group_id, created_at, message_id, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (EXTRACT_NAME, group_id, _BACKFILL_START[0], _BACKFILL_START[1], int(now)),
+            )
+        family_extract.save_last_push(_conn, EXTRACT_NAME, group_id, {**summary, "mode": extract_mode()})
+    except Exception as exc:
+        logger.warning("anniversary push counts not saved error_type=%s", type(exc).__name__)
+
+
 def push_today_reminders(group_id: str, *, now: float | None = None) -> int:
-    """Daily launchd 跑：check D-7 / D-1 / D-day anniversaries → push."""
+    """Daily launchd 跑：check D-7 / D-1 / D-day anniversaries → push.  Returns how many went out.
+
+    The counts are kept (``_save_push_counts``): ``due`` the ones not yet pushed this year, ``pushed`` the ones
+    LINE took, ``push_ok`` whether every one due went out, and ``error`` the type when an exception stopped the
+    run (it still goes up: main logs it and exits 1).  A later run the same day writes its own counts."""
     now = time.time() if now is None else float(now)
     today = datetime.fromtimestamp(now, _TW).date()
     year = today.year
-    n_sent = 0
+    summary = {"date": today.isoformat(), "due": 0, "pushed": 0, "push_ok": True}
     # 「提到人就真 @」：紀念日是要其他人準備，Andrew 11/12 選「@ 全家」；只在家族主群 @all，其他群組照舊不 @。
     # 字是程式寫的，加上三種稱呼（2026-11-13）：家人原文裡的稱呼（抽取時對照過原文，不讀 bot 自己的回覆）、
     # 說話者說「我生日」時程式換上的本機稱呼、Andrew 用 --as／add 打的字；都要 Andrew 確認過才會在這裡推。
@@ -668,18 +728,31 @@ def push_today_reminders(group_id: str, *, now: float | None = None) -> int:
     except Exception as exc:
         logger.warning("anniversary mention failed error_type=%s", type(exc).__name__)
         everyone = []
-    for offset in REMINDER_OFFSETS:
-        target = today + timedelta(days=offset)
-        for ann in falling_on(group_id, target):
-            if already_reminded(ann["anniversary_id"], year, offset):
-                continue
-            text = _format_anniversary(ann, offset)
-            retry_key = str(uuid.uuid5(uuid.NAMESPACE_URL, f"anniversary:{ann['anniversary_id']}:{year}:{offset}"))
-            if _push(group_id, text, everyone, retry_key=retry_key):
+    try:
+        for offset in REMINDER_OFFSETS:
+            target = today + timedelta(days=offset)
+            for ann in falling_on(group_id, target):
+                if already_reminded(ann["anniversary_id"], year, offset):
+                    continue
+                summary["due"] += 1
+                text = _format_anniversary(ann, offset)
+                retry_key = str(uuid.uuid5(uuid.NAMESPACE_URL, f"anniversary:{ann['anniversary_id']}:{year}:{offset}"))
+                if not _push(group_id, text, everyone, retry_key=retry_key):
+                    summary["push_ok"] = False  # not marked: a run later today tries it again
+                    continue
+                summary["pushed"] += 1
                 mark_reminded(ann["anniversary_id"], year, offset, now=now)
-                n_sent += 1
                 logger.info("anniversary reminder sent id=%s offset=%d", ann["anniversary_id"][:8], offset)
-    return n_sent
+    except BaseException as exc:
+        summary["push_ok"] = False
+        summary["error"] = type(exc).__name__
+        raise
+    finally:
+        _save_push_counts(group_id, summary, now)
+        logger.info(
+            "anniversary push due=%d pushed=%d push_ok=%d", summary["due"], summary["pushed"], int(summary["push_ok"])
+        )
+    return summary["pushed"]
 
 
 def main_extractor(*, now: float | None = None) -> int:
@@ -742,27 +815,42 @@ def _pick_one(c, table: str, id_col: str, prefix, extra: str = "") -> sqlite3.Ro
     return rows[0]
 
 
+def _coming(month: int, day: int, today: date) -> date | None:
+    """The first day from ``today`` on (today included) that this anniversary falls on, by the push's own rule."""
+    for n in range(373):
+        day_ = today + timedelta(days=n)
+        if (month, day) in _month_days_on(day_):
+            return day_
+    return None
+
+
 def next_push(month: int, day: int, *, now: float | None = None) -> dict:
     """PRE_3 N-c: the day the 08:00 job next pushes this anniversary, found day by day with the push's own rule
-    (``_month_days_on``).  Today counts only before 08:00: the job may not have run yet."""
+    (``_month_days_on``).  Today counts only before 08:00: the job may not have run yet.
+
+    The note is about the coming time (the nearest day it falls on, today included): what is left of its three
+    pushes, or, when all three are past, that it is not pushed.  POST_2 N-8: a push past New Year is still this
+    time's (12/30 → 1/1 for a 1/2 birthday), never 「今年不推」."""
     now = time.time() if now is None else float(now)
     moment = datetime.fromtimestamp(now, _TW)
     today = moment.date()
     start = today if moment.hour < PUSH_HOUR else today + timedelta(days=1)
+    coming = _coming(month, day, today)
     for n in range(373):
         day_ = start + timedelta(days=n)
         for offset in REMINDER_OFFSETS:
             falls = day_ + timedelta(days=offset)
             if (month, day) in _month_days_on(falls):
-                notes = []
-                if offset == 1:
-                    notes.append("這次一週前那則已經過了，只剩前一天和當天")
+                if coming is not None and falls != coming:
+                    note = f"這次（{coming.isoformat()}）的三則都已經過了，不推"
+                elif offset == 1:
+                    note = "這次一週前那則已經過了，只剩前一天和當天"
                 elif offset == 0:
-                    notes.append("這次只剩當天")
-                if day_.year > today.year:
-                    notes.append("今年不推")
+                    note = "這次只剩當天"
+                else:
+                    note = ""
                 return {"date": day_.isoformat(), "offset": offset, "label": _NEXT_LABEL[offset],
-                        "falls_on": falls.isoformat(), "note": "；".join(notes)}
+                        "falls_on": falls.isoformat(), "note": note}
     return {"date": "", "offset": -1, "label": "", "falls_on": "", "note": "算不出下一次推播"}
 
 
