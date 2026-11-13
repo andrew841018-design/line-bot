@@ -27,6 +27,7 @@ from urllib3.util.retry import Retry  # noqa: E402
 
 import calendar_db  # noqa: E402
 import line_mentions  # noqa: E402
+import output_validator  # noqa: E402
 from line_push_client import (  # noqa: E402
     LinePushError,
     line_access_token,
@@ -346,16 +347,18 @@ def build_reminder_message_spec(
         if not plain_text.strip():
             return None
         if allow_mention and cfg["mention_text"] and cfg["user_id"]:
-            mention_text = validate_push_text(
-                cfg["mention_text"], source="event_reminder"
-            )
-            if not mention_text.strip():
-                return None
-            if mention_text != cfg["mention_text"]:
-                return {"kind": "text", "text": mention_text, **reminder_ref}
+            # 2026-11-13: when the @ template alone is blocked or emptied, the @ goes and the reminder
+            # (plain_text, checked above) does not -- it used to become the blocked sentence or nothing.
+            mention_check = output_validator.validate_outbound_text(cfg["mention_text"])
+            if not mention_check.ok or mention_check.text != cfg["mention_text"]:
+                logger.info(
+                    "one-off event reminder @ dropped: the template got another verdict (%s)",
+                    mention_check.reason or "changed",
+                )
+                return {"kind": "text", "text": plain_text, **reminder_ref}
             return {
                 "kind": "mention",
-                "text": mention_text,
+                "text": cfg["mention_text"],
                 "placeholder": cfg["placeholder"],
                 "user_id": cfg["user_id"],
                 "fallback_text": plain_text,
@@ -388,6 +391,17 @@ def build_reminder_message_spec(
         if fallback_text != line_mentions.text_with_plain_mentions(
             text, targets, plain_labels
         ):
+            return {"kind": "text", "text": fallback_text, **reminder_ref}
+        # 2026-11-13: push_messages validates the template itself on the way out, and its @ line
+        # differs from the plain twin's (resolved {p1} first, unresolved names after them), so it
+        # can get another verdict and go out as the blocked sentence.  Then the @ goes, the
+        # reminder does not.  Reason only in the log: never the family's words.
+        template_check = output_validator.validate_outbound_text(message["text"])
+        if not template_check.ok or template_check.text != message["text"]:
+            logger.info(
+                "event reminder @ dropped: the template got another verdict (%s)",
+                template_check.reason or "changed",
+            )
             return {"kind": "text", "text": fallback_text, **reminder_ref}
         return {
             "kind": "textV2",
