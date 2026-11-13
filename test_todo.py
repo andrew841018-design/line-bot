@@ -263,16 +263,20 @@ def test_a_quota_error_in_one_group_does_not_stop_the_next(temp_todo_db, named, 
     assert sent == ["GRP2"]
 
 
-def test_owners_on_overdue_lines_are_pinged_too_in_the_order_the_lines_appear(temp_todo_db, named):
+def test_owners_are_pinged_in_the_order_the_lines_appear_and_overdue_ones_not_at_all(temp_todo_db, named):
+    """The final 11/12 version pinged overdue owners too.  Since 2026-11-13 (Andrew 選 B) a todo is pushed
+    once, on its day: an overdue one expires instead, so it is neither printed nor pinged."""
     import todo
 
     today = datetime.now(ZoneInfo("Asia/Taipei")).date()
     todo.insert_todo("GRP", "繳學費", "U_A", (today - timedelta(days=2)).isoformat())  # overdue
     todo.insert_todo("GRP", "買菜", "U_B", today.isoformat())  # due today
+    todo.insert_todo("GRP", "交報告", "U_A", today.isoformat())  # due today, inserted after 買菜
     assert todo.push_daily_reminders("GRP") == 2
     [call] = named
     subs = call["messages"][0]["substitution"]
-    assert [sub["mentionee"]["userId"] for sub in subs.values()] == ["U_B", "U_A"]  # due lines come first, not id order
+    assert [sub["mentionee"]["userId"] for sub in subs.values()] == ["U_B", "U_A"]  # line order, not id order
+    assert "繳學費" not in call["messages"][0]["text"]
 
 
 def test_a_mention_that_cannot_be_built_never_stops_the_todo_push(temp_todo_db, named, monkeypatch):
