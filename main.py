@@ -1446,14 +1446,24 @@ def _enforce_new_value_reply(
             return ""
     # 2026-11-06 Andrew: 「不要講這種空話」.  The contract no longer asks for it; this is the
     # net under that, and for what older turns in the chat may teach the model.
+    # 2026-11-12 (maintenance report D): also the sentences that only hand the question back.
+    handback: dict = {}
     try:
         kept = (reply_text if reply_text in _FIXED_GUARD_REPLIES
-                else reply_policy.strip_missing_data(reply_text, request_text or ""))
+                else reply_policy.strip_missing_data(
+                    reply_text, request_text or "", addressed=addressed, stats=handback))
     except Exception as exc:
         logger.warning("missing-data guard skipped error_type=%s", type(exc).__name__)
         kept = reply_text
+    if handback.get("errors"):
+        logger.warning("hand-back guard skipped sentences=%d", handback["errors"])
     if kept != reply_text:
-        logger.info("reply had nothing to say before=%d after=%d", len(reply_text), len(kept))
+        # Counts only.
+        logger.info("reply had nothing to say before=%d after=%d kinds=%s", len(reply_text), len(kept), handback)
+    elif handback:
+        # Marked but kept as it was: a premise further down, or sent as before (review post-4 F4).
+        logger.info("hand-back guard kept before=%d kinds=%s", len(reply_text), handback)
+    if kept != reply_text:
         if not kept:
             return ""
         reply_text = kept
@@ -1563,6 +1573,24 @@ def _enforce_new_value_reply(
                 "", addressed=addressed, numbers_dropped=regulation_dropped
             )
         reply_text = guards.text
+        if guards.nonanswer and reply_policy.handback_guard_on():
+            # B3 took a hand-back, a pronoun guess or a recap out of a sentence and kept the rest, which may now open with what
+            # it could not see or be a search or seller line on its own (maintenance report D,
+            # reviews 2 #5 and 3 #9): the same check again on what is left.
+            second: dict = {}
+            try:
+                before = len(reply_text)
+                reply_text = reply_policy.strip_missing_data(
+                    reply_text, request_text or "", addressed=addressed, stats=second)
+                if second:
+                    logger.info("hand-back second pass before=%d after=%d kinds=%s", before, len(reply_text), second)
+            except Exception as exc:
+                logger.warning("hand-back second pass skipped error_type=%s", type(exc).__name__)
+            if not reply_text:
+                # The same exit as B3 emptying it above (review post-4 F3).
+                return reply_guards.unconfirmed_regulation_reply(
+                    "", addressed=addressed, numbers_dropped=regulation_dropped
+                )
     try:
         import restatement_judge
 
@@ -1684,6 +1712,9 @@ def _guard_generated_reply(
     removed; a reply that was nothing else is dropped like the others.
     ``speaker`` is the sender's name when the caller knows it.
     2026-10-28: a date claim ``_date_claims_unbacked`` rejects drops the reply too.
+    TODO(2026-11-12 deferred, maintenance report D review 2 #10): ``reply_policy.strip_missing_data``
+    (no data, a picture it cannot see, search it／ask the seller) does not run here; replay these
+    paths and pass ``addressed`` before adding it.
     2026-11-07: so does the bot's own silence instruction printed anywhere in it, unless whoever
     asked brought up empty strings: the model chose silence and what stands next to it is its reason.
     """

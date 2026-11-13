@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import bisect
+import os
 import re
 import unicodedata
 
@@ -2955,10 +2956,169 @@ _SENDS_TO_LOOK_RE = re.compile(
     r"|自己(?:再|去|到|上)?[^。！？!?\n]{0,10}?(?<![檢調審])查(?!過|到|了)"
 )
 _ASKS_WHERE_RE = re.compile(r"怎麼查|哪裡查|哪查|哪裡看|在哪看|網址|連結")
+# 2026-11-12 (maintenance report D): what still reached the family after 11/06.  A photo the bot
+# could not see came back as a search-it-yourself-or-ask-the-maker line, and nobody had asked it
+# when it said it had no feature to remind someone.  A sentence goes only when it is nothing else: each
+# part of it is such a hand-back, the 「若您想知道…」 lead-in, an 「無法確認…」 riding along, or filler.
+# What to ask (「問門市有沒有現貨」), a named place to look (「…」, an agency, a site) and anything
+# about care (doctors, pharmacists, 就醫) are not hand-backs: those are answers or safety advice.
+# Replayed on the replies the bot sent before (Data_engineer/ops/state/line_bot_empty_talk_20261112/).
+# Index: _HANDBACK_SEARCH_RE／_NAMED_PLACE_RE search it yourself; _HANDBACK_VENDOR_RE ask the seller;
+# _CANNOT_SEE_RE／_CANNOT_SEE_BARE_RE／_RESEND_RE the picture it cannot see; _NO_FEATURE_RE a feature
+# it lacks; _HANDBACK_LEAD_RE／_CANNOT_TELL_RE／_HANDBACK_FILLER_RE what rides along; _CARE_RE／
+# _ACK_TOKEN_RE／_HEADING_RE what does not open a reply; _ASKS_*／_QUESTION_LINE_RE what the family asked for.
+# Three word lists, three jobs: _CARE_RE keeps a whole sentence out and, like _SAFETY_RE (which also
+# keeps a seller line next to a scam), sends an opening it-cannot-see reply as before; _KEEP_AS_IS_RE
+# only does that last thing.  Do not merge them.
+# LINE_BOT_HANDBACK_GUARD=0 turns these off and leaves the 11/06 rules on.
+_LOOKUP_VERB = r"(?:搜尋|搜一下|搜搜看|查詢|查一下|查查|查看看|(?i:google)|估狗)(?![過到了後])"
+_SEARCH_VERB = r"(?:搜尋|搜一下|搜搜看|(?i:google)|估狗)(?![過到了後])"
+_ONLINE = r"(?:上網|到網路上|在網路上|去網路上)"
+# 「建議查詢國健署的…」 is a pointer: without 自己／上網 only searching counts.  What a search found
+# (「上網查詢後發現…」「搜尋過的人都說」) and the bot's own search (「我上網查詢」) are not hand-backs.
+_HANDBACK_SEARCH_RE = re.compile(
+    rf"(?:(?<!我)(?<!咪寶)(?:(?:自己|自行)(?:再|先|去)?{_ONLINE}?|{_ONLINE}){_LOOKUP_VERB}"
+    rf"|(?:建議|可以|不妨|最好|請|記得)(?:您|你|妳|大家)?(?:先|再|直接)?\s{{0,3}}{_SEARCH_VERB})"
+    r"(?:一下|看看)?(?P<obj>(?:(?!的時候|的人|發現|結果)[^，,；;。！？!?\n]){0,20})"
+)
+# A model number or a platform (「ABC-123」「PTT」), 「…」《…》, a site, an agency: somewhere to look.
+_NAMED_PLACE_RE = re.compile(r"[「『“\"《]|https?://|署|局|官網|網站|系統|平台|地圖|[A-Za-z0-9]{2,}")
+_VENDOR_NAME = r"(?:廠商|製造商|原廠|品牌方?|業者|賣家|代理商|經銷商|通路|商家|賣場|店家|店員|客服|官方|專櫃|門市)"
+_VENDOR = (
+    rf"(?:該|這家|那家)?(?:(?![^，,；;。！？!?\n的]{{0,5}}(?:銀行|發卡))[^，,；;。！？!?\n的]{{1,6}}的)?{_VENDOR_NAME}"
+    rf"(?:(?:或是|或者|或|、|和|及|/)?(?:該|這家|那家)?{_VENDOR_NAME}){{0,3}}"
+)
+# Only the ask: what to ask about is left over, so 「問門市有沒有現貨」 stays.
+_HANDBACK_VENDOR_RE = re.compile(
+    rf"(?:直接|自行|自己|先|再)?(?:打電話|致電)?(?:諮詢|詢問|洽詢|請教|問問?|聯絡|聯繫|致電|打給|洽|找)(?:一下)?{_VENDOR}"
+    r"(?:(?:比較|最)(?:準|快|清楚))?"
+    rf"|(?:直接|自行|自己|先|再)?(?:向|跟|和|與){_VENDOR}(?:確認|詢問|洽詢|諮詢|問清楚|查詢)"
+)
+_IMAGE = r"(?:圖片|照片|相片|截圖|圖檔|附圖|圖)"
+_CANNOT_SEE_VERB = (
+    r"(?:看不到|看不見|看不清楚|沒看到|沒有看到|沒收到|沒有收到|讀不到|打不開"
+    r"|無法(?:看到|看見|讀取|開啟|打開|顯示|辨識|載入)|沒辦法(?:看到|看見|讀取|開啟|打開|載入))"
+)
+_SENT_IMAGE = (
+    rf"(?:你|妳|您|大家)?(?:傳|分享|貼|上傳)?(?:的|來的)?(?:這|那)?(?:張|些|個)?{_IMAGE}"
+    r"(?:的)?(?:內容|畫面|文字|字)?"
+)
+_SEE_ADVERB = r"(?:這邊|目前|暫時|還是|還|也|好像|一直)"
+# The bot itself: 「我目前還看不到圖片」「這張圖我這邊沒收到」.
+_CANNOT_SEE_RE = re.compile(
+    rf"(?:我|咪寶){_SEE_ADVERB}{{0,3}}{_CANNOT_SEE_VERB}{_SENT_IMAGE}"
+    rf"|{_SENT_IMAGE}(?:我|咪寶){_SEE_ADVERB}{{0,3}}{_CANNOT_SEE_VERB}"
+)
+# Nobody, at the start of a clause; not in a question, where it asks the family (「看不到照片？試試…」),
+# and 「照片看不到可能是過期了」 is a how-to.
+_CANNOT_SEE_BARE_RE = re.compile(
+    rf"(?:^|[，,：:；;、])\s*(?:[•・\-]\s*)?(?:抱歉|不好意思|可惜)?{_SEE_ADVERB}{{0,3}}(?:因為|由於)?"
+    rf"{_CANNOT_SEE_VERB}{_SENT_IMAGE}"
+)
+_QUESTION_END_RE = re.compile(r"(?:[？?]|嗎|呢)[\s。！？!?]*$")
+# Asking for it again goes with not seeing it (9/19 「不請人重貼」, 11/07 圖片失敗不送字).
+_RESEND_RE = re.compile(
+    r"(?:再|重新)(?:傳|貼)(?:一次|一遍)?|重傳|重貼|傳一次|(?:貼|傳)(?:出來|上來|過來)"
+    r"|把[^，,；;。！？!?\n]{0,12}?(?:貼|傳)(?:出來|上來|過來|一次)"
+)
+# Unasked, 「我沒有提醒某人的功能」 is noise; asked 「你能不能…」, it is the answer (``addressed``).
+# 「我沒用過這個功能」 is not about the bot's features.
+_NO_FEATURE_RE = re.compile(
+    r"(?:我|咪寶)(?:目前|現在|這邊|暫時|還|並)?(?:沒有|沒|不具備|不支援)"
+    r"(?!用過|試過|看過|開過|開|注意|想到|發現|聽過)"
+    r"(?:這個|這種|這項|那個|這|那|相關|任何|[^。！？!?\n，,]{1,12}?的)?(?:功能|權限)"
+)
+# 「若您想知道X…」 restates the question; without 若／如果 only a vague 「想知道更多的話」 does
+# (「想知道有沒有現貨，可以問問門市」 says what to ask, like 「可以問問門市有沒有現貨」).
+_HANDBACK_LEAD_RE = re.compile(
+    r"(?:若|如果|要是|假如)(?:您|你|妳|大家)?想(?:要)?(?:進一步|更)?(?:知道|了解)"
+    r"(?:(?!的話|但|不過|可是|只是|一般|通常|大多|多半)[^，,；;。！？!?\n]){0,40}(?:的話)?"
+    r"|(?:^|(?<=[，,：:；;]))\s*(?:您|你|妳|大家)?想(?:要)?(?:進一步|更)?(?:知道|了解)"
+    r"(?:更多|詳細|細節|詳情|相關(?:資訊|資料|內容|細節)?)?(?:的話)?(?=\s*(?:[，,；;。！？!?]|$))"
+)
+# Only alongside a hand-back: alone it is the link rules' note (「內容我無法確認」).  It stops at
+# advice: 「不能確定的話先別吃」.
+_CANNOT_TELL_RE = re.compile(
+    r"(?:我|咪寶)?(?:這邊|目前|暫時|也|因此|所以)?(?:無法|沒辦法|不能|不太能)"
+    r"(?:確認|確定|判斷|得知|核實|查證|回答|辨識|看出|提供)"
+    r"(?:(?!的話|之前|先別|不要|別|但|不過|可是|只是|一般|通常|大多|多半)[^，,；;。！？!?\n]){0,30}"
+)
+# 「可以」 only before a hand-back (two blanks are one taken out): 「可以退喔」 is an answer.
+_HANDBACK_FILLER_RE = re.compile(
+    r"(?:也)?可以(?=\s{2,}|\s{0,2}(?:先|再|直接|自己|自行)?\s{0,2}(?:上網|到網路上|在網路上|去網路上|搜|查|問|詢問"
+    r"|諮詢|洽|聯絡|聯繫|致電|打給|找|跟|向|傳|貼|(?i:google)|估狗))"
+    r"|建議|不妨|最好|記得|請|您|你|妳|大家|自己|自行|或是|或者|或|也|再|先|直接|然後|所以|因此"
+    r"|不過|但是|但|可是|另外|而且|並|的話|好的|好喔|收到|了解|沒問題|哈囉|(?i:ok)|嗯+|嗨+"
+    r"|囉|喔|哦|唷|喲|呢|啦|耶|吧|嗎|哈|抱歉|不好意思"
+)
+# TODO(2026-11-12 deferred, maintenance report D reviews): a reply that is only a care referral is
+# sent (PLAN §5, Andrew's call); a care word anywhere keeps the whole sentence (review 1 #10);
+# 「自己…查」 drops a reply opening with it while 「自行…查詢」 goes alone (review 1 #11); these words
+# are kept apart from B3's (review 2 #5); _ACK_TOKEN_RE and the filler words differ (post review 4
+# F5); a first-aid step without a keyword (「先不要移動他」) does not keep a reply (post review 1 I1).
+_119 = r"(?<![0-9０-９])(?:119|１１９)(?![0-9０-９])"
+_CALL_VERB = r"(?:打給|撥給|撥打|聯絡|聯繫|致電|通知|打|撥|叫|報)"
+_CALL_FOR_HELP = rf"{_CALL_VERB}\s{{0,2}}(?:{_119}|救護車)"
+# 「中正路 119 號」「追劇中毒」 are not about care.
+_CARE_RE = re.compile(
+    rf"醫師|醫生|藥師|營養師|護理師|醫院|診所|就醫|就診|送醫|看醫生|急診|{_CALL_FOR_HELP}|救護車|獸醫|衛生局|毒物|藥局"
+)
+# Fraud and a stolen card: 「請致電客服」 there is what to do, not a hand-back (review 2 #6).
+_SAFETY_RE = re.compile(
+    rf"{_CALL_VERB}\s{{0,2}}(?:165|110|１６５|１１０)(?![0-9０-９])"
+    r"|反詐騙|詐騙|被騙|盜刷|盜用|掛失|停卡|帳號被盜|個資外洩|報警|報案|假冒|冒充|釣魚|檢察官|監管帳戶|召回|下架|瑕疵"
+)
+# A line that only acknowledges, a heading or a lead-in (「好的，以下說明：」) does not open a reply,
+# and is no reply left over; 「可以。」「有！」 are answers (review 3 #4, #13).
+# One token at a time: a nested repeat here backtracked exponentially on 「哈哈哈…吧」 (post review 3 #1).
+_ACK_TOKEN_RE = re.compile(r"好的|好喔|好哦|好|收到|了解|沒問題|(?i:ok)|嗯|嗨|哈囉|哈|喔|哦|囉|耶|呢|啦|唷|呀|啊|了")
+_HEADING_RE = re.compile(r"^\s*(?:\*\*[^*\n]{1,30}\*\*|#{1,6}\s*[^\n]{1,30})\s*$")
+# A reply that opens with a picture it cannot see goes as before when it says where to go, whom to
+# call or what not to hand over (review 4 #3).  Wide on purpose: a wrong hit only sends what was sent
+# before 11/12.  Places and people, not topics: 藥／醫 would undo the 11/12 fix.
+_KEEP_AS_IS_RE = re.compile(
+    r"牙醫|中醫|看醫|(?:看|掛|轉|去|到)[\u4e00-\u9fff]{0,3}科(?![技學目系幻])|門診|掛號|警察|警局|派出所|轉帳|匯款|驗證碼|ATM|提款機"
+    r"|專線|生命線|張老師|消防|瓦斯公司|CPR|AED|心肺復甦|哈姆立克"
+    r"|匯錢|別匯|不要匯|密碼|不要點|別點|誤吞|誤食|呼吸困難|發紫|昏迷|抽搐|叫不醒"
+    r"|自殺|輕生|心理師|諮商|社工|封鎖|檢舉|一氧化碳|火災|瓦斯|帳號|遠端|解除分期|威脅|停藥|孕婦|不能跟酒"
+    r"|(?<![0-9０-９])(?:110|113|165|1925|1980|1995|１１０|１１３|１６５|１９２５|１９８０|１９９５)(?![0-9０-９])"
+)
+# Down a run of warnings, or a list under a scam, a seller line is still what to do (post review 2 #5).
+_WARNING_RE = re.compile(r"不要|千萬|勿|小心|提防|^\s*(?:\d+[.、)]|[•・\-])")
+_QUESTION_LINE_RE = re.compile(r"[？?]|嗎|呢|怎麼|哪|什麼|誰|能不能|可不可以|有沒有")
+# What the family asked makes the hand-back the answer.  Their own words only, and in a burst
+# only the last line (review 3 #6, #7).
+_ASKS_WHO_RE = re.compile(
+    r"問誰|找誰|聯絡誰|向誰|跟誰(?:問|確認|聯絡|說)|哪裡問|去哪問|怎麼問|客服|怎麼聯絡|聯絡方式"
+    r"|[問找](?:廠商|店家|賣家|原廠|門市)|退貨|退款|換貨|保固|維修|報修|怎麼申請"
+)
+# Not 提醒: 「幫我提醒某人」 is what the 11/10 reply answered unasked.
+_ASKS_ABOUT_FEATURE_RE = re.compile(
+    r"(?:你|咪寶)[^。？?\n]{0,6}(?:有沒有|能不能|可不可以|會不會|可以|有)[^。？?\n]{0,10}(?:功能|權限)"
+    r"|(?:功能|權限)[^。？?\n]{0,4}(?:嗎|[？?])|(?:能不能|可不可以|有沒有辦法)設"
+)
+_ASKS_SEARCH_RE = re.compile(
+    r"怎麼搜|搜什麼|關鍵字(?:是什麼|是啥|要打什麼|怎麼打)|(?:用|打)什麼關鍵字"
+    r"|(?:去)?哪(?:裡)?(?:搜|找|查)(?![^。？?\n]{0,8}?不到)(?!到|得到|過)"
+    r"|怎麼(?:找|查)(?![^。？?\n]{0,8}?不到)(?!到|得到|過)|在哪看|哪裡看"
+    r"|(?:網址|連結)(?:是什麼|是啥|在哪|有沒有|呢)|給我(?:網址|連結)"
+)
+_IMAGE_ASKED = r"(?:圖片|照片|相片|截圖|附圖|畫面)"
+_IMAGE_TROUBLE = (
+    r"(?:看不到|看不見|打不開|沒顯示|顯示不出|跑不出|載不出|傳不上|傳不出|收不到|沒收到|沒有收到|沒看到|沒有看到|不見)"
+)
+_ASKS_ABOUT_IMAGES_RE = re.compile(
+    rf"{_IMAGE_ASKED}(?:我|也|都|還|一直|這邊){{0,3}}{_IMAGE_TROUBLE}"
+    rf"|{_IMAGE_TROUBLE}(?:你們|妳們|你|妳|您|大家)?(?:傳的|傳來的|分享的|貼的|的)?{_IMAGE_ASKED}"
+)
 # A URL is part of its sentence: 「?ref=1」 ends nothing.
 _REPLY_SENTENCE_RE = re.compile(r"(?:https?://\S+|[^。！？!?\n])+[。！？!?]*")
 # Less than this left is no reply: a bullet mark, 「另外，」.
 _MIN_REPLY_WORDS = 8
+# After only search／seller lines went: 「可以退喔！」 is a reply (review 1 #5).
+_MIN_ALONE_REPLY_WORDS = 3
+# What is left of a sentence once its hand-back parts are blanked: less is no content.
+_MIN_LEFT_WORDS = 2
 
 
 def _silence_line(line: str) -> str:
@@ -2978,7 +3138,137 @@ def has_printed_silence(text: str | None, request: str = "") -> bool:
     ) and not _ASKS_ABOUT_EMPTY_RE.search(_user_words(request))
 
 
-def strip_missing_data(text: str | None, request: str = "") -> str:
+def _word_count(text: str) -> int:
+    return len(re.sub(r"[\W_]+", "", text))
+
+
+def _ack_only(text: str) -> bool:
+    return bool(_ACK_TOKEN_RE.search(text)) and not _word_count(_ACK_TOKEN_RE.sub("", text))
+
+
+# 「可以。」「快報警！」 answer as they stand; 「另外，」 does not (post review 3 #6, #8).
+_CONNECTIVE_ONLY_RE = re.compile(r"[\W_]*(?:另外|不過|但是|但|所以|然後|而且)[\W_]*")
+
+
+def _complete_answer(text: str) -> bool:
+    text = text.strip()
+    return bool(text) and text[-1] in "。！!？?" and bool(_word_count(text)) and not _CONNECTIVE_ONLY_RE.fullmatch(text)
+
+
+_MISSING, _WHOLE, _ALONE = "missing", "whole", "alone"
+
+
+def _hands_back(sentence: str, *, addressed: bool, look: bool, ask: bool, images: bool) -> str | None:
+    """How a sentence that only hands the question back goes (2026-11-12, maintenance report D).
+
+    ``_WHOLE``: it cannot see the picture, or (nobody ``addressed`` the bot) has no such feature;
+    the reply is written around that, as around 「無法確認」.  ``_ALONE``: search it, ask the
+    seller; only that sentence goes.  ``None``: something else is in it, it is about care, or the
+    family asked for exactly that (``look``: where to search, ``ask``: whom to ask, ``images``:
+    about pictures not showing).
+    """
+    if _CARE_RE.search(sentence):
+        return None
+    # A phone number or an address in it: the contact guard after this must still see it (post review 3 #2).
+    if unbacked_contact_details(sentence, (), ()):
+        return None
+    seen = [m.span() for m in _CANNOT_SEE_RE.finditer(sentence)]
+    if not _QUESTION_END_RE.search(sentence):
+        seen += [m.span() for m in _CANNOT_SEE_BARE_RE.finditer(sentence)]
+    # Asked about pictures not showing, 「我也看不到」 is part of the answer, not a hand-back.
+    whole = [] if images else seen
+    if not addressed:
+        whole += [m.span() for m in _NO_FEATURE_RE.finditer(sentence)]
+    spans = list(whole)
+    if not look:
+        spans += [
+            m.span() for m in _HANDBACK_SEARCH_RE.finditer(sentence)
+            if not _NAMED_PLACE_RE.search(m.group("obj"))
+        ]
+    if not ask:
+        spans += [m.span() for m in _HANDBACK_VENDOR_RE.finditer(sentence)]
+    if not spans:
+        return None
+    riders = (_HANDBACK_LEAD_RE, _CANNOT_TELL_RE) + ((_RESEND_RE,) if seen else ())
+    spans += [m.span() for pattern in riders for m in pattern.finditer(sentence)]
+    if images:
+        spans += seen
+    rest = list(sentence)
+    for start, end in spans:
+        rest[start:end] = " " * (end - start)
+    if _word_count(_HANDBACK_FILLER_RE.sub("", "".join(rest))) >= _MIN_LEFT_WORDS:
+        return None
+    return _WHOLE if whole else _ALONE
+
+
+def _opens(sentence: str) -> bool:
+    return not (
+        _ack_only(sentence) or _HEADING_RE.match(sentence) or sentence.rstrip().endswith(("：", ":"))
+    )
+
+
+def handback_guard_on() -> bool:
+    """``LINE_BOT_HANDBACK_GUARD`` is not 0／false／no／off (2026-11-12, maintenance report D)."""
+    return os.environ.get("LINE_BOT_HANDBACK_GUARD", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _keeps_as_is(sentence: str) -> bool:
+    return bool(_CARE_RE.search(sentence) or _SAFETY_RE.search(sentence) or _KEEP_AS_IS_RE.search(sentence))
+
+
+def _classify_sentences(value: str, request: str, addressed: bool, stats: dict) -> tuple[list, dict[int, str]]:
+    """The reply's sentences and, by start, how each one that has nothing to say goes."""
+    # The raw request for the 11/06 rule, as before (so it stays exactly as it was); the family's own
+    # words for the new ones, so a shared link or the bot's wrappers do not open them (review 3 #6).
+    told_to_look = bool(_ASKS_WHERE_RE.search(request or ""))
+    words = _user_words(request)
+    if not addressed:
+        # A burst holds everyone's lines: what was asked is the last question (review 4 #8).
+        lines = [line for line in words.splitlines() if line.strip()]
+        words = next((line for line in reversed(lines) if _QUESTION_LINE_RE.search(line)), lines[-1] if lines else "")
+    asked_whom = bool(_ASKS_WHO_RE.search(words))
+    hand_backs = handback_guard_on()
+    found = [m for m in _REPLY_SENTENCE_RE.finditer(value) if m.group(0).strip()]
+    kinds: dict[int, str] = {}
+    previous, warned = "", False
+    for match in found:
+        sentence = match.group(0)
+        # A stolen card or a scam: 「請致電客服」 next to it is what to do, also down a run of warnings
+        # or a list under it (review 2 #6, review 3 #10, post review 2 #5).
+        fraud = bool(_SAFETY_RE.search(sentence) or _SAFETY_RE.search(previous) or warned)
+        warned = bool(_SAFETY_RE.search(sentence)) or (warned and bool(_WARNING_RE.search(sentence)))
+        previous = sentence
+        if _MISSING_DATA_RE.search(sentence) or (not told_to_look and _SENDS_TO_LOOK_RE.search(sentence)):
+            kinds[match.start()] = _MISSING
+            continue
+        if not hand_backs:
+            continue
+        try:
+            kind = _hands_back(
+                sentence,
+                addressed=addressed or bool(_ASKS_ABOUT_FEATURE_RE.search(words)),
+                look=bool(_ASKS_SEARCH_RE.search(words)),
+                ask=asked_whom or fraud,
+                images=bool(_ASKS_ABOUT_IMAGES_RE.search(words)),
+            )
+        except Exception:  # the 11/06 rules above keep working; the caller logs the count
+            stats["errors"] = stats.get("errors", 0) + 1
+            kind = None
+        if kind:
+            kinds[match.start()] = kind
+    return found, kinds
+
+
+def _without(value: str, found: list, drop) -> str:
+    for match in reversed(found):
+        if drop(match):
+            value = value[:match.start()] + value[match.end():]
+    return re.sub(r"\n{3,}", "\n\n", value).strip()
+
+
+def strip_missing_data(
+    text: str | None, request: str = "", *, addressed: bool = True, stats: dict | None = None,
+) -> str:
     """``text`` without the sentences saying it has no data or sending the reader to look.
 
     ``""`` when the reply opens with one: all it had to say is that it could not check, and what
@@ -2987,22 +3277,75 @@ def strip_missing_data(text: str | None, request: str = "") -> str:
     ``""`` too when it prints its own silence instruction anywhere.
     ``request``: what was asked; someone asking where to look gets told, and someone asking about
     empty strings gets the answer.
+    2026-11-12 (maintenance report D, reviews 1–4): sentences that only hand the question back go
+    too (``_hands_back``).
+    - 「建議上網搜尋」「直接諮詢廠商」 go alone wherever they stand; three characters left are then
+      a reply (「可以退喔！」) unless they only acknowledge.
+    - A picture it cannot see, or (nobody ``addressed`` the bot) a feature it lacks, is what the rest
+      is written around: opening the reply it drops it like 「無法確認」, unless the reply says where
+      to go or whom to call (``_keeps_as_is``): then it goes as before, the premise still said,
+      without the no-data and hand-back sentences.  Further down it stays while something follows it
+      and goes when nothing does.
+    - The opening is the first sentence marked as having nothing to say or, before it, one that is
+      not an acknowledgement, a heading or a lead-in ending in 「：」.
+    With ``LINE_BOT_HANDBACK_GUARD=0`` none of this: the rules as they were on 11/06.
+    ``stats`` receives counts only: sentences of each kind, ``errors``, ``kept_for_safety``.
     """
     value = text or ""
     if has_printed_silence(value, request):
         return ""
-    told_to_look = bool(_ASKS_WHERE_RE.search(request or ""))
-    found = [m for m in _REPLY_SENTENCE_RE.finditer(value) if m.group(0).strip()]
-    bad = [
-        m for m in found
-        if _MISSING_DATA_RE.search(m.group(0))
-        or (not told_to_look and _SENDS_TO_LOOK_RE.search(m.group(0)))
-    ]
-    if not bad:
+    stats = {} if stats is None else stats
+    found, kinds = _classify_sentences(value, request, addressed, stats)
+    if not kinds:
         return value
-    if bad[0] is found[0]:
+    for kind in kinds.values():
+        stats[kind] = stats.get(kind, 0) + 1
+    missing = {start for start, kind in kinds.items() if kind == _MISSING}
+    if not handback_guard_on():  # exactly as before 11/12 (review 4 #5)
+        return _as_on_1106(value, found, missing)
+    try:
+        return _strip_hand_backs(value, found, kinds, missing, stats)
+    except Exception:  # new rules that fail leave the 11/06 ones (post review 2 #8)
+        stats["errors"] = stats.get("errors", 0) + 1
+        return _as_on_1106(value, found, missing)
+
+
+def _as_on_1106(value: str, found: list, missing: set) -> str:
+    """strip_missing_data as it was before 11/12: the first sentence decides; eight characters left."""
+    if not missing:
+        return value
+    if found[0].start() in missing:
         return ""
-    for match in reversed(bad):
-        value = value[:match.start()] + value[match.end():]
-    value = re.sub(r"\n{3,}", "\n\n", value).strip()
-    return value if len(re.sub(r"[\W_]+", "", value)) >= _MIN_REPLY_WORDS else ""
+    value = _without(value, found, lambda m: m.start() in missing)
+    return value if _word_count(value) >= _MIN_REPLY_WORDS else ""
+
+
+def _strip_hand_backs(value: str, found: list, kinds: dict, missing: set, stats: dict) -> str:
+    """The 11/12 rules on a classified reply.  Never more than the 11/06 rules would send: nothing when
+    they send nothing, else those sentences or fewer (post reviews 1–4)."""
+    if not _as_on_1106(value, found, missing):
+        return ""
+    opening = next(
+        (m for m in found
+         if kinds.get(m.start()) in (_MISSING, _WHOLE) or (m.start() not in kinds and _opens(m.group(0)))),
+        None,
+    )
+    if opening is not None and kinds.get(opening.start()) in (_MISSING, _WHOLE):
+        # Written around what it could not do: nothing, unless it says where to go, whom to call or what
+        # not to do; then as 11/06 sent it, without the hand-backs (review 3 (c), post reviews 1–3).
+        if not any(m.start() not in kinds and _keeps_as_is(m.group(0)) for m in found):
+            return ""
+        stats["kept_for_safety"] = 1
+        return _without(value, found, lambda m: kinds.get(m.start()) in (_MISSING, _ALONE))
+    # Further down, a picture it cannot see is the premise of what follows it (review 4 #2).
+    premises, content_after = set(), False
+    for match in reversed(found):
+        kind = kinds.get(match.start())
+        if kind is None and _opens(match.group(0)):
+            content_after = True
+        elif kind == _WHOLE and content_after:
+            premises.add(match.start())
+    value = _without(value, found, lambda m: m.start() in kinds and m.start() not in premises)
+    if _ack_only(value):
+        return ""
+    return value if _word_count(value) >= _MIN_ALONE_REPLY_WORDS or _complete_answer(value) else ""

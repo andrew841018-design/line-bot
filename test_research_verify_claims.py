@@ -811,7 +811,7 @@ def test_a_url_is_part_of_its_sentence():
 def test_a_pretend_search_still_takes_the_whole_reply(monkeypatch):
     monkeypatch.setenv("LINE_BOT_RESTATEMENT_JUDGE", "0")
     dropped = []
-    monkeypatch.setattr(main.reply_policy, "strip_missing_data", lambda *a: dropped.append(a) or a[0])
+    monkeypatch.setattr(main.reply_policy, "strip_missing_data", lambda *a, **k: dropped.append(a) or a[0])
     assert main._enforce_new_value_reply(
         "輝達今天大跌13%。我查過沒有相關報導。", source_text="合成", request_text="合成",
         context=[], addressed=False,
