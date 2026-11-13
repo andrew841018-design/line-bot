@@ -1,8 +1,14 @@
-"""Feature D tests — anniversary extractor + reminder (Andrew 2026-05-25)."""
+"""Feature D tests — anniversary reminders (Andrew 2026-05-25).
 
+The 2026-11-13 extraction, the candidates and jobs/anniversary_review.py are tested in test_anniversary_extract.py.
+"""
+
+import json
 import os
 import tempfile
+import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -37,6 +43,7 @@ def test_init_db_creates_tables(temp_anniv_db):
         ]
     assert "anniversaries" in tables
     assert "anniversary_reminders_sent" in tables
+    assert "anniversary_candidates" in tables  # 2026-11-13: what extraction finds waits here for Andrew
 
 
 def test_insert_and_get_anniversary(temp_anniv_db):
@@ -127,12 +134,6 @@ def test_main_extractor_requires_group_id():
         assert anniversary.main_extractor() == 1
 
 
-def test_extract_from_text_empty():
-    import anniversary
-    assert anniversary.extract_from_text("") == []
-    assert anniversary.extract_from_text("   ") == []
-
-
 # ── 2026-11-12 「提到人就真 @」: 紀念日 @ 全家（Andrew 選的），只在家族主群 ─────────────────────────
 # Synthetic ids and names only; the push goes to conftest's recorder, the token is a stand-in.
 
@@ -213,24 +214,6 @@ def test_a_failed_anniversary_push_is_not_marked_and_the_next_row_still_goes(tem
     assert [anniversary.already_reminded(aid, year, 0) for aid in (first, second)].count(True) == 1
 
 
-def test_the_sweep_skips_the_bots_own_replies(temp_anniv_db, monkeypatch):
-    import anniversary
-    import memory
-
-    memory.log_raw_message("GRP_FAMILY", "m_member", "U_A", "成員甲 3/5 生日")
-    memory.log_raw_message("GRP_FAMILY", "m_bot", "__bot__", "咪寶：成員乙 4/6 生日")
-    seen: list[str] = []
-
-    def extract(text):
-        seen.append(text)
-        person = "成員乙" if "成員乙" in text else "成員甲"
-        return [{"person": person, "anniversary_type": "birthday", "month": 3, "day": 5}]
-
-    monkeypatch.setattr(anniversary, "extract_from_text", extract)
-    assert anniversary.run_sweep("GRP_FAMILY", since_days=0) == 1
-    assert seen == ["成員甲 3/5 生日"]
-
-
 def test_a_mention_that_cannot_be_built_never_stops_the_anniversary_push(temp_anniv_db, monkeypatch, pushed):
     import line_mentions
 
@@ -246,18 +229,67 @@ def test_a_mention_that_cannot_be_built_never_stops_the_anniversary_push(temp_an
     assert [call["messages"][0]["type"] for call in pushed] == ["text"]
 
 
-def test_the_sweep_still_reads_rows_without_a_sender(temp_anniv_db, monkeypatch):
+# ── 2026-11-12, kept on the 2026-11-13 reader (family_extract): who the model hears ─────────────────────
+# The model is faked at its one seam (gemini_client.side_task_last_tier) and every test counts its calls.
+
+
+@pytest.fixture
+def reader(temp_anniv_db, monkeypatch):
+    """The family main group is GRP_FAMILY; the model answers every prompt with one birthday for line 1."""
+    import gemini_client
+
     import anniversary
+
+    monkeypatch.setattr(anniversary.settings, "family_group_id", "GRP_FAMILY")
+    monkeypatch.setenv("ALLOWED_GROUP_IDS", "GRP_FAMILY")
+    monkeypatch.delenv("LINE_BOT_ANNIVERSARY_EXTRACT", raising=False)
+    prompts: list[str] = []
+
+    def side_task(prompt, config, *, label):
+        prompts.append(prompt)
+        item = {"i": 1, "person": "成員甲", "anniversary_type": "birthday", "month": 3, "day": 5, "lunar": False}
+        return SimpleNamespace(
+            text=json.dumps([item], ensure_ascii=False),
+            candidates=[SimpleNamespace(finish_reason=SimpleNamespace(name="STOP"))],
+        )
+
+    monkeypatch.setattr(gemini_client, "side_task_last_tier", side_task)
+    monkeypatch.setattr(gemini_client, "side_task_last_tier_ready", lambda: True)
+    return prompts
+
+
+def _raw_rows(rows):
     import memory
 
     with memory._conn() as c:
-        c.execute(
-            "INSERT INTO raw_messages (group_id, message_id, user_id, text, created_at) "
-            "VALUES (?, ?, NULL, ?, strftime('%s','now'))",
-            ("GRP_FAMILY", "m_null", "成員甲 3/5 生日"),
+        c.executemany(
+            "INSERT INTO raw_messages (group_id, message_id, user_id, text, created_at) VALUES (?, ?, ?, ?, ?)",
+            rows,
         )
-    monkeypatch.setattr(
-        anniversary, "extract_from_text",
-        lambda text: [{"person": "成員甲", "anniversary_type": "birthday", "month": 3, "day": 5}],
-    )
-    assert anniversary.run_sweep("GRP_FAMILY", since_days=0) == 1
+
+
+def test_the_sweep_skips_the_bots_own_replies(reader):
+    import anniversary
+
+    now = time.time()
+    _raw_rows([
+        ("GRP_FAMILY", "m_member", "user-a", "成員甲 3/5 生日", int(now - 3600)),
+        ("GRP_FAMILY", "m_bot", "__bot__", "咪寶：成員乙 4/6 生日", int(now - 3500)),
+    ])
+
+    result = anniversary.run_incremental("GRP_FAMILY", now=now)
+
+    assert len(reader) == 1 and result.new == 1
+    assert "成員甲 3/5 生日" in reader[0]
+    assert "成員乙" not in reader[0] and "咪寶" not in reader[0]
+
+
+def test_the_sweep_still_reads_rows_without_a_sender(reader):
+    import anniversary
+
+    now = time.time()
+    _raw_rows([("GRP_FAMILY", "m_null", None, "成員甲 3/5 生日", int(now - 3600))])
+
+    result = anniversary.run_incremental("GRP_FAMILY", now=now)
+
+    assert len(reader) == 1 and "成員甲 3/5 生日" in reader[0] and result.new == 1
