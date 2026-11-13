@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 from linebot.v3.webhooks import GroupSource, MessageEvent, TextMessageContent
 
 import calendar_db
+import line_mentions
 import main
 import memory
 
@@ -339,6 +340,7 @@ def test_quote_missed_repairs_dropped_pending_row(monkeypatch):
         ).fetchone()
     assert pending is not None and pending["status"] == "done"
     assert replies[0][0].startswith("已補上提醒")
+    assert isinstance(replies[0][0], line_mentions.AllowsMemberMention)  # a receipt keeps its @s (2026-11-13)
     assert replies[0][1]["include_auxiliary"] is False
     assert receipt is None  # drops are silent since 2026-10-04
 

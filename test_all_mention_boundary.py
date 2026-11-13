@@ -146,7 +146,9 @@ def _synthetic_aliases(monkeypatch):
 
 
 def _substitution(text: str, **kwargs) -> dict:
-    _sent, message = main._text_message_with_mentions(text, allow_all_mention=True, **kwargs)
+    _sent, message = main._text_message_with_mentions(
+        text, allow_all_mention=True, allow_member_mention=True, **kwargs
+    )
     return getattr(message, "substitution", None) or {}
 
 

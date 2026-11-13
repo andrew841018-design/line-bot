@@ -943,6 +943,7 @@ def test_contextual_handler_commits_once_and_never_queues_or_calls_model(
 
     reply.assert_called_once()
     assert reply.call_args.args[1].startswith("已新增 4 筆提醒\n")
+    assert type(reply.call_args.args[1]).__name__ == "AllowsMemberMention"  # a receipt keeps its @s (2026-11-13)
     assert "2099-11-16 12:00 爸爸 11/16 14:30" in reply.call_args.args[1]
     assert reply.call_args.kwargs["allow_push_fallback"] is False
     with sqlite3.connect(temp_db) as conn:

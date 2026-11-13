@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from linebot.v3.webhooks import GroupSource, MessageEvent, TextMessageContent
 
+import line_mentions
 import main
 import memory
 import reminder_intent as ri
@@ -615,6 +616,7 @@ def test_quoting_the_folded_push_cancels_the_one_remaining_reminder(monkeypatch)
     replies = _quote_cancel(monkeypatch, "push-after-fold")
 
     assert len(replies) == 1 and "已取消提醒" in replies[0]
+    assert isinstance(replies[0], line_mentions.AllowsMemberMention)  # a receipt keeps its @s (2026-11-13)
     assert {_status(rid) for rid in rids} == {"cancelled"}
     _set_now(monkeypatch, at)
     assert reminder_push._due_reminder_items(group_id=G) == []

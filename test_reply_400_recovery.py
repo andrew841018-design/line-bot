@@ -169,7 +169,7 @@ def test_the_plain_resend_drops_the_mention_and_the_placeholder(line):
     main._reply_mention_targets_by_token[TOKEN] = [target]
     line.script = [bad(0, prop="substitution")]
 
-    assert say("@成員甲 這是回答") is True
+    assert say(line_mentions.AllowsMemberMention("@成員甲 這是回答")) is True
 
     assert kinds(line.replies[0]) == ["TextMessageV2"] and texts(line.replies[0])[0].startswith("{p1}")
     assert kinds(line.replies[1]) == ["TextMessage"]
@@ -344,10 +344,21 @@ def test_menu_cards_are_never_recovered_as_plain_text(line, card):
 
 
 def arm_mention():
-    """The primary mentions someone, so it is a textV2 message (and a plain resend would be visible)."""
+    """The primary mentions someone, so it is a textV2 message (and a plain resend would be visible).
+    Since 2026-11-13 only a text the program wrote may mention anyone: a receipt's mark."""
     target = line_mentions.MentionTarget(key="p1", kind="user", user_id="U_A", label="@成員甲")
     main._reply_mention_targets_by_token[TOKEN] = [target]
-    return "@成員甲 嗨"
+    return line_mentions.AllowsMemberMention("@成員甲 嗨")
+
+
+def test_the_armed_primary_really_is_a_textv2_mention(line):
+    # Without this the tests that arm a mention could pass for nothing.
+    open_event()
+
+    assert say(arm_mention()) is True
+
+    [sent] = line.replies[0]
+    assert type(sent).__name__ == "TextMessageV2" and list(sent.substitution) == ["p1"]
 
 
 def test_a_named_reminder_is_fenced_and_the_primary_goes_alone_as_it_was_built(line, riding, monkeypatch):
@@ -1112,7 +1123,7 @@ def test_a_reply_with_braces_and_a_mention_is_one_valid_textv2_message(line):
     target = line_mentions.MentionTarget(key="p1", kind="user", user_id="U_A", label="@成員甲")
     main._reply_mention_targets_by_token[TOKEN] = [target]
 
-    assert say('@成員甲 結果是 {"ok": true}') is True
+    assert say(line_mentions.AllowsMemberMention('@成員甲 結果是 {"ok": true}')) is True
 
     sent = line.replies[0][0]
     assert type(sent).__name__ == "TextMessageV2"
@@ -1125,7 +1136,7 @@ def test_the_archive_keeps_the_words_not_the_escapes(line):
     target = line_mentions.MentionTarget(key="p1", kind="user", user_id="U_A", label="@成員甲")
     main._reply_mention_targets_by_token[TOKEN] = [target]
 
-    assert say('@成員甲 結果是 {"ok": true}') is True
+    assert say(line_mentions.AllowsMemberMention('@成員甲 結果是 {"ok": true}')) is True
 
     archived = raw_bot_texts()
     assert len(archived) == 1 and '{"ok": true}' in archived[0] and "{{" not in archived[0]

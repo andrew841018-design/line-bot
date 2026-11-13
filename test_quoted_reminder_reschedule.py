@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 from linebot.v3.webhooks import GroupSource, MessageEvent, TextMessageContent
 
+import line_mentions
 import main
 import memory
 import reminder_cancel
@@ -486,6 +487,7 @@ def test_acceptance_1_bound_push_time_only(replies, fixed_now):
     assert len(replies) == 1
     text, kwargs = replies[0]
     assert text.startswith("已更新提醒（2099-10-01 12:00 → 2099-10-01 09:00）")
+    assert isinstance(text, line_mentions.AllowsMemberMention)  # a receipt keeps its @s (2026-11-13)
     assert "事項：繳管理費" in text
     assert kwargs["include_auxiliary"] is False
     assert kwargs["primary_reminder_ref"] == {"reminder_id": rid}
@@ -565,6 +567,7 @@ def test_redelivery_replays_instead_of_overwriting_a_later_edit(replies, fixed_n
     main._handle_text_message(_event("10/8", quoted="ack-r", message_id="msg-a"), "G1")
     assert _row(rid)["remind_at"] == _ts("2099-10-10 12:00")
     assert replies[-1][0].startswith("這則更正先前已處理（2099-10-01 12:00 → 2099-10-08 12:00）")
+    assert isinstance(replies[-1][0], line_mentions.AllowsMemberMention)  # a receipt keeps its @s (2026-11-13)
     assert "時間：2099-10-10 12:00" in replies[-1][0]
 
 
@@ -1059,6 +1062,7 @@ def test_replay_reply_failure_still_says_it_was_handled(replies, fixed_now, monk
     monkeypatch.setattr(memory, "get_reminder", broken)
     main._handle_text_message(_event("10/8", quoted="push-rf", message_id="msg-rf"), "G1")
     assert replies[-1][0].startswith("這則更正先前已處理（2099-10-01 12:00 → 2099-10-08 12:00）")
+    assert isinstance(replies[-1][0], line_mentions.AllowsMemberMention)  # a receipt keeps its @s (2026-11-13)
 
 
 # ── Round-2 correctness review additions ────────────────────────────────────

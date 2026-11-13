@@ -4,6 +4,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 import calendar_regex
+import line_mentions
 import main
 import memory
 import reminder_restatement as rr
@@ -92,6 +93,7 @@ def test_correction_persisted_before_reply_without_later_routing(monkeypatch):
     assert len(replies) == 2
     assert len(memory.list_pending_reminders_full("G_TEST")) == 1
     assert all("已更新" in reply for reply in replies)
+    assert all(isinstance(reply, line_mentions.AllowsMemberMention) for reply in replies)  # a receipt keeps its @s (2026-11-13)
 
 
 def test_reconcile_exact_repair_and_source_replay():

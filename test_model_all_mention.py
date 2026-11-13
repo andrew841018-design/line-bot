@@ -6,7 +6,7 @@ together after any filter, so the rule is read off the message at the last step.
 stays in the words.  What counts as an @all: test_all_mention_boundary.py.  All text is made up, and
 nothing here reaches the network.
 
-Still open, its own task (Andrew 2026-11-12): a model reply that @s every member by name pings each of them.
+A member's @ in a model's reply pings nobody either since 2026-11-13: test_model_member_mention.py.
 """
 
 from __future__ import annotations
@@ -192,13 +192,13 @@ def test_an_article_the_research_path_read_cannot_ping_the_group(line, research_
     assert not pings_everyone(message)
 
 
-def test_a_member_on_the_same_line_is_still_pinged(line):
+def test_a_member_on_the_same_line_is_not_pinged_either(line):
+    # Andrew 2026-11-13 「聊天回覆一律不 @」 (test_model_member_mention.py): the words stay as they are.
     assert say("@all @成員甲\n明天開會")
 
     [message] = line.replies[0]
-    assert message.text == "{p1} @all\n明天開會"
-    assert set(message.substitution) == {"p1"}
-    assert message.substitution["p1"].mentionee.user_id == "U_A"
+    assert message.text == "@all @成員甲\n明天開會"
+    assert not getattr(message, "substitution", None)
 
 
 @pytest.mark.parametrize(
@@ -255,8 +255,8 @@ def test_a_queued_answer_riding_on_a_reply_does_not_ping_the_group(line, monkeyp
     assert say(first)
 
     _first, queued = line.replies[0]
-    assert "@all" in queued.text
-    assert set(queued.substitution) == {"p1"}
+    assert queued.text == "@all 排隊的回覆 @成員甲"  # a model's words: nobody is pinged (2026-11-13)
+    assert not getattr(queued, "substitution", None)
 
 
 @pytest.mark.parametrize(
@@ -426,6 +426,8 @@ def test_a_confirmation_riding_on_a_model_reply_still_pings_the_group(line):
 
 # ── every place that can ping the whole group, as one list ──────────────────────────────────
 
+# Names, not every class under AllowsAllMention: when ReminderReceipt moves under AllowsMemberMention (the
+# reminder-path stage 2), take it out of here too, or its call sites still count as pinging the group.
 _MARKS = {"AllowsAllMention", "ReminderReceipt"}
 # what these store goes out with allow_all_mention=True
 _WRITERS = {"queue_one_shot_reply", "_save_one_shot_replies", "enqueue_reminder_confirmation"}
@@ -447,7 +449,7 @@ MAY_PING = {
     "main._format_schedule_receipt marks a text": 2,
     "main._format_source_calendar_capture_confirmation marks a text": 2,
     "main._maybe_extract_reminder marks a text": 1,
-    # the one place a text's @all is read
+    # the one place a text's @all is read (a member's @: MAY_PING_A_MEMBER in test_model_member_mention.py)
     "main._reply builds with allow_all_mention": 2,  # the reply and its push fallback: by the text's type
     "main._reply builds with True": 2,  # riders the program wrote: a stored confirmation, a due reminder
     "main._try_one_shot_reply builds with True": 1,  # a file a person writes by hand

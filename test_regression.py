@@ -1190,8 +1190,10 @@ def test_reply_strips_user_visible_mode_labels(monkeypatch):
     assert "local LLM" not in sent
 
 
-def test_reply_uses_text_v2_for_known_plain_mentions(monkeypatch):
-    """Plain @ labels in ordinary replies should become real LINE mentions."""
+@pytest.mark.parametrize("marked", [False, True], ids=["a-model-reply", "a-receipt"])
+def test_reply_uses_text_v2_for_known_plain_mentions(monkeypatch, marked):
+    """Plain @ labels become real LINE mentions only in a text the program wrote: a model's reply pings
+    nobody, a receipt (`line_mentions.AllowsMemberMention`) pings as it did (Andrew 2026-11-13)."""
     monkeypatch.setattr(main.settings, "bot_muted", False)
     monkeypatch.setattr(main, "_reminder_reply_piggyback_enabled", lambda: False)
 
@@ -1208,17 +1210,25 @@ def test_reply_uses_text_v2_for_known_plain_mentions(monkeypatch):
         patch("main.MessagingApi", return_value=mock_messaging),
         patch("main._load_pending_explicit", return_value={}),
     ):
-        main._reply("TOKEN001", "@爸爸 記得看這個", group_id="GRP001")
+        words = "@爸爸 記得看這個"
+        main._reply("TOKEN001", line_mentions.AllowsMemberMention(words) if marked else words, group_id="GRP001")
 
     request = mock_messaging.reply_message.call_args.args[0]
     message = request.messages[0]
+    if not marked:
+        assert message.type == "text" and message.text == words
+        return
     assert message.type == "textV2"
     assert message.text.startswith("{p1}\n")
     assert message.substitution["p1"].mentionee.user_id == "U_DAD"
 
 
-def test_reply_uses_incoming_mention_payload_targets():
-    """Reply payload should notify mentioned user IDs, even when reply text has no @alias."""
+@pytest.mark.parametrize("marked", [False, True], ids=["a-chat-reply", "a-receipt"])
+def test_reply_uses_incoming_mention_payload_targets(marked):
+    """The people the asker @'d are pinged again by a receipt, not by a chat reply (Andrew 2026-11-13:
+    「也拿掉」, 「回條照舊跟著 @」).  The token's entry is taken out either way."""
+    import line_mentions
+
     mock_api = MagicMock()
     mock_api.__enter__ = MagicMock(return_value=mock_api)
     mock_api.__exit__ = MagicMock(return_value=False)
@@ -1244,18 +1254,25 @@ def test_reply_uses_incoming_mention_payload_targets():
         patch.object(main.settings, "bot_muted", False),
         patch.object(main, "_reminder_reply_piggyback_enabled", lambda: False),
     ):
-        main._reply("TOKEN001", "幫我確認這件事", group_id="GRP001")
+        words = "幫我確認這件事"
+        main._reply("TOKEN001", line_mentions.AllowsMemberMention(words) if marked else words, group_id="GRP001")
 
     request = mock_messaging.reply_message.call_args.args[0]
     message = request.messages[0]
+    if not marked:
+        assert message.type == "text" and message.text == words
+        assert main._consume_reply_mention_targets("TOKEN001") == []
+        return
     assert message.type == "textV2"
     assert message.text.startswith("{p1}\n")
     assert message.substitution["p1"].mentionee.user_id == "U_DAD"
     assert main._consume_reply_mention_targets("TOKEN001") == []
 
 
-def test_reply_fallback_push_uses_text_v2_for_known_plain_mentions(monkeypatch):
-    """Expired reply token fallback must not downgrade real mentions to plain text."""
+@pytest.mark.parametrize("marked", [False, True], ids=["a-model-reply", "a-receipt"])
+def test_reply_fallback_push_uses_text_v2_for_known_plain_mentions(monkeypatch, marked):
+    """Expired reply token fallback must not downgrade a receipt's real mentions to plain text; a model's
+    reply pings nobody either way (Andrew 2026-11-13)."""
     monkeypatch.setattr(main.settings, "bot_muted", False)
     monkeypatch.setattr(main, "_reminder_reply_piggyback_enabled", lambda: False)
 
@@ -1273,10 +1290,14 @@ def test_reply_fallback_push_uses_text_v2_for_known_plain_mentions(monkeypatch):
         patch("main.MessagingApi", return_value=mock_messaging),
         patch("main._load_pending_explicit", return_value={}),
     ):
-        main._reply("TOKEN001", "@爸爸 記得看這個", group_id="GRP001")
+        words = "@爸爸 記得看這個"
+        main._reply("TOKEN001", line_mentions.AllowsMemberMention(words) if marked else words, group_id="GRP001")
 
     request = mock_messaging.push_message.call_args.args[0]
     message = request.messages[0]
+    if not marked:
+        assert message.type == "text" and message.text == words
+        return
     assert message.type == "textV2"
     assert message.text.startswith("{p1}\n")
     assert message.substitution["p1"].mentionee.user_id == "U_DAD"

@@ -1379,6 +1379,7 @@ def test_markerless_quoted_time_assertion_updates_event_and_mirror_atomically(
         assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 1
         assert conn.execute("SELECT COUNT(*) FROM reminders").fetchone()[0] == 1
     assert replies and replies[0].startswith("已更正行程與提醒")
+    assert type(replies[0]).__name__ == "AllowsMemberMention"  # a receipt keeps its @s (2026-11-13)
     assert cancelled_bursts == ["G1"]
 
 
@@ -1431,6 +1432,7 @@ def test_markerless_time_assertion_replying_to_sent_reminder_updates_same_identi
         "%Y-%m-%d %H:%M"
     ) == "2026-08-02 20:00"
     assert replies and replies[0].startswith("已更正行程與提醒")
+    assert type(replies[0]).__name__ == "AllowsMemberMention"  # a receipt keeps its @s (2026-11-13)
     assert cancelled_bursts == ["G1"]
 
 

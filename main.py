@@ -5790,11 +5790,13 @@ def _try_handle_missed_reminder_repair(
     heading = "已補上提醒" if created else "這則提醒已存在，未重複新增"
     _reply(
         event.reply_token,
-        "\n".join(
-            (
-                heading,
-                f"時間：{event_data['event_date']} {event_data['event_time']}{time_note}",
-                f"事項：{calendar_db.event_shown_title(event_data)}",
+        line_mentions.AllowsMemberMention(  # a receipt: its @s ping as they always did (2026-11-13)
+            "\n".join(
+                (
+                    heading,
+                    f"時間：{event_data['event_date']} {event_data['event_time']}{time_note}",
+                    f"事項：{calendar_db.event_shown_title(event_data)}",
+                )
             )
         ),
         group_id=group_id,
@@ -6532,6 +6534,7 @@ def _try_handle_calendar_correction(
             details.append(f"提醒已同步更新 {reminders_updated} 筆")
         if details:
             reply += "\n" + "、".join(details)
+        reply = line_mentions.AllowsMemberMention(reply)  # a receipt, marked after its last change (2026-11-13)
 
     burst_filter.cancel_burst(group_id)
     memory.append_turn(group_id, "user", _labelled_turn(group_id, text, event=event))
@@ -6634,13 +6637,15 @@ def _try_handle_quoted_calendar_correction(
             when = str(persisted.get("event_date") or "")
             if persisted.get("event_time"):
                 when += f" {persisted['event_time']}"
-            reply = "\n".join(
-                (
-                    heading,
-                    f"時間：{when}",
-                    "事項：" + calendar_db.event_shown_title(
-                        {**persisted, "title": persisted.get("title") or "未命名行程"}
-                    ),
+            reply = line_mentions.AllowsMemberMention(  # a receipt (2026-11-13)
+                "\n".join(
+                    (
+                        heading,
+                        f"時間：{when}",
+                        "事項：" + calendar_db.event_shown_title(
+                            {**persisted, "title": persisted.get("title") or "未命名行程"}
+                        ),
+                    )
                 )
             )
         elif status == "busy":
@@ -6759,14 +6764,14 @@ def _try_handle_reminder_cancellation(
                         tz=ZoneInfo("Asia/Taipei"),
                     ).strftime("%Y-%m-%d %H:%M")
                     if cancelled_row.get("_delivery_in_flight"):
-                        reply = (
+                        reply = line_mentions.AllowsMemberMention(  # a receipt (2026-11-13)
                             "已取消後續提醒\n"
                             "這一則已開始傳送，仍可能送達。\n"
                             f"時間：{when}\n"
                             f"事項：{_reminder_shown_action(cancelled_row)}"
                         )
                     else:
-                        reply = (
+                        reply = line_mentions.AllowsMemberMention(  # a receipt (2026-11-13)
                             "已取消提醒\n"
                             f"時間：{when}\n"
                             f"事項：{_reminder_shown_action(cancelled_row)}"
@@ -7220,14 +7225,14 @@ def _try_handle_reminder_cancellation(
                         tz=ZoneInfo("Asia/Taipei"),
                     ).strftime("%Y-%m-%d %H:%M")
                     if cancelled_row.get("_delivery_in_flight"):
-                        reply = (
+                        reply = line_mentions.AllowsMemberMention(  # a receipt (2026-11-13)
                             "已取消後續提醒\n"
                             "這一則已開始傳送，仍可能送達。\n"
                             f"時間：{when}\n"
                             f"事項：{_reminder_shown_action(cancelled_row)}"
                         )
                     else:
-                        reply = (
+                        reply = line_mentions.AllowsMemberMention(  # a receipt (2026-11-13)
                             "已取消提醒\n"
                             f"時間：{when}\n"
                             f"事項：{_reminder_shown_action(cancelled_row)}"
@@ -7736,7 +7741,7 @@ def _reschedule_replay_reply(group_id: str, logged: dict) -> tuple[str, dict | N
     import reminder_overview
 
     old_at, new_at = int(logged["old_remind_at"]), int(logged["new_remind_at"])
-    fallback = rr.replay_receipt(old_at, new_at), None
+    fallback = line_mentions.AllowsMemberMention(rr.replay_receipt(old_at, new_at)), None  # receipts (2026-11-13)
     try:
         row = memory.get_reminder(int(logged["reminder_id"]))
         if row is None or row["group_id"] != group_id or row["status"] != "pending":
@@ -7747,16 +7752,18 @@ def _reschedule_replay_reply(group_id: str, logged: dict) -> tuple[str, dict | N
         ):
             people = reminder_overview.shown_people(row)
             if old_at == new_at and logged["old_action_hash"] == logged["new_action_hash"]:
-                reply = rr.unchanged_receipt(new_at, row["action"], people)
+                reply = line_mentions.AllowsMemberMention(rr.unchanged_receipt(new_at, row["action"], people))
             else:
-                reply = rr.updated_receipt(old_at, new_at, row["action"], people)
+                reply = line_mentions.AllowsMemberMention(rr.updated_receipt(old_at, new_at, row["action"], people))
         else:
-            reply = rr.replay_receipt(
-                old_at,
-                new_at,
-                current_at=row["remind_at"],
-                current_action=row["action"],
-                people=reminder_overview.shown_people(row),
+            reply = line_mentions.AllowsMemberMention(
+                rr.replay_receipt(
+                    old_at,
+                    new_at,
+                    current_at=row["remind_at"],
+                    current_action=row["action"],
+                    people=reminder_overview.shown_people(row),
+                )
             )
         if not _reschedule_receipt_displayable(reply):
             return fallback
@@ -7856,7 +7863,7 @@ def _apply_quoted_reschedule(
     old_at = int(row["remind_at"])
     unchanged = new_at == old_at and new_action == row["action"]
     people = reminder_overview.shown_people(row)
-    planned = (
+    planned = line_mentions.AllowsMemberMention(  # a receipt (2026-11-13)
         rr.unchanged_receipt(old_at, new_action, people)
         if unchanged
         else rr.updated_receipt(old_at, new_at, new_action, people)
@@ -8076,8 +8083,10 @@ def _try_handle_reminder_push_limit(
         return True
     try:
         people = reminder_overview.shown_people(state)
-        planned = rpl.receipt(
-            "updated", keep, remind_at=state["remind_at"], action=state["action"], people=people
+        planned = line_mentions.AllowsMemberMention(  # a receipt (2026-11-13)
+            rpl.receipt(
+                "updated", keep, remind_at=state["remind_at"], action=state["action"], people=people
+            )
         )
         displayable = _reschedule_receipt_displayable(planned)
     except Exception as exc:
@@ -8111,24 +8120,28 @@ def _try_handle_reminder_push_limit(
         _push_limit_calendar_title(group_id, state) if status == "updated" and keep else ""
     )
     try:
-        reply = rpl.receipt(
-            status,
-            keep,
-            remind_at=state["remind_at"],
-            action=state["action"],
-            people=people,
-            kept_already_sent=bool(result.get("kept_already_sent")),
-            calendar_title=calendar_title,
-        )
-        if not _reschedule_receipt_displayable(reply):
-            # Only the calendar line can make it fail: send the receipt without it.
-            reply = rpl.receipt(
+        reply = line_mentions.AllowsMemberMention(  # a receipt (2026-11-13)
+            rpl.receipt(
                 status,
                 keep,
                 remind_at=state["remind_at"],
                 action=state["action"],
                 people=people,
                 kept_already_sent=bool(result.get("kept_already_sent")),
+                calendar_title=calendar_title,
+            )
+        )
+        if not _reschedule_receipt_displayable(reply):
+            # Only the calendar line can make it fail: send the receipt without it.
+            reply = line_mentions.AllowsMemberMention(
+                rpl.receipt(
+                    status,
+                    keep,
+                    remind_at=state["remind_at"],
+                    action=state["action"],
+                    people=people,
+                    kept_already_sent=bool(result.get("kept_already_sent")),
+                )
             )
     except Exception as exc:
         # The change is written: still confirm it with the receipt planned before the write.
@@ -8325,7 +8338,9 @@ def _handle_text_message(
         if status in {"updated", "unchanged"}:
             saved = memory.get_reminder(restated["reminder_id"])
             when = datetime.fromtimestamp(saved["remind_at"], ZoneInfo("Asia/Taipei"))
-            reply = f"已更新提醒\n時間：{when:%Y-%m-%d %H:%M}\n事項：{_reminder_shown_action(saved)}"
+            reply = line_mentions.AllowsMemberMention(  # a receipt (2026-11-13)
+                f"已更新提醒\n時間：{when:%Y-%m-%d %H:%M}\n事項：{_reminder_shown_action(saved)}"
+            )
         else:
             reply = "尚未更新提醒：無法安全確認唯一事項，或提醒正在處理中。請回覆原始提醒再更正。"
         burst_filter.cancel_burst(group_id)
@@ -12900,12 +12915,17 @@ def _text_message_with_mentions(
     explicit_only: bool = False,
     reply_targets: list | None = None,
     allow_all_mention: bool = False,
+    allow_member_mention: bool = False,
 ) -> tuple[str, object]:
-    """``allow_all_mention``: an @all in this text may ping the whole group.  `_reply` passes it for a
-    `line_mentions.AllowsAllMention`; the callers that send text the program stored pass True, and
-    the two that send a queued model answer pass False.  Without it a literal 「@all」 stays in the
-    words and pings nobody, and a member's @ still pings them.
-    Checked here, on the final text: `_md_to_line` still changes what stands next to an @all, so no
+    """``allow_all_mention``: an @all in this text may ping the whole group.  ``allow_member_mention``:
+    a member's @ in this text (with ``explicit_only=False``, a member's bare name too) may ping them.
+    `_reply` sets both from the text's type (`line_mentions.AllowsAllMention`,
+    `line_mentions.AllowsMemberMention`); the callers that send text the program stored pass True,
+    and the two that send a queued model answer pass False.  Without them the words stay as they are
+    and ping nobody (Andrew 2026-11-07 for @all, 2026-11-13 for members).
+    ``reply_targets`` are taken whatever the flags say: the caller chose them.  The exercise nudge
+    pings its member that way, and is dropped when no mention comes out.
+    Checked here, on the final text: `_md_to_line` still changes what stands next to an @, so no
     earlier filter can tell (2026-11-07)."""
     reply_text = str(text or "")
     if not prepared:
@@ -12913,7 +12933,9 @@ def _text_message_with_mentions(
     # LINE counts text in UTF-16 code units (an emoji is 2), so the limit is applied in those.
     reply_text = line_mentions.clip_utf16(reply_text, limit)
     try:
-        if explicit_only:
+        if not allow_member_mention:
+            aliases = []  # a member's @ in these words pings nobody (Andrew 2026-11-13)
+        elif explicit_only:
             aliases = []
             for candidate in line_mentions.mention_names(reply_text):
                 clean = str(candidate or "").strip().lstrip("@")
@@ -13316,8 +13338,8 @@ def _handle_todo_query(
 ) -> None:
     """deterministic todo/reminder query path — read DB, skip LLM."""
     reply = _build_todo_status_reply(group_id, clean_text)
-    # Only a written @ mentions anyone: names in the list (「回診（媽媽）」,
-    # 「（全家）」) are not a reason to ping them (2026-10-07).
+    # Nobody is pinged: the list's words go out as they are, a written @ too
+    # (Andrew 2026-11-13, 「一起改成不響」).
     reply_text, message = _text_message_with_mentions(reply, explicit_only=True)
     try:
         if not settings.bot_muted:
@@ -16312,7 +16334,8 @@ def _save_one_shot_replies(data: dict[str, str]) -> None:
 
 def queue_one_shot_reply(group_id: str, text: str) -> None:
     """Queue one text for the group's next message.  `_try_one_shot_reply` sends it with
-    allow_all_mention=True (2026-11-07): never queue a model's words here."""
+    allow_all_mention=True and allow_member_mention=True (2026-11-07, 2026-11-13): a member's name
+    pings even without an @, and 「全家」 pings the whole group.  Never queue a model's words here."""
     group_id = (group_id or "").strip()
     text = (text or "").strip()
     if not group_id or not text:
@@ -16351,9 +16374,10 @@ def _try_one_shot_reply(event: MessageEvent, group_id: str) -> bool:
             completed,
         )
         return True
-    # A person wrote this file by hand; nothing queues a model's words into it.
+    # A person wrote this file by hand; nothing queues a model's words into it.  A member's name
+    # pings even without an @ (explicit_only=False), and 「全家」 pings the whole group.
     reply_text, message = _text_message_with_mentions(
-        prepared_text, prepared=True, allow_all_mention=True
+        prepared_text, prepared=True, allow_all_mention=True, allow_member_mention=True
     )
     if settings.bot_muted:
         logger.info("[MUTED] would one-shot reply group=%s len=%d", group_id, len(reply_text))
@@ -17393,6 +17417,7 @@ def _drain_pending_for_group(
                     quote_token=str(qt) if qt else None,
                     explicit_only=True,
                     allow_all_mention=False,  # a queued answer is a model's words
+                    allow_member_mention=False,
                 )
 
                 with ApiClient(_get_line_config()) as api_client:
@@ -19174,7 +19199,7 @@ def _contextual_date_reminder_plan(
 def _format_contextual_date_reminder_confirmation(
     plan: dict,
     outcome: str,
-) -> str:
+) -> line_mentions.AllowsMemberMention:
     heading = (
         "4 筆提醒皆已存在，未重複新增"
         if outcome == "duplicate"
@@ -19196,7 +19221,7 @@ def _format_contextual_date_reminder_confirmation(
             ZoneInfo("Asia/Taipei"),
         ).strftime("%H:%M")
         lines.append(f"未指定提醒時間，均預設 {default_clock}。")
-    return "\n".join(lines)
+    return line_mentions.AllowsMemberMention("\n".join(lines))  # a receipt (2026-11-13)
 
 
 def _try_handle_contextual_date_reminder(
@@ -19891,6 +19916,9 @@ def _explicit_range_reminder_result(
 
 # TODO(2026-11-12 deferred, the reminder-path task): a receipt's 事項 or title can still carry words an
 # extraction model or a pasted message wrote, and an @all there pings everyone (the whole receipt is read).
+# The same goes for a member's @ (2026-11-13), here and in the receipts marked
+# `line_mentions.AllowsMemberMention` where they are built: once such words are stored, every receipt
+# that reads them back pings that member again.
 class ReminderReceipt(line_mentions.AllowsAllMention):
     """A group receipt that also carries the reminders it announced.
 
@@ -23723,7 +23751,7 @@ def _cancel_calendar_event(group_id: str, keyword: str) -> str:
     if not target:
         return f"找不到含「{keyword}」的活動。用 /行事曆 看清單。"
     if calendar_db.cancel_event(target["event_id"]):
-        return f"已取消：{target['event_date']} {target['title']}"
+        return line_mentions.AllowsMemberMention(f"已取消：{target['event_date']} {target['title']}")  # a receipt (2026-11-13)
     return f"取消失敗（活動可能已被取消）：{target['title']}"
 
 
@@ -24777,8 +24805,11 @@ def _reply(
     ``index_for_recall``：False 時 bot 的這則回覆存檔但不進 recall 索引（FCN、股票推薦用）。
 
     全群提及（Andrew 2026-11-07：模型寫的回覆一律不能）：``text`` 是 `line_mentions.AllowsAllMention`
-    （民調、提醒回條）主訊息和它的 push fallback 才會全群提及，其他字裡的 @all 只是字。看字的型別、不開參數：
+    （民調、`ReminderReceipt`）主訊息和它的 push fallback 才會全群提及，其他字裡的 @all 只是字。看字的型別、不開參數：
     同一個呼叫點會送民調也會送模型寫的 /檢討（`_handle_command`）。搭車的確認和到期提醒是程式寫的，照響。
+    提及個別家人（Andrew 2026-11-13：聊天回覆一律不 @、回條照舊）：``text`` 是 `line_mentions.AllowsMemberMention`
+    （提醒回條；`AllowsAllMention` 也是）才會 @ 字裡寫到的家人，也才會跟著 @ 發問者 @ 過的人（``reply_targets``）。
+    模型的回覆、清單、行事曆查詢、固定句都不 @，字原樣送出。
     """
     if flex_card is not None and (menu_card or large_menu_card):
         logger.error("flex_card cannot be combined with menu cards group=%s", group_id)
@@ -24786,6 +24817,7 @@ def _reply(
     archive_kwargs: dict = {} if index_for_recall else {"index_for_recall": False}
     original_text = text
     allow_all_mention = isinstance(text, line_mentions.AllowsAllMention)  # the checks below give a plain str back
+    allow_member_mention = isinstance(text, line_mentions.AllowsMemberMention)  # likewise
     if not text or not text.strip():
         if reply_provenance.dropped():
             # A guard dropped the reply, or Claude chose not to reply: intentionally silent.
@@ -24827,6 +24859,10 @@ def _reply(
     # reminders 可趁正常 reply 一起送，作為 LINE push quota 429 時的補救路徑。
     # legacy pending branch 僅在 _PENDING_REPLY_ENABLED=True 的測試/rollback 場景會啟用。
     reply_targets = _consume_reply_mention_targets(reply_token)
+    if not allow_member_mention:
+        # Andrew 2026-11-13: a chat reply does not ping again whom the asker @'d (a receipt still does).
+        # Taken out first, so the token's entry is cleared either way.
+        reply_targets = []
     primary_message = None
     if menu_card or large_menu_card or flex_card is not None:
         include_auxiliary = False
@@ -24864,6 +24900,7 @@ def _reply(
             explicit_only=True,
             reply_targets=reply_targets,
             allow_all_mention=allow_all_mention,
+            allow_member_mention=allow_member_mention,
         )
     messages_to_send: list = [] if primary_suppressed else [primary_message]
     # primary_reminder_ref binds the primary message to one reminder, so a
@@ -24925,6 +24962,7 @@ def _reply(
                                 limit=5000,
                                 explicit_only=True,
                                 allow_all_mention=False,  # a queued answer is a model's words
+                                allow_member_mention=False,
                             )
                             messages_to_send.append(pig_message)
                             message_reminder_refs.append(None)
@@ -24973,6 +25011,7 @@ def _reply(
                                 limit=5000,
                                 explicit_only=True,
                                 allow_all_mention=True,
+                                allow_member_mention=True,
                             )
                         )
                         messages_to_send.append(confirmation_message)
@@ -25100,6 +25139,7 @@ def _reply(
                                     limit=5000,
                                     explicit_only=True,
                                     allow_all_mention=True,
+                                    allow_member_mention=True,
                                 )[1]
                             )
                             riders.append(
@@ -25517,6 +25557,7 @@ def _reply(
                             explicit_only=True,
                             reply_targets=reply_targets,
                             allow_all_mention=allow_all_mention,
+                            allow_member_mention=allow_member_mention,
                         )
                     push_request_built = True
                     with ApiClient(_get_line_config()) as api_client:

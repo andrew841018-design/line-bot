@@ -43,14 +43,24 @@ class MentionTarget:
     label: str = ""
 
 
-class AllowsAllMention(str):
-    """A message one of the program's own formatters put together (a poll, a reminder receipt): an
-    @all in it may ping the whole group (Andrew 2026-11-07).
+class AllowsMemberMention(str):
+    """A message one of the program's own formatters put together (a reminder receipt): a member's @
+    in it may ping that member, and so may the people the asker @'d in their own message (Andrew
+    2026-11-13: 「回條照舊跟著 @」).
 
-    A reply the model wrote never may, whatever it printed: a page, a video's text or an article in
-    its prompt can tell it to print 「@all」.  Every `str` method that changes the words hands back a
-    plain `str`, so losing this mark on the way to LINE only makes a message quiet.  Wrap a
-    formatter's result, never a model's reply.
+    A reply the model wrote never may, whatever it printed (「聊天回覆一律不 @」): a page, a video's
+    text or an article in its prompt can tell it to @ every member by name.  Nor may a list or a
+    calendar query (「一起改成不響」).  Every `str` method that changes the words hands back a plain
+    `str`, so losing this mark on the way to LINE only makes a message quiet.  Wrap the line a
+    receipt formatter builds, after its last change to the words: never a sending helper, never a
+    model's reply.
+    """
+
+
+class AllowsAllMention(AllowsMemberMention):
+    """An `AllowsMemberMention` (a poll, a `ReminderReceipt`) whose @all may also ping the whole group
+    (Andrew 2026-11-07).  A reply the model wrote never may, whatever it printed: a page, a video's
+    text or an article in its prompt can tell it to print 「@all」.
     """
 
 

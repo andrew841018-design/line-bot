@@ -737,7 +737,8 @@ def test_handle_calendar_query_no_match(monkeypatch):
     assert "沒有" in captured["text"] or "0" in captured["text"]
 
 
-def test_handle_calendar_query_uses_text_v2_for_known_mentions(monkeypatch):
+def test_handle_calendar_query_pings_no_one_an_event_names(monkeypatch):
+    """Andrew 2026-11-13 「一起改成不響」: an @ in an event's words stays in the words and pings nobody."""
     import main
     import calendar_db
     import event_reminder
@@ -774,9 +775,8 @@ def test_handle_calendar_query_uses_text_v2_for_known_mentions(monkeypatch):
 
     main._handle_calendar_query(FakeEvent(), "G1", "明天有什麼安排")
 
-    assert captured["message"].type == "textV2"
-    assert captured["message"].text.startswith("{p1}\n")
-    assert captured["message"].substitution["p1"].mentionee.user_id == "U_DAD"
+    assert captured["message"].type == "text"
+    assert "@爸爸\n打壁球" in captured["message"].text
 
 
 def test_handle_calendar_query_finds_hwang_new_zealand_dates(monkeypatch):
@@ -6329,7 +6329,9 @@ def test_mention_builder_keeps_all_and_named_mentions(monkeypatch):
         lambda: {"U_DAD": "爸爸", "U_MOM": "媽媽"},
     )
 
-    _text, message = main._text_message_with_mentions("參加人：@all、@爸爸、@媽媽", allow_all_mention=True)
+    _text, message = main._text_message_with_mentions(
+        "參加人：@all、@爸爸、@媽媽", allow_all_mention=True, allow_member_mention=True
+    )
 
     assert message.type == "textV2"
     assert message.text.startswith("{all} {p2} {p3}\n")

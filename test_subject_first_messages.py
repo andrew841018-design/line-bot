@@ -86,7 +86,7 @@ def test_a_receipt_puts_the_people_first_and_pings_them_once():
     )
 
     assert receipt == "@成員甲\n已新增提醒\n時間：2099-10-01 12:00\n事項：成員甲 繳管理費"
-    text, message = main._text_message_with_mentions(receipt, explicit_only=True)
+    text, message = main._text_message_with_mentions(receipt, explicit_only=True, allow_member_mention=True)
     assert text == receipt
     assert message.text == "{p1}\n已新增提醒\n時間：2099-10-01 12:00\n事項：成員甲 繳管理費"
     assert message.substitution["p1"].mentionee.user_id == "U_A"
@@ -109,11 +109,15 @@ def test_a_receipt_pings_only_whom_the_old_line_pinged(people, expected):
     assert receipt == expected
 
 
-def test_other_replies_keep_their_mention_line():
+def test_other_replies_keep_their_words_and_ping_nobody():
+    # Andrew 2026-11-13 「聊天回覆一律不 @」: only a text the program wrote pings (allow_member_mention).
     text, message = main._text_message_with_mentions("記得 @成員甲 繳費", explicit_only=True)
 
     assert text == "記得 @成員甲 繳費"
-    assert message.text == "{p1}\n記得 @成員甲 繳費"
+    assert message.text == "記得 @成員甲 繳費"
+    assert not getattr(message, "substitution", None)
+    _text, told = main._text_message_with_mentions("記得 @成員甲 繳費", explicit_only=True, allow_member_mention=True)
+    assert told.text == "{p1}\n記得 @成員甲 繳費"
 
 
 def test_the_calendar_push_and_list_put_the_people_first():

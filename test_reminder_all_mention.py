@@ -684,7 +684,8 @@ def test_a_name_that_touches_the_shop_is_still_read_whole(monkeypatch):
 
 
 def _pinged(text: str) -> set[str]:
-    _sent, message = main._text_message_with_mentions(text, explicit_only=True)
+    # The word boundaries, in a text that may ping members (a receipt); who may: test_model_member_mention.py.
+    _sent, message = main._text_message_with_mentions(text, explicit_only=True, allow_member_mention=True)
     return {
         mention.mentionee.user_id
         for mention in (getattr(message, "substitution", None) or {}).values()

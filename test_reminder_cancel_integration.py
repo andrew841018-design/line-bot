@@ -9,6 +9,7 @@ import pytest
 from linebot.v3.messaging import TextMessage
 from linebot.v3.webhooks import GroupSource, MessageEvent, TextMessageContent
 
+import line_mentions
 import main
 import memory
 import reminder_cancel
@@ -144,6 +145,7 @@ def test_line_inbound_no_activity_date_cancels_unique_pending(monkeypatch):
     assert _status(other_group_id) == "pending"
     assert len(replies) == 1
     assert "已取消提醒" in replies[0][0]
+    assert isinstance(replies[0][0], line_mentions.AllowsMemberMention)  # a receipt keeps its @s (2026-11-13)
     assert "2030-08-08 09:00" in replies[0][0]
     assert "桃園高鐵上皮拉提斯" in replies[0][0]
     assert replies[0][1]["include_auxiliary"] is False
@@ -827,6 +829,7 @@ def test_cancellation_reports_truthfully_when_delivery_claim_won(monkeypatch):
 
     assert _status(reminder_id) == "cancelled"
     assert replies and "已取消後續提醒" in replies[0]
+    assert isinstance(replies[0], line_mentions.AllowsMemberMention)  # a receipt keeps its @s (2026-11-13)
     assert "仍可能送達" in replies[0]
     assert memory.release_reminder_delivery_claim(claim)
 

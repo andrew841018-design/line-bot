@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 from linebot.v3.webhooks import GroupSource, MessageEvent, TextMessageContent
 
+import line_mentions
 import main
 import memory
 import reminder_push
@@ -445,6 +446,7 @@ def test_quoted_push_keeps_one_stage_and_binds_the_receipt(replies):
     main._handle_text_message(_event("只要一小時前提醒", quoted="push-1"), "G1")
     (text, kwargs), = replies
     assert text.splitlines()[0] == "已改成只在 1 小時前提醒"
+    assert isinstance(text, line_mentions.AllowsMemberMention)  # a receipt keeps its @s (2026-11-13)
     assert "時間：2099-09-30 14:00" in text and "看牙醫" in text
     assert kwargs["primary_reminder_ref"] == {"reminder_id": rid}
     assert kwargs["allow_push_fallback"] is True
