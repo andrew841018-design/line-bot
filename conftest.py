@@ -123,6 +123,289 @@ import sys as _sys
 os.environ.setdefault("PYSPARK_PYTHON", _sys.executable)
 os.environ.setdefault("PYSPARK_DRIVER_PYTHON", _sys.executable)
 
+# 2026-11-13 測試全域網路閘門（block_network）。在 import main 之前就裝，而且故意永遠不拆；為什麼、擋什麼、擋不到什麼見
+# block_network 的說明。計畫、探測、審查、部署在 ops/state/line_bot_test_network_gate_20261112/。
+# 改這段之前：它要留在所有專案模組的 import 之前（新的 import 放在 block_network() 下面）；換掉的函式有增減時，
+# test_network_gate.py 寫死的 10 個名字和 ops/state/…/mutants.py 的逐字片段要一起改；改任何一行都要重審。
+import _socket  # noqa: E402
+import errno  # noqa: E402
+import ipaddress  # noqa: E402
+import socket  # noqa: E402
+import weakref  # noqa: E402
+
+_NETWORK_GATE_MESSAGE = "tests may not use the network (conftest.py block_network)"
+# 正式 bot 的埠（preflight_check.UVICORN_PORT，test_network_gate.py 釘住兩邊一致）：就算這個行程自己綁了同一號也不放行。
+# 模組層變數：test_network_gate.py 用 monkeypatch 換成自己開的埠來測，絕不真的去連 8080。
+_GATE_NEVER_OURS = frozenset({8080})
+# 這個 pytest 行程裡 bind 過的 TCP／UDP socket：連本機時只放行同種類、同家族、還開著的那一個的埠。
+_gate_bound_sockets: "weakref.WeakSet[socket.socket]" = weakref.WeakSet()
+_gate_bound_lock = threading.Lock()
+# 故意永遠不 undo：整輪結束後還沒跑完的背景工作（ThreadPoolExecutor 佇列裡的、atexit）也要擋。
+_gate_monkeypatch = pytest.MonkeyPatch()
+_gate_installed = False
+# 裝閘門前的原版（test_network_gate.py 用它檢查沒有模組在閘門裝好前就存了一份原版）。
+_GATE_ORIGINALS: dict = {}
+
+
+def _gate_refusal(what) -> str:
+    return f"{_NETWORK_GATE_MESSAGE}: {what}"
+
+
+def _gate_host(host) -> str:
+    if isinstance(host, (bytes, bytearray)):
+        return bytes(host).decode("ascii", "replace")
+    return str(host)
+
+
+def _gate_numeric_addresses(host) -> "list[str] | None":
+    """libc 只讀字串（AI_NUMERICHOST，絕不問 DNS）讀得懂就是數字位址，回它代表的位址；讀不懂（是名字）回 None。
+    127.1、0x7f.1、2130706433 這類舊式寫法 ipaddress 讀不懂，libc 讀得懂。用 C 的 _socket.getaddrinfo，
+    不能改成 socket.getaddrinfo：那個已經是閘門版，會繞回自己。"""
+    try:
+        infos = _socket.getaddrinfo(host, None, 0, 0, 0, socket.AI_NUMERICHOST)
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return None
+    return [info[4][0] for info in infos]
+
+
+def _gate_ip(address: str):
+    return ipaddress.ip_address(address.split("%", 1)[0])
+
+
+def _gate_addresses_are_this_machine(addresses) -> bool:
+    # Python 3.13 起，IPv4-mapped（::ffff:127.0.0.1）的 is_loopback／is_unspecified 就看 IPv4 那一半。
+    return bool(addresses) and all(_gate_ip(a).is_loopback or _gate_ip(a).is_unspecified for a in addresses)
+
+
+def _gate_is_localhost_name(host) -> bool:
+    return _gate_host(host).lower() in ("localhost", "localhost.")
+
+
+def _gate_is_this_machine(host) -> bool:
+    """這台機器自己：確切的 "localhost"（不分大小寫，交給系統的 hosts 檔），或系統只讀字串（不問 DNS）就讀成
+    127.0.0.0/8、::1（帶 scope 也算）、IPv4-mapped 的 127.x、萬用位址 0.0.0.0／::（連過去就是連本機）的寫法。
+    這台電腦自己的主機名稱算外面。不先拿掉 % 或方括號：系統拿到的是原字串，"127.0.0.1%x.invalid"、"[::1]"
+    這類寫法它會當名字去查 DNS，所以不算本機。"""
+    return _gate_is_localhost_name(host) or _gate_addresses_are_this_machine(_gate_numeric_addresses(host))
+
+
+def _gate_family_on_the_wire(caller, host) -> int:
+    """IPv6 socket 連 IPv4 位址（127.0.0.1，或 IPv4-mapped 的 ::ffff:127.0.0.1）時，封包實際走 IPv4，
+    接的是 IPv4 的聽口。"""
+    if caller.family == socket.AF_INET6:
+        ips = [_gate_ip(a) for a in _gate_numeric_addresses(host) or []]
+        if ips and all(ip.version == 4 or ip.ipv4_mapped is not None for ip in ips):
+            return socket.AF_INET
+    return caller.family
+
+
+def _gate_port_is_ours(kind, family, port) -> bool:
+    """要連的是這個 port、種類 kind（TCP／UDP）、封包實際走 family（IPv4／IPv6）。TCP 和 UDP、IPv4 和 IPv6
+    各有自己的埠：同號碼不代表是同一個 server，要種類、家族都對得上；IPv4 只認綁在 :: 而且收 IPv4
+    （沒設 IPV6_V6ONLY）的雙棧 IPv6。"""
+    if port in _GATE_NEVER_OURS:
+        return False
+    with _gate_bound_lock:
+        candidates = list(_gate_bound_sockets)
+    for own in candidates:
+        try:
+            if own.fileno() == -1 or own.type != kind:
+                continue
+            bound_host, bound_port = own.getsockname()[:2]
+            if bound_port != port:
+                continue
+            if own.family == family:
+                return True
+            if (
+                own.family == socket.AF_INET6
+                and family == socket.AF_INET
+                and bound_host == "::"
+                and not own.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY)
+            ):
+                return True
+        except OSError:  # closed in between
+            continue
+    return False
+
+
+def _gate_remember(sock) -> None:
+    """記下「這個行程的」socket：bind 過的，以及送出過資料、connect 過的 UDP socket（系統替它挑了埠，回覆就寄到那裡）。"""
+    if sock.family in (socket.AF_INET, socket.AF_INET6):
+        with _gate_bound_lock:
+            _gate_bound_sockets.add(sock)
+
+
+def _gate_remember_datagram(sock) -> None:
+    """UDP 要在真的送出（或 connect）之前就記：對方可能在這個呼叫回來前就回覆。還沒拿到埠的 socket 埠號是 0，
+    不會對上任何人。"""
+    if sock.type == socket.SOCK_DGRAM:
+        _gate_remember(sock)
+
+
+def _gate_check_address(caller, address) -> None:
+    """connect／connect_ex／sendto／sendmsg 的目的地。AF_UNIX 的路徑（不是 tuple）放行，見 block_network。"""
+    if not isinstance(address, tuple) or len(address) < 2:
+        return
+    host, port = address[0], address[1]
+    if _gate_is_this_machine(host):
+        if _gate_port_is_ours(caller.type, _gate_family_on_the_wire(caller, host), port):
+            return
+        raise ConnectionRefusedError(
+            errno.ECONNREFUSED, _gate_refusal(f"loopback port {port} was not opened by this test run")
+        )
+    raise OSError(_gate_refusal(f"{_gate_host(host)}:{port}"))
+
+
+def _gate_refuse_lookup(host, error=socket.gaierror, code=socket.EAI_NONAME) -> None:
+    if host and not _gate_is_this_machine(host):
+        raise error(code, _gate_refusal(f"no lookup of {_gate_host(host)}"))
+
+
+def _install_network_gate(mp: pytest.MonkeyPatch) -> None:
+    real = {
+        "connect": socket.socket.connect,
+        "connect_ex": socket.socket.connect_ex,
+        "sendto": socket.socket.sendto,
+        "sendmsg": socket.socket.sendmsg,
+        "bind": socket.socket.bind,
+        "getaddrinfo": socket.getaddrinfo,
+        "gethostbyname": socket.gethostbyname,
+        "gethostbyname_ex": socket.gethostbyname_ex,
+        "gethostbyaddr": socket.gethostbyaddr,
+        "getnameinfo": socket.getnameinfo,
+    }
+    _GATE_ORIGINALS.update(real)
+
+    def connect(sock, address, *args, **kwargs):
+        _gate_check_address(sock, address)
+        _gate_remember_datagram(sock)
+        return real["connect"](sock, address, *args, **kwargs)
+
+    def connect_ex(sock, address, *args, **kwargs):
+        try:
+            _gate_check_address(sock, address)
+        except ConnectionRefusedError:  # 本機別人的埠：跟沒人在聽一樣回 ECONNREFUSED；對外照樣丟例外
+            return errno.ECONNREFUSED
+        _gate_remember_datagram(sock)
+        return real["connect_ex"](sock, address, *args, **kwargs)
+
+    def sendto(sock, data, *args):  # sendto(data, address) / sendto(data, flags, address)
+        if args:
+            _gate_check_address(sock, args[-1])
+        _gate_remember_datagram(sock)
+        return real["sendto"](sock, data, *args)
+
+    def sendmsg(sock, *args):  # sendmsg(buffers[, ancdata[, flags[, address]]])
+        if len(args) >= 4:
+            _gate_check_address(sock, args[3])
+        _gate_remember_datagram(sock)
+        return real["sendmsg"](sock, *args)
+
+    def bind(sock, address, *args, **kwargs):
+        result = real["bind"](sock, address, *args, **kwargs)
+        _gate_remember(sock)
+        return result
+
+    def getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        if host and not _gate_is_localhost_name(host):
+            addresses = _gate_numeric_addresses(host)
+            if addresses is None:  # 是名字：不查
+                raise socket.gaierror(socket.EAI_NONAME, _gate_refusal(f"no lookup of {_gate_host(host)}"))
+            if not _gate_addresses_are_this_machine(addresses):
+                flags |= socket.AI_NUMERICHOST  # 別台的數字位址：只在本機讀字串，絕不問 DNS；之後的 connect 照樣由閘門管
+        return real["getaddrinfo"](host, port, family, type, proto, flags)
+
+    def gethostbyname(host):
+        _gate_refuse_lookup(host)
+        return real["gethostbyname"](host)
+
+    def gethostbyname_ex(host):
+        _gate_refuse_lookup(host)
+        return real["gethostbyname_ex"](host)
+
+    def gethostbyaddr(host):
+        _gate_refuse_lookup(host, socket.herror, 1)  # 1 = HOST_NOT_FOUND，跟真的反查失敗一樣
+        return real["gethostbyaddr"](host)
+
+    def getnameinfo(sockaddr, flags):
+        if isinstance(sockaddr, tuple) and sockaddr:
+            _gate_refuse_lookup(sockaddr[0])
+        return real["getnameinfo"](sockaddr, flags)
+
+    for target, name, gate in (
+        (socket.socket, "connect", connect),
+        (socket.socket, "connect_ex", connect_ex),
+        (socket.socket, "sendto", sendto),
+        (socket.socket, "sendmsg", sendmsg),
+        (socket.socket, "bind", bind),
+        (socket, "getaddrinfo", getaddrinfo),
+        (socket, "gethostbyname", gethostbyname),
+        (socket, "gethostbyname_ex", gethostbyname_ex),
+        (socket, "gethostbyaddr", gethostbyaddr),
+        (socket, "getnameinfo", getnameinfo),
+    ):
+        gate.network_gate = True  # test_network_gate.py 用這個記號確認裝的是閘門版
+        mp.setattr(target, name, gate)
+
+    # yt-dlp 偽裝瀏覽器時走 curl_cffi：libcurl 在 C 裡自己查 DNS、自己連線，上面的 socket 擋不到，在 Python 入口擋。
+    # 丟 curl_cffi 自己的 CurlError（6 = CURLE_COULDNT_RESOLVE_HOST，跟真的斷網一樣）：呼叫端只接 CurlError，
+    # 丟別的會在串流執行緒裡被吞掉，只剩「HTTP Error 0」。
+    try:
+        from curl_cffi.curl import Curl, CurlError
+    except ImportError:  # 沒裝：yt-dlp 只會走 Python 的 HTTP，上面已經擋住
+        return
+
+    def perform(curl, *args, **kwargs):
+        raise CurlError(_gate_refusal("curl_cffi"), 6)
+
+    perform.network_gate = True
+    mp.setattr(Curl, "perform", perform)
+
+
+def block_network() -> None:
+    """測試不能連到這台機器以外，也不能連到這台機器上別的程式：正式 bot 就在 127.0.0.1:8080，它的 /jobs 信任本機。
+
+    - 什麼時候裝：conftest 一被 import 就裝，在它 import main 之前，所以 main 和它帶進來的模組存下來的也是閘門版。
+      故意永遠不拆：整輪結束後 ThreadPoolExecutor 佇列裡還沒跑的工作、atexit 都還會跑。同一個行程只裝一次。
+    - 擋什麼：
+      - 對外的 connect／connect_ex／sendto／sendmsg 丟 OSError。
+      - 查名字：getaddrinfo、gethostbyname、gethostbyname_ex、getnameinfo 查不是本機的名字丟 gaierror；
+        gethostbyaddr 丟 herror。本機的名字只有 localhost，這台電腦自己的主機名稱算外面。
+      - 數字位址：getaddrinfo 照常在本機讀出來、不問 DNS，連過去才擋；別台的數字位址強制加 AI_NUMERICHOST，
+        所以 family=AF_INET6 查 IPv4 字面位址會丟 gaierror（真的斷網時會給 ::ffff: 對映，這點比斷網嚴）。
+        gethostbyname、gethostbyname_ex、getnameinfo、gethostbyaddr 連數字位址也擋，比真的斷網嚴，是故意的。
+      - curl_cffi（libcurl）的 Curl.perform 丟 CurlError（代碼 6，跟查不到主機一樣）。
+    - 本機（_gate_is_this_machine）：只放行這個 pytest 行程自己的 socket 的埠，也就是 bind 過的，或送出過資料、
+      connect 過的 UDP（系統替它挑了埠，回覆寄到那裡）；而且要還開著、TCP／UDP 相同、家族照封包實際走的相同
+      （IPv6 socket 連 127.0.0.1 或 ::ffff:127.x 算 IPv4；綁在 :: 又沒設 IPV6_V6ONLY 的 IPv6 也接 IPv4）。別的本機埠：
+      TCP 丟 ConnectionRefusedError（connect_ex 回 ECONNREFUSED），跟沒人在聽一樣；UDP 在 connect 或送出時就丟。
+      _GATE_NEVER_OURS（正式 bot 的 8080）就算自己綁了也一律拒絕。
+    - 例外：AF_UNIX（socket 檔）不管，本機程式的 socket 檔（例如 postgres 的 /tmp/.s.PGSQL.5432）連得到。
+    - 要測連線行為：在測試裡自己開本機 server，或換假物件；不要放寬這個閘門，也不要加開關。開 server 用 port 0：
+      用指定號碼綁 0.0.0.0／:: 又設 SO_REUSEADDR 時，別人在 127.0.0.1 的同號聽口會接走連線，閘門看不出來。
+      不要包 TLS：包了會換掉 socket，閘門就不認了。test_model_all_mention.py 自己的 _no_network 疊在上面，沒有衝突。
+    - 閘門的錯走的是呼叫端「連不上」的那條路，不一定跟有網路時一樣：例如 Gemini 把它當暫時性錯誤，重試、多睡幾秒。
+      背景執行緒沒接住閘門的錯時，警告（PytestUnhandledThreadExceptionWarning，或物件回收時才冒出的
+      PytestUnraisableExceptionWarning）會掛在後面另一條測試上。
+    - 擋不到（寫在這裡，別以為有）：
+      - 子行程：Claude CLI 靠 run_gate_suite.sh 的 CLAUDE_CODE_CMD=/nonexistent/claude，手動跑 pytest 沒有這層；
+        curl、ffmpeg、multiprocessing spawn 出來的行程等都沒有。
+      - 自己在 C 裡連線的函式庫：libpq、uvloop／libuv 事件迴圈、curl_cffi 的 AsyncSession。
+      - 繞過 Python 那層直接用 C 的：_socket、socket.SocketType、_socket.socket.connect(s, …)、
+        importlib.reload(socket)（會把原版放回去）。
+      - conftest 被 import 之前就跑的東西（pytest 外掛載入時）；不經 pytest、直接 `python test_x.py` 跑的檔。
+      - 本機位址的反查（gethostbyaddr("127.0.0.1") 等）照常交給系統解析器。
+      - 刻意偽造的型別（__str__ 騙人的字串、永遠相等的 port 物件）。整數 host 會丟 OSError，不是原本的 TypeError。
+    """
+    global _gate_installed
+    if _gate_installed:
+        return
+    _install_network_gate(_gate_monkeypatch)
+    _gate_installed = True
+
+
+block_network()
+
 import burst_filter  # noqa: E402
 import claude_client  # noqa: E402
 import config  # noqa: E402
