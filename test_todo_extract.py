@@ -1,12 +1,14 @@
 """TODO extraction, push folds, switch and unsend (2026-11-13, Andrew 選「B：兩個都開」).
 
-Design: ops/state/line_bot_extractor_sweep_20261113/IMPL_PLAN_v2.md (PRE_3 §5 with PRE_4's fixes).
+Design: ops/state/line_bot_extractor_sweep_20261113/IMPL_PLAN_v2.md (PRE_3 §5 with PRE_4's fixes), and
+FIX_LIST.md items 1–12 after the four post-implementation reviews (POST_1–POST_4).
 The model is faked at its one seam (gemini_client.side_task_last_tier), and every test that runs the
 extraction asserts how often it was called.  Pushes go to conftest's recorder, never LINE.  People are
 成員甲／成員乙 (user-a／user-b), texts and ids are synthetic, and now is always injected.
 """
 
 import ast
+import itertools
 import json
 import logging
 import os
@@ -79,18 +81,21 @@ def _answer(items, finish="STOP", text=None):
 
 @pytest.fixture(autouse=True)
 def model(monkeypatch):
-    """Answers queued per test: a list of items, None (no answer) or a ready response.  Every test in this
-    file has the model faked, so nothing can reach the real one."""
+    """Answers queued per test: a list of items, None (no answer) or a ready response.  ``during`` holds
+    what happens elsewhere while the model answers (another process, the bot).  Every test in this file
+    has the model faked, so nothing can reach the real one."""
     import gemini_client
 
     calls: dict = {
-        "prompts": [], "labels": [], "answers": [], "ready": True,
+        "prompts": [], "labels": [], "answers": [], "during": [], "ready": True,
         "real": (gemini_client.side_task_last_tier, gemini_client.side_task_last_tier_ready),
     }
 
     def side_task(prompt, config, *, label):
         calls["prompts"].append(prompt)
         calls["labels"].append(label)
+        if calls["during"]:
+            calls["during"].pop(0)()
         answer = calls["answers"].pop(0) if calls["answers"] else []
         if answer is None or isinstance(answer, SimpleNamespace):
             return answer
@@ -130,28 +135,33 @@ def _todo(todo_id):
         return dict(c.execute("SELECT * FROM todos WHERE todo_id=?", (todo_id,)).fetchone())
 
 
-def _seed_todo(task, owner="user-a", due=TODAY, *, mid=None, source=None, status="pending", group=GROUP):
+def _seed_todo(task, owner="user-a", due=TODAY, *, mid=None, source=None, status="pending", group=GROUP,
+               said=LAST_NIGHT, todo_id=None):
+    """A todo as the extraction writes it: ``created_at`` is when its message was said (milliseconds)."""
     import todo
 
-    tid = uuid.uuid4().hex
+    tid = todo_id or uuid.uuid4().hex
     with todo._conn() as c:
         c.execute(
             "INSERT INTO todos (todo_id, group_id, sender_user_id, task, due_date, status, source_msg_id, "
             "source_text, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (tid, group, owner, task, _iso(due), status, mid, source, int(time.time() * 1000)),
+            (tid, group, owner, task, _iso(due), status, mid, source, int(said) * 1000),
         )
     return tid
 
 
 def _reminder(action, remind_at, *, user="user-a", status="pending", aliases=(), source_ref="",
-              source_text=None, source_kind="", time_kind="clock", group=GROUP):
+              source_text=None, source_kind="", time_kind="clock", group=GROUP, created_at=None):
+    """``created_at`` (seconds) is a day before ``remind_at`` unless given: the text match only counts a
+    reminder made around its message (POST_1 I-2), so the tests that rely on it say when it was made."""
     import memory
 
+    made = int(remind_at) - 86400 if created_at is None else int(created_at)
     with memory._conn() as c:
         cur = c.execute(
             "INSERT INTO reminders (group_id, user_id, action, remind_at, created_at, status, source_kind, "
             "source_ref, source_text, mention_aliases, time_kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (group, user, action, int(remind_at), int(remind_at) - 86400, status, source_kind, source_ref,
+            (group, user, action, int(remind_at), made, status, source_kind, source_ref,
              source_text, json.dumps(list(aliases), ensure_ascii=False), time_kind),
         )
         return cur.lastrowid
@@ -204,6 +214,14 @@ def _last_push(group=GROUP) -> dict:
     return json.loads(row[0]) if row else {}
 
 
+def _last_run(group=GROUP) -> dict:
+    import todo
+
+    with todo._conn() as c:
+        row = c.execute("SELECT last_run FROM extract_cursors WHERE name='todo' AND group_id=?", (group,)).fetchone()
+    return json.loads(row[0]) if row else {}
+
+
 def _push(now=NOW, group=GROUP) -> int:
     import todo
 
@@ -222,9 +240,10 @@ def _pushed_text(call) -> str:
 
 
 def _run(now=NOW, group=GROUP):
+    """The 08:00 job's extraction: its push follows, so a todo due today is made (main_reminder)."""
     import todo
 
-    return todo.run_incremental(group, now=now)
+    return todo.run_incremental(group, now=now, push_follows=True)
 
 
 def _item(i, task, due, **extra):
@@ -257,13 +276,42 @@ def test_a_message_said_last_night_is_read_once_and_pushed_this_morning(model):
 def test_extract_only_reads_and_never_pushes(model):
     import todo
 
-    _raw("msg-1", "user-a", "我明天要交報告", LAST_NIGHT)
-    model["answers"].append([_item(1, "交報告", TODAY)])
+    _raw("msg-1", "user-a", "我後天要交報告", LAST_NIGHT)
+    model["answers"].append([_item(1, "交報告", TODAY + timedelta(days=1))])
 
     assert todo.main_extractor_sweep(now=NOW) == 0
 
     assert len(model["prompts"]) == 1 and _pushes() == []
     assert [r["task"] for r in _todos()] == ["交報告"] and _todos()[0]["last_reminded_at"] is None
+
+
+def test_an_extract_no_push_follows_makes_no_todo_due_today(model):
+    """POST_1 N-3: only the 08:00 job pushes, right after it extracts.  The Sunday 19:00 extract (or any
+    manual one) would make a row due today that can only expire, so it makes none."""
+    import todo
+
+    sunday = date(2026, 11, 15)
+    _raw("msg-1", "user-a", "我今天晚上要繳費", _ts(sunday, 10))
+    _raw("msg-2", "user-a", "我明天要交報告", _ts(sunday, 11))
+    model["answers"].append([_item(1, "繳費", sunday), _item(2, "交報告", sunday + timedelta(days=1))])
+
+    assert todo.main_extractor_sweep(now=_ts(sunday, 19)) == 0
+
+    assert len(model["prompts"]) == 1 and _pushes() == []
+    assert [r["task"] for r in _todos()] == ["交報告"]
+    run = _last_run()
+    assert (run["new"], run["skipped"]) == (1, {"due_today_no_push": 1})
+
+
+def test_run_incremental_alone_is_an_extract_no_push_follows(model):
+    import todo
+
+    _raw("msg-1", "user-a", "我明天要交報告", LAST_NIGHT)
+    model["answers"].append([_item(1, "交報告", TODAY)])
+
+    result = todo.run_incremental(GROUP, now=NOW)
+
+    assert len(model["prompts"]) == 1 and result.skipped == {"due_today_no_push": 1} and _todos() == []
 
 
 def test_only_no_argument_or_extract_does_anything(monkeypatch, model):
@@ -458,6 +506,100 @@ def test_tomorrow_said_after_midnight_is_not_sent(model):
     assert model["prompts"] == [] and result.skipped.get("late_night_ambiguous") == 1
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "我今天要交報告", "我今晚要交報告", "我明天要交報告", "我明早要交報告", "我明晚要交報告", "我明日要交報告",
+        "我後天要交報告", "我大後天要交報告", "我下週三要交報告", "我這週日要回老家", "我週三要交報告",
+        "我禮拜三要交報告", "我星期三要交報告", "我下個月要搬家", "我月底要繳房租",
+        "我週末要回老家", "我晚點要去買菜", "我5號要繳費", "我明天11/20要交報告",
+    ],
+)
+def test_a_date_counted_from_today_said_after_midnight_is_not_sent(model, text):
+    """F2 widened (POST_2 I-2): at 00:30 on a Monday, 「下週三」 still means the speaker's Sunday-night next
+    week.  Between 00:00 and 04:59 only absolute dates are sent."""
+    _raw("msg-1", "user-a", text, _ts(TODAY, 0, 30))
+
+    result = _run()
+
+    assert model["prompts"] == [] and result.skipped == {"late_night_ambiguous": 1}
+
+
+@pytest.mark.parametrize(
+    "text", ["我11/20要交報告", "我11月20日要交報告", "我十一月二十日要交報告", "我2026-11-20要交報告", "我11/20 14:30要交報告"]
+)
+def test_an_absolute_date_said_after_midnight_is_sent(model, text):
+    _raw("msg-1", "user-a", text, _ts(TODAY, 0, 30))
+
+    result = _run()
+
+    assert len(model["prompts"]) == 1 and text in model["prompts"][0] and result.skipped == {}
+
+
+@pytest.mark.parametrize("hour,minute,sent", [(4, 59, False), (5, 0, True)])
+def test_the_late_night_rule_ends_at_five(model, hour, minute, sent):
+    _raw("msg-1", "user-a", "我明天要交報告", _ts(TODAY, hour, minute))
+
+    result = _run()
+
+    assert len(model["prompts"]) == (1 if sent else 0)
+    assert result.skipped.get("late_night_ambiguous", 0) == (0 if sent else 1)
+
+
+def test_someone_elses_plan_with_no_i_in_it_is_not_sent(model):
+    """POST_2 I-3: the owner is always the speaker, so a message about another person with no 我 in it is
+    never sent (before this, the prompt's rule 1 was the only guard and a wrong item @ed the speaker)."""
+    for n, text in enumerate(("爸爸下週三要去健檢", "成員乙明天要交報告", "你明天記得要繳房租喔", "外公明天要去銀行")):
+        _raw(f"msg-{n}", "user-a", text, LAST_NIGHT + n)
+
+    result = _run()
+
+    assert model["prompts"] == [] and result.skipped == {"other_subject": 4}
+
+
+def test_a_message_with_i_in_it_or_no_other_person_is_sent(model):
+    texts = (
+        "媽媽明天回診，我載她去", "明天要交報告", "明天要去公司開會", "明天要買牛奶", "明天要買其他東西",
+        "成員甲明天要繳房租",  # the speaker's own name
+    )
+    for n, text in enumerate(texts):
+        _raw(f"msg-{n}", "user-a", text, LAST_NIGHT + n)
+    model["answers"].append([_item(1, "載媽媽回診", TODAY), _item(2, "交報告", TODAY)])
+
+    result = _run()
+
+    assert len(model["prompts"]) == 1 and "other_subject" not in result.skipped and result.new == 2
+    sent = model["prompts"][0].split("【訊息】\n", 1)[1]
+    assert all(text in sent for text in texts)
+
+
+def test_known_limits_of_the_subject_check(model):
+    """Known limits (FIX_LIST 4: only a message with no 我 is checked, against a fixed list of words).
+    Someone else's plan with 我 in it, or with a person word not on the list, is still sent and only the
+    prompt's rule 1 guards it; the speaker's own plan with a family word and no 我 is not sent."""
+    missed = ("我媽明天要回診", "阿姨明天要來家裡", "大家明天要早起")
+    for n, text in enumerate(missed):
+        _raw(f"msg-{n}", "user-a", text, LAST_NIGHT + n)
+    _raw("msg-9", "user-a", "明天要載媽媽去回診", LAST_NIGHT + 9)
+
+    result = _run()
+
+    assert len(model["prompts"]) == 1 and result.skipped == {"other_subject": 1}
+    sent = model["prompts"][0].split("【訊息】\n", 1)[1]
+    assert all(text in sent for text in missed) and "載媽媽" not in sent
+
+
+def test_a_standing_routine_is_not_a_todo(model):
+    """POST_2 N-1: 「每週三」 is not one day; a message about a routine is not sent at all."""
+    texts = ("我每週三要倒垃圾", "我每個禮拜三要去運動", "我從明天開始每天都要早起", "我每個月5號要繳房租", "我每年過年都要回老家")
+    for n, text in enumerate(texts):
+        _raw(f"msg-{n}", "user-a", text, LAST_NIGHT + n)
+
+    result = _run()
+
+    assert model["prompts"] == [] and result.skipped == {"recurring": 5}
+
+
 # ── what each answer item must pass ─────────────────────────────────────────────────────────────────
 
 
@@ -595,7 +737,7 @@ def test_expected_dates_reads_the_message_own_words():
         "我1/5要交": {date(2027, 1, 5)},
         "我12月1號要交": {date(2026, 12, 1)},
         "我2026年12月1日要交": {date(2026, 12, 1)},
-        "我5號要繳費": {date(2026, 11, 5), date(2026, 12, 5)},
+        "我5號要繳費": {date(2026, 12, 5)},  # this month's 5th is over (POST_2 I-1: one month, not two)
         "我2/30要交": set(),
         "我2/29要交": set(),
         "我月底要繳": set(),
@@ -606,18 +748,123 @@ def test_expected_dates_reads_the_message_own_words():
     assert todo.expected_dates("我2/29要交", date(2027, 11, 13)) == {date(2028, 2, 29)}
 
 
+@pytest.mark.parametrize(
+    "text,said,want",
+    [
+        # POST_2 I-1: a bare day number is the first such day not before the day it was said
+        ("我5號要繳費", date(2026, 11, 13), {date(2026, 12, 5)}),
+        ("我13號要繳費", date(2026, 11, 13), {date(2026, 11, 13)}),
+        ("我25號要繳學費", date(2026, 11, 20), {date(2026, 11, 25)}),
+        ("我20日要繳費", date(2026, 11, 13), {date(2026, 11, 20)}),
+        ("我31號要繳", date(2026, 11, 20), {date(2026, 12, 31)}),  # November has no 31st
+        ("我30號要交", date(2027, 1, 31), {date(2027, 3, 30)}),  # nor February a 30th
+        # …and a month word says which month
+        ("我下個月5號要繳房租", date(2026, 11, 3), {date(2026, 12, 5)}),
+        ("我下月25號要繳", date(2026, 11, 3), {date(2026, 12, 25)}),
+        ("我下個月的5號要繳", date(2026, 12, 3), {date(2027, 1, 5)}),
+        ("我下下個月5號要繳", date(2026, 11, 3), {date(2027, 1, 5)}),
+        ("我這個月20號要繳", date(2026, 11, 13), {date(2026, 11, 20)}),
+        ("我本月5號要繳", date(2026, 11, 13), {date(2026, 11, 5)}),  # over: the bounds drop any answer
+        ("我下個月30號要繳", date(2027, 1, 13), set()),  # no such day
+        # POST_2 N-1／POST_1 N-4: Chinese numerals (一 to 三十一, 廿)
+        ("我十五號要交報告", date(2026, 11, 13), {date(2026, 11, 15)}),
+        ("我三號要繳", date(2026, 11, 13), {date(2026, 12, 3)}),
+        ("我廿五號要繳", date(2026, 11, 13), {date(2026, 11, 25)}),
+        ("我二十號要繳", date(2026, 11, 13), {date(2026, 11, 20)}),
+        ("我三十一號要繳", date(2026, 11, 13), {date(2026, 12, 31)}),
+        ("我十一月二十號要出差", date(2026, 11, 13), {date(2026, 11, 20)}),
+        ("我三月五日要出發", date(2026, 11, 13), {date(2027, 3, 5)}),
+        ("我下個月五號要繳", date(2026, 11, 13), {date(2026, 12, 5)}),
+        ("今天主管說我十一月二十號要出差", date(2026, 11, 13), {date(2026, 11, 13), date(2026, 11, 20)}),
+        # …and words that look like a weekday or a day number but are not one
+        ("這週天氣好冷，我下週二要去看牙醫", date(2026, 11, 13), {date(2026, 11, 17)}),
+        ("下週日本出差要準備", date(2026, 11, 12), set()),
+        ("上週三說好的，我週五要交報告", date(2026, 11, 16), {date(2026, 11, 20)}),
+        ("我每週三要倒垃圾", date(2026, 11, 13), set()),
+        ("我3日後要交", date(2026, 11, 13), set()),
+        ("我明天要去1日遊", date(2026, 11, 13), {date(2026, 11, 14)}),
+    ],
+)
+def test_day_numbers_and_week_words_read_as_a_calendar_would(text, said, want):
+    import todo
+
+    assert todo.expected_dates(text, said) == want
+
+
+def test_a_day_number_admits_one_month_only(model):
+    """POST_2 I-1: 「下個月5號」 is next month's 5th and a bare 「25號」 this month's; a model answer a month
+    off is dropped, not pushed a month early or late."""
+    said = date(2026, 11, 3)
+    _raw("msg-1", "user-a", "我下個月5號要繳房租", _ts(said, 21))
+    _raw("msg-2", "user-a", "我25號要繳學費", _ts(said, 21) + 1)
+    model["answers"].append([
+        _item(1, "繳房租", date(2026, 11, 5)),  # a month early
+        _item(2, "繳學費", date(2026, 12, 25)),  # a month late
+        _item(1, "繳房租", date(2026, 12, 5)),
+        _item(2, "繳學費", date(2026, 11, 25)),
+    ])
+
+    result = _run(_ts(said + timedelta(days=1), 8))
+
+    assert len(model["prompts"]) == 1 and result.skipped.get("date_mismatch") == 2 and result.new == 2
+    assert sorted(r["due_date"] for r in _todos()) == ["2026-11-25", "2026-12-05"]
+
+
+def test_date_words_are_taken_out_of_the_task(model):
+    """POST_2 N-9: pushed on its day, a task must not still say 「明天」.  A task that was only a date is
+    dropped; 一日遊 and 過年 are not dates here."""
+    import todo
+
+    _raw("msg-1", "user-a", "我明天要交報告", LAST_NIGHT)
+    _raw("msg-2", "user-a", "我下週三要去銀行", LAST_NIGHT + 1)
+    _raw("msg-3", "user-a", "我11/20要繳房租", LAST_NIGHT + 2)
+    _raw("msg-4", "user-a", "我明天要去一日遊", LAST_NIGHT + 3)
+    model["answers"].append([
+        _item(1, "明天交報告", TODAY),
+        _item(2, "下週三去銀行", date(2026, 11, 18)),
+        _item(3, "11/20 繳房租", date(2026, 11, 20)),
+        _item(4, "去一日遊", TODAY),
+        _item(1, "明天", TODAY),
+    ])
+
+    result = _run()
+
+    assert len(model["prompts"]) == 1 and result.new == 4 and result.skipped == {"bad_task": 1}
+    assert sorted(r["task"] for r in _todos()) == sorted(["交報告", "去銀行", "繳房租", "去一日遊"])
+    assert todo._clean_task("準備過年的年菜") == "準備過年的年菜"
+    assert todo._clean_task("下週三的家長會") == "家長會"
+    assert todo._clean_task("預約下週三看牙醫") == "預約看牙醫"  # no gap left between the words
+    assert todo._clean_task("準備明天的簡報") == "準備簡報"  # a date goes with its 的
+    assert todo._clean_task("交上週的報告") == "交報告"
+    assert todo._clean_task("加1/3杯水") == "加1/3杯水"  # a fraction is no date
+
+
 def test_a_message_that_already_made_a_reminder_or_event_makes_no_todo(model):
     _raw("msg-1", "user-a", "我明天要交報告", LAST_NIGHT)
     _raw("msg-2", "user-a", "我明天要繳房租", LAST_NIGHT + 1)
     _raw("msg-3", "user-a", "我明天要去銀行", LAST_NIGHT + 2)
     _reminder("交期末報告", _ts(TODAY, 9), source_ref="msg-1:0", source_kind="schedule_line", status="done")
     _event("繳房租", TODAY, mid="msg-2", status="cancelled")
-    _reminder("去銀行辦事", _ts(TODAY, 10), user="user-b", source_text="我明天要去銀行")
+    _reminder("去銀行辦事", _ts(TODAY, 10), user="user-b", source_text="我明天要去銀行", created_at=LAST_NIGHT + 62)
     model["answers"].append([_item(1, "交報告", TODAY), _item(2, "繳房租", TODAY), _item(3, "去銀行", TODAY)])
 
     result = _run()
 
     assert len(model["prompts"]) == 1 and result.skipped.get("dup_structural") == 3 and _todos() == []
+
+
+def test_the_same_words_said_again_the_next_night_make_their_own_todo(model):
+    """POST_1 I-2: two nights ago 「我明天要加班」 made a reminder (for yesterday); last night the same words
+    made none.  Its todo is made (the old reminder was made before this message) and pushed today."""
+    _reminder("加班", _ts(YESTERDAY, 9), user="user-a", status="done", source_text="我明天要加班",
+              created_at=LAST_NIGHT - 86400 + 60)
+    _raw("msg-1", "user-a", "我明天要加班", LAST_NIGHT)
+    model["answers"].append([_item(1, "加班", TODAY)])
+
+    result = _run()
+
+    assert len(model["prompts"]) == 1 and result.new == 1 and result.skipped == {}
+    assert _push() == 1 and _last_push()["fold_structural"] == 0
 
 
 def test_two_todos_from_one_message_are_both_kept_but_one_task_is_never_stored_twice(model):
@@ -690,6 +937,20 @@ def test_shadow_rows_never_expire(monkeypatch):
     assert _todo(old)["status"] == "shadow" and _last_push()["expired"] == 0
 
 
+@pytest.mark.parametrize("mode", ["on", "off", "shadow"])
+def test_a_shadow_row_loses_its_words_once_its_day_is_over_whatever_the_mode(monkeypatch, mode):
+    """PRE_4 I9 (POST_1 N-5, POST_2 N-5): a shadow row is never pushed, so the first push step after its
+    day drops its words, even after the switch went back to on (or off).  It stays shadow."""
+    monkeypatch.setenv("LINE_BOT_TODO_MODE", mode)
+    past = _seed_todo("去銀行", due=YESTERDAY, mid="msg-1", source="我下週三要去銀行", status="shadow")
+    later = _seed_todo("交報告", due=TODAY + timedelta(days=1), mid="msg-2", source="我後天要交報告", status="shadow")
+
+    _push()
+
+    assert (_todo(past)["status"], _todo(past)["source_text"]) == ("shadow", None)
+    assert (_todo(later)["status"], _todo(later)["source_text"]) == ("shadow", "我後天要交報告")
+
+
 def test_switching_back_on_after_days_off_raises_no_push_alarm():
     """Rows that fell due while the job was off just expire; push_ok only says whether today's went out."""
     first = _seed_todo("交報告", due=YESTERDAY)
@@ -754,6 +1015,86 @@ def test_the_retry_key_carries_the_sorted_ids():
     assert users == ["user-a", "user-b"]
 
 
+@pytest.mark.parametrize("order", [("todo-b", "todo-a"), ("todo-a", "todo-b")], ids=["b_first", "a_first"])
+def test_the_retry_key_is_the_same_whichever_row_comes_first(order):
+    """POST_3 N5: two fixed ids in both orders (the push reads them by message time), so an unsorted key
+    fails every time, not by chance."""
+    owners = {"todo-a": ("user-a", "交報告"), "todo-b": ("user-b", "繳房租")}
+    for n, tid in enumerate(order):
+        _seed_todo(owners[tid][1], owner=owners[tid][0], todo_id=tid, said=LAST_NIGHT + n)
+
+    assert _push() == 2
+
+    [call] = _pushes()
+    key = f"todo_daily:{GROUP}:{_iso(TODAY)}:todo-a,todo-b"
+    assert call["retry_key"] == str(uuid.uuid5(uuid.NAMESPACE_URL, key))
+
+
+def test_a_push_that_went_out_is_ok_even_when_marking_it_fails(monkeypatch):
+    """POST_1 N-2: LINE took the message; only the marking failed.  push_ok stays true (no false
+    todo_push_failed alarm) and mark_error counts the rows left unmarked."""
+    import todo
+
+    _seed_todo("交報告", source="我明天要交報告")
+
+    def locked(ids, now, **kwargs):
+        if ids:
+            raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(todo, "_mark_done", locked)
+
+    assert _push() == 1
+
+    push = _last_push()
+    assert len(_pushes()) == 1 and (push["push_ok"], push["mark_error"], push["pushed"]) == (True, 1, 1)
+
+
+def test_a_fold_that_cannot_be_marked_holds_back_nothing_else(monkeypatch):
+    import todo
+
+    folded = _seed_todo("交報告", mid="msg-1", source="我明天要交報告")
+    _reminder("交報告", _ts(TODAY, 9), user="user-a")  # the same event, and it pings the owner
+    pushed = _seed_todo("繳房租", owner="user-b", mid="msg-2", source="我明天要繳房租")
+    real = todo._mark_done
+
+    def flaky(ids, now, **kwargs):
+        if folded in ids:
+            raise sqlite3.OperationalError("database is locked")
+        return real(ids, now, **kwargs)
+
+    monkeypatch.setattr(todo, "_mark_done", flaky)
+
+    assert _push() == 1
+
+    push = _last_push()
+    assert (push["fold_semantic"], push["mark_error"], push["pushed"], push["push_ok"]) == (1, 1, 1, True)
+    assert _todo(pushed)["last_reminded_at"] and _todo(folded)["last_reminded_at"] is None
+
+
+def test_the_push_waits_30_seconds_for_the_database_and_an_unsend_5(monkeypatch):
+    """PRE_4 N4, POST_1 N-2: the 08:00 push waits as long as the job's other connections.  forget_message
+    runs in the bot's one webhook thread, so it waits 5 seconds at most (POST_1 N-9, POST_4 N1)."""
+    import todo
+
+    _seed_todo("交報告", mid="msg-1", source="我明天要交報告")
+    _seed_cursor()
+    seen: list = []
+    real = todo._conn
+
+    def spy(timeout=5.0):
+        seen.append(timeout)
+        return real(timeout=timeout)
+
+    monkeypatch.setattr(todo, "_conn", spy)
+
+    assert todo.push_daily_reminders(GROUP, now=NOW) == 1
+    assert seen and set(seen) == {30.0}
+
+    seen.clear()
+    todo.forget_message(GROUP, "msg-2", now=NOW)
+    assert seen == [5.0]
+
+
 def test_a_failed_push_is_not_marked_and_expires_tomorrow(monkeypatch):
     import line_push_client
 
@@ -805,9 +1146,9 @@ def test_the_reminder_format_keeps_its_two_arguments():
     "made",
     [
         lambda: _reminder("繳交期末報告", _ts(TODAY + timedelta(days=3), 9), user="user-b",
-                          source_text="我明天要交期末報告"),
+                          source_text="我明天要交期末報告", created_at=LAST_NIGHT + 62),
         lambda: _reminder("繳交期末報告", _ts(TODAY + timedelta(days=3), 9), user="user-b",
-                          source_text="別人的一則\n---\n我明天要交期末報告"),
+                          source_text="別人的一則\n---\n我明天要交期末報告", created_at=LAST_NIGHT + 62),
         lambda: _reminder("期末報告", _ts(TODAY + timedelta(days=3), 9), user="user-b",
                           source_kind="schedule_line", source_ref="msg-1:2", status="cancelled"),
         lambda: _event("期末報告", TODAY + timedelta(days=3), mid="msg-1", status="cancelled"),
@@ -823,6 +1164,81 @@ def test_a_reminder_or_event_made_from_the_same_message_folds_the_todo(made):
     push = _last_push()
     assert (push["fold_structural"], push["fold_queue"], push["fold_semantic"]) == (1, 0, 0) and _pushes() == []
     assert _todo(tid)["last_reminded_at"] and _todo(tid)["source_text"] is None
+
+
+@pytest.mark.parametrize(
+    "made_at,folded",
+    [
+        (LAST_NIGHT - 300, True),
+        (LAST_NIGHT + 7 * 86400, True),
+        (LAST_NIGHT - 301, False),
+        (LAST_NIGHT + 7 * 86400 + 1, False),
+        (LAST_NIGHT - 35 * 86400, False),
+    ],
+    ids=["300s_before", "7_days_after", "301s_before", "past_7_days", "five_weeks_before"],
+)
+def test_the_same_words_fold_a_todo_only_from_a_reminder_made_around_its_message(made_at, folded):
+    """POST_1 I-2: equal words are the same message only for a reminder made from 300 seconds before it was
+    said to 7 days after (the reminder queue).  The id keys (source_ref, the event's message) hold always."""
+    _seed_todo("加班", mid="msg-1", source="我明天要加班")
+    _reminder("加班", _ts(TODAY + timedelta(days=10), 9), user="user-b", source_text="我明天要加班",
+              created_at=made_at)
+
+    assert _push() == (0 if folded else 1)
+
+    assert _last_push()["fold_structural"] == (1 if folded else 0)
+
+
+def test_the_same_words_from_a_reminder_weeks_ago_leave_the_todo_to_be_pushed(model):
+    """POST_1 I-2 (P4): five weeks ago the same sentence made a passive reminder; last night's made none.
+    That old reminder is another message: the todo is made and pushed."""
+    import todo
+
+    old = _ts(TODAY - timedelta(days=34), 9)
+    _reminder("加班", old, user="user-a", status="done", source_text="我明天要加班", created_at=old - 86400)
+    _raw("msg-1", "user-a", "我明天要加班", LAST_NIGHT)
+    model["answers"].append([_item(1, "加班", TODAY)])
+
+    assert todo.main_reminder(now=NOW) == 0
+
+    assert len(model["prompts"]) == 1 and len(_pushes()) == 1
+    assert (_last_push()["fold_structural"], _last_push()["pushed"]) == (0, 1)
+
+
+def test_the_push_matches_the_words_against_when_the_message_was_said(monkeypatch, model):
+    """POST_1 I-2: todos.created_at is when the message was said, not when the job ran.  Here the
+    extraction's own look failed (the row is kept), so only the push can fold it into the reminder made
+    from that message an hour after it was said, hours before the extraction ran."""
+    import memory
+
+    _raw("msg-1", "user-a", "我後天要交報告", LAST_NIGHT)
+    _reminder("交報告", _ts(TODAY + timedelta(days=1), 9), user="user-b", source_text="我後天要交報告",
+              created_at=LAST_NIGHT + 3600)
+    model["answers"].append([_item(1, "交報告", TODAY + timedelta(days=1))])
+
+    def down(*args, **kwargs):
+        raise RuntimeError("the reminder table is unreadable")
+
+    with monkeypatch.context() as m:
+        m.setattr(memory, "reminders_between", down)
+        result = _run()
+    assert len(model["prompts"]) == 1 and result.new == 1 and result.skipped == {"structural_unchecked": 1}
+
+    assert _push(NOW + 86400) == 0
+
+    assert _last_push()["fold_structural"] == 1 and _pushes() == []
+
+
+def test_a_long_message_folds_on_its_first_500_characters():
+    """POST_1 I-2: todos.source_text keeps 500 characters and a reminder the whole message; both are cut
+    the same way before they are compared."""
+    long = "我明天要加班，" + "合成的說明文字" * 80
+    _seed_todo("加班", mid="msg-1", source=long[:500])
+    _reminder("加班", _ts(TODAY + timedelta(days=10), 9), user="user-b", source_text=long, created_at=LAST_NIGHT + 62)
+
+    assert _push() == 0
+
+    assert _last_push()["fold_structural"] == 1
 
 
 @pytest.mark.parametrize("status,folded", [("pending", True), ("processing", True), ("done", False), ("dropped", False)])
@@ -937,6 +1353,89 @@ def test_an_unsend_after_extraction_cancels_its_todos_and_drops_their_words(monk
     assert len(model["prompts"]) == 1 and "倒垃圾" in _pushed_text(_pushes()[0])
 
 
+def test_an_unsend_gives_up_on_a_locked_database_and_logs_the_type_only(monkeypatch, caplog):
+    """POST_1 N-9, POST_4 N1: the bot's webhook thread never waits long; a lock makes the unsend give up
+    (logged by type), the row is left as it was."""
+    import todo
+
+    tid = _seed_todo("交報告", mid="msg-secret-1", source="我明天要交報告")
+    monkeypatch.setattr(todo, "FORGET_TIMEOUT_S", 0.05, raising=False)
+    caplog.set_level(logging.INFO)
+    holder = sqlite3.connect(todo._DB_PATH, isolation_level=None, timeout=1)
+    try:
+        holder.execute("BEGIN IMMEDIATE")  # another writer holds the database
+        assert todo.forget_message(GROUP, "msg-secret-1", now=NOW) == 0
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+
+    assert (_todo(tid)["status"], _todo(tid)["source_text"]) == ("pending", "我明天要交報告")
+    assert "error_type=OperationalError" in caplog.text
+    for word in ("msg-secret-1", GROUP, "交報告"):
+        assert word not in caplog.text, word
+
+
+# ── the batch transaction looks again (PRE_3 5.3 step 6.5.1) ───────────────────────────────────────────
+
+
+def test_a_message_unsent_while_the_model_answers_makes_no_todo(model):
+    """The unsend table was read before the request; the batch transaction reads it again."""
+    import todo
+
+    _raw("msg-1", "user-a", "我明天要交報告", LAST_NIGHT)
+    model["answers"].append([_item(1, "交報告", TODAY)])
+    model["during"].append(lambda: todo.forget_message(GROUP, "msg-1", now=NOW - 30))
+
+    result = _run()
+
+    assert len(model["prompts"]) == 1 and result.skipped == {"unsent": 1} and result.new == 0
+    assert _todos() == []
+
+
+def test_a_message_that_made_a_todo_while_the_model_answered_makes_no_second_one(model):
+    """What a message already made was read before the request; the batch transaction reads it again.  The
+    row made meanwhile (another run) has another task and day and is no longer pending, so neither the
+    duplicate check nor the unique index could stop a second one."""
+    _raw("msg-1", "user-a", "我明天要交報告", LAST_NIGHT)
+    model["answers"].append([_item(1, "交報告", TODAY)])
+    model["during"].append(
+        lambda: _seed_todo("交期末報告", due=TODAY + timedelta(days=1), mid="msg-1", status="cancelled")
+    )
+
+    result = _run()
+
+    assert len(model["prompts"]) == 1 and result.skipped == {"produced_before": 1} and result.new == 0
+    assert [r["task"] for r in _todos()] == ["交期末報告"]
+
+
+def test_a_failed_reminder_lookup_keeps_the_todo_and_counts_it(monkeypatch, caplog, model):
+    """The extraction's structural look is a first pass only: the push looks again before anything goes
+    out (test_a_reminder_or_event_made_from_the_same_message_folds_the_todo)."""
+    import memory
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("合成的祕密字")
+
+    monkeypatch.setattr(memory, "reminders_between", broken)
+    caplog.set_level(logging.INFO)
+    _raw("msg-1", "user-a", "我明天要交報告", LAST_NIGHT)
+    model["answers"].append([_item(1, "交報告", TODAY)])
+
+    result = _run()
+
+    assert len(model["prompts"]) == 1 and result.new == 1 and result.skipped == {"structural_unchecked": 1}
+    assert "error_type=RuntimeError" in caplog.text and "祕密" not in caplog.text
+
+
+def test_a_message_with_no_sender_is_nobodys_todo(model):
+    _raw("msg-1", None, "我明天要交報告", LAST_NIGHT)
+    model["answers"].append([_item(1, "交報告", TODAY)])
+
+    result = _run()
+
+    assert len(model["prompts"]) == 1 and result.skipped == {"bad_owner": 1} and _todos() == []
+
+
 # ── the list ────────────────────────────────────────────────────────────────────────────────────────
 
 
@@ -998,7 +1497,7 @@ def test_an_exception_while_checking_an_item_is_logged_by_type_only(monkeypatch,
 def test_a_failed_extraction_still_lets_the_push_run_and_logs_the_type_only(monkeypatch, caplog, model):
     import todo
 
-    def boom(group_id, *, now=None):
+    def boom(group_id, *, now=None, push_follows=False):
         raise RuntimeError("合成的祕密字 msg-secret")
 
     monkeypatch.setattr(todo, "run_incremental", boom)
@@ -1064,6 +1563,70 @@ def test_every_date_word_main_sends_on_is_a_todo_date_word():
     for text in _MAIN_DATE_SAMPLES:
         assert main_hint.search(todo._mask_non_date_slash_tokens(text)), text  # the sample covers main
         assert todo.todo_date_hint(text), text
+
+
+def _pattern_text(path: Path, name: str) -> str:
+    call = _assigned(path, name)
+    assert isinstance(call, ast.Call) and ast.unparse(call.func) == "re.compile", name
+    return ast.literal_eval(call.args[0])
+
+
+def _written_out(pattern: str) -> list[str]:
+    """Every spelling of every alternative of ``pattern``, by re's own parser: a literal as it is, a
+    character class as each of its characters, \\d as 1, \\s as a space, a repeat at its least count.  It
+    fails on anything else, so a new kind of word in main.py cannot slip past this reader unread."""
+    from re import _constants as sre
+    from re import _parser
+
+    def seq(items) -> list[str]:
+        out = [""]
+        for op, av in items:
+            out = [a + b for a in out for b in one(op, av)]
+            assert len(out) <= 1000, "too many spellings"
+        return out
+
+    def one(op, av) -> list[str]:
+        if op is sre.LITERAL:
+            return [chr(av)]
+        if op is sre.IN:
+            chars = []
+            for kind, value in av:
+                if kind is sre.LITERAL:
+                    chars.append(chr(value))
+                elif kind is sre.RANGE:
+                    chars.append(chr(value[0]))
+                elif kind is sre.CATEGORY and value is sre.CATEGORY_DIGIT:
+                    chars.append("1")
+                elif kind is sre.CATEGORY and value is sre.CATEGORY_SPACE:
+                    chars.append(" ")
+                else:
+                    raise AssertionError(f"cannot write out {kind} {value}")
+            return chars
+        if op is sre.BRANCH:
+            return [s for branch in av[1] for s in seq(branch)]
+        if op is sre.SUBPATTERN:
+            return seq(av[-1])
+        if op in (sre.MAX_REPEAT, sre.MIN_REPEAT):
+            low, _high, item = av
+            return ["".join(p) for p in itertools.product(seq(item), repeat=low)] if low else [""]
+        raise AssertionError(f"cannot write out {op}")
+
+    return seq(_parser.parse(pattern))
+
+
+def test_every_alternative_of_main_date_words_is_a_todo_date_word():
+    """POST_3 I4: main._REMINDER_DATE_HINT is read by AST and each of its alternatives written out by re's
+    own parser, not taken from a fixed list of sample sentences: a word main adds later (「改天」) fails
+    here until todo.py has it too."""
+    import todo
+
+    main_hint = _compiled(ROOT / "main.py", "_REMINDER_DATE_HINT")
+    words = _written_out(_pattern_text(ROOT / "main.py", "_REMINDER_DATE_HINT"))
+    assert {"今天", "今晚", "明天", "明日", "明晚", "後天", "大後天", "下週", "星期三", "1/1", "1月1"} <= set(words)
+    assert {"改天", "1號"} <= set(_written_out(r"(今天|改天|\d+號)"))  # the reader sees an added word
+    for word in words:
+        assert main_hint.search(todo._mask_non_date_slash_tokens(word)), word  # the reader spells main's words
+        assert todo.todo_date_hint(word), word
 
 
 def test_every_calendar_date_word_and_the_added_ones_are_todo_date_words():

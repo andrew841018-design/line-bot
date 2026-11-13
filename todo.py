@@ -5,12 +5,14 @@ Andrew 2026-05-25 directive (Feature E).  2026-11-13 Andrew 選「B：兩個都�
 milliseconds and never read a message.  Now:
 
 - **Extraction** (``run_incremental``): ``family_extract`` reads each family-group message once, after
-  this job's cursor.  Only messages with a date word, not about 提醒 or said to the bot, not a late-night
-  「明天」 and not obviously noncommittal are sent, in batches, to the last-tier side task (at most
+  this job's cursor.  Only messages with a date word, not about 提醒 or said to the bot, not a routine
+  (每週三…), not dated from 「today」 between 00:00 and 04:59, not obviously noncommittal and not about
+  someone else with no 我 in them are sent, in batches, to the last-tier side task (at most
   ``MAX_REQUESTS`` requests a run, the retry after 61 seconds included).  Each item the model returns is
   checked here: its message, an owner with a local family name, a task lifted from that message (at
-  least half of its bigrams), a due date in range that agrees with the message's own date words, and
-  no reminder or calendar event already made from that message.  Shadow mode stores ``status='shadow'``.
+  least half of its bigrams, its date words taken out), a due date in range that agrees with the
+  message's own date words, and no reminder or calendar event already made from that message.  Only
+  the 08:00 job (``push_follows``) makes a todo due the same day.  Shadow mode stores ``status='shadow'``.
 - **Push** (``push_daily_reminders``): pending rows that fell due before today expire; today's are
   pushed once, unless the message was unsent, or a reminder or calendar event for the same message,
   the reminder queue, or a same-event reminder that already pings the owner covers it.  A check that
@@ -18,8 +20,9 @@ milliseconds and never read a message.  Now:
 - **Unsend** (``forget_message``): the message is never sent and its waiting todos are cancelled.
 
 Logs and stored summaries hold counts and exception types only: never family text, names or ids.
-``todos.created_at``／``last_reminded_at``／``completed_at`` are milliseconds; ``extract_*`` tables use
-seconds.  ``source_text`` is kept only until the row is pushed, folded or ends.
+``todos.created_at`` is when the todo's message was said, ``last_reminded_at``／``completed_at`` when
+they happened (all milliseconds); ``extract_*`` tables use seconds.  ``source_text`` is kept only until
+the row is pushed, folded or ends (a shadow row: until its day is over).
 """
 
 from __future__ import annotations
@@ -72,9 +75,14 @@ SOURCE_TEXT_MAX_CHARS = 500
 TASK_MAX_CHARS = 100
 DUE_MAX_DAYS = 180
 PROVENANCE_MIN = 0.5  # share of the task's bigrams found in its own message (PRE_4 I1), inclusive
-LATE_NIGHT_END_HOUR = 5  # 00:00–04:59: 「明天」 may mean the day that just began (F2)
+LATE_NIGHT_END_HOUR = 5  # 00:00–04:59: a date counted from 「today」 may count from the day that just began (F2)
 FOLD_LOOKBACK_DAYS = 14  # a 「前 N 天提醒」 label fires up to this long before the event
 STRUCTURAL_AHEAD_DAYS = 400  # a reminder made from a message fires before this
+# A reminder made from a message was made between 300 s before it was said and 7 days after (the
+# reminder queue): only such a reminder can share the message's words by being made from it (POST_1 I-2).
+SOURCE_MATCH_BEFORE_S = 300
+SOURCE_MATCH_AFTER_S = 7 * 86400
+FORGET_TIMEOUT_S = 5.0  # forget_message runs in the bot's one webhook thread (POST_1 N-9, POST_4 N1)
 
 
 def _get_target_group_ids() -> list[str]:
@@ -276,12 +284,13 @@ def mark_reminded(todo_id: str, *, now: float | None = None) -> None:
     _mark_done([todo_id], time.time() if now is None else float(now))
 
 
-def _mark_done(todo_ids: Sequence[str], now: float) -> None:
+def _mark_done(todo_ids: Sequence[str], now: float, *, conn_factory=None) -> None:
+    """``conn_factory``: the push passes ``_job_conn`` (30 seconds); the default waits 5."""
     ids = [str(t) for t in todo_ids if t]
     if not ids:
         return
     marks = ",".join("?" for _ in ids)
-    with _lock, _conn() as c:
+    with _lock, (conn_factory or _conn)() as c:
         c.execute(
             f"UPDATE todos SET last_reminded_at=?, source_text=NULL WHERE todo_id IN ({marks})",
             (int(float(now) * 1000), *ids),
@@ -312,8 +321,39 @@ _FRACTION_SUFFIX_RE = re.compile(
     r"(?:ml|cc|g)(?![a-z])|的?價(?:格|錢)?|折|倍)",
     re.IGNORECASE,
 )
-_LATE_NIGHT_RE = re.compile(r"明天|明日|明早|明晚|後天")
 _TO_BOT_PREFIX_RE = re.compile(r"^\s*@\s*ai(?![a-z])")
+
+# Pieces of the date words read here and below.  Chinese numerals: 一 to 三十一, 廿 being 二十.
+_CN_DIGITS = "一二三四五六七八九"
+_CN_DAY = (
+    r"(?:三十一|三十|二十[一二三四五六七八九]|二十|廿[一二三四五六七八九]|廿"
+    r"|十[一二三四五六七八九]|十|[一二三四五六七八九])"
+)
+_CN_MONTH = r"(?:十[一二]|十|[一二三四五六七八九])"
+_NOT_AFTER_CN = r"(?<![一二三四五六七八九十廿])"  # never the tail of a longer numeral (十一月 is not 一月)
+_WEEK_WORD = r"(?:週|周|星期|禮拜)"
+_WEEKDAY_CHAR = r"[一二三四五六日天]"
+_NOT_A_WEEKDAY_AFTER = r"(?![氣本子常])"  # 這週天氣, 下週日本, 週日子, 週一常常 (POST_2 N-1)
+# A year, month and day; a month and day; M/D (after the fraction mask): the only dates that mean the
+# same day whenever they are said.
+_ABSOLUTE_DATE = (
+    r"(?<![0-9])[0-9]{4}\s*[-/.年]\s*[0-9]{1,2}\s*[-/.月]\s*[0-9]{1,2}(?![0-9])\s*[日號]?"
+    r"|(?<![0-9])[0-9]{1,2}\s*月\s*[0-9]{1,2}(?![0-9])\s*[日號]?"
+    rf"|{_NOT_AFTER_CN}{_CN_MONTH}\s*月\s*{_CN_DAY}\s*[日號]"
+    r"|(?<![0-9/])[0-9]{1,2}\s*/\s*[0-9]{1,2}(?![0-9/])"
+)
+_ABSOLUTE_DATE_RE = re.compile(_ABSOLUTE_DATE)
+_CLOCK = r"(?:[01]?\d|2[0-3])\s*[:：]\s*[0-5]\d"
+_CLOCK_RE = re.compile(_CLOCK)
+# 每週三, 每個禮拜三, 每天, 每個月5號, 每年, 每隔兩天: a routine, not one day's todo (POST_2 N-1).
+_RECURRING_RE = re.compile(r"每\s*[個一]?\s*(?:週|周|星期|禮拜|天|日|晚|早|月|年)|每隔")
+# Someone else as the one who does it (POST_2 I-3, FIX_LIST 4).  公 and 奶 count only inside a kinship
+# word (公司, 牛奶 are no people), and 其他／吉他／迷你／雞婆／媽祖 are no people either.
+_OTHER_PERSON_RE = re.compile(
+    r"(?<![其吉])他|她|(?<!迷)你|妳|您"
+    r"|爸|媽(?!祖)|哥|姊|姐|弟|妹|爺|嬤|孫|兒子|女兒"
+    r"|阿公|外公|公公|老公|叔公|伯公|舅公|(?<!雞)婆|奶奶|阿奶"
+)
 
 
 def _slash_token_is_date(text: str, match: re.Match) -> bool:
@@ -353,14 +393,54 @@ def is_excluded(text: str) -> bool:
     return bool(_TO_BOT_PREFIX_RE.match(folded))
 
 
+def is_recurring(text: str) -> bool:
+    """每週三、每個禮拜三、每天、每月…: a routine, not one day's todo (POST_2 N-1)."""
+    return bool(_RECURRING_RE.search(str(text or "")))
+
+
 def is_late_night_relative(msg: family_extract.Message) -> bool:
-    """「明天」 said between 00:00 and 04:59 often means the day that just began (F2): not sent."""
-    return family_extract.tw_hour(msg.created_at) < LATE_NIGHT_END_HOUR and bool(
-        _LATE_NIGHT_RE.search(msg.text or "")
-    )
+    """Said between 00:00 and 04:59, a date counted from 「today」 (明天, 今晚, 下週三, 週三, 5號, 月底…) may
+    count from the day that just began (F2, widened by POST_2 I-2).  Only a message whose dates are all
+    absolute (M/D, M月D日, YYYY-MM-DD; a clock time beside one is fine) is sent then."""
+    if family_extract.tw_hour(msg.created_at) >= LATE_NIGHT_END_HOUR:
+        return False
+    masked = _mask_non_date_slash_tokens(msg.text or "")
+    if not _ABSOLUTE_DATE_RE.search(masked):
+        return True  # whatever dates it (明天, 週三, 5號, 14:30…) counts from 「today」
+    rest = _CLOCK_RE.sub(" ", _ABSOLUTE_DATE_RE.sub(" ", masked))
+    return bool(_TODO_DATE_HINT_RE.search(rest))
 
 
-def _prefilter(msg: family_extract.Message, result: family_extract.RunResult) -> bool:
+def _family_names() -> dict[str, str]:
+    """Each local family name (the full one, its short form, a role word) → the name it stands for."""
+    import line_mentions
+
+    try:
+        mapping = line_mentions.configured_family_alias_mapping(include_short=True)
+    except Exception as exc:
+        logger.warning("todo family names unreadable error_type=%s", type(exc).__name__)
+        return {}
+    return {name: canon.lstrip("@＠").strip() for name, canon in mapping.items() if len(name) >= 2}
+
+
+def is_about_someone_else(text: str, speaker: str | None, names: dict[str, str] | None = None) -> bool:
+    """Someone else does it (POST_2 I-3): no 我 in the message, and a pronoun (你／他／她…), a kinship word
+    (爸、媽、外公…) or another member's local name in it.  The owner is always the speaker, so such a
+    message is never sent.  Known limits (test_known_limits_of_the_subject_check): 「我媽明天要回診」 (我 in
+    it) and person words not listed (阿姨, 大家) pass; 「明天要載媽媽去回診」, the speaker's own plan, does not."""
+    text = str(text or "")
+    if "我" in text:
+        return False
+    if _OTHER_PERSON_RE.search(text):
+        return True
+    own = _owner_alias(str(speaker)) if speaker else ""
+    names = _family_names() if names is None else names
+    return any(name in text for name, canon in names.items() if canon != own)
+
+
+def _prefilter(
+    msg: family_extract.Message, result: family_extract.RunResult, *, names: dict[str, str] | None = None
+) -> bool:
     import reminder_intent
 
     text = msg.text or ""
@@ -370,11 +450,22 @@ def _prefilter(msg: family_extract.Message, result: family_extract.RunResult) ->
     if is_excluded(text):
         result.skip("excluded")
         return False
+    if is_recurring(text):
+        result.skip("recurring")
+        return False
     if is_late_night_relative(msg):
         result.skip("late_night_ambiguous")
         return False
+    # TODO(2026-11-13 deferred, PRE_3 P2-I2): this gate and should_reject_reminder_candidate in _check_item
+    # also stop five kinds of real plans: a plan followed by a question (「我下週要出差，你們要什麼伴手禮？」
+    # 「我下禮拜要回診，誰可以載我？」「我月底要搬家，有人要來幫忙嗎」「我週末要回老家，要帶什麼嗎？」) and a plan
+    # ending in 呢 (「我明天要去看牙醫呢」).  TODO has no confirmation step, so a missed one is preferred to a
+    # wrong @ (test_the_five_known_false_rejections_are_not_sent_but_a_plain_plan_is).
     if reminder_intent.is_obvious_noncommittal_source(text):
         result.skip("gate_rejected")
+        return False
+    if is_about_someone_else(text, msg.user_id, names):
+        result.skip("other_subject")
         return False
     return True
 
@@ -382,19 +473,22 @@ def _prefilter(msg: family_extract.Message, result: family_extract.RunResult) ->
 # ── The dates a message's own words allow (F3) ──────────────────────────────────────────────────────
 
 _WEEKDAY_INDEX = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
-_WEEK_WORD = r"(?:週|周|星期|禮拜)"
-_WEEKDAY_CHAR = r"[一二三四五六日天]"
-# One pass, left to right, longest reading first at each place: 「大後天」 is never also 「後天」, and a
-# 「下週三」 never also a bare 「週三」.
+_DAY_NUMBER = rf"(?:[0-9]{{1,2}}|{_CN_DAY})"
+# One pass, left to right, longest reading first at each place: 「大後天」 is never also 「後天」, a
+# 「下週三」 never also a bare 「週三」, and 「下下個月5號」 never also 「下個月5號」.
 _EXPECTED_DATE_RE = re.compile(
     r"(?P<ymd>(?<![0-9])(?P<y>[0-9]{4})\s*[-/.年]\s*(?P<ym>[0-9]{1,2})\s*[-/.月]\s*(?P<yd>[0-9]{1,2})(?![0-9]))"
     r"|(?P<md>(?<![0-9])(?P<m>[0-9]{1,2})\s*月\s*(?P<d>[0-9]{1,2})(?![0-9]))"
+    rf"|(?P<cmd>{_NOT_AFTER_CN}(?P<cm>{_CN_MONTH})\s*月\s*(?P<cd>{_CN_DAY})\s*[日號])"
     r"|(?P<slash>(?<![0-9/])(?P<sm>[0-9]{1,2})\s*/\s*(?P<sd>[0-9]{1,2})(?![0-9/]))"
-    rf"|(?P<next2>下\s*下\s*個?\s*{_WEEK_WORD}(?P<n2>{_WEEKDAY_CHAR}))"
-    rf"|(?P<next>下\s*個?\s*{_WEEK_WORD}(?P<n1>{_WEEKDAY_CHAR}))"
-    rf"|(?P<this>(?:這|本)\s*個?\s*{_WEEK_WORD}(?P<t>{_WEEKDAY_CHAR}))"
-    rf"|(?P<bare>{_WEEK_WORD}(?P<b>{_WEEKDAY_CHAR}))"
-    r"|(?P<dayno>(?<![0-9/])(?P<dn>[0-9]{1,2})\s*號)"
+    rf"|(?P<monthday>(?P<which>下\s*下|下|這|本)\s*個?\s*月\s*的?\s*(?P<qd>{_DAY_NUMBER})\s*[號日])"
+    rf"|(?P<noday>(?:上\s*上|上|每)\s*[個一]?\s*(?:{_WEEK_WORD}\s*{_WEEKDAY_CHAR}?|月\s*的?\s*(?:{_DAY_NUMBER}\s*[號日])?))"
+    rf"|(?P<next2>下\s*下\s*個?\s*{_WEEK_WORD}(?P<n2>{_WEEKDAY_CHAR}){_NOT_A_WEEKDAY_AFTER})"
+    rf"|(?P<next>下\s*個?\s*{_WEEK_WORD}(?P<n1>{_WEEKDAY_CHAR}){_NOT_A_WEEKDAY_AFTER})"
+    rf"|(?P<this>(?:這|本)\s*個?\s*{_WEEK_WORD}(?P<t>{_WEEKDAY_CHAR}){_NOT_A_WEEKDAY_AFTER})"
+    rf"|(?P<bare>{_WEEK_WORD}(?P<b>{_WEEKDAY_CHAR}){_NOT_A_WEEKDAY_AFTER})"
+    r"|(?P<dayno>(?<![0-9/])(?P<dn>[0-9]{1,2})\s*(?:號|日(?!\s*[遊游後內内前])))"  # not 1日遊, 3日後
+    rf"|(?P<cdayno>{_NOT_AFTER_CN}(?P<cdn>{_CN_DAY})\s*號)"
     r"|(?P<plus3>大後天)|(?P<plus2>後天)|(?P<plus1>明天|明日|明早|明晚)|(?P<plus0>今天|今日|今晚|今早)"
 )
 
@@ -406,48 +500,80 @@ def _safe_date(year: int, month: int, day: int) -> date | None:
         return None
 
 
+def _cn_number(text: str) -> int:
+    """一 to 三十一 (廿 is 二十) as a number."""
+    text = text.replace("廿", "二十")
+    if "十" not in text:
+        return _CN_DIGITS.index(text) + 1
+    tens, _, ones = text.partition("十")
+    return (_CN_DIGITS.index(tens) + 1 if tens else 1) * 10 + (_CN_DIGITS.index(ones) + 1 if ones else 0)
+
+
+def _number(text: str) -> int:
+    return int(text) if text.isascii() else _cn_number(text)
+
+
+def _month_after(year: int, month: int, months: int) -> tuple[int, int]:
+    index = year * 12 + month - 1 + months
+    return index // 12, index % 12 + 1
+
+
+def _first_numbered_day(day: int, said: date) -> date | None:
+    """The first day ``day`` of a month not before ``said``: a month without that day is passed over."""
+    for months in range(3):
+        found = _safe_date(*_month_after(said.year, said.month, months), day)
+        if found and found >= said:
+            return found
+    return None
+
+
 def expected_dates(text: str, said: date) -> set[date]:
     """The days the message's own date words point at, counted from the day it was said.
 
-    Empty when it has none this can read (月底, 週末, 下個月…): then only the bounds apply.  A due
-    date outside a non-empty set is dropped, never moved to one of these (PRE_3 F3)."""
+    A bare 「D號」／「D日」 is the first such day not before that day; 「下(下)個月D號」 and 「這個月／本月D號」
+    are that month's only (POST_2 I-1).  Chinese numerals are read too (十五號, 十一月二十日).  上週三 and
+    每週三 point at no day ahead.  Empty when it has none this can read (月底, 週末, 下個月…): then only the
+    bounds apply.  A due date outside a non-empty set is dropped, never moved to one of these (PRE_3 F3)."""
     masked = _mask_non_date_slash_tokens(str(text or ""))
     monday = said - timedelta(days=said.weekday())
     out: set[date] = set()
     for m in _EXPECTED_DATE_RE.finditer(masked):
+        found: date | None = None
         if m.group("ymd"):
             found = _safe_date(int(m.group("y")), int(m.group("ym")), int(m.group("yd")))
-            if found:
-                out.add(found)
-        elif m.group("md") or m.group("slash"):
-            month = int(m.group("m") or m.group("sm"))
-            day = int(m.group("d") or m.group("sd"))
+        elif m.group("md") or m.group("slash") or m.group("cmd"):
+            if m.group("cmd"):
+                month, day = _cn_number(m.group("cm")), _cn_number(m.group("cd"))
+            else:
+                month, day = int(m.group("m") or m.group("sm")), int(m.group("d") or m.group("sd"))
             for year in (said.year, said.year + 1):  # this year or next: the first not before that day
-                found = _safe_date(year, month, day)
-                if found and found >= said:
-                    out.add(found)
+                candidate = _safe_date(year, month, day)
+                if candidate and candidate >= said:
+                    found = candidate
                     break
+        elif m.group("monthday"):
+            months = {"下下": 2, "下": 1}.get(re.sub(r"\s", "", m.group("which")), 0)  # 這／本: this month
+            found = _safe_date(*_month_after(said.year, said.month, months), _number(m.group("qd")))
+        elif m.group("noday"):
+            continue  # 上週三, 每週三, 每個月5號: no one day ahead
         elif m.group("next2"):
-            out.add(monday + timedelta(days=14 + _WEEKDAY_INDEX[m.group("n2")]))
+            found = monday + timedelta(days=14 + _WEEKDAY_INDEX[m.group("n2")])
         elif m.group("next"):
-            out.add(monday + timedelta(days=7 + _WEEKDAY_INDEX[m.group("n1")]))
+            found = monday + timedelta(days=7 + _WEEKDAY_INDEX[m.group("n1")])
         elif m.group("this"):
-            out.add(monday + timedelta(days=_WEEKDAY_INDEX[m.group("t")]))
+            found = monday + timedelta(days=_WEEKDAY_INDEX[m.group("t")])
         elif m.group("bare"):
             found = monday + timedelta(days=_WEEKDAY_INDEX[m.group("b")])
-            out.add(found if found >= said else found + timedelta(days=7))
-        elif m.group("dayno"):
-            day = int(m.group("dn"))
-            next_month = (said.year + 1, 1) if said.month == 12 else (said.year, said.month + 1)
-            for year, month in ((said.year, said.month), next_month):  # this month or next
-                found = _safe_date(year, month, day)
-                if found:
-                    out.add(found)
+            found = found if found >= said else found + timedelta(days=7)
+        elif m.group("dayno") or m.group("cdayno"):
+            found = _first_numbered_day(_number(m.group("dn") or m.group("cdn")), said)
         else:
             for name, days in (("plus3", 3), ("plus2", 2), ("plus1", 1), ("plus0", 0)):
                 if m.group(name):
-                    out.add(said + timedelta(days=days))
+                    found = said + timedelta(days=days)
                     break
+        if found:
+            out.add(found)
     return out
 
 
@@ -491,7 +617,8 @@ _EXTRACT_PROMPT = (
     "問句、邀約、請求、過去發生的事、感想和閒聊都不要。\n"
     "2. 日期一律從那一則訊息自己的 date 算：「今天」是那天，「明天」是隔天，「後天」是兩天後；"
     "「週X」單獨出現是那一週（週一到週日）的星期X，已經過了就是下一週的；「這週X」是那一週的；"
-    "「下週X」是下一週（下週一到下週日）的星期X；「M/D」「M月D日」是不早於那天的第一個 M 月 D 日。"
+    "「下週X」是下一週（下週一到下週日）的星期X；「M/D」「M月D日」是不早於那天的第一個 M 月 D 日；"
+    "單獨的「D號」是不早於那天的第一個 D 號（這個月的已經過了就是下個月的），「下個月D號」是下個月的。"
     "算不出確切的哪一天，就不要回那一筆。\n"
     "3. task 寫要做的事：動詞加受詞，12 個字以內，用原文裡的字；不要加人名、稱呼、@ 或網址。\n"
     '4. 每一筆回 {"i": 訊息編號, "task": "…", "due_date": "YYYY-MM-DD"}；沒有就回 []。\n'
@@ -504,15 +631,43 @@ _ITEM_PROPERTIES = {
 }
 _DUE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 _TASK_FORBIDDEN = frozenset("@＠{}")
+# Date words a task must not keep (POST_2 N-9): it is pushed on its own day, where a word counted from
+# the day it was said reads wrong.  The dates read above, the relative words and a clock time, each with
+# the 的 after it (準備明天的簡報 → 準備簡報, not 準備的簡報).  Not 過年, 晚點, 週報 or a Chinese numeral with
+# 日 (一日遊): those are also ordinary words.
+_TASK_DATE_RE = re.compile(
+    "(?:"
+    + _ABSOLUTE_DATE
+    + rf"|(?:下\s*下|下|這|本|上\s*上|上|每)\s*[個一]?\s*月\s*的?\s*(?:{_DAY_NUMBER}\s*[號日])?"
+    + rf"|(?:下\s*下|下|這|本|上\s*上|上|每)\s*[個一]?\s*{_WEEK_WORD}(?:{_WEEKDAY_CHAR}{_NOT_A_WEEKDAY_AFTER}|末)?"
+    + rf"|{_WEEK_WORD}(?:{_WEEKDAY_CHAR}{_NOT_A_WEEKDAY_AFTER}|末)"
+    + r"|(?<![0-9/])[0-9]{1,2}\s*(?:號|日(?!\s*[遊游後內内前]))"
+    + rf"|{_NOT_AFTER_CN}{_CN_DAY}\s*號"
+    + r"|大後天|後天|明天|明日|明早|明晚|今天|今日|今晚|今早|月底|月初|月中|年底"
+    + rf"|{_CLOCK}"
+    + r")(?:\s*的)?"
+)
+_TASK_EDGE_RE = re.compile(r"^[\s，,、。.．:：;；!！?？~～的]+|[\s，,、。.．:：;；!！?？~～]+$")
 
 
 def _build_prompt(batch: Sequence[family_extract.Message]) -> str:
     return _EXTRACT_PROMPT + family_extract.format_batch(batch, MESSAGE_MAX_CHARS)
 
 
+def _without_date_words(task: str) -> str:
+    """``task`` without its date words (a fraction such as 1/3 is no date), then trimmed: no gap is left
+    between two Chinese characters (預約下週三看牙醫 → 預約看牙醫)."""
+    chars = list(task)  # no control characters by now: \x00 marks what goes
+    for m in _TASK_DATE_RE.finditer(_mask_non_date_slash_tokens(task)):  # the mask keeps every position
+        chars[m.start():m.end()] = "\x00" * (m.end() - m.start())
+    kept = re.sub(r"(?<=[\u4e00-\u9fff])\x00+(?=[\u4e00-\u9fff])", "", "".join(chars))
+    return _TASK_EDGE_RE.sub("", " ".join(kept.replace("\x00", " ").split()))
+
+
 def _clean_task(value: object) -> str | None:
-    """The model's task, pushed with an @ beside it: 1–100 characters on one line, no @／{}, no
-    control or format characters, no link (PRE_3 N-a)."""
+    """The model's task, pushed with an @ beside it on its own day: 1–100 characters on one line, no @／{},
+    no control or format characters, no link (PRE_3 N-a), then its date words (明天, 下週三, 11/20…) taken
+    out (POST_2 N-9).  None when nothing is left."""
     if not isinstance(value, str):
         return None
     task = value.strip()
@@ -522,7 +677,9 @@ def _clean_task(value: object) -> str | None:
         return None
     import fact_filters
 
-    return None if fact_filters.LINK_RE.search(task) else task
+    if fact_filters.LINK_RE.search(task):
+        return None
+    return _without_date_words(task) or None
 
 
 def _parse_due(value: object) -> date | None:
@@ -581,6 +738,7 @@ def _check_item(item, batch, result: family_extract.RunResult, *, today: date) -
     return {
         "message_id": msg.message_id,
         "said": said,
+        "said_at": int(msg.created_at),  # seconds; todos.created_at keeps it (milliseconds)
         "owner": owner,
         "task": task,
         "due": due.isoformat(),
@@ -594,25 +752,42 @@ def _day_start(day: date) -> int:
 
 
 def _same_source_text(todo_source: object, reminder_source: object) -> bool:
-    """The reminder was written from this very message: one of its merged sources is the same text."""
+    """One of the reminder's merged sources is the same text.  Both are cut to the 500 characters
+    todos.source_text keeps before they are compared (a reminder keeps the whole message)."""
     import memory
 
-    want = memory._normalize_reminder_text(str(todo_source or ""))
+    want = memory._normalize_reminder_text(str(todo_source or "")[:SOURCE_TEXT_MAX_CHARS])
     if not want:
         return False
     return any(
-        memory._normalize_reminder_text(part) == want
+        memory._normalize_reminder_text(part[:SOURCE_TEXT_MAX_CHARS]) == want
         for part in str(reminder_source or "").split("\n---\n")
     )
 
 
-def _structural_hit(group_id: str, message_id: str, source_text: object, reminders: Sequence[dict]) -> bool:
-    """A reminder (a schedule line's too) or calendar event made from the same message, any status."""
+def _made_around(reminder: dict, said_at: int | None) -> bool:
+    """The reminder was made from 300 seconds before the message was said to 7 days after: the only
+    reminders its words can have been copied into (POST_1 I-2).  The same words in a reminder made at
+    any other time are another message, said again."""
+    if not said_at:
+        return False
+    try:
+        made = int(reminder.get("created_at") or 0)
+    except (TypeError, ValueError):
+        return False
+    return said_at - SOURCE_MATCH_BEFORE_S <= made <= said_at + SOURCE_MATCH_AFTER_S
+
+
+def _structural_hit(
+    group_id: str, message_id: str, source_text: object, reminders: Sequence[dict], *, said_at: int | None
+) -> bool:
+    """A reminder (a schedule line's too) or calendar event made from the same message, any status: by
+    the message id at any time, by the message's words only when made around it (``said_at``, seconds)."""
     prefix = f"{message_id}:" if message_id else ""
     for row in reminders:
         if prefix and str(row.get("source_ref") or "").startswith(prefix):
             return True
-        if _same_source_text(source_text, row.get("source_text")):
+        if _made_around(row, said_at) and _same_source_text(source_text, row.get("source_text")):
             return True
     if message_id:
         import calendar_db
@@ -622,9 +797,12 @@ def _structural_hit(group_id: str, message_id: str, source_text: object, reminde
     return False
 
 
-def _prepare(group_id: str, batch, items, result: family_extract.RunResult, *, today: date, status: str) -> list:
+def _prepare(
+    group_id: str, batch, items, result: family_extract.RunResult, *, today: date, status: str, push_follows: bool
+) -> list:
     """Outside the batch transaction: check each item and look for a reminder or event made from the
-    same message (read only, in the reminder and calendar tables)."""
+    same message (read only, in the reminder and calendar tables).  With no push after this run, a todo
+    due today could only expire: it is counted, not made (POST_1 N-3)."""
     rows: list[dict] = []
     checked: list[dict] = []
     for item in items:
@@ -651,14 +829,18 @@ def _prepare(group_id: str, batch, items, result: family_extract.RunResult, *, t
         for row in checked:
             mid = row["message_id"]
             if mid not in hits:
-                hits[mid] = _structural_hit(group_id, mid, row["full_text"], reminders)
+                hits[mid] = _structural_hit(group_id, mid, row["full_text"], reminders, said_at=row["said_at"])
     except Exception as exc:
         # Kept: the push checks the same keys again before anything is sent.
         logger.warning("todo structural check failed error_type=%s", type(exc).__name__)
         result.skip("structural_unchecked", len(checked))
+    today_iso = today.isoformat()
     for row in checked:
         if hits.get(row["message_id"]):
             result.skip("dup_structural")
+            continue
+        if not push_follows and row["due"] == today_iso:
+            result.skip("due_today_no_push")
             continue
         row["status"] = status
         rows.append(row)
@@ -678,14 +860,15 @@ def _produced(conn, group_id: str, message_ids: Sequence[str]) -> set[str]:
     return {str(r[0]) for r in rows}
 
 
-def _write(conn, group_id: str, rows: list, result: family_extract.RunResult, *, now: float) -> None:
+def _write(conn, group_id: str, rows: list, result: family_extract.RunResult) -> None:
     """Inside the batch transaction, with ``conn`` only: no message twice, none unsent, and no second
-    copy of the same todo (the unique index only covers pending rows, not shadow ones)."""
+    copy of the same todo (the unique index only covers pending rows, not shadow ones).  ``created_at``
+    is when the message was said: the push matches a reminder's words against that time."""
     ids = sorted({row["message_id"] for row in rows})
     produced = _produced(conn, group_id, ids)  # before this batch writes anything
     unsent = family_extract.unsent_ids(conn, group_id, ids)
-    created_ms = int(float(now) * 1000)
     for row in rows:
+        created_ms = int(row["said_at"]) * 1000
         mid = row["message_id"]
         if mid in unsent:
             result.skip("unsent")
@@ -713,18 +896,21 @@ def _write(conn, group_id: str, rows: list, result: family_extract.RunResult, *,
             result.skip("duplicate")
 
 
-def _feature(group_id: str, *, now: float, mode: str) -> family_extract.Feature:
+def _feature(group_id: str, *, now: float, mode: str, push_follows: bool) -> family_extract.Feature:
     today = family_extract.tw_day(now)
     status = "shadow" if mode == "shadow" else "pending"
+    names = _family_names()  # read once a run
     return family_extract.Feature(
         name=FEATURE_NAME,
         label="todo extract",
-        prefilter=_prefilter,
+        prefilter=lambda msg, result: _prefilter(msg, result, names=names),
         build_prompt=_build_prompt,
         item_properties=_ITEM_PROPERTIES,
         required=("i", "task", "due_date"),
-        prepare=lambda batch, items, result: _prepare(group_id, batch, items, result, today=today, status=status),
-        write=lambda conn, rows, result: _write(conn, group_id, rows, result, now=now),
+        prepare=lambda batch, items, result: _prepare(
+            group_id, batch, items, result, today=today, status=status, push_follows=push_follows
+        ),
+        write=lambda conn, rows, result: _write(conn, group_id, rows, result),
         produced=_produced,
         initial_cursor=lambda start: (int(start) - 86400, ""),
         max_requests=MAX_REQUESTS,
@@ -747,9 +933,12 @@ def _record_mode_only(group_id: str, result: family_extract.RunResult) -> None:
         logger.warning("todo extract mode record failed error_type=%s", type(exc).__name__)
 
 
-def run_incremental(group_id: str, *, now: float | None = None) -> family_extract.RunResult:
+def run_incremental(
+    group_id: str, *, now: float | None = None, push_follows: bool = False
+) -> family_extract.RunResult:
     """Read the family group's new messages for todos (family_extract.run).  Off reads nothing; any
-    other group is not read at all."""
+    other group is not read at all.  ``push_follows``: only the 08:00 job, which pushes right after, may
+    make a todo due today (POST_1 N-3); the Sunday 19:00 extract and a manual one may not."""
     now = time.time() if now is None else float(now)
     mode = current_mode()
     if mode == "off":
@@ -761,35 +950,51 @@ def run_incremental(group_id: str, *, now: float | None = None) -> family_extrac
         result = family_extract.RunResult(mode=mode, stopped="not_family_group")
         logger.info("todo extract %s", result.log_fields())
         return result
-    return family_extract.run(_feature(group_id, now=now, mode=mode), group_id, _job_conn, now=now, mode=mode)
+    feature = _feature(group_id, now=now, mode=mode, push_follows=push_follows)
+    return family_extract.run(feature, group_id, _job_conn, now=now, mode=mode)
+
+
+def _is_lock_error(exc: BaseException) -> bool:
+    text = str(exc).lower()  # only looked at, never logged
+    return "locked" in text or "busy" in text
 
 
 def forget_message(group_id: str, message_id: str, *, now: float | None = None) -> int:
     """收回 (2026-11-13, PRE_3 F1 and PRE_4 I8): the message is never sent to the model, the todos it made
     that still wait (pending or shadow) are cancelled, and its words go from every row it made.
-    Returns how many were cancelled."""
+    Returns how many were cancelled.
+
+    The bot calls this in its one webhook thread: it waits ``FORGET_TIMEOUT_S`` for the database at most
+    and gives up on a lock, logged by type (POST_1 N-9).  Nothing is then recorded, so neither the next
+    extraction nor the push knows about this unsend."""
     if not group_id or not message_id:
         return 0
     now = time.time() if now is None else float(now)
-    with _lock, _conn() as c:
-        family_extract.ensure_tables(c)
-        c.execute("BEGIN IMMEDIATE")
-        try:
-            family_extract.record_unsent(c, group_id, message_id, now)
-            cancelled = c.execute(
-                "UPDATE todos SET status='cancelled', source_text=NULL "
-                "WHERE group_id=? AND source_msg_id=? AND status IN ('pending', 'shadow')",
-                (group_id, message_id),
-            ).rowcount
-            c.execute(
-                "UPDATE todos SET source_text=NULL "
-                "WHERE group_id=? AND source_msg_id=? AND source_text IS NOT NULL",
-                (group_id, message_id),
-            )
-            c.execute("COMMIT")
-        except BaseException:
-            c.execute("ROLLBACK")
+    try:
+        with _lock, _conn(timeout=FORGET_TIMEOUT_S) as c:
+            family_extract.ensure_tables(c)
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                family_extract.record_unsent(c, group_id, message_id, now)
+                cancelled = c.execute(
+                    "UPDATE todos SET status='cancelled', source_text=NULL "
+                    "WHERE group_id=? AND source_msg_id=? AND status IN ('pending', 'shadow')",
+                    (group_id, message_id),
+                ).rowcount
+                c.execute(
+                    "UPDATE todos SET source_text=NULL "
+                    "WHERE group_id=? AND source_msg_id=? AND source_text IS NOT NULL",
+                    (group_id, message_id),
+                )
+                c.execute("COMMIT")
+            except BaseException:
+                c.execute("ROLLBACK")
+                raise
+    except sqlite3.OperationalError as exc:
+        if not _is_lock_error(exc):
             raise
+        logger.warning("todo forget gave up error_type=%s", type(exc).__name__)
+        return 0
     logger.info("todo forget cancelled=%d", cancelled)
     return cancelled
 
@@ -879,8 +1084,8 @@ def _owner_targets(owners) -> list:
 
 def expire_past_due(group_id: str, today: date) -> int:
     """Pending rows due before today are never pushed: expired, their words dropped.  Shadow rows keep
-    their status (they were never going to be pushed)."""
-    with _lock, _conn() as c:
+    their status (they were never going to be pushed); _drop_past_shadow_words drops their words."""
+    with _lock, _job_conn() as c:
         cur = c.execute(
             "UPDATE todos SET status='expired', source_text=NULL "
             "WHERE group_id=? AND status='pending' AND due_date IS NOT NULL AND due_date < ?",
@@ -889,8 +1094,19 @@ def expire_past_due(group_id: str, today: date) -> int:
         return cur.rowcount
 
 
+def _drop_past_shadow_words(group_id: str, today: date) -> None:
+    """A shadow row whose day is over keeps no words, whatever the mode is now (PRE_4 I9; POST_1 N-5,
+    POST_2 N-5: the shadow push marks only the rows due on a day it runs).  It stays shadow."""
+    with _lock, _job_conn() as c:
+        c.execute(
+            "UPDATE todos SET source_text=NULL WHERE group_id=? AND status='shadow' "
+            "AND due_date IS NOT NULL AND due_date < ? AND source_text IS NOT NULL",
+            (group_id, today.isoformat()),
+        )
+
+
 def _due_rows(group_id: str, today_iso: str, status: str) -> list[dict]:
-    with _lock, _conn() as c:
+    with _lock, _job_conn() as c:
         c.row_factory = sqlite3.Row
         rows = c.execute(
             "SELECT * FROM todos WHERE group_id=? AND status=? AND due_date=? "
@@ -902,7 +1118,7 @@ def _due_rows(group_id: str, today_iso: str, status: str) -> list[dict]:
 
 def _drop_unsent(group_id: str, rows: list[dict]) -> tuple[list[dict], int]:
     """Looked up again just before the push (PRE_4 I8): an unsend whose cleanup failed still wins."""
-    with _lock, _conn() as c:
+    with _lock, _job_conn() as c:
         family_extract.ensure_tables(c)
         gone = family_extract.unsent_ids(c, group_id, [str(r.get("source_msg_id") or "") for r in rows])
         hit = [str(r["todo_id"]) for r in rows if str(r.get("source_msg_id") or "") in gone]
@@ -966,7 +1182,8 @@ class _FoldCheck:
         import memory
 
         message_id = str(row.get("source_msg_id") or "")
-        if _structural_hit(self.group_id, message_id, row.get("source_text"), self.reminders):
+        said_at = int(row.get("created_at") or 0) // 1000 or None  # when its message was said
+        if _structural_hit(self.group_id, message_id, row.get("source_text"), self.reminders, said_at=said_at):
             return "fold_structural"
         if message_id:
             queued = memory.get_pending_reminder_extract_by_message(self.group_id, message_id)
@@ -980,6 +1197,11 @@ class _FoldCheck:
         """A reminder of any status (or a calendar event) for the same event that pings the owner."""
         import reminder_overview
         import reminder_push
+
+        # TODO(2026-11-13 deferred, IMPL_PLAN_v2): two known limits, both pushed
+        # (test_known_limits_are_still_pushed).  (1) A reminder worded another way (「牙醫回診」 for
+        # 「看牙醫」) is not the same event to todo_same_event.  (2) A reminder set for the evening before
+        # with no 「前一天」 label is a reminder for another day, not this event.
 
         owner = str(row.get("sender_user_id") or "")
         due = date.fromisoformat(str(row.get("due_date") or ""))
@@ -1016,11 +1238,27 @@ def _new_push_summary(mode: str, now: float, today: date) -> dict:
         "due": 0, "expired": 0, "unsent": 0,
         "fold_structural": 0, "fold_queue": 0, "fold_semantic": 0, "fold_error": 0,
         "pushed": 0, "lines": 0, "would_push": 0, "would_fold": 0,
-        "push_ok": True,
+        "push_ok": True, "mark_error": 0,
     }
 
 
+def _mark(todo_ids: list, now: float, summary: dict) -> None:
+    """Pushed or folded rows marked done.  Marking is bookkeeping: a failure is counted in ``mark_error``
+    (logged by type) and never holds a push back or makes one that went out look failed (POST_1 N-2)."""
+    if not todo_ids:
+        return
+    try:
+        _mark_done(todo_ids, now, conn_factory=_job_conn)
+    except Exception as exc:
+        logger.warning("todo mark failed error_type=%s", type(exc).__name__)
+        summary["mark_error"] += len(todo_ids)
+
+
 def _push_today(group_id: str, mode: str, today: date, now: float, summary: dict) -> int:
+    try:
+        _drop_past_shadow_words(group_id, today)  # every mode, off too: it only drops words
+    except Exception as exc:
+        logger.warning("todo shadow words not dropped error_type=%s", type(exc).__name__)
     if mode == "off":
         return 0
     summary["expired"] = expire_past_due(group_id, today)
@@ -1054,9 +1292,9 @@ def _push_today(group_id: str, mode: str, today: date, now: float, summary: dict
     if shadow:
         # Counted, not pushed; marked so a second run today does not count them again.
         summary["would_push"] = len(keep)
-        _mark_done([r["todo_id"] for r in folded + keep], now)
+        _mark([r["todo_id"] for r in folded + keep], now, summary)
         return 0
-    _mark_done([r["todo_id"] for r in folded], now)
+    _mark([r["todo_id"] for r in folded], now, summary)
     if not keep:
         return 0
     lines = _merged_lines(keep)
@@ -1068,7 +1306,7 @@ def _push_today(group_id: str, mode: str, today: date, now: float, summary: dict
     if not _push(group_id, text, _owner_targets(owners), retry_key=retry_key):
         summary["push_ok"] = False  # not marked: tomorrow they expire and the report counts them
         return 0
-    _mark_done(ids, now)
+    _mark(ids, now, summary)  # LINE has it: push_ok stays true even if the marking fails
     summary["pushed"] = len(keep)
     summary["lines"] = len(lines)
     return len(keep)
@@ -1132,7 +1370,7 @@ def main_reminder(*, now: float | None = None) -> int:
     family = _family_group()
     if family:
         try:
-            run_incremental(family, now=now)
+            run_incremental(family, now=now, push_follows=True)
         except Exception as exc:
             logger.warning("todo extract failed error_type=%s", type(exc).__name__)
     else:
