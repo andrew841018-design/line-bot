@@ -4136,9 +4136,11 @@ def _handle_event(event) -> None:
 
     # 收回訊息（2026-10-11 爸媽健康）：刪掉那則留言記下的健康紀錄；其他資料照舊。
     # 2026-10-24 自動學習糾正：收回的抱怨學到的規則退休、還在排隊的判斷丟掉。
+    # 2026-11-13 TODO／紀念日抽取：收回的那則不再送模型、它建的 TODO 不推、待確認的候選刪掉。
     if isinstance(event, UnsendEvent):
         _forget_unsent_health_records(event)
         _forget_unsent_complaint(event)
+        _forget_unsent_family_extract(event)
         return
 
     # 只處理群組裡的 message
@@ -23264,6 +23266,33 @@ def _forget_unsent_health_records(event) -> None:
         parent_health.forget_message(group_id, str(message_id))
     except Exception as exc:
         logger.warning("parent health unsend cleanup failed error_type=%s", type(exc).__name__)
+
+
+def _forget_unsent_family_extract(event) -> None:
+    """收回訊息（2026-11-13，TODO／紀念日抽取）：那則不再送模型，它建的 TODO 取消、不推，
+    待確認的紀念日候選刪掉；Andrew 確認過的紀念日不動（群組白名單照舊）。"""
+    source = getattr(event, "source", None)
+    unsend = getattr(event, "unsend", None)
+    if not isinstance(source, GroupSource) or unsend is None:
+        return
+    group_id = source.group_id
+    if settings.allowed_group_ids and group_id not in settings.allowed_group_ids:
+        return
+    message_id = getattr(unsend, "message_id", None)
+    if not message_id:
+        return
+    try:
+        import todo
+
+        todo.forget_message(group_id, str(message_id))
+    except Exception as exc:
+        logger.warning("todo unsend cleanup failed error_type=%s", type(exc).__name__)
+    try:
+        import anniversary
+
+        anniversary.forget_message(group_id, str(message_id))
+    except Exception as exc:
+        logger.warning("anniversary unsend cleanup failed error_type=%s", type(exc).__name__)
 
 
 def _observe_complaint(event, group_id: str, msg, sender_user_id: str | None) -> None:

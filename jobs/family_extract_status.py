@@ -1,0 +1,190 @@
+"""TODO／紀念日抽取的數字（2026-11-13，給每日維護）：唯讀、只印數字 JSON。
+
+在正式目錄用 ``.venv/bin/python jobs/family_extract_status.py`` 跑。DB 用 ``mode=ro`` 開，不 import
+todo／anniversary（它們 import 時會建表），只讀白名單欄位，不印任何家人文字、稱呼、id。
+
+輸出：每個 job 的游標狀態（family_extract.status）、TODO 與候選的筆數，以及 ``alerts``：一串固定代碼，
+每日維護照代碼寫成一句話。exit code：0 完成；2 不在正式目錄（沒有 .env 或 DB）。
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import sys
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+BASE = Path(__file__).resolve().parent.parent
+if str(BASE) not in sys.path:
+    sys.path.insert(0, str(BASE))
+
+_TW = ZoneInfo("Asia/Taipei")
+_ENV_KEYS = (
+    "SQLITE_PATH", "ALLOWED_GROUP_IDS", "LINE_ALLOWED_GROUP_ID", "ALLOWED_GROUP_ID", "FAMILY_GROUP_ID",
+    "LINE_BOT_TODO_MODE", "LINE_BOT_ANNIVERSARY_EXTRACT",
+)
+
+
+def _mode(raw: str | None, *, allowed: tuple[str, ...]) -> str:
+    """The jobs' own reading (family_extract.parse_mode): unset or on → on, a typo → off."""
+    value = str(raw or "").strip().lower()
+    if value in ("", "on", "1", "true", "yes"):
+        return "on"
+    if value in ("off", "0", "false", "no"):
+        return "off"
+    return value if value in allowed else "off"
+
+
+def _env(base: Path) -> dict[str, str] | None:
+    path = base / ".env"
+    if not path.is_file():
+        return None
+    out: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.strip() in _ENV_KEYS:
+            out[key.strip()] = value.strip().strip('"').strip("'")
+    return out
+
+
+def _family_group(env: dict[str, str]) -> str:
+    """config.Settings.family_group_id (FAMILY_GROUP_ID, else the legacy ALLOWED_GROUP_ID), kept only
+    when it is one of the allowed groups, as the jobs themselves decide."""
+    allowed = [g.strip() for g in env.get("ALLOWED_GROUP_IDS", "").split(",") if g.strip()]
+    if not allowed:
+        single = (env.get("LINE_ALLOWED_GROUP_ID") or env.get("ALLOWED_GROUP_ID") or "").strip()
+        allowed = [single] if single else []
+    family = (env.get("FAMILY_GROUP_ID") or env.get("ALLOWED_GROUP_ID") or "").strip()
+    return family if family and family in allowed else ""
+
+
+def _count(conn, sql: str, params: tuple = ()) -> int | None:
+    """One integer, or None when the table is missing or the value is NULL (MAX of no rows)."""
+    try:
+        value = conn.execute(sql, params).fetchone()[0]
+    except sqlite3.Error:
+        return None
+    return None if value is None else int(value)
+
+
+def collect(base: Path = BASE, *, now: float | None = None) -> dict | None:
+    import family_extract
+
+    env = _env(base)
+    if env is None:
+        return None
+    db_path = Path(env.get("SQLITE_PATH") or "line_bot.db")
+    if not db_path.is_absolute():
+        db_path = base / db_path
+    if not db_path.is_file():
+        return None
+    now = time.time() if now is None else float(now)
+    group = _family_group(env)
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+    try:
+        newest = _count(conn, "SELECT MAX(created_at) FROM raw_messages WHERE group_id=?", (group,)) if group else None
+        jobs = {}
+        for name in ("todo", "anniversary"):
+            row = None
+            try:
+                row = conn.execute(
+                    "SELECT created_at, message_id FROM extract_cursors WHERE name=? AND group_id=?", (name, group)
+                ).fetchone()
+            except sqlite3.Error:
+                row = None
+            unread = None
+            if row is not None:
+                unread = _count(
+                    conn,
+                    "SELECT COUNT(*) FROM raw_messages WHERE group_id=? "
+                    "AND (created_at > ? OR (created_at = ? AND message_id > ?))",
+                    (group, int(row[0]), int(row[0]), str(row[1])),
+                )
+            jobs[name] = family_extract.status(conn, name, group, now=now, newest_raw=newest, unread=unread)
+        today = datetime.fromtimestamp(now, _TW).date()
+        week_ago = (today - timedelta(days=7)).isoformat()
+        todo_counts = {
+            "pending_upcoming": _count(
+                conn, "SELECT COUNT(*) FROM todos WHERE status='pending' AND due_date >= ?", (today.isoformat(),)
+            ),
+            "shadow": _count(conn, "SELECT COUNT(*) FROM todos WHERE status='shadow'"),
+            # Context only, not an alert: switching off → on expires the rows that fell due meanwhile.
+            "expired_never_pushed_7d": _count(
+                conn,
+                "SELECT COUNT(*) FROM todos WHERE status='expired' AND last_reminded_at IS NULL AND due_date >= ?",
+                (week_ago,),
+            ),
+        }
+        anniversary_counts = {
+            status: _count(conn, "SELECT COUNT(*) FROM anniversary_candidates WHERE status=?", (status,))
+            for status in ("pending", "confirmed", "rejected")
+        }
+        anniversary_counts["anniversaries"] = _count(conn, "SELECT COUNT(*) FROM anniversaries")
+    finally:
+        conn.close()
+    modes = {
+        "todo": _mode(env.get("LINE_BOT_TODO_MODE"), allowed=("on", "shadow", "off")),
+        "anniversary": _mode(env.get("LINE_BOT_ANNIVERSARY_EXTRACT"), allowed=("on", "off")),
+    }
+    return {
+        "family_group_set": bool(group),
+        "modes": modes,
+        "jobs": jobs,
+        "todo": todo_counts,
+        "anniversary": anniversary_counts,
+        "alerts": alerts(jobs, anniversary_counts, modes),
+    }
+
+
+def alerts(jobs: dict, anniversary_counts: dict, modes: dict) -> list[str]:
+    """Fixed codes; the daily maintenance prompt turns each into one sentence.  A job switched off
+    raises nothing (its numbers simply stop moving)."""
+    out: list[str] = []
+    for name, job in jobs.items():
+        if modes.get(name) == "off":
+            continue
+        if not job.get("ran"):
+            out.append(f"{name}_never_ran")
+            continue
+        last = job.get("last_run") or {}
+        skipped = last.get("skipped") or {}
+        if (job.get("no_answer_h") or 0) >= 36:
+            out.append(f"{name}_no_answer_36h")
+        if job.get("failures") or skipped.get("given_up") or skipped.get("blocked"):
+            out.append(f"{name}_bad_answers")
+        if last.get("gap_s"):
+            out.append(f"{name}_gap")
+        if (job.get("behind_h") or 0) > 48:
+            out.append(f"{name}_behind_48h")
+        if last.get("stopped") == "db_busy":
+            out.append(f"{name}_db_busy")
+        if (job.get("since_run_h") or 0) > 26:
+            out.append(f"{name}_not_run_26h")
+    push = (jobs.get("todo") or {}).get("last_push") or {}
+    if modes.get("todo") == "on" and push.get("mode") == "on":
+        if push.get("push_ok") is False:
+            out.append("todo_push_failed")
+        if push.get("fold_error"):
+            out.append("todo_fold_error")
+    if anniversary_counts.get("pending"):
+        out.append("anniversary_candidates_pending")
+    return out
+
+
+def main(argv: list[str] | None = None) -> int:
+    data = collect()
+    if data is None:
+        print(json.dumps({"error": "not_production_folder"}))
+        return 2
+    print(json.dumps(data, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
