@@ -383,9 +383,14 @@ def test_the_rest_of_a_dated_claim_stays_home():
 
 @pytest.mark.parametrize("word", ["峰會", "國宴", "2026年", "昨天", "美國", "的"])
 def test_a_run_of_lead_words_stays_fast(word, monkeypatch):
+    # 昨天 first: with no time word requires_current_research answers False before the lead
+    # regex runs, so 4 of these 6 words never reached it (found 2026-11-12).  The first line
+    # times the failing match itself; the True asserts only check that both sentences still
+    # count as dated public-office claims, which today sends them through the name check.
     def check(run):
-        public_research.requires_current_research(run + "總統宣布停火")
-        public_research.requires_current_research(run + "張三總統宣布停火")
+        assert public_research._SUBJECT_LEAD.fullmatch("昨天" + run + "張") is None
+        assert public_research.requires_current_research("昨天" + run + "總統宣布停火")
+        assert public_research.requires_current_research("昨天" + run + "張三總統宣布停火")
 
     forbid_other_threads(monkeypatch)
     assert cpu_seconds(check, word * 30) < 1
