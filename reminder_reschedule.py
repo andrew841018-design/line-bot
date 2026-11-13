@@ -59,6 +59,11 @@ _RECEIPT_HEADERS = (
     "已更新提醒",
     "提醒本來就是這個時間",
     "這則更正先前已處理",
+    # 2026-11-12 家人可要求提醒只推一次 (reminder_push_limit receipts).
+    "已改成只在",
+    "已改回照原本的規則提醒",
+    "提醒本來就只在",
+    "提醒本來就是照原本的規則推",
 )
 _MULTI_RECEIPT_RE = re.compile(r"已新增\s*\d+\s*筆提醒|\d+\s*筆提醒皆已存在")
 _PUSH_HEADER_RE = re.compile(r"^⏰\s*提醒")
@@ -74,6 +79,8 @@ _PEOPLE_LINE_RE = re.compile(r"^(?:對象|參加人)\s*[:：]")
 # fixR5a: pushes and receipts may show a fuller absorbed wording on this line
 # (reminder_push.fuller_detail_line); it never names another reminder.
 _DETAIL_LINE_RE = re.compile(r"^(?:細節|细节)\s*[:：]")
+# A push-limit receipt may add one line about the same event on the calendar.
+_CALENDAR_NOTE_LINE_RE = re.compile(r"^行事曆的「.*」照原本的規則提醒，不受影響。$")
 _PLACEHOLDER_RE = re.compile(r"\{p\d{1,3}\}")
 _MAX_QUOTED_LENGTH = 2000
 
@@ -151,6 +158,7 @@ def parse_quoted_reminder(text: str) -> QuotedReminder:
             if (
                 _PEOPLE_LINE_RE.match(line)
                 or _DETAIL_LINE_RE.match(line)
+                or _CALENDAR_NOTE_LINE_RE.match(line)
                 or _is_mention_line(line)
             ):
                 index += 1

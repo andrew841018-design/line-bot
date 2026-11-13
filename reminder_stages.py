@@ -31,6 +31,17 @@ FLAG_COLUMNS: dict[str, str] = {
 CONSUMABLE_STAGES: tuple[str, ...] = ("weekly", "3d", "1d", "4hr", "2hr", "1hr")
 WEEKLY_REPEAT_DAYS = 6.5
 
+# 2026-11-12 家人可要求提醒只推一次: a generic reminder may keep one stage
+# (reminders.push_keep_stage; '' keeps the whole ladder).
+KEEPABLE_STAGES: tuple[str, ...] = ("now", "1hr", "2hr", "4hr")
+# (lower exclusive, upper inclusive) seconds before remind_at, as window_stage.
+KEEP_WINDOW_SECONDS: dict[str, tuple[int, int]] = {
+    "1hr": (1800, 5400),
+    "2hr": (5400, 9000),
+    "4hr": (12600, 16200),
+}
+_NOW_HALF_WINDOW_SECONDS = 900
+
 # A timed calendar mirror carries its clock in the source text.
 _MIRROR_CLOCK_RE = re.compile(r"(?:活動)?時間：(?:[01]\d|2[0-3]):[0-5]\d(?:\b|$)")
 
@@ -96,11 +107,83 @@ def weekly_owed(last_weekly_at: object, now: int) -> bool:
     return days_since >= WEEKLY_REPEAT_DAYS
 
 
+def keep_stage_of(row: Mapping) -> str:
+    """The one stage a family member asked to keep, or ''.
+
+    Only generic reminders (no source_kind, no source_ref) honour it: a
+    calendar mirror, a 前一天／當天 row or any value outside KEEPABLE_STAGES
+    reads as no limit, so a stray value never stops a push run.
+    """
+
+    if str(row.get("source_kind") or "") or str(row.get("source_ref") or ""):
+        return ""
+    keep = str(row.get("push_keep_stage") or "")
+    return keep if keep in KEEPABLE_STAGES else ""
+
+
+def kept_stage_delivered(row: Mapping, keep: str) -> bool:
+    """Whether the kept 1/2/4-hour stage really went out.
+
+    A creation receipt (consume_open_stages) or a fold can set the flag
+    without a push, so the flag alone is not proof.  A real push writes
+    last_pushed_at; the limited row's other stages are held back and the
+    windows do not overlap, so a push at or after the kept window's upper
+    edge was the kept stage.
+    """
+
+    bounds = KEEP_WINDOW_SECONDS.get(keep)
+    if bounds is None:
+        return False
+    if not int(row.get(FLAG_COLUMNS[keep]) or 0):
+        return False
+    last = int(row.get("last_pushed_at") or 0)
+    return last > 0 and last >= int(row["remind_at"]) - bounds[1]
+
+
+def keep_allows(row: Mapping, stage: str) -> bool:
+    """Whether a push limit lets ``stage`` go out (shared by open_stage and the claim).
+
+    The kept stage goes out as usual; the at-time push is the safety net when
+    the kept stage never really went out (push failures, a later time
+    change); every other stage, weekly included, is held back.
+    """
+
+    keep = keep_stage_of(row)
+    if not keep or stage == keep:
+        return True
+    return stage == "now" and not kept_stage_delivered(row, keep)
+
+
+def keep_window_state(remind_at: int, keep: str, now: int) -> str:
+    """'ahead', 'open' or 'passed' for the kept stage's window at ``now``."""
+
+    delta = int(remind_at) - int(now)
+    if keep == "now":
+        if delta > _NOW_HALF_WINDOW_SECONDS:
+            return "ahead"
+        return "open" if delta >= -_NOW_HALF_WINDOW_SECONDS else "passed"
+    low, high = KEEP_WINDOW_SECONDS[keep]
+    if delta > high:
+        return "ahead"
+    return "open" if delta > low else "passed"
+
+
+def merged_keep_stage(primary_keep: object, peer_keeps) -> str:
+    """The limit a merged row keeps: its own, else the first peer's that has one."""
+
+    for value in (primary_keep, *(peer_keeps or ())):
+        keep = str(value or "")
+        if keep in KEEPABLE_STAGES:
+            return keep
+    return ""
+
+
 def open_stage(row: Mapping, now: int) -> str | None:
     """The stage to push for ``row`` at ``now``; None means nothing is due.
 
     ``row`` needs remind_at, the pushed_* flags and last_weekly_at, plus
-    source_kind/source_ref/source_text when present.
+    source_kind/source_ref/source_text, push_keep_stage and last_pushed_at
+    when present.
     """
 
     stage = window_stage(
@@ -111,6 +194,8 @@ def open_stage(row: Mapping, now: int) -> str | None:
         source_text=row.get("source_text"),
     )
     if stage is None:
+        return None
+    if not keep_allows(row, stage):
         return None
     if stage == "weekly":
         return "weekly" if weekly_owed(row.get("last_weekly_at"), now) else None

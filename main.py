@@ -7882,6 +7882,265 @@ def _apply_quoted_reschedule(
     return status, rr.refusal_text(status), None
 
 
+# ── 家人可要求提醒只推一次（2026-11-12 提案） ───────────────────────────────
+
+
+def _mentions_someone_other_than_bot(message) -> bool:
+    mention = getattr(message, "mention", None)
+    mentionees = getattr(mention, "mentionees", None) or []
+    return any(not getattr(item, "is_self", False) for item in mentionees)
+
+
+def _recent_bot_reminder_message(group_id: str) -> bool:
+    """A bot reminder push or receipt went out in this group in the last 30 minutes."""
+    import reminder_reschedule as rr
+
+    since = int(time.time()) - 1800
+    for text in memory.recent_bot_message_texts(group_id, since):
+        if rr.parse_quoted_reminder(text).status != rr.QUOTED_NONE:
+            return True
+    return False
+
+
+def _push_limit_calendar_title(group_id: str, state: dict) -> str:
+    """The calendar event that is this same appointment (read-only, best effort)."""
+    try:
+        import calendar_db
+        import line_mentions
+        import reminder_push
+
+        tw = ZoneInfo("Asia/Taipei")
+        day = datetime.fromtimestamp(int(state["remind_at"]), tw).date()
+        days = (day - datetime.now(tw).date()).days
+        if days < 0 or days > 400:
+            return ""
+        for item in calendar_db.list_upcoming(group_id, days=days + 1):
+            if str(item.get("event_date") or "") != day.isoformat():
+                continue
+            title = str(item.get("title") or "")
+            if title and reminder_push._strict_same_event(
+                title,
+                str(item.get("event_time") or ""),
+                line_mentions.parse_participants(item.get("participants")),
+                state,
+                int(state["remind_at"]),
+            ):
+                return str(calendar_db.event_shown_title(item) or title)
+    except Exception as exc:
+        logger.warning("push limit calendar check skipped error_type=%s", type(exc).__name__)
+    return ""
+
+
+def _send_push_limit_reply(
+    event: MessageEvent,
+    group_id: str,
+    message_id: str,
+    reply: str,
+    reminder_ref: dict | None,
+    status: str,
+    keep: str,
+    *,
+    changed: bool,
+) -> None:
+    # Only a change owns the group's pending burst (like the quoted reschedule);
+    # a how-to line or a refusal must not close messages nobody answered yet.
+    if changed:
+        try:
+            burst_filter.cancel_burst(group_id)
+        except Exception as exc:
+            logger.warning("push limit cancel_burst failed error_type=%s", type(exc).__name__)
+    if settings.bot_muted:
+        # _reply's muted path logs a text preview; the receipt holds the action.
+        delivered = False
+    else:
+        delivered = _reply(
+            event.reply_token,
+            reply,
+            group_id=group_id,
+            include_auxiliary=False,
+            allow_push_fallback=changed,
+            primary_reminder_ref=reminder_ref,
+        )
+    logger.info(
+        "reminder push limit handled group=%s message=%s status=%s keep=%s "
+        "reminder=%s delivered=%s",
+        group_id,
+        message_id,
+        status,
+        keep or "-",
+        (reminder_ref or {}).get("reminder_id"),
+        bool(delivered),
+    )
+
+
+def _try_handle_reminder_push_limit(
+    event: MessageEvent, group_id: str, text: str
+) -> bool:
+    """「只要提醒一次／只要一小時前提醒／照原本提醒就好」on a quoted bot reminder.
+
+    Runs after quote-cancel and before quoted-reschedule, so 「改成只提醒一次」
+    never gets the reschedule refusal.  ``reminder_push_limit.classify`` reads
+    the whole message over a closed vocabulary; anything else returns False and
+    keeps the old routing.  A quote of a family message is left to the
+    quote-context creation path.  Quoting one generic bot reminder keeps that
+    stage (memory.set_reminder_push_keep_stage) and replies a receipt bound to
+    the reminder; every other quoted outcome replies one 「尚未更新提醒：」 line
+    (a complaint gets the how-to line instead).
+    Without a reminder quote only a how-to line goes out, and only when the bot
+    was addressed or a bot reminder message went out in the last 30 minutes.
+    """
+    import reminder_overview
+    import reminder_push_limit as rpl
+
+    message = getattr(event, "message", None)
+    message_id = getattr(message, "id", None)
+    if (
+        not group_id
+        or not isinstance(message_id, str)
+        or not message_id
+        or len(text or "") > 240
+    ):
+        return False
+    try:
+        if _mentions_someone_other_than_bot(message):
+            return False
+        addressed_text = _extract_gemini_trigger(text, message)
+        request = rpl.classify(addressed_text if addressed_text is not None else text)
+        if request.status == rpl.NOT_OURS:
+            return False
+        import reminder_reschedule as rr
+
+        # Anything the quoted reschedule reads as a time change stays with it.
+        if rr.classify_reschedule_text(text).status != rr.NOT_RESCHEDULE:
+            return False
+        quoted_message_id = getattr(message, "quoted_message_id", None)
+        if quoted_message_id:
+            quoted = memory.get_raw_message(group_id, str(quoted_message_id))
+            if quoted is None or quoted[0] != "__bot__":
+                return False
+    except Exception as exc:
+        logger.warning(
+            "reminder push limit skipped group=%s error_type=%s",
+            group_id,
+            type(exc).__name__,
+        )
+        return False
+    keep = request.keep if request.status == rpl.KEEP else ""
+    kind, row = "none", None
+    if quoted_message_id:
+        try:
+            kind, row = _quoted_reschedule_target(group_id, str(quoted_message_id), text)
+        except Exception as exc:
+            logger.warning("push limit lookup failed error_type=%s", type(exc).__name__)
+            _send_push_limit_reply(
+                event, group_id, message_id, rpl.refusal_text("unavailable"), None,
+                "unavailable", keep, changed=False,
+            )
+            return True
+    if kind == "none":
+        try:
+            if addressed_text is None and not _recent_bot_reminder_message(group_id):
+                return False
+        except Exception as exc:
+            logger.warning("push limit recent check failed error_type=%s", type(exc).__name__)
+            return False
+        _send_push_limit_reply(
+            event, group_id, message_id, rpl.howto_text(request), None, "howto", keep,
+            changed=False,
+        )
+        return True
+    if kind != "generic" or row is None:
+        reason = "calendar" if kind == "handoff" else kind
+        _send_push_limit_reply(
+            event, group_id, message_id, rpl.refusal_text(reason), None, reason, keep,
+            changed=False,
+        )
+        return True
+    if request.status == rpl.REPLY:
+        _send_push_limit_reply(
+            event, group_id, message_id, rpl.refusal_text(request.reason), None,
+            request.reason, keep, changed=False,
+        )
+        return True
+    reminder_id = int(row["reminder_id"])
+    try:
+        state = memory.get_reminder_push_state(group_id, reminder_id)
+    except Exception as exc:
+        logger.warning("push limit state read failed error_type=%s", type(exc).__name__)
+        state = None
+    if state is None:
+        _send_push_limit_reply(
+            event, group_id, message_id, rpl.refusal_text("unavailable"), None,
+            "unavailable", keep, changed=False,
+        )
+        return True
+    try:
+        people = reminder_overview.shown_people(state)
+        planned = rpl.receipt(
+            "updated", keep, remind_at=state["remind_at"], action=state["action"], people=people
+        )
+        displayable = _reschedule_receipt_displayable(planned)
+    except Exception as exc:
+        logger.warning("push limit receipt build failed error_type=%s", type(exc).__name__)
+        _send_push_limit_reply(
+            event, group_id, message_id, rpl.refusal_text("unavailable"), None,
+            "unavailable", keep, changed=False,
+        )
+        return True
+    if not displayable:
+        _send_push_limit_reply(
+            event, group_id, message_id, rpl.refusal_text("display_unsafe"), None,
+            "display_unsafe", keep, changed=False,
+        )
+        return True
+    result = memory.set_reminder_push_keep_stage(
+        group_id,
+        reminder_id,
+        keep_stage=keep,
+        expected_action=str(row["action"]),
+        expected_remind_at=int(row["remind_at"]),
+    )
+    status = str(result.get("status") or "unavailable")
+    if status not in ("updated", "unchanged"):
+        _send_push_limit_reply(
+            event, group_id, message_id, rpl.refusal_text(status), None, status, keep,
+            changed=False,
+        )
+        return True
+    calendar_title = (
+        _push_limit_calendar_title(group_id, state) if status == "updated" and keep else ""
+    )
+    try:
+        reply = rpl.receipt(
+            status,
+            keep,
+            remind_at=state["remind_at"],
+            action=state["action"],
+            people=people,
+            kept_already_sent=bool(result.get("kept_already_sent")),
+            calendar_title=calendar_title,
+        )
+        if not _reschedule_receipt_displayable(reply):
+            # Only the calendar line can make it fail: send the receipt without it.
+            reply = rpl.receipt(
+                status,
+                keep,
+                remind_at=state["remind_at"],
+                action=state["action"],
+                people=people,
+                kept_already_sent=bool(result.get("kept_already_sent")),
+            )
+    except Exception as exc:
+        # The change is written: still confirm it with the receipt planned before the write.
+        logger.warning("push limit receipt failed error_type=%s", type(exc).__name__)
+        reply = planned
+    _send_push_limit_reply(
+        event, group_id, message_id, reply, {"reminder_id": reminder_id}, status, keep,
+        changed=status == "updated",
+    )
+    return True
+
+
 def _try_handle_quoted_reminder_reschedule(
     event: MessageEvent, group_id: str, text: str
 ) -> bool:
@@ -8041,6 +8300,10 @@ def _handle_text_message(
     # calendar capture, classifiers, and reminder extraction.  Otherwise a
     # pasted cancellation can be misread as a new reminder.
     if _try_handle_reminder_cancellation(event, group_id, text):
+        return
+    # 家人引用提醒說「只要提醒一次／只要一小時前提醒」（2026-11-12）：放在引用改期前，
+    # 免得「改成只提醒一次」被改期回成「目前只能改日期或時間」。
+    if _try_handle_reminder_push_limit(event, group_id, text):
         return
     # A quoted bot reminder plus only a new date/time moves that reminder
     # before restatement, calendar correction and creation can see it.
