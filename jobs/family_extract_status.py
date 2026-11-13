@@ -71,8 +71,8 @@ def _count(conn, sql: str, params: tuple = ()) -> int | None:
     return None if value is None else int(value)
 
 
-_NAME_RE = re.compile(r"^[a-z_]{1,40}$")
-_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_NAME_RE = re.compile(r"[a-z_]{1,40}", re.ASCII)
+_DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", re.ASCII)
 _RUN_KEYS = ("mode", "read", "sent", "requests", "answered", "new", "stopped", "gap_s", "skipped")
 _PUSH_KEYS = (
     "mode", "date", "due", "expired", "unsent", "fold_structural", "fold_queue", "fold_semantic",
@@ -90,11 +90,13 @@ def _clean(summary: dict, keys: tuple[str, ...]) -> dict:
         elif key == "skipped" and isinstance(value, dict):
             out[key] = {
                 k: v for k, v in value.items()
-                if isinstance(k, str) and _NAME_RE.match(k) and isinstance(v, int) and not isinstance(v, bool)
+                if isinstance(k, str) and _NAME_RE.fullmatch(k) and isinstance(v, int) and not isinstance(v, bool)
             }
-        elif key in ("mode", "stopped", "error") and isinstance(value, str) and re.fullmatch(r"[A-Za-z_]{0,60}", value):
+        elif key == "mode" and value in ("on", "shadow", "off"):
             out[key] = value
-        elif key == "date" and isinstance(value, str) and _DATE_RE.match(value):
+        elif key in ("stopped", "error") and isinstance(value, str) and re.fullmatch(r"[A-Za-z_]{0,60}", value, re.ASCII):
+            out[key] = value
+        elif key == "date" and isinstance(value, str) and _DATE_RE.fullmatch(value):
             out[key] = value
     return out
 
@@ -173,11 +175,11 @@ def collect(base: Path = BASE, *, now: float | None = None) -> dict | None:
         "jobs": jobs,
         "todo": todo_counts,
         "anniversary": anniversary_counts,
-        "alerts": alerts(jobs, anniversary_counts, modes),
+        "alerts": alerts(jobs, anniversary_counts, modes, now=now),
     }
 
 
-def alerts(jobs: dict, anniversary_counts: dict, modes: dict) -> list[str]:
+def alerts(jobs: dict, anniversary_counts: dict, modes: dict, *, now: float | None = None) -> list[str]:
     """Fixed codes; the daily maintenance prompt turns each into one sentence.  A job switched off
     raises nothing (its numbers simply stop moving)."""
     out: list[str] = []
@@ -201,6 +203,13 @@ def alerts(jobs: dict, anniversary_counts: dict, modes: dict) -> list[str]:
             out.append(f"{name}_db_busy")
         if (job.get("since_run_h") or 0) > 26:
             out.append(f"{name}_not_run_26h")
+        # Both jobs run at 08:00: by 08:10 today's run should have left its mark, even when a lock kept
+        # it from recording why it stopped (REV_1 I-1).
+        if now is not None and job.get("since_run_h") is not None:
+            here = datetime.fromtimestamp(now, _TW)
+            run_at = here.replace(hour=8, minute=0, second=0, microsecond=0)
+            if here >= run_at + timedelta(minutes=10) and job["since_run_h"] * 3600 > (now - run_at.timestamp()) + 360:
+                out.append(f"{name}_not_run_today")
     push = (jobs.get("todo") or {}).get("last_push") or {}
     if modes.get("todo") == "on" and push.get("mode") == "on":
         if push.get("push_ok") is False:

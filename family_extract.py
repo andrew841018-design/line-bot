@@ -479,10 +479,11 @@ def _run(feature: Feature, group_id: str, conn_factory: Callable, *, now: float 
             if failures < feature.max_failures:
                 result.skip("bad_answer")
                 return finish_run("bad_answer")
-            settle_at = next(
-                (m for m in batch if (m.created_at, m.message_id) == end), batch[-1]
-            )
-            result.skip("given_up", batch.index(settle_at) + 1)
+            # Up to the last message still at or before where the failing batch ended: a message that
+            # joined later is never given up with it, even when the old end itself was unsent.
+            held = [m for m in batch if (m.created_at, m.message_id) <= end]
+            settle_at = held[-1] if held else batch[0]
+            result.skip("given_up", len(held) or 1)
         elif status == "blocked":
             result.skip("blocked", len(batch))
         else:

@@ -53,9 +53,10 @@ def test_numbers_only_and_no_alerts_on_a_healthy_day(base):
         c.execute("INSERT INTO raw_messages VALUES (?, 'm1', 'user-a', '家人的話', ?)", (GROUP, int(now - 600)))
         c.execute("INSERT INTO todos VALUES ('t1', 'pending', '2099-01-01', NULL, '交報告')")
         c.execute("INSERT INTO anniversary_candidates VALUES ('c1', 'rejected', '成員甲')")
-    _cursor(base, "todo", created_at=now - 600, updated_at=now - 3600,
+    # both ran a minute ago: healthy whatever the wall clock says (not_run_today looks at 08:00)
+    _cursor(base, "todo", created_at=now - 600, updated_at=now - 60,
             last_push={"mode": "on", "push_ok": True, "fold_error": 0})
-    _cursor(base, "anniversary", created_at=now - 600, updated_at=now - 3600)
+    _cursor(base, "anniversary", created_at=now - 600, updated_at=now - 60)
 
     data = status.collect(base, now=now)
 
@@ -250,3 +251,85 @@ def test_an_unexpected_error_still_gives_one_line(monkeypatch, capsys):
     assert status.main([]) == 1
     out = capsys.readouterr().out
     assert "status_failed" in out and "secret" not in out
+
+
+# ── 2026-11-14 覆核（REV_2）補的測試 ──────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("env_mode,push_mode", [("shadow", "on"), ("on", "shadow")])
+def test_each_half_of_the_push_alert_gate_holds_on_its_own(base, env_mode, push_mode):
+    from jobs import family_extract_status as status
+
+    now = time.time()
+    with open(base / ".env", "a", encoding="utf-8") as f:
+        f.write(f"LINE_BOT_TODO_MODE={env_mode}\n")
+    _cursor(base, "todo", created_at=now - 60, updated_at=now - 60,
+            last_push={"mode": push_mode, "push_ok": False, "fold_error": 1, "mark_error": 1})
+
+    codes = status.collect(base, now=now)["alerts"]
+
+    assert not {"todo_push_failed", "todo_fold_error", "todo_mark_error"} & set(codes)
+
+
+def test_a_push_left_unmarked_raises_its_code(base):
+    from jobs import family_extract_status as status
+
+    now = time.time()
+    _cursor(base, "todo", created_at=now - 60, updated_at=now - 60,
+            last_push={"mode": "on", "push_ok": True, "mark_error": 1})
+
+    assert "todo_mark_error" in status.collect(base, now=now)["alerts"]
+
+
+@pytest.mark.parametrize("hours,alert", [(23, False), (25, True)])
+def test_no_answer_alerts_after_a_day(base, hours, alert):
+    from jobs import family_extract_status as status
+
+    now = time.time()
+    _cursor(base, "todo", created_at=now - 60, updated_at=now - 60, no_answer_since=now - hours * 3600)
+
+    assert ("todo_no_answer_2d" in status.collect(base, now=now)["alerts"]) is alert
+
+
+def test_pushed_today_counts_from_taipei_midnight(base):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from jobs import family_extract_status as status
+
+    tw = ZoneInfo("Asia/Taipei")
+    now = datetime(2026, 11, 14, 0, 30, tzinfo=tw).timestamp()
+    with _db(base) as c:
+        c.execute("CREATE TABLE anniversary_reminders_sent (anniversary_id TEXT, year INTEGER, "
+                  "offset_days INTEGER, sent_at INTEGER)")
+        for aid, when in (("a1", datetime(2026, 11, 13, 23, 50, tzinfo=tw)), ("a2", datetime(2026, 11, 14, 0, 10, tzinfo=tw))):
+            c.execute("INSERT INTO anniversary_reminders_sent VALUES (?, 2026, 0, ?)", (aid, int(when.timestamp() * 1000)))
+
+    assert status.collect(base, now=now)["anniversary"]["pushed_today"] == 1
+
+
+def test_the_whitelist_keeps_only_known_words():
+    from jobs import family_extract_status as status
+
+    kept = status._clean(
+        {"mode": "Emily_Huang", "stopped": "raced\n", "error": "OperationalError", "date": "２０２６-11-14"},
+        status._PUSH_KEYS + ("stopped",),
+    )
+
+    assert kept == {"error": "OperationalError"}
+
+
+
+@pytest.mark.parametrize("ran_at_hour,alert", [(7, True), (8.05, False)])
+def test_a_job_that_left_no_mark_since_08_00_raises_not_run_today(base, ran_at_hour, alert):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from jobs import family_extract_status as status
+
+    tw = ZoneInfo("Asia/Taipei")
+    now = datetime(2026, 11, 14, 9, 40, tzinfo=tw).timestamp()  # the daily maintenance
+    ran_at = datetime(2026, 11, 14, 0, 0, tzinfo=tw).timestamp() + ran_at_hour * 3600
+    _cursor(base, "todo", created_at=ran_at - 60, updated_at=ran_at)
+
+    assert ("todo_not_run_today" in status.collect(base, now=now)["alerts"]) is alert

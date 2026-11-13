@@ -1782,3 +1782,18 @@ def test_the_shadow_list_never_imports_todo():
     imported = {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
     imported |= {node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
     assert "todo" not in imported and "family_extract" not in imported
+
+
+
+def test_a_manual_extract_before_08_00_keeps_todays_todo_for_the_push(model):
+    """REV_1 I-2: run by hand at 07:00, a todo due today is made; the 08:00 job pushes it."""
+    import todo
+
+    _raw("msg-1", "user-a", "我明天要交報告", LAST_NIGHT)
+    model["answers"].append([_item(1, "交報告", TODAY)])
+
+    early = todo.run_incremental(GROUP, now=_ts(TODAY, 7))
+    assert early.new == 1 and early.skipped == {} and len(model["prompts"]) == 1
+
+    assert todo.main_reminder(now=NOW) == 0
+    assert len(model["prompts"]) == 1 and len(_pushes()) == 1

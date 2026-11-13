@@ -293,7 +293,7 @@ def test_a_purge_before_reading_is_reported_but_the_first_run_is_not(db, model):
         c.execute("UPDATE extract_cursors SET created_at=?, message_id='x'", (int(now - 30 * 86400),))
     later = _run(db, _feature(db), now)
 
-    assert first.gap_s == 0 and later.gap_s > 0
+    assert first.gap_s == 0 and later.gap_s > 0 and model["prompts"] == []
 
 
 def test_the_request_goes_to_the_last_tier_only(db, monkeypatch):
@@ -490,5 +490,50 @@ def test_the_copied_patterns_match_the_daily_memory_job():
     import family_extract
     from jobs import daily_memory
 
-    assert family_extract._PLACEHOLDER_RE.pattern == daily_memory._PLACEHOLDER_RE.pattern
-    assert family_extract._LONG_DIGITS_RE.pattern == daily_memory._LONG_DIGITS_RE.pattern
+    for name in ("_PLACEHOLDER_RE", "_LONG_DIGITS_RE"):
+        ours, theirs = getattr(family_extract, name), getattr(daily_memory, name)
+        assert (ours.pattern, ours.flags) == (theirs.pattern, theirs.flags)
+
+
+# ── 2026-11-14 覆核（REV_2）補的測試 ──────────────────────────────────────────────
+
+
+def test_the_race_loser_never_writes_back_its_stale_failure_count(db, model):
+    import family_extract
+
+    now = time.time()
+    _raw("m1", "user-a", "我明天要交報告", now - 3600)
+    model["answers"].append(_answer([], finish="STOP", text="not json"))
+    assert _run(db, _feature(db), now).stopped == "bad_answer"  # failures = 1
+    model["answers"].extend([[{"i": 1, "word": "A"}], [{"i": 1, "word": "B"}]])
+    inner_prepare = _feature(db).prepare
+
+    def racing_prepare(batch, items, result):
+        family_extract.run(_feature(db), GROUP, _closing(db), now=now + 60)  # wins, resets failures
+        return inner_prepare(batch, items, result)
+
+    loser = family_extract.run(_feature(db, prepare=racing_prepare), GROUP, _closing(db), now=now + 60)
+
+    assert loser.stopped == "raced" and len(model["prompts"]) == 3
+    with _closing(db)() as c:
+        assert c.execute("SELECT failures, failure_key FROM extract_cursors").fetchone() == (0, "")
+
+
+def test_giving_up_never_takes_a_message_that_joined_after_the_old_end_was_unsent(db, model):
+    import family_extract
+
+    now = time.time()
+    _raw("m1", "user-a", "我要做第一件", now - 3600)
+    _raw("m2", "user-a", "我要做第二件", now - 3500)
+    bad = _answer([], finish="STOP", text="not json")
+    model["answers"].extend([bad, bad, [{"i": 1, "word": "三"}]])
+
+    _run(db, _feature(db), now)  # [m1, m2] fails once: the batch ended at m2
+    with _closing(db)() as c:
+        family_extract.record_unsent(c, GROUP, "m2", now)
+    _raw("m3", "user-a", "我要做第三件", now - 300)
+    second = _run(db, _feature(db), now + 60)  # [m1, m3] fails again: only m1 is given up
+    third = _run(db, _feature(db), now + 120)
+
+    assert second.skipped.get("given_up") == 1
+    assert "第三件" in model["prompts"][2] and _found(db) == ["m3"]

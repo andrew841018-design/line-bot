@@ -346,7 +346,7 @@ _ABSOLUTE_DATE_RE = re.compile(_ABSOLUTE_DATE)
 _CLOCK = r"(?:[01]?\d|2[0-3])\s*[:：]\s*[0-5]\d"
 _CLOCK_RE = re.compile(_CLOCK)
 # 每週三, 每個禮拜三, 每天, 每個月5號, 每年, 每隔兩天: a routine, not one day's todo (POST_2 N-1).
-_RECURRING_RE = re.compile(r"每\s*[個一]?\s*(?:週|周|星期|禮拜|天|日|晚|早|月|年)|每隔")
+_RECURRING_RE = re.compile(r"每\s*(?:[個一]\s*)?(?:週|周|星期|禮拜|天|日|晚|早|月|年)|每隔")
 # Someone else as the one who does it (POST_2 I-3, FIX_LIST 4).  公 and 奶 count only inside a kinship
 # word (公司, 牛奶 are no people), and 其他／吉他／迷你／雞婆／媽祖 are no people either.
 _OTHER_PERSON_RE = re.compile(
@@ -482,7 +482,7 @@ _EXPECTED_DATE_RE = re.compile(
     rf"|(?P<cmd>{_NOT_AFTER_CN}(?P<cm>{_CN_MONTH})\s*月\s*(?P<cd>{_CN_DAY})\s*[日號])"
     r"|(?P<slash>(?<![0-9/])(?P<sm>[0-9]{1,2})\s*/\s*(?P<sd>[0-9]{1,2})(?![0-9/]))"
     rf"|(?P<monthday>(?P<which>下\s*下|下|這|本)\s*個?\s*月\s*的?\s*(?P<qd>{_DAY_NUMBER})\s*[號日])"
-    rf"|(?P<noday>(?:上\s*上|上|每)\s*[個一]?\s*(?:{_WEEK_WORD}\s*{_WEEKDAY_CHAR}?|月\s*的?\s*(?:{_DAY_NUMBER}\s*[號日])?))"
+    rf"|(?P<noday>(?:上\s*上|上|每)\s*(?:[個一]\s*)?(?:{_WEEK_WORD}\s*{_WEEKDAY_CHAR}?|月\s*的?\s*(?:{_DAY_NUMBER}\s*[號日])?))"
     rf"|(?P<next2>下\s*下\s*個?\s*{_WEEK_WORD}(?P<n2>{_WEEKDAY_CHAR}){_NOT_A_WEEKDAY_AFTER})"
     rf"|(?P<next>下\s*個?\s*{_WEEK_WORD}(?P<n1>{_WEEKDAY_CHAR}){_NOT_A_WEEKDAY_AFTER})"
     rf"|(?P<this>(?:這|本)\s*個?\s*{_WEEK_WORD}(?P<t>{_WEEKDAY_CHAR}){_NOT_A_WEEKDAY_AFTER})"
@@ -638,8 +638,8 @@ _TASK_FORBIDDEN = frozenset("@＠{}")
 _TASK_DATE_RE = re.compile(
     "(?:"
     + _ABSOLUTE_DATE
-    + rf"|(?:下\s*下|下|這|本|上\s*上|上|每)\s*[個一]?\s*月\s*的?\s*(?:{_DAY_NUMBER}\s*[號日])?"
-    + rf"|(?:下\s*下|下|這|本|上\s*上|上|每)\s*[個一]?\s*{_WEEK_WORD}(?:{_WEEKDAY_CHAR}{_NOT_A_WEEKDAY_AFTER}|末)?"
+    + rf"|(?:下\s*下|下|這|本|上\s*上|上|每)\s*(?:[個一]\s*)?月\s*的?\s*(?:{_DAY_NUMBER}\s*[號日])?"
+    + rf"|(?:下\s*下|下|這|本|上\s*上|上|每)\s*(?:[個一]\s*)?{_WEEK_WORD}(?:{_WEEKDAY_CHAR}{_NOT_A_WEEKDAY_AFTER}|末)?"
     + rf"|{_WEEK_WORD}(?:{_WEEKDAY_CHAR}{_NOT_A_WEEKDAY_AFTER}|末)"
     + r"|(?<![0-9/])[0-9]{1,2}\s*(?:號|日(?!\s*[遊游後內内前]))"
     + rf"|{_NOT_AFTER_CN}{_CN_DAY}\s*號"
@@ -896,8 +896,14 @@ def _write(conn, group_id: str, rows: list, result: family_extract.RunResult) ->
             result.skip("duplicate")
 
 
+PUSH_HOUR = 8  # com.andrew.line-bot-todo-reminder runs at 08:00
+
+
 def _feature(group_id: str, *, now: float, mode: str, push_follows: bool) -> family_extract.Feature:
     today = family_extract.tw_day(now)
+    # Before 08:00 (Taipei) the day's push is still to come, so a todo due today is pushed then: a manual
+    # extract after midnight must not drop it (REV_1 I-2).
+    push_follows = push_follows or family_extract.tw_hour(now) < PUSH_HOUR
     status = "shadow" if mode == "shadow" else "pending"
     names = _family_names()  # read once a run
     return family_extract.Feature(
