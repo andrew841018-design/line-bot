@@ -106,6 +106,25 @@ class Settings(BaseSettings):
         default=60,
         validation_alias="CLAUDE_CLI_TIMEOUT_SEC",
     )
+    # Reminder extraction on Claude (2026-11-14, reminder_extract_claude.py).
+    # Its own key under this one name only: ANTHROPIC_API_KEY / CLAUDE_API_KEY
+    # above switch every reply to the API.  The name keeps "API_KEY" so the
+    # reply CLI's child environment drops it.  Empty (or not "sk-ant-…") = off:
+    # extraction is Gemini only, as before.
+    reminder_extract_claude_api_key: str = Field(
+        default="",
+        validation_alias="REMINDER_EXTRACT_CLAUDE_API_KEY",
+        repr=False,
+    )
+    reminder_extract_claude_model: str = Field(
+        default="claude-haiku-5-5",
+        validation_alias="REMINDER_EXTRACT_CLAUDE_MODEL",
+    )
+    # A hard total limit (worker thread), 1–10 seconds.
+    reminder_extract_claude_timeout_sec: float = Field(
+        default=6.0,
+        validation_alias="REMINDER_EXTRACT_CLAUDE_TIMEOUT_SEC",
+    )
     # The CLI otherwise uses the account's own Claude Code default model
     # (opus), which is too slow for a chat reply.  An alias tracks the latest.
     claude_cli_model: str = Field(

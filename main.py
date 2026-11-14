@@ -106,6 +106,16 @@ except Exception as _card_pages_error:  # noqa: BLE001
 from correction_memory import ORGANIC_CORRECTION_PREFIXES, is_question_like
 import feedback_collector
 import gemini_client
+try:
+    # 2026-11-14: reminder extraction asks Claude first.  A missing or broken
+    # module (a half-copied deploy) must not stop the bot: Gemini only, as before.
+    import reminder_extract_claude as _reminder_extract_claude
+except Exception as _reminder_extract_claude_error:  # pragma: no cover - deploy safety
+    _reminder_extract_claude = None
+    logging.getLogger(__name__).warning(
+        "reminder_extract_claude unavailable error_type=%s",
+        type(_reminder_extract_claude_error).__name__,
+    )
 import line_errors
 import line_mentions
 import reply_riders
@@ -21426,6 +21436,17 @@ def _schedule_not_written_reply(items: list[dict]) -> str:
     return _REMINDER_PAST_TIME_REPLY if items else _REMINDER_TRY_AGAIN_REPLY
 
 
+def _claude_reminder_answer(text: str):
+    """Claude's reading of a chat message (2026-11-14), or None when the module is missing.
+
+    ``reminder_extract_claude.try_extract`` never raises: its ``unusable`` (off,
+    cooling down, a failed check…) sends the caller down today's Gemini path.
+    """
+    if _reminder_extract_claude is None:
+        return None
+    return _reminder_extract_claude.try_extract(text, datetime.now().strftime("%Y-%m-%d %A"))
+
+
 def _maybe_extract_reminder(
     text: str,
     group_id: str,
@@ -21519,7 +21540,15 @@ def _maybe_extract_reminder(
         result = local_result
         from_model = False
         model_unavailable = False
-        if result is None:
+        claude = _claude_reminder_answer(text) if result is None else None
+        if claude is not None and claude.kind == "answer":
+            # Already through Gemini's checks and finishing steps.
+            result = claude.result
+            from_model = True
+        elif claude is not None and claude.kind == "none":
+            pass  # read as no reminder, like the model's null below
+        # Claude off or unusable: today's Gemini path, unchanged.
+        elif result is None:
             # extract_reminder() never touches flash, so it is not gated on
             # flash's 20-request reserve (that starved this path to 4/day).
             if _gemini_side_task_allowed("reminder_extract", uses_flash=False):
