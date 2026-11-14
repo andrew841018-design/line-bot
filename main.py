@@ -21444,7 +21444,11 @@ def _claude_reminder_answer(text: str):
     """
     if _reminder_extract_claude is None:
         return None
-    return _reminder_extract_claude.try_extract(text, datetime.now().strftime("%Y-%m-%d %A"))
+    try:
+        return _reminder_extract_claude.try_extract(text, datetime.now().strftime("%Y-%m-%d %A"))
+    except Exception as e:  # a half-deployed module must still leave today's Gemini path
+        logger.warning("claude reminder extract failed error_type=%s", type(e).__name__)
+        return None
 
 
 def _maybe_extract_reminder(

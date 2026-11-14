@@ -120,9 +120,10 @@ class Settings(BaseSettings):
         default="claude-haiku-5-5",
         validation_alias="REMINDER_EXTRACT_CLAUDE_MODEL",
     )
-    # A hard total limit (worker thread), 1–10 seconds.
-    reminder_extract_claude_timeout_sec: float = Field(
-        default=6.0,
+    # A hard total limit (worker thread), 1–10 seconds.  Text, read by the module:
+    # a typo here must not stop the bot.
+    reminder_extract_claude_timeout_sec: str = Field(
+        default="6",
         validation_alias="REMINDER_EXTRACT_CLAUDE_TIMEOUT_SEC",
     )
     # The CLI otherwise uses the account's own Claude Code default model

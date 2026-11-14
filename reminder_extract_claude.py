@@ -12,8 +12,11 @@ never raises and returns one of three outcomes:
   main then runs today's Gemini code unchanged, so this path can only be
   stricter than before.
 
-Step A changes no behaviour on purpose: the prompt carries the production
-rules only (no rule for 393 or 397, no prep field).
+Step A keeps the production rules (no prep field, no rule moving a booking):
+the prompt only spells them out, because Claude read the short production
+wording more eagerly than intended in the eval (news, other people's plans,
+jokes built reminders; urged tasks and 「還」 plans were dropped once
+over-corrected).  See ops/state/line_bot_passive_reminder_model_20261113/.
 
 Safety notes:
 - The key comes only from ``REMINDER_EXTRACT_CLAUDE_API_KEY`` (config): the
@@ -31,7 +34,7 @@ Safety notes:
 
 from __future__ import annotations
 
-import concurrent.futures
+import http.client
 import json
 import logging
 import re
@@ -81,12 +84,14 @@ _SYSTEM_PROMPT = """你從家庭 LINE 群組的一則訊息，判斷有沒有「
 要建（is_reminder = true）：
 - 家人自己、或家人之間互相要求，未來某一天要做的具體事。
 - 已經約好的時間和事情，即使同一句裡也在說誰什麼時候有空，例如「後天我整天在公司，晚上7點去游泳」要建「去游泳」。
+- 請家人去做、催家人做的事也算，即使還沒做、只是說要趕快做，例如「你記得繳12/9的學費喔」。
+- 「還」常是「照舊」或「歸還」：「還在老地方集合」「還在家等人來修」「還書」都是要做的事。只說自己那時人在哪、在忙什麼、哪個時段方便的，才不建。
 
 不建（is_reminder = false）：
 - 沒有明確日期、過去的事、只是在問問題。
 - 純閒聊、心情或抱怨（例如「後天又要值夜班了，好累」）、玩笑或不可能的事（例如「後天要搭太空船去上班哈哈」）。
 - 純資訊分享：新聞、公告、天氣、價格、活動或節目消息，或別人家（鄰居、同事、朋友、店家、政府）要做的事，例如「新聞說下週二捷運部分路段停駛」「樓上那戶12/10要搬走」。訊息沒有要家人自己去做什麼，就不建。
-- 取消、改期、改成線上、不辦了、還沒決定、說不用做、已經有人辦好了。
+- 取消、改期、改成線上、不辦了、還沒決定要不要做、說不用做、已經有人辦好了。
 
 例子（假設今天是 2026-11-16 Monday）：
 - 「22號星期五下午14:00拿喜來登贈送的生日蛋糕」→ 建「拿喜來登贈送的生日蛋糕」，2026/11/22 14:00。
@@ -105,7 +110,18 @@ _lock = threading.Lock()
 _cooldown_until = 0.0
 _server_strikes = 0
 _in_flight = False
-_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="claude-extract")
+_cooling_logged = False
+_bad_key_logged = False
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A 30x must not carry the x-api-key header anywhere else (post-review P2 N-3)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
 
 
 @dataclass(frozen=True)
@@ -123,16 +139,24 @@ class _HTTPFailure(Exception):
 
 
 def _reset_state_for_tests() -> None:
-    global _cooldown_until, _server_strikes, _in_flight
+    global _cooldown_until, _server_strikes, _in_flight, _cooling_logged, _bad_key_logged
     with _lock:
         _cooldown_until = 0.0
         _server_strikes = 0
         _in_flight = False
+        _cooling_logged = False
+        _bad_key_logged = False
 
 
 def _api_key() -> str:
+    global _bad_key_logged
     key = str(getattr(settings, "reminder_extract_claude_api_key", "") or "").strip()
-    return key if key.startswith("sk-ant-") else ""
+    if key and not key.startswith("sk-ant-"):
+        if not _bad_key_logged:
+            _bad_key_logged = True
+            logger.warning("claude extract key is set but not an API key (sk-ant-...): off")
+        return ""
+    return key
 
 
 def enabled() -> bool:
@@ -141,18 +165,22 @@ def enabled() -> bool:
 
 
 def _timeout() -> float:
+    # Read from text here, not by pydantic: a typo in .env must not stop the bot (P2 N-7).
     try:
-        value = float(getattr(settings, "reminder_extract_claude_timeout_sec", 6.0))
+        value = float(str(getattr(settings, "reminder_extract_claude_timeout_sec", "6") or "6").strip())
     except (TypeError, ValueError):
+        value = 6.0
+    if value != value:  # NaN
         value = 6.0
     return min(10.0, max(1.0, value))
 
 
 def _cool_down(seconds: float, reason: str) -> None:
-    global _cooldown_until, _server_strikes
+    global _cooldown_until, _server_strikes, _cooling_logged
     with _lock:
         _cooldown_until = max(_cooldown_until, time.time() + seconds)
         _server_strikes = 0
+        _cooling_logged = False
     logger.info("claude extract cooling down reason=%s seconds=%d", reason, int(seconds))
 
 
@@ -169,7 +197,7 @@ def _post(body: dict) -> dict:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=_timeout()) as resp:
+        with _OPENER.open(req, timeout=_timeout()) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         retry_after = None
@@ -192,25 +220,38 @@ def _body(text: str, today_iso: str) -> dict:
 
 
 def _send(body: dict) -> dict:
-    """The request under the hard time limit; at most one in flight."""
+    """The request under the hard time limit; at most one in flight.
+
+    A daemon thread per request (P2 N-4): a request stuck in DNS must not hold a
+    restart.  ``_in_flight`` keeps it to one thread at a time.
+    """
     global _in_flight, _server_strikes
     with _lock:
         if _in_flight:
             raise _Busy()
         _in_flight = True
+    box: dict = {}
+    done = threading.Event()
 
-    def run() -> dict:
+    def run() -> None:
         global _in_flight
         try:
-            return _post(body)
+            box["raw"] = _post(body)
+        except BaseException as e:  # handed to the caller below
+            box["error"] = e
         finally:
             with _lock:
                 _in_flight = False
+            done.set()
 
-    future = _executor.submit(run)
+    threading.Thread(target=run, name="claude-extract", daemon=True).start()
     try:
-        raw = future.result(timeout=_timeout())
-    except concurrent.futures.TimeoutError:
+        if not done.wait(_timeout()):
+            raise TimeoutError
+        if "error" in box:
+            raise box["error"]
+        raw = box["raw"]
+    except TimeoutError:
         _cool_down(_COOLDOWN_TRANSPORT, "timeout")
         raise _Unusable("timeout") from None
     except _HTTPFailure as e:
@@ -226,7 +267,7 @@ def _send(body: dict) -> dict:
         else:
             _cool_down(_COOLDOWN_AUTH, f"http_{e.status}")
         raise _Unusable(f"http_{e.status}") from None
-    except (OSError, ValueError) as e:  # URLError, DNS, reset, TLS, a body that is not JSON
+    except (OSError, ValueError, http.client.HTTPException) as e:  # URLError, DNS, reset, TLS, bad body
         _cool_down(_COOLDOWN_TRANSPORT, type(e).__name__)
         raise _Unusable("transport") from None
     with _lock:
@@ -254,12 +295,29 @@ def _norm(value: str) -> str:
 
 
 def _check_action(text: str, action: str, month: int, day: int) -> None:
-    if _CONTROL_RE.search(action) or any(unicodedata.category(c) == "Cc" for c in action):
+    # Control and format characters (bidi, zero width) could disguise a receipt; the
+    # emoji joiner U+200D stays (P2 N-2).
+    if _CONTROL_RE.search(action) or any(
+        unicodedata.category(c) in ("Cc", "Cf") and c != "\u200d" for c in action
+    ):
         raise _Unusable("action_control")
     action_n, text_n = _norm(action), _norm(text)
     for mention in _MENTION_RE.findall(action_n):
         if mention not in text_n:
             raise _Unusable("action_mention")
+    import line_mentions
+
+    # As the receipt and the push read them (P2 N-1): no @all and no @name the message lacks.
+    if line_mentions.has_all_mention(action_n) and not line_mentions.has_all_mention(text_n):
+        raise _Unusable("action_mention")
+    if not set(line_mentions.mention_names(action_n)) <= set(line_mentions.mention_names(text_n)):
+        raise _Unusable("action_mention")
+    # A family member's name the message does not have: the push @s names it finds in the
+    # action (P2 I-1).  The names are never logged.
+    for label in line_mentions.load_user_aliases().values():
+        name = _norm(label).strip()
+        if name and name in action_n and name not in text_n:
+            raise _Unusable("action_name")
     for m, d in _ACTION_DATE_RE.findall(action_n):
         if (int(m), int(d)) != (month, day):
             raise _Unusable("action_date")
@@ -331,10 +389,20 @@ def try_extract(text: str, today_iso: str) -> Outcome:
             return Outcome("unusable", reason="off")
         if not text or len(text) > 500 or reminder_intent.is_obvious_noncommittal_source(text):
             return Outcome("unusable", reason="precheck")
+        # A message that closes or opens our delimiter goes to Gemini (P2 I-2).
+        lowered = _norm(text).casefold()
+        if "<message" in lowered or "</message" in lowered:
+            return Outcome("unusable", reason="delimiter")
+        global _cooling_logged
         with _lock:
             cooling = time.time() < _cooldown_until
+            ended = not cooling and _cooldown_until > 0 and not _cooling_logged
+            if ended:
+                _cooling_logged = True
         if cooling:
             return Outcome("unusable", reason="cooldown")
+        if ended:
+            logger.info("claude extract cooldown over")
         raw = _send(_body(text, today_iso))
         answer = _answer(raw)
         if answer is None:
