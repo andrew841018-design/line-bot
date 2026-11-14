@@ -8,10 +8,15 @@ delivery claim (`sending` -> finalized / released / fenced as `uncertain`), a co
 
 When LINE answers a text reply with a 400 that names the refused message (``details[].property``
 = ``messages[N]...``), `main._recover_rejected_reply` takes the riders out of the batch and sends
-the primary message alone.  A rider is never sent again as plain text (its plain version starts
-with the label of the person it pings -- the literal 「@當事人」 when the creator has no local
-alias).  The helpers here settle the riders that were taken out -- *fenced* when LINE named them,
-*released* otherwise -- and keep every list `_reply` finalizes later (``event_claims``,
+the primary message alone.  The one exception (2026-11-14, Andrew 「改送純文字」 on the 11/12 rule
+「textV2 被 LINE 拒收時改送純文字一次」): a named due reminder -- calendar or natural, a textV2 that
+carries its plain twin in ``Rider.plain_text`` -- stays in the batch with its message swapped for
+that plain text and goes once more with the primary; its plain version starts with the label of
+the person it pinged (the literal 「@當事人」 when the creator has no local alias), which the group
+now reads as text.  If LINE does not take that one more try it is fenced like any named rider.
+Every other rider is never sent again as plain text.  The helpers here settle the riders that
+were taken out -- *fenced* when LINE named them, *released* otherwise -- and keep every list
+`_reply` finalizes later (``event_claims``,
 ``natural_claims``, ``confirmation_claims``, ``commit_ids``) equal to what is still in the batch,
 so that nothing is settled twice.  That matters because `memory.release_reminder_delivery_claim`
 is a plain DELETE: releasing a claim that was just fenced as ``uncertain`` would erase the fence,
@@ -130,6 +135,10 @@ class Rider:
     confirmation: tuple[int, str] | None = None
     commit_id: str | None = None
     slot: NudgeSlot | None = None
+    # A due reminder's validated plain twin (what its push sends when LINE refuses the textV2):
+    # what it is sent again as when LINE names it (2026-11-14).  None for every other rider.
+    # Family words: never in a rider's repr (review PRE_1 N7).
+    plain_text: str | None = field(default=None, repr=False)
 
     def claims(self) -> list:
         return [*self.event_claims, *self.natural_claims]

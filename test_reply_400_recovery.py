@@ -11,8 +11,10 @@ it out, and settles each rider's claim exactly once:
   plain text);
 * the primary is named, or LINE names nothing: every rider is released (not fenced) and the primary
   goes alone as one plain TextMessage;
-* a rider is never sent again as plain text: its plain version starts with the label of the person
-  it pings, the literal 「@當事人」 when the creator has no local alias;
+* a rider is never sent again as plain text -- except, since 2026-11-14 (Andrew 「改送純文字」), a
+  named due reminder that is a textV2: it goes with the primary once more as its plain twin (which
+  starts with the label of the person it pings, the literal 「@當事人」 when the creator has no local
+  alias), and is fenced only if LINE does not take that try (test_reply_rider_plain_fallback.py);
 * ambiguous at any step -> the fence stays, nothing is pushed; refused everywhere -> a push, only
   where batch 1's fence rules allow one.
 
@@ -340,7 +342,8 @@ def test_menu_cards_are_never_recovered_as_plain_text(line, card):
 # ═══ a rider is refused ══════════════════════════════════════════════════════════════════════
 #
 # A rider is fenced when LINE names it and then left out; the other riders are released unsent; the
-# primary goes alone, as it was built.  A rider is never sent again as plain text (below).
+# primary goes alone, as it was built.  A named due reminder (a textV2) goes with it once more as
+# plain text first, and is fenced only when that try is not taken (2026-11-14, below).
 
 
 def arm_mention():
@@ -361,8 +364,11 @@ def test_the_armed_primary_really_is_a_textv2_mention(line):
     assert type(sent).__name__ == "TextMessageV2" and list(sent.substitution) == ["p1"]
 
 
-def test_a_named_reminder_is_fenced_and_the_primary_goes_alone_as_it_was_built(line, riding, monkeypatch):
+def test_a_named_reminder_goes_once_more_as_plain_text_with_the_primary_as_it_was_built(line, riding, monkeypatch):
+    """2026-11-14 (Andrew 「改送純文字」): a named due reminder is no longer fenced at once; it goes
+    with the primary once more, as its plain twin, and that stage is delivered."""
     rid = due_natural(monkeypatch)
+    [item] = reminder_push.due_reminders_for_reply(GROUP, limit=4)
     open_event()
     line.script = [bad(1)]
 
@@ -371,7 +377,24 @@ def test_a_named_reminder_is_fenced_and_the_primary_goes_alone_as_it_was_built(l
     assert len(line.replies) == 2 and not line.pushes
     first, second = line.replies
     assert kinds(first) == ["TextMessageV2", "TextMessageV2"]
-    assert kinds(second) == ["TextMessageV2"] and texts(second) == texts(first)[:1]  # same message, mention and all
+    assert kinds(second) == ["TextMessageV2", "TextMessage"]  # the primary as built, the reminder as plain text
+    assert texts(second) == [texts(first)[0], item["text"]]
+    assert pushed_1hr(rid) == 1
+    assert claims() == []  # delivered: finalized, not fenced
+    assert status() == "replied"
+    assert len(raw_bot_texts()) == 2 and raw_bot_texts()[1] == item["text"]  # what was sent is archived
+
+
+def test_a_named_reminder_whose_plain_text_is_refused_too_is_fenced(line, riding, monkeypatch):
+    rid = due_natural(monkeypatch)
+    open_event()
+    line.script = [bad(1), bad(1)]
+
+    assert say(arm_mention()) is True
+
+    assert [kinds(batch) for batch in line.replies] == [
+        ["TextMessageV2", "TextMessageV2"], ["TextMessageV2", "TextMessage"], ["TextMessage"],
+    ]  # LINE did not take its one more try: the primary goes alone, as plain text (as before)
     assert pushed_1hr(rid) == 0
     assert claims() == [(str(rid), "uncertain")]  # fenced: it cannot ride again
     assert status() == "replied"
@@ -381,7 +404,7 @@ def test_a_named_reminder_is_fenced_and_the_primary_goes_alone_as_it_was_built(l
 def test_a_fenced_reminder_does_not_ride_on_the_next_reply(line, riding, monkeypatch):
     rid = due_natural(monkeypatch)
     open_event()
-    line.script = [bad(1)]
+    line.script = [bad(1), bad(1)]  # its plain text is refused too: fenced
     assert say("嗨") is True
     line.replies.clear()
 
@@ -392,19 +415,21 @@ def test_a_fenced_reminder_does_not_ride_on_the_next_reply(line, riding, monkeyp
     assert claims() == [(str(rid), "uncertain")]
 
 
-def test_the_other_riders_are_released_when_one_is_fenced(line, riding, monkeypatch):
+def test_the_other_riders_are_released_when_one_is_named(line, riding, monkeypatch):
     bad_one = due_natural(monkeypatch, "繳房屋稅", user="U_A")
     good_one = due_natural(monkeypatch, "拿乾洗衣物", user="U_B")
+    plain_by_rid = {int(item["reminder_id"]): item["text"] for item in reminder_push.due_reminders_for_reply(GROUP, limit=4)}
     open_event()
     line.script = [bad(1)]  # the first reminder in the batch
 
     assert say("嗨") is True
 
-    assert kinds(line.replies[1]) == ["TextMessage"] and texts(line.replies[1]) == ["嗨"]
-    fenced = [subject for subject, state in claims() if state == "uncertain"]
-    assert len(fenced) == 1 and len(claims()) == 1  # the other claim was released, not fenced
-    released = ({str(bad_one), str(good_one)} - set(fenced)).pop()
-    assert pushed_1hr(int(released)) == 0  # still due: it rides on a later reply
+    assert kinds(line.replies[1]) == ["TextMessage", "TextMessage"] and texts(line.replies[1])[0] == "嗨"
+    assert claims() == []  # the named one delivered as plain text; the other released, not fenced
+    [delivered] = [rid for rid in (bad_one, good_one) if pushed_1hr(rid) == 1]
+    assert texts(line.replies[1])[1] == plain_by_rid[delivered]
+    released = ({bad_one, good_one} - {delivered}).pop()
+    assert pushed_1hr(released) == 0  # still due: it rides on a later reply
 
 
 def test_a_named_reminder_and_a_refused_primary_send_the_primary_as_plain_text(line, riding, monkeypatch):
@@ -415,8 +440,8 @@ def test_a_named_reminder_and_a_refused_primary_send_the_primary_as_plain_text(l
     assert say(arm_mention()) is True
 
     assert [kinds(batch) for batch in line.replies] == [
-        ["TextMessageV2", "TextMessageV2"], ["TextMessageV2"], ["TextMessage"],
-    ]
+        ["TextMessageV2", "TextMessageV2"], ["TextMessageV2", "TextMessage"], ["TextMessage"],
+    ]  # the reminder's one more try went with the primary; refused, it is fenced
     assert "{p1}" not in texts(line.replies[2])[0]
     assert claims() == [(str(rid), "uncertain")] and not line.pushes
     assert status() == "replied"
@@ -430,6 +455,9 @@ def test_everything_refused_is_pushed_as_plain_text_once(line, riding, monkeypat
     assert say(arm_mention()) is True
 
     assert len(line.replies) == 3 and len(line.pushes) == 1
+    assert [kinds(batch) for batch in line.replies] == [
+        ["TextMessageV2", "TextMessageV2"], ["TextMessageV2", "TextMessage"], ["TextMessage"],
+    ]  # the reminder's one more try went in the first resend only
     assert kinds(line.pushes[0][0]) == ["TextMessage"]
     assert claims() == [(str(rid), "uncertain")]
     assert status() == "replied"
@@ -648,14 +676,30 @@ def test_a_refused_primary_releases_the_riders_that_were_named_with_it(line, rid
     assert claims() == [] and pushed_1hr(rid) == 0  # released: it rides again
 
 
-def test_a_reminder_only_reply_fences_the_named_rider_and_has_nothing_left_to_send(line, riding, monkeypatch):
+def test_a_reminder_only_reply_sends_the_named_reminder_once_more_as_plain_text(line, riding, monkeypatch):
     rid = due_natural(monkeypatch)
+    [item] = reminder_push.due_reminders_for_reply(GROUP, limit=4)
     open_event()
     line.script = [bad(0)]
 
-    assert say("Gemini 暫時忙不過來") is False  # the primary is suppressed: the reminder rides alone
+    assert say("Gemini 暫時忙不過來") is True  # the primary is suppressed: the reminder rides alone
 
-    assert len(line.replies) == 1 and not line.pushes
+    assert [kinds(batch) for batch in line.replies] == [["TextMessageV2"], ["TextMessage"]]
+    assert texts(line.replies[1]) == [item["text"]] and not line.pushes
+    assert claims() == [] and pushed_1hr(rid) == 1
+    assert status() == "replied"
+
+
+def test_a_reminder_only_reply_whose_plain_text_is_refused_too_fences_it_and_sends_nothing_more(
+    line, riding, monkeypatch
+):
+    rid = due_natural(monkeypatch)
+    open_event()
+    line.script = [bad(0), bad(0)]
+
+    assert say("Gemini 暫時忙不過來") is False
+
+    assert len(line.replies) == 2 and not line.pushes
     assert claims() == [(str(rid), "uncertain")]
     assert status() == "processing"
 
@@ -674,13 +718,25 @@ def test_a_reminder_only_reply_with_an_unnamed_refusal_releases_and_sends_nothin
 def test_the_references_of_a_primary_sent_alone_are_not_shifted(line, riding, monkeypatch):
     rid = due_natural(monkeypatch)
     open_event()
-    line.script = [bad(1)]
+    line.script = [bad(1), bad(1)]  # the reminder's plain text is refused too: the primary goes alone
 
     assert say("嗨", primary_reminder_ref={"reminder_id": 4242}) is True
 
     assert memory.get_sent_reminder_reference(GROUP, "sent-1")["reminder_id"] == 4242  # still bound to the primary
     assert memory.get_sent_reminder_reference(GROUP, "sent-2") is None
     assert claims() == [(str(rid), "uncertain")]
+
+
+def test_the_references_follow_the_messages_of_a_resend_with_a_plain_reminder(line, riding, monkeypatch):
+    rid = due_natural(monkeypatch)
+    open_event()
+    line.script = [bad(1)]
+
+    assert say("嗨", primary_reminder_ref={"reminder_id": 4242}) is True
+
+    assert memory.get_sent_reminder_reference(GROUP, "sent-1")["reminder_id"] == 4242  # the primary's
+    assert memory.get_sent_reminder_reference(GROUP, "sent-2")["reminder_id"] == rid  # the plain reminder's own
+    assert claims() == []
 
 
 def test_the_menu_buttons_follow_the_last_message_that_is_finally_sent(line, riding, monkeypatch):
@@ -694,7 +750,8 @@ def test_the_menu_buttons_follow_the_last_message_that_is_finally_sent(line, rid
 
     first, second, third = line.replies
     assert first[-1].quick_reply is not None and first[0].quick_reply is None  # on the rider, as always
-    assert second[-1].quick_reply is not None and len(second) == 1  # the primary alone, as built
+    assert kinds(second) == ["TextMessage", "TextMessage"]  # the primary as built, the reminder as plain text
+    assert second[-1].quick_reply is not None and second[0].quick_reply is None  # on the last one sent
     assert third[-1].quick_reply is not None and kinds(third) == ["TextMessage"]  # the plain text
 
 
@@ -717,26 +774,59 @@ def test_a_named_calendar_reminder_is_fenced_like_any_other_rider(line, riding):
         assert c.execute("SELECT reminded_1d FROM events WHERE event_id=?", (event_id,)).fetchone()[0] is None
 
 
-# ── a rider is never sent again as plain text ──────────────────────────────────────────────
+# ── a rider's plain text: only a named due reminder, only once ─────────────────────────────
+#
+# Until 2026-11-14 no rider was ever sent again as plain text: a reminder's plain version starts with
+# the label of the person it pings -- the literal 「@當事人」 when its creator has no local alias --
+# which the family reads as text where textV2 showed a real @.  Andrew chose 「改送純文字」 (the
+# 11/12 rule: a refused textV2 goes once as plain text, the @ must never cost the delivery): a
+# reminder LINE names goes once more as that plain text.  Every other path still never shows it.
+
+
+@pytest.mark.parametrize(
+    "script, delivered",
+    [
+        ([bad(1)], True),                    # the rider is named: once more, as plain text
+        ([bad(1), bad(0)], False),           # ... that resend is refused for the primary: fenced
+        ([bad(1), bad(0), bad(0)], False),   # ... and the plain primary is refused too: pushed
+        ([bad(1), BAD_TOKEN], False),        # ... the token is gone: fenced, the primary pushed
+    ],
+    ids=["named", "named+primary", "named+primary+plain", "named+token"],
+)
+def test_a_named_reminder_shows_its_plain_text_exactly_once(line, riding, monkeypatch, script, delivered):
+    due_natural(monkeypatch, "繳房屋稅", user="U_STRANGER")  # no alias for this creator
+    [item] = reminder_push.due_reminders_for_reply(GROUP, limit=4)
+    assert item["text"].startswith("@當事人\n")
+    open_event()
+    line.script = list(script)
+
+    say(arm_mention())
+
+    first = texts(line.replies[0])
+    assert "繳房屋稅" in first[1] and first[1].startswith("{target}")  # the placeholder form, as always
+    tried = [text for batch in line.replies[1:] for text in texts(batch)]
+    assert tried.count(item["text"]) == 1  # one more try, in the first resend
+    assert sum("繳房屋稅" in text for text in tried) == 1  # and its words in no other form (POST_1 N5)
+    assert texts(line.replies[1])[-1] == item["text"]
+    pushed = [text for messages, _key in line.pushes for text in texts(messages)]
+    assert all("繳房屋稅" not in text for text in pushed), pushed  # a push carries the primary only
+    archived = raw_bot_texts()
+    assert archived.count(item["text"]) == int(delivered)
+    assert all("@當事人" not in text for text in archived if text != item["text"]), archived
 
 
 @pytest.mark.parametrize(
     "script",
     [
-        [bad(1)],                       # the rider is named: left out, fenced
-        [bad(1), bad(0)],               # ... and the primary is refused after all: plain text
-        [bad(1), bad(0), bad(0)],       # ... and plain text is refused too: pushed
-        [bad(1), BAD_TOKEN],            # ... the token is gone: pushed
         [bad(0, 1)],                    # the primary is named with it
         [BAD_UNNAMED],                  # LINE names nothing
         [BAD_UNNAMED, bad(0)],
     ],
-    ids=["named", "named+primary", "named+primary+plain", "named+token", "primary+rider", "unnamed", "unnamed+plain"],
+    ids=["primary+rider", "unnamed", "unnamed+plain"],
 )
-def test_no_resend_path_shows_the_plain_text_of_a_reminder(line, riding, monkeypatch, script):
-    """The plain version of a reminder starts with the label of the person it pings -- the literal
-    「@當事人」 when its creator has no local alias.  textV2 shows a real @ there; as plain text the
-    family would read 「@當事人」 in the group."""
+def test_no_other_resend_path_shows_the_plain_text_of_a_reminder(line, riding, monkeypatch, script):
+    """The primary is named, or nothing is: the riders are released and ride again later, as textV2;
+    their plain text is never shown."""
     due_natural(monkeypatch, "繳房屋稅", user="U_STRANGER")  # no alias for this creator
     open_event()
     line.script = list(script)
@@ -924,7 +1014,7 @@ def _natural_and_later_mirror(monkeypatch, action="施打流感疫苗和新冠�
     return rid, mirror
 
 
-def test_the_claim_of_a_folded_reminder_is_fenced_with_its_carrier(line, riding, monkeypatch):
+def test_the_claim_of_a_folded_reminder_is_delivered_with_its_plain_carrier(line, riding, monkeypatch):
     natural, mirror = _natural_and_later_mirror(monkeypatch)
     open_event()
     line.script = [bad(1)]
@@ -932,8 +1022,44 @@ def test_the_claim_of_a_folded_reminder_is_fenced_with_its_carrier(line, riding,
     assert say("嗨") is True
 
     assert len(line.replies[0]) == 2  # one message for the natural reminder and its mirror
+    assert kinds(line.replies[1]) == ["TextMessage", "TextMessage"]  # the carrier once more, as plain text
+    assert claims() == []
+    assert pushed_1hr(natural) == 1 and pushed_1hr(mirror) == 1  # both settled with the message that went out
+
+
+def test_the_claim_of_a_folded_reminder_is_fenced_with_its_carrier(line, riding, monkeypatch):
+    natural, mirror = _natural_and_later_mirror(monkeypatch)
+    open_event()
+    line.script = [bad(1), bad(1)]  # the carrier's plain text is refused too
+
+    assert say("嗨") is True
+
+    assert len(line.replies[0]) == 2  # one message for the natural reminder and its mirror
     assert claims() == sorted([(str(natural), "uncertain"), (str(mirror), "uncertain")])
     assert pushed_1hr(natural) == 0 and pushed_1hr(mirror) == 0
+
+
+def test_a_named_carrier_holding_a_claim_no_rider_owns_says_why_it_is_not_sent_as_plain_text(
+    line, riding, monkeypatch, caplog
+):
+    """(2026-11-14, review PRE_2 N1) A failed fold leaves a claim no rider owns: the named carrier is fenced
+    as before (no plain resend, so the event cannot arrive twice), and the log says why -- a count only."""
+    import reply_riders
+
+    _natural_and_later_mirror(monkeypatch)
+
+    def failing_fold(*_args, **_kwargs):
+        raise RuntimeError("fold failed")
+
+    monkeypatch.setattr(reply_riders, "fold_claims", failing_fold)
+    open_event()
+    line.script = [bad(1)]
+    caplog.set_level(logging.WARNING)
+
+    assert say("嗨") is True
+
+    assert "reply rider plain text skipped: claims without a rider=1" in caplog.text
+    assert texts(line.replies[-1]) == ["嗨"]  # the primary alone, as before
 
 
 def test_the_claim_of_a_folded_reminder_is_released_with_its_carrier(line, riding, monkeypatch):
@@ -977,7 +1103,7 @@ def test_a_claim_no_rider_owns_is_released_when_the_reply_is_recovered(line, rid
     assert texts(line.replies[-1]) == ["嗨"]
 
 
-def test_the_claim_of_a_calendar_event_covered_by_a_reminder_is_fenced_with_its_carrier(line, riding, monkeypatch):
+def _event_covered_by_a_reminder(monkeypatch):
     import calendar_db
 
     day = _day(1)
@@ -989,8 +1115,32 @@ def test_the_claim_of_a_calendar_event_covered_by_a_reminder_is_fenced_with_its_
         GROUP, "U_A", "拿生日蛋糕", _at(day, 14), source_text=f"{day.month}/{day.day} 14:00 拿生日蛋糕", time_kind="clock"
     )
     monkeypatch.setattr(reminder_push, "_now_ts", lambda: _at(day, 13))
+    return event_id, rid
+
+
+def test_the_claim_of_a_calendar_event_covered_by_a_reminder_is_delivered_with_its_plain_carrier(
+    line, riding, monkeypatch
+):
+    import calendar_db
+
+    event_id, rid = _event_covered_by_a_reminder(monkeypatch)
     open_event()
     line.script = [bad(1)]
+
+    assert say("嗨") is True
+
+    assert len(line.replies[0]) == 2  # the event and its reminder go out as one message
+    assert kinds(line.replies[1]) == ["TextMessage", "TextMessage"] and texts(line.replies[1])[0] == "嗨"
+    assert claims() == []  # the event's and the reminder's, both settled with the plain carrier
+    assert pushed_1hr(rid) == 1
+    with calendar_db._conn() as c:
+        assert c.execute("SELECT reminded_1d FROM events WHERE event_id=?", (event_id,)).fetchone()[0] is not None
+
+
+def test_the_claim_of_a_calendar_event_covered_by_a_reminder_is_fenced_with_its_carrier(line, riding, monkeypatch):
+    _event_covered_by_a_reminder(monkeypatch)
+    open_event()
+    line.script = [bad(1), bad(1)]  # the carrier's plain text is refused too
 
     assert say("嗨") is True
 

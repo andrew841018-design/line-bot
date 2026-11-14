@@ -4569,7 +4569,11 @@ def _try_piggyback_reminders_fast_path(
     """Use an ordinary group message's reply_token to deliver due reminders.
 
     LINE push_message can hit monthly 429 quota; reply_message does not use that
-    quota. Stages are marked only after reply_message succeeds.
+    quota. Stages are marked only after reply_message succeeds.  A 400 that is not
+    about the token gets one more reply with the refused textV2 reminders (all of
+    them when LINE names none) as plain text (2026-11-14); any other failure, or a
+    failed plain resend, fences them as before.  Both calls run on the webhook
+    thread; when this returns False the same token goes on to the burst reply.
     """
     if (
         not _reminder_reply_piggyback_enabled()
@@ -4765,15 +4769,54 @@ def _try_piggyback_reminders_fast_path(
             delivery_accepted = True
         except Exception as e:
             claims = [*event_delivery_claims, *natural_delivery_claims]
-            if _is_definite_reply_token_error(e):
-                memory.release_reminder_delivery_claims(claims)
-            else:
-                memory.mark_reminder_delivery_claims_uncertain(claims)
+            # 2026-11-14 (Andrew 「改送純文字」): LINE refused textV2 reminders: once more, those
+            # as plain text (see `_fast_path_plain_messages`).  Built in its own try: a failure
+            # here must not reach the handler below, which logs the exception's text.
+            try:
+                plain_messages = _fast_path_plain_messages(e, messages, message_plain_texts)
+            except Exception as build_error:
+                logger.warning(
+                    "reminder fast-path plain text not built error_type=%s",
+                    type(build_error).__name__,
+                )
+                plain_messages = None
+            if plain_messages is None:
+                if _is_definite_reply_token_error(e):
+                    memory.release_reminder_delivery_claims(claims)
+                else:
+                    memory.mark_reminder_delivery_claims_uncertain(claims)
+                logger.warning(
+                    "reminder fast-path reply failed (reminders preserved): %s",
+                    _line_error_detail(e, secrets=(reply_token,)),
+                )
+                return False
             logger.warning(
-                "reminder fast-path reply failed (reminders preserved): %s",
+                "reminder fast-path reply refused; sending %d reminder(s) once more as plain text "
+                "group=%s: %s",
+                sum(1 for old, new in zip(messages, plain_messages) if old is not new),
+                group_id,
                 _line_error_detail(e, secrets=(reply_token,)),
             )
-            return False
+            try:
+                with ApiClient(_get_line_config()) as api_client:
+                    response = MessagingApi(api_client).reply_message(
+                        ReplyMessageRequest(
+                            reply_token=reply_token, messages=plain_messages,
+                        )
+                    )
+            except Exception as retry_error:
+                # Refused again, the token gone, or no answer: fenced, as the first refusal was
+                # before 2026-11-14.  Never released -- if the first refusal spent the token, a
+                # released reminder would make every later message's reply fail the same way.
+                memory.mark_reminder_delivery_claims_uncertain(claims)
+                logger.warning(
+                    "reminder fast-path plain resend failed (reminders fenced): %s",
+                    _line_error_detail(retry_error, secrets=(reply_token,)),
+                )
+                return False
+            _mark_inbound_reply_succeeded(reply_token)
+            delivery_accepted = True
+            messages = plain_messages
         try:
             sent_messages = getattr(response, "sent_messages", None) or []
             for idx, sent in enumerate(sent_messages):
@@ -24604,6 +24647,74 @@ def _sanitized_plain_text_message(text: str):
     )
 
 
+# 2026-11-14 (Andrew 「改送純文字」, the 11/12 rule 「textV2 被 LINE 拒收時改送純文字一次，不能因為加了 @ 讓訊息
+# 送不到」): a due reminder LINE refuses while it rides on a reply goes once more as plain text in the
+# same reply, instead of being fenced as `uncertain` (which blocked every later claim of that stage,
+# so it never arrived in any form; pushes may be out of monthly quota, the reply is then the only
+# way a reminder arrives).  Its plain twin is the validated text its own push sends on a refusal:
+# the label of the person it pinged written as text (the literal 「@當事人」 when the creator has no
+# local alias).  One more try only: if LINE does not take it, the reminder is fenced as before.
+
+
+def _reminder_spec_plain_text(spec: dict) -> str | None:
+    """The plain twin of a calendar reminder spec that pings someone (``event_reminder``'s validated
+    ``fallback_text``); None for a spec that is plain text already."""
+    if spec.get("kind") not in ("textV2", "mention"):
+        return None
+    return str(spec.get("fallback_text") or "") or None
+
+
+def _plain_reminder_message(message, plain_text: str | None):
+    """The plain TextMessage a refused due reminder is sent again as, or None when it cannot be one:
+    its message is not a textV2 (a plain message is not helped by a plain resend) or it carries no
+    plain twin."""
+    plain = str(plain_text or "")
+    if type(message).__name__ != "TextMessageV2" or not plain.strip():
+        return None
+    return TextMessage(text=line_mentions.clip_utf16(plain, reply_riders.PLAIN_TEXT_LIMIT) or "…")
+
+
+def _rider_plain_message(rider, message):
+    """`_plain_reminder_message` for a reply rider: only a calendar or natural reminder.  An
+    acknowledgement, the nudge and a pending text are never sent again as plain text."""
+    if rider is None or rider.kind not in ("event", "natural"):
+        return None
+    return _plain_reminder_message(message, rider.plain_text)
+
+
+def _fast_path_plain_messages(error: BaseException, messages: list, plain_texts: list) -> list | None:
+    """The fast path's reply (due reminders only) was refused with a 400 that is not about the token:
+    the batch to send once more, or None (the reminders are fenced, as before).
+
+    LINE named the refused message(s): when every named one is a textV2 reminder with its plain twin,
+    those go as plain text and the others as they were.  LINE named none (review PRE_1 Q1): the
+    request holds nothing but reminders, so every textV2 one with its plain twin goes as plain text
+    -- the others lose their @ for this once, where before 2026-11-14 the whole batch was lost.
+    None when a named message cannot go plain, or when nothing would change."""
+    if not line_errors.is_bad_request(error) or _is_definite_reply_token_error(error):
+        return None
+
+    def plain_of(index: int):
+        return _plain_reminder_message(messages[index], plain_texts[index] if index < len(plain_texts) else None)
+
+    named = [index for index in line_errors.rejected_message_indexes(error) if 0 <= index < len(messages)]
+    resend = list(messages)
+    if named:
+        for index in named:
+            plain_message = plain_of(index)
+            if plain_message is None:
+                return None
+            resend[index] = plain_message
+        return resend
+    changed = False
+    for index in range(len(messages)):
+        plain_message = plain_of(index)
+        if plain_message is not None:
+            resend[index] = plain_message
+            changed = True
+    return resend if changed else None
+
+
 class _ReplyRecovery(NamedTuple):
     outcome: str  # "accepted" | "ambiguous" | "rejected"
     resp: object | None  # LINE's answer when accepted
@@ -24667,16 +24778,21 @@ def _recover_rejected_reply(
       acknowledgement stays claimed until its claim lapses and is given up the third time it is
       fenced -- so a bad rider does not ride on every later reply; every other rider is released
       unsent; and the primary goes alone, exactly as it was built (if LINE refuses it after all,
-      once more as plain text);
+      once more as plain text).  Except (2026-11-14) a named *due reminder* that is a textV2 with
+      its plain twin: it is not fenced yet but goes with the primary once more, as plain text
+      (`_rider_plain_message`); if LINE does not take that try (refused again, or the token is
+      gone), it is fenced then -- an ambiguous answer leaves it to the caller's `uncertain`;
     * the primary message is named, or no message could be told: every rider is released (not
       fenced) and the primary goes alone as one plain TextMessage -- except that a rider which was
       in such an unnamed refusal on three replies in a row is fenced (it is the likely culprit
       and would otherwise cost an extra failed call on every later reply).
 
-    A rider is never sent again as plain text: its plain version starts with the label of the
-    person it pings -- the literal 「@當事人」 when the creator has no local alias -- which the
-    group would read as text, where the textV2 placeholder showed a real @; and the refusal may
-    well come from that mention (a person who is not in the group).
+    A rider other than a named due reminder is never sent again as plain text.  A reminder's plain
+    version starts with the label of the person it pings -- the literal 「@當事人」 when the creator
+    has no local alias -- which the group reads as text where the textV2 placeholder showed a real
+    @; until 2026-11-14 that kept every rider off plain text, and the refused stage was never
+    delivered.  Andrew chose 「改送純文字」: the refusal may well come from the mention (a person
+    who is not in the group), and the plain text cannot be refused for that.
 
     Every outcome that is not an acceptance ends the same way: ``rejected`` -- LINE refused
     everything it was given, so the caller may push (only where the fence rules allow) --, or
@@ -24696,6 +24812,7 @@ def _recover_rejected_reply(
         _line_error_detail(error, secrets=(reply_token,)),
     )
     every_rider = {index for index, rider in enumerate(batch.riders) if rider is not None}
+    plain_riders: set[int] = set()
     if case == "unknown":
         # LINE named nothing, so every rider is released -- but one that is in such a refusal on
         # three replies in a row is the likely culprit and is fenced, so it cannot cost an extra
@@ -24710,20 +24827,71 @@ def _recover_rejected_reply(
         # run of unnamed refusals is over.
         reply_riders.clear_unnamed_refusals(batch.group_id, batch.riders)
         fence = set(hits) if case == "riders" else frozenset()
-    batch.remove_riders(every_rider, fence=fence, orphans="release")
-    if primary_suppressed:  # a reply of riders only: nothing is left to send
+        orphan_event, orphan_natural = batch.orphan_claims()
+        if case == "riders" and not orphan_event and not orphan_natural:
+            # A named due reminder stays, swapped for its plain twin (before anything is removed:
+            # the indexes shift then), and goes once more; its claims and reference stay with it.
+            # Not when a claim belongs to no rider (a fold failed): which message carried it is not
+            # known, so it is released below, and a delivered carrier would bring it back later as
+            # a second reminder of the same event -- the named reminders are fenced as before.
+            # Every plain message is built before anything changes (review PRE_1 I3): nothing has
+            # been sent since the 400, so a failure here must leave today's flow, not an
+            # "ambiguous" send that fences every rider and never resends the primary.
+            try:
+                swaps = {}
+                for index in hits:
+                    plain_message = _rider_plain_message(batch.riders[index], batch.messages[index])
+                    if plain_message is not None:
+                        swaps[index] = plain_message
+            except Exception as exc:
+                logger.warning("reply rider plain text not built error_type=%s", type(exc).__name__)
+                swaps = {}
+            for index, plain_message in swaps.items():
+                batch.messages[index] = plain_message
+                plain_riders.add(index)
+            fence -= plain_riders
+        elif case == "riders":
+            # (review PRE_2 N1) tells this case apart from any other fenced rider in the log: a count only
+            logger.warning(
+                "reply rider plain text skipped: claims without a rider=%d",
+                len(orphan_event) + len(orphan_natural),
+            )
+    for index in sorted(plain_riders):
+        rider = batch.riders[index]
+        logger.warning("reply rider goes once more as plain text kind=%s id=%s", rider.kind, rider.label)
+    batch.remove_riders(every_rider - plain_riders, fence=fence, orphans="release")
+    if primary_suppressed and not plain_riders:  # a reply of riders only: nothing is left to send
         return _ReplyRecovery("rejected", None, error, False)
 
     if case == "riders":
-        # The primary was not named: it goes alone as it was built (mention and all).
+        # The primary was not named: it goes as it was built (mention and all), with the named due
+        # reminders as plain text -- alone when there are none (no primary: the reminders alone).
         status, payload = _reply_attempt(
             reply_token, list(batch.messages), send_fence, menu_buttons=menu_buttons, group_id=group_id
         )
         if status == "accepted":
-            logger.info("reply accepted without the refused rider(s) group=%s", group_id)
+            if plain_riders:
+                logger.info(
+                    "reply accepted with %d refused reminder(s) as plain text group=%s",
+                    len(plain_riders),
+                    group_id,
+                )
+            else:
+                logger.info("reply accepted without the refused rider(s) group=%s", group_id)
             return _ReplyRecovery("accepted", payload, None, False)
         if status == "ambiguous":
             return _ReplyRecovery("ambiguous", None, payload, False)
+        if plain_riders:
+            # LINE did not take the reminders' one more try: fenced now, as a named rider is (never
+            # released: a reminder that keeps being refused must not ride on every later reply).
+            # Taken out of the batch, so `_reply`'s release of what is left cannot erase the fence
+            # (review PRE_1 I1).  Their indexes are counted again here: the first removal shifted
+            # them (a released rider before one of them), and every rider left is one of them.
+            remaining = {index for index, rider in enumerate(batch.riders) if rider is not None}
+            logger.warning("reply rider plain text not taken either; fenced riders=%d", len(remaining))
+            batch.remove_riders(remaining, fence=remaining)
+        if primary_suppressed:
+            return _ReplyRecovery("rejected", None, payload, False)
         if _is_definite_reply_token_error(payload):
             # LINE may spend the token on a refusal: the push is all that is left, and the
             # primary was never accused, so it keeps its usual form.
@@ -24776,8 +24944,9 @@ def _reply(
     2026-10-24（B6.3）：文字回覆被 LINE 以 400 拒絕、而且不是 token 的問題時，不再整則放棄——依
     ``details[].property`` 找出被拒的那一則（`_recover_rejected_reply`）：只點名搭車訊息（提醒、確認、
     運動提醒）→ 那些圍住、其他搭車的放掉，主訊息照原樣單獨再送；點名主訊息或點名不出來 → 搭車的全部放掉，
-    主訊息改純文字單獨再送一次。搭車訊息絕不改成純文字重送。再被拒才 push（只在批次 1 的圍欄規則允許時）；
-    含糊結果一律留著圍欄、不 push。選單與 Flex 卡片不走這條。
+    主訊息改純文字單獨再送一次。2026-11-14（Andrew「改送純文字」）：被點名的到點提醒（帶 @ 的 textV2）不圍住，
+    改成它的純文字版跟主訊息一起再送一次，還是送不出才圍住；其他搭車訊息絕不改成純文字重送。再被拒才 push
+    （只在批次 1 的圍欄規則允許時）；含糊結果一律留著圍欄、不 push。選單與 Flex 卡片不走這條。
 
     settings.bot_muted=True 時整個函式 short-circuit:
     不 reply、不 push、只把原本要送的 text 寫進 log 方便除錯。
@@ -25074,7 +25243,11 @@ def _reply(
                             pending_reminder_indexes.append(len(messages_to_send))
                             messages_to_send.append(reminder_message)
                             riders.append(
-                                reply_riders.Rider("event", f"event:{e.get('event_id')}")
+                                reply_riders.Rider(
+                                    "event",
+                                    f"event:{e.get('event_id')}",
+                                    plain_text=_reminder_spec_plain_text(spec),
+                                )
                             )
                             message_reminder_refs.append(
                                 {
@@ -25143,7 +25316,11 @@ def _reply(
                                 )[1]
                             )
                             riders.append(
-                                reply_riders.Rider("natural", f"reminder:{int(item['reminder_id'])}")
+                                reply_riders.Rider(
+                                    "natural",
+                                    f"reminder:{int(item['reminder_id'])}",
+                                    plain_text=str(item.get("text") or "") or None,
+                                )
                             )
                             message_reminder_refs.append(
                                 {
@@ -25417,8 +25594,10 @@ def _reply(
             send_error is not None
             and not (menu_card or large_menu_card or flex_card is not None)
             # a degraded receipt Andrew rejected is not worth a second delivery path: a refusal
-            # ends it (below), as before
-            and not user_rejected_primary
+            # ends it (below), as before -- but once it is suppressed the reply is its riders
+            # alone, and a named due reminder among them still goes once more as plain text
+            # (2026-11-14, review PRE_1 I4); the receipt itself is never resent or pushed
+            and (not user_rejected_primary or primary_suppressed)
             and line_errors.is_bad_request(send_error)
             and not _is_definite_reply_token_error(send_error)
         ):
@@ -25541,6 +25720,10 @@ def _reply(
                         # nothing was delivered, so the fence lifts; LINE's redelivery brings a
                         # fresh token and the attempts cap bounds the re-runs.
                         _release_inbound_send(send_fence)
+                        if user_rejected_primary:
+                            # A degraded receipt Andrew rejected (its riders' recovery ran, 2026-11-14):
+                            # the event ends here, as it did before that recovery existed for it.
+                            _mark_inbound_reply_completed_no_reply(reply_token)
                     return False
                 push_request_built = False
                 try:
