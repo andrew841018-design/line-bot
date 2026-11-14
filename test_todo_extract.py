@@ -59,7 +59,13 @@ def todo_env(monkeypatch, tmp_path, reset_main_globals, block_external_side_effe
 
     monkeypatch.setenv("LINE_BOT_TODO_MODE", "on")
     monkeypatch.setenv("ALLOWED_GROUP_IDS", f"{GROUP},{OTHER}")
-    monkeypatch.setattr(config.settings, "family_group_id", GROUP)
+    # every settings object the jobs may hold: test_main_calendar_query reloads config, so todo.settings
+    # can differ from config.settings (suite-order dependence found 11/14)
+    import anniversary
+    import todo
+
+    for holder in {id(s): s for s in (config.settings, todo.settings, anniversary.settings)}.values():
+        monkeypatch.setattr(holder, "family_group_id", GROUP)
     aliases = tmp_path / "user_aliases.json"
     aliases.write_text(json.dumps({"user-a": "成員甲", "user-b": "成員乙"}, ensure_ascii=False), encoding="utf-8")
     roles = tmp_path / "family_roles.local.json"

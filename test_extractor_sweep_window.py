@@ -38,7 +38,10 @@ def jobs(tmp_path, monkeypatch):
     monkeypatch.setenv("ALLOWED_GROUP_IDS", GROUP)
     monkeypatch.delenv("LINE_BOT_TODO_MODE", raising=False)
     monkeypatch.delenv("LINE_BOT_ANNIVERSARY_EXTRACT", raising=False)
-    monkeypatch.setattr(config.settings, "family_group_id", GROUP)
+    # every settings object the jobs may hold: test_main_calendar_query reloads config, so the module copies
+    # can differ from config.settings (suite-order dependence found 11/14)
+    for holder in {id(s): s for s in (config.settings, todo.settings, anniversary.settings)}.values():
+        monkeypatch.setattr(holder, "family_group_id", GROUP)
     aliases = tmp_path / "user_aliases.json"
     aliases.write_text(json.dumps({"user-a": "成員甲"}, ensure_ascii=False), encoding="utf-8")
     monkeypatch.setenv("LINE_USER_ALIASES_PATH", str(aliases))

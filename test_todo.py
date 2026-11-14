@@ -30,7 +30,10 @@ def todo_on_without_a_model(monkeypatch):
         raise AssertionError("test_todo never calls the model")
 
     monkeypatch.setenv("LINE_BOT_TODO_MODE", "on")
-    monkeypatch.setattr(config.settings, "family_group_id", "")
+    import todo
+
+    for holder in {id(s): s for s in (config.settings, todo.settings)}.values():  # config may be reloaded
+        monkeypatch.setattr(holder, "family_group_id", "")
     monkeypatch.setattr(gemini_client, "side_task_last_tier", no_model)
 
 
