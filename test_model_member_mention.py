@@ -873,6 +873,9 @@ def _member_sites(root: Path) -> dict:
 # lands later adds the lines of 「提到人就真 @」 (`user_mention_targets`, `push_text_with_mentions`,
 # `try_push_text_with_mentions`).
 MAY_PING_A_MEMBER = {
+    # reminder_extract_claude (2026-11-14): a guard that refuses a model's action naming members the
+    # message does not name; it only reads names, and never marks or sends anything.
+    'reminder_extract_claude._check_action calls mention_names': 2,
     # the marks (a class under AllowsMemberMention is one too) and the one place they are read
     'line_mentions.AllowsAllMention is a member mark': 1,
     'main.ReminderReceipt is a member mark': 1,
