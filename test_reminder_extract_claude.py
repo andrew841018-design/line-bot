@@ -15,7 +15,7 @@ import json
 import logging
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -28,7 +28,7 @@ import reminder_extract_claude as rec
 from test_gemini_last_tier import LITE, resp, tier  # noqa: F401  tier is a fixture
 
 _TW = ZoneInfo("Asia/Taipei")
-KEY = "sk-ant-test-" + "0" * 40
+KEY = "sk-ant-test-" + "0" * 90  # as long as a real key; a short one reads as "off"
 SIX = {"action", "year", "month", "day", "hour", "minute"}
 
 
@@ -106,7 +106,7 @@ def test_the_key_has_one_name_that_never_switches_replies():
     assert not {"ANTHROPIC_API_KEY", "CLAUDE_API_KEY"} & {fields["reminder_extract_claude_api_key"].validation_alias}
 
 
-@pytest.mark.parametrize("key", ["", "apikey_01AbCdEf", "sk-ant-…xyz"[:3]])
+@pytest.mark.parametrize("key", ["", "apikey_01AbCdEf0123456789", "sk-ant-api03-…AbCd", "sk-ant-short"])
 def test_without_a_real_looking_key_nothing_is_sent(claude, monkeypatch, key):
     calls = claude(api(_answer()))
     _set(monkeypatch, "reminder_extract_claude_api_key", key)
@@ -151,11 +151,12 @@ _BAD = [
     pytest.param(api({k: v for k, v in _answer().items() if k != "hour"}), id="missing-key"),
     pytest.param(api(_answer(hour=True)), id="bool-number"),
     pytest.param(api(_answer(hour="15")), id="string-number"),
-    pytest.param(api(_answer(day=_tomorrow().replace(year=2099))), id="far-year"),
+    pytest.param(api(_answer(day=date(2099, 1, 1))), id="far-year"),
     pytest.param(api(_answer(action="看牙醫\n狀態：已完成")), id="line-break"),
     pytest.param(api(_answer(action="看牙醫 已取消")), id="line-separator"),
     pytest.param(api(_answer(action="@all 看牙醫")), id="mention-not-in-text"),
-    pytest.param(api(_answer(action="看12/9的牙醫")), id="action-date-differs"),
+    pytest.param(api(_answer(action="看{0.month}/{0.day}的牙醫".format(_tomorrow() + timedelta(days=3)))),
+                 id="action-date-differs"),
     pytest.param(api(_answer(action="   ")), id="blank-action"),
 ]
 
@@ -383,3 +384,63 @@ def test_a_module_that_raises_still_leaves_todays_gemini_path(tier, monkeypatch)
     out = main._maybe_extract_reminder("明天下午3點看牙醫", GROUP, USER, message_id="M_CLAUDE_8")
     assert out and out.startswith("已新增提醒")
     assert fake.generated == [LITE]
+
+
+# ── post-review P1 (11/14) ─────────────────────────────────────────────────────────────────────
+
+
+def test_a_thread_that_never_starts_does_not_leave_claude_busy(claude, monkeypatch):
+    claude(api(_answer()))
+    real_start = threading.Thread.start
+    calls = {"n": 0}
+
+    def start(self):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("can't start new thread")
+        return real_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+    assert rec.try_extract("明天下午3點看牙醫", _today_iso()).reason == "submit"
+    assert rec.try_extract("明天下午3點看牙醫", _today_iso()).kind == "answer"
+
+
+def _same_as_key_off(install, claude_steps, text, monkeypatch, tier, gemini_plan):
+    fake = tier(generate={LITE: gemini_plan})
+    install(*claude_steps)
+    via_claude = main._maybe_extract_reminder(text, GROUP + "_EQ", USER, message_id="M_EQ_1")
+    _set(monkeypatch, "reminder_extract_claude_api_key", "")
+    today = main._maybe_extract_reminder(text, GROUP + "_EQ_OFF", USER, message_id="M_EQ_2")
+    return via_claude, today, fake
+
+
+def test_a_noncommittal_source_never_reaches_claude(claude, tier, monkeypatch):
+    import reminder_intent
+
+    text = next((t for t in ("要不要明天下午3點去看牙醫", "明天下午3點看牙醫好嗎？", "也許明天下午3點去看牙醫")
+                 if reminder_intent.is_obvious_noncommittal_source(t)), None)
+    if text is None:
+        pytest.skip("no sample reads as noncommittal")
+    via_claude, today, _ = _same_as_key_off(claude, [api(_answer())], text, monkeypatch, tier,
+                                            [resp("null"), resp("null")])
+    assert via_claude == today
+
+
+def test_no_readable_default_time_leaves_it_to_gemini(claude, tier, monkeypatch):
+    import reminder_intent
+
+    text = "明天早上我要上班，中午才有空，下午拜拜"
+    assert reminder_intent.resolve_reminder_default_time(text) is None
+    via_claude, today, _ = _same_as_key_off(claude, [api(_answer(action="拜拜", hour=15))], text, monkeypatch, tier,
+                                            [resp("null"), resp("null")])
+    assert via_claude == today
+
+
+def test_gate_closed_and_claude_says_no_writes_nothing(claude, tier, monkeypatch):
+    # Claude's "no" is a model null: nothing local, nothing queued (Phase 4, 11/14).
+    fake = tier(generate={LITE: _gemini_answer()})
+    claude(api({"is_reminder": False, "action": "", "year": 0, "month": 0, "day": 0, "hour": 0, "minute": 0}))
+    monkeypatch.setattr(main, "_gemini_side_task_allowed", lambda *a, **k: False)
+    assert main._maybe_extract_reminder("明天下午要帶阿嬤回診拿慢性處方箋", GROUP + "_NO", USER, message_id="M_NO") is None
+    assert not memory.list_pending_reminder_retries(GROUP + "_NO", limit=5)
+    assert fake.generated == []

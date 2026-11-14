@@ -151,7 +151,10 @@ def _reset_state_for_tests() -> None:
 def _api_key() -> str:
     global _bad_key_logged
     key = str(getattr(settings, "reminder_extract_claude_api_key", "") or "").strip()
-    if key and not key.startswith("sk-ant-"):
+    # A real key is long plain ASCII; Console's shortened display ("sk-ant-…AbCd") or a key
+    # id ("apikey_…") is not (both were pasted on 11/14; post-review P1).
+    if key and not (key.startswith("sk-ant-") and key.isascii() and len(key) >= 80
+                    and not any(c.isspace() for c in key)):
         if not _bad_key_logged:
             _bad_key_logged = True
             logger.warning("claude extract key is set but not an API key (sk-ant-...): off")
@@ -244,7 +247,13 @@ def _send(body: dict) -> dict:
                 _in_flight = False
             done.set()
 
-    threading.Thread(target=run, name="claude-extract", daemon=True).start()
+    try:
+        threading.Thread(target=run, name="claude-extract", daemon=True).start()
+    except Exception:
+        # Never started: clear the flag, or every later message would read "busy" (P1).
+        with _lock:
+            _in_flight = False
+        raise _Unusable("submit") from None
     try:
         if not done.wait(_timeout()):
             raise TimeoutError
