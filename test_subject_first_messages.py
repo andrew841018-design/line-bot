@@ -96,12 +96,13 @@ def test_a_receipt_puts_the_people_first_and_pings_them_once():
     ("people", "expected"),
     [
         (["哥哥"], "已新增提醒\n時間：2099-10-01 12:00\n事項：哥哥 繳管理費"),
-        (["all"], "@all\n已新增提醒\n時間：2099-10-01 12:00\n事項：全家 繳管理費"),
+        (["all"], "已新增提醒\n時間：2099-10-01 12:00\n事項：全家 繳管理費"),
         (["全家"], "已新增提醒\n時間：2099-10-01 12:00\n事項：全家 繳管理費"),
     ],
 )
 def test_a_receipt_pings_only_whom_the_old_line_pinged(people, expected):
-    """哥哥 has no LINE account here and 「@全家」 never pinged; @all did."""
+    """哥哥 has no LINE account here and 「@全家」 never pinged; @all did until D2 (2026-11-13: the receipt
+    no longer rings everyone, the reminder does when it falls due)."""
     receipt = main._format_reminder_write_confirmation(
         "created", "繳管理費", main.datetime(2099, 10, 1, 12, 0), people
     )

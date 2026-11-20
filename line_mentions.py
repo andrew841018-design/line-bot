@@ -58,7 +58,7 @@ class AllowsMemberMention(str):
 
 
 class AllowsAllMention(AllowsMemberMention):
-    """An `AllowsMemberMention` (a poll, a `ReminderReceipt`) whose @all may also ping the whole group
+    """An `AllowsMemberMention` (a poll) whose @all may also ping the whole group
     (Andrew 2026-11-07).  A reply the model wrote never may, whatever it printed: a page, a video's
     text or an article in its prompt can tell it to print 「@all」.
     """

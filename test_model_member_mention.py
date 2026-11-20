@@ -8,7 +8,8 @@ at 18:4x on 11/13):
 - 「一起改成不響」: the to-do/reminder list and the calendar query ping nobody, even when an item's
   words hold an 「@成員甲」.
 - 「回條照舊跟著 @」: a reminder receipt keeps pinging as it did, the asker's @s included.
-Receipts are `line_mentions.AllowsMemberMention` where they are built (`ReminderReceipt` and polls are
+Receipts are `line_mentions.AllowsMemberMention` where they are built (`ReminderReceipt` is an
+`AllowsMemberMention` since the reminder-path stage 2 (D2, Andrew 2026-11-13); polls are
 `AllowsAllMention`, under it); due reminders and the exercise nudge ping whom they name as before.  The
 whole-group half is test_model_all_mention.py.  All text is made up, and nothing here reaches the network.
 """
@@ -764,6 +765,9 @@ _MEMBER_SOURCES = {
     "user_mention_targets",  # 「提到人就真 @」, not in main yet: whoever lands later adds its lines
     "push_text_with_mentions",
     "try_push_text_with_mentions",  # 「提到人就真 @」's wrapper of the one above: its callers come on the list too
+    # a stored confirmation goes out later riding on a reply, its members pinged (D2): nothing writes one
+    # today, so a writer that ever does comes on the list
+    "enqueue_reminder_confirmation",
 }
 
 
@@ -869,7 +873,7 @@ def _member_sites(root: Path) -> dict:
 # 2026-11-13.  Before a line here is added or changed: a 「marks a text for members」 line may only be a
 # receipt formatter building its own words, after its last change to them.  Never a sending helper (it also
 # sends refusals, and `_handle_command`'s `_reply` sends the model's /檢討) and never a model's reply.  The words
-# a receipt reads back (a stored 事項 or title) ping whom they @: TODO for the reminder-path stage 2.  Whoever
+# a receipt reads back (a stored 事項 or title) ping whom they @: TODO for the reminder-path stage 2b.  Whoever
 # lands later adds the lines of 「提到人就真 @」 (`user_mention_targets`, `push_text_with_mentions`,
 # `try_push_text_with_mentions`).
 MAY_PING_A_MEMBER = {

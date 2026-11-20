@@ -1,10 +1,10 @@
 """2026-11-07 (Andrew): a reply the model wrote never pings the whole group, whatever it printed.
 
-Only what the program wrote itself does: a poll, a reminder receipt, a due reminder.  A page, a video's
-text or an article in the prompt can tell the model to print 「@all」, and `_md_to_line` can put one
-together after any filter, so the rule is read off the message at the last step.  A blocked 「@all」
-stays in the words.  What counts as an @all: test_all_mention_boundary.py.  All text is made up, and
-nothing here reaches the network.
+Only what the program wrote itself does: a poll, a due reminder (a receipt no longer: Andrew 2026-11-13,
+D2).  A page, a video's text or an article in the prompt can tell the model to print 「@all」, and
+`_md_to_line` can put one together after any filter, so the rule is read off the message at the last
+step.  A blocked 「@all」 stays in the words.  What counts as an @all: test_all_mention_boundary.py.  All
+text is made up, and nothing here reaches the network.
 
 A member's @ in a model's reply pings nobody either since 2026-11-13: test_model_member_mention.py.
 """
@@ -291,16 +291,28 @@ def test_a_poll_sent_by_push_pings_the_group(line, poll, formatter):
     assert pings_everyone(line.pushes[0][0][0])
 
 
-def test_a_receipt_for_everyone_pings_the_group_and_the_same_words_as_a_plain_str_do_not(line):
-    words = main._format_reminder_write_confirmation(
-        "created", "繳管理費", main.datetime(2099, 10, 1, 12, 0), ["all"]
-    )
+# A receipt's words as they could still read: an @all line on top, as the formatter wrote it before D2, and
+# an @all in a 事項 stored before the reminder-path stage 2.
+RECEIPT_WITH_ALL = "@all @成員甲\n已新增提醒\n時間：2099-10-01 12:00\n事項：@all 繳管理費"
 
-    assert say(main.ReminderReceipt(words))
-    assert say(str(words))
 
-    assert pings_everyone(line.replies[0][0])
-    assert not pings_everyone(line.replies[1][0])
+def pinged_members(message) -> set[str]:
+    return {
+        mention.mentionee.user_id
+        for mention in (getattr(message, "substitution", None) or {}).values()
+        if getattr(mention.mentionee, "user_id", None)
+    }
+
+
+def test_a_receipt_for_everyone_does_not_ping_the_group(line):
+    # Andrew 2026-11-13, D2 「回條不全家響」: the reminder rings everyone when it falls due, not its receipt.
+    # A member it names is still pinged (「回條照舊跟著 @」); the same words as a plain str ping nobody.
+    assert say(main.ReminderReceipt(RECEIPT_WITH_ALL))
+    assert say(str(RECEIPT_WITH_ALL))
+
+    receipt, plain = line.replies[0][0], line.replies[1][0]
+    assert not pings_everyone(receipt) and pinged_members(receipt) == {"U_A"}
+    assert not pings_everyone(plain) and pinged_members(plain) == set()
 
 
 @pytest.mark.parametrize(
@@ -348,7 +360,8 @@ def test_a_quoted_schedule_receipt_reaches_reply_with_its_mark(monkeypatch):
         schedule._text_event("咪寶", message_id="m-cmd", user_id=schedule.U_OTHER, quoted="m-src"), schedule.G
     )
 
-    assert len(sent) == 1 and isinstance(sent[0], line_mentions.AllowsAllMention)
+    assert len(sent) == 1 and isinstance(sent[0], line_mentions.AllowsMemberMention)
+    assert not isinstance(sent[0], line_mentions.AllowsAllMention)  # D2
 
 
 def test_a_followup_receipt_reaches_reply_with_its_mark(monkeypatch):
@@ -362,7 +375,8 @@ def test_a_followup_receipt_reaches_reply_with_its_mark(monkeypatch):
         schedule._text_event("加到提醒", message_id="m-fcmd", quoted="m-fsrc"), schedule.G, "加到提醒"
     )
 
-    assert len(sent) == 1 and isinstance(sent[0], line_mentions.AllowsAllMention)
+    assert len(sent) == 1 and isinstance(sent[0], line_mentions.AllowsMemberMention)
+    assert not isinstance(sent[0], line_mentions.AllowsAllMention)  # D2
 
 
 def test_a_hand_written_one_shot_keeps_its_all(line, monkeypatch):
@@ -372,6 +386,17 @@ def test_a_hand_written_one_shot_keeps_its_all(line, monkeypatch):
     assert main._try_one_shot_reply(_make_text_event("早安"), GROUP)
 
     assert pings_everyone(line.replies[0][0])
+
+
+def test_a_receipt_sent_by_push_does_not_ping_the_group_either(line):
+    # Seat 1 N1 (stage 2 pre-review): every caller that sends a receipt today passes
+    # allow_push_fallback=False, so this guards a later caller that lets one fall back to a push.
+    line.script = [BAD_TOKEN]
+
+    assert say(main.ReminderReceipt(RECEIPT_WITH_ALL), allow_push_fallback=True)
+
+    [(batch, _key)] = line.pushes
+    assert not pings_everyone(batch[0]) and pinged_members(batch[0]) == {"U_A"}
 
 
 # ── riders on a model reply: their mention is their own ──────────────────────────────────────
@@ -414,23 +439,24 @@ def test_a_due_reminder_riding_on_a_model_reply_still_pings_the_group(line, monk
     assert pings_everyone(reminder)
 
 
-def test_a_confirmation_riding_on_a_model_reply_still_pings_the_group(line):
+def test_a_confirmation_riding_on_a_model_reply_no_longer_pings_the_group(line):
+    # A stored confirmation is a receipt sent later (D2).  Nothing in the bot stores one today.
     memory.enqueue_reminder_confirmation(GROUP, "pending_reminder:1", "@all\n已新增提醒\n事項：繳管理費")
 
     assert say("@all 開會")
 
     model_reply, confirmation = line.replies[0]
     assert not pings_everyone(model_reply)
-    assert pings_everyone(confirmation)
+    assert not pings_everyone(confirmation)
 
 
 # ── every place that can ping the whole group, as one list ──────────────────────────────────
 
-# Names, not every class under AllowsAllMention: when ReminderReceipt moves under AllowsMemberMention (the
-# reminder-path stage 2), take it out of here too, or its call sites still count as pinging the group.
-_MARKS = {"AllowsAllMention", "ReminderReceipt"}
-# what these store goes out with allow_all_mention=True
-_WRITERS = {"queue_one_shot_reply", "_save_one_shot_replies", "enqueue_reminder_confirmation"}
+# Names, not every class under AllowsAllMention: ReminderReceipt moved under AllowsMemberMention in the
+# reminder-path stage 2 (D2) and left this set.  A class put under AllowsAllMention again goes in here.
+_MARKS = {"AllowsAllMention"}
+# what these store goes out with allow_all_mention=True (a stored confirmation no longer: D2)
+_WRITERS = {"queue_one_shot_reply", "_save_one_shot_replies"}
 _BUILDER = "_text_message_with_mentions"
 # where a mention of the whole group is made without reading any text: the due reminders and events
 _ALL_SOURCES = {"text_v2_dict", "sdk_message_from_text_v2_dict", "reminder_actor_targets", "event_mention_targets"}
@@ -441,21 +467,13 @@ MAY_PING = {
     # text the program put together; an @all in it pings
     "family_poll.format_created_reply marks a text": 1,
     "family_poll.format_nudge_reply marks a text": 1,
-    "main.ReminderReceipt is a mark": 1,
-    # TODO(2026-11-12 deferred, the reminder-path task): the receipts below can carry a title or 事項 an
-    # extraction model or a pasted message wrote, so an @all in those words still pings.
-    "main._create_schedule_reminders marks a text": 1,
-    "main._creation_followup_reply marks a text": 1,
-    "main._format_schedule_receipt marks a text": 2,
-    "main._format_source_calendar_capture_confirmation marks a text": 2,
-    "main._maybe_extract_reminder marks a text": 1,
     # the one place a text's @all is read (a member's @: MAY_PING_A_MEMBER in test_model_member_mention.py)
     "main._reply builds with allow_all_mention": 2,  # the reply and its push fallback: by the text's type
-    "main._reply builds with True": 2,  # riders the program wrote: a stored confirmation, a due reminder
+    "main._reply builds with True": 1,  # a due reminder riding along
     "main._try_one_shot_reply builds with True": 1,  # a file a person writes by hand
     "main._text_message_with_mentions makes an all target": 1,
     # never pings: listed so that a change here is seen
-    "main._reply builds with False": 1,  # a queued answer riding along: a model wrote it
+    "main._reply builds with False": 2,  # a queued answer, a model wrote it; a stored confirmation (D2)
     "main._drain_pending_for_group builds with False": 1,  # a queued answer: a model wrote it
     "main._exercise_nudge_message builds with nothing": 1,
     "main._handle_calendar_query builds with nothing": 1,

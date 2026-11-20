@@ -13011,9 +13011,10 @@ def _text_message_with_mentions(
     """``allow_all_mention``: an @all in this text may ping the whole group.  ``allow_member_mention``:
     a member's @ in this text (with ``explicit_only=False``, a member's bare name too) may ping them.
     `_reply` sets both from the text's type (`line_mentions.AllowsAllMention`,
-    `line_mentions.AllowsMemberMention`); the callers that send text the program stored pass True,
-    and the two that send a queued model answer pass False.  Without them the words stay as they are
-    and ping nobody (Andrew 2026-11-07 for @all, 2026-11-13 for members).
+    `line_mentions.AllowsMemberMention`); a due reminder riding along passes True for both, and so does
+    a one-shot file a family member wrote by hand (`_try_one_shot_reply`); a stored confirmation passes
+    True for members only (D2); the two that send a queued model answer pass False.  Without them the
+    words stay as they are and ping nobody (Andrew 2026-11-07 for @all, 2026-11-13 for members).
     ``reply_targets`` are taken whatever the flags say: the caller chose them.  The exercise nudge
     pings its member that way, and is dropped when no mention comes out.
     Checked here, on the final text: `_md_to_line` still changes what stands next to an @, so no
@@ -20005,12 +20006,9 @@ def _explicit_range_reminder_result(
     }
 
 
-# TODO(2026-11-12 deferred, the reminder-path task): a receipt's 事項 or title can still carry words an
-# extraction model or a pasted message wrote, and an @all there pings everyone (the whole receipt is read).
-# The same goes for a member's @ (2026-11-13), here and in the receipts marked
-# `line_mentions.AllowsMemberMention` where they are built: once such words are stored, every receipt
-# that reads them back pings that member again.
-class ReminderReceipt(line_mentions.AllowsAllMention):
+# TODO(stage 2b): a receipt's 事項 or title can still carry a member's @ an extraction model or a pasted
+# message wrote; once stored, every receipt that reads it back pings that member again.
+class ReminderReceipt(line_mentions.AllowsMemberMention):
     """A group receipt that also carries the reminders it announced.
 
     Still a plain ``str`` for every caller.  After LINE accepts it the sender
@@ -20023,7 +20021,8 @@ class ReminderReceipt(line_mentions.AllowsAllMention):
     never goes out twice at the same moment).  A plain duplicate consumes
     nothing; its open stage still goes out at a later moment.
 
-    It is an `AllowsAllMention`: an @all anywhere in it pings the whole group.
+    A member's @ in it rings, and so do the people the asker @'d (「回條照舊跟著 @」); an @all does not
+    (Andrew 2026-11-13, D2: 「回條不全家響」).  The reminder itself rings everyone when it falls due.
     Build one only from a receipt formatter's result, never around a model's words.
     """
 
@@ -20334,12 +20333,10 @@ def _format_reminder_write_confirmation(
         lines.append(detail_line)
     mentions: list[str] = []
     for alias in aliases:
-        if alias.casefold() == "all":
-            mention = "@all"
-        elif line_mentions.user_id_for_alias(alias):
+        if line_mentions.user_id_for_alias(alias):
             mention = f"@{alias}"
         else:
-            continue  # the old line never pinged it either; 事項 names it
+            continue  # nobody to ping, all and 全家 included (D2); 事項 names it
         if mention not in mentions:
             mentions.append(mention)
     if mentions:
@@ -25095,10 +25092,11 @@ def _reply(
     ``index_for_recall``：False 時 bot 的這則回覆存檔但不進 recall 索引（FCN、股票推薦用）。
 
     全群提及（Andrew 2026-11-07：模型寫的回覆一律不能）：``text`` 是 `line_mentions.AllowsAllMention`
-    （民調、`ReminderReceipt`）主訊息和它的 push fallback 才會全群提及，其他字裡的 @all 只是字。看字的型別、不開參數：
-    同一個呼叫點會送民調也會送模型寫的 /檢討（`_handle_command`）。搭車的確認和到期提醒是程式寫的，照響。
+    （民調）主訊息和它的 push fallback 才會全群提及，其他字裡的 @all 只是字。看字的型別、不開參數：
+    同一個呼叫點會送民調也會送模型寫的 /檢討（`_handle_command`）。搭車的到期提醒是程式寫的，照響；
+    提醒回條、搭車的已存確認不全群提及（Andrew 2026-11-13 D2）。
     提及個別家人（Andrew 2026-11-13：聊天回覆一律不 @、回條照舊）：``text`` 是 `line_mentions.AllowsMemberMention`
-    （提醒回條；`AllowsAllMention` 也是）才會 @ 字裡寫到的家人，也才會跟著 @ 發問者 @ 過的人（``reply_targets``）。
+    （提醒回條、民調）才會 @ 字裡寫到的家人，也才會跟著 @ 發問者 @ 過的人（``reply_targets``）。
     模型的回覆、清單、行事曆查詢、固定句都不 @，字原樣送出。
     """
     if flex_card is not None and (menu_card or large_menu_card):
@@ -25300,7 +25298,7 @@ def _reply(
                                 validation_source="reminder_confirmation_mentions",
                                 limit=5000,
                                 explicit_only=True,
-                                allow_all_mention=True,
+                                allow_all_mention=False,
                                 allow_member_mention=True,
                             )
                         )

@@ -122,6 +122,7 @@ def _sent_as_reply(text: str):
         prepared=True,
         explicit_only=True,
         allow_all_mention=isinstance(text, line_mentions.AllowsAllMention),
+        allow_member_mention=isinstance(text, line_mentions.AllowsMemberMention),
     )
     return message
 

@@ -31,7 +31,7 @@ REAL = [
     "@all 吃飯",
     "大家@all",
     "@all。",
-    # the shape of the bot's own receipts
+    # the shape the bot's own receipts had before D2 (2026-11-13: a receipt prints no @all line now)
     "@all\n已新增提醒",
     "@all @成員甲\n已新增提醒",
     # further along the text
@@ -247,17 +247,19 @@ def test_a_poll_opens_with_an_all_that_counts(poll, formatter):
 @pytest.mark.parametrize(
     ("people", "first_line", "keys"),
     [
-        (["all"], "@all", {"all"}),
-        (["all", "成員甲"], "@all @成員甲", {"all", "p2"}),
-        (["成員甲", "all"], "@成員甲 @all", {"all", "p2"}),
+        (["all"], "已新增提醒", set()),
+        (["all", "成員甲"], "@成員甲", {"p1"}),
+        (["成員甲", "all"], "@成員甲", {"p1"}),
     ],
 )
-def test_a_receipt_for_everyone_opens_with_an_all_that_counts(people, first_line, keys):
+def test_a_receipt_for_everyone_opens_without_an_all(people, first_line, keys):
+    # Andrew 2026-11-13, D2 「回條不全家響」: no @all line; a member is still @'d.
     receipt = main._format_reminder_write_confirmation(
         "created", "繳管理費", main.datetime(2099, 10, 1, 12, 0), people
     )
 
     assert receipt.startswith(first_line + "\n")
+    assert "@all" not in receipt
     assert set(_substitution(receipt, explicit_only=True)) == keys
 
 
