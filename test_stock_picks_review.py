@@ -347,6 +347,8 @@ def test_weekly_data_section_does_not_need_the_c1_module(ready, monkeypatch, set
     assert "・台股 AI 相關股：記到 10/27，共 1 個交易日（本週 +1），沒有缺漏" in text
     assert "【推薦成績】這週算不出來（ModuleNotFoundError），其他內容照常" in text  # 真的擋到了
     assert "【冷凍條件試算】這週算不出來（ModuleNotFoundError），其他內容照常" in text  # C2a 也靠 returns：一樣只換一行
+    assert "【背景規則】這週算不出來（ModuleNotFoundError），其他內容照常" in text  # C3 選版也用 returns
+    assert "樣本夠 6 期的試驗版本這週算不出來）" in text
 
 
 def test_sunday_before_eight_does_not_send_last_weeks_late_report(ready):
@@ -374,9 +376,19 @@ def test_weekly_content_reports_collection_status_in_one_message(ready, settle40
     assert ("【台股休市表】2026 已取得；2027 尚未取得（建議 2027/2/23 前取得；"
             "最晚 2027/2/26 前沒有，跨年那幾天的推薦會永久不算）") in text
     assert "⚠️" not in text  # 12/1 之前下一年的表還沒取得只寫在休市表那一行
-    assert "自動冷凍績效差的股票：試算中" in text and "最早約 2027/5" in text and "2027/1/31" in text
+    assert "自動冷凍績效差的股票：試算中" in text and "2027/1/31" in text
+    assert ("・背景規則（試驗版本）：試算中（每週從頭重算；樣本夠 6 期的試驗版本 0 個）；要不要問你換規則，"
+            "等 12 月定門檻") in text
     # 這個世界的成績帳不在 bot 目錄（elsewhere）：試算不寫「還沒有 20 日成績」，說法和【推薦成績】同一套
     assert "【冷凍條件試算】只算，還沒有自動拿掉任何股票\n・成績帳不在這個 bot 目錄（測試或 staging）：這週先不算" in text
+    # C3：這個世界只有 10/27（早於起算日）的紀錄；放在【冷凍條件試算】之後、【之後的檢查點】之前
+    c3 = ("【背景規則】只算，還沒有換任何規則\n・台股 AI 相關股：7 個試驗版本，每個可比 0 期（要 6 期）；還沒有可以比的天\n"
+          "・美股：4 個試驗版本，每個可比 0 期（要 6 期）；還沒有可以比的天\n・資料：還沒有可以對帳的天；作廢 0 期")
+    assert text.index("【冷凍條件試算】") < text.index(c3) < text.index("【之後的檢查點】")
+    rules = _last_run(ready)["stages"]["weekly"]["rules"]  # 對帳與樣本的數字也在 weekly 階段的輸出（只有數字）
+    assert rules["computed"] == 1 and rules["checked_days"] == rules["samples"] == rules["ready"] == 0
+    assert rules.pop("bad_values_types") == {}  # {例外類別: 天數}，其他都是數字
+    assert all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in rules.values())
     assert text.rstrip().endswith(weekly.METHOD)
 
 

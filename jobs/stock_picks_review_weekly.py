@@ -1,7 +1,7 @@
-"""股票推薦回測（計畫 B）的每週 Discord 週報：A 段骨架（收集狀態）＋C1 的推薦成績＋C2a 的冷凍條件試算；C2b／C3 再往上
-加真的冷凍、背景規則。
+"""股票推薦回測（計畫 B）的每週 Discord 週報：A 段骨架（收集狀態）＋C1 的推薦成績＋C2a 的冷凍條件試算＋C3 精簡版的背景
+規則；C2b 再往上加真的冷凍。
 
-規格：ops/state/line_bot_stock_backtest_20261028/PLAN.md（v5）§4.5、§6（C1）；PLAN_B2C2.md §3.3（C2a）。
+規格：ops/state/line_bot_stock_backtest_20261028/PLAN.md（v5）§4.5、§6（C1）；PLAN_B2C2.md §3.3（C2a）；PLAN_C3.md §5（C3）。
 - 時間：台北週日 20:00 之後；只處理最近一個週日（最早 2026-11-01 那份：A 段 10/29 上線，不補 10/25）。
   每輪只要 outbox／sent／failed 都還沒有「YYYY-MM-DD-stock-picks-weekly」開頭的檔，就組一份放進 outbox
   （token_weekly_report 的 _queued／_drop 模式；暫存檔寫在 job 自己的 drafts/）。
@@ -16,6 +16,10 @@
 - C2a 的【冷凍條件試算】接在【推薦成績】後面，由 stock_picks_review_cooldown.report_lines 組（只算、只列，不寫任何狀態）；
   一樣出錯只換成一行。兩段各自呼叫 returns.report_data（每週多讀一次帳，只多幾秒）：各自的 try 讓一段的格式化出錯
   不拖另一段；report_data 本身壞了就兩段都換成一行。
+- C3 的【背景規則】接在【冷凍條件試算】後面、【之後的檢查點】前面，由 stock_picks_review_rules.report_lines 組（每週從頭
+  重算、只列數字，不呼叫 report_data）；在自己的 try 裡，出錯一樣只換成一行。它回傳的數字（對帳、樣本的計數；bad_values_types 是 {例外類別: 天數}）放在
+  週報資料行，以及組週報那一輪的 last_run（weekly 階段的輸出）；檢查點那一行的「樣本夠 6 期的試驗版本 n 個」也用它
+  （數字裡沒有 ready，也就是任一族沒有正常算或整段算不出來時，寫「這週算不出來」）。
 - 推薦成績卡只讀 state/stock_picks_perf.json 的摘要（唯讀，不呼叫 perf 讀檔：檔案路徑由 job 注入（測試指到暫存目錄），
   而且 v1、v2 兩版的結果檔都要讀得懂，只取兩版共同的欄位）。
 - 台股休市表：跨年的成績要靠下一年的休市表。最後期限＝下一年第一個交易日再加 S − 1 個交易日，S＝perf 的
@@ -45,9 +49,11 @@ REPORT_MAX_CHARS = 5000  # 整份上限：relay 照行切，每段最多 1,890 �
 PERF_MAX_BYTES = 1024 * 1024
 
 # 各段的檢查點（PLAN §1；之後的段上線時改這裡的說明）。C1 的成績比較已經上線（週報的【推薦成績】），不再列。
+# 背景規則那一行的 {ready} 換成【背景規則】算出來的「樣本夠 6 期的試驗版本」數（PLAN_C3 §5）。
+READY_MARK = "{ready}"
 CHECKPOINTS = (
     ("自動冷凍績效差的股票", "試算中（真的拿掉的功能目標 2027/1/10 前上線；最早可能觸發是 2027/1/31 那份週報）"),
-    ("背景規則（測試修正版規則）", "尚未啟用（目標 12/13 前上線；最早約 2027/5 才有結果）"),
+    ("背景規則（試驗版本）", f"試算中（每週從頭重算；樣本夠 6 期的試驗版本{READY_MARK}）；要不要問你換規則，等 12 月定門檻"),
 )
 DEFAULT_SETTLE_SESSIONS = 10  # 讀不到 perf 時用（stock_picks_perf.SETTLE_SESSIONS）
 HOLIDAY_MARGIN_DAYS = 3  # 建議期限比最後期限再提早幾天
@@ -328,7 +334,33 @@ def cooldown_lines(ctx, conn, calendars: dict[str, list[str]]) -> list[str]:
         return [f"【冷凍條件試算】這週算不出來（{type(exc).__name__}），其他內容照常"]
 
 
-def build_report(ctx, sunday: date) -> str:
+def rules_lines(ctx, conn, calendars: dict[str, list[str]], numbers: dict) -> list[str]:
+    """C3 的【背景規則】一段；和 cooldown_lines 一樣出錯只換成一行。沒有 review.sqlite 就不寫這段。
+    numbers：算得出來時放進對帳與樣本的計數（bad_values_types 是 {例外類別: 天數}），算不出來時只放 computed＝0。"""
+    if conn is None:
+        return []
+    try:
+        from jobs import stock_picks_review_rules as rules
+
+        lines, counts = rules.report_lines(ctx, conn, calendars)
+    except Exception as exc:  # noqa: BLE001
+        log.error("stock picks review weekly rules error_type=%s", type(exc).__name__)
+        numbers.update(computed=0)
+        return [f"【背景規則】這週算不出來（{type(exc).__name__}），其他內容照常"]
+    numbers.update(counts)
+    return lines
+
+
+def _checkpoint_lines(rules_numbers: dict) -> list[str]:
+    ready = rules_numbers.get("ready")  # 只有兩族都正常算出來時才有（rules.numbers_of）
+    ready_text = "這週算不出來" if ready is None else f" {ready} 個"
+    return [f"・{name}：{state.replace(READY_MARK, ready_text)}" for name, state in CHECKPOINTS]
+
+
+# TODO（deferred.md 2026-11-21 C3-2）：C2b 抽段落 helper 時，改成內部函式回 (text, numbers)，不再用參數帶回數字（C3 r2 N-6、r4 N-8）
+def build_report(ctx, sunday: date, rules_numbers: Optional[dict] = None) -> str:
+    """整份週報。rules_numbers：給 weekly 階段的輸出用，【背景規則】的數字放進去（見 rules_lines）。"""
+    rules_numbers = {} if rules_numbers is None else rules_numbers
     conn = ctx.db()
     today = ctx.today
     calendars = {market: trading_days(conn, market) for market in ("tw", "us")} if conn is not None else {}
@@ -353,8 +385,10 @@ def build_report(ctx, sunday: date) -> str:
     cooldown = cooldown_lines(ctx, conn, calendars)
     if cooldown:
         lines += ["", *cooldown]
-    lines += ["", "【之後的檢查點】"]
-    lines += [f"・{name}：{state}" for name, state in CHECKPOINTS]
+    rules_section = rules_lines(ctx, conn, calendars, rules_numbers)
+    if rules_section:
+        lines += ["", *rules_section]
+    lines += ["", "【之後的檢查點】", *_checkpoint_lines(rules_numbers)]
     lines += ["", METHOD]
     text = "\n".join(lines)
     return text if len(text) <= REPORT_MAX_CHARS else text[:REPORT_MAX_CHARS - 1] + "…"
@@ -368,8 +402,12 @@ def weekly_stage(ctx) -> dict:
     name = report_name(sunday)
     if ctx.queued(name):
         return {"status": "skipped:queued", "week": sunday.isoformat()}
-    text = build_report(ctx, sunday)
+    rules_numbers: dict = {}
+    text = build_report(ctx, sunday, rules_numbers)
+    # 【背景規則】的對帳與樣本計數，只在組週報這一輪的 last_run。TODO（deferred.md 2026-11-21 C3-1）：C2b 改 runner 時帶到
+    # 下一輪，並加進每日維護讀 last_run 的白名單
+    extra = {"rules": rules_numbers} if rules_numbers else {}
     if ctx.dry_run:
-        return {"status": "dry_run", "week": sunday.isoformat(), "chars": len(text), "text": text}
+        return {"status": "dry_run", "week": sunday.isoformat(), "chars": len(text), **extra, "text": text}
     ctx.drop(f"{name}.md", text)
-    return {"status": "queued", "week": sunday.isoformat(), "chars": len(text)}
+    return {"status": "queued", "week": sunday.isoformat(), "chars": len(text), **extra}

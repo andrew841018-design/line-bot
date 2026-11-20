@@ -385,6 +385,47 @@ def test_contract_a_real_spool_is_found_and_accepted_by_the_job(monkeypatch, clo
     assert version.cooldown_read == "missing"  # C2b 合併前的檢查點：B2 活著
 
 
+def test_c3_engine_reproduces_the_bots_picks_from_a_real_spool(monkeypatch, clock):
+    """回測 C3（PLAN_C3 §6）：真的 _maybe_fill_ai（只換掉 Yahoo）→ 真的 write_ai_spool → job 的 spool_version、
+    write_version 寫進 review.sqlite → C3 從 pool_rows 讀回來，用底規則跑出來的要等於 AI 狀態的 picks，整串候選＝rank。
+    走勢 no:／skipped:（確定不選）與 unknown（未知）真實資料還沒出現過，只有這裡走得到（審查 C3 r1 I2）。"""
+    pool = _job("stock_picks_review_pool")
+    rdb = _job("stock_picks_review_db")
+    rules = _job("stock_picks_review_rules")
+    variants = _job("stock_picks_review_variants")
+    spool = _job_spool(monkeypatch)
+    rig = Rig(monkeypatch, clock, 10, cum=lambda i: 100.0 - i if i < 9 else 5.0)  # 1101–1109 是候選
+    rig.snapshot.pool["1101"] = _facts("1101")  # 主池有走勢：pool
+    sp._ai_cache_t = rig.snapshot.t
+    sp._ai_chart_cache.update({"1102": (sp._AI_NO, "chart_unavailable"), "1108": (sp._AI_HOLE, clock.mono + 600)})
+    sp._ai_fail_tries["1109"] = 1
+    rig.yahoo.kind("1103", "below")  # ok，在年線之下
+    rig.yahoo.kind("1104", "short")  # no:bars_short
+    rig.yahoo.kind("1105", "hot")  # ok，比季線高 13.7%：底規則不合格，ai_p60_20（≤ 20%）合格
+    state = rig.run()
+    assert rig.picks == ["1101", "1106", "1107"]
+    [path] = _spool_files(spool)
+    version = _job_accepts(pool, path, state)
+    conn = rdb.open_db(spool.parent / "review.sqlite")
+    try:
+        assert pool.write_version(conn, version, now=time.time()) == "new"
+        rows = rules.load_members(conn, version, version.derive_version)
+    finally:
+        conn.close()
+    labels = {row.code: json.loads(row.trend_json)["trend"] for row in rows}
+    assert labels == {"1101": "pool", "1102": "skipped:chart_unavailable", "1103": "ok", "1104": "no:bars_short",
+                      "1105": "ok", "1106": "ok", "1107": "ok", "1108": "unknown", "1109": "unknown", "1110": None}
+    t = state["t"]
+    base = rules.parse_and_choose(pool.FAMILY_AI, variants.AI_BASE, rows, t)
+    assert base.picks == tuple(rig.picks) and base.candidates == tuple(f"{1101 + i}" for i in range(9))
+    assert rules.parity_ok(pool.FAMILY_AI, base, rows, None)  # 選出的集合、整串候選＝rank
+    p60_20 = rules.parse_and_choose(pool.FAMILY_AI, variants.params_of("ai_p60_20"), rows, t)
+    assert p60_20.picks == ("1101", "1105", "1106")
+    assert rules.parse_and_choose(pool.FAMILY_AI, variants.params_of("ai_p60_5"), rows, t).picks == tuple(rig.picks)
+    more = rules.parse_and_choose(pool.FAMILY_AI, {**variants.AI_BASE, "max_picks": 4}, rows, t)  # 第 4 檔得走到 1108
+    assert more.picks is None and more.reason == rules.UNKNOWN_TREND
+
+
 def test_contract_the_largest_spool_is_accepted_by_the_job():
     pool = _job("stock_picks_review_pool")
     facts = [_facts(str(1101 + i), name="測試股票名稱十六個字以內好", revenue=sp.Revenue(2026, 8, 10.0, 100.0 - i / 10))

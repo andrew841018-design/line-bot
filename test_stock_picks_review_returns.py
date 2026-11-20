@@ -30,6 +30,7 @@ from jobs import stock_picks_review_cooldown as cooldown
 from jobs import stock_picks_review_db as rdb
 from jobs import stock_picks_review_pool as pool
 from jobs import stock_picks_review_returns as returns
+from jobs import stock_picks_review_rules as rules
 from jobs import stock_picks_review_weekly as weekly
 
 TPE = ZoneInfo("Asia/Taipei")
@@ -1015,6 +1016,9 @@ def test_weekly_report_keeps_phase_a_content_and_fits_three_chunks(paths, monkey
     assert text.index("【推薦成績】") < text.index("【之後的檢查點】") and text.rstrip().endswith(weekly.METHOD)
     c2a = "\n".join(cooldown.format_lines({}))  # 這個世界沒有能用的 20 日成績（唯一一筆 h＝20 是跳過的）
     assert c2a in text and text.index("【推薦成績】") < text.index(c2a) < text.index("【之後的檢查點】")
+    # C3 的【背景規則】在【冷凍條件試算】之後、【之後的檢查點】之前（PLAN_C3 §5）
+    assert text.index(c2a) < text.index("\n\n" + rules.HEAD + "\n") < text.index("【之後的檢查點】")
+    assert "樣本夠 6 期的試驗版本 0 個）" in text and "這週算不出來" not in text
     assert text.count("推薦隔天收盤進場") == 1  # 算法只寫在最後一行（【推薦成績】的標題不重複）
     assert len(text) <= weekly.REPORT_MAX_CHARS and len(_relay_chunks(text)) <= 3
 
@@ -1045,6 +1049,27 @@ def test_cooldown_error_only_replaces_its_own_section(paths, monkeypatch):
     assert "\n【冷凍條件試算】這週算不出來（RuntimeError），其他內容照常\n" in text
     assert "【資料收集】" in text and "【推薦成績】\n台股 AI 相關股\n・5 日 6 次：平均 +2.9%" in text
     assert text.rstrip().endswith(weekly.METHOD)
+
+
+def test_rules_error_only_replaces_its_own_section(paths, monkeypatch):
+    """C3 的【背景規則】出錯只換成一行（例外類別），其他段照常；檢查點寫「這週算不出來」，weekly 階段的數字只有 computed＝0。"""
+    _report_world(paths, monkeypatch)
+    fx.write_states(paths.state_dir, main=fx.main_snapshot(), ai=fx.ai_state(), us=fx.us_snapshot())
+
+    def broken(*_args, **_kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(rules, "report_lines", broken)
+    ctx = _ctx(paths, SUNDAY)
+    numbers: dict = {}
+    try:
+        text = weekly.build_report(ctx, D("2026-11-01"), numbers)
+    finally:
+        ctx.close()
+    assert "\n【背景規則】這週算不出來（RuntimeError），其他內容照常\n\n【之後的檢查點】\n" in text
+    assert "【推薦成績】\n台股 AI 相關股\n・5 日 6 次：平均 +2.9%" in text and "【冷凍條件試算】只算" in text
+    assert "樣本夠 6 期的試驗版本這週算不出來）" in text and numbers == {"computed": 0}
+    assert text.rstrip().endswith(weekly.METHOD) and "boom" not in text
 
 
 def test_largest_possible_report_still_fits_three_chunks():
@@ -1083,6 +1108,16 @@ def test_largest_possible_report_still_fits_three_chunks():
     c2a = "\n".join(c2a_lines)
     assert len(c1) + len(c2a) + a_part < weekly.REPORT_MAX_CHARS and max(len(line) for line in c2a_lines) < 150
     assert len(_relay_chunks(("x" * 100 + "\n") * 15 + c1 + "\n\n" + c2a)) <= 3
+    # C3 的【背景規則】最長的寫法（每種可選的行都出現、數字取最長；放不下時退回每族一行）：硬上限 550 字，
+    # 加上它整份還是在 5,000 字、三段以內（審查 C3 r3 I-4、r4 S5）。檢查點那一行變長的部分算在 a_part 裡。
+    from test_stock_picks_review_rules import worst_results
+
+    c3_lines = rules.format_lines(worst_results(), D("2030-12-01"))
+    c3 = "\n".join(c3_lines)
+    assert len(c3) <= rules.MAX_CHARS and max(len(line) for line in c3_lines) < 300
+    assert len(weekly._checkpoint_lines({"ready": 11})[1]) < 80
+    assert len(c1) + len(c2a) + len(c3) + 6 + a_part < weekly.REPORT_MAX_CHARS
+    assert len(_relay_chunks(("x" * 100 + "\n") * 15 + c1 + "\n\n" + c2a + "\n\n" + c3)) <= 3
 
 
 def test_missing_versions_before_pool_logging_say_why():

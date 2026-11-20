@@ -713,6 +713,8 @@ def build_performance(perf, conn, versions: dict[str, dict], ledger: Sequence[di
         """(用哪一版, flag)。快取鍵帶「有沒有給 picks」：給 picks（比對帳釘住那一行）和不給（直接取 E 收盤前最後一版）
         選出來的不一定是同一版，之後有人用 picks＝None 問台股 AI／美股也不會拿到比對過的那一版。同一個鍵只認第一次的
         picks（同一個 (m, t) 的帳列都釘住同一行）。"""
+        # TODO（deferred.md 2026-11-21 C3-5；PLAN §8）：picks is None 這個鍵還沒有測試釘住；有人用 picks=None 呼叫時補一支
+        # 「先後用兩種 picks 選版」的測試（C3 不經過這個快取）
         key = (family, m, t, picks is None)
         if key not in selected:
             deadline = perf.close_deadline(m, t, tuple(calendars.get(m, ())))
