@@ -5629,6 +5629,18 @@ def _try_handle_missed_reminder_repair(
             include_auxiliary=False,
         )
         return True
+    if str(raw.get("user_id") or "") == "__bot__":
+        # 咪寶's own push or reply is never an event's own message: only the family's words count
+        # (Andrew 2026-11-13/14, D3, D4), as the quoted schedule capture (:7396) and the follow-up
+        # (reminder_followup.resolve_source) already hold.
+        _reply(
+            event.reply_token,
+            "引用的是咪寶自己的訊息，先沒有建立提醒。請直接回覆家人原本那則訊息，再說「這個漏掉了」。",
+            group_id=group_id,
+            allow_push_fallback=False,
+            include_auxiliary=False,
+        )
+        return True
 
     import calendar_db
     import calendar_regex
@@ -15217,7 +15229,8 @@ def _capture_calendar_event_now(
         for data in extracted.get("events") or []:
             actor = None
             if data.get("event_type") == "medical":
-                actor = _infer_medical_actor(combined_text, sender_user_id)
+                # the family's own words only (D3): a quoted push of 咪寶's never names the patient
+                actor = _infer_medical_actor(calendar_extractor.family_words(combined_text), sender_user_id)
                 data["title"] = _apply_medical_actor(data["title"], actor)
                 data["participants"] = _with_medical_actor_participant(
                     data.get("participants"), actor
@@ -15234,6 +15247,7 @@ def _capture_calendar_event_now(
                 participants=data.get("participants") or [],
                 event_type=data.get("event_type", "family_gathering"),
                 source_msg_id=message_id,
+                title_names_family=data.get("_title_names_family"),
             )
             if event_id and write_outcome in {"created", "merged", "duplicate"}:
                 logger.info(

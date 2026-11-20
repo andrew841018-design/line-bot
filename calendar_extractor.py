@@ -30,6 +30,7 @@ from zoneinfo import ZoneInfo
 from google.genai import types
 
 import gemini_client
+import line_mentions
 import reminder_intent
 from quote_context import QUOTE_CONTEXT_RULE
 
@@ -133,6 +134,15 @@ def _negated(line: str, word: re.Match) -> bool:
         return False
     after = line[word.end():word.end() + 3]
     return bool(_NEGATION_BEFORE_RE.search(before) or _NEGATION_AFTER_RE.match(after))
+
+
+def family_words(text: str | None) -> str:
+    """What the family wrote in a capture's text: without the quote rule and without any quoted
+    earlier message (_QUOTED_BLOCK_RE, as the cancel check reads it), so 咪寶's own push quoted back
+    in a burst never stands for the family (Andrew 2026-11-13/14, D3, D4).  A quoted family message
+    does not count either: it made its own event when it was sent."""
+    plain = str(text or "").replace(QUOTE_CONTEXT_RULE, "\n")
+    return _QUOTED_BLOCK_RE.sub("\n", plain)
 
 
 def _word_near_keyword(text: str, keyword: str, words: re.Pattern) -> tuple[bool, str, int]:
@@ -243,7 +253,7 @@ def extract(combined_text: str) -> dict:
     else:
         try:
             text = _strip_code_fence(resp.text or "")
-            data = _normalize(json.loads(text))
+            data = _normalize(json.loads(text), family_text=family_words(combined_text))
             logger.info(
                 "calendar extract result has_event=%s is_cancellation=%s",
                 bool(data.get("has_event")), bool(data.get("is_cancellation")),
@@ -373,7 +383,7 @@ def extract_many(combined_text: str, primary: dict | None = None) -> dict:
     }
 
 
-def _normalize(data: dict) -> dict:
+def _normalize(data: dict, family_text: str | None = None) -> dict:
     has = bool(data.get("has_event"))
     cancel = bool(data.get("is_cancellation"))
     parts = data.get("participants") or []
@@ -434,4 +444,16 @@ def _normalize(data: dict) -> dict:
                 "participants": [],
             }
         )
+    if family_text is not None:
+        # A model's 全家 rings only with the family's own words behind it (Andrew 2026-11-13/14, D3, D4):
+        # an @ to everyone, or a title and a message that both say 全家.  The program's medical 全家 is
+        # added later, after this.
+        title_backed = line_mentions.title_names_family(out["title"], family_text)
+        out["_title_names_family"] = title_backed
+        if not (title_backed or line_mentions.whole_family_mentions(family_text)):
+            kept = [p for p in out["participants"] if not line_mentions.is_whole_family_participant(p)]
+            if len(kept) != len(out["participants"]):
+                logger.info("calendar extract: %d whole-family participant(s) dropped, no family words behind them",
+                            len(out["participants"]) - len(kept))
+            out["participants"] = kept
     return out

@@ -258,6 +258,32 @@ def user_id_for_family_role(role: str) -> str | None:
     return user_id_for_alias(role)
 
 
+def clean_participant_name(name: str) -> str:
+    """A participant as an event's reminder reads it: no @ in front, nothing from a bracket on
+    (「全家(主辦)」 is 全家).  The one copy; calendar_db reads participants with it."""
+    cleaned = str(name or "").strip()
+    if not cleaned:
+        return ""
+    cleaned = cleaned.lstrip("@")
+    for marker in ("(", "（"):
+        if marker in cleaned:
+            cleaned = cleaned.split(marker, 1)[0].strip()
+            break
+    return cleaned
+
+
+def is_whole_family_participant(name: str) -> bool:
+    """Whether an event's reminder would ring everyone for this participant.  The mirror reads it this
+    way; the offset push, which cuts no bracket, reads fewer as everyone, never more."""
+    return is_all_participants([clean_participant_name(name)])
+
+
+def title_names_family(title: str | None, text: str | None) -> bool:
+    """A 全家 in a model's title counts only when the family's own words say 全家 too (Andrew 2026-11-14,
+    D4)."""
+    return names_the_family(title) and names_the_family(text)
+
+
 def parse_participants(value: Any) -> list[str]:
     if value is None:
         return []

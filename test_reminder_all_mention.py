@@ -310,8 +310,11 @@ def test_participants_say_the_whole_family(cd):
 
 @pytest.mark.parametrize("title", ["全家聚餐", "全家去餐廳聚餐", "我們全家回台北", "@全家 聚餐"])
 def test_a_title_says_the_whole_family(cd, title):
-    # The local regex files 「明天下午2點全家聚餐」 with no participants and no model ever sees it.
-    _event_id, row = _write_event(cd, "週六見", title=title)
+    # The local regex files 「明天下午2點全家聚餐」 with no participants and no model ever sees it.  Its
+    # message holds the title, as a regex event's does: a model's 全家 title needs the family's own words
+    # behind it (D4, test_calendar_family_mention.py).  The message leaves out the title's @, so only the
+    # title can ring here: an @ in the message rings on its own (seat 4 N10).
+    _event_id, row = _write_event(cd, "週六" + title.replace("@", ""), title=title)
 
     assert row["mention_aliases"] == ["全家"]
     assert _kinds(row) == ["all"]
@@ -326,7 +329,7 @@ def test_a_title_about_the_shop_does_not(cd, title):
 
 
 def test_a_title_adds_to_the_people_already_there(cd):
-    _event_id, row = _write_event(cd, "@成員乙 週六見", title="全家聚餐", participants=["成員甲(主辦)"])
+    _event_id, row = _write_event(cd, "@成員乙 週六全家聚餐", title="全家聚餐", participants=["成員甲(主辦)"])
 
     assert row["mention_aliases"] == ["成員甲", "成員乙", "全家"]
 
@@ -392,7 +395,7 @@ def test_a_sync_takes_the_old_ping_off_a_pending_row(cd):
 
 
 def test_a_sync_keeps_a_ping_the_title_asks_for(cd):
-    event_id, row = _write_event(cd, "週六見", title="全家聚餐")
+    event_id, row = _write_event(cd, "週六全家聚餐", title="全家聚餐")
     _as_written_before(row["reminder_id"])
 
     assert cd.synchronize_pending_event_reminder_mirror(cd.get_active_event_by_id("G1", event_id))
@@ -422,14 +425,17 @@ def test_moving_the_event_rewrites_the_ping_too(cd):
     assert (json.loads(aliases), status) == ([], "pending")
 
 
-def test_a_repair_reads_the_title_the_way_the_mirror_was_written(cd):
+@pytest.mark.parametrize(("raw", "aliases"), [("週六上課", []), ("週六全家皮拉提斯", ["全家"])])
+def test_a_repair_reads_the_title_the_way_the_mirror_was_written(cd, raw, aliases):
     # repair_legacy_reminders_as_calendar_events compares the mirror it wrote with what it would write now:
-    # the title has to count on both sides, or a finished repair reads as drift.
+    # the title has to count the same way on both sides, the event's message read both times (D4), or a
+    # finished repair reads as drift.
     import memory
 
     with memory._conn() as conn:
         conn.execute(
-            "INSERT INTO raw_messages(group_id,message_id,user_id,text,created_at) VALUES ('G1','M-1','U1','週六上課',1)"
+            "INSERT INTO raw_messages(group_id,message_id,user_id,text,created_at) VALUES ('G1','M-1','U1',?,1)",
+            (raw,),
         )
         legacy = conn.execute(
             "INSERT INTO reminders(group_id,user_id,action,remind_at,created_at,status,source_kind,source_ref,"
@@ -453,7 +459,7 @@ def test_a_repair_reads_the_title_the_way_the_mirror_was_written(cd):
     again = cd.repair_legacy_reminders_as_calendar_events("G1", reminder_expectations=expectations, event_specs=specs)
 
     assert outcome == "created"
-    assert _mirror(event_ids[0])["mention_aliases"] == ["全家"]
+    assert _mirror(event_ids[0])["mention_aliases"] == aliases
     assert again == (event_ids, "already_applied")
 
 

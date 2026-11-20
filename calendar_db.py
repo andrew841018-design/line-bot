@@ -141,9 +141,20 @@ def _raw_text_reminder_aliases(text: str) -> list[str]:
     ]
 
 
-def _title_family_aliases(event: Mapping[str, object]) -> list[str]:
-    """「全家聚餐」 is the whole family; 「去全家買牛奶」 and 「全家便利商店」 are the shop."""
-    return ["全家"] if line_mentions.names_the_family(str(event.get("title") or "")) else []
+def _title_family_aliases(event: Mapping[str, object], raw_text: str = "") -> list[str]:
+    """「全家聚餐」 rings everyone when the family said 全家 too (Andrew 2026-11-14, D4): the event's own
+    message decides; with no message (a burst), what the capture decided, for the first mirror only (it
+    is not stored, so a recompute has neither); with neither, the title alone (11/07).  「去全家買牛奶」
+    and 「全家便利商店」 are the shop either way."""
+    title = str(event.get("title") or "")
+    if not line_mentions.names_the_family(title):
+        return []
+    if str(raw_text or "").strip():
+        return ["全家"] if line_mentions.title_names_family(title, raw_text) else []
+    decided = event.get("title_names_family")
+    if decided is not None:
+        return ["全家"] if decided else []
+    return ["全家"]
 
 
 def _mirror_mention_aliases(event: Mapping[str, object], raw_text: str) -> list[str]:
@@ -153,20 +164,11 @@ def _mirror_mention_aliases(event: Mapping[str, object], raw_text: str) -> list[
     if _is_badminton_event(event) and participant_aliases:
         return participant_aliases
     return _merge_mention_aliases(
-        participant_aliases, _raw_text_reminder_aliases(raw_text), _title_family_aliases(event)
+        participant_aliases, _raw_text_reminder_aliases(raw_text), _title_family_aliases(event, raw_text)
     )
 
 
-def _clean_participant_name(name: str) -> str:
-    cleaned = str(name or "").strip()
-    if not cleaned:
-        return ""
-    cleaned = cleaned.lstrip("@")
-    for marker in ("(", "（"):
-        if marker in cleaned:
-            cleaned = cleaned.split(marker, 1)[0].strip()
-            break
-    return cleaned
+_clean_participant_name = line_mentions.clean_participant_name  # one copy (review 2026-11-14)
 
 
 def _is_badminton_event(event: Mapping[str, object]) -> bool:
@@ -900,6 +902,7 @@ def insert_event_with_outcome(
     participants: list[str] | None = None,
     source_msg_id: str | None = None,
     event_type: str = 'family_gathering',
+    title_names_family: bool | None = None,
 ) -> tuple[str, str]:
     event_id = uuid.uuid4().hex
     parts_json = json.dumps(participants or [], ensure_ascii=False)
@@ -916,6 +919,10 @@ def insert_event_with_outcome(
         "status": "active",
         "event_type": et,
     }
+    if title_names_family is not None:
+        # What the capture decided about a model's 全家 title (D4), for the first mirror of an event
+        # with no message of its own.  Not stored.
+        incoming["title_names_family"] = title_names_family
     try:
         _ensure_memory_db_path()
         with _lock, _conn() as c:
