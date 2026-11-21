@@ -128,6 +128,9 @@ class RunResult:
     skipped: dict[str, int] = field(default_factory=dict)
     stopped: str = ""
     gap_s: int = 0
+    # The run's clock, set only when the run gets to its end (or records db_busy): a batch that moved the
+    # cursor before a lock cut the run off leaves yesterday's value, so the report sees it (2026-11-21 F1).
+    finished_at: int = 0
 
     def skip(self, reason: str, n: int = 1) -> None:
         if n:
@@ -346,14 +349,13 @@ def run(feature: Feature, group_id: str, conn_factory: Callable, *, now: float |
     except sqlite3.OperationalError as exc:
         if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
             raise
-        result = RunResult(mode=mode, stopped="db_busy")
+        result = RunResult(mode=mode, stopped="db_busy", finished_at=int(time.time() if now is None else now))
         logger.warning("%s %s", feature.label, result.log_fields())
         try:  # the lock may be gone by now; the daily maintenance alert reads this row
             with conn_factory() as c:
                 c.execute(
                     "UPDATE extract_cursors SET updated_at=?, last_run=? WHERE name=? AND group_id=?",
-                    (int(time.time() if now is None else now), json.dumps(asdict(result), sort_keys=True),
-                     feature.name, group_id),
+                    (result.finished_at, json.dumps(asdict(result), sort_keys=True), feature.name, group_id),
                 )
         except sqlite3.Error as inner:
             logger.warning("%s db_busy not recorded error_type=%s", feature.label, type(inner).__name__)
@@ -381,6 +383,7 @@ def _run(feature: Feature, group_id: str, conn_factory: Callable, *, now: float 
 
     def finish_run(reason: str = "") -> RunResult:
         result.stopped = reason
+        result.finished_at = int(now)
         quiet = reason in ("no_answer", "not_ready")
         with conn_factory() as c:
             if reason == "raced":

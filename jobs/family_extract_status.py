@@ -73,7 +73,7 @@ def _count(conn, sql: str, params: tuple = ()) -> int | None:
 
 _NAME_RE = re.compile(r"[a-z_]{1,40}", re.ASCII)
 _DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", re.ASCII)
-_RUN_KEYS = ("mode", "read", "sent", "requests", "answered", "new", "stopped", "gap_s", "skipped")
+_RUN_KEYS = ("mode", "read", "sent", "requests", "answered", "new", "stopped", "gap_s", "skipped", "finished_at")
 _PUSH_KEYS = (
     "mode", "date", "due", "expired", "unsent", "fold_structural", "fold_queue", "fold_semantic",
     "fold_error", "pushed", "lines", "would_push", "would_fold", "push_ok", "mark_error", "error",
@@ -179,6 +179,28 @@ def collect(base: Path = BASE, *, now: float | None = None) -> dict | None:
     }
 
 
+def _since_h(now: float | None, ts) -> float | None:
+    if now is None or isinstance(ts, bool) or not isinstance(ts, int) or ts <= 0:
+        return None
+    return max(0.0, (now - ts) / 3600)
+
+
+def _after_0810(now: float | None) -> datetime | None:
+    """Today 08:00 (Taipei) once it is 08:10 or later, else None: both jobs run at 08:00."""
+    if now is None:
+        return None
+    here = datetime.fromtimestamp(now, _TW)
+    run_at = here.replace(hour=8, minute=0, second=0, microsecond=0)
+    return run_at if here >= run_at + timedelta(minutes=10) else None
+
+
+def _push_not_today(push: dict, now: float | None) -> bool:
+    """A push that ran before but left no summary today (2026-11-21 F1): a lock took the push half, or the
+    save of its summary.  A push that never ran yet (the deploy day) raises nothing here."""
+    run_at = _after_0810(now)
+    return run_at is not None and bool(push.get("date")) and push.get("date") != run_at.date().isoformat()
+
+
 def alerts(jobs: dict, anniversary_counts: dict, modes: dict, *, now: float | None = None) -> list[str]:
     """Fixed codes; the daily maintenance prompt turns each into one sentence.  A job switched off
     raises nothing (its numbers simply stop moving)."""
@@ -201,16 +223,21 @@ def alerts(jobs: dict, anniversary_counts: dict, modes: dict, *, now: float | No
             out.append(f"{name}_behind_48h")
         if last.get("stopped") == "db_busy":
             out.append(f"{name}_db_busy")
-        if (job.get("since_run_h") or 0) > 26:
+        # A run that got to its end (finished_at), not a batch that moved the cursor (updated_at): a lock can
+        # cut a run off after its first batch (2026-11-21 F1).  A row without finished_at falls back.
+        since_run_h = _since_h(now, last.get("finished_at"))
+        if since_run_h is None:
+            since_run_h = job.get("since_run_h")
+        if (since_run_h or 0) > 26:
             out.append(f"{name}_not_run_26h")
-        # Both jobs run at 08:00: by 08:10 today's run should have left its mark, even when a lock kept
-        # it from recording why it stopped (REV_1 I-1).
-        if now is not None and job.get("since_run_h") is not None:
-            here = datetime.fromtimestamp(now, _TW)
-            run_at = here.replace(hour=8, minute=0, second=0, microsecond=0)
-            if here >= run_at + timedelta(minutes=10) and job["since_run_h"] * 3600 > (now - run_at.timestamp()) + 360:
-                out.append(f"{name}_not_run_today")
+        # Both jobs run at 08:00: by 08:10 today's run should have finished, even when a lock kept it from
+        # recording why it stopped (REV_1 I-1).
+        run_at = _after_0810(now)
+        if run_at is not None and since_run_h is not None and since_run_h * 3600 > (now - run_at.timestamp()) + 360:
+            out.append(f"{name}_not_run_today")
     push = (jobs.get("todo") or {}).get("last_push") or {}
+    if modes.get("todo") != "off" and (jobs.get("todo") or {}).get("ran") and _push_not_today(push, now):
+        out.append("todo_push_not_today")
     if modes.get("todo") == "on" and push.get("mode") == "on":
         if push.get("push_ok") is False:
             out.append("todo_push_failed")
@@ -221,6 +248,8 @@ def alerts(jobs: dict, anniversary_counts: dict, modes: dict, *, now: float | No
     anniversary_push = (jobs.get("anniversary") or {}).get("last_push") or {}
     if anniversary_push.get("push_ok") is False:  # the push runs whatever the extraction switch says
         out.append("anniversary_push_failed")
+    if (jobs.get("anniversary") or {}).get("ran") and _push_not_today(anniversary_push, now):
+        out.append("anniversary_push_not_today")
     if anniversary_counts.get("pending"):
         out.append("anniversary_candidates_pending")
     return out

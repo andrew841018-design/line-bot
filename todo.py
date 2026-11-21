@@ -11,8 +11,9 @@ milliseconds and never read a message.  Now:
   ``MAX_REQUESTS`` requests a run, the retry after 61 seconds included).  Each item the model returns is
   checked here: its message, an owner with a local family name, a task lifted from that message (at
   least half of its bigrams, its date words taken out), a due date in range that agrees with the
-  message's own date words, and no reminder or calendar event already made from that message.  Only
-  the 08:00 job (``push_follows``) makes a todo due the same day.  Shadow mode stores ``status='shadow'``.
+  message's own date words, and no reminder or calendar event already made from that message.  Only a
+  run the day's 08:00 push still follows (``push_follows``: the 08:00 job, or any extract before 08:00)
+  makes a todo due the same day.  Shadow mode stores ``status='shadow'``.
 - **Push** (``push_daily_reminders``): pending rows that fell due before today expire; today's are
   pushed once, unless the message was unsent, or a reminder or calendar event for the same message,
   the reminder queue, or a same-event reminder that already pings the owner covers it.  A check that
@@ -481,11 +482,12 @@ _EXPECTED_DATE_RE = re.compile(
     r"|(?P<md>(?<![0-9])(?P<m>[0-9]{1,2})\s*月\s*(?P<d>[0-9]{1,2})(?![0-9]))"
     rf"|(?P<cmd>{_NOT_AFTER_CN}(?P<cm>{_CN_MONTH})\s*月\s*(?P<cd>{_CN_DAY})\s*[日號])"
     r"|(?P<slash>(?<![0-9/])(?P<sm>[0-9]{1,2})\s*/\s*(?P<sd>[0-9]{1,2})(?![0-9/]))"
-    rf"|(?P<monthday>(?P<which>下\s*下|下|這|本)\s*個?\s*月\s*的?\s*(?P<qd>{_DAY_NUMBER})\s*[號日])"
+    # One optional group per gap, never 「\s*X?\s*」: on a run of spaces that tries every split (2026-11-21 F3).
+    rf"|(?P<monthday>(?P<which>下\s*下|下|這|本)\s*(?:個\s*)?月\s*(?:的\s*)?(?P<qd>{_DAY_NUMBER})\s*[號日])"
     rf"|(?P<noday>(?:上\s*上|上|每)\s*(?:[個一]\s*)?(?:{_WEEK_WORD}\s*{_WEEKDAY_CHAR}?|月\s*的?\s*(?:{_DAY_NUMBER}\s*[號日])?))"
-    rf"|(?P<next2>下\s*下\s*個?\s*{_WEEK_WORD}(?P<n2>{_WEEKDAY_CHAR}){_NOT_A_WEEKDAY_AFTER})"
-    rf"|(?P<next>下\s*個?\s*{_WEEK_WORD}(?P<n1>{_WEEKDAY_CHAR}){_NOT_A_WEEKDAY_AFTER})"
-    rf"|(?P<this>(?:這|本)\s*個?\s*{_WEEK_WORD}(?P<t>{_WEEKDAY_CHAR}){_NOT_A_WEEKDAY_AFTER})"
+    rf"|(?P<next2>下\s*下\s*(?:個\s*)?{_WEEK_WORD}(?P<n2>{_WEEKDAY_CHAR}){_NOT_A_WEEKDAY_AFTER})"
+    rf"|(?P<next>下\s*(?:個\s*)?{_WEEK_WORD}(?P<n1>{_WEEKDAY_CHAR}){_NOT_A_WEEKDAY_AFTER})"
+    rf"|(?P<this>(?:這|本)\s*(?:個\s*)?{_WEEK_WORD}(?P<t>{_WEEKDAY_CHAR}){_NOT_A_WEEKDAY_AFTER})"
     rf"|(?P<bare>{_WEEK_WORD}(?P<b>{_WEEKDAY_CHAR}){_NOT_A_WEEKDAY_AFTER})"
     r"|(?P<dayno>(?<![0-9/])(?P<dn>[0-9]{1,2})\s*(?:號|日(?!\s*[遊游後內内前])))"  # not 1日遊, 3日後
     rf"|(?P<cdayno>{_NOT_AFTER_CN}(?P<cdn>{_CN_DAY})\s*號)"
@@ -943,12 +945,13 @@ def run_incremental(
     group_id: str, *, now: float | None = None, push_follows: bool = False
 ) -> family_extract.RunResult:
     """Read the family group's new messages for todos (family_extract.run).  Off reads nothing; any
-    other group is not read at all.  ``push_follows``: only the 08:00 job, which pushes right after, may
-    make a todo due today (POST_1 N-3); the Sunday 19:00 extract and a manual one may not."""
+    other group is not read at all.  ``push_follows``: a run the day's 08:00 push still follows may make a
+    todo due today (POST_1 N-3): the 08:00 job, which pushes right after, and any extract before 08:00
+    (REV_1 I-2, decided in ``_feature``).  The Sunday 19:00 extract and a manual one after 08:00 may not."""
     now = time.time() if now is None else float(now)
     mode = current_mode()
     if mode == "off":
-        result = family_extract.RunResult(mode="off", stopped="off")
+        result = family_extract.RunResult(mode="off", stopped="off", finished_at=int(now))
         _record_mode_only(group_id, result)
         logger.info("todo extract %s", result.log_fields())
         return result

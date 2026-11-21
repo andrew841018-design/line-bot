@@ -266,13 +266,21 @@ def test_a_quota_error_in_one_group_does_not_stop_the_next(temp_todo_db, named, 
     assert sent == ["GRP2"]
 
 
-def test_owners_are_pinged_in_the_order_the_lines_appear_and_overdue_ones_not_at_all(temp_todo_db, named):
+def test_owners_are_pinged_in_the_order_the_lines_appear_and_overdue_ones_not_at_all(
+    temp_todo_db, named, tmp_path, monkeypatch
+):
     """The final 11/12 version pinged overdue owners too.  Since 2026-11-13 (Andrew 選 B) a todo is pushed
-    once, on its day: an overdue one expires instead, so it is neither printed nor pinged."""
+    once, on its day: an overdue one expires instead, so it is neither printed nor pinged.  The overdue row
+    has an owner of its own (2026-11-21 F5): an owner who also has a line today is pinged either way."""
+    import json
+
     import todo
 
+    aliases = tmp_path / "aliases_with_c.json"
+    aliases.write_text(json.dumps({"U_A": "成員甲", "U_B": "成員乙", "U_C": "成員丙"}, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setenv("LINE_USER_ALIASES_PATH", str(aliases))
     today = datetime.now(ZoneInfo("Asia/Taipei")).date()
-    todo.insert_todo("GRP", "繳學費", "U_A", (today - timedelta(days=2)).isoformat())  # overdue
+    todo.insert_todo("GRP", "繳學費", "U_C", (today - timedelta(days=2)).isoformat())  # overdue, its own owner
     todo.insert_todo("GRP", "買菜", "U_B", today.isoformat())  # due today
     todo.insert_todo("GRP", "交報告", "U_A", today.isoformat())  # due today, inserted after 買菜
     assert todo.push_daily_reminders("GRP") == 2

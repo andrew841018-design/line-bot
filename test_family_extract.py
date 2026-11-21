@@ -537,3 +537,83 @@ def test_giving_up_never_takes_a_message_that_joined_after_the_old_end_was_unsen
 
     assert second.skipped.get("given_up") == 1
     assert "第三件" in model["prompts"][2] and _found(db) == ["m3"]
+
+
+# ── 2026-11-21 修正輪第 2 輪覆核（新版 §3.8，1 席反例）F1 ──────────────────────────────
+
+
+def test_a_run_records_when_it_finished_and_a_locked_one_too(db, model, monkeypatch):
+    """F1: the report needs proof that today's run got to its end, not only that a batch moved the cursor.
+    A finished run (and a db_busy record) keeps its clock as ``finished_at``."""
+    import memory
+
+    now = time.time()
+    _raw("m1", "user-a", "我明天要交報告", now - 3600)
+    model["answers"].append([{"i": 1, "word": "交報告"}])
+    assert _run(db, _feature(db), now).stopped == ""
+    with _closing(db)() as c:
+        (last_run,) = c.execute("SELECT last_run FROM extract_cursors").fetchone()
+    assert json.loads(last_run)["finished_at"] == int(now)
+
+    def locked(*a, **k):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(memory, "raw_messages_stats", locked)
+    assert _run(db, _feature(db), now + 60).stopped == "db_busy"
+    with _closing(db)() as c:
+        (last_run,) = c.execute("SELECT last_run FROM extract_cursors").fetchone()
+    assert json.loads(last_run)["finished_at"] == int(now + 60)
+
+
+def test_a_lock_after_the_first_batch_shows_as_not_run_today(db, model, monkeypatch, tmp_path):
+    """F1 (c): batch 1 commits at 08:00, then a lock takes batch 2 and the db_busy record with it.  The cursor
+    row was touched today, but no run finished today, and the 09:40 report must say so."""
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    import family_extract
+    from jobs import family_extract_status as status
+
+    tw = ZoneInfo("Asia/Taipei")
+    monkeypatch.setattr(family_extract, "BATCH_MAX_MESSAGES", 1)
+    today = datetime.now(tw).date() - timedelta(days=1)
+    run_at = datetime(today.year, today.month, today.day, 8, 0, tzinfo=tw).timestamp()
+    check_at = run_at + 100 * 60  # 09:40
+    path = tmp_path / "job.db"
+
+    class Short:
+        def __enter__(self):
+            self.c = sqlite3.connect(path, isolation_level=None, timeout=0.2)
+            return self.c
+
+        def __exit__(self, *exc):
+            self.c.close()
+
+    _raw("m0", "user-a", "我要做零", run_at - 86400 - 3600)
+    model["answers"].append([{"i": 1, "word": "零"}])
+    assert family_extract.run(_feature(db), GROUP, Short, now=run_at - 86400).stopped == ""
+
+    _raw("m1", "user-a", "我要做一", run_at - 3600)
+    _raw("m2", "user-a", "我要做二", run_at - 3500)
+    model["answers"].extend([[{"i": 1, "word": "一"}], [{"i": 1, "word": "二"}]])
+    inner = _feature(db).prepare
+    held = {}
+
+    def prepare(batch, items, result):
+        if batch[0].message_id == "m2":  # another process takes the write lock during batch 2
+            h = sqlite3.connect(path, isolation_level=None)
+            h.execute("BEGIN IMMEDIATE")
+            held["h"] = h
+        return inner(batch, items, result)
+
+    res = family_extract.run(_feature(db, prepare=prepare), GROUP, Short, now=run_at)
+    held["h"].execute("ROLLBACK")
+    held["h"].close()
+
+    with Short() as c:
+        job = family_extract.status(c, "fake", GROUP, now=check_at, newest_raw=None, unread=None)
+    job["last_run"] = status._clean(job["last_run"], status._RUN_KEYS)
+    job["last_push"] = status._clean(job["last_push"], status._PUSH_KEYS)
+    codes = status.alerts({"todo": job}, {}, {"todo": "on", "anniversary": "off"}, now=check_at)
+    assert res.stopped == "db_busy" and _found(db) == ["m0", "m1"]
+    assert "todo_not_run_today" in codes

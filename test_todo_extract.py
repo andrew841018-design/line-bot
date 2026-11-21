@@ -292,8 +292,9 @@ def test_extract_only_reads_and_never_pushes(model):
 
 
 def test_an_extract_no_push_follows_makes_no_todo_due_today(model):
-    """POST_1 N-3: only the 08:00 job pushes, right after it extracts.  The Sunday 19:00 extract (or any
-    manual one) would make a row due today that can only expire, so it makes none."""
+    """POST_1 N-3: only the 08:00 job pushes, right after it extracts.  The Sunday 19:00 extract (or a manual
+    one after 08:00) would make a row due today that can only expire, so it makes none; an extract before
+    08:00 may, since the day's push still follows it (REV_1 I-2)."""
     import todo
 
     sunday = date(2026, 11, 15)
@@ -1803,3 +1804,80 @@ def test_a_manual_extract_before_08_00_keeps_todays_todo_for_the_push(model):
 
     assert todo.main_reminder(now=NOW) == 0
     assert len(model["prompts"]) == 1 and len(_pushes()) == 1
+
+
+# ── 2026-11-21 修正輪第 2 輪覆核（新版 §3.8，1 席反例）F1、F3 ──────────────────────────
+
+
+def test_a_lock_during_the_push_leaves_an_alert_for_the_daily_report(model, monkeypatch):
+    """F1 (a): the 08:00 extraction finishes, then another writer holds the lock through the push half, so
+    nothing is pushed and no summary is saved.  Yesterday's summary must not read as today's."""
+    import sqlite3
+
+    import family_extract
+    import todo
+    from jobs import family_extract_status as status
+
+    assert todo.main_reminder(now=NOW - 86400) == 0  # yesterday: healthy, nothing due
+    _raw("msg-1", "user-a", "我明天要交報告", LAST_NIGHT)
+    model["answers"].append([_item(1, "交報告", TODAY)])
+    with todo._conn() as c:
+        path = c.execute("PRAGMA database_list").fetchone()[2]
+    real_expire = todo.expire_past_due
+    held = {}
+
+    def locked_expire(group_id, today):
+        if group_id == GROUP and "h" not in held:
+            h = sqlite3.connect(path, isolation_level=None)
+            h.execute("BEGIN IMMEDIATE")  # another process takes the write lock as the push starts
+            held["h"] = h
+        return real_expire(group_id, today)
+
+    monkeypatch.setattr(todo, "expire_past_due", locked_expire)
+    monkeypatch.setattr(todo, "_job_conn", lambda: todo._conn(timeout=0.2))
+    assert todo.main_reminder(now=NOW) == 0
+    held["h"].execute("ROLLBACK")
+    held["h"].close()
+
+    with todo._conn() as c:
+        job = family_extract.status(c, "todo", GROUP, now=NOW + 6000, newest_raw=None, unread=None)
+    job["last_run"] = status._clean(job["last_run"], status._RUN_KEYS)
+    job["last_push"] = status._clean(job["last_push"], status._PUSH_KEYS)
+    codes = status.alerts({"todo": job}, {}, {"todo": "on", "anniversary": "off"}, now=NOW + 6000)
+    assert _pushes() == [] and job["last_push"]["date"] == _iso(YESTERDAY)
+    assert "todo_push_not_today" in codes
+
+
+@pytest.mark.parametrize("prefix", ["下下", "下", "這", "本", "下個月", "下下個", "每", "上", "每月"])
+def test_a_long_run_of_spaces_after_a_date_word_stays_fast(prefix):
+    """F3: 「\\s*個?\\s*」 and 「\\s*的?\\s*」 tried every split of a run of spaces (5000 spaces: 0.42 s, and one
+    LINE message can hold them).  One optional group per gap keeps the search linear."""
+    import time
+
+    import todo
+
+    text = prefix + " " * 20000 + "x"
+    started = time.perf_counter()
+    todo._EXPECTED_DATE_RE.search(text)
+    assert time.perf_counter() - started < 1.0
+
+
+def test_the_faster_date_pattern_reads_every_text_the_way_the_old_one_did():
+    """F3, differential (新版 §3.8): only the way a gap of spaces is written changed, so on random texts made
+    of the words the pattern knows, the old form and the new form find the same dates in the same places."""
+    import random
+    import re
+
+    import todo
+
+    new = todo._EXPECTED_DATE_RE
+    old = re.compile(new.pattern.replace(r"\s*(?:個\s*)?", r"\s*個?\s*").replace(r"\s*(?:的\s*)?", r"\s*的?\s*"))
+    assert old.pattern != new.pattern
+    pieces = ["下", "下", "這", "本", "上", "每", "個", "一", "月", "的", "週", "星期", "禮拜", "三", "日", "天",
+              "號", "5", "12", "/", " ", "  ", "明天", "後天", "年", "2026", "-", "十", "二十", "x"]
+    rng = random.Random(20261121)
+    for _ in range(20000):
+        text = "".join(rng.choice(pieces) for _ in range(rng.randint(1, 10)))
+        found_old = [(m.span(), m.groupdict()) for m in old.finditer(text)]
+        found_new = [(m.span(), m.groupdict()) for m in new.finditer(text)]
+        assert found_old == found_new, text
