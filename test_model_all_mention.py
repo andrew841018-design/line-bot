@@ -308,7 +308,7 @@ def test_a_receipt_for_everyone_pings_the_group_and_the_same_words_as_a_plain_st
     [
         ("/民調 今晚可以嗎", "M-poll-command"),  # `_handle_command`, the call site model words share
         ("咪寶 幫我做民調：今晚可以嗎", "M-poll-explicit"),
-        ("提醒我明天10:00開會 @all", "M-receipt"),
+        # a reminder's @all: test_reminder_family_mention.py (stored words), the receipt's type: B
     ],
 )
 def test_the_text_handler_hands_the_mark_on(line, poll_db, monkeypatch, text, message_id):  # noqa: F811

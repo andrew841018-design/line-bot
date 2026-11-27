@@ -571,10 +571,21 @@ def _semantic_event_score(event: Mapping[str, object]) -> tuple[int, int, int]:
     )
 
 
+def _rings_everyone(event: Mapping[str, object]) -> bool:
+    """Whether an event's participants ring everyone as its offset pushes read them
+    (line_mentions.event_mention_targets: no bracket cut), the reading that calls fewer events everyone's:
+    「全家(主辦)」 does not here, though the mirror's reading (_event_participants) cuts it to 全家."""
+    return line_mentions.is_all_participants(line_mentions.parse_participants(event.get("participants")))
+
+
 def _semantic_event_candidates_conn(
     c: sqlite3.Connection,
     incoming: Mapping[str, object],
+    *,
+    as_before_stage2: bool = False,
 ) -> list[sqlite3.Row]:
+    """The day's active events that ``incoming`` may be.  ``as_before_stage2``: people read as 58d5d5c read
+    them, 全家 a name like any other (_named_apart); everything else is read the same."""
     key = reminder_intent.event_semantic_key(incoming.get("title"))
     if not key:
         return []
@@ -588,7 +599,10 @@ def _semantic_event_candidates_conn(
     ).fetchall()
     incoming_source = str(incoming.get("source_msg_id") or "").strip()
     incoming_location = reminder_intent.normalize_text(incoming.get("location"))
-    incoming_participants = set(_event_participants(incoming))
+    # 全家 is who hears, never who an event is about (reminder_intent.people_named), and two events that both
+    # ring everyone are never apart for the other people they name (2026-11-27, seat 2 R3-N1)
+    incoming_participants = reminder_intent.people_named(_event_participants(incoming))
+    incoming_everyone = _rings_everyone(incoming)
     candidates: list[sqlite3.Row] = []
     for row in rows:
         current = dict(row)
@@ -614,12 +628,16 @@ def _semantic_event_candidates_conn(
             and incoming_location != current_location
         ):
             continue
-        current_participants = set(_event_participants(current))
-        if (
-            incoming_participants
-            and current_participants
-            and incoming_participants.isdisjoint(current_participants)
-        ):
+        current_participants = reminder_intent.people_named(_event_participants(current))
+        if as_before_stage2:
+            apart = _named_apart(incoming, current)
+        else:
+            apart = (
+                bool(incoming_participants and current_participants)
+                and incoming_participants.isdisjoint(current_participants)
+                and not (incoming_everyone and _rings_everyone(current))
+            )
+        if apart:
             continue
         if not reminder_intent.schedules_are_compatible(
             current.get("event_time"),
@@ -649,8 +667,25 @@ def _semantic_desired_event(
             "event_type",
         ):
             desired[key] = incoming.get(key)
+        if line_mentions.is_all_participants(_event_participants(existing)):
+            # an event for everyone (D5, a medical 全家) stays so when a message takes it over
+            desired["participants"] = json.dumps(
+                line_mentions.with_whole_family(line_mentions.parse_participants(incoming.get("participants"))),
+                ensure_ascii=False,
+            )
         return desired
     if existing_source and not incoming_source:
+        if line_mentions.is_all_participants(_event_participants(incoming)) and not (
+            line_mentions.is_all_participants(_event_participants(existing))
+        ):
+            # A capture with no message of its own (a burst) for everyone lands on another message's event:
+            # that event becomes everyone's, still one push (D5), and keeps its own people.
+            # TODO(review_metrics/deferred.md, 2026-11-21 line_bot_reminder_extract_mention_20261113 N-d): read with the bracket cut, an event of
+            # 「全家(主辦)」 counts as everyone's here, while its offset push (no cut) does not.
+            desired["participants"] = json.dumps(
+                line_mentions.with_whole_family(line_mentions.parse_participants(existing.get("participants"))),
+                ensure_ascii=False,
+            )
         return desired
 
     if _semantic_event_score(incoming) > _semantic_event_score(existing):
@@ -848,6 +883,14 @@ def _insert_new_event_reminder_conn(
     return int(cursor.lastrowid)
 
 
+def _named_apart(incoming: Mapping[str, object], current: Mapping[str, object]) -> bool:
+    """Whether two events both name their people and share none, 全家 read as one of the names: the
+    reading before stage 2 (58d5d5c), under which such a pair was never one event."""
+    incoming_people = set(_event_participants(incoming))
+    current_people = set(_event_participants(current))
+    return bool(incoming_people and current_people and incoming_people.isdisjoint(current_people))
+
+
 def insert_event_with_outcome(
     group_id: str,
     title: str,
@@ -879,10 +922,30 @@ def insert_event_with_outcome(
             c.row_factory = sqlite3.Row
             c.execute("BEGIN IMMEDIATE")
             candidates = _semantic_event_candidates_conn(c, incoming)
+            if len(candidates) > 1 and line_mentions.is_all_participants(_event_participants(incoming)):
+                # An event for everyone that could be any of several: the ones whose own participants and
+                # this one's are both written and share nobody drop out (_named_apart, the reading before
+                # stage 2), unless they ring everyone too ([大家], [all]: 2026-11-27, seat 3 N-c).  None
+                # left: an event of its own.
+                candidates = [
+                    row
+                    for row in candidates
+                    if _rings_everyone(dict(row)) or not _named_apart(incoming, dict(row))
+                ]
             if len(candidates) > 1:
                 return "", "ambiguous"
             if len(candidates) == 1:
-                return _merge_semantic_event_conn(c, candidates[0], incoming)
+                merged_id, outcome = _merge_semantic_event_conn(c, candidates[0], incoming)
+                if outcome not in ("blocked", "busy") or _semantic_event_candidates_conn(
+                    c, incoming, as_before_stage2=True
+                ):
+                    return merged_id, outcome
+                # The merge cannot write (that event's mirror is no longer pending: it has gone out, been
+                # cleaned up, or is going out now), and before stage 2 nothing on that day was this event
+                # (58d5d5c's reading finds no candidate, that one included): an event of its own, as then.
+                # Any event that reading finds keeps it out, blocked or busy as it is (2026-11-27, seat 2
+                # R3-N1).  Nothing was written above; one with the same title, date and time lands on the
+                # unique index below.
             cur = c.execute(
                 "INSERT OR IGNORE INTO events (event_id, group_id, title, "
                 "event_date, event_time, location, participants, source_msg_id, "
@@ -903,14 +966,14 @@ def insert_event_with_outcome(
             )
             if cur.rowcount == 0:
                 exact = c.execute(
-                    "SELECT event_id, source_msg_id FROM events "
+                    "SELECT * FROM events "
                     "WHERE group_id=? AND title=? "
                     "AND event_date=? AND COALESCE(event_time, '')=COALESCE(?, '') "
                     "AND status='active'",
                     (group_id, title, event_date, event_time),
                 ).fetchone()
                 if exact:
-                    existing_source = str(exact[1] or "").strip()
+                    existing_source = str(exact["source_msg_id"] or "").strip()
                     incoming_source = str(source_msg_id or "").strip()
                     if (
                         existing_source
@@ -918,7 +981,12 @@ def insert_event_with_outcome(
                         and existing_source != incoming_source
                     ):
                         return "", "conflict"
-                    return str(exact[0]), "duplicate"
+                    if not incoming_source and _rings_everyone(incoming):
+                        # A capture for everyone with no message of its own (a burst) that the unique index
+                        # drops goes into that event the semantic merge's way (2026-11-27, seat 3 N-b): 全家
+                        # joins and the event keeps its people (R2 ①); blocked or busy as they are.
+                        return _merge_semantic_event_conn(c, exact, incoming)
+                    return str(exact["event_id"]), "duplicate"
                 return "", "conflict"
             _insert_new_event_reminder_conn(c, incoming)
     except (sqlite3.Error, OSError, RuntimeError, ValueError):

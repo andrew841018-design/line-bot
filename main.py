@@ -7645,6 +7645,11 @@ def _creation_followup_reply(event: MessageEvent, group_id: str, text: str) -> s
                         *(int(result[k]) for k in ("year", "month", "day", "hour", "minute")),
                         tzinfo=ZoneInfo("Asia/Taipei"),
                     )
+                    # D1.  A follow-up on the message that made an event lands on that event's mirror
+                    # (persist_source's event branch) and needs nothing more: the mirror reads the same
+                    # message's @ (calendar_db._raw_text_reminder_aliases).  An event another message made
+                    # is not reached: its participants and offset pushes stay as they are (stage 2b).
+                    result = _with_family_mentions(source["text"], result)
                     rid, outcome = reminder_followup.persist_source(group_id, source, result, int(due.timestamp()))
                     if rid is not None and outcome in {"created", "duplicate"}:
                         saved = memory.get_reminder(rid)
@@ -20966,6 +20971,7 @@ def _drain_pending_reminders(
                     "expired",
                 )
                 continue
+            result = _with_family_mentions(row["text"], result)
             # No receipt and no stage consumption (2026-10-04): the reminder's
             # next push is the family's only signal for a late extraction.
             rid, outcome, _persisted = (
@@ -21161,6 +21167,24 @@ def _format_schedule_receipt(written: list[dict]) -> ReminderReceipt:
     return ReminderReceipt("\n".join(lines), ids, named)
 
 
+def _with_family_mentions(source_text: str, result: dict) -> dict:
+    """The reminder as it is written: 全家 among its aliases when the family member's own message
+    @-called everyone (Andrew 2026-11-13, D1), and that @ out of its words, so the words a receipt or a
+    list reads back carry no @all (D2).
+
+    Only the message is read, never the words a model or a parser made of it.  Called last before each
+    write: the medical step replaces the aliases, and the transit step puts the whole message, @all
+    and all, back into the words."""
+    aliases = [str(alias) for alias in (result.get("mention_aliases") or []) if str(alias).strip()]
+    if line_mentions.whole_family_mentions(source_text):
+        aliases = line_mentions.with_whole_family(aliases)
+    return dict(
+        result,
+        action=line_mentions.strip_whole_family_mentions(str(result.get("action") or "")),
+        mention_aliases=aliases,
+    )
+
+
 def _create_schedule_reminders(
     group_id: str,
     owner_user_id: str,
@@ -21199,6 +21223,8 @@ def _create_schedule_reminders(
         action = str(item.get("title") or "").strip()
         if not action:
             continue
+        fields = _with_family_mentions(source_text, {"action": action, "mention_aliases": []})
+        action = fields["action"]
         try:
             rid, outcome = memory.add_reminder_with_outcome(
                 group_id,
@@ -21206,7 +21232,7 @@ def _create_schedule_reminders(
                 action,
                 remind_at,
                 source_text=source_text,
-                mention_aliases=[],
+                mention_aliases=fields["mention_aliases"],
                 time_kind=reminder_intent.time_kind_from_default(default_kind),
                 source_kind=_SCHEDULE_LINE_SOURCE_KIND if source_message_id else "",
                 source_ref=f"{source_message_id}:{index}" if source_message_id else "",
@@ -21230,6 +21256,7 @@ def _create_schedule_reminders(
                 "remind_dt": remind_dt,
                 "default_kind": default_kind,
                 "daypart": item.get("daypart"),
+                "mention_aliases": fields["mention_aliases"],
             }
         )
     if not written:
@@ -21247,7 +21274,7 @@ def _create_schedule_reminders(
                 entry["rid"],
                 entry["action"],
                 entry["remind_dt"],
-                [],
+                entry["mention_aliases"],
                 entry["default_kind"],
             ),
             _receipt_ids(entry["outcome"], entry["rid"]),
@@ -21680,6 +21707,7 @@ def _maybe_extract_reminder(
         # 即時建立只接受未來時間；1-hour grace 僅保留給 delayed pending drain。
         if remind_at <= time.time():
             return _REMINDER_PAST_TIME_REPLY if request_to_bot else None
+        result = _with_family_mentions(text, result)
         rid, outcome = memory.add_reminder_with_outcome(
             group_id, user_id, result["action"], remind_at, source_text=text,
             mention_aliases=result.get("mention_aliases") or [],

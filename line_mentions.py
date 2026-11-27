@@ -355,9 +355,92 @@ _WHOLE_FAMILY_MENTION_RE = re.compile(
 
 def whole_family_mentions(text: str | None) -> list[str]:
     """The family words a message @-mentions (「all」, 「全家」…), each once, English in lower case.
-    Full-width 「＠」 counts."""
-    found = _WHOLE_FAMILY_MENTION_RE.findall((text or "").replace("＠", "@"))
+    Full-width 「＠」 counts.  An @全家 that is FamilyMart (「取件@全家」) calls nobody: _at_the_shop."""
+    probe = (text or "").replace("＠", "@")
+    found = [
+        match.group(1) for match in _WHOLE_FAMILY_MENTION_RE.finditer(probe) if not _at_the_shop(probe, match)
+    ]
     return list(dict.fromkeys(word.lower() for word in found))
+
+
+# 2026-11-20: an errand at the shop glued to the @ means "at" there (「取件@全家」).  With a space
+# between, the @ is a call to everyone (「記得繳費 @全家」).
+_SHOP_ERRAND_RE = re.compile(
+    r"(?:取貨|取件|寄件|寄貨|領貨|領件|領包裹|寄包裹|取包裹|拿包裹|退貨|繳費|店到店)\Z"
+)
+# After a glued errand, 全家人, 全家福, 全家聚... are still the family (the words _FAMILYMART_RE keeps too).
+_FAMILY_AFTER_RE = re.compile(r"[人福聚都團]|一起|圍爐|過年")
+
+
+# TODO(review_metrics/deferred.md, 2026-11-21 line_bot_reminder_extract_mention_20261113 C-1): an errand glued to the @ after another place is
+# named (「去郵局寄包裹@全家」) still reads as the shop; Andrew 2026-11-21 chose to ship it so (DECISIONS item 7).
+def _at_the_shop(probe: str, match: re.Match[str]) -> bool:
+    """Whether an @全家 is FamilyMart, where the @ means "at" (2026-11-20, 11/21).  Two ways only: an
+    errand at the shop glued to the @ (「取件@全家」, 「寄包裹＠全家」; 「取件@全家人」 is the family), or,
+    with this one @ out, a word of the shop's right after 全家 (「@全家便利商店」, 「去@全家取貨」,
+    「明天 @全家取貨」).  Every other @全家 calls everyone, 去 or 到 in front included (「不要遲到@全家」,
+    「記得到@全家吃飯」).  Only the Chinese 全家: 大家, 所有人, all and the rest are no shop.  ``probe`` has
+    every 「＠」 as 「@」."""
+    if match.group(1) != "全家":
+        return False
+    start = match.start()
+    if _SHOP_ERRAND_RE.search(probe[:start]):
+        return not _FAMILY_AFTER_RE.match(probe, match.end())
+    plain = probe[:start] + probe[start + 1:]  # 全家 now starts at ``start``
+    shop = _FAMILYMART_RE.match(plain, start)
+    # Of the shop rules only the first takes letters after 全家 (便利商店, 取貨, 藥局...), so a match longer
+    # than 全家 is that one.  The other two only look around 全家 (去 or 到 in front, half of another word),
+    # and with an @ in between those are how a call is written (「不要遲到@全家」): they do not count here.
+    return shop is not None and shop.end() > start + len("全家")
+
+
+def strip_whole_family_mentions(text: str | None) -> str:
+    """The words without the @ that called everyone, for a reminder's stored text.
+
+    The reminder rings everyone through its 全家 alias (Andrew 2026-11-13, D1), so a stored 「@all」 would
+    only ring again where the words are read back (D2).  An English word goes with its @; a Chinese one
+    with more letters right after it keeps them and loses only the @: 「@全家人一起吃飯」 means 全家人.
+    FamilyMart's @全家 stays (「取件@全家」), and words that were only the call become 「全家」.
+
+    Taking an @ out can bring the next one into view (「@all@全家」: the second is glued to the first), so
+    it goes again until whole_family_mentions reads none.  Words without such an @ are left as they are.
+    When one comes out, every run of half- or full-width spaces in the words becomes a single space, and
+    whitespace at either end (a newline too) goes."""
+    words = str(text or "")
+    for _ in range(len(words) + 1):  # each pass takes at least one @ away
+        if not whole_family_mentions(words):
+            break
+        words = _strip_once(words)
+    return words
+
+
+def _strip_once(value: str) -> str:
+    """One pass of strip_whole_family_mentions."""
+    probe = value.replace("＠", "@")  # one for one, so every position stays
+    kept: list[str] = []
+    last = 0
+    for match in _WHOLE_FAMILY_MENTION_RE.finditer(probe):
+        if _at_the_shop(probe, match):
+            continue
+        end = match.end()
+        if not match.group(1).isascii() and probe[end:end + 1].isalnum():
+            end = match.start() + 1
+        kept.append(value[last:match.start()])
+        last = end
+    if not kept:
+        return value
+    kept.append(value[last:])
+    words = re.sub(r"[ 　]{2,}", " ", "".join(kept)).strip()
+    return words if any(ch.isalnum() for ch in words) else "全家"
+
+
+def with_whole_family(participants: list[str]) -> list[str]:
+    """An event's participants with 全家 in front, as D5 and a medical 全家 write them; as they are when
+    one of them already means everyone.  Read the offset push's way (no bracket cut, unlike the mirror's
+    reading), so a lone 「全家(主辦)」 gets a second 全家 and shows it twice: rare, and this reading stands
+    on its own."""
+    names = [str(name) for name in participants]
+    return names if is_all_participants(names) else ["全家", *names]
 
 
 # 2026-11-07: an @ inside an address or a link mentions nobody: 「x@成員甲」, 「.com/@成員甲」.  A "/" with no
@@ -390,8 +473,14 @@ _FAMILYMART_RE = re.compile(
 def names_the_family(text: str | None) -> bool:
     """Whether the text has a 全家 that is the family: not the shop, not a clinic or a pharmacy of that
     name, not half of another word.  Each of those is cut out first, leaving a space so that the letters
-    on either side cannot close up into a 全家 nobody wrote."""
-    return "全家" in _FAMILYMART_RE.sub(" ", text or "")
+    on either side cannot close up into a 全家 nobody wrote, and so is an @全家 that is FamilyMart the way
+    whole_family_mentions reads it (_at_the_shop: 「取件@全家」, 2026-11-27, seat 1 G2)."""
+    value = text or ""
+    probe = value.replace("＠", "@")  # one for one, so every position stays
+    shops = [match for match in _WHOLE_FAMILY_MENTION_RE.finditer(probe) if _at_the_shop(probe, match)]
+    for match in reversed(shops):
+        value = value[: match.start()] + " " + value[match.end():]
+    return "全家" in _FAMILYMART_RE.sub(" ", value)
 
 
 def is_all_participants(names: list[str]) -> bool:

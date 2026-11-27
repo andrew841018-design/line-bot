@@ -26,6 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import hearsay
+import line_mentions
 import reminder_intent
 from config import settings
 from sqlite_security import connect_private_sqlite
@@ -3741,7 +3742,13 @@ def _merge_same_event_conn(
             and not any(int(flag or 0) for flag in row[7:11])
             and not in_flight
             and reminder_intent.same_event_move_match(
-                action, row[1], identity, names, same_author=same_author
+                action,
+                row[1],
+                identity,
+                names,
+                same_author=same_author,
+                incoming_everyone=line_mentions.is_all_participants(list(mentions)),
+                kept_everyone=line_mentions.is_all_participants(_load_mention_aliases(row[3])),
             )
         )
         if not movable:
@@ -3772,7 +3779,7 @@ def _merge_same_event_conn(
     return reminder_id, "merged" if changed else "duplicate"
 
 
-def _add_reminder_with_outcome_conn(
+def _add_or_fold_reminder_conn(
     c: sqlite3.Connection,
     group_id: str,
     user_id: str,
@@ -3783,6 +3790,7 @@ def _add_reminder_with_outcome_conn(
     now: int,
     time_kind: str | None = None,
 ) -> tuple[int, str]:
+    """The write itself (honor-or-insert).  Writers call _add_reminder_with_outcome_conn, never this."""
     mentions_json = json.dumps(mentions, ensure_ascii=False)
     incoming_hhmm = _reminder_hhmm(remind_at)
     fragment = _merged_detail_fragment(action, source_text)
@@ -3987,6 +3995,82 @@ def _add_reminder_with_outcome_conn(
     )
     reminder_id = int(c.execute("SELECT last_insert_rowid()").fetchone()[0])
     return reminder_id, "created"
+
+
+def _whole_family_into_event_conn(c: sqlite3.Connection, group_id: str, event_id: str) -> None:
+    """全家 into an active event's participants, inside the caller's transaction.  Not through
+    calendar_db: importing it runs init_db() on a connection of its own (at import, the module's last
+    line)."""
+    row = c.execute(
+        "SELECT participants FROM events WHERE group_id=? AND event_id=? AND status='active'",
+        (group_id, event_id),
+    ).fetchone()
+    if row is None:
+        return
+    try:
+        current = json.loads(row[0] or "[]")
+    except ValueError:
+        return
+    if not isinstance(current, list):
+        return
+    wanted = line_mentions.with_whole_family(current)
+    if wanted != current:
+        c.execute(
+            "UPDATE events SET participants=? WHERE group_id=? AND event_id=? AND status='active'",
+            (json.dumps(wanted, ensure_ascii=False), group_id, event_id),
+        )
+
+
+def _keep_whole_family_conn(
+    c: sqlite3.Connection, group_id: str, reminder_id: int, aliases: list[str]
+) -> None:
+    """A message that asked for everyone (D1) and folded into a pending row keeps that row ringing
+    everyone.  Only 全家 joins, never the newcomer's people: a weak fragment's people stay off a richer
+    row (7c6a395).  A calendar mirror is rebuilt from its event, so there 全家 goes into the event's
+    participants too, and its offset pushes ring everyone (Andrew 2026-11-14, D5)."""
+    if not line_mentions.is_all_participants(list(aliases or [])):
+        return
+    row = c.execute(
+        "SELECT COALESCE(mention_aliases, '[]'), COALESCE(source_kind, ''), COALESCE(source_ref, '') "
+        "FROM reminders WHERE reminder_id=? AND group_id=? AND status='pending'",
+        (int(reminder_id), group_id),
+    ).fetchone()
+    if row is None:
+        return
+    if not line_mentions.is_all_participants(_load_mention_aliases(row[0])):
+        c.execute(
+            "UPDATE reminders SET mention_aliases=? WHERE reminder_id=? AND status='pending'",
+            (_merge_mention_aliases_json(row[0], ["全家"]), int(reminder_id)),
+        )
+    if row[1] == "calendar_event" and row[2]:
+        _whole_family_into_event_conn(c, group_id, row[2])
+
+
+def _add_reminder_with_outcome_conn(
+    c: sqlite3.Connection,
+    group_id: str,
+    user_id: str,
+    action: str,
+    remind_at: int,
+    source_text: str,
+    mentions: list[str],
+    now: int,
+    time_kind: str | None = None,
+) -> tuple[int, str]:
+    """Add a reminder, or fold it into the pending row that already reminds about it.
+
+    Every writer that can fold into another row comes through here: live and a schedule list through
+    add_reminder_with_outcome, the drain through complete_pending_reminder, which calls this directly.
+    Three write rows of their own without it: the creation follow-up (reminder_followup.persist_source,
+    which finds only the row its own source made), the contextual date batch
+    (complete_contextual_date_reminder_batch) and an event's mirror (calendar_db).  A fold never loses a
+    whole-family audience: _keep_whole_family_conn."""
+    reminder_id, outcome = _add_or_fold_reminder_conn(
+        c, group_id, user_id, action, remind_at, source_text, mentions, now, time_kind
+    )
+    if outcome in ("duplicate", "merged"):
+        _keep_whole_family_conn(c, group_id, reminder_id, mentions)
+    return reminder_id, outcome
 
 
 def add_reminder_with_outcome(
@@ -6298,6 +6382,16 @@ def delete_duplicate_pending_reminders(
                     "",
                 )
             created_at = min(int(row["created_at"] or 0) for row in cluster)
+            if source_kind == "calendar_event" and source_ref and any(
+                line_mentions.is_all_participants(_load_mention_aliases(row["mention_aliases"]))
+                for row in cluster
+                if (str(row["source_kind"] or ""), str(row["source_ref"] or "")) != (source_kind, source_ref)
+            ):
+                # D5 the other way round: a reminder that asked for everyone folded into an event's
+                # mirror.  Only the rows folded in count, told apart by their source, not by which row is
+                # deleted (a live claim can keep the plain row).  The mirror's own 全家 (a title, an @ in
+                # its message) already rings it and must not turn on the event's offset pushes.
+                _whole_family_into_event_conn(c, str(keep["group_id"] or ""), source_ref)
             keep_stage = ""
             if not source_kind and not source_ref:
                 import reminder_stages

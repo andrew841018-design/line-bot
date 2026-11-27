@@ -16,8 +16,9 @@ raised OverflowError, which main's date check did not catch, so the drain put th
 asked the model again on every drain until the row aged out.  A null year is this year, like a
 missing one.
 
-Not covered here: the words the model writes into ``action``.  An @all, an @member or a line break
-there still reaches the receipt, and every push pings a member it names (the next stage).
+Not covered here: the words the model writes into ``action``.  An @member or a line break there still
+reaches the receipt, and every push pings a member it names (stage 2b).  An @all there is taken out
+when the reminder is written, since stage 2: test_reminder_family_mention.py.
 
 These tests drive the real ``extract_reminder`` through a fake client (``tier`` from
 test_gemini_last_tier): a test that replaced ``extract_reminder`` itself would never reach the

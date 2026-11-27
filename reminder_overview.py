@@ -368,8 +368,9 @@ def _reads_into(incoming: _Item, kept: _Item) -> bool:
         kept_hhmm=kept.hhmm,
         kept_identity=kept.identity,
         kept_source=str(kept.source.get("source_text") or ""),
-        mentions=[name for name in incoming.names if name not in _EVERYONE],
-        kept_mentions=[name for name in kept.names if name not in _EVERYONE],
+        # the matcher leaves 全家 out of the people itself and still drops it from the words (people_named)
+        mentions=list(incoming.names),
+        kept_mentions=list(kept.names),
         same_author=bool(user_id) and user_id == str(kept.source.get("user_id") or ""),
     )
 

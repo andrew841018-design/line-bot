@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 import unicodedata
 
+import line_mentions
+
 
 _INTERNAL_PROMPT_MARKERS = (
     "--- 原始訊息 結束 ---",
@@ -437,8 +439,18 @@ def _same_event_people_pattern(names: tuple[str, ...]) -> str:
     return "|".join(re.escape(person) for person in people)
 
 
-def same_event_people(text: object, names: tuple[str, ...] = ()) -> set[str]:
-    """Family members, configured aliases and personal names in ``text``."""
+def people_named(names) -> set[str]:
+    """The names that say who an event is about.  全家, all, 大家… say who hears it, so they are left
+    out: 「@全家 看牙醫」 and 「測試成員甲看牙醫」 are one visit, rung once for everyone (Andrew
+    2026-11-14, D5).  They stay among the names a text's core drops (``all_names``), so
+    「全家8點吃飯」 still reads as 「吃飯」."""
+    return {str(name) for name in names if name and not line_mentions.is_all_participants([str(name)])}
+
+
+def _named_in(text: object, names: tuple[str, ...] = ()) -> set[str]:
+    """Every name in ``text``: family members, configured aliases and personal names, 全家 and the other
+    words for everyone among them.  Two short descriptions of one event compare these (_named_alike):
+    two reminders of 「全家聚餐」 are one dinner."""
 
     value = normalize_text(text)
     found: set[str] = set()
@@ -448,6 +460,32 @@ def same_event_people(text: object, names: tuple[str, ...] = ()) -> set[str]:
             value = value.replace(person, " ")
     found.update(_SAME_EVENT_NAME_RE.findall(normalize_text(text)))
     return found
+
+
+def same_event_people(text: object, names: tuple[str, ...] = ()) -> set[str]:
+    """Family members, configured aliases and personal names in ``text``: who it is about (people_named)."""
+
+    return people_named(_named_in(text, names))
+
+
+def _named_alike(
+    incoming: object,
+    kept_action: object,
+    names: tuple[str, ...],
+    *,
+    incoming_everyone: bool = False,
+    kept_everyone: bool = False,
+) -> bool:
+    """Whether two short descriptions hold the same names (_named_in), at least one: the short-core test
+    of same_event_text and same_event_move_match.  When both reminders are for everyone (an alias on each
+    side reads as everyone), 全家 counts among both sides' names: D1's strip takes the call out of the
+    words (「@全家 聚餐」 is stored as 「聚餐」 with 全家 among its aliases), and two of them stay one, as
+    two of 「全家聚餐」 do (2026-11-27, seat 3 I-b).  One side for everyone alone adds nothing, so such a
+    pair reads as it did before."""
+
+    both = {"全家"} if incoming_everyone and kept_everyone else set()
+    incoming_names = _named_in(incoming, names) | both
+    return bool(incoming_names) and incoming_names == _named_in(kept_action, names) | both
 
 
 def _same_event_role_signature(text: object, names: tuple[str, ...]) -> tuple[str, ...] | None:
@@ -751,6 +789,8 @@ def same_event_text(
     same_clock: bool = False,
     names: tuple[str, ...] = (),
     same_author: bool = False,
+    incoming_everyone: bool = False,
+    kept_everyone: bool = False,
 ) -> bool:
     """Whether a new description names the same activity as the kept reminder.
 
@@ -758,6 +798,8 @@ def same_event_text(
     and both sides adding their own words to the shared run (王小明/李大華,
     送/拿, 眼科/牙科, 台新…/…國泰) name different events even at the same
     clock; travel (回台北) or one side only adding words is not a difference.
+    ``incoming_everyone`` / ``kept_everyone``: that side's aliases read as
+    everyone (_named_alike).
     """
 
     left = same_event_core(incoming, names)
@@ -768,8 +810,9 @@ def same_event_text(
         return (
             len(left) >= 3
             or same_clock
-            or bool(same_event_people(incoming, names))
-            and same_event_people(incoming, names) == same_event_people(kept_action, names)
+            or _named_alike(
+                incoming, kept_action, names, incoming_everyone=incoming_everyone, kept_everyone=kept_everyone
+            )
             or _same_words_same_author(incoming, kept_action, same_author)
         )
     size, end_left, end_right = _longest_common_run(left, right)
@@ -788,8 +831,11 @@ def same_event_move_match(
     identity: list[object] | tuple[object, ...],
     names: tuple[str, ...] = (),
     same_author: bool = False,
+    incoming_everyone: bool = False,
+    kept_everyone: bool = False,
 ) -> bool:
-    """Stricter match needed before a new mention may change a reminder's time."""
+    """Stricter match needed before a new mention may change a reminder's time.  The two flags as in
+    same_event_text."""
 
     people = same_event_people(incoming, names)
     if same_event_identity_conflict(incoming, identity, names) or people != same_event_people(
@@ -799,7 +845,11 @@ def same_event_move_match(
     left = same_event_core(incoming, names)
     right = same_event_core(kept_action, names)
     if left and left == right and (
-        len(left) >= 3 or people or _same_words_same_author(incoming, kept_action, same_author)
+        len(left) >= 3
+        or _named_alike(
+            incoming, kept_action, names, incoming_everyone=incoming_everyone, kept_everyone=kept_everyone
+        )
+        or _same_words_same_author(incoming, kept_action, same_author)
     ):
         return True
     shorter, longer = sorted((left, right), key=len)
@@ -998,8 +1048,8 @@ def mention_matches_reminder(
     identity = list(kept_identity) if kept_identity else [kept_action]
     if not times_compatible(kept_kind, kept_hhmm, time_kind, hhmm):
         return False
-    incoming_people = set(mentions) | same_event_people(action, all_names)
-    known_people = set(kept_mentions).union(
+    incoming_people = people_named(mentions) | same_event_people(action, all_names)
+    known_people = people_named(kept_mentions).union(
         *(same_event_people(text, all_names) for text in identity)
     )
     if (
@@ -1012,7 +1062,13 @@ def mention_matches_reminder(
         return False
     same_clock = time_rank(kept_kind) == 2 and time_rank(time_kind) == 2 and kept_hhmm == hhmm
     if same_event_text(
-        action, kept_action, same_clock=same_clock, names=all_names, same_author=same_author
+        action,
+        kept_action,
+        same_clock=same_clock,
+        names=all_names,
+        same_author=same_author,
+        incoming_everyone=line_mentions.is_all_participants(list(mentions)),
+        kept_everyone=line_mentions.is_all_participants(list(kept_mentions)),
     ):
         return True
     return (
